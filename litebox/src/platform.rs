@@ -12,7 +12,10 @@ use thiserror::Error;
 /// Ideally, a [`Provider`] is zero-sized, and only exists to provide access to functionality
 /// provided by it. _However_, most of the provided APIs within the provider act upon an `&self` to
 /// allow storage of any useful "globals" within it necessary.
-pub trait Provider: RawMutexProvider + IPInterfaceProvider + PunchthroughProvider {}
+pub trait Provider:
+    RawMutexProvider + IPInterfaceProvider + TimeProvider + PunchthroughProvider
+{
+}
 
 /// Punch through any functionality for a particular platform that is not explicitly part of the
 /// common _shared_ platform interface.
@@ -159,6 +162,26 @@ pub enum SendError {}
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum ReceiveError {}
+
+/// An interface to understanding time.
+pub trait TimeProvider {
+    type Instant: Instant;
+    /// Returns an instant coresponding to "now".
+    fn now(&self) -> Self::Instant;
+}
+
+/// An opaque measurement of a monotonically nondecreasing clock.
+pub trait Instant {
+    /// Returns the amount of time elapsed from another instant to this one, or `None` if that
+    /// instant is later than this one.
+    fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration>;
+    /// Returns the amount of time elapsed from another instant to this one, or zero duration if
+    /// that instant is later than this one.
+    fn duration_since(&self, earlier: &Self) -> core::time::Duration {
+        self.checked_duration_since(earlier)
+            .unwrap_or(core::time::Duration::from_secs(0))
+    }
+}
 
 /// Implementations of trivial providers.
 ///
