@@ -37,7 +37,7 @@ impl<Platform: platform::Provider> Network<Platform> {
 /// This file descriptor **must** be consumed by a `close` operation, otherwise will panic at
 /// run-time upon being dropped.
 pub struct SocketFd {
-    fd: crate::fd::OwnedFd,
+    pub(crate) fd: crate::fd::OwnedFd,
 }
 
 impl<Platform: platform::Provider> Network<Platform> {
