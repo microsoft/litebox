@@ -19,6 +19,7 @@ flowchart TD
     psl["POSIX Shim Layer"]
     wsl["WASI Shim Layer"]
     rsl["Rust Shim Layer"]
+    alloc{{Allocator}}
     lb["LiteBox"]
     pflk["Linux Kernel Platform"]
     pflu["Linux User Platform"]
@@ -40,6 +41,10 @@ flowchart TD
     subgraph "&nbsp;&nbsp;&nbsp;"
         lb
     end
+
+    %% The `~~~` thing is purely for stylistic reasons
+    alloc ~~~ lb
+    lb-->alloc
 
     lb-->|Platform interface|pflk & pflu
 
