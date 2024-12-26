@@ -4,6 +4,7 @@ use core::{net::SocketAddr, num::NonZeroU32};
 
 use crate::platform;
 
+use bitflags::bitflags;
 use thiserror::Error;
 
 /// The `Network` provides access to all networking related functionality provided by LiteBox.
@@ -62,6 +63,31 @@ impl<Platform: platform::Provider> Network<Platform> {
     pub fn connect(&self, fd: &SocketFd, addr: &SocketAddr) -> Result<()> {
         todo!()
     }
+
+    /// Bind a socket to a specific address and port.
+    pub fn bind(&self, fd: &SocketFd, addr: &SocketAddr) -> Result<()> {
+        todo!()
+    }
+
+    /// Prepare a socket to accept incoming connections.
+    pub fn listen(&self, fd: &SocketFd, backlog: i32) -> Result<()> {
+        todo!()
+    }
+
+    /// Accept a new incoming connection on a listening socket.
+    pub fn accept(&self, fd: &SocketFd) -> Result<SocketFd> {
+        todo!()
+    }
+
+    /// Send data over a connected socket.
+    pub fn send(&self, fd: &SocketFd, buf: &[u8], flags: SendFlags) -> Result<usize> {
+        todo!()
+    }
+
+    /// Receive data from a connected socket.
+    pub fn receive(&self, fd: &SocketFd, buf: &mut [u8], flags: ReceiveFlags) -> Result<usize> {
+        todo!()
+    }
 }
 
 /// `AF_*` constants for use with [`Network::socket`]
@@ -93,4 +119,48 @@ pub struct Protocol {
     // TODO(jayb): Does this need to be public, or can we restrict by specifying an enum of values
     // we want to support/allow?
     pub protocol: NonZeroU32,
+}
+
+bitflags! {
+    /// Flags for the `receive` function.
+    pub struct ReceiveFlags: u32 {
+        /// `MSG_CMSG_CLOEXEC`: close-on-exec for the associated file descriptor
+        const CMSG_CLOEXEC = 0x40000000;
+        /// `MSG_DONTWAIT`: non-blocking operation
+        const DONTWAIT = 0x40;
+        /// `MSG_ERRQUEUE`: destination for error messages
+        const ERRQUEUE = 0x2000;
+        /// `MSG_OOB`: requests receipt of out-of-band data
+        const OOB = 0x1;
+        /// `MSG_PEEK`: requests to peek at incoming messages
+        const PEEK = 0x2;
+        /// `MSG_TRUNC`: truncate the message
+        const TRUNC = 0x20;
+        /// `MSG_WAITALL`: wait for the full amount of data
+        const WAITALL = 0x100;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags! {
+    /// Flags for the `send` function.
+    pub struct SendFlags: u32 {
+        /// `MSG_CONFIRM`: requests confirmation of the message delivery.
+        const CONFIRM = 0x800;
+        /// `MSG_DONTROUTE`: send the message directly to the interface, bypassing routing.
+        const DONTROUTE = 0x4;
+        /// `MSG_DONTWAIT`: non-blocking operation, do not wait for buffer space to become available.
+        const DONTWAIT = 0x40;
+        /// `MSG_EOR`: indicates the end of a record for message-oriented sockets.
+        const EOR = 0x80;
+        /// `MSG_MORE`: indicates that more data will follow.
+        const MORE = 0x8000;
+        /// `MSG_NOSIGNAL`: prevents the sending of SIGPIPE signals when writing to a socket that is closed.
+        const NOSIGNAL = 0x4000;
+        /// `MSG_OOB`: sends out-of-band data.
+        const OOB = 0x1;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
 }
