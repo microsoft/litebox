@@ -54,6 +54,36 @@ impl<Platform: platform::Provider> FileSystem<Platform> {
         fd.mark_as_closed();
         todo!()
     }
+
+    /// Read from a file descriptor into a buffer
+    pub fn read(&self, fd: &OwnedFd, buf: &mut [u8]) -> Result<usize> {
+        todo!()
+    }
+
+    /// Write from a buffer to a file descriptor
+    pub fn write(&self, fd: &OwnedFd, buf: &[u8]) -> Result<usize> {
+        todo!()
+    }
+
+    /// Change the permissions of a file
+    pub fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<()> {
+        todo!()
+    }
+
+    /// Unlink a file
+    pub fn unlink(&self, path: impl path::Arg) -> Result<()> {
+        todo!()
+    }
+
+    /// Create a new directory
+    pub fn mkdir(&self, path: impl path::Arg, mode: Mode) -> Result<()> {
+        todo!()
+    }
+
+    /// Remove a directory
+    pub fn rmdir(&self, path: impl path::Arg) -> Result<()> {
+        todo!()
+    }
 }
 
 bitflags! {
