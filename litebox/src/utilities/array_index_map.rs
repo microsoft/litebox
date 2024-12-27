@@ -22,7 +22,7 @@ pub(crate) struct ArrayIndexMap<T, const CAPACITY: usize> {
 /// It is important to use an [`Index`] only with the [`ArrayIndexMap`] that produced it; no checks
 /// are done at runtime to ensure this, and if you use an [`Index`] with the wrong [`ArrayIndexMap`]
 /// the results might be surprising.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Index {
     // Generation number. By using non-zero-u32 (rather than a `u32`), this restricts one less
     // generation per slot in the map _overall_, but allows for `Slot` to undergo niche-filling

@@ -7,6 +7,8 @@ edition = "2021"
 arrayvec = { version = "0.7.6", default-features = false, optional = true }
 bitflags = "2.6.0"
 either = { version = "1.13.0", default-features = false }
+hashbrown = "0.15.2"
+smallvec = "1.13.2"
 spin = { version = "0.9.8", default-features = false, optional = true }
 thiserror = { version = "2.0.6", default-features = false }
 

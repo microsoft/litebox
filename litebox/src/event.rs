@@ -1,18 +1,35 @@
 //! Events related functionality
 
+use hashbrown::HashMap;
+use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::{
     fd::{OwnedFd, RawFd},
     net::SocketFd,
-    platform,
+    platform::{self, RawMutex},
+    utilities::array_index_map::{ArrayIndexMap, Index},
 };
+
+use core::sync::atomic::Ordering::Relaxed;
+
+/// A maximum limit to the number of [`Waitable`]s that can be registered to an [`EventManager`].
+///
+/// This is mostly an arbitrary limit that can be bumped up if necessary, at the cost of using extra
+/// memory in every [`EventManager`].
+pub const CONFIG_MAX_WAITABLES: usize = 128;
 
 /// The `EventManager` provides access to the ability to wait on events on files and sockets.
 ///
 /// A LiteBox `EventManager` is parametric in the platform it runs on.
 pub struct EventManager<Platform: platform::Provider> {
     platform: &'static Platform,
+    triggered_events: ArrayIndexMap<Platform::RawMutex, CONFIG_MAX_WAITABLES>,
+    // We use a `SmallVec` here to prevent unnecessary heap allocation for the common case of having
+    // only a small number of `Waitable`s on a single `RawFd`. The number beyond which a heap
+    // allocation occurs is a tradeoff between memory usage (wasted unused space) vs number of heap
+    // allocations. For now, the chosen number is picked purely based on *vibes*.
+    fd_to_indexes: HashMap<RawFd, SmallVec<[Index; 2]>>,
 }
 
 impl<Platform: platform::Provider> EventManager<Platform> {
@@ -22,7 +39,11 @@ impl<Platform: platform::Provider> EventManager<Platform> {
     /// and the created `EventManager` handle is expected to be shared across all usage over the
     /// system.
     pub fn new(platform: &'static Platform) -> Self {
-        Self { platform }
+        Self {
+            platform,
+            triggered_events: ArrayIndexMap::new(),
+            fd_to_indexes: HashMap::new(),
+        }
     }
 }
 
@@ -32,14 +53,30 @@ impl<Platform: platform::Provider> EventManager<Platform> {
     /// Returns a [`Waitable`] that supports a `wait` method to wait until the registered conditions
     /// are satisfied.
     #[must_use]
-    pub fn register<'b>(&self, waitable_builder: &'b WaitableBuilder) -> Waitable<'b> {
-        todo!()
+    pub fn register<'b>(&mut self, builder: &'b WaitableBuilder) -> Waitable<'b> {
+        let rm = self.platform.new_raw_mutex();
+        rm.underlying_atomic()
+            .store(Events::empty().bits(), Relaxed);
+        let index = self.triggered_events.insert(rm);
+        self.fd_to_indexes
+            .entry(builder.raw_fd)
+            .or_default()
+            .push(index);
+        Waitable { builder, index }
     }
 
     /// Release registration. Note that this is a private function that is automatically invoked
     /// when a [`Waitable`] is dropped.
-    fn unregister(&self, waitable: &Waitable<'_>) {
-        todo!()
+    fn unregister(&mut self, waitable: &Waitable<'_>) {
+        self.triggered_events.remove(waitable.index).unwrap();
+        let idxs = self
+            .fd_to_indexes
+            .get_mut(&waitable.builder.raw_fd)
+            .unwrap();
+        idxs.swap_remove(idxs.iter().position(|&idx| idx == waitable.index).unwrap());
+        if idxs.is_empty() {
+            self.fd_to_indexes.remove(&waitable.builder.raw_fd);
+        }
     }
 }
 
@@ -57,6 +94,8 @@ pub struct Waitable<'b> {
     // An immutable reference to the builder prevents modification of the choice of events or such
     // until de-registered by dropping.
     builder: &'b WaitableBuilder,
+    // An index into the `triggered_events`
+    index: Index,
 }
 
 impl Waitable<'_> {
