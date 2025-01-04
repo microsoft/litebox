@@ -148,7 +148,7 @@ impl<Platform: platform::IPInterfaceProvider + platform::TimeProvider + 'static>
 
     #[expect(clippy::unnecessary_wraps)]
     fn close(&mut self, fd: SocketFd) -> Result<(), NetError> {
-        let socket_handle = core::mem::take(&mut self.handles[fd.as_usize()]).unwrap();
+        let mut socket_handle = core::mem::take(&mut self.handles[fd.as_usize()]).unwrap();
         let socket = self.socket_set.remove(socket_handle.handle);
         match socket {
             smoltcp::socket::Socket::Raw(_) | smoltcp::socket::Socket::Icmp(_) => {
@@ -158,6 +158,9 @@ impl<Platform: platform::IPInterfaceProvider + platform::TimeProvider + 'static>
                 socket.close();
             }
             smoltcp::socket::Socket::Tcp(mut socket) => {
+                if let Some(local_port) = socket_handle.local_port.take() {
+                    self.local_port_allocator.deallocate(local_port);
+                }
                 // TODO: Should we `.close()` or should we `.abort()`?
                 socket.abort();
             }
