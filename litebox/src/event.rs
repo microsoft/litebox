@@ -29,8 +29,8 @@ pub const CONFIG_MAX_WAITABLES: usize = 128;
 /// The `EventManager` provides access to the ability to wait on events on files and sockets.
 ///
 /// A LiteBox `EventManager` is parametric in the platform it runs on.
-pub struct EventManager<Platform: platform::RawMutexProvider + 'static> {
-    platform: &'static Platform,
+pub struct EventManager<'platform, Platform: platform::RawMutexProvider> {
+    platform: &'platform Platform,
     triggered_events: ArrayIndexMap<Arc<Platform::RawMutex>, CONFIG_MAX_WAITABLES>,
     // We use a `SmallVec` here to prevent unnecessary heap allocation for the common case of having
     // only a small number of `Waitable`s on a single `RawFd`. The number beyond which a heap
@@ -39,13 +39,13 @@ pub struct EventManager<Platform: platform::RawMutexProvider + 'static> {
     fd_to_indexes: HashMap<InternalFd, SmallVec<[Index; 2]>>,
 }
 
-impl<Platform: platform::RawMutexProvider + 'static> EventManager<Platform> {
+impl<'platform, Platform: platform::RawMutexProvider> EventManager<'platform, Platform> {
     /// Construct a new `EventManager` instance
     ///
     /// This function is expected to only be invoked once per platform, as an initialization step,
     /// and the created `EventManager` handle is expected to be shared across all usage over the
     /// system.
-    pub fn new(platform: &'static Platform) -> Self {
+    pub fn new(platform: &'platform Platform) -> Self {
         Self {
             platform,
             triggered_events: ArrayIndexMap::new(),
@@ -54,7 +54,7 @@ impl<Platform: platform::RawMutexProvider + 'static> EventManager<Platform> {
     }
 }
 
-impl<Platform: platform::RawMutexProvider + 'static> EventManager<Platform> {
+impl<Platform: platform::RawMutexProvider> EventManager<'_, Platform> {
     /// Register interest in waiting on events.
     ///
     /// Returns a [`Waitable`] that supports a `wait` method to wait until the registered conditions
