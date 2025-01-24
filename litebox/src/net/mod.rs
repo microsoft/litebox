@@ -50,7 +50,7 @@ const MAX_PACKET_COUNT: usize = 32;
 /// An important decision that must be made by a user of a `Network` is decided by
 /// [`set_platform_interaction`](Self::set_platform_interaction), whose docs explain this further.
 ///
-/// A user of `Network` who does not care about [events](crate::events) can choose to have a trivial
+/// A user of `Network` who does not care about [events](crate::event) can choose to have a trivial
 /// provider for [`platform::RawMutexProvider`] that panics on all calls except `new_raw_mutex` and
 /// `underlying_atomic`.
 pub struct Network<'platform, Platform>
