@@ -1,0 +1,3 @@
+[submodule "litebox-platform-linux-kernel/sandbox_driver"]
+	path = litebox-platform-linux-kernel/sandbox_driver
+	url = https://github.com/MSRSSP/sandbox_driver.git

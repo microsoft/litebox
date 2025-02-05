@@ -1,0 +1,13 @@
+[package]
+name = "litebox-platform-linux-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+platform_snp = []
+
+[build-dependencies]
+bindgen = "0.71.0"
+
+[dependencies]
+litebox = { path = "../litebox/", version = "0.1.0" }
