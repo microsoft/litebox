@@ -3,6 +3,7 @@ use core::arch::asm;
 use thiserror::Error;
 
 mod hypercall;
+pub mod linux;
 #[cfg(feature = "platform_snp")]
 pub mod snp;
 

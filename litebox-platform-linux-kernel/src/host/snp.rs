@@ -1,4 +1,12 @@
-use super::{hypercall::HyperVInterface, HostInterface, HostRequest, HyperCallArgs};
+use core::sync::atomic::AtomicU32;
+
+use thiserror::Error;
+
+use super::{
+    hypercall::HyperVInterface,
+    linux::{pt_regs, Timespec},
+    HostInterface, HostRequest, HyperCallArgs,
+};
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
@@ -7,7 +15,7 @@ type ArgsArray = [u64; MAX_ARGS_SIZE];
 
 impl SnpVmplRequestArgs {
     #[inline]
-    pub fn new_request(code: u32, size: u32, args: ArgsArray) -> Self {
+    fn new_request(code: u32, size: u32, args: ArgsArray) -> Self {
         SnpVmplRequestArgs {
             code,
             status: SNP_VMPL_REQ_INCOMPLETE,
@@ -18,12 +26,12 @@ impl SnpVmplRequestArgs {
         }
     }
 
-    pub fn new_exit_request() -> Self {
+    fn new_exit_request() -> Self {
         SnpVmplRequestArgs::new_request(SNP_VMPL_EXIT_REQ, 0, ArgsArray::default())
     }
 }
 
-impl<'a> From<HostRequest<'a, OtherHostRequest>> for SnpVmplRequestArgs {
+impl<'a> From<HostRequest<'a, OtherHostRequest<'a>>> for SnpVmplRequestArgs {
     fn from(request: HostRequest<'a, OtherHostRequest>) -> Self {
         match request {
             HostRequest::Alloc { order } => {
@@ -52,6 +60,11 @@ impl<'a> From<HostRequest<'a, OtherHostRequest>> for SnpVmplRequestArgs {
                 OtherHostRequest::AllocFutexPage => {
                     SnpVmplRequestArgs::new_request(SNP_VMPL_ALLOC_FUTEX_REQ, 0, [0, 0, 0, 0, 0, 0])
                 }
+                OtherHostRequest::Syscall { num, pt_regs } => SnpVmplRequestArgs::new_request(
+                    SNP_VMPL_SYSCALL_REQ,
+                    2,
+                    [pt_regs as *mut _ as u64, num, 0, 0, 0, 0],
+                ),
                 #[cfg(debug_assertions)]
                 OtherHostRequest::DumpStack { rsp, len } => SnpVmplRequestArgs::new_request(
                     SNP_VMPL_PRINT_REQ,
@@ -62,7 +75,14 @@ impl<'a> From<HostRequest<'a, OtherHostRequest>> for SnpVmplRequestArgs {
                 OtherHostRequest::DumpRegs(regs) => SnpVmplRequestArgs::new_request(
                     SNP_VMPL_PRINT_REQ,
                     2,
-                    [SNP_VMPL_PRINT_PT_REGS as u64, regs, 0, 0, 0, 0],
+                    [
+                        SNP_VMPL_PRINT_PT_REGS as u64,
+                        regs as *const _ as u64,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
                 ),
             },
         }
@@ -73,10 +93,12 @@ const PAGE_SIZE: u64 = 4096;
 /// Max physical address
 const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 
-const EAGAIN: i64 = 11;
 const EINTR: i64 = 4;
+const EAGAIN: i64 = 11;
+const ETIMEDOUT: i64 = 110;
+const ERESTARTSYS: i64 = 512;
 
-impl HyperCallArgs<'_, OtherHostRequest> for SnpVmplRequestArgs {
+impl<'a> HyperCallArgs<'a, OtherHostRequest<'a>> for SnpVmplRequestArgs {
     fn parse_alloc_result(&self, order: u64, _r: ()) -> Result<u64, super::AllocError> {
         let ret = self.ret;
         if ret == 0 {
@@ -120,8 +142,14 @@ impl HyperCallArgs<'_, OtherHostRequest> for SnpVmplRequestArgs {
     }
 }
 
-enum OtherHostRequest {
+enum OtherHostRequest<'a> {
     AllocFutexPage,
+
+    /// Syscalls forwarded to the host
+    Syscall {
+        num: u64,
+        pt_regs: &'a mut pt_regs,
+    },
 
     /// Special hypercall for debugging purposes
     #[cfg(debug_assertions)]
@@ -130,12 +158,12 @@ enum OtherHostRequest {
         len: u64,
     },
     #[cfg(debug_assertions)]
-    DumpRegs(u64),
+    DumpRegs(&'a pt_regs),
 }
 
 pub struct SnpInterface;
 
-impl HostInterface<'_, SnpVmplRequestArgs, OtherHostRequest> for SnpInterface {
+impl<'a> HostInterface<'a, SnpVmplRequestArgs, OtherHostRequest<'a>> for SnpInterface {
     type HyperCallInterface = HyperVInterface;
 
     fn post_check(req: &SnpVmplRequestArgs, _res: ()) {
@@ -146,6 +174,87 @@ impl HostInterface<'_, SnpVmplRequestArgs, OtherHostRequest> for SnpInterface {
     }
 }
 
+const NR_SYSCALL_FUTEX: u64 = 202;
+
+#[derive(Error, Debug)]
+pub enum SysFutexError {
+    #[error("Would block")]
+    WouldBlock,
+    #[error("Interrupted")]
+    Interrupted,
+    #[error("Timeout")]
+    Timeout,
+}
+
+macro_rules! sys_forward_0 {
+    ($num:expr, $regs:ident) => {{
+        let orig_rax = $regs.rax;
+        let ret = Self::syscall($num, $regs);
+        $regs.rax = orig_rax;
+        ret
+    }};
+}
+
+macro_rules! sys_forward_1 {
+    ($num:expr, $regs:ident, $arg0:expr) => {{
+        let orig_rdi = $regs.rdi;
+        $regs.rdi = $arg0;
+        let ret = sys_forward_0!($num, $regs);
+        $regs.rdi = orig_rdi;
+        ret
+    }};
+}
+
+macro_rules! sys_forward_2 {
+    ($num:expr, $regs:ident, $arg0:expr, $arg1:expr) => {{
+        let orig_rsi = $regs.rsi;
+        $regs.rsi = $arg1;
+        let ret = sys_forward_1!($num, $regs, $arg0);
+        $regs.rsi = orig_rsi;
+        ret
+    }};
+}
+
+macro_rules! sys_forward_3 {
+    ($num:expr, $regs:ident, $arg0:expr, $arg1:expr, $arg2:expr) => {{
+        let orig_rdx = $regs.rdx;
+        $regs.rdx = $arg2;
+        let ret = sys_forward_2!($num, $regs, $arg0, $arg1);
+        $regs.rdx = orig_rdx;
+        ret
+    }};
+}
+
+macro_rules! sys_forward_4 {
+    ($num:expr, $regs:ident, $arg0:expr, $arg1:expr, $arg2:expr, $arg3:expr) => {{
+        let orig_r10 = $regs.r10;
+        $regs.r10 = $arg3;
+        let ret = sys_forward_3!($num, $regs, $arg0, $arg1, $arg2);
+        $regs.r10 = orig_r10;
+        ret
+    }};
+}
+
+macro_rules! sys_forward_5 {
+    ($num:expr, $regs:ident, $arg0:expr, $arg1:expr, $arg2:expr, $arg3:expr, $arg4:expr) => {{
+        let orig_r8 = $regs.r8;
+        $regs.r8 = $arg4;
+        let ret = sys_forward_4!($num, $regs, $arg0, $arg1, $arg2, $arg3);
+        $regs.r8 = orig_r8;
+        ret
+    }};
+}
+
+macro_rules! sys_forward_6 {
+    ($num:expr, $regs:ident, $arg0:expr, $arg1:expr, $arg2:expr, $arg3:expr, $arg4:expr, $arg5:expr) => {{
+        let orig_r9 = $regs.r9;
+        $regs.r9 = $arg5;
+        let ret = sys_forward_5!($num, $regs, $arg0, $arg1, $arg2, $arg3, $arg4);
+        $regs.r9 = orig_r9;
+        ret
+    }};
+}
+
 impl SnpInterface {
     pub fn alloc_futex_page() -> Result<u64, super::AllocError> {
         let req = &mut HostRequest::Other(OtherHostRequest::AllocFutexPage).into();
@@ -153,11 +262,59 @@ impl SnpInterface {
         req.parse_alloc_result(0, ())
     }
 
+    #[inline]
+    fn syscall(num: u64, pt_regs: &mut pt_regs) -> i64 {
+        let req = &mut HostRequest::Other(OtherHostRequest::Syscall { num, pt_regs }).into();
+        Self::call(req);
+        req.ret as i64
+    }
+
+    pub fn sys_futex(
+        pt_regs: &mut pt_regs,
+        uaddr: Option<*const AtomicU32>,
+        futex_op: i32,
+        val: u32,
+        timeout: Option<*const Timespec>,
+        uaddr2: Option<*const AtomicU32>,
+        val3: u32,
+    ) -> Result<usize, SysFutexError> {
+        let ret = sys_forward_6!(
+            NR_SYSCALL_FUTEX,
+            pt_regs,
+            match uaddr {
+                Some(uaddr) => uaddr as _,
+                None => 0,
+            },
+            futex_op as _,
+            val as _,
+            match timeout {
+                Some(timeout) => timeout as _,
+                None => 0,
+            },
+            match uaddr2 {
+                Some(uaddr2) => uaddr2 as _,
+                None => 0,
+            },
+            val3 as _
+        );
+
+        if ret < 0 {
+            match ret.abs() {
+                EAGAIN => Err(SysFutexError::WouldBlock),
+                EINTR | ERESTARTSYS => Err(SysFutexError::Interrupted),
+                ETIMEDOUT => Err(SysFutexError::Timeout),
+                _ => panic!("Unknown error: {}", ret),
+            }
+        } else {
+            Ok(ret as usize)
+        }
+    }
+
     pub fn dump_stack(rsp: u64) {
         Self::call(&mut HostRequest::Other(OtherHostRequest::DumpStack { rsp, len: 512 }).into())
     }
 
-    pub fn dump_pt_regs(regs: u64) {
+    pub fn dump_pt_regs(regs: &pt_regs) {
         Self::call(&mut HostRequest::Other(OtherHostRequest::DumpRegs(regs)).into())
     }
 }
