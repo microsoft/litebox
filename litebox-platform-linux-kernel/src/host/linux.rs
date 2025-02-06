@@ -41,38 +41,6 @@ pub struct pt_regs {
     /* top of stack page */
 }
 
-/// Registers used for syscall arguments
-pub struct SyscallRegs {
-    pub rdi: u64,
-    pub rsi: u64,
-    pub rdx: u64,
-    pub r10: u64,
-    pub r8: u64,
-    pub r9: u64,
-}
-
-impl pt_regs {
-    pub fn save_syscall_regs(&self) -> SyscallRegs {
-        SyscallRegs {
-            rdi: self.rdi,
-            rsi: self.rsi,
-            rdx: self.rdx,
-            r10: self.r10,
-            r8: self.r8,
-            r9: self.r9,
-        }
-    }
-
-    pub fn restore_syscall_regs(&mut self, regs: SyscallRegs) {
-        self.rdi = regs.rdi;
-        self.rsi = regs.rsi;
-        self.rdx = regs.rdx;
-        self.r10 = regs.r10;
-        self.r8 = regs.r8;
-        self.r9 = regs.r9;
-    }
-}
-
 /// timespec from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/include/uapi/linux/time.h#L11)
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]

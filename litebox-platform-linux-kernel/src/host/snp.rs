@@ -1,4 +1,4 @@
-use core::sync::atomic::AtomicU32;
+//! Host interface for SEV-SNP platform
 
 use thiserror::Error;
 
@@ -269,13 +269,17 @@ impl SnpInterface {
         req.ret as i64
     }
 
+    /// Call futex syscall
+    ///
+    /// uaddr and uaddr2 are pointers to the underlying integer obtained from
+    /// e.g., [`core::sync::atomic::AtomicU32::as_ptr`].
     pub fn sys_futex(
         pt_regs: &mut pt_regs,
-        uaddr: Option<*const AtomicU32>,
+        uaddr: Option<*const u32>,
         futex_op: i32,
         val: u32,
         timeout: Option<*const Timespec>,
-        uaddr2: Option<*const AtomicU32>,
+        uaddr2: Option<*const u32>,
         val3: u32,
     ) -> Result<usize, SysFutexError> {
         let ret = sys_forward_6!(
