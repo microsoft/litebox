@@ -76,15 +76,17 @@ impl Descriptors {
             return None;
         }
         let fd = fd as usize;
-        self.descriptors[fd].take()
+        self.descriptors.get_mut(fd)?.take()
     }
     fn remove_file(&mut self, fd: u32) -> Option<litebox::fd::FileFd> {
         if fd >= (2 << 30) {
             return None;
         }
         let fd = fd as usize;
-        if let Some(Descriptor::File(file_fd)) =
-            self.descriptors[fd].take_if(|v| matches!(v, Descriptor::File(_)))
+        if let Some(Descriptor::File(file_fd)) = self
+            .descriptors
+            .get_mut(fd)?
+            .take_if(|v| matches!(v, Descriptor::File(_)))
         {
             Some(file_fd)
         } else {
@@ -96,8 +98,10 @@ impl Descriptors {
             return None;
         }
         let fd = fd as usize;
-        if let Some(Descriptor::Socket(socket_fd)) =
-            self.descriptors[fd].take_if(|v| matches!(v, Descriptor::Socket(_)))
+        if let Some(Descriptor::Socket(socket_fd)) = self
+            .descriptors
+            .get_mut(fd)?
+            .take_if(|v| matches!(v, Descriptor::Socket(_)))
         {
             Some(socket_fd)
         } else {
@@ -108,7 +112,7 @@ impl Descriptors {
         if fd >= (2 << 30) {
             return None;
         }
-        match self.descriptors[fd as usize].as_ref()? {
+        match self.descriptors.get(fd as usize)?.as_ref()? {
             Descriptor::File(file_fd) => Some(file_fd),
             Descriptor::Socket(_) => None,
         }
@@ -117,7 +121,7 @@ impl Descriptors {
         if fd >= (2 << 30) {
             return None;
         }
-        match self.descriptors[fd as usize].as_mut()? {
+        match self.descriptors.get_mut(fd as usize)?.as_mut()? {
             Descriptor::File(file_fd) => Some(file_fd),
             Descriptor::Socket(_) => None,
         }
@@ -126,7 +130,7 @@ impl Descriptors {
         if fd >= (2 << 30) {
             return None;
         }
-        match self.descriptors[fd as usize].as_ref()? {
+        match self.descriptors.get(fd as usize)?.as_ref()? {
             Descriptor::File(_) => None,
             Descriptor::Socket(socket_fd) => Some(socket_fd),
         }
@@ -135,7 +139,7 @@ impl Descriptors {
         if fd >= (2 << 30) {
             return None;
         }
-        match self.descriptors[fd as usize].as_mut()? {
+        match self.descriptors.get_mut(fd as usize)?.as_mut()? {
             Descriptor::File(_) => None,
             Descriptor::Socket(socket_fd) => Some(socket_fd),
         }
