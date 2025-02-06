@@ -73,6 +73,9 @@ const PAGE_SIZE: u64 = 4096;
 /// Max physical address
 const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 
+const EAGAIN: i64 = 11;
+const EINTR: i64 = 4;
+
 impl HyperCallArgs<'_, OtherHostRequest> for SnpVmplRequestArgs {
     fn parse_alloc_result(&self, order: u64, _r: ()) -> Result<u64, super::AllocError> {
         let ret = self.ret;
@@ -93,9 +96,9 @@ impl HyperCallArgs<'_, OtherHostRequest> for SnpVmplRequestArgs {
     fn parse_recv_result(&self, _r: ()) -> Result<usize, super::NetworkError> {
         let ret = self.ret as i64;
         if ret < 0 {
-            match ret.abs() as i32 {
-                libc::EAGAIN => Err(super::NetworkError::WouldBlock),
-                libc::EINTR => Err(super::NetworkError::Interrupted),
+            match ret.abs() {
+                EAGAIN => Err(super::NetworkError::WouldBlock),
+                EINTR => Err(super::NetworkError::Interrupted),
                 _ => panic!("Unknown error: {}", ret),
             }
         } else {
@@ -106,9 +109,9 @@ impl HyperCallArgs<'_, OtherHostRequest> for SnpVmplRequestArgs {
     fn parse_send_result(&self, _r: ()) -> Result<usize, super::NetworkError> {
         let ret = self.ret as i64;
         if ret <= 0 {
-            match ret.abs() as i32 {
-                0 | libc::EAGAIN => Err(super::NetworkError::WouldBlock),
-                libc::EINTR => Err(super::NetworkError::Interrupted),
+            match ret.abs() {
+                0 | EAGAIN => Err(super::NetworkError::WouldBlock),
+                EINTR => Err(super::NetworkError::Interrupted),
                 _ => panic!("Unknown error: {}", ret),
             }
         } else {
