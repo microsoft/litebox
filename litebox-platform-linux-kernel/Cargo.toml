@@ -11,3 +11,4 @@ bindgen = "0.71.0"
 
 [dependencies]
 litebox = { path = "../litebox/", version = "0.1.0" }
+thiserror = { version = "2.0.6", default-features = false }

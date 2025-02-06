@@ -1,4 +1,4 @@
-use super::{hypercall::HyperVInterface, HostInterface, HostRequest};
+use super::{hypercall::HyperVInterface, HostInterface, HostRequest, HyperCallArgs};
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
@@ -23,25 +23,8 @@ impl SnpVmplRequestArgs {
     }
 }
 
-enum OtherHostRequest {
-    AllocFutexPage,
-
-    /// Special hypercall for debugging purposes
-    #[cfg(debug_assertions)]
-    DumpStack {
-        rsp: u64,
-        len: u64,
-    },
-    #[cfg(debug_assertions)]
-    DumpRegs(u64),
-}
-
-pub struct SnpInterface;
-
-impl HostInterface<SnpVmplRequestArgs, OtherHostRequest> for SnpInterface {
-    type HyperCallInterface = HyperVInterface;
-
-    fn get_request(request: HostRequest<OtherHostRequest>) -> SnpVmplRequestArgs {
+impl From<HostRequest<OtherHostRequest>> for SnpVmplRequestArgs {
+    fn from(request: HostRequest<OtherHostRequest>) -> Self {
         match request {
             HostRequest::Alloc { order } => {
                 SnpVmplRequestArgs::new_request(SNP_VMPL_ALLOC_REQ, 1, [order, 0, 0, 0, 0, 0])
@@ -76,19 +59,61 @@ impl HostInterface<SnpVmplRequestArgs, OtherHostRequest> for SnpInterface {
     }
 }
 
+const PAGE_SIZE: u64 = 4096;
+/// Max physical address
+const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
+
+impl HyperCallArgs<OtherHostRequest> for SnpVmplRequestArgs {
+    fn parse_alloc_result(&self, order: u64, _r: ()) -> Result<u64, super::AllocError> {
+        let ret = self.ret;
+        if ret == 0 {
+            Err(super::AllocError::OutOfMemory)
+        } else if ret % (PAGE_SIZE << order) != 0 {
+            Err(super::AllocError::InvalidOutput)
+        } else if ret > PHYS_ADDR_MAX - (PAGE_SIZE << order) {
+            Err(super::AllocError::InvalidOutput)
+        } else {
+            Ok(self.ret)
+        }
+    }
+}
+
+enum OtherHostRequest {
+    AllocFutexPage,
+
+    /// Special hypercall for debugging purposes
+    #[cfg(debug_assertions)]
+    DumpStack {
+        rsp: u64,
+        len: u64,
+    },
+    #[cfg(debug_assertions)]
+    DumpRegs(u64),
+}
+
+pub struct SnpInterface;
+
+impl HostInterface<SnpVmplRequestArgs, OtherHostRequest> for SnpInterface {
+    type HyperCallInterface = HyperVInterface;
+
+    fn post_check(req: &SnpVmplRequestArgs, _res: ()) {
+        if req.status != SNP_VMPL_REQ_SUCCESS {
+            let status = req.status;
+            panic!("Request failed with status: {}", status);
+        }
+    }
+}
+
 impl SnpInterface {
     pub fn alloc_futex_page() {
-        Self::call(HostRequest::Other(OtherHostRequest::AllocFutexPage))
+        Self::call(&mut HostRequest::Other(OtherHostRequest::AllocFutexPage).into())
     }
 
     pub fn dump_stack(rsp: u64) {
-        Self::call(HostRequest::Other(OtherHostRequest::DumpStack {
-            rsp,
-            len: 512,
-        }))
+        Self::call(&mut HostRequest::Other(OtherHostRequest::DumpStack { rsp, len: 512 }).into())
     }
 
     pub fn dump_pt_regs(regs: u64) {
-        Self::call(HostRequest::Other(OtherHostRequest::DumpRegs(regs)))
+        Self::call(&mut HostRequest::Other(OtherHostRequest::DumpRegs(regs)).into())
     }
 }
