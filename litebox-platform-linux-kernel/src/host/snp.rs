@@ -23,12 +23,20 @@ impl SnpVmplRequestArgs {
     }
 }
 
+enum OtherHostRequest {
+    /// Special hypercall for debugging purposes
+    #[cfg(debug_assertions)]
+    DumpStack { rsp: u64, len: u64 },
+    #[cfg(debug_assertions)]
+    DumpRegs(u64),
+}
+
 pub struct SnpInterface;
 
-impl HostInterface<SnpVmplRequestArgs> for SnpInterface {
+impl HostInterface<SnpVmplRequestArgs, OtherHostRequest> for SnpInterface {
     type HyperCallInterface = HyperVInterface;
 
-    fn get_request(request: HostRequest) -> SnpVmplRequestArgs {
+    fn get_request(request: HostRequest<OtherHostRequest>) -> SnpVmplRequestArgs {
         match request {
             HostRequest::Exit => SnpVmplRequestArgs::new_exit_request(),
             HostRequest::Terminate {
@@ -39,6 +47,33 @@ impl HostInterface<SnpVmplRequestArgs> for SnpInterface {
                 2,
                 [reason_set, reason_code, 0, 0, 0, 0],
             ),
+            HostRequest::Other(other) => match other {
+                #[cfg(debug_assertions)]
+                OtherHostRequest::DumpStack { rsp, len } => SnpVmplRequestArgs::new_request(
+                    SNP_VMPL_PRINT_REQ,
+                    3,
+                    [SNP_VMPL_PRINT_STACK as u64, rsp, len, 0, 0, 0],
+                ),
+                #[cfg(debug_assertions)]
+                OtherHostRequest::DumpRegs(regs) => SnpVmplRequestArgs::new_request(
+                    SNP_VMPL_PRINT_REQ,
+                    2,
+                    [SNP_VMPL_PRINT_PT_REGS as u64, regs, 0, 0, 0, 0],
+                ),
+            },
         }
+    }
+}
+
+impl SnpInterface {
+    pub fn dump_stack(rsp: u64) {
+        Self::call(HostRequest::Other(OtherHostRequest::DumpStack {
+            rsp,
+            len: 512,
+        }))
+    }
+
+    pub fn dump_pt_regs(regs: u64) {
+        Self::call(HostRequest::Other(OtherHostRequest::DumpRegs(regs)))
     }
 }

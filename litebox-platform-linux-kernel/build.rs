@@ -1,6 +1,7 @@
 #[cfg(feature = "platform_snp")]
 fn build_binding_from_sandbox_driver() {
     let bindings = bindgen::Builder::default()
+        .clang_arg("--target=x86_64-unknown-none")
         // The input header we would like to generate
         // bindings for.
         .header("wrapper.h")
@@ -10,6 +11,7 @@ fn build_binding_from_sandbox_driver() {
         .allowlist_type("SnpVmplRequestArgs")
         .allowlist_var("SNP_VMPL_.+")
         .use_core()
+        .formatter(bindgen::Formatter::Rustfmt)
         // Finish the builder and generate the bindings.
         .generate()
         // Unwrap the Result and panic on failure.
