@@ -8,6 +8,10 @@ pub mod snp;
 
 pub trait HyperCallArgs<'a, Other, R = ()>: From<HostRequest<'a, Other>> {
     fn parse_alloc_result(&self, order: u64, r: R) -> Result<u64, AllocError>;
+
+    fn parse_recv_result(&self, r: R) -> Result<usize, NetworkError>;
+
+    fn parse_send_result(&self, r: R) -> Result<usize, NetworkError>;
 }
 
 pub trait HyperCallInterface<'a, InOut: HyperCallArgs<'a, Other, R>, Other, R = ()> {
@@ -27,10 +31,18 @@ pub enum HostRequest<'a, Other> {
 pub enum AllocError {
     #[error("Out of memory")]
     OutOfMemory,
-    #[error("Invalid input")]
-    InvalidInput,
-    #[error("Invalid output")]
-    InvalidOutput,
+    #[error("Invalid input {0}")]
+    InvalidInput(u64),
+    #[error("Invalid output {0}")]
+    InvalidOutput(u64),
+}
+
+#[derive(Error, Debug)]
+pub enum NetworkError {
+    #[error("Would block")]
+    WouldBlock,
+    #[error("Interrupted")]
+    Interrupted,
 }
 
 pub trait HostInterface<'a, InOut: HyperCallArgs<'a, Other, R>, Other = (), R: Copy = ()> {
@@ -48,6 +60,22 @@ pub trait HostInterface<'a, InOut: HyperCallArgs<'a, Other, R>, Other = (), R: C
         let req = &mut HostRequest::Alloc { order }.into();
         let r = Self::call(req);
         req.parse_alloc_result(order, r)
+    }
+
+    fn recv_packet(packet: &'a mut [u8]) -> Result<usize, NetworkError> {
+        let req = &mut HostRequest::RecvPacket(packet).into();
+        let r = Self::call(req);
+        req.parse_recv_result(r)
+    }
+
+    fn send_packet(packet: &'a [u8]) -> Result<usize, NetworkError> {
+        if packet.is_empty() {
+            return Ok(0);
+        }
+
+        let req = &mut HostRequest::SendPacket(packet).into();
+        let r = Self::call(req);
+        req.parse_send_result(r)
     }
 
     fn exit() {

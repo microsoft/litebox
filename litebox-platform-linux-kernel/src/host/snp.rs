@@ -77,12 +77,42 @@ impl HyperCallArgs<'_, OtherHostRequest> for SnpVmplRequestArgs {
     fn parse_alloc_result(&self, order: u64, _r: ()) -> Result<u64, super::AllocError> {
         let ret = self.ret;
         if ret == 0 {
-            Err(super::AllocError::OutOfMemory)
+            if order > SNP_VMPL_ALLOC_MAX_ORDER as u64 {
+                Err(super::AllocError::InvalidInput(order))
+            } else {
+                Err(super::AllocError::OutOfMemory)
+            }
         } else if ret % (PAGE_SIZE << order) != 0 || ret > PHYS_ADDR_MAX - (PAGE_SIZE << order) {
             // Address is not aligned or out of bounds
-            Err(super::AllocError::InvalidOutput)
+            Err(super::AllocError::InvalidOutput(ret))
         } else {
             Ok(self.ret)
+        }
+    }
+
+    fn parse_recv_result(&self, _r: ()) -> Result<usize, super::NetworkError> {
+        let ret = self.ret as i64;
+        if ret < 0 {
+            match ret.abs() as i32 {
+                libc::EAGAIN => Err(super::NetworkError::WouldBlock),
+                libc::EINTR => Err(super::NetworkError::Interrupted),
+                _ => panic!("Unknown error: {}", ret),
+            }
+        } else {
+            Ok(ret as usize)
+        }
+    }
+
+    fn parse_send_result(&self, _r: ()) -> Result<usize, super::NetworkError> {
+        let ret = self.ret as i64;
+        if ret <= 0 {
+            match ret.abs() as i32 {
+                0 | libc::EAGAIN => Err(super::NetworkError::WouldBlock),
+                libc::EINTR => Err(super::NetworkError::Interrupted),
+                _ => panic!("Unknown error: {}", ret),
+            }
+        } else {
+            Ok(ret as usize)
         }
     }
 }
