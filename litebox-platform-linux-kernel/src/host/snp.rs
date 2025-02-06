@@ -38,6 +38,9 @@ impl HostInterface<SnpVmplRequestArgs, OtherHostRequest> for SnpInterface {
 
     fn get_request(request: HostRequest<OtherHostRequest>) -> SnpVmplRequestArgs {
         match request {
+            HostRequest::Alloc { order } => {
+                SnpVmplRequestArgs::new_request(SNP_VMPL_ALLOC_REQ, 1, [order, 0, 0, 0, 0, 0])
+            }
             HostRequest::Exit => SnpVmplRequestArgs::new_exit_request(),
             HostRequest::Terminate {
                 reason_set,

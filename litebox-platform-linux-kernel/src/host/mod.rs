@@ -1,7 +1,7 @@
 use core::arch::asm;
 
 mod hypercall;
-// #[cfg(feature = "platform_snp")]
+#[cfg(feature = "platform_snp")]
 pub mod snp;
 
 pub trait HyperCallInterface<T> {
@@ -9,6 +9,7 @@ pub trait HyperCallInterface<T> {
 }
 
 pub enum HostRequest<Other> {
+    Alloc { order: u64 },
     Exit,
     Terminate { reason_set: u64, reason_code: u64 },
     Other(Other),
@@ -23,6 +24,10 @@ pub trait HostInterface<T, Other = ()> {
     fn call(request: HostRequest<Other>) {
         let mut req = Self::get_request(request);
         Self::HyperCallInterface::request(&mut req);
+    }
+
+    fn alloc(order: u64) {
+        Self::call(HostRequest::Alloc { order });
     }
 
     fn exit() {
