@@ -147,8 +147,10 @@ impl HostInterface<'_, SnpVmplRequestArgs, OtherHostRequest> for SnpInterface {
 }
 
 impl SnpInterface {
-    pub fn alloc_futex_page() {
-        Self::call(&mut HostRequest::Other(OtherHostRequest::AllocFutexPage).into())
+    pub fn alloc_futex_page() -> Result<u64, super::AllocError> {
+        let req = &mut HostRequest::Other(OtherHostRequest::AllocFutexPage).into();
+        Self::call(req);
+        req.parse_alloc_result(0, ())
     }
 
     pub fn dump_stack(rsp: u64) {
