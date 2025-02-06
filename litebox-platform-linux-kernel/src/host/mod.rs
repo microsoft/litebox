@@ -6,16 +6,18 @@ mod hypercall;
 #[cfg(feature = "platform_snp")]
 pub mod snp;
 
-pub trait HyperCallArgs<Other, R = ()>: From<HostRequest<Other>> {
+pub trait HyperCallArgs<'a, Other, R = ()>: From<HostRequest<'a, Other>> {
     fn parse_alloc_result(&self, order: u64, r: R) -> Result<u64, AllocError>;
 }
 
-pub trait HyperCallInterface<InOut: HyperCallArgs<Other, R>, Other, R = ()> {
+pub trait HyperCallInterface<'a, InOut: HyperCallArgs<'a, Other, R>, Other, R = ()> {
     fn request(arg: &mut InOut) -> R;
 }
 
-pub enum HostRequest<Other> {
+pub enum HostRequest<'a, Other> {
     Alloc { order: u64 },
+    RecvPacket(&'a mut [u8]),
+    SendPacket(&'a [u8]),
     Exit,
     Terminate { reason_set: u64, reason_code: u64 },
     Other(Other),
@@ -31,8 +33,8 @@ pub enum AllocError {
     InvalidOutput,
 }
 
-pub trait HostInterface<InOut: HyperCallArgs<Other, R>, Other = (), R: Copy = ()> {
-    type HyperCallInterface: HyperCallInterface<InOut, Other, R>;
+pub trait HostInterface<'a, InOut: HyperCallArgs<'a, Other, R>, Other = (), R: Copy = ()> {
+    type HyperCallInterface: HyperCallInterface<'a, InOut, Other, R>;
 
     fn call(req: &mut InOut) -> R {
         let r = Self::HyperCallInterface::request(req);

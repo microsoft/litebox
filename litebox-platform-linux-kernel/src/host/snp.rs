@@ -23,12 +23,22 @@ impl SnpVmplRequestArgs {
     }
 }
 
-impl From<HostRequest<OtherHostRequest>> for SnpVmplRequestArgs {
-    fn from(request: HostRequest<OtherHostRequest>) -> Self {
+impl<'a> From<HostRequest<'a, OtherHostRequest>> for SnpVmplRequestArgs {
+    fn from(request: HostRequest<'a, OtherHostRequest>) -> Self {
         match request {
             HostRequest::Alloc { order } => {
                 SnpVmplRequestArgs::new_request(SNP_VMPL_ALLOC_REQ, 1, [order, 0, 0, 0, 0, 0])
             }
+            HostRequest::RecvPacket(buf) => SnpVmplRequestArgs::new_request(
+                SNP_VMPL_TUN_READ_REQ,
+                3,
+                [buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0],
+            ),
+            HostRequest::SendPacket(data) => SnpVmplRequestArgs::new_request(
+                SNP_VMPL_TUN_WRITE_REQ,
+                3,
+                [data.as_ptr() as u64, data.len() as u64, 0, 0, 0, 0],
+            ),
             HostRequest::Exit => SnpVmplRequestArgs::new_exit_request(),
             HostRequest::Terminate {
                 reason_set,
@@ -63,14 +73,13 @@ const PAGE_SIZE: u64 = 4096;
 /// Max physical address
 const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 
-impl HyperCallArgs<OtherHostRequest> for SnpVmplRequestArgs {
+impl HyperCallArgs<'_, OtherHostRequest> for SnpVmplRequestArgs {
     fn parse_alloc_result(&self, order: u64, _r: ()) -> Result<u64, super::AllocError> {
         let ret = self.ret;
         if ret == 0 {
             Err(super::AllocError::OutOfMemory)
-        } else if ret % (PAGE_SIZE << order) != 0 {
-            Err(super::AllocError::InvalidOutput)
-        } else if ret > PHYS_ADDR_MAX - (PAGE_SIZE << order) {
+        } else if ret % (PAGE_SIZE << order) != 0 || ret > PHYS_ADDR_MAX - (PAGE_SIZE << order) {
+            // Address is not aligned or out of bounds
             Err(super::AllocError::InvalidOutput)
         } else {
             Ok(self.ret)
@@ -93,7 +102,7 @@ enum OtherHostRequest {
 
 pub struct SnpInterface;
 
-impl HostInterface<SnpVmplRequestArgs, OtherHostRequest> for SnpInterface {
+impl HostInterface<'_, SnpVmplRequestArgs, OtherHostRequest> for SnpInterface {
     type HyperCallInterface = HyperVInterface;
 
     fn post_check(req: &SnpVmplRequestArgs, _res: ()) {

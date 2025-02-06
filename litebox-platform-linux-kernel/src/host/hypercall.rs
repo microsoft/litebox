@@ -4,9 +4,9 @@ const HVCALL_VTL_CALL: u16 = 0x0011;
 
 pub struct HyperVInterface;
 
-impl<InOut, Other> super::HyperCallInterface<InOut, Other> for HyperVInterface
+impl<'a, InOut, Other> super::HyperCallInterface<'a, InOut, Other> for HyperVInterface
 where
-    InOut: super::HyperCallArgs<Other>,
+    InOut: super::HyperCallArgs<'a, Other>,
 {
     /// [VTL CALL](https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/vsm#vtl-call) via VMMCALL
     fn request(arg: &mut InOut) {
