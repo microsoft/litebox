@@ -24,9 +24,14 @@ impl SnpVmplRequestArgs {
 }
 
 enum OtherHostRequest {
+    AllocFutexPage,
+
     /// Special hypercall for debugging purposes
     #[cfg(debug_assertions)]
-    DumpStack { rsp: u64, len: u64 },
+    DumpStack {
+        rsp: u64,
+        len: u64,
+    },
     #[cfg(debug_assertions)]
     DumpRegs(u64),
 }
@@ -51,6 +56,9 @@ impl HostInterface<SnpVmplRequestArgs, OtherHostRequest> for SnpInterface {
                 [reason_set, reason_code, 0, 0, 0, 0],
             ),
             HostRequest::Other(other) => match other {
+                OtherHostRequest::AllocFutexPage => {
+                    SnpVmplRequestArgs::new_request(SNP_VMPL_ALLOC_FUTEX_REQ, 0, [0, 0, 0, 0, 0, 0])
+                }
                 #[cfg(debug_assertions)]
                 OtherHostRequest::DumpStack { rsp, len } => SnpVmplRequestArgs::new_request(
                     SNP_VMPL_PRINT_REQ,
@@ -69,6 +77,10 @@ impl HostInterface<SnpVmplRequestArgs, OtherHostRequest> for SnpInterface {
 }
 
 impl SnpInterface {
+    pub fn alloc_futex_page() {
+        Self::call(HostRequest::Other(OtherHostRequest::AllocFutexPage))
+    }
+
     pub fn dump_stack(rsp: u64) {
         Self::call(HostRequest::Other(OtherHostRequest::DumpStack {
             rsp,
