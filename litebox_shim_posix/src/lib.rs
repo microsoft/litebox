@@ -50,6 +50,7 @@ struct Descriptors {
 
 impl Descriptors {
     fn new() -> Self {
+        // TODO: Add stdin/stdout/stderr
         Self {
             descriptors: vec![],
         }
