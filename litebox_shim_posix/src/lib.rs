@@ -165,6 +165,9 @@ pub(crate) fn file_descriptors<'a>() -> &'a RwLock<'static, Platform, Descriptor
 ///
 /// `pathname` must point to a valid nul-terminated C string
 pub unsafe extern "C" fn open(pathname: *const i8, flags: u32, mode: u32) -> i32 {
+    if pathname.is_null() {
+        return -errno::constants::EFAULT;
+    }
     let path = unsafe { CStr::from_ptr(pathname) };
     match litebox_fs().open(
         path,
