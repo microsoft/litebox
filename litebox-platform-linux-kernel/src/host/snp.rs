@@ -1,12 +1,17 @@
 //! Host interface for SEV-SNP platform
 
-use thiserror::Error;
+use litebox::platform::{Punchthrough, PunchthroughError, PunchthroughToken};
+
+use crate::error;
 
 use super::{
     hypercall::HyperVInterface,
     linux::{pt_regs, Timespec},
-    HostInterface, HostRequest, HyperCallArgs,
+    HostPunchthrough, HostPunchthroughProvider, HostPunchthroughToken, HyperCallInterface,
 };
+
+use paste::paste;
+use seq_macro::seq;
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
@@ -26,29 +31,62 @@ impl SnpVmplRequestArgs {
         }
     }
 
-    fn new_exit_request() -> Self {
+    pub fn new_exit_request() -> Self {
         SnpVmplRequestArgs::new_request(SNP_VMPL_EXIT_REQ, 0, ArgsArray::default())
     }
 }
 
-impl<'a> From<HostRequest<'a, OtherHostRequest<'a>>> for SnpVmplRequestArgs {
-    fn from(request: HostRequest<'a, OtherHostRequest>) -> Self {
-        match request {
-            HostRequest::Alloc { order } => {
+/// Punchthrough for syscalls
+pub struct SyscallN<'a, const N: usize> {
+    num: u64,
+    pt_regs: &'a mut pt_regs,
+    args: [u64; N],
+    saved_args: [u64; N],
+    saved_rax: u64,
+}
+
+seq!(N in 0..=6 {
+    /// vsbox specific punchthrough
+    pub enum OtherPunchthrough<'a> {
+        /// Allocate one page for futex
+        AllocFutexPage,
+
+        /// Syscalls forwarded to the host
+        #(
+            Syscall~N(SyscallN<'a, N>),
+        )*
+
+        /// Special hypercall for debugging purposes
+        #[cfg(debug_assertions)]
+        DumpStack {
+            rsp: u64,
+            len: u64,
+        },
+        #[cfg(debug_assertions)]
+        DumpRegs(&'a pt_regs),
+    }
+});
+
+pub type SnpPunchthrough<'b> = HostPunchthrough<'b, OtherPunchthrough<'b>>;
+
+impl From<&SnpPunchthrough<'_>> for SnpVmplRequestArgs {
+    fn from(request: &SnpPunchthrough) -> Self {
+        match *request {
+            HostPunchthrough::Alloc { order } => {
                 SnpVmplRequestArgs::new_request(SNP_VMPL_ALLOC_REQ, 1, [order, 0, 0, 0, 0, 0])
             }
-            HostRequest::RecvPacket(buf) => SnpVmplRequestArgs::new_request(
+            HostPunchthrough::RecvPacket(ref buf) => SnpVmplRequestArgs::new_request(
                 SNP_VMPL_TUN_READ_REQ,
                 3,
-                [buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0],
+                [buf.as_ptr() as u64, buf.len() as u64, 0, 0, 0, 0],
             ),
-            HostRequest::SendPacket(data) => SnpVmplRequestArgs::new_request(
+            HostPunchthrough::SendPacket(data) => SnpVmplRequestArgs::new_request(
                 SNP_VMPL_TUN_WRITE_REQ,
                 3,
                 [data.as_ptr() as u64, data.len() as u64, 0, 0, 0, 0],
             ),
-            HostRequest::Exit => SnpVmplRequestArgs::new_exit_request(),
-            HostRequest::Terminate {
+            HostPunchthrough::Exit => SnpVmplRequestArgs::new_exit_request(),
+            HostPunchthrough::Terminate {
                 reason_set,
                 reason_code,
             } => SnpVmplRequestArgs::new_request(
@@ -56,35 +94,7 @@ impl<'a> From<HostRequest<'a, OtherHostRequest<'a>>> for SnpVmplRequestArgs {
                 2,
                 [reason_set, reason_code, 0, 0, 0, 0],
             ),
-            HostRequest::Other(other) => match other {
-                OtherHostRequest::AllocFutexPage => {
-                    SnpVmplRequestArgs::new_request(SNP_VMPL_ALLOC_FUTEX_REQ, 0, [0, 0, 0, 0, 0, 0])
-                }
-                OtherHostRequest::Syscall { num, pt_regs } => SnpVmplRequestArgs::new_request(
-                    SNP_VMPL_SYSCALL_REQ,
-                    2,
-                    [pt_regs as *mut _ as u64, num, 0, 0, 0, 0],
-                ),
-                #[cfg(debug_assertions)]
-                OtherHostRequest::DumpStack { rsp, len } => SnpVmplRequestArgs::new_request(
-                    SNP_VMPL_PRINT_REQ,
-                    3,
-                    [SNP_VMPL_PRINT_STACK as u64, rsp, len, 0, 0, 0],
-                ),
-                #[cfg(debug_assertions)]
-                OtherHostRequest::DumpRegs(regs) => SnpVmplRequestArgs::new_request(
-                    SNP_VMPL_PRINT_REQ,
-                    2,
-                    [
-                        SNP_VMPL_PRINT_PT_REGS as u64,
-                        regs as *const _ as u64,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ],
-                ),
-            },
+            HostPunchthrough::Other(ref other) => other.into(),
         }
     }
 }
@@ -93,198 +103,335 @@ const PAGE_SIZE: u64 = 4096;
 /// Max physical address
 const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 
-const EINTR: i64 = 4;
-const EAGAIN: i64 = 11;
-const ETIMEDOUT: i64 = 110;
-const ERESTARTSYS: i64 = 512;
-
-impl<'a> HyperCallArgs<'a, OtherHostRequest<'a>> for SnpVmplRequestArgs {
-    fn parse_alloc_result(&self, order: u64, _r: ()) -> Result<u64, super::AllocError> {
-        let ret = self.ret;
-        if ret == 0 {
-            if order > SNP_VMPL_ALLOC_MAX_ORDER as u64 {
-                Err(super::AllocError::InvalidInput(order))
-            } else {
-                Err(super::AllocError::OutOfMemory)
-            }
-        } else if ret % (PAGE_SIZE << order) != 0 || ret > PHYS_ADDR_MAX - (PAGE_SIZE << order) {
-            // Address is not aligned or out of bounds
-            Err(super::AllocError::InvalidOutput(ret))
-        } else {
-            Ok(self.ret)
-        }
+impl<'a, const N: usize> From<&SyscallN<'a, N>> for SnpVmplRequestArgs {
+    fn from(v: &SyscallN<'a, N>) -> Self {
+        SnpVmplRequestArgs::new_request(
+            SNP_VMPL_SYSCALL_REQ,
+            2,
+            [v.pt_regs as *const _ as u64, v.num, 0, 0, 0, 0],
+        )
     }
+}
 
-    fn parse_recv_result(&self, _r: ()) -> Result<usize, super::NetworkError> {
-        let ret = self.ret as i64;
-        if ret < 0 {
-            match ret.abs() {
-                EAGAIN => Err(super::NetworkError::WouldBlock),
-                EINTR => Err(super::NetworkError::Interrupted),
-                _ => panic!("Unknown error: {}", ret),
+impl From<&OtherPunchthrough<'_>> for SnpVmplRequestArgs {
+    fn from(req: &OtherPunchthrough) -> Self {
+        match *req {
+            OtherPunchthrough::AllocFutexPage => {
+                SnpVmplRequestArgs::new_request(SNP_VMPL_ALLOC_FUTEX_REQ, 0, [0, 0, 0, 0, 0, 0])
             }
-        } else {
-            Ok(ret as usize)
-        }
-    }
-
-    fn parse_send_result(&self, _r: ()) -> Result<usize, super::NetworkError> {
-        let ret = self.ret as i64;
-        if ret <= 0 {
-            match ret.abs() {
-                0 | EAGAIN => Err(super::NetworkError::WouldBlock),
-                EINTR => Err(super::NetworkError::Interrupted),
-                _ => panic!("Unknown error: {}", ret),
-            }
-        } else {
-            Ok(ret as usize)
+            #[cfg(debug_assertions)]
+            OtherPunchthrough::DumpStack { rsp, len } => SnpVmplRequestArgs::new_request(
+                SNP_VMPL_PRINT_REQ,
+                3,
+                [SNP_VMPL_PRINT_STACK as u64, rsp, len, 0, 0, 0],
+            ),
+            #[cfg(debug_assertions)]
+            OtherPunchthrough::DumpRegs(regs) => SnpVmplRequestArgs::new_request(
+                SNP_VMPL_PRINT_REQ,
+                2,
+                [
+                    SNP_VMPL_PRINT_PT_REGS as u64,
+                    regs as *const _ as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            OtherPunchthrough::Syscall0(ref v) => v.into(),
+            OtherPunchthrough::Syscall1(ref v) => v.into(),
+            OtherPunchthrough::Syscall2(ref v) => v.into(),
+            OtherPunchthrough::Syscall3(ref v) => v.into(),
+            OtherPunchthrough::Syscall4(ref v) => v.into(),
+            OtherPunchthrough::Syscall5(ref v) => v.into(),
+            OtherPunchthrough::Syscall6(ref v) => v.into(),
         }
     }
 }
 
-enum OtherHostRequest<'a> {
-    AllocFutexPage,
-
-    /// Syscalls forwarded to the host
-    Syscall {
-        num: u64,
-        pt_regs: &'a mut pt_regs,
-    },
-
-    /// Special hypercall for debugging purposes
-    #[cfg(debug_assertions)]
-    DumpStack {
-        rsp: u64,
-        len: u64,
-    },
-    #[cfg(debug_assertions)]
-    DumpRegs(&'a pt_regs),
-}
-
-pub struct SnpInterface;
-
-impl<'a> HostInterface<'a, SnpVmplRequestArgs, OtherHostRequest<'a>> for SnpInterface {
-    type HyperCallInterface = HyperVInterface;
-
-    fn post_check(req: &SnpVmplRequestArgs, _res: ()) {
-        if req.status != SNP_VMPL_REQ_SUCCESS {
-            let status = req.status;
-            panic!("Request failed with status: {}", status);
-        }
-    }
-}
-
+const NR_SYSCALL_KILL: u64 = 62;
 const NR_SYSCALL_FUTEX: u64 = 202;
 
-#[derive(Error, Debug)]
-pub enum SysFutexError {
-    #[error("Would block")]
-    WouldBlock,
-    #[error("Interrupted")]
-    Interrupted,
-    #[error("Timeout")]
-    Timeout,
-}
-
-macro_rules! sys_forward_0 {
-    ($num:expr, $regs:ident) => {{
-        let orig_rax = $regs.rax;
-        let ret = Self::syscall($num, $regs);
-        $regs.rax = orig_rax;
-        ret
+macro_rules! sys_forward {
+    ($self:ident, $num:expr, $regs:ident, $i:literal, $($args:expr),*) => {{
+        paste! {
+            let args = SyscallN::<$i> {
+                num: $num,
+                $regs,
+                args: [$($args),*],
+                saved_args: [0; $i],
+                saved_rax: 0,
+            };
+            let req = SnpPunchthrough::Other(OtherPunchthrough::[<Syscall$i>](args));
+            $self.get_punchthrough_token_for(req)
+        }
     }};
 }
 
-macro_rules! sys_forward_1 {
-    ($num:expr, $regs:ident, $arg0:expr) => {{
-        let orig_rdi = $regs.rdi;
-        $regs.rdi = $arg0;
-        let ret = sys_forward_0!($num, $regs);
-        $regs.rdi = orig_rdi;
-        ret
+macro_rules! sys_save_0 {
+    ($v:ident) => {{
+        $v.saved_rax = $v.pt_regs.rax;
+    }};
+}
+macro_rules! sys_restore_0 {
+    ($v:ident) => {{
+        $v.pt_regs.rax = $v.saved_rax;
     }};
 }
 
-macro_rules! sys_forward_2 {
-    ($num:expr, $regs:ident, $arg0:expr, $arg1:expr) => {{
-        let orig_rsi = $regs.rsi;
-        $regs.rsi = $arg1;
-        let ret = sys_forward_1!($num, $regs, $arg0);
-        $regs.rsi = orig_rsi;
-        ret
+macro_rules! sys_restore_1 {
+    ($v:ident) => {{
+        sys_restore_0!($v);
+        $v.pt_regs.rdi = $v.saved_args[0];
     }};
 }
 
-macro_rules! sys_forward_3 {
-    ($num:expr, $regs:ident, $arg0:expr, $arg1:expr, $arg2:expr) => {{
-        let orig_rdx = $regs.rdx;
-        $regs.rdx = $arg2;
-        let ret = sys_forward_2!($num, $regs, $arg0, $arg1);
-        $regs.rdx = orig_rdx;
-        ret
+macro_rules! sys_save_1 {
+    ($v:ident) => {{
+        sys_save_0!($v);
+        $v.saved_args[0] = $v.pt_regs.rdi;
+        $v.pt_regs.rdi = $v.args[0];
     }};
 }
 
-macro_rules! sys_forward_4 {
-    ($num:expr, $regs:ident, $arg0:expr, $arg1:expr, $arg2:expr, $arg3:expr) => {{
-        let orig_r10 = $regs.r10;
-        $regs.r10 = $arg3;
-        let ret = sys_forward_3!($num, $regs, $arg0, $arg1, $arg2);
-        $regs.r10 = orig_r10;
-        ret
+macro_rules! sys_restore_2 {
+    ($v:ident) => {{
+        sys_restore_1!($v);
+        $v.pt_regs.rsi = $v.saved_args[1];
     }};
 }
 
-macro_rules! sys_forward_5 {
-    ($num:expr, $regs:ident, $arg0:expr, $arg1:expr, $arg2:expr, $arg3:expr, $arg4:expr) => {{
-        let orig_r8 = $regs.r8;
-        $regs.r8 = $arg4;
-        let ret = sys_forward_4!($num, $regs, $arg0, $arg1, $arg2, $arg3);
-        $regs.r8 = orig_r8;
-        ret
+macro_rules! sys_save_2 {
+    ($v:ident) => {{
+        sys_save_1!($v);
+        $v.saved_args[1] = $v.pt_regs.rsi;
+        $v.pt_regs.rsi = $v.args[1];
     }};
 }
 
-macro_rules! sys_forward_6 {
-    ($num:expr, $regs:ident, $arg0:expr, $arg1:expr, $arg2:expr, $arg3:expr, $arg4:expr, $arg5:expr) => {{
-        let orig_r9 = $regs.r9;
-        $regs.r9 = $arg5;
-        let ret = sys_forward_5!($num, $regs, $arg0, $arg1, $arg2, $arg3, $arg4);
-        $regs.r9 = orig_r9;
-        ret
+macro_rules! sys_restore_3 {
+    ($v:ident) => {{
+        sys_restore_2!($v);
+        $v.pt_regs.rdx = $v.saved_args[2];
     }};
 }
 
-impl SnpInterface {
-    pub fn alloc_futex_page() -> Result<u64, super::AllocError> {
-        let req = &mut HostRequest::Other(OtherHostRequest::AllocFutexPage).into();
-        Self::call(req);
-        req.parse_alloc_result(0, ())
+macro_rules! sys_save_3 {
+    ($v:ident) => {{
+        sys_save_2!($v);
+        $v.saved_args[2] = $v.pt_regs.rdx;
+        $v.pt_regs.rdx = $v.args[2];
+    }};
+}
+
+macro_rules! sys_restore_4 {
+    ($v:ident) => {{
+        sys_restore_3!($v);
+        $v.pt_regs.r10 = $v.saved_args[3];
+    }};
+}
+
+macro_rules! sys_save_4 {
+    ($v:ident) => {{
+        sys_save_3!($v);
+        $v.saved_args[3] = $v.pt_regs.r10;
+        $v.pt_regs.r10 = $v.args[3];
+    }};
+}
+
+macro_rules! sys_restore_5 {
+    ($v:ident) => {{
+        sys_restore_4!($v);
+        $v.pt_regs.r8 = $v.saved_args[4];
+    }};
+}
+
+macro_rules! sys_save_5 {
+    ($v:ident) => {{
+        sys_save_4!($v);
+        $v.saved_args[4] = $v.pt_regs.r8;
+        $v.pt_regs.r8 = $v.args[4];
+    }};
+}
+
+macro_rules! sys_restore_6 {
+    ($v:ident) => {{
+        sys_restore_5!($v);
+        $v.pt_regs.r9 = $v.saved_args[5];
+    }};
+}
+
+macro_rules! sys_save_6 {
+    ($v:ident) => {{
+        sys_save_5!($v);
+        $v.saved_args[5] = $v.pt_regs.r9;
+        $v.pt_regs.r9 = $v.args[5];
+    }};
+}
+
+pub struct SnpPunchthroughToken<'a> {
+    punchthrough: SnpPunchthrough<'a>,
+}
+
+impl SnpPunchthroughToken<'_> {
+    fn parse_alloc_result(order: u64, addr: u64) -> Result<u64, PunchthroughError<error::Errno>> {
+        if addr == 0 {
+            if order > SNP_VMPL_ALLOC_MAX_ORDER as u64 {
+                Err(PunchthroughError::Failure(error::Errno::EINVAL))
+            } else {
+                Err(PunchthroughError::Failure(error::Errno::ENOMEM))
+            }
+        } else if addr % (PAGE_SIZE << order) != 0 || addr > PHYS_ADDR_MAX - (PAGE_SIZE << order) {
+            // Address is not aligned or out of bounds
+            Err(PunchthroughError::Failure(error::Errno::EINVAL))
+        } else {
+            Ok(addr)
+        }
+    }
+}
+
+impl<'a> PunchthroughToken for SnpPunchthroughToken<'a> {
+    type Punchthrough = SnpPunchthrough<'a>;
+
+    fn execute(
+        self,
+    ) -> Result<
+        <Self::Punchthrough as Punchthrough>::ReturnSuccess,
+        PunchthroughError<<Self::Punchthrough as Punchthrough>::ReturnFailure>,
+    > {
+        let mut punchthrough = self.punchthrough;
+        match punchthrough {
+            SnpPunchthrough::Other(OtherPunchthrough::Syscall0(ref mut v)) => {
+                sys_save_0!(v)
+            }
+            SnpPunchthrough::Other(OtherPunchthrough::Syscall1(ref mut v)) => {
+                sys_save_1!(v)
+            }
+            SnpPunchthrough::Other(OtherPunchthrough::Syscall2(ref mut v)) => {
+                sys_save_2!(v)
+            }
+            SnpPunchthrough::Other(OtherPunchthrough::Syscall3(ref mut v)) => {
+                sys_save_3!(v)
+            }
+            SnpPunchthrough::Other(OtherPunchthrough::Syscall4(ref mut v)) => {
+                sys_save_4!(v)
+            }
+            SnpPunchthrough::Other(OtherPunchthrough::Syscall5(ref mut v)) => {
+                sys_save_5!(v)
+            }
+            SnpPunchthrough::Other(OtherPunchthrough::Syscall6(ref mut v)) => {
+                sys_save_6!(v)
+            }
+            _ => {}
+        }
+
+        let mut req = SnpVmplRequestArgs::from(&punchthrough);
+        <Self as HostPunchthroughToken<'a, SnpVmplRequestArgs>>::HyperCallInterface::request(
+            &mut req,
+        );
+        let ret = req.ret as i64;
+
+        match punchthrough {
+            SnpPunchthrough::Alloc { order } => return Self::parse_alloc_result(order, ret as u64),
+            SnpPunchthrough::Other(OtherPunchthrough::AllocFutexPage) => {
+                return Self::parse_alloc_result(0, ret as u64)
+            }
+            SnpPunchthrough::Other(OtherPunchthrough::Syscall0(v)) => {
+                sys_restore_0!(v)
+            }
+            SnpPunchthrough::Other(OtherPunchthrough::Syscall1(v)) => {
+                sys_restore_1!(v)
+            }
+            SnpPunchthrough::Other(OtherPunchthrough::Syscall2(v)) => {
+                sys_restore_2!(v)
+            }
+            SnpPunchthrough::Other(OtherPunchthrough::Syscall3(v)) => {
+                sys_restore_3!(v)
+            }
+            SnpPunchthrough::Other(OtherPunchthrough::Syscall4(v)) => {
+                sys_restore_4!(v)
+            }
+            SnpPunchthrough::Other(OtherPunchthrough::Syscall5(v)) => {
+                sys_restore_5!(v)
+            }
+            SnpPunchthrough::Other(OtherPunchthrough::Syscall6(v)) => {
+                sys_restore_6!(v)
+            }
+            _ => {}
+        }
+
+        // Common handling for all requests
+        if ret < 0 {
+            Err(PunchthroughError::Failure(error::Errno::from_raw(
+                ret as i32,
+            )))
+        } else {
+            Ok(ret as u64)
+        }
+    }
+}
+
+impl From<&SnpPunchthroughToken<'_>> for SnpVmplRequestArgs {
+    fn from(value: &SnpPunchthroughToken<'_>) -> Self {
+        SnpVmplRequestArgs::from(&value.punchthrough)
+    }
+}
+
+impl<'a, InOut> HostPunchthroughToken<'a, InOut> for SnpPunchthroughToken<'a> {
+    type HyperCallInterface = HyperVInterface;
+}
+
+pub struct SnpPunchthroughProvider;
+
+impl<'a> HostPunchthroughProvider<'a, SnpVmplRequestArgs, OtherPunchthrough<'a>>
+    for SnpPunchthroughProvider
+{
+    type Token = SnpPunchthroughToken<'a>;
+
+    fn get_punchthrough_token_for(
+        &mut self,
+        punchthrough: SnpPunchthrough<'a>,
+    ) -> Option<Self::Token> {
+        Some(SnpPunchthroughToken { punchthrough })
+    }
+}
+
+impl Default for SnpPunchthroughProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SnpPunchthroughProvider {
+    pub const fn new() -> Self {
+        Self
     }
 
-    #[inline]
-    fn syscall(num: u64, pt_regs: &mut pt_regs) -> i64 {
-        let req = &mut HostRequest::Other(OtherHostRequest::Syscall { num, pt_regs }).into();
-        Self::call(req);
-        req.ret as i64
+    pub fn alloc_futex_page<'a>(&mut self) -> Option<SnpPunchthroughToken<'a>> {
+        let req = SnpPunchthrough::Other(OtherPunchthrough::AllocFutexPage);
+        self.get_punchthrough_token_for(req)
     }
 
     /// Call futex syscall
     ///
     /// uaddr and uaddr2 are pointers to the underlying integer obtained from
     /// e.g., [`core::sync::atomic::AtomicU32::as_ptr`].
-    pub fn sys_futex(
-        pt_regs: &mut pt_regs,
-        uaddr: Option<*const u32>,
+    #[allow(clippy::too_many_arguments)]
+    pub fn sys_futex<'a>(
+        &mut self,
+        pt_regs: &'a mut pt_regs,
+        uaddr: Option<*mut u32>,
         futex_op: i32,
         val: u32,
         timeout: Option<*const Timespec>,
-        uaddr2: Option<*const u32>,
+        uaddr2: Option<*mut u32>,
         val3: u32,
-    ) -> Result<usize, SysFutexError> {
-        let ret = sys_forward_6!(
+    ) -> Option<SnpPunchthroughToken<'a>> {
+        sys_forward!(
+            self,
             NR_SYSCALL_FUTEX,
             pt_regs,
+            6,
             match uaddr {
                 Some(uaddr) => uaddr as _,
                 None => 0,
@@ -300,25 +447,28 @@ impl SnpInterface {
                 None => 0,
             },
             val3 as _
-        );
-
-        if ret < 0 {
-            match ret.abs() {
-                EAGAIN => Err(SysFutexError::WouldBlock),
-                EINTR | ERESTARTSYS => Err(SysFutexError::Interrupted),
-                ETIMEDOUT => Err(SysFutexError::Timeout),
-                _ => panic!("Unknown error: {}", ret),
-            }
-        } else {
-            Ok(ret as usize)
-        }
+        )
     }
 
-    pub fn dump_stack(rsp: u64) {
-        Self::call(&mut HostRequest::Other(OtherHostRequest::DumpStack { rsp, len: 512 }).into())
+    pub fn sys_kill<'a>(
+        &mut self,
+        pt_regs: &'a mut pt_regs,
+        pid: i32,
+        sig: i32,
+    ) -> Option<SnpPunchthroughToken<'a>> {
+        sys_forward!(self, NR_SYSCALL_KILL, pt_regs, 2, pid as _, sig as _)
     }
 
-    pub fn dump_pt_regs(regs: &pt_regs) {
-        Self::call(&mut HostRequest::Other(OtherHostRequest::DumpRegs(regs)).into())
+    #[cfg(debug_assertions)]
+    pub fn dump_stack<'a>(&mut self, rsp: u64) -> Option<SnpPunchthroughToken<'a>> {
+        self.get_punchthrough_token_for(SnpPunchthrough::Other(OtherPunchthrough::DumpStack {
+            rsp,
+            len: 512,
+        }))
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn dump_pt_regs<'a>(&mut self, regs: &'a pt_regs) -> Option<SnpPunchthroughToken<'a>> {
+        self.get_punchthrough_token_for(SnpPunchthrough::Other(OtherPunchthrough::DumpRegs(regs)))
     }
 }
