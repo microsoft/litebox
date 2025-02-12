@@ -32,17 +32,19 @@ pub trait Provider:
 /// punchthrough, their code is suspicious; if all host invocations pass through the punchthrough,
 /// then it is sufficient to audit the punchthrough interface".
 pub trait PunchthroughProvider {
-    type PunchthroughToken: PunchthroughToken;
+    type PunchthroughToken<'a>: PunchthroughToken
+    where
+        Self: 'a;
     /// Give permission token to invoke `punchthrough`, possibly after checking that it is ok.
     ///
     /// The reason `&mut self` is taken mutably is to ensure that tokens aren't being held around
     /// for too long (i.e., all other platform interaction is disallowed between the creation and
     /// consumption of a token), as well as allowing the token to (possibly) get mutable access to
     /// the underlying platform storage.
-    fn get_punchthrough_token_for(
-        &mut self,
-        punchthrough: <Self::PunchthroughToken as PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken>;
+    fn get_punchthrough_token_for<'a>(
+        &'a mut self,
+        punchthrough: <Self::PunchthroughToken<'a> as PunchthroughToken>::Punchthrough,
+    ) -> Option<Self::PunchthroughToken<'a>>;
 }
 
 /// A token that demonstrates that the platform is allowing access for a particular [`Punchthrough`]

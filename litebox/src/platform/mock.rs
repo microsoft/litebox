@@ -115,13 +115,49 @@ impl TimeProvider for MockPlatform {
     }
 }
 
+pub(crate) struct MockPunchthrough<'a> {
+    msg: &'a str,
+}
+
+pub(crate) struct MockPunchthroughToken<'a> {
+    // Just to demonstrate that it can get access to everything necessary, both the platform, as
+    // well as the punchthrough object itself (which _itself_ has an associated lifetime).
+    platform: &'a mut MockPlatform,
+    punchthrough: MockPunchthrough<'a>,
+}
+
+impl Punchthrough for MockPunchthrough<'_> {
+    type ReturnSuccess = ();
+    type ReturnFailure = core::convert::Infallible;
+}
+
+impl<'a> PunchthroughToken for MockPunchthroughToken<'a> {
+    type Punchthrough = MockPunchthrough<'a>;
+
+    fn execute(
+        self,
+    ) -> Result<
+        <Self::Punchthrough as Punchthrough>::ReturnSuccess,
+        PunchthroughError<<Self::Punchthrough as Punchthrough>::ReturnFailure>,
+    > {
+        std::eprintln!("Punched through with {:?}", self.punchthrough.msg);
+        Ok(())
+    }
+}
+
 impl PunchthroughProvider for MockPlatform {
-    type PunchthroughToken = trivial_providers::ImpossiblePunchthroughToken;
-    fn get_punchthrough_token_for(
-        &mut self,
-        punchthrough: <Self::PunchthroughToken as PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken> {
-        None
+    type PunchthroughToken<'a>
+        = MockPunchthroughToken<'a>
+    where
+        Self: 'a;
+    fn get_punchthrough_token_for<'a>(
+        &'a mut self,
+        punchthrough: <Self::PunchthroughToken<'a> as PunchthroughToken>::Punchthrough,
+    ) -> Option<Self::PunchthroughToken<'a>> {
+        Some(MockPunchthroughToken {
+            platform: self,
+            punchthrough,
+        })
     }
 }
 

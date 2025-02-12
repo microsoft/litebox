@@ -349,12 +349,15 @@ impl litebox::platform::Instant for Instant {
 impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     litebox::platform::PunchthroughProvider for LinuxUserland<PunchthroughProvider>
 {
-    type PunchthroughToken = PunchthroughProvider::PunchthroughToken;
+    type PunchthroughToken<'a>
+        = PunchthroughProvider::PunchthroughToken<'a>
+    where
+        Self: 'a;
 
-    fn get_punchthrough_token_for(
-        &mut self,
-        punchthrough: <Self::PunchthroughToken as litebox::platform::PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken> {
+    fn get_punchthrough_token_for<'a>(
+        &'a mut self,
+        punchthrough: <Self::PunchthroughToken<'a> as litebox::platform::PunchthroughToken>::Punchthrough,
+    ) -> Option<Self::PunchthroughToken<'a>> {
         // TODO(jayb): We may wish to make the linux userland platform less generic, and support a
         // _specific_ syscall-based punchthrough interface?
         self.punchthrough_provider
