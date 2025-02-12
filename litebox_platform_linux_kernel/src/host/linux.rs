@@ -51,3 +51,6 @@ pub struct Timespec {
     /// Nanoseconds. Must be less than 1_000_000_000.
     pub tv_nsec: i64,
 }
+
+#[allow(non_camel_case_types)]
+pub type sigset_t = ::core::ffi::c_ulong;

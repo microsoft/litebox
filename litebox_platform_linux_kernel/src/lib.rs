@@ -4,6 +4,7 @@
 
 use core::{arch::asm, sync::atomic::AtomicU32};
 
+use host::linux::sigset_t;
 use litebox::platform::RawMutex as _;
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, Provider, Punchthrough,
@@ -43,11 +44,13 @@ pub struct SyscallN<const N: usize, const ID: u32> {
     args: [u64; N],
 }
 
-pub const NR_SYSCALL_FUTEX: u32 = 202;
+const NR_SYSCALL_FUTEX: u32 = 202;
+const NR_SYSCALL_RT_SIGPROCMASK: u32 = 14;
 
 /// Punchthrough for syscalls
+/// Note we assume all punchthroughs are non-blocking
 pub enum LinuxPunchthrough {
-    Futex(SyscallN<6, NR_SYSCALL_FUTEX>),
+    RtSigprocmask(SyscallN<4, NR_SYSCALL_RT_SIGPROCMASK>),
     // TODO: Add more syscalls
 }
 
@@ -71,7 +74,7 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
         litebox::platform::PunchthroughError<<Self::Punchthrough as Punchthrough>::ReturnFailure>,
     > {
         let r = match self.punchthrough {
-            LinuxPunchthrough::Futex(syscall) => Host::syscalls(syscall),
+            LinuxPunchthrough::RtSigprocmask(syscall) => Host::syscalls(syscall),
         };
         match r {
             Ok(v) => Ok(v),
@@ -97,29 +100,22 @@ impl<Host: HostInterface, T: Task> PunchthroughProvider for LinuxKernel<Host, T>
 }
 
 impl<Host: HostInterface, T: Task> LinuxKernel<Host, T> {
-    /// Call futex syscall
+    /// Call rt_sigprocmask syscall
     ///
-    /// uaddr and uaddr2 are pointers to the underlying integer obtained from
-    /// e.g., [`core::sync::atomic::AtomicU32::as_ptr`].
-    /// Note all pointers should be in user space
-    #[allow(clippy::too_many_arguments)]
-    pub fn sys_futex(
+    /// set and old_set are pointers in user space
+    pub fn rt_sigprocmask(
         &mut self,
-        uaddr: Option<*mut u32>,
-        futex_op: i32,
-        val: u32,
-        timeout: Option<*const host::linux::Timespec>,
-        uaddr2: Option<*mut u32>,
-        val3: u32,
+        how: i32,
+        set: Option<*const sigset_t>,
+        old_set: Option<*mut sigset_t>,
+        sigsetsize: usize,
     ) -> Result<usize, PunchthroughError<error::Errno>> {
-        let punchthrough = LinuxPunchthrough::Futex(SyscallN {
+        let punchthrough = LinuxPunchthrough::RtSigprocmask(SyscallN {
             args: [
-                uaddr.map_or(0, |v| v as u64),
-                futex_op as u64,
-                val as u64,
-                timeout.map_or(0, |t| t as u64),
-                uaddr2.map_or(0, |v| v as u64),
-                val3 as u64,
+                how as u32 as _,
+                set.map_or(0, |v| v as u64),
+                old_set.map_or(0, |v| v as u64),
+                sigsetsize as _,
             ],
         });
         let token = self
