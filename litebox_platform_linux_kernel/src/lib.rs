@@ -37,6 +37,7 @@ pub trait Task {
 ///
 /// The generic parameter `N` is the number of arguments for the syscall
 /// The generic parameter `ID` is the syscall number
+#[allow(dead_code)]
 pub struct SyscallN<const N: usize, const ID: u32> {
     /// Arguments for the syscall
     args: [u64; N],

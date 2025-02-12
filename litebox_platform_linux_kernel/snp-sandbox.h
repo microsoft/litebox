@@ -1,4 +1,4 @@
-//! This file is copied sandbox_driver/include/snp-sandbox.h
+//! This file is copied from sandbox_driver/include/snp-sandbox.h
 
 #ifndef _SNP_SANDBOX_SNP_SANDBOX_HEADER_H
 #define _SNP_SANDBOX_SNP_SANDBOX_HEADER_H
