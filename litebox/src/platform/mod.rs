@@ -270,7 +270,7 @@ pub trait DebugLogProvider {
 /// user and kernel.
 pub trait RawPointerProvider {
     type RawConstPointer<T: Clone>: RawConstPointer<T>;
-    // TODO(jayb): type RawMutPointer<T: Clone>: RawMutPointer<T>;
+    type RawMutPointer<T: Clone>: RawMutPointer<T>;
 }
 
 /// A read-only raw pointer, morally equivalent to `*const T`.
@@ -381,4 +381,44 @@ where
     {
         Some(unsafe { <Self as RawConstPointer<T>>::to_cow_cstr(self) }?.into_owned())
     }
+}
+
+/// A writable raw pointer, morally equivalent to `*mut T`.
+///
+/// See [`RawPointerProvider`] for details.
+///
+/// This is a sub-trait of [`RawConstPointer`] in order to support the reading-related functionality
+/// on the pointer in addition to the writing-related functionality defined by this trait.
+pub trait RawMutPointer<T>: Copy + RawConstPointer<T>
+where
+    T: Clone,
+{
+    /// Write the value of the pointer at signed offset from it.
+    ///
+    /// Returns `None` if the provided pointer is invalid, or such an offset is known (in advance)
+    /// to be invalid.
+    ///
+    /// # Safety
+    ///
+    /// The offset must be valid location for the pointer.
+    #[must_use]
+    unsafe fn write_at_offset(self, offset: isize, value: T) -> Option<()>;
+
+    /// Obtain a mutable (sub)slice of memory at the pointer, and run `f` upon it.
+    ///
+    /// Returns `None` (and does not invoke `f`) if the provided pointer is invalid, or such a slice
+    /// is known (in advance) to be invalid.
+    ///
+    /// This function may be a direct access to the underlying slice, or may be a newly allocated
+    /// slice that is "flushed" at the end of the execution, depending on the platform. Thus, for
+    /// performance reasons, a user of this function ideally invokes with the shortest subslice that
+    /// they wish to mutate.
+    ///
+    /// Note: if `f` panics, there is no guarantee that the memory is left unchanged.
+    #[must_use]
+    fn mutate_subslice_with<R>(
+        self,
+        range: impl core::ops::RangeBounds<isize>,
+        f: impl FnOnce(&mut [T]) -> R,
+    ) -> Option<R>;
 }
