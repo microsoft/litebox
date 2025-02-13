@@ -3,7 +3,10 @@
 //! Most users of LiteBox may possibly need more featureful providers, provided by other crates;
 //! however, some users might find these sufficient for their use case.
 
-use super::{Punchthrough, PunchthroughError, PunchthroughProvider, PunchthroughToken};
+use super::{
+    Punchthrough, PunchthroughError, PunchthroughProvider, PunchthroughToken, RawConstPointer,
+    RawMutPointer,
+};
 
 /// A trivial provider, useful when no punchthrough is necessary.
 pub struct ImpossiblePunchthroughProvider {}
@@ -97,3 +100,95 @@ impl core::fmt::Display for Underspecified {
     }
 }
 impl core::error::Error for Underspecified {}
+
+/// A trivial [`RawConstPointer`] that is literally just `*const T`.
+///
+/// Useful for purely-userland contexts.
+#[repr(C)]
+#[derive(Clone)]
+pub struct TransparentConstPtr<T> {
+    inner: *const T,
+}
+impl<T: Clone> Copy for TransparentConstPtr<T> {}
+impl<T: Clone> RawConstPointer<T> for TransparentConstPtr<T> {
+    unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
+        if self.inner.is_null() || !self.inner.is_aligned() {
+            return None;
+        }
+        Some(alloc::borrow::Cow::Borrowed(&*self.inner.offset(count)))
+    }
+    unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
+        if self.inner.is_null() || !self.inner.is_aligned() {
+            return None;
+        }
+        Some(alloc::borrow::Cow::Borrowed(core::slice::from_raw_parts(
+            self.inner, len,
+        )))
+    }
+}
+
+/// A trivial [`RawMutPointer`] that is literally just `*mut T`.
+///
+/// Useful for purely-userland contexts.
+#[repr(C)]
+#[derive(Clone)]
+pub struct TransparentMutPtr<T> {
+    inner: *mut T,
+}
+impl<T: Clone> Copy for TransparentMutPtr<T> {}
+impl<T: Clone> RawConstPointer<T> for TransparentMutPtr<T> {
+    unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
+        if self.inner.is_null() || !self.inner.is_aligned() {
+            return None;
+        }
+        Some(alloc::borrow::Cow::Borrowed(&*self.inner.offset(count)))
+    }
+    unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
+        if self.inner.is_null() || !self.inner.is_aligned() {
+            return None;
+        }
+        Some(alloc::borrow::Cow::Borrowed(core::slice::from_raw_parts(
+            self.inner, len,
+        )))
+    }
+}
+impl<T: Clone> RawMutPointer<T> for TransparentMutPtr<T> {
+    unsafe fn write_at_offset(self, count: isize, value: T) -> Option<()> {
+        if self.inner.is_null() || !self.inner.is_aligned() {
+            return None;
+        }
+        *self.inner.offset(count) = value;
+        Some(())
+    }
+    fn mutate_subslice_with<R>(
+        self,
+        range: impl core::ops::RangeBounds<isize>,
+        f: impl FnOnce(&mut [T]) -> R,
+    ) -> Option<R> {
+        if self.inner.is_null() || !self.inner.is_aligned() {
+            return None;
+        }
+        let start = match range.start_bound() {
+            core::ops::Bound::Included(&x) => x,
+            core::ops::Bound::Excluded(_) => unreachable!(),
+            core::ops::Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            core::ops::Bound::Included(&x) => x.checked_add(1)?,
+            core::ops::Bound::Excluded(&x) => x,
+            core::ops::Bound::Unbounded => {
+                return None;
+            }
+        };
+        let len = if start <= end {
+            start.abs_diff(end)
+        } else {
+            return None;
+        };
+        let _ = start.checked_mul(size_of::<T>().try_into().ok()?)?;
+        let data = unsafe { self.inner.offset(start) };
+        let _ = isize::try_from(len.checked_mul(size_of::<T>())?).ok()?;
+        let slice = unsafe { core::slice::from_raw_parts_mut(data, len) };
+        Some(f(slice))
+    }
+}

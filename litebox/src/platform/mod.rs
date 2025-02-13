@@ -266,8 +266,8 @@ pub trait DebugLogProvider {
 /// Essentially, these types indicate "user" pointers (which are allowed to be null). Platforms with
 /// no meaningful user-kernel separation can use [`trivial_providers::TransparentConstPtr`] and
 /// [`trivial_providers::TransparentMutPtr`]. Platforms with meaningful user-kernal separation
-/// should define their own `repr(C, packed)` newtype wrappers that perform relevant copying between
-/// user and kernel.
+/// should define their own `repr(C)` newtype wrappers that perform relevant copying between user
+/// and kernel.
 pub trait RawPointerProvider {
     type RawConstPointer<T: Clone>: RawConstPointer<T>;
     type RawMutPointer<T: Clone>: RawMutPointer<T>;
@@ -289,7 +289,7 @@ where
     ///
     /// The pointer (and underlying memory for the value at the offset) should remain valid and
     /// unchanged for the entirety of the lifetime that the borrow (if any) is made.
-    unsafe fn read_at_offset<'a>(self, offset: isize) -> Option<alloc::borrow::Cow<'a, T>>;
+    unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>>;
 
     /// Read the pointer as a slice of memory.
     ///
@@ -402,7 +402,7 @@ where
     ///
     /// The offset must be valid location for the pointer.
     #[must_use]
-    unsafe fn write_at_offset(self, offset: isize, value: T) -> Option<()>;
+    unsafe fn write_at_offset(self, count: isize, value: T) -> Option<()>;
 
     /// Obtain a mutable (sub)slice of memory at the pointer, and run `f` upon it.
     ///
