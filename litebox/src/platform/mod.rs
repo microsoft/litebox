@@ -18,7 +18,12 @@ use thiserror::Error;
 /// provided by it. _However_, most of the provided APIs within the provider act upon an `&self` to
 /// allow storage of any useful "globals" within it necessary.
 pub trait Provider:
-    RawMutexProvider + IPInterfaceProvider + TimeProvider + PunchthroughProvider + DebugLogProvider
+    RawMutexProvider
+    + IPInterfaceProvider
+    + TimeProvider
+    + PunchthroughProvider
+    + DebugLogProvider
+    + RawPointerProvider
 {
 }
 
