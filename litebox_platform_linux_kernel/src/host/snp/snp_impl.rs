@@ -2,7 +2,8 @@
 
 use core::arch::asm;
 
-use crate::{error, host::ghcb::ghcb_prints, HostInterface, Task};
+use super::ghcb::ghcb_prints;
+use crate::{error, HostInterface, Task};
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
