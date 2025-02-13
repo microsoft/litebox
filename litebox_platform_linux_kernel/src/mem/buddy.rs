@@ -1,0 +1,72 @@
+//! Page Allocator using buddy allocator
+
+use core::{
+    alloc::{GlobalAlloc, Layout},
+    ops::Deref,
+    ptr::NonNull,
+};
+
+use buddy_system_allocator::Heap;
+use litebox::{
+    platform::RawMutexProvider,
+    sync::{Mutex, Synchronization},
+};
+
+use super::MemoryProvider;
+
+/// A locked version of `Heap` with rescue before oom
+///
+/// # Usage
+///
+/// Create a locked heap:
+/// ```
+/// let heap = LockedHeapWithRescue::new(|heap: &mut Heap<33>, layout: &core::alloc::Layout| {});
+/// ```
+///
+/// Before oom, the allocator will try to call rescue function and try for one more time.
+pub struct LockedHeapWithRescue<'a, const ORDER: usize, Platform: RawMutexProvider> {
+    inner: Mutex<'a, Platform, Heap<ORDER>>,
+}
+
+impl<'a, const ORDER: usize, Platform: RawMutexProvider> LockedHeapWithRescue<'a, ORDER, Platform> {
+    /// Creates an empty heap
+    pub fn new(sync: &'a Synchronization<'_, Platform>) -> Self {
+        LockedHeapWithRescue {
+            inner: sync.new_mutex(Heap::<ORDER>::new()),
+        }
+    }
+}
+
+impl<'a, const ORDER: usize, Platform: RawMutexProvider> Deref
+    for LockedHeapWithRescue<'a, ORDER, Platform>
+{
+    type Target = Mutex<'a, Platform, Heap<ORDER>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+unsafe impl<const ORDER: usize, Platform: RawMutexProvider + MemoryProvider> GlobalAlloc
+    for LockedHeapWithRescue<'_, ORDER, Platform>
+{
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let mut inner = self.inner.lock();
+        match inner.alloc(layout) {
+            Ok(allocation) => allocation.as_ptr(),
+            Err(_) => {
+                Platform::rescue_heap(&mut inner, &layout);
+                inner
+                    .alloc(layout)
+                    .ok()
+                    .map_or(core::ptr::null_mut(), |allocation| allocation.as_ptr())
+            }
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.inner
+            .lock()
+            .dealloc(NonNull::new_unchecked(ptr), layout)
+    }
+}

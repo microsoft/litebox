@@ -11,6 +11,7 @@ use litebox::platform::{
     PunchthroughError, PunchthroughProvider, PunchthroughToken, RawMutexProvider, TimeProvider,
     UnblockedOrTimedOut,
 };
+use mem::MemoryProvider;
 use litebox::platform::{RawMutex as _, RawPointerProvider};
 use ptr::{UserConstPtr, UserMutPtr};
 
@@ -149,12 +150,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         token.execute()
     }
 
-    /// Allocate 2^order pages from host
-    #[allow(dead_code)]
-    fn alloc(&self, order: u32) -> Result<u64, error::Errno> {
-        Host::alloc(order)
-    }
-
     #[allow(dead_code)]
     fn exit(&self) {
         Host::exit();
@@ -163,6 +158,12 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     #[allow(dead_code)]
     fn terminate(&self, reason_set: u64, reason_code: u64) -> ! {
         Host::terminate(reason_set, reason_code)
+    }
+}
+
+impl<Host: HostInterface> MemoryProvider for LinuxKernel<Host> {
+    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
+        Host::alloc(layout)
     }
 }
 
@@ -339,8 +340,11 @@ impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
 
 /// Platform-Host Interface
 pub trait HostInterface {
-    /// For memory allocation
-    fn alloc(order: u32) -> Result<u64, error::Errno>;
+    /// For page allocation.
+    ///
+    /// It can return more than requested size. On success, it returns the start address
+    /// and the size of the allocated memory.
+    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), error::Errno>;
 
     /// Exit
     ///

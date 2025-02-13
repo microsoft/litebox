@@ -95,7 +95,7 @@ impl HostSnpInterface {
 
     /// To be used by [`Self::alloc_raw_mutex`]
     #[allow(dead_code)]
-    fn alloc_futex_page() -> Result<u64, error::Errno> {
+    fn alloc_futex_page() -> Result<usize, error::Errno> {
         let mut req = bindings::SnpVmplRequestArgs::new_request(
             bindings::SNP_VMPL_ALLOC_FUTEX_REQ,
             0,
@@ -114,7 +114,7 @@ impl HostSnpInterface {
         }
     }
 
-    fn parse_alloc_result(order: u32, addr: u64) -> Result<u64, crate::error::Errno> {
+    fn parse_alloc_result(order: u32, addr: u64) -> Result<usize, crate::error::Errno> {
         if addr == 0 {
             if order > bindings::SNP_VMPL_ALLOC_MAX_ORDER {
                 Err(error::Errno::EINVAL)
@@ -125,7 +125,7 @@ impl HostSnpInterface {
             // Address is not aligned or out of bounds
             Err(error::Errno::EINVAL)
         } else {
-            Ok(addr)
+            Ok(addr as usize)
         }
     }
 }
@@ -155,14 +155,19 @@ impl HostInterface for HostSnpInterface {
         ghcb_prints(msg);
     }
 
-    fn alloc(order: u32) -> Result<u64, error::Errno> {
+    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), error::Errno> {
+        // allocate at least one page
+        let size = core::cmp::max(layout.size().next_power_of_two(), PAGE_SIZE as usize);
+        assert!(size > (PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER) as usize);
+
         let mut req = bindings::SnpVmplRequestArgs::new_request(
             bindings::SNP_VMPL_ALLOC_REQ,
             1,
-            [order as u64, 0, 0, 0, 0, 0],
+            [bindings::SNP_VMPL_ALLOC_MAX_ORDER as u64, 0, 0, 0, 0, 0],
         );
         Self::request(&mut req);
-        Self::parse_alloc_result(order, req.ret)
+        Self::parse_alloc_result(SNP_VMPL_ALLOC_MAX_ORDER, req.ret)
+            .map(|addr| (addr, (PAGE_SIZE << SNP_VMPL_ALLOC_MAX_ORDER) as usize))
     }
 
     fn exit() -> ! {
