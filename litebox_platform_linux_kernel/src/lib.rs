@@ -2,6 +2,7 @@
 
 #![no_std]
 
+use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};
 
 use host::linux::sigset_t;
@@ -17,7 +18,7 @@ extern crate alloc;
 pub mod error;
 pub mod host;
 
-static CPU_MHZ: once_cell::race::OnceBox<u64> = once_cell::race::OnceBox::new();
+static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 
 /// This is the platform for running LiteBox in kernel mode.
 /// It requires a host that implements the [`HostInterface`]
@@ -30,8 +31,8 @@ pub struct LinuxKernel<Host: HostInterface, T: Task> {
 pub trait Task {
     fn current<'a>() -> Option<&'a Self>;
 
-    /// Shared memory may be mapped to different address spaces in host and guest.
-    /// This function is to convert the pointer to host address space.
+    /// Shared memory may be mapped to different address spaces in host and guest kernel.
+    /// This function is to convert a kernel pointer to host address space.
     fn convert_ptr_to_host<T>(&self, ptr: *const T) -> *const T;
     /// Similar to [`Self::convert_ptr_to_host`], but for mutable pointers
     fn convert_mut_ptr_to_host<T>(&self, ptr: *mut T) -> *mut T;
@@ -101,7 +102,7 @@ impl<Host: HostInterface, T: Task> PunchthroughProvider for LinuxKernel<Host, T>
 
 impl<Host: HostInterface, T: Task> LinuxKernel<Host, T> {
     pub fn init(&self, cpu_mhz: u64) {
-        CPU_MHZ.get_or_init(|| alloc::boxed::Box::new(cpu_mhz));
+        CPU_MHZ.store(cpu_mhz, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// rt_sigprocmask: examine and change blocked signals.
@@ -286,9 +287,11 @@ impl<Host: HostInterface, T: Task> TimeProvider for LinuxKernel<Host, T> {
 
 impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
-        self.0
-            .checked_sub(earlier.0)
-            .map(|v| core::time::Duration::from_micros(v / CPU_MHZ.get().unwrap()))
+        self.0.checked_sub(earlier.0).map(|v| {
+            core::time::Duration::from_micros(
+                v / CPU_MHZ.load(core::sync::atomic::Ordering::Relaxed),
+            )
+        })
     }
 }
 
