@@ -12,20 +12,29 @@ use litebox::platform::{
     UnblockedOrTimedOut,
 };
 
+extern crate alloc;
+
 pub mod error;
 pub mod host;
+
+static CPU_MHZ: once_cell::race::OnceBox<u64> = once_cell::race::OnceBox::new();
 
 /// This is the platform for running LiteBox in kernel mode.
 /// It requires a host that implements the [`HostInterface`]
 /// and a task that implements the [`Task`] trait.
 pub struct LinuxKernel<Host: HostInterface, T: Task> {
-    cpu_mhz: u64,
     host_and_task: core::marker::PhantomData<(Host, T)>,
+}
+
+impl<Host: HostInterface, T: Task> LinuxKernel<Host, T> {
+    pub fn init(&self, cpu_mhz: u64) {
+        CPU_MHZ.get_or_init(|| alloc::boxed::Box::new(cpu_mhz));
+    }
 }
 
 /// Analogous to `task struct` in Linux
 pub trait Task {
-    fn current<'a>() -> Option<&'a mut Self>;
+    fn current<'a>() -> Option<&'a Self>;
 
     /// Shared memory may be mapped to different address spaces in host and guest.
     /// This function is to convert the pointer to host address space.
@@ -35,22 +44,14 @@ pub trait Task {
 }
 
 /// Punchthrough for syscalls
-///
-/// The generic parameter `N` is the number of arguments for the syscall
-/// The generic parameter `ID` is the syscall number
-#[allow(dead_code)]
-pub struct SyscallN<const N: usize, const ID: u32> {
-    /// Arguments for the syscall
-    args: [u64; N],
-}
-
-const NR_SYSCALL_FUTEX: u32 = 202;
-const NR_SYSCALL_RT_SIGPROCMASK: u32 = 14;
-
-/// Punchthrough for syscalls
 /// Note we assume all punchthroughs are non-blocking
 pub enum LinuxPunchthrough {
-    RtSigprocmask(SyscallN<4, NR_SYSCALL_RT_SIGPROCMASK>),
+    RtSigprocmask {
+        how: i32,
+        set: Option<*const sigset_t>,
+        old_set: Option<*mut sigset_t>,
+        sigsetsize: usize,
+    },
     // TODO: Add more syscalls
 }
 
@@ -74,7 +75,12 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
         litebox::platform::PunchthroughError<<Self::Punchthrough as Punchthrough>::ReturnFailure>,
     > {
         let r = match self.punchthrough {
-            LinuxPunchthrough::RtSigprocmask(syscall) => Host::syscalls(syscall),
+            LinuxPunchthrough::RtSigprocmask {
+                how,
+                set,
+                old_set,
+                sigsetsize,
+            } => Host::rt_sigprocmask(how, set, old_set, sigsetsize),
         };
         match r {
             Ok(v) => Ok(v),
@@ -100,7 +106,34 @@ impl<Host: HostInterface, T: Task> PunchthroughProvider for LinuxKernel<Host, T>
 }
 
 impl<Host: HostInterface, T: Task> LinuxKernel<Host, T> {
-    /// Call rt_sigprocmask syscall
+    /// rt_sigprocmask: examine and change blocked signals.
+    /// sigprocmask() is used to fetch and/or change the signal mask of the calling thread.
+    /// The signal mask is the set of signals whose delivery is currently blocked for the
+    /// caller (see also signal(7) for more details).
+    ///
+    ///The behavior of the call is dependent on the value of how, as follows.
+    ///
+    /// *SIG_BLOCK*
+    /// The set of blocked signals is the union of the current set and the set argument.
+    ///
+    /// *SIG_UNBLOCK*
+    /// The signals in set are removed from the current set of blocked signals. It is permissible to attempt to unblock a signal which is not blocked.
+    ///
+    /// *SIG_SETMASK*
+    /// The set of blocked signals is set to the argument set.
+    /// If oldset is non-NULL, the previous value of the signal mask is stored in oldset.
+    /// If set is NULL, then the signal mask is unchanged (i.e., how is ignored), but the current value of the signal mask is nevertheless returned in oldset (if it is not NULL).
+    /// The use of sigprocmask() is unspecified in a multithreaded process; see pthread_sigmask(3).
+    ///
+    /// **Return Value**
+    ///
+    /// sigprocmask() returns 0 on success and -1 on error.
+    ///
+    /// **Errors**
+    ///
+    /// *EFAULT* the set or oldset argument points outside the process's allocated address space.
+    ///
+    /// *EINVAL* The value specified in how was invalid.
     ///
     /// set and old_set are pointers in user space
     pub fn rt_sigprocmask(
@@ -110,14 +143,12 @@ impl<Host: HostInterface, T: Task> LinuxKernel<Host, T> {
         old_set: Option<*mut sigset_t>,
         sigsetsize: usize,
     ) -> Result<usize, PunchthroughError<error::Errno>> {
-        let punchthrough = LinuxPunchthrough::RtSigprocmask(SyscallN {
-            args: [
-                how as u32 as _,
-                set.map_or(0, |v| v as u64),
-                old_set.map_or(0, |v| v as u64),
-                sigsetsize as _,
-            ],
-        });
+        let punchthrough = LinuxPunchthrough::RtSigprocmask {
+            how,
+            set,
+            old_set,
+            sigsetsize,
+        };
         let token = self
             .get_punchthrough_token_for(punchthrough)
             .ok_or(PunchthroughError::Unsupported)?;
@@ -146,7 +177,7 @@ impl<Host: HostInterface, T: Task> RawMutexProvider for LinuxKernel<Host, T> {
 
     fn new_raw_mutex(&self) -> Self::RawMutex {
         Self::RawMutex {
-            inner: Host::alloc_raw_mutex(),
+            inner: AtomicU32::new(0),
             host: core::marker::PhantomData,
         }
     }
@@ -154,27 +185,21 @@ impl<Host: HostInterface, T: Task> RawMutexProvider for LinuxKernel<Host, T> {
 
 /// An implementation of [`litebox::platform::RawMutex`]
 pub struct RawMutex<Host: HostInterface, T: Task> {
-    inner: *mut AtomicU32,
+    inner: AtomicU32,
     host: core::marker::PhantomData<(Host, T)>,
 }
 
 unsafe impl<Host: HostInterface, T: Task> Send for RawMutex<Host, T> {}
 unsafe impl<Host: HostInterface, T: Task> Sync for RawMutex<Host, T> {}
 
-impl<Host: HostInterface, T: Task> Drop for RawMutex<Host, T> {
-    fn drop(&mut self) {
-        Host::release_raw_mutex(self.inner);
-    }
-}
-
 /// TODO: common mutex implementation could be moved to a shared crate
 impl<Host: HostInterface, T: Task> litebox::platform::RawMutex for RawMutex<Host, T> {
     fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32 {
-        unsafe { &mut *self.inner }
+        &self.inner
     }
 
     fn wake_many(&self, n: usize) -> usize {
-        Host::wake_many::<T>(self.inner, n).unwrap()
+        Host::wake_many::<T>(&self.inner, n).unwrap()
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
@@ -210,7 +235,7 @@ impl<Host: HostInterface, T: Task> RawMutex<Host, T> {
                 return Err(ImmediatelyWokenUp);
             }
 
-            let ret = Host::block_or_maybe_timeout::<T>(self.inner, val, timeout);
+            let ret = Host::block_or_maybe_timeout::<T>(&self.inner, val, timeout);
 
             match ret {
                 Ok(_) => {
@@ -257,7 +282,7 @@ impl<Host: HostInterface, T: Task> TimeProvider for LinuxKernel<Host, T> {
     type Instant = Instant;
 
     fn now(&self) -> Self::Instant {
-        Instant::now(self.cpu_mhz)
+        Instant::now()
     }
 }
 
@@ -265,7 +290,7 @@ impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
         self.0
             .checked_sub(earlier.0)
-            .map(core::time::Duration::from_micros)
+            .map(|v| core::time::Duration::from_micros(v / CPU_MHZ.get().unwrap()))
     }
 }
 
@@ -283,10 +308,10 @@ impl Instant {
         ((hi as u64) << 32) | (lo as u64)
     }
 
-    fn now(cpu_mhz: u64) -> Self {
-        let tsc = Self::rdtsc();
-        let ms = tsc / cpu_mhz;
-        Instant(ms)
+    fn now() -> Self {
+        // let tsc = Self::rdtsc();
+        // let ms = tsc / cpu_mhz;
+        Instant(Self::rdtsc())
     }
 }
 
@@ -318,60 +343,35 @@ impl<Host: HostInterface, T: Task> IPInterfaceProvider for LinuxKernel<Host, T> 
     }
 }
 
-const FUTEX_WAIT: i32 = 0;
-const FUTEX_WAKE: i32 = 1;
-
 /// Platform-Host Interface
 pub trait HostInterface {
     /// For memory allocation
     fn alloc(order: u32) -> Result<u64, error::Errno>;
 
-    /// For exit/terminate
+    /// Exit
     ///
     /// Exit allows to come back to handle some requests from host,
     /// but it should not return back to the caller.
-    /// TODO: add a callback func as argument
-    fn exit();
+    fn exit() -> !;
+
+    /// Terminate LiteBox
     fn terminate(reason_set: u64, reason_code: u64) -> !;
 
     /// For Punchthrough
-    fn syscalls<const N: usize, const ID: u32>(arg: SyscallN<N, ID>)
-        -> Result<usize, error::Errno>;
+    fn rt_sigprocmask(
+        how: i32,
+        set: Option<*const sigset_t>,
+        old_set: Option<*mut sigset_t>,
+        sigsetsize: usize,
+    ) -> Result<usize, error::Errno>;
 
-    /// For RawMutex
-    fn alloc_raw_mutex() -> *mut AtomicU32;
-
-    fn release_raw_mutex(mutex: *mut AtomicU32);
-
-    fn wake_many<T: Task>(mutex: *mut AtomicU32, n: usize) -> Result<usize, error::Errno> {
-        let mutex = T::current().unwrap().convert_mut_ptr_to_host(mutex);
-        Self::syscalls(crate::SyscallN::<6, NR_SYSCALL_FUTEX> {
-            args: [mutex as u64, FUTEX_WAKE as u64, n as u64, 0, 0, 0],
-        })
-    }
+    fn wake_many<T: Task>(mutex: &AtomicU32, n: usize) -> Result<usize, error::Errno>;
 
     fn block_or_maybe_timeout<T: Task>(
-        mutex: *mut AtomicU32,
+        mutex: &AtomicU32,
         val: u32,
         timeout: Option<core::time::Duration>,
-    ) -> Result<(), error::Errno> {
-        let timeout = timeout.map(|t| host::linux::Timespec {
-            tv_sec: t.as_secs() as i64,
-            tv_nsec: t.subsec_nanos() as i64,
-        });
-        let mutex = T::current().unwrap().convert_mut_ptr_to_host(mutex);
-        Self::syscalls(crate::SyscallN::<6, NR_SYSCALL_FUTEX> {
-            args: [
-                mutex as u64,
-                FUTEX_WAIT as u64,
-                val as u64,
-                timeout.as_ref().map_or(0, |t| t as *const _ as u64),
-                0,
-                0,
-            ],
-        })
-        .map(|_| ())
-    }
+    ) -> Result<(), error::Errno>;
 
     /// For Network
     fn send_ip_packet(packet: &[u8]) -> Result<usize, error::Errno>;

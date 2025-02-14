@@ -3,7 +3,7 @@
 use core::arch::asm;
 
 use super::ghcb::ghcb_prints;
-use crate::{error, HostInterface, Task};
+use crate::{error, host::linux, HostInterface, Task};
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
@@ -41,6 +41,21 @@ const PAGE_SIZE: u64 = 4096;
 /// Max physical address
 const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 
+const NR_SYSCALL_FUTEX: u32 = 202;
+const NR_SYSCALL_RT_SIGPROCMASK: u32 = 14;
+
+const FUTEX_WAIT: i32 = 0;
+const FUTEX_WAKE: i32 = 1;
+
+/// Punchthrough for syscalls
+///
+/// The generic parameter `N` is the number of arguments for the syscall
+/// The generic parameter `ID` is the syscall number
+pub struct SyscallN<const N: usize, const ID: u32> {
+    /// Arguments for the syscall
+    args: [u64; N],
+}
+
 impl HostSnpInterface {
     /// [VTL CALL](https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/vsm#vtl-call) via VMMCALL
     fn request(arg: &mut SnpVmplRequestArgs) {
@@ -50,6 +65,21 @@ impl HostSnpInterface {
                 in("r14") arg as *const _ as u64,
             );
         }
+    }
+
+    fn syscalls<const N: usize, const ID: u32>(
+        arg: SyscallN<N, ID>,
+    ) -> Result<usize, crate::error::Errno> {
+        let mut args = [0; MAX_ARGS_SIZE];
+        args[..N].copy_from_slice(&arg.args);
+        let mut req = SnpVmplRequestArgs::new_request(
+            // FIXME: need to update sandbox driver for the change of this interface
+            SNP_VMPL_SYSCALL_REQ,
+            ID, // repurpose size field to syscall id
+            args,
+        );
+        Self::request(&mut req);
+        Self::parse_result(req.ret)
     }
 
     /// To be used by [`Self::alloc_raw_mutex`]
@@ -87,33 +117,6 @@ impl HostSnpInterface {
 }
 
 impl HostInterface for HostSnpInterface {
-    fn syscalls<const N: usize, const ID: u32>(
-        arg: crate::SyscallN<N, ID>,
-    ) -> Result<usize, crate::error::Errno> {
-        let mut args = [0; MAX_ARGS_SIZE];
-        args[..N].copy_from_slice(&arg.args);
-        let mut req = SnpVmplRequestArgs::new_request(
-            // FIXME: need to update sandbox driver for the change of this interface
-            SNP_VMPL_SYSCALL_REQ,
-            ID, // repurpose size field to syscall id
-            args,
-        );
-        Self::request(&mut req);
-        Self::parse_result(req.ret)
-    }
-
-    fn alloc_raw_mutex() -> *mut core::sync::atomic::AtomicU32 {
-        // Move code from https://github.com/MSRSSP/snp-sandbox/blob/6b111447f3637fdaad10d8fb3de5c1322b359966/sandbox_kernel/sandbox_core/src/platform/snp/futex.rs#L24
-        // once we have allocator implemented
-        todo!()
-    }
-
-    fn release_raw_mutex(_mutex: *mut core::sync::atomic::AtomicU32) {
-        // Move code from https://github.com/MSRSSP/snp-sandbox/blob/6b111447f3637fdaad10d8fb3de5c1322b359966/sandbox_kernel/sandbox_core/src/platform/snp/futex.rs#L65
-        // once we have allocator implemented
-        todo!()
-    }
-
     fn send_ip_packet(packet: &[u8]) -> Result<usize, crate::error::Errno> {
         let mut req = SnpVmplRequestArgs::new_request(
             SNP_VMPL_TUN_WRITE_REQ,
@@ -145,9 +148,12 @@ impl HostInterface for HostSnpInterface {
         Self::parse_alloc_result(order, req.ret)
     }
 
-    fn exit() {
+    fn exit() -> ! {
         let mut req = SnpVmplRequestArgs::new_exit_request();
         Self::request(&mut req);
+        loop {
+            unsafe { asm!("hlt") }
+        }
     }
 
     fn terminate(reason_set: u64, reason_code: u64) -> ! {
@@ -163,6 +169,60 @@ impl HostInterface for HostSnpInterface {
         loop {
             unsafe { asm!("hlt") }
         }
+    }
+
+    fn rt_sigprocmask(
+        how: i32,
+        set: Option<*const crate::host::linux::sigset_t>,
+        oldset: Option<*mut crate::host::linux::sigset_t>,
+        sigsetsize: usize,
+    ) -> Result<usize, error::Errno> {
+        let args = SyscallN::<4, NR_SYSCALL_RT_SIGPROCMASK> {
+            args: [
+                how as u32 as _,
+                set.map_or(0, |v| v as u64),
+                oldset.map_or(0, |v| v as u64),
+                sigsetsize as _,
+            ],
+        };
+        Self::syscalls(args)
+    }
+
+    fn wake_many<T: Task>(
+        mutex: &core::sync::atomic::AtomicU32,
+        n: usize,
+    ) -> Result<usize, error::Errno> {
+        let mutex = T::current()
+            .unwrap()
+            .convert_mut_ptr_to_host(mutex.as_ptr());
+        Self::syscalls(SyscallN::<6, NR_SYSCALL_FUTEX> {
+            args: [mutex as u64, FUTEX_WAKE as u64, n as u64, 0, 0, 0],
+        })
+    }
+
+    fn block_or_maybe_timeout<T: Task>(
+        mutex: &core::sync::atomic::AtomicU32,
+        val: u32,
+        timeout: Option<core::time::Duration>,
+    ) -> Result<(), error::Errno> {
+        let timeout = timeout.map(|t| linux::Timespec {
+            tv_sec: t.as_secs() as i64,
+            tv_nsec: t.subsec_nanos() as i64,
+        });
+        let mutex = T::current()
+            .unwrap()
+            .convert_mut_ptr_to_host(mutex.as_ptr());
+        Self::syscalls(SyscallN::<6, NR_SYSCALL_FUTEX> {
+            args: [
+                mutex as u64,
+                FUTEX_WAIT as u64,
+                val as u64,
+                timeout.as_ref().map_or(0, |t| t as *const _ as u64),
+                0,
+                0,
+            ],
+        })
+        .map(|_| ())
     }
 }
 
@@ -184,7 +244,7 @@ fn virt_to_phys(addr: u64) -> u64 {
 }
 
 impl Task for vsbox_task {
-    fn current<'a>() -> Option<&'a mut Self> {
+    fn current<'a>() -> Option<&'a Self> {
         let task: u64;
         unsafe {
             asm!("rdgsbase {}", out(reg) task, options(nostack, preserves_flags));
@@ -192,7 +252,7 @@ impl Task for vsbox_task {
             if task == 0 {
                 return None;
             }
-            Some(&mut *(task as *mut Self))
+            Some(&*(task as *const Self))
         }
     }
 

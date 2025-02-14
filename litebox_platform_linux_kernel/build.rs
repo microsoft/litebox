@@ -4,7 +4,7 @@ fn build_binding_from_sandbox_driver() {
         .clang_arg("--target=x86_64-unknown-none")
         // The input header we would like to generate
         // bindings for.
-        .header("wrapper.h")
+        .header("src/host/snp/wrapper.h")
         // Tell cargo to invalidate the built crate whenever any of the
         // included header files changed.
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
