@@ -130,3 +130,8 @@ impl DebugLogProvider for MockPlatform {
         std::eprintln!("{msg}");
     }
 }
+
+impl RawPointerProvider for MockPlatform {
+    type RawConstPointer<T: Clone> = super::trivial_providers::TransparentConstPtr<T>;
+    type RawMutPointer<T: Clone> = super::trivial_providers::TransparentMutPtr<T>;
+}

@@ -11,8 +11,6 @@
 
 extern crate alloc;
 
-use core::ffi::CStr;
-
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -20,7 +18,7 @@ use alloc::vec::Vec;
 // platform-specific things within it.
 use once_cell::race::OnceBox;
 
-use litebox::{fs::FileSystem as _, sync::RwLock};
+use litebox::{fs::FileSystem as _, platform::RawConstPointer as _, sync::RwLock};
 use litebox_platform_multiplex::Platform;
 
 pub mod errno;
@@ -43,6 +41,10 @@ pub(crate) fn litebox_sync<'a>() -> &'a litebox::sync::Synchronization<'static, 
         ))
     })
 }
+
+// Convenience type aliases
+type ConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
+type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
 struct Descriptors {
     descriptors: Vec<Option<Descriptor>>,
@@ -164,11 +166,10 @@ pub(crate) fn file_descriptors<'a>() -> &'a RwLock<'static, Platform, Descriptor
 /// # Safety
 ///
 /// `pathname` must point to a valid nul-terminated C string
-pub unsafe extern "C" fn open(pathname: *const i8, flags: u32, mode: u32) -> i32 {
-    if pathname.is_null() {
+pub unsafe extern "C" fn open(pathname: ConstPtr<i8>, flags: u32, mode: u32) -> i32 {
+    let Some(path) = pathname.to_cstring() else {
         return -errno::constants::EFAULT;
-    }
-    let path = unsafe { CStr::from_ptr(pathname) };
+    };
     match litebox_fs().open(
         path,
         litebox::fs::OFlags::from_bits(flags).unwrap(),

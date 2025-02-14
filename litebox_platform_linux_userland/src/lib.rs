@@ -370,6 +370,13 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     }
 }
 
+impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
+    litebox::platform::RawPointerProvider for LinuxUserland<PunchthroughProvider>
+{
+    type RawConstPointer<T: Clone> = litebox::platform::trivial_providers::TransparentConstPtr<T>;
+    type RawMutPointer<T: Clone> = litebox::platform::trivial_providers::TransparentMutPtr<T>;
+}
+
 /// Operations currently supported by the safer variants of the Linux futex syscall
 /// ([`futex_timeout`] and [`futex_val2`]).
 #[repr(i32)]
