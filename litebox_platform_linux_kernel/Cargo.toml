@@ -11,4 +11,6 @@ bindgen = "0.71.0"
 
 [dependencies]
 buddy_system_allocator = { version = "0.11.0", default-features = false }
+lazy_static = "1.5.0"
+slabmalloc = { version = "0.11.0", default-features = false }
 litebox = { path = "../litebox/", version = "0.1.0" }

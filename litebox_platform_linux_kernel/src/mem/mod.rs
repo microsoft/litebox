@@ -5,6 +5,7 @@
 use buddy_system_allocator::Heap;
 
 pub mod buddy;
+pub mod slab;
 #[cfg(test)]
 pub mod tests;
 

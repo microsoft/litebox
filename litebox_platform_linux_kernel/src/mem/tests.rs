@@ -7,15 +7,27 @@ use crate::{
     LinuxKernel,
 };
 
-use super::buddy::LockedHeapWithRescue;
+use super::{buddy::LockedHeapWithRescue, slab::LockedSlabAllocator};
+
+static PLATFORM: LinuxKernel<MockHostInterface, MockTask> = LinuxKernel::new(0x1000);
+lazy_static::lazy_static!(
+    static ref SYNC: Synchronization<'static, LinuxKernel<MockHostInterface, MockTask>> = Synchronization::new(&PLATFORM);
+);
 
 #[test]
 fn test_heap_oom_rescue() {
-    let platform = LinuxKernel::<MockHostInterface, MockTask>::new(0x1000);
-    let sync = Synchronization::new(&platform);
-    let allocator = LockedHeapWithRescue::<'_, 23, _>::new(&sync);
-
+    let allocator = LockedHeapWithRescue::<'_, 23, _>::new(&SYNC);
     unsafe {
         assert!(allocator.alloc(Layout::from_size_align(0x1000, 1).unwrap()) as usize != 0);
+    }
+}
+
+#[test]
+fn test_slab() {
+    let allocator = LockedSlabAllocator::<'_, 23, _>::new(&SYNC);
+
+    unsafe {
+        assert!(allocator.alloc(Layout::from_size_align(0x1000, 0x1000).unwrap()) as usize != 0);
+        assert!(allocator.alloc(Layout::from_size_align(0x10, 0x10).unwrap()) as usize != 0);
     }
 }

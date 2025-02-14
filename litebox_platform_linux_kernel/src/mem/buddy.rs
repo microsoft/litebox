@@ -47,6 +47,21 @@ impl<'a, const ORDER: usize, Platform: RawMutexProvider> Deref
     }
 }
 
+impl<const ORDER: usize, Platform: RawMutexProvider + MemoryProvider>
+    LockedHeapWithRescue<'_, ORDER, Platform>
+{
+    /// Allocates pages (page_size >= 4096)
+    pub(super) fn alloc_pages(&self, page_size: usize) -> Option<*mut u8> {
+        let layout = Layout::from_size_align(page_size, 0x1000).unwrap();
+        let ptr = unsafe { self.alloc(layout) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(ptr)
+        }
+    }
+}
+
 unsafe impl<const ORDER: usize, Platform: RawMutexProvider + MemoryProvider> GlobalAlloc
     for LockedHeapWithRescue<'_, ORDER, Platform>
 {

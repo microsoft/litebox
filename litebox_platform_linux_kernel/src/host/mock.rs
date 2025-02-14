@@ -9,8 +9,8 @@ pub struct MockHostInterface {}
 
 static MUTEX_VEC_ALLOCATED: SpinMutex<Vec<AtomicU32>> = SpinMutex::new(Vec::new());
 #[repr(align(0x1000))]
-struct Space([u8; 0x1000]);
-static mut SPACE: Space = Space([0; 0x1000]);
+struct Space([u8; 0x2000]);
+static mut SPACE: Space = Space([0; 0x2000]);
 
 impl HostInterface for MockHostInterface {
     #[allow(static_mut_refs)]
