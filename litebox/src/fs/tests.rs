@@ -151,3 +151,33 @@ mod in_mem {
         );
     }
 }
+
+mod tar_ro {
+    use crate::fs::tar_ro;
+    use crate::fs::{FileSystem as _, Mode, OFlags};
+    use crate::platform::mock::MockPlatform;
+    use alloc::vec;
+    extern crate std;
+
+    const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");
+
+    #[test]
+    fn file_read() {
+        let platform = MockPlatform::new();
+        let mut fs = tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into());
+        let fd = fs
+            .open("foo", OFlags::RDONLY, Mode::RWXU)
+            .expect("Failed to open file");
+        let mut buffer = vec![0; 1024];
+        let bytes_read = fs.read(&fd, &mut buffer).expect("Failed to read from file");
+        assert_eq!(&buffer[..bytes_read], b"testfoo\n");
+        fs.close(fd).expect("Failed to close file");
+        let fd = fs
+            .open("bar/baz", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open file");
+        let mut buffer = vec![0; 1024];
+        let bytes_read = fs.read(&fd, &mut buffer).expect("Failed to read from file");
+        assert_eq!(&buffer[..bytes_read], b"test bar baz\n");
+        fs.close(fd).expect("Failed to close file");
+    }
+}
