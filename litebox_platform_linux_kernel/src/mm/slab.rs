@@ -1,3 +1,5 @@
+//! Allocator that uses buddy allocator for pages and slab allocator for small objects.
+
 use core::{alloc::GlobalAlloc, mem::transmute, ptr::NonNull};
 
 use litebox::{
@@ -8,6 +10,9 @@ use slabmalloc::{AllocationError, Allocator, LargeObjectPage, ObjectPage, ZoneAl
 
 use super::{buddy::LockedHeapWithRescue, MemoryProvider};
 
+/// Allocator that uses buddy allocator for pages and slab allocator for small objects.
+///
+/// Note this is not very scalable since we use a single big lock around the slab allocator.
 pub struct LockedSlabAllocator<'a, const ORDER: usize, Platform: RawMutexProvider + MemoryProvider>
 {
     buddy_allocator: LockedHeapWithRescue<'a, ORDER, Platform>,
@@ -27,12 +32,14 @@ impl<'a, const ORDER: usize, Platform: RawMutexProvider + MemoryProvider>
         }
     }
 
+    /// Allocates a new [`ObjectPage`] from the System.
     pub fn alloc_page(&self) -> Option<&'static mut ObjectPage<'static>> {
         self.buddy_allocator
             .alloc_pages(Self::BASE_PAGE_SIZE)
             .map(|r| unsafe { transmute(r as usize) })
     }
 
+    /// Allocates a new [`LargeObjectPage`] from the system.
     pub fn alloc_large_page(&self) -> Option<&'static mut LargeObjectPage<'static>> {
         self.buddy_allocator
             .alloc_pages(Self::LARGE_PAGE_SIZE)
