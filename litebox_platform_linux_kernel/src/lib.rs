@@ -310,8 +310,6 @@ impl Instant {
     }
 
     fn now() -> Self {
-        // let tsc = Self::rdtsc();
-        // let ms = tsc / cpu_mhz;
         Instant(Self::rdtsc())
     }
 }
