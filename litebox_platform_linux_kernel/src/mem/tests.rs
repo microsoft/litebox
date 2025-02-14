@@ -9,7 +9,7 @@ use crate::{
 
 use super::{buddy::LockedHeapWithRescue, slab::LockedSlabAllocator};
 
-static PLATFORM: LinuxKernel<MockHostInterface, MockTask> = LinuxKernel::new(0x1000);
+static PLATFORM: LinuxKernel<MockHostInterface, MockTask> = LinuxKernel::new();
 lazy_static::lazy_static!(
     static ref SYNC: Synchronization<'static, LinuxKernel<MockHostInterface, MockTask>> = Synchronization::new(&PLATFORM);
 );
