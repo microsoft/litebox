@@ -29,28 +29,28 @@ impl HostInterface for MockHostInterface {
     fn log(_msg: &str) {
         todo!()
     }
-    
+
     fn exit() -> ! {
         todo!()
     }
-    
+
     fn rt_sigprocmask(
-        how: i32,
-        set: Option<*const super::linux::sigset_t>,
-        old_set: Option<*mut super::linux::sigset_t>,
-        sigsetsize: usize,
+        _how: i32,
+        _set: Option<*const super::linux::sigset_t>,
+        _old_set: Option<*mut super::linux::sigset_t>,
+        _sigsetsize: usize,
     ) -> Result<usize, crate::error::Errno> {
         todo!()
     }
-    
-    fn wake_many<T: Task>(mutex: &AtomicU32, n: usize) -> Result<usize, crate::error::Errno> {
+
+    fn wake_many<T: Task>(_mutex: &AtomicU32, _n: usize) -> Result<usize, crate::error::Errno> {
         todo!()
     }
-    
+
     fn block_or_maybe_timeout<T: Task>(
-        mutex: &AtomicU32,
-        val: u32,
-        timeout: Option<core::time::Duration>,
+        _mutex: &AtomicU32,
+        _val: u32,
+        _timeout: Option<core::time::Duration>,
     ) -> Result<(), crate::error::Errno> {
         todo!()
     }

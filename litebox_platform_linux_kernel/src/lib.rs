@@ -96,7 +96,19 @@ impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
     }
 }
 
+impl<Host: HostInterface, T: Task> Default for LinuxKernel<Host, T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<Host: HostInterface> LinuxKernel<Host> {
+    pub const fn new() -> Self {
+        Self {
+            host_and_task: core::marker::PhantomData,
+        }
+    }
+
     pub fn init(&self, cpu_mhz: u64) {
         CPU_MHZ.store(cpu_mhz, core::sync::atomic::Ordering::Relaxed);
     }
