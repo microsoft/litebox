@@ -31,10 +31,10 @@ pub trait MemoryProvider {
 
 /// Macro to define a global allocator using [`slab::LockedSlabAllocator`].
 ///
-/// [`SafeSlabAllocator`] is a wrapper around [`slab::LockedSlabAllocator`] using
+/// Define a wrapper `SafeSlabAllocator` around [`slab::LockedSlabAllocator`] using
 /// [`once_cell::race::OnceBox`] to ensure thread-safe initialization. Since we cannot
 /// implement the external trait `GlobalAlloc` for the external struct `OnceBox`, we need
-/// to define a new struct [`SafeSlabAllocator`] that implements `GlobalAlloc`.
+/// to define a new struct `SafeSlabAllocator` that implements `GlobalAlloc`.
 ///
 /// ## Arguments
 ///
@@ -75,8 +75,9 @@ macro_rules! define_global_allocator {
             }
 
             pub fn get(&self) -> &$crate::mem::slab::LockedSlabAllocator<'a, ORDER, $platform> {
-                self.0
-                    .get_or_init(|| alloc::boxed::Box::new($crate::mem::slab::LockedSlabAllocator::new($sync)))
+                self.0.get_or_init(|| {
+                    alloc::boxed::Box::new($crate::mem::slab::LockedSlabAllocator::new($sync))
+                })
             }
         }
 
