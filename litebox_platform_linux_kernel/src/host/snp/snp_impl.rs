@@ -3,7 +3,7 @@
 use core::arch::asm;
 
 use super::ghcb::ghcb_prints;
-use crate::{error, host::linux, HostInterface, Task};
+use crate::{error, host::linux, HostInterface};
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
@@ -188,19 +188,14 @@ impl HostInterface for HostSnpInterface {
         Self::syscalls(args)
     }
 
-    fn wake_many<T: Task>(
-        mutex: &core::sync::atomic::AtomicU32,
-        n: usize,
-    ) -> Result<usize, error::Errno> {
-        let mutex = T::current()
-            .unwrap()
-            .convert_mut_ptr_to_host(mutex.as_ptr());
+    fn wake_many(mutex: &core::sync::atomic::AtomicU32, n: usize) -> Result<usize, error::Errno> {
+        // TODO: sandbox driver needs to be updated to accept a kernel pointer from the guest
         Self::syscalls(SyscallN::<6, NR_SYSCALL_FUTEX> {
-            args: [mutex as u64, FUTEX_WAKE as u64, n as u64, 0, 0, 0],
+            args: [mutex.as_ptr() as u64, FUTEX_WAKE as u64, n as u64, 0, 0, 0],
         })
     }
 
-    fn block_or_maybe_timeout<T: Task>(
+    fn block_or_maybe_timeout(
         mutex: &core::sync::atomic::AtomicU32,
         val: u32,
         timeout: Option<core::time::Duration>,
@@ -209,12 +204,10 @@ impl HostInterface for HostSnpInterface {
             tv_sec: t.as_secs() as i64,
             tv_nsec: t.subsec_nanos() as i64,
         });
-        let mutex = T::current()
-            .unwrap()
-            .convert_mut_ptr_to_host(mutex.as_ptr());
+        // TODO: sandbox driver needs to be updated to accept a kernel pointer from the guest
         Self::syscalls(SyscallN::<6, NR_SYSCALL_FUTEX> {
             args: [
-                mutex as u64,
+                mutex.as_ptr() as u64,
                 FUTEX_WAIT as u64,
                 val as u64,
                 timeout.as_ref().map_or(0, |t| t as *const _ as u64),
@@ -223,46 +216,5 @@ impl HostInterface for HostSnpInterface {
             ],
         })
         .map(|_| ())
-    }
-}
-
-/// The base address of the one-to-one mapping for all physical memory
-/// to kernel virtual memory.
-const VMPL2_PAGE_OFFSET: u64 = 0xffff890000000000;
-
-/// Convert physical address to kernel virtual address
-#[allow(dead_code)]
-fn phys_to_virt(addr: u64) -> u64 {
-    // assume(addr < PHYS_ADDR_MAX);
-    addr + VMPL2_PAGE_OFFSET
-}
-
-/// Convert kernel virtual address to physical address
-fn virt_to_phys(addr: u64) -> u64 {
-    assert!(addr > VMPL2_PAGE_OFFSET);
-    addr - VMPL2_PAGE_OFFSET
-}
-
-impl Task for vsbox_task {
-    fn current<'a>() -> Option<&'a Self> {
-        let task: u64;
-        unsafe {
-            asm!("rdgsbase {}", out(reg) task, options(nostack, preserves_flags));
-
-            if task == 0 {
-                return None;
-            }
-            Some(&*(task as *const Self))
-        }
-    }
-
-    fn convert_ptr_to_host<T>(&self, ptr: *const T) -> *const T {
-        let mem_base = self.snp_vmpl0_mem_base;
-        (virt_to_phys(ptr as u64) + mem_base) as *const T
-    }
-
-    fn convert_mut_ptr_to_host<T>(&self, ptr: *mut T) -> *mut T {
-        let mem_base = self.snp_vmpl0_mem_base;
-        (virt_to_phys(ptr as u64) + mem_base) as *mut T
     }
 }

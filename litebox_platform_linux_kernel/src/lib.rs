@@ -21,21 +21,9 @@ pub mod host;
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 
 /// This is the platform for running LiteBox in kernel mode.
-/// It requires a host that implements the [`HostInterface`]
-/// and a task that implements the [`Task`] trait.
-pub struct LinuxKernel<Host: HostInterface, T: Task> {
-    host_and_task: core::marker::PhantomData<(Host, T)>,
-}
-
-/// Analogous to `task struct` in Linux
-pub trait Task {
-    fn current<'a>() -> Option<&'a Self>;
-
-    /// Shared memory may be mapped to different address spaces in host and guest kernel.
-    /// This function is to convert a kernel pointer to host address space.
-    fn convert_ptr_to_host<T>(&self, ptr: *const T) -> *const T;
-    /// Similar to [`Self::convert_ptr_to_host`], but for mutable pointers
-    fn convert_mut_ptr_to_host<T>(&self, ptr: *mut T) -> *mut T;
+/// It requires a host that implements the [`HostInterface`] trait.
+pub struct LinuxKernel<Host: HostInterface> {
+    host_and_task: core::marker::PhantomData<Host>,
 }
 
 /// Punchthrough for syscalls
@@ -84,9 +72,9 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
     }
 }
 
-impl<Host: HostInterface, T: Task> Provider for LinuxKernel<Host, T> {}
+impl<Host: HostInterface> Provider for LinuxKernel<Host> {}
 
-impl<Host: HostInterface, T: Task> PunchthroughProvider for LinuxKernel<Host, T> {
+impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
     type PunchthroughToken = LinuxPunchthroughToken<Host>;
 
     fn get_punchthrough_token_for(
@@ -100,7 +88,7 @@ impl<Host: HostInterface, T: Task> PunchthroughProvider for LinuxKernel<Host, T>
     }
 }
 
-impl<Host: HostInterface, T: Task> LinuxKernel<Host, T> {
+impl<Host: HostInterface> LinuxKernel<Host> {
     pub fn init(&self, cpu_mhz: u64) {
         CPU_MHZ.store(cpu_mhz, core::sync::atomic::Ordering::Relaxed);
     }
@@ -171,8 +159,8 @@ impl<Host: HostInterface, T: Task> LinuxKernel<Host, T> {
     }
 }
 
-impl<Host: HostInterface, T: Task> RawMutexProvider for LinuxKernel<Host, T> {
-    type RawMutex = RawMutex<Host, T>;
+impl<Host: HostInterface> RawMutexProvider for LinuxKernel<Host> {
+    type RawMutex = RawMutex<Host>;
 
     fn new_raw_mutex(&self) -> Self::RawMutex {
         Self::RawMutex {
@@ -183,22 +171,22 @@ impl<Host: HostInterface, T: Task> RawMutexProvider for LinuxKernel<Host, T> {
 }
 
 /// An implementation of [`litebox::platform::RawMutex`]
-pub struct RawMutex<Host: HostInterface, T: Task> {
+pub struct RawMutex<Host: HostInterface> {
     inner: AtomicU32,
-    host: core::marker::PhantomData<(Host, T)>,
+    host: core::marker::PhantomData<Host>,
 }
 
-unsafe impl<Host: HostInterface, T: Task> Send for RawMutex<Host, T> {}
-unsafe impl<Host: HostInterface, T: Task> Sync for RawMutex<Host, T> {}
+unsafe impl<Host: HostInterface> Send for RawMutex<Host> {}
+unsafe impl<Host: HostInterface> Sync for RawMutex<Host> {}
 
 /// TODO: common mutex implementation could be moved to a shared crate
-impl<Host: HostInterface, T: Task> litebox::platform::RawMutex for RawMutex<Host, T> {
+impl<Host: HostInterface> litebox::platform::RawMutex for RawMutex<Host> {
     fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32 {
         &self.inner
     }
 
     fn wake_many(&self, n: usize) -> usize {
-        Host::wake_many::<T>(&self.inner, n).unwrap()
+        Host::wake_many(&self.inner, n).unwrap()
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
@@ -218,7 +206,7 @@ impl<Host: HostInterface, T: Task> litebox::platform::RawMutex for RawMutex<Host
     }
 }
 
-impl<Host: HostInterface, T: Task> RawMutex<Host, T> {
+impl<Host: HostInterface> RawMutex<Host> {
     fn block_or_maybe_timeout(
         &self,
         val: u32,
@@ -234,7 +222,7 @@ impl<Host: HostInterface, T: Task> RawMutex<Host, T> {
                 return Err(ImmediatelyWokenUp);
             }
 
-            let ret = Host::block_or_maybe_timeout::<T>(&self.inner, val, timeout);
+            let ret = Host::block_or_maybe_timeout(&self.inner, val, timeout);
 
             match ret {
                 Ok(_) => {
@@ -268,7 +256,7 @@ impl<Host: HostInterface, T: Task> RawMutex<Host, T> {
     }
 }
 
-impl<Host: HostInterface, T: Task> DebugLogProvider for LinuxKernel<Host, T> {
+impl<Host: HostInterface> DebugLogProvider for LinuxKernel<Host> {
     fn debug_log_print(&self, msg: &str) {
         Host::log(msg);
     }
@@ -277,7 +265,7 @@ impl<Host: HostInterface, T: Task> DebugLogProvider for LinuxKernel<Host, T> {
 /// An implementation of [`litebox::platform::Instant`]
 pub struct Instant(u64);
 
-impl<Host: HostInterface, T: Task> TimeProvider for LinuxKernel<Host, T> {
+impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
     type Instant = Instant;
 
     fn now(&self) -> Self::Instant {
@@ -314,7 +302,7 @@ impl Instant {
     }
 }
 
-impl<Host: HostInterface, T: Task> IPInterfaceProvider for LinuxKernel<Host, T> {
+impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
         match Host::send_ip_packet(packet) {
             Ok(n) => {
@@ -364,9 +352,9 @@ pub trait HostInterface {
         sigsetsize: usize,
     ) -> Result<usize, error::Errno>;
 
-    fn wake_many<T: Task>(mutex: &AtomicU32, n: usize) -> Result<usize, error::Errno>;
+    fn wake_many(mutex: &AtomicU32, n: usize) -> Result<usize, error::Errno>;
 
-    fn block_or_maybe_timeout<T: Task>(
+    fn block_or_maybe_timeout(
         mutex: &AtomicU32,
         val: u32,
         timeout: Option<core::time::Duration>,
