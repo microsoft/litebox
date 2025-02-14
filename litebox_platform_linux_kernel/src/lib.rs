@@ -26,12 +26,6 @@ pub struct LinuxKernel<Host: HostInterface, T: Task> {
     host_and_task: core::marker::PhantomData<(Host, T)>,
 }
 
-impl<Host: HostInterface, T: Task> LinuxKernel<Host, T> {
-    pub fn init(&self, cpu_mhz: u64) {
-        CPU_MHZ.get_or_init(|| alloc::boxed::Box::new(cpu_mhz));
-    }
-}
-
 /// Analogous to `task struct` in Linux
 pub trait Task {
     fn current<'a>() -> Option<&'a Self>;
@@ -106,6 +100,10 @@ impl<Host: HostInterface, T: Task> PunchthroughProvider for LinuxKernel<Host, T>
 }
 
 impl<Host: HostInterface, T: Task> LinuxKernel<Host, T> {
+    pub fn init(&self, cpu_mhz: u64) {
+        CPU_MHZ.get_or_init(|| alloc::boxed::Box::new(cpu_mhz));
+    }
+
     /// rt_sigprocmask: examine and change blocked signals.
     /// sigprocmask() is used to fetch and/or change the signal mask of the calling thread.
     /// The signal mask is the set of signals whose delivery is currently blocked for the
