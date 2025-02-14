@@ -35,7 +35,7 @@ jobs:
             echo "reaction=hooray" >> "$GITHUB_OUTPUT"
           else
             echo "Semver check failed."
-            echo "reaction=confused" >> "$GITHUB_OUTPUT"
+            echo "reaction=eyes" >> "$GITHUB_OUTPUT"
           fi
       - name: React to the PR based on semver-checks
         if: ${{ github.event.pull_request }}
