@@ -6,7 +6,7 @@ pub struct MockHostInterface {}
 
 #[repr(align(0x1000))]
 struct Space([u8; 0x1000]);
-static mut SPACES: [Space; 2] = [Space([0; 0x1000]), Space([0; 0x1000])];
+static mut SPACES: [Space; 3] = [Space([0; 0x1000]), Space([0; 0x1000]), Space([0; 0x1000])];
 
 impl HostInterface for MockHostInterface {
     #[allow(static_mut_refs)]
