@@ -97,7 +97,7 @@ impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
     }
 }
 
-impl<Host: HostInterface, T: Task> Default for LinuxKernel<Host, T> {
+impl<Host: HostInterface> Default for LinuxKernel<Host> {
     fn default() -> Self {
         Self::new()
     }
@@ -174,7 +174,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     }
 }
 
-impl<Host: HostInterface> MemoryProvider for LinuxKernel<Host> {
+impl<Host: HostInterface> mm::MemoryProvider for LinuxKernel<Host> {
     fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
         Host::alloc(layout)
     }

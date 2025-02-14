@@ -16,7 +16,7 @@ mod bindings {
 }
 
 const HEAP_ORDER: usize = bindings::SNP_VMPL_ALLOC_MAX_ORDER as usize + 12 + 1;
-pub type SnpLinuxKernel = LinuxKernel<HostSnpInterface, vsbox_task>;
+pub type SnpLinuxKernel = LinuxKernel<HostSnpInterface>;
 pub type SnpSlabAllocator = LockedSlabAllocator<'static, HEAP_ORDER, SnpLinuxKernel>;
 
 const MAX_ARGS_SIZE: usize = 6;

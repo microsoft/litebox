@@ -1,15 +1,12 @@
 use core::alloc::{GlobalAlloc, Layout};
 
-use crate::{
-    host::mock::{MockHostInterface, MockTask},
-    LinuxKernel,
-};
+use crate::{host::mock::MockHostInterface, LinuxKernel};
 
 use super::{buddy::LockedHeapWithRescue, slab::LockedSlabAllocator};
 
 lazy_static::lazy_static!(
-    static ref PLATFORM: LinuxKernel<MockHostInterface, MockTask> = LinuxKernel::new();
-    static ref SYNC: litebox::sync::Synchronization<'static, LinuxKernel<MockHostInterface, MockTask>>  = litebox::sync::Synchronization::new(&PLATFORM);
+    static ref PLATFORM: LinuxKernel<MockHostInterface> = LinuxKernel::new();
+    static ref SYNC: litebox::sync::Synchronization<'static, LinuxKernel<MockHostInterface>>  = litebox::sync::Synchronization::new(&PLATFORM);
 );
 
 const MAX_ORDER: usize = 23;
