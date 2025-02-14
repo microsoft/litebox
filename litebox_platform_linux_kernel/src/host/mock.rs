@@ -5,13 +5,18 @@ use crate::{HostInterface, Task};
 pub struct MockHostInterface {}
 
 #[repr(align(0x1000))]
-struct Space([u8; 0x2000]);
-static mut SPACE: Space = Space([0; 0x2000]);
+struct Space([u8; 0x1000]);
+static mut SPACES: [Space; 2] = [Space([0; 0x1000]), Space([0; 0x1000])];
 
 impl HostInterface for MockHostInterface {
     #[allow(static_mut_refs)]
     fn alloc(_layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
-        unsafe { Ok((SPACE.0.as_ptr() as usize, SPACE.0.len() * size_of::<u8>())) }
+        static mut IDX: usize = 0;
+        unsafe {
+            let space = &mut SPACES[IDX];
+            IDX += 1;
+            Ok((space.0.as_ptr() as usize, space.0.len() * size_of::<u8>()))
+        }
     }
 
     fn terminate(_reason_set: u64, _reason_code: u64) -> ! {

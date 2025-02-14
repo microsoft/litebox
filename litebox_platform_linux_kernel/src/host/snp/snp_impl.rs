@@ -7,12 +7,17 @@ use crate::{
     HostInterface, error,
     host::linux::{self, sigset_t},
     ptr::{UserConstPtr, UserMutPtr},
+    mem::slab::LockedSlabAllocator, HostInterface, LinuxKernel,
 };
 
 #[allow(dead_code)]
 mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
+
+const HEAP_ORDER: usize = bindings::SNP_VMPL_ALLOC_MAX_ORDER as usize + 12 + 1;
+pub type SnpLinuxKernel = LinuxKernel<HostSnpInterface, vsbox_task>;
+pub type SnpSlabAllocator = LockedSlabAllocator<'static, HEAP_ORDER, SnpLinuxKernel>;
 
 const MAX_ARGS_SIZE: usize = 6;
 type ArgsArray = [u64; MAX_ARGS_SIZE];
@@ -91,18 +96,6 @@ impl HostSnpInterface {
         );
         Self::request(&mut req);
         Self::parse_result(req.ret)
-    }
-
-    /// To be used by [`Self::alloc_raw_mutex`]
-    #[allow(dead_code)]
-    fn alloc_futex_page() -> Result<usize, error::Errno> {
-        let mut req = bindings::SnpVmplRequestArgs::new_request(
-            bindings::SNP_VMPL_ALLOC_FUTEX_REQ,
-            0,
-            [0, 0, 0, 0, 0, 0],
-        );
-        Self::request(&mut req);
-        Self::parse_alloc_result(0, req.ret)
     }
 
     fn parse_result(res: u64) -> Result<usize, crate::error::Errno> {
