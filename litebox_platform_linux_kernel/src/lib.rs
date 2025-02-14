@@ -19,6 +19,7 @@ extern crate alloc;
 
 pub mod error;
 pub mod host;
+pub mod mm;
 pub mod ptr;
 
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
