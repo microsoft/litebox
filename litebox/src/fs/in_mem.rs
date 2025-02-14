@@ -2,11 +2,10 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
-use crate::fd::{FileFd, OwnedFd};
+use crate::fd::FileFd;
 use crate::path::Arg;
 use crate::sync;
 
@@ -515,9 +514,7 @@ impl Permissions {
     }
 }
 
-struct Descriptors<'platform, Platform: sync::RawSyncPrimitivesProvider> {
-    descriptors: Vec<Option<Descriptor<'platform, Platform>>>,
-}
+type Descriptors<'platform, Platform> = super::shared::Descriptors<Descriptor<'platform, Platform>>;
 
 enum Descriptor<'platform, Platform: sync::RawSyncPrimitivesProvider> {
     File {
@@ -529,45 +526,4 @@ enum Descriptor<'platform, Platform: sync::RawSyncPrimitivesProvider> {
     Dir {
         dir: Dir<'platform, Platform>,
     },
-}
-
-impl<'platform, Platform: sync::RawSyncPrimitivesProvider> Descriptors<'platform, Platform> {
-    fn new() -> Self {
-        Self {
-            descriptors: vec![],
-        }
-    }
-
-    fn insert(&mut self, descriptor: Descriptor<'platform, Platform>) -> FileFd {
-        let idx = self
-            .descriptors
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or_else(|| {
-                self.descriptors.push(None);
-                self.descriptors.len() - 1
-            });
-        let old = self.descriptors[idx].replace(descriptor);
-        assert!(old.is_none());
-        FileFd {
-            x: OwnedFd::new(idx),
-        }
-    }
-
-    fn remove(&mut self, mut fd: FileFd) {
-        let old = self.descriptors[fd.x.as_usize()].take();
-        assert!(old.is_some());
-        fd.x.mark_as_closed();
-    }
-
-    fn get(&self, fd: &FileFd) -> &Descriptor<'platform, Platform> {
-        // Since the `fd` is borrowed, it must still exist, thus this index will always exist, as
-        // well as have a value within it.
-        self.descriptors[fd.x.as_usize()].as_ref().unwrap()
-    }
-    fn get_mut(&mut self, fd: &FileFd) -> &mut Descriptor<'platform, Platform> {
-        // Since the `fd` is borrowed, it must still exist, thus this index will always exist, as
-        // well as have a value within it.
-        self.descriptors[fd.x.as_usize()].as_mut().unwrap()
-    }
 }
