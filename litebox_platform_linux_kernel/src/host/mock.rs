@@ -10,7 +10,8 @@ static mut SPACES: [Space; 3] = [Space([0; 0x1000]), Space([0; 0x1000]), Space([
 
 impl HostInterface for MockHostInterface {
     #[allow(static_mut_refs)]
-    fn alloc(_layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
+    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
+        assert!(layout.size() <= 0x1000);
         static mut IDX: usize = 0;
         unsafe {
             let space = &mut SPACES[IDX];
