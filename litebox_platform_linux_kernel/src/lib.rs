@@ -6,17 +6,19 @@ use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};
 
 use host::linux::sigset_t;
-use litebox::platform::RawMutex as _;
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, Provider, Punchthrough,
     PunchthroughError, PunchthroughProvider, PunchthroughToken, RawMutexProvider, TimeProvider,
     UnblockedOrTimedOut,
 };
+use litebox::platform::{RawMutex as _, RawPointerProvider};
+use ptr::{UserConstPtr, UserMutPtr};
 
 extern crate alloc;
 
 pub mod error;
 pub mod host;
+pub mod ptr;
 
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 
@@ -31,8 +33,8 @@ pub struct LinuxKernel<Host: HostInterface> {
 pub enum LinuxPunchthrough {
     RtSigprocmask {
         how: i32,
-        set: Option<*const sigset_t>,
-        old_set: Option<*mut sigset_t>,
+        set: UserConstPtr<sigset_t>,
+        old_set: UserMutPtr<sigset_t>,
         sigsetsize: usize,
     },
     // TODO: Add more syscalls
@@ -73,6 +75,11 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
 }
 
 impl<Host: HostInterface> Provider for LinuxKernel<Host> {}
+
+impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
+    type RawConstPointer<T: Clone> = ptr::UserConstPtr<T>;
+    type RawMutPointer<T: Clone> = ptr::UserMutPtr<T>;
+}
 
 impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
     type PunchthroughToken = LinuxPunchthroughToken<Host>;
@@ -126,8 +133,8 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     pub fn rt_sigprocmask(
         &mut self,
         how: i32,
-        set: Option<*const sigset_t>,
-        old_set: Option<*mut sigset_t>,
+        set: UserConstPtr<sigset_t>,
+        old_set: UserMutPtr<sigset_t>,
         sigsetsize: usize,
     ) -> Result<usize, PunchthroughError<error::Errno>> {
         let punchthrough = LinuxPunchthrough::RtSigprocmask {
@@ -347,8 +354,8 @@ pub trait HostInterface {
     /// For Punchthrough
     fn rt_sigprocmask(
         how: i32,
-        set: Option<*const sigset_t>,
-        old_set: Option<*mut sigset_t>,
+        set: UserConstPtr<sigset_t>,
+        old_set: UserMutPtr<sigset_t>,
         sigsetsize: usize,
     ) -> Result<usize, error::Errno>;
 

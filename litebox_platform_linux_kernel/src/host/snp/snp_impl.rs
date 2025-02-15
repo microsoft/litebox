@@ -3,7 +3,12 @@
 use core::arch::asm;
 
 use super::ghcb::ghcb_prints;
-use crate::{error, host::linux, HostInterface};
+use crate::{
+    error,
+    host::linux::{self, sigset_t},
+    ptr::{UserConstPtr, UserMutPtr},
+    HostInterface,
+};
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
@@ -173,19 +178,35 @@ impl HostInterface for HostSnpInterface {
 
     fn rt_sigprocmask(
         how: i32,
-        set: Option<*const crate::host::linux::sigset_t>,
-        oldset: Option<*mut crate::host::linux::sigset_t>,
+        set: UserConstPtr<sigset_t>,
+        oldset: UserMutPtr<sigset_t>,
         sigsetsize: usize,
     ) -> Result<usize, error::Errno> {
+        // Instead of passing the user space pointers to host, here we perform extra read and write
+        // and pass kernel pointers to host. As long as we don't have large data to deal with, this
+        // scheme is more straightforward. Alternative solution from previous implementation requires
+        // the user space memory has mapped to physical pages as host operates on physical pages.
+        // For kernel memory, it is always mapped to physical pages.
+        let kset: Option<sigset_t> = if set.is_null() {
+            None
+        } else {
+            Some(set.read_from_user(0).ok_or(error::Errno::EFAULT)?)
+        };
+        let mut koldset: Option<sigset_t> = if oldset.is_null() { None } else { Some(0) };
         let args = SyscallN::<4, NR_SYSCALL_RT_SIGPROCMASK> {
             args: [
                 how as u32 as _,
-                set.map_or(0, |v| v as u64),
-                oldset.map_or(0, |v| v as u64),
+                // TODO: sandbox driver needs to be updated to accept a kernel pointer from the guest
+                kset.as_ref().map_or(0, |v| v as *const _ as u64),
+                koldset.as_mut().map_or(0, |v| v as *mut _ as u64),
                 sigsetsize as _,
             ],
         };
-        Self::syscalls(args)
+        let r = Self::syscalls(args)?;
+        if let Some(v) = koldset {
+            oldset.write_to_user(0, v).ok_or(error::Errno::EFAULT)?;
+        }
+        Ok(r)
     }
 
     fn wake_many(mutex: &core::sync::atomic::AtomicU32, n: usize) -> Result<usize, error::Errno> {
