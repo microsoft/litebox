@@ -24,8 +24,11 @@ use super::MemoryProvider;
 /// ```
 ///
 /// Before oom, the allocator will try to call rescue function and try for one more time.
-pub struct LockedHeapWithRescue<'a, const ORDER: usize, Platform: RawMutexProvider> {
-    inner: Mutex<'a, Platform, Heap<ORDER>>,
+/// Note we use [`spin::mutex::SpinMutex`] instead of our own Mutex because SpinMutex does not require
+/// an allocator, which breaks the circular dependency.
+pub struct LockedHeapWithRescue<const ORDER: usize, Platform: MemoryProvider> {
+    inner: SpinMutex<Heap<ORDER>>,
+    platform: core::marker::PhantomData<Platform>,
 }
 
 impl<'a, const ORDER: usize, Platform: RawMutexProvider> LockedHeapWithRescue<'a, ORDER, Platform> {
@@ -51,8 +54,7 @@ impl<const ORDER: usize, Platform: RawMutexProvider + MemoryProvider>
     LockedHeapWithRescue<'_, ORDER, Platform>
 {
     /// Allocates pages (page_size >= 4096)
-    pub(super) fn alloc_pages(&self, page_size: usize) -> Option<*mut u8> {
-        let layout = Layout::from_size_align(page_size, 0x1000).unwrap();
+    pub(super) fn alloc_pages(&self, layout: Layout) -> Option<*mut u8> {
         let ptr = unsafe { self.alloc(layout) };
         if ptr.is_null() {
             None

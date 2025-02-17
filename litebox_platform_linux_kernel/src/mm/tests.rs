@@ -13,18 +13,15 @@ const MAX_ORDER: usize = 23;
 
 #[test]
 fn test_heap_oom_rescue() {
-    let allocator = LockedHeapWithRescue::<'_, MAX_ORDER, _>::new(&SYNC);
     unsafe {
-        assert!(allocator.alloc(Layout::from_size_align(0x1000, 1).unwrap()) as usize != 0);
+        assert!(ALLOCATOR.alloc(Layout::from_size_align(0x1000, 1).unwrap()) as usize != 0);
     }
 }
 
 #[test]
 fn test_slab() {
-    let allocator = LockedSlabAllocator::<'_, MAX_ORDER, _>::new(&SYNC);
-
     unsafe {
-        assert!(allocator.alloc(Layout::from_size_align(0x1000, 0x1000).unwrap()) as usize != 0);
-        assert!(allocator.alloc(Layout::from_size_align(0x10, 0x10).unwrap()) as usize != 0);
+        assert!(ALLOCATOR.alloc(Layout::from_size_align(0x1000, 0x1000).unwrap()) as usize != 0);
+        assert!(ALLOCATOR.alloc(Layout::from_size_align(0x10, 0x10).unwrap()) as usize != 0);
     }
 }

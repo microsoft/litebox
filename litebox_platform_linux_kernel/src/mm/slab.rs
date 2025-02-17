@@ -1,6 +1,10 @@
 //! Allocator that uses buddy allocator for pages and slab allocator for small objects.
 
-use core::{alloc::GlobalAlloc, mem::transmute, ptr::NonNull};
+use core::{
+    alloc::{GlobalAlloc, Layout},
+    mem::transmute,
+    ptr::NonNull,
+};
 
 use litebox::{
     platform::RawMutexProvider,
@@ -35,14 +39,18 @@ impl<'a, const ORDER: usize, Platform: RawMutexProvider + MemoryProvider>
     /// Allocates a new [`ObjectPage`] from the System.
     pub fn alloc_page(&self) -> Option<&'static mut ObjectPage<'static>> {
         self.buddy_allocator
-            .alloc_pages(Self::BASE_PAGE_SIZE)
+            .alloc_pages(
+                Layout::from_size_align(Self::BASE_PAGE_SIZE, Self::BASE_PAGE_SIZE).unwrap(),
+            )
             .map(|r| unsafe { transmute(r as usize) })
     }
 
     /// Allocates a new [`LargeObjectPage`] from the system.
     pub fn alloc_large_page(&self) -> Option<&'static mut LargeObjectPage<'static>> {
         self.buddy_allocator
-            .alloc_pages(Self::LARGE_PAGE_SIZE)
+            .alloc_pages(
+                Layout::from_size_align(Self::LARGE_PAGE_SIZE, Self::LARGE_PAGE_SIZE).unwrap(),
+            )
             .map(|r| unsafe { transmute(r as usize) })
     }
 }
@@ -54,11 +62,15 @@ unsafe impl<const ORDER: usize, Platform: RawMutexProvider + MemoryProvider> Glo
         match layout.size() {
             Self::BASE_PAGE_SIZE => self
                 .buddy_allocator
-                .alloc_pages(Self::BASE_PAGE_SIZE)
+                .alloc_pages(
+                    Layout::from_size_align(Self::BASE_PAGE_SIZE, Self::BASE_PAGE_SIZE).unwrap(),
+                )
                 .expect("allocate page"),
             Self::LARGE_PAGE_SIZE => self
                 .buddy_allocator
-                .alloc_pages(Self::LARGE_PAGE_SIZE)
+                .alloc_pages(
+                    Layout::from_size_align(Self::LARGE_PAGE_SIZE, Self::LARGE_PAGE_SIZE).unwrap(),
+                )
                 .expect("allocate large page"),
             0..=ZoneAllocator::MAX_ALLOC_SIZE => {
                 let mut allocator = self.slab_allocator.lock();
@@ -90,7 +102,7 @@ unsafe impl<const ORDER: usize, Platform: RawMutexProvider + MemoryProvider> Glo
             }
             _ => self
                 .buddy_allocator
-                .alloc_pages(layout.size())
+                .alloc_pages(layout)
                 .expect("allocate page"),
         }
     }

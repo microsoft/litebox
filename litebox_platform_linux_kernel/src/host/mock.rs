@@ -4,20 +4,27 @@ use crate::HostInterface;
 
 pub struct MockHostInterface {}
 
-#[repr(align(0x1000))]
-struct Space([u8; 0x1000]);
-static mut SPACES: [Space; 3] = [Space([0; 0x1000]), Space([0; 0x1000]), Space([0; 0x1000])];
+#[macro_export]
+macro_rules! mock_log_println {
+    ($($tt:tt)*) => {{
+        use core::fmt::Write;
+        let mut t: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
+        writeln!(t, $($tt)*).unwrap();
+        <crate::host::mock::MockHostInterface as crate::HostInterface>::log(&t);
+    }};
+}
 
 impl HostInterface for MockHostInterface {
     #[allow(static_mut_refs)]
     fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
-        assert!(layout.size() <= 0x1000);
-        static mut IDX: usize = 0;
-        unsafe {
-            let space = &mut SPACES[IDX];
-            IDX += 1;
-            Ok((space.0.as_ptr() as usize, space.0.len() * size_of::<u8>()))
-        }
+        assert!(layout.size() <= 0x40_0000); // 4MB
+        let size = core::cmp::max(
+            layout.size().next_power_of_two(),
+            core::cmp::max(layout.align(), 0x1000),
+        );
+        let addr = unsafe { libc::memalign(layout.align(), size) };
+        assert_ne!(addr, libc::MAP_FAILED);
+        Ok((addr as usize, size))
     }
 
     fn terminate(_reason_set: u64, _reason_code: u64) -> ! {
@@ -32,8 +39,8 @@ impl HostInterface for MockHostInterface {
         todo!()
     }
 
-    fn log(_msg: &str) {
-        todo!()
+    fn log(msg: &str) {
+        unsafe { libc::write(libc::STDOUT_FILENO, msg.as_ptr() as *const _, msg.len()) };
     }
 
     fn exit() -> ! {
