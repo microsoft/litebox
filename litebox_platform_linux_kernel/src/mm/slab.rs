@@ -37,7 +37,7 @@ impl<'a, const ORDER: usize, Platform: RawMutexProvider + MemoryProvider>
     }
 
     /// Allocates a new [`ObjectPage`] from the System.
-    pub fn alloc_page(&self) -> Option<&'static mut ObjectPage<'static>> {
+    fn alloc_page(&self) -> Option<&'static mut ObjectPage<'static>> {
         self.buddy_allocator
             .alloc_pages(
                 Layout::from_size_align(Self::BASE_PAGE_SIZE, Self::BASE_PAGE_SIZE).unwrap(),
@@ -46,7 +46,7 @@ impl<'a, const ORDER: usize, Platform: RawMutexProvider + MemoryProvider>
     }
 
     /// Allocates a new [`LargeObjectPage`] from the system.
-    pub fn alloc_large_page(&self) -> Option<&'static mut LargeObjectPage<'static>> {
+    fn alloc_large_page(&self) -> Option<&'static mut LargeObjectPage<'static>> {
         self.buddy_allocator
             .alloc_pages(
                 Layout::from_size_align(Self::LARGE_PAGE_SIZE, Self::LARGE_PAGE_SIZE).unwrap(),

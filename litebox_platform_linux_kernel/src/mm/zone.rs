@@ -86,7 +86,7 @@ impl<'a> ZoneAllocator<'a> {
     }
 
     /// Allocate a pointer to a block of memory described by `layout`.
-    pub fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocationError> {
+    pub(super) fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocationError> {
         match ZoneAllocator::get_slab(layout.size()) {
             Slab::Base(idx) => self.small_slabs[idx].lock().allocate(layout),
             Slab::Large(idx) => self.big_slabs[idx].lock().allocate(layout),
@@ -100,7 +100,11 @@ impl<'a> ZoneAllocator<'a> {
     /// # Arguments
     ///  * `ptr` - Address of the memory location to free.
     ///  * `layout` - Memory layout of the block pointed to by `ptr`.
-    pub fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) -> Result<(), AllocationError> {
+    pub(super) fn deallocate(
+        &self,
+        ptr: NonNull<u8>,
+        layout: Layout,
+    ) -> Result<(), AllocationError> {
         match ZoneAllocator::get_slab(layout.size()) {
             Slab::Base(idx) => self.small_slabs[idx].lock().deallocate(ptr, layout),
             Slab::Large(idx) => self.big_slabs[idx].lock().deallocate(ptr, layout),
@@ -113,7 +117,7 @@ impl<'a> ZoneAllocator<'a> {
     ///
     /// # Safety
     /// ObjectPage needs to be emtpy etc.
-    pub unsafe fn refill_and_allocate(
+    pub(super) unsafe fn refill_and_allocate(
         &self,
         layout: Layout,
         new_page: &'a mut ObjectPage<'a>,
@@ -133,7 +137,7 @@ impl<'a> ZoneAllocator<'a> {
     ///
     /// # Safety
     /// ObjectPage needs to be emtpy etc.
-    pub unsafe fn refill_large_and_allocate(
+    pub(super) unsafe fn refill_large_and_allocate(
         &self,
         layout: Layout,
         new_page: &'a mut LargeObjectPage<'a>,

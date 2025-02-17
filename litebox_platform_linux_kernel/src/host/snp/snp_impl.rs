@@ -159,8 +159,12 @@ impl HostInterface for HostSnpInterface {
             [bindings::SNP_VMPL_ALLOC_MAX_ORDER as u64, 0, 0, 0, 0, 0],
         );
         Self::request(&mut req);
-        Self::parse_alloc_result(SNP_VMPL_ALLOC_MAX_ORDER, req.ret)
-            .map(|addr| (addr, (PAGE_SIZE << SNP_VMPL_ALLOC_MAX_ORDER) as usize))
+        Self::parse_alloc_result(bindings::SNP_VMPL_ALLOC_MAX_ORDER, req.ret).map(|addr| {
+            (
+                addr,
+                (PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER) as usize,
+            )
+        })
     }
 
     fn exit() -> ! {
