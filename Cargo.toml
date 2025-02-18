@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "litebox",
+    "litebox_platform_linux_kernel",
     "litebox_platform_linux_userland",
     "litebox_platform_multiplex",
     "litebox_shim_posix",
