@@ -10,8 +10,8 @@ platform_snp = []
 bindgen = "0.71.0"
 
 [dependencies]
-buddy_system_allocator = { version = "0.11.0", default-features = false }
-slabmalloc = { git = "https://github.com/MSRSSP/rust-slabmalloc.git", branch = "master" }
+buddy_system_allocator = { version = "0.11.0", default-features = false, features = ["use_spin"] }
+slabmalloc = { git = "https://github.com/MSRSSP/rust-slabmalloc.git" }
 litebox = { path = "../litebox/", version = "0.1.0" }
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 libc = "0.2.169"

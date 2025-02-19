@@ -346,11 +346,17 @@ impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
 
 /// Platform-Host Interface
 pub trait HostInterface {
-    /// For page allocation.
+    /// Page allocation from host.
     ///
     /// It can return more than requested size. On success, it returns the start address
     /// and the size of the allocated memory.
     fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), error::Errno>;
+
+    /// Returns the memory back to host.
+    ///
+    /// Note host should know the size of allocated memory and needs to check the validity
+    /// of the given address.
+    fn free(addr: usize);
 
     /// Exit
     ///

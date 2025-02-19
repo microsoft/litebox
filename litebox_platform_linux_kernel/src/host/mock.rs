@@ -26,6 +26,10 @@ impl HostInterface for MockHostInterface {
         Ok((addr as usize, size))
     }
 
+    fn free(addr: usize) {
+        unsafe { libc::free(addr as *mut _) };
+    }
+
     fn terminate(_reason_set: u64, _reason_code: u64) -> ! {
         todo!()
     }

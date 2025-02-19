@@ -23,21 +23,25 @@ type ArgsArray = [u64; MAX_ARGS_SIZE];
 
 #[cfg(not(test))]
 #[global_allocator]
-static SNP_ALLOCATOR: crate::mm::slab::LockedSlabAllocator<'static, HEAP_ORDER, SnpLinuxKernel> =
-    crate::mm::slab::LockedSlabAllocator::new();
+static SNP_ALLOCATOR: crate::mm::alloc::SafeZoneAllocator<'static, HEAP_ORDER, SnpLinuxKernel> =
+    crate::mm::alloc::SafeZoneAllocator::new();
 
 #[cfg(not(test))]
 impl crate::mm::MemoryProvider for SnpLinuxKernel {
-    fn mem_allocate_pages(order: usize) -> Option<*mut u8> {
+    fn mem_allocate_pages(order: u32) -> Option<*mut u8> {
         SNP_ALLOCATOR.allocate_pages(order)
     }
 
-    unsafe fn mem_free_pages(ptr: *mut u8, order: usize) {
+    unsafe fn mem_free_pages(ptr: *mut u8, order: u32) {
         SNP_ALLOCATOR.free_pages(ptr, order)
     }
 
     fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
         HostSnpInterface::alloc(layout)
+    }
+
+    fn free(addr: usize) {
+        HostSnpInterface::free(addr)
     }
 }
 
@@ -168,7 +172,8 @@ impl HostInterface for HostSnpInterface {
     }
 
     fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), error::Errno> {
-        // allocate at least one page
+        // To reduce the number of hypercalls, we allocate the maximum order.
+        // Assertion is added to prevent the allocation size from exceeding the maximum order.
         let size = core::cmp::max(layout.size().next_power_of_two(), PAGE_SIZE as usize);
         assert!(size > (PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER) as usize);
 
@@ -184,6 +189,10 @@ impl HostInterface for HostSnpInterface {
                 (PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER) as usize,
             )
         })
+    }
+
+    fn free(_addr: usize) {
+        unimplemented!()
     }
 
     fn exit() -> ! {

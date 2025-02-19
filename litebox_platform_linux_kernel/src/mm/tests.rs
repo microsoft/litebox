@@ -2,26 +2,29 @@ use core::alloc::{GlobalAlloc, Layout};
 
 use crate::{host::mock::MockHostInterface, mm::MemoryProvider, HostInterface, LinuxKernel};
 
-use super::slab::LockedSlabAllocator;
+use super::alloc::SafeZoneAllocator;
 
 const MAX_ORDER: usize = 23;
 type MockKernel = LinuxKernel<MockHostInterface>;
 
 #[global_allocator]
-pub static ALLOCATOR: LockedSlabAllocator<'static, MAX_ORDER, MockKernel> =
-    LockedSlabAllocator::new();
+pub static ALLOCATOR: SafeZoneAllocator<'static, MAX_ORDER, MockKernel> = SafeZoneAllocator::new();
 
 impl super::MemoryProvider for MockKernel {
     fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
         MockHostInterface::alloc(layout)
     }
 
-    fn mem_allocate_pages(order: usize) -> Option<*mut u8> {
+    fn mem_allocate_pages(order: u32) -> Option<*mut u8> {
         ALLOCATOR.allocate_pages(order)
     }
 
-    unsafe fn mem_free_pages(ptr: *mut u8, order: usize) {
+    unsafe fn mem_free_pages(ptr: *mut u8, order: u32) {
         ALLOCATOR.free_pages(ptr, order)
+    }
+
+    fn free(addr: usize) {
+        MockHostInterface::free(addr);
     }
 }
 
