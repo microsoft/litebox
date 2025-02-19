@@ -75,6 +75,7 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
     }
 
     /// De-allocates physically contiguous pages returned from [`LockedSlabAllocator::allocate_pages`].
+    #[allow(dead_code)]
     pub(crate) unsafe fn free_pages(&self, ptr: *mut u8, order: u32) {
         self.buddy_allocator.dealloc(
             ptr,
