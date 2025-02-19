@@ -11,10 +11,8 @@ bindgen = "0.71.0"
 
 [dependencies]
 buddy_system_allocator = { version = "0.11.0", default-features = false }
-lazy_static = "1.5.0"
 slabmalloc = { git = "https://github.com/MSRSSP/rust-slabmalloc.git", branch = "master" }
 litebox = { path = "../litebox/", version = "0.1.0" }
-once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 libc = "0.2.169"
 arrayvec = { version = "0.7.6", default-features = false }

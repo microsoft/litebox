@@ -53,6 +53,8 @@ impl<const ORDER: usize, Platform: MemoryProvider> LockedSlabAllocator<'_, ORDER
             .map(|r| unsafe { transmute(r as usize) })
     }
 
+    #[allow(dead_code)]
+    /// Allocate (1 << `order`) virtually and physically contiguous pages using buddy allocator.
     pub(crate) fn allocate_pages(&self, order: usize) -> Option<*mut u8> {
         self.buddy_allocator.alloc_pages(
             Layout::from_size_align(Self::BASE_PAGE_SIZE << order, Self::BASE_PAGE_SIZE << order)
@@ -60,6 +62,8 @@ impl<const ORDER: usize, Platform: MemoryProvider> LockedSlabAllocator<'_, ORDER
         )
     }
 
+    #[allow(dead_code)]
+    /// De-allocates physically contiguous pages returned from [`LockedSlabAllocator::allocate_pages`].
     pub(crate) unsafe fn free_pages(&self, ptr: *mut u8, order: usize) {
         self.buddy_allocator.dealloc(
             ptr,

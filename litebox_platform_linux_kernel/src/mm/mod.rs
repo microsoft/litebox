@@ -36,7 +36,7 @@ pub trait MemoryProvider {
     /// Allocate (1 << `order`) virtually and physically contiguous pages using buddy allocator.
     fn mem_allocate_pages(order: usize) -> Option<*mut u8>;
 
-    /// De-allocates physically consecutive pages returned from [`Self::mem_allocate_pages`].
+    /// De-allocates physically contiguous pages returned from [`Self::mem_allocate_pages`].
     ///
     /// # Safety
     ///
