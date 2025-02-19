@@ -13,13 +13,6 @@ use super::MemoryProvider;
 
 /// A locked version of `Heap` with rescue before oom
 ///
-/// # Usage
-///
-/// Create a locked heap:
-/// ```
-/// let heap = LockedHeapWithRescue::new(|heap: &mut Heap<33>, layout: &core::alloc::Layout| {});
-/// ```
-///
 /// Before oom, the allocator will try to call rescue function and try for one more time.
 /// Note we use [`spin::mutex::SpinMutex`] instead of our own Mutex because SpinMutex does not require
 /// an allocator, which breaks the circular dependency.
