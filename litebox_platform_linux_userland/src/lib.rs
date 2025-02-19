@@ -352,7 +352,7 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     type PunchthroughToken = PunchthroughProvider::PunchthroughToken;
 
     fn get_punchthrough_token_for(
-        &mut self,
+        &self,
         punchthrough: <Self::PunchthroughToken as litebox::platform::PunchthroughToken>::Punchthrough,
     ) -> Option<Self::PunchthroughToken> {
         // TODO(jayb): We may wish to make the linux userland platform less generic, and support a

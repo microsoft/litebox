@@ -13,7 +13,7 @@ pub struct ImpossiblePunchthroughProvider {}
 impl PunchthroughProvider for ImpossiblePunchthroughProvider {
     type PunchthroughToken = ImpossiblePunchthroughToken;
     fn get_punchthrough_token_for(
-        &mut self,
+        &self,
         punchthrough: <Self::PunchthroughToken as PunchthroughToken>::Punchthrough,
     ) -> Option<Self::PunchthroughToken> {
         // Since `ImpossiblePunchthrough` is an empty enum, it is impossible to actually invoke
@@ -53,7 +53,7 @@ pub struct IgnoredPunchthroughProvider {}
 impl PunchthroughProvider for IgnoredPunchthroughProvider {
     type PunchthroughToken = IgnoredPunchthroughToken;
     fn get_punchthrough_token_for(
-        &mut self,
+        &self,
         punchthrough: <Self::PunchthroughToken as PunchthroughToken>::Punchthrough,
     ) -> Option<Self::PunchthroughToken> {
         Some(IgnoredPunchthroughToken { punchthrough })

@@ -85,7 +85,7 @@ impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
     type PunchthroughToken = LinuxPunchthroughToken<Host>;
 
     fn get_punchthrough_token_for(
-        &mut self,
+        &self,
         punchthrough: <Self::PunchthroughToken as PunchthroughToken>::Punchthrough,
     ) -> Option<Self::PunchthroughToken> {
         Some(LinuxPunchthroughToken {
