@@ -7,10 +7,7 @@ use core::{
 };
 
 use buddy_system_allocator::Heap;
-use litebox::{
-    platform::RawMutexProvider,
-    sync::{Mutex, Synchronization},
-};
+use spin::mutex::SpinMutex;
 
 use super::MemoryProvider;
 
@@ -31,30 +28,28 @@ pub struct LockedHeapWithRescue<const ORDER: usize, Platform: MemoryProvider> {
     platform: core::marker::PhantomData<Platform>,
 }
 
-impl<'a, const ORDER: usize, Platform: RawMutexProvider> LockedHeapWithRescue<'a, ORDER, Platform> {
+impl<const ORDER: usize, Platform: MemoryProvider> LockedHeapWithRescue<ORDER, Platform> {
     /// Creates an empty heap
-    pub fn new(sync: &'a Synchronization<'_, Platform>) -> Self {
+    pub(super) const fn new() -> Self {
         LockedHeapWithRescue {
-            inner: sync.new_mutex(Heap::<ORDER>::new()),
+            inner: SpinMutex::new(Heap::<ORDER>::new()),
+            platform: core::marker::PhantomData,
         }
     }
 }
 
-impl<'a, const ORDER: usize, Platform: RawMutexProvider> Deref
-    for LockedHeapWithRescue<'a, ORDER, Platform>
-{
-    type Target = Mutex<'a, Platform, Heap<ORDER>>;
+impl<const ORDER: usize, Platform: MemoryProvider> Deref for LockedHeapWithRescue<ORDER, Platform> {
+    type Target = SpinMutex<Heap<ORDER>>;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-impl<const ORDER: usize, Platform: RawMutexProvider + MemoryProvider>
-    LockedHeapWithRescue<'_, ORDER, Platform>
-{
+impl<const ORDER: usize, Platform: MemoryProvider> LockedHeapWithRescue<ORDER, Platform> {
     /// Allocates pages (page_size >= 4096)
     pub(super) fn alloc_pages(&self, layout: Layout) -> Option<*mut u8> {
+        assert_ne!(layout.size(), 0);
         let ptr = unsafe { self.alloc(layout) };
         if ptr.is_null() {
             None
@@ -64,8 +59,8 @@ impl<const ORDER: usize, Platform: RawMutexProvider + MemoryProvider>
     }
 }
 
-unsafe impl<const ORDER: usize, Platform: RawMutexProvider + MemoryProvider> GlobalAlloc
-    for LockedHeapWithRescue<'_, ORDER, Platform>
+unsafe impl<const ORDER: usize, Platform: MemoryProvider> GlobalAlloc
+    for LockedHeapWithRescue<ORDER, Platform>
 {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut inner = self.inner.lock();

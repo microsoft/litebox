@@ -11,7 +11,6 @@ use litebox::platform::{
     PunchthroughError, PunchthroughProvider, PunchthroughToken, RawMutexProvider, TimeProvider,
     UnblockedOrTimedOut,
 };
-use mem::MemoryProvider;
 use litebox::platform::{RawMutex as _, RawPointerProvider};
 use ptr::{UserConstPtr, UserMutPtr};
 
@@ -171,12 +170,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     #[allow(dead_code)]
     fn terminate(&self, reason_set: u64, reason_code: u64) -> ! {
         Host::terminate(reason_set, reason_code)
-    }
-}
-
-impl<Host: HostInterface> mm::MemoryProvider for LinuxKernel<Host> {
-    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
-        Host::alloc(layout)
     }
 }
 

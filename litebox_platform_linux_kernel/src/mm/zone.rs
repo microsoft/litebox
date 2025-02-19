@@ -33,10 +33,10 @@ impl<'a> ZoneAllocator<'a> {
     /// e.g. this is 4 KiB - 80 bytes of meta-data.
     pub const MAX_BASE_ALLOC_SIZE: usize = 256;
 
-    /// How many allocators of type SCAllocator<ObjectPage> we have.
+    /// How many allocators of type [`SCAllocator<ObjectPage>`] we have.
     const MAX_BASE_SIZE_CLASSES: usize = 6;
 
-    /// How many allocators of type SCAllocator<LargeObjectPage> we have.
+    /// How many allocators of type [`SCAllocator<LargeObjectPage>`] we have.
     const MAX_LARGE_SIZE_CLASSES: usize = 9;
 
     pub(super) const fn new() -> Self {

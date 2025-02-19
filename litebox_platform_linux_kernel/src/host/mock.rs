@@ -15,7 +15,6 @@ macro_rules! mock_log_println {
 }
 
 impl HostInterface for MockHostInterface {
-    #[allow(static_mut_refs)]
     fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
         assert!(layout.size() <= 0x40_0000); // 4MB
         let size = core::cmp::max(
@@ -47,15 +46,6 @@ impl HostInterface for MockHostInterface {
         todo!()
     }
 
-    fn rt_sigprocmask(
-        _how: i32,
-        _set: Option<*const super::linux::sigset_t>,
-        _old_set: Option<*mut super::linux::sigset_t>,
-        _sigsetsize: usize,
-    ) -> Result<usize, crate::error::Errno> {
-        todo!()
-    }
-
     fn wake_many(_mutex: &AtomicU32, _n: usize) -> Result<usize, crate::error::Errno> {
         todo!()
     }
@@ -65,6 +55,15 @@ impl HostInterface for MockHostInterface {
         _val: u32,
         _timeout: Option<core::time::Duration>,
     ) -> Result<(), crate::error::Errno> {
+        todo!()
+    }
+
+    fn rt_sigprocmask(
+        _how: i32,
+        _set: crate::ptr::UserConstPtr<super::linux::sigset_t>,
+        _old_set: crate::ptr::UserMutPtr<super::linux::sigset_t>,
+        _sigsetsize: usize,
+    ) -> Result<usize, crate::error::Errno> {
         todo!()
     }
 }

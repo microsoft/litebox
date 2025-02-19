@@ -26,7 +26,7 @@ impl<T: Clone> UserConstPtr<T> {
     }
 
     /// Read from user space at the `off` offset
-    pub fn read_from_user(self, off: isize) -> Option<T> {
+    pub fn from_user_at_offset(self, off: isize) -> Option<T> {
         unsafe { Some(self.read_at_offset(off)?.into_owned()) }
     }
 }
@@ -69,7 +69,7 @@ impl<T: Clone> UserMutPtr<T> {
     }
 
     /// Write to user space at the `off` offset
-    pub fn write_to_user(self, off: isize, value: T) -> Option<()> {
+    pub fn to_user_at_offset(self, off: isize, value: T) -> Option<()> {
         unsafe { self.write_at_offset(off, value) }
     }
 }

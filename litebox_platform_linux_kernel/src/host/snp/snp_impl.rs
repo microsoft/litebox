@@ -7,7 +7,7 @@ use crate::{
     HostInterface, error,
     host::linux::{self, sigset_t},
     ptr::{UserConstPtr, UserMutPtr},
-    mem::slab::LockedSlabAllocator, HostInterface, LinuxKernel,
+    HostInterface, LinuxKernel,
 };
 
 #[allow(dead_code)]
@@ -17,10 +17,29 @@ mod bindings {
 
 const HEAP_ORDER: usize = bindings::SNP_VMPL_ALLOC_MAX_ORDER as usize + 12 + 1;
 pub type SnpLinuxKernel = LinuxKernel<HostSnpInterface>;
-pub type SnpSlabAllocator = LockedSlabAllocator<'static, HEAP_ORDER, SnpLinuxKernel>;
 
 const MAX_ARGS_SIZE: usize = 6;
 type ArgsArray = [u64; MAX_ARGS_SIZE];
+
+#[cfg(not(test))]
+#[global_allocator]
+static SNP_ALLOCATOR: crate::mm::slab::LockedSlabAllocator<'static, HEAP_ORDER, SnpLinuxKernel> =
+    crate::mm::slab::LockedSlabAllocator::new();
+
+#[cfg(not(test))]
+impl crate::mm::MemoryProvider for SnpLinuxKernel {
+    fn mem_allocate_pages(order: usize) -> Option<*mut u8> {
+        SNP_ALLOCATOR.allocate_pages(order)
+    }
+
+    unsafe fn mem_free_pages(ptr: *mut u8, order: usize) {
+        SNP_ALLOCATOR.free_pages(ptr, order)
+    }
+
+    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
+        HostSnpInterface::alloc(layout)
+    }
+}
 
 impl bindings::SnpVmplRequestArgs {
     #[inline]
@@ -204,7 +223,7 @@ impl HostInterface for HostSnpInterface {
         let kset: Option<sigset_t> = if set.is_null() {
             None
         } else {
-            Some(set.read_from_user(0).ok_or(error::Errno::EFAULT)?)
+            Some(set.from_user_at_offset(0).ok_or(error::Errno::EFAULT)?)
         };
         let mut koldset: Option<sigset_t> = if oldset.is_null() { None } else { Some(0) };
         let args = SyscallN::<4, NR_SYSCALL_RT_SIGPROCMASK> {
@@ -218,7 +237,7 @@ impl HostInterface for HostSnpInterface {
         };
         let r = Self::syscalls(args)?;
         if let Some(v) = koldset {
-            oldset.write_to_user(0, v).ok_or(error::Errno::EFAULT)?;
+            oldset.to_user_at_offset(0, v).ok_or(error::Errno::EFAULT)?;
         }
         Ok(r)
     }
