@@ -4,3 +4,5 @@ mod snp;
 
 #[cfg(test)]
 pub mod mock;
+
+pub use snp::SnpLinuxKenrel;

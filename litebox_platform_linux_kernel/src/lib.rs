@@ -162,13 +162,11 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         token.execute()
     }
 
-    #[allow(dead_code)]
-    fn exit(&self) {
+    pub fn exit(&self) {
         Host::exit();
     }
 
-    #[allow(dead_code)]
-    fn terminate(&self, reason_set: u64, reason_code: u64) -> ! {
+    pub fn terminate(&self, reason_set: u64, reason_code: u64) -> ! {
         Host::terminate(reason_set, reason_code)
     }
 }
