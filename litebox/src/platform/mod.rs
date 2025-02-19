@@ -40,12 +40,13 @@ pub trait PunchthroughProvider {
     type PunchthroughToken: PunchthroughToken;
     /// Give permission token to invoke `punchthrough`, possibly after checking that it is ok.
     ///
-    /// The reason `&mut self` is taken mutably is to ensure that tokens aren't being held around
-    /// for too long (i.e., all other platform interaction is disallowed between the creation and
-    /// consumption of a token), as well as allowing the token to (possibly) get mutable access to
-    /// the underlying platform storage.
+    /// Even though `&self` is taken shared, the intention with the tokens is to use them
+    /// _immediately_ before invoking other platform interactions. Ideally, we would ensure this via
+    /// an `&mut self` to guarantee exclusivity, but this would limit us from supporting the ability
+    /// for other threads being blocked when a punchthrough is done. Thus, this is kept as a
+    /// `&self`. Morally this should be viewed as a `&mut self`.
     fn get_punchthrough_token_for(
-        &mut self,
+        &self,
         punchthrough: <Self::PunchthroughToken as PunchthroughToken>::Punchthrough,
     ) -> Option<Self::PunchthroughToken>;
 }
