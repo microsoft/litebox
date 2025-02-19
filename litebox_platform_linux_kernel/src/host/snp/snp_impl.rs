@@ -7,7 +7,7 @@ use crate::{
     HostInterface, error,
     host::linux::{self, sigset_t},
     ptr::{UserConstPtr, UserMutPtr},
-    HostInterface, LinuxKernel,
+    HostInterface,
 };
 
 #[allow(dead_code)]
@@ -15,19 +15,22 @@ mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
+#[allow(dead_code)]
 const HEAP_ORDER: usize = bindings::SNP_VMPL_ALLOC_MAX_ORDER as usize + 12 + 1;
-pub type SnpLinuxKernel = LinuxKernel<HostSnpInterface>;
 
 const MAX_ARGS_SIZE: usize = 6;
 type ArgsArray = [u64; MAX_ARGS_SIZE];
 
 #[cfg(not(test))]
 #[global_allocator]
-static SNP_ALLOCATOR: crate::mm::alloc::SafeZoneAllocator<'static, HEAP_ORDER, SnpLinuxKernel> =
-    crate::mm::alloc::SafeZoneAllocator::new();
+static SNP_ALLOCATOR: crate::mm::alloc::SafeZoneAllocator<
+    'static,
+    HEAP_ORDER,
+    crate::LinuxKernel<HostSnpInterface>,
+> = crate::mm::alloc::SafeZoneAllocator::new();
 
 #[cfg(not(test))]
-impl crate::mm::MemoryProvider for SnpLinuxKernel {
+impl crate::mm::MemoryProvider for crate::LinuxKernel<HostSnpInterface> {
     fn mem_allocate_pages(order: u32) -> Option<*mut u8> {
         SNP_ALLOCATOR.allocate_pages(order)
     }
