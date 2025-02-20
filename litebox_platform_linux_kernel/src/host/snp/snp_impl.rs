@@ -14,31 +14,43 @@ mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
-#[allow(dead_code)]
-const HEAP_ORDER: usize = bindings::SNP_VMPL_ALLOC_MAX_ORDER as usize + 12 + 1;
 pub type SnpLinuxKenrel = crate::LinuxKernel<HostSnpInterface>;
 
 const MAX_ARGS_SIZE: usize = 6;
 type ArgsArray = [u64; MAX_ARGS_SIZE];
 
 #[cfg(not(test))]
-#[global_allocator]
-static SNP_ALLOCATOR: crate::mm::alloc::SafeZoneAllocator<'static, HEAP_ORDER, SnpLinuxKenrel> =
-    crate::mm::alloc::SafeZoneAllocator::new();
+mod alloc {
+    use crate::HostInterface;
 
-#[cfg(not(test))]
-impl crate::mm::MemoryProvider for SnpLinuxKenrel {
-    fn mem_allocate_pages(order: u32) -> Option<*mut u8> {
-        SNP_ALLOCATOR.allocate_pages(order)
-    }
+    const HEAP_ORDER: usize = super::bindings::SNP_VMPL_ALLOC_MAX_ORDER as usize + 12 + 1;
+    const PGDIR_SHIFT: u64 = 39;
+    const LINUX_PAGE_OFFSET: u64 = 0xffff888000000000;
+    const LITEBOX_PAGE_OFFSET: u64 = LINUX_PAGE_OFFSET + (1 << PGDIR_SHIFT);
+
+    #[global_allocator]
+    static SNP_ALLOCATOR: crate::mm::alloc::SafeZoneAllocator<
+        'static,
+        HEAP_ORDER,
+        super::SnpLinuxKenrel,
+    > = crate::mm::alloc::SafeZoneAllocator::new();
+
+    #[cfg(not(test))]
+    impl crate::mm::MemoryProvider for super::SnpLinuxKenrel {
+        const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(LITEBOX_PAGE_OFFSET);
+        const PRIVATE_PTE_MASK: u64 = 1 << 51; // SNP encryption bit
+
+        fn mem_allocate_pages(order: u32) -> Option<*mut u8> {
+            SNP_ALLOCATOR.allocate_pages(order)
+        }
 
     unsafe fn mem_free_pages(ptr: *mut u8, order: u32) {
         unsafe { SNP_ALLOCATOR.free_pages(ptr, order) }
     }
 
-    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
-        HostSnpInterface::alloc(layout)
-    }
+        fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
+            super::HostSnpInterface::alloc(layout)
+        }
 
     unsafe fn free(addr: usize) {
         unsafe { HostSnpInterface::free(addr) }

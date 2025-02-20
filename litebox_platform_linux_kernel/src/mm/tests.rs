@@ -11,6 +11,9 @@ type MockKernel = LinuxKernel<MockHostInterface>;
 pub static ALLOCATOR: SafeZoneAllocator<'static, MAX_ORDER, MockKernel> = SafeZoneAllocator::new();
 
 impl super::MemoryProvider for MockKernel {
+    const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(0);
+    const PRIVATE_PTE_MASK: u64 = 0;
+
     fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
         MockHostInterface::alloc(layout)
     }

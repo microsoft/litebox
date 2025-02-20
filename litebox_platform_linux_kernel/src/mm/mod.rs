@@ -4,12 +4,20 @@
 use buddy_system_allocator::Heap;
 
 pub mod alloc;
+mod pgtable;
 
 #[cfg(test)]
 pub mod tests;
 
 /// Memory provider trait for global allocator.
 pub trait MemoryProvider {
+    /// Global virtual address offset for one-to-one mapping of physical memory
+    /// to kernel virtual memory.
+    const GVA_OFFSET: x86_64::VirtAddr;
+    /// Mask for private page table entry (e.g., SNP encryption bit).
+    /// For simplicity, we assume the mask is constant.
+    const PRIVATE_PTE_MASK: u64;
+
     /// For page allocation from host.
     ///
     /// Note this is only called by [`Self::rescue_heap`] when the buddy allocator is out of memory.
@@ -50,4 +58,20 @@ pub trait MemoryProvider {
     ///
     /// `order` must be the same as the one used during allocation.
     unsafe fn mem_free_pages(ptr: *mut u8, order: u32);
+
+    /// Obtain physical address (PA) of a page given its VA
+    fn va_to_pa(va: x86_64::VirtAddr) -> x86_64::PhysAddr {
+        x86_64::PhysAddr::new_truncate(va - Self::GVA_OFFSET)
+    }
+
+    /// Obtain virtual address (VA) of a page given its PA
+    fn pa_to_va(pa: x86_64::PhysAddr) -> x86_64::VirtAddr {
+        let pa = pa.as_u64() & !Self::PRIVATE_PTE_MASK;
+        x86_64::VirtAddr::new_truncate(pa + Self::GVA_OFFSET.as_u64())
+    }
+
+    /// /// Set physical address as private via mask.
+    fn make_pa_private(pa: x86_64::PhysAddr) -> x86_64::PhysAddr {
+        x86_64::PhysAddr::new_truncate(pa.as_u64() | Self::PRIVATE_PTE_MASK)
+    }
 }
