@@ -4,10 +4,9 @@ use core::arch::asm;
 
 use super::ghcb::ghcb_prints;
 use crate::{
-    error,
+    HostInterface, error,
     host::linux::{self, sigset_t},
     ptr::{UserConstPtr, UserMutPtr},
-    HostInterface,
 };
 
 #[allow(dead_code)]

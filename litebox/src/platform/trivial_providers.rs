@@ -112,18 +112,22 @@ pub struct TransparentConstPtr<T> {
 impl<T: Clone> Copy for TransparentConstPtr<T> {}
 impl<T: Clone> RawConstPointer<T> for TransparentConstPtr<T> {
     unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
-        if self.inner.is_null() || !self.inner.is_aligned() {
-            return None;
+        unsafe {
+            if self.inner.is_null() || !self.inner.is_aligned() {
+                return None;
+            }
+            Some(alloc::borrow::Cow::Borrowed(&*self.inner.offset(count)))
         }
-        Some(alloc::borrow::Cow::Borrowed(&*self.inner.offset(count)))
     }
     unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
-        if self.inner.is_null() || !self.inner.is_aligned() {
-            return None;
+        unsafe {
+            if self.inner.is_null() || !self.inner.is_aligned() {
+                return None;
+            }
+            Some(alloc::borrow::Cow::Borrowed(core::slice::from_raw_parts(
+                self.inner, len,
+            )))
         }
-        Some(alloc::borrow::Cow::Borrowed(core::slice::from_raw_parts(
-            self.inner, len,
-        )))
     }
 }
 
@@ -138,27 +142,33 @@ pub struct TransparentMutPtr<T> {
 impl<T: Clone> Copy for TransparentMutPtr<T> {}
 impl<T: Clone> RawConstPointer<T> for TransparentMutPtr<T> {
     unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
-        if self.inner.is_null() || !self.inner.is_aligned() {
-            return None;
+        unsafe {
+            if self.inner.is_null() || !self.inner.is_aligned() {
+                return None;
+            }
+            Some(alloc::borrow::Cow::Borrowed(&*self.inner.offset(count)))
         }
-        Some(alloc::borrow::Cow::Borrowed(&*self.inner.offset(count)))
     }
     unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
-        if self.inner.is_null() || !self.inner.is_aligned() {
-            return None;
+        unsafe {
+            if self.inner.is_null() || !self.inner.is_aligned() {
+                return None;
+            }
+            Some(alloc::borrow::Cow::Borrowed(core::slice::from_raw_parts(
+                self.inner, len,
+            )))
         }
-        Some(alloc::borrow::Cow::Borrowed(core::slice::from_raw_parts(
-            self.inner, len,
-        )))
     }
 }
 impl<T: Clone> RawMutPointer<T> for TransparentMutPtr<T> {
     unsafe fn write_at_offset(self, count: isize, value: T) -> Option<()> {
-        if self.inner.is_null() || !self.inner.is_aligned() {
-            return None;
+        unsafe {
+            if self.inner.is_null() || !self.inner.is_aligned() {
+                return None;
+            }
+            *self.inner.offset(count) = value;
+            Some(())
         }
-        *self.inner.offset(count) = value;
-        Some(())
     }
     fn mutate_subslice_with<R>(
         self,

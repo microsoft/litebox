@@ -10,11 +10,11 @@ use crate::fd::{FileFd, OwnedFd};
 use crate::path::Arg;
 use crate::sync;
 
+use super::Mode;
 use super::errors::{
     ChmodError, CloseError, MkdirError, OpenError, PathError, ReadError, RmdirError, UnlinkError,
     WriteError,
 };
-use super::Mode;
 
 /// A backing implementation for [`FileSystem`](super::FileSystem) storing all files in-memory.
 ///

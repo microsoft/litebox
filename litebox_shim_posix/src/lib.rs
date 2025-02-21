@@ -24,7 +24,7 @@ use litebox_platform_multiplex::Platform;
 pub mod errno;
 use errno::AsErrno as _;
 
-pub(crate) fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
+pub(crate) fn litebox_fs<'a>() -> &'a (impl litebox::fs::FileSystem + use<>) {
     static FS: OnceBox<litebox::fs::in_mem::FileSystem<Platform>> = OnceBox::new();
     FS.get_or_init(|| {
         alloc::boxed::Box::new(litebox::fs::in_mem::FileSystem::new(
@@ -86,14 +86,13 @@ impl Descriptors {
             return None;
         }
         let fd = fd as usize;
-        if let Some(Descriptor::File(file_fd)) = self
+        match self
             .descriptors
             .get_mut(fd)?
             .take_if(|v| matches!(v, Descriptor::File(_)))
         {
-            Some(file_fd)
-        } else {
-            None
+            Some(Descriptor::File(file_fd)) => Some(file_fd),
+            _ => None,
         }
     }
     fn remove_socket(&mut self, fd: u32) -> Option<litebox::fd::SocketFd> {
@@ -101,14 +100,13 @@ impl Descriptors {
             return None;
         }
         let fd = fd as usize;
-        if let Some(Descriptor::Socket(socket_fd)) = self
+        match self
             .descriptors
             .get_mut(fd)?
             .take_if(|v| matches!(v, Descriptor::Socket(_)))
         {
-            Some(socket_fd)
-        } else {
-            None
+            Some(Descriptor::Socket(socket_fd)) => Some(socket_fd),
+            _ => None,
         }
     }
     fn get_file_fd(&self, fd: u32) -> Option<&litebox::fd::FileFd> {
