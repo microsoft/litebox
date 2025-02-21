@@ -29,7 +29,7 @@ pub(crate) struct Index {
     // optimization to make storage more efficient. Additionally, this also allows for `Index` to
     // get niche-filling-optimized if it is placed into some struct/enum outside (e.g.,
     // `Option<Index>` takes 32-bits fewer than if we had kept this as a u32).
-    r#gen: NonZeroU32,
+    generation: NonZeroU32,
     // Index into the `ArrayIndexMap::storage`
     idx: u32,
 }
@@ -43,8 +43,8 @@ impl Index {
 }
 
 enum Slot<T> {
-    Filled { r#gen: NonZeroU32, data: T },
-    Unfilled { r#gen: NonZeroU32 },
+    Filled { generation: NonZeroU32, data: T },
+    Unfilled { generation: NonZeroU32 },
 }
 
 impl<T, const CAPACITY: usize> ArrayIndexMap<T, CAPACITY> {
@@ -53,7 +53,7 @@ impl<T, const CAPACITY: usize> ArrayIndexMap<T, CAPACITY> {
         Self {
             storage: [const {
                 Slot::Unfilled {
-                    r#gen: NonZeroU32::new(1).unwrap(),
+                    generation: NonZeroU32::new(1).unwrap(),
                 }
             }; CAPACITY],
             next_free_slot: 0,
@@ -70,26 +70,29 @@ impl<T, const CAPACITY: usize> ArrayIndexMap<T, CAPACITY> {
     /// Insert `v` into the map, returning a new index to refer to it.
     pub(crate) fn insert(&mut self, v: T) -> Index {
         // Get the next _actually_ unfilled slot that we can fill up
-        let (r#gen, idx) = loop {
+        let (generation, idx) = loop {
             let idx = self.next_free_slot;
             self.next_free_slot = (self.next_free_slot + 1) % CAPACITY;
             match self.storage[idx] {
                 Slot::Filled { .. } => {
                     // Is filled, we don't want it
                 }
-                Slot::Unfilled { r#gen } if r#gen == NonZeroU32::MAX => {
+                Slot::Unfilled { generation } if generation == NonZeroU32::MAX => {
                     // Has used up all of the possible generations; is a tombstone, we don't want it
                 }
-                Slot::Unfilled { r#gen } => {
-                    break (r#gen, idx);
+                Slot::Unfilled { generation } => {
+                    break (generation, idx);
                 }
             }
         };
         // Fill it up, keeping generation number the same (it is only incremented upon removal)
-        self.storage[idx] = Slot::Filled { r#gen, data: v };
+        self.storage[idx] = Slot::Filled {
+            generation,
+            data: v,
+        };
         // And produce the strong generational index to access it
         Index {
-            r#gen,
+            generation,
             idx: idx.try_into().unwrap(),
         }
     }
@@ -100,14 +103,18 @@ impl<T, const CAPACITY: usize> ArrayIndexMap<T, CAPACITY> {
         let _ = self.get(idx)?;
         // We now know that we can remove the value. We do this by dropping in the unfilled marker,
         // bumping up the generation.
-        let Slot::Filled { r#gen: _, data } = core::mem::replace(
+        let Slot::Filled {
+            generation: _,
+            data,
+        } = core::mem::replace(
             &mut self.storage[idx.index()],
             Slot::Unfilled {
                 // Since it is a filled slot, it could not have transitioned from a tombstone
                 // (u32::MAX), thus this addition should never overflow.
-                r#gen: idx.r#gen.checked_add(1).unwrap(),
+                generation: idx.generation.checked_add(1).unwrap(),
             },
-        ) else {
+        )
+        else {
             // We just confirmed that we are in a filled slot stage in the right generation, so it
             // is impossible for this to be reached.
             unreachable!()
@@ -123,12 +130,15 @@ impl<T, const CAPACITY: usize> ArrayIndexMap<T, CAPACITY> {
                 // Has already been removed at some point
                 None
             }
-            Slot::Filled { r#gen, .. } if *r#gen != idx.r#gen => {
+            Slot::Filled { generation, .. } if *generation != idx.generation => {
                 // Has been removed, and then a new element was filled in at some point. This is not
                 // the correct generation for this index.
                 None
             }
-            Slot::Filled { r#gen: _, data } => {
+            Slot::Filled {
+                generation: _,
+                data,
+            } => {
                 // We have the right generation :)
                 Some(data)
             }
@@ -143,12 +153,15 @@ impl<T, const CAPACITY: usize> ArrayIndexMap<T, CAPACITY> {
                 // Has already been removed at some point
                 None
             }
-            Slot::Filled { r#gen, .. } if *r#gen != idx.r#gen => {
+            Slot::Filled { generation, .. } if *generation != idx.generation => {
                 // Has been removed, and then a new element was filled in at some point. This is not
                 // the correct generation for this index.
                 None
             }
-            Slot::Filled { r#gen: _, data } => {
+            Slot::Filled {
+                generation: _,
+                data,
+            } => {
                 // We have the right generation :)
                 Some(data)
             }
