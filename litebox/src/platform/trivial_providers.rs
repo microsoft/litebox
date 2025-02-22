@@ -115,15 +115,17 @@ impl<T: Clone> RawConstPointer<T> for TransparentConstPtr<T> {
         if self.inner.is_null() || !self.inner.is_aligned() {
             return None;
         }
-        Some(alloc::borrow::Cow::Borrowed(&*self.inner.offset(count)))
+        Some(alloc::borrow::Cow::Borrowed(unsafe {
+            &*self.inner.offset(count)
+        }))
     }
     unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
         if self.inner.is_null() || !self.inner.is_aligned() {
             return None;
         }
-        Some(alloc::borrow::Cow::Borrowed(core::slice::from_raw_parts(
-            self.inner, len,
-        )))
+        Some(alloc::borrow::Cow::Borrowed(unsafe {
+            core::slice::from_raw_parts(self.inner, len)
+        }))
     }
 }
 
@@ -141,15 +143,17 @@ impl<T: Clone> RawConstPointer<T> for TransparentMutPtr<T> {
         if self.inner.is_null() || !self.inner.is_aligned() {
             return None;
         }
-        Some(alloc::borrow::Cow::Borrowed(&*self.inner.offset(count)))
+        Some(alloc::borrow::Cow::Borrowed(unsafe {
+            &*self.inner.offset(count)
+        }))
     }
     unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
         if self.inner.is_null() || !self.inner.is_aligned() {
             return None;
         }
-        Some(alloc::borrow::Cow::Borrowed(core::slice::from_raw_parts(
-            self.inner, len,
-        )))
+        Some(alloc::borrow::Cow::Borrowed(unsafe {
+            core::slice::from_raw_parts(self.inner, len)
+        }))
     }
 }
 impl<T: Clone> RawMutPointer<T> for TransparentMutPtr<T> {
@@ -157,7 +161,9 @@ impl<T: Clone> RawMutPointer<T> for TransparentMutPtr<T> {
         if self.inner.is_null() || !self.inner.is_aligned() {
             return None;
         }
-        *self.inner.offset(count) = value;
+        unsafe {
+            *self.inner.offset(count) = value;
+        }
         Some(())
     }
     fn mutate_subslice_with<R>(

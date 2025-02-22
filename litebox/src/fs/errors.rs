@@ -88,7 +88,9 @@ pub enum MkdirError {
 pub enum RmdirError {
     #[error("the parent directory does not allow write permission")]
     NoWritePerms,
-    #[error("currently in use by the system, or something prevents its removal (e.g., is the root directory)")]
+    #[error(
+        "currently in use by the system, or something prevents its removal (e.g., is the root directory)"
+    )]
     Busy,
     #[error("pathname contains entries other than . and ..")]
     NotEmpty,

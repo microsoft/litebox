@@ -344,20 +344,20 @@ where
         use core::ffi::c_char;
         let nul_position = {
             let mut i = 0isize;
-            while *<Self as RawConstPointer<T>>::read_at_offset(self, i)? != 0 {
+            while *unsafe { <Self as RawConstPointer<T>>::read_at_offset(self, i) }? != 0 {
                 i = i.checked_add(1)?;
             }
             i
         };
         let len = nul_position.checked_add(1)?.try_into().ok()?;
-        let slice: Cow<[c_char]> = self.to_cow_slice(len)?;
+        let slice: Cow<[c_char]> = unsafe { self.to_cow_slice(len) }?;
         match slice {
             Cow::Borrowed(bytes) => {
                 // Since we know it is a `[c_char]` (which is guaranteed to be i8 or u8 on modern
                 // architectures, see https://doc.rust-lang.org/core/ffi/type.c_char.html), this is
                 // always safe to transmute into a `[u8]`.
-                let bytes = &*(core::ptr::from_ref(bytes) as *const [u8]);
-                core::ffi::CStr::from_bytes_with_nul(bytes)
+                let bytes = core::ptr::from_ref(bytes) as *const [u8];
+                core::ffi::CStr::from_bytes_with_nul(unsafe { &*bytes })
                     .ok()
                     .map(Cow::Borrowed)
             }
@@ -368,7 +368,7 @@ where
                 let bytes: Box<[c_char]> = bytes.into_boxed_slice();
                 let bytes: *mut [c_char] = Box::into_raw(bytes);
                 let bytes: *mut [u8] = bytes as *mut [u8];
-                let bytes: Box<[u8]> = Box::from_raw(bytes);
+                let bytes: Box<[u8]> = unsafe { Box::from_raw(bytes) };
                 let bytes: Vec<u8> = Vec::from(bytes);
                 alloc::ffi::CString::from_vec_with_nul(bytes)
                     .ok()
