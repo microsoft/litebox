@@ -37,7 +37,7 @@ mod alloc {
 
     #[cfg(not(test))]
     impl crate::mm::MemoryProvider for super::SnpLinuxKenrel {
-        const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(LITEBOX_PAGE_OFFSET);
+        const GVA_OFFSET: crate::arch::VirtAddr = crate::arch::VirtAddr::new(LITEBOX_PAGE_OFFSET);
         const PRIVATE_PTE_MASK: u64 = 1 << 51; // SNP encryption bit
 
         fn mem_allocate_pages(order: u32) -> Option<*mut u8> {

@@ -16,6 +16,7 @@ use ptr::{UserConstPtr, UserMutPtr};
 
 extern crate alloc;
 
+pub mod arch;
 pub mod error;
 pub mod host;
 pub mod mm;
