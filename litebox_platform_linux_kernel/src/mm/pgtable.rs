@@ -48,6 +48,8 @@ pub trait PageTableImpl {
 
     /// Handle page fault
     ///
+    /// `flush` indicates whether the TLB should be flushed after the page fault is handled.
+    ///
     /// # Safety
     ///
     /// The caller must ensure that the `p` is valid and properly aligned.
@@ -63,10 +65,14 @@ pub trait PageTableImpl {
 
     /// Unmap 4KiB pages from the page table
     ///
+    /// `flush` indicates whether the TLB should be flushed after the pages are unmapped.
+    ///
     /// `start` and `len` must be aligned to 4KiB.
-    fn unmap_pages(&mut self, start: VirtAddr, len: usize, free_page: bool);
+    fn unmap_pages(&mut self, start: VirtAddr, len: usize, free_page: bool, flush: bool);
 
     /// Remap 4KiB pages in the page table from `old_addr` to `new_addr`
+    ///
+    /// `flush` indicates whether the TLB should be flushed after the pages are remapped.
     ///
     /// # Safety
     ///
@@ -78,6 +84,7 @@ pub trait PageTableImpl {
         old_addr: VirtAddr,
         new_addr: VirtAddr,
         len: usize,
+        flush: bool,
     ) -> Result<(), PageTableWalkError>;
 
     /// Change the page table flags for 4KiB pages
@@ -91,6 +98,7 @@ pub trait PageTableImpl {
         start: VirtAddr,
         len: usize,
         new_flags: PageTableFlags,
+        flush: bool,
     ) -> Result<(), PageTableWalkError>;
 }
 

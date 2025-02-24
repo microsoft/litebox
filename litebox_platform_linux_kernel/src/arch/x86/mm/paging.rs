@@ -152,7 +152,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
     ///
     /// Note it does not free the allocated frames for page table itself (only those allocated to
     /// user space).
-    fn unmap_pages(&mut self, va: VirtAddr, len: usize, free_page: bool) {
+    fn unmap_pages(&mut self, va: VirtAddr, len: usize, free_page: bool, flush: bool) {
         assert!(len != 0);
         assert!(va.is_aligned(Size4KiB::SIZE));
         assert!(len % Size4KiB::SIZE as usize == 0);
@@ -165,11 +165,13 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
         // If we have N pages, it will be N times slower.
         for page in Page::range(start, end) {
             match self.inner.unmap(page) {
-                Ok((frame, flush)) => {
+                Ok((frame, fl)) => {
                     if free_page {
                         unsafe { allocator.deallocate_frame(frame) };
                     }
-                    flush.flush();
+                    if flush {
+                        fl.flush();
+                    }
                 }
                 Err(UnmapError::PageNotMapped) => {}
                 Err(UnmapError::ParentEntryHugePage) => {
@@ -187,6 +189,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
         old_addr: VirtAddr,
         new_addr: VirtAddr,
         len: usize,
+        flush: bool,
     ) -> Result<(), PageTableWalkError> {
         assert!(old_addr.is_aligned(Size4KiB::SIZE));
         assert!(new_addr.is_aligned(Size4KiB::SIZE));
@@ -205,7 +208,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
                     offset: _,
                     flags,
                 } => match self.inner.unmap(start) {
-                    Ok((frame, flush)) => {
+                    Ok((frame, fl)) => {
                         match self.inner.map_to(new_start, frame, flags, &mut allocator) {
                             Ok(_) => {}
                             Err(e) => match e {
@@ -220,7 +223,9 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
                                 }
                             },
                         }
-                        flush.flush();
+                        if flush {
+                            fl.flush();
+                        }
                     }
                     Err(UnmapError::PageNotMapped) => {
                         unreachable!()
@@ -241,7 +246,6 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
             new_start += 1;
         }
 
-        self.unmap_pages(old_addr, len, false);
         Ok(())
     }
 
@@ -250,6 +254,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
         start: VirtAddr,
         len: usize,
         new_flags: PageTableFlags,
+        flush: bool,
     ) -> Result<(), PageTableWalkError> {
         let begin: Page<Size4KiB> = Page::containing_address(start);
         let end: Page<Size4KiB> = Page::containing_address(start + len as _ - 1);
@@ -273,7 +278,11 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
                     };
                     if flags != new_flags {
                         match self.inner.update_flags(page, new_flags) {
-                            Ok(flush) => flush.flush(),
+                            Ok(fl) => {
+                                if flush {
+                                    fl.flush();
+                                }
+                            }
                             Err(e) => match e {
                                 FlagUpdateError::PageNotMapped => unreachable!(),
                                 FlagUpdateError::ParentEntryHugePage => {

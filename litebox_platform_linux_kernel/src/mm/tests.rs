@@ -5,13 +5,17 @@ use spin::mutex::SpinMutex;
 use x86_64::{
     structures::{
         idt::PageFaultErrorCode,
-        paging::{mapper::TranslateResult, Page, PageSize, PageTableFlags, Size4KiB},
+        paging::{
+            mapper::{MappedFrame, TranslateResult},
+            page::PageRange,
+            Page, PageSize, PageTableFlags, Size4KiB,
+        },
     },
     PhysAddr, VirtAddr,
 };
 
 use crate::{
-    arch::X64PageTable,
+    arch::{X64PageTable, PAGE_SIZE},
     host::mock::MockHostInterface,
     mm::{pgtable::PageTableAllocator, MemoryProvider},
     mock_log_println, HostInterface, LinuxKernel,
@@ -94,37 +98,104 @@ fn test_slab() {
     }
 }
 
-#[test]
-fn test_page_fault() {
+fn check_flags(
+    pgtable: &X64PageTable<'_, MockKernel>,
+    page: Page<Size4KiB>,
+    flags: PageTableFlags,
+) {
+    match pgtable.translate(page.start_address()) {
+        TranslateResult::Mapped {
+            frame,
+            offset,
+            flags: f,
+        } => {
+            assert!(matches!(frame, MappedFrame::Size4KiB(_)));
+            assert_eq!(offset, 0);
+            assert_eq!(flags, f);
+        }
+        _ => assert!(false),
+    }
+}
+
+fn get_test_pgtable<'a>(
+    range: PageRange,
+    fault_flags: PageTableFlags,
+) -> X64PageTable<'a, MockKernel> {
     let mut allocator = PageTableAllocator::<MockKernel>::new();
     let p4 = allocator.allocate_frame(true).unwrap();
     let mut pgtable = unsafe { X64PageTable::<MockKernel>::init(p4.start_address()) };
 
-    let fault_addr = VirtAddr::new(0x1000);
-    let fault_page = Page::<Size4KiB>::containing_address(fault_addr);
-    let fault_flags =
-        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    for page in range {
+        unsafe {
+            pgtable
+                .handle_page_fault(page, fault_flags, PageFaultErrorCode::USER_MODE, false)
+                .unwrap();
+        }
+    }
+
+    for page in range {
+        check_flags(&pgtable, page, fault_flags);
+    }
+
+    pgtable
+}
+
+#[test]
+fn test_page_table() {
+    let start_addr = VirtAddr::new(0x1000);
+    let start_page = Page::<Size4KiB>::containing_address(start_addr);
+    let flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    let range = Page::range(start_page, start_page + 4);
+    let mut pgtable = get_test_pgtable(range, flags);
+
+    // update flags
+    let new_flags = PageTableFlags::PRESENT;
     unsafe {
         assert!(pgtable
-            .handle_page_fault(
-                fault_page,
-                fault_flags,
-                PageFaultErrorCode::CAUSED_BY_WRITE | PageFaultErrorCode::USER_MODE,
-                false,
+            .mprotect_pages(
+                start_addr + 2 * PAGE_SIZE as u64,
+                4 * PAGE_SIZE,
+                new_flags,
+                false
             )
-            .is_ok());
+            .is_ok())
     };
+    for page in Page::range(start_page, start_page + 2) {
+        check_flags(&pgtable, page, flags);
+    }
+    for page in Page::range(start_page + 2, start_page + 4) {
+        check_flags(&pgtable, page, new_flags);
+    }
 
-    match pgtable.translate(fault_addr) {
-        TranslateResult::Mapped {
-            frame,
-            offset,
-            flags,
-        } => {
-            assert!(frame.start_address().as_u64() > 0);
-            assert_eq!(offset, 0);
-            assert_eq!(flags, fault_flags);
-        }
-        _ => assert!(false),
+    // remap pages
+    let new_addr = VirtAddr::new(0x20_1000);
+    let new_page = Page::<Size4KiB>::containing_address(new_addr);
+    unsafe {
+        assert!(pgtable
+            .remap_pages(start_addr, new_addr, 2 * PAGE_SIZE, false)
+            .is_ok())
+    };
+    for page in Page::range(start_page, start_page + 2) {
+        assert!(matches!(
+            pgtable.translate(page.start_address()),
+            TranslateResult::NotMapped
+        ));
+    }
+    for page in Page::range(new_page, new_page + 2) {
+        check_flags(&pgtable, page, flags);
+    }
+
+    // unmap all pages
+    pgtable.unmap_pages(
+        start_addr,
+        (new_addr - start_addr) as usize + 4 * PAGE_SIZE,
+        true,
+        false,
+    );
+    for page in Page::range(start_page, new_page + 4) {
+        assert!(matches!(
+            pgtable.translate(page.start_address()),
+            TranslateResult::NotMapped
+        ));
     }
 }
