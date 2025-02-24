@@ -14,8 +14,36 @@ mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
+#[allow(dead_code)]
+const HEAP_ORDER: usize = bindings::SNP_VMPL_ALLOC_MAX_ORDER as usize + 12 + 1;
+pub type SnpLinuxKenrel = crate::LinuxKernel<HostSnpInterface>;
+
 const MAX_ARGS_SIZE: usize = 6;
 type ArgsArray = [u64; MAX_ARGS_SIZE];
+
+#[cfg(not(test))]
+#[global_allocator]
+static SNP_ALLOCATOR: crate::mm::alloc::SafeZoneAllocator<'static, HEAP_ORDER, SnpLinuxKenrel> =
+    crate::mm::alloc::SafeZoneAllocator::new();
+
+#[cfg(not(test))]
+impl crate::mm::MemoryProvider for SnpLinuxKenrel {
+    fn mem_allocate_pages(order: u32) -> Option<*mut u8> {
+        SNP_ALLOCATOR.allocate_pages(order)
+    }
+
+    unsafe fn mem_free_pages(ptr: *mut u8, order: u32) {
+        unsafe { SNP_ALLOCATOR.free_pages(ptr, order) }
+    }
+
+    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
+        HostSnpInterface::alloc(layout)
+    }
+
+    unsafe fn free(addr: usize) {
+        unsafe { HostSnpInterface::free(addr) }
+    }
+}
 
 impl bindings::SnpVmplRequestArgs {
     #[inline]
@@ -93,18 +121,6 @@ impl HostSnpInterface {
         Self::parse_result(req.ret)
     }
 
-    /// To be used by [`Self::alloc_raw_mutex`]
-    #[allow(dead_code)]
-    fn alloc_futex_page() -> Result<u64, error::Errno> {
-        let mut req = bindings::SnpVmplRequestArgs::new_request(
-            bindings::SNP_VMPL_ALLOC_FUTEX_REQ,
-            0,
-            [0, 0, 0, 0, 0, 0],
-        );
-        Self::request(&mut req);
-        Self::parse_alloc_result(0, req.ret)
-    }
-
     fn parse_result(res: u64) -> Result<usize, crate::error::Errno> {
         if is_err_value(res) {
             let v = res as i64;
@@ -114,7 +130,7 @@ impl HostSnpInterface {
         }
     }
 
-    fn parse_alloc_result(order: u32, addr: u64) -> Result<u64, crate::error::Errno> {
+    fn parse_alloc_result(order: u32, addr: u64) -> Result<usize, crate::error::Errno> {
         if addr == 0 {
             if order > bindings::SNP_VMPL_ALLOC_MAX_ORDER {
                 Err(error::Errno::EINVAL)
@@ -125,7 +141,7 @@ impl HostSnpInterface {
             // Address is not aligned or out of bounds
             Err(error::Errno::EINVAL)
         } else {
-            Ok(addr)
+            Ok(addr as usize)
         }
     }
 }
@@ -155,14 +171,28 @@ impl HostInterface for HostSnpInterface {
         ghcb_prints(msg);
     }
 
-    fn alloc(order: u32) -> Result<u64, error::Errno> {
+    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), error::Errno> {
+        // To reduce the number of hypercalls, we allocate the maximum order.
+        // Assertion is added to prevent the allocation size from exceeding the maximum order.
+        let size = core::cmp::max(layout.size().next_power_of_two(), PAGE_SIZE as usize);
+        assert!(size > (PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER) as usize);
+
         let mut req = bindings::SnpVmplRequestArgs::new_request(
             bindings::SNP_VMPL_ALLOC_REQ,
             1,
-            [order as u64, 0, 0, 0, 0, 0],
+            [bindings::SNP_VMPL_ALLOC_MAX_ORDER as u64, 0, 0, 0, 0, 0],
         );
         Self::request(&mut req);
-        Self::parse_alloc_result(order, req.ret)
+        Self::parse_alloc_result(bindings::SNP_VMPL_ALLOC_MAX_ORDER, req.ret).map(|addr| {
+            (
+                addr,
+                (PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER) as usize,
+            )
+        })
+    }
+
+    unsafe fn free(_addr: usize) {
+        unimplemented!()
     }
 
     fn exit() -> ! {
@@ -202,7 +232,7 @@ impl HostInterface for HostSnpInterface {
         let kset: Option<sigset_t> = if set.is_null() {
             None
         } else {
-            Some(set.read_from_user(0).ok_or(error::Errno::EFAULT)?)
+            Some(set.from_user_at_offset(0).ok_or(error::Errno::EFAULT)?)
         };
         let mut koldset: Option<sigset_t> = if oldset.is_null() { None } else { Some(0) };
         let args = SyscallN::<4, NR_SYSCALL_RT_SIGPROCMASK> {
@@ -216,7 +246,7 @@ impl HostInterface for HostSnpInterface {
         };
         let r = Self::syscalls(args)?;
         if let Some(v) = koldset {
-            oldset.write_to_user(0, v).ok_or(error::Errno::EFAULT)?;
+            oldset.to_user_at_offset(0, v).ok_or(error::Errno::EFAULT)?;
         }
         Ok(r)
     }

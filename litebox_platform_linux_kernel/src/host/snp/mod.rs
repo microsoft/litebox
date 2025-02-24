@@ -2,3 +2,5 @@
 
 mod ghcb;
 mod snp_impl;
+
+pub use snp_impl::SnpLinuxKenrel;
