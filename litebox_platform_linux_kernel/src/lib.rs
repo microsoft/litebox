@@ -162,7 +162,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         token.execute()
     }
 
-    pub fn exit(&self) {
+    pub fn exit(&self) -> ! {
         Host::exit();
     }
 
@@ -354,7 +354,11 @@ pub trait HostInterface {
     ///
     /// Note host should know the size of allocated memory and needs to check the validity
     /// of the given address.
-    fn free(addr: usize);
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the `addr` is valid and was allocated by this [`Self::alloc`].
+    unsafe fn free(addr: usize);
 
     /// Exit
     ///

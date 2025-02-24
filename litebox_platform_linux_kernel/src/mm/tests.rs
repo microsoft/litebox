@@ -23,8 +23,8 @@ impl super::MemoryProvider for MockKernel {
         unsafe { ALLOCATOR.free_pages(ptr, order) }
     }
 
-    fn free(addr: usize) {
-        MockHostInterface::free(addr);
+    unsafe fn free(addr: usize) {
+        unsafe { MockHostInterface::free(addr) };
     }
 }
 

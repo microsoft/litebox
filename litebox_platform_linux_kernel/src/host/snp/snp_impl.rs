@@ -40,8 +40,8 @@ impl crate::mm::MemoryProvider for SnpLinuxKenrel {
         HostSnpInterface::alloc(layout)
     }
 
-    fn free(addr: usize) {
-        HostSnpInterface::free(addr)
+    unsafe fn free(addr: usize) {
+        unsafe { HostSnpInterface::free(addr) }
     }
 }
 
@@ -191,7 +191,7 @@ impl HostInterface for HostSnpInterface {
         })
     }
 
-    fn free(_addr: usize) {
+    unsafe fn free(_addr: usize) {
         unimplemented!()
     }
 

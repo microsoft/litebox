@@ -19,7 +19,11 @@ pub trait MemoryProvider {
     fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno>;
 
     /// Returns the memory back to host.
-    fn free(addr: usize);
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the `addr` is valid and was allocated by [`Self::alloc`].
+    unsafe fn free(addr: usize);
 
     /// Called to refill the buddy allocator when OOM occurs.
     fn rescue_heap<const ORDER: usize>(heap: &mut Heap<ORDER>, layout: &core::alloc::Layout) {

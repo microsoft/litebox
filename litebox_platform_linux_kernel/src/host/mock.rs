@@ -26,7 +26,7 @@ impl HostInterface for MockHostInterface {
         Ok((addr as usize, size))
     }
 
-    fn free(addr: usize) {
+    unsafe fn free(addr: usize) {
         unsafe { libc::free(addr as *mut _) };
     }
 
