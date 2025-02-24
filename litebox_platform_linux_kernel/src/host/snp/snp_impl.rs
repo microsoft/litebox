@@ -35,7 +35,6 @@ mod alloc {
         super::SnpLinuxKenrel,
     > = crate::mm::alloc::SafeZoneAllocator::new();
 
-    #[cfg(not(test))]
     impl crate::mm::MemoryProvider for super::SnpLinuxKenrel {
         const GVA_OFFSET: crate::arch::VirtAddr = crate::arch::VirtAddr::new(LITEBOX_PAGE_OFFSET);
         const PRIVATE_PTE_MASK: u64 = 1 << 51; // SNP encryption bit
@@ -52,8 +51,9 @@ mod alloc {
             super::HostSnpInterface::alloc(layout)
         }
 
-    unsafe fn free(addr: usize) {
-        unsafe { HostSnpInterface::free(addr) }
+        unsafe fn free(addr: usize) {
+            unsafe { super::HostSnpInterface::free(addr) }
+        }
     }
 }
 
