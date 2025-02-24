@@ -27,10 +27,9 @@ use super::{alloc::SafeZoneAllocator, pgtable::PageTableImpl};
 const MAX_ORDER: usize = 23;
 type MockKernel = LinuxKernel<MockHostInterface>;
 
-#[global_allocator]
 static ALLOCATOR: SafeZoneAllocator<'static, MAX_ORDER, MockKernel> = SafeZoneAllocator::new();
 /// const Array for VA to PA mapping
-static MAPPING: SpinMutex<ArrayVec<VirtAddr, 8192>> = SpinMutex::new(ArrayVec::new_const());
+static MAPPING: SpinMutex<ArrayVec<VirtAddr, 1024>> = SpinMutex::new(ArrayVec::new_const());
 
 impl super::MemoryProvider for MockKernel {
     const GVA_OFFSET: super::VirtAddr = super::VirtAddr::new(0);
@@ -44,6 +43,7 @@ impl super::MemoryProvider for MockKernel {
         for page in Page::range(begin, end) {
             if mapping.is_full() {
                 mock_log_println!("MAPPING is OOM");
+                assert!(false);
             }
             mapping.push(page.start_address());
         }
@@ -94,8 +94,12 @@ fn test_buddy() {
 #[test]
 fn test_slab() {
     unsafe {
-        assert!(ALLOCATOR.alloc(Layout::from_size_align(0x1000, 0x1000).unwrap()) as usize != 0);
-        assert!(ALLOCATOR.alloc(Layout::from_size_align(0x10, 0x10).unwrap()) as usize != 0);
+        let ptr1 = ALLOCATOR.alloc(Layout::from_size_align(0x1000, 0x1000).unwrap());
+        assert!(ptr1 as usize != 0);
+        let ptr2 = ALLOCATOR.alloc(Layout::from_size_align(0x10, 0x10).unwrap());
+        assert!(ptr2 as usize != 0);
+        ALLOCATOR.dealloc(ptr1, Layout::from_size_align(0x1000, 0x1000).unwrap());
+        ALLOCATOR.dealloc(ptr2, Layout::from_size_align(0x10, 0x10).unwrap());
     }
 }
 
