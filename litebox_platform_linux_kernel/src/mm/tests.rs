@@ -1,21 +1,48 @@
 use core::alloc::{GlobalAlloc, Layout};
 
-use crate::{HostInterface, LinuxKernel, host::mock::MockHostInterface, mm::MemoryProvider};
+use arrayvec::ArrayVec;
+use spin::mutex::SpinMutex;
+use x86_64::{
+    structures::{
+        idt::PageFaultErrorCode,
+        paging::{mapper::TranslateResult, Page, PageSize, PageTableFlags, Size4KiB},
+    },
+    PhysAddr, VirtAddr,
+};
 
-use super::alloc::SafeZoneAllocator;
+use crate::{
+    arch::X64PageTable,
+    host::mock::MockHostInterface,
+    mm::{pgtable::PageTableAllocator, MemoryProvider},
+    mock_log_println, HostInterface, LinuxKernel,
+};
+
+use super::{alloc::SafeZoneAllocator, pgtable::PageTableImpl};
 
 const MAX_ORDER: usize = 23;
 type MockKernel = LinuxKernel<MockHostInterface>;
 
 #[global_allocator]
-pub static ALLOCATOR: SafeZoneAllocator<'static, MAX_ORDER, MockKernel> = SafeZoneAllocator::new();
+static ALLOCATOR: SafeZoneAllocator<'static, MAX_ORDER, MockKernel> = SafeZoneAllocator::new();
+/// const Array for VA to PA mapping
+static MAPPING: SpinMutex<ArrayVec<VirtAddr, 8192>> = SpinMutex::new(ArrayVec::new_const());
 
 impl super::MemoryProvider for MockKernel {
     const GVA_OFFSET: super::VirtAddr = super::VirtAddr::new(0);
     const PRIVATE_PTE_MASK: u64 = 0;
 
     fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
-        MockHostInterface::alloc(layout)
+        let mut mapping = MAPPING.lock();
+        let (start, len) = MockHostInterface::alloc(layout)?;
+        let begin = Page::<Size4KiB>::from_start_address(VirtAddr::new(start as _)).unwrap();
+        let end = Page::<Size4KiB>::from_start_address(VirtAddr::new((start + len) as _)).unwrap();
+        for page in Page::range(begin, end) {
+            if mapping.is_full() {
+                mock_log_println!("MAPPING is OOM");
+            }
+            mapping.push(page.start_address());
+        }
+        Ok((start, len))
     }
 
     fn mem_allocate_pages(order: u32) -> Option<*mut u8> {
@@ -28,6 +55,25 @@ impl super::MemoryProvider for MockKernel {
 
     unsafe fn free(addr: usize) {
         unsafe { MockHostInterface::free(addr) };
+    }
+
+    fn va_to_pa(va: VirtAddr) -> PhysAddr {
+        let idx = MAPPING.lock().iter().position(|x| *x == va);
+        assert!(idx.is_some());
+        PhysAddr::new(idx.unwrap() as u64 * Size4KiB::SIZE + 0x1000_0000)
+    }
+
+    fn pa_to_va(pa: PhysAddr) -> VirtAddr {
+        let mapping = MAPPING.lock();
+        let idx = (pa.as_u64() - 0x1000_0000) / Size4KiB::SIZE;
+        let va = mapping.get(idx as usize);
+        assert!(va.is_some());
+        let va = va.unwrap().clone();
+        if va.is_null() {
+            mock_log_println!("Invalid PA");
+            panic!("Invalid PA");
+        }
+        va
     }
 }
 
@@ -45,5 +91,40 @@ fn test_slab() {
     unsafe {
         assert!(ALLOCATOR.alloc(Layout::from_size_align(0x1000, 0x1000).unwrap()) as usize != 0);
         assert!(ALLOCATOR.alloc(Layout::from_size_align(0x10, 0x10).unwrap()) as usize != 0);
+    }
+}
+
+#[test]
+fn test_page_fault() {
+    let mut allocator = PageTableAllocator::<MockKernel>::new();
+    let p4 = allocator.allocate_frame(true).unwrap();
+    let mut pgtable = unsafe { X64PageTable::<MockKernel>::init(p4.start_address()) };
+
+    let fault_addr = VirtAddr::new(0x1000);
+    let fault_page = Page::<Size4KiB>::containing_address(fault_addr);
+    let fault_flags =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    unsafe {
+        assert!(pgtable
+            .handle_page_fault(
+                fault_page,
+                fault_flags,
+                PageFaultErrorCode::CAUSED_BY_WRITE | PageFaultErrorCode::USER_MODE,
+                false,
+            )
+            .is_ok());
+    };
+
+    match pgtable.translate(fault_addr) {
+        TranslateResult::Mapped {
+            frame,
+            offset,
+            flags,
+        } => {
+            assert!(frame.start_address().as_u64() > 0);
+            assert_eq!(offset, 0);
+            assert_eq!(flags, fault_flags);
+        }
+        _ => assert!(false),
     }
 }

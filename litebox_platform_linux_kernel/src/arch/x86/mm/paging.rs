@@ -3,37 +3,20 @@ use x86_64::{
         idt::PageFaultErrorCode,
         paging::{
             mapper::{
-                FlagUpdateError, MapToError, MapperFlush, PageTableFrameMapping, TranslateResult,
+                FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult, UnmapError,
             },
-            page_table::{FrameError, PageTableEntry},
+            page_table::FrameError,
             FrameAllocator, FrameDeallocator, MappedPageTable, Mapper, Page, PageSize, PageTable,
-            PageTableFlags, PageTableIndex, PhysFrame, Size4KiB, Translate,
+            PageTableFlags, PhysFrame, Size4KiB, Translate,
         },
     },
     PhysAddr, VirtAddr,
 };
 
 use crate::mm::{
-    pgtable::{
-        PageFaultError, PageTableAllocator, PageTableImpl, PageTableRangeWalker, PageTableWalkError,
-    },
+    pgtable::{PageFaultError, PageTableAllocator, PageTableImpl, PageTableWalkError},
     MemoryProvider,
 };
-
-pub const PGDIR_SHIFT: u64 = 39;
-pub const PGDIR_SIZE: u64 = 0x8000000000; // 1 << PGDIR_SHIFT;
-pub const PGDIR_MASK: u64 = !(PGDIR_SIZE - 1);
-pub const PUD_SHIFR: u64 = 30;
-pub const PUD_SIZE: u64 = 0x40000000; // 1 << PUD_SHIFR;
-pub const PUD_MASK: u64 = !(PUD_SIZE - 1);
-pub const PMD_SHIFT: u64 = 21;
-pub const PMD_SIZE: u64 = 0x200000; // 1 << PMD_SHIFT;
-pub const PMD_MASK: u64 = !(PMD_SIZE - 1);
-
-struct PageTablePGDWalker;
-struct PageTablePUDWalker;
-struct PageTablePMDWalker;
-struct PageTablePTEWalker;
 
 #[inline]
 fn frame_to_pointer<M: MemoryProvider>(frame: PhysFrame) -> *mut PageTable {
@@ -47,124 +30,6 @@ impl From<FrameError> for PageTableWalkError {
             FrameError::FrameNotPresent => PageTableWalkError::NotMapped,
             FrameError::HugeFrame => PageTableWalkError::MappedToHugePage,
         }
-    }
-}
-
-impl<M: MemoryProvider> PageTableRangeWalker<M> for PageTablePGDWalker {
-    type NextLevelWalker = PageTablePUDWalker;
-
-    fn index(addr: VirtAddr) -> PageTableIndex {
-        addr.p1_index()
-    }
-
-    fn next_addr(addr: VirtAddr, end: VirtAddr) -> VirtAddr {
-        let boundary = (addr.as_u64() + PGDIR_SIZE) & PGDIR_MASK;
-        if boundary - 1 < end.as_u64() - 1 {
-            VirtAddr::new(boundary)
-        } else {
-            end
-        }
-    }
-}
-
-impl<M: MemoryProvider> PageTableRangeWalker<M> for PageTablePUDWalker {
-    type NextLevelWalker = PageTablePMDWalker;
-
-    fn index(addr: VirtAddr) -> PageTableIndex {
-        addr.p2_index()
-    }
-
-    fn next_addr(addr: VirtAddr, end: VirtAddr) -> VirtAddr {
-        let boundary = (addr.as_u64() + PUD_SIZE) & PUD_MASK;
-        if boundary - 1 < end.as_u64() - 1 {
-            VirtAddr::new(boundary)
-        } else {
-            end
-        }
-    }
-}
-
-impl<M: MemoryProvider> PageTableRangeWalker<M> for PageTablePMDWalker {
-    type NextLevelWalker = PageTablePTEWalker;
-
-    fn index(addr: VirtAddr) -> PageTableIndex {
-        addr.p3_index()
-    }
-
-    fn next_addr(addr: VirtAddr, end: VirtAddr) -> VirtAddr {
-        let boundary = (addr.as_u64() + PMD_SIZE) & PMD_MASK;
-        if boundary - 1 < end.as_u64() - 1 {
-            VirtAddr::new(boundary)
-        } else {
-            end
-        }
-    }
-}
-
-impl<M: MemoryProvider> PageTableRangeWalker<M> for PageTablePTEWalker {
-    type NextLevelWalker = PageTablePTEWalker;
-
-    fn index(addr: VirtAddr) -> PageTableIndex {
-        addr.p4_index()
-    }
-
-    fn next_addr(addr: VirtAddr, _end: VirtAddr) -> VirtAddr {
-        addr + Size4KiB::SIZE
-    }
-
-    unsafe fn walk_page_table_mut<F>(pt: &mut PageTable, start: VirtAddr, end: VirtAddr, cb: &mut F)
-    where
-        F: FnMut(VirtAddr, &mut PageTableEntry),
-    {
-        let mut addr = start;
-        while addr < end {
-            let next = <Self as PageTableRangeWalker<M>>::next_addr(addr, end);
-            let entry = &mut pt[<Self as PageTableRangeWalker<M>>::index(addr)];
-            cb(addr, entry);
-            addr = next;
-        }
-    }
-
-    unsafe fn walk_two_different_page_tables<F>(
-        src_pt: &PageTable,
-        dst_pt: &mut PageTable,
-        addr1: VirtAddr,
-        addr1_end: VirtAddr,
-        addr2: VirtAddr,
-        _allocator: &mut PageTableAllocator<M>,
-        cb: &mut F,
-    ) -> Result<(), PageTableWalkError>
-    where
-        F: FnMut(&PageTableEntry, &mut PageTableEntry),
-    {
-        let mut addr1_start = addr1;
-        let mut addr2_start = addr2;
-        while addr1_start < addr1_end {
-            let next = <Self as PageTableRangeWalker<M>>::next_addr(addr1_start, addr1_end);
-            let src_entry = &src_pt[<Self as PageTableRangeWalker<M>>::index(addr1_start)];
-            let dst_entry = &mut dst_pt[<Self as PageTableRangeWalker<M>>::index(addr2_start)];
-            cb(src_entry, dst_entry);
-            addr1_start = next;
-            addr2_start = <Self as PageTableRangeWalker<M>>::next_addr(
-                addr2_start,
-                <Self as PageTableRangeWalker<M>>::VADDR_MAX,
-            );
-        }
-        Ok(())
-    }
-
-    unsafe fn walk_two_but_same_page_table<F>(
-        _pt: &mut PageTable,
-        _addr1: VirtAddr,
-        _addr1_end: VirtAddr,
-        _addr2: VirtAddr,
-        _allocator: &mut PageTableAllocator<M>,
-        _cb: &mut F,
-    ) -> Result<(), PageTableWalkError>
-    where
-        F: FnMut(&PageTableEntry, &mut PageTableEntry),
-    {
-        unimplemented!()
     }
 }
 
@@ -195,7 +60,7 @@ impl<M: MemoryProvider> FrameDeallocator<Size4KiB> for PageTableAllocator<M> {
     }
 }
 
-impl<'a, M: MemoryProvider> PageTableImpl for X64PageTable<'a, M> {
+impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
     unsafe fn init(p4: PhysAddr) -> Self {
         assert!(p4.is_aligned(Size4KiB::SIZE));
         let frame = PhysFrame::from_start_address(p4).unwrap();
@@ -209,11 +74,16 @@ impl<'a, M: MemoryProvider> PageTableImpl for X64PageTable<'a, M> {
         }
     }
 
+    fn translate(&self, addr: VirtAddr) -> TranslateResult {
+        self.inner.translate(addr)
+    }
+
     unsafe fn handle_page_fault(
         &mut self,
         page: Page<Size4KiB>,
         flags: PageTableFlags,
         error_code: PageFaultErrorCode,
+        flush: bool,
     ) -> Result<(), crate::mm::pgtable::PageFaultError> {
         match self.inner.translate(page.start_address()) {
             TranslateResult::Mapped {
@@ -252,7 +122,11 @@ impl<'a, M: MemoryProvider> PageTableImpl for X64PageTable<'a, M> {
                     table_flags,
                     &mut allocator,
                 ) {
-                    Ok(flush) => flush.flush(),
+                    Ok(fl) => {
+                        if flush {
+                            fl.flush();
+                        }
+                    }
                     Err(e) => {
                         allocator.deallocate_frame(frame);
                         match e {
@@ -279,34 +153,33 @@ impl<'a, M: MemoryProvider> PageTableImpl for X64PageTable<'a, M> {
     /// Note it does not free the allocated frames for page table itself (only those allocated to
     /// user space).
     fn unmap_pages(&mut self, va: VirtAddr, len: usize, free_page: bool) {
-        let start = va.align_down(Size4KiB::SIZE);
-        let end = (va + len as u64).align_up(Size4KiB::SIZE);
+        assert!(len != 0);
+        assert!(va.is_aligned(Size4KiB::SIZE));
+        assert!(len % Size4KiB::SIZE as usize == 0);
+
+        let start = Page::<Size4KiB>::from_start_address(va).unwrap();
+        let end = Page::<Size4KiB>::from_start_address(va + len as _).unwrap();
         let mut allocator = PageTableAllocator::<M>::new();
 
-        let pt = self.inner.level_4_table_mut();
-        unsafe {
-            <PageTablePGDWalker as PageTableRangeWalker<M>>::walk_page_table_mut(
-                pt,
-                start,
-                end,
-                &mut |va, entry| match entry.frame() {
-                    Ok(frame) => {
-                        entry.set_unused();
-                        let page = Page::<Size4KiB>::from_start_address(va).unwrap();
-                        MapperFlush::new(page).flush();
-                        // TODO: once we have implmented reference counting (to support shared pages),
-                        // we need to check it before deallocating the frame (instead of relying on the caller)
-                        if free_page {
-                            allocator.deallocate_frame(frame);
-                        }
+        // Note this implementation is slow as each page requires a full page table walk.
+        // If we have N pages, it will be N times slower.
+        for page in Page::range(start, end) {
+            match self.inner.unmap(page) {
+                Ok((frame, flush)) => {
+                    if free_page {
+                        unsafe { allocator.deallocate_frame(frame) };
                     }
-                    Err(FrameError::FrameNotPresent) => {}
-                    Err(FrameError::HugeFrame) => {
-                        panic!("Huge page cannot be unmapped");
-                    }
-                },
-            )
-        };
+                    flush.flush();
+                }
+                Err(UnmapError::PageNotMapped) => {}
+                Err(UnmapError::ParentEntryHugePage) => {
+                    panic!("Huge page cannot be unmapped");
+                }
+                Err(UnmapError::InvalidFrameAddress(pa)) => {
+                    panic!("Invalid frame address: {:#x}", pa);
+                }
+            }
+        }
     }
 
     unsafe fn remap_pages(
@@ -319,20 +192,54 @@ impl<'a, M: MemoryProvider> PageTableImpl for X64PageTable<'a, M> {
         assert!(new_addr.is_aligned(Size4KiB::SIZE));
         assert!(len % Size4KiB::SIZE as usize == 0);
 
-        let pt = self.inner.level_4_table_mut();
+        // Note this implementation is slow as each page requires three full page table walks.
+        // If we have N pages, it will be 3N times slower.
         let mut allocator = PageTableAllocator::<M>::new();
-        <PageTablePGDWalker as PageTableRangeWalker<M>>::walk_two_but_same_page_table(
-            pt,
-            old_addr,
-            old_addr + len as _,
-            new_addr,
-            &mut allocator,
-            &mut |src_entry, dst_entry| {
-                if let Ok(frame) = src_entry.frame() {
-                    dst_entry.set_frame(frame, src_entry.flags());
+        let mut start: Page<Size4KiB> = Page::from_start_address(old_addr).unwrap();
+        let mut new_start: Page<Size4KiB> = Page::from_start_address(new_addr).unwrap();
+        let end: Page<Size4KiB> = Page::from_start_address(old_addr + len as _).unwrap();
+        while start < end {
+            match self.inner.translate(start.start_address()) {
+                TranslateResult::Mapped {
+                    frame: _,
+                    offset: _,
+                    flags,
+                } => match self.inner.unmap(start) {
+                    Ok((frame, flush)) => {
+                        match self.inner.map_to(new_start, frame, flags, &mut allocator) {
+                            Ok(_) => {}
+                            Err(e) => match e {
+                                MapToError::PageAlreadyMapped(_) => {
+                                    panic!("Page already mapped")
+                                }
+                                MapToError::ParentEntryHugePage => {
+                                    return Err(PageTableWalkError::MappedToHugePage)
+                                }
+                                MapToError::FrameAllocationFailed => {
+                                    return Err(PageTableWalkError::AllocationFailed)
+                                }
+                            },
+                        }
+                        flush.flush();
+                    }
+                    Err(UnmapError::PageNotMapped) => {
+                        unreachable!()
+                    }
+                    Err(UnmapError::ParentEntryHugePage) => {
+                        return Err(PageTableWalkError::MappedToHugePage)
+                    }
+                    Err(UnmapError::InvalidFrameAddress(pa)) => {
+                        panic!("Invalid frame address: {:#x}", pa);
+                    }
+                },
+                TranslateResult::NotMapped => {}
+                TranslateResult::InvalidFrameAddress(pa) => {
+                    panic!("Invalid frame address: {:#x}", pa);
                 }
-            },
-        )?;
+            }
+            start += 1;
+            new_start += 1;
+        }
 
         self.unmap_pages(old_addr, len, false);
         Ok(())

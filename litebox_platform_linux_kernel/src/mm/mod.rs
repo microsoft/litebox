@@ -1,5 +1,6 @@
 //! Memory management module including:
 //! - Buddy and Slab allocator
+//! - Page table management
 
 use buddy_system_allocator::Heap;
 
@@ -72,7 +73,7 @@ pub trait MemoryProvider {
         VirtAddr::new_truncate(pa + Self::GVA_OFFSET.as_u64())
     }
 
-    /// /// Set physical address as private via mask.
+    /// Set physical address as private via mask.
     fn make_pa_private(pa: PhysAddr) -> PhysAddr {
         PhysAddr::new_truncate(pa.as_u64() | Self::PRIVATE_PTE_MASK)
     }
