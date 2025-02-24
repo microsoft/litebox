@@ -7,7 +7,6 @@ use crate::{
     HostInterface, error,
     host::linux::{self, sigset_t},
     ptr::{UserConstPtr, UserMutPtr},
-    HostInterface,
 };
 
 #[allow(dead_code)]
@@ -34,7 +33,7 @@ impl crate::mm::MemoryProvider for SnpLinuxKenrel {
     }
 
     unsafe fn mem_free_pages(ptr: *mut u8, order: u32) {
-        SNP_ALLOCATOR.free_pages(ptr, order)
+        unsafe { SNP_ALLOCATOR.free_pages(ptr, order) }
     }
 
     fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {

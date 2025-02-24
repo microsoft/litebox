@@ -1,6 +1,6 @@
 use core::alloc::{GlobalAlloc, Layout};
 
-use crate::{host::mock::MockHostInterface, mm::MemoryProvider, HostInterface, LinuxKernel};
+use crate::{HostInterface, LinuxKernel, host::mock::MockHostInterface, mm::MemoryProvider};
 
 use super::alloc::SafeZoneAllocator;
 
@@ -20,7 +20,7 @@ impl super::MemoryProvider for MockKernel {
     }
 
     unsafe fn mem_free_pages(ptr: *mut u8, order: u32) {
-        ALLOCATOR.free_pages(ptr, order)
+        unsafe { ALLOCATOR.free_pages(ptr, order) }
     }
 
     fn free(addr: usize) {

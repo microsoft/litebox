@@ -67,21 +67,30 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
                 .unwrap(),
             )
         };
-        if ptr.is_null() {
-            None
-        } else {
-            Some(ptr)
-        }
+        if ptr.is_null() { None } else { Some(ptr) }
     }
 
     /// De-allocates physically contiguous pages returned from [`LockedSlabAllocator::allocate_pages`].
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    ///
+    /// * `ptr` is a block of memory currently allocated via this allocator and,
+    ///
+    /// * `order` is the same that was used to allocate that block of memory.
     #[allow(dead_code)]
     pub(crate) unsafe fn free_pages(&self, ptr: *mut u8, order: u32) {
-        self.buddy_allocator.dealloc(
-            ptr,
-            Layout::from_size_align(Self::BASE_PAGE_SIZE << order, Self::BASE_PAGE_SIZE << order)
+        unsafe {
+            self.buddy_allocator.dealloc(
+                ptr,
+                Layout::from_size_align(
+                    Self::BASE_PAGE_SIZE << order,
+                    Self::BASE_PAGE_SIZE << order,
+                )
                 .unwrap(),
-        );
+            )
+        };
     }
 }
 
@@ -97,7 +106,7 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
                     .expect("allocate page")
             }
             Self::LARGE_PAGE_SIZE => {
-                // Best to use the underlying backend directly to allocate large
+                // Best to use the underlying backend directly to allocate large pages
                 // to avoid fragmentation
                 self.allocate_pages(Self::LARGE_PAGE_SIZE_ORDER)
                     .expect("allocate large page")
@@ -109,9 +118,11 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
                     Err(AllocationError::OutOfMemory) => {
                         if layout.size() <= ZoneAllocator::MAX_BASE_ALLOC_SIZE {
                             self.alloc_page().map_or(core::ptr::null_mut(), |page| {
-                                zone_allocator
-                                    .refill(layout, page)
-                                    .expect("Could not refill?");
+                                unsafe {
+                                    zone_allocator
+                                        .refill(layout, page)
+                                        .expect("Could not refill?")
+                                };
                                 zone_allocator
                                     .allocate(layout)
                                     .expect("Should succeed after refill")
@@ -120,9 +131,11 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
                         } else {
                             self.alloc_large_page()
                                 .map_or(core::ptr::null_mut(), |large_page| {
-                                    zone_allocator
-                                        .refill_large(layout, large_page)
-                                        .expect("Could not refill?");
+                                    unsafe {
+                                        zone_allocator
+                                            .refill_large(layout, large_page)
+                                            .expect("Could not refill?")
+                                    };
                                     zone_allocator
                                         .allocate(layout)
                                         .expect("Should succeed after refill")
@@ -135,14 +148,14 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
                     }
                 }
             }
-            _ => self.buddy_allocator.alloc(layout),
+            _ => unsafe { self.buddy_allocator.alloc(layout) },
         }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
         match layout.size() {
-            Self::BASE_PAGE_SIZE => self.buddy_allocator.dealloc(ptr, layout),
-            Self::LARGE_PAGE_SIZE => self.buddy_allocator.dealloc(ptr, layout),
+            Self::BASE_PAGE_SIZE => unsafe { self.buddy_allocator.dealloc(ptr, layout) },
+            Self::LARGE_PAGE_SIZE => unsafe { self.buddy_allocator.dealloc(ptr, layout) },
             0..=ZoneAllocator::MAX_ALLOC_SIZE => {
                 if let Some(ptr) = NonNull::new(ptr) {
                     self.slab_allocator
@@ -154,9 +167,9 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
                 // TODO: An proper reclamation strategy could be implemented here
                 // to release empty pages back from the ZoneAllocator to the buddy allocator.
             }
-            _ => {
+            _ => unsafe {
                 self.buddy_allocator.dealloc(ptr, layout);
-            }
+            },
         }
     }
 }
