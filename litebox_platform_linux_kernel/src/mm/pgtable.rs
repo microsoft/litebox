@@ -1,6 +1,6 @@
 use crate::arch::{
-    Page, PageFaultErrorCode, PageTableFlags, PhysAddr, PhysFrame, Size4KiB, TranslateResult,
-    VirtAddr, PAGE_SIZE,
+    PAGE_SIZE, Page, PageFaultErrorCode, PageTableFlags, PhysAddr, PhysFrame, Size4KiB,
+    TranslateResult, VirtAddr,
 };
 
 /// Page table allocator

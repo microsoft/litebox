@@ -44,9 +44,9 @@ mod alloc {
             SNP_ALLOCATOR.allocate_pages(order)
         }
 
-    unsafe fn mem_free_pages(ptr: *mut u8, order: u32) {
-        unsafe { SNP_ALLOCATOR.free_pages(ptr, order) }
-    }
+        unsafe fn mem_free_pages(ptr: *mut u8, order: u32) {
+            unsafe { SNP_ALLOCATOR.free_pages(ptr, order) }
+        }
 
         fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
             super::HostSnpInterface::alloc(layout)

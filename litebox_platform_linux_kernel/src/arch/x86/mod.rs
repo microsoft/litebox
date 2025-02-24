@@ -4,7 +4,7 @@ pub use x86_64::{
     addr::{PhysAddr, VirtAddr},
     structures::{
         idt::PageFaultErrorCode,
-        paging::{mapper::TranslateResult, Page, PageSize, PageTableFlags, PhysFrame, Size4KiB},
+        paging::{Page, PageSize, PageTableFlags, PhysFrame, Size4KiB, mapper::TranslateResult},
     },
 };
 

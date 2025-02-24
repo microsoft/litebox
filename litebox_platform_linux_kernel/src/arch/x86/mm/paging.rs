@@ -1,21 +1,21 @@
 use x86_64::{
+    PhysAddr, VirtAddr,
     structures::{
         idt::PageFaultErrorCode,
         paging::{
+            FrameAllocator, FrameDeallocator, MappedPageTable, Mapper, Page, PageSize, PageTable,
+            PageTableFlags, PhysFrame, Size4KiB, Translate,
             mapper::{
                 FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult, UnmapError,
             },
             page_table::FrameError,
-            FrameAllocator, FrameDeallocator, MappedPageTable, Mapper, Page, PageSize, PageTable,
-            PageTableFlags, PhysFrame, Size4KiB, Translate,
         },
     },
-    PhysAddr, VirtAddr,
 };
 
 use crate::mm::{
-    pgtable::{PageFaultError, PageTableAllocator, PageTableImpl, PageTableWalkError},
     MemoryProvider,
+    pgtable::{PageFaultError, PageTableAllocator, PageTableImpl, PageTableWalkError},
 };
 
 #[inline]
@@ -56,7 +56,7 @@ unsafe impl<M: MemoryProvider> FrameAllocator<Size4KiB> for PageTableAllocator<M
 impl<M: MemoryProvider> FrameDeallocator<Size4KiB> for PageTableAllocator<M> {
     unsafe fn deallocate_frame(&mut self, frame: PhysFrame<Size4KiB>) {
         let vaddr = M::pa_to_va(frame.start_address());
-        M::mem_free_pages(vaddr.as_mut_ptr(), 0);
+        unsafe { M::mem_free_pages(vaddr.as_mut_ptr(), 0) };
     }
 }
 
@@ -68,9 +68,9 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
             _provider: core::marker::PhantomData,
         };
         let p4_va = mapping.frame_to_pointer(frame);
-        let p4 = &mut *p4_va;
+        let p4 = unsafe { &mut *p4_va };
         X64PageTable {
-            inner: MappedPageTable::new(p4, mapping),
+            inner: unsafe { MappedPageTable::new(p4, mapping) },
         }
     }
 
@@ -115,26 +115,28 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
                 let table_flags = PageTableFlags::PRESENT
                     | PageTableFlags::WRITABLE
                     | PageTableFlags::USER_ACCESSIBLE;
-                match self.inner.map_to_with_table_flags(
-                    page,
-                    frame,
-                    flags,
-                    table_flags,
-                    &mut allocator,
-                ) {
+                match unsafe {
+                    self.inner.map_to_with_table_flags(
+                        page,
+                        frame,
+                        flags,
+                        table_flags,
+                        &mut allocator,
+                    )
+                } {
                     Ok(fl) => {
                         if flush {
                             fl.flush();
                         }
                     }
                     Err(e) => {
-                        allocator.deallocate_frame(frame);
+                        unsafe { allocator.deallocate_frame(frame) };
                         match e {
                             MapToError::PageAlreadyMapped(_) => {
                                 unreachable!()
                             }
                             MapToError::ParentEntryHugePage => {
-                                return Err(PageFaultError::HugePage)
+                                return Err(PageFaultError::HugePage);
                             }
                             MapToError::FrameAllocationFailed => return Err(PageFaultError::OOM),
                         }
@@ -209,17 +211,18 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
                     flags,
                 } => match self.inner.unmap(start) {
                     Ok((frame, fl)) => {
-                        match self.inner.map_to(new_start, frame, flags, &mut allocator) {
+                        match unsafe { self.inner.map_to(new_start, frame, flags, &mut allocator) }
+                        {
                             Ok(_) => {}
                             Err(e) => match e {
                                 MapToError::PageAlreadyMapped(_) => {
                                     panic!("Page already mapped")
                                 }
                                 MapToError::ParentEntryHugePage => {
-                                    return Err(PageTableWalkError::MappedToHugePage)
+                                    return Err(PageTableWalkError::MappedToHugePage);
                                 }
                                 MapToError::FrameAllocationFailed => {
-                                    return Err(PageTableWalkError::AllocationFailed)
+                                    return Err(PageTableWalkError::AllocationFailed);
                                 }
                             },
                         }
@@ -231,7 +234,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
                         unreachable!()
                     }
                     Err(UnmapError::ParentEntryHugePage) => {
-                        return Err(PageTableWalkError::MappedToHugePage)
+                        return Err(PageTableWalkError::MappedToHugePage);
                     }
                     Err(UnmapError::InvalidFrameAddress(pa)) => {
                         panic!("Invalid frame address: {:#x}", pa);
@@ -277,7 +280,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
                         new_flags
                     };
                     if flags != new_flags {
-                        match self.inner.update_flags(page, new_flags) {
+                        match unsafe { self.inner.update_flags(page, new_flags) } {
                             Ok(fl) => {
                                 if flush {
                                     fl.flush();
@@ -286,7 +289,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
                             Err(e) => match e {
                                 FlagUpdateError::PageNotMapped => unreachable!(),
                                 FlagUpdateError::ParentEntryHugePage => {
-                                    return Err(PageTableWalkError::MappedToHugePage)
+                                    return Err(PageTableWalkError::MappedToHugePage);
                                 }
                             },
                         }

@@ -3,22 +3,23 @@ use core::alloc::{GlobalAlloc, Layout};
 use arrayvec::ArrayVec;
 use spin::mutex::SpinMutex;
 use x86_64::{
+    PhysAddr, VirtAddr,
     structures::{
         idt::PageFaultErrorCode,
         paging::{
+            Page, PageSize, PageTableFlags, Size4KiB,
             mapper::{MappedFrame, TranslateResult},
             page::PageRange,
-            Page, PageSize, PageTableFlags, Size4KiB,
         },
     },
-    PhysAddr, VirtAddr,
 };
 
 use crate::{
-    arch::{X64PageTable, PAGE_SIZE},
+    HostInterface, LinuxKernel,
+    arch::{PAGE_SIZE, X64PageTable},
     host::mock::MockHostInterface,
-    mm::{pgtable::PageTableAllocator, MemoryProvider},
-    mock_log_println, HostInterface, LinuxKernel,
+    mm::{MemoryProvider, pgtable::PageTableAllocator},
+    mock_log_println,
 };
 
 use super::{alloc::SafeZoneAllocator, pgtable::PageTableImpl};
@@ -151,14 +152,16 @@ fn test_page_table() {
     // update flags
     let new_flags = PageTableFlags::PRESENT;
     unsafe {
-        assert!(pgtable
-            .mprotect_pages(
-                start_addr + 2 * PAGE_SIZE as u64,
-                4 * PAGE_SIZE,
-                new_flags,
-                false
-            )
-            .is_ok())
+        assert!(
+            pgtable
+                .mprotect_pages(
+                    start_addr + 2 * PAGE_SIZE as u64,
+                    4 * PAGE_SIZE,
+                    new_flags,
+                    false
+                )
+                .is_ok()
+        )
     };
     for page in Page::range(start_page, start_page + 2) {
         check_flags(&pgtable, page, flags);
@@ -171,9 +174,11 @@ fn test_page_table() {
     let new_addr = VirtAddr::new(0x20_1000);
     let new_page = Page::<Size4KiB>::containing_address(new_addr);
     unsafe {
-        assert!(pgtable
-            .remap_pages(start_addr, new_addr, 2 * PAGE_SIZE, false)
-            .is_ok())
+        assert!(
+            pgtable
+                .remap_pages(start_addr, new_addr, 2 * PAGE_SIZE, false)
+                .is_ok()
+        )
     };
     for page in Page::range(start_page, start_page + 2) {
         assert!(matches!(
