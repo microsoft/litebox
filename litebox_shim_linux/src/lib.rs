@@ -1,4 +1,4 @@
-//! A shim that provides a POSIX-compatible ABI via LiteBox.
+//! A shim that provides a Linux-compatible ABI via LiteBox.
 //!
 //! This shim is parametric in the choice of [LiteBox platform](../litebox/platform/index.html),
 //! chosen by the [platform multiplex](../litebox_platform_multiplex/index.html).

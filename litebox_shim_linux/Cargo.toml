@@ -1,5 +1,5 @@
 [package]
-name = "litebox_shim_posix"
+name = "litebox_shim_linux"
 version = "0.1.0"
 edition = "2024"
 
