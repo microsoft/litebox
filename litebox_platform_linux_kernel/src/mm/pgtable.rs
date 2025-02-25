@@ -37,13 +37,14 @@ impl<M: super::MemoryProvider> PageTableAllocator<M> {
 }
 
 pub trait PageTableImpl {
-    /// Initialize the page table
+    /// Initialize the page table with the physical address of the top-level page table.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that the `p4` is valid and properly aligned.
+    /// The caller must ensure that the `p` is valid and properly aligned.
     unsafe fn init(p: PhysAddr) -> Self;
 
+    /// Translate a virtual address to a physical address
     fn translate(&self, addr: VirtAddr) -> TranslateResult;
 
     /// Handle page fault
