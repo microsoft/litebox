@@ -22,3 +22,56 @@ jobs:
       - run: ./.github/tools/github_actions_run_cargo clippy
       - run: ./.github/tools/github_actions_run_cargo build
       - run: ./.github/tools/github_actions_run_cargo test
+
+  confirm_no_std:
+    name: Confirm no_std
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update
+      - name: Confirm that we haven't accidentally pulled in std into LiteBox
+        run: |
+          # Essentially, we run a build on a target that simply does NOT have
+          # `std` support at all. If that build succeeds, then we know that the
+          # litebox crate has not accidentally pulled in `std` from a dependency
+          # that is not a `#[no_std]` crate.
+          #
+          # This build will fail if any of the dependencies of `litebox` pull in
+          # `std`. Unfortunately, the error message is not very useful to point
+          # out _which_ dependency pulled in `std`, but otoh, hopefully it
+          # should be quite obvious by looking at the PR itself.
+          #
+          # The `find` invocation runs through every `Cargo.toml` in the
+          # repository, and runs a build with `x86_64-unknown-none` target
+          # (which does not support `std`), thereby catching any crate that
+          # pulls in an std-crate accidentally. The `-not -path` lines are an
+          # allow-list (i.e., crates that are allowed to have `std`).
+          #
+          # Reason for each item in allow-list:
+          #
+          # - `.` is itself special, since it would otherwise trigger a
+          #   full-workspace check, which we don't want, thus we allow that one
+          #   in particular to also have `std` in it.
+          #
+          # - `litebox_platform_linux_userland` is allowed to have `std` access,
+          #   since it is a purely-userland implementation.
+          #
+          # - `litebox_platform_multiplex` is allowed to have `std` access (in
+          #   its default feature set) because `litebox_platform_linux_userland`
+          #   has access, and this is just a multiplexer. Ideally, we'd do a
+          #   more precise check, but as long as we are tracking the underlying
+          #   platforms, we are unlikely to hit any significant issues here.
+          #
+          # - `litebox_shim_linux` (in its default feature set) depends on
+          #   `litebox_platform_multiplex`; similarly, ideally we'd do a more
+          #   precise check.
+          rustup target add x86_64-unknown-none
+          find . -type f -name 'Cargo.toml' \
+            -not -path './Cargo.toml' \
+            -not -path './litebox_platform_linux_userland/Cargo.toml' \
+            -not -path './litebox_platform_multiplex/Cargo.toml' \
+            -not -path './litebox_shim_linux/Cargo.toml' \
+            -execdir sh -c 'pwd; cargo build --target x86_64-unknown-none; echo; echo' \;
