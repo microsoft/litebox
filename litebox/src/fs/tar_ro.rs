@@ -94,6 +94,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::private::Sealed
 {
 }
 
+fn contains_dir(haystack: &str, needle: &str) -> bool {
+    assert!(!needle.ends_with('/'));
+    haystack.starts_with(needle) && haystack.as_bytes().get(needle.len()) == Some(&b'/')
+}
+
 impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem<'_, Platform> {
     fn open(
         &self,
@@ -115,7 +120,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             // direct hashmap lookup of relevant information and data.
             self.tar_data.entries().enumerate().find(|(_, entry)| {
                 match entry.filename().as_str() {
-                    Ok(p) => p.starts_with(path),
+                    Ok(p) => p == path || contains_dir(p, path),
                     Err(_) => false,
                 }
             })
@@ -175,7 +180,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             .tar_data
             .entries()
             .any(|entry| match entry.filename().as_str() {
-                Ok(p) => p.starts_with(path),
+                Ok(p) => p == path || contains_dir(p, path),
                 Err(_) => false,
             })
         {
@@ -193,7 +198,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             .tar_data
             .entries()
             .find(|entry| match entry.filename().as_str() {
-                Ok(p) => p.starts_with(path),
+                Ok(p) => p == path || contains_dir(p, path),
                 Err(_) => false,
             });
         match entry {

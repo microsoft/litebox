@@ -180,4 +180,20 @@ mod tar_ro {
         assert_eq!(&buffer[..bytes_read], b"test bar baz\n");
         fs.close(fd).expect("Failed to close file");
     }
+
+    #[test]
+    fn dir_and_nonexist_checks() {
+        let platform = MockPlatform::new();
+        let mut fs = tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into());
+        assert!(matches!(
+            fs.open("bar/ba", OFlags::RDONLY, Mode::empty()),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::NoSuchFileOrDirectory
+            )),
+        ));
+        let fd = fs
+            .open("bar", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open dir");
+        fs.close(fd).expect("Failed to close dir");
+    }
 }
