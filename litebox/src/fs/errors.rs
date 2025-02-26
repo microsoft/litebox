@@ -16,6 +16,8 @@ pub enum OpenError {
     AccessNotAllowed,
     #[error("the parent directory does not allow write permission")]
     NoWritePerms,
+    #[error("write access requested for a file on a read-only filesystem")]
+    ReadOnlyFileSystem,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -54,6 +56,8 @@ pub enum ChmodError {
          and the process is not privileged"
     )]
     NotTheOwner,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -66,6 +70,8 @@ pub enum UnlinkError {
     NoWritePerms,
     #[error("pathname is a directory")]
     IsADirectory,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -78,6 +84,8 @@ pub enum MkdirError {
     NoWritePerms,
     #[error("pathname already exists, not necessarily a directory")]
     AlreadyExists,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -96,6 +104,8 @@ pub enum RmdirError {
     NotEmpty,
     #[error("pathname is not a directory")]
     NotADirectory,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
     #[error(transparent)]
     PathError(#[from] PathError),
 }

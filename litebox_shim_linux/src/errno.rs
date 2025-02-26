@@ -25,6 +25,7 @@ impl AsErrno for litebox::fs::errors::OpenError {
             litebox::fs::errors::OpenError::AccessNotAllowed => EACCES,
             litebox::fs::errors::OpenError::NoWritePerms => EACCES,
             litebox::fs::errors::OpenError::PathError(path_error) => path_error.as_errno(),
+            litebox::fs::errors::OpenError::ReadOnlyFileSystem => EROFS,
             _ => unimplemented!(),
         }
     }

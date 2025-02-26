@@ -10,6 +10,8 @@ use core::ffi::c_uint;
 pub mod errors;
 pub mod in_mem;
 pub mod nine_p;
+pub(crate) mod shared;
+pub mod tar_ro;
 
 #[cfg(test)]
 mod tests;
