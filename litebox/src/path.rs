@@ -91,6 +91,39 @@ pub trait Arg: private::Sealed {
         res.extend(self.normalized_components()?);
         Ok(res.join("/"))
     }
+
+    /// Convenience wrapper for getting the list of ancestors of the path.
+    ///
+    /// Essentially, this gives `["", "a", "a/..", "a/../b"]` for `"a/../b"`. Note that this is the
+    /// opposite order from Rust's `std::path::Path::ancestors`.
+    fn increasing_ancestors(&self) -> Result<impl Iterator<Item = &str>> {
+        let orig_path = self.as_rust_str()?;
+        let mut path = orig_path;
+        let mut res: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+
+        if path.is_empty() {
+            res.push("");
+            return Ok(res.into_iter());
+        }
+
+        while !path.is_empty() {
+            res.push(path);
+            if let Some(posn) = path.rfind('/') {
+                path = &path[..posn];
+            } else {
+                res.push("");
+                break;
+            }
+        }
+
+        if res.last().unwrap().len() > 1 {
+            res.push("/");
+        }
+
+        res.reverse();
+
+        Ok(res.into_iter())
+    }
 }
 
 impl Arg for &str {
@@ -218,6 +251,47 @@ mod tests {
                 .unwrap()
                 .collect::<Vec<_>>(),
             vec!["..", "bar", "baz"],
+        );
+    }
+
+    #[test]
+    fn increasing_ancestors() {
+        assert_eq!(
+            "".increasing_ancestors().unwrap().collect::<Vec<_>>(),
+            vec![""]
+        );
+        assert_eq!(
+            "/".increasing_ancestors().unwrap().collect::<Vec<_>>(),
+            vec!["/"]
+        );
+        assert_eq!(
+            "//".increasing_ancestors().unwrap().collect::<Vec<_>>(),
+            vec!["/", "//"]
+        );
+        assert_eq!(
+            "a/../b".increasing_ancestors().unwrap().collect::<Vec<_>>(),
+            vec!["", "a", "a/..", "a/../b"]
+        );
+        assert_eq!(
+            "/a/../b"
+                .increasing_ancestors()
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec!["/", "/a", "/a/..", "/a/../b"]
+        );
+        assert_eq!(
+            "/a/..//b"
+                .increasing_ancestors()
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec!["/", "/a", "/a/..", "/a/../", "/a/..//b"]
+        );
+        assert_eq!(
+            "//a/..//b"
+                .increasing_ancestors()
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec!["/", "//a", "//a/..", "//a/../", "//a/..//b"]
         );
     }
 }
