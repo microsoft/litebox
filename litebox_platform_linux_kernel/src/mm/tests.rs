@@ -16,7 +16,7 @@ use x86_64::{
 
 use crate::{
     HostInterface, LinuxKernel,
-    arch::{PAGE_SIZE, X64PageTable},
+    arch::{PAGE_SIZE, mm::paging::X64PageTable},
     host::mock::MockHostInterface,
     mm::{MemoryProvider, pgtable::PageTableAllocator},
     mock_log_println,
@@ -195,12 +195,14 @@ fn test_page_table() {
     }
 
     // unmap all pages
-    pgtable.unmap_pages(
-        start_addr,
-        (new_addr - start_addr) as usize + 4 * PAGE_SIZE,
-        true,
-        false,
-    );
+    unsafe {
+        pgtable.unmap_pages(
+            start_addr,
+            (new_addr - start_addr) as usize + 4 * PAGE_SIZE,
+            true,
+            false,
+        )
+    };
     for page in Page::range(start_page, new_page + 4) {
         assert!(matches!(
             pgtable.translate(page.start_address()),

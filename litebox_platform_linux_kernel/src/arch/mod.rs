@@ -1,10 +1,9 @@
 //! Arch-specific code
 
+#[cfg(target_arch = "x86_64")]
 mod x86;
 
-pub use x86::{
-    Page, PageFaultErrorCode, PageSize, PageTableFlags, PhysAddr, PhysFrame, Size4KiB,
-    TranslateResult, VirtAddr, X64PageTable,
-};
+#[cfg(target_arch = "x86_64")]
+pub use x86::*;
 
 pub const PAGE_SIZE: usize = Size4KiB::SIZE as usize;

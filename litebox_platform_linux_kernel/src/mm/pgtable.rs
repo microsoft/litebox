@@ -67,9 +67,17 @@ pub trait PageTableImpl {
     /// Unmap 4KiB pages from the page table
     ///
     /// `flush` indicates whether the TLB should be flushed after the pages are unmapped.
+    /// `free_page` indicates whether the unmapped pages should be freed (This may be helpful
+    /// when implementing [`Self::remap_pages`]).
+    ///
+    /// # Safety
     ///
     /// `start` and `len` must be aligned to 4KiB.
-    fn unmap_pages(&mut self, start: VirtAddr, len: usize, free_page: bool, flush: bool);
+    ///
+    /// # Panics
+    ///
+    /// panic if `start` or `len` is misaligned.
+    unsafe fn unmap_pages(&mut self, start: VirtAddr, len: usize, free_page: bool, flush: bool);
 
     /// Remap 4KiB pages in the page table from `old_addr` to `new_addr`
     ///

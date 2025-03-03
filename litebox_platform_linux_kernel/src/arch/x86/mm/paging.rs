@@ -154,8 +154,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
     ///
     /// Note it does not free the allocated frames for page table itself (only those allocated to
     /// user space).
-    fn unmap_pages(&mut self, va: VirtAddr, len: usize, free_page: bool, flush: bool) {
-        assert!(len != 0);
+    unsafe fn unmap_pages(&mut self, va: VirtAddr, len: usize, free_page: bool, flush: bool) {
         assert!(va.is_aligned(Size4KiB::SIZE));
         assert!(len % Size4KiB::SIZE as usize == 0);
 

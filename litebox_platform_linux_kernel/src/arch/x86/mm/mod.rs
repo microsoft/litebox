@@ -1,3 +1,1 @@
-mod paging;
-
-pub use paging::X64PageTable;
+pub mod paging;

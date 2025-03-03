@@ -1,4 +1,4 @@
-mod mm;
+pub mod mm;
 
 pub use x86_64::{
     addr::{PhysAddr, VirtAddr},
@@ -7,5 +7,3 @@ pub use x86_64::{
         paging::{Page, PageSize, PageTableFlags, PhysFrame, Size4KiB, mapper::TranslateResult},
     },
 };
-
-pub use mm::X64PageTable;
