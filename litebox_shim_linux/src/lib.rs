@@ -22,6 +22,7 @@ use litebox::{fs::FileSystem as _, platform::RawConstPointer as _, sync::RwLock}
 use litebox_platform_multiplex::Platform;
 
 pub mod errno;
+pub mod loader;
 use errno::AsErrno as _;
 
 pub(crate) fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
