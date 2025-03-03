@@ -34,10 +34,11 @@ impl<Descriptor> Descriptors<Descriptor> {
         }
     }
 
-    pub(crate) fn remove(&mut self, mut fd: FileFd) {
+    pub(crate) fn remove(&mut self, mut fd: FileFd) -> Descriptor {
         let old = self.descriptors[fd.x.as_usize()].take();
         assert!(old.is_some());
         fd.x.mark_as_closed();
+        old.unwrap()
     }
 
     pub(crate) fn get(&self, fd: &FileFd) -> &Descriptor {
