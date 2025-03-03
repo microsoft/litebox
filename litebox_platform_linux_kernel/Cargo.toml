@@ -15,3 +15,4 @@ litebox = { path = "../litebox/", version = "0.1.0" }
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 libc = "0.2.169"
 arrayvec = { version = "0.7.6", default-features = false }
+x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
