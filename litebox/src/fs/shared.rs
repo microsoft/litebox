@@ -52,4 +52,8 @@ impl<Descriptor> Descriptors<Descriptor> {
         // well as have a value within it.
         self.descriptors[fd.x.as_usize()].as_mut().unwrap()
     }
+
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut Descriptor> {
+        self.descriptors.iter_mut().flatten()
+    }
 }
