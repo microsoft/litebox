@@ -23,6 +23,7 @@ use litebox_platform_multiplex::Platform;
 
 pub mod errno;
 pub mod loader;
+pub mod syscall;
 use errno::AsErrno as _;
 
 pub(crate) fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {

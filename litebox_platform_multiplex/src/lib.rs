@@ -23,19 +23,23 @@ extern crate alloc;
 //
 // NOTE: Currently, we only support one platform, thus this is a trivial no-op. However, once we
 // have more, we must account for each of the possible pairs.
-#[cfg(any())]
+#[cfg(any(all(feature = "platform_linux_kernel", feature = "platform_linux_userland"),))]
 compile_error!(
     r##"Too many platforms specified. Are you sure you have marked 'default-features = false'?"##
 );
 
 // Check if no platforms have been specified. If so, compiler error.
-#[cfg(not(any(feature = "platform_linux_userland")))]
+#[cfg(not(any(feature = "platform_linux_userland", feature = "platform_linux_kernel")))]
 compile_error!(
     r##"No platforms specified.  Please enable the feature for the platform you want."##
 );
 
 #[cfg(feature = "platform_linux_userland")]
 pub type Platform = litebox_platform_linux_userland::LinuxUserland;
+#[cfg(all(feature = "platform_linux_kernel", feature = "host_mock"))]
+pub type Platform = litebox_platform_linux_kernel::host::mock::MockKernel;
+#[cfg(all(feature = "platform_linux_kernel", feature = "host_snp"))]
+pub type Platform = litebox_platform_linux_kernel::host::snp::SnpLinuxKenrel;
 
 static PLATFORM: once_cell::race::OnceBox<Platform> = once_cell::race::OnceBox::new();
 

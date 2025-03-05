@@ -1,8 +1,6 @@
 //! Different host implementations of [`super::HostInterface`]
 pub mod linux;
-mod snp;
-
-#[cfg(test)]
+#[cfg(any(test, feature = "host_mock"))]
 pub mod mock;
-
-pub use snp::SnpLinuxKenrel;
+#[cfg(feature = "host_snp")]
+pub mod snp;

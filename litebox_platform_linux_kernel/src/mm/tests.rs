@@ -19,9 +19,9 @@ use x86_64::{
 };
 
 use crate::{
-    HostInterface, LinuxKernel,
+    HostInterface,
     arch::{PAGE_SIZE, mm::paging::X64PageTable},
-    host::mock::MockHostInterface,
+    host::mock::{MockHostInterface, MockKernel},
     mm::{
         MemoryProvider,
         pgtable::{PageFaultError, PageTableAllocator},
@@ -37,7 +37,6 @@ use super::{
 };
 
 const MAX_ORDER: usize = 23;
-type MockKernel = LinuxKernel<MockHostInterface>;
 
 static ALLOCATOR: SafeZoneAllocator<'static, MAX_ORDER, MockKernel> = SafeZoneAllocator::new();
 /// const Array for VA to PA mapping

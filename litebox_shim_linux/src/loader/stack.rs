@@ -47,17 +47,21 @@ impl<P: RawMutPointer<u8>> UserStack<P> {
     const STACK_ALIGNMENT: usize = 16;
 
     /// stack_top must be aligned to [`STACK_ALIGNMENT`] bytes
-    pub fn new<T>(stack_top: P, stack_top_vaddr: T) -> Self 
+    pub fn new<T>(stack_top: P, stack_top_vaddr: T) -> Self
     where
         T: FnOnce() -> usize,
     {
-        Self { stack_top, stack_top_vaddr: stack_top_vaddr() }
+        Self {
+            stack_top,
+            stack_top_vaddr: stack_top_vaddr(),
+        }
     }
 
     fn write_bytes(&self, bytes: &[u8], pos: isize) -> Option<isize> {
         let len = bytes.len() as isize;
         let new_pos = pos - len;
-        self.stack_top.mutate_subslice_with(new_pos..pos, |s| s.copy_from_slice(bytes))?;
+        self.stack_top
+            .mutate_subslice_with(new_pos..pos, |s| s.copy_from_slice(bytes))?;
         Some(new_pos)
     }
 
@@ -97,7 +101,7 @@ impl<P: RawMutPointer<u8>> UserStack<P> {
         let mut new_pos = pos;
         for (key, val) in aux.iter() {
             new_pos = self.write_bytes(&val.to_le_bytes(), new_pos)?;
-            new_pos = self.write_bytes(&(*key as usize).to_le_bytes(), new_pos)?; 
+            new_pos = self.write_bytes(&(*key as usize).to_le_bytes(), new_pos)?;
         }
         Some(new_pos)
     }
@@ -109,12 +113,17 @@ impl<P: RawMutPointer<u8>> UserStack<P> {
 
     fn get_random_value(&self) -> [u8; 16] {
         [
-            0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
-            0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+            0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD,
+            0xBE, 0xEF,
         ]
     }
 
-    pub fn init(&self, argv: Vec<CString>, env: Vec<CString>, mut aux: BTreeMap<AuxKey, usize>) -> Option<isize> {
+    pub fn init(
+        &self,
+        argv: Vec<CString>,
+        env: Vec<CString>,
+        mut aux: BTreeMap<AuxKey, usize>,
+    ) -> Option<isize> {
         let pos: isize = -8;
         // end markers
         unsafe {
@@ -125,7 +134,10 @@ impl<P: RawMutPointer<u8>> UserStack<P> {
         let (pos, argvp) = self.write_cstrings(&argv, pos)?;
 
         let pos = self.write_bytes(&self.get_random_value(), pos)?;
-        aux.insert(AuxKey::AT_RANDOM, (self.stack_top_vaddr as isize + pos) as usize);
+        aux.insert(
+            AuxKey::AT_RANDOM,
+            (self.stack_top_vaddr as isize + pos) as usize,
+        );
 
         // ensure stack is aligned
         let pos = self.align_down(pos, 8);
@@ -133,7 +145,8 @@ impl<P: RawMutPointer<u8>> UserStack<P> {
         let len = (aux.len() + 1) * 2 + envp.len() + 1 + argvp.len() + 1 + /* argc */ 1;
         let size = len * size_of::<usize>();
         let final_pos = pos - size as isize;
-        let new_pos = pos - (final_pos - self.align_down(final_pos, Self::STACK_ALIGNMENT)) as isize;
+        let new_pos =
+            pos - (final_pos - self.align_down(final_pos, Self::STACK_ALIGNMENT)) as isize;
 
         let new_pos = self.write_aux(aux, new_pos)?;
         let new_pos = self.write_pointers(envp, new_pos)?;

@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+host_snp = []
+host_mock = []
 
 [build-dependencies]
 bindgen = "0.71.0"
