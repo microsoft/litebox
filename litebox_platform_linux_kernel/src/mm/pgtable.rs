@@ -1,3 +1,5 @@
+use thiserror::Error;
+
 use crate::arch::{
     PAGE_SIZE, Page, PageFaultErrorCode, PageTableFlags, PhysAddr, PhysFrame, Size4KiB,
     TranslateResult, VirtAddr,
@@ -42,19 +44,27 @@ impl<M: super::MemoryProvider> PageTableAllocator<M> {
 }
 
 pub trait PageTableImpl {
+    /// [`PageTableFlags::WRITABLE`] | [`PageTableFlags::USER_ACCESSIBLE`] | [`PageTableFlags::NO_EXECUTE`]
+    const MPROTECT_PTE_MASK: u64 = PageTableFlags::WRITABLE.bits()
+        | PageTableFlags::USER_ACCESSIBLE.bits()
+        | PageTableFlags::NO_EXECUTE.bits();
+
     /// Initialize the page table with the physical address of the top-level page table.
     ///
     /// # Safety
     ///
     /// The caller must ensure that the `p` is valid and properly aligned.
+    #[allow(dead_code)]
     unsafe fn init(p: PhysAddr) -> Self;
 
     /// Translate a virtual address to a physical address
+    #[allow(dead_code)]
     fn translate(&self, addr: VirtAddr) -> TranslateResult;
 
     /// Handle page fault
     ///
     /// `flush` indicates whether the TLB should be flushed after the page fault is handled.
+    /// `flags` presents the PTE flags to be set for the page.
     ///
     /// # Safety
     ///
@@ -73,7 +83,8 @@ pub trait PageTableImpl {
     ///
     /// `flush` indicates whether the TLB should be flushed after the pages are unmapped.
     /// `free_page` indicates whether the unmapped pages should be freed (This may be helpful
-    /// when implementing [`Self::remap_pages`]).
+    /// when implementing [`Self::remap_pages`]. If we maintain refcnt for pages, we may not
+    /// need this).
     ///
     /// # Safety
     ///
@@ -116,16 +127,20 @@ pub trait PageTableImpl {
     ) -> Result<(), PageTableWalkError>;
 }
 
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum PageTableWalkError {
-    NotMapped,
+    #[error("Given page is part of an already mapped huge page")]
     MappedToHugePage,
+    #[error("Page table allocation failed")]
     AllocationFailed,
 }
 
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum PageFaultError {
-    AccessError,
-    OOM,
+    #[error("No access: {0}")]
+    AccessError(&'static str),
+    #[error("Allocation failed")]
+    AllocationFailed,
+    #[error("Given page is part of an already mapped huge page")]
     HugePage,
 }
