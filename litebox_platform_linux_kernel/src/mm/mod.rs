@@ -6,8 +6,9 @@ use buddy_system_allocator::Heap;
 
 use crate::arch::{PhysAddr, VirtAddr};
 
-pub mod alloc;
-pub mod pgtable;
+pub(crate) mod alloc;
+pub(crate) mod pgtable;
+pub(crate) mod vm;
 
 #[cfg(test)]
 pub mod tests;
