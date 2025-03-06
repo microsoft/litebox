@@ -243,12 +243,11 @@ fn test_vmm_mapping() {
     vmm.insert_mapping(
         range,
         VmFlags::VM_READ | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE,
-        false,
     );
     // [(0x1000, 0xd000)]
     assert_eq!(collect_mappings(&vmm), vec![0x1000..0xd000]);
 
-    vmm.remove_mapping(PageRange::new(start_page + 2, start_page + 4), false);
+    vmm.remove_mapping(PageRange::new(start_page + 2, start_page + 4));
     // [(0x1000, 0x3000), (0x5000, 0xd000)]
     assert_eq!(collect_mappings(&vmm), vec![0x1000..0x3000, 0x5000..0xd000]);
 
@@ -256,37 +255,33 @@ fn test_vmm_mapping() {
         vmm.resize_mapping(
             PageRange::new(start_page + 2, start_page + 3),
             NonZeroPageSize::new(PAGE_SIZE * 2),
-            false
         ),
+        // Failed to resize, remain [(0x1000, 0x3000), (0x5000, 0xd000)]
         Err(VmemResizeError::NotExist(_))
     ));
-    // Failed to resize, [(0x1000, 0x3000), (0x5000, 0xd000)]
 
     assert!(matches!(
         vmm.resize_mapping(
             PageRange::new(start_page, start_page + 3),
             NonZeroPageSize::new(PAGE_SIZE * 4),
-            false
         ),
+        // Failed to resize, remain [(0x1000, 0x3000), (0x5000, 0xd000)]
         Err(VmemResizeError::InvalidAddr { .. })
     ));
-    // Failed to resize, [(0x1000, 0x3000), (0x5000, 0xd000)]
 
     assert!(matches!(
         vmm.protect_mapping(
             PageRange::new(start_page + 2, start_page + 4),
             VmFlags::VM_READ | VmFlags::VM_WRITE,
-            false
         ),
+        // Failed to protect, remain [(0x1000, 0x3000), (0x5000, 0xd000)]
         Err(VmemProtectError::InvalidRange(_))
     ));
-    // Failed to protect, [(0x1000, 0x3000), (0x5000, 0xd000)]
 
     assert!(
         vmm.resize_mapping(
             PageRange::new(start_page, start_page + 2),
             NonZeroPageSize::new(PAGE_SIZE * 4),
-            false
         )
         .is_ok()
     );
@@ -297,17 +292,15 @@ fn test_vmm_mapping() {
         vmm.protect_mapping(
             PageRange::new(start_page, start_page + 4),
             VmFlags::VM_READ | VmFlags::VM_EXEC,
-            false
         ),
+        // Failed to protect, remain [(0x1000, 0xd000)]
         Err(VmemProtectError::NoAccess { .. })
     ));
-    // Failed to protect, [(0x1000, 0xd000)]
 
     assert!(
         vmm.protect_mapping(
             PageRange::new(start_page + 2, start_page + 4),
             VmFlags::VM_READ | VmFlags::VM_WRITE,
-            false
         )
         .is_ok()
     );
@@ -320,21 +313,80 @@ fn test_vmm_mapping() {
     // try to remap [0x3000, 0x5000)
     let r = PageRange::new(start_page + 2, start_page + 4);
     assert!(matches!(
-        vmm.resize_mapping(r, NonZeroPageSize::new(PAGE_SIZE * 4), false),
+        vmm.resize_mapping(r, NonZeroPageSize::new(PAGE_SIZE * 4)),
         Err(VmemResizeError::RangeOccupied(_))
     ));
     assert!(
-        vmm.move_mappings(
-            r,
-            NonZeroPageSize::new(PAGE_SIZE * 4),
-            VirtAddr::zero(),
-            false
-        )
-        .is_some_and(|v| v.as_u64() == 0xd000)
+        vmm.move_mappings(r, NonZeroPageSize::new(PAGE_SIZE * 4), VirtAddr::zero(),)
+            .is_some_and(|v| v.as_u64() == 0xd000)
     );
     assert_eq!(
         collect_mappings(&vmm),
         vec![0x1000..0x3000, 0x5000..0xd000, 0xd000..0x11000]
+    );
+
+    // create new mapping with no suggested address
+    assert_eq!(
+        vmm.create_mapping(
+            PageRange::new(
+                Page::from_start_address(VirtAddr::new(0)).unwrap(),
+                start_page
+            ),
+            VmFlags::VM_READ | VmFlags::VM_MAYREAD,
+            false
+        )
+        .unwrap(),
+        VirtAddr::new(0x11000)
+    );
+    assert_eq!(
+        collect_mappings(&vmm),
+        vec![
+            0x1000..0x3000,
+            0x5000..0xd000,
+            0xd000..0x11000,
+            0x11000..0x12000
+        ]
+    );
+
+    // create new mapping with fixed address that overlaps with other mapping
+    assert_eq!(
+        vmm.create_mapping(
+            PageRange::new(start_page + 1, start_page + 3),
+            VmFlags::VM_READ | VmFlags::VM_MAYREAD,
+            true
+        )
+        .unwrap(),
+        (start_page + 1).start_address()
+    );
+    assert_eq!(
+        collect_mappings(&vmm),
+        vec![
+            0x1000..0x2000,
+            0x2000..0x4000,
+            0x5000..0xd000,
+            0xd000..0x11000,
+            0x11000..0x12000
+        ]
+    );
+
+    // shrink mapping
+    assert!(
+        vmm.resize_mapping(
+            PageRange::new(start_page + 4, start_page + 8),
+            NonZeroPageSize::new(0x2000)
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        collect_mappings(&vmm),
+        vec![
+            0x1000..0x2000,
+            0x2000..0x4000,
+            0x5000..0x7000,
+            0x9000..0xd000,
+            0xd000..0x11000,
+            0x11000..0x12000
+        ]
     );
 }
 
@@ -349,19 +401,18 @@ fn test_vmm_page_fault() {
     vmm.insert_mapping(
         PageRange::new(start_page, start_page + 4),
         VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE,
-        false,
     );
     // [0x1000, 0x5000)
 
     // Access page w/o mapping
     assert!(matches!(
-        vmm.handle_page_fault(start_page + 6, PageFaultErrorCode::USER_MODE, false),
+        vmm.handle_page_fault(start_page + 6, PageFaultErrorCode::USER_MODE),
         Err(PageFaultError::AccessError(_))
     ));
 
     // Access non-present page w/ mapping
     assert!(
-        vmm.handle_page_fault(start_page + 2, PageFaultErrorCode::USER_MODE, false)
+        vmm.handle_page_fault(start_page + 2, PageFaultErrorCode::USER_MODE)
             .is_ok()
     );
     check_flags(
@@ -382,12 +433,11 @@ fn test_vmm_page_fault() {
             | VmFlags::VM_MAYREAD
             | VmFlags::VM_MAYWRITE
             | VmFlags::VM_GROWSDOWN,
-        false,
     );
     // [0x1000, 0x5000), [0x1000_0000, 0x1000_4000)
     // Test stack growth
     assert!(
-        vmm.handle_page_fault(stack_page - 1, PageFaultErrorCode::USER_MODE, false)
+        vmm.handle_page_fault(stack_page - 1, PageFaultErrorCode::USER_MODE)
             .is_ok()
     );
     assert_eq!(
@@ -396,7 +446,7 @@ fn test_vmm_page_fault() {
     );
     // Cannot grow stack too far
     assert!(matches!(
-        vmm.handle_page_fault(start_page + 100, PageFaultErrorCode::USER_MODE, false),
+        vmm.handle_page_fault(start_page + 100, PageFaultErrorCode::USER_MODE),
         Err(PageFaultError::AllocationFailed)
     ));
 }

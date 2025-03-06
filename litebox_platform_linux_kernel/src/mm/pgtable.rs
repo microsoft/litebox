@@ -38,10 +38,13 @@ impl<M: super::MemoryProvider> PageTableAllocator<M> {
 }
 
 pub(crate) trait PageTableImpl {
+    /// Flags that `mprotect` can change:
     /// [`PageTableFlags::WRITABLE`] | [`PageTableFlags::USER_ACCESSIBLE`] | [`PageTableFlags::NO_EXECUTE`]
-    const MPROTECT_PTE_MASK: u64 = PageTableFlags::WRITABLE.bits()
-        | PageTableFlags::USER_ACCESSIBLE.bits()
-        | PageTableFlags::NO_EXECUTE.bits();
+    const MPROTECT_PTE_MASK: PageTableFlags = PageTableFlags::from_bits_truncate(
+        PageTableFlags::WRITABLE.bits()
+            | PageTableFlags::USER_ACCESSIBLE.bits()
+            | PageTableFlags::NO_EXECUTE.bits(),
+    );
 
     /// Initialize the page table with the physical address of the top-level page table.
     ///
