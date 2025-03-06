@@ -1,4 +1,4 @@
-use litebox::fd::FileFd;
+use litebox::{fd::FileFd, fs::FileSystem};
 use thiserror::Error;
 
 use crate::{
@@ -6,19 +6,25 @@ use crate::{
         AsErrno,
         constants::{EBADF, EINVAL, ENOMEM, EOVERFLOW},
     },
-    file_descriptors,
+    file_descriptors, litebox_fs,
 };
 
 const PAGE_SIZE: usize = 4096;
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 const PAGE_SHIFT: usize = PAGE_SIZE.trailing_zeros() as usize;
 
+#[non_exhaustive]
 #[derive(Error, Debug)]
-enum MmapError {}
+enum MmapError {
+    #[error("Failed to allocate {0:#x} bytes")]
+    OutOfMemory(usize),
+}
 
 impl AsErrno for MmapError {
     fn as_errno(&self) -> i32 {
-        todo!()
+        match self {
+            MmapError::OutOfMemory(_) => ENOMEM,
+        }
     }
 }
 
@@ -67,6 +73,7 @@ fn do_mmap_file(
     file: &FileFd,
     pgoff: usize,
 ) -> Result<usize, MmapError> {
+    litebox_fs().read(file, buf);
     todo!()
 }
 
@@ -113,6 +120,6 @@ pub extern "C" fn mmap(
 
     match res {
         Ok(addr) => addr as isize,
-        Err(err) => err.as_errno() as isize,
+        Err(err) => -err.as_errno() as isize,
     }
 }

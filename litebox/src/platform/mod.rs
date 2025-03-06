@@ -428,3 +428,35 @@ where
         f: impl FnOnce(&mut [T]) -> R,
     ) -> Option<R>;
 }
+
+#[derive(Error, Debug)]
+pub enum MappingError {
+    #[error("Not enough memory")]
+    OutOfMemory,
+}
+
+pub trait MappingProvider {
+    fn create_executable_page<F>(
+        &self,
+        suggested_addr: Option<usize>,
+        op: F,
+    ) -> Result<usize, MappingError>
+    where
+        F: FnOnce(&mut [u8]) -> usize;
+
+    fn create_writable_page<F>(
+        &self,
+        suggested_addr: Option<usize>,
+        op: F,
+    ) -> Result<usize, MappingError>
+    where
+        F: FnOnce(&mut [u8]) -> usize;
+
+    fn create_readable_page<F>(
+        &self,
+        suggested_addr: Option<usize>,
+        op: F,
+    ) -> Result<usize, MappingError>
+    where
+        F: FnOnce(&mut [u8]) -> usize;
+}
