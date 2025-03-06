@@ -663,8 +663,6 @@ struct Descriptor {
 struct RootDir {
     // keys are normalized paths; directories do not have the final `/` (thus the root would be at
     // the empty-string key "")
-    //
-    // TODO: Consider ensuring that we only ever store lower/tombstone, and never upper?
     entries: HashMap<String, Entry>,
 }
 
