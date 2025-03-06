@@ -36,10 +36,10 @@ pub struct FileSystem<
     sync: sync::Synchronization<'platform, Platform>,
     upper: Upper,
     lower: Lower,
-    root: sync::RwLock<'platform, Platform, RootDir<'platform, Platform>>,
+    root: sync::RwLock<'platform, Platform, RootDir>,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
-    descriptors: sync::RwLock<'platform, Platform, Descriptors<'platform, Platform>>,
+    descriptors: sync::RwLock<'platform, Platform, Descriptors>,
 }
 
 impl<
@@ -53,7 +53,7 @@ impl<
     #[must_use]
     pub fn new(platform: &'platform Platform, upper: Upper, lower: Lower) -> Self {
         let sync = sync::Synchronization::new(platform);
-        let root = sync.new_rwlock(RootDir::new(&sync));
+        let root = sync.new_rwlock(RootDir::new());
         let descriptors = sync.new_rwlock(Descriptors::new());
         Self {
             sync,
@@ -164,7 +164,7 @@ impl<
                      flags,
                      entry,
                  }| {
-                    match &*entry.read() {
+                    match entry.as_ref() {
                         EntryX::Upper { fd: _ } => {
                             // Need to do nothing, jump to next
                             return;
@@ -182,15 +182,15 @@ impl<
                             // necessary.
                             let old_entry = core::mem::replace(
                                 entry,
-                                Arc::new(self.sync.new_rwlock(EntryX::Upper {
+                                Arc::new(EntryX::Upper {
                                     fd: self.upper.open(path, *flags, Mode::empty()).unwrap(),
-                                })),
+                                }),
                             );
                             let root_entry = root_entries.remove(path).unwrap();
                             assert!(Arc::ptr_eq(&old_entry, &root_entry));
                             drop(root_entry);
                             let entry = Arc::into_inner(old_entry).unwrap();
-                            match entry.into_inner() {
+                            match entry {
                                 EntryX::Upper { .. } | EntryX::Tombstone => unreachable!(),
                                 EntryX::Lower { fd } => {
                                     self.lower.close(fd).unwrap();
@@ -200,9 +200,9 @@ impl<
                         _ => {
                             // Other FDs are open with the same file too. We'll handle the open one
                             // here locally, and a future FD will take care of the relevant closing.
-                            *entry = Arc::new(self.sync.new_rwlock(EntryX::Upper {
+                            *entry = Arc::new(EntryX::Upper {
                                 fd: self.upper.open(path, *flags, Mode::empty()).unwrap(),
-                            }));
+                            });
                         }
                     }
                 },
@@ -263,7 +263,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         // If we already have an entry saying it is a tombstone, then we need to quit out early;
         // otherwise, we'll check the levels.
         if let Some(entry) = self.root.read().entries.get(&path) {
-            match *entry.read() {
+            match entry.as_ref() {
                 EntryX::Tombstone => {
                     // The file has been cleared out; it used to exist on the lower level, but we
                     // explicitly have placed a tombstone in its place.
@@ -293,14 +293,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         }
         if tombstone_removal {
             let entry = self.root.write().entries.remove(&path).unwrap();
-            let EntryX::Tombstone = *entry.read() else {
+            let EntryX::Tombstone = *entry else {
                 unreachable!()
             };
         }
         // Otherwise, we first check the upper level, creating an entry if needed
         match self.upper.open(&*path, flags, mode) {
             Ok(fd) => {
-                let entry = Arc::new(self.sync.new_rwlock(EntryX::Upper { fd }));
+                let entry = Arc::new(EntryX::Upper { fd });
                 let old = self
                     .root
                     .write()
@@ -347,9 +347,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         //
         // Any errors from lower level now _must_ propagate up, so we can just invoke
         // the lower level and set up the relevant descriptor upon success.
-        let entry = Arc::new(self.sync.new_rwlock(EntryX::Lower {
+        let entry = Arc::new(EntryX::Lower {
             fd: self.lower.open(path.as_str(), flags, mode)?,
-        }));
+        });
         let old = self
             .root
             .write()
@@ -372,7 +372,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         // We can first sanity check that we don't have a tombstone: none of the other operations
         // should ever cause the entry _at_ an fd to become a tombstone, even if the entry at the
         // path becomes a tombstone due to a file removal.
-        match *entry.read() {
+        match entry.as_ref() {
             EntryX::Upper { .. } | EntryX::Lower { .. } => {}
             EntryX::Tombstone => unreachable!(),
         }
@@ -397,8 +397,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         // We are now assured that we can close out the underlying file; we are the only holder of
         // the entry, and thus can change it from an Arc to the underlying value itself.
         let entry = Arc::into_inner(entry).unwrap();
-        // This also means we can grab the rw-locked value out.
-        let entry = entry.into_inner();
         // We can now finally look at the underlying FDs and close things out there.
         match entry {
             EntryX::Upper { fd } => self.upper.close(fd),
@@ -417,7 +415,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         if !descriptor.flags.contains(OFlags::RDONLY) && !descriptor.flags.contains(OFlags::RDWR) {
             return Err(ReadError::NotForReading);
         }
-        match &*descriptor.entry.read() {
+        match descriptor.entry.as_ref() {
             EntryX::Upper { fd } => self.upper.read(fd, buf),
             EntryX::Lower { fd } => self.lower.read(fd, buf),
             EntryX::Tombstone => unreachable!(),
@@ -430,11 +428,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         // actually being written to.
         let descriptors = self.descriptors.read();
         let descriptor = descriptors.get(fd);
-        let mut entry = descriptor.entry.write();
         if !descriptor.flags.contains(OFlags::WRONLY) && !descriptor.flags.contains(OFlags::RDWR) {
             return Err(WriteError::NotForWriting);
         }
-        match &*entry {
+        match descriptor.entry.as_ref() {
             EntryX::Upper { fd } => return self.upper.write(fd, buf),
             EntryX::Lower { fd } => {
                 // fallthrough
@@ -443,8 +440,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         }
         // Get the path, since we are gonna drop the mutexes
         let path = descriptor.path.clone();
-        // Drop all the relevant mutexes, so we don't end up locking ourselves out
-        drop(entry);
+        // Drop the relevant lock, so we don't end up locking ourselves out when attempting to
+        // migrate up
         drop(descriptors);
         // Change it to an upper-level file, also altering the file descriptor.
         match self.migrate_file_up(&path) {
@@ -531,7 +528,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         self.root
             .write()
             .entries
-            .insert(path, Arc::new(self.sync.new_rwlock(EntryX::Tombstone)));
+            .insert(path, Arc::new(EntryX::Tombstone));
         Ok(())
     }
 
@@ -632,33 +629,31 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     }
 }
 
-type Descriptors<'platform, Platform> = super::shared::Descriptors<Descriptor<'platform, Platform>>;
+type Descriptors = super::shared::Descriptors<Descriptor>;
 
-struct Descriptor<'platform, Platform: sync::RawSyncPrimitivesProvider> {
+struct Descriptor {
     path: String,
     flags: OFlags,
-    entry: Entry<'platform, Platform>,
+    entry: Entry,
 }
 
-struct RootDir<'platform, Platform: sync::RawSyncPrimitivesProvider> {
+struct RootDir {
     // keys are normalized paths; directories do not have the final `/` (thus the root would be at
     // the empty-string key "")
     //
     // TODO: Consider ensuring that we only ever store lower/tombstone, and never upper?
-    entries: HashMap<String, Entry<'platform, Platform>>,
+    entries: HashMap<String, Entry>,
 }
 
-impl<'platform, Platform: sync::RawSyncPrimitivesProvider> RootDir<'platform, Platform> {
-    fn new(sync: &sync::Synchronization<'platform, Platform>) -> Self {
+impl RootDir {
+    fn new() -> Self {
         Self {
             entries: HashMap::new(),
         }
     }
 }
 
-// TODO(jayb): Do we really need the RwLock here? I _think_ the other RwLocks _may_ be sufficient
-// overall.
-type Entry<'platform, Platform> = Arc<sync::RwLock<'platform, Platform, EntryX>>;
+type Entry = Arc<EntryX>;
 
 enum EntryX {
     // This file should be considered a purely upper-level file, independent of whether lower level file exists or not.
