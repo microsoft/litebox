@@ -14,7 +14,6 @@ use x86_64::{
         paging::{
             Page, PageSize, PageTableFlags, Size4KiB,
             mapper::{MappedFrame, TranslateResult},
-            page::PageRange,
         },
     },
 };
@@ -26,7 +25,7 @@ use crate::{
     mm::{
         MemoryProvider,
         pgtable::{PageFaultError, PageTableAllocator},
-        vm::{VmemProtectError, VmemResizeError},
+        vm::{NonZeroPageSize, VmemProtectError, VmemResizeError},
     },
     mock_log_println,
 };
@@ -34,7 +33,7 @@ use crate::{
 use super::{
     alloc::SafeZoneAllocator,
     pgtable::PageTableImpl,
-    vm::{VmFlags, Vmem},
+    vm::{PageRange, VmFlags, Vmem},
 };
 
 const MAX_ORDER: usize = 23;
@@ -163,7 +162,7 @@ fn test_page_table() {
     let start_addr = VirtAddr::new(0x1000);
     let start_page = Page::<Size4KiB>::containing_address(start_addr);
     let flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-    let range = Page::range(start_page, start_page + 4);
+    let range = PageRange::new(start_page, start_page + 4);
     let mut pgtable = get_test_pgtable(range, flags);
 
     // update flags
@@ -234,7 +233,7 @@ fn collect_mappings(vmm: &Vmem<X64PageTable<MockKernel>>) -> Vec<Range<u64>> {
 fn test_vmm_mapping() {
     let start_addr = VirtAddr::new(0x1000);
     let start_page = Page::from_start_address(start_addr).unwrap();
-    let range = Page::range(start_page, start_page + 12);
+    let range = PageRange::new(start_page, start_page + 12);
     let fault_flags =
         PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE;
     let pt = get_test_pgtable(range, fault_flags);
@@ -248,14 +247,14 @@ fn test_vmm_mapping() {
     // [(0x1000, 0xd000)]
     assert_eq!(collect_mappings(&vmm), vec![0x1000..0xd000]);
 
-    vmm.remove_mapping(Page::range(start_page + 2, start_page + 4), false);
+    vmm.remove_mapping(PageRange::new(start_page + 2, start_page + 4), false);
     // [(0x1000, 0x3000), (0x5000, 0xd000)]
     assert_eq!(collect_mappings(&vmm), vec![0x1000..0x3000, 0x5000..0xd000]);
 
     assert!(matches!(
         vmm.resize_mapping(
-            Page::range(start_page + 2, start_page + 3),
-            PAGE_SIZE * 2,
+            PageRange::new(start_page + 2, start_page + 3),
+            NonZeroPageSize::new(PAGE_SIZE * 2),
             false
         ),
         Err(VmemResizeError::NotExist(_))
@@ -264,8 +263,8 @@ fn test_vmm_mapping() {
 
     assert!(matches!(
         vmm.resize_mapping(
-            Page::range(start_page, start_page + 3),
-            PAGE_SIZE * 4,
+            PageRange::new(start_page, start_page + 3),
+            NonZeroPageSize::new(PAGE_SIZE * 4),
             false
         ),
         Err(VmemResizeError::InvalidAddr { .. })
@@ -274,7 +273,7 @@ fn test_vmm_mapping() {
 
     assert!(matches!(
         vmm.protect_mapping(
-            Page::range(start_page + 2, start_page + 4),
+            PageRange::new(start_page + 2, start_page + 4),
             VmFlags::VM_READ | VmFlags::VM_WRITE,
             false
         ),
@@ -284,8 +283,8 @@ fn test_vmm_mapping() {
 
     assert!(
         vmm.resize_mapping(
-            Page::range(start_page, start_page + 2),
-            PAGE_SIZE * 4,
+            PageRange::new(start_page, start_page + 2),
+            NonZeroPageSize::new(PAGE_SIZE * 4),
             false
         )
         .is_ok()
@@ -295,7 +294,7 @@ fn test_vmm_mapping() {
 
     assert!(matches!(
         vmm.protect_mapping(
-            Page::range(start_page, start_page + 4),
+            PageRange::new(start_page, start_page + 4),
             VmFlags::VM_READ | VmFlags::VM_EXEC,
             false
         ),
@@ -305,7 +304,7 @@ fn test_vmm_mapping() {
 
     assert!(
         vmm.protect_mapping(
-            Page::range(start_page + 2, start_page + 4),
+            PageRange::new(start_page + 2, start_page + 4),
             VmFlags::VM_READ | VmFlags::VM_WRITE,
             false
         )
@@ -318,14 +317,19 @@ fn test_vmm_mapping() {
     );
 
     // try to remap [0x3000, 0x5000)
-    let r = Page::range(start_page + 2, start_page + 4);
+    let r = PageRange::new(start_page + 2, start_page + 4);
     assert!(matches!(
-        vmm.resize_mapping(r, PAGE_SIZE * 4, false),
+        vmm.resize_mapping(r, NonZeroPageSize::new(PAGE_SIZE * 4), false),
         Err(VmemResizeError::RangeOccupied(_))
     ));
     assert!(
-        vmm.move_mappings(r, PAGE_SIZE * 4, VirtAddr::zero(), false)
-            .is_some_and(|v| v.as_u64() == 0xd000)
+        vmm.move_mappings(
+            r,
+            NonZeroPageSize::new(PAGE_SIZE * 4),
+            VirtAddr::zero(),
+            false
+        )
+        .is_some_and(|v| v.as_u64() == 0xd000)
     );
     assert_eq!(
         collect_mappings(&vmm),
@@ -337,12 +341,12 @@ fn test_vmm_mapping() {
 fn test_vmm_page_fault() {
     let start_addr = VirtAddr::new(0x1000);
     let start_page = Page::from_start_address(start_addr).unwrap();
-    let range = Page::range(start_page, start_page + 2);
+    let range = PageRange::new(start_page, start_page + 2);
     let fault_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
     let pt = get_test_pgtable(range, fault_flags);
     let mut vmm = Vmem::new(pt);
     vmm.insert_mapping(
-        Page::range(start_page, start_page + 4),
+        PageRange::new(start_page, start_page + 4),
         VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE,
     );
     // [0x1000, 0x5000)
@@ -370,7 +374,7 @@ fn test_vmm_page_fault() {
     // insert stack mapping
     let stack_page = Page::from_start_address(VirtAddr::new(0x1000_0000)).unwrap();
     vmm.insert_mapping(
-        Page::range(stack_page, stack_page + 4),
+        PageRange::new(stack_page, stack_page + 4),
         VmFlags::VM_READ
             | VmFlags::VM_WRITE
             | VmFlags::VM_MAYREAD
