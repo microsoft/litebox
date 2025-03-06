@@ -381,27 +381,50 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         let RootDir {
             entries: root_entries,
         } = &mut *self.root.write();
-        // Just a sanity-check: any held fd must also have something in self.root too
-        assert!(Arc::strong_count(&entry) >= 2);
-        // We can check if there are other FDs referring to the same file
-        if Arc::strong_count(&entry) > 2 {
-            // There are other FDs pointing at this file, leave it alone
-            return Ok(());
-        }
-        // Otherwise, we are the only FD pointing at it. We need to clean up the lower level. We
-        // first grab it out of the root.
-        let root_entry = root_entries.remove(&path).unwrap();
-        // Then we perform a sanity checks, before dropping that entry out entirely.
-        assert!(Arc::ptr_eq(&entry, &root_entry));
-        drop(root_entry);
-        // We are now assured that we can close out the underlying file; we are the only holder of
-        // the entry, and thus can change it from an Arc to the underlying value itself.
-        let entry = Arc::into_inner(entry).unwrap();
-        // We can now finally look at the underlying FDs and close things out there.
-        match entry {
-            EntryX::Upper { fd } => self.upper.close(fd),
-            EntryX::Lower { fd, .. } => self.lower.close(fd),
-            EntryX::Tombstone => unreachable!(),
+        // Our approach to this changes depending on whether this is an upper level FD or a
+        // lower FD.
+        match *entry {
+            EntryX::Tombstone => {
+                // A tombstone should never have even become an FD (if a file was opened, and then
+                // was subsequently deleted, then the FD itself would not yet be a tombstone, but
+                // would be pointing to the original value).
+                unreachable!()
+            }
+            EntryX::Upper { .. } => {
+                // Upper-level FDs do not have any entry in the root, nor do they share anything via
+                // `Arc`s. Thus, we can deal with them individually.
+                assert_eq!(Arc::strong_count(&entry), 1);
+                // Specifically, we can just immediately close them out, consuming the entry itself.
+                let EntryX::Upper { fd } = Arc::into_inner(entry).unwrap() else {
+                    unreachable!()
+                };
+                self.upper.close(fd)
+            }
+            EntryX::Lower { .. } => {
+                // Lower level FDs always have a corresponding entry in the root. Thus, we might
+                // need to possibly clean things up from the root.
+                //
+                // First, a sanity check.
+                assert!(Arc::strong_count(&entry) >= 2);
+                // We can check if there are other FDs referring to the same file
+                if Arc::strong_count(&entry) > 2 {
+                    // There are other FDs pointing at this file, leave it alone
+                    return Ok(());
+                }
+                // Otherwise, we are the only FD pointing at it. We need to clean up the lower level. We
+                // first grab it out of the root.
+                let root_entry = root_entries.remove(&path).unwrap();
+                // Then we perform a sanity checks, before dropping that entry out entirely.
+                assert!(Arc::ptr_eq(&entry, &root_entry));
+                drop(root_entry);
+                // We are now assured that we can close out the underlying file; we are the only
+                // holder of the entry, and thus can change it from an Arc to the underlying value
+                // itself, and then close it out.
+                let EntryX::Lower { fd, .. } = Arc::into_inner(entry).unwrap() else {
+                    unreachable!()
+                };
+                self.lower.close(fd)
+            }
         }
     }
 
