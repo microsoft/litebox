@@ -150,12 +150,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Ok(())
     }
 
-    fn read(&self, fd: &crate::fd::FileFd, buf: &mut [u8]) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        fd: &crate::fd::FileFd,
+        buf: &mut [u8],
+        mut offset: Option<usize>,
+    ) -> Result<usize, ReadError> {
         let mut descriptors = self.descriptors.write();
         let Descriptor::File { idx, position } = descriptors.get_mut(fd) else {
             return Err(ReadError::NotAFile);
         };
         let file = self.tar_data.entries().nth(*idx).unwrap().data();
+        let position = offset.as_mut().unwrap_or(position);
         let start = (*position).min(file.len());
         let end = position.checked_add(buf.len()).unwrap().min(file.len());
         debug_assert!(start <= end);

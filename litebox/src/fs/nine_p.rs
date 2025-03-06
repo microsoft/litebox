@@ -41,6 +41,7 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<'_, Platform
         &self,
         fd: &crate::fd::FileFd,
         buf: &mut [u8],
+        offset: Option<usize>,
     ) -> Result<usize, super::errors::ReadError> {
         todo!()
     }

@@ -429,10 +429,13 @@ where
     ) -> Option<R>;
 }
 
+#[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum MappingError {
-    #[error("Not enough memory")]
+    #[error("not enough memory")]
     OutOfMemory,
+    #[error("failed to read from file")]
+    ReadError(#[from] crate::fs::errors::ReadError),
 }
 
 pub trait MappingProvider<P: RawMutPointer<u8>> {
@@ -444,25 +447,25 @@ pub trait MappingProvider<P: RawMutPointer<u8>> {
         op: F,
     ) -> Result<usize, MappingError>
     where
-        F: FnOnce(P) -> usize;
+        F: FnOnce(P) -> Result<usize, MappingError>;
 
     fn create_writable_page<F>(
-        &self,
+        &mut self,
         suggested_addr: Option<usize>,
         len: usize,
         fixed_addr: bool,
         op: F,
     ) -> Result<usize, MappingError>
     where
-        F: FnOnce(&mut [u8]) -> usize;
+        F: FnOnce(P) -> Result<usize, MappingError>;
 
     fn create_readable_page<F>(
-        &self,
+        &mut self,
         suggested_addr: Option<usize>,
         len: usize,
         fixed_addr: bool,
         op: F,
     ) -> Result<usize, MappingError>
     where
-        F: FnOnce(&mut [u8]) -> usize;
+        F: FnOnce(P) -> Result<usize, MappingError>;
 }

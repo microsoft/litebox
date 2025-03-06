@@ -9,7 +9,6 @@ use crate::{
     ptr::{UserConstPtr, UserMutPtr},
 };
 
-#[allow(dead_code)]
 mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }

@@ -37,7 +37,7 @@ pub enum AuxKey {
     AT_SYSINFO_EHDR = 33, /* the start address of the page containing the VDSO */
 }
 
-pub struct UserStack<P: RawMutPointer<u8>> {
+pub(super) struct UserStack<P: RawMutPointer<u8>> {
     stack_top: P,
     stack_top_vaddr: usize,
 }
@@ -46,7 +46,7 @@ impl<P: RawMutPointer<u8>> UserStack<P> {
     /// Stack alignment required by libc ABI
     const STACK_ALIGNMENT: usize = 16;
 
-    /// stack_top must be aligned to [`STACK_ALIGNMENT`] bytes
+    /// stack_top must be aligned to [`Self::STACK_ALIGNMENT`] bytes
     pub fn new<T>(stack_top: P, stack_top_vaddr: T) -> Self
     where
         T: FnOnce() -> usize,

@@ -43,8 +43,8 @@ pub trait FileSystem: private::Sealed {
     fn open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<FileFd, OpenError>;
     /// Close the file at `fd`
     fn close(&self, fd: FileFd) -> Result<(), CloseError>;
-    /// Read from a file descriptor into a buffer
-    fn read(&self, fd: &FileFd, buf: &mut [u8]) -> Result<usize, ReadError>;
+    /// Read from a file descriptor into a buffer at a specific offset if given
+    fn read(&self, fd: &FileFd, buf: &mut [u8], offset: Option<usize>) -> Result<usize, ReadError>;
     /// Write from a buffer to a file descriptor
     fn write(&self, fd: &FileFd, buf: &[u8]) -> Result<usize, WriteError>;
     /// Change the permissions of a file

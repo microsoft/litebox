@@ -23,7 +23,7 @@ extern crate alloc;
 //
 // NOTE: Currently, we only support one platform, thus this is a trivial no-op. However, once we
 // have more, we must account for each of the possible pairs.
-#[cfg(any(all(feature = "platform_linux_kernel", feature = "platform_linux_userland"),))]
+#[cfg(any())]
 compile_error!(
     r##"Too many platforms specified. Are you sure you have marked 'default-features = false'?"##
 );

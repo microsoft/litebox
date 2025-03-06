@@ -181,7 +181,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Ok(())
     }
 
-    fn read(&self, fd: &FileFd, buf: &mut [u8]) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        fd: &FileFd,
+        buf: &mut [u8],
+        mut offset: Option<usize>,
+    ) -> Result<usize, ReadError> {
         let mut descriptors = self.descriptors.write();
         let Descriptor::File {
             file,
@@ -195,6 +200,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         if !*read_allowed {
             return Err(ReadError::NotForReading);
         }
+        let position = offset.as_mut().unwrap_or(position);
         let file = file.read();
         let start = (*position).min(file.data.len());
         let end = position

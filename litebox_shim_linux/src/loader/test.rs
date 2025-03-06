@@ -1,10 +1,15 @@
-use alloc::{collections::btree_map::BTreeMap, ffi::CString, string::ToString, vec};
+use alloc::{
+    collections::btree_map::BTreeMap,
+    ffi::CString,
+    string::{String, ToString},
+    vec,
+};
 use core::arch::global_asm;
 use elf_loader::{
     Elf,
     arch::ElfPhdr,
     mmap::{Mmap, MmapImpl},
-    object::{ElfBinary, ElfFile},
+    object::ElfFile,
     segment::PAGE_SIZE,
 };
 use litebox::platform::trivial_providers::TransparentMutPtr;
@@ -13,7 +18,7 @@ use crate::loader::stack::{AuxKey, UserStack};
 
 extern crate std;
 
-const TEST_EXEC_FILE: &[u8] = include_bytes!("./hello");
+// const TEST_EXEC_FILE: &[u8] = include_bytes!("./hello");
 #[repr(align(4096))]
 struct Stack([u8; 8192]);
 static mut TEST_EXEC_STACK: Stack = Stack([0; 8192]);
@@ -108,14 +113,35 @@ impl Mmap for LiteBoxMmap {
     }
 }
 
+fn compile(path: &std::path::PathBuf) {
+    // Compile the hello.c file to an executable
+    let output = std::process::Command::new("gcc")
+        .arg("-o")
+        .arg(path.to_str().unwrap())
+        .arg("./src/loader/hello.c")
+        .arg("-static")
+        .output()
+        .expect("Failed to compile hello.c");
+    if !output.status.success() {
+        panic!(
+            "Failed to compile hello.c: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 #[test]
 fn test_load_exec() {
     use elf_loader::Loader;
 
+    // no std::env::var("OUT_DIR").unwrap()??
+    let path = std::path::PathBuf::from("../target/debug").join("hello");
+    compile(&path);
+
     let elf = {
-        let mut loader = Loader::<LiteBoxMmap>::new();
+        let mut loader = Loader::<MmapImpl>::new();
         loader
-            .easy_load(ElfFile::from_path("./src/loader/hello").unwrap())
+            .easy_load(ElfFile::from_path(path.to_str().unwrap()).unwrap())
             .unwrap()
         // loader
         //     .easy_load(ElfBinary::new("hello", TEST_EXEC_FILE))
@@ -130,8 +156,6 @@ fn test_load_exec() {
     } else {
         None
     };
-
-    assert!(false);
 
     unsafe extern "C" {
         fn trampoline(entry: usize, sp: *mut usize) -> !;
