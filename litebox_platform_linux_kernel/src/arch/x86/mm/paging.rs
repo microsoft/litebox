@@ -250,8 +250,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
         new_flags: PageTableFlags,
         flush: bool,
     ) -> Result<(), PageTableWalkError> {
-        let mask = PageTableFlags::from_bits(Self::MPROTECT_PTE_MASK).unwrap();
-        let new_flags = new_flags & mask;
+        let new_flags = new_flags & Self::MPROTECT_PTE_MASK;
         let begin: Page<Size4KiB> = Page::containing_address(start);
         let end: Page<Size4KiB> = Page::containing_address(start + len as _ - 1);
 
@@ -273,8 +272,10 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
                         new_flags
                     };
                     if flags != new_flags {
-                        match unsafe { self.inner.update_flags(page, (flags & !mask) | new_flags) }
-                        {
+                        match unsafe {
+                            self.inner
+                                .update_flags(page, (flags & !Self::MPROTECT_PTE_MASK) | new_flags)
+                        } {
                             Ok(fl) => {
                                 if flush {
                                     fl.flush();

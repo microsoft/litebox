@@ -8,6 +8,11 @@ use crate::arch::{PAGE_SIZE, Page, PageFaultErrorCode, PageTableFlags, VirtAddr}
 
 use super::pgtable::{PageFaultError, PageTableImpl, PageTableWalkError};
 
+#[cfg(not(test))]
+const FLUSH_TLB: bool = true;
+#[cfg(test)]
+const FLUSH_TLB: bool = false;
+
 bitflags::bitflags! {
     /// Flags to describe the properties of a memory region.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,7 +89,7 @@ impl Iterator for PageRange {
     }
 }
 
-/// A non-zero page-aligned size in bytes.
+/// A non-zero 4KiB-page-aligned size in bytes.
 #[derive(Clone, Copy)]
 pub(super) struct NonZeroPageSize {
     size: usize,
@@ -158,12 +163,12 @@ impl<PT: PageTableImpl> Vmem<PT> {
     ///
     /// If the range to be removed _partially_ overlaps any ranges, then those ranges will
     /// be contracted to no longer cover the removed range.
-    pub(super) fn remove_mapping(&mut self, range: PageRange, flush: bool) {
+    pub(super) fn remove_mapping(&mut self, range: PageRange) {
         let (start, end) = (range.start.start_address(), range.end.start_address());
         self.vmas.remove(start..end);
         unsafe {
             self.pt
-                .unmap_pages(start, (end - start) as usize, true, flush)
+                .unmap_pages(start, (end - start) as usize, true, FLUSH_TLB)
         };
     }
 
@@ -180,7 +185,7 @@ impl<PT: PageTableImpl> Vmem<PT> {
     /// # Panics
     ///
     /// Panics if the range is beyond the task address space [[`Self::TASK_ADDR_MIN`], [`Self::TASK_ADDR_MAX`]]).
-    pub(super) fn insert_mapping(&mut self, range: PageRange, flags: VmFlags, flush: bool) {
+    pub(super) fn insert_mapping(&mut self, range: PageRange, flags: VmFlags) {
         let (start, end) = (range.start.start_address(), range.end.start_address());
         assert!(start >= Self::TASK_ADDR_MIN);
         assert!(end <= Self::TASK_ADDR_MAX);
@@ -191,14 +196,20 @@ impl<PT: PageTableImpl> Vmem<PT> {
                     intersection.start,
                     (intersection.end - intersection.start).try_into().unwrap(),
                     true,
-                    flush,
+                    FLUSH_TLB,
                 )
             };
         }
         self.vmas.insert(start..end, VmArea { flags })
     }
 
-    pub fn create_mapping(
+    /// Create a new mapping in the virtual address space.
+    /// The mapping will be created at the suggested address. If the start address is zero,
+    /// some available range will be choosen by the kernel.
+    /// Note that if the suggested address is given and `fixed_addr` is set to `true`,
+    /// the kernel uses it directly without checking if it is available, causing overlapping
+    /// mappings to be unmapped.
+    pub(super) fn create_mapping(
         &mut self,
         suggested_range: PageRange,
         flags: VmFlags,
@@ -209,7 +220,11 @@ impl<PT: PageTableImpl> Vmem<PT> {
             suggested_range.end.start_address(),
         );
         let len = suggested_end - suggested_start;
-        let new_addr = self.get_unmmaped_area(suggested_start, len as usize, fixed_addr)?;
+        let new_addr = self.get_unmmaped_area(
+            suggested_start,
+            NonZeroPageSize::new(len as usize),
+            fixed_addr,
+        )?;
         self.vmas.insert(new_addr..new_addr + len, VmArea { flags });
         Some(new_addr)
     }
@@ -224,9 +239,9 @@ impl<PT: PageTableImpl> Vmem<PT> {
         &mut self,
         range: PageRange,
         new_size: NonZeroPageSize,
-        flush: bool,
     ) -> Result<(), VmemResizeError> {
         let range = range.start.start_address()..range.end.start_address();
+        // `cur_range` contains `range.start`
         let (cur_range, cur_vma) = self
             .vmas
             .get_key_value(&range.start)
@@ -240,13 +255,10 @@ impl<PT: PageTableImpl> Vmem<PT> {
             }
             core::cmp::Ordering::Less => {
                 // shrink
-                self.remove_mapping(
-                    PageRange::new(
-                        Page::from_start_address(new_end).unwrap(),
-                        Page::from_start_address(range.end).unwrap(),
-                    ),
-                    flush,
-                );
+                self.remove_mapping(PageRange::new(
+                    Page::from_start_address(new_end).unwrap(),
+                    Page::from_start_address(range.end).unwrap(),
+                ));
                 return Ok(());
             }
             core::cmp::Ordering::Greater => {}
@@ -286,23 +298,23 @@ impl<PT: PageTableImpl> Vmem<PT> {
         range: PageRange,
         new_size: NonZeroPageSize,
         suggested_addr: VirtAddr,
-        flush: bool,
     ) -> Option<VirtAddr> {
         let (start, end) = (range.start.start_address(), range.end.start_address());
         assert!(new_size.as_u64() >= (end - start));
 
-        let (target_range, vma) = self
+        // Check if the given range is within one mapping
+        let (cur_range, vma) = self
             .vmas
             .get_key_value(&start)
             .expect("VMEM: range not found");
-        assert!(target_range.contains(&(end - 1)));
+        assert!(cur_range.contains(&(end - 1)));
 
         let new_addr = self.get_unmmaped_area(suggested_addr, new_size, false)?;
         self.vmas
             .insert(new_addr..new_addr + new_size.as_u64(), *vma);
         unsafe {
             self.pt
-                .remap_pages(start, new_addr, (end - start) as usize, flush)
+                .remap_pages(start, new_addr, (end - start) as usize, FLUSH_TLB)
                 .ok()
         };
         self.vmas.remove(start..end);
@@ -316,7 +328,6 @@ impl<PT: PageTableImpl> Vmem<PT> {
         &mut self,
         range: PageRange,
         flags: VmFlags,
-        flush: bool,
     ) -> Result<(), VmemProtectError> {
         // only change the access flags
         let flags = flags & VmFlags::VM_ACCESS_FLAGS;
@@ -355,7 +366,7 @@ impl<PT: PageTableImpl> Vmem<PT> {
                     intersection.start,
                     (intersection.end - intersection.start) as usize,
                     new_flags.into(),
-                    flush,
+                    FLUSH_TLB,
                 )
             } {
                 Ok(_) => {}
@@ -386,7 +397,6 @@ impl<PT: PageTableImpl> Vmem<PT> {
         &mut self,
         page: Page,
         error_code: PageFaultErrorCode,
-        flush: bool,
     ) -> Result<(), PageFaultError> {
         let fault_addr = page.start_address();
         if fault_addr < Self::TASK_ADDR_MIN || fault_addr >= Self::TASK_ADDR_MAX {
@@ -413,11 +423,12 @@ impl<PT: PageTableImpl> Vmem<PT> {
                 .overlapping(Self::TASK_ADDR_MIN..fault_addr)
                 .next_back()
                 .is_none_or(|(prev_range, prev_vma)| {
-                    // enforce gap between stack and other preceding non-stack mappings
+                    // Enforce gap between stack and other preceding non-stack mappings.
                     // Either the previous mapping is also a stack mapping w/ some access flags
-                    (prev_vma.flags.contains(VmFlags::VM_GROWSDOWN) && !(prev_vma.flags & VmFlags::VM_ACCESS_FLAGS).is_empty())
-                    // Or the previous mapping is far enough from the fault address
-                    || fault_addr - prev_range.end >= Self::STACK_GUARD_GAP
+                    // or the previous mapping is far enough from the fault address
+                    (prev_vma.flags.contains(VmFlags::VM_GROWSDOWN)
+                        && !(prev_vma.flags & VmFlags::VM_ACCESS_FLAGS).is_empty())
+                        || fault_addr - prev_range.end >= Self::STACK_GUARD_GAP
                 })
             {
                 return Err(PageFaultError::AllocationFailed);
@@ -431,13 +442,17 @@ impl<PT: PageTableImpl> Vmem<PT> {
 
         unsafe {
             self.pt
-                .handle_page_fault(page, vma.flags.into(), error_code, flush)
+                .handle_page_fault(page, vma.flags.into(), error_code, FLUSH_TLB)
         }
     }
 
     /*================================Internal Functions================================ */
 
     /// Get an unmapped area in the virtual address space.
+    /// `suggested_addr` and `fixed_addr` are the hint address and MAP_FIXED flag respectively,
+    /// similar to how `mmap` works.
+    ///
+    /// Returns `None` if the area is not found.
     fn get_unmmaped_area(
         &self,
         suggested_addr: VirtAddr,
@@ -496,10 +511,6 @@ impl<PT: PageTableImpl> Vmem<PT> {
 
     /// Check if it has access to the fault address.
     fn access_error(error_code: PageFaultErrorCode, flags: VmFlags) -> bool {
-        if error_code.intersects(PageFaultErrorCode::PROTECTION_KEY | PageFaultErrorCode::SGX) {
-            return true;
-        }
-
         if error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE) {
             return !flags.contains(VmFlags::VM_WRITE);
         }
