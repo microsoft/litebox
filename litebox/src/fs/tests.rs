@@ -251,6 +251,9 @@ mod layered {
         fs.close(fd).expect("Failed to close dir");
     }
 
+    /// Check that for the same file, even though it started as a lower-level file, writing to it
+    /// successfully migrated it to an upper-level file, and converted the internal descriptors
+    /// over, such that the expected semantics of being able to see the updated file are held.
     #[test]
     fn file_read_write_sync_up() {
         let platform = MockPlatform::new();
@@ -258,6 +261,10 @@ mod layered {
         let mut in_mem_fs = in_mem::FileSystem::new(&platform);
         in_mem_fs.with_root_privileges(|fs| {
             // Change the permissions for `/` to allow file creation
+            //
+            // TODO: We might need to force-allow file creation in cases where the lower level
+            // already has the file in the correct mode. This would likely require `stat` as well as
+            // some internal-only force-creation API.
             fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod /");
         });
@@ -281,9 +288,12 @@ mod layered {
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"testfoo\n");
 
-        // TODO: This line triggers an assertion failure at the moment
-        // fs.write(&fd2, b"migration")
-        //     .expect("Failed to write to file");
+        fs.write(&fd2, b"share").expect("Failed to write to file");
+
+        let bytes_read = fs
+            .read(&fd1, &mut buffer)
+            .expect("Failed to read from file");
+        assert_eq!(&buffer[..bytes_read], b"shareoo\n");
 
         fs.close(fd1).expect("Failed to close file");
         fs.close(fd2).expect("Failed to close file");
