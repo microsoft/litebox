@@ -243,6 +243,7 @@ fn test_vmm_mapping() {
     vmm.insert_mapping(
         range,
         VmFlags::VM_READ | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE,
+        false,
     );
     // [(0x1000, 0xd000)]
     assert_eq!(collect_mappings(&vmm), vec![0x1000..0xd000]);
@@ -348,6 +349,7 @@ fn test_vmm_page_fault() {
     vmm.insert_mapping(
         PageRange::new(start_page, start_page + 4),
         VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE,
+        false,
     );
     // [0x1000, 0x5000)
 
@@ -380,6 +382,7 @@ fn test_vmm_page_fault() {
             | VmFlags::VM_MAYREAD
             | VmFlags::VM_MAYWRITE
             | VmFlags::VM_GROWSDOWN,
+        false,
     );
     // [0x1000, 0x5000), [0x1000_0000, 0x1000_4000)
     // Test stack growth

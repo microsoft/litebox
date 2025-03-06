@@ -180,11 +180,38 @@ impl<PT: PageTableImpl> Vmem<PT> {
     /// # Panics
     ///
     /// Panics if the range is beyond the task address space [[`Self::TASK_ADDR_MIN`], [`Self::TASK_ADDR_MAX`]]).
-    pub(super) fn insert_mapping(&mut self, range: PageRange, flags: VmFlags) {
+    pub(super) fn insert_mapping(&mut self, range: PageRange, flags: VmFlags, flush: bool) {
         let (start, end) = (range.start.start_address(), range.end.start_address());
         assert!(start >= Self::TASK_ADDR_MIN);
         assert!(end <= Self::TASK_ADDR_MAX);
+        for (r, _) in self.vmas.overlapping(start..end) {
+            let intersection = r.start.max(start)..r.end.min(end);
+            unsafe {
+                self.pt.unmap_pages(
+                    intersection.start,
+                    (intersection.end - intersection.start).try_into().unwrap(),
+                    true,
+                    flush,
+                )
+            };
+        }
         self.vmas.insert(start..end, VmArea { flags })
+    }
+
+    pub fn create_mapping(
+        &mut self,
+        suggested_range: PageRange,
+        flags: VmFlags,
+        fixed_addr: bool,
+    ) -> Option<VirtAddr> {
+        let (suggested_start, suggested_end) = (
+            suggested_range.start.start_address(),
+            suggested_range.end.start_address(),
+        );
+        let len = suggested_end - suggested_start;
+        let new_addr = self.get_unmmaped_area(suggested_start, len as usize, fixed_addr)?;
+        self.vmas.insert(new_addr..new_addr + len, VmArea { flags });
+        Some(new_addr)
     }
 
     /// Resize a range in the virtual address space.
@@ -270,7 +297,7 @@ impl<PT: PageTableImpl> Vmem<PT> {
             .expect("VMEM: range not found");
         assert!(target_range.contains(&(end - 1)));
 
-        let new_addr = self.get_unmmaped_area(suggested_addr, new_size)?;
+        let new_addr = self.get_unmmaped_area(suggested_addr, new_size, false)?;
         self.vmas
             .insert(new_addr..new_addr + new_size.as_u64(), *vma);
         unsafe {
@@ -415,6 +442,7 @@ impl<PT: PageTableImpl> Vmem<PT> {
         &self,
         suggested_addr: VirtAddr,
         size: NonZeroPageSize,
+        fixed_addr: bool,
     ) -> Option<VirtAddr> {
         debug_assert!(suggested_addr.is_aligned(PAGE_SIZE as u64));
 
@@ -425,9 +453,10 @@ impl<PT: PageTableImpl> Vmem<PT> {
             if (Self::TASK_ADDR_MAX - size.as_u64()) < suggested_addr {
                 return None;
             }
-            if !self
-                .vmas
-                .overlaps(&(suggested_addr..(suggested_addr + size.as_u64())))
+            if fixed_addr
+                || !self
+                    .vmas
+                    .overlaps(&(suggested_addr..(suggested_addr + size.as_u64())))
             {
                 return Some(suggested_addr);
             }
@@ -491,23 +520,23 @@ impl<PT: PageTableImpl> Vmem<PT> {
 
 #[derive(Error, Debug)]
 pub(super) enum VmemResizeError {
-    #[error("No mapping containing the address {0:?}")]
+    #[error("no mapping containing the address {0:?}")]
     NotExist(VirtAddr),
-    #[error("Invalid address {addr:?} exceeds range {range:?}")]
+    #[error("invalid address {addr:?} exceeds range {range:?}")]
     InvalidAddr {
         range: Range<VirtAddr>,
         addr: VirtAddr,
     },
-    #[error("Range {0:?} is already (partially) occupied")]
+    #[error("range {0:?} is already (partially) occupied")]
     RangeOccupied(Range<VirtAddr>),
 }
 
 #[derive(Error, Debug)]
 pub(super) enum VmemProtectError {
-    #[error("The range {0:?} has no mapping memory")]
+    #[error("the range {0:?} has no mapping memory")]
     InvalidRange(Range<VirtAddr>),
-    #[error("Failed to change permissions from {old:?} to {new:?}")]
+    #[error("failed to change permissions from {old:?} to {new:?}")]
     NoAccess { old: VmFlags, new: VmFlags },
-    #[error("Allocation failed")]
+    #[error("allocation failed")]
     AllocationFailed,
 }
