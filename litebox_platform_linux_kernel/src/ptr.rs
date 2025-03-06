@@ -1,5 +1,6 @@
 //! Userspace Pointer Abstraction
 
+use crate::arch::VirtAddr;
 use litebox::platform::{RawConstPointer, RawMutPointer};
 
 /// Represent a user space pointer to a read-only object
@@ -71,5 +72,21 @@ impl<T: Clone> UserMutPtr<T> {
     /// Write to user space at the `off` offset
     pub fn to_user_at_offset(self, off: isize, value: T) -> Option<()> {
         unsafe { self.write_at_offset(off, value) }
+    }
+}
+
+impl<T> From<VirtAddr> for UserMutPtr<T> {
+    fn from(addr: VirtAddr) -> Self {
+        Self {
+            inner: addr.as_mut_ptr(),
+        }
+    }
+}
+
+impl<T> From<VirtAddr> for UserConstPtr<T> {
+    fn from(addr: VirtAddr) -> Self {
+        Self {
+            inner: addr.as_ptr(),
+        }
     }
 }

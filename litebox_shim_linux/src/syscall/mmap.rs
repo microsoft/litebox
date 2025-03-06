@@ -73,7 +73,7 @@ fn do_mmap_file(
     file: &FileFd,
     pgoff: usize,
 ) -> Result<usize, MmapError> {
-    litebox_fs().read(file, buf);
+    // litebox_fs().read(file, buf);
     todo!()
 }
 

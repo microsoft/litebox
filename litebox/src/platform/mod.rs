@@ -435,18 +435,22 @@ pub enum MappingError {
     OutOfMemory,
 }
 
-pub trait MappingProvider {
+pub trait MappingProvider<P: RawMutPointer<u8>> {
     fn create_executable_page<F>(
-        &self,
+        &mut self,
         suggested_addr: Option<usize>,
+        len: usize,
+        fixed_addr: bool,
         op: F,
     ) -> Result<usize, MappingError>
     where
-        F: FnOnce(&mut [u8]) -> usize;
+        F: FnOnce(P) -> usize;
 
     fn create_writable_page<F>(
         &self,
         suggested_addr: Option<usize>,
+        len: usize,
+        fixed_addr: bool,
         op: F,
     ) -> Result<usize, MappingError>
     where
@@ -455,6 +459,8 @@ pub trait MappingProvider {
     fn create_readable_page<F>(
         &self,
         suggested_addr: Option<usize>,
+        len: usize,
+        fixed_addr: bool,
         op: F,
     ) -> Result<usize, MappingError>
     where
