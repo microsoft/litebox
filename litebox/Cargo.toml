@@ -17,3 +17,6 @@ thiserror = { version = "2.0.6", default-features = false }
 [features]
 lock_tracing = ["dep:arrayvec", "dep:spin", "spin?/mutex", "spin?/spin_mutex"]
 panic_on_unclosed_fd_drop = []
+
+[lints]
+workspace = true
