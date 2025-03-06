@@ -1,12 +1,11 @@
 use thiserror::Error;
 
 use crate::arch::{
-    PAGE_SIZE, Page, PageFaultErrorCode, PageTableFlags, PhysAddr, PhysFrame, Size4KiB,
-    TranslateResult, VirtAddr,
+    PAGE_SIZE, Page, PageFaultErrorCode, PageTableFlags, PhysAddr, PhysFrame, Size4KiB, VirtAddr,
 };
 
 /// Page table allocator
-pub struct PageTableAllocator<M: super::MemoryProvider> {
+pub(crate) struct PageTableAllocator<M: super::MemoryProvider> {
     _provider: core::marker::PhantomData<M>,
 }
 
@@ -38,7 +37,7 @@ impl<M: super::MemoryProvider> PageTableAllocator<M> {
     }
 }
 
-pub trait PageTableImpl {
+pub(crate) trait PageTableImpl {
     /// [`PageTableFlags::WRITABLE`] | [`PageTableFlags::USER_ACCESSIBLE`] | [`PageTableFlags::NO_EXECUTE`]
     const MPROTECT_PTE_MASK: u64 = PageTableFlags::WRITABLE.bits()
         | PageTableFlags::USER_ACCESSIBLE.bits()
@@ -49,12 +48,10 @@ pub trait PageTableImpl {
     /// # Safety
     ///
     /// The caller must ensure that the `p` is valid and properly aligned.
-    #[allow(dead_code)]
     unsafe fn init(p: PhysAddr) -> Self;
 
     /// Translate a virtual address to a physical address
-    #[allow(dead_code)]
-    fn translate(&self, addr: VirtAddr) -> TranslateResult;
+    fn translate(&self, addr: VirtAddr) -> crate::arch::TranslateResult;
 
     /// Handle page fault
     ///
@@ -123,7 +120,7 @@ pub trait PageTableImpl {
 }
 
 #[derive(Error, Debug)]
-pub enum PageTableWalkError {
+pub(crate) enum PageTableWalkError {
     #[error("Given page is part of an already mapped huge page")]
     MappedToHugePage,
     #[error("Page table allocation failed")]
@@ -131,11 +128,11 @@ pub enum PageTableWalkError {
 }
 
 #[derive(Error, Debug)]
-pub enum PageFaultError {
-    #[error("No access: {0}")]
+pub(crate) enum PageFaultError {
+    #[error("no access: {0}")]
     AccessError(&'static str),
-    #[error("Allocation failed")]
+    #[error("allocation failed")]
     AllocationFailed,
-    #[error("Given page is part of an already mapped huge page")]
+    #[error("given page is part of an already mapped huge page")]
     HugePage,
 }

@@ -4,14 +4,14 @@ use alloc::vec::Vec;
 use rangemap::RangeMap;
 use thiserror::Error;
 
-use crate::arch::{PAGE_SIZE, Page, PageFaultErrorCode, PageRange, PageTableFlags, VirtAddr};
+use crate::arch::{PAGE_SIZE, Page, PageFaultErrorCode, PageTableFlags, VirtAddr};
 
 use super::pgtable::{PageFaultError, PageTableImpl, PageTableWalkError};
 
 bitflags::bitflags! {
     /// Flags to describe the properties of a memory region.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct VmFlags: u32 {
+    pub(super) struct VmFlags: u32 {
         /// Readable.
         const VM_READ = 1 << 0;
         /// Writable.
@@ -59,39 +59,98 @@ impl From<VmFlags> for PageTableFlags {
     }
 }
 
+/// A page range that guarantees the `start` and `end` addresses
+/// are page aligned and `start` < `end`.
+#[derive(Clone, Copy)]
+pub(super) struct PageRange {
+    /// Start page of the range.
+    start: Page,
+    /// End page of the range.
+    end: Page,
+}
+
+impl Iterator for PageRange {
+    type Item = Page;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.start < self.end {
+            let page = self.start;
+            self.start += 1;
+            Some(page)
+        } else {
+            None
+        }
+    }
+}
+
+/// A non-zero page-aligned size in bytes.
+#[derive(Clone, Copy)]
+pub(super) struct NonZeroPageSize {
+    size: usize,
+}
+
+impl NonZeroPageSize {
+    /// Create a new non-zero page-aligned size.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size` is zero or not a multiple of [`PAGE_SIZE`].
+    pub(super) fn new(size: usize) -> Self {
+        assert!(size != 0);
+        assert!(size % PAGE_SIZE == 0);
+        Self { size }
+    }
+
+    #[inline]
+    fn as_u64(&self) -> u64 {
+        self.size as u64
+    }
+}
+
+impl PageRange {
+    /// Create a new page range.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `start` >= `end`.
+    pub(super) fn new(start: Page, end: Page) -> Self {
+        assert!(start < end);
+        Self { start, end }
+    }
+}
+
 /// Virtual memory area
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct VmArea {
+pub(super) struct VmArea {
     /// Flags describing the properties of the memory region.
     flags: VmFlags,
 }
 
-#[allow(dead_code)]
 /// Virtual Address Space Manager
-pub struct Vmem<PT: PageTableImpl> {
+pub(super) struct Vmem<PT: PageTableImpl> {
     /// Virtual memory areas. The ranges need to be page aligned.
     vmas: RangeMap<VirtAddr, VmArea>,
     pt: PT,
 }
 
-#[allow(dead_code)]
 impl<PT: PageTableImpl> Vmem<PT> {
     const TASK_ADDR_MIN: VirtAddr = VirtAddr::new(PAGE_SIZE as u64);
     const TASK_ADDR_MAX: VirtAddr = VirtAddr::new(0x7FFF_FFFF_F000); // (1 << 47) - PAGE_SIZE;
     const STACK_GUARD_GAP: u64 = 256u64 << 12;
 
-    pub const fn new(pt: PT) -> Self {
+    pub(super) const fn new(pt: PT) -> Self {
         Self {
             vmas: RangeMap::new(),
             pt,
         }
     }
 
-    pub fn iter(&self) -> rangemap::map::Iter<'_, VirtAddr, VmArea> {
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&Range<VirtAddr>, &VmArea)> {
         self.vmas.iter()
     }
 
-    pub fn get_pgtable(&self) -> &PT {
+    pub(super) fn get_pgtable(&self) -> &PT {
         &self.pt
     }
 
@@ -99,11 +158,7 @@ impl<PT: PageTableImpl> Vmem<PT> {
     ///
     /// If the range to be removed _partially_ overlaps any ranges, then those ranges will
     /// be contracted to no longer cover the removed range.
-    ///
-    /// # Panics
-    ///
-    /// Panics if range `start >= end`.
-    pub fn remove_mapping(&mut self, range: PageRange, flush: bool) {
+    pub(super) fn remove_mapping(&mut self, range: PageRange, flush: bool) {
         let (start, end) = (range.start.start_address(), range.end.start_address());
         self.vmas.remove(start..end);
         unsafe {
@@ -124,9 +179,8 @@ impl<PT: PageTableImpl> Vmem<PT> {
     ///
     /// # Panics
     ///
-    /// Panics if range `start >= end`.
     /// Panics if the range is beyond the task address space [[`Self::TASK_ADDR_MIN`], [`Self::TASK_ADDR_MAX`]]).
-    pub fn insert_mapping(&mut self, range: PageRange, flags: VmFlags) {
+    pub(super) fn insert_mapping(&mut self, range: PageRange, flags: VmFlags) {
         let (start, end) = (range.start.start_address(), range.end.start_address());
         assert!(start >= Self::TASK_ADDR_MIN);
         assert!(end <= Self::TASK_ADDR_MAX);
@@ -139,26 +193,19 @@ impl<PT: PageTableImpl> Vmem<PT> {
     /// any existing ranges.
     ///
     /// See https://elixir.bootlin.com/linux/v5.19.17/source/mm/mremap.c#L886 for reference.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `new_size` is not a multiple of `PAGE_SIZE` or is zero.
-    pub fn resize_mapping(
+    pub(super) fn resize_mapping(
         &mut self,
         range: PageRange,
-        new_size: usize,
+        new_size: NonZeroPageSize,
         flush: bool,
     ) -> Result<(), VmemResizeError> {
-        assert!(new_size != 0);
-        assert!(new_size % PAGE_SIZE == 0);
-
         let range = range.start.start_address()..range.end.start_address();
         let (cur_range, cur_vma) = self
             .vmas
             .get_key_value(&range.start)
             .ok_or(VmemResizeError::NotExist(range.start))?;
 
-        let new_end = range.start + new_size as u64;
+        let new_end = range.start + new_size.as_u64();
         match new_end.cmp(&range.end) {
             core::cmp::Ordering::Equal => {
                 // no change
@@ -167,7 +214,7 @@ impl<PT: PageTableImpl> Vmem<PT> {
             core::cmp::Ordering::Less => {
                 // shrink
                 self.remove_mapping(
-                    Page::range(
+                    PageRange::new(
                         Page::from_start_address(new_end).unwrap(),
                         Page::from_start_address(range.end).unwrap(),
                     ),
@@ -205,21 +252,17 @@ impl<PT: PageTableImpl> Vmem<PT> {
     ///
     /// # Panics
     ///
-    /// Panics if `new_size` is not a multiple of `PAGE_SIZE` or is zero.
     /// Panics if `new_size` is smaller than the current size of the range.
-    /// Panics if range `start >= end`.
     /// Panics if range is not within exact one mapping.
-    pub fn move_mappings(
+    pub(super) fn move_mappings(
         &mut self,
         range: PageRange,
-        new_size: usize,
+        new_size: NonZeroPageSize,
         suggested_addr: VirtAddr,
         flush: bool,
     ) -> Option<VirtAddr> {
-        assert!(new_size != 0);
-        assert!(new_size % PAGE_SIZE == 0);
         let (start, end) = (range.start.start_address(), range.end.start_address());
-        assert!(new_size >= (end - start) as usize);
+        assert!(new_size.as_u64() >= (end - start));
 
         let (target_range, vma) = self
             .vmas
@@ -228,7 +271,8 @@ impl<PT: PageTableImpl> Vmem<PT> {
         assert!(target_range.contains(&(end - 1)));
 
         let new_addr = self.get_unmmaped_area(suggested_addr, new_size)?;
-        self.vmas.insert(new_addr..new_addr + new_size as u64, *vma);
+        self.vmas
+            .insert(new_addr..new_addr + new_size.as_u64(), *vma);
         unsafe {
             self.pt
                 .remap_pages(start, new_addr, (end - start) as usize, flush)
@@ -241,7 +285,7 @@ impl<PT: PageTableImpl> Vmem<PT> {
     /// Change the permissions ([`VmFlags::VM_ACCESS_FLAG`]) of a range in the virtual address space.
     ///
     /// See https://elixir.bootlin.com/linux/v5.19.17/source/mm/mprotect.c#L617 for reference.
-    pub fn protect_mapping(
+    pub(super) fn protect_mapping(
         &mut self,
         range: PageRange,
         flags: VmFlags,
@@ -278,25 +322,26 @@ impl<PT: PageTableImpl> Vmem<PT> {
             let after = intersection.end..end;
 
             let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
-            unsafe {
-                // `intersection` is page aligned.
-                match self.pt.mprotect_pages(
+            // `intersection` is page aligned.
+            match unsafe {
+                self.pt.mprotect_pages(
                     intersection.start,
                     (intersection.end - intersection.start) as usize,
                     new_flags.into(),
                     flush,
-                ) {
-                    Ok(_) => {}
-                    Err(PageTableWalkError::MappedToHugePage) => {
-                        unreachable!("VMEM: We don't support huge pages")
-                    }
-                    Err(PageTableWalkError::AllocationFailed) => {
-                        // restore the original mapping
-                        self.vmas.insert(start..end, vma);
-                        return Err(VmemProtectError::AllocationFailed);
-                    }
+                )
+            } {
+                Ok(_) => {}
+                Err(PageTableWalkError::MappedToHugePage) => {
+                    unreachable!("VMEM: We don't support huge pages")
                 }
-            };
+                Err(PageTableWalkError::AllocationFailed) => {
+                    // restore the original mapping
+                    self.vmas.insert(start..end, vma);
+                    return Err(VmemProtectError::AllocationFailed);
+                }
+            }
+
             self.vmas.insert(intersection, VmArea { flags: new_flags });
 
             if !before.is_empty() {
@@ -310,7 +355,7 @@ impl<PT: PageTableImpl> Vmem<PT> {
         Ok(())
     }
 
-    pub fn handle_page_fault(
+    pub(super) fn handle_page_fault(
         &mut self,
         page: Page,
         error_code: PageFaultErrorCode,
@@ -366,20 +411,23 @@ impl<PT: PageTableImpl> Vmem<PT> {
     /*================================Internal Functions================================ */
 
     /// Get an unmapped area in the virtual address space.
-    fn get_unmmaped_area(&self, suggested_addr: VirtAddr, size: usize) -> Option<VirtAddr> {
+    fn get_unmmaped_area(
+        &self,
+        suggested_addr: VirtAddr,
+        size: NonZeroPageSize,
+    ) -> Option<VirtAddr> {
         debug_assert!(suggested_addr.is_aligned(PAGE_SIZE as u64));
-        debug_assert!(size % PAGE_SIZE == 0);
 
-        if size > Self::TASK_ADDR_MAX.as_u64() as usize {
+        if size.as_u64() > Self::TASK_ADDR_MAX.as_u64() {
             return None;
         }
         if !suggested_addr.is_null() {
-            if (Self::TASK_ADDR_MAX - size as u64) < suggested_addr {
+            if (Self::TASK_ADDR_MAX - size.as_u64()) < suggested_addr {
                 return None;
             }
             if !self
                 .vmas
-                .overlaps(&(suggested_addr..(suggested_addr + size as u64)))
+                .overlaps(&(suggested_addr..(suggested_addr + size.as_u64())))
             {
                 return Some(suggested_addr);
             }
@@ -387,7 +435,7 @@ impl<PT: PageTableImpl> Vmem<PT> {
 
         // top down
         // 1. check [last_end, TASK_SIZE_MAX)
-        let (low_limit, high_limit) = (Self::TASK_ADDR_MIN, Self::TASK_ADDR_MAX - size as u64);
+        let (low_limit, high_limit) = (Self::TASK_ADDR_MIN, Self::TASK_ADDR_MAX - size.as_u64());
         let last_end = self
             .vmas
             .last_range_value()
@@ -399,7 +447,7 @@ impl<PT: PageTableImpl> Vmem<PT> {
 
         // 2. check gaps between ranges
         for (r, _) in self.vmas.iter().rev().skip(1) {
-            if !self.vmas.overlaps(&(r.end..r.end + size as u64)) {
+            if !self.vmas.overlaps(&(r.end..r.end + size.as_u64())) {
                 return Some(r.end);
             }
         }
@@ -410,8 +458,8 @@ impl<PT: PageTableImpl> Vmem<PT> {
             .first_range_value()
             .map(|r| r.0.start)
             .unwrap_or(high_limit);
-        if low_limit + size as u64 <= first_start {
-            return Some(first_start - size as u64);
+        if low_limit + size.as_u64() <= first_start {
+            return Some(first_start - size.as_u64());
         }
 
         None
@@ -442,7 +490,7 @@ impl<PT: PageTableImpl> Vmem<PT> {
 }
 
 #[derive(Error, Debug)]
-pub enum VmemResizeError {
+pub(super) enum VmemResizeError {
     #[error("No mapping containing the address {0:?}")]
     NotExist(VirtAddr),
     #[error("Invalid address {addr:?} exceeds range {range:?}")]
@@ -455,7 +503,7 @@ pub enum VmemResizeError {
 }
 
 #[derive(Error, Debug)]
-pub enum VmemProtectError {
+pub(super) enum VmemProtectError {
     #[error("The range {0:?} has no mapping memory")]
     InvalidRange(Range<VirtAddr>),
     #[error("Failed to change permissions from {old:?} to {new:?}")]
