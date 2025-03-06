@@ -319,13 +319,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 | OpenError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
-                    | PathError::MissingComponent
                     | PathError::NoSearchPerms { .. },
                 ) => {
                     // None of these can be handled by lower level, just quit out early
                     return Err(e);
                 }
-                OpenError::PathError(PathError::NoSuchFileOrDirectory) => {
+                OpenError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                ) => {
                     // Handle-able by a lower level, fallthrough
                 }
             },
@@ -434,21 +435,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             return Err(WriteError::NotForWriting);
         }
         match &*entry {
-            EntryX::Upper { fd } => self.upper.write(fd, buf),
+            EntryX::Upper { fd } => return self.upper.write(fd, buf),
             EntryX::Lower { fd } => {
-                // Change it to an upper-level file, also altering the file descriptor.
-                match self.migrate_file_up(&descriptor.path) {
-                    Ok(()) => {}
-                    Err(MigrationError::NoReadPerms) => unimplemented!(),
-                    Err(MigrationError::NotAFile) => return Err(WriteError::NotAFile),
-                    Err(MigrationError::PathError(e)) => unreachable!(),
-                }
-                // Since it has been migrated, we can just re-trigger, causing it to apply to the
-                // upper layer
-                self.write(fd, buf)
+                // fallthrough
             }
             EntryX::Tombstone => unreachable!(),
         }
+        // Get the path, since we are gonna drop the mutexes
+        let path = descriptor.path.clone();
+        // Drop all the relevant mutexes, so we don't end up locking ourselves out
+        drop(entry);
+        drop(descriptors);
+        // Change it to an upper-level file, also altering the file descriptor.
+        match self.migrate_file_up(&path) {
+            Ok(()) => {}
+            Err(MigrationError::NoReadPerms) => unimplemented!(),
+            Err(MigrationError::NotAFile) => return Err(WriteError::NotAFile),
+            Err(MigrationError::PathError(e)) => unreachable!(),
+        }
+        // Since it has been migrated, we can just re-trigger, causing it to apply to the
+        // upper layer
+        self.write(fd, buf)
     }
 
     fn chmod(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), ChmodError> {
