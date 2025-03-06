@@ -43,7 +43,7 @@ impl super::MemoryProvider for MockKernel {
         for page in Page::range(begin, end) {
             if mapping.is_full() {
                 mock_log_println!("MAPPING is OOM");
-                assert!(false);
+                panic!()
             }
             mapping.push(page.start_address());
         }
@@ -73,7 +73,7 @@ impl super::MemoryProvider for MockKernel {
         let idx = (pa.as_u64() - 0x1000_0000) / Size4KiB::SIZE;
         let va = mapping.get(idx as usize);
         assert!(va.is_some());
-        let va = va.unwrap().clone();
+        let va = *va.unwrap();
         if va.is_null() {
             mock_log_println!("Invalid PA");
             panic!("Invalid PA");
@@ -118,7 +118,7 @@ fn check_flags(
             assert_eq!(offset, 0);
             assert_eq!(flags, f);
         }
-        _ => assert!(false),
+        _ => panic!(),
     }
 }
 
