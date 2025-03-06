@@ -71,7 +71,7 @@ impl Descriptors {
         if idx >= (2 << 30) {
             panic!("Too many FDs");
         } else {
-            idx as u32
+            u32::try_from(idx).unwrap()
         }
     }
     fn remove(&mut self, fd: u32) -> Option<Descriptor> {
@@ -166,6 +166,10 @@ pub(crate) fn file_descriptors<'a>() -> &'a RwLock<'static, Platform, Descriptor
 /// # Safety
 ///
 /// `pathname` must point to a valid nul-terminated C string
+#[expect(
+    clippy::missing_panics_doc,
+    reason = "the panics here are ideally never hit, and should not be user-facing"
+)]
 pub unsafe extern "C" fn open(pathname: ConstPtr<i8>, flags: u32, mode: u32) -> i32 {
     let Some(path) = pathname.to_cstring() else {
         return -errno::constants::EFAULT;

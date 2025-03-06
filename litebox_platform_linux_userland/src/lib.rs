@@ -28,6 +28,10 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     /// Create a new userland-Linux platform for use in `LiteBox`.
     ///
     /// Takes a tun device name (such as `"tun0"` or `"tun99"`) to connect networking.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tun device could not be successfully opened.
     pub fn new(tun_device_name: &str, punchthrough_provider: PunchthroughProvider) -> Self {
         let tun_socket_fd = {
             let tun_fd = nix::fcntl::open(
@@ -47,16 +51,16 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
                     for (i, b) in tun_device_name.char_indices() {
                         let b = b as u32;
                         assert!(b < 128);
-                        name[i] = b as i8;
+                        name[i] = i8::try_from(b).unwrap();
                     }
                     name
                 },
                 ifr_ifru: nix::libc::__c_anonymous_ifr_ifru {
-                    ifru_flags: nix::libc::IFF_TUN as i16,
+                    ifru_flags: i16::try_from(nix::libc::IFF_TUN).unwrap(),
                 },
             };
             let ifreq: *const libc::ifreq = &ifreq as _;
-            let ifreq: *const i32 = ifreq as _;
+            let ifreq: *const i32 = ifreq.cast();
             unsafe { tunsetiff(tun_fd, ifreq) }.unwrap();
 
             // By taking ownership, we are letting the drop handler automatically run `libc::close`
@@ -366,7 +370,7 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     litebox::platform::DebugLogProvider for LinuxUserland<PunchthroughProvider>
 {
     fn debug_log_print(&self, msg: &str) {
-        eprint!("{msg}")
+        eprint!("{msg}");
     }
 }
 
@@ -386,6 +390,7 @@ enum FutexOperation {
 }
 
 /// Safer invocation of the Linux futex syscall, with the "timeout" variant of the arguments.
+#[expect(clippy::similar_names, reason = "sec/nsec are as needed by libc")]
 fn futex_timeout(
     uaddr: &AtomicU32,
     futex_op: FutexOperation,

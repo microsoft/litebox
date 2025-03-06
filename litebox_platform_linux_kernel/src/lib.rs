@@ -238,15 +238,15 @@ impl<Host: HostInterface> RawMutex<Host> {
             let ret = Host::block_or_maybe_timeout(&self.inner, val, timeout);
 
             match ret {
-                Ok(_) => {
+                Ok(()) => {
                     if self
                         .underlying_atomic()
                         .load(core::sync::atomic::Ordering::Relaxed)
-                        != val
+                        == val
                     {
-                        return Ok(UnblockedOrTimedOut::Unblocked);
-                    } else {
                         continue;
+                    } else {
+                        return Ok(UnblockedOrTimedOut::Unblocked);
                     }
                 }
                 Err(error::Errno::EAGAIN) => {
@@ -307,7 +307,7 @@ impl Instant {
                 out("edx") hi,
             );
         }
-        ((hi as u64) << 32) | (lo as u64)
+        (u64::from(hi) << 32) | u64::from(lo)
     }
 
     fn now() -> Self {

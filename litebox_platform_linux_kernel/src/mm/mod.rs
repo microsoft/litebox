@@ -44,8 +44,8 @@ pub trait MemoryProvider {
                 // TODO: init reference count for allocated pages
                 unsafe { heap.add_to_heap(start, start + size) };
             }
-            Err(_) => {
-                panic!("OOM");
+            Err(e) => {
+                panic!("OOM: {e}");
             }
         }
     }

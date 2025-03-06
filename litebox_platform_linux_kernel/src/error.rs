@@ -401,6 +401,10 @@ impl Errno {
     pub const EDEADLOCK: Errno = Errno::EDEADLK;
     pub const ENOTSUP: Errno = Errno::EOPNOTSUPP;
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "this repetitive code will be replaced by linux-common eventually"
+    )]
     pub const fn from_raw(e: i32) -> Errno {
         match e {
             EPERM => Errno::EPERM,
@@ -542,6 +546,6 @@ impl core::error::Error for Errno {}
 
 impl core::fmt::Display for Errno {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        write!(f, "{:?}: some error", self)
+        write!(f, "{self:?}: some error")
     }
 }

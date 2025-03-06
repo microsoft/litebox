@@ -15,12 +15,13 @@ pub fn rdmsr(msr: u32) -> u64 {
              options(nostack));
     }
 
-    ((hi as u64) << 32) | lo as u64
+    (u64::from(hi) << 32) | u64::from(lo)
 }
 
 /// Write to MSR a given value
 #[inline]
 pub fn wrmsr(msr: u32, value: u64) {
+    #[expect(clippy::cast_possible_truncation)]
     let lo: u32 = value as u32;
     let hi: u32 = (value >> 32) as u32;
 

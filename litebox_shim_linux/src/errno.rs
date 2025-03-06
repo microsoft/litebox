@@ -1,5 +1,18 @@
 //! Error handling
 
+#![expect(
+    clippy::match_same_arms,
+    reason = "in this one module, we want to make sure we do the necessary repeat, just to keep consistency; \
+              thus we don't want clippy to complain about this here"
+)]
+// Funnily, we can't use `expect` here, and must use `allow`: this may be a Rust bug with how it
+// handles the `expect` lint for these imports. Anyways, we don't expect this one to go away, so
+// perfectly fine to `allow` in this module.
+#![allow(
+    clippy::wildcard_imports,
+    reason = "in this one module, we want to pull in all the constants, rather than manually list them"
+)]
+
 use constants::*;
 
 pub(crate) trait AsErrno {

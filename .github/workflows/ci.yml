@@ -19,7 +19,7 @@ jobs:
           rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy
       - uses: Swatinem/rust-cache@v2
       - run: ./.github/tools/github_actions_run_cargo fmt
-      - run: ./.github/tools/github_actions_run_cargo clippy
+      - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features
       - run: ./.github/tools/github_actions_run_cargo build
       - run: ./.github/tools/github_actions_run_cargo test
 
