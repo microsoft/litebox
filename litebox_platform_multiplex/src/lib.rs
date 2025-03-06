@@ -43,6 +43,14 @@ static PLATFORM: once_cell::race::OnceBox<Platform> = once_cell::race::OnceBox::
 ///
 /// **Must** be invoked prior to any of the other functionality provided by this crate; all other
 /// functionality is prone to panics if this has not been invoked first.
+///
+/// # Panics
+///
+/// Panics if invoked more than once
+#[expect(
+    clippy::match_wild_err_arm,
+    reason = "the platform itself is not Debug thus we cannot use `expect`"
+)]
 pub fn set_platform(platform: Platform) {
     match PLATFORM.set(alloc::boxed::Box::new(platform)) {
         Ok(()) => {}
@@ -51,6 +59,10 @@ pub fn set_platform(platform: Platform) {
 }
 
 /// Get the global platform, or panic if [`set_platform`] has not yet been invoked.
+///
+/// # Panics
+///
+/// Panics if [`set_platform`] has not been invoked before this
 pub fn platform<'a>() -> &'a Platform {
     PLATFORM
         .get()

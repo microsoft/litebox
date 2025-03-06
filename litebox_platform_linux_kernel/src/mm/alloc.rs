@@ -89,7 +89,7 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
                     Self::BASE_PAGE_SIZE << order,
                 )
                 .unwrap(),
-            )
+            );
         };
     }
 }
@@ -121,8 +121,8 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
                                 unsafe {
                                     zone_allocator
                                         .refill(layout, page)
-                                        .expect("Could not refill?")
-                                };
+                                        .expect("Could not refill?");
+                                }
                                 zone_allocator
                                     .allocate(layout)
                                     .expect("Should succeed after refill")
@@ -134,8 +134,8 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
                                     unsafe {
                                         zone_allocator
                                             .refill_large(layout, large_page)
-                                            .expect("Could not refill?")
-                                    };
+                                            .expect("Could not refill?");
+                                    }
                                     zone_allocator
                                         .allocate(layout)
                                         .expect("Should succeed after refill")
@@ -154,8 +154,9 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
         match layout.size() {
-            Self::BASE_PAGE_SIZE => unsafe { self.buddy_allocator.dealloc(ptr, layout) },
-            Self::LARGE_PAGE_SIZE => unsafe { self.buddy_allocator.dealloc(ptr, layout) },
+            Self::BASE_PAGE_SIZE | Self::LARGE_PAGE_SIZE => unsafe {
+                self.buddy_allocator.dealloc(ptr, layout);
+            },
             0..=ZoneAllocator::MAX_ALLOC_SIZE => {
                 if let Some(ptr) = NonNull::new(ptr) {
                     self.slab_allocator

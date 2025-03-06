@@ -156,7 +156,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
     /// user space).
     unsafe fn unmap_pages(&mut self, va: VirtAddr, len: usize, free_page: bool, flush: bool) {
         assert!(va.is_aligned(Size4KiB::SIZE));
-        assert!(len % Size4KiB::SIZE as usize == 0);
+        assert!(len as u64 % Size4KiB::SIZE == 0);
 
         let start = Page::<Size4KiB>::from_start_address(va).unwrap();
         let end = Page::<Size4KiB>::from_start_address(va + len as _).unwrap();
@@ -194,7 +194,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
     ) -> Result<(), PageTableWalkError> {
         assert!(old_addr.is_aligned(Size4KiB::SIZE));
         assert!(new_addr.is_aligned(Size4KiB::SIZE));
-        assert!(len % Size4KiB::SIZE as usize == 0);
+        assert!(len as u64 % Size4KiB::SIZE == 0);
 
         // Note this implementation is slow as each page requires three full page table walks.
         // If we have N pages, it will be 3N times slower.

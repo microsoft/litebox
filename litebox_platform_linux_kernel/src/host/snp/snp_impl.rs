@@ -113,7 +113,7 @@ impl HostSnpInterface {
         unsafe {
             asm!("vmmcall",
                 in("rcx") HVCALL_VTL_CALL,
-                in("r14") arg as *const _ as u64,
+                in("r14") core::ptr::from_ref(arg) as u64,
             );
         }
     }
@@ -135,10 +135,11 @@ impl HostSnpInterface {
 
     fn parse_result(res: u64) -> Result<usize, crate::error::Errno> {
         if is_err_value(res) {
+            #[expect(clippy::cast_possible_wrap)]
             let v = res as i64;
-            Err(error::Errno::from_raw(v.abs() as i32))
+            Err(error::Errno::from_raw(i32::try_from(v.abs()).unwrap()))
         } else {
-            Ok(res as usize)
+            Ok(usize::try_from(res).unwrap())
         }
     }
 
@@ -153,7 +154,7 @@ impl HostSnpInterface {
             // Address is not aligned or out of bounds
             Err(error::Errno::EINVAL)
         } else {
-            Ok(addr as usize)
+            Ok(usize::try_from(addr).unwrap())
         }
     }
 }
@@ -186,19 +187,22 @@ impl HostInterface for HostSnpInterface {
     fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), error::Errno> {
         // To reduce the number of hypercalls, we allocate the maximum order.
         // Assertion is added to prevent the allocation size from exceeding the maximum order.
-        let size = core::cmp::max(layout.size().next_power_of_two(), PAGE_SIZE as usize);
-        assert!(size > (PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER) as usize);
+        let size = core::cmp::max(
+            layout.size().next_power_of_two(),
+            usize::try_from(PAGE_SIZE).unwrap(),
+        );
+        assert!(size > usize::try_from(PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER).unwrap());
 
         let mut req = bindings::SnpVmplRequestArgs::new_request(
             bindings::SNP_VMPL_ALLOC_REQ,
             1,
-            [bindings::SNP_VMPL_ALLOC_MAX_ORDER as u64, 0, 0, 0, 0, 0],
+            [u64::from(bindings::SNP_VMPL_ALLOC_MAX_ORDER), 0, 0, 0, 0, 0],
         );
         Self::request(&mut req);
         Self::parse_alloc_result(bindings::SNP_VMPL_ALLOC_MAX_ORDER, req.ret).map(|addr| {
             (
                 addr,
-                (PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER) as usize,
+                usize::try_from(PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER).unwrap(),
             )
         })
     }
@@ -249,10 +253,12 @@ impl HostInterface for HostSnpInterface {
         let mut koldset: Option<sigset_t> = if oldset.is_null() { None } else { Some(0) };
         let args = SyscallN::<4, NR_SYSCALL_RT_SIGPROCMASK> {
             args: [
-                how as u32 as _,
+                u64::from(u32::try_from(how).unwrap()),
                 // TODO: sandbox driver needs to be updated to accept a kernel pointer from the guest
-                kset.as_ref().map_or(0, |v| v as *const _ as u64),
-                koldset.as_mut().map_or(0, |v| v as *mut _ as u64),
+                kset.as_ref().map_or(0, |v| core::ptr::from_ref(v) as u64),
+                koldset
+                    .as_mut()
+                    .map_or(0, |v| core::ptr::from_mut(v) as u64),
                 sigsetsize as _,
             ],
         };
@@ -276,16 +282,18 @@ impl HostInterface for HostSnpInterface {
         timeout: Option<core::time::Duration>,
     ) -> Result<(), error::Errno> {
         let timeout = timeout.map(|t| linux::Timespec {
-            tv_sec: t.as_secs() as i64,
-            tv_nsec: t.subsec_nanos() as i64,
+            tv_sec: i64::try_from(t.as_secs()).unwrap(),
+            tv_nsec: i64::from(t.subsec_nanos()),
         });
         // TODO: sandbox driver needs to be updated to accept a kernel pointer from the guest
         Self::syscalls(SyscallN::<6, NR_SYSCALL_FUTEX> {
             args: [
                 mutex.as_ptr() as u64,
                 FUTEX_WAIT as u64,
-                val as u64,
-                timeout.as_ref().map_or(0, |t| t as *const _ as u64),
+                u64::from(val),
+                timeout
+                    .as_ref()
+                    .map_or(0, |t| core::ptr::from_ref(t) as u64),
                 0,
                 0,
             ],

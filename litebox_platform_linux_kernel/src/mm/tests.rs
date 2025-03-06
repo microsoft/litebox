@@ -118,7 +118,7 @@ fn check_flags(
             assert_eq!(offset, 0);
             assert_eq!(flags, f);
         }
-        _ => panic!(),
+        other => panic!("unexpected: {other:?}"),
     }
 }
 
@@ -165,8 +165,8 @@ fn test_page_table() {
                     false
                 )
                 .is_ok()
-        )
-    };
+        );
+    }
     for page in Page::range(start_page, start_page + 2) {
         check_flags(&pgtable, page, flags);
     }
@@ -182,8 +182,8 @@ fn test_page_table() {
             pgtable
                 .remap_pages(start_addr, new_addr, 2 * PAGE_SIZE, false)
                 .is_ok()
-        )
-    };
+        );
+    }
     for page in Page::range(start_page, start_page + 2) {
         assert!(matches!(
             pgtable.translate(page.start_address()),
@@ -198,11 +198,11 @@ fn test_page_table() {
     unsafe {
         pgtable.unmap_pages(
             start_addr,
-            (new_addr - start_addr) as usize + 4 * PAGE_SIZE,
+            usize::try_from(new_addr - start_addr).unwrap() + 4 * PAGE_SIZE,
             true,
             false,
-        )
-    };
+        );
+    }
     for page in Page::range(start_page, new_page + 4) {
         assert!(matches!(
             pgtable.translate(page.start_address()),

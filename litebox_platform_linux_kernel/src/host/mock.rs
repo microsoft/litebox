@@ -43,7 +43,7 @@ impl HostInterface for MockHostInterface {
     }
 
     fn log(msg: &str) {
-        unsafe { libc::write(libc::STDOUT_FILENO, msg.as_ptr() as *const _, msg.len()) };
+        unsafe { libc::write(libc::STDOUT_FILENO, msg.as_ptr().cast(), msg.len()) };
     }
 
     fn exit() -> ! {
