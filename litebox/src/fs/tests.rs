@@ -298,4 +298,40 @@ mod layered {
         fs.close(fd1).expect("Failed to close file");
         fs.close(fd2).expect("Failed to close file");
     }
+
+    #[test]
+    fn file_deletion() {
+        let platform = MockPlatform::new();
+
+        let mut fs = layered::FileSystem::new(
+            &platform,
+            in_mem::FileSystem::new(&platform),
+            tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into()),
+        );
+        let fd = fs
+            .open("foo", OFlags::RDONLY, Mode::RWXU)
+            .expect("Failed to open file");
+
+        let mut buffer = vec![0; 4];
+
+        // The file exists, and is readable
+        let bytes_read = fs.read(&fd, &mut buffer).expect("Failed to read from file");
+        assert_eq!(&buffer[..bytes_read], b"test");
+
+        // Then we delete it
+        fs.unlink("foo").unwrap();
+
+        // This should not really impact the readability; file is fine.
+        let bytes_read = fs.read(&fd, &mut buffer).expect("Failed to read from file");
+        assert_eq!(&buffer[..bytes_read], b"foo\n");
+
+        // But if we close and attempt to re-open, it should not exist
+        fs.close(fd).expect("Failed to close file");
+        assert!(matches!(
+            fs.open("foo", OFlags::RDONLY, Mode::empty()),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::NoSuchFileOrDirectory
+            )),
+        ));
+    }
 }
