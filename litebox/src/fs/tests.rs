@@ -38,7 +38,7 @@ mod in_mem {
                 .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to create file");
             let data = b"Hello, world!";
-            fs.write(&fd, data).expect("Failed to write to file");
+            fs.write(&fd, data, None).expect("Failed to write to file");
             fs.close(fd).expect("Failed to close file");
 
             // Read from the file
@@ -46,7 +46,9 @@ mod in_mem {
                 .open(path, OFlags::RDONLY, Mode::RWXU)
                 .expect("Failed to open file");
             let mut buffer = vec![0; data.len()];
-            let bytes_read = fs.read(&fd, &mut buffer).expect("Failed to read from file");
+            let bytes_read = fs
+                .read(&fd, &mut buffer, None)
+                .expect("Failed to read from file");
             assert_eq!(bytes_read, data.len());
             assert_eq!(&buffer, data);
             fs.close(fd).expect("Failed to close file");
@@ -114,7 +116,9 @@ mod in_mem {
             .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         let data = b"Hello, world!";
-        fs.write(&fd, data).expect("Failed to write to file");
+        fs.write(&fd, data, None).expect("Failed to write to file");
+        fs.write(&fd, &data[2..], Some(2))
+            .expect("Failed to write to file with offset");
         fs.close(fd).expect("Failed to close file");
 
         // Read from the file
@@ -122,8 +126,14 @@ mod in_mem {
             .open(path, OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let mut buffer = vec![0; data.len()];
-        let bytes_read = fs.read(&fd, &mut buffer).expect("Failed to read from file");
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
+        let bytes_read2 = fs
+            .read(&fd, &mut buffer[2..], Some(2))
+            .expect("Failed to read from file with offset");
         assert_eq!(bytes_read, data.len());
+        assert_eq!(bytes_read2, data.len() - 2);
         assert_eq!(&buffer, data);
         fs.close(fd).expect("Failed to close file");
     }
@@ -169,14 +179,18 @@ mod tar_ro {
             .open("foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
-        let bytes_read = fs.read(&fd, &mut buffer).expect("Failed to read from file");
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"testfoo\n");
         fs.close(fd).expect("Failed to close file");
         let fd = fs
             .open("bar/baz", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
-        let bytes_read = fs.read(&fd, &mut buffer).expect("Failed to read from file");
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"test bar baz\n");
         fs.close(fd).expect("Failed to close file");
     }

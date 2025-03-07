@@ -43,10 +43,18 @@ pub trait FileSystem: private::Sealed {
     fn open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<FileFd, OpenError>;
     /// Close the file at `fd`
     fn close(&self, fd: FileFd) -> Result<(), CloseError>;
-    /// Read from a file descriptor into a buffer
-    fn read(&self, fd: &FileFd, buf: &mut [u8]) -> Result<usize, ReadError>;
-    /// Write from a buffer to a file descriptor
-    fn write(&self, fd: &FileFd, buf: &[u8]) -> Result<usize, WriteError>;
+    /// Read from a file descriptor at `offset` into a buffer
+    ///
+    /// If `offset` is None, the read will start at the current file offset and update the file offset
+    /// to the end of the read.
+    /// If `offset` is Some, the file offset is not changed.
+    fn read(&self, fd: &FileFd, buf: &mut [u8], offset: Option<usize>) -> Result<usize, ReadError>;
+    /// Write from a buffer to a file descriptor at `offset`
+    ///
+    /// If `offset` is None, the write will start at the current file offset and update the file offset
+    /// to the end of the write.
+    /// If `offset` is Some, the file offset is not changed.
+    fn write(&self, fd: &FileFd, buf: &[u8], offset: Option<usize>) -> Result<usize, WriteError>;
     /// Change the permissions of a file
     fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
     /// Unlink a file
