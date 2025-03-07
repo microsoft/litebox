@@ -39,7 +39,7 @@ unsafe impl<M: MemoryProvider> PageTableFrameMapping for FrameMapping<M> {
 
 unsafe impl<M: MemoryProvider> FrameAllocator<Size4KiB> for PageTableAllocator<M> {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
-        self.allocate_frame(true)
+        Self::allocate_frame(true)
     }
 }
 
@@ -101,7 +101,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
             TranslateResult::NotMapped => {
                 let mut allocator = PageTableAllocator::<M>::new();
                 // TODO: if it is file-backed, we need to read the page from file
-                let frame = allocator.allocate_frame(true).unwrap();
+                let frame = PageTableAllocator::<M>::allocate_frame(true).unwrap();
                 let table_flags = PageTableFlags::PRESENT
                     | PageTableFlags::WRITABLE
                     | PageTableFlags::USER_ACCESSIBLE;

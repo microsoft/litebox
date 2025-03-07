@@ -132,11 +132,10 @@ fn get_test_pgtable<'a>(
     range: PageRange,
     fault_flags: PageTableFlags,
 ) -> X64PageTable<'a, MockKernel> {
-    let mut allocator = PageTableAllocator::<MockKernel>::new();
-    let p4 = allocator.allocate_frame(true).unwrap();
+    let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
     let mut pgtable = unsafe { X64PageTable::<MockKernel>::init(p4.start_address()) };
 
-    for page in range {
+    for page in range.clone() {
         unsafe {
             pgtable
                 .handle_page_fault(page, fault_flags, PageFaultErrorCode::USER_MODE, false)
@@ -224,13 +223,14 @@ fn collect_mappings(vmm: &Vmem<X64PageTable<MockKernel>>) -> Vec<Range<u64>> {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_vmm_mapping() {
     let start_addr = VirtAddr::new(0x1000);
     let start_page = Page::from_start_address(start_addr).unwrap();
     let range = PageRange::new(start_page, start_page + 12);
     let fault_flags =
         PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE;
-    let pt = get_test_pgtable(range, fault_flags);
+    let pt = get_test_pgtable(range.clone(), fault_flags);
     let mut vmm = Vmem::new(pt);
 
     // []
@@ -307,7 +307,7 @@ fn test_vmm_mapping() {
     // try to remap [0x3000, 0x5000)
     let r = PageRange::new(start_page + 2, start_page + 4);
     assert!(matches!(
-        vmm.resize_mapping(r, NonZeroPageSize::new(PAGE_SIZE * 4)),
+        vmm.resize_mapping(r.clone(), NonZeroPageSize::new(PAGE_SIZE * 4)),
         Err(VmemResizeError::RangeOccupied(_))
     ));
     assert!(

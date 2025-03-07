@@ -27,7 +27,7 @@ impl<M: super::MemoryProvider> PageTableAllocator<M> {
     /// # Panics
     ///
     /// Panics if the address is not correctly aligned (i.e. is not a valid frame start)
-    pub fn allocate_frame(&mut self, clear: bool) -> Option<PhysFrame<Size4KiB>> {
+    pub fn allocate_frame(clear: bool) -> Option<PhysFrame<Size4KiB>> {
         M::mem_allocate_pages(0).map(|addr| {
             if clear {
                 unsafe {

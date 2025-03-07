@@ -66,7 +66,7 @@ impl From<VmFlags> for PageTableFlags {
 
 /// A page range that guarantees the `start` and `end` addresses
 /// are page aligned and `start` < `end`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct PageRange {
     /// Start page of the range.
     start: Page,
@@ -108,7 +108,7 @@ impl NonZeroPageSize {
     }
 
     #[inline]
-    fn as_u64(&self) -> u64 {
+    fn as_u64(self) -> u64 {
         self.size as u64
     }
 }
@@ -167,8 +167,12 @@ impl<PT: PageTableImpl> Vmem<PT> {
         let (start, end) = (range.start.start_address(), range.end.start_address());
         self.vmas.remove(start..end);
         unsafe {
-            self.pt
-                .unmap_pages(start, (end - start) as usize, true, FLUSH_TLB)
+            self.pt.unmap_pages(
+                start,
+                usize::try_from(end - start).unwrap(),
+                true,
+                FLUSH_TLB,
+            );
         };
     }
 
@@ -197,10 +201,10 @@ impl<PT: PageTableImpl> Vmem<PT> {
                     (intersection.end - intersection.start).try_into().unwrap(),
                     true,
                     FLUSH_TLB,
-                )
+                );
             };
         }
-        self.vmas.insert(start..end, VmArea { flags })
+        self.vmas.insert(start..end, VmArea { flags });
     }
 
     /// Create a new mapping in the virtual address space.
@@ -222,7 +226,7 @@ impl<PT: PageTableImpl> Vmem<PT> {
         let len = suggested_end - suggested_start;
         let new_addr = self.get_unmmaped_area(
             suggested_start,
-            NonZeroPageSize::new(len as usize),
+            NonZeroPageSize::new(usize::try_from(len).unwrap()),
             fixed_addr,
         )?;
         self.vmas.insert(new_addr..new_addr + len, VmArea { flags });
@@ -314,7 +318,12 @@ impl<PT: PageTableImpl> Vmem<PT> {
             .insert(new_addr..new_addr + new_size.as_u64(), *vma);
         unsafe {
             self.pt
-                .remap_pages(start, new_addr, (end - start) as usize, FLUSH_TLB)
+                .remap_pages(
+                    start,
+                    new_addr,
+                    usize::try_from(end - start).unwrap(),
+                    FLUSH_TLB,
+                )
                 .ok()
         };
         self.vmas.remove(start..end);
@@ -364,12 +373,12 @@ impl<PT: PageTableImpl> Vmem<PT> {
             match unsafe {
                 self.pt.mprotect_pages(
                     intersection.start,
-                    (intersection.end - intersection.start) as usize,
+                    usize::try_from(intersection.end - intersection.start).unwrap(),
                     new_flags.into(),
                     FLUSH_TLB,
                 )
             } {
-                Ok(_) => {}
+                Ok(()) => {}
                 Err(PageTableWalkError::MappedToHugePage) => {
                     unreachable!("VMEM: We don't support huge pages")
                 }
@@ -480,11 +489,7 @@ impl<PT: PageTableImpl> Vmem<PT> {
         // top down
         // 1. check [last_end, TASK_SIZE_MAX)
         let (low_limit, high_limit) = (Self::TASK_ADDR_MIN, Self::TASK_ADDR_MAX - size.as_u64());
-        let last_end = self
-            .vmas
-            .last_range_value()
-            .map(|r| r.0.end)
-            .unwrap_or(low_limit);
+        let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
         if last_end <= high_limit {
             return Some(last_end);
         }
@@ -500,8 +505,7 @@ impl<PT: PageTableImpl> Vmem<PT> {
         let first_start = self
             .vmas
             .first_range_value()
-            .map(|r| r.0.start)
-            .unwrap_or(high_limit);
+            .map_or(high_limit, |r| r.0.start);
         if low_limit + size.as_u64() <= first_start {
             return Some(first_start - size.as_u64());
         }
