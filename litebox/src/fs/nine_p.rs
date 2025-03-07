@@ -55,6 +55,15 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<'_, Platform
         todo!()
     }
 
+    fn seek(
+        &self,
+        fd: &crate::fd::FileFd,
+        offset: isize,
+        whence: super::SeekWhence,
+    ) -> Result<usize, super::errors::SeekError> {
+        todo!()
+    }
+
     fn chmod(
         &self,
         path: impl crate::path::Arg,

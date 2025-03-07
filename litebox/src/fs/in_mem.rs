@@ -9,11 +9,11 @@ use crate::fd::FileFd;
 use crate::path::Arg;
 use crate::sync;
 
-use super::Mode;
 use super::errors::{
-    ChmodError, CloseError, MkdirError, OpenError, PathError, ReadError, RmdirError, UnlinkError,
-    WriteError,
+    ChmodError, CloseError, MkdirError, OpenError, PathError, ReadError, RmdirError, SeekError,
+    UnlinkError, WriteError,
 };
+use super::{Mode, SeekWhence};
 
 /// A backing implementation for [`FileSystem`](super::FileSystem) storing all files in-memory.
 ///
@@ -251,6 +251,34 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         file.data.extend(&buf[start..]);
         *position = file.data.len();
         Ok(buf.len())
+    }
+
+    fn seek(&self, fd: &FileFd, offset: isize, whence: SeekWhence) -> Result<usize, SeekError> {
+        let mut descriptors = self.descriptors.write();
+        let Descriptor::File {
+            file,
+            read_allowed: _,
+            write_allowed,
+            position,
+        } = descriptors.get_mut(fd)
+        else {
+            return Err(SeekError::NotAFile);
+        };
+        let file_len = file.read().data.len();
+        let base = match whence {
+            SeekWhence::RelativeToBeginning => 0,
+            SeekWhence::RelativeToCurrentOffset => *position,
+            SeekWhence::RelativeToEnd => file_len,
+        };
+        let new_posn = base
+            .checked_add_signed(offset)
+            .ok_or(SeekError::InvalidOffset)?;
+        if new_posn > file_len {
+            Err(SeekError::InvalidOffset)
+        } else {
+            *position = new_posn;
+            Ok(new_posn)
+        }
     }
 
     fn chmod(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), ChmodError> {

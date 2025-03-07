@@ -29,9 +29,9 @@ use tar_no_std::TarArchive;
 use crate::{path::Arg as _, sync};
 
 use super::{
-    Mode, OFlags,
+    Mode, OFlags, SeekWhence,
     errors::{
-        ChmodError, CloseError, MkdirError, OpenError, PathError, ReadError, RmdirError,
+        ChmodError, CloseError, MkdirError, OpenError, PathError, ReadError, RmdirError, SeekError,
         UnlinkError, WriteError,
     },
 };
@@ -180,6 +180,33 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         match self.descriptors.read().get(fd) {
             Descriptor::File { .. } => Err(WriteError::NotForWriting),
             Descriptor::Dir { .. } => Err(WriteError::NotAFile),
+        }
+    }
+
+    fn seek(
+        &self,
+        fd: &crate::fd::FileFd,
+        offset: isize,
+        whence: SeekWhence,
+    ) -> Result<usize, SeekError> {
+        let mut descriptors = self.descriptors.write();
+        let Descriptor::File { idx, position } = descriptors.get_mut(fd) else {
+            return Err(SeekError::NotAFile);
+        };
+        let file_len = self.tar_data.entries().nth(*idx).unwrap().data().len();
+        let base = match whence {
+            SeekWhence::RelativeToBeginning => 0,
+            SeekWhence::RelativeToCurrentOffset => *position,
+            SeekWhence::RelativeToEnd => file_len,
+        };
+        let new_posn = base
+            .checked_add_signed(offset)
+            .ok_or(SeekError::InvalidOffset)?;
+        if new_posn > file_len {
+            Err(SeekError::InvalidOffset)
+        } else {
+            *position = new_posn;
+            Ok(new_posn)
         }
     }
 
