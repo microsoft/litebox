@@ -34,10 +34,11 @@ impl<Descriptor> Descriptors<Descriptor> {
         }
     }
 
-    pub(crate) fn remove(&mut self, mut fd: FileFd) {
+    pub(crate) fn remove(&mut self, mut fd: FileFd) -> Descriptor {
         let old = self.descriptors[fd.x.as_usize()].take();
         assert!(old.is_some());
         fd.x.mark_as_closed();
+        old.unwrap()
     }
 
     pub(crate) fn get(&self, fd: &FileFd) -> &Descriptor {
@@ -50,5 +51,9 @@ impl<Descriptor> Descriptors<Descriptor> {
         // Since the `fd` is borrowed, it must still exist, thus this index will always exist, as
         // well as have a value within it.
         self.descriptors[fd.x.as_usize()].as_mut().unwrap()
+    }
+
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut Descriptor> {
+        self.descriptors.iter_mut().flatten()
     }
 }
