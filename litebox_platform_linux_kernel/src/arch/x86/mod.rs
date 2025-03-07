@@ -8,5 +8,8 @@ pub(crate) use x86_64::{
 #[cfg(test)]
 pub(crate) use x86_64::structures::{
     idt::PageFaultErrorCode,
-    paging::{Page, PageTableFlags, PhysFrame, mapper::TranslateResult},
+    paging::{
+        Page, PageTableFlags, PhysFrame,
+        mapper::{MappedFrame, TranslateResult},
+    },
 };

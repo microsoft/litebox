@@ -3,20 +3,14 @@ use core::{
     ops::Range,
 };
 
+use crate::arch::{
+    MappedFrame, Page, PageFaultErrorCode, PageSize, PageTableFlags, PhysAddr, Size4KiB,
+    TranslateResult, VirtAddr,
+};
 use alloc::vec;
 use alloc::vec::Vec;
 use arrayvec::ArrayVec;
 use spin::mutex::SpinMutex;
-use x86_64::{
-    PhysAddr, VirtAddr,
-    structures::{
-        idt::PageFaultErrorCode,
-        paging::{
-            Page, PageSize, PageTableFlags, Size4KiB,
-            mapper::{MappedFrame, TranslateResult},
-        },
-    },
-};
 
 use crate::{
     HostInterface, LinuxKernel,
