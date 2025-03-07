@@ -293,10 +293,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             }
         }
         if tombstone_removal {
-            let entry = self.root.write().entries.remove(&path).unwrap();
-            let EntryX::Tombstone = *entry else {
-                unreachable!()
-            };
+            if let Some(entry) = self.root.write().entries.remove(&path) {
+                let EntryX::Tombstone = *entry else {
+                    unreachable!()
+                };
+            } else {
+                // Another thread which also was attempting to create the same file (on top of a
+                // tombstoned file) won on the race to lock `self.root`, and thus it has already
+                // removed it for us. We don't need to remove it, and can proceed as normal.
+            }
         }
         // Otherwise, we first check the upper level, creating an entry if needed
         match self.upper.open(&*path, flags, mode) {
