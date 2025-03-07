@@ -1,10 +1,11 @@
+use thiserror::Error;
+
 use crate::arch::{
-    PAGE_SIZE, Page, PageFaultErrorCode, PageTableFlags, PhysAddr, PhysFrame, Size4KiB,
-    TranslateResult, VirtAddr,
+    PAGE_SIZE, Page, PageFaultErrorCode, PageTableFlags, PhysAddr, PhysFrame, Size4KiB, VirtAddr,
 };
 
 /// Page table allocator
-pub struct PageTableAllocator<M: super::MemoryProvider> {
+pub(crate) struct PageTableAllocator<M: super::MemoryProvider> {
     _provider: core::marker::PhantomData<M>,
 }
 
@@ -26,7 +27,7 @@ impl<M: super::MemoryProvider> PageTableAllocator<M> {
     /// # Panics
     ///
     /// Panics if the address is not correctly aligned (i.e. is not a valid frame start)
-    pub fn allocate_frame(&mut self, clear: bool) -> Option<PhysFrame<Size4KiB>> {
+    pub fn allocate_frame(clear: bool) -> Option<PhysFrame<Size4KiB>> {
         M::mem_allocate_pages(0).map(|addr| {
             if clear {
                 unsafe {
@@ -41,7 +42,15 @@ impl<M: super::MemoryProvider> PageTableAllocator<M> {
     }
 }
 
-pub trait PageTableImpl {
+pub(crate) trait PageTableImpl {
+    /// Flags that `mprotect` can change:
+    /// [`PageTableFlags::WRITABLE`] | [`PageTableFlags::USER_ACCESSIBLE`] | [`PageTableFlags::NO_EXECUTE`]
+    const MPROTECT_PTE_MASK: PageTableFlags = PageTableFlags::from_bits_truncate(
+        PageTableFlags::WRITABLE.bits()
+            | PageTableFlags::USER_ACCESSIBLE.bits()
+            | PageTableFlags::NO_EXECUTE.bits(),
+    );
+
     /// Initialize the page table with the physical address of the top-level page table.
     ///
     /// # Safety
@@ -50,11 +59,12 @@ pub trait PageTableImpl {
     unsafe fn init(p: PhysAddr) -> Self;
 
     /// Translate a virtual address to a physical address
-    fn translate(&self, addr: VirtAddr) -> TranslateResult;
+    fn translate(&self, addr: VirtAddr) -> crate::arch::TranslateResult;
 
     /// Handle page fault
     ///
     /// `flush` indicates whether the TLB should be flushed after the page fault is handled.
+    /// `flags` presents the PTE flags to be set for the page.
     ///
     /// # Safety
     ///
@@ -73,7 +83,8 @@ pub trait PageTableImpl {
     ///
     /// `flush` indicates whether the TLB should be flushed after the pages are unmapped.
     /// `free_page` indicates whether the unmapped pages should be freed (This may be helpful
-    /// when implementing [`Self::remap_pages`]).
+    /// when implementing [`Self::remap_pages`]. If we maintain refcnt for pages, we may not
+    /// need this).
     ///
     /// # Safety
     ///
@@ -116,16 +127,20 @@ pub trait PageTableImpl {
     ) -> Result<(), PageTableWalkError>;
 }
 
-#[derive(Debug)]
-pub enum PageTableWalkError {
-    NotMapped,
+#[derive(Error, Debug)]
+pub(crate) enum PageTableWalkError {
+    #[error("given page is part of an already mapped huge page")]
     MappedToHugePage,
+    #[error("page table allocation failed")]
     AllocationFailed,
 }
 
-#[derive(Debug)]
-pub enum PageFaultError {
-    AccessError,
-    OOM,
+#[derive(Error, Debug)]
+pub(crate) enum PageFaultError {
+    #[error("no access: {0}")]
+    AccessError(&'static str),
+    #[error("allocation failed")]
+    AllocationFailed,
+    #[error("given page is part of an already mapped huge page")]
     HugePage,
 }

@@ -8,7 +8,6 @@ use x86_64::{
             mapper::{
                 FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult, UnmapError,
             },
-            page_table::FrameError,
         },
     },
 };
@@ -22,15 +21,6 @@ use crate::mm::{
 fn frame_to_pointer<M: MemoryProvider>(frame: PhysFrame) -> *mut PageTable {
     let virt = M::pa_to_va(frame.start_address());
     virt.as_mut_ptr()
-}
-
-impl From<FrameError> for PageTableWalkError {
-    fn from(value: FrameError) -> Self {
-        match value {
-            FrameError::FrameNotPresent => PageTableWalkError::NotMapped,
-            FrameError::HugeFrame => PageTableWalkError::MappedToHugePage,
-        }
-    }
 }
 
 pub struct X64PageTable<'a, M: MemoryProvider> {
@@ -49,7 +39,7 @@ unsafe impl<M: MemoryProvider> PageTableFrameMapping for FrameMapping<M> {
 
 unsafe impl<M: MemoryProvider> FrameAllocator<Size4KiB> for PageTableAllocator<M> {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
-        self.allocate_frame(true)
+        Self::allocate_frame(true)
     }
 }
 
@@ -111,7 +101,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
             TranslateResult::NotMapped => {
                 let mut allocator = PageTableAllocator::<M>::new();
                 // TODO: if it is file-backed, we need to read the page from file
-                let frame = allocator.allocate_frame(true).unwrap();
+                let frame = PageTableAllocator::<M>::allocate_frame(true).unwrap();
                 let table_flags = PageTableFlags::PRESENT
                     | PageTableFlags::WRITABLE
                     | PageTableFlags::USER_ACCESSIBLE;
@@ -119,7 +109,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
                     self.inner.map_to_with_table_flags(
                         page,
                         frame,
-                        flags,
+                        flags | PageTableFlags::PRESENT,
                         table_flags,
                         &mut allocator,
                     )
@@ -138,7 +128,9 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
                             MapToError::ParentEntryHugePage => {
                                 return Err(PageFaultError::HugePage);
                             }
-                            MapToError::FrameAllocationFailed => return Err(PageFaultError::OOM),
+                            MapToError::FrameAllocationFailed => {
+                                return Err(PageFaultError::AllocationFailed);
+                            }
                         }
                     }
                 }
@@ -258,6 +250,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
         new_flags: PageTableFlags,
         flush: bool,
     ) -> Result<(), PageTableWalkError> {
+        let new_flags = new_flags & Self::MPROTECT_PTE_MASK;
         let begin: Page<Size4KiB> = Page::containing_address(start);
         let end: Page<Size4KiB> = Page::containing_address(start + len as _ - 1);
 
@@ -279,7 +272,10 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
                         new_flags
                     };
                     if flags != new_flags {
-                        match unsafe { self.inner.update_flags(page, new_flags) } {
+                        match unsafe {
+                            self.inner
+                                .update_flags(page, (flags & !Self::MPROTECT_PTE_MASK) | new_flags)
+                        } {
                             Ok(fl) => {
                                 if flush {
                                     fl.flush();
