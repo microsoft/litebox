@@ -279,10 +279,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     // fallthrough since we might not have the descriptor open with the correct flags
                 }
                 EntryX::Lower { .. } => {
-                    // As an optimization, since a lower-level file entry is always is opened with
-                    // the same flags, and since it indicates that there is no such file at the
-                    // upper level, we can just return that directly (with the "real" flags being
-                    // wrapped up in the layered descriptor).
+                    // As an optimization, since a lower-level file entry is always opened with the
+                    // same flags, and since it indicates that there is no such file at the upper
+                    // level, we can just return that directly (with the "real" flags being wrapped
+                    // up in the layered descriptor).
                     return Ok(self.descriptors.write().insert(Descriptor {
                         path,
                         flags,
