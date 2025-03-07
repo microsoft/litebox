@@ -126,8 +126,9 @@ impl<
                         );
                     }
                     let upper_fd = upper_fd.as_ref().unwrap();
-                    self.upper.write(upper_fd, &temp_buf[..size]);
-                    if size == 0 {
+                    if size > 0 {
+                        self.upper.write(upper_fd, &temp_buf[..size]);
+                    } else {
                         // EOF
                         break;
                     }
