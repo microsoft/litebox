@@ -94,8 +94,16 @@ pub trait Arg: private::Sealed {
 
     /// Convenience wrapper for getting the list of ancestors of the path.
     ///
-    /// Essentially, this gives `["", "a", "a/..", "a/../b"]` for `"a/../b"`. Note that this is the
-    /// opposite order from Rust's `std::path::Path::ancestors`.
+    /// Note that this is the opposite order from Rust's `std::path::Path::ancestors`.
+    ///
+    /// This handles both relative and absolute paths:
+    /// ```
+    /// # use litebox::path::Arg as _;
+    /// assert_eq!("a/../b".increasing_ancestors().unwrap().collect::<Vec<_>>(),
+    ///            vec!["", "a", "a/..", "a/../b"]);
+    /// assert_eq!("/a/../b".increasing_ancestors().unwrap().collect::<Vec<_>>(),
+    ///            vec!["/", "/a", "/a/..", "/a/../b"]);
+    /// ```
     fn increasing_ancestors(&self) -> Result<impl Iterator<Item = &str>> {
         let orig_path = self.as_rust_str()?;
         let mut path = orig_path;
