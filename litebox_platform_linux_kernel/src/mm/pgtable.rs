@@ -129,9 +129,9 @@ pub(crate) trait PageTableImpl {
 
 #[derive(Error, Debug)]
 pub(crate) enum PageTableWalkError {
-    #[error("Given page is part of an already mapped huge page")]
+    #[error("given page is part of an already mapped huge page")]
     MappedToHugePage,
-    #[error("Page table allocation failed")]
+    #[error("page table allocation failed")]
     AllocationFailed,
 }
 
