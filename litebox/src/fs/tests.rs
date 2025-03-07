@@ -233,14 +233,18 @@ mod layered {
             .open("foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
-        let bytes_read = fs.read(&fd, &mut buffer).expect("Failed to read from file");
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"testfoo\n");
         fs.close(fd).expect("Failed to close file");
         let fd = fs
             .open("bar/baz", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
-        let bytes_read = fs.read(&fd, &mut buffer).expect("Failed to read from file");
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"test bar baz\n");
         fs.close(fd).expect("Failed to close file");
     }
@@ -298,14 +302,15 @@ mod layered {
         let mut buffer = vec![0; 1024];
 
         let bytes_read = fs
-            .read(&fd1, &mut buffer)
+            .read(&fd1, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"testfoo\n");
 
-        fs.write(&fd2, b"share").expect("Failed to write to file");
+        fs.write(&fd2, b"share", None)
+            .expect("Failed to write to file");
 
         let bytes_read = fs
-            .read(&fd1, &mut buffer)
+            .read(&fd1, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"shareoo\n");
 
@@ -329,14 +334,18 @@ mod layered {
         let mut buffer = vec![0; 4];
 
         // The file exists, and is readable
-        let bytes_read = fs.read(&fd, &mut buffer).expect("Failed to read from file");
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"test");
 
         // Then we delete it
         fs.unlink("foo").unwrap();
 
         // This should not really impact the readability; file is fine.
-        let bytes_read = fs.read(&fd, &mut buffer).expect("Failed to read from file");
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"foo\n");
 
         // But if we close and attempt to re-open, it should not exist

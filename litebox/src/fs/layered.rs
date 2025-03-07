@@ -108,13 +108,17 @@ impl<
         let mut upper_fd = None;
         let mut temp_buf = [0u8; 4096];
         loop {
-            match self.lower.read(&lower_fd, &mut temp_buf) {
+            match self.lower.read(&lower_fd, &mut temp_buf, None) {
                 Ok(size) => {
                     if upper_fd.is_none() {
                         // We are here the first time around, and did not error out, yay! We can
                         // actually open up the file.
                         //
                         // TODO: We might need to make all the parent directories?
+                        //
+                        // TODO: We need to migrate the file offsets (for read/write with offset:
+                        // `None`), but we currently don't have `lseek` support yet, so we
+                        // effectively end up resetting position upon a move. (╯°□°）╯︵ ┻━┻
                         //
                         // TODO: We need to `stat` the mode from the lower level, and migrate it
                         // over, but we currently don't have `stat` support yet, so we're just
@@ -127,7 +131,7 @@ impl<
                     }
                     let upper_fd = upper_fd.as_ref().unwrap();
                     if size > 0 {
-                        self.upper.write(upper_fd, &temp_buf[..size]);
+                        self.upper.write(upper_fd, &temp_buf[..size], None);
                     } else {
                         // EOF
                         break;
@@ -459,7 +463,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         }
     }
 
-    fn read(&self, fd: &crate::fd::FileFd, buf: &mut [u8]) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        fd: &crate::fd::FileFd,
+        buf: &mut [u8],
+        offset: Option<usize>,
+    ) -> Result<usize, ReadError> {
         // Since a write to a lower-level file upgrades the underlying entry out completely to an
         // upper-level file, we don't actually need to worry about a desync; a write to lower-level
         // file will successfully be seen as just being an upper level file. Thus, it is sufficient
@@ -470,13 +479,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             return Err(ReadError::NotForReading);
         }
         match descriptor.entry.as_ref() {
-            EntryX::Upper { fd } => self.upper.read(fd, buf),
-            EntryX::Lower { fd } => self.lower.read(fd, buf),
+            EntryX::Upper { fd } => self.upper.read(fd, buf, offset),
+            EntryX::Lower { fd } => self.lower.read(fd, buf, offset),
             EntryX::Tombstone => unreachable!(),
         }
     }
 
-    fn write(&self, fd: &crate::fd::FileFd, buf: &[u8]) -> Result<usize, WriteError> {
+    fn write(
+        &self,
+        fd: &crate::fd::FileFd,
+        buf: &[u8],
+        offset: Option<usize>,
+    ) -> Result<usize, WriteError> {
         // Writing needs to be careful of how it is performing the write. Any upper-level file can
         // instantly be written to; but a lower-level file must become a upper-level file, before
         // actually being written to.
@@ -486,7 +500,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             return Err(WriteError::NotForWriting);
         }
         match descriptor.entry.as_ref() {
-            EntryX::Upper { fd } => return self.upper.write(fd, buf),
+            EntryX::Upper { fd } => return self.upper.write(fd, buf, offset),
             EntryX::Lower { fd } => {
                 // fallthrough
             }
@@ -506,7 +520,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         }
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
-        self.write(fd, buf)
+        self.write(fd, buf, offset)
     }
 
     fn chmod(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), ChmodError> {
@@ -689,6 +703,8 @@ struct Descriptor {
     path: String,
     flags: OFlags,
     entry: Entry,
+    // TODO: We also need to track file offsets, and perform the relevant `lseek` whenever we
+    // migrate an FD from lower to upper.
 }
 
 struct RootDir {
