@@ -1,4 +1,5 @@
 use litebox::mm::vm::{ProtectError, RemapError, VmFlags, VmemBackend};
+use sealed::sealed;
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::{
@@ -15,7 +16,7 @@ use x86_64::{
 
 use crate::mm::{
     MemoryProvider,
-    pgtable::{PageFaultError, PageTableAllocator, PageTableImpl},
+    pgtable::{__seal_page_table_impl, PageFaultError, PageTableAllocator, PageTableImpl},
 };
 
 #[cfg(not(test))]
@@ -232,6 +233,7 @@ impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
     }
 }
 
+#[sealed]
 impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
     unsafe fn init(p4: PhysAddr) -> Self {
         assert!(p4.is_aligned(Size4KiB::SIZE));
@@ -246,6 +248,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
         }
     }
 
+    #[cfg(test)]
     fn translate(&self, addr: VirtAddr) -> TranslateResult {
         self.inner.translate(addr)
     }

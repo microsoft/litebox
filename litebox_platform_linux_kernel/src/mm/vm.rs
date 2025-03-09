@@ -2,34 +2,36 @@ use core::ops::Range;
 
 use litebox::mm::vm::{PageRange, VmArea, VmFlags, Vmem};
 
-use crate::arch::{PAGE_SIZE, Page, PageFaultErrorCode, VirtAddr, mm::paging::vmflags_to_pteflags};
+use crate::arch::{
+    PAGE_SIZE, Page, PageFaultErrorCode, PhysAddr, VirtAddr, mm::paging::vmflags_to_pteflags,
+};
 
 use super::pgtable::{PageFaultError, PageTableImpl};
 
 /// Virtual memory manager in Kernel that uses `PageTableImpl` as the backend.
-pub(super) struct KernelVmem<PT: PageTableImpl>(Vmem<PT>);
+pub struct KernelVmem<PT: PageTableImpl>(Vmem<PT>);
 
 impl<PT: PageTableImpl> KernelVmem<PT> {
     const STACK_GUARD_GAP: usize = 256 << 12;
 
-    pub(super) fn new(pt: PT) -> Self {
-        KernelVmem(Vmem::<PT>::new(pt))
+    pub unsafe fn new(p: PhysAddr) -> Self {
+        KernelVmem(Vmem::<PT>::new(unsafe { PT::init(p) }))
     }
 
-    pub(super) fn get_pgtable(&self) -> &PT {
+    pub fn get_pgtable(&self) -> &PT {
         self.0.get_inner()
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (&Range<usize>, &VmArea)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&Range<usize>, &VmArea)> {
         self.0.iter()
     }
 
     /// See [`Vmem::insert_mapping`] for details.
-    pub(super) fn insert_mapping(&mut self, range: PageRange, vma: VmArea) {
+    pub fn insert_mapping(&mut self, range: PageRange, vma: VmArea) {
         self.0.insert_mapping(range, vma);
     }
 
-    pub(super) fn handle_page_fault(
+    pub fn handle_page_fault(
         &mut self,
         fault_addr: usize,
         error_code: PageFaultErrorCode,

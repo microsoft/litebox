@@ -1,2 +1,1 @@
-#[cfg(test)]
-pub mod paging;
+pub(crate) mod paging;

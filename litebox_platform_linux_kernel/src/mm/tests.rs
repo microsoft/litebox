@@ -210,10 +210,8 @@ fn collect_mappings(vmm: &KernelVmem<X64PageTable<'_, MockKernel>>) -> Vec<Range
 #[test]
 fn test_vmm_page_fault() {
     let start_addr: usize = 0x1000;
-    let range = PageRange::new(start_addr, start_addr + 2 * PAGE_SIZE);
-    let fault_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-    let pt = get_test_pgtable(range, fault_flags);
-    let mut vmm = KernelVmem::new(pt);
+    let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
+    let mut vmm = unsafe { KernelVmem::new(p4.start_address()) };
     vmm.insert_mapping(
         PageRange::new(start_addr, start_addr + 4 * PAGE_SIZE),
         VmArea::new(

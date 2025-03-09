@@ -1,4 +1,5 @@
 use litebox::mm::vm::VmemBackend;
+use sealed::sealed;
 use thiserror::Error;
 
 use crate::arch::{
@@ -43,7 +44,8 @@ impl<M: super::MemoryProvider> PageTableAllocator<M> {
     }
 }
 
-pub(crate) trait PageTableImpl: VmemBackend {
+#[sealed(pub(crate))]
+pub trait PageTableImpl: VmemBackend {
     /// Flags that `mprotect` can change:
     /// [`PageTableFlags::WRITABLE`] | [`PageTableFlags::USER_ACCESSIBLE`] | [`PageTableFlags::NO_EXECUTE`]
     const MPROTECT_PTE_MASK: PageTableFlags = PageTableFlags::from_bits_truncate(
@@ -60,6 +62,7 @@ pub(crate) trait PageTableImpl: VmemBackend {
     unsafe fn init(p: PhysAddr) -> Self;
 
     /// Translate a virtual address to a physical address
+    #[cfg(test)]
     fn translate(&self, addr: VirtAddr) -> crate::arch::TranslateResult;
 
     /// Handle page fault
@@ -81,7 +84,7 @@ pub(crate) trait PageTableImpl: VmemBackend {
 }
 
 #[derive(Error, Debug)]
-pub(crate) enum PageFaultError {
+pub enum PageFaultError {
     #[error("no access: {0}")]
     AccessError(&'static str),
     #[error("allocation failed")]

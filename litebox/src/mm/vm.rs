@@ -127,7 +127,7 @@ impl VmArea {
 /// Virtual Memory Manager
 ///
 /// This struct mantains the virtual memory areas of a process.
-pub struct Vmem<Backend: VmemBackend = ()> {
+pub struct Vmem<Backend: VmemBackend> {
     /// Virtual memory areas. The ranges need to be page aligned.
     vmas: RangeMap<usize, VmArea>,
     /// Memory backend that provides the actual memory.

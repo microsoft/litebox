@@ -9,7 +9,7 @@ use crate::mm::vm::{
 
 use super::vm::Vmem;
 
-fn collect_mappings(vmm: &Vmem) -> Vec<Range<usize>> {
+fn collect_mappings(vmm: &Vmem<()>) -> Vec<Range<usize>> {
     vmm.iter().map(|v| v.0.start..v.0.end).collect()
 }
 
