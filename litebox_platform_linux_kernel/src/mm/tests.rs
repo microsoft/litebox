@@ -187,17 +187,13 @@ fn test_page_table() {
             TranslateResult::NotMapped
         ));
     }
-    for page in PageRange::<PAGE_SIZE>::new(start_addr, start_addr + 2 * PAGE_SIZE) {
+    for page in PageRange::<PAGE_SIZE>::new(new_addr, new_addr + 2 * PAGE_SIZE) {
         check_flags(&pgtable, page, pteflags);
     }
 
     // unmap all pages
     unsafe {
-        pgtable.unmap_pages(
-            start_addr,
-            usize::try_from(new_addr - start_addr).unwrap() + 4 * PAGE_SIZE,
-            true,
-        );
+        pgtable.unmap_pages(start_addr, new_addr - start_addr + 4 * PAGE_SIZE, true);
     }
     for page in PageRange::<PAGE_SIZE>::new(start_addr, new_addr + 4 * PAGE_SIZE) {
         assert!(matches!(
@@ -214,7 +210,6 @@ fn collect_mappings(vmm: &KernelVmem<X64PageTable<'_, MockKernel>>) -> Vec<Range
 #[test]
 fn test_vmm_page_fault() {
     let start_addr: usize = 0x1000;
-    let start_page = Page::from_start_address(VirtAddr::new(start_addr as _)).unwrap();
     let range = PageRange::new(start_addr, start_addr + 2 * PAGE_SIZE);
     let fault_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
     let pt = get_test_pgtable(range, fault_flags);
@@ -229,13 +224,13 @@ fn test_vmm_page_fault() {
 
     // Access page w/o mapping
     assert!(matches!(
-        vmm.handle_page_fault(start_page + 6, PageFaultErrorCode::USER_MODE),
+        vmm.handle_page_fault(start_addr + 6 * PAGE_SIZE, PageFaultErrorCode::USER_MODE),
         Err(PageFaultError::AccessError(_))
     ));
 
     // Access non-present page w/ mapping
     assert!(
-        vmm.handle_page_fault(start_page + 2, PageFaultErrorCode::USER_MODE)
+        vmm.handle_page_fault(start_addr + 2 * PAGE_SIZE, PageFaultErrorCode::USER_MODE)
             .is_ok()
     );
     check_flags(
@@ -249,7 +244,6 @@ fn test_vmm_page_fault() {
 
     // insert stack mapping
     let stack_addr: usize = 0x1000_0000;
-    let stack_page = Page::from_start_address(VirtAddr::new(stack_addr as _)).unwrap();
     vmm.insert_mapping(
         PageRange::new(stack_addr, stack_addr + 4 * PAGE_SIZE),
         VmArea::new(
@@ -263,7 +257,7 @@ fn test_vmm_page_fault() {
     // [0x1000, 0x5000), [0x1000_0000, 0x1000_4000)
     // Test stack growth
     assert!(
-        vmm.handle_page_fault(stack_page - 1, PageFaultErrorCode::USER_MODE)
+        vmm.handle_page_fault(stack_addr - PAGE_SIZE, PageFaultErrorCode::USER_MODE)
             .is_ok()
     );
     assert_eq!(
@@ -272,7 +266,7 @@ fn test_vmm_page_fault() {
     );
     // Cannot grow stack too far
     assert!(matches!(
-        vmm.handle_page_fault(start_page + 100, PageFaultErrorCode::USER_MODE),
+        vmm.handle_page_fault(start_addr + 100 * PAGE_SIZE, PageFaultErrorCode::USER_MODE),
         Err(PageFaultError::AllocationFailed)
     ));
 }

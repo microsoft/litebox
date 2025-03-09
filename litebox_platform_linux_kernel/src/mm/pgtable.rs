@@ -81,14 +81,6 @@ pub(crate) trait PageTableImpl: VmemBackend {
 }
 
 #[derive(Error, Debug)]
-pub(crate) enum PageTableWalkError {
-    #[error("given page is part of an already mapped huge page")]
-    MappedToHugePage,
-    #[error("page table allocation failed")]
-    AllocationFailed,
-}
-
-#[derive(Error, Debug)]
 pub(crate) enum PageFaultError {
     #[error("no access: {0}")]
     AccessError(&'static str),

@@ -14,6 +14,7 @@ fn collect_mappings(vmm: &Vmem) -> Vec<Range<usize>> {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_vmm_mapping() {
     let start_addr: usize = 0x1000;
     let range = PageRange::new(start_addr, start_addr + 12 * PAGE_SIZE);
@@ -131,12 +132,12 @@ fn test_vmm_mapping() {
     // create new mapping with fixed address that overlaps with other mapping
     assert_eq!(
         vmm.create_mapping(
-            PageRange::new(start_addr + 1 * PAGE_SIZE, start_addr + 3 * PAGE_SIZE),
+            PageRange::new(start_addr + PAGE_SIZE, start_addr + 3 * PAGE_SIZE),
             VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD),
             true
         )
         .unwrap(),
-        start_addr + 1 * PAGE_SIZE
+        start_addr + PAGE_SIZE
     );
     assert_eq!(
         collect_mappings(&vmm),

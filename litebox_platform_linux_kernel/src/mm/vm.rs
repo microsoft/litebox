@@ -2,7 +2,7 @@ use core::ops::Range;
 
 use litebox::mm::vm::{PageRange, VmArea, VmFlags, Vmem};
 
-use crate::arch::{Page, PageFaultErrorCode, mm::paging::vmflags_to_pteflags};
+use crate::arch::{PAGE_SIZE, Page, PageFaultErrorCode, VirtAddr, mm::paging::vmflags_to_pteflags};
 
 use super::pgtable::{PageFaultError, PageTableImpl};
 
@@ -31,11 +31,11 @@ impl<PT: PageTableImpl> KernelVmem<PT> {
 
     pub(super) fn handle_page_fault(
         &mut self,
-        page: Page,
+        fault_addr: usize,
         error_code: PageFaultErrorCode,
     ) -> Result<(), PageFaultError> {
-        let fault_addr = page.start_address().as_u64() as usize;
-        if fault_addr < Vmem::<PT>::TASK_ADDR_MIN || fault_addr >= Vmem::<PT>::TASK_ADDR_MAX {
+        let fault_addr = fault_addr & !(PAGE_SIZE - 1);
+        if !(Vmem::<PT>::TASK_ADDR_MIN..Vmem::<PT>::TASK_ADDR_MAX).contains(&fault_addr) {
             return Err(PageFaultError::AccessError("Invalid address"));
         }
 
@@ -79,7 +79,7 @@ impl<PT: PageTableImpl> KernelVmem<PT> {
 
         unsafe {
             self.0.get_inner_mut().handle_page_fault(
-                page,
+                Page::from_start_address(VirtAddr::new(fault_addr as _)).unwrap(),
                 vmflags_to_pteflags(vma.flags()),
                 error_code,
             )

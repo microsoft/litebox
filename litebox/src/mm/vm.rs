@@ -222,11 +222,8 @@ impl<Backend: VmemBackend> Vmem<Backend> {
     ) -> Option<usize> {
         let (suggested_start, suggested_end) = (suggested_range.start, suggested_range.end);
         let len = suggested_end - suggested_start;
-        let new_addr = self.get_unmmaped_area(
-            suggested_start,
-            NonZeroPageSize::new(usize::try_from(len).unwrap()),
-            fixed_addr,
-        )?;
+        let new_addr =
+            self.get_unmmaped_area(suggested_start, NonZeroPageSize::new(len), fixed_addr)?;
         self.vmas.insert(new_addr..new_addr + len, vma);
         Some(new_addr)
     }
