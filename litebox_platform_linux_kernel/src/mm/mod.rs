@@ -3,19 +3,19 @@
 //! - Page table management
 
 use buddy_system_allocator::Heap;
+use sealed::sealed;
 
 use crate::arch::{PhysAddr, VirtAddr};
 
 pub(crate) mod alloc;
-#[cfg(test)]
 pub(crate) mod pgtable;
-#[cfg(test)]
-pub(crate) mod vm;
+pub mod vm;
 
 #[cfg(test)]
 pub mod tests;
 
 /// Memory provider trait for global allocator.
+#[sealed(pub(crate))]
 pub trait MemoryProvider {
     /// Global virtual address offset for one-to-one mapping of physical memory
     /// to kernel virtual memory.

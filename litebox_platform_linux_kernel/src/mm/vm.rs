@@ -2,8 +2,12 @@ use core::ops::Range;
 
 use litebox::mm::vm::{PageRange, VmArea, VmFlags, Vmem};
 
-use crate::arch::{
-    PAGE_SIZE, Page, PageFaultErrorCode, PhysAddr, VirtAddr, mm::paging::vmflags_to_pteflags,
+use crate::{
+    arch::{
+        PAGE_SIZE, Page, PageFaultErrorCode, PhysAddr, VirtAddr,
+        mm::paging::{X64PageTable, vmflags_to_pteflags},
+    },
+    host::SnpLinuxKenrel,
 };
 
 use super::pgtable::{PageFaultError, PageTableImpl};
@@ -14,6 +18,11 @@ pub struct KernelVmem<PT: PageTableImpl>(Vmem<PT>);
 impl<PT: PageTableImpl> KernelVmem<PT> {
     const STACK_GUARD_GAP: usize = 256 << 12;
 
+    /// Create a new `KernelVmem` instance with the physical address of a page table.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the `p` is a valid address of a top-level page table.
     pub unsafe fn new(p: PhysAddr) -> Self {
         KernelVmem(Vmem::<PT>::new(unsafe { PT::init(p) }))
     }
@@ -81,7 +90,7 @@ impl<PT: PageTableImpl> KernelVmem<PT> {
 
         unsafe {
             self.0.get_inner_mut().handle_page_fault(
-                Page::from_start_address(VirtAddr::new(fault_addr as _)).unwrap(),
+                Page::containing_address(VirtAddr::new(fault_addr as u64)),
                 vmflags_to_pteflags(vma.flags()),
                 error_code,
             )
@@ -109,3 +118,6 @@ impl<PT: PageTableImpl> KernelVmem<PT> {
         false
     }
 }
+
+#[cfg(target_arch = "x86_64")]
+pub type KernelVmemX64 = KernelVmem<X64PageTable<'static, SnpLinuxKenrel>>;

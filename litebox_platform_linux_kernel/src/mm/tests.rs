@@ -11,6 +11,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use arrayvec::ArrayVec;
 use litebox::mm::vm::{PageRange, VmArea, VmFlags, VmemBackend};
+use sealed::sealed;
 use spin::mutex::SpinMutex;
 
 use crate::{
@@ -33,6 +34,7 @@ static ALLOCATOR: SafeZoneAllocator<'static, MAX_ORDER, MockKernel> = SafeZoneAl
 /// const Array for VA to PA mapping
 static MAPPING: SpinMutex<ArrayVec<VirtAddr, 1024>> = SpinMutex::new(ArrayVec::new_const());
 
+#[sealed]
 impl super::MemoryProvider for MockKernel {
     const GVA_OFFSET: super::VirtAddr = super::VirtAddr::new(0);
     const PRIVATE_PTE_MASK: u64 = 0;
