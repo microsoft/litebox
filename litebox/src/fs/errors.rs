@@ -47,6 +47,16 @@ pub enum WriteError {
     NotForWriting,
 }
 
+/// Possible errors from [`FileSystem::seek`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum SeekError {
+    #[error("file descriptor does not point to a file")]
+    NotAFile,
+    #[error("would seek to an invalid (negative or past end) of seekable positions")]
+    InvalidOffset,
+}
+
 /// Possible errors from [`FileSystem::chmod`]
 #[non_exhaustive]
 #[derive(Error, Debug)]

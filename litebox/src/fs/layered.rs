@@ -2,6 +2,7 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use hashbrown::HashMap;
 
 use crate::fd::FileFd;
@@ -9,10 +10,10 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, CloseError, MkdirError, OpenError, PathError, ReadError, RmdirError, UnlinkError,
-    WriteError,
+    ChmodError, CloseError, MkdirError, OpenError, PathError, ReadError, RmdirError, SeekError,
+    UnlinkError, WriteError,
 };
-use super::{Mode, OFlags};
+use super::{Mode, OFlags, SeekWhence};
 
 /// A backing implementation of [`FileSystem`](super::FileSystem) that layers a file system on top
 /// of another.
@@ -116,10 +117,6 @@ impl<
                         //
                         // TODO: We might need to make all the parent directories?
                         //
-                        // TODO: We need to migrate the file offsets (for read/write with offset:
-                        // `None`), but we currently don't have `lseek` support yet, so we
-                        // effectively end up resetting position upon a move. (╯°□°）╯︵ ┻━┻
-                        //
                         // TODO: We need to `stat` the mode from the lower level, and migrate it
                         // over, but we currently don't have `stat` support yet, so we're just
                         // making it have every bit in the mode flags. ┻━┻︵ \(°□°)/ ︵ ┻━┻
@@ -168,6 +165,7 @@ impl<
                      path: _,
                      flags,
                      entry,
+                     position,
                  }| {
                     match entry.as_ref() {
                         EntryX::Upper { fd: _ } => {
@@ -179,18 +177,26 @@ impl<
                         }
                         EntryX::Tombstone => unreachable!(),
                     }
+                    // First, we set up the upper entry we'll be swapping/placing in.
+                    let upper_fd = self.upper.open(path, *flags, Mode::empty()).unwrap();
+                    let position = position.load(SeqCst);
+                    if position > 0 {
+                        self.upper
+                            .seek(
+                                &upper_fd,
+                                isize::try_from(position).unwrap(),
+                                SeekWhence::RelativeToBeginning,
+                            )
+                            .unwrap();
+                    }
+                    let upper_entry = Arc::new(EntryX::Upper { fd: upper_fd });
                     match Arc::strong_count(entry) {
                         0 | 1 => unreachable!(), // We are holding one, and also there must be an entry in `root`
                         2 => {
                             // Perfect amount to trigger a `close` on the lower level, and remove
                             // the underlying root entry, since further syncing is no longer
                             // necessary.
-                            let old_entry = core::mem::replace(
-                                entry,
-                                Arc::new(EntryX::Upper {
-                                    fd: self.upper.open(path, *flags, Mode::empty()).unwrap(),
-                                }),
-                            );
+                            let old_entry = core::mem::replace(entry, upper_entry);
                             let root_entry = root_entries.remove(path).unwrap();
                             assert!(Arc::ptr_eq(&old_entry, &root_entry));
                             drop(root_entry);
@@ -205,9 +211,7 @@ impl<
                         _ => {
                             // Other FDs are open with the same file too. We'll handle the open one
                             // here locally, and a future FD will take care of the relevant closing.
-                            *entry = Arc::new(EntryX::Upper {
-                                fd: self.upper.open(path, *flags, Mode::empty()).unwrap(),
-                            });
+                            *entry = upper_entry;
                         }
                     }
                 },
@@ -292,6 +296,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         path,
                         flags,
                         entry: Arc::clone(entry),
+                        position: 0.into(),
                     }));
                 }
             }
@@ -317,10 +322,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     .entries
                     .insert(path.clone(), Arc::clone(&entry));
                 assert!(old.is_none());
-                return Ok(self
-                    .descriptors
-                    .write()
-                    .insert(Descriptor { path, flags, entry }));
+                return Ok(self.descriptors.write().insert(Descriptor {
+                    path,
+                    flags,
+                    entry,
+                    position: 0.into(),
+                }));
             }
             Err(e) => match &e {
                 OpenError::AccessNotAllowed
@@ -370,6 +377,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             path,
             flags: original_flags,
             entry,
+            position: 0.into(),
         }))
     }
 
@@ -378,6 +386,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             path,
             entry,
             flags: _,
+            position: _,
         } = self.descriptors.write().remove(fd);
         // We can first sanity check that we don't have a tombstone: none of the other operations
         // should ever cause the entry _at_ an fd to become a tombstone, even if the entry at the
@@ -478,11 +487,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         if !descriptor.flags.contains(OFlags::RDONLY) && !descriptor.flags.contains(OFlags::RDWR) {
             return Err(ReadError::NotForReading);
         }
-        match descriptor.entry.as_ref() {
-            EntryX::Upper { fd } => self.upper.read(fd, buf, offset),
-            EntryX::Lower { fd } => self.lower.read(fd, buf, offset),
+        let num_bytes = match descriptor.entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.read(fd, buf, offset)?,
+            EntryX::Lower { fd } => self.lower.read(fd, buf, offset)?,
             EntryX::Tombstone => unreachable!(),
-        }
+        };
+        descriptor.position.fetch_add(num_bytes, SeqCst);
+        Ok(num_bytes)
     }
 
     fn write(
@@ -500,7 +511,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             return Err(WriteError::NotForWriting);
         }
         match descriptor.entry.as_ref() {
-            EntryX::Upper { fd } => return self.upper.write(fd, buf, offset),
+            EntryX::Upper { fd } => {
+                let num_bytes = self.upper.write(fd, buf, offset)?;
+                descriptor.position.fetch_add(num_bytes, SeqCst);
+                return Ok(num_bytes);
+            }
             EntryX::Lower { fd } => {
                 // fallthrough
             }
@@ -521,6 +536,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
         self.write(fd, buf, offset)
+    }
+
+    fn seek(&self, fd: &FileFd, offset: isize, whence: SeekWhence) -> Result<usize, SeekError> {
+        let descriptors = self.descriptors.read();
+        let descriptor = descriptors.get(fd);
+        // Perform the seek, and update the position info
+        let position = match descriptor.entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.seek(fd, offset, whence)?,
+            EntryX::Lower { fd } => self.lower.seek(fd, offset, whence)?,
+            EntryX::Tombstone => unreachable!(),
+        };
+        descriptor.position.store(position, SeqCst);
+        Ok(position)
     }
 
     fn chmod(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), ChmodError> {
@@ -703,8 +731,7 @@ struct Descriptor {
     path: String,
     flags: OFlags,
     entry: Entry,
-    // TODO: We also need to track file offsets, and perform the relevant `lseek` whenever we
-    // migrate an FD from lower to upper.
+    position: AtomicUsize,
 }
 
 struct RootDir {

@@ -18,7 +18,8 @@ pub mod tar_ro;
 mod tests;
 
 use errors::{
-    ChmodError, CloseError, MkdirError, OpenError, ReadError, RmdirError, UnlinkError, WriteError,
+    ChmodError, CloseError, MkdirError, OpenError, ReadError, RmdirError, SeekError, UnlinkError,
+    WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -56,6 +57,10 @@ pub trait FileSystem: private::Sealed {
     /// to the end of the write.
     /// If `offset` is Some, the file offset is not changed.
     fn write(&self, fd: &FileFd, buf: &[u8], offset: Option<usize>) -> Result<usize, WriteError>;
+    /// Reposition read/write file offset, by changing it to `offset` relative to `whence`.
+    ///
+    /// Returns the resulting offset (in bytes from start of file) on success.
+    fn seek(&self, fd: &FileFd, offset: isize, whence: SeekWhence) -> Result<usize, SeekError>;
     /// Change the permissions of a file
     fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
     /// Unlink a file
@@ -161,4 +166,14 @@ bitflags! {
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
     }
+}
+
+/// The `whence` directive to [`FileSystem::seek`]
+pub enum SeekWhence {
+    /// The file offset is set to `offset` bytes.
+    RelativeToBeginning,
+    /// The file offset is set to its current location plus `offset` bytes.
+    RelativeToCurrentOffset,
+    /// The file offset is set to the size of the file plus `offset` bytes.
+    RelativeToEnd,
 }
