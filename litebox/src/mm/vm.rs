@@ -445,7 +445,7 @@ impl<Backend: VmemBackend> Vmem<Backend> {
 }
 
 pub trait VmemBackend {
-    /// Unmap 4KiB pages from the page table
+    /// Unmap 4KiB pages
     ///
     /// `free_page` indicates whether the unmapped pages should be freed (This may be helpful
     /// when implementing [`Self::remap_pages`]. If we maintain refcnt for pages, we may not
@@ -460,7 +460,7 @@ pub trait VmemBackend {
     /// panic if `start` or `len` is misaligned.
     unsafe fn unmap_pages(&mut self, start: usize, len: usize, free_page: bool);
 
-    /// Remap 4KiB pages in the page table from `old_addr` to `new_addr`
+    /// Remap 4KiB pages from `old_addr` to `new_addr`
     ///
     /// # Safety
     ///
@@ -474,7 +474,7 @@ pub trait VmemBackend {
         len: usize,
     ) -> Result<(), RemapError>;
 
-    /// Change the page table flags for 4KiB pages
+    /// Change the protection for 4KiB pages
     ///
     /// # Safety
     ///
@@ -528,27 +528,4 @@ pub(super) enum VmemProtectError {
 pub enum ProtectError {
     #[error("protect page that belongs to a huge page")]
     ProtectHugePage,
-}
-
-/// A dummy implementation of [`VmemBackend`] that does nothing.
-impl VmemBackend for () {
-    unsafe fn unmap_pages(&mut self, start: usize, len: usize, free_page: bool) {}
-
-    unsafe fn remap_pages(
-        &mut self,
-        old_addr: usize,
-        new_addr: usize,
-        len: usize,
-    ) -> Result<(), RemapError> {
-        Ok(())
-    }
-
-    unsafe fn mprotect_pages(
-        &mut self,
-        start: usize,
-        len: usize,
-        new_flags: VmFlags,
-    ) -> Result<(), ProtectError> {
-        Ok(())
-    }
 }

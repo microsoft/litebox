@@ -3,11 +3,33 @@ use core::ops::Range;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::mm::vm::{
-    NonZeroPageSize, PAGE_SIZE, PageRange, VmArea, VmFlags, VmemProtectError, VmemResizeError,
+use super::vm::{
+    NonZeroPageSize, PAGE_SIZE, PageRange, ProtectError, RemapError, VmArea, VmFlags, Vmem,
+    VmemBackend, VmemProtectError, VmemResizeError,
 };
 
-use super::vm::Vmem;
+/// A dummy implementation of [`VmemBackend`] that does nothing.
+impl VmemBackend for () {
+    unsafe fn unmap_pages(&mut self, start: usize, len: usize, free_page: bool) {}
+
+    unsafe fn remap_pages(
+        &mut self,
+        old_addr: usize,
+        new_addr: usize,
+        len: usize,
+    ) -> Result<(), RemapError> {
+        Ok(())
+    }
+
+    unsafe fn mprotect_pages(
+        &mut self,
+        start: usize,
+        len: usize,
+        new_flags: VmFlags,
+    ) -> Result<(), ProtectError> {
+        Ok(())
+    }
+}
 
 fn collect_mappings(vmm: &Vmem<()>) -> Vec<Range<usize>> {
     vmm.iter().map(|v| v.0.start..v.0.end).collect()
