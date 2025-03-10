@@ -151,7 +151,7 @@ impl<Backend: VmemBackend> Vmem<Backend> {
         self.vmas.iter()
     }
 
-    pub fn get_inner(&self) -> &Backend {
+    pub fn get_backend(&self) -> &Backend {
         &self.backend
     }
 
