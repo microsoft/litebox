@@ -1,6 +1,8 @@
 use alloc::{collections::btree_map::BTreeMap, ffi::CString, vec::Vec};
 use litebox::platform::RawMutPointer;
 
+use crate::MutPtr;
+
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
@@ -37,31 +39,24 @@ pub enum AuxKey {
     AT_SYSINFO_EHDR = 33, /* the start address of the page containing the VDSO */
 }
 
-pub(super) struct UserStack<P: RawMutPointer<u8>> {
-    stack_top: P,
+pub(super) struct UserStack {
     stack_top_vaddr: usize,
 }
 
-impl<P: RawMutPointer<u8>> UserStack<P> {
+impl UserStack {
     /// Stack alignment required by libc ABI
     const STACK_ALIGNMENT: usize = 16;
 
     /// stack_top must be aligned to [`Self::STACK_ALIGNMENT`] bytes
-    pub fn new<T>(stack_top: P, stack_top_vaddr: T) -> Self
-    where
-        T: FnOnce() -> usize,
-    {
-        Self {
-            stack_top,
-            stack_top_vaddr: stack_top_vaddr(),
-        }
+    pub fn new(stack_top_vaddr: usize) -> Self {
+        Self { stack_top_vaddr }
     }
 
     fn write_bytes(&self, bytes: &[u8], pos: isize) -> Option<isize> {
         let len = bytes.len() as isize;
         let new_pos = pos - len;
-        self.stack_top
-            .mutate_subslice_with(new_pos..pos, |s| s.copy_from_slice(bytes))?;
+        let stack_top = MutPtr::<u8>::from(self.stack_top_vaddr);
+        stack_top.mutate_subslice_with(new_pos..pos, |s| s.copy_from_slice(bytes))?;
         Some(new_pos)
     }
 
@@ -85,7 +80,8 @@ impl<P: RawMutPointer<u8>> UserStack<P> {
         let pos = self.write_bytes(&0isize.to_le_bytes(), pos)?;
         let len = offsets.len();
         let new_pos = pos - (len * size_of::<isize>()) as isize;
-        self.stack_top.mutate_subslice_with(new_pos..pos, |s| {
+        let stack_top = MutPtr::<u8>::from(self.stack_top_vaddr);
+        stack_top.mutate_subslice_with(new_pos..pos, |s| {
             for (i, p) in offsets.iter().enumerate() {
                 let addr = self.stack_top_vaddr as isize + *p;
                 s[i * 8..(i + 1) * 8].copy_from_slice(&addr.to_le_bytes());
@@ -126,8 +122,9 @@ impl<P: RawMutPointer<u8>> UserStack<P> {
     ) -> Option<isize> {
         let pos: isize = -8;
         // end markers
+        let stack_top = MutPtr::<u8>::from(self.stack_top_vaddr);
         unsafe {
-            self.stack_top.write_at_offset(pos, 0)?;
+            stack_top.write_at_offset(pos, 0)?;
         }
 
         let (pos, envp) = self.write_cstrings(&env, pos)?;
