@@ -22,12 +22,23 @@ use litebox::{fs::FileSystem as _, platform::RawConstPointer as _, sync::RwLock}
 use litebox_common_linux::errno::Errno;
 use litebox_platform_multiplex::Platform;
 
+pub mod errno;
+pub mod loader;
+pub mod syscall;
+use errno::AsErrno as _;
+
 pub(crate) fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
     static FS: OnceBox<litebox::fs::in_mem::FileSystem<Platform>> = OnceBox::new();
     FS.get_or_init(|| {
-        alloc::boxed::Box::new(litebox::fs::in_mem::FileSystem::new(
-            litebox_platform_multiplex::platform(),
-        ))
+        let mut in_mem_fs =
+            litebox::fs::in_mem::FileSystem::new(litebox_platform_multiplex::platform());
+        #[cfg(test)]
+        in_mem_fs.with_root_privileges(|fs| {
+            use litebox::fs::Mode;
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to set permissions on root");
+        });
+        alloc::boxed::Box::new(in_mem_fs)
     })
 }
 
@@ -38,6 +49,20 @@ pub(crate) fn litebox_sync<'a>() -> &'a litebox::sync::Synchronization<'static, 
             litebox_platform_multiplex::platform(),
         ))
     })
+}
+
+static VMEM: once_cell::race::OnceBox<RwLock<'static, Platform, litebox_platform_multiplex::VMem>> =
+    once_cell::race::OnceBox::new();
+pub(crate) fn set_vmm(vmm: litebox_platform_multiplex::VMem) {
+    match VMEM.set(alloc::boxed::Box::new(litebox_sync().new_rwlock(vmm))) {
+        Ok(()) => {}
+        Err(_) => panic!("set_vmm should only be called once per crate"),
+    }
+}
+
+pub(crate) fn litebox_vmm<'a>() -> &'a RwLock<'static, Platform, litebox_platform_multiplex::VMem> {
+    VMEM.get()
+        .expect("set_vmm must be called before litebox_vmm")
 }
 
 // Convenience type aliases

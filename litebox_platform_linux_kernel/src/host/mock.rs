@@ -2,6 +2,8 @@ use core::sync::atomic::AtomicU32;
 
 use crate::HostInterface;
 
+pub(crate) type MockKernel = crate::LinuxKernel<MockHostInterface>;
+
 pub struct MockHostInterface {}
 
 pub type MockKernel = crate::LinuxKernel<MockHostInterface>;
