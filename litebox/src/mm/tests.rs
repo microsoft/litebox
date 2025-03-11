@@ -10,13 +10,18 @@ use super::vm::{
 
 /// A dummy implementation of [`VmemBackend`] that does nothing.
 impl VmemBackend for () {
+    fn map_pages(&mut self, start: usize, len: usize, flags: VmFlags) -> Option<usize> {
+        Some(start)
+    }
+
     unsafe fn unmap_pages(&mut self, start: usize, len: usize, free_page: bool) {}
 
     unsafe fn remap_pages(
         &mut self,
         old_addr: usize,
         new_addr: usize,
-        len: usize,
+        old_len: usize,
+        new_len: usize,
     ) -> Result<(), RemapError> {
         Ok(())
     }

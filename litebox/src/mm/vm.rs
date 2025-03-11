@@ -191,7 +191,7 @@ impl<Backend: VmemBackend> Vmem<Backend> {
     /// # Panics
     ///
     /// Panics if the range is beyond the task address space [[`Self::TASK_ADDR_MIN`], [`Self::TASK_ADDR_MAX`]]).
-    pub fn insert_mapping(&mut self, range: PageRange, vma: VmArea) {
+    pub fn insert_mapping(&mut self, range: PageRange, vma: VmArea) -> Option<usize> {
         let (start, end) = (range.start, range.end);
         assert!(start >= Self::TASK_ADDR_MIN);
         assert!(end <= Self::TASK_ADDR_MAX);
@@ -205,7 +205,12 @@ impl<Backend: VmemBackend> Vmem<Backend> {
                 );
             };
         }
+        assert_eq!(
+            start,
+            self.backend.map_pages(start, end - start, vma.flags)?
+        );
         self.vmas.insert(start..end, vma);
+        Some(start)
     }
 
     /// Create a new mapping in the virtual address space.
@@ -224,7 +229,7 @@ impl<Backend: VmemBackend> Vmem<Backend> {
         let len = suggested_end - suggested_start;
         let new_addr =
             self.get_unmmaped_area(suggested_start, NonZeroPageSize::new(len), fixed_addr)?;
-        self.vmas.insert(new_addr..new_addr + len, vma);
+        self.insert_mapping(PageRange::new(new_addr, new_addr + len), vma);
         Some(new_addr)
     }
 
@@ -312,10 +317,13 @@ impl<Backend: VmemBackend> Vmem<Backend> {
         let new_addr = self
             .get_unmmaped_area(suggested_addr, new_size, false)
             .ok_or(VmemMoveError::OutOfMemory)?;
+        unsafe {
+            self.backend
+                .remap_pages(start, new_addr, end - start, new_size.as_usize())
+        }
+        .map_err(VmemMoveError::RemapError)?;
         self.vmas
             .insert(new_addr..new_addr + new_size.as_usize(), *vma);
-        unsafe { self.backend.remap_pages(start, new_addr, end - start) }
-            .map_err(VmemMoveError::RemapError)?;
         self.vmas.remove(start..end);
         Ok(new_addr)
     }
@@ -445,6 +453,13 @@ impl<Backend: VmemBackend> Vmem<Backend> {
 }
 
 pub trait VmemBackend {
+    /// Map/Allocate 4KiB pages at the fixed address `start` with `flags`
+    ///
+    /// # Panics
+    ///
+    /// Panics if `start` or `len` is not aligned to 4KiB.
+    fn map_pages(&mut self, start: usize, len: usize, flags: VmFlags) -> Option<usize>;
+
     /// Unmap 4KiB pages
     ///
     /// `free_page` indicates whether the unmapped pages should be freed (This may be helpful
@@ -466,12 +481,13 @@ pub trait VmemBackend {
     ///
     /// The caller must also ensure that the [`new_addr`, `new_addr` + `len`]
     /// is not already mapped, and `old_addr` and `new_addr` do not overlap.
-    /// `old_addr`, `new_addr`, and `len` must be aligned to 4KiB.
+    /// `old_addr`, `new_addr`, `old_len`, and `new_len` must be aligned to 4KiB.
     unsafe fn remap_pages(
         &mut self,
         old_addr: usize,
         new_addr: usize,
-        len: usize,
+        old_len: usize,
+        new_len: usize,
     ) -> Result<(), RemapError>;
 
     /// Change the protection for 4KiB pages

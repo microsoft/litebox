@@ -72,6 +72,11 @@ pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
 }
 
 impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
+    fn map_pages(&mut self, start: usize, _len: usize, _flags: VmFlags) -> Option<usize> {
+        // leave it to page fault handler
+        Some(start)
+    }
+
     /// Unmap 4KiB pages from the page table
     ///
     /// Note it does not free the allocated frames for page table itself (only those allocated to
@@ -112,20 +117,22 @@ impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
         &mut self,
         old_addr: usize,
         new_addr: usize,
-        len: usize,
+        old_len: usize,
+        new_len: usize,
     ) -> Result<(), RemapError> {
         let old_addr = VirtAddr::new(old_addr as _);
         let new_addr = VirtAddr::new(new_addr as _);
         assert!(old_addr.is_aligned(Size4KiB::SIZE));
         assert!(new_addr.is_aligned(Size4KiB::SIZE));
-        assert!(len as u64 % Size4KiB::SIZE == 0);
+        assert!(old_len as u64 % Size4KiB::SIZE == 0);
+        assert!(new_len as u64 % Size4KiB::SIZE == 0);
 
         // Note this implementation is slow as each page requires three full page table walks.
         // If we have N pages, it will be 3N times slower.
         let mut allocator = PageTableAllocator::<M>::new();
         let mut start: Page<Size4KiB> = Page::from_start_address(old_addr).unwrap();
         let mut new_start: Page<Size4KiB> = Page::from_start_address(new_addr).unwrap();
-        let end: Page<Size4KiB> = Page::from_start_address(old_addr + len as _).unwrap();
+        let end: Page<Size4KiB> = Page::from_start_address(old_addr + old_len as _).unwrap();
         while start < end {
             match self.inner.translate(start.start_address()) {
                 TranslateResult::Mapped {

@@ -179,7 +179,7 @@ fn test_page_table() {
     unsafe {
         assert!(
             pgtable
-                .remap_pages(start_addr, new_addr, 2 * PAGE_SIZE)
+                .remap_pages(start_addr, new_addr, 2 * PAGE_SIZE, 2 * PAGE_SIZE)
                 .is_ok()
         );
     }
