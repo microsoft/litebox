@@ -198,3 +198,11 @@ impl<T: Clone> RawMutPointer<T> for TransparentMutPtr<T> {
         Some(f(slice))
     }
 }
+
+impl<T> From<usize> for TransparentMutPtr<T> {
+    fn from(inner: usize) -> Self {
+        Self {
+            inner: inner as *mut T,
+        }
+    }
+}

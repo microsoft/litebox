@@ -73,3 +73,19 @@ impl<T: Clone> UserMutPtr<T> {
         unsafe { self.write_at_offset(off, value) }
     }
 }
+
+impl<T> From<usize> for UserMutPtr<T> {
+    fn from(addr: usize) -> Self {
+        Self {
+            inner: addr as *mut T,
+        }
+    }
+}
+
+impl<T> From<usize> for UserConstPtr<T> {
+    fn from(addr: usize) -> Self {
+        Self {
+            inner: addr as *const T,
+        }
+    }
+}
