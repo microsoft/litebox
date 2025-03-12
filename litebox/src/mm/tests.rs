@@ -4,8 +4,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::linux::{
-    NonZeroPageSize, PAGE_SIZE, PageRange, ProtectError, RemapError, VmArea, VmFlags, Vmem,
-    VmemBackend, VmemProtectError, VmemResizeError,
+    NonZeroPageSize, PAGE_SIZE, PageRange, ProtectError, RemapError, UnmapError, VmArea, VmFlags,
+    Vmem, VmemBackend, VmemProtectError, VmemResizeError,
 };
 
 /// A dummy implementation of [`VmemBackend`] that does nothing.
@@ -16,7 +16,9 @@ impl VmemBackend for DummyVmemBackend {
         Some(start)
     }
 
-    unsafe fn unmap_pages(&mut self, start: usize, len: usize) {}
+    unsafe fn unmap_pages(&mut self, start: usize, len: usize) -> Result<(), UnmapError> {
+        Ok(())
+    }
 
     unsafe fn remap_pages(
         &mut self,

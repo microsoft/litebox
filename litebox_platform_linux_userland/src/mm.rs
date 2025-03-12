@@ -1,6 +1,8 @@
 use litebox::{
     mm::{
-        linux::{PageRange, ProtectError, RemapError, VmFlags, Vmem, VmemBackend},
+        linux::{
+            PAGE_SIZE, PageRange, ProtectError, RemapError, UnmapError, VmFlags, Vmem, VmemBackend,
+        },
         mapping::{MappingError, MappingProvider},
     },
     platform::trivial_providers::TransparentMutPtr,
@@ -31,8 +33,8 @@ impl VmemBackend for UserMemBackend {
     unsafe fn map_pages(&mut self, start: usize, len: usize, flags: VmFlags) -> Option<usize> {
         unsafe {
             nix::sys::mman::mmap_anonymous(
-                Some(core::num::NonZeroUsize::new(start).unwrap()),
-                core::num::NonZeroUsize::new(len).unwrap(),
+                Some(core::num::NonZeroUsize::new(start).expect("non null addr")),
+                core::num::NonZeroUsize::new(len).expect("non zero len"),
                 vmflags_to_prots(flags),
                 nix::sys::mman::MapFlags::MAP_PRIVATE
                     | nix::sys::mman::MapFlags::MAP_ANONYMOUS
@@ -43,10 +45,27 @@ impl VmemBackend for UserMemBackend {
         .ok()
     }
 
-    unsafe fn unmap_pages(&mut self, start: usize, len: usize) {
-        unsafe {
-            nix::sys::mman::munmap(core::ptr::NonNull::new(start as _).unwrap(), len).unwrap();
+    unsafe fn unmap_pages(&mut self, start: usize, len: usize) -> Result<(), UnmapError> {
+        if start % PAGE_SIZE != 0 {
+            return Err(UnmapError::MisAligned {
+                val: start,
+                align: PAGE_SIZE,
+            });
         }
+        if len % PAGE_SIZE != 0 {
+            return Err(UnmapError::MisAligned {
+                val: len,
+                align: PAGE_SIZE,
+            });
+        }
+        unsafe {
+            nix::sys::mman::munmap(
+                core::ptr::NonNull::new(start as _).expect("non null addr"),
+                len,
+            )
+        }
+        .expect("munmap failed");
+        Ok(())
     }
 
     unsafe fn remap_pages(
@@ -58,13 +77,13 @@ impl VmemBackend for UserMemBackend {
     ) -> Result<(), RemapError> {
         let res = unsafe {
             nix::sys::mman::mremap(
-                core::ptr::NonNull::new(old_addr as _).unwrap(),
+                core::ptr::NonNull::new(old_addr as _).expect("non null addr"),
                 old_len,
                 new_len,
                 MRemapFlags::MREMAP_FIXED,
-                Some(core::ptr::NonNull::new(new_addr as _).unwrap()),
+                Some(core::ptr::NonNull::new(new_addr as _).expect("non null new addr")),
             )
-            .unwrap()
+            .expect("mremap failed")
         };
         assert_eq!(res.as_ptr() as usize, new_addr);
         Ok(())
@@ -78,7 +97,7 @@ impl VmemBackend for UserMemBackend {
     ) -> Result<(), ProtectError> {
         unsafe {
             nix::sys::mman::mprotect(
-                core::ptr::NonNull::new(start as _).unwrap(),
+                core::ptr::NonNull::new(start as _).expect("non null addr"),
                 len,
                 vmflags_to_prots(new_flags),
             )
@@ -89,7 +108,7 @@ impl VmemBackend for UserMemBackend {
 }
 
 /// Virtual memory manager for user space
-pub struct UserVmem<const ALIGN: usize> {
+pub struct UserVmem<const ALIGN: usize = PAGE_SIZE> {
     inner: Vmem<UserMemBackend, ALIGN>,
 }
 

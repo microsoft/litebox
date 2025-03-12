@@ -17,6 +17,7 @@ pub enum MappingError {
     ReadError(#[from] crate::fs::errors::ReadError),
 }
 
+/// A trait for creating readable, writable, or executable pages
 pub trait MappingProvider<P: RawMutPointer<u8> + From<usize>, const ALIGN: usize> {
     /// Create readable and executable pages.
     ///

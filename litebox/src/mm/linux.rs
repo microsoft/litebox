@@ -8,6 +8,9 @@ use alloc::vec::Vec;
 use rangemap::RangeMap;
 use thiserror::Error;
 
+/// Page size in bytes
+pub const PAGE_SIZE: usize = 4096;
+
 bitflags::bitflags! {
     /// Flags to describe the properties of a memory region.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,7 +93,7 @@ impl<const ALIGN: usize> PageRange<ALIGN> {
     }
 
     /// Whether the range is empty or not
-    /// 
+    ///
     /// Note this range is never empty.
     pub fn is_empty(&self) -> bool {
         false
@@ -160,8 +163,6 @@ pub struct Vmem<Backend: VmemBackend, const ALIGN: usize> {
     vmas: RangeMap<usize, VmArea>,
 }
 
-pub const PAGE_SIZE: usize = 4096;
-
 impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
     pub const TASK_ADDR_MIN: usize = PAGE_SIZE;
     pub const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
@@ -197,12 +198,15 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
     /// # Safety
     ///
     /// The caller must ensure that the memory region is no longer used by any other.
-    pub unsafe fn remove_mapping(&mut self, range: PageRange<ALIGN>) {
+    pub unsafe fn remove_mapping(&mut self, range: PageRange<ALIGN>) -> Result<(), VmemUnmapError> {
         let (start, end) = (range.start, range.end);
-        self.vmas.remove(start..end);
         unsafe {
-            self.backend.unmap_pages(start, end - start);
-        };
+            self.backend
+                .unmap_pages(start, end - start)
+                .map_err(VmemUnmapError::UnmapError)?;
+        }
+        self.vmas.remove(start..end);
+        Ok(())
     }
 
     /// Insert a range to its virtual address space.
@@ -231,8 +235,9 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
             let intersection = r.start.max(start)..r.end.min(end);
             unsafe {
                 self.backend
-                    .unmap_pages(intersection.start, intersection.end - intersection.start);
-            };
+                    .unmap_pages(intersection.start, intersection.end - intersection.start)
+                    .ok()?;
+            }
         }
         assert_eq!(start, unsafe {
             self.backend.map_pages(start, end - start, vma.flags)?
@@ -524,11 +529,7 @@ pub trait VmemBackend {
     /// # Safety
     ///
     /// The caller must ensure that the memory region is not used by any other.
-    ///
-    /// # Panics
-    ///
-    /// panic if `start` or `len` is misaligned or not `ALIGN`-aligned.
-    unsafe fn unmap_pages(&mut self, start: usize, len: usize);
+    unsafe fn unmap_pages(&mut self, start: usize, len: usize) -> Result<(), UnmapError>;
 
     /// Remap `ALIGN`-aligned pages from `old_addr` to `new_addr`
     ///
@@ -562,6 +563,19 @@ pub trait VmemBackend {
     ) -> Result<(), ProtectError>;
 }
 
+#[derive(Error, Debug)]
+pub enum VmemUnmapError {
+    #[error("failed to unmap pages: {0:?}")]
+    UnmapError(#[from] UnmapError),
+}
+
+/// Error for [`VmemBackend::unmap_pages`]
+#[derive(Error, Debug)]
+pub enum UnmapError {
+    #[error("{val:#x} is not aligned to {align:#x}")]
+    MisAligned { val: usize, align: usize },
+}
+
 /// Error for [`Vmem::resize_mapping`]
 #[derive(Error, Debug)]
 pub enum VmemResizeError {
@@ -585,6 +599,8 @@ pub enum VmemMoveError {
 /// Error for [`VmemBackend::remap_pages`]
 #[derive(Error, Debug)]
 pub enum RemapError {
+    #[error("{val:#x} is not aligned to {align:#x}")]
+    MisAligned { val: usize, align: usize },
     #[error("out of memory")]
     OutOfMemory,
     #[error("remap to huge page")]

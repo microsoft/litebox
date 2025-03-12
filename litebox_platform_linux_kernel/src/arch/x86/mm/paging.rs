@@ -1,4 +1,4 @@
-use litebox::mm::linux::{ProtectError, RemapError, VmFlags, VmemBackend};
+use litebox::mm::linux::{ProtectError, RemapError, UnmapError, VmFlags, VmemBackend};
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::{
@@ -7,7 +7,8 @@ use x86_64::{
             FrameAllocator, FrameDeallocator, MappedPageTable, Mapper, Page, PageSize, PageTable,
             PageTableFlags, PhysFrame, Size4KiB, Translate,
             mapper::{
-                FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult, UnmapError,
+                FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult,
+                UnmapError as X64UnmapError,
             },
         },
     },
@@ -80,12 +81,19 @@ impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
     ///
     /// Note it does not free the allocated frames for page table itself (only those allocated to
     /// user space).
-    unsafe fn unmap_pages(&mut self, va: usize, len: usize) {
-        let va = VirtAddr::new(va as _);
-        assert!(va.is_aligned(Size4KiB::SIZE));
-        assert!(len as u64 % Size4KiB::SIZE == 0);
-        let start = Page::<Size4KiB>::from_start_address(va).unwrap();
-        let end = Page::<Size4KiB>::from_start_address(va + len as _).unwrap();
+    unsafe fn unmap_pages(&mut self, start: usize, len: usize) -> Result<(), UnmapError> {
+        let va = VirtAddr::new(start as _);
+        let start =
+            Page::<Size4KiB>::from_start_address(va).map_err(|_| UnmapError::MisAligned {
+                val: start,
+                align: 4096,
+            })?;
+        let end = Page::<Size4KiB>::from_start_address(va + len as _).map_err(|_| {
+            UnmapError::MisAligned {
+                val: len,
+                align: 4096,
+            }
+        })?;
         let mut allocator = PageTableAllocator::<M>::new();
 
         // Note this implementation is slow as each page requires a full page table walk.
@@ -98,15 +106,16 @@ impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
                         fl.flush();
                     }
                 }
-                Err(UnmapError::PageNotMapped) => {}
-                Err(UnmapError::ParentEntryHugePage) => {
-                    panic!("Huge page cannot be unmapped");
+                Err(X64UnmapError::PageNotMapped) => {}
+                Err(X64UnmapError::ParentEntryHugePage) => {
+                    unreachable!("we do not support huge pages");
                 }
-                Err(UnmapError::InvalidFrameAddress(pa)) => {
-                    panic!("Invalid frame address: {:#x}", pa);
+                Err(X64UnmapError::InvalidFrameAddress(pa)) => {
+                    todo!("Invalid frame address: {:#x}", pa);
                 }
             }
         }
+        Ok(())
     }
 
     unsafe fn remap_pages(
@@ -156,13 +165,13 @@ impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
                             fl.flush();
                         }
                     }
-                    Err(UnmapError::PageNotMapped) => {
+                    Err(X64UnmapError::PageNotMapped) => {
                         unreachable!()
                     }
-                    Err(UnmapError::ParentEntryHugePage) => {
+                    Err(X64UnmapError::ParentEntryHugePage) => {
                         return Err(RemapError::RemapToHugePage);
                     }
-                    Err(UnmapError::InvalidFrameAddress(pa)) => {
+                    Err(X64UnmapError::InvalidFrameAddress(pa)) => {
                         panic!("Invalid frame address: {:#x}", pa);
                     }
                 },

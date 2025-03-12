@@ -1,3 +1,5 @@
+//! Virtual memory manager in Kernel
+
 use core::ops::Range;
 
 use litebox::mm::{

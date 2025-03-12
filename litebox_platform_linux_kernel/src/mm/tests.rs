@@ -193,9 +193,7 @@ fn test_page_table() {
     }
 
     // unmap all pages
-    unsafe {
-        pgtable.unmap_pages(start_addr, new_addr - start_addr + 4 * PAGE_SIZE);
-    }
+    unsafe { pgtable.unmap_pages(start_addr, new_addr - start_addr + 4 * PAGE_SIZE) }.unwrap();
     for page in PageRange::<PAGE_SIZE>::new(start_addr, new_addr + 4 * PAGE_SIZE).unwrap() {
         assert!(matches!(
             pgtable.translate(VirtAddr::new(page as _)),
