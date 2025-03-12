@@ -1,4 +1,4 @@
-use litebox::mm::linux::{ProtectError, RemapError, UnmapError, VmFlags, VmemBackend};
+use litebox::mm::linux::{MmapError, ProtectError, RemapError, UnmapError, VmFlags, VmemBackend};
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::{
@@ -72,9 +72,14 @@ pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
 }
 
 impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
-    unsafe fn map_pages(&mut self, start: usize, _len: usize, _flags: VmFlags) -> Option<usize> {
+    unsafe fn map_pages(
+        &mut self,
+        _start: usize,
+        _len: usize,
+        _flags: VmFlags,
+    ) -> Result<(), MmapError> {
         // leave it to page fault handler
-        Some(start)
+        Ok(())
     }
 
     /// Unmap 4KiB pages from the page table

@@ -1,7 +1,8 @@
 use litebox::{
     mm::{
         linux::{
-            PAGE_SIZE, PageRange, ProtectError, RemapError, UnmapError, VmFlags, Vmem, VmemBackend,
+            MmapError, PAGE_SIZE, PageRange, ProtectError, RemapError, UnmapError, VmFlags, Vmem,
+            VmemBackend,
         },
         mapping::{MappingError, MappingProvider},
     },
@@ -30,7 +31,12 @@ fn vmflags_to_prots(flags: VmFlags) -> nix::sys::mman::ProtFlags {
 }
 
 impl VmemBackend for UserMemBackend {
-    unsafe fn map_pages(&mut self, start: usize, len: usize, flags: VmFlags) -> Option<usize> {
+    unsafe fn map_pages(
+        &mut self,
+        start: usize,
+        len: usize,
+        flags: VmFlags,
+    ) -> Result<(), MmapError> {
         unsafe {
             nix::sys::mman::mmap_anonymous(
                 Some(core::num::NonZeroUsize::new(start).expect("non null addr")),
@@ -41,8 +47,8 @@ impl VmemBackend for UserMemBackend {
                     | nix::sys::mman::MapFlags::MAP_FIXED,
             )
         }
-        .map(|addr| addr.as_ptr() as usize)
-        .ok()
+        .expect("mmap failed");
+        Ok(())
     }
 
     unsafe fn unmap_pages(&mut self, start: usize, len: usize) -> Result<(), UnmapError> {

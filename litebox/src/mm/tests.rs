@@ -4,16 +4,21 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::linux::{
-    NonZeroPageSize, PAGE_SIZE, PageRange, ProtectError, RemapError, UnmapError, VmArea, VmFlags,
-    Vmem, VmemBackend, VmemProtectError, VmemResizeError,
+    MmapError, NonZeroPageSize, PAGE_SIZE, PageRange, ProtectError, RemapError, UnmapError, VmArea,
+    VmFlags, Vmem, VmemBackend, VmemProtectError, VmemResizeError,
 };
 
 /// A dummy implementation of [`VmemBackend`] that does nothing.
 struct DummyVmemBackend;
 
 impl VmemBackend for DummyVmemBackend {
-    unsafe fn map_pages(&mut self, start: usize, len: usize, flags: VmFlags) -> Option<usize> {
-        Some(start)
+    unsafe fn map_pages(
+        &mut self,
+        start: usize,
+        len: usize,
+        flags: VmFlags,
+    ) -> Result<(), MmapError> {
+        Ok(())
     }
 
     unsafe fn unmap_pages(&mut self, start: usize, len: usize) -> Result<(), UnmapError> {

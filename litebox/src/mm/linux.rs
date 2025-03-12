@@ -236,9 +236,7 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
                     .ok()?;
             }
         }
-        assert_eq!(start, unsafe {
-            self.backend.map_pages(start, end - start, vma.flags)?
-        });
+        unsafe { self.backend.map_pages(start, end - start, vma.flags) }.ok()?;
         self.vmas.insert(start..end, vma);
         Some(start)
     }
@@ -515,7 +513,12 @@ pub trait VmemBackend {
     /// # Safety
     ///
     /// The caller must ensure that the memory region is not used by any other.
-    unsafe fn map_pages(&mut self, start: usize, len: usize, flags: VmFlags) -> Option<usize>;
+    unsafe fn map_pages(
+        &mut self,
+        start: usize,
+        len: usize,
+        flags: VmFlags,
+    ) -> Result<(), MmapError>;
 
     /// Unmap `ALIGN`-aligned memory region from `start` to `start` + `len`
     ///
@@ -550,6 +553,14 @@ pub trait VmemBackend {
         len: usize,
         new_flags: VmFlags,
     ) -> Result<(), ProtectError>;
+}
+
+/// Error for [`VmemBackend::map_pages`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum MmapError {
+    #[error("{0:#x} is not aligned")]
+    MisAligned(usize),
 }
 
 #[derive(Error, Debug)]
