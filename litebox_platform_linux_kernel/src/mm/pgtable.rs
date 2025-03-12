@@ -1,9 +1,9 @@
-use litebox::mm::vm::VmemBackend;
-use sealed::sealed;
+use litebox::mm::linux::VmemBackend;
 use thiserror::Error;
+use x86_64::structures::paging::PageSize;
 
 use crate::arch::{
-    PAGE_SIZE, Page, PageFaultErrorCode, PageTableFlags, PhysAddr, PhysFrame, Size4KiB, VirtAddr,
+    Page, PageFaultErrorCode, PageTableFlags, PhysAddr, PhysFrame, Size4KiB, VirtAddr,
 };
 
 /// Page table allocator
@@ -33,7 +33,11 @@ impl<M: super::MemoryProvider> PageTableAllocator<M> {
         M::mem_allocate_pages(0).map(|addr| {
             if clear {
                 unsafe {
-                    core::intrinsics::write_bytes(addr, 0, PAGE_SIZE);
+                    core::intrinsics::write_bytes(
+                        addr,
+                        0,
+                        usize::try_from(Size4KiB::SIZE).unwrap(),
+                    );
                 }
             }
             PhysFrame::from_start_address(M::make_pa_private(M::va_to_pa(VirtAddr::new(
@@ -44,7 +48,6 @@ impl<M: super::MemoryProvider> PageTableAllocator<M> {
     }
 }
 
-#[sealed(pub(crate))]
 pub trait PageTableImpl: VmemBackend {
     /// Flags that `mprotect` can change:
     /// [`PageTableFlags::WRITABLE`] | [`PageTableFlags::USER_ACCESSIBLE`] | [`PageTableFlags::NO_EXECUTE`]
@@ -67,12 +70,10 @@ pub trait PageTableImpl: VmemBackend {
 
     /// Handle page fault
     ///
-    /// `flush` indicates whether the TLB should be flushed after the page fault is handled.
     /// `flags` presents the PTE flags to be set for the page.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that the `p` is valid and properly aligned.
     /// The caller must also ensure that the `page` is valid and user has
     /// access to it.
     unsafe fn handle_page_fault(

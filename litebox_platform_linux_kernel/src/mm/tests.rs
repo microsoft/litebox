@@ -4,19 +4,18 @@ use core::{
 };
 
 use crate::arch::{
-    MappedFrame, Page, PageFaultErrorCode, PageSize, PageTableFlags, PhysAddr, Size4KiB,
-    TranslateResult, VirtAddr, mm::paging::vmflags_to_pteflags,
+    MappedFrame, Page, PageFaultErrorCode, PageTableFlags, PhysAddr, Size4KiB, TranslateResult,
+    VirtAddr, mm::paging::vmflags_to_pteflags,
 };
 use alloc::vec;
 use alloc::vec::Vec;
 use arrayvec::ArrayVec;
-use litebox::mm::vm::{PageRange, VmArea, VmFlags, VmemBackend};
-use sealed::sealed;
+use litebox::mm::linux::{PAGE_SIZE, PageRange, VmArea, VmFlags, VmemBackend};
 use spin::mutex::SpinMutex;
 
 use crate::{
     HostInterface, LinuxKernel,
-    arch::{PAGE_SIZE, mm::paging::X64PageTable},
+    arch::mm::paging::X64PageTable,
     host::mock::MockHostInterface,
     mm::{
         MemoryProvider,
@@ -34,7 +33,6 @@ static ALLOCATOR: SafeZoneAllocator<'static, MAX_ORDER, MockKernel> = SafeZoneAl
 /// const Array for VA to PA mapping
 static MAPPING: SpinMutex<ArrayVec<VirtAddr, 1024>> = SpinMutex::new(ArrayVec::new_const());
 
-#[sealed]
 impl super::MemoryProvider for MockKernel {
     const GVA_OFFSET: super::VirtAddr = super::VirtAddr::new(0);
     const PRIVATE_PTE_MASK: u64 = 0;
@@ -69,13 +67,13 @@ impl super::MemoryProvider for MockKernel {
     fn va_to_pa(va: VirtAddr) -> PhysAddr {
         let idx = MAPPING.lock().iter().position(|x| *x == va);
         assert!(idx.is_some());
-        PhysAddr::new(idx.unwrap() as u64 * Size4KiB::SIZE + 0x1000_0000)
+        PhysAddr::new((idx.unwrap() * PAGE_SIZE + 0x1000_0000) as u64)
     }
 
     fn pa_to_va(pa: PhysAddr) -> VirtAddr {
         let mapping = MAPPING.lock();
-        let idx = (pa.as_u64() - 0x1000_0000) / Size4KiB::SIZE;
-        let va = mapping.get(idx as usize);
+        let idx = (pa.as_u64() - 0x1000_0000) / PAGE_SIZE as u64;
+        let va = mapping.get(usize::try_from(idx).unwrap());
         assert!(va.is_some());
         let va = *va.unwrap();
         if va.is_null() {
@@ -123,13 +121,13 @@ fn check_flags(pgtable: &X64PageTable<'_, MockKernel>, addr: usize, flags: PageT
 }
 
 fn get_test_pgtable<'a>(
-    range: PageRange,
+    range: PageRange<PAGE_SIZE>,
     fault_flags: PageTableFlags,
 ) -> X64PageTable<'a, MockKernel> {
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
     let mut pgtable = unsafe { X64PageTable::<MockKernel>::init(p4.start_address()) };
 
-    for page in range.clone() {
+    for page in range {
         unsafe {
             pgtable
                 .handle_page_fault(
@@ -153,7 +151,7 @@ fn test_page_table() {
     let start_addr: usize = 0x1000;
     let vmflags = VmFlags::VM_READ;
     let pteflags = vmflags_to_pteflags(vmflags) | PageTableFlags::PRESENT;
-    let range = PageRange::new(start_addr, start_addr + 4 * PAGE_SIZE);
+    let range = PageRange::new(start_addr, start_addr + 4 * PAGE_SIZE).unwrap();
     let mut pgtable = get_test_pgtable(range, pteflags);
 
     // update flags
@@ -166,10 +164,11 @@ fn test_page_table() {
                 .is_ok()
         );
     }
-    for page in PageRange::<PAGE_SIZE>::new(start_addr, start_addr + 2 * PAGE_SIZE) {
+    for page in PageRange::<PAGE_SIZE>::new(start_addr, start_addr + 2 * PAGE_SIZE).unwrap() {
         check_flags(&pgtable, page, pteflags);
     }
-    for page in PageRange::<PAGE_SIZE>::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE)
+    for page in
+        PageRange::<PAGE_SIZE>::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap()
     {
         check_flags(&pgtable, page, new_pteflags);
     }
@@ -183,21 +182,21 @@ fn test_page_table() {
                 .is_ok()
         );
     }
-    for page in PageRange::<PAGE_SIZE>::new(start_addr, start_addr + 2 * PAGE_SIZE) {
+    for page in PageRange::<PAGE_SIZE>::new(start_addr, start_addr + 2 * PAGE_SIZE).unwrap() {
         assert!(matches!(
             pgtable.translate(VirtAddr::new(page as _)),
             TranslateResult::NotMapped
         ));
     }
-    for page in PageRange::<PAGE_SIZE>::new(new_addr, new_addr + 2 * PAGE_SIZE) {
+    for page in PageRange::<PAGE_SIZE>::new(new_addr, new_addr + 2 * PAGE_SIZE).unwrap() {
         check_flags(&pgtable, page, pteflags);
     }
 
     // unmap all pages
     unsafe {
-        pgtable.unmap_pages(start_addr, new_addr - start_addr + 4 * PAGE_SIZE, true);
+        pgtable.unmap_pages(start_addr, new_addr - start_addr + 4 * PAGE_SIZE);
     }
-    for page in PageRange::<PAGE_SIZE>::new(start_addr, new_addr + 4 * PAGE_SIZE) {
+    for page in PageRange::<PAGE_SIZE>::new(start_addr, new_addr + 4 * PAGE_SIZE).unwrap() {
         assert!(matches!(
             pgtable.translate(VirtAddr::new(page as _)),
             TranslateResult::NotMapped
@@ -205,7 +204,9 @@ fn test_page_table() {
     }
 }
 
-fn collect_mappings(vmm: &KernelVmem<X64PageTable<'_, MockKernel>>) -> Vec<Range<usize>> {
+fn collect_mappings(
+    vmm: &KernelVmem<X64PageTable<'_, MockKernel>, PAGE_SIZE>,
+) -> Vec<Range<usize>> {
     vmm.iter().map(|v| v.0.start..v.0.end).collect()
 }
 
@@ -214,12 +215,14 @@ fn test_vmm_page_fault() {
     let start_addr: usize = 0x1000;
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
     let mut vmm = unsafe { KernelVmem::new(p4.start_address()) };
-    vmm.insert_mapping(
-        PageRange::new(start_addr, start_addr + 4 * PAGE_SIZE),
-        VmArea::new(
-            VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE,
-        ),
-    );
+    unsafe {
+        vmm.insert_mapping(
+            PageRange::new(start_addr, start_addr + 4 * PAGE_SIZE).unwrap(),
+            VmArea::new(
+                VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE,
+            ),
+        );
+    }
     // [0x1000, 0x5000)
 
     // Access page w/o mapping
@@ -244,16 +247,18 @@ fn test_vmm_page_fault() {
 
     // insert stack mapping
     let stack_addr: usize = 0x1000_0000;
-    vmm.insert_mapping(
-        PageRange::new(stack_addr, stack_addr + 4 * PAGE_SIZE),
-        VmArea::new(
-            VmFlags::VM_READ
-                | VmFlags::VM_WRITE
-                | VmFlags::VM_MAYREAD
-                | VmFlags::VM_MAYWRITE
-                | VmFlags::VM_GROWSDOWN,
-        ),
-    );
+    unsafe {
+        vmm.insert_mapping(
+            PageRange::new(stack_addr, stack_addr + 4 * PAGE_SIZE).unwrap(),
+            VmArea::new(
+                VmFlags::VM_READ
+                    | VmFlags::VM_WRITE
+                    | VmFlags::VM_MAYREAD
+                    | VmFlags::VM_MAYWRITE
+                    | VmFlags::VM_GROWSDOWN,
+            ),
+        );
+    }
     // [0x1000, 0x5000), [0x1000_0000, 0x1000_4000)
     // Test stack growth
     assert!(

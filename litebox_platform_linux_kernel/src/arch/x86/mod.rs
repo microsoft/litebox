@@ -4,7 +4,7 @@ pub(crate) use x86_64::{
     addr::{PhysAddr, VirtAddr},
     structures::{
         idt::PageFaultErrorCode,
-        paging::{Page, PageSize, PageTableFlags, PhysFrame, Size4KiB},
+        paging::{Page, PageTableFlags, PhysFrame, Size4KiB},
     },
 };
 

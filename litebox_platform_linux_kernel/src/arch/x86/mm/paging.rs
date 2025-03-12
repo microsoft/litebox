@@ -1,5 +1,4 @@
-use litebox::mm::vm::{ProtectError, RemapError, VmFlags, VmemBackend};
-use sealed::sealed;
+use litebox::mm::linux::{ProtectError, RemapError, VmFlags, VmemBackend};
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::{
@@ -16,7 +15,7 @@ use x86_64::{
 
 use crate::mm::{
     MemoryProvider,
-    pgtable::{__seal_page_table_impl, PageFaultError, PageTableAllocator, PageTableImpl},
+    pgtable::{PageFaultError, PageTableAllocator, PageTableImpl},
 };
 
 #[cfg(not(test))]
@@ -72,7 +71,7 @@ pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
 }
 
 impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
-    fn map_pages(&mut self, start: usize, _len: usize, _flags: VmFlags) -> Option<usize> {
+    unsafe fn map_pages(&mut self, start: usize, _len: usize, _flags: VmFlags) -> Option<usize> {
         // leave it to page fault handler
         Some(start)
     }
@@ -81,11 +80,10 @@ impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
     ///
     /// Note it does not free the allocated frames for page table itself (only those allocated to
     /// user space).
-    unsafe fn unmap_pages(&mut self, va: usize, len: usize, free_page: bool) {
+    unsafe fn unmap_pages(&mut self, va: usize, len: usize) {
         let va = VirtAddr::new(va as _);
         assert!(va.is_aligned(Size4KiB::SIZE));
         assert!(len as u64 % Size4KiB::SIZE == 0);
-
         let start = Page::<Size4KiB>::from_start_address(va).unwrap();
         let end = Page::<Size4KiB>::from_start_address(va + len as _).unwrap();
         let mut allocator = PageTableAllocator::<M>::new();
@@ -95,9 +93,7 @@ impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
         for page in Page::range(start, end) {
             match self.inner.unmap(page) {
                 Ok((frame, fl)) => {
-                    if free_page {
-                        unsafe { allocator.deallocate_frame(frame) };
-                    }
+                    unsafe { allocator.deallocate_frame(frame) };
                     if FLUSH_TLB {
                         fl.flush();
                     }
@@ -240,7 +236,6 @@ impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
     }
 }
 
-#[sealed]
 impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
     unsafe fn init(p4: PhysAddr) -> Self {
         assert!(p4.is_aligned(Size4KiB::SIZE));

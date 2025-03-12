@@ -19,7 +19,6 @@ libc = "0.2.169"
 arrayvec = { version = "0.7.6", default-features = false }
 rangemap = { version = "1.5.1", features = ["const_fn"] }
 thiserror = { version = "2.0.6", default-features = false }
-sealed = "0.6.0"
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }

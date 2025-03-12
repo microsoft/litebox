@@ -1,10 +1,10 @@
 use core::ops::Range;
 
-use litebox::mm::vm::{PageRange, VmArea, VmFlags, Vmem};
+use litebox::mm::linux::{PAGE_SIZE, PageRange, VmArea, VmFlags, Vmem};
 
 use crate::{
     arch::{
-        PAGE_SIZE, Page, PageFaultErrorCode, PhysAddr, VirtAddr,
+        Page, PageFaultErrorCode, PhysAddr, VirtAddr,
         mm::paging::{X64PageTable, vmflags_to_pteflags},
     },
     host::SnpLinuxKenrel,
@@ -13,11 +13,11 @@ use crate::{
 use super::pgtable::{PageFaultError, PageTableImpl};
 
 /// Virtual memory manager in Kernel that uses `PageTableImpl` as the backend.
-pub struct KernelVmem<PT: PageTableImpl> {
-    inner: Vmem<PT>,
+pub struct KernelVmem<PT: PageTableImpl, const ALIGN: usize> {
+    inner: Vmem<PT, ALIGN>,
 }
 
-impl<PT: PageTableImpl> KernelVmem<PT> {
+impl<PT: PageTableImpl, const ALIGN: usize> KernelVmem<PT, ALIGN> {
     const STACK_GUARD_GAP: usize = 256 << 12;
 
     /// Create a new `KernelVmem` instance with the physical address of a page table.
@@ -27,30 +27,40 @@ impl<PT: PageTableImpl> KernelVmem<PT> {
     /// The caller must ensure that the `p` is a valid address of a top-level page table.
     pub unsafe fn new(p: PhysAddr) -> Self {
         KernelVmem {
-            inner: Vmem::<PT>::new(unsafe { PT::init(p) }),
+            inner: Vmem::<PT, ALIGN>::new(unsafe { PT::init(p) }),
         }
     }
 
+    /// Get the page table
     pub fn get_pgtable(&self) -> &PT {
-        self.inner.get_backend()
+        &self.inner.backend
     }
 
+    /// Gets an iterator over the mappings in the virtual memory manager,
+    /// ordered by the address of the mappings.
     pub fn iter(&self) -> impl Iterator<Item = (&Range<usize>, &VmArea)> {
         self.inner.iter()
     }
 
-    /// See [`Vmem::insert_mapping`] for details.
-    pub fn insert_mapping(&mut self, range: PageRange, vma: VmArea) {
-        self.inner.insert_mapping(range, vma);
+    /// Insert a range to its virtual address space.
+    ///
+    /// # Safety
+    ///
+    /// See [`Vmem::insert_mapping`] for more details.
+    pub unsafe fn insert_mapping(&mut self, range: PageRange<ALIGN>, vma: VmArea) {
+        unsafe { self.inner.insert_mapping(range, vma) };
     }
 
+    /// Handle a page fault for the given address.
     pub fn handle_page_fault(
         &mut self,
         fault_addr: usize,
         error_code: PageFaultErrorCode,
     ) -> Result<(), PageFaultError> {
-        let fault_addr = fault_addr & !(PAGE_SIZE - 1);
-        if !(Vmem::<PT>::TASK_ADDR_MIN..Vmem::<PT>::TASK_ADDR_MAX).contains(&fault_addr) {
+        let fault_addr = fault_addr & !(ALIGN - 1);
+        if !(Vmem::<PT, ALIGN>::TASK_ADDR_MIN..Vmem::<PT, ALIGN>::TASK_ADDR_MAX)
+            .contains(&fault_addr)
+        {
             return Err(PageFaultError::AccessError("Invalid address"));
         }
 
@@ -58,7 +68,7 @@ impl<PT: PageTableImpl> KernelVmem<PT> {
         let (start, vma) = {
             let (r, vma) = self
                 .inner
-                .overlapping(fault_addr..Vmem::<PT>::TASK_ADDR_MAX)
+                .overlapping(fault_addr..Vmem::<PT, ALIGN>::TASK_ADDR_MAX)
                 .next()
                 .ok_or(PageFaultError::AccessError("no mapping"))?;
             (r.start, *vma)
@@ -71,7 +81,7 @@ impl<PT: PageTableImpl> KernelVmem<PT> {
 
             if !self
                 .inner
-                .overlapping(Vmem::<PT>::TASK_ADDR_MIN..fault_addr)
+                .overlapping(Vmem::<PT, ALIGN>::TASK_ADDR_MIN..fault_addr)
                 .next_back()
                 .is_none_or(|(prev_range, prev_vma)| {
                     // Enforce gap between stack and other preceding non-stack mappings.
@@ -84,8 +94,10 @@ impl<PT: PageTableImpl> KernelVmem<PT> {
             {
                 return Err(PageFaultError::AllocationFailed);
             }
-            self.inner
-                .insert_mapping(PageRange::new(fault_addr, start), vma);
+            unsafe {
+                self.inner
+                    .insert_mapping(PageRange::new_unchecked(fault_addr, start), vma)
+            };
         }
 
         if Self::access_error(error_code, vma.flags()) {
@@ -93,7 +105,7 @@ impl<PT: PageTableImpl> KernelVmem<PT> {
         }
 
         unsafe {
-            self.inner.get_inner_mut().handle_page_fault(
+            self.inner.backend.handle_page_fault(
                 Page::containing_address(VirtAddr::new(fault_addr as u64)),
                 vmflags_to_pteflags(vma.flags()),
                 error_code,
@@ -124,4 +136,4 @@ impl<PT: PageTableImpl> KernelVmem<PT> {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub type KernelVmemX64 = KernelVmem<X64PageTable<'static, SnpLinuxKenrel>>;
+pub type KernelVmemX64 = KernelVmem<X64PageTable<'static, SnpLinuxKenrel>, PAGE_SIZE>;

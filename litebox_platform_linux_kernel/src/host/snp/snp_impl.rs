@@ -22,7 +22,6 @@ type ArgsArray = [u64; MAX_ARGS_SIZE];
 #[cfg(not(test))]
 mod alloc {
     use crate::HostInterface;
-    use sealed::sealed;
 
     const HEAP_ORDER: usize = super::bindings::SNP_VMPL_ALLOC_MAX_ORDER as usize + 12 + 1;
     const PGDIR_SHIFT: u64 = 39;
@@ -36,7 +35,6 @@ mod alloc {
         super::SnpLinuxKenrel,
     > = crate::mm::alloc::SafeZoneAllocator::new();
 
-    #[sealed]
     impl crate::mm::MemoryProvider for super::SnpLinuxKenrel {
         const GVA_OFFSET: crate::arch::VirtAddr = crate::arch::VirtAddr::new(LITEBOX_PAGE_OFFSET);
         const PRIVATE_PTE_MASK: u64 = 1 << 51; // SNP encryption bit
