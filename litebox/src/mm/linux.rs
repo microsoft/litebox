@@ -513,15 +513,11 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
 }
 
 pub trait VmemBackend {
-    /// Map/Allocate `ALIGN`-aligned pages at the fixed address `start` with `flags`
+    /// Map/Allocate pages at the fixed address `start` with `flags`
     ///
     /// # Safety
     ///
     /// The caller must ensure that the memory region is not used by any other.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `start` or `len` is not aligned to `ALIGN`.
     unsafe fn map_pages(&mut self, start: usize, len: usize, flags: VmFlags) -> Option<usize>;
 
     /// Unmap `ALIGN`-aligned memory region from `start` to `start` + `len`
@@ -531,17 +527,13 @@ pub trait VmemBackend {
     /// The caller must ensure that the memory region is not used by any other.
     unsafe fn unmap_pages(&mut self, start: usize, len: usize) -> Result<(), UnmapError>;
 
-    /// Remap `ALIGN`-aligned pages from `old_addr` to `new_addr`
+    /// Remap the given memory from `old_addr` to `new_addr`
     ///
     /// # Safety
     ///
     /// The caller must ensure that the [`old_addr`, `old_addr` + `old_len`] is safe to be unmapped,
     /// and [`new_addr`, `new_addr` + `new_len`] is not already mapped.
     /// Also, these two regions can not overlap.
-    ///
-    /// # Panics
-    ///
-    /// `old_addr`, `new_addr`, `old_len`, and `new_len` must be aligned to 4KiB.
     unsafe fn remap_pages(
         &mut self,
         old_addr: usize,
@@ -550,7 +542,7 @@ pub trait VmemBackend {
         new_len: usize,
     ) -> Result<(), RemapError>;
 
-    /// Change the protection for `ALIGN`-aligned memory region from `start` to `start` + `len`
+    /// Change the protection for the given memory from `start` to `start` + `len`
     ///
     /// # Safety
     ///
@@ -572,8 +564,8 @@ pub enum VmemUnmapError {
 /// Error for [`VmemBackend::unmap_pages`]
 #[derive(Error, Debug)]
 pub enum UnmapError {
-    #[error("{val:#x} is not aligned to {align:#x}")]
-    MisAligned { val: usize, align: usize },
+    #[error("{0:#x} is not aligned")]
+    MisAligned(usize),
 }
 
 /// Error for [`Vmem::resize_mapping`]
@@ -599,8 +591,8 @@ pub enum VmemMoveError {
 /// Error for [`VmemBackend::remap_pages`]
 #[derive(Error, Debug)]
 pub enum RemapError {
-    #[error("{val:#x} is not aligned to {align:#x}")]
-    MisAligned { val: usize, align: usize },
+    #[error("{0:#x} is not aligned")]
+    MisAligned(usize),
     #[error("out of memory")]
     OutOfMemory,
     #[error("remap to huge page")]

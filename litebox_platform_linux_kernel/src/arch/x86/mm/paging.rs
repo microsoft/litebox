@@ -84,16 +84,9 @@ impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
     unsafe fn unmap_pages(&mut self, start: usize, len: usize) -> Result<(), UnmapError> {
         let va = VirtAddr::new(start as _);
         let start =
-            Page::<Size4KiB>::from_start_address(va).map_err(|_| UnmapError::MisAligned {
-                val: start,
-                align: 4096,
-            })?;
-        let end = Page::<Size4KiB>::from_start_address(va + len as _).map_err(|_| {
-            UnmapError::MisAligned {
-                val: len,
-                align: 4096,
-            }
-        })?;
+            Page::<Size4KiB>::from_start_address(va).map_err(|_| UnmapError::MisAligned(start))?;
+        let end = Page::<Size4KiB>::from_start_address(va + len as _)
+            .map_err(|_| UnmapError::MisAligned(len))?;
         let mut allocator = PageTableAllocator::<M>::new();
 
         // Note this implementation is slow as each page requires a full page table walk.
@@ -125,19 +118,20 @@ impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
         old_len: usize,
         new_len: usize,
     ) -> Result<(), RemapError> {
-        let old_addr = VirtAddr::new(old_addr as _);
-        let new_addr = VirtAddr::new(new_addr as _);
-        assert!(old_addr.is_aligned(Size4KiB::SIZE));
-        assert!(new_addr.is_aligned(Size4KiB::SIZE));
-        assert!(old_len as u64 % Size4KiB::SIZE == 0);
-        assert!(new_len as u64 % Size4KiB::SIZE == 0);
+        if new_len as u64 % Size4KiB::SIZE != 0 {
+            return Err(RemapError::MisAligned(new_len));
+        }
+        let mut start: Page<Size4KiB> = Page::from_start_address(VirtAddr::new(old_addr as _))
+            .map_err(|_| RemapError::MisAligned(old_addr))?;
+        let mut new_start: Page<Size4KiB> = Page::from_start_address(VirtAddr::new(new_addr as _))
+            .map_err(|_| RemapError::MisAligned(new_addr))?;
+        let end: Page<Size4KiB> =
+            Page::from_start_address(VirtAddr::new((old_addr + old_len) as u64))
+                .map_err(|_| RemapError::MisAligned(old_len))?;
 
         // Note this implementation is slow as each page requires three full page table walks.
         // If we have N pages, it will be 3N times slower.
         let mut allocator = PageTableAllocator::<M>::new();
-        let mut start: Page<Size4KiB> = Page::from_start_address(old_addr).unwrap();
-        let mut new_start: Page<Size4KiB> = Page::from_start_address(new_addr).unwrap();
-        let end: Page<Size4KiB> = Page::from_start_address(old_addr + old_len as _).unwrap();
         while start < end {
             match self.inner.translate(start.start_address()) {
                 TranslateResult::Mapped {

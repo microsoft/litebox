@@ -47,16 +47,10 @@ impl VmemBackend for UserMemBackend {
 
     unsafe fn unmap_pages(&mut self, start: usize, len: usize) -> Result<(), UnmapError> {
         if start % PAGE_SIZE != 0 {
-            return Err(UnmapError::MisAligned {
-                val: start,
-                align: PAGE_SIZE,
-            });
+            return Err(UnmapError::MisAligned(start));
         }
         if len % PAGE_SIZE != 0 {
-            return Err(UnmapError::MisAligned {
-                val: len,
-                align: PAGE_SIZE,
-            });
+            return Err(UnmapError::MisAligned(len));
         }
         unsafe {
             nix::sys::mman::munmap(
@@ -75,6 +69,18 @@ impl VmemBackend for UserMemBackend {
         old_len: usize,
         new_len: usize,
     ) -> Result<(), RemapError> {
+        if old_addr % PAGE_SIZE != 0 {
+            return Err(RemapError::MisAligned(old_addr));
+        }
+        if new_addr % PAGE_SIZE != 0 {
+            return Err(RemapError::MisAligned(new_addr));
+        }
+        if old_len % PAGE_SIZE != 0 {
+            return Err(RemapError::MisAligned(old_len));
+        }
+        if new_len % PAGE_SIZE != 0 {
+            return Err(RemapError::MisAligned(new_len));
+        }
         let res = unsafe {
             nix::sys::mman::mremap(
                 core::ptr::NonNull::new(old_addr as _).expect("non null addr"),
