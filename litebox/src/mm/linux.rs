@@ -223,14 +223,11 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
     ///
     /// The caller must ensure that the memory region is not used by any other (i.e., safe
     /// to unmap all overlapping mappings if any).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the range is beyond the task address space [[`Self::TASK_ADDR_MIN`], [`Self::TASK_ADDR_MAX`]]).
     pub unsafe fn insert_mapping(&mut self, range: PageRange<ALIGN>, vma: VmArea) -> Option<usize> {
         let (start, end) = (range.start, range.end);
-        assert!(start >= Self::TASK_ADDR_MIN);
-        assert!(end <= Self::TASK_ADDR_MAX);
+        if start < Self::TASK_ADDR_MIN || end > Self::TASK_ADDR_MAX {
+            return None;
+        }
         for (r, _) in self.vmas.overlapping(start..end) {
             let intersection = r.start.max(start)..r.end.min(end);
             unsafe {
