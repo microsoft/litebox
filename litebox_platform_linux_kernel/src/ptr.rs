@@ -81,11 +81,3 @@ impl<T> From<usize> for UserMutPtr<T> {
         }
     }
 }
-
-impl<T> From<usize> for UserConstPtr<T> {
-    fn from(addr: usize) -> Self {
-        Self {
-            inner: addr as *const T,
-        }
-    }
-}

@@ -1,35 +1,34 @@
 use litebox::{
     mm::{
-        mapping::MappingProvider,
-        vm::{Vmem, VmemBackend},
+        linux::{PageRange, ProtectError, RemapError, VmFlags, Vmem, VmemBackend},
+        mapping::{MappingError, MappingProvider},
     },
     platform::trivial_providers::TransparentMutPtr,
 };
 use nix::sys::mman::MRemapFlags;
 
+/// Memory backend for user space
+///
+/// This backend uses syscalls (e.g., mmap, munmap) to manage memory.
 struct UserMemBackend;
 
-fn vmflags_to_prots(flags: litebox::mm::vm::VmFlags) -> nix::sys::mman::ProtFlags {
+/// Convert [`VmFlags`] to [`nix::sys::mman::ProtFlags`].
+fn vmflags_to_prots(flags: VmFlags) -> nix::sys::mman::ProtFlags {
     let mut mmap_prot = nix::sys::mman::ProtFlags::PROT_NONE;
-    if flags.contains(litebox::mm::vm::VmFlags::VM_READ) {
+    if flags.contains(VmFlags::VM_READ) {
         mmap_prot |= nix::sys::mman::ProtFlags::PROT_READ;
     }
-    if flags.contains(litebox::mm::vm::VmFlags::VM_WRITE) {
+    if flags.contains(VmFlags::VM_WRITE) {
         mmap_prot |= nix::sys::mman::ProtFlags::PROT_WRITE;
     }
-    if flags.contains(litebox::mm::vm::VmFlags::VM_EXEC) {
+    if flags.contains(VmFlags::VM_EXEC) {
         mmap_prot |= nix::sys::mman::ProtFlags::PROT_EXEC;
     }
     mmap_prot
 }
 
 impl VmemBackend for UserMemBackend {
-    fn map_pages(
-        &mut self,
-        start: usize,
-        len: usize,
-        flags: litebox::mm::vm::VmFlags,
-    ) -> Option<usize> {
+    unsafe fn map_pages(&mut self, start: usize, len: usize, flags: VmFlags) -> Option<usize> {
         unsafe {
             nix::sys::mman::mmap_anonymous(
                 Some(core::num::NonZeroUsize::new(start).unwrap()),
@@ -44,7 +43,7 @@ impl VmemBackend for UserMemBackend {
         .ok()
     }
 
-    unsafe fn unmap_pages(&mut self, start: usize, len: usize, _free_page: bool) {
+    unsafe fn unmap_pages(&mut self, start: usize, len: usize) {
         unsafe {
             nix::sys::mman::munmap(core::ptr::NonNull::new(start as _).unwrap(), len).unwrap();
         }
@@ -56,7 +55,7 @@ impl VmemBackend for UserMemBackend {
         new_addr: usize,
         old_len: usize,
         new_len: usize,
-    ) -> Result<(), litebox::mm::vm::RemapError> {
+    ) -> Result<(), RemapError> {
         let res = unsafe {
             nix::sys::mman::mremap(
                 core::ptr::NonNull::new(old_addr as _).unwrap(),
@@ -75,8 +74,8 @@ impl VmemBackend for UserMemBackend {
         &mut self,
         start: usize,
         len: usize,
-        new_flags: litebox::mm::vm::VmFlags,
-    ) -> Result<(), litebox::mm::vm::ProtectError> {
+        new_flags: VmFlags,
+    ) -> Result<(), ProtectError> {
         unsafe {
             nix::sys::mman::mprotect(
                 core::ptr::NonNull::new(start as _).unwrap(),
@@ -89,11 +88,12 @@ impl VmemBackend for UserMemBackend {
     }
 }
 
-pub struct UserVmem {
-    inner: Vmem<UserMemBackend>,
+/// Virtual memory manager for user space
+pub struct UserVmem<const ALIGN: usize> {
+    inner: Vmem<UserMemBackend, ALIGN>,
 }
 
-impl UserVmem {
+impl<const ALIGN: usize> UserVmem<ALIGN> {
     pub fn new() -> Self {
         Self {
             inner: Vmem::new(UserMemBackend),
@@ -101,46 +101,55 @@ impl UserVmem {
     }
 }
 
-impl MappingProvider<TransparentMutPtr<u8>> for UserVmem {
-    fn create_executable_page<F>(
+impl<const ALIGN: usize> Default for UserVmem<ALIGN> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const ALIGN: usize> MappingProvider<TransparentMutPtr<u8>, ALIGN> for UserVmem<ALIGN> {
+    unsafe fn create_executable_page<F>(
         &mut self,
-        suggested_addr: Option<usize>,
-        len: usize,
+        suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
         op: F,
-    ) -> Result<usize, litebox::mm::mapping::MappingError>
+    ) -> Result<usize, MappingError>
     where
-        F: FnOnce(TransparentMutPtr<u8>) -> Result<usize, litebox::mm::mapping::MappingError>,
+        F: FnOnce(TransparentMutPtr<u8>) -> Result<usize, MappingError>,
     {
-        self.inner
-            .create_executable_page(suggested_addr, len, fixed_addr, op)
+        unsafe {
+            self.inner
+                .create_executable_page(suggested_range, fixed_addr, op)
+        }
     }
 
-    fn create_writable_page<F>(
+    unsafe fn create_writable_page<F>(
         &mut self,
-        suggested_addr: Option<usize>,
-        len: usize,
+        suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
         op: F,
-    ) -> Result<usize, litebox::mm::mapping::MappingError>
+    ) -> Result<usize, MappingError>
     where
-        F: FnOnce(TransparentMutPtr<u8>) -> Result<usize, litebox::mm::mapping::MappingError>,
+        F: FnOnce(TransparentMutPtr<u8>) -> Result<usize, MappingError>,
     {
-        self.inner
-            .create_writable_page(suggested_addr, len, fixed_addr, op)
+        unsafe {
+            self.inner
+                .create_writable_page(suggested_range, fixed_addr, op)
+        }
     }
 
-    fn create_readable_page<F>(
+    unsafe fn create_readable_page<F>(
         &mut self,
-        suggested_addr: Option<usize>,
-        len: usize,
+        suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
         op: F,
-    ) -> Result<usize, litebox::mm::mapping::MappingError>
+    ) -> Result<usize, MappingError>
     where
-        F: FnOnce(TransparentMutPtr<u8>) -> Result<usize, litebox::mm::mapping::MappingError>,
+        F: FnOnce(TransparentMutPtr<u8>) -> Result<usize, MappingError>,
     {
-        self.inner
-            .create_readable_page(suggested_addr, len, fixed_addr, op)
+        unsafe {
+            self.inner
+                .create_readable_page(suggested_range, fixed_addr, op)
+        }
     }
 }

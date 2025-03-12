@@ -83,6 +83,18 @@ impl<const ALIGN: usize> PageRange<ALIGN> {
     pub unsafe fn new_unchecked(start: usize, end: usize) -> Self {
         Self { start, end }
     }
+
+    /// Get the size of this `ALIGN`-aligned range
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// Whether the range is empty or not
+    /// 
+    /// Note this range is never empty.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
 }
 
 /// A non-zero 4KiB-page-aligned size in bytes.
@@ -232,6 +244,9 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
     /// Create a new mapping in the virtual address space.
     /// The mapping will be created at the suggested address. If the suggested start address is zero,
     /// some available range will be choosen by the kernel.
+    ///
+    /// Return `Some(new_addr)` if the mapping is created successfully.
+    /// The returned address is `ALIGN`-aligned.
     ///
     /// # Safety
     ///

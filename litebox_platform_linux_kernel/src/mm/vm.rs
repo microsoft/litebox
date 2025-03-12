@@ -1,8 +1,8 @@
 use core::ops::Range;
 
 use litebox::mm::{
-    mapping::MappingProvider,
     linux::{PAGE_SIZE, PageRange, VmArea, VmFlags, Vmem},
+    mapping::MappingProvider,
 };
 
 use crate::{
@@ -138,49 +138,54 @@ impl<PT: PageTableImpl, const ALIGN: usize> KernelVmem<PT, ALIGN> {
     }
 }
 
-impl<PT: PageTableImpl> MappingProvider<UserMutPtr<u8>> for KernelVmem<PT> {
-    fn create_executable_page<F>(
+impl<PT: PageTableImpl, const ALIGN: usize> MappingProvider<UserMutPtr<u8>, ALIGN>
+    for KernelVmem<PT, ALIGN>
+{
+    unsafe fn create_executable_page<F>(
         &mut self,
-        suggested_addr: Option<usize>,
-        len: usize,
+        suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
         op: F,
     ) -> Result<usize, litebox::mm::mapping::MappingError>
     where
         F: FnOnce(UserMutPtr<u8>) -> Result<usize, litebox::mm::mapping::MappingError>,
     {
-        self.inner
-            .create_executable_page(suggested_addr, len, fixed_addr, op)
+        unsafe {
+            self.inner
+                .create_executable_page(suggested_range, fixed_addr, op)
+        }
     }
 
-    fn create_writable_page<F>(
+    unsafe fn create_writable_page<F>(
         &mut self,
-        suggested_addr: Option<usize>,
-        len: usize,
+        suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
         op: F,
     ) -> Result<usize, litebox::mm::mapping::MappingError>
     where
         F: FnOnce(UserMutPtr<u8>) -> Result<usize, litebox::mm::mapping::MappingError>,
     {
-        self.inner
-            .create_writable_page(suggested_addr, len, fixed_addr, op)
+        unsafe {
+            self.inner
+                .create_writable_page(suggested_range, fixed_addr, op)
+        }
     }
 
-    fn create_readable_page<F>(
+    unsafe fn create_readable_page<F>(
         &mut self,
-        suggested_addr: Option<usize>,
-        len: usize,
+        suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
         op: F,
     ) -> Result<usize, litebox::mm::mapping::MappingError>
     where
         F: FnOnce(UserMutPtr<u8>) -> Result<usize, litebox::mm::mapping::MappingError>,
     {
-        self.inner
-            .create_readable_page(suggested_addr, len, fixed_addr, op)
+        unsafe {
+            self.inner
+                .create_readable_page(suggested_range, fixed_addr, op)
+        }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
-pub type KernelVmemX64 = KernelVmem<X64PageTable<'static, SnpLinuxKenrel>, PAGE_SIZE>;
+pub type KernelVmemX64 = KernelVmem<X64PageTable<'static, crate::host::SnpLinuxKenrel>, PAGE_SIZE>;
