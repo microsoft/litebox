@@ -1,8 +1,8 @@
-//! Error number constants.
+//! Generated code for the [`super::Errno`] constants.
 //!
-//! This particular module itself is private, but defines all the below associated constants within
-//! the public [`super::Errno`] type, so as to have them all be exposed, but still keep the auto-generated
-//! code restricted to this single file.
+//! This particular module itself is private, but defines all of the below within the public
+//! [`super::Errno`] type, so as to have them all be exposed, but still keep the auto-generated code
+//! restricted to this single file.
 
 /// The associated constants for [`super::Errno`] are generated using:
 /// ```sh

@@ -15,7 +15,7 @@
 
 use thiserror::Error;
 
-mod constants;
+mod generated;
 
 /// Linux error numbers
 ///
