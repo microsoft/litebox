@@ -21,7 +21,7 @@ mod generated;
 ///
 /// This is a transparent wrapper around Linux error numbers (i.e., `i32`s) intended
 /// to provide some type safety by expecting explicit conversions to/from `i32`s.
-#[derive(PartialEq, Eq, Clone, Copy, Debug, Error)]
+#[derive(PartialEq, Eq, Clone, Copy, Error)]
 pub struct Errno {
     value: core::num::NonZeroU8,
 }
@@ -35,6 +35,12 @@ impl From<Errno> for i32 {
 impl core::fmt::Display for Errno {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+impl core::fmt::Debug for Errno {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Errno({} = {})", self.value.get(), self.as_str())
     }
 }
 
