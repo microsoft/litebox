@@ -66,6 +66,8 @@ impl ElfObject for ElfFile {
     }
 }
 
+/// [`elf_loader::mmap::Mmap`] implementation for ELF loader
+/// using [`litebox::mm::mapping::MappingProvider`].
 struct ElfLoaderMmap;
 
 impl ElfLoaderMmap {
@@ -115,6 +117,10 @@ impl ElfLoaderMmap {
         file: &litebox::fd::FileFd,
         offset: usize,
     ) -> elf_loader::Result<usize> {
+        // TODO: we copy the file to the memory to support file-backed mmap.
+        // Loader may rely on `mmap`` instead of `mprotect` to change the memory protection,
+        // in which case the file is copied multiple times. To reduce the overhead, we
+        // could convert some `mmap` calls to `mprotect` calls whenever possible.
         let op = |ptr: MutPtr<u8>| -> Result<usize, MappingError> {
             ptr.mutate_subslice_with(..isize::try_from(len).unwrap(), |user_buf| {
                 // Loader code always runs before the program starts, so we can ensure
@@ -161,6 +167,9 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
                 }
             }
         } else {
+            // No file provided because it is a blob.
+            // Set `need_copy` so that the loader will copy the memory
+            // to the new address space.
             *need_copy = true;
             Self::do_mmap_anonymous(addr, len, prot, flags)?
         };
