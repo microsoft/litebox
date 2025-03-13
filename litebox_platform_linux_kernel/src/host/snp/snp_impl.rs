@@ -4,7 +4,7 @@ use core::arch::asm;
 
 use super::ghcb::ghcb_prints;
 use crate::{
-    HostInterface, error,
+    Errno, HostInterface,
     host::linux::{self, sigset_t},
     ptr::{UserConstPtr, UserMutPtr},
 };
@@ -47,7 +47,7 @@ mod alloc {
             unsafe { SNP_ALLOCATOR.free_pages(ptr, order) }
         }
 
-        fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
+        fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::Errno> {
             super::HostSnpInterface::alloc(layout)
         }
 
@@ -118,9 +118,7 @@ impl HostSnpInterface {
         }
     }
 
-    fn syscalls<const N: usize, const ID: u32>(
-        arg: SyscallN<N, ID>,
-    ) -> Result<usize, crate::error::Errno> {
+    fn syscalls<const N: usize, const ID: u32>(arg: SyscallN<N, ID>) -> Result<usize, Errno> {
         let mut args = [0; MAX_ARGS_SIZE];
         args[..N].copy_from_slice(&arg.args);
         let mut req = bindings::SnpVmplRequestArgs::new_request(
@@ -133,26 +131,26 @@ impl HostSnpInterface {
         Self::parse_result(req.ret)
     }
 
-    fn parse_result(res: u64) -> Result<usize, crate::error::Errno> {
+    fn parse_result(res: u64) -> Result<usize, Errno> {
         if is_err_value(res) {
             #[expect(clippy::cast_possible_wrap)]
             let v = res as i64;
-            Err(error::Errno::from_raw(i32::try_from(v.abs()).unwrap()))
+            Err(Errno::try_from(i32::try_from(v.abs()).unwrap()).unwrap())
         } else {
             Ok(usize::try_from(res).unwrap())
         }
     }
 
-    fn parse_alloc_result(order: u32, addr: u64) -> Result<usize, crate::error::Errno> {
+    fn parse_alloc_result(order: u32, addr: u64) -> Result<usize, Errno> {
         if addr == 0 {
             if order > bindings::SNP_VMPL_ALLOC_MAX_ORDER {
-                Err(error::Errno::EINVAL)
+                Err(Errno::EINVAL)
             } else {
-                Err(error::Errno::ENOMEM)
+                Err(Errno::ENOMEM)
             }
         } else if addr % (PAGE_SIZE << order) != 0 || addr > PHYS_ADDR_MAX - (PAGE_SIZE << order) {
             // Address is not aligned or out of bounds
-            Err(error::Errno::EINVAL)
+            Err(Errno::EINVAL)
         } else {
             Ok(usize::try_from(addr).unwrap())
         }
@@ -160,7 +158,7 @@ impl HostSnpInterface {
 }
 
 impl HostInterface for HostSnpInterface {
-    fn send_ip_packet(packet: &[u8]) -> Result<usize, crate::error::Errno> {
+    fn send_ip_packet(packet: &[u8]) -> Result<usize, Errno> {
         let mut req = bindings::SnpVmplRequestArgs::new_request(
             bindings::SNP_VMPL_TUN_WRITE_REQ,
             3,
@@ -170,7 +168,7 @@ impl HostInterface for HostSnpInterface {
         Self::parse_result(req.ret)
     }
 
-    fn receive_ip_packet(packet: &mut [u8]) -> Result<usize, crate::error::Errno> {
+    fn receive_ip_packet(packet: &mut [u8]) -> Result<usize, Errno> {
         let mut req = bindings::SnpVmplRequestArgs::new_request(
             bindings::SNP_VMPL_TUN_READ_REQ,
             3,
@@ -184,7 +182,7 @@ impl HostInterface for HostSnpInterface {
         ghcb_prints(msg);
     }
 
-    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), error::Errno> {
+    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), Errno> {
         // To reduce the number of hypercalls, we allocate the maximum order.
         // Assertion is added to prevent the allocation size from exceeding the maximum order.
         let size = core::cmp::max(
@@ -239,7 +237,7 @@ impl HostInterface for HostSnpInterface {
         set: UserConstPtr<sigset_t>,
         oldset: UserMutPtr<sigset_t>,
         sigsetsize: usize,
-    ) -> Result<usize, error::Errno> {
+    ) -> Result<usize, Errno> {
         // Instead of passing the user space pointers to host, here we perform extra read and write
         // and pass kernel pointers to host. As long as we don't have large data to deal with, this
         // scheme is more straightforward. Alternative solution from previous implementation requires
@@ -248,7 +246,7 @@ impl HostInterface for HostSnpInterface {
         let kset: Option<sigset_t> = if set.is_null() {
             None
         } else {
-            Some(set.from_user_at_offset(0).ok_or(error::Errno::EFAULT)?)
+            Some(set.from_user_at_offset(0).ok_or(Errno::EFAULT)?)
         };
         let mut koldset: Option<sigset_t> = if oldset.is_null() { None } else { Some(0) };
         let args = SyscallN::<4, NR_SYSCALL_RT_SIGPROCMASK> {
@@ -264,12 +262,12 @@ impl HostInterface for HostSnpInterface {
         };
         let r = Self::syscalls(args)?;
         if let Some(v) = koldset {
-            oldset.to_user_at_offset(0, v).ok_or(error::Errno::EFAULT)?;
+            oldset.to_user_at_offset(0, v).ok_or(Errno::EFAULT)?;
         }
         Ok(r)
     }
 
-    fn wake_many(mutex: &core::sync::atomic::AtomicU32, n: usize) -> Result<usize, error::Errno> {
+    fn wake_many(mutex: &core::sync::atomic::AtomicU32, n: usize) -> Result<usize, Errno> {
         // TODO: sandbox driver needs to be updated to accept a kernel pointer from the guest
         Self::syscalls(SyscallN::<6, NR_SYSCALL_FUTEX> {
             args: [mutex.as_ptr() as u64, FUTEX_WAKE as u64, n as u64, 0, 0, 0],
@@ -280,7 +278,7 @@ impl HostInterface for HostSnpInterface {
         mutex: &core::sync::atomic::AtomicU32,
         val: u32,
         timeout: Option<core::time::Duration>,
-    ) -> Result<(), error::Errno> {
+    ) -> Result<(), Errno> {
         let timeout = timeout.map(|t| linux::Timespec {
             tv_sec: i64::try_from(t.as_secs()).unwrap(),
             tv_nsec: i64::from(t.subsec_nanos()),

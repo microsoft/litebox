@@ -30,7 +30,7 @@ pub trait MemoryProvider {
     ///
     /// It can return more than requested size. On success, it returns the start address
     /// and the size of the allocated memory.
-    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno>;
+    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::Errno>;
 
     /// Returns the memory back to host.
     ///

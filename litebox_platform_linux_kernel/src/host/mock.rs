@@ -15,7 +15,7 @@ macro_rules! mock_log_println {
 }
 
 impl HostInterface for MockHostInterface {
-    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
+    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::Errno> {
         assert!(layout.size() <= 0x40_0000); // 4MB
         let size = core::cmp::max(
             layout.size().next_power_of_two(),
@@ -34,11 +34,11 @@ impl HostInterface for MockHostInterface {
         todo!()
     }
 
-    fn send_ip_packet(_packet: &[u8]) -> Result<usize, crate::error::Errno> {
+    fn send_ip_packet(_packet: &[u8]) -> Result<usize, crate::Errno> {
         todo!()
     }
 
-    fn receive_ip_packet(_packet: &mut [u8]) -> Result<usize, crate::error::Errno> {
+    fn receive_ip_packet(_packet: &mut [u8]) -> Result<usize, crate::Errno> {
         todo!()
     }
 
@@ -50,7 +50,7 @@ impl HostInterface for MockHostInterface {
         todo!()
     }
 
-    fn wake_many(_mutex: &AtomicU32, _n: usize) -> Result<usize, crate::error::Errno> {
+    fn wake_many(_mutex: &AtomicU32, _n: usize) -> Result<usize, crate::Errno> {
         todo!()
     }
 
@@ -58,7 +58,7 @@ impl HostInterface for MockHostInterface {
         _mutex: &AtomicU32,
         _val: u32,
         _timeout: Option<core::time::Duration>,
-    ) -> Result<(), crate::error::Errno> {
+    ) -> Result<(), crate::Errno> {
         todo!()
     }
 
@@ -67,7 +67,7 @@ impl HostInterface for MockHostInterface {
         _set: crate::ptr::UserConstPtr<super::linux::sigset_t>,
         _old_set: crate::ptr::UserMutPtr<super::linux::sigset_t>,
         _sigsetsize: usize,
-    ) -> Result<usize, crate::error::Errno> {
+    ) -> Result<usize, crate::Errno> {
         todo!()
     }
 }

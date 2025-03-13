@@ -1,7 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "litebox",
+    "litebox", 
+    "litebox_common_linux",
     "litebox_platform_linux_kernel",
     "litebox_platform_linux_userland",
     "litebox_platform_multiplex",

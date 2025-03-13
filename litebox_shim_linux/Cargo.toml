@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 litebox = { path = "../litebox/", version = "0.1.0" }
+litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
 litebox_platform_multiplex = { path = "../litebox_platform_multiplex/", version = "0.1.0" }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
 
