@@ -97,49 +97,35 @@ impl TryFrom<u8> for Errno {
     }
 }
 
-/// Provides conversion from various error types to Linux [`errno` constants](constants).
-pub trait AsErrno {
-    /// Returns the **positive** error number associated with `self`
-    fn as_errno(&self) -> i32;
-}
-
-impl AsErrno for litebox::fs::errors::PathError {
-    fn as_errno(&self) -> i32 {
-        match self {
+impl From<litebox::fs::errors::PathError> for Errno {
+    fn from(value: litebox::fs::errors::PathError) -> Self {
+        match value {
             litebox::fs::errors::PathError::NoSuchFileOrDirectory => Errno::ENOENT,
             litebox::fs::errors::PathError::NoSearchPerms { .. } => Errno::EACCES,
             litebox::fs::errors::PathError::InvalidPathname => Errno::EINVAL,
             litebox::fs::errors::PathError::MissingComponent => Errno::ENOENT,
             litebox::fs::errors::PathError::ComponentNotADirectory => Errno::ENOTDIR,
         }
-        .into()
     }
 }
 
-impl AsErrno for litebox::fs::errors::OpenError {
-    fn as_errno(&self) -> i32 {
-        match self {
+impl From<litebox::fs::errors::OpenError> for Errno {
+    fn from(value: litebox::fs::errors::OpenError) -> Self {
+        match value {
             litebox::fs::errors::OpenError::AccessNotAllowed => Errno::EACCES,
             litebox::fs::errors::OpenError::NoWritePerms => Errno::EACCES,
-            litebox::fs::errors::OpenError::PathError(path_error) => return path_error.as_errno(),
+            litebox::fs::errors::OpenError::PathError(path_error) => path_error.into(),
             litebox::fs::errors::OpenError::ReadOnlyFileSystem => Errno::EROFS,
             _ => unimplemented!(),
         }
-        .into()
     }
 }
 
-impl AsErrno for litebox::fs::errors::CloseError {
-    fn as_errno(&self) -> i32 {
+impl From<litebox::fs::errors::CloseError> for Errno {
+    fn from(value: litebox::fs::errors::CloseError) -> Self {
         #[expect(clippy::match_single_binding)]
-        match self {
+        match value {
             _ => unimplemented!(),
         }
-    }
-}
-
-impl AsErrno for i32 {
-    fn as_errno(&self) -> i32 {
-        *self
     }
 }

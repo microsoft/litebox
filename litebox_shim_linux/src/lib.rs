@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use once_cell::race::OnceBox;
 
 use litebox::{fs::FileSystem as _, platform::RawConstPointer as _, sync::RwLock};
-use litebox_common_linux::errno::{AsErrno as _, Errno};
+use litebox_common_linux::errno::Errno;
 use litebox_platform_multiplex::Platform;
 
 pub(crate) fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
@@ -182,7 +182,7 @@ pub unsafe extern "C" fn open(pathname: ConstPtr<i8>, flags: u32, mode: u32) -> 
             .insert(Descriptor::File(fd))
             .try_into()
             .unwrap(),
-        Err(err) => -err.as_errno(),
+        Err(err) => Errno::from(err).as_neg(),
     }
 }
 
@@ -194,7 +194,7 @@ pub extern "C" fn close(fd: i32) -> i32 {
     match file_descriptors().write().remove(fd) {
         Some(Descriptor::File(file_fd)) => match litebox_fs().close(file_fd) {
             Ok(()) => 0,
-            Err(err) => -err.as_errno(),
+            Err(err) => Errno::from(err).as_neg(),
         },
         Some(Descriptor::Socket(socket_fd)) => todo!(),
         None => Errno::EBADF.as_neg(),
