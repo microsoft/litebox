@@ -21,15 +21,6 @@ mod constants;
 ///
 /// This is a transparent wrapper around Linux error numbers (i.e., `i32`s) intended
 /// to provide some type safety by expecting explicit conversions to/from `i32`s.
-///
-/// The associated constants for this are generated using:
-/// ```sh
-/// /usr/bin/errno -l | awk \
-///     -e 'function f(n,c,s){print "/// "s "\npub const " n ": Self = Self::from_const(" c ");"}' \
-///     -e 'BEGIN{max=0}' \
-///     -e '{n=$1; c=$2; $1=""; $2=""; f(n,c,substr($0,3)); max=max>c?max:c;}' \
-///     -e 'END{f("MAX",max,"The maximum supported Errno")}'
-/// ```
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Error)]
 pub struct Errno {
     value: core::num::NonZeroU8,
@@ -43,8 +34,7 @@ impl From<Errno> for i32 {
 
 impl core::fmt::Display for Errno {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // TODO: Update this with a nicer display message based on actual error number constants
-        write!(f, "Errno({})", self.value.get())
+        write!(f, "{}", self.as_str())
     }
 }
 
