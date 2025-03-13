@@ -1,4 +1,4 @@
-//! Error handling
+//! Error handling. See [`Errno`].
 
 #![expect(
     clippy::match_same_arms,
@@ -59,6 +59,7 @@ impl Errno {
     }
 }
 
+/// Errors when converting to an [`Errno`]
 #[derive(Error, Debug)]
 pub enum ErrnoConversionError {
     #[error("Expected positive error number")]
