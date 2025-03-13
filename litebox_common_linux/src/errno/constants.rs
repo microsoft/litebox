@@ -4,543 +4,275 @@
 //! the public [`Errno`] type, so as to have them all be exposed, but still keep the auto-generated
 //! code restricted to this single file.
 
-use core::num::NonZeroU8;
-
 impl super::Errno {
     /// Operation not permitted
-    pub const EPERM: Self = Self {
-        value: NonZeroU8::new(1).unwrap(),
-    };
+    pub const EPERM: Self = Self::from_const(1);
     /// No such file or directory
-    pub const ENOENT: Self = Self {
-        value: NonZeroU8::new(2).unwrap(),
-    };
+    pub const ENOENT: Self = Self::from_const(2);
     /// No such process
-    pub const ESRCH: Self = Self {
-        value: NonZeroU8::new(3).unwrap(),
-    };
+    pub const ESRCH: Self = Self::from_const(3);
     /// Interrupted system call
-    pub const EINTR: Self = Self {
-        value: NonZeroU8::new(4).unwrap(),
-    };
+    pub const EINTR: Self = Self::from_const(4);
     /// Input/output error
-    pub const EIO: Self = Self {
-        value: NonZeroU8::new(5).unwrap(),
-    };
+    pub const EIO: Self = Self::from_const(5);
     /// No such device or address
-    pub const ENXIO: Self = Self {
-        value: NonZeroU8::new(6).unwrap(),
-    };
+    pub const ENXIO: Self = Self::from_const(6);
     /// Argument list too long
-    pub const E2BIG: Self = Self {
-        value: NonZeroU8::new(7).unwrap(),
-    };
+    pub const E2BIG: Self = Self::from_const(7);
     /// Exec format error
-    pub const ENOEXEC: Self = Self {
-        value: NonZeroU8::new(8).unwrap(),
-    };
+    pub const ENOEXEC: Self = Self::from_const(8);
     /// Bad file descriptor
-    pub const EBADF: Self = Self {
-        value: NonZeroU8::new(9).unwrap(),
-    };
+    pub const EBADF: Self = Self::from_const(9);
     /// No child processes
-    pub const ECHILD: Self = Self {
-        value: NonZeroU8::new(10).unwrap(),
-    };
+    pub const ECHILD: Self = Self::from_const(10);
     /// Resource temporarily unavailable
-    pub const EAGAIN: Self = Self {
-        value: NonZeroU8::new(11).unwrap(),
-    };
+    pub const EAGAIN: Self = Self::from_const(11);
     /// Cannot allocate memory
-    pub const ENOMEM: Self = Self {
-        value: NonZeroU8::new(12).unwrap(),
-    };
+    pub const ENOMEM: Self = Self::from_const(12);
     /// Permission denied
-    pub const EACCES: Self = Self {
-        value: NonZeroU8::new(13).unwrap(),
-    };
+    pub const EACCES: Self = Self::from_const(13);
     /// Bad address
-    pub const EFAULT: Self = Self {
-        value: NonZeroU8::new(14).unwrap(),
-    };
+    pub const EFAULT: Self = Self::from_const(14);
     /// Block device required
-    pub const ENOTBLK: Self = Self {
-        value: NonZeroU8::new(15).unwrap(),
-    };
+    pub const ENOTBLK: Self = Self::from_const(15);
     /// Device or resource busy
-    pub const EBUSY: Self = Self {
-        value: NonZeroU8::new(16).unwrap(),
-    };
+    pub const EBUSY: Self = Self::from_const(16);
     /// File exists
-    pub const EEXIST: Self = Self {
-        value: NonZeroU8::new(17).unwrap(),
-    };
+    pub const EEXIST: Self = Self::from_const(17);
     /// Invalid cross-device link
-    pub const EXDEV: Self = Self {
-        value: NonZeroU8::new(18).unwrap(),
-    };
+    pub const EXDEV: Self = Self::from_const(18);
     /// No such device
-    pub const ENODEV: Self = Self {
-        value: NonZeroU8::new(19).unwrap(),
-    };
+    pub const ENODEV: Self = Self::from_const(19);
     /// Not a directory
-    pub const ENOTDIR: Self = Self {
-        value: NonZeroU8::new(20).unwrap(),
-    };
+    pub const ENOTDIR: Self = Self::from_const(20);
     /// Is a directory
-    pub const EISDIR: Self = Self {
-        value: NonZeroU8::new(21).unwrap(),
-    };
+    pub const EISDIR: Self = Self::from_const(21);
     /// Invalid argument
-    pub const EINVAL: Self = Self {
-        value: NonZeroU8::new(22).unwrap(),
-    };
+    pub const EINVAL: Self = Self::from_const(22);
     /// Too many open files in system
-    pub const ENFILE: Self = Self {
-        value: NonZeroU8::new(23).unwrap(),
-    };
+    pub const ENFILE: Self = Self::from_const(23);
     /// Too many open files
-    pub const EMFILE: Self = Self {
-        value: NonZeroU8::new(24).unwrap(),
-    };
+    pub const EMFILE: Self = Self::from_const(24);
     /// Inappropriate ioctl for device
-    pub const ENOTTY: Self = Self {
-        value: NonZeroU8::new(25).unwrap(),
-    };
+    pub const ENOTTY: Self = Self::from_const(25);
     /// Text file busy
-    pub const ETXTBSY: Self = Self {
-        value: NonZeroU8::new(26).unwrap(),
-    };
+    pub const ETXTBSY: Self = Self::from_const(26);
     /// File too large
-    pub const EFBIG: Self = Self {
-        value: NonZeroU8::new(27).unwrap(),
-    };
+    pub const EFBIG: Self = Self::from_const(27);
     /// No space left on device
-    pub const ENOSPC: Self = Self {
-        value: NonZeroU8::new(28).unwrap(),
-    };
+    pub const ENOSPC: Self = Self::from_const(28);
     /// Illegal seek
-    pub const ESPIPE: Self = Self {
-        value: NonZeroU8::new(29).unwrap(),
-    };
+    pub const ESPIPE: Self = Self::from_const(29);
     /// Read-only file system
-    pub const EROFS: Self = Self {
-        value: NonZeroU8::new(30).unwrap(),
-    };
+    pub const EROFS: Self = Self::from_const(30);
     /// Too many links
-    pub const EMLINK: Self = Self {
-        value: NonZeroU8::new(31).unwrap(),
-    };
+    pub const EMLINK: Self = Self::from_const(31);
     /// Broken pipe
-    pub const EPIPE: Self = Self {
-        value: NonZeroU8::new(32).unwrap(),
-    };
+    pub const EPIPE: Self = Self::from_const(32);
     /// Numerical argument out of domain
-    pub const EDOM: Self = Self {
-        value: NonZeroU8::new(33).unwrap(),
-    };
+    pub const EDOM: Self = Self::from_const(33);
     /// Numerical result out of range
-    pub const ERANGE: Self = Self {
-        value: NonZeroU8::new(34).unwrap(),
-    };
+    pub const ERANGE: Self = Self::from_const(34);
     /// Resource deadlock avoided
-    pub const EDEADLK: Self = Self {
-        value: NonZeroU8::new(35).unwrap(),
-    };
+    pub const EDEADLK: Self = Self::from_const(35);
     /// File name too long
-    pub const ENAMETOOLONG: Self = Self {
-        value: NonZeroU8::new(36).unwrap(),
-    };
+    pub const ENAMETOOLONG: Self = Self::from_const(36);
     /// No locks available
-    pub const ENOLCK: Self = Self {
-        value: NonZeroU8::new(37).unwrap(),
-    };
+    pub const ENOLCK: Self = Self::from_const(37);
     /// Function not implemented
-    pub const ENOSYS: Self = Self {
-        value: NonZeroU8::new(38).unwrap(),
-    };
+    pub const ENOSYS: Self = Self::from_const(38);
     /// Directory not empty
-    pub const ENOTEMPTY: Self = Self {
-        value: NonZeroU8::new(39).unwrap(),
-    };
+    pub const ENOTEMPTY: Self = Self::from_const(39);
     /// Too many levels of symbolic links
-    pub const ELOOP: Self = Self {
-        value: NonZeroU8::new(40).unwrap(),
-    };
+    pub const ELOOP: Self = Self::from_const(40);
     /// Resource temporarily unavailable
-    pub const EWOULDBLOCK: Self = Self {
-        value: NonZeroU8::new(11).unwrap(),
-    };
+    pub const EWOULDBLOCK: Self = Self::from_const(11);
     /// No message of desired type
-    pub const ENOMSG: Self = Self {
-        value: NonZeroU8::new(42).unwrap(),
-    };
+    pub const ENOMSG: Self = Self::from_const(42);
     /// Identifier removed
-    pub const EIDRM: Self = Self {
-        value: NonZeroU8::new(43).unwrap(),
-    };
+    pub const EIDRM: Self = Self::from_const(43);
     /// Channel number out of range
-    pub const ECHRNG: Self = Self {
-        value: NonZeroU8::new(44).unwrap(),
-    };
+    pub const ECHRNG: Self = Self::from_const(44);
     /// Level 2 not synchronized
-    pub const EL2NSYNC: Self = Self {
-        value: NonZeroU8::new(45).unwrap(),
-    };
+    pub const EL2NSYNC: Self = Self::from_const(45);
     /// Level 3 halted
-    pub const EL3HLT: Self = Self {
-        value: NonZeroU8::new(46).unwrap(),
-    };
+    pub const EL3HLT: Self = Self::from_const(46);
     /// Level 3 reset
-    pub const EL3RST: Self = Self {
-        value: NonZeroU8::new(47).unwrap(),
-    };
+    pub const EL3RST: Self = Self::from_const(47);
     /// Link number out of range
-    pub const ELNRNG: Self = Self {
-        value: NonZeroU8::new(48).unwrap(),
-    };
+    pub const ELNRNG: Self = Self::from_const(48);
     /// Protocol driver not attached
-    pub const EUNATCH: Self = Self {
-        value: NonZeroU8::new(49).unwrap(),
-    };
+    pub const EUNATCH: Self = Self::from_const(49);
     /// No CSI structure available
-    pub const ENOCSI: Self = Self {
-        value: NonZeroU8::new(50).unwrap(),
-    };
+    pub const ENOCSI: Self = Self::from_const(50);
     /// Level 2 halted
-    pub const EL2HLT: Self = Self {
-        value: NonZeroU8::new(51).unwrap(),
-    };
+    pub const EL2HLT: Self = Self::from_const(51);
     /// Invalid exchange
-    pub const EBADE: Self = Self {
-        value: NonZeroU8::new(52).unwrap(),
-    };
+    pub const EBADE: Self = Self::from_const(52);
     /// Invalid request descriptor
-    pub const EBADR: Self = Self {
-        value: NonZeroU8::new(53).unwrap(),
-    };
+    pub const EBADR: Self = Self::from_const(53);
     /// Exchange full
-    pub const EXFULL: Self = Self {
-        value: NonZeroU8::new(54).unwrap(),
-    };
+    pub const EXFULL: Self = Self::from_const(54);
     /// No anode
-    pub const ENOANO: Self = Self {
-        value: NonZeroU8::new(55).unwrap(),
-    };
+    pub const ENOANO: Self = Self::from_const(55);
     /// Invalid request code
-    pub const EBADRQC: Self = Self {
-        value: NonZeroU8::new(56).unwrap(),
-    };
+    pub const EBADRQC: Self = Self::from_const(56);
     /// Invalid slot
-    pub const EBADSLT: Self = Self {
-        value: NonZeroU8::new(57).unwrap(),
-    };
+    pub const EBADSLT: Self = Self::from_const(57);
     /// Resource deadlock avoided
-    pub const EDEADLOCK: Self = Self {
-        value: NonZeroU8::new(35).unwrap(),
-    };
+    pub const EDEADLOCK: Self = Self::from_const(35);
     /// Bad font file format
-    pub const EBFONT: Self = Self {
-        value: NonZeroU8::new(59).unwrap(),
-    };
+    pub const EBFONT: Self = Self::from_const(59);
     /// Device not a stream
-    pub const ENOSTR: Self = Self {
-        value: NonZeroU8::new(60).unwrap(),
-    };
+    pub const ENOSTR: Self = Self::from_const(60);
     /// No data available
-    pub const ENODATA: Self = Self {
-        value: NonZeroU8::new(61).unwrap(),
-    };
+    pub const ENODATA: Self = Self::from_const(61);
     /// Timer expired
-    pub const ETIME: Self = Self {
-        value: NonZeroU8::new(62).unwrap(),
-    };
+    pub const ETIME: Self = Self::from_const(62);
     /// Out of streams resources
-    pub const ENOSR: Self = Self {
-        value: NonZeroU8::new(63).unwrap(),
-    };
+    pub const ENOSR: Self = Self::from_const(63);
     /// Machine is not on the network
-    pub const ENONET: Self = Self {
-        value: NonZeroU8::new(64).unwrap(),
-    };
+    pub const ENONET: Self = Self::from_const(64);
     /// Package not installed
-    pub const ENOPKG: Self = Self {
-        value: NonZeroU8::new(65).unwrap(),
-    };
+    pub const ENOPKG: Self = Self::from_const(65);
     /// Object is remote
-    pub const EREMOTE: Self = Self {
-        value: NonZeroU8::new(66).unwrap(),
-    };
+    pub const EREMOTE: Self = Self::from_const(66);
     /// Link has been severed
-    pub const ENOLINK: Self = Self {
-        value: NonZeroU8::new(67).unwrap(),
-    };
+    pub const ENOLINK: Self = Self::from_const(67);
     /// Advertise error
-    pub const EADV: Self = Self {
-        value: NonZeroU8::new(68).unwrap(),
-    };
+    pub const EADV: Self = Self::from_const(68);
     /// Srmount error
-    pub const ESRMNT: Self = Self {
-        value: NonZeroU8::new(69).unwrap(),
-    };
+    pub const ESRMNT: Self = Self::from_const(69);
     /// Communication error on send
-    pub const ECOMM: Self = Self {
-        value: NonZeroU8::new(70).unwrap(),
-    };
+    pub const ECOMM: Self = Self::from_const(70);
     /// Protocol error
-    pub const EPROTO: Self = Self {
-        value: NonZeroU8::new(71).unwrap(),
-    };
+    pub const EPROTO: Self = Self::from_const(71);
     /// Multihop attempted
-    pub const EMULTIHOP: Self = Self {
-        value: NonZeroU8::new(72).unwrap(),
-    };
+    pub const EMULTIHOP: Self = Self::from_const(72);
     /// RFS specific error
-    pub const EDOTDOT: Self = Self {
-        value: NonZeroU8::new(73).unwrap(),
-    };
+    pub const EDOTDOT: Self = Self::from_const(73);
     /// Bad message
-    pub const EBADMSG: Self = Self {
-        value: NonZeroU8::new(74).unwrap(),
-    };
+    pub const EBADMSG: Self = Self::from_const(74);
     /// Value too large for defined data type
-    pub const EOVERFLOW: Self = Self {
-        value: NonZeroU8::new(75).unwrap(),
-    };
+    pub const EOVERFLOW: Self = Self::from_const(75);
     /// Name not unique on network
-    pub const ENOTUNIQ: Self = Self {
-        value: NonZeroU8::new(76).unwrap(),
-    };
+    pub const ENOTUNIQ: Self = Self::from_const(76);
     /// File descriptor in bad state
-    pub const EBADFD: Self = Self {
-        value: NonZeroU8::new(77).unwrap(),
-    };
+    pub const EBADFD: Self = Self::from_const(77);
     /// Remote address changed
-    pub const EREMCHG: Self = Self {
-        value: NonZeroU8::new(78).unwrap(),
-    };
+    pub const EREMCHG: Self = Self::from_const(78);
     /// Can not access a needed shared library
-    pub const ELIBACC: Self = Self {
-        value: NonZeroU8::new(79).unwrap(),
-    };
+    pub const ELIBACC: Self = Self::from_const(79);
     /// Accessing a corrupted shared library
-    pub const ELIBBAD: Self = Self {
-        value: NonZeroU8::new(80).unwrap(),
-    };
+    pub const ELIBBAD: Self = Self::from_const(80);
     /// .lib section in a.out corrupted
-    pub const ELIBSCN: Self = Self {
-        value: NonZeroU8::new(81).unwrap(),
-    };
+    pub const ELIBSCN: Self = Self::from_const(81);
     /// Attempting to link in too many shared libraries
-    pub const ELIBMAX: Self = Self {
-        value: NonZeroU8::new(82).unwrap(),
-    };
+    pub const ELIBMAX: Self = Self::from_const(82);
     /// Cannot exec a shared library directly
-    pub const ELIBEXEC: Self = Self {
-        value: NonZeroU8::new(83).unwrap(),
-    };
+    pub const ELIBEXEC: Self = Self::from_const(83);
     /// Invalid or incomplete multibyte or wide character
-    pub const EILSEQ: Self = Self {
-        value: NonZeroU8::new(84).unwrap(),
-    };
+    pub const EILSEQ: Self = Self::from_const(84);
     /// Interrupted system call should be restarted
-    pub const ERESTART: Self = Self {
-        value: NonZeroU8::new(85).unwrap(),
-    };
+    pub const ERESTART: Self = Self::from_const(85);
     /// Streams pipe error
-    pub const ESTRPIPE: Self = Self {
-        value: NonZeroU8::new(86).unwrap(),
-    };
+    pub const ESTRPIPE: Self = Self::from_const(86);
     /// Too many users
-    pub const EUSERS: Self = Self {
-        value: NonZeroU8::new(87).unwrap(),
-    };
+    pub const EUSERS: Self = Self::from_const(87);
     /// Socket operation on non-socket
-    pub const ENOTSOCK: Self = Self {
-        value: NonZeroU8::new(88).unwrap(),
-    };
+    pub const ENOTSOCK: Self = Self::from_const(88);
     /// Destination address required
-    pub const EDESTADDRREQ: Self = Self {
-        value: NonZeroU8::new(89).unwrap(),
-    };
+    pub const EDESTADDRREQ: Self = Self::from_const(89);
     /// Message too long
-    pub const EMSGSIZE: Self = Self {
-        value: NonZeroU8::new(90).unwrap(),
-    };
+    pub const EMSGSIZE: Self = Self::from_const(90);
     /// Protocol wrong type for socket
-    pub const EPROTOTYPE: Self = Self {
-        value: NonZeroU8::new(91).unwrap(),
-    };
+    pub const EPROTOTYPE: Self = Self::from_const(91);
     /// Protocol not available
-    pub const ENOPROTOOPT: Self = Self {
-        value: NonZeroU8::new(92).unwrap(),
-    };
+    pub const ENOPROTOOPT: Self = Self::from_const(92);
     /// Protocol not supported
-    pub const EPROTONOSUPPORT: Self = Self {
-        value: NonZeroU8::new(93).unwrap(),
-    };
+    pub const EPROTONOSUPPORT: Self = Self::from_const(93);
     /// Socket type not supported
-    pub const ESOCKTNOSUPPORT: Self = Self {
-        value: NonZeroU8::new(94).unwrap(),
-    };
+    pub const ESOCKTNOSUPPORT: Self = Self::from_const(94);
     /// Operation not supported
-    pub const EOPNOTSUPP: Self = Self {
-        value: NonZeroU8::new(95).unwrap(),
-    };
+    pub const EOPNOTSUPP: Self = Self::from_const(95);
     /// Protocol family not supported
-    pub const EPFNOSUPPORT: Self = Self {
-        value: NonZeroU8::new(96).unwrap(),
-    };
+    pub const EPFNOSUPPORT: Self = Self::from_const(96);
     /// Address family not supported by protocol
-    pub const EAFNOSUPPORT: Self = Self {
-        value: NonZeroU8::new(97).unwrap(),
-    };
+    pub const EAFNOSUPPORT: Self = Self::from_const(97);
     /// Address already in use
-    pub const EADDRINUSE: Self = Self {
-        value: NonZeroU8::new(98).unwrap(),
-    };
+    pub const EADDRINUSE: Self = Self::from_const(98);
     /// Cannot assign requested address
-    pub const EADDRNOTAVAIL: Self = Self {
-        value: NonZeroU8::new(99).unwrap(),
-    };
+    pub const EADDRNOTAVAIL: Self = Self::from_const(99);
     /// Network is down
-    pub const ENETDOWN: Self = Self {
-        value: NonZeroU8::new(100).unwrap(),
-    };
+    pub const ENETDOWN: Self = Self::from_const(100);
     /// Network is unreachable
-    pub const ENETUNREACH: Self = Self {
-        value: NonZeroU8::new(101).unwrap(),
-    };
+    pub const ENETUNREACH: Self = Self::from_const(101);
     /// Network dropped connection on reset
-    pub const ENETRESET: Self = Self {
-        value: NonZeroU8::new(102).unwrap(),
-    };
+    pub const ENETRESET: Self = Self::from_const(102);
     /// Software caused connection abort
-    pub const ECONNABORTED: Self = Self {
-        value: NonZeroU8::new(103).unwrap(),
-    };
+    pub const ECONNABORTED: Self = Self::from_const(103);
     /// Connection reset by peer
-    pub const ECONNRESET: Self = Self {
-        value: NonZeroU8::new(104).unwrap(),
-    };
+    pub const ECONNRESET: Self = Self::from_const(104);
     /// No buffer space available
-    pub const ENOBUFS: Self = Self {
-        value: NonZeroU8::new(105).unwrap(),
-    };
+    pub const ENOBUFS: Self = Self::from_const(105);
     /// Transport endpoint is already connected
-    pub const EISCONN: Self = Self {
-        value: NonZeroU8::new(106).unwrap(),
-    };
+    pub const EISCONN: Self = Self::from_const(106);
     /// Transport endpoint is not connected
-    pub const ENOTCONN: Self = Self {
-        value: NonZeroU8::new(107).unwrap(),
-    };
+    pub const ENOTCONN: Self = Self::from_const(107);
     /// Cannot send after transport endpoint shutdown
-    pub const ESHUTDOWN: Self = Self {
-        value: NonZeroU8::new(108).unwrap(),
-    };
+    pub const ESHUTDOWN: Self = Self::from_const(108);
     /// Too many references: cannot splice
-    pub const ETOOMANYREFS: Self = Self {
-        value: NonZeroU8::new(109).unwrap(),
-    };
+    pub const ETOOMANYREFS: Self = Self::from_const(109);
     /// Connection timed out
-    pub const ETIMEDOUT: Self = Self {
-        value: NonZeroU8::new(110).unwrap(),
-    };
+    pub const ETIMEDOUT: Self = Self::from_const(110);
     /// Connection refused
-    pub const ECONNREFUSED: Self = Self {
-        value: NonZeroU8::new(111).unwrap(),
-    };
+    pub const ECONNREFUSED: Self = Self::from_const(111);
     /// Host is down
-    pub const EHOSTDOWN: Self = Self {
-        value: NonZeroU8::new(112).unwrap(),
-    };
+    pub const EHOSTDOWN: Self = Self::from_const(112);
     /// No route to host
-    pub const EHOSTUNREACH: Self = Self {
-        value: NonZeroU8::new(113).unwrap(),
-    };
+    pub const EHOSTUNREACH: Self = Self::from_const(113);
     /// Operation already in progress
-    pub const EALREADY: Self = Self {
-        value: NonZeroU8::new(114).unwrap(),
-    };
+    pub const EALREADY: Self = Self::from_const(114);
     /// Operation now in progress
-    pub const EINPROGRESS: Self = Self {
-        value: NonZeroU8::new(115).unwrap(),
-    };
+    pub const EINPROGRESS: Self = Self::from_const(115);
     /// Stale file handle
-    pub const ESTALE: Self = Self {
-        value: NonZeroU8::new(116).unwrap(),
-    };
+    pub const ESTALE: Self = Self::from_const(116);
     /// Structure needs cleaning
-    pub const EUCLEAN: Self = Self {
-        value: NonZeroU8::new(117).unwrap(),
-    };
+    pub const EUCLEAN: Self = Self::from_const(117);
     /// Not a XENIX named type file
-    pub const ENOTNAM: Self = Self {
-        value: NonZeroU8::new(118).unwrap(),
-    };
+    pub const ENOTNAM: Self = Self::from_const(118);
     /// No XENIX semaphores available
-    pub const ENAVAIL: Self = Self {
-        value: NonZeroU8::new(119).unwrap(),
-    };
+    pub const ENAVAIL: Self = Self::from_const(119);
     /// Is a named type file
-    pub const EISNAM: Self = Self {
-        value: NonZeroU8::new(120).unwrap(),
-    };
+    pub const EISNAM: Self = Self::from_const(120);
     /// Remote I/O error
-    pub const EREMOTEIO: Self = Self {
-        value: NonZeroU8::new(121).unwrap(),
-    };
+    pub const EREMOTEIO: Self = Self::from_const(121);
     /// Disk quota exceeded
-    pub const EDQUOT: Self = Self {
-        value: NonZeroU8::new(122).unwrap(),
-    };
+    pub const EDQUOT: Self = Self::from_const(122);
     /// No medium found
-    pub const ENOMEDIUM: Self = Self {
-        value: NonZeroU8::new(123).unwrap(),
-    };
+    pub const ENOMEDIUM: Self = Self::from_const(123);
     /// Wrong medium type
-    pub const EMEDIUMTYPE: Self = Self {
-        value: NonZeroU8::new(124).unwrap(),
-    };
+    pub const EMEDIUMTYPE: Self = Self::from_const(124);
     /// Operation canceled
-    pub const ECANCELED: Self = Self {
-        value: NonZeroU8::new(125).unwrap(),
-    };
+    pub const ECANCELED: Self = Self::from_const(125);
     /// Required key not available
-    pub const ENOKEY: Self = Self {
-        value: NonZeroU8::new(126).unwrap(),
-    };
+    pub const ENOKEY: Self = Self::from_const(126);
     /// Key has expired
-    pub const EKEYEXPIRED: Self = Self {
-        value: NonZeroU8::new(127).unwrap(),
-    };
+    pub const EKEYEXPIRED: Self = Self::from_const(127);
     /// Key has been revoked
-    pub const EKEYREVOKED: Self = Self {
-        value: NonZeroU8::new(128).unwrap(),
-    };
+    pub const EKEYREVOKED: Self = Self::from_const(128);
     /// Key was rejected by service
-    pub const EKEYREJECTED: Self = Self {
-        value: NonZeroU8::new(129).unwrap(),
-    };
+    pub const EKEYREJECTED: Self = Self::from_const(129);
     /// Owner died
-    pub const EOWNERDEAD: Self = Self {
-        value: NonZeroU8::new(130).unwrap(),
-    };
+    pub const EOWNERDEAD: Self = Self::from_const(130);
     /// State not recoverable
-    pub const ENOTRECOVERABLE: Self = Self {
-        value: NonZeroU8::new(131).unwrap(),
-    };
+    pub const ENOTRECOVERABLE: Self = Self::from_const(131);
     /// Operation not possible due to RF-kill
-    pub const ERFKILL: Self = Self {
-        value: NonZeroU8::new(132).unwrap(),
-    };
+    pub const ERFKILL: Self = Self::from_const(132);
     /// Memory page has hardware error
-    pub const EHWPOISON: Self = Self {
-        value: NonZeroU8::new(133).unwrap(),
-    };
+    pub const EHWPOISON: Self = Self::from_const(133);
     /// Operation not supported
-    pub const ENOTSUP: Self = Self {
-        value: NonZeroU8::new(95).unwrap(),
-    };
+    pub const ENOTSUP: Self = Self::from_const(95);
+    /// The maximum supported Errno
+    pub const MAX: Self = Self::from_const(133);
 }

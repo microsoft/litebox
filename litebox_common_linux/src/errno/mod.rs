@@ -24,8 +24,11 @@ mod constants;
 ///
 /// The associated constants for this are generated using:
 /// ```sh
-/// /usr/bin/errno -l | \
-///   awk '{n=$1; c=$2; $1=""; $2=""; print "/// " substr($0,3) "\npub const " n ": Self = Self { value: NonZeroU8::new(" c ").unwrap() };"}'
+/// /usr/bin/errno -l | awk \
+///     -e 'function f(n,c,s){print "/// "s "\npub const " n ": Self = Self::from_const(" c ");"}' \
+///     -e 'BEGIN{max=0}' \
+///     -e '{n=$1; c=$2; $1=""; $2=""; f(n,c,substr($0,3)); max=max>c?max:c;}' \
+///     -e 'END{f("MAX",max,"The maximum supported Errno")}'
 /// ```
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Error)]
 pub struct Errno {
@@ -56,6 +59,14 @@ impl Errno {
     /// ```
     pub fn as_neg(self) -> i32 {
         -i32::from(self)
+    }
+
+    /// (Private-only) Helper function that makes the associated [`constants`] significantly more
+    /// readable. Not intended to be used outside this crate, or even this module.
+    const fn from_const(v: u8) -> Self {
+        Self {
+            value: core::num::NonZeroU8::new(v).unwrap(),
+        }
     }
 }
 
@@ -93,8 +104,11 @@ impl TryFrom<u8> for Errno {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         let value =
             core::num::NonZeroU8::new(value).ok_or(ErrnoConversionError::ExpectedNonZero)?;
-        // TODO: Check for the allowed max value.
-        Ok(Self { value })
+        if value.get() <= Self::MAX.value.get() {
+            Ok(Self { value })
+        } else {
+            Err(ErrnoConversionError::ExpectedSmallEnough)
+        }
     }
 }
 
