@@ -4,7 +4,7 @@ use crate::HostInterface;
 
 pub(crate) type MockKernel = crate::LinuxKernel<MockHostInterface>;
 
-pub struct MockHostInterface {}
+pub(crate) struct MockHostInterface {}
 
 pub type MockKernel = crate::LinuxKernel<MockHostInterface>;
 

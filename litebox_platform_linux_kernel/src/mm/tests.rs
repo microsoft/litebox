@@ -124,7 +124,6 @@ fn check_flags(
     }
 }
 
-#[cfg(test)]
 fn get_test_pgtable<'a>(
     range: PageRange<PAGE_SIZE>,
     fault_flags: PageTableFlags,

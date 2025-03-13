@@ -179,12 +179,11 @@ impl UserStack {
 
         // ensure stack is aligned
         let pos = Self::align_down(pos, size_of::<usize>());
-        // assert_eq!(pos, 0);
+        // to ensure the final pos is aligned, we need to add some padding
         let len = (aux.len() + 1) * 2 + envp.len() + 1 + argvp.len() + 1 + /* argc */ 1;
         let size = len * size_of::<usize>();
         let final_pos = pos.checked_sub_unsigned(size)?;
-        let new_pos =
-            pos - (final_pos - Self::align_down(final_pos, Self::STACK_ALIGNMENT)) as isize;
+        let new_pos = pos - (final_pos - Self::align_down(final_pos, Self::STACK_ALIGNMENT));
 
         let new_pos = self.write_aux(aux, new_pos)?;
         let new_pos = self.write_pointers(envp, new_pos)?;
