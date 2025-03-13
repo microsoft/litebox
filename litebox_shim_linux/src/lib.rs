@@ -24,7 +24,7 @@ use litebox_platform_multiplex::Platform;
 
 pub mod errno;
 pub mod loader;
-pub mod syscall;
+
 use errno::AsErrno as _;
 
 pub(crate) fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
@@ -54,6 +54,7 @@ pub(crate) fn litebox_sync<'a>() -> &'a litebox::sync::Synchronization<'static, 
 static VMEM: once_cell::race::OnceBox<RwLock<'static, Platform, litebox_platform_multiplex::VMem>> =
     once_cell::race::OnceBox::new();
 pub(crate) fn set_vmm(vmm: litebox_platform_multiplex::VMem) {
+    #[allow(clippy::match_wild_err_arm, reason = "RwLock is not Debug")]
     match VMEM.set(alloc::boxed::Box::new(litebox_sync().new_rwlock(vmm))) {
         Ok(()) => {}
         Err(_) => panic!("set_vmm should only be called once per crate"),

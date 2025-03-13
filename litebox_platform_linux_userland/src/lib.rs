@@ -33,12 +33,8 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     /// # Panics
     ///
     /// Panics if the tun device could not be successfully opened.
-    pub fn new(
-        tun_device_name: &str,
-        punchthrough_provider: PunchthroughProvider,
-        test: bool,
-    ) -> Self {
-        let tun_socket_fd = if !test {
+    pub fn new(tun_device_name: &str, punchthrough_provider: PunchthroughProvider) -> Self {
+        let tun_socket_fd = {
             let tun_fd = nix::fcntl::open(
                 "/dev/net/tun",
                 nix::fcntl::OFlag::O_RDWR
@@ -71,13 +67,22 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
             // By taking ownership, we are letting the drop handler automatically run `libc::close`
             // when necessary.
             unsafe { std::os::fd::OwnedFd::from_raw_fd(tun_fd) }
-        } else {
-            assert!(tun_device_name.len() < 16);
-            unsafe { std::os::fd::OwnedFd::from_raw_fd(-2) }
         };
 
         Self {
             tun_socket_fd,
+            punchthrough_provider,
+        }
+    }
+
+    /// Create a new userland-Linux platform for use in `LiteBox` for testing.
+    ///
+    /// # Safety
+    ///
+    /// This is for testing purposes only.
+    pub unsafe fn new_for_test(punchthrough_provider: PunchthroughProvider) -> Self {
+        Self {
+            tun_socket_fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(-2) },
             punchthrough_provider,
         }
     }

@@ -29,23 +29,16 @@ compile_error!(
 );
 
 // Check if no platforms have been specified. If so, compiler error.
-#[cfg(not(any(
-    feature = "platform_linux_userland",
-    feature = "litebox_platform_linux_kernel"
-)))]
+#[cfg(not(any(feature = "platform_linux_userland",)))]
 compile_error!(
     r##"No platforms specified.  Please enable the feature for the platform you want."##
 );
 
 #[cfg(feature = "platform_linux_userland")]
 pub type Platform = litebox_platform_linux_userland::LinuxUserland;
-#[cfg(feature = "litebox_platform_linux_kernel")]
-pub type Platform = litebox_platform_linux_kernel::host::snp::SnpLinuxKenrel;
 
 #[cfg(feature = "platform_linux_userland")]
 pub type VMem = litebox_platform_linux_userland::mm::UserVmem;
-#[cfg(feature = "litebox_platform_linux_kernel")]
-pub type VMem = litebox_platform_linux_kernel::mm::vm::KernelVmemX64<'static>;
 
 static PLATFORM: once_cell::race::OnceBox<Platform> = once_cell::race::OnceBox::new();
 
