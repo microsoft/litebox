@@ -1,3 +1,5 @@
+//! ELF loader for LiteBox
+
 use core::{ffi::c_int, ptr::NonNull, str::FromStr};
 
 use alloc::{collections::btree_map::BTreeMap, ffi::CString, string::ToString, vec::Vec};
@@ -208,8 +210,7 @@ impl ElfLoader {
     fn init_auxvec(elf: &Elf) -> BTreeMap<AuxKey, usize> {
         let mut aux = BTreeMap::new();
         let phdrs = elf.phdrs();
-        // TODO: where should we get this value?
-        aux.insert(AuxKey::AT_PAGESZ, 0x1000);
+        aux.insert(AuxKey::AT_PAGESZ, PAGE_SIZE);
         aux.insert(
             AuxKey::AT_PHDR,
             if phdrs.is_empty() {

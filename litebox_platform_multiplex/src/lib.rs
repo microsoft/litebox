@@ -29,7 +29,7 @@ compile_error!(
 );
 
 // Check if no platforms have been specified. If so, compiler error.
-#[cfg(not(any(feature = "platform_linux_userland",)))]
+#[cfg(not(any(feature = "platform_linux_userland")))]
 compile_error!(
     r##"No platforms specified.  Please enable the feature for the platform you want."##
 );
