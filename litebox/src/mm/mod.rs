@@ -53,9 +53,8 @@ where
 
     /// Create readable and executable pages.
     ///
-    /// `suggested_addr` is the hint address to create the pages. If it is not given (i.e., zero),
-    /// some available memory region will be chosen. Otherwise, the range will be created at the given address if it
-    /// is available.
+    /// `suggested_addr` is the hint address where to create the pages. Provide `0` to let the kernel
+    /// choose an available memory region.
     ///
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
     /// existing overlapping mappings being removed.
@@ -95,9 +94,8 @@ where
 
     /// Create readable and writable pages.
     ///
-    /// `suggested_addr` is the hint address to create the pages. If it is not given (i.e., zero),
-    /// some available memory region will be chosen. Otherwise, the range will be created at the given address if it
-    /// is available.
+    /// `suggested_addr` is the hint address where to create the pages. Provide `0` to let the kernel
+    /// choose an available memory region.
     ///
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
     /// existing overlapping mappings being removed.
@@ -129,9 +127,8 @@ where
 
     /// Create read-only pages.
     ///
-    /// `suggested_addr` is the hint address to create the pages. If it is not given (i.e., zero),
-    /// some available memory region will be chosen. Otherwise, the range will be created at the given address if it
-    /// is available.
+    /// `suggested_addr` is the hint address where to create the pages. Provide `0` to let the kernel
+    /// choose an available memory region.
     ///
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
     /// existing overlapping mappings being removed.
@@ -169,9 +166,8 @@ where
 
     /// Create stack pages.
     ///
-    /// `suggested_addr` is the hint address to create the pages. If it is not given (i.e., zero),
-    /// some available memory region will be chosen. Otherwise, the range will be created at the given address if it
-    /// is available.
+    /// `suggested_addr` is the hint address where to create the pages. Provide `0` to let the kernel
+    /// choose an available memory region.
     ///
     /// # Safety
     ///
