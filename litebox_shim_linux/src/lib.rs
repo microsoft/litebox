@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 // platform-specific things within it.
 use once_cell::race::OnceBox;
 
-use litebox::{fs::FileSystem as _, platform::RawConstPointer as _, sync::RwLock};
+use litebox::{fs::FileSystem as _, mm::{linux::PAGE_SIZE, PageManager}, platform::RawConstPointer as _, sync::RwLock};
 use litebox_common_linux::errno::Errno;
 use litebox_platform_multiplex::Platform;
 
@@ -51,19 +51,12 @@ pub(crate) fn litebox_sync<'a>() -> &'a litebox::sync::Synchronization<'static, 
     })
 }
 
-static VMEM: once_cell::race::OnceBox<RwLock<'static, Platform, litebox_platform_multiplex::VMem>> =
-    once_cell::race::OnceBox::new();
-pub(crate) fn set_vmm(vmm: litebox_platform_multiplex::VMem) {
-    #[allow(clippy::match_wild_err_arm, reason = "RwLock is not Debug")]
-    match VMEM.set(alloc::boxed::Box::new(litebox_sync().new_rwlock(vmm))) {
-        Ok(()) => {}
-        Err(_) => panic!("set_vmm should only be called once per crate"),
-    }
-}
-
-pub(crate) fn litebox_vmm<'a>() -> &'a RwLock<'static, Platform, litebox_platform_multiplex::VMem> {
-    VMEM.get()
-        .expect("set_vmm must be called before litebox_vmm")
+pub(crate) fn litebox_vmm<'a>() -> &'a PageManager<'static, Platform, PAGE_SIZE> {
+    static VMEM: OnceBox<PageManager<'static, Platform, PAGE_SIZE>> = OnceBox::new();
+    VMEM.get_or_init(|| {
+        let vmm = unsafe { PageManager::new(litebox_sync(), ()) };
+        alloc::boxed::Box::new(vmm)
+    })
 }
 
 // Convenience type aliases

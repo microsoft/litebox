@@ -37,9 +37,6 @@ compile_error!(
 #[cfg(feature = "platform_linux_userland")]
 pub type Platform = litebox_platform_linux_userland::LinuxUserland;
 
-#[cfg(feature = "platform_linux_userland")]
-pub type VMem = litebox_platform_linux_userland::mm::UserVmem;
-
 static PLATFORM: once_cell::race::OnceBox<Platform> = once_cell::race::OnceBox::new();
 
 /// Initialize the shim by providing a [LiteBox platform](../litebox/platform/index.html).

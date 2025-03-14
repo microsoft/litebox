@@ -2,11 +2,9 @@ use core::sync::atomic::AtomicU32;
 
 use crate::HostInterface;
 
-pub(crate) type MockKernel = crate::LinuxKernel<MockHostInterface>;
-
-pub(crate) struct MockHostInterface {}
-
 pub type MockKernel = crate::LinuxKernel<MockHostInterface>;
+
+pub struct MockHostInterface {}
 
 #[macro_export]
 macro_rules! mock_log_println {

@@ -8,12 +8,9 @@ use elf_loader::{
     object::ElfObject,
 };
 use litebox::{
-    fs::{FileSystem, Mode, OFlags, errors::OpenError},
-    mm::{
-        linux::PageRange,
-        mapping::{MappingError, MappingProvider},
-    },
-    platform::RawMutPointer,
+    fs::{errors::OpenError, FileSystem, Mode, OFlags},
+    mm::linux::{MappingError, PageRange},
+    platform::{RawConstPointer, RawMutPointer},
 };
 use thiserror::Error;
 
@@ -83,30 +80,24 @@ impl ElfLoaderMmap {
         op: impl FnOnce(MutPtr<u8>) -> Result<usize, MappingError>,
     ) -> elf_loader::Result<usize> {
         let fixed_addr = flags.contains(MapFlags::MAP_FIXED);
-        let suggested_range = match addr {
-            Some(start) => {
-                PageRange::new(start, start + len).ok_or(elf_loader::Error::MmapError {
-                    msg: "invalid addr or len".to_string(),
-                })?
-            }
-            None => PageRange::new(0, len).ok_or(elf_loader::Error::MmapError {
-                msg: "invalid len".to_string(),
-            })?,
-        };
-        let mut vmm = litebox_vmm().write();
-        match prot.bits() {
+        let suggested_addr = addr.unwrap_or(0);
+        let vmm = litebox_vmm();
+        let res = match prot.bits() {
             Self::PROT_EXECUTABLE => unsafe {
-                vmm.create_executable_page(suggested_range, fixed_addr, op)
+                vmm.create_executable_pages(suggested_addr, len, fixed_addr, op)
             },
             Self::PROT_WRITABLE => unsafe {
-                vmm.create_writable_page(suggested_range, fixed_addr, op)
+                vmm.create_writable_pages(suggested_addr, len, fixed_addr, op)
             },
             Self::PROT_READABLE => unsafe {
-                vmm.create_readable_page(suggested_range, fixed_addr, op)
+                vmm.create_readable_pages(suggested_addr, len, fixed_addr, op)
             },
             _ => todo!(),
+        };
+        match res {
+            Ok(addr) => Ok(addr.as_usize()),
+            Err(e) => Err(elf_loader::Error::MmapError { msg: e.to_string() }),
         }
-        .map_err(|e| elf_loader::Error::MmapError { msg: e.to_string() })
     }
 
     fn do_mmap_file(
@@ -290,7 +281,7 @@ enum ElfLoaderError {
 #[cfg(test)]
 mod tests {
     use super::ElfLoader;
-    use crate::{litebox_fs, set_vmm};
+    use crate::litebox_fs;
     use alloc::ffi::CString;
     use alloc::vec;
     use core::arch::global_asm;
@@ -298,7 +289,7 @@ mod tests {
         fs::{FileSystem, Mode, OFlags},
         platform::trivial_providers::ImpossiblePunchthroughProvider,
     };
-    use litebox_platform_multiplex::{Platform, VMem, set_platform};
+    use litebox_platform_multiplex::{Platform, set_platform};
 
     extern crate std;
 
@@ -325,9 +316,6 @@ mod tests {
         ONCE.call_once(|| {
             let platform = unsafe { Platform::new_for_test(ImpossiblePunchthroughProvider {}) };
             set_platform(platform);
-
-            let vmm = VMem::new();
-            set_vmm(vmm);
         });
     }
 
