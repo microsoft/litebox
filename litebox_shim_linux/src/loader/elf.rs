@@ -394,6 +394,9 @@ mod tests {
         test_load_exec_common(executable_path);
     }
 
+    // FIXME: this function exits the process so only one test in this file
+    // can be run at a time. I have to manually run each test to make sure
+    // everything works.
     fn test_load_exec_common(executable_path: &str) {
         let argv = vec![
             CString::new(executable_path).unwrap(),
