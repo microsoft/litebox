@@ -219,12 +219,6 @@ fn test_page_table() {
     }
 }
 
-// fn collect_mappings(
-//     vmm: &KernelVmem<X64PageTable<'_, MockKernel>, PAGE_SIZE>,
-// ) -> Vec<Range<usize>> {
-//     vmm.iter().map(|v| v.0.start..v.0.end).collect()
-// }
-
 #[test]
 fn test_vmm_page_fault() {
     let start_addr: usize = 0x1000;
