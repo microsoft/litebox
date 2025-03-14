@@ -107,7 +107,7 @@ impl<const ALIGN: usize> PageRange<ALIGN> {
     }
 }
 
-/// A non-zero 4KiB-page-aligned size in bytes.
+/// A non-zero `ALIGN`-aligned size in bytes.
 #[derive(Clone, Copy)]
 pub(super) struct NonZeroPageSize<const ALIGN: usize> {
     size: usize,
@@ -134,6 +134,7 @@ impl<const ALIGN: usize> NonZeroPageSize<ALIGN> {
         Self { size }
     }
 
+    /// Get the size
     #[inline]
     pub(super) fn as_usize(self) -> usize {
         self.size
@@ -148,11 +149,13 @@ pub(super) struct VmArea {
 }
 
 impl VmArea {
+    /// Get the [flags](`VmFlags`) of this memory area.
     #[inline]
     pub(super) fn flags(self) -> VmFlags {
         self.flags
     }
 
+    /// Create a new [`VmArea`] with the given flags.
     #[inline]
     pub(super) fn new(flags: VmFlags) -> Self {
         Self { flags }

@@ -14,7 +14,7 @@ use linux::{
 };
 
 use crate::{
-    platform::{PageManagementProvider, RawConstPointer, RawPointerProvider},
+    platform::{PageManagementProvider, RawConstPointer},
     sync::{RawSyncPrimitivesProvider, RwLock, Synchronization},
 };
 
@@ -32,7 +32,7 @@ where
 
 impl<'platform, Platform, const ALIGN: usize> PageManager<'platform, Platform, ALIGN>
 where
-    Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN> + RawPointerProvider,
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
     /// Create a new `PageManager` instance.
     ///
