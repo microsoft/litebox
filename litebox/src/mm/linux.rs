@@ -8,6 +8,8 @@ use alloc::vec::Vec;
 use rangemap::RangeMap;
 use thiserror::Error;
 
+use crate::platform::RawConstPointer;
+
 /// Page size in bytes
 pub const PAGE_SIZE: usize = 4096;
 
@@ -231,7 +233,7 @@ impl<Backend: VmemBackend<ALIGN>, const ALIGN: usize> Vmem<Backend, ALIGN> {
         &mut self,
         range: PageRange<ALIGN>,
         vma: VmArea,
-    ) -> Option<usize> {
+    ) -> Option<<Backend as VmemBackend<ALIGN>>::RawMutPointer> {
         let (start, end) = (range.start, range.end);
         if start < Backend::TASK_ADDR_MIN || end > Backend::TASK_ADDR_MAX {
             return None;
@@ -246,9 +248,9 @@ impl<Backend: VmemBackend<ALIGN>, const ALIGN: usize> Vmem<Backend, ALIGN> {
             }
             .ok()?;
         }
-        unsafe { self.backend.map_pages(range, vma.flags) }.ok()?;
+        let ret = unsafe { self.backend.map_pages(range, vma.flags) }.ok()?;
         self.vmas.insert(start..end, vma);
-        Some(start)
+        Some(ret)
     }
 
     /// Create a new mapping in the virtual address space.
@@ -268,7 +270,7 @@ impl<Backend: VmemBackend<ALIGN>, const ALIGN: usize> Vmem<Backend, ALIGN> {
         suggested_range: PageRange<ALIGN>,
         vma: VmArea,
         fixed_addr: bool,
-    ) -> Option<usize> {
+    ) -> Option<<Backend as VmemBackend<ALIGN>>::RawMutPointer> {
         let new_addr = self.get_unmmaped_area(suggested_range, fixed_addr)?;
         // new_addr must be ALIGN aligned
         let new_range =
@@ -469,28 +471,30 @@ impl<Backend: VmemBackend<ALIGN>, const ALIGN: usize> Vmem<Backend, ALIGN> {
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     ///
     /// Also, caller must ensure flags are set correctly.
-    pub(super) unsafe fn create_pages<F, P>(
+    pub(super) unsafe fn create_pages<F>(
         &mut self,
         suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
         before_flags: VmFlags,
         after_flags: VmFlags,
         op: F,
-    ) -> Result<usize, MappingError>
+    ) -> Result<<Backend as VmemBackend<ALIGN>>::RawMutPointer, MappingError>
     where
-        P: crate::platform::RawMutPointer<u8> + From<usize>,
-        F: FnOnce(P) -> Result<usize, MappingError>,
+        F: FnOnce(<Backend as VmemBackend<ALIGN>>::RawMutPointer) -> Result<usize, MappingError>,
     {
         let addr =
             unsafe { self.create_mapping(suggested_range, VmArea::new(before_flags), fixed_addr) }
                 .ok_or(MappingError::OutOfMemory)?;
         // call the user function with the pages
-        let _ = op(P::from(addr))?;
+        let _ = op(addr)?;
         if before_flags != after_flags {
             // `protect` should succeed, as we just created the mapping.
             unsafe {
                 self.protect_mapping(
-                    PageRange::new_unchecked(addr, addr + suggested_range.len()),
+                    PageRange::new_unchecked(
+                        addr.as_usize(),
+                        addr.as_usize() + suggested_range.len(),
+                    ),
                     after_flags,
                 )
             }
@@ -555,6 +559,7 @@ impl<Backend: VmemBackend<ALIGN>, const ALIGN: usize> Vmem<Backend, ALIGN> {
 /// A trait for a virtual memory backend
 pub trait VmemBackend<const ALIGN: usize> {
     type InitItem;
+    type RawMutPointer: crate::platform::RawMutPointer<u8>;
 
     const TASK_ADDR_MIN: usize = PAGE_SIZE;
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
@@ -576,7 +581,7 @@ pub trait VmemBackend<const ALIGN: usize> {
         &mut self,
         range: PageRange<ALIGN>,
         flags: VmFlags,
-    ) -> Result<(), MmapError>;
+    ) -> Result<Self::RawMutPointer, MmapError>;
 
     /// Unmap pages at the given `range`
     ///

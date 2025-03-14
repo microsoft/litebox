@@ -3,6 +3,8 @@ use core::ops::Range;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::platform::{RawConstPointer, trivial_providers::TransparentMutPtr};
+
 use super::linux::{
     MmapError, NonZeroPageSize, PAGE_SIZE, PageRange, ProtectError, RemapError, UnmapError, VmArea,
     VmFlags, Vmem, VmemBackend, VmemProtectError, VmemResizeError,
@@ -13,6 +15,7 @@ struct DummyVmemBackend;
 
 impl VmemBackend<PAGE_SIZE> for DummyVmemBackend {
     type InitItem = ();
+    type RawMutPointer = TransparentMutPtr<u8>;
 
     unsafe fn new(item: Self::InitItem) -> Self {
         Self
@@ -22,8 +25,10 @@ impl VmemBackend<PAGE_SIZE> for DummyVmemBackend {
         &mut self,
         range: PageRange<PAGE_SIZE>,
         flags: VmFlags,
-    ) -> Result<(), MmapError> {
-        Ok(())
+    ) -> Result<TransparentMutPtr<u8>, MmapError> {
+        Ok(unsafe {
+            core::mem::transmute::<*mut u8, TransparentMutPtr<u8>>(range.start as *mut u8)
+        })
     }
 
     unsafe fn unmap_pages(&mut self, range: PageRange<PAGE_SIZE>) -> Result<(), UnmapError> {
@@ -171,7 +176,8 @@ fn test_vmm_mapping() {
                 false,
             )
         }
-        .unwrap(),
+        .unwrap()
+        .as_usize(),
         0x11000
     );
     assert_eq!(
@@ -193,7 +199,8 @@ fn test_vmm_mapping() {
                 true,
             )
         }
-        .unwrap(),
+        .unwrap()
+        .as_usize(),
         start_addr + PAGE_SIZE
     );
     assert_eq!(

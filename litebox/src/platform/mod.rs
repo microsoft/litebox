@@ -286,6 +286,9 @@ pub trait RawConstPointer<T>: Copy
 where
     T: Clone,
 {
+    /// Get the address of the pointer as a `usize`.
+    fn as_usize(&self) -> usize;
+
     /// Read the value of the pointer at signed offset from it.
     ///
     /// Returns `None` if the provided pointer is invalid, or such an offset is known (in advance)

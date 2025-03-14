@@ -14,7 +14,7 @@ use linux::{
 };
 
 use crate::{
-    platform::PageManagementProvider,
+    platform::{PageManagementProvider, RawConstPointer, RawPointerProvider},
     sync::{RawSyncPrimitivesProvider, RwLock, Synchronization},
 };
 
@@ -32,7 +32,7 @@ where
 
 impl<'platform, Platform, const ALIGN: usize> PageManager<'platform, Platform, ALIGN>
 where
-    Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN> + RawPointerProvider,
 {
     /// Create a new `PageManager` instance.
     ///
@@ -67,15 +67,14 @@ where
     /// If the suggested start address is given (i.e., not zero) and `fixed_addr` is set to `true`,
     /// the kernel uses it directly without checking if it is available, causing overlapping
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
-    pub unsafe fn create_executable_pages<F, P>(
+    pub unsafe fn create_executable_pages<F>(
         &self,
-        suggested_range: crate::mm::linux::PageRange<ALIGN>,
+        suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
         op: F,
-    ) -> Result<usize, crate::mm::linux::MappingError>
+    ) -> Result<<<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer, MappingError>
     where
-        P: crate::platform::RawMutPointer<u8> + From<usize>,
-        F: FnOnce(P) -> Result<usize, crate::mm::linux::MappingError>,
+        F: FnOnce(<<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer) -> Result<usize, MappingError>,
     {
         let mut vmem = self.vmem.write();
         unsafe {
@@ -107,15 +106,14 @@ where
     /// If the suggested start address is given (i.e., not zero) and `fixed_addr` is set to `true`,
     /// the kernel uses it directly without checking if it is available, causing overlapping
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
-    pub unsafe fn create_writable_pages<F, P>(
+    pub unsafe fn create_writable_pages<F>(
         &self,
         suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
         op: F,
-    ) -> Result<usize, MappingError>
+    ) -> Result<<<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer, MappingError>
     where
-        P: crate::platform::RawMutPointer<u8> + From<usize>,
-        F: FnOnce(P) -> Result<usize, MappingError>,
+        F: FnOnce(<<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer) -> Result<usize, MappingError>,
     {
         let flags =
             VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE;
@@ -139,15 +137,14 @@ where
     /// If the suggested start address is given (i.e., not zero) and `fixed_addr` is set to `true`,
     /// the kernel uses it directly without checking if it is available, causing overlapping
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
-    pub unsafe fn create_readable_pages<F, P>(
+    pub unsafe fn create_readable_pages<F>(
         &self,
         suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
         op: F,
-    ) -> Result<usize, MappingError>
+    ) -> Result<<<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer, MappingError>
     where
-        P: crate::platform::RawMutPointer<u8> + From<usize>,
-        F: FnOnce(P) -> Result<usize, MappingError>,
+        F: FnOnce(<<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer) -> Result<usize, MappingError>,
     {
         let mut vmem = self.vmem.write();
         unsafe {
@@ -172,21 +169,21 @@ where
     /// If the suggested start address is given (i.e., not zero) and `fixed_addr` is set to `true`,
     /// the kernel uses it directly without checking if it is available, causing overlapping
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
-    pub unsafe fn create_stack_pages<P>(
+    pub unsafe fn create_stack_pages(
         &self,
         suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
-    ) -> Result<usize, MappingError>
-    where
-        P: crate::platform::RawMutPointer<u8> + From<usize>,
-    {
+    ) -> Result<
+        <<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer,
+        MappingError,
+    > {
         let flags = VmFlags::VM_READ
             | VmFlags::VM_WRITE
             | VmFlags::VM_MAYREAD
             | VmFlags::VM_MAYWRITE
             | VmFlags::VM_GROWSDOWN;
         let mut vmem = self.vmem.write();
-        unsafe { vmem.create_pages(suggested_range, fixed_addr, flags, flags, |_: P| Ok(0)) }
+        unsafe { vmem.create_pages(suggested_range, fixed_addr, flags, flags, |_| Ok(0)) }
     }
 
     /// Remove pages from the mapping.
@@ -194,8 +191,13 @@ where
     /// # Safety
     ///
     /// The caller must ensure that the memory region is no longer used by any other.
-    pub unsafe fn remove_pages(&self, start: usize, len: usize) -> Result<(), VmemUnmapError> {
+    pub unsafe fn remove_pages(
+        &self,
+        ptr: <<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer,
+        len: usize,
+    ) -> Result<(), VmemUnmapError> {
         let mut vmem = self.vmem.write();
+        let start = ptr.as_usize();
         let range = PageRange::new(start, start + len).ok_or(VmemUnmapError::MisAligned)?;
         unsafe { vmem.remove_mapping(range) }
     }
@@ -209,7 +211,7 @@ where
     }
 }
 
-/// If Backend also implements VmemPageFaultHandler, it can handle page faults.
+/// If Backend also implements [`VmemPageFaultHandler`], it can handle page faults.
 impl<Platform, const ALIGN: usize> PageManager<'_, Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,

@@ -17,9 +17,12 @@ use x86_64::{
     },
 };
 
-use crate::mm::{
-    MemoryProvider,
-    pgtable::{PageTableAllocator, PageTableImpl},
+use crate::{
+    mm::{
+        MemoryProvider,
+        pgtable::{PageTableAllocator, PageTableImpl},
+    },
+    ptr::UserMutPtr,
 };
 
 #[cfg(not(test))]
@@ -75,6 +78,7 @@ pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
 }
 
 impl<M: MemoryProvider, const ALIGN: usize> VmemBackend<ALIGN> for X64PageTable<'_, M, ALIGN> {
+    type RawMutPointer = UserMutPtr<u8>;
     type InitItem = PhysAddr;
 
     unsafe fn new(item: Self::InitItem) -> Self {
@@ -83,11 +87,11 @@ impl<M: MemoryProvider, const ALIGN: usize> VmemBackend<ALIGN> for X64PageTable<
 
     unsafe fn map_pages(
         &mut self,
-        _range: PageRange<ALIGN>,
+        range: PageRange<ALIGN>,
         _flags: VmFlags,
-    ) -> Result<(), MmapError> {
+    ) -> Result<UserMutPtr<u8>, MmapError> {
         // leave it to page fault handler
-        Ok(())
+        Ok(unsafe { core::mem::transmute::<*mut u8, UserMutPtr<u8>>(range.start as *mut u8) })
     }
 
     /// Unmap 4KiB pages from the page table

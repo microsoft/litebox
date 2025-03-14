@@ -8,6 +8,7 @@ use litebox::{
         PageManager,
         linux::{PAGE_SIZE, PageFaultError, PageRange, VmFlags, VmemBackend},
     },
+    platform::RawConstPointer,
     sync::Synchronization,
 };
 use spin::mutex::SpinMutex;
@@ -238,7 +239,8 @@ fn test_vmm_page_fault() {
                 true,
                 |_: UserMutPtr<u8>| Ok(0),
             )
-            .unwrap(),
+            .unwrap()
+            .as_usize(),
             start_addr
         );
     }
@@ -270,11 +272,12 @@ fn test_vmm_page_fault() {
     let stack_addr: usize = 0x1000_0000;
     unsafe {
         assert_eq!(
-            vmm.create_stack_pages::<UserMutPtr<u8>>(
+            vmm.create_stack_pages(
                 PageRange::new(stack_addr, stack_addr + 4 * PAGE_SIZE).unwrap(),
                 true,
             )
-            .unwrap(),
+            .unwrap()
+            .as_usize(),
             stack_addr
         );
     }

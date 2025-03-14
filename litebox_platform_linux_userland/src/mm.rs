@@ -1,5 +1,6 @@
-use litebox::mm::linux::{
-    MmapError, PageRange, ProtectError, RemapError, UnmapError, VmFlags, VmemBackend,
+use litebox::{
+    mm::linux::{MmapError, PageRange, ProtectError, RemapError, UnmapError, VmFlags, VmemBackend},
+    platform::trivial_providers::TransparentMutPtr,
 };
 use nix::sys::mman::MRemapFlags;
 
@@ -24,6 +25,7 @@ fn vmflags_to_prots(flags: VmFlags) -> nix::sys::mman::ProtFlags {
 }
 
 impl<const ALIGN: usize> VmemBackend<ALIGN> for UserMemBackend {
+    type RawMutPointer = TransparentMutPtr<u8>;
     type InitItem = ();
 
     unsafe fn new(_item: Self::InitItem) -> Self {
@@ -34,8 +36,8 @@ impl<const ALIGN: usize> VmemBackend<ALIGN> for UserMemBackend {
         &mut self,
         range: PageRange<ALIGN>,
         flags: VmFlags,
-    ) -> Result<(), MmapError> {
-        unsafe {
+    ) -> Result<TransparentMutPtr<u8>, MmapError> {
+        let ptr = unsafe {
             nix::sys::mman::mmap_anonymous(
                 Some(core::num::NonZeroUsize::new(range.start).expect("non null addr")),
                 core::num::NonZeroUsize::new(range.len()).expect("non zero len"),
@@ -46,7 +48,7 @@ impl<const ALIGN: usize> VmemBackend<ALIGN> for UserMemBackend {
             )
         }
         .expect("mmap failed");
-        Ok(())
+        unsafe { core::mem::transmute(ptr.as_ptr()) }
     }
 
     unsafe fn unmap_pages(&mut self, range: PageRange<ALIGN>) -> Result<(), UnmapError> {

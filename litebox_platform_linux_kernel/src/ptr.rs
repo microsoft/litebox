@@ -18,6 +18,10 @@ impl<T: Clone> RawConstPointer<T> for UserConstPtr<T> {
     unsafe fn to_cow_slice<'a>(self, _len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
         todo!()
     }
+
+    fn as_usize(&self) -> usize {
+        self.inner as usize
+    }
 }
 
 impl<T: Clone> UserConstPtr<T> {
@@ -48,6 +52,10 @@ impl<T: Clone> RawConstPointer<T> for UserMutPtr<T> {
     unsafe fn to_cow_slice<'a>(self, _len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
         todo!()
     }
+
+    fn as_usize(&self) -> usize {
+        self.inner as usize
+    }
 }
 
 impl<T: Clone> RawMutPointer<T> for UserMutPtr<T> {
@@ -73,13 +81,5 @@ impl<T: Clone> UserMutPtr<T> {
     /// Write to user space at the `off` offset
     pub fn to_user_at_offset(self, off: isize, value: T) -> Option<()> {
         unsafe { self.write_at_offset(off, value) }
-    }
-}
-
-impl<T> From<usize> for UserMutPtr<T> {
-    fn from(addr: usize) -> Self {
-        Self {
-            inner: addr as *mut T,
-        }
     }
 }
