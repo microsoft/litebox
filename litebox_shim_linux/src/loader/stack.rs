@@ -75,8 +75,11 @@ pub enum AuxKey {
 /// for the new process. The stack is set up in a way that is compatible with
 /// the Linux ABI.
 pub(super) struct UserStack {
+    /// The top of the stack (base address)
     stack_top: MutPtr<u8>,
+    /// The length of the stack
     len: usize,
+    /// The current position of the stack pointer
     pos: isize,
 }
 
@@ -84,10 +87,14 @@ impl UserStack {
     /// Stack alignment required by libc ABI
     const STACK_ALIGNMENT: usize = 16;
 
-    /// stack_top must be aligned to [`Self::STACK_ALIGNMENT`] bytes
+    /// Create a new stack for the user process.
+    ///
+    /// `stack_top` and `len` must be aligned to [`Self::STACK_ALIGNMENT`]
     pub(super) fn new(stack_top: MutPtr<u8>, len: usize) -> Option<Self> {
-        let bottom = stack_top.as_usize() + len;
-        if bottom % Self::STACK_ALIGNMENT != 0 {
+        if stack_top.as_usize() % Self::STACK_ALIGNMENT != 0 {
+            return None;
+        }
+        if len % Self::STACK_ALIGNMENT != 0 {
             return None;
         }
         Some(Self {
@@ -97,11 +104,15 @@ impl UserStack {
         })
     }
 
+    /// Get the current stack pointer.
     pub(super) fn get_cur_stack_top(&self) -> usize {
         debug_assert!(self.pos >= 0);
         self.stack_top.as_usize() + self.pos.unsigned_abs()
     }
 
+    /// Push `bytes` to the stack.
+    ///
+    /// Returns `None` if stack has no enough space.
     fn write_bytes(&mut self, bytes: &[u8]) -> Option<()> {
         let old_pos = self.pos;
         self.pos = self.pos.checked_sub_unsigned(bytes.len())?;
@@ -110,15 +121,25 @@ impl UserStack {
         Some(())
     }
 
+    /// Push a value to the stack.
+    ///
+    /// Returns `None` if stack has no enough space.
     fn write_usize(&mut self, val: usize) -> Option<()> {
         self.write_bytes(&val.to_le_bytes())
     }
 
+    /// Push a string with a null terminator to the stack.
+    ///
+    /// Returns `None` if stack has no enough space.
     fn write_cstring(&mut self, val: &CString) -> Option<()> {
         let bytes = val.as_bytes_with_nul();
         self.write_bytes(bytes)
     }
 
+    /// Push a vector of strings with null terminators to the stack.
+    ///
+    /// Returns the offsets of the strings in the stack.
+    /// Returns `None` if stack has no enough space.
     fn write_cstrings(&mut self, vals: &[CString]) -> Option<Vec<isize>> {
         let mut envp = Vec::with_capacity(vals.len());
         for val in vals {
@@ -128,6 +149,11 @@ impl UserStack {
         Some(envp)
     }
 
+    /// Push a vector of stack pointers to the stack.
+    ///
+    /// `offsets` are the offsets of the pointers in the stack.
+    ///
+    /// Returns `None` if stack has no enough space.
     fn write_pointers(&mut self, offsets: Vec<isize>) -> Option<()> {
         // write end marker
         self.write_usize(0)?;
@@ -145,6 +171,9 @@ impl UserStack {
         Some(())
     }
 
+    /// Push a auxiliary vector to the stack.
+    ///
+    /// Returns `None` if stack has no enough space.
     fn write_aux(&mut self, aux: BTreeMap<AuxKey, usize>) -> Option<()> {
         // write end marker
         self.write_usize(0)?;
