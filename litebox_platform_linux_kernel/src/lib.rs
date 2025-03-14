@@ -6,6 +6,7 @@ use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};
 
 use host::linux::sigset_t;
+use litebox::mm::linux::PageRange;
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider, Provider,
     Punchthrough, PunchthroughError, PunchthroughProvider, PunchthroughToken, RawMutexProvider,
@@ -28,6 +29,7 @@ static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 /// It requires a host that implements the [`HostInterface`] trait.
 pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
+    mem_mgmt: mm::KernelVmemBackend<4096>,
 }
 
 /// Punchthrough for syscalls
@@ -104,9 +106,11 @@ impl<Host: HostInterface> Default for LinuxKernel<Host> {
 }
 
 impl<Host: HostInterface> LinuxKernel<Host> {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             host_and_task: core::marker::PhantomData,
+            // TODO: Update the init physaddr
+            mem_mgmt: unsafe { mm::KernelVmemBackend::new(x86_64::PhysAddr::zero()) },
         }
     }
 
@@ -396,5 +400,78 @@ pub trait HostInterface {
 }
 
 impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
-    type Backend = mm::KernelVmemBackend<ALIGN>;
+    fn allocate_pages(
+        &self,
+        range: core::ops::Range<usize>,
+        initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+        max_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+        can_grow_down: bool,
+    ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
+        let range = PageRange::new(range.start, range.end)
+            .ok_or(litebox::platform::page_mgmt::AllocationError::Unaligned)?;
+        let flags = (initial_permissions.bits() as u32)
+            | ((max_permissions.bits() as u32) << 4)
+            | if can_grow_down {
+                litebox::mm::linux::VmFlags::VM_GROWSDOWN.bits()
+            } else {
+                0
+            };
+        let flags = litebox::mm::linux::VmFlags::from_bits(flags).unwrap();
+        unsafe { self.mem_mgmt.map_pages(range, flags) }
+    }
+
+    unsafe fn deallocate_pages(
+        &self,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
+        let range = PageRange::new(range.start, range.end)
+            .ok_or(litebox::platform::page_mgmt::DeallocationError::Unaligned)?;
+        unsafe { self.mem_mgmt.unmap_pages(range) }
+    }
+
+    unsafe fn remap_pages(
+        &self,
+        old_range: core::ops::Range<usize>,
+        new_range: core::ops::Range<usize>,
+    ) -> Result<(), litebox::platform::page_mgmt::RemapError> {
+        let old_range = PageRange::new(old_range.start, old_range.end)
+            .ok_or(litebox::platform::page_mgmt::RemapError::Unaligned)?;
+        let new_range = PageRange::new(new_range.start, new_range.end)
+            .ok_or(litebox::platform::page_mgmt::RemapError::Unaligned)?;
+        if old_range.start.max(new_range.start) <= old_range.end.min(new_range.end) {
+            return Err(litebox::platform::page_mgmt::RemapError::Overlapping);
+        }
+        unsafe { self.mem_mgmt.remap_pages(old_range, new_range) }
+    }
+
+    unsafe fn update_permissions(
+        &self,
+        range: core::ops::Range<usize>,
+        new_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+    ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
+        let range = PageRange::new(range.start, range.end)
+            .ok_or(litebox::platform::page_mgmt::PermissionUpdateError::Unaligned)?;
+        let new_flags =
+            litebox::mm::linux::VmFlags::from_bits(new_permissions.bits().try_into().unwrap())
+                .unwrap();
+        unsafe { self.mem_mgmt.mprotect_pages(range, new_flags) }
+    }
+}
+
+impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKernel<Host> {
+    unsafe fn handle_page_fault(
+        &self,
+        fault_addr: usize,
+        flags: litebox::mm::linux::VmFlags,
+        error_code: u64,
+    ) -> Result<(), litebox::mm::linux::PageFaultError> {
+        unsafe {
+            self.mem_mgmt
+                .handle_page_fault(fault_addr, flags, error_code)
+        }
+    }
+
+    fn access_error(error_code: u64, flags: litebox::mm::linux::VmFlags) -> bool {
+        mm::KernelVmemBackend::<4096>::access_error(error_code, flags)
+    }
 }

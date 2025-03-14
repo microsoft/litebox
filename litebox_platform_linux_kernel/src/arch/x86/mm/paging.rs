@@ -1,7 +1,5 @@
-use litebox::mm::linux::{
-    MmapError, PageFaultError, PageRange, ProtectError, RemapError, UnmapError, VmFlags,
-    VmemBackend, VmemPageFaultHandler,
-};
+use litebox::mm::linux::{PageFaultError, PageRange, VmFlags, VmemPageFaultHandler};
+use litebox::platform::page_mgmt;
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::{
@@ -37,7 +35,7 @@ fn frame_to_pointer<M: MemoryProvider>(frame: PhysFrame) -> *mut PageTable {
 }
 
 pub struct X64PageTable<'a, M: MemoryProvider, const ALIGN: usize> {
-    inner: MappedPageTable<'a, FrameMapping<M>>,
+    inner: spin::mutex::SpinMutex<MappedPageTable<'a, FrameMapping<M>>>,
 }
 
 struct FrameMapping<M: MemoryProvider> {
@@ -77,19 +75,16 @@ pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
     flags
 }
 
-impl<M: MemoryProvider, const ALIGN: usize> VmemBackend<ALIGN> for X64PageTable<'_, M, ALIGN> {
-    type RawMutPointer = UserMutPtr<u8>;
-    type InitItem = PhysAddr;
-
-    unsafe fn new(item: Self::InitItem) -> Self {
+impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
+    pub(crate) unsafe fn new(item: PhysAddr) -> Self {
         unsafe { Self::init(item) }
     }
 
-    unsafe fn map_pages(
-        &mut self,
+    pub(crate) unsafe fn map_pages(
+        &self,
         range: PageRange<ALIGN>,
         _flags: VmFlags,
-    ) -> Result<UserMutPtr<u8>, MmapError> {
+    ) -> Result<UserMutPtr<u8>, page_mgmt::AllocationError> {
         // leave it to page fault handler
         Ok(unsafe { core::mem::transmute::<*mut u8, UserMutPtr<u8>>(range.start as *mut u8) })
     }
@@ -98,7 +93,10 @@ impl<M: MemoryProvider, const ALIGN: usize> VmemBackend<ALIGN> for X64PageTable<
     ///
     /// Note it does not free the allocated frames for page table itself (only those allocated to
     /// user space).
-    unsafe fn unmap_pages(&mut self, range: PageRange<ALIGN>) -> Result<(), UnmapError> {
+    pub(crate) unsafe fn unmap_pages(
+        &self,
+        range: PageRange<ALIGN>,
+    ) -> Result<(), page_mgmt::DeallocationError> {
         let start_va = VirtAddr::new(range.start as _);
         let start = Page::<Size4KiB>::from_start_address(start_va).expect("invalid start address");
         let end_va = VirtAddr::new(range.end as _);
@@ -107,8 +105,9 @@ impl<M: MemoryProvider, const ALIGN: usize> VmemBackend<ALIGN> for X64PageTable<
 
         // Note this implementation is slow as each page requires a full page table walk.
         // If we have N pages, it will be N times slower.
+        let mut inner = self.inner.lock();
         for page in Page::range(start, end) {
-            match self.inner.unmap(page) {
+            match inner.unmap(page) {
                 Ok((frame, fl)) => {
                     unsafe { allocator.deallocate_frame(frame) };
                     if FLUSH_TLB {
@@ -127,11 +126,11 @@ impl<M: MemoryProvider, const ALIGN: usize> VmemBackend<ALIGN> for X64PageTable<
         Ok(())
     }
 
-    unsafe fn remap_pages(
-        &mut self,
+    pub(crate) unsafe fn remap_pages(
+        &self,
         old_range: PageRange<ALIGN>,
         new_range: PageRange<ALIGN>,
-    ) -> Result<(), RemapError> {
+    ) -> Result<(), page_mgmt::RemapError> {
         let mut start: Page<Size4KiB> =
             Page::from_start_address(VirtAddr::new(old_range.start as u64))
                 .expect("invalid start address");
@@ -144,26 +143,26 @@ impl<M: MemoryProvider, const ALIGN: usize> VmemBackend<ALIGN> for X64PageTable<
         // Note this implementation is slow as each page requires three full page table walks.
         // If we have N pages, it will be 3N times slower.
         let mut allocator = PageTableAllocator::<M>::new();
+        let mut inner = self.inner.lock();
         while start < end {
-            match self.inner.translate(start.start_address()) {
+            match inner.translate(start.start_address()) {
                 TranslateResult::Mapped {
                     frame: _,
                     offset: _,
                     flags,
-                } => match self.inner.unmap(start) {
+                } => match inner.unmap(start) {
                     Ok((frame, fl)) => {
-                        match unsafe { self.inner.map_to(new_start, frame, flags, &mut allocator) }
-                        {
+                        match unsafe { inner.map_to(new_start, frame, flags, &mut allocator) } {
                             Ok(_) => {}
                             Err(e) => match e {
                                 MapToError::PageAlreadyMapped(_) => {
                                     panic!("Page already mapped")
                                 }
                                 MapToError::ParentEntryHugePage => {
-                                    return Err(RemapError::RemapToHugePage);
+                                    todo!("return Err(page_mgmt::RemapError::RemapToHugePage);")
                                 }
                                 MapToError::FrameAllocationFailed => {
-                                    return Err(RemapError::OutOfMemory);
+                                    return Err(page_mgmt::RemapError::OutOfMemory);
                                 }
                             },
                         }
@@ -175,7 +174,7 @@ impl<M: MemoryProvider, const ALIGN: usize> VmemBackend<ALIGN> for X64PageTable<
                         unreachable!()
                     }
                     Err(X64UnmapError::ParentEntryHugePage) => {
-                        return Err(RemapError::RemapToHugePage);
+                        todo!("return Err(page_mgmt::RemapError::RemapToHugePage);")
                     }
                     Err(X64UnmapError::InvalidFrameAddress(pa)) => {
                         panic!("Invalid frame address: {:#x}", pa);
@@ -193,11 +192,11 @@ impl<M: MemoryProvider, const ALIGN: usize> VmemBackend<ALIGN> for X64PageTable<
         Ok(())
     }
 
-    unsafe fn mprotect_pages(
-        &mut self,
+    pub(crate) unsafe fn mprotect_pages(
+        &self,
         range: PageRange<ALIGN>,
         new_flags: VmFlags,
-    ) -> Result<(), ProtectError> {
+    ) -> Result<(), page_mgmt::PermissionUpdateError> {
         let start = VirtAddr::new(range.start as _);
         let end = VirtAddr::new(range.end as _);
         let new_flags = vmflags_to_pteflags(new_flags) & Self::MPROTECT_PTE_MASK;
@@ -206,8 +205,9 @@ impl<M: MemoryProvider, const ALIGN: usize> VmemBackend<ALIGN> for X64PageTable<
 
         // TODO: this implementation is slow as each page requires two full page table walks.
         // If we have N pages, it will be 2N times slower.
+        let mut inner = self.inner.lock();
         for page in Page::range(start, end + 1) {
-            match self.inner.translate(page.start_address()) {
+            match inner.translate(page.start_address()) {
                 TranslateResult::Mapped {
                     frame: _,
                     offset: _,
@@ -223,8 +223,7 @@ impl<M: MemoryProvider, const ALIGN: usize> VmemBackend<ALIGN> for X64PageTable<
                     };
                     if flags != new_flags {
                         match unsafe {
-                            self.inner
-                                .update_flags(page, (flags & !Self::MPROTECT_PTE_MASK) | new_flags)
+                            inner.update_flags(page, (flags & !Self::MPROTECT_PTE_MASK) | new_flags)
                         } {
                             Ok(fl) => {
                                 if FLUSH_TLB {
@@ -234,7 +233,7 @@ impl<M: MemoryProvider, const ALIGN: usize> VmemBackend<ALIGN> for X64PageTable<
                             Err(e) => match e {
                                 FlagUpdateError::PageNotMapped => unreachable!(),
                                 FlagUpdateError::ParentEntryHugePage => {
-                                    return Err(ProtectError::ProtectHugePage);
+                                    todo!("return Err(ProtectError::ProtectHugePage);")
                                 }
                             },
                         }
@@ -261,22 +260,23 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
         let p4_va = mapping.frame_to_pointer(frame);
         let p4 = unsafe { &mut *p4_va };
         X64PageTable {
-            inner: unsafe { MappedPageTable::new(p4, mapping) },
+            inner: unsafe { MappedPageTable::new(p4, mapping) }.into(),
         }
     }
 
     #[cfg(test)]
     fn translate(&self, addr: VirtAddr) -> TranslateResult {
-        self.inner.translate(addr)
+        self.inner.lock().translate(addr)
     }
 
     unsafe fn handle_page_fault(
-        &mut self,
+        &self,
         page: Page<Size4KiB>,
         flags: PageTableFlags,
         error_code: PageFaultErrorCode,
     ) -> Result<(), PageFaultError> {
-        match self.inner.translate(page.start_address()) {
+        let mut inner = self.inner.lock();
+        match inner.translate(page.start_address()) {
             TranslateResult::Mapped {
                 frame: _,
                 offset: _,
@@ -307,7 +307,7 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                     | PageTableFlags::WRITABLE
                     | PageTableFlags::USER_ACCESSIBLE;
                 match unsafe {
-                    self.inner.map_to_with_table_flags(
+                    inner.map_to_with_table_flags(
                         page,
                         frame,
                         flags | PageTableFlags::PRESENT,
@@ -346,7 +346,7 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
 
 impl<M: MemoryProvider, const ALIGN: usize> VmemPageFaultHandler for X64PageTable<'_, M, ALIGN> {
     unsafe fn handle_page_fault(
-        &mut self,
+        &self,
         fault_addr: usize,
         flags: VmFlags,
         error_code: u64,

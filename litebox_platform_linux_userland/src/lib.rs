@@ -11,8 +11,7 @@ use std::time::Duration;
 
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
-
-pub mod mm;
+use litebox::platform::page_mgmt::MemoryRegionPermissions;
 
 /// The userland Linux platform.
 ///
@@ -438,6 +437,97 @@ fn futex_val2(
     unsafe { libc::syscall(libc::SYS_futex, uaddr, futex_op, val, val2, uaddr2, val3) }
 }
 
+fn prot_flags(flags: MemoryRegionPermissions) -> nix::sys::mman::ProtFlags {
+    use nix::sys::mman::ProtFlags;
+    let mut res = nix::sys::mman::ProtFlags::PROT_NONE;
+    res.set(
+        ProtFlags::PROT_READ,
+        flags.contains(MemoryRegionPermissions::READ),
+    );
+    res.set(
+        ProtFlags::PROT_WRITE,
+        flags.contains(MemoryRegionPermissions::WRITE),
+    );
+    res.set(
+        ProtFlags::PROT_EXEC,
+        flags.contains(MemoryRegionPermissions::EXEC),
+    );
+    if flags.contains(MemoryRegionPermissions::SHARED) {
+        unimplemented!()
+    }
+    res
+}
+
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for LinuxUserland {
-    type Backend = mm::UserMemBackend;
+    fn allocate_pages(
+        &self,
+        range: std::ops::Range<usize>,
+        initial_permissions: MemoryRegionPermissions,
+        max_permissions: MemoryRegionPermissions,
+        can_grow_down: bool,
+    ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
+        // TODO: Track `max_permission` somehow?
+        let _ = max_permissions;
+        let ptr = unsafe {
+            nix::sys::mman::mmap_anonymous(
+                Some(core::num::NonZeroUsize::new(range.start).expect("non null addr")),
+                core::num::NonZeroUsize::new(range.len()).expect("non zero len"),
+                prot_flags(initial_permissions),
+                nix::sys::mman::MapFlags::MAP_PRIVATE
+                    | nix::sys::mman::MapFlags::MAP_ANONYMOUS
+                    | nix::sys::mman::MapFlags::MAP_FIXED
+                    | (if can_grow_down {
+                        nix::sys::mman::MapFlags::MAP_GROWSDOWN
+                    } else {
+                        nix::sys::mman::MapFlags::empty()
+                    }),
+            )
+        }
+        .expect("mmap failed");
+        Ok(litebox::platform::trivial_providers::TransparentMutPtr {
+            inner: ptr.as_ptr().cast(),
+        })
+    }
+
+    unsafe fn deallocate_pages(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
+        let addr = core::ptr::NonNull::new(range.start as _).expect("non null addr");
+        unsafe { nix::sys::mman::munmap(addr, range.len()) }.expect("munmap failed");
+        Ok(())
+    }
+
+    unsafe fn remap_pages(
+        &self,
+        old_range: std::ops::Range<usize>,
+        new_range: std::ops::Range<usize>,
+    ) -> Result<(), litebox::platform::page_mgmt::RemapError> {
+        let addr = core::ptr::NonNull::new(old_range.start as _).expect("non null addr");
+        let new_address =
+            Some(core::ptr::NonNull::new(new_range.start as _).expect("non null new addr"));
+        let res = unsafe {
+            nix::sys::mman::mremap(
+                addr,
+                old_range.len(),
+                new_range.len(),
+                nix::sys::mman::MRemapFlags::MREMAP_FIXED,
+                new_address,
+            )
+            .expect("mremap failed")
+        };
+        assert_eq!(res.as_ptr() as usize, new_range.start);
+        Ok(())
+    }
+
+    unsafe fn update_permissions(
+        &self,
+        range: std::ops::Range<usize>,
+        new_permissions: MemoryRegionPermissions,
+    ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
+        let addr = core::ptr::NonNull::new(range.start as _).expect("non null addr");
+        unsafe { nix::sys::mman::mprotect(addr, range.len(), prot_flags(new_permissions)) }
+            .expect("mprotect failed");
+        Ok(())
+    }
 }

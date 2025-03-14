@@ -6,7 +6,7 @@ use arrayvec::ArrayVec;
 use litebox::{
     mm::{
         PageManager,
-        linux::{PAGE_SIZE, PageFaultError, PageRange, VmFlags, VmemBackend},
+        linux::{PAGE_SIZE, PageFaultError, PageRange, VmFlags},
     },
     platform::RawConstPointer,
     sync::Synchronization,
@@ -225,7 +225,8 @@ fn test_vmm_page_fault() {
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
     let platform = MockKernel::new();
     let sync = Synchronization::new(&platform);
-    let mut vmm = unsafe { PageManager::<'_, _, PAGE_SIZE>::new(&sync, p4.start_address()) };
+    // TODO: Handle passing p4.start_address()
+    let mut vmm = unsafe { PageManager::<'_, _, PAGE_SIZE>::new(&platform) };
     unsafe {
         assert_eq!(
             vmm.create_writable_pages(start_addr, 4 * PAGE_SIZE, true, |_: UserMutPtr<u8>| Ok(0),)

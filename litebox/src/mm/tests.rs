@@ -3,51 +3,56 @@ use core::ops::Range;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::platform::{RawConstPointer, trivial_providers::TransparentMutPtr};
+use crate::platform::{
+    RawConstPointer,
+    trivial_providers::{TransparentConstPtr, TransparentMutPtr},
+};
 
 use super::linux::{
-    MmapError, NonZeroPageSize, PAGE_SIZE, PageRange, ProtectError, RemapError, UnmapError, VmArea,
-    VmFlags, Vmem, VmemBackend, VmemProtectError, VmemResizeError,
+    NonZeroPageSize, PAGE_SIZE, PageRange, VmArea, VmFlags, Vmem, VmemProtectError, VmemResizeError,
 };
 
 /// A dummy implementation of [`VmemBackend`] that does nothing.
 struct DummyVmemBackend;
 
-impl VmemBackend<PAGE_SIZE> for DummyVmemBackend {
-    type InitItem = ();
-    type RawMutPointer = TransparentMutPtr<u8>;
+impl crate::platform::RawPointerProvider for DummyVmemBackend {
+    type RawConstPointer<T: Clone> = TransparentConstPtr<T>;
+    type RawMutPointer<T: Clone> = TransparentMutPtr<T>;
+}
 
-    unsafe fn new(item: Self::InitItem) -> Self {
-        Self
-    }
-
-    unsafe fn map_pages(
-        &mut self,
-        range: PageRange<PAGE_SIZE>,
-        flags: VmFlags,
-    ) -> Result<TransparentMutPtr<u8>, MmapError> {
+impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
+    fn allocate_pages(
+        &self,
+        range: Range<usize>,
+        initial_permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
+        max_permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
+        can_grow_down: bool,
+    ) -> Result<Self::RawMutPointer<u8>, crate::platform::page_mgmt::AllocationError> {
         Ok(unsafe {
             core::mem::transmute::<*mut u8, TransparentMutPtr<u8>>(range.start as *mut u8)
         })
     }
 
-    unsafe fn unmap_pages(&mut self, range: PageRange<PAGE_SIZE>) -> Result<(), UnmapError> {
+    unsafe fn deallocate_pages(
+        &self,
+        range: Range<usize>,
+    ) -> Result<(), crate::platform::page_mgmt::DeallocationError> {
         Ok(())
     }
 
     unsafe fn remap_pages(
-        &mut self,
-        old_range: PageRange<PAGE_SIZE>,
-        new_range: PageRange<PAGE_SIZE>,
-    ) -> Result<(), RemapError> {
+        &self,
+        old_range: Range<usize>,
+        new_range: Range<usize>,
+    ) -> Result<(), crate::platform::page_mgmt::RemapError> {
         Ok(())
     }
 
-    unsafe fn mprotect_pages(
-        &mut self,
-        range: PageRange<PAGE_SIZE>,
-        new_flags: VmFlags,
-    ) -> Result<(), ProtectError> {
+    unsafe fn update_permissions(
+        &self,
+        range: Range<usize>,
+        new_permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
+    ) -> Result<(), crate::platform::page_mgmt::PermissionUpdateError> {
         Ok(())
     }
 }
@@ -61,7 +66,7 @@ fn collect_mappings(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<Range<usize>
 fn test_vmm_mapping() {
     let start_addr: usize = 0x1000;
     let range = PageRange::new(start_addr, start_addr + 12 * PAGE_SIZE).unwrap();
-    let mut vmm = Vmem::new(DummyVmemBackend);
+    let mut vmm = Vmem::new(&DummyVmemBackend);
 
     // []
     unsafe {
