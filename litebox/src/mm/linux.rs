@@ -58,6 +58,7 @@ pub struct PageRange<const ALIGN: usize> {
     /// End page of the range.
     pub end: usize,
 }
+
 impl<const ALIGN: usize> From<PageRange<ALIGN>> for Range<usize> {
     fn from(range: PageRange<ALIGN>) -> Self {
         range.start..range.end
@@ -602,7 +603,7 @@ pub enum VmemMoveError {
 
 /// Error for protecting mappings
 #[derive(Error, Debug)]
-pub enum VmemProtectError {
+pub(super) enum VmemProtectError {
     #[error("the range {0:?} has no mapping memory")]
     InvalidRange(Range<usize>),
     #[error("failed to change permissions from {old:?} to {new:?}")]
