@@ -8,8 +8,8 @@ use elf_loader::{
     object::ElfObject,
 };
 use litebox::{
-    fs::{errors::OpenError, FileSystem, Mode, OFlags},
-    mm::linux::{MappingError, PageRange},
+    fs::{FileSystem, Mode, OFlags, errors::OpenError},
+    mm::linux::{MappingError, PAGE_SIZE},
     platform::{RawConstPointer, RawMutPointer},
 };
 use thiserror::Error;
@@ -203,6 +203,8 @@ struct ElfLoadInfo {
 struct ElfLoader;
 
 impl ElfLoader {
+    const DEFAULT_STACK_SIZE: usize = 2 * PAGE_SIZE;
+
     fn init_auxvec(elf: &Elf) -> BTreeMap<AuxKey, usize> {
         let mut aux = BTreeMap::new();
         let phdrs = elf.phdrs();
@@ -227,7 +229,6 @@ impl ElfLoader {
         path: &str,
         argv: Vec<CString>,
         envp: Vec<CString>,
-        stack_top_vaddr: usize,
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let elf = {
             let mut loader = Loader::<ElfLoaderMmap>::new();
@@ -255,15 +256,19 @@ impl ElfLoader {
             elf.entry()
         };
 
-        let stack = UserStack::new(stack_top_vaddr)
-            .ok_or(ElfLoaderError::InvalidStackAddr(stack_top_vaddr))?;
-        let pos = stack
+        let sp = unsafe {
+            litebox_vmm()
+                .create_stack_pages(0, Self::DEFAULT_STACK_SIZE, false)
+                .unwrap()
+        };
+        let mut stack = UserStack::new(sp, Self::DEFAULT_STACK_SIZE).unwrap();
+        stack
             .init(argv, envp, aux)
-            .ok_or(ElfLoaderError::InvalidStackAddr(stack_top_vaddr))?;
+            .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ElfLoadInfo {
             entry_point: entry,
-            user_stack_top: stack_top_vaddr.checked_add_signed(pos).unwrap(),
+            user_stack_top: stack.get_cur_stack_top(),
         })
     }
 }
@@ -274,8 +279,8 @@ enum ElfLoaderError {
     OpenError(#[from] OpenError),
     #[error("failed to load the ELF file: {0}")]
     LoaderError(#[from] elf_loader::Error),
-    #[error("invalid stack addr: {0}")]
-    InvalidStackAddr(usize),
+    #[error("invalid stack")]
+    InvalidStackAddr,
 }
 
 #[cfg(test)]
@@ -359,16 +364,12 @@ mod tests {
         let executable_path = "/hello";
         install_file(&path, executable_path);
 
-        #[allow(static_mut_refs)]
-        let sp: *mut u8 = unsafe { TEST_EXEC_STACK.0.as_mut_ptr().add(TEST_EXEC_STACK.0.len()) };
         let argv = vec![
             CString::new("./hello").unwrap(),
             CString::new("hello").unwrap(),
         ];
         let envp = vec![CString::new("PATH=/bin").unwrap()];
-
-        let info = ElfLoader::load(executable_path, argv, envp, sp as usize)
-            .expect("failed to load executable");
+        let info = ElfLoader::load(executable_path, argv, envp).expect("failed to load executable");
 
         unsafe { trampoline(info.entry_point, info.user_stack_top) };
     }

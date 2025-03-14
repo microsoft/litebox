@@ -31,7 +31,7 @@ position            content                     size (bytes) + comment
   ------------------------------------------------------------------------
  */
 use alloc::{collections::btree_map::BTreeMap, ffi::CString, vec::Vec};
-use litebox::platform::RawMutPointer;
+use litebox::platform::{RawConstPointer, RawMutPointer};
 
 use crate::MutPtr;
 
@@ -75,7 +75,9 @@ pub enum AuxKey {
 /// for the new process. The stack is set up in a way that is compatible with
 /// the Linux ABI.
 pub(super) struct UserStack {
-    stack_top_vaddr: usize,
+    stack_top: MutPtr<u8>,
+    len: usize,
+    pos: isize,
 }
 
 impl UserStack {
@@ -83,62 +85,75 @@ impl UserStack {
     const STACK_ALIGNMENT: usize = 16;
 
     /// stack_top must be aligned to [`Self::STACK_ALIGNMENT`] bytes
-    pub(super) fn new(stack_top_vaddr: usize) -> Option<Self> {
-        if stack_top_vaddr % Self::STACK_ALIGNMENT != 0 {
+    pub(super) fn new(stack_top: MutPtr<u8>, len: usize) -> Option<Self> {
+        let bottom = stack_top.as_usize() + len;
+        if bottom % Self::STACK_ALIGNMENT != 0 {
             return None;
         }
-        Some(Self { stack_top_vaddr })
+        Some(Self {
+            stack_top,
+            len,
+            pos: isize::try_from(len).ok()?,
+        })
     }
 
-    fn write_bytes(&self, bytes: &[u8], pos: isize) -> Option<isize> {
-        let new_pos = pos.checked_sub_unsigned(bytes.len())?;
-        let stack_top = MutPtr::<u8>::from(self.stack_top_vaddr);
-        stack_top.mutate_subslice_with(new_pos..pos, |s| s.copy_from_slice(bytes))?;
-        Some(new_pos)
+    pub(super) fn get_cur_stack_top(&self) -> usize {
+        debug_assert!(self.pos >= 0);
+        self.stack_top.as_usize() + self.pos.unsigned_abs()
     }
 
-    fn write_cstring(&self, val: &CString, pos: isize) -> Option<isize> {
+    fn write_bytes(&mut self, bytes: &[u8]) -> Option<()> {
+        let old_pos = self.pos;
+        self.pos = self.pos.checked_sub_unsigned(bytes.len())?;
+        self.stack_top
+            .mutate_subslice_with(self.pos..old_pos, |s| s.copy_from_slice(bytes))?;
+        Some(())
+    }
+
+    fn write_usize(&mut self, val: usize) -> Option<()> {
+        self.write_bytes(&val.to_le_bytes())
+    }
+
+    fn write_cstring(&mut self, val: &CString) -> Option<()> {
         let bytes = val.as_bytes_with_nul();
-        self.write_bytes(bytes, pos)
+        self.write_bytes(bytes)
     }
 
-    fn write_cstrings(&self, vals: &[CString], pos: isize) -> Option<(isize, Vec<isize>)> {
+    fn write_cstrings(&mut self, vals: &[CString]) -> Option<Vec<isize>> {
         let mut envp = Vec::with_capacity(vals.len());
-        let mut new_pos = pos;
         for val in vals {
-            new_pos = self.write_cstring(val, new_pos)?;
-            envp.push(new_pos);
+            self.write_cstring(val)?;
+            envp.push(self.pos);
         }
-        Some((new_pos, envp))
+        Some(envp)
     }
 
-    fn write_pointers(&self, offsets: Vec<isize>, pos: isize) -> Option<isize> {
+    fn write_pointers(&mut self, offsets: Vec<isize>) -> Option<()> {
         // write end marker
-        let pos = self.write_bytes(&0isize.to_le_bytes(), pos)?;
+        self.write_usize(0)?;
         let len = offsets.len();
-        let new_pos = pos.checked_sub_unsigned(len * size_of::<isize>());
-        let new_pos = pos.checked_sub_unsigned(len * size_of::<usize>())?;
-        let stack_top = MutPtr::<u8>::from(self.stack_top_vaddr);
-        stack_top.mutate_subslice_with(new_pos..pos, |s| -> Option<()> {
-            for (i, p) in offsets.iter().enumerate() {
-                let addr = self.stack_top_vaddr.checked_add_signed(*p)?;
-                s[i * 8..(i + 1) * 8].copy_from_slice(&addr.to_le_bytes());
-            }
-            Some(())
-        })?;
-        Some(new_pos)
+        let old_pos = self.pos;
+        self.pos = self.pos.checked_sub_unsigned(len * size_of::<isize>())?;
+        self.stack_top
+            .mutate_subslice_with(self.pos..old_pos, |s| -> Option<()> {
+                for (i, p) in offsets.iter().enumerate() {
+                    let addr = self.stack_top.as_usize().checked_add_signed(*p)?;
+                    s[i * 8..(i + 1) * 8].copy_from_slice(&addr.to_le_bytes());
+                }
+                Some(())
+            })?;
+        Some(())
     }
 
-    fn write_aux(&self, aux: BTreeMap<AuxKey, usize>, pos: isize) -> Option<isize> {
+    fn write_aux(&mut self, aux: BTreeMap<AuxKey, usize>) -> Option<()> {
         // write end marker
-        let pos = self.write_bytes(&0usize.to_le_bytes(), pos)?;
-        let pos = self.write_bytes(&(AuxKey::AT_NULL as usize).to_le_bytes(), pos)?;
-        let mut new_pos = pos;
+        self.write_usize(0)?;
+        self.write_usize(AuxKey::AT_NULL as usize)?;
         for (key, val) in aux {
-            new_pos = self.write_bytes(&val.to_le_bytes(), new_pos)?;
-            new_pos = self.write_bytes(&(key as usize).to_le_bytes(), new_pos)?;
+            self.write_usize(val)?;
+            self.write_usize(key as usize)?;
         }
-        Some(new_pos)
+        Some(())
     }
 
     fn align_down(pos: isize, alignment: usize) -> isize {
@@ -156,41 +171,40 @@ impl UserStack {
 
     /// Initialize the stack for the new process.
     pub(super) fn init(
-        &self,
+        &mut self,
         argv: Vec<CString>,
         env: Vec<CString>,
         mut aux: BTreeMap<AuxKey, usize>,
-    ) -> Option<isize> {
-        let pos: isize = -8;
+    ) -> Option<()> {
         // end markers
-        let stack_top = MutPtr::<u8>::from(self.stack_top_vaddr);
+        self.pos = self.pos.checked_sub_unsigned(size_of::<usize>())?;
         unsafe {
-            stack_top.write_at_offset(pos, 0)?;
+            self.stack_top.write_at_offset(self.pos, 0)?;
         }
 
-        let (pos, envp) = self.write_cstrings(&env, pos)?;
-        let (pos, argvp) = self.write_cstrings(&argv, pos)?;
+        let envp = self.write_cstrings(&env)?;
+        let argvp = self.write_cstrings(&argv)?;
 
-        let pos = self.write_bytes(&Self::get_random_value(), pos)?;
+        self.write_bytes(&Self::get_random_value())?;
         aux.insert(
             AuxKey::AT_RANDOM,
-            self.stack_top_vaddr.checked_add_signed(pos)?,
+            self.stack_top.as_usize().checked_add_signed(self.pos)?,
         );
 
         // ensure stack is aligned
-        let pos = Self::align_down(pos, size_of::<usize>());
+        self.pos = Self::align_down(self.pos, size_of::<usize>());
         // to ensure the final pos is aligned, we need to add some padding
         let len = (aux.len() + 1) * 2 + envp.len() + 1 + argvp.len() + 1 + /* argc */ 1;
         let size = len * size_of::<usize>();
-        let final_pos = pos.checked_sub_unsigned(size)?;
-        let new_pos = pos - (final_pos - Self::align_down(final_pos, Self::STACK_ALIGNMENT));
+        let final_pos = self.pos.checked_sub_unsigned(size)?;
+        self.pos -= final_pos - Self::align_down(final_pos, Self::STACK_ALIGNMENT);
 
-        let new_pos = self.write_aux(aux, new_pos)?;
-        let new_pos = self.write_pointers(envp, new_pos)?;
-        let new_pos = self.write_pointers(argvp, new_pos)?;
+        self.write_aux(aux)?;
+        self.write_pointers(envp)?;
+        self.write_pointers(argvp)?;
 
-        let new_pos = self.write_bytes(&argv.len().to_le_bytes(), new_pos)?;
-        assert_eq!(new_pos, Self::align_down(new_pos, Self::STACK_ALIGNMENT));
-        Some(new_pos)
+        self.write_usize(argv.len())?;
+        assert_eq!(self.pos, Self::align_down(self.pos, Self::STACK_ALIGNMENT));
+        Some(())
     }
 }

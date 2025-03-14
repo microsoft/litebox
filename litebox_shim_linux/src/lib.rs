@@ -18,7 +18,12 @@ use alloc::vec::Vec;
 // platform-specific things within it.
 use once_cell::race::OnceBox;
 
-use litebox::{fs::FileSystem as _, mm::{linux::PAGE_SIZE, PageManager}, platform::RawConstPointer as _, sync::RwLock};
+use litebox::{
+    fs::FileSystem as _,
+    mm::{PageManager, linux::PAGE_SIZE},
+    platform::RawConstPointer as _,
+    sync::RwLock,
+};
 use litebox_common_linux::errno::Errno;
 use litebox_platform_multiplex::Platform;
 
