@@ -228,13 +228,9 @@ fn test_vmm_page_fault() {
     let mut vmm = unsafe { PageManager::<'_, _, PAGE_SIZE>::new(&sync, p4.start_address()) };
     unsafe {
         assert_eq!(
-            vmm.create_writable_pages(
-                PageRange::new(start_addr, start_addr + 4 * PAGE_SIZE).unwrap(),
-                true,
-                |_: UserMutPtr<u8>| Ok(0),
-            )
-            .unwrap()
-            .as_usize(),
+            vmm.create_writable_pages(start_addr, 4 * PAGE_SIZE, true, |_: UserMutPtr<u8>| Ok(0),)
+                .unwrap()
+                .as_usize(),
             start_addr
         );
     }

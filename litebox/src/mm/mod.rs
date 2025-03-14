@@ -53,8 +53,8 @@ where
 
     /// Create readable and executable pages.
     ///
-    /// `suggested_range` is the range of pages to create. If the start address is not given (i.e., zero), some
-    /// available memory region will be chosen. Otherwise, the range will be created at the given address if it
+    /// `suggested_addr` is the hint address to create the pages. If it is not given (i.e., zero),
+    /// some available memory region will be chosen. Otherwise, the range will be created at the given address if it
     /// is available.
     ///
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
@@ -69,13 +69,16 @@ where
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     pub unsafe fn create_executable_pages<F>(
         &self,
-        suggested_range: PageRange<ALIGN>,
+        suggested_addr: usize,
+        len: usize,
         fixed_addr: bool,
         op: F,
     ) -> Result<<<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer, MappingError>
     where
         F: FnOnce(<<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer) -> Result<usize, MappingError>,
     {
+        let suggested_range =
+            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::MisAligned)?;
         let mut vmem = self.vmem.write();
         unsafe {
             vmem.create_pages(
@@ -92,8 +95,8 @@ where
 
     /// Create readable and writable pages.
     ///
-    /// `suggested_range` is the range of pages to create. If the start address is not given (i.e., zero), some
-    /// available memory region will be chosen. Otherwise, the range will be created at the given address if it
+    /// `suggested_addr` is the hint address to create the pages. If it is not given (i.e., zero),
+    /// some available memory region will be chosen. Otherwise, the range will be created at the given address if it
     /// is available.
     ///
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
@@ -108,7 +111,8 @@ where
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     pub unsafe fn create_writable_pages<F>(
         &self,
-        suggested_range: PageRange<ALIGN>,
+        suggested_addr: usize,
+        len: usize,
         fixed_addr: bool,
         op: F,
     ) -> Result<<<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer, MappingError>
@@ -117,14 +121,16 @@ where
     {
         let flags =
             VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE;
+        let suggested_range =
+            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::MisAligned)?;
         let mut vmem = self.vmem.write();
         unsafe { vmem.create_pages(suggested_range, fixed_addr, flags, flags, op) }
     }
 
     /// Create read-only pages.
     ///
-    /// `suggested_range` is the range of pages to create. If the start address is not given (i.e., zero), some
-    /// available memory region will be chosen. Otherwise, the range will be created at the given address if it
+    /// `suggested_addr` is the hint address to create the pages. If it is not given (i.e., zero),
+    /// some available memory region will be chosen. Otherwise, the range will be created at the given address if it
     /// is available.
     ///
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
@@ -139,7 +145,8 @@ where
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     pub unsafe fn create_readable_pages<F>(
         &self,
-        suggested_range: PageRange<ALIGN>,
+        suggested_addr: usize,
+        len: usize,
         fixed_addr: bool,
         op: F,
     ) -> Result<<<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer, MappingError>
@@ -147,6 +154,8 @@ where
         F: FnOnce(<<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer) -> Result<usize, MappingError>,
     {
         let mut vmem = self.vmem.write();
+        let suggested_range =
+            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::MisAligned)?;
         unsafe {
             vmem.create_pages(
                 suggested_range,
@@ -160,8 +169,8 @@ where
 
     /// Create stack pages.
     ///
-    /// `suggested_range` is the range of pages to create. If the start address is not given (i.e., zero), some
-    /// available memory region will be chosen. Otherwise, the range will be created at the given address if it
+    /// `suggested_addr` is the hint address to create the pages. If it is not given (i.e., zero),
+    /// some available memory region will be chosen. Otherwise, the range will be created at the given address if it
     /// is available.
     ///
     /// # Safety

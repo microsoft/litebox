@@ -690,6 +690,8 @@ pub enum ProtectError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum MappingError {
+    #[error("arg is not aligned")]
+    MisAligned,
     #[error("not enough memory")]
     OutOfMemory,
     #[error("failed to read from file")]
