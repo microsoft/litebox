@@ -1,4 +1,7 @@
-use litebox::mm::linux::{MmapError, ProtectError, RemapError, UnmapError, VmFlags, VmemBackend};
+use litebox::mm::linux::{
+    MmapError, PageFaultError, ProtectError, RemapError, UnmapError, VmFlags, VmemBackend,
+    VmemPageFaultHandler,
+};
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::{
@@ -16,7 +19,7 @@ use x86_64::{
 
 use crate::mm::{
     MemoryProvider,
-    pgtable::{PageFaultError, PageTableAllocator, PageTableImpl},
+    pgtable::{PageTableAllocator, PageTableImpl},
 };
 
 #[cfg(not(test))]
@@ -72,6 +75,12 @@ pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
 }
 
 impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
+    type InitItem = PhysAddr;
+
+    unsafe fn new(item: Self::InitItem) -> Self {
+        unsafe { Self::init(item) }
+    }
+
     unsafe fn map_pages(
         &mut self,
         _start: usize,
@@ -268,7 +277,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
         page: Page<Size4KiB>,
         flags: PageTableFlags,
         error_code: PageFaultErrorCode,
-    ) -> Result<(), crate::mm::pgtable::PageFaultError> {
+    ) -> Result<(), PageFaultError> {
         match self.inner.translate(page.start_address()) {
             TranslateResult::Mapped {
                 frame: _,
@@ -334,5 +343,38 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
             }
         }
         Ok(())
+    }
+}
+
+impl<M: MemoryProvider> VmemPageFaultHandler for X64PageTable<'_, M> {
+    unsafe fn handle_page_fault(
+        &mut self,
+        fault_addr: usize,
+        flags: VmFlags,
+        error_code: u64,
+    ) -> Result<(), PageFaultError> {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(fault_addr as u64));
+        let error_code = PageFaultErrorCode::from_bits_truncate(error_code);
+        let flags = vmflags_to_pteflags(flags);
+        unsafe { PageTableImpl::handle_page_fault(self, page, flags, error_code) }
+    }
+
+    fn access_error(error_code: u64, flags: VmFlags) -> bool {
+        let error_code = PageFaultErrorCode::from_bits_truncate(error_code);
+        if error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE) {
+            return !flags.contains(VmFlags::VM_WRITE);
+        }
+
+        // read, present
+        if error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION) {
+            return true;
+        }
+
+        // read, not present
+        if (flags & VmFlags::VM_ACCESS_FLAGS).is_empty() {
+            return true;
+        }
+
+        false
     }
 }

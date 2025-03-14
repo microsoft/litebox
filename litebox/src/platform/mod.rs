@@ -428,3 +428,8 @@ where
         f: impl FnOnce(&mut [T]) -> R,
     ) -> Option<R>;
 }
+
+/// A provider of page management functionality.
+pub trait PageManagementProvider {
+    type Backend: crate::mm::linux::VmemBackend;
+}

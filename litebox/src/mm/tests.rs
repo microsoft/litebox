@@ -12,6 +12,12 @@ use super::linux::{
 struct DummyVmemBackend;
 
 impl VmemBackend for DummyVmemBackend {
+    type InitItem = ();
+
+    unsafe fn new(item: Self::InitItem) -> Self {
+        Self
+    }
+
     unsafe fn map_pages(
         &mut self,
         start: usize,

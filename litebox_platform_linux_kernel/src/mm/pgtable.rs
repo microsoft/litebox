@@ -1,5 +1,4 @@
-use litebox::mm::linux::VmemBackend;
-use thiserror::Error;
+use litebox::mm::linux::{PageFaultError, VmemBackend};
 use x86_64::structures::paging::PageSize;
 
 use crate::arch::{
@@ -82,14 +81,4 @@ pub trait PageTableImpl: VmemBackend {
         flags: PageTableFlags,
         error_code: PageFaultErrorCode,
     ) -> Result<(), PageFaultError>;
-}
-
-#[derive(Error, Debug)]
-pub enum PageFaultError {
-    #[error("no access: {0}")]
-    AccessError(&'static str),
-    #[error("allocation failed")]
-    AllocationFailed,
-    #[error("given page is part of an already mapped huge page")]
-    HugePage,
 }

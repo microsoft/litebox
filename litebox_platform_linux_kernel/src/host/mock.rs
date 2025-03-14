@@ -4,6 +4,8 @@ use crate::HostInterface;
 
 pub struct MockHostInterface {}
 
+pub type MockKernel = crate::LinuxKernel<MockHostInterface>;
+
 #[macro_export]
 macro_rules! mock_log_println {
     ($($tt:tt)*) => {{

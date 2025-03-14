@@ -1,4 +1,4 @@
-//! This module implements a [virtual memory manager](`Vmem`) that manages virtual address spaces
+//! This module implements a virtual memory manager `Vmem` that manages virtual address spaces
 //! backed by a memory [backend](`VmemBackend`). It provides functionality to create, remove, resize,
 //! move, and protect memory mappings within a process's virtual address space.
 
@@ -54,6 +54,11 @@ pub struct PageRange<const ALIGN: usize> {
     /// End page of the range.
     end: usize,
 }
+impl<const ALIGN: usize> From<PageRange<ALIGN>> for Range<usize> {
+    fn from(range: PageRange<ALIGN>) -> Self {
+        range.start..range.end
+    }
+}
 
 impl<const ALIGN: usize> IntoIterator for PageRange<ALIGN> {
     type Item = usize;
@@ -102,7 +107,7 @@ impl<const ALIGN: usize> PageRange<ALIGN> {
 
 /// A non-zero 4KiB-page-aligned size in bytes.
 #[derive(Clone, Copy)]
-pub struct NonZeroPageSize<const ALIGN: usize> {
+pub(super) struct NonZeroPageSize<const ALIGN: usize> {
     size: usize,
 }
 
@@ -110,7 +115,7 @@ impl<const ALIGN: usize> NonZeroPageSize<ALIGN> {
     /// Create a new non-zero `ALIGN`-aligned size.
     ///
     /// Returns `None` if the size is zero or not `ALIGN`-aligned.
-    pub fn new(size: usize) -> Option<Self> {
+    pub(super) fn new(size: usize) -> Option<Self> {
         if size == 0 || size % ALIGN != 0 {
             return None;
         }
@@ -123,31 +128,31 @@ impl<const ALIGN: usize> NonZeroPageSize<ALIGN> {
     ///
     /// The caller must ensure that the size is non-zero and `ALIGN`-aligned.
     #[inline]
-    pub unsafe fn new_unchecked(size: usize) -> Self {
+    pub(super) unsafe fn new_unchecked(size: usize) -> Self {
         Self { size }
     }
 
     #[inline]
-    pub fn as_usize(self) -> usize {
+    pub(super) fn as_usize(self) -> usize {
         self.size
     }
 }
 
 /// Virtual memory area
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct VmArea {
+pub(super) struct VmArea {
     /// Flags describing the properties of the memory region.
     flags: VmFlags,
 }
 
 impl VmArea {
     #[inline]
-    pub fn flags(&self) -> VmFlags {
+    pub(super) fn flags(self) -> VmFlags {
         self.flags
     }
 
     #[inline]
-    pub fn new(flags: VmFlags) -> Self {
+    pub(super) fn new(flags: VmFlags) -> Self {
         Self { flags }
     }
 }
@@ -156,19 +161,16 @@ impl VmArea {
 ///
 /// This struct mantains the virtual memory ranges backed by a memory [backend](`VmemBackend`).
 /// Each range needs to be `ALIGN`-aligned.
-pub struct Vmem<Backend: VmemBackend, const ALIGN: usize> {
+pub(super) struct Vmem<Backend: VmemBackend, const ALIGN: usize> {
     /// Memory backend that provides the actual memory.
-    pub backend: Backend,
+    pub(super) backend: Backend,
     /// Virtual memory areas.
     vmas: RangeMap<usize, VmArea>,
 }
 
 impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
-    pub const TASK_ADDR_MIN: usize = PAGE_SIZE;
-    pub const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
-
     /// Create a new [`Vmem`] instance with the given memory [backend](`VmemBackend`).
-    pub const fn new(backend: Backend) -> Self {
+    pub(super) const fn new(backend: Backend) -> Self {
         Self {
             vmas: RangeMap::new(),
             backend,
@@ -177,13 +179,13 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
 
     /// Gets an iterator over all pairs of ([`Range<usize>`], [`VmArea`]),
     /// ordered by key range.
-    pub fn iter(&self) -> impl Iterator<Item = (&Range<usize>, &VmArea)> {
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&Range<usize>, &VmArea)> {
         self.vmas.iter()
     }
 
     /// Gets an iterator over all the stored ranges that are
     /// either partially or completely overlapped by the given range.
-    pub fn overlapping(
+    pub(super) fn overlapping(
         &self,
         range: Range<usize>,
     ) -> impl DoubleEndedIterator<Item = (&Range<usize>, &VmArea)> {
@@ -198,7 +200,10 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
     /// # Safety
     ///
     /// The caller must ensure that the memory region is no longer used by any other.
-    pub unsafe fn remove_mapping(&mut self, range: PageRange<ALIGN>) -> Result<(), VmemUnmapError> {
+    pub(super) unsafe fn remove_mapping(
+        &mut self,
+        range: PageRange<ALIGN>,
+    ) -> Result<(), VmemUnmapError> {
         let (start, end) = (range.start, range.end);
         unsafe {
             self.backend
@@ -223,9 +228,13 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
     ///
     /// The caller must ensure that the memory region is not used by any other (i.e., safe
     /// to unmap all overlapping mappings if any).
-    pub unsafe fn insert_mapping(&mut self, range: PageRange<ALIGN>, vma: VmArea) -> Option<usize> {
+    pub(super) unsafe fn insert_mapping(
+        &mut self,
+        range: PageRange<ALIGN>,
+        vma: VmArea,
+    ) -> Option<usize> {
         let (start, end) = (range.start, range.end);
-        if start < Self::TASK_ADDR_MIN || end > Self::TASK_ADDR_MAX {
+        if start < Backend::TASK_ADDR_MIN || end > Backend::TASK_ADDR_MAX {
             return None;
         }
         for (r, _) in self.vmas.overlapping(start..end) {
@@ -253,7 +262,7 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
     /// Note that if the suggested address is given and `fixed_addr` is set to `true`,
     /// the kernel uses it directly without checking if it is available, causing overlapping
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
-    pub unsafe fn create_mapping(
+    pub(super) unsafe fn create_mapping(
         &mut self,
         suggested_range: PageRange<ALIGN>,
         vma: VmArea,
@@ -267,10 +276,7 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
             fixed_addr,
         )?;
         // new_addr must be ALIGN aligned
-        unsafe {
-            self.insert_mapping(PageRange::new_unchecked(new_addr, new_addr + len), vma);
-        }
-        Some(new_addr)
+        unsafe { self.insert_mapping(PageRange::new_unchecked(new_addr, new_addr + len), vma) }
     }
 
     /// Resize a range in the virtual address space.
@@ -286,7 +292,7 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
     /// # Safety
     ///
     /// If it shrinks, the caller must ensure that the unmapped memory region is not used by any other.
-    pub unsafe fn resize_mapping(
+    pub(super) unsafe fn resize_mapping(
         &mut self,
         range: PageRange<ALIGN>,
         new_size: NonZeroPageSize<ALIGN>,
@@ -348,7 +354,7 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
     ///
     /// Panics if `new_size` is smaller than the current size of the range.
     /// Panics if range is not within exact one mapping.
-    pub unsafe fn move_mappings(
+    pub(super) unsafe fn move_mappings(
         &mut self,
         range: PageRange<ALIGN>,
         new_size: NonZeroPageSize<ALIGN>,
@@ -386,7 +392,7 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
     ///
     /// The caller must ensure it is safe to change the permissions of the given range, e.g., no more
     /// write access to the range if it is changed to read-only.
-    pub unsafe fn protect_mapping(
+    pub(super) unsafe fn protect_mapping(
         &mut self,
         range: PageRange<ALIGN>,
         flags: VmFlags,
@@ -448,6 +454,56 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
         Ok(())
     }
 
+    /// Create a mapping with the given flags.
+    ///
+    /// `suggested_range` is the range of pages to create. If the start address is not given (i.e., zero), some
+    /// available memory region will be chosen. Otherwise, the range will be created at the given address if it
+    /// is available.
+    ///
+    /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
+    /// existing overlapping mappings being removed.
+    ///
+    /// `op` is a callback for caller to initialize the created pages.
+    ///
+    /// `before_flags` and `after_flags` are the flags to set before and after the call to `op`.
+    ///
+    /// # Safety
+    ///
+    /// Note that if the suggested address is given and `fixed_addr` is set to `true`,
+    /// the kernel uses it directly without checking if it is available, causing overlapping
+    /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
+    ///
+    /// Also, caller must ensure flags are set correctly.
+    pub(super) unsafe fn create_pages<F, P>(
+        &mut self,
+        suggested_range: PageRange<ALIGN>,
+        fixed_addr: bool,
+        before_flags: VmFlags,
+        after_flags: VmFlags,
+        op: F,
+    ) -> Result<usize, MappingError>
+    where
+        P: crate::platform::RawMutPointer<u8> + From<usize>,
+        F: FnOnce(P) -> Result<usize, MappingError>,
+    {
+        let addr =
+            unsafe { self.create_mapping(suggested_range, VmArea::new(before_flags), fixed_addr) }
+                .ok_or(MappingError::OutOfMemory)?;
+        // call the user function with the pages
+        let _ = op(P::from(addr))?;
+        if before_flags != after_flags {
+            // `protect` should succeed, as we just created the mapping.
+            unsafe {
+                self.protect_mapping(
+                    PageRange::new_unchecked(addr, addr + suggested_range.len()),
+                    after_flags,
+                )
+            }
+            .expect("failed to protect mapping");
+        }
+        Ok(addr)
+    }
+
     /*================================Internal Functions================================ */
 
     /// Get an unmapped area in the virtual address space.
@@ -462,12 +518,12 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
         fixed_addr: bool,
     ) -> Option<usize> {
         let size = size.as_usize();
-        if size > Self::TASK_ADDR_MAX {
+        if size > Backend::TASK_ADDR_MAX {
             return None;
         }
         if suggested_addr != 0 {
             debug_assert!(suggested_addr % PAGE_SIZE == 0);
-            if (Self::TASK_ADDR_MAX - size) < suggested_addr {
+            if (Backend::TASK_ADDR_MAX - size) < suggested_addr {
                 return None;
             }
             if fixed_addr
@@ -481,7 +537,7 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
 
         // top down
         // 1. check [last_end, TASK_SIZE_MAX)
-        let (low_limit, high_limit) = (Self::TASK_ADDR_MIN, Self::TASK_ADDR_MAX - size);
+        let (low_limit, high_limit) = (Backend::TASK_ADDR_MIN, Backend::TASK_ADDR_MAX - size);
         let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
         if last_end <= high_limit {
             return Some(last_end);
@@ -507,7 +563,21 @@ impl<Backend: VmemBackend, const ALIGN: usize> Vmem<Backend, ALIGN> {
     }
 }
 
+/// A trait for a virtual memory backend
 pub trait VmemBackend {
+    type InitItem;
+
+    const TASK_ADDR_MIN: usize = PAGE_SIZE;
+    const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+    const STACK_GUARD_GAP: usize = 256 << 12;
+
+    /// Create a new [`VmemBackend`] instance
+    ///
+    /// # Safety
+    ///
+    /// `item` must be a valid initialization item for the backend.
+    unsafe fn new(item: Self::InitItem) -> Self;
+
     /// Map/Allocate pages at the fixed address `start` with `flags`
     ///
     /// # Safety
@@ -578,7 +648,7 @@ pub enum UnmapError {
 
 /// Error for [`Vmem::resize_mapping`]
 #[derive(Error, Debug)]
-pub enum VmemResizeError {
+pub(super) enum VmemResizeError {
     #[error("no mapping containing the address {0:?}")]
     NotExist(usize),
     #[error("invalid address {addr:?} exceeds range {range:?}")]
@@ -589,7 +659,7 @@ pub enum VmemResizeError {
 
 /// Error for [`Vmem::move_mappings`]
 #[derive(Error, Debug)]
-pub enum VmemMoveError {
+pub(super) enum VmemMoveError {
     #[error("out of memory")]
     OutOfMemory,
     #[error("remap failed: {0}")]
@@ -609,7 +679,7 @@ pub enum RemapError {
 
 /// Error for [`Vmem::protect_mapping`]
 #[derive(Error, Debug)]
-pub enum VmemProtectError {
+pub(super) enum VmemProtectError {
     #[error("the range {0:?} has no mapping memory")]
     InvalidRange(Range<usize>),
     #[error("failed to change permissions from {old:?} to {new:?}")]
@@ -623,4 +693,44 @@ pub enum VmemProtectError {
 pub enum ProtectError {
     #[error("protect page that belongs to a huge page")]
     ProtectHugePage,
+}
+
+/// Error for creating mappings
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum MappingError {
+    #[error("not enough memory")]
+    OutOfMemory,
+    #[error("failed to read from file")]
+    ReadError(#[from] crate::fs::errors::ReadError),
+}
+
+/// Enable [`super::PageManager`] to handle page faults if its
+/// [backend](`crate::platform::PageManagementProvider::Backend`) implements this trait
+pub trait VmemPageFaultHandler {
+    /// Handle a page fault for the given address.
+    ///
+    /// # Safety
+    ///
+    /// This should only be called from the kernel page fault handler.
+    unsafe fn handle_page_fault(
+        &mut self,
+        fault_addr: usize,
+        flags: VmFlags,
+        error_code: u64,
+    ) -> Result<(), PageFaultError>;
+
+    /// Check if it has access to the fault address.
+    fn access_error(error_code: u64, flags: VmFlags) -> bool;
+}
+
+/// Error for handling page fault
+#[derive(Error, Debug)]
+pub enum PageFaultError {
+    #[error("no access: {0}")]
+    AccessError(&'static str),
+    #[error("allocation failed")]
+    AllocationFailed,
+    #[error("given page is part of an already mapped huge page")]
+    HugePage,
 }

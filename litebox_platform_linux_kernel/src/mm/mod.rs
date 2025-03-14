@@ -8,7 +8,6 @@ use crate::arch::{PhysAddr, VirtAddr};
 
 pub(crate) mod alloc;
 pub(crate) mod pgtable;
-pub mod vm;
 
 #[cfg(test)]
 pub mod tests;
@@ -79,3 +78,10 @@ pub trait MemoryProvider {
         PhysAddr::new_truncate(pa.as_u64() | Self::PRIVATE_PTE_MASK)
     }
 }
+
+#[cfg(all(target_arch = "x86_64", not(test)))]
+pub type KernelVmemBackend =
+    crate::arch::mm::paging::X64PageTable<'static, crate::host::snp::SnpLinuxKenrel>;
+#[cfg(all(target_arch = "x86_64", test))]
+pub type KernelVmemBackend =
+    crate::arch::mm::paging::X64PageTable<'static, crate::host::mock::MockKernel>;

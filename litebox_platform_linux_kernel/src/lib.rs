@@ -7,9 +7,9 @@ use core::{arch::asm, sync::atomic::AtomicU32};
 
 use host::linux::sigset_t;
 use litebox::platform::{
-    DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, Provider, Punchthrough,
-    PunchthroughError, PunchthroughProvider, PunchthroughToken, RawMutexProvider, TimeProvider,
-    UnblockedOrTimedOut,
+    DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider, Provider,
+    Punchthrough, PunchthroughError, PunchthroughProvider, PunchthroughToken, RawMutexProvider,
+    TimeProvider, UnblockedOrTimedOut,
 };
 use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::errno::Errno;
@@ -393,4 +393,8 @@ pub trait HostInterface {
 
     /// For Debugging
     fn log(msg: &str);
+}
+
+impl<Host: HostInterface> PageManagementProvider for LinuxKernel<Host> {
+    type Backend = mm::KernelVmemBackend;
 }

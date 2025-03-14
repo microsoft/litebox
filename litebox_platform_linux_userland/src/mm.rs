@@ -1,19 +1,12 @@
-use litebox::{
-    mm::{
-        linux::{
-            MmapError, PAGE_SIZE, PageRange, ProtectError, RemapError, UnmapError, VmFlags, Vmem,
-            VmemBackend,
-        },
-        mapping::{MappingError, MappingProvider},
-    },
-    platform::trivial_providers::TransparentMutPtr,
+use litebox::mm::linux::{
+    MmapError, PAGE_SIZE, ProtectError, RemapError, UnmapError, VmFlags, VmemBackend,
 };
 use nix::sys::mman::MRemapFlags;
 
 /// Memory backend for user space
 ///
 /// This backend uses syscalls (e.g., mmap, munmap) to manage memory.
-struct UserMemBackend;
+pub struct UserMemBackend;
 
 /// Convert [`VmFlags`] to [`nix::sys::mman::ProtFlags`].
 fn vmflags_to_prots(flags: VmFlags) -> nix::sys::mman::ProtFlags {
@@ -31,6 +24,12 @@ fn vmflags_to_prots(flags: VmFlags) -> nix::sys::mman::ProtFlags {
 }
 
 impl VmemBackend for UserMemBackend {
+    type InitItem = ();
+
+    unsafe fn new(_item: Self::InitItem) -> Self {
+        Self
+    }
+
     unsafe fn map_pages(
         &mut self,
         start: usize,
@@ -116,71 +115,5 @@ impl VmemBackend for UserMemBackend {
         }
         .expect("mprotect failed");
         Ok(())
-    }
-}
-
-/// Virtual memory manager for user space
-pub struct UserVmem<const ALIGN: usize = PAGE_SIZE> {
-    inner: Vmem<UserMemBackend, ALIGN>,
-}
-
-impl<const ALIGN: usize> UserVmem<ALIGN> {
-    pub fn new() -> Self {
-        Self {
-            inner: Vmem::new(UserMemBackend),
-        }
-    }
-}
-
-impl<const ALIGN: usize> Default for UserVmem<ALIGN> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<const ALIGN: usize> MappingProvider<TransparentMutPtr<u8>, ALIGN> for UserVmem<ALIGN> {
-    unsafe fn create_executable_page<F>(
-        &mut self,
-        suggested_range: PageRange<ALIGN>,
-        fixed_addr: bool,
-        op: F,
-    ) -> Result<usize, MappingError>
-    where
-        F: FnOnce(TransparentMutPtr<u8>) -> Result<usize, MappingError>,
-    {
-        unsafe {
-            self.inner
-                .create_executable_page(suggested_range, fixed_addr, op)
-        }
-    }
-
-    unsafe fn create_writable_page<F>(
-        &mut self,
-        suggested_range: PageRange<ALIGN>,
-        fixed_addr: bool,
-        op: F,
-    ) -> Result<usize, MappingError>
-    where
-        F: FnOnce(TransparentMutPtr<u8>) -> Result<usize, MappingError>,
-    {
-        unsafe {
-            self.inner
-                .create_writable_page(suggested_range, fixed_addr, op)
-        }
-    }
-
-    unsafe fn create_readable_page<F>(
-        &mut self,
-        suggested_range: PageRange<ALIGN>,
-        fixed_addr: bool,
-        op: F,
-    ) -> Result<usize, MappingError>
-    where
-        F: FnOnce(TransparentMutPtr<u8>) -> Result<usize, MappingError>,
-    {
-        unsafe {
-            self.inner
-                .create_readable_page(suggested_range, fixed_addr, op)
-        }
     }
 }

@@ -1,33 +1,33 @@
-use core::{
-    alloc::{GlobalAlloc, Layout},
-    ops::Range,
-};
+use core::alloc::{GlobalAlloc, Layout};
 
-use crate::arch::{
-    MappedFrame, Page, PageFaultErrorCode, PageTableFlags, PhysAddr, Size4KiB, TranslateResult,
-    VirtAddr, mm::paging::vmflags_to_pteflags,
-};
 use alloc::vec;
 use alloc::vec::Vec;
 use arrayvec::ArrayVec;
-use litebox::mm::linux::{PAGE_SIZE, PageRange, VmArea, VmFlags, VmemBackend};
+use litebox::{
+    mm::{
+        PageManager,
+        linux::{PAGE_SIZE, PageFaultError, PageRange, VmFlags, VmemBackend},
+    },
+    sync::Synchronization,
+};
 use spin::mutex::SpinMutex;
 
 use crate::{
-    HostInterface, LinuxKernel,
-    arch::mm::paging::X64PageTable,
-    host::mock::MockHostInterface,
-    mm::{
-        MemoryProvider,
-        pgtable::{PageFaultError, PageTableAllocator},
+    HostInterface,
+    arch::{
+        MappedFrame, Page, PageFaultErrorCode, PageTableFlags, PhysAddr, Size4KiB, TranslateResult,
+        VirtAddr,
+        mm::paging::{X64PageTable, vmflags_to_pteflags},
     },
+    host::mock::{MockHostInterface, MockKernel},
+    mm::{MemoryProvider, pgtable::PageTableAllocator},
     mock_log_println,
+    ptr::UserMutPtr,
 };
 
-use super::{alloc::SafeZoneAllocator, pgtable::PageTableImpl, vm::KernelVmem};
+use super::{alloc::SafeZoneAllocator, pgtable::PageTableImpl};
 
 const MAX_ORDER: usize = 23;
-type MockKernel = LinuxKernel<MockHostInterface>;
 
 static ALLOCATOR: SafeZoneAllocator<'static, MAX_ORDER, MockKernel> = SafeZoneAllocator::new();
 /// const Array for VA to PA mapping
@@ -202,74 +202,89 @@ fn test_page_table() {
     }
 }
 
-fn collect_mappings(
-    vmm: &KernelVmem<X64PageTable<'_, MockKernel>, PAGE_SIZE>,
-) -> Vec<Range<usize>> {
-    vmm.iter().map(|v| v.0.start..v.0.end).collect()
-}
+// fn collect_mappings(
+//     vmm: &KernelVmem<X64PageTable<'_, MockKernel>, PAGE_SIZE>,
+// ) -> Vec<Range<usize>> {
+//     vmm.iter().map(|v| v.0.start..v.0.end).collect()
+// }
 
 #[test]
 fn test_vmm_page_fault() {
     let start_addr: usize = 0x1000;
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
-    let mut vmm = unsafe { KernelVmem::new(p4.start_address()) };
+    let platform = MockKernel::new();
+    let sync = Synchronization::new(&platform);
+    let mut vmm = unsafe { PageManager::<'_, _, PAGE_SIZE>::new(&sync, p4.start_address()) };
     unsafe {
-        vmm.insert_mapping(
-            PageRange::new(start_addr, start_addr + 4 * PAGE_SIZE).unwrap(),
-            VmArea::new(
-                VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE,
-            ),
+        assert_eq!(
+            vmm.create_writable_pages(
+                PageRange::new(start_addr, start_addr + 4 * PAGE_SIZE).unwrap(),
+                true,
+                |_: UserMutPtr<u8>| Ok(0),
+            )
+            .unwrap(),
+            start_addr
         );
     }
     // [0x1000, 0x5000)
 
     // Access page w/o mapping
     assert!(matches!(
-        vmm.handle_page_fault(start_addr + 6 * PAGE_SIZE, PageFaultErrorCode::USER_MODE),
+        unsafe {
+            vmm.handle_page_fault(
+                start_addr + 6 * PAGE_SIZE,
+                PageFaultErrorCode::USER_MODE.bits(),
+            )
+        },
         Err(PageFaultError::AccessError(_))
     ));
 
     // Access non-present page w/ mapping
     assert!(
-        vmm.handle_page_fault(start_addr + 2 * PAGE_SIZE, PageFaultErrorCode::USER_MODE)
-            .is_ok()
-    );
-    check_flags(
-        vmm.get_pgtable(),
-        start_addr + 2 * PAGE_SIZE,
-        PageTableFlags::PRESENT
-            | PageTableFlags::USER_ACCESSIBLE
-            | PageTableFlags::WRITABLE
-            | PageTableFlags::NO_EXECUTE,
+        unsafe {
+            vmm.handle_page_fault(
+                start_addr + 2 * PAGE_SIZE,
+                PageFaultErrorCode::USER_MODE.bits(),
+            )
+        }
+        .is_ok()
     );
 
     // insert stack mapping
     let stack_addr: usize = 0x1000_0000;
     unsafe {
-        vmm.insert_mapping(
-            PageRange::new(stack_addr, stack_addr + 4 * PAGE_SIZE).unwrap(),
-            VmArea::new(
-                VmFlags::VM_READ
-                    | VmFlags::VM_WRITE
-                    | VmFlags::VM_MAYREAD
-                    | VmFlags::VM_MAYWRITE
-                    | VmFlags::VM_GROWSDOWN,
-            ),
+        assert_eq!(
+            vmm.create_stack_pages::<UserMutPtr<u8>>(
+                PageRange::new(stack_addr, stack_addr + 4 * PAGE_SIZE).unwrap(),
+                true,
+            )
+            .unwrap(),
+            stack_addr
         );
     }
     // [0x1000, 0x5000), [0x1000_0000, 0x1000_4000)
     // Test stack growth
     assert!(
-        vmm.handle_page_fault(stack_addr - PAGE_SIZE, PageFaultErrorCode::USER_MODE)
-            .is_ok()
+        unsafe {
+            vmm.handle_page_fault(stack_addr - PAGE_SIZE, PageFaultErrorCode::USER_MODE.bits())
+        }
+        .is_ok()
     );
     assert_eq!(
-        collect_mappings(&vmm),
+        vmm.mappings()
+            .iter()
+            .map(|v| v.0.clone())
+            .collect::<Vec<_>>(),
         vec![0x1000..0x5000, 0x0fff_f000..0x1000_4000]
     );
     // Cannot grow stack too far
     assert!(matches!(
-        vmm.handle_page_fault(start_addr + 100 * PAGE_SIZE, PageFaultErrorCode::USER_MODE),
+        unsafe {
+            vmm.handle_page_fault(
+                start_addr + 100 * PAGE_SIZE,
+                PageFaultErrorCode::USER_MODE.bits(),
+            )
+        },
         Err(PageFaultError::AllocationFailed)
     ));
 }

@@ -437,3 +437,7 @@ fn futex_val2(
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
     unsafe { libc::syscall(libc::SYS_futex, uaddr, futex_op, val, val2, uaddr2, val3) }
 }
+
+impl litebox::platform::PageManagementProvider for LinuxUserland {
+    type Backend = mm::UserMemBackend;
+}

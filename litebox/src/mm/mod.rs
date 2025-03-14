@@ -1,7 +1,269 @@
 //! Memory management related functionality
 
 pub mod linux;
-pub mod mapping;
 
 #[cfg(test)]
 mod tests;
+
+use core::ops::Range;
+
+use alloc::vec::Vec;
+use linux::{
+    MappingError, PageFaultError, PageRange, VmFlags, Vmem, VmemBackend, VmemPageFaultHandler,
+};
+
+use crate::{
+    platform::PageManagementProvider,
+    sync::{RawSyncPrimitivesProvider, RwLock, Synchronization},
+};
+
+/// A page manager to support `mmap`, `munmap`, and etc.
+pub struct PageManager<'platform, Platform, const ALIGN: usize>
+where
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider,
+{
+    vmem: RwLock<'platform, Platform, Vmem<<Platform as PageManagementProvider>::Backend, ALIGN>>,
+}
+
+impl<'platform, Platform, const ALIGN: usize> PageManager<'platform, Platform, ALIGN>
+where
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider,
+{
+    /// Create a new `PageManager` instance.
+    ///
+    /// `data` is the initialization item for the backend.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the `data` is a valid initialization item for the backend.
+    /// See [`VmemBackend::new`] for more details.
+    pub unsafe fn new(
+        sync: &Synchronization<'platform, Platform>,
+        data: <<Platform as PageManagementProvider>::Backend as VmemBackend>::InitItem,
+    ) -> Self {
+        let backend = unsafe { <Platform as PageManagementProvider>::Backend::new(data) };
+        let vmem = sync.new_rwlock(linux::Vmem::new(backend));
+        Self { vmem }
+    }
+
+    /// Create readable and executable pages.
+    ///
+    /// `suggested_range` is the range of pages to create. If the start address is not given (i.e., zero), some
+    /// available memory region will be chosen. Otherwise, the range will be created at the given address if it
+    /// is available.
+    ///
+    /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
+    /// existing overlapping mappings being removed.
+    ///
+    /// `op` is a callback for caller to initialize the created pages.
+    ///
+    /// # Safety
+    ///
+    /// If the suggested start address is given (i.e., not zero) and `fixed_addr` is set to `true`,
+    /// the kernel uses it directly without checking if it is available, causing overlapping
+    /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
+    pub unsafe fn create_executable_pages<F, P>(
+        &self,
+        suggested_range: crate::mm::linux::PageRange<ALIGN>,
+        fixed_addr: bool,
+        op: F,
+    ) -> Result<usize, crate::mm::linux::MappingError>
+    where
+        P: crate::platform::RawMutPointer<u8> + From<usize>,
+        F: FnOnce(P) -> Result<usize, crate::mm::linux::MappingError>,
+    {
+        let mut vmem = self.vmem.write();
+        unsafe {
+            vmem.create_pages(
+                suggested_range,
+                fixed_addr,
+                // create READ | WRITE pages (set MAYEXEC so we can enable it later)
+                VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD | VmFlags::VM_MAYEXEC,
+                // keep VM_READ, turn off VM_WRITE and turn on VM_EXEC
+                VmFlags::VM_READ | VmFlags::VM_EXEC | VmFlags::VM_MAYREAD | VmFlags::VM_MAYEXEC,
+                op,
+            )
+        }
+    }
+
+    /// Create readable and writable pages.
+    ///
+    /// `suggested_range` is the range of pages to create. If the start address is not given (i.e., zero), some
+    /// available memory region will be chosen. Otherwise, the range will be created at the given address if it
+    /// is available.
+    ///
+    /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
+    /// existing overlapping mappings being removed.
+    ///
+    /// `op` is a callback for caller to initialize the created pages.
+    ///
+    /// # Safety
+    ///
+    /// If the suggested start address is given (i.e., not zero) and `fixed_addr` is set to `true`,
+    /// the kernel uses it directly without checking if it is available, causing overlapping
+    /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
+    pub unsafe fn create_writable_pages<F, P>(
+        &self,
+        suggested_range: PageRange<ALIGN>,
+        fixed_addr: bool,
+        op: F,
+    ) -> Result<usize, MappingError>
+    where
+        P: crate::platform::RawMutPointer<u8> + From<usize>,
+        F: FnOnce(P) -> Result<usize, MappingError>,
+    {
+        let flags =
+            VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE;
+        let mut vmem = self.vmem.write();
+        unsafe { vmem.create_pages(suggested_range, fixed_addr, flags, flags, op) }
+    }
+
+    /// Create read-only pages.
+    ///
+    /// `suggested_range` is the range of pages to create. If the start address is not given (i.e., zero), some
+    /// available memory region will be chosen. Otherwise, the range will be created at the given address if it
+    /// is available.
+    ///
+    /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
+    /// existing overlapping mappings being removed.
+    ///
+    /// `op` is a callback for caller to initialize the created pages.
+    ///
+    /// # Safety
+    ///
+    /// If the suggested start address is given (i.e., not zero) and `fixed_addr` is set to `true`,
+    /// the kernel uses it directly without checking if it is available, causing overlapping
+    /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
+    pub unsafe fn create_readable_pages<F, P>(
+        &self,
+        suggested_range: PageRange<ALIGN>,
+        fixed_addr: bool,
+        op: F,
+    ) -> Result<usize, MappingError>
+    where
+        P: crate::platform::RawMutPointer<u8> + From<usize>,
+        F: FnOnce(P) -> Result<usize, MappingError>,
+    {
+        let mut vmem = self.vmem.write();
+        unsafe {
+            vmem.create_pages(
+                suggested_range,
+                fixed_addr,
+                VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD,
+                VmFlags::VM_READ | VmFlags::VM_MAYREAD,
+                op,
+            )
+        }
+    }
+
+    /// Create stack pages.
+    ///
+    /// `suggested_range` is the range of pages to create. If the start address is not given (i.e., zero), some
+    /// available memory region will be chosen. Otherwise, the range will be created at the given address if it
+    /// is available.
+    ///
+    /// # Safety
+    ///
+    /// If the suggested start address is given (i.e., not zero) and `fixed_addr` is set to `true`,
+    /// the kernel uses it directly without checking if it is available, causing overlapping
+    /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
+    pub unsafe fn create_stack_pages<P>(
+        &self,
+        suggested_range: PageRange<ALIGN>,
+        fixed_addr: bool,
+    ) -> Result<usize, MappingError>
+    where
+        P: crate::platform::RawMutPointer<u8> + From<usize>,
+    {
+        let flags = VmFlags::VM_READ
+            | VmFlags::VM_WRITE
+            | VmFlags::VM_MAYREAD
+            | VmFlags::VM_MAYWRITE
+            | VmFlags::VM_GROWSDOWN;
+        let mut vmem = self.vmem.write();
+        unsafe { vmem.create_pages(suggested_range, fixed_addr, flags, flags, |_: P| Ok(0)) }
+    }
+
+    /// Returns all mappings in a vector.
+    pub fn mappings(&self) -> Vec<(Range<usize>, VmFlags)> {
+        let mut vmem = self.vmem.read();
+        vmem.iter()
+            .map(|(r, vma)| (r.start..r.end, vma.flags()))
+            .collect()
+    }
+}
+
+/// If Backend also implements VmemPageFaultHandler, it can handle page faults.
+impl<Platform, const ALIGN: usize> PageManager<'_, Platform, ALIGN>
+where
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider,
+    <Platform as PageManagementProvider>::Backend: VmemPageFaultHandler,
+{
+    /// Handle page fault at the given address.
+    ///
+    /// # Safety
+    ///
+    /// This should only be called from the kernel page fault handler.
+    pub unsafe fn handle_page_fault(
+        &mut self,
+        fault_addr: usize,
+        error_code: u64,
+    ) -> Result<(), PageFaultError> {
+        let fault_addr = fault_addr & !(ALIGN - 1);
+        if !(<Platform as PageManagementProvider>::Backend::TASK_ADDR_MIN
+            ..<Platform as PageManagementProvider>::Backend::TASK_ADDR_MAX)
+            .contains(&fault_addr)
+        {
+            return Err(PageFaultError::AccessError("Invalid address"));
+        }
+
+        let mut vmem = self.vmem.write();
+        // Find the range closest to the fault address
+        let (start, vma) = {
+            let (r, vma) = vmem
+                .overlapping(
+                    fault_addr..<Platform as PageManagementProvider>::Backend::TASK_ADDR_MAX,
+                )
+                .next()
+                .ok_or(PageFaultError::AccessError("no mapping"))?;
+            (r.start, *vma)
+        };
+        if fault_addr < start {
+            // address is out of range, test if it is next to a stack
+            if !vma.flags().contains(VmFlags::VM_GROWSDOWN) {
+                return Err(PageFaultError::AccessError("no mapping"));
+            }
+
+            if !vmem
+                .overlapping(
+                    <Platform as PageManagementProvider>::Backend::TASK_ADDR_MIN..fault_addr,
+                )
+                .next_back()
+                .is_none_or(|(prev_range, prev_vma)| {
+                    // Enforce gap between stack and other preceding non-stack mappings.
+                    // Either the previous mapping is also a stack mapping w/ some access flags
+                    // or the previous mapping is far enough from the fault address
+                    (prev_vma.flags().contains(VmFlags::VM_GROWSDOWN)
+                        && !(prev_vma.flags() & VmFlags::VM_ACCESS_FLAGS).is_empty())
+                        || fault_addr - prev_range.end
+                            >= <Platform as PageManagementProvider>::Backend::STACK_GUARD_GAP
+                })
+            {
+                return Err(PageFaultError::AllocationFailed);
+            }
+            unsafe { vmem.insert_mapping(PageRange::new_unchecked(fault_addr, start), vma) };
+        }
+
+        if <<Platform as PageManagementProvider>::Backend as VmemPageFaultHandler>::access_error(
+            error_code,
+            vma.flags(),
+        ) {
+            return Err(PageFaultError::AccessError("access error"));
+        }
+
+        unsafe {
+            vmem.backend
+                .handle_page_fault(fault_addr, vma.flags(), error_code)
+        }
+    }
+}
