@@ -262,12 +262,9 @@ fn test_vmm_page_fault() {
     let stack_addr: usize = 0x1000_0000;
     unsafe {
         assert_eq!(
-            vmm.create_stack_pages(
-                PageRange::new(stack_addr, stack_addr + 4 * PAGE_SIZE).unwrap(),
-                true,
-            )
-            .unwrap()
-            .as_usize(),
+            vmm.create_stack_pages(stack_addr, 4 * PAGE_SIZE, true,)
+                .unwrap()
+                .as_usize(),
             stack_addr
         );
     }

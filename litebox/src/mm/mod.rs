@@ -176,7 +176,8 @@ where
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     pub unsafe fn create_stack_pages(
         &self,
-        suggested_range: PageRange<ALIGN>,
+        suggested_addr: usize,
+        len: usize,
         fixed_addr: bool,
     ) -> Result<
         <<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer,
@@ -188,6 +189,8 @@ where
             | VmFlags::VM_MAYWRITE
             | VmFlags::VM_GROWSDOWN;
         let mut vmem = self.vmem.write();
+        let suggested_range =
+            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::MisAligned)?;
         unsafe { vmem.create_pages(suggested_range, fixed_addr, flags, flags, |_| Ok(0)) }
     }
 
