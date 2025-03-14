@@ -312,10 +312,6 @@ mod tests {
         hlt"
     );
 
-    #[repr(align(4096))]
-    struct Stack([u8; 8192]);
-    static mut TEST_EXEC_STACK: Stack = Stack([0; 8192]);
-
     fn init_platform() {
         static ONCE: spin::Once = spin::Once::new();
         ONCE.call_once(|| {
