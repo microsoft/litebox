@@ -11,7 +11,7 @@ use super::linux::{
 /// A dummy implementation of [`VmemBackend`] that does nothing.
 struct DummyVmemBackend;
 
-impl VmemBackend for DummyVmemBackend {
+impl VmemBackend<PAGE_SIZE> for DummyVmemBackend {
     type InitItem = ();
 
     unsafe fn new(item: Self::InitItem) -> Self {
@@ -20,31 +20,27 @@ impl VmemBackend for DummyVmemBackend {
 
     unsafe fn map_pages(
         &mut self,
-        start: usize,
-        len: usize,
+        range: PageRange<PAGE_SIZE>,
         flags: VmFlags,
     ) -> Result<(), MmapError> {
         Ok(())
     }
 
-    unsafe fn unmap_pages(&mut self, start: usize, len: usize) -> Result<(), UnmapError> {
+    unsafe fn unmap_pages(&mut self, range: PageRange<PAGE_SIZE>) -> Result<(), UnmapError> {
         Ok(())
     }
 
     unsafe fn remap_pages(
         &mut self,
-        old_addr: usize,
-        new_addr: usize,
-        old_len: usize,
-        new_len: usize,
+        old_range: PageRange<PAGE_SIZE>,
+        new_range: PageRange<PAGE_SIZE>,
     ) -> Result<(), RemapError> {
         Ok(())
     }
 
     unsafe fn mprotect_pages(
         &mut self,
-        start: usize,
-        len: usize,
+        range: PageRange<PAGE_SIZE>,
         new_flags: VmFlags,
     ) -> Result<(), ProtectError> {
         Ok(())
@@ -158,7 +154,7 @@ fn test_vmm_mapping() {
         Err(VmemResizeError::RangeOccupied(_))
     ));
     assert!(
-        unsafe { vmm.move_mappings(r, NonZeroPageSize::new(PAGE_SIZE * 4).unwrap(), 0) }
+        unsafe { vmm.move_mappings(r, PageRange::new(0, PAGE_SIZE * 4).unwrap()) }
             .is_ok_and(|v| v == 0xd000)
     );
     assert_eq!(

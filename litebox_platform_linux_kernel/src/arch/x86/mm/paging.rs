@@ -1,6 +1,6 @@
 use litebox::mm::linux::{
-    MmapError, PageFaultError, ProtectError, RemapError, UnmapError, VmFlags, VmemBackend,
-    VmemPageFaultHandler,
+    MmapError, PageFaultError, PageRange, ProtectError, RemapError, UnmapError, VmFlags,
+    VmemBackend, VmemPageFaultHandler,
 };
 use x86_64::{
     PhysAddr, VirtAddr,
@@ -33,7 +33,7 @@ fn frame_to_pointer<M: MemoryProvider>(frame: PhysFrame) -> *mut PageTable {
     virt.as_mut_ptr()
 }
 
-pub struct X64PageTable<'a, M: MemoryProvider> {
+pub struct X64PageTable<'a, M: MemoryProvider, const ALIGN: usize> {
     inner: MappedPageTable<'a, FrameMapping<M>>,
 }
 
@@ -74,7 +74,7 @@ pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
     flags
 }
 
-impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
+impl<M: MemoryProvider, const ALIGN: usize> VmemBackend<ALIGN> for X64PageTable<'_, M, ALIGN> {
     type InitItem = PhysAddr;
 
     unsafe fn new(item: Self::InitItem) -> Self {
@@ -83,8 +83,7 @@ impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
 
     unsafe fn map_pages(
         &mut self,
-        _start: usize,
-        _len: usize,
+        _range: PageRange<ALIGN>,
         _flags: VmFlags,
     ) -> Result<(), MmapError> {
         // leave it to page fault handler
@@ -95,12 +94,11 @@ impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
     ///
     /// Note it does not free the allocated frames for page table itself (only those allocated to
     /// user space).
-    unsafe fn unmap_pages(&mut self, start: usize, len: usize) -> Result<(), UnmapError> {
-        let va = VirtAddr::new(start as _);
-        let start =
-            Page::<Size4KiB>::from_start_address(va).map_err(|_| UnmapError::MisAligned(start))?;
-        let end = Page::<Size4KiB>::from_start_address(va + len as _)
-            .map_err(|_| UnmapError::MisAligned(len))?;
+    unsafe fn unmap_pages(&mut self, range: PageRange<ALIGN>) -> Result<(), UnmapError> {
+        let start_va = VirtAddr::new(range.start as _);
+        let start = Page::<Size4KiB>::from_start_address(start_va).expect("invalid start address");
+        let end_va = VirtAddr::new(range.end as _);
+        let end = Page::<Size4KiB>::from_start_address(end_va).expect("invalid end address");
         let mut allocator = PageTableAllocator::<M>::new();
 
         // Note this implementation is slow as each page requires a full page table walk.
@@ -127,21 +125,17 @@ impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
 
     unsafe fn remap_pages(
         &mut self,
-        old_addr: usize,
-        new_addr: usize,
-        old_len: usize,
-        new_len: usize,
+        old_range: PageRange<ALIGN>,
+        new_range: PageRange<ALIGN>,
     ) -> Result<(), RemapError> {
-        if new_len as u64 % Size4KiB::SIZE != 0 {
-            return Err(RemapError::MisAligned(new_len));
-        }
-        let mut start: Page<Size4KiB> = Page::from_start_address(VirtAddr::new(old_addr as _))
-            .map_err(|_| RemapError::MisAligned(old_addr))?;
-        let mut new_start: Page<Size4KiB> = Page::from_start_address(VirtAddr::new(new_addr as _))
-            .map_err(|_| RemapError::MisAligned(new_addr))?;
-        let end: Page<Size4KiB> =
-            Page::from_start_address(VirtAddr::new((old_addr + old_len) as u64))
-                .map_err(|_| RemapError::MisAligned(old_len))?;
+        let mut start: Page<Size4KiB> =
+            Page::from_start_address(VirtAddr::new(old_range.start as u64))
+                .expect("invalid start address");
+        let mut new_start: Page<Size4KiB> =
+            Page::from_start_address(VirtAddr::new(new_range.start as u64))
+                .expect("invalid new start address");
+        let end: Page<Size4KiB> = Page::from_start_address(VirtAddr::new(old_range.end as u64))
+            .expect("invalid end address");
 
         // Note this implementation is slow as each page requires three full page table walks.
         // If we have N pages, it will be 3N times slower.
@@ -197,18 +191,18 @@ impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
 
     unsafe fn mprotect_pages(
         &mut self,
-        start: usize,
-        len: usize,
+        range: PageRange<ALIGN>,
         new_flags: VmFlags,
     ) -> Result<(), ProtectError> {
-        let start = VirtAddr::new(start as _);
+        let start = VirtAddr::new(range.start as _);
+        let end = VirtAddr::new(range.end as _);
         let new_flags = vmflags_to_pteflags(new_flags) & Self::MPROTECT_PTE_MASK;
-        let begin: Page<Size4KiB> = Page::containing_address(start);
-        let end: Page<Size4KiB> = Page::containing_address(start + len as _ - 1);
+        let start: Page<Size4KiB> = Page::from_start_address(start).expect("invalid start address");
+        let end: Page<Size4KiB> = Page::containing_address(end - 1);
 
         // TODO: this implementation is slow as each page requires two full page table walks.
         // If we have N pages, it will be 2N times slower.
-        for page in Page::range(begin, end + 1) {
+        for page in Page::range(start, end + 1) {
             match self.inner.translate(page.start_address()) {
                 TranslateResult::Mapped {
                     frame: _,
@@ -253,7 +247,7 @@ impl<M: MemoryProvider> VmemBackend for X64PageTable<'_, M> {
     }
 }
 
-impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
+impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTable<'_, M, ALIGN> {
     unsafe fn init(p4: PhysAddr) -> Self {
         assert!(p4.is_aligned(Size4KiB::SIZE));
         let frame = PhysFrame::from_start_address(p4).unwrap();
@@ -346,7 +340,7 @@ impl<M: MemoryProvider> PageTableImpl for X64PageTable<'_, M> {
     }
 }
 
-impl<M: MemoryProvider> VmemPageFaultHandler for X64PageTable<'_, M> {
+impl<M: MemoryProvider, const ALIGN: usize> VmemPageFaultHandler for X64PageTable<'_, M, ALIGN> {
     unsafe fn handle_page_fault(
         &mut self,
         fault_addr: usize,

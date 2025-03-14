@@ -430,6 +430,6 @@ where
 }
 
 /// A provider of page management functionality.
-pub trait PageManagementProvider {
-    type Backend: crate::mm::linux::VmemBackend;
+pub trait PageManagementProvider<const ALIGN: usize> {
+    type Backend: crate::mm::linux::VmemBackend<ALIGN>;
 }

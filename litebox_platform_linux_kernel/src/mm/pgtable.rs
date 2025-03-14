@@ -47,7 +47,7 @@ impl<M: super::MemoryProvider> PageTableAllocator<M> {
     }
 }
 
-pub trait PageTableImpl: VmemBackend {
+pub trait PageTableImpl<const ALIGN: usize>: VmemBackend<ALIGN> {
     /// Flags that `mprotect` can change:
     /// [`PageTableFlags::WRITABLE`] | [`PageTableFlags::USER_ACCESSIBLE`] | [`PageTableFlags::NO_EXECUTE`]
     const MPROTECT_PTE_MASK: PageTableFlags = PageTableFlags::from_bits_truncate(

@@ -105,7 +105,11 @@ fn test_slab() {
     }
 }
 
-fn check_flags(pgtable: &X64PageTable<'_, MockKernel>, addr: usize, flags: PageTableFlags) {
+fn check_flags(
+    pgtable: &X64PageTable<'_, MockKernel, PAGE_SIZE>,
+    addr: usize,
+    flags: PageTableFlags,
+) {
     match pgtable.translate(VirtAddr::new(addr as _)) {
         TranslateResult::Mapped {
             frame,
@@ -123,9 +127,9 @@ fn check_flags(pgtable: &X64PageTable<'_, MockKernel>, addr: usize, flags: PageT
 fn get_test_pgtable<'a>(
     range: PageRange<PAGE_SIZE>,
     fault_flags: PageTableFlags,
-) -> X64PageTable<'a, MockKernel> {
+) -> X64PageTable<'a, MockKernel, PAGE_SIZE> {
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
-    let mut pgtable = unsafe { X64PageTable::<MockKernel>::init(p4.start_address()) };
+    let mut pgtable = unsafe { X64PageTable::<MockKernel, PAGE_SIZE>::init(p4.start_address()) };
 
     for page in range {
         unsafe {
@@ -160,7 +164,10 @@ fn test_page_table() {
     unsafe {
         assert!(
             pgtable
-                .mprotect_pages(start_addr + 2 * PAGE_SIZE, 4 * PAGE_SIZE, new_vmflags,)
+                .mprotect_pages(
+                    PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 6 * PAGE_SIZE).unwrap(),
+                    new_vmflags
+                )
                 .is_ok()
         );
     }
@@ -178,7 +185,10 @@ fn test_page_table() {
     unsafe {
         assert!(
             pgtable
-                .remap_pages(start_addr, new_addr, 2 * PAGE_SIZE, 2 * PAGE_SIZE)
+                .remap_pages(
+                    PageRange::new(start_addr, start_addr + 2 * PAGE_SIZE).unwrap(),
+                    PageRange::new(new_addr, new_addr + 2 * PAGE_SIZE).unwrap()
+                )
                 .is_ok()
         );
     }
@@ -193,7 +203,13 @@ fn test_page_table() {
     }
 
     // unmap all pages
-    unsafe { pgtable.unmap_pages(start_addr, new_addr - start_addr + 4 * PAGE_SIZE) }.unwrap();
+    unsafe {
+        pgtable.unmap_pages(PageRange::new_unchecked(
+            start_addr,
+            new_addr + 4 * PAGE_SIZE,
+        ))
+    }
+    .unwrap();
     for page in PageRange::<PAGE_SIZE>::new(start_addr, new_addr + 4 * PAGE_SIZE).unwrap() {
         assert!(matches!(
             pgtable.translate(VirtAddr::new(page as _)),

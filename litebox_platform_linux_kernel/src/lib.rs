@@ -395,6 +395,6 @@ pub trait HostInterface {
     fn log(msg: &str);
 }
 
-impl<Host: HostInterface> PageManagementProvider for LinuxKernel<Host> {
-    type Backend = mm::KernelVmemBackend;
+impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
+    type Backend = mm::KernelVmemBackend<ALIGN>;
 }

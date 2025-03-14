@@ -438,6 +438,6 @@ fn futex_val2(
     unsafe { libc::syscall(libc::SYS_futex, uaddr, futex_op, val, val2, uaddr2, val3) }
 }
 
-impl litebox::platform::PageManagementProvider for LinuxUserland {
+impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for LinuxUserland {
     type Backend = mm::UserMemBackend;
 }

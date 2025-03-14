@@ -80,8 +80,8 @@ pub trait MemoryProvider {
 }
 
 #[cfg(all(target_arch = "x86_64", not(test)))]
-pub type KernelVmemBackend =
-    crate::arch::mm::paging::X64PageTable<'static, crate::host::snp::SnpLinuxKenrel>;
+pub type KernelVmemBackend<const ALIGN: usize> =
+    crate::arch::mm::paging::X64PageTable<'static, crate::host::snp::SnpLinuxKenrel, ALIGN>;
 #[cfg(all(target_arch = "x86_64", test))]
-pub type KernelVmemBackend =
-    crate::arch::mm::paging::X64PageTable<'static, crate::host::mock::MockKernel>;
+pub type KernelVmemBackend<const ALIGN: usize> =
+    crate::arch::mm::paging::X64PageTable<'static, crate::host::mock::MockKernel, ALIGN>;
