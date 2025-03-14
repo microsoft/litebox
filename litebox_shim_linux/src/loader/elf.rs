@@ -290,7 +290,7 @@ mod tests {
     use crate::litebox_fs;
     use alloc::ffi::CString;
     use alloc::vec;
-    use core::arch::global_asm;
+    use core::{arch::global_asm, str::FromStr};
     use litebox::{
         fs::{FileSystem, Mode, OFlags},
         platform::trivial_providers::ImpossiblePunchthroughProvider,
@@ -321,16 +321,27 @@ mod tests {
         });
     }
 
-    fn compile(path: &std::path::Path) {
+    fn compile(path: &std::path::Path, exec_or_lib: bool) {
         // Compile the hello.c file to an executable
+        let mut args = vec!["-o", path.to_str().unwrap(), "./src/loader/hello.c"];
+        if exec_or_lib {
+            args.push("-static");
+        }
         let output = std::process::Command::new("gcc")
-            .arg("-o")
-            .arg(path.to_str().unwrap())
-            .arg("./src/loader/hello.c")
-            .arg("-static")
+            .args(args)
             .output()
             .expect("Failed to compile hello.c");
-        assert!(output.status.success(), "failed to compile hello.c");
+        assert!(
+            output.status.success(),
+            "failed to compile hello.c {:?}",
+            output.stderr
+        );
+    }
+
+    fn install_dir(path: &str) {
+        litebox_fs()
+            .mkdir(path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .expect("Failed to create directory");
     }
 
     fn install_file(path: &std::path::PathBuf, out: &str) {
@@ -346,27 +357,50 @@ mod tests {
         litebox_fs().close(fd).unwrap();
     }
 
-    #[test]
-    fn test_load_exec() {
-        unsafe extern "C" {
-            fn trampoline(entry: usize, sp: usize) -> !;
-        }
+    unsafe extern "C" {
+        fn trampoline(entry: usize, sp: usize) -> !;
+    }
 
+    #[test]
+    fn test_load_exec_static() {
         init_platform();
 
         // no std::env::var("OUT_DIR").unwrap()??
-        let path = std::path::Path::new("../target/debug").join("hello");
-        compile(&path);
+        let path = std::path::Path::new("../target/debug").join("hello_exec");
+        compile(&path, true);
 
-        let executable_path = "/hello";
+        let executable_path = "/hello_exec";
         install_file(&path, executable_path);
 
+        test_load_exec_common(executable_path);
+    }
+
+    #[test]
+    fn test_load_exec_dynamic() {
+        init_platform();
+
+        // no std::env::var("OUT_DIR").unwrap()??
+        let path = std::path::Path::new("../target/debug").join("hello_dylib");
+        compile(&path, false);
+
+        let executable_path = "/hello_dylib";
+        install_file(&path, executable_path);
+        install_dir("/lib64");
+        install_file(
+            &std::path::PathBuf::from_str("/lib64/ld-linux-x86-64.so.2").unwrap(),
+            "/lib64/ld-linux-x86-64.so.2",
+        );
+
+        test_load_exec_common(executable_path);
+    }
+
+    fn test_load_exec_common(executable_path: &str) {
         let argv = vec![
-            CString::new("./hello").unwrap(),
+            CString::new(executable_path).unwrap(),
             CString::new("hello").unwrap(),
         ];
         let envp = vec![CString::new("PATH=/bin").unwrap()];
-        let info = ElfLoader::load(executable_path, argv, envp).expect("failed to load executable");
+        let info = ElfLoader::load(executable_path, argv, envp).unwrap();
 
         unsafe { trampoline(info.entry_point, info.user_stack_top) };
     }

@@ -63,7 +63,7 @@ fn collect_mappings(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<Range<usize>
 #[test]
 #[allow(clippy::too_many_lines)]
 fn test_vmm_mapping() {
-    let start_addr: usize = 0x1000;
+    let start_addr: usize = 0x1_0000;
     let range = PageRange::new(start_addr, start_addr + 12 * PAGE_SIZE).unwrap();
     let mut vmm = Vmem::new(&DummyVmemBackend);
 
@@ -74,16 +74,25 @@ fn test_vmm_mapping() {
             VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE),
         );
     }
-    // [(0x1000, 0xd000)]
-    assert_eq!(collect_mappings(&vmm), vec![0x1000..0xd000]);
+    // [(0x1_0000, 0x1_c000)]
+    assert_eq!(
+        collect_mappings(&vmm),
+        vec![start_addr..start_addr + 12 * PAGE_SIZE]
+    );
 
     unsafe {
         vmm.remove_mapping(
             PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap(),
         );
     }
-    // [(0x1000, 0x3000), (0x5000, 0xd000)]
-    assert_eq!(collect_mappings(&vmm), vec![0x1000..0x3000, 0x5000..0xd000]);
+    // [(0x1_0000, 0x1_2000), (0x1_4000, 0x1_c000)]
+    assert_eq!(
+        collect_mappings(&vmm),
+        vec![
+            start_addr..start_addr + 2 * PAGE_SIZE,
+            start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE
+        ]
+    );
 
     assert!(matches!(
         unsafe {
@@ -92,7 +101,7 @@ fn test_vmm_mapping() {
                 NonZeroPageSize::new(PAGE_SIZE * 2).unwrap(),
             )
         },
-        // Failed to resize, remain [(0x1000, 0x3000), (0x5000, 0xd000)]
+        // Failed to resize, remain [(0x1_0000, 0x1_2000), (0x1_4000, 0x1_c000)]
         Err(VmemResizeError::NotExist(_))
     ));
 
@@ -103,7 +112,7 @@ fn test_vmm_mapping() {
                 NonZeroPageSize::new(PAGE_SIZE * 4).unwrap(),
             )
         },
-        // Failed to resize, remain [(0x1000, 0x3000), (0x5000, 0xd000)]
+        // Failed to resize, remain [(0x1_0000, 0x1_2000), (0x1_4000, 0x1_c000)]
         Err(VmemResizeError::InvalidAddr { .. })
     ));
 
@@ -114,7 +123,7 @@ fn test_vmm_mapping() {
                 VmFlags::VM_READ | VmFlags::VM_WRITE,
             )
         },
-        // Failed to protect, remain [(0x1000, 0x3000), (0x5000, 0xd000)]
+        // Failed to protect, remain [(0x1_0000, 0x1_2000), (0x1_4000, 0x1_c000)]
         Err(VmemProtectError::InvalidRange(_))
     ));
 
@@ -127,8 +136,11 @@ fn test_vmm_mapping() {
         }
         .is_ok()
     );
-    // Grow and merge, [(0x1000, 0xd000)]
-    assert_eq!(collect_mappings(&vmm), vec![0x1000..0xd000]);
+    // Grow and merge, [(0x1_0000, 0x1_c000)]
+    assert_eq!(
+        collect_mappings(&vmm),
+        vec![start_addr..start_addr + 12 * PAGE_SIZE]
+    );
 
     assert!(matches!(
         unsafe {
@@ -137,7 +149,7 @@ fn test_vmm_mapping() {
                 VmFlags::VM_READ | VmFlags::VM_EXEC,
             )
         },
-        // Failed to protect, remain [(0x1000, 0xd000)]
+        // Failed to protect, remain [(0x1_0000, 0x1_c000)]
         Err(VmemProtectError::NoAccess { .. })
     ));
 
@@ -150,13 +162,17 @@ fn test_vmm_mapping() {
         }
         .is_ok()
     );
-    // Change permission, [(0x1000, 0x3000), (0x3000, 0x5000), (0x5000, 0xd000)]
+    // Change permission, [(0x1_0000, 0x1_2000), (0x1_2000, 0x1_4000), (0x1_4000, 0x1_c000)]
     assert_eq!(
         collect_mappings(&vmm),
-        vec![0x1000..0x3000, 0x3000..0x5000, 0x5000..0xd000]
+        vec![
+            start_addr..start_addr + 2 * PAGE_SIZE,
+            start_addr + 2 * PAGE_SIZE..start_addr + 4 * PAGE_SIZE,
+            start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE
+        ]
     );
 
-    // try to remap [0x3000, 0x5000)
+    // try to remap [0x1_2000, 0x1_4000)
     let r = PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap();
     assert!(matches!(
         unsafe { vmm.resize_mapping(r, NonZeroPageSize::new(PAGE_SIZE * 4).unwrap()) },
@@ -164,33 +180,37 @@ fn test_vmm_mapping() {
     ));
     assert!(
         unsafe { vmm.move_mappings(r, PageRange::new(0, PAGE_SIZE * 4).unwrap()) }
-            .is_ok_and(|v| v == 0xd000)
+            .is_ok_and(|v| v == start_addr + 12 * PAGE_SIZE)
     );
     assert_eq!(
         collect_mappings(&vmm),
-        vec![0x1000..0x3000, 0x5000..0xd000, 0xd000..0x11000]
+        vec![
+            start_addr..start_addr + 2 * PAGE_SIZE,
+            start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
+            start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE
+        ]
     );
 
     // create new mapping with no suggested address
     assert_eq!(
         unsafe {
             vmm.create_mapping(
-                PageRange::new(0, start_addr).unwrap(),
+                PageRange::new(0, PAGE_SIZE).unwrap(),
                 VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD),
                 false,
             )
         }
         .unwrap()
         .as_usize(),
-        0x11000
+        start_addr + 16 * PAGE_SIZE
     );
     assert_eq!(
         collect_mappings(&vmm),
         vec![
-            0x1000..0x3000,
-            0x5000..0xd000,
-            0xd000..0x11000,
-            0x11000..0x12000
+            start_addr..start_addr + 2 * PAGE_SIZE,
+            start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
+            start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
+            start_addr + 16 * PAGE_SIZE..start_addr + 17 * PAGE_SIZE,
         ]
     );
 
@@ -210,11 +230,11 @@ fn test_vmm_mapping() {
     assert_eq!(
         collect_mappings(&vmm),
         vec![
-            0x1000..0x2000,
-            0x2000..0x4000,
-            0x5000..0xd000,
-            0xd000..0x11000,
-            0x11000..0x12000
+            start_addr..start_addr + PAGE_SIZE,
+            start_addr + PAGE_SIZE..start_addr + 3 * PAGE_SIZE,
+            start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
+            start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
+            start_addr + 16 * PAGE_SIZE..start_addr + 17 * PAGE_SIZE,
         ]
     );
 
@@ -223,7 +243,7 @@ fn test_vmm_mapping() {
         unsafe {
             vmm.resize_mapping(
                 PageRange::new(start_addr + 4 * PAGE_SIZE, start_addr + 8 * PAGE_SIZE).unwrap(),
-                NonZeroPageSize::new(0x2000).unwrap(),
+                NonZeroPageSize::new(2 * PAGE_SIZE).unwrap(),
             )
         }
         .is_ok()
@@ -231,12 +251,12 @@ fn test_vmm_mapping() {
     assert_eq!(
         collect_mappings(&vmm),
         vec![
-            0x1000..0x2000,
-            0x2000..0x4000,
-            0x5000..0x7000,
-            0x9000..0xd000,
-            0xd000..0x11000,
-            0x11000..0x12000
+            start_addr..start_addr + PAGE_SIZE,
+            start_addr + PAGE_SIZE..start_addr + 3 * PAGE_SIZE,
+            start_addr + 4 * PAGE_SIZE..start_addr + 6 * PAGE_SIZE,
+            start_addr + 8 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
+            start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
+            start_addr + 16 * PAGE_SIZE..start_addr + 17 * PAGE_SIZE,
         ]
     );
 }
