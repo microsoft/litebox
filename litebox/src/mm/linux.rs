@@ -489,7 +489,17 @@ impl<Backend: VmemBackend<ALIGN>, const ALIGN: usize> Vmem<Backend, ALIGN> {
             unsafe { self.create_mapping(suggested_range, VmArea::new(before_flags), fixed_addr) }
                 .ok_or(MappingError::OutOfMemory)?;
         // call the user function with the pages
-        let _ = op(addr)?;
+        if let Err(e) = op(addr) {
+            // remove the mapping if the user function fails
+            unsafe {
+                self.remove_mapping(
+                    PageRange::new(addr.as_usize(), addr.as_usize() + suggested_range.len())
+                        .unwrap(),
+                )
+            }
+            .unwrap();
+            return Err(e);
+        }
         if before_flags != after_flags {
             // `protect` should succeed, as we just created the mapping.
             unsafe {
