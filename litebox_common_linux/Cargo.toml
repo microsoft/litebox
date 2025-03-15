@@ -1,0 +1,11 @@
+[package]
+name = "litebox_common_linux"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+litebox = { path = "../litebox/", version = "0.1.0" }
+thiserror = { version = "2.0.6", default-features = false }
+
+[lints]
+workspace = true

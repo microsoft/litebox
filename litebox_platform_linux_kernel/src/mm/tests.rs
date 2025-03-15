@@ -41,7 +41,7 @@ impl super::MemoryProvider for MockKernel {
     const GVA_OFFSET: super::VirtAddr = super::VirtAddr::new(0);
     const PRIVATE_PTE_MASK: u64 = 0;
 
-    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::error::Errno> {
+    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::Errno> {
         let mut mapping = MAPPING.lock();
         let (start, len) = MockHostInterface::alloc(layout)?;
         let begin = Page::<Size4KiB>::from_start_address(VirtAddr::new(start as _)).unwrap();

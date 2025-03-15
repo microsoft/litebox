@@ -19,10 +19,8 @@ use alloc::vec::Vec;
 use once_cell::race::OnceBox;
 
 use litebox::{fs::FileSystem as _, platform::RawConstPointer as _, sync::RwLock};
+use litebox_common_linux::errno::Errno;
 use litebox_platform_multiplex::Platform;
-
-pub mod errno;
-use errno::AsErrno as _;
 
 pub(crate) fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
     static FS: OnceBox<litebox::fs::in_mem::FileSystem<Platform>> = OnceBox::new();
@@ -172,7 +170,7 @@ pub(crate) fn file_descriptors<'a>() -> &'a RwLock<'static, Platform, Descriptor
 )]
 pub unsafe extern "C" fn open(pathname: ConstPtr<i8>, flags: u32, mode: u32) -> i32 {
     let Some(path) = pathname.to_cstring() else {
-        return -errno::constants::EFAULT;
+        return Errno::EFAULT.as_neg();
     };
     match litebox_fs().open(
         path,
@@ -184,21 +182,21 @@ pub unsafe extern "C" fn open(pathname: ConstPtr<i8>, flags: u32, mode: u32) -> 
             .insert(Descriptor::File(fd))
             .try_into()
             .unwrap(),
-        Err(err) => -err.as_errno(),
+        Err(err) => Errno::from(err).as_neg(),
     }
 }
 
 /// Closes the file
 pub extern "C" fn close(fd: i32) -> i32 {
     let Ok(fd) = u32::try_from(fd) else {
-        return -errno::constants::EBADF;
+        return Errno::EBADF.as_neg();
     };
     match file_descriptors().write().remove(fd) {
         Some(Descriptor::File(file_fd)) => match litebox_fs().close(file_fd) {
             Ok(()) => 0,
-            Err(err) => -err.as_errno(),
+            Err(err) => Errno::from(err).as_neg(),
         },
         Some(Descriptor::Socket(socket_fd)) => todo!(),
-        None => -errno::constants::EBADF,
+        None => Errno::EBADF.as_neg(),
     }
 }

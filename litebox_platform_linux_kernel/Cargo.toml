@@ -13,6 +13,7 @@ bitflags = "2.9.0"
 buddy_system_allocator = { version = "0.11.0", default-features = false, features = ["use_spin"] }
 slabmalloc = { git = "https://github.com/gz/rust-slabmalloc.git", rev = "19480b2e82704210abafe575fb9699184c1be110" }
 litebox = { path = "../litebox/", version = "0.1.0" }
+litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 libc = "0.2.169"
 arrayvec = { version = "0.7.6", default-features = false }

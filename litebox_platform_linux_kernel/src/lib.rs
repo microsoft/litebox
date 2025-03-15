@@ -12,12 +12,12 @@ use litebox::platform::{
     UnblockedOrTimedOut,
 };
 use litebox::platform::{RawMutex as _, RawPointerProvider};
+use litebox_common_linux::errno::Errno;
 use ptr::{UserConstPtr, UserMutPtr};
 
 extern crate alloc;
 
 pub mod arch;
-pub mod error;
 pub mod host;
 pub mod mm;
 pub mod ptr;
@@ -44,7 +44,7 @@ pub enum LinuxPunchthrough {
 
 impl Punchthrough for LinuxPunchthrough {
     type ReturnSuccess = usize;
-    type ReturnFailure = error::Errno;
+    type ReturnFailure = Errno;
 }
 
 pub struct LinuxPunchthroughToken<Host: HostInterface> {
@@ -150,7 +150,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         set: UserConstPtr<sigset_t>,
         old_set: UserMutPtr<sigset_t>,
         sigsetsize: usize,
-    ) -> Result<usize, PunchthroughError<error::Errno>> {
+    ) -> Result<usize, PunchthroughError<Errno>> {
         let punchthrough = LinuxPunchthrough::RtSigprocmask {
             how,
             set,
@@ -249,16 +249,16 @@ impl<Host: HostInterface> RawMutex<Host> {
                         return Ok(UnblockedOrTimedOut::Unblocked);
                     }
                 }
-                Err(error::Errno::EAGAIN) => {
+                Err(Errno::EAGAIN) => {
                     // If the futex value does not match val, then the call fails
                     // immediately with the error EAGAIN.
                     return Err(ImmediatelyWokenUp);
                 }
-                Err(error::Errno::EINTR) => {
+                Err(Errno::EINTR) => {
                     // return Err(ImmediatelyWokenUp);
                     todo!("EINTR");
                 }
-                Err(error::Errno::ETIMEDOUT) => {
+                Err(Errno::ETIMEDOUT) => {
                     return Ok(UnblockedOrTimedOut::TimedOut);
                 }
                 Err(e) => {
@@ -349,7 +349,7 @@ pub trait HostInterface {
     ///
     /// It can return more than requested size. On success, it returns the start address
     /// and the size of the allocated memory.
-    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), error::Errno>;
+    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), Errno>;
 
     /// Returns the memory back to host.
     ///
@@ -376,20 +376,20 @@ pub trait HostInterface {
         set: UserConstPtr<sigset_t>,
         old_set: UserMutPtr<sigset_t>,
         sigsetsize: usize,
-    ) -> Result<usize, error::Errno>;
+    ) -> Result<usize, Errno>;
 
-    fn wake_many(mutex: &AtomicU32, n: usize) -> Result<usize, error::Errno>;
+    fn wake_many(mutex: &AtomicU32, n: usize) -> Result<usize, Errno>;
 
     fn block_or_maybe_timeout(
         mutex: &AtomicU32,
         val: u32,
         timeout: Option<core::time::Duration>,
-    ) -> Result<(), error::Errno>;
+    ) -> Result<(), Errno>;
 
     /// For Network
-    fn send_ip_packet(packet: &[u8]) -> Result<usize, error::Errno>;
+    fn send_ip_packet(packet: &[u8]) -> Result<usize, Errno>;
 
-    fn receive_ip_packet(packet: &mut [u8]) -> Result<usize, error::Errno>;
+    fn receive_ip_packet(packet: &mut [u8]) -> Result<usize, Errno>;
 
     /// For Debugging
     fn log(msg: &str);
