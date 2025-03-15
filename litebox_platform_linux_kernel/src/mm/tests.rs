@@ -9,7 +9,6 @@ use litebox::{
         linux::{PAGE_SIZE, PageFaultError, PageRange, VmFlags},
     },
     platform::RawConstPointer,
-    sync::Synchronization,
 };
 use spin::mutex::SpinMutex;
 
@@ -130,7 +129,7 @@ fn get_test_pgtable<'a>(
     fault_flags: PageTableFlags,
 ) -> X64PageTable<'a, MockKernel, PAGE_SIZE> {
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
-    let mut pgtable = unsafe { X64PageTable::<MockKernel, PAGE_SIZE>::init(p4.start_address()) };
+    let pgtable = unsafe { X64PageTable::<MockKernel, PAGE_SIZE>::init(p4.start_address()) };
 
     for page in range {
         unsafe {
@@ -157,7 +156,7 @@ fn test_page_table() {
     let vmflags = VmFlags::VM_READ;
     let pteflags = vmflags_to_pteflags(vmflags) | PageTableFlags::PRESENT;
     let range = PageRange::new(start_addr, start_addr + 4 * PAGE_SIZE).unwrap();
-    let mut pgtable = get_test_pgtable(range, pteflags);
+    let pgtable = get_test_pgtable(range, pteflags);
 
     // update flags
     let new_vmflags = VmFlags::empty();
@@ -224,9 +223,9 @@ fn test_vmm_page_fault() {
     let start_addr: usize = 0x1000;
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
     let platform = MockKernel::new();
-    let sync = Synchronization::new(&platform);
     // TODO: Handle passing p4.start_address()
-    let mut vmm = unsafe { PageManager::<'_, _, PAGE_SIZE>::new(&platform) };
+    let _ = p4.start_address();
+    let mut vmm = PageManager::<'_, _, PAGE_SIZE>::new(&platform);
     unsafe {
         assert_eq!(
             vmm.create_writable_pages(start_addr, 4 * PAGE_SIZE, true, |_: UserMutPtr<u8>| Ok(0),)

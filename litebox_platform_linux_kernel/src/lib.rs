@@ -409,8 +409,8 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let range = PageRange::new(range.start, range.end)
             .ok_or(litebox::platform::page_mgmt::AllocationError::Unaligned)?;
-        let flags = (initial_permissions.bits() as u32)
-            | ((max_permissions.bits() as u32) << 4)
+        let flags = u32::from(initial_permissions.bits())
+            | (u32::from(max_permissions.bits()) << 4)
             | if can_grow_down {
                 litebox::mm::linux::VmFlags::VM_GROWSDOWN.bits()
             } else {
@@ -452,8 +452,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         let range = PageRange::new(range.start, range.end)
             .ok_or(litebox::platform::page_mgmt::PermissionUpdateError::Unaligned)?;
         let new_flags =
-            litebox::mm::linux::VmFlags::from_bits(new_permissions.bits().try_into().unwrap())
-                .unwrap();
+            litebox::mm::linux::VmFlags::from_bits(new_permissions.bits().into()).unwrap();
         unsafe { self.mem_mgmt.mprotect_pages(range, new_flags) }
     }
 }

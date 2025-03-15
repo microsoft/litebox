@@ -80,6 +80,11 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         unsafe { Self::init(item) }
     }
 
+    #[expect(
+        clippy::unused_self,
+        clippy::unnecessary_wraps,
+        reason = "signature left unchanged for easier review of PR#36"
+    )]
     pub(crate) unsafe fn map_pages(
         &self,
         range: PageRange<ALIGN>,
@@ -93,6 +98,10 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     ///
     /// Note it does not free the allocated frames for page table itself (only those allocated to
     /// user space).
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "signature left unchanged for easier review of PR#36"
+    )]
     pub(crate) unsafe fn unmap_pages(
         &self,
         range: PageRange<ALIGN>,
@@ -192,6 +201,10 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "signature left unchanged for easier review of PR#36"
+    )]
     pub(crate) unsafe fn mprotect_pages(
         &self,
         range: PageRange<ALIGN>,
