@@ -1,35 +1,5 @@
 //! This module contains the stack layout for the user process.
 
-/*                        STACK LAYOUT
-position            content                     size (bytes) + comment
-  ------------------------------------------------------------------------
-  stack pointer ->  [ argc = number of args ]     8
-                    [ argv[0] (pointer) ]         8   (program name)
-                    [ argv[1] (pointer) ]         8
-                    [ argv[..] (pointer) ]        8 * x
-                    [ argv[n - 1] (pointer) ]     8
-                    [ argv[n] (pointer) ]         8   (= NULL)
-
-                    [ envp[0] (pointer) ]         8
-                    [ envp[1] (pointer) ]         8
-                    [ envp[..] (pointer) ]        8 * y
-                    [ envp[term] (pointer) ]      8   (= NULL)
-
-                    [ auxv[0] (Elf64_auxv_t) ]    8
-                    [ auxv[1] (Elf64_auxv_t) ]    8
-                    [ auxv[..] (Elf64_auxv_t) ]   8 * z
-                    [ auxv[term] (Elf64_auxv_t) ] 8   (= AT_NULL vector)
-
-                    [ padding ]                   0 - 16
-
-                    [ argument ASCIIZ strings ]   >= 0
-                    [ environment ASCIIZ str. ]   >= 0
-
-  (0xbffffffc)      [ end marker ]                8   (= NULL)
-
-  (0xc0000000)      < bottom of stack >           0   (virtual)
-  ------------------------------------------------------------------------
- */
 use alloc::{collections::btree_map::BTreeMap, ffi::CString, vec::Vec};
 use litebox::platform::{RawConstPointer, RawMutPointer};
 
@@ -72,8 +42,40 @@ pub enum AuxKey {
 }
 
 /// The stack layout for the user process. This is used to set up the stack
-/// for the new process. The stack is set up in a way that is compatible with
-/// the Linux ABI.
+/// for the new process.
+///
+/// The stack layout is as follows:
+/// ```text
+///                           STACK LAYOUT
+/// position            content                     size (bytes) + comment
+/// ------------------------------------------------------------------------
+/// stack pointer ->  [ argc = number of args ]     8
+///                   [ argv[0] (pointer) ]         8   (program name)
+///                   [ argv[1] (pointer) ]         8
+///                   [ argv[..] (pointer) ]        8 * x
+///                   [ argv[n - 1] (pointer) ]     8
+///                   [ argv[n] (pointer) ]         8   (= NULL)
+///
+///                   [ envp[0] (pointer) ]         8
+///                   [ envp[1] (pointer) ]         8
+///                   [ envp[..] (pointer) ]        8 * y
+///                   [ envp[term] (pointer) ]      8   (= NULL)
+///
+///                   [ auxv[0] (Elf64_auxv_t) ]    8
+///                   [ auxv[1] (Elf64_auxv_t) ]    8
+///                   [ auxv[..] (Elf64_auxv_t) ]   8 * z
+///                   [ auxv[term] (Elf64_auxv_t) ] 8   (= AT_NULL vector)
+///
+///                   [ padding ]                   0 - 16
+///
+///                   [ argument ASCIIZ strings ]   >= 0
+///                   [ environment ASCIIZ str. ]   >= 0
+///
+/// (0xbffffffc)      [ end marker ]                8   (= NULL)
+///
+/// (0xc0000000)      < bottom of stack >           0   (virtual)
+/// ------------------------------------------------------------------------
+/// ```
 pub(super) struct UserStack {
     /// The top of the stack (base address)
     stack_top: MutPtr<u8>,
@@ -113,7 +115,7 @@ impl UserStack {
     /// Push `bytes` to the stack.
     ///
     /// Returns `None` if stack has no enough space.
-    fn write_bytes(&mut self, bytes: &[u8]) -> Option<()> {
+    fn push_bytes(&mut self, bytes: &[u8]) -> Option<()> {
         let old_pos = self.pos;
         self.pos = self.pos.checked_sub_unsigned(bytes.len())?;
         self.stack_top
@@ -124,26 +126,26 @@ impl UserStack {
     /// Push a value to the stack.
     ///
     /// Returns `None` if stack has no enough space.
-    fn write_usize(&mut self, val: usize) -> Option<()> {
-        self.write_bytes(&val.to_le_bytes())
+    fn push_usize(&mut self, val: usize) -> Option<()> {
+        self.push_bytes(&val.to_le_bytes())
     }
 
     /// Push a string with a null terminator to the stack.
     ///
     /// Returns `None` if stack has no enough space.
-    fn write_cstring(&mut self, val: &CString) -> Option<()> {
+    fn push_cstring(&mut self, val: &CString) -> Option<()> {
         let bytes = val.as_bytes_with_nul();
-        self.write_bytes(bytes)
+        self.push_bytes(bytes)
     }
 
     /// Push a vector of strings with null terminators to the stack.
     ///
     /// Returns the offsets of the strings in the stack.
     /// Returns `None` if stack has no enough space.
-    fn write_cstrings(&mut self, vals: &[CString]) -> Option<Vec<isize>> {
+    fn push_cstrings(&mut self, vals: &[CString]) -> Option<Vec<isize>> {
         let mut envp = Vec::with_capacity(vals.len());
         for val in vals {
-            self.write_cstring(val)?;
+            self.push_cstring(val)?;
             envp.push(self.pos);
         }
         Some(envp)
@@ -154,12 +156,12 @@ impl UserStack {
     /// `offsets` are the offsets of the pointers in the stack.
     ///
     /// Returns `None` if stack has no enough space.
-    fn write_pointers(&mut self, offsets: Vec<isize>) -> Option<()> {
+    fn push_pointers(&mut self, offsets: Vec<isize>) -> Option<()> {
         // write end marker
-        self.write_usize(0)?;
-        let len = offsets.len();
+        self.push_usize(0)?;
+        let size = offsets.len().checked_mul(size_of::<isize>())?;
         let old_pos = self.pos;
-        self.pos = self.pos.checked_sub_unsigned(len * size_of::<isize>())?;
+        self.pos = self.pos.checked_sub_unsigned(size)?;
         self.stack_top
             .mutate_subslice_with(self.pos..old_pos, |s| -> Option<()> {
                 for (i, p) in offsets.iter().enumerate() {
@@ -174,13 +176,13 @@ impl UserStack {
     /// Push a auxiliary vector to the stack.
     ///
     /// Returns `None` if stack has no enough space.
-    fn write_aux(&mut self, aux: BTreeMap<AuxKey, usize>) -> Option<()> {
+    fn push_aux(&mut self, aux: BTreeMap<AuxKey, usize>) -> Option<()> {
         // write end marker
-        self.write_usize(0)?;
-        self.write_usize(AuxKey::AT_NULL as usize)?;
+        self.push_usize(0)?;
+        self.push_usize(AuxKey::AT_NULL as usize)?;
         for (key, val) in aux {
-            self.write_usize(val)?;
-            self.write_usize(key as usize)?;
+            self.push_usize(val)?;
+            self.push_usize(key as usize)?;
         }
         Some(())
     }
@@ -211,10 +213,10 @@ impl UserStack {
             self.stack_top.write_at_offset(self.pos, 0)?;
         }
 
-        let envp = self.write_cstrings(&env)?;
-        let argvp = self.write_cstrings(&argv)?;
+        let envp = self.push_cstrings(&env)?;
+        let argvp = self.push_cstrings(&argv)?;
 
-        self.write_bytes(&Self::get_random_value())?;
+        self.push_bytes(&Self::get_random_value())?;
         aux.insert(
             AuxKey::AT_RANDOM,
             self.stack_top.as_usize().checked_add_signed(self.pos)?,
@@ -228,11 +230,11 @@ impl UserStack {
         let final_pos = self.pos.checked_sub_unsigned(size)?;
         self.pos -= final_pos - Self::align_down(final_pos, Self::STACK_ALIGNMENT);
 
-        self.write_aux(aux)?;
-        self.write_pointers(envp)?;
-        self.write_pointers(argvp)?;
+        self.push_aux(aux)?;
+        self.push_pointers(envp)?;
+        self.push_pointers(argvp)?;
 
-        self.write_usize(argv.len())?;
+        self.push_usize(argv.len())?;
         assert_eq!(self.pos, Self::align_down(self.pos, Self::STACK_ALIGNMENT));
         Some(())
     }

@@ -80,6 +80,7 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     /// # Safety
     ///
     /// This is for testing purposes only.
+    #[cfg(feature = "testing")]
     pub unsafe fn new_for_test(punchthrough_provider: PunchthroughProvider) -> Self {
         Self {
             tun_socket_fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(-2) },

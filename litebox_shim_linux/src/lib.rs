@@ -32,18 +32,23 @@ pub mod loader;
 
 use errno::AsErrno as _;
 
-pub(crate) fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
-    static FS: OnceBox<litebox::fs::in_mem::FileSystem<Platform>> = OnceBox::new();
+static FS: OnceBox<litebox::fs::in_mem::FileSystem<Platform>> = OnceBox::new();
+/// Set the global file system
+///
+/// # Panics
+///
+/// Panics if this is called more than once or `litebox_fs` is called before this
+pub fn set_fs(fs: litebox::fs::in_mem::FileSystem<'static, Platform>) {
+    FS.set(alloc::boxed::Box::new(fs))
+        .map_err(|_| {})
+        .expect("fs is already set");
+}
+
+pub fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
     FS.get_or_init(|| {
-        let mut in_mem_fs =
-            litebox::fs::in_mem::FileSystem::new(litebox_platform_multiplex::platform());
-        #[cfg(test)]
-        in_mem_fs.with_root_privileges(|fs| {
-            use litebox::fs::Mode;
-            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to set permissions on root");
-        });
-        alloc::boxed::Box::new(in_mem_fs)
+        alloc::boxed::Box::new(litebox::fs::in_mem::FileSystem::new(
+            litebox_platform_multiplex::platform(),
+        ))
     })
 }
 

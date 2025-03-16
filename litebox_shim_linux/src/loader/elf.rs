@@ -28,7 +28,7 @@ struct ElfFile {
 
 impl ElfFile {
     pub(super) fn from_path(path: &str) -> Result<Self, OpenError> {
-        let file = litebox_fs().open(path, OFlags::RDWR, Mode::empty())?;
+        let file = litebox_fs().open(path, OFlags::RDONLY, Mode::empty())?;
         let fd = file_descriptors()
             .write()
             .insert(crate::Descriptor::File(file));
@@ -66,7 +66,6 @@ impl ElfObject for ElfFile {
 }
 
 /// [`elf_loader::mmap::Mmap`] implementation for ELF loader
-/// using [`litebox::mm::mapping::MappingProvider`].
 struct ElfLoaderMmap;
 
 impl ElfLoaderMmap {
@@ -196,13 +195,13 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
 
 /// Struct to hold the information needed to start the program
 /// (entry point and user stack top).
-struct ElfLoadInfo {
-    entry_point: usize,
-    user_stack_top: usize,
+pub struct ElfLoadInfo {
+    pub entry_point: usize,
+    pub user_stack_top: usize,
 }
 
 /// Loader for ELF files
-struct ElfLoader;
+pub struct ElfLoader;
 
 impl ElfLoader {
     const DEFAULT_STACK_SIZE: usize = 2 * PAGE_SIZE;
@@ -226,7 +225,7 @@ impl ElfLoader {
     }
 
     /// Load an ELF file and prepare the stack for the new process.
-    fn load(
+    pub fn load(
         path: &str,
         argv: Vec<CString>,
         envp: Vec<CString>,
@@ -260,9 +259,10 @@ impl ElfLoader {
         let sp = unsafe {
             litebox_vmm()
                 .create_stack_pages(0, Self::DEFAULT_STACK_SIZE, false)
-                .unwrap()
+                .map_err(ElfLoaderError::MappingError)?
         };
-        let mut stack = UserStack::new(sp, Self::DEFAULT_STACK_SIZE).unwrap();
+        let mut stack =
+            UserStack::new(sp, Self::DEFAULT_STACK_SIZE).ok_or(ElfLoaderError::InvalidStackAddr)?;
         stack
             .init(argv, envp, aux)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
@@ -275,136 +275,13 @@ impl ElfLoader {
 }
 
 #[derive(Error, Debug)]
-enum ElfLoaderError {
+pub enum ElfLoaderError {
     #[error("failed to open the ELF file: {0}")]
     OpenError(#[from] OpenError),
     #[error("failed to load the ELF file: {0}")]
     LoaderError(#[from] elf_loader::Error),
     #[error("invalid stack")]
     InvalidStackAddr,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ElfLoader;
-    use crate::litebox_fs;
-    use alloc::ffi::CString;
-    use alloc::vec;
-    use core::{arch::global_asm, str::FromStr};
-    use litebox::{
-        fs::{FileSystem, Mode, OFlags},
-        platform::trivial_providers::ImpossiblePunchthroughProvider,
-    };
-    use litebox_platform_multiplex::{Platform, set_platform};
-
-    extern crate std;
-
-    global_asm!(
-        "
-        .text
-        .align	4
-        .globl	trampoline
-        .type	trampoline,@function
-    trampoline:
-        xor rdx, rdx
-        mov	rsp, rsi
-        jmp	rdi
-        /* Should not reach. */
-        hlt"
-    );
-
-    fn init_platform() {
-        static ONCE: spin::Once = spin::Once::new();
-        ONCE.call_once(|| {
-            let platform = unsafe { Platform::new_for_test(ImpossiblePunchthroughProvider {}) };
-            set_platform(platform);
-        });
-    }
-
-    fn compile(path: &std::path::Path, exec_or_lib: bool) {
-        // Compile the hello.c file to an executable
-        let mut args = vec!["-o", path.to_str().unwrap(), "./src/loader/hello.c"];
-        if exec_or_lib {
-            args.push("-static");
-        }
-        let output = std::process::Command::new("gcc")
-            .args(args)
-            .output()
-            .expect("Failed to compile hello.c");
-        assert!(
-            output.status.success(),
-            "failed to compile hello.c {:?}",
-            output.stderr
-        );
-    }
-
-    fn install_dir(path: &str) {
-        litebox_fs()
-            .mkdir(path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
-            .expect("Failed to create directory");
-    }
-
-    fn install_file(path: &std::path::PathBuf, out: &str) {
-        let fd = litebox_fs()
-            .open(
-                out,
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::XGRP | Mode::XOTH | Mode::XUSR | Mode::RGRP | Mode::ROTH | Mode::RUSR,
-            )
-            .unwrap();
-        let contents = std::fs::read(path).unwrap();
-        litebox_fs().write(&fd, &contents, None).unwrap();
-        litebox_fs().close(fd).unwrap();
-    }
-
-    unsafe extern "C" {
-        fn trampoline(entry: usize, sp: usize) -> !;
-    }
-
-    #[test]
-    fn test_load_exec_static() {
-        init_platform();
-
-        // no std::env::var("OUT_DIR").unwrap()??
-        let path = std::path::Path::new("../target/debug").join("hello_exec");
-        compile(&path, true);
-
-        let executable_path = "/hello_exec";
-        install_file(&path, executable_path);
-
-        test_load_exec_common(executable_path);
-    }
-
-    #[test]
-    fn test_load_exec_dynamic() {
-        init_platform();
-
-        // no std::env::var("OUT_DIR").unwrap()??
-        let path = std::path::Path::new("../target/debug").join("hello_dylib");
-        compile(&path, false);
-
-        let executable_path = "/hello_dylib";
-        install_file(&path, executable_path);
-        install_dir("/lib64");
-        install_file(
-            &std::path::PathBuf::from_str("/lib64/ld-linux-x86-64.so.2").unwrap(),
-            "/lib64/ld-linux-x86-64.so.2",
-        );
-
-        test_load_exec_common(executable_path);
-    }
-
-    // FIXME: this function exits the process so only one test in this file
-    // can be run at a time. I have to manually run each test to make sure
-    // everything works.
-    fn test_load_exec_common(executable_path: &str) {
-        let argv = vec![
-            CString::new(executable_path).unwrap(),
-            CString::new("hello").unwrap(),
-        ];
-        let envp = vec![CString::new("PATH=/bin").unwrap()];
-        let info = ElfLoader::load(executable_path, argv, envp).unwrap();
-
-        unsafe { trampoline(info.entry_point, info.user_stack_top) };
-    }
+    #[error("failed to mmap: {0}")]
+    MappingError(#[from] MappingError),
 }

@@ -1,4 +1,4 @@
 //! This module contains the loader for the LiteBox shim.
 
-mod elf;
+pub mod elf;
 mod stack;
