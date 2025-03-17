@@ -155,11 +155,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             false
         };
         let write_allowed = if flags.contains(OFlags::WRONLY) || flags.contains(OFlags::RDWR) {
-            true
-        } else {
             if !self.current_user.can_write(&entry.perms()) {
                 return Err(OpenError::AccessNotAllowed);
             }
+            true
+        } else {
             false
         };
         match entry {
