@@ -10,28 +10,25 @@ use elf_loader::{
     object::ElfObject,
 };
 use litebox::{
-    fs::{FileSystem, Mode, OFlags, errors::OpenError},
+    fs::{Mode, OFlags, errors::OpenError},
     mm::linux::{MappingError, PAGE_SIZE},
     platform::{RawConstPointer, RawMutPointer},
 };
 use thiserror::Error;
 
-use crate::{MutPtr, file_descriptors, litebox_fs, litebox_vmm};
+use crate::{MutPtr, litebox_vmm, sys_open, syscalls::read::sys_read};
 
 use super::stack::{AuxKey, UserStack};
 
 // An opened elf file
 struct ElfFile {
     name: CString,
-    fd: u32,
+    fd: i32,
 }
 
 impl ElfFile {
     pub(super) fn from_path(path: &str) -> Result<Self, OpenError> {
-        let file = litebox_fs().open(path, OFlags::RDONLY, Mode::empty())?;
-        let fd = file_descriptors()
-            .write()
-            .insert(crate::Descriptor::File(file));
+        let fd = sys_open(path, OFlags::RDONLY, Mode::empty())?;
 
         Ok(Self {
             name: CString::from_str(path).unwrap(),
@@ -46,22 +43,16 @@ impl ElfObject for ElfFile {
     }
 
     fn read(&mut self, buf: &mut [u8], offset: usize) -> elf_loader::Result<()> {
-        if let Some(file) = file_descriptors().read().get_file_fd(self.fd) {
-            match litebox_fs().read(file, buf, Some(offset)) {
-                Ok(_) => Ok(()),
-                Err(_) => Err(elf_loader::Error::IOError {
-                    msg: "failed to read from file".to_string(),
-                }),
-            }
-        } else {
-            Err(elf_loader::Error::IOError {
-                msg: "failed to get file descriptor".to_string(),
-            })
+        match sys_read(self.fd, buf, Some(offset)) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(elf_loader::Error::IOError {
+                msg: "failed to read from file".to_string(),
+            }),
         }
     }
 
     fn as_fd(&self) -> Option<i32> {
-        Some(self.fd.try_into().unwrap())
+        Some(self.fd)
     }
 }
 
@@ -106,7 +97,7 @@ impl ElfLoaderMmap {
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
-        file: &litebox::fd::FileFd,
+        fd: i32,
         offset: usize,
     ) -> elf_loader::Result<usize> {
         // TODO: we copy the file to the memory to support file-backed mmap.
@@ -117,7 +108,7 @@ impl ElfLoaderMmap {
             ptr.mutate_subslice_with(..isize::try_from(len).unwrap(), |user_buf| {
                 // Loader code always runs before the program starts, so we can ensure
                 // user_buf is valid (e.g., won't be unmapped).
-                litebox_fs().read(file, user_buf, Some(offset))
+                sys_read(fd, user_buf, Some(offset))
             })
             .unwrap()
             .map_err(MappingError::ReadError)
@@ -147,17 +138,7 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
         need_copy: &mut bool,
     ) -> elf_loader::Result<NonNull<core::ffi::c_void>> {
         let ptr = if let Some(fd) = fd {
-            match file_descriptors()
-                .read()
-                .get_file_fd(fd.try_into().unwrap())
-            {
-                Some(file) => Self::do_mmap_file(addr, len, prot, flags, file, offset)?,
-                None => {
-                    return Err(elf_loader::Error::MmapError {
-                        msg: "Invalid file descriptor".to_string(),
-                    });
-                }
-            }
+            Self::do_mmap_file(addr, len, prot, flags, fd, offset)?
         } else {
             // No file provided because it is a blob.
             // Set `need_copy` so that the loader will copy the memory

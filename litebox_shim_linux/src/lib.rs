@@ -29,8 +29,10 @@ use litebox_platform_multiplex::Platform;
 
 pub mod errno;
 pub mod loader;
+pub mod syscalls;
 
 use errno::AsErrno as _;
+use syscalls::open::sys_open;
 
 static FS: OnceBox<litebox::fs::in_mem::FileSystem<Platform>> = OnceBox::new();
 /// Set the global file system
@@ -201,7 +203,7 @@ pub unsafe extern "C" fn open(pathname: ConstPtr<i8>, flags: u32, mode: u32) -> 
     let Some(path) = pathname.to_cstring() else {
         return Errno::EFAULT.as_neg();
     };
-    match litebox_fs().open(
+    sys_open(
         path,
         litebox::fs::OFlags::from_bits(flags).unwrap(),
         litebox::fs::Mode::from_bits(mode).unwrap(),
