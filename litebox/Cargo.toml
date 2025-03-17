@@ -13,6 +13,7 @@ smoltcp = { version = "0.12.0", default-features = false, features = ["log", "pr
 spin = { version = "0.9.8", default-features = false, optional = true }
 tar-no-std = { version = "0.3.2", default-features = false, features = ["alloc"] }
 thiserror = { version = "2.0.6", default-features = false }
+rangemap = { version = "1.5.1", features = ["const_fn"] }
 
 [features]
 lock_tracing = ["dep:arrayvec", "dep:spin", "spin?/mutex", "spin?/spin_mutex"]

@@ -20,6 +20,7 @@ extern crate alloc;
 pub mod event;
 pub mod fd;
 pub mod fs;
+pub mod mm;
 pub mod net;
 pub mod path;
 pub mod platform;

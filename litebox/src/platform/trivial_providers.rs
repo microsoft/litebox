@@ -127,6 +127,10 @@ impl<T: Clone> RawConstPointer<T> for TransparentConstPtr<T> {
             core::slice::from_raw_parts(self.inner, len)
         }))
     }
+
+    fn as_usize(&self) -> usize {
+        self.inner as usize
+    }
 }
 
 /// A trivial [`RawMutPointer`] that is literally just `*mut T`.
@@ -154,6 +158,10 @@ impl<T: Clone> RawConstPointer<T> for TransparentMutPtr<T> {
         Some(alloc::borrow::Cow::Borrowed(unsafe {
             core::slice::from_raw_parts(self.inner, len)
         }))
+    }
+
+    fn as_usize(&self) -> usize {
+        self.inner as usize
     }
 }
 impl<T: Clone> RawMutPointer<T> for TransparentMutPtr<T> {

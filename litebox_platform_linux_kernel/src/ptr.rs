@@ -18,9 +18,14 @@ impl<T: Clone> RawConstPointer<T> for UserConstPtr<T> {
     unsafe fn to_cow_slice<'a>(self, _len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
         todo!()
     }
+
+    fn as_usize(&self) -> usize {
+        self.inner as usize
+    }
 }
 
 impl<T: Clone> UserConstPtr<T> {
+    /// Check if it's null
     pub fn is_null(self) -> bool {
         self.inner.is_null()
     }
@@ -47,6 +52,10 @@ impl<T: Clone> RawConstPointer<T> for UserMutPtr<T> {
     unsafe fn to_cow_slice<'a>(self, _len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
         todo!()
     }
+
+    fn as_usize(&self) -> usize {
+        self.inner as usize
+    }
 }
 
 impl<T: Clone> RawMutPointer<T> for UserMutPtr<T> {
@@ -64,6 +73,7 @@ impl<T: Clone> RawMutPointer<T> for UserMutPtr<T> {
 }
 
 impl<T: Clone> UserMutPtr<T> {
+    /// Check if it's null
     pub fn is_null(self) -> bool {
         self.inner.is_null()
     }

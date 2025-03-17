@@ -7,10 +7,7 @@ use buddy_system_allocator::Heap;
 use crate::arch::{PhysAddr, VirtAddr};
 
 pub(crate) mod alloc;
-#[cfg(test)]
 pub(crate) mod pgtable;
-#[cfg(test)]
-pub(crate) mod vm;
 
 #[cfg(test)]
 pub mod tests;
@@ -81,3 +78,10 @@ pub trait MemoryProvider {
         PhysAddr::new_truncate(pa.as_u64() | Self::PRIVATE_PTE_MASK)
     }
 }
+
+#[cfg(all(target_arch = "x86_64", not(test)))]
+pub type KernelVmemBackend<const ALIGN: usize> =
+    crate::arch::mm::paging::X64PageTable<'static, crate::host::snp::SnpLinuxKenrel, ALIGN>;
+#[cfg(all(target_arch = "x86_64", test))]
+pub type KernelVmemBackend<const ALIGN: usize> =
+    crate::arch::mm::paging::X64PageTable<'static, crate::host::mock::MockKernel, ALIGN>;
