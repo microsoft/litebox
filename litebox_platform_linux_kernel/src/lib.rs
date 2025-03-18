@@ -99,18 +99,12 @@ impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
     }
 }
 
-impl<Host: HostInterface> Default for LinuxKernel<Host> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<Host: HostInterface> LinuxKernel<Host> {
-    pub fn new() -> Self {
+    pub fn new(init_page_table_addr: x86_64::PhysAddr) -> Self {
         Self {
             host_and_task: core::marker::PhantomData,
             // TODO: Update the init physaddr
-            page_table: unsafe { mm::PageTable::new(x86_64::PhysAddr::zero()) },
+            page_table: unsafe { mm::PageTable::new(init_page_table_addr) },
         }
     }
 
