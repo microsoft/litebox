@@ -40,6 +40,7 @@ jobs:
       - name: Set up Rust
         run: |
           rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target x86_64-unknown-none
+      - uses: Swatinem/rust-cache@v2
       - name: Confirm that we haven't accidentally pulled in std into LiteBox
         run: |
           # Essentially, we run a build on a target that simply does NOT have
