@@ -27,7 +27,7 @@ struct ElfFile {
 }
 
 impl ElfFile {
-    pub(super) fn from_path(path: &str) -> Result<Self, OpenError> {
+    fn from_path(path: &str) -> Result<Self, OpenError> {
         let fd = sys_open(path, OFlags::RDONLY, Mode::empty())?;
 
         Ok(Self {
@@ -176,13 +176,13 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
 
 /// Struct to hold the information needed to start the program
 /// (entry point and user stack top).
-pub struct ElfLoadInfo {
-    pub entry_point: usize,
-    pub user_stack_top: usize,
+struct ElfLoadInfo {
+    entry_point: usize,
+    user_stack_top: usize,
 }
 
 /// Loader for ELF files
-pub struct ElfLoader;
+struct ElfLoader;
 
 impl ElfLoader {
     const DEFAULT_STACK_SIZE: usize = 2 * PAGE_SIZE;
@@ -206,7 +206,7 @@ impl ElfLoader {
     }
 
     /// Load an ELF file and prepare the stack for the new process.
-    pub fn load(
+    fn load(
         path: &str,
         argv: Vec<CString>,
         envp: Vec<CString>,
@@ -256,7 +256,7 @@ impl ElfLoader {
 }
 
 #[derive(Error, Debug)]
-pub enum ElfLoaderError {
+enum ElfLoaderError {
     #[error("failed to open the ELF file: {0}")]
     OpenError(#[from] OpenError),
     #[error("failed to load the ELF file: {0}")]
@@ -265,4 +265,135 @@ pub enum ElfLoaderError {
     InvalidStackAddr,
     #[error("failed to mmap: {0}")]
     MappingError(#[from] MappingError),
+}
+
+#[cfg(test)]
+mod tests {
+    use core::{arch::global_asm, str::FromStr as _};
+
+    use alloc::{ffi::CString, vec};
+    use litebox::{
+        fs::{FileSystem as _, Mode, OFlags},
+        platform::trivial_providers::ImpossiblePunchthroughProvider,
+    };
+    use litebox_platform_multiplex::{Platform, set_platform};
+
+    use crate::{litebox_fs, set_fs};
+
+    extern crate std;
+
+    global_asm!(
+        "
+        .text
+        .align	4
+        .globl	trampoline
+        .type	trampoline,@function
+    trampoline:
+        xor rdx, rdx
+        mov	rsp, rsi
+        jmp	rdi
+        /* Should not reach. */
+        hlt"
+    );
+
+    unsafe extern "C" {
+        fn trampoline(entry: usize, sp: usize) -> !;
+    }
+
+    fn init_platform() {
+        static ONCE: spin::Once = spin::Once::new();
+        ONCE.call_once(|| {
+            let platform = unsafe { Platform::new_for_test(ImpossiblePunchthroughProvider {}) };
+            set_platform(platform);
+
+            let mut in_mem_fs =
+                litebox::fs::in_mem::FileSystem::new(litebox_platform_multiplex::platform());
+            in_mem_fs.with_root_privileges(|fs| {
+                fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                    .expect("Failed to set permissions on root");
+            });
+            set_fs(in_mem_fs);
+
+            install_dir("/lib64");
+        });
+    }
+
+    fn compile(output: &std::path::Path, exec_or_lib: bool) {
+        // Compile the hello.c file to an executable
+        let mut args = vec!["-o", output.to_str().unwrap(), "./tests/hello.c"];
+        if exec_or_lib {
+            args.push("-static");
+        }
+        let output = std::process::Command::new("gcc")
+            .args(args)
+            .output()
+            .expect("Failed to compile hello.c");
+        assert!(
+            output.status.success(),
+            "failed to compile hello.c {:?}",
+            output.stderr
+        );
+    }
+
+    fn install_dir(path: &str) {
+        litebox_fs()
+            .mkdir(path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .expect("Failed to create directory");
+    }
+
+    fn install_file(path: &std::path::PathBuf, out: &str) {
+        let fd = litebox_fs()
+            .open(
+                out,
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXG | Mode::RWXO | Mode::RWXU,
+            )
+            .unwrap();
+        let contents = std::fs::read(path).unwrap();
+        litebox_fs().write(&fd, &contents, None).unwrap();
+        litebox_fs().close(fd).unwrap();
+    }
+
+    fn test_load_exec_common(executable_path: &str) {
+        let argv = vec![
+            CString::new(executable_path).unwrap(),
+            CString::new("hello").unwrap(),
+        ];
+        let envp = vec![CString::new("PATH=/bin").unwrap()];
+        let info = super::ElfLoader::load(executable_path, argv, envp).unwrap();
+
+        unsafe { trampoline(info.entry_point, info.user_stack_top) };
+    }
+
+    #[test]
+    fn test_load_exec_dynamic() {
+        init_platform();
+
+        let path =
+            std::path::Path::new(std::env::var("OUT_DIR").unwrap().as_str()).join("hello_dylib");
+        compile(&path, false);
+
+        let executable_path = "/hello_dylib";
+        install_file(&path, executable_path);
+        install_file(
+            &std::path::PathBuf::from_str("/lib64/ld-linux-x86-64.so.2").unwrap(),
+            "/lib64/ld-linux-x86-64.so.2",
+        );
+
+        test_load_exec_common(executable_path);
+    }
+
+    #[test]
+    fn test_load_exec_static() {
+        init_platform();
+
+        // no std::env::var("OUT_DIR").unwrap()??
+        let path = std::path::Path::new("../target/debug").join("hello_exec");
+        compile(&path, true);
+
+        let executable_path = "/hello_exec";
+        install_file(&path, executable_path);
+
+        test_load_exec_common(executable_path);
+    }
 }
