@@ -39,7 +39,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Set up Rust
         run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target x86_64-unknown-none
       - name: Confirm that we haven't accidentally pulled in std into LiteBox
         run: |
           # Essentially, we run a build on a target that simply does NOT have
@@ -76,7 +76,6 @@ jobs:
           # - `litebox_shim_linux` (in its default feature set) depends on
           #   `litebox_platform_multiplex`; similarly, ideally we'd do a more
           #   precise check.
-          rustup target add x86_64-unknown-none
           find . -type f -name 'Cargo.toml' \
             -not -path './Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
