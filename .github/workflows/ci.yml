@@ -17,11 +17,19 @@ jobs:
       - name: Set up Rust
         run: |
           rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy
+      - name: Set up Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
       - uses: Swatinem/rust-cache@v2
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features
       - run: ./.github/tools/github_actions_run_cargo build
-      - run: ./.github/tools/github_actions_run_cargo test
+      - run: ./.github/tools/github_actions_run_cargo nextest
+      - run: |
+          ./.github/tools/github_actions_run_cargo test --doc
+          # We need to run `cargo test --doc` separately because doc tests
+          # aren't included in nextest at the moment. See relevant discussion at
+          # https://github.com/nextest-rs/nextest/issues/16
 
   confirm_no_std:
     name: Confirm no_std
