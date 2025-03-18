@@ -404,13 +404,11 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         &self,
         range: core::ops::Range<usize>,
         initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
-        max_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
         can_grow_down: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let range = PageRange::new(range.start, range.end)
             .ok_or(litebox::platform::page_mgmt::AllocationError::Unaligned)?;
         let flags = u32::from(initial_permissions.bits())
-            | (u32::from(max_permissions.bits()) << 4)
             | if can_grow_down {
                 litebox::mm::linux::VmFlags::VM_GROWSDOWN.bits()
             } else {

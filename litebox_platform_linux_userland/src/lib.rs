@@ -463,11 +463,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         &self,
         range: std::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
-        max_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
-        // TODO: Track `max_permission` somehow?
-        let _ = max_permissions;
         let ptr = unsafe {
             nix::sys::mman::mmap_anonymous(
                 Some(core::num::NonZeroUsize::new(range.start).expect("non null addr")),

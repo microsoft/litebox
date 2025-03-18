@@ -25,7 +25,6 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
         &self,
         range: Range<usize>,
         initial_permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
-        max_permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
         can_grow_down: bool,
     ) -> Result<Self::RawMutPointer<u8>, crate::platform::page_mgmt::AllocationError> {
         Ok(unsafe {

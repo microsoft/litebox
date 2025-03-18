@@ -27,15 +27,12 @@ bitflags::bitflags! {
 pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// Allocate new memory pages at given `range` with `initial_permissions`.
     ///
-    /// `max_permissions` specifies the maximum allowable permissions (see [`Self::update_permissions`]).
-    ///
     /// `can_grow_down` specifies if the region is allowed to grow "downward" (i.e., towards zero),
     /// upon a page fault.
     fn allocate_pages(
         &self,
         range: Range<usize>,
         initial_permissions: MemoryRegionPermissions,
-        max_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError>;
 
@@ -79,8 +76,6 @@ pub enum AllocationError {
     Unaligned,
     #[error("provided range is already allocated")]
     AlreadyAllocated,
-    #[error("max permissions are not a superset of initial permissions")]
-    InvalidPermissionArguments,
     #[error("out of memory")]
     OutOfMemory,
 }
@@ -119,6 +114,4 @@ pub enum PermissionUpdateError {
     Unaligned,
     #[error("provided range contains unallocated pages")]
     AlreadyUnallocated,
-    #[error("new permissions are not a subset of allowed permissions on these pages")]
-    InvalidPermissions,
 }

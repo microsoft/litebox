@@ -263,11 +263,14 @@ impl<'platform, Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>
             >> 4)
             .try_into()
             .unwrap();
+        assert_eq!(
+            MemoryRegionPermissions::from_bits(max_permissions).unwrap(),
+            MemoryRegionPermissions::all()
+        );
         let ret = unsafe {
             self.platform.allocate_pages(
                 range.into(),
                 MemoryRegionPermissions::from_bits(permissions).unwrap(),
-                MemoryRegionPermissions::from_bits(max_permissions).unwrap(),
                 vma.flags.contains(VmFlags::VM_GROWSDOWN),
             )
         }
