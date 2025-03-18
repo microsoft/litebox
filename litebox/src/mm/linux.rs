@@ -263,10 +263,8 @@ impl<'platform, Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>
             >> 4)
             .try_into()
             .unwrap();
-        assert_eq!(
-            MemoryRegionPermissions::from_bits(max_permissions).unwrap(),
-            MemoryRegionPermissions::all()
-        );
+        // TODO: What should we do with the max_permissions?
+        let _ = max_permissions;
         let ret = unsafe {
             self.platform.allocate_pages(
                 range.into(),
@@ -456,7 +454,7 @@ impl<'platform, Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>
 
             let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
             let new_permissions =
-                MemoryRegionPermissions::from_bits(new_flags.bits().try_into().unwrap()).unwrap();
+                MemoryRegionPermissions::from_bits_truncate(new_flags.bits().try_into().unwrap());
             // `intersection` is page aligned.
             unsafe {
                 self.platform
