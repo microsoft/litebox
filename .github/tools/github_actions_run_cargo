@@ -52,6 +52,13 @@ case "$COMMAND" in
             exit 1
         fi
         ;;
+    nextest)
+        # Reads the config from .config/nextest.toml
+        if ! cargo nextest run --profile ci "$@"; then
+            echo '::error title=Tests failed::"cargo nextest run" failed'
+            exit 1
+        fi
+        ;;
     *)
         echo "Unsupported command: $COMMAND"
         exit 1

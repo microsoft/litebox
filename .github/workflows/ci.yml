@@ -17,11 +17,19 @@ jobs:
       - name: Set up Rust
         run: |
           rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy
+      - name: Set up Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
       - uses: Swatinem/rust-cache@v2
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features
       - run: ./.github/tools/github_actions_run_cargo build
-      - run: ./.github/tools/github_actions_run_cargo test
+      - run: ./.github/tools/github_actions_run_cargo nextest
+      - run: |
+          ./.github/tools/github_actions_run_cargo test --doc
+          # We need to run `cargo test --doc` separately because doc tests
+          # aren't included in nextest at the moment. See relevant discussion at
+          # https://github.com/nextest-rs/nextest/issues/16
 
   confirm_no_std:
     name: Confirm no_std
@@ -31,7 +39,8 @@ jobs:
         uses: actions/checkout@v4
       - name: Set up Rust
         run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target x86_64-unknown-none
+      - uses: Swatinem/rust-cache@v2
       - name: Confirm that we haven't accidentally pulled in std into LiteBox
         run: |
           # Essentially, we run a build on a target that simply does NOT have
@@ -68,7 +77,6 @@ jobs:
           # - `litebox_shim_linux` (in its default feature set) depends on
           #   `litebox_platform_multiplex`; similarly, ideally we'd do a more
           #   precise check.
-          rustup target add x86_64-unknown-none
           find . -type f -name 'Cargo.toml' \
             -not -path './Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
