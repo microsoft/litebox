@@ -80,36 +80,28 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         unsafe { Self::init(item) }
     }
 
-    #[expect(
-        clippy::unused_self,
-        clippy::unnecessary_wraps,
-        reason = "signature left unchanged for easier review of PR#36"
-    )]
-    pub(crate) unsafe fn map_pages(
-        &self,
-        range: PageRange<ALIGN>,
-        _flags: VmFlags,
-    ) -> Result<UserMutPtr<u8>, page_mgmt::AllocationError> {
+    #[expect(clippy::unused_self, reason = "for consistency with unmap/remap/...")]
+    pub(crate) fn map_pages(&self, range: PageRange<ALIGN>, _flags: VmFlags) -> UserMutPtr<u8> {
         // leave it to page fault handler
-        Ok(unsafe { core::mem::transmute::<*mut u8, UserMutPtr<u8>>(range.start as *mut u8) })
+        UserMutPtr {
+            inner: range.start as *mut u8,
+        }
     }
 
     /// Unmap 4KiB pages from the page table
     ///
     /// Note it does not free the allocated frames for page table itself (only those allocated to
     /// user space).
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "signature left unchanged for easier review of PR#36"
-    )]
     pub(crate) unsafe fn unmap_pages(
         &self,
         range: PageRange<ALIGN>,
     ) -> Result<(), page_mgmt::DeallocationError> {
         let start_va = VirtAddr::new(range.start as _);
-        let start = Page::<Size4KiB>::from_start_address(start_va).expect("invalid start address");
+        let start = Page::<Size4KiB>::from_start_address(start_va)
+            .or(Err(page_mgmt::DeallocationError::Unaligned))?;
         let end_va = VirtAddr::new(range.end as _);
-        let end = Page::<Size4KiB>::from_start_address(end_va).expect("invalid end address");
+        let end = Page::<Size4KiB>::from_start_address(end_va)
+            .or(Err(page_mgmt::DeallocationError::Unaligned))?;
         let mut allocator = PageTableAllocator::<M>::new();
 
         // Note this implementation is slow as each page requires a full page table walk.
@@ -142,12 +134,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     ) -> Result<(), page_mgmt::RemapError> {
         let mut start: Page<Size4KiB> =
             Page::from_start_address(VirtAddr::new(old_range.start as u64))
-                .expect("invalid start address");
+                .or(Err(page_mgmt::RemapError::Unaligned))?;
         let mut new_start: Page<Size4KiB> =
             Page::from_start_address(VirtAddr::new(new_range.start as u64))
-                .expect("invalid new start address");
+                .or(Err(page_mgmt::RemapError::Unaligned))?;
         let end: Page<Size4KiB> = Page::from_start_address(VirtAddr::new(old_range.end as u64))
-            .expect("invalid end address");
+            .or(Err(page_mgmt::RemapError::Unaligned))?;
 
         // Note this implementation is slow as each page requires three full page table walks.
         // If we have N pages, it will be 3N times slower.
@@ -165,7 +157,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                             Ok(_) => {}
                             Err(e) => match e {
                                 MapToError::PageAlreadyMapped(_) => {
-                                    panic!("Page already mapped")
+                                    return Err(page_mgmt::RemapError::AlreadyAllocated);
                                 }
                                 MapToError::ParentEntryHugePage => {
                                     todo!("return Err(page_mgmt::RemapError::RemapToHugePage);")
@@ -201,10 +193,6 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(())
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "signature left unchanged for easier review of PR#36"
-    )]
     pub(crate) unsafe fn mprotect_pages(
         &self,
         range: PageRange<ALIGN>,
@@ -213,7 +201,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         let start = VirtAddr::new(range.start as _);
         let end = VirtAddr::new(range.end as _);
         let new_flags = vmflags_to_pteflags(new_flags) & Self::MPROTECT_PTE_MASK;
-        let start: Page<Size4KiB> = Page::from_start_address(start).expect("invalid start address");
+        let start: Page<Size4KiB> =
+            Page::from_start_address(start).or(Err(page_mgmt::PermissionUpdateError::Unaligned))?;
         let end: Page<Size4KiB> = Page::containing_address(end - 1);
 
         // TODO: this implementation is slow as each page requires two full page table walks.

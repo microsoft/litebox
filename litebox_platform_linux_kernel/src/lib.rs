@@ -29,7 +29,7 @@ static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 /// It requires a host that implements the [`HostInterface`] trait.
 pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
-    mem_mgmt: mm::KernelVmemBackend<4096>,
+    page_table: mm::PageTable<4096>,
 }
 
 /// Punchthrough for syscalls
@@ -110,7 +110,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         Self {
             host_and_task: core::marker::PhantomData,
             // TODO: Update the init physaddr
-            mem_mgmt: unsafe { mm::KernelVmemBackend::new(x86_64::PhysAddr::zero()) },
+            page_table: unsafe { mm::PageTable::new(x86_64::PhysAddr::zero()) },
         }
     }
 
@@ -415,7 +415,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
                 0
             };
         let flags = litebox::mm::linux::VmFlags::from_bits(flags).unwrap();
-        unsafe { self.mem_mgmt.map_pages(range, flags) }
+        Ok(self.page_table.map_pages(range, flags))
     }
 
     unsafe fn deallocate_pages(
@@ -424,7 +424,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
         let range = PageRange::new(range.start, range.end)
             .ok_or(litebox::platform::page_mgmt::DeallocationError::Unaligned)?;
-        unsafe { self.mem_mgmt.unmap_pages(range) }
+        unsafe { self.page_table.unmap_pages(range) }
     }
 
     unsafe fn remap_pages(
@@ -439,7 +439,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         if old_range.start.max(new_range.start) <= old_range.end.min(new_range.end) {
             return Err(litebox::platform::page_mgmt::RemapError::Overlapping);
         }
-        unsafe { self.mem_mgmt.remap_pages(old_range, new_range) }
+        unsafe { self.page_table.remap_pages(old_range, new_range) }
     }
 
     unsafe fn update_permissions(
@@ -451,7 +451,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             .ok_or(litebox::platform::page_mgmt::PermissionUpdateError::Unaligned)?;
         let new_flags =
             litebox::mm::linux::VmFlags::from_bits(new_permissions.bits().into()).unwrap();
-        unsafe { self.mem_mgmt.mprotect_pages(range, new_flags) }
+        unsafe { self.page_table.mprotect_pages(range, new_flags) }
     }
 }
 
@@ -463,12 +463,12 @@ impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKern
         error_code: u64,
     ) -> Result<(), litebox::mm::linux::PageFaultError> {
         unsafe {
-            self.mem_mgmt
+            self.page_table
                 .handle_page_fault(fault_addr, flags, error_code)
         }
     }
 
     fn access_error(error_code: u64, flags: litebox::mm::linux::VmFlags) -> bool {
-        mm::KernelVmemBackend::<4096>::access_error(error_code, flags)
+        mm::PageTable::<4096>::access_error(error_code, flags)
     }
 }

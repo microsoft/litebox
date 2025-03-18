@@ -113,5 +113,5 @@ pub enum PermissionUpdateError {
     #[error("provided range is not page-aligned")]
     Unaligned,
     #[error("provided range contains unallocated pages")]
-    AlreadyUnallocated,
+    Unallocated,
 }
