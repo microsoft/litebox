@@ -146,7 +146,7 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
             *need_copy = true;
             Self::do_mmap_anonymous(addr, len, prot, flags)?
         };
-        Ok(unsafe { NonNull::new_unchecked(ptr as _) })
+        Ok(NonNull::new(ptr as _).expect("null pointer"))
     }
 
     unsafe fn mmap_anonymous(
@@ -157,7 +157,7 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
     ) -> elf_loader::Result<NonNull<core::ffi::c_void>> {
         let addr = if addr == 0 { None } else { Some(addr) };
         let ptr = Self::do_mmap_anonymous(addr, len, prot, flags)?;
-        Ok(unsafe { NonNull::new_unchecked(ptr as _) })
+        Ok(NonNull::new(ptr as _).expect("null pointer"))
     }
 
     unsafe fn munmap(_addr: NonNull<core::ffi::c_void>, _len: usize) -> elf_loader::Result<()> {
