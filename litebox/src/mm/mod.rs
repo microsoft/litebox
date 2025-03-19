@@ -9,13 +9,12 @@ use core::ops::Range;
 
 use alloc::vec::Vec;
 use linux::{
-    MappingError, PageFaultError, PageRange, VmFlags, Vmem, VmemBackend, VmemPageFaultHandler,
-    VmemUnmapError,
+    MappingError, PageFaultError, PageRange, VmFlags, Vmem, VmemPageFaultHandler, VmemUnmapError,
 };
 
 use crate::{
     platform::{PageManagementProvider, RawConstPointer},
-    sync::{RawSyncPrimitivesProvider, RwLock, Synchronization},
+    sync::{RawSyncPrimitivesProvider, RwLock},
 };
 
 /// A page manager to support `mmap`, `munmap`, and etc.
@@ -23,11 +22,7 @@ pub struct PageManager<'platform, Platform, const ALIGN: usize>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
-    vmem: RwLock<
-        'platform,
-        Platform,
-        Vmem<<Platform as PageManagementProvider<ALIGN>>::Backend, ALIGN>,
-    >,
+    vmem: RwLock<'platform, Platform, Vmem<'platform, Platform, ALIGN>>,
 }
 
 impl<'platform, Platform, const ALIGN: usize> PageManager<'platform, Platform, ALIGN>
@@ -35,19 +30,9 @@ where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
     /// Create a new `PageManager` instance.
-    ///
-    /// `data` is the initialization item for the backend.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the `data` is a valid initialization item for the backend.
-    /// See [`VmemBackend::new`] for more details.
-    pub unsafe fn new(
-        sync: &Synchronization<'platform, Platform>,
-        data: <<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::InitItem,
-    ) -> Self {
-        let backend = unsafe { <Platform as PageManagementProvider<ALIGN>>::Backend::new(data) };
-        let vmem = sync.new_rwlock(linux::Vmem::new(backend));
+    pub fn new(platform: &'platform Platform) -> Self {
+        let vmem =
+            crate::sync::Synchronization::new(platform).new_rwlock(linux::Vmem::new(platform));
         Self { vmem }
     }
 
@@ -72,9 +57,9 @@ where
         len: usize,
         fixed_addr: bool,
         op: F,
-    ) -> Result<<<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer, MappingError>
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
-        F: FnOnce(<<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer) -> Result<usize, MappingError>,
+        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
         let suggested_range =
             PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::MisAligned)?;
@@ -113,9 +98,9 @@ where
         len: usize,
         fixed_addr: bool,
         op: F,
-    ) -> Result<<<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer, MappingError>
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
-        F: FnOnce(<<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer) -> Result<usize, MappingError>,
+        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
         let flags =
             VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE;
@@ -146,9 +131,9 @@ where
         len: usize,
         fixed_addr: bool,
         op: F,
-    ) -> Result<<<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer, MappingError>
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
-        F: FnOnce(<<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer) -> Result<usize, MappingError>,
+        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
         let mut vmem = self.vmem.write();
         let suggested_range =
@@ -179,10 +164,7 @@ where
         suggested_addr: usize,
         len: usize,
         fixed_addr: bool,
-    ) -> Result<
-        <<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer,
-        MappingError,
-    > {
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let flags = VmFlags::VM_READ
             | VmFlags::VM_WRITE
             | VmFlags::VM_MAYREAD
@@ -201,7 +183,7 @@ where
     /// The caller must ensure that the memory region is no longer used by any other.
     pub unsafe fn remove_pages(
         &self,
-        ptr: <<Platform as PageManagementProvider<ALIGN>>::Backend as VmemBackend<ALIGN>>::RawMutPointer,
+        ptr: Platform::RawMutPointer<u8>,
         len: usize,
     ) -> Result<(), VmemUnmapError> {
         let mut vmem = self.vmem.write();
@@ -223,7 +205,7 @@ where
 impl<Platform, const ALIGN: usize> PageManager<'_, Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
-    <Platform as PageManagementProvider<ALIGN>>::Backend: VmemPageFaultHandler,
+    Platform: VmemPageFaultHandler,
 {
     /// Handle page fault at the given address.
     ///
@@ -236,8 +218,7 @@ where
         error_code: u64,
     ) -> Result<(), PageFaultError> {
         let fault_addr = fault_addr & !(ALIGN - 1);
-        if !(<Platform as PageManagementProvider<ALIGN>>::Backend::TASK_ADDR_MIN
-            ..<Platform as PageManagementProvider<ALIGN>>::Backend::TASK_ADDR_MAX)
+        if !(Vmem::<'_, Platform, ALIGN>::TASK_ADDR_MIN..Vmem::<'_, Platform, ALIGN>::TASK_ADDR_MAX)
             .contains(&fault_addr)
         {
             return Err(PageFaultError::AccessError("Invalid address"));
@@ -247,9 +228,7 @@ where
         // Find the range closest to the fault address
         let (start, vma) = {
             let (r, vma) = vmem
-                .overlapping(
-                    fault_addr..<Platform as PageManagementProvider<ALIGN>>::Backend::TASK_ADDR_MAX,
-                )
+                .overlapping(fault_addr..Vmem::<'_, Platform, ALIGN>::TASK_ADDR_MAX)
                 .next()
                 .ok_or(PageFaultError::AccessError("no mapping"))?;
             (r.start, *vma)
@@ -261,9 +240,7 @@ where
             }
 
             if !vmem
-                .overlapping(
-                    <Platform as PageManagementProvider<ALIGN>>::Backend::TASK_ADDR_MIN..fault_addr,
-                )
+                .overlapping(Vmem::<'_, Platform, ALIGN>::TASK_ADDR_MIN..fault_addr)
                 .next_back()
                 .is_none_or(|(prev_range, prev_vma)| {
                     // Enforce gap between stack and other preceding non-stack mappings.
@@ -272,7 +249,7 @@ where
                     (prev_vma.flags().contains(VmFlags::VM_GROWSDOWN)
                         && !(prev_vma.flags() & VmFlags::VM_ACCESS_FLAGS).is_empty())
                         || fault_addr - prev_range.end
-                            >= <Platform as PageManagementProvider<ALIGN>>::Backend::STACK_GUARD_GAP
+                            >= Vmem::<'_, Platform, ALIGN>::STACK_GUARD_GAP
                 })
             {
                 return Err(PageFaultError::AllocationFailed);
@@ -280,15 +257,12 @@ where
             unsafe { vmem.insert_mapping(PageRange::new_unchecked(fault_addr, start), vma) };
         }
 
-        if <<Platform as PageManagementProvider<ALIGN>>::Backend as VmemPageFaultHandler>::access_error(
-            error_code,
-            vma.flags(),
-        ) {
+        if <Platform as VmemPageFaultHandler>::access_error(error_code, vma.flags()) {
             return Err(PageFaultError::AccessError("access error"));
         }
 
         unsafe {
-            vmem.backend
+            vmem.platform
                 .handle_page_fault(fault_addr, vma.flags(), error_code)
         }
     }

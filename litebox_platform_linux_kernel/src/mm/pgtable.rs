@@ -1,4 +1,4 @@
-use litebox::mm::linux::{PageFaultError, VmemBackend};
+use litebox::mm::linux::PageFaultError;
 use x86_64::structures::paging::PageSize;
 
 use crate::arch::{
@@ -47,7 +47,7 @@ impl<M: super::MemoryProvider> PageTableAllocator<M> {
     }
 }
 
-pub trait PageTableImpl<const ALIGN: usize>: VmemBackend<ALIGN> {
+pub trait PageTableImpl<const ALIGN: usize> {
     /// Flags that `mprotect` can change:
     /// [`PageTableFlags::WRITABLE`] | [`PageTableFlags::USER_ACCESSIBLE`] | [`PageTableFlags::NO_EXECUTE`]
     const MPROTECT_PTE_MASK: PageTableFlags = PageTableFlags::from_bits_truncate(
@@ -76,7 +76,7 @@ pub trait PageTableImpl<const ALIGN: usize>: VmemBackend<ALIGN> {
     /// The caller must also ensure that the `page` is valid and user has
     /// access to it.
     unsafe fn handle_page_fault(
-        &mut self,
+        &self,
         page: Page<Size4KiB>,
         flags: PageTableFlags,
         error_code: PageFaultErrorCode,

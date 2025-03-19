@@ -107,7 +107,7 @@ impl core::error::Error for Underspecified {}
 #[repr(C)]
 #[derive(Clone)]
 pub struct TransparentConstPtr<T> {
-    inner: *const T,
+    pub inner: *const T,
 }
 impl<T: Clone> Copy for TransparentConstPtr<T> {}
 impl<T: Clone> RawConstPointer<T> for TransparentConstPtr<T> {
@@ -139,7 +139,7 @@ impl<T: Clone> RawConstPointer<T> for TransparentConstPtr<T> {
 #[repr(C)]
 #[derive(Clone)]
 pub struct TransparentMutPtr<T> {
-    inner: *mut T,
+    pub inner: *mut T,
 }
 impl<T: Clone> Copy for TransparentMutPtr<T> {}
 impl<T: Clone> RawConstPointer<T> for TransparentMutPtr<T> {

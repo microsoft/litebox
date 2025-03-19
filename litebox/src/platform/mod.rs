@@ -4,6 +4,7 @@
 //! trait is merely a collection of subtraits that could be composed independently from various
 //! other crates that implement them upon various types.
 
+pub mod page_mgmt;
 pub mod trivial_providers;
 
 #[cfg(test)]
@@ -11,6 +12,8 @@ pub(crate) mod mock;
 
 use either::Either;
 use thiserror::Error;
+
+pub use page_mgmt::PageManagementProvider;
 
 /// A provider of a platform upon which LiteBox can execute.
 ///
@@ -430,9 +433,4 @@ where
         range: impl core::ops::RangeBounds<isize>,
         f: impl FnOnce(&mut [T]) -> R,
     ) -> Option<R>;
-}
-
-/// A provider of page management functionality.
-pub trait PageManagementProvider<const ALIGN: usize> {
-    type Backend: crate::mm::linux::VmemBackend<ALIGN>;
 }
