@@ -263,7 +263,8 @@ impl<'platform, Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>
             >> 4)
             .try_into()
             .unwrap();
-        // TODO: What should we do with the max_permissions?
+        // The `max_permissions` is tracked by `VMem::protect_mapping` and thus doesn't need to be
+        // passed to `allocate_pages`.
         let _ = max_permissions;
         let ret = unsafe {
             self.platform.allocate_pages(
