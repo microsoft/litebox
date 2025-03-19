@@ -301,21 +301,16 @@ mod tests {
     }
 
     fn init_platform() {
-        static ONCE: spin::Once = spin::Once::new();
-        ONCE.call_once(|| {
-            let platform = unsafe { Platform::new_for_test(ImpossiblePunchthroughProvider {}) };
-            set_platform(platform);
+        let platform = unsafe { Platform::new_for_test(ImpossiblePunchthroughProvider {}) };
+        set_platform(platform);
 
-            let mut in_mem_fs =
-                litebox::fs::in_mem::FileSystem::new(litebox_platform_multiplex::platform());
-            in_mem_fs.with_root_privileges(|fs| {
-                fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                    .expect("Failed to set permissions on root");
-            });
-            set_fs(in_mem_fs);
-
-            install_dir("/lib64");
+        let mut in_mem_fs =
+            litebox::fs::in_mem::FileSystem::new(litebox_platform_multiplex::platform());
+        in_mem_fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to set permissions on root");
         });
+        set_fs(in_mem_fs);
     }
 
     fn compile(output: &std::path::Path, exec_or_lib: bool) {
@@ -375,6 +370,7 @@ mod tests {
 
         let executable_path = "/hello_dylib";
         install_file(&path, executable_path);
+        install_dir("/lib64");
         install_file(
             &std::path::PathBuf::from_str("/lib64/ld-linux-x86-64.so.2").unwrap(),
             "/lib64/ld-linux-x86-64.so.2",

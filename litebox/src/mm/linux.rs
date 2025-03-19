@@ -603,7 +603,7 @@ pub enum VmemMoveError {
 
 /// Error for protecting mappings
 #[derive(Error, Debug)]
-pub(super) enum VmemProtectError {
+pub enum VmemProtectError {
     #[error("the range {0:?} has no mapping memory")]
     InvalidRange(Range<usize>),
     #[error("failed to change permissions from {old:?} to {new:?}")]

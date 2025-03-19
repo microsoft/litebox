@@ -1,8 +1,7 @@
 use litebox::mm::linux::PageFaultError;
-use x86_64::structures::paging::PageSize;
 
 use crate::arch::{
-    Page, PageFaultErrorCode, PageTableFlags, PhysAddr, PhysFrame, Size4KiB, VirtAddr,
+    Page, PageFaultErrorCode, PageSize, PageTableFlags, PhysAddr, PhysFrame, Size4KiB, VirtAddr,
 };
 
 /// Page table allocator
