@@ -120,6 +120,14 @@ pub enum RmdirError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`FileSystem::file_status`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum FileStatusError {
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors in any file-system function due to path errors.
 #[derive(Error, Debug)]
 pub enum PathError {

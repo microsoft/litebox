@@ -213,7 +213,7 @@ mod tar_ro {
 }
 
 mod layered {
-    use crate::fs::{FileSystem as _, Mode, OFlags};
+    use crate::fs::{FileSystem as _, FileType, Mode, OFlags};
     use crate::fs::{in_mem, layered, tar_ro};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
@@ -237,7 +237,15 @@ mod layered {
             .read(&fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"testfoo\n");
+        let stat = fs.fd_file_status(&fd).expect("Failed to fd file stat");
+        assert_eq!(stat.file_type, FileType::RegularFile);
+        assert_eq!(stat.mode, Mode::from_bits(0o644).unwrap());
         fs.close(fd).expect("Failed to close file");
+
+        let stat = fs.file_status("bar").expect("Failed to file stat");
+        assert_eq!(stat.file_type, FileType::Directory);
+        assert_eq!(stat.mode, Mode::from_bits(0o777).unwrap());
+
         let fd = fs
             .open("bar/baz", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file");
@@ -246,6 +254,9 @@ mod layered {
             .read(&fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"test bar baz\n");
+        let stat = fs.fd_file_status(&fd).expect("Failed to fd file stat");
+        assert_eq!(stat.file_type, FileType::RegularFile);
+        assert_eq!(stat.mode, Mode::from_bits(0o644).unwrap());
         fs.close(fd).expect("Failed to close file");
     }
 

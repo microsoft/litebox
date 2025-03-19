@@ -18,8 +18,8 @@ pub mod tar_ro;
 mod tests;
 
 use errors::{
-    ChmodError, CloseError, MkdirError, OpenError, ReadError, RmdirError, SeekError, UnlinkError,
-    WriteError,
+    ChmodError, CloseError, FileStatusError, MkdirError, OpenError, ReadError, RmdirError,
+    SeekError, UnlinkError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -69,6 +69,10 @@ pub trait FileSystem: private::Sealed {
     fn mkdir(&self, path: impl path::Arg, mode: Mode) -> Result<(), MkdirError>;
     /// Remove a directory
     fn rmdir(&self, path: impl path::Arg) -> Result<(), RmdirError>;
+    /// Obtain the status of a file/directory/... on the file-system.
+    fn file_status(&self, path: impl path::Arg) -> Result<FileStatus, FileStatusError>;
+    /// Equivalent to [`Self::file_status`], but open an open `fd` instead.
+    fn fd_file_status(&self, fd: &FileFd) -> Result<FileStatus, FileStatusError>;
 }
 
 bitflags! {
@@ -109,6 +113,16 @@ bitflags! {
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
     }
+}
+
+/// Types of files on a file-system.
+///
+/// See [`FileSystem::file_status`].
+#[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FileType {
+    RegularFile,
+    Directory,
 }
 
 bitflags! {
@@ -176,4 +190,16 @@ pub enum SeekWhence {
     RelativeToCurrentOffset,
     /// The file offset is set to the size of the file plus `offset` bytes.
     RelativeToEnd,
+}
+
+/// The status of a file/directory/... on the file-system, inspired by `stat(3type)`.
+///
+/// This is explicitly a non-exhaustive struct with public members. As LiteBox evolves, more
+/// elements might be added to this struct, allowing file systems to provide richer information
+/// about the status of files. However, users of LiteBox must not depend on the completeness or even
+/// layout of this particular type.
+#[non_exhaustive]
+pub struct FileStatus {
+    pub file_type: FileType,
+    pub mode: Mode,
 }
