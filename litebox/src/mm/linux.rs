@@ -84,16 +84,7 @@ impl<const ALIGN: usize> PageRange<ALIGN> {
         if start >= end {
             return None;
         }
-        Some(unsafe { Self::new_unchecked(start, end) })
-    }
-
-    /// Create a new [`PageRange`] without checking for alignment or emptiness.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the range is `ALIGN`-aligned and not empty.
-    pub unsafe fn new_unchecked(start: usize, end: usize) -> Self {
-        Self { start, end }
+        Some(Self { start, end })
     }
 
     /// Get the size of this `ALIGN`-aligned range
@@ -298,8 +289,7 @@ impl<'platform, Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>
     ) -> Option<Platform::RawMutPointer<u8>> {
         let new_addr = self.get_unmmaped_area(suggested_range, fixed_addr)?;
         // new_addr must be ALIGN aligned
-        let new_range =
-            unsafe { PageRange::new_unchecked(new_addr, new_addr + suggested_range.len()) };
+        let new_range = PageRange::new(new_addr, new_addr + suggested_range.len()).unwrap();
         unsafe { self.insert_mapping(new_range, vma) }
     }
 
@@ -336,7 +326,8 @@ impl<'platform, Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>
             }
             core::cmp::Ordering::Less => {
                 // shrink
-                unsafe { self.remove_mapping(PageRange::new_unchecked(new_end, range.end)) };
+                let range = PageRange::new(new_end, range.end).unwrap();
+                unsafe { self.remove_mapping(range) };
                 return Ok(());
             }
             core::cmp::Ordering::Greater => {}
@@ -357,7 +348,8 @@ impl<'platform, Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>
             if self.vmas.overlaps(&r) {
                 return Err(VmemResizeError::RangeOccupied(r));
             }
-            unsafe { self.insert_mapping(PageRange::new_unchecked(range.end, new_end), *cur_vma) };
+            let range = PageRange::new(range.end, new_end).unwrap();
+            unsafe { self.insert_mapping(range, *cur_vma) };
             return Ok(());
         }
 
@@ -526,17 +518,10 @@ impl<'platform, Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>
             return Err(e);
         }
         if before_flags != after_flags {
+            let range =
+                PageRange::new(addr.as_usize(), addr.as_usize() + suggested_range.len()).unwrap();
             // `protect` should succeed, as we just created the mapping.
-            unsafe {
-                self.protect_mapping(
-                    PageRange::new_unchecked(
-                        addr.as_usize(),
-                        addr.as_usize() + suggested_range.len(),
-                    ),
-                    after_flags,
-                )
-            }
-            .expect("failed to protect mapping");
+            unsafe { self.protect_mapping(range, after_flags) }.expect("failed to protect mapping");
         }
         Ok(addr)
     }

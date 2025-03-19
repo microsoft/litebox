@@ -254,7 +254,10 @@ where
             {
                 return Err(PageFaultError::AllocationFailed);
             }
-            unsafe { vmem.insert_mapping(PageRange::new_unchecked(fault_addr, start), vma) };
+            let Some(range) = PageRange::new(fault_addr, start) else {
+                unreachable!()
+            };
+            unsafe { vmem.insert_mapping(range, vma) };
         }
 
         if <Platform as VmemPageFaultHandler>::access_error(error_code, vma.flags()) {
