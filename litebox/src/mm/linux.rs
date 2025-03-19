@@ -114,17 +114,7 @@ impl<const ALIGN: usize> NonZeroPageSize<ALIGN> {
         if size == 0 || size % ALIGN != 0 {
             return None;
         }
-        Some(unsafe { Self::new_unchecked(size) })
-    }
-
-    /// Create a new non-zero `ALIGN`-aligned size without checking for zero or alignment.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the size is non-zero and `ALIGN`-aligned.
-    #[inline]
-    pub(super) unsafe fn new_unchecked(size: usize) -> Self {
-        Self { size }
+        Some(Self { size })
     }
 
     /// Get the size
