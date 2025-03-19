@@ -1,3 +1,5 @@
+//! Read syscall implementation
+
 use litebox::fs::{FileSystem, errors::ReadError};
 
 use crate::{file_descriptors, litebox_fs};
