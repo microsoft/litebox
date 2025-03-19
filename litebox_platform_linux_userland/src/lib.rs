@@ -34,6 +34,8 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     ///
     /// Panics if the tun device could not be successfully opened.
     pub fn new(tun_device_name: &str, punchthrough_provider: PunchthroughProvider) -> Self {
+        platform::init_sys_intercept();
+
         let tun_socket_fd = {
             let tun_fd = nix::fcntl::open(
                 "/dev/net/tun",
@@ -84,6 +86,8 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     /// `cfg(test)` across crates, we cannot use `#[cfg(test)]` here.
     #[cfg(feature = "unstable-testing")]
     pub unsafe fn new_for_test(punchthrough_provider: PunchthroughProvider) -> Self {
+        platform::init_sys_intercept();
+
         Self {
             tun_socket_fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(-2) },
             punchthrough_provider,
