@@ -1,5 +1,5 @@
 //! This module implements a virtual memory manager `Vmem` that manages virtual address spaces
-//! backed by a memory [backend](`VmemBackend`). It provides functionality to create, remove, resize,
+//! backed by a memory [backend](`PageManagementProvider`). It provides functionality to create, remove, resize,
 //! move, and protect memory mappings within a process's virtual address space.
 
 use core::ops::Range;
@@ -160,7 +160,7 @@ pub(super) struct Vmem<'platform, Platform: PageManagementProvider<ALIGN>, const
 impl<'platform, Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>
     Vmem<'platform, Platform, ALIGN>
 {
-    pub(super) const TASK_ADDR_MIN: usize = PAGE_SIZE;
+    pub(super) const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
     pub(super) const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
     pub(super) const STACK_GUARD_GAP: usize = 256 << 12;
 
@@ -626,8 +626,7 @@ pub enum MappingError {
     MapError(#[from] crate::platform::page_mgmt::AllocationError),
 }
 
-/// Enable [`super::PageManager`] to handle page faults if its
-/// [backend](`crate::platform::PageManagementProvider::Backend`) implements this trait
+/// Enable [`super::PageManager`] to handle page faults if its platform implements this trait
 pub trait VmemPageFaultHandler {
     /// Handle a page fault for the given address.
     ///

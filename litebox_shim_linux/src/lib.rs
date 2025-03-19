@@ -64,7 +64,7 @@ pub(crate) fn litebox_sync<'a>() -> &'a litebox::sync::Synchronization<'static, 
 pub(crate) fn litebox_vmm<'a>() -> &'a PageManager<'static, Platform, PAGE_SIZE> {
     static VMEM: OnceBox<PageManager<'static, Platform, PAGE_SIZE>> = OnceBox::new();
     VMEM.get_or_init(|| {
-        let vmm = unsafe { PageManager::new(litebox_sync(), ()) };
+        let vmm = PageManager::new(litebox_platform_multiplex::platform());
         alloc::boxed::Box::new(vmm)
     })
 }
