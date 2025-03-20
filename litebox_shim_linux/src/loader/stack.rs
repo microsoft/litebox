@@ -211,19 +211,6 @@ impl UserStack {
         Some(())
     }
 
-    fn align_down(pos: usize, alignment: usize) -> usize {
-        debug_assert!(alignment.is_power_of_two());
-        pos & !(alignment - 1)
-    }
-
-    fn get_random_value() -> [u8; 16] {
-        // TODO: generate a random value
-        [
-            0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD,
-            0xBE, 0xEF,
-        ]
-    }
-
     /// Initialize the stack for the new process.
     pub(super) fn init(
         &mut self,
@@ -241,23 +228,32 @@ impl UserStack {
         let envp = self.push_cstrings(&env)?;
         let argvp = self.push_cstrings(&argv)?;
 
-        self.push_bytes(&Self::get_random_value())?;
+        // TODO: generate a random value
+        self.push_bytes(&[
+            0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD,
+            0xBE, 0xEF,
+        ])?;
         aux.insert(AuxKey::AT_RANDOM, self.stack_top.as_usize() + self.pos);
 
+        let align_down = |pos: usize, alignment: usize| -> usize {
+            debug_assert!(alignment.is_power_of_two());
+            pos & !(alignment - 1)
+        };
+
         // ensure stack is aligned
-        self.pos = Self::align_down(self.pos, size_of::<usize>());
+        self.pos = align_down(self.pos, size_of::<usize>());
         // to ensure the final pos is aligned, we need to add some padding
         let len = (aux.len() + 1) * 2 + envp.len() + 1 + argvp.len() + 1 + /* argc */ 1;
         let size = len * size_of::<usize>();
         let final_pos = self.pos.checked_sub(size)?;
-        self.pos -= final_pos - Self::align_down(final_pos, Self::STACK_ALIGNMENT);
+        self.pos -= final_pos - align_down(final_pos, Self::STACK_ALIGNMENT);
 
         self.push_aux(aux)?;
         self.push_pointers(envp)?;
         self.push_pointers(argvp)?;
 
         self.push_usize(argv.len())?;
-        assert_eq!(self.pos, Self::align_down(self.pos, Self::STACK_ALIGNMENT));
+        assert_eq!(self.pos, align_down(self.pos, Self::STACK_ALIGNMENT));
         Some(())
     }
 }

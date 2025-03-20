@@ -127,10 +127,14 @@ impl ElfLoaderMmap {
             ptr.mutate_subslice_with(..isize::try_from(len).unwrap(), |user_buf| {
                 // Loader code always runs before the program starts, so we can ensure
                 // user_buf is valid (e.g., won't be unmapped).
-                crate::syscalls::file::sys_read(fd, user_buf, Some(offset))
+                crate::syscalls::file::sys_read(fd, user_buf, Some(offset)).map_err(|e| match e {
+                    Errno::EBADF => MappingError::BadFD(fd),
+                    Errno::EISDIR => MappingError::NotAFile,
+                    Errno::EACCES => MappingError::NotForReading,
+                    _ => unimplemented!(),
+                })
             })
             .unwrap()
-            .map_err(|e| MappingError::ReadError(i32::from(e)))
         };
         Self::do_mmap_common(addr, len, prot, flags, op)
     }

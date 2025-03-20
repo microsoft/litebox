@@ -620,8 +620,15 @@ pub enum MappingError {
     MisAligned,
     #[error("not enough memory")]
     OutOfMemory,
-    #[error("failed to read from file: {0}")]
-    ReadError(i32),
+
+    // Errors from mapping a file
+    #[error("bad file descriptor: {0}")]
+    BadFD(i32),
+    #[error("file descriptor does not point to a file")]
+    NotAFile,
+    #[error("file not open for reading")]
+    NotForReading,
+
     #[error("mapping failed: {0}")]
     MapError(#[from] crate::platform::page_mgmt::AllocationError),
 }
