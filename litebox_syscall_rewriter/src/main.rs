@@ -3,8 +3,6 @@ use capstone::prelude::*;
 use object::build::elf;
 use std::{env, fs, path::Path, vec::Vec};
 
-mod rewriter;
-
 fn hook_syscalls(
     text_data: &mut Vec<u8>,
     text_addr: u64,
@@ -182,10 +180,6 @@ fn rewrite_elf(in_path: &Path) -> Result<()> {
     // Update the segment containing the trampoline section
     let text_segment = builder.segments.get_mut(text_segment_id);
     text_segment.recalculate_ranges(&builder.sections);
-
-    // Move sections
-    rewriter::move_sections(&mut builder)
-        .with_context(|| format!("Failed to move sections in file '{}'", in_path.display()))?;
 
     // Write the modified ELF file
     let out_path = in_path.with_extension("hooked");
