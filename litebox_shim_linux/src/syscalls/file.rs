@@ -38,3 +38,15 @@ pub(crate) fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result
         None => Err(Errno::EBADF),
     }
 }
+
+/// Close a file
+pub(crate) fn sys_close(fd: i32) -> Result<(), Errno> {
+    let Ok(fd) = u32::try_from(fd) else {
+        return Err(Errno::EBADF);
+    };
+    match file_descriptors().write().remove(fd) {
+        Some(Descriptor::File(file_fd)) => litebox_fs().close(file_fd).map_err(Errno::from),
+        Some(Descriptor::Socket(socket_fd)) => todo!(),
+        None => Err(Errno::EBADF),
+    }
+}

@@ -19,7 +19,6 @@ use alloc::vec::Vec;
 use once_cell::race::OnceBox;
 
 use litebox::{
-    fs::FileSystem as _,
     mm::{PageManager, linux::PAGE_SIZE},
     platform::RawConstPointer as _,
     sync::RwLock,
@@ -212,15 +211,5 @@ pub unsafe extern "C" fn open(pathname: ConstPtr<i8>, flags: u32, mode: u32) -> 
 
 /// Closes the file
 pub extern "C" fn close(fd: i32) -> i32 {
-    let Ok(fd) = u32::try_from(fd) else {
-        return Errno::EBADF.as_neg();
-    };
-    match file_descriptors().write().remove(fd) {
-        Some(Descriptor::File(file_fd)) => match litebox_fs().close(file_fd) {
-            Ok(()) => 0,
-            Err(err) => Errno::from(err).as_neg(),
-        },
-        Some(Descriptor::Socket(socket_fd)) => todo!(),
-        None => Errno::EBADF.as_neg(),
-    }
+    syscalls::file::sys_close(fd).map_or_else(Errno::as_neg, |()| 0)
 }
