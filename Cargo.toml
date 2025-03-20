@@ -7,7 +7,7 @@ members = [
     "litebox_platform_linux_userland",
     "litebox_platform_multiplex",
     "litebox_shim_linux",
-    "syscall_rewriter",
+    "litebox_syscall_rewriter",
 ]
 
 # Introduce all the pedantic clippy lints and remove ones I (jayb) think are
