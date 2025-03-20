@@ -1,4 +1,5 @@
 use crossbeam::channel::Sender;
+use litebox_common_linux::errno::Errno;
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use std::os::raw::{c_int, c_uint};
 use std::{arch::global_asm, collections::BTreeMap, sync::OnceLock};
@@ -19,10 +20,11 @@ struct CustomSiginfo {
 #[derive(Debug)]
 struct SyscallContext {
     syscall_number: i64,
-    syscall_args: [u64; 6],
+    syscall_args: [usize; 6],
 }
 
-static SYS_SENDER: OnceLock<Sender<(SyscallContext, Sender<i64>)>> = OnceLock::new();
+static SYS_SENDER: OnceLock<Sender<(SyscallContext, Sender<Result<i64, Errno>>)>> =
+    OnceLock::new();
 
 global_asm!(
     "
@@ -86,26 +88,43 @@ unsafe extern "C" {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const u64) -> i64 {
+unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize) -> i64 {
+    let syscall_args = unsafe { std::slice::from_raw_parts(args, 6) };
+    unsafe { request_syscall(syscall_number, syscall_args.try_into().unwrap())
+        .unwrap_or_else(|e| e.as_neg() as i64) }
+}
+
+unsafe fn request_syscall(syscall_number: i64, args: [usize; 6]) -> Result<i64, Errno> {
     let s = SYS_SENDER.get().unwrap();
     let (resp_tx, resp_rx) = crossbeam::channel::bounded(1);
-    let syscall_args = unsafe { std::slice::from_raw_parts(args, 6) };
     s.send((
         SyscallContext {
             syscall_number,
-            syscall_args: [
-                syscall_args[0],
-                syscall_args[1],
-                syscall_args[2],
-                syscall_args[3],
-                syscall_args[4],
-                syscall_args[5],
-            ],
+            syscall_args: args,
         },
         resp_tx,
     ))
     .unwrap();
     resp_rx.recv().unwrap()
+}
+
+pub(crate) unsafe fn request_mmap(
+    addr: usize,
+    len: usize,
+    prot: nix::sys::mman::ProtFlags,
+    flags: nix::sys::mman::MapFlags,
+    fd: i32,
+    offset: usize,
+) -> Result<i64, Errno> {
+    let args = [
+        addr,
+        len,
+        prot.bits() as _,
+        flags.bits() as _,
+        fd as _,
+        offset,
+    ];
+    unsafe { request_syscall(libc::SYS_mmap, args) }
 }
 
 extern "C" fn sigsys_handler(sig: c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
@@ -148,43 +167,16 @@ fn register_sigsys_handler() {
     }
 }
 
-pub(crate) fn init_sys_intercept() {
-    register_sigsys_handler();
-
-    let (s, r) = crossbeam::channel::unbounded();
-    SYS_SENDER.set(s).unwrap();
-
-    std::thread::spawn(move || {
-        loop {
-            match r.recv() {
-                Ok((syscall_context, resp_tx)) => {
-                    std::println!("Received syscall context: {:?}", syscall_context);
-                    let resp: i64 = match syscall_context.syscall_number {
-                        // libc::SYS_getpid => {
-                        //     std::println!("getpid syscall intercepted");
-                        //     unsafe { libc::getpid() as i64 }
-                        // }
-                        _ => {
-                            std::println!("Unknown syscall intercepted");
-                            panic!();
-                        }
-                    };
-                    resp_tx.send(resp).unwrap();
-                }
-                Err(_) => {
-                    std::println!("Receiver closed");
-                    break;
-                }
-            }
-        }
-    });
-
+#[cfg(not(test))]
+fn register_seccomp_filter() {
     // allow list
     let rules = vec![
         // (libc::SYS_getpid, vec![])
         (libc::SYS_write, vec![]),
         (libc::SYS_munmap, vec![]),
+        (libc::SYS_rt_sigreturn, vec![]),
         (libc::SYS_sigaltstack, vec![]),
+        (libc::SYS_futex, vec![]),
         (libc::SYS_exit_group, vec![]),
     ];
     let rule_map: BTreeMap<i64, Vec<SeccompRule>> = rules.into_iter().collect();
@@ -200,4 +192,54 @@ pub(crate) fn init_sys_intercept() {
     let bpf_prog: BpfProgram = filter.try_into().unwrap();
 
     seccompiler::apply_filter(&bpf_prog).unwrap();
+}
+
+pub(crate) fn init_sys_intercept() {
+    register_sigsys_handler();
+
+    let (s, r) = crossbeam::channel::unbounded();
+    SYS_SENDER.set(s).unwrap();
+
+    std::thread::spawn(move || {
+        loop {
+            match r.recv() {
+                Ok((syscall_context, resp_tx)) => {
+                    std::println!("Received syscall context: {:?}", syscall_context);
+                    let resp: Result<i64, Errno> = match syscall_context.syscall_number {
+                        // libc::SYS_getpid => {
+                        //     std::println!("getpid syscall intercepted");
+                        //     unsafe { libc::getpid() as i64 }
+                        // }
+                        libc::SYS_mmap => {
+                            let args = syscall_context.syscall_args;
+                            let res = unsafe {
+                                libc::syscall(
+                                    syscall_context.syscall_number,
+                                    args[0], args[1], args[2], args[3], args[4], args[5],
+                                )
+                            };
+                            // map the result to a Result<isize, Errno>, compared with Errno::MAX
+                            match res {
+                                -4096..=-1 => todo!(),
+                                0.. => Ok(res),
+                                _ => panic!("unknown result"),
+                            }
+                        }
+                        _ => {
+                            std::println!("Unknown syscall intercepted");
+                            panic!();
+                        }
+                    };
+                    resp_tx.send(resp).unwrap();
+                }
+                Err(_) => {
+                    std::println!("Receiver closed");
+                    break;
+                }
+            }
+        }
+    });
+
+    #[cfg(not(test))]
+    register_sigsys_handler();
 }

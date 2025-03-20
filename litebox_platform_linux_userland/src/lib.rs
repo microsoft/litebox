@@ -13,6 +13,8 @@ use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 
+pub mod platform;
+
 /// The userland Linux platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
@@ -485,9 +487,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         can_grow_down: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let ptr = unsafe {
-            nix::sys::mman::mmap_anonymous(
-                Some(core::num::NonZeroUsize::new(range.start).expect("non null addr")),
-                core::num::NonZeroUsize::new(range.len()).expect("non zero len"),
+            platform::request_mmap(
+                range.start,
+                range.len(),
                 prot_flags(initial_permissions),
                 nix::sys::mman::MapFlags::MAP_PRIVATE
                     | nix::sys::mman::MapFlags::MAP_ANONYMOUS
@@ -497,6 +499,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                     } else {
                         nix::sys::mman::MapFlags::empty()
                     }),
+                -1,
+                0,
             )
         }
         .expect("mmap failed");

@@ -199,13 +199,13 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
 
 /// Struct to hold the information needed to start the program
 /// (entry point and user stack top).
-struct ElfLoadInfo {
-    entry_point: usize,
-    user_stack_top: usize,
+pub struct ElfLoadInfo {
+    pub entry_point: usize,
+    pub user_stack_top: usize,
 }
 
 /// Loader for ELF files
-struct ElfLoader;
+pub(super) struct ElfLoader;
 
 impl ElfLoader {
     const DEFAULT_STACK_SIZE: usize = 2 * PAGE_SIZE;
@@ -229,7 +229,7 @@ impl ElfLoader {
     }
 
     /// Load an ELF file and prepare the stack for the new process.
-    fn load(
+    pub(super) fn load(
         path: &str,
         argv: Vec<CString>,
         envp: Vec<CString>,
@@ -279,7 +279,7 @@ impl ElfLoader {
 }
 
 #[derive(Error, Debug)]
-enum ElfLoaderError {
+pub(super) enum ElfLoaderError {
     #[error("failed to open the ELF file: {0}")]
     OpenError(#[from] Errno),
     #[error("failed to load the ELF file: {0}")]
@@ -288,6 +288,17 @@ enum ElfLoaderError {
     InvalidStackAddr,
     #[error("failed to mmap: {0}")]
     MappingError(#[from] MappingError),
+}
+
+impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
+    fn from(value: ElfLoaderError) -> Self {
+        match value {
+            ElfLoaderError::OpenError(e) => e.into(),
+            ElfLoaderError::LoaderError(_) => litebox_common_linux::errno::Errno::EINVAL,
+            ElfLoaderError::InvalidStackAddr => litebox_common_linux::errno::Errno::ENOMEM,
+            ElfLoaderError::MappingError(_) => litebox_common_linux::errno::Errno::ENOMEM,
+        }
+    }
 }
 
 #[cfg(test)]
