@@ -1,4 +1,4 @@
-/// The code below is copied from https://github.com/gimli-rs/object/blame/master/crates/rewrite/src/elf.rs.
+/// The code below is copied from https://github.com/gimli-rs/object/blob/master/crates/rewrite/src/elf.rs
 use anyhow::Result;
 use object::build;
 use object::elf;
