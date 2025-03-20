@@ -1,4 +1,4 @@
-//! This module contains the stack layout for the user process.
+//! This module manages the stack layout for the user process.
 
 use alloc::{collections::btree_map::BTreeMap, ffi::CString, vec::Vec};
 use litebox::platform::{RawConstPointer, RawMutPointer};
@@ -8,37 +8,60 @@ use crate::MutPtr;
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
-pub enum AuxKey {
-    AT_NULL = 0,      /* end of vector */
-    AT_IGNORE = 1,    /* entry should be ignored */
-    AT_EXECFD = 2,    /* file descriptor of program */
-    AT_PHDR = 3,      /* program headers for program */
-    AT_PHENT = 4,     /* size of program header entry */
-    AT_PHNUM = 5,     /* number of program headers */
-    AT_PAGESZ = 6,    /* system page size */
-    AT_BASE = 7,      /* base address of interpreter */
-    AT_FLAGS = 8,     /* flags */
-    AT_ENTRY = 9,     /* entry point of program */
-    AT_NOTELF = 10,   /* program is not ELF */
-    AT_UID = 11,      /* real uid */
-    AT_EUID = 12,     /* effective uid */
-    AT_GID = 13,      /* real gid */
-    AT_EGID = 14,     /* effective gid */
-    AT_PLATFORM = 15, /* string identifying CPU for optimizations */
-    AT_HWCAP = 16,    /* arch dependent hints at CPU capabilities */
-    AT_CLKTCK = 17,   /* frequency at which times() increments */
+pub(super) enum AuxKey {
+    /// end of vector
+    AT_NULL = 0,
+    /// entry should be ignored
+    AT_IGNORE = 1,
+    /// file descriptor of program
+    AT_EXECFD = 2,
+    /// program headers for program
+    AT_PHDR = 3,
+    /// size of program header entry
+    AT_PHENT = 4,
+    /// number of program headers
+    AT_PHNUM = 5,
+    /// system page size
+    AT_PAGESZ = 6,
+    /// base address of interpreter
+    AT_BASE = 7,
+    /// flags
+    AT_FLAGS = 8,
+    /// entry point of program
+    AT_ENTRY = 9,
+    /// program is not ELF
+    AT_NOTELF = 10,
+    /// real uid
+    AT_UID = 11,
+    /// effective uid
+    AT_EUID = 12,
+    /// real gid
+    AT_GID = 13,
+    /// effective gid
+    AT_EGID = 14,
+    /// string identifying CPU for optimizations
+    AT_PLATFORM = 15,
+    /// arch dependent hints at CPU capabilities
+    AT_HWCAP = 16,
+    /// frequency at which times() increments
+    AT_CLKTCK = 17,
 
     /* 18...22 not used */
-    AT_SECURE = 23, /* secure mode boolean */
-    AT_BASE_PLATFORM = 24, /* string identifying real platform, may
-                     * differ from AT_PLATFORM. */
-    AT_RANDOM = 25, /* address of 16 random bytes */
-    AT_HWCAP2 = 26, /* extension of AT_HWCAP */
+    /// secure mode boolean
+    AT_SECURE = 23,
+    /// string identifying real platform, may differ from AT_PLATFORM
+    AT_BASE_PLATFORM = 24,
+    /// address of 16 random bytes
+    AT_RANDOM = 25,
+    /// extension of AT_HWCAP
+    AT_HWCAP2 = 26,
 
     /* 28...30 not used */
-    AT_EXECFN = 31, /* filename of program */
+    /// filename of program
+    AT_EXECFN = 31,
     AT_SYSINFO = 32,
-    AT_SYSINFO_EHDR = 33, /* the start address of the page containing the VDSO */
+    /// the start address of the page containing the VDSO
+    AT_SYSINFO_EHDR = 33,
 }
 
 /// The stack layout for the user process. This is used to set up the stack
@@ -82,7 +105,7 @@ pub(super) struct UserStack {
     /// The length of the stack
     len: usize,
     /// The current position of the stack pointer
-    pos: isize,
+    pos: usize,
 }
 
 impl UserStack {
@@ -102,24 +125,24 @@ impl UserStack {
         Some(Self {
             stack_top,
             len,
-            pos: isize::try_from(len).ok()?,
+            pos: len,
         })
     }
 
     /// Get the current stack pointer.
     pub(super) fn get_cur_stack_top(&self) -> usize {
-        debug_assert!(self.pos >= 0);
-        self.stack_top.as_usize() + self.pos.unsigned_abs()
+        self.stack_top.as_usize() + self.pos
     }
 
     /// Push `bytes` to the stack.
     ///
     /// Returns `None` if stack has no enough space.
     fn push_bytes(&mut self, bytes: &[u8]) -> Option<()> {
-        let old_pos = self.pos;
-        self.pos = self.pos.checked_sub_unsigned(bytes.len())?;
+        let end = isize::try_from(self.pos).ok()?;
+        self.pos = self.pos.checked_sub(bytes.len())?;
+        let begin = isize::try_from(self.pos).ok()?;
         self.stack_top
-            .mutate_subslice_with(self.pos..old_pos, |s| s.copy_from_slice(bytes))?;
+            .mutate_subslice_with(begin..end, |s| s.copy_from_slice(bytes))?;
         Some(())
     }
 
@@ -142,7 +165,7 @@ impl UserStack {
     ///
     /// Returns the offsets of the strings in the stack.
     /// Returns `None` if stack has no enough space.
-    fn push_cstrings(&mut self, vals: &[CString]) -> Option<Vec<isize>> {
+    fn push_cstrings(&mut self, vals: &[CString]) -> Option<Vec<usize>> {
         let mut envp = Vec::with_capacity(vals.len());
         for val in vals {
             self.push_cstring(val)?;
@@ -156,16 +179,17 @@ impl UserStack {
     /// `offsets` are the offsets of the pointers in the stack.
     ///
     /// Returns `None` if stack has no enough space.
-    fn push_pointers(&mut self, offsets: Vec<isize>) -> Option<()> {
+    fn push_pointers(&mut self, offsets: Vec<usize>) -> Option<()> {
         // write end marker
         self.push_usize(0)?;
-        let size = offsets.len().checked_mul(size_of::<isize>())?;
-        let old_pos = self.pos;
-        self.pos = self.pos.checked_sub_unsigned(size)?;
+        let size = offsets.len().checked_mul(size_of::<usize>())?;
+        let end = isize::try_from(self.pos).ok()?;
+        self.pos = self.pos.checked_sub(size)?;
+        let begin = isize::try_from(self.pos).ok()?;
         self.stack_top
-            .mutate_subslice_with(self.pos..old_pos, |s| -> Option<()> {
+            .mutate_subslice_with(begin..end, |s| -> Option<()> {
                 for (i, p) in offsets.iter().enumerate() {
-                    let addr = self.stack_top.as_usize().checked_add_signed(*p)?;
+                    let addr = self.stack_top.as_usize() + *p;
                     s[i * 8..(i + 1) * 8].copy_from_slice(&addr.to_le_bytes());
                 }
                 Some(())
@@ -187,9 +211,9 @@ impl UserStack {
         Some(())
     }
 
-    fn align_down(pos: isize, alignment: usize) -> isize {
-        assert!(alignment.is_power_of_two());
-        pos & !isize::try_from(alignment - 1).unwrap()
+    fn align_down(pos: usize, alignment: usize) -> usize {
+        debug_assert!(alignment.is_power_of_two());
+        pos & !(alignment - 1)
     }
 
     fn get_random_value() -> [u8; 16] {
@@ -208,26 +232,24 @@ impl UserStack {
         mut aux: BTreeMap<AuxKey, usize>,
     ) -> Option<()> {
         // end markers
-        self.pos = self.pos.checked_sub_unsigned(size_of::<usize>())?;
+        self.pos = self.pos.checked_sub(size_of::<usize>())?;
         unsafe {
-            self.stack_top.write_at_offset(self.pos, 0)?;
+            self.stack_top
+                .write_at_offset(isize::try_from(self.pos).ok()?, 0)?;
         }
 
         let envp = self.push_cstrings(&env)?;
         let argvp = self.push_cstrings(&argv)?;
 
         self.push_bytes(&Self::get_random_value())?;
-        aux.insert(
-            AuxKey::AT_RANDOM,
-            self.stack_top.as_usize().checked_add_signed(self.pos)?,
-        );
+        aux.insert(AuxKey::AT_RANDOM, self.stack_top.as_usize() + self.pos);
 
         // ensure stack is aligned
         self.pos = Self::align_down(self.pos, size_of::<usize>());
         // to ensure the final pos is aligned, we need to add some padding
         let len = (aux.len() + 1) * 2 + envp.len() + 1 + argvp.len() + 1 + /* argc */ 1;
         let size = len * size_of::<usize>();
-        let final_pos = self.pos.checked_sub_unsigned(size)?;
+        let final_pos = self.pos.checked_sub(size)?;
         self.pos -= final_pos - Self::align_down(final_pos, Self::STACK_ALIGNMENT);
 
         self.push_aux(aux)?;

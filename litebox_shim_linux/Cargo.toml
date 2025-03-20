@@ -16,4 +16,4 @@ thiserror = { version = "2.0.6", default-features = false }
 workspace = true
 
 [dev-dependencies]
-litebox_platform_multiplex = { path = "../litebox_platform_multiplex/", version = "0.1.0", features = ["testing"] }
+litebox_platform_multiplex = { path = "../litebox_platform_multiplex/", version = "0.1.0", features = ["unstable-testing"] }

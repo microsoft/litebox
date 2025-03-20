@@ -1,6 +1,6 @@
 //! ELF loader for LiteBox
 
-use core::{ffi::c_int, ptr::NonNull, str::FromStr};
+use core::{ffi::c_int, ptr::NonNull};
 
 use alloc::{collections::btree_map::BTreeMap, ffi::CString, string::ToString, vec::Vec};
 use elf_loader::{
@@ -10,13 +10,14 @@ use elf_loader::{
     object::ElfObject,
 };
 use litebox::{
-    fs::{Mode, OFlags, errors::OpenError},
+    fs::{Mode, OFlags},
     mm::linux::{MappingError, PAGE_SIZE},
     platform::{RawConstPointer, RawMutPointer},
 };
+use litebox_common_linux::errno::Errno;
 use thiserror::Error;
 
-use crate::{MutPtr, litebox_vmm, sys_open, syscalls::read::sys_read};
+use crate::{MutPtr, litebox_page_manager};
 
 use super::stack::{AuxKey, UserStack};
 
@@ -27,13 +28,11 @@ struct ElfFile {
 }
 
 impl ElfFile {
-    fn from_path(path: &str) -> Result<Self, OpenError> {
-        let fd = sys_open(path, OFlags::RDONLY, Mode::empty())?;
+    fn new(path: &str) -> Result<Self, Errno> {
+        let name = CString::new(path).unwrap();
+        let fd = crate::syscalls::file::sys_open(path, OFlags::RDONLY, Mode::empty())?;
 
-        Ok(Self {
-            name: CString::from_str(path).unwrap(),
-            fd,
-        })
+        Ok(Self { name, fd })
     }
 }
 
@@ -42,12 +41,32 @@ impl ElfObject for ElfFile {
         &self.name
     }
 
-    fn read(&mut self, buf: &mut [u8], offset: usize) -> elf_loader::Result<()> {
-        match sys_read(self.fd, buf, Some(offset)) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(elf_loader::Error::IOError {
-                msg: "failed to read from file".to_string(),
-            }),
+    fn read(&mut self, mut buf: &mut [u8], mut offset: usize) -> elf_loader::Result<()> {
+        loop {
+            if buf.is_empty() {
+                return Ok(());
+            }
+            // Try to read the remaining bytes
+            match crate::syscalls::file::sys_read(self.fd, buf, Some(offset)) {
+                Ok(bytes_read) => {
+                    if bytes_read == 0 {
+                        // reached the end of the file
+                        return Err(elf_loader::Error::IOError {
+                            msg: "failed to fill buffer".to_string(),
+                        });
+                    } else {
+                        // Successfully read some bytes
+                        buf = &mut buf[bytes_read..];
+                        offset += bytes_read;
+                    }
+                }
+                Err(_) => {
+                    // Error occurred
+                    return Err(elf_loader::Error::IOError {
+                        msg: "failed to read from file".to_string(),
+                    });
+                }
+            }
         }
     }
 
@@ -73,16 +92,16 @@ impl ElfLoaderMmap {
     ) -> elf_loader::Result<usize> {
         let fixed_addr = flags.contains(MapFlags::MAP_FIXED);
         let suggested_addr = addr.unwrap_or(0);
-        let vmm = litebox_vmm();
+        let pm = litebox_page_manager();
         let res = match prot.bits() {
             Self::PROT_EXECUTABLE => unsafe {
-                vmm.create_executable_pages(suggested_addr, len, fixed_addr, op)
+                pm.create_executable_pages(suggested_addr, len, fixed_addr, op)
             },
             Self::PROT_WRITABLE => unsafe {
-                vmm.create_writable_pages(suggested_addr, len, fixed_addr, op)
+                pm.create_writable_pages(suggested_addr, len, fixed_addr, op)
             },
             Self::PROT_READABLE => unsafe {
-                vmm.create_readable_pages(suggested_addr, len, fixed_addr, op)
+                pm.create_readable_pages(suggested_addr, len, fixed_addr, op)
             },
             _ => todo!(),
         };
@@ -101,17 +120,17 @@ impl ElfLoaderMmap {
         offset: usize,
     ) -> elf_loader::Result<usize> {
         // TODO: we copy the file to the memory to support file-backed mmap.
-        // Loader may rely on `mmap`` instead of `mprotect` to change the memory protection,
+        // Loader may rely on `mmap` instead of `mprotect` to change the memory protection,
         // in which case the file is copied multiple times. To reduce the overhead, we
         // could convert some `mmap` calls to `mprotect` calls whenever possible.
         let op = |ptr: MutPtr<u8>| -> Result<usize, MappingError> {
             ptr.mutate_subslice_with(..isize::try_from(len).unwrap(), |user_buf| {
                 // Loader code always runs before the program starts, so we can ensure
                 // user_buf is valid (e.g., won't be unmapped).
-                sys_read(fd, user_buf, Some(offset))
+                crate::syscalls::file::sys_read(fd, user_buf, Some(offset))
             })
             .unwrap()
-            .map_err(MappingError::ReadError)
+            .map_err(|e| MappingError::ReadError(i32::from(e)))
         };
         Self::do_mmap_common(addr, len, prot, flags, op)
     }
@@ -214,7 +233,7 @@ impl ElfLoader {
         let elf = {
             let mut loader = Loader::<ElfLoaderMmap>::new();
             loader
-                .easy_load(ElfFile::from_path(path).map_err(ElfLoaderError::OpenError)?)
+                .easy_load(ElfFile::new(path).map_err(ElfLoaderError::OpenError)?)
                 .map_err(ElfLoaderError::LoaderError)?
         };
         let interp: Option<Elf> = if let Some(interp_name) = elf.interp() {
@@ -222,7 +241,7 @@ impl ElfLoader {
             let mut loader = Loader::<ElfLoaderMmap>::new();
             Some(
                 loader
-                    .easy_load(ElfFile::from_path(interp_name).map_err(ElfLoaderError::OpenError)?)
+                    .easy_load(ElfFile::new(interp_name).map_err(ElfLoaderError::OpenError)?)
                     .map_err(ElfLoaderError::LoaderError)?,
             )
         } else {
@@ -238,7 +257,7 @@ impl ElfLoader {
         };
 
         let sp = unsafe {
-            litebox_vmm()
+            litebox_page_manager()
                 .create_stack_pages(0, Self::DEFAULT_STACK_SIZE, false)
                 .map_err(ElfLoaderError::MappingError)?
         };
@@ -258,7 +277,7 @@ impl ElfLoader {
 #[derive(Error, Debug)]
 enum ElfLoaderError {
     #[error("failed to open the ELF file: {0}")]
-    OpenError(#[from] OpenError),
+    OpenError(#[from] Errno),
     #[error("failed to load the ELF file: {0}")]
     LoaderError(#[from] elf_loader::Error),
     #[error("invalid stack")]

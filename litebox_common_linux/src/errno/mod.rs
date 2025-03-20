@@ -140,3 +140,13 @@ impl From<litebox::fs::errors::CloseError> for Errno {
         }
     }
 }
+
+impl From<litebox::fs::errors::ReadError> for Errno {
+    fn from(value: litebox::fs::errors::ReadError) -> Self {
+        match value {
+            litebox::fs::errors::ReadError::NotAFile => Errno::EISDIR,
+            litebox::fs::errors::ReadError::NotForReading => Errno::EACCES,
+            _ => unimplemented!(),
+        }
+    }
+}

@@ -30,14 +30,13 @@ use litebox_platform_multiplex::Platform;
 pub mod loader;
 pub mod syscalls;
 
-use syscalls::open::sys_open;
-
 static FS: OnceBox<litebox::fs::in_mem::FileSystem<Platform>> = OnceBox::new();
 /// Set the global file system
 ///
 /// # Panics
 ///
 /// Panics if this is called more than once or `litebox_fs` is called before this
+#[cfg(test)]
 pub fn set_fs(fs: litebox::fs::in_mem::FileSystem<'static, Platform>) {
     FS.set(alloc::boxed::Box::new(fs))
         .map_err(|_| {})
@@ -61,7 +60,7 @@ pub(crate) fn litebox_sync<'a>() -> &'a litebox::sync::Synchronization<'static, 
     })
 }
 
-pub(crate) fn litebox_vmm<'a>() -> &'a PageManager<'static, Platform, PAGE_SIZE> {
+pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<'static, Platform, PAGE_SIZE> {
     static VMEM: OnceBox<PageManager<'static, Platform, PAGE_SIZE>> = OnceBox::new();
     VMEM.get_or_init(|| {
         let vmm = PageManager::new(litebox_platform_multiplex::platform());
@@ -201,13 +200,13 @@ pub unsafe extern "C" fn open(pathname: ConstPtr<i8>, flags: u32, mode: u32) -> 
     let Some(path) = pathname.to_cstring() else {
         return Errno::EFAULT.as_neg();
     };
-    match sys_open(
+    match syscalls::file::sys_open(
         path,
         litebox::fs::OFlags::from_bits(flags).unwrap(),
         litebox::fs::Mode::from_bits(mode).unwrap(),
     ) {
         Ok(fd) => fd,
-        Err(err) => Errno::from(err).as_neg(),
+        Err(err) => err.as_neg(),
     }
 }
 

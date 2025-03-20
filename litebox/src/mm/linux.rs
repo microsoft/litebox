@@ -620,8 +620,8 @@ pub enum MappingError {
     MisAligned,
     #[error("not enough memory")]
     OutOfMemory,
-    #[error("failed to read from file")]
-    ReadError(#[from] crate::fs::errors::ReadError),
+    #[error("failed to read from file: {0}")]
+    ReadError(i32),
     #[error("mapping failed: {0}")]
     MapError(#[from] crate::platform::page_mgmt::AllocationError),
 }
