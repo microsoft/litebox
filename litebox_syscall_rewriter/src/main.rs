@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use capstone::prelude::*;
 use object::build::elf;
-use std::{env, fs, path::Path, vec::Vec};
+use std::{env, fs, path::Path};
 
 fn hook_syscalls(
     text_data: &mut Vec<u8>,
