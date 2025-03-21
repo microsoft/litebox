@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use capstone::prelude::*;
 use object::build::elf;
-use std::{env, fs, path::Path};
+use std::{env, fs, path::Path, vec};
 
 fn hook_syscalls(
     text_data: &mut [u8],
@@ -145,7 +145,9 @@ fn rewrite_elf(in_path: &Path) -> Result<()> {
         text_segment.append_section(trampoline_section);
         (trampoline_section.id(), trampoline_section.sh_addr)
     };
-    let mut trampoline_data = vec![0x0; 0x8];
+
+    // We use the first 8 bytes to store the syscall hook address
+    let mut trampoline_data = vec![0; 8];
 
     // Hook syscalls
     hook_syscalls(
