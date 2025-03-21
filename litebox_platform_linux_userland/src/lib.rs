@@ -74,6 +74,21 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
             punchthrough_provider,
         }
     }
+
+    /// Create a new userland-Linux platform for use in `LiteBox` for testing.
+    ///
+    /// # Safety
+    ///
+    /// This should only be used in tests.
+    /// Due to [the lack of support](https://github.com/rust-lang/cargo/issues/8379) for
+    /// `cfg(test)` across crates, we cannot use `#[cfg(test)]` here.
+    #[cfg(feature = "unstable-testing")]
+    pub unsafe fn new_for_test(punchthrough_provider: PunchthroughProvider) -> Self {
+        Self {
+            tun_socket_fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(-2) },
+            punchthrough_provider,
+        }
+    }
 }
 
 impl<PunchthroughProvider: litebox::platform::PunchthroughProvider> litebox::platform::Provider

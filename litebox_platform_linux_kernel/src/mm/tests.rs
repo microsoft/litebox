@@ -215,7 +215,7 @@ fn test_page_table() {
 
 #[test]
 fn test_vmm_page_fault() {
-    let start_addr: usize = 0x1000;
+    let start_addr: usize = 0x1_0000;
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
     let platform = MockKernel::new(p4.start_address());
     let mut vmm = PageManager::<'_, _, PAGE_SIZE>::new(&platform);
@@ -227,7 +227,7 @@ fn test_vmm_page_fault() {
             start_addr
         );
     }
-    // [0x1000, 0x5000)
+    // [0x1_0000, 0x1_4000)
 
     // Access page w/o mapping
     assert!(matches!(
@@ -261,7 +261,7 @@ fn test_vmm_page_fault() {
             stack_addr
         );
     }
-    // [0x1000, 0x5000), [0x1000_0000, 0x1000_4000)
+    // [0x1_0000, 0x1_4000), [0x1000_0000, 0x1000_4000)
     // Test stack growth
     assert!(
         unsafe {
@@ -274,7 +274,7 @@ fn test_vmm_page_fault() {
             .iter()
             .map(|v| v.0.clone())
             .collect::<Vec<_>>(),
-        vec![0x1000..0x5000, 0x0fff_f000..0x1000_4000]
+        vec![0x1_0000..0x1_4000, 0x0fff_f000..0x1000_4000]
     );
     // Cannot grow stack too far
     assert!(matches!(

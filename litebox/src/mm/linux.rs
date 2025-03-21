@@ -1,5 +1,5 @@
 //! This module implements a virtual memory manager `Vmem` that manages virtual address spaces
-//! backed by a memory [backend](`VmemBackend`). It provides functionality to create, remove, resize,
+//! backed by a memory [backend](`PageManagementProvider`). It provides functionality to create, remove, resize,
 //! move, and protect memory mappings within a process's virtual address space.
 
 use core::ops::Range;
@@ -58,6 +58,7 @@ pub struct PageRange<const ALIGN: usize> {
     /// End page of the range.
     pub end: usize,
 }
+
 impl<const ALIGN: usize> From<PageRange<ALIGN>> for Range<usize> {
     fn from(range: PageRange<ALIGN>) -> Self {
         range.start..range.end
@@ -159,7 +160,7 @@ pub(super) struct Vmem<'platform, Platform: PageManagementProvider<ALIGN>, const
 impl<'platform, Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>
     Vmem<'platform, Platform, ALIGN>
 {
-    pub(super) const TASK_ADDR_MIN: usize = PAGE_SIZE;
+    pub(super) const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
     pub(super) const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
     pub(super) const STACK_GUARD_GAP: usize = 256 << 12;
 
@@ -619,14 +620,20 @@ pub enum MappingError {
     MisAligned,
     #[error("not enough memory")]
     OutOfMemory,
-    #[error("failed to read from file")]
-    ReadError(#[from] crate::fs::errors::ReadError),
+
+    // Errors from mapping a file
+    #[error("bad file descriptor: {0}")]
+    BadFD(i32),
+    #[error("file descriptor does not point to a file")]
+    NotAFile,
+    #[error("file not open for reading")]
+    NotForReading,
+
     #[error("mapping failed: {0}")]
     MapError(#[from] crate::platform::page_mgmt::AllocationError),
 }
 
-/// Enable [`super::PageManager`] to handle page faults if its
-/// [backend](`crate::platform::PageManagementProvider::Backend`) implements this trait
+/// Enable [`super::PageManager`] to handle page faults if its platform implements this trait
 pub trait VmemPageFaultHandler {
     /// Handle a page fault for the given address.
     ///

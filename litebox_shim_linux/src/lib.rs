@@ -18,12 +18,31 @@ use alloc::vec::Vec;
 // platform-specific things within it.
 use once_cell::race::OnceBox;
 
-use litebox::{fs::FileSystem as _, platform::RawConstPointer as _, sync::RwLock};
+use litebox::{
+    mm::{PageManager, linux::PAGE_SIZE},
+    platform::RawConstPointer as _,
+    sync::RwLock,
+};
 use litebox_common_linux::errno::Errno;
 use litebox_platform_multiplex::Platform;
 
-pub(crate) fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
-    static FS: OnceBox<litebox::fs::in_mem::FileSystem<Platform>> = OnceBox::new();
+pub mod loader;
+pub mod syscalls;
+
+static FS: OnceBox<litebox::fs::in_mem::FileSystem<Platform>> = OnceBox::new();
+/// Set the global file system
+///
+/// # Panics
+///
+/// Panics if this is called more than once or `litebox_fs` is called before this
+#[cfg(test)]
+pub fn set_fs(fs: litebox::fs::in_mem::FileSystem<'static, Platform>) {
+    FS.set(alloc::boxed::Box::new(fs))
+        .map_err(|_| {})
+        .expect("fs is already set");
+}
+
+pub fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
     FS.get_or_init(|| {
         alloc::boxed::Box::new(litebox::fs::in_mem::FileSystem::new(
             litebox_platform_multiplex::platform(),
@@ -37,6 +56,14 @@ pub(crate) fn litebox_sync<'a>() -> &'a litebox::sync::Synchronization<'static, 
         alloc::boxed::Box::new(litebox::sync::Synchronization::new(
             litebox_platform_multiplex::platform(),
         ))
+    })
+}
+
+pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<'static, Platform, PAGE_SIZE> {
+    static VMEM: OnceBox<PageManager<'static, Platform, PAGE_SIZE>> = OnceBox::new();
+    VMEM.get_or_init(|| {
+        let vmm = PageManager::new(litebox_platform_multiplex::platform());
+        alloc::boxed::Box::new(vmm)
     })
 }
 
@@ -172,31 +199,17 @@ pub unsafe extern "C" fn open(pathname: ConstPtr<i8>, flags: u32, mode: u32) -> 
     let Some(path) = pathname.to_cstring() else {
         return Errno::EFAULT.as_neg();
     };
-    match litebox_fs().open(
+    match syscalls::file::sys_open(
         path,
         litebox::fs::OFlags::from_bits(flags).unwrap(),
         litebox::fs::Mode::from_bits(mode).unwrap(),
     ) {
-        Ok(fd) => file_descriptors()
-            .write()
-            .insert(Descriptor::File(fd))
-            .try_into()
-            .unwrap(),
-        Err(err) => Errno::from(err).as_neg(),
+        Ok(fd) => fd,
+        Err(err) => err.as_neg(),
     }
 }
 
 /// Closes the file
 pub extern "C" fn close(fd: i32) -> i32 {
-    let Ok(fd) = u32::try_from(fd) else {
-        return Errno::EBADF.as_neg();
-    };
-    match file_descriptors().write().remove(fd) {
-        Some(Descriptor::File(file_fd)) => match litebox_fs().close(file_fd) {
-            Ok(()) => 0,
-            Err(err) => Errno::from(err).as_neg(),
-        },
-        Some(Descriptor::Socket(socket_fd)) => todo!(),
-        None => Errno::EBADF.as_neg(),
-    }
+    syscalls::file::sys_close(fd).map_or_else(Errno::as_neg, |()| 0)
 }

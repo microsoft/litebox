@@ -9,7 +9,7 @@ use crate::{
     ptr::{UserConstPtr, UserMutPtr},
 };
 
-#[allow(dead_code)]
+#[expect(dead_code, reason = "bindings are generated from C header files")]
 mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
