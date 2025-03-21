@@ -150,3 +150,28 @@ impl From<litebox::fs::errors::ReadError> for Errno {
         }
     }
 }
+
+impl From<litebox::platform::page_mgmt::AllocationError> for Errno {
+    fn from(value: litebox::platform::page_mgmt::AllocationError) -> Self {
+        match value {
+            litebox::platform::page_mgmt::AllocationError::Unaligned => Errno::EINVAL,
+            litebox::platform::page_mgmt::AllocationError::AlreadyAllocated => Errno::EINVAL,
+            litebox::platform::page_mgmt::AllocationError::OutOfMemory => Errno::ENOMEM,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::mm::linux::MappingError> for Errno {
+    fn from(value: litebox::mm::linux::MappingError) -> Self {
+        match value {
+            litebox::mm::linux::MappingError::MisAligned => Errno::EINVAL,
+            litebox::mm::linux::MappingError::OutOfMemory => Errno::ENOMEM,
+            litebox::mm::linux::MappingError::BadFD(_) => Errno::EBADF,
+            litebox::mm::linux::MappingError::NotAFile => Errno::EISDIR,
+            litebox::mm::linux::MappingError::NotForReading => Errno::EACCES,
+            litebox::mm::linux::MappingError::MapError(e) => e.into(),
+            _ => unimplemented!(),
+        }
+    }
+}

@@ -1,6 +1,6 @@
 //! ELF loader for LiteBox
 
-use core::{ffi::c_int, ptr::NonNull};
+use core::ptr::NonNull;
 
 use alloc::{collections::btree_map::BTreeMap, ffi::CString, string::ToString, vec::Vec};
 use elf_loader::{
@@ -12,12 +12,12 @@ use elf_loader::{
 use litebox::{
     fs::{Mode, OFlags},
     mm::linux::{MappingError, PAGE_SIZE},
-    platform::{RawConstPointer, RawMutPointer},
+    platform::RawConstPointer,
 };
 use litebox_common_linux::errno::Errno;
 use thiserror::Error;
 
-use crate::{MutPtr, litebox_page_manager};
+use crate::litebox_page_manager;
 
 use super::stack::{AuxKey, UserStack};
 
@@ -79,38 +79,6 @@ impl ElfObject for ElfFile {
 struct ElfLoaderMmap;
 
 impl ElfLoaderMmap {
-    const PROT_EXECUTABLE: c_int = ProtFlags::PROT_READ.bits() | ProtFlags::PROT_EXEC.bits();
-    const PROT_WRITABLE: c_int = ProtFlags::PROT_READ.bits() | ProtFlags::PROT_WRITE.bits();
-    const PROT_READABLE: c_int = ProtFlags::PROT_READ.bits();
-
-    fn do_mmap_common(
-        addr: Option<usize>,
-        len: usize,
-        prot: ProtFlags,
-        flags: MapFlags,
-        op: impl FnOnce(MutPtr<u8>) -> Result<usize, MappingError>,
-    ) -> elf_loader::Result<usize> {
-        let fixed_addr = flags.contains(MapFlags::MAP_FIXED);
-        let suggested_addr = addr.unwrap_or(0);
-        let pm = litebox_page_manager();
-        let res = match prot.bits() {
-            Self::PROT_EXECUTABLE => unsafe {
-                pm.create_executable_pages(suggested_addr, len, fixed_addr, op)
-            },
-            Self::PROT_WRITABLE => unsafe {
-                pm.create_writable_pages(suggested_addr, len, fixed_addr, op)
-            },
-            Self::PROT_READABLE => unsafe {
-                pm.create_readable_pages(suggested_addr, len, fixed_addr, op)
-            },
-            _ => todo!(),
-        };
-        match res {
-            Ok(addr) => Ok(addr.as_usize()),
-            Err(e) => Err(elf_loader::Error::MmapError { msg: e.to_string() }),
-        }
-    }
-
     fn do_mmap_file(
         addr: Option<usize>,
         len: usize,
@@ -123,20 +91,17 @@ impl ElfLoaderMmap {
         // Loader may rely on `mmap` instead of `mprotect` to change the memory protection,
         // in which case the file is copied multiple times. To reduce the overhead, we
         // could convert some `mmap` calls to `mprotect` calls whenever possible.
-        let op = |ptr: MutPtr<u8>| -> Result<usize, MappingError> {
-            ptr.mutate_subslice_with(..isize::try_from(len).unwrap(), |user_buf| {
-                // Loader code always runs before the program starts, so we can ensure
-                // user_buf is valid (e.g., won't be unmapped).
-                crate::syscalls::file::sys_read(fd, user_buf, Some(offset)).map_err(|e| match e {
-                    Errno::EBADF => MappingError::BadFD(fd),
-                    Errno::EISDIR => MappingError::NotAFile,
-                    Errno::EACCES => MappingError::NotForReading,
-                    _ => unimplemented!(),
-                })
-            })
-            .unwrap()
-        };
-        Self::do_mmap_common(addr, len, prot, flags, op)
+        match crate::syscalls::mm::sys_mmap(
+            addr.unwrap_or(0),
+            len,
+            prot.bits(),
+            flags.bits(),
+            fd,
+            offset,
+        ) {
+            Ok(addr) => Ok(addr.as_usize()),
+            Err(e) => Err(elf_loader::Error::MmapError { msg: e.to_string() }),
+        }
     }
 
     fn do_mmap_anonymous(
@@ -145,8 +110,17 @@ impl ElfLoaderMmap {
         prot: ProtFlags,
         flags: MapFlags,
     ) -> elf_loader::Result<usize> {
-        let op = |_| Ok(0);
-        Self::do_mmap_common(addr, len, prot, flags, op)
+        match crate::syscalls::mm::sys_mmap(
+            addr.unwrap_or(0),
+            len,
+            prot.bits(),
+            flags.bits() | MapFlags::MAP_ANONYMOUS.bits(),
+            -1,
+            0,
+        ) {
+            Ok(addr) => Ok(addr.as_usize()),
+            Err(e) => Err(elf_loader::Error::MmapError { msg: e.to_string() }),
+        }
     }
 }
 
@@ -279,7 +253,7 @@ impl ElfLoader {
 }
 
 #[derive(Error, Debug)]
-pub(super) enum ElfLoaderError {
+pub enum ElfLoaderError {
     #[error("failed to open the ELF file: {0}")]
     OpenError(#[from] Errno),
     #[error("failed to load the ELF file: {0}")]
@@ -293,137 +267,11 @@ pub(super) enum ElfLoaderError {
 impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
     fn from(value: ElfLoaderError) -> Self {
         match value {
-            ElfLoaderError::OpenError(e) => e.into(),
+            ElfLoaderError::OpenError(e) => e,
             ElfLoaderError::LoaderError(_) => litebox_common_linux::errno::Errno::EINVAL,
-            ElfLoaderError::InvalidStackAddr => litebox_common_linux::errno::Errno::ENOMEM,
-            ElfLoaderError::MappingError(_) => litebox_common_linux::errno::Errno::ENOMEM,
+            ElfLoaderError::InvalidStackAddr | ElfLoaderError::MappingError(_) => {
+                litebox_common_linux::errno::Errno::ENOMEM
+            }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use core::{arch::global_asm, str::FromStr as _};
-
-    use alloc::{ffi::CString, vec};
-    use litebox::{
-        fs::{FileSystem as _, Mode, OFlags},
-        platform::trivial_providers::ImpossiblePunchthroughProvider,
-    };
-    use litebox_platform_multiplex::{Platform, set_platform};
-
-    use crate::{litebox_fs, set_fs};
-
-    extern crate std;
-
-    global_asm!(
-        "
-        .text
-        .align	4
-        .globl	trampoline
-        .type	trampoline,@function
-    trampoline:
-        xor rdx, rdx
-        mov	rsp, rsi
-        jmp	rdi
-        /* Should not reach. */
-        hlt"
-    );
-
-    unsafe extern "C" {
-        fn trampoline(entry: usize, sp: usize) -> !;
-    }
-
-    fn init_platform() {
-        let platform = unsafe { Platform::new_for_test(ImpossiblePunchthroughProvider {}) };
-        set_platform(platform);
-
-        let mut in_mem_fs =
-            litebox::fs::in_mem::FileSystem::new(litebox_platform_multiplex::platform());
-        in_mem_fs.with_root_privileges(|fs| {
-            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to set permissions on root");
-        });
-        set_fs(in_mem_fs);
-    }
-
-    fn compile(output: &std::path::Path, exec_or_lib: bool) {
-        // Compile the hello.c file to an executable
-        let mut args = vec!["-o", output.to_str().unwrap(), "./tests/hello.c"];
-        if exec_or_lib {
-            args.push("-static");
-        }
-        let output = std::process::Command::new("gcc")
-            .args(args)
-            .output()
-            .expect("Failed to compile hello.c");
-        assert!(
-            output.status.success(),
-            "failed to compile hello.c {:?}",
-            output.stderr
-        );
-    }
-
-    fn install_dir(path: &str) {
-        litebox_fs()
-            .mkdir(path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
-            .expect("Failed to create directory");
-    }
-
-    fn install_file(path: &std::path::PathBuf, out: &str) {
-        let fd = litebox_fs()
-            .open(
-                out,
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXG | Mode::RWXO | Mode::RWXU,
-            )
-            .unwrap();
-        let contents = std::fs::read(path).unwrap();
-        litebox_fs().write(&fd, &contents, None).unwrap();
-        litebox_fs().close(fd).unwrap();
-    }
-
-    fn test_load_exec_common(executable_path: &str) {
-        let argv = vec![
-            CString::new(executable_path).unwrap(),
-            CString::new("hello").unwrap(),
-        ];
-        let envp = vec![CString::new("PATH=/bin").unwrap()];
-        let info = super::ElfLoader::load(executable_path, argv, envp).unwrap();
-
-        unsafe { trampoline(info.entry_point, info.user_stack_top) };
-    }
-
-    #[test]
-    fn test_load_exec_dynamic() {
-        init_platform();
-
-        let path =
-            std::path::Path::new(std::env::var("OUT_DIR").unwrap().as_str()).join("hello_dylib");
-        compile(&path, false);
-
-        let executable_path = "/hello_dylib";
-        install_file(&path, executable_path);
-        install_dir("/lib64");
-        install_file(
-            &std::path::PathBuf::from_str("/lib64/ld-linux-x86-64.so.2").unwrap(),
-            "/lib64/ld-linux-x86-64.so.2",
-        );
-
-        test_load_exec_common(executable_path);
-    }
-
-    #[test]
-    fn test_load_exec_static() {
-        init_platform();
-
-        let path =
-            std::path::Path::new(std::env::var("OUT_DIR").unwrap().as_str()).join("hello_exec");
-        compile(&path, true);
-
-        let executable_path = "/hello_exec";
-        install_file(&path, executable_path);
-
-        test_load_exec_common(executable_path);
     }
 }

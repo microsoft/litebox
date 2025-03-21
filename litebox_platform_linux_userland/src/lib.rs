@@ -35,8 +35,12 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     /// # Panics
     ///
     /// Panics if the tun device could not be successfully opened.
-    pub fn new(tun_device_name: &str, punchthrough_provider: PunchthroughProvider) -> Self {
-        platform::init_sys_intercept();
+    pub fn new(
+        tun_device_name: &str,
+        punchthrough_provider: PunchthroughProvider,
+        handler: impl Fn(i64, &[usize]) -> i64 + Send + Sync + 'static,
+    ) -> Self {
+        platform::init_sys_intercept(handler);
 
         let tun_socket_fd = {
             let tun_fd = nix::fcntl::open(
@@ -87,8 +91,11 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     /// Due to [the lack of support](https://github.com/rust-lang/cargo/issues/8379) for
     /// `cfg(test)` across crates, we cannot use `#[cfg(test)]` here.
     #[cfg(feature = "unstable-testing")]
-    pub unsafe fn new_for_test(punchthrough_provider: PunchthroughProvider) -> Self {
-        platform::init_sys_intercept();
+    pub unsafe fn new_for_test(
+        punchthrough_provider: PunchthroughProvider,
+        handler: impl Fn(i64, &[usize]) -> i64 + Send + Sync + 'static,
+    ) -> Self {
+        platform::init_sys_intercept(handler);
 
         Self {
             tun_socket_fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(-2) },
@@ -487,9 +494,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         can_grow_down: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let ptr = unsafe {
-            platform::request_mmap(
-                range.start,
-                range.len(),
+            nix::sys::mman::mmap_anonymous(
+                Some(core::num::NonZeroUsize::new(range.start).expect("non null addr")),
+                core::num::NonZeroUsize::new(range.len()).expect("non zero len"),
                 prot_flags(initial_permissions),
                 nix::sys::mman::MapFlags::MAP_PRIVATE
                     | nix::sys::mman::MapFlags::MAP_ANONYMOUS
@@ -499,8 +506,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                     } else {
                         nix::sys::mman::MapFlags::empty()
                     }),
-                -1,
-                0,
             )
         }
         .expect("mmap failed");

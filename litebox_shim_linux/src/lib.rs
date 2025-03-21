@@ -35,7 +35,7 @@ static FS: OnceBox<litebox::fs::in_mem::FileSystem<Platform>> = OnceBox::new();
 /// # Panics
 ///
 /// Panics if this is called more than once or `litebox_fs` is called before this
-#[cfg(test)]
+#[cfg(feature = "unstable-testing")]
 pub fn set_fs(fs: litebox::fs::in_mem::FileSystem<'static, Platform>) {
     FS.set(alloc::boxed::Box::new(fs))
         .map_err(|_| {})
@@ -212,4 +212,8 @@ pub unsafe extern "C" fn open(pathname: ConstPtr<i8>, flags: u32, mode: u32) -> 
 /// Closes the file
 pub extern "C" fn close(fd: i32) -> i32 {
     syscalls::file::sys_close(fd).map_or_else(Errno::as_neg, |()| 0)
+}
+
+pub fn syscall_entry(sysno: i64, args: &[usize]) -> i64 {
+    unimplemented!()
 }
