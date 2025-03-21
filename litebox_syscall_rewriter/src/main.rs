@@ -87,11 +87,8 @@ fn rewrite_elf(in_path: &Path) -> Result<()> {
     let file_kind =
         object::FileKind::parse(in_data).with_context(|| "Failed to parse file kind")?;
     let arch_mode = match file_kind {
-        object::FileKind::Elf32 => capstone::arch::x86::ArchMode::Mode32,
         object::FileKind::Elf64 => capstone::arch::x86::ArchMode::Mode64,
-        _ => {
-            return Err(anyhow::anyhow!("Unsupported file format"));
-        }
+        _ => anyhow::bail!("Unsupported file format"),
     };
 
     let mut builder = elf::Builder::read(in_data)?;
