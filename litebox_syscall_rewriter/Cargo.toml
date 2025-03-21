@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 capstone = { version = "0.13", features = ["full"] }
-object = { version = "0.36.7", features = ["build"] }
+object = { version = "0.36.7", default-features = false, features = ["build_core", "elf", "std"] }
 anyhow = "1.0"
 memmap2 = "0.9"
 
