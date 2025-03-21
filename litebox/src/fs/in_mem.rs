@@ -398,26 +398,48 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
-        let (file_type, perms) = match entry {
-            Entry::File(file) => (super::FileType::RegularFile, file.read().perms.clone()),
-            Entry::Dir(dir) => (super::FileType::Directory, dir.read().perms.clone()),
+        let (file_type, perms, size) = match entry {
+            Entry::File(file) => {
+                let file = file.read();
+                (
+                    super::FileType::RegularFile,
+                    file.perms.clone(),
+                    file.data.len(),
+                )
+            }
+            Entry::Dir(dir) => (
+                super::FileType::Directory,
+                dir.read().perms.clone(),
+                super::DEFAULT_DIRECTORY_SIZE,
+            ),
         };
         Ok(FileStatus {
             file_type,
             mode: perms.mode,
+            size,
         })
     }
 
     fn fd_file_status(&self, fd: &FileFd) -> Result<FileStatus, FileStatusError> {
-        let (file_type, perms) = match self.descriptors.read().get(fd) {
+        let (file_type, perms, size) = match self.descriptors.read().get(fd) {
             Descriptor::File { file, .. } => {
-                (super::FileType::RegularFile, file.read().perms.clone())
+                let file = file.read();
+                (
+                    super::FileType::RegularFile,
+                    file.perms.clone(),
+                    file.data.len(),
+                )
             }
-            Descriptor::Dir { dir } => (super::FileType::Directory, dir.read().perms.clone()),
+            Descriptor::Dir { dir } => (
+                super::FileType::Directory,
+                dir.read().perms.clone(),
+                super::DEFAULT_DIRECTORY_SIZE,
+            ),
         };
         Ok(FileStatus {
             file_type,
             mode: perms.mode,
+            size,
         })
     }
 }

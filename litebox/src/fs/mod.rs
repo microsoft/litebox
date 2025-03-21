@@ -200,6 +200,13 @@ pub enum SeekWhence {
 /// layout of this particular type.
 #[non_exhaustive]
 pub struct FileStatus {
+    /// File type
     pub file_type: FileType,
+    /// Permissions for the file
     pub mode: Mode,
+    /// Size of the file, in bytes. This value considered informative if this is a regular file.
+    pub size: usize,
 }
+
+/// The size reported as the size of a directory.
+const DEFAULT_DIRECTORY_SIZE: usize = 4096;

@@ -730,18 +730,36 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         // inodes and such.
         let path = self.absolute_path(path)?;
         if let Some(entry) = self.root.read().entries.get(&path) {
-            let FileStatus { file_type, mode } = match entry.as_ref() {
+            let FileStatus {
+                file_type,
+                mode,
+                size,
+            } = match entry.as_ref() {
                 EntryX::Upper { fd } => self.upper.fd_file_status(fd)?,
                 EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
                 EntryX::Tombstone => {
                     return Err(PathError::NoSuchFileOrDirectory)?;
                 }
             };
-            return Ok(FileStatus { file_type, mode });
+            return Ok(FileStatus {
+                file_type,
+                mode,
+                size,
+            });
         };
         // The file is not open, we must look at the levels themselves.
         match self.upper.file_status(&*path) {
-            Ok(FileStatus { file_type, mode }) => return Ok(FileStatus { file_type, mode }),
+            Ok(FileStatus {
+                file_type,
+                mode,
+                size,
+            }) => {
+                return Ok(FileStatus {
+                    file_type,
+                    mode,
+                    size,
+                });
+            }
             Err(e) => match e {
                 FileStatusError::PathError(
                     PathError::ComponentNotADirectory
@@ -758,21 +776,37 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 }
             },
         };
-        let FileStatus { file_type, mode } = self.lower.file_status(path)?;
-        Ok(FileStatus { file_type, mode })
+        let FileStatus {
+            file_type,
+            mode,
+            size,
+        } = self.lower.file_status(path)?;
+        Ok(FileStatus {
+            file_type,
+            mode,
+            size,
+        })
     }
 
     fn fd_file_status(&self, fd: &FileFd) -> Result<FileStatus, FileStatusError> {
         let descriptors = self.descriptors.read();
         let descriptor = descriptors.get(fd);
-        let FileStatus { file_type, mode } = match descriptor.entry.as_ref() {
+        let FileStatus {
+            file_type,
+            mode,
+            size,
+        } = match descriptor.entry.as_ref() {
             EntryX::Upper { fd } => self.upper.fd_file_status(fd)?,
             EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
             EntryX::Tombstone => unreachable!(),
         };
         // Note: we grab the info and then immediately spit back the same, essentially to ask the
         // compiler to remind us we need to update this when we support inodes and such.
-        Ok(FileStatus { file_type, mode })
+        Ok(FileStatus {
+            file_type,
+            mode,
+            size,
+        })
     }
 }
 

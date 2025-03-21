@@ -276,10 +276,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             Some(p) if p.filename().as_str().unwrap() != path => Ok(super::FileStatus {
                 file_type: super::FileType::Directory,
                 mode: DEFAULT_DIR_MODE,
+                size: super::DEFAULT_DIRECTORY_SIZE,
             }),
             Some(p) => Ok(super::FileStatus {
                 file_type: super::FileType::RegularFile,
                 mode: mode_of_modeflags(p.posix_header().mode.to_flags().unwrap()),
+                size: p.size(),
             }),
         }
     }
@@ -289,22 +291,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         fd: &crate::fd::FileFd,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         match self.descriptors.read().get(fd) {
-            Descriptor::File { idx, .. } => Ok(super::FileStatus {
-                file_type: super::FileType::RegularFile,
-                mode: mode_of_modeflags(
-                    self.tar_data
-                        .entries()
-                        .nth(*idx)
-                        .unwrap()
-                        .posix_header()
-                        .mode
-                        .to_flags()
-                        .unwrap(),
-                ),
-            }),
+            Descriptor::File { idx, .. } => {
+                let entry = self.tar_data.entries().nth(*idx).unwrap();
+                Ok(super::FileStatus {
+                    file_type: super::FileType::RegularFile,
+                    mode: mode_of_modeflags(entry.posix_header().mode.to_flags().unwrap()),
+                    size: entry.size(),
+                })
+            }
             Descriptor::Dir { .. } => Ok(super::FileStatus {
                 file_type: super::FileType::Directory,
                 mode: DEFAULT_DIR_MODE,
+                size: super::DEFAULT_DIRECTORY_SIZE,
             }),
         }
     }
