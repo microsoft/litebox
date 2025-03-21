@@ -111,6 +111,8 @@ extern "C" fn sigsys_handler(sig: c_int, info: *mut libc::siginfo_t, context: *m
         *stack_pointer -= 8;
         *(*stack_pointer as *mut usize) = addr as usize;
 
+        // TODO: hotpatch the syscall instruction to jump to the `sigsys_callback`
+        // to avoid traps again.
         let rip = &mut ucontext.uc_mcontext.gregs[libc::REG_RIP as usize];
         // Set the instruction pointer to the syscall dispatcher
         *rip = i64::try_from(sigsys_callback as usize).unwrap();
