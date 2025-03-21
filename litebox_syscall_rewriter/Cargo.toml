@@ -4,10 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-capstone = { version = "0.13", features = ["full"] }
-object = { version = "0.36.7", default-features = false, features = ["build_core", "elf", "std"] }
 anyhow = "1.0"
+capstone = { version = "0.13.0", default-features = false }
+clap = { version = "4.5.32", features = ["derive"] }
 memmap2 = "0.9"
+object = { version = "0.36.7", default-features = false, features = ["elf", "build", "std"] }
+thiserror = { version = "2.0.6", default-features = false }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+insta = "1.42.2"
+similar = "2.7.0"
+tempfile = "3.19.1"
