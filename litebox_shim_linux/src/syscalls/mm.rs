@@ -89,18 +89,38 @@ fn do_mmap_file(
 ) -> Result<MutPtr<u8>, MappingError> {
     let fixed_addr = flags.contains(MapFlags::MAP_FIXED);
     let op = |ptr: MutPtr<u8>| -> Result<usize, MappingError> {
-        // FIXME: ptr may be unmaped
-        ptr.mutate_subslice_with(..isize::try_from(len).unwrap(), |user_buf| {
-            // Loader code always runs before the program starts, so we can ensure
-            // user_buf is valid (e.g., won't be unmapped).
-            crate::syscalls::file::sys_read(fd, user_buf, Some(offset)).map_err(|e| match e {
-                Errno::EBADF => MappingError::BadFD(fd),
-                Errno::EISDIR => MappingError::NotAFile,
-                Errno::EACCES => MappingError::NotForReading,
-                _ => unimplemented!(),
-            })
-        })
-        .unwrap()
+        // Note a malicious user may unmap ptr while we are reading.
+        // `sys_read` does not handle page faults, so we need to use a
+        // temporary buffer to read the data from fs (without worrying page
+        // faults) and write it to the user buffer with page fault handling.
+        let mut file_offset = offset;
+        let mut buffer = [0; PAGE_SIZE];
+        let mut copied = 0;
+        while copied < len {
+            let size = crate::syscalls::file::sys_read(fd, &mut buffer, Some(file_offset))
+                .map_err(|e| match e {
+                    Errno::EBADF => MappingError::BadFD(fd),
+                    Errno::EISDIR => MappingError::NotAFile,
+                    Errno::EACCES => MappingError::NotForReading,
+                    _ => unimplemented!(),
+                })?;
+            if size == 0 {
+                break;
+            }
+            let start = isize::try_from(copied).unwrap();
+            ptr.mutate_subslice_with(
+                start..start.checked_add_unsigned(size).unwrap(),
+                |user_buf| {
+                    // TODO: implement [`memcpy`](https://elixir.bootlin.com/linux/v5.19.17/source/arch/x86/lib/memcpy_64.S#L30)
+                    // to return EFAULT if the user buffer is not valid
+                    user_buf.copy_from_slice(&buffer[..size]);
+                },
+            )
+            .unwrap();
+            copied += size;
+            file_offset += size;
+        }
+        Ok(copied)
     };
     do_mmap(suggested_addr, len, prot, flags, op)
 }
@@ -128,7 +148,6 @@ pub(crate) fn sys_mmap(
     let flags = MapFlags::from_bits(flags).expect("Unsupported flags");
     let aligned_len = align_up(len, PAGE_SIZE);
     if aligned_len == 0 {
-        // overflow
         return Err(Errno::ENOMEM);
     }
     if offset.checked_add(aligned_len).is_none() {

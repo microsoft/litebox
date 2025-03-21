@@ -1,3 +1,5 @@
+//! The systrap platform relies on seccomp’s `SECCOMP_RET_TRAP` feature to intercept system calls.
+
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use std::os::raw::{c_int, c_uint};
 use std::{arch::global_asm, sync::OnceLock};
@@ -148,6 +150,10 @@ fn register_seccomp_filter() {
     seccompiler::apply_filter(&bpf_prog).unwrap();
 }
 
+/// Initialize the syscall interception mechanism.
+///
+/// This function sets up the syscall handler and registers seccomp
+/// filters and the SIGSYS signal handler.
 pub(crate) fn init_sys_intercept(handler: impl Fn(i64, &[usize]) -> i64 + Send + Sync + 'static) {
     #[allow(
         clippy::match_wild_err_arm,
@@ -162,6 +168,8 @@ pub(crate) fn init_sys_intercept(handler: impl Fn(i64, &[usize]) -> i64 + Send +
 
     register_sigsys_handler();
 
+    // Cargo unit test does not forward signals to tests.
+    // Use integration tests to test it.
     #[cfg(not(test))]
     register_seccomp_filter();
 }

@@ -31,6 +31,8 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     /// Create a new userland-Linux platform for use in `LiteBox`.
     ///
     /// Takes a tun device name (such as `"tun0"` or `"tun99"`) to connect networking.
+    /// Registers `sys_handler` to handle all intercepted syscalls. See `platform::systrap::syscall_dispatcher`
+    /// for details.
     ///
     /// # Panics
     ///
@@ -38,9 +40,9 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     pub fn new(
         tun_device_name: &str,
         punchthrough_provider: PunchthroughProvider,
-        handler: impl Fn(i64, &[usize]) -> i64 + Send + Sync + 'static,
+        sys_handler: impl Fn(i64, &[usize]) -> i64 + Send + Sync + 'static,
     ) -> Self {
-        platform::init_sys_intercept(handler);
+        platform::init_sys_intercept(sys_handler);
 
         let tun_socket_fd = {
             let tun_fd = nix::fcntl::open(
@@ -93,9 +95,9 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     #[cfg(feature = "unstable-testing")]
     pub unsafe fn new_for_test(
         punchthrough_provider: PunchthroughProvider,
-        handler: impl Fn(i64, &[usize]) -> i64 + Send + Sync + 'static,
+        sys_handler: impl Fn(i64, &[usize]) -> i64 + Send + Sync + 'static,
     ) -> Self {
-        platform::init_sys_intercept(handler);
+        platform::init_sys_intercept(sys_handler);
 
         Self {
             tun_socket_fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(-2) },
