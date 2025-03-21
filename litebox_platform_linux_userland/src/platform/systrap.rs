@@ -4,16 +4,17 @@ use std::{arch::global_asm, sync::OnceLock};
 
 // Define a custom structure to reinterpret siginfo_t
 #[repr(C)]
-struct CustomSiginfo {
-    si_signo: c_int,
-    si_errno: c_int,
-    si_code: c_int,
-    si_call_addr: *mut libc::c_void,
-    si_syscall: c_int,
-    si_arch: c_uint,
+struct SyscallSiginfo {
+    signo: c_int,
+    errno: c_int,
+    code: c_int,
+    call_addr: *mut libc::c_void,
+    syscall: c_int,
+    arch: c_uint,
 }
 
-static SYSCALL_HANDLER: OnceLock<Box<dyn Fn(i64, &[usize]) -> i64 + Send + Sync>> = OnceLock::new();
+type SysHandler = dyn Fn(i64, &[usize]) -> i64 + Send + Sync;
+static SYSCALL_HANDLER: OnceLock<Box<SysHandler>> = OnceLock::new();
 
 global_asm!(
     "
@@ -90,10 +91,9 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
 extern "C" fn sigsys_handler(sig: c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
     unsafe {
         assert!(sig == libc::SIGSYS);
-        // Reinterpret the siginfo_t pointer as a CustomSiginfo pointer
-        let custom_info = &*(info as *const CustomSiginfo);
-        let syscall_number = custom_info.si_syscall;
-        let addr = custom_info.si_call_addr;
+        let custom_info = &*info.cast::<SyscallSiginfo>();
+        let syscall_number = custom_info.syscall;
+        let addr = custom_info.call_addr;
         eprintln!("Caught SIGSYS: syscall={syscall_number} addr={addr:?}");
 
         // Ensure the address is valid
@@ -103,15 +103,15 @@ extern "C" fn sigsys_handler(sig: c_int, info: *mut libc::siginfo_t, context: *m
         }
 
         // Get the instruction pointer (RIP) from the context
-        let ucontext = &mut *(context as *mut libc::ucontext_t);
-        let rsp = &mut ucontext.uc_mcontext.gregs[libc::REG_RSP as usize];
+        let ucontext = &mut *(context.cast::<libc::ucontext_t>());
+        let stack_pointer = &mut ucontext.uc_mcontext.gregs[libc::REG_RSP as usize];
         // push the return address onto the stack
-        *rsp -= 8;
-        *(*rsp as *mut usize) = addr as usize;
+        *stack_pointer -= 8;
+        *(*stack_pointer as *mut usize) = addr as usize;
 
         let rip = &mut ucontext.uc_mcontext.gregs[libc::REG_RIP as usize];
         // Set the instruction pointer to the syscall dispatcher
-        *rip = sigsys_callback as usize as i64;
+        *rip = i64::try_from(sigsys_callback as usize).unwrap();
     }
 }
 
@@ -149,6 +149,10 @@ fn register_seccomp_filter() {
 }
 
 pub(crate) fn init_sys_intercept(handler: impl Fn(i64, &[usize]) -> i64 + Send + Sync + 'static) {
+    #[allow(
+        clippy::match_wild_err_arm,
+        reason = "Debug is not implemented for the type"
+    )]
     match SYSCALL_HANDLER.set(Box::new(handler)) {
         Ok(()) => {}
         Err(_) => {
