@@ -4,7 +4,7 @@ use object::build::elf;
 use std::{env, fs, path::Path};
 
 fn hook_syscalls(
-    text_data: &mut Vec<u8>,
+    text_data: &mut [u8],
     text_addr: u64,
     trampoline_data: &mut Vec<u8>,
     trampoline_addr: u64,
@@ -16,7 +16,7 @@ fn hook_syscalls(
         .mode(arch_mode)
         .syntax(capstone::arch::x86::ArchSyntax::Intel)
         .build()?;
-    let instructions = cs.disasm_all(text_data.as_slice(), text_addr)?;
+    let instructions = cs.disasm_all(text_data, text_addr)?;
 
     for (i, inst) in instructions.iter().enumerate() {
         if inst.mnemonic().unwrap_or_default() == "syscall" {
