@@ -132,13 +132,53 @@ fn register_sigsys_handler() {
 fn register_seccomp_filter() {
     use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
 
-    let rule_map = std::collections::BTreeMap::<i64, Vec<SeccompRule>>::new();
+    // allow list
+    // TODO: remove syscalls once they are implemented in the shim
+    let rules = vec![
+        (libc::SYS_read, vec![]),
+        (libc::SYS_write, vec![]),
+        (libc::SYS_mmap, vec![]),
+        (libc::SYS_close, vec![]),
+        (libc::SYS_lseek, vec![]),
+        (libc::SYS_mprotect, vec![]),
+        (libc::SYS_munmap, vec![]),
+        (libc::SYS_brk, vec![]),
+        (libc::SYS_rt_sigprocmask, vec![]),
+        (libc::SYS_rt_sigreturn, vec![]),
+        (libc::SYS_pread64, vec![]),
+        (libc::SYS_writev, vec![]),
+        (libc::SYS_access, vec![]),
+        (libc::SYS_sched_yield, vec![]),
+        (libc::SYS_getpid, vec![]),
+        (libc::SYS_uname, vec![]),
+        (libc::SYS_getcwd, vec![]),
+        (libc::SYS_readlink, vec![]),
+        (libc::SYS_getuid, vec![]),
+        (libc::SYS_getgid, vec![]),
+        (libc::SYS_geteuid, vec![]),
+        (libc::SYS_getegid, vec![]),
+        (libc::SYS_sigaltstack, vec![]),
+        (libc::SYS_arch_prctl, vec![]),
+        (libc::SYS_gettid, vec![]),
+        (libc::SYS_futex, vec![]),
+        (libc::SYS_set_tid_address, vec![]),
+        (libc::SYS_exit_group, vec![]),
+        (libc::SYS_tgkill, vec![]),
+        (libc::SYS_openat, vec![]),
+        (libc::SYS_newfstatat, vec![]),
+        (libc::SYS_set_robust_list, vec![]),
+        (libc::SYS_prlimit64, vec![]),
+        (libc::SYS_getrandom, vec![]),
+        (libc::SYS_statx, vec![]),
+        (libc::SYS_rseq, vec![]),
+    ];
+    let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> = rules.into_iter().collect();
 
     // TODO: switch to allow list and implement necessary syscalls
     let filter = SeccompFilter::new(
         rule_map,
-        SeccompAction::Allow,
         SeccompAction::Trap,
+        SeccompAction::Allow,
         seccompiler::TargetArch::x86_64,
     )
     .unwrap();
