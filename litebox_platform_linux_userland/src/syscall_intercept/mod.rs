@@ -2,4 +2,4 @@
 
 mod systrap;
 
-pub(crate) use systrap::*;
+pub(crate) use systrap::init_sys_intercept;

@@ -15,8 +15,8 @@ struct SyscallSiginfo {
     arch: c_uint,
 }
 
-type SysHandler = dyn Fn(i64, &[usize]) -> i64 + Send + Sync;
-static SYSCALL_HANDLER: OnceLock<Box<SysHandler>> = OnceLock::new();
+type SyscallHandler = dyn Fn(i64, &[usize]) -> i64 + Send + Sync;
+static SYSCALL_HANDLER: OnceLock<Box<SyscallHandler>> = OnceLock::new();
 
 global_asm!(
     "
@@ -94,17 +94,14 @@ extern "C" fn sigsys_handler(sig: c_int, info: *mut libc::siginfo_t, context: *m
     unsafe {
         assert!(sig == libc::SIGSYS);
         let custom_info = &*info.cast::<SyscallSiginfo>();
-        let syscall_number = custom_info.syscall;
         let addr = custom_info.call_addr;
-        eprintln!("Caught SIGSYS: syscall={syscall_number} addr={addr:?}");
 
         // Ensure the address is valid
         if addr.is_null() {
-            eprintln!("Invalid syscall address");
-            panic!();
+            std::process::abort();
         }
 
-        // Get the instruction pointer (RIP) from the context
+        // Get the stack pointer (RSP) from the context
         let ucontext = &mut *(context.cast::<libc::ucontext_t>());
         let stack_pointer = &mut ucontext.uc_mcontext.gregs[libc::REG_RSP as usize];
         // push the return address onto the stack
@@ -135,8 +132,7 @@ fn register_sigsys_handler() {
 fn register_seccomp_filter() {
     use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
 
-    let rules = vec![];
-    let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> = rules.into_iter().collect();
+    let rule_map = std::collections::BTreeMap::<i64, Vec<SeccompRule>>::new();
 
     // TODO: switch to allow list and implement necessary syscalls
     let filter = SeccompFilter::new(

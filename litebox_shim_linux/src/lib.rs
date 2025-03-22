@@ -215,5 +215,5 @@ pub extern "C" fn close(fd: i32) -> i32 {
 }
 
 pub fn syscall_entry(sysno: i64, args: &[usize]) -> i64 {
-    unimplemented!()
+    todo!()
 }
