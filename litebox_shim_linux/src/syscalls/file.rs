@@ -25,6 +25,19 @@ pub(crate) fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Resul
         .map_err(Errno::from)
 }
 
+const AT_FDCWD: i32 = -100;
+pub(crate) fn sys_openat(
+    dirfd: i32,
+    pathname: impl path::Arg,
+    flags: OFlags,
+    mode: Mode,
+) -> Result<i32, Errno> {
+    if dirfd == AT_FDCWD {
+        return sys_open(pathname, flags, mode);
+    }
+    todo!("openat");
+}
+
 /// Read from a file
 ///
 /// `offset` is an optional offset to read from. If `None`, it will read from the current file position.
@@ -37,6 +50,14 @@ pub(crate) fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result
         Some(file) => litebox_fs().read(file, buf, offset).map_err(Errno::from),
         None => Err(Errno::EBADF),
     }
+}
+
+pub(crate) fn sys_pread64(fd: i32, buf: &mut [u8], offset: i64) -> Result<usize, Errno> {
+    if offset < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let offset = usize::try_from(offset).unwrap();
+    sys_read(fd, buf, Some(offset))
 }
 
 /// Close a file

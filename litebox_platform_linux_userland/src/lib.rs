@@ -41,7 +41,10 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     pub fn new(
         tun_device_name: Option<&str>,
         punchthrough_provider: PunchthroughProvider,
-        syscall_handler: impl Fn(i64, &[usize]) -> i64 + Send + Sync + 'static,
+        syscall_handler: impl Fn(litebox_common_linux::SyscallRequest<LinuxUserland>) -> i64
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         // TODO: have better signature and registration of the syscall handler.
         syscall_intercept::init_sys_intercept(syscall_handler);
