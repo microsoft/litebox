@@ -217,14 +217,15 @@ pub extern "C" fn close(fd: i32) -> i32 {
 const SYS_MMAP: i64 = 9;
 const SYS_OPENAT: i64 = 257;
 
-pub fn syscall_entry(dispatcher: SyscallRequest<Platform>) -> isize {
-    match dispatcher {
+/// Entry point for the syscall handler
+pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
+    match request {
         SyscallRequest::Read(fd, buf, count) => {
             let Ok(count) = isize::try_from(count) else {
                 return Errno::EINVAL.as_neg() as isize;
             };
             buf.mutate_subslice_with(..count, |user_buf| {
-                // TODO: user kernel buffer
+                // TODO: user kernel buffer to avoid page faults
                 syscalls::file::sys_read(fd, user_buf, None).map_or_else(
                     |e| e.as_neg() as isize,
                     #[allow(clippy::cast_possible_wrap)]
@@ -241,7 +242,7 @@ pub fn syscall_entry(dispatcher: SyscallRequest<Platform>) -> isize {
                 return Errno::EINVAL.as_neg() as isize;
             };
             buf.mutate_subslice_with(..count, |user_buf| {
-                // TODO: user kernel buffer
+                // TODO: user kernel buffer to avoid page faults
                 syscalls::file::sys_pread64(fd, user_buf, off).map_or_else(
                     |e| e.as_neg() as isize,
                     #[allow(clippy::cast_possible_wrap)]
