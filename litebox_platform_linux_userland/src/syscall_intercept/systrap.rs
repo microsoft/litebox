@@ -247,6 +247,7 @@ fn register_seccomp_filter() {
         (libc::SYS_exit_group, vec![]),
         (libc::SYS_tgkill, vec![]),
         (libc::SYS_newfstatat, vec![]),
+        (libc::SYS_readlinkat, vec![]),
         (libc::SYS_set_robust_list, vec![]),
         (libc::SYS_prlimit64, vec![]),
         (libc::SYS_getrandom, vec![]),
