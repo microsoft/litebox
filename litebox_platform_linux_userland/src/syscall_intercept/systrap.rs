@@ -96,11 +96,7 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize) -> isize {
     let syscall_args = unsafe { std::slice::from_raw_parts(args, 6) };
-    std::eprintln!(
-        "syscall_dispatcher: syscall_number={} args={:?}",
-        syscall_number,
-        syscall_args
-    );
+    std::eprintln!("syscall_dispatcher: syscall_number={syscall_number} args={syscall_args:?}",);
     let dispatcher = match syscall_number {
         libc::SYS_read => SyscallRequest::Read(
             syscall_args[0] as i32,
