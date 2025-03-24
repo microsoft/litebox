@@ -207,6 +207,7 @@ fn register_seccomp_filter() {
                 .unwrap(),
             ],
         ),
+        (libc::SYS_fstat, vec![]),
         (libc::SYS_mprotect, vec![]),
         (libc::SYS_munmap, vec![]),
         (libc::SYS_brk, vec![]),
