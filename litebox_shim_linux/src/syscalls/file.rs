@@ -52,11 +52,10 @@ pub(crate) fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result
     }
 }
 
-pub(crate) fn sys_pread64(fd: i32, buf: &mut [u8], offset: i64) -> Result<usize, Errno> {
-    if offset < 0 {
+pub(crate) fn sys_pread64(fd: i32, buf: &mut [u8], offset: usize) -> Result<usize, Errno> {
+    if offset > isize::MAX as usize {
         return Err(Errno::EINVAL);
     }
-    let offset = usize::try_from(offset).unwrap();
     sys_read(fd, buf, Some(offset))
 }
 

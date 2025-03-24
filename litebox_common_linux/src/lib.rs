@@ -44,7 +44,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Read(i32, Platform::RawMutPointer<u8>, usize),
     Close(i32),
     Mmap(usize, usize, ProtFlags, MapFlags, i32, usize),
-    Pread64(i32, Platform::RawMutPointer<u8>, usize, i64),
+    Pread64(i32, Platform::RawMutPointer<u8>, usize, usize),
     Openat(
         i32,
         Platform::RawConstPointer<i8>,

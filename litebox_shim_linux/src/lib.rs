@@ -217,51 +217,55 @@ pub extern "C" fn close(fd: i32) -> i32 {
 const SYS_MMAP: i64 = 9;
 const SYS_OPENAT: i64 = 257;
 
-pub fn syscall_entry(dispatcher: SyscallRequest<Platform>) -> i64 {
-    extern crate std;
-    let ret = match dispatcher {
+pub fn syscall_entry(dispatcher: SyscallRequest<Platform>) -> isize {
+    match dispatcher {
         SyscallRequest::Read(fd, buf, count) => {
-            buf.mutate_subslice_with(..count as isize, |user_buf| {
+            let Ok(count) = isize::try_from(count) else {
+                return Errno::EINVAL.as_neg() as isize;
+            };
+            buf.mutate_subslice_with(..count, |user_buf| {
                 // TODO: user kernel buffer
-                syscalls::file::sys_read(fd, user_buf, None)
-                    .map_or_else(|e| e.as_neg() as i64, |size| size as i64)
+                syscalls::file::sys_read(fd, user_buf, None).map_or_else(
+                    |e| e.as_neg() as isize,
+                    #[allow(clippy::cast_possible_wrap)]
+                    |size| size as isize,
+                )
             })
-            .unwrap_or(Errno::EFAULT.as_neg() as i64)
+            .unwrap_or(Errno::EFAULT.as_neg() as isize)
         }
         SyscallRequest::Close(fd) => {
-            syscalls::file::sys_close(fd).map_or_else(Errno::as_neg, |_| 0) as i64
+            syscalls::file::sys_close(fd).map_or_else(Errno::as_neg, |()| 0) as isize
         }
         SyscallRequest::Pread64(fd, buf, count, off) => {
-            buf.mutate_subslice_with(..count as isize, |user_buf| {
+            let Ok(count) = isize::try_from(count) else {
+                return Errno::EINVAL.as_neg() as isize;
+            };
+            buf.mutate_subslice_with(..count, |user_buf| {
                 // TODO: user kernel buffer
-                syscalls::file::sys_pread64(fd, user_buf, off)
-                    .map_or_else(|e| e.as_neg() as i64, |size| size as i64)
+                syscalls::file::sys_pread64(fd, user_buf, off).map_or_else(
+                    |e| e.as_neg() as isize,
+                    #[allow(clippy::cast_possible_wrap)]
+                    |size| size as isize,
+                )
             })
-            .unwrap_or(Errno::EFAULT.as_neg() as i64)
+            .unwrap_or(Errno::EFAULT.as_neg() as isize)
         }
         SyscallRequest::Mmap(addr, len, prot, flags, fd, offset) => {
-            syscalls::mm::sys_mmap(addr, len, prot, flags, fd, offset)
-                .map_or_else(|e| e.as_neg() as i64, |ptr| ptr.as_usize() as i64)
+            syscalls::mm::sys_mmap(addr, len, prot, flags, fd, offset).map_or_else(
+                |e| e.as_neg() as isize,
+                #[allow(clippy::cast_possible_wrap)]
+                |ptr| ptr.as_usize() as isize,
+            )
         }
         SyscallRequest::Openat(dirfd, pathname, flags, mode) => {
             let Some(path) = pathname.to_cstring() else {
-                return Errno::EFAULT.as_neg() as i64;
+                return Errno::EFAULT.as_neg() as isize;
             };
-            // Errno::ENOENT.as_neg() as i64
-            std::eprintln!(
-                "openat: dirfd={} path={:?} flags={:?} mode={:?}",
-                dirfd,
-                path,
-                flags,
-                mode
-            );
             syscalls::file::sys_openat(dirfd, path, flags, mode).unwrap_or_else(Errno::as_neg)
-                as i64
+                as isize
         }
         _ => {
             todo!()
         }
-    };
-    std::eprintln!("syscall_entry: ret={}", ret);
-    ret
+    }
 }
