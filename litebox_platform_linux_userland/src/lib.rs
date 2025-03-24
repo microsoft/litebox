@@ -32,7 +32,6 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     ///
     /// Takes a tun device name (such as `"tun0"` or `"tun99"`) to connect networking.
     /// Registers `syscall_handler` to handle all intercepted syscalls.
-    /// for details.
     ///
     /// # Panics
     ///
