@@ -1,0 +1,1638 @@
+---
+source: litebox_syscall_rewriter/tests/snapshot_tests.rs
+expression: diff
+snapshot_kind: text
+---
+--- original
++++ rewritten
+@@ -131,8 +131,9 @@
+   401217:	48 c7 85 50 ff ff ff 	movq   $0x20,-0xb0(%rbp)
+   40121e:	20 00 00 00 
+   401222:	bf 01 00 00 00       	mov    $0x1,%edi
+-  401227:	b8 0e 00 00 00       	mov    $0xe,%eax
+-  40122c:	0f 05                	syscall
++  401227:	e9 6c d5 07 00       	jmp    47e798 <_fini+0x18>
++  40122c:	90                   	nop
++  40122d:	90                   	nop
+   40122e:	8b 05 0c fc 0a 00    	mov    0xafc0c(%rip),%eax        # 4b0e40 <stage>
+   401234:	83 f8 01             	cmp    $0x1,%eax
+   401237:	75 77                	jne    4012b0 <abort+0x119>
+@@ -1133,9 +1134,8 @@
+   401e6c:	74 12                	je     401e80 <__libc_start_call_main+0x90>
+   401e6e:	ba 3c 00 00 00       	mov    $0x3c,%edx
+   401e73:	0f 1f 44 00 00       	nopl   0x0(%rax,%rax,1)
+-  401e78:	31 ff                	xor    %edi,%edi
+-  401e7a:	89 d0                	mov    %edx,%eax
+-  401e7c:	0f 05                	syscall
++  401e78:	e9 2b c9 07 00       	jmp    47e7a8 <_fini+0x28>
++  401e7d:	90                   	nop
+   401e7e:	eb f8                	jmp    401e78 <__libc_start_call_main+0x88>
+   401e80:	31 c0                	xor    %eax,%eax
+   401e82:	eb d4                	jmp    401e58 <__libc_start_call_main+0x68>
+@@ -3117,8 +3117,9 @@
+   403ed9:	74 11                	je     403eec <__libc_start_main+0x13c>
+   403edb:	be 01 00 00 00       	mov    $0x1,%esi
+   403ee0:	bf 01 50 00 00       	mov    $0x5001,%edi
+-  403ee5:	b8 9e 00 00 00       	mov    $0x9e,%eax
+-  403eea:	0f 05                	syscall
++  403ee5:	e9 cd a8 07 00       	jmp    47e7b7 <_fini+0x37>
++  403eea:	90                   	nop
++  403eeb:	90                   	nop
+   403eec:	44 89 ef             	mov    %r13d,%edi
+   403eef:	e8 9c d4 01 00       	call   421390 <_dl_cet_setup_features>
+   403ef4:	48 8b 15 0d 52 0a 00 	mov    0xa520d(%rip),%rdx        # 4a9108 <_dl_random>
+@@ -3441,18 +3442,22 @@
+   4043c5:	48 89 46 08          	mov    %rax,0x8(%rsi)
+   4043c9:	b8 9e 00 00 00       	mov    $0x9e,%eax
+   4043ce:	48 89 36             	mov    %rsi,(%rsi)
+-  4043d1:	48 89 76 10          	mov    %rsi,0x10(%rsi)
+-  4043d5:	0f 05                	syscall
++  4043d1:	e9 f1 a3 07 00       	jmp    47e7c7 <_fini+0x47>
++  4043d6:	90                   	nop
+   4043d7:	85 c0                	test   %eax,%eax
+   4043d9:	74 24                	je     4043ff <__libc_setup_tls+0x1df>
+   4043db:	ba 2d 00 00 00       	mov    $0x2d,%edx
+   4043e0:	bf 02 00 00 00       	mov    $0x2,%edi
+   4043e5:	b8 01 00 00 00       	mov    $0x1,%eax
+-  4043ea:	48 8d 35 c7 d1 07 00 	lea    0x7d1c7(%rip),%rsi        # 4815b8 <slashdot.0+0x76b>
+-  4043f1:	0f 05                	syscall
++  4043ea:	e9 e7 a3 07 00       	jmp    47e7d6 <_fini+0x56>
++  4043ef:	90                   	nop
++  4043f0:	90                   	nop
++  4043f1:	90                   	nop
++  4043f2:	90                   	nop
+   4043f3:	bf 7f 00 00 00       	mov    $0x7f,%edi
+-  4043f8:	b8 e7 00 00 00       	mov    $0xe7,%eax
+-  4043fd:	0f 05                	syscall
++  4043f8:	e9 eb a3 07 00       	jmp    47e7e8 <_fini+0x68>
++  4043fd:	90                   	nop
++  4043fe:	90                   	nop
+   4043ff:	e8 dc ba 01 00       	call   41fee0 <__tls_init_tp>
+   404404:	48 8b 45 c8          	mov    -0x38(%rbp),%rax
+   404408:	4d 89 ae 78 04 00 00 	mov    %r13,0x478(%r14)
+@@ -3492,11 +3497,15 @@
+   4044b0:	ba 2d 00 00 00       	mov    $0x2d,%edx
+   4044b5:	bf 02 00 00 00       	mov    $0x2,%edi
+   4044ba:	b8 01 00 00 00       	mov    $0x1,%eax
+-  4044bf:	48 8d 35 f2 d0 07 00 	lea    0x7d0f2(%rip),%rsi        # 4815b8 <slashdot.0+0x76b>
+-  4044c6:	0f 05                	syscall
++  4044bf:	e9 34 a3 07 00       	jmp    47e7f8 <_fini+0x78>
++  4044c4:	90                   	nop
++  4044c5:	90                   	nop
++  4044c6:	90                   	nop
++  4044c7:	90                   	nop
+   4044c8:	bf 7f 00 00 00       	mov    $0x7f,%edi
+-  4044cd:	b8 e7 00 00 00       	mov    $0xe7,%eax
+-  4044d2:	0f 05                	syscall
++  4044cd:	e9 38 a3 07 00       	jmp    47e80a <_fini+0x8a>
++  4044d2:	90                   	nop
++  4044d3:	90                   	nop
+   4044d4:	e9 70 fe ff ff       	jmp    404349 <__libc_setup_tls+0x129>
+   4044d9:	0f 1f 80 00 00 00 00 	nopl   0x0(%rax)
+ 
+@@ -9234,8 +9243,7 @@
+   40a3dc:	0f 1f 40 00          	nopl   0x0(%rax)
+   40a3e0:	48 8b b5 f0 fe ff ff 	mov    -0x110(%rbp),%rsi
+   40a3e7:	bf 02 00 00 00       	mov    $0x2,%edi
+-  40a3ec:	44 89 c8             	mov    %r9d,%eax
+-  40a3ef:	0f 05                	syscall
++  40a3ec:	e9 29 44 07 00       	jmp    47e81a <_fini+0x9a>
+   40a3f1:	48 83 f8 fc          	cmp    $0xfffffffffffffffc,%rax
+   40a3f5:	74 e9                	je     40a3e0 <__libc_message_impl+0x150>
+   40a3f7:	45 31 c9             	xor    %r9d,%r9d
+@@ -9372,8 +9380,9 @@
+   40a5c7:	45 31 d2             	xor    %r10d,%r10d
+   40a5ca:	ba 02 00 00 00       	mov    $0x2,%edx
+   40a5cf:	be 80 00 00 00       	mov    $0x80,%esi
+-  40a5d4:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  40a5d9:	0f 05                	syscall
++  40a5d4:	e9 4f 42 07 00       	jmp    47e828 <_fini+0xa8>
++  40a5d9:	90                   	nop
++  40a5da:	90                   	nop
+   40a5db:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   40a5e1:	76 d8                	jbe    40a5bb <__lll_lock_wait_private+0xb>
+   40a5e3:	83 f8 f5             	cmp    $0xfffffff5,%eax
+@@ -9405,8 +9414,8 @@
+   40a62d:	45 31 d2             	xor    %r10d,%r10d
+   40a630:	ba 02 00 00 00       	mov    $0x2,%edx
+   40a635:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  40a63a:	40 80 f6 80          	xor    $0x80,%sil
+-  40a63e:	0f 05                	syscall
++  40a63a:	e9 f9 41 07 00       	jmp    47e838 <_fini+0xb8>
++  40a63f:	90                   	nop
+   40a640:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   40a646:	76 d6                	jbe    40a61e <__lll_lock_wait+0xe>
+   40a648:	83 f8 f5             	cmp    $0xfffffff5,%eax
+@@ -9426,8 +9435,9 @@
+   40a674:	45 31 d2             	xor    %r10d,%r10d
+   40a677:	ba 01 00 00 00       	mov    $0x1,%edx
+   40a67c:	be 81 00 00 00       	mov    $0x81,%esi
+-  40a681:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  40a686:	0f 05                	syscall
++  40a681:	e9 c1 41 07 00       	jmp    47e847 <_fini+0xc7>
++  40a686:	90                   	nop
++  40a687:	90                   	nop
+   40a688:	c3                   	ret
+   40a689:	0f 1f 80 00 00 00 00 	nopl   0x0(%rax)
+ 
+@@ -9436,8 +9446,9 @@
+   40a694:	40 80 f6 81          	xor    $0x81,%sil
+   40a698:	45 31 d2             	xor    %r10d,%r10d
+   40a69b:	ba 01 00 00 00       	mov    $0x1,%edx
+-  40a6a0:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  40a6a5:	0f 05                	syscall
++  40a6a0:	e9 b2 41 07 00       	jmp    47e857 <_fini+0xd7>
++  40a6a5:	90                   	nop
++  40a6a6:	90                   	nop
+   40a6a7:	c3                   	ret
+   40a6a8:	0f 1f 84 00 00 00 00 	nopl   0x0(%rax,%rax,1)
+   40a6af:	00 
+@@ -10840,8 +10851,9 @@
+   40bbd5:	48 89 45 e8          	mov    %rax,-0x18(%rbp)
+   40bbd9:	31 c0                	xor    %eax,%eax
+   40bbdb:	c6 05 3e 4c 0a 00 01 	movb   $0x1,0xa4c3e(%rip)        # 4b0820 <__malloc_initialized>
+-  40bbe2:	b8 3e 01 00 00       	mov    $0x13e,%eax
+-  40bbe7:	0f 05                	syscall
++  40bbe2:	e9 80 2c 07 00       	jmp    47e867 <_fini+0xe7>
++  40bbe7:	90                   	nop
++  40bbe8:	90                   	nop
+   40bbe9:	48 8d 5d d0          	lea    -0x30(%rbp),%rbx
+   40bbed:	48 83 f8 08          	cmp    $0x8,%rax
+   40bbf1:	74 4e                	je     40bc41 <ptmalloc_init.part.0+0x91>
+@@ -23532,8 +23544,9 @@
+   4181dc:	5d                   	pop    %rbp
+   4181dd:	c3                   	ret
+   4181de:	66 90                	xchg   %ax,%ax
+-  4181e0:	b8 e4 00 00 00       	mov    $0xe4,%eax
+-  4181e5:	0f 05                	syscall
++  4181e0:	e9 92 66 06 00       	jmp    47e877 <_fini+0xf7>
++  4181e5:	90                   	nop
++  4181e6:	90                   	nop
+   4181e7:	85 c0                	test   %eax,%eax
+   4181e9:	75 1d                	jne    418208 <__clock_gettime+0x48>
+   4181eb:	31 c0                	xor    %eax,%eax
+@@ -23564,9 +23577,7 @@
+   41823b:	ba e7 00 00 00       	mov    $0xe7,%edx
+   418240:	eb 07                	jmp    418249 <_exit+0x19>
+   418242:	66 0f 1f 44 00 00    	nopw   0x0(%rax,%rax,1)
+-  418248:	f4                   	hlt
+-  418249:	89 d0                	mov    %edx,%eax
+-  41824b:	0f 05                	syscall
++  418248:	e9 3a 66 06 00       	jmp    47e887 <_fini+0x107>
+   41824d:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   418253:	76 f3                	jbe    418248 <_exit+0x18>
+   418255:	f7 d8                	neg    %eax
+@@ -23576,8 +23587,9 @@
+ 
+ 0000000000418260 <__fstat>:
+   418260:	f3 0f 1e fa          	endbr64
+-  418264:	b8 05 00 00 00       	mov    $0x5,%eax
+-  418269:	0f 05                	syscall
++  418264:	e9 2c 66 06 00       	jmp    47e895 <_fini+0x115>
++  418269:	90                   	nop
++  41826a:	90                   	nop
+   41826b:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   418271:	77 05                	ja     418278 <__fstat+0x18>
+   418273:	c3                   	ret
+@@ -23591,8 +23603,9 @@
+ 
+ 0000000000418290 <__close_nocancel>:
+   418290:	f3 0f 1e fa          	endbr64
+-  418294:	b8 03 00 00 00       	mov    $0x3,%eax
+-  418299:	0f 05                	syscall
++  418294:	e9 0c 66 06 00       	jmp    47e8a5 <_fini+0x125>
++  418299:	90                   	nop
++  41829a:	90                   	nop
+   41829b:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   4182a1:	77 05                	ja     4182a8 <__close_nocancel+0x18>
+   4182a3:	c3                   	ret
+@@ -23621,8 +23634,9 @@
+   4182f2:	48 89 45 c0          	mov    %rax,-0x40(%rbp)
+   4182f6:	83 fe 09             	cmp    $0x9,%esi
+   4182f9:	74 25                	je     418320 <__fcntl64_nocancel+0x60>
+-  4182fb:	b8 48 00 00 00       	mov    $0x48,%eax
+-  418300:	0f 05                	syscall
++  4182fb:	e9 b5 65 06 00       	jmp    47e8b5 <_fini+0x135>
++  418300:	90                   	nop
++  418301:	90                   	nop
+   418302:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   418308:	77 3e                	ja     418348 <__fcntl64_nocancel+0x88>
+   41830a:	48 8b 55 c8          	mov    -0x38(%rbp),%rdx
+@@ -23634,8 +23648,9 @@
+   41831b:	0f 1f 44 00 00       	nopl   0x0(%rax,%rax,1)
+   418320:	48 8d 55 a8          	lea    -0x58(%rbp),%rdx
+   418324:	be 10 00 00 00       	mov    $0x10,%esi
+-  418329:	b8 48 00 00 00       	mov    $0x48,%eax
+-  41832e:	0f 05                	syscall
++  418329:	e9 97 65 06 00       	jmp    47e8c5 <_fini+0x145>
++  41832e:	90                   	nop
++  41832f:	90                   	nop
+   418330:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
+   418335:	77 11                	ja     418348 <__fcntl64_nocancel+0x88>
+   418337:	83 7d a8 02          	cmpl   $0x2,-0x58(%rbp)
+@@ -23662,8 +23677,9 @@
+   418379:	31 c0                	xor    %eax,%eax
+   41837b:	83 fe 09             	cmp    $0x9,%esi
+   41837e:	74 20                	je     4183a0 <__fcntl64_nocancel_adjusted+0x40>
+-  418380:	b8 48 00 00 00       	mov    $0x48,%eax
+-  418385:	0f 05                	syscall
++  418380:	e9 50 65 06 00       	jmp    47e8d5 <_fini+0x155>
++  418385:	90                   	nop
++  418386:	90                   	nop
+   418387:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   41838d:	77 39                	ja     4183c8 <__fcntl64_nocancel_adjusted+0x68>
+   41838f:	48 8b 55 f8          	mov    -0x8(%rbp),%rdx
+@@ -23674,8 +23690,9 @@
+   41839f:	c3                   	ret
+   4183a0:	48 8d 55 f0          	lea    -0x10(%rbp),%rdx
+   4183a4:	be 10 00 00 00       	mov    $0x10,%esi
+-  4183a9:	b8 48 00 00 00       	mov    $0x48,%eax
+-  4183ae:	0f 05                	syscall
++  4183a9:	e9 37 65 06 00       	jmp    47e8e5 <_fini+0x165>
++  4183ae:	90                   	nop
++  4183af:	90                   	nop
+   4183b0:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
+   4183b5:	77 11                	ja     4183c8 <__fcntl64_nocancel_adjusted+0x68>
+   4183b7:	83 7d f0 02          	cmpl   $0x2,-0x10(%rbp)
+@@ -23711,8 +23728,9 @@
+   418413:	89 f2                	mov    %esi,%edx
+   418415:	b8 01 01 00 00       	mov    $0x101,%eax
+   41841a:	48 89 fe             	mov    %rdi,%rsi
+-  41841d:	bf 9c ff ff ff       	mov    $0xffffff9c,%edi
+-  418422:	0f 05                	syscall
++  41841d:	e9 d3 64 06 00       	jmp    47e8f5 <_fini+0x175>
++  418422:	90                   	nop
++  418423:	90                   	nop
+   418424:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   41842a:	77 34                	ja     418460 <__open64_nocancel+0x80>
+   41842c:	48 8b 55 c8          	mov    -0x38(%rbp),%rdx
+@@ -23740,9 +23758,10 @@
+   41847f:	00 
+ 
+ 0000000000418480 <__read_nocancel>:
+-  418480:	f3 0f 1e fa          	endbr64
+-  418484:	31 c0                	xor    %eax,%eax
+-  418486:	0f 05                	syscall
++  418480:	e9 80 64 06 00       	jmp    47e905 <_fini+0x185>
++  418485:	90                   	nop
++  418486:	90                   	nop
++  418487:	90                   	nop
+   418488:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   41848e:	77 08                	ja     418498 <__read_nocancel+0x18>
+   418490:	c3                   	ret
+@@ -23756,8 +23775,9 @@
+ 
+ 00000000004184b0 <__brk>:
+   4184b0:	f3 0f 1e fa          	endbr64
+-  4184b4:	b8 0c 00 00 00       	mov    $0xc,%eax
+-  4184b9:	0f 05                	syscall
++  4184b4:	e9 5d 64 06 00       	jmp    47e916 <_fini+0x196>
++  4184b9:	90                   	nop
++  4184ba:	90                   	nop
+   4184bb:	48 89 05 96 83 09 00 	mov    %rax,0x98396(%rip)        # 4b0858 <__curbrk>
+   4184c2:	48 39 f8             	cmp    %rdi,%rax
+   4184c5:	72 09                	jb     4184d0 <__brk+0x20>
+@@ -23922,8 +23942,9 @@
+   418714:	48 89 45 f8          	mov    %rax,-0x8(%rbp)
+   418718:	31 c0                	xor    %eax,%eax
+   41871a:	48 8d 95 f0 ef ff ff 	lea    -0x1010(%rbp),%rdx
+-  418721:	b8 cc 00 00 00       	mov    $0xcc,%eax
+-  418726:	0f 05                	syscall
++  418721:	e9 00 62 06 00       	jmp    47e926 <_fini+0x1a6>
++  418726:	90                   	nop
++  418727:	90                   	nop
+   418728:	85 c0                	test   %eax,%eax
+   41872a:	7f 24                	jg     418750 <__get_nprocs_sched+0x60>
+   41872c:	83 f8 ea             	cmp    $0xffffffea,%eax
+@@ -24231,8 +24252,9 @@
+ 
+ 0000000000418b40 <__madvise>:
+   418b40:	f3 0f 1e fa          	endbr64
+-  418b44:	b8 1c 00 00 00       	mov    $0x1c,%eax
+-  418b49:	0f 05                	syscall
++  418b44:	e9 ed 5d 06 00       	jmp    47e936 <_fini+0x1b6>
++  418b49:	90                   	nop
++  418b4a:	90                   	nop
+   418b4b:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
+   418b51:	73 01                	jae    418b54 <__madvise+0x14>
+   418b53:	c3                   	ret
+@@ -24259,8 +24281,9 @@
+   418b8d:	74 41                	je     418bd0 <__mmap64+0x60>
+   418b8f:	45 89 e2             	mov    %r12d,%r10d
+   418b92:	48 89 df             	mov    %rbx,%rdi
+-  418b95:	b8 09 00 00 00       	mov    $0x9,%eax
+-  418b9a:	0f 05                	syscall
++  418b95:	e9 ac 5d 06 00       	jmp    47e946 <_fini+0x1c6>
++  418b9a:	90                   	nop
++  418b9b:	90                   	nop
+   418b9c:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   418ba2:	77 6c                	ja     418c10 <__mmap64+0xa0>
+   418ba4:	5b                   	pop    %rbx
+@@ -24284,8 +24307,8 @@
+   418be8:	45 89 e2             	mov    %r12d,%r10d
+   418beb:	31 ff                	xor    %edi,%edi
+   418bed:	b8 09 00 00 00       	mov    $0x9,%eax
+-  418bf2:	41 83 ca 40          	or     $0x40,%r10d
+-  418bf6:	0f 05                	syscall
++  418bf2:	e9 5f 5d 06 00       	jmp    47e956 <_fini+0x1d6>
++  418bf7:	90                   	nop
+   418bf8:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   418bfe:	76 a4                	jbe    418ba4 <__mmap64+0x34>
+   418c00:	48 c7 c1 c0 ff ff ff 	mov    $0xffffffffffffffc0,%rcx
+@@ -24303,8 +24326,9 @@
+ 
+ 0000000000418c30 <__mprotect>:
+   418c30:	f3 0f 1e fa          	endbr64
+-  418c34:	b8 0a 00 00 00       	mov    $0xa,%eax
+-  418c39:	0f 05                	syscall
++  418c34:	e9 2c 5d 06 00       	jmp    47e965 <_fini+0x1e5>
++  418c39:	90                   	nop
++  418c3a:	90                   	nop
+   418c3b:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
+   418c41:	73 01                	jae    418c44 <__mprotect+0x14>
+   418c43:	c3                   	ret
+@@ -24319,8 +24343,9 @@
+ 
+ 0000000000418c60 <__munmap>:
+   418c60:	f3 0f 1e fa          	endbr64
+-  418c64:	b8 0b 00 00 00       	mov    $0xb,%eax
+-  418c69:	0f 05                	syscall
++  418c64:	e9 0c 5d 06 00       	jmp    47e975 <_fini+0x1f5>
++  418c69:	90                   	nop
++  418c6a:	90                   	nop
+   418c6b:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
+   418c71:	73 01                	jae    418c74 <__munmap+0x14>
+   418c73:	c3                   	ret
+@@ -24396,8 +24421,9 @@
+   418d42:	83 e1 02             	and    $0x2,%ecx
+   418d45:	75 29                	jne    418d70 <__mremap+0x50>
+   418d47:	45 31 c0             	xor    %r8d,%r8d
+-  418d4a:	b8 19 00 00 00       	mov    $0x19,%eax
+-  418d4f:	0f 05                	syscall
++  418d4a:	e9 36 5c 06 00       	jmp    47e985 <_fini+0x205>
++  418d4f:	90                   	nop
++  418d50:	90                   	nop
+   418d51:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   418d57:	77 37                	ja     418d90 <__mremap+0x70>
+   418d59:	48 8b 55 c8          	mov    -0x38(%rbp),%rdx
+@@ -24463,8 +24489,9 @@
+   418e1e:	48 89 da             	mov    %rbx,%rdx
+   418e21:	31 f6                	xor    %esi,%esi
+   418e23:	bf 41 4d 56 53       	mov    $0x53564d41,%edi
+-  418e28:	b8 9d 00 00 00       	mov    $0x9d,%eax
+-  418e2d:	0f 05                	syscall
++  418e28:	e9 68 5b 06 00       	jmp    47e995 <_fini+0x215>
++  418e2d:	90                   	nop
++  418e2e:	90                   	nop
+   418e2f:	83 f8 ea             	cmp    $0xffffffea,%eax
+   418e32:	75 a4                	jne    418dd8 <__set_vma_name+0x28>
+   418e34:	c7 05 5e 1c 09 00 00 	movl   $0x0,0x91c5e(%rip)        # 4aaa9c <prctl_supported.0>
+@@ -24477,8 +24504,9 @@
+ 
+ 0000000000418e50 <__sysinfo>:
+   418e50:	f3 0f 1e fa          	endbr64
+-  418e54:	b8 63 00 00 00       	mov    $0x63,%eax
+-  418e59:	0f 05                	syscall
++  418e54:	e9 4c 5b 06 00       	jmp    47e9a5 <_fini+0x225>
++  418e59:	90                   	nop
++  418e5a:	90                   	nop
+   418e5b:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
+   418e61:	73 01                	jae    418e64 <__sysinfo+0x14>
+   418e63:	c3                   	ret
+@@ -29948,8 +29976,7 @@
+   41e488:	b8 0b 01 00 00       	mov    $0x10b,%eax
+   41e48d:	48 8d 35 0d 17 06 00 	lea    0x6170d(%rip),%rsi        # 47fba1 <__PRETTY_FUNCTION__.20+0x37e>
+   41e494:	48 8d 9d e0 ef ff ff 	lea    -0x1020(%rbp),%rbx
+-  41e49b:	48 89 da             	mov    %rbx,%rdx
+-  41e49e:	0f 05                	syscall
++  41e49b:	e9 15 05 06 00       	jmp    47e9b5 <_fini+0x235>
+   41e4a0:	85 c0                	test   %eax,%eax
+   41e4a2:	7e 5c                	jle    41e500 <_dl_get_origin+0xa0>
+   41e4a4:	0f b6 95 e0 ef ff ff 	movzbl -0x1020(%rbp),%edx
+@@ -30115,8 +30142,9 @@
+   41e6d2:	8b bd a8 f6 ff ff    	mov    -0x958(%rbp),%edi
+   41e6d8:	48 63 d3             	movslq %ebx,%rdx
+   41e6db:	48 8d b5 d0 f6 ff ff 	lea    -0x930(%rbp),%rsi
+-  41e6e2:	b8 14 00 00 00       	mov    $0x14,%eax
+-  41e6e7:	0f 05                	syscall
++  41e6e2:	e9 dc 02 06 00       	jmp    47e9c3 <_fini+0x243>
++  41e6e7:	90                   	nop
++  41e6e8:	90                   	nop
+   41e6e9:	48 81 c4 38 09 00 00 	add    $0x938,%rsp
+   41e6f0:	5b                   	pop    %rbx
+   41e6f1:	41 5c                	pop    %r12
+@@ -31674,8 +31702,9 @@
+   41ff19:	48 89 42 08          	mov    %rax,0x8(%rdx)
+   41ff1d:	48 89 05 ec 09 09 00 	mov    %rax,0x909ec(%rip)        # 4b0910 <_dl_stack_user>
+   41ff24:	48 8d bb d0 02 00 00 	lea    0x2d0(%rbx),%rdi
+-  41ff2b:	b8 da 00 00 00       	mov    $0xda,%eax
+-  41ff30:	0f 05                	syscall
++  41ff2b:	e9 a3 ea 05 00       	jmp    47e9d3 <_fini+0x253>
++  41ff30:	90                   	nop
++  41ff31:	90                   	nop
+   41ff32:	89 83 d0 02 00 00    	mov    %eax,0x2d0(%rbx)
+   41ff38:	48 8d 83 10 03 00 00 	lea    0x310(%rbx),%rax
+   41ff3f:	64 48 89 04 25 10 05 	mov    %rax,%fs:0x510
+@@ -31692,8 +31721,11 @@
+   41ff77:	b8 11 01 00 00       	mov    $0x111,%eax
+   41ff7c:	66 48 0f 6e c7       	movq   %rdi,%xmm0
+   41ff81:	66 0f 6c c0          	punpcklqdq %xmm0,%xmm0
+-  41ff85:	0f 11 83 d8 02 00 00 	movups %xmm0,0x2d8(%rbx)
+-  41ff8c:	0f 05                	syscall
++  41ff85:	e9 59 ea 05 00       	jmp    47e9e3 <_fini+0x263>
++  41ff8a:	90                   	nop
++  41ff8b:	90                   	nop
++  41ff8c:	90                   	nop
++  41ff8d:	90                   	nop
+   41ff8e:	31 d2                	xor    %edx,%edx
+   41ff90:	48 8d 75 ec          	lea    -0x14(%rbp),%rsi
+   41ff94:	bf 28 00 00 00       	mov    $0x28,%edi
+@@ -31719,8 +31751,9 @@
+   41ffed:	31 d2                	xor    %edx,%edx
+   41ffef:	be 20 00 00 00       	mov    $0x20,%esi
+   41fff4:	48 89 df             	mov    %rbx,%rdi
+-  41fff7:	b8 4e 01 00 00       	mov    $0x14e,%eax
+-  41fffc:	0f 05                	syscall
++  41fff7:	e9 f9 e9 05 00       	jmp    47e9f5 <_fini+0x275>
++  41fffc:	90                   	nop
++  41fffd:	90                   	nop
+   41fffe:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
+   420003:	77 a7                	ja     41ffac <__tls_init_tp+0xcc>
+   420005:	c7 05 11 7b 08 00 20 	movl   $0x20,0x87b11(%rip)        # 4a7b20 <__rseq_size>
+@@ -33086,8 +33119,9 @@
+   421339:	0f 84 d9 fe ff ff    	je     421218 <_dl_cet_open_check+0x158>
+   42133f:	be 01 00 00 00       	mov    $0x1,%esi
+   421344:	bf 02 50 00 00       	mov    $0x5002,%edi
+-  421349:	b8 9e 00 00 00       	mov    $0x9e,%eax
+-  42134e:	0f 05                	syscall
++  421349:	e9 b7 d6 05 00       	jmp    47ea05 <_fini+0x285>
++  42134e:	90                   	nop
++  42134f:	90                   	nop
+   421350:	89 c7                	mov    %eax,%edi
+   421352:	85 c0                	test   %eax,%eax
+   421354:	75 24                	jne    42137a <_dl_cet_open_check+0x2ba>
+@@ -33117,8 +33151,8 @@
+   42139e:	bf 05 50 00 00       	mov    $0x5005,%edi
+   4213a3:	89 d0                	mov    %edx,%eax
+   4213a5:	48 89 e5             	mov    %rsp,%rbp
+-  4213a8:	48 8d 75 f8          	lea    -0x8(%rbp),%rsi
+-  4213ac:	0f 05                	syscall
++  4213a8:	e9 68 d6 05 00       	jmp    47ea15 <_fini+0x295>
++  4213ad:	90                   	nop
+   4213ae:	48 85 c0             	test   %rax,%rax
+   4213b1:	74 15                	je     4213c8 <_dl_cet_setup_features+0x38>
+   4213b3:	31 c0                	xor    %eax,%eax
+@@ -33141,9 +33175,11 @@
+   4213ec:	a8 0c                	test   $0xc,%al
+   4213ee:	74 10                	je     421400 <_dl_cet_setup_features+0x70>
+   4213f0:	48 c7 c6 ff ff ff ff 	mov    $0xffffffffffffffff,%rsi
+-  4213f7:	bf 03 50 00 00       	mov    $0x5003,%edi
+-  4213fc:	89 d0                	mov    %edx,%eax
+-  4213fe:	0f 05                	syscall
++  4213f7:	e9 28 d6 05 00       	jmp    47ea24 <_fini+0x2a4>
++  4213fc:	90                   	nop
++  4213fd:	90                   	nop
++  4213fe:	90                   	nop
++  4213ff:	90                   	nop
+   421400:	b8 02 00 00 00       	mov    $0x2,%eax
+   421405:	eb ae                	jmp    4213b5 <_dl_cet_setup_features+0x25>
+   421407:	66 0f 1f 84 00 00 00 	nopw   0x0(%rax,%rax,1)
+@@ -33172,13 +33208,13 @@
+   421446:	66 2e 0f 1f 84 00 00 	cs nopw 0x0(%rax,%rax,1)
+   42144d:	00 00 00 
+   421450:	be 0c 00 00 00       	mov    $0xc,%esi
+-  421455:	31 ff                	xor    %edi,%edi
+-  421457:	89 f0                	mov    %esi,%eax
+-  421459:	0f 05                	syscall
++  421455:	e9 dc d5 05 00       	jmp    47ea36 <_fini+0x2b6>
++  42145a:	90                   	nop
+   42145b:	48 89 c2             	mov    %rax,%rdx
+-  42145e:	48 8d 3c 18          	lea    (%rax,%rbx,1),%rdi
+-  421462:	89 f0                	mov    %esi,%eax
+-  421464:	0f 05                	syscall
++  42145e:	e9 e2 d5 05 00       	jmp    47ea45 <_fini+0x2c5>
++  421463:	90                   	nop
++  421464:	90                   	nop
++  421465:	90                   	nop
+   421466:	48 39 c2             	cmp    %rax,%rdx
+   421469:	75 cd                	jne    421438 <_dl_early_allocate+0x28>
+   42146b:	45 31 c9             	xor    %r9d,%r9d
+@@ -33187,8 +33223,9 @@
+   421479:	31 ff                	xor    %edi,%edi
+   42147b:	41 ba 22 00 00 00    	mov    $0x22,%r10d
+   421481:	48 89 de             	mov    %rbx,%rsi
+-  421484:	b8 09 00 00 00       	mov    $0x9,%eax
+-  421489:	0f 05                	syscall
++  421484:	e9 cd d5 05 00       	jmp    47ea56 <_fini+0x2d6>
++  421489:	90                   	nop
++  42148a:	90                   	nop
+   42148b:	31 d2                	xor    %edx,%edx
+   42148d:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   421493:	48 8b 5d f8          	mov    -0x8(%rbp),%rbx
+@@ -69741,8 +69778,9 @@
+   444c0d:	41 ba 08 00 00 00    	mov    $0x8,%r10d
+   444c13:	4c 89 f2             	mov    %r14,%rdx
+   444c16:	48 8d 35 b3 0a 04 00 	lea    0x40ab3(%rip),%rsi        # 4856d0 <sigall_set>
+-  444c1d:	b8 0e 00 00 00       	mov    $0xe,%eax
+-  444c22:	0f 05                	syscall
++  444c1d:	e9 44 9e 03 00       	jmp    47ea66 <_fini+0x2e6>
++  444c22:	90                   	nop
++  444c23:	90                   	nop
+   444c24:	31 c0                	xor    %eax,%eax
+   444c26:	4c 8d a3 04 09 00 00 	lea    0x904(%rbx),%r12
+   444c2d:	ba 01 00 00 00       	mov    $0x1,%edx
+@@ -69759,8 +69797,9 @@
+   444c5e:	31 d2                	xor    %edx,%edx
+   444c60:	4c 89 f6             	mov    %r14,%rsi
+   444c63:	bf 02 00 00 00       	mov    $0x2,%edi
+-  444c68:	b8 0e 00 00 00       	mov    $0xe,%eax
+-  444c6d:	0f 05                	syscall
++  444c68:	e9 09 9e 03 00       	jmp    47ea76 <_fini+0x2f6>
++  444c6d:	90                   	nop
++  444c6e:	90                   	nop
+   444c6f:	48 8b 45 d8          	mov    -0x28(%rbp),%rax
+   444c73:	64 48 2b 04 25 28 00 	sub    %fs:0x28,%rax
+   444c7a:	00 00 
+@@ -69779,23 +69818,26 @@
+   444ca3:	44 89 ea             	mov    %r13d,%edx
+   444ca6:	89 c7                	mov    %eax,%edi
+   444ca8:	89 de                	mov    %ebx,%esi
+-  444caa:	b8 ea 00 00 00       	mov    $0xea,%eax
+-  444caf:	0f 05                	syscall
++  444caa:	e9 d7 9d 03 00       	jmp    47ea86 <_fini+0x306>
++  444caf:	90                   	nop
++  444cb0:	90                   	nop
+   444cb1:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
+   444cb6:	76 8f                	jbe    444c47 <__pthread_kill_internal+0x77>
+   444cb8:	89 c3                	mov    %eax,%ebx
+   444cba:	f7 db                	neg    %ebx
+   444cbc:	eb 8b                	jmp    444c49 <__pthread_kill_internal+0x79>
+   444cbe:	66 90                	xchg   %ax,%ax
+-  444cc0:	b8 ba 00 00 00       	mov    $0xba,%eax
+-  444cc5:	0f 05                	syscall
++  444cc0:	e9 d1 9d 03 00       	jmp    47ea96 <_fini+0x316>
++  444cc5:	90                   	nop
++  444cc6:	90                   	nop
+   444cc7:	89 c3                	mov    %eax,%ebx
+   444cc9:	e8 82 6e 01 00       	call   45bb50 <__getpid>
+   444cce:	44 89 ea             	mov    %r13d,%edx
+   444cd1:	89 de                	mov    %ebx,%esi
+   444cd3:	89 c7                	mov    %eax,%edi
+-  444cd5:	b8 ea 00 00 00       	mov    $0xea,%eax
+-  444cda:	0f 05                	syscall
++  444cd5:	e9 cc 9d 03 00       	jmp    47eaa6 <_fini+0x326>
++  444cda:	90                   	nop
++  444cdb:	90                   	nop
+   444cdc:	89 c3                	mov    %eax,%ebx
+   444cde:	f7 db                	neg    %ebx
+   444ce0:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
+@@ -69843,8 +69885,11 @@
+   444d71:	31 ff                	xor    %edi,%edi
+   444d73:	b8 0e 00 00 00       	mov    $0xe,%eax
+   444d78:	4c 89 fa             	mov    %r15,%rdx
+-  444d7b:	48 8d 35 4e 09 04 00 	lea    0x4094e(%rip),%rsi        # 4856d0 <sigall_set>
+-  444d82:	0f 05                	syscall
++  444d7b:	e9 36 9d 03 00       	jmp    47eab6 <_fini+0x336>
++  444d80:	90                   	nop
++  444d81:	90                   	nop
++  444d82:	90                   	nop
++  444d83:	90                   	nop
+   444d84:	31 c0                	xor    %eax,%eax
+   444d86:	4c 8d ab 04 09 00 00 	lea    0x904(%rbx),%r13
+   444d8d:	ba 01 00 00 00       	mov    $0x1,%edx
+@@ -69861,8 +69906,9 @@
+   444dbf:	31 d2                	xor    %edx,%edx
+   444dc1:	4c 89 fe             	mov    %r15,%rsi
+   444dc4:	bf 02 00 00 00       	mov    $0x2,%edi
+-  444dc9:	b8 0e 00 00 00       	mov    $0xe,%eax
+-  444dce:	0f 05                	syscall
++  444dc9:	e9 fa 9c 03 00       	jmp    47eac8 <_fini+0x348>
++  444dce:	90                   	nop
++  444dcf:	90                   	nop
+   444dd0:	48 8b 45 c8          	mov    -0x38(%rbp),%rax
+   444dd4:	64 48 2b 04 25 28 00 	sub    %fs:0x28,%rax
+   444ddb:	00 00 
+@@ -69882,22 +69928,25 @@
+   444e03:	44 89 e2             	mov    %r12d,%edx
+   444e06:	89 c7                	mov    %eax,%edi
+   444e08:	89 de                	mov    %ebx,%esi
+-  444e0a:	b8 ea 00 00 00       	mov    $0xea,%eax
+-  444e0f:	0f 05                	syscall
++  444e0a:	e9 c9 9c 03 00       	jmp    47ead8 <_fini+0x358>
++  444e0f:	90                   	nop
++  444e10:	90                   	nop
+   444e11:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
+   444e16:	76 8f                	jbe    444da7 <__pthread_kill+0x87>
+   444e18:	41 89 c6             	mov    %eax,%r14d
+   444e1b:	41 f7 de             	neg    %r14d
+   444e1e:	eb 8a                	jmp    444daa <__pthread_kill+0x8a>
+-  444e20:	b8 ba 00 00 00       	mov    $0xba,%eax
+-  444e25:	0f 05                	syscall
++  444e20:	e9 c3 9c 03 00       	jmp    47eae8 <_fini+0x368>
++  444e25:	90                   	nop
++  444e26:	90                   	nop
+   444e27:	89 c3                	mov    %eax,%ebx
+   444e29:	e8 22 6d 01 00       	call   45bb50 <__getpid>
+   444e2e:	44 89 e2             	mov    %r12d,%edx
+   444e31:	89 de                	mov    %ebx,%esi
+   444e33:	89 c7                	mov    %eax,%edi
+-  444e35:	b8 ea 00 00 00       	mov    $0xea,%eax
+-  444e3a:	0f 05                	syscall
++  444e35:	e9 be 9c 03 00       	jmp    47eaf8 <_fini+0x378>
++  444e3a:	90                   	nop
++  444e3b:	90                   	nop
+   444e3c:	41 89 c6             	mov    %eax,%r14d
+   444e3f:	41 f7 de             	neg    %r14d
+   444e42:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
+@@ -70102,8 +70151,10 @@
+   445101:	48 89 df             	mov    %rbx,%rdi
+   445104:	44 89 f0             	mov    %r14d,%eax
+   445107:	f7 d6                	not    %esi
+-  445109:	81 e6 80 00 00 00    	and    $0x80,%esi
+-  44510f:	0f 05                	syscall
++  445109:	e9 fa 99 03 00       	jmp    47eb08 <_fini+0x388>
++  44510e:	90                   	nop
++  44510f:	90                   	nop
++  445110:	90                   	nop
+   445111:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   445117:	76 b7                	jbe    4450d0 <__pthread_mutex_lock_full+0x1a0>
+   445119:	83 f8 f5             	cmp    $0xfffffff5,%eax
+@@ -70220,8 +70271,9 @@
+   4452df:	45 31 d2             	xor    %r10d,%r10d
+   4452e2:	31 f6                	xor    %esi,%esi
+   4452e4:	48 89 df             	mov    %rbx,%rdi
+-  4452e7:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  4452ec:	0f 05                	syscall
++  4452e7:	e9 2d 98 03 00       	jmp    47eb19 <_fini+0x399>
++  4452ec:	90                   	nop
++  4452ed:	90                   	nop
+   4452ee:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   4452f4:	0f 87 4e 02 00 00    	ja     445548 <__pthread_mutex_lock_full+0x618>
+   4452fa:	8b 13                	mov    (%rbx),%edx
+@@ -70339,8 +70391,9 @@
+   4454fa:	31 d2                	xor    %edx,%edx
+   4454fc:	48 89 df             	mov    %rbx,%rdi
+   4454ff:	be 07 00 00 00       	mov    $0x7,%esi
+-  445504:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  445509:	0f 05                	syscall
++  445504:	e9 20 96 03 00       	jmp    47eb29 <_fini+0x3a9>
++  445509:	90                   	nop
++  44550a:	90                   	nop
+   44550b:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   445511:	0f 86 71 ff ff ff    	jbe    445488 <__pthread_mutex_lock_full+0x558>
+   445517:	83 f8 92             	cmp    $0xffffff92,%eax
+@@ -70720,8 +70773,8 @@
+   445aa1:	4c 89 c7             	mov    %r8,%rdi
+   445aa4:	b8 ca 00 00 00       	mov    $0xca,%eax
+   445aa9:	81 e6 80 00 00 00    	and    $0x80,%esi
+-  445aaf:	40 80 f6 81          	xor    $0x81,%sil
+-  445ab3:	0f 05                	syscall
++  445aaf:	e9 85 90 03 00       	jmp    47eb39 <_fini+0x3b9>
++  445ab4:	90                   	nop
+   445ab5:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   445abb:	0f 87 0e 02 00 00    	ja     445ccf <__pthread_mutex_unlock_full+0x3bf>
+   445ac1:	90                   	nop
+@@ -70863,8 +70916,9 @@
+   445cf3:	ba 01 00 00 00       	mov    $0x1,%edx
+   445cf8:	be 01 00 00 00       	mov    $0x1,%esi
+   445cfd:	4c 89 c7             	mov    %r8,%rdi
+-  445d00:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  445d05:	0f 05                	syscall
++  445d00:	e9 43 8e 03 00       	jmp    47eb48 <_fini+0x3c8>
++  445d05:	90                   	nop
++  445d06:	90                   	nop
+   445d07:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   445d0d:	0f 86 36 fd ff ff    	jbe    445a49 <__pthread_mutex_unlock_full+0x139>
+   445d13:	83 c0 16             	add    $0x16,%eax
+@@ -70875,8 +70929,9 @@
+   445d24:	45 31 d2             	xor    %r10d,%r10d
+   445d27:	31 d2                	xor    %edx,%edx
+   445d29:	4c 89 c7             	mov    %r8,%rdi
+-  445d2c:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  445d31:	0f 05                	syscall
++  445d2c:	e9 27 8e 03 00       	jmp    47eb58 <_fini+0x3d8>
++  445d31:	90                   	nop
++  445d32:	90                   	nop
+   445d33:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   445d39:	0f 86 f8 fd ff ff    	jbe    445b37 <__pthread_mutex_unlock_full+0x227>
+   445d3f:	83 f8 92             	cmp    $0xffffff92,%eax
+@@ -71093,8 +71148,9 @@
+   446007:	45 31 d2             	xor    %r10d,%r10d
+   44600a:	be 80 00 00 00       	mov    $0x80,%esi
+   44600f:	48 89 df             	mov    %rbx,%rdi
+-  446012:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  446017:	0f 05                	syscall
++  446012:	e9 51 8b 03 00       	jmp    47eb68 <_fini+0x3e8>
++  446017:	90                   	nop
++  446018:	90                   	nop
+   446019:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   44601f:	76 a1                	jbe    445fc2 <__pthread_once_slow+0x22>
+   446021:	83 f8 f5             	cmp    $0xfffffff5,%eax
+@@ -71130,8 +71186,9 @@
+   4460a5:	be 81 00 00 00       	mov    $0x81,%esi
+   4460aa:	c7 03 02 00 00 00    	movl   $0x2,(%rbx)
+   4460b0:	48 89 df             	mov    %rbx,%rdi
+-  4460b3:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  4460b8:	0f 05                	syscall
++  4460b3:	e9 c0 8a 03 00       	jmp    47eb78 <_fini+0x3f8>
++  4460b8:	90                   	nop
++  4460b9:	90                   	nop
+   4460ba:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   4460c0:	0f 86 02 ff ff ff    	jbe    445fc8 <__pthread_once_slow+0x28>
+   4460c6:	83 c0 16             	add    $0x16,%eax
+@@ -71173,8 +71230,9 @@
+   44613a:	45 31 d2             	xor    %r10d,%r10d
+   44613d:	ba ff ff ff 7f       	mov    $0x7fffffff,%edx
+   446142:	be 81 00 00 00       	mov    $0x81,%esi
+-  446147:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  44614c:	0f 05                	syscall
++  446147:	e9 3c 8a 03 00       	jmp    47eb88 <_fini+0x408>
++  44614c:	90                   	nop
++  44614d:	90                   	nop
+   44614e:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   446154:	77 0a                	ja     446160 <clear_once_control+0x30>
+   446156:	c3                   	ret
+@@ -71316,8 +71374,8 @@
+   4462dc:	40 0f 95 c6          	setne  %sil
+   4462e0:	45 31 d2             	xor    %r10d,%r10d
+   4462e3:	c1 e6 07             	shl    $0x7,%esi
+-  4462e6:	40 80 f6 81          	xor    $0x81,%sil
+-  4462ea:	0f 05                	syscall
++  4462e6:	e9 ad 88 03 00       	jmp    47eb98 <_fini+0x418>
++  4462eb:	90                   	nop
+   4462ec:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   4462f2:	0f 86 2e ff ff ff    	jbe    446226 <___pthread_rwlock_rdlock+0x46>
+   4462f8:	83 c0 16             	add    $0x16,%eax
+@@ -71420,8 +71478,9 @@
+   44642f:	ba ff ff ff 7f       	mov    $0x7fffffff,%edx
+   446434:	4c 89 c7             	mov    %r8,%rdi
+   446437:	40 80 f6 81          	xor    $0x81,%sil
+-  44643b:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  446440:	0f 05                	syscall
++  44643b:	e9 67 87 03 00       	jmp    47eba7 <_fini+0x427>
++  446440:	90                   	nop
++  446441:	90                   	nop
+   446442:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   446448:	0f 87 da 00 00 00    	ja     446528 <___pthread_rwlock_unlock+0x158>
+   44644e:	5b                   	pop    %rbx
+@@ -71446,8 +71505,8 @@
+   446482:	45 31 d2             	xor    %r10d,%r10d
+   446485:	ba ff ff ff 7f       	mov    $0x7fffffff,%edx
+   44648a:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  44648f:	40 80 f6 81          	xor    $0x81,%sil
+-  446493:	0f 05                	syscall
++  44648f:	e9 23 87 03 00       	jmp    47ebb7 <_fini+0x437>
++  446494:	90                   	nop
+   446495:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   44649b:	76 83                	jbe    446420 <___pthread_rwlock_unlock+0x50>
+   44649d:	83 c0 16             	add    $0x16,%eax
+@@ -71487,8 +71546,9 @@
+   446509:	ba 01 00 00 00       	mov    $0x1,%edx
+   44650e:	48 89 df             	mov    %rbx,%rdi
+   446511:	40 80 f6 81          	xor    $0x81,%sil
+-  446515:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  44651a:	0f 05                	syscall
++  446515:	e9 ac 86 03 00       	jmp    47ebc6 <_fini+0x446>
++  44651a:	90                   	nop
++  44651b:	90                   	nop
+   44651c:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   446522:	0f 86 26 ff ff ff    	jbe    44644e <___pthread_rwlock_unlock+0x7e>
+   446528:	83 c0 16             	add    $0x16,%eax
+@@ -71515,8 +71575,8 @@
+   44656f:	45 31 d2             	xor    %r10d,%r10d
+   446572:	ba ff ff ff 7f       	mov    $0x7fffffff,%edx
+   446577:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  44657c:	40 80 f6 81          	xor    $0x81,%sil
+-  446580:	0f 05                	syscall
++  44657c:	e9 55 86 03 00       	jmp    47ebd6 <_fini+0x456>
++  446581:	90                   	nop
+   446582:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   446588:	0f 86 6c ff ff ff    	jbe    4464fa <___pthread_rwlock_unlock+0x12a>
+   44658e:	83 c0 16             	add    $0x16,%eax
+@@ -71736,8 +71796,9 @@
+   44684d:	ba 01 00 00 00       	mov    $0x1,%edx
+   446852:	4c 89 e7             	mov    %r12,%rdi
+   446855:	40 80 f6 81          	xor    $0x81,%sil
+-  446859:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  44685e:	0f 05                	syscall
++  446859:	e9 87 83 03 00       	jmp    47ebe5 <_fini+0x465>
++  44685e:	90                   	nop
++  44685f:	90                   	nop
+   446860:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   446866:	0f 87 f9 00 00 00    	ja     446965 <___pthread_rwlock_wrlock+0x3c5>
+   44686c:	41 83 e0 04          	and    $0x4,%r8d
+@@ -71747,8 +71808,9 @@
+   446878:	ba ff ff ff 7f       	mov    $0x7fffffff,%edx
+   44687d:	48 89 df             	mov    %rbx,%rdi
+   446880:	40 80 f6 81          	xor    $0x81,%sil
+-  446884:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  446889:	0f 05                	syscall
++  446884:	e9 6c 83 03 00       	jmp    47ebf5 <_fini+0x475>
++  446889:	90                   	nop
++  44688a:	90                   	nop
+   44688b:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   446891:	0f 87 c1 00 00 00    	ja     446958 <___pthread_rwlock_wrlock+0x3b8>
+   446897:	41 b8 6e 00 00 00    	mov    $0x6e,%r8d
+@@ -71786,8 +71848,9 @@
+   44691c:	ba 01 00 00 00       	mov    $0x1,%edx
+   446921:	4c 89 e7             	mov    %r12,%rdi
+   446924:	40 80 f6 81          	xor    $0x81,%sil
+-  446928:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  44692d:	0f 05                	syscall
++  446928:	e9 d8 82 03 00       	jmp    47ec05 <_fini+0x485>
++  44692d:	90                   	nop
++  44692e:	90                   	nop
+   44692f:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   446935:	0f 86 e8 fc ff ff    	jbe    446623 <___pthread_rwlock_wrlock+0x83>
+   44693b:	83 c0 16             	add    $0x16,%eax
+@@ -71852,8 +71915,9 @@
+   446a05:	48 89 f0             	mov    %rsi,%rax
+   446a08:	48 89 c6             	mov    %rax,%rsi
+   446a0b:	41 ba 08 00 00 00    	mov    $0x8,%r10d
+-  446a11:	b8 0e 00 00 00       	mov    $0xe,%eax
+-  446a16:	0f 05                	syscall
++  446a11:	e9 ff 81 03 00       	jmp    47ec15 <_fini+0x495>
++  446a16:	90                   	nop
++  446a17:	90                   	nop
+   446a18:	89 c2                	mov    %eax,%edx
+   446a1a:	f7 da                	neg    %edx
+   446a1c:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
+@@ -93239,8 +93303,9 @@
+   45ba24:	b8 ff ff ff 7f       	mov    $0x7fffffff,%eax
+   45ba29:	48 39 c2             	cmp    %rax,%rdx
+   45ba2c:	48 0f 47 d0          	cmova  %rax,%rdx
+-  45ba30:	b8 d9 00 00 00       	mov    $0xd9,%eax
+-  45ba35:	0f 05                	syscall
++  45ba30:	e9 f0 31 02 00       	jmp    47ec25 <_fini+0x4a5>
++  45ba35:	90                   	nop
++  45ba36:	90                   	nop
+   45ba37:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   45ba3d:	77 01                	ja     45ba40 <__getdents+0x20>
+   45ba3f:	c3                   	ret
+@@ -93332,8 +93397,9 @@
+ 
+ 000000000045bb50 <__getpid>:
+   45bb50:	f3 0f 1e fa          	endbr64
+-  45bb54:	b8 27 00 00 00       	mov    $0x27,%eax
+-  45bb59:	0f 05                	syscall
++  45bb54:	e9 dc 30 02 00       	jmp    47ec35 <_fini+0x4b5>
++  45bb59:	90                   	nop
++  45bb5a:	90                   	nop
+   45bb5b:	c3                   	ret
+   45bb5c:	0f 1f 40 00          	nopl   0x0(%rax)
+ 
+@@ -93365,8 +93431,9 @@
+ 
+ 000000000045bba0 <__sched_getparam>:
+   45bba0:	f3 0f 1e fa          	endbr64
+-  45bba4:	b8 8f 00 00 00       	mov    $0x8f,%eax
+-  45bba9:	0f 05                	syscall
++  45bba4:	e9 9c 30 02 00       	jmp    47ec45 <_fini+0x4c5>
++  45bba9:	90                   	nop
++  45bbaa:	90                   	nop
+   45bbab:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
+   45bbb1:	73 01                	jae    45bbb4 <__sched_getparam+0x14>
+   45bbb3:	c3                   	ret
+@@ -93381,8 +93448,9 @@
+ 
+ 000000000045bbd0 <__sched_getscheduler>:
+   45bbd0:	f3 0f 1e fa          	endbr64
+-  45bbd4:	b8 91 00 00 00       	mov    $0x91,%eax
+-  45bbd9:	0f 05                	syscall
++  45bbd4:	e9 7c 30 02 00       	jmp    47ec55 <_fini+0x4d5>
++  45bbd9:	90                   	nop
++  45bbda:	90                   	nop
+   45bbdb:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
+   45bbe1:	73 01                	jae    45bbe4 <__sched_getscheduler+0x14>
+   45bbe3:	c3                   	ret
+@@ -93397,8 +93465,9 @@
+ 
+ 000000000045bc00 <__sched_get_priority_max>:
+   45bc00:	f3 0f 1e fa          	endbr64
+-  45bc04:	b8 92 00 00 00       	mov    $0x92,%eax
+-  45bc09:	0f 05                	syscall
++  45bc04:	e9 5c 30 02 00       	jmp    47ec65 <_fini+0x4e5>
++  45bc09:	90                   	nop
++  45bc0a:	90                   	nop
+   45bc0b:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
+   45bc11:	73 01                	jae    45bc14 <__sched_get_priority_max+0x14>
+   45bc13:	c3                   	ret
+@@ -93413,8 +93482,9 @@
+ 
+ 000000000045bc30 <__sched_get_priority_min>:
+   45bc30:	f3 0f 1e fa          	endbr64
+-  45bc34:	b8 93 00 00 00       	mov    $0x93,%eax
+-  45bc39:	0f 05                	syscall
++  45bc34:	e9 3c 30 02 00       	jmp    47ec75 <_fini+0x4f5>
++  45bc39:	90                   	nop
++  45bc3a:	90                   	nop
+   45bc3b:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
+   45bc41:	73 01                	jae    45bc44 <__sched_get_priority_min+0x14>
+   45bc43:	c3                   	ret
+@@ -93429,8 +93499,9 @@
+ 
+ 000000000045bc60 <__sched_setscheduler>:
+   45bc60:	f3 0f 1e fa          	endbr64
+-  45bc64:	b8 90 00 00 00       	mov    $0x90,%eax
+-  45bc69:	0f 05                	syscall
++  45bc64:	e9 1c 30 02 00       	jmp    47ec85 <_fini+0x505>
++  45bc69:	90                   	nop
++  45bc6a:	90                   	nop
+   45bc6b:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
+   45bc71:	73 01                	jae    45bc74 <__sched_setscheduler+0x14>
+   45bc73:	c3                   	ret
+@@ -93477,8 +93548,9 @@
+   45bd00:	48 89 85 08 ff ff ff 	mov    %rax,-0xf8(%rbp)
+   45bd07:	0f 84 21 04 00 00    	je     45c12e <__getcwd+0x49e>
+   45bd0d:	48 8b bd 08 ff ff ff 	mov    -0xf8(%rbp),%rdi
+-  45bd14:	b8 4f 00 00 00       	mov    $0x4f,%eax
+-  45bd19:	0f 05                	syscall
++  45bd14:	e9 7c 2f 02 00       	jmp    47ec95 <_fini+0x515>
++  45bd19:	90                   	nop
++  45bd1a:	90                   	nop
+   45bd1b:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   45bd21:	0f 87 85 05 00 00    	ja     45c2ac <__getcwd+0x61c>
+   45bd27:	85 c0                	test   %eax,%eax
+@@ -93914,8 +93986,9 @@
+ 
+ 000000000045c510 <__libc_lseek>:
+   45c510:	f3 0f 1e fa          	endbr64
+-  45c514:	b8 08 00 00 00       	mov    $0x8,%eax
+-  45c519:	0f 05                	syscall
++  45c514:	e9 8c 27 02 00       	jmp    47eca5 <_fini+0x525>
++  45c519:	90                   	nop
++  45c51a:	90                   	nop
+   45c51b:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   45c521:	77 05                	ja     45c528 <__libc_lseek+0x18>
+   45c523:	c3                   	ret
+@@ -93962,8 +94035,9 @@
+   45c5a4:	89 da                	mov    %ebx,%edx
+   45c5a6:	4c 89 e6             	mov    %r12,%rsi
+   45c5a9:	bf 9c ff ff ff       	mov    $0xffffff9c,%edi
+-  45c5ae:	b8 01 01 00 00       	mov    $0x101,%eax
+-  45c5b3:	0f 05                	syscall
++  45c5ae:	e9 02 27 02 00       	jmp    47ecb5 <_fini+0x535>
++  45c5b3:	90                   	nop
++  45c5b4:	90                   	nop
+   45c5b5:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   45c5bb:	0f 87 7f 00 00 00    	ja     45c640 <__libc_open+0xe0>
+   45c5c1:	48 8b 55 b8          	mov    -0x48(%rbp),%rdx
+@@ -93991,8 +94065,9 @@
+   45c613:	4c 89 e6             	mov    %r12,%rsi
+   45c616:	41 89 c0             	mov    %eax,%r8d
+   45c619:	bf 9c ff ff ff       	mov    $0xffffff9c,%edi
+-  45c61e:	b8 01 01 00 00       	mov    $0x101,%eax
+-  45c623:	0f 05                	syscall
++  45c61e:	e9 a2 26 02 00       	jmp    47ecc5 <_fini+0x545>
++  45c623:	90                   	nop
++  45c624:	90                   	nop
+   45c625:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   45c62b:	77 33                	ja     45c660 <__libc_open+0x100>
+   45c62d:	44 89 c7             	mov    %r8d,%edi
+@@ -94036,8 +94111,9 @@
+   45c6b0:	74 36                	je     45c6e8 <__libc_openat64+0x68>
+   45c6b2:	80 3d df e3 04 00 00 	cmpb   $0x0,0x4e3df(%rip)        # 4aaa98 <__libc_single_threaded>
+   45c6b9:	74 51                	je     45c70c <__libc_openat64+0x8c>
+-  45c6bb:	b8 01 01 00 00       	mov    $0x101,%eax
+-  45c6c0:	0f 05                	syscall
++  45c6bb:	e9 15 26 02 00       	jmp    47ecd5 <_fini+0x555>
++  45c6c0:	90                   	nop
++  45c6c1:	90                   	nop
+   45c6c2:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   45c6c8:	0f 87 8a 00 00 00    	ja     45c758 <__libc_openat64+0xd8>
+   45c6ce:	48 8b 55 c8          	mov    -0x38(%rbp),%rdx
+@@ -94065,8 +94141,9 @@
+   45c726:	41 89 c0             	mov    %eax,%r8d
+   45c729:	48 8b 75 a0          	mov    -0x60(%rbp),%rsi
+   45c72d:	8b 7d a8             	mov    -0x58(%rbp),%edi
+-  45c730:	b8 01 01 00 00       	mov    $0x101,%eax
+-  45c735:	0f 05                	syscall
++  45c730:	e9 b0 25 02 00       	jmp    47ece5 <_fini+0x565>
++  45c735:	90                   	nop
++  45c736:	90                   	nop
+   45c737:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   45c73d:	77 31                	ja     45c770 <__libc_openat64+0xf0>
+   45c73f:	44 89 c7             	mov    %r8d,%edi
+@@ -94093,9 +94170,8 @@
+ 000000000045c790 <__libc_read>:
+   45c790:	f3 0f 1e fa          	endbr64
+   45c794:	80 3d fd e2 04 00 00 	cmpb   $0x0,0x4e2fd(%rip)        # 4aaa98 <__libc_single_threaded>
+-  45c79b:	74 13                	je     45c7b0 <__libc_read+0x20>
+-  45c79d:	31 c0                	xor    %eax,%eax
+-  45c79f:	0f 05                	syscall
++  45c79b:	e9 55 25 02 00       	jmp    47ecf5 <_fini+0x575>
++  45c7a0:	90                   	nop
+   45c7a1:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   45c7a7:	77 4f                	ja     45c7f8 <__libc_read+0x68>
+   45c7a9:	c3                   	ret
+@@ -94110,9 +94186,9 @@
+   45c7c8:	48 8b 55 e8          	mov    -0x18(%rbp),%rdx
+   45c7cc:	48 8b 75 f0          	mov    -0x10(%rbp),%rsi
+   45c7d0:	41 89 c0             	mov    %eax,%r8d
+-  45c7d3:	8b 7d f8             	mov    -0x8(%rbp),%edi
+-  45c7d6:	31 c0                	xor    %eax,%eax
+-  45c7d8:	0f 05                	syscall
++  45c7d3:	e9 2c 25 02 00       	jmp    47ed04 <_fini+0x584>
++  45c7d8:	90                   	nop
++  45c7d9:	90                   	nop
+   45c7da:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   45c7e0:	77 2e                	ja     45c810 <__libc_read+0x80>
+   45c7e2:	44 89 c7             	mov    %r8d,%edi
+@@ -94151,8 +94227,9 @@
+   45c850:	f3 0f 1e fa          	endbr64
+   45c854:	80 3d 3d e2 04 00 00 	cmpb   $0x0,0x4e23d(%rip)        # 4aaa98 <__libc_single_threaded>
+   45c85b:	74 13                	je     45c870 <__libc_write+0x20>
+-  45c85d:	b8 01 00 00 00       	mov    $0x1,%eax
+-  45c862:	0f 05                	syscall
++  45c85d:	e9 b2 24 02 00       	jmp    47ed14 <_fini+0x594>
++  45c862:	90                   	nop
++  45c863:	90                   	nop
+   45c864:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   45c86a:	77 54                	ja     45c8c0 <__libc_write+0x70>
+   45c86c:	c3                   	ret
+@@ -94168,8 +94245,9 @@
+   45c88c:	48 8b 75 f0          	mov    -0x10(%rbp),%rsi
+   45c890:	41 89 c0             	mov    %eax,%r8d
+   45c893:	8b 7d f8             	mov    -0x8(%rbp),%edi
+-  45c896:	b8 01 00 00 00       	mov    $0x1,%eax
+-  45c89b:	0f 05                	syscall
++  45c896:	e9 89 24 02 00       	jmp    47ed24 <_fini+0x5a4>
++  45c89b:	90                   	nop
++  45c89c:	90                   	nop
+   45c89d:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   45c8a3:	77 33                	ja     45c8d8 <__libc_write+0x88>
+   45c8a5:	44 89 c7             	mov    %r8d,%edi
+@@ -94210,8 +94288,9 @@
+   45c919:	f7 d0                	not    %eax
+   45c91b:	a9 00 00 41 00       	test   $0x410000,%eax
+   45c920:	74 26                	je     45c948 <__openat64_nocancel+0x58>
+-  45c922:	b8 01 01 00 00       	mov    $0x101,%eax
+-  45c927:	0f 05                	syscall
++  45c922:	e9 0d 24 02 00       	jmp    47ed34 <_fini+0x5b4>
++  45c927:	90                   	nop
++  45c928:	90                   	nop
+   45c929:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   45c92f:	77 37                	ja     45c968 <__openat64_nocancel+0x78>
+   45c931:	48 8b 55 c8          	mov    -0x38(%rbp),%rdx
+@@ -94239,8 +94318,9 @@
+ 000000000045c980 <__pread64_nocancel>:
+   45c980:	f3 0f 1e fa          	endbr64
+   45c984:	49 89 ca             	mov    %rcx,%r10
+-  45c987:	b8 11 00 00 00       	mov    $0x11,%eax
+-  45c98c:	0f 05                	syscall
++  45c987:	e9 b8 23 02 00       	jmp    47ed44 <_fini+0x5c4>
++  45c98c:	90                   	nop
++  45c98d:	90                   	nop
+   45c98e:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   45c994:	77 0a                	ja     45c9a0 <__pread64_nocancel+0x20>
+   45c996:	c3                   	ret
+@@ -94257,8 +94337,9 @@
+ 
+ 000000000045c9c0 <__write_nocancel>:
+   45c9c0:	f3 0f 1e fa          	endbr64
+-  45c9c4:	b8 01 00 00 00       	mov    $0x1,%eax
+-  45c9c9:	0f 05                	syscall
++  45c9c4:	e9 8b 23 02 00       	jmp    47ed54 <_fini+0x5d4>
++  45c9c9:	90                   	nop
++  45c9ca:	90                   	nop
+   45c9cb:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   45c9d1:	77 05                	ja     45c9d8 <__write_nocancel+0x18>
+   45c9d3:	c3                   	ret
+@@ -94282,8 +94363,9 @@
+   45ca0d:	48 89 45 f8          	mov    %rax,-0x8(%rbp)
+   45ca11:	31 c0                	xor    %eax,%eax
+   45ca13:	48 8d 55 d0          	lea    -0x30(%rbp),%rdx
+-  45ca17:	b8 10 00 00 00       	mov    $0x10,%eax
+-  45ca1c:	0f 05                	syscall
++  45ca17:	e9 48 23 02 00       	jmp    47ed64 <_fini+0x5e4>
++  45ca1c:	90                   	nop
++  45ca1d:	90                   	nop
+   45ca1e:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   45ca24:	77 6a                	ja     45ca90 <__tcgetattr+0xa0>
+   45ca26:	89 c2                	mov    %eax,%edx
+@@ -94329,9 +94411,11 @@
+   45cab4:	49 89 f2             	mov    %rsi,%r10
+   45cab7:	31 d2                	xor    %edx,%edx
+   45cab9:	89 fe                	mov    %edi,%esi
+-  45cabb:	b8 2e 01 00 00       	mov    $0x12e,%eax
+-  45cac0:	31 ff                	xor    %edi,%edi
+-  45cac2:	0f 05                	syscall
++  45cabb:	e9 b4 22 02 00       	jmp    47ed74 <_fini+0x5f4>
++  45cac0:	90                   	nop
++  45cac1:	90                   	nop
++  45cac2:	90                   	nop
++  45cac3:	90                   	nop
+   45cac4:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   45caca:	77 04                	ja     45cad0 <__GI___getrlimit+0x20>
+   45cacc:	c3                   	ret
+@@ -97928,8 +98012,9 @@
+   45ff97:	64 48 8b 04 25 10 00 	mov    %fs:0x10,%rax
+   45ff9e:	00 00 
+   45ffa0:	48 8d 78 1c          	lea    0x1c(%rax),%rdi
+-  45ffa4:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  45ffa9:	0f 05                	syscall
++  45ffa4:	e9 dd ed 01 00       	jmp    47ed86 <_fini+0x606>
++  45ffa9:	90                   	nop
++  45ffaa:	90                   	nop
+   45ffab:	48 8d 3d 6e ab 04 00 	lea    0x4ab6e(%rip),%rdi        # 4aab20 <_dl_load_lock>
+   45ffb2:	44 89 8d 44 ff ff ff 	mov    %r9d,-0xbc(%rbp)
+   45ffb9:	4c 89 85 48 ff ff ff 	mov    %r8,-0xb8(%rbp)
+@@ -100864,8 +100949,7 @@
+   463062:	45 31 d2             	xor    %r10d,%r10d
+   463065:	ba 02 00 00 00       	mov    $0x2,%edx
+   46306a:	be 80 00 00 00       	mov    $0x80,%esi
+-  46306f:	44 89 c8             	mov    %r9d,%eax
+-  463072:	0f 05                	syscall
++  46306f:	e9 22 bd 01 00       	jmp    47ed96 <_fini+0x616>
+   463074:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   46307a:	76 dc                	jbe    463058 <__thread_gscope_wait+0x88>
+   46307c:	83 f8 f5             	cmp    $0xfffffff5,%eax
+@@ -100904,8 +100988,7 @@
+   463102:	45 31 d2             	xor    %r10d,%r10d
+   463105:	ba 02 00 00 00       	mov    $0x2,%edx
+   46310a:	be 80 00 00 00       	mov    $0x80,%esi
+-  46310f:	44 89 c8             	mov    %r9d,%eax
+-  463112:	0f 05                	syscall
++  46310f:	e9 90 bc 01 00       	jmp    47eda4 <_fini+0x624>
+   463114:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   46311a:	76 dc                	jbe    4630f8 <__thread_gscope_wait+0x128>
+   46311c:	83 f8 f5             	cmp    $0xfffffff5,%eax
+@@ -104731,8 +104814,11 @@
+   4669cc:	0f 1f 40 00          	nopl   0x0(%rax)
+ 
+ 00000000004669d0 <__restore_rt>:
+-  4669d0:	48 c7 c0 0f 00 00 00 	mov    $0xf,%rax
+-  4669d7:	0f 05                	syscall
++  4669d0:	e9 dd 83 01 00       	jmp    47edb2 <_fini+0x632>
++  4669d5:	90                   	nop
++  4669d6:	90                   	nop
++  4669d7:	90                   	nop
++  4669d8:	90                   	nop
+   4669d9:	0f 1f 80 00 00 00 00 	nopl   0x0(%rax)
+ 
+ 00000000004669e0 <__libc_sigaction>:
+@@ -104776,8 +104862,9 @@
+   466a9f:	0f 11 b5 38 ff ff ff 	movups %xmm6,-0xc8(%rbp)
+   466aa6:	0f 11 bd 48 ff ff ff 	movups %xmm7,-0xb8(%rbp)
+   466aad:	41 ba 08 00 00 00    	mov    $0x8,%r10d
+-  466ab3:	b8 0d 00 00 00       	mov    $0xd,%eax
+-  466ab8:	0f 05                	syscall
++  466ab3:	e9 0c 83 01 00       	jmp    47edc4 <_fini+0x644>
++  466ab8:	90                   	nop
++  466ab9:	90                   	nop
+   466aba:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   466ac0:	0f 87 ba 00 00 00    	ja     466b80 <__libc_sigaction+0x1a0>
+   466ac6:	89 c2                	mov    %eax,%edx
+@@ -111544,8 +111631,7 @@
+   46cb11:	45 31 d2             	xor    %r10d,%r10d
+   46cb14:	89 ca                	mov    %ecx,%edx
+   46cb16:	be 80 00 00 00       	mov    $0x80,%esi
+-  46cb1b:	44 89 c0             	mov    %r8d,%eax
+-  46cb1e:	0f 05                	syscall
++  46cb1b:	e9 b4 22 01 00       	jmp    47edd4 <_fini+0x654>
+   46cb20:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+   46cb26:	77 0d                	ja     46cb35 <__pthread_disable_asynccancel+0x65>
+   46cb28:	8b 0f                	mov    (%rdi),%ecx
+@@ -111701,8 +111787,7 @@
+   46ccd5:	81 f6 00 01 00 00    	xor    $0x100,%esi
+   46ccdb:	40 80 ce 89          	or     $0x89,%sil
+   46ccdf:	44 31 c6             	xor    %r8d,%esi
+-  46cce2:	45 31 c0             	xor    %r8d,%r8d
+-  46cce5:	0f 05                	syscall
++  46cce2:	e9 fb 20 01 00       	jmp    47ede2 <_fini+0x662>
+   46cce7:	85 c0                	test   %eax,%eax
+   46cce9:	7f 27                	jg     46cd12 <__futex_abstimed_wait64+0x62>
+   46cceb:	83 f8 ea             	cmp    $0xffffffea,%eax
+@@ -111756,8 +111841,9 @@
+   46cd83:	45 31 c0             	xor    %r8d,%r8d
+   46cd86:	49 89 ca             	mov    %rcx,%r10
+   46cd89:	44 89 e2             	mov    %r12d,%edx
+-  46cd8c:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  46cd91:	0f 05                	syscall
++  46cd8c:	e9 5f 20 01 00       	jmp    47edf0 <_fini+0x670>
++  46cd91:	90                   	nop
++  46cd92:	90                   	nop
+   46cd93:	48 89 c3             	mov    %rax,%rbx
+   46cd96:	89 d8                	mov    %ebx,%eax
+   46cd98:	85 db                	test   %ebx,%ebx
+@@ -111802,8 +111888,9 @@
+   46ce0d:	48 8b 7d d0          	mov    -0x30(%rbp),%rdi
+   46ce11:	41 b9 ff ff ff ff    	mov    $0xffffffff,%r9d
+   46ce17:	44 89 e2             	mov    %r12d,%edx
+-  46ce1a:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  46ce1f:	0f 05                	syscall
++  46ce1a:	e9 e1 1f 01 00       	jmp    47ee00 <_fini+0x680>
++  46ce1f:	90                   	nop
++  46ce20:	90                   	nop
+   46ce21:	44 89 ef             	mov    %r13d,%edi
+   46ce24:	48 89 c3             	mov    %rax,%rbx
+   46ce27:	e8 a4 fc ff ff       	call   46cad0 <__pthread_disable_asynccancel>
+@@ -111827,8 +111914,9 @@
+   46ce66:	48 85 d2             	test   %rdx,%rdx
+   46ce69:	0f 45 f1             	cmovne %ecx,%esi
+   46ce6c:	31 d2                	xor    %edx,%edx
+-  46ce6e:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  46ce73:	0f 05                	syscall
++  46ce6e:	e9 9d 1f 01 00       	jmp    47ee10 <_fini+0x690>
++  46ce73:	90                   	nop
++  46ce74:	90                   	nop
+   46ce75:	83 f8 da             	cmp    $0xffffffda,%eax
+   46ce78:	74 26                	je     46cea0 <__futex_lock_pi64+0x50>
+   46ce7a:	83 f8 92             	cmp    $0xffffff92,%eax
+@@ -114436,8 +114524,9 @@
+ 000000000046f340 <__GI___fstatat>:
+   46f340:	f3 0f 1e fa          	endbr64
+   46f344:	41 89 ca             	mov    %ecx,%r10d
+-  46f347:	b8 06 01 00 00       	mov    $0x106,%eax
+-  46f34c:	0f 05                	syscall
++  46f347:	e9 d4 fa 00 00       	jmp    47ee20 <_fini+0x6a0>
++  46f34c:	90                   	nop
++  46f34d:	90                   	nop
+   46f34e:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
+   46f353:	77 0b                	ja     46f360 <__GI___fstatat+0x20>
+   46f355:	31 c0                	xor    %eax,%eax
+@@ -117945,8 +118034,9 @@
+   47296c:	64 48 8b 04 25 10 00 	mov    %fs:0x10,%rax
+   472973:	00 00 
+   472975:	48 8d 78 1c          	lea    0x1c(%rax),%rdi
+-  472979:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  47297e:	0f 05                	syscall
++  472979:	e9 b2 c4 00 00       	jmp    47ee30 <_fini+0x6b0>
++  47297e:	90                   	nop
++  47297f:	90                   	nop
+   472980:	eb 8c                	jmp    47290e <_dl_fixup+0x10e>
+   472982:	66 0f 1f 44 00 00    	nopw   0x0(%rax,%rax,1)
+   472988:	31 c0                	xor    %eax,%eax
+@@ -122353,8 +122443,9 @@
+   476c07:	64 48 8b 04 25 10 00 	mov    %fs:0x10,%rax
+   476c0e:	00 00 
+   476c10:	48 8d 78 1c          	lea    0x1c(%rax),%rdi
+-  476c14:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  476c19:	0f 05                	syscall
++  476c14:	e9 27 82 00 00       	jmp    47ee40 <_fini+0x6c0>
++  476c19:	90                   	nop
++  476c1a:	90                   	nop
+   476c1b:	48 83 7d 98 00       	cmpq   $0x0,-0x68(%rbp)
+   476c20:	48 8b 4d b0          	mov    -0x50(%rbp),%rcx
+   476c24:	0f 84 ae fd ff ff    	je     4769d8 <_dl_vsym+0xb8>
+@@ -122513,8 +122604,9 @@
+   476e41:	64 48 8b 04 25 10 00 	mov    %fs:0x10,%rax
+   476e48:	00 00 
+   476e4a:	48 8d 78 1c          	lea    0x1c(%rax),%rdi
+-  476e4e:	b8 ca 00 00 00       	mov    $0xca,%eax
+-  476e53:	0f 05                	syscall
++  476e4e:	e9 fd 7f 00 00       	jmp    47ee50 <_fini+0x6d0>
++  476e53:	90                   	nop
++  476e54:	90                   	nop
+   476e55:	48 83 7d 98 00       	cmpq   $0x0,-0x68(%rbp)
+   476e5a:	48 8b 4d b0          	mov    -0x50(%rbp),%rcx
+   476e5e:	0f 84 3c fe ff ff    	je     476ca0 <_dl_sym+0x60>
+@@ -130847,4 +130939,345 @@
+   47e780:	f3 0f 1e fa          	endbr64
+   47e784:	48 83 ec 08          	sub    $0x8,%rsp
+   47e788:	48 83 c4 08          	add    $0x8,%rsp
+-  47e78c:	c3                   	ret
+\ No newline at end of file
++  47e78c:	c3                   	ret
++
++Disassembly of section .trampolineLB0:
++
++000000000047e790 <.trampolineLB0>:
++	...
++  47e798:	b8 0e 00 00 00       	mov    $0xe,%eax
++  47e79d:	ff 15 ed ff ff ff    	call   *-0x13(%rip)        # 47e790 <_fini+0x10>
++  47e7a3:	e9 86 2a f8 ff       	jmp    40122e <abort+0x97>
++  47e7a8:	31 ff                	xor    %edi,%edi
++  47e7aa:	89 d0                	mov    %edx,%eax
++  47e7ac:	ff 15 de ff ff ff    	call   *-0x22(%rip)        # 47e790 <_fini+0x10>
++  47e7b2:	e9 c7 36 f8 ff       	jmp    401e7e <__libc_start_call_main+0x8e>
++  47e7b7:	b8 9e 00 00 00       	mov    $0x9e,%eax
++  47e7bc:	ff 15 ce ff ff ff    	call   *-0x32(%rip)        # 47e790 <_fini+0x10>
++  47e7c2:	e9 25 57 f8 ff       	jmp    403eec <__libc_start_main+0x13c>
++  47e7c7:	48 89 76 10          	mov    %rsi,0x10(%rsi)
++  47e7cb:	ff 15 bf ff ff ff    	call   *-0x41(%rip)        # 47e790 <_fini+0x10>
++  47e7d1:	e9 01 5c f8 ff       	jmp    4043d7 <__libc_setup_tls+0x1b7>
++  47e7d6:	48 8d 35 c7 d1 07 00 	lea    0x7d1c7(%rip),%rsi        # 4fb9a4 <_end+0x4a77c>
++  47e7dd:	ff 15 ad ff ff ff    	call   *-0x53(%rip)        # 47e790 <_fini+0x10>
++  47e7e3:	e9 0b 5c f8 ff       	jmp    4043f3 <__libc_setup_tls+0x1d3>
++  47e7e8:	b8 e7 00 00 00       	mov    $0xe7,%eax
++  47e7ed:	ff 15 9d ff ff ff    	call   *-0x63(%rip)        # 47e790 <_fini+0x10>
++  47e7f3:	e9 07 5c f8 ff       	jmp    4043ff <__libc_setup_tls+0x1df>
++  47e7f8:	48 8d 35 f2 d0 07 00 	lea    0x7d0f2(%rip),%rsi        # 4fb8f1 <_end+0x4a6c9>
++  47e7ff:	ff 15 8b ff ff ff    	call   *-0x75(%rip)        # 47e790 <_fini+0x10>
++  47e805:	e9 be 5c f8 ff       	jmp    4044c8 <__libc_setup_tls+0x2a8>
++  47e80a:	b8 e7 00 00 00       	mov    $0xe7,%eax
++  47e80f:	ff 15 7b ff ff ff    	call   *-0x85(%rip)        # 47e790 <_fini+0x10>
++  47e815:	e9 ba 5c f8 ff       	jmp    4044d4 <__libc_setup_tls+0x2b4>
++  47e81a:	44 89 c8             	mov    %r9d,%eax
++  47e81d:	ff 15 6d ff ff ff    	call   *-0x93(%rip)        # 47e790 <_fini+0x10>
++  47e823:	e9 c9 bb f8 ff       	jmp    40a3f1 <__libc_message_impl+0x161>
++  47e828:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47e82d:	ff 15 5d ff ff ff    	call   *-0xa3(%rip)        # 47e790 <_fini+0x10>
++  47e833:	e9 a3 bd f8 ff       	jmp    40a5db <__lll_lock_wait_private+0x2b>
++  47e838:	40 80 f6 80          	xor    $0x80,%sil
++  47e83c:	ff 15 4e ff ff ff    	call   *-0xb2(%rip)        # 47e790 <_fini+0x10>
++  47e842:	e9 f9 bd f8 ff       	jmp    40a640 <__lll_lock_wait+0x30>
++  47e847:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47e84c:	ff 15 3e ff ff ff    	call   *-0xc2(%rip)        # 47e790 <_fini+0x10>
++  47e852:	e9 31 be f8 ff       	jmp    40a688 <__lll_lock_wake_private+0x18>
++  47e857:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47e85c:	ff 15 2e ff ff ff    	call   *-0xd2(%rip)        # 47e790 <_fini+0x10>
++  47e862:	e9 40 be f8 ff       	jmp    40a6a7 <__lll_lock_wake+0x17>
++  47e867:	b8 3e 01 00 00       	mov    $0x13e,%eax
++  47e86c:	ff 15 1e ff ff ff    	call   *-0xe2(%rip)        # 47e790 <_fini+0x10>
++  47e872:	e9 72 d3 f8 ff       	jmp    40bbe9 <ptmalloc_init.part.0+0x39>
++  47e877:	b8 e4 00 00 00       	mov    $0xe4,%eax
++  47e87c:	ff 15 0e ff ff ff    	call   *-0xf2(%rip)        # 47e790 <_fini+0x10>
++  47e882:	e9 60 99 f9 ff       	jmp    4181e7 <__clock_gettime+0x27>
++  47e887:	f4                   	hlt
++  47e888:	89 d0                	mov    %edx,%eax
++  47e88a:	ff 15 00 ff ff ff    	call   *-0x100(%rip)        # 47e790 <_fini+0x10>
++  47e890:	e9 b8 99 f9 ff       	jmp    41824d <_exit+0x1d>
++  47e895:	b8 05 00 00 00       	mov    $0x5,%eax
++  47e89a:	ff 15 f0 fe ff ff    	call   *-0x110(%rip)        # 47e790 <_fini+0x10>
++  47e8a0:	e9 c6 99 f9 ff       	jmp    41826b <__fstat+0xb>
++  47e8a5:	b8 03 00 00 00       	mov    $0x3,%eax
++  47e8aa:	ff 15 e0 fe ff ff    	call   *-0x120(%rip)        # 47e790 <_fini+0x10>
++  47e8b0:	e9 e6 99 f9 ff       	jmp    41829b <__close_nocancel+0xb>
++  47e8b5:	b8 48 00 00 00       	mov    $0x48,%eax
++  47e8ba:	ff 15 d0 fe ff ff    	call   *-0x130(%rip)        # 47e790 <_fini+0x10>
++  47e8c0:	e9 3d 9a f9 ff       	jmp    418302 <__fcntl64_nocancel+0x42>
++  47e8c5:	b8 48 00 00 00       	mov    $0x48,%eax
++  47e8ca:	ff 15 c0 fe ff ff    	call   *-0x140(%rip)        # 47e790 <_fini+0x10>
++  47e8d0:	e9 5b 9a f9 ff       	jmp    418330 <__fcntl64_nocancel+0x70>
++  47e8d5:	b8 48 00 00 00       	mov    $0x48,%eax
++  47e8da:	ff 15 b0 fe ff ff    	call   *-0x150(%rip)        # 47e790 <_fini+0x10>
++  47e8e0:	e9 a2 9a f9 ff       	jmp    418387 <__fcntl64_nocancel_adjusted+0x27>
++  47e8e5:	b8 48 00 00 00       	mov    $0x48,%eax
++  47e8ea:	ff 15 a0 fe ff ff    	call   *-0x160(%rip)        # 47e790 <_fini+0x10>
++  47e8f0:	e9 bb 9a f9 ff       	jmp    4183b0 <__fcntl64_nocancel_adjusted+0x50>
++  47e8f5:	bf 9c ff ff ff       	mov    $0xffffff9c,%edi
++  47e8fa:	ff 15 90 fe ff ff    	call   *-0x170(%rip)        # 47e790 <_fini+0x10>
++  47e900:	e9 1f 9b f9 ff       	jmp    418424 <__open64_nocancel+0x44>
++  47e905:	f3 0f 1e fa          	endbr64
++  47e909:	31 c0                	xor    %eax,%eax
++  47e90b:	ff 15 7f fe ff ff    	call   *-0x181(%rip)        # 47e790 <_fini+0x10>
++  47e911:	e9 72 9b f9 ff       	jmp    418488 <__read_nocancel+0x8>
++  47e916:	b8 0c 00 00 00       	mov    $0xc,%eax
++  47e91b:	ff 15 6f fe ff ff    	call   *-0x191(%rip)        # 47e790 <_fini+0x10>
++  47e921:	e9 95 9b f9 ff       	jmp    4184bb <__brk+0xb>
++  47e926:	b8 cc 00 00 00       	mov    $0xcc,%eax
++  47e92b:	ff 15 5f fe ff ff    	call   *-0x1a1(%rip)        # 47e790 <_fini+0x10>
++  47e931:	e9 f2 9d f9 ff       	jmp    418728 <__get_nprocs_sched+0x38>
++  47e936:	b8 1c 00 00 00       	mov    $0x1c,%eax
++  47e93b:	ff 15 4f fe ff ff    	call   *-0x1b1(%rip)        # 47e790 <_fini+0x10>
++  47e941:	e9 05 a2 f9 ff       	jmp    418b4b <__madvise+0xb>
++  47e946:	b8 09 00 00 00       	mov    $0x9,%eax
++  47e94b:	ff 15 3f fe ff ff    	call   *-0x1c1(%rip)        # 47e790 <_fini+0x10>
++  47e951:	e9 46 a2 f9 ff       	jmp    418b9c <__mmap64+0x2c>
++  47e956:	41 83 ca 40          	or     $0x40,%r10d
++  47e95a:	ff 15 30 fe ff ff    	call   *-0x1d0(%rip)        # 47e790 <_fini+0x10>
++  47e960:	e9 93 a2 f9 ff       	jmp    418bf8 <__mmap64+0x88>
++  47e965:	b8 0a 00 00 00       	mov    $0xa,%eax
++  47e96a:	ff 15 20 fe ff ff    	call   *-0x1e0(%rip)        # 47e790 <_fini+0x10>
++  47e970:	e9 c6 a2 f9 ff       	jmp    418c3b <__mprotect+0xb>
++  47e975:	b8 0b 00 00 00       	mov    $0xb,%eax
++  47e97a:	ff 15 10 fe ff ff    	call   *-0x1f0(%rip)        # 47e790 <_fini+0x10>
++  47e980:	e9 e6 a2 f9 ff       	jmp    418c6b <__munmap+0xb>
++  47e985:	b8 19 00 00 00       	mov    $0x19,%eax
++  47e98a:	ff 15 00 fe ff ff    	call   *-0x200(%rip)        # 47e790 <_fini+0x10>
++  47e990:	e9 bc a3 f9 ff       	jmp    418d51 <__mremap+0x31>
++  47e995:	b8 9d 00 00 00       	mov    $0x9d,%eax
++  47e99a:	ff 15 f0 fd ff ff    	call   *-0x210(%rip)        # 47e790 <_fini+0x10>
++  47e9a0:	e9 8a a4 f9 ff       	jmp    418e2f <__set_vma_name+0x7f>
++  47e9a5:	b8 63 00 00 00       	mov    $0x63,%eax
++  47e9aa:	ff 15 e0 fd ff ff    	call   *-0x220(%rip)        # 47e790 <_fini+0x10>
++  47e9b0:	e9 a6 a4 f9 ff       	jmp    418e5b <__sysinfo+0xb>
++  47e9b5:	48 89 da             	mov    %rbx,%rdx
++  47e9b8:	ff 15 d2 fd ff ff    	call   *-0x22e(%rip)        # 47e790 <_fini+0x10>
++  47e9be:	e9 dd fa f9 ff       	jmp    41e4a0 <_dl_get_origin+0x40>
++  47e9c3:	b8 14 00 00 00       	mov    $0x14,%eax
++  47e9c8:	ff 15 c2 fd ff ff    	call   *-0x23e(%rip)        # 47e790 <_fini+0x10>
++  47e9ce:	e9 16 fd f9 ff       	jmp    41e6e9 <_dl_debug_vdprintf+0x119>
++  47e9d3:	b8 da 00 00 00       	mov    $0xda,%eax
++  47e9d8:	ff 15 b2 fd ff ff    	call   *-0x24e(%rip)        # 47e790 <_fini+0x10>
++  47e9de:	e9 4f 15 fa ff       	jmp    41ff32 <__tls_init_tp+0x52>
++  47e9e3:	0f 11 83 d8 02 00 00 	movups %xmm0,0x2d8(%rbx)
++  47e9ea:	ff 15 a0 fd ff ff    	call   *-0x260(%rip)        # 47e790 <_fini+0x10>
++  47e9f0:	e9 99 15 fa ff       	jmp    41ff8e <__tls_init_tp+0xae>
++  47e9f5:	b8 4e 01 00 00       	mov    $0x14e,%eax
++  47e9fa:	ff 15 90 fd ff ff    	call   *-0x270(%rip)        # 47e790 <_fini+0x10>
++  47ea00:	e9 f9 15 fa ff       	jmp    41fffe <__tls_init_tp+0x11e>
++  47ea05:	b8 9e 00 00 00       	mov    $0x9e,%eax
++  47ea0a:	ff 15 80 fd ff ff    	call   *-0x280(%rip)        # 47e790 <_fini+0x10>
++  47ea10:	e9 3b 29 fa ff       	jmp    421350 <_dl_cet_open_check+0x290>
++  47ea15:	48 8d 75 f8          	lea    -0x8(%rbp),%rsi
++  47ea19:	ff 15 71 fd ff ff    	call   *-0x28f(%rip)        # 47e790 <_fini+0x10>
++  47ea1f:	e9 8a 29 fa ff       	jmp    4213ae <_dl_cet_setup_features+0x1e>
++  47ea24:	bf 03 50 00 00       	mov    $0x5003,%edi
++  47ea29:	89 d0                	mov    %edx,%eax
++  47ea2b:	ff 15 5f fd ff ff    	call   *-0x2a1(%rip)        # 47e790 <_fini+0x10>
++  47ea31:	e9 ca 29 fa ff       	jmp    421400 <_dl_cet_setup_features+0x70>
++  47ea36:	31 ff                	xor    %edi,%edi
++  47ea38:	89 f0                	mov    %esi,%eax
++  47ea3a:	ff 15 50 fd ff ff    	call   *-0x2b0(%rip)        # 47e790 <_fini+0x10>
++  47ea40:	e9 16 2a fa ff       	jmp    42145b <_dl_early_allocate+0x4b>
++  47ea45:	48 8d 3c 18          	lea    (%rax,%rbx,1),%rdi
++  47ea49:	89 f0                	mov    %esi,%eax
++  47ea4b:	ff 15 3f fd ff ff    	call   *-0x2c1(%rip)        # 47e790 <_fini+0x10>
++  47ea51:	e9 10 2a fa ff       	jmp    421466 <_dl_early_allocate+0x56>
++  47ea56:	b8 09 00 00 00       	mov    $0x9,%eax
++  47ea5b:	ff 15 2f fd ff ff    	call   *-0x2d1(%rip)        # 47e790 <_fini+0x10>
++  47ea61:	e9 25 2a fa ff       	jmp    42148b <_dl_early_allocate+0x7b>
++  47ea66:	b8 0e 00 00 00       	mov    $0xe,%eax
++  47ea6b:	ff 15 1f fd ff ff    	call   *-0x2e1(%rip)        # 47e790 <_fini+0x10>
++  47ea71:	e9 ae 61 fc ff       	jmp    444c24 <__pthread_kill_internal+0x54>
++  47ea76:	b8 0e 00 00 00       	mov    $0xe,%eax
++  47ea7b:	ff 15 0f fd ff ff    	call   *-0x2f1(%rip)        # 47e790 <_fini+0x10>
++  47ea81:	e9 e9 61 fc ff       	jmp    444c6f <__pthread_kill_internal+0x9f>
++  47ea86:	b8 ea 00 00 00       	mov    $0xea,%eax
++  47ea8b:	ff 15 ff fc ff ff    	call   *-0x301(%rip)        # 47e790 <_fini+0x10>
++  47ea91:	e9 1b 62 fc ff       	jmp    444cb1 <__pthread_kill_internal+0xe1>
++  47ea96:	b8 ba 00 00 00       	mov    $0xba,%eax
++  47ea9b:	ff 15 ef fc ff ff    	call   *-0x311(%rip)        # 47e790 <_fini+0x10>
++  47eaa1:	e9 21 62 fc ff       	jmp    444cc7 <__pthread_kill_internal+0xf7>
++  47eaa6:	b8 ea 00 00 00       	mov    $0xea,%eax
++  47eaab:	ff 15 df fc ff ff    	call   *-0x321(%rip)        # 47e790 <_fini+0x10>
++  47eab1:	e9 26 62 fc ff       	jmp    444cdc <__pthread_kill_internal+0x10c>
++  47eab6:	48 8d 35 4e 09 04 00 	lea    0x4094e(%rip),%rsi        # 4bf40b <_end+0xe1e3>
++  47eabd:	ff 15 cd fc ff ff    	call   *-0x333(%rip)        # 47e790 <_fini+0x10>
++  47eac3:	e9 bc 62 fc ff       	jmp    444d84 <__pthread_kill+0x64>
++  47eac8:	b8 0e 00 00 00       	mov    $0xe,%eax
++  47eacd:	ff 15 bd fc ff ff    	call   *-0x343(%rip)        # 47e790 <_fini+0x10>
++  47ead3:	e9 f8 62 fc ff       	jmp    444dd0 <__pthread_kill+0xb0>
++  47ead8:	b8 ea 00 00 00       	mov    $0xea,%eax
++  47eadd:	ff 15 ad fc ff ff    	call   *-0x353(%rip)        # 47e790 <_fini+0x10>
++  47eae3:	e9 29 63 fc ff       	jmp    444e11 <__pthread_kill+0xf1>
++  47eae8:	b8 ba 00 00 00       	mov    $0xba,%eax
++  47eaed:	ff 15 9d fc ff ff    	call   *-0x363(%rip)        # 47e790 <_fini+0x10>
++  47eaf3:	e9 2f 63 fc ff       	jmp    444e27 <__pthread_kill+0x107>
++  47eaf8:	b8 ea 00 00 00       	mov    $0xea,%eax
++  47eafd:	ff 15 8d fc ff ff    	call   *-0x373(%rip)        # 47e790 <_fini+0x10>
++  47eb03:	e9 34 63 fc ff       	jmp    444e3c <__pthread_kill+0x11c>
++  47eb08:	81 e6 80 00 00 00    	and    $0x80,%esi
++  47eb0e:	ff 15 7c fc ff ff    	call   *-0x384(%rip)        # 47e790 <_fini+0x10>
++  47eb14:	e9 f8 65 fc ff       	jmp    445111 <__pthread_mutex_lock_full+0x1e1>
++  47eb19:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47eb1e:	ff 15 6c fc ff ff    	call   *-0x394(%rip)        # 47e790 <_fini+0x10>
++  47eb24:	e9 c5 67 fc ff       	jmp    4452ee <__pthread_mutex_lock_full+0x3be>
++  47eb29:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47eb2e:	ff 15 5c fc ff ff    	call   *-0x3a4(%rip)        # 47e790 <_fini+0x10>
++  47eb34:	e9 d2 69 fc ff       	jmp    44550b <__pthread_mutex_lock_full+0x5db>
++  47eb39:	40 80 f6 81          	xor    $0x81,%sil
++  47eb3d:	ff 15 4d fc ff ff    	call   *-0x3b3(%rip)        # 47e790 <_fini+0x10>
++  47eb43:	e9 6d 6f fc ff       	jmp    445ab5 <__pthread_mutex_unlock_full+0x1a5>
++  47eb48:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47eb4d:	ff 15 3d fc ff ff    	call   *-0x3c3(%rip)        # 47e790 <_fini+0x10>
++  47eb53:	e9 af 71 fc ff       	jmp    445d07 <__pthread_mutex_unlock_full+0x3f7>
++  47eb58:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47eb5d:	ff 15 2d fc ff ff    	call   *-0x3d3(%rip)        # 47e790 <_fini+0x10>
++  47eb63:	e9 cb 71 fc ff       	jmp    445d33 <__pthread_mutex_unlock_full+0x423>
++  47eb68:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47eb6d:	ff 15 1d fc ff ff    	call   *-0x3e3(%rip)        # 47e790 <_fini+0x10>
++  47eb73:	e9 a1 74 fc ff       	jmp    446019 <__pthread_once_slow+0x79>
++  47eb78:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47eb7d:	ff 15 0d fc ff ff    	call   *-0x3f3(%rip)        # 47e790 <_fini+0x10>
++  47eb83:	e9 32 75 fc ff       	jmp    4460ba <__pthread_once_slow+0x11a>
++  47eb88:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47eb8d:	ff 15 fd fb ff ff    	call   *-0x403(%rip)        # 47e790 <_fini+0x10>
++  47eb93:	e9 b6 75 fc ff       	jmp    44614e <clear_once_control+0x1e>
++  47eb98:	40 80 f6 81          	xor    $0x81,%sil
++  47eb9c:	ff 15 ee fb ff ff    	call   *-0x412(%rip)        # 47e790 <_fini+0x10>
++  47eba2:	e9 45 77 fc ff       	jmp    4462ec <___pthread_rwlock_rdlock+0x10c>
++  47eba7:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47ebac:	ff 15 de fb ff ff    	call   *-0x422(%rip)        # 47e790 <_fini+0x10>
++  47ebb2:	e9 8b 78 fc ff       	jmp    446442 <___pthread_rwlock_unlock+0x72>
++  47ebb7:	40 80 f6 81          	xor    $0x81,%sil
++  47ebbb:	ff 15 cf fb ff ff    	call   *-0x431(%rip)        # 47e790 <_fini+0x10>
++  47ebc1:	e9 cf 78 fc ff       	jmp    446495 <___pthread_rwlock_unlock+0xc5>
++  47ebc6:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47ebcb:	ff 15 bf fb ff ff    	call   *-0x441(%rip)        # 47e790 <_fini+0x10>
++  47ebd1:	e9 46 79 fc ff       	jmp    44651c <___pthread_rwlock_unlock+0x14c>
++  47ebd6:	40 80 f6 81          	xor    $0x81,%sil
++  47ebda:	ff 15 b0 fb ff ff    	call   *-0x450(%rip)        # 47e790 <_fini+0x10>
++  47ebe0:	e9 9d 79 fc ff       	jmp    446582 <___pthread_rwlock_unlock+0x1b2>
++  47ebe5:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47ebea:	ff 15 a0 fb ff ff    	call   *-0x460(%rip)        # 47e790 <_fini+0x10>
++  47ebf0:	e9 6b 7c fc ff       	jmp    446860 <___pthread_rwlock_wrlock+0x2c0>
++  47ebf5:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47ebfa:	ff 15 90 fb ff ff    	call   *-0x470(%rip)        # 47e790 <_fini+0x10>
++  47ec00:	e9 86 7c fc ff       	jmp    44688b <___pthread_rwlock_wrlock+0x2eb>
++  47ec05:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47ec0a:	ff 15 80 fb ff ff    	call   *-0x480(%rip)        # 47e790 <_fini+0x10>
++  47ec10:	e9 1a 7d fc ff       	jmp    44692f <___pthread_rwlock_wrlock+0x38f>
++  47ec15:	b8 0e 00 00 00       	mov    $0xe,%eax
++  47ec1a:	ff 15 70 fb ff ff    	call   *-0x490(%rip)        # 47e790 <_fini+0x10>
++  47ec20:	e9 f3 7d fc ff       	jmp    446a18 <__pthread_sigmask+0x48>
++  47ec25:	b8 d9 00 00 00       	mov    $0xd9,%eax
++  47ec2a:	ff 15 60 fb ff ff    	call   *-0x4a0(%rip)        # 47e790 <_fini+0x10>
++  47ec30:	e9 02 ce fd ff       	jmp    45ba37 <__getdents+0x17>
++  47ec35:	b8 27 00 00 00       	mov    $0x27,%eax
++  47ec3a:	ff 15 50 fb ff ff    	call   *-0x4b0(%rip)        # 47e790 <_fini+0x10>
++  47ec40:	e9 16 cf fd ff       	jmp    45bb5b <__getpid+0xb>
++  47ec45:	b8 8f 00 00 00       	mov    $0x8f,%eax
++  47ec4a:	ff 15 40 fb ff ff    	call   *-0x4c0(%rip)        # 47e790 <_fini+0x10>
++  47ec50:	e9 56 cf fd ff       	jmp    45bbab <__sched_getparam+0xb>
++  47ec55:	b8 91 00 00 00       	mov    $0x91,%eax
++  47ec5a:	ff 15 30 fb ff ff    	call   *-0x4d0(%rip)        # 47e790 <_fini+0x10>
++  47ec60:	e9 76 cf fd ff       	jmp    45bbdb <__sched_getscheduler+0xb>
++  47ec65:	b8 92 00 00 00       	mov    $0x92,%eax
++  47ec6a:	ff 15 20 fb ff ff    	call   *-0x4e0(%rip)        # 47e790 <_fini+0x10>
++  47ec70:	e9 96 cf fd ff       	jmp    45bc0b <__sched_get_priority_max+0xb>
++  47ec75:	b8 93 00 00 00       	mov    $0x93,%eax
++  47ec7a:	ff 15 10 fb ff ff    	call   *-0x4f0(%rip)        # 47e790 <_fini+0x10>
++  47ec80:	e9 b6 cf fd ff       	jmp    45bc3b <__sched_get_priority_min+0xb>
++  47ec85:	b8 90 00 00 00       	mov    $0x90,%eax
++  47ec8a:	ff 15 00 fb ff ff    	call   *-0x500(%rip)        # 47e790 <_fini+0x10>
++  47ec90:	e9 d6 cf fd ff       	jmp    45bc6b <__sched_setscheduler+0xb>
++  47ec95:	b8 4f 00 00 00       	mov    $0x4f,%eax
++  47ec9a:	ff 15 f0 fa ff ff    	call   *-0x510(%rip)        # 47e790 <_fini+0x10>
++  47eca0:	e9 76 d0 fd ff       	jmp    45bd1b <__getcwd+0x8b>
++  47eca5:	b8 08 00 00 00       	mov    $0x8,%eax
++  47ecaa:	ff 15 e0 fa ff ff    	call   *-0x520(%rip)        # 47e790 <_fini+0x10>
++  47ecb0:	e9 66 d8 fd ff       	jmp    45c51b <__libc_lseek+0xb>
++  47ecb5:	b8 01 01 00 00       	mov    $0x101,%eax
++  47ecba:	ff 15 d0 fa ff ff    	call   *-0x530(%rip)        # 47e790 <_fini+0x10>
++  47ecc0:	e9 f0 d8 fd ff       	jmp    45c5b5 <__libc_open+0x55>
++  47ecc5:	b8 01 01 00 00       	mov    $0x101,%eax
++  47ecca:	ff 15 c0 fa ff ff    	call   *-0x540(%rip)        # 47e790 <_fini+0x10>
++  47ecd0:	e9 50 d9 fd ff       	jmp    45c625 <__libc_open+0xc5>
++  47ecd5:	b8 01 01 00 00       	mov    $0x101,%eax
++  47ecda:	ff 15 b0 fa ff ff    	call   *-0x550(%rip)        # 47e790 <_fini+0x10>
++  47ece0:	e9 dd d9 fd ff       	jmp    45c6c2 <__libc_openat64+0x42>
++  47ece5:	b8 01 01 00 00       	mov    $0x101,%eax
++  47ecea:	ff 15 a0 fa ff ff    	call   *-0x560(%rip)        # 47e790 <_fini+0x10>
++  47ecf0:	e9 42 da fd ff       	jmp    45c737 <__libc_openat64+0xb7>
++  47ecf5:	74 13                	je     47ed0a <_fini+0x58a>
++  47ecf7:	31 c0                	xor    %eax,%eax
++  47ecf9:	ff 15 91 fa ff ff    	call   *-0x56f(%rip)        # 47e790 <_fini+0x10>
++  47ecff:	e9 9d da fd ff       	jmp    45c7a1 <__libc_read+0x11>
++  47ed04:	8b 7d f8             	mov    -0x8(%rbp),%edi
++  47ed07:	31 c0                	xor    %eax,%eax
++  47ed09:	ff 15 81 fa ff ff    	call   *-0x57f(%rip)        # 47e790 <_fini+0x10>
++  47ed0f:	e9 c6 da fd ff       	jmp    45c7da <__libc_read+0x4a>
++  47ed14:	b8 01 00 00 00       	mov    $0x1,%eax
++  47ed19:	ff 15 71 fa ff ff    	call   *-0x58f(%rip)        # 47e790 <_fini+0x10>
++  47ed1f:	e9 40 db fd ff       	jmp    45c864 <__libc_write+0x14>
++  47ed24:	b8 01 00 00 00       	mov    $0x1,%eax
++  47ed29:	ff 15 61 fa ff ff    	call   *-0x59f(%rip)        # 47e790 <_fini+0x10>
++  47ed2f:	e9 69 db fd ff       	jmp    45c89d <__libc_write+0x4d>
++  47ed34:	b8 01 01 00 00       	mov    $0x101,%eax
++  47ed39:	ff 15 51 fa ff ff    	call   *-0x5af(%rip)        # 47e790 <_fini+0x10>
++  47ed3f:	e9 e5 db fd ff       	jmp    45c929 <__openat64_nocancel+0x39>
++  47ed44:	b8 11 00 00 00       	mov    $0x11,%eax
++  47ed49:	ff 15 41 fa ff ff    	call   *-0x5bf(%rip)        # 47e790 <_fini+0x10>
++  47ed4f:	e9 3a dc fd ff       	jmp    45c98e <__pread64_nocancel+0xe>
++  47ed54:	b8 01 00 00 00       	mov    $0x1,%eax
++  47ed59:	ff 15 31 fa ff ff    	call   *-0x5cf(%rip)        # 47e790 <_fini+0x10>
++  47ed5f:	e9 67 dc fd ff       	jmp    45c9cb <__write_nocancel+0xb>
++  47ed64:	b8 10 00 00 00       	mov    $0x10,%eax
++  47ed69:	ff 15 21 fa ff ff    	call   *-0x5df(%rip)        # 47e790 <_fini+0x10>
++  47ed6f:	e9 aa dc fd ff       	jmp    45ca1e <__tcgetattr+0x2e>
++  47ed74:	b8 2e 01 00 00       	mov    $0x12e,%eax
++  47ed79:	31 ff                	xor    %edi,%edi
++  47ed7b:	ff 15 0f fa ff ff    	call   *-0x5f1(%rip)        # 47e790 <_fini+0x10>
++  47ed81:	e9 3e dd fd ff       	jmp    45cac4 <__GI___getrlimit+0x14>
++  47ed86:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47ed8b:	ff 15 ff f9 ff ff    	call   *-0x601(%rip)        # 47e790 <_fini+0x10>
++  47ed91:	e9 15 12 fe ff       	jmp    45ffab <_dl_lookup_symbol_x+0xa6b>
++  47ed96:	44 89 c8             	mov    %r9d,%eax
++  47ed99:	ff 15 f1 f9 ff ff    	call   *-0x60f(%rip)        # 47e790 <_fini+0x10>
++  47ed9f:	e9 d0 42 fe ff       	jmp    463074 <__thread_gscope_wait+0xa4>
++  47eda4:	44 89 c8             	mov    %r9d,%eax
++  47eda7:	ff 15 e3 f9 ff ff    	call   *-0x61d(%rip)        # 47e790 <_fini+0x10>
++  47edad:	e9 62 43 fe ff       	jmp    463114 <__thread_gscope_wait+0x144>
++  47edb2:	48 c7 c0 0f 00 00 00 	mov    $0xf,%rax
++  47edb9:	ff 15 d1 f9 ff ff    	call   *-0x62f(%rip)        # 47e790 <_fini+0x10>
++  47edbf:	e9 15 7c fe ff       	jmp    4669d9 <__restore_rt+0x9>
++  47edc4:	b8 0d 00 00 00       	mov    $0xd,%eax
++  47edc9:	ff 15 c1 f9 ff ff    	call   *-0x63f(%rip)        # 47e790 <_fini+0x10>
++  47edcf:	e9 e6 7c fe ff       	jmp    466aba <__libc_sigaction+0xda>
++  47edd4:	44 89 c0             	mov    %r8d,%eax
++  47edd7:	ff 15 b3 f9 ff ff    	call   *-0x64d(%rip)        # 47e790 <_fini+0x10>
++  47eddd:	e9 3e dd fe ff       	jmp    46cb20 <__pthread_disable_asynccancel+0x50>
++  47ede2:	45 31 c0             	xor    %r8d,%r8d
++  47ede5:	ff 15 a5 f9 ff ff    	call   *-0x65b(%rip)        # 47e790 <_fini+0x10>
++  47edeb:	e9 f7 de fe ff       	jmp    46cce7 <__futex_abstimed_wait64+0x37>
++  47edf0:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47edf5:	ff 15 95 f9 ff ff    	call   *-0x66b(%rip)        # 47e790 <_fini+0x10>
++  47edfb:	e9 93 df fe ff       	jmp    46cd93 <__futex_abstimed_wait_cancelable64+0x53>
++  47ee00:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47ee05:	ff 15 85 f9 ff ff    	call   *-0x67b(%rip)        # 47e790 <_fini+0x10>
++  47ee0b:	e9 11 e0 fe ff       	jmp    46ce21 <__futex_abstimed_wait_cancelable64+0xe1>
++  47ee10:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47ee15:	ff 15 75 f9 ff ff    	call   *-0x68b(%rip)        # 47e790 <_fini+0x10>
++  47ee1b:	e9 55 e0 fe ff       	jmp    46ce75 <__futex_lock_pi64+0x25>
++  47ee20:	b8 06 01 00 00       	mov    $0x106,%eax
++  47ee25:	ff 15 65 f9 ff ff    	call   *-0x69b(%rip)        # 47e790 <_fini+0x10>
++  47ee2b:	e9 1e 05 ff ff       	jmp    46f34e <__GI___fstatat+0xe>
++  47ee30:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47ee35:	ff 15 55 f9 ff ff    	call   *-0x6ab(%rip)        # 47e790 <_fini+0x10>
++  47ee3b:	e9 40 3b ff ff       	jmp    472980 <_dl_fixup+0x180>
++  47ee40:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47ee45:	ff 15 45 f9 ff ff    	call   *-0x6bb(%rip)        # 47e790 <_fini+0x10>
++  47ee4b:	e9 cb 7d ff ff       	jmp    476c1b <_dl_vsym+0x2fb>
++  47ee50:	b8 ca 00 00 00       	mov    $0xca,%eax
++  47ee55:	ff 15 35 f9 ff ff    	call   *-0x6cb(%rip)        # 47e790 <_fini+0x10>
++  47ee5b:	e9 f5 7f ff ff       	jmp    476e55 <_dl_sym+0x215>
+\ No newline at end of file
