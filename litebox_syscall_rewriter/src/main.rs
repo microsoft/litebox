@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
     let mut input_binary = std::fs::File::open(&cli_args.input_binary)?;
     let mut input_binary_bytes = vec![];
     input_binary.read_to_end(&mut input_binary_bytes)?;
-    let res = litebox_syscall_rewriter::hook_syscalls_in_elf(
+    let output_binary = litebox_syscall_rewriter::hook_syscalls_in_elf(
         &input_binary_bytes,
         cli_args.trampoline_addr,
     )?;
@@ -44,6 +44,6 @@ fn main() -> anyhow::Result<()> {
     file.set_permissions(std::fs::Permissions::from_mode(
         input_binary.metadata()?.mode(),
     ))?;
-    file.write_all(&res)?;
+    file.write_all(&output_binary)?;
     Ok(())
 }
