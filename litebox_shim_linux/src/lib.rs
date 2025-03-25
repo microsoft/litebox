@@ -225,7 +225,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
                 return Errno::EINVAL.as_neg() as isize;
             };
             buf.mutate_subslice_with(..count, |user_buf| {
-                // TODO: user kernel buffer to avoid page faults
+                // TODO: use kernel buffer to avoid page faults
                 syscalls::file::sys_read(fd, user_buf, None).map_or_else(
                     |e| e.as_neg() as isize,
                     #[allow(clippy::cast_possible_wrap)]
@@ -242,7 +242,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
                 return Errno::EINVAL.as_neg() as isize;
             };
             buf.mutate_subslice_with(..count, |user_buf| {
-                // TODO: user kernel buffer to avoid page faults
+                // TODO: use kernel buffer to avoid page faults
                 syscalls::file::sys_pread64(fd, user_buf, off).map_or_else(
                     |e| e.as_neg() as isize,
                     #[allow(clippy::cast_possible_wrap)]
@@ -254,8 +254,14 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
         SyscallRequest::Mmap(addr, len, prot, flags, fd, offset) => {
             syscalls::mm::sys_mmap(addr, len, prot, flags, fd, offset).map_or_else(
                 |e| e.as_neg() as isize,
-                #[allow(clippy::cast_possible_wrap)]
-                |ptr| ptr.as_usize() as isize,
+                |ptr| {
+                    let Ok(addr) = isize::try_from(ptr.as_usize()) else {
+                        // Note it assumes user space address does not exceed isize::MAX (0x7FFF_FFFF_FFFF_FFFF).
+                        // For Linux the max user address is 0x7FFF_FFFF_F000.
+                        unreachable!("invalid user pointer");
+                    };
+                    addr
+                },
             )
         }
         SyscallRequest::Openat(dirfd, pathname, flags, mode) => {
