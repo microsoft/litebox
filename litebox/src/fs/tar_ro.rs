@@ -48,6 +48,11 @@ pub struct FileSystem<'platform, Platform: sync::RawSyncPrimitivesProvider> {
     descriptors: sync::RwLock<'platform, Platform, Descriptors>,
 }
 
+/// An empty tar file to support an empty file system.
+pub fn empty_tar_file() -> Vec<u8> {
+    alloc::vec![0u8; 10240]
+}
+
 impl<'platform, Platform: sync::RawSyncPrimitivesProvider> FileSystem<'platform, Platform> {
     /// Construct a new `FileSystem` instance from provided `tar_data`.
     ///
@@ -56,6 +61,8 @@ impl<'platform, Platform: sync::RawSyncPrimitivesProvider> FileSystem<'platform,
     /// to an _external_ forced-memcpy for any particular use case, then this could be updated to a
     /// more flexible type, at the cost of adding an additional lifetime throughout this file
     /// system.
+    ///
+    /// Use [`empty_tar_file`] if you need an empty file system.
     ///
     /// # Panics
     ///

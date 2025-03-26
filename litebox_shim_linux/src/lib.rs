@@ -29,26 +29,41 @@ use litebox_platform_multiplex::Platform;
 pub mod loader;
 pub mod syscalls;
 
-static FS: OnceBox<litebox::fs::in_mem::FileSystem<Platform>> = OnceBox::new();
+static FS: OnceBox<
+    litebox::fs::layered::FileSystem<
+        Platform,
+        litebox::fs::in_mem::FileSystem<Platform>,
+        litebox::fs::tar_ro::FileSystem<Platform>,
+    >,
+> = OnceBox::new();
 /// Set the global file system
+///
+/// NOTE: This function signature might change as better parametricity is added to file systems.
+/// Related: <https://github.com/MSRSSP/litebox/issues/24>
 ///
 /// # Panics
 ///
-/// Panics if this is called more than once or `litebox_fs` is called before this
-#[cfg(feature = "unstable-testing")]
-pub fn set_fs(fs: litebox::fs::in_mem::FileSystem<'static, Platform>) {
+/// Panics if this is called more than once or [`litebox_fs`] is called before this
+pub fn set_fs(
+    fs: litebox::fs::layered::FileSystem<
+        'static,
+        Platform,
+        litebox::fs::in_mem::FileSystem<'static, Platform>,
+        litebox::fs::tar_ro::FileSystem<'static, Platform>,
+    >,
+) {
     FS.set(alloc::boxed::Box::new(fs))
         .map_err(|_| {})
         .expect("fs is already set");
 }
 
 /// Get the global file system
+///
+/// # Panics
+///
+/// Panics if this is called before [`set_fs`] has been called
 pub fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
-    FS.get_or_init(|| {
-        alloc::boxed::Box::new(litebox::fs::in_mem::FileSystem::new(
-            litebox_platform_multiplex::platform(),
-        ))
-    })
+    FS.get().expect("fs has not yet been set")
 }
 
 pub(crate) fn litebox_sync<'a>() -> &'a litebox::sync::Synchronization<'static, Platform> {
