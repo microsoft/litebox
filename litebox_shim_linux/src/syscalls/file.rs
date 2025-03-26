@@ -3,18 +3,17 @@
 //! * `close`
 //! * `read`
 
-use alloc::vec::Vec;
 use litebox::{
     fs::{FileSystem as _, Mode, OFlags},
     path,
-    platform::RawMutPointer,
+    platform::RawConstPointer,
 };
 use litebox_common_linux::{AtFlags, FileStat, errno::Errno};
 
 use crate::{Descriptor, file_descriptors, litebox_fs};
 
 /// Open a file
-pub(crate) fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<i32, Errno> {
+pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<i32, Errno> {
     litebox_fs()
         .open(path, flags, mode)
         .map(|file| {
@@ -29,8 +28,8 @@ pub(crate) fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Resul
 
 /// Special value `libc::AT_FDCWD` used to indicate openat should use
 /// the current working directory.
-pub(crate) const AT_FDCWD: i32 = -100;
-pub(crate) fn sys_openat(
+pub const AT_FDCWD: i32 = -100;
+pub fn sys_openat(
     dirfd: i32,
     pathname: impl path::Arg,
     flags: OFlags,
@@ -46,7 +45,7 @@ pub(crate) fn sys_openat(
 ///
 /// `offset` is an optional offset to read from. If `None`, it will read from the current file position.
 /// If `Some`, it will read from the specified offset without changing the current file position.
-pub(crate) fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize, Errno> {
+pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
@@ -56,7 +55,7 @@ pub(crate) fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result
     }
 }
 
-pub(crate) fn sys_pread64(fd: i32, buf: &mut [u8], offset: usize) -> Result<usize, Errno> {
+pub fn sys_pread64(fd: i32, buf: &mut [u8], offset: usize) -> Result<usize, Errno> {
     if offset > isize::MAX as usize {
         return Err(Errno::EINVAL);
     }
@@ -64,7 +63,7 @@ pub(crate) fn sys_pread64(fd: i32, buf: &mut [u8], offset: usize) -> Result<usiz
 }
 
 /// Close a file
-pub(crate) fn sys_close(fd: i32) -> Result<(), Errno> {
+pub fn sys_close(fd: i32) -> Result<(), Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
@@ -75,9 +74,9 @@ pub(crate) fn sys_close(fd: i32) -> Result<(), Errno> {
     }
 }
 
-pub(crate) fn sys_writev(
+pub fn sys_writev(
     fd: i32,
-    iovs: Vec<litebox_common_linux::IoVec<litebox_platform_multiplex::Platform>>,
+    iovs: &[litebox_common_linux::IoVec<litebox_platform_multiplex::Platform>],
 ) -> Result<usize, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
@@ -89,20 +88,12 @@ pub(crate) fn sys_writev(
                 if iov.iov_len == 0 {
                     continue;
                 }
-                let Ok(iov_len) = isize::try_from(iov.iov_len) else {
-                    return Err(Errno::EINVAL);
-                };
-                let size = iov
-                    .iov_base
-                    .mutate_subslice_with(..iov_len, |user_buf| {
-                        // TODO: The data transfers performed by readv() and writev() are atomic:
-                        // the data written by writev() is written as a single block that is not intermingled
-                        // with output from writes in other processes.
-                        litebox_fs()
-                            .write(file, user_buf, None)
-                            .map_err(Errno::from)
-                    })
-                    .ok_or(Errno::EFAULT)??;
+                let slice =
+                    unsafe { iov.iov_base.to_cow_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
+                let size = litebox_fs()
+                    .write(file, &slice, None)
+                    .map_err(Errno::from)?;
+
                 total_written += size;
                 if size != iov.iov_len {
                     // Okay to transfer fewer bytes than requested
@@ -115,18 +106,18 @@ pub(crate) fn sys_writev(
     }
 }
 
-pub(crate) fn sys_access(
+pub fn sys_access(
     pathname: impl path::Arg,
     mode: litebox_common_linux::AccessFlags,
 ) -> Result<(), Errno> {
     Err(Errno::ENOSYS)
 }
 
-pub(crate) fn sys_readlink(pathname: impl path::Arg, buf: &mut [u8]) -> Result<usize, Errno> {
+pub fn sys_readlink(pathname: impl path::Arg, buf: &mut [u8]) -> Result<usize, Errno> {
     Err(Errno::ENOSYS)
 }
 
-pub(crate) fn sys_newfstatat(
+pub fn sys_newfstatat(
     dirfd: i32,
     pathname: impl path::Arg,
     flags: AtFlags,

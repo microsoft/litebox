@@ -153,7 +153,7 @@ pub struct FileStat {
 
 /// Linux's `iovec` struct
 pub struct IoVec<Platform: litebox::platform::RawPointerProvider> {
-    pub iov_base: Platform::RawMutPointer<u8>,
+    pub iov_base: Platform::RawConstPointer<u8>,
     pub iov_len: usize,
 }
 

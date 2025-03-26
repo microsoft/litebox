@@ -159,7 +159,7 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
         old_fs_base
     };
 
-    let syscall_args = unsafe { std::slice::from_raw_parts(args, 6) };
+    let syscall_args = unsafe { core::slice::from_raw_parts(args, 6) };
     std::eprintln!("syscall: {} args: {:?}", syscall_number, syscall_args);
     let dispatcher = match syscall_number {
         libc::SYS_read => SyscallRequest::Read {
@@ -207,7 +207,7 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                 Some(flags) => flags,
                 None => {
                     std::eprintln!("Invalid access flags: {}", syscall_args[1]);
-                    return -libc::EINVAL as isize;
+                    return -libc::EINVAL as i64;
                 }
             },
         ),
@@ -240,7 +240,7 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                 Some(flags) => flags,
                 None => {
                     std::eprintln!("Invalid at flags: {}", syscall_args[3]);
-                    return -libc::EINVAL as isize;
+                    return -libc::EINVAL as i64;
                 }
             },
         ),

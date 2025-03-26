@@ -5,7 +5,9 @@ use litebox::{
     platform::trivial_providers::ImpossiblePunchthroughProvider,
 };
 use litebox_platform_multiplex::{Platform, set_platform};
-use litebox_shim_linux::{litebox_fs, loader::load_program, set_fs, syscall_entry};
+use litebox_shim_linux::{
+    litebox_fs, loader::load_program, set_fs, syscall_entry, syscalls::file::sys_open,
+};
 
 global_asm!(
     "
@@ -36,6 +38,20 @@ pub fn init_platform() {
             .expect("Failed to set permissions on root");
     });
     set_fs(in_mem_fs);
+
+    // set up stdin, stdout, and stderr
+    assert_eq!(
+        sys_open("/stdin", OFlags::RDONLY | OFlags::CREAT, Mode::RWXU).unwrap(),
+        0
+    );
+    assert_eq!(
+        sys_open("/stdout", OFlags::WRONLY | OFlags::CREAT, Mode::RWXU).unwrap(),
+        1
+    );
+    assert_eq!(
+        sys_open("/stderr", OFlags::WRONLY | OFlags::CREAT, Mode::RWXU).unwrap(),
+        2
+    );
 
     install_dir("/lib64");
     install_dir("/lib");

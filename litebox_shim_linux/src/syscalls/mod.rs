@@ -1,4 +1,4 @@
 //! Syscalls Handlers
 
-pub(crate) mod file;
+pub mod file;
 pub(crate) mod mm;

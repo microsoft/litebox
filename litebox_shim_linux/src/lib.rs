@@ -11,10 +11,9 @@
 
 extern crate alloc;
 
+use alloc::vec;
 use alloc::vec::Vec;
-use alloc::{borrow::ToOwned, vec};
 
-use litebox_common_linux::IoVec;
 // TODO(jayb) Replace out all uses of once_cell and such with our own implementation that uses
 // platform-specific things within it.
 use once_cell::race::OnceBox;
@@ -278,35 +277,35 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
         SyscallRequest::Writev(fd, iov, count) => {
             // TODO: allow to write to stdout
             match unsafe { iov.to_cow_slice(count) } {
-                Some(iovs) => syscalls::file::sys_writev(fd, iovs.into_owned())
-                    .map_or_else(|e| e.as_neg() as isize, |size| size as isize),
-                None => Errno::EFAULT.as_neg() as isize,
+                Some(iovs) => syscalls::file::sys_writev(fd, &iovs)
+                    .map_or_else(|e| e.as_neg() as i64, |size| size as i64),
+                None => Errno::EFAULT.as_neg() as i64,
             }
         }
         SyscallRequest::Access(pathname, mode) => {
             let Some(path) = pathname.to_cstring() else {
-                return Errno::EFAULT.as_neg() as isize;
+                return Errno::EFAULT.as_neg() as i64;
             };
             std::eprintln!("access: {:?}, {:?}", path, mode);
-            syscalls::file::sys_access(path, mode).map_or_else(Errno::as_neg, |()| 0) as isize
+            syscalls::file::sys_access(path, mode).map_or_else(Errno::as_neg, |()| 0) as i64
         }
         SyscallRequest::Readlink(pathname, buf, size) => {
             let Some(path) = pathname.to_cstring() else {
-                return Errno::EFAULT.as_neg() as isize;
+                return Errno::EFAULT.as_neg() as i64;
             };
             let Ok(size) = isize::try_from(size) else {
-                return Errno::EINVAL.as_neg() as isize;
+                return Errno::EINVAL.as_neg() as i64;
             };
             std::eprintln!("readlink: {path:?}");
             buf.mutate_subslice_with(..size, |user_buf| {
                 // TODO: use kernel buffer to avoid page faults
                 syscalls::file::sys_readlink(path, user_buf).map_or_else(
-                    |e| e.as_neg() as isize,
+                    |e| e.as_neg() as i64,
                     #[allow(clippy::cast_possible_wrap)]
-                    |size| size as isize,
+                    |size| size as i64,
                 )
             })
-            .unwrap_or(Errno::EFAULT.as_neg() as isize)
+            .unwrap_or(Errno::EFAULT.as_neg() as i64)
         }
         SyscallRequest::Openat {
             dirfd,
@@ -324,13 +323,13 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
         }
         SyscallRequest::Newfstatat(dirfd, pathname, buf, flags) => {
             let Some(path) = pathname.to_cstring() else {
-                return Errno::EFAULT.as_neg() as isize;
+                return Errno::EFAULT.as_neg() as i64;
             };
             std::eprintln!("newfstatat: {path:?}");
             match syscalls::file::sys_newfstatat(dirfd, path, flags) {
                 Ok(stat) => unsafe { buf.write_at_offset(0, stat) }
-                    .map_or(Errno::EFAULT.as_neg() as isize, |()| 0),
-                Err(err) => err.as_neg() as isize,
+                    .map_or(Errno::EFAULT.as_neg() as i64, |()| 0),
+                Err(err) => err.as_neg() as i64,
             }
         }
         _ => {
