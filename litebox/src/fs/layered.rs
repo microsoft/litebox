@@ -284,9 +284,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         return Err(PathError::NoSuchFileOrDirectory)?;
                     }
                 }
-                EntryX::Upper { .. } => {
-                    // fallthrough since we might not have the descriptor open with the correct flags
-                }
+                EntryX::Upper { .. } => unreachable!(),
                 EntryX::Lower { .. } => {
                     // As an optimization, since a lower-level file entry is always opened with the
                     // same flags, and since it indicates that there is no such file at the upper
@@ -316,12 +314,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         match self.upper.open(&*path, flags, mode) {
             Ok(fd) => {
                 let entry = Arc::new(EntryX::Upper { fd });
-                let old = self
-                    .root
-                    .write()
-                    .entries
-                    .insert(path.clone(), Arc::clone(&entry));
-                assert!(old.is_none());
                 return Ok(self.descriptors.write().insert(Descriptor {
                     path,
                     flags,
@@ -737,6 +729,8 @@ struct Descriptor {
 struct RootDir {
     // keys are normalized paths; directories do not have the final `/` (thus the root would be at
     // the empty-string key "")
+    //
+    // Invariant: this only stores lower+tombstone entries, no upper entries will show up here.
     entries: HashMap<String, Entry>,
 }
 
