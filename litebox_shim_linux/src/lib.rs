@@ -216,6 +216,7 @@ pub extern "C" fn close(fd: i32) -> i32 {
 
 /// Entry point for the syscall handler
 pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
+    extern crate std;
     match request {
         SyscallRequest::Read { fd, buf, count } => {
             let Ok(count) = isize::try_from(count) else {
@@ -273,6 +274,34 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
                 },
             )
         }
+        SyscallRequest::Writev(fd, iov, count) => {
+            todo!()
+        }
+        SyscallRequest::Access(pathname, mode) => {
+            let Some(path) = pathname.to_cstring() else {
+                return Errno::EFAULT.as_neg() as isize;
+            };
+            std::eprintln!("access: {:?}, {:?}", path, mode);
+            syscalls::file::sys_access(path, mode).map_or_else(Errno::as_neg, |()| 0) as isize
+        }
+        SyscallRequest::Readlink(pathname, buf, size) => {
+            let Some(path) = pathname.to_cstring() else {
+                return Errno::EFAULT.as_neg() as isize;
+            };
+            let Ok(size) = isize::try_from(size) else {
+                return Errno::EINVAL.as_neg() as isize;
+            };
+            std::eprintln!("readlink: {path:?}");
+            buf.mutate_subslice_with(..size, |user_buf| {
+                // TODO: use kernel buffer to avoid page faults
+                syscalls::file::sys_readlink(path, user_buf).map_or_else(
+                    |e| e.as_neg() as isize,
+                    #[allow(clippy::cast_possible_wrap)]
+                    |size| size as isize,
+                )
+            })
+            .unwrap_or(Errno::EFAULT.as_neg() as isize)
+        }
         SyscallRequest::Openat {
             dirfd,
             pathname,
@@ -282,9 +311,21 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
             let Some(path) = pathname.to_cstring() else {
                 return i64::from(Errno::EFAULT.as_neg());
             };
+            std::eprintln!("openat: {path:?}");
             i64::from(
                 syscalls::file::sys_openat(dirfd, path, flags, mode).unwrap_or_else(Errno::as_neg),
             )
+        }
+        SyscallRequest::Newfstatat(dirfd, pathname, buf, flags) => {
+            let Some(path) = pathname.to_cstring() else {
+                return Errno::EFAULT.as_neg() as isize;
+            };
+            std::eprintln!("newfstatat: {path:?}");
+            match syscalls::file::sys_newfstatat(dirfd, path, flags) {
+                Ok(stat) => unsafe { buf.write_at_offset(0, stat) }
+                    .map_or(Errno::EFAULT.as_neg() as isize, |()| 0),
+                Err(err) => err.as_neg() as isize,
+            }
         }
         _ => {
             todo!()

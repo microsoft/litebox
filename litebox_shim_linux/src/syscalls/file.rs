@@ -7,7 +7,7 @@ use litebox::{
     fs::{FileSystem as _, Mode, OFlags},
     path,
 };
-use litebox_common_linux::errno::Errno;
+use litebox_common_linux::{AtFlags, FileStat, errno::Errno};
 
 use crate::{Descriptor, file_descriptors, litebox_fs};
 
@@ -71,4 +71,23 @@ pub(crate) fn sys_close(fd: i32) -> Result<(), Errno> {
         Some(Descriptor::Socket(socket_fd)) => todo!(),
         None => Err(Errno::EBADF),
     }
+}
+
+pub(crate) fn sys_access(
+    pathname: impl path::Arg,
+    mode: litebox_common_linux::AccessFlags,
+) -> Result<(), Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(crate) fn sys_readlink(pathname: impl path::Arg, buf: &mut [u8]) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(crate) fn sys_newfstatat(
+    dirfd: i32,
+    pathname: impl path::Arg,
+    flags: AtFlags,
+) -> Result<FileStat, Errno> {
+    Err(Errno::ENOSYS)
 }
