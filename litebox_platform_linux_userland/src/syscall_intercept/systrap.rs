@@ -17,7 +17,7 @@ struct SyscallSiginfo {
     arch: c_uint,
 }
 
-type SyscallHandler = dyn Fn(SyscallRequest<crate::LinuxUserland>) -> isize + Send + Sync;
+type SyscallHandler = dyn Fn(SyscallRequest<crate::LinuxUserland>) -> i64 + Send + Sync;
 static SYSCALL_HANDLER: OnceLock<Box<SyscallHandler>> = OnceLock::new();
 
 global_asm!(
@@ -85,11 +85,11 @@ sigsys_callback:
 "
 );
 unsafe extern "C" {
-    fn sigsys_callback() -> isize;
+    fn sigsys_callback() -> i64;
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize) -> isize {
+unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize) -> i64 {
     let syscall_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let dispatcher = match syscall_number {
         libc::SYS_read => SyscallRequest::Read {
@@ -311,7 +311,7 @@ fn register_seccomp_filter() {
 /// This function sets up the syscall handler and registers seccomp
 /// filters and the SIGSYS signal handler.
 pub(crate) fn init_sys_intercept(
-    handler: impl Fn(SyscallRequest<crate::LinuxUserland>) -> isize + Send + Sync + 'static,
+    handler: impl Fn(SyscallRequest<crate::LinuxUserland>) -> i64 + Send + Sync + 'static,
 ) {
     #[allow(
         clippy::match_wild_err_arm,

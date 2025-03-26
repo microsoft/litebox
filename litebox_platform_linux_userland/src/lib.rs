@@ -41,7 +41,7 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     pub fn new(
         tun_device_name: Option<&str>,
         punchthrough_provider: PunchthroughProvider,
-        syscall_handler: impl Fn(litebox_common_linux::SyscallRequest<LinuxUserland>) -> isize
+        syscall_handler: impl Fn(litebox_common_linux::SyscallRequest<LinuxUserland>) -> i64
         + Send
         + Sync
         + 'static,
