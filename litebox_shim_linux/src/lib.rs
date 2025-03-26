@@ -214,9 +214,6 @@ pub extern "C" fn close(fd: i32) -> i32 {
     syscalls::file::sys_close(fd).map_or_else(Errno::as_neg, |()| 0)
 }
 
-const SYS_MMAP: i64 = 9;
-const SYS_OPENAT: i64 = 257;
-
 /// Entry point for the syscall handler
 pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
     match request {
