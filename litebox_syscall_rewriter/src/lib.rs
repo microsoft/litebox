@@ -78,16 +78,23 @@ pub const TRAMPOLINE_SECTION_NAME: &str = ".trampolineLB0";
     reason = "any panics in here are not part of the public contract and should be fixed within this module"
 )]
 pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> Result<Vec<u8>> {
-    let mut input_workaround: Vec<u8>;
+    let mut input_workaround: Vec<u64>;
     let input_binary: &[u8] = if (&raw const input_binary[0] as usize) % 8 != 0 {
-        // JB: This is a REALLY ugly workaround to `object` requiring that its input binary being
-        // parsed is always aligned to 8-bytes (otherwise it throws an error); this is very
-        // surprising and probably should be corrected upstream in `object`, but for now, we just
-        // make a copy and re-run.
-        let start = 4 + 8 - (&raw const input_binary[0] as usize) % 8;
-        input_workaround = vec![0u8; start];
-        input_workaround.extend_from_slice(input_binary);
-        &input_workaround[start..]
+        // JB: This is an ugly workaround to `object` requiring that its input binary being parsed
+        // is always aligned to 8-bytes (otherwise it throws an error); this is very surprising and
+        // probably should be corrected upstream in `object`, but for now, we just make a copy and
+        // re-run. Essentially, we use u64 to force a 8-byte alignment, but then we look at it as
+        // bytes instead.
+        input_workaround = vec![0u64; input_binary.len() / 8 + 1];
+        let input_workaround_bytes: &mut [u8] = unsafe {
+            core::slice::from_raw_parts_mut(
+                input_workaround.as_mut_ptr().cast(),
+                input_workaround.len() * 8,
+            )
+        };
+        let input_workaround_bytes = &mut input_workaround_bytes[..input_binary.len()];
+        input_workaround_bytes.copy_from_slice(input_binary);
+        &*input_workaround_bytes
     } else {
         input_binary
     };
