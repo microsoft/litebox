@@ -3,9 +3,11 @@
 //! * `close`
 //! * `read`
 
+use alloc::vec::Vec;
 use litebox::{
     fs::{FileSystem as _, Mode, OFlags},
     path,
+    platform::RawMutPointer,
 };
 use litebox_common_linux::{AtFlags, FileStat, errno::Errno};
 
@@ -69,6 +71,46 @@ pub(crate) fn sys_close(fd: i32) -> Result<(), Errno> {
     match file_descriptors().write().remove(fd) {
         Some(Descriptor::File(file_fd)) => litebox_fs().close(file_fd).map_err(Errno::from),
         Some(Descriptor::Socket(socket_fd)) => todo!(),
+        None => Err(Errno::EBADF),
+    }
+}
+
+pub(crate) fn sys_writev(
+    fd: i32,
+    iovs: Vec<litebox_common_linux::IoVec<litebox_platform_multiplex::Platform>>,
+) -> Result<usize, Errno> {
+    let Ok(fd) = u32::try_from(fd) else {
+        return Err(Errno::EBADF);
+    };
+    match file_descriptors().read().get_file_fd(fd) {
+        Some(file) => {
+            let mut total_written = 0;
+            for iov in iovs {
+                if iov.iov_len == 0 {
+                    continue;
+                }
+                let Ok(iov_len) = isize::try_from(iov.iov_len) else {
+                    return Err(Errno::EINVAL);
+                };
+                let size = iov
+                    .iov_base
+                    .mutate_subslice_with(..iov_len, |user_buf| {
+                        // TODO: The data transfers performed by readv() and writev() are atomic:
+                        // the data written by writev() is written as a single block that is not intermingled
+                        // with output from writes in other processes.
+                        litebox_fs()
+                            .write(file, user_buf, None)
+                            .map_err(Errno::from)
+                    })
+                    .ok_or(Errno::EFAULT)??;
+                total_written += size;
+                if size != iov.iov_len {
+                    // Okay to transfer fewer bytes than requested
+                    break;
+                }
+            }
+            Ok(total_written)
+        }
         None => Err(Errno::EBADF),
     }
 }

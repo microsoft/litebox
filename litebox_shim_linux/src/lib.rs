@@ -11,9 +11,10 @@
 
 extern crate alloc;
 
-use alloc::vec;
 use alloc::vec::Vec;
+use alloc::{borrow::ToOwned, vec};
 
+use litebox_common_linux::IoVec;
 // TODO(jayb) Replace out all uses of once_cell and such with our own implementation that uses
 // platform-specific things within it.
 use once_cell::race::OnceBox;
@@ -217,7 +218,7 @@ pub extern "C" fn close(fd: i32) -> i32 {
 /// Entry point for the syscall handler
 pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
     extern crate std;
-    match request {
+    let ret = match request {
         SyscallRequest::Read { fd, buf, count } => {
             let Ok(count) = isize::try_from(count) else {
                 return i64::from(Errno::EINVAL.as_neg());
@@ -275,7 +276,12 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
             )
         }
         SyscallRequest::Writev(fd, iov, count) => {
-            todo!()
+            // TODO: allow to write to stdout
+            match unsafe { iov.to_cow_slice(count) } {
+                Some(iovs) => syscalls::file::sys_writev(fd, iovs.into_owned())
+                    .map_or_else(|e| e.as_neg() as isize, |size| size as isize),
+                None => Errno::EFAULT.as_neg() as isize,
+            }
         }
         SyscallRequest::Access(pathname, mode) => {
             let Some(path) = pathname.to_cstring() else {
@@ -330,5 +336,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
         _ => {
             todo!()
         }
-    }
+    };
+    std::eprintln!("syscall_entry: {ret}");
+    ret
 }

@@ -151,6 +151,16 @@ impl From<litebox::fs::errors::ReadError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::WriteError> for Errno {
+    fn from(value: litebox::fs::errors::WriteError) -> Self {
+        match value {
+            litebox::fs::errors::WriteError::NotAFile => Errno::EISDIR,
+            litebox::fs::errors::WriteError::NotForWriting => Errno::EACCES,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::platform::page_mgmt::AllocationError> for Errno {
     fn from(value: litebox::platform::page_mgmt::AllocationError) -> Self {
         match value {
