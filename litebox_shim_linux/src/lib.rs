@@ -20,7 +20,7 @@ use once_cell::race::OnceBox;
 
 use litebox::{
     mm::{PageManager, linux::PAGE_SIZE},
-    platform::{RawConstPointer as _, RawMutPointer},
+    platform::{RawConstPointer as _, RawMutPointer as _},
     sync::RwLock,
 };
 use litebox_common_linux::{SyscallRequest, errno::Errno};
@@ -220,7 +220,7 @@ const SYS_OPENAT: i64 = 257;
 /// Entry point for the syscall handler
 pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
     match request {
-        SyscallRequest::Read(fd, buf, count) => {
+        SyscallRequest::Read { fd, buf, count } => {
             let Ok(count) = isize::try_from(count) else {
                 return Errno::EINVAL.as_neg() as isize;
             };
@@ -234,16 +234,21 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
             })
             .unwrap_or(Errno::EFAULT.as_neg() as isize)
         }
-        SyscallRequest::Close(fd) => {
+        SyscallRequest::Close { fd } => {
             syscalls::file::sys_close(fd).map_or_else(Errno::as_neg, |()| 0) as isize
         }
-        SyscallRequest::Pread64(fd, buf, count, off) => {
+        SyscallRequest::Pread64 {
+            fd,
+            buf,
+            count,
+            offset,
+        } => {
             let Ok(count) = isize::try_from(count) else {
                 return Errno::EINVAL.as_neg() as isize;
             };
             buf.mutate_subslice_with(..count, |user_buf| {
                 // TODO: use kernel buffer to avoid page faults
-                syscalls::file::sys_pread64(fd, user_buf, off).map_or_else(
+                syscalls::file::sys_pread64(fd, user_buf, offset).map_or_else(
                     |e| e.as_neg() as isize,
                     #[allow(clippy::cast_possible_wrap)]
                     |size| size as isize,
@@ -251,8 +256,15 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
             })
             .unwrap_or(Errno::EFAULT.as_neg() as isize)
         }
-        SyscallRequest::Mmap(addr, len, prot, flags, fd, offset) => {
-            syscalls::mm::sys_mmap(addr, len, prot, flags, fd, offset).map_or_else(
+        SyscallRequest::Mmap {
+            addr,
+            length,
+            prot,
+            flags,
+            fd,
+            offset,
+        } => {
+            syscalls::mm::sys_mmap(addr, length, prot, flags, fd, offset).map_or_else(
                 |e| e.as_neg() as isize,
                 |ptr| {
                     let Ok(addr) = isize::try_from(ptr.as_usize()) else {
@@ -264,7 +276,12 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
                 },
             )
         }
-        SyscallRequest::Openat(dirfd, pathname, flags, mode) => {
+        SyscallRequest::Openat {
+            dirfd,
+            pathname,
+            flags,
+            mode,
+        } => {
             let Some(path) = pathname.to_cstring() else {
                 return Errno::EFAULT.as_neg() as isize;
             };

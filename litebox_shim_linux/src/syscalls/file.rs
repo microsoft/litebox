@@ -25,7 +25,9 @@ pub(crate) fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Resul
         .map_err(Errno::from)
 }
 
-const AT_FDCWD: i32 = -100;
+/// Special value `libc::AT_FDCWD` used to indicate openat should use
+/// the current working directory.
+pub(crate) const AT_FDCWD: i32 = -100;
 pub(crate) fn sys_openat(
     dirfd: i32,
     pathname: impl path::Arg,

@@ -88,48 +88,87 @@ unsafe extern "C" {
     fn sigsys_callback() -> isize;
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    reason = "reinterprete arguments directly"
-)]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize) -> isize {
     let syscall_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let dispatcher = match syscall_number {
-        libc::SYS_read => SyscallRequest::Read(
-            syscall_args[0] as i32,
-            TransparentMutPtr {
+        libc::SYS_read => SyscallRequest::Read {
+            #[allow(
+                clippy::cast_possible_wrap,
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            fd: syscall_args[0] as i32,
+            buf: TransparentMutPtr {
                 inner: syscall_args[1] as *mut u8,
             },
-            syscall_args[2],
-        ),
-        libc::SYS_close => SyscallRequest::Close(syscall_args[0] as i32),
-        libc::SYS_mmap => SyscallRequest::Mmap(
-            syscall_args[0],
-            syscall_args[1],
-            litebox_common_linux::ProtFlags::from_bits_truncate(syscall_args[2] as i32),
-            litebox_common_linux::MapFlags::from_bits(syscall_args[3] as i32)
-                .expect("unsupported flags"),
-            syscall_args[4] as i32,
-            syscall_args[5],
-        ),
-        libc::SYS_pread64 => SyscallRequest::Pread64(
-            syscall_args[0] as i32,
-            TransparentMutPtr {
+            count: syscall_args[2],
+        },
+        libc::SYS_close => SyscallRequest::Close {
+            #[allow(
+                clippy::cast_possible_wrap,
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            fd: syscall_args[0] as i32,
+        },
+        libc::SYS_mmap => SyscallRequest::Mmap {
+            addr: syscall_args[0],
+            length: syscall_args[1],
+            #[allow(
+                clippy::cast_possible_wrap,
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            prot: litebox_common_linux::ProtFlags::from_bits_truncate(syscall_args[2] as i32),
+            #[allow(
+                clippy::cast_possible_wrap,
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            flags: litebox_common_linux::MapFlags::from_bits_truncate(syscall_args[3] as i32),
+            #[allow(
+                clippy::cast_possible_wrap,
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            fd: syscall_args[4] as i32,
+            offset: syscall_args[5],
+        },
+        libc::SYS_pread64 => SyscallRequest::Pread64 {
+            #[allow(
+                clippy::cast_possible_wrap,
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            fd: syscall_args[0] as i32,
+            buf: TransparentMutPtr {
                 inner: syscall_args[1] as *mut u8,
             },
-            syscall_args[2],
-            syscall_args[3],
-        ),
-        libc::SYS_openat => SyscallRequest::Openat(
-            syscall_args[0] as i32,
-            TransparentConstPtr {
+            count: syscall_args[2],
+            offset: syscall_args[3],
+        },
+        libc::SYS_openat => SyscallRequest::Openat {
+            #[allow(
+                clippy::cast_possible_wrap,
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            dirfd: syscall_args[0] as i32,
+            pathname: TransparentConstPtr {
                 inner: syscall_args[1] as *const i8,
             },
-            litebox::fs::OFlags::from_bits_truncate(syscall_args[2] as u32),
-            litebox::fs::Mode::from_bits_truncate(syscall_args[3] as u32),
-        ),
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            flags: litebox::fs::OFlags::from_bits_truncate(syscall_args[2] as u32),
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            mode: litebox::fs::Mode::from_bits_truncate(syscall_args[3] as u32),
+        },
         _ => todo!(),
     };
     SYSCALL_HANDLER.get().unwrap()(dispatcher)
