@@ -112,6 +112,22 @@ pub(crate) fn sys_mmap(
     if len == 0 {
         return Err(Errno::EINVAL);
     }
+    if flags.intersects(
+        MapFlags::MAP_SHARED
+            | MapFlags::MAP_32BIT
+            | MapFlags::MAP_GROWSDOWN
+            | MapFlags::MAP_LOCKED
+            | MapFlags::MAP_NORESERVE
+            | MapFlags::MAP_POPULATE
+            | MapFlags::MAP_NONBLOCK
+            | MapFlags::MAP_SYNC
+            | MapFlags::MAP_HUGETLB
+            | MapFlags::MAP_HUGE_2MB
+            | MapFlags::MAP_HUGE_1GB
+            | MapFlags::MAP_FIXED_NOREPLACE,
+    ) {
+        todo!("Unsupported flags {:?}", flags);
+    }
 
     let aligned_len = align_up(len, PAGE_SIZE);
     if aligned_len == 0 {
