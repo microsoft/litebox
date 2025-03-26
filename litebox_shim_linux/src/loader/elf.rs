@@ -95,7 +95,7 @@ impl ElfLoaderMmap {
             addr.unwrap_or(0),
             len,
             litebox_common_linux::ProtFlags::from_bits_truncate(prot.bits()),
-            litebox_common_linux::MapFlags::from_bits_truncate(flags.bits()),
+            litebox_common_linux::MapFlags::from_bits(flags.bits()).expect("unsupported flags"),
             fd,
             offset,
         ) {
@@ -114,9 +114,10 @@ impl ElfLoaderMmap {
             addr.unwrap_or(0),
             len,
             litebox_common_linux::ProtFlags::from_bits_truncate(prot.bits()),
-            litebox_common_linux::MapFlags::from_bits_truncate(
+            litebox_common_linux::MapFlags::from_bits(
                 flags.bits() | MapFlags::MAP_ANONYMOUS.bits(),
-            ),
+            )
+            .expect("unsupported flags"),
             -1,
             0,
         ) {
