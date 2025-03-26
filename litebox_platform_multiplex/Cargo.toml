@@ -10,7 +10,6 @@ once_cell = { version = "1.20.2", default-features = false, features = ["alloc",
 
 [features]
 default = ["platform_linux_userland"]
-unstable-testing = ["litebox_platform_linux_userland?/unstable-testing"]
 platform_linux_userland = ["dep:litebox_platform_linux_userland"]
 
 [lints]

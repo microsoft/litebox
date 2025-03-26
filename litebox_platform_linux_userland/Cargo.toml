@@ -3,9 +3,6 @@ name = "litebox_platform_linux_userland"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-unstable-testing = []
-
 [dependencies]
 libc = { version = "0.2.169", default-features = false }
 litebox = { path = "../litebox/", version = "0.1.0" }
