@@ -18,3 +18,4 @@ workspace = true
 insta = "1.42.2"
 similar = "2.7.0"
 tempfile = "3.19.1"
+regex = "1.11.1"
