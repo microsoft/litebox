@@ -6,7 +6,6 @@ use core::ffi::{c_int, c_uint};
 use litebox::platform::trivial_providers::{TransparentConstPtr, TransparentMutPtr};
 use litebox_common_linux::SyscallRequest;
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
-use std::cell::Cell;
 
 // Define a custom structure to reinterpret siginfo_t
 #[repr(C)]
@@ -98,10 +97,11 @@ unsafe extern "C" {
 static GET_FS_BASE: spin::Once<fn() -> u64> = spin::Once::new();
 /// Function pointer to set the fs base.
 static SET_FS_BASE: spin::Once<fn(u64)> = spin::Once::new();
-thread_local! {
-    /// Litebox's per-thread fs base, set once for each thread.
-    static FS_BASE: Cell<u64> = const { Cell::new(0) };
-}
+/// Litebox's fs base.
+///
+/// TODO: Currently we assume there is only one thread in the process.
+/// Need to change it to per-thread.
+static FS_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Get fs register value via syscall `arch_prctl`.
 fn get_fs_base_arch_prctl() -> u64 {
@@ -155,7 +155,7 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
     // e.g., signal handlers.
     let old_fs_base = {
         let old_fs_base = GET_FS_BASE.get().unwrap()();
-        SET_FS_BASE.get().unwrap()(FS_BASE.get());
+        SET_FS_BASE.get().unwrap()(FS_BASE.load(core::sync::atomic::Ordering::Relaxed));
         old_fs_base
     };
 
@@ -341,7 +341,10 @@ fn register_seccomp_filter() {
 
 /// Save the current thread's fs base to thread local storage.
 fn save_current_fs_base() {
-    FS_BASE.with(|base| base.set(GET_FS_BASE.get().unwrap()()));
+    FS_BASE.store(
+        GET_FS_BASE.get().unwrap()(),
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 fn init_fs_base() {
