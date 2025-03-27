@@ -13,13 +13,10 @@ fn objdump(binary: &[u8]) -> String {
         .output()
         .unwrap();
 
-    // some version of objdump may append some spaces to instructions with no
-    // operands (e.g. `syscall`), so we need to trim them.
-    let re = regex::Regex::new(r"[a-z](64)?\s{1,4}$").unwrap();
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|l| !l.contains("/tmp/"))
-        .map(|l| if re.is_match(l) { l.trim_end() } else { l })
+        .map(|l| l.trim_end())
         .collect::<Vec<_>>()
         .join("\n")
 }
