@@ -1,11 +1,12 @@
 //! The systrap platform relies on seccomp’s `SECCOMP_RET_TRAP` feature to intercept system calls.
 
 use crate::utils::{ReinterpretSignedExt as _, TruncateExt as _};
+use core::arch::global_asm;
+use core::ffi::{c_int, c_uint};
 use litebox::platform::trivial_providers::{TransparentConstPtr, TransparentMutPtr};
 use litebox_common_linux::SyscallRequest;
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
-use std::os::raw::{c_int, c_uint};
-use std::{arch::global_asm, sync::OnceLock};
+use std::cell::Cell;
 
 // Define a custom structure to reinterpret siginfo_t
 #[repr(C)]
@@ -19,7 +20,7 @@ struct SyscallSiginfo {
 }
 
 type SyscallHandler = dyn Fn(SyscallRequest<crate::LinuxUserland>) -> i64 + Send + Sync;
-static SYSCALL_HANDLER: OnceLock<Box<SyscallHandler>> = OnceLock::new();
+static SYSCALL_HANDLER: spin::Once<Box<SyscallHandler>> = spin::Once::new();
 
 global_asm!(
     "
@@ -89,8 +90,75 @@ unsafe extern "C" {
     fn sigsys_callback() -> i64;
 }
 
+/*
+ * Depending on whether `fsgsbase` instructions are enabled, we can choose
+ * between `arch_prctl` or `rdfsbase/wrfsbase` to get/set the fs base.
+ */
+/// Function pointer to get the current fs base.
+static GET_FS_BASE: spin::Once<fn() -> u64> = spin::Once::new();
+/// Function pointer to set the fs base.
+static SET_FS_BASE: spin::Once<fn(u64)> = spin::Once::new();
+thread_local! {
+    /// Litebox's per-thread fs base, set once for each thread.
+    static FS_BASE: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Get fs register value via syscall `arch_prctl`.
+fn get_fs_base_arch_prctl() -> u64 {
+    const ARCH_GET_FS: u64 = 0x1003;
+    let mut fs_base = core::mem::MaybeUninit::<u64>::uninit();
+    assert_eq!(
+        unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_GET_FS, fs_base.as_mut_ptr()) },
+        0
+    );
+    unsafe { fs_base.assume_init() }
+}
+
+/// Set fs register value via syscall `arch_prctl`.
+fn set_fs_base_arch_prctl(fs_base: u64) {
+    const ARCH_SET_FS: u64 = 0x1002;
+    assert_eq!(
+        unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_FS, fs_base) },
+        0
+    );
+}
+
+/// Get fs register value via `rdfsbase` instruction.
+fn get_fs_base_rdfsbase() -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "rdfsbase {}",
+            out(reg) ret,
+            options(nostack, nomem)
+        );
+    }
+    ret
+}
+
+/// Set fs register value via `wrfsbase` instruction.
+fn set_fs_base_wrfsbase(fs_base: u64) {
+    unsafe {
+        core::arch::asm!(
+            "wrfsbase {}",
+            in(reg) fs_base,
+            options(nostack, nomem)
+        );
+    }
+}
+
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize) -> i64 {
+    // Litebox and the loaded program have different fs bases. Save and restore fs base
+    // whenever switching between them.
+    // TODO: we may also need to do in other places where switching world happens,
+    // e.g., signal handlers.
+    let old_fs_base = {
+        let old_fs_base = GET_FS_BASE.get().unwrap()();
+        SET_FS_BASE.get().unwrap()(FS_BASE.get());
+        old_fs_base
+    };
+
     let syscall_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let dispatcher = match syscall_number {
         libc::SYS_read => SyscallRequest::Read {
@@ -133,7 +201,10 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
         },
         _ => todo!(),
     };
-    SYSCALL_HANDLER.get().unwrap()(dispatcher)
+    let ret = SYSCALL_HANDLER.get().unwrap()(dispatcher);
+
+    SET_FS_BASE.get().unwrap()(old_fs_base);
+    ret
 }
 
 /// Signal handler for SIGSYS.
@@ -268,6 +339,25 @@ fn register_seccomp_filter() {
     seccompiler::apply_filter(&bpf_prog).unwrap();
 }
 
+/// Save the current thread's fs base to thread local storage.
+fn save_current_fs_base() {
+    FS_BASE.with(|base| base.set(GET_FS_BASE.get().unwrap()()));
+}
+
+fn init_fs_base() {
+    // from asm/hwcap2.h
+    const HWCAP2_FSGSBASE: u64 = 1 << 1;
+    if unsafe { libc::getauxval(libc::AT_HWCAP2) } & HWCAP2_FSGSBASE != 0 {
+        GET_FS_BASE.call_once(|| get_fs_base_rdfsbase);
+        SET_FS_BASE.call_once(|| set_fs_base_wrfsbase);
+    } else {
+        GET_FS_BASE.call_once(|| get_fs_base_arch_prctl);
+        SET_FS_BASE.call_once(|| set_fs_base_arch_prctl);
+    }
+
+    save_current_fs_base();
+}
+
 /// Initialize the syscall interception mechanism.
 ///
 /// This function sets up the syscall handler and registers seccomp
@@ -275,16 +365,7 @@ fn register_seccomp_filter() {
 pub(crate) fn init_sys_intercept(
     handler: impl Fn(SyscallRequest<crate::LinuxUserland>) -> i64 + Send + Sync + 'static,
 ) {
-    #[allow(
-        clippy::match_wild_err_arm,
-        reason = "Debug is not implemented for the type"
-    )]
-    match SYSCALL_HANDLER.set(Box::new(handler)) {
-        Ok(()) => {}
-        Err(_) => {
-            panic!("Syscall handler already set");
-        }
-    }
+    SYSCALL_HANDLER.call_once(|| Box::new(handler));
 
     register_sigsys_handler();
 
@@ -292,4 +373,6 @@ pub(crate) fn init_sys_intercept(
     // Use integration tests to test it.
     #[cfg(not(test))]
     register_seccomp_filter();
+
+    init_fs_base();
 }
