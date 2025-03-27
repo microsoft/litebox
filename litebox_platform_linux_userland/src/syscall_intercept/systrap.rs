@@ -340,6 +340,8 @@ fn register_seccomp_filter() {
 }
 
 /// Save the current thread's fs base to thread local storage.
+///
+/// TODO: make FS_BASE per-thread.
 fn save_current_fs_base() {
     FS_BASE.store(
         GET_FS_BASE.get().unwrap()(),
