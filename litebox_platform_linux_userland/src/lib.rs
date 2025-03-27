@@ -14,6 +14,7 @@ use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 
 mod syscall_intercept;
+mod utils;
 
 /// The userland Linux platform.
 ///
