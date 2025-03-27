@@ -7,7 +7,7 @@ snapshot_kind: text
 +++ rewritten
 @@ -131,8 +131,9 @@
    401217:	48 c7 85 50 ff ff ff 	movq   $0x20,-0xb0(%rbp)
-   40121e:	20 00 00 00 
+   40121e:	20 00 00 00
    401222:	bf 01 00 00 00       	mov    $0x1,%edi
 -  401227:	b8 0e 00 00 00       	mov    $0xe,%eax
 -  40122c:	0f 05                	syscall
@@ -146,7 +146,7 @@ snapshot_kind: text
 +  40a6a6:	90                   	nop
    40a6a7:	c3                   	ret
    40a6a8:	0f 1f 84 00 00 00 00 	nopl   0x0(%rax,%rax,1)
-   40a6af:	00 
+   40a6af:	00
 @@ -10840,8 +10851,9 @@
    40bbd5:	48 89 45 e8          	mov    %rax,-0x18(%rbp)
    40bbd9:	31 c0                	xor    %eax,%eax
@@ -267,7 +267,7 @@ snapshot_kind: text
    41842a:	77 34                	ja     418460 <__open64_nocancel+0x80>
    41842c:	48 8b 55 c8          	mov    -0x38(%rbp),%rdx
 @@ -23740,9 +23758,10 @@
-   41847f:	00 
+   41847f:	00
  
  0000000000418480 <__read_nocancel>:
 -  418480:	f3 0f 1e fa          	endbr64
@@ -499,7 +499,7 @@ snapshot_kind: text
    421407:	66 0f 1f 84 00 00 00 	nopw   0x0(%rax,%rax,1)
 @@ -33172,13 +33208,13 @@
    421446:	66 2e 0f 1f 84 00 00 	cs nopw 0x0(%rax,%rax,1)
-   42144d:	00 00 00 
+   42144d:	00 00 00
    421450:	be 0c 00 00 00       	mov    $0xc,%esi
 -  421455:	31 ff                	xor    %edi,%edi
 -  421457:	89 f0                	mov    %esi,%eax
@@ -552,7 +552,7 @@ snapshot_kind: text
 +  444c6e:	90                   	nop
    444c6f:	48 8b 45 d8          	mov    -0x28(%rbp),%rax
    444c73:	64 48 2b 04 25 28 00 	sub    %fs:0x28,%rax
-   444c7a:	00 00 
+   444c7a:	00 00
 @@ -69779,23 +69818,26 @@
    444ca3:	44 89 ea             	mov    %r13d,%edx
    444ca6:	89 c7                	mov    %eax,%edi
@@ -611,7 +611,7 @@ snapshot_kind: text
 +  444dcf:	90                   	nop
    444dd0:	48 8b 45 c8          	mov    -0x38(%rbp),%rax
    444dd4:	64 48 2b 04 25 28 00 	sub    %fs:0x28,%rax
-   444ddb:	00 00 
+   444ddb:	00 00
 @@ -69882,22 +69928,25 @@
    444e03:	44 89 e2             	mov    %r12d,%edx
    444e06:	89 c7                	mov    %eax,%edi
@@ -1127,7 +1127,7 @@ snapshot_kind: text
    45cacc:	c3                   	ret
 @@ -97928,8 +98012,9 @@
    45ff97:	64 48 8b 04 25 10 00 	mov    %fs:0x10,%rax
-   45ff9e:	00 00 
+   45ff9e:	00 00
    45ffa0:	48 8d 78 1c          	lea    0x1c(%rax),%rdi
 -  45ffa4:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  45ffa9:	0f 05                	syscall
@@ -1253,7 +1253,7 @@ snapshot_kind: text
    46f355:	31 c0                	xor    %eax,%eax
 @@ -117945,8 +118034,9 @@
    47296c:	64 48 8b 04 25 10 00 	mov    %fs:0x10,%rax
-   472973:	00 00 
+   472973:	00 00
    472975:	48 8d 78 1c          	lea    0x1c(%rax),%rdi
 -  472979:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  47297e:	0f 05                	syscall
@@ -1265,7 +1265,7 @@ snapshot_kind: text
    472988:	31 c0                	xor    %eax,%eax
 @@ -122353,8 +122443,9 @@
    476c07:	64 48 8b 04 25 10 00 	mov    %fs:0x10,%rax
-   476c0e:	00 00 
+   476c0e:	00 00
    476c10:	48 8d 78 1c          	lea    0x1c(%rax),%rdi
 -  476c14:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  476c19:	0f 05                	syscall
@@ -1277,7 +1277,7 @@ snapshot_kind: text
    476c24:	0f 84 ae fd ff ff    	je     4769d8 <_dl_vsym+0xb8>
 @@ -122513,8 +122604,9 @@
    476e41:	64 48 8b 04 25 10 00 	mov    %fs:0x10,%rax
-   476e48:	00 00 
+   476e48:	00 00
    476e4a:	48 8d 78 1c          	lea    0x1c(%rax),%rdi
 -  476e4e:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  476e53:	0f 05                	syscall
