@@ -26,8 +26,7 @@ unsafe extern "C" {
 }
 
 pub fn init_platform() {
-    let platform =
-        unsafe { Platform::new_for_test(ImpossiblePunchthroughProvider {}, syscall_entry) };
+    let platform = Platform::new(None, ImpossiblePunchthroughProvider {}, syscall_entry);
     set_platform(platform);
 
     let mut in_mem_fs =

@@ -21,7 +21,7 @@ mod syscall_intercept;
 /// traits. Notably, however, it supports parametric punchtrough (defaulted to impossible
 /// punchtrough).
 pub struct LinuxUserland<PunchthroughProvider: litebox::platform::PunchthroughProvider = litebox::platform::trivial_providers::ImpossiblePunchthroughProvider> {
-    tun_socket_fd: std::os::fd::OwnedFd,
+    tun_socket_fd: Option<std::os::fd::OwnedFd>,
     punchthrough_provider: PunchthroughProvider,
 }
 
@@ -30,21 +30,23 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
 {
     /// Create a new userland-Linux platform for use in `LiteBox`.
     ///
-    /// Takes a tun device name (such as `"tun0"` or `"tun99"`) to connect networking.
+    /// Takes an optional tun device name (such as `"tun0"` or `"tun99"`) to connect networking (if
+    /// not specified, networking is disabled).
+    ///
     /// Registers `syscall_handler` to handle all intercepted syscalls.
     ///
     /// # Panics
     ///
     /// Panics if the tun device could not be successfully opened.
     pub fn new(
-        tun_device_name: &str,
+        tun_device_name: Option<&str>,
         punchthrough_provider: PunchthroughProvider,
         syscall_handler: impl Fn(i64, &[usize]) -> i64 + Send + Sync + 'static,
     ) -> Self {
         // TODO: have better signature and registration of the syscall handler.
         syscall_intercept::init_sys_intercept(syscall_handler);
 
-        let tun_socket_fd = {
+        let tun_socket_fd = tun_device_name.map(|tun_device_name| {
             let tun_fd = nix::fcntl::open(
                 "/dev/net/tun",
                 nix::fcntl::OFlag::O_RDWR
@@ -77,30 +79,10 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
             // By taking ownership, we are letting the drop handler automatically run `libc::close`
             // when necessary.
             unsafe { std::os::fd::OwnedFd::from_raw_fd(tun_fd) }
-        };
+        });
 
         Self {
             tun_socket_fd,
-            punchthrough_provider,
-        }
-    }
-
-    /// Create a new userland-Linux platform for use in `LiteBox` for testing.
-    ///
-    /// # Safety
-    ///
-    /// This should only be used in tests.
-    /// Due to [the lack of support](https://github.com/rust-lang/cargo/issues/8379) for
-    /// `cfg(test)` across crates, we cannot use `#[cfg(test)]` here.
-    #[cfg(feature = "unstable-testing")]
-    pub unsafe fn new_for_test(
-        punchthrough_provider: PunchthroughProvider,
-        syscall_handler: impl Fn(i64, &[usize]) -> i64 + Send + Sync + 'static,
-    ) -> Self {
-        syscall_intercept::init_sys_intercept(syscall_handler);
-
-        Self {
-            tun_socket_fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(-2) },
             punchthrough_provider,
         }
     }
@@ -332,7 +314,10 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     litebox::platform::IPInterfaceProvider for LinuxUserland<PunchthroughProvider>
 {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        match nix::unistd::write(&self.tun_socket_fd, packet) {
+        let Some(tun_socket_fd) = self.tun_socket_fd.as_ref() else {
+            unimplemented!("networking without tun is unimplemented")
+        };
+        match nix::unistd::write(tun_socket_fd, packet) {
             Ok(size) => {
                 if size != packet.len() {
                     unimplemented!()
@@ -349,7 +334,10 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
         &self,
         packet: &mut [u8],
     ) -> Result<usize, litebox::platform::ReceiveError> {
-        nix::unistd::read(self.tun_socket_fd.as_raw_fd(), packet).map_err(|errno| {
+        let Some(tun_socket_fd) = self.tun_socket_fd.as_ref() else {
+            unimplemented!("networking without tun is unimplemented")
+        };
+        nix::unistd::read(tun_socket_fd.as_raw_fd(), packet).map_err(|errno| {
             if errno == nix::Error::EWOULDBLOCK || errno == nix::Error::EAGAIN {
                 litebox::platform::ReceiveError::WouldBlock
             } else {
