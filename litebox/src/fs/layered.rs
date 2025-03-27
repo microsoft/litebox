@@ -13,7 +13,7 @@ use super::errors::{
     ChmodError, CloseError, FileStatusError, MkdirError, OpenError, PathError, ReadError,
     RmdirError, SeekError, UnlinkError, WriteError,
 };
-use super::{FileStatus, Mode, OFlags, SeekWhence};
+use super::{FileStatus, FileType, Mode, OFlags, SeekWhence};
 
 /// A backing implementation of [`FileSystem`](super::FileSystem) that layers a file system on top
 /// of another.
@@ -68,18 +68,10 @@ impl<
 
     /// (private-only) check if the lower level has the path; if there is a path failure, just fail
     /// out with the relevant path error.
-    fn ensure_lower_contains(&self, path: &str) -> Result<(), PathError> {
-        // TODO: We current do this with `open`. We might want to switch to `stat` or similar.
-        match self.lower.open(path, OFlags::RDONLY, Mode::empty()) {
-            Ok(fd) => {
-                self.lower.close(fd);
-                Ok(())
-            }
-            Err(e) => match e {
-                OpenError::AccessNotAllowed => Ok(()),
-                OpenError::NoWritePerms | OpenError::ReadOnlyFileSystem => unreachable!(),
-                OpenError::PathError(path_error) => Err(path_error),
-            },
+    fn ensure_lower_contains(&self, path: &str) -> Result<FileType, PathError> {
+        match self.lower.file_status(path) {
+            Ok(stat) => Ok(stat.file_type),
+            Err(FileStatusError::PathError(e)) => Err(e),
         }
     }
 
@@ -116,13 +108,13 @@ impl<
                         // actually open up the file.
                         //
                         // TODO: We might need to make all the parent directories?
-                        //
-                        // TODO: We need to `stat` the mode from the lower level, and migrate it
-                        // over, but we currently don't have `stat` support yet, so we're just
-                        // making it have every bit in the mode flags. ┻━┻︵ \(°□°)/ ︵ ┻━┻
                         upper_fd = Some(
                             self.upper
-                                .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::all())
+                                .open(
+                                    path,
+                                    OFlags::CREAT | OFlags::WRONLY,
+                                    self.lower.fd_file_status(&lower_fd).unwrap().mode,
+                                )
                                 .unwrap(),
                         );
                     }
@@ -350,10 +342,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         flags.remove(OFlags::RDWR);
         flags.remove(OFlags::WRONLY);
         flags.insert(OFlags::RDONLY);
-        // TODO: We need to track whether what the permissions on the file from the
-        // lower layer themselves are, otherwise we might end up allowing write (via
-        // CoW) on a read-only file.
-        //
         // Any errors from lower level now _must_ propagate up, so we can just invoke
         // the lower level and set up the relevant descriptor upon success.
         let entry = Arc::new(EntryX::Lower {
@@ -606,8 +594,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 ) => {
                     // We must now check if the lower level contains the file; if it does not, we
                     // must exit with failure. Otherwise, we fallthrough to place the tombstone.
-                    self.ensure_lower_contains(&path)?;
-                    // TODO: We need to confirm that it is _actually_ file, and not a directory
+                    match self.ensure_lower_contains(&path)? {
+                        FileType::RegularFile => {
+                            // fallthrough
+                        }
+                        FileType::Directory => {
+                            return Err(UnlinkError::IsADirectory);
+                        }
+                    }
                 }
             },
         }
@@ -656,11 +650,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         // lower layer, and erroring out if no lower layer component exists of that form.
         for dir in path.increasing_ancestors().map_err(PathError::from)? {
             match self.ensure_lower_contains(dir) {
-                Ok(()) => {
+                Ok(FileType::Directory) => {
                     // The dir does in fact exist; we just need to confirm that the upper layer also
                     // has it.
-                    // TODO: Get the mode using `stat` or whatever
-                    match self.upper.mkdir(dir, mode) {
+                    match self
+                        .upper
+                        .mkdir(dir, self.lower.file_status(dir).unwrap().mode)
+                    {
                         Ok(()) => {
                             // fallthrough to next increasing ancestor
                             continue;
@@ -686,9 +682,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         },
                     }
                 }
+                Ok(FileType::RegularFile) | Err(PathError::MissingComponent) => unreachable!(),
                 Err(PathError::ComponentNotADirectory) => unimplemented!(),
                 Err(PathError::InvalidPathname) => unreachable!("we just confirmed valid path"),
-                Err(PathError::MissingComponent) => unreachable!(),
                 Err(e @ PathError::NoSearchPerms { .. }) => {
                     return Err(e)?;
                 }
