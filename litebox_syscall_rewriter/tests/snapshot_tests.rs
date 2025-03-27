@@ -16,7 +16,7 @@ fn objdump(binary: &[u8]) -> String {
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|l| !l.contains("/tmp/"))
-        .map(|l| l.trim_end())
+        .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")
 }
