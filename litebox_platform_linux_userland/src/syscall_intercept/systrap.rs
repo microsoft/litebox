@@ -1,5 +1,7 @@
 //! The systrap platform relies on seccomp’s `SECCOMP_RET_TRAP` feature to intercept system calls.
 
+use litebox::platform::trivial_providers::{TransparentConstPtr, TransparentMutPtr};
+use litebox_common_linux::SyscallRequest;
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use std::os::raw::{c_int, c_uint};
 use std::{arch::global_asm, sync::OnceLock};
@@ -15,7 +17,7 @@ struct SyscallSiginfo {
     arch: c_uint,
 }
 
-type SyscallHandler = dyn Fn(i64, &[usize]) -> i64 + Send + Sync;
+type SyscallHandler = dyn Fn(SyscallRequest<crate::LinuxUserland>) -> i64 + Send + Sync;
 static SYSCALL_HANDLER: OnceLock<Box<SyscallHandler>> = OnceLock::new();
 
 global_asm!(
@@ -25,7 +27,7 @@ global_asm!(
     .globl  sigsys_callback
     .type   sigsys_callback,@function
 sigsys_callback:
-    /* TODO: save floating point registers if needed */
+    /* TODO: save float and vector registers (xsave or fxsave) */
     /* Save caller-saved registers */
     push rcx
     push rdx
@@ -38,7 +40,8 @@ sigsys_callback:
     pushf
 
     /* Save the original stack pointer */
-    mov r11, rsp
+    push rbp
+    mov  rbp, rsp
 
     /* Align the stack to 16 bytes */
     and rsp, -16
@@ -63,7 +66,8 @@ sigsys_callback:
     call syscall_dispatcher
 
     /* Restore the original stack pointer */
-    mov rsp, r11
+    mov  rsp, rbp
+    pop  rbp
 
     /* Restore caller-saved registers */
     popf
@@ -87,9 +91,93 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize) -> i64 {
     let syscall_args = unsafe { std::slice::from_raw_parts(args, 6) };
-    SYSCALL_HANDLER.get().unwrap()(syscall_number, syscall_args)
+    let dispatcher = match syscall_number {
+        libc::SYS_read => SyscallRequest::Read {
+            #[allow(
+                clippy::cast_possible_wrap,
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            fd: syscall_args[0] as i32,
+            buf: TransparentMutPtr {
+                inner: syscall_args[1] as *mut u8,
+            },
+            count: syscall_args[2],
+        },
+        libc::SYS_close => SyscallRequest::Close {
+            #[allow(
+                clippy::cast_possible_wrap,
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            fd: syscall_args[0] as i32,
+        },
+        libc::SYS_mmap => SyscallRequest::Mmap {
+            addr: syscall_args[0],
+            length: syscall_args[1],
+            #[allow(
+                clippy::cast_possible_wrap,
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            prot: litebox_common_linux::ProtFlags::from_bits_truncate(syscall_args[2] as i32),
+            #[allow(
+                clippy::cast_possible_wrap,
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            flags: litebox_common_linux::MapFlags::from_bits_truncate(syscall_args[3] as i32),
+            #[allow(
+                clippy::cast_possible_wrap,
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            fd: syscall_args[4] as i32,
+            offset: syscall_args[5],
+        },
+        libc::SYS_pread64 => SyscallRequest::Pread64 {
+            #[allow(
+                clippy::cast_possible_wrap,
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            fd: syscall_args[0] as i32,
+            buf: TransparentMutPtr {
+                inner: syscall_args[1] as *mut u8,
+            },
+            count: syscall_args[2],
+            offset: syscall_args[3],
+        },
+        libc::SYS_openat => SyscallRequest::Openat {
+            #[allow(
+                clippy::cast_possible_wrap,
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            dirfd: syscall_args[0] as i32,
+            pathname: TransparentConstPtr {
+                inner: syscall_args[1] as *const i8,
+            },
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            flags: litebox::fs::OFlags::from_bits_truncate(syscall_args[2] as u32),
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "reinterprete arguments directly"
+            )]
+            mode: litebox::fs::Mode::from_bits_truncate(syscall_args[3] as u32),
+        },
+        _ => todo!(),
+    };
+    SYSCALL_HANDLER.get().unwrap()(dispatcher)
 }
 
+/// Signal handler for SIGSYS.
+///
+/// Note: only async-signal-safe functions should be used in this handler.
+/// See full list at <https://www.man7.org/linux/man-pages/man7/signal-safety.7.html>
 extern "C" fn sigsys_handler(sig: c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
     unsafe {
         assert!(sig == libc::SIGSYS);
@@ -130,15 +218,85 @@ fn register_sigsys_handler() {
 
 #[cfg(not(test))]
 fn register_seccomp_filter() {
-    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
+    use seccompiler::{
+        BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+        SeccompRule,
+    };
 
-    let rule_map = std::collections::BTreeMap::<i64, Vec<SeccompRule>>::new();
+    // allow list
+    // TODO: remove syscalls once they are implemented in the shim
+    let rules = vec![
+        (libc::SYS_write, vec![]),
+        (
+            libc::SYS_mmap,
+            vec![
+                // Allow mmap with MAP_ANONYMOUS (i.e., non-file-backed)
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        3,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::MaskedEq(
+                            u64::try_from(nix::sys::mman::MapFlags::MAP_ANONYMOUS.bits()).unwrap(),
+                        ),
+                        u64::try_from(nix::sys::mman::MapFlags::MAP_ANONYMOUS.bits()).unwrap(),
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            ],
+        ),
+        (libc::SYS_fstat, vec![]),
+        (libc::SYS_mprotect, vec![]),
+        (libc::SYS_munmap, vec![]),
+        (libc::SYS_brk, vec![]),
+        (
+            libc::SYS_rt_sigaction,
+            vec![
+                // Allow rt_sigaction for non-SIGSYS signals
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        0,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::Ne,
+                        Signal::SIGSYS as u64,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            ],
+        ),
+        (libc::SYS_rt_sigprocmask, vec![]),
+        (libc::SYS_rt_sigreturn, vec![]),
+        (libc::SYS_access, vec![]),
+        (libc::SYS_sched_yield, vec![]),
+        (libc::SYS_getpid, vec![]),
+        (libc::SYS_uname, vec![]),
+        (libc::SYS_getcwd, vec![]),
+        (libc::SYS_readlink, vec![]),
+        (libc::SYS_getuid, vec![]),
+        (libc::SYS_getgid, vec![]),
+        (libc::SYS_geteuid, vec![]),
+        (libc::SYS_getegid, vec![]),
+        (libc::SYS_sigaltstack, vec![]),
+        (libc::SYS_arch_prctl, vec![]),
+        (libc::SYS_gettid, vec![]),
+        (libc::SYS_futex, vec![]),
+        (libc::SYS_set_tid_address, vec![]),
+        (libc::SYS_exit_group, vec![]),
+        (libc::SYS_tgkill, vec![]),
+        (libc::SYS_newfstatat, vec![]),
+        (libc::SYS_readlinkat, vec![]),
+        (libc::SYS_set_robust_list, vec![]),
+        (libc::SYS_prlimit64, vec![]),
+        (libc::SYS_getrandom, vec![]),
+        (libc::SYS_rseq, vec![]),
+    ];
+    let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> = rules.into_iter().collect();
 
-    // TODO: switch to allow list and implement necessary syscalls
     let filter = SeccompFilter::new(
         rule_map,
-        SeccompAction::Allow,
         SeccompAction::Trap,
+        SeccompAction::Allow,
         seccompiler::TargetArch::x86_64,
     )
     .unwrap();
@@ -152,7 +310,9 @@ fn register_seccomp_filter() {
 ///
 /// This function sets up the syscall handler and registers seccomp
 /// filters and the SIGSYS signal handler.
-pub(crate) fn init_sys_intercept(handler: impl Fn(i64, &[usize]) -> i64 + Send + Sync + 'static) {
+pub(crate) fn init_sys_intercept(
+    handler: impl Fn(SyscallRequest<crate::LinuxUserland>) -> i64 + Send + Sync + 'static,
+) {
     #[allow(
         clippy::match_wild_err_arm,
         reason = "Debug is not implemented for the type"

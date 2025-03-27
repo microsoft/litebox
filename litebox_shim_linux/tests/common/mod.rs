@@ -38,6 +38,8 @@ pub fn init_platform() {
     set_fs(in_mem_fs);
 
     install_dir("/lib64");
+    install_dir("/lib");
+    install_dir("/lib/x86_64-linux-gnu");
 }
 
 pub fn compile(output: &std::path::Path, exec_or_lib: bool) {

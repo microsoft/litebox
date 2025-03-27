@@ -94,8 +94,8 @@ impl ElfLoaderMmap {
         match crate::syscalls::mm::sys_mmap(
             addr.unwrap_or(0),
             len,
-            prot.bits(),
-            flags.bits(),
+            litebox_common_linux::ProtFlags::from_bits_truncate(prot.bits()),
+            litebox_common_linux::MapFlags::from_bits(flags.bits()).expect("unsupported flags"),
             fd,
             offset,
         ) {
@@ -113,8 +113,11 @@ impl ElfLoaderMmap {
         match crate::syscalls::mm::sys_mmap(
             addr.unwrap_or(0),
             len,
-            prot.bits(),
-            flags.bits() | MapFlags::MAP_ANONYMOUS.bits(),
+            litebox_common_linux::ProtFlags::from_bits_truncate(prot.bits()),
+            litebox_common_linux::MapFlags::from_bits(
+                flags.bits() | MapFlags::MAP_ANONYMOUS.bits(),
+            )
+            .expect("unsupported flags"),
             -1,
             0,
         ) {
@@ -182,7 +185,8 @@ pub struct ElfLoadInfo {
 pub(super) struct ElfLoader;
 
 impl ElfLoader {
-    const DEFAULT_STACK_SIZE: usize = 2 * PAGE_SIZE;
+    // TODO: set a guard page for the stack
+    const DEFAULT_STACK_SIZE: usize = 2048 * PAGE_SIZE; // 8MB
 
     fn init_auxvec(elf: &Elf) -> BTreeMap<AuxKey, usize> {
         let mut aux = BTreeMap::new();

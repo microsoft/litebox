@@ -20,10 +20,10 @@ use once_cell::race::OnceBox;
 
 use litebox::{
     mm::{PageManager, linux::PAGE_SIZE},
-    platform::RawConstPointer as _,
+    platform::{RawConstPointer as _, RawMutPointer as _},
     sync::RwLock,
 };
-use litebox_common_linux::errno::Errno;
+use litebox_common_linux::{SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
 pub mod loader;
@@ -214,6 +214,80 @@ pub extern "C" fn close(fd: i32) -> i32 {
     syscalls::file::sys_close(fd).map_or_else(Errno::as_neg, |()| 0)
 }
 
-pub fn syscall_entry(sysno: i64, args: &[usize]) -> i64 {
-    todo!()
+/// Entry point for the syscall handler
+pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
+    match request {
+        SyscallRequest::Read { fd, buf, count } => {
+            let Ok(count) = isize::try_from(count) else {
+                return i64::from(Errno::EINVAL.as_neg());
+            };
+            buf.mutate_subslice_with(..count, |user_buf| {
+                // TODO: use kernel buffer to avoid page faults
+                syscalls::file::sys_read(fd, user_buf, None).map_or_else(
+                    |e| i64::from(e.as_neg()),
+                    #[allow(clippy::cast_possible_wrap)]
+                    |size| size as i64,
+                )
+            })
+            .unwrap_or(i64::from(Errno::EFAULT.as_neg()))
+        }
+        SyscallRequest::Close { fd } => {
+            i64::from(syscalls::file::sys_close(fd).map_or_else(Errno::as_neg, |()| 0))
+        }
+        SyscallRequest::Pread64 {
+            fd,
+            buf,
+            count,
+            offset,
+        } => {
+            let Ok(count) = isize::try_from(count) else {
+                return i64::from(Errno::EINVAL.as_neg());
+            };
+            buf.mutate_subslice_with(..count, |user_buf| {
+                // TODO: use kernel buffer to avoid page faults
+                syscalls::file::sys_pread64(fd, user_buf, offset).map_or_else(
+                    |e| i64::from(e.as_neg()),
+                    #[allow(clippy::cast_possible_wrap)]
+                    |size| size as i64,
+                )
+            })
+            .unwrap_or(i64::from(Errno::EFAULT.as_neg()))
+        }
+        SyscallRequest::Mmap {
+            addr,
+            length,
+            prot,
+            flags,
+            fd,
+            offset,
+        } => {
+            syscalls::mm::sys_mmap(addr, length, prot, flags, fd, offset).map_or_else(
+                |e| i64::from(e.as_neg()),
+                |ptr| {
+                    let Ok(addr) = i64::try_from(ptr.as_usize()) else {
+                        // Note it assumes user space address does not exceed i64::MAX (0x7FFF_FFFF_FFFF_FFFF).
+                        // For Linux the max user address is 0x7FFF_FFFF_F000.
+                        unreachable!("invalid user pointer");
+                    };
+                    addr
+                },
+            )
+        }
+        SyscallRequest::Openat {
+            dirfd,
+            pathname,
+            flags,
+            mode,
+        } => {
+            let Some(path) = pathname.to_cstring() else {
+                return i64::from(Errno::EFAULT.as_neg());
+            };
+            i64::from(
+                syscalls::file::sys_openat(dirfd, path, flags, mode).unwrap_or_else(Errno::as_neg),
+            )
+        }
+        _ => {
+            todo!()
+        }
+    }
 }

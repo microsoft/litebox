@@ -2,43 +2,12 @@ use litebox::{
     mm::linux::{MappingError, PAGE_SIZE},
     platform::RawMutPointer,
 };
-use litebox_common_linux::errno::Errno;
+use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 
 use crate::{MutPtr, litebox_page_manager};
 
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 const PAGE_SHIFT: usize = PAGE_SIZE.trailing_zeros() as usize;
-
-bitflags::bitflags! {
-    /// Desired memory protection of a memory mapping.
-    #[derive(PartialEq, Debug)]
-    struct ProtFlags: core::ffi::c_int {
-        /// Pages cannot be accessed.
-        const PROT_NONE = 0;
-        /// Pages can be read.
-        const PROT_READ = 1 << 0;
-        /// Pages can be written.
-        const PROT_WRITE = 1 << 1;
-        /// Pages can be executed
-        const PROT_EXEC = 1 << 2;
-
-        const PROT_READ_EXEC = Self::PROT_READ.bits() | Self::PROT_EXEC.bits();
-        const PROT_READ_WRITE = Self::PROT_READ.bits() | Self::PROT_WRITE.bits();
-    }
-}
-
-bitflags::bitflags! {
-    #[non_exhaustive]
-    #[derive(Debug)]
-    struct MapFlags: core::ffi::c_int {
-        /// Changes are private
-        const MAP_PRIVATE = 1 << 1;
-        /// Interpret addr exactly
-        const MAP_FIXED = 1 << 4;
-        /// don't use a file
-        const MAP_ANONYMOUS = 1 << 5;
-    }
-}
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
@@ -128,8 +97,8 @@ fn do_mmap_file(
 pub(crate) fn sys_mmap(
     addr: usize,
     len: usize,
-    prot: i32,
-    flags: i32,
+    prot: ProtFlags,
+    flags: MapFlags,
     fd: i32,
     offset: usize,
 ) -> Result<MutPtr<u8>, Errno> {
@@ -143,9 +112,23 @@ pub(crate) fn sys_mmap(
     if len == 0 {
         return Err(Errno::EINVAL);
     }
+    if flags.intersects(
+        MapFlags::MAP_SHARED
+            | MapFlags::MAP_32BIT
+            | MapFlags::MAP_GROWSDOWN
+            | MapFlags::MAP_LOCKED
+            | MapFlags::MAP_NORESERVE
+            | MapFlags::MAP_POPULATE
+            | MapFlags::MAP_NONBLOCK
+            | MapFlags::MAP_SYNC
+            | MapFlags::MAP_HUGETLB
+            | MapFlags::MAP_HUGE_2MB
+            | MapFlags::MAP_HUGE_1GB
+            | MapFlags::MAP_FIXED_NOREPLACE,
+    ) {
+        todo!("Unsupported flags {:?}", flags);
+    }
 
-    let prot = ProtFlags::from_bits_truncate(prot);
-    let flags = MapFlags::from_bits(flags).expect("Unsupported flags");
     let aligned_len = align_up(len, PAGE_SIZE);
     if aligned_len == 0 {
         return Err(Errno::ENOMEM);
