@@ -10,10 +10,10 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, CloseError, MkdirError, OpenError, PathError, ReadError, RmdirError, SeekError,
-    UnlinkError, WriteError,
+    ChmodError, CloseError, FileStatusError, MkdirError, OpenError, PathError, ReadError,
+    RmdirError, SeekError, UnlinkError, WriteError,
 };
-use super::{Mode, SeekWhence};
+use super::{FileStatus, Mode, SeekWhence};
 
 /// A backing implementation for [`FileSystem`](super::FileSystem) storing all files in-memory.
 ///
@@ -389,6 +389,58 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         // Just a sanity check
         assert!(matches!(removed, Entry::Dir(_)));
         Ok(())
+    }
+
+    fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {
+        let path = self.absolute_path(path)?;
+        let root = self.root.read();
+        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let Some(entry) = entry else {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        };
+        let (file_type, perms, size) = match entry {
+            Entry::File(file) => {
+                let file = file.read();
+                (
+                    super::FileType::RegularFile,
+                    file.perms.clone(),
+                    file.data.len(),
+                )
+            }
+            Entry::Dir(dir) => (
+                super::FileType::Directory,
+                dir.read().perms.clone(),
+                super::DEFAULT_DIRECTORY_SIZE,
+            ),
+        };
+        Ok(FileStatus {
+            file_type,
+            mode: perms.mode,
+            size,
+        })
+    }
+
+    fn fd_file_status(&self, fd: &FileFd) -> Result<FileStatus, FileStatusError> {
+        let (file_type, perms, size) = match self.descriptors.read().get(fd) {
+            Descriptor::File { file, .. } => {
+                let file = file.read();
+                (
+                    super::FileType::RegularFile,
+                    file.perms.clone(),
+                    file.data.len(),
+                )
+            }
+            Descriptor::Dir { dir } => (
+                super::FileType::Directory,
+                dir.read().perms.clone(),
+                super::DEFAULT_DIRECTORY_SIZE,
+            ),
+        };
+        Ok(FileStatus {
+            file_type,
+            mode: perms.mode,
+            size,
+        })
     }
 }
 

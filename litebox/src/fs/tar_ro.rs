@@ -257,6 +257,73 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         // should the other functions be simplified to this?
         Err(RmdirError::ReadOnlyFileSystem)
     }
+
+    fn file_status(
+        &self,
+        path: impl crate::path::Arg,
+    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
+        let path = self.absolute_path(path)?;
+        let path = &path[1..];
+        let entry = self
+            .tar_data
+            .entries()
+            .find(|entry| match entry.filename().as_str() {
+                Ok(p) => p == path || contains_dir(p, path),
+                Err(_) => false,
+            });
+        match entry {
+            None => Err(PathError::NoSuchFileOrDirectory)?,
+            Some(p) if p.filename().as_str().unwrap() != path => Ok(super::FileStatus {
+                file_type: super::FileType::Directory,
+                mode: DEFAULT_DIR_MODE,
+                size: super::DEFAULT_DIRECTORY_SIZE,
+            }),
+            Some(p) => Ok(super::FileStatus {
+                file_type: super::FileType::RegularFile,
+                mode: mode_of_modeflags(p.posix_header().mode.to_flags().unwrap()),
+                size: p.size(),
+            }),
+        }
+    }
+
+    fn fd_file_status(
+        &self,
+        fd: &crate::fd::FileFd,
+    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
+        match self.descriptors.read().get(fd) {
+            Descriptor::File { idx, .. } => {
+                let entry = self.tar_data.entries().nth(*idx).unwrap();
+                Ok(super::FileStatus {
+                    file_type: super::FileType::RegularFile,
+                    mode: mode_of_modeflags(entry.posix_header().mode.to_flags().unwrap()),
+                    size: entry.size(),
+                })
+            }
+            Descriptor::Dir { .. } => Ok(super::FileStatus {
+                file_type: super::FileType::Directory,
+                mode: DEFAULT_DIR_MODE,
+                size: super::DEFAULT_DIRECTORY_SIZE,
+            }),
+        }
+    }
+}
+
+const DEFAULT_DIR_MODE: Mode =
+    Mode::from_bits(Mode::RWXU.bits() | Mode::RWXG.bits() | Mode::RWXO.bits()).unwrap();
+
+fn mode_of_modeflags(perms: tar_no_std::ModeFlags) -> Mode {
+    use tar_no_std::ModeFlags;
+    let mut mode = Mode::empty();
+    mode.set(Mode::RUSR, perms.contains(ModeFlags::OwnerRead));
+    mode.set(Mode::WUSR, perms.contains(ModeFlags::OwnerWrite));
+    mode.set(Mode::XUSR, perms.contains(ModeFlags::OwnerExec));
+    mode.set(Mode::RGRP, perms.contains(ModeFlags::GroupRead));
+    mode.set(Mode::WGRP, perms.contains(ModeFlags::GroupWrite));
+    mode.set(Mode::XGRP, perms.contains(ModeFlags::GroupExec));
+    mode.set(Mode::ROTH, perms.contains(ModeFlags::OthersRead));
+    mode.set(Mode::WOTH, perms.contains(ModeFlags::OthersWrite));
+    mode.set(Mode::XOTH, perms.contains(ModeFlags::OthersExec));
+    mode
 }
 
 type Descriptors = super::shared::Descriptors<Descriptor>;

@@ -10,10 +10,10 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, CloseError, MkdirError, OpenError, PathError, ReadError, RmdirError, SeekError,
-    UnlinkError, WriteError,
+    ChmodError, CloseError, FileStatusError, MkdirError, OpenError, PathError, ReadError,
+    RmdirError, SeekError, UnlinkError, WriteError,
 };
-use super::{Mode, OFlags, SeekWhence};
+use super::{FileStatus, Mode, OFlags, SeekWhence};
 
 /// A backing implementation of [`FileSystem`](super::FileSystem) that layers a file system on top
 /// of another.
@@ -722,6 +722,91 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         // do at least a "number of entries" check on both upper and lower level at all times.
         // However, in terms of functionality, we will be placing tombstone entries.
         todo!()
+    }
+
+    fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {
+        // Note: we grab the info from the relevant level and then immediately spit back the same,
+        // essentially to ask the compiler to remind us we need to update this when we support
+        // inodes and such.
+        let path = self.absolute_path(path)?;
+        if let Some(entry) = self.root.read().entries.get(&path) {
+            let FileStatus {
+                file_type,
+                mode,
+                size,
+            } = match entry.as_ref() {
+                EntryX::Upper { fd } => self.upper.fd_file_status(fd)?,
+                EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
+                EntryX::Tombstone => {
+                    return Err(PathError::NoSuchFileOrDirectory)?;
+                }
+            };
+            return Ok(FileStatus {
+                file_type,
+                mode,
+                size,
+            });
+        };
+        // The file is not open, we must look at the levels themselves.
+        match self.upper.file_status(&*path) {
+            Ok(FileStatus {
+                file_type,
+                mode,
+                size,
+            }) => {
+                return Ok(FileStatus {
+                    file_type,
+                    mode,
+                    size,
+                });
+            }
+            Err(e) => match e {
+                FileStatusError::PathError(
+                    PathError::ComponentNotADirectory
+                    | PathError::InvalidPathname
+                    | PathError::NoSearchPerms { .. },
+                ) => {
+                    // None of these can be handled by lower level, just quit out early
+                    return Err(e);
+                }
+                FileStatusError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                ) => {
+                    // Handle-able by a lower level, fallthrough
+                }
+            },
+        };
+        let FileStatus {
+            file_type,
+            mode,
+            size,
+        } = self.lower.file_status(path)?;
+        Ok(FileStatus {
+            file_type,
+            mode,
+            size,
+        })
+    }
+
+    fn fd_file_status(&self, fd: &FileFd) -> Result<FileStatus, FileStatusError> {
+        let descriptors = self.descriptors.read();
+        let descriptor = descriptors.get(fd);
+        let FileStatus {
+            file_type,
+            mode,
+            size,
+        } = match descriptor.entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.fd_file_status(fd)?,
+            EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
+            EntryX::Tombstone => unreachable!(),
+        };
+        // Note: we grab the info and then immediately spit back the same, essentially to ask the
+        // compiler to remind us we need to update this when we support inodes and such.
+        Ok(FileStatus {
+            file_type,
+            mode,
+            size,
+        })
     }
 }
 

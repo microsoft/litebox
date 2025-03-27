@@ -87,4 +87,18 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<'_, Platform
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), super::errors::RmdirError> {
         todo!()
     }
+
+    fn file_status(
+        &self,
+        path: impl crate::path::Arg,
+    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
+        todo!()
+    }
+
+    fn fd_file_status(
+        &self,
+        fd: &crate::fd::FileFd,
+    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
+        todo!()
+    }
 }
