@@ -193,6 +193,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     Writev(i32, Platform::RawConstPointer<IoVec<Platform>>, usize),
     Access(Platform::RawConstPointer<i8>, AccessFlags),
+    Getcwd { buf: Platform::RawMutPointer<u8>, size: usize },
     Readlink(
         Platform::RawConstPointer<i8>,
         Platform::RawMutPointer<u8>,

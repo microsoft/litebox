@@ -211,6 +211,12 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                 }
             },
         ),
+        libc::SYS_getcwd => SyscallRequest::Getcwd {
+            buf: TransparentMutPtr {
+                inner: syscall_args[0] as *mut u8,
+            },
+            size: syscall_args[1],
+        },
         libc::SYS_readlink => SyscallRequest::Readlink(
             TransparentConstPtr {
                 inner: syscall_args[0] as *const i8,
@@ -358,6 +364,7 @@ fn register_seccomp_filter() {
         (libc::SYS_set_tid_address, vec![]),
         (libc::SYS_exit_group, vec![]),
         (libc::SYS_tgkill, vec![]),
+        // open_path fatal_error
         // (libc::SYS_newfstatat, vec![]),
         (libc::SYS_set_robust_list, vec![]),
         (libc::SYS_prlimit64, vec![]),

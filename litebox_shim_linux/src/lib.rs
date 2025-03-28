@@ -289,6 +289,19 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
             std::eprintln!("access: {:?}, {:?}", path, mode);
             syscalls::file::sys_access(path, mode).map_or_else(Errno::as_neg, |()| 0) as i64
         }
+        SyscallRequest::Getcwd { buf, size } => {
+            let Ok(size) = isize::try_from(size) else {
+                return Errno::EINVAL.as_neg() as i64;
+            };
+            buf.mutate_subslice_with(..size, |user_buf| {
+                // TODO: use kernel buffer to avoid page faults
+                syscalls::file::sys_getcwd(user_buf).map_or_else(
+                    |e| i64::from(e.as_neg()),
+                    #[allow(clippy::cast_possible_wrap)]
+                    |size| size as i64,
+                )
+            }).unwrap_or(i64::from(Errno::EFAULT.as_neg()))
+        }
         SyscallRequest::Readlink(pathname, buf, size) => {
             let Some(path) = pathname.to_cstring() else {
                 return Errno::EFAULT.as_neg() as i64;
@@ -325,7 +338,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
             let Some(path) = pathname.to_cstring() else {
                 return Errno::EFAULT.as_neg() as i64;
             };
-            std::eprintln!("newfstatat: {path:?}");
+            std::eprintln!("newfstatat: {path:?}, flags: {flags:?}");
             match syscalls::file::sys_newfstatat(dirfd, path, flags) {
                 Ok(stat) => unsafe { buf.write_at_offset(0, stat) }
                     .map_or(Errno::EFAULT.as_neg() as i64, |()| 0),

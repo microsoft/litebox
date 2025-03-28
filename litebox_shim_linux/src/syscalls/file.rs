@@ -3,6 +3,7 @@
 //! * `close`
 //! * `read`
 
+use alloc::ffi::CString;
 use litebox::{
     fs::{FileSystem as _, Mode, OFlags},
     path,
@@ -90,6 +91,10 @@ pub fn sys_writev(
                 }
                 let slice =
                     unsafe { iov.iov_base.to_cow_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
+                if fd == 1 || fd == 2 {
+                    extern crate std;
+                    std::eprintln!("{}", std::str::from_utf8(&slice).unwrap());
+                }
                 let size = litebox_fs()
                     .write(file, &slice, None)
                     .map_err(Errno::from)?;
@@ -122,5 +127,23 @@ pub fn sys_newfstatat(
     pathname: impl path::Arg,
     flags: AtFlags,
 ) -> Result<FileStat, Errno> {
+    if dirfd != AT_FDCWD {
+        todo!("sys_newfstatat");
+    }
+    // let stat = litebox_fs().file_status(pathname)?;
     Err(Errno::ENOSYS)
+}
+
+pub fn sys_getcwd(buf: &mut [u8]) -> Result<usize, Errno> {
+    // TODO: use a fixed path for now
+    let cwd = "/";
+    // need to account for the null terminator
+    if cwd.len() >= buf.len() {
+        return Err(Errno::ERANGE);
+    }
+
+    let name = CString::new(cwd).unwrap();
+    let bytes = name.as_bytes_with_nul();
+    buf[..bytes.len()].copy_from_slice(bytes);
+    Ok(bytes.len())
 }
