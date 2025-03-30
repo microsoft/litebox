@@ -7,11 +7,11 @@ use alloc::ffi::CString;
 use litebox::{
     fs::{FileSystem as _, Mode, OFlags},
     path,
-    platform::RawConstPointer,
+    platform::{RawConstPointer, RawMutPointer},
 };
-use litebox_common_linux::{AtFlags, FileStat, errno::Errno};
+use litebox_common_linux::{AtFlags, FileStat, IoReadVec, IoWriteVec, errno::Errno};
 
-use crate::{Descriptor, file_descriptors, litebox_fs};
+use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox_fs};
 
 enum FsPath<P: path::Arg> {
     Absolute { path: P },
@@ -92,8 +92,28 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
-    match file_descriptors().read().get_file_fd(fd) {
-        Some(file) => litebox_fs().read(file, buf, offset).map_err(Errno::from),
+    match file_descriptors().read().get_fd(fd) {
+        Some(desc) => match desc {
+            Descriptor::File(file) => litebox_fs().read(file, buf, offset).map_err(Errno::from),
+            Descriptor::Socket(socket) => todo!(),
+        },
+        None => Err(Errno::EBADF),
+    }
+}
+
+/// Write to a file
+///
+/// `offset` is an optional offset to write to. If `None`, it will write to the current file position.
+/// If `Some`, it will write to the specified offset without changing the current file position.
+pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Errno> {
+    let Ok(fd) = u32::try_from(fd) else {
+        return Err(Errno::EBADF);
+    };
+    match file_descriptors().read().get_fd(fd) {
+        Some(desc) => match desc {
+            Descriptor::File(file) => litebox_fs().write(file, buf, offset).map_err(Errno::from),
+            Descriptor::Socket(socket) => todo!(),
+        },
         None => Err(Errno::EBADF),
     }
 }
@@ -103,6 +123,13 @@ pub fn sys_pread64(fd: i32, buf: &mut [u8], offset: usize) -> Result<usize, Errn
         return Err(Errno::EINVAL);
     }
     sys_read(fd, buf, Some(offset))
+}
+
+pub fn sys_pwrite64(fd: i32, buf: &[u8], offset: usize) -> Result<usize, Errno> {
+    if offset > isize::MAX as usize {
+        return Err(Errno::EINVAL);
+    }
+    sys_write(fd, buf, Some(offset))
 }
 
 /// Close a file
@@ -117,15 +144,63 @@ pub fn sys_close(fd: i32) -> Result<(), Errno> {
     }
 }
 
-pub fn sys_writev(
+pub fn sys_readv(
     fd: i32,
-    iovs: &[litebox_common_linux::IoVec<litebox_platform_multiplex::Platform>],
+    iovec: ConstPtr<IoReadVec<MutPtr<u8>>>,
+    iovcnt: usize,
 ) -> Result<usize, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
-    match file_descriptors().read().get_file_fd(fd) {
-        Some(file) => {
+    let iovs: &[IoReadVec<MutPtr<u8>>] =
+        unsafe { &iovec.to_cow_slice(iovcnt).ok_or(Errno::EFAULT)? };
+    match file_descriptors().read().get_fd(fd) {
+        Some(desc) => {
+            let mut total_read = 0;
+            for iov in iovs {
+                if iov.iov_len == 0 {
+                    continue;
+                }
+                // TODO: use kernel buffer to avoid page faults
+                let size = iov
+                    .iov_base
+                    .mutate_subslice_with(..iov.iov_len as isize, |user_buf| {
+                        // TODO: The data transfers performed by readv() and writev() are atomic: the data
+                        // written by writev() is written as a single block that is not intermingled with
+                        // output from writes in other processes
+                        match desc {
+                            Descriptor::File(file) => {
+                                litebox_fs().read(file, user_buf, None).map_err(Errno::from)
+                            }
+                            Descriptor::Socket(socket) => todo!(),
+                        }
+                    })
+                    .ok_or(Errno::EFAULT)??;
+
+                total_read += size;
+                if size != iov.iov_len {
+                    // Okay to transfer fewer bytes than requested
+                    break;
+                }
+            }
+            Ok(total_read)
+        }
+        None => Err(Errno::EBADF),
+    }
+}
+
+pub fn sys_writev(
+    fd: i32,
+    iovec: ConstPtr<IoWriteVec<ConstPtr<u8>>>,
+    iovcnt: usize,
+) -> Result<usize, Errno> {
+    let Ok(fd) = u32::try_from(fd) else {
+        return Err(Errno::EBADF);
+    };
+    let iovs: &[IoWriteVec<ConstPtr<u8>>] =
+        unsafe { &iovec.to_cow_slice(iovcnt).ok_or(Errno::EFAULT)? };
+    match file_descriptors().read().get_fd(fd) {
+        Some(desc) => {
             let mut total_written = 0;
             for iov in iovs {
                 if iov.iov_len == 0 {
@@ -133,9 +208,15 @@ pub fn sys_writev(
                 }
                 let slice =
                     unsafe { iov.iov_base.to_cow_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
-                let size = litebox_fs()
-                    .write(file, &slice, None)
-                    .map_err(Errno::from)?;
+                // TODO: The data transfers performed by readv() and writev() are atomic: the data
+                // written by writev() is written as a single block that is not intermingled with
+                // output from writes in other processes
+                let size = match desc {
+                    Descriptor::File(file) => litebox_fs()
+                        .write(file, &slice, None)
+                        .map_err(Errno::from)?,
+                    Descriptor::Socket(socket) => todo!(),
+                };
 
                 total_written += size;
                 if size != iov.iov_len {

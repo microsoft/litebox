@@ -136,6 +136,12 @@ impl Descriptors {
             None
         }
     }
+    fn get_fd(&self, fd: u32) -> Option<&Descriptor> {
+        if fd >= (2 << 30) {
+            return None;
+        }
+        self.descriptors.get(fd as usize)?.as_ref()
+    }
     fn get_file_fd(&self, fd: u32) -> Option<&litebox::fd::FileFd> {
         if fd >= (2 << 30) {
             return None;
@@ -232,6 +238,11 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
             })
             .unwrap_or(i64::from(Errno::EFAULT.as_neg()))
         }
+        SyscallRequest::Write { fd, buf, count } => match unsafe { buf.to_cow_slice(count) } {
+            Some(buf) => syscalls::file::sys_write(fd, &buf, None)
+                .map_or_else(|e| i64::from(e.as_neg()), |size| size as i64),
+            None => Errno::EFAULT.as_neg() as i64,
+        },
         SyscallRequest::Close { fd } => {
             i64::from(syscalls::file::sys_close(fd).map_or_else(Errno::as_neg, |()| 0))
         }
@@ -254,6 +265,16 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
             })
             .unwrap_or(i64::from(Errno::EFAULT.as_neg()))
         }
+        SyscallRequest::Pwrite64 {
+            fd,
+            buf,
+            count,
+            offset,
+        } => match unsafe { buf.to_cow_slice(count) } {
+            Some(buf) => syscalls::file::sys_pwrite64(fd, &buf, offset)
+                .map_or_else(|e| i64::from(e.as_neg()), |size| size as i64),
+            None => Errno::EFAULT.as_neg() as i64,
+        },
         SyscallRequest::Mmap {
             addr,
             length,
@@ -274,13 +295,11 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
                 },
             )
         }
-        SyscallRequest::Writev(fd, iov, count) => {
-            // TODO: allow to write to stdout
-            match unsafe { iov.to_cow_slice(count) } {
-                Some(iovs) => syscalls::file::sys_writev(fd, &iovs)
-                    .map_or_else(|e| e.as_neg() as i64, |size| size as i64),
-                None => Errno::EFAULT.as_neg() as i64,
-            }
+        SyscallRequest::Readv { fd, iovec, iovcnt } => syscalls::file::sys_readv(fd, iovec, iovcnt)
+            .map_or_else(|e| i64::from(e.as_neg()), |size| size as i64),
+        SyscallRequest::Writev { fd, iovec, iovcnt } => {
+            syscalls::file::sys_writev(fd, iovec, iovcnt)
+                .map_or_else(|e| i64::from(e.as_neg()), |size| size as i64)
         }
         SyscallRequest::Access(pathname, mode) => {
             let Some(path) = pathname.to_cstring() else {
@@ -342,13 +361,13 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
             flags,
         } => {
             let Some(path) = pathname.to_cstring() else {
-                return Errno::EFAULT.as_neg() as i64;
+                return i64::from(Errno::EFAULT.as_neg());
             };
             std::eprintln!("newfstatat: {path:?}, flags: {flags:?}");
             match syscalls::file::sys_newfstatat(dirfd, path, flags) {
                 Ok(stat) => unsafe { buf.write_at_offset(0, stat) }
-                    .map_or(Errno::EFAULT.as_neg() as i64, |()| 0),
-                Err(err) => err.as_neg() as i64,
+                    .map_or(i64::from(Errno::EFAULT.as_neg()), |()| 0),
+                Err(err) => i64::from(err.as_neg()),
             }
         }
         _ => {

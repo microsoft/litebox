@@ -2,6 +2,8 @@
 
 #![no_std]
 
+use litebox::platform::{RawConstPointer, RawMutPointer};
+
 pub mod errno;
 
 // TODO(jayb): Should errno::Errno be publicly re-exported?
@@ -179,10 +181,36 @@ pub struct FileStat {
     __unused: [i64; 3],
 }
 
-/// Linux's `iovec` struct
-pub struct IoVec<Platform: litebox::platform::RawPointerProvider> {
-    pub iov_base: Platform::RawConstPointer<u8>,
+/// Linux's `iovec` struct for `writev`
+#[repr(C)]
+pub struct IoWriteVec<P: RawConstPointer<u8>> {
+    pub iov_base: P,
     pub iov_len: usize,
+}
+
+/// Linux's `iovec` struct for `readv`
+#[repr(C)]
+pub struct IoReadVec<P: RawMutPointer<u8>> {
+    pub iov_base: P,
+    pub iov_len: usize,
+}
+
+impl<P: RawConstPointer<u8>> Clone for IoWriteVec<P> {
+    fn clone(&self) -> Self {
+        Self {
+            iov_base: self.iov_base,
+            iov_len: self.iov_len,
+        }
+    }
+}
+
+impl<P: RawMutPointer<u8>> Clone for IoReadVec<P> {
+    fn clone(&self) -> Self {
+        Self {
+            iov_base: self.iov_base,
+            iov_len: self.iov_len,
+        }
+    }
 }
 
 impl From<litebox::fs::FileStatus> for FileStat {
@@ -223,21 +251,17 @@ impl From<litebox::fs::FileStatus> for FileStat {
     }
 }
 
-impl<Platform: litebox::platform::RawPointerProvider> Clone for IoVec<Platform> {
-    fn clone(&self) -> Self {
-        Self {
-            iov_base: self.iov_base,
-            iov_len: self.iov_len,
-        }
-    }
-}
-
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Read {
         fd: i32,
         buf: Platform::RawMutPointer<u8>,
+        count: usize,
+    },
+    Write {
+        fd: i32,
+        buf: Platform::RawConstPointer<u8>,
         count: usize,
     },
     Close {
@@ -257,7 +281,22 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         count: usize,
         offset: usize,
     },
-    Writev(i32, Platform::RawConstPointer<IoVec<Platform>>, usize),
+    Pwrite64 {
+        fd: i32,
+        buf: Platform::RawConstPointer<u8>,
+        count: usize,
+        offset: usize,
+    },
+    Readv {
+        fd: i32,
+        iovec: Platform::RawConstPointer<IoReadVec<Platform::RawMutPointer<u8>>>,
+        iovcnt: usize,
+    },
+    Writev {
+        fd: i32,
+        iovec: Platform::RawConstPointer<IoWriteVec<Platform::RawConstPointer<u8>>>,
+        iovcnt: usize,
+    },
     Access(Platform::RawConstPointer<i8>, AccessFlags),
     Getcwd {
         buf: Platform::RawMutPointer<u8>,

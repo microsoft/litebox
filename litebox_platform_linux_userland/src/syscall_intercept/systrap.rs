@@ -169,6 +169,13 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             },
             count: syscall_args[2],
         },
+        libc::SYS_write => SyscallRequest::Write {
+            fd: syscall_args[0].reinterpret_as_signed().truncate(),
+            buf: TransparentConstPtr {
+                inner: syscall_args[1] as *const u8,
+            },
+            count: syscall_args[2],
+        },
         libc::SYS_close => SyscallRequest::Close {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
         },
@@ -192,13 +199,22 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             count: syscall_args[2],
             offset: syscall_args[3],
         },
-        libc::SYS_writev => SyscallRequest::Writev(
-            syscall_args[0] as i32,
-            TransparentConstPtr {
-                inner: syscall_args[1] as *const litebox_common_linux::IoVec<crate::LinuxUserland>,
+        libc::SYS_readv => SyscallRequest::Readv {
+            fd: syscall_args[0] as i32,
+            iovec: TransparentConstPtr {
+                inner: syscall_args[1]
+                    as *const litebox_common_linux::IoReadVec<TransparentMutPtr<u8>>,
             },
-            syscall_args[2],
-        ),
+            iovcnt: syscall_args[2],
+        },
+        libc::SYS_writev => SyscallRequest::Writev {
+            fd: syscall_args[0] as i32,
+            iovec: TransparentConstPtr {
+                inner: syscall_args[1]
+                    as *const litebox_common_linux::IoWriteVec<TransparentConstPtr<u8>>,
+            },
+            iovcnt: syscall_args[2],
+        },
         libc::SYS_access => SyscallRequest::Access(
             TransparentConstPtr {
                 inner: syscall_args[0] as *const i8,
@@ -310,7 +326,23 @@ fn register_seccomp_filter() {
     // allow list
     // TODO: remove syscalls once they are implemented in the shim
     let rules = vec![
-        (libc::SYS_write, vec![]),
+        // TODO: before we support standard input/output, allow writes
+        // to fd <= 2
+        (
+            libc::SYS_write,
+            vec![
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        0,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::Le,
+                        libc::STDERR_FILENO as u64,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            ],
+        ),
         (
             libc::SYS_mmap,
             vec![
