@@ -81,7 +81,7 @@ bitflags::bitflags! {
 
 bitflags::bitflags! {
     /// Options for access()
-    #[derive(Debug)]
+    #[derive(Debug, PartialEq)]
     pub struct AccessFlags: core::ffi::c_int {
         /// Test for existence of file.
         const F_OK = 0;
@@ -127,9 +127,37 @@ bitflags::bitflags! {
     }
 }
 
+#[repr(u32)]
+pub enum InodeType {
+    /// FIFO (named pipe)
+    NamedPipe = 0o010000,
+    /// character device
+    CharDevice = 0o020000,
+    /// directory
+    Dir = 0o040000,
+    /// block device
+    BlockDevice = 0o060000,
+    /// regular file
+    File = 0o100000,
+    /// symbolic link
+    SymLink = 0o120000,
+    /// socket
+    Socket = 0o140000,
+}
+
+impl From<litebox::fs::FileType> for InodeType {
+    fn from(value: litebox::fs::FileType) -> Self {
+        match value {
+            litebox::fs::FileType::RegularFile => InodeType::File,
+            litebox::fs::FileType::Directory => InodeType::Dir,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 /// Linux's `stat` struct
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct FileStat {
     pub st_dev: u64,
     pub st_ino: u64,
@@ -155,6 +183,44 @@ pub struct FileStat {
 pub struct IoVec<Platform: litebox::platform::RawPointerProvider> {
     pub iov_base: Platform::RawConstPointer<u8>,
     pub iov_len: usize,
+}
+
+impl From<litebox::fs::FileStatus> for FileStat {
+    fn from(value: litebox::fs::FileStatus) -> Self {
+        static mut INO: u64 = 0x1245;
+        // TODO: add more fields
+        let litebox::fs::FileStatus {
+            file_type,
+            mode,
+            size,
+            ..
+        } = value;
+        unsafe {
+            INO += 1;
+        }
+        Self {
+            // TODO: st_dev and st_ino are used by ld.so to unique identify
+            // shared libraries. Give a random value for now.
+            st_dev: 0,
+            st_ino: unsafe { INO },
+            st_nlink: 1,
+            st_mode: mode.bits() | InodeType::from(file_type) as u32,
+            st_uid: 0,
+            st_gid: 0,
+            __pad0: 0,
+            st_rdev: 0,
+            st_size: size as i64,
+            st_blksize: 0,
+            st_blocks: 0,
+            st_atime: 0,
+            st_atime_nsec: 0,
+            st_mtime: 0,
+            st_mtime_nsec: 0,
+            st_ctime: 0,
+            st_ctime_nsec: 0,
+            __unused: [0; 3],
+        }
+    }
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> Clone for IoVec<Platform> {
@@ -193,7 +259,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     Writev(i32, Platform::RawConstPointer<IoVec<Platform>>, usize),
     Access(Platform::RawConstPointer<i8>, AccessFlags),
-    Getcwd { buf: Platform::RawMutPointer<u8>, size: usize },
+    Getcwd {
+        buf: Platform::RawMutPointer<u8>,
+        size: usize,
+    },
     Readlink(
         Platform::RawConstPointer<i8>,
         Platform::RawMutPointer<u8>,
@@ -205,10 +274,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         flags: litebox::fs::OFlags,
         mode: litebox::fs::Mode,
     },
-    Newfstatat(
-        i32,
-        Platform::RawConstPointer<i8>,
-        Platform::RawMutPointer<FileStat>,
-        AtFlags,
-    ),
+    Newfstatat {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        buf: Platform::RawMutPointer<FileStat>,
+        flags: AtFlags,
+    },
 }

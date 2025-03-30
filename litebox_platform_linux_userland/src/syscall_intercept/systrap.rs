@@ -234,22 +234,22 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             flags: litebox::fs::OFlags::from_bits_truncate(syscall_args[2].truncate()),
             mode: litebox::fs::Mode::from_bits_truncate(syscall_args[3].truncate()),
         },
-        libc::SYS_newfstatat => SyscallRequest::Newfstatat(
-            syscall_args[0] as i32,
-            TransparentConstPtr {
+        libc::SYS_newfstatat => SyscallRequest::Newfstatat {
+            dirfd: syscall_args[0] as i32,
+            pathname: TransparentConstPtr {
                 inner: syscall_args[1] as *const i8,
             },
-            TransparentMutPtr {
+            buf: TransparentMutPtr {
                 inner: syscall_args[2] as *mut litebox_common_linux::FileStat,
             },
-            match litebox_common_linux::AtFlags::from_bits(syscall_args[3] as i32) {
+            flags: match litebox_common_linux::AtFlags::from_bits(syscall_args[3] as i32) {
                 Some(flags) => flags,
                 None => {
                     std::eprintln!("Invalid at flags: {}", syscall_args[3]);
                     return -libc::EINVAL as i64;
                 }
             },
-        ),
+        },
         _ => todo!(),
     };
     let ret = SYSCALL_HANDLER.get().unwrap()(dispatcher);
@@ -364,8 +364,6 @@ fn register_seccomp_filter() {
         (libc::SYS_set_tid_address, vec![]),
         (libc::SYS_exit_group, vec![]),
         (libc::SYS_tgkill, vec![]),
-        // open_path fatal_error
-        // (libc::SYS_newfstatat, vec![]),
         (libc::SYS_set_robust_list, vec![]),
         (libc::SYS_prlimit64, vec![]),
         (libc::SYS_getrandom, vec![]),

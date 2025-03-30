@@ -300,7 +300,8 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
                     #[allow(clippy::cast_possible_wrap)]
                     |size| size as i64,
                 )
-            }).unwrap_or(i64::from(Errno::EFAULT.as_neg()))
+            })
+            .unwrap_or(i64::from(Errno::EFAULT.as_neg()))
         }
         SyscallRequest::Readlink(pathname, buf, size) => {
             let Some(path) = pathname.to_cstring() else {
@@ -334,7 +335,12 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
                 syscalls::file::sys_openat(dirfd, path, flags, mode).unwrap_or_else(Errno::as_neg),
             )
         }
-        SyscallRequest::Newfstatat(dirfd, pathname, buf, flags) => {
+        SyscallRequest::Newfstatat {
+            dirfd,
+            pathname,
+            buf,
+            flags,
+        } => {
             let Some(path) = pathname.to_cstring() else {
                 return Errno::EFAULT.as_neg() as i64;
             };

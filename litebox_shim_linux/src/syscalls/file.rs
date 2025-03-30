@@ -13,6 +13,48 @@ use litebox_common_linux::{AtFlags, FileStat, errno::Errno};
 
 use crate::{Descriptor, file_descriptors, litebox_fs};
 
+enum FsPath<P: path::Arg> {
+    Absolute { path: P },
+    CwdRelative { path: P },
+    Cwd,
+    FdRelative { fd: u32, path: P },
+    Fd(u32),
+}
+
+/// Maximum size of a file path
+pub const PATH_MAX: usize = 4096;
+/// Special value `libc::AT_FDCWD` used to indicate openat should use
+/// the current working directory.
+pub const AT_FDCWD: i32 = -100;
+
+impl<P: path::Arg> FsPath<P> {
+    fn new(dirfd: i32, path: P) -> Result<Self, Errno> {
+        let path_str = path.as_rust_str()?;
+        if path_str.len() > PATH_MAX {
+            return Err(Errno::ENAMETOOLONG);
+        }
+        let fs_path = if path_str.starts_with('/') {
+            FsPath::Absolute { path }
+        } else if dirfd >= 0 {
+            let dirfd = u32::try_from(dirfd).expect("dirfd >= 0");
+            if path_str.is_empty() {
+                FsPath::Fd(dirfd)
+            } else {
+                FsPath::FdRelative { fd: dirfd, path }
+            }
+        } else if dirfd == AT_FDCWD {
+            if path_str.is_empty() {
+                FsPath::Cwd
+            } else {
+                FsPath::CwdRelative { path }
+            }
+        } else {
+            return Err(Errno::EBADF);
+        };
+        Ok(fs_path)
+    }
+}
+
 /// Open a file
 pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<i32, Errno> {
     litebox_fs()
@@ -27,19 +69,19 @@ pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<i32, 
         .map_err(Errno::from)
 }
 
-/// Special value `libc::AT_FDCWD` used to indicate openat should use
-/// the current working directory.
-pub const AT_FDCWD: i32 = -100;
 pub fn sys_openat(
     dirfd: i32,
     pathname: impl path::Arg,
     flags: OFlags,
     mode: Mode,
 ) -> Result<i32, Errno> {
-    if dirfd == AT_FDCWD {
-        return sys_open(pathname, flags, mode);
+    let fs_path = FsPath::new(dirfd, pathname)?;
+    match fs_path {
+        FsPath::Absolute { path } | FsPath::CwdRelative { path } => sys_open(path, flags, mode),
+        FsPath::Cwd => sys_open("", flags, mode),
+        FsPath::Fd(fd) => todo!(),
+        FsPath::FdRelative { fd, path } => todo!(),
     }
-    todo!("openat");
 }
 
 /// Read from a file
@@ -91,10 +133,6 @@ pub fn sys_writev(
                 }
                 let slice =
                     unsafe { iov.iov_base.to_cow_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
-                if fd == 1 || fd == 2 {
-                    extern crate std;
-                    std::eprintln!("{}", std::str::from_utf8(&slice).unwrap());
-                }
                 let size = litebox_fs()
                     .write(file, &slice, None)
                     .map_err(Errno::from)?;
@@ -115,7 +153,28 @@ pub fn sys_access(
     pathname: impl path::Arg,
     mode: litebox_common_linux::AccessFlags,
 ) -> Result<(), Errno> {
-    Err(Errno::ENOSYS)
+    let status = litebox_fs().file_status(pathname)?;
+    if mode == litebox_common_linux::AccessFlags::F_OK {
+        return Ok(());
+    }
+    // TODO: the check is done using the calling process's real UID and GID.
+    // Here we assume the caller owns the file.
+    if mode.contains(litebox_common_linux::AccessFlags::R_OK)
+        && !status.mode.contains(litebox::fs::Mode::RUSR)
+    {
+        return Err(Errno::EACCES);
+    }
+    if mode.contains(litebox_common_linux::AccessFlags::W_OK)
+        && !status.mode.contains(litebox::fs::Mode::WUSR)
+    {
+        return Err(Errno::EACCES);
+    }
+    if mode.contains(litebox_common_linux::AccessFlags::X_OK)
+        && !status.mode.contains(litebox::fs::Mode::XUSR)
+    {
+        return Err(Errno::EACCES);
+    }
+    Ok(())
 }
 
 pub fn sys_readlink(pathname: impl path::Arg, buf: &mut [u8]) -> Result<usize, Errno> {
@@ -127,11 +186,24 @@ pub fn sys_newfstatat(
     pathname: impl path::Arg,
     flags: AtFlags,
 ) -> Result<FileStat, Errno> {
-    if dirfd != AT_FDCWD {
-        todo!("sys_newfstatat");
+    if !(flags & !AtFlags::AT_EMPTY_PATH).is_empty() {
+        todo!("unsupported flags");
     }
-    // let stat = litebox_fs().file_status(pathname)?;
-    Err(Errno::ENOSYS)
+
+    let fs_path = FsPath::new(dirfd, pathname)?;
+    let status = match fs_path {
+        FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
+            litebox_fs().file_status(path)?
+        }
+        FsPath::Cwd => litebox_fs().file_status("")?,
+        FsPath::Fd(fd) => file_descriptors()
+            .read()
+            .get_file_fd(fd)
+            .ok_or(Errno::EBADF)
+            .and_then(|file| Ok(litebox_fs().fd_file_status(file)?))?,
+        FsPath::FdRelative { fd, path } => todo!(),
+    };
+    Ok(FileStat::from(status))
 }
 
 pub fn sys_getcwd(buf: &mut [u8]) -> Result<usize, Errno> {
