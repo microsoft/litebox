@@ -42,6 +42,7 @@ pub fn set_fs(fs: litebox::fs::in_mem::FileSystem<'static, Platform>) {
         .expect("fs is already set");
 }
 
+/// Get the global file system
 pub fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
     FS.get_or_init(|| {
         alloc::boxed::Box::new(litebox::fs::in_mem::FileSystem::new(

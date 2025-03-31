@@ -10,11 +10,17 @@ use litebox_common_linux::{AtFlags, FileStat, IoReadVec, IoWriteVec, errno::Errn
 
 use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox_fs};
 
+/// Path in the file system
 enum FsPath<P: path::Arg> {
+    /// Absolute path
     Absolute { path: P },
+    /// Path is relative to `cwd`
     CwdRelative { path: P },
+    /// Current working directory
     Cwd,
+    /// Path is relative to a file descriptor
     FdRelative { fd: u32, path: P },
+    /// Fd
     Fd(u32),
 }
 
@@ -52,7 +58,7 @@ impl<P: path::Arg> FsPath<P> {
     }
 }
 
-/// Open a file
+/// Handle syscall `open`
 pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
     litebox_fs()
         .open(path, flags, mode)
@@ -60,6 +66,7 @@ pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, 
         .map_err(Errno::from)
 }
 
+/// Handle syscall `openat`
 pub fn sys_openat(
     dirfd: i32,
     pathname: impl path::Arg,
@@ -75,7 +82,7 @@ pub fn sys_openat(
     }
 }
 
-/// Read from a file
+/// Handle syscall `read`
 ///
 /// `offset` is an optional offset to read from. If `None`, it will read from the current file position.
 /// If `Some`, it will read from the specified offset without changing the current file position.
@@ -92,7 +99,7 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
     }
 }
 
-/// Write to a file
+/// Handle syscall `write`
 ///
 /// `offset` is an optional offset to write to. If `None`, it will write to the current file position.
 /// If `Some`, it will write to the specified offset without changing the current file position.
@@ -109,6 +116,7 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
     }
 }
 
+/// Handle syscall `pread64`
 pub fn sys_pread64(fd: i32, buf: &mut [u8], offset: usize) -> Result<usize, Errno> {
     if offset > isize::MAX as usize {
         return Err(Errno::EINVAL);
@@ -116,6 +124,7 @@ pub fn sys_pread64(fd: i32, buf: &mut [u8], offset: usize) -> Result<usize, Errn
     sys_read(fd, buf, Some(offset))
 }
 
+/// Handle syscall `pwrite64`
 pub fn sys_pwrite64(fd: i32, buf: &[u8], offset: usize) -> Result<usize, Errno> {
     if offset > isize::MAX as usize {
         return Err(Errno::EINVAL);
@@ -123,7 +132,7 @@ pub fn sys_pwrite64(fd: i32, buf: &[u8], offset: usize) -> Result<usize, Errno> 
     sys_write(fd, buf, Some(offset))
 }
 
-/// Close a file
+/// Handle syscall `close`
 pub fn sys_close(fd: i32) -> Result<(), Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
@@ -135,6 +144,7 @@ pub fn sys_close(fd: i32) -> Result<(), Errno> {
     }
 }
 
+/// Handle syscall `readv`
 pub fn sys_readv(
     fd: i32,
     iovec: ConstPtr<IoReadVec<MutPtr<u8>>>,
@@ -183,6 +193,7 @@ pub fn sys_readv(
     }
 }
 
+/// Handle syscall `writev`
 pub fn sys_writev(
     fd: i32,
     iovec: ConstPtr<IoWriteVec<ConstPtr<u8>>>,
@@ -224,6 +235,7 @@ pub fn sys_writev(
     }
 }
 
+/// Handle syscall `access`
 pub fn sys_access(
     pathname: impl path::Arg,
     mode: litebox_common_linux::AccessFlags,
@@ -252,11 +264,13 @@ pub fn sys_access(
     Ok(())
 }
 
+/// Handle syscall `readlink`
 pub fn sys_readlink(pathname: impl path::Arg, buf: &mut [u8]) -> Result<usize, Errno> {
     // TODO: support symbolic links
     Err(Errno::ENOSYS)
 }
 
+/// Handle syscall `readlinkat`
 pub fn sys_readlinkat(
     dirfd: i32,
     pathname: impl path::Arg,
@@ -266,6 +280,7 @@ pub fn sys_readlinkat(
     Err(Errno::ENOSYS)
 }
 
+/// Handle syscall `fstat`
 pub fn sys_fstat(fd: i32) -> Result<FileStat, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
@@ -280,6 +295,7 @@ pub fn sys_fstat(fd: i32) -> Result<FileStat, Errno> {
     Ok(FileStat::from(stat))
 }
 
+/// Handle syscall `newfstatat`
 pub fn sys_newfstatat(
     dirfd: i32,
     pathname: impl path::Arg,
@@ -305,6 +321,7 @@ pub fn sys_newfstatat(
     Ok(FileStat::from(status))
 }
 
+/// Handle syscall `getcwd`
 pub fn sys_getcwd(buf: &mut [u8]) -> Result<usize, Errno> {
     // TODO: use a fixed path for now
     let cwd = "/";
