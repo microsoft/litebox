@@ -161,7 +161,6 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
     };
 
     let syscall_args = unsafe { core::slice::from_raw_parts(args, 6) };
-    std::eprintln!("syscall_number: {syscall_number}, args: {syscall_args:?}");
     let dispatcher = match syscall_number {
         libc::SYS_read => SyscallRequest::Read {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
