@@ -268,6 +268,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Close {
         fd: i32,
     },
+    Fstat {
+        fd: i32,
+        buf: Platform::RawMutPointer<FileStat>,
+    },
     Mmap {
         addr: usize,
         length: usize,
@@ -303,11 +307,17 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         buf: Platform::RawMutPointer<u8>,
         size: usize,
     },
-    Readlink(
-        Platform::RawConstPointer<i8>,
-        Platform::RawMutPointer<u8>,
-        usize,
-    ),
+    Readlink {
+        pathname: Platform::RawConstPointer<i8>,
+        buf: Platform::RawMutPointer<u8>,
+        bufsiz: usize,
+    },
+    Readlinkat {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        buf: Platform::RawMutPointer<u8>,
+        bufsiz: usize,
+    },
     Openat {
         dirfd: i32,
         pathname: Platform::RawConstPointer<i8>,

@@ -161,6 +161,7 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
     };
 
     let syscall_args = unsafe { core::slice::from_raw_parts(args, 6) };
+    std::eprintln!("syscall_number: {syscall_number}, args: {syscall_args:?}");
     let dispatcher = match syscall_number {
         libc::SYS_read => SyscallRequest::Read {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
@@ -178,6 +179,12 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
         },
         libc::SYS_close => SyscallRequest::Close {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
+        },
+        libc::SYS_fstat => SyscallRequest::Fstat {
+            fd: syscall_args[0].reinterpret_as_signed().truncate(),
+            buf: TransparentMutPtr {
+                inner: syscall_args[1] as *mut litebox_common_linux::FileStat,
+            },
         },
         libc::SYS_mmap => SyscallRequest::Mmap {
             addr: syscall_args[0],
@@ -234,15 +241,25 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             },
             size: syscall_args[1],
         },
-        libc::SYS_readlink => SyscallRequest::Readlink(
-            TransparentConstPtr {
+        libc::SYS_readlink => SyscallRequest::Readlink {
+            pathname: TransparentConstPtr {
                 inner: syscall_args[0] as *const i8,
             },
-            TransparentMutPtr {
+            buf: TransparentMutPtr {
                 inner: syscall_args[1] as *mut u8,
             },
-            syscall_args[2],
-        ),
+            bufsiz: syscall_args[2],
+        },
+        libc::SYS_readlinkat => SyscallRequest::Readlinkat {
+            dirfd: syscall_args[0].reinterpret_as_signed().truncate(),
+            pathname: TransparentConstPtr {
+                inner: syscall_args[1] as *const i8,
+            },
+            buf: TransparentMutPtr {
+                inner: syscall_args[2] as *mut u8,
+            },
+            bufsiz: syscall_args[3],
+        },
         libc::SYS_openat => SyscallRequest::Openat {
             dirfd: syscall_args[0].reinterpret_as_signed().truncate(),
             pathname: TransparentConstPtr {

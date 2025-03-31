@@ -253,7 +253,31 @@ pub fn sys_access(
 }
 
 pub fn sys_readlink(pathname: impl path::Arg, buf: &mut [u8]) -> Result<usize, Errno> {
+    // TODO: support symbolic links
     Err(Errno::ENOSYS)
+}
+
+pub fn sys_readlinkat(
+    dirfd: i32,
+    pathname: impl path::Arg,
+    buf: &mut [u8],
+) -> Result<usize, Errno> {
+    // TODO: support symbolic links
+    Err(Errno::ENOSYS)
+}
+
+pub fn sys_fstat(fd: i32) -> Result<FileStat, Errno> {
+    let Ok(fd) = u32::try_from(fd) else {
+        return Err(Errno::EBADF);
+    };
+    let stat = match file_descriptors().read().get_fd(fd) {
+        Some(desc) => match desc {
+            Descriptor::File(file) => litebox_fs().fd_file_status(file)?,
+            Descriptor::Socket(socket) => todo!(),
+        },
+        None => return Err(Errno::EBADF),
+    };
+    Ok(FileStat::from(stat))
 }
 
 pub fn sys_newfstatat(

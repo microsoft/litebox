@@ -295,14 +295,35 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
                     .unwrap_or(Err(Errno::EFAULT))
                 })
         }
-        SyscallRequest::Readlink(pathname, buf, size) => {
+        SyscallRequest::Readlink {
+            pathname,
+            buf,
+            bufsiz,
+        } => {
             pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                let Ok(size) = isize::try_from(size) else {
+                let Ok(size) = isize::try_from(bufsiz) else {
                     return Err(Errno::EINVAL);
                 };
                 buf.mutate_subslice_with(..size, |user_buf| {
                     // TODO: use kernel buffer to avoid page faults
                     syscalls::file::sys_readlink(path, user_buf)
+                })
+                .unwrap_or(Err(Errno::EFAULT))
+            })
+        }
+        SyscallRequest::Readlinkat {
+            dirfd,
+            pathname,
+            buf,
+            bufsiz,
+        } => {
+            pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                let Ok(size) = isize::try_from(bufsiz) else {
+                    return Err(Errno::EINVAL);
+                };
+                buf.mutate_subslice_with(..size, |user_buf| {
+                    // TODO: use kernel buffer to avoid page faults
+                    syscalls::file::sys_readlinkat(dirfd, path, user_buf)
                 })
                 .unwrap_or(Err(Errno::EFAULT))
             })
@@ -315,18 +336,22 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
         } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
             syscalls::file::sys_openat(dirfd, path, flags, mode).map(|fd| fd as usize)
         }),
+        SyscallRequest::Fstat { fd, buf } => syscalls::file::sys_fstat(fd).and_then(|stat| {
+            unsafe { buf.write_at_offset(0, stat) }
+                .ok_or(Errno::EFAULT)
+                .map(|()| 0)
+        }),
         SyscallRequest::Newfstatat {
             dirfd,
             pathname,
             buf,
             flags,
         } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-            match syscalls::file::sys_newfstatat(dirfd, path, flags) {
-                Ok(stat) => unsafe { buf.write_at_offset(0, stat) }
+            syscalls::file::sys_newfstatat(dirfd, path, flags).and_then(|stat| {
+                unsafe { buf.write_at_offset(0, stat) }
                     .ok_or(Errno::EFAULT)
-                    .map(|()| 0),
-                Err(err) => Err(err),
-            }
+                    .map(|()| 0)
+            })
         }),
         _ => {
             todo!()
