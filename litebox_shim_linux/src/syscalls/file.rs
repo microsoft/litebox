@@ -1,7 +1,4 @@
-//! File related syscalls implementation including:
-//! * `open`
-//! * `close`
-//! * `read`
+//! Implementation of file related syscalls, e.g., `open`, `read`, `write`, etc.
 
 use alloc::ffi::CString;
 use litebox::{
@@ -56,16 +53,10 @@ impl<P: path::Arg> FsPath<P> {
 }
 
 /// Open a file
-pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<i32, Errno> {
+pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
     litebox_fs()
         .open(path, flags, mode)
-        .map(|file| {
-            file_descriptors()
-                .write()
-                .insert(Descriptor::File(file))
-                .try_into()
-                .unwrap()
-        })
+        .map(|file| file_descriptors().write().insert(Descriptor::File(file)))
         .map_err(Errno::from)
 }
 
@@ -74,7 +65,7 @@ pub fn sys_openat(
     pathname: impl path::Arg,
     flags: OFlags,
     mode: Mode,
-) -> Result<i32, Errno> {
+) -> Result<u32, Errno> {
     let fs_path = FsPath::new(dirfd, pathname)?;
     match fs_path {
         FsPath::Absolute { path } | FsPath::CwdRelative { path } => sys_open(path, flags, mode),
@@ -161,10 +152,13 @@ pub fn sys_readv(
                 if iov.iov_len == 0 {
                     continue;
                 }
+                let Ok(iov_len) = isize::try_from(iov.iov_len) else {
+                    return Err(Errno::EINVAL);
+                };
                 // TODO: use kernel buffer to avoid page faults
                 let size = iov
                     .iov_base
-                    .mutate_subslice_with(..iov.iov_len as isize, |user_buf| {
+                    .mutate_subslice_with(..iov_len, |user_buf| {
                         // TODO: The data transfers performed by readv() and writev() are atomic: the data
                         // written by writev() is written as a single block that is not intermingled with
                         // output from writes in other processes
@@ -295,7 +289,9 @@ pub fn sys_getcwd(buf: &mut [u8]) -> Result<usize, Errno> {
         return Err(Errno::ERANGE);
     }
 
-    let name = CString::new(cwd).unwrap();
+    let Ok(name) = CString::new(cwd) else {
+        return Err(Errno::EINVAL);
+    };
     let bytes = name.as_bytes_with_nul();
     buf[..bytes.len()].copy_from_slice(bytes);
     Ok(bytes.len())

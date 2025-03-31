@@ -147,6 +147,7 @@ fn set_fs_base_wrfsbase(fs_base: u64) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize) -> i64 {
     // Litebox and the loaded program have different fs bases. Save and restore fs base
@@ -160,7 +161,6 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
     };
 
     let syscall_args = unsafe { core::slice::from_raw_parts(args, 6) };
-    std::eprintln!("syscall: {} args: {:?}", syscall_number, syscall_args);
     let dispatcher = match syscall_number {
         libc::SYS_read => SyscallRequest::Read {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
@@ -200,7 +200,7 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             offset: syscall_args[3],
         },
         libc::SYS_readv => SyscallRequest::Readv {
-            fd: syscall_args[0] as i32,
+            fd: syscall_args[0].reinterpret_as_signed().truncate(),
             iovec: TransparentConstPtr {
                 inner: syscall_args[1]
                     as *const litebox_common_linux::IoReadVec<TransparentMutPtr<u8>>,
@@ -208,7 +208,7 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             iovcnt: syscall_args[2],
         },
         libc::SYS_writev => SyscallRequest::Writev {
-            fd: syscall_args[0] as i32,
+            fd: syscall_args[0].reinterpret_as_signed().truncate(),
             iovec: TransparentConstPtr {
                 inner: syscall_args[1]
                     as *const litebox_common_linux::IoWriteVec<TransparentConstPtr<u8>>,
@@ -219,11 +219,12 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             TransparentConstPtr {
                 inner: syscall_args[0] as *const i8,
             },
-            match litebox_common_linux::AccessFlags::from_bits(syscall_args[1] as i32) {
+            match litebox_common_linux::AccessFlags::from_bits(
+                syscall_args[1].reinterpret_as_signed().truncate(),
+            ) {
                 Some(flags) => flags,
                 None => {
-                    std::eprintln!("Invalid access flags: {}", syscall_args[1]);
-                    return -libc::EINVAL as i64;
+                    return i64::from(-libc::EINVAL);
                 }
             },
         ),
@@ -251,18 +252,19 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             mode: litebox::fs::Mode::from_bits_truncate(syscall_args[3].truncate()),
         },
         libc::SYS_newfstatat => SyscallRequest::Newfstatat {
-            dirfd: syscall_args[0] as i32,
+            dirfd: syscall_args[0].reinterpret_as_signed().truncate(),
             pathname: TransparentConstPtr {
                 inner: syscall_args[1] as *const i8,
             },
             buf: TransparentMutPtr {
                 inner: syscall_args[2] as *mut litebox_common_linux::FileStat,
             },
-            flags: match litebox_common_linux::AtFlags::from_bits(syscall_args[3] as i32) {
+            flags: match litebox_common_linux::AtFlags::from_bits(
+                syscall_args[3].reinterpret_as_signed().truncate(),
+            ) {
                 Some(flags) => flags,
                 None => {
-                    std::eprintln!("Invalid at flags: {}", syscall_args[3]);
-                    return -libc::EINVAL as i64;
+                    return i64::from(-libc::EINVAL);
                 }
             },
         },

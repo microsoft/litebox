@@ -237,6 +237,7 @@ impl From<litebox::fs::FileStatus> for FileStat {
             st_gid: 0,
             __pad0: 0,
             st_rdev: 0,
+            #[allow(clippy::cast_possible_wrap)]
             st_size: size as i64,
             st_blksize: 0,
             st_blocks: 0,

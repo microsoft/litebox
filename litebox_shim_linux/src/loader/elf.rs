@@ -31,6 +31,9 @@ impl ElfFile {
     fn new(path: &str) -> Result<Self, Errno> {
         let name = CString::new(path).unwrap();
         let fd = crate::syscalls::file::sys_open(path, OFlags::RDONLY, Mode::empty())?;
+        let Ok(fd) = i32::try_from(fd) else {
+            unreachable!("fd should be a valid i32");
+        };
 
         Ok(Self { name, fd })
     }
