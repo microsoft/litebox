@@ -155,42 +155,39 @@ pub fn sys_readv(
     };
     let iovs: &[IoReadVec<MutPtr<u8>>] =
         unsafe { &iovec.to_cow_slice(iovcnt).ok_or(Errno::EFAULT)? };
-    match file_descriptors().read().get_fd(fd) {
-        Some(desc) => {
-            let mut total_read = 0;
-            for iov in iovs {
-                if iov.iov_len == 0 {
-                    continue;
-                }
-                let Ok(iov_len) = isize::try_from(iov.iov_len) else {
-                    return Err(Errno::EINVAL);
-                };
-                // TODO: use kernel buffer to avoid page faults
-                let size = iov
-                    .iov_base
-                    .mutate_subslice_with(..iov_len, |user_buf| {
-                        // TODO: The data transfers performed by readv() and writev() are atomic: the data
-                        // written by writev() is written as a single block that is not intermingled with
-                        // output from writes in other processes
-                        match desc {
-                            Descriptor::File(file) => {
-                                litebox_fs().read(file, user_buf, None).map_err(Errno::from)
-                            }
-                            Descriptor::Socket(socket) => todo!(),
-                        }
-                    })
-                    .ok_or(Errno::EFAULT)??;
-
-                total_read += size;
-                if size != iov.iov_len {
-                    // Okay to transfer fewer bytes than requested
-                    break;
-                }
-            }
-            Ok(total_read)
+    let locked_file_descriptors = file_descriptors().read();
+    let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
+    let mut total_read = 0;
+    for iov in iovs {
+        if iov.iov_len == 0 {
+            continue;
         }
-        None => Err(Errno::EBADF),
+        let Ok(iov_len) = isize::try_from(iov.iov_len) else {
+            return Err(Errno::EINVAL);
+        };
+        // TODO: use kernel buffer to avoid page faults
+        let size = iov
+            .iov_base
+            .mutate_subslice_with(..iov_len, |user_buf| {
+                // TODO: The data transfers performed by readv() and writev() are atomic: the data
+                // written by writev() is written as a single block that is not intermingled with
+                // output from writes in other processes
+                match desc {
+                    Descriptor::File(file) => {
+                        litebox_fs().read(file, user_buf, None).map_err(Errno::from)
+                    }
+                    Descriptor::Socket(socket) => todo!(),
+                }
+            })
+            .ok_or(Errno::EFAULT)??;
+
+        total_read += size;
+        if size < iov.iov_len {
+            // Okay to transfer fewer bytes than requested
+            break;
+        }
     }
+    Ok(total_read)
 }
 
 /// Handle syscall `writev`
@@ -204,35 +201,31 @@ pub fn sys_writev(
     };
     let iovs: &[IoWriteVec<ConstPtr<u8>>] =
         unsafe { &iovec.to_cow_slice(iovcnt).ok_or(Errno::EFAULT)? };
-    match file_descriptors().read().get_fd(fd) {
-        Some(desc) => {
-            let mut total_written = 0;
-            for iov in iovs {
-                if iov.iov_len == 0 {
-                    continue;
-                }
-                let slice =
-                    unsafe { iov.iov_base.to_cow_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
-                // TODO: The data transfers performed by readv() and writev() are atomic: the data
-                // written by writev() is written as a single block that is not intermingled with
-                // output from writes in other processes
-                let size = match desc {
-                    Descriptor::File(file) => litebox_fs()
-                        .write(file, &slice, None)
-                        .map_err(Errno::from)?,
-                    Descriptor::Socket(socket) => todo!(),
-                };
-
-                total_written += size;
-                if size != iov.iov_len {
-                    // Okay to transfer fewer bytes than requested
-                    break;
-                }
-            }
-            Ok(total_written)
+    let locked_file_descriptors = file_descriptors().read();
+    let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
+    let mut total_written = 0;
+    for iov in iovs {
+        if iov.iov_len == 0 {
+            continue;
         }
-        None => Err(Errno::EBADF),
+        let slice = unsafe { iov.iov_base.to_cow_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
+        // TODO: The data transfers performed by readv() and writev() are atomic: the data
+        // written by writev() is written as a single block that is not intermingled with
+        // output from writes in other processes
+        let size = match desc {
+            Descriptor::File(file) => litebox_fs()
+                .write(file, &slice, None)
+                .map_err(Errno::from)?,
+            Descriptor::Socket(socket) => todo!(),
+        };
+
+        total_written += size;
+        if size < iov.iov_len {
+            // Okay to transfer fewer bytes than requested
+            break;
+        }
     }
+    Ok(total_written)
 }
 
 /// Handle syscall `access`
@@ -301,7 +294,8 @@ pub fn sys_newfstatat(
     pathname: impl path::Arg,
     flags: AtFlags,
 ) -> Result<FileStat, Errno> {
-    if !(flags & !AtFlags::AT_EMPTY_PATH).is_empty() {
+    let current_support_flags = AtFlags::AT_EMPTY_PATH;
+    if flags.contains(current_support_flags.complement()) {
         todo!("unsupported flags");
     }
 

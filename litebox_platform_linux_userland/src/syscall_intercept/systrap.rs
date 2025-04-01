@@ -221,19 +221,14 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             },
             iovcnt: syscall_args[2],
         },
-        libc::SYS_access => SyscallRequest::Access(
-            TransparentConstPtr {
+        libc::SYS_access => SyscallRequest::Access {
+            pathname: TransparentConstPtr {
                 inner: syscall_args[0] as *const i8,
             },
-            match litebox_common_linux::AccessFlags::from_bits(
+            mode: litebox_common_linux::AccessFlags::from_bits_truncate(
                 syscall_args[1].reinterpret_as_signed().truncate(),
-            ) {
-                Some(flags) => flags,
-                None => {
-                    return i64::from(-libc::EINVAL);
-                }
-            },
-        ),
+            ),
+        },
         libc::SYS_getcwd => SyscallRequest::Getcwd {
             buf: TransparentMutPtr {
                 inner: syscall_args[0] as *mut u8,
@@ -275,14 +270,9 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             buf: TransparentMutPtr {
                 inner: syscall_args[2] as *mut litebox_common_linux::FileStat,
             },
-            flags: match litebox_common_linux::AtFlags::from_bits(
+            flags: litebox_common_linux::AtFlags::from_bits_truncate(
                 syscall_args[3].reinterpret_as_signed().truncate(),
-            ) {
-                Some(flags) => flags,
-                None => {
-                    return i64::from(-libc::EINVAL);
-                }
-            },
+            ),
         },
         _ => todo!(),
     };

@@ -93,6 +93,8 @@ bitflags::bitflags! {
         const W_OK = 2;
         /// Test for execute (search) permission.
         const X_OK = 1;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
     }
 }
 
@@ -126,6 +128,9 @@ bitflags::bitflags! {
         const AT_STATX_FORCE_SYNC = 0x2000;
         /// Don't sync attributes with the server
         const AT_STATX_DONT_SYNC = 0x4000;
+
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
     }
 }
 
@@ -158,7 +163,7 @@ impl From<litebox::fs::FileType> for InodeType {
 }
 
 /// Linux's `stat` struct
-#[repr(C)]
+#[repr(C, packed)]
 #[derive(Clone, Default)]
 pub struct FileStat {
     pub st_dev: u64,
@@ -302,7 +307,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         iovec: Platform::RawConstPointer<IoWriteVec<Platform::RawConstPointer<u8>>>,
         iovcnt: usize,
     },
-    Access(Platform::RawConstPointer<i8>, AccessFlags),
+    Access {
+        pathname: Platform::RawConstPointer<i8>,
+        mode: AccessFlags,
+    },
     Getcwd {
         buf: Platform::RawMutPointer<u8>,
         size: usize,

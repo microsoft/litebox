@@ -280,7 +280,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
         SyscallRequest::Writev { fd, iovec, iovcnt } => {
             syscalls::file::sys_writev(fd, iovec, iovcnt)
         }
-        SyscallRequest::Access(pathname, mode) => {
+        SyscallRequest::Access { pathname, mode } => {
             pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                 syscalls::file::sys_access(path, mode).map(|()| 0)
             })
