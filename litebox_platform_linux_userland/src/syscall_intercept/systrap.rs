@@ -147,6 +147,7 @@ fn set_fs_base_wrfsbase(fs_base: u64) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize) -> i64 {
     // Litebox and the loaded program have different fs bases. Save and restore fs base
@@ -159,7 +160,7 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
         old_fs_base
     };
 
-    let syscall_args = unsafe { std::slice::from_raw_parts(args, 6) };
+    let syscall_args = unsafe { core::slice::from_raw_parts(args, 6) };
     let dispatcher = match syscall_number {
         libc::SYS_read => SyscallRequest::Read {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
@@ -168,8 +169,21 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             },
             count: syscall_args[2],
         },
+        libc::SYS_write => SyscallRequest::Write {
+            fd: syscall_args[0].reinterpret_as_signed().truncate(),
+            buf: TransparentConstPtr {
+                inner: syscall_args[1] as *const u8,
+            },
+            count: syscall_args[2],
+        },
         libc::SYS_close => SyscallRequest::Close {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
+        },
+        libc::SYS_fstat => SyscallRequest::Fstat {
+            fd: syscall_args[0].reinterpret_as_signed().truncate(),
+            buf: TransparentMutPtr {
+                inner: syscall_args[1] as *mut litebox_common_linux::FileStat,
+            },
         },
         libc::SYS_mmap => SyscallRequest::Mmap {
             addr: syscall_args[0],
@@ -191,6 +205,55 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             count: syscall_args[2],
             offset: syscall_args[3],
         },
+        libc::SYS_readv => SyscallRequest::Readv {
+            fd: syscall_args[0].reinterpret_as_signed().truncate(),
+            iovec: TransparentConstPtr {
+                inner: syscall_args[1]
+                    as *const litebox_common_linux::IoReadVec<TransparentMutPtr<u8>>,
+            },
+            iovcnt: syscall_args[2],
+        },
+        libc::SYS_writev => SyscallRequest::Writev {
+            fd: syscall_args[0].reinterpret_as_signed().truncate(),
+            iovec: TransparentConstPtr {
+                inner: syscall_args[1]
+                    as *const litebox_common_linux::IoWriteVec<TransparentConstPtr<u8>>,
+            },
+            iovcnt: syscall_args[2],
+        },
+        libc::SYS_access => SyscallRequest::Access {
+            pathname: TransparentConstPtr {
+                inner: syscall_args[0] as *const i8,
+            },
+            mode: litebox_common_linux::AccessFlags::from_bits_truncate(
+                syscall_args[1].reinterpret_as_signed().truncate(),
+            ),
+        },
+        libc::SYS_getcwd => SyscallRequest::Getcwd {
+            buf: TransparentMutPtr {
+                inner: syscall_args[0] as *mut u8,
+            },
+            size: syscall_args[1],
+        },
+        libc::SYS_readlink => SyscallRequest::Readlink {
+            pathname: TransparentConstPtr {
+                inner: syscall_args[0] as *const i8,
+            },
+            buf: TransparentMutPtr {
+                inner: syscall_args[1] as *mut u8,
+            },
+            bufsiz: syscall_args[2],
+        },
+        libc::SYS_readlinkat => SyscallRequest::Readlinkat {
+            dirfd: syscall_args[0].reinterpret_as_signed().truncate(),
+            pathname: TransparentConstPtr {
+                inner: syscall_args[1] as *const i8,
+            },
+            buf: TransparentMutPtr {
+                inner: syscall_args[2] as *mut u8,
+            },
+            bufsiz: syscall_args[3],
+        },
         libc::SYS_openat => SyscallRequest::Openat {
             dirfd: syscall_args[0].reinterpret_as_signed().truncate(),
             pathname: TransparentConstPtr {
@@ -198,6 +261,18 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             },
             flags: litebox::fs::OFlags::from_bits_truncate(syscall_args[2].truncate()),
             mode: litebox::fs::Mode::from_bits_truncate(syscall_args[3].truncate()),
+        },
+        libc::SYS_newfstatat => SyscallRequest::Newfstatat {
+            dirfd: syscall_args[0].reinterpret_as_signed().truncate(),
+            pathname: TransparentConstPtr {
+                inner: syscall_args[1] as *const i8,
+            },
+            buf: TransparentMutPtr {
+                inner: syscall_args[2] as *mut litebox_common_linux::FileStat,
+            },
+            flags: litebox_common_linux::AtFlags::from_bits_truncate(
+                syscall_args[3].reinterpret_as_signed().truncate(),
+            ),
         },
         _ => todo!(),
     };
@@ -259,7 +334,23 @@ fn register_seccomp_filter() {
     // allow list
     // TODO: remove syscalls once they are implemented in the shim
     let rules = vec![
-        (libc::SYS_write, vec![]),
+        // TODO: before we support standard input/output, allow writes
+        // to fd <= 2
+        (
+            libc::SYS_write,
+            vec![
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        0,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::Le,
+                        libc::STDERR_FILENO as u64,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            ],
+        ),
         (
             libc::SYS_mmap,
             vec![
@@ -278,7 +369,6 @@ fn register_seccomp_filter() {
                 .unwrap(),
             ],
         ),
-        (libc::SYS_fstat, vec![]),
         (libc::SYS_mprotect, vec![]),
         (libc::SYS_munmap, vec![]),
         (libc::SYS_brk, vec![]),
@@ -300,12 +390,9 @@ fn register_seccomp_filter() {
         ),
         (libc::SYS_rt_sigprocmask, vec![]),
         (libc::SYS_rt_sigreturn, vec![]),
-        (libc::SYS_access, vec![]),
         (libc::SYS_sched_yield, vec![]),
         (libc::SYS_getpid, vec![]),
         (libc::SYS_uname, vec![]),
-        (libc::SYS_getcwd, vec![]),
-        (libc::SYS_readlink, vec![]),
         (libc::SYS_getuid, vec![]),
         (libc::SYS_getgid, vec![]),
         (libc::SYS_geteuid, vec![]),
@@ -317,8 +404,6 @@ fn register_seccomp_filter() {
         (libc::SYS_set_tid_address, vec![]),
         (libc::SYS_exit_group, vec![]),
         (libc::SYS_tgkill, vec![]),
-        (libc::SYS_newfstatat, vec![]),
-        (libc::SYS_readlinkat, vec![]),
         (libc::SYS_set_robust_list, vec![]),
         (libc::SYS_prlimit64, vec![]),
         (libc::SYS_getrandom, vec![]),

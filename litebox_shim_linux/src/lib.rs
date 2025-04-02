@@ -42,6 +42,7 @@ pub fn set_fs(fs: litebox::fs::in_mem::FileSystem<'static, Platform>) {
         .expect("fs is already set");
 }
 
+/// Get the global file system
 pub fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
     FS.get_or_init(|| {
         alloc::boxed::Box::new(litebox::fs::in_mem::FileSystem::new(
@@ -100,16 +101,10 @@ impl Descriptors {
         }
     }
     fn remove(&mut self, fd: u32) -> Option<Descriptor> {
-        if fd >= (2 << 30) {
-            return None;
-        }
         let fd = fd as usize;
         self.descriptors.get_mut(fd)?.take()
     }
     fn remove_file(&mut self, fd: u32) -> Option<litebox::fd::FileFd> {
-        if fd >= (2 << 30) {
-            return None;
-        }
         let fd = fd as usize;
         if let Some(Descriptor::File(file_fd)) = self
             .descriptors
@@ -122,9 +117,6 @@ impl Descriptors {
         }
     }
     fn remove_socket(&mut self, fd: u32) -> Option<litebox::fd::SocketFd> {
-        if fd >= (2 << 30) {
-            return None;
-        }
         let fd = fd as usize;
         if let Some(Descriptor::Socket(socket_fd)) = self
             .descriptors
@@ -136,37 +128,28 @@ impl Descriptors {
             None
         }
     }
+    fn get_fd(&self, fd: u32) -> Option<&Descriptor> {
+        self.descriptors.get(fd as usize)?.as_ref()
+    }
     fn get_file_fd(&self, fd: u32) -> Option<&litebox::fd::FileFd> {
-        if fd >= (2 << 30) {
-            return None;
-        }
         match self.descriptors.get(fd as usize)?.as_ref()? {
             Descriptor::File(file_fd) => Some(file_fd),
             Descriptor::Socket(_) => None,
         }
     }
     fn get_file_fd_mut(&mut self, fd: u32) -> Option<&mut litebox::fd::FileFd> {
-        if fd >= (2 << 30) {
-            return None;
-        }
         match self.descriptors.get_mut(fd as usize)?.as_mut()? {
             Descriptor::File(file_fd) => Some(file_fd),
             Descriptor::Socket(_) => None,
         }
     }
     fn get_socket_fd(&self, fd: u32) -> Option<&litebox::fd::SocketFd> {
-        if fd >= (2 << 30) {
-            return None;
-        }
         match self.descriptors.get(fd as usize)?.as_ref()? {
             Descriptor::File(_) => None,
             Descriptor::Socket(socket_fd) => Some(socket_fd),
         }
     }
     fn get_socket_fd_mut(&mut self, fd: u32) -> Option<&mut litebox::fd::SocketFd> {
-        if fd >= (2 << 30) {
-            return None;
-        }
         match self.descriptors.get_mut(fd as usize)?.as_mut()? {
             Descriptor::File(_) => None,
             Descriptor::Socket(socket_fd) => Some(socket_fd),
@@ -204,7 +187,7 @@ pub unsafe extern "C" fn open(pathname: ConstPtr<i8>, flags: u32, mode: u32) -> 
         litebox::fs::OFlags::from_bits(flags).unwrap(),
         litebox::fs::Mode::from_bits(mode).unwrap(),
     ) {
-        Ok(fd) => fd,
+        Ok(fd) => fd.try_into().unwrap(),
         Err(err) => err.as_neg(),
     }
 }
@@ -215,44 +198,50 @@ pub extern "C" fn close(fd: i32) -> i32 {
 }
 
 /// Entry point for the syscall handler
+#[allow(clippy::too_many_lines)]
 pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
-    match request {
+    let res: Result<usize, Errno> = match request {
         SyscallRequest::Read { fd, buf, count } => {
-            let Ok(count) = isize::try_from(count) else {
-                return i64::from(Errno::EINVAL.as_neg());
-            };
-            buf.mutate_subslice_with(..count, |user_buf| {
-                // TODO: use kernel buffer to avoid page faults
-                syscalls::file::sys_read(fd, user_buf, None).map_or_else(
-                    |e| i64::from(e.as_neg()),
-                    #[allow(clippy::cast_possible_wrap)]
-                    |size| size as i64,
-                )
-            })
-            .unwrap_or(i64::from(Errno::EFAULT.as_neg()))
+            isize::try_from(count)
+                .map_err(|_| Errno::EINVAL)
+                .and_then(|count| {
+                    buf.mutate_subslice_with(..count, |user_buf| {
+                        // TODO: use kernel buffer to avoid page faults
+                        syscalls::file::sys_read(fd, user_buf, None)
+                    })
+                    .unwrap_or(Err(Errno::EFAULT))
+                })
         }
-        SyscallRequest::Close { fd } => {
-            i64::from(syscalls::file::sys_close(fd).map_or_else(Errno::as_neg, |()| 0))
-        }
+        SyscallRequest::Write { fd, buf, count } => match unsafe { buf.to_cow_slice(count) } {
+            Some(buf) => syscalls::file::sys_write(fd, &buf, None),
+            None => Err(Errno::EFAULT),
+        },
+        SyscallRequest::Close { fd } => syscalls::file::sys_close(fd).map(|()| 0),
         SyscallRequest::Pread64 {
             fd,
             buf,
             count,
             offset,
         } => {
-            let Ok(count) = isize::try_from(count) else {
-                return i64::from(Errno::EINVAL.as_neg());
-            };
-            buf.mutate_subslice_with(..count, |user_buf| {
-                // TODO: use kernel buffer to avoid page faults
-                syscalls::file::sys_pread64(fd, user_buf, offset).map_or_else(
-                    |e| i64::from(e.as_neg()),
-                    #[allow(clippy::cast_possible_wrap)]
-                    |size| size as i64,
-                )
-            })
-            .unwrap_or(i64::from(Errno::EFAULT.as_neg()))
+            isize::try_from(count)
+                .map_err(|_| Errno::EINVAL)
+                .and_then(|count| {
+                    buf.mutate_subslice_with(..count, |user_buf| {
+                        // TODO: use kernel buffer to avoid page faults
+                        syscalls::file::sys_pread64(fd, user_buf, offset)
+                    })
+                    .unwrap_or(Err(Errno::EFAULT))
+                })
         }
+        SyscallRequest::Pwrite64 {
+            fd,
+            buf,
+            count,
+            offset,
+        } => match unsafe { buf.to_cow_slice(count) } {
+            Some(buf) => syscalls::file::sys_pwrite64(fd, &buf, offset),
+            None => Err(Errno::EFAULT),
+        },
         SyscallRequest::Mmap {
             addr,
             length,
@@ -261,33 +250,101 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
             fd,
             offset,
         } => {
-            syscalls::mm::sys_mmap(addr, length, prot, flags, fd, offset).map_or_else(
-                |e| i64::from(e.as_neg()),
-                |ptr| {
-                    let Ok(addr) = i64::try_from(ptr.as_usize()) else {
-                        // Note it assumes user space address does not exceed i64::MAX (0x7FFF_FFFF_FFFF_FFFF).
-                        // For Linux the max user address is 0x7FFF_FFFF_F000.
-                        unreachable!("invalid user pointer");
-                    };
-                    addr
-                },
-            )
+            syscalls::mm::sys_mmap(addr, length, prot, flags, fd, offset).map(|ptr| ptr.as_usize())
+        }
+        SyscallRequest::Readv { fd, iovec, iovcnt } => syscalls::file::sys_readv(fd, iovec, iovcnt),
+        SyscallRequest::Writev { fd, iovec, iovcnt } => {
+            syscalls::file::sys_writev(fd, iovec, iovcnt)
+        }
+        SyscallRequest::Access { pathname, mode } => {
+            pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                syscalls::file::sys_access(path, mode).map(|()| 0)
+            })
+        }
+        SyscallRequest::Getcwd { buf, size } => {
+            isize::try_from(size)
+                .map_err(|_| Errno::EINVAL)
+                .and_then(|size| {
+                    buf.mutate_subslice_with(..size, |user_buf| {
+                        // TODO: use kernel buffer to avoid page faults
+                        syscalls::file::sys_getcwd(user_buf)
+                    })
+                    .unwrap_or(Err(Errno::EFAULT))
+                })
+        }
+        SyscallRequest::Readlink {
+            pathname,
+            buf,
+            bufsiz,
+        } => {
+            pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                let Ok(size) = isize::try_from(bufsiz) else {
+                    return Err(Errno::EINVAL);
+                };
+                buf.mutate_subslice_with(..size, |user_buf| {
+                    // TODO: use kernel buffer to avoid page faults
+                    syscalls::file::sys_readlink(path, user_buf)
+                })
+                .unwrap_or(Err(Errno::EFAULT))
+            })
+        }
+        SyscallRequest::Readlinkat {
+            dirfd,
+            pathname,
+            buf,
+            bufsiz,
+        } => {
+            pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                let Ok(size) = isize::try_from(bufsiz) else {
+                    return Err(Errno::EINVAL);
+                };
+                buf.mutate_subslice_with(..size, |user_buf| {
+                    // TODO: use kernel buffer to avoid page faults
+                    syscalls::file::sys_readlinkat(dirfd, path, user_buf)
+                })
+                .unwrap_or(Err(Errno::EFAULT))
+            })
         }
         SyscallRequest::Openat {
             dirfd,
             pathname,
             flags,
             mode,
-        } => {
-            let Some(path) = pathname.to_cstring() else {
-                return i64::from(Errno::EFAULT.as_neg());
-            };
-            i64::from(
-                syscalls::file::sys_openat(dirfd, path, flags, mode).unwrap_or_else(Errno::as_neg),
-            )
-        }
+        } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+            syscalls::file::sys_openat(dirfd, path, flags, mode).map(|fd| fd as usize)
+        }),
+        SyscallRequest::Fstat { fd, buf } => syscalls::file::sys_fstat(fd).and_then(|stat| {
+            unsafe { buf.write_at_offset(0, stat) }
+                .ok_or(Errno::EFAULT)
+                .map(|()| 0)
+        }),
+        SyscallRequest::Newfstatat {
+            dirfd,
+            pathname,
+            buf,
+            flags,
+        } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+            syscalls::file::sys_newfstatat(dirfd, path, flags).and_then(|stat| {
+                unsafe { buf.write_at_offset(0, stat) }
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            })
+        }),
         _ => {
             todo!()
         }
-    }
+    };
+
+    res.map_or_else(
+        |e| i64::from(e.as_neg()),
+        |val| {
+            let Ok(v) = i64::try_from(val) else {
+                // Note in case where val is an address (e.g., returned from `mmap`), it assumes
+                // user space address does not exceed i64::MAX (0x7FFF_FFFF_FFFF_FFFF).
+                // For Linux the max user address is 0x7FFF_FFFF_F000.
+                unreachable!("invalid user pointer");
+            };
+            v
+        },
+    )
 }

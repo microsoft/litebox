@@ -151,6 +151,16 @@ impl From<litebox::fs::errors::ReadError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::WriteError> for Errno {
+    fn from(value: litebox::fs::errors::WriteError) -> Self {
+        match value {
+            litebox::fs::errors::WriteError::NotAFile => Errno::EISDIR,
+            litebox::fs::errors::WriteError::NotForWriting => Errno::EACCES,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::platform::page_mgmt::AllocationError> for Errno {
     fn from(value: litebox::platform::page_mgmt::AllocationError) -> Self {
         match value {
@@ -171,6 +181,23 @@ impl From<litebox::mm::linux::MappingError> for Errno {
             litebox::mm::linux::MappingError::NotAFile => Errno::EISDIR,
             litebox::mm::linux::MappingError::NotForReading => Errno::EACCES,
             litebox::mm::linux::MappingError::MapError(e) => e.into(),
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::path::ConversionError> for Errno {
+    fn from(value: litebox::path::ConversionError) -> Self {
+        match value {
+            litebox::path::ConversionError::FailedToConvertTo(_) => Errno::EINVAL,
+        }
+    }
+}
+
+impl From<litebox::fs::errors::FileStatusError> for Errno {
+    fn from(value: litebox::fs::errors::FileStatusError) -> Self {
+        match value {
+            litebox::fs::errors::FileStatusError::PathError(path_error) => path_error.into(),
             _ => unimplemented!(),
         }
     }
