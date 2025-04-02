@@ -106,24 +106,24 @@ impl Descriptors {
     }
     fn remove_file(&mut self, fd: u32) -> Option<litebox::fd::FileFd> {
         let fd = fd as usize;
-        if let Some(Descriptor::File(file_fd)) = self
+        if let Some(Descriptor::File { file, .. }) = self
             .descriptors
             .get_mut(fd)?
-            .take_if(|v| matches!(v, Descriptor::File(_)))
+            .take_if(|v| matches!(v, Descriptor::File { .. }))
         {
-            Some(file_fd)
+            Some(file)
         } else {
             None
         }
     }
     fn remove_socket(&mut self, fd: u32) -> Option<litebox::fd::SocketFd> {
         let fd = fd as usize;
-        if let Some(Descriptor::Socket(socket_fd)) = self
+        if let Some(Descriptor::Socket { socket, .. }) = self
             .descriptors
             .get_mut(fd)?
-            .take_if(|v| matches!(v, Descriptor::Socket(_)))
+            .take_if(|v| matches!(v, Descriptor::Socket { .. }))
         {
-            Some(socket_fd)
+            Some(socket)
         } else {
             None
         }
@@ -133,33 +133,39 @@ impl Descriptors {
     }
     fn get_file_fd(&self, fd: u32) -> Option<&litebox::fd::FileFd> {
         match self.descriptors.get(fd as usize)?.as_ref()? {
-            Descriptor::File(file_fd) => Some(file_fd),
-            Descriptor::Socket(_) => None,
+            Descriptor::File { file, .. } => Some(file),
+            Descriptor::Socket { .. } => None,
         }
     }
     fn get_file_fd_mut(&mut self, fd: u32) -> Option<&mut litebox::fd::FileFd> {
         match self.descriptors.get_mut(fd as usize)?.as_mut()? {
-            Descriptor::File(file_fd) => Some(file_fd),
-            Descriptor::Socket(_) => None,
+            Descriptor::File { file, .. } => Some(file),
+            Descriptor::Socket { .. } => None,
         }
     }
     fn get_socket_fd(&self, fd: u32) -> Option<&litebox::fd::SocketFd> {
         match self.descriptors.get(fd as usize)?.as_ref()? {
-            Descriptor::File(_) => None,
-            Descriptor::Socket(socket_fd) => Some(socket_fd),
+            Descriptor::File { .. } => None,
+            Descriptor::Socket { socket, .. } => Some(socket),
         }
     }
     fn get_socket_fd_mut(&mut self, fd: u32) -> Option<&mut litebox::fd::SocketFd> {
         match self.descriptors.get_mut(fd as usize)?.as_mut()? {
-            Descriptor::File(_) => None,
-            Descriptor::Socket(socket_fd) => Some(socket_fd),
+            Descriptor::File { .. } => None,
+            Descriptor::Socket { socket, .. } => Some(socket),
         }
     }
 }
 
 enum Descriptor {
-    File(litebox::fd::FileFd),
-    Socket(litebox::fd::SocketFd),
+    File {
+        file: litebox::fd::FileFd,
+        flags: core::cell::Cell<litebox::fs::OFlags>,
+    },
+    Socket {
+        socket: litebox::fd::SocketFd,
+        flags: core::cell::Cell<litebox::fs::OFlags>,
+    },
 }
 
 pub(crate) fn file_descriptors<'a>() -> &'a RwLock<'static, Platform, Descriptors> {
@@ -261,6 +267,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
                 syscalls::file::sys_access(path, mode).map(|()| 0)
             })
         }
+        SyscallRequest::Fcntl { fd, arg } => syscalls::file::sys_fcntl(fd, arg).map(|v| v as usize),
         SyscallRequest::Getcwd { buf, size } => {
             isize::try_from(size)
                 .map_err(|_| Errno::EINVAL)

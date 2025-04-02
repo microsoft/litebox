@@ -255,6 +255,26 @@ impl From<litebox::fs::FileStatus> for FileStat {
     }
 }
 
+/// Commands for use with [`fcntl`].
+#[allow(non_camel_case_types)]
+#[derive(Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum FcntlArg {
+    /// Get descriptor status flags
+    F_GETFL,
+}
+
+pub const F_GETFL: i32 = 3;
+
+impl FcntlArg {
+    pub fn from(cmd: i32, _arg: usize) -> Self {
+        match cmd {
+            F_GETFL => Self::F_GETFL,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
@@ -308,6 +328,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Access {
         pathname: Platform::RawConstPointer<i8>,
         mode: AccessFlags,
+    },
+    Fcntl {
+        fd: i32,
+        arg: FcntlArg,
     },
     Getcwd {
         buf: Platform::RawMutPointer<u8>,
