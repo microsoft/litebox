@@ -235,7 +235,7 @@ pub fn sys_readv(
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
         let size = match desc {
-            Descriptor::File(file) => litebox_fs()
+            Descriptor::File(file) | Descriptor::Stdio(file) => litebox_fs()
                 .read(file, &mut kernel_buffer, None)
                 .map_err(Errno::from)?,
             Descriptor::Stdio(file) => file.read(&mut kernel_buffer, None)?,
@@ -279,7 +279,7 @@ pub fn sys_writev(
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
         let size = match desc {
-            Descriptor::File(file) => litebox_fs()
+            Descriptor::File(file) | Descriptor::Stdio(file) => litebox_fs()
                 .write(file, &slice, None)
                 .map_err(Errno::from)?,
             Descriptor::Stdio(file) => file.write(&slice, None)?,
@@ -564,7 +564,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
             Ok(0)
         }
         FcntlArg::GETFL => match desc {
-            Descriptor::File(file) => todo!(),
+            Descriptor::File(file) | Descriptor::Stdio(file) => todo!(),
             Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { consumer, .. } => Ok(consumer.get_status().bits()),
             Descriptor::PipeWriter { producer, .. } => Ok(producer.get_status().bits()),
