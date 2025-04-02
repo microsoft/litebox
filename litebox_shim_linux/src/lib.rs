@@ -157,6 +157,12 @@ impl Descriptors {
     }
 }
 
+enum StdType {
+    Stdin,
+    Stdout,
+    Stderr,
+}
+
 enum Descriptor {
     File(litebox::fd::FileFd),
     Socket(litebox::fd::SocketFd),
@@ -172,6 +178,7 @@ enum Descriptor {
         file: alloc::sync::Arc<syscalls::eventfd::EventFile<Platform>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
+    Stdio(litebox::fd::FileFd),
 }
 
 pub(crate) fn file_descriptors<'a>() -> &'a RwLock<Platform, Descriptors> {
