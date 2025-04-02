@@ -218,6 +218,13 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             fd: syscall_args[4].reinterpret_as_signed().truncate(),
             offset: syscall_args[5],
         },
+        libc::SYS_ioctl => SyscallRequest::Ioctl {
+            fd: syscall_args[0].reinterpret_as_signed().truncate(),
+            request: syscall_args[1].truncate(),
+            arg: TransparentMutPtr {
+                inner: syscall_args[2] as *mut u8,
+            },
+        },
         libc::SYS_munmap => SyscallRequest::Munmap {
             addr: TransparentMutPtr {
                 inner: syscall_args[0] as *mut u8,

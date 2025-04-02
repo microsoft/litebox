@@ -633,3 +633,69 @@ pub fn sys_eventfd2(initval: u32, flags: EfdFlags) -> Result<u32, Errno> {
     });
     Ok(fd)
 }
+
+const TCGETS: u32 = 0x5401;
+#[allow(non_camel_case_types)]
+type cc_t = ::core::ffi::c_uchar;
+#[allow(non_camel_case_types)]
+type tcflag_t = ::core::ffi::c_uint;
+#[repr(C)]
+#[derive(Debug, Clone)]
+struct Termios {
+    c_iflag: tcflag_t,
+    c_oflag: tcflag_t,
+    c_cflag: tcflag_t,
+    c_lflag: tcflag_t,
+    c_line: cc_t,
+    c_cc: [cc_t; 19usize],
+}
+
+fn stdio_ioctl(file: &litebox::fd::FileFd, request: u32, arg: MutPtr<u8>) -> Result<u32, Errno> {
+    if request == TCGETS {
+        let termios = unsafe { core::mem::transmute::<MutPtr<u8>, MutPtr<Termios>>(arg) };
+        unsafe {
+            termios.write_at_offset(
+                0,
+                Termios {
+                    c_iflag: 0,
+                    c_oflag: 0,
+                    c_cflag: 0,
+                    c_lflag: 0,
+                    c_line: 0,
+                    c_cc: [0; 19],
+                },
+            )
+        }
+        .ok_or(Errno::EFAULT)?;
+        Ok(0)
+    } else {
+        todo!()
+    }
+}
+
+/// Handle syscall `ioctl`
+pub fn sys_ioctl(fd: i32, request: u32, arg: MutPtr<u8>) -> Result<u32, Errno> {
+    let Ok(fd) = u32::try_from(fd) else {
+        return Err(Errno::EBADF);
+    };
+
+    let locked_file_descriptors = file_descriptors().read();
+    let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
+    match desc {
+        Descriptor::Stdio(file) => stdio_ioctl(file, request, arg),
+        Descriptor::File(file) => todo!(),
+        Descriptor::Socket(socket) => todo!(),
+        Descriptor::PipeReader {
+            consumer,
+            close_on_exec,
+        } => todo!(),
+        Descriptor::PipeWriter {
+            producer,
+            close_on_exec,
+        } => todo!(),
+        Descriptor::Eventfd {
+            file,
+            close_on_exec,
+        } => todo!(),
+    }
+}
