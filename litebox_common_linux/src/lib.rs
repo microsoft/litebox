@@ -257,18 +257,36 @@ impl From<litebox::fs::FileStatus> for FileStat {
 
 /// Commands for use with [`fcntl`].
 #[allow(non_camel_case_types)]
-#[derive(Debug, Eq, Hash, PartialEq)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum FcntlArg {
+    /// Get the file descriptor flags
+    F_GETFD,
+    /// Set the file descriptor flags
+    F_SETFD(FileDescriptorFlags),
     /// Get descriptor status flags
     F_GETFL,
 }
 
+pub const F_GETFD: i32 = 1;
+pub const F_SETFD: i32 = 2;
 pub const F_GETFL: i32 = 3;
 
+bitflags::bitflags! {
+    #[derive(Debug)]
+    pub struct FileDescriptorFlags: u32 {
+        /// Close-on-exec flag
+        const FD_CLOEXEC = 0x1;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
 impl FcntlArg {
-    pub fn from(cmd: i32, _arg: usize) -> Self {
+    pub fn from(cmd: i32, arg: usize) -> Self {
         match cmd {
+            F_GETFD => Self::F_GETFD,
+            F_SETFD => Self::F_SETFD(FileDescriptorFlags::from_bits_truncate(arg as u32)),
             F_GETFL => Self::F_GETFL,
             _ => unimplemented!(),
         }
