@@ -114,8 +114,6 @@ bitflags::bitflags! {
         /// Used with `faccessat`, the checks for accessibility are performed using the
         /// effective user and group IDs instead of the real user and group ID
         const AT_EACCESS = 0x200;
-        /// Remove directory instead of unlinking file.
-        const AT_REMOVEDIR = 0x200;
         /// Do not follow symbolic links.
         const AT_SYMLINK_NOFOLLOW = 0x100;
 
