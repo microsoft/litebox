@@ -160,11 +160,11 @@ impl Descriptors {
 enum Descriptor {
     File {
         file: litebox::fd::FileFd,
-        flags: core::cell::Cell<litebox::fs::OFlags>,
+        flags: alloc::sync::Arc<core::sync::atomic::AtomicU32>,
     },
     Socket {
         socket: litebox::fd::SocketFd,
-        flags: core::cell::Cell<litebox::fs::OFlags>,
+        flags: alloc::sync::Arc<core::sync::atomic::AtomicU32>,
     },
 }
 

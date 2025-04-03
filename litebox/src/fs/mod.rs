@@ -218,6 +218,17 @@ bitflags! {
         const TRUNC = 0x200;
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
+
+        /// All file status flags
+        const STATUS_FLAGS_MASK = Self::APPEND.bits()
+            | Self::NONBLOCK.bits()
+            | Self::DSYNC.bits()
+            | Self::ASYNC.bits()
+            | Self::DIRECT.bits()
+            | Self::LARGEFILE.bits()
+            | Self::NOATIME.bits()
+            | Self::SYNC.bits()
+            | Self::PATH.bits();
     }
 }
 

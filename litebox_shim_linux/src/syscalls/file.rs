@@ -65,7 +65,9 @@ pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, 
         .map(|file| {
             file_descriptors().write().insert(Descriptor::File {
                 file,
-                flags: core::cell::Cell::new(flags),
+                flags: alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(
+                    (flags & OFlags::STATUS_FLAGS_MASK).bits(),
+                )),
             })
         })
         .map_err(Errno::from)
@@ -333,8 +335,9 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
             let locked_file_descriptors = file_descriptors().read();
             let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
             match desc {
-                Descriptor::File { flags, .. } => Ok(flags.get().bits()),
-                Descriptor::Socket { flags, .. } => todo!(),
+                Descriptor::File { flags, .. } | Descriptor::Socket { flags, .. } => {
+                    Ok(flags.load(core::sync::atomic::Ordering::Relaxed))
+                }
             }
         }
         _ => unimplemented!(),
