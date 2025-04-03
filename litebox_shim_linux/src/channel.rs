@@ -27,6 +27,26 @@ impl<T> EndPointer<T> {
     }
 }
 
+macro_rules! common_functions_for_channel {
+    () => {
+        pub fn is_shutdown(&self) -> bool {
+            self.endpoint.is_shutdown()
+        }
+
+        pub fn shutdown(&self) {
+            self.endpoint.shutdown();
+        }
+
+        pub fn is_peer_shutdown(&self) -> bool {
+            if let Some(peer) = self.peer.upgrade() {
+                peer.is_shutdown()
+            } else {
+                true
+            }
+        }
+    };
+}
+
 pub(crate) struct Producer<T> {
     endpoint: Arc<EndPointer<HeapProd<T>>>,
     peer: Weak<EndPointer<HeapCons<T>>>,
@@ -38,6 +58,14 @@ impl<T> Producer<T> {
             endpoint: Arc::new(EndPointer::new(rb, platform)),
             peer: Weak::new(),
         }
+    }
+
+    common_functions_for_channel!();
+}
+
+impl<T> Drop for Producer<T> {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -52,6 +80,14 @@ impl<T> Consumer<T> {
             endpoint: Arc::new(EndPointer::new(rb, platform)),
             peer: Weak::new(),
         }
+    }
+
+    common_functions_for_channel!();
+}
+
+impl<T> Drop for Consumer<T> {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
