@@ -286,6 +286,18 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                 syscall_args[3].reinterpret_as_signed().truncate(),
             ),
         },
+        libc::SYS_pipe => SyscallRequest::Pipe2 {
+            pipefd: TransparentMutPtr {
+                inner: syscall_args[0] as *mut _,
+            },
+            flags: litebox::fs::OFlags::empty(),
+        },
+        libc::SYS_pipe2 => SyscallRequest::Pipe2 {
+            pipefd: TransparentMutPtr {
+                inner: syscall_args[0] as *mut _,
+            },
+            flags: litebox::fs::OFlags::from_bits_truncate(syscall_args[1].truncate()),
+        },
         libc::SYS_rt_sigaction => {
             let mut ret = 0;
             let signo: i32 = syscall_args[0].reinterpret_as_signed().truncate();

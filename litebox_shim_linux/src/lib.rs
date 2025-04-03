@@ -26,6 +26,7 @@ use litebox::{
 use litebox_common_linux::{SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
+pub(crate) mod channel;
 pub mod loader;
 pub mod syscalls;
 
@@ -164,6 +165,7 @@ impl Descriptors {
 enum Descriptor {
     File(litebox::fd::FileFd),
     Socket(litebox::fd::SocketFd),
+    Pipe(syscalls::pipe::Pipe),
 }
 
 pub(crate) fn file_descriptors<'a>() -> &'a RwLock<'static, Platform, Descriptors> {
@@ -325,6 +327,13 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
                     .map(|()| 0)
             })
         }),
+        SyscallRequest::Pipe2 { pipefd, flags } => {
+            syscalls::file::sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
+                unsafe { pipefd.write_at_offset(0, read_fd).ok_or(Errno::EFAULT) }?;
+                unsafe { pipefd.write_at_offset(1, write_fd).ok_or(Errno::EFAULT) }?;
+                Ok(0)
+            })
+        }
         _ => {
             todo!()
         }

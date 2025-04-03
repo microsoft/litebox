@@ -105,6 +105,7 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
         Some(desc) => match desc {
             Descriptor::File(file) => litebox_fs().read(file, buf, offset).map_err(Errno::from),
             Descriptor::Socket(socket) => todo!(),
+            Descriptor::Pipe(pipe) => todo!(),
         },
         None => Err(Errno::EBADF),
     }
@@ -122,6 +123,7 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
         Some(desc) => match desc {
             Descriptor::File(file) => litebox_fs().write(file, buf, offset).map_err(Errno::from),
             Descriptor::Socket(socket) => todo!(),
+            Descriptor::Pipe(pipe) => todo!(),
         },
         None => Err(Errno::EBADF),
     }
@@ -151,6 +153,7 @@ pub fn sys_close(fd: i32) -> Result<(), Errno> {
     match file_descriptors().write().remove(fd) {
         Some(Descriptor::File(file)) => litebox_fs().close(file).map_err(Errno::from),
         Some(Descriptor::Socket(socket)) => todo!(),
+        Some(Descriptor::Pipe(_)) => Ok(()),
         None => Err(Errno::EBADF),
     }
 }
@@ -192,6 +195,7 @@ pub fn sys_readv(
                 .read(file, &mut kernel_buffer, None)
                 .map_err(Errno::from)?,
             Descriptor::Socket(socket) => todo!(),
+            Descriptor::Pipe(pipe) => todo!(),
         };
         iov.iov_base
             .copy_from_slice(0, &kernel_buffer[..size])
@@ -232,6 +236,7 @@ pub fn sys_writev(
                 .write(file, &slice, None)
                 .map_err(Errno::from)?,
             Descriptor::Socket(socket) => todo!(),
+            Descriptor::Pipe(pipe) => todo!(),
         };
 
         total_written += size;
@@ -297,6 +302,34 @@ pub fn sys_fstat(fd: i32) -> Result<FileStat, Errno> {
         Some(desc) => match desc {
             Descriptor::File(file) => FileStat::from(litebox_fs().fd_file_status(file)?),
             Descriptor::Socket(socket) => todo!(),
+            Descriptor::Pipe(super::pipe::Pipe::Reader { .. }) => FileStat {
+                // TODO: give correct values
+                st_dev: 0,
+                st_ino: 0,
+                st_nlink: 1,
+                st_mode: Mode::RUSR.bits() | InodeType::NamedPipe as u32,
+                st_uid: 0,
+                st_gid: 0,
+                st_rdev: 0,
+                st_size: 0,
+                st_blksize: 0,
+                st_blocks: 0,
+                ..Default::default()
+            },
+            Descriptor::Pipe(super::pipe::Pipe::Writer { .. }) => FileStat {
+                // TODO: give correct values
+                st_dev: 0,
+                st_ino: 0,
+                st_nlink: 1,
+                st_mode: Mode::WUSR.bits() | InodeType::NamedPipe as u32,
+                st_uid: 0,
+                st_gid: 0,
+                st_rdev: 0,
+                st_size: 0,
+                st_blksize: 0,
+                st_blocks: 0,
+                ..Default::default()
+            },
         },
         None => return Err(Errno::EBADF),
     };
@@ -379,4 +412,21 @@ pub fn sys_getcwd(buf: &mut [u8]) -> Result<usize, Errno> {
     let bytes = name.as_bytes_with_nul();
     buf[..bytes.len()].copy_from_slice(bytes);
     Ok(bytes.len())
+}
+
+pub fn sys_pipe2(flags: OFlags) -> Result<(u32, u32), Errno> {
+    if flags.contains((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement()) {
+        return Err(Errno::EINVAL);
+    }
+
+    let (reader, writer) = super::pipe::pipe(flags, litebox_platform_multiplex::platform());
+    let close_on_exec = flags.contains(OFlags::CLOEXEC);
+    let read_fd = file_descriptors()
+        .write()
+        .insert(Descriptor::Pipe(reader), flags, close_on_exec);
+    let write_fd =
+        file_descriptors()
+            .write()
+            .insert(Descriptor::Pipe(writer), flags, close_on_exec);
+    Ok((read_fd, write_fd))
 }
