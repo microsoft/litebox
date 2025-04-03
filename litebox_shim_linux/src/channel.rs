@@ -2,8 +2,12 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::sync::{Arc, Weak};
 use litebox::sync::Synchronization;
+use litebox_common_linux::errno::Errno;
 use litebox_platform_multiplex::Platform;
-use ringbuf::{HeapCons, HeapProd, HeapRb, traits::Split as _};
+use ringbuf::{
+    HeapCons, HeapProd, HeapRb,
+    traits::{Consumer as _, Producer as _, Split as _},
+};
 
 struct EndPointer<T> {
     rb: litebox::sync::Mutex<'static, Platform, T>,
@@ -60,6 +64,42 @@ impl<T> Producer<T> {
         }
     }
 
+    fn try_write(&self, buf: &[T]) -> Result<usize, Errno>
+    where
+        T: Copy,
+    {
+        if self.is_shutdown() || self.is_peer_shutdown() {
+            return Err(Errno::EPIPE);
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let write_len = self.endpoint.rb.lock().push_slice(buf);
+        if write_len > 0 {
+            Ok(write_len)
+        } else {
+            Err(Errno::EAGAIN)
+        }
+    }
+
+    pub(crate) fn write(&self, buf: &[T], is_nonblocking: bool) -> Result<usize, Errno>
+    where
+        T: Copy,
+    {
+        if is_nonblocking {
+            self.try_write(buf)
+        } else {
+            // TODO: use poll rather than busy wait
+            loop {
+                match self.try_write(buf) {
+                    Err(Errno::EAGAIN) => {}
+                    ret => return ret,
+                }
+            }
+        }
+    }
+
     common_functions_for_channel!();
 }
 
@@ -79,6 +119,47 @@ impl<T> Consumer<T> {
         Self {
             endpoint: Arc::new(EndPointer::new(rb, platform)),
             peer: Weak::new(),
+        }
+    }
+
+    fn try_read(&self, buf: &mut [T]) -> Result<usize, Errno>
+    where
+        T: Copy,
+    {
+        if self.is_shutdown() {
+            return Err(Errno::EPIPE);
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let read_len = self.endpoint.rb.lock().pop_slice(buf);
+
+        if self.is_peer_shutdown() {
+            return Ok(read_len);
+        }
+
+        if read_len > 0 {
+            Ok(read_len)
+        } else {
+            Err(Errno::EAGAIN)
+        }
+    }
+
+    pub(crate) fn read(&self, buf: &mut [T], is_nonblocking: bool) -> Result<usize, Errno>
+    where
+        T: Copy,
+    {
+        if is_nonblocking {
+            self.try_read(buf)
+        } else {
+            // TODO: use poll rather than busy wait
+            loop {
+                match self.try_read(buf) {
+                    Err(Errno::EAGAIN) => {}
+                    ret => return ret,
+                }
+            }
         }
     }
 

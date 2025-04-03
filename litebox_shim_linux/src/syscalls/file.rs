@@ -105,7 +105,10 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
         Some(desc) => match desc {
             Descriptor::File(file) => litebox_fs().read(file, buf, offset).map_err(Errno::from),
             Descriptor::Socket(socket) => todo!(),
-            Descriptor::Pipe(pipe) => todo!(),
+            Descriptor::Pipe(super::pipe::Pipe::Reader { consumer, flags }) => {
+                consumer.read(buf, flags.get().contains(OFlags::NONBLOCK))
+            }
+            Descriptor::Pipe(super::pipe::Pipe::Writer { .. }) => Err(Errno::EINVAL),
         },
         None => Err(Errno::EBADF),
     }
@@ -123,7 +126,10 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
         Some(desc) => match desc {
             Descriptor::File(file) => litebox_fs().write(file, buf, offset).map_err(Errno::from),
             Descriptor::Socket(socket) => todo!(),
-            Descriptor::Pipe(pipe) => todo!(),
+            Descriptor::Pipe(super::pipe::Pipe::Reader { .. }) => Err(Errno::EINVAL),
+            Descriptor::Pipe(super::pipe::Pipe::Writer { producer, flags }) => {
+                producer.write(buf, flags.get().contains(OFlags::NONBLOCK))
+            }
         },
         None => Err(Errno::EBADF),
     }
