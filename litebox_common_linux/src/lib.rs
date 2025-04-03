@@ -295,6 +295,17 @@ impl FcntlArg {
     }
 }
 
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy)]
+    pub struct EfdFlags: core::ffi::c_uint {
+        const SEMAPHORE = 1;
+        const CLOEXEC = litebox::fs::OFlags::CLOEXEC.bits();
+        const NONBLOCK = litebox::fs::OFlags::NONBLOCK.bits();
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
@@ -387,6 +398,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pathname: Platform::RawConstPointer<i8>,
         buf: Platform::RawMutPointer<FileStat>,
         flags: AtFlags,
+    },
+    Eventfd2 {
+        initval: u32,
+        flags: EfdFlags,
     },
     Pipe2 {
         pipefd: Platform::RawMutPointer<u32>,

@@ -168,6 +168,10 @@ enum Descriptor {
         producer: alloc::sync::Arc<crate::channel::Producer<u8>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
+    Eventfd {
+        file: alloc::sync::Arc<syscalls::eventfd::EventFile<'static, Platform>>,
+        close_on_exec: core::sync::atomic::AtomicBool,
+    },
 }
 
 pub(crate) fn file_descriptors<'a>() -> &'a RwLock<Platform, Descriptors> {
@@ -347,6 +351,9 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
                     .map(|()| 0)
             })
         }),
+        SyscallRequest::Eventfd2 { initval, flags } => {
+            syscalls::file::sys_eventfd2(initval, flags).map(|fd| fd as usize)
+        }
         SyscallRequest::Pipe2 { pipefd, flags } => {
             syscalls::file::sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
                 unsafe { pipefd.write_at_offset(0, read_fd).ok_or(Errno::EFAULT) }?;
