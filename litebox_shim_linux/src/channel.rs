@@ -1,4 +1,7 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::{
+    cell::RefCell,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use alloc::sync::{Arc, Weak};
 use litebox::sync::Synchronization;
@@ -42,8 +45,8 @@ macro_rules! common_functions_for_channel {
         }
 
         pub fn is_peer_shutdown(&self) -> bool {
-            if let Some(peer) = self.peer.upgrade() {
-                peer.is_shutdown()
+            if let Some(peer) = self.peer.borrow().upgrade() {
+                peer.endpoint.is_shutdown()
             } else {
                 true
             }
@@ -52,15 +55,15 @@ macro_rules! common_functions_for_channel {
 }
 
 pub(crate) struct Producer<T> {
-    endpoint: Arc<EndPointer<HeapProd<T>>>,
-    peer: Weak<EndPointer<HeapCons<T>>>,
+    endpoint: EndPointer<HeapProd<T>>,
+    peer: RefCell<Weak<Consumer<T>>>,
 }
 
 impl<T> Producer<T> {
     fn new(rb: HeapProd<T>, platform: &'static Platform) -> Self {
         Self {
-            endpoint: Arc::new(EndPointer::new(rb, platform)),
-            peer: Weak::new(),
+            endpoint: EndPointer::new(rb, platform),
+            peer: RefCell::new(Weak::new()),
         }
     }
 
@@ -110,15 +113,15 @@ impl<T> Drop for Producer<T> {
 }
 
 pub(crate) struct Consumer<T> {
-    endpoint: Arc<EndPointer<HeapCons<T>>>,
-    peer: Weak<EndPointer<HeapProd<T>>>,
+    endpoint: EndPointer<HeapCons<T>>,
+    peer: RefCell<Weak<Producer<T>>>,
 }
 
 impl<T> Consumer<T> {
     fn new(rb: HeapCons<T>, platform: &'static Platform) -> Self {
         Self {
-            endpoint: Arc::new(EndPointer::new(rb, platform)),
-            peer: Weak::new(),
+            endpoint: EndPointer::new(rb, platform),
+            peer: RefCell::new(Weak::new()),
         }
     }
 
@@ -173,8 +176,8 @@ impl<T> Drop for Consumer<T> {
 }
 
 pub(crate) struct Channel<T> {
-    prod: Producer<T>,
-    cons: Consumer<T>,
+    prod: Arc<Producer<T>>,
+    cons: Arc<Consumer<T>>,
 }
 
 impl<T> Channel<T> {
@@ -182,11 +185,11 @@ impl<T> Channel<T> {
         let rb: HeapRb<T> = HeapRb::new(capacity);
         let (rb_prod, rb_cons) = rb.split();
 
-        let mut producer = Producer::new(rb_prod, platform);
-        let mut consumer = Consumer::new(rb_cons, platform);
+        let producer = Arc::new(Producer::new(rb_prod, platform));
+        let consumer = Arc::new(Consumer::new(rb_cons, platform));
 
-        producer.peer = Arc::downgrade(&consumer.endpoint);
-        consumer.peer = Arc::downgrade(&producer.endpoint);
+        *producer.peer.borrow_mut() = (Arc::downgrade(&consumer));
+        *consumer.peer.borrow_mut() = (Arc::downgrade(&producer));
 
         Self {
             prod: producer,
@@ -195,7 +198,7 @@ impl<T> Channel<T> {
     }
 
     /// Turn the channel into a pair of producer and consumer.
-    pub(crate) fn split(self) -> (Producer<T>, Consumer<T>) {
+    pub(crate) fn split(self) -> (Arc<Producer<T>>, Arc<Consumer<T>>) {
         let Channel { prod, cons } = self;
         (prod, cons)
     }

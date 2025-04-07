@@ -1,8 +1,8 @@
 use litebox_platform_multiplex::Platform;
 
 pub(crate) enum Pipe {
-    Reader(crate::channel::Consumer<u8>),
-    Writer(crate::channel::Producer<u8>),
+    Reader(alloc::sync::Arc<crate::channel::Consumer<u8>>),
+    Writer(alloc::sync::Arc<crate::channel::Producer<u8>>),
 }
 
 const PIPE_BUF_SIZE: usize = 1024 * 1024;
