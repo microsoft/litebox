@@ -255,7 +255,7 @@ impl From<litebox::fs::FileStatus> for FileStat {
     }
 }
 
-/// Commands for use with [`fcntl`].
+/// Commands for use with `fcntl`.
 #[allow(non_camel_case_types)]
 #[derive(Debug)]
 #[non_exhaustive]
@@ -268,9 +268,9 @@ pub enum FcntlArg {
     F_GETFL,
 }
 
-pub const F_GETFD: i32 = 1;
-pub const F_SETFD: i32 = 2;
-pub const F_GETFL: i32 = 3;
+const F_GETFD: i32 = 1;
+const F_SETFD: i32 = 2;
+const F_GETFL: i32 = 3;
 
 bitflags::bitflags! {
     #[derive(Debug)]
@@ -286,6 +286,7 @@ impl FcntlArg {
     pub fn from(cmd: i32, arg: usize) -> Self {
         match cmd {
             F_GETFD => Self::F_GETFD,
+            #[allow(clippy::cast_possible_truncation)]
             F_SETFD => Self::F_SETFD(FileDescriptorFlags::from_bits_truncate(arg as u32)),
             F_GETFL => Self::F_GETFL,
             _ => unimplemented!(),

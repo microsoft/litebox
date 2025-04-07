@@ -7,8 +7,7 @@ use litebox::{
     platform::{RawConstPointer, RawMutPointer},
 };
 use litebox_common_linux::{
-    AtFlags, FcntlArg, FileDescriptorFlags, FileStat, InodeType, IoReadVec, IoWriteVec,
-    errno::Errno,
+    AtFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec, IoWriteVec, errno::Errno,
 };
 
 use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox_fs};
@@ -67,11 +66,9 @@ pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, 
     litebox_fs()
         .open(path, flags, mode)
         .map(|file| {
-            file_descriptors().write().insert(
-                Descriptor::File(file),
-                flags & OFlags::STATUS_FLAGS_MASK,
-                close_on_exec,
-            )
+            file_descriptors()
+                .write()
+                .insert(Descriptor::File(file), flags, close_on_exec)
         })
         .map_err(Errno::from)
 }
@@ -297,7 +294,7 @@ pub fn sys_fstat(fd: i32) -> Result<FileStat, Errno> {
         },
         None => return Err(Errno::EBADF),
     };
-    Ok(FileStat::from(stat))
+    Ok(stat)
 }
 
 /// Handle syscall `newfstatat`
@@ -352,7 +349,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
             );
             Ok(0)
         }
-        FcntlArg::F_GETFL => Ok(entry.status.get().bits()),
+        FcntlArg::F_GETFL => Ok(entry.status.load(core::sync::atomic::Ordering::Relaxed)),
         _ => unimplemented!(),
     }
 }

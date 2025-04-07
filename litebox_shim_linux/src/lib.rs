@@ -72,9 +72,12 @@ pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<'static, Platform, P
 type ConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
+/// A file table entry containing a file descriptor and its status
+///
+/// Note `close_on_exec` is per-entry while the `status` is per-file.
 struct DescriptorEntry {
     desc: Descriptor,
-    status: alloc::sync::Arc<core::cell::Cell<OFlags>>,
+    status: alloc::sync::Arc<core::sync::atomic::AtomicU32>,
     close_on_exec: core::sync::atomic::AtomicBool,
 }
 
@@ -89,7 +92,12 @@ impl Descriptors {
             descriptors: vec![],
         }
     }
-    fn insert(&mut self, descriptor: Descriptor, flags: OFlags, close_on_exec: bool) -> u32 {
+    fn insert(
+        &mut self,
+        descriptor: Descriptor,
+        flags: litebox::fs::OFlags,
+        close_on_exec: bool,
+    ) -> u32 {
         let idx = self
             .descriptors
             .iter()
@@ -100,7 +108,9 @@ impl Descriptors {
             });
         let old = self.descriptors[idx].replace(DescriptorEntry {
             desc: descriptor,
-            status: alloc::sync::Arc::new(core::cell::Cell::new(flags & OFlags::STATUS_FLAGS_MASK)),
+            status: alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(
+                (flags & litebox::fs::OFlags::STATUS_FLAGS_MASK).bits(),
+            )),
             close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
         });
         assert!(old.is_none());
