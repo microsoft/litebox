@@ -332,7 +332,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
     let locked_file_descriptors = file_descriptors().read();
     let entry = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
     match arg {
-        FcntlArg::F_GETFD => {
+        FcntlArg::GETFD => {
             if entry
                 .close_on_exec
                 .load(core::sync::atomic::Ordering::Relaxed)
@@ -342,14 +342,14 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                 Ok(0)
             }
         }
-        FcntlArg::F_SETFD(flags) => {
+        FcntlArg::SETFD(flags) => {
             entry.close_on_exec.store(
                 flags.contains(FileDescriptorFlags::FD_CLOEXEC),
                 core::sync::atomic::Ordering::Relaxed,
             );
             Ok(0)
         }
-        FcntlArg::F_GETFL => Ok(entry.status.load(core::sync::atomic::Ordering::Relaxed)),
+        FcntlArg::GETFL => Ok(entry.status.load(core::sync::atomic::Ordering::Relaxed)),
         _ => unimplemented!(),
     }
 }
