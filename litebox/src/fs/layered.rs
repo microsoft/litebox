@@ -551,7 +551,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     // fallthrough
                 }
             },
-        };
+        }
         self.ensure_lower_contains(&path)?;
         match self.migrate_file_up(&path) {
             Ok(()) => {}
@@ -659,7 +659,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     {
                         Ok(()) => {
                             // fallthrough to next increasing ancestor
-                            continue;
                         }
                         Err(e) => match e {
                             MkdirError::AlreadyExists => {
@@ -734,7 +733,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 mode,
                 size,
             });
-        };
+        }
         // The file is not open, we must look at the levels themselves.
         match self.upper.file_status(&*path) {
             Ok(FileStatus {
@@ -763,7 +762,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     // Handle-able by a lower level, fallthrough
                 }
             },
-        };
+        }
         let FileStatus {
             file_type,
             mode,

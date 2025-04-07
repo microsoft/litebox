@@ -295,7 +295,7 @@ impl<Platform: RawSyncPrimitivesProvider> LockTrackerX<'_, Platform> {
                     blank = "",
                     width = tracker.as_ref().unwrap().active(),
                 );
-            };
+            }
         } else if let Some(t) = contended {
             if CONFIG_PRINT_CONTENDED_LOCKS {
                 debug_log_println!(

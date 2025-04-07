@@ -191,7 +191,7 @@ impl TcpServerSpecific {
                     // Impossible, since listen endpoint port is non 0.
                     unreachable!()
                 }
-            };
+            }
             self.socket_set_handles
                 .push(socket_set.add(listening_socket));
         }
@@ -407,7 +407,7 @@ where
                     socket_state_changed = true;
                 }
             }
-        };
+        }
         if socket_state_changed {
             self.check_and_update_events();
             PlatformInteractionReinvocationAdvice::CallAgainImmediately
@@ -771,7 +771,7 @@ where
                 };
                 if server_socket.backlog.is_none() {
                     return Err(AcceptError::NotListening);
-                };
+                }
                 // (Purely an optimization) remove all handles that are closed, by only keeping ones
                 // that are not closed
                 server_socket.socket_set_handles.retain(|&h| {

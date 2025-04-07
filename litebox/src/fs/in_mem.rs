@@ -125,7 +125,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 let mut parent = parent.write();
                 if !self.current_user.can_write(&parent.perms) {
                     return Err(OpenError::NoWritePerms);
-                };
+                }
                 parent.children_count = parent.children_count.checked_add(1).unwrap();
                 let entry = Entry::File(Arc::new(self.sync.new_rwlock(FileX {
                     perms: Permissions {
@@ -321,7 +321,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         };
         if let Entry::Dir(_) = entry {
             return Err(UnlinkError::IsADirectory);
-        };
+        }
         let mut parent = parent.write();
         if !self.current_user.can_write(&parent.perms) {
             return Err(UnlinkError::NoWritePerms);
@@ -347,7 +347,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let mut parent = parent.write();
         if !self.current_user.can_write(&parent.perms) {
             return Err(MkdirError::NoWritePerms);
-        };
+        }
         parent.children_count = parent.children_count.checked_add(1).unwrap();
         let old = root.entries.insert(
             path,
