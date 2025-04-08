@@ -1,7 +1,4 @@
-use core::{
-    cell::RefCell,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::sync::{Arc, Weak};
 use litebox::sync::Synchronization;
@@ -11,6 +8,11 @@ use ringbuf::{
     HeapCons, HeapProd, HeapRb,
     traits::{Consumer as _, Producer as _, Split as _},
 };
+
+/// The maximum number of bytes for atomic write.
+///
+/// See <https://man7.org/linux/man-pages/man7/pipe.7.html> for more details.
+const PIPE_BUF: usize = 4096;
 
 struct EndPointer<T> {
     rb: litebox::sync::Mutex<'static, Platform, T>,
@@ -45,25 +47,43 @@ macro_rules! common_functions_for_channel {
         }
 
         pub fn is_peer_shutdown(&self) -> bool {
-            if let Some(peer) = self.peer.borrow().upgrade() {
+            if let Some(peer) = self.peer.get().unwrap().upgrade() {
                 peer.endpoint.is_shutdown()
             } else {
                 true
             }
+        }
+
+        pub fn poll(
+            &self,
+            mask: IoEvents,
+            observer: Option<Weak<dyn Observer<IoEvents>>>,
+        ) -> IoEvents {
+            self.endpoint
+                .pollee
+                .poll(mask, observer, || self.check_io_events())
+        }
+
+        pub(crate) fn register_observer(
+            &self,
+            observer: alloc::sync::Weak<dyn Observer<IoEvents>>,
+            filter: IoEvents,
+        ) {
+            self.endpoint.pollee.register_observer(observer, filter);
         }
     };
 }
 
 pub(crate) struct Producer<T> {
     endpoint: EndPointer<HeapProd<T>>,
-    peer: RefCell<Weak<Consumer<T>>>,
+    peer: spin::Once<Weak<Consumer<T>>>,
 }
 
 impl<T> Producer<T> {
     fn new(rb: HeapProd<T>, platform: &'static Platform) -> Self {
         Self {
             endpoint: EndPointer::new(rb, platform),
-            peer: RefCell::new(Weak::new()),
+            peer: spin::Once::new(),
         }
     }
 
@@ -114,14 +134,14 @@ impl<T> Drop for Producer<T> {
 
 pub(crate) struct Consumer<T> {
     endpoint: EndPointer<HeapCons<T>>,
-    peer: RefCell<Weak<Producer<T>>>,
+    peer: spin::Once<Weak<Producer<T>>>,
 }
 
 impl<T> Consumer<T> {
     fn new(rb: HeapCons<T>, platform: &'static Platform) -> Self {
         Self {
             endpoint: EndPointer::new(rb, platform),
-            peer: RefCell::new(Weak::new()),
+            peer: spin::Once::new(),
         }
     }
 
@@ -188,8 +208,8 @@ impl<T> Channel<T> {
         let producer = Arc::new(Producer::new(rb_prod, platform));
         let consumer = Arc::new(Consumer::new(rb_cons, platform));
 
-        *producer.peer.borrow_mut() = (Arc::downgrade(&consumer));
-        *consumer.peer.borrow_mut() = (Arc::downgrade(&producer));
+        producer.peer.call_once(|| Arc::downgrade(&consumer));
+        consumer.peer.call_once(|| Arc::downgrade(&producer));
 
         Self {
             prod: producer,
