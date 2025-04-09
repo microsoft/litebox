@@ -635,6 +635,7 @@ pub fn sys_eventfd2(initval: u32, flags: EfdFlags) -> Result<u32, Errno> {
 }
 
 const TCGETS: u32 = 0x5401;
+const TIOCGPTN: u32 = 0x80045430;
 #[allow(non_camel_case_types)]
 type cc_t = ::core::ffi::c_uchar;
 #[allow(non_camel_case_types)]
@@ -651,25 +652,27 @@ struct Termios {
 }
 
 fn stdio_ioctl(file: &litebox::fd::FileFd, request: u32, arg: MutPtr<u8>) -> Result<u32, Errno> {
-    if request == TCGETS {
-        let termios = unsafe { core::mem::transmute::<MutPtr<u8>, MutPtr<Termios>>(arg) };
-        unsafe {
-            termios.write_at_offset(
-                0,
-                Termios {
-                    c_iflag: 0,
-                    c_oflag: 0,
-                    c_cflag: 0,
-                    c_lflag: 0,
-                    c_line: 0,
-                    c_cc: [0; 19],
-                },
-            )
+    match request {
+        TCGETS => {
+            let termios = unsafe { core::mem::transmute::<MutPtr<u8>, MutPtr<Termios>>(arg) };
+            unsafe {
+                termios.write_at_offset(
+                    0,
+                    Termios {
+                        c_iflag: 0,
+                        c_oflag: 0,
+                        c_cflag: 0,
+                        c_lflag: 0,
+                        c_line: 0,
+                        c_cc: [0; 19],
+                    },
+                )
+            }
+            .ok_or(Errno::EFAULT)?;
+            Ok(0)
         }
-        .ok_or(Errno::EFAULT)?;
-        Ok(0)
-    } else {
-        todo!()
+        TIOCGPTN => Err(Errno::ENOTTY),
+        _ => todo!(),
     }
 }
 
