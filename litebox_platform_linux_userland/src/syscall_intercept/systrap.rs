@@ -184,6 +184,14 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
         libc::SYS_close => SyscallRequest::Close {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
         },
+        libc::SYS_stat => SyscallRequest::Stat {
+            pathname: TransparentConstPtr {
+                inner: syscall_args[0] as *const i8,
+            },
+            buf: TransparentMutPtr {
+                inner: syscall_args[1] as *mut litebox_common_linux::FileStat,
+            },
+        },
         libc::SYS_fstat => SyscallRequest::Fstat {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
             buf: TransparentMutPtr {

@@ -301,6 +301,12 @@ pub fn sys_readlinkat(
     Err(Errno::ENOSYS)
 }
 
+/// Handle syscall `stat`
+pub fn sys_stat(pathname: impl path::Arg) -> Result<FileStat, Errno> {
+    let status = litebox_fs().file_status(pathname)?;
+    Ok(FileStat::from(status))
+}
+
 /// Handle syscall `fstat`
 pub fn sys_fstat(fd: i32) -> Result<FileStat, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
