@@ -104,6 +104,10 @@ static SET_FS_BASE: spin::Once<fn(u64)> = spin::Once::new();
 /// Need to change it to per-thread.
 static FS_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// Certain syscalls with this magic argument are allowed.
+// This is useful for syscall interception where we need to invoke the original syscall.
+const SYSCALL_ARG_MAGIC: u64 = u64::from_le_bytes(*b"LITE BOX");
+
 /// Get fs register value via syscall `arch_prctl`.
 fn get_fs_base_arch_prctl() -> u64 {
     const ARCH_GET_FS: u64 = 0x1003;
@@ -309,6 +313,22 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             }
             SyscallRequest::Ret(i64::from(ret))
         }
+        libc::SYS_rt_sigprocmask => {
+            // never block SIGSYS
+            let mut set = unsafe { *(syscall_args[1] as *const libc::sigset_t) };
+            unsafe { libc::sigdelset(&raw mut set, libc::SIGSYS) };
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_rt_sigprocmask,
+                    syscall_args[0],
+                    &raw const set,
+                    syscall_args[2],
+                    syscall_args[3],
+                    SYSCALL_ARG_MAGIC,
+                )
+            };
+            SyscallRequest::Ret(ret)
+        }
         _ => todo!(),
     };
     let ret = SYSCALL_HANDLER.get().unwrap()(dispatcher);
@@ -359,6 +379,7 @@ fn register_sigsys_handler() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
 fn register_seccomp_filter() {
     use seccompiler::{
@@ -423,7 +444,32 @@ fn register_seccomp_filter() {
                 .unwrap(),
             ],
         ),
-        (libc::SYS_rt_sigprocmask, vec![]),
+        (
+            // allow rt_sigaction that does not block SIGSYS
+            libc::SYS_rt_sigprocmask,
+            vec![
+                SeccompRule::new(vec![
+                    // A backdoor to allow invoking rt_sigprocmask.
+                    // A malicious program can use this to block SIGSYS. However, it only
+                    // causes the program to crash when any syscall is invoked.
+                    SeccompCondition::new(
+                        4,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::Eq,
+                        SYSCALL_ARG_MAGIC,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+                SeccompRule::new(vec![
+                    // The second argument `set` is null, so it does not change the block set.
+                    // Unfortunately, seccomp does not allow to inspect memory so we cannot set
+                    // more precise condition.
+                    SeccompCondition::new(1, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0).unwrap(),
+                ])
+                .unwrap(),
+            ],
+        ),
         (libc::SYS_rt_sigreturn, vec![]),
         (libc::SYS_sched_yield, vec![]),
         (libc::SYS_getpid, vec![]),
