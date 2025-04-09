@@ -301,19 +301,9 @@ pub fn sys_readlinkat(
     Err(Errno::ENOSYS)
 }
 
-/// Handle syscall `stat`
-pub fn sys_stat(pathname: impl path::Arg) -> Result<FileStat, Errno> {
-    let status = litebox_fs().file_status(pathname)?;
-    Ok(FileStat::from(status))
-}
-
-/// Handle syscall `fstat`
-pub fn sys_fstat(fd: i32) -> Result<FileStat, Errno> {
-    let Ok(fd) = u32::try_from(fd) else {
-        return Err(Errno::EBADF);
-    };
-    let stat = match file_descriptors().read().get_fd(fd) {
-        Some(desc) => match desc {
+impl Descriptor {
+    fn stat(&self) -> Result<FileStat, Errno> {
+        let fstat = match self {
             Descriptor::File(file) => FileStat::from(litebox_fs().fd_file_status(file)?),
             Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { .. } => FileStat {
@@ -326,7 +316,7 @@ pub fn sys_fstat(fd: i32) -> Result<FileStat, Errno> {
                 st_gid: 0,
                 st_rdev: 0,
                 st_size: 0,
-                st_blksize: 0,
+                st_blksize: 4096,
                 st_blocks: 0,
                 ..Default::default()
             },
@@ -340,14 +330,31 @@ pub fn sys_fstat(fd: i32) -> Result<FileStat, Errno> {
                 st_gid: 0,
                 st_rdev: 0,
                 st_size: 0,
-                st_blksize: 0,
+                st_blksize: 4096,
                 st_blocks: 0,
                 ..Default::default()
             },
-        },
-        None => return Err(Errno::EBADF),
+        };
+        Ok(fstat)
+    }
+}
+
+/// Handle syscall `stat`
+pub fn sys_stat(pathname: impl path::Arg) -> Result<FileStat, Errno> {
+    let status = litebox_fs().file_status(pathname)?;
+    Ok(FileStat::from(status))
+}
+
+/// Handle syscall `fstat`
+pub fn sys_fstat(fd: i32) -> Result<FileStat, Errno> {
+    let Ok(fd) = u32::try_from(fd) else {
+        return Err(Errno::EBADF);
     };
-    Ok(stat)
+    file_descriptors()
+        .read()
+        .get_fd(fd)
+        .ok_or(Errno::EBADF)?
+        .stat()
 }
 
 /// Handle syscall `newfstatat`
@@ -362,19 +369,22 @@ pub fn sys_newfstatat(
     }
 
     let fs_path = FsPath::new(dirfd, pathname)?;
-    let status = match fs_path {
-        FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
-            litebox_fs().file_status(path)?
-        }
-        FsPath::Cwd => litebox_fs().file_status("")?,
+    match fs_path {
+        FsPath::Absolute { path } | FsPath::CwdRelative { path } => litebox_fs()
+            .file_status(path)
+            .map(FileStat::from)
+            .map_err(Errno::from),
+        FsPath::Cwd => litebox_fs()
+            .file_status("")
+            .map(FileStat::from)
+            .map_err(Errno::from),
         FsPath::Fd(fd) => file_descriptors()
             .read()
-            .get_file_fd(fd)
+            .get_fd(fd)
             .ok_or(Errno::EBADF)
-            .and_then(|file| Ok(litebox_fs().fd_file_status(file)?))?,
+            .and_then(Descriptor::stat),
         FsPath::FdRelative { fd, path } => todo!(),
-    };
-    Ok(FileStat::from(status))
+    }
 }
 
 pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
