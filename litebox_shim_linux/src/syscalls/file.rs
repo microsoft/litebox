@@ -635,6 +635,7 @@ pub fn sys_eventfd2(initval: u32, flags: EfdFlags) -> Result<u32, Errno> {
 }
 
 const TCGETS: u32 = 0x5401;
+const FIONBIO: u32 = 0x5421;
 const TIOCGPTN: u32 = 0x80045430;
 #[allow(non_camel_case_types)]
 type cc_t = ::core::ffi::c_uchar;
@@ -684,6 +685,25 @@ pub fn sys_ioctl(fd: i32, request: u32, arg: MutPtr<u8>) -> Result<u32, Errno> {
 
     let locked_file_descriptors = file_descriptors().read();
     let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
+    if request == FIONBIO {
+        let arg: MutPtr<i32> = unsafe { core::mem::transmute(arg) };
+        let val = unsafe { arg.read_at_offset(0) }
+            .ok_or(Errno::EFAULT)?
+            .into_owned();
+        match desc {
+            Descriptor::File(file) | Descriptor::Stdio(file) => todo!(),
+            Descriptor::Socket(socket) => todo!(),
+            Descriptor::PipeReader { consumer, .. } => {
+                consumer.set_status(OFlags::NONBLOCK, val != 0);
+            }
+            Descriptor::PipeWriter { producer, .. } => {
+                producer.set_status(OFlags::NONBLOCK, val != 0);
+            }
+            Descriptor::Eventfd { file, .. } => file.set_status(OFlags::NONBLOCK, val != 0),
+        }
+        return Ok(0);
+    }
+
     match desc {
         Descriptor::Stdio(file) => stdio_ioctl(file, request, arg),
         Descriptor::File(file) => todo!(),
