@@ -635,6 +635,7 @@ pub fn sys_eventfd2(initval: u32, flags: EfdFlags) -> Result<u32, Errno> {
 }
 
 const TCGETS: u32 = 0x5401;
+const TIOCGWINSZ: u32 = 0x5413;
 const FIONBIO: u32 = 0x5421;
 const TIOCGPTN: u32 = 0x80045430;
 #[allow(non_camel_case_types)]
@@ -650,6 +651,14 @@ struct Termios {
     c_lflag: tcflag_t,
     c_line: cc_t,
     c_cc: [cc_t; 19usize],
+}
+#[derive(Debug, Clone)]
+#[repr(C)]
+struct Winsize {
+    row: u16,
+    col: u16,
+    xpixel: u16,
+    ypixel: u16,
 }
 
 fn stdio_ioctl(file: &litebox::fd::FileFd, request: u32, arg: MutPtr<u8>) -> Result<u32, Errno> {
@@ -671,6 +680,22 @@ fn stdio_ioctl(file: &litebox::fd::FileFd, request: u32, arg: MutPtr<u8>) -> Res
             }
             .ok_or(Errno::EFAULT)?;
             Ok(0)
+        }
+        TIOCGWINSZ => {
+            let ws: MutPtr<Winsize> = unsafe { core::mem::transmute(arg) };
+            unsafe {
+                ws.write_at_offset(
+                    0,
+                    Winsize {
+                        row: 20,
+                        col: 20,
+                        xpixel: 0,
+                        ypixel: 0,
+                    },
+                )
+                .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
         }
         TIOCGPTN => Err(Errno::ENOTTY),
         _ => todo!(),
