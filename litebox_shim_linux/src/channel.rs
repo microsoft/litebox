@@ -1,7 +1,7 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use alloc::sync::{Arc, Weak};
-use litebox::sync::Synchronization;
+use litebox::{fs::OFlags, sync::Synchronization};
 use litebox_common_linux::errno::Errno;
 use litebox_platform_multiplex::Platform;
 use ringbuf::{
@@ -71,19 +71,37 @@ macro_rules! common_functions_for_channel {
         ) {
             self.endpoint.pollee.register_observer(observer, filter);
         }
+
+        pub(crate) fn get_status(&self) -> OFlags {
+            OFlags::from_bits(self.status.load(core::sync::atomic::Ordering::Relaxed)).unwrap()
+        }
+
+        pub(crate) fn set_status(&self, flag: OFlags, on: bool) {
+            if on {
+                self.status
+                    .fetch_or(flag.bits(), core::sync::atomic::Ordering::Relaxed);
+            } else {
+                self.status.fetch_and(
+                    flag.complement().bits(),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
     };
 }
 
 pub(crate) struct Producer<T> {
     endpoint: EndPointer<HeapProd<T>>,
     peer: spin::Once<Weak<Consumer<T>>>,
+    status: AtomicU32,
 }
 
 impl<T> Producer<T> {
-    fn new(rb: HeapProd<T>, platform: &'static Platform) -> Self {
+    fn new(rb: HeapProd<T>, flags: OFlags, platform: &'static Platform) -> Self {
         Self {
             endpoint: EndPointer::new(rb, platform),
             peer: spin::Once::new(),
+            status: AtomicU32::new((flags & OFlags::STATUS_FLAGS_MASK).bits()),
         }
     }
 
@@ -135,14 +153,28 @@ impl<T> Drop for Producer<T> {
 pub(crate) struct Consumer<T> {
     endpoint: EndPointer<HeapCons<T>>,
     peer: spin::Once<Weak<Producer<T>>>,
+    status: AtomicU32,
 }
 
 impl<T> Consumer<T> {
-    fn new(rb: HeapCons<T>, platform: &'static Platform) -> Self {
+    fn new(rb: HeapCons<T>, flags: OFlags, platform: &'static Platform) -> Self {
         Self {
             endpoint: EndPointer::new(rb, platform),
             peer: spin::Once::new(),
+            status: AtomicU32::new((flags & OFlags::STATUS_FLAGS_MASK).bits()),
         }
+    }
+
+    fn check_io_events(&self) -> IoEvents {
+        let rb = self.endpoint.rb.lock();
+        let mut events = IoEvents::empty();
+        if self.is_peer_shutdown() {
+            events |= IoEvents::HUP;
+        }
+        if !self.is_shutdown() && !rb.is_empty() {
+            events |= IoEvents::IN;
+        }
+        events
     }
 
     fn try_read(&self, buf: &mut [T]) -> Result<usize, Errno>
@@ -201,12 +233,12 @@ pub(crate) struct Channel<T> {
 }
 
 impl<T> Channel<T> {
-    pub(crate) fn new(capacity: usize, platform: &'static Platform) -> Self {
+    pub(crate) fn new(capacity: usize, flags: OFlags, platform: &'static Platform) -> Self {
         let rb: HeapRb<T> = HeapRb::new(capacity);
         let (rb_prod, rb_cons) = rb.split();
 
-        let producer = Arc::new(Producer::new(rb_prod, platform));
-        let consumer = Arc::new(Consumer::new(rb_cons, platform));
+        let producer = Arc::new(Producer::new(rb_prod, flags, platform));
+        let consumer = Arc::new(Consumer::new(rb_cons, flags, platform));
 
         producer.peer.call_once(|| Arc::downgrade(&consumer));
         consumer.peer.call_once(|| Arc::downgrade(&producer));
