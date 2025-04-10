@@ -68,7 +68,7 @@ pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, 
         .map(|file| {
             file_descriptors()
                 .write()
-                .insert(Descriptor::File(file), flags, close_on_exec)
+                .insert(Descriptor::File(file), flags.contains(OFlags::CLOEXEC))
         })
         .map_err(Errno::from)
 }
@@ -349,7 +349,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
             );
             Ok(0)
         }
-        FcntlArg::GETFL => Ok(entry.status.load(core::sync::atomic::Ordering::Relaxed)),
+        FcntlArg::GETFL => todo!(),
         _ => unimplemented!(),
     }
 }

@@ -77,7 +77,6 @@ type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPoin
 /// Note `close_on_exec` is per-entry while the `status` is per-file.
 struct DescriptorEntry {
     desc: Descriptor,
-    status: alloc::sync::Arc<core::sync::atomic::AtomicU32>,
     close_on_exec: core::sync::atomic::AtomicBool,
 }
 
@@ -92,12 +91,7 @@ impl Descriptors {
             descriptors: vec![],
         }
     }
-    fn insert(
-        &mut self,
-        descriptor: Descriptor,
-        flags: litebox::fs::OFlags,
-        close_on_exec: bool,
-    ) -> u32 {
+    fn insert(&mut self, descriptor: Descriptor, close_on_exec: bool) -> u32 {
         let idx = self
             .descriptors
             .iter()
@@ -108,9 +102,6 @@ impl Descriptors {
             });
         let old = self.descriptors[idx].replace(DescriptorEntry {
             desc: descriptor,
-            status: alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(
-                (flags & litebox::fs::OFlags::STATUS_FLAGS_MASK).bits(),
-            )),
             close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
         });
         assert!(old.is_none());
