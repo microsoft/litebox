@@ -598,6 +598,7 @@ impl litebox::platform::StdioProvider for LinuxUserland {
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::AtomicU32;
+    use std::thread::sleep;
 
     use litebox::platform::RawMutex;
 
@@ -612,6 +613,7 @@ mod tests {
 
         let copied_mutex = mutex.clone();
         std::thread::spawn(move || {
+            sleep(core::time::Duration::from_millis(500));
             copied_mutex.wake_many(1);
         });
 
