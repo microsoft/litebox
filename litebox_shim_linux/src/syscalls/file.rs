@@ -139,10 +139,8 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
                 producer.write(buf, producer.get_status().contains(OFlags::NONBLOCK))
             }
             Descriptor::Eventfd { file, .. } => {
-                if buf.len() < 8 {
-                    return Err(Errno::EINVAL);
-                }
-                let value: u64 = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                let value: u64 =
+                    u64::from_le_bytes(buf[..8].try_into().map_err(|_| Errno::EINVAL)?);
                 file.write(value, file.get_status().contains(OFlags::NONBLOCK))
             }
         },
@@ -574,7 +572,7 @@ pub fn sys_eventfd2(initval: u32, flags: EfdFlags) -> Result<u32, Errno> {
     }
 
     let eventfd = super::eventfd::EventFile::new(
-        initval as u64,
+        u64::from(initval),
         flags,
         litebox_platform_multiplex::platform(),
     );
