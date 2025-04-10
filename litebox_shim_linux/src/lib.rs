@@ -72,9 +72,7 @@ pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<'static, Platform, P
 type ConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
-/// A file table entry containing a file descriptor and its status
-///
-/// Note `close_on_exec` is per-entry while the `status` is per-file.
+/// A file table entry containing a file descriptor and the `close_on_exec` flag
 struct DescriptorEntry {
     desc: Descriptor,
     close_on_exec: core::sync::atomic::AtomicBool,
