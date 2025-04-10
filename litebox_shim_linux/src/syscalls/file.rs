@@ -635,6 +635,7 @@ pub fn sys_eventfd2(initval: u32, flags: EfdFlags) -> Result<u32, Errno> {
 }
 
 const TCGETS: u32 = 0x5401;
+const TCSETS: u32 = 0x5402;
 const TIOCGWINSZ: u32 = 0x5413;
 const FIONBIO: u32 = 0x5421;
 const TIOCGPTN: u32 = 0x80045430;
@@ -681,6 +682,7 @@ fn stdio_ioctl(file: &litebox::fd::FileFd, request: u32, arg: MutPtr<u8>) -> Res
             .ok_or(Errno::EFAULT)?;
             Ok(0)
         }
+        TCSETS => Ok(0),
         TIOCGWINSZ => {
             let ws: MutPtr<Winsize> = unsafe { core::mem::transmute(arg) };
             unsafe {
