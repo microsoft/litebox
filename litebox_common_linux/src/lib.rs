@@ -312,6 +312,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         fd: i32,
         buf: Platform::RawMutPointer<FileStat>,
     },
+    Lstat {
+        pathname: Platform::RawConstPointer<i8>,
+        buf: Platform::RawMutPointer<FileStat>,
+    },
     Mmap {
         addr: usize,
         length: usize,

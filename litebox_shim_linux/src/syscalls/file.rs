@@ -345,6 +345,16 @@ pub fn sys_stat(pathname: impl path::Arg) -> Result<FileStat, Errno> {
     Ok(FileStat::from(status))
 }
 
+/// Handle syscall `lstat`
+///
+/// lstat() is identical to stat(), except that if pathname is a symbolic link,
+/// then it returns information about the link itself, not the file that the link refers to.
+/// TODO: we do not support symbolic links yet.
+pub fn sys_lstat(pathname: impl path::Arg) -> Result<FileStat, Errno> {
+    let status = litebox_fs().file_status(pathname)?;
+    Ok(FileStat::from(status))
+}
+
 /// Handle syscall `fstat`
 pub fn sys_fstat(fd: i32) -> Result<FileStat, Errno> {
     let Ok(fd) = u32::try_from(fd) else {

@@ -326,6 +326,15 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
                 })
             })
         }
+        SyscallRequest::Lstat { pathname, buf } => {
+            pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                syscalls::file::sys_lstat(path).and_then(|stat| {
+                    unsafe { buf.write_at_offset(0, stat) }
+                        .ok_or(Errno::EFAULT)
+                        .map(|()| 0)
+                })
+            })
+        }
         SyscallRequest::Fstat { fd, buf } => syscalls::file::sys_fstat(fd).and_then(|stat| {
             unsafe { buf.write_at_offset(0, stat) }
                 .ok_or(Errno::EFAULT)
