@@ -247,13 +247,12 @@ impl litebox::platform::RawMutex for RawMutex {
             &self.num_to_wake_up,
             FutexOperation::Requeue,
             /* number to wake up */ 0,
-            /* number to requeue */ u32::MAX,
+            /* number to requeue */ i32::MAX as u32,
             Some(&temp_q),
             /* val3: ignored */ 0,
         ) {
-            0 => {
-                // Since we didn't ask for anyone to wake up, this should just move everyone over,
-                // and tell us no one was woken up.
+            0.. => {
+                // on success, return the number of tasks requeued or woken;
             }
             _ => unreachable!(),
         }
@@ -276,21 +275,22 @@ impl litebox::platform::RawMutex for RawMutex {
             &temp_q,
             FutexOperation::Requeue,
             /* number to wake up */ n,
-            /* number to requeue */ u32::MAX,
+            /* number to requeue */ i32::MAX as u32,
             Some(&self.num_to_wake_up),
             /* val3: ignored */ 0,
         );
 
         // Unlock the lock bits, allowing other wakers to run.
-        let final_num_to_wake_up = self.num_to_wake_up.swap(0, SeqCst);
-
-        // Confirm that no one has clobbered the lock bits (which would indicate an implementation
-        // failure somewhere).
-        assert_eq!(
-            final_num_to_wake_up >> 30,
-            0b11,
-            "lock bits should remain unclobbered"
-        );
+        let remain = (0b11 << 30) | (n - num_woken_up as u32);
+        while let Err(v) = self
+            .num_to_wake_up
+            .compare_exchange(remain, 0, SeqCst, SeqCst)
+        {
+            // Confirm that no one has clobbered the lock bits (which would indicate an implementation
+            // failure somewhere).
+            debug_assert_eq!(v >> 30, 0b11, "lock bits should remain unclobbered");
+            core::hint::spin_loop();
+        }
 
         // Return the number that were actually woken up
         num_woken_up.try_into().unwrap()
@@ -588,6 +588,32 @@ impl litebox::platform::StdioProvider for LinuxUserland {
             StdioStream::Stdin => std::io::stdin().is_terminal(),
             StdioStream::Stdout => std::io::stdout().is_terminal(),
             StdioStream::Stderr => std::io::stderr().is_terminal(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::AtomicU32;
+
+    use litebox::platform::RawMutex;
+
+    extern crate std;
+
+    #[test]
+    fn test_raw_mutex() {
+        let mutex = std::sync::Arc::new(super::RawMutex {
+            inner: AtomicU32::new(0),
+            num_to_wake_up: AtomicU32::new(0),
+        });
+
+        let copied_mutex = mutex.clone();
+        std::thread::spawn(move || {
+            copied_mutex.wake_many(1);
+        });
+
+        if let Err(_) = mutex.block(0) {
+            assert!(false);
         }
     }
 }
