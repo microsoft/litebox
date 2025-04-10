@@ -279,9 +279,12 @@ impl litebox::platform::RawMutex for RawMutex {
             Some(&self.num_to_wake_up),
             /* val3: ignored */ 0,
         );
+        if num_woken_up < 0 {
+            unreachable!()
+        }
 
         // Unlock the lock bits, allowing other wakers to run.
-        let remain = (0b11 << 30) | (n - num_woken_up as u32);
+        let remain = (0b11 << 30) | (n - u32::try_from(num_woken_up).unwrap());
         while let Err(v) = self
             .num_to_wake_up
             .compare_exchange(remain, 0, SeqCst, SeqCst)
@@ -612,8 +615,6 @@ mod tests {
             copied_mutex.wake_many(1);
         });
 
-        if let Err(_) = mutex.block(0) {
-            assert!(false);
-        }
+        assert!(mutex.block(0).is_ok());
     }
 }
