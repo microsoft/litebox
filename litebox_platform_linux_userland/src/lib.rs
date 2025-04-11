@@ -252,7 +252,7 @@ impl litebox::platform::RawMutex for RawMutex {
             /* val3: ignored */ 0,
         ) {
             0.. => {
-                // on success, return the number of tasks requeued or woken;
+                // On success, returns the number of tasks requeued or woken, which we ignore
             }
             _ => unreachable!(),
         }
@@ -271,7 +271,7 @@ impl litebox::platform::RawMutex for RawMutex {
 
         // Now we can actually wake them up; if anyone is left unwoken though, we should move them
         // back into the main queue.
-        let num_woken_up = futex_val2(
+        let num_woken_or_requeued = futex_val2(
             &temp_q,
             FutexOperation::Requeue,
             /* number to wake up */ n,
@@ -279,12 +279,13 @@ impl litebox::platform::RawMutex for RawMutex {
             Some(&self.num_to_wake_up),
             /* val3: ignored */ 0,
         );
-        if num_woken_up < 0 {
+        if num_woken_or_requeued < 0 {
             unreachable!()
         }
+        let num_woken_up = core::cmp::min(n, u32::try_from(num_woken_or_requeued).unwrap());
 
         // Unlock the lock bits, allowing other wakers to run.
-        let remain = (0b11 << 30) | (n - u32::try_from(num_woken_up).unwrap());
+        let remain = (0b11 << 30) | (n - num_woken_up);
         while let Err(v) = self
             .num_to_wake_up
             .compare_exchange(remain, 0, SeqCst, SeqCst)
@@ -614,7 +615,7 @@ mod tests {
         let copied_mutex = mutex.clone();
         std::thread::spawn(move || {
             sleep(core::time::Duration::from_millis(500));
-            copied_mutex.wake_many(1);
+            copied_mutex.wake_many(10);
         });
 
         assert!(mutex.block(0).is_ok());
