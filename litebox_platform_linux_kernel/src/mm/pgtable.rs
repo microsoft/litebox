@@ -31,11 +31,8 @@ impl<M: super::MemoryProvider> PageTableAllocator<M> {
         M::mem_allocate_pages(0).map(|addr| {
             if clear {
                 unsafe {
-                    core::intrinsics::write_bytes(
-                        addr,
-                        0,
-                        usize::try_from(Size4KiB::SIZE).unwrap(),
-                    );
+                    core::slice::from_raw_parts_mut(addr, usize::try_from(Size4KiB::SIZE).unwrap())
+                        .fill(0);
                 }
             }
             PhysFrame::from_start_address(M::make_pa_private(M::va_to_pa(VirtAddr::new(

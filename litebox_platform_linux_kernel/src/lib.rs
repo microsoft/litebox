@@ -240,10 +240,8 @@ impl<Host: HostInterface> RawMutex<Host> {
                     if self
                         .underlying_atomic()
                         .load(core::sync::atomic::Ordering::Relaxed)
-                        == val
+                        != val
                     {
-                        continue;
-                    } else {
                         return Ok(UnblockedOrTimedOut::Unblocked);
                     }
                 }

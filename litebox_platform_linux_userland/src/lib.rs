@@ -221,7 +221,6 @@ impl RawMutex {
                     // We have not yet been asked to wake up, this is spurious. Spin that
                     // loop again.
                     first_time = false;
-                    continue;
                 }
             }
         }
