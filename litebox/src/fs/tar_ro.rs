@@ -306,6 +306,42 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }),
         }
     }
+
+    fn with_metadata<T: core::any::Any, R>(
+        &self,
+        fd: &crate::fd::FileFd,
+        f: impl FnOnce(&T) -> R,
+    ) -> Result<R, super::errors::MetadataError> {
+        Err(super::errors::MetadataError::NoSuchMetadata)
+    }
+
+    fn with_metadata_mut<T: core::any::Any, R>(
+        &self,
+        fd: &crate::fd::FileFd,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> Result<R, super::errors::MetadataError> {
+        Err(super::errors::MetadataError::NoSuchMetadata)
+    }
+
+    fn set_file_metadata<T: core::any::Any>(
+        &self,
+        _fd: &crate::fd::FileFd,
+        metadata: T,
+    ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
+        Err(super::errors::SetMetadataError::ReadOnlyFileSystem(
+            metadata,
+        ))
+    }
+
+    fn set_fd_metadata<T: core::any::Any>(
+        &self,
+        fd: &crate::fd::FileFd,
+        metadata: T,
+    ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
+        Err(super::errors::SetMetadataError::ReadOnlyFileSystem(
+            metadata,
+        ))
+    }
 }
 
 const DEFAULT_DIR_MODE: Mode =
