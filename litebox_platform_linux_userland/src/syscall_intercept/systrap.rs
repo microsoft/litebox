@@ -104,8 +104,8 @@ static SET_FS_BASE: spin::Once<fn(u64)> = spin::Once::new();
 /// Need to change it to per-thread.
 static FS_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-// Certain syscalls with this magic argument are allowed.
-// This is useful for syscall interception where we need to invoke the original syscall.
+/// Certain syscalls with this magic argument are allowed.
+/// This is useful for syscall interception where we need to invoke the original syscall.
 const SYSCALL_ARG_MAGIC: u64 = u64::from_le_bytes(*b"LITE BOX");
 
 /// Get fs register value via syscall `arch_prctl`.
@@ -450,7 +450,7 @@ fn register_seccomp_filter() {
             ],
         ),
         (
-            // allow rt_sigaction that does not block SIGSYS
+            // allow rt_sigprocmask that does not block SIGSYS
             libc::SYS_rt_sigprocmask,
             vec![
                 SeccompRule::new(vec![
