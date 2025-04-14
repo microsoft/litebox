@@ -297,6 +297,7 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                             libc::sigaction {
                                 sa_sigaction: sigsys_handler as usize,
                                 sa_flags: libc::SA_SIGINFO,
+                                // SAFETY: Initialized by `libc::sigemptyset`
                                 sa_mask: sigset.assume_init(),
                                 sa_restorer: None,
                             },
@@ -331,7 +332,11 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
         }
         _ => todo!(),
     };
-    let ret = SYSCALL_HANDLER.get().unwrap()(dispatcher);
+    let ret = if let SyscallRequest::Ret(v) = dispatcher {
+        v
+    } else {
+        SYSCALL_HANDLER.get().unwrap()(dispatcher)
+    };
 
     SET_FS_BASE.get().unwrap()(old_fs_base);
     ret

@@ -336,5 +336,6 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         buf: Platform::RawMutPointer<FileStat>,
         flags: AtFlags,
     },
+    /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(i64),
 }
