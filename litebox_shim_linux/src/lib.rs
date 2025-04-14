@@ -72,14 +72,8 @@ pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<'static, Platform, P
 type ConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
-/// A file table entry containing a file descriptor and the `close_on_exec` flag
-struct DescriptorEntry {
-    desc: Descriptor,
-    close_on_exec: core::sync::atomic::AtomicBool,
-}
-
 struct Descriptors {
-    descriptors: Vec<Option<DescriptorEntry>>,
+    descriptors: Vec<Option<Descriptor>>,
 }
 
 impl Descriptors {
@@ -89,7 +83,7 @@ impl Descriptors {
             descriptors: vec![],
         }
     }
-    fn insert(&mut self, descriptor: Descriptor, close_on_exec: bool) -> u32 {
+    fn insert(&mut self, descriptor: Descriptor) -> u32 {
         let idx = self
             .descriptors
             .iter()
@@ -98,10 +92,7 @@ impl Descriptors {
                 self.descriptors.push(None);
                 self.descriptors.len() - 1
             });
-        let old = self.descriptors[idx].replace(DescriptorEntry {
-            desc: descriptor,
-            close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
-        });
+        let old = self.descriptors[idx].replace(descriptor);
         assert!(old.is_none());
         if idx >= (2 << 30) {
             panic!("Too many FDs");
@@ -109,59 +100,49 @@ impl Descriptors {
             u32::try_from(idx).unwrap()
         }
     }
-    fn remove(&mut self, fd: u32) -> Option<DescriptorEntry> {
+    fn remove(&mut self, fd: u32) -> Option<Descriptor> {
         let fd = fd as usize;
         self.descriptors.get_mut(fd)?.take()
     }
     fn remove_file(&mut self, fd: u32) -> Option<litebox::fd::FileFd> {
         let fd = fd as usize;
-        if let Some(DescriptorEntry {
-            desc: Descriptor::File(file),
-            ..
-        }) = self
+        if let Some(Descriptor::File(file_fd)) = self
             .descriptors
             .get_mut(fd)?
-            .take_if(|v| matches!(v.desc, Descriptor::File { .. }))
+            .take_if(|v| matches!(v, Descriptor::File(_)))
         {
-            Some(file)
+            Some(file_fd)
         } else {
             None
         }
     }
     fn remove_socket(&mut self, fd: u32) -> Option<litebox::fd::SocketFd> {
         let fd = fd as usize;
-        if let Some(DescriptorEntry {
-            desc: Descriptor::Socket(socket),
-            ..
-        }) = self
+        if let Some(Descriptor::Socket(socket_fd)) = self
             .descriptors
             .get_mut(fd)?
-            .take_if(|v| matches!(v.desc, Descriptor::Socket { .. }))
+            .take_if(|v| matches!(v, Descriptor::Socket(_)))
         {
-            Some(socket)
+            Some(socket_fd)
         } else {
             None
         }
     }
-    fn get_fd(&self, fd: u32) -> Option<&DescriptorEntry> {
+    fn get_fd(&self, fd: u32) -> Option<&Descriptor> {
         self.descriptors.get(fd as usize)?.as_ref()
     }
     fn get_file_fd(&self, fd: u32) -> Option<&litebox::fd::FileFd> {
-        match self.descriptors.get(fd as usize)?.as_ref()? {
-            DescriptorEntry {
-                desc: Descriptor::File(file),
-                ..
-            } => Some(file),
-            _ => None,
+        if let Descriptor::File(file_fd) = self.descriptors.get(fd as usize)?.as_ref()? {
+            Some(file_fd)
+        } else {
+            None
         }
     }
     fn get_socket_fd(&self, fd: u32) -> Option<&litebox::fd::SocketFd> {
-        match self.descriptors.get(fd as usize)?.as_ref()? {
-            DescriptorEntry {
-                desc: Descriptor::Socket(socket),
-                ..
-            } => Some(socket),
-            _ => None,
+        if let Descriptor::Socket(socket_fd) = self.descriptors.get(fd as usize)?.as_ref()? {
+            Some(socket_fd)
+        } else {
+            None
         }
     }
 }

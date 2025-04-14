@@ -272,7 +272,7 @@ const F_SETFD: i32 = 2;
 const F_GETFL: i32 = 3;
 
 bitflags::bitflags! {
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     pub struct FileDescriptorFlags: u32 {
         /// Close-on-exec flag
         const FD_CLOEXEC = 0x1;

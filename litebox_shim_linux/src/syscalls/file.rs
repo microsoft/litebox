@@ -66,9 +66,14 @@ pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, 
     litebox_fs()
         .open(path, flags, mode)
         .map(|file| {
-            file_descriptors()
-                .write()
-                .insert(Descriptor::File(file), flags.contains(OFlags::CLOEXEC))
+            if flags.contains(OFlags::CLOEXEC)
+                && litebox_fs()
+                    .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
+                    .is_err()
+            {
+                unreachable!()
+            }
+            file_descriptors().write().insert(Descriptor::File(file))
         })
         .map_err(Errno::from)
 }
@@ -98,7 +103,7 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
         return Err(Errno::EBADF);
     };
     match file_descriptors().read().get_fd(fd) {
-        Some(entry) => match &entry.desc {
+        Some(desc) => match desc {
             Descriptor::File(file) => litebox_fs().read(file, buf, offset).map_err(Errno::from),
             Descriptor::Socket(socket) => todo!(),
         },
@@ -115,7 +120,7 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
         return Err(Errno::EBADF);
     };
     match file_descriptors().read().get_fd(fd) {
-        Some(entry) => match &entry.desc {
+        Some(desc) => match desc {
             Descriptor::File(file) => litebox_fs().write(file, buf, offset).map_err(Errno::from),
             Descriptor::Socket(socket) => todo!(),
         },
@@ -145,10 +150,8 @@ pub fn sys_close(fd: i32) -> Result<(), Errno> {
         return Err(Errno::EBADF);
     };
     match file_descriptors().write().remove(fd) {
-        Some(entry) => match entry.desc {
-            Descriptor::File(file) => litebox_fs().close(file).map_err(Errno::from),
-            Descriptor::Socket(socket) => todo!(),
-        },
+        Some(Descriptor::File(file)) => litebox_fs().close(file).map_err(Errno::from),
+        Some(Descriptor::Socket(socket)) => todo!(),
         None => Err(Errno::EBADF),
     }
 }
@@ -165,7 +168,7 @@ pub fn sys_readv(
     let iovs: &[IoReadVec<MutPtr<u8>>] =
         unsafe { &iovec.to_cow_slice(iovcnt).ok_or(Errno::EFAULT)? };
     let locked_file_descriptors = file_descriptors().read();
-    let entry = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
+    let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
     let mut total_read = 0;
     for iov in iovs {
         if iov.iov_len == 0 {
@@ -181,7 +184,7 @@ pub fn sys_readv(
                 // TODO: The data transfers performed by readv() and writev() are atomic: the data
                 // written by writev() is written as a single block that is not intermingled with
                 // output from writes in other processes
-                match &entry.desc {
+                match desc {
                     Descriptor::File(file) => {
                         litebox_fs().read(file, user_buf, None).map_err(Errno::from)
                     }
@@ -211,7 +214,7 @@ pub fn sys_writev(
     let iovs: &[IoWriteVec<ConstPtr<u8>>] =
         unsafe { &iovec.to_cow_slice(iovcnt).ok_or(Errno::EFAULT)? };
     let locked_file_descriptors = file_descriptors().read();
-    let entry = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
+    let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
     let mut total_written = 0;
     for iov in iovs {
         if iov.iov_len == 0 {
@@ -221,7 +224,7 @@ pub fn sys_writev(
         // TODO: The data transfers performed by readv() and writev() are atomic: the data
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
-        let size = match &entry.desc {
+        let size = match desc {
             Descriptor::File(file) => litebox_fs()
                 .write(file, &slice, None)
                 .map_err(Errno::from)?,
@@ -288,7 +291,7 @@ pub fn sys_fstat(fd: i32) -> Result<FileStat, Errno> {
         return Err(Errno::EBADF);
     };
     let stat = match file_descriptors().read().get_fd(fd) {
-        Some(entry) => match &entry.desc {
+        Some(desc) => match desc {
             Descriptor::File(file) => FileStat::from(litebox_fs().fd_file_status(file)?),
             Descriptor::Socket(socket) => todo!(),
         },
@@ -330,23 +333,27 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
     };
 
     let locked_file_descriptors = file_descriptors().read();
-    let entry = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
+    let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
     match arg {
         FcntlArg::GETFD => {
-            if entry
-                .close_on_exec
-                .load(core::sync::atomic::Ordering::Relaxed)
-            {
-                Ok(FileDescriptorFlags::FD_CLOEXEC.bits())
-            } else {
-                Ok(0)
-            }
+            let flags: FileDescriptorFlags =
+                match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
+                    Descriptor::File(file) => litebox_fs()
+                        .with_metadata(file, |flags: &FileDescriptorFlags| *flags)
+                        .unwrap_or(FileDescriptorFlags::empty()),
+                    Descriptor::Socket(socket) => todo!(),
+                };
+            Ok(flags.bits())
         }
         FcntlArg::SETFD(flags) => {
-            entry.close_on_exec.store(
-                flags.contains(FileDescriptorFlags::FD_CLOEXEC),
-                core::sync::atomic::Ordering::Relaxed,
-            );
+            match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
+                Descriptor::File(file) => {
+                    if litebox_fs().set_fd_metadata(file, flags).is_err() {
+                        unreachable!()
+                    }
+                }
+                Descriptor::Socket(socket) => todo!(),
+            }
             Ok(0)
         }
         FcntlArg::GETFL => todo!(),
