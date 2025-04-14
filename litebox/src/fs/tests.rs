@@ -228,6 +228,7 @@ mod layered {
             &platform,
             in_mem::FileSystem::new(&platform),
             tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
         );
         let fd = fs
             .open("foo", OFlags::RDONLY, Mode::RWXU)
@@ -267,6 +268,7 @@ mod layered {
             &platform,
             in_mem::FileSystem::new(&platform),
             tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
         );
         assert!(matches!(
             fs.open("bar/ba", OFlags::RDONLY, Mode::empty()),
@@ -302,6 +304,7 @@ mod layered {
             &platform,
             in_mem_fs,
             tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
         );
         let fd1 = fs
             .open("foo", OFlags::RDONLY, Mode::RWXU)
@@ -352,6 +355,7 @@ mod layered {
             &platform,
             in_mem_fs,
             tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
         );
         let fd1 = fs
             .open("foo", OFlags::RDONLY, Mode::RWXU)
@@ -387,6 +391,7 @@ mod layered {
             &platform,
             in_mem::FileSystem::new(&platform),
             tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
         );
         let fd = fs
             .open("foo", OFlags::RDONLY, Mode::RWXU)

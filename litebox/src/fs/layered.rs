@@ -15,6 +15,22 @@ use super::errors::{
 };
 use super::{FileStatus, FileType, Mode, OFlags, SeekWhence};
 
+/// Possible semantics for layering file systems together
+#[non_exhaustive]
+pub enum LayeringSemantics {
+    /// Lower layer is read-only.
+    ///
+    /// Any writes to the lower layer have copy-on-write semantics, copying it over to the upper
+    /// layer, before performing the write.
+    LowerLayerReadOnly,
+    /// Lower layer's files are writable.
+    ///
+    /// No new files can be made at the lower layer, but any existing files in the lower layer can
+    /// still be written to. If an upper level file exists with the same name as a lower layer file,
+    /// then it is shadowed, and only the upper layer file would be visible.
+    LowerLayerWritableFiles,
+}
+
 /// A backing implementation of [`FileSystem`](super::FileSystem) that layers a file system on top
 /// of another.
 ///
@@ -22,10 +38,12 @@ use super::{FileStatus, FileType, Mode, OFlags, SeekWhence};
 /// each of the the layers. Specifically, this implementation will look for and work with files in
 /// the upper layer, unless they don't exist, in which case the lower layer is looked at.
 ///
-/// The current design of layering treats the lower layer as read-only, and thus if a file is opened
-/// in writable mode that doesn't exist in the upper layer, but _does_ exist in the lower layer,
-/// this will have copy-on-write semantics. Future versions of the layering might support other
-/// configurable options for the layering.
+/// The current design of layering supports treating the lower layer as read-only, or as a
+/// transparent write-through. In read-only lower layer, if a file is opened in writable mode that
+/// doesn't exist in the upper layer, but _does_ exist in the lower layer, this will have
+/// copy-on-write semantics.
+///
+/// Future versions of the layering might support other configurable options for the layering.
 pub struct FileSystem<
     'platform,
     Platform: sync::RawSyncPrimitivesProvider,
@@ -38,6 +56,7 @@ pub struct FileSystem<
     upper: Upper,
     lower: Lower,
     root: sync::RwLock<'platform, Platform, RootDir>,
+    layering_semantics: LayeringSemantics,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
     descriptors: sync::RwLock<'platform, Platform, Descriptors>,
@@ -52,7 +71,12 @@ impl<
 {
     /// Construct a new `FileSystem` instance
     #[must_use]
-    pub fn new(platform: &'platform Platform, upper: Upper, lower: Lower) -> Self {
+    pub fn new(
+        platform: &'platform Platform,
+        upper: Upper,
+        lower: Lower,
+        layering_semantics: LayeringSemantics,
+    ) -> Self {
         let sync = sync::Synchronization::new(platform);
         let root = sync.new_rwlock(RootDir::new());
         let descriptors = sync.new_rwlock(Descriptors::new());
@@ -63,6 +87,7 @@ impl<
             root,
             current_working_dir: "/".into(),
             descriptors,
+            layering_semantics,
         }
     }
 
@@ -82,7 +107,25 @@ impl<
     /// necessary.
     ///
     /// Note: this focuses only on files.
+    #[allow(clippy::too_many_lines)]
     fn migrate_file_up(&self, path: &str) -> Result<(), MigrationError> {
+        match self.layering_semantics {
+            LayeringSemantics::LowerLayerReadOnly => {
+                // fallthrough
+            }
+            LayeringSemantics::LowerLayerWritableFiles => {
+                // If this is ever hit, then that specific layered function calling this
+                // `migrate_file_up` function needs to be looked at to make sure that it is
+                // implemented correctly and update its semantics if necessary. The
+                // `migrate_file_up` functionality was implemented when there was only one set of
+                // semantics for layered file systems (namely `LowerLayerReadOnly`), thus the file
+                // system may not correctly account for other situations just yet (specifically,
+                // some situations might attempt to migrate files when they shouldn't). This
+                // particular panic is simply to catch such cases.
+                unreachable!()
+            }
+        }
+
         // We first open the file up at the lower level for reading
         let lower_fd = match self.lower.open(path, OFlags::RDONLY, Mode::empty()) {
             Ok(fd) => fd,
@@ -337,11 +380,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         let mut flags = flags;
         // Prevent creation of files at lower level
         flags.remove(OFlags::CREAT);
-        // Switch the lower level to read-only; the other calls will take care of
-        // copying into the upper level if/when necessary.
-        flags.remove(OFlags::RDWR);
-        flags.remove(OFlags::WRONLY);
-        flags.insert(OFlags::RDONLY);
+        match self.layering_semantics {
+            LayeringSemantics::LowerLayerReadOnly => {
+                // Switch the lower level to read-only; the other calls will take care of
+                // copying into the upper level if/when necessary.
+                flags.remove(OFlags::RDWR);
+                flags.remove(OFlags::WRONLY);
+                flags.insert(OFlags::RDONLY);
+            }
+            LayeringSemantics::LowerLayerWritableFiles => {
+                // Do nothing more to the flags, because we might be writing things to lower level.
+                // We just make sure that there is no creation happening, that's all :)
+                assert!(!flags.contains(OFlags::CREAT));
+            }
+        }
         // Any errors from lower level now _must_ propagate up, so we can just invoke
         // the lower level and set up the relevant descriptor upon success.
         let entry = Arc::new(EntryX::Lower {
@@ -497,7 +549,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 return Ok(num_bytes);
             }
             EntryX::Lower { fd } => {
-                // fallthrough
+                match self.layering_semantics {
+                    LayeringSemantics::LowerLayerReadOnly => {
+                        // fallthrough
+                    }
+                    LayeringSemantics::LowerLayerWritableFiles => {
+                        // Allow direct write to lower layer
+                        let num_bytes = self.lower.write(fd, buf, offset)?;
+                        descriptor.position.fetch_add(num_bytes, SeqCst);
+                        return Ok(num_bytes);
+                    }
+                }
             }
             EntryX::Tombstone => unreachable!(),
         }
