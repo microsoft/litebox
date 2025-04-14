@@ -10,10 +10,11 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, CloseError, FileStatusError, MkdirError, OpenError, PathError, ReadError,
-    RmdirError, SeekError, UnlinkError, WriteError,
+    ChmodError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError, PathError,
+    ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError, WriteError,
 };
 use super::{FileStatus, Mode, SeekWhence};
+use crate::utilities::anymap::AnyMap;
 
 /// A backing implementation for [`FileSystem`](super::FileSystem) storing all files in-memory.
 ///
@@ -133,6 +134,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                         userinfo: self.current_user,
                     },
                     data: Vec::new(),
+                    metadata: AnyMap::new(),
                 })));
                 let old = root.entries.insert(path, entry.clone());
                 assert!(old.is_none());
@@ -168,11 +170,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 read_allowed,
                 write_allowed,
                 position: 0,
+                metadata: AnyMap::new(),
             })),
-            Entry::Dir(dir) => Ok(self
-                .descriptors
-                .write()
-                .insert(Descriptor::Dir { dir: dir.clone() })),
+            Entry::Dir(dir) => Ok(self.descriptors.write().insert(Descriptor::Dir {
+                dir: dir.clone(),
+                metadata: AnyMap::new(),
+            })),
         }
     }
 
@@ -193,6 +196,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             read_allowed,
             write_allowed: _,
             position,
+            metadata: _,
         } = descriptors.get_mut(fd)
         else {
             return Err(ReadError::NotAFile);
@@ -226,6 +230,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             read_allowed: _,
             write_allowed,
             position,
+            metadata: _,
         } = descriptors.get_mut(fd)
         else {
             return Err(WriteError::NotAFile);
@@ -260,6 +265,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             read_allowed: _,
             write_allowed,
             position,
+            metadata: _,
         } = descriptors.get_mut(fd)
         else {
             return Err(SeekError::NotAFile);
@@ -357,6 +363,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     userinfo: self.current_user,
                 },
                 children_count: 0,
+                metadata: AnyMap::new(),
             }))),
         );
         assert!(old.is_none());
@@ -430,7 +437,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     file.data.len(),
                 )
             }
-            Descriptor::Dir { dir } => (
+            Descriptor::Dir { dir, .. } => (
                 super::FileType::Directory,
                 dir.read().perms.clone(),
                 super::DEFAULT_DIRECTORY_SIZE,
@@ -441,6 +448,83 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             mode: perms.mode,
             size,
         })
+    }
+
+    fn with_metadata<T: core::any::Any, R>(
+        &self,
+        fd: &crate::fd::FileFd,
+        f: impl FnOnce(&T) -> R,
+    ) -> Result<R, MetadataError> {
+        match self.descriptors.read().get(fd) {
+            Descriptor::File { file, metadata, .. } => match metadata.get::<T>() {
+                Some(m) => Ok(f(m)),
+                None => file
+                    .read()
+                    .metadata
+                    .get::<T>()
+                    .map(f)
+                    .ok_or(MetadataError::NoSuchMetadata),
+            },
+            Descriptor::Dir { dir, metadata } => match metadata.get::<T>() {
+                Some(m) => Ok(f(m)),
+                None => dir
+                    .read()
+                    .metadata
+                    .get::<T>()
+                    .map(f)
+                    .ok_or(MetadataError::NoSuchMetadata),
+            },
+        }
+    }
+
+    fn with_metadata_mut<T: core::any::Any, R>(
+        &self,
+        fd: &crate::fd::FileFd,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> Result<R, MetadataError> {
+        match self.descriptors.write().get_mut(fd) {
+            Descriptor::File { file, metadata, .. } => match metadata.get_mut::<T>() {
+                Some(m) => Ok(f(m)),
+                None => file
+                    .write()
+                    .metadata
+                    .get_mut::<T>()
+                    .map(f)
+                    .ok_or(MetadataError::NoSuchMetadata),
+            },
+            Descriptor::Dir { dir, metadata } => match metadata.get_mut::<T>() {
+                Some(m) => Ok(f(m)),
+                None => dir
+                    .write()
+                    .metadata
+                    .get_mut::<T>()
+                    .map(f)
+                    .ok_or(MetadataError::NoSuchMetadata),
+            },
+        }
+    }
+
+    fn set_file_metadata<T: core::any::Any>(
+        &self,
+        fd: &FileFd,
+        m: T,
+    ) -> Result<Option<T>, SetMetadataError<T>> {
+        match self.descriptors.read().get(fd) {
+            Descriptor::File { file, .. } => Ok(file.write().metadata.insert(m)),
+            Descriptor::Dir { dir, .. } => Ok(dir.write().metadata.insert(m)),
+        }
+    }
+
+    fn set_fd_metadata<T: core::any::Any>(
+        &self,
+        fd: &FileFd,
+        m: T,
+    ) -> Result<Option<T>, SetMetadataError<T>> {
+        match self.descriptors.write().get_mut(fd) {
+            Descriptor::File { metadata, .. } | Descriptor::Dir { metadata, .. } => {
+                Ok(metadata.insert(m))
+            }
+        }
     }
 }
 
@@ -466,6 +550,7 @@ impl<'platform, Platform: sync::RawSyncPrimitivesProvider> RootDir<'platform, Pl
                         userinfo: UserInfo { user: 0, group: 0 },
                     },
                     children_count: 0,
+                    metadata: AnyMap::new(),
                 }))),
             )]
             .into_iter()
@@ -543,6 +628,7 @@ type Dir<'platform, Platform> = Arc<sync::RwLock<'platform, Platform, DirX>>;
 struct DirX {
     perms: Permissions,
     children_count: u32,
+    metadata: AnyMap,
 }
 
 type File<'platform, Platform> = Arc<sync::RwLock<'platform, Platform, FileX>>;
@@ -550,6 +636,7 @@ type File<'platform, Platform> = Arc<sync::RwLock<'platform, Platform, FileX>>;
 struct FileX {
     perms: Permissions,
     data: Vec<u8>,
+    metadata: AnyMap,
 }
 
 #[derive(Clone, Debug)]
@@ -614,8 +701,10 @@ enum Descriptor<'platform, Platform: sync::RawSyncPrimitivesProvider> {
         read_allowed: bool,
         write_allowed: bool,
         position: usize,
+        metadata: AnyMap,
     },
     Dir {
         dir: Dir<'platform, Platform>,
+        metadata: AnyMap,
     },
 }

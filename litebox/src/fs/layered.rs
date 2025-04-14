@@ -795,6 +795,62 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             size,
         })
     }
+
+    fn with_metadata<T: core::any::Any, R>(
+        &self,
+        fd: &FileFd,
+        f: impl FnOnce(&T) -> R,
+    ) -> Result<R, super::errors::MetadataError> {
+        let descriptors = self.descriptors.read();
+        let descriptor = descriptors.get(fd);
+        match descriptor.entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.with_metadata(fd, f),
+            EntryX::Lower { fd } => self.lower.with_metadata(fd, f),
+            EntryX::Tombstone => unreachable!(),
+        }
+    }
+
+    fn with_metadata_mut<T: core::any::Any, R>(
+        &self,
+        fd: &FileFd,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> Result<R, super::errors::MetadataError> {
+        let descriptors = self.descriptors.read();
+        let descriptor = descriptors.get(fd);
+        match descriptor.entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.with_metadata_mut(fd, f),
+            EntryX::Lower { fd } => self.lower.with_metadata_mut(fd, f),
+            EntryX::Tombstone => unreachable!(),
+        }
+    }
+
+    fn set_file_metadata<T: core::any::Any>(
+        &self,
+        fd: &FileFd,
+        metadata: T,
+    ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
+        let descriptors = self.descriptors.read();
+        let descriptor = descriptors.get(fd);
+        match descriptor.entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.set_file_metadata(fd, metadata),
+            EntryX::Lower { fd } => unimplemented!(),
+            EntryX::Tombstone => unreachable!(),
+        }
+    }
+
+    fn set_fd_metadata<T: core::any::Any>(
+        &self,
+        fd: &FileFd,
+        metadata: T,
+    ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
+        let descriptors = self.descriptors.read();
+        let descriptor = descriptors.get(fd);
+        match descriptor.entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.set_fd_metadata(fd, metadata),
+            EntryX::Lower { fd } => unimplemented!(),
+            EntryX::Tombstone => unreachable!(),
+        }
+    }
 }
 
 type Descriptors = super::shared::Descriptors<Descriptor>;

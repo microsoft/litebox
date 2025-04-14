@@ -101,4 +101,36 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<'_, Platform
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         todo!()
     }
+
+    fn with_metadata<T: core::any::Any, R>(
+        &self,
+        fd: &crate::fd::FileFd,
+        f: impl FnOnce(&T) -> R,
+    ) -> Result<R, super::errors::MetadataError> {
+        todo!()
+    }
+
+    fn with_metadata_mut<T: core::any::Any, R>(
+        &self,
+        fd: &crate::fd::FileFd,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> Result<R, super::errors::MetadataError> {
+        todo!()
+    }
+
+    fn set_file_metadata<T: core::any::Any>(
+        &self,
+        fd: &crate::fd::FileFd,
+        metadata: T,
+    ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
+        todo!()
+    }
+
+    fn set_fd_metadata<T: core::any::Any>(
+        &self,
+        fd: &crate::fd::FileFd,
+        metadata: T,
+    ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
+        todo!()
+    }
 }

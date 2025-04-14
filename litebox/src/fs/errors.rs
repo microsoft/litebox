@@ -128,6 +128,23 @@ pub enum FileStatusError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`FileSystem::with_metadata`] and [`FileSystem::with_metadata_mut`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum MetadataError {
+    #[error("no such metadata available")]
+    NoSuchMetadata,
+}
+
+/// Possible errors from  [`FileSystem::set_file_metadata`] and [`FileSystem::set_fd_metadata`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum SetMetadataError<T> {
+    #[error("the file resides on a read-only filesystem")]
+    // Note: we return the T just so we are not dropping data
+    ReadOnlyFileSystem(T),
+}
+
 /// Possible errors in any file-system function due to path errors.
 #[derive(Error, Debug)]
 pub enum PathError {
