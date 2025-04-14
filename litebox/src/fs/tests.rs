@@ -490,3 +490,68 @@ mod stdio {
         ));
     }
 }
+
+mod layered_stdio {
+    use crate::fs::layered::LayeringSemantics;
+    use crate::fs::{FileSystem as _, Mode, OFlags};
+    use crate::fs::{devices, in_mem, layered};
+    use crate::platform::mock::MockPlatform;
+    use alloc::vec;
+    extern crate std;
+
+    #[test]
+    fn layered_stdio_open_read_write() {
+        let platform = MockPlatform::new();
+        let layered_fs = layered::FileSystem::new(
+            &platform,
+            in_mem::FileSystem::new(&platform),
+            devices::stdio::FileSystem::new(&platform),
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        // Test opening and writing to /dev/stdout
+        let fd_stdout = layered_fs
+            .open("/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .expect("Failed to open /dev/stdout");
+        let data = b"Hello, layered stdout!";
+        layered_fs
+            .write(&fd_stdout, data, None)
+            .expect("Failed to write to /dev/stdout");
+        layered_fs
+            .close(fd_stdout)
+            .expect("Failed to close /dev/stdout");
+        assert_eq!(platform.stdout_queue.borrow().len(), 1);
+        assert_eq!(platform.stdout_queue.borrow()[0], data);
+
+        // Test opening and writing to /dev/stderr
+        let fd_stderr = layered_fs
+            .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .expect("Failed to open /dev/stderr");
+        let data = b"Hello, layered stderr!";
+        layered_fs
+            .write(&fd_stderr, data, None)
+            .expect("Failed to write to /dev/stderr");
+        layered_fs
+            .close(fd_stderr)
+            .expect("Failed to close /dev/stderr");
+        assert_eq!(platform.stderr_queue.borrow().len(), 1);
+        assert_eq!(platform.stderr_queue.borrow()[0], data);
+
+        // Test opening and reading from /dev/stdin
+        platform
+            .stdin_queue
+            .borrow_mut()
+            .push_back(b"Hello, layered stdin!".to_vec());
+        let fd_stdin = layered_fs
+            .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open /dev/stdin");
+        let mut buffer = vec![0; 1024];
+        let bytes_read = layered_fs
+            .read(&fd_stdin, &mut buffer, None)
+            .expect("Failed to read from /dev/stdin");
+        assert_eq!(&buffer[..bytes_read], b"Hello, layered stdin!");
+        layered_fs
+            .close(fd_stdin)
+            .expect("Failed to close /dev/stdin");
+    }
+}
