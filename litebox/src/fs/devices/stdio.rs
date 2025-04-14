@@ -5,7 +5,7 @@ use alloc::string::String;
 use crate::{
     fd::{FileFd, OwnedFd},
     fs::{
-        Mode, OFlags, SeekWhence,
+        FileStatus, FileType, Mode, OFlags, SeekWhence,
         errors::{
             ChmodError, CloseError, FileStatusError, MkdirError, OpenError, PathError, ReadError,
             RmdirError, SeekError, UnlinkError, WriteError,
@@ -147,11 +147,20 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem
         todo!()
     }
 
-    fn file_status(&self, path: impl Arg) -> Result<crate::fs::FileStatus, FileStatusError> {
-        todo!()
+    fn file_status(&self, path: impl Arg) -> Result<FileStatus, FileStatusError> {
+        let path = self.absolute_path(path)?;
+        if matches!(path.as_str(), "/dev/stdin" | "/dev/stdout" | "/dev/stderr") {
+            Ok(FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                size: 0,
+            })
+        } else {
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
+        }
     }
 
-    fn fd_file_status(&self, fd: &FileFd) -> Result<crate::fs::FileStatus, FileStatusError> {
+    fn fd_file_status(&self, fd: &FileFd) -> Result<FileStatus, FileStatusError> {
         todo!()
     }
 

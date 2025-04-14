@@ -554,4 +554,37 @@ mod layered_stdio {
             .close(fd_stdin)
             .expect("Failed to close /dev/stdin");
     }
+
+    #[test]
+    fn layered_write_to_non_dev() {
+        let platform = MockPlatform::new();
+        let in_mem = {
+            let mut in_mem = in_mem::FileSystem::new(&platform);
+            in_mem.with_root_privileges(|fs| {
+                fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO).unwrap();
+            });
+            in_mem
+        };
+        let fs = layered::FileSystem::new(
+            &platform,
+            in_mem,
+            devices::stdio::FileSystem::new(&platform),
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        // Test file creation
+        let path = "/testfile";
+        let fd = fs
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+
+        fs.close(fd).expect("Failed to close file");
+
+        // Test file deletion
+        fs.unlink(path).expect("Failed to unlink file");
+        assert!(
+            fs.open(path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            "File should not exist"
+        );
+    }
 }

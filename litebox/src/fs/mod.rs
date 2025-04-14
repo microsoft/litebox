@@ -7,11 +7,11 @@ use bitflags::bitflags;
 
 use core::ffi::c_uint;
 
+pub mod devices;
 pub mod errors;
 pub mod in_mem;
 pub mod layered;
 pub mod nine_p;
-pub mod devices;
 pub(crate) mod shared;
 pub mod tar_ro;
 
@@ -163,6 +163,7 @@ bitflags! {
 pub enum FileType {
     RegularFile,
     Directory,
+    CharacterDevice,
 }
 
 bitflags! {

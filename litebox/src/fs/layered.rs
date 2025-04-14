@@ -663,6 +663,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         FileType::Directory => {
                             return Err(UnlinkError::IsADirectory);
                         }
+                        FileType::CharacterDevice => unimplemented!(),
                     }
                 }
             },
@@ -743,7 +744,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         },
                     }
                 }
-                Ok(FileType::RegularFile) | Err(PathError::MissingComponent) => unreachable!(),
+                Ok(FileType::RegularFile | FileType::CharacterDevice)
+                | Err(PathError::MissingComponent) => unreachable!(),
                 Err(PathError::ComponentNotADirectory) => unimplemented!(),
                 Err(PathError::InvalidPathname) => unreachable!("we just confirmed valid path"),
                 Err(e @ PathError::NoSearchPerms { .. }) => {
