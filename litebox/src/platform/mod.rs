@@ -434,3 +434,51 @@ where
         f: impl FnOnce(&mut [T]) -> R,
     ) -> Option<R>;
 }
+
+/// A non-exhaustive list of errors that can be thrown by [`StdioProvider::read_from_stdin`].
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum StdioReadError {
+    #[error("input stream has been closed")]
+    Closed,
+}
+
+/// A non-exhaustive list of errors that can be thrown by [`StdioProvider::write_to`].
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum StdioWriteError {
+    #[error("output stream has been closed")]
+    Closed,
+}
+
+/// Possible standard output/error streams
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StdioOutStream {
+    /// Standard output
+    Stdout,
+    /// Standard error
+    Stderr,
+}
+
+/// Possible standard input/output streams
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StdioStream {
+    /// Standard input
+    Stdin,
+    /// Standard output
+    Stdout,
+    /// Standard error
+    Stderr,
+}
+
+/// A provider of standard input/output functionality.
+pub trait StdioProvider {
+    /// Read from standard input. Returns number of bytes read.
+    fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, StdioReadError>;
+
+    /// Write to stdout/stderr. Returns number of bytes written.
+    fn write_to(&self, stream: StdioOutStream, buf: &[u8]) -> Result<usize, StdioWriteError>;
+
+    /// Check if a stream is connected to a TTY.
+    fn is_a_tty(&self, stream: StdioStream) -> bool;
+}
