@@ -419,3 +419,69 @@ mod layered {
         ));
     }
 }
+
+mod stdio {
+    use crate::fs::{FileSystem as _, Mode, OFlags};
+    use crate::platform::mock::MockPlatform;
+    use alloc::vec;
+    extern crate std;
+
+    #[test]
+    fn stdio_open_read_write() {
+        let platform = MockPlatform::new();
+        let fs = crate::fs::devices::stdio::FileSystem::new(&platform);
+
+        // Test opening and writing to /dev/stdout
+        let fd_stdout = fs
+            .open("/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .expect("Failed to open /dev/stdout");
+        let data = b"Hello, stdout!";
+        fs.write(&fd_stdout, data, None)
+            .expect("Failed to write to /dev/stdout");
+        fs.close(fd_stdout).expect("Failed to close /dev/stdout");
+        assert_eq!(platform.stdout_queue.borrow().len(), 1);
+        assert_eq!(platform.stdout_queue.borrow()[0], data);
+
+        // Test opening and writing to /dev/stderr
+        let fd_stderr = fs
+            .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .expect("Failed to open /dev/stderr");
+        let data = b"Hello, stderr!";
+        fs.write(&fd_stderr, data, None)
+            .expect("Failed to write to /dev/stderr");
+        fs.close(fd_stderr).expect("Failed to close /dev/stderr");
+        assert_eq!(platform.stderr_queue.borrow().len(), 1);
+        assert_eq!(platform.stderr_queue.borrow()[0], data);
+
+        // Test opening and reading from /dev/stdin
+        platform
+            .stdin_queue
+            .borrow_mut()
+            .push_back(b"Hello, stdin!".to_vec());
+        let fd_stdin = fs
+            .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open /dev/stdin");
+        let mut buffer = vec![0; 13];
+        let bytes_read = fs
+            .read(&fd_stdin, &mut buffer, None)
+            .expect("Failed to read from /dev/stdin");
+        assert_eq!(bytes_read, 13);
+        assert_eq!(&buffer, b"Hello, stdin!");
+        fs.close(fd_stdin).expect("Failed to close /dev/stdin");
+    }
+
+    #[test]
+    fn non_dev_path_fails() {
+        let platform = MockPlatform::new();
+        let fs = crate::fs::devices::stdio::FileSystem::new(&platform);
+
+        // Attempt to open a non-/dev/* path
+        let result = fs.open("foo", OFlags::RDONLY, Mode::empty());
+        assert!(matches!(
+            result,
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::NoSuchFileOrDirectory
+            ))
+        ));
+    }
+}
