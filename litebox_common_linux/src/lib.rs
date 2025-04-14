@@ -336,4 +336,5 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         buf: Platform::RawMutPointer<FileStat>,
         flags: AtFlags,
     },
+    Ret(i64),
 }
