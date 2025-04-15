@@ -152,7 +152,7 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem
         if matches!(path.as_str(), "/dev/stdin" | "/dev/stdout" | "/dev/stderr") {
             Ok(FileStatus {
                 file_type: FileType::CharacterDevice,
-                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
                 size: 0,
             })
         } else {
