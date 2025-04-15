@@ -29,13 +29,19 @@ use litebox_platform_multiplex::Platform;
 pub mod loader;
 pub mod syscalls;
 
-static FS: OnceBox<
+type LinuxFS = litebox::fs::layered::FileSystem<
+    'static,
+    Platform,
+    litebox::fs::in_mem::FileSystem<'static, Platform>,
     litebox::fs::layered::FileSystem<
+        'static,
         Platform,
-        litebox::fs::in_mem::FileSystem<Platform>,
-        litebox::fs::tar_ro::FileSystem<Platform>,
+        litebox::fs::devices::stdio::FileSystem<'static, Platform>,
+        litebox::fs::tar_ro::FileSystem<'static, Platform>,
     >,
-> = OnceBox::new();
+>;
+
+static FS: OnceBox<LinuxFS> = OnceBox::new();
 /// Set the global file system
 ///
 /// NOTE: This function signature might change as better parametricity is added to file systems.
@@ -44,14 +50,7 @@ static FS: OnceBox<
 /// # Panics
 ///
 /// Panics if this is called more than once or [`litebox_fs`] is called before this
-pub fn set_fs(
-    fs: litebox::fs::layered::FileSystem<
-        'static,
-        Platform,
-        litebox::fs::in_mem::FileSystem<'static, Platform>,
-        litebox::fs::tar_ro::FileSystem<'static, Platform>,
-    >,
-) {
+pub fn set_fs(fs: LinuxFS) {
     FS.set(alloc::boxed::Box::new(fs))
         .map_err(|_| {})
         .expect("fs is already set");

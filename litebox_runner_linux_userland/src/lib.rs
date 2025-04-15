@@ -124,11 +124,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             litebox::fs::tar_ro::empty_tar_file()
         };
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(&*platform, tar_data);
+        let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&*platform);
         litebox::fs::layered::FileSystem::new(
             &*platform,
             in_mem,
-            tar_ro,
-            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+            litebox::fs::layered::FileSystem::new(
+                &*platform,
+                dev_stdio,
+                tar_ro,
+                litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+            ),
+            litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
         )
     };
     litebox_shim_linux::set_fs(initial_file_system);

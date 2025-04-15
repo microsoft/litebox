@@ -41,13 +41,19 @@ pub fn init_platform() {
         fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to set permissions on root");
     });
+    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(platform);
     let tar_ro_fs =
         litebox::fs::tar_ro::FileSystem::new(platform, litebox::fs::tar_ro::empty_tar_file());
     set_fs(litebox::fs::layered::FileSystem::new(
         platform,
         in_mem_fs,
-        tar_ro_fs,
-        litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+        litebox::fs::layered::FileSystem::new(
+            platform,
+            dev_stdio,
+            tar_ro_fs,
+            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+        ),
+        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     ));
 
     // set up stdin, stdout, and stderr
