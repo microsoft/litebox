@@ -1,10 +1,10 @@
 //! The systrap platform relies on seccomp’s `SECCOMP_RET_TRAP` feature to intercept system calls.
 
-use crate::utils::{ReinterpretSignedExt as _, TruncateExt as _};
 use core::arch::global_asm;
 use core::ffi::{c_int, c_uint};
 use litebox::platform::RawMutPointer as _;
 use litebox::platform::trivial_providers::{TransparentConstPtr, TransparentMutPtr};
+use litebox::utils::{ReinterpretSignedExt as _, TruncateExt as _};
 use litebox_common_linux::SyscallRequest;
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 
