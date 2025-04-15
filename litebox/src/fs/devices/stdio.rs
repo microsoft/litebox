@@ -128,23 +128,23 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem
     }
 
     fn seek(&self, fd: &FileFd, offset: isize, whence: SeekWhence) -> Result<usize, SeekError> {
-        todo!()
+        unimplemented!()
     }
 
     fn chmod(&self, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
-        todo!()
+        unimplemented!()
     }
 
     fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {
-        todo!()
+        unimplemented!()
     }
 
     fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
-        todo!()
+        unimplemented!()
     }
 
     fn rmdir(&self, path: impl Arg) -> Result<(), RmdirError> {
-        todo!()
+        unimplemented!()
     }
 
     fn file_status(&self, path: impl Arg) -> Result<FileStatus, FileStatusError> {
@@ -161,7 +161,7 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem
     }
 
     fn fd_file_status(&self, fd: &FileFd) -> Result<FileStatus, FileStatusError> {
-        todo!()
+        unimplemented!()
     }
 
     fn with_metadata<T: core::any::Any, R>(
@@ -169,7 +169,7 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem
         fd: &FileFd,
         f: impl FnOnce(&T) -> R,
     ) -> Result<R, crate::fs::errors::MetadataError> {
-        todo!()
+        unimplemented!()
     }
 
     fn with_metadata_mut<T: core::any::Any, R>(
@@ -177,7 +177,7 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem
         fd: &FileFd,
         f: impl FnOnce(&mut T) -> R,
     ) -> Result<R, crate::fs::errors::MetadataError> {
-        todo!()
+        unimplemented!()
     }
 
     fn set_file_metadata<T: core::any::Any>(
@@ -185,7 +185,7 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem
         fd: &FileFd,
         metadata: T,
     ) -> Result<Option<T>, crate::fs::errors::SetMetadataError<T>> {
-        todo!()
+        unimplemented!()
     }
 
     fn set_fd_metadata<T: core::any::Any>(
@@ -193,6 +193,6 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem
         fd: &FileFd,
         metadata: T,
     ) -> Result<Option<T>, crate::fs::errors::SetMetadataError<T>> {
-        todo!()
+        unimplemented!()
     }
 }
