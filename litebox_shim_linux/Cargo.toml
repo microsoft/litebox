@@ -12,6 +12,7 @@ once_cell = { version = "1.20.2", default-features = false, features = ["alloc",
 elf_loader = { version = "0.9.2", features = ["fs"] }
 thiserror = { version = "2.0.6", default-features = false }
 ringbuf = { version = "0.4.8", default-features = false, features = ["alloc"] }
+spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 
 [features]
 unstable-testing = []

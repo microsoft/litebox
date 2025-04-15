@@ -165,7 +165,14 @@ impl Descriptors {
 enum Descriptor {
     File(litebox::fd::FileFd),
     Socket(litebox::fd::SocketFd),
-    Pipe(syscalls::pipe::Pipe),
+    PipeReader {
+        consumer: alloc::sync::Arc<crate::channel::Consumer<u8>>,
+        close_on_exec: core::sync::atomic::AtomicBool,
+    },
+    PipeWriter {
+        producer: alloc::sync::Arc<crate::channel::Producer<u8>>,
+        close_on_exec: core::sync::atomic::AtomicBool,
+    },
 }
 
 pub(crate) fn file_descriptors<'a>() -> &'a RwLock<'static, Platform, Descriptors> {

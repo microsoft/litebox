@@ -105,10 +105,10 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
         Some(desc) => match desc {
             Descriptor::File(file) => litebox_fs().read(file, buf, offset).map_err(Errno::from),
             Descriptor::Socket(socket) => todo!(),
-            Descriptor::Pipe(super::pipe::Pipe::Reader(consumer)) => {
-                consumer.read(buf, entry.status.get().contains(OFlags::NONBLOCK))
+            Descriptor::PipeReader { consumer, .. } => {
+                consumer.read(buf, consumer.get_status().contains(OFlags::NONBLOCK))
             }
-            Descriptor::Pipe(super::pipe::Pipe::Writer { .. }) => Err(Errno::EINVAL),
+            Descriptor::PipeWriter { .. } => Err(Errno::EINVAL),
         },
         None => Err(Errno::EBADF),
     }
@@ -126,9 +126,9 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
         Some(desc) => match desc {
             Descriptor::File(file) => litebox_fs().write(file, buf, offset).map_err(Errno::from),
             Descriptor::Socket(socket) => todo!(),
-            Descriptor::Pipe(super::pipe::Pipe::Reader { .. }) => Err(Errno::EINVAL),
-            Descriptor::Pipe(super::pipe::Pipe::Writer(producer)) => {
-                producer.write(buf, entry.status.get().contains(OFlags::NONBLOCK))
+            Descriptor::PipeReader { .. } => Err(Errno::EINVAL),
+            Descriptor::PipeWriter { producer, .. } => {
+                producer.write(buf, producer.get_status().contains(OFlags::NONBLOCK))
             }
         },
         None => Err(Errno::EBADF),
@@ -159,7 +159,7 @@ pub fn sys_close(fd: i32) -> Result<(), Errno> {
     match file_descriptors().write().remove(fd) {
         Some(Descriptor::File(file)) => litebox_fs().close(file).map_err(Errno::from),
         Some(Descriptor::Socket(socket)) => todo!(),
-        Some(Descriptor::Pipe(_)) => Ok(()),
+        Some(Descriptor::PipeReader { .. } | Descriptor::PipeWriter { .. }) => Ok(()),
         None => Err(Errno::EBADF),
     }
 }
@@ -201,7 +201,8 @@ pub fn sys_readv(
                 .read(file, &mut kernel_buffer, None)
                 .map_err(Errno::from)?,
             Descriptor::Socket(socket) => todo!(),
-            Descriptor::Pipe(pipe) => todo!(),
+            Descriptor::PipeReader { consumer, .. } => todo!(),
+            Descriptor::PipeWriter { .. } => return Err(Errno::EINVAL),
         };
         iov.iov_base
             .copy_from_slice(0, &kernel_buffer[..size])
@@ -242,7 +243,8 @@ pub fn sys_writev(
                 .write(file, &slice, None)
                 .map_err(Errno::from)?,
             Descriptor::Socket(socket) => todo!(),
-            Descriptor::Pipe(pipe) => todo!(),
+            Descriptor::PipeReader { .. } => return Err(Errno::EINVAL),
+            Descriptor::PipeWriter { producer, .. } => todo!(),
         };
 
         total_written += size;
@@ -308,12 +310,12 @@ pub fn sys_fstat(fd: i32) -> Result<FileStat, Errno> {
         Some(desc) => match desc {
             Descriptor::File(file) => FileStat::from(litebox_fs().fd_file_status(file)?),
             Descriptor::Socket(socket) => todo!(),
-            Descriptor::Pipe(super::pipe::Pipe::Reader { .. }) => FileStat {
+            Descriptor::PipeReader { .. } => FileStat {
                 // TODO: give correct values
                 st_dev: 0,
                 st_ino: 0,
                 st_nlink: 1,
-                st_mode: Mode::RUSR.bits() | InodeType::NamedPipe as u32,
+                st_mode: Mode::RUSR.bits() | litebox_common_linux::InodeType::NamedPipe as u32,
                 st_uid: 0,
                 st_gid: 0,
                 st_rdev: 0,
@@ -322,12 +324,12 @@ pub fn sys_fstat(fd: i32) -> Result<FileStat, Errno> {
                 st_blocks: 0,
                 ..Default::default()
             },
-            Descriptor::Pipe(super::pipe::Pipe::Writer { .. }) => FileStat {
+            Descriptor::PipeWriter { .. } => FileStat {
                 // TODO: give correct values
                 st_dev: 0,
                 st_ino: 0,
                 st_nlink: 1,
-                st_mode: Mode::WUSR.bits() | InodeType::NamedPipe as u32,
+                st_mode: Mode::WUSR.bits() | litebox_common_linux::InodeType::NamedPipe as u32,
                 st_uid: 0,
                 st_gid: 0,
                 st_rdev: 0,
@@ -384,6 +386,14 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                         .with_metadata(file, |flags: &FileDescriptorFlags| *flags)
                         .unwrap_or(FileDescriptorFlags::empty()),
                     Descriptor::Socket(socket) => todo!(),
+                    Descriptor::PipeReader { close_on_exec, .. }
+                    | Descriptor::PipeWriter { close_on_exec, .. } => {
+                        if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
+                            FileDescriptorFlags::FD_CLOEXEC
+                        } else {
+                            FileDescriptorFlags::empty()
+                        }
+                    }
                 };
             Ok(flags.bits())
         }
@@ -395,10 +405,22 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                     }
                 }
                 Descriptor::Socket(socket) => todo!(),
+                Descriptor::PipeReader { close_on_exec, .. }
+                | Descriptor::PipeWriter { close_on_exec, .. } => {
+                    close_on_exec.store(
+                        flags.contains(FileDescriptorFlags::FD_CLOEXEC),
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                }
             }
             Ok(0)
         }
-        FcntlArg::GETFL => todo!(),
+        FcntlArg::GETFL => match desc {
+            Descriptor::File(file) => todo!(),
+            Descriptor::Socket(socket) => todo!(),
+            Descriptor::PipeReader { consumer, .. } => Ok(consumer.get_status().bits()),
+            Descriptor::PipeWriter { producer, .. } => Ok(producer.get_status().bits()),
+        },
         _ => unimplemented!(),
     }
 }
@@ -420,19 +442,30 @@ pub fn sys_getcwd(buf: &mut [u8]) -> Result<usize, Errno> {
     Ok(bytes.len())
 }
 
+const DEFAULT_PIPE_BUF_SIZE: usize = 1024 * 1024;
 pub fn sys_pipe2(flags: OFlags) -> Result<(u32, u32), Errno> {
     if flags.contains((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement()) {
         return Err(Errno::EINVAL);
     }
 
-    let (reader, writer) = super::pipe::pipe(flags, litebox_platform_multiplex::platform());
+    if flags.contains(litebox::fs::OFlags::DIRECT) {
+        todo!("O_DIRECT not supported");
+    }
+
+    let (writer, reader) = crate::channel::Channel::new(
+        DEFAULT_PIPE_BUF_SIZE,
+        flags,
+        litebox_platform_multiplex::platform(),
+    )
+    .split();
     let close_on_exec = flags.contains(OFlags::CLOEXEC);
-    let read_fd = file_descriptors()
-        .write()
-        .insert(Descriptor::Pipe(reader), flags, close_on_exec);
-    let write_fd =
-        file_descriptors()
-            .write()
-            .insert(Descriptor::Pipe(writer), flags, close_on_exec);
+    let read_fd = file_descriptors().write().insert(Descriptor::PipeReader {
+        consumer: reader,
+        close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
+    });
+    let write_fd = file_descriptors().write().insert(Descriptor::PipeWriter {
+        producer: writer,
+        close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
+    });
     Ok((read_fd, write_fd))
 }

@@ -9,11 +9,6 @@ use ringbuf::{
     traits::{Consumer as _, Producer as _, Split as _},
 };
 
-/// The maximum number of bytes for atomic write.
-///
-/// See <https://man7.org/linux/man-pages/man7/pipe.7.html> for more details.
-const PIPE_BUF: usize = 4096;
-
 struct EndPointer<T> {
     rb: litebox::sync::Mutex<'static, Platform, T>,
     is_shutdown: AtomicBool,
@@ -52,24 +47,6 @@ macro_rules! common_functions_for_channel {
             } else {
                 true
             }
-        }
-
-        pub fn poll(
-            &self,
-            mask: IoEvents,
-            observer: Option<Weak<dyn Observer<IoEvents>>>,
-        ) -> IoEvents {
-            self.endpoint
-                .pollee
-                .poll(mask, observer, || self.check_io_events())
-        }
-
-        pub(crate) fn register_observer(
-            &self,
-            observer: alloc::sync::Weak<dyn Observer<IoEvents>>,
-            filter: IoEvents,
-        ) {
-            self.endpoint.pollee.register_observer(observer, filter);
         }
 
         pub(crate) fn get_status(&self) -> OFlags {
@@ -163,18 +140,6 @@ impl<T> Consumer<T> {
             peer: spin::Once::new(),
             status: AtomicU32::new((flags & OFlags::STATUS_FLAGS_MASK).bits()),
         }
-    }
-
-    fn check_io_events(&self) -> IoEvents {
-        let rb = self.endpoint.rb.lock();
-        let mut events = IoEvents::empty();
-        if self.is_peer_shutdown() {
-            events |= IoEvents::HUP;
-        }
-        if !self.is_shutdown() && !rb.is_empty() {
-            events |= IoEvents::IN;
-        }
-        events
     }
 
     fn try_read(&self, buf: &mut [T]) -> Result<usize, Errno>
