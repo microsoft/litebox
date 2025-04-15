@@ -11,6 +11,12 @@ struct CliArgs {
     /// The program and arguments passed to it (e.g., `python3 --version`)
     #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     program_and_arguments: Vec<String>,
+    /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times)
+    #[arg(long = "env")]
+    environment_variables: Vec<String>,
+    /// Forward the existing environment variables
+    #[arg(long = "forward-env")]
+    forward_environment_variables: bool,
     /// Allow using unstable options
     #[arg(short = 'Z', long = "unstable")]
     unstable: bool,
@@ -57,17 +63,35 @@ fn main() -> Result<()> {
     litebox_shim_linux::set_fs(initial_file_system);
     litebox_platform_multiplex::set_platform(platform);
 
-    let loaded_program = litebox_shim_linux::loader::load_program(
-        &cli_args.program_and_arguments[0],
-        cli_args
-            .program_and_arguments
-            .iter()
-            .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
-            .collect(),
-        // TODO: Initial environment variables
-        vec![],
-    )
-    .unwrap();
+    let argv = cli_args
+        .program_and_arguments
+        .iter()
+        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+        .collect();
+    let envp: Vec<_> = cli_args
+        .environment_variables
+        .iter()
+        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+        .collect();
+    let envp = if cli_args.forward_environment_variables {
+        envp.into_iter()
+            .chain(std::env::vars().map(|(k, v)| {
+                std::ffi::CString::new(
+                    k.bytes()
+                        .chain([b'='])
+                        .chain(v.bytes())
+                        .collect::<Vec<u8>>(),
+                )
+                .unwrap()
+            }))
+            .collect()
+    } else {
+        envp
+    };
+
+    let loaded_program =
+        litebox_shim_linux::loader::load_program(&cli_args.program_and_arguments[0], argv, envp)
+            .unwrap();
 
     unsafe {
         trampoline::jump_to_entry_point(loaded_program.entry_point, loaded_program.user_stack_top)
