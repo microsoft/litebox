@@ -228,6 +228,7 @@ mod layered {
             &platform,
             in_mem::FileSystem::new(&platform),
             tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
         );
         let fd = fs
             .open("foo", OFlags::RDONLY, Mode::RWXU)
@@ -267,6 +268,7 @@ mod layered {
             &platform,
             in_mem::FileSystem::new(&platform),
             tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
         );
         assert!(matches!(
             fs.open("bar/ba", OFlags::RDONLY, Mode::empty()),
@@ -302,6 +304,7 @@ mod layered {
             &platform,
             in_mem_fs,
             tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
         );
         let fd1 = fs
             .open("foo", OFlags::RDONLY, Mode::RWXU)
@@ -352,6 +355,7 @@ mod layered {
             &platform,
             in_mem_fs,
             tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
         );
         let fd1 = fs
             .open("foo", OFlags::RDONLY, Mode::RWXU)
@@ -387,6 +391,7 @@ mod layered {
             &platform,
             in_mem::FileSystem::new(&platform),
             tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
         );
         let fd = fs
             .open("foo", OFlags::RDONLY, Mode::RWXU)
@@ -417,5 +422,169 @@ mod layered {
                 crate::fs::errors::PathError::NoSuchFileOrDirectory
             )),
         ));
+    }
+}
+
+mod stdio {
+    use crate::fs::{FileSystem as _, Mode, OFlags};
+    use crate::platform::mock::MockPlatform;
+    use alloc::vec;
+    extern crate std;
+
+    #[test]
+    fn stdio_open_read_write() {
+        let platform = MockPlatform::new();
+        let fs = crate::fs::devices::stdio::FileSystem::new(&platform);
+
+        // Test opening and writing to /dev/stdout
+        let fd_stdout = fs
+            .open("/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .expect("Failed to open /dev/stdout");
+        let data = b"Hello, stdout!";
+        fs.write(&fd_stdout, data, None)
+            .expect("Failed to write to /dev/stdout");
+        fs.close(fd_stdout).expect("Failed to close /dev/stdout");
+        assert_eq!(platform.stdout_queue.borrow().len(), 1);
+        assert_eq!(platform.stdout_queue.borrow()[0], data);
+
+        // Test opening and writing to /dev/stderr
+        let fd_stderr = fs
+            .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .expect("Failed to open /dev/stderr");
+        let data = b"Hello, stderr!";
+        fs.write(&fd_stderr, data, None)
+            .expect("Failed to write to /dev/stderr");
+        fs.close(fd_stderr).expect("Failed to close /dev/stderr");
+        assert_eq!(platform.stderr_queue.borrow().len(), 1);
+        assert_eq!(platform.stderr_queue.borrow()[0], data);
+
+        // Test opening and reading from /dev/stdin
+        platform
+            .stdin_queue
+            .borrow_mut()
+            .push_back(b"Hello, stdin!".to_vec());
+        let fd_stdin = fs
+            .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open /dev/stdin");
+        let mut buffer = vec![0; 13];
+        let bytes_read = fs
+            .read(&fd_stdin, &mut buffer, None)
+            .expect("Failed to read from /dev/stdin");
+        assert_eq!(bytes_read, 13);
+        assert_eq!(&buffer, b"Hello, stdin!");
+        fs.close(fd_stdin).expect("Failed to close /dev/stdin");
+    }
+
+    #[test]
+    fn non_dev_path_fails() {
+        let platform = MockPlatform::new();
+        let fs = crate::fs::devices::stdio::FileSystem::new(&platform);
+
+        // Attempt to open a non-/dev/* path
+        let result = fs.open("foo", OFlags::RDONLY, Mode::empty());
+        assert!(matches!(
+            result,
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::NoSuchFileOrDirectory
+            ))
+        ));
+    }
+}
+
+mod layered_stdio {
+    use crate::fs::layered::LayeringSemantics;
+    use crate::fs::{FileSystem as _, Mode, OFlags};
+    use crate::fs::{devices, in_mem, layered};
+    use crate::platform::mock::MockPlatform;
+    use alloc::vec;
+    extern crate std;
+
+    #[test]
+    fn layered_stdio_open_read_write() {
+        let platform = MockPlatform::new();
+        let layered_fs = layered::FileSystem::new(
+            &platform,
+            in_mem::FileSystem::new(&platform),
+            devices::stdio::FileSystem::new(&platform),
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        // Test opening and writing to /dev/stdout
+        let fd_stdout = layered_fs
+            .open("/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .expect("Failed to open /dev/stdout");
+        let data = b"Hello, layered stdout!";
+        layered_fs
+            .write(&fd_stdout, data, None)
+            .expect("Failed to write to /dev/stdout");
+        layered_fs
+            .close(fd_stdout)
+            .expect("Failed to close /dev/stdout");
+        assert_eq!(platform.stdout_queue.borrow().len(), 1);
+        assert_eq!(platform.stdout_queue.borrow()[0], data);
+
+        // Test opening and writing to /dev/stderr
+        let fd_stderr = layered_fs
+            .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .expect("Failed to open /dev/stderr");
+        let data = b"Hello, layered stderr!";
+        layered_fs
+            .write(&fd_stderr, data, None)
+            .expect("Failed to write to /dev/stderr");
+        layered_fs
+            .close(fd_stderr)
+            .expect("Failed to close /dev/stderr");
+        assert_eq!(platform.stderr_queue.borrow().len(), 1);
+        assert_eq!(platform.stderr_queue.borrow()[0], data);
+
+        // Test opening and reading from /dev/stdin
+        platform
+            .stdin_queue
+            .borrow_mut()
+            .push_back(b"Hello, layered stdin!".to_vec());
+        let fd_stdin = layered_fs
+            .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open /dev/stdin");
+        let mut buffer = vec![0; 1024];
+        let bytes_read = layered_fs
+            .read(&fd_stdin, &mut buffer, None)
+            .expect("Failed to read from /dev/stdin");
+        assert_eq!(&buffer[..bytes_read], b"Hello, layered stdin!");
+        layered_fs
+            .close(fd_stdin)
+            .expect("Failed to close /dev/stdin");
+    }
+
+    #[test]
+    fn layered_write_to_non_dev() {
+        let platform = MockPlatform::new();
+        let in_mem = {
+            let mut in_mem = in_mem::FileSystem::new(&platform);
+            in_mem.with_root_privileges(|fs| {
+                fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO).unwrap();
+            });
+            in_mem
+        };
+        let fs = layered::FileSystem::new(
+            &platform,
+            in_mem,
+            devices::stdio::FileSystem::new(&platform),
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        // Test file creation
+        let path = "/testfile";
+        let fd = fs
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+
+        fs.close(fd).expect("Failed to close file");
+
+        // Test file deletion
+        fs.unlink(path).expect("Failed to unlink file");
+        assert!(
+            fs.open(path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            "File should not exist"
+        );
     }
 }
