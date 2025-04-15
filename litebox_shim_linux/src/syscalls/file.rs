@@ -394,6 +394,17 @@ pub fn sys_newfstatat(
     Ok(fstat)
 }
 
+macro_rules! toggle_flags {
+    ($t:ident, $flags:ident, $setfl_mask:ident) => {
+        let diff = $t.get_status() ^ $flags;
+        if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
+            todo!("unsupported flags");
+        }
+        $t.set_status($flags & $setfl_mask, true);
+        $t.set_status($flags.complement() & $setfl_mask, false);
+    };
+}
+
 pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
@@ -444,6 +455,27 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
             Descriptor::PipeReader { consumer, .. } => Ok(consumer.get_status().bits()),
             Descriptor::PipeWriter { producer, .. } => Ok(producer.get_status().bits()),
         },
+        FcntlArg::SETFL(flags) => {
+            let setfl_mask = OFlags::APPEND
+                | OFlags::NONBLOCK
+                | OFlags::NDELAY
+                | OFlags::DIRECT
+                | OFlags::NOATIME;
+            match desc {
+                Descriptor::File(file) | Descriptor::Stdio(file) => todo!(),
+                Descriptor::Socket(socket) => todo!(),
+                Descriptor::PipeReader { consumer, .. } => {
+                    toggle_flags!(consumer, flags, setfl_mask);
+                }
+                Descriptor::PipeWriter { producer, .. } => {
+                    toggle_flags!(producer, flags, setfl_mask);
+                }
+                Descriptor::Eventfd { file, .. } => {
+                    toggle_flags!(file, flags, setfl_mask);
+                }
+            }
+            Ok(0)
+        }
         _ => unimplemented!(),
     }
 }
