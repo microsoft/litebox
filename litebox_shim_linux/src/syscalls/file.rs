@@ -62,7 +62,6 @@ impl<P: path::Arg> FsPath<P> {
 
 /// Handle syscall `open`
 pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
-    let close_on_exec = flags.contains(OFlags::CLOEXEC);
     litebox_fs()
         .open(path, flags, mode)
         .map(|file| {
