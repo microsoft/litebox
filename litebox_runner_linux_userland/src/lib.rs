@@ -55,7 +55,31 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     }
 
+    // NOTE: We need to grab this info before initializing the platform, because that installs in
+    // hooks that will start taking control of the syscalls being run.
+    let (ancestor_modes, prog_data): (Vec<litebox::fs::Mode>, Vec<u8>) = {
+        let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
+        let ancestors: Vec<_> = prog.ancestors().collect();
+        let modes: Vec<_> = ancestors
+            .into_iter()
+            .rev()
+            .skip(1)
+            .map(|path| litebox::fs::Mode::from_bits(path.metadata().unwrap().st_mode()).unwrap())
+            .collect();
+        let data = std::fs::read(prog).unwrap();
+        let data = if cli_args.rewrite_syscalls {
+            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
+        } else {
+            data
+        };
+        (modes, data)
+    };
+
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
+    //
+    // TODO: We also need to pick the type of syscall interception based on whether we want we want
+    // systrap/sigsys interception, or binary rewriting interception. Currently
+    // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Box::leak(Box::new(Platform::new(
         None,
         litebox::platform::trivial_providers::ImpossiblePunchthroughProvider {},
@@ -66,27 +90,23 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         in_mem.with_root_privileges(|fs| {
             let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
             let ancestors: Vec<_> = prog.ancestors().collect();
-            for path in ancestors.into_iter().skip(1).rev() {
-                fs.mkdir(
-                    path.to_str().unwrap(),
-                    litebox::fs::Mode::from_bits(path.metadata().unwrap().st_mode()).unwrap(),
-                )
-                .unwrap();
+            for (path, &mode) in ancestors
+                .into_iter()
+                .skip(1)
+                .rev()
+                .skip(1)
+                .zip(&ancestor_modes)
+            {
+                fs.mkdir(path.to_str().unwrap(), mode).unwrap();
             }
             let fd = fs
                 .open(
                     prog.to_str().unwrap(),
                     litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
-                    litebox::fs::Mode::from_bits(prog.metadata().unwrap().st_mode()).unwrap(),
+                    *ancestor_modes.last().unwrap(),
                 )
                 .unwrap();
-            let prog_data = std::fs::read(prog).unwrap();
-            let data = if cli_args.rewrite_syscalls {
-                litebox_syscall_rewriter::hook_syscalls_in_elf(&prog_data, None).unwrap()
-            } else {
-                prog_data
-            };
-            let mut data = data.as_slice();
+            let mut data = prog_data.as_slice();
             while !data.is_empty() {
                 let len = fs.write(&fd, data, None).unwrap();
                 data = &data[len..];
