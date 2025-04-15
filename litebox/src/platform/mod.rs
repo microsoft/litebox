@@ -178,7 +178,7 @@ pub trait RawMutex: Send + Sync {
     ///
     /// Returns the number of waiters that were woken up.
     fn wake_all(&self) -> usize {
-        self.wake_many(usize::MAX)
+        self.wake_many(u32::MAX as usize)
     }
 
     /// If the underlying value is `val`, block until a wake operation wakes us up.
