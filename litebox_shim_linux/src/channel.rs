@@ -220,3 +220,105 @@ impl<T> Channel<T> {
         (prod, cons)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use litebox::platform::trivial_providers::ImpossiblePunchthroughProvider;
+    use litebox_common_linux::errno::Errno;
+    use litebox_platform_multiplex::{Platform, set_platform};
+
+    extern crate std;
+
+    fn init_platform() {
+        let syscall_entry: Option<
+            fn(litebox_common_linux::SyscallRequest<litebox_platform_multiplex::Platform>) -> i64,
+        > = None;
+        let platform = Platform::new(None, ImpossiblePunchthroughProvider {}, syscall_entry);
+        set_platform(platform);
+    }
+
+    #[test]
+    fn test_blocking_channel() {
+        init_platform();
+
+        let (prod, cons) = super::Channel::<u8>::new(
+            2,
+            litebox::fs::OFlags::empty(),
+            litebox_platform_multiplex::platform(),
+        )
+        .split();
+        std::thread::spawn(move || {
+            let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+            let mut i = 0;
+            while i < data.len() {
+                let ret = prod.write(&data[i..], false).unwrap();
+                i += ret;
+            }
+            prod.shutdown();
+        });
+
+        let mut buf = [0; 10];
+        let mut i = 0;
+        loop {
+            let ret = cons.read(&mut buf[i..], false).unwrap();
+            if ret == 0 {
+                cons.shutdown();
+                break;
+            }
+            i += ret;
+        }
+        assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn test_nonblocking_channel() {
+        init_platform();
+
+        let (prod, cons) = super::Channel::<u8>::new(
+            2,
+            litebox::fs::OFlags::empty(),
+            litebox_platform_multiplex::platform(),
+        )
+        .split();
+        std::thread::spawn(move || {
+            let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+            let mut i = 0;
+            while i < data.len() {
+                match prod.write(&data[i..], true) {
+                    Ok(n) => {
+                        i += n;
+                    }
+                    Err(Errno::EAGAIN) => {
+                        // busy wait
+                        // TODO: use poll rather than busy wait
+                    }
+                    Err(e) => {
+                        panic!("Error writing to channel: {:?}", e);
+                    }
+                }
+            }
+            prod.shutdown();
+        });
+
+        let mut buf = [0; 10];
+        let mut i = 0;
+        loop {
+            match cons.read(&mut buf[i..], true) {
+                Ok(n) => {
+                    if n == 0 {
+                        break;
+                    }
+                    i += n;
+                }
+                Err(Errno::EAGAIN) => {
+                    // busy wait
+                    // TODO: use poll rather than busy wait
+                }
+                Err(e) => {
+                    panic!("Error reading from channel: {:?}", e);
+                }
+            }
+        }
+        assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+}

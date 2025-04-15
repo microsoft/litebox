@@ -170,7 +170,7 @@ pub struct FileStat {
     pub st_mode: u32,
     pub st_uid: u32,
     pub st_gid: u32,
-    __pad0: core::ffi::c_int,
+    pub pad0: core::ffi::c_int,
     pub st_rdev: u64,
     pub st_size: i64,
     pub st_blksize: i64,
@@ -181,7 +181,7 @@ pub struct FileStat {
     pub st_mtime_nsec: i64,
     pub st_ctime: i64,
     pub st_ctime_nsec: i64,
-    __unused: [i64; 3],
+    pub unused: [i64; 3],
 }
 
 /// Linux's `iovec` struct for `writev`
@@ -238,19 +238,12 @@ impl From<litebox::fs::FileStatus> for FileStat {
             st_mode: mode.bits() | InodeType::from(file_type) as u32,
             st_uid: 0,
             st_gid: 0,
-            __pad0: 0,
             st_rdev: 0,
             #[allow(clippy::cast_possible_wrap)]
             st_size: size as i64,
             st_blksize: 0,
             st_blocks: 0,
-            st_atime: 0,
-            st_atime_nsec: 0,
-            st_mtime: 0,
-            st_mtime_nsec: 0,
-            st_ctime: 0,
-            st_ctime_nsec: 0,
-            __unused: [0; 3],
+            ..Default::default()
         }
     }
 }
