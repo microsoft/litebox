@@ -19,10 +19,15 @@ use super::*;
 ///   + time moves at one millisecond per "now" call
 ///   + IP packets are placed into a deterministic ring buffer and spin back around
 /// - Debuging output goes to stderr
+/// - Can pre-fill stdin and check stdout easily between invocations (see [`Self::stdin_queue`],
+///   [`Self::stdout_queue`], and [`Self::stderr_queue`])
 /// - It will not mock you for using it during tests
 pub(crate) struct MockPlatform {
     current_time: AtomicU64,
     ip_packets: RefCell<VecDeque<Vec<u8>>>,
+    pub(crate) stdin_queue: RefCell<VecDeque<Vec<u8>>>,
+    pub(crate) stdout_queue: RefCell<VecDeque<Vec<u8>>>,
+    pub(crate) stderr_queue: RefCell<VecDeque<Vec<u8>>>,
 }
 
 impl MockPlatform {
@@ -30,6 +35,9 @@ impl MockPlatform {
         MockPlatform {
             current_time: AtomicU64::new(0),
             ip_packets: RefCell::new(VecDeque::new()),
+            stdin_queue: RefCell::new(VecDeque::new()),
+            stdout_queue: RefCell::new(VecDeque::new()),
+            stderr_queue: RefCell::new(VecDeque::new()),
         }
     }
 }
@@ -134,4 +142,34 @@ impl DebugLogProvider for MockPlatform {
 impl RawPointerProvider for MockPlatform {
     type RawConstPointer<T: Clone> = super::trivial_providers::TransparentConstPtr<T>;
     type RawMutPointer<T: Clone> = super::trivial_providers::TransparentMutPtr<T>;
+}
+
+impl StdioProvider for MockPlatform {
+    fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, StdioReadError> {
+        let Some(front) = self.stdin_queue.borrow_mut().pop_front() else {
+            return Err(StdioReadError::Closed);
+        };
+        let len = front.len().min(buf.len());
+        buf[..len].copy_from_slice(&front[..len]);
+        if front.len() > len {
+            self.stdin_queue
+                .borrow_mut()
+                .push_front(front.into_iter().skip(len).collect());
+        }
+        Ok(len)
+    }
+
+    fn write_to(&self, stream: StdioOutStream, buf: &[u8]) -> Result<usize, StdioWriteError> {
+        match stream {
+            StdioOutStream::Stdout => &self.stdout_queue,
+            StdioOutStream::Stderr => &self.stderr_queue,
+        }
+        .borrow_mut()
+        .push_back(buf.to_vec());
+        Ok(buf.len())
+    }
+
+    fn is_a_tty(&self, _stream: StdioStream) -> bool {
+        false
+    }
 }
