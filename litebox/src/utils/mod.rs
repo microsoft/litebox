@@ -1,8 +1,14 @@
-//! "The kitchen sink": helpful utilities that are hard to organize into other modules.
+//! Miscellaneous "kitchen sink" for use in various LiteBox crates.
+//!
+//! Note: while we do not anticipate significant API changes in these utilities, these utilities do
+//! not (necessarily) come with the API stability guarantees of the rest of LiteBox's modules. They
+//! exist mostly to share utility code that used in the various LiteBox crates, and as such, might
+//! be changed if necessary.
+// NOTE: There is a separate `utilities` module in this crate meant for crate-internal utilities.
 
 /// An extension trait that adds `truncate` to truncate integers to a specific size of the same
 /// signedness.
-pub(crate) trait TruncateExt<To> {
+pub trait TruncateExt<To> {
     /// Truncate `self` to `To`, taking only lower-order bits.
     fn truncate(self) -> To;
 }
@@ -51,18 +57,14 @@ impl_truncate! { i32, i8 }
 impl_truncate! { i16, i8 }
 
 /// An extension trait that adds `reinterpret_as_signed` to unsigned integers.
-pub(crate) trait ReinterpretSignedExt {
+pub trait ReinterpretSignedExt {
     type Signed;
     /// Reinterpret `self` to `Self::To`
     fn reinterpret_as_signed(self) -> Self::Signed;
 }
 
 /// An extension trait that adds `reinterpret_as_unsigned` to signed integers.
-#[expect(
-    dead_code,
-    reason = "currently unused; remove this attr once it is used"
-)]
-pub(crate) trait ReinterpretUnsignedExt {
+pub trait ReinterpretUnsignedExt {
     type Unsigned;
     /// Reinterpret `self` to `Self::To`
     fn reinterpret_as_unsigned(self) -> Self::Unsigned;
