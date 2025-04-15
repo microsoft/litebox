@@ -161,7 +161,12 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem
     }
 
     fn fd_file_status(&self, fd: &FileFd) -> Result<FileStatus, FileStatusError> {
-        unimplemented!()
+        assert!(matches!(fd.x.as_usize(), 0..=2));
+        Ok(FileStatus {
+            file_type: FileType::CharacterDevice,
+            mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
+            size: 0,
+        })
     }
 
     fn with_metadata<T: core::any::Any, R>(
