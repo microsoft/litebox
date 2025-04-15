@@ -44,7 +44,10 @@ pub fn init_platform() {
     let tar_ro_fs =
         litebox::fs::tar_ro::FileSystem::new(platform, litebox::fs::tar_ro::empty_tar_file());
     set_fs(litebox::fs::layered::FileSystem::new(
-        platform, in_mem_fs, tar_ro_fs,
+        platform,
+        in_mem_fs,
+        tar_ro_fs,
+        litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
     ));
 
     // set up stdin, stdout, and stderr

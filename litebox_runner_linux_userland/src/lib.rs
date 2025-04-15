@@ -48,6 +48,7 @@ pub struct CliArgs {
 /// Can panic if any particulars of the environment are not set up as expected. Ideally, would not
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
+#[expect(clippy::too_many_lines)]
 pub fn run(cli_args: CliArgs) -> Result<()> {
     if !cli_args.insert_files.is_empty() {
         unimplemented!(
@@ -123,7 +124,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             litebox::fs::tar_ro::empty_tar_file()
         };
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(&*platform, tar_data);
-        litebox::fs::layered::FileSystem::new(&*platform, in_mem, tar_ro)
+        litebox::fs::layered::FileSystem::new(
+            &*platform,
+            in_mem,
+            tar_ro,
+            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+        )
     };
     litebox_shim_linux::set_fs(initial_file_system);
     litebox_platform_multiplex::set_platform(platform);
