@@ -1,6 +1,8 @@
 use anyhow::{Result, anyhow};
 use clap::Parser;
+use litebox::fs::FileSystem as _;
 use litebox_platform_multiplex::Platform;
+use std::os::linux::fs::MetadataExt as _;
 use std::path::PathBuf;
 
 // TODO(jb): Remove all the `unwrap`s from this
@@ -29,6 +31,13 @@ struct CliArgs {
     #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath,
           requires = "unstable", help_heading = "Unstable Options")]
     initial_files: Option<PathBuf>,
+    /// Automatically rewrite syscalls for the ELF file if necessary
+    #[arg(
+        long = "rewrite-syscalls",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    rewrite_syscalls: bool,
 }
 
 fn main() -> Result<()> {
@@ -47,7 +56,37 @@ fn main() -> Result<()> {
         litebox_shim_linux::syscall_entry,
     )));
     let initial_file_system = {
-        let in_mem = litebox::fs::in_mem::FileSystem::new(&*platform);
+        let mut in_mem = litebox::fs::in_mem::FileSystem::new(&*platform);
+        in_mem.with_root_privileges(|fs| {
+            let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
+            let ancestors: Vec<_> = prog.ancestors().collect();
+            for path in ancestors.into_iter().skip(1).rev() {
+                fs.mkdir(
+                    path.to_str().unwrap(),
+                    litebox::fs::Mode::from_bits(path.metadata().unwrap().st_mode()).unwrap(),
+                )
+                .unwrap();
+            }
+            let fd = fs
+                .open(
+                    prog.to_str().unwrap(),
+                    litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                    litebox::fs::Mode::from_bits(prog.metadata().unwrap().st_mode()).unwrap(),
+                )
+                .unwrap();
+            let prog_data = std::fs::read(prog).unwrap();
+            let data = if cli_args.rewrite_syscalls {
+                litebox_syscall_rewriter::hook_syscalls_in_elf(&prog_data, None).unwrap()
+            } else {
+                prog_data
+            };
+            let mut data = data.as_slice();
+            while !data.is_empty() {
+                let len = fs.write(&fd, data, None).unwrap();
+                data = &data[len..];
+            }
+            fs.close(fd).unwrap();
+        });
         let tar_data = if let Some(tar_file) = cli_args.initial_files.as_ref() {
             if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
                 anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
