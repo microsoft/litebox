@@ -132,27 +132,17 @@ impl Descriptors {
         self.descriptors.get(fd as usize)?.as_ref()
     }
     fn get_file_fd(&self, fd: u32) -> Option<&litebox::fd::FileFd> {
-        match self.descriptors.get(fd as usize)?.as_ref()? {
-            Descriptor::File(file_fd) => Some(file_fd),
-            Descriptor::Socket(_) => None,
-        }
-    }
-    fn get_file_fd_mut(&mut self, fd: u32) -> Option<&mut litebox::fd::FileFd> {
-        match self.descriptors.get_mut(fd as usize)?.as_mut()? {
-            Descriptor::File(file_fd) => Some(file_fd),
-            Descriptor::Socket(_) => None,
+        if let Descriptor::File(file_fd) = self.descriptors.get(fd as usize)?.as_ref()? {
+            Some(file_fd)
+        } else {
+            None
         }
     }
     fn get_socket_fd(&self, fd: u32) -> Option<&litebox::fd::SocketFd> {
-        match self.descriptors.get(fd as usize)?.as_ref()? {
-            Descriptor::File(_) => None,
-            Descriptor::Socket(socket_fd) => Some(socket_fd),
-        }
-    }
-    fn get_socket_fd_mut(&mut self, fd: u32) -> Option<&mut litebox::fd::SocketFd> {
-        match self.descriptors.get_mut(fd as usize)?.as_mut()? {
-            Descriptor::File(_) => None,
-            Descriptor::Socket(socket_fd) => Some(socket_fd),
+        if let Descriptor::Socket(socket_fd) = self.descriptors.get(fd as usize)?.as_ref()? {
+            Some(socket_fd)
+        } else {
+            None
         }
     }
 }
@@ -261,6 +251,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
                 syscalls::file::sys_access(path, mode).map(|()| 0)
             })
         }
+        SyscallRequest::Fcntl { fd, arg } => syscalls::file::sys_fcntl(fd, arg).map(|v| v as usize),
         SyscallRequest::Getcwd { buf, size } => {
             isize::try_from(size)
                 .map_err(|_| Errno::EINVAL)

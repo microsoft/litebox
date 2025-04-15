@@ -234,6 +234,13 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                 syscall_args[1].reinterpret_as_signed().truncate(),
             ),
         },
+        libc::SYS_fcntl => SyscallRequest::Fcntl {
+            fd: syscall_args[0].reinterpret_as_signed().truncate(),
+            arg: litebox_common_linux::FcntlArg::from(
+                syscall_args[1].reinterpret_as_signed().truncate(),
+                syscall_args[2],
+            ),
+        },
         libc::SYS_getcwd => SyscallRequest::Getcwd {
             buf: TransparentMutPtr {
                 inner: syscall_args[0] as *mut u8,

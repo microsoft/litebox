@@ -6,7 +6,9 @@ use litebox::{
     path,
     platform::{RawConstPointer, RawMutPointer},
 };
-use litebox_common_linux::{AtFlags, FileStat, IoReadVec, IoWriteVec, errno::Errno};
+use litebox_common_linux::{
+    AtFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec, IoWriteVec, errno::Errno,
+};
 
 use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox_fs};
 
@@ -62,7 +64,16 @@ impl<P: path::Arg> FsPath<P> {
 pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
     litebox_fs()
         .open(path, flags, mode)
-        .map(|file| file_descriptors().write().insert(Descriptor::File(file)))
+        .map(|file| {
+            if flags.contains(OFlags::CLOEXEC)
+                && litebox_fs()
+                    .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
+                    .is_err()
+            {
+                unreachable!()
+            }
+            file_descriptors().write().insert(Descriptor::File(file))
+        })
         .map_err(Errno::from)
 }
 
@@ -138,8 +149,8 @@ pub fn sys_close(fd: i32) -> Result<(), Errno> {
         return Err(Errno::EBADF);
     };
     match file_descriptors().write().remove(fd) {
-        Some(Descriptor::File(file_fd)) => litebox_fs().close(file_fd).map_err(Errno::from),
-        Some(Descriptor::Socket(socket_fd)) => todo!(),
+        Some(Descriptor::File(file)) => litebox_fs().close(file).map_err(Errno::from),
+        Some(Descriptor::Socket(socket)) => todo!(),
         None => Err(Errno::EBADF),
     }
 }
@@ -280,12 +291,12 @@ pub fn sys_fstat(fd: i32) -> Result<FileStat, Errno> {
     };
     let stat = match file_descriptors().read().get_fd(fd) {
         Some(desc) => match desc {
-            Descriptor::File(file) => litebox_fs().fd_file_status(file)?,
+            Descriptor::File(file) => FileStat::from(litebox_fs().fd_file_status(file)?),
             Descriptor::Socket(socket) => todo!(),
         },
         None => return Err(Errno::EBADF),
     };
-    Ok(FileStat::from(stat))
+    Ok(stat)
 }
 
 /// Handle syscall `newfstatat`
@@ -313,6 +324,40 @@ pub fn sys_newfstatat(
         FsPath::FdRelative { fd, path } => todo!(),
     };
     Ok(FileStat::from(status))
+}
+
+pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
+    let Ok(fd) = u32::try_from(fd) else {
+        return Err(Errno::EBADF);
+    };
+
+    let locked_file_descriptors = file_descriptors().read();
+    let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
+    match arg {
+        FcntlArg::GETFD => {
+            let flags: FileDescriptorFlags =
+                match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
+                    Descriptor::File(file) => litebox_fs()
+                        .with_metadata(file, |flags: &FileDescriptorFlags| *flags)
+                        .unwrap_or(FileDescriptorFlags::empty()),
+                    Descriptor::Socket(socket) => todo!(),
+                };
+            Ok(flags.bits())
+        }
+        FcntlArg::SETFD(flags) => {
+            match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
+                Descriptor::File(file) => {
+                    if litebox_fs().set_fd_metadata(file, flags).is_err() {
+                        unreachable!()
+                    }
+                }
+                Descriptor::Socket(socket) => todo!(),
+            }
+            Ok(0)
+        }
+        FcntlArg::GETFL => todo!(),
+        _ => unimplemented!(),
+    }
 }
 
 /// Handle syscall `getcwd`

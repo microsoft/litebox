@@ -255,6 +255,44 @@ impl From<litebox::fs::FileStatus> for FileStat {
     }
 }
 
+/// Commands for use with `fcntl`.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum FcntlArg {
+    /// Get the file descriptor flags
+    GETFD,
+    /// Set the file descriptor flags
+    SETFD(FileDescriptorFlags),
+    /// Get descriptor status flags
+    GETFL,
+}
+
+const F_GETFD: i32 = 1;
+const F_SETFD: i32 = 2;
+const F_GETFL: i32 = 3;
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy)]
+    pub struct FileDescriptorFlags: u32 {
+        /// Close-on-exec flag
+        const FD_CLOEXEC = 0x1;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+impl FcntlArg {
+    pub fn from(cmd: i32, arg: usize) -> Self {
+        match cmd {
+            F_GETFD => Self::GETFD,
+            #[allow(clippy::cast_possible_truncation)]
+            F_SETFD => Self::SETFD(FileDescriptorFlags::from_bits_truncate(arg as u32)),
+            F_GETFL => Self::GETFL,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
@@ -308,6 +346,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Access {
         pathname: Platform::RawConstPointer<i8>,
         mode: AccessFlags,
+    },
+    Fcntl {
+        fd: i32,
+        arg: FcntlArg,
     },
     Getcwd {
         buf: Platform::RawMutPointer<u8>,
