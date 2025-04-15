@@ -247,13 +247,12 @@ impl litebox::platform::RawMutex for RawMutex {
             &self.num_to_wake_up,
             FutexOperation::Requeue,
             /* number to wake up */ 0,
-            /* number to requeue */ u32::MAX,
+            /* number to requeue */ i32::MAX as u32,
             Some(&temp_q),
             /* val3: ignored */ 0,
         ) {
-            0 => {
-                // Since we didn't ask for anyone to wake up, this should just move everyone over,
-                // and tell us no one was woken up.
+            0.. => {
+                // On success, returns the number of tasks requeued or woken, which we ignore
             }
             _ => unreachable!(),
         }
@@ -272,25 +271,30 @@ impl litebox::platform::RawMutex for RawMutex {
 
         // Now we can actually wake them up; if anyone is left unwoken though, we should move them
         // back into the main queue.
-        let num_woken_up = futex_val2(
+        let num_woken_or_requeued = futex_val2(
             &temp_q,
             FutexOperation::Requeue,
             /* number to wake up */ n,
-            /* number to requeue */ u32::MAX,
+            /* number to requeue */ i32::MAX as u32,
             Some(&self.num_to_wake_up),
             /* val3: ignored */ 0,
         );
+        if num_woken_or_requeued < 0 {
+            unreachable!()
+        }
+        let num_woken_up = core::cmp::min(n, u32::try_from(num_woken_or_requeued).unwrap());
 
         // Unlock the lock bits, allowing other wakers to run.
-        let final_num_to_wake_up = self.num_to_wake_up.swap(0, SeqCst);
-
-        // Confirm that no one has clobbered the lock bits (which would indicate an implementation
-        // failure somewhere).
-        assert_eq!(
-            final_num_to_wake_up >> 30,
-            0b11,
-            "lock bits should remain unclobbered"
-        );
+        let remain = (0b11 << 30) | (n - num_woken_up);
+        while let Err(v) = self
+            .num_to_wake_up
+            .compare_exchange(remain, 0, SeqCst, SeqCst)
+        {
+            // Confirm that no one has clobbered the lock bits (which would indicate an implementation
+            // failure somewhere).
+            debug_assert_eq!(v >> 30, 0b11, "lock bits should remain unclobbered");
+            core::hint::spin_loop();
+        }
 
         // Return the number that were actually woken up
         num_woken_up.try_into().unwrap()
@@ -589,5 +593,31 @@ impl litebox::platform::StdioProvider for LinuxUserland {
             StdioStream::Stdout => std::io::stdout().is_terminal(),
             StdioStream::Stderr => std::io::stderr().is_terminal(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::AtomicU32;
+    use std::thread::sleep;
+
+    use litebox::platform::RawMutex;
+
+    extern crate std;
+
+    #[test]
+    fn test_raw_mutex() {
+        let mutex = std::sync::Arc::new(super::RawMutex {
+            inner: AtomicU32::new(0),
+            num_to_wake_up: AtomicU32::new(0),
+        });
+
+        let copied_mutex = mutex.clone();
+        std::thread::spawn(move || {
+            sleep(core::time::Duration::from_millis(500));
+            copied_mutex.wake_many(10);
+        });
+
+        assert!(mutex.block(0).is_ok());
     }
 }
