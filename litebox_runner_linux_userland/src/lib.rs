@@ -75,6 +75,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         };
         (modes, data)
     };
+    let tar_data = if let Some(tar_file) = cli_args.initial_files.as_ref() {
+        if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
+            anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
+        }
+        std::fs::read(tar_file)
+            .map_err(|e| anyhow!("Could not read tar file at {}: {}", tar_file.display(), e))?
+    } else {
+        litebox::fs::tar_ro::empty_tar_file()
+    };
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     //
@@ -114,15 +123,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
             fs.close(fd).unwrap();
         });
-        let tar_data = if let Some(tar_file) = cli_args.initial_files.as_ref() {
-            if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
-                anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
-            }
-            std::fs::read(tar_file)
-                .map_err(|e| anyhow!("Could not read tar file at {}: {}", tar_file.display(), e))?
-        } else {
-            litebox::fs::tar_ro::empty_tar_file()
-        };
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(&*platform, tar_data);
         let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&*platform);
         litebox::fs::layered::FileSystem::new(
