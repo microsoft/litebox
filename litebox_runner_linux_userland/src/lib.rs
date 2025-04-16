@@ -56,8 +56,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     }
 
-    // NOTE: We need to grab this info before initializing the platform, because that installs in
-    // hooks that will start taking control of the syscalls being run.
     let (ancestor_modes, prog_data): (Vec<litebox::fs::Mode>, Vec<u8>) = {
         let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
         let ancestors: Vec<_> = prog.ancestors().collect();
@@ -93,7 +91,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let platform = Box::leak(Box::new(Platform::new(
         None,
         litebox::platform::trivial_providers::ImpossiblePunchthroughProvider {},
-        litebox_shim_linux::syscall_entry,
     )));
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(&*platform);
@@ -139,6 +136,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
     litebox_shim_linux::set_fs(initial_file_system);
     litebox_platform_multiplex::set_platform(platform);
+    platform.enable_syscall_interception_with(litebox_shim_linux::syscall_entry);
 
     let argv = cli_args
         .program_and_arguments

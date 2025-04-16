@@ -31,7 +31,6 @@ pub fn init_platform() {
     let platform = Box::leak(Box::new(Platform::new(
         None,
         ImpossiblePunchthroughProvider {},
-        syscall_entry,
     )));
     set_platform(&*platform);
     let platform = litebox_platform_multiplex::platform();
@@ -55,6 +54,7 @@ pub fn init_platform() {
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     ));
+    platform.enable_syscall_interception_with(syscall_entry);
 
     // set up stdin, stdout, and stderr
     assert_eq!(
