@@ -154,14 +154,14 @@ impl<T> Consumer<T> {
         }
 
         let read_len = self.endpoint.rb.lock().pop_slice(buf);
-
-        if self.is_peer_shutdown() {
-            return Ok(read_len);
-        }
-
         if read_len > 0 {
             Ok(read_len)
         } else {
+            if self.is_peer_shutdown() {
+                // Note: we need to read again to ensure no data sent between `pop_slice`
+                // and `is_peer_shutdown` are lost.
+                return Ok(self.endpoint.rb.lock().pop_slice(buf));
+            }
             Err(Errno::EAGAIN)
         }
     }
@@ -255,6 +255,7 @@ mod tests {
                 i += ret;
             }
             prod.shutdown();
+            assert_eq!(i, data.len());
         });
 
         let mut buf = [0; 10];
@@ -298,6 +299,7 @@ mod tests {
                 }
             }
             prod.shutdown();
+            assert_eq!(i, data.len());
         });
 
         let mut buf = [0; 10];
