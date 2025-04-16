@@ -192,15 +192,12 @@ pub extern "C" fn close(fd: i32) -> i32 {
 pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
     let res: Result<usize, Errno> = match request {
         SyscallRequest::Read { fd, buf, count } => {
-            isize::try_from(count)
-                .map_err(|_| Errno::EINVAL)
-                .and_then(|count| {
-                    buf.mutate_subslice_with(..count, |user_buf| {
-                        // TODO: use kernel buffer to avoid page faults
-                        syscalls::file::sys_read(fd, user_buf, None)
-                    })
-                    .unwrap_or(Err(Errno::EFAULT))
-                })
+            let mut kernel_buf = vec![0u8; count];
+            syscalls::file::sys_read(fd, &mut kernel_buf, None).and_then(|size| {
+                buf.copy_from_slice(0, &kernel_buf[..size])
+                    .map(|()| size)
+                    .ok_or(Errno::EFAULT)
+            })
         }
         SyscallRequest::Write { fd, buf, count } => match unsafe { buf.to_cow_slice(count) } {
             Some(buf) => syscalls::file::sys_write(fd, &buf, None),
@@ -213,15 +210,12 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
             count,
             offset,
         } => {
-            isize::try_from(count)
-                .map_err(|_| Errno::EINVAL)
-                .and_then(|count| {
-                    buf.mutate_subslice_with(..count, |user_buf| {
-                        // TODO: use kernel buffer to avoid page faults
-                        syscalls::file::sys_pread64(fd, user_buf, offset)
-                    })
-                    .unwrap_or(Err(Errno::EFAULT))
-                })
+            let mut kernel_buf = vec![0u8; count];
+            syscalls::file::sys_pread64(fd, &mut kernel_buf, offset).and_then(|size| {
+                buf.copy_from_slice(0, &kernel_buf[..size])
+                    .map(|()| size)
+                    .ok_or(Errno::EFAULT)
+            })
         }
         SyscallRequest::Pwrite64 {
             fd,
@@ -252,50 +246,39 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
             })
         }
         SyscallRequest::Fcntl { fd, arg } => syscalls::file::sys_fcntl(fd, arg).map(|v| v as usize),
-        SyscallRequest::Getcwd { buf, size } => {
-            isize::try_from(size)
-                .map_err(|_| Errno::EINVAL)
-                .and_then(|size| {
-                    buf.mutate_subslice_with(..size, |user_buf| {
-                        // TODO: use kernel buffer to avoid page faults
-                        syscalls::file::sys_getcwd(user_buf)
-                    })
-                    .unwrap_or(Err(Errno::EFAULT))
-                })
+        SyscallRequest::Getcwd { buf, size: count } => {
+            let mut kernel_buf = vec![0u8; count];
+            syscalls::file::sys_getcwd(&mut kernel_buf).and_then(|size| {
+                buf.copy_from_slice(0, &kernel_buf[..size])
+                    .map(|()| size)
+                    .ok_or(Errno::EFAULT)
+            })
         }
         SyscallRequest::Readlink {
             pathname,
             buf,
             bufsiz,
-        } => {
-            pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                let Ok(size) = isize::try_from(bufsiz) else {
-                    return Err(Errno::EINVAL);
-                };
-                buf.mutate_subslice_with(..size, |user_buf| {
-                    // TODO: use kernel buffer to avoid page faults
-                    syscalls::file::sys_readlink(path, user_buf)
-                })
-                .unwrap_or(Err(Errno::EFAULT))
+        } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+            let mut kernel_buf = vec![0u8; bufsiz];
+            syscalls::file::sys_readlink(path, &mut kernel_buf).and_then(|size| {
+                buf.copy_from_slice(0, &kernel_buf[..size])
+                    .map(|()| size)
+                    .ok_or(Errno::EFAULT)
             })
-        }
+        }),
         SyscallRequest::Readlinkat {
             dirfd,
             pathname,
             buf,
             bufsiz,
-        } => {
-            pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                let Ok(size) = isize::try_from(bufsiz) else {
-                    return Err(Errno::EINVAL);
-                };
-                buf.mutate_subslice_with(..size, |user_buf| {
-                    // TODO: use kernel buffer to avoid page faults
-                    syscalls::file::sys_readlinkat(dirfd, path, user_buf)
-                })
-                .unwrap_or(Err(Errno::EFAULT))
+        } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+            let mut kernel_buf = vec![0u8; bufsiz];
+            syscalls::file::sys_readlinkat(dirfd, path, &mut kernel_buf).and_then(|size| {
+                buf.copy_from_slice(0, &kernel_buf[..size])
+                    .map(|()| size)
+                    .ok_or(Errno::EFAULT)
             })
-        }
+        }),
         SyscallRequest::Openat {
             dirfd,
             pathname,

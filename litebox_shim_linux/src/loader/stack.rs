@@ -140,9 +140,7 @@ impl UserStack {
     fn push_bytes(&mut self, bytes: &[u8]) -> Option<()> {
         let end = isize::try_from(self.pos).ok()?;
         self.pos = self.pos.checked_sub(bytes.len())?;
-        let begin = isize::try_from(self.pos).ok()?;
-        self.stack_top
-            .mutate_subslice_with(begin..end, |s| s.copy_from_slice(bytes))?;
+        self.stack_top.copy_from_slice(self.pos, bytes)?;
         Some(())
     }
 

@@ -1,6 +1,6 @@
 //! Implementation of file related syscalls, e.g., `open`, `read`, `write`, etc.
 
-use alloc::ffi::CString;
+use alloc::{ffi::CString, vec};
 use litebox::{
     fs::{FileSystem as _, Mode, OFlags},
     path,
@@ -169,6 +169,7 @@ pub fn sys_readv(
     let locked_file_descriptors = file_descriptors().read();
     let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
     let mut total_read = 0;
+    let mut kernel_buffer = vec![0u8; iovs.iter().map(|i| i.iov_len).max().unwrap_or_default()];
     for iov in iovs {
         if iov.iov_len == 0 {
             continue;
@@ -176,22 +177,18 @@ pub fn sys_readv(
         let Ok(iov_len) = isize::try_from(iov.iov_len) else {
             return Err(Errno::EINVAL);
         };
-        // TODO: use kernel buffer to avoid page faults
-        let size = iov
-            .iov_base
-            .mutate_subslice_with(..iov_len, |user_buf| {
-                // TODO: The data transfers performed by readv() and writev() are atomic: the data
-                // written by writev() is written as a single block that is not intermingled with
-                // output from writes in other processes
-                match desc {
-                    Descriptor::File(file) => {
-                        litebox_fs().read(file, user_buf, None).map_err(Errno::from)
-                    }
-                    Descriptor::Socket(socket) => todo!(),
-                }
-            })
-            .ok_or(Errno::EFAULT)??;
-
+        // TODO: The data transfers performed by readv() and writev() are atomic: the data
+        // written by writev() is written as a single block that is not intermingled with
+        // output from writes in other processes
+        let size = match desc {
+            Descriptor::File(file) => litebox_fs()
+                .read(file, &mut kernel_buffer, None)
+                .map_err(Errno::from)?,
+            Descriptor::Socket(socket) => todo!(),
+        };
+        iov.iov_base
+            .copy_from_slice(0, &kernel_buffer[..size])
+            .ok_or(Errno::EFAULT)?;
         total_read += size;
         if size < iov.iov_len {
             // Okay to transfer fewer bytes than requested

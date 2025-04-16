@@ -433,6 +433,27 @@ where
         range: impl core::ops::RangeBounds<isize>,
         f: impl FnOnce(&mut [T]) -> R,
     ) -> Option<R>;
+
+    /// Copy in a slice at the pointer offset.
+    ///
+    /// Returns `None` without copying if the provided pointer is invalid, or such a slice is known
+    /// (in advance) to be invalid.
+    ///
+    /// This is essentially just a convenience wrapper around [`Self::mutate_subslice_with`], that
+    /// makes it easier to notice and prevent some hazards that can come from
+    /// `mutate_subslice_with`, by making sure kernel buffers are used before copying things in.
+    #[must_use]
+    fn copy_from_slice(self, start_offset: usize, buf: &[T]) -> Option<()>
+    where
+        T: Copy,
+    {
+        let start: isize = start_offset.try_into().ok()?;
+        let end = start.checked_add_unsigned(buf.len())?;
+        self.mutate_subslice_with(start..end, |x| {
+            debug_assert_eq!(x.len(), buf.len());
+            x.copy_from_slice(buf);
+        })
+    }
 }
 
 /// A non-exhaustive list of errors that can be thrown by [`StdioProvider::read_from_stdin`].
