@@ -187,12 +187,19 @@ pub extern "C" fn close(fd: i32) -> i32 {
     syscalls::file::sys_close(fd).map_or_else(Errno::as_neg, |()| 0)
 }
 
+// This places size limits on maximum read/write sizes that might occur; it exists primarily to
+// prevent OOM due to the user asking for a _massive_ read or such at once. Keeping this too small
+// has the downside of requiring too many syscalls, while having it be too large allows for massive
+// allocations to be triggered by the userland program. For now, this is set to a
+// hopefully-reasonable middle ground.
+const MAX_KERNEL_BUF_SIZE: usize = 64 * 1024;
+
 /// Entry point for the syscall handler
 #[allow(clippy::too_many_lines)]
 pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
     let res: Result<usize, Errno> = match request {
         SyscallRequest::Read { fd, buf, count } => {
-            let mut kernel_buf = vec![0u8; count];
+            let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
             syscalls::file::sys_read(fd, &mut kernel_buf, None).and_then(|size| {
                 buf.copy_from_slice(0, &kernel_buf[..size])
                     .map(|()| size)
@@ -210,7 +217,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
             count,
             offset,
         } => {
-            let mut kernel_buf = vec![0u8; count];
+            let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
             syscalls::file::sys_pread64(fd, &mut kernel_buf, offset).and_then(|size| {
                 buf.copy_from_slice(0, &kernel_buf[..size])
                     .map(|()| size)
@@ -247,7 +254,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
         }
         SyscallRequest::Fcntl { fd, arg } => syscalls::file::sys_fcntl(fd, arg).map(|v| v as usize),
         SyscallRequest::Getcwd { buf, size: count } => {
-            let mut kernel_buf = vec![0u8; count];
+            let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
             syscalls::file::sys_getcwd(&mut kernel_buf).and_then(|size| {
                 buf.copy_from_slice(0, &kernel_buf[..size])
                     .map(|()| size)
@@ -259,7 +266,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
             buf,
             bufsiz,
         } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-            let mut kernel_buf = vec![0u8; bufsiz];
+            let mut kernel_buf = vec![0u8; bufsiz.min(MAX_KERNEL_BUF_SIZE)];
             syscalls::file::sys_readlink(path, &mut kernel_buf).and_then(|size| {
                 buf.copy_from_slice(0, &kernel_buf[..size])
                     .map(|()| size)
@@ -272,7 +279,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
             buf,
             bufsiz,
         } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-            let mut kernel_buf = vec![0u8; bufsiz];
+            let mut kernel_buf = vec![0u8; bufsiz.min(MAX_KERNEL_BUF_SIZE)];
             syscalls::file::sys_readlinkat(dirfd, path, &mut kernel_buf).and_then(|size| {
                 buf.copy_from_slice(0, &kernel_buf[..size])
                     .map(|()| size)

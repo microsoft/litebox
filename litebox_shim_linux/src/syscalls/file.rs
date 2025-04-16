@@ -169,7 +169,14 @@ pub fn sys_readv(
     let locked_file_descriptors = file_descriptors().read();
     let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
     let mut total_read = 0;
-    let mut kernel_buffer = vec![0u8; iovs.iter().map(|i| i.iov_len).max().unwrap_or_default()];
+    let mut kernel_buffer = vec![
+        0u8;
+        iovs.iter()
+            .map(|i| i.iov_len)
+            .max()
+            .unwrap_or_default()
+            .min(super::super::MAX_KERNEL_BUF_SIZE)
+    ];
     for iov in iovs {
         if iov.iov_len == 0 {
             continue;
