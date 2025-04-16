@@ -379,22 +379,19 @@ pub fn sys_newfstatat(
     }
 
     let fs_path = FsPath::new(dirfd, pathname)?;
-    match fs_path {
-        FsPath::Absolute { path } | FsPath::CwdRelative { path } => litebox_fs()
-            .file_status(path)
-            .map(FileStat::from)
-            .map_err(Errno::from),
-        FsPath::Cwd => litebox_fs()
-            .file_status("")
-            .map(FileStat::from)
-            .map_err(Errno::from),
+    let fstat: FileStat = match fs_path {
+        FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
+            litebox_fs().file_status(path)?.into()
+        }
+        FsPath::Cwd => litebox_fs().file_status("")?.into(),
         FsPath::Fd(fd) => file_descriptors()
             .read()
             .get_fd(fd)
             .ok_or(Errno::EBADF)
-            .and_then(Descriptor::stat),
+            .and_then(Descriptor::stat)?,
         FsPath::FdRelative { fd, path } => todo!(),
-    }
+    };
+    Ok(fstat)
 }
 
 pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
