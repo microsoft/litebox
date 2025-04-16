@@ -1,3 +1,6 @@
+//! This module implements a unidirectional communication channel, intended to implement IPC,
+//! e.g., pipe, unix domain sockets, etc.
+
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use alloc::sync::{Arc, Weak};
@@ -70,6 +73,7 @@ macro_rules! common_functions_for_channel {
 pub(crate) struct Producer<T> {
     endpoint: EndPointer<HeapProd<T>>,
     peer: spin::Once<Weak<Consumer<T>>>,
+    /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
     status: AtomicU32,
 }
 
@@ -192,12 +196,15 @@ impl<T> Drop for Consumer<T> {
     }
 }
 
+/// A unidirectional communication channel, intended to implement IPC, e.g., pipe,
+/// unix domain sockets, etc.
 pub(crate) struct Channel<T> {
     prod: Arc<Producer<T>>,
     cons: Arc<Consumer<T>>,
 }
 
 impl<T> Channel<T> {
+    /// Creates a new channel with the given capacity and flags.
     pub(crate) fn new(capacity: usize, flags: OFlags, platform: &'static Platform) -> Self {
         let rb: HeapRb<T> = HeapRb::new(capacity);
         let (rb_prod, rb_cons) = rb.split();

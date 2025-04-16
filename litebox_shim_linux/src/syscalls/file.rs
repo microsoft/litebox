@@ -443,6 +443,7 @@ pub fn sys_getcwd(buf: &mut [u8]) -> Result<usize, Errno> {
 }
 
 const DEFAULT_PIPE_BUF_SIZE: usize = 1024 * 1024;
+/// Handle syscall `pipe2`
 pub fn sys_pipe2(flags: OFlags) -> Result<(u32, u32), Errno> {
     if flags.contains((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement()) {
         return Err(Errno::EINVAL);
