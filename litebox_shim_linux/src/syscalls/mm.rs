@@ -76,16 +76,9 @@ fn do_mmap_file(
             if size == 0 {
                 break;
             }
-            let start = isize::try_from(copied).unwrap();
-            ptr.mutate_subslice_with(
-                start..start.checked_add_unsigned(size).unwrap(),
-                |user_buf| {
-                    // TODO: implement [`memcpy`](https://elixir.bootlin.com/linux/v5.19.17/source/arch/x86/lib/memcpy_64.S#L30)
-                    // to return EFAULT if the user buffer is not valid
-                    user_buf.copy_from_slice(&buffer[..size]);
-                },
-            )
-            .unwrap();
+            // TODO: implement [`memcpy`](https://elixir.bootlin.com/linux/v5.19.17/source/arch/x86/lib/memcpy_64.S#L30)
+            // to return EFAULT if the user buffer is not valid
+            ptr.copy_from_slice(copied, &buffer[..size]).unwrap();
             copied += size;
             file_offset += size;
         }
