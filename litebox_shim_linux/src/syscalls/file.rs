@@ -347,7 +347,7 @@ pub fn sys_stat(pathname: impl path::Arg) -> Result<FileStat, Errno> {
 
 /// Handle syscall `lstat`
 ///
-/// lstat() is identical to stat(), except that if pathname is a symbolic link,
+/// `lstat` is identical to `stat`, except that if `pathname` is a symbolic link,
 /// then it returns information about the link itself, not the file that the link refers to.
 /// TODO: we do not support symbolic links yet.
 pub fn sys_lstat(pathname: impl path::Arg) -> Result<FileStat, Errno> {
