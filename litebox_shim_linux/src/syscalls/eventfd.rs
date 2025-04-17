@@ -107,11 +107,11 @@ mod tests {
     extern crate std;
 
     fn init_platform() {
-        let syscall_entry: Option<
-            fn(litebox_common_linux::SyscallRequest<litebox_platform_multiplex::Platform>) -> i64,
-        > = None;
-        let platform = Platform::new(None, ImpossiblePunchthroughProvider {}, syscall_entry);
-        set_platform(platform);
+        let platform = alloc::boxed::Box::leak(alloc::boxed::Box::new(Platform::new(
+            None,
+            ImpossiblePunchthroughProvider {},
+        )));
+        set_platform(&*platform);
     }
 
     #[test]
@@ -175,9 +175,7 @@ mod tests {
             copied_eventfd.write(1, true).unwrap();
             // block until the first read finishes
             while let Err(e) = copied_eventfd.write(u64::MAX - 1, true) {
-                if e != Errno::EAGAIN {
-                    panic!("Unexpected error: {:?}", e);
-                }
+                assert_eq!(e, Errno::EAGAIN, "Unexpected error: {e:?}");
                 core::hint::spin_loop();
             }
         });
