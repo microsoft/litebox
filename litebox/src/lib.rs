@@ -24,6 +24,7 @@ pub mod mm;
 pub mod net;
 pub mod path;
 pub mod platform;
+pub mod subsystem_manager;
 pub mod sync;
 
 // Explicitly-private, the utilities are not exposed to users of LiteBox, and are intended entirely
@@ -32,3 +33,5 @@ mod utilities;
 
 // Public utilities that might be used in other LiteBox crates.
 pub mod utils;
+
+pub use subsystem_manager::LiteBox;
