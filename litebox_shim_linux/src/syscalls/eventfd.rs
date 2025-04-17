@@ -100,9 +100,9 @@ impl<'platform, Platform: RawSyncPrimitivesProvider> EventFile<'platform, Platfo
 
 #[cfg(test)]
 mod tests {
-    use litebox::{platform::trivial_providers::ImpossiblePunchthroughProvider};
-    use litebox_common_linux::EfdFlags;
-    use litebox_platform_multiplex::{set_platform, Platform};
+    use litebox::platform::trivial_providers::ImpossiblePunchthroughProvider;
+    use litebox_common_linux::{EfdFlags, errno::Errno};
+    use litebox_platform_multiplex::{Platform, set_platform};
 
     extern crate std;
 
@@ -118,7 +118,11 @@ mod tests {
     fn test_semaphore_eventfd() {
         init_platform();
 
-        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::SEMAPHORE, litebox_platform_multiplex::platform()));
+        let eventfd = alloc::sync::Arc::new(super::EventFile::new(
+            0,
+            EfdFlags::SEMAPHORE,
+            litebox_platform_multiplex::platform(),
+        ));
         let total = 8;
         for _ in 0..total {
             let copied_eventfd = eventfd.clone();
@@ -135,7 +139,11 @@ mod tests {
     fn test_blocking_eventfd() {
         init_platform();
 
-        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::empty(), litebox_platform_multiplex::platform()));
+        let eventfd = alloc::sync::Arc::new(super::EventFile::new(
+            0,
+            EfdFlags::empty(),
+            litebox_platform_multiplex::platform(),
+        ));
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
             copied_eventfd.write(1, false).unwrap();
@@ -143,7 +151,6 @@ mod tests {
             copied_eventfd.write(u64::MAX - 1, false).unwrap();
         });
 
-        let mut buf = [0; 8];
         // block until the first write
         let ret = eventfd.read(false).unwrap();
         assert_eq!(ret, 1);
@@ -157,21 +164,46 @@ mod tests {
     fn test_nonblocking_eventfd() {
         init_platform();
 
-        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::NONBLOCK, litebox_platform_multiplex::platform()));
+        let eventfd = alloc::sync::Arc::new(super::EventFile::new(
+            0,
+            EfdFlags::NONBLOCK,
+            litebox_platform_multiplex::platform(),
+        ));
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
-            copied_eventfd.write(1, false).unwrap();
+            // first write should succeed immediately
+            copied_eventfd.write(1, true).unwrap();
             // block until the first read finishes
-            copied_eventfd.write(u64::MAX - 1, false).unwrap();
+            while let Err(e) = copied_eventfd.write(u64::MAX - 1, true) {
+                if e != Errno::EAGAIN {
+                    panic!("Unexpected error: {:?}", e);
+                }
+                core::hint::spin_loop();
+            }
         });
 
-        let mut buf = [0; 8];
-        // block until the first write
-        let ret = eventfd.read(false).unwrap();
-        assert_eq!(ret, 1);
+        let read = |eventfd: &super::EventFile<litebox_platform_multiplex::Platform>,
+                    expected_value: u64| {
+            loop {
+                match eventfd.read(true) {
+                    Ok(ret) => {
+                        assert_eq!(ret, expected_value);
+                        break;
+                    }
+                    Err(Errno::EAGAIN) => {
+                        // busy wait
+                        // TODO: use poll rather than busy wait
+                    }
+                    Err(e) => panic!("Unexpected error: {:?}", e),
+                }
+                core::hint::spin_loop();
+            }
+        };
 
+        // block until the first write
+        read(&eventfd, 1);
+        // std::thread::sleep(core::time::Duration::from_millis(100));
         // block until the second write
-        let ret = eventfd.read(false).unwrap();
-        assert_eq!(ret, u64::MAX - 1);
+        read(&eventfd, u64::MAX - 1);
     }
 }
