@@ -37,7 +37,7 @@ compile_error!(
 #[cfg(feature = "platform_linux_userland")]
 pub type Platform = litebox_platform_linux_userland::LinuxUserland;
 
-static PLATFORM: once_cell::race::OnceBox<Platform> = once_cell::race::OnceBox::new();
+static PLATFORM: once_cell::race::OnceBox<&'static Platform> = once_cell::race::OnceBox::new();
 
 /// Initialize the shim by providing a [LiteBox platform](../litebox/platform/index.html).
 ///
@@ -51,7 +51,7 @@ static PLATFORM: once_cell::race::OnceBox<Platform> = once_cell::race::OnceBox::
     clippy::match_wild_err_arm,
     reason = "the platform itself is not Debug thus we cannot use `expect`"
 )]
-pub fn set_platform(platform: Platform) {
+pub fn set_platform(platform: &'static Platform) {
     match PLATFORM.set(alloc::boxed::Box::new(platform)) {
         Ok(()) => {}
         Err(_) => panic!("set_platform should only be called once per crate"),

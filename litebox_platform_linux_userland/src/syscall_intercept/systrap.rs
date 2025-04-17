@@ -337,7 +337,7 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             };
             SyscallRequest::Ret(ret)
         }
-        _ => todo!(),
+        _ => todo!("Currently unimplemented syscall: {syscall_number}"),
     };
     let ret = if let SyscallRequest::Ret(v) = dispatcher {
         v

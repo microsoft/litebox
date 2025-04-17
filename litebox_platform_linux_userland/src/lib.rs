@@ -23,6 +23,7 @@ mod syscall_intercept;
 pub struct LinuxUserland<PunchthroughProvider: litebox::platform::PunchthroughProvider = litebox::platform::trivial_providers::ImpossiblePunchthroughProvider> {
     tun_socket_fd: Option<std::os::fd::OwnedFd>,
     punchthrough_provider: PunchthroughProvider,
+    interception_enabled: std::sync::atomic::AtomicBool,
 }
 
 impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
@@ -33,22 +34,10 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     /// Takes an optional tun device name (such as `"tun0"` or `"tun99"`) to connect networking (if
     /// not specified, networking is disabled).
     ///
-    /// Registers `syscall_handler` to handle all intercepted syscalls.
-    ///
     /// # Panics
     ///
     /// Panics if the tun device could not be successfully opened.
-    pub fn new(
-        tun_device_name: Option<&str>,
-        punchthrough_provider: PunchthroughProvider,
-        syscall_handler: impl Fn(litebox_common_linux::SyscallRequest<LinuxUserland>) -> i64
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        // TODO: have better signature and registration of the syscall handler.
-        syscall_intercept::init_sys_intercept(syscall_handler);
-
+    pub fn new(tun_device_name: Option<&str>, punchthrough_provider: PunchthroughProvider) -> Self {
         let tun_socket_fd = tun_device_name.map(|tun_device_name| {
             let tun_fd = nix::fcntl::open(
                 "/dev/net/tun",
@@ -87,7 +76,34 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
         Self {
             tun_socket_fd,
             punchthrough_provider,
+            interception_enabled: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Register `syscall_handler` to handle all intercepted syscalls.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this function has already been invoked on the platform earlier.
+    pub fn enable_syscall_interception_with(
+        &self,
+        syscall_handler: impl Fn(litebox_common_linux::SyscallRequest<LinuxUserland>) -> i64
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        assert!(
+            self.interception_enabled
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst
+                )
+                .is_ok()
+        );
+        // TODO: have better signature and registration of the syscall handler.
+        syscall_intercept::init_sys_intercept(syscall_handler);
     }
 }
 
