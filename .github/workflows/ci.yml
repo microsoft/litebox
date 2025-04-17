@@ -74,13 +74,22 @@ jobs:
           #   more precise check, but as long as we are tracking the underlying
           #   platforms, we are unlikely to hit any significant issues here.
           #
+          # - `litebox_runner_linux_userland` is allowed to have `std` access
+          #   since it needs to actually access the file-system, pull in
+          #   relevant files, and then actually trigger LiteBox itself.
+          #
           # - `litebox_shim_linux` (in its default feature set) depends on
           #   `litebox_platform_multiplex`; similarly, ideally we'd do a more
           #   precise check.
+          #
+          # - `litebox_syscall_rewriter` is allowed to have `std` access since
+          #   it is a helper binary that runs in userland to AOT "compile" ELFs.
           find . -type f -name 'Cargo.toml' \
             -not -path './Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
             -not -path './litebox_platform_multiplex/Cargo.toml' \
+            -not -path './litebox_runner_linux_userland/Cargo.toml' \
             -not -path './litebox_shim_linux/Cargo.toml' \
+            -not -path './litebox_syscall_rewriter/Cargo.toml' \
             -print0 | \
               xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --target x86_64-unknown-none || exit 1; echo; echo'
