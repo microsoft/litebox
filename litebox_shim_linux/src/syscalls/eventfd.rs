@@ -202,7 +202,6 @@ mod tests {
 
         // block until the first write
         read(&eventfd, 1);
-        // std::thread::sleep(core::time::Duration::from_millis(100));
         // block until the second write
         read(&eventfd, u64::MAX - 1);
     }
