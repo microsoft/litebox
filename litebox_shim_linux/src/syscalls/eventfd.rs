@@ -65,6 +65,7 @@ impl<'platform, Platform: RawSyncPrimitivesProvider> EventFile<'platform, Platfo
                     Err(Errno::EAGAIN) => {}
                     ret => return ret,
                 }
+                core::hint::spin_loop();
             }
         }
     }
@@ -93,6 +94,7 @@ impl<'platform, Platform: RawSyncPrimitivesProvider> EventFile<'platform, Platfo
                     Err(Errno::EAGAIN) => {}
                     ret => return ret,
                 }
+                core::hint::spin_loop();
             }
         }
     }
