@@ -82,4 +82,5 @@ jobs:
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
             -not -path './litebox_platform_multiplex/Cargo.toml' \
             -not -path './litebox_shim_linux/Cargo.toml' \
-            -execdir sh -c 'pwd; cargo build --target x86_64-unknown-none; echo; echo' \;
+            -print0 | \
+              xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --target x86_64-unknown-none || exit 1; echo; echo'
