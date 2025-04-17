@@ -244,11 +244,11 @@ mod tests {
     extern crate std;
 
     fn init_platform() {
-        let syscall_entry: Option<
-            fn(litebox_common_linux::SyscallRequest<litebox_platform_multiplex::Platform>) -> i64,
-        > = None;
-        let platform = Platform::new(None, ImpossiblePunchthroughProvider {}, syscall_entry);
-        set_platform(platform);
+        let platform = alloc::boxed::Box::leak(alloc::boxed::Box::new(Platform::new(
+            None,
+            ImpossiblePunchthroughProvider {},
+        )));
+        set_platform(&*platform);
     }
 
     #[test]
