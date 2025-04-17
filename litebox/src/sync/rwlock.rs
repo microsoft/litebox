@@ -398,8 +398,22 @@ pub struct RwLockReadGuard<'a, Platform: RawSyncPrimitivesProvider, T> {
     locked_witness: LockedWitness<Platform>,
 }
 
+pub struct MappedRwLockReadGuard<'a, Platform: RawSyncPrimitivesProvider, T> {
+    data: core::ptr::NonNull<T>,
+    raw_lock: &'a RawRwLock<Platform>,
+    #[cfg(feature = "lock_tracing")]
+    locked_witness: LockedWitness<Platform>,
+}
+
 pub struct RwLockWriteGuard<'a, Platform: RawSyncPrimitivesProvider, T> {
     rwlock: &'a RwLock<Platform, T>,
+    #[cfg(feature = "lock_tracing")]
+    locked_witness: LockedWitness<Platform>,
+}
+
+pub struct MappedRwLockWriteGuard<'a, Platform: RawSyncPrimitivesProvider, T> {
+    data: core::ptr::NonNull<T>,
+    raw_lock: &'a RawRwLock<Platform>,
     #[cfg(feature = "lock_tracing")]
     locked_witness: LockedWitness<Platform>,
 }
@@ -448,6 +462,110 @@ impl<Platform: RawSyncPrimitivesProvider, T> Drop for RwLockWriteGuard<'_, Platf
 
         unsafe {
             self.rwlock.raw.write_unlock();
+        }
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider, T> core::ops::Deref
+    for MappedRwLockReadGuard<'_, Platform, T>
+{
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe { self.data.as_ref() }
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider, T> Drop for MappedRwLockReadGuard<'_, Platform, T> {
+    fn drop(&mut self) {
+        #[cfg(feature = "lock_tracing")]
+        self.locked_witness.mark_unlock();
+
+        unsafe {
+            self.raw_lock.read_unlock();
+        }
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider, T> core::ops::Deref
+    for MappedRwLockWriteGuard<'_, Platform, T>
+{
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe { self.data.as_ref() }
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider, T> core::ops::DerefMut
+    for MappedRwLockWriteGuard<'_, Platform, T>
+{
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { self.data.as_mut() }
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider, T> Drop for MappedRwLockWriteGuard<'_, Platform, T> {
+    fn drop(&mut self) {
+        #[cfg(feature = "lock_tracing")]
+        self.locked_witness.mark_unlock();
+
+        unsafe {
+            self.raw_lock.write_unlock();
+        }
+    }
+}
+
+impl<'a, Platform: RawSyncPrimitivesProvider, T> RwLockReadGuard<'a, Platform, T> {
+    /// Makes a `MappedRwLockReadGuard` for a component of the borrowed data, e.g. an enum variant.
+    ///
+    /// The `RwLock` is already locked for reading, so this cannot fail.
+    ///
+    /// This is an associated function that needs to be used as `RwLockReadGuard::map(...)`. A
+    /// method would interfere with methods of the same name on the contents of the `RwLockReadGuard`
+    /// used through `Deref`.
+    pub fn map<U, F: FnOnce(&T) -> &U>(orig: Self, f: F) -> MappedRwLockReadGuard<'a, Platform, U> {
+        let data_t: *mut T = orig.rwlock.data.get();
+        let data_t: *const T = data_t;
+        // SAFETY: We are holding a read-lock to the underlying T, thus it is safe to dereference
+        // here. The reference to U has the same lifetime as that to T, and the lock will continue
+        // to be held to the right duration.
+        let data_u: &U = f(unsafe { &*data_t });
+        let data = core::ptr::NonNull::from(data_u);
+        let mut orig = core::mem::ManuallyDrop::new(orig);
+        MappedRwLockReadGuard {
+            data,
+            raw_lock: &orig.rwlock.raw,
+            #[cfg(feature = "lock_tracing")]
+            locked_witness: unsafe { orig.locked_witness.reborrow_for_mapped_guard() },
+        }
+    }
+}
+
+impl<'a, Platform: RawSyncPrimitivesProvider, T> RwLockWriteGuard<'a, Platform, T> {
+    /// Makes a `MappedRwLockWriteGuard` for a component of the borrowed data, e.g. an enum variant.
+    ///
+    /// The `RwLock` is already locked for writing, so this cannot fail.
+    ///
+    /// This is an associated function that needs to be used as `RwLockWriteGuard::map(...)`. A
+    /// method would interfere with methods of the same name on the contents of the `RwLockWriteGuard`
+    /// used through `Deref`/`DerefMut`.
+    pub fn map<U, F: FnOnce(&mut T) -> &mut U>(
+        orig: Self,
+        f: F,
+    ) -> MappedRwLockWriteGuard<'a, Platform, U> {
+        let data_t: *mut T = orig.rwlock.data.get();
+        // SAFETY: We are holding a write-lock to the underlying T, thus it is safe to dereference
+        // here. The reference to U has the same lifetime as that to T, and the lock will continue
+        // to be held to the right duration.
+        let data_u: &mut U = f(unsafe { &mut *data_t });
+        let data = core::ptr::NonNull::from(data_u);
+        let mut orig = core::mem::ManuallyDrop::new(orig);
+        MappedRwLockWriteGuard {
+            data,
+            raw_lock: &orig.rwlock.raw,
+            #[cfg(feature = "lock_tracing")]
+            locked_witness: unsafe { orig.locked_witness.reborrow_for_mapped_guard() },
         }
     }
 }
