@@ -1,3 +1,5 @@
+//! Event file for notification
+
 use core::sync::atomic::AtomicU32;
 
 use litebox::{
@@ -8,6 +10,7 @@ use litebox_common_linux::{EfdFlags, errno::Errno};
 
 pub(crate) struct EventFile<'platform, Platform: RawSyncPrimitivesProvider> {
     counter: litebox::sync::Mutex<'platform, Platform, u64>,
+    /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
     status: AtomicU32,
     semaphore: bool,
 }
@@ -43,13 +46,12 @@ impl<'platform, Platform: RawSyncPrimitivesProvider> EventFile<'platform, Platfo
 
     fn try_read(&self) -> Result<u64, Errno> {
         let mut counter = self.counter.lock();
-        let cur_value = *counter;
         if *counter == 0 {
             return Err(Errno::EAGAIN);
         }
 
-        let res = if self.semaphore { 1 } else { cur_value };
-        *counter = cur_value - res;
+        let res = if self.semaphore { 1 } else { *counter };
+        *counter -= res;
         Ok(res)
     }
 
@@ -70,6 +72,8 @@ impl<'platform, Platform: RawSyncPrimitivesProvider> EventFile<'platform, Platfo
     fn try_write(&self, value: u64) -> Result<usize, Errno> {
         let mut counter = self.counter.lock();
         if let Some(new_value) = (*counter).checked_add(value) {
+            // The maximum value that may be stored in the counter is the largest unsigned
+            // 64-bit value minus 1 (i.e., 0xfffffffffffffffe)
             if new_value != u64::MAX {
                 *counter = new_value;
                 return Ok(8);
@@ -91,5 +95,83 @@ impl<'platform, Platform: RawSyncPrimitivesProvider> EventFile<'platform, Platfo
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use litebox::{platform::trivial_providers::ImpossiblePunchthroughProvider};
+    use litebox_common_linux::EfdFlags;
+    use litebox_platform_multiplex::{set_platform, Platform};
+
+    extern crate std;
+
+    fn init_platform() {
+        let syscall_entry: Option<
+            fn(litebox_common_linux::SyscallRequest<litebox_platform_multiplex::Platform>) -> i64,
+        > = None;
+        let platform = Platform::new(None, ImpossiblePunchthroughProvider {}, syscall_entry);
+        set_platform(platform);
+    }
+
+    #[test]
+    fn test_semaphore_eventfd() {
+        init_platform();
+
+        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::SEMAPHORE, litebox_platform_multiplex::platform()));
+        let total = 8;
+        for _ in 0..total {
+            let copied_eventfd = eventfd.clone();
+            std::thread::spawn(move || {
+                copied_eventfd.read(false).unwrap();
+            });
+        }
+
+        std::thread::sleep(core::time::Duration::from_millis(500));
+        eventfd.write(total, false).unwrap();
+    }
+
+    #[test]
+    fn test_blocking_eventfd() {
+        init_platform();
+
+        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::empty(), litebox_platform_multiplex::platform()));
+        let copied_eventfd = eventfd.clone();
+        std::thread::spawn(move || {
+            copied_eventfd.write(1, false).unwrap();
+            // block until the first read finishes
+            copied_eventfd.write(u64::MAX - 1, false).unwrap();
+        });
+
+        let mut buf = [0; 8];
+        // block until the first write
+        let ret = eventfd.read(false).unwrap();
+        assert_eq!(ret, 1);
+
+        // block until the second write
+        let ret = eventfd.read(false).unwrap();
+        assert_eq!(ret, u64::MAX - 1);
+    }
+
+    #[test]
+    fn test_nonblocking_eventfd() {
+        init_platform();
+
+        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::NONBLOCK, litebox_platform_multiplex::platform()));
+        let copied_eventfd = eventfd.clone();
+        std::thread::spawn(move || {
+            copied_eventfd.write(1, false).unwrap();
+            // block until the first read finishes
+            copied_eventfd.write(u64::MAX - 1, false).unwrap();
+        });
+
+        let mut buf = [0; 8];
+        // block until the first write
+        let ret = eventfd.read(false).unwrap();
+        assert_eq!(ret, 1);
+
+        // block until the second write
+        let ret = eventfd.read(false).unwrap();
+        assert_eq!(ret, u64::MAX - 1);
     }
 }
