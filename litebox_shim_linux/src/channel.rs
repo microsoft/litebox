@@ -45,7 +45,7 @@ macro_rules! common_functions_for_channel {
         }
 
         pub fn is_peer_shutdown(&self) -> bool {
-            if let Some(peer) = self.peer.get().unwrap().upgrade() {
+            if let Some(peer) = self.peer.upgrade() {
                 peer.endpoint.is_shutdown()
             } else {
                 true
@@ -72,7 +72,7 @@ macro_rules! common_functions_for_channel {
 
 pub(crate) struct Producer<T> {
     endpoint: EndPointer<HeapProd<T>>,
-    peer: spin::Once<Weak<Consumer<T>>>,
+    peer: Weak<Consumer<T>>,
     /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
     status: AtomicU32,
 }
@@ -81,7 +81,7 @@ impl<T> Producer<T> {
     fn new(rb: HeapProd<T>, flags: OFlags, platform: &'static Platform) -> Self {
         Self {
             endpoint: EndPointer::new(rb, platform),
-            peer: spin::Once::new(),
+            peer: Weak::new(),
             status: AtomicU32::new((flags & OFlags::STATUS_FLAGS_MASK).bits()),
         }
     }
@@ -118,6 +118,7 @@ impl<T> Producer<T> {
                     Err(Errno::EAGAIN) => {}
                     ret => return ret,
                 }
+                core::hint::spin_loop();
             }
         }
     }
@@ -133,7 +134,7 @@ impl<T> Drop for Producer<T> {
 
 pub(crate) struct Consumer<T> {
     endpoint: EndPointer<HeapCons<T>>,
-    peer: spin::Once<Weak<Producer<T>>>,
+    peer: Weak<Producer<T>>,
     status: AtomicU32,
 }
 
@@ -141,7 +142,7 @@ impl<T> Consumer<T> {
     fn new(rb: HeapCons<T>, flags: OFlags, platform: &'static Platform) -> Self {
         Self {
             endpoint: EndPointer::new(rb, platform),
-            peer: spin::Once::new(),
+            peer: Weak::new(),
             status: AtomicU32::new((flags & OFlags::STATUS_FLAGS_MASK).bits()),
         }
     }
@@ -183,6 +184,7 @@ impl<T> Consumer<T> {
                     Err(Errno::EAGAIN) => {}
                     ret => return ret,
                 }
+                core::hint::spin_loop();
             }
         }
     }
@@ -209,11 +211,16 @@ impl<T> Channel<T> {
         let rb: HeapRb<T> = HeapRb::new(capacity);
         let (rb_prod, rb_cons) = rb.split();
 
-        let producer = Arc::new(Producer::new(rb_prod, flags, platform));
-        let consumer = Arc::new(Consumer::new(rb_cons, flags, platform));
-
-        producer.peer.call_once(|| Arc::downgrade(&consumer));
-        consumer.peer.call_once(|| Arc::downgrade(&producer));
+        // Create the producer and consumer, and set up cyclic references.
+        let mut producer = Arc::new(Producer::new(rb_prod, flags, platform));
+        let consumer = Arc::new_cyclic(|weak_self| {
+            // Producer has no other references as it is just created.
+            // So we can safely get a mutable reference to it.
+            Arc::get_mut(&mut producer).unwrap().peer = weak_self.clone();
+            let mut consumer = Consumer::new(rb_cons, flags, platform);
+            consumer.peer = Arc::downgrade(&producer);
+            consumer
+        });
 
         Self {
             prod: producer,

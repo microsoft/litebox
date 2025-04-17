@@ -170,7 +170,8 @@ pub struct FileStat {
     pub st_mode: u32,
     pub st_uid: u32,
     pub st_gid: u32,
-    pub pad0: core::ffi::c_int,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __pad0: core::ffi::c_int,
     pub st_rdev: u64,
     pub st_size: i64,
     pub st_blksize: i64,
@@ -181,7 +182,8 @@ pub struct FileStat {
     pub st_mtime_nsec: i64,
     pub st_ctime: i64,
     pub st_ctime_nsec: i64,
-    pub unused: [i64; 3],
+    #[expect(clippy::pub_underscore_fields)]
+    pub __unused: [i64; 3],
 }
 
 /// Linux's `iovec` struct for `writev`
