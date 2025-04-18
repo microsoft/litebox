@@ -88,9 +88,36 @@ struct Descriptors {
 
 impl Descriptors {
     fn new() -> Self {
-        // TODO: Add stdin/stdout/stderr
         Self {
-            descriptors: vec![],
+            descriptors: vec![
+                Some(Descriptor::Stdio(
+                    litebox_fs()
+                        .open(
+                            "/dev/stdin",
+                            litebox::fs::OFlags::RDONLY,
+                            litebox::fs::Mode::empty(),
+                        )
+                        .unwrap(),
+                )),
+                Some(Descriptor::Stdio(
+                    litebox_fs()
+                        .open(
+                            "/dev/stdout",
+                            litebox::fs::OFlags::WRONLY,
+                            litebox::fs::Mode::empty(),
+                        )
+                        .unwrap(),
+                )),
+                Some(Descriptor::Stdio(
+                    litebox_fs()
+                        .open(
+                            "/dev/stderr",
+                            litebox::fs::OFlags::WRONLY,
+                            litebox::fs::Mode::empty(),
+                        )
+                        .unwrap(),
+                )),
+            ],
         }
     }
     fn insert(&mut self, descriptor: Descriptor) -> u32 {
@@ -155,12 +182,6 @@ impl Descriptors {
             None
         }
     }
-}
-
-enum StdType {
-    Stdin,
-    Stdout,
-    Stderr,
 }
 
 enum Descriptor {

@@ -62,6 +62,10 @@ impl<P: path::Arg> FsPath<P> {
 
 /// Handle syscall `open`
 pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
+    let is_stdio = matches!(
+        path.normalized()?.as_str(),
+        "/dev/stdin" | "/dev/stdout" | "/dev/stderr"
+    );
     litebox_fs()
         .open(path, flags, mode)
         .map(|file| {
@@ -72,7 +76,11 @@ pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, 
             {
                 unreachable!()
             }
-            file_descriptors().write().insert(Descriptor::File(file))
+            file_descriptors().write().insert(if is_stdio {
+                Descriptor::Stdio(file)
+            } else {
+                Descriptor::File(file)
+            })
         })
         .map_err(Errno::from)
 }

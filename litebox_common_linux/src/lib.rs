@@ -159,6 +159,7 @@ impl From<litebox::fs::FileType> for InodeType {
         match value {
             litebox::fs::FileType::RegularFile => InodeType::File,
             litebox::fs::FileType::Directory => InodeType::Dir,
+            litebox::fs::FileType::CharacterDevice => InodeType::CharDevice,
             _ => unimplemented!(),
         }
     }
