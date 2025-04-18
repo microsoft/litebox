@@ -269,9 +269,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
             None => Err(Errno::EFAULT),
         },
         SyscallRequest::Close { fd } => syscalls::file::sys_close(fd).map(|()| 0),
-        SyscallRequest::Ioctl { fd, request, arg } => {
-            syscalls::file::sys_ioctl(fd, request, arg).map(|v| v as usize)
-        }
+        SyscallRequest::Ioctl { fd, arg } => syscalls::file::sys_ioctl(fd, arg).map(|v| v as usize),
         SyscallRequest::Pread64 {
             fd,
             buf,

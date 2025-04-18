@@ -307,6 +307,50 @@ bitflags::bitflags! {
     }
 }
 
+#[allow(non_camel_case_types)]
+type cc_t = ::core::ffi::c_uchar;
+#[allow(non_camel_case_types)]
+type tcflag_t = ::core::ffi::c_uint;
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct Termios {
+    pub c_iflag: tcflag_t,
+    pub c_oflag: tcflag_t,
+    pub c_cflag: tcflag_t,
+    pub c_lflag: tcflag_t,
+    pub c_line: cc_t,
+    pub c_cc: [cc_t; 19usize],
+}
+
+#[derive(Debug, Clone)]
+#[repr(C)]
+pub struct Winsize {
+    pub row: u16,
+    pub col: u16,
+    pub xpixel: u16,
+    pub ypixel: u16,
+}
+
+pub const TCGETS: u32 = 0x5401;
+pub const TCSETS: u32 = 0x5402;
+pub const TIOCGWINSZ: u32 = 0x5413;
+pub const FIONBIO: u32 = 0x5421;
+pub const TIOCGPTN: u32 = 0x80045430;
+
+/// Commands for use with `fcntl`.
+#[non_exhaustive]
+pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
+    TCGETS(Platform::RawMutPointer<Termios>),
+    TCSETS(Platform::RawConstPointer<Termios>),
+    TIOCGWINSZ(Platform::RawMutPointer<Winsize>),
+    TIOCGPTN(Platform::RawMutPointer<u32>),
+    FIONBIO(Platform::RawConstPointer<i32>),
+    Raw {
+        cmd: u32,
+        arg: Platform::RawMutPointer<u8>,
+    },
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
@@ -343,14 +387,13 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         fd: i32,
         offset: usize,
     },
-    Ioctl {
-        fd: i32,
-        request: u32,
-        arg: Platform::RawMutPointer<u8>,
-    },
     Munmap {
         addr: Platform::RawMutPointer<u8>,
         length: usize,
+    },
+    Ioctl {
+        fd: i32,
+        arg: IoctlArg<Platform>,
     },
     Pread64 {
         fd: i32,

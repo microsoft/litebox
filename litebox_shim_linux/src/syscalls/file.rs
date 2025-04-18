@@ -11,7 +11,8 @@ use litebox::{
     platform::{RawConstPointer, RawMutPointer},
 };
 use litebox_common_linux::{
-    AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec, IoWriteVec, errno::Errno,
+    AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec, IoWriteVec, IoctlArg,
+    errno::Errno,
 };
 
 use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox_fs};
@@ -634,42 +635,16 @@ pub fn sys_eventfd2(initval: u32, flags: EfdFlags) -> Result<u32, Errno> {
     Ok(fd)
 }
 
-const TCGETS: u32 = 0x5401;
-const TCSETS: u32 = 0x5402;
-const TIOCGWINSZ: u32 = 0x5413;
-const FIONBIO: u32 = 0x5421;
-const TIOCGPTN: u32 = 0x80045430;
-#[allow(non_camel_case_types)]
-type cc_t = ::core::ffi::c_uchar;
-#[allow(non_camel_case_types)]
-type tcflag_t = ::core::ffi::c_uint;
-#[repr(C)]
-#[derive(Debug, Clone)]
-struct Termios {
-    c_iflag: tcflag_t,
-    c_oflag: tcflag_t,
-    c_cflag: tcflag_t,
-    c_lflag: tcflag_t,
-    c_line: cc_t,
-    c_cc: [cc_t; 19usize],
-}
-#[derive(Debug, Clone)]
-#[repr(C)]
-struct Winsize {
-    row: u16,
-    col: u16,
-    xpixel: u16,
-    ypixel: u16,
-}
-
-fn stdio_ioctl(file: &litebox::fd::FileFd, request: u32, arg: MutPtr<u8>) -> Result<u32, Errno> {
-    match request {
-        TCGETS => {
-            let termios = unsafe { core::mem::transmute::<MutPtr<u8>, MutPtr<Termios>>(arg) };
+fn stdio_ioctl(
+    file: &crate::stdio::StdioFile,
+    arg: IoctlArg<litebox_platform_multiplex::Platform>,
+) -> Result<u32, Errno> {
+    match arg {
+        IoctlArg::TCGETS(termios) => {
             unsafe {
                 termios.write_at_offset(
                     0,
-                    Termios {
+                    litebox_common_linux::Termios {
                         c_iflag: 0,
                         c_oflag: 0,
                         c_cflag: 0,
@@ -682,43 +657,45 @@ fn stdio_ioctl(file: &litebox::fd::FileFd, request: u32, arg: MutPtr<u8>) -> Res
             .ok_or(Errno::EFAULT)?;
             Ok(0)
         }
-        TCSETS => Ok(0),
-        TIOCGWINSZ => {
-            let ws: MutPtr<Winsize> = unsafe { core::mem::transmute(arg) };
-            unsafe {
-                ws.write_at_offset(
-                    0,
-                    Winsize {
-                        row: 20,
-                        col: 20,
-                        xpixel: 0,
-                        ypixel: 0,
-                    },
-                )
-                .ok_or(Errno::EFAULT)?;
-                Ok(0)
-            }
-        }
-        TIOCGPTN => Err(Errno::ENOTTY),
+        IoctlArg::TCSETS(_) => Ok(0), // TODO: implement
+        IoctlArg::TIOCGWINSZ(ws) => unsafe {
+            ws.write_at_offset(
+                0,
+                litebox_common_linux::Winsize {
+                    row: 20,
+                    col: 20,
+                    xpixel: 0,
+                    ypixel: 0,
+                },
+            )
+            .ok_or(Errno::EFAULT)?;
+            Ok(0)
+        },
+        IoctlArg::TIOCGPTN(_) => Err(Errno::ENOTTY),
         _ => todo!(),
     }
 }
 
 /// Handle syscall `ioctl`
-pub fn sys_ioctl(fd: i32, request: u32, arg: MutPtr<u8>) -> Result<u32, Errno> {
+pub fn sys_ioctl(
+    fd: i32,
+    arg: IoctlArg<litebox_platform_multiplex::Platform>,
+) -> Result<u32, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
 
     let locked_file_descriptors = file_descriptors().read();
     let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
-    if request == FIONBIO {
-        let arg: MutPtr<i32> = unsafe { core::mem::transmute(arg) };
+    if let IoctlArg::FIONBIO(arg) = arg {
         let val = unsafe { arg.read_at_offset(0) }
             .ok_or(Errno::EFAULT)?
             .into_owned();
         match desc {
-            Descriptor::File(file) | Descriptor::Stdio(file) => todo!(),
+            Descriptor::File(file) => todo!(),
+            Descriptor::Stdio(file) => {
+                file.set_status(OFlags::NONBLOCK, val != 0);
+            }
             Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { consumer, .. } => {
                 consumer.set_status(OFlags::NONBLOCK, val != 0);
@@ -732,7 +709,7 @@ pub fn sys_ioctl(fd: i32, request: u32, arg: MutPtr<u8>) -> Result<u32, Errno> {
     }
 
     match desc {
-        Descriptor::Stdio(file) => stdio_ioctl(file, request, arg),
+        Descriptor::Stdio(file) => stdio_ioctl(file, arg),
         Descriptor::File(file) => todo!(),
         Descriptor::Socket(socket) => todo!(),
         Descriptor::PipeReader {
