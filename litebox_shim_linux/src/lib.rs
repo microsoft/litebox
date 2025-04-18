@@ -192,12 +192,6 @@ impl Descriptors {
     }
 }
 
-enum StdType {
-    Stdin,
-    Stdout,
-    Stderr,
-}
-
 enum Descriptor {
     File(litebox::fd::FileFd),
     Socket(litebox::fd::SocketFd),
