@@ -30,6 +30,7 @@ use litebox_platform_multiplex::Platform;
 
 pub(crate) mod channel;
 pub mod loader;
+pub(crate) mod stdio;
 pub mod syscalls;
 
 type LinuxFS = litebox::fs::layered::FileSystem<
@@ -91,39 +92,36 @@ impl Descriptors {
     fn new() -> Self {
         Self {
             descriptors: vec![
-                Some(Descriptor::Stdio {
-                    file: litebox_fs()
+                Some(Descriptor::Stdio(stdio::StdioFile::new(
+                    litebox_fs()
                         .open(
                             "/dev/stdin",
                             litebox::fs::OFlags::RDONLY,
                             litebox::fs::Mode::empty(),
                         )
                         .unwrap(),
-                    status: litebox::fs::OFlags::APPEND,
-                    close_on_exec: core::sync::atomic::AtomicBool::new(false),
-                }),
-                Some(Descriptor::Stdio {
-                    file: litebox_fs()
+                    litebox::fs::OFlags::APPEND,
+                ))),
+                Some(Descriptor::Stdio(stdio::StdioFile::new(
+                    litebox_fs()
                         .open(
                             "/dev/stdout",
                             litebox::fs::OFlags::WRONLY,
                             litebox::fs::Mode::empty(),
                         )
                         .unwrap(),
-                    status: litebox::fs::OFlags::APPEND,
-                    close_on_exec: core::sync::atomic::AtomicBool::new(false),
-                }),
-                Some(Descriptor::Stdio {
-                    file: litebox_fs()
+                    litebox::fs::OFlags::APPEND,
+                ))),
+                Some(Descriptor::Stdio(stdio::StdioFile::new(
+                    litebox_fs()
                         .open(
                             "/dev/stderr",
                             litebox::fs::OFlags::WRONLY,
                             litebox::fs::Mode::empty(),
                         )
                         .unwrap(),
-                    status: litebox::fs::OFlags::APPEND,
-                    close_on_exec: core::sync::atomic::AtomicBool::new(false),
-                }),
+                    litebox::fs::OFlags::APPEND,
+                ))),
             ],
         }
     }
@@ -206,11 +204,7 @@ enum Descriptor {
         file: alloc::sync::Arc<syscalls::eventfd::EventFile<Platform>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
-    Stdio {
-        file: litebox::fd::FileFd,
-        status: litebox::fs::OFlags,
-        close_on_exec: core::sync::atomic::AtomicBool,
-    },
+    Stdio(stdio::StdioFile),
 }
 
 pub(crate) fn file_descriptors<'a>() -> &'a RwLock<Platform, Descriptors> {
