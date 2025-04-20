@@ -235,7 +235,7 @@ pub fn sys_readv(
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
         let size = match desc {
-            Descriptor::File(file) | Descriptor::Stdio { file, .. } => litebox_fs()
+            Descriptor::File(file) => litebox_fs()
                 .read(file, &mut kernel_buffer, None)
                 .map_err(Errno::from)?,
             Descriptor::Stdio(file) => file.read(&mut kernel_buffer, None)?,
@@ -279,7 +279,7 @@ pub fn sys_writev(
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
         let size = match desc {
-            Descriptor::File(file) | Descriptor::Stdio { file, .. } => litebox_fs()
+            Descriptor::File(file) => litebox_fs()
                 .write(file, &slice, None)
                 .map_err(Errno::from)?,
             Descriptor::Stdio(file) => file.write(&slice, None)?,
@@ -534,7 +534,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                     Descriptor::PipeReader { close_on_exec, .. }
                     | Descriptor::PipeWriter { close_on_exec, .. }
                     | Descriptor::Eventfd { close_on_exec, .. }
-                    | Descriptor::Stdio { close_on_exec, .. } => {
+                    | Descriptor::Stdio(crate::stdio::StdioFile { close_on_exec, .. }) => {
                         if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
                             FileDescriptorFlags::FD_CLOEXEC
                         } else {
@@ -556,7 +556,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                 Descriptor::PipeReader { close_on_exec, .. }
                 | Descriptor::PipeWriter { close_on_exec, .. }
                 | Descriptor::Eventfd { close_on_exec, .. }
-                | Descriptor::Stdio { close_on_exec, .. } => {
+                | Descriptor::Stdio(crate::stdio::StdioFile { close_on_exec, .. }) => {
                     close_on_exec.store(
                         flags.contains(FileDescriptorFlags::FD_CLOEXEC),
                         core::sync::atomic::Ordering::Relaxed,
