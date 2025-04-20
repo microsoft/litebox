@@ -69,18 +69,25 @@ pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, 
     litebox_fs()
         .open(path, flags, mode)
         .map(|file| {
-            if flags.contains(OFlags::CLOEXEC)
-                && litebox_fs()
-                    .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
-                    .is_err()
-            {
-                unreachable!()
-            }
-            file_descriptors().write().insert(if is_stdio {
-                Descriptor::Stdio(file)
+            let file = if is_stdio {
+                Descriptor::Stdio {
+                    file,
+                    status: OFlags::APPEND,
+                    close_on_exec: core::sync::atomic::AtomicBool::new(
+                        flags.contains(OFlags::CLOEXEC),
+                    ),
+                }
             } else {
+                if flags.contains(OFlags::CLOEXEC)
+                    && litebox_fs()
+                        .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
+                        .is_err()
+                {
+                    unreachable!()
+                }
                 Descriptor::File(file)
-            })
+            };
+            file_descriptors().write().insert(file)
         })
         .map_err(Errno::from)
 }
@@ -111,7 +118,7 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
     };
     match file_descriptors().read().get_fd(fd) {
         Some(desc) => match desc {
-            Descriptor::File(file) | Descriptor::Stdio(file) => {
+            Descriptor::File(file) | Descriptor::Stdio { file, .. } => {
                 litebox_fs().read(file, buf, offset).map_err(Errno::from)
             }
             Descriptor::Socket(socket) => todo!(),
@@ -140,7 +147,7 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
     };
     match file_descriptors().read().get_fd(fd) {
         Some(desc) => match desc {
-            Descriptor::File(file) | Descriptor::Stdio(file) => {
+            Descriptor::File(file) | Descriptor::Stdio { file, .. } => {
                 litebox_fs().write(file, buf, offset).map_err(Errno::from)
             }
             Descriptor::Socket(socket) => todo!(),
@@ -181,7 +188,7 @@ pub fn sys_close(fd: i32) -> Result<(), Errno> {
         return Err(Errno::EBADF);
     };
     match file_descriptors().write().remove(fd) {
-        Some(Descriptor::File(file) | Descriptor::Stdio(file)) => {
+        Some(Descriptor::File(file) | Descriptor::Stdio { file, .. }) => {
             litebox_fs().close(file).map_err(Errno::from)
         }
         Some(Descriptor::Socket(socket)) => todo!(),
@@ -227,7 +234,7 @@ pub fn sys_readv(
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
         let size = match desc {
-            Descriptor::File(file) | Descriptor::Stdio(file) => litebox_fs()
+            Descriptor::File(file) | Descriptor::Stdio { file, .. } => litebox_fs()
                 .read(file, &mut kernel_buffer, None)
                 .map_err(Errno::from)?,
             Descriptor::Socket(socket) => todo!(),
@@ -270,7 +277,7 @@ pub fn sys_writev(
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
         let size = match desc {
-            Descriptor::File(file) | Descriptor::Stdio(file) => litebox_fs()
+            Descriptor::File(file) | Descriptor::Stdio { file, .. } => litebox_fs()
                 .write(file, &slice, None)
                 .map_err(Errno::from)?,
             Descriptor::Socket(socket) => todo!(),
@@ -336,7 +343,7 @@ pub fn sys_readlinkat(
 impl Descriptor {
     fn stat(&self) -> Result<FileStat, Errno> {
         let fstat = match self {
-            Descriptor::File(file) | Descriptor::Stdio(file) => {
+            Descriptor::File(file) | Descriptor::Stdio { file, .. } => {
                 FileStat::from(litebox_fs().fd_file_status(file)?)
             }
             Descriptor::Socket(socket) => todo!(),
@@ -464,13 +471,14 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
         FcntlArg::GETFD => {
             let flags: FileDescriptorFlags =
                 match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
-                    Descriptor::File(file) | Descriptor::Stdio(file) => litebox_fs()
+                    Descriptor::File(file) => litebox_fs()
                         .with_metadata(file, |flags: &FileDescriptorFlags| *flags)
                         .unwrap_or(FileDescriptorFlags::empty()),
                     Descriptor::Socket(socket) => todo!(),
                     Descriptor::PipeReader { close_on_exec, .. }
                     | Descriptor::PipeWriter { close_on_exec, .. }
-                    | Descriptor::Eventfd { close_on_exec, .. } => {
+                    | Descriptor::Eventfd { close_on_exec, .. }
+                    | Descriptor::Stdio { close_on_exec, .. } => {
                         if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
                             FileDescriptorFlags::FD_CLOEXEC
                         } else {
@@ -482,7 +490,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
         }
         FcntlArg::SETFD(flags) => {
             match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
-                Descriptor::File(file) | Descriptor::Stdio(file) => {
+                Descriptor::File(file) => {
                     if litebox_fs().set_fd_metadata(file, flags).is_err() {
                         unreachable!()
                     }
@@ -490,7 +498,8 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                 Descriptor::Socket(socket) => todo!(),
                 Descriptor::PipeReader { close_on_exec, .. }
                 | Descriptor::PipeWriter { close_on_exec, .. }
-                | Descriptor::Eventfd { close_on_exec, .. } => {
+                | Descriptor::Eventfd { close_on_exec, .. }
+                | Descriptor::Stdio { close_on_exec, .. } => {
                     close_on_exec.store(
                         flags.contains(FileDescriptorFlags::FD_CLOEXEC),
                         core::sync::atomic::Ordering::Relaxed,
@@ -500,11 +509,12 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
             Ok(0)
         }
         FcntlArg::GETFL => match desc {
-            Descriptor::File(file) | Descriptor::Stdio(file) => todo!(),
+            Descriptor::File(file) => todo!(),
             Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { consumer, .. } => Ok(consumer.get_status().bits()),
             Descriptor::PipeWriter { producer, .. } => Ok(producer.get_status().bits()),
             Descriptor::Eventfd { file, .. } => Ok(file.get_status().bits()),
+            Descriptor::Stdio { status, .. } => Ok(status.bits()),
         },
         FcntlArg::SETFL(flags) => {
             let setfl_mask = OFlags::APPEND
@@ -523,7 +533,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                 };
             }
             match desc {
-                Descriptor::File(file) => todo!(),
+                Descriptor::File(file) | Descriptor::Stdio { file, .. } => todo!(),
                 Descriptor::Socket(socket) => todo!(),
                 Descriptor::PipeReader { consumer, .. } => {
                     toggle_flags!(consumer);

@@ -20,6 +20,7 @@ use once_cell::race::OnceBox;
 
 use litebox::{
     LiteBox,
+    fs::FileSystem,
     mm::{PageManager, linux::PAGE_SIZE},
     platform::{RawConstPointer as _, RawMutPointer as _},
     sync::RwLock,
@@ -90,33 +91,39 @@ impl Descriptors {
     fn new() -> Self {
         Self {
             descriptors: vec![
-                Some(Descriptor::Stdio(
-                    litebox_fs()
+                Some(Descriptor::Stdio {
+                    file: litebox_fs()
                         .open(
                             "/dev/stdin",
                             litebox::fs::OFlags::RDONLY,
                             litebox::fs::Mode::empty(),
                         )
                         .unwrap(),
-                )),
-                Some(Descriptor::Stdio(
-                    litebox_fs()
+                    status: litebox::fs::OFlags::APPEND,
+                    close_on_exec: core::sync::atomic::AtomicBool::new(false),
+                }),
+                Some(Descriptor::Stdio {
+                    file: litebox_fs()
                         .open(
                             "/dev/stdout",
                             litebox::fs::OFlags::WRONLY,
                             litebox::fs::Mode::empty(),
                         )
                         .unwrap(),
-                )),
-                Some(Descriptor::Stdio(
-                    litebox_fs()
+                    status: litebox::fs::OFlags::APPEND,
+                    close_on_exec: core::sync::atomic::AtomicBool::new(false),
+                }),
+                Some(Descriptor::Stdio {
+                    file: litebox_fs()
                         .open(
                             "/dev/stderr",
                             litebox::fs::OFlags::WRONLY,
                             litebox::fs::Mode::empty(),
                         )
                         .unwrap(),
-                )),
+                    status: litebox::fs::OFlags::APPEND,
+                    close_on_exec: core::sync::atomic::AtomicBool::new(false),
+                }),
             ],
         }
     }
@@ -199,7 +206,11 @@ enum Descriptor {
         file: alloc::sync::Arc<syscalls::eventfd::EventFile<Platform>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
-    Stdio(litebox::fd::FileFd),
+    Stdio {
+        file: litebox::fd::FileFd,
+        status: litebox::fs::OFlags,
+        close_on_exec: core::sync::atomic::AtomicBool,
+    },
 }
 
 pub(crate) fn file_descriptors<'a>() -> &'a RwLock<Platform, Descriptors> {
