@@ -26,7 +26,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use tar_no_std::TarArchive;
 
-use crate::{LiteBox, path::Arg as _, sync};
+use crate::{LiteBox, path::Arg as _, sync, utilities::anymap::AnyMap};
 
 use super::{
     Mode, OFlags, SeekWhence,
@@ -137,14 +137,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         assert!(flags.contains(OFlags::RDONLY));
         if entry.filename().as_str().unwrap() == path {
             // it is a file
-            Ok(self
-                .descriptors
-                .write()
-                .insert(Descriptor::File { idx, position: 0 }))
+            Ok(self.descriptors.write().insert(Descriptor::File {
+                idx,
+                position: 0,
+                metadata: AnyMap::new(),
+            }))
         } else {
             // it is a dir
             Ok(self.descriptors.write().insert(Descriptor::Dir {
                 path: path.to_owned(),
+                metadata: AnyMap::new(),
             }))
         }
     }
@@ -161,7 +163,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         mut offset: Option<usize>,
     ) -> Result<usize, ReadError> {
         let mut descriptors = self.descriptors.write();
-        let Descriptor::File { idx, position } = descriptors.get_mut(fd) else {
+        let Descriptor::File {
+            idx,
+            position,
+            metadata: _,
+        } = descriptors.get_mut(fd)
+        else {
             return Err(ReadError::NotAFile);
         };
         let position = offset.as_mut().unwrap_or(position);
@@ -194,7 +201,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
         let mut descriptors = self.descriptors.write();
-        let Descriptor::File { idx, position } = descriptors.get_mut(fd) else {
+        let Descriptor::File {
+            idx,
+            position,
+            metadata: _,
+        } = descriptors.get_mut(fd)
+        else {
             return Err(SeekError::NotAFile);
         };
         let file_len = self.tar_data.entries().nth(*idx).unwrap().data().len();
@@ -340,11 +352,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn set_fd_metadata<T: core::any::Any>(
         &self,
         fd: &crate::fd::FileFd,
-        metadata: T,
+        m: T,
     ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
-        Err(super::errors::SetMetadataError::ReadOnlyFileSystem(
-            metadata,
-        ))
+        match self.descriptors.write().get_mut(fd) {
+            Descriptor::File { metadata, .. } | Descriptor::Dir { metadata, .. } => {
+                Ok(metadata.insert(m))
+            }
+        }
     }
 }
 
@@ -369,6 +383,13 @@ fn mode_of_modeflags(perms: tar_no_std::ModeFlags) -> Mode {
 type Descriptors = super::shared::Descriptors<Descriptor>;
 
 enum Descriptor {
-    File { idx: usize, position: usize },
-    Dir { path: String },
+    File {
+        idx: usize,
+        position: usize,
+        metadata: AnyMap,
+    },
+    Dir {
+        path: String,
+        metadata: AnyMap,
+    },
 }
