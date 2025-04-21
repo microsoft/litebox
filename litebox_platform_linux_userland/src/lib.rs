@@ -300,11 +300,16 @@ impl litebox::platform::RawMutex for RawMutex {
         let num_woken_up = core::cmp::min(n, u32::try_from(num_woken_or_requeued).unwrap());
 
         // Unlock the lock bits, allowing other wakers to run.
-        let remain = (0b11 << 30) | (n - num_woken_up);
-        while let Err(v) = self
-            .num_to_wake_up
-            .compare_exchange(remain, 0, SeqCst, SeqCst)
-        {
+        let remain = n - num_woken_up;
+        while let Err(v) = self.num_to_wake_up.fetch_update(SeqCst, SeqCst, |v| {
+            // Due to spurious or immediate wake-ups (i.e., unexpected wakeups that may decrease `num_to_wake_up`),
+            // `num_to_wake_up` might end up being less than expected. Thus, we check `<=` rather than `==`.
+            if v & ((1 << 30) - 1) <= remain {
+                Some(0)
+            } else {
+                None
+            }
+        }) {
             // Confirm that no one has clobbered the lock bits (which would indicate an implementation
             // failure somewhere).
             debug_assert_eq!(v >> 30, 0b11, "lock bits should remain unclobbered");
