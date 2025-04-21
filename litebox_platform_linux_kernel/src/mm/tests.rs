@@ -218,7 +218,7 @@ fn test_vmm_page_fault() {
     let start_addr: usize = 0x1_0000;
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
     let platform = MockKernel::new(p4.start_address());
-    let mut vmm = PageManager::<'_, _, PAGE_SIZE>::new(&platform);
+    let mut vmm = PageManager::<'_, _, PAGE_SIZE>::new(platform);
     unsafe {
         assert_eq!(
             vmm.create_writable_pages(start_addr, 4 * PAGE_SIZE, true, |_: UserMutPtr<u8>| Ok(0),)
