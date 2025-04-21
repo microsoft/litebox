@@ -13,7 +13,7 @@ use ringbuf::{
 };
 
 struct EndPointer<T> {
-    rb: litebox::sync::Mutex<'static, Platform, T>,
+    rb: litebox::sync::Mutex<Platform, T>,
     is_shutdown: AtomicBool,
 }
 

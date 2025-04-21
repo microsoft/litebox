@@ -51,14 +51,14 @@ pub struct FileSystem<
 > {
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
     // sync-primitives platform, as well as cost of mutexes and such?
-    sync: sync::Synchronization<'static, Platform>,
+    sync: sync::Synchronization<Platform>,
     upper: Upper,
     lower: Lower,
-    root: sync::RwLock<'static, Platform, RootDir>,
+    root: sync::RwLock<Platform, RootDir>,
     layering_semantics: LayeringSemantics,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
-    descriptors: sync::RwLock<'static, Platform, Descriptors>,
+    descriptors: sync::RwLock<Platform, Descriptors>,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower: super::FileSystem>

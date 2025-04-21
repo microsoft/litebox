@@ -41,11 +41,11 @@ use super::{
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
     // sync-primitives platform, as well as cost of mutexes and such?
-    sync: sync::Synchronization<'static, Platform>,
+    sync: sync::Synchronization<Platform>,
     tar_data: TarArchive,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
-    descriptors: sync::RwLock<'static, Platform, Descriptors>,
+    descriptors: sync::RwLock<Platform, Descriptors>,
 }
 
 /// An empty tar file to support an empty file system.

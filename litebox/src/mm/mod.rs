@@ -22,7 +22,7 @@ pub struct PageManager<Platform, const ALIGN: usize>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
-    vmem: RwLock<'static, Platform, Vmem<Platform, ALIGN>>,
+    vmem: RwLock<Platform, Vmem<Platform, ALIGN>>,
 }
 
 impl<Platform, const ALIGN: usize> PageManager<Platform, ALIGN>

@@ -45,20 +45,20 @@ impl<Platform> RawSyncPrimitivesProvider for Platform where
 /// LiteBox.
 ///
 /// A LiteBox `Synchronization` is parametric in the platform it runs on.
-pub struct Synchronization<'platform, Platform: RawSyncPrimitivesProvider> {
-    platform: &'platform Platform,
+pub struct Synchronization<Platform: RawSyncPrimitivesProvider> {
+    platform: &'static Platform,
 
     #[cfg(feature = "lock_tracing")]
-    tracker: lock_tracing::LockTracker<'platform, Platform>,
+    tracker: lock_tracing::LockTracker<Platform>,
 }
 
-impl<'platform, Platform: RawSyncPrimitivesProvider> Synchronization<'platform, Platform> {
+impl<Platform: RawSyncPrimitivesProvider> Synchronization<Platform> {
     /// Construct a new `Synchronization` instance
     ///
     /// This function is expected to only be invoked once per platform, as an initialization step,
     /// and the created `Synchronization` handle is expected to be shared across all usage over the
     /// system.
-    pub fn new(platform: &'platform Platform) -> Self {
+    pub fn new(platform: &'static Platform) -> Self {
         Self {
             platform,
             #[cfg(feature = "lock_tracing")]
@@ -67,7 +67,7 @@ impl<'platform, Platform: RawSyncPrimitivesProvider> Synchronization<'platform, 
     }
 }
 
-impl<'platform, Platform: RawSyncPrimitivesProvider> Synchronization<'platform, Platform> {
+impl<Platform: RawSyncPrimitivesProvider> Synchronization<Platform> {
     /// Create a new [`Condvar`]
     #[must_use]
     pub fn new_condvar(&self) -> Condvar<Platform> {
@@ -76,13 +76,13 @@ impl<'platform, Platform: RawSyncPrimitivesProvider> Synchronization<'platform, 
 
     /// Create a new [`Mutex`]
     #[must_use]
-    pub fn new_mutex<T>(&self, val: T) -> Mutex<'platform, Platform, T> {
+    pub fn new_mutex<T>(&self, val: T) -> Mutex<Platform, T> {
         Mutex::new_from_synchronization(self, val)
     }
 
     /// Create a new [`Mutex`]
     #[must_use]
-    pub fn new_rwlock<T>(&self, val: T) -> RwLock<'platform, Platform, T> {
+    pub fn new_rwlock<T>(&self, val: T) -> RwLock<Platform, T> {
         RwLock::new_from_synchronization(self, val)
     }
 }

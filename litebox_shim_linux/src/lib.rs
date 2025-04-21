@@ -64,7 +64,7 @@ pub fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
     FS.get().expect("fs has not yet been set")
 }
 
-pub(crate) fn litebox_sync<'a>() -> &'a litebox::sync::Synchronization<'static, Platform> {
+pub(crate) fn litebox_sync<'a>() -> &'a litebox::sync::Synchronization<Platform> {
     static SYNC: OnceBox<litebox::sync::Synchronization<Platform>> = OnceBox::new();
     SYNC.get_or_init(|| {
         alloc::boxed::Box::new(litebox::sync::Synchronization::new(
@@ -173,8 +173,8 @@ enum Descriptor {
     },
 }
 
-pub(crate) fn file_descriptors<'a>() -> &'a RwLock<'static, Platform, Descriptors> {
-    static FILE_DESCRIPTORS: once_cell::race::OnceBox<RwLock<'_, Platform, Descriptors>> =
+pub(crate) fn file_descriptors<'a>() -> &'a RwLock<Platform, Descriptors> {
+    static FILE_DESCRIPTORS: once_cell::race::OnceBox<RwLock<Platform, Descriptors>> =
         once_cell::race::OnceBox::new();
     FILE_DESCRIPTORS
         .get_or_init(|| alloc::boxed::Box::new(litebox_sync().new_rwlock(Descriptors::new())))

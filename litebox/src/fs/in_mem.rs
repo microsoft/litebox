@@ -25,12 +25,12 @@ use crate::utilities::anymap::AnyMap;
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
     // sync-primitives platform, as well as cost of mutexes and such?
-    sync: sync::Synchronization<'static, Platform>,
-    root: sync::RwLock<'static, Platform, RootDir<Platform>>,
+    sync: sync::Synchronization<Platform>,
+    root: sync::RwLock<Platform, RootDir<Platform>>,
     current_user: UserInfo,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
-    descriptors: sync::RwLock<'static, Platform, Descriptors<Platform>>,
+    descriptors: sync::RwLock<Platform, Descriptors<Platform>>,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
@@ -537,7 +537,7 @@ struct RootDir<Platform: sync::RawSyncPrimitivesProvider> {
 type ParentAndEntry<'a, D, E> = Result<(Option<(&'a str, D)>, Option<E>), PathError>;
 
 impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
-    fn new(sync: &sync::Synchronization<'static, Platform>) -> Self {
+    fn new(sync: &sync::Synchronization<Platform>) -> Self {
         Self {
             entries: [(
                 String::new(),
@@ -620,7 +620,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Clone for Entry<Platform> {
     }
 }
 
-type Dir<Platform> = Arc<sync::RwLock<'static, Platform, DirX>>;
+type Dir<Platform> = Arc<sync::RwLock<Platform, DirX>>;
 
 struct DirX {
     perms: Permissions,
@@ -628,7 +628,7 @@ struct DirX {
     metadata: AnyMap,
 }
 
-type File<Platform> = Arc<sync::RwLock<'static, Platform, FileX>>;
+type File<Platform> = Arc<sync::RwLock<Platform, FileX>>;
 
 struct FileX {
     perms: Permissions,
