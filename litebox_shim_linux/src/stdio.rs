@@ -4,14 +4,20 @@ use litebox_common_linux::errno::Errno;
 use crate::litebox_fs;
 
 pub(crate) struct StdioFile {
+    pub(crate) typ: litebox::platform::StdioStream,
     pub(crate) file: litebox::fd::FileFd,
     pub(crate) status: core::sync::atomic::AtomicU32,
     pub(crate) close_on_exec: core::sync::atomic::AtomicBool,
 }
 
 impl StdioFile {
-    pub(crate) fn new(file: litebox::fd::FileFd, flags: OFlags) -> Self {
+    pub(crate) fn new(
+        typ: litebox::platform::StdioStream,
+        file: litebox::fd::FileFd,
+        flags: OFlags,
+    ) -> Self {
         Self {
+            typ,
             file,
             status: core::sync::atomic::AtomicU32::new(flags.bits()),
             close_on_exec: core::sync::atomic::AtomicBool::new(flags.contains(OFlags::CLOEXEC)),

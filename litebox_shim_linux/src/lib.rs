@@ -93,6 +93,7 @@ impl Descriptors {
         Self {
             descriptors: vec![
                 Some(Descriptor::Stdio(stdio::StdioFile::new(
+                    litebox::platform::StdioStream::Stdin,
                     litebox_fs()
                         .open(
                             "/dev/stdin",
@@ -103,6 +104,7 @@ impl Descriptors {
                     litebox::fs::OFlags::APPEND,
                 ))),
                 Some(Descriptor::Stdio(stdio::StdioFile::new(
+                    litebox::platform::StdioStream::Stdout,
                     litebox_fs()
                         .open(
                             "/dev/stdout",
@@ -113,6 +115,7 @@ impl Descriptors {
                     litebox::fs::OFlags::APPEND,
                 ))),
                 Some(Descriptor::Stdio(stdio::StdioFile::new(
+                    litebox::platform::StdioStream::Stderr,
                     litebox_fs()
                         .open(
                             "/dev/stderr",

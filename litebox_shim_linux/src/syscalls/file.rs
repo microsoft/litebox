@@ -62,15 +62,17 @@ impl<P: path::Arg> FsPath<P> {
 
 /// Handle syscall `open`
 pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
-    let is_stdio = matches!(
-        path.normalized()?.as_str(),
-        "/dev/stdin" | "/dev/stdout" | "/dev/stderr"
-    );
+    let stdio_typ = match path.normalized()?.as_str() {
+        "/dev/stdin" => Some(litebox::platform::StdioStream::Stdin),
+        "/dev/stdout" => Some(litebox::platform::StdioStream::Stdout),
+        "/dev/stderr" => Some(litebox::platform::StdioStream::Stderr),
+        _ => None,
+    };
     litebox_fs()
         .open(path, flags, mode)
         .map(|file| {
-            let file = if is_stdio {
-                Descriptor::Stdio(crate::stdio::StdioFile::new(file, flags))
+            let file = if let Some(typ) = stdio_typ {
+                Descriptor::Stdio(crate::stdio::StdioFile::new(typ, file, flags))
             } else {
                 if flags.contains(OFlags::CLOEXEC)
                     && litebox_fs()
