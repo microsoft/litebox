@@ -1,5 +1,12 @@
 //! File descriptors used in LiteBox
 
+/// TODO(jb): This will actually come in a future PR, currently, it does nothing, but in the future,
+/// this will allow for cleaner file descriptors shared across the different subsystems.
+pub(crate) struct Descriptors<Platform: 'static> {
+    platform: &'static Platform,
+    // TODO(jb): This will actually come in a future PR
+}
+
 /// A crate-internal representation of file descriptors that supports cloning/copying, and does
 /// *not* indicate validity/existence/ownership.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

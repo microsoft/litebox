@@ -49,6 +49,18 @@ mod private {
         fn requirements(&self) -> smallvec::SmallVec<[SubsystemKind; 2]>;
     }
 
+    impl<Platform> SealedSubsystem for crate::fd::Descriptors<Platform> {
+        fn name(&self) -> &'static str {
+            "fd::Descriptors"
+        }
+        fn kind(&self) -> SubsystemKind {
+            SubsystemKind::Descriptors
+        }
+        fn requirements(&self) -> smallvec::SmallVec<[SubsystemKind; 2]> {
+            smallvec::SmallVec::new()
+        }
+    }
+
     impl<Platform> SealedSubsystem for crate::net::Network<Platform>
     where
         Platform: crate::platform::IPInterfaceProvider
