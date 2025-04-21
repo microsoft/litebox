@@ -286,7 +286,8 @@ impl litebox::platform::RawMutex for RawMutex {
         // Unlock the lock bits, allowing other wakers to run.
         let remain = n - num_woken_up;
         while let Err(v) = self.num_to_wake_up.fetch_update(SeqCst, SeqCst, |v| {
-            // due to spurious or immediate wake-ups, `v` might be less than `remain`
+            // due to spurious or immediate wake-ups (i.e., unexpected wakeups that may decrease `num_to_wake_up`),
+            // `num_to_wake_up` might end up being less than expected. Thus, we check `<=` rather than `==`.
             if v & ((1 << 30) - 1) <= remain {
                 Some(0)
             } else {
