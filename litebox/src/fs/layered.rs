@@ -52,8 +52,8 @@ pub struct FileSystem<
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
     // sync-primitives platform, as well as cost of mutexes and such?
     sync: sync::Synchronization<Platform>,
-    upper: Upper,
-    lower: Lower,
+    pub(crate) upper: Upper,
+    pub(crate) lower: Lower,
     root: sync::RwLock<Platform, RootDir>,
     layering_semantics: LayeringSemantics,
     // cwd invariant: always ends with a `/`

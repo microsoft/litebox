@@ -32,6 +32,8 @@ pub enum SubsystemKind {
 }
 
 mod private {
+    use super::SubsystemKind;
+
     /// Ensuring that this crate is the only one who can define subsystems, we declare all the
     /// things we need out of a subsystem here. We have public sub-trait [`super::Subsystem`] which
     /// has this as a super-trait, so that external users are unable to look inside this particular
@@ -42,9 +44,116 @@ mod private {
         /// Name of the subsystem, used purely for diagnostic purposes.
         fn name(&self) -> &'static str;
         /// The kind of subsystem this is; this is used as a key into the subsystem map.
-        fn kind(&self) -> super::SubsystemKind;
+        fn kind(&self) -> SubsystemKind;
         /// Which subsystems are required by this subsystem.
-        fn requirements(&self) -> &[super::SubsystemKind];
+        fn requirements(&self) -> smallvec::SmallVec<[SubsystemKind; 2]>;
+    }
+
+    impl<Platform> SealedSubsystem for crate::net::Network<Platform>
+    where
+        Platform: crate::platform::IPInterfaceProvider
+            + crate::platform::TimeProvider
+            + crate::platform::RawMutexProvider,
+    {
+        fn name(&self) -> &'static str {
+            "net"
+        }
+        fn kind(&self) -> SubsystemKind {
+            SubsystemKind::Network
+        }
+        fn requirements(&self) -> smallvec::SmallVec<[SubsystemKind; 2]> {
+            [SubsystemKind::Descriptors].into_iter().collect()
+        }
+    }
+    impl<Platform> super::Subsystem for crate::net::Network<Platform> where
+        Platform: crate::platform::IPInterfaceProvider
+            + crate::platform::TimeProvider
+            + crate::platform::RawMutexProvider
+    {
+    }
+
+    impl<Platform: crate::sync::RawSyncPrimitivesProvider> SealedSubsystem
+        for crate::fs::in_mem::FileSystem<Platform>
+    {
+        fn name(&self) -> &'static str {
+            "in_mem::fs"
+        }
+        fn kind(&self) -> SubsystemKind {
+            SubsystemKind::FileSystem
+        }
+        fn requirements(&self) -> smallvec::SmallVec<[SubsystemKind; 2]> {
+            [SubsystemKind::Descriptors].into_iter().collect()
+        }
+    }
+    impl<Platform: crate::sync::RawSyncPrimitivesProvider> super::Subsystem
+        for crate::fs::in_mem::FileSystem<Platform>
+    {
+    }
+
+    impl<Platform: crate::sync::RawSyncPrimitivesProvider> SealedSubsystem
+        for crate::fs::tar_ro::FileSystem<Platform>
+    {
+        fn name(&self) -> &'static str {
+            "tar_ro::fs"
+        }
+        fn kind(&self) -> SubsystemKind {
+            SubsystemKind::FileSystem
+        }
+        fn requirements(&self) -> smallvec::SmallVec<[SubsystemKind; 2]> {
+            [SubsystemKind::Descriptors].into_iter().collect()
+        }
+    }
+    impl<Platform: crate::sync::RawSyncPrimitivesProvider> super::Subsystem
+        for crate::fs::tar_ro::FileSystem<Platform>
+    {
+    }
+
+    impl<Platform: crate::platform::Provider> SealedSubsystem
+        for crate::fs::nine_p::FileSystem<Platform>
+    {
+        fn name(&self) -> &'static str {
+            "nine_p::fs"
+        }
+        fn kind(&self) -> SubsystemKind {
+            SubsystemKind::FileSystem
+        }
+        fn requirements(&self) -> smallvec::SmallVec<[SubsystemKind; 2]> {
+            [SubsystemKind::Descriptors, SubsystemKind::Network]
+                .into_iter()
+                .collect()
+        }
+    }
+    impl<Platform: crate::platform::Provider> super::Subsystem
+        for crate::fs::nine_p::FileSystem<Platform>
+    {
+    }
+
+    impl<
+        Platform: crate::platform::Provider + 'static,
+        Upper: crate::fs::FileSystem + SealedSubsystem + 'static,
+        Lower: crate::fs::FileSystem + SealedSubsystem + 'static,
+    > SealedSubsystem for crate::fs::layered::FileSystem<Platform, Upper, Lower>
+    {
+        fn name(&self) -> &'static str {
+            "layered::fs"
+        }
+        fn kind(&self) -> SubsystemKind {
+            SubsystemKind::FileSystem
+        }
+        fn requirements(&self) -> smallvec::SmallVec<[SubsystemKind; 2]> {
+            self.upper
+                .requirements()
+                .into_iter()
+                .chain(self.lower.requirements())
+                .collect()
+        }
+    }
+    impl<
+        Platform: crate::platform::Provider + 'static,
+        Upper: crate::fs::FileSystem + SealedSubsystem + 'static,
+        Lower: crate::fs::FileSystem + SealedSubsystem + 'static,
+    > super::Subsystem for crate::fs::layered::FileSystem<Platform, Upper, Lower>
+    {
     }
 }
 
@@ -85,7 +194,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
     pub fn register<S: Subsystem + 'static>(&mut self, subsystem: S) {
         let mut subsystems = self.subsystems.write();
         let new_name = subsystem.name();
-        for r in subsystem.requirements() {
+        for r in &subsystem.requirements() {
             assert!(
                 subsystems.contains_key(r),
                 "Attempted to register {new_name}, but no {r:?} subsystem found",
@@ -127,7 +236,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
             return;
         }
         let s = init_subsystem();
-        for r in s.requirements() {
+        for r in &s.requirements() {
             if !subsystems.contains_key(r) {
                 unreachable!(
                     "Attempted to register {}, but no {:?} subsystem found",
