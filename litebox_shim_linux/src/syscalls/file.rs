@@ -1,6 +1,10 @@
 //! Implementation of file related syscalls, e.g., `open`, `read`, `write`, etc.
 
-use alloc::{ffi::CString, vec};
+use alloc::{
+    ffi::CString,
+    string::{String, ToString as _},
+    vec,
+};
 use litebox::{
     fs::{FileSystem as _, Mode, OFlags},
     path,
@@ -318,6 +322,26 @@ pub fn sys_access(
         return Err(Errno::EACCES);
     }
     Ok(())
+}
+
+const PROC_SELF_FD_PREFIX: &str = "/proc/self/fd/";
+fn do_readlink(fullpath: &str) -> Result<String, Errno> {
+    if fullpath.starts_with(PROC_SELF_FD_PREFIX) {
+        let fd = fullpath[PROC_SELF_FD_PREFIX.len()..]
+            .parse::<u32>()
+            .map_err(|_| Errno::EINVAL)?;
+        let locked_file_descriptors = file_descriptors().read();
+        let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
+        if let Descriptor::Stdio(crate::stdio::StdioFile { typ, .. }) = desc {
+            return match typ {
+                litebox::platform::StdioStream::Stdin => Ok("/dev/stdin".to_string()),
+                litebox::platform::StdioStream::Stdout => Ok("/dev/stdout".to_string()),
+                litebox::platform::StdioStream::Stderr => Ok("/dev/stderr".to_string()),
+            };
+        }
+    }
+
+    unimplemented!();
 }
 
 /// Handle syscall `readlink`
