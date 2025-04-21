@@ -37,7 +37,10 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     /// # Panics
     ///
     /// Panics if the tun device could not be successfully opened.
-    pub fn new(tun_device_name: Option<&str>, punchthrough_provider: PunchthroughProvider) -> Self {
+    pub fn new(
+        tun_device_name: Option<&str>,
+        punchthrough_provider: PunchthroughProvider,
+    ) -> &'static Self {
         let tun_socket_fd = tun_device_name.map(|tun_device_name| {
             let tun_fd = nix::fcntl::open(
                 "/dev/net/tun",
@@ -73,11 +76,11 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
             unsafe { std::os::fd::OwnedFd::from_raw_fd(tun_fd) }
         });
 
-        Self {
+        Box::leak(Box::new(Self {
             tun_socket_fd,
             punchthrough_provider,
             interception_enabled: std::sync::atomic::AtomicBool::new(false),
-        }
+        }))
     }
 
     /// Register `syscall_handler` to handle all intercepted syscalls.

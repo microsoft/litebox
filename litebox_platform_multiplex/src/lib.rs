@@ -63,7 +63,7 @@ pub fn set_platform(platform: &'static Platform) {
 /// # Panics
 ///
 /// Panics if [`set_platform`] has not been invoked before this
-pub fn platform<'a>() -> &'a Platform {
+pub fn platform() -> &'static Platform {
     PLATFORM
         .get()
         .expect("set_platform should have already been called before this point")

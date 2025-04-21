@@ -248,7 +248,7 @@ mod tests {
             None,
             ImpossiblePunchthroughProvider {},
         )));
-        set_platform(&*platform);
+        set_platform(platform);
     }
 
     #[test]
