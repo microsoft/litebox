@@ -18,19 +18,19 @@ use crate::{
 };
 
 /// A page manager to support `mmap`, `munmap`, and etc.
-pub struct PageManager<'platform, Platform, const ALIGN: usize>
+pub struct PageManager<Platform, const ALIGN: usize>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
-    vmem: RwLock<'platform, Platform, Vmem<'platform, Platform, ALIGN>>,
+    vmem: RwLock<'static, Platform, Vmem<Platform, ALIGN>>,
 }
 
-impl<'platform, Platform, const ALIGN: usize> PageManager<'platform, Platform, ALIGN>
+impl<Platform, const ALIGN: usize> PageManager<Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
     /// Create a new `PageManager` instance.
-    pub fn new(platform: &'platform Platform) -> Self {
+    pub fn new(platform: &'static Platform) -> Self {
         let vmem =
             crate::sync::Synchronization::new(platform).new_rwlock(linux::Vmem::new(platform));
         Self { vmem }
@@ -202,7 +202,7 @@ where
 }
 
 /// If Backend also implements [`VmemPageFaultHandler`], it can handle page faults.
-impl<Platform, const ALIGN: usize> PageManager<'_, Platform, ALIGN>
+impl<Platform, const ALIGN: usize> PageManager<Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
     Platform: VmemPageFaultHandler,
@@ -218,7 +218,7 @@ where
         error_code: u64,
     ) -> Result<(), PageFaultError> {
         let fault_addr = fault_addr & !(ALIGN - 1);
-        if !(Vmem::<'_, Platform, ALIGN>::TASK_ADDR_MIN..Vmem::<'_, Platform, ALIGN>::TASK_ADDR_MAX)
+        if !(Vmem::<Platform, ALIGN>::TASK_ADDR_MIN..Vmem::<Platform, ALIGN>::TASK_ADDR_MAX)
             .contains(&fault_addr)
         {
             return Err(PageFaultError::AccessError("Invalid address"));
@@ -228,7 +228,7 @@ where
         // Find the range closest to the fault address
         let (start, vma) = {
             let (r, vma) = vmem
-                .overlapping(fault_addr..Vmem::<'_, Platform, ALIGN>::TASK_ADDR_MAX)
+                .overlapping(fault_addr..Vmem::<Platform, ALIGN>::TASK_ADDR_MAX)
                 .next()
                 .ok_or(PageFaultError::AccessError("no mapping"))?;
             (r.start, *vma)
@@ -240,7 +240,7 @@ where
             }
 
             if !vmem
-                .overlapping(Vmem::<'_, Platform, ALIGN>::TASK_ADDR_MIN..fault_addr)
+                .overlapping(Vmem::<Platform, ALIGN>::TASK_ADDR_MIN..fault_addr)
                 .next_back()
                 .is_none_or(|(prev_range, prev_vma)| {
                     // Enforce gap between stack and other preceding non-stack mappings.
@@ -248,8 +248,7 @@ where
                     // or the previous mapping is far enough from the fault address
                     (prev_vma.flags().contains(VmFlags::VM_GROWSDOWN)
                         && !(prev_vma.flags() & VmFlags::VM_ACCESS_FLAGS).is_empty())
-                        || fault_addr - prev_range.end
-                            >= Vmem::<'_, Platform, ALIGN>::STACK_GUARD_GAP
+                        || fault_addr - prev_range.end >= Vmem::<Platform, ALIGN>::STACK_GUARD_GAP
                 })
             {
                 return Err(PageFaultError::AllocationFailed);
