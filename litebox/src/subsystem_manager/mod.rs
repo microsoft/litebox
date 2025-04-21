@@ -1,12 +1,12 @@
 //! Managing various LiteBox subsystems; see [`LiteBox`]
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 use hashbrown::HashMap;
 
 use crate::sync;
 
 type Subsystems<Platform> =
-    sync::RwLock<Platform, HashMap<SubsystemKind, sync::RwLock<Platform, Box<dyn Subsystem>>>>;
+    sync::RwLock<Platform, HashMap<SubsystemKind, Arc<sync::RwLock<Platform, Box<dyn Subsystem>>>>>;
 
 /// A full LiteBox system, managing registered subsytems.
 ///
@@ -91,7 +91,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
                 "Attempted to register {new_name}, but no {r:?} subsystem found",
             );
         }
-        let old = subsystems.insert(subsystem.kind(), self.sync.new_rwlock(Box::new(subsystem)));
+        let old = subsystems.insert(
+            subsystem.kind(),
+            Arc::new(self.sync.new_rwlock(Box::new(subsystem))),
+        );
         if let Some(old) = old {
             let old = old.read();
             let old_name = old.name();
@@ -133,7 +136,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
                 );
             }
         }
-        subsystems.insert(kind, self.sync.new_rwlock(Box::new(s)));
+        subsystems.insert(kind, Arc::new(self.sync.new_rwlock(Box::new(s))));
     }
 
     /// Crate-internal: get the registered subsystem of a particular kind.
@@ -142,16 +145,47 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
     ///
     /// This function will panic if the requested subsystem is of the wrong type, or if the
     /// subsystem does not even exist.
-    pub(crate) fn get<S: Subsystem>(
-        &self,
-        kind: SubsystemKind,
-    ) -> impl core::ops::Deref<Target = S> {
-        // UGH, ugly and doesn't even work :(
-        let subsystems = self.subsystems.read();
-        sync::RwLockReadGuard::map(subsystems, |subsystems| {
-            &sync::RwLockReadGuard::map(subsystems.get(&kind).unwrap().read(), |x| {
-                (&**x as &dyn core::any::Any).downcast_ref().unwrap()
-            })
+    pub(crate) fn get<S: Subsystem>(&self, kind: SubsystemKind) -> LockedSubsystem<Platform, S> {
+        let subsystem = Arc::clone(self.subsystems.read().get(&kind).unwrap());
+        LockedSubsystem {
+            _phantom: core::marker::PhantomData,
+            subsystem,
+        }
+    }
+}
+
+/// A locked subsystem `S`
+pub(crate) struct LockedSubsystem<Platform: sync::RawSyncPrimitivesProvider, S: Subsystem> {
+    // Invariant: the `dyn Subsystem` must be an `S` specifically.
+    _phantom: core::marker::PhantomData<S>,
+    subsystem: Arc<sync::RwLock<Platform, Box<dyn Subsystem>>>,
+}
+
+impl<Platform: sync::RawSyncPrimitivesProvider, S: Subsystem> LockedSubsystem<Platform, S> {
+    /// Make a new `LockedSubsystem`.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the requested subsystem is of the wrong type.
+    fn new(subsystem: &Arc<sync::RwLock<Platform, Box<dyn Subsystem>>>) -> Self {
+        assert!((&*subsystem.read() as &dyn core::any::Any).is::<S>());
+        Self {
+            _phantom: core::marker::PhantomData,
+            subsystem: Arc::clone(subsystem),
+        }
+    }
+
+    /// Obtain read-only access to `S`
+    pub(crate) fn read(&self) -> impl core::ops::Deref<Target = S> {
+        sync::RwLockReadGuard::map(self.subsystem.read(), |x| {
+            (x as &dyn core::any::Any).downcast_ref().unwrap()
+        })
+    }
+
+    /// Obtain read/write access to `S`
+    pub(crate) fn write(&self) -> impl core::ops::DerefMut<Target = S> {
+        sync::RwLockWriteGuard::map(self.subsystem.write(), |x| {
+            (x as &mut dyn core::any::Any).downcast_mut().unwrap()
         })
     }
 }
