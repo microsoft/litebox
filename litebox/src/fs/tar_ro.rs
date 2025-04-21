@@ -38,14 +38,14 @@ use super::{
 
 /// A backing implementation for [`FileSystem`](super::FileSystem), storing all files in-memory, via
 /// a read-only `.tar` file.
-pub struct FileSystem<'platform, Platform: sync::RawSyncPrimitivesProvider> {
+pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
     // sync-primitives platform, as well as cost of mutexes and such?
-    sync: sync::Synchronization<'platform, Platform>,
+    sync: sync::Synchronization<'static, Platform>,
     tar_data: TarArchive,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
-    descriptors: sync::RwLock<'platform, Platform, Descriptors>,
+    descriptors: sync::RwLock<'static, Platform, Descriptors>,
 }
 
 /// An empty tar file to support an empty file system.
@@ -53,7 +53,7 @@ pub fn empty_tar_file() -> Vec<u8> {
     alloc::vec![0u8; 10240]
 }
 
-impl<'platform, Platform: sync::RawSyncPrimitivesProvider> FileSystem<'platform, Platform> {
+impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// Construct a new `FileSystem` instance from provided `tar_data`.
     ///
     /// Note: this function takes `tar_data` as a `Vec` rather than a `&[u8]` to eliminate a memcpy
@@ -68,7 +68,7 @@ impl<'platform, Platform: sync::RawSyncPrimitivesProvider> FileSystem<'platform,
     ///
     /// Panics if the provided `tar_data` is found to be an invalid `.tar` file.
     #[must_use]
-    pub fn new(platform: &'platform Platform, tar_data: Vec<u8>) -> Self {
+    pub fn new(platform: &'static Platform, tar_data: Vec<u8>) -> Self {
         let sync = sync::Synchronization::new(platform);
         let descriptors = sync.new_rwlock(Descriptors::new());
         Self {
@@ -96,17 +96,14 @@ impl<'platform, Platform: sync::RawSyncPrimitivesProvider> FileSystem<'platform,
     }
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider> super::private::Sealed
-    for FileSystem<'_, Platform>
-{
-}
+impl<Platform: sync::RawSyncPrimitivesProvider> super::private::Sealed for FileSystem<Platform> {}
 
 fn contains_dir(haystack: &str, needle: &str) -> bool {
     assert!(!needle.ends_with('/'));
     haystack.starts_with(needle) && haystack.as_bytes().get(needle.len()) == Some(&b'/')
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem<'_, Platform> {
+impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem<Platform> {
     fn open(
         &self,
         path: impl crate::path::Arg,

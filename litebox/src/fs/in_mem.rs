@@ -22,25 +22,25 @@ use crate::utilities::anymap::AnyMap;
 ///
 /// This has no physical backing store, thus any files in memory are erased as soon as this object
 /// is dropped.
-pub struct FileSystem<'platform, Platform: sync::RawSyncPrimitivesProvider> {
+pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
     // sync-primitives platform, as well as cost of mutexes and such?
-    sync: sync::Synchronization<'platform, Platform>,
-    root: sync::RwLock<'platform, Platform, RootDir<'platform, Platform>>,
+    sync: sync::Synchronization<'static, Platform>,
+    root: sync::RwLock<'static, Platform, RootDir<Platform>>,
     current_user: UserInfo,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
-    descriptors: sync::RwLock<'platform, Platform, Descriptors<'platform, Platform>>,
+    descriptors: sync::RwLock<'static, Platform, Descriptors<Platform>>,
 }
 
-impl<'platform, Platform: sync::RawSyncPrimitivesProvider> FileSystem<'platform, Platform> {
+impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// Construct a new `FileSystem` instance
     ///
     /// This function is expected to only be invoked once per platform, as an initialiation step,
     /// and the created `FileSystem` handle is expected to be shared across all usage over the
     /// system.
     #[must_use]
-    pub fn new(platform: &'platform Platform) -> Self {
+    pub fn new(platform: &'static Platform) -> Self {
         let sync = sync::Synchronization::new(platform);
         let root = sync.new_rwlock(RootDir::new(&sync));
         let descriptors = sync.new_rwlock(Descriptors::new());
@@ -74,12 +74,9 @@ impl<'platform, Platform: sync::RawSyncPrimitivesProvider> FileSystem<'platform,
     }
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider> super::private::Sealed
-    for FileSystem<'_, Platform>
-{
-}
+impl<Platform: sync::RawSyncPrimitivesProvider> super::private::Sealed for FileSystem<Platform> {}
 
-impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<'_, Platform> {
+impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     // Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
     // for any relative paths from current working directory.
     //
@@ -97,7 +94,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<'_, Platform> {
     }
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem<'_, Platform> {
+impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem<Platform> {
     fn open(
         &self,
         path: impl crate::path::Arg,
@@ -528,10 +525,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     }
 }
 
-struct RootDir<'platform, Platform: sync::RawSyncPrimitivesProvider> {
+struct RootDir<Platform: sync::RawSyncPrimitivesProvider> {
     // keys are normalized paths; directories do not have the final `/` (thus the root would be at
     // the empty-string key "")
-    entries: HashMap<String, Entry<'platform, Platform>>,
+    entries: HashMap<String, Entry<Platform>>,
 }
 
 // Parent, if it exists, is the path as well as the directory
@@ -539,8 +536,8 @@ struct RootDir<'platform, Platform: sync::RawSyncPrimitivesProvider> {
 // The entry, if it exists, is just the entry itself
 type ParentAndEntry<'a, D, E> = Result<(Option<(&'a str, D)>, Option<E>), PathError>;
 
-impl<'platform, Platform: sync::RawSyncPrimitivesProvider> RootDir<'platform, Platform> {
-    fn new(sync: &sync::Synchronization<'platform, Platform>) -> Self {
+impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
+    fn new(sync: &sync::Synchronization<'static, Platform>) -> Self {
         Self {
             entries: [(
                 String::new(),
@@ -562,7 +559,7 @@ impl<'platform, Platform: sync::RawSyncPrimitivesProvider> RootDir<'platform, Pl
         &self,
         path: &str,
         current_user: UserInfo,
-    ) -> ParentAndEntry<Dir<'platform, Platform>, Entry<'platform, Platform>> {
+    ) -> ParentAndEntry<Dir<Platform>, Entry<Platform>> {
         let mut real_components_seen = false;
         let mut collected = String::new();
         let mut parent_dir = None;
@@ -600,12 +597,12 @@ impl<'platform, Platform: sync::RawSyncPrimitivesProvider> RootDir<'platform, Pl
     }
 }
 
-enum Entry<'platform, Platform: sync::RawSyncPrimitivesProvider> {
-    File(File<'platform, Platform>),
-    Dir(Dir<'platform, Platform>),
+enum Entry<Platform: sync::RawSyncPrimitivesProvider> {
+    File(File<Platform>),
+    Dir(Dir<Platform>),
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider> Entry<'_, Platform> {
+impl<Platform: sync::RawSyncPrimitivesProvider> Entry<Platform> {
     fn perms(&self) -> Permissions {
         match self {
             Self::File(file) => file.read().perms.clone(),
@@ -614,7 +611,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Entry<'_, Platform> {
     }
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider> Clone for Entry<'_, Platform> {
+impl<Platform: sync::RawSyncPrimitivesProvider> Clone for Entry<Platform> {
     fn clone(&self) -> Self {
         match self {
             Self::File(file) => Self::File(file.clone()),
@@ -623,7 +620,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Clone for Entry<'_, Platform> {
     }
 }
 
-type Dir<'platform, Platform> = Arc<sync::RwLock<'platform, Platform, DirX>>;
+type Dir<Platform> = Arc<sync::RwLock<'static, Platform, DirX>>;
 
 struct DirX {
     perms: Permissions,
@@ -631,7 +628,7 @@ struct DirX {
     metadata: AnyMap,
 }
 
-type File<'platform, Platform> = Arc<sync::RwLock<'platform, Platform, FileX>>;
+type File<Platform> = Arc<sync::RwLock<'static, Platform, FileX>>;
 
 struct FileX {
     perms: Permissions,
@@ -693,18 +690,18 @@ impl Permissions {
     }
 }
 
-type Descriptors<'platform, Platform> = super::shared::Descriptors<Descriptor<'platform, Platform>>;
+type Descriptors<Platform> = super::shared::Descriptors<Descriptor<Platform>>;
 
-enum Descriptor<'platform, Platform: sync::RawSyncPrimitivesProvider> {
+enum Descriptor<Platform: sync::RawSyncPrimitivesProvider> {
     File {
-        file: File<'platform, Platform>,
+        file: File<Platform>,
         read_allowed: bool,
         write_allowed: bool,
         position: usize,
         metadata: AnyMap,
     },
     Dir {
-        dir: Dir<'platform, Platform>,
+        dir: Dir<Platform>,
         metadata: AnyMap,
     },
 }

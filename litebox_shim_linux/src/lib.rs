@@ -31,14 +31,12 @@ pub mod loader;
 pub mod syscalls;
 
 type LinuxFS = litebox::fs::layered::FileSystem<
-    'static,
     Platform,
-    litebox::fs::in_mem::FileSystem<'static, Platform>,
+    litebox::fs::in_mem::FileSystem<Platform>,
     litebox::fs::layered::FileSystem<
-        'static,
         Platform,
-        litebox::fs::devices::stdio::FileSystem<'static, Platform>,
-        litebox::fs::tar_ro::FileSystem<'static, Platform>,
+        litebox::fs::devices::stdio::FileSystem<Platform>,
+        litebox::fs::tar_ro::FileSystem<Platform>,
     >,
 >;
 

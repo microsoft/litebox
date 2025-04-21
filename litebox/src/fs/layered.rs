@@ -45,34 +45,29 @@ pub enum LayeringSemantics {
 ///
 /// Future versions of the layering might support other configurable options for the layering.
 pub struct FileSystem<
-    'platform,
     Platform: sync::RawSyncPrimitivesProvider,
     Upper: super::FileSystem,
     Lower: super::FileSystem,
 > {
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
     // sync-primitives platform, as well as cost of mutexes and such?
-    sync: sync::Synchronization<'platform, Platform>,
+    sync: sync::Synchronization<'static, Platform>,
     upper: Upper,
     lower: Lower,
-    root: sync::RwLock<'platform, Platform, RootDir>,
+    root: sync::RwLock<'static, Platform, RootDir>,
     layering_semantics: LayeringSemantics,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
-    descriptors: sync::RwLock<'platform, Platform, Descriptors>,
+    descriptors: sync::RwLock<'static, Platform, Descriptors>,
 }
 
-impl<
-    'platform,
-    Platform: sync::RawSyncPrimitivesProvider,
-    Upper: super::FileSystem,
-    Lower: super::FileSystem,
-> FileSystem<'platform, Platform, Upper, Lower>
+impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower: super::FileSystem>
+    FileSystem<Platform, Upper, Lower>
 {
     /// Construct a new `FileSystem` instance
     #[must_use]
     pub fn new(
-        platform: &'platform Platform,
+        platform: &'static Platform,
         upper: Upper,
         lower: Lower,
         layering_semantics: LayeringSemantics,
@@ -284,12 +279,12 @@ pub enum MigrationError {
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower: super::FileSystem>
-    super::private::Sealed for FileSystem<'_, Platform, Upper, Lower>
+    super::private::Sealed for FileSystem<Platform, Upper, Lower>
 {
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower: super::FileSystem>
-    super::FileSystem for FileSystem<'_, Platform, Upper, Lower>
+    super::FileSystem for FileSystem<Platform, Upper, Lower>
 {
     fn open(
         &self,
