@@ -264,6 +264,9 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
         } => {
             syscalls::mm::sys_mmap(addr, length, prot, flags, fd, offset).map(|ptr| ptr.as_usize())
         }
+        SyscallRequest::Munmap { addr, length } => {
+            syscalls::mm::sys_munmap(addr, length).map(|()| 0)
+        }
         SyscallRequest::Readv { fd, iovec, iovcnt } => syscalls::file::sys_readv(fd, iovec, iovcnt),
         SyscallRequest::Writev { fd, iovec, iovcnt } => {
             syscalls::file::sys_writev(fd, iovec, iovcnt)

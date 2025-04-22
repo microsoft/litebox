@@ -324,6 +324,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         fd: i32,
         offset: usize,
     },
+    Munmap {
+        addr: Platform::RawMutPointer<u8>,
+        length: usize,
+    },
     Pread64 {
         fd: i32,
         buf: Platform::RawMutPointer<u8>,
