@@ -1,29 +1,23 @@
-fn build_binding_from_sandbox_driver() {
+use std::env;
+use std::path::PathBuf;
+
+fn generate_bindings(header: &str, module_name: &str) {
     let bindings = bindgen::Builder::default()
+        .header(header)
         .clang_arg("--target=x86_64-unknown-none")
-        // The input header we would like to generate
-        // bindings for.
-        .header("src/host/snp/wrapper.h")
-        // Tell cargo to invalidate the built crate whenever any of the
-        // included header files changed.
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        .allowlist_type("SnpVmplRequestArgs")
-        .allowlist_type("vsbox_task")
-        .allowlist_var("SNP_VMPL_.+")
         .use_core()
-        .formatter(bindgen::Formatter::Rustfmt)
-        // Finish the builder and generate the bindings.
+        .ctypes_prefix("core::ffi")
+        .wrap_unsafe_ops(true)
         .generate()
-        // Unwrap the Result and panic on failure.
         .expect("Unable to generate bindings");
 
-    // Write the bindings to the $OUT_DIR/bindings.rs file.
-    let out_path = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let out_file = PathBuf::from(env::var("OUT_DIR").unwrap()).join(format!("{}.rs", module_name));
     bindings
-        .write_to_file(out_path.join("bindings.rs"))
+        .write_to_file(out_file)
         .expect("Couldn't write bindings!");
 }
 
 fn main() {
-    build_binding_from_sandbox_driver();
+    generate_bindings("src/host/mshv/mshv_wrapper.h", "mshv_bindings");
+    generate_bindings("src/host/mshv/msr_wrapper.h", "msr_bindings");
 }
