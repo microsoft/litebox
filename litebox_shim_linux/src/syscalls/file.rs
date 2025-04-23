@@ -346,8 +346,7 @@ fn do_readlink(fullpath: &str) -> Result<String, Errno> {
 
 /// Handle syscall `readlink`
 pub fn sys_readlink(pathname: impl path::Arg, buf: &mut [u8]) -> Result<usize, Errno> {
-    // TODO: support symbolic links
-    Err(Errno::ENOSYS)
+    sys_readlinkat(AT_FDCWD, pathname, buf)
 }
 
 /// Handle syscall `readlinkat`
@@ -356,8 +355,15 @@ pub fn sys_readlinkat(
     pathname: impl path::Arg,
     buf: &mut [u8],
 ) -> Result<usize, Errno> {
-    // TODO: support symbolic links
-    Err(Errno::ENOSYS)
+    let fspath = FsPath::new(dirfd, pathname)?;
+    let path = match fspath {
+        FsPath::Absolute { path } => do_readlink(path.normalized()?.as_str()),
+        _ => todo!(),
+    }?;
+    let bytes = path.as_bytes();
+    let min_len = core::cmp::min(buf.len(), bytes.len());
+    buf[..min_len].copy_from_slice(&bytes[..min_len]);
+    Ok(min_len)
 }
 
 impl Descriptor {
