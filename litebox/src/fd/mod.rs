@@ -1,5 +1,10 @@
 //! File descriptors used in LiteBox
 
+#![expect(
+    dead_code,
+    reason = "still under development, remove before merging PR"
+)]
+
 mod temp_old_stuff;
 pub(crate) use temp_old_stuff::InternalFd;
 pub use temp_old_stuff::{FileFd, SocketFd};
@@ -10,10 +15,8 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 use thiserror::Error;
 
-use crate::{
-    LiteBox,
-    sync::{self, RwLock},
-};
+use crate::LiteBox;
+use crate::sync::RawSyncPrimitivesProvider;
 
 /// Storage of file descriptors and their entries.
 ///
@@ -21,35 +24,37 @@ use crate::{
 /// integers, with a reasonable amount of safety---this will not be able to check for "ABA" style
 /// issues, but will at least prevent using a descriptor for an unintended subsystem at the point of
 /// conversion.
-pub struct Descriptors<Platform: sync::RawSyncPrimitivesProvider> {
+pub struct Descriptors<Platform: RawSyncPrimitivesProvider> {
     litebox: LiteBox<Platform>,
-    entries: RwLock<Platform, Vec<Option<Arc<DescriptorEntry<Platform>>>>>,
+    entries: Vec<Option<Arc<DescriptorEntry<Platform>>>>,
     /// Stored FDs are used to provide raw integer values in a safer way.
     stored_fds: Vec<Option<OwnedFd>>,
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider> Descriptors<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// Explicitly crate-internal: Create a new empty descriptor table.
     ///
     /// This should only be invoked once per LiteBox system.
     pub(crate) fn new(litebox: &LiteBox<Platform>) -> Self {
         let litebox = litebox.clone();
-        let entries = litebox.sync().new_rwlock(vec![]);
         Self {
             litebox,
-            entries,
+            entries: vec![],
             stored_fds: vec![],
         }
     }
 
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
     pub(crate) fn insert(&mut self, entry: DescriptorEntry<Platform>) -> OwnedFd {
-        let mut entries = self.entries.write();
-        let idx = entries.iter().position(Option::is_none).unwrap_or_else(|| {
-            entries.push(None);
-            entries.len() - 1
-        });
-        let old = entries[idx].replace(Arc::new(entry));
+        let idx = self
+            .entries
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                self.entries.push(None);
+                self.entries.len() - 1
+            });
+        let old = self.entries[idx].replace(Arc::new(entry));
         assert!(old.is_none());
         OwnedFd::new(idx)
     }
@@ -59,7 +64,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// Returns the descriptor entry if it is unique (i.e., it was not duplicated, or all duplicates
     /// have been cleared out).
     pub(crate) fn remove(&mut self, mut fd: OwnedFd) -> Option<DescriptorEntry<Platform>> {
-        let Some(old) = self.entries.write()[fd.as_usize()].take() else {
+        let Some(old) = self.entries[fd.as_usize()].take() else {
             unreachable!();
         };
         fd.mark_as_closed();
@@ -67,10 +72,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Descriptors<Platform> {
     }
 
     /// Get the entry at `fd`.
-    pub(crate) fn get(&self, fd: &OwnedFd) -> Arc<DescriptorEntry<Platform>> {
-        // Since the `fd` is borrowed, it must still exist, thus this index will always exist, as
-        // well as have a value within it.
-        Arc::clone(self.entries.read()[fd.as_usize()].as_ref().unwrap())
+    pub(crate) fn get<Subsystem: FdEnabledSubsystem>(
+        &self,
+        fd: &TypedFd<Subsystem>,
+    ) -> impl core::ops::Deref<Target = Subsystem::Entry> {
+        // Since the typed FD should not have been created unless we had the correct subsystem in
+        // the first place, none of this should panic---if it does, someone has done a bad transmute
+        // somewhere.
+        self.entries[fd.x.as_usize()]
+            .as_ref()
+            .unwrap()
+            .as_subsystem::<Subsystem>()
     }
 
     /// Get the corresponding integer value of the provided `fd`.
@@ -85,9 +97,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Descriptors<Platform> {
         fd: TypedFd<Subsystem>,
     ) -> usize {
         let raw = fd.x.as_usize();
-        debug_assert!(Subsystem::matches_entry(
-            self.entries.read()[raw].as_ref().unwrap().kind()
-        ));
+        debug_assert_eq!(self.entries[raw].as_ref().unwrap().kind(), Subsystem::KIND);
         if self.stored_fds.len() <= raw {
             self.stored_fds.resize_with(raw + 1, || None);
         }
@@ -110,11 +120,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Descriptors<Platform> {
         &self,
         fd: usize,
     ) -> Result<&TypedFd<Subsystem>, ErrRawIntFd> {
-        let entries = self.entries.read();
-        let Some(Some(entry)) = entries.get(fd) else {
+        let Some(Some(entry)) = self.entries.get(fd) else {
             return Err(ErrRawIntFd::NotFound);
         };
-        if !Subsystem::matches_entry(entry.kind()) {
+        if entry.kind() != Subsystem::KIND {
             return Err(ErrRawIntFd::InvalidSubsystem);
         }
         let Some(Some(stored_fd)) = self.stored_fds.get(fd) else {
@@ -140,11 +149,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Descriptors<Platform> {
         &mut self,
         fd: usize,
     ) -> Result<TypedFd<Subsystem>, ErrRawIntFd> {
-        let entries = self.entries.read();
-        let Some(Some(entry)) = entries.get(fd) else {
+        let Some(Some(entry)) = self.entries.get(fd) else {
             return Err(ErrRawIntFd::NotFound);
         };
-        if !Subsystem::matches_entry(entry.kind()) {
+        if entry.kind() != Subsystem::KIND {
             return Err(ErrRawIntFd::InvalidSubsystem);
         }
         let Some(stored_fd) = self.stored_fds.get_mut(fd) else {
@@ -163,8 +171,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Descriptors<Platform> {
 /// LiteBox subsystems that support having file descriptors.
 pub trait FdEnabledSubsystem {
     #[doc(hidden)]
-    #[must_use]
-    fn matches_entry(entry: EntryKind) -> bool;
+    type Entry: 'static;
+    #[doc(hidden)]
+    const KIND: EntryKind;
 }
 
 /// Possible errors from [`Descriptors::fd_from_raw_integer`] and
@@ -181,17 +190,48 @@ pub enum ErrRawIntFd {
 ///
 /// Any new introduction of a file-system or network or similar would need its own entry to be
 /// provided here in order to be able to store descriptors.
-pub(crate) enum DescriptorEntry<Platform: sync::RawSyncPrimitivesProvider> {
+pub(crate) enum DescriptorEntry<Platform: RawSyncPrimitivesProvider> {
     Socket(crate::net::SocketHandle),
     InMemFS(crate::fs::in_mem::Descriptor<Platform>),
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider> DescriptorEntry<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> DescriptorEntry<Platform> {
     fn kind(&self) -> EntryKind {
         match self {
             DescriptorEntry::Socket(_) => EntryKind::Socket,
             DescriptorEntry::InMemFS(_) => EntryKind::InMemFS,
         }
+    }
+
+    /// Obtains `self` as the subsystem's entry type.
+    ///
+    /// Panics if invalid for the particular subsystem.
+    fn as_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> &Subsystem::Entry {
+        macro_rules! kind {
+            ($($id:ident),*) => {
+                match Subsystem::KIND {
+                    $(
+                        EntryKind::$id => match self {
+                            DescriptorEntry::$id(x) => {
+                                if
+                                    core::any::TypeId::of::<Subsystem::Entry>() !=
+                                    core::any::Any::type_id(x)
+                                {
+                                    unreachable!("\
+                                        The types in `FdEnabledSubsystem` must be perfectly \
+                                        in sync with `DescriptorEntry`."
+                                    )
+                                }
+                                // SAFETY: We just confirmed they are the same type.
+                                unsafe { &*core::ptr::from_ref(x).cast() }
+                            }
+                            _ => unreachable!(),
+                        }
+                    )*
+                }
+            };
+        }
+        kind!(Socket, InMemFS)
     }
 }
 
