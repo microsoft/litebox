@@ -681,7 +681,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Clone for Entry<Platform> {
 
 type Dir<Platform> = Arc<sync::RwLock<Platform, DirX>>;
 
-struct DirX {
+pub(crate) struct DirX {
     perms: Permissions,
     children_count: u32,
     metadata: AnyMap,
@@ -689,7 +689,7 @@ struct DirX {
 
 type File<Platform> = Arc<sync::RwLock<Platform, FileX>>;
 
-struct FileX {
+pub(crate) struct FileX {
     perms: Permissions,
     data: Vec<u8>,
     metadata: AnyMap,
@@ -751,7 +751,7 @@ impl Permissions {
 
 type Descriptors<Platform> = super::shared::Descriptors<Descriptor<Platform>>;
 
-enum Descriptor<Platform: sync::RawSyncPrimitivesProvider> {
+pub(crate) enum Descriptor<Platform: sync::RawSyncPrimitivesProvider> {
     File {
         file: File<Platform>,
         read_allowed: bool,

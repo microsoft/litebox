@@ -1,5 +1,7 @@
 //! Transitional module, that is intended to be removed before making the PR.
 
+use super::OwnedFd;
+
 /// A crate-internal representation of file descriptors that supports cloning/copying, and does
 /// *not* indicate validity/existence/ownership.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

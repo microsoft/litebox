@@ -125,7 +125,7 @@ where
 
 /// [`SocketHandle`] stores all relevant information for a specific [`SocketFd`], for easy access
 /// from [`SocketFd`], _except_ the `Socket` itself which is stored in the [`Network::socket_set`].
-struct SocketHandle {
+pub(crate) struct SocketHandle {
     /// The handle into the `socket_set`
     handle: smoltcp::iface::SocketHandle,
     // Protocol-specific data
@@ -154,7 +154,7 @@ impl core::ops::DerefMut for SocketHandle {
     dead_code,
     reason = "these might eventually get used, they exist for completeness sake"
 )]
-enum ProtocolSpecific {
+pub(crate) enum ProtocolSpecific {
     Tcp(TcpSpecific),
     Udp(UdpSpecific),
     Icmp(IcmpSpecific),
@@ -162,7 +162,7 @@ enum ProtocolSpecific {
 }
 
 /// Socket-specific data for TCP sockets
-struct TcpSpecific {
+pub(crate) struct TcpSpecific {
     /// A local port associated with this socket, if any
     local_port: Option<LocalPort>,
     /// Server socket specific data
@@ -206,13 +206,13 @@ impl TcpServerSpecific {
 }
 
 /// Socket-specific data for UDP sockets
-struct UdpSpecific {}
+pub(crate) struct UdpSpecific {}
 
 /// Socket-specific data for ICMP sockets
-struct IcmpSpecific {}
+pub(crate) struct IcmpSpecific {}
 
 /// Socket-specific data for RAW sockets
-struct RawSpecific {
+pub(crate) struct RawSpecific {
     protocol: u8,
 }
 
