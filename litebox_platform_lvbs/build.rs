@@ -11,7 +11,7 @@ fn generate_bindings(header: &str, module_name: &str) {
         .generate()
         .expect("Unable to generate bindings");
 
-    let out_file = PathBuf::from(env::var("OUT_DIR").unwrap()).join(format!("{}.rs", module_name));
+    let out_file = PathBuf::from(env::var("OUT_DIR").unwrap()).join(format!("{module_name}.rs"));
     bindings
         .write_to_file(out_file)
         .expect("Couldn't write bindings!");
