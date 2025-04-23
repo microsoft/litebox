@@ -5,7 +5,7 @@ pub mod file;
 pub(crate) mod mm;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 macro_rules! common_functions_for_file_status {
     () => {

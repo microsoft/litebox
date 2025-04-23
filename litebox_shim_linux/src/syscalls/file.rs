@@ -370,8 +370,16 @@ pub fn sys_readlinkat(
 impl Descriptor {
     fn stat(&self) -> Result<FileStat, Errno> {
         let fstat = match self {
-            Descriptor::File(file) | Descriptor::Stdio(crate::stdio::StdioFile { file, .. }) => {
-                FileStat::from(litebox_fs().fd_file_status(file)?)
+            Descriptor::File(file) => FileStat::from(litebox_fs().fd_file_status(file)?),
+            Descriptor::Stdio(crate::stdio::StdioFile { typ, file, .. }) => {
+                // TODO: we don't have correct values for these fields yet, but ensure there are consistent.
+                // (See <https://github.com/bminor/glibc/blob/e78caeb4ff812ae19d24d65f4d4d48508154277b/sysdeps/unix/sysv/linux/ttyname.h#L35>).
+                let mut fstat = FileStat::from(litebox_fs().fd_file_status(file)?);
+                fstat.st_ino = *typ as u64;
+                fstat.st_dev = 0;
+                fstat.st_rdev = 34824;
+                fstat.st_blksize = 1024;
+                fstat
             }
             Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { .. } => FileStat {
@@ -421,10 +429,35 @@ impl Descriptor {
     }
 }
 
+fn do_stat(pathname: impl path::Arg, follow_symlink: bool) -> Result<FileStat, Errno> {
+    let normalized_path = pathname.normalized()?;
+    let path = if follow_symlink {
+        do_readlink(normalized_path.as_str()).unwrap_or(normalized_path)
+    } else {
+        normalized_path
+    };
+    let stdio_typ = match path.as_str() {
+        "/dev/stdin" => Some(litebox::platform::StdioStream::Stdin),
+        "/dev/stdout" => Some(litebox::platform::StdioStream::Stdout),
+        "/dev/stderr" => Some(litebox::platform::StdioStream::Stderr),
+        _ => None,
+    };
+    let status = litebox_fs().file_status(path)?;
+    let mut fstat = FileStat::from(status);
+    if let Some(typ) = stdio_typ {
+        // TODO: we don't have correct values for these fields yet, but ensure there are consistent.
+        // (See <https://github.com/bminor/glibc/blob/e78caeb4ff812ae19d24d65f4d4d48508154277b/sysdeps/unix/sysv/linux/ttyname.h#L35>).
+        fstat.st_ino = typ as u64;
+        fstat.st_dev = 0;
+        fstat.st_rdev = 34824;
+        fstat.st_blksize = 1024;
+    }
+    Ok(fstat)
+}
+
 /// Handle syscall `stat`
 pub fn sys_stat(pathname: impl path::Arg) -> Result<FileStat, Errno> {
-    let status = litebox_fs().file_status(pathname)?;
-    Ok(FileStat::from(status))
+    do_stat(pathname, true)
 }
 
 /// Handle syscall `lstat`
@@ -433,8 +466,7 @@ pub fn sys_stat(pathname: impl path::Arg) -> Result<FileStat, Errno> {
 /// then it returns information about the link itself, not the file that the link refers to.
 /// TODO: we do not support symbolic links yet.
 pub fn sys_lstat(pathname: impl path::Arg) -> Result<FileStat, Errno> {
-    let status = litebox_fs().file_status(pathname)?;
-    Ok(FileStat::from(status))
+    do_stat(pathname, false)
 }
 
 /// Handle syscall `fstat`
@@ -463,7 +495,7 @@ pub fn sys_newfstatat(
     let fs_path = FsPath::new(dirfd, pathname)?;
     let fstat: FileStat = match fs_path {
         FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
-            litebox_fs().file_status(path)?.into()
+            do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))?
         }
         FsPath::Cwd => litebox_fs().file_status("")?.into(),
         FsPath::Fd(fd) => file_descriptors()

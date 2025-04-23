@@ -167,7 +167,7 @@ impl From<litebox::fs::FileType> for InodeType {
 
 /// Linux's `stat` struct
 #[repr(C, packed)]
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Debug)]
 pub struct FileStat {
     pub st_dev: u64,
     pub st_ino: u64,

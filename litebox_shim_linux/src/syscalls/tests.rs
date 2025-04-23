@@ -4,7 +4,7 @@ use litebox_platform_multiplex::{Platform, set_platform};
 
 use super::file::{sys_eventfd2, sys_fcntl, sys_pipe2};
 
-fn init_platform() {
+pub(crate) fn init_platform() {
     set_platform(Platform::new(None, ImpossiblePunchthroughProvider {}));
 
     let platform = litebox_platform_multiplex::platform();
