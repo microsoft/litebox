@@ -78,9 +78,17 @@ jobs:
           #   since it needs to actually access the file-system, pull in
           #   relevant files, and then actually trigger LiteBox itself.
           #
+          # - `litebox_runner_lvbs` has a custom target (`no_std`), so it does
+          #   not work with the current no_std checker.
+          #
           # - `litebox_shim_linux` (in its default feature set) depends on
           #   `litebox_platform_multiplex`; similarly, ideally we'd do a more
           #   precise check.
+          #
+          # - `litebox_shim_optee` is expected to work with
+          #   `litebox_platform_lvbs` (`no_std`) and
+          #   `litebox_platform_linux_userland` (for debugging) which
+          #   depends on `litebox_platform_multiplex`.
           #
           # - `litebox_syscall_rewriter` is allowed to have `std` access since
           #   it is a helper binary that runs in userland to AOT "compile" ELFs.
@@ -89,7 +97,9 @@ jobs:
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
             -not -path './litebox_platform_multiplex/Cargo.toml' \
             -not -path './litebox_runner_linux_userland/Cargo.toml' \
+            -not -path './litebox_runner_lvbs/Cargo.toml' \
             -not -path './litebox_shim_linux/Cargo.toml' \
+            -not -path './litebox_shim_optee/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
             -print0 | \
               xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --target x86_64-unknown-none || exit 1; echo; echo'

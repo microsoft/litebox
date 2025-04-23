@@ -1,0 +1,8 @@
+[package]
+name = "litebox_runner_lvbs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+litebox = { version = "0.1.0", path = "../litebox" }
+litebox_platform_lvbs = { version = "0.1.0", path = "../litebox_platform_lvbs" }
