@@ -1,6 +1,7 @@
 use std::{arch::global_asm, ffi::CString};
 
 use litebox::{
+    LiteBox,
     fs::{FileSystem as _, Mode, OFlags},
     platform::trivial_providers::ImpossiblePunchthroughProvider,
 };
@@ -31,20 +32,21 @@ pub fn init_platform() {
     let platform = Platform::new(None, ImpossiblePunchthroughProvider {});
     set_platform(platform);
     let platform = litebox_platform_multiplex::platform();
+    let litebox = LiteBox::new(platform);
 
-    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(platform);
+    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(&litebox);
     in_mem_fs.with_root_privileges(|fs| {
         fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to set permissions on root");
     });
-    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(platform);
+    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&litebox);
     let tar_ro_fs =
-        litebox::fs::tar_ro::FileSystem::new(platform, litebox::fs::tar_ro::empty_tar_file());
+        litebox::fs::tar_ro::FileSystem::new(&litebox, litebox::fs::tar_ro::empty_tar_file());
     set_fs(litebox::fs::layered::FileSystem::new(
-        platform,
+        &litebox,
         in_mem_fs,
         litebox::fs::layered::FileSystem::new(
-            platform,
+            &litebox,
             dev_stdio,
             tar_ro_fs,
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,

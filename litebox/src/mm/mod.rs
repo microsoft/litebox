@@ -13,6 +13,7 @@ use linux::{
 };
 
 use crate::{
+    LiteBox,
     platform::{PageManagementProvider, RawConstPointer},
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
@@ -30,9 +31,10 @@ where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
     /// Create a new `PageManager` instance.
-    pub fn new(platform: &'static Platform) -> Self {
-        let vmem =
-            crate::sync::Synchronization::new(platform).new_rwlock(linux::Vmem::new(platform));
+    pub fn new(litebox: &LiteBox<Platform>) -> Self {
+        let vmem = litebox
+            .sync()
+            .new_rwlock(linux::Vmem::new(litebox.x.platform));
         Self { vmem }
     }
 
