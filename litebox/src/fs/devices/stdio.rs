@@ -18,20 +18,20 @@ use crate::{
 /// A backing implementation for [`FileSystem`](super::super::FileSystem).
 ///
 /// This provider provides only `/dev/stdin`, `/dev/stdout`, and `/dev/stderr`.
-pub struct FileSystem<'platform, Platform: crate::platform::StdioProvider> {
-    platform: &'platform Platform,
+pub struct FileSystem<Platform: crate::platform::StdioProvider + 'static> {
+    platform: &'static Platform,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
 }
 
-impl<'platform, Platform: crate::platform::StdioProvider> FileSystem<'platform, Platform> {
+impl<Platform: crate::platform::StdioProvider> FileSystem<Platform> {
     /// Construct a new `FileSystem` instance
     ///
     /// This function is expected to only be invoked once per platform, as an initialiation step,
     /// and the created `FileSystem` handle is expected to be shared across all usage over the
     /// system.
     #[must_use]
-    pub fn new(platform: &'platform Platform) -> Self {
+    pub fn new(platform: &'static Platform) -> Self {
         Self {
             platform,
             current_working_dir: "/".into(),
@@ -40,11 +40,11 @@ impl<'platform, Platform: crate::platform::StdioProvider> FileSystem<'platform, 
 }
 
 impl<Platform: crate::platform::StdioProvider> super::super::private::Sealed
-    for FileSystem<'_, Platform>
+    for FileSystem<Platform>
 {
 }
 
-impl<Platform: crate::platform::StdioProvider> FileSystem<'_, Platform> {
+impl<Platform: crate::platform::StdioProvider> FileSystem<Platform> {
     // Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
     // for any relative paths from current working directory.
     //
@@ -62,9 +62,7 @@ impl<Platform: crate::platform::StdioProvider> FileSystem<'_, Platform> {
     }
 }
 
-impl<Platform: crate::platform::StdioProvider> super::super::FileSystem
-    for FileSystem<'_, Platform>
-{
+impl<Platform: crate::platform::StdioProvider> super::super::FileSystem for FileSystem<Platform> {
     // NOTE: The counters inside this are purely internal to this module, so we are just using the
     // regular convention of 0,1,2 for stdin,stdout,stderr. This does NOT need to account for
     // anything externally, so as long as we are internally consistent, we are good.

@@ -28,11 +28,8 @@ unsafe extern "C" {
 }
 
 pub fn init_platform() {
-    let platform = Box::leak(Box::new(Platform::new(
-        None,
-        ImpossiblePunchthroughProvider {},
-    )));
-    set_platform(&*platform);
+    let platform = Platform::new(None, ImpossiblePunchthroughProvider {});
+    set_platform(platform);
     let platform = litebox_platform_multiplex::platform();
 
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(platform);

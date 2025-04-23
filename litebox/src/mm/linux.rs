@@ -150,22 +150,20 @@ impl VmArea {
 ///
 /// This struct mantains the virtual memory ranges backed by a memory [backend](`VmemBackend`).
 /// Each range needs to be `ALIGN`-aligned.
-pub(super) struct Vmem<'platform, Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> {
+pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> {
     /// Memory backend that provides the actual memory.
-    pub(super) platform: &'platform Platform,
+    pub(super) platform: &'static Platform,
     /// Virtual memory areas.
     vmas: RangeMap<usize, VmArea>,
 }
 
-impl<'platform, Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>
-    Vmem<'platform, Platform, ALIGN>
-{
+impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem<Platform, ALIGN> {
     pub(super) const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
     pub(super) const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
     pub(super) const STACK_GUARD_GAP: usize = 256 << 12;
 
     /// Create a new [`Vmem`] instance with the given memory [backend](`VmemBackend`).
-    pub(super) const fn new(platform: &'platform Platform) -> Self {
+    pub(super) const fn new(platform: &'static Platform) -> Self {
         Self {
             vmas: RangeMap::new(),
             platform,

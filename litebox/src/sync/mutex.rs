@@ -7,8 +7,6 @@ use crate::platform::RawMutex as _;
 
 #[cfg(feature = "lock_tracing")]
 use crate::sync::lock_tracing::{LockTracker, LockType, LockedWitness};
-#[cfg(not(feature = "lock_tracing"))]
-use core::marker::PhantomData;
 
 use super::RawSyncPrimitivesProvider;
 
@@ -134,16 +132,14 @@ impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
 /// `DerefMut` implementations.
 ///
 /// This structure is created by [`Mutex::lock`].
-pub struct MutexGuard<'a, 'platform, Platform: RawSyncPrimitivesProvider, T: ?Sized + 'a> {
-    mutex: &'a Mutex<'platform, Platform, T>,
+pub struct MutexGuard<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized + 'a> {
+    mutex: &'a Mutex<Platform, T>,
     #[cfg(feature = "lock_tracing")]
-    locked_witness: LockedWitness<'platform, Platform>,
-    #[cfg(not(feature = "lock_tracing"))]
-    _phantom: PhantomData<&'platform Platform>,
+    locked_witness: LockedWitness<Platform>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
-    for MutexGuard<'_, '_, Platform, T>
+    for MutexGuard<'_, Platform, T>
 {
     type Target = T;
 
@@ -154,7 +150,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
 }
 
 impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::DerefMut
-    for MutexGuard<'_, '_, Platform, T>
+    for MutexGuard<'_, Platform, T>
 {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: Access to the guard means that the current thread is the only thread with access
@@ -162,7 +158,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::DerefMut
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for MutexGuard<'_, '_, Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for MutexGuard<'_, Platform, T> {
     fn drop(&mut self) {
         #[cfg(feature = "lock_tracing")]
         self.locked_witness.mark_unlock();
@@ -179,22 +175,19 @@ impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for MutexGuard<'_, '_,
 ///
 /// A notable difference from Rust's `std` is that this `Mutex` does not maintain any poisoning
 /// information, thus its [`lock`](Self::lock) functionality directly returns a locked guard.
-pub struct Mutex<'platform, Platform: RawSyncPrimitivesProvider, T: ?Sized> {
+pub struct Mutex<Platform: RawSyncPrimitivesProvider, T: ?Sized> {
     raw: SpinEnabledRawMutex<Platform>,
 
     #[cfg(feature = "lock_tracing")]
-    tracker: LockTracker<'platform, Platform>,
-
-    #[cfg(not(feature = "lock_tracing"))]
-    _phantom: PhantomData<&'platform Platform>,
+    tracker: LockTracker<Platform>,
 
     data: UnsafeCell<T>,
 }
 
-impl<'platform, Platform: RawSyncPrimitivesProvider, T> Mutex<'platform, Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     #[inline]
     pub(super) fn new_from_synchronization(
-        sync: &super::Synchronization<'platform, Platform>,
+        sync: &super::Synchronization<Platform>,
         val: T,
     ) -> Self {
         Self {
@@ -202,19 +195,17 @@ impl<'platform, Platform: RawSyncPrimitivesProvider, T> Mutex<'platform, Platfor
             data: UnsafeCell::new(val),
             #[cfg(feature = "lock_tracing")]
             tracker: sync.tracker.clone(),
-            #[cfg(not(feature = "lock_tracing"))]
-            _phantom: PhantomData,
         }
     }
 }
 
-unsafe impl<Platform: RawSyncPrimitivesProvider, T> Send for Mutex<'_, Platform, T> {}
-unsafe impl<Platform: RawSyncPrimitivesProvider, T> Sync for Mutex<'_, Platform, T> {}
+unsafe impl<Platform: RawSyncPrimitivesProvider, T> Send for Mutex<Platform, T> {}
+unsafe impl<Platform: RawSyncPrimitivesProvider, T> Sync for Mutex<Platform, T> {}
 
-impl<'platform, Platform: RawSyncPrimitivesProvider, T> Mutex<'platform, Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     #[inline]
     #[track_caller]
-    pub fn lock(&self) -> MutexGuard<'_, 'platform, Platform, T> {
+    pub fn lock(&self) -> MutexGuard<'_, Platform, T> {
         #[cfg(feature = "lock_tracing")]
         let attempt = self
             .tracker
@@ -226,8 +217,6 @@ impl<'platform, Platform: RawSyncPrimitivesProvider, T> Mutex<'platform, Platfor
             mutex: self,
             #[cfg(feature = "lock_tracing")]
             locked_witness: self.tracker.mark_lock(attempt),
-            #[cfg(not(feature = "lock_tracing"))]
-            _phantom: PhantomData,
         }
     }
 }

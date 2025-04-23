@@ -53,15 +53,18 @@ const MAX_PACKET_COUNT: usize = 32;
 /// A user of `Network` who does not care about [events](crate::event) can choose to have a trivial
 /// provider for [`platform::RawMutexProvider`] that panics on all calls except `new_raw_mutex` and
 /// `underlying_atomic`.
-pub struct Network<'platform, Platform>
+pub struct Network<Platform>
 where
-    Platform: platform::IPInterfaceProvider + platform::TimeProvider + platform::RawMutexProvider,
+    Platform: platform::IPInterfaceProvider
+        + platform::TimeProvider
+        + platform::RawMutexProvider
+        + 'static,
 {
-    platform: &'platform Platform,
+    platform: &'static Platform,
     /// Events, and their manager
     // TODO(jayb): Figure out a way to structure this better (currently, we are using it as a line, but
     // eventually we might want to handle the DAG, how do we handle it then?)
-    pub event_manager: EventManager<'platform, Platform>,
+    pub event_manager: EventManager<Platform>,
     /// The set of sockets
     socket_set: smoltcp::iface::SocketSet<'static>,
     /// Handles into the `socket_set`; the position/index corresponds to the `raw_fd` of the
@@ -69,7 +72,7 @@ where
     // TODO: Maybe a better name for this, and `SocketHandle`?
     handles: Vec<Option<SocketHandle>>,
     /// The actual "physical" device, that connects to the platform
-    device: phy::Device<'platform, Platform>,
+    device: phy::Device<Platform>,
     /// The smoltcp network interface
     interface: smoltcp::iface::Interface,
     /// Initial instant of creation, used as an arbitrary stop point from when time begins
@@ -81,7 +84,7 @@ where
     platform_interaction: PlatformInteraction,
 }
 
-impl<'platform, Platform> Network<'platform, Platform>
+impl<Platform> Network<Platform>
 where
     Platform: platform::IPInterfaceProvider + platform::TimeProvider + platform::RawMutexProvider,
 {
@@ -90,7 +93,7 @@ where
     /// This function is expected to only be invoked once per platform, as an initialization step,
     /// and the created `Network` handle is expected to be shared across all usage over the
     /// system.
-    pub fn new(platform: &'platform Platform) -> Self {
+    pub fn new(platform: &'static Platform) -> Self {
         let mut device = phy::Device::new(platform);
         let config = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
         let mut interface =
@@ -334,7 +337,7 @@ impl PlatformInteractionReinvocationAdvice {
     }
 }
 
-impl<Platform> Network<'_, Platform>
+impl<Platform> Network<Platform>
 where
     Platform: platform::IPInterfaceProvider + platform::TimeProvider + platform::RawMutexProvider,
 {
@@ -458,7 +461,7 @@ where
     }
 }
 
-impl<Platform> Network<'_, Platform>
+impl<Platform> Network<Platform>
 where
     Platform: platform::IPInterfaceProvider + platform::TimeProvider + platform::RawMutexProvider,
 {

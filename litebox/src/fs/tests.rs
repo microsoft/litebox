@@ -9,7 +9,7 @@ mod in_mem {
     fn root_file_creation_and_deletion() {
         let platform = MockPlatform::new();
 
-        in_mem::FileSystem::new(&platform).with_root_privileges(|fs| {
+        in_mem::FileSystem::new(platform).with_root_privileges(|fs| {
             // Test file creation
             let path = "/testfile";
             let fd = fs
@@ -31,7 +31,7 @@ mod in_mem {
     fn root_file_read_write() {
         let platform = MockPlatform::new();
 
-        in_mem::FileSystem::new(&platform).with_root_privileges(|fs| {
+        in_mem::FileSystem::new(platform).with_root_privileges(|fs| {
             // Create and write to a file
             let path = "/testfile";
             let fd = fs
@@ -59,7 +59,7 @@ mod in_mem {
     fn root_directory_creation_and_removal() {
         let platform = MockPlatform::new();
 
-        in_mem::FileSystem::new(&platform).with_root_privileges(|fs| {
+        in_mem::FileSystem::new(platform).with_root_privileges(|fs| {
             // Test directory creation
             let path = "/testdir";
             fs.mkdir(path, Mode::RWXU)
@@ -77,7 +77,7 @@ mod in_mem {
     #[test]
     fn file_creation_and_deletion() {
         let platform = MockPlatform::new();
-        let mut fs = in_mem::FileSystem::new(&platform);
+        let mut fs = in_mem::FileSystem::new(platform);
         fs.with_root_privileges(|fs| {
             // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
             fs.mkdir("/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
@@ -103,7 +103,7 @@ mod in_mem {
     #[test]
     fn file_read_write() {
         let platform = MockPlatform::new();
-        let mut fs = in_mem::FileSystem::new(&platform);
+        let mut fs = in_mem::FileSystem::new(platform);
         fs.with_root_privileges(|fs| {
             // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
             fs.mkdir("/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
@@ -141,7 +141,7 @@ mod in_mem {
     #[test]
     fn directory_creation_and_removal() {
         let platform = MockPlatform::new();
-        let mut fs = in_mem::FileSystem::new(&platform);
+        let mut fs = in_mem::FileSystem::new(platform);
         fs.with_root_privileges(|fs| {
             // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
             fs.mkdir("/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
@@ -174,7 +174,7 @@ mod tar_ro {
     #[test]
     fn file_read() {
         let platform = MockPlatform::new();
-        let mut fs = tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into());
+        let mut fs = tar_ro::FileSystem::new(platform, TEST_TAR_FILE.into());
         let fd = fs
             .open("foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
@@ -198,7 +198,7 @@ mod tar_ro {
     #[test]
     fn dir_and_nonexist_checks() {
         let platform = MockPlatform::new();
-        let mut fs = tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into());
+        let mut fs = tar_ro::FileSystem::new(platform, TEST_TAR_FILE.into());
         assert!(matches!(
             fs.open("bar/ba", OFlags::RDONLY, Mode::empty()),
             Err(crate::fs::errors::OpenError::PathError(
@@ -225,9 +225,9 @@ mod layered {
     fn file_read_from_lower() {
         let platform = MockPlatform::new();
         let mut fs = layered::FileSystem::new(
-            &platform,
-            in_mem::FileSystem::new(&platform),
-            tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into()),
+            platform,
+            in_mem::FileSystem::new(platform),
+            tar_ro::FileSystem::new(platform, TEST_TAR_FILE.into()),
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
         let fd = fs
@@ -265,9 +265,9 @@ mod layered {
     fn dir_and_nonexist_checks() {
         let platform = MockPlatform::new();
         let mut fs = layered::FileSystem::new(
-            &platform,
-            in_mem::FileSystem::new(&platform),
-            tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into()),
+            platform,
+            in_mem::FileSystem::new(platform),
+            tar_ro::FileSystem::new(platform, TEST_TAR_FILE.into()),
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
         assert!(matches!(
@@ -289,7 +289,7 @@ mod layered {
     fn file_read_write_sync_up() {
         let platform = MockPlatform::new();
 
-        let mut in_mem_fs = in_mem::FileSystem::new(&platform);
+        let mut in_mem_fs = in_mem::FileSystem::new(platform);
         in_mem_fs.with_root_privileges(|fs| {
             // Change the permissions for `/` to allow file creation
             //
@@ -301,9 +301,9 @@ mod layered {
         });
 
         let mut fs = layered::FileSystem::new(
-            &platform,
+            platform,
             in_mem_fs,
-            tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into()),
+            tar_ro::FileSystem::new(platform, TEST_TAR_FILE.into()),
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
         let fd1 = fs
@@ -340,7 +340,7 @@ mod layered {
     fn file_read_write_seek_sync() {
         let platform = MockPlatform::new();
 
-        let mut in_mem_fs = in_mem::FileSystem::new(&platform);
+        let mut in_mem_fs = in_mem::FileSystem::new(platform);
         in_mem_fs.with_root_privileges(|fs| {
             // Change the permissions for `/` to allow file creation
             //
@@ -352,9 +352,9 @@ mod layered {
         });
 
         let mut fs = layered::FileSystem::new(
-            &platform,
+            platform,
             in_mem_fs,
-            tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into()),
+            tar_ro::FileSystem::new(platform, TEST_TAR_FILE.into()),
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
         let fd1 = fs
@@ -388,9 +388,9 @@ mod layered {
         let platform = MockPlatform::new();
 
         let mut fs = layered::FileSystem::new(
-            &platform,
-            in_mem::FileSystem::new(&platform),
-            tar_ro::FileSystem::new(&platform, TEST_TAR_FILE.into()),
+            platform,
+            in_mem::FileSystem::new(platform),
+            tar_ro::FileSystem::new(platform, TEST_TAR_FILE.into()),
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
         let fd = fs
@@ -434,7 +434,7 @@ mod stdio {
     #[test]
     fn stdio_open_read_write() {
         let platform = MockPlatform::new();
-        let fs = crate::fs::devices::stdio::FileSystem::new(&platform);
+        let fs = crate::fs::devices::stdio::FileSystem::new(platform);
 
         // Test opening and writing to /dev/stdout
         let fd_stdout = fs
@@ -478,7 +478,7 @@ mod stdio {
     #[test]
     fn non_dev_path_fails() {
         let platform = MockPlatform::new();
-        let fs = crate::fs::devices::stdio::FileSystem::new(&platform);
+        let fs = crate::fs::devices::stdio::FileSystem::new(platform);
 
         // Attempt to open a non-/dev/* path
         let result = fs.open("foo", OFlags::RDONLY, Mode::empty());
@@ -503,9 +503,9 @@ mod layered_stdio {
     fn layered_stdio_open_read_write() {
         let platform = MockPlatform::new();
         let layered_fs = layered::FileSystem::new(
-            &platform,
-            in_mem::FileSystem::new(&platform),
-            devices::stdio::FileSystem::new(&platform),
+            platform,
+            in_mem::FileSystem::new(platform),
+            devices::stdio::FileSystem::new(platform),
             LayeringSemantics::LowerLayerWritableFiles,
         );
 
@@ -559,16 +559,16 @@ mod layered_stdio {
     fn layered_write_to_non_dev() {
         let platform = MockPlatform::new();
         let in_mem = {
-            let mut in_mem = in_mem::FileSystem::new(&platform);
+            let mut in_mem = in_mem::FileSystem::new(platform);
             in_mem.with_root_privileges(|fs| {
                 fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO).unwrap();
             });
             in_mem
         };
         let fs = layered::FileSystem::new(
-            &platform,
+            platform,
             in_mem,
-            devices::stdio::FileSystem::new(&platform),
+            devices::stdio::FileSystem::new(platform),
             LayeringSemantics::LowerLayerWritableFiles,
         );
 

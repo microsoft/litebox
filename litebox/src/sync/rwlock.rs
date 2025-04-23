@@ -11,8 +11,6 @@ use crate::platform::RawMutex;
 
 #[cfg(feature = "lock_tracing")]
 use crate::sync::lock_tracing::{LockTracker, LockType, LockedWitness};
-#[cfg(not(feature = "lock_tracing"))]
-use core::marker::PhantomData;
 
 use super::RawSyncPrimitivesProvider;
 
@@ -385,33 +383,28 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
 ///
 /// A notable difference from Rust's `std` is that this `RwLock` does not maintain any poisoning
 /// information.
-pub struct RwLock<'platform, Platform: RawSyncPrimitivesProvider, T: ?Sized> {
+pub struct RwLock<Platform: RawSyncPrimitivesProvider, T: ?Sized> {
     raw: RawRwLock<Platform>,
 
     #[cfg(feature = "lock_tracing")]
-    tracker: LockTracker<'platform, Platform>,
-
-    #[cfg(not(feature = "lock_tracing"))]
-    _phantom: PhantomData<&'platform Platform>,
+    tracker: LockTracker<Platform>,
 
     data: UnsafeCell<T>,
 }
 
-pub struct RwLockReadGuard<'a, 'platform, Platform: RawSyncPrimitivesProvider, T> {
-    rwlock: &'a RwLock<'platform, Platform, T>,
+pub struct RwLockReadGuard<'a, Platform: RawSyncPrimitivesProvider, T> {
+    rwlock: &'a RwLock<Platform, T>,
     #[cfg(feature = "lock_tracing")]
-    locked_witness: LockedWitness<'platform, Platform>,
+    locked_witness: LockedWitness<Platform>,
 }
 
-pub struct RwLockWriteGuard<'a, 'platform, Platform: RawSyncPrimitivesProvider, T> {
-    rwlock: &'a RwLock<'platform, Platform, T>,
+pub struct RwLockWriteGuard<'a, Platform: RawSyncPrimitivesProvider, T> {
+    rwlock: &'a RwLock<Platform, T>,
     #[cfg(feature = "lock_tracing")]
-    locked_witness: LockedWitness<'platform, Platform>,
+    locked_witness: LockedWitness<Platform>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider, T> core::ops::Deref
-    for RwLockReadGuard<'_, '_, Platform, T>
-{
+impl<Platform: RawSyncPrimitivesProvider, T> core::ops::Deref for RwLockReadGuard<'_, Platform, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -419,7 +412,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> core::ops::Deref
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider, T> Drop for RwLockReadGuard<'_, '_, Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider, T> Drop for RwLockReadGuard<'_, Platform, T> {
     fn drop(&mut self) {
         #[cfg(feature = "lock_tracing")]
         self.locked_witness.mark_unlock();
@@ -431,7 +424,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> Drop for RwLockReadGuard<'_, '_, Pl
 }
 
 impl<Platform: RawSyncPrimitivesProvider, T> core::ops::Deref
-    for RwLockWriteGuard<'_, '_, Platform, T>
+    for RwLockWriteGuard<'_, Platform, T>
 {
     type Target = T;
 
@@ -441,14 +434,14 @@ impl<Platform: RawSyncPrimitivesProvider, T> core::ops::Deref
 }
 
 impl<Platform: RawSyncPrimitivesProvider, T> core::ops::DerefMut
-    for RwLockWriteGuard<'_, '_, Platform, T>
+    for RwLockWriteGuard<'_, Platform, T>
 {
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.rwlock.data.get() }
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider, T> Drop for RwLockWriteGuard<'_, '_, Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider, T> Drop for RwLockWriteGuard<'_, Platform, T> {
     fn drop(&mut self) {
         #[cfg(feature = "lock_tracing")]
         self.locked_witness.mark_unlock();
@@ -459,10 +452,10 @@ impl<Platform: RawSyncPrimitivesProvider, T> Drop for RwLockWriteGuard<'_, '_, P
     }
 }
 
-impl<'platform, Platform: RawSyncPrimitivesProvider, T> RwLock<'platform, Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     #[inline]
     pub(super) fn new_from_synchronization(
-        sync: &super::Synchronization<'platform, Platform>,
+        sync: &super::Synchronization<Platform>,
         val: T,
     ) -> Self {
         Self {
@@ -470,14 +463,14 @@ impl<'platform, Platform: RawSyncPrimitivesProvider, T> RwLock<'platform, Platfo
             data: UnsafeCell::new(val),
             #[cfg(feature = "lock_tracing")]
             tracker: sync.tracker.clone(),
-            #[cfg(not(feature = "lock_tracing"))]
-            _phantom: PhantomData,
         }
     }
+}
 
+impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     #[inline]
     #[track_caller]
-    pub fn read(&self) -> RwLockReadGuard<'_, 'platform, Platform, T> {
+    pub fn read(&self) -> RwLockReadGuard<'_, Platform, T> {
         #[cfg(feature = "lock_tracing")]
         let attempt = self
             .tracker
@@ -492,7 +485,7 @@ impl<'platform, Platform: RawSyncPrimitivesProvider, T> RwLock<'platform, Platfo
 
     #[inline]
     #[track_caller]
-    pub fn write(&self) -> RwLockWriteGuard<'_, 'platform, Platform, T> {
+    pub fn write(&self) -> RwLockWriteGuard<'_, Platform, T> {
         #[cfg(feature = "lock_tracing")]
         let attempt = self
             .tracker
@@ -525,5 +518,5 @@ impl<'platform, Platform: RawSyncPrimitivesProvider, T> RwLock<'platform, Platfo
     }
 }
 
-unsafe impl<Platform: RawSyncPrimitivesProvider, T> Sync for RwLock<'_, Platform, T> {}
-unsafe impl<Platform: RawSyncPrimitivesProvider, T> Send for RwLock<'_, Platform, T> {}
+unsafe impl<Platform: RawSyncPrimitivesProvider, T> Sync for RwLock<Platform, T> {}
+unsafe impl<Platform: RawSyncPrimitivesProvider, T> Send for RwLock<Platform, T> {}

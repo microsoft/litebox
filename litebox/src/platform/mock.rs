@@ -31,14 +31,16 @@ pub(crate) struct MockPlatform {
 }
 
 impl MockPlatform {
-    pub(crate) fn new() -> Self {
-        MockPlatform {
+    pub(crate) fn new() -> &'static Self {
+        //  Since this is used entirely for tests, leaking a bit of memory is perfectly fine in
+        //  order to give ourselves a statically lived platform easily.
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(MockPlatform {
             current_time: AtomicU64::new(0),
             ip_packets: RefCell::new(VecDeque::new()),
             stdin_queue: RefCell::new(VecDeque::new()),
             stdout_queue: RefCell::new(VecDeque::new()),
             stderr_queue: RefCell::new(VecDeque::new()),
-        }
+        }))
     }
 }
 

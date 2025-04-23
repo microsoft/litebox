@@ -100,12 +100,14 @@ impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
 }
 
 impl<Host: HostInterface> LinuxKernel<Host> {
-    pub fn new(init_page_table_addr: x86_64::PhysAddr) -> Self {
-        Self {
+    pub fn new(init_page_table_addr: x86_64::PhysAddr) -> &'static Self {
+        // There is only one long-running platform ever expected, thus this leak is perfectly ok in
+        // order to simplify usage of the platform.
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(Self {
             host_and_task: core::marker::PhantomData,
             // TODO: Update the init physaddr
             page_table: unsafe { mm::PageTable::new(init_page_table_addr) },
-        }
+        }))
     }
 
     pub fn init(&self, cpu_mhz: u64) {

@@ -13,7 +13,7 @@ use ringbuf::{
 };
 
 struct EndPointer<T> {
-    rb: litebox::sync::Mutex<'static, Platform, T>,
+    rb: litebox::sync::Mutex<Platform, T>,
     is_shutdown: AtomicBool,
 }
 
@@ -244,11 +244,7 @@ mod tests {
     extern crate std;
 
     fn init_platform() {
-        let platform = alloc::boxed::Box::leak(alloc::boxed::Box::new(Platform::new(
-            None,
-            ImpossiblePunchthroughProvider {},
-        )));
-        set_platform(&*platform);
+        set_platform(Platform::new(None, ImpossiblePunchthroughProvider {}));
     }
 
     #[test]

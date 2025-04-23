@@ -88,12 +88,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // TODO: We also need to pick the type of syscall interception based on whether we want
     // systrap/sigsys interception, or binary rewriting interception. Currently
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
-    let platform = Box::leak(Box::new(Platform::new(
+    let platform = Platform::new(
         None,
         litebox::platform::trivial_providers::ImpossiblePunchthroughProvider {},
-    )));
+    );
     let initial_file_system = {
-        let mut in_mem = litebox::fs::in_mem::FileSystem::new(&*platform);
+        let mut in_mem = litebox::fs::in_mem::FileSystem::new(platform);
         in_mem.with_root_privileges(|fs| {
             let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
             let ancestors: Vec<_> = prog.ancestors().collect();
@@ -120,13 +120,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
             fs.close(fd).unwrap();
         });
-        let tar_ro = litebox::fs::tar_ro::FileSystem::new(&*platform, tar_data);
-        let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&*platform);
+        let tar_ro = litebox::fs::tar_ro::FileSystem::new(platform, tar_data);
+        let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(platform);
         litebox::fs::layered::FileSystem::new(
-            &*platform,
+            platform,
             in_mem,
             litebox::fs::layered::FileSystem::new(
-                &*platform,
+                platform,
                 dev_stdio,
                 tar_ro,
                 litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
