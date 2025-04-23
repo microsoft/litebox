@@ -1,5 +1,5 @@
 # A shim that provides an OP-TEE-compatible ABI via LiteBox
 
-This shim is parametric in the choice of platform, which is initialized by first
-invoking `set_platform`, after which all functionality within the OP-TEE shim is
-able to use that particular platform.
+> [!WARNING]
+> This crate is work in progress. Currently, it is a copy of
+> `litebox_shim_linux`.
