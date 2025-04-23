@@ -194,6 +194,18 @@ impl<Platform: RawSyncPrimitivesProvider> Drop for LockedWitness<Platform> {
         assert!(self.unlocked, "Someone forgot to call `mark_unlock`");
     }
 }
+impl<Platform: RawSyncPrimitivesProvider> LockedWitness<Platform> {
+    /// This function creates a new witness from a borrowed witness. This is only safe to run if
+    /// `&self` is under a `ManuallyDrop` and thus won't be auto-dropped. This is intended to be
+    /// used only with the mapped guards.
+    pub(crate) unsafe fn reborrow_for_mapped_guard(&mut self) -> Self {
+        Self {
+            idx: self.idx,
+            unlocked: self.unlocked,
+            tracker: self.tracker.clone(),
+        }
+    }
+}
 
 /// A witness to having invoked [`LockTracker::begin_lock_attempt`].
 ///

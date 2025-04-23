@@ -17,7 +17,9 @@ mod lock_tracing;
 
 pub use condvar::Condvar;
 pub use mutex::{Mutex, MutexGuard};
-pub use rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+pub use rwlock::{
+    MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 
 #[cfg(not(feature = "lock_tracing"))]
 /// A convenience name for specific requirements from the platform
