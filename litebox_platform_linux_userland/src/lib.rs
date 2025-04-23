@@ -419,7 +419,16 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     litebox::platform::DebugLogProvider for LinuxUserland<PunchthroughProvider>
 {
     fn debug_log_print(&self, msg: &str) {
-        eprint!("{msg}");
+        unsafe {
+            libc::syscall(
+                libc::SYS_write,
+                libc::STDERR_FILENO,
+                msg.as_ptr(),
+                msg.len(),
+                // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+            )
+        };
     }
 }
 
@@ -607,18 +616,35 @@ impl litebox::platform::StdioProvider for LinuxUserland {
         stream: litebox::platform::StdioOutStream,
         buf: &[u8],
     ) -> Result<usize, litebox::platform::StdioWriteError> {
-        use std::io::Write as _;
-        match stream {
-            litebox::platform::StdioOutStream::Stdout => std::io::stdout().write(buf),
-            litebox::platform::StdioOutStream::Stderr => std::io::stderr().write(buf),
-        }
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::BrokenPipe {
-                litebox::platform::StdioWriteError::Closed
-            } else {
-                panic!("unhandled error {err}")
+        let n = match stream {
+            litebox::platform::StdioOutStream::Stdout => unsafe {
+                libc::syscall(
+                    libc::SYS_write,
+                    libc::STDOUT_FILENO,
+                    buf.as_ptr(),
+                    buf.len(),
+                    // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                    syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                )
+            },
+            litebox::platform::StdioOutStream::Stderr => unsafe {
+                libc::syscall(
+                    libc::SYS_write,
+                    libc::STDERR_FILENO,
+                    buf.as_ptr(),
+                    buf.len(),
+                    // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                    syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                )
+            },
+        };
+        if n < 0 {
+            match latest_errno() {
+                libc::EPIPE => return Err(litebox::platform::StdioWriteError::Closed),
+                _ => panic!("unhandled error {}", latest_errno()),
             }
-        })
+        }
+        Ok(usize::try_from(n).unwrap())
     }
 
     fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {

@@ -68,7 +68,7 @@ pub fn init_platform() {
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     ));
-    platform.enable_syscall_interception_with(syscall_entry);
+    platform.enable_syscall_interception_with(litebox_shim_linux::syscall_entry);
 
     install_dir("/lib64");
     install_dir("/lib32");

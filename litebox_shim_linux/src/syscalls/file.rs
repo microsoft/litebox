@@ -326,10 +326,8 @@ pub fn sys_access(
 
 const PROC_SELF_FD_PREFIX: &str = "/proc/self/fd/";
 fn do_readlink(fullpath: &str) -> Result<String, Errno> {
-    if fullpath.starts_with(PROC_SELF_FD_PREFIX) {
-        let fd = fullpath[PROC_SELF_FD_PREFIX.len()..]
-            .parse::<u32>()
-            .map_err(|_| Errno::EINVAL)?;
+    if let Some(stripped) = fullpath.strip_prefix(PROC_SELF_FD_PREFIX) {
+        let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
         let locked_file_descriptors = file_descriptors().read();
         let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
         if let Descriptor::Stdio(crate::stdio::StdioFile { typ, .. }) = desc {
@@ -341,7 +339,8 @@ fn do_readlink(fullpath: &str) -> Result<String, Errno> {
         }
     }
 
-    unimplemented!();
+    // TODO: we do not support symbolic links other than stdio yet.
+    Err(Errno::ENOENT)
 }
 
 /// Handle syscall `readlink`

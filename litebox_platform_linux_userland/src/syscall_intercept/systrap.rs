@@ -444,17 +444,16 @@ fn register_seccomp_filter() {
     // allow list
     // TODO: remove syscalls once they are implemented in the shim
     let rules = vec![
-        // TODO: before we support standard input/output, allow writes
-        // to fd <= 2
         (
             libc::SYS_write,
             vec![
                 SeccompRule::new(vec![
+                    // A backdoor to allow invoking write.
                     SeccompCondition::new(
-                        0,
-                        SeccompCmpArgLen::Dword,
-                        SeccompCmpOp::Le,
-                        libc::STDERR_FILENO as u64,
+                        3,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::Eq,
+                        SYSCALL_ARG_MAGIC,
                     )
                     .unwrap(),
                 ])
