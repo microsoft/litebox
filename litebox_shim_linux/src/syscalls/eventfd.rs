@@ -17,13 +17,12 @@ pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider> {
 
 impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
     pub(crate) fn new(count: u64, flags: EfdFlags, platform: &'static Platform) -> Self {
+        let mut status = OFlags::RDWR;
+        status.set(OFlags::NONBLOCK, flags.contains(EfdFlags::NONBLOCK));
+
         Self {
             counter: Synchronization::new(platform).new_mutex(count),
-            status: AtomicU32::new(if flags.contains(EfdFlags::NONBLOCK) {
-                litebox::fs::OFlags::NONBLOCK.bits()
-            } else {
-                0
-            }),
+            status: AtomicU32::new(status.bits()),
             semaphore: flags.contains(EfdFlags::SEMAPHORE),
         }
     }
