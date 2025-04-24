@@ -89,11 +89,11 @@ impl<T> Producer<T> {
         }
     }
 
-    pub(crate) fn write(&self, buf: &[T], is_nonblocking: bool) -> Result<usize, Errno>
+    pub(crate) fn write(&self, buf: &[T]) -> Result<usize, Errno>
     where
         T: Copy,
     {
-        if is_nonblocking {
+        if self.get_status().contains(OFlags::NONBLOCK) {
             self.try_write(buf)
         } else {
             // TODO: use poll rather than busy wait
@@ -156,11 +156,11 @@ impl<T> Consumer<T> {
         }
     }
 
-    pub(crate) fn read(&self, buf: &mut [T], is_nonblocking: bool) -> Result<usize, Errno>
+    pub(crate) fn read(&self, buf: &mut [T]) -> Result<usize, Errno>
     where
         T: Copy,
     {
-        if is_nonblocking {
+        if self.get_status().contains(OFlags::NONBLOCK) {
             self.try_read(buf)
         } else {
             // TODO: use poll rather than busy wait
@@ -243,7 +243,7 @@ mod tests {
             let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
             let mut i = 0;
             while i < data.len() {
-                let ret = prod.write(&data[i..], false).unwrap();
+                let ret = prod.write(&data[i..]).unwrap();
                 i += ret;
             }
             prod.shutdown();
@@ -253,7 +253,7 @@ mod tests {
         let mut buf = [0; 10];
         let mut i = 0;
         loop {
-            let ret = cons.read(&mut buf[i..], false).unwrap();
+            let ret = cons.read(&mut buf[i..]).unwrap();
             if ret == 0 {
                 cons.shutdown();
                 break;
@@ -268,12 +268,12 @@ mod tests {
         init_platform();
 
         let (prod, cons) =
-            super::Channel::<u8>::new(2, litebox::fs::OFlags::empty(), crate::litebox()).split();
+            super::Channel::<u8>::new(2, litebox::fs::OFlags::NONBLOCK, crate::litebox()).split();
         std::thread::spawn(move || {
             let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
             let mut i = 0;
             while i < data.len() {
-                match prod.write(&data[i..], true) {
+                match prod.write(&data[i..]) {
                     Ok(n) => {
                         i += n;
                     }
@@ -293,7 +293,7 @@ mod tests {
         let mut buf = [0; 10];
         let mut i = 0;
         loop {
-            match cons.read(&mut buf[i..], true) {
+            match cons.read(&mut buf[i..]) {
                 Ok(n) => {
                     if n == 0 {
                         break;

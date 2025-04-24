@@ -105,15 +105,13 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
         Some(desc) => match desc {
             Descriptor::File(file) => litebox_fs().read(file, buf, offset).map_err(Errno::from),
             Descriptor::Socket(socket) => todo!(),
-            Descriptor::PipeReader { consumer, .. } => {
-                consumer.read(buf, consumer.get_status().contains(OFlags::NONBLOCK))
-            }
+            Descriptor::PipeReader { consumer, .. } => consumer.read(buf),
             Descriptor::PipeWriter { .. } => Err(Errno::EINVAL),
             Descriptor::Eventfd { file, .. } => {
                 if buf.len() < 8 {
                     return Err(Errno::EINVAL);
                 }
-                let value = file.read(file.get_status().contains(OFlags::NONBLOCK))?;
+                let value = file.read()?;
                 buf[..8].copy_from_slice(&value.to_le_bytes());
                 Ok(size_of::<u64>())
             }
@@ -135,13 +133,11 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
             Descriptor::File(file) => litebox_fs().write(file, buf, offset).map_err(Errno::from),
             Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { .. } => Err(Errno::EINVAL),
-            Descriptor::PipeWriter { producer, .. } => {
-                producer.write(buf, producer.get_status().contains(OFlags::NONBLOCK))
-            }
+            Descriptor::PipeWriter { producer, .. } => producer.write(buf),
             Descriptor::Eventfd { file, .. } => {
                 let value: u64 =
                     u64::from_le_bytes(buf[..8].try_into().map_err(|_| Errno::EINVAL)?);
-                file.write(value, file.get_status().contains(OFlags::NONBLOCK))
+                file.write(value)
             }
         },
         None => Err(Errno::EBADF),
