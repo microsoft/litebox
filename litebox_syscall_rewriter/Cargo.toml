@@ -4,11 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0"
+anyhow = { version = "1.0.97", default-features = false }
 capstone = { version = "0.13.0", default-features = false }
-clap = { version = "4.5.32", features = ["derive"] }
 memmap2 = "0.9"
-object = { version = "0.36.7", default-features = false, features = ["elf", "build", "std"] }
+object = { version = "0.36.7", default-features = false, features = [
+    "elf",
+    "build_core",
+] }
 thiserror = { version = "2.0.6", default-features = false }
 
 [lints]
@@ -18,3 +20,6 @@ workspace = true
 insta = "1.42.2"
 similar = "2.7.0"
 tempfile = "3.19.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+clap = { version = "4.5.32", features = ["derive"] }
