@@ -1,21 +1,21 @@
 //! An implementation of [`HostInterface`] for LVBS
 
-use crate::host::linux::{self, sigset_t};
-use crate::ptr::{UserConstPtr, UserMutPtr};
-use crate::{Errno, HostInterface};
+// use crate::host::linux::{self, sigset_t};
+// use crate::ptr::{UserConstPtr, UserMutPtr};
+use crate::{Errno, HostInterface, VtlCallParam};
 use core::arch::asm;
 
-#[allow(unsafe_code)]
-mod bindings {
-    #![allow(dead_code)]
-    #![allow(non_snake_case)]
-    #![allow(non_camel_case_types)]
-    #![allow(non_upper_case_globals)]
-    #![allow(unused_imports)]
-    #![allow(improper_ctypes)]
-    #![allow(clippy::all)]
-    include!(concat!(env!("OUT_DIR"), "/mshv_bindings.rs"));
-}
+// #[allow(unsafe_code)]
+// mod bindings {
+//     #![allow(dead_code)]
+//     #![allow(non_snake_case)]
+//     #![allow(non_camel_case_types)]
+//     #![allow(non_upper_case_globals)]
+//     #![allow(unused_imports)]
+//     #![allow(improper_ctypes)]
+//     #![allow(clippy::all)]
+//     include!(concat!(env!("OUT_DIR"), "/mshv_bindings.rs"));
+// }
 
 pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
 
@@ -60,29 +60,21 @@ impl HostInterface for HostLvbsInterface {
         unimplemented!()
     }
 
-    fn alloc(_layout: &core::alloc::Layout) -> Result<(usize, usize), Errno> {
-        unimplemented!()
-    }
+    fn switch(result: u64) -> VtlCallParam {
+        // save VTL1 registers
+        // restore VTL0 registers
 
-    unsafe fn free(_addr: usize) {
-        unimplemented!()
-    }
+        unsafe {
+            asm!("vmcall", in("rax") 0x0, in("rcx") 0x12, in("r8") result);
+        }
 
-    fn exit() -> ! {
-        unimplemented!()
-    }
+        // save VTL0 registers
+        // restore VTL1 registers
 
-    fn terminate(_reason_set: u64, _reason_code: u64) -> ! {
-        unimplemented!()
-    }
-
-    fn rt_sigprocmask(
-        _how: i32,
-        _set: UserConstPtr<sigset_t>,
-        _oldset: UserMutPtr<sigset_t>,
-        _sigsetsize: usize,
-    ) -> Result<usize, Errno> {
-        unimplemented!()
+        VtlCallParam {
+            entry_reason: 0,
+            args: [0, 0, 0, 0],
+        }
     }
 
     fn wake_many(_mutex: &core::sync::atomic::AtomicU32, _n: usize) -> Result<usize, Errno> {
