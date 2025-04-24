@@ -169,7 +169,7 @@ enum Descriptor {
         close_on_exec: core::sync::atomic::AtomicBool,
     },
     Eventfd {
-        file: alloc::sync::Arc<syscalls::eventfd::EventFile<'static, Platform>>,
+        file: alloc::sync::Arc<syscalls::eventfd::EventFile<Platform>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
 }

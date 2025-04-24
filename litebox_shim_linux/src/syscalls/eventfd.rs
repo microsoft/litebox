@@ -2,21 +2,18 @@
 
 use core::sync::atomic::AtomicU32;
 
-use litebox::{
-    fs::OFlags,
-    sync::{RawSyncPrimitivesProvider, Synchronization},
-};
+use litebox::sync::{RawSyncPrimitivesProvider, Synchronization};
 use litebox_common_linux::{EfdFlags, errno::Errno};
 
-pub(crate) struct EventFile<'platform, Platform: RawSyncPrimitivesProvider> {
-    counter: litebox::sync::Mutex<'platform, Platform, u64>,
+pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider> {
+    counter: litebox::sync::Mutex<Platform, u64>,
     /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
     status: AtomicU32,
     semaphore: bool,
 }
 
-impl<'platform, Platform: RawSyncPrimitivesProvider> EventFile<'platform, Platform> {
-    pub(crate) fn new(count: u64, flags: EfdFlags, platform: &'platform Platform) -> Self {
+impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
+    pub(crate) fn new(count: u64, flags: EfdFlags, platform: &'static Platform) -> Self {
         Self {
             counter: Synchronization::new(platform).new_mutex(count),
             status: AtomicU32::new(if flags.contains(EfdFlags::NONBLOCK) {
@@ -25,22 +22,6 @@ impl<'platform, Platform: RawSyncPrimitivesProvider> EventFile<'platform, Platfo
                 0
             }),
             semaphore: flags.contains(EfdFlags::SEMAPHORE),
-        }
-    }
-
-    pub(crate) fn get_status(&self) -> OFlags {
-        OFlags::from_bits(self.status.load(core::sync::atomic::Ordering::Relaxed)).unwrap()
-    }
-
-    pub(crate) fn set_status(&self, flag: OFlags, on: bool) {
-        if on {
-            self.status
-                .fetch_or(flag.bits(), core::sync::atomic::Ordering::Relaxed);
-        } else {
-            self.status.fetch_and(
-                flag.complement().bits(),
-                core::sync::atomic::Ordering::Relaxed,
-            );
         }
     }
 
@@ -98,6 +79,8 @@ impl<'platform, Platform: RawSyncPrimitivesProvider> EventFile<'platform, Platfo
             }
         }
     }
+
+    crate::syscalls::common_functions_for_file_status!();
 }
 
 #[cfg(test)]
@@ -109,11 +92,7 @@ mod tests {
     extern crate std;
 
     fn init_platform() {
-        let platform = alloc::boxed::Box::leak(alloc::boxed::Box::new(Platform::new(
-            None,
-            ImpossiblePunchthroughProvider {},
-        )));
-        set_platform(&*platform);
+        set_platform(Platform::new(None, ImpossiblePunchthroughProvider {}));
     }
 
     #[test]

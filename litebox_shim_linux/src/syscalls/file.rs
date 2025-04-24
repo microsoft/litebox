@@ -516,6 +516,9 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                 Descriptor::PipeWriter { producer, .. } => {
                     toggle_flags!(producer);
                 }
+                Descriptor::Eventfd { file, .. } => {
+                    toggle_flags!(file, flags, setfl_mask);
+                }
             }
             Ok(0)
         }
