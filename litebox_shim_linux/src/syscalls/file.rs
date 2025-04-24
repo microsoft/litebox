@@ -462,16 +462,13 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                 | OFlags::DIRECT
                 | OFlags::NOATIME;
             match desc {
-                Descriptor::File(file) | Descriptor::Stdio(file) => todo!(),
+                Descriptor::File(file) => todo!(),
                 Descriptor::Socket(socket) => todo!(),
                 Descriptor::PipeReader { consumer, .. } => {
                     toggle_flags!(consumer, flags, setfl_mask);
                 }
                 Descriptor::PipeWriter { producer, .. } => {
                     toggle_flags!(producer, flags, setfl_mask);
-                }
-                Descriptor::Eventfd { file, .. } => {
-                    toggle_flags!(file, flags, setfl_mask);
                 }
             }
             Ok(0)
