@@ -17,6 +17,18 @@ macro_rules! mock_log_println {
 }
 
 impl HostInterface for MockHostInterface {
+    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::Errno> {
+        todo!()
+    }
+
+    unsafe fn free(addr: usize) {
+        todo!()
+    }
+
+    fn terminate(_reason_set: u64, _reason_code: u64) -> ! {
+        todo!()
+    }
+
     fn send_ip_packet(_packet: &[u8]) -> Result<usize, crate::Errno> {
         todo!()
     }
@@ -27,6 +39,10 @@ impl HostInterface for MockHostInterface {
 
     fn log(msg: &str) {
         unsafe { libc::write(libc::STDOUT_FILENO, msg.as_ptr().cast(), msg.len()) };
+    }
+
+    fn exit() -> ! {
+        todo!()
     }
 
     fn switch(_result: u64) -> VtlCallParam {
