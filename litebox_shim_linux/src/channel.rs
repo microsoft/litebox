@@ -66,7 +66,7 @@ impl<T> Producer<T> {
         Self {
             endpoint: EndPointer::new(rb, platform),
             peer: Weak::new(),
-            status: AtomicU32::new((flags & OFlags::STATUS_FLAGS_MASK).bits()),
+            status: AtomicU32::new((flags | OFlags::WRONLY).bits()),
         }
     }
 
@@ -128,7 +128,7 @@ impl<T> Consumer<T> {
         Self {
             endpoint: EndPointer::new(rb, platform),
             peer: Weak::new(),
-            status: AtomicU32::new((flags & OFlags::STATUS_FLAGS_MASK).bits()),
+            status: AtomicU32::new((flags | OFlags::RDONLY).bits()),
         }
     }
 

@@ -230,7 +230,8 @@ bitflags! {
             | Self::LARGEFILE.bits()
             | Self::NOATIME.bits()
             | Self::SYNC.bits()
-            | Self::PATH.bits();
+            | Self::PATH.bits()
+            | Self::RDWR.bits();
     }
 }
 
