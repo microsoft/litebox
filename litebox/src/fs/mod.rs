@@ -231,6 +231,8 @@ bitflags! {
             | Self::NOATIME.bits()
             | Self::SYNC.bits()
             | Self::PATH.bits()
+            | Self::RDONLY.bits()
+            | Self::WRONLY.bits()
             | Self::RDWR.bits();
     }
 }

@@ -3,6 +3,9 @@
 pub mod file;
 pub(crate) mod mm;
 
+#[cfg(test)]
+mod tests;
+
 macro_rules! common_functions_for_file_status {
     () => {
         pub(crate) fn get_status(&self) -> litebox::fs::OFlags {

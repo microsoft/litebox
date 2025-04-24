@@ -5,6 +5,7 @@
 use litebox::{
     fs::OFlags,
     platform::{RawConstPointer, RawMutPointer},
+    utils::TruncateExt,
 };
 
 pub mod errno;
@@ -286,11 +287,9 @@ impl FcntlArg {
     pub fn from(cmd: i32, arg: usize) -> Self {
         match cmd {
             F_GETFD => Self::GETFD,
-            #[allow(clippy::cast_possible_truncation)]
-            F_SETFD => Self::SETFD(FileDescriptorFlags::from_bits_truncate(arg as u32)),
+            F_SETFD => Self::SETFD(FileDescriptorFlags::from_bits_truncate(arg.truncate())),
             F_GETFL => Self::GETFL,
-            #[allow(clippy::cast_possible_truncation)]
-            F_SETFL => Self::SETFL(OFlags::from_bits_truncate(arg as u32)),
+            F_SETFL => Self::SETFL(OFlags::from_bits_truncate(arg.truncate())),
             _ => unimplemented!(),
         }
     }
