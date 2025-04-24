@@ -24,6 +24,7 @@ pub mod ptr;
 
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 
+#[expect(dead_code)]
 pub struct VtlCallParam {
     entry_reason: u32,
     args: [u64; 4],

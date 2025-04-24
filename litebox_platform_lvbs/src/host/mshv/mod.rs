@@ -1,15 +1,10 @@
 //! An implementation of [`crate::HostInterface`] for MSHV
 
-#[allow(unsafe_code)]
-#[allow(dead_code)]
-#[allow(non_snake_case)]
-#[allow(non_camel_case_types)]
-#[allow(non_upper_case_globals)]
-#[allow(unused_imports)]
-#[allow(improper_ctypes)]
-#[allow(clippy::all)]
-pub mod msr {
-    include!(concat!(env!("OUT_DIR"), "/msr_bindings.rs"));
+#[expect(non_camel_case_types)]
+#[expect(non_upper_case_globals)]
+#[expect(clippy::pub_underscore_fields)]
+pub mod msr_index {
+    include!(concat!(env!("OUT_DIR"), "/msr_index_bindings.rs"));
 }
 
 mod mshv_impl;

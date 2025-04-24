@@ -4,6 +4,7 @@
 use core::{arch::asm, panic::PanicInfo};
 use litebox_runner_lvbs::hlt_loop;
 
+#[expect(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
     unsafe {

@@ -5,6 +5,17 @@ use crate::ptr::{UserConstPtr, UserMutPtr};
 use crate::{Errno, HostInterface, VtlCallParam};
 use core::arch::asm;
 
+#[expect(unsafe_code)]
+#[expect(dead_code)]
+#[expect(non_snake_case)]
+#[expect(non_camel_case_types)]
+#[expect(non_upper_case_globals)]
+#[expect(unsafe_op_in_unsafe_fn)]
+#[expect(clippy::pub_underscore_fields)]
+mod bindings {
+    include!(concat!(env!("OUT_DIR"), "/mshv_bindings.rs"));
+}
+
 pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
 
 #[cfg(not(test))]
