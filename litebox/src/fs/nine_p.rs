@@ -1,12 +1,12 @@
 //! A network file system, using the 9p protocol
 
-use crate::platform;
+use crate::{LiteBox, platform};
 
 /// A backing implementation for [`FileSystem`](super::FileSystem) using a 9p-based network file
 /// system.
 // TODO(jayb): Reduce the requirements necessary on `Platform` to the most precise one possible.
 pub struct FileSystem<Platform: platform::Provider + 'static> {
-    platform: &'static Platform,
+    litebox: LiteBox<Platform>,
 }
 
 impl<Platform: platform::Provider + 'static> FileSystem<Platform> {
@@ -16,8 +16,10 @@ impl<Platform: platform::Provider + 'static> FileSystem<Platform> {
     /// and the created `FileSystem` handle is expected to be shared across all usage over the
     /// system.
     #[must_use]
-    pub fn new(platform: &'static Platform) -> Self {
-        Self { platform }
+    pub fn new(litebox: &LiteBox<Platform>) -> Self {
+        Self {
+            litebox: litebox.clone(),
+        }
     }
 }
 

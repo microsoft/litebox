@@ -476,12 +476,8 @@ pub fn sys_pipe2(flags: OFlags) -> Result<(u32, u32), Errno> {
         todo!("O_DIRECT not supported");
     }
 
-    let (writer, reader) = crate::channel::Channel::new(
-        DEFAULT_PIPE_BUF_SIZE,
-        flags,
-        litebox_platform_multiplex::platform(),
-    )
-    .split();
+    let (writer, reader) =
+        crate::channel::Channel::new(DEFAULT_PIPE_BUF_SIZE, flags, crate::litebox()).split();
     let close_on_exec = flags.contains(OFlags::CLOEXEC);
     let read_fd = file_descriptors().write().insert(Descriptor::PipeReader {
         consumer: reader,

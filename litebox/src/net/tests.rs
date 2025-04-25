@@ -75,15 +75,15 @@ fn bidi_tcp_comms(mut network: Network<MockPlatform>, comms: fn(&mut Network<Moc
 
 #[test]
 fn test_bidirectional_tcp_communication_default() {
-    let platform = MockPlatform::new();
-    let network = Network::new(platform);
+    let litebox = LiteBox::new(MockPlatform::new());
+    let network = Network::new(&litebox);
     bidi_tcp_comms(network, |_| {});
 }
 
 #[test]
 fn test_bidirectional_tcp_communication_manual() {
-    let platform = MockPlatform::new();
-    let mut network = Network::new(platform);
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
     network.set_platform_interaction(PlatformInteraction::Manual);
     bidi_tcp_comms(network, |nw| {
         while nw.perform_platform_interaction().call_again_immediately() {}
@@ -92,8 +92,8 @@ fn test_bidirectional_tcp_communication_manual() {
 
 #[test]
 fn test_bidirectional_tcp_communication_automatic() {
-    let platform = MockPlatform::new();
-    let mut network = Network::new(platform);
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
     network.set_platform_interaction(PlatformInteraction::Automatic);
     bidi_tcp_comms(network, |_| {});
 }

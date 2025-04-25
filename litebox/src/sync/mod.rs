@@ -55,12 +55,9 @@ pub struct Synchronization<Platform: RawSyncPrimitivesProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Synchronization<Platform> {
-    /// Construct a new `Synchronization` instance
-    ///
-    /// This function is expected to only be invoked once per platform, as an initialization step,
-    /// and the created `Synchronization` handle is expected to be shared across all usage over the
-    /// system.
-    pub fn new(platform: &'static Platform) -> Self {
+    /// Construct a new `Synchronization` instance. This is expected to be invoked only by
+    /// [`LiteBox`]'s creation method, and should not be invoked anywhere else in the codebase.
+    pub(crate) fn new_from_platform(platform: &'static Platform) -> Self {
         Self {
             platform,
             #[cfg(feature = "lock_tracing")]

@@ -19,6 +19,7 @@ use alloc::vec::Vec;
 use once_cell::race::OnceBox;
 
 use litebox::{
+    LiteBox,
     mm::{PageManager, linux::PAGE_SIZE},
     platform::{RawConstPointer as _, RawMutPointer as _},
     sync::RwLock,
@@ -39,6 +40,14 @@ type LinuxFS = litebox::fs::layered::FileSystem<
         litebox::fs::tar_ro::FileSystem<Platform>,
     >,
 >;
+
+/// Get the global litebox object
+pub fn litebox<'a>() -> &'a LiteBox<Platform> {
+    static LITEBOX: OnceBox<LiteBox<Platform>> = OnceBox::new();
+    LITEBOX.get_or_init(|| {
+        alloc::boxed::Box::new(LiteBox::new(litebox_platform_multiplex::platform()))
+    })
+}
 
 static FS: OnceBox<LinuxFS> = OnceBox::new();
 /// Set the global file system
@@ -64,21 +73,9 @@ pub fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
     FS.get().expect("fs has not yet been set")
 }
 
-pub(crate) fn litebox_sync<'a>() -> &'a litebox::sync::Synchronization<Platform> {
-    static SYNC: OnceBox<litebox::sync::Synchronization<Platform>> = OnceBox::new();
-    SYNC.get_or_init(|| {
-        alloc::boxed::Box::new(litebox::sync::Synchronization::new(
-            litebox_platform_multiplex::platform(),
-        ))
-    })
-}
-
 pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE> {
     static VMEM: OnceBox<PageManager<Platform, PAGE_SIZE>> = OnceBox::new();
-    VMEM.get_or_init(|| {
-        let vmm = PageManager::new(litebox_platform_multiplex::platform());
-        alloc::boxed::Box::new(vmm)
-    })
+    VMEM.get_or_init(|| alloc::boxed::Box::new(PageManager::new(litebox())))
 }
 
 // Convenience type aliases
@@ -177,7 +174,7 @@ pub(crate) fn file_descriptors<'a>() -> &'a RwLock<Platform, Descriptors> {
     static FILE_DESCRIPTORS: once_cell::race::OnceBox<RwLock<Platform, Descriptors>> =
         once_cell::race::OnceBox::new();
     FILE_DESCRIPTORS
-        .get_or_init(|| alloc::boxed::Box::new(litebox_sync().new_rwlock(Descriptors::new())))
+        .get_or_init(|| alloc::boxed::Box::new(litebox().sync().new_rwlock(Descriptors::new())))
 }
 
 /// Open a file

@@ -3,6 +3,7 @@
 use alloc::string::String;
 
 use crate::{
+    LiteBox,
     fd::{FileFd, OwnedFd},
     fs::{
         FileStatus, FileType, Mode, OFlags, SeekWhence,
@@ -24,16 +25,18 @@ pub struct FileSystem<Platform: crate::platform::StdioProvider + 'static> {
     current_working_dir: String,
 }
 
-impl<Platform: crate::platform::StdioProvider> FileSystem<Platform> {
+impl<Platform: crate::platform::StdioProvider + crate::sync::RawSyncPrimitivesProvider>
+    FileSystem<Platform>
+{
     /// Construct a new `FileSystem` instance
     ///
     /// This function is expected to only be invoked once per platform, as an initialiation step,
     /// and the created `FileSystem` handle is expected to be shared across all usage over the
     /// system.
     #[must_use]
-    pub fn new(platform: &'static Platform) -> Self {
+    pub fn new(litebox: &LiteBox<Platform>) -> Self {
         Self {
-            platform,
+            platform: litebox.x.platform,
             current_working_dir: "/".into(),
         }
     }

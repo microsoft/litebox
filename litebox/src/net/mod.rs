@@ -6,8 +6,8 @@ use core::net::{Ipv4Addr, SocketAddr};
 
 use crate::event::Events;
 use crate::fd::InternalFd;
-use crate::platform;
 use crate::platform::Instant;
+use crate::{LiteBox, platform, sync};
 use crate::{event::EventManager, fd::SocketFd};
 
 use bitflags::bitflags;
@@ -55,10 +55,8 @@ const MAX_PACKET_COUNT: usize = 32;
 /// `underlying_atomic`.
 pub struct Network<Platform>
 where
-    Platform: platform::IPInterfaceProvider
-        + platform::TimeProvider
-        + platform::RawMutexProvider
-        + 'static,
+    Platform:
+        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
 {
     platform: &'static Platform,
     /// Events, and their manager
@@ -86,15 +84,16 @@ where
 
 impl<Platform> Network<Platform>
 where
-    Platform: platform::IPInterfaceProvider + platform::TimeProvider + platform::RawMutexProvider,
+    Platform:
+        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
 {
     /// Construct a new `Network` instance
     ///
     /// This function is expected to only be invoked once per platform, as an initialization step,
     /// and the created `Network` handle is expected to be shared across all usage over the
     /// system.
-    pub fn new(platform: &'static Platform) -> Self {
-        let mut device = phy::Device::new(platform);
+    pub fn new(litebox: &LiteBox<Platform>) -> Self {
+        let mut device = phy::Device::new(litebox.x.platform);
         let config = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
         let mut interface =
             smoltcp::iface::Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
@@ -115,13 +114,13 @@ where
             _ => unreachable!(),
         }
         Self {
-            platform,
-            event_manager: EventManager::new(platform),
+            platform: litebox.x.platform,
+            event_manager: EventManager::new(litebox),
             socket_set: smoltcp::iface::SocketSet::new(vec![]),
             handles: vec![],
             device,
             interface,
-            zero_time: platform.now(),
+            zero_time: litebox.x.platform.now(),
             local_port_allocator: LocalPortAllocator::new(),
             platform_interaction: PlatformInteraction::Automatic,
         }
@@ -339,7 +338,8 @@ impl PlatformInteractionReinvocationAdvice {
 
 impl<Platform> Network<Platform>
 where
-    Platform: platform::IPInterfaceProvider + platform::TimeProvider + platform::RawMutexProvider,
+    Platform:
+        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
 {
     /// Sets the interaction with the outside world to `platform_interaction`.
     ///
@@ -463,7 +463,8 @@ where
 
 impl<Platform> Network<Platform>
 where
-    Platform: platform::IPInterfaceProvider + platform::TimeProvider + platform::RawMutexProvider,
+    Platform:
+        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
 {
     /// Explicitly private-only function that returns the current (smoltcp) Instant, relative to the
     /// initialized arbitrary 0-point in time.
