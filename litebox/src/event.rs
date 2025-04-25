@@ -12,8 +12,10 @@ use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::{
+    LiteBox,
     fd::{FileFd, InternalFd, SocketFd},
-    platform::{self, ImmediatelyWokenUp, RawMutex, RawMutexProvider, UnblockedOrTimedOut},
+    platform::{ImmediatelyWokenUp, RawMutex, RawMutexProvider, UnblockedOrTimedOut},
+    sync::RawSyncPrimitivesProvider,
     utilities::array_index_map::{ArrayIndexMap, Index},
 };
 
@@ -29,7 +31,7 @@ pub const CONFIG_MAX_WAITABLES: usize = 128;
 /// The `EventManager` provides access to the ability to wait on events on files and sockets.
 ///
 /// A LiteBox `EventManager` is parametric in the platform it runs on.
-pub struct EventManager<Platform: platform::RawMutexProvider + 'static> {
+pub struct EventManager<Platform: RawSyncPrimitivesProvider> {
     platform: &'static Platform,
     triggered_events: ArrayIndexMap<Arc<Platform::RawMutex>, CONFIG_MAX_WAITABLES>,
     // We use a `SmallVec` here to prevent unnecessary heap allocation for the common case of having
@@ -39,22 +41,22 @@ pub struct EventManager<Platform: platform::RawMutexProvider + 'static> {
     fd_to_indexes: HashMap<InternalFd, SmallVec<[Index; 2]>>,
 }
 
-impl<Platform: platform::RawMutexProvider> EventManager<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> EventManager<Platform> {
     /// Construct a new `EventManager` instance
     ///
     /// This function is expected to only be invoked once per platform, as an initialization step,
     /// and the created `EventManager` handle is expected to be shared across all usage over the
     /// system.
-    pub fn new(platform: &'static Platform) -> Self {
+    pub fn new(litebox: &LiteBox<Platform>) -> Self {
         Self {
-            platform,
+            platform: litebox.x.platform,
             triggered_events: ArrayIndexMap::new(),
             fd_to_indexes: HashMap::new(),
         }
     }
 }
 
-impl<Platform: platform::RawMutexProvider> EventManager<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> EventManager<Platform> {
     /// Register interest in waiting on events.
     ///
     /// Returns a [`Waitable`] that supports a `wait` method to wait until the registered conditions
