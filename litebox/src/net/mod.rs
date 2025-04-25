@@ -884,6 +884,7 @@ where
 
 /// Protocols for sockets supported by LiteBox
 #[non_exhaustive]
+#[derive(Debug, PartialEq)]
 pub enum Protocol {
     Tcp,
     Udp,

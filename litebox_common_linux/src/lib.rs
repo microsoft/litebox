@@ -443,6 +443,16 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pathname: Platform::RawConstPointer<i8>,
         mode: AccessFlags,
     },
+    Socket {
+        domain: AddressFamily,
+        ty: SockType,
+        flags: SockFlags,
+        /// The `protocol` specifies a particular protocol to be used with the
+        /// socket.  Normally only a single protocol exists to support a
+        /// particular socket type within a given protocol family, in which case
+        /// protocol can be specified as `None`.
+        protocol: Option<litebox::net::Protocol>,
+    },
     Fcntl {
         fd: i32,
         arg: FcntlArg,

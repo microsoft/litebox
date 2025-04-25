@@ -223,3 +223,12 @@ impl From<litebox::fs::errors::FileStatusError> for Errno {
         }
     }
 }
+
+impl From<litebox::net::errors::SocketError> for Errno {
+    fn from(value: litebox::net::errors::SocketError) -> Self {
+        match value {
+            litebox::net::errors::SocketError::UnsupportedProtocol(_) => Errno::EPROTONOSUPPORT,
+            _ => unimplemented!(),
+        }
+    }
+}

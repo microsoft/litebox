@@ -297,6 +297,24 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                 syscall_args[1].reinterpret_as_signed().truncate(),
             ),
         },
+        libc::SYS_socket => {
+            let domain: u32 = syscall_args[0].truncate();
+            let ty: u32 = syscall_args[1].truncate();
+            SyscallRequest::Socket {
+                domain: litebox_common_linux::AddressFamily::from(domain),
+                ty: litebox_common_linux::SockType::from(ty),
+                flags: litebox_common_linux::SockFlags::from_bits_truncate(
+                    syscall_args[2].truncate(),
+                ),
+                protocol: if syscall_args[3] == 0 {
+                    None
+                } else {
+                    Some(litebox_common_linux::protocol_from_u8(
+                        syscall_args[3].truncate(),
+                    ))
+                },
+            }
+        }
         libc::SYS_fcntl => SyscallRequest::Fcntl {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
             arg: litebox_common_linux::FcntlArg::from(
