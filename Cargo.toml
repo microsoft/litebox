@@ -5,7 +5,6 @@ members = [
     "litebox_common_linux",
     "litebox_platform_linux_kernel",
     "litebox_platform_linux_userland",
-    "litebox_platform_lvbs",
     "litebox_platform_multiplex",
     "litebox_runner_linux_userland",
     "litebox_shim_linux",
@@ -14,6 +13,7 @@ members = [
 
 # exclude binaries which need different toolchain and build target.
 exclude = [
+    "litebox_platform_lvbs",
     "litebox_runner_lvbs"
 ]
 
