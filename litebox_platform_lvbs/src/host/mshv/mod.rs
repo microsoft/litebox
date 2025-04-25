@@ -2,7 +2,6 @@
 
 #[expect(non_camel_case_types)]
 #[expect(non_upper_case_globals)]
-#[expect(clippy::pub_underscore_fields)]
 pub mod msr_index {
     include!(concat!(env!("OUT_DIR"), "/msr_index_bindings.rs"));
 }

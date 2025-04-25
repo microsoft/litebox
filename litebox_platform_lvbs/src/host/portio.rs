@@ -6,7 +6,7 @@ use spin::Mutex;
 // LVBS uses COM PORT 2 for printing out debug messages
 const COM_PORT_2: u16 = 0x2F8;
 
-#[inline(always)]
+#[inline]
 fn outb(port: u16, value: u8) {
     unsafe {
         asm!("\
@@ -15,7 +15,7 @@ fn outb(port: u16, value: u8) {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn inb(port: u16) -> u8 {
     let mut value: u8;
 
@@ -34,7 +34,7 @@ pub struct ComPort {
 
 impl ComPort {
     pub const fn new(port: u16) -> Self {
-        ComPort { port: port }
+        ComPort { port }
     }
 
     pub fn init(&mut self) {
