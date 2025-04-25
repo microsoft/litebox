@@ -2,15 +2,17 @@ use crate::kernel_context::{
     INTERRUPT_STACK_SIZE, MAX_CORES, get_core_id, get_per_core_kernel_context,
 };
 use core::mem::MaybeUninit;
-use x86_64::instructions::{
-    segmentation::{CS, DS, Segment},
-    tables::load_tss,
+use x86_64::{
+    PrivilegeLevel, VirtAddr,
+    instructions::{
+        segmentation::{CS, DS, Segment},
+        tables::load_tss,
+    },
+    structures::{
+        gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector},
+        tss::TaskStateSegment,
+    },
 };
-use x86_64::structures::{
-    gdt::{Descriptor, DescriptorFlags, GlobalDescriptorTable, SegmentSelector},
-    tss::TaskStateSegment,
-};
-use x86_64::{PrivilegeLevel, VirtAddr};
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
@@ -19,7 +21,7 @@ pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 pub struct AlignedTss(pub TaskStateSegment);
 
 #[derive(Clone, Copy)]
-pub struct Selectors {
+struct Selectors {
     kernel_code: SegmentSelector,
     kernel_data: SegmentSelector,
     tss: SegmentSelector,
@@ -46,8 +48,8 @@ impl Default for Selectors {
 }
 
 pub struct GdtWrapper {
-    pub gdt: GlobalDescriptorTable,
-    pub selectors: Selectors,
+    gdt: GlobalDescriptorTable,
+    selectors: Selectors,
 }
 
 impl GdtWrapper {
@@ -79,14 +81,10 @@ fn setup_gdt_tss() {
     tss.0.interrupt_stack_table[0] = stack_end;
 
     let gdt = unsafe { &mut *GDT_STORAGE[core_id].as_mut_ptr() };
-
     *gdt = GdtWrapper::new();
-    let kernel_data_flags =
-        DescriptorFlags::USER_SEGMENT | DescriptorFlags::PRESENT | DescriptorFlags::WRITABLE;
+
     gdt.selectors.kernel_code = gdt.gdt.append(Descriptor::kernel_code_segment());
-    gdt.selectors.kernel_data = gdt
-        .gdt
-        .append(Descriptor::UserSegment(kernel_data_flags.bits()));
+    gdt.selectors.kernel_data = gdt.gdt.append(Descriptor::kernel_data_segment());
     gdt.selectors.tss = gdt.gdt.append(Descriptor::tss_segment(&tss.0));
     gdt.selectors.user_code = gdt.gdt.append(Descriptor::user_code_segment());
     gdt.selectors.user_data = gdt.gdt.append(Descriptor::user_data_segment());

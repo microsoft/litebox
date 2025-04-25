@@ -6,8 +6,7 @@ use lazy_static::lazy_static;
 use litebox_platform_lvbs::{
     arch::{gdt, interrupts},
     host::LvbsLinuxKernel,
-    mshv::hvcall,
-    mshv::vtl1_mem_layout::get_memory_base_address,
+    mshv::{hvcall, vtl1_mem_layout::get_memory_base_address},
 };
 use litebox_runner_lvbs::hlt_loop;
 use spin::Mutex;
@@ -42,7 +41,10 @@ pub fn kernel_main() -> ! {
 
     // set up VTL1 environment
     unsafe {
-        asm!("vmcall", in("rax") 0x0, in("rcx") 0x12, in("r8") 0);
+        asm!(
+            "vmcall",
+             in("rax") 0x0, in("rcx") 0x12, in("r8") 0
+        );
     }
     // kernel.switch(0);
 

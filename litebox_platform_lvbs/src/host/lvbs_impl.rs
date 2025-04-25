@@ -1,8 +1,10 @@
 //! An implementation of [`HostInterface`] for LVBS
 
-use crate::host::{linux::sigset_t, portio::port_print_string};
-use crate::ptr::{UserConstPtr, UserMutPtr};
-use crate::{Errno, HostInterface, VtlCallParam};
+use crate::{
+    Errno, HostInterface, VtlCallParam,
+    host::{linux::sigset_t, portio::port_print_string},
+    ptr::{UserConstPtr, UserMutPtr},
+};
 use core::arch::asm;
 
 pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
@@ -99,7 +101,10 @@ impl HostInterface for HostLvbsInterface {
         // restore VTL0 registers
 
         unsafe {
-            asm!("vmcall", in("rax") 0x0, in("rcx") 0x12, in("r8") result);
+            asm!(
+                "vmcall",
+                 in("rax") 0x0, in("rcx") 0x12, in("r8") result
+            );
         }
 
         // save VTL0 registers

@@ -1,28 +1,31 @@
-use core::arch::asm;
-use core::fmt;
+use core::{arch::asm, fmt};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
 // LVBS uses COM PORT 2 for printing out debug messages
 const COM_PORT_2: u16 = 0x2F8;
 
-#[inline]
+#[expect(clippy::inline_always)]
+#[inline(always)]
 fn outb(port: u16, value: u8) {
     unsafe {
-        asm!("\
-        out dx, al",
-        in("dx") port, in("al") value);
+        asm!(
+            "out dx, al",
+            in("dx") port, in("al") value
+        );
     }
 }
 
-#[inline]
+#[expect(clippy::inline_always)]
+#[inline(always)]
 fn inb(port: u16) -> u8 {
     let mut value: u8;
 
     unsafe {
-        asm!("\
-        in al, dx",
-        in("dx") port, out("al") value);
+        asm!(
+            "in al, dx",
+            in("dx") port, out("al") value
+        );
     }
 
     value
