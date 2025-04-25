@@ -17,11 +17,11 @@ macro_rules! mock_log_println {
 }
 
 impl HostInterface for MockHostInterface {
-    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::Errno> {
+    fn alloc(_layout: &core::alloc::Layout) -> Result<(usize, usize), crate::Errno> {
         todo!()
     }
 
-    unsafe fn free(addr: usize) {
+    unsafe fn free(_addr: usize) {
         todo!()
     }
 
