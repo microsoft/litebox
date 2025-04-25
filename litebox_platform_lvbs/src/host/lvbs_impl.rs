@@ -1,40 +1,23 @@
 //! An implementation of [`HostInterface`] for LVBS
 
-use crate::host::linux::sigset_t;
+use crate::host::{linux::sigset_t, portio::port_print_string};
 use crate::ptr::{UserConstPtr, UserMutPtr};
 use crate::{Errno, HostInterface, VtlCallParam};
 use core::arch::asm;
-
-#[expect(clippy::cast_lossless)]
-#[expect(clippy::cast_possible_truncation)]
-#[expect(clippy::cast_possible_wrap)]
-#[expect(clippy::default_trait_access)]
-#[expect(clippy::unnecessary_cast)]
-#[expect(clippy::used_underscore_binding)]
-#[expect(clippy::useless_transmute)]
-#[expect(clippy::ptr_as_ptr)]
-#[expect(clippy::ptr_offset_with_cast)]
-#[expect(clippy::ref_as_ptr)]
-#[expect(clippy::semicolon_if_nothing_returned)]
-#[expect(clippy::similar_names)]
-#[expect(clippy::too_many_arguments)]
-#[expect(clippy::too_many_lines)]
-#[expect(clippy::transmute_ptr_to_ptr)]
-#[expect(clippy::trivially_copy_pass_by_ref)]
-#[expect(dead_code)]
-#[expect(non_camel_case_types)]
-#[expect(non_snake_case)]
-#[expect(non_upper_case_globals)]
-#[expect(unsafe_code)]
-#[expect(unsafe_op_in_unsafe_fn)]
-mod bindings {
-    include!(concat!(env!("OUT_DIR"), "/mshv_bindings.rs"));
-}
 
 pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
 
 #[cfg(not(test))]
 mod alloc {
+    const HEAP_ORDER: usize = 21;
+
+    #[global_allocator]
+    static LVBS_ALLOCATOR: crate::mm::alloc::SafeZoneAllocator<
+        'static,
+        HEAP_ORDER,
+        super::LvbsLinuxKernel,
+    > = crate::mm::alloc::SafeZoneAllocator::new();
+
     impl crate::mm::MemoryProvider for super::LvbsLinuxKernel {
         const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(0);
         const PRIVATE_PTE_MASK: u64 = 0;
@@ -70,8 +53,8 @@ impl HostInterface for HostLvbsInterface {
         unimplemented!()
     }
 
-    fn log(_msg: &str) {
-        unimplemented!()
+    fn log(msg: &str) {
+        port_print_string(msg);
     }
 
     fn alloc(_layout: &core::alloc::Layout) -> Result<(usize, usize), Errno> {

@@ -106,3 +106,7 @@ macro_rules! port_println {
     () => ($crate::port_print!("\n"));
     ($($arg:tt)*) => ($crate::port_print!("{}\n", format_args!($($arg)*)));
 }
+
+pub fn port_print_string(s: &str) {
+    COM.lock().write_string(s);
+}

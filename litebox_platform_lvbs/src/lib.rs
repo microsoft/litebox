@@ -1,4 +1,4 @@
-//! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox in kernel mode
+//! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox in VTL1 kernel mode
 
 #![no_std]
 
@@ -19,7 +19,9 @@ extern crate alloc;
 
 pub mod arch;
 pub mod host;
+pub mod kernel_context;
 pub mod mm;
+pub mod mshv;
 pub mod ptr;
 
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);

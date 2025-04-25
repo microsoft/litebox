@@ -8,5 +8,7 @@ pub(crate) use x86_64::{
     },
 };
 
+pub mod msr;
+
 #[cfg(test)]
 pub(crate) use x86_64::structures::paging::mapper::{MappedFrame, TranslateResult};
