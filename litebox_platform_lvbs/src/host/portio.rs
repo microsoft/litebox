@@ -98,7 +98,7 @@ pub fn _print(args: ::core::fmt::Arguments) {
 
 #[macro_export]
 macro_rules! port_print {
-    ($($arg:tt)*) => ($crate::portio::_print(format_args!($($arg)*)));
+    ($($arg:tt)*) => ($crate::host::portio::_print(format_args!($($arg)*)));
 }
 
 #[macro_export]

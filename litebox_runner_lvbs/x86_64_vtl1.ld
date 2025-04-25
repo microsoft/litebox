@@ -15,6 +15,8 @@ SECTIONS
     .text : ALIGN(0x200000) {
         *(.text._start)
         *(.text.*)
+	. = ALIGN(0x1000);
+	_hypercall_page = .;
         *(.got)
     }
     .data : ALIGN(0x200000) { 

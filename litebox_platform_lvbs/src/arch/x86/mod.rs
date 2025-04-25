@@ -8,6 +8,8 @@ pub(crate) use x86_64::{
     },
 };
 
+pub mod gdt;
+pub mod interrupts;
 pub mod msr;
 
 #[cfg(test)]

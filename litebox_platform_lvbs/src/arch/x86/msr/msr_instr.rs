@@ -1,7 +1,6 @@
 use core::arch::asm;
 
 #[expect(clippy::inline_always)]
-#[expect(dead_code)]
 #[inline(always)]
 pub fn rdmsr(msr: u32) -> u64 {
     let low: u32;

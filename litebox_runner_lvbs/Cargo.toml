@@ -17,5 +17,6 @@ features = ["spin_no_std"]
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = { version = "0.15.2", default-features = false, features = [
+  "abi_x86_interrupt",
   "instructions",
 ] }

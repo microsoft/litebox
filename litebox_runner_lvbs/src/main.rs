@@ -4,7 +4,10 @@
 use core::{arch::asm, panic::PanicInfo};
 use lazy_static::lazy_static;
 use litebox_platform_lvbs::{
-    host::LvbsLinuxKernel, mshv::vtl1_mem_layout::get_memory_base_address,
+    arch::{gdt, interrupts},
+    host::LvbsLinuxKernel,
+    mshv::hvcall,
+    mshv::vtl1_mem_layout::get_memory_base_address,
 };
 use litebox_runner_lvbs::hlt_loop;
 use spin::Mutex;
@@ -31,6 +34,12 @@ pub unsafe extern "C" fn _start() -> ! {
 }
 
 pub fn kernel_main() -> ! {
+    gdt::init();
+    interrupts::init_idt();
+    hvcall::per_core_init();
+
+    // port_println!("LiteBox VTL1 Runner");
+
     // set up VTL1 environment
     unsafe {
         asm!("vmcall", in("rax") 0x0, in("rcx") 0x12, in("r8") 0);

@@ -1,6 +1,7 @@
 //! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox in VTL1 kernel mode
 
 #![no_std]
+#![feature(abi_x86_interrupt)]
 
 use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};

@@ -1,69 +1,49 @@
-use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
-use x86_64::PrivilegeLevel;
-use x86_64::structures::gdt::{GlobalDescriptorTable, SegmentSelector};
+use crate::{
+    arch::gdt,
+    mshv::{mshv_bindings::hv_vp_assist_page, vtl1_mem_layout::PAGE_SIZE},
+};
 use x86_64::structures::tss::TaskStateSegment;
 
-const MAX_CORES: usize = 8; // for now
-const INTERRUPT_STACK_SIZE: usize = 2 * PAGE_SIZE;
-const KERNEL_STACK_SIZE: usize = 8 * PAGE_SIZE;
-// const DOUBLE_FAULT_IST_INDEX: u16 = 0;
-
-#[expect(dead_code)]
-#[repr(align(16))]
-#[derive(Clone, Copy)]
-struct AlignedTss(TaskStateSegment);
-
-#[expect(dead_code)]
-#[derive(Clone, Copy)]
-struct Selectors {
-    kernel_code: SegmentSelector,
-    kernel_data: SegmentSelector,
-    tss: SegmentSelector,
-    user_data: SegmentSelector,
-    user_code: SegmentSelector,
-}
-
-#[expect(dead_code)]
-impl Selectors {
-    pub fn new() -> Self {
-        Selectors {
-            kernel_code: SegmentSelector::new(0, PrivilegeLevel::Ring3),
-            kernel_data: SegmentSelector::new(0, PrivilegeLevel::Ring3),
-            tss: SegmentSelector::new(0, PrivilegeLevel::Ring3),
-            user_data: SegmentSelector::new(0, PrivilegeLevel::Ring3),
-            user_code: SegmentSelector::new(0, PrivilegeLevel::Ring3),
-        }
-    }
-}
-
-#[expect(dead_code)]
-struct GdtWrapper {
-    gdt: GlobalDescriptorTable,
-    selectors: Selectors,
-}
+pub const MAX_CORES: usize = 8; // for now
+pub const INTERRUPT_STACK_SIZE: usize = 2 * PAGE_SIZE;
+pub const KERNEL_STACK_SIZE: usize = 8 * PAGE_SIZE;
 
 // Per-core VTL1 kernel context
-#[expect(dead_code)]
 #[repr(align(4096))]
 #[derive(Clone, Copy)]
-struct KernelContext {
-    hv_vp_assist_page: [u8; PAGE_SIZE],
-    interrupt_stack: [u8; INTERRUPT_STACK_SIZE],
+pub struct KernelContext {
+    pub hv_vp_assist_page: hv_vp_assist_page,
+    pub interrupt_stack: [u8; INTERRUPT_STACK_SIZE],
     _guard_page_0: [u8; PAGE_SIZE],
-    kernel_stack: [u8; KERNEL_STACK_SIZE],
+    pub kernel_stack: [u8; KERNEL_STACK_SIZE],
     _guard_page_1: [u8; PAGE_SIZE],
-    tss: AlignedTss,
-    gdt: Option<&'static GdtWrapper>,
+    pub tss: gdt::AlignedTss,
+    pub gdt: Option<&'static gdt::GdtWrapper>,
 }
 
 // TODO: use heap later
-#[expect(dead_code)]
 static mut PER_CORE_KERNEL_CONTEXT: [KernelContext; MAX_CORES] = [KernelContext {
-    hv_vp_assist_page: [0u8; PAGE_SIZE],
+    hv_vp_assist_page: unsafe { core::mem::zeroed() },
     interrupt_stack: [0u8; INTERRUPT_STACK_SIZE],
     _guard_page_0: [0u8; PAGE_SIZE],
     kernel_stack: [0u8; KERNEL_STACK_SIZE],
     _guard_page_1: [0u8; PAGE_SIZE],
-    tss: AlignedTss(TaskStateSegment::new()),
+    tss: gdt::AlignedTss(TaskStateSegment::new()),
     gdt: const { None },
 }; MAX_CORES];
+
+#[inline]
+pub fn get_core_id() -> usize {
+    use core::arch::x86_64::__cpuid_count as cpuid_count;
+    const CPU_VERSION_INFO: u32 = 1;
+
+    let result = unsafe { cpuid_count(CPU_VERSION_INFO, 0x0) };
+    let apic_id = (result.ebx >> 24) & 0xff;
+
+    apic_id as usize
+}
+
+pub fn get_per_core_kernel_context() -> &'static mut KernelContext {
+    let core_id = get_core_id();
+    unsafe { &mut PER_CORE_KERNEL_CONTEXT[core_id] }
+}

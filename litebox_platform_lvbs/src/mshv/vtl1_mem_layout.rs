@@ -25,13 +25,13 @@ pub const VTL1_CMDLINE_PAGE: usize = VTL1_BOOT_PARAMS_PAGE + 1;
 
 // repurpose page frames pre-allocated for VTL1 kernel
 // TODO: use heap or embed this info in the binary
-pub const VTL1_HEAP_START_PAGE: usize = 3092;
-pub const VTL1_HEAP_END_PAGE: usize = 4091;
-pub const VTL1_TEMP_PTE_PAGE: usize = 4092;
-pub const VTL1_VP_ASSIST_PAGE: usize = 4093;
-pub const VTL1_HYPERCALL_PAGE: usize = 4094;
-pub const VTL1_HV_SIMP_PAGE: usize = 4095;
-pub const VTL1_EXT_PTE_BASE: usize = 4096;
+// pub const VTL1_HEAP_START_PAGE: usize = 3092;
+// pub const VTL1_HEAP_END_PAGE: usize = 4091;
+// pub const VTL1_TEMP_PTE_PAGE: usize = 4092;
+// pub const VTL1_VP_ASSIST_PAGE: usize = 4093;
+// pub const VTL1_HYPERCALL_PAGE: usize = 4094;
+// pub const VTL1_HV_SIMP_PAGE: usize = 4095;
+// pub const VTL1_EXT_PTE_BASE: usize = 4096;
 
 // special user pages
 // TODO: use heap
@@ -42,8 +42,10 @@ pub const VTL1_EXT_PTE_BASE: usize = 4096;
 
 unsafe extern "C" {
     static _memory_base: u8;
+    static _hypercall_page: u8;
 }
 
+// TODO: should be removed in the future
 #[inline]
 pub fn get_memory_base_address() -> u64 {
     &raw const _memory_base as u64
@@ -53,4 +55,10 @@ pub fn get_memory_base_address() -> u64 {
 #[inline]
 pub fn get_address_from_page(page: usize) -> u64 {
     get_memory_base_address() + (page as u64) * PAGE_SIZE as u64
+}
+
+// A hypercall page is a shared read-only page, so it doesn't have to use heap.
+#[inline]
+pub fn get_hypercall_page_address() -> u64 {
+    &raw const _hypercall_page as u64
 }

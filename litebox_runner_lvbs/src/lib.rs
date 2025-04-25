@@ -15,17 +15,6 @@ pub fn hlt_loop() -> ! {
     }
 }
 
-#[inline]
-pub fn get_core_id() -> usize {
-    use core::arch::x86_64::__cpuid_count as cpuid_count;
-    const CPU_VERSION_INFO: u32 = 1;
-
-    let result = unsafe { cpuid_count(CPU_VERSION_INFO, 0x0) };
-    let apic_id = (result.ebx >> 24) & 0xff;
-
-    apic_id as usize
-}
-
 struct BootParamsWrapper {
     page: &'static mut BootParams,
 }
