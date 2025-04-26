@@ -51,22 +51,6 @@ macro_rules! common_functions_for_channel {
                 true
             }
         }
-
-        pub(crate) fn get_status(&self) -> OFlags {
-            OFlags::from_bits(self.status.load(core::sync::atomic::Ordering::Relaxed)).unwrap()
-        }
-
-        pub(crate) fn set_status(&self, flag: OFlags, on: bool) {
-            if on {
-                self.status
-                    .fetch_or(flag.bits(), core::sync::atomic::Ordering::Relaxed);
-            } else {
-                self.status.fetch_and(
-                    flag.complement().bits(),
-                    core::sync::atomic::Ordering::Relaxed,
-                );
-            }
-        }
     };
 }
 
@@ -82,7 +66,7 @@ impl<T> Producer<T> {
         Self {
             endpoint: EndPointer::new(rb, litebox),
             peer: Weak::new(),
-            status: AtomicU32::new((flags & OFlags::STATUS_FLAGS_MASK).bits()),
+            status: AtomicU32::new((flags | OFlags::WRONLY).bits()),
         }
     }
 
@@ -124,6 +108,7 @@ impl<T> Producer<T> {
     }
 
     common_functions_for_channel!();
+    crate::syscalls::common_functions_for_file_status!();
 }
 
 impl<T> Drop for Producer<T> {
@@ -143,7 +128,7 @@ impl<T> Consumer<T> {
         Self {
             endpoint: EndPointer::new(rb, litebox),
             peer: Weak::new(),
-            status: AtomicU32::new((flags & OFlags::STATUS_FLAGS_MASK).bits()),
+            status: AtomicU32::new((flags | OFlags::RDONLY).bits()),
         }
     }
 
@@ -190,6 +175,7 @@ impl<T> Consumer<T> {
     }
 
     common_functions_for_channel!();
+    crate::syscalls::common_functions_for_file_status!();
 }
 
 impl<T> Drop for Consumer<T> {
