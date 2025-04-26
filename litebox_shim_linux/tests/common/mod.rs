@@ -10,6 +10,7 @@ use litebox_shim_linux::{
     litebox_fs, loader::load_program, set_fs, syscall_entry, syscalls::file::sys_open,
 };
 
+#[cfg(target_arch = "x86_64")]
 global_asm!(
     "
     .text
@@ -20,6 +21,22 @@ trampoline:
     xor rdx, rdx
     mov	rsp, rsi
     jmp	rdi
+    /* Should not reach. */
+    hlt"
+);
+#[cfg(target_arch = "x86")]
+global_asm!(
+    "
+    .text
+    .align  4
+    .globl  trampoline
+    .type   trampoline,@function
+trampoline:
+    xor     edx, edx
+    mov     eax, [esp + 4]
+    mov     ebx, [esp]
+    mov     esp, eax
+    jmp     ebx
     /* Should not reach. */
     hlt"
 );
