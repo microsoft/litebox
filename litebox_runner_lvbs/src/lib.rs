@@ -1,21 +1,20 @@
 #![no_std]
 
-use core::arch::asm;
 use lazy_static::lazy_static;
 use linux_boot_params::{BootE820Entry, BootParams, E820Type};
-use litebox_platform_lvbs::mshv::vtl1_mem_layout::{
-    VTL1_BOOT_PARAMS_PAGE, get_address_of_special_page,
+use litebox_platform_lvbs::{
+    arch::{gdt, interrupts},
+    mshv::{
+        hvcall,
+        vtl1_mem_layout::{VTL1_BOOT_PARAMS_PAGE, get_address_of_special_page},
+    },
 };
 use spin::Mutex;
 
-#[expect(clippy::inline_always)]
-#[inline(always)]
-pub fn hlt_loop() -> ! {
-    loop {
-        unsafe {
-            asm!("hlt");
-        }
-    }
+pub fn per_core_init() {
+    gdt::init();
+    interrupts::init_idt();
+    hvcall::init();
 }
 
 struct BootParamsWrapper {

@@ -1,22 +1,9 @@
-use crate::port_println;
-use core::arch::asm;
+use crate::{arch::instrs::hlt_loop, port_println};
 use lazy_static::lazy_static;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
-// TODO: don't duplicate this
-#[expect(clippy::inline_always)]
-#[inline(always)]
-pub fn hlt_loop() -> ! {
-    loop {
-        unsafe {
-            asm!("hlt");
-        }
-    }
-}
-
-// TODO: per-core?
 lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
         let mut idt = InterruptDescriptorTable::new();

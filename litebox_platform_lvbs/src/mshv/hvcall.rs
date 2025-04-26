@@ -1,5 +1,5 @@
 use crate::{
-    arch::msr::msr_instr::{rdmsr, wrmsr},
+    arch::instrs::{rdmsr, wrmsr},
     kernel_context::get_per_core_kernel_context,
     mshv::mshv_bindings::{
         HV_X64_MSR_GUEST_OS_ID, HV_X64_MSR_HYPERCALL, HV_X64_MSR_HYPERCALL_ENABLE,
@@ -31,7 +31,7 @@ fn generate_guest_id(dinfo1: u64, kernver: u64, dinfo2: u64) -> u64 {
 /// Enable Hyper-V hypercalls by initializing MSR and VP registers (per core)
 /// # Panics
 /// Panics if the underlying hardware/platform is not Hyper-V
-pub fn per_core_hvcall_enable() {
+pub fn init() {
     #[cfg(not(test))]
     assert!(is_hyperv());
 

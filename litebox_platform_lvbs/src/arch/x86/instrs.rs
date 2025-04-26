@@ -2,6 +2,16 @@ use core::arch::asm;
 
 #[expect(clippy::inline_always)]
 #[inline(always)]
+pub fn hlt_loop() -> ! {
+    loop {
+        unsafe {
+            asm!("hlt");
+        }
+    }
+}
+
+#[expect(clippy::inline_always)]
+#[inline(always)]
 pub fn rdmsr(msr: u32) -> u64 {
     let low: u32;
     let high: u32;

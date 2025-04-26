@@ -98,20 +98,3 @@ fn setup_gdt_tss() {
 pub fn init() {
     setup_gdt_tss();
 }
-
-/// # Panics
-/// Panics if GDT has not been initialized
-#[inline]
-pub fn set_usermode_segs() -> (u16, u16) {
-    let kernel_context = get_per_core_kernel_context();
-
-    let gdt = kernel_context.gdt.unwrap();
-    let mut cs = gdt.selectors.user_code;
-    let mut ds = gdt.selectors.user_data;
-    cs.0 |= PrivilegeLevel::Ring3 as u16;
-    ds.0 |= PrivilegeLevel::Ring3 as u16;
-    unsafe {
-        DS::set_reg(ds);
-    }
-    (cs.0, ds.0)
-}
