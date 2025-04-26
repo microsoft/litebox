@@ -461,14 +461,24 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                 | OFlags::NDELAY
                 | OFlags::DIRECT
                 | OFlags::NOATIME;
+            macro_rules! toggle_flags {
+                ($t:ident) => {
+                    let diff = $t.get_status() ^ flags;
+                    if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
+                        todo!("unsupported flags");
+                    }
+                    $t.set_status(flags & setfl_mask, true);
+                    $t.set_status(flags.complement() & setfl_mask, false);
+                };
+            }
             match desc {
                 Descriptor::File(file) => todo!(),
                 Descriptor::Socket(socket) => todo!(),
                 Descriptor::PipeReader { consumer, .. } => {
-                    toggle_flags!(consumer, flags, setfl_mask);
+                    toggle_flags!(consumer);
                 }
                 Descriptor::PipeWriter { producer, .. } => {
-                    toggle_flags!(producer, flags, setfl_mask);
+                    toggle_flags!(producer);
                 }
             }
             Ok(0)
