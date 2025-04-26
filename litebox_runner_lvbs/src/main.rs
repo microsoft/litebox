@@ -6,7 +6,9 @@ use lazy_static::lazy_static;
 use litebox_platform_lvbs::{
     arch::{gdt, interrupts},
     host::LvbsLinuxKernel,
+    kernel_context::{KERNEL_STACK_SIZE, get_per_core_kernel_context},
     mshv::{hvcall, vtl1_mem_layout::get_memory_base_address},
+    port_println,
 };
 use litebox_runner_lvbs::hlt_loop;
 use spin::Mutex;
@@ -21,11 +23,16 @@ lazy_static! {
 #[expect(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
+    let kernel_context = get_per_core_kernel_context();
+    let stack_top = &raw const kernel_context.kernel_stack as u64 + (KERNEL_STACK_SIZE - 1) as u64;
+
     unsafe {
         asm!(
+            "mov rsp, rax",
+            "and rsp, -16",
             "push rax",
             "call {kernel_main}",
-            kernel_main = sym kernel_main
+            in("rax") stack_top, kernel_main = sym kernel_main
         );
     }
 
@@ -33,6 +40,8 @@ pub unsafe extern "C" fn _start() -> ! {
 }
 
 pub fn kernel_main() -> ! {
+    port_println!("Hello from LiteBox for LVBS!");
+
     gdt::init();
     interrupts::init_idt();
     hvcall::per_core_init();

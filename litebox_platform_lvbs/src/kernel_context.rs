@@ -1,7 +1,4 @@
-use crate::{
-    arch::gdt,
-    mshv::{mshv_bindings::hv_vp_assist_page, vtl1_mem_layout::PAGE_SIZE},
-};
+use crate::{arch::gdt, mshv::vtl1_mem_layout::PAGE_SIZE};
 use x86_64::structures::tss::TaskStateSegment;
 
 pub const MAX_CORES: usize = 8; // for now
@@ -12,7 +9,7 @@ pub const KERNEL_STACK_SIZE: usize = 8 * PAGE_SIZE;
 #[repr(align(4096))]
 #[derive(Clone, Copy)]
 pub struct KernelContext {
-    pub hv_vp_assist_page: hv_vp_assist_page,
+    pub hv_vp_assist_page: [u8; PAGE_SIZE],
     pub interrupt_stack: [u8; INTERRUPT_STACK_SIZE],
     _guard_page_0: [u8; PAGE_SIZE],
     pub kernel_stack: [u8; KERNEL_STACK_SIZE],
@@ -23,7 +20,7 @@ pub struct KernelContext {
 
 // TODO: use heap later
 static mut PER_CORE_KERNEL_CONTEXT: [KernelContext; MAX_CORES] = [KernelContext {
-    hv_vp_assist_page: unsafe { core::mem::zeroed() },
+    hv_vp_assist_page: [0u8; PAGE_SIZE],
     interrupt_stack: [0u8; INTERRUPT_STACK_SIZE],
     _guard_page_0: [0u8; PAGE_SIZE],
     kernel_stack: [0u8; KERNEL_STACK_SIZE],
