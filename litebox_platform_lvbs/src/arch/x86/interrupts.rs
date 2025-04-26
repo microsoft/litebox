@@ -1,7 +1,9 @@
-use crate::{arch::x86::gdt, port_println};
+use crate::port_println;
 use core::arch::asm;
 use lazy_static::lazy_static;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+
+const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
 // TODO: don't duplicate this
 #[expect(clippy::inline_always)]
@@ -23,7 +25,7 @@ lazy_static! {
         unsafe {
             idt.double_fault
                 .set_handler_fn(double_fault_handler)
-                .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+                .set_stack_index(DOUBLE_FAULT_IST_INDEX);
         }
         idt.page_fault.set_handler_fn(page_fault_handler);
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);

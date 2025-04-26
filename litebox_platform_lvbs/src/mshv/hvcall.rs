@@ -19,16 +19,6 @@ const PKG_ABI: u32 = 0;
 const HV_CANONICAL_VENDOR_ID: u32 = 0x80;
 const HV_LINUX_VENDOR_ID: u32 = 0x8100;
 
-#[inline]
-fn generate_guest_id(dinfo1: u64, kernver: u64, dinfo2: u64) -> u64 {
-    let mut guest_id = u64::from(HV_LINUX_VENDOR_ID) << 48;
-    guest_id |= dinfo1 << 48;
-    guest_id |= kernver << 16;
-    guest_id |= dinfo2;
-
-    guest_id
-}
-
 impl hv_vp_assist_page {
     #[expect(clippy::similar_names)]
     pub fn set_vtl_ret_regs(&mut self, rax: u64, rcx: u64) {
@@ -39,6 +29,16 @@ impl hv_vp_assist_page {
     pub fn get_vtl_entry_reason(&self) -> u32 {
         self.vtl_entry_reason
     }
+}
+
+#[inline]
+fn generate_guest_id(dinfo1: u64, kernver: u64, dinfo2: u64) -> u64 {
+    let mut guest_id = u64::from(HV_LINUX_VENDOR_ID) << 48;
+    guest_id |= dinfo1 << 48;
+    guest_id |= kernver << 16;
+    guest_id |= dinfo2;
+
+    guest_id
 }
 
 /// Initialize per-core MSR and virtual partition registers for Hyper-V Hypercalls

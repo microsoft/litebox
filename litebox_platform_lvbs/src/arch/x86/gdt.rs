@@ -1,6 +1,4 @@
-use crate::kernel_context::{
-    INTERRUPT_STACK_SIZE, MAX_CORES, get_core_id, get_per_core_kernel_context,
-};
+use crate::kernel_context::{MAX_CORES, get_core_id, get_per_core_kernel_context};
 use core::mem::MaybeUninit;
 use x86_64::{
     PrivilegeLevel, VirtAddr,
@@ -13,8 +11,6 @@ use x86_64::{
         tss::TaskStateSegment,
     },
 };
-
-pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
 #[repr(align(16))]
 #[derive(Clone, Copy)]
@@ -75,10 +71,9 @@ fn setup_gdt_tss() {
     let core_id = get_core_id();
     let kernel_context = get_per_core_kernel_context();
 
+    let stack_top = kernel_context.get_interrupt_stack_top();
     let tss = &mut kernel_context.tss;
-    let stack_start = VirtAddr::from_ptr(&raw const kernel_context.kernel_stack);
-    let stack_end = stack_start + (INTERRUPT_STACK_SIZE - 1) as u64;
-    tss.0.interrupt_stack_table[0] = stack_end;
+    tss.0.interrupt_stack_table[0] = VirtAddr::new(stack_top);
 
     let gdt = unsafe { &mut *GDT_STORAGE[core_id].as_mut_ptr() };
     *gdt = GdtWrapper::new();
@@ -110,8 +105,9 @@ pub fn init() {
 pub fn set_usermode_segs() -> (u16, u16) {
     let kernel_context = get_per_core_kernel_context();
 
-    let mut cs = kernel_context.gdt.unwrap().selectors.user_code;
-    let mut ds = kernel_context.gdt.unwrap().selectors.user_data;
+    let gdt = kernel_context.gdt.unwrap();
+    let mut cs = gdt.selectors.user_code;
+    let mut ds = gdt.selectors.user_data;
     cs.0 |= PrivilegeLevel::Ring3 as u16;
     ds.0 |= PrivilegeLevel::Ring3 as u16;
     unsafe {

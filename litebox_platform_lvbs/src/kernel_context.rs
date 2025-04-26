@@ -1,4 +1,7 @@
-use crate::{arch::gdt, mshv::vtl1_mem_layout::PAGE_SIZE};
+use crate::{
+    arch::gdt,
+    mshv::{mshv_bindings::hv_vp_assist_page, vtl1_mem_layout::PAGE_SIZE},
+};
 use x86_64::structures::tss::TaskStateSegment;
 
 pub const MAX_CORES: usize = 8; // for now
@@ -16,6 +19,24 @@ pub struct KernelContext {
     _guard_page_1: [u8; PAGE_SIZE],
     pub tss: gdt::AlignedTss,
     pub gdt: Option<&'static gdt::GdtWrapper>,
+}
+
+impl KernelContext {
+    pub fn get_kernel_stack_top(&self) -> u64 {
+        &raw const self.kernel_stack as u64 + (self.kernel_stack.len() - 1) as u64
+    }
+
+    pub fn get_interrupt_stack_top(&self) -> u64 {
+        &raw const self.interrupt_stack as u64 + (self.interrupt_stack.len() - 1) as u64
+    }
+
+    pub fn get_hv_vp_assist_page_ptr(&self) -> *const hv_vp_assist_page {
+        (&raw const self.hv_vp_assist_page).cast::<hv_vp_assist_page>()
+    }
+
+    pub fn get_hv_vp_assist_page_mut_ptr(&mut self) -> *mut hv_vp_assist_page {
+        (&raw mut self.hv_vp_assist_page).cast::<hv_vp_assist_page>()
+    }
 }
 
 // TODO: use heap later

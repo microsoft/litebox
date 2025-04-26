@@ -28,9 +28,6 @@ pub const VTL1_CMDLINE_PAGE: usize = VTL1_BOOT_PARAMS_PAGE + 1;
 // pub const VTL1_HEAP_START_PAGE: usize = 3092;
 // pub const VTL1_HEAP_END_PAGE: usize = 4091;
 // pub const VTL1_TEMP_PTE_PAGE: usize = 4092;
-// pub const VTL1_VP_ASSIST_PAGE: usize = 4093;
-// pub const VTL1_HYPERCALL_PAGE: usize = 4094;
-// pub const VTL1_HV_SIMP_PAGE: usize = 4095;
 // pub const VTL1_EXT_PTE_BASE: usize = 4096;
 
 // special user pages
@@ -49,7 +46,6 @@ unsafe extern "C" {
 #[inline]
 pub fn get_memory_base_address() -> u64 {
     &raw const _memory_base as u64
-    // unsafe { &_memory_base as *const u8 as u64 }
 }
 
 #[inline]

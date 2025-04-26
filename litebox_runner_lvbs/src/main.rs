@@ -6,7 +6,7 @@ use lazy_static::lazy_static;
 use litebox_platform_lvbs::{
     arch::{gdt, interrupts},
     host::LvbsLinuxKernel,
-    kernel_context::{KERNEL_STACK_SIZE, get_per_core_kernel_context},
+    kernel_context::get_per_core_kernel_context,
     mshv::{hvcall, vtl1_mem_layout::get_memory_base_address},
     port_println,
 };
@@ -24,7 +24,7 @@ lazy_static! {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
     let kernel_context = get_per_core_kernel_context();
-    let stack_top = &raw const kernel_context.kernel_stack as u64 + (KERNEL_STACK_SIZE - 1) as u64;
+    let stack_top = kernel_context.get_kernel_stack_top();
 
     unsafe {
         asm!(
