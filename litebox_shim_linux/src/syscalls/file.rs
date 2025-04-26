@@ -513,7 +513,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                     toggle_flags!(producer);
                 }
                 Descriptor::Eventfd { file, .. } => {
-                    toggle_flags!(file, flags, setfl_mask);
+                    toggle_flags!(file);
                 }
             }
             Ok(0)
@@ -569,11 +569,7 @@ pub fn sys_eventfd2(initval: u32, flags: EfdFlags) -> Result<u32, Errno> {
         return Err(Errno::EINVAL);
     }
 
-    let eventfd = super::eventfd::EventFile::new(
-        u64::from(initval),
-        flags,
-        litebox_platform_multiplex::platform(),
-    );
+    let eventfd = super::eventfd::EventFile::new(u64::from(initval), flags, crate::litebox());
     let fd = file_descriptors().write().insert(Descriptor::Eventfd {
         file: alloc::sync::Arc::new(eventfd),
         close_on_exec: core::sync::atomic::AtomicBool::new(flags.contains(EfdFlags::CLOEXEC)),

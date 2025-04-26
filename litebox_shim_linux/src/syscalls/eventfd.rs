@@ -2,10 +2,7 @@
 
 use core::sync::atomic::AtomicU32;
 
-use litebox::{
-    fs::OFlags,
-    sync::{RawSyncPrimitivesProvider, Synchronization},
-};
+use litebox::{fs::OFlags, sync::RawSyncPrimitivesProvider};
 use litebox_common_linux::{EfdFlags, errno::Errno};
 
 pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider> {
@@ -16,12 +13,12 @@ pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
-    pub(crate) fn new(count: u64, flags: EfdFlags, platform: &'static Platform) -> Self {
+    pub(crate) fn new(count: u64, flags: EfdFlags, litebox: &litebox::LiteBox<Platform>) -> Self {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(EfdFlags::NONBLOCK));
 
         Self {
-            counter: Synchronization::new(platform).new_mutex(count),
+            counter: litebox.sync().new_mutex(count),
             status: AtomicU32::new(status.bits()),
             semaphore: flags.contains(EfdFlags::SEMAPHORE),
         }
@@ -104,7 +101,7 @@ mod tests {
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,
             EfdFlags::SEMAPHORE,
-            litebox_platform_multiplex::platform(),
+            crate::litebox(),
         ));
         let total = 8;
         for _ in 0..total {
@@ -125,7 +122,7 @@ mod tests {
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,
             EfdFlags::empty(),
-            litebox_platform_multiplex::platform(),
+            crate::litebox(),
         ));
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
@@ -150,7 +147,7 @@ mod tests {
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,
             EfdFlags::NONBLOCK,
-            litebox_platform_multiplex::platform(),
+            crate::litebox(),
         ));
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
