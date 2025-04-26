@@ -4,6 +4,7 @@ use lazy_static::lazy_static;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 // TODO: don't duplicate this
+#[expect(clippy::inline_always)]
 #[inline(always)]
 pub fn hlt_loop() -> ! {
     loop {

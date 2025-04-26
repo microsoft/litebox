@@ -94,14 +94,14 @@ impl fmt::Write for ComPort {
 }
 
 #[doc(hidden)]
-pub fn _print(args: ::core::fmt::Arguments) {
+pub fn print(args: ::core::fmt::Arguments) {
     use core::fmt::Write;
     let _ = COM.lock().write_fmt(args);
 }
 
 #[macro_export]
 macro_rules! port_print {
-    ($($arg:tt)*) => ($crate::host::portio::_print(format_args!($($arg)*)));
+    ($($arg:tt)*) => ($crate::host::portio::print(format_args!($($arg)*)));
 }
 
 #[macro_export]

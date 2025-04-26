@@ -21,7 +21,7 @@ const HV_LINUX_VENDOR_ID: u32 = 0x8100;
 
 #[inline]
 fn generate_guest_id(dinfo1: u64, kernver: u64, dinfo2: u64) -> u64 {
-    let mut guest_id = (HV_LINUX_VENDOR_ID as u64) << 48;
+    let mut guest_id = u64::from(HV_LINUX_VENDOR_ID) << 48;
     guest_id |= dinfo1 << 48;
     guest_id |= kernver << 16;
     guest_id |= dinfo2;
@@ -42,7 +42,8 @@ impl hv_vp_assist_page {
 }
 
 /// Initialize per-core MSR and virtual partition registers for Hyper-V Hypercalls
-#[expect(clippy::missing_panics_doc)]
+/// # Panics
+/// Panics if the underlying hardware/platform is not Hyper-V
 pub fn per_core_init() {
     #[cfg(not(test))]
     assert!(is_hyperv());
@@ -61,9 +62,9 @@ pub fn per_core_init() {
     );
 
     let guest_id = generate_guest_id(
-        HV_CANONICAL_VENDOR_ID as _,
-        LINUX_VERSION_CODE as _,
-        PKG_ABI as _,
+        HV_CANONICAL_VENDOR_ID.into(),
+        LINUX_VERSION_CODE.into(),
+        PKG_ABI.into(),
     );
     wrmsr(HV_X64_MSR_GUEST_OS_ID, guest_id);
 

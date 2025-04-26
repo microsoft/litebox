@@ -6,6 +6,7 @@ use linux_boot_params::{BootE820Entry, BootParams, E820Type};
 use litebox_platform_lvbs::mshv::vtl1_mem_layout::{VTL1_BOOT_PARAMS_PAGE, get_address_from_page};
 use spin::Mutex;
 
+#[expect(clippy::inline_always)]
 #[inline(always)]
 pub fn hlt_loop() -> ! {
     loop {
