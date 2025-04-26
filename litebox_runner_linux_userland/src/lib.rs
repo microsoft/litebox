@@ -176,6 +176,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 }
 
 mod trampoline {
+    #[cfg(target_arch = "x86_64")]
     core::arch::global_asm!(
         "
     .text
@@ -186,6 +187,22 @@ jump_to_entry_point:
     xor rdx, rdx
     mov     rsp, rsi
     jmp     rdi
+    /* Should not reach. */
+    hlt"
+    );
+    #[cfg(target_arch = "x86")]
+    core::arch::global_asm!(
+        "
+    .text
+    .align  4
+    .globl  jump_to_entry_point
+    .type   jump_to_entry_point,@function
+jump_to_entry_point:
+    xor     edx, edx
+    mov     eax, [esp + 4]
+    mov     ebx, [esp]
+    mov     esp, eax
+    jmp     ebx
     /* Should not reach. */
     hlt"
     );
