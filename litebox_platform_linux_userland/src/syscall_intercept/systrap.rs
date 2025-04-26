@@ -302,6 +302,14 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                 syscall_args[3].reinterpret_as_signed().truncate(),
             ),
         },
+        libc::SYS_eventfd => SyscallRequest::Eventfd2 {
+            initval: syscall_args[0].truncate(),
+            flags: litebox_common_linux::EfdFlags::empty(),
+        },
+        libc::SYS_eventfd2 => SyscallRequest::Eventfd2 {
+            initval: syscall_args[0].truncate(),
+            flags: litebox_common_linux::EfdFlags::from_bits_truncate(syscall_args[1].truncate()),
+        },
         libc::SYS_pipe => SyscallRequest::Pipe2 {
             pipefd: TransparentMutPtr {
                 inner: syscall_args[0] as *mut _,
