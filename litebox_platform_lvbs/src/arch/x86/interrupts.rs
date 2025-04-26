@@ -1,4 +1,4 @@
-use crate::{arch::instrs::hlt_loop, port_println};
+use crate::{arch::instrs::hlt_loop, serial_println};
 use lazy_static::lazy_static;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
@@ -55,10 +55,10 @@ extern "x86-interrupt" fn page_fault_handler(
 ) {
     use x86_64::registers::control::Cr2;
 
-    port_println!("EXCEPTION: PAGE FAULT");
-    port_println!("Accessed Address: {:?}", Cr2::read());
-    port_println!("Error Code: {:?}", error_code);
-    port_println!("{:#?}", stack_frame);
+    serial_println!("EXCEPTION: PAGE FAULT");
+    serial_println!("Accessed Address: {:?}", Cr2::read());
+    serial_println!("Error Code: {:?}", error_code);
+    serial_println!("{:#?}", stack_frame);
 
     hlt_loop();
 }
@@ -66,9 +66,9 @@ extern "x86-interrupt" fn page_fault_handler(
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
     use x86_64::registers::control::Cr2;
 
-    port_println!("EXCEPTION: INVALID OPCODE");
-    port_println!("Accessed Address: {:?}", Cr2::read());
-    port_println!("{:#?}", stack_frame);
+    serial_println!("EXCEPTION: INVALID OPCODE");
+    serial_println!("Accessed Address: {:?}", Cr2::read());
+    serial_println!("{:#?}", stack_frame);
 
     hlt_loop();
 }

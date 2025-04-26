@@ -3,7 +3,8 @@
 use crate::mshv::vtl_switch::vtl_return;
 use crate::{
     Errno, HostInterface, VtlCallParam,
-    host::{linux::sigset_t, portio::port_print_string},
+    arch::ioport::serial_print_string,
+    host::linux::sigset_t,
     ptr::{UserConstPtr, UserMutPtr},
 };
 
@@ -56,7 +57,7 @@ impl HostInterface for HostLvbsInterface {
     }
 
     fn log(msg: &str) {
-        port_print_string(msg);
+        serial_print_string(msg);
     }
 
     fn alloc(_layout: &core::alloc::Layout) -> Result<(usize, usize), Errno> {

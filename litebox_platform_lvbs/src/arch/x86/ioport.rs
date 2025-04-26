@@ -100,16 +100,16 @@ pub fn print(args: ::core::fmt::Arguments) {
 }
 
 #[macro_export]
-macro_rules! port_print {
-    ($($arg:tt)*) => ($crate::host::portio::print(format_args!($($arg)*)));
+macro_rules! serial_print {
+    ($($arg:tt)*) => ($crate::arch::ioport::print(format_args!($($arg)*)));
 }
 
 #[macro_export]
-macro_rules! port_println {
-    () => ($crate::port_print!("\n"));
-    ($($arg:tt)*) => ($crate::port_print!("{}\n", format_args!($($arg)*)));
+macro_rules! serial_println {
+    () => ($crate::serial_print!("\n"));
+    ($($arg:tt)*) => ($crate::serial_print!("{}\n", format_args!($($arg)*)));
 }
 
-pub fn port_print_string(s: &str) {
+pub fn serial_print_string(s: &str) {
     COM.lock().write_string(s);
 }

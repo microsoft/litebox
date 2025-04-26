@@ -4,7 +4,7 @@
 use core::{arch::asm, panic::PanicInfo};
 use litebox_platform_lvbs::{
     arch::instrs::hlt_loop, kernel_context::get_per_core_kernel_context,
-    mshv::vtl_switch::vtl_return, port_println,
+    mshv::vtl_switch::vtl_return, serial_println,
 };
 
 // shared? per-core?
@@ -34,7 +34,7 @@ pub unsafe extern "C" fn _start() -> ! {
 }
 
 pub fn kernel_main() -> ! {
-    port_println!("Hello from LiteBox for LVBS!");
+    serial_println!("Hello from LiteBox for LVBS!");
 
     // TODO: BSP init (e.g., heap, ...)
     litebox_runner_lvbs::per_core_init();
