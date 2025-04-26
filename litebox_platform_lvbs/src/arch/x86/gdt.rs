@@ -71,7 +71,7 @@ fn setup_gdt_tss() {
     let core_id = get_core_id();
     let kernel_context = get_per_core_kernel_context();
 
-    let stack_top = kernel_context.get_interrupt_stack_top();
+    let stack_top = kernel_context.interrupt_stack_top();
     let tss = &mut kernel_context.tss;
     tss.0.interrupt_stack_table[0] = VirtAddr::new(stack_top);
 

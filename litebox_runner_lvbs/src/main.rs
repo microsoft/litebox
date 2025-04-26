@@ -7,7 +7,10 @@ use litebox_platform_lvbs::{
     arch::{gdt, interrupts},
     host::LvbsLinuxKernel,
     kernel_context::get_per_core_kernel_context,
-    mshv::{hvcall, vtl1_mem_layout::get_memory_base_address},
+    mshv::{
+        hvcall::per_core_hvcall_enable, vtl_switch::vtl_return,
+        vtl1_mem_layout::get_memory_base_address,
+    },
     port_println,
 };
 use litebox_runner_lvbs::hlt_loop;
@@ -24,7 +27,7 @@ lazy_static! {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
     let kernel_context = get_per_core_kernel_context();
-    let stack_top = kernel_context.get_kernel_stack_top();
+    let stack_top = kernel_context.kernel_stack_top();
 
     unsafe {
         asm!(
@@ -44,7 +47,7 @@ pub fn kernel_main() -> ! {
 
     gdt::init();
     interrupts::init_idt();
-    hvcall::per_core_init();
+    per_core_hvcall_enable();
 
     // port_println!("LiteBox VTL1 Runner");
 
@@ -64,9 +67,7 @@ pub fn kernel_main() -> ! {
         // invoke a vtl call handler based on entry reason and params
 
         let result: u64 = 0;
-        unsafe {
-            asm!("vmcall", in("rax") 0x0, in("rcx") 0x12, in("r8") result);
-        }
+        vtl_return(result);
         // kernel.switch(result);
     }
 }

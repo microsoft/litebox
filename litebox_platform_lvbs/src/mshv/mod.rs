@@ -2,6 +2,7 @@
 
 pub mod hvcall;
 pub mod vtl1_mem_layout;
+pub mod vtl_switch;
 
 /// MSHV-specific bindings generated from the MSHV and VSM headers. We do not use
 /// the official mshv crate because it does not support `no_std`.

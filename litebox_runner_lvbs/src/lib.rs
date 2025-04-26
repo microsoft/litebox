@@ -3,7 +3,9 @@
 use core::arch::asm;
 use lazy_static::lazy_static;
 use linux_boot_params::{BootE820Entry, BootParams, E820Type};
-use litebox_platform_lvbs::mshv::vtl1_mem_layout::{VTL1_BOOT_PARAMS_PAGE, get_address_from_page};
+use litebox_platform_lvbs::mshv::vtl1_mem_layout::{
+    VTL1_BOOT_PARAMS_PAGE, get_address_of_special_page,
+};
 use spin::Mutex;
 
 #[expect(clippy::inline_always)]
@@ -40,7 +42,9 @@ impl BootParamsWrapper {
 
 lazy_static! {
     static ref BOOT_PARAMS_PAGE: Mutex<BootParamsWrapper> = Mutex::new(BootParamsWrapper {
-        page: unsafe { &mut *(get_address_from_page(VTL1_BOOT_PARAMS_PAGE) as *mut BootParams) }
+        page: unsafe {
+            &mut *(get_address_of_special_page(VTL1_BOOT_PARAMS_PAGE) as *mut BootParams)
+        }
     });
 }
 

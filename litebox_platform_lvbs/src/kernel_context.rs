@@ -4,7 +4,7 @@ use crate::{
 };
 use x86_64::structures::tss::TaskStateSegment;
 
-pub const MAX_CORES: usize = 8; // for now
+pub const MAX_CORES: usize = 8; // TODO: MAX_CORES = 96?
 pub const INTERRUPT_STACK_SIZE: usize = 2 * PAGE_SIZE;
 pub const KERNEL_STACK_SIZE: usize = 8 * PAGE_SIZE;
 
@@ -17,25 +17,35 @@ pub struct KernelContext {
     _guard_page_0: [u8; PAGE_SIZE],
     pub kernel_stack: [u8; KERNEL_STACK_SIZE],
     _guard_page_1: [u8; PAGE_SIZE],
+    // TODO: VTL0 state saving
+    // TODO: VTL1 state saving
     pub tss: gdt::AlignedTss,
     pub gdt: Option<&'static gdt::GdtWrapper>,
 }
 
 impl KernelContext {
-    pub fn get_kernel_stack_top(&self) -> u64 {
+    pub fn kernel_stack_top(&self) -> u64 {
         &raw const self.kernel_stack as u64 + (self.kernel_stack.len() - 1) as u64
     }
 
-    pub fn get_interrupt_stack_top(&self) -> u64 {
+    pub fn interrupt_stack_top(&self) -> u64 {
         &raw const self.interrupt_stack as u64 + (self.interrupt_stack.len() - 1) as u64
     }
 
-    pub fn get_hv_vp_assist_page_ptr(&self) -> *const hv_vp_assist_page {
+    pub fn hv_vp_assist_page_as_ptr(&self) -> *const hv_vp_assist_page {
         (&raw const self.hv_vp_assist_page).cast::<hv_vp_assist_page>()
     }
 
-    pub fn get_hv_vp_assist_page_mut_ptr(&mut self) -> *mut hv_vp_assist_page {
+    pub fn hv_vp_assist_page_as_mut_ptr(&mut self) -> *mut hv_vp_assist_page {
         (&raw mut self.hv_vp_assist_page).cast::<hv_vp_assist_page>()
+    }
+
+    pub fn hv_vp_assist_page_as_u64(&self) -> u64 {
+        &raw const self.hv_vp_assist_page as u64
+    }
+
+    pub fn hv_hypercall_page_as_u64(&self) -> u64 {
+        get_hypercall_page_address()
     }
 }
 
@@ -64,4 +74,14 @@ pub fn get_core_id() -> usize {
 pub fn get_per_core_kernel_context() -> &'static mut KernelContext {
     let core_id = get_core_id();
     unsafe { &mut PER_CORE_KERNEL_CONTEXT[core_id] }
+}
+
+// A hypercall page is a shared read-only code page, so it's better not to use heap.
+unsafe extern "C" {
+    static _hypercall_page: u8;
+}
+
+#[inline]
+pub fn get_hypercall_page_address() -> u64 {
+    &raw const _hypercall_page as u64
 }
