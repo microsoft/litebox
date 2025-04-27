@@ -6,21 +6,6 @@ edition = "2024"
 [dependencies]
 litebox = { version = "0.1.0", path = "../litebox" }
 litebox_platform_lvbs = { version = "0.1.0", path = "../litebox_platform_lvbs" }
-linux-boot-params = "0.14.1"
-spin = { version = "0.10.0", default-features = false, features = [
-  "spin_mutex",
-  "once",
-] }
-
-# [dependencies.lazy_static]
-# version = "1.5.0"
-# features = ["spin_no_std"]
-
-[target.'cfg(target_arch = "x86_64")'.dependencies]
-x86_64 = { version = "0.15.2", default-features = false, features = [
-  "abi_x86_interrupt",
-  "instructions",
-] }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
