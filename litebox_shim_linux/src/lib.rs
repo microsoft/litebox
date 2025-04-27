@@ -101,7 +101,7 @@ impl Descriptors {
                             litebox::fs::Mode::empty(),
                         )
                         .unwrap(),
-                    litebox::fs::OFlags::APPEND,
+                    litebox::fs::OFlags::APPEND | litebox::fs::OFlags::RDWR,
                 ))),
                 Some(Descriptor::Stdio(stdio::StdioFile::new(
                     litebox::platform::StdioStream::Stdout,
@@ -112,7 +112,7 @@ impl Descriptors {
                             litebox::fs::Mode::empty(),
                         )
                         .unwrap(),
-                    litebox::fs::OFlags::APPEND,
+                    litebox::fs::OFlags::APPEND | litebox::fs::OFlags::RDWR,
                 ))),
                 Some(Descriptor::Stdio(stdio::StdioFile::new(
                     litebox::platform::StdioStream::Stderr,
@@ -123,7 +123,7 @@ impl Descriptors {
                             litebox::fs::Mode::empty(),
                         )
                         .unwrap(),
-                    litebox::fs::OFlags::APPEND,
+                    litebox::fs::OFlags::APPEND | litebox::fs::OFlags::RDWR,
                 ))),
             ],
         }

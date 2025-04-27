@@ -510,9 +510,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
             Descriptor::PipeReader { consumer, .. } => Ok(consumer.get_status().bits()),
             Descriptor::PipeWriter { producer, .. } => Ok(producer.get_status().bits()),
             Descriptor::Eventfd { file, .. } => Ok(file.get_status().bits()),
-            Descriptor::Stdio(crate::stdio::StdioFile { status, .. }) => {
-                Ok(status.load(core::sync::atomic::Ordering::Relaxed))
-            }
+            Descriptor::Stdio(file) => Ok(file.get_status().bits()),
         },
         FcntlArg::SETFL(flags) => {
             let setfl_mask = OFlags::APPEND
