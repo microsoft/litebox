@@ -531,7 +531,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
             match desc {
                 Descriptor::File(file) => todo!(),
                 Descriptor::Stdio(file) => {
-                    toggle_flags!(file, flags, setfl_mask);
+                    toggle_flags!(file);
                 }
                 Descriptor::Socket(socket) => todo!(),
                 Descriptor::PipeReader { consumer, .. } => {
