@@ -1,12 +1,14 @@
 #![no_std]
 
+use core::panic::PanicInfo;
 use linux_boot_params::{BootE820Entry, BootParams, E820Type};
 use litebox_platform_lvbs::{
-    arch::{gdt, interrupts},
+    arch::{gdt, instrs::hlt_loop, interrupts},
     mshv::{
         hvcall,
         vtl1_mem_layout::{VTL1_BOOT_PARAMS_PAGE, VtlMemoyError, get_address_of_special_page},
     },
+    serial_println,
 };
 use spin::Once;
 
@@ -60,4 +62,10 @@ pub fn get_vtl1_base_address_size() -> Result<(u64, u64), VtlMemoyError> {
     // };
     // boot_params_wrapper.ram_addr_size()
     boot_params().ram_addr_size()
+}
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    serial_println!("{}", info);
+    hlt_loop()
 }
