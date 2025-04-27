@@ -51,3 +51,10 @@ pub fn get_address_of_special_page(page: usize) -> u64 {
 // pub const KERNEL_USER_SHARED_PAGE: u64 = 0x1f_e000;
 // pub const USER_STACK_TOP: u64 = 0x1f_e000;
 // pub const USER_CODE_BASE: u64 = 0x1000;
+
+/// Error for VSM memory
+#[derive(Debug, PartialEq)]
+pub enum VtlMemoyError {
+    InvalidBootParams,
+    InvalidCmdLine,
+}
