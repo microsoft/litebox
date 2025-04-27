@@ -8,6 +8,7 @@ use litebox_platform_lvbs::{
         vtl1_mem_layout::{VTL1_BOOT_PARAMS_PAGE, get_address_of_special_page},
     },
 };
+use spin::Once;
 
 pub fn per_core_init() {
     gdt::init();
@@ -37,13 +38,21 @@ impl BootParamsWrapper {
     }
 }
 
-// the BootParams page is free from data race because it is read only at VTL1 boot
-// and ignored later.
-pub fn get_vtl1_base_address_size() -> (u64, u64) {
-    let boot_params_wrapper = BootParamsWrapper {
+fn boot_params() -> &'static BootParamsWrapper {
+    static BOOT_PARAMS_ONCE: Once<BootParamsWrapper> = Once::new();
+    BOOT_PARAMS_ONCE.call_once(|| BootParamsWrapper {
         page: unsafe {
             &*(get_address_of_special_page(VTL1_BOOT_PARAMS_PAGE) as *const BootParams)
         },
-    };
-    boot_params_wrapper.ram_addr_size()
+    })
+}
+
+pub fn get_vtl1_base_address_size() -> (u64, u64) {
+    // let boot_params_wrapper = BootParamsWrapper {
+    //     page: unsafe {
+    //         &*(get_address_of_special_page(VTL1_BOOT_PARAMS_PAGE) as *const BootParams)
+    //     },
+    // };
+    // boot_params_wrapper.ram_addr_size()
+    boot_params().ram_addr_size()
 }

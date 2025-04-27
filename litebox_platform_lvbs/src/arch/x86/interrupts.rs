@@ -1,11 +1,32 @@
 use crate::{arch::instrs::hlt_loop, serial_println};
-use lazy_static::lazy_static;
+use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+// use lazy_static::lazy_static;
 
 const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
-lazy_static! {
-    static ref IDT: InterruptDescriptorTable = {
+// lazy_static! {
+//     static ref IDT: InterruptDescriptorTable = {
+//         let mut idt = InterruptDescriptorTable::new();
+//         idt.divide_error.set_handler_fn(divide_error_handler);
+//         idt.breakpoint.set_handler_fn(breakpoint_handler);
+//         unsafe {
+//             idt.double_fault
+//                 .set_handler_fn(double_fault_handler)
+//                 .set_stack_index(DOUBLE_FAULT_IST_INDEX);
+//         }
+//         idt.page_fault.set_handler_fn(page_fault_handler);
+//         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+//         idt.general_protection_fault
+//             .set_handler_fn(general_protection_fault_handler);
+
+//         idt
+//     };
+// }
+
+fn idt() -> &'static InterruptDescriptorTable {
+    static IDT_ONCE: Once<InterruptDescriptorTable> = Once::new();
+    IDT_ONCE.call_once(|| {
         let mut idt = InterruptDescriptorTable::new();
         idt.divide_error.set_handler_fn(divide_error_handler);
         idt.breakpoint.set_handler_fn(breakpoint_handler);
@@ -18,13 +39,13 @@ lazy_static! {
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
         idt.general_protection_fault
             .set_handler_fn(general_protection_fault_handler);
-
         idt
-    };
+    })
 }
 
 pub fn init_idt() {
-    IDT.load();
+    // IDT.load();
+    idt().load();
 }
 
 extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame) {
