@@ -894,7 +894,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         let descriptor = descriptors.get(fd);
         match descriptor.entry.as_ref() {
             EntryX::Upper { fd } => self.upper.set_file_metadata(fd, metadata),
-            EntryX::Lower { fd } => unimplemented!(),
+            EntryX::Lower { fd } => self.lower.set_file_metadata(fd, metadata),
             EntryX::Tombstone => unreachable!(),
         }
     }
@@ -908,7 +908,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         let descriptor = descriptors.get(fd);
         match descriptor.entry.as_ref() {
             EntryX::Upper { fd } => self.upper.set_fd_metadata(fd, metadata),
-            EntryX::Lower { fd } => unimplemented!(),
+            EntryX::Lower { fd } => self.lower.set_fd_metadata(fd, metadata),
             EntryX::Tombstone => unreachable!(),
         }
     }
