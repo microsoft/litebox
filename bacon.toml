@@ -1,0 +1,71 @@
+# This is a configuration file for the bacon tool
+#
+# Complete help on configuration: https://dystroy.org/bacon/config/
+# 
+# You may check the current default at
+#   https://github.com/Canop/bacon/blob/main/defaults/default-bacon.toml
+
+default_job = "clippy"
+env.CARGO_TERM_COLOR = "always"
+
+# Check on all targets
+[jobs.check]
+command = ["cargo", "check", "--all-targets"]
+need_stdout = false
+
+# Check on all targets and features
+[jobs.check-all]
+command = ["cargo", "check", "--all-targets", "--all-features"]
+need_stdout = false
+
+# Clippy on all targets
+[jobs.clippy]
+command = ["cargo", "clippy", "--all-targets"]
+need_stdout = false
+
+# Clippy on all targets and features
+[jobs.clippy-all]
+command = ["cargo", "clippy", "--all-targets", "--all-features"]
+need_stdout = false
+
+# Run nextest on default target
+[jobs.nextest]
+command = [
+    "cargo", "nextest", "run",
+    "--hide-progress-bar", "--failure-output", "final"
+]
+need_stdout = true
+analyzer = "nextest"
+
+# Run nextest on 32-bit x86
+[jobs.nextest-x86]
+command = [
+    "cargo", "nextest", "run",
+    "--target=i686-unknown-linux-gnu",
+    "--hide-progress-bar", "--failure-output", "final"
+]
+need_stdout = true
+analyzer = "nextest"
+
+# Documentation
+[jobs.doc]
+command = ["cargo", "doc", "--no-deps"]
+need_stdout = false
+
+# If the doc compiles, then it opens in your browser
+[jobs.doc-open]
+command = ["cargo", "doc", "--no-deps", "--open"]
+need_stdout = false
+allow_warnings = true
+on_success = "job:doc" # so that we don't open the browser at each change
+
+# Project-specific keybindings, to make it easier to run the various jobs here.
+[keybindings]
+k = "job:check"
+alt-k = "job:check-all"
+c = "job:clippy"
+alt-c = "job:clippy-all"
+n = "job:nextest"
+alt-n = "job:nextest-x86"
+d = "job:doc-open"
+alt-d = "job:doc"
