@@ -87,6 +87,7 @@ pub fn init_platform() {
     );
 
     install_dir("/lib64");
+    install_dir("/lib32");
     install_dir("/lib");
     install_dir("/lib/x86_64-linux-gnu");
 }
