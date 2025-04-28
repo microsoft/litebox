@@ -1,6 +1,6 @@
 use crate::{
     arch::instrs::{rdmsr, wrmsr},
-    kernel_context::get_per_core_kernel_context,
+    kernel_context::{get_core_id, get_per_core_kernel_context},
     mshv::mshv_bindings::{
         HV_HYPERCALL_REP_COMP_MASK, HV_HYPERCALL_REP_COMP_OFFSET, HV_HYPERCALL_REP_START_MASK,
         HV_HYPERCALL_REP_START_OFFSET, HV_HYPERCALL_RESULT_MASK, HV_HYPERCALL_VARHEAD_OFFSET,
@@ -17,9 +17,6 @@ use crate::{
 };
 use core::arch::asm;
 use num_enum::TryFromPrimitive;
-
-#[cfg(debug_assertions)]
-use crate::kernel_context::get_core_id;
 
 #[cfg(debug_assertions)]
 use crate::serial_println;
@@ -102,8 +99,6 @@ pub fn init() -> Result<(), HypervError> {
     {
         return Err(HypervError::InvalidHypercallPage);
     }
-
-    // TODO: configure virtual partitions (if core # is 0)
 
     #[cfg(debug_assertions)]
     serial_println!("HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
@@ -197,6 +192,7 @@ pub enum HypervError {
     InvalidAssistPage,
     InvalidGuestOSID,
     InvalidHypercallPage,
+    VPSetupFailed,
 }
 
 /// Error for Hyper-V hypercall

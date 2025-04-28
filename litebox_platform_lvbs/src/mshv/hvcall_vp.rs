@@ -3,19 +3,24 @@ use crate::{
         instrs::rdmsr,
         msr::msr_index::{MSR_EFER, MSR_IA32_CR_PAT},
     },
+    kernel_context::MAX_CORES,
     mshv::{
         HV_PARTITION_ID_SELF, HV_VP_INDEX_SELF,
-        hvcall::{HypervCallError, hv_do_hypercall, hv_do_rep_hypercall},
+        hvcall::{HypervCallError, HypervError, hv_do_hypercall, hv_do_rep_hypercall},
         mshv_bindings::{
             HVCALL_ENABLE_VP_VTL, HVCALL_GET_VP_REGISTERS, HVCALL_SET_VP_REGISTERS,
             hv_enable_vp_vtl, hv_get_vp_registers_input, hv_get_vp_registers_output,
             hv_set_vp_registers_input,
         },
+        vtl1_mem_layout::{
+            PAGE_SIZE, VTL1_KERNEL_STACK_PAGE, VTL1_TSS_PAGE, get_address_of_special_page,
+        },
     },
+    serial_println,
 };
 
 // const HV_VTL_NORMAL: u8 = 0x0;
-// const HV_VTL_SECURE: u8 = 0x1;
+const HV_VTL_SECURE: u8 = 0x1;
 // const HV_VTL_MGMT: u8 = 0x2;
 
 #[expect(clippy::missing_panics_doc)]
@@ -107,21 +112,10 @@ fn hv_vtl_populate_vp_context(input: &mut hv_enable_vp_vtl, tss: u64, rip: u64, 
     input.vp_context.ss.__bindgen_anon_1.attributes = 0xc093;
 
     input.vp_context.tr.selector = 3 << 3;
-    // input.vp_context.tr.base = get_address_of_special_page(VTL1_TSS_PAGE);
     input.vp_context.tr.base = tss;
     input.vp_context.tr.limit = 104 - 1;
     input.vp_context.tr.__bindgen_anon_1.attributes = 0x8b;
 }
-
-// // TODO: better way to get the entry point?
-// unsafe extern "C" {
-//     static _start: u8;
-// }
-
-// #[inline]
-// fn get_entry() -> u64 {
-//     &raw const _start as u64
-// }
 
 #[expect(clippy::similar_names)]
 pub fn hvcall_enable_vp_vtl(
@@ -139,10 +133,38 @@ pub fn hvcall_enable_vp_vtl(
         hvin.target_vtl.__bindgen_anon_1.set_target_vtl(target_vtl);
     }
 
-    // let rip: u64 = get_entry() as *const () as u64;
-    // let rsp = get_address_of_special_page(VTL1_KERNEL_STACK_PAGE) + PAGE_SIZE as u64 - 1;
-
     hv_vtl_populate_vp_context(&mut hvin, tss, rip, rsp);
 
     hv_do_hypercall(u64::from(HVCALL_ENABLE_VP_VTL), &raw const hvin as u64, 0)
+}
+
+// TODO: better way to get the entry point?
+unsafe extern "C" {
+    static _start: u8;
+}
+
+#[inline]
+fn get_entry() -> u64 {
+    &raw const _start as u64
+}
+
+/// # Panics
+/// Panics if the number of online cores is greater than `MAX_CORES`.
+#[expect(clippy::similar_names)]
+pub fn init_vtl_aps(online_cores: u32) -> Result<(), HypervError> {
+    assert!(online_cores <= u32::try_from(MAX_CORES).expect("MAX_CORES"));
+
+    let rip: u64 = get_entry() as *const () as u64;
+    let rsp = get_address_of_special_page(VTL1_KERNEL_STACK_PAGE) + PAGE_SIZE as u64 - 1;
+    let tss = get_address_of_special_page(VTL1_TSS_PAGE);
+
+    for core in 1..online_cores {
+        let result = hvcall_enable_vp_vtl(core, HV_VTL_SECURE, tss, rip, rsp);
+        if result.is_err() {
+            serial_println!("Failed to enable VTL for core {}: {:?}", core, result);
+            return Err(HypervError::VPSetupFailed);
+        }
+    }
+
+    Ok(())
 }
