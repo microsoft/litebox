@@ -1,3 +1,5 @@
+//! I/O Port-based serial communication
+
 use core::{arch::asm, fmt};
 use spin::{Mutex, Once};
 // use lazy_static::lazy_static;

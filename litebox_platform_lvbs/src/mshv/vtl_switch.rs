@@ -1,20 +1,25 @@
+//! VTL switch related functions
+
 use crate::mshv::mshv_bindings::hv_vp_assist_page;
 use core::arch::asm;
 
 // TODO: add VTL switch related stuffs
 
 impl hv_vp_assist_page {
+    /// Return RAX and RCX registers to VTL0 through the HV VP assist page
     #[expect(clippy::similar_names)]
     pub fn set_vtl_ret_regs(&mut self, rax: u64, rcx: u64) {
         self.vtl_ret_x64rax = rax;
         self.vtl_ret_x64rcx = rcx;
     }
 
+    /// Get the entry reason of VTL switch
     pub fn get_vtl_entry_reason(&self) -> u32 {
         self.vtl_entry_reason
     }
 }
 
+/// Return to VTL0
 #[expect(clippy::inline_always)]
 #[inline(always)]
 pub fn vtl_return(result: u64) {

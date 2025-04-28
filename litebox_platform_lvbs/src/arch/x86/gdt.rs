@@ -1,3 +1,5 @@
+//! Global Descriptor Table (GDT) and Task State Segment (TSS)
+
 use crate::kernel_context::{MAX_CORES, get_core_id, get_per_core_kernel_context};
 use core::mem::MaybeUninit;
 use x86_64::{
@@ -12,6 +14,7 @@ use x86_64::{
     },
 };
 
+/// TSS with 16-byte alignment (HW requirement)
 #[repr(align(16))]
 #[derive(Clone, Copy)]
 pub struct AlignedTss(pub TaskStateSegment);
@@ -43,6 +46,7 @@ impl Default for Selectors {
     }
 }
 
+/// Package GDT and selectors
 pub struct GdtWrapper {
     gdt: GlobalDescriptorTable,
     selectors: Selectors,
@@ -95,6 +99,7 @@ fn setup_gdt_tss() {
     kernel_context.gdt = Some(gdt);
 }
 
+/// Set up GDT and TSS (for a core)
 pub fn init() {
     setup_gdt_tss();
 }

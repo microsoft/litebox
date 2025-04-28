@@ -1,3 +1,5 @@
+//! VTL1 kernel context
+
 use crate::{
     arch::gdt,
     mshv::{mshv_bindings::hv_vp_assist_page, vtl1_mem_layout::PAGE_SIZE},
@@ -60,6 +62,7 @@ static mut PER_CORE_KERNEL_CONTEXT: [KernelContext; MAX_CORES] = [KernelContext 
     gdt: const { None },
 }; MAX_CORES];
 
+/// Get the APIC ID of the current core.
 #[inline]
 pub fn get_core_id() -> usize {
     use core::arch::x86_64::__cpuid_count as cpuid_count;
@@ -71,6 +74,7 @@ pub fn get_core_id() -> usize {
     apic_id as usize
 }
 
+/// Get the per-core kernel context
 pub fn get_per_core_kernel_context() -> &'static mut KernelContext {
     let core_id = get_core_id();
     unsafe { &mut PER_CORE_KERNEL_CONTEXT[core_id] }
@@ -81,6 +85,7 @@ unsafe extern "C" {
     static _hypercall_page: u8;
 }
 
+/// Get the hypercall page address
 #[inline]
 pub fn get_hypercall_page_address() -> u64 {
     &raw const _hypercall_page as u64

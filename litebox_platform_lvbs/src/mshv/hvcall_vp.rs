@@ -1,3 +1,5 @@
+//! Hyper-V Hypercall functions for virtual processor (VP)
+
 use crate::{
     arch::{
         instrs::rdmsr,
@@ -23,6 +25,7 @@ use crate::{
 const HV_VTL_SECURE: u8 = 0x1;
 // const HV_VTL_MGMT: u8 = 0x2;
 
+/// Hyper-V Hypercall to set virtual processor (VP) registers
 #[expect(clippy::missing_panics_doc)]
 pub fn hvcall_set_vp_registers(
     reg_name: u32,
@@ -46,6 +49,7 @@ pub fn hvcall_set_vp_registers(
     )
 }
 
+/// Hyper-V Hypercall to get virtual processor (VP) registers
 #[expect(clippy::missing_panics_doc)]
 pub fn hvcall_get_vp_registers(
     reg_name: u32,
@@ -76,6 +80,7 @@ pub fn hvcall_get_vp_registers(
     }
 }
 
+/// Populate the VP context for VTL1
 // TODO: avoid using magic numbers
 #[expect(clippy::similar_names)]
 fn hv_vtl_populate_vp_context(input: &mut hv_enable_vp_vtl, tss: u64, rip: u64, rsp: u64) {
@@ -117,8 +122,9 @@ fn hv_vtl_populate_vp_context(input: &mut hv_enable_vp_vtl, tss: u64, rip: u64, 
     input.vp_context.tr.__bindgen_anon_1.attributes = 0x8b;
 }
 
+/// Hyper-V Hypercall to enable VTL (VTL1 for now) for a specific virtual processor (VP)
 #[expect(clippy::similar_names)]
-pub fn hvcall_enable_vp_vtl(
+fn hvcall_enable_vp_vtl(
     core_id: u32,
     target_vtl: u8,
     tss: u64,
@@ -148,6 +154,8 @@ fn get_entry() -> u64 {
     &raw const _start as u64
 }
 
+/// Hyper-V Hypercall to initialize VTL (VTL1 for now) for all online cores (except core 0)
+///
 /// # Panics
 /// Panics if the number of online cores is greater than `MAX_CORES`.
 #[expect(clippy::similar_names)]

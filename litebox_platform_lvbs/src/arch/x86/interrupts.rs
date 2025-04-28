@@ -1,3 +1,5 @@
+//! Interrupt Descriptor Table (IDT)
+
 use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 // use lazy_static::lazy_static;
@@ -42,6 +44,7 @@ fn idt() -> &'static InterruptDescriptorTable {
     })
 }
 
+/// Initialize IDT (for a core)
 pub fn init_idt() {
     // IDT.load();
     idt().load();

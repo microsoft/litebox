@@ -1,3 +1,5 @@
+//! Some Assembly instructions
+
 use core::arch::asm;
 
 #[expect(clippy::inline_always)]

@@ -1,3 +1,5 @@
+//! VTL1 physical memory layout (LVBS-specific)
+
 pub const PAGE_SIZE: usize = 4096;
 pub const PTES_PER_PAGE: usize = 512;
 

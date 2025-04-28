@@ -1,3 +1,5 @@
+//! Hyper-V Hypercall functions
+
 use crate::{
     arch::instrs::{rdmsr, wrmsr},
     kernel_context::{get_core_id, get_per_core_kernel_context},
@@ -61,7 +63,7 @@ fn check_hyperv() -> Result<(), HypervError> {
     Ok(())
 }
 
-/// Enable Hyper-V hypercalls by initializing MSR and VP registers (per core)
+/// Enable Hyper-V Hypercalls by initializing MSR and VP registers (for a core)
 /// # Panics
 /// Panics if the underlying hardware/platform is not Hyper-V
 /// Panics if the MSR/VP registers writes fail
@@ -129,6 +131,7 @@ pub fn hv_result_success(status: u64) -> bool {
     hv_result(status) == HV_STATUS_SUCCESS
 }
 
+/// Hyper-V Hypercall using the hypercall page
 pub fn hv_do_hypercall(control: u64, input: u64, output: u64) -> Result<u64, HypervCallError> {
     let mut status: u64;
     let kernel_context = get_per_core_kernel_context();
@@ -155,6 +158,7 @@ fn hv_repcomp(status: u64) -> u16 {
     ((status & HV_HYPERCALL_REP_COMP_MASK) >> HV_HYPERCALL_REP_COMP_OFFSET) as u16
 }
 
+/// Hyper-V Hypercall with repeat support
 pub fn hv_do_rep_hypercall(
     code: u16,
     rep_count: u16,
@@ -195,7 +199,7 @@ pub enum HypervError {
     VPSetupFailed,
 }
 
-/// Error for Hyper-V hypercall
+/// Error for Hyper-V Hypercall
 #[derive(Debug, TryFromPrimitive)]
 #[repr(u32)]
 pub enum HypervCallError {
