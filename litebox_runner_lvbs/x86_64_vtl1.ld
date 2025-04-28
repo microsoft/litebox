@@ -15,13 +15,13 @@ SECTIONS
     .text : ALIGN(0x200000) {
         *(.text._start)
         *(.text.*)
-	. = ALIGN(0x1000);
-	_hypercall_page = .;
         *(.got)
     }
     .data : ALIGN(0x200000) { 
         *(.rodata .rodata.*)
         *(.data .data.*)
+        . = ALIGN(0x1000);
+        _hypercall_page = . ;
         . = ALIGN(0x1000);
         _ta_data_start = . ;
         KEEP(*(.binary_data))
