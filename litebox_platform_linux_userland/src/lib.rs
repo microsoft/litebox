@@ -538,8 +538,18 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         &self,
         range: std::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
-        let addr = core::ptr::NonNull::new(range.start as _).expect("non null addr");
-        unsafe { nix::sys::mman::munmap(addr, range.len()) }.expect("munmap failed");
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_munmap,
+                    range.start,
+                    range.len(),
+                    // This is to ensure it won't be intercepted by Seccomp if enabled.
+                    syscall_intercept::SYSCALL_ARG_MAGIC,
+                )
+            },
+            0,
+        );
         Ok(())
     }
 

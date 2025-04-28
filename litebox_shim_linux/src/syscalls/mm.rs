@@ -1,6 +1,8 @@
+//! Implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
+
 use litebox::{
-    mm::linux::{MappingError, PAGE_SIZE},
-    platform::RawMutPointer,
+    mm::linux::{MappingError, PAGE_SIZE, VmemUnmapError},
+    platform::{RawConstPointer, RawMutPointer, page_mgmt::DeallocationError},
 };
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 
@@ -87,6 +89,7 @@ fn do_mmap_file(
     do_mmap(suggested_addr, len, prot, flags, op)
 }
 
+/// Handle syscall `mmap`
 pub(crate) fn sys_mmap(
     addr: usize,
     len: usize,
@@ -137,4 +140,30 @@ pub(crate) fn sys_mmap(
         do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
     }
     .map_err(Errno::from)
+}
+
+/// Handle syscall `munmap`
+pub(crate) fn sys_munmap(addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
+    if addr.as_usize() & !PAGE_MASK != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if len == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let aligned_len = align_up(len, PAGE_SIZE);
+    if addr.as_usize().checked_add(aligned_len).is_none() {
+        return Err(Errno::EINVAL);
+    }
+
+    let pm = litebox_page_manager();
+    match unsafe { pm.remove_pages(addr, len) } {
+        Err(VmemUnmapError::MisAligned) => Err(Errno::EINVAL),
+        Err(VmemUnmapError::UnmapError(e)) => match e {
+            DeallocationError::Unaligned => Err(Errno::EINVAL),
+            // It is not an error if the indicated range does not contain any mapped pages.
+            DeallocationError::AlreadyUnallocated => Ok(()),
+            _ => unimplemented!(),
+        },
+        Ok(()) => Ok(()),
+    }
 }
