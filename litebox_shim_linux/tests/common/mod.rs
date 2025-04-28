@@ -33,8 +33,8 @@ global_asm!(
     .type   trampoline,@function
 trampoline:
     xor     edx, edx
-    mov     eax, [esp + 4]
-    mov     ebx, [esp]
+    mov     ebx, [esp + 4]
+    mov     eax, [esp + 8]
     mov     esp, eax
     jmp     ebx
     /* Should not reach. */

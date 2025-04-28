@@ -199,8 +199,8 @@ jump_to_entry_point:
     .type   jump_to_entry_point,@function
 jump_to_entry_point:
     xor     edx, edx
-    mov     eax, [esp + 4]
-    mov     ebx, [esp]
+    mov     ebx, [esp + 4]
+    mov     eax, [esp + 8]
     mov     esp, eax
     jmp     ebx
     /* Should not reach. */
