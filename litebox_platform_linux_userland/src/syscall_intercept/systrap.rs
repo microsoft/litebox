@@ -313,6 +313,13 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                 },
             }
         }
+        libc::SYS_connect => SyscallRequest::Connect {
+            sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
+            sockaddr: TransparentConstPtr {
+                inner: syscall_args[1] as *const u8,
+            },
+            addrlen: syscall_args[2],
+        },
         libc::SYS_fcntl => SyscallRequest::Fcntl {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
             arg: litebox_common_linux::FcntlArg::from(

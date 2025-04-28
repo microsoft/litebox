@@ -368,8 +368,8 @@ bitflags::bitflags! {
     }
 }
 
-const AF_UNIX: u32 = 1;
-const AF_INET: u32 = 2;
+pub const AF_UNIX: u32 = 1;
+pub const AF_INET: u32 = 2;
 const AF_INET6: u32 = 10;
 const AF_NETLINK: u32 = 16;
 #[repr(u32)]
@@ -520,6 +520,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         /// particular socket type within a given protocol family, in which case
         /// protocol can be specified as `None`.
         protocol: Option<litebox::net::Protocol>,
+    },
+    Connect {
+        sockfd: i32,
+        sockaddr: Platform::RawConstPointer<u8>,
+        addrlen: usize,
     },
     Fcntl {
         fd: i32,

@@ -333,6 +333,11 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
             flags,
             protocol,
         } => syscalls::net::sys_socket(domain, ty, flags, protocol).map(|fd| fd as usize),
+        SyscallRequest::Connect {
+            sockfd,
+            sockaddr,
+            addrlen,
+        } => syscalls::net::sys_connect(sockfd, sockaddr, addrlen).map(|()| 0),
         SyscallRequest::Fcntl { fd, arg } => syscalls::file::sys_fcntl(fd, arg).map(|v| v as usize),
         SyscallRequest::Getcwd { buf, size: count } => {
             let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
