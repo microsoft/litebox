@@ -97,6 +97,11 @@ pub fn compile(output: &std::path::Path, exec_or_lib: bool) {
     if exec_or_lib {
         args.push("-static");
     }
+    args.push(match std::env::consts::ARCH {
+        "x86_64" => "-m64",
+        "x86" => "-m32",
+        _ => unimplemented!(),
+    });
     let output = std::process::Command::new("gcc")
         .args(args)
         .output()
