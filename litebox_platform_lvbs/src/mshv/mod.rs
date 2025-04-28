@@ -1,8 +1,12 @@
 //! Hyper-V-specific code
 
 pub mod hvcall;
+pub mod hvcall_vp;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
+
+pub const HV_PARTITION_ID_SELF: u64 = 0xffff_ffff_ffff_ffffu64;
+pub const HV_VP_INDEX_SELF: u32 = 0xffff_fffeu32;
 
 /// MSHV-specific bindings generated from the MSHV and VSM headers. We do not use
 /// the official mshv crate because it does not support `no_std`.
