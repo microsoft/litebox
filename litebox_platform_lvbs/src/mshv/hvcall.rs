@@ -2,17 +2,27 @@ use crate::{
     arch::instrs::{rdmsr, wrmsr},
     kernel_context::get_per_core_kernel_context,
     mshv::mshv_bindings::{
-        HV_STATUS_ACCESS_DENIED, HV_STATUS_INSUFFICIENT_BUFFERS, HV_STATUS_INSUFFICIENT_MEMORY,
-        HV_STATUS_INVALID_ALIGNMENT, HV_STATUS_INVALID_CONNECTION_ID,
-        HV_STATUS_INVALID_HYPERCALL_CODE, HV_STATUS_INVALID_HYPERCALL_INPUT,
-        HV_STATUS_INVALID_PARAMETER, HV_STATUS_INVALID_PORT_ID, HV_STATUS_OPERATION_DENIED,
-        HV_STATUS_TIME_OUT, HV_STATUS_VTL_ALREADY_ENABLED, HV_X64_MSR_GUEST_OS_ID,
-        HV_X64_MSR_HYPERCALL, HV_X64_MSR_HYPERCALL_ENABLE, HV_X64_MSR_VP_ASSIST_PAGE,
-        HV_X64_MSR_VP_ASSIST_PAGE_ENABLE, HYPERV_CPUID_IMPLEMENT_LIMITS, HYPERV_CPUID_INTERFACE,
+        HV_HYPERCALL_REP_COMP_MASK, HV_HYPERCALL_REP_COMP_OFFSET, HV_HYPERCALL_REP_START_MASK,
+        HV_HYPERCALL_REP_START_OFFSET, HV_HYPERCALL_RESULT_MASK, HV_HYPERCALL_VARHEAD_OFFSET,
+        HV_REGISTER_VP_INDEX, HV_STATUS_ACCESS_DENIED, HV_STATUS_INSUFFICIENT_BUFFERS,
+        HV_STATUS_INSUFFICIENT_MEMORY, HV_STATUS_INVALID_ALIGNMENT,
+        HV_STATUS_INVALID_CONNECTION_ID, HV_STATUS_INVALID_HYPERCALL_CODE,
+        HV_STATUS_INVALID_HYPERCALL_INPUT, HV_STATUS_INVALID_PARAMETER, HV_STATUS_INVALID_PORT_ID,
+        HV_STATUS_OPERATION_DENIED, HV_STATUS_SUCCESS, HV_STATUS_TIME_OUT,
+        HV_STATUS_VTL_ALREADY_ENABLED, HV_X64_MSR_GUEST_OS_ID, HV_X64_MSR_HYPERCALL,
+        HV_X64_MSR_HYPERCALL_ENABLE, HV_X64_MSR_VP_ASSIST_PAGE, HV_X64_MSR_VP_ASSIST_PAGE_ENABLE,
+        HYPERV_CPUID_IMPLEMENT_LIMITS, HYPERV_CPUID_INTERFACE,
         HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, HYPERV_HYPERVISOR_PRESENT_BIT,
     },
 };
+use core::arch::asm;
 use num_enum::TryFromPrimitive;
+
+#[cfg(debug_assertions)]
+use crate::kernel_context::get_core_id;
+
+#[cfg(debug_assertions)]
+use crate::serial_println;
 
 const CPU_VERSION_INFO: u32 = 1;
 const HV_CPUID_SIGNATURE_EAX: u32 = 0x31237648;
@@ -33,16 +43,33 @@ fn generate_guest_id(dinfo1: u64, kernver: u64, dinfo2: u64) -> u64 {
     guest_id
 }
 
+fn check_hyperv() -> Result<(), HypervError> {
+    use core::arch::x86_64::__cpuid_count as cpuid_count;
+
+    let result = unsafe { cpuid_count(CPU_VERSION_INFO, 0x0) };
+    if result.ecx & HYPERV_HYPERVISOR_PRESENT_BIT == 0 {
+        return Err(HypervError::NonVirtualized);
+    }
+
+    let result = unsafe { cpuid_count(HYPERV_CPUID_INTERFACE, 0x0) };
+    if result.eax != HV_CPUID_SIGNATURE_EAX {
+        return Err(HypervError::NonHyperv);
+    }
+
+    let result = unsafe { cpuid_count(HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, 0x0) };
+    if result.eax < HYPERV_CPUID_IMPLEMENT_LIMITS {
+        return Err(HypervError::NoVTLSupport);
+    }
+
+    Ok(())
+}
+
 /// Enable Hyper-V hypercalls by initializing MSR and VP registers (per core)
 /// # Panics
 /// Panics if the underlying hardware/platform is not Hyper-V
+/// Panics if the MSR/VP registers writes fail
 pub fn init() -> Result<(), HypervError> {
-    let result = check_hyperv();
-
-    #[expect(clippy::question_mark)]
-    if result.is_err() {
-        return result;
-    }
+    check_hyperv()?;
 
     let kernel_context = get_per_core_kernel_context();
 
@@ -78,30 +105,87 @@ pub fn init() -> Result<(), HypervError> {
 
     // TODO: configure virtual partitions (if core # is 0)
 
+    #[cfg(debug_assertions)]
+    serial_println!("HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
+
+    #[cfg(debug_assertions)]
+    if get_core_id() == 0 {
+        serial_println!(
+            "HV_X64_MSR_VP_ASSIST_PAGE: {:#x}",
+            rdmsr(HV_X64_MSR_VP_ASSIST_PAGE)
+        );
+        serial_println!(
+            "HV_X64_MSR_GUEST_OS_ID: {:#x}",
+            rdmsr(HV_X64_MSR_GUEST_OS_ID)
+        );
+        serial_println!("HV_X64_MSR_HYPERCALL: {:#x}", rdmsr(HV_X64_MSR_HYPERCALL));
+    }
+
     Ok(())
 }
 
-// TODO: add hv_do and hv_do_rep hypercalls
+#[inline]
+fn hv_result(status: u64) -> u32 {
+    u32::try_from(status & u64::from(HV_HYPERCALL_RESULT_MASK)).expect("mask error")
+}
 
-fn check_hyperv() -> Result<(), HypervError> {
-    use core::arch::x86_64::__cpuid_count as cpuid_count;
+#[inline]
+pub fn hv_result_success(status: u64) -> bool {
+    hv_result(status) == HV_STATUS_SUCCESS
+}
 
-    let result = unsafe { cpuid_count(CPU_VERSION_INFO, 0x0) };
-    if result.ecx & HYPERV_HYPERVISOR_PRESENT_BIT == 0 {
-        return Err(HypervError::NonVirtualized);
+pub fn hv_do_hypercall(control: u64, input: u64, output: u64) -> Result<u64, HypervCallError> {
+    let mut status: u64;
+    let kernel_context = get_per_core_kernel_context();
+    let hypercall_pg_addr: u64 = kernel_context.hv_hypercall_page_as_u64();
+
+    unsafe {
+        asm!(
+            "call rax",
+            in("rax") hypercall_pg_addr, in("rcx") control, in("rdx") input,
+            in("r8") output, lateout("rax") status, options(nostack)
+        );
     }
 
-    let result = unsafe { cpuid_count(HYPERV_CPUID_INTERFACE, 0x0) };
-    if result.eax != HV_CPUID_SIGNATURE_EAX {
-        return Err(HypervError::NonHyperv);
+    if !hv_result_success(status) {
+        let err = HypervCallError::try_from(hv_result(status)).unwrap_or(HypervCallError::Unknown);
+        return Err(err);
     }
 
-    let result = unsafe { cpuid_count(HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, 0x0) };
-    if result.eax < HYPERV_CPUID_IMPLEMENT_LIMITS {
-        return Err(HypervError::NoVTLSupport);
+    Ok(status)
+}
+
+#[inline]
+fn hv_repcomp(status: u64) -> u16 {
+    ((status & HV_HYPERCALL_REP_COMP_MASK) >> HV_HYPERCALL_REP_COMP_OFFSET) as u16
+}
+
+pub fn hv_do_rep_hypercall(
+    code: u16,
+    rep_count: u16,
+    varhead_size: u16,
+    input: u64,
+    output: u64,
+) -> Result<u64, HypervCallError> {
+    let mut control: u64 = u64::from(code);
+    let mut rep_comp: u16;
+
+    control |= u64::from(varhead_size) << HV_HYPERCALL_VARHEAD_OFFSET;
+    control |= u64::from(rep_count) << HV_HYPERCALL_REP_COMP_OFFSET;
+
+    loop {
+        let status = hv_do_hypercall(control, input, output)?;
+
+        rep_comp = hv_repcomp(status);
+        control &= !HV_HYPERCALL_REP_START_MASK;
+        control |= u64::from(rep_comp) << HV_HYPERCALL_REP_START_OFFSET;
+
+        if rep_comp >= rep_count {
+            break;
+        }
     }
 
-    Ok(())
+    Ok(HV_STATUS_SUCCESS.into())
 }
 
 /// Error for Hyper-V initialization
@@ -131,4 +215,5 @@ pub enum HypervCallError {
     InsufficientBuffers = HV_STATUS_INSUFFICIENT_BUFFERS,
     TimeOut = HV_STATUS_TIME_OUT,
     AlreadyEnabled = HV_STATUS_VTL_ALREADY_ENABLED,
+    Unknown = 0xffff_ffff,
 }
