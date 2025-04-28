@@ -132,7 +132,11 @@ pub fn hv_result_success(status: u64) -> bool {
 }
 
 /// Hyper-V Hypercall using the hypercall page
-pub fn hv_do_hypercall(control: u64, input: u64, output: u64) -> Result<u64, HypervCallError> {
+pub fn hv_do_hypercall(
+    control: u64,
+    input: *const core::ffi::c_void,
+    output: *mut core::ffi::c_void,
+) -> Result<u64, HypervCallError> {
     let mut status: u64;
     let kernel_context = get_per_core_kernel_context();
     let hypercall_pg_addr: u64 = kernel_context.hv_hypercall_page_as_u64();
@@ -163,8 +167,8 @@ pub fn hv_do_rep_hypercall(
     code: u16,
     rep_count: u16,
     varhead_size: u16,
-    input: u64,
-    output: u64,
+    input: *const core::ffi::c_void,
+    output: *mut core::ffi::c_void,
 ) -> Result<u64, HypervCallError> {
     let mut control: u64 = u64::from(code);
     let mut rep_comp: u16;

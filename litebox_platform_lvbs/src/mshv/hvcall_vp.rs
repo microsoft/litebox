@@ -44,8 +44,8 @@ pub fn hvcall_set_vp_registers(
         u16::try_from(HVCALL_SET_VP_REGISTERS).expect("HVCALL_SET_VP_REGISTERS"),
         1,
         0,
-        &raw const hvin as u64,
-        0,
+        (&raw const hvin).cast::<core::ffi::c_void>(),
+        core::ptr::null_mut(),
     )
 }
 
@@ -57,7 +57,7 @@ pub fn hvcall_get_vp_registers(
     input_vtl: u8,
 ) -> Result<u64, HypervCallError> {
     let mut hvin: hv_get_vp_registers_input = unsafe { core::mem::zeroed() };
-    let hvout: hv_get_vp_registers_output = unsafe { core::mem::zeroed() };
+    let mut hvout: hv_get_vp_registers_output = unsafe { core::mem::zeroed() };
 
     hvin.header.partitionid = HV_PARTITION_ID_SELF;
     hvin.header.vpindex = HV_VP_INDEX_SELF;
@@ -68,8 +68,8 @@ pub fn hvcall_get_vp_registers(
         u16::try_from(HVCALL_GET_VP_REGISTERS).expect("HVCALL_GET_VP_REGISTERS"),
         1,
         0,
-        &raw const hvin as u64,
-        &raw const hvout as u64,
+        (&raw const hvin).cast::<core::ffi::c_void>(),
+        (&raw mut hvout).cast::<core::ffi::c_void>(),
     );
 
     if status.is_err() {
@@ -141,7 +141,11 @@ fn hvcall_enable_vp_vtl(
 
     hv_vtl_populate_vp_context(&mut hvin, tss, rip, rsp);
 
-    hv_do_hypercall(u64::from(HVCALL_ENABLE_VP_VTL), &raw const hvin as u64, 0)
+    hv_do_hypercall(
+        u64::from(HVCALL_ENABLE_VP_VTL),
+        (&raw const hvin).cast::<core::ffi::c_void>(),
+        core::ptr::null_mut(),
+    )
 }
 
 // TODO: better way to get the entry point?
