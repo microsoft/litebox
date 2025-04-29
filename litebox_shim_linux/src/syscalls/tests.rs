@@ -4,14 +4,12 @@ use litebox_platform_multiplex::{Platform, set_platform};
 
 use super::file::{sys_eventfd2, sys_fcntl, sys_pipe2};
 
-pub(crate) fn init_platform() {
-    set_platform(Platform::new(None));
+pub(crate) fn init_platform(tun_device_name: Option<&str>) {
+    set_platform(Platform::new(tun_device_name));
 
-    let platform = litebox_platform_multiplex::platform();
-    let litebox = litebox::LiteBox::new(platform);
-
-    let in_mem_fs = litebox::fs::in_mem::FileSystem::new(&litebox);
-    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&litebox);
+    let litebox = crate::litebox();
+    let in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(litebox);
     let tar_ro_fs =
         litebox::fs::tar_ro::FileSystem::new(&litebox, litebox::fs::tar_ro::empty_tar_file());
     crate::set_fs(litebox::fs::layered::FileSystem::new(
@@ -29,7 +27,7 @@ pub(crate) fn init_platform() {
 
 #[test]
 fn test_fcntl() {
-    init_platform();
+    init_platform(None);
 
     let check = |fd: i32, flags1: OFlags, flags2: OFlags| {
         assert_eq!(

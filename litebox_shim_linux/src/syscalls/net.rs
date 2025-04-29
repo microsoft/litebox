@@ -59,18 +59,18 @@ impl CSockStorage {
                 ))))
             }
             _ => {
-                todo!("unsupported family");
+                todo!("unsupported family {family}");
             }
         }
     }
 }
 
 #[repr(C, packed)]
-pub struct CSockInetAddr {
-    pub family: i16,
-    pub port: u16,
-    pub addr: [u8; 4],
-    pub padding: u64,
+struct CSockInetAddr {
+    family: i16,
+    port: u16,
+    addr: [u8; 4],
+    __pad: u64,
 }
 
 impl From<CSockInetAddr> for SocketAddrV4 {
@@ -82,8 +82,8 @@ impl From<CSockInetAddr> for SocketAddrV4 {
 const UNIX_PATH_MAX: usize = 108;
 #[repr(C)]
 struct CSockUnixAddr {
-    pub family: i16,
-    pub path: [u8; UNIX_PATH_MAX],
+    family: i16,
+    path: [u8; UNIX_PATH_MAX],
 }
 
 pub(super) enum SocketAddress {
@@ -106,10 +106,28 @@ impl Socket {
         }
     }
 
+    fn accept(&self) -> Result<SocketFd, Errno> {
+        litebox_net().lock().accept(&self.fd).map_err(Errno::from)
+    }
+
     fn bind(&self, sockaddr: SocketAddr) -> Result<(), Errno> {
         litebox_net()
             .lock()
             .bind(&self.fd, &sockaddr)
+            .map_err(Errno::from)
+    }
+
+    fn connect(&self, sockaddr: SocketAddr) -> Result<(), Errno> {
+        litebox_net()
+            .lock()
+            .connect(&self.fd, &sockaddr)
+            .map_err(Errno::from)
+    }
+
+    fn listen(&self, backlog: u16) -> Result<(), Errno> {
+        litebox_net()
+            .lock()
+            .listen(&self.fd, backlog)
             .map_err(Errno::from)
     }
 
@@ -170,6 +188,21 @@ fn read_sockaddr_from_user(sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<Soc
     storage.to_sockaddr(addrlen)
 }
 
+pub(crate) fn sys_accept(sockfd: i32) -> Result<SocketFd, Errno> {
+    let Ok(sockfd) = u32::try_from(sockfd) else {
+        return Err(Errno::EBADF);
+    };
+
+    match file_descriptors()
+        .read()
+        .get_fd(sockfd)
+        .ok_or(Errno::EBADF)?
+    {
+        Descriptor::Socket(socket) => socket.accept(),
+        _ => Err(Errno::ENOTSOCK),
+    }
+}
+
 pub(crate) fn sys_connect(fd: i32, sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<(), Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
@@ -177,7 +210,10 @@ pub(crate) fn sys_connect(fd: i32, sockaddr: ConstPtr<u8>, addrlen: usize) -> Re
 
     let addr = read_sockaddr_from_user(sockaddr, addrlen)?;
     match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
-        Descriptor::Socket(socket) => todo!(),
+        Descriptor::Socket(socket) => {
+            let SocketAddress::Inet(addr) = addr;
+            socket.connect(addr)
+        }
         _ => Err(Errno::ENOTSOCK),
     }
 }
@@ -198,5 +234,92 @@ pub(crate) fn sys_bind(sockfd: i32, sockaddr: ConstPtr<u8>, addrlen: usize) -> R
             socket.bind(addr)
         }
         _ => Err(Errno::ENOTSOCK),
+    }
+}
+
+pub(crate) fn sys_listen(sockfd: i32, backlog: u16) -> Result<(), Errno> {
+    let Ok(sockfd) = u32::try_from(sockfd) else {
+        return Err(Errno::EBADF);
+    };
+
+    match file_descriptors()
+        .read()
+        .get_fd(sockfd)
+        .ok_or(Errno::EBADF)?
+    {
+        Descriptor::Socket(socket) => socket.listen(backlog),
+        _ => Err(Errno::ENOTSOCK),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use litebox_common_linux::{AddressFamily, SockFlags, SockType, errno::Errno};
+
+    use crate::ConstPtr;
+
+    use super::{
+        CSockInetAddr, CSockStorage, sys_accept, sys_bind, sys_connect, sys_listen, sys_socket,
+    };
+
+    extern crate std;
+
+    #[test]
+    fn test_blocking_inet_socket() {
+        crate::syscalls::tests::init_platform(Some("tun99"));
+
+        let server = sys_socket(
+            AddressFamily::INET,
+            SockType::Stream,
+            SockFlags::empty(),
+            None,
+        )
+        .unwrap();
+        let server = i32::try_from(server).unwrap();
+        let inetaddr = CSockInetAddr {
+            family: AddressFamily::INET as i16,
+            port: 8080u16.to_be(),
+            addr: [10, 0, 0, 2],
+            __pad: 0,
+        };
+        let mut sockaddr = CSockStorage::default();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                &inetaddr as *const _ as *const u8,
+                &mut sockaddr as *mut _ as *mut u8,
+                core::mem::size_of::<CSockInetAddr>(),
+            );
+        }
+        let addr: ConstPtr<u8> = unsafe { core::mem::transmute(&sockaddr) };
+        sys_bind(server, addr, core::mem::size_of::<CSockInetAddr>())
+            .expect("Failed to bind socket");
+        sys_listen(server, 1).expect("Failed to listen on socket");
+
+        std::thread::spawn(move || {
+            let client = sys_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                SockFlags::empty(),
+                None,
+            )
+            .unwrap();
+            let client = i32::try_from(client).unwrap();
+            let addr: ConstPtr<u8> = unsafe { core::mem::transmute(&sockaddr) };
+            while let Err(e) = sys_connect(client, addr, core::mem::size_of::<CSockInetAddr>()) {
+                assert_eq!(e, Errno::EAGAIN);
+                core::hint::spin_loop();
+            }
+
+            loop {
+                {
+                    core::hint::spin_loop();
+                }
+            }
+        });
+
+        while let Err(e) = sys_accept(server) {
+            assert_eq!(e, Errno::EAGAIN);
+            core::hint::spin_loop();
+        }
     }
 }
