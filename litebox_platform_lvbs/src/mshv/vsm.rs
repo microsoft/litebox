@@ -2,16 +2,14 @@
 
 use crate::{
     mshv::{
-        hvcall_vp::{hvcall_set_vp_registers, init_vtl_aps},
+        hvcall_vp::init_vtl_aps,
         mshv_bindings::{
-            CR0_PIN_MASK, HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
-            HV_REGISTER_CR_INTERCEPT_CR4_MASK, VSM_VTL_CALL_FUNC_ID_BOOT_APS,
-            VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY, VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL,
-            VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT, VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE,
-            VSM_VTL_CALL_FUNC_ID_LOAD_KDATA, VSM_VTL_CALL_FUNC_ID_LOCK_REGS,
-            VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY, VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT,
-            VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE, VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE,
-            hv_cr_intercept_control,
+            VSM_VTL_CALL_FUNC_ID_BOOT_APS, VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY,
+            VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL, VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT,
+            VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE, VSM_VTL_CALL_FUNC_ID_LOAD_KDATA,
+            VSM_VTL_CALL_FUNC_ID_LOCK_REGS, VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY,
+            VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT, VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE,
+            VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE,
         },
     },
     serial_println,
@@ -21,7 +19,7 @@ use num_enum::TryFromPrimitive;
 /// VTL call parameters (param[0]: function ID, param[1-3]: parameters)
 pub const NUM_VTLCALL_PARAMS: usize = 4;
 
-const CR4_PIN_MASK: u64 = 0xffff_ffff_ffff_de3fu64;
+// const CR4_PIN_MASK: u64 = 0xffff_ffff_ffff_de3fu64;
 
 /// VSM function for enabling VTL of APs
 /// # Panics
@@ -51,51 +49,7 @@ pub fn mshv_vsm_boot_aps(_cpu_online_mask_pfn: u64, _boot_signal_pfn: u64) -> u6
 pub fn mshv_vsm_lock_regs() -> u64 {
     #[cfg(debug_assertions)]
     serial_println!("VSM: Lock control registers");
-
-    let mut ctrl: hv_cr_intercept_control = unsafe { core::mem::zeroed() };
-    unsafe {
-        ctrl.__bindgen_anon_1.set_cr0_write(1);
-        ctrl.__bindgen_anon_1.set_cr4_write(1);
-        ctrl.__bindgen_anon_1.set_gdtr_write(1);
-        ctrl.__bindgen_anon_1.set_idtr_write(1);
-        ctrl.__bindgen_anon_1.set_ldtr_write(1);
-        ctrl.__bindgen_anon_1.set_tr_write(1);
-        ctrl.__bindgen_anon_1.set_msr_lstar_write(1);
-        ctrl.__bindgen_anon_1.set_msr_star_write(1);
-        ctrl.__bindgen_anon_1.set_msr_cstar_write(1);
-        ctrl.__bindgen_anon_1.set_msr_apic_base_write(1);
-        ctrl.__bindgen_anon_1.set_msr_efer_write(1);
-        ctrl.__bindgen_anon_1.set_msr_sysenter_cs_write(1);
-        ctrl.__bindgen_anon_1.set_msr_sysenter_eip_write(1);
-        ctrl.__bindgen_anon_1.set_msr_sysenter_esp_write(1);
-        ctrl.__bindgen_anon_1.set_msr_sfmask_write(1);
-    }
-
-    if let Err(result) =
-        hvcall_set_vp_registers(HV_REGISTER_CR_INTERCEPT_CONTROL, unsafe { ctrl.as_u64 }, 0)
-    {
-        serial_println!("Err: {:?}", result);
-        let err: u32 = result.into();
-        return err.into();
-    }
-
-    if let Err(result) = hvcall_set_vp_registers(HV_REGISTER_CR_INTERCEPT_CR4_MASK, CR4_PIN_MASK, 0)
-    {
-        serial_println!("Err: {:?}", result);
-        let err: u32 = result.into();
-        return err.into();
-    }
-
-    if let Err(result) = hvcall_set_vp_registers(
-        HV_REGISTER_CR_INTERCEPT_CR0_MASK,
-        u64::from(CR0_PIN_MASK),
-        0,
-    ) {
-        serial_println!("Err: {:?}", result);
-        let err: u32 = result.into();
-        return err.into();
-    }
-
+    // TODO: lock control registers
     0
 }
 
