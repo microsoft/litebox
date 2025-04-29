@@ -40,20 +40,6 @@ pub fn get_address_of_special_page(page: usize) -> u64 {
     get_memory_base_address() + (page as u64) * PAGE_SIZE as u64
 }
 
-// repurpose page frames pre-allocated for VTL1 kernel
-// TODO: use heap or embed this info in the binary
-// pub const VTL1_HEAP_START_PAGE: usize = 3092;
-// pub const VTL1_HEAP_END_PAGE: usize = 4091;
-// pub const VTL1_TEMP_PTE_PAGE: usize = 4092;
-// pub const VTL1_EXT_PTE_BASE: usize = 4096;
-
-// special user pages
-// TODO: use heap
-// pub const DL_PHDR_INFO_PAGE: u64 = 0x1f_f000;
-// pub const KERNEL_USER_SHARED_PAGE: u64 = 0x1f_e000;
-// pub const USER_STACK_TOP: u64 = 0x1f_e000;
-// pub const USER_CODE_BASE: u64 = 0x1000;
-
 /// Error for VSM memory
 #[derive(Debug, PartialEq)]
 pub enum VtlMemoyError {

@@ -2,7 +2,6 @@
 
 use core::{arch::asm, fmt};
 use spin::{Mutex, Once};
-// use lazy_static::lazy_static;
 
 // LVBS uses COM PORT 2 for printing out debug messages
 const COM_PORT_2: u16 = 0x2F8;
@@ -115,15 +114,6 @@ impl ComPort {
     }
 }
 
-// lazy_static! {
-//     pub static ref COM: Mutex<ComPort> = {
-//         let mut com_port = ComPort::new(COM_PORT_2);
-//         com_port.init();
-
-//         Mutex::new(com_port)
-//     };
-// }
-
 fn com() -> &'static Mutex<ComPort> {
     static COM_ONCE: Once<Mutex<ComPort>> = Once::new();
     COM_ONCE.call_once(|| {
@@ -144,7 +134,6 @@ impl fmt::Write for ComPort {
 pub fn print(args: ::core::fmt::Arguments) {
     use core::fmt::Write;
     let _ = com().lock().write_fmt(args);
-    // let _ = COM.lock().write_fmt(args);
 }
 
 #[macro_export]
@@ -160,5 +149,4 @@ macro_rules! serial_println {
 
 pub fn serial_print_string(s: &str) {
     com().lock().write_string(s);
-    // COM.lock().write_string(s);
 }
