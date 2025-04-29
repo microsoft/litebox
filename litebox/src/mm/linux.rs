@@ -159,7 +159,10 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
 
 impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem<Platform, ALIGN> {
     pub(super) const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
+    #[cfg(target_arch = "x86_64")]
     pub(super) const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+    #[cfg(target_arch = "x86")]
+    pub(super) const TASK_ADDR_MAX: usize = 0xC000_0000; // 3 GiB (see arch/x86/include/asm/page_32_types.h)
     pub(super) const STACK_GUARD_GAP: usize = 256 << 12;
 
     /// Create a new [`Vmem`] instance with the given memory [backend](`VmemBackend`).

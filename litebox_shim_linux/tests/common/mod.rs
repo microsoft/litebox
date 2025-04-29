@@ -10,6 +10,7 @@ use litebox_shim_linux::{
     litebox_fs, loader::load_program, set_fs, syscall_entry, syscalls::file::sys_open,
 };
 
+#[cfg(target_arch = "x86_64")]
 global_asm!(
     "
     .text
@@ -20,6 +21,22 @@ trampoline:
     xor rdx, rdx
     mov	rsp, rsi
     jmp	rdi
+    /* Should not reach. */
+    hlt"
+);
+#[cfg(target_arch = "x86")]
+global_asm!(
+    "
+    .text
+    .align  4
+    .globl  trampoline
+    .type   trampoline,@function
+trampoline:
+    xor     edx, edx
+    mov     ebx, [esp + 4]
+    mov     eax, [esp + 8]
+    mov     esp, eax
+    jmp     ebx
     /* Should not reach. */
     hlt"
 );
@@ -70,6 +87,7 @@ pub fn init_platform() {
     );
 
     install_dir("/lib64");
+    install_dir("/lib32");
     install_dir("/lib");
     install_dir("/lib/x86_64-linux-gnu");
 }
@@ -80,6 +98,11 @@ pub fn compile(output: &std::path::Path, exec_or_lib: bool) {
     if exec_or_lib {
         args.push("-static");
     }
+    args.push(match std::env::consts::ARCH {
+        "x86_64" => "-m64",
+        "x86" => "-m32",
+        _ => unimplemented!(),
+    });
     let output = std::process::Command::new("gcc")
         .args(args)
         .output()

@@ -99,13 +99,19 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
         input_binary
     };
     assert_eq!((&raw const input_binary[0] as usize) % 8, 0);
-    if object::FileKind::parse(input_binary).map_err(|e| Error::ParseError(e.to_string()))?
-        != object::FileKind::Elf64
+    let mut builder = match object::FileKind::parse(input_binary)
+        .map_err(|e| Error::ParseError(e.to_string()))?
     {
-        return Err(Error::UnsupportedObjectFile);
+        object::FileKind::Elf64 => object::build::elf::Builder::read64(input_binary),
+        object::FileKind::Elf32 => object::build::elf::Builder::read32(input_binary),
+        _ => return Err(Error::UnsupportedObjectFile),
     }
-    let mut builder = object::build::elf::Builder::read64(input_binary)
-        .map_err(|e| Error::ParseError(e.to_string()))?;
+    .map_err(|e| Error::ParseError(e.to_string()))?;
+    let arch = if builder.is_64 {
+        Arch::X86_64
+    } else {
+        Arch::X86_32
+    };
 
     let text_sections = text_sections(&builder)?;
     let trampoline_section = setup_trampoline_section(&mut builder)?;
@@ -144,6 +150,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
             unimplemented!()
         };
         match hook_syscalls_in_section(
+            arch,
             s.sh_addr,
             data.to_mut(),
             trampoline_base_addr,
@@ -216,8 +223,15 @@ fn setup_trampoline_section(
     Ok(s.id())
 }
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash)]
+enum Arch {
+    X86_32,
+    X86_64,
+}
+
 /// (private) Hook all syscalls in `section`, possibly extending `trampoline_data` to do so.
 fn hook_syscalls_in_section(
+    arch: Arch,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
@@ -228,16 +242,30 @@ fn hook_syscalls_in_section(
     // Disassemble the section
     let cs = capstone::Capstone::new()
         .x86()
-        .mode(capstone::arch::x86::ArchMode::Mode64)
+        .mode(match arch {
+            Arch::X86_32 => capstone::arch::x86::ArchMode::Mode32,
+            Arch::X86_64 => capstone::arch::x86::ArchMode::Mode64,
+        })
         .syntax(capstone::arch::x86::ArchSyntax::Intel)
         .build()?;
     let instructions = cs.disasm_all(section_data, section_base_addr)?;
 
     for (i, inst) in instructions.iter().enumerate() {
-        if capstone::arch::x86::X86Insn::from(inst.id().0)
-            != capstone::arch::x86::X86Insn::X86_INS_SYSCALL
-        {
-            continue;
+        // Forward search for `syscall` / `int 0x80`
+        match arch {
+            Arch::X86_32 => {
+                // `int 0x80` (the 32-bit Linux "syscall" instruction).
+                if inst.bytes() != [0xcd, 0x80] {
+                    continue;
+                }
+            }
+            Arch::X86_64 => {
+                if capstone::arch::x86::X86Insn::from(inst.id().0)
+                    != capstone::arch::x86::X86Insn::X86_INS_SYSCALL
+                {
+                    continue;
+                }
+            }
         }
 
         let replace_end = inst

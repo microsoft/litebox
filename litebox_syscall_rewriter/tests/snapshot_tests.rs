@@ -21,7 +21,10 @@ fn objdump(binary: &[u8]) -> String {
         .join("\n")
 }
 
+#[cfg(target_arch = "x86_64")]
 const HELLO_INPUT: &[u8] = include_bytes!("hello");
+#[cfg(target_arch = "x86")]
+const HELLO_INPUT: &[u8] = include_bytes!("hello-32");
 
 #[test]
 fn snapshot_test_hello_world() {
@@ -33,5 +36,10 @@ fn snapshot_test_hello_world() {
         3,
         Some(("original", "rewritten")),
     );
-    insta::assert_snapshot!("hello-diff", diff);
+
+    match std::env::consts::ARCH {
+        "x86_64" => insta::assert_snapshot!("hello-diff", diff),
+        "x86" => insta::assert_snapshot!("hello-32-diff", diff),
+        _ => unimplemented!(),
+    }
 }

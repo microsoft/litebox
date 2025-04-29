@@ -1,6 +1,6 @@
 //! This module contains the loader for the LiteBox shim.
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 mod elf;
 mod stack;
 
