@@ -201,6 +201,7 @@ pub enum HypervError {
     InvalidGuestOSID,
     InvalidHypercallPage,
     VPSetupFailed,
+    Unknown,
 }
 
 /// Error for Hyper-V Hypercall

@@ -40,8 +40,6 @@ pub fn vtl_return(result: u64) {
     }
 }
 
-// TODO: for now, register save/restore relies on a stack trick. Better implementation might be needed.
-//
 // The following registers are shared between different VTLs.
 // If VTL entry is due to VTL call, we don't need to worry about VTL0 registers because
 // the caller saves them. However, if VTL entry is due to interrupt or intercept,
@@ -76,10 +74,6 @@ impl VtlState {
         VtlState {
             ..VtlState::default()
         }
-    }
-
-    pub fn copy_from(&mut self, src: &VtlState) {
-        *self = *src;
     }
 
     pub fn get_rax_rcx(&self) -> (u64, u64) {
@@ -159,7 +153,9 @@ fn drop_vtl_state_from_stack() {
 fn save_vtl0_state() {
     let vtl0_state = push_vtl_state_to_stack();
     let kernel_context = get_per_core_kernel_context();
-    kernel_context.vtl0_state.copy_from(unsafe { &*vtl0_state });
+    kernel_context
+        .vtl0_state
+        .clone_from(unsafe { &*vtl0_state });
     drop_vtl_state_from_stack();
 }
 
@@ -168,7 +164,9 @@ fn save_vtl0_state() {
 fn save_vtl1_state() {
     let vtl1_state = push_vtl_state_to_stack();
     let kernel_context = get_per_core_kernel_context();
-    kernel_context.vtl1_state.copy_from(unsafe { &*vtl1_state });
+    kernel_context
+        .vtl1_state
+        .clone_from(unsafe { &*vtl1_state });
     drop_vtl_state_from_stack();
 }
 
