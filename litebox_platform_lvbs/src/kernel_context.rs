@@ -2,7 +2,7 @@
 
 use crate::{
     arch::gdt,
-    mshv::{mshv_bindings::hv_vp_assist_page, vtl1_mem_layout::PAGE_SIZE},
+    mshv::{mshv_bindings::hv_vp_assist_page, vtl_switch::VtlState, vtl1_mem_layout::PAGE_SIZE},
 };
 use x86_64::structures::tss::TaskStateSegment;
 
@@ -19,9 +19,9 @@ pub struct KernelContext {
     _guard_page_0: [u8; PAGE_SIZE],
     pub kernel_stack: [u8; KERNEL_STACK_SIZE],
     _guard_page_1: [u8; PAGE_SIZE],
-    // TODO: VTL0 state saving
-    // TODO: VTL1 state saving
     pub tss: gdt::AlignedTss,
+    pub vtl0_state: VtlState,
+    pub vtl1_state: VtlState,
     pub gdt: Option<&'static gdt::GdtWrapper>,
 }
 
@@ -59,6 +59,48 @@ static mut PER_CORE_KERNEL_CONTEXT: [KernelContext; MAX_CORES] = [KernelContext 
     kernel_stack: [0u8; KERNEL_STACK_SIZE],
     _guard_page_1: [0u8; PAGE_SIZE],
     tss: gdt::AlignedTss(TaskStateSegment::new()),
+    vtl0_state: VtlState {
+        rbp: 0,
+        cr2: 0,
+        rax: 0,
+        rbx: 0,
+        rcx: 0,
+        rdx: 0,
+        rsi: 0,
+        rdi: 0,
+        r8: 0,
+        r9: 0,
+        r10: 0,
+        r11: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+    },
+    vtl1_state: VtlState {
+        rbp: 0,
+        cr2: 0,
+        rax: 0,
+        rbx: 0,
+        rcx: 0,
+        rdx: 0,
+        rsi: 0,
+        rdi: 0,
+        r8: 0,
+        r9: 0,
+        r10: 0,
+        r11: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+    },
+    // vtl0_state: VtlState {
+    //     regs: [0u64; NUM_REGS],
+    // },
+    // vtl1_state: VtlState {
+    //     regs: [0u64; NUM_REGS],
+    // },
     gdt: const { None },
 }; MAX_CORES];
 

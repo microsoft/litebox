@@ -5,7 +5,7 @@ use core::arch::asm;
 use litebox_platform_lvbs::{
     arch::instrs::hlt_loop,
     kernel_context::{get_core_id, get_per_core_kernel_context},
-    mshv::vtl_switch::vtl_return,
+    mshv::vtl_switch::vtl_switch_loop,
     serial_println,
 };
 
@@ -44,18 +44,7 @@ pub fn kernel_main() -> ! {
     // TODO: BSP init (e.g., heap, ...)
 
     litebox_runner_lvbs::per_core_init();
-    vtl_return(0);
 
-    if core_id == 0 {
-        // TODO: get this info through VTL call (cpumask)
-        let online_cores = 6;
-        litebox_runner_lvbs::secondary_init(online_cores);
-        vtl_return(0);
-    }
-
-    // TODO: event loop
-    loop {
-        let result: u64 = 0;
-        vtl_return(result);
-    }
+    // TODO: platfrom.switch_loop()?
+    vtl_switch_loop()
 }
