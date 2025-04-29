@@ -38,7 +38,9 @@ pub unsafe extern "C" fn _start() -> ! {
 pub fn kernel_main() -> ! {
     let core_id = get_core_id();
     if core_id == 0 {
-        serial_println!("Hello from LiteBox for LVBS!");
+        serial_println!("==============================");
+        serial_println!(" Hello from LiteBox for LVBS! ");
+        serial_println!("==============================");
     }
 
     // TODO: BSP init (e.g., heap, ...)

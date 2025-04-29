@@ -18,7 +18,7 @@ use crate::{
     },
 };
 use core::arch::asm;
-use num_enum::TryFromPrimitive;
+use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 #[cfg(debug_assertions)]
 use crate::serial_println;
@@ -205,7 +205,7 @@ pub enum HypervError {
 }
 
 /// Error for Hyper-V Hypercall
-#[derive(Debug, TryFromPrimitive)]
+#[derive(Debug, TryFromPrimitive, IntoPrimitive)]
 #[repr(u32)]
 pub enum HypervCallError {
     InvalidCode = HV_STATUS_INVALID_HYPERCALL_CODE,

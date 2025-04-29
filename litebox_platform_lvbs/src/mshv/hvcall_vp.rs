@@ -8,7 +8,7 @@ use crate::{
     kernel_context::MAX_CORES,
     mshv::{
         HV_PARTITION_ID_SELF, HV_VP_INDEX_SELF,
-        hvcall::{HypervCallError, HypervError, hv_do_hypercall, hv_do_rep_hypercall},
+        hvcall::{HypervCallError, hv_do_hypercall, hv_do_rep_hypercall},
         mshv_bindings::{
             HVCALL_ENABLE_VP_VTL, HVCALL_GET_VP_REGISTERS, HVCALL_SET_VP_REGISTERS,
             hv_enable_vp_vtl, hv_get_vp_registers_input, hv_get_vp_registers_output,
@@ -163,7 +163,7 @@ fn get_entry() -> u64 {
 /// # Panics
 /// Panics if the number of online cores is greater than `MAX_CORES`.
 #[expect(clippy::similar_names)]
-pub fn init_vtl_aps(online_cores: u32) -> Result<(), HypervError> {
+pub fn init_vtl_aps(online_cores: u32) -> Result<u64, HypervCallError> {
     assert!(online_cores <= u32::try_from(MAX_CORES).expect("MAX_CORES"));
 
     let rip: u64 = get_entry() as *const () as u64;
@@ -174,9 +174,9 @@ pub fn init_vtl_aps(online_cores: u32) -> Result<(), HypervError> {
         let result = hvcall_enable_vp_vtl(core, HV_VTL_SECURE, tss, rip, rsp);
         if result.is_err() {
             serial_println!("Failed to enable VTL for core {}: {:?}", core, result);
-            return Err(HypervError::VPSetupFailed);
+            return result;
         }
     }
 
-    Ok(())
+    Ok(0)
 }

@@ -72,7 +72,7 @@
 #define X86_CR0_CD          (1UL<<30) /* Cache Disable */
 #define X86_CR0_PG          (1UL<<31) /* Paging */
 
-#define CR4_PIN_MASK ~(X86_CR4_MCE | X86_CR4_PGE | X86_CR4_PCE | X86_CR4_VMXE)
+// #define CR4_PIN_MASK ~(X86_CR4_MCE | X86_CR4_PGE | X86_CR4_PCE | X86_CR4_VMXE)
 #define CR0_PIN_MASK (X86_CR0_PE | X86_CR0_WP | X86_CR0_PG)
 
 /*
