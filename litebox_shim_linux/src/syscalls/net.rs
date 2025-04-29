@@ -1,9 +1,8 @@
 use core::{
-    net::Ipv4Addr,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::atomic::{AtomicBool, AtomicU32},
 };
 
-use alloc::string::ToString as _;
 use litebox::{fd::SocketFd, net::Protocol, platform::RawConstPointer};
 use litebox_common_linux::{AddressFamily, SockFlags, SockType, errno::Errno};
 
@@ -46,7 +45,7 @@ transmute_sockaddr!(transmute_to_unix, CSockUnixAddr);
 transmute_sockaddr!(transmute_to_inet, CSockInetAddr);
 
 impl CSockStorage {
-    pub fn to_sockaddr(self, addrlen: usize) -> Result<SocketAddr, Errno> {
+    pub fn to_sockaddr(self, addrlen: usize) -> Result<SocketAddress, Errno> {
         let family = self.sa_family as u32;
         match family {
             litebox_common_linux::AF_UNIX => todo!(),
@@ -55,7 +54,9 @@ impl CSockStorage {
                     return Err(Errno::EINVAL);
                 }
                 let inet_addr = self.transmute_to_inet();
-                Ok(SocketAddr::IPv4(SocketIPv4Addr::from(inet_addr)))
+                Ok(SocketAddress::Inet(SocketAddr::V4(SocketAddrV4::from(
+                    inet_addr,
+                ))))
             }
             _ => {
                 todo!("unsupported family");
@@ -72,17 +73,9 @@ pub struct CSockInetAddr {
     pub padding: u64,
 }
 
-struct SocketIPv4Addr {
-    pub addr: Ipv4Addr,
-    pub port: u16,
-}
-
-impl From<CSockInetAddr> for SocketIPv4Addr {
+impl From<CSockInetAddr> for SocketAddrV4 {
     fn from(c_addr: CSockInetAddr) -> Self {
-        Self {
-            addr: Ipv4Addr::from(c_addr.addr),
-            port: u16::from_be(c_addr.port),
-        }
+        SocketAddrV4::new(Ipv4Addr::from(c_addr.addr), u16::from_be(c_addr.port))
     }
 }
 
@@ -93,8 +86,8 @@ struct CSockUnixAddr {
     pub path: [u8; UNIX_PATH_MAX],
 }
 
-pub(super) enum SocketAddr {
-    IPv4(SocketIPv4Addr),
+pub(super) enum SocketAddress {
+    Inet(SocketAddr),
 }
 
 pub(crate) struct Socket {
@@ -112,6 +105,14 @@ impl Socket {
             close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
         }
     }
+
+    fn bind(&self, sockaddr: SocketAddr) -> Result<(), Errno> {
+        litebox_net()
+            .lock()
+            .bind(&self.fd, &sockaddr)
+            .map_err(Errno::from)
+    }
+
     crate::syscalls::common_functions_for_file_status!();
 }
 
@@ -150,7 +151,7 @@ pub(crate) fn sys_socket(
     }
 }
 
-fn read_sockaddr_from_user(sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<SocketAddr, Errno> {
+fn read_sockaddr_from_user(sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<SocketAddress, Errno> {
     if addrlen < 2 {
         return Err(Errno::EINVAL);
     }
@@ -177,6 +178,25 @@ pub(crate) fn sys_connect(fd: i32, sockaddr: ConstPtr<u8>, addrlen: usize) -> Re
     let addr = read_sockaddr_from_user(sockaddr, addrlen)?;
     match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
         Descriptor::Socket(socket) => todo!(),
+        _ => Err(Errno::ENOTSOCK),
+    }
+}
+
+pub(crate) fn sys_bind(sockfd: i32, sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<(), Errno> {
+    let Ok(sockfd) = u32::try_from(sockfd) else {
+        return Err(Errno::EBADF);
+    };
+
+    let addr = read_sockaddr_from_user(sockaddr, addrlen)?;
+    match file_descriptors()
+        .read()
+        .get_fd(sockfd)
+        .ok_or(Errno::EBADF)?
+    {
+        Descriptor::Socket(socket) => {
+            let SocketAddress::Inet(addr) = addr;
+            socket.bind(addr)
+        }
         _ => Err(Errno::ENOTSOCK),
     }
 }

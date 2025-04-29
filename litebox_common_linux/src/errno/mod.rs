@@ -232,3 +232,14 @@ impl From<litebox::net::errors::SocketError> for Errno {
         }
     }
 }
+
+impl From<litebox::net::errors::BindError> for Errno {
+    fn from(value: litebox::net::errors::BindError) -> Self {
+        match value {
+            litebox::net::errors::BindError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::BindError::UnsupportedAddress(_) => Errno::EAFNOSUPPORT,
+            litebox::net::errors::BindError::PortAlreadyInUse(_) => Errno::EADDRINUSE,
+            _ => unimplemented!(),
+        }
+    }
+}

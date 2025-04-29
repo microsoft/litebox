@@ -526,6 +526,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         sockaddr: Platform::RawConstPointer<u8>,
         addrlen: usize,
     },
+    Bind {
+        sockfd: i32,
+        sockaddr: Platform::RawConstPointer<u8>,
+        addrlen: usize,
+    },
     Fcntl {
         fd: i32,
         arg: FcntlArg,
