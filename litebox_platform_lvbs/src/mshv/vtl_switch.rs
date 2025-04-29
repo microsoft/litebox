@@ -40,12 +40,14 @@ pub fn vtl_return(result: u64) {
     }
 }
 
-// TODO: for now, register save/restore reliy on a trick. Better implementation is needed.
+// TODO: for now, register save/restore relies on a stack trick. Better implementation might be needed.
+//
 // The following registers are shared between different VTLs.
-// If VTL entry is due to VTL call, we don't need to worry about VTL0 registers
-// because the caller saves them. However, if VTL entry is due to interrupt
-// intercept, we should save/restore VTL0 registers. For now, we conservately
-// save/restore all VTL0/VTL1 registers (results in performance overhead)
+// If VTL entry is due to VTL call, we don't need to worry about VTL0 registers because
+// the caller saves them. However, if VTL entry is due to interrupt or intercept,
+// we should save/restore VTL0 registers. For now, we conservately save/restore all
+// VTL0/VTL1 registers (results in performance degradation)
+/// Struct to save VTL state (general-purpose registers)
 #[derive(Default, Clone, Copy)]
 #[repr(C)]
 pub struct VtlState {
@@ -78,17 +80,6 @@ impl VtlState {
 
     pub fn copy_from(&mut self, src: &VtlState) {
         *self = *src;
-    }
-
-    fn copy_to(&self, dst: &mut VtlState) {
-        *dst = *self;
-    }
-
-    #[must_use]
-    pub fn get_copy(&self) -> VtlState {
-        let mut vtl_state: VtlState = VtlState::default();
-        self.copy_to(&mut vtl_state);
-        vtl_state
     }
 
     pub fn get_rax_rcx(&self) -> (u64, u64) {
@@ -185,7 +176,7 @@ fn save_vtl1_state() {
 #[inline(always)]
 fn load_vtl0_state() {
     let kernel_context = get_per_core_kernel_context();
-    let vtl0_state: VtlState = kernel_context.vtl0_state.get_copy();
+    let vtl0_state: VtlState = kernel_context.vtl0_state;
     pop_vtl_state(&vtl0_state);
 }
 
@@ -193,15 +184,17 @@ fn load_vtl0_state() {
 #[inline(always)]
 fn load_vtl1_state() {
     let kernel_context = get_per_core_kernel_context();
-    let vtl1_state: VtlState = kernel_context.vtl1_state.get_copy();
+    let vtl1_state: VtlState = kernel_context.vtl1_state;
     pop_vtl_state(&vtl1_state);
 }
 
+/// VTL switch loop (entry point)
 pub fn vtl_switch_loop() -> ! {
     save_vtl0_state();
     vtl_switch_loop_internal(0);
 }
 
+/// VTL switch loop (internal)
 /// # Panics
 /// Panics if VTL call parameter 0 is greater than u32::MAX
 pub fn vtl_switch_loop_internal(result: u64) -> ! {
@@ -246,6 +239,7 @@ pub fn vtl_switch_loop_internal(result: u64) -> ! {
     }
 }
 
+/// VTL Entry Reason
 #[derive(Debug, TryFromPrimitive)]
 #[repr(u32)]
 pub enum VtlEntryReason {

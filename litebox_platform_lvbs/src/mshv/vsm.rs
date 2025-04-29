@@ -1,3 +1,5 @@
+//! VSM functions
+
 use crate::{
     mshv::{
         hvcall_vp,
@@ -14,9 +16,13 @@ use crate::{
 };
 use num_enum::TryFromPrimitive;
 
+/// VTL call parameters (param[0]: function ID, param[1-3]: parameters)
 pub const NUM_VTLCALL_PARAMS: usize = 4;
 
-fn mshv_vsm_enable_aps(_cpu_present_mask: u64) -> u64 {
+/// VSM function for enabling VTL of APs
+/// # Panics
+/// Panics if hypercall for initializing VTL for APs fails
+pub fn mshv_vsm_enable_aps(_cpu_present_mask: u64) -> u64 {
     #[cfg(debug_assertions)]
     serial_println!("VSM: Enable VTL of APs");
 
@@ -27,76 +33,86 @@ fn mshv_vsm_enable_aps(_cpu_present_mask: u64) -> u64 {
     0
 }
 
-fn mshv_vsm_boot_aps(_cpu_online_mask_pfn: u64, _boot_signal_pfn: u64) -> u64 {
+/// VSM function for booting APs
+pub fn mshv_vsm_boot_aps(_cpu_online_mask_pfn: u64, _boot_signal_pfn: u64) -> u64 {
     #[cfg(debug_assertions)]
     serial_println!("VSM: Boot APs");
     // TODO: update boot signal page accordingly
     0
 }
 
-fn mshv_vsm_lock_regs() -> u64 {
+/// VSM function for locking control registers
+pub fn mshv_vsm_lock_regs() -> u64 {
     #[cfg(debug_assertions)]
     serial_println!("VSM: Lock control registers");
     0
 }
 
-fn mshv_vsm_end_of_boot() -> u64 {
+/// VSM function for signaling end of boot
+pub fn mshv_vsm_end_of_boot() -> u64 {
     #[cfg(debug_assertions)]
     serial_println!("VSM: End of boot");
     // TODO: update global data structure
     0
 }
 
-fn mshv_vsm_protect_memory(_pa: u64, _nranges: u64) -> u64 {
+/// VSM function for protecting certain memory range
+pub fn mshv_vsm_protect_memory(_pa: u64, _nranges: u64) -> u64 {
     #[cfg(debug_assertions)]
     serial_println!("VSM: Protect memory");
     // TODO: protect memory using hv_modify_protection_mask()
     0
 }
 
-fn mshv_vsm_load_kdata(_pa: u64, _nranges: u64) -> u64 {
+/// VSM function for loading kernel data into VTL1
+pub fn mshv_vsm_load_kdata(_pa: u64, _nranges: u64) -> u64 {
     #[cfg(debug_assertions)]
     serial_println!("VSM: Lock kernel data");
     // TODO: load kernel data
     0
 }
 
-fn mshv_vsm_validate_guest_module(_pa: u64, _nranges: u64, _flags: u64) -> u64 {
+/// VSM function for validating guest kernel module
+pub fn mshv_vsm_validate_guest_module(_pa: u64, _nranges: u64, _flags: u64) -> u64 {
     #[cfg(debug_assertions)]
     serial_println!("VSM: Validate kernel module");
     // TODO: validate kernel module
     0
 }
 
-fn mshv_vsm_free_guest_module_init(_token: u64) -> u64 {
+/// VSM function for initializing guest kernel module
+pub fn mshv_vsm_free_guest_module_init(_token: u64) -> u64 {
     #[cfg(debug_assertions)]
     serial_println!("VSM: Free kernel module init");
     // TODO: free kernel module
     0
 }
 
-fn mshv_vsm_unload_guest_module(_token: u64) -> u64 {
+/// VSM function for unloading guest kernel module
+pub fn mshv_vsm_unload_guest_module(_token: u64) -> u64 {
     #[cfg(debug_assertions)]
     serial_println!("VSM: Unload kernel module");
     // TODO: unload kernel module
     0
 }
 
-fn mshv_vsm_copy_secondary_key(_pa: u64, _nranges: u64) -> u64 {
+/// VSM function for copying secondary key
+pub fn mshv_vsm_copy_secondary_key(_pa: u64, _nranges: u64) -> u64 {
     #[cfg(debug_assertions)]
     serial_println!("VSM: Copy secondary key");
     // TODO: copy secondary key
     0
 }
 
-fn mshv_vsm_kexec_validate(_pa: u64, _nranges: u64, _crash: u64) -> u64 {
+/// VSM function for validating kexec
+pub fn mshv_vsm_kexec_validate(_pa: u64, _nranges: u64, _crash: u64) -> u64 {
     #[cfg(debug_assertions)]
     serial_println!("VSM: Validate kexec");
     // TODO: validate kexec
     0
 }
 
-// TODO: implement handlers
+/// VSM function dispatcher
 /// # Panics
 /// Panics if VTL call parameter 0 is greater than u32::MAX
 pub fn vsm_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> u64 {

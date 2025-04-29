@@ -122,7 +122,7 @@ fn hv_vtl_populate_vp_context(input: &mut hv_enable_vp_vtl, tss: u64, rip: u64, 
     input.vp_context.tr.__bindgen_anon_1.attributes = 0x8b;
 }
 
-/// Hyper-V Hypercall to enable VTL (VTL1 for now) for a specific virtual processor (VP)
+/// Hyper-V Hypercall to enable a certain VTL for a specific virtual processor (VP)
 #[expect(clippy::similar_names)]
 fn hvcall_enable_vp_vtl(
     core_id: u32,

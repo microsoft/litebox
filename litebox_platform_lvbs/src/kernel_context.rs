@@ -10,7 +10,7 @@ pub const MAX_CORES: usize = 8; // TODO: MAX_CORES = 96?
 pub const INTERRUPT_STACK_SIZE: usize = 2 * PAGE_SIZE;
 pub const KERNEL_STACK_SIZE: usize = 8 * PAGE_SIZE;
 
-// Per-core VTL1 kernel context
+/// Per-core VTL1 kernel context
 #[repr(align(4096))]
 #[derive(Clone, Copy)]
 pub struct KernelContext {
@@ -95,12 +95,6 @@ static mut PER_CORE_KERNEL_CONTEXT: [KernelContext; MAX_CORES] = [KernelContext 
         r14: 0,
         r15: 0,
     },
-    // vtl0_state: VtlState {
-    //     regs: [0u64; NUM_REGS],
-    // },
-    // vtl1_state: VtlState {
-    //     regs: [0u64; NUM_REGS],
-    // },
     gdt: const { None },
 }; MAX_CORES];
 
