@@ -2,7 +2,11 @@
 
 #![no_std]
 
-use litebox::platform::{RawConstPointer, RawMutPointer};
+use litebox::{
+    fs::OFlags,
+    platform::{RawConstPointer, RawMutPointer},
+    utils::TruncateExt,
+};
 
 pub mod errno;
 
@@ -260,11 +264,14 @@ pub enum FcntlArg {
     SETFD(FileDescriptorFlags),
     /// Get descriptor status flags
     GETFL,
+    /// Set descriptor status flags
+    SETFL(OFlags),
 }
 
 const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
 const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
@@ -280,11 +287,22 @@ impl FcntlArg {
     pub fn from(cmd: i32, arg: usize) -> Self {
         match cmd {
             F_GETFD => Self::GETFD,
-            #[allow(clippy::cast_possible_truncation)]
-            F_SETFD => Self::SETFD(FileDescriptorFlags::from_bits_truncate(arg as u32)),
+            F_SETFD => Self::SETFD(FileDescriptorFlags::from_bits_truncate(arg.truncate())),
             F_GETFL => Self::GETFL,
+            F_SETFL => Self::SETFL(OFlags::from_bits_truncate(arg.truncate())),
             _ => unimplemented!(),
         }
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy)]
+    pub struct EfdFlags: core::ffi::c_uint {
+        const SEMAPHORE = 1;
+        const CLOEXEC = litebox::fs::OFlags::CLOEXEC.bits();
+        const NONBLOCK = litebox::fs::OFlags::NONBLOCK.bits();
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
     }
 }
 
@@ -323,6 +341,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         flags: MapFlags,
         fd: i32,
         offset: usize,
+    },
+    Munmap {
+        addr: Platform::RawMutPointer<u8>,
+        length: usize,
     },
     Pread64 {
         fd: i32,
@@ -380,6 +402,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pathname: Platform::RawConstPointer<i8>,
         buf: Platform::RawMutPointer<FileStat>,
         flags: AtFlags,
+    },
+    Eventfd2 {
+        initval: u32,
+        flags: EfdFlags,
     },
     Pipe2 {
         pipefd: Platform::RawMutPointer<u32>,

@@ -1,8 +1,8 @@
 //! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox on userland Linux.
 
-// Restrict this crate to only work on Linux. For now, we are restricting this to only x86-64 Linux,
-// but we _may_ allow for more in the future, if we find it useful to do so.
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+// Restrict this crate to only work on Linux. For now, we are restricting this to only x86/x86-64
+// Linux, but we _may_ allow for more in the future, if we find it useful to do so.
+#![cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
 
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::sync::atomic::AtomicU32;
@@ -447,7 +447,7 @@ fn futex_timeout(
     timeout: Option<Duration>,
     uaddr2: Option<&AtomicU32>,
     val3: u32,
-) -> i64 {
+) -> isize {
     let uaddr: *const AtomicU32 = uaddr as _;
     let futex_op: i32 = futex_op as _;
     let timeout = timeout.map(|t| {
@@ -467,7 +467,9 @@ fn futex_timeout(
     });
     let timeout: *const libc::timespec = timeout.map_or(std::ptr::null(), |t| &t);
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
-    unsafe { libc::syscall(libc::SYS_futex, uaddr, futex_op, val, timeout, uaddr2, val3) }
+    let ret =
+        unsafe { libc::syscall(libc::SYS_futex, uaddr, futex_op, val, timeout, uaddr2, val3) };
+    isize::try_from(ret).unwrap()
 }
 
 /// Safer invocation of the Linux futex syscall, with the "val2" variant of the arguments.
@@ -478,11 +480,12 @@ fn futex_val2(
     val2: u32,
     uaddr2: Option<&AtomicU32>,
     val3: u32,
-) -> i64 {
+) -> isize {
     let uaddr: *const AtomicU32 = uaddr as _;
     let futex_op: i32 = futex_op as _;
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
-    unsafe { libc::syscall(libc::SYS_futex, uaddr, futex_op, val, val2, uaddr2, val3) }
+    let ret = unsafe { libc::syscall(libc::SYS_futex, uaddr, futex_op, val, val2, uaddr2, val3) };
+    isize::try_from(ret).unwrap()
 }
 
 fn prot_flags(flags: MemoryRegionPermissions) -> nix::sys::mman::ProtFlags {
@@ -538,8 +541,18 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         &self,
         range: std::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
-        let addr = core::ptr::NonNull::new(range.start as _).expect("non null addr");
-        unsafe { nix::sys::mman::munmap(addr, range.len()) }.expect("munmap failed");
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_munmap,
+                    range.start,
+                    range.len(),
+                    // This is to ensure it won't be intercepted by Seccomp if enabled.
+                    syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                )
+            },
+            0,
+        );
         Ok(())
     }
 

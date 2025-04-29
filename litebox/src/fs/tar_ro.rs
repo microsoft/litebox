@@ -26,7 +26,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use tar_no_std::TarArchive;
 
-use crate::{path::Arg as _, sync};
+use crate::{LiteBox, path::Arg as _, sync, utilities::anymap::AnyMap};
 
 use super::{
     Mode, OFlags, SeekWhence,
@@ -39,12 +39,12 @@ use super::{
 /// A backing implementation for [`FileSystem`](super::FileSystem), storing all files in-memory, via
 /// a read-only `.tar` file.
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
-    // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
-    // sync-primitives platform, as well as cost of mutexes and such?
-    sync: sync::Synchronization<Platform>,
+    litebox: LiteBox<Platform>,
     tar_data: TarArchive,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
+    // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
+    // sync-primitives platform, as well as cost of mutexes and such?
     descriptors: sync::RwLock<Platform, Descriptors>,
 }
 
@@ -68,11 +68,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     ///
     /// Panics if the provided `tar_data` is found to be an invalid `.tar` file.
     #[must_use]
-    pub fn new(platform: &'static Platform, tar_data: Vec<u8>) -> Self {
-        let sync = sync::Synchronization::new(platform);
-        let descriptors = sync.new_rwlock(Descriptors::new());
+    pub fn new(litebox: &LiteBox<Platform>, tar_data: Vec<u8>) -> Self {
+        let litebox = litebox.clone();
+        let descriptors = litebox.sync().new_rwlock(Descriptors::new());
         Self {
-            sync,
+            litebox,
             tar_data: TarArchive::new(tar_data.into_boxed_slice()).unwrap(),
             current_working_dir: "/".into(),
             descriptors,
@@ -137,14 +137,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         assert!(flags.contains(OFlags::RDONLY));
         if entry.filename().as_str().unwrap() == path {
             // it is a file
-            Ok(self
-                .descriptors
-                .write()
-                .insert(Descriptor::File { idx, position: 0 }))
+            Ok(self.descriptors.write().insert(Descriptor::File {
+                idx,
+                position: 0,
+                metadata: AnyMap::new(),
+            }))
         } else {
             // it is a dir
             Ok(self.descriptors.write().insert(Descriptor::Dir {
                 path: path.to_owned(),
+                metadata: AnyMap::new(),
             }))
         }
     }
@@ -161,7 +163,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         mut offset: Option<usize>,
     ) -> Result<usize, ReadError> {
         let mut descriptors = self.descriptors.write();
-        let Descriptor::File { idx, position } = descriptors.get_mut(fd) else {
+        let Descriptor::File {
+            idx,
+            position,
+            metadata: _,
+        } = descriptors.get_mut(fd)
+        else {
             return Err(ReadError::NotAFile);
         };
         let position = offset.as_mut().unwrap_or(position);
@@ -194,7 +201,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
         let mut descriptors = self.descriptors.write();
-        let Descriptor::File { idx, position } = descriptors.get_mut(fd) else {
+        let Descriptor::File {
+            idx,
+            position,
+            metadata: _,
+        } = descriptors.get_mut(fd)
+        else {
             return Err(SeekError::NotAFile);
         };
         let file_len = self.tar_data.entries().nth(*idx).unwrap().data().len();
@@ -340,11 +352,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn set_fd_metadata<T: core::any::Any>(
         &self,
         fd: &crate::fd::FileFd,
-        metadata: T,
+        m: T,
     ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
-        Err(super::errors::SetMetadataError::ReadOnlyFileSystem(
-            metadata,
-        ))
+        match self.descriptors.write().get_mut(fd) {
+            Descriptor::File { metadata, .. } | Descriptor::Dir { metadata, .. } => {
+                Ok(metadata.insert(m))
+            }
+        }
     }
 }
 
@@ -369,6 +383,13 @@ fn mode_of_modeflags(perms: tar_no_std::ModeFlags) -> Mode {
 type Descriptors = super::shared::Descriptors<Descriptor>;
 
 enum Descriptor {
-    File { idx: usize, position: usize },
-    Dir { path: String },
+    File {
+        idx: usize,
+        position: usize,
+        metadata: AnyMap,
+    },
+    Dir {
+        path: String,
+        metadata: AnyMap,
+    },
 }

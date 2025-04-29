@@ -5,6 +5,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use hashbrown::HashMap;
 
+use crate::LiteBox;
 use crate::fd::FileFd;
 use crate::path::Arg;
 use crate::sync;
@@ -49,11 +50,11 @@ pub struct FileSystem<
     Upper: super::FileSystem,
     Lower: super::FileSystem,
 > {
-    // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
-    // sync-primitives platform, as well as cost of mutexes and such?
-    sync: sync::Synchronization<Platform>,
+    litebox: LiteBox<Platform>,
     upper: Upper,
     lower: Lower,
+    // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
+    // sync-primitives platform, as well as cost of mutexes and such?
     root: sync::RwLock<Platform, RootDir>,
     layering_semantics: LayeringSemantics,
     // cwd invariant: always ends with a `/`
@@ -67,16 +68,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     /// Construct a new `FileSystem` instance
     #[must_use]
     pub fn new(
-        platform: &'static Platform,
+        litebox: &LiteBox<Platform>,
         upper: Upper,
         lower: Lower,
         layering_semantics: LayeringSemantics,
     ) -> Self {
-        let sync = sync::Synchronization::new(platform);
+        let litebox = litebox.clone();
+        let sync = litebox.sync();
         let root = sync.new_rwlock(RootDir::new());
         let descriptors = sync.new_rwlock(Descriptors::new());
         Self {
-            sync,
+            litebox,
             upper,
             lower,
             root,
@@ -892,7 +894,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         let descriptor = descriptors.get(fd);
         match descriptor.entry.as_ref() {
             EntryX::Upper { fd } => self.upper.set_file_metadata(fd, metadata),
-            EntryX::Lower { fd } => unimplemented!(),
+            EntryX::Lower { fd } => self.lower.set_file_metadata(fd, metadata),
             EntryX::Tombstone => unreachable!(),
         }
     }
@@ -906,7 +908,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         let descriptor = descriptors.get(fd);
         match descriptor.entry.as_ref() {
             EntryX::Upper { fd } => self.upper.set_fd_metadata(fd, metadata),
-            EntryX::Lower { fd } => unimplemented!(),
+            EntryX::Lower { fd } => self.lower.set_fd_metadata(fd, metadata),
             EntryX::Tombstone => unreachable!(),
         }
     }

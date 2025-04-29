@@ -106,7 +106,7 @@ static FS_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::n
 
 /// Certain syscalls with this magic argument are allowed.
 /// This is useful for syscall interception where we need to invoke the original syscall.
-const SYSCALL_ARG_MAGIC: u64 = u64::from_le_bytes(*b"LITE BOX");
+pub(crate) const SYSCALL_ARG_MAGIC: u64 = u64::from_le_bytes(*b"LITE BOX");
 
 /// Get fs register value via syscall `arch_prctl`.
 fn get_fs_base_arch_prctl() -> u64 {
@@ -218,6 +218,12 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             fd: syscall_args[4].reinterpret_as_signed().truncate(),
             offset: syscall_args[5],
         },
+        libc::SYS_munmap => SyscallRequest::Munmap {
+            addr: TransparentMutPtr {
+                inner: syscall_args[0] as *mut u8,
+            },
+            length: syscall_args[1],
+        },
         libc::SYS_pread64 => SyscallRequest::Pread64 {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
             buf: TransparentMutPtr {
@@ -301,6 +307,14 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             flags: litebox_common_linux::AtFlags::from_bits_truncate(
                 syscall_args[3].reinterpret_as_signed().truncate(),
             ),
+        },
+        libc::SYS_eventfd => SyscallRequest::Eventfd2 {
+            initval: syscall_args[0].truncate(),
+            flags: litebox_common_linux::EfdFlags::empty(),
+        },
+        libc::SYS_eventfd2 => SyscallRequest::Eventfd2 {
+            initval: syscall_args[0].truncate(),
+            flags: litebox_common_linux::EfdFlags::from_bits_truncate(syscall_args[1].truncate()),
         },
         libc::SYS_pipe => SyscallRequest::Pipe2 {
             pipefd: TransparentMutPtr {
@@ -466,7 +480,22 @@ fn register_seccomp_filter() {
             ],
         ),
         (libc::SYS_mprotect, vec![]),
-        (libc::SYS_munmap, vec![]),
+        (
+            libc::SYS_munmap,
+            vec![
+                // A backdoor to allow invoking munmap.
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        2,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::Eq,
+                        SYSCALL_ARG_MAGIC,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            ],
+        ),
         (libc::SYS_brk, vec![]),
         (
             libc::SYS_rt_sigaction,

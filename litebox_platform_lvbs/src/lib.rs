@@ -1,5 +1,6 @@
 //! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox in VTL1 kernel mode
 
+#![cfg(target_arch = "x86_64")]
 #![no_std]
 #![feature(abi_x86_interrupt)]
 

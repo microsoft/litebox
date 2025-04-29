@@ -4,6 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use arrayvec::ArrayVec;
 use litebox::{
+    LiteBox,
     mm::{
         PageManager,
         linux::{PAGE_SIZE, PageFaultError, PageRange, VmFlags},

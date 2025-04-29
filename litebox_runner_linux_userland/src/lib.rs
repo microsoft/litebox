@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use clap::Parser;
+use litebox::LiteBox;
 use litebox::fs::FileSystem as _;
 use litebox_platform_multiplex::Platform;
 use std::os::linux::fs::MetadataExt as _;
@@ -92,8 +93,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         None,
         litebox::platform::trivial_providers::ImpossiblePunchthroughProvider {},
     );
+    let litebox = LiteBox::new(platform);
     let initial_file_system = {
-        let mut in_mem = litebox::fs::in_mem::FileSystem::new(platform);
+        let mut in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
         in_mem.with_root_privileges(|fs| {
             let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
             let ancestors: Vec<_> = prog.ancestors().collect();
@@ -120,13 +122,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
             fs.close(fd).unwrap();
         });
-        let tar_ro = litebox::fs::tar_ro::FileSystem::new(platform, tar_data);
-        let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(platform);
+        let tar_ro = litebox::fs::tar_ro::FileSystem::new(&litebox, tar_data);
+        let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&litebox);
         litebox::fs::layered::FileSystem::new(
-            platform,
+            &litebox,
             in_mem,
             litebox::fs::layered::FileSystem::new(
-                platform,
+                &litebox,
                 dev_stdio,
                 tar_ro,
                 litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
@@ -174,6 +176,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 }
 
 mod trampoline {
+    #[cfg(target_arch = "x86_64")]
     core::arch::global_asm!(
         "
     .text
@@ -184,6 +187,22 @@ jump_to_entry_point:
     xor rdx, rdx
     mov     rsp, rsi
     jmp     rdi
+    /* Should not reach. */
+    hlt"
+    );
+    #[cfg(target_arch = "x86")]
+    core::arch::global_asm!(
+        "
+    .text
+    .align  4
+    .globl  jump_to_entry_point
+    .type   jump_to_entry_point,@function
+jump_to_entry_point:
+    xor     edx, edx
+    mov     ebx, [esp + 4]
+    mov     eax, [esp + 8]
+    mov     esp, eax
+    jmp     ebx
     /* Should not reach. */
     hlt"
     );

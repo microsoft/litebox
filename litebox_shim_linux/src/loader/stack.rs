@@ -99,6 +99,9 @@ pub(super) enum AuxKey {
 /// (0xc0000000)      < bottom of stack >           0   (virtual)
 /// ------------------------------------------------------------------------
 /// ```
+///
+/// NOTE: The above layout diagram is for 64-bit processes. Similar (but updated to use 32-bit
+/// values, rather than 64-bit values) is used for 32-bit processes.
 pub(super) struct UserStack {
     /// The top of the stack (base address)
     stack_top: MutPtr<u8>,
@@ -187,8 +190,9 @@ impl UserStack {
         self.stack_top
             .mutate_subslice_with(begin..end, |s| -> Option<()> {
                 for (i, p) in offsets.iter().enumerate() {
-                    let addr = self.stack_top.as_usize() + *p;
-                    s[i * 8..(i + 1) * 8].copy_from_slice(&addr.to_le_bytes());
+                    let addr: usize = self.stack_top.as_usize() + *p;
+                    s[i * core::mem::size_of::<usize>()..(i + 1) * core::mem::size_of::<usize>()]
+                        .copy_from_slice(&addr.to_le_bytes());
                 }
                 Some(())
             })?;

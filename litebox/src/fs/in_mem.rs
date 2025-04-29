@@ -5,6 +5,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
+use crate::LiteBox;
 use crate::fd::FileFd;
 use crate::path::Arg;
 use crate::sync;
@@ -23,9 +24,9 @@ use crate::utilities::anymap::AnyMap;
 /// This has no physical backing store, thus any files in memory are erased as soon as this object
 /// is dropped.
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
+    litebox: LiteBox<Platform>,
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
     // sync-primitives platform, as well as cost of mutexes and such?
-    sync: sync::Synchronization<Platform>,
     root: sync::RwLock<Platform, RootDir<Platform>>,
     current_user: UserInfo,
     // cwd invariant: always ends with a `/`
@@ -40,12 +41,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// and the created `FileSystem` handle is expected to be shared across all usage over the
     /// system.
     #[must_use]
-    pub fn new(platform: &'static Platform) -> Self {
-        let sync = sync::Synchronization::new(platform);
-        let root = sync.new_rwlock(RootDir::new(&sync));
+    pub fn new(litebox: &LiteBox<Platform>) -> Self {
+        let litebox = litebox.clone();
+        let sync = litebox.sync();
+        let root = sync.new_rwlock(RootDir::new(sync));
         let descriptors = sync.new_rwlock(Descriptors::new());
         Self {
-            sync,
+            litebox,
             root,
             current_user: UserInfo {
                 user: 1000,
@@ -125,7 +127,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     return Err(OpenError::NoWritePerms);
                 }
                 parent.children_count = parent.children_count.checked_add(1).unwrap();
-                let entry = Entry::File(Arc::new(self.sync.new_rwlock(FileX {
+                let entry = Entry::File(Arc::new(self.litebox.sync().new_rwlock(FileX {
                     perms: Permissions {
                         mode,
                         userinfo: self.current_user,
@@ -354,7 +356,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         parent.children_count = parent.children_count.checked_add(1).unwrap();
         let old = root.entries.insert(
             path,
-            Entry::Dir(Arc::new(self.sync.new_rwlock(DirX {
+            Entry::Dir(Arc::new(self.litebox.sync().new_rwlock(DirX {
                 perms: Permissions {
                     mode,
                     userinfo: self.current_user,
