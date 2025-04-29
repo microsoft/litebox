@@ -2,6 +2,7 @@
 
 pub mod hvcall;
 pub mod hvcall_vp;
+pub mod vsm;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 
