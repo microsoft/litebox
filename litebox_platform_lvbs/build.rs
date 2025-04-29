@@ -18,6 +18,5 @@ fn generate_bindings(header: &str, module_name: &str) {
 }
 
 fn main() {
-    generate_bindings("src/arch/x86/msr/msr_wrapper.h", "msr_index_bindings");
     generate_bindings("src/mshv/mshv_wrapper.h", "mshv_bindings");
 }

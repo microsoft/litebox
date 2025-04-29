@@ -3,7 +3,7 @@
 use crate::{
     arch::{
         instrs::rdmsr,
-        msr::msr_index::{MSR_EFER, MSR_IA32_CR_PAT},
+        msr::{MSR_EFER, MSR_IA32_CR_PAT},
     },
     kernel_context::MAX_CORES,
     mshv::{
