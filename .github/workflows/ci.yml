@@ -55,6 +55,34 @@ jobs:
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
 
+  build_lvbs:
+    name: Build LVBS (skip test)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+      - run: sudo apt install -y gcc-multilib
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' litebox_runner_lvbs/rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target i686-unknown-linux-gnu
+          rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
+      - name: Set up Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - uses: Swatinem/rust-cache@v2
+      - run: pushd litebox_runner_lvbs; ../.github/tools/github_actions_run_cargo build; popd
+      - run: pushd litebox_platform_lvbs; ../.github/tools/github_actions_run_cargo build; popd
+      - run: |
+          pushd litebox_runner_lvbs; ../.github/tools/github_actions_run_cargo test --doc; popd
+          pushd litebox_platform_lvbs; ../.github/tools/github_actions_run_cargo test --doc; popd
+          # We need to run `cargo test --doc` separately because doc tests
+          # aren't included in nextest at the moment. See relevant discussion at
+          # https://github.com/nextest-rs/nextest/issues/16
+          #
+          # sanghle: I'll to change the directory structure of LVBS later to simplify CI
+
   confirm_no_std:
     name: Confirm no_std
     runs-on: ubuntu-latest
