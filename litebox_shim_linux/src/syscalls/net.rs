@@ -3,10 +3,15 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU32},
 };
 
-use litebox::{fd::SocketFd, net::Protocol, platform::RawConstPointer};
+use litebox::{
+    fd::SocketFd,
+    fs::OFlags,
+    net::{Protocol, ReceiveFlags, SendFlags},
+    platform::{RawConstPointer, RawMutPointer},
+};
 use litebox_common_linux::{AddressFamily, SockFlags, SockType, errno::Errno};
 
-use crate::{ConstPtr, Descriptor, file_descriptors, litebox_net};
+use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox_net};
 
 const ADDR_MAX_LEN: usize = 128;
 
@@ -131,6 +136,28 @@ impl Socket {
             .map_err(Errno::from)
     }
 
+    fn sendto(
+        &self,
+        buf: &[u8],
+        flags: SendFlags,
+        sockaddr: Option<SocketAddr>,
+    ) -> Result<usize, Errno> {
+        if let Some(addr) = sockaddr {
+            unimplemented!("sendto with addr {addr}");
+        }
+        litebox_net()
+            .lock()
+            .send(&self.fd, buf, flags)
+            .map_err(Errno::from)
+    }
+
+    fn receive(&self, buf: &mut [u8], flags: ReceiveFlags) -> Result<usize, Errno> {
+        litebox_net()
+            .lock()
+            .receive(&self.fd, buf, flags)
+            .map_err(Errno::from)
+    }
+
     crate::syscalls::common_functions_for_file_status!();
 }
 
@@ -248,6 +275,70 @@ pub(crate) fn sys_listen(sockfd: i32, backlog: u16) -> Result<(), Errno> {
         .ok_or(Errno::EBADF)?
     {
         Descriptor::Socket(socket) => socket.listen(backlog),
+        _ => Err(Errno::ENOTSOCK),
+    }
+}
+
+pub(crate) fn sys_sendto(
+    fd: i32,
+    buf: ConstPtr<u8>,
+    len: usize,
+    mut flags: SendFlags,
+    sockaddr: Option<ConstPtr<u8>>,
+    addrlen: Option<usize>,
+) -> Result<usize, Errno> {
+    let Ok(fd) = u32::try_from(fd) else {
+        return Err(Errno::EBADF);
+    };
+
+    let sockaddr = sockaddr
+        .map(|addr| read_sockaddr_from_user(addr, addrlen.unwrap_or(0)))
+        .transpose()?;
+    let buf = unsafe { buf.to_cow_slice(len).ok_or(Errno::EFAULT) }?;
+    match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
+        Descriptor::Socket(socket) => {
+            if socket.get_status().contains(OFlags::NONBLOCK) {
+                flags.insert(SendFlags::DONTWAIT);
+            }
+            let sockaddr = match sockaddr {
+                Some(SocketAddress::Inet(addr)) => Some(addr),
+                None => None,
+            };
+            socket.sendto(&buf, flags, sockaddr)
+        }
+        _ => Err(Errno::ENOTSOCK),
+    }
+}
+
+pub(crate) fn sys_recvfrom(
+    fd: i32,
+    buf: MutPtr<u8>,
+    len: usize,
+    mut flags: ReceiveFlags,
+    sockaddr: Option<ConstPtr<u8>>,
+    addrlen: Option<usize>,
+) -> Result<usize, Errno> {
+    let Ok(fd) = u32::try_from(fd) else {
+        return Err(Errno::EBADF);
+    };
+    if sockaddr.is_some() {
+        unimplemented!();
+    }
+
+    match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
+        Descriptor::Socket(socket) => {
+            if socket.get_status().contains(OFlags::NONBLOCK) {
+                flags.insert(ReceiveFlags::DONTWAIT);
+            }
+            // ignore MSG_WAITALL flag if MSG_DONTWAIT is set
+            if flags.contains(ReceiveFlags::DONTWAIT) {
+                flags.remove(ReceiveFlags::WAITALL);
+            }
+            let mut buffer: [u8; 4096] = [0; 4096];
+            let size = socket.receive(&mut buffer, flags)?;
+            buf.copy_from_slice(0, &buffer).ok_or(Errno::EFAULT);
+            Ok(size)
+        }
         _ => Err(Errno::ENOTSOCK),
     }
 }

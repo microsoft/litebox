@@ -278,3 +278,24 @@ impl From<litebox::net::errors::ListenError> for Errno {
         }
     }
 }
+
+impl From<litebox::net::errors::SendError> for Errno {
+    fn from(value: litebox::net::errors::SendError) -> Self {
+        match value {
+            litebox::net::errors::SendError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::SendError::SocketInInvalidState => Errno::ENOTCONN,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::net::errors::ReceiveError> for Errno {
+    fn from(value: litebox::net::errors::ReceiveError) -> Self {
+        match value {
+            litebox::net::errors::ReceiveError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::ReceiveError::SocketInInvalidState => Errno::EAGAIN,
+            litebox::net::errors::ReceiveError::OperationFinished => Errno::ESHUTDOWN,
+            _ => unimplemented!(),
+        }
+    }
+}
