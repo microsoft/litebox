@@ -67,6 +67,7 @@ impl<P: path::Arg> FsPath<P> {
 
 /// Handle syscall `open`
 pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
+    // TODO: check file stat instead of hardcoding the path to distinguish between stdio and other files
     let stdio_typ = match path.normalized()?.as_str() {
         "/dev/stdin" => Some(litebox::platform::StdioStream::Stdin),
         "/dev/stdout" => Some(litebox::platform::StdioStream::Stdout),
@@ -475,17 +476,6 @@ pub fn sys_newfstatat(
     Ok(fstat)
 }
 
-macro_rules! toggle_flags {
-    ($t:ident, $flags:ident, $setfl_mask:ident) => {
-        let diff = $t.get_status() ^ $flags;
-        if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
-            todo!("unsupported flags");
-        }
-        $t.set_status($flags & $setfl_mask, true);
-        $t.set_status($flags.complement() & $setfl_mask, false);
-    };
-}
-
 pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
@@ -497,14 +487,14 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
         FcntlArg::GETFD => {
             let flags: FileDescriptorFlags =
                 match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
-                    Descriptor::File(file) => litebox_fs()
+                    Descriptor::File(file)
+                    | Descriptor::Stdio(crate::stdio::StdioFile { file, .. }) => litebox_fs()
                         .with_metadata(file, |flags: &FileDescriptorFlags| *flags)
                         .unwrap_or(FileDescriptorFlags::empty()),
                     Descriptor::Socket(socket) => todo!(),
                     Descriptor::PipeReader { close_on_exec, .. }
                     | Descriptor::PipeWriter { close_on_exec, .. }
-                    | Descriptor::Eventfd { close_on_exec, .. }
-                    | Descriptor::Stdio(crate::stdio::StdioFile { close_on_exec, .. }) => {
+                    | Descriptor::Eventfd { close_on_exec, .. } => {
                         if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
                             FileDescriptorFlags::FD_CLOEXEC
                         } else {
@@ -516,7 +506,8 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
         }
         FcntlArg::SETFD(flags) => {
             match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
-                Descriptor::File(file) => {
+                Descriptor::File(file)
+                | Descriptor::Stdio(crate::stdio::StdioFile { file, .. }) => {
                     if litebox_fs().set_fd_metadata(file, flags).is_err() {
                         unreachable!()
                     }
@@ -524,8 +515,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                 Descriptor::Socket(socket) => todo!(),
                 Descriptor::PipeReader { close_on_exec, .. }
                 | Descriptor::PipeWriter { close_on_exec, .. }
-                | Descriptor::Eventfd { close_on_exec, .. }
-                | Descriptor::Stdio(crate::stdio::StdioFile { close_on_exec, .. }) => {
+                | Descriptor::Eventfd { close_on_exec, .. } => {
                     close_on_exec.store(
                         flags.contains(FileDescriptorFlags::FD_CLOEXEC),
                         core::sync::atomic::Ordering::Relaxed,

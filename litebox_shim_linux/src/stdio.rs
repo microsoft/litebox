@@ -7,7 +7,6 @@ pub(crate) struct StdioFile {
     pub(crate) typ: litebox::platform::StdioStream,
     pub(crate) file: litebox::fd::FileFd,
     pub(crate) status: core::sync::atomic::AtomicU32,
-    pub(crate) close_on_exec: core::sync::atomic::AtomicBool,
 }
 
 impl StdioFile {
@@ -16,11 +15,11 @@ impl StdioFile {
         file: litebox::fd::FileFd,
         flags: OFlags,
     ) -> Self {
+        let flags = flags | OFlags::RDWR | OFlags::APPEND;
         Self {
             typ,
             file,
             status: core::sync::atomic::AtomicU32::new(flags.bits()),
-            close_on_exec: core::sync::atomic::AtomicBool::new(flags.contains(OFlags::CLOEXEC)),
         }
     }
 
