@@ -533,8 +533,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                     Descriptor::Socket(socket) => todo!(),
                     Descriptor::PipeReader { close_on_exec, .. }
                     | Descriptor::PipeWriter { close_on_exec, .. }
-                    | Descriptor::Eventfd { close_on_exec, .. }
-                    | Descriptor::Stdio(crate::stdio::StdioFile { close_on_exec, .. }) => {
+                    | Descriptor::Eventfd { close_on_exec, .. } => {
                         if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
                             FileDescriptorFlags::FD_CLOEXEC
                         } else {
@@ -555,8 +554,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                 Descriptor::Socket(socket) => todo!(),
                 Descriptor::PipeReader { close_on_exec, .. }
                 | Descriptor::PipeWriter { close_on_exec, .. }
-                | Descriptor::Eventfd { close_on_exec, .. }
-                | Descriptor::Stdio(crate::stdio::StdioFile { close_on_exec, .. }) => {
+                | Descriptor::Eventfd { close_on_exec, .. } => {
                     close_on_exec.store(
                         flags.contains(FileDescriptorFlags::FD_CLOEXEC),
                         core::sync::atomic::Ordering::Relaxed,
