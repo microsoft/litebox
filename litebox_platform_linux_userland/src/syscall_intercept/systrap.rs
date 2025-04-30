@@ -605,6 +605,7 @@ fn register_seccomp_filter() {
         (libc::SYS_gettid, vec![]),
         (libc::SYS_futex, vec![]),
         (libc::SYS_set_tid_address, vec![]),
+        (libc::SYS_exit, vec![]),
         (libc::SYS_exit_group, vec![]),
         (libc::SYS_tgkill, vec![]),
         (libc::SYS_set_robust_list, vec![]),

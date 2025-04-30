@@ -77,11 +77,14 @@ pub fn init_platform(enable_systrap: bool) {
     install_dir("/lib/x86_64-linux-gnu");
 }
 
-pub fn compile(output: &std::path::Path, exec_or_lib: bool) {
+pub fn compile(input: &str, output: &std::path::Path, exec_or_lib: bool, nolibc: bool) {
     // Compile the hello.c file to an executable
-    let mut args = vec!["-o", output.to_str().unwrap(), "./tests/hello.c"];
+    let mut args = vec!["-o", output.to_str().unwrap(), input];
     if exec_or_lib {
         args.push("-static");
+    }
+    if nolibc {
+        args.push("-nostdlib");
     }
     args.push(match std::env::consts::ARCH {
         "x86_64" => "-m64",

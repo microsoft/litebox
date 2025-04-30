@@ -24,6 +24,7 @@ use litebox::{
     mm::{PageManager, linux::PAGE_SIZE},
     platform::{RawConstPointer as _, RawMutPointer as _},
     sync::RwLock,
+    utils::{ReinterpretSignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
@@ -501,8 +502,32 @@ unsafe extern "C" {
     pub(crate) fn syscall_callback() -> i64;
 }
 
-#[allow(clippy::too_many_lines)]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_handler(syscall_number: i64, args: *const usize) -> i64 {
-    todo!()
+    let syscall_args = unsafe { core::slice::from_raw_parts(args, 6) };
+    let sysno = ::syscalls::Sysno::from(syscall_number as u32);
+    let dispatcher = match sysno {
+        ::syscalls::Sysno::write => SyscallRequest::Write {
+            fd: syscall_args[0].reinterpret_as_signed().truncate(),
+            buf: unsafe { core::mem::transmute(syscall_args[1]) },
+            count: syscall_args[2],
+        },
+        ::syscalls::Sysno::exit => {
+            let _ =
+                unsafe { ::syscalls::syscall1(::syscalls::Sysno::exit, syscall_args[0]) }.unwrap();
+            unreachable!()
+        }
+        ::syscalls::Sysno::exit_group => {
+            let _ = unsafe { ::syscalls::syscall1(::syscalls::Sysno::exit_group, syscall_args[0]) }
+                .unwrap();
+            unreachable!()
+        }
+        _ => todo!("syscall {sysno} not implemented"),
+    };
+    let ret = if let SyscallRequest::Ret(ret) = dispatcher {
+        ret
+    } else {
+        syscall_entry(dispatcher)
+    };
+    ret
 }

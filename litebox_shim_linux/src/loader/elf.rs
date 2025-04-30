@@ -186,8 +186,10 @@ pub struct ElfLoadInfo {
 
 type Ehdr = elf::file::Elf64_Ehdr;
 type Shdr = elf::section::Elf64_Shdr;
-const REWRITER_MAGIC: u64 = u64::from_le_bytes(*b"LITE BOX");
-fn get_syscall_callback_placeholder(object: &mut ElfFile) -> NonNull<u64> {
+/// Get the syscall callback placeholder address from the ELF file if it is modified by our syscall
+/// rewriter. The placeholder initially has a magic number that is going to be replaced by the actual
+/// syscall callback.
+fn get_syscall_callback_placeholder(object: &mut ElfFile) -> Option<NonNull<u64>> {
     let mut buf: [u8; size_of::<Ehdr>()] = [0; size_of::<Ehdr>()];
     object.read(&mut buf, 0).unwrap();
     let elfhdr: &Ehdr = unsafe { &*(buf.as_ptr().cast()) };
@@ -200,19 +202,21 @@ fn get_syscall_callback_placeholder(object: &mut ElfFile) -> NonNull<u64> {
     let shdrs: &[Shdr] =
         unsafe { core::slice::from_raw_parts(buf.as_ptr().cast(), usize::from(elfhdr.e_shnum)) };
 
-    // Note: assume our syscall rewriter adds a trampoline section at the end.
+    // Note: our syscall rewriter adds a trampoline section at the end.
     let trampoline_shdr = &shdrs[shdrs.len() - 1];
-    assert_eq!(trampoline_shdr.sh_type, elf::abi::SHT_PROGBITS);
-    assert_eq!(
-        trampoline_shdr.sh_flags,
-        u64::from(elf::abi::SHF_ALLOC | elf::abi::SHF_EXECINSTR)
-    );
+    if trampoline_shdr.sh_type != elf::abi::SHT_PROGBITS
+        || trampoline_shdr.sh_flags != u64::from(elf::abi::SHF_ALLOC | elf::abi::SHF_EXECINSTR)
+    {
+        return None;
+    }
 
     let mut placeholder: [u8; 8] = [0; 8];
     object.read(&mut placeholder, trampoline_shdr.sh_offset as usize);
     let magic_number = u64::from_ne_bytes(placeholder);
-    assert_eq!(magic_number, REWRITER_MAGIC);
-    NonNull::new(trampoline_shdr.sh_addr as *mut u64).unwrap()
+    if magic_number != super::REWRITER_MAGIC_NUMBER {
+        return None;
+    }
+    NonNull::new(trampoline_shdr.sh_addr as *mut u64)
 }
 
 /// Loader for ELF files
@@ -249,17 +253,37 @@ impl ElfLoader {
         let elf = {
             let mut loader = Loader::<ElfLoaderMmap>::new();
             let mut object = ElfFile::new(path).map_err(ElfLoaderError::OpenError)?;
+            // Check if the file is modified by our syscall rewriter. If so, we need to update
+            // the syscall callback pointer.
             let placeholder = get_syscall_callback_placeholder(&mut object);
             let elf = loader
                 .easy_load(object)
                 .map_err(ElfLoaderError::LoaderError)?;
-            // mprotect the memory to make it writable
-            let protflags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
-            let start_addr = placeholder.as_ptr() as usize & !(PAGE_SIZE - 1);
-            unsafe { syscalls::syscall3(syscalls::Sysno::mprotect, start_addr, 0x1000, protflags.bits() as usize).unwrap() };
-            unsafe { placeholder.write(crate::syscall_callback as u64) };
-            let protflags = ProtFlags::PROT_READ | ProtFlags::PROT_EXEC;
-            unsafe { syscalls::syscall3(syscalls::Sysno::mprotect, start_addr, 0x1000, protflags.bits() as usize).unwrap() };
+            if let Some(placeholder) = placeholder {
+                // mprotect the memory to make it writable
+                let protflags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+                let start_addr = placeholder.as_ptr() as usize & !(PAGE_SIZE - 1);
+                unsafe {
+                    syscalls::syscall3(
+                        syscalls::Sysno::mprotect,
+                        start_addr,
+                        0x1000,
+                        protflags.bits() as usize,
+                    )
+                    .unwrap()
+                };
+                unsafe { placeholder.write(crate::syscall_callback as u64) };
+                let protflags = ProtFlags::PROT_READ | ProtFlags::PROT_EXEC;
+                unsafe {
+                    syscalls::syscall3(
+                        syscalls::Sysno::mprotect,
+                        start_addr,
+                        0x1000,
+                        protflags.bits() as usize,
+                    )
+                    .unwrap()
+                };
+            }
             elf
         };
         let interp: Option<Elf> = if let Some(interp_name) = elf.interp() {
