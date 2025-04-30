@@ -1,3 +1,5 @@
+//! Standard input/output streams.
+
 use litebox::fs::{FileSystem as _, OFlags};
 use litebox_common_linux::errno::Errno;
 

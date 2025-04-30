@@ -340,10 +340,16 @@ pub const TIOCGPTN: u32 = 0x80045430;
 /// Commands for use with `fcntl`.
 #[non_exhaustive]
 pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
+    /// Get the current serial port settings.
     TCGETS(Platform::RawMutPointer<Termios>),
+    /// Set the current serial port settings.
     TCSETS(Platform::RawConstPointer<Termios>),
+    /// Get window size.
     TIOCGWINSZ(Platform::RawMutPointer<Winsize>),
+    /// Obtain device unit number, which can be used to generate
+    /// the filename of the pseudo-terminal slave device.
     TIOCGPTN(Platform::RawMutPointer<u32>),
+    /// Enables or disables non-blocking mode
     FIONBIO(Platform::RawConstPointer<i32>),
     Raw {
         cmd: u32,

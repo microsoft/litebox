@@ -67,7 +67,8 @@ impl<P: path::Arg> FsPath<P> {
 
 /// Handle syscall `open`
 pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
-    // TODO: check file stat instead of hardcoding the path to distinguish between stdio and other files
+    // TODO: check file stat instead of hardcoding the path to distinguish between stdio
+    // and other files once #68 is completed.
     let stdio_typ = match path.normalized()?.as_str() {
         "/dev/stdin" => Some(litebox::platform::StdioStream::Stdin),
         "/dev/stdout" => Some(litebox::platform::StdioStream::Stdout),
@@ -327,7 +328,12 @@ pub fn sys_access(
 }
 
 const PROC_SELF_FD_PREFIX: &str = "/proc/self/fd/";
+/// Read the target of a symbolic link
+/// 
+/// Note that this function only handles the following cases that we hardcoded:
+/// - `/proc/self/fd/<fd>`
 fn do_readlink(fullpath: &str) -> Result<String, Errno> {
+    // It assumes that the path is absolute. Will fix once #71 is done.
     if let Some(stripped) = fullpath.strip_prefix(PROC_SELF_FD_PREFIX) {
         let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
         let locked_file_descriptors = file_descriptors().read();
@@ -432,6 +438,7 @@ impl Descriptor {
 fn do_stat(pathname: impl path::Arg, follow_symlink: bool) -> Result<FileStat, Errno> {
     let normalized_path = pathname.normalized()?;
     let path = if follow_symlink {
+        // TODO: `do_readlink` assumes the path is absolute
         do_readlink(normalized_path.as_str()).unwrap_or(normalized_path)
     } else {
         normalized_path
