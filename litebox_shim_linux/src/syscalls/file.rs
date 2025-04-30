@@ -329,7 +329,7 @@ pub fn sys_access(
 
 const PROC_SELF_FD_PREFIX: &str = "/proc/self/fd/";
 /// Read the target of a symbolic link
-/// 
+///
 /// Note that this function only handles the following cases that we hardcoded:
 /// - `/proc/self/fd/<fd>`
 fn do_readlink(fullpath: &str) -> Result<String, Errno> {
