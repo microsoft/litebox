@@ -74,10 +74,10 @@ pub fn init() -> Result<(), HypervError> {
 
     wrmsr(
         HV_X64_MSR_VP_ASSIST_PAGE,
-        kernel_context.hv_vp_assist_page_as_u64() | u64::from(HV_X64_MSR_VP_ASSIST_PAGE_ENABLE),
+        kernel_context.hv_vp_assist_page_as_u64() | HV_X64_MSR_VP_ASSIST_PAGE_ENABLE,
     );
     if rdmsr(HV_X64_MSR_VP_ASSIST_PAGE)
-        != kernel_context.hv_vp_assist_page_as_u64() | u64::from(HV_X64_MSR_VP_ASSIST_PAGE_ENABLE)
+        != kernel_context.hv_vp_assist_page_as_u64() | HV_X64_MSR_VP_ASSIST_PAGE_ENABLE
     {
         return Err(HypervError::InvalidAssistPage);
     }

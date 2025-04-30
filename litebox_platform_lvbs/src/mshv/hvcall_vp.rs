@@ -7,12 +7,11 @@ use crate::{
     },
     kernel_context::MAX_CORES,
     mshv::{
-        HV_PARTITION_ID_SELF, HV_VP_INDEX_SELF,
         hvcall::{HypervCallError, hv_do_hypercall, hv_do_rep_hypercall},
         mshv_bindings::{
-            HVCALL_ENABLE_VP_VTL, HVCALL_GET_VP_REGISTERS, HVCALL_SET_VP_REGISTERS,
-            hv_enable_vp_vtl, hv_get_vp_registers_input, hv_get_vp_registers_output,
-            hv_set_vp_registers_input,
+            HV_PARTITION_ID_SELF, HV_VP_INDEX_SELF, HVCALL_ENABLE_VP_VTL, HVCALL_GET_VP_REGISTERS,
+            HVCALL_SET_VP_REGISTERS, hv_enable_vp_vtl, hv_get_vp_registers_input,
+            hv_get_vp_registers_output, hv_set_vp_registers_input,
         },
         vtl1_mem_layout::{
             PAGE_SIZE, VTL1_KERNEL_STACK_PAGE, VTL1_TSS_PAGE, get_address_of_special_page,
@@ -26,13 +25,12 @@ const HV_VTL_SECURE: u8 = 0x1;
 // const HV_VTL_MGMT: u8 = 0x2;
 
 /// Hyper-V Hypercall to set virtual processor (VP) registers
-#[expect(clippy::missing_panics_doc)]
 pub fn hvcall_set_vp_registers(
     reg_name: u32,
     value: u64,
     input_vtl: u8,
 ) -> Result<u64, HypervCallError> {
-    let mut hvin: hv_set_vp_registers_input = unsafe { core::mem::zeroed() };
+    let mut hvin = hv_set_vp_registers_input::new();
 
     hvin.header.partitionid = HV_PARTITION_ID_SELF;
     hvin.header.vpindex = HV_VP_INDEX_SELF;
@@ -41,7 +39,7 @@ pub fn hvcall_set_vp_registers(
     hvin.element.valuelow = value;
 
     hv_do_rep_hypercall(
-        u16::try_from(HVCALL_SET_VP_REGISTERS).expect("HVCALL_SET_VP_REGISTERS"),
+        HVCALL_SET_VP_REGISTERS,
         1,
         0,
         (&raw const hvin).cast::<core::ffi::c_void>(),
@@ -56,8 +54,8 @@ pub fn hvcall_get_vp_registers(
     result: &mut u64,
     input_vtl: u8,
 ) -> Result<u64, HypervCallError> {
-    let mut hvin: hv_get_vp_registers_input = unsafe { core::mem::zeroed() };
-    let mut hvout: hv_get_vp_registers_output = unsafe { core::mem::zeroed() };
+    let mut hvin = hv_get_vp_registers_input::new();
+    let mut hvout = hv_get_vp_registers_output::new();
 
     hvin.header.partitionid = HV_PARTITION_ID_SELF;
     hvin.header.vpindex = HV_VP_INDEX_SELF;
@@ -65,7 +63,7 @@ pub fn hvcall_get_vp_registers(
     hvin.element.name0 = reg_name;
 
     let status = hv_do_rep_hypercall(
-        u16::try_from(HVCALL_GET_VP_REGISTERS).expect("HVCALL_GET_VP_REGISTERS"),
+        HVCALL_GET_VP_REGISTERS,
         1,
         0,
         (&raw const hvin).cast::<core::ffi::c_void>(),
@@ -75,7 +73,7 @@ pub fn hvcall_get_vp_registers(
     if status.is_err() {
         status
     } else {
-        *result = unsafe { hvout.__bindgen_anon_1.as64.low };
+        *result = hvout.as_u64().low;
         Ok(status.unwrap())
     }
 }
@@ -109,17 +107,17 @@ fn hv_vtl_populate_vp_context(input: &mut hv_enable_vp_vtl, tss: u64, rip: u64, 
     input.vp_context.cs.selector = 1 << 3;
     input.vp_context.cs.base = 0;
     input.vp_context.cs.limit = 0xffff_ffff;
-    input.vp_context.cs.__bindgen_anon_1.attributes = 0xa09b;
+    input.vp_context.cs.set_attributes(0xa09b);
 
     input.vp_context.ss.selector = 2 << 3;
     input.vp_context.ss.base = 0;
     input.vp_context.ss.limit = 0xffff_ffff;
-    input.vp_context.ss.__bindgen_anon_1.attributes = 0xc093;
+    input.vp_context.ss.set_attributes(0xc093);
 
     input.vp_context.tr.selector = 3 << 3;
     input.vp_context.tr.base = tss;
     input.vp_context.tr.limit = 104 - 1;
-    input.vp_context.tr.__bindgen_anon_1.attributes = 0x8b;
+    input.vp_context.tr.set_attributes(0x8b);
 }
 
 /// Hyper-V Hypercall to enable a certain VTL for a specific virtual processor (VP)
@@ -131,13 +129,11 @@ fn hvcall_enable_vp_vtl(
     rip: u64,
     rsp: u64,
 ) -> Result<u64, HypervCallError> {
-    let mut hvin: hv_enable_vp_vtl = unsafe { core::mem::zeroed() };
+    let mut hvin = hv_enable_vp_vtl::new();
 
-    unsafe {
-        hvin.partition_id = HV_PARTITION_ID_SELF;
-        hvin.vp_index = core_id;
-        hvin.target_vtl.__bindgen_anon_1.set_target_vtl(target_vtl);
-    }
+    hvin.partition_id = HV_PARTITION_ID_SELF;
+    hvin.vp_index = core_id;
+    hvin.target_vtl.set_target_vtl(target_vtl);
 
     hv_vtl_populate_vp_context(&mut hvin, tss, rip, rsp);
 

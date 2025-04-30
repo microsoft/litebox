@@ -4,8 +4,7 @@ use crate::{
     kernel_context::get_per_core_kernel_context,
     mshv::{
         mshv_bindings::{
-            VTL_ENTRY_REASON_INTERCEPT, VTL_ENTRY_REASON_INTERRUPT,
-            VTL_ENTRY_REASON_LOWER_VTL_CALL, hv_vp_assist_page,
+            VTL_ENTRY_REASON_INTERCEPT, VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL,
         },
         vsm::{NUM_VTLCALL_PARAMS, VSMFunction, vsm_dispatch},
     },
@@ -13,20 +12,6 @@ use crate::{
 };
 use core::{arch::asm, mem};
 use num_enum::TryFromPrimitive;
-
-impl hv_vp_assist_page {
-    /// Return RAX and RCX registers to VTL0 through the HV VP assist page
-    #[expect(clippy::similar_names)]
-    pub fn set_vtl_ret_regs(&mut self, rax: u64, rcx: u64) {
-        self.vtl_ret_x64rax = rax;
-        self.vtl_ret_x64rcx = rcx;
-    }
-
-    /// Get the entry reason of VTL switch
-    pub fn get_vtl_entry_reason(&self) -> u32 {
-        self.vtl_entry_reason
-    }
-}
 
 /// Return to VTL0
 #[expect(clippy::inline_always)]
@@ -206,7 +191,7 @@ pub fn vtl_switch_loop_internal(result: u64) -> ! {
         load_vtl1_state();
 
         let kernel_context = get_per_core_kernel_context();
-        let reason = unsafe { (*kernel_context.hv_vp_assist_page_as_ptr()).get_vtl_entry_reason() };
+        let reason = unsafe { (*kernel_context.hv_vp_assist_page_as_ptr()).vtl_entry_reason };
         match VtlEntryReason::try_from(reason).unwrap_or(VtlEntryReason::Unknown) {
             VtlEntryReason::VtlCall => {
                 let params = kernel_context.vtl0_state.get_vtlcall_params();
