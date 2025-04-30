@@ -253,8 +253,13 @@ impl ElfLoader {
             let elf = loader
                 .easy_load(object)
                 .map_err(ElfLoaderError::LoaderError)?;
-            // TODO: mprotect the memory to make it writable
+            // mprotect the memory to make it writable
+            let protflags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+            let start_addr = placeholder.as_ptr() as usize & !(PAGE_SIZE - 1);
+            unsafe { syscalls::syscall3(syscalls::Sysno::mprotect, start_addr, 0x1000, protflags.bits() as usize).unwrap() };
             unsafe { placeholder.write(crate::syscall_callback as u64) };
+            let protflags = ProtFlags::PROT_READ | ProtFlags::PROT_EXEC;
+            unsafe { syscalls::syscall3(syscalls::Sysno::mprotect, start_addr, 0x1000, protflags.bits() as usize).unwrap() };
             elf
         };
         let interp: Option<Elf> = if let Some(interp_name) = elf.interp() {
