@@ -9,9 +9,20 @@ fn test_load_exec_static() {
     let executable_path = "/hello_exec";
     let executable_data = std::fs::read(path).unwrap();
 
-    common::init_platform();
+    common::init_platform(true);
 
     common::install_file(executable_data, executable_path);
 
+    common::test_load_exec_common(executable_path);
+}
+
+#[test]
+fn test_syscall_rewriter() {
+    let path = "../hello.hooked";
+    let executable_path = "/hello_exec";
+    let executable_data = std::fs::read(path).unwrap();
+
+    common::init_platform(false);
+    common::install_file(executable_data, executable_path);
     common::test_load_exec_common(executable_path);
 }

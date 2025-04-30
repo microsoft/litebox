@@ -184,6 +184,37 @@ pub struct ElfLoadInfo {
     pub user_stack_top: usize,
 }
 
+type Ehdr = elf::file::Elf64_Ehdr;
+type Shdr = elf::section::Elf64_Shdr;
+const REWRITER_MAGIC: u64 = u64::from_le_bytes(*b"LITE BOX");
+fn get_syscall_callback_placeholder(object: &mut ElfFile) -> NonNull<u64> {
+    let mut buf: [u8; size_of::<Ehdr>()] = [0; size_of::<Ehdr>()];
+    object.read(&mut buf, 0).unwrap();
+    let elfhdr: &Ehdr = unsafe { &*(buf.as_ptr().cast()) };
+
+    // read section headers
+    let shdrs_size = usize::from(elfhdr.e_shentsize) * usize::from(elfhdr.e_shnum);
+    let shdrs_start = elfhdr.e_shoff as usize;
+    let mut buf: Vec<u8> = alloc::vec![0; shdrs_size];
+    object.read(&mut buf, shdrs_start).unwrap();
+    let shdrs: &[Shdr] =
+        unsafe { core::slice::from_raw_parts(buf.as_ptr().cast(), usize::from(elfhdr.e_shnum)) };
+
+    // Note: assume our syscall rewriter adds a trampoline section at the end.
+    let trampoline_shdr = &shdrs[shdrs.len() - 1];
+    assert_eq!(trampoline_shdr.sh_type, elf::abi::SHT_PROGBITS);
+    assert_eq!(
+        trampoline_shdr.sh_flags,
+        u64::from(elf::abi::SHF_ALLOC | elf::abi::SHF_EXECINSTR)
+    );
+
+    let mut placeholder: [u8; 8] = [0; 8];
+    object.read(&mut placeholder, trampoline_shdr.sh_offset as usize);
+    let magic_number = u64::from_ne_bytes(placeholder);
+    assert_eq!(magic_number, REWRITER_MAGIC);
+    NonNull::new(trampoline_shdr.sh_addr as *mut u64).unwrap()
+}
+
 /// Loader for ELF files
 pub(super) struct ElfLoader;
 
@@ -217,9 +248,14 @@ impl ElfLoader {
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let elf = {
             let mut loader = Loader::<ElfLoaderMmap>::new();
-            loader
-                .easy_load(ElfFile::new(path).map_err(ElfLoaderError::OpenError)?)
-                .map_err(ElfLoaderError::LoaderError)?
+            let mut object = ElfFile::new(path).map_err(ElfLoaderError::OpenError)?;
+            let placeholder = get_syscall_callback_placeholder(&mut object);
+            let elf = loader
+                .easy_load(object)
+                .map_err(ElfLoaderError::LoaderError)?;
+            // TODO: mprotect the memory to make it writable
+            unsafe { placeholder.write(crate::syscall_callback as u64) };
+            elf
         };
         let interp: Option<Elf> = if let Some(interp_name) = elf.interp() {
             // e.g., /lib64/ld-linux-x86-64.so.2

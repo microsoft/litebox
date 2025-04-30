@@ -25,7 +25,7 @@ fn test_load_exec_dynamic() {
         .map(|f| (f, std::fs::read(f).unwrap()))
         .collect();
 
-    common::init_platform();
+    common::init_platform(true);
 
     common::install_file(executable_data, executable_path);
     for (path, data) in files {

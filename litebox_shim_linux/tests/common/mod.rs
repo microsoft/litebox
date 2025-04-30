@@ -42,7 +42,7 @@ unsafe extern "C" {
     fn trampoline(entry: usize, sp: usize) -> !;
 }
 
-pub fn init_platform() {
+pub fn init_platform(enable_systrap: bool) {
     let platform = Platform::new(None);
     set_platform(platform);
     let platform = litebox_platform_multiplex::platform();
@@ -67,7 +67,9 @@ pub fn init_platform() {
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     ));
-    platform.enable_syscall_interception_with(litebox_shim_linux::syscall_entry);
+    if enable_systrap {
+        platform.enable_syscall_interception_with(litebox_shim_linux::syscall_entry);
+    }
 
     install_dir("/lib64");
     install_dir("/lib32");

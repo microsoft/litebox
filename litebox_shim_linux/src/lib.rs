@@ -432,3 +432,77 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
         },
     )
 }
+
+core::arch::global_asm!(
+    "
+    .text
+    .align  4
+    .globl  syscall_callback
+    .type   syscall_callback,@function
+syscall_callback:
+    /* TODO: save float and vector registers (xsave or fxsave) */
+    /* Save caller-saved registers */
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    pushf
+
+    /* Save the original stack pointer */
+    push rbp
+    mov  rbp, rsp
+
+    /* Align the stack to 16 bytes */
+    and rsp, -16
+
+    /* Reserve space on the stack for syscall arguments */
+    sub rsp, 48
+
+    /* Save syscall arguments (rdi, rsi, rdx, r10, r8, r9) into the reserved space */
+    mov [rsp], rdi
+    mov [rsp + 8], rsi
+    mov [rsp + 16], rdx
+    mov [rsp + 24], r10
+    mov [rsp + 32], r8
+    mov [rsp + 40], r9
+
+    /* Pass the syscall number to the syscall dispatcher */
+    mov rdi, rax
+    /* Pass the pointer to the syscall arguments to syscall_handler */
+    mov rsi, rsp
+
+    /* Call syscall_handler */
+    call syscall_handler
+
+    /* Restore the original stack pointer */
+    mov  rsp, rbp
+    pop  rbp
+
+    /* Restore caller-saved registers */
+    popf
+    pop  r11
+    pop  r10
+    pop  r9
+    pop  r8
+    pop  rdi
+    pop  rsi
+    pop  rdx
+    pop  rcx
+
+    /* Return to the caller */
+    ret
+"
+);
+unsafe extern "C" {
+    pub(crate) fn syscall_callback() -> i64;
+}
+
+#[allow(clippy::too_many_lines)]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn syscall_handler(syscall_number: i64, args: *const usize) -> i64 {
+    todo!()
+}
