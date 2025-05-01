@@ -60,23 +60,37 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
+      CARGO_BIN_ENV: "cargo +nightly-2025-03-31"
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
-      - run: sudo apt install -y gcc-multilib
       - name: Set up Rust
         run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' litebox_runner_lvbs/rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target i686-unknown-linux-gnu
-          rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
+          rustup toolchain install $(echo $CARGO_BIN_ENV | awk -F'+' '{print $2}') --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-unknown-none
+          rustup component add rust-src --toolchain $(echo $CARGO_BIN_ENV | awk -F'+' '{print $2}')-x86_64-unknown-linux-gnu
       - name: Set up Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
       - uses: Swatinem/rust-cache@v2
-      - run: pushd litebox_runner_lvbs; ../.github/tools/github_actions_run_cargo build; popd
-      - run: pushd litebox_platform_lvbs; ../.github/tools/github_actions_run_cargo build; popd
-      - run: |
-          pushd litebox_runner_lvbs; ../.github/tools/github_actions_run_cargo test --doc; popd
-          pushd litebox_platform_lvbs; ../.github/tools/github_actions_run_cargo test --doc; popd
+      - name: cargo fmt
+        run: |
+          .github/tools/github_actions_run_cargo fmt --manifest-path=litebox_runner_lvbs/Cargo.toml
+          .github/tools/github_actions_run_cargo fmt --manifest-path=litebox_platform_lvbs/Cargo.toml
+      - name: cargo clippy
+        run: |
+          .github/tools/github_actions_run_cargo clippy --lib --bins --examples --no-deps --all-features -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
+          .github/tools/github_actions_run_cargo clippy --lib --bins --examples --no-deps --all-features -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_platform_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
+      - name: cargo build 
+        run: |
+          .github/tools/github_actions_run_cargo build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
+          .github/tools/github_actions_run_cargo build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_platform_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
+      - name: cargo nextest
+        run: |
+          .github/tools/github_actions_run_cargo nextest --no-tests=pass --manifest-path=litebox_platform_lvbs/Cargo.toml
+      - name: cargo test --doc
+        run: |
+          .github/tools/github_actions_run_cargo test --doc -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
+          .github/tools/github_actions_run_cargo test --doc -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_platform_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
           # We need to run `cargo test --doc` separately because doc tests
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
