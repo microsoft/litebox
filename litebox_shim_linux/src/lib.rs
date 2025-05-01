@@ -584,16 +584,9 @@ unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) 
             buf: unsafe { core::mem::transmute::<usize, ConstPtr<u8>>(syscall_args[1]) },
             count: syscall_args[2],
         },
-        // TODO: add them as punchthroughs
-        ::syscalls::Sysno::exit => {
-            let _ =
-                unsafe { ::syscalls::syscall1(::syscalls::Sysno::exit, syscall_args[0]) }.unwrap();
-            unreachable!()
-        }
+        ::syscalls::Sysno::exit => litebox_platform_multiplex::platform().exit(syscall_args[0]),
         ::syscalls::Sysno::exit_group => {
-            let _ = unsafe { ::syscalls::syscall1(::syscalls::Sysno::exit_group, syscall_args[0]) }
-                .unwrap();
-            unreachable!()
+            litebox_platform_multiplex::platform().exit_group(syscall_args[0])
         }
         _ => todo!("syscall {sysno} not implemented"),
     };

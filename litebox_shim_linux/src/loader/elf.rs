@@ -273,29 +273,18 @@ impl ElfLoader {
                 .map_err(ElfLoaderError::LoaderError)?;
             if let Some(placeholder) = placeholder {
                 // mprotect the memory to make it writable
-                // TODO: add mprotect as punchthrough
-                let protflags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+                let protflags = litebox_common_linux::ProtFlags::PROT_READ
+                    | litebox_common_linux::ProtFlags::PROT_WRITE;
                 let start_addr = placeholder.as_ptr() as usize & !(PAGE_SIZE - 1);
-                unsafe {
-                    syscalls::syscall3(
-                        syscalls::Sysno::mprotect,
-                        start_addr,
-                        0x1000,
-                        protflags.bits() as usize,
-                    )
-                    .unwrap()
-                };
+                litebox_platform_multiplex::platform()
+                    .mprotect(start_addr, 0x1000, protflags)
+                    .unwrap();
                 unsafe { placeholder.write(crate::syscall_callback as usize) };
-                let protflags = ProtFlags::PROT_READ | ProtFlags::PROT_EXEC;
-                unsafe {
-                    syscalls::syscall3(
-                        syscalls::Sysno::mprotect,
-                        start_addr,
-                        0x1000,
-                        protflags.bits() as usize,
-                    )
-                    .unwrap()
-                };
+                let protflags = litebox_common_linux::ProtFlags::PROT_READ
+                    | litebox_common_linux::ProtFlags::PROT_EXEC;
+                litebox_platform_multiplex::platform()
+                    .mprotect(start_addr, 0x1000, protflags)
+                    .unwrap();
             }
             elf
         };

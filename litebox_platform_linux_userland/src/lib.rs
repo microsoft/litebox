@@ -13,6 +13,8 @@ use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox_common_linux::PunchthroughSyscall;
+use litebox_common_linux::ProtFlags;
+use litebox_common_linux::errno::Errno;
 
 mod syscall_intercept;
 
