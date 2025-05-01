@@ -1,8 +1,7 @@
 //! An implementation of [`HostInterface`] for LVBS
 
-use crate::mshv::vtl_switch::vtl_return;
 use crate::{
-    Errno, HostInterface, VtlCallParam,
+    Errno, HostInterface,
     arch::ioport::serial_print_string,
     host::linux::sigset_t,
     ptr::{UserConstPtr, UserMutPtr},
@@ -97,16 +96,7 @@ impl HostInterface for HostLvbsInterface {
         unimplemented!()
     }
 
-    fn switch(result: u64) -> VtlCallParam {
-        // save VTL1 registers
-        // restore VTL0 registers
-        vtl_return(result);
-        // save VTL0 registers
-        // restore VTL1 registers
-
-        VtlCallParam {
-            entry_reason: 0,
-            args: [0, 0, 0, 0],
-        }
+    fn switch(_result: u64) -> ! {
+        unimplemented!()
     }
 }

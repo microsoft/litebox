@@ -28,12 +28,6 @@ pub mod ptr;
 
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 
-#[expect(dead_code)]
-pub struct VtlCallParam {
-    entry_reason: u32,
-    args: [u64; 4],
-}
-
 /// This is the platform for running LiteBox in kernel mode.
 /// It requires a host that implements the [`HostInterface`] trait.
 pub struct LinuxKernel<Host: HostInterface> {
@@ -59,10 +53,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 
     pub fn init(&self, cpu_mhz: u64) {
         CPU_MHZ.store(cpu_mhz, core::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn switch(&self, result: u64) -> VtlCallParam {
-        Host::switch(result)
     }
 }
 
@@ -300,7 +290,7 @@ pub trait HostInterface {
     /// Switch enables a context switch from VTL1 kernel to VTL0 kernel while passing a value
     /// through a CPU register. VTL1 kernel will execute the next instruction of `switch()`
     /// when VTL0 kernel switches back to VTL1 kernel.
-    fn switch(result: u64) -> VtlCallParam;
+    fn switch(result: u64) -> !;
 }
 
 impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
