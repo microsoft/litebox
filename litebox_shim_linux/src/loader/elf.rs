@@ -201,16 +201,16 @@ fn get_syscall_callback_placeholder(object: &mut ElfFile) -> Option<NonNull<usiz
     let elfhdr: &Ehdr = unsafe { &*(buf.as_ptr().cast()) };
 
     // read section headers
-    let shdrs_size = usize::from(elfhdr.e_shentsize) * usize::from(elfhdr.e_shnum);
-    let mut buf: Vec<u8> = alloc::vec![0; shdrs_size];
+    let shdrs_size = usize::from(elfhdr.e_shentsize) * usize::from(elfhdr.e_shnum.checked_sub(1)?);
+    let mut buf: [u8; size_of::<Shdr>()] = [0; size_of::<Shdr>()];
+    // Read the last section header because our syscall rewriter adds a trampoline section at the end.
     object
-        .read(&mut buf, usize::try_from(elfhdr.e_shoff).unwrap())
+        .read(
+            &mut buf,
+            usize::try_from(elfhdr.e_shoff).unwrap() + shdrs_size,
+        )
         .unwrap();
-    let shdrs: &[Shdr] =
-        unsafe { core::slice::from_raw_parts(buf.as_ptr().cast(), usize::from(elfhdr.e_shnum)) };
-
-    // Note: our syscall rewriter adds a trampoline section at the end.
-    let trampoline_shdr = &shdrs[shdrs.len() - 1];
+    let trampoline_shdr: &Shdr = unsafe { &*(buf.as_ptr().cast()) };
     if trampoline_shdr.sh_type != elf::abi::SHT_PROGBITS
         || trampoline_shdr.sh_flags != (elf::abi::SHF_ALLOC | elf::abi::SHF_EXECINSTR).into()
     {
