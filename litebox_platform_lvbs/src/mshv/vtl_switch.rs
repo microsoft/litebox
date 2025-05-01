@@ -3,9 +3,7 @@
 use crate::{
     kernel_context::get_per_core_kernel_context,
     mshv::{
-        mshv_bindings::{
-            VTL_ENTRY_REASON_INTERCEPT, VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL,
-        },
+        VTL_ENTRY_REASON_INTERCEPT, VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL,
         vsm::{NUM_VTLCALL_PARAMS, VSMFunction, vsm_dispatch},
     },
     serial_println,
@@ -53,6 +51,7 @@ pub struct VtlState {
     // DR[0-6]
     // X87, XMM, AVX, XCR
 }
+const NUM_SAVED_REGISTERS: usize = 16;
 
 impl VtlState {
     pub fn new() -> Self {
@@ -129,9 +128,10 @@ fn pop_vtl_state(state: &VtlState) {
 #[inline(always)]
 fn drop_vtl_state_from_stack() {
     unsafe {
-        asm!("add rsp, {}", const mem::size_of::<VtlState>());
+        asm!("add rsp, {}", const mem::size_of::<u64>() * NUM_SAVED_REGISTERS);
     }
 }
+// This function heavily relies on the stack alignment and packed struct.
 
 #[expect(clippy::inline_always)]
 #[inline(always)]
@@ -218,7 +218,7 @@ pub fn vtl_switch_loop_internal(result: u64) -> ! {
                 vtl_switch_loop_internal(0)
             }
         }
-        // DO NOT PUT ANY CODE
+        // do not put any code which might corrupt registers
     }
 }
 

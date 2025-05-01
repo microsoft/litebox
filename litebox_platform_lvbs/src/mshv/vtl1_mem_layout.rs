@@ -17,7 +17,7 @@ pub const VTL1_PML4E_PAGE: usize = 2;
 pub const VTL1_PDPE_PAGE: usize = 3;
 pub const VTL1_PDE_PAGE: usize = 4;
 pub const VTL1_PTE_0_PAGE: usize = 5;
-// pub const VTL1_PTE_63_PAGE: usize = 68;
+
 // use this stack only for per-core VTL startup
 pub const VTL1_KERNEL_STACK_PAGE: usize = VTL1_PTE_0_PAGE + VSM_SK_PTE_PAGES_COUNT;
 

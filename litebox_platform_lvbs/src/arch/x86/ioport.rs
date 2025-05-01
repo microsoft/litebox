@@ -6,15 +6,10 @@ use spin::{Mutex, Once};
 // LVBS uses COM PORT 2 for printing out debug messages
 const COM_PORT_2: u16 = 0x2F8;
 
-// const DATA_OFFSET: u16 = 0;
 const INTERRUPT_ENABLE_OFFSET: u16 = 1;
-// const IN_INTERRUPT_IDENTIFICATION_OFFSET: u16 = 2;
 const OUT_FIFO_CONTROL_OFFSET: u16 = 2;
-// const LINE_CONTROL_OFFSET: u16 = 3;
 const MODEM_CONTROL_OFFSET: u16 = 4;
 const IN_LINE_STATUS_OFFSET: u16 = 5;
-// const IN_MODEM_STATUS_OFFSET: u16 = 6;
-// const SCRATCH_OFFSET: u16 = 7;
 
 #[expect(clippy::inline_always)]
 #[inline(always)]
@@ -91,20 +86,12 @@ impl ComPort {
 
         match byte {
             0x20..=0x7e => outb(self.port, byte),
-            b'\n' => self.new_line(),
+            b'\n' => {
+                outb(self.port, b'\r');
+                outb(self.port, b'\n');
+            }
             _ => outb(self.port, 0xfe),
         }
-    }
-
-    fn new_line(&mut self) {
-        loop {
-            if (line_status(self.port) & 0x20) != 0 {
-                // transmittable
-                break;
-            }
-        }
-        outb(self.port, b'\r');
-        outb(self.port, b'\n');
     }
 
     pub fn write_string(&mut self, s: &str) {

@@ -3,7 +3,7 @@
 use crate::{
     arch::instrs::{rdmsr, wrmsr},
     kernel_context::{get_core_id, get_per_core_kernel_context},
-    mshv::mshv_bindings::{
+    mshv::{
         HV_HYPERCALL_REP_COMP_MASK, HV_HYPERCALL_REP_COMP_OFFSET, HV_HYPERCALL_REP_START_MASK,
         HV_HYPERCALL_REP_START_OFFSET, HV_HYPERCALL_RESULT_MASK, HV_HYPERCALL_VARHEAD_OFFSET,
         HV_REGISTER_VP_INDEX, HV_STATUS_ACCESS_DENIED, HV_STATUS_INSUFFICIENT_BUFFERS,

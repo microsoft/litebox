@@ -2,7 +2,7 @@
 
 use crate::{
     arch::gdt,
-    mshv::{mshv_bindings::hv_vp_assist_page, vtl_switch::VtlState, vtl1_mem_layout::PAGE_SIZE},
+    mshv::{HvVpAssistPage, vtl_switch::VtlState, vtl1_mem_layout::PAGE_SIZE},
 };
 use x86_64::structures::tss::TaskStateSegment;
 
@@ -34,12 +34,12 @@ impl KernelContext {
         &raw const self.interrupt_stack as u64 + (self.interrupt_stack.len() - 1) as u64
     }
 
-    pub fn hv_vp_assist_page_as_ptr(&self) -> *const hv_vp_assist_page {
-        (&raw const self.hv_vp_assist_page).cast::<hv_vp_assist_page>()
+    pub fn hv_vp_assist_page_as_ptr(&self) -> *const HvVpAssistPage {
+        (&raw const self.hv_vp_assist_page).cast::<HvVpAssistPage>()
     }
 
-    pub fn hv_vp_assist_page_as_mut_ptr(&mut self) -> *mut hv_vp_assist_page {
-        (&raw mut self.hv_vp_assist_page).cast::<hv_vp_assist_page>()
+    pub fn hv_vp_assist_page_as_mut_ptr(&mut self) -> *mut HvVpAssistPage {
+        (&raw mut self.hv_vp_assist_page).cast::<HvVpAssistPage>()
     }
 
     pub fn hv_vp_assist_page_as_u64(&self) -> u64 {
