@@ -9,13 +9,6 @@ use litebox_platform_lvbs::{
     serial_println,
 };
 
-// shared? per-core?
-// lazy_static! {
-//     static ref PLATFORM: Mutex<&'static LvbsLinuxKernel> = Mutex::new(LvbsLinuxKernel::new(
-//         PhysAddr::new(get_memory_base_address())
-//     ));
-// }
-
 #[expect(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
