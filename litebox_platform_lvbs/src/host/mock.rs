@@ -1,6 +1,6 @@
 use core::sync::atomic::AtomicU32;
 
-use crate::{HostInterface, VtlCallParam};
+use crate::HostInterface;
 
 pub struct MockHostInterface {}
 
@@ -45,7 +45,7 @@ impl HostInterface for MockHostInterface {
         todo!()
     }
 
-    fn switch(_result: u64) -> VtlCallParam {
+    fn switch(_result: u64) -> ! {
         todo!()
     }
 
