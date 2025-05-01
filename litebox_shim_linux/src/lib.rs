@@ -434,6 +434,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
     )
 }
 
+#[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     "
     .text
@@ -498,20 +499,92 @@ syscall_callback:
     ret
 "
 );
+
+/// Syscall callback function for 32-bit x86
+///
+/// The stack layout at the entry of the callback (see litebox_syscall_rewriter
+/// for more details):
+///
+/// Addr |   data   |
+/// 0    | sysno    |
+/// -4:  | ret addr |  <-- esp
+///
+/// The first two instructions adjust the stack such that it saves one
+/// instruction (i.e., `pop sysno`) from the caller (trampoline code).
+#[cfg(target_arch = "x86")]
+core::arch::global_asm!(
+    "
+    .text
+    .align  4
+    .globl  syscall_callback
+    .type   syscall_callback,@function
+syscall_callback:
+    pop  eax        /* pop ret addr */
+    xchg eax, [esp] /* exchange it with sysno */
+
+    /* Save registers and constructs arguments */
+    push ebp
+    push edi
+    push esi
+    push edx
+    push ecx
+    push ebx
+    push eax
+
+    /* save the pointer to argments in eax */
+    mov eax, esp
+
+    pushf
+    /* Save the original stack pointer */
+    mov ebp, esp
+    /* Align the stack to 16 bytes */
+    and esp, -16
+
+    /* Pass the pointer to the sysno and arguments to syscall_handler_32 */
+    push eax
+
+    call syscall_handler_32
+
+    mov esp, ebp
+    popf
+    pop ebx /* not need to restore eax (sysno) */
+    pop ebx
+    pop ecx
+    pop edx
+    pop esi
+    pop edi
+    pop ebp
+
+    /* Return to the caller */
+    ret
+"
+);
+
 unsafe extern "C" {
-    pub(crate) fn syscall_callback() -> i64;
+    pub(crate) fn syscall_callback() -> isize;
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn syscall_handler(syscall_number: i64, args: *const usize) -> i64 {
+#[cfg(target_arch = "x86")]
+unsafe extern "C" fn syscall_handler_32(args: *const usize) -> isize {
+    let syscall_number = unsafe { *args };
+    unsafe { syscall_handler(syscall_number, args.add(1)) }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) -> isize {
     let syscall_args = unsafe { core::slice::from_raw_parts(args, 6) };
-    let sysno = ::syscalls::Sysno::from(syscall_number as u32);
+    let Ok(syscall_number) = u32::try_from(syscall_number) else {
+        return Errno::ENOSYS.as_neg() as isize;
+    };
+    let sysno = ::syscalls::Sysno::from(syscall_number);
     let dispatcher = match sysno {
         ::syscalls::Sysno::write => SyscallRequest::Write {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
-            buf: unsafe { core::mem::transmute(syscall_args[1]) },
+            buf: unsafe { core::mem::transmute::<usize, ConstPtr<u8>>(syscall_args[1]) },
             count: syscall_args[2],
         },
+        // TODO: add them as punchthroughs
         ::syscalls::Sysno::exit => {
             let _ =
                 unsafe { ::syscalls::syscall1(::syscalls::Sysno::exit, syscall_args[0]) }.unwrap();
@@ -524,10 +597,9 @@ unsafe extern "C" fn syscall_handler(syscall_number: i64, args: *const usize) ->
         }
         _ => todo!("syscall {sysno} not implemented"),
     };
-    let ret = if let SyscallRequest::Ret(ret) = dispatcher {
+    if let SyscallRequest::Ret(ret) = dispatcher {
         ret
     } else {
         syscall_entry(dispatcher)
-    };
-    ret
+    }
 }

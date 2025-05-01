@@ -184,39 +184,51 @@ pub struct ElfLoadInfo {
     pub user_stack_top: usize,
 }
 
+#[cfg(target_arch = "x86_64")]
 type Ehdr = elf::file::Elf64_Ehdr;
+#[cfg(target_arch = "x86")]
+type Ehdr = elf::file::Elf32_Ehdr;
+#[cfg(target_arch = "x86_64")]
 type Shdr = elf::section::Elf64_Shdr;
+#[cfg(target_arch = "x86")]
+type Shdr = elf::section::Elf32_Shdr;
 /// Get the syscall callback placeholder address from the ELF file if it is modified by our syscall
 /// rewriter. The placeholder initially has a magic number that is going to be replaced by the actual
 /// syscall callback.
-fn get_syscall_callback_placeholder(object: &mut ElfFile) -> Option<NonNull<u64>> {
+fn get_syscall_callback_placeholder(object: &mut ElfFile) -> Option<NonNull<usize>> {
     let mut buf: [u8; size_of::<Ehdr>()] = [0; size_of::<Ehdr>()];
     object.read(&mut buf, 0).unwrap();
     let elfhdr: &Ehdr = unsafe { &*(buf.as_ptr().cast()) };
 
     // read section headers
     let shdrs_size = usize::from(elfhdr.e_shentsize) * usize::from(elfhdr.e_shnum);
-    let shdrs_start = elfhdr.e_shoff as usize;
     let mut buf: Vec<u8> = alloc::vec![0; shdrs_size];
-    object.read(&mut buf, shdrs_start).unwrap();
+    object
+        .read(&mut buf, usize::try_from(elfhdr.e_shoff).unwrap())
+        .unwrap();
     let shdrs: &[Shdr] =
         unsafe { core::slice::from_raw_parts(buf.as_ptr().cast(), usize::from(elfhdr.e_shnum)) };
 
     // Note: our syscall rewriter adds a trampoline section at the end.
     let trampoline_shdr = &shdrs[shdrs.len() - 1];
     if trampoline_shdr.sh_type != elf::abi::SHT_PROGBITS
-        || trampoline_shdr.sh_flags != u64::from(elf::abi::SHF_ALLOC | elf::abi::SHF_EXECINSTR)
+        || trampoline_shdr.sh_flags != (elf::abi::SHF_ALLOC | elf::abi::SHF_EXECINSTR).into()
     {
         return None;
     }
 
     let mut placeholder: [u8; 8] = [0; 8];
-    object.read(&mut placeholder, trampoline_shdr.sh_offset as usize);
+    object
+        .read(
+            &mut placeholder,
+            usize::try_from(trampoline_shdr.sh_offset).unwrap(),
+        )
+        .ok()?;
     let magic_number = u64::from_ne_bytes(placeholder);
     if magic_number != super::REWRITER_MAGIC_NUMBER {
         return None;
     }
-    NonNull::new(trampoline_shdr.sh_addr as *mut u64)
+    NonNull::new(trampoline_shdr.sh_addr as *mut usize)
 }
 
 /// Loader for ELF files
@@ -261,6 +273,7 @@ impl ElfLoader {
                 .map_err(ElfLoaderError::LoaderError)?;
             if let Some(placeholder) = placeholder {
                 // mprotect the memory to make it writable
+                // TODO: add mprotect as punchthrough
                 let protflags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
                 let start_addr = placeholder.as_ptr() as usize & !(PAGE_SIZE - 1);
                 unsafe {
@@ -272,7 +285,7 @@ impl ElfLoader {
                     )
                     .unwrap()
                 };
-                unsafe { placeholder.write(crate::syscall_callback as u64) };
+                unsafe { placeholder.write(crate::syscall_callback as usize) };
                 let protflags = ProtFlags::PROT_READ | ProtFlags::PROT_EXEC;
                 unsafe {
                     syscalls::syscall3(
