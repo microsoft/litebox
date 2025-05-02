@@ -60,14 +60,15 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
-      CARGO_BIN_ENV: "cargo +nightly-2025-03-31"
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
       - name: Set up Rust
         run: |
-          rustup toolchain install $(echo $CARGO_BIN_ENV | awk -F'+' '{print $2}') --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-unknown-none
-          rustup component add rust-src --toolchain $(echo $CARGO_BIN_ENV | awk -F'+' '{print $2}')-x86_64-unknown-linux-gnu
+          RUST_CHANNEL=$(awk -F'"' '/channel/{print $2}' litebox_runner_lvbs/rust-toolchain.toml)
+          rustup toolchain install ${RUST_CHANNEL} --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-unknown-none
+          rustup component add rust-src --toolchain ${RUST_CHANNEL}-x86_64-unknown-linux-gnu
+          echo "CARGO_BIN_ENV=cargo +${RUST_CHANNEL}" >> $GITHUB_ENV
       - name: Set up Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
