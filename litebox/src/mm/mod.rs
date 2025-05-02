@@ -9,7 +9,8 @@ use core::ops::Range;
 
 use alloc::vec::Vec;
 use linux::{
-    MappingError, PageFaultError, PageRange, VmFlags, Vmem, VmemPageFaultHandler, VmemUnmapError,
+    MappingError, PageFaultError, PageRange, VmFlags, Vmem, VmemPageFaultHandler, VmemProtectError,
+    VmemUnmapError,
 };
 
 use crate::{
@@ -71,9 +72,13 @@ where
                 suggested_range,
                 fixed_addr,
                 // create READ | WRITE pages (set MAYEXEC so we can enable it later)
-                VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD | VmFlags::VM_MAYEXEC,
+                VmFlags::VM_READ
+                    | VmFlags::VM_WRITE
+                    | VmFlags::VM_MAYREAD
+                    | VmFlags::VM_MAYWRITE
+                    | VmFlags::VM_MAYEXEC,
                 // keep VM_READ, turn off VM_WRITE and turn on VM_EXEC
-                VmFlags::VM_READ | VmFlags::VM_EXEC | VmFlags::VM_MAYREAD | VmFlags::VM_MAYEXEC,
+                VmFlags::VM_READ | VmFlags::VM_EXEC,
                 op,
             )
         }
@@ -192,6 +197,60 @@ where
         let start = ptr.as_usize();
         let range = PageRange::new(start, start + len).ok_or(VmemUnmapError::MisAligned)?;
         unsafe { vmem.remove_mapping(range) }
+    }
+
+    /// Make pages readable and writable.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure it is safe to read and write to the memory region
+    /// and it will not be executed.
+    pub unsafe fn make_pages_writable(
+        &self,
+        ptr: Platform::RawMutPointer<u8>,
+        len: usize,
+    ) -> Result<(), VmemProtectError> {
+        let mut vmem = self.vmem.write();
+        let start = ptr.as_usize();
+        let range = PageRange::new(start, start + len)
+            .ok_or(VmemProtectError::InvalidRange(start..start + len))?;
+        unsafe { vmem.protect_mapping(range, VmFlags::VM_READ | VmFlags::VM_WRITE) }
+    }
+
+    /// Make pages readable and executable.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure it is safe to read and execute the memory region
+    /// and it will not be written to.
+    pub unsafe fn make_pages_executable(
+        &self,
+        ptr: Platform::RawMutPointer<u8>,
+        len: usize,
+    ) -> Result<(), VmemProtectError> {
+        let mut vmem = self.vmem.write();
+        let start = ptr.as_usize();
+        let range = PageRange::new(start, start + len)
+            .ok_or(VmemProtectError::InvalidRange(start..start + len))?;
+        unsafe { vmem.protect_mapping(range, VmFlags::VM_READ | VmFlags::VM_EXEC) }
+    }
+
+    /// Make pages readable only.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure it is safe to read the memory region
+    /// and it will not be written to or executed.
+    pub unsafe fn make_pages_readable(
+        &self,
+        ptr: Platform::RawMutPointer<u8>,
+        len: usize,
+    ) -> Result<(), VmemProtectError> {
+        let mut vmem = self.vmem.write();
+        let start = ptr.as_usize();
+        let range = PageRange::new(start, start + len)
+            .ok_or(VmemProtectError::InvalidRange(start..start + len))?;
+        unsafe { vmem.protect_mapping(range, VmFlags::VM_READ) }
     }
 
     /// Returns all mappings in a vector.

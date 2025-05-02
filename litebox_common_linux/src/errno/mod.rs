@@ -186,6 +186,27 @@ impl From<litebox::mm::linux::MappingError> for Errno {
     }
 }
 
+impl From<litebox::platform::page_mgmt::PermissionUpdateError> for Errno {
+    fn from(value: litebox::platform::page_mgmt::PermissionUpdateError) -> Self {
+        match value {
+            litebox::platform::page_mgmt::PermissionUpdateError::Unaligned => Errno::EINVAL,
+            litebox::platform::page_mgmt::PermissionUpdateError::Unallocated => Errno::ENOMEM,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::mm::linux::VmemProtectError> for Errno {
+    fn from(value: litebox::mm::linux::VmemProtectError) -> Self {
+        match value {
+            litebox::mm::linux::VmemProtectError::MisAligned(_) => Errno::EINVAL,
+            litebox::mm::linux::VmemProtectError::InvalidRange(_) => Errno::ENOMEM,
+            litebox::mm::linux::VmemProtectError::NoAccess { .. } => Errno::EACCES,
+            litebox::mm::linux::VmemProtectError::ProtectError(e) => e.into(),
+        }
+    }
+}
+
 impl From<litebox::path::ConversionError> for Errno {
     fn from(value: litebox::path::ConversionError) -> Self {
         match value {

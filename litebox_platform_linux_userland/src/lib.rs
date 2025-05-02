@@ -583,9 +583,20 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         range: std::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
-        let addr = core::ptr::NonNull::new(range.start as _).expect("non null addr");
-        unsafe { nix::sys::mman::mprotect(addr, range.len(), prot_flags(new_permissions)) }
-            .expect("mprotect failed");
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_mprotect,
+                    range.start,
+                    range.len(),
+                    prot_flags(new_permissions).bits(),
+                    // This is to ensure it won't be intercepted by Seccomp if enabled.
+                    syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                )
+            },
+            0,
+            "mprotect failed",
+        );
         Ok(())
     }
 }

@@ -475,6 +475,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// `op` is a callback for caller to initialize the created pages.
     ///
     /// `before_flags` and `after_flags` are the flags to set before and after the call to `op`.
+    /// Note `before_flags` needs to set `VM_MAY_ACCESS_FLAGS` bits and `after_flags` is only used
+    /// when `before_flags` is different from `after_flags` on those `VM_ACCESS_FLAGS` bits.
     ///
     /// # Safety
     ///
@@ -509,7 +511,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .unwrap();
             return Err(e);
         }
-        if before_flags != after_flags {
+        if before_flags & VmFlags::VM_ACCESS_FLAGS != after_flags & VmFlags::VM_ACCESS_FLAGS {
             let range =
                 PageRange::new(addr.as_usize(), addr.as_usize() + suggested_range.len()).unwrap();
             // `protect` should succeed, as we just created the mapping.
@@ -605,6 +607,8 @@ pub enum VmemMoveError {
 /// Error for protecting mappings
 #[derive(Error, Debug)]
 pub enum VmemProtectError {
+    #[error("the range {0:?} is not aligned")]
+    MisAligned(Range<usize>),
     #[error("the range {0:?} has no mapping memory")]
     InvalidRange(Range<usize>),
     #[error("failed to change permissions from {old:?} to {new:?}")]
