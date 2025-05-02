@@ -10,8 +10,8 @@ use core::{arch::asm, sync::atomic::AtomicU32};
 use host::linux::sigset_t;
 use litebox::mm::linux::PageRange;
 use litebox::platform::{
-    DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
-    RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
+    DebugLogProvider, ExitProvider, IPInterfaceProvider, ImmediatelyWokenUp,
+    PageManagementProvider, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
 };
 use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::errno::Errno;
@@ -33,6 +33,16 @@ static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
     page_table: mm::PageTable<4096>,
+}
+
+impl<Host: HostInterface> ExitProvider for LinuxKernel<Host> {
+    type ExitCode = i32;
+    const EXIT_SUCCESS: Self::ExitCode = 0;
+    const EXIT_FAILURE: Self::ExitCode = 1;
+    fn exit(&self, _code: Self::ExitCode) -> ! {
+        // TODO: We should probably expand the host to handle an error code?
+        Host::exit()
+    }
 }
 
 impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
