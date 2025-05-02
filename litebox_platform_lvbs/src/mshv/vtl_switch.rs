@@ -135,12 +135,32 @@ fn drop_vtl_state_from_stack() {
 
 #[expect(clippy::inline_always)]
 #[inline(always)]
+fn assert_rsp_eq(exected_rsp: u64) {
+    let mut match_flag: u8;
+    unsafe {
+        asm!(
+            "cmp rsp, rax",
+            "sete al",
+            in("rax") exected_rsp,
+            lateout("al") match_flag,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    assert!(match_flag != 0, "RSP does not match expected value");
+}
+
+#[expect(clippy::inline_always)]
+#[inline(always)]
 fn save_vtl0_state() {
     let vtl0_state = push_vtl_state_to_stack();
     let kernel_context = get_per_core_kernel_context();
     kernel_context
         .vtl0_state
         .clone_from(unsafe { &*vtl0_state });
+    // any code between push and drop must not leave any data on the stack
+    // to avoid memory leak. the following assert is to confirm this.
+    assert_rsp_eq(vtl0_state as u64);
     drop_vtl_state_from_stack();
 }
 
@@ -152,6 +172,9 @@ fn save_vtl1_state() {
     kernel_context
         .vtl1_state
         .clone_from(unsafe { &*vtl1_state });
+    // any code between push and drop must not leave any data on the stack
+    // to avoid memory leak. the following assert is to confirm this.
+    assert_rsp_eq(vtl1_state as u64);
     drop_vtl_state_from_stack();
 }
 
