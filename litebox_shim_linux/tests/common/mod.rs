@@ -3,7 +3,6 @@ use std::{arch::global_asm, ffi::CString};
 use litebox::{
     LiteBox,
     fs::{FileSystem as _, Mode, OFlags},
-    platform::trivial_providers::ImpossiblePunchthroughProvider,
 };
 use litebox_platform_multiplex::{Platform, set_platform};
 use litebox_shim_linux::{litebox_fs, loader::load_program, set_fs};
@@ -44,7 +43,7 @@ unsafe extern "C" {
 }
 
 pub fn init_platform() {
-    let platform = Platform::new(None, ImpossiblePunchthroughProvider {});
+    let platform = Platform::new(None);
     set_platform(platform);
     let platform = litebox_platform_multiplex::platform();
     let litebox = LiteBox::new(platform);

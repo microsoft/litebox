@@ -34,6 +34,13 @@ impl<T: Clone> UserConstPtr<T> {
     pub fn from_user_at_offset(self, off: isize) -> Option<T> {
         unsafe { Some(self.read_at_offset(off)?.into_owned()) }
     }
+
+    /// Cast to a pointer with different underlying type
+    pub fn cast<U>(self) -> UserConstPtr<U> {
+        UserConstPtr {
+            inner: self.inner.cast(),
+        }
+    }
 }
 
 /// Represent a user space pointer to a mutable object
@@ -81,5 +88,12 @@ impl<T: Clone> UserMutPtr<T> {
     /// Write to user space at the `off` offset
     pub fn to_user_at_offset(self, off: isize, value: T) -> Option<()> {
         unsafe { self.write_at_offset(off, value) }
+    }
+
+    /// Cast to a pointer with different underlying type
+    pub fn cast<U>(self) -> UserMutPtr<U> {
+        UserMutPtr {
+            inner: self.inner.cast(),
+        }
     }
 }

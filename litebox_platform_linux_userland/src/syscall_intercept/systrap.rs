@@ -19,7 +19,7 @@ struct SyscallSiginfo {
     arch: c_uint,
 }
 
-type SyscallHandler = dyn Fn(SyscallRequest<crate::LinuxUserland>) -> i64 + Send + Sync;
+type SyscallHandler = dyn Fn(SyscallRequest<crate::LinuxUserland>) -> isize + Send + Sync;
 static SYSCALL_HANDLER: spin::Once<Box<SyscallHandler>> = spin::Once::new();
 
 global_asm!(
@@ -180,7 +180,7 @@ fn to_ioctl_arg(cmd: u32, arg: usize) -> IoctlArg<crate::LinuxUserland> {
 
 #[allow(clippy::too_many_lines)]
 #[unsafe(no_mangle)]
-unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize) -> i64 {
+unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize) -> isize {
     // Litebox and the loaded program have different fs bases. Save and restore fs base
     // whenever switching between them.
     // TODO: we may also need to do in other places where switching world happens,
@@ -391,7 +391,7 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                 // don't allow changing the SIGSYS handler
                 ret = libc::EINVAL;
             }
-            SyscallRequest::Ret(i64::from(ret))
+            SyscallRequest::Ret(isize::try_from(ret).unwrap())
         }
         libc::SYS_rt_sigprocmask => {
             // never block SIGSYS
@@ -407,7 +407,7 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                     SYSCALL_ARG_MAGIC,
                 )
             };
-            SyscallRequest::Ret(ret)
+            SyscallRequest::Ret(isize::try_from(ret).unwrap())
         }
         _ => todo!("Currently unimplemented syscall: {syscall_number}"),
     };
@@ -632,7 +632,7 @@ fn init_fs_base() {
 /// This function sets up the syscall handler and registers seccomp
 /// filters and the SIGSYS signal handler.
 pub(crate) fn init_sys_intercept(
-    handler: impl Fn(SyscallRequest<crate::LinuxUserland>) -> i64 + Send + Sync + 'static,
+    handler: impl Fn(SyscallRequest<crate::LinuxUserland>) -> isize + Send + Sync + 'static,
 ) {
     SYSCALL_HANDLER.call_once(|| Box::new(handler));
 
