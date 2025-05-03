@@ -342,7 +342,7 @@ pub trait HostInterface {
     ///
     /// It can return more than requested size. On success, it returns the start address
     /// and the size of the allocated memory.
-    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), Errno>;
+    fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)>;
 
     /// Returns the memory back to host.
     ///

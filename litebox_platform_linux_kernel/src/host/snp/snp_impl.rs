@@ -29,11 +29,21 @@ mod alloc {
     const LITEBOX_PAGE_OFFSET: u64 = LINUX_PAGE_OFFSET + (1 << PGDIR_SHIFT);
 
     #[global_allocator]
-    static SNP_ALLOCATOR: crate::mm::alloc::SafeZoneAllocator<
+    static SNP_ALLOCATOR: litebox::mm::alloc::SafeZoneAllocator<
         'static,
         HEAP_ORDER,
         super::SnpLinuxKenrel,
-    > = crate::mm::alloc::SafeZoneAllocator::new();
+    > = litebox::mm::alloc::SafeZoneAllocator::new();
+
+    impl litebox::mm::alloc::MemoryProvider for super::SnpLinuxKenrel {
+        fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
+            super::HostSnpInterface::alloc(layout)
+        }
+
+        unsafe fn free(addr: usize) {
+            unsafe { super::HostSnpInterface::free(addr) }
+        }
+    }
 
     impl crate::mm::MemoryProvider for super::SnpLinuxKenrel {
         const GVA_OFFSET: crate::arch::VirtAddr = crate::arch::VirtAddr::new(LITEBOX_PAGE_OFFSET);
@@ -45,14 +55,6 @@ mod alloc {
 
         unsafe fn mem_free_pages(ptr: *mut u8, order: u32) {
             unsafe { SNP_ALLOCATOR.free_pages(ptr, order) }
-        }
-
-        fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::Errno> {
-            super::HostSnpInterface::alloc(layout)
-        }
-
-        unsafe fn free(addr: usize) {
-            unsafe { super::HostSnpInterface::free(addr) }
         }
     }
 }
@@ -182,7 +184,7 @@ impl HostInterface for HostSnpInterface {
         ghcb_prints(msg);
     }
 
-    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), Errno> {
+    fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
         // To reduce the number of hypercalls, we allocate the maximum order.
         // Assertion is added to prevent the allocation size from exceeding the maximum order.
         let size = core::cmp::max(
@@ -197,12 +199,14 @@ impl HostInterface for HostSnpInterface {
             [u64::from(bindings::SNP_VMPL_ALLOC_MAX_ORDER), 0, 0, 0, 0, 0],
         );
         Self::request(&mut req);
-        Self::parse_alloc_result(bindings::SNP_VMPL_ALLOC_MAX_ORDER, req.ret).map(|addr| {
-            (
+        match Self::parse_alloc_result(bindings::SNP_VMPL_ALLOC_MAX_ORDER, req.ret) {
+            Ok(addr) => Some((
                 addr,
                 usize::try_from(PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER).unwrap(),
-            )
-        })
+            )),
+            Err(Errno::ENOMEM) => None,
+            Err(e) => unimplemented!("Unexpected error: {}", e),
+        }
     }
 
     unsafe fn free(_addr: usize) {
