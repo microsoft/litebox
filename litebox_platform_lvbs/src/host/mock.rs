@@ -17,19 +17,12 @@ macro_rules! mock_log_println {
 }
 
 impl HostInterface for MockHostInterface {
-    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::Errno> {
-        assert!(layout.size() <= 0x40_0000); // 4MB
-        let size = core::cmp::max(
-            layout.size().next_power_of_two(),
-            core::cmp::max(layout.align(), 0x1000),
-        );
-        let addr = unsafe { libc::memalign(layout.align(), size) };
-        assert_ne!(addr, libc::MAP_FAILED);
-        Ok((addr as usize, size))
+    fn alloc(_layout: &core::alloc::Layout) -> Result<(usize, usize), crate::Errno> {
+        todo!()
     }
 
-    unsafe fn free(addr: usize) {
-        unsafe { libc::free(addr as *mut _) };
+    unsafe fn free(_addr: usize) {
+        todo!()
     }
 
     fn terminate(_reason_set: u64, _reason_code: u64) -> ! {
@@ -49,6 +42,10 @@ impl HostInterface for MockHostInterface {
     }
 
     fn exit() -> ! {
+        todo!()
+    }
+
+    fn switch(_result: u64) -> ! {
         todo!()
     }
 

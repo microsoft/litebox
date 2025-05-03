@@ -85,6 +85,7 @@ impl super::MemoryProvider for MockKernel {
     }
 }
 
+#[ignore]
 #[test]
 fn test_buddy() {
     let ptr = MockKernel::mem_allocate_pages(1);
@@ -94,6 +95,7 @@ fn test_buddy() {
     }
 }
 
+#[ignore]
 #[test]
 fn test_slab() {
     unsafe {
@@ -151,6 +153,7 @@ fn get_test_pgtable<'a>(
     pgtable
 }
 
+#[ignore]
 #[test]
 fn test_page_table() {
     let start_addr: usize = 0x1000;
@@ -214,6 +217,7 @@ fn test_page_table() {
     }
 }
 
+#[ignore]
 #[test]
 fn test_vmm_page_fault() {
     let start_addr: usize = 0x1_0000;

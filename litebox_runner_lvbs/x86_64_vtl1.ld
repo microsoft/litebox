@@ -21,6 +21,8 @@ SECTIONS
         *(.rodata .rodata.*)
         *(.data .data.*)
         . = ALIGN(0x1000);
+        _hypercall_page = . ;
+        . = ALIGN(0x1000);
         _ta_data_start = . ;
         KEEP(*(.binary_data))
         _ta_data_end = . ;
