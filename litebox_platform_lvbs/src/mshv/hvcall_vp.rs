@@ -107,7 +107,6 @@ fn hvcall_enable_vp_vtl(
     )
 }
 
-// TODO: better way to get the entry point?
 unsafe extern "C" {
     static _start: u8;
 }

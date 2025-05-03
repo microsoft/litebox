@@ -6,7 +6,7 @@ use crate::{
 };
 use x86_64::structures::tss::TaskStateSegment;
 
-pub const MAX_CORES: usize = 8; // TODO: MAX_CORES = 96?
+pub const MAX_CORES: usize = 8; // TODO: use cpumask
 pub const INTERRUPT_STACK_SIZE: usize = 2 * PAGE_SIZE;
 pub const KERNEL_STACK_SIZE: usize = 8 * PAGE_SIZE;
 
@@ -51,7 +51,7 @@ impl KernelContext {
     }
 }
 
-// TODO: use heap later
+// TODO: use heap
 static mut PER_CORE_KERNEL_CONTEXT: [KernelContext; MAX_CORES] = [KernelContext {
     hv_vp_assist_page: [0u8; PAGE_SIZE],
     interrupt_stack: [0u8; INTERRUPT_STACK_SIZE],

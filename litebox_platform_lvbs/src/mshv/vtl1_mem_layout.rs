@@ -29,7 +29,6 @@ unsafe extern "C" {
     static _memory_base: u8;
 }
 
-// TODO: should be removed in the future
 #[inline]
 pub fn get_memory_base_address() -> u64 {
     &raw const _memory_base as u64

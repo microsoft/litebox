@@ -23,7 +23,7 @@ pub fn mshv_vsm_enable_aps(_cpu_present_mask: u64) -> u64 {
     #[cfg(debug_assertions)]
     serial_println!("VSM: Enable VTL of APs");
 
-    let num_cores = 6; // TODO: decode cpu_present_mask instead of using hardcoded value
+    let num_cores = 6; // TODO: use cpumask
     if let Err(result) = init_vtl_aps(num_cores) {
         serial_println!("Err: {:?}", result);
         let err: u32 = result.into();

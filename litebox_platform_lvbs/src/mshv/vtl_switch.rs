@@ -194,16 +194,18 @@ fn load_vtl1_state() {
     pop_vtl_state(&vtl1_state);
 }
 
-/// VTL switch loop (entry point)
-pub fn vtl_switch_loop() -> ! {
+pub fn vtl_switch_loop_entry() -> ! {
     save_vtl0_state();
-    vtl_switch_loop_internal(0);
+    // This is a dummy call to satisfy load_vtl0_state() with reasonable register values.
+    // We do not save VTL0 registers during VTL1 initialization.
+
+    vtl_switch_loop(0);
 }
 
-/// VTL switch loop (internal)
+/// VTL switch loop
 /// # Panics
 /// Panics if VTL call parameter 0 is greater than u32::MAX
-pub fn vtl_switch_loop_internal(result: u64) -> ! {
+pub fn vtl_switch_loop(result: u64) -> ! {
     loop {
         save_vtl1_state();
         load_vtl0_state();
@@ -225,20 +227,20 @@ pub fn vtl_switch_loop_internal(result: u64) -> ! {
                     serial_println!("unknown function ID = {:#x}", params[0]);
                 } else {
                     let new_result = vsm_dispatch(&params);
-                    vtl_switch_loop_internal(new_result)
+                    vtl_switch_loop(new_result)
                 }
             }
             VtlEntryReason::Interrupt => {
                 serial_println!("handle VTL interrupt");
-                vtl_switch_loop_internal(0)
+                vtl_switch_loop(0)
             }
             VtlEntryReason::Intercept => {
                 serial_println!("handle VTL intercept");
-                vtl_switch_loop_internal(0)
+                vtl_switch_loop(0)
             }
             VtlEntryReason::Unknown => {
                 serial_println!("Unknown VTL entry reason");
-                vtl_switch_loop_internal(0)
+                vtl_switch_loop(0)
             }
         }
         // do not put any code which might corrupt registers
