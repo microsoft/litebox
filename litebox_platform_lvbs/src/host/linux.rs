@@ -54,3 +54,35 @@ pub struct Timespec {
 
 #[allow(non_camel_case_types)]
 pub type sigset_t = ::core::ffi::c_ulong;
+
+const CONFIG_NR_CPUS: usize = 512;
+const BITS_PER_LONG: usize = 64;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct CpuMask {
+    bits: [u64; CONFIG_NR_CPUS.div_ceil(BITS_PER_LONG)],
+}
+
+impl CpuMask {
+    #[expect(dead_code)]
+    fn new() -> Self {
+        CpuMask {
+            bits: [0; CONFIG_NR_CPUS.div_ceil(BITS_PER_LONG)],
+        }
+    }
+
+    #[expect(dead_code)]
+    fn decode_cpu_mask(&self) -> [bool; CONFIG_NR_CPUS] {
+        let mut cpu_mask = [false; CONFIG_NR_CPUS];
+        for (i, &word) in self.bits.iter().enumerate() {
+            for j in 0..BITS_PER_LONG {
+                if (word & (1 << j)) != 0 {
+                    cpu_mask[i * BITS_PER_LONG + j] = true;
+                }
+            }
+        }
+
+        cpu_mask
+    }
+}
