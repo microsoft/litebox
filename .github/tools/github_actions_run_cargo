@@ -25,8 +25,6 @@ function to_gha {
    '
 }
 
-[[ -z "${CARGO_BIN_ENV}" ]] && CARGO_BIN="cargo" || CARGO_BIN="${CARGO_BIN_ENV}"
-
 if [ $# -lt 1 ]; then
     echo "Usage: $0 {build|check|clippy|fmt} [extra args...]"
     exit 1
@@ -37,26 +35,26 @@ shift
 
 case "$COMMAND" in
     build|check|clippy)
-        if ! $CARGO_BIN "$COMMAND" --message-format json --verbose "$@" | to_gha; then
+        if ! cargo "$COMMAND" --message-format json --verbose "$@" | to_gha; then
             echo '::error title='"$COMMAND"' issue::"cargo '"$COMMAND"'" failed'
             exit 1
         fi
         ;;
     fmt)
-        if ! $CARGO_BIN fmt --check --verbose "$@"; then
+        if ! cargo fmt --check --verbose "$@"; then
             echo '::error title=Formatting issue::"cargo fmt" failed'
             exit 1
         fi
         ;;
     test)
-        if ! $CARGO_BIN test --verbose "$@"; then
+        if ! cargo test --verbose "$@"; then
             echo '::error title=Tests failed::"cargo test" failed'
             exit 1
         fi
         ;;
     nextest)
         # Reads the config from .config/nextest.toml
-        if ! $CARGO_BIN nextest run --profile ci "$@"; then
+        if ! cargo nextest run --profile ci "$@"; then
             echo '::error title=Tests failed::"cargo nextest run" failed'
             exit 1
         fi
