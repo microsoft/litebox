@@ -9,6 +9,9 @@ use litebox_platform_lvbs::{
     serial_println,
 };
 
+#[cfg(debug_assertions)]
+use litebox_runner_lvbs::print_boot_params;
+
 #[expect(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
@@ -35,6 +38,9 @@ pub fn kernel_main() -> ! {
         serial_println!(" Hello from LiteBox for LVBS! ");
         serial_println!("==============================");
     }
+
+    #[cfg(debug_assertions)]
+    print_boot_params();
 
     // TODO: common init (e.g., heap, ...)
 

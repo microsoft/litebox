@@ -1,4 +1,5 @@
 //! Different host implementations of [`super::HostInterface`]
+pub mod bootparam;
 pub mod linux;
 pub mod lvbs_impl;
 

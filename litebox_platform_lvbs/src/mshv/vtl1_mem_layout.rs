@@ -41,7 +41,7 @@ pub fn get_address_of_special_page(page: usize) -> u64 {
 
 /// Error for VSM memory
 #[derive(Debug, PartialEq)]
-pub enum VtlMemoyError {
+pub enum VtlMemoryError {
     InvalidBootParams,
     InvalidCmdLine,
 }
