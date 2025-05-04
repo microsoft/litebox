@@ -44,16 +44,24 @@ impl<const ORDER: usize, M: MemoryProvider> Default for SafeZoneAllocator<'_, OR
 impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
     const PAGE_SIZE: usize = 4096;
     /// 4 KiB
-    const BASE_PAGE_SIZE: usize = size_of::<ObjectPage>();
+    const BASE_PAGE_SIZE: usize = 4096;
     /// 2 MiB
-    const LARGE_PAGE_SIZE: usize = size_of::<LargeObjectPage>();
+    const LARGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
     const BASE_PAGE_SIZE_ORDER: u32 = (Self::BASE_PAGE_SIZE / Self::PAGE_SIZE).trailing_zeros();
     const LARGE_PAGE_SIZE_ORDER: u32 = (Self::LARGE_PAGE_SIZE / Self::PAGE_SIZE).trailing_zeros();
 
     pub const fn new() -> Self {
         Self {
             buddy_allocator: LockedHeapWithRescue::new(|heap, layout| {
-                if let Some((start, size)) = M::alloc(layout) {
+                let page_aligned_size = layout.size().next_power_of_two();
+                if page_aligned_size.trailing_zeros() as usize > ORDER {
+                    unimplemented!("requested size {page_aligned_size:#} is too large");
+                }
+                let Ok(layout) = Layout::from_size_align(page_aligned_size, page_aligned_size)
+                else {
+                    unreachable!();
+                };
+                if let Some((start, size)) = M::alloc(&layout) {
                     // the returned size might be larger than requested (i.e., layout.size())
                     unsafe { heap.add_to_heap(start, start + size) };
                 }

@@ -12,7 +12,7 @@ use std::time::Duration;
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
-use litebox_common_linux::PunchthroughSyscall;
+use litebox_common_linux::{MapFlags, ProtFlags, PunchthroughSyscall};
 
 mod syscall_intercept;
 
@@ -670,6 +670,40 @@ impl litebox::platform::StdioProvider for LinuxUserland {
             StdioStream::Stdout => std::io::stdout().is_terminal(),
             StdioStream::Stderr => std::io::stderr().is_terminal(),
         }
+    }
+}
+
+#[global_allocator]
+static SLAB_ALLOC: litebox::mm::alloc::SafeZoneAllocator<'static, 23, LinuxUserland> =
+    litebox::mm::alloc::SafeZoneAllocator::new();
+
+impl litebox::mm::alloc::MemoryProvider for LinuxUserland {
+    fn alloc(layout: &std::alloc::Layout) -> Option<(usize, usize)> {
+        let size = core::cmp::max(
+            layout.size().next_power_of_two(),
+            // Note `mmap` provides no guarantee of alignment, so we double the size to ensure we
+            // can always find a required chunk within the returned memory region.
+            core::cmp::max(layout.align(), 0x1000) << 1,
+        );
+        let addr = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                size << 1,
+                ProtFlags::PROT_READ_WRITE.bits(),
+                (MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON).bits(),
+                -1,
+                0,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            None
+        } else {
+            Some((addr as usize, size << 1))
+        }
+    }
+
+    unsafe fn free(_addr: usize) {
+        todo!();
     }
 }
 
