@@ -583,17 +583,15 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         range: std::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
-        let mprotect_ret = 
-            unsafe {
-                libc::syscall(
-                    libc::SYS_mprotect,
-                    range.start,
-                    range.len(),
-                    prot_flags(new_permissions).bits(),
-                    // This is to ensure it won't be intercepted by Seccomp if enabled.
-                    syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
-                )
-            }
+        let mprotect_ret = unsafe {
+            libc::syscall(
+                libc::SYS_mprotect,
+                range.start,
+                range.len(),
+                prot_flags(new_permissions).bits(),
+                // This is to ensure it won't be intercepted by Seccomp if enabled.
+                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+            )
         };
         assert_eq!(mprotect_ret, 0);
         Ok(())

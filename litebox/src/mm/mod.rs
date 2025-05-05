@@ -203,8 +203,7 @@ where
     ///
     /// # Safety
     ///
-    /// The caller must ensure the memory region is used only for reading and writing
-    /// but not executing if this call succeeds.
+    /// The caller must ensure there is no concurrent `execute` access to the memory region.
     pub unsafe fn make_pages_writable(
         &self,
         ptr: Platform::RawMutPointer<u8>,
@@ -221,8 +220,7 @@ where
     ///
     /// # Safety
     ///
-    /// The caller must ensure the memory region is used only for reading and executing
-    /// but not writing if this call succeeds.
+    /// The caller must ensure there is no concurrent `write` access to the memory region.
     pub unsafe fn make_pages_executable(
         &self,
         ptr: Platform::RawMutPointer<u8>,
@@ -239,8 +237,7 @@ where
     ///
     /// # Safety
     ///
-    /// The caller must ensure the memory region is used only for reading
-    /// but not writing or executing if this call succeeds.
+    /// The caller must ensure there is no concurrent `write/execute` access to the memory region.
     pub unsafe fn make_pages_readable(
         &self,
         ptr: Platform::RawMutPointer<u8>,
