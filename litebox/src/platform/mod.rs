@@ -505,11 +505,11 @@ pub enum StdioOutStream {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StdioStream {
     /// Standard input
-    Stdin,
+    Stdin = 0,
     /// Standard output
-    Stdout,
+    Stdout = 1,
     /// Standard error
-    Stderr,
+    Stderr = 2,
 }
 
 /// A provider of standard input/output functionality.

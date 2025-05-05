@@ -159,6 +159,7 @@ impl From<litebox::fs::FileType> for InodeType {
         match value {
             litebox::fs::FileType::RegularFile => InodeType::File,
             litebox::fs::FileType::Directory => InodeType::Dir,
+            litebox::fs::FileType::CharacterDevice => InodeType::CharDevice,
             _ => unimplemented!(),
         }
     }
@@ -166,7 +167,7 @@ impl From<litebox::fs::FileType> for InodeType {
 
 /// Linux's `stat` struct
 #[repr(C, packed)]
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Debug)]
 pub struct FileStat {
     pub st_dev: u64,
     pub st_ino: u64,
@@ -306,6 +307,56 @@ bitflags::bitflags! {
     }
 }
 
+#[allow(non_camel_case_types)]
+type cc_t = ::core::ffi::c_uchar;
+#[allow(non_camel_case_types)]
+type tcflag_t = ::core::ffi::c_uint;
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct Termios {
+    pub c_iflag: tcflag_t,
+    pub c_oflag: tcflag_t,
+    pub c_cflag: tcflag_t,
+    pub c_lflag: tcflag_t,
+    pub c_line: cc_t,
+    pub c_cc: [cc_t; 19usize],
+}
+
+#[derive(Debug, Clone)]
+#[repr(C)]
+pub struct Winsize {
+    pub row: u16,
+    pub col: u16,
+    pub xpixel: u16,
+    pub ypixel: u16,
+}
+
+pub const TCGETS: u32 = 0x5401;
+pub const TCSETS: u32 = 0x5402;
+pub const TIOCGWINSZ: u32 = 0x5413;
+pub const FIONBIO: u32 = 0x5421;
+pub const TIOCGPTN: u32 = 0x80045430;
+
+/// Commands for use with `ioctl`.
+#[non_exhaustive]
+pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
+    /// Get the current serial port settings.
+    TCGETS(Platform::RawMutPointer<Termios>),
+    /// Set the current serial port settings.
+    TCSETS(Platform::RawConstPointer<Termios>),
+    /// Get window size.
+    TIOCGWINSZ(Platform::RawMutPointer<Winsize>),
+    /// Obtain device unit number, which can be used to generate
+    /// the filename of the pseudo-terminal slave device.
+    TIOCGPTN(Platform::RawMutPointer<u32>),
+    /// Enables or disables non-blocking mode
+    FIONBIO(Platform::RawConstPointer<i32>),
+    Raw {
+        cmd: u32,
+        arg: Platform::RawMutPointer<u8>,
+    },
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
@@ -345,6 +396,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Munmap {
         addr: Platform::RawMutPointer<u8>,
         length: usize,
+    },
+    Ioctl {
+        fd: i32,
+        arg: IoctlArg<Platform>,
     },
     Pread64 {
         fd: i32,

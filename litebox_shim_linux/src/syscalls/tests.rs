@@ -4,8 +4,27 @@ use litebox_platform_multiplex::{Platform, set_platform};
 
 use super::file::{sys_eventfd2, sys_fcntl, sys_pipe2};
 
-fn init_platform() {
+pub(crate) fn init_platform() {
     set_platform(Platform::new(None, ImpossiblePunchthroughProvider {}));
+
+    let platform = litebox_platform_multiplex::platform();
+    let litebox = litebox::LiteBox::new(platform);
+
+    let in_mem_fs = litebox::fs::in_mem::FileSystem::new(&litebox);
+    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&litebox);
+    let tar_ro_fs =
+        litebox::fs::tar_ro::FileSystem::new(&litebox, litebox::fs::tar_ro::empty_tar_file());
+    crate::set_fs(litebox::fs::layered::FileSystem::new(
+        &litebox,
+        in_mem_fs,
+        litebox::fs::layered::FileSystem::new(
+            &litebox,
+            dev_stdio,
+            tar_ro_fs,
+            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+        ),
+        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+    ));
 }
 
 #[test]

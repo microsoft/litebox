@@ -6,9 +6,7 @@ use litebox::{
     platform::trivial_providers::ImpossiblePunchthroughProvider,
 };
 use litebox_platform_multiplex::{Platform, set_platform};
-use litebox_shim_linux::{
-    litebox_fs, loader::load_program, set_fs, syscall_entry, syscalls::file::sys_open,
-};
+use litebox_shim_linux::{litebox_fs, loader::load_program, set_fs};
 
 #[cfg(target_arch = "x86_64")]
 global_asm!(
@@ -70,21 +68,7 @@ pub fn init_platform() {
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     ));
-    platform.enable_syscall_interception_with(syscall_entry);
-
-    // set up stdin, stdout, and stderr
-    assert_eq!(
-        sys_open("/stdin", OFlags::RDONLY | OFlags::CREAT, Mode::RWXU).unwrap(),
-        0
-    );
-    assert_eq!(
-        sys_open("/stdout", OFlags::WRONLY | OFlags::CREAT, Mode::RWXU).unwrap(),
-        1
-    );
-    assert_eq!(
-        sys_open("/stderr", OFlags::WRONLY | OFlags::CREAT, Mode::RWXU).unwrap(),
-        2
-    );
+    platform.enable_syscall_interception_with(litebox_shim_linux::syscall_entry);
 
     install_dir("/lib64");
     install_dir("/lib32");

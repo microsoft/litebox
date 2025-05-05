@@ -20,6 +20,7 @@ use once_cell::race::OnceBox;
 
 use litebox::{
     LiteBox,
+    fs::FileSystem,
     mm::{PageManager, linux::PAGE_SIZE},
     platform::{RawConstPointer as _, RawMutPointer as _},
     sync::RwLock,
@@ -29,6 +30,7 @@ use litebox_platform_multiplex::Platform;
 
 pub(crate) mod channel;
 pub mod loader;
+pub(crate) mod stdio;
 pub mod syscalls;
 
 type LinuxFS = litebox::fs::layered::FileSystem<
@@ -88,9 +90,42 @@ struct Descriptors {
 
 impl Descriptors {
     fn new() -> Self {
-        // TODO: Add stdin/stdout/stderr
         Self {
-            descriptors: vec![],
+            descriptors: vec![
+                Some(Descriptor::Stdio(stdio::StdioFile::new(
+                    litebox::platform::StdioStream::Stdin,
+                    litebox_fs()
+                        .open(
+                            "/dev/stdin",
+                            litebox::fs::OFlags::RDONLY,
+                            litebox::fs::Mode::empty(),
+                        )
+                        .unwrap(),
+                    litebox::fs::OFlags::APPEND | litebox::fs::OFlags::RDWR,
+                ))),
+                Some(Descriptor::Stdio(stdio::StdioFile::new(
+                    litebox::platform::StdioStream::Stdout,
+                    litebox_fs()
+                        .open(
+                            "/dev/stdout",
+                            litebox::fs::OFlags::WRONLY,
+                            litebox::fs::Mode::empty(),
+                        )
+                        .unwrap(),
+                    litebox::fs::OFlags::APPEND | litebox::fs::OFlags::RDWR,
+                ))),
+                Some(Descriptor::Stdio(stdio::StdioFile::new(
+                    litebox::platform::StdioStream::Stderr,
+                    litebox_fs()
+                        .open(
+                            "/dev/stderr",
+                            litebox::fs::OFlags::WRONLY,
+                            litebox::fs::Mode::empty(),
+                        )
+                        .unwrap(),
+                    litebox::fs::OFlags::APPEND | litebox::fs::OFlags::RDWR,
+                ))),
+            ],
         }
     }
     fn insert(&mut self, descriptor: Descriptor) -> u32 {
@@ -172,6 +207,8 @@ enum Descriptor {
         file: alloc::sync::Arc<syscalls::eventfd::EventFile<Platform>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
+    // TODO: we may not need this once #31 and #68 are done.
+    Stdio(stdio::StdioFile),
 }
 
 pub(crate) fn file_descriptors<'a>() -> &'a RwLock<Platform, Descriptors> {
@@ -233,6 +270,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
             None => Err(Errno::EFAULT),
         },
         SyscallRequest::Close { fd } => syscalls::file::sys_close(fd).map(|()| 0),
+        SyscallRequest::Ioctl { fd, arg } => syscalls::file::sys_ioctl(fd, arg).map(|v| v as usize),
         SyscallRequest::Pread64 {
             fd,
             buf,

@@ -5,7 +5,7 @@ use core::ffi::{c_int, c_uint};
 use litebox::platform::RawMutPointer as _;
 use litebox::platform::trivial_providers::{TransparentConstPtr, TransparentMutPtr};
 use litebox::utils::{ReinterpretSignedExt as _, TruncateExt as _};
-use litebox_common_linux::SyscallRequest;
+use litebox_common_linux::{IoctlArg, SyscallRequest};
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 
 // Define a custom structure to reinterpret siginfo_t
@@ -152,6 +152,32 @@ fn set_fs_base_wrfsbase(fs_base: u64) {
     }
 }
 
+fn to_ioctl_arg(cmd: u32, arg: usize) -> IoctlArg<crate::LinuxUserland> {
+    match cmd {
+        litebox_common_linux::TCGETS => IoctlArg::TCGETS(TransparentMutPtr {
+            inner: arg as *mut litebox_common_linux::Termios,
+        }),
+        litebox_common_linux::TCSETS => IoctlArg::TCSETS(TransparentConstPtr {
+            inner: arg as *const litebox_common_linux::Termios,
+        }),
+        litebox_common_linux::TIOCGWINSZ => IoctlArg::TIOCGWINSZ(TransparentMutPtr {
+            inner: arg as *mut litebox_common_linux::Winsize,
+        }),
+        litebox_common_linux::TIOCGPTN => IoctlArg::TIOCGPTN(TransparentMutPtr {
+            inner: arg as *mut u32,
+        }),
+        litebox_common_linux::FIONBIO => IoctlArg::FIONBIO(TransparentConstPtr {
+            inner: arg as *mut i32,
+        }),
+        _ => IoctlArg::Raw {
+            cmd,
+            arg: TransparentMutPtr {
+                inner: arg as *mut u8,
+            },
+        },
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize) -> i64 {
@@ -223,6 +249,10 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                 inner: syscall_args[0] as *mut u8,
             },
             length: syscall_args[1],
+        },
+        libc::SYS_ioctl => SyscallRequest::Ioctl {
+            fd: syscall_args[0].reinterpret_as_signed().truncate(),
+            arg: to_ioctl_arg(syscall_args[1].truncate(), syscall_args[2]),
         },
         libc::SYS_pread64 => SyscallRequest::Pread64 {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
@@ -444,17 +474,16 @@ fn register_seccomp_filter() {
     // allow list
     // TODO: remove syscalls once they are implemented in the shim
     let rules = vec![
-        // TODO: before we support standard input/output, allow writes
-        // to fd <= 2
         (
             libc::SYS_write,
             vec![
                 SeccompRule::new(vec![
+                    // A backdoor to allow invoking write.
                     SeccompCondition::new(
-                        0,
-                        SeccompCmpArgLen::Dword,
-                        SeccompCmpOp::Le,
-                        libc::STDERR_FILENO as u64,
+                        3,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::Eq,
+                        SYSCALL_ARG_MAGIC,
                     )
                     .unwrap(),
                 ])
