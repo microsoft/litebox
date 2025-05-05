@@ -9,8 +9,8 @@ use core::ops::Range;
 
 use alloc::vec::Vec;
 use linux::{
-    MappingError, PageFaultError, PageRange, VmFlags, Vmem, VmemPageFaultHandler, VmemProtectError,
-    VmemUnmapError,
+    MappingError, PageFaultError, PageRange, ProtFlags, VmFlags, Vmem, VmemPageFaultHandler,
+    VmemProtectError, VmemUnmapError,
 };
 
 use crate::{
@@ -71,14 +71,10 @@ where
             vmem.create_pages(
                 suggested_range,
                 fixed_addr,
-                // create READ | WRITE pages (set MAYEXEC so we can enable it later)
-                VmFlags::VM_READ
-                    | VmFlags::VM_WRITE
-                    | VmFlags::VM_MAYREAD
-                    | VmFlags::VM_MAYWRITE
-                    | VmFlags::VM_MAYEXEC,
-                // keep VM_READ, turn off VM_WRITE and turn on VM_EXEC
-                VmFlags::VM_READ | VmFlags::VM_EXEC,
+                // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the code)
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                // keep READ, turn off WRITE and turn on EXEC
+                ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
                 op,
             )
         }
@@ -109,8 +105,7 @@ where
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
-        let flags =
-            VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE;
+        let flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
         let suggested_range =
             PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::MisAligned)?;
         let mut vmem = self.vmem.write();
@@ -149,8 +144,10 @@ where
             vmem.create_pages(
                 suggested_range,
                 fixed_addr,
-                VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD,
-                VmFlags::VM_READ | VmFlags::VM_MAYREAD,
+                // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the data)
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                // kepp READ, turn off WRITE
+                ProtFlags::PROT_READ,
                 op,
             )
         }
@@ -172,11 +169,7 @@ where
         len: usize,
         fixed_addr: bool,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
-        let flags = VmFlags::VM_READ
-            | VmFlags::VM_WRITE
-            | VmFlags::VM_MAYREAD
-            | VmFlags::VM_MAYWRITE
-            | VmFlags::VM_GROWSDOWN;
+        let flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_GROWSDOWN;
         let mut vmem = self.vmem.write();
         let suggested_range =
             PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::MisAligned)?;

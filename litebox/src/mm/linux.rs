@@ -50,6 +50,56 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// Desired memory protection of a memory mapping, same as `mmap` flags.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    pub(super) struct ProtFlags: core::ffi::c_int {
+        /// Pages cannot be accessed.
+        const PROT_NONE = 0;
+        /// Pages can be read.
+        const PROT_READ = 1 << 0;
+        /// Pages can be written.
+        const PROT_WRITE = 1 << 1;
+        /// Pages can be executed
+        const PROT_EXEC = 1 << 2;
+        /// Apply the protection mode down to the beginning of a
+        /// mapping that grows downward
+        const PROT_GROWSDOWN = 1 << 24;
+        /// Apply the protection mode up to the end of a mapping that
+        /// grows upwards.
+        const PROT_GROWSUP = 1 << 25;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+
+        const PROT_READ_EXEC = Self::PROT_READ.bits() | Self::PROT_EXEC.bits();
+        const PROT_READ_WRITE = Self::PROT_READ.bits() | Self::PROT_WRITE.bits();
+    }
+}
+
+impl From<ProtFlags> for VmFlags {
+    fn from(value: ProtFlags) -> Self {
+        if value.intersects(
+            (ProtFlags::PROT_READ
+                | ProtFlags::PROT_WRITE
+                | ProtFlags::PROT_EXEC
+                | ProtFlags::PROT_GROWSDOWN)
+                .complement(),
+        ) {
+            unimplemented!("Unsupported ProtFlags: {value:?}");
+        }
+
+        let mut flags = VmFlags::empty();
+        flags.set(VmFlags::VM_READ, value.contains(ProtFlags::PROT_READ));
+        flags.set(VmFlags::VM_WRITE, value.contains(ProtFlags::PROT_WRITE));
+        flags.set(VmFlags::VM_EXEC, value.contains(ProtFlags::PROT_EXEC));
+        flags.set(
+            VmFlags::VM_GROWSDOWN,
+            value.contains(ProtFlags::PROT_GROWSDOWN),
+        );
+        flags
+    }
+}
+
 /// A non-empty range of page-aligned addresses
 #[derive(Clone, Copy)]
 pub struct PageRange<const ALIGN: usize> {
@@ -474,9 +524,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ///
     /// `op` is a callback for caller to initialize the created pages.
     ///
-    /// `before_flags` and `after_flags` are the flags to set before and after the call to `op`.
-    /// Note `before_flags` needs to set `VM_MAY_ACCESS_FLAGS` bits and `after_flags` is only used
-    /// when `before_flags` is different from `after_flags` on those `VM_ACCESS_FLAGS` bits.
+    /// `before_flags` and `after_flags` are the permissions to set before and after the call to `op`.
     ///
     /// # Safety
     ///
@@ -489,16 +537,21 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         &mut self,
         suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
-        before_flags: VmFlags,
-        after_flags: VmFlags,
+        before_flags: ProtFlags,
+        after_flags: ProtFlags,
         op: F,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
-        let addr =
-            unsafe { self.create_mapping(suggested_range, VmArea::new(before_flags), fixed_addr) }
-                .ok_or(MappingError::OutOfMemory)?;
+        let addr = unsafe {
+            self.create_mapping(
+                suggested_range,
+                VmArea::new(VmFlags::from(before_flags) | VmFlags::VM_MAY_ACCESS_FLAGS),
+                fixed_addr,
+            )
+        }
+        .ok_or(MappingError::OutOfMemory)?;
         // call the user function with the pages
         if let Err(e) = op(addr) {
             // remove the mapping if the user function fails
@@ -511,11 +564,12 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .unwrap();
             return Err(e);
         }
-        if before_flags & VmFlags::VM_ACCESS_FLAGS != after_flags & VmFlags::VM_ACCESS_FLAGS {
+        if before_flags != after_flags {
             let range =
                 PageRange::new(addr.as_usize(), addr.as_usize() + suggested_range.len()).unwrap();
             // `protect` should succeed, as we just created the mapping.
-            unsafe { self.protect_mapping(range, after_flags) }.expect("failed to protect mapping");
+            unsafe { self.protect_mapping(range, after_flags.into()) }
+                .expect("failed to protect mapping");
         }
         Ok(addr)
     }
