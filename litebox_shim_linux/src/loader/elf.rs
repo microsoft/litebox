@@ -275,6 +275,7 @@ impl ElfLoader {
                 // mprotect the memory to make it writable
                 let protflags = litebox_common_linux::ProtFlags::PROT_READ
                     | litebox_common_linux::ProtFlags::PROT_WRITE;
+                // `mmap` requires the address to be page-aligned
                 let start_addr = placeholder.as_ptr() as usize & !(PAGE_SIZE - 1);
                 litebox_platform_multiplex::platform()
                     .mprotect(start_addr, 0x1000, protflags)
