@@ -46,6 +46,15 @@ impl MockPlatform {
 
 impl Provider for MockPlatform {}
 
+impl ExitProvider for MockPlatform {
+    type ExitCode = i32;
+    const EXIT_SUCCESS: Self::ExitCode = 0;
+    const EXIT_FAILURE: Self::ExitCode = 1;
+    fn exit(&self, code: Self::ExitCode) -> ! {
+        unimplemented!("exit for MockPlatform")
+    }
+}
+
 pub(crate) struct MockRawMutex {
     atomic: core::sync::atomic::AtomicU32,
 }

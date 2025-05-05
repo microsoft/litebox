@@ -21,7 +21,7 @@ mod syscall_intercept;
 /// traits. Notably, however, it supports parametric punchtrough (defaulted to impossible
 /// punchtrough).
 pub struct LinuxUserland<PunchthroughProvider: litebox::platform::PunchthroughProvider = litebox::platform::trivial_providers::ImpossiblePunchthroughProvider> {
-    tun_socket_fd: Option<std::os::fd::OwnedFd>,
+    tun_socket_fd: std::sync::RwLock< Option<std::os::fd::OwnedFd>>,
     punchthrough_provider: PunchthroughProvider,
     interception_enabled: std::sync::atomic::AtomicBool,
 }
@@ -41,40 +41,42 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
         tun_device_name: Option<&str>,
         punchthrough_provider: PunchthroughProvider,
     ) -> &'static Self {
-        let tun_socket_fd = tun_device_name.map(|tun_device_name| {
-            let tun_fd = nix::fcntl::open(
-                "/dev/net/tun",
-                nix::fcntl::OFlag::O_RDWR
-                    | nix::fcntl::OFlag::O_CLOEXEC
-                    | nix::fcntl::OFlag::O_NONBLOCK,
-                nix::sys::stat::Mode::empty(),
-            )
-            .unwrap();
+        let tun_socket_fd = tun_device_name
+            .map(|tun_device_name| {
+                let tun_fd = nix::fcntl::open(
+                    "/dev/net/tun",
+                    nix::fcntl::OFlag::O_RDWR
+                        | nix::fcntl::OFlag::O_CLOEXEC
+                        | nix::fcntl::OFlag::O_NONBLOCK,
+                    nix::sys::stat::Mode::empty(),
+                )
+                .unwrap();
 
-            nix::ioctl_write_ptr!(tunsetiff, b'T', 202, ::core::ffi::c_int);
-            let ifreq = libc::ifreq {
-                ifr_name: {
-                    let mut name = [0i8; 16];
-                    assert!(tun_device_name.len() < 16); // Note: strictly-less-than 16, to ensure it fits
-                    for (i, b) in tun_device_name.char_indices() {
-                        let b = b as u32;
-                        assert!(b < 128);
-                        name[i] = i8::try_from(b).unwrap();
-                    }
-                    name
-                },
-                ifr_ifru: nix::libc::__c_anonymous_ifr_ifru {
-                    ifru_flags: i16::try_from(nix::libc::IFF_TUN).unwrap(),
-                },
-            };
-            let ifreq: *const libc::ifreq = &ifreq as _;
-            let ifreq: *const i32 = ifreq.cast();
-            unsafe { tunsetiff(tun_fd, ifreq) }.unwrap();
+                nix::ioctl_write_ptr!(tunsetiff, b'T', 202, ::core::ffi::c_int);
+                let ifreq = libc::ifreq {
+                    ifr_name: {
+                        let mut name = [0i8; 16];
+                        assert!(tun_device_name.len() < 16); // Note: strictly-less-than 16, to ensure it fits
+                        for (i, b) in tun_device_name.char_indices() {
+                            let b = b as u32;
+                            assert!(b < 128);
+                            name[i] = i8::try_from(b).unwrap();
+                        }
+                        name
+                    },
+                    ifr_ifru: nix::libc::__c_anonymous_ifr_ifru {
+                        ifru_flags: i16::try_from(nix::libc::IFF_TUN).unwrap(),
+                    },
+                };
+                let ifreq: *const libc::ifreq = &ifreq as _;
+                let ifreq: *const i32 = ifreq.cast();
+                unsafe { tunsetiff(tun_fd, ifreq) }.unwrap();
 
-            // By taking ownership, we are letting the drop handler automatically run `libc::close`
-            // when necessary.
-            unsafe { std::os::fd::OwnedFd::from_raw_fd(tun_fd) }
-        });
+                // By taking ownership, we are letting the drop handler automatically run `libc::close`
+                // when necessary.
+                unsafe { std::os::fd::OwnedFd::from_raw_fd(tun_fd) }
+            })
+            .into();
 
         Box::leak(Box::new(Self {
             tun_socket_fd,
@@ -113,6 +115,28 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
 impl<PunchthroughProvider: litebox::platform::PunchthroughProvider> litebox::platform::Provider
     for LinuxUserland<PunchthroughProvider>
 {
+}
+
+impl<PunchthroughProvider: litebox::platform::PunchthroughProvider> litebox::platform::ExitProvider
+    for LinuxUserland<PunchthroughProvider>
+{
+    type ExitCode = i32;
+    const EXIT_SUCCESS: Self::ExitCode = 0;
+    const EXIT_FAILURE: Self::ExitCode = 1;
+
+    fn exit(&self, code: Self::ExitCode) -> ! {
+        let Self {
+            tun_socket_fd,
+            punchthrough_provider: _,
+            interception_enabled: _,
+        } = self;
+        // We don't need to explicitly drop this, but doing so clarifies our intent that we want to
+        // close it out :). The type itself is re-specified here to make sure we look at this
+        // particular function in case we decide to change up the types within `LinuxUserland`.
+        drop::<Option<std::os::fd::OwnedFd>>(tun_socket_fd.write().unwrap().take());
+        // And then we actually exit
+        std::process::exit(code)
+    }
 }
 
 impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
@@ -344,7 +368,8 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     litebox::platform::IPInterfaceProvider for LinuxUserland<PunchthroughProvider>
 {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        let Some(tun_socket_fd) = self.tun_socket_fd.as_ref() else {
+        let tun_fd = self.tun_socket_fd.read().unwrap();
+        let Some(tun_socket_fd) = tun_fd.as_ref() else {
             unimplemented!("networking without tun is unimplemented")
         };
         match nix::unistd::write(tun_socket_fd, packet) {
@@ -364,7 +389,8 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
         &self,
         packet: &mut [u8],
     ) -> Result<usize, litebox::platform::ReceiveError> {
-        let Some(tun_socket_fd) = self.tun_socket_fd.as_ref() else {
+        let tun_fd = self.tun_socket_fd.read().unwrap();
+        let Some(tun_socket_fd) = tun_fd.as_ref() else {
             unimplemented!("networking without tun is unimplemented")
         };
         nix::unistd::read(tun_socket_fd.as_raw_fd(), packet).map_err(|errno| {
