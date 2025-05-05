@@ -207,6 +207,7 @@ enum Descriptor {
         file: alloc::sync::Arc<syscalls::eventfd::EventFile<Platform>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
+    // TODO: we may not need this once #31 and #68 are done.
     Stdio(stdio::StdioFile),
 }
 

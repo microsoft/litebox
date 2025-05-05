@@ -616,27 +616,18 @@ impl litebox::platform::StdioProvider for LinuxUserland {
         stream: litebox::platform::StdioOutStream,
         buf: &[u8],
     ) -> Result<usize, litebox::platform::StdioWriteError> {
-        let n = match stream {
-            litebox::platform::StdioOutStream::Stdout => unsafe {
-                libc::syscall(
-                    libc::SYS_write,
-                    libc::STDOUT_FILENO,
-                    buf.as_ptr(),
-                    buf.len(),
-                    // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                    syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
-                )
-            },
-            litebox::platform::StdioOutStream::Stderr => unsafe {
-                libc::syscall(
-                    libc::SYS_write,
-                    libc::STDERR_FILENO,
-                    buf.as_ptr(),
-                    buf.len(),
-                    // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                    syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
-                )
-            },
+        let n = unsafe {
+            libc::syscall(
+                libc::SYS_write,
+                match stream {
+                    litebox::platform::StdioOutStream::Stdout => libc::STDOUT_FILENO,
+                    litebox::platform::StdioOutStream::Stderr => libc::STDERR_FILENO,
+                },
+                buf.as_ptr(),
+                buf.len(),
+                // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+            )
         };
         if n < 0 {
             match latest_errno() {

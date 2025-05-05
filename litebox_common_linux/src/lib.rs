@@ -337,7 +337,7 @@ pub const TIOCGWINSZ: u32 = 0x5413;
 pub const FIONBIO: u32 = 0x5421;
 pub const TIOCGPTN: u32 = 0x80045430;
 
-/// Commands for use with `fcntl`.
+/// Commands for use with `ioctl`.
 #[non_exhaustive]
 pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     /// Get the current serial port settings.
