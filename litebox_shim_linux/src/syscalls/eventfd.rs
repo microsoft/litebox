@@ -84,14 +84,13 @@ impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
 
 #[cfg(test)]
 mod tests {
-    use litebox::platform::trivial_providers::ImpossiblePunchthroughProvider;
     use litebox_common_linux::{EfdFlags, errno::Errno};
     use litebox_platform_multiplex::{Platform, set_platform};
 
     extern crate std;
 
     fn init_platform() {
-        set_platform(Platform::new(None, ImpossiblePunchthroughProvider {}));
+        set_platform(Platform::new(None));
     }
 
     #[test]

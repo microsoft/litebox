@@ -12,23 +12,20 @@ use std::time::Duration;
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
+use litebox_common_linux::PunchthroughSyscall;
 
 mod syscall_intercept;
 
 /// The userland Linux platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
-/// traits. Notably, however, it supports parametric punchtrough (defaulted to impossible
-/// punchtrough).
-pub struct LinuxUserland<PunchthroughProvider: litebox::platform::PunchthroughProvider = litebox::platform::trivial_providers::ImpossiblePunchthroughProvider> {
-    tun_socket_fd: std::sync::RwLock< Option<std::os::fd::OwnedFd>>,
-    punchthrough_provider: PunchthroughProvider,
+/// traits.
+pub struct LinuxUserland {
+    tun_socket_fd: std::sync::RwLock<Option<std::os::fd::OwnedFd>>,
     interception_enabled: std::sync::atomic::AtomicBool,
 }
 
-impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
-    LinuxUserland<PunchthroughProvider>
-{
+impl LinuxUserland {
     /// Create a new userland-Linux platform for use in `LiteBox`.
     ///
     /// Takes an optional tun device name (such as `"tun0"` or `"tun99"`) to connect networking (if
@@ -37,10 +34,7 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     /// # Panics
     ///
     /// Panics if the tun device could not be successfully opened.
-    pub fn new(
-        tun_device_name: Option<&str>,
-        punchthrough_provider: PunchthroughProvider,
-    ) -> &'static Self {
+    pub fn new(tun_device_name: Option<&str>) -> &'static Self {
         let tun_socket_fd = tun_device_name
             .map(|tun_device_name| {
                 let tun_fd = nix::fcntl::open(
@@ -80,7 +74,6 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
 
         Box::leak(Box::new(Self {
             tun_socket_fd,
-            punchthrough_provider,
             interception_enabled: std::sync::atomic::AtomicBool::new(false),
         }))
     }
@@ -92,7 +85,7 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     /// Panics if this function has already been invoked on the platform earlier.
     pub fn enable_syscall_interception_with(
         &self,
-        syscall_handler: impl Fn(litebox_common_linux::SyscallRequest<LinuxUserland>) -> i64
+        syscall_handler: impl Fn(litebox_common_linux::SyscallRequest<LinuxUserland>) -> isize
         + Send
         + Sync
         + 'static,
@@ -112,14 +105,9 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     }
 }
 
-impl<PunchthroughProvider: litebox::platform::PunchthroughProvider> litebox::platform::Provider
-    for LinuxUserland<PunchthroughProvider>
-{
-}
+impl litebox::platform::Provider for LinuxUserland {}
 
-impl<PunchthroughProvider: litebox::platform::PunchthroughProvider> litebox::platform::ExitProvider
-    for LinuxUserland<PunchthroughProvider>
-{
+impl litebox::platform::ExitProvider for LinuxUserland {
     type ExitCode = i32;
     const EXIT_SUCCESS: Self::ExitCode = 0;
     const EXIT_FAILURE: Self::ExitCode = 1;
@@ -127,7 +115,6 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider> litebox::pla
     fn exit(&self, code: Self::ExitCode) -> ! {
         let Self {
             tun_socket_fd,
-            punchthrough_provider: _,
             interception_enabled: _,
         } = self;
         // We don't need to explicitly drop this, but doing so clarifies our intent that we want to
@@ -139,9 +126,7 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider> litebox::pla
     }
 }
 
-impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
-    litebox::platform::RawMutexProvider for LinuxUserland<PunchthroughProvider>
-{
+impl litebox::platform::RawMutexProvider for LinuxUserland {
     type RawMutex = RawMutex;
 
     fn new_raw_mutex(&self) -> Self::RawMutex {
@@ -364,9 +349,7 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 }
 
-impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
-    litebox::platform::IPInterfaceProvider for LinuxUserland<PunchthroughProvider>
-{
+impl litebox::platform::IPInterfaceProvider for LinuxUserland {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
         let tun_fd = self.tun_socket_fd.read().unwrap();
         let Some(tun_socket_fd) = tun_fd.as_ref() else {
@@ -403,9 +386,7 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     }
 }
 
-impl<PunchthroughProvider: litebox::platform::PunchthroughProvider> litebox::platform::TimeProvider
-    for LinuxUserland<PunchthroughProvider>
-{
+impl litebox::platform::TimeProvider for LinuxUserland {
     type Instant = Instant;
 
     fn now(&self) -> Self::Instant {
@@ -425,25 +406,44 @@ impl litebox::platform::Instant for Instant {
     }
 }
 
-impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
-    litebox::platform::PunchthroughProvider for LinuxUserland<PunchthroughProvider>
-{
-    type PunchthroughToken = PunchthroughProvider::PunchthroughToken;
+pub struct PunchthroughToken {
+    punchthrough: PunchthroughSyscall<LinuxUserland>,
+}
 
+impl litebox::platform::PunchthroughToken for PunchthroughToken {
+    type Punchthrough = PunchthroughSyscall<LinuxUserland>;
+    fn execute(
+        self,
+    ) -> Result<
+        <Self::Punchthrough as litebox::platform::Punchthrough>::ReturnSuccess,
+        litebox::platform::PunchthroughError<
+            <Self::Punchthrough as litebox::platform::Punchthrough>::ReturnFailure,
+        >,
+    > {
+        match self.punchthrough {
+            PunchthroughSyscall::RtSigprocmask { .. } => {
+                // TODO(jayb): Based on the specific backend of the Linux userland platform, we need
+                // to introduce the "backdoor" argument or not. For now, we just trigger a panic.
+                todo!()
+            }
+        }
+    }
+}
+
+impl litebox::platform::PunchthroughProvider for LinuxUserland {
+    type PunchthroughToken = PunchthroughToken;
     fn get_punchthrough_token_for(
         &self,
         punchthrough: <Self::PunchthroughToken as litebox::platform::PunchthroughToken>::Punchthrough,
     ) -> Option<Self::PunchthroughToken> {
-        // TODO(jayb): We may wish to make the linux userland platform less generic, and support a
-        // _specific_ syscall-based punchthrough interface?
-        self.punchthrough_provider
-            .get_punchthrough_token_for(punchthrough)
+        // TODO(jayb): Currently, we are disabling all punchthroughs. Once we get the backend
+        // parametricity working, we can switch this out to enable the punchthrough.
+        let _ = punchthrough;
+        None
     }
 }
 
-impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
-    litebox::platform::DebugLogProvider for LinuxUserland<PunchthroughProvider>
-{
+impl litebox::platform::DebugLogProvider for LinuxUserland {
     fn debug_log_print(&self, msg: &str) {
         unsafe {
             libc::syscall(
@@ -458,9 +458,7 @@ impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
     }
 }
 
-impl<PunchthroughProvider: litebox::platform::PunchthroughProvider>
-    litebox::platform::RawPointerProvider for LinuxUserland<PunchthroughProvider>
-{
+impl litebox::platform::RawPointerProvider for LinuxUserland {
     type RawConstPointer<T: Clone> = litebox::platform::trivial_providers::TransparentConstPtr<T>;
     type RawMutPointer<T: Clone> = litebox::platform::trivial_providers::TransparentMutPtr<T>;
 }

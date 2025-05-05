@@ -89,10 +89,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // TODO: We also need to pick the type of syscall interception based on whether we want
     // systrap/sigsys interception, or binary rewriting interception. Currently
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
-    let platform = Platform::new(
-        None,
-        litebox::platform::trivial_providers::ImpossiblePunchthroughProvider {},
-    );
+    let platform = Platform::new(None);
     let litebox = LiteBox::new(platform);
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
