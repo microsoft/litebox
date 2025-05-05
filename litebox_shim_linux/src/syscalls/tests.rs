@@ -1,11 +1,11 @@
-use litebox::{fs::OFlags, platform::trivial_providers::ImpossiblePunchthroughProvider};
+use litebox::fs::OFlags;
 use litebox_common_linux::{EfdFlags, FcntlArg, FileDescriptorFlags};
 use litebox_platform_multiplex::{Platform, set_platform};
 
 use super::file::{sys_eventfd2, sys_fcntl, sys_pipe2};
 
 pub(crate) fn init_platform() {
-    set_platform(Platform::new(None, ImpossiblePunchthroughProvider {}));
+    set_platform(Platform::new(None));
 
     let platform = litebox_platform_multiplex::platform();
     let litebox = litebox::LiteBox::new(platform);

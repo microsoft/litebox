@@ -467,5 +467,40 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         flags: litebox::fs::OFlags,
     },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
-    Ret(i64),
+    Ret(isize),
+}
+
+/// A set of syscalls that are allowed to be punched through to platforms that work with the Linux
+/// shim.
+///
+/// NOTE: It is assumed that all punchthroughs here are non-blocking.
+pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
+    /// Examine and change blocked signals
+    RtSigprocmask {
+        /// The behavior of the call is dependent on the value of how
+        ///
+        /// * `SIG_BLOCK` (0): The set of blocked signals is the union of the current set and the `set`
+        ///   argument.
+        ///
+        /// * `SIG_UNBLOCK` (1): The signals in `set` are removed from the current set of blocked
+        ///   signals. It is permissible to attempt to unblock a signal which is not blocked.
+        ///
+        /// * `SIG_SETMASK` (2): The set of blocked signals is set to the argument `set`.
+        how: i32,
+        /// If `set` is NULL, then the signal mask is unchanged (i.e., `how` is ignored), but the
+        /// current value of the signal mask is nevertheless returned in `oldset` (if it is not
+        /// NULL).
+        set: Platform::RawConstPointer<u8>,
+        /// If `oldset` is non-NULL, the previous value of the signal mask is stored in `oldset`.
+        old_set: Platform::RawMutPointer<u8>,
+        /// Specifies the size in bytes of the signal sets in `set` and `oldset`.
+        sigsetsize: usize,
+    },
+}
+
+impl<Platform: litebox::platform::RawPointerProvider> litebox::platform::Punchthrough
+    for PunchthroughSyscall<Platform>
+{
+    type ReturnSuccess = usize;
+    type ReturnFailure = errno::Errno;
 }

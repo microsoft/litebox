@@ -255,7 +255,7 @@ const MAX_KERNEL_BUF_SIZE: usize = 64 * 1024;
 
 /// Entry point for the syscall handler
 #[allow(clippy::too_many_lines)]
-pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
+pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
     let res: Result<usize, Errno> = match request {
         SyscallRequest::Read { fd, buf, count } => {
             let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
@@ -408,12 +408,21 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
     };
 
     res.map_or_else(
-        |e| i64::from(e.as_neg()),
-        |val| {
-            let Ok(v) = i64::try_from(val) else {
-                // Note in case where val is an address (e.g., returned from `mmap`), it assumes
-                // user space address does not exceed i64::MAX (0x7FFF_FFFF_FFFF_FFFF).
-                // For Linux the max user address is 0x7FFF_FFFF_F000.
+        |e| {
+            let e: i32 = e.as_neg();
+            let Ok(e) = isize::try_from(e) else {
+                // On both 32-bit and 64-bit, this should never be triggered
+                unreachable!()
+            };
+            e
+        },
+        |val: usize| {
+            let Ok(v) = isize::try_from(val) else {
+                // Note in case where val is an address (e.g., returned from `mmap`), we currently
+                // assume user space address does not exceed isize::MAX. On 64-bit, the max user
+                // address is 0x7FFF_FFFF_F000, which is below this; for 32-bit, this may not hold,
+                // and we might need to de-restrict this if ever seen in practice. For now, we are
+                // keeping the stricter version.
                 unreachable!("invalid user pointer");
             };
             v

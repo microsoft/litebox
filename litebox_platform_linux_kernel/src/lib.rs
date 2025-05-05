@@ -14,6 +14,7 @@ use litebox::platform::{
     PunchthroughToken, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
 };
 use litebox::platform::{RawMutex as _, RawPointerProvider};
+use litebox_common_linux::PunchthroughSyscall;
 use litebox_common_linux::errno::Errno;
 use ptr::{UserConstPtr, UserMutPtr};
 
@@ -33,30 +34,13 @@ pub struct LinuxKernel<Host: HostInterface> {
     page_table: mm::PageTable<4096>,
 }
 
-/// Punchthrough for syscalls
-/// Note we assume all punchthroughs are non-blocking
-pub enum LinuxPunchthrough {
-    RtSigprocmask {
-        how: i32,
-        set: UserConstPtr<sigset_t>,
-        old_set: UserMutPtr<sigset_t>,
-        sigsetsize: usize,
-    },
-    // TODO: Add more syscalls
-}
-
-impl Punchthrough for LinuxPunchthrough {
-    type ReturnSuccess = usize;
-    type ReturnFailure = Errno;
-}
-
 pub struct LinuxPunchthroughToken<Host: HostInterface> {
-    punchthrough: LinuxPunchthrough,
+    punchthrough: PunchthroughSyscall<LinuxKernel<Host>>,
     host: core::marker::PhantomData<Host>,
 }
 
 impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
-    type Punchthrough = LinuxPunchthrough;
+    type Punchthrough = PunchthroughSyscall<LinuxKernel<Host>>;
 
     fn execute(
         self,
@@ -65,12 +49,12 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
         litebox::platform::PunchthroughError<<Self::Punchthrough as Punchthrough>::ReturnFailure>,
     > {
         let r = match self.punchthrough {
-            LinuxPunchthrough::RtSigprocmask {
+            PunchthroughSyscall::RtSigprocmask {
                 how,
                 set,
                 old_set,
                 sigsetsize,
-            } => Host::rt_sigprocmask(how, set, old_set, sigsetsize),
+            } => Host::rt_sigprocmask(how, set.cast(), old_set.cast(), sigsetsize),
         };
         match r {
             Ok(v) => Ok(v),
@@ -162,10 +146,10 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         old_set: UserMutPtr<sigset_t>,
         sigsetsize: usize,
     ) -> Result<usize, PunchthroughError<Errno>> {
-        let punchthrough = LinuxPunchthrough::RtSigprocmask {
+        let punchthrough = PunchthroughSyscall::RtSigprocmask {
             how,
-            set,
-            old_set,
+            set: set.cast(),
+            old_set: old_set.cast(),
             sigsetsize,
         };
         let token = self

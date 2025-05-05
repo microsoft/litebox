@@ -10,7 +10,7 @@ pub(crate) mod systrap {
     pub(crate) const SYSCALL_ARG_MAGIC: u32 = u32::from_le_bytes(*b"LtBx");
 
     pub(crate) fn init_sys_intercept(
-        _handler: impl Fn(SyscallRequest<crate::LinuxUserland>) -> i64 + Send + Sync + 'static,
+        _handler: impl Fn(SyscallRequest<crate::LinuxUserland>) -> isize + Send + Sync + 'static,
     ) {
         // TODO: Actually start intercepting syscalls on 32-bit Linux.
         //
