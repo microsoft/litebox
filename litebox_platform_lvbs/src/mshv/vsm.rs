@@ -2,12 +2,16 @@
 
 use crate::{
     mshv::{
+        HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
+        HV_REGISTER_CR_INTERCEPT_CR4_MASK, HvCrInterceptControlFlags, HvPageProtFlags,
         VSM_VTL_CALL_FUNC_ID_BOOT_APS, VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY,
         VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL, VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT,
         VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE, VSM_VTL_CALL_FUNC_ID_LOAD_KDATA,
         VSM_VTL_CALL_FUNC_ID_LOCK_REGS, VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY,
         VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT, VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE,
-        VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, hvcall_vp::init_vtl_aps,
+        VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags, X86Cr4Flags,
+        hvcall_mm::hv_modify_vtl_protection_mask,
+        hvcall_vp::{hvcall_set_vp_registers, init_vtl_aps},
     },
     serial_println,
 };
@@ -44,7 +48,49 @@ pub fn mshv_vsm_boot_aps(_cpu_online_mask_pfn: u64, _boot_signal_pfn: u64) -> u6
 pub fn mshv_vsm_lock_regs() -> u64 {
     #[cfg(debug_assertions)]
     serial_println!("VSM: Lock control registers");
-    // TODO: lock control registers
+
+    let flag = HvCrInterceptControlFlags::CR0_WRITE.bits()
+        | HvCrInterceptControlFlags::CR4_WRITE.bits()
+        | HvCrInterceptControlFlags::GDTR_WRITE.bits()
+        | HvCrInterceptControlFlags::IDTR_WRITE.bits()
+        | HvCrInterceptControlFlags::LDTR_WRITE.bits()
+        | HvCrInterceptControlFlags::TR_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_LSTAR_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_STAR_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_CSTAR_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_APIC_BASE_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_EFER_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_SYSENTER_CS_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_SYSENTER_ESP_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_SYSENTER_EIP_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_SFMASK_WRITE.bits();
+
+    if let Err(result) = hvcall_set_vp_registers(HV_REGISTER_CR_INTERCEPT_CONTROL, flag, 0) {
+        serial_println!("Err: {:?}", result);
+        let err: u32 = result.into();
+        return err.into();
+    }
+
+    if let Err(result) = hvcall_set_vp_registers(
+        HV_REGISTER_CR_INTERCEPT_CR4_MASK,
+        X86Cr4Flags::CR4_PIN_MASK.bits().into(),
+        0,
+    ) {
+        serial_println!("Err: {:?}", result);
+        let err: u32 = result.into();
+        return err.into();
+    }
+
+    if let Err(result) = hvcall_set_vp_registers(
+        HV_REGISTER_CR_INTERCEPT_CR0_MASK,
+        X86Cr0Flags::CR0_PIN_MASK.bits().into(),
+        0,
+    ) {
+        serial_println!("Err: {:?}", result);
+        let err: u32 = result.into();
+        return err.into();
+    }
+
     0
 }
 
@@ -57,10 +103,26 @@ pub fn mshv_vsm_end_of_boot() -> u64 {
 }
 
 /// VSM function for protecting certain memory range
-pub fn mshv_vsm_protect_memory(_pa: u64, _nranges: u64) -> u64 {
+pub fn mshv_vsm_protect_memory(_pa: u64, nranges: u64) -> u64 {
     #[cfg(debug_assertions)]
     serial_println!("VSM: Protect memory");
-    // TODO: protect memory using hv_modify_protection_mask()
+
+    // TODO: mmap pa
+
+    // TODO: walk the ranges and apply the permissions for each guest page
+    for _r in 0..nranges {
+        // TODO: get the range info from pa
+        let start = 0;
+        let num = 0;
+        let prot = HvPageProtFlags::HV_PAGE_FULL_ACCESS;
+
+        if let Err(result) = hv_modify_vtl_protection_mask(start, num, prot) {
+            serial_println!("Err: {:?}", result);
+            let err: u32 = result.into();
+            return err.into();
+        }
+    }
+
     0
 }
 
@@ -116,6 +178,11 @@ pub fn mshv_vsm_kexec_validate(_pa: u64, _nranges: u64, _crash: u64) -> u64 {
 /// # Panics
 /// Panics if VTL call parameter 0 is greater than u32::MAX
 pub fn vsm_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> u64 {
+    if params[0] > u32::MAX.into() {
+        serial_println!("VSM: Unknown function ID {:#x}", params[0]);
+        return 1;
+    }
+
     match VSMFunction::try_from(u32::try_from(params[0]).expect("VTL call param 0"))
         .unwrap_or(VSMFunction::Unknown)
     {
@@ -133,7 +200,7 @@ pub fn vsm_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> u64 {
         VSMFunction::CopySecondaryKey => mshv_vsm_copy_secondary_key(params[1], params[2]),
         VSMFunction::KexecValidate => mshv_vsm_kexec_validate(params[1], params[2], params[3]),
         VSMFunction::Unknown => {
-            serial_println!("VSM: Unknown function");
+            serial_println!("VSM: Unknown function ID {:#x}", params[0]);
 
             1
         }

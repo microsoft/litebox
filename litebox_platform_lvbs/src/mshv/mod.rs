@@ -1,10 +1,13 @@
 //! Hyper-V-specific code
 
 pub mod hvcall;
+mod hvcall_mm;
 mod hvcall_vp;
 mod vsm;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
+
+use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 
 pub const HV_HYPERCALL_REP_COMP_MASK: u64 = 0xfff_0000_0000;
 pub const HV_HYPERCALL_REP_COMP_OFFSET: u32 = 32;
@@ -55,6 +58,10 @@ pub const HVCALL_ENABLE_VP_VTL: u16 = 0x_000f;
 pub const HVCALL_GET_VP_REGISTERS: u16 = 0x_0050;
 pub const HVCALL_SET_VP_REGISTERS: u16 = 0x_0051;
 
+pub const HV_REGISTER_CR_INTERCEPT_CONTROL: u32 = 0x_000e_0000;
+pub const HV_REGISTER_CR_INTERCEPT_CR0_MASK: u32 = 0x_000e_0001;
+pub const HV_REGISTER_CR_INTERCEPT_CR4_MASK: u32 = 0x_000e_0002;
+
 pub const VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL: u32 = 0x1_ffe0;
 pub const VSM_VTL_CALL_FUNC_ID_BOOT_APS: u32 = 0x1_ffe1;
 pub const VSM_VTL_CALL_FUNC_ID_LOCK_REGS: u32 = 0x1_ffe2;
@@ -67,7 +74,23 @@ pub const VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE: u32 = 0x1_ffe8;
 pub const VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY: u32 = 0x1_ffe9;
 pub const VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE: u32 = 0x1_ffea;
 
-pub const CR4_PIN_MASK: u64 = 0xffff_ffff_ffff_de3fu64;
+bitflags::bitflags! {
+    #[derive(Debug, PartialEq)]
+    pub struct HvPageProtFlags: u32 {
+        const HV_PAGE_ACCESS_NONE = 0x0;
+        const HV_PAGE_READABLE = 0x1;
+        const HV_PAGE_WRITABLE = 0x2;
+        const HV_PAGE_KERNEL_EXECUTABLE = 0x4;
+        const HV_PAGE_USER_EXECUTABLE = 0x8;
+
+        const _ = !0;
+
+        const HV_PAGE_EXECUTABLE = Self::HV_PAGE_KERNEL_EXECUTABLE.bits() | Self::HV_PAGE_USER_EXECUTABLE.bits();
+        const HV_PAGE_FULL_ACCESS = Self::HV_PAGE_READABLE.bits()
+            | Self::HV_PAGE_WRITABLE.bits()
+            | Self::HV_PAGE_EXECUTABLE.bits();
+    }
+}
 
 #[derive(Default, Clone, Copy)]
 #[repr(C, packed)]
@@ -85,6 +108,23 @@ pub struct HvX64SegmentRegister {
 }
 
 impl HvX64SegmentRegister {
+    const SEGMENT_TYPE_MASK: u16 = 0xf;
+    const NON_SYSTEM_SEGMANT_MASK: u16 = 0x10;
+    const DESCRIPTOR_PRIVILEGE_LEVEL_MASK: u16 = 0x60;
+    const PRESENT_MASK: u16 = 0x80;
+    const AVAILABLE_MASK: u16 = 0x1000;
+    const LONG_MASK: u16 = 0x2000;
+    const DEFAULT_MASK: u16 = 0x4000;
+    const GRANULARITY_MASK: u16 = 0x8000;
+    const SEGMENT_TYPE_SHIFT: u16 = 0;
+    const NON_SYSTEM_SEGMANT_SHIFT: u16 = 4;
+    const DESCRIPTOR_PRIVILEGE_LEVEL_SHIFT: u16 = 5;
+    const PRESENT_SHIFT: u16 = 7;
+    const AVAILABLE_SHIFT: u16 = 12;
+    const LONG_SHIFT: u16 = 13;
+    const DEFAULT_SHIFT: u16 = 14;
+    const GRANULARITY_SHIFT: u16 = 15;
+
     pub fn new() -> Self {
         HvX64SegmentRegister {
             ..Default::default()
@@ -94,6 +134,55 @@ impl HvX64SegmentRegister {
     #[expect(clippy::used_underscore_binding)]
     pub fn set_attributes(&mut self, attrs: u16) {
         self._attributes = attrs;
+    }
+
+    #[expect(clippy::used_underscore_binding)]
+    fn set_sub_attribute(&mut self, shift: u16, mask: u16, value: u16) {
+        self._attributes |= (value << shift) & mask;
+    }
+
+    pub fn set_segment_type(&mut self, segment_type: u16) {
+        self.set_sub_attribute(
+            Self::SEGMENT_TYPE_SHIFT,
+            Self::SEGMENT_TYPE_MASK,
+            segment_type,
+        );
+    }
+
+    pub fn set_non_system_segment(&mut self, nss: u16) {
+        self.set_sub_attribute(
+            Self::NON_SYSTEM_SEGMANT_SHIFT,
+            Self::NON_SYSTEM_SEGMANT_MASK,
+            nss,
+        );
+    }
+
+    pub fn set_descriptor_privilege_level(&mut self, dpl: u16) {
+        self.set_sub_attribute(
+            Self::DESCRIPTOR_PRIVILEGE_LEVEL_SHIFT,
+            Self::DESCRIPTOR_PRIVILEGE_LEVEL_MASK,
+            dpl,
+        );
+    }
+
+    pub fn set_present(&mut self, present: u16) {
+        self.set_sub_attribute(Self::PRESENT_SHIFT, Self::PRESENT_MASK, present);
+    }
+
+    pub fn set_available(&mut self, available: u16) {
+        self.set_sub_attribute(Self::AVAILABLE_SHIFT, Self::AVAILABLE_MASK, available);
+    }
+
+    pub fn set_long(&mut self, long: u16) {
+        self.set_sub_attribute(Self::LONG_SHIFT, Self::LONG_MASK, long);
+    }
+
+    pub fn set_default(&mut self, default: u16) {
+        self.set_sub_attribute(Self::DEFAULT_SHIFT, Self::DEFAULT_MASK, default);
+    }
+
+    pub fn set_granularity(&mut self, granularity: u16) {
+        self.set_sub_attribute(Self::GRANULARITY_SHIFT, Self::GRANULARITY_MASK, granularity);
     }
 }
 
@@ -149,6 +238,10 @@ pub struct HvInputVtl {
 }
 
 impl HvInputVtl {
+    const TARGET_VTL_MASK: u8 = 0xf;
+    const USE_TARGET_VTL_MASK: u8 = 0x10;
+    const USE_TARGET_VTL_SHIFT: u8 = 4;
+
     pub fn new() -> Self {
         HvInputVtl {
             ..Default::default()
@@ -157,7 +250,13 @@ impl HvInputVtl {
 
     #[expect(clippy::used_underscore_binding)]
     pub fn set_target_vtl(&mut self, target_vtl: u8) {
-        self._as_uint8 |= target_vtl & 0xf;
+        self._as_uint8 |= target_vtl & Self::TARGET_VTL_MASK;
+    }
+
+    #[expect(clippy::used_underscore_binding)]
+    pub fn set_use_target_vtl(&mut self, use_target_vtl: u8) {
+        self._as_uint8 |=
+            (use_target_vtl << Self::USE_TARGET_VTL_SHIFT) & Self::USE_TARGET_VTL_MASK;
     }
 }
 
@@ -223,12 +322,36 @@ pub struct HvNestedEnlightenmentsControlFeatures {
     // directhypercall: 1, reserved: 31
 }
 
+impl HvNestedEnlightenmentsControlFeatures {
+    const DIRECTHYPERCALL_MASK: u32 = 0x1;
+    pub fn new() -> Self {
+        HvNestedEnlightenmentsControlFeatures { _raw: 0 }
+    }
+
+    #[expect(clippy::used_underscore_binding)]
+    pub fn set_direct_hypercall(&mut self, direct_hypercall: u32) {
+        self._raw |= direct_hypercall & Self::DIRECTHYPERCALL_MASK;
+    }
+}
+
 #[derive(Default, Clone, Copy)]
 #[repr(C, packed)]
 pub struct HvNestedEnlightenmentsControlHypercallControls {
     _raw: u32,
     // union of
     // inter_partition_comm: 1, reserved: 31
+}
+
+impl HvNestedEnlightenmentsControlHypercallControls {
+    const INTER_PARTITION_COMM_MASK: u32 = 0x1;
+    pub fn new() -> Self {
+        HvNestedEnlightenmentsControlHypercallControls { _raw: 0 }
+    }
+
+    #[expect(clippy::used_underscore_binding)]
+    pub fn set_inter_partition_comm(&mut self, inter_partition_comm: u32) {
+        self._raw |= inter_partition_comm & Self::INTER_PARTITION_COMM_MASK;
+    }
 }
 
 #[expect(non_snake_case)]
@@ -286,5 +409,128 @@ impl HvVpAssistPage {
 impl Default for HvVpAssistPage {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// We do not support Hyper-V hypercalls with multiple input pages (a large request must be broken down).
+// Thus, the number of maximum GPA pages that each hypercall can protect is restricted like below.
+pub(crate) const HV_MODIFY_MAX_PAGES: usize =
+    (PAGE_SIZE - core::mem::size_of::<u64>() * 2) / core::mem::size_of::<u64>();
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvInputModifyVtlProtectionMask {
+    pub partition_id: u64,
+    pub map_flags: u32,
+    pub target_vtl: HvInputVtl,
+    reserved8_z: u8,
+    reserved16_z: u16,
+    pub gpa_page_list: [u64; HV_MODIFY_MAX_PAGES], // variable-length array
+}
+
+impl HvInputModifyVtlProtectionMask {
+    pub fn new() -> Self {
+        HvInputModifyVtlProtectionMask {
+            partition_id: 0,
+            map_flags: 0,
+            target_vtl: HvInputVtl::new(),
+            reserved8_z: 0,
+            reserved16_z: 0,
+            gpa_page_list: [0u64; HV_MODIFY_MAX_PAGES],
+        }
+    }
+}
+
+impl Default for HvInputModifyVtlProtectionMask {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, PartialEq)]
+    pub struct X86Cr4Flags: u32 {
+        const X86_CR4_VME = 1 << 0;
+        const X86_CR4_PVI = 1 << 1;
+        const X86_CR4_TSD = 1 << 2;
+        const X86_CR4_DE = 1 << 3;
+        const X86_CR4_PSE = 1 << 4;
+        const X86_CR4_PAE = 1 << 5;
+        const X86_CR4_MCE = 1 << 6;
+        const X86_CR4_PGE = 1 << 7;
+        const X86_CR4_PCE = 1 << 8;
+        const X86_CR4_OSFXSR = 1 << 8;
+        const X86_CR4_OSXMMEXCPT = 1 << 10;
+        const X86_CR4_UMIP = 1 << 11;
+        const X86_CR4_LA57 = 1 << 12;
+        const X86_CR4_VMXE = 1 << 13;
+        const X86_CR4_SMXE = 1 << 14;
+        const X86_CR4_FSGBASE = 1 << 16;
+        const X86_CR4_PCIDE = 1 << 17;
+        const X86_CR4_OSXSAVE = 1 << 18;
+        const X86_CR4_SMEP = 1 << 20;
+        const X86_CR4_SMAP = 1 << 21;
+        const X86_CR4_PKE = 1 << 22;
+
+        const _ = !0;
+
+        const CR4_PIN_MASK = !(Self::X86_CR4_MCE.bits()
+            | Self::X86_CR4_PGE.bits()
+            | Self::X86_CR4_PCE.bits()
+            | Self::X86_CR4_VMXE.bits());
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, PartialEq)]
+    pub struct X86Cr0Flags: u32 {
+        const X86_CR0_PE = 1 << 0;
+        const X86_CR0_MP = 1 << 1;
+        const X86_CR0_EM = 1 << 2;
+        const X86_CR0_TS = 1 << 3;
+        const X86_CR0_ET = 1 << 4;
+        const X86_CR0_NE = 1 << 5;
+        const X86_CR0_WP = 1 << 16;
+        const X86_CR0_AM = 1 << 18;
+        const X86_CR0_NW = 1 << 29;
+        const X86_CR0_CD = 1 << 30;
+        const X86_CR0_PG = 1 << 31;
+
+        const _ = !0;
+
+        const CR0_PIN_MASK = Self::X86_CR0_PE.bits() | Self::X86_CR0_WP.bits() | Self::X86_CR0_PG.bits();
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, PartialEq)]
+    pub struct HvCrInterceptControlFlags: u64 {
+        const CR0_WRITE = 1 << 0;
+        const CR4_WRITE = 1 << 1;
+        const XCR0_WRITE = 1 << 2;
+        const IA32MISCENABLE_READ = 1 << 3;
+        const IA32MISCENABLE_WRITE = 1 << 4;
+        const MSR_LSTAR_READ = 1 << 5;
+        const MSR_LSTAR_WRITE = 1 << 6;
+        const MSR_STAR_READ = 1 << 7;
+        const MSR_STAR_WRITE = 1 << 8;
+        const MSR_CSTAR_READ = 1 << 9;
+        const MSR_CSTAR_WRITE = 1 << 10;
+        const MSR_APIC_BASE_READ = 1 << 11;
+        const MSR_APIC_BASE_WRITE = 1 << 12;
+        const MSR_EFER_READ = 1 << 13;
+        const MSR_EFER_WRITE = 1 << 14;
+        const GDTR_WRITE = 1 << 15;
+        const IDTR_WRITE = 1 << 16;
+        const LDTR_WRITE = 1 << 17;
+        const TR_WRITE = 1 << 18;
+        const MSR_SYSENTER_CS_WRITE = 1 << 19;
+        const MSR_SYSENTER_EIP_WRITE = 1 << 20;
+        const MSR_SYSENTER_ESP_WRITE = 1 << 21;
+        const MSR_SFMASK_WRITE = 1 << 22;
+        const MSR_TSC_AUX_WRITE = 1 << 23;
+        const MSR_SGX_LAUNCH_CTRL_WRITE = 1 << 24;
+
+        const _ = !0;
     }
 }

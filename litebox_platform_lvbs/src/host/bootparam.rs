@@ -1,4 +1,4 @@
-//! Linx kernel boot params
+//! VTL1 kernel boot parameters (compatible with Linux kernel's boot_params structure)
 
 use crate::{mshv::vtl1_mem_layout::VtlMemoryError, serial_println};
 use num_enum::TryFromPrimitive;
@@ -57,9 +57,8 @@ impl BootParams {
     pub fn dump(&self) {
         for entry in self.e820_table {
             let typ_val = entry.typ;
-            let typ_val = E820Type::from_u32(typ_val);
 
-            if typ_val == E820Type::Unknown {
+            if E820Type::try_from(typ_val).unwrap_or(E820Type::Unknown) == E820Type::Unknown {
                 break;
             } else {
                 let addr_val = entry.addr;
@@ -77,13 +76,16 @@ impl BootParams {
     pub fn memory_info(&self) -> Result<(u64, u64), VtlMemoryError> {
         for entry in self.e820_table {
             let typ_val = entry.typ;
-            match E820Type::from_u32(typ_val) {
+
+            match E820Type::try_from(typ_val).unwrap_or(E820Type::Unknown) {
                 E820Type::Ram => {
                     let addr_val = entry.addr;
                     let size_val = entry.size;
                     return Ok((addr_val, size_val));
                 }
-                E820Type::Unknown => return Err(VtlMemoryError::InvalidBootParams),
+                E820Type::Unknown => {
+                    return Err(VtlMemoryError::InvalidBootParams);
+                }
                 _ => {}
             }
         }
@@ -111,20 +113,4 @@ pub enum E820Type {
     Pram = E820_PRAM,
     ReservedKern = E820_RESERVED_KERN,
     Unknown = 0xffff_ffff,
-}
-
-impl E820Type {
-    pub fn from_u32(value: u32) -> Self {
-        match value {
-            E820_RAM => E820Type::Ram,
-            E820_RESERVED => E820Type::Reserved,
-            E820_ACPI => E820Type::Acpi,
-            E820_NVS => E820Type::Nvs,
-            E820_UNUSABLE => E820Type::Unusable,
-            E820_PMEM => E820Type::Pmem,
-            E820_PRAM => E820Type::Pram,
-            E820_RESERVED_KERN => E820Type::ReservedKern,
-            _ => E820Type::Unknown,
-        }
-    }
 }

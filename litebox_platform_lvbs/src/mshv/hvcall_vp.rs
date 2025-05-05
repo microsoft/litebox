@@ -5,7 +5,7 @@ use crate::{
         instrs::rdmsr,
         msr::{MSR_EFER, MSR_IA32_CR_PAT},
     },
-    kernel_context::MAX_CORES,
+    kernel_context::{MAX_CORES, get_per_core_kernel_context},
     mshv::{
         HV_PARTITION_ID_SELF, HV_VP_INDEX_SELF, HV_VTL_SECURE, HVCALL_ENABLE_VP_VTL,
         HVCALL_SET_VP_REGISTERS, HvEnableVpVtl, HvSetVpRegistersInput,
@@ -18,13 +18,18 @@ use crate::{
 };
 
 /// Hyper-V Hypercall to set virtual processor (VP) registers
-#[expect(dead_code)]
 pub fn hvcall_set_vp_registers(
     reg_name: u32,
     value: u64,
     input_vtl: u8,
 ) -> Result<u64, HypervCallError> {
-    let mut hvin = HvSetVpRegistersInput::new();
+    let kernel_context = get_per_core_kernel_context();
+    let hvin = unsafe {
+        &mut *kernel_context
+            .hv_hypercall_input_page_as_mut_ptr()
+            .cast::<HvSetVpRegistersInput>()
+    };
+    *hvin = HvSetVpRegistersInput::new();
 
     hvin.header.partitionid = HV_PARTITION_ID_SELF;
     hvin.header.vpindex = HV_VP_INDEX_SELF;

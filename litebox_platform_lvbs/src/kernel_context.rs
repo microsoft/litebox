@@ -19,6 +19,7 @@ pub struct KernelContext {
     _guard_page_0: [u8; PAGE_SIZE],
     pub kernel_stack: [u8; KERNEL_STACK_SIZE],
     _guard_page_1: [u8; PAGE_SIZE],
+    pub hvcall_input: [u8; PAGE_SIZE],
     pub tss: gdt::AlignedTss,
     pub vtl0_state: VtlState,
     pub vtl1_state: VtlState,
@@ -49,6 +50,11 @@ impl KernelContext {
     pub fn hv_hypercall_page_as_u64(&self) -> u64 {
         get_hypercall_page_address()
     }
+
+    pub fn hv_hypercall_input_page_as_mut_ptr(&mut self) -> *mut [u8; PAGE_SIZE] {
+        self.hvcall_input = [0u8; PAGE_SIZE];
+        &raw mut self.hvcall_input
+    }
 }
 
 // TODO: use heap
@@ -58,6 +64,7 @@ static mut PER_CORE_KERNEL_CONTEXT: [KernelContext; MAX_CORES] = [KernelContext 
     _guard_page_0: [0u8; PAGE_SIZE],
     kernel_stack: [0u8; KERNEL_STACK_SIZE],
     _guard_page_1: [0u8; PAGE_SIZE],
+    hvcall_input: [0u8; PAGE_SIZE],
     tss: gdt::AlignedTss(TaskStateSegment::new()),
     vtl0_state: VtlState {
         rbp: 0,
