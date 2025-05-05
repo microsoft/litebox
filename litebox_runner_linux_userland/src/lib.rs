@@ -68,6 +68,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .collect();
         let data = std::fs::read(prog).unwrap();
         let data = if cli_args.rewrite_syscalls {
+            // capstone declares a global allocator in conflict with our own.
+            // https://github.com/capstone-rust/capstone-rs/blob/14e855ca58400f454cb7ceb87d2c5e7b635ce498/capstone-rs/src/lib.rs#L16
             // litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
             todo!()
         } else {

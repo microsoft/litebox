@@ -18,18 +18,33 @@ macro_rules! mock_log_println {
 
 impl HostInterface for MockHostInterface {
     fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
-        assert!(layout.size() <= 0x40_0000); // 4MB
         let size = core::cmp::max(
             layout.size().next_power_of_two(),
-            core::cmp::max(layout.align(), 0x1000),
+            // Note `mmap` provides no guarantee of alignment, so we double the size to ensure we
+            // can always find a required chunk within the returned memory region.
+            core::cmp::max(layout.align(), 0x1000) << 1,
         );
-        let addr = unsafe { libc::memalign(layout.align(), size) };
-        assert_ne!(addr, libc::MAP_FAILED);
-        Some((addr as usize, size))
+        let addr = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                size << 1,
+                litebox_common_linux::ProtFlags::PROT_READ_WRITE.bits(),
+                (litebox_common_linux::MapFlags::MAP_PRIVATE
+                    | litebox_common_linux::MapFlags::MAP_ANON)
+                    .bits(),
+                -1,
+                0,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            None
+        } else {
+            Some((addr as usize, size << 1))
+        }
     }
 
-    unsafe fn free(addr: usize) {
-        unsafe { libc::free(addr as *mut _) };
+    unsafe fn free(_addr: usize) {
+        todo!()
     }
 
     fn terminate(_reason_set: u64, _reason_code: u64) -> ! {
