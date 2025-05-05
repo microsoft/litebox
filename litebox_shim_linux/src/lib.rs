@@ -22,9 +22,9 @@ use litebox::{
     LiteBox,
     fs::FileSystem,
     mm::{PageManager, linux::PAGE_SIZE},
-    platform::{RawConstPointer as _, RawMutPointer as _},
+    platform::{ExitProvider as _, RawConstPointer as _, RawMutPointer as _},
     sync::RwLock,
-    utils::{ReinterpretSignedExt as _, TruncateExt as _},
+    utils::{ReinterpretSignedExt, TruncateExt as _},
 };
 use litebox_common_linux::{SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
@@ -584,9 +584,9 @@ unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) 
             buf: unsafe { core::mem::transmute::<usize, ConstPtr<u8>>(syscall_args[1]) },
             count: syscall_args[2],
         },
-        ::syscalls::Sysno::exit => litebox_platform_multiplex::platform().exit(syscall_args[0]),
-        ::syscalls::Sysno::exit_group => {
-            litebox_platform_multiplex::platform().exit_group(syscall_args[0])
+        ::syscalls::Sysno::exit | ::syscalls::Sysno::exit_group => {
+            litebox_platform_multiplex::platform()
+                .exit(syscall_args[0].reinterpret_as_signed().truncate())
         }
         _ => todo!("syscall {sysno} not implemented"),
     };
