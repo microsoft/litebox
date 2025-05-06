@@ -303,6 +303,9 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
         } => {
             syscalls::mm::sys_mmap(addr, length, prot, flags, fd, offset).map(|ptr| ptr.as_usize())
         }
+        SyscallRequest::Mprotect { addr, length, prot } => {
+            syscalls::mm::sys_mprotect(addr, length, prot).map(|()| 0)
+        }
         SyscallRequest::Munmap { addr, length } => {
             syscalls::mm::sys_munmap(addr, length).map(|()| 0)
         }

@@ -393,6 +393,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         fd: i32,
         offset: usize,
     },
+    Mprotect {
+        addr: Platform::RawMutPointer<u8>,
+        length: usize,
+        prot: ProtFlags,
+    },
     Munmap {
         addr: Platform::RawMutPointer<u8>,
         length: usize,

@@ -244,6 +244,15 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             fd: syscall_args[4].reinterpret_as_signed().truncate(),
             offset: syscall_args[5],
         },
+        libc::SYS_mprotect => SyscallRequest::Mprotect {
+            addr: TransparentMutPtr {
+                inner: syscall_args[0] as *mut u8,
+            },
+            length: syscall_args[1],
+            prot: litebox_common_linux::ProtFlags::from_bits_truncate(
+                syscall_args[2].reinterpret_as_signed().truncate(),
+            ),
+        },
         libc::SYS_munmap => SyscallRequest::Munmap {
             addr: TransparentMutPtr {
                 inner: syscall_args[0] as *mut u8,
@@ -508,7 +517,22 @@ fn register_seccomp_filter() {
                 .unwrap(),
             ],
         ),
-        (libc::SYS_mprotect, vec![]),
+        (
+            libc::SYS_mprotect,
+            vec![
+                // A backdoor to allow invoking mprotect.
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        3,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::Eq,
+                        SYSCALL_ARG_MAGIC,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            ],
+        ),
         (
             libc::SYS_munmap,
             vec![

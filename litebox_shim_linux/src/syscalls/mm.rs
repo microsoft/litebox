@@ -157,7 +157,7 @@ pub(crate) fn sys_munmap(addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errn
 
     let pm = litebox_page_manager();
     match unsafe { pm.remove_pages(addr, len) } {
-        Err(VmemUnmapError::MisAligned) => Err(Errno::EINVAL),
+        Err(VmemUnmapError::UnAligned) => Err(Errno::EINVAL),
         Err(VmemUnmapError::UnmapError(e)) => match e {
             DeallocationError::Unaligned => Err(Errno::EINVAL),
             // It is not an error if the indicated range does not contain any mapped pages.
@@ -166,4 +166,28 @@ pub(crate) fn sys_munmap(addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errn
         },
         Ok(()) => Ok(()),
     }
+}
+
+/// Handle syscall `mprotect`
+pub(crate) fn sys_mprotect(
+    addr: crate::MutPtr<u8>,
+    len: usize,
+    prot: ProtFlags,
+) -> Result<(), Errno> {
+    if addr.as_usize() & !PAGE_MASK != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if len == 0 {
+        return Ok(());
+    }
+
+    let pm = litebox_page_manager();
+    match prot {
+        ProtFlags::PROT_READ_EXEC => unsafe { pm.make_pages_executable(addr, len) },
+        ProtFlags::PROT_READ_WRITE => unsafe { pm.make_pages_writable(addr, len) },
+        ProtFlags::PROT_READ => unsafe { pm.make_pages_readable(addr, len) },
+        ProtFlags::PROT_NONE => unsafe { pm.make_pages_inaccessible(addr, len) },
+        _ => todo!("Unsupported prot flags {:?}", prot),
+    }
+    .map_err(Errno::from)
 }

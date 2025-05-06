@@ -9,12 +9,13 @@ use core::ops::Range;
 
 use alloc::vec::Vec;
 use linux::{
-    MappingError, PageFaultError, PageRange, VmFlags, Vmem, VmemPageFaultHandler, VmemUnmapError,
+    MappingError, PageFaultError, PageRange, VmFlags, Vmem, VmemPageFaultHandler, VmemProtectError,
+    VmemUnmapError,
 };
 
 use crate::{
     LiteBox,
-    platform::{PageManagementProvider, RawConstPointer},
+    platform::{PageManagementProvider, RawConstPointer, page_mgmt::MemoryRegionPermissions},
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
 
@@ -64,16 +65,17 @@ where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
         let suggested_range =
-            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::MisAligned)?;
+            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::UnAligned)?;
         let mut vmem = self.vmem.write();
         unsafe {
             vmem.create_pages(
                 suggested_range,
                 fixed_addr,
-                // create READ | WRITE pages (set MAYEXEC so we can enable it later)
-                VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD | VmFlags::VM_MAYEXEC,
-                // keep VM_READ, turn off VM_WRITE and turn on VM_EXEC
-                VmFlags::VM_READ | VmFlags::VM_EXEC | VmFlags::VM_MAYREAD | VmFlags::VM_MAYEXEC,
+                false,
+                // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the code)
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                // keep READ, turn off WRITE and turn on EXEC
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
                 op,
             )
         }
@@ -104,12 +106,11 @@ where
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
-        let flags =
-            VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE;
+        let flags = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         let suggested_range =
-            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::MisAligned)?;
+            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::UnAligned)?;
         let mut vmem = self.vmem.write();
-        unsafe { vmem.create_pages(suggested_range, fixed_addr, flags, flags, op) }
+        unsafe { vmem.create_pages(suggested_range, fixed_addr, false, flags, flags, op) }
     }
 
     /// Create read-only pages.
@@ -139,13 +140,16 @@ where
     {
         let mut vmem = self.vmem.write();
         let suggested_range =
-            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::MisAligned)?;
+            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::UnAligned)?;
         unsafe {
             vmem.create_pages(
                 suggested_range,
                 fixed_addr,
-                VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD,
-                VmFlags::VM_READ | VmFlags::VM_MAYREAD,
+                false,
+                // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the data)
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                // keep READ, turn off WRITE
+                MemoryRegionPermissions::READ,
                 op,
             )
         }
@@ -167,15 +171,11 @@ where
         len: usize,
         fixed_addr: bool,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
-        let flags = VmFlags::VM_READ
-            | VmFlags::VM_WRITE
-            | VmFlags::VM_MAYREAD
-            | VmFlags::VM_MAYWRITE
-            | VmFlags::VM_GROWSDOWN;
+        let flags = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         let mut vmem = self.vmem.write();
         let suggested_range =
-            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::MisAligned)?;
-        unsafe { vmem.create_pages(suggested_range, fixed_addr, flags, flags, |_| Ok(0)) }
+            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::UnAligned)?;
+        unsafe { vmem.create_pages(suggested_range, fixed_addr, true, flags, flags, |_| Ok(0)) }
     }
 
     /// Remove pages from the mapping.
@@ -190,8 +190,82 @@ where
     ) -> Result<(), VmemUnmapError> {
         let mut vmem = self.vmem.write();
         let start = ptr.as_usize();
-        let range = PageRange::new(start, start + len).ok_or(VmemUnmapError::MisAligned)?;
+        let range = PageRange::new(start, start + len).ok_or(VmemUnmapError::UnAligned)?;
         unsafe { vmem.remove_mapping(range) }
+    }
+
+    /// Internal common function used by `make_pages_*` to change page permissions.
+    fn change_page_permissions(
+        &self,
+        ptr: Platform::RawMutPointer<u8>,
+        len: usize,
+        new_permissions: MemoryRegionPermissions,
+    ) -> Result<(), VmemProtectError> {
+        let mut vmem = self.vmem.write();
+        let start = ptr.as_usize();
+        let range = PageRange::new(start, start + len)
+            .ok_or(VmemProtectError::InvalidRange(start..start + len))?;
+        unsafe { vmem.protect_mapping(range, new_permissions) }
+    }
+
+    /// Make pages readable and writable.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure there is no concurrent `execute` access to the memory region.
+    pub unsafe fn make_pages_writable(
+        &self,
+        ptr: Platform::RawMutPointer<u8>,
+        len: usize,
+    ) -> Result<(), VmemProtectError> {
+        self.change_page_permissions(
+            ptr,
+            len,
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+        )
+    }
+
+    /// Make pages readable and executable.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure there is no concurrent `write` access to the memory region.
+    pub unsafe fn make_pages_executable(
+        &self,
+        ptr: Platform::RawMutPointer<u8>,
+        len: usize,
+    ) -> Result<(), VmemProtectError> {
+        self.change_page_permissions(
+            ptr,
+            len,
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+        )
+    }
+
+    /// Make pages readable only.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure there is no concurrent `write/execute` access to the memory region.
+    pub unsafe fn make_pages_readable(
+        &self,
+        ptr: Platform::RawMutPointer<u8>,
+        len: usize,
+    ) -> Result<(), VmemProtectError> {
+        self.change_page_permissions(ptr, len, MemoryRegionPermissions::READ)
+    }
+
+    /// Make pages inaccessible.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure there is no concurrent access to the memory region.
+    pub unsafe fn make_pages_inaccessible(
+        &self,
+        ptr: Platform::RawMutPointer<u8>,
+        len: usize,
+    ) -> Result<(), VmemProtectError> {
+        self.change_page_permissions(ptr, len, MemoryRegionPermissions::empty())
     }
 
     /// Returns all mappings in a vector.

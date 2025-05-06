@@ -175,13 +175,34 @@ impl From<litebox::platform::page_mgmt::AllocationError> for Errno {
 impl From<litebox::mm::linux::MappingError> for Errno {
     fn from(value: litebox::mm::linux::MappingError) -> Self {
         match value {
-            litebox::mm::linux::MappingError::MisAligned => Errno::EINVAL,
+            litebox::mm::linux::MappingError::UnAligned => Errno::EINVAL,
             litebox::mm::linux::MappingError::OutOfMemory => Errno::ENOMEM,
             litebox::mm::linux::MappingError::BadFD(_) => Errno::EBADF,
             litebox::mm::linux::MappingError::NotAFile => Errno::EISDIR,
             litebox::mm::linux::MappingError::NotForReading => Errno::EACCES,
             litebox::mm::linux::MappingError::MapError(e) => e.into(),
             _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::platform::page_mgmt::PermissionUpdateError> for Errno {
+    fn from(value: litebox::platform::page_mgmt::PermissionUpdateError) -> Self {
+        match value {
+            litebox::platform::page_mgmt::PermissionUpdateError::Unaligned => Errno::EINVAL,
+            litebox::platform::page_mgmt::PermissionUpdateError::Unallocated => Errno::ENOMEM,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::mm::linux::VmemProtectError> for Errno {
+    fn from(value: litebox::mm::linux::VmemProtectError) -> Self {
+        match value {
+            litebox::mm::linux::VmemProtectError::UnAligned(_) => Errno::EINVAL,
+            litebox::mm::linux::VmemProtectError::InvalidRange(_) => Errno::ENOMEM,
+            litebox::mm::linux::VmemProtectError::NoAccess { .. } => Errno::EACCES,
+            litebox::mm::linux::VmemProtectError::ProtectError(e) => e.into(),
         }
     }
 }

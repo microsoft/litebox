@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 
 use crate::platform::{
     RawConstPointer,
+    page_mgmt::MemoryRegionPermissions,
     trivial_providers::{TransparentConstPtr, TransparentMutPtr},
 };
 
@@ -120,7 +121,7 @@ fn test_vmm_mapping() {
         unsafe {
             vmm.protect_mapping(
                 PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap(),
-                VmFlags::VM_READ | VmFlags::VM_WRITE,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
             )
         },
         // Failed to protect, remain [(0x1_0000, 0x1_2000), (0x1_4000, 0x1_c000)]
@@ -146,7 +147,7 @@ fn test_vmm_mapping() {
         unsafe {
             vmm.protect_mapping(
                 PageRange::new(start_addr, start_addr + 4 * PAGE_SIZE).unwrap(),
-                VmFlags::VM_READ | VmFlags::VM_EXEC,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
             )
         },
         // Failed to protect, remain [(0x1_0000, 0x1_c000)]
@@ -157,7 +158,7 @@ fn test_vmm_mapping() {
         unsafe {
             vmm.protect_mapping(
                 PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap(),
-                VmFlags::VM_READ | VmFlags::VM_WRITE,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
             )
         }
         .is_ok()

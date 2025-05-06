@@ -50,6 +50,28 @@ bitflags::bitflags! {
     }
 }
 
+impl From<MemoryRegionPermissions> for VmFlags {
+    fn from(value: MemoryRegionPermissions) -> Self {
+        let mut flags = VmFlags::empty();
+        flags.set(
+            VmFlags::VM_READ,
+            value.contains(MemoryRegionPermissions::READ),
+        );
+        flags.set(
+            VmFlags::VM_WRITE,
+            value.contains(MemoryRegionPermissions::WRITE),
+        );
+        flags.set(
+            VmFlags::VM_EXEC,
+            value.contains(MemoryRegionPermissions::EXEC),
+        );
+        if value.contains(MemoryRegionPermissions::SHARED) {
+            unimplemented!("SHARED permission is not supported yet");
+        }
+        flags
+    }
+}
+
 /// A non-empty range of page-aligned addresses
 #[derive(Clone, Copy)]
 pub struct PageRange<const ALIGN: usize> {
@@ -405,10 +427,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) unsafe fn protect_mapping(
         &mut self,
         range: PageRange<ALIGN>,
-        flags: VmFlags,
+        permissions: MemoryRegionPermissions,
     ) -> Result<(), VmemProtectError> {
-        // only change the access flags
-        let flags = flags & VmFlags::VM_ACCESS_FLAGS;
+        // `MemoryRegionPermissions` is a subset of `VmFlags` and we only change the access flags
+        let flags =
+            VmFlags::from_bits(u32::from(permissions.bits())).unwrap() & VmFlags::VM_ACCESS_FLAGS;
         let range = range.start..range.end;
         let mut mappings_to_change = Vec::new();
         for (r, vma) in self.vmas.overlapping(range.clone()) {
@@ -438,12 +461,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             let after = intersection.end..end;
 
             let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
-            let new_permissions =
-                MemoryRegionPermissions::from_bits_truncate(new_flags.bits().try_into().unwrap());
             // `intersection` is page aligned.
             unsafe {
                 self.platform
-                    .update_permissions(intersection.clone(), new_permissions)
+                    .update_permissions(intersection.clone(), permissions)
             }
             .map_err(|e| {
                 // restore the original mapping
@@ -472,9 +493,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
     /// existing overlapping mappings being removed.
     ///
+    /// Set `is_stack` to `true` to create a stack mapping, which allows the stack to grow downward.
+    ///
     /// `op` is a callback for caller to initialize the created pages.
     ///
-    /// `before_flags` and `after_flags` are the flags to set before and after the call to `op`.
+    /// `before_perms` and `after_perms` are the permissions to set before and after the call to `op`.
     ///
     /// # Safety
     ///
@@ -487,16 +510,30 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         &mut self,
         suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
-        before_flags: VmFlags,
-        after_flags: VmFlags,
+        is_stack: bool,
+        before_perms: MemoryRegionPermissions,
+        after_perms: MemoryRegionPermissions,
         op: F,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
-        let addr =
-            unsafe { self.create_mapping(suggested_range, VmArea::new(before_flags), fixed_addr) }
-                .ok_or(MappingError::OutOfMemory)?;
+        let addr = unsafe {
+            self.create_mapping(
+                suggested_range,
+                VmArea::new(
+                    VmFlags::from(before_perms)
+                        | VmFlags::VM_MAY_ACCESS_FLAGS
+                        | if is_stack {
+                            VmFlags::VM_GROWSDOWN
+                        } else {
+                            VmFlags::empty()
+                        },
+                ),
+                fixed_addr,
+            )
+        }
+        .ok_or(MappingError::OutOfMemory)?;
         // call the user function with the pages
         if let Err(e) = op(addr) {
             // remove the mapping if the user function fails
@@ -509,11 +546,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .unwrap();
             return Err(e);
         }
-        if before_flags != after_flags {
+        if before_perms != after_perms {
             let range =
                 PageRange::new(addr.as_usize(), addr.as_usize() + suggested_range.len()).unwrap();
             // `protect` should succeed, as we just created the mapping.
-            unsafe { self.protect_mapping(range, after_flags) }.expect("failed to protect mapping");
+            unsafe { self.protect_mapping(range, after_perms) }.expect("failed to protect mapping");
         }
         Ok(addr)
     }
@@ -575,7 +612,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
 #[derive(Error, Debug)]
 pub enum VmemUnmapError {
     #[error("arg is not aligned")]
-    MisAligned,
+    UnAligned,
     #[error("failed to unmap pages: {0}")]
     UnmapError(#[from] crate::platform::page_mgmt::DeallocationError),
 }
@@ -595,7 +632,7 @@ pub(super) enum VmemResizeError {
 #[derive(Error, Debug)]
 pub enum VmemMoveError {
     #[error("arg is not aligned")]
-    MisAligned,
+    UnAligned,
     #[error("out of memory")]
     OutOfMemory,
     #[error("remap failed: {0}")]
@@ -605,6 +642,8 @@ pub enum VmemMoveError {
 /// Error for protecting mappings
 #[derive(Error, Debug)]
 pub enum VmemProtectError {
+    #[error("the range {0:?} is not aligned")]
+    UnAligned(Range<usize>),
     #[error("the range {0:?} has no mapping memory")]
     InvalidRange(Range<usize>),
     #[error("failed to change permissions from {old:?} to {new:?}")]
@@ -618,7 +657,7 @@ pub enum VmemProtectError {
 #[derive(Error, Debug)]
 pub enum MappingError {
     #[error("arg is not aligned")]
-    MisAligned,
+    UnAligned,
     #[error("not enough memory")]
     OutOfMemory,
 
