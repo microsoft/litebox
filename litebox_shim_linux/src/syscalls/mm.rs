@@ -186,6 +186,7 @@ pub(crate) fn sys_mprotect(
         ProtFlags::PROT_READ_EXEC => unsafe { pm.make_pages_executable(addr, len) },
         ProtFlags::PROT_READ_WRITE => unsafe { pm.make_pages_writable(addr, len) },
         ProtFlags::PROT_READ => unsafe { pm.make_pages_readable(addr, len) },
+        ProtFlags::PROT_NONE => unsafe { pm.make_pages_inaccessible(addr, len) },
         _ => todo!("Unsupported prot flags {:?}", prot),
     }
     .map_err(Errno::from)

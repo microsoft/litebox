@@ -194,6 +194,20 @@ where
         unsafe { vmem.remove_mapping(range) }
     }
 
+    /// Internal common function used by `make_pages_*` to change page permissions.
+    fn change_page_permissions(
+        &self,
+        ptr: Platform::RawMutPointer<u8>,
+        len: usize,
+        new_permissions: MemoryRegionPermissions,
+    ) -> Result<(), VmemProtectError> {
+        let mut vmem = self.vmem.write();
+        let start = ptr.as_usize();
+        let range = PageRange::new(start, start + len)
+            .ok_or(VmemProtectError::InvalidRange(start..start + len))?;
+        unsafe { vmem.protect_mapping(range, new_permissions) }
+    }
+
     /// Make pages readable and writable.
     ///
     /// # Safety
@@ -204,16 +218,11 @@ where
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
     ) -> Result<(), VmemProtectError> {
-        let mut vmem = self.vmem.write();
-        let start = ptr.as_usize();
-        let range = PageRange::new(start, start + len)
-            .ok_or(VmemProtectError::InvalidRange(start..start + len))?;
-        unsafe {
-            vmem.protect_mapping(
-                range,
-                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-            )
-        }
+        self.change_page_permissions(
+            ptr,
+            len,
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+        )
     }
 
     /// Make pages readable and executable.
@@ -226,16 +235,11 @@ where
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
     ) -> Result<(), VmemProtectError> {
-        let mut vmem = self.vmem.write();
-        let start = ptr.as_usize();
-        let range = PageRange::new(start, start + len)
-            .ok_or(VmemProtectError::InvalidRange(start..start + len))?;
-        unsafe {
-            vmem.protect_mapping(
-                range,
-                MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
-            )
-        }
+        self.change_page_permissions(
+            ptr,
+            len,
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+        )
     }
 
     /// Make pages readable only.
@@ -248,11 +252,20 @@ where
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
     ) -> Result<(), VmemProtectError> {
-        let mut vmem = self.vmem.write();
-        let start = ptr.as_usize();
-        let range = PageRange::new(start, start + len)
-            .ok_or(VmemProtectError::InvalidRange(start..start + len))?;
-        unsafe { vmem.protect_mapping(range, MemoryRegionPermissions::READ) }
+        self.change_page_permissions(ptr, len, MemoryRegionPermissions::READ)
+    }
+
+    /// Make pages inaccessible.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure there is no concurrent access to the memory region.
+    pub unsafe fn make_pages_inaccessible(
+        &self,
+        ptr: Platform::RawMutPointer<u8>,
+        len: usize,
+    ) -> Result<(), VmemProtectError> {
+        self.change_page_permissions(ptr, len, MemoryRegionPermissions::empty())
     }
 
     /// Returns all mappings in a vector.
