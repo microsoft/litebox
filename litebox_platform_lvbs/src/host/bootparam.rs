@@ -1,7 +1,12 @@
 //! VTL1 kernel boot parameters (compatible with Linux kernel's boot_params structure)
 
-use crate::{mshv::vtl1_mem_layout::VtlMemoryError, serial_println};
+use crate::mshv::vtl1_mem_layout::{
+    VTL1_BOOT_PARAMS_PAGE, VtlMemoryError, get_address_of_special_page,
+};
 use num_enum::TryFromPrimitive;
+
+#[cfg(debug_assertions)]
+use crate::serial_println;
 
 // This module defines a simplified Linux boot params structure
 // (based on arch/x86/include/uapi/asm/bootparam.h and
@@ -54,6 +59,7 @@ impl BootParams {
         }
     }
 
+    #[cfg(debug_assertions)]
     pub fn dump(&self) {
         for entry in self.e820_table {
             let typ_val = entry.typ;
@@ -98,6 +104,20 @@ impl Default for BootParams {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(debug_assertions)]
+pub fn dump_boot_params() {
+    let boot_params = get_address_of_special_page(VTL1_BOOT_PARAMS_PAGE) as *const BootParams;
+    unsafe {
+        (*boot_params).dump();
+    }
+}
+
+/// Funtion to get the guest physical start address and size of VTL1 memory
+pub fn get_vtl1_memory_info() -> Result<(u64, u64), VtlMemoryError> {
+    let boot_params = get_address_of_special_page(VTL1_BOOT_PARAMS_PAGE) as *const BootParams;
+    unsafe { (*boot_params).memory_info() }
 }
 
 /// E820 entry type

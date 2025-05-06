@@ -58,6 +58,9 @@ pub const HVCALL_ENABLE_VP_VTL: u16 = 0x_000f;
 pub const HVCALL_GET_VP_REGISTERS: u16 = 0x_0050;
 pub const HVCALL_SET_VP_REGISTERS: u16 = 0x_0051;
 
+pub const HV_REGISTER_VSM_PARTITION_STATUS: u32 = 0x_000d_0004;
+pub const HV_REGISTER_VSM_PARTITION_CONFIG: u32 = 0x_000d_0007;
+pub const HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0: u32 = 0x_000d_0010;
 pub const HV_REGISTER_CR_INTERCEPT_CONTROL: u32 = 0x_000e_0000;
 pub const HV_REGISTER_CR_INTERCEPT_CR0_MASK: u32 = 0x_000e_0001;
 pub const HV_REGISTER_CR_INTERCEPT_CR4_MASK: u32 = 0x_000e_0002;
@@ -92,6 +95,25 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    #[derive(Debug, PartialEq)]
+    pub struct SegmentRegisterAttributeFlags: u16 {
+        const ACCESSED = 1 << 0;
+        const WRITABLE = 1 << 1;
+        const CONFORMING = 1 << 2;
+        const EXECUTABLE = 1 << 3;
+        const USER_SEGMENT = 1 << 4;
+        const DPL_RING_3 = 1 << 5;
+        const PRESENT = 1 << 7;
+        const AVAILABLE = 1 << 12;
+        const LONG_MODE = 1 << 13;
+        const DEFAULT_SIZE = 1 << 14;
+        const GRANULARITY = 1 << 15;
+
+        const _ = !0;
+    }
+}
+
 #[derive(Default, Clone, Copy)]
 #[repr(C, packed)]
 pub struct HvX64SegmentRegister {
@@ -108,25 +130,10 @@ pub struct HvX64SegmentRegister {
 }
 
 impl HvX64SegmentRegister {
-    const SEGMENT_TYPE_MASK: u16 = 0xf;
-    const NON_SYSTEM_SEGMANT_MASK: u16 = 0x10;
-    const DESCRIPTOR_PRIVILEGE_LEVEL_MASK: u16 = 0x60;
-    const PRESENT_MASK: u16 = 0x80;
-    const AVAILABLE_MASK: u16 = 0x1000;
-    const LONG_MASK: u16 = 0x2000;
-    const DEFAULT_MASK: u16 = 0x4000;
-    const GRANULARITY_MASK: u16 = 0x8000;
-    const SEGMENT_TYPE_SHIFT: u16 = 0;
-    const NON_SYSTEM_SEGMANT_SHIFT: u16 = 4;
-    const DESCRIPTOR_PRIVILEGE_LEVEL_SHIFT: u16 = 5;
-    const PRESENT_SHIFT: u16 = 7;
-    const AVAILABLE_SHIFT: u16 = 12;
-    const LONG_SHIFT: u16 = 13;
-    const DEFAULT_SHIFT: u16 = 14;
-    const GRANULARITY_SHIFT: u16 = 15;
-
     pub fn new() -> Self {
         HvX64SegmentRegister {
+            base: 0,
+            limit: u32::MAX,
             ..Default::default()
         }
     }
@@ -134,55 +141,6 @@ impl HvX64SegmentRegister {
     #[expect(clippy::used_underscore_binding)]
     pub fn set_attributes(&mut self, attrs: u16) {
         self._attributes = attrs;
-    }
-
-    #[expect(clippy::used_underscore_binding)]
-    fn set_sub_attribute(&mut self, shift: u16, mask: u16, value: u16) {
-        self._attributes |= (value << shift) & mask;
-    }
-
-    pub fn set_segment_type(&mut self, segment_type: u16) {
-        self.set_sub_attribute(
-            Self::SEGMENT_TYPE_SHIFT,
-            Self::SEGMENT_TYPE_MASK,
-            segment_type,
-        );
-    }
-
-    pub fn set_non_system_segment(&mut self, nss: u16) {
-        self.set_sub_attribute(
-            Self::NON_SYSTEM_SEGMANT_SHIFT,
-            Self::NON_SYSTEM_SEGMANT_MASK,
-            nss,
-        );
-    }
-
-    pub fn set_descriptor_privilege_level(&mut self, dpl: u16) {
-        self.set_sub_attribute(
-            Self::DESCRIPTOR_PRIVILEGE_LEVEL_SHIFT,
-            Self::DESCRIPTOR_PRIVILEGE_LEVEL_MASK,
-            dpl,
-        );
-    }
-
-    pub fn set_present(&mut self, present: u16) {
-        self.set_sub_attribute(Self::PRESENT_SHIFT, Self::PRESENT_MASK, present);
-    }
-
-    pub fn set_available(&mut self, available: u16) {
-        self.set_sub_attribute(Self::AVAILABLE_SHIFT, Self::AVAILABLE_MASK, available);
-    }
-
-    pub fn set_long(&mut self, long: u16) {
-        self.set_sub_attribute(Self::LONG_SHIFT, Self::LONG_MASK, long);
-    }
-
-    pub fn set_default(&mut self, default: u16) {
-        self.set_sub_attribute(Self::DEFAULT_SHIFT, Self::DEFAULT_MASK, default);
-    }
-
-    pub fn set_granularity(&mut self, granularity: u16) {
-        self.set_sub_attribute(Self::GRANULARITY_SHIFT, Self::GRANULARITY_MASK, granularity);
     }
 }
 
@@ -412,11 +370,6 @@ impl Default for HvVpAssistPage {
     }
 }
 
-// We do not support Hyper-V hypercalls with multiple input pages (a large request must be broken down).
-// Thus, the number of maximum GPA pages that each hypercall can protect is restricted like below.
-pub(crate) const HV_MODIFY_MAX_PAGES: usize =
-    (PAGE_SIZE - core::mem::size_of::<u64>() * 2) / core::mem::size_of::<u64>();
-
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 pub struct HvInputModifyVtlProtectionMask {
@@ -425,7 +378,6 @@ pub struct HvInputModifyVtlProtectionMask {
     pub target_vtl: HvInputVtl,
     reserved8_z: u8,
     reserved16_z: u16,
-    pub gpa_page_list: [u64; HV_MODIFY_MAX_PAGES], // variable-length array
 }
 
 impl HvInputModifyVtlProtectionMask {
@@ -436,7 +388,6 @@ impl HvInputModifyVtlProtectionMask {
             target_vtl: HvInputVtl::new(),
             reserved8_z: 0,
             reserved16_z: 0,
-            gpa_page_list: [0u64; HV_MODIFY_MAX_PAGES],
         }
     }
 }
@@ -444,6 +395,208 @@ impl HvInputModifyVtlProtectionMask {
 impl Default for HvInputModifyVtlProtectionMask {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// We do not support Hyper-V hypercalls with multiple input pages (a large request must be broken down).
+// Thus, the number of maximum GPA pages that each hypercall can protect is restricted like below.
+pub(crate) const HV_MODIFY_MAX_PAGES: usize = (PAGE_SIZE
+    - core::mem::size_of::<HvInputModifyVtlProtectionMask>())
+    / core::mem::size_of::<u64>();
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvInputModifyVtlProtectionMaskWithPageList {
+    pub mask: HvInputModifyVtlProtectionMask,
+    pub gpa_page_list: [u64; HV_MODIFY_MAX_PAGES],
+}
+
+impl HvInputModifyVtlProtectionMaskWithPageList {
+    pub fn new() -> Self {
+        HvInputModifyVtlProtectionMaskWithPageList {
+            mask: HvInputModifyVtlProtectionMask::new(),
+            gpa_page_list: [0u64; HV_MODIFY_MAX_PAGES],
+        }
+    }
+}
+
+impl Default for HvInputModifyVtlProtectionMaskWithPageList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvRegisterVsmVpSecureVtlConfig {
+    _as_u64: u64,
+    // union of
+    // mbec_enabled : 1;
+    // tlb_locked : 1;
+    // reserved: 62;
+}
+
+impl HvRegisterVsmVpSecureVtlConfig {
+    const MBEC_ENABLED_MASK: u64 = 0x1;
+    const TLB_LOCKED_MASK: u64 = 0x2;
+    const MBEC_ENABLED_SHIFT: u64 = 0;
+    const TLB_LOCKED_SHIFT: u64 = 1;
+
+    pub fn new() -> Self {
+        HvRegisterVsmVpSecureVtlConfig {
+            ..Default::default()
+        }
+    }
+
+    #[expect(clippy::used_underscore_binding)]
+    pub fn as_u64(&self) -> u64 {
+        self._as_u64
+    }
+
+    #[expect(clippy::used_underscore_binding)]
+    fn set_sub_config(&mut self, shift: u64, mask: u64, value: u64) {
+        self._as_u64 |= (value << shift) & mask;
+    }
+
+    pub fn set_mbec_enabled(&mut self) {
+        self.set_sub_config(Self::MBEC_ENABLED_MASK, Self::MBEC_ENABLED_SHIFT, 1);
+    }
+
+    pub fn set_tlb_locked(&mut self) {
+        self.set_sub_config(Self::TLB_LOCKED_MASK, Self::TLB_LOCKED_SHIFT, 1);
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvRegisterVsmPartitionConfig {
+    _as_u64: u64,
+    // union of
+    // enable_vtl_protection : 1,
+    // default_vtl_protection_mask : 4,
+    // zero_memory_on_reset : 1,
+    // deny_lower_vtl_startup : 1,
+    // intercept_acceptance : 1,
+    // intercept_enable_vtl_protection : 1,
+    // intercept_vp_startup : 1,
+    // intercept_cpuid_unimplemented : 1,
+    // intercept_unrecoverable_exception : 1,
+    // intercept_page : 1,
+    // mbz : 51,
+}
+
+impl HvRegisterVsmPartitionConfig {
+    const ENABLE_VTL_PROTECTION_MASK: u64 = 0x1;
+    const DEFAULT_VTL_PROTECTION_MASK_MASK: u64 = 0x1e;
+    const ZERO_MEMORY_ON_RESET_MASK: u64 = 0x20;
+    const DENY_LOWER_VTL_STARTUP_MASK: u64 = 0x40;
+    const INTERCEPT_ACCEPTANCE_MASK: u64 = 0x80;
+    const INTERCEPT_ENABLE_VTL_PROTECTION_MASK: u64 = 0x100;
+    const INTERCEPT_VP_STARTUP_MASK: u64 = 0x200;
+    const INTERCEPT_CPUID_UNIMPLEMENTED_MASK: u64 = 0x400;
+    const INTERCEPT_UNRECOVERABLE_EXCEPTION_MASK: u64 = 0x800;
+    const INTERCEPT_PAGE_MASK: u64 = 0x1000;
+    const ENABLE_VTL_PROTECTION_SHIFT: u64 = 0;
+    const DEFAULT_VTL_PROTECTION_MASK_SHIFT: u64 = 1;
+    const ZERO_MEMORY_ON_RESET_SHIFT: u64 = 5;
+    const DENY_LOWER_VTL_STARTUP_SHIFT: u64 = 6;
+    const INTERCEPT_ACCEPTANCE_SHIFT: u64 = 7;
+    const INTERCEPT_ENABLE_VTL_PROTECTION_SHIFT: u64 = 8;
+    const INTERCEPT_VP_STARTUP_SHIFT: u64 = 9;
+    const INTERCEPT_CPUID_UNIMPLEMENTED_SHIFT: u64 = 10;
+    const INTERCEPT_UNRECOVERABLE_EXCEPTION_SHIFT: u64 = 11;
+    const INTERCEPT_PAGE_SHIFT: u64 = 12;
+
+    pub fn new() -> Self {
+        HvRegisterVsmPartitionConfig {
+            ..Default::default()
+        }
+    }
+
+    #[expect(clippy::used_underscore_binding)]
+    pub fn as_u64(&self) -> u64 {
+        self._as_u64
+    }
+
+    #[expect(clippy::used_underscore_binding)]
+    fn set_sub_config(&mut self, shift: u64, mask: u64, value: u64) {
+        self._as_u64 |= (value << shift) & mask;
+    }
+
+    pub fn set_enable_vtl_protection(&mut self) {
+        self.set_sub_config(
+            Self::ENABLE_VTL_PROTECTION_MASK,
+            Self::ENABLE_VTL_PROTECTION_SHIFT,
+            1,
+        );
+    }
+
+    pub fn set_default_vtl_protection_mask(&mut self, mask: u64) {
+        self.set_sub_config(
+            Self::DEFAULT_VTL_PROTECTION_MASK_MASK,
+            Self::DEFAULT_VTL_PROTECTION_MASK_SHIFT,
+            mask,
+        );
+    }
+
+    pub fn set_zero_memory_on_reset(&mut self) {
+        self.set_sub_config(
+            Self::ZERO_MEMORY_ON_RESET_MASK,
+            Self::ZERO_MEMORY_ON_RESET_SHIFT,
+            1,
+        );
+    }
+
+    pub fn set_deny_lower_vtl_startup(&mut self) {
+        self.set_sub_config(
+            Self::DENY_LOWER_VTL_STARTUP_MASK,
+            Self::DENY_LOWER_VTL_STARTUP_SHIFT,
+            1,
+        );
+    }
+
+    pub fn set_intercept_acceptance(&mut self) {
+        self.set_sub_config(
+            Self::INTERCEPT_ACCEPTANCE_MASK,
+            Self::INTERCEPT_ACCEPTANCE_SHIFT,
+            1,
+        );
+    }
+
+    pub fn set_intercept_enable_vtl_protection(&mut self) {
+        self.set_sub_config(
+            Self::INTERCEPT_ENABLE_VTL_PROTECTION_MASK,
+            Self::INTERCEPT_ENABLE_VTL_PROTECTION_SHIFT,
+            1,
+        );
+    }
+
+    pub fn set_intercept_vp_startup(&mut self) {
+        self.set_sub_config(
+            Self::INTERCEPT_VP_STARTUP_MASK,
+            Self::INTERCEPT_VP_STARTUP_SHIFT,
+            1,
+        );
+    }
+
+    pub fn set_intercept_cpuid_unimplemented(&mut self) {
+        self.set_sub_config(
+            Self::INTERCEPT_CPUID_UNIMPLEMENTED_MASK,
+            Self::INTERCEPT_CPUID_UNIMPLEMENTED_SHIFT,
+            1,
+        );
+    }
+
+    pub fn set_intercept_unrecoverable_exception(&mut self) {
+        self.set_sub_config(
+            Self::INTERCEPT_UNRECOVERABLE_EXCEPTION_MASK,
+            Self::INTERCEPT_UNRECOVERABLE_EXCEPTION_SHIFT,
+            1,
+        );
+    }
+
+    pub fn set_intercept_page(&mut self) {
+        self.set_sub_config(Self::INTERCEPT_PAGE_MASK, Self::INTERCEPT_PAGE_SHIFT, 1);
     }
 }
 

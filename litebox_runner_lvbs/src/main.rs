@@ -10,7 +10,7 @@ use litebox_platform_lvbs::{
 };
 
 #[cfg(debug_assertions)]
-use litebox_runner_lvbs::print_boot_params;
+use litebox_platform_lvbs::host::bootparam::dump_boot_params;
 
 #[expect(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
@@ -40,7 +40,7 @@ pub fn kernel_main() -> ! {
     }
 
     #[cfg(debug_assertions)]
-    print_boot_params();
+    dump_boot_params();
 
     // TODO: common init (e.g., heap, ...)
 

@@ -1,9 +1,13 @@
 //! VSM functions
 
 use crate::{
+    host::bootparam::get_vtl1_memory_info,
+    kernel_context::get_core_id,
     mshv::{
         HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
-        HV_REGISTER_CR_INTERCEPT_CR4_MASK, HvCrInterceptControlFlags, HvPageProtFlags,
+        HV_REGISTER_CR_INTERCEPT_CR4_MASK, HV_REGISTER_VSM_PARTITION_CONFIG,
+        HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HvCrInterceptControlFlags, HvPageProtFlags,
+        HvRegisterVsmPartitionConfig, HvRegisterVsmVpSecureVtlConfig,
         VSM_VTL_CALL_FUNC_ID_BOOT_APS, VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY,
         VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL, VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT,
         VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE, VSM_VTL_CALL_FUNC_ID_LOAD_KDATA,
@@ -12,6 +16,7 @@ use crate::{
         VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags, X86Cr4Flags,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_set_vp_registers, init_vtl_aps},
+        vtl1_mem_layout::PAGE_SIZE,
     },
     serial_println,
 };
@@ -19,6 +24,25 @@ use num_enum::TryFromPrimitive;
 
 /// VTL call parameters (param[0]: function ID, param[1-3]: parameters)
 pub const NUM_VTLCALL_PARAMS: usize = 4;
+
+pub fn init() {
+    if get_core_id() == 0 {
+        mshv_vsm_configure_partition();
+    }
+    mshv_vsm_secure_config_vtl0();
+
+    if get_core_id() == 0 {
+        if let Ok((start, size)) = get_vtl1_memory_info() {
+            let num_pages = size / PAGE_SIZE as u64;
+            let prot = HvPageProtFlags::HV_PAGE_ACCESS_NONE;
+            if let Err(result) = hv_modify_vtl_protection_mask(start, num_pages, prot) {
+                serial_println!("Err: {:?}", result);
+            }
+        } else {
+            serial_println!("Failed to get memory info");
+        }
+    }
+}
 
 /// VSM function for enabling VTL of APs
 /// # Panics
@@ -41,6 +65,44 @@ pub fn mshv_vsm_boot_aps(_cpu_online_mask_pfn: u64, _boot_signal_pfn: u64) -> u6
     #[cfg(debug_assertions)]
     serial_println!("VSM: Boot APs");
     // TODO: update boot signal page accordingly
+    0
+}
+
+pub fn mshv_vsm_secure_config_vtl0() -> u64 {
+    #[cfg(debug_assertions)]
+    serial_println!("VSM: Secure config VTL0");
+
+    let mut config = HvRegisterVsmVpSecureVtlConfig::new();
+    config.set_mbec_enabled();
+    config.set_tlb_locked();
+
+    if let Err(result) =
+        hvcall_set_vp_registers(HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, config.as_u64(), 0)
+    {
+        serial_println!("Err: {:?}", result);
+        let err: u32 = result.into();
+        return err.into();
+    }
+
+    0
+}
+
+pub fn mshv_vsm_configure_partition() -> u64 {
+    #[cfg(debug_assertions)]
+    serial_println!("VSM: Configure partition");
+
+    let mut config = HvRegisterVsmPartitionConfig::new();
+    config.set_default_vtl_protection_mask(HvPageProtFlags::HV_PAGE_FULL_ACCESS.bits().into());
+    config.set_enable_vtl_protection();
+
+    if let Err(result) =
+        hvcall_set_vp_registers(HV_REGISTER_VSM_PARTITION_CONFIG, config.as_u64(), 0)
+    {
+        serial_println!("Err: {:?}", result);
+        let err: u32 = result.into();
+        return err.into();
+    }
+
     0
 }
 

@@ -14,7 +14,7 @@ use crate::{
         HV_STATUS_VTL_ALREADY_ENABLED, HV_X64_MSR_GUEST_OS_ID, HV_X64_MSR_HYPERCALL,
         HV_X64_MSR_HYPERCALL_ENABLE, HV_X64_MSR_VP_ASSIST_PAGE, HV_X64_MSR_VP_ASSIST_PAGE_ENABLE,
         HYPERV_CPUID_IMPLEMENT_LIMITS, HYPERV_CPUID_INTERFACE,
-        HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, HYPERV_HYPERVISOR_PRESENT_BIT,
+        HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, HYPERV_HYPERVISOR_PRESENT_BIT, vsm,
     },
 };
 use core::arch::asm;
@@ -118,6 +118,8 @@ pub fn init() -> Result<(), HypervError> {
         serial_println!("HV_X64_MSR_HYPERCALL: {:#x}", rdmsr(HV_X64_MSR_HYPERCALL));
     }
 
+    vsm::init();
+
     Ok(())
 }
 
@@ -188,7 +190,7 @@ pub fn hv_do_rep_hypercall(
         }
     }
 
-    Ok(HV_STATUS_SUCCESS.into())
+    Ok(rep_comp.into())
 }
 
 /// Error for Hyper-V initialization
