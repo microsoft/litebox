@@ -42,7 +42,7 @@ unsafe extern "C" {
     fn trampoline(entry: usize, sp: usize) -> !;
 }
 
-pub fn init_platform() {
+pub fn init_platform(enable_systrap: bool) {
     let platform = Platform::new(None);
     set_platform(platform);
     let platform = litebox_platform_multiplex::platform();
@@ -67,7 +67,9 @@ pub fn init_platform() {
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     ));
-    platform.enable_syscall_interception_with(litebox_shim_linux::syscall_entry);
+    if enable_systrap {
+        platform.enable_syscall_interception_with(litebox_shim_linux::syscall_entry);
+    }
 
     install_dir("/lib64");
     install_dir("/lib32");
@@ -75,11 +77,14 @@ pub fn init_platform() {
     install_dir("/lib/x86_64-linux-gnu");
 }
 
-pub fn compile(output: &std::path::Path, exec_or_lib: bool) {
-    // Compile the hello.c file to an executable
-    let mut args = vec!["-o", output.to_str().unwrap(), "./tests/hello.c"];
+/// Compile C code into an executable
+pub fn compile(input: &str, output: &str, exec_or_lib: bool, nolibc: bool) {
+    let mut args = vec!["-o", output, input];
     if exec_or_lib {
         args.push("-static");
+    }
+    if nolibc {
+        args.push("-nostdlib");
     }
     args.push(match std::env::consts::ARCH {
         "x86_64" => "-m64",

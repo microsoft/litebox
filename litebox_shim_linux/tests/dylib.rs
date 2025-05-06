@@ -6,7 +6,7 @@ mod common;
 fn test_load_exec_dynamic() {
     let dir_path = std::env::var("OUT_DIR").unwrap();
     let path = std::path::Path::new(dir_path.as_str()).join("hello_dylib");
-    common::compile(&path, false);
+    common::compile("./tests/hello.c", path.to_str().unwrap(), false, false);
 
     let executable_path = "/hello_dylib";
     let executable_data = std::fs::read(path).unwrap();
@@ -25,7 +25,7 @@ fn test_load_exec_dynamic() {
         .map(|f| (f, std::fs::read(f).unwrap()))
         .collect();
 
-    common::init_platform();
+    common::init_platform(true);
 
     common::install_file(executable_data, executable_path);
     for (path, data) in files {
