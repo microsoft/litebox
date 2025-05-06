@@ -612,7 +612,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
 #[derive(Error, Debug)]
 pub enum VmemUnmapError {
     #[error("arg is not aligned")]
-    MisAligned,
+    UnAligned,
     #[error("failed to unmap pages: {0}")]
     UnmapError(#[from] crate::platform::page_mgmt::DeallocationError),
 }
@@ -632,7 +632,7 @@ pub(super) enum VmemResizeError {
 #[derive(Error, Debug)]
 pub enum VmemMoveError {
     #[error("arg is not aligned")]
-    MisAligned,
+    UnAligned,
     #[error("out of memory")]
     OutOfMemory,
     #[error("remap failed: {0}")]
@@ -643,7 +643,7 @@ pub enum VmemMoveError {
 #[derive(Error, Debug)]
 pub enum VmemProtectError {
     #[error("the range {0:?} is not aligned")]
-    MisAligned(Range<usize>),
+    UnAligned(Range<usize>),
     #[error("the range {0:?} has no mapping memory")]
     InvalidRange(Range<usize>),
     #[error("failed to change permissions from {old:?} to {new:?}")]
@@ -657,7 +657,7 @@ pub enum VmemProtectError {
 #[derive(Error, Debug)]
 pub enum MappingError {
     #[error("arg is not aligned")]
-    MisAligned,
+    UnAligned,
     #[error("not enough memory")]
     OutOfMemory,
 

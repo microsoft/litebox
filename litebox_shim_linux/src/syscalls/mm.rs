@@ -157,7 +157,7 @@ pub(crate) fn sys_munmap(addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errn
 
     let pm = litebox_page_manager();
     match unsafe { pm.remove_pages(addr, len) } {
-        Err(VmemUnmapError::MisAligned) => Err(Errno::EINVAL),
+        Err(VmemUnmapError::UnAligned) => Err(Errno::EINVAL),
         Err(VmemUnmapError::UnmapError(e)) => match e {
             DeallocationError::Unaligned => Err(Errno::EINVAL),
             // It is not an error if the indicated range does not contain any mapped pages.

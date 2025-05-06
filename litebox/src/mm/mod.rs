@@ -65,7 +65,7 @@ where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
         let suggested_range =
-            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::MisAligned)?;
+            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::UnAligned)?;
         let mut vmem = self.vmem.write();
         unsafe {
             vmem.create_pages(
@@ -108,7 +108,7 @@ where
     {
         let flags = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         let suggested_range =
-            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::MisAligned)?;
+            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::UnAligned)?;
         let mut vmem = self.vmem.write();
         unsafe { vmem.create_pages(suggested_range, fixed_addr, false, flags, flags, op) }
     }
@@ -140,7 +140,7 @@ where
     {
         let mut vmem = self.vmem.write();
         let suggested_range =
-            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::MisAligned)?;
+            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::UnAligned)?;
         unsafe {
             vmem.create_pages(
                 suggested_range,
@@ -174,7 +174,7 @@ where
         let flags = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         let mut vmem = self.vmem.write();
         let suggested_range =
-            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::MisAligned)?;
+            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::UnAligned)?;
         unsafe { vmem.create_pages(suggested_range, fixed_addr, true, flags, flags, |_| Ok(0)) }
     }
 
@@ -190,7 +190,7 @@ where
     ) -> Result<(), VmemUnmapError> {
         let mut vmem = self.vmem.write();
         let start = ptr.as_usize();
-        let range = PageRange::new(start, start + len).ok_or(VmemUnmapError::MisAligned)?;
+        let range = PageRange::new(start, start + len).ok_or(VmemUnmapError::UnAligned)?;
         unsafe { vmem.remove_mapping(range) }
     }
 
