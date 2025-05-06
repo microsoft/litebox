@@ -870,8 +870,8 @@ where
                 .get_mut::<tcp::Socket>(socket_handle.handle)
                 .recv_slice(buf)
                 .map_err(|e| match e {
-                    tcp::RecvError::InvalidState => ReceiveError::OperationFinished,
-                    tcp::RecvError::Finished => ReceiveError::SocketInInvalidState,
+                    tcp::RecvError::InvalidState => ReceiveError::SocketInInvalidState,
+                    tcp::RecvError::Finished => ReceiveError::OperationFinished,
                 }),
             Protocol::Udp => unimplemented!(),
             Protocol::Icmp => unimplemented!(),
