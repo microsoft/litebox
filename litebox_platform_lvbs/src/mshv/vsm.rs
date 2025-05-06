@@ -70,7 +70,7 @@ pub fn mshv_vsm_boot_aps(_cpu_online_mask_pfn: u64, _boot_signal_pfn: u64) -> u6
 
 pub fn mshv_vsm_secure_config_vtl0() -> u64 {
     #[cfg(debug_assertions)]
-    serial_println!("VSM: Secure config VTL0");
+    serial_println!("VSM: Secure VTL0 configuration");
 
     let mut config = HvRegisterVsmVpSecureVtlConfig::new();
     config.set_mbec_enabled();
@@ -165,26 +165,10 @@ pub fn mshv_vsm_end_of_boot() -> u64 {
 }
 
 /// VSM function for protecting certain memory range
-pub fn mshv_vsm_protect_memory(_pa: u64, nranges: u64) -> u64 {
+pub fn mshv_vsm_protect_memory(_pa: u64, _nranges: u64) -> u64 {
     #[cfg(debug_assertions)]
     serial_println!("VSM: Protect memory");
-
-    // TODO: mmap pa
-
-    // TODO: walk the ranges and apply the permissions for each guest page
-    for _r in 0..nranges {
-        // TODO: get the range info from pa
-        let start = 0;
-        let num = 0;
-        let prot = HvPageProtFlags::HV_PAGE_FULL_ACCESS;
-
-        if let Err(result) = hv_modify_vtl_protection_mask(start, num, prot) {
-            serial_println!("Err: {:?}", result);
-            let err: u32 = result.into();
-            return err.into();
-        }
-    }
-
+    // TODO: protect memory using hv_modify_protection_mask()
     0
 }
 

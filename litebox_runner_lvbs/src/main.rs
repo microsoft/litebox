@@ -37,10 +37,9 @@ pub fn kernel_main() -> ! {
         serial_println!("==============================");
         serial_println!(" Hello from LiteBox for LVBS! ");
         serial_println!("==============================");
+        #[cfg(debug_assertions)]
+        dump_boot_params();
     }
-
-    #[cfg(debug_assertions)]
-    dump_boot_params();
 
     // TODO: common init (e.g., heap, ...)
 

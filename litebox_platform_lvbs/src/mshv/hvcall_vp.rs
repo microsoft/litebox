@@ -55,11 +55,14 @@ pub fn hvcall_set_vp_registers(
 #[expect(clippy::similar_names)]
 fn hv_vtl_populate_vp_context(input: &mut HvEnableVpVtl, tss: u64, rip: u64, rsp: u64) {
     use x86_64::instructions::tables::{sgdt, sidt};
-    use x86_64::registers::control::{Cr0, Cr3, Cr4};
+    use x86_64::registers::{
+        control::{Cr0, Cr3, Cr4},
+        rflags,
+    };
 
     input.vp_context.rip = rip;
     input.vp_context.rsp = rsp;
-    input.vp_context.rflags = 0x2;
+    input.vp_context.rflags = rflags::read_raw();
     input.vp_context.efer = rdmsr(MSR_EFER);
     input.vp_context.cr0 = Cr0::read_raw();
     let (frame, val) = Cr3::read_raw();
