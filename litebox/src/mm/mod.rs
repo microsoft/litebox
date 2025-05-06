@@ -148,7 +148,7 @@ where
                 false,
                 // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the data)
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-                // kepp READ, turn off WRITE
+                // keep READ, turn off WRITE
                 MemoryRegionPermissions::READ,
                 op,
             )
