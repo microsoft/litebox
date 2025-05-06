@@ -22,8 +22,9 @@ use litebox::{
     LiteBox,
     fs::FileSystem,
     mm::{PageManager, linux::PAGE_SIZE},
-    platform::{RawConstPointer as _, RawMutPointer as _},
+    platform::{ExitProvider as _, RawConstPointer as _, RawMutPointer as _},
     sync::RwLock,
+    utils::{ReinterpretSignedExt, TruncateExt as _},
 };
 use litebox_common_linux::{SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
@@ -431,4 +432,167 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
             v
         },
     )
+}
+
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    "
+    .text
+    .align  4
+    .globl  syscall_callback
+    .type   syscall_callback,@function
+syscall_callback:
+    /* TODO: save float and vector registers (xsave or fxsave) */
+    /* Save caller-saved registers */
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    pushf
+
+    /* Save the original stack pointer */
+    push rbp
+    mov  rbp, rsp
+
+    /* Align the stack to 16 bytes */
+    and rsp, -16
+
+    /* Reserve space on the stack for syscall arguments */
+    sub rsp, 48
+
+    /* Save syscall arguments (rdi, rsi, rdx, r10, r8, r9) into the reserved space */
+    mov [rsp], rdi
+    mov [rsp + 8], rsi
+    mov [rsp + 16], rdx
+    mov [rsp + 24], r10
+    mov [rsp + 32], r8
+    mov [rsp + 40], r9
+
+    /* Pass the syscall number to the syscall dispatcher */
+    mov rdi, rax
+    /* Pass the pointer to the syscall arguments to syscall_handler */
+    mov rsi, rsp
+
+    /* Call syscall_handler */
+    call syscall_handler
+
+    /* Restore the original stack pointer */
+    mov  rsp, rbp
+    pop  rbp
+
+    /* Restore caller-saved registers */
+    popf
+    pop  r11
+    pop  r10
+    pop  r9
+    pop  r8
+    pop  rdi
+    pop  rsi
+    pop  rdx
+    pop  rcx
+
+    /* Return to the caller */
+    ret
+"
+);
+
+/// Syscall callback function for 32-bit x86
+///
+/// The stack layout at the entry of the callback (see litebox_syscall_rewriter
+/// for more details):
+///
+/// Addr |   data   |
+/// 0    | sysno    |
+/// -4:  | ret addr |  <-- esp
+///
+/// The first two instructions adjust the stack such that it saves one
+/// instruction (i.e., `pop sysno`) from the caller (trampoline code).
+#[cfg(target_arch = "x86")]
+core::arch::global_asm!(
+    "
+    .text
+    .align  4
+    .globl  syscall_callback
+    .type   syscall_callback,@function
+syscall_callback:
+    pop  eax        /* pop ret addr */
+    xchg eax, [esp] /* exchange it with sysno */
+
+    /* Save registers and constructs arguments */
+    push ebp
+    push edi
+    push esi
+    push edx
+    push ecx
+    push ebx
+    push eax
+
+    /* save the pointer to argments in eax */
+    mov eax, esp
+
+    pushf
+    /* Save the original stack pointer */
+    mov ebp, esp
+    /* Align the stack to 16 bytes */
+    and esp, -16
+
+    /* Pass the pointer to the sysno and arguments to syscall_handler_32 */
+    push eax
+
+    call syscall_handler_32
+
+    mov esp, ebp
+    popf
+    pop ebx /* not need to restore eax (sysno) */
+    pop ebx
+    pop ecx
+    pop edx
+    pop esi
+    pop edi
+    pop ebp
+
+    /* Return to the caller */
+    ret
+"
+);
+
+unsafe extern "C" {
+    pub(crate) fn syscall_callback() -> isize;
+}
+
+#[unsafe(no_mangle)]
+#[cfg(target_arch = "x86")]
+unsafe extern "C" fn syscall_handler_32(args: *const usize) -> isize {
+    let syscall_number = unsafe { *args };
+    unsafe { syscall_handler(syscall_number, args.add(1)) }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) -> isize {
+    let syscall_args = unsafe { core::slice::from_raw_parts(args, 6) };
+    let Ok(syscall_number) = u32::try_from(syscall_number) else {
+        return Errno::ENOSYS.as_neg() as isize;
+    };
+    let sysno = ::syscalls::Sysno::from(syscall_number);
+    let dispatcher = match sysno {
+        ::syscalls::Sysno::write => SyscallRequest::Write {
+            fd: syscall_args[0].reinterpret_as_signed().truncate(),
+            buf: unsafe { core::mem::transmute::<usize, ConstPtr<u8>>(syscall_args[1]) },
+            count: syscall_args[2],
+        },
+        ::syscalls::Sysno::exit | ::syscalls::Sysno::exit_group => {
+            litebox_platform_multiplex::platform()
+                .exit(syscall_args[0].reinterpret_as_signed().truncate())
+        }
+        _ => todo!("syscall {sysno} not implemented"),
+    };
+    if let SyscallRequest::Ret(ret) = dispatcher {
+        ret
+    } else {
+        syscall_entry(dispatcher)
+    }
 }

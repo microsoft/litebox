@@ -288,9 +288,21 @@ fn hook_syscalls_in_section(
         );
 
         // Add call [rip + offset_to_shared_target]
-        trampoline_data.extend_from_slice(&[0xFF, 0x15]);
-        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() + 4);
-        trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+        if arch == Arch::X86_64 {
+            trampoline_data.extend_from_slice(&[0xFF, 0x15]);
+            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() + 4);
+            trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+        } else {
+            // For 32-bit, use a different approach to simulate `call [rip + disp32]`
+            trampoline_data.push(0x50); // PUSH EAX
+            trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
+            trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
+            trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
+            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
+            trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+            // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
+            // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
+        }
 
         // Add jmp back to original after syscall
         let return_addr = inst.address() + inst.bytes().len() as u64;
