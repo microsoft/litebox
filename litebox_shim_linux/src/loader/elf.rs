@@ -54,7 +54,7 @@ impl ElfObject for ElfFile {
                 Ok(bytes_read) => {
                     if bytes_read == 0 {
                         // reached the end of the file
-                        return Err(elf_loader::Error::IOError {
+                        return Err(elf_loader::Error::MmapError {
                             msg: "failed to fill buffer".to_string(),
                         });
                     } else {
@@ -65,7 +65,7 @@ impl ElfObject for ElfFile {
                 }
                 Err(_) => {
                     // Error occurred
-                    return Err(elf_loader::Error::IOError {
+                    return Err(elf_loader::Error::MmapError {
                         msg: "failed to read from file".to_string(),
                     });
                 }
