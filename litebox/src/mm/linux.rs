@@ -50,52 +50,24 @@ bitflags::bitflags! {
     }
 }
 
-bitflags::bitflags! {
-    /// Desired memory protection of a memory mapping, same as `mmap` flags.
-    #[derive(Clone, Copy, PartialEq, Debug)]
-    pub(super) struct ProtFlags: core::ffi::c_int {
-        /// Pages cannot be accessed.
-        const PROT_NONE = 0;
-        /// Pages can be read.
-        const PROT_READ = 1 << 0;
-        /// Pages can be written.
-        const PROT_WRITE = 1 << 1;
-        /// Pages can be executed
-        const PROT_EXEC = 1 << 2;
-        /// Apply the protection mode down to the beginning of a
-        /// mapping that grows downward
-        const PROT_GROWSDOWN = 1 << 24;
-        /// Apply the protection mode up to the end of a mapping that
-        /// grows upwards.
-        const PROT_GROWSUP = 1 << 25;
-        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
-        const _ = !0;
-
-        const PROT_READ_EXEC = Self::PROT_READ.bits() | Self::PROT_EXEC.bits();
-        const PROT_READ_WRITE = Self::PROT_READ.bits() | Self::PROT_WRITE.bits();
-    }
-}
-
-impl From<ProtFlags> for VmFlags {
-    fn from(value: ProtFlags) -> Self {
-        if value.intersects(
-            (ProtFlags::PROT_READ
-                | ProtFlags::PROT_WRITE
-                | ProtFlags::PROT_EXEC
-                | ProtFlags::PROT_GROWSDOWN)
-                .complement(),
-        ) {
-            unimplemented!("Unsupported ProtFlags: {value:?}");
-        }
-
+impl From<MemoryRegionPermissions> for VmFlags {
+    fn from(value: MemoryRegionPermissions) -> Self {
         let mut flags = VmFlags::empty();
-        flags.set(VmFlags::VM_READ, value.contains(ProtFlags::PROT_READ));
-        flags.set(VmFlags::VM_WRITE, value.contains(ProtFlags::PROT_WRITE));
-        flags.set(VmFlags::VM_EXEC, value.contains(ProtFlags::PROT_EXEC));
         flags.set(
-            VmFlags::VM_GROWSDOWN,
-            value.contains(ProtFlags::PROT_GROWSDOWN),
+            VmFlags::VM_READ,
+            value.contains(MemoryRegionPermissions::READ),
         );
+        flags.set(
+            VmFlags::VM_WRITE,
+            value.contains(MemoryRegionPermissions::WRITE),
+        );
+        flags.set(
+            VmFlags::VM_EXEC,
+            value.contains(MemoryRegionPermissions::EXEC),
+        );
+        if value.contains(MemoryRegionPermissions::SHARED) {
+            unimplemented!("SHARED permission is not supported yet");
+        }
         flags
     }
 }
@@ -455,10 +427,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) unsafe fn protect_mapping(
         &mut self,
         range: PageRange<ALIGN>,
-        flags: VmFlags,
+        permissions: MemoryRegionPermissions,
     ) -> Result<(), VmemProtectError> {
-        // only change the access flags
-        let flags = flags & VmFlags::VM_ACCESS_FLAGS;
+        // `MemoryRegionPermissions` is a subset of `VmFlags` and we only change the access flags
+        let flags =
+            VmFlags::from_bits(u32::from(permissions.bits())).unwrap() & VmFlags::VM_ACCESS_FLAGS;
         let range = range.start..range.end;
         let mut mappings_to_change = Vec::new();
         for (r, vma) in self.vmas.overlapping(range.clone()) {
@@ -488,12 +461,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             let after = intersection.end..end;
 
             let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
-            let new_permissions =
-                MemoryRegionPermissions::from_bits_truncate(new_flags.bits().try_into().unwrap());
             // `intersection` is page aligned.
             unsafe {
                 self.platform
-                    .update_permissions(intersection.clone(), new_permissions)
+                    .update_permissions(intersection.clone(), permissions)
             }
             .map_err(|e| {
                 // restore the original mapping
@@ -522,9 +493,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
     /// existing overlapping mappings being removed.
     ///
+    /// Set `is_stack` to `true` to create a stack mapping, which allows the stack to grow downward.
+    ///
     /// `op` is a callback for caller to initialize the created pages.
     ///
-    /// `before_flags` and `after_flags` are the permissions to set before and after the call to `op`.
+    /// `before_perms` and `after_perms` are the permissions to set before and after the call to `op`.
     ///
     /// # Safety
     ///
@@ -537,8 +510,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         &mut self,
         suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
-        before_flags: ProtFlags,
-        after_flags: ProtFlags,
+        is_stack: bool,
+        before_perms: MemoryRegionPermissions,
+        after_perms: MemoryRegionPermissions,
         op: F,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
@@ -547,7 +521,15 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let addr = unsafe {
             self.create_mapping(
                 suggested_range,
-                VmArea::new(VmFlags::from(before_flags) | VmFlags::VM_MAY_ACCESS_FLAGS),
+                VmArea::new(
+                    VmFlags::from(before_perms)
+                        | VmFlags::VM_MAY_ACCESS_FLAGS
+                        | if is_stack {
+                            VmFlags::VM_GROWSDOWN
+                        } else {
+                            VmFlags::empty()
+                        },
+                ),
                 fixed_addr,
             )
         }
@@ -564,12 +546,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .unwrap();
             return Err(e);
         }
-        if before_flags != after_flags {
+        if before_perms != after_perms {
             let range =
                 PageRange::new(addr.as_usize(), addr.as_usize() + suggested_range.len()).unwrap();
             // `protect` should succeed, as we just created the mapping.
-            unsafe { self.protect_mapping(range, after_flags.into()) }
-                .expect("failed to protect mapping");
+            unsafe { self.protect_mapping(range, after_perms) }.expect("failed to protect mapping");
         }
         Ok(addr)
     }
