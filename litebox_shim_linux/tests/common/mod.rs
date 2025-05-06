@@ -77,9 +77,9 @@ pub fn init_platform(enable_systrap: bool) {
     install_dir("/lib/x86_64-linux-gnu");
 }
 
-pub fn compile(input: &str, output: &std::path::Path, exec_or_lib: bool, nolibc: bool) {
-    // Compile the hello.c file to an executable
-    let mut args = vec!["-o", output.to_str().unwrap(), input];
+/// Compile C code into an executable
+pub fn compile(input: &str, output: &str, exec_or_lib: bool, nolibc: bool) {
+    let mut args = vec!["-o", output, input];
     if exec_or_lib {
         args.push("-static");
     }

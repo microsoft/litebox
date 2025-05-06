@@ -300,6 +300,8 @@ fn hook_syscalls_in_section(
             trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
             let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
             trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+            // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
+            // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
         }
 
         // Add jmp back to original after syscall

@@ -12,9 +12,7 @@ use std::time::Duration;
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
-use litebox_common_linux::ProtFlags;
 use litebox_common_linux::PunchthroughSyscall;
-use litebox_common_linux::errno::Errno;
 
 mod syscall_intercept;
 
@@ -104,21 +102,6 @@ impl LinuxUserland {
         );
         // TODO: have better signature and registration of the syscall handler.
         syscall_intercept::init_sys_intercept(syscall_handler);
-    }
-
-    /************************ Punchthroughs ******************************/
-
-    pub fn mprotect(&self, addr: usize, len: usize, prot: ProtFlags) -> Result<(), Errno> {
-        let ret = unsafe { libc::syscall(libc::SYS_mprotect, addr, len, prot.bits()) };
-        if ret == 0 {
-            Ok(())
-        } else {
-            let errno = latest_errno();
-            let Ok(errno) = Errno::try_from(errno) else {
-                unreachable!();
-            };
-            Err(errno)
-        }
     }
 }
 

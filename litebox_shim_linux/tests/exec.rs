@@ -4,7 +4,7 @@ mod common;
 fn test_load_exec_static() {
     let dir_path = std::env::var("OUT_DIR").unwrap();
     let path = std::path::Path::new(dir_path.as_str()).join("hello_exec");
-    common::compile("./tests/hello.c", &path, true, false);
+    common::compile("./tests/hello.c", path.to_str().unwrap(), true, false);
 
     let executable_path = "/hello_exec";
     let executable_data = std::fs::read(path).unwrap();
@@ -106,7 +106,12 @@ fn test_syscall_rewriter() {
     let src_path = std::path::Path::new(dir_path.as_str()).join("hello_exec_nolibc.c");
     std::fs::write(src_path.clone(), HELLO_WORLD_NOLIBC).unwrap();
     let path = std::path::Path::new(dir_path.as_str()).join("hello_exec_nolibc");
-    common::compile(src_path.to_str().unwrap(), &path, true, true);
+    common::compile(
+        src_path.to_str().unwrap(),
+        path.to_str().unwrap(),
+        true,
+        true,
+    );
 
     // rewrite the hello_exec_nolibc
     let hooked_path = std::path::Path::new(dir_path.as_str()).join("hello_exec_nolibc.hooked");

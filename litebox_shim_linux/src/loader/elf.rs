@@ -192,6 +192,7 @@ type Ehdr = elf::file::Elf32_Ehdr;
 type Shdr = elf::section::Elf64_Shdr;
 #[cfg(target_arch = "x86")]
 type Shdr = elf::section::Elf32_Shdr;
+
 /// Get the syscall callback placeholder address from the ELF file if it is modified by our syscall
 /// rewriter. The placeholder initially has a magic number that is going to be replaced by the actual
 /// syscall callback.
@@ -225,6 +226,7 @@ fn get_syscall_callback_placeholder(object: &mut ElfFile) -> Option<NonNull<usiz
         )
         .ok()?;
     let magic_number = u64::from_ne_bytes(placeholder);
+    // TODO: check section name instead of magic number
     if magic_number != super::REWRITER_MAGIC_NUMBER {
         return None;
     }
@@ -273,19 +275,17 @@ impl ElfLoader {
                 .map_err(ElfLoaderError::LoaderError)?;
             if let Some(placeholder) = placeholder {
                 // mprotect the memory to make it writable
-                let protflags = litebox_common_linux::ProtFlags::PROT_READ
-                    | litebox_common_linux::ProtFlags::PROT_WRITE;
-                // `mmap` requires the address to be page-aligned
+                let pm = litebox_page_manager();
+                // `mprotect` requires the address to be page-aligned
                 let start_addr = placeholder.as_ptr() as usize & !(PAGE_SIZE - 1);
-                litebox_platform_multiplex::platform()
-                    .mprotect(start_addr, 0x1000, protflags)
-                    .unwrap();
+                let ptr = unsafe {
+                    core::mem::transmute::<*mut u8, crate::MutPtr<u8>>(start_addr as *mut u8)
+                };
+                unsafe { pm.make_pages_writable(ptr, 0x1000) }
+                    .expect("failed to make pages writable");
                 unsafe { placeholder.write(crate::syscall_callback as usize) };
-                let protflags = litebox_common_linux::ProtFlags::PROT_READ
-                    | litebox_common_linux::ProtFlags::PROT_EXEC;
-                litebox_platform_multiplex::platform()
-                    .mprotect(start_addr, 0x1000, protflags)
-                    .unwrap();
+                unsafe { pm.make_pages_executable(ptr, 0x1000) }
+                    .expect("failed to make pages executable");
             }
             elf
         };
