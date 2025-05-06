@@ -674,7 +674,7 @@ impl litebox::platform::StdioProvider for LinuxUserland {
 }
 
 #[global_allocator]
-static SLAB_ALLOC: litebox::mm::alloc::SafeZoneAllocator<'static, 23, LinuxUserland> =
+static SLAB_ALLOC: litebox::mm::alloc::SafeZoneAllocator<'static, 28, LinuxUserland> =
     litebox::mm::alloc::SafeZoneAllocator::new();
 
 impl litebox::mm::alloc::MemoryProvider for LinuxUserland {
@@ -688,7 +688,7 @@ impl litebox::mm::alloc::MemoryProvider for LinuxUserland {
         let addr = unsafe {
             libc::mmap(
                 core::ptr::null_mut(),
-                size << 1,
+                size,
                 ProtFlags::PROT_READ_WRITE.bits(),
                 (MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON).bits(),
                 -1,
@@ -698,7 +698,7 @@ impl litebox::mm::alloc::MemoryProvider for LinuxUserland {
         if addr == libc::MAP_FAILED {
             None
         } else {
-            Some((addr as usize, size << 1))
+            Some((addr as usize, size))
         }
     }
 
