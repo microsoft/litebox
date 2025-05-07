@@ -4,8 +4,7 @@ use crate::{
     kernel_context::get_per_core_kernel_context,
     mshv::{
         HV_MODIFY_MAX_PAGES, HV_PARTITION_ID_SELF, HV_VTL_SECURE,
-        HVCALL_MODIFY_VTL_PROTECTION_MASK, HvInputModifyVtlProtectionMaskWithPageList,
-        HvPageProtFlags,
+        HVCALL_MODIFY_VTL_PROTECTION_MASK, HvInputModifyVtlProtectionMask, HvPageProtFlags,
         hvcall::{HypervCallError, hv_do_rep_hypercall},
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
@@ -21,13 +20,13 @@ pub fn hv_modify_vtl_protection_mask(
     let hvin = unsafe {
         &mut *kernel_context
             .hv_hypercall_input_page_as_mut_ptr()
-            .cast::<HvInputModifyVtlProtectionMaskWithPageList>()
+            .cast::<HvInputModifyVtlProtectionMask>()
     };
-    *hvin = HvInputModifyVtlProtectionMaskWithPageList::new();
+    *hvin = HvInputModifyVtlProtectionMask::new();
 
-    hvin.mask.partition_id = HV_PARTITION_ID_SELF;
-    hvin.mask.target_vtl.set_target_vtl(HV_VTL_SECURE);
-    hvin.mask.map_flags = page_access.bits();
+    hvin.partition_id = HV_PARTITION_ID_SELF;
+    hvin.target_vtl.set_target_vtl(HV_VTL_SECURE);
+    hvin.map_flags = page_access.bits();
 
     let mut total_protected: u64 = 0;
     while total_protected < num_pages {

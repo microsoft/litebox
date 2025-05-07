@@ -256,12 +256,13 @@ pub struct HvSetVpRegistersInputElement {
     pub valuehigh: u64,
 }
 
+pub(crate) const HV_SET_VP_MAX_REGISTERS: usize = 1;
+
 #[derive(Default, Clone, Copy)]
 #[repr(C, packed)]
 pub struct HvSetVpRegistersInput {
     pub header: HvSetVpRegistersInputHeader,
-    pub element: HvSetVpRegistersInputElement,
-    // in fact, it is an array of undefined length, element[], but we only use one element
+    pub element: [HvSetVpRegistersInputElement; HV_SET_VP_MAX_REGISTERS],
 }
 
 impl HvSetVpRegistersInput {
@@ -370,6 +371,12 @@ impl Default for HvVpAssistPage {
     }
 }
 
+// We do not support Hyper-V hypercalls with multiple input pages (a large request must be broken down).
+// Thus, the number of maximum GPA pages that each hypercall can protect is restricted like below.
+#[expect(clippy::cast_possible_truncation)]
+pub(crate) const HV_MODIFY_MAX_PAGES: usize =
+    ((PAGE_SIZE as u32 - u64::BITS * 2 / 8) / (u64::BITS / 8)) as usize;
+
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 pub struct HvInputModifyVtlProtectionMask {
@@ -378,6 +385,7 @@ pub struct HvInputModifyVtlProtectionMask {
     pub target_vtl: HvInputVtl,
     reserved8_z: u8,
     reserved16_z: u16,
+    pub gpa_page_list: [u64; HV_MODIFY_MAX_PAGES],
 }
 
 impl HvInputModifyVtlProtectionMask {
@@ -388,39 +396,12 @@ impl HvInputModifyVtlProtectionMask {
             target_vtl: HvInputVtl::new(),
             reserved8_z: 0,
             reserved16_z: 0,
-        }
-    }
-}
-
-impl Default for HvInputModifyVtlProtectionMask {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// We do not support Hyper-V hypercalls with multiple input pages (a large request must be broken down).
-// Thus, the number of maximum GPA pages that each hypercall can protect is restricted like below.
-pub(crate) const HV_MODIFY_MAX_PAGES: usize = (PAGE_SIZE
-    - core::mem::size_of::<HvInputModifyVtlProtectionMask>())
-    / core::mem::size_of::<u64>();
-
-#[derive(Clone, Copy)]
-#[repr(C, packed)]
-pub struct HvInputModifyVtlProtectionMaskWithPageList {
-    pub mask: HvInputModifyVtlProtectionMask,
-    pub gpa_page_list: [u64; HV_MODIFY_MAX_PAGES],
-}
-
-impl HvInputModifyVtlProtectionMaskWithPageList {
-    pub fn new() -> Self {
-        HvInputModifyVtlProtectionMaskWithPageList {
-            mask: HvInputModifyVtlProtectionMask::new(),
             gpa_page_list: [0u64; HV_MODIFY_MAX_PAGES],
         }
     }
 }
 
-impl Default for HvInputModifyVtlProtectionMaskWithPageList {
+impl Default for HvInputModifyVtlProtectionMask {
     fn default() -> Self {
         Self::new()
     }

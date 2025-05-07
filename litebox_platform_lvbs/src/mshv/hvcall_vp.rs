@@ -39,8 +39,8 @@ pub fn hvcall_set_vp_registers(
     hvin.header.partitionid = HV_PARTITION_ID_SELF;
     hvin.header.vpindex = HV_VP_INDEX_SELF;
     hvin.header.inputvtl = input_vtl;
-    hvin.element.name = reg_name;
-    hvin.element.valuelow = value;
+    hvin.element[0].name = reg_name;
+    hvin.element[0].valuelow = value;
 
     hv_do_rep_hypercall(
         HVCALL_SET_VP_REGISTERS,
