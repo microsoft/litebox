@@ -132,7 +132,6 @@ pub struct HvX64SegmentRegister {
 impl HvX64SegmentRegister {
     pub fn new() -> Self {
         HvX64SegmentRegister {
-            base: 0,
             limit: u32::MAX,
             ..Default::default()
         }
@@ -374,7 +373,7 @@ impl Default for HvVpAssistPage {
 // We do not support Hyper-V hypercalls with multiple input pages (a large request must be broken down).
 // Thus, the number of maximum GPA pages that each hypercall can protect is restricted like below.
 #[expect(clippy::cast_possible_truncation)]
-pub(crate) const HV_MODIFY_MAX_PAGES: usize =
+const HV_MODIFY_MAX_PAGES: usize =
     ((PAGE_SIZE as u32 - u64::BITS * 2 / 8) / (u64::BITS / 8)) as usize;
 
 #[derive(Clone, Copy)]
@@ -389,6 +388,8 @@ pub struct HvInputModifyVtlProtectionMask {
 }
 
 impl HvInputModifyVtlProtectionMask {
+    pub const MAX_PAGES_PER_REQUEST: usize = HV_MODIFY_MAX_PAGES;
+
     pub fn new() -> Self {
         HvInputModifyVtlProtectionMask {
             partition_id: 0,

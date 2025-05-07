@@ -1,8 +1,9 @@
-//! VTL1 kernel boot parameters (compatible with Linux kernel's boot_params structure)
+//! VTL1 kernel boot parameters (compatible with Linux kernel's boot_params structure and command line)
 
 use crate::mshv::vtl1_mem_layout::{
-    VTL1_BOOT_PARAMS_PAGE, VtlMemoryError, get_address_of_special_page,
+    VTL1_BOOT_PARAMS_PAGE, VTL1_CMDLINE_PAGE, VtlMemoryError, get_address_of_special_page,
 };
+use core::ffi::{CStr, c_char};
 use num_enum::TryFromPrimitive;
 
 #[cfg(debug_assertions)]
@@ -35,9 +36,7 @@ pub struct BootE820Entry {
 impl BootE820Entry {
     pub fn new() -> Self {
         Self {
-            addr: 0,
-            size: 0,
-            typ: 0,
+            ..Default::default()
         }
     }
 }
@@ -114,10 +113,45 @@ pub fn dump_boot_params() {
     }
 }
 
+#[cfg(debug_assertions)]
+pub fn dump_cmdline() {
+    let cmdline = get_address_of_special_page(VTL1_CMDLINE_PAGE) as *const c_char;
+    if cmdline.is_null() {
+        return;
+    }
+
+    if let Some(cmdline_str) = unsafe { CStr::from_ptr(cmdline).to_str().ok() } {
+        serial_println!("{}", cmdline_str);
+    }
+}
+
 /// Funtion to get the guest physical start address and size of VTL1 memory
 pub fn get_vtl1_memory_info() -> Result<(u64, u64), VtlMemoryError> {
     let boot_params = get_address_of_special_page(VTL1_BOOT_PARAMS_PAGE) as *const BootParams;
     unsafe { (*boot_params).memory_info() }
+}
+
+/// Funtion to get the number of possible cpus from the command line (Linux kerne's num_possible_cpus())
+pub fn get_num_possible_cpus() -> Result<u32, VtlMemoryError> {
+    let cmdline = get_address_of_special_page(VTL1_CMDLINE_PAGE) as *const c_char;
+    if cmdline.is_null() {
+        return Err(VtlMemoryError::InvalidCmdLine);
+    }
+
+    if let Some(cmdline_str) = unsafe { CStr::from_ptr(cmdline).to_str().ok() } {
+        for token in cmdline_str.split_whitespace() {
+            if token.starts_with("possible_cpus=") {
+                if let Some((_, v)) = token.split_once('=') {
+                    let num = v.parse::<u32>().unwrap_or(0);
+                    if num > 0 {
+                        return Ok(num);
+                    }
+                }
+            }
+        }
+    }
+
+    Err(VtlMemoryError::InvalidCmdLine)
 }
 
 /// E820 entry type

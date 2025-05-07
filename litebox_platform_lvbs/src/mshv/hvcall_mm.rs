@@ -3,8 +3,8 @@
 use crate::{
     kernel_context::get_per_core_kernel_context,
     mshv::{
-        HV_MODIFY_MAX_PAGES, HV_PARTITION_ID_SELF, HV_VTL_SECURE,
-        HVCALL_MODIFY_VTL_PROTECTION_MASK, HvInputModifyVtlProtectionMask, HvPageProtFlags,
+        HV_PARTITION_ID_SELF, HV_VTL_SECURE, HVCALL_MODIFY_VTL_PROTECTION_MASK,
+        HvInputModifyVtlProtectionMask, HvPageProtFlags,
         hvcall::{HypervCallError, hv_do_rep_hypercall},
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
@@ -31,7 +31,7 @@ pub fn hv_modify_vtl_protection_mask(
     let mut total_protected: u64 = 0;
     while total_protected < num_pages {
         let mut pages_to_protect: u16 = 0;
-        for i in 0..HV_MODIFY_MAX_PAGES {
+        for i in 0..HvInputModifyVtlProtectionMask::MAX_PAGES_PER_REQUEST {
             if total_protected + i as u64 >= num_pages {
                 break;
             } else {

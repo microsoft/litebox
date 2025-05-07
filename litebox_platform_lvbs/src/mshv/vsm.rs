@@ -1,7 +1,7 @@
 //! VSM functions
 
 use crate::{
-    host::bootparam::get_vtl1_memory_info,
+    host::bootparam::{get_num_possible_cpus, get_vtl1_memory_info},
     kernel_context::get_core_id,
     mshv::{
         HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
@@ -29,6 +29,7 @@ pub fn init() {
     if get_core_id() == 0 {
         mshv_vsm_configure_partition();
     }
+
     mshv_vsm_secure_config_vtl0();
 
     if get_core_id() == 0 {
@@ -51,7 +52,14 @@ pub fn mshv_vsm_enable_aps(_cpu_present_mask: u64) -> u64 {
     #[cfg(debug_assertions)]
     serial_println!("VSM: Enable VTL of APs");
 
-    let num_cores = 6; // TODO: use cpumask
+    let Ok(num_cores) = get_num_possible_cpus() else {
+        serial_println!("Failed to get number of possible cores");
+        return 1;
+    };
+
+    #[cfg(debug_assertions)]
+    serial_println!("the number of possible cores: {}", num_cores);
+
     if let Err(result) = init_vtl_aps(num_cores) {
         serial_println!("Err: {:?}", result);
         let err: u32 = result.into();
