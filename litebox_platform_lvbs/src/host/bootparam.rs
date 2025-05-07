@@ -14,7 +14,7 @@ use crate::serial_println;
 // arch/x86/include/uapi/asm/e820.h). We need this because VTL0 kernel
 // passes memory information to VTL1 kernel via boot params.
 
-pub const E820_MAX_ENTRIES: usize = 128;
+const E820_MAX_ENTRIES: usize = 128;
 
 const E820_RAM: u32 = 1;
 const E820_RESERVED: u32 = 2;
@@ -27,23 +27,15 @@ const E820_RESERVED_KERN: u32 = 128;
 
 #[derive(Default, Clone, Copy)]
 #[repr(C, packed)]
-pub struct BootE820Entry {
+struct BootE820Entry {
     pub addr: u64,
     pub size: u64,
     pub typ: u32,
 }
 
-impl BootE820Entry {
-    pub fn new() -> Self {
-        Self {
-            ..Default::default()
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
-pub struct BootParams {
+struct BootParams {
     _unused0: [u8; 720], // Elements in this area are not used.
     pub e820_table: [BootE820Entry; E820_MAX_ENTRIES],
     _unused1: [u8; 816], // Elements in this area are not used.
@@ -157,7 +149,7 @@ pub fn get_num_possible_cpus() -> Result<u32, VtlMemoryError> {
 /// E820 entry type
 #[derive(Debug, PartialEq, TryFromPrimitive)]
 #[repr(u32)]
-pub enum E820Type {
+enum E820Type {
     Ram = E820_RAM,
     Reserved = E820_RESERVED,
     Acpi = E820_ACPI,
