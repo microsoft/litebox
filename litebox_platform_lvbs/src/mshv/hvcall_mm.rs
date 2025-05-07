@@ -9,10 +9,8 @@ use crate::{
         hvcall::{HypervCallError, hv_do_rep_hypercall},
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
+    serial_println,
 };
-
-#[cfg(debug_assertions)]
-use crate::serial_println;
 
 pub fn hv_modify_vtl_protection_mask(
     start: u64,
