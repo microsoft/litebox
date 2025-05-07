@@ -42,7 +42,7 @@ pub fn hv_modify_vtl_protection_mask(
 
         #[cfg(debug_assertions)]
         serial_println!(
-            "protect addresses from {:#x} to {:#x}",
+            "protect GPAs from {:#x} to {:#x}",
             start + total_protected * PAGE_SIZE as u64,
             start + (total_protected + u64::from(pages_to_protect)) * PAGE_SIZE as u64,
         );

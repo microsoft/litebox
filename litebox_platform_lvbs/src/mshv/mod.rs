@@ -42,8 +42,8 @@ pub const HYPERV_CPUID_INTERFACE: u32 = 0x_4000_0001;
 pub const HYPERV_CPUID_IMPLEMENT_LIMITS: u32 = 0x_4000_0005;
 pub const HYPERV_HYPERVISOR_PRESENT_BIT: u32 = 0x_8000_0000;
 
-pub const HV_PARTITION_ID_SELF: u64 = 0xffff_ffff_ffff_ffffu64;
-pub const HV_VP_INDEX_SELF: u32 = 0xffff_fffeu32;
+pub const HV_PARTITION_ID_SELF: u64 = u64::MAX;
+pub const HV_VP_INDEX_SELF: u32 = u32::MAX - 1;
 
 pub const HV_VTL_NORMAL: u8 = 0x0;
 pub const HV_VTL_SECURE: u8 = 0x1;
@@ -500,7 +500,7 @@ impl HvRegisterVsmPartitionConfig {
     }
 
     #[expect(clippy::used_underscore_binding)]
-    fn set_sub_config(&mut self, shift: u64, mask: u64, value: u64) {
+    fn set_sub_config(&mut self, mask: u64, shift: u64, value: u64) {
         self._as_u64 |= (value << shift) & mask;
     }
 
