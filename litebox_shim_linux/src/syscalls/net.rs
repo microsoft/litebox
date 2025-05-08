@@ -352,6 +352,7 @@ pub(crate) fn sys_recvfrom(
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString as _;
     use litebox::net::{ReceiveFlags, SendFlags};
     use litebox_common_linux::{AddressFamily, SockFlags, SockType, errno::Errno};
 
@@ -363,6 +364,8 @@ mod tests {
     };
 
     extern crate std;
+
+    const TUN_IP_ADDR: [u8; 4] = [10, 0, 0, 2];
 
     fn create_inet_addr(addr: [u8; 4], port: u16) -> CSockStorage {
         let inetaddr = CSockInetAddr {
@@ -382,10 +385,7 @@ mod tests {
         sockaddr
     }
 
-    #[test]
-    fn test_blocking_inet_socket() {
-        crate::syscalls::tests::init_platform(Some("tun99"));
-
+    fn test_tcp_socket(ip: [u8; 4], port: u16, callback: fn([u8; 4], u16) -> ()) {
         let server = sys_socket(
             AddressFamily::INET,
             SockType::Stream,
@@ -394,41 +394,14 @@ mod tests {
         )
         .unwrap();
         let server = i32::try_from(server).unwrap();
-        let sockaddr = create_inet_addr([10, 0, 0, 2], 8080);
+        let sockaddr = create_inet_addr(ip, port);
         let addr: ConstPtr<u8> = unsafe { core::mem::transmute(&sockaddr) };
         sys_bind(server, addr, core::mem::size_of::<CSockInetAddr>())
             .expect("Failed to bind socket");
         sys_listen(server, 1).expect("Failed to listen on socket");
 
-        std::thread::spawn(move || {
-            let client = sys_socket(
-                AddressFamily::INET,
-                SockType::Stream,
-                SockFlags::NONBLOCK,
-                None,
-            )
-            .unwrap();
-            let client = i32::try_from(client).unwrap();
-            let addr: ConstPtr<u8> = unsafe { core::mem::transmute(&sockaddr) };
-            while let Err(e) = sys_connect(client, addr, core::mem::size_of::<CSockInetAddr>()) {
-                assert_eq!(e, Errno::EAGAIN);
-                core::hint::spin_loop();
-            }
-
-            let mut buf = [0u8; 24];
-            let ptr = unsafe { core::mem::transmute(buf.as_mut_ptr()) };
-            let n = loop {
-                match sys_recvfrom(client, ptr, buf.len(), ReceiveFlags::DONTWAIT, None, None) {
-                    Ok(0) => {}
-                    Err(e) => {
-                        assert_eq!(e, Errno::EAGAIN);
-                    }
-                    Ok(n) => break n,
-                }
-                core::hint::spin_loop();
-            };
-            assert_eq!(&buf[..n], b"Hello, world!");
-        });
+        // Invoke the callback after binding and listening
+        callback(ip, port);
 
         let client_fd = loop {
             match sys_accept(server) {
@@ -444,5 +417,134 @@ mod tests {
         let ptr = unsafe { core::mem::transmute(buf.as_ptr()) };
         let n = sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None, None).unwrap();
         assert_eq!(n, buf.len());
+    }
+
+    #[test]
+    fn test_nonblocking_tcp_socket() {
+        let port = 8080;
+        crate::syscalls::tests::init_platform(Some("tun99"));
+
+        test_tcp_socket(TUN_IP_ADDR, port, |ip, port| {
+            std::thread::spawn(move || {
+                let client = sys_socket(
+                    AddressFamily::INET,
+                    SockType::Stream,
+                    SockFlags::NONBLOCK,
+                    None,
+                )
+                .unwrap();
+                let client = i32::try_from(client).unwrap();
+                let sockaddr = create_inet_addr(ip, port);
+                let addr: ConstPtr<u8> = unsafe { core::mem::transmute(&sockaddr) };
+                while let Err(e) = sys_connect(client, addr, core::mem::size_of::<CSockInetAddr>())
+                {
+                    assert_eq!(e, Errno::EAGAIN);
+                    core::hint::spin_loop();
+                }
+
+                let mut buf = [0u8; 24];
+                let ptr = unsafe { core::mem::transmute(buf.as_mut_ptr()) };
+                let n = loop {
+                    match sys_recvfrom(client, ptr, buf.len(), ReceiveFlags::DONTWAIT, None, None) {
+                        Ok(0) => {}
+                        Err(e) => {
+                            assert_eq!(e, Errno::EAGAIN);
+                        }
+                        Ok(n) => break n,
+                    }
+                    core::hint::spin_loop();
+                };
+                assert_eq!(&buf[..n], b"Hello, world!");
+            });
+        });
+    }
+
+    const EXTERNAL_CLIENT_C_CODE: &str = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+
+int main(int argc, char *argv[]) {
+    // create a tcp client to connect to the server and receive message from it
+    int sockfd;
+    struct sockaddr_in server_addr;
+    char buffer[1024];
+    int port;
+
+    // get port number from command line argument
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <port>\n", argv[0]);
+        return 1;
+    }
+    // convert port number from string to integer
+    port = atoi(argv[1]);
+    printf("Port number: %d\n", port);
+
+    // create socket
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    // set server address
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    server_addr.sin_addr.s_addr = inet_addr("10.0.0.2");
+
+    // sleep for 100ms to allow server to start
+    usleep(100000);
+
+    // connect to server
+    if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("connect");
+        close(sockfd);
+        return 1;
+    }
+
+    // receive message from server
+    int bytes_received = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
+    if (bytes_received < 0) {
+        perror("recv");
+        close(sockfd);
+        return 1;
+    }
+
+    // null-terminate the received message
+    buffer[bytes_received] = '\0';
+
+    // print the received message
+    printf("Received message: %s\n", buffer);
+
+    // close the socket
+    close(sockfd);
+    return 0;
+}
+    "#;
+
+    #[test]
+    fn test_nonblocking_tcp_socket_with_external_client() {
+        let port = 8081;
+        let dir_path = std::env::var("OUT_DIR").unwrap();
+        let src_path = std::path::Path::new(dir_path.as_str()).join("external_client.c");
+        std::fs::write(src_path.as_path(), EXTERNAL_CLIENT_C_CODE).unwrap();
+        let output_path = std::path::Path::new(dir_path.as_str()).join("external_client");
+        crate::syscalls::tests::compile(
+            src_path.to_str().unwrap(),
+            output_path.to_str().unwrap(),
+            true,
+            false,
+        );
+
+        std::process::Command::new(output_path.to_str().unwrap())
+            .args(&[port.to_string().as_str()])
+            .spawn()
+            .expect("Failed to spawn client");
+        crate::syscalls::tests::init_platform(Some("tun99"));
+        test_tcp_socket(TUN_IP_ADDR, port, |_, _| {});
     }
 }
