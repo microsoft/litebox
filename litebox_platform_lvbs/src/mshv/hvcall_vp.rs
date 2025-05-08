@@ -30,9 +30,9 @@ pub fn hvcall_set_vp_registers(
 ) -> Result<u64, HypervCallError> {
     let kernel_context = get_per_core_kernel_context();
     let hvin = unsafe {
-        &mut *kernel_context
-            .hv_hypercall_input_page_as_mut_ptr()
-            .cast::<HvSetVpRegistersInput>()
+        let ptr = kernel_context.hv_hypercall_input_page_as_mut_ptr();
+        (*ptr).fill(0);
+        &mut *ptr.cast::<HvSetVpRegistersInput>()
     };
     *hvin = HvSetVpRegistersInput::new();
 

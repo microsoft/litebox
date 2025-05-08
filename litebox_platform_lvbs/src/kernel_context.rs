@@ -52,7 +52,6 @@ impl KernelContext {
     }
 
     pub fn hv_hypercall_input_page_as_mut_ptr(&mut self) -> *mut [u8; PAGE_SIZE] {
-        self.hvcall_input = [0u8; PAGE_SIZE];
         &raw mut self.hvcall_input
     }
 }

@@ -18,9 +18,9 @@ pub fn hv_modify_vtl_protection_mask(
 ) -> Result<u64, HypervCallError> {
     let kernel_context = get_per_core_kernel_context();
     let hvin = unsafe {
-        &mut *kernel_context
-            .hv_hypercall_input_page_as_mut_ptr()
-            .cast::<HvInputModifyVtlProtectionMask>()
+        let ptr = kernel_context.hv_hypercall_input_page_as_mut_ptr();
+        (*ptr).fill(0);
+        &mut *ptr.cast::<HvInputModifyVtlProtectionMask>()
     };
     *hvin = HvInputModifyVtlProtectionMask::new();
 
