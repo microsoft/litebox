@@ -1,6 +1,6 @@
 //! Memory management related functionality
 
-pub mod alloc;
+pub mod allocator;
 pub mod linux;
 
 #[cfg(test)]
@@ -8,7 +8,7 @@ mod tests;
 
 use core::ops::Range;
 
-use ::alloc::vec::Vec;
+use alloc::vec::Vec;
 use linux::{
     MappingError, PageFaultError, PageRange, VmFlags, Vmem, VmemPageFaultHandler, VmemUnmapError,
 };

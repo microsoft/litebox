@@ -674,10 +674,10 @@ impl litebox::platform::StdioProvider for LinuxUserland {
 }
 
 #[global_allocator]
-static SLAB_ALLOC: litebox::mm::alloc::SafeZoneAllocator<'static, 28, LinuxUserland> =
-    litebox::mm::alloc::SafeZoneAllocator::new();
+static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 28, LinuxUserland> =
+    litebox::mm::allocator::SafeZoneAllocator::new();
 
-impl litebox::mm::alloc::MemoryProvider for LinuxUserland {
+impl litebox::mm::allocator::MemoryProvider for LinuxUserland {
     fn alloc(layout: &std::alloc::Layout) -> Option<(usize, usize)> {
         let size = core::cmp::max(
             layout.size().next_power_of_two(),

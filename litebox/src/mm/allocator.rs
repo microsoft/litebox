@@ -29,6 +29,9 @@ pub trait MemoryProvider {
 }
 
 /// Allocator that uses buddy allocator for pages and slab allocator for small objects.
+///
+/// `ORDER` is the maximum order of the buddy allocator, specifying the maximum size of the
+/// allocation that can be done using the buddy allocator -- i.e., 2^ORDER * PAGE_SIZE.
 pub struct SafeZoneAllocator<'a, const ORDER: usize, M: MemoryProvider> {
     buddy_allocator: LockedHeapWithRescue<ORDER>,
     slab_allocator: SpinMutex<ZoneAllocator<'a>>,
@@ -71,10 +74,8 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
         }
     }
 
-    /// Adds a range of memory to the buddy allocator.
-    ///
-    /// In addition to [`MemoryProvider::alloc`], this is used to add memory
-    /// to the buddy allocator when the system is initialized.
+    /// Adds a range of memory to allow it to be controlled by the buddy allocator.
+    /// Morally, the buddy allocator takes ownership of this range of memory.
     ///
     /// # Safety
     ///

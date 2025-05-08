@@ -7,7 +7,7 @@ use litebox::{
     LiteBox,
     mm::{
         PageManager,
-        alloc::SafeZoneAllocator,
+        allocator::SafeZoneAllocator,
         linux::{PAGE_SIZE, PageFaultError, PageRange, VmFlags},
     },
     platform::RawConstPointer,
@@ -35,7 +35,7 @@ static ALLOCATOR: SafeZoneAllocator<'static, MAX_ORDER, MockKernel> = SafeZoneAl
 /// const Array for VA to PA mapping
 static MAPPING: SpinMutex<ArrayVec<VirtAddr, 1024>> = SpinMutex::new(ArrayVec::new_const());
 
-impl litebox::mm::alloc::MemoryProvider for MockKernel {
+impl litebox::mm::allocator::MemoryProvider for MockKernel {
     fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
         let mut mapping = MAPPING.lock();
         let (start, len) = MockHostInterface::alloc(layout)?;

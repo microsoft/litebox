@@ -29,13 +29,13 @@ mod alloc {
     const LITEBOX_PAGE_OFFSET: u64 = LINUX_PAGE_OFFSET + (1 << PGDIR_SHIFT);
 
     #[global_allocator]
-    static SNP_ALLOCATOR: litebox::mm::alloc::SafeZoneAllocator<
+    static SNP_ALLOCATOR: litebox::mm::allocator::SafeZoneAllocator<
         'static,
         HEAP_ORDER,
         super::SnpLinuxKenrel,
-    > = litebox::mm::alloc::SafeZoneAllocator::new();
+    > = litebox::mm::allocator::SafeZoneAllocator::new();
 
-    impl litebox::mm::alloc::MemoryProvider for super::SnpLinuxKenrel {
+    impl litebox::mm::allocator::MemoryProvider for super::SnpLinuxKenrel {
         fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
             super::HostSnpInterface::alloc(layout)
         }
