@@ -860,7 +860,7 @@ where
             .as_mut()
             .ok_or(ReceiveError::InvalidFd)?;
 
-        if !flags.is_empty() {
+        if flags.intersects(ReceiveFlags::DONTWAIT.complement()) {
             unimplemented!()
         }
 

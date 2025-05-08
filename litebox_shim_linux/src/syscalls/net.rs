@@ -112,6 +112,9 @@ impl Socket {
     }
 
     fn accept(&self) -> Result<SocketFd, Errno> {
+        if !self.get_status().contains(OFlags::NONBLOCK) {
+            todo!("blocking accept");
+        }
         litebox_net().lock().accept(&self.fd).map_err(Errno::from)
     }
 
@@ -215,19 +218,23 @@ fn read_sockaddr_from_user(sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<Soc
     storage.to_sockaddr(addrlen)
 }
 
-pub(crate) fn sys_accept(sockfd: i32) -> Result<SocketFd, Errno> {
+pub(crate) fn sys_accept(sockfd: i32) -> Result<u32, Errno> {
     let Ok(sockfd) = u32::try_from(sockfd) else {
         return Err(Errno::EBADF);
     };
 
-    match file_descriptors()
+    let fd = match file_descriptors()
         .read()
         .get_fd(sockfd)
         .ok_or(Errno::EBADF)?
     {
-        Descriptor::Socket(socket) => socket.accept(),
+        Descriptor::Socket(socket) => {
+            let fd = socket.accept()?;
+            Ok(Socket::new(fd, SockFlags::empty()))
+        }
         _ => Err(Errno::ENOTSOCK),
-    }
+    }?;
+    Ok(file_descriptors().write().insert(Descriptor::Socket(fd)))
 }
 
 pub(crate) fn sys_connect(fd: i32, sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<(), Errno> {
@@ -345,32 +352,23 @@ pub(crate) fn sys_recvfrom(
 
 #[cfg(test)]
 mod tests {
+    use litebox::net::{ReceiveFlags, SendFlags};
     use litebox_common_linux::{AddressFamily, SockFlags, SockType, errno::Errno};
 
-    use crate::ConstPtr;
+    use crate::{ConstPtr, syscalls::net::sys_recvfrom};
 
     use super::{
-        CSockInetAddr, CSockStorage, sys_accept, sys_bind, sys_connect, sys_listen, sys_socket,
+        CSockInetAddr, CSockStorage, sys_accept, sys_bind, sys_connect, sys_listen, sys_sendto,
+        sys_socket,
     };
 
     extern crate std;
 
-    #[test]
-    fn test_blocking_inet_socket() {
-        crate::syscalls::tests::init_platform(Some("tun99"));
-
-        let server = sys_socket(
-            AddressFamily::INET,
-            SockType::Stream,
-            SockFlags::empty(),
-            None,
-        )
-        .unwrap();
-        let server = i32::try_from(server).unwrap();
+    fn create_inet_addr(addr: [u8; 4], port: u16) -> CSockStorage {
         let inetaddr = CSockInetAddr {
             family: AddressFamily::INET as i16,
-            port: 8080u16.to_be(),
-            addr: [10, 0, 0, 2],
+            port: port.to_be(),
+            addr,
             __pad: 0,
         };
         let mut sockaddr = CSockStorage::default();
@@ -380,7 +378,23 @@ mod tests {
                 &mut sockaddr as *mut _ as *mut u8,
                 core::mem::size_of::<CSockInetAddr>(),
             );
-        }
+        };
+        sockaddr
+    }
+
+    #[test]
+    fn test_blocking_inet_socket() {
+        crate::syscalls::tests::init_platform(Some("tun99"));
+
+        let server = sys_socket(
+            AddressFamily::INET,
+            SockType::Stream,
+            SockFlags::NONBLOCK,
+            None,
+        )
+        .unwrap();
+        let server = i32::try_from(server).unwrap();
+        let sockaddr = create_inet_addr([10, 0, 0, 2], 8080);
         let addr: ConstPtr<u8> = unsafe { core::mem::transmute(&sockaddr) };
         sys_bind(server, addr, core::mem::size_of::<CSockInetAddr>())
             .expect("Failed to bind socket");
@@ -390,7 +404,7 @@ mod tests {
             let client = sys_socket(
                 AddressFamily::INET,
                 SockType::Stream,
-                SockFlags::empty(),
+                SockFlags::NONBLOCK,
                 None,
             )
             .unwrap();
@@ -401,16 +415,34 @@ mod tests {
                 core::hint::spin_loop();
             }
 
-            loop {
-                {
+            let mut buf = [0u8; 24];
+            let ptr = unsafe { core::mem::transmute(buf.as_mut_ptr()) };
+            let n = loop {
+                match sys_recvfrom(client, ptr, buf.len(), ReceiveFlags::DONTWAIT, None, None) {
+                    Ok(0) => {}
+                    Err(e) => {
+                        assert_eq!(e, Errno::EAGAIN);
+                    }
+                    Ok(n) => break n,
+                }
+                core::hint::spin_loop();
+            };
+            assert_eq!(&buf[..n], b"Hello, world!");
+        });
+
+        let client_fd = loop {
+            match sys_accept(server) {
+                Ok(fd) => break fd,
+                Err(e) => {
+                    assert_eq!(e, Errno::EAGAIN);
                     core::hint::spin_loop();
                 }
             }
-        });
-
-        while let Err(e) = sys_accept(server) {
-            assert_eq!(e, Errno::EAGAIN);
-            core::hint::spin_loop();
-        }
+        };
+        let client_fd = i32::try_from(client_fd).unwrap();
+        let buf = "Hello, world!";
+        let ptr = unsafe { core::mem::transmute(buf.as_ptr()) };
+        let n = sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None, None).unwrap();
+        assert_eq!(n, buf.len());
     }
 }
