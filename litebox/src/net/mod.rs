@@ -764,6 +764,7 @@ where
 
     /// Accept a new incoming connection on a listening socket.
     pub fn accept(&mut self, fd: &SocketFd) -> Result<SocketFd, AcceptError> {
+        self.automated_platform_interaction(PollDirection::Both);
         let socket_handle = self.handles[fd.x.as_usize()]
             .as_mut()
             .ok_or(AcceptError::InvalidFd)?;
