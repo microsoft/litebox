@@ -170,7 +170,7 @@ impl Descriptors {
             None
         }
     }
-    fn remove_socket(&mut self, fd: u32) -> Option<crate::syscalls::net::Socket> {
+    fn remove_socket(&mut self, fd: u32) -> Option<alloc::sync::Arc<crate::syscalls::net::Socket>> {
         let fd = fd as usize;
         if let Some(Descriptor::Socket(socket_fd)) = self
             .descriptors
@@ -203,7 +203,7 @@ impl Descriptors {
 
 enum Descriptor {
     File(litebox::fd::FileFd),
-    Socket(crate::syscalls::net::Socket),
+    Socket(alloc::sync::Arc<crate::syscalls::net::Socket>),
     PipeReader {
         consumer: alloc::sync::Arc<crate::channel::Consumer<u8>>,
         close_on_exec: core::sync::atomic::AtomicBool,
