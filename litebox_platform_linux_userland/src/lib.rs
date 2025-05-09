@@ -587,10 +587,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             });
         let ptr = unsafe {
             syscalls::syscall6(
-                #[cfg(target_arch = "x86_64")]
-                syscalls::Sysno::mmap,
-                #[cfg(target_arch = "x86")]
-                syscalls::Sysno::mmap2,
+                {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        syscalls::Sysno::mmap
+                    }
+                    #[cfg(target_arch = "x86")]
+                    {
+                        syscalls::Sysno::mmap2
+                    }
+                },
                 range.start,
                 range.len(),
                 prot_flags(initial_permissions)
@@ -728,10 +734,16 @@ impl litebox::mm::allocator::MemoryProvider for LinuxUserland {
         );
         unsafe {
             syscalls::syscall6(
-                #[cfg(target_arch = "x86_64")]
-                syscalls::Sysno::mmap,
-                #[cfg(target_arch = "x86")]
-                syscalls::Sysno::mmap2,
+                {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        syscalls::Sysno::mmap
+                    }
+                    #[cfg(target_arch = "x86")]
+                    {
+                        syscalls::Sysno::mmap2
+                    }
+                },
                 0,
                 size,
                 ProtFlags::PROT_READ_WRITE.bits().reinterpret_as_unsigned() as usize,
