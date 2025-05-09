@@ -1,15 +1,19 @@
 //! Hyper-V Hypercall functions for memory management
 
 use crate::{
+    debug_serial_println,
     kernel_context::get_per_core_kernel_context,
     mshv::{
         HV_PARTITION_ID_SELF, HV_VTL_SECURE, HVCALL_MODIFY_VTL_PROTECTION_MASK,
         HvInputModifyVtlProtectionMask, HvPageProtFlags,
         hvcall::{HypervCallError, hv_do_rep_hypercall},
-        vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
+        vtl1_mem_layout::PAGE_SHIFT,
     },
     serial_println,
 };
+
+#[cfg(debug_assertions)]
+use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 
 pub fn hv_modify_vtl_protection_mask(
     start: u64,
@@ -18,9 +22,9 @@ pub fn hv_modify_vtl_protection_mask(
 ) -> Result<u64, HypervCallError> {
     let kernel_context = get_per_core_kernel_context();
     let hvin = unsafe {
-        let ptr = kernel_context.hv_hypercall_input_page_as_mut_ptr();
-        (*ptr).fill(0);
-        &mut *ptr.cast::<HvInputModifyVtlProtectionMask>()
+        &mut *kernel_context
+            .hv_hypercall_input_page_as_mut_ptr()
+            .cast::<HvInputModifyVtlProtectionMask>()
     };
     *hvin = HvInputModifyVtlProtectionMask::new();
 
@@ -40,8 +44,7 @@ pub fn hv_modify_vtl_protection_mask(
             }
         }
 
-        #[cfg(debug_assertions)]
-        serial_println!(
+        debug_serial_println!(
             "protect GPAs from {:#x} to {:#x}",
             start + total_protected * PAGE_SIZE as u64,
             start + (total_protected + u64::from(pages_to_protect)) * PAGE_SIZE as u64,

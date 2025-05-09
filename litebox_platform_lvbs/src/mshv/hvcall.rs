@@ -2,26 +2,27 @@
 
 use crate::{
     arch::instrs::{rdmsr, wrmsr},
+    debug_serial_println,
     kernel_context::{get_core_id, get_per_core_kernel_context},
     mshv::{
         HV_HYPERCALL_REP_COMP_MASK, HV_HYPERCALL_REP_COMP_OFFSET, HV_HYPERCALL_REP_START_MASK,
         HV_HYPERCALL_REP_START_OFFSET, HV_HYPERCALL_RESULT_MASK, HV_HYPERCALL_VARHEAD_OFFSET,
-        HV_REGISTER_VP_INDEX, HV_STATUS_ACCESS_DENIED, HV_STATUS_INSUFFICIENT_BUFFERS,
-        HV_STATUS_INSUFFICIENT_MEMORY, HV_STATUS_INVALID_ALIGNMENT,
-        HV_STATUS_INVALID_CONNECTION_ID, HV_STATUS_INVALID_HYPERCALL_CODE,
-        HV_STATUS_INVALID_HYPERCALL_INPUT, HV_STATUS_INVALID_PARAMETER, HV_STATUS_INVALID_PORT_ID,
-        HV_STATUS_OPERATION_DENIED, HV_STATUS_SUCCESS, HV_STATUS_TIME_OUT,
-        HV_STATUS_VTL_ALREADY_ENABLED, HV_X64_MSR_GUEST_OS_ID, HV_X64_MSR_HYPERCALL,
-        HV_X64_MSR_HYPERCALL_ENABLE, HV_X64_MSR_VP_ASSIST_PAGE, HV_X64_MSR_VP_ASSIST_PAGE_ENABLE,
-        HYPERV_CPUID_IMPLEMENT_LIMITS, HYPERV_CPUID_INTERFACE,
-        HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, HYPERV_HYPERVISOR_PRESENT_BIT, vsm,
+        HV_STATUS_ACCESS_DENIED, HV_STATUS_INSUFFICIENT_BUFFERS, HV_STATUS_INSUFFICIENT_MEMORY,
+        HV_STATUS_INVALID_ALIGNMENT, HV_STATUS_INVALID_CONNECTION_ID,
+        HV_STATUS_INVALID_HYPERCALL_CODE, HV_STATUS_INVALID_HYPERCALL_INPUT,
+        HV_STATUS_INVALID_PARAMETER, HV_STATUS_INVALID_PORT_ID, HV_STATUS_OPERATION_DENIED,
+        HV_STATUS_SUCCESS, HV_STATUS_TIME_OUT, HV_STATUS_VTL_ALREADY_ENABLED,
+        HV_X64_MSR_GUEST_OS_ID, HV_X64_MSR_HYPERCALL, HV_X64_MSR_HYPERCALL_ENABLE,
+        HV_X64_MSR_VP_ASSIST_PAGE, HV_X64_MSR_VP_ASSIST_PAGE_ENABLE, HYPERV_CPUID_IMPLEMENT_LIMITS,
+        HYPERV_CPUID_INTERFACE, HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS,
+        HYPERV_HYPERVISOR_PRESENT_BIT, vsm,
     },
 };
 use core::arch::asm;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 #[cfg(debug_assertions)]
-use crate::serial_println;
+use crate::mshv::HV_REGISTER_VP_INDEX;
 
 const CPU_VERSION_INFO: u32 = 1;
 const HV_CPUID_SIGNATURE_EAX: u32 = 0x31237648;
@@ -102,20 +103,18 @@ pub fn init() -> Result<(), HypervError> {
         return Err(HypervError::InvalidHypercallPage);
     }
 
-    #[cfg(debug_assertions)]
-    serial_println!("HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
+    debug_serial_println!("HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
 
-    #[cfg(debug_assertions)]
     if get_core_id() == 0 {
-        serial_println!(
+        debug_serial_println!(
             "HV_X64_MSR_VP_ASSIST_PAGE: {:#x}",
             rdmsr(HV_X64_MSR_VP_ASSIST_PAGE)
         );
-        serial_println!(
+        debug_serial_println!(
             "HV_X64_MSR_GUEST_OS_ID: {:#x}",
             rdmsr(HV_X64_MSR_GUEST_OS_ID)
         );
-        serial_println!("HV_X64_MSR_HYPERCALL: {:#x}", rdmsr(HV_X64_MSR_HYPERCALL));
+        debug_serial_println!("HV_X64_MSR_HYPERCALL: {:#x}", rdmsr(HV_X64_MSR_HYPERCALL));
     }
 
     vsm::init();

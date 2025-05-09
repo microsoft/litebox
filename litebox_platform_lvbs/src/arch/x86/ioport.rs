@@ -134,6 +134,12 @@ macro_rules! serial_println {
     ($($arg:tt)*) => ($crate::serial_print!("{}\n", format_args!($($arg)*)));
 }
 
+#[macro_export]
+macro_rules! debug_serial_println {
+    () => (#[cfg(debug_assertions)] $crate::serial_print!("\n"));
+    ($($arg:tt)*) => (#[cfg(debug_assertions)] $crate::serial_print!("{}\n", format_args!($($arg)*)));
+}
+
 pub fn serial_print_string(s: &str) {
     com().lock().write_string(s);
 }

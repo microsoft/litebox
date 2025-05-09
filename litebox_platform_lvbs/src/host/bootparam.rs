@@ -36,9 +36,9 @@ struct BootE820Entry {
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 struct BootParams {
-    _unused0: [u8; 720], // Elements in this area are not used.
-    pub e820_table: [BootE820Entry; E820_MAX_ENTRIES],
-    _unused1: [u8; 816], // Elements in this area are not used.
+    _unused0: [u8; 720], // fields in this area are not used.
+    e820_table: [BootE820Entry; E820_MAX_ENTRIES],
+    _unused1: [u8; 816], // fields in this area are not used.
 }
 
 impl BootParams {
@@ -123,7 +123,7 @@ pub fn get_vtl1_memory_info() -> Result<(u64, u64), VtlMemoryError> {
     unsafe { (*boot_params).memory_info() }
 }
 
-/// Funtion to get the number of possible cpus from the command line (Linux kerne's num_possible_cpus())
+/// Funtion to get the number of possible cpus from the command line (Linux kernel's num_possible_cpus())
 pub fn get_num_possible_cpus() -> Result<u32, VtlMemoryError> {
     let cmdline = get_address_of_special_page(VTL1_CMDLINE_PAGE) as *const c_char;
     if cmdline.is_null() {
