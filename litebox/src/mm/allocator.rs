@@ -16,7 +16,9 @@ use spin::mutex::SpinMutex;
 pub trait MemoryProvider {
     /// For page allocation from host.
     ///
-    /// Note this is only called when the buddy allocator is out of memory.
+    /// Note this is only called when the allocator is out of memory.
+    /// To add memory to the allocator at any time (e.g., initialize the allocator with
+    /// pre-allocated fixed-size memory), use [`SafeZoneAllocator::fill_pages`].
     ///
     /// It can return more than requested size. On success, it returns the start address
     /// and the size of the allocated memory.
