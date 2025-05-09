@@ -395,12 +395,12 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                     }
                     .is_none()
                     {
-                        ret = libc::EFAULT;
+                        ret = -libc::EFAULT;
                     }
                 }
             } else {
                 // don't allow changing the SIGSYS handler
-                ret = libc::EINVAL;
+                ret = -libc::EINVAL;
             }
             SyscallRequest::Ret(isize::try_from(ret).unwrap())
         }

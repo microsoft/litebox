@@ -723,21 +723,24 @@ impl litebox::mm::allocator::MemoryProvider for LinuxUserland {
             // can always find a required chunk within the returned memory region.
             core::cmp::max(layout.align(), 0x1000) << 1,
         );
-        let addr = unsafe {
-            libc::mmap(
-                core::ptr::null_mut(),
+        unsafe {
+            syscalls::syscall6(
+                #[cfg(target_arch = "x86_64")]
+                syscalls::Sysno::mmap,
+                #[cfg(target_arch = "x86")]
+                syscalls::Sysno::mmap2,
+                0,
                 size,
-                ProtFlags::PROT_READ_WRITE.bits(),
-                (MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON).bits(),
-                -1,
+                ProtFlags::PROT_READ_WRITE.bits().reinterpret_as_unsigned() as usize,
+                (MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON)
+                    .bits()
+                    .reinterpret_as_unsigned() as usize,
+                usize::MAX,
                 0,
             )
-        };
-        if addr == libc::MAP_FAILED {
-            None
-        } else {
-            Some((addr as usize, size))
         }
+        .map(|addr| (addr, size))
+        .ok()
     }
 
     unsafe fn free(_addr: usize) {
