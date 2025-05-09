@@ -7,7 +7,7 @@ pub(crate) mod systrap;
 pub(crate) mod systrap {
     use litebox_common_linux::SyscallRequest;
 
-    pub(crate) const SYSCALL_ARG_MAGIC: u32 = u32::from_le_bytes(*b"LtBx");
+    pub(crate) const SYSCALL_ARG_MAGIC: usize = usize::from_le_bytes(*b"LtBx");
 
     pub(crate) fn init_sys_intercept(
         _handler: impl Fn(SyscallRequest<crate::LinuxUserland>) -> isize + Send + Sync + 'static,
