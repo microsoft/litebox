@@ -357,6 +357,17 @@ pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     },
 }
 
+bitflags::bitflags! {
+    pub struct MRemapFlags: u32 {
+        /// Permit the kernel to relocate the mapping to a new virtual address, if necessary.
+        const MREMAP_MAYMOVE = 1;
+        /// Place the mapping at exactly the address specified in `new_address`.
+        const MREMAP_FIXED = 2;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {

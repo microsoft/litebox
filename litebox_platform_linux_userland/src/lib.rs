@@ -12,7 +12,8 @@ use std::time::Duration;
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
-use litebox_common_linux::{MapFlags, ProtFlags, PunchthroughSyscall};
+use litebox::utils::ReinterpretUnsignedExt;
+use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
 
 mod syscall_intercept;
 
@@ -156,10 +157,6 @@ pub struct RawMutex {
     num_to_wake_up: AtomicU32,
 }
 
-fn latest_errno() -> i32 {
-    unsafe { *libc::__errno_location() }
-}
-
 impl RawMutex {
     fn block_or_maybe_timeout(
         &self,
@@ -201,26 +198,24 @@ impl RawMutex {
                 /* ignored */ None,
                 /* ignored */ 0,
             ) {
-                0 => {
+                Ok(0) => {
                     // Fallthrough: check if spurious.
                 }
-                -1 => {
-                    let errno = latest_errno();
-                    if errno == libc::EAGAIN {
-                        // A wake-up was already in progress when we attempted to wait. Has someone
-                        // already touched inner value? We only check this on the first time around,
-                        // anything else could be a true wake.
-                        if first_time && self.inner.load(SeqCst) != val {
-                            // Ah, we seem to have actually been immediately woken up! Let us not
-                            // miss this.
-                            return Err(ImmediatelyWokenUp);
-                        } else {
-                            // Fallthrough: check if spurious. A wake-up was already in progress
-                            // when we attempted to wait, so we can do a proper check.
-                        }
+                Err(syscalls::Errno::EAGAIN) => {
+                    // A wake-up was already in progress when we attempted to wait. Has someone
+                    // already touched inner value? We only check this on the first time around,
+                    // anything else could be a true wake.
+                    if first_time && self.inner.load(SeqCst) != val {
+                        // Ah, we seem to have actually been immediately woken up! Let us not
+                        // miss this.
+                        return Err(ImmediatelyWokenUp);
                     } else {
-                        panic!("Unexpected errno={errno} for FUTEX_WAIT")
+                        // Fallthrough: check if spurious. A wake-up was already in progress
+                        // when we attempted to wait, so we can do a proper check.
                     }
+                }
+                Err(e) => {
+                    panic!("Unexpected errno={e} for FUTEX_WAIT")
                 }
                 _ => unreachable!(),
             }
@@ -278,7 +273,7 @@ impl litebox::platform::RawMutex for RawMutex {
             Some(&temp_q),
             /* val3: ignored */ 0,
         ) {
-            0.. => {
+            Ok(_) => {
                 // On success, returns the number of tasks requeued or woken, which we ignore
             }
             _ => unreachable!(),
@@ -305,10 +300,8 @@ impl litebox::platform::RawMutex for RawMutex {
             /* number to requeue */ i32::MAX as u32,
             Some(&self.num_to_wake_up),
             /* val3: ignored */ 0,
-        );
-        if num_woken_or_requeued < 0 {
-            unreachable!()
-        }
+        )
+        .unwrap();
         let num_woken_up = core::cmp::min(n, u32::try_from(num_woken_or_requeued).unwrap());
 
         // Unlock the lock bits, allowing other wakers to run.
@@ -355,7 +348,15 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
         let Some(tun_socket_fd) = tun_fd.as_ref() else {
             unimplemented!("networking without tun is unimplemented")
         };
-        match nix::unistd::write(tun_socket_fd, packet) {
+        match unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::write,
+                usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
+                packet.as_ptr() as usize,
+                packet.len(),
+                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+            )
+        } {
             Ok(size) => {
                 if size != packet.len() {
                     unimplemented!()
@@ -376,11 +377,20 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
         let Some(tun_socket_fd) = tun_fd.as_ref() else {
             unimplemented!("networking without tun is unimplemented")
         };
-        nix::unistd::read(tun_socket_fd.as_raw_fd(), packet).map_err(|errno| {
-            if errno == nix::Error::EWOULDBLOCK || errno == nix::Error::EAGAIN {
+        unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::read,
+                usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
+                packet.as_mut_ptr() as usize,
+                packet.len(),
+                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+            )
+        }
+        .map_err(|e| {
+            if e == syscalls::Errno::EWOULDBLOCK || e == syscalls::Errno::EAGAIN {
                 litebox::platform::ReceiveError::WouldBlock
             } else {
-                unimplemented!("unexpected error {}", errno)
+                unimplemented!("unexpected error {}", e)
             }
         })
     }
@@ -445,11 +455,11 @@ impl litebox::platform::PunchthroughProvider for LinuxUserland {
 
 impl litebox::platform::DebugLogProvider for LinuxUserland {
     fn debug_log_print(&self, msg: &str) {
-        unsafe {
-            libc::syscall(
-                libc::SYS_write,
-                libc::STDERR_FILENO,
-                msg.as_ptr(),
+        let _ = unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::write,
+                libc::STDERR_FILENO as usize,
+                msg.as_ptr() as usize,
                 msg.len(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
                 syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
@@ -480,7 +490,7 @@ fn futex_timeout(
     timeout: Option<Duration>,
     uaddr2: Option<&AtomicU32>,
     val3: u32,
-) -> isize {
+) -> Result<usize, syscalls::Errno> {
     let uaddr: *const AtomicU32 = uaddr as _;
     let futex_op: i32 = futex_op as _;
     let timeout = timeout.map(|t| {
@@ -500,9 +510,17 @@ fn futex_timeout(
     });
     let timeout: *const libc::timespec = timeout.map_or(std::ptr::null(), |t| &t);
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
-    let ret =
-        unsafe { libc::syscall(libc::SYS_futex, uaddr, futex_op, val, timeout, uaddr2, val3) };
-    isize::try_from(ret).unwrap()
+    unsafe {
+        syscalls::syscall6(
+            syscalls::Sysno::futex,
+            uaddr as usize,
+            usize::try_from(futex_op).unwrap(),
+            val as usize,
+            timeout as usize,
+            uaddr2 as usize,
+            val3 as usize,
+        )
+    }
 }
 
 /// Safer invocation of the Linux futex syscall, with the "val2" variant of the arguments.
@@ -513,17 +531,25 @@ fn futex_val2(
     val2: u32,
     uaddr2: Option<&AtomicU32>,
     val3: u32,
-) -> isize {
+) -> Result<usize, syscalls::Errno> {
     let uaddr: *const AtomicU32 = uaddr as _;
     let futex_op: i32 = futex_op as _;
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
-    let ret = unsafe { libc::syscall(libc::SYS_futex, uaddr, futex_op, val, val2, uaddr2, val3) };
-    isize::try_from(ret).unwrap()
+    unsafe {
+        syscalls::syscall6(
+            syscalls::Sysno::futex,
+            uaddr as usize,
+            usize::try_from(futex_op).unwrap(),
+            val as usize,
+            val2 as usize,
+            uaddr2 as usize,
+            val3 as usize,
+        )
+    }
 }
 
-fn prot_flags(flags: MemoryRegionPermissions) -> nix::sys::mman::ProtFlags {
-    use nix::sys::mman::ProtFlags;
-    let mut res = nix::sys::mman::ProtFlags::PROT_NONE;
+fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
+    let mut res = ProtFlags::PROT_NONE;
     res.set(
         ProtFlags::PROT_READ,
         flags.contains(MemoryRegionPermissions::READ),
@@ -549,24 +575,33 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
+        let flags = MapFlags::MAP_PRIVATE
+            | MapFlags::MAP_ANONYMOUS
+            | MapFlags::MAP_FIXED
+            | (if can_grow_down {
+                MapFlags::MAP_GROWSDOWN
+            } else {
+                MapFlags::empty()
+            });
         let ptr = unsafe {
-            nix::sys::mman::mmap_anonymous(
-                Some(core::num::NonZeroUsize::new(range.start).expect("non null addr")),
-                core::num::NonZeroUsize::new(range.len()).expect("non zero len"),
-                prot_flags(initial_permissions),
-                nix::sys::mman::MapFlags::MAP_PRIVATE
-                    | nix::sys::mman::MapFlags::MAP_ANONYMOUS
-                    | nix::sys::mman::MapFlags::MAP_FIXED
-                    | (if can_grow_down {
-                        nix::sys::mman::MapFlags::MAP_GROWSDOWN
-                    } else {
-                        nix::sys::mman::MapFlags::empty()
-                    }),
+            syscalls::syscall6(
+                #[cfg(target_arch = "x86_64")]
+                syscalls::Sysno::mmap,
+                #[cfg(target_arch = "x86")]
+                syscalls::Sysno::mmap2,
+                range.start,
+                range.len(),
+                prot_flags(initial_permissions)
+                    .bits()
+                    .reinterpret_as_unsigned() as usize,
+                flags.bits().reinterpret_as_unsigned() as usize,
+                usize::MAX,
+                0,
             )
         }
         .expect("mmap failed");
         Ok(litebox::platform::trivial_providers::TransparentMutPtr {
-            inner: ptr.as_ptr().cast(),
+            inner: ptr as *mut u8,
         })
     }
 
@@ -574,18 +609,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         &self,
         range: std::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
-        assert_eq!(
-            unsafe {
-                libc::syscall(
-                    libc::SYS_munmap,
-                    range.start,
-                    range.len(),
-                    // This is to ensure it won't be intercepted by Seccomp if enabled.
-                    syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
-                )
-            },
-            0,
-        );
+        let _ = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::munmap,
+                range.start,
+                range.len(),
+                // This is to ensure it won't be intercepted by Seccomp if enabled.
+                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+            )
+        }
+        .expect("munmap failed");
         Ok(())
     }
 
@@ -594,20 +627,19 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         old_range: std::ops::Range<usize>,
         new_range: std::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::RemapError> {
-        let addr = core::ptr::NonNull::new(old_range.start as _).expect("non null addr");
-        let new_address =
-            Some(core::ptr::NonNull::new(new_range.start as _).expect("non null new addr"));
         let res = unsafe {
-            nix::sys::mman::mremap(
-                addr,
+            syscalls::syscall6(
+                syscalls::Sysno::mremap,
+                old_range.start,
                 old_range.len(),
                 new_range.len(),
-                nix::sys::mman::MRemapFlags::MREMAP_FIXED,
-                new_address,
+                MRemapFlags::MREMAP_FIXED.bits() as usize,
+                new_range.start,
+                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
             )
             .expect("mremap failed")
         };
-        assert_eq!(res.as_ptr() as usize, new_range.start);
+        assert_eq!(res, new_range.start);
         Ok(())
     }
 
@@ -616,17 +648,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         range: std::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
-        let mprotect_ret = unsafe {
-            libc::syscall(
-                libc::SYS_mprotect,
+        unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::mprotect,
                 range.start,
                 range.len(),
-                prot_flags(new_permissions).bits(),
+                prot_flags(new_permissions).bits().reinterpret_as_unsigned() as usize,
                 // This is to ensure it won't be intercepted by Seccomp if enabled.
                 syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
             )
-        };
-        assert_eq!(mprotect_ret, 0);
+        }
+        .expect("mprotect failed");
         Ok(())
     }
 }
@@ -648,26 +680,24 @@ impl litebox::platform::StdioProvider for LinuxUserland {
         stream: litebox::platform::StdioOutStream,
         buf: &[u8],
     ) -> Result<usize, litebox::platform::StdioWriteError> {
-        let n = unsafe {
-            libc::syscall(
-                libc::SYS_write,
-                match stream {
+        match unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::write,
+                usize::try_from(match stream {
                     litebox::platform::StdioOutStream::Stdout => libc::STDOUT_FILENO,
                     litebox::platform::StdioOutStream::Stderr => libc::STDERR_FILENO,
-                },
-                buf.as_ptr(),
+                })
+                .unwrap(),
+                buf.as_ptr() as usize,
                 buf.len(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
                 syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
             )
-        };
-        if n < 0 {
-            match latest_errno() {
-                libc::EPIPE => return Err(litebox::platform::StdioWriteError::Closed),
-                _ => panic!("unhandled error {}", latest_errno()),
-            }
+        } {
+            Ok(n) => Ok(n),
+            Err(syscalls::Errno::EPIPE) => Err(litebox::platform::StdioWriteError::Closed),
+            Err(err) => panic!("unhandled error {err}"),
         }
-        Ok(usize::try_from(n).unwrap())
     }
 
     fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {

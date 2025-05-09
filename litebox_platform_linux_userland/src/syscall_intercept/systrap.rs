@@ -95,42 +95,44 @@ unsafe extern "C" {
  * between `arch_prctl` or `rdfsbase/wrfsbase` to get/set the fs base.
  */
 /// Function pointer to get the current fs base.
-static GET_FS_BASE: spin::Once<fn() -> u64> = spin::Once::new();
+static GET_FS_BASE: spin::Once<fn() -> usize> = spin::Once::new();
 /// Function pointer to set the fs base.
-static SET_FS_BASE: spin::Once<fn(u64)> = spin::Once::new();
+static SET_FS_BASE: spin::Once<fn(usize)> = spin::Once::new();
 /// Litebox's fs base.
 ///
 /// TODO: Currently we assume there is only one thread in the process.
 /// Need to change it to per-thread.
-static FS_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FS_BASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Certain syscalls with this magic argument are allowed.
 /// This is useful for syscall interception where we need to invoke the original syscall.
-pub(crate) const SYSCALL_ARG_MAGIC: u64 = u64::from_le_bytes(*b"LITE BOX");
+pub(crate) const SYSCALL_ARG_MAGIC: usize = usize::from_le_bytes(*b"LITE BOX");
 
 /// Get fs register value via syscall `arch_prctl`.
-fn get_fs_base_arch_prctl() -> u64 {
-    const ARCH_GET_FS: u64 = 0x1003;
-    let mut fs_base = core::mem::MaybeUninit::<u64>::uninit();
-    assert_eq!(
-        unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_GET_FS, fs_base.as_mut_ptr()) },
-        0
-    );
+fn get_fs_base_arch_prctl() -> usize {
+    const ARCH_GET_FS: usize = 0x1003;
+    let mut fs_base = core::mem::MaybeUninit::<usize>::uninit();
+    unsafe {
+        syscalls::syscall2(
+            syscalls::Sysno::arch_prctl,
+            ARCH_GET_FS,
+            fs_base.as_mut_ptr() as usize,
+        )
+    }
+    .expect("arch_prctl failed");
     unsafe { fs_base.assume_init() }
 }
 
 /// Set fs register value via syscall `arch_prctl`.
-fn set_fs_base_arch_prctl(fs_base: u64) {
-    const ARCH_SET_FS: u64 = 0x1002;
-    assert_eq!(
-        unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_FS, fs_base) },
-        0
-    );
+fn set_fs_base_arch_prctl(fs_base: usize) {
+    const ARCH_SET_FS: usize = 0x1002;
+    unsafe { syscalls::syscall2(syscalls::Sysno::arch_prctl, ARCH_SET_FS, fs_base) }
+        .expect("arch_prctl failed");
 }
 
 /// Get fs register value via `rdfsbase` instruction.
-fn get_fs_base_rdfsbase() -> u64 {
-    let ret: u64;
+fn get_fs_base_rdfsbase() -> usize {
+    let ret: usize;
     unsafe {
         core::arch::asm!(
             "rdfsbase {}",
@@ -142,7 +144,7 @@ fn get_fs_base_rdfsbase() -> u64 {
 }
 
 /// Set fs register value via `wrfsbase` instruction.
-fn set_fs_base_wrfsbase(fs_base: u64) {
+fn set_fs_base_wrfsbase(fs_base: usize) {
     unsafe {
         core::arch::asm!(
             "wrfsbase {}",
@@ -406,17 +408,20 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             // never block SIGSYS
             let mut set = unsafe { *(syscall_args[1] as *const libc::sigset_t) };
             unsafe { libc::sigdelset(&raw mut set, libc::SIGSYS) };
-            let ret = unsafe {
-                libc::syscall(
-                    libc::SYS_rt_sigprocmask,
+            let ret: isize = match unsafe {
+                syscalls::syscall5(
+                    syscalls::Sysno::rt_sigprocmask,
                     syscall_args[0],
-                    &raw const set,
+                    &raw const set as usize,
                     syscall_args[2],
                     syscall_args[3],
                     SYSCALL_ARG_MAGIC,
                 )
+            } {
+                Ok(_) => 0,
+                Err(e) => e.into_raw() as isize,
             };
-            SyscallRequest::Ret(isize::try_from(ret).unwrap())
+            SyscallRequest::Ret(ret)
         }
         _ => todo!("Currently unimplemented syscall: {syscall_number}"),
     };
@@ -492,7 +497,7 @@ fn register_seccomp_filter() {
                         3,
                         SeccompCmpArgLen::Qword,
                         SeccompCmpOp::Eq,
-                        SYSCALL_ARG_MAGIC,
+                        SYSCALL_ARG_MAGIC as u64,
                     )
                     .unwrap(),
                 ])
@@ -526,7 +531,7 @@ fn register_seccomp_filter() {
                         3,
                         SeccompCmpArgLen::Qword,
                         SeccompCmpOp::Eq,
-                        SYSCALL_ARG_MAGIC,
+                        SYSCALL_ARG_MAGIC as u64,
                     )
                     .unwrap(),
                 ])
@@ -542,7 +547,7 @@ fn register_seccomp_filter() {
                         2,
                         SeccompCmpArgLen::Qword,
                         SeccompCmpOp::Eq,
-                        SYSCALL_ARG_MAGIC,
+                        SYSCALL_ARG_MAGIC as u64,
                     )
                     .unwrap(),
                 ])
@@ -578,7 +583,7 @@ fn register_seccomp_filter() {
                         4,
                         SeccompCmpArgLen::Qword,
                         SeccompCmpOp::Eq,
-                        SYSCALL_ARG_MAGIC,
+                        SYSCALL_ARG_MAGIC as u64,
                     )
                     .unwrap(),
                 ])
