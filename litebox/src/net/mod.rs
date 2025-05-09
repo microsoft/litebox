@@ -895,7 +895,7 @@ pub enum Protocol {
 
 bitflags! {
     /// Flags for the `receive` function.
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     pub struct ReceiveFlags: u32 {
         /// `MSG_CMSG_CLOEXEC`: close-on-exec for the associated file descriptor
         const CMSG_CLOEXEC = 0x40000000;
@@ -918,7 +918,7 @@ bitflags! {
 
 bitflags! {
     /// Flags for the `send` function.
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     pub struct SendFlags: u32 {
         /// `MSG_CONFIRM`: requests confirmation of the message delivery.
         const CONFIRM = 0x800;

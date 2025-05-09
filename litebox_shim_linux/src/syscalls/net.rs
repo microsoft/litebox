@@ -359,14 +359,14 @@ pub(crate) fn sys_sendto(
     len: usize,
     mut flags: SendFlags,
     sockaddr: Option<ConstPtr<u8>>,
-    addrlen: Option<usize>,
+    addrlen: u32,
 ) -> Result<usize, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
 
     let sockaddr = sockaddr
-        .map(|addr| read_sockaddr_from_user(addr, addrlen.unwrap_or(0)))
+        .map(|addr| read_sockaddr_from_user(addr, addrlen as usize))
         .transpose()?;
     let buf = unsafe { buf.to_cow_slice(len).ok_or(Errno::EFAULT) }?;
     let file_table = file_descriptors().read();
@@ -394,14 +394,14 @@ pub(crate) fn sys_recvfrom(
     buf: MutPtr<u8>,
     len: usize,
     mut flags: ReceiveFlags,
-    sockaddr: Option<ConstPtr<u8>>,
-    addrlen: Option<usize>,
+    sockaddr: Option<MutPtr<u8>>,
+    addrlen: Option<MutPtr<u32>>,
 ) -> Result<usize, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
-    if sockaddr.is_some() {
-        unimplemented!();
+    if sockaddr.is_some() || addrlen.is_some() {
+        todo!();
     }
 
     let file_table = file_descriptors().read();
@@ -507,7 +507,7 @@ mod tests {
         let ptr = unsafe { core::mem::transmute(buf.as_ptr()) };
         let n = if is_nonblocking {
             loop {
-                match sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None, None) {
+                match sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None, 0) {
                     Ok(0) => {}
                     Err(e) => {
                         assert_eq!(e, Errno::EAGAIN);
@@ -517,7 +517,7 @@ mod tests {
                 core::hint::spin_loop();
             }
         } else {
-            sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None, None)
+            sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None, 0)
                 .expect("Failed to send data")
         };
         assert_eq!(n, buf.len());

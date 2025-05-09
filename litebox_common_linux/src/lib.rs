@@ -4,6 +4,7 @@
 
 use litebox::{
     fs::OFlags,
+    net::{ReceiveFlags, SendFlags},
     platform::{RawConstPointer, RawMutPointer},
     utils::TruncateExt,
 };
@@ -531,6 +532,22 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         addr: Option<Platform::RawMutPointer<u8>>,
         addrlen: Option<Platform::RawMutPointer<u32>>,
         flags: SockFlags,
+    },
+    Sendto {
+        sockfd: i32,
+        buf: Platform::RawConstPointer<u8>,
+        len: usize,
+        flags: SendFlags,
+        addr: Option<Platform::RawConstPointer<u8>>,
+        addrlen: u32,
+    },
+    Recvfrom {
+        sockfd: i32,
+        buf: Platform::RawMutPointer<u8>,
+        len: usize,
+        flags: ReceiveFlags,
+        addr: Option<Platform::RawMutPointer<u8>>,
+        addrlen: Option<Platform::RawMutPointer<u32>>,
     },
     Bind {
         sockfd: i32,
