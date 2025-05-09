@@ -338,6 +338,12 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
             sockaddr,
             addrlen,
         } => syscalls::net::sys_connect(sockfd, sockaddr, addrlen).map(|()| 0),
+        SyscallRequest::Accept {
+            sockfd,
+            addr,
+            addrlen,
+            flags,
+        } => syscalls::net::sys_accept(sockfd, addr, addrlen, flags).map(|fd| fd as usize),
         SyscallRequest::Bind {
             sockfd,
             sockaddr,

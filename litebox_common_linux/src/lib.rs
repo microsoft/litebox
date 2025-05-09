@@ -526,6 +526,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         sockaddr: Platform::RawConstPointer<u8>,
         addrlen: usize,
     },
+    Accept {
+        sockfd: i32,
+        addr: Option<Platform::RawMutPointer<u8>>,
+        addrlen: Option<Platform::RawMutPointer<u32>>,
+        flags: SockFlags,
+    },
     Bind {
         sockfd: i32,
         sockaddr: Platform::RawConstPointer<u8>,

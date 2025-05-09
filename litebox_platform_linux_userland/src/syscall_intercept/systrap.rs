@@ -5,7 +5,7 @@ use core::ffi::{c_int, c_uint};
 use litebox::platform::RawMutPointer as _;
 use litebox::platform::trivial_providers::{TransparentConstPtr, TransparentMutPtr};
 use litebox::utils::{ReinterpretSignedExt as _, TruncateExt as _};
-use litebox_common_linux::{IoctlArg, SyscallRequest};
+use litebox_common_linux::{IoctlArg, SockFlags, SyscallRequest};
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 
 // Define a custom structure to reinterpret siginfo_t
@@ -319,6 +319,42 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                 inner: syscall_args[1] as *const u8,
             },
             addrlen: syscall_args[2],
+        },
+        libc::SYS_accept => SyscallRequest::Accept {
+            sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
+            addr: if syscall_args[1] == 0 {
+                None
+            } else {
+                Some(TransparentMutPtr {
+                    inner: syscall_args[1] as *mut u8,
+                })
+            },
+            addrlen: if syscall_args[2] == 0 {
+                None
+            } else {
+                Some(TransparentMutPtr {
+                    inner: syscall_args[2] as *mut u32,
+                })
+            },
+            flags: SockFlags::empty(),
+        },
+        libc::SYS_accept4 => SyscallRequest::Accept {
+            sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
+            addr: if syscall_args[1] == 0 {
+                None
+            } else {
+                Some(TransparentMutPtr {
+                    inner: syscall_args[1] as *mut u8,
+                })
+            },
+            addrlen: if syscall_args[2] == 0 {
+                None
+            } else {
+                Some(TransparentMutPtr {
+                    inner: syscall_args[2] as *mut u32,
+                })
+            },
+            flags: SockFlags::from_bits_truncate(syscall_args[3].truncate()),
         },
         libc::SYS_bind => SyscallRequest::Bind {
             sockfd: syscall_args[0].reinterpret_as_signed().truncate(),

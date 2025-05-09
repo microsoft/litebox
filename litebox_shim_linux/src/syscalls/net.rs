@@ -275,7 +275,16 @@ fn read_sockaddr_from_user(sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<Soc
     storage.to_sockaddr(addrlen)
 }
 
-pub(crate) fn sys_accept(sockfd: i32) -> Result<u32, Errno> {
+pub(crate) fn sys_accept(
+    sockfd: i32,
+    addr: Option<MutPtr<u8>>,
+    addrlen: Option<MutPtr<u32>>,
+    flags: SockFlags,
+) -> Result<u32, Errno> {
+    if addr.is_some() || addrlen.is_some() {
+        todo!("accept with addr");
+    }
+
     let Ok(sockfd) = u32::try_from(sockfd) else {
         return Err(Errno::EBADF);
     };
@@ -288,7 +297,7 @@ pub(crate) fn sys_accept(sockfd: i32) -> Result<u32, Errno> {
             // drop file table as `accept` may block
             drop(file_table);
             let fd = socket.accept()?;
-            Descriptor::Socket(alloc::sync::Arc::new(Socket::new(fd, SockFlags::empty())))
+            Descriptor::Socket(alloc::sync::Arc::new(Socket::new(fd, flags)))
         }
         _ => return Err(Errno::ENOTSOCK),
     };
@@ -482,7 +491,7 @@ mod tests {
 
         let client_fd = if is_nonblocking {
             loop {
-                match sys_accept(server) {
+                match sys_accept(server, None, None, SockFlags::empty()) {
                     Ok(fd) => break fd,
                     Err(e) => {
                         assert_eq!(e, Errno::EAGAIN);
@@ -491,7 +500,7 @@ mod tests {
                 }
             }
         } else {
-            sys_accept(server).expect("Failed to accept connection")
+            sys_accept(server, None, None, SockFlags::empty()).expect("Failed to accept connection")
         };
         let client_fd = i32::try_from(client_fd).unwrap();
         let buf = "Hello, world!";
