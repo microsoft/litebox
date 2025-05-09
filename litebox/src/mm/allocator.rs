@@ -10,9 +10,32 @@ use buddy_system_allocator::LockedHeapWithRescue;
 use slabmalloc::{AllocationError, Allocator, LargeObjectPage, ObjectPage, ZoneAllocator};
 use spin::mutex::SpinMutex;
 
-use super::MemoryProvider;
+/// Memory provider trait for global allocator.
+///
+/// TODO: consider taking a `&mut self` to allow for more flexibility in the future.
+pub trait MemoryProvider {
+    /// For page allocation from host.
+    ///
+    /// Note this is only called when the allocator is out of memory.
+    /// To add memory to the allocator at any time (e.g., initialize the allocator with
+    /// pre-allocated fixed-size memory), use [`SafeZoneAllocator::fill_pages`].
+    ///
+    /// It can return more than requested size. On success, it returns the start address
+    /// and the size of the allocated memory.
+    fn alloc(layout: &Layout) -> Option<(usize, usize)>;
+
+    /// Returns the memory back to host.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the `addr` is valid and was allocated by [`Self::alloc`].
+    unsafe fn free(addr: usize);
+}
 
 /// Allocator that uses buddy allocator for pages and slab allocator for small objects.
+///
+/// `ORDER` is the maximum order of the buddy allocator, specifying the maximum size of the
+/// allocation that can be done using the buddy allocator -- i.e., 2^ORDER * PAGE_SIZE.
 pub struct SafeZoneAllocator<'a, const ORDER: usize, M: MemoryProvider> {
     buddy_allocator: LockedHeapWithRescue<ORDER>,
     slab_allocator: SpinMutex<ZoneAllocator<'a>>,
@@ -28,20 +51,41 @@ impl<const ORDER: usize, M: MemoryProvider> Default for SafeZoneAllocator<'_, OR
 impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
     const PAGE_SIZE: usize = 4096;
     /// 4 KiB
-    const BASE_PAGE_SIZE: usize = size_of::<ObjectPage>();
+    const BASE_PAGE_SIZE: usize = 4096;
     /// 2 MiB
-    const LARGE_PAGE_SIZE: usize = size_of::<LargeObjectPage>();
+    const LARGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
     const BASE_PAGE_SIZE_ORDER: u32 = (Self::BASE_PAGE_SIZE / Self::PAGE_SIZE).trailing_zeros();
     const LARGE_PAGE_SIZE_ORDER: u32 = (Self::LARGE_PAGE_SIZE / Self::PAGE_SIZE).trailing_zeros();
 
     pub const fn new() -> Self {
         Self {
             buddy_allocator: LockedHeapWithRescue::new(|heap, layout| {
-                M::rescue_heap(heap, layout);
+                let page_aligned_size = layout.size().next_power_of_two();
+                if page_aligned_size.trailing_zeros() as usize > ORDER {
+                    unimplemented!("requested size {page_aligned_size:#} is too large");
+                }
+                let Ok(layout) = Layout::from_size_align(page_aligned_size, page_aligned_size)
+                else {
+                    unreachable!();
+                };
+                if let Some((start, size)) = M::alloc(&layout) {
+                    // the returned size might be larger than requested (i.e., layout.size())
+                    unsafe { heap.add_to_heap(start, start + size) };
+                }
             }),
             slab_allocator: SpinMutex::new(ZoneAllocator::new()),
             memory_provider: core::marker::PhantomData,
         }
+    }
+
+    /// Adds a range of memory to allow it to be controlled by the buddy allocator.
+    /// Morally, the buddy allocator takes ownership of this range of memory.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the memory range is valid and not used by any others.
+    pub unsafe fn fill_pages(&self, addr: usize, size: usize) {
+        unsafe { self.buddy_allocator.lock().add_to_heap(addr, addr + size) };
     }
 
     /// Allocates a new [`ObjectPage`] from the System.
@@ -56,21 +100,21 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
             .map(|r| unsafe { transmute(r as usize) })
     }
 
-    /// Allocate (1 << `order`) virtually and physically contiguous pages using buddy allocator.
-    pub(crate) fn allocate_pages(&self, order: u32) -> Option<*mut u8> {
+    /// Allocate (1 << `order`) virtually contiguous pages using buddy allocator.
+    pub fn allocate_pages(&self, order: u32) -> Option<*mut u8> {
         let ptr = unsafe {
             self.buddy_allocator.alloc(
                 Layout::from_size_align(
                     Self::BASE_PAGE_SIZE << order,
                     Self::BASE_PAGE_SIZE << order,
                 )
-                .unwrap(),
+                .ok()?,
             )
         };
         if ptr.is_null() { None } else { Some(ptr) }
     }
 
-    /// De-allocates physically contiguous pages returned from [`LockedSlabAllocator::allocate_pages`].
+    /// De-allocates virtually contiguous pages returned from [`SafeZoneAllocator::allocate_pages`].
     ///
     /// # Safety
     ///
@@ -79,8 +123,12 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
     /// * `ptr` is a block of memory currently allocated via this allocator and,
     ///
     /// * `order` is the same that was used to allocate that block of memory.
-    #[allow(dead_code)]
-    pub(crate) unsafe fn free_pages(&self, ptr: *mut u8, order: u32) {
+    ///
+    /// # Panics
+    ///
+    /// Panics if `order` is greater than `ORDER`.
+    pub unsafe fn free_pages(&self, ptr: *mut u8, order: u32) {
+        assert!(order as usize <= ORDER);
         unsafe {
             self.buddy_allocator.dealloc(
                 ptr,

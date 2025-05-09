@@ -1,5 +1,6 @@
 //! Memory management related functionality
 
+pub mod allocator;
 pub mod linux;
 
 #[cfg(test)]
