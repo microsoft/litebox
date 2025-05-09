@@ -354,6 +354,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                 usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
                 packet.as_ptr() as usize,
                 packet.len(),
+                // Unused by the syscall but would be checked by Seccomp filter if enabled.
                 syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
             )
         } {
@@ -383,6 +384,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                 usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
                 packet.as_mut_ptr() as usize,
                 packet.len(),
+                // Unused by the syscall but would be checked by Seccomp filter if enabled.
                 syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
             )
         }
@@ -635,6 +637,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 new_range.len(),
                 MRemapFlags::MREMAP_FIXED.bits() as usize,
                 new_range.start,
+                // Unused by the syscall but would be checked by Seccomp filter if enabled.
                 syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
             )
             .expect("mremap failed")

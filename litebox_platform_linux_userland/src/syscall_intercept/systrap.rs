@@ -415,6 +415,7 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                     &raw const set as usize,
                     syscall_args[2],
                     syscall_args[3],
+                    // Unused by the syscall but would be checked by Seccomp filter if enabled.
                     SYSCALL_ARG_MAGIC,
                 )
             } {
