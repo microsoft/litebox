@@ -12,8 +12,8 @@ use std::time::Duration;
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
-use litebox::utils::ReinterpretUnsignedExt;
-use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
+use litebox::utils::ReinterpretUnsignedExt as _;
+use litebox_common_linux::{MRemapFlags, MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
 
 mod syscall_intercept;
 
@@ -351,7 +351,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
         match unsafe {
             syscalls::syscall4(
                 syscalls::Sysno::write,
-                usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
+                tun_socket_fd.as_raw_fd().reinterpret_as_unsigned() as usize,
                 packet.as_ptr() as usize,
                 packet.len(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
@@ -381,7 +381,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
         unsafe {
             syscalls::syscall4(
                 syscalls::Sysno::read,
-                usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
+                tun_socket_fd.as_raw_fd().reinterpret_as_unsigned() as usize,
                 packet.as_mut_ptr() as usize,
                 packet.len(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
