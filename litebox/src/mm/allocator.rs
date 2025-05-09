@@ -11,6 +11,8 @@ use slabmalloc::{AllocationError, Allocator, LargeObjectPage, ObjectPage, ZoneAl
 use spin::mutex::SpinMutex;
 
 /// Memory provider trait for global allocator.
+///
+/// TODO: consider taking a `&mut self` to allow for more flexibility in the future.
 pub trait MemoryProvider {
     /// For page allocation from host.
     ///
