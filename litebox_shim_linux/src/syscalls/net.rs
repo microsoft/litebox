@@ -35,7 +35,7 @@ macro_rules! transmute_sockaddr {
                 let mut buf = [0u8; size_of::<$addr_type>()];
                 unsafe {
                     core::ptr::copy_nonoverlapping(
-                        &self as *const _ as *const u8,
+                        (&raw const self).cast::<u8>(),
                         buf.as_mut_ptr(),
                         size_of::<$addr_type>(),
                     );
@@ -50,8 +50,8 @@ transmute_sockaddr!(transmute_to_unix, CSockUnixAddr);
 transmute_sockaddr!(transmute_to_inet, CSockInetAddr);
 
 impl CSockStorage {
-    pub fn to_sockaddr(self, addrlen: usize) -> Result<SocketAddress, Errno> {
-        let family = self.sa_family as u32;
+    pub fn into_sockaddr(self, addrlen: usize) -> Result<SocketAddress, Errno> {
+        let family = u32::from(self.sa_family);
         match family {
             litebox_common_linux::AF_UNIX => todo!(),
             litebox_common_linux::AF_INET => {
@@ -272,7 +272,7 @@ fn read_sockaddr_from_user(sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<Soc
         );
     }
 
-    storage.to_sockaddr(addrlen)
+    storage.into_sockaddr(addrlen)
 }
 
 pub(crate) fn sys_accept(
@@ -377,10 +377,7 @@ pub(crate) fn sys_sendto(
             if socket.get_status().contains(OFlags::NONBLOCK) {
                 flags.insert(SendFlags::DONTWAIT);
             }
-            let sockaddr = match sockaddr {
-                Some(SocketAddress::Inet(addr)) => Some(addr),
-                None => None,
-            };
+            let sockaddr = sockaddr.map(|SocketAddress::Inet(addr)| addr);
             // drop file table as `sendto` may block
             drop(file_table);
             socket.sendto(&buf, flags, sockaddr)
@@ -430,14 +427,13 @@ pub(crate) fn sys_recvfrom(
 #[cfg(test)]
 mod tests {
     use alloc::string::ToString as _;
-    use litebox::net::{ReceiveFlags, SendFlags};
+    use litebox::net::SendFlags;
     use litebox_common_linux::{AddressFamily, SockFlags, SockType, errno::Errno};
 
-    use crate::{ConstPtr, syscalls::net::sys_recvfrom};
+    use crate::{ConstPtr, syscalls::file::sys_close};
 
     use super::{
-        CSockInetAddr, CSockStorage, sys_accept, sys_bind, sys_connect, sys_listen, sys_sendto,
-        sys_socket,
+        CSockInetAddr, CSockStorage, sys_accept, sys_bind, sys_listen, sys_sendto, sys_socket,
     };
 
     extern crate std;
@@ -454,8 +450,8 @@ mod tests {
         let mut sockaddr = CSockStorage::default();
         unsafe {
             core::ptr::copy_nonoverlapping(
-                &inetaddr as *const _ as *const u8,
-                &mut sockaddr as *mut _ as *mut u8,
+                (&raw const inetaddr).cast::<u8>(),
+                (&raw mut sockaddr).cast::<u8>(),
                 core::mem::size_of::<CSockInetAddr>(),
             );
         };
@@ -466,7 +462,7 @@ mod tests {
         ip: [u8; 4],
         port: u16,
         is_nonblocking: bool,
-        callback: impl FnOnce([u8; 4], u16) -> (),
+        callback: impl FnOnce([u8; 4], u16),
     ) {
         let server = sys_socket(
             AddressFamily::INET,
@@ -504,7 +500,7 @@ mod tests {
         };
         let client_fd = i32::try_from(client_fd).unwrap();
         let buf = "Hello, world!";
-        let ptr = unsafe { core::mem::transmute(buf.as_ptr()) };
+        let ptr = unsafe { core::mem::transmute::<*const _, ConstPtr<u8>>(buf.as_ptr()) };
         let n = if is_nonblocking {
             loop {
                 match sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None, 0) {
@@ -521,66 +517,8 @@ mod tests {
                 .expect("Failed to send data")
         };
         assert_eq!(n, buf.len());
-    }
-
-    fn test_tcp_socket_with_internal_client_common(is_nonblocking: bool, port: u16) {
-        crate::syscalls::tests::init_platform(Some("tun99"));
-
-        test_tcp_socket(TUN_IP_ADDR, port, is_nonblocking, |ip, port| {
-            std::thread::spawn(move || {
-                let client = sys_socket(
-                    AddressFamily::INET,
-                    SockType::Stream,
-                    if is_nonblocking {
-                        SockFlags::NONBLOCK
-                    } else {
-                        SockFlags::empty()
-                    },
-                    None,
-                )
-                .unwrap();
-                let client = i32::try_from(client).unwrap();
-                let sockaddr = create_inet_addr(ip, port);
-                let addr: ConstPtr<u8> = unsafe { core::mem::transmute(&sockaddr) };
-                if is_nonblocking {
-                    while let Err(e) =
-                        sys_connect(client, addr, core::mem::size_of::<CSockInetAddr>())
-                    {
-                        assert_eq!(e, Errno::EAGAIN);
-                        core::hint::spin_loop();
-                    }
-                } else {
-                    sys_connect(client, addr, core::mem::size_of::<CSockInetAddr>())
-                        .expect("Failed to connect to server");
-                }
-
-                let mut buf = [0u8; 24];
-                let ptr = unsafe { core::mem::transmute(buf.as_mut_ptr()) };
-                let n = if is_nonblocking {
-                    loop {
-                        match sys_recvfrom(
-                            client,
-                            ptr,
-                            buf.len(),
-                            ReceiveFlags::empty(),
-                            None,
-                            None,
-                        ) {
-                            Ok(0) => {}
-                            Err(e) => {
-                                assert_eq!(e, Errno::EAGAIN);
-                            }
-                            Ok(n) => break n,
-                        }
-                        core::hint::spin_loop();
-                    }
-                } else {
-                    sys_recvfrom(client, ptr, buf.len(), ReceiveFlags::empty(), None, None)
-                        .expect("Failed to receive data")
-                };
-                assert_eq!(&buf[..n], b"Hello, world!");
-            });
-        });
+        sys_close(client_fd).expect("Failed to close client socket");
+        sys_close(server).expect("Failed to close server socket");
     }
 
     const EXTERNAL_CLIENT_C_CODE: &str = r#"
@@ -650,11 +588,11 @@ int main(int argc, char *argv[]) {
 }
     "#;
 
-    fn test_nonblocking_tcp_socket_with_external_client(port: u16) {
+    fn test_tcp_socket_with_external_client(port: u16, is_nonblocking: bool) {
         let dir_path = std::env::var("OUT_DIR").unwrap();
-        let src_path = std::path::Path::new(dir_path.as_str()).join("external_nb_client.c");
+        let src_path = std::path::Path::new(dir_path.as_str()).join("external_client.c");
         std::fs::write(src_path.as_path(), EXTERNAL_CLIENT_C_CODE).unwrap();
-        let output_path = std::path::Path::new(dir_path.as_str()).join("external_nb_client");
+        let output_path = std::path::Path::new(dir_path.as_str()).join("external_client");
         crate::syscalls::tests::compile(
             src_path.to_str().unwrap(),
             output_path.to_str().unwrap(),
@@ -662,18 +600,22 @@ int main(int argc, char *argv[]) {
             false,
         );
 
+        #[allow(clippy::zombie_processes)]
         std::process::Command::new(output_path.to_str().unwrap())
-            .args(&[port.to_string().as_str()])
+            .args([port.to_string().as_str()])
             .spawn()
             .expect("Failed to spawn client");
         crate::syscalls::tests::init_platform(Some("tun99"));
-        test_tcp_socket(TUN_IP_ADDR, port, true, |_, _| {});
+        test_tcp_socket(TUN_IP_ADDR, port, is_nonblocking, |_, _| {});
     }
 
     #[test]
-    fn test_tcp_socket_in_sequence() {
-        test_tcp_socket_with_internal_client_common(true, 8080);
-        test_tcp_socket_with_internal_client_common(false, 8081);
-        test_nonblocking_tcp_socket_with_external_client(8082);
+    fn test_tun_blocking_tcp_socket_with_external_client() {
+        test_tcp_socket_with_external_client(8080, false);
+    }
+
+    #[test]
+    fn test_tun_nonblocking_tcp_socket_with_external_client() {
+        test_tcp_socket_with_external_client(8080, true);
     }
 }

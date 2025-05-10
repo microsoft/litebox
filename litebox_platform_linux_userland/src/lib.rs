@@ -13,8 +13,7 @@ use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::utils::ReinterpretUnsignedExt as _;
-use litebox_common_linux::errno::Errno;
-use litebox_common_linux::{MRemapFlags, MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
+use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
 
 mod syscall_intercept;
 
@@ -61,7 +60,10 @@ impl LinuxUserland {
                         name
                     },
                     ifr_ifru: nix::libc::__c_anonymous_ifr_ifru {
-                        ifru_flags: i16::try_from(nix::libc::IFF_TUN).unwrap(),
+                        // IFF_NO_PI: no tun header
+                        // IFF_TUN: create tun (i.e., IP)
+                        ifru_flags: i16::try_from(nix::libc::IFF_TUN | nix::libc::IFF_NO_PI)
+                            .unwrap(),
                     },
                 };
                 let ifreq: *const libc::ifreq = &ifreq as _;
@@ -343,23 +345,14 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 }
 
-const TUN_IPV4_HEADER: [u8; 4] = [0x0, 0x0, 0x8, 0x0];
+// const TUN_IPV4_HEADER: [u8; 4] = [0x0, 0x0, 0x8, 0x0];
+// const TUN_IPV6_HEADER: [u8; 4] = [0x0, 0x0, 0x86, 0xdd];
 impl litebox::platform::IPInterfaceProvider for LinuxUserland {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
         let tun_fd = self.tun_socket_fd.read().unwrap();
         let Some(tun_socket_fd) = tun_fd.as_ref() else {
             unimplemented!("networking without tun is unimplemented")
         };
-        let iovec: [libc::iovec; 2] = [
-            libc::iovec {
-                iov_base: TUN_IPV4_HEADER.as_ptr() as *mut _,
-                iov_len: TUN_IPV4_HEADER.len(),
-            },
-            libc::iovec {
-                iov_base: packet.as_ptr() as *mut _,
-                iov_len: packet.len(),
-            },
-        ];
         match unsafe {
             syscalls::syscall4(
                 syscalls::Sysno::write,
@@ -371,7 +364,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
             )
         } {
             Ok(n) => {
-                if n != 4 + packet.len() {
+                if n != packet.len() {
                     unimplemented!("unexpected size {n}")
                 }
                 Ok(())
@@ -390,18 +383,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
         let Some(tun_socket_fd) = tun_fd.as_ref() else {
             unimplemented!("networking without tun is unimplemented")
         };
-        let mut header: [u8; 4] = [0; 4];
-        let iovec: [libc::iovec; 2] = [
-            libc::iovec {
-                iov_base: header.as_mut_ptr() as *mut _,
-                iov_len: header.len(),
-            },
-            libc::iovec {
-                iov_base: packet.as_mut_ptr() as *mut _,
-                iov_len: packet.len(),
-            },
-        ];
-        match unsafe {
+        unsafe {
             syscalls::syscall4(
                 syscalls::Sysno::read,
                 tun_socket_fd.as_raw_fd().reinterpret_as_unsigned() as usize,
@@ -410,18 +392,11 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
                 syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
             )
-        } {
-            Ok(n) => {
-                if n < 4 {
-                    unimplemented!("unexpected size {n}")
-                }
-                Ok((n - 4) as usize)
-            }
-            Err(syscalls::Errno::EWOULDBLOCK) => {
-                Err(litebox::platform::ReceiveError::WouldBlock)
-            }
-            Err(errno) => unimplemented!("unexpected error {errno}"),
         }
+        .map_err(|errno| match errno {
+            syscalls::Errno::EWOULDBLOCK => litebox::platform::ReceiveError::WouldBlock,
+            _ => unimplemented!("unexpected error {errno}"),
+        })
     }
 }
 

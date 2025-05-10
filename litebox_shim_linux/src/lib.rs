@@ -351,8 +351,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
             flags,
             addr,
             addrlen,
-        } => syscalls::net::sys_sendto(sockfd, buf, len, flags, addr, addrlen)
-            .map(|size| size as usize),
+        } => syscalls::net::sys_sendto(sockfd, buf, len, flags, addr, addrlen),
         SyscallRequest::Recvfrom {
             sockfd,
             buf,

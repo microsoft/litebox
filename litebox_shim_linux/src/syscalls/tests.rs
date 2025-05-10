@@ -17,12 +17,12 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) {
         let in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
         let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(litebox);
         let tar_ro_fs =
-            litebox::fs::tar_ro::FileSystem::new(&litebox, litebox::fs::tar_ro::empty_tar_file());
+            litebox::fs::tar_ro::FileSystem::new(litebox, litebox::fs::tar_ro::empty_tar_file());
         crate::set_fs(litebox::fs::layered::FileSystem::new(
-            &litebox,
+            litebox,
             in_mem_fs,
             litebox::fs::layered::FileSystem::new(
-                &litebox,
+                litebox,
                 dev_stdio,
                 tar_ro_fs,
                 litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,

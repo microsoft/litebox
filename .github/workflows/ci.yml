@@ -20,6 +20,9 @@ jobs:
       - name: Set up Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up tun
+        run: |
+          sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh
       - uses: Swatinem/rust-cache@v2
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features
@@ -46,6 +49,9 @@ jobs:
       - name: Set up Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up tun
+        run: |
+          sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh
       - uses: Swatinem/rust-cache@v2
       - run: ./.github/tools/github_actions_run_cargo build --target=i686-unknown-linux-gnu
       - run: ./.github/tools/github_actions_run_cargo nextest --target=i686-unknown-linux-gnu

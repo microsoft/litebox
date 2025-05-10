@@ -54,7 +54,7 @@ mod tests {
 
     #[test]
     fn test_stdio() {
-        crate::syscalls::tests::init_platform();
+        crate::syscalls::tests::init_platform(None);
 
         // Check that the stdio streams are in the file table
         let stdin_stat = sys_fstat(0).unwrap();

@@ -708,38 +708,6 @@ fn register_seccomp_filter() {
             ],
         ),
         (libc::SYS_rt_sigreturn, vec![]),
-        (
-            libc::SYS_readv,
-            vec![
-                // A backdoor to allow invoking readv.
-                SeccompRule::new(vec![
-                    SeccompCondition::new(
-                        3,
-                        SeccompCmpArgLen::Qword,
-                        SeccompCmpOp::Eq,
-                        SYSCALL_ARG_MAGIC,
-                    )
-                    .unwrap(),
-                ])
-                .unwrap(),
-            ],
-        ),
-        (
-            libc::SYS_writev,
-            vec![
-                // A backdoor to allow invoking writev.
-                SeccompRule::new(vec![
-                    SeccompCondition::new(
-                        3,
-                        SeccompCmpArgLen::Qword,
-                        SeccompCmpOp::Eq,
-                        SYSCALL_ARG_MAGIC,
-                    )
-                    .unwrap(),
-                ])
-                .unwrap(),
-            ],
-        ),
         (libc::SYS_sched_yield, vec![]),
         (libc::SYS_getpid, vec![]),
         (libc::SYS_uname, vec![]),
