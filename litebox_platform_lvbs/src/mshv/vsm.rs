@@ -35,6 +35,7 @@ pub fn init() {
 
     if get_core_id() == 0 {
         if let Ok((start, size)) = get_vtl1_memory_info() {
+            debug_serial_println!("VSM: Protect GPAs from {:#x} to {:#x}", start, start + size);
             let num_pages = size / PAGE_SIZE as u64;
             let prot = HvPageProtFlags::HV_PAGE_ACCESS_NONE;
             if let Err(result) = hv_modify_vtl_protection_mask(start, num_pages, prot) {
