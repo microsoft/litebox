@@ -1,3 +1,5 @@
+//! Socket-related syscalls, e.g., socket, bind, listen, etc.
+
 use core::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::atomic::{AtomicBool, AtomicU32},
@@ -46,8 +48,8 @@ macro_rules! transmute_sockaddr {
     };
 }
 
-transmute_sockaddr!(transmute_to_unix, CSockUnixAddr);
-transmute_sockaddr!(transmute_to_inet, CSockInetAddr);
+transmute_sockaddr!(into_unix, CSockUnixAddr);
+transmute_sockaddr!(into_inet, CSockInetAddr);
 
 impl CSockStorage {
     pub fn into_sockaddr(self, addrlen: usize) -> Result<SocketAddress, Errno> {
@@ -58,7 +60,7 @@ impl CSockStorage {
                 if addrlen < size_of::<CSockInetAddr>() {
                     return Err(Errno::EINVAL);
                 }
-                let inet_addr = self.transmute_to_inet();
+                let inet_addr = self.into_inet();
                 Ok(SocketAddress::Inet(SocketAddr::V4(SocketAddrV4::from(
                     inet_addr,
                 ))))
@@ -222,6 +224,7 @@ impl Socket {
     crate::syscalls::common_functions_for_file_status!();
 }
 
+/// Handle syscall `socket`
 pub(crate) fn sys_socket(
     domain: AddressFamily,
     ty: SockType,
@@ -275,6 +278,7 @@ fn read_sockaddr_from_user(sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<Soc
     storage.into_sockaddr(addrlen)
 }
 
+/// Handle syscall `accept`
 pub(crate) fn sys_accept(
     sockfd: i32,
     addr: Option<MutPtr<u8>>,
@@ -304,6 +308,7 @@ pub(crate) fn sys_accept(
     Ok(file_descriptors().write().insert(file))
 }
 
+/// Handle syscall `connect`
 pub(crate) fn sys_connect(fd: i32, sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<(), Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
@@ -319,6 +324,7 @@ pub(crate) fn sys_connect(fd: i32, sockaddr: ConstPtr<u8>, addrlen: usize) -> Re
     }
 }
 
+/// Handle syscall `bind`
 pub(crate) fn sys_bind(sockfd: i32, sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<(), Errno> {
     let Ok(sockfd) = u32::try_from(sockfd) else {
         return Err(Errno::EBADF);
@@ -338,6 +344,7 @@ pub(crate) fn sys_bind(sockfd: i32, sockaddr: ConstPtr<u8>, addrlen: usize) -> R
     }
 }
 
+/// Handle syscall `listen`
 pub(crate) fn sys_listen(sockfd: i32, backlog: u16) -> Result<(), Errno> {
     let Ok(sockfd) = u32::try_from(sockfd) else {
         return Err(Errno::EBADF);
@@ -353,6 +360,7 @@ pub(crate) fn sys_listen(sockfd: i32, backlog: u16) -> Result<(), Errno> {
     }
 }
 
+/// Handle syscall `sendto`
 pub(crate) fn sys_sendto(
     fd: i32,
     buf: ConstPtr<u8>,
@@ -386,6 +394,7 @@ pub(crate) fn sys_sendto(
     }
 }
 
+/// Handle syscall `recvfrom`
 pub(crate) fn sys_recvfrom(
     fd: i32,
     buf: MutPtr<u8>,

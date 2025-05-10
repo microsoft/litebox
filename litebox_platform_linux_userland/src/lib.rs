@@ -345,8 +345,6 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 }
 
-// const TUN_IPV4_HEADER: [u8; 4] = [0x0, 0x0, 0x8, 0x0];
-// const TUN_IPV6_HEADER: [u8; 4] = [0x0, 0x0, 0x86, 0xdd];
 impl litebox::platform::IPInterfaceProvider for LinuxUserland {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
         let tun_fd = self.tun_socket_fd.read().unwrap();
