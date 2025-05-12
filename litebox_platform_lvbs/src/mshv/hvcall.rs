@@ -105,6 +105,7 @@ pub fn init() -> Result<(), HypervError> {
 
     debug_serial_println!("HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
 
+    #[cfg(debug_assertions)]
     if get_core_id() == 0 {
         debug_serial_println!(
             "HV_X64_MSR_VP_ASSIST_PAGE: {:#x}",
