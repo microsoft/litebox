@@ -1,17 +1,16 @@
 use litebox::fs::OFlags;
 use litebox_common_linux::{EfdFlags, FcntlArg, FileDescriptorFlags};
 use litebox_platform_multiplex::{Platform, set_platform};
-use once_cell::race::OnceBox;
 
 use super::file::{sys_eventfd2, sys_fcntl, sys_pipe2};
 
 extern crate std;
 
 // Ensure we only init the platform once
-static INIT_FUNC: OnceBox<()> = OnceBox::new();
+static INIT_FUNC: spin::Once = spin::Once::new();
 
 pub(crate) fn init_platform(tun_device_name: Option<&str>) {
-    INIT_FUNC.get_or_init(|| {
+    INIT_FUNC.call_once(|| {
         set_platform(Platform::new(tun_device_name));
 
         let litebox = crate::litebox();
@@ -30,7 +29,6 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) {
             ),
             litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
         ));
-        alloc::boxed::Box::new(())
     });
 }
 
