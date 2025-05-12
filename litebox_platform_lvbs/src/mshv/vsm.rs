@@ -1,13 +1,23 @@
 //! VSM functions
 
 use crate::{
+    debug_serial_println,
+    host::bootparam::{get_num_possible_cpus, get_vtl1_memory_info},
+    kernel_context::get_core_id,
     mshv::{
+        HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
+        HV_REGISTER_CR_INTERCEPT_CR4_MASK, HV_REGISTER_VSM_PARTITION_CONFIG,
+        HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HvCrInterceptControlFlags, HvPageProtFlags,
+        HvRegisterVsmPartitionConfig, HvRegisterVsmVpSecureVtlConfig,
         VSM_VTL_CALL_FUNC_ID_BOOT_APS, VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY,
         VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL, VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT,
         VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE, VSM_VTL_CALL_FUNC_ID_LOAD_KDATA,
         VSM_VTL_CALL_FUNC_ID_LOCK_REGS, VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY,
         VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT, VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE,
-        VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, hvcall_vp::init_vtl_aps,
+        VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags, X86Cr4Flags,
+        hvcall_mm::hv_modify_vtl_protection_mask,
+        hvcall_vp::{hvcall_set_vp_registers, init_vtl_aps},
+        vtl1_mem_layout::PAGE_SIZE,
     },
     serial_println,
 };
@@ -16,14 +26,40 @@ use num_enum::TryFromPrimitive;
 /// VTL call parameters (param[0]: function ID, param[1-3]: parameters)
 pub const NUM_VTLCALL_PARAMS: usize = 4;
 
+pub fn init() {
+    if get_core_id() == 0 {
+        mshv_vsm_configure_partition();
+    }
+
+    mshv_vsm_secure_config_vtl0();
+
+    if get_core_id() == 0 {
+        if let Ok((start, size)) = get_vtl1_memory_info() {
+            debug_serial_println!("VSM: Protect GPAs from {:#x} to {:#x}", start, start + size);
+            let num_pages = size / PAGE_SIZE as u64;
+            let prot = HvPageProtFlags::HV_PAGE_ACCESS_NONE;
+            if let Err(result) = hv_modify_vtl_protection_mask(start, num_pages, prot) {
+                serial_println!("Err: {:?}", result);
+            }
+        } else {
+            serial_println!("Failed to get memory info");
+        }
+    }
+}
+
 /// VSM function for enabling VTL of APs
 /// # Panics
 /// Panics if hypercall for initializing VTL for APs fails
 pub fn mshv_vsm_enable_aps(_cpu_present_mask: u64) -> u64 {
-    #[cfg(debug_assertions)]
-    serial_println!("VSM: Enable VTL of APs");
+    debug_serial_println!("VSM: Enable VTL of APs");
 
-    let num_cores = 6; // TODO: use cpumask
+    let Ok(num_cores) = get_num_possible_cpus() else {
+        serial_println!("Failed to get number of possible cores");
+        return 1;
+    };
+
+    debug_serial_println!("the number of possible cores: {}", num_cores);
+
     if let Err(result) = init_vtl_aps(num_cores) {
         serial_println!("Err: {:?}", result);
         let err: u32 = result.into();
@@ -34,80 +70,148 @@ pub fn mshv_vsm_enable_aps(_cpu_present_mask: u64) -> u64 {
 
 /// VSM function for booting APs
 pub fn mshv_vsm_boot_aps(_cpu_online_mask_pfn: u64, _boot_signal_pfn: u64) -> u64 {
-    #[cfg(debug_assertions)]
-    serial_println!("VSM: Boot APs");
+    debug_serial_println!("VSM: Boot APs");
     // TODO: update boot signal page accordingly
+    0
+}
+
+pub fn mshv_vsm_secure_config_vtl0() -> u64 {
+    debug_serial_println!("VSM: Secure VTL0 configuration");
+
+    let mut config = HvRegisterVsmVpSecureVtlConfig::new();
+    config.set_mbec_enabled();
+    config.set_tlb_locked();
+
+    if let Err(result) =
+        hvcall_set_vp_registers(HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, config.as_u64(), 0)
+    {
+        serial_println!("Err: {:?}", result);
+        let err: u32 = result.into();
+        return err.into();
+    }
+
+    0
+}
+
+pub fn mshv_vsm_configure_partition() -> u64 {
+    debug_serial_println!("VSM: Configure partition");
+
+    let mut config = HvRegisterVsmPartitionConfig::new();
+    config.set_default_vtl_protection_mask(HvPageProtFlags::HV_PAGE_FULL_ACCESS.bits().into());
+    config.set_enable_vtl_protection();
+
+    if let Err(result) =
+        hvcall_set_vp_registers(HV_REGISTER_VSM_PARTITION_CONFIG, config.as_u64(), 0)
+    {
+        serial_println!("Err: {:?}", result);
+        let err: u32 = result.into();
+        return err.into();
+    }
+
     0
 }
 
 /// VSM function for locking control registers
 pub fn mshv_vsm_lock_regs() -> u64 {
-    #[cfg(debug_assertions)]
-    serial_println!("VSM: Lock control registers");
-    // TODO: lock control registers
+    debug_serial_println!("VSM: Lock control registers");
+
+    let flag = HvCrInterceptControlFlags::CR0_WRITE.bits()
+        | HvCrInterceptControlFlags::CR4_WRITE.bits()
+        | HvCrInterceptControlFlags::GDTR_WRITE.bits()
+        | HvCrInterceptControlFlags::IDTR_WRITE.bits()
+        | HvCrInterceptControlFlags::LDTR_WRITE.bits()
+        | HvCrInterceptControlFlags::TR_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_LSTAR_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_STAR_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_CSTAR_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_APIC_BASE_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_EFER_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_SYSENTER_CS_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_SYSENTER_ESP_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_SYSENTER_EIP_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_SFMASK_WRITE.bits();
+
+    if let Err(result) = hvcall_set_vp_registers(HV_REGISTER_CR_INTERCEPT_CONTROL, flag, 0) {
+        serial_println!("Err: {:?}", result);
+        let err: u32 = result.into();
+        return err.into();
+    }
+
+    if let Err(result) = hvcall_set_vp_registers(
+        HV_REGISTER_CR_INTERCEPT_CR4_MASK,
+        X86Cr4Flags::CR4_PIN_MASK.bits().into(),
+        0,
+    ) {
+        serial_println!("Err: {:?}", result);
+        let err: u32 = result.into();
+        return err.into();
+    }
+
+    if let Err(result) = hvcall_set_vp_registers(
+        HV_REGISTER_CR_INTERCEPT_CR0_MASK,
+        X86Cr0Flags::CR0_PIN_MASK.bits().into(),
+        0,
+    ) {
+        serial_println!("Err: {:?}", result);
+        let err: u32 = result.into();
+        return err.into();
+    }
+
     0
 }
 
 /// VSM function for signaling end of boot
 pub fn mshv_vsm_end_of_boot() -> u64 {
-    #[cfg(debug_assertions)]
-    serial_println!("VSM: End of boot");
+    debug_serial_println!("VSM: End of boot");
     // TODO: update global data structure
     0
 }
 
 /// VSM function for protecting certain memory range
 pub fn mshv_vsm_protect_memory(_pa: u64, _nranges: u64) -> u64 {
-    #[cfg(debug_assertions)]
-    serial_println!("VSM: Protect memory");
+    debug_serial_println!("VSM: Protect memory");
     // TODO: protect memory using hv_modify_protection_mask()
     0
 }
 
 /// VSM function for loading kernel data into VTL1
 pub fn mshv_vsm_load_kdata(_pa: u64, _nranges: u64) -> u64 {
-    #[cfg(debug_assertions)]
-    serial_println!("VSM: Lock kernel data");
+    debug_serial_println!("VSM: Load kernel data");
     // TODO: load kernel data
     0
 }
 
 /// VSM function for validating guest kernel module
 pub fn mshv_vsm_validate_guest_module(_pa: u64, _nranges: u64, _flags: u64) -> u64 {
-    #[cfg(debug_assertions)]
-    serial_println!("VSM: Validate kernel module");
+    debug_serial_println!("VSM: Validate kernel module");
     // TODO: validate kernel module
     0
 }
 
 /// VSM function for initializing guest kernel module
 pub fn mshv_vsm_free_guest_module_init(_token: u64) -> u64 {
-    #[cfg(debug_assertions)]
-    serial_println!("VSM: Free kernel module init");
+    debug_serial_println!("VSM: Free kernel module init");
     // TODO: free kernel module
     0
 }
 
 /// VSM function for unloading guest kernel module
 pub fn mshv_vsm_unload_guest_module(_token: u64) -> u64 {
-    #[cfg(debug_assertions)]
-    serial_println!("VSM: Unload kernel module");
+    debug_serial_println!("VSM: Unload kernel module");
     // TODO: unload kernel module
     0
 }
 
 /// VSM function for copying secondary key
 pub fn mshv_vsm_copy_secondary_key(_pa: u64, _nranges: u64) -> u64 {
-    #[cfg(debug_assertions)]
-    serial_println!("VSM: Copy secondary key");
+    debug_serial_println!("VSM: Copy secondary key");
     // TODO: copy secondary key
     0
 }
 
 /// VSM function for validating kexec
 pub fn mshv_vsm_kexec_validate(_pa: u64, _nranges: u64, _crash: u64) -> u64 {
-    #[cfg(debug_assertions)]
-    serial_println!("VSM: Validate kexec");
+    debug_serial_println!("VSM: Validate kexec");
     // TODO: validate kexec
     0
 }
@@ -116,6 +220,11 @@ pub fn mshv_vsm_kexec_validate(_pa: u64, _nranges: u64, _crash: u64) -> u64 {
 /// # Panics
 /// Panics if VTL call parameter 0 is greater than u32::MAX
 pub fn vsm_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> u64 {
+    if params[0] > u32::MAX.into() {
+        serial_println!("VSM: Unknown function ID {:#x}", params[0]);
+        return 1;
+    }
+
     match VSMFunction::try_from(u32::try_from(params[0]).expect("VTL call param 0"))
         .unwrap_or(VSMFunction::Unknown)
     {
@@ -133,7 +242,7 @@ pub fn vsm_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> u64 {
         VSMFunction::CopySecondaryKey => mshv_vsm_copy_secondary_key(params[1], params[2]),
         VSMFunction::KexecValidate => mshv_vsm_kexec_validate(params[1], params[2], params[3]),
         VSMFunction::Unknown => {
-            serial_println!("VSM: Unknown function");
+            serial_println!("VSM: Unknown function ID {:#x}", params[0]);
 
             1
         }

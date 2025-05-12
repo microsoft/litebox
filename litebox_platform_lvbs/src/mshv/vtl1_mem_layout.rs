@@ -1,6 +1,7 @@
 //! VTL1 physical memory layout (LVBS-specific)
 
 pub const PAGE_SIZE: usize = 4096;
+pub const PAGE_SHIFT: usize = 12;
 pub const PTES_PER_PAGE: usize = 512;
 
 pub const VSM_PMD_SIZE: usize = PAGE_SIZE * PTES_PER_PAGE;
@@ -41,7 +42,7 @@ pub fn get_address_of_special_page(page: usize) -> u64 {
 
 /// Error for VSM memory
 #[derive(Debug, PartialEq)]
-pub enum VtlMemoyError {
+pub enum VtlMemoryError {
     InvalidBootParams,
     InvalidCmdLine,
 }

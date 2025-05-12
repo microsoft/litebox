@@ -5,10 +5,11 @@ use crate::{
         instrs::rdmsr,
         msr::{MSR_EFER, MSR_IA32_CR_PAT},
     },
-    kernel_context::MAX_CORES,
+    kernel_context::{MAX_CORES, get_per_core_kernel_context},
     mshv::{
         HV_PARTITION_ID_SELF, HV_VP_INDEX_SELF, HV_VTL_SECURE, HVCALL_ENABLE_VP_VTL,
         HVCALL_SET_VP_REGISTERS, HvEnableVpVtl, HvSetVpRegistersInput,
+        SegmentRegisterAttributeFlags,
         hvcall::{HypervCallError, hv_do_hypercall, hv_do_rep_hypercall},
         vtl1_mem_layout::{
             PAGE_SIZE, VTL1_KERNEL_STACK_PAGE, VTL1_TSS_PAGE, get_address_of_special_page,
@@ -16,41 +17,52 @@ use crate::{
     },
     serial_println,
 };
+use x86_64::{
+    PrivilegeLevel,
+    structures::{gdt::SegmentSelector, tss::TaskStateSegment},
+};
 
 /// Hyper-V Hypercall to set virtual processor (VP) registers
-#[expect(dead_code)]
 pub fn hvcall_set_vp_registers(
     reg_name: u32,
     value: u64,
     input_vtl: u8,
 ) -> Result<u64, HypervCallError> {
-    let mut hvin = HvSetVpRegistersInput::new();
+    let kernel_context = get_per_core_kernel_context();
+    let hvin = unsafe {
+        &mut *kernel_context
+            .hv_hypercall_input_page_as_mut_ptr()
+            .cast::<HvSetVpRegistersInput>()
+    };
+    *hvin = HvSetVpRegistersInput::new();
 
     hvin.header.partitionid = HV_PARTITION_ID_SELF;
     hvin.header.vpindex = HV_VP_INDEX_SELF;
     hvin.header.inputvtl = input_vtl;
-    hvin.element.name = reg_name;
-    hvin.element.valuelow = value;
+    hvin.element[0].name = reg_name;
+    hvin.element[0].valuelow = value;
 
     hv_do_rep_hypercall(
         HVCALL_SET_VP_REGISTERS,
         1,
         0,
-        (&raw const hvin).cast::<core::ffi::c_void>(),
+        (&raw const *hvin).cast::<core::ffi::c_void>(),
         core::ptr::null_mut(),
     )
 }
 
 /// Populate the VP context for VTL1
-// TODO: avoid using magic numbers
 #[expect(clippy::similar_names)]
 fn hv_vtl_populate_vp_context(input: &mut HvEnableVpVtl, tss: u64, rip: u64, rsp: u64) {
     use x86_64::instructions::tables::{sgdt, sidt};
-    use x86_64::registers::control::{Cr0, Cr3, Cr4};
+    use x86_64::registers::{
+        control::{Cr0, Cr3, Cr4},
+        rflags,
+    };
 
     input.vp_context.rip = rip;
     input.vp_context.rsp = rsp;
-    input.vp_context.rflags = 0x2;
+    input.vp_context.rflags = rflags::read_raw();
     input.vp_context.efer = rdmsr(MSR_EFER);
     input.vp_context.cr0 = Cr0::read_raw();
     let (frame, val) = Cr3::read_raw();
@@ -67,20 +79,37 @@ fn hv_vtl_populate_vp_context(input: &mut HvEnableVpVtl, tss: u64, rip: u64, rsp
     input.vp_context.idtr.limit = idt_ptr.limit;
     input.vp_context.idtr.base = idt_ptr.base.as_u64();
 
-    input.vp_context.cs.selector = 1 << 3;
-    input.vp_context.cs.base = 0;
-    input.vp_context.cs.limit = 0xffff_ffff;
-    input.vp_context.cs.set_attributes(0xa09b);
+    // We only support 64-bit long mode for now, so most of the segment register fields are ignored.
+    input.vp_context.cs.selector = SegmentSelector::new(1, PrivilegeLevel::Ring0).0;
+    input.vp_context.cs.set_attributes(
+        SegmentRegisterAttributeFlags::ACCESSED.bits()
+            | SegmentRegisterAttributeFlags::WRITABLE.bits()
+            | SegmentRegisterAttributeFlags::EXECUTABLE.bits()
+            | SegmentRegisterAttributeFlags::USER_SEGMENT.bits()
+            | SegmentRegisterAttributeFlags::PRESENT.bits()
+            | SegmentRegisterAttributeFlags::AVAILABLE.bits()
+            | SegmentRegisterAttributeFlags::LONG_MODE.bits(),
+    );
 
-    input.vp_context.ss.selector = 2 << 3;
-    input.vp_context.ss.base = 0;
-    input.vp_context.ss.limit = 0xffff_ffff;
-    input.vp_context.ss.set_attributes(0xc093);
+    input.vp_context.ss.selector = SegmentSelector::new(2, PrivilegeLevel::Ring0).0;
+    input.vp_context.ss.set_attributes(
+        SegmentRegisterAttributeFlags::ACCESSED.bits()
+            | SegmentRegisterAttributeFlags::WRITABLE.bits()
+            | SegmentRegisterAttributeFlags::USER_SEGMENT.bits()
+            | SegmentRegisterAttributeFlags::PRESENT.bits()
+            | SegmentRegisterAttributeFlags::AVAILABLE.bits(),
+    );
 
-    input.vp_context.tr.selector = 3 << 3;
+    input.vp_context.tr.selector = SegmentSelector::new(3, PrivilegeLevel::Ring0).0;
     input.vp_context.tr.base = tss;
-    input.vp_context.tr.limit = 104 - 1;
-    input.vp_context.tr.set_attributes(0x8b);
+    input.vp_context.tr.limit =
+        u32::try_from(core::mem::size_of::<TaskStateSegment>()).unwrap() - 1;
+    input.vp_context.tr.set_attributes(
+        SegmentRegisterAttributeFlags::ACCESSED.bits()
+            | SegmentRegisterAttributeFlags::WRITABLE.bits()
+            | SegmentRegisterAttributeFlags::EXECUTABLE.bits()
+            | SegmentRegisterAttributeFlags::PRESENT.bits(),
+    );
 }
 
 /// Hyper-V Hypercall to enable a certain VTL for a specific virtual processor (VP)
