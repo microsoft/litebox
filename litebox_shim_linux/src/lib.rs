@@ -81,11 +81,13 @@ pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE>
     VMEM.get_or_init(|| alloc::boxed::Box::new(PageManager::new(litebox())))
 }
 
-pub(crate) fn litebox_net<'a>() -> &'a spin::Mutex<litebox::net::Network<Platform>> {
-    static NET: OnceBox<spin::Mutex<litebox::net::Network<Platform>>> = OnceBox::new();
+pub(crate) fn litebox_net<'a>()
+-> &'a litebox::sync::Mutex<Platform, litebox::net::Network<Platform>> {
+    static NET: OnceBox<litebox::sync::Mutex<Platform, litebox::net::Network<Platform>>> =
+        OnceBox::new();
     NET.get_or_init(|| {
         let net = litebox::net::Network::new(litebox());
-        alloc::boxed::Box::new(spin::Mutex::new(net))
+        alloc::boxed::Box::new(litebox().sync().new_mutex(net))
     })
 }
 
