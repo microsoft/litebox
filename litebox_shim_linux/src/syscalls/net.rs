@@ -29,49 +29,7 @@ impl Default for CSockStorage {
     }
 }
 
-macro_rules! transmute_sockaddr {
-    ($func_name:ident, $addr_type:ty) => {
-        impl CSockStorage {
-            /// Transmute the CSockStorage to a specific type
-            pub fn $func_name(self) -> $addr_type {
-                let mut buf = [0u8; size_of::<$addr_type>()];
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        (&raw const self).cast::<u8>(),
-                        buf.as_mut_ptr(),
-                        size_of::<$addr_type>(),
-                    );
-                    core::mem::transmute(buf)
-                }
-            }
-        }
-    };
-}
-
-transmute_sockaddr!(into_unix, CSockUnixAddr);
-transmute_sockaddr!(into_inet, CSockInetAddr);
-
-impl CSockStorage {
-    pub fn into_sockaddr(self, addrlen: usize) -> Result<SocketAddress, Errno> {
-        let family = u32::from(self.sa_family);
-        match family {
-            litebox_common_linux::AF_UNIX => todo!(),
-            litebox_common_linux::AF_INET => {
-                if addrlen < size_of::<CSockInetAddr>() {
-                    return Err(Errno::EINVAL);
-                }
-                let inet_addr = self.into_inet();
-                Ok(SocketAddress::Inet(SocketAddr::V4(SocketAddrV4::from(
-                    inet_addr,
-                ))))
-            }
-            _ => {
-                todo!("unsupported family {family}");
-            }
-        }
-    }
-}
-
+#[derive(Clone, Copy)]
 #[repr(C, packed)]
 struct CSockInetAddr {
     family: i16,
@@ -86,19 +44,16 @@ impl From<CSockInetAddr> for SocketAddrV4 {
     }
 }
 
-const UNIX_PATH_MAX: usize = 108;
-#[repr(C)]
-struct CSockUnixAddr {
-    family: i16,
-    path: [u8; UNIX_PATH_MAX],
-}
-
+/// Socket address structure for different address families.
+/// Currently only supports IPv4 (AF_INET).
+#[non_exhaustive]
 pub(super) enum SocketAddress {
     Inet(SocketAddr),
 }
 
 pub(crate) struct Socket {
     pub(crate) fd: Option<SocketFd>,
+    /// File status flags (see [`litebox::fs::OFlags::STATUS_FLAGS_MASK`])
     pub(crate) status: AtomicU32,
     pub(crate) close_on_exec: AtomicBool,
 }
@@ -115,7 +70,7 @@ impl Socket {
     pub(crate) fn new(fd: SocketFd, flags: SockFlags) -> Self {
         Self {
             fd: Some(fd),
-            // SockFlags is a subset of OFlags
+            // `SockFlags` is a subset of `OFlags`
             status: AtomicU32::new(flags.bits()),
             close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
         }
@@ -264,18 +219,27 @@ fn read_sockaddr_from_user(sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<Soc
         return Err(Errno::EINVAL);
     }
 
-    let mut storage = CSockStorage::default();
-    let data = unsafe { sockaddr.to_cow_slice(core::cmp::min(addrlen, size_of::<CSockStorage>())) }
-        .ok_or(Errno::EFAULT)?;
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            data.as_ptr(),
-            core::ptr::from_mut(&mut storage).cast(),
-            data.len(),
-        );
+    let ptr: ConstPtr<u16> = unsafe { core::mem::transmute(sockaddr) };
+    let family = unsafe { ptr.read_at_offset(0) }
+        .ok_or(Errno::EFAULT)?
+        .into_owned();
+    match u32::from(family) {
+        litebox_common_linux::AF_INET => {
+            if addrlen < size_of::<CSockInetAddr>() {
+                return Err(Errno::EINVAL);
+            }
+            let ptr: ConstPtr<CSockInetAddr> = unsafe { core::mem::transmute(sockaddr) };
+            // Note it reads the first 2 bytes (i.e., sa_family) again, but it is not used.
+            // SocketAddrV4 only needs the port and addr.
+            let inet_addr = unsafe { ptr.read_at_offset(0) }
+                .ok_or(Errno::EFAULT)?
+                .into_owned();
+            Ok(SocketAddress::Inet(SocketAddr::V4(SocketAddrV4::from(
+                inet_addr,
+            ))))
+        }
+        _ => todo!("unsupported family {family}"),
     }
-
-    storage.into_sockaddr(addrlen)
 }
 
 /// Handle syscall `accept`

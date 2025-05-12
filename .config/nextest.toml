@@ -8,14 +8,13 @@ status-level = "all"
 failure-output = "immediate-final"
 
 [test-groups]
+# ensure only one test accessing tun at a time
 tun-access = { max-threads = 1 }
 
 [[profile.ci.overrides]]
-# Match by test binary name
 filter = 'package(litebox_shim_linux) and test(test_tun)'
 test-group = "tun-access"
 
 [[profile.default.overrides]]
-# Match by test binary name
 filter = 'package(litebox_shim_linux) and test(test_tun)'
 test-group = "tun-access"
