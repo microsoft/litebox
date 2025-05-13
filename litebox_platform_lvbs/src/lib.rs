@@ -9,6 +9,7 @@ use core::{arch::asm, sync::atomic::AtomicU32};
 
 use host::linux::sigset_t;
 use litebox::mm::linux::PageRange;
+use litebox::platform::page_mgmt::DeallocationError;
 use litebox::platform::{
     DebugLogProvider, ExitProvider, IPInterfaceProvider, ImmediatelyWokenUp,
     PageManagementProvider, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
@@ -16,6 +17,7 @@ use litebox::platform::{
 use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::errno::Errno;
 use ptr::{UserConstPtr, UserMutPtr};
+use x86_64::structures::paging::{PhysFrame, Size4KiB, frame::PhysFrameRange, mapper::MapToError};
 
 extern crate alloc;
 
@@ -33,6 +35,7 @@ static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
     page_table: mm::PageTable<4096>,
+    vtl1_phys_frame_range: PhysFrameRange,
 }
 
 impl<Host: HostInterface> ExitProvider for LinuxKernel<Host> {
@@ -51,18 +54,59 @@ impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
 }
 
 impl<Host: HostInterface> LinuxKernel<Host> {
-    pub fn new(init_page_table_addr: x86_64::PhysAddr) -> &'static Self {
+    /// # Panics
+    ///
+    /// Panics if phys_start or phys_end is not aligned to the page size
+    pub fn new(
+        init_page_table_addr: x86_64::PhysAddr,
+        phys_start: x86_64::PhysAddr,
+        phys_end: x86_64::PhysAddr,
+    ) -> &'static Self {
+        let pt = unsafe { mm::PageTable::new(init_page_table_addr) };
+        let physframe_start = PhysFrame::from_start_address(phys_start).unwrap();
+        let physframe_end = PhysFrame::from_start_address(phys_end).unwrap();
+        pt.map_phys_frame_range(PhysFrame::range(physframe_start, physframe_end), true)
+            .unwrap();
+
         // There is only one long-running platform ever expected, thus this leak is perfectly ok in
         // order to simplify usage of the platform.
         alloc::boxed::Box::leak(alloc::boxed::Box::new(Self {
             host_and_task: core::marker::PhantomData,
-            // TODO: Update the init physaddr
-            page_table: unsafe { mm::PageTable::new(init_page_table_addr) },
+            page_table: pt,
+            vtl1_phys_frame_range: PhysFrame::range(physframe_start, physframe_end),
         }))
     }
 
     pub fn init(&self, cpu_mhz: u64) {
         CPU_MHZ.store(cpu_mhz, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// This maps VTL0 physical memory to the page table
+    /// # Panics
+    ///
+    /// Panics if phys_start or phys_end is not aligned to the page size
+    pub fn map_vtl0_phys_range(
+        &self,
+        phys_start: x86_64::PhysAddr,
+        phys_end: x86_64::PhysAddr,
+    ) -> Result<*mut u8, MapToError<Size4KiB>> {
+        let frame_range = PhysFrame::range(
+            PhysFrame::from_start_address(phys_start).unwrap(),
+            PhysFrame::from_start_address(phys_end).unwrap(),
+        );
+        if frame_range.end < self.vtl1_phys_frame_range.start
+            || frame_range.start > self.vtl1_phys_frame_range.end
+        {
+            self.page_table.map_phys_frame_range(frame_range, false)
+        } else {
+            Err(MapToError::FrameAllocationFailed)
+        }
+    }
+
+    /// This unmaps VTL0 pages from the page table. Allocator does not allocate frames
+    /// for VTL0 pages, so it does not attempt to deallocate them.
+    pub fn unmap_vtl0_pages(&self, page_range: PageRange<4096>) -> Result<(), DeallocationError> {
+        unsafe { self.page_table.unmap_pages_wo_dealloc(page_range) }
     }
 }
 

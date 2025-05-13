@@ -7,6 +7,7 @@ use x86_64::{
         paging::{
             FrameAllocator, FrameDeallocator, MappedPageTable, Mapper, Page, PageSize, PageTable,
             PageTableFlags, PhysFrame, Size4KiB, Translate,
+            frame::PhysFrameRange,
             mapper::{
                 FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult,
                 UnmapError as X64UnmapError,
@@ -96,6 +97,25 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         &self,
         range: PageRange<ALIGN>,
     ) -> Result<(), page_mgmt::DeallocationError> {
+        unsafe { self.unmap_pages_internal(range, true) }
+    }
+
+    /// Unmap 4KiB pages from the page table without frame deallocation
+    ///
+    /// Note it does not free the allocated frames for page table itself (only those allocated to
+    /// user space).
+    pub(crate) unsafe fn unmap_pages_wo_dealloc(
+        &self,
+        range: PageRange<ALIGN>,
+    ) -> Result<(), page_mgmt::DeallocationError> {
+        unsafe { self.unmap_pages_internal(range, false) }
+    }
+
+    unsafe fn unmap_pages_internal(
+        &self,
+        range: PageRange<ALIGN>,
+        dealloc_frame: bool,
+    ) -> Result<(), page_mgmt::DeallocationError> {
         let start_va = VirtAddr::new(range.start as _);
         let start = Page::<Size4KiB>::from_start_address(start_va)
             .or(Err(page_mgmt::DeallocationError::Unaligned))?;
@@ -110,7 +130,9 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         for page in Page::range(start, end) {
             match inner.unmap(page) {
                 Ok((frame, fl)) => {
-                    unsafe { allocator.deallocate_frame(frame) };
+                    if dealloc_frame {
+                        unsafe { allocator.deallocate_frame(frame) };
+                    }
                     if FLUSH_TLB {
                         fl.flush();
                     }
@@ -249,6 +271,36 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn map_phys_frame_range(
+        &self,
+        frame_range: PhysFrameRange,
+        is_vtl1: bool,
+    ) -> Result<*mut u8, MapToError<Size4KiB>> {
+        let mut allocator = PageTableAllocator::<M>::new();
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+
+        let mut inner = self.inner.lock();
+        for frame in frame_range {
+            let page: Page<Size4KiB> = if is_vtl1 {
+                Page::containing_address(M::pa_to_va(frame.start_address()))
+            } else {
+                Page::containing_address(M::vtl0_pa_to_va(frame.start_address()))
+            };
+            match unsafe {
+                inner.map_to_with_table_flags(page, frame, flags, flags, &mut allocator)
+            } {
+                Ok(fl) => {
+                    if FLUSH_TLB {
+                        fl.flush();
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(M::pa_to_va(frame_range.start.start_address()).as_mut_ptr())
     }
 }
 

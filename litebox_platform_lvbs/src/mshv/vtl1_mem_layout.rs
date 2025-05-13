@@ -26,6 +26,14 @@ pub const VTL1_KERNEL_STACK_PAGE: usize = VTL1_PTE_0_PAGE + VSM_SK_PTE_PAGES_COU
 pub const VTL1_BOOT_PARAMS_PAGE: usize = VTL1_KERNEL_STACK_PAGE + 1;
 pub const VTL1_CMDLINE_PAGE: usize = VTL1_BOOT_PARAMS_PAGE + 1;
 
+// VTL1 kernel roughly uses 6 MiB of memory (mostly empty, 2 MB aligned)
+// 2 MiB for page tables and other metadata
+// 2 MiB for kernel text
+// 2 MiB for kernel data (static variables, stacks, ...)
+pub const PREALLOCATED_AREA_SIZE: usize = 6 * 1024 * 1024;
+pub const VTL1_HEAP_START: usize = PREALLOCATED_AREA_SIZE;
+pub const VTL1_HEAP_SIZE: usize = VTL1_TOTAL_MEMORY_SIZE - VTL1_HEAP_START;
+
 unsafe extern "C" {
     static _memory_base: u8;
 }

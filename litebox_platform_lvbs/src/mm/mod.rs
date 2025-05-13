@@ -15,6 +15,9 @@ pub trait MemoryProvider {
     /// Mask for private page table entry (e.g., SNP encryption bit).
     /// For simplicity, we assume the mask is constant.
     const PRIVATE_PTE_MASK: u64;
+    /// Global virtual address offset for one-to-one mapping of VTL0 physical memory
+    /// to kernel virtual memory.
+    const VTL0_GVA_OFFSET: VirtAddr;
 
     /// Allocate (1 << `order`) virtually and physically contiguous pages from global allocator.
     fn mem_allocate_pages(order: u32) -> Option<*mut u8>;
@@ -42,6 +45,17 @@ pub trait MemoryProvider {
     /// Set physical address as private via mask.
     fn make_pa_private(pa: PhysAddr) -> PhysAddr {
         PhysAddr::new_truncate(pa.as_u64() | Self::PRIVATE_PTE_MASK)
+    }
+
+    /// Obtain VTL0 PA of a page given its VA
+    fn va_to_vtl0_pa(va: VirtAddr) -> PhysAddr {
+        PhysAddr::new_truncate(va - Self::VTL0_GVA_OFFSET)
+    }
+
+    /// Obtain VA of a page given its VTL0 PA
+    fn vtl0_pa_to_va(pa: PhysAddr) -> VirtAddr {
+        let pa = pa.as_u64() & !Self::PRIVATE_PTE_MASK;
+        VirtAddr::new_truncate(pa + Self::VTL0_GVA_OFFSET.as_u64())
     }
 }
 
