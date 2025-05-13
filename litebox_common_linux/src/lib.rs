@@ -2,6 +2,7 @@
 
 #![no_std]
 
+use int_enum::IntEnum;
 use litebox::{
     fs::OFlags,
     net::{ReceiveFlags, SendFlags},
@@ -369,49 +370,23 @@ bitflags::bitflags! {
     }
 }
 
-pub const AF_UNIX: u32 = 1;
-pub const AF_INET: u32 = 2;
-const AF_INET6: u32 = 10;
-const AF_NETLINK: u32 = 16;
 #[repr(u32)]
 #[non_exhaustive]
-#[derive(Debug)]
+#[derive(Debug, IntEnum)]
 pub enum AddressFamily {
-    UNIX = AF_UNIX,
-    INET = AF_INET,
-    INET6 = AF_INET6,
-    NETLINK = AF_NETLINK,
+    UNIX = 1,
+    INET = 2,
+    INET6 = 10,
+    NETLINK = 16,
 }
 
-impl From<u32> for AddressFamily {
-    fn from(value: u32) -> Self {
-        match value {
-            AF_UNIX => Self::UNIX,
-            AF_INET => Self::INET,
-            AF_INET6 => Self::INET6,
-            AF_NETLINK => Self::NETLINK,
-            _ => unimplemented!(),
-        }
-    }
-}
-
+#[repr(u32)]
 #[non_exhaustive]
-#[derive(Debug)]
+#[derive(Debug, IntEnum)]
 pub enum SockType {
     Stream = 1,
     Datagram = 2,
     Raw = 3,
-}
-
-impl From<u32> for SockType {
-    fn from(value: u32) -> Self {
-        match value {
-            1 => Self::Stream,
-            2 => Self::Datagram,
-            3 => Self::Raw,
-            _ => unimplemented!(),
-        }
-    }
 }
 
 bitflags::bitflags! {
@@ -424,17 +399,14 @@ bitflags::bitflags! {
     }
 }
 
-const IPPROTO_ICMP: u8 = 1;
-const IPPROTO_TCP: u8 = 6;
-const IPPROTO_UDP: u8 = 17;
-/// convert u8 to [`litebox::net::Protocol`]
-pub fn protocol_from_u8(value: u8) -> litebox::net::Protocol {
-    match value {
-        IPPROTO_ICMP => litebox::net::Protocol::Icmp,
-        IPPROTO_TCP => litebox::net::Protocol::Tcp,
-        IPPROTO_UDP => litebox::net::Protocol::Udp,
-        v => litebox::net::Protocol::Raw { protocol: v },
-    }
+#[repr(u8)]
+#[non_exhaustive]
+#[derive(IntEnum, PartialEq)]
+pub enum Protocol {
+    ICMP = 1,
+    TCP = 6,
+    UDP = 17,
+    RAW = 255,
 }
 
 /// Request to syscall handler
@@ -520,7 +492,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         /// socket.  Normally only a single protocol exists to support a
         /// particular socket type within a given protocol family, in which case
         /// protocol can be specified as `None`.
-        protocol: Option<litebox::net::Protocol>,
+        protocol: Option<Protocol>,
     },
     Connect {
         sockfd: i32,

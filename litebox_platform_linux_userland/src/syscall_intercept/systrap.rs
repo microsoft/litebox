@@ -302,15 +302,19 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             let domain: u32 = syscall_args[0].truncate();
             let type_and_flags: u32 = syscall_args[1].truncate();
             SyscallRequest::Socket {
-                domain: litebox_common_linux::AddressFamily::from(domain),
-                ty: litebox_common_linux::SockType::from(type_and_flags & 0x0f),
+                domain: litebox_common_linux::AddressFamily::try_from(domain)
+                    .expect("Invalid domain"),
+                ty: litebox_common_linux::SockType::try_from(type_and_flags & 0x0f)
+                    .expect("Invalid sock type"),
                 flags: litebox_common_linux::SockFlags::from_bits_truncate(type_and_flags & !0x0f),
                 protocol: if syscall_args[2] == 0 {
                     None
                 } else {
-                    Some(litebox_common_linux::protocol_from_u8(
-                        syscall_args[2].truncate(),
-                    ))
+                    let protocol: u8 = syscall_args[2].truncate();
+                    Some(
+                        litebox_common_linux::Protocol::try_from(protocol)
+                            .expect("Invalid protocol"),
+                    )
                 },
             }
         }
@@ -599,10 +603,26 @@ fn register_seccomp_filter() {
     // TODO: remove syscalls once they are implemented in the shim
     let rules = vec![
         (
+            libc::SYS_read,
+            vec![
+                // A backdoor to allow invoking read for devices.
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        3,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::Eq,
+                        SYSCALL_ARG_MAGIC as u64,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            ],
+        ),
+        (
             libc::SYS_write,
             vec![
                 SeccompRule::new(vec![
-                    // A backdoor to allow invoking write.
+                    // A backdoor to allow invoking write for devices.
                     SeccompCondition::new(
                         3,
                         SeccompCmpArgLen::Qword,

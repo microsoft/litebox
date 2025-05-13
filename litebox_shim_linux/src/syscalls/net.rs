@@ -8,7 +8,7 @@ use core::{
 use litebox::{
     fd::SocketFd,
     fs::OFlags,
-    net::{Protocol, ReceiveFlags, SendFlags},
+    net::{ReceiveFlags, SendFlags},
     platform::{RawConstPointer, RawMutPointer},
 };
 use litebox_common_linux::{AddressFamily, SockFlags, SockType, errno::Errno};
@@ -184,24 +184,24 @@ pub(crate) fn sys_socket(
     domain: AddressFamily,
     ty: SockType,
     flags: SockFlags,
-    protocol: Option<Protocol>,
+    protocol: Option<litebox_common_linux::Protocol>,
 ) -> Result<u32, Errno> {
     let file = match domain {
         AddressFamily::INET => {
             let protocol = match ty {
                 SockType::Stream => {
-                    if protocol.is_some_and(|p| p != Protocol::Tcp) {
+                    if protocol.is_some_and(|p| p != litebox_common_linux::Protocol::TCP) {
                         return Err(Errno::EINVAL);
                     }
-                    Protocol::Tcp
+                    litebox::net::Protocol::Tcp
                 }
                 SockType::Datagram => {
-                    if protocol.is_some_and(|p| p != Protocol::Udp) {
+                    if protocol.is_some_and(|p| p != litebox_common_linux::Protocol::UDP) {
                         return Err(Errno::EINVAL);
                     }
-                    Protocol::Udp
+                    litebox::net::Protocol::Udp
                 }
-                SockType::Raw => protocol.unwrap_or(Protocol::Raw { protocol: 0 }),
+                SockType::Raw => todo!(),
                 _ => unimplemented!(),
             };
             let socket = litebox_net().lock().socket(protocol)?;
@@ -223,8 +223,9 @@ fn read_sockaddr_from_user(sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<Soc
     let family = unsafe { ptr.read_at_offset(0) }
         .ok_or(Errno::EFAULT)?
         .into_owned();
-    match u32::from(family) {
-        litebox_common_linux::AF_INET => {
+    let family = AddressFamily::try_from(u32::from(family)).map_err(|_| Errno::EAFNOSUPPORT)?;
+    match family {
+        AddressFamily::INET => {
             if addrlen < size_of::<CSockInetAddr>() {
                 return Err(Errno::EINVAL);
             }
@@ -238,7 +239,7 @@ fn read_sockaddr_from_user(sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<Soc
                 inet_addr,
             ))))
         }
-        _ => todo!("unsupported family {family}"),
+        _ => todo!("unsupported family {family:?}"),
     }
 }
 
@@ -573,13 +574,13 @@ int main(int argc, char *argv[]) {
             false,
         );
 
-        #[allow(clippy::zombie_processes)]
-        std::process::Command::new(output_path.to_str().unwrap())
+        let mut child = std::process::Command::new(output_path.to_str().unwrap())
             .args([port.to_string().as_str()])
             .spawn()
             .expect("Failed to spawn client");
         crate::syscalls::tests::init_platform(Some("tun99"));
         test_tcp_socket(TUN_IP_ADDR, port, is_nonblocking, |_, _| {});
+        child.wait().expect("Failed to wait for client");
     }
 
     #[test]

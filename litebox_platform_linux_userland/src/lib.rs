@@ -354,7 +354,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
         match unsafe {
             syscalls::syscall4(
                 syscalls::Sysno::write,
-                tun_socket_fd.as_raw_fd().reinterpret_as_unsigned() as usize,
+                usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
                 packet.as_ptr() as usize,
                 packet.len(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
@@ -384,7 +384,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
         unsafe {
             syscalls::syscall4(
                 syscalls::Sysno::read,
-                tun_socket_fd.as_raw_fd().reinterpret_as_unsigned() as usize,
+                usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
                 packet.as_mut_ptr() as usize,
                 packet.len(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
@@ -392,7 +392,10 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
             )
         }
         .map_err(|errno| match errno {
-            syscalls::Errno::EWOULDBLOCK => litebox::platform::ReceiveError::WouldBlock,
+            #[allow(unreachable_patterns, reason = "EAGAIN == EWOULDBLOCK")]
+            syscalls::Errno::EWOULDBLOCK | syscalls::Errno::EAGAIN => {
+                litebox::platform::ReceiveError::WouldBlock
+            }
             _ => unimplemented!("unexpected error {errno}"),
         })
     }

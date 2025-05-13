@@ -183,25 +183,21 @@ pub fn sys_pwrite64(fd: i32, buf: &[u8], offset: usize) -> Result<usize, Errno> 
     sys_write(fd, buf, Some(offset))
 }
 
-fn do_close(file: Descriptor) -> Result<(), Errno> {
-    match file {
-        Descriptor::File(file) | Descriptor::Stdio(crate::stdio::StdioFile { file, .. }) => {
-            litebox_fs().close(file).map_err(Errno::from)
-        }
-        Descriptor::Socket(socket) => Ok(()),
-        Descriptor::PipeReader { .. }
-        | Descriptor::PipeWriter { .. }
-        | Descriptor::Eventfd { .. } => Ok(()),
-    }
-}
-
 /// Handle syscall `close`
 pub fn sys_close(fd: i32) -> Result<(), Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
     match file_descriptors().write().remove(fd) {
-        Some(desc) => do_close(desc),
+        Some(desc) => match desc {
+            Descriptor::File(file) | Descriptor::Stdio(crate::stdio::StdioFile { file, .. }) => {
+                litebox_fs().close(file).map_err(Errno::from)
+            }
+            Descriptor::Socket(socket) => Ok(()), // The actual close happens when the socket is dropped
+            Descriptor::PipeReader { .. }
+            | Descriptor::PipeWriter { .. }
+            | Descriptor::Eventfd { .. } => Ok(()),
+        },
         None => Err(Errno::EBADF),
     }
 }
