@@ -162,7 +162,7 @@ impl Socket {
     }
 
     fn receive(&self, buf: &mut [u8], flags: ReceiveFlags) -> Result<usize, Errno> {
-        if flags.contains(ReceiveFlags::DONTWAIT) {
+        if self.get_status().contains(OFlags::NONBLOCK) || flags.contains(ReceiveFlags::DONTWAIT) {
             self.try_receive(buf, flags)
         } else {
             // TODO: use `poll` instead of busy wait
@@ -379,15 +379,8 @@ pub(crate) fn sys_recvfrom(
     let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
     match socket {
         Descriptor::Socket(socket) => {
-            if socket.get_status().contains(OFlags::NONBLOCK) {
-                flags.insert(ReceiveFlags::DONTWAIT);
-            }
-            // ignore MSG_WAITALL flag if MSG_DONTWAIT is set
-            if flags.contains(ReceiveFlags::DONTWAIT) {
-                flags.remove(ReceiveFlags::WAITALL);
-            }
             let socket = socket.clone();
-            // drop file table as `recvfrom` may block
+            // drop file table as `receive` may block
             drop(file_table);
             let mut buffer: [u8; 4096] = [0; 4096];
             let size = socket.receive(&mut buffer, flags)?;
