@@ -11,14 +11,26 @@ pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
 
 #[cfg(not(test))]
 mod alloc {
+    use crate::HostInterface;
+
     const HEAP_ORDER: usize = 21;
 
     #[global_allocator]
-    static LVBS_ALLOCATOR: crate::mm::alloc::SafeZoneAllocator<
+    static LVBS_ALLOCATOR: litebox::mm::allocator::SafeZoneAllocator<
         'static,
         HEAP_ORDER,
         super::LvbsLinuxKernel,
-    > = crate::mm::alloc::SafeZoneAllocator::new();
+    > = litebox::mm::allocator::SafeZoneAllocator::new();
+
+    impl litebox::mm::allocator::MemoryProvider for super::LvbsLinuxKernel {
+        fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
+            super::HostLvbsInterface::alloc(layout)
+        }
+
+        unsafe fn free(addr: usize) {
+            unsafe { super::HostLvbsInterface::free(addr) }
+        }
+    }
 
     impl crate::mm::MemoryProvider for super::LvbsLinuxKernel {
         const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(0);
@@ -29,14 +41,6 @@ mod alloc {
         }
 
         unsafe fn mem_free_pages(_ptr: *mut u8, _order: u32) {
-            unimplemented!()
-        }
-
-        fn alloc(_layout: &core::alloc::Layout) -> Result<(usize, usize), crate::Errno> {
-            unimplemented!()
-        }
-
-        unsafe fn free(_addr: usize) {
             unimplemented!()
         }
     }
@@ -59,7 +63,7 @@ impl HostInterface for HostLvbsInterface {
         serial_print_string(msg);
     }
 
-    fn alloc(_layout: &core::alloc::Layout) -> Result<(usize, usize), Errno> {
+    fn alloc(_layout: &core::alloc::Layout) -> Option<(usize, usize)> {
         unimplemented!()
     }
 

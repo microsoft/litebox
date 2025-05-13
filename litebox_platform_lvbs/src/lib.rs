@@ -241,7 +241,7 @@ pub trait HostInterface {
     ///
     /// It can return more than requested size. On success, it returns the start address
     /// and the size of the allocated memory.
-    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), Errno>;
+    fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)>;
     // TODO: leave this for now for testing. LVBS does not allow dynamnic memory allocation,
     // so it should be no-op or removed.
 

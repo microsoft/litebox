@@ -17,7 +17,7 @@ macro_rules! mock_log_println {
 }
 
 impl HostInterface for MockHostInterface {
-    fn alloc(_layout: &core::alloc::Layout) -> Result<(usize, usize), crate::Errno> {
+    fn alloc(_layout: &core::alloc::Layout) -> Option<(usize, usize)> {
         todo!()
     }
 
