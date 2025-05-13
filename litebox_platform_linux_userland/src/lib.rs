@@ -587,6 +587,9 @@ impl RawMutex {
                         // when we attempted to wait, so we can do a proper check.
                     }
                 }
+                Err(syscalls::Errno::ETIMEDOUT) => {
+                    return Ok(UnblockedOrTimedOut::TimedOut);
+                }
                 Err(e) => {
                     panic!("Unexpected errno={e} for FUTEX_WAIT")
                 }
