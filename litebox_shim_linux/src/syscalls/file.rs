@@ -770,61 +770,46 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Descriptor {
     }
 }
 
-/// Handle syscall `dup`
-pub fn sys_dup(fd: i32) -> Result<u32, Errno> {
-    let Ok(fd) = u32::try_from(fd) else {
-        return Err(Errno::EBADF);
-    };
-    let new_file = file_descriptors()
-        .read()
-        .get_fd(fd)
-        .ok_or(Errno::EBADF)
-        .map(|desc| do_dup(desc, OFlags::empty()))?;
-    let new_fd = file_descriptors().write().insert(new_file);
-    Ok(new_fd)
-}
-
-/// Handle syscall `dup2`
-pub fn sys_dup2(oldfd: i32, newfd: i32) -> Result<u32, Errno> {
-    // Different from dup3, if oldfd is a valid file descriptor, and newfd has the same value
-    // as oldfd, then dup2() does nothing.
-    if oldfd == newfd {
-        let Ok(oldfd) = u32::try_from(oldfd) else {
-            return Err(Errno::EBADF);
-        };
-        if file_descriptors().read().get_fd(oldfd).is_none() {
-            return Err(Errno::EBADF);
-        }
-        return Ok(oldfd);
-    }
-
-    sys_dup3(oldfd, newfd, OFlags::empty())
-}
-
-/// Handle syscall `dup3`
-pub fn sys_dup3(oldfd: i32, newfd: i32, flags: OFlags) -> Result<u32, Errno> {
-    if newfd < 0 {
-        return Err(Errno::EINVAL);
-    }
+/// Handle syscall `dup/dup2/dup3`
+///
+/// The dup() system call creates a copy of the file descriptor oldfd, using the lowest-numbered unused file descriptor for the new descriptor.
+/// The dup2() system call performs the same task as dup(), but instead of using the lowest-numbered unused file descriptor, it uses the file descriptor number specified in newfd.
+/// The dup3() system call is similar to dup2(), but it also takes an additional flags argument that can be used to set the close-on-exec flag for the new file descriptor.
+pub fn sys_dup(oldfd: i32, newfd: Option<i32>, flags: Option<OFlags>) -> Result<u32, Errno> {
     let Ok(oldfd) = u32::try_from(oldfd) else {
         return Err(Errno::EBADF);
     };
-    let Ok(newfd) = u32::try_from(newfd) else {
-        return Err(Errno::EBADF);
-    };
-    if oldfd == newfd {
-        return Err(Errno::EINVAL);
-    }
-
     let new_file = file_descriptors()
         .read()
         .get_fd(oldfd)
         .ok_or(Errno::EBADF)
-        .map(|desc| do_dup(desc, flags))?;
-    let old_file = file_descriptors()
-        .write()
-        .insert_at(new_file, newfd as usize)
-        .ok_or(Errno::EBADF)?;
-    do_close(old_file)?;
-    Ok(newfd)
+        .map(|desc| do_dup(desc, flags.unwrap_or(OFlags::empty())))?;
+    if let Some(newfd) = newfd {
+        // dup2/dup3
+        let Ok(newfd) = u32::try_from(newfd) else {
+            return Err(Errno::EBADF);
+        };
+        if oldfd == newfd {
+            // Different from dup3, if oldfd is a valid file descriptor, and newfd has the same value
+            // as oldfd, then dup2() does nothing.
+            return if flags.is_some() {
+                // dup3
+                Err(Errno::EINVAL)
+            } else {
+                // dup2
+                Ok(oldfd)
+            };
+        }
+
+        if let Some(old_file) = file_descriptors()
+            .write()
+            .insert_at(new_file, newfd as usize)
+        {
+            do_close(old_file)?;
+        }
+        Ok(newfd)
+    } else {
+        // dup
+        Ok(file_descriptors().write().insert(new_file))
+    }
 }

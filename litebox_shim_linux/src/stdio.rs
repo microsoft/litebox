@@ -139,7 +139,7 @@ mod tests {
         let stdin = 0;
         let flags = sys_fcntl(stdin, FcntlArg::GETFL).unwrap();
 
-        let stdin2 = i32::try_from(sys_dup(stdin).unwrap()).unwrap();
+        let stdin2 = i32::try_from(sys_dup(stdin, None, None).unwrap()).unwrap();
         assert_eq!(flags, sys_fcntl(stdin2, FcntlArg::GETFL).unwrap());
 
         let mut stdio_path: [u8; 32] = [0; 32];

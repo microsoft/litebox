@@ -486,15 +486,8 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     Dup {
         oldfd: i32,
-    },
-    Dup2 {
-        oldfd: i32,
-        newfd: i32,
-    },
-    Dup3 {
-        oldfd: i32,
-        newfd: i32,
-        flags: litebox::fs::OFlags,
+        newfd: Option<i32>,
+        flags: Option<litebox::fs::OFlags>,
     },
     Socket {
         domain: AddressFamily,
