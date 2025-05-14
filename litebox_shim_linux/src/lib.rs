@@ -205,6 +205,9 @@ impl Descriptors {
 
 enum Descriptor {
     File(litebox::fd::FileFd),
+    // Note we are using `Arc` here so that we can hold a reference to the socket
+    // without holding a lock on the file descriptor (see `sys_accept` for an example).
+    // TODO: this could be addressed by #120.
     Socket(alloc::sync::Arc<crate::syscalls::net::Socket>),
     PipeReader {
         consumer: alloc::sync::Arc<crate::channel::Consumer<u8>>,

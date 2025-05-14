@@ -51,6 +51,7 @@ pub(super) enum SocketAddress {
     Inet(SocketAddr),
 }
 
+// TODO: move `status` and `close_on_exec` to litebox once #119 is completed
 pub(crate) struct Socket {
     pub(crate) fd: Option<SocketFd>,
     /// File status flags (see [`litebox::fs::OFlags::STATUS_FLAGS_MASK`])
