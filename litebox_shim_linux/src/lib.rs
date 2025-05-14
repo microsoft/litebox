@@ -156,6 +156,11 @@ impl Descriptors {
             u32::try_from(idx).unwrap()
         }
     }
+    fn insert_at(&mut self, descriptor: Descriptor, idx: usize) -> Option<Descriptor> {
+        self.descriptors
+            .get_mut(idx)
+            .and_then(|v| v.replace(descriptor))
+    }
     fn remove(&mut self, fd: u32) -> Option<Descriptor> {
         let fd = fd as usize;
         self.descriptors.get_mut(fd)?.take()
@@ -332,6 +337,15 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
                 syscalls::file::sys_access(path, mode).map(|()| 0)
             })
         }
+        SyscallRequest::Dup { oldfd } => syscalls::file::sys_dup(oldfd).map(|newfd| newfd as usize),
+        SyscallRequest::Dup2 { oldfd, newfd } => {
+            syscalls::file::sys_dup2(oldfd, newfd).map(|newfd| newfd as usize)
+        }
+        SyscallRequest::Dup3 {
+            oldfd,
+            newfd,
+            flags,
+        } => syscalls::file::sys_dup3(oldfd, newfd, flags).map(|newfd| newfd as usize),
         SyscallRequest::Socket {
             domain,
             ty,

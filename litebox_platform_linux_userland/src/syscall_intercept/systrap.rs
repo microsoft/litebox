@@ -298,6 +298,18 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                 syscall_args[1].reinterpret_as_signed().truncate(),
             ),
         },
+        libc::SYS_dup => SyscallRequest::Dup {
+            oldfd: syscall_args[0].reinterpret_as_signed().truncate(),
+        },
+        libc::SYS_dup2 => SyscallRequest::Dup2 {
+            oldfd: syscall_args[0].reinterpret_as_signed().truncate(),
+            newfd: syscall_args[1].reinterpret_as_signed().truncate(),
+        },
+        libc::SYS_dup3 => SyscallRequest::Dup3 {
+            oldfd: syscall_args[0].reinterpret_as_signed().truncate(),
+            newfd: syscall_args[1].reinterpret_as_signed().truncate(),
+            flags: litebox::fs::OFlags::from_bits_truncate(syscall_args[2].truncate()),
+        },
         libc::SYS_socket => {
             let domain: u32 = syscall_args[0].truncate();
             let type_and_flags: u32 = syscall_args[1].truncate();
