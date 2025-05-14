@@ -2,8 +2,10 @@
 
 #![no_std]
 
+use int_enum::IntEnum;
 use litebox::{
     fs::OFlags,
+    net::{ReceiveFlags, SendFlags},
     platform::{RawConstPointer, RawMutPointer},
     utils::TruncateExt,
 };
@@ -368,6 +370,45 @@ bitflags::bitflags! {
     }
 }
 
+#[repr(u32)]
+#[non_exhaustive]
+#[derive(Debug, IntEnum)]
+pub enum AddressFamily {
+    UNIX = 1,
+    INET = 2,
+    INET6 = 10,
+    NETLINK = 16,
+}
+
+#[repr(u32)]
+#[non_exhaustive]
+#[derive(Debug, IntEnum)]
+pub enum SockType {
+    Stream = 1,
+    Datagram = 2,
+    Raw = 3,
+}
+
+bitflags::bitflags! {
+    #[derive(Debug)]
+    pub struct SockFlags: core::ffi::c_uint {
+        const NONBLOCK = OFlags::NONBLOCK.bits();
+        const CLOEXEC = OFlags::CLOEXEC.bits();
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+#[repr(u8)]
+#[non_exhaustive]
+#[derive(IntEnum, PartialEq)]
+pub enum Protocol {
+    ICMP = 1,
+    TCP = 6,
+    UDP = 17,
+    RAW = 255,
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
@@ -442,6 +483,52 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Access {
         pathname: Platform::RawConstPointer<i8>,
         mode: AccessFlags,
+    },
+    Socket {
+        domain: AddressFamily,
+        ty: SockType,
+        flags: SockFlags,
+        /// The `protocol` specifies a particular protocol to be used with the
+        /// socket.  Normally only a single protocol exists to support a
+        /// particular socket type within a given protocol family, in which case
+        /// protocol can be specified as `None`.
+        protocol: Option<Protocol>,
+    },
+    Connect {
+        sockfd: i32,
+        sockaddr: Platform::RawConstPointer<u8>,
+        addrlen: usize,
+    },
+    Accept {
+        sockfd: i32,
+        addr: Option<Platform::RawMutPointer<u8>>,
+        addrlen: Option<Platform::RawMutPointer<u32>>,
+        flags: SockFlags,
+    },
+    Sendto {
+        sockfd: i32,
+        buf: Platform::RawConstPointer<u8>,
+        len: usize,
+        flags: SendFlags,
+        addr: Option<Platform::RawConstPointer<u8>>,
+        addrlen: u32,
+    },
+    Recvfrom {
+        sockfd: i32,
+        buf: Platform::RawMutPointer<u8>,
+        len: usize,
+        flags: ReceiveFlags,
+        addr: Option<Platform::RawMutPointer<u8>>,
+        addrlen: Option<Platform::RawMutPointer<u32>>,
+    },
+    Bind {
+        sockfd: i32,
+        sockaddr: Platform::RawConstPointer<u8>,
+        addrlen: usize,
+    },
+    Listen {
+        sockfd: i32,
+        backlog: u16,
     },
     Fcntl {
         fd: i32,

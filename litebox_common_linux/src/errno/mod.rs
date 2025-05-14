@@ -223,3 +223,79 @@ impl From<litebox::fs::errors::FileStatusError> for Errno {
         }
     }
 }
+
+impl From<litebox::net::errors::SocketError> for Errno {
+    fn from(value: litebox::net::errors::SocketError) -> Self {
+        match value {
+            litebox::net::errors::SocketError::UnsupportedProtocol(_) => Errno::EPROTONOSUPPORT,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::net::errors::AcceptError> for Errno {
+    fn from(value: litebox::net::errors::AcceptError) -> Self {
+        match value {
+            litebox::net::errors::AcceptError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::AcceptError::NotListening => Errno::ENOTCONN,
+            litebox::net::errors::AcceptError::NoConnectionsReady => Errno::EAGAIN,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::net::errors::BindError> for Errno {
+    fn from(value: litebox::net::errors::BindError) -> Self {
+        match value {
+            litebox::net::errors::BindError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::BindError::UnsupportedAddress(_) => Errno::EAFNOSUPPORT,
+            litebox::net::errors::BindError::PortAlreadyInUse(_) => Errno::EADDRINUSE,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::net::errors::ConnectError> for Errno {
+    fn from(value: litebox::net::errors::ConnectError) -> Self {
+        match value {
+            litebox::net::errors::ConnectError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::ConnectError::UnsupportedAddress(_) => Errno::EAFNOSUPPORT,
+            litebox::net::errors::ConnectError::PortAllocationFailure(_) => Errno::EADDRINUSE,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::net::errors::ListenError> for Errno {
+    fn from(value: litebox::net::errors::ListenError) -> Self {
+        match value {
+            litebox::net::errors::ListenError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::ListenError::InvalidAddress => Errno::EINVAL,
+            litebox::net::errors::ListenError::InvalidState => Errno::EINVAL,
+            litebox::net::errors::ListenError::NoAvailableFreeEphemeralPorts => Errno::ENOSPC,
+
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::net::errors::SendError> for Errno {
+    fn from(value: litebox::net::errors::SendError) -> Self {
+        match value {
+            litebox::net::errors::SendError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::SendError::SocketInInvalidState => Errno::ENOTCONN,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::net::errors::ReceiveError> for Errno {
+    fn from(value: litebox::net::errors::ReceiveError) -> Self {
+        match value {
+            litebox::net::errors::ReceiveError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::ReceiveError::SocketInInvalidState => Errno::EAGAIN,
+            litebox::net::errors::ReceiveError::OperationFinished => Errno::ESHUTDOWN,
+            _ => unimplemented!(),
+        }
+    }
+}

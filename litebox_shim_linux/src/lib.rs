@@ -81,6 +81,16 @@ pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE>
     VMEM.get_or_init(|| alloc::boxed::Box::new(PageManager::new(litebox())))
 }
 
+pub(crate) fn litebox_net<'a>()
+-> &'a litebox::sync::Mutex<Platform, litebox::net::Network<Platform>> {
+    static NET: OnceBox<litebox::sync::Mutex<Platform, litebox::net::Network<Platform>>> =
+        OnceBox::new();
+    NET.get_or_init(|| {
+        let net = litebox::net::Network::new(litebox());
+        alloc::boxed::Box::new(litebox().sync().new_mutex(net))
+    })
+}
+
 // Convenience type aliases
 type ConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
@@ -162,7 +172,7 @@ impl Descriptors {
             None
         }
     }
-    fn remove_socket(&mut self, fd: u32) -> Option<litebox::fd::SocketFd> {
+    fn remove_socket(&mut self, fd: u32) -> Option<alloc::sync::Arc<crate::syscalls::net::Socket>> {
         let fd = fd as usize;
         if let Some(Descriptor::Socket(socket_fd)) = self
             .descriptors
@@ -184,7 +194,7 @@ impl Descriptors {
             None
         }
     }
-    fn get_socket_fd(&self, fd: u32) -> Option<&litebox::fd::SocketFd> {
+    fn get_socket_fd(&self, fd: u32) -> Option<&crate::syscalls::net::Socket> {
         if let Descriptor::Socket(socket_fd) = self.descriptors.get(fd as usize)?.as_ref()? {
             Some(socket_fd)
         } else {
@@ -195,7 +205,10 @@ impl Descriptors {
 
 enum Descriptor {
     File(litebox::fd::FileFd),
-    Socket(litebox::fd::SocketFd),
+    // Note we are using `Arc` here so that we can hold a reference to the socket
+    // without holding a lock on the file descriptor (see `sys_accept` for an example).
+    // TODO: this could be addressed by #120.
+    Socket(alloc::sync::Arc<crate::syscalls::net::Socket>),
     PipeReader {
         consumer: alloc::sync::Arc<crate::channel::Consumer<u8>>,
         close_on_exec: core::sync::atomic::AtomicBool,
@@ -318,6 +331,47 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
             pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                 syscalls::file::sys_access(path, mode).map(|()| 0)
             })
+        }
+        SyscallRequest::Socket {
+            domain,
+            ty,
+            flags,
+            protocol,
+        } => syscalls::net::sys_socket(domain, ty, flags, protocol).map(|fd| fd as usize),
+        SyscallRequest::Connect {
+            sockfd,
+            sockaddr,
+            addrlen,
+        } => syscalls::net::sys_connect(sockfd, sockaddr, addrlen).map(|()| 0),
+        SyscallRequest::Accept {
+            sockfd,
+            addr,
+            addrlen,
+            flags,
+        } => syscalls::net::sys_accept(sockfd, addr, addrlen, flags).map(|fd| fd as usize),
+        SyscallRequest::Sendto {
+            sockfd,
+            buf,
+            len,
+            flags,
+            addr,
+            addrlen,
+        } => syscalls::net::sys_sendto(sockfd, buf, len, flags, addr, addrlen),
+        SyscallRequest::Recvfrom {
+            sockfd,
+            buf,
+            len,
+            flags,
+            addr,
+            addrlen,
+        } => syscalls::net::sys_recvfrom(sockfd, buf, len, flags, addr, addrlen),
+        SyscallRequest::Bind {
+            sockfd,
+            sockaddr,
+            addrlen,
+        } => syscalls::net::sys_bind(sockfd, sockaddr, addrlen).map(|()| 0),
+        SyscallRequest::Listen { sockfd, backlog } => {
+            syscalls::net::sys_listen(sockfd, backlog).map(|()| 0)
         }
         SyscallRequest::Fcntl { fd, arg } => syscalls::file::sys_fcntl(fd, arg).map(|v| v as usize),
         SyscallRequest::Getcwd { buf, size: count } => {

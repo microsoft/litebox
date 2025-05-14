@@ -35,3 +35,4 @@ workspace = true
 
 [dev-dependencies]
 litebox_shim_linux = { path = ".", features = ["unstable-testing"] }
+spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }

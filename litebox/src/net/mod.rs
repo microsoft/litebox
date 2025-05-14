@@ -764,6 +764,7 @@ where
 
     /// Accept a new incoming connection on a listening socket.
     pub fn accept(&mut self, fd: &SocketFd) -> Result<SocketFd, AcceptError> {
+        self.automated_platform_interaction(PollDirection::Both);
         let socket_handle = self.handles[fd.x.as_usize()]
             .as_mut()
             .ok_or(AcceptError::InvalidFd)?;
@@ -860,7 +861,7 @@ where
             .as_mut()
             .ok_or(ReceiveError::InvalidFd)?;
 
-        if !flags.is_empty() {
+        if flags.intersects(ReceiveFlags::DONTWAIT.complement()) {
             unimplemented!()
         }
 
@@ -870,8 +871,8 @@ where
                 .get_mut::<tcp::Socket>(socket_handle.handle)
                 .recv_slice(buf)
                 .map_err(|e| match e {
-                    tcp::RecvError::InvalidState => ReceiveError::OperationFinished,
-                    tcp::RecvError::Finished => ReceiveError::SocketInInvalidState,
+                    tcp::RecvError::InvalidState => ReceiveError::SocketInInvalidState,
+                    tcp::RecvError::Finished => ReceiveError::OperationFinished,
                 }),
             Protocol::Udp => unimplemented!(),
             Protocol::Icmp => unimplemented!(),
@@ -893,6 +894,7 @@ pub enum Protocol {
 
 bitflags! {
     /// Flags for the `receive` function.
+    #[derive(Clone, Copy, Debug)]
     pub struct ReceiveFlags: u32 {
         /// `MSG_CMSG_CLOEXEC`: close-on-exec for the associated file descriptor
         const CMSG_CLOEXEC = 0x40000000;
@@ -915,6 +917,7 @@ bitflags! {
 
 bitflags! {
     /// Flags for the `send` function.
+    #[derive(Clone, Copy, Debug)]
     pub struct SendFlags: u32 {
         /// `MSG_CONFIRM`: requests confirmation of the message delivery.
         const CONFIRM = 0x800;

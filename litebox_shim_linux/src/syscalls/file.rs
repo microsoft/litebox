@@ -189,15 +189,15 @@ pub fn sys_close(fd: i32) -> Result<(), Errno> {
         return Err(Errno::EBADF);
     };
     match file_descriptors().write().remove(fd) {
-        Some(Descriptor::File(file) | Descriptor::Stdio(crate::stdio::StdioFile { file, .. })) => {
-            litebox_fs().close(file).map_err(Errno::from)
-        }
-        Some(Descriptor::Socket(socket)) => todo!(),
-        Some(
+        Some(desc) => match desc {
+            Descriptor::File(file) | Descriptor::Stdio(crate::stdio::StdioFile { file, .. }) => {
+                litebox_fs().close(file).map_err(Errno::from)
+            }
+            Descriptor::Socket(socket) => Ok(()), // The actual close happens when the socket is dropped
             Descriptor::PipeReader { .. }
             | Descriptor::PipeWriter { .. }
-            | Descriptor::Eventfd { .. },
-        ) => Ok(()),
+            | Descriptor::Eventfd { .. } => Ok(()),
+        },
         None => Err(Errno::EBADF),
     }
 }

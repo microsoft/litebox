@@ -2,10 +2,11 @@
 
 use core::arch::global_asm;
 use core::ffi::{c_int, c_uint};
+use litebox::net::{ReceiveFlags, SendFlags};
 use litebox::platform::RawMutPointer as _;
 use litebox::platform::trivial_providers::{TransparentConstPtr, TransparentMutPtr};
 use litebox::utils::{ReinterpretSignedExt as _, TruncateExt as _};
-use litebox_common_linux::{IoctlArg, SyscallRequest};
+use litebox_common_linux::{IoctlArg, SockFlags, SyscallRequest};
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 
 // Define a custom structure to reinterpret siginfo_t
@@ -297,6 +298,118 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                 syscall_args[1].reinterpret_as_signed().truncate(),
             ),
         },
+        libc::SYS_socket => {
+            let domain: u32 = syscall_args[0].truncate();
+            let type_and_flags: u32 = syscall_args[1].truncate();
+            SyscallRequest::Socket {
+                domain: litebox_common_linux::AddressFamily::try_from(domain)
+                    .expect("Invalid domain"),
+                ty: litebox_common_linux::SockType::try_from(type_and_flags & 0x0f)
+                    .expect("Invalid sock type"),
+                flags: litebox_common_linux::SockFlags::from_bits_truncate(type_and_flags & !0x0f),
+                protocol: if syscall_args[2] == 0 {
+                    None
+                } else {
+                    let protocol: u8 = syscall_args[2].truncate();
+                    Some(
+                        litebox_common_linux::Protocol::try_from(protocol)
+                            .expect("Invalid protocol"),
+                    )
+                },
+            }
+        }
+        libc::SYS_connect => SyscallRequest::Connect {
+            sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
+            sockaddr: TransparentConstPtr {
+                inner: syscall_args[1] as *const u8,
+            },
+            addrlen: syscall_args[2],
+        },
+        libc::SYS_accept => SyscallRequest::Accept {
+            sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
+            addr: if syscall_args[1] == 0 {
+                None
+            } else {
+                Some(TransparentMutPtr {
+                    inner: syscall_args[1] as *mut u8,
+                })
+            },
+            addrlen: if syscall_args[2] == 0 {
+                None
+            } else {
+                Some(TransparentMutPtr {
+                    inner: syscall_args[2] as *mut u32,
+                })
+            },
+            flags: SockFlags::empty(),
+        },
+        libc::SYS_accept4 => SyscallRequest::Accept {
+            sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
+            addr: if syscall_args[1] == 0 {
+                None
+            } else {
+                Some(TransparentMutPtr {
+                    inner: syscall_args[1] as *mut u8,
+                })
+            },
+            addrlen: if syscall_args[2] == 0 {
+                None
+            } else {
+                Some(TransparentMutPtr {
+                    inner: syscall_args[2] as *mut u32,
+                })
+            },
+            flags: SockFlags::from_bits_truncate(syscall_args[3].truncate()),
+        },
+        libc::SYS_sendto => SyscallRequest::Sendto {
+            sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
+            buf: TransparentConstPtr {
+                inner: syscall_args[1] as *const u8,
+            },
+            len: syscall_args[2],
+            flags: SendFlags::from_bits_truncate(syscall_args[3].truncate()),
+            addr: if syscall_args[4] == 0 {
+                None
+            } else {
+                Some(TransparentConstPtr {
+                    inner: syscall_args[4] as *const u8,
+                })
+            },
+            addrlen: syscall_args[5].truncate(),
+        },
+        libc::SYS_recvfrom => SyscallRequest::Recvfrom {
+            sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
+            buf: TransparentMutPtr {
+                inner: syscall_args[1] as *mut u8,
+            },
+            len: syscall_args[2],
+            flags: ReceiveFlags::from_bits_truncate(syscall_args[3].truncate()),
+            addr: if syscall_args[4] == 0 {
+                None
+            } else {
+                Some(TransparentMutPtr {
+                    inner: syscall_args[4] as *mut u8,
+                })
+            },
+            addrlen: if syscall_args[5] == 0 {
+                None
+            } else {
+                Some(TransparentMutPtr {
+                    inner: syscall_args[5] as *mut u32,
+                })
+            },
+        },
+        libc::SYS_bind => SyscallRequest::Bind {
+            sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
+            sockaddr: TransparentConstPtr {
+                inner: syscall_args[1] as *const u8,
+            },
+            addrlen: syscall_args[2],
+        },
+        libc::SYS_listen => SyscallRequest::Listen {
+            sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
+            backlog: syscall_args[1].truncate(),
+        },
         libc::SYS_fcntl => SyscallRequest::Fcntl {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
             arg: litebox_common_linux::FcntlArg::from(
@@ -490,10 +603,26 @@ fn register_seccomp_filter() {
     // TODO: remove syscalls once they are implemented in the shim
     let rules = vec![
         (
+            libc::SYS_read,
+            vec![
+                // A backdoor to allow invoking read for devices.
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        3,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::Eq,
+                        SYSCALL_ARG_MAGIC as u64,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            ],
+        ),
+        (
             libc::SYS_write,
             vec![
                 SeccompRule::new(vec![
-                    // A backdoor to allow invoking write.
+                    // A backdoor to allow invoking write for devices.
                     SeccompCondition::new(
                         3,
                         SeccompCmpArgLen::Qword,

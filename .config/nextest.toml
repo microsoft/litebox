@@ -6,3 +6,15 @@ status-level = "all"
 # Output failures as soon as they happen _and_ at the end of the test run;
 # combination of "immediate" and "final".
 failure-output = "immediate-final"
+
+[test-groups]
+# ensure only one test accessing tun at a time
+tun-access = { max-threads = 1 }
+
+[[profile.ci.overrides]]
+filter = 'package(litebox_shim_linux) and test(test_tun)'
+test-group = "tun-access"
+
+[[profile.default.overrides]]
+filter = 'package(litebox_shim_linux) and test(test_tun)'
+test-group = "tun-access"

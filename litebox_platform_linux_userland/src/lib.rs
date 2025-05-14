@@ -12,7 +12,7 @@ use std::time::Duration;
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
-use litebox::utils::ReinterpretUnsignedExt;
+use litebox::utils::ReinterpretUnsignedExt as _;
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
 
 mod syscall_intercept;
@@ -60,7 +60,10 @@ impl LinuxUserland {
                         name
                     },
                     ifr_ifru: nix::libc::__c_anonymous_ifr_ifru {
-                        ifru_flags: i16::try_from(nix::libc::IFF_TUN).unwrap(),
+                        // IFF_NO_PI: no tun header
+                        // IFF_TUN: create tun (i.e., IP)
+                        ifru_flags: i16::try_from(nix::libc::IFF_TUN | nix::libc::IFF_NO_PI)
+                            .unwrap(),
                     },
                 };
                 let ifreq: *const libc::ifreq = &ifreq as _;
@@ -358,14 +361,14 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                 syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
             )
         } {
-            Ok(size) => {
-                if size != packet.len() {
-                    unimplemented!()
+            Ok(n) => {
+                if n != packet.len() {
+                    unimplemented!("unexpected size {n}")
                 }
                 Ok(())
             }
             Err(errno) => {
-                unimplemented!("unexpected error {}", errno)
+                unimplemented!("unexpected error {errno}")
             }
         }
     }
@@ -388,12 +391,12 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                 syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
             )
         }
-        .map_err(|e| {
-            if e == syscalls::Errno::EWOULDBLOCK || e == syscalls::Errno::EAGAIN {
+        .map_err(|errno| match errno {
+            #[allow(unreachable_patterns, reason = "EAGAIN == EWOULDBLOCK")]
+            syscalls::Errno::EWOULDBLOCK | syscalls::Errno::EAGAIN => {
                 litebox::platform::ReceiveError::WouldBlock
-            } else {
-                unimplemented!("unexpected error {}", e)
             }
+            _ => unimplemented!("unexpected error {errno}"),
         })
     }
 }
