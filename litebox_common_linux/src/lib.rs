@@ -1,6 +1,7 @@
 //! Common Linux-y items suitable for LiteBox
 
 #![no_std]
+#![allow(non_camel_case_types)]
 
 use int_enum::IntEnum;
 use litebox::{
@@ -309,9 +310,7 @@ bitflags::bitflags! {
     }
 }
 
-#[allow(non_camel_case_types)]
 type cc_t = ::core::ffi::c_uchar;
-#[allow(non_camel_case_types)]
 type tcflag_t = ::core::ffi::c_uint;
 #[repr(C)]
 #[derive(Debug, Clone)]
@@ -407,6 +406,99 @@ pub enum Protocol {
     TCP = 6,
     UDP = 17,
     RAW = 255,
+}
+
+#[repr(u32)]
+#[derive(Debug, IntEnum)]
+pub enum IpOption {
+    TOS = 1,
+}
+
+#[repr(u32)]
+#[derive(Debug, IntEnum)]
+pub enum SocketOption {
+    REUSEADDR = 2,
+    TYPE = 3,
+    BROADCAST = 6,
+    SNDBUF = 7,
+    RCVBUF = 8,
+    KEEPALIVE = 9,
+    PEERCRED = 17,
+    RCVTIMEO = 20,
+    SNDTIMEO = 21,
+}
+
+#[repr(u32)]
+#[derive(Debug, IntEnum)]
+pub enum TcpOption {
+    NODELAY = 1,
+    CORK = 3,
+    INFO = 11,
+    CONGESTION = 13,
+}
+
+#[derive(Debug)]
+pub enum SocketOptionName {
+    IP(IpOption),
+    Socket(SocketOption),
+    TCP(TcpOption),
+}
+
+#[repr(u32)]
+#[derive(Debug, IntEnum)]
+pub enum SocketOptionLevel {
+    IP = 0,
+    SOCKET = 1,
+    TCP = 6,
+    UDP = 17,
+    RAW = 255,
+}
+
+impl SocketOptionName {
+    pub fn from(level: u32, optname: u32) -> Option<Self> {
+        let level = SocketOptionLevel::try_from(level).ok()?;
+        match level {
+            SocketOptionLevel::IP => Some(Self::IP(IpOption::try_from(optname).ok()?)),
+            SocketOptionLevel::SOCKET => Some(Self::Socket(SocketOption::try_from(optname).ok()?)),
+            SocketOptionLevel::TCP => Some(Self::TCP(TcpOption::try_from(optname).ok()?)),
+            _ => todo!(),
+        }
+    }
+}
+
+cfg_if::cfg_if! {
+    if #[cfg(all(target_arch = "x86"))] {
+        pub type time_t = u32;
+        pub type suseconds_t = u64;
+    } else if #[cfg(all(target_arch = "x86_64"))] {
+        pub type time_t = u64;
+        pub type suseconds_t = u64;
+    } else {
+        compile_error!("Unsupported architecture");
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TimeVal {
+    tv_sec: time_t,
+    tv_usec: suseconds_t,
+}
+
+const MICROS_PER_SEC: u64 = 1_000_000;
+impl TryFrom<TimeVal> for core::time::Duration {
+    type Error = errno::Errno;
+
+    fn try_from(value: TimeVal) -> Result<Self, Self::Error> {
+        if value.tv_usec >= MICROS_PER_SEC {
+            Err(errno::Errno::EDOM)
+        } else {
+            Ok(core::time::Duration::new(
+                value.tv_sec as _,
+                u32::try_from(value.tv_usec * 1000).unwrap(),
+            ))
+        }
+    }
 }
 
 /// Request to syscall handler
@@ -534,6 +626,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Listen {
         sockfd: i32,
         backlog: u16,
+    },
+    Setsockopt {
+        sockfd: i32,
+        optname: SocketOptionName,
+        optval: Platform::RawConstPointer<u8>,
+        optlen: usize,
     },
     Fcntl {
         fd: i32,

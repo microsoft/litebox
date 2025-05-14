@@ -427,6 +427,24 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
             backlog: syscall_args[1].truncate(),
         },
+        libc::SYS_setsockopt => {
+            let optname = litebox_common_linux::SocketOptionName::from(
+                syscall_args[1].truncate(),
+                syscall_args[2].truncate(),
+            );
+            if let Some(optname) = optname {
+                SyscallRequest::Setsockopt {
+                    sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
+                    optname,
+                    optval: TransparentConstPtr {
+                        inner: syscall_args[3] as *const u8,
+                    },
+                    optlen: syscall_args[4],
+                }
+            } else {
+                SyscallRequest::Ret(-libc::EINVAL as isize)
+            }
+        }
         libc::SYS_fcntl => SyscallRequest::Fcntl {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
             arg: litebox_common_linux::FcntlArg::from(

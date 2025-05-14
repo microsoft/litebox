@@ -879,6 +879,21 @@ where
         self.automated_platform_interaction(PollDirection::Ingress);
         ret
     }
+
+    /// Invoke the given function with the given socket if it is a valid tcp socket.
+    pub fn call_on_tcp_socket_mut<F, R>(&mut self, fd: &SocketFd, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut smoltcp::socket::tcp::Socket) -> R,
+    {
+        let socket_handle = self.handles[fd.x.as_usize()].as_ref()?;
+        match socket_handle.protocol() {
+            Protocol::Tcp => {
+                let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
+                Some(f(tcp_socket))
+            }
+            Protocol::Udp | Protocol::Icmp | Protocol::Raw { .. } => None,
+        }
+    }
 }
 
 /// Protocols for sockets supported by LiteBox

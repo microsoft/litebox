@@ -10,8 +10,11 @@ use litebox::{
     fs::OFlags,
     net::{ReceiveFlags, SendFlags},
     platform::{RawConstPointer, RawMutPointer},
+    sync::RawSyncPrimitivesProvider,
 };
-use litebox_common_linux::{AddressFamily, SockFlags, SockType, errno::Errno};
+use litebox_common_linux::{
+    AddressFamily, SockFlags, SockType, SocketOption, SocketOptionName, TcpOption, errno::Errno,
+};
 
 use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox_net};
 
@@ -51,15 +54,26 @@ pub(super) enum SocketAddress {
     Inet(SocketAddr),
 }
 
+#[derive(Default)]
+pub(super) struct SocketOptions {
+    pub(super) reuse_address: bool,
+    pub(super) keep_alive: bool,
+    /// Receiving timeout, None (default value) means no timeout
+    pub(super) recv_timeout: Option<core::time::Duration>,
+    /// Sending timeout, None (default value) means no timeout
+    pub(super) send_timeout: Option<core::time::Duration>,
+}
+
 // TODO: move `status` and `close_on_exec` to litebox once #119 is completed
-pub(crate) struct Socket {
+pub(crate) struct Socket<Platform: RawSyncPrimitivesProvider> {
     pub(crate) fd: Option<SocketFd>,
     /// File status flags (see [`litebox::fs::OFlags::STATUS_FLAGS_MASK`])
     pub(crate) status: AtomicU32,
     pub(crate) close_on_exec: AtomicBool,
+    options: litebox::sync::Mutex<Platform, SocketOptions>,
 }
 
-impl Drop for Socket {
+impl<Platform: RawSyncPrimitivesProvider> Drop for Socket<Platform> {
     fn drop(&mut self) {
         if let Some(sockfd) = self.fd.take() {
             litebox_net().lock().close(sockfd);
@@ -67,13 +81,132 @@ impl Drop for Socket {
     }
 }
 
-impl Socket {
-    pub(crate) fn new(fd: SocketFd, flags: SockFlags) -> Self {
+impl<Platform: RawSyncPrimitivesProvider> Socket<Platform> {
+    pub(crate) fn new(
+        fd: SocketFd,
+        flags: SockFlags,
+        litebox: &litebox::LiteBox<Platform>,
+    ) -> Self {
+        let mut status = OFlags::RDWR;
+        status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
+
         Self {
             fd: Some(fd),
             // `SockFlags` is a subset of `OFlags`
             status: AtomicU32::new(flags.bits()),
             close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
+            options: litebox.sync().new_mutex(SocketOptions::default()),
+        }
+    }
+
+    fn setsockopt(
+        &self,
+        optname: SocketOptionName,
+        optval: ConstPtr<u8>,
+        optlen: usize,
+    ) -> Result<(), Errno> {
+        match optname {
+            SocketOptionName::IP(ip) => match ip {
+                litebox_common_linux::IpOption::TOS => Err(Errno::EOPNOTSUPP),
+            },
+            SocketOptionName::Socket(so) => {
+                let read_timeval_as_duration =
+                    |optval| -> Result<Option<core::time::Duration>, Errno> {
+                        if optlen < size_of::<litebox_common_linux::TimeVal>() {
+                            return Err(Errno::EINVAL);
+                        }
+                        let optval: ConstPtr<litebox_common_linux::TimeVal> =
+                            unsafe { core::mem::transmute(optval) };
+                        let timeval = unsafe { optval.read_at_offset(0) }
+                            .ok_or(Errno::EFAULT)?
+                            .into_owned();
+                        let d = core::time::Duration::try_from(timeval)?;
+                        if d.is_zero() { Ok(None) } else { Ok(Some(d)) }
+                    };
+                match so {
+                    SocketOption::RCVTIMEO => {
+                        self.options.lock().recv_timeout = read_timeval_as_duration(optval)?;
+                        return Ok(());
+                    }
+                    SocketOption::SNDTIMEO => {
+                        self.options.lock().send_timeout = read_timeval_as_duration(optval)?;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+
+                if optlen < size_of::<u32>() {
+                    return Err(Errno::EINVAL);
+                }
+                let optval: ConstPtr<u32> = unsafe { core::mem::transmute(optval) };
+                let val = unsafe { optval.read_at_offset(0) }
+                    .ok_or(Errno::EFAULT)?
+                    .into_owned();
+                match so {
+                    SocketOption::REUSEADDR => {
+                        self.options.lock().reuse_address = val != 0;
+                    }
+                    SocketOption::BROADCAST => {
+                        if val == 0 {
+                            todo!("disable SO_BROADCAST");
+                        }
+                    }
+                    SocketOption::KEEPALIVE => {
+                        let keep_alive = val != 0;
+                        // This option probably has no effect on other protocols
+                        let _ = litebox_net().lock().call_on_tcp_socket_mut(
+                            self.fd.as_ref().unwrap(),
+                            |tcp| {
+                                tcp.set_keep_alive(if keep_alive {
+                                    // default time interval is 2 hours
+                                    Some(smoltcp::time::Duration::from_secs(2 * 60 * 60))
+                                } else {
+                                    None
+                                });
+                            },
+                        );
+                        self.options.lock().keep_alive = keep_alive;
+                    }
+                    // We use fixed buffer size for now
+                    SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
+                    // Already handled at the beginning
+                    SocketOption::RCVTIMEO | SocketOption::SNDTIMEO => {}
+                    // Socket does not support these options
+                    SocketOption::TYPE | SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
+                }
+                Ok(())
+            }
+            SocketOptionName::TCP(to) => {
+                let optval: ConstPtr<u32> = unsafe { core::mem::transmute(optval) };
+                let val = unsafe { optval.read_at_offset(0) }
+                    .ok_or(Errno::EFAULT)?
+                    .into_owned();
+                match to {
+                    TcpOption::NODELAY => {
+                        litebox_net()
+                            .lock()
+                            .call_on_tcp_socket_mut(self.fd.as_ref().unwrap(), |tcp| {
+                                tcp.set_nagle_enabled(val == 0);
+                            })
+                            .ok_or(Errno::EOPNOTSUPP)?;
+                        Ok(())
+                    }
+                    TcpOption::CORK => {
+                        // Some applications use Nagle’s Algorithm (via the TCP_NODELAY option) for a similar effect.
+                        // However, TCP_CORK offers more fine-grained control, as it’s designed for applications that
+                        // send variable-length chunks of data that don’t necessarily fit nicely into a full TCP segment.
+                        // Because smoltcp does not support TCP_CORK, we emulate it by enabling/disabling Nagle’s Algorithm.
+                        litebox_net()
+                            .lock()
+                            .call_on_tcp_socket_mut(self.fd.as_ref().unwrap(), |tcp| {
+                                tcp.set_nagle_enabled(val != 0);
+                            })
+                            .ok_or(Errno::EOPNOTSUPP)?;
+                        Ok(())
+                    }
+                    _ => unimplemented!("TCP option {to:?}"),
+                }
+            }
         }
     }
 
@@ -144,6 +277,11 @@ impl Socket {
         if flags.contains(SendFlags::DONTWAIT) {
             self.try_sendto(buf, flags, sockaddr)
         } else {
+            let timeout = self.options.lock().send_timeout;
+            if timeout.is_some() {
+                todo!("send timeout");
+            }
+
             // TODO: use `poll` instead of busy wait
             loop {
                 match self.try_sendto(buf, flags, sockaddr) {
@@ -166,6 +304,11 @@ impl Socket {
         if self.get_status().contains(OFlags::NONBLOCK) || flags.contains(ReceiveFlags::DONTWAIT) {
             self.try_receive(buf, flags)
         } else {
+            let timeout = self.options.lock().recv_timeout;
+            if timeout.is_some() {
+                todo!("recv timeout");
+            }
+
             // TODO: use `poll` instead of busy wait
             loop {
                 match self.try_receive(buf, flags) {
@@ -206,7 +349,11 @@ pub(crate) fn sys_socket(
                 _ => unimplemented!(),
             };
             let socket = litebox_net().lock().socket(protocol)?;
-            Descriptor::Socket(alloc::sync::Arc::new(Socket::new(socket, flags)))
+            Descriptor::Socket(alloc::sync::Arc::new(Socket::new(
+                socket,
+                flags,
+                crate::litebox(),
+            )))
         }
         AddressFamily::UNIX => todo!(),
         AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
@@ -267,7 +414,11 @@ pub(crate) fn sys_accept(
             // drop file table as `accept` may block
             drop(file_table);
             let fd = socket.accept()?;
-            Descriptor::Socket(alloc::sync::Arc::new(Socket::new(fd, flags)))
+            Descriptor::Socket(alloc::sync::Arc::new(Socket::new(
+                fd,
+                flags,
+                crate::litebox(),
+            )))
         }
         _ => return Err(Errno::ENOTSOCK),
     };
@@ -388,6 +539,26 @@ pub(crate) fn sys_recvfrom(
             buf.copy_from_slice(0, &buffer).ok_or(Errno::EFAULT);
             Ok(size)
         }
+        _ => Err(Errno::ENOTSOCK),
+    }
+}
+
+pub(crate) fn sys_setsockopt(
+    sockfd: i32,
+    optname: SocketOptionName,
+    optval: ConstPtr<u8>,
+    optlen: usize,
+) -> Result<(), Errno> {
+    let Ok(sockfd) = u32::try_from(sockfd) else {
+        return Err(Errno::EBADF);
+    };
+
+    match file_descriptors()
+        .read()
+        .get_fd(sockfd)
+        .ok_or(Errno::EBADF)?
+    {
+        Descriptor::Socket(socket) => socket.setsockopt(optname, optval, optlen),
         _ => Err(Errno::ENOTSOCK),
     }
 }

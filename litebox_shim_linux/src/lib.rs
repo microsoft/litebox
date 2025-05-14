@@ -28,6 +28,7 @@ use litebox::{
 };
 use litebox_common_linux::{SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
+use syscalls::net::sys_setsockopt;
 
 pub(crate) mod channel;
 pub mod loader;
@@ -180,7 +181,10 @@ impl Descriptors {
             None
         }
     }
-    fn remove_socket(&mut self, fd: u32) -> Option<alloc::sync::Arc<crate::syscalls::net::Socket>> {
+    fn remove_socket(
+        &mut self,
+        fd: u32,
+    ) -> Option<alloc::sync::Arc<crate::syscalls::net::Socket<Platform>>> {
         let fd = fd as usize;
         if let Some(Descriptor::Socket(socket_fd)) = self
             .descriptors
@@ -202,7 +206,7 @@ impl Descriptors {
             None
         }
     }
-    fn get_socket_fd(&self, fd: u32) -> Option<&crate::syscalls::net::Socket> {
+    fn get_socket_fd(&self, fd: u32) -> Option<&crate::syscalls::net::Socket<Platform>> {
         if let Descriptor::Socket(socket_fd) = self.descriptors.get(fd as usize)?.as_ref()? {
             Some(socket_fd)
         } else {
@@ -216,7 +220,7 @@ enum Descriptor {
     // Note we are using `Arc` here so that we can hold a reference to the socket
     // without holding a lock on the file descriptor (see `sys_accept` for an example).
     // TODO: this could be addressed by #120.
-    Socket(alloc::sync::Arc<crate::syscalls::net::Socket>),
+    Socket(alloc::sync::Arc<crate::syscalls::net::Socket<Platform>>),
     PipeReader {
         consumer: alloc::sync::Arc<crate::channel::Consumer<u8>>,
         close_on_exec: core::sync::atomic::AtomicBool,
@@ -386,6 +390,12 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
         SyscallRequest::Listen { sockfd, backlog } => {
             syscalls::net::sys_listen(sockfd, backlog).map(|()| 0)
         }
+        SyscallRequest::Setsockopt {
+            sockfd,
+            optname,
+            optval,
+            optlen,
+        } => sys_setsockopt(sockfd, optname, optval, optlen).map(|()| 0),
         SyscallRequest::Fcntl { fd, arg } => syscalls::file::sys_fcntl(fd, arg).map(|v| v as usize),
         SyscallRequest::Getcwd { buf, size: count } => {
             let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
