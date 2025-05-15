@@ -468,11 +468,11 @@ impl SocketOptionName {
 
 cfg_if::cfg_if! {
     if #[cfg(all(target_arch = "x86"))] {
-        pub type time_t = u32;
-        pub type suseconds_t = u64;
+        pub type time_t = i32;
+        pub type suseconds_t = i32;
     } else if #[cfg(all(target_arch = "x86_64"))] {
-        pub type time_t = u64;
-        pub type suseconds_t = u64;
+        pub type time_t = i64;
+        pub type suseconds_t = i64;
     } else {
         compile_error!("Unsupported architecture");
     }
@@ -485,17 +485,17 @@ pub struct TimeVal {
     tv_usec: suseconds_t,
 }
 
-const MICROS_PER_SEC: u64 = 1_000_000;
+const MICROS_PER_SEC: i32 = 1_000_000;
 impl TryFrom<TimeVal> for core::time::Duration {
     type Error = errno::Errno;
 
     fn try_from(value: TimeVal) -> Result<Self, Self::Error> {
-        if value.tv_usec >= MICROS_PER_SEC {
+        if value.tv_usec >= MICROS_PER_SEC.into() {
             Err(errno::Errno::EDOM)
         } else {
             Ok(core::time::Duration::new(
-                value.tv_sec as _,
-                u32::try_from(value.tv_usec * 1000).unwrap(),
+                u64::try_from(value.tv_sec).map_err(|_| errno::Errno::EDOM)?,
+                u32::try_from(value.tv_usec * 1000).map_err(|_| errno::Errno::EDOM)?,
             ))
         }
     }

@@ -192,9 +192,9 @@ impl<Platform: RawSyncPrimitivesProvider> Socket<Platform> {
                         Ok(())
                     }
                     TcpOption::CORK => {
-                        // Some applications use Nagle’s Algorithm (via the TCP_NODELAY option) for a similar effect.
-                        // However, TCP_CORK offers more fine-grained control, as it’s designed for applications that
-                        // send variable-length chunks of data that don’t necessarily fit nicely into a full TCP segment.
+                        // Some applications use Nagle's Algorithm (via the TCP_NODELAY option) for a similar effect.
+                        // However, TCP_CORK offers more fine-grained control, as it's designed for applications that
+                        // send variable-length chunks of data that don't necessarily fit nicely into a full TCP segment.
                         // Because smoltcp does not support TCP_CORK, we emulate it by enabling/disabling Nagle’s Algorithm.
                         litebox_net()
                             .lock()
