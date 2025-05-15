@@ -120,23 +120,32 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
-    match file_descriptors().read().get_fd(fd) {
-        Some(desc) => match desc {
-            Descriptor::File(file) => litebox_fs().read(file, buf, offset).map_err(Errno::from),
-            Descriptor::Stdio(file) => file.read(buf, offset),
-            Descriptor::Socket(socket) => todo!(),
-            Descriptor::PipeReader { consumer, .. } => consumer.read(buf),
-            Descriptor::PipeWriter { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
-            Descriptor::Eventfd { file, .. } => {
-                if buf.len() < size_of::<u64>() {
-                    return Err(Errno::EINVAL);
-                }
-                let value = file.read()?;
-                buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
-                Ok(size_of::<u64>())
+    let file_table = file_descriptors().read();
+    let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
+    match desc {
+        Descriptor::File(file) => litebox_fs().read(file, buf, offset).map_err(Errno::from),
+        Descriptor::Stdio(file) => file.read(buf, offset),
+        Descriptor::Socket(socket) => {
+            let socket = socket.clone();
+            drop(file_table);
+            socket.receive(buf, litebox::net::ReceiveFlags::empty())
+        }
+        Descriptor::PipeReader { consumer, .. } => {
+            let consumer = consumer.clone();
+            drop(file_table);
+            consumer.read(buf)
+        }
+        Descriptor::PipeWriter { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
+        Descriptor::Eventfd { file, .. } => {
+            let file = file.clone();
+            drop(file_table);
+            if buf.len() < size_of::<u64>() {
+                return Err(Errno::EINVAL);
             }
-        },
-        None => Err(Errno::EBADF),
+            let value = file.read()?;
+            buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+            Ok(size_of::<u64>())
+        }
     }
 }
 
@@ -148,23 +157,32 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
-    match file_descriptors().read().get_fd(fd) {
-        Some(desc) => match desc {
-            Descriptor::File(file) => litebox_fs().write(file, buf, offset).map_err(Errno::from),
-            Descriptor::Stdio(file) => file.write(buf, offset),
-            Descriptor::Socket(socket) => todo!(),
-            Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
-            Descriptor::PipeWriter { producer, .. } => producer.write(buf),
-            Descriptor::Eventfd { file, .. } => {
-                let value: u64 = u64::from_le_bytes(
-                    buf[..size_of::<u64>()]
-                        .try_into()
-                        .map_err(|_| Errno::EINVAL)?,
-                );
-                file.write(value)
-            }
-        },
-        None => Err(Errno::EBADF),
+    let file_table = file_descriptors().read();
+    let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
+    match desc {
+        Descriptor::File(file) => litebox_fs().write(file, buf, offset).map_err(Errno::from),
+        Descriptor::Stdio(file) => file.write(buf, offset),
+        Descriptor::Socket(socket) => {
+            let socket = socket.clone();
+            drop(file_table);
+            socket.sendto(buf, litebox::net::SendFlags::empty(), None)
+        }
+        Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
+        Descriptor::PipeWriter { producer, .. } => {
+            let producer = producer.clone();
+            drop(file_table);
+            producer.write(buf)
+        }
+        Descriptor::Eventfd { file, .. } => {
+            let file = file.clone();
+            drop(file_table);
+            let value: u64 = u64::from_le_bytes(
+                buf[..size_of::<u64>()]
+                    .try_into()
+                    .map_err(|_| Errno::EINVAL)?,
+            );
+            file.write(value)
+        }
     }
 }
 
@@ -262,6 +280,26 @@ pub fn sys_readv(
     Ok(total_read)
 }
 
+fn write_to_iovec<F>(iovs: &[IoWriteVec<ConstPtr<u8>>], write_fn: F) -> Result<usize, Errno>
+where
+    F: Fn(&[u8]) -> Result<usize, Errno>,
+{
+    let mut total_written = 0;
+    for iov in iovs {
+        if iov.iov_len == 0 {
+            continue;
+        }
+        let slice = unsafe { iov.iov_base.to_cow_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
+        let size = write_fn(&slice)?;
+        total_written += size;
+        if size < iov.iov_len {
+            // Okay to transfer fewer bytes than requested
+            break;
+        }
+    }
+    Ok(total_written)
+}
+
 /// Handle syscall `writev`
 pub fn sys_writev(
     fd: i32,
@@ -275,33 +313,26 @@ pub fn sys_writev(
         unsafe { &iovec.to_cow_slice(iovcnt).ok_or(Errno::EFAULT)? };
     let locked_file_descriptors = file_descriptors().read();
     let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
-    let mut total_written = 0;
-    for iov in iovs {
-        if iov.iov_len == 0 {
-            continue;
-        }
-        let slice = unsafe { iov.iov_base.to_cow_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
+    match desc {
         // TODO: The data transfers performed by readv() and writev() are atomic: the data
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
-        let size = match desc {
-            Descriptor::File(file) => litebox_fs()
-                .write(file, &slice, None)
-                .map_err(Errno::from)?,
-            Descriptor::Stdio(file) => file.write(&slice, None)?,
-            Descriptor::Socket(socket) => todo!(),
-            Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
-            Descriptor::PipeWriter { producer, .. } => todo!(),
-            Descriptor::Eventfd { file, .. } => todo!(),
-        };
-
-        total_written += size;
-        if size < iov.iov_len {
-            // Okay to transfer fewer bytes than requested
-            break;
+        Descriptor::File(file) => write_to_iovec(iovs, |buf: &[u8]| {
+            litebox_fs().write(file, buf, None).map_err(Errno::from)
+        }),
+        Descriptor::Stdio(file) => write_to_iovec(iovs, |buf: &[u8]| file.write(buf, None)),
+        Descriptor::Socket(socket) => {
+            let socket = socket.clone();
+            drop(locked_file_descriptors);
+            write_to_iovec(iovs, |buf: &[u8]| {
+                socket.sendto(buf, litebox::net::SendFlags::empty(), None)
+            })
         }
+        Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
+        Descriptor::PipeWriter { producer, .. } => todo!(),
+        Descriptor::Eventfd { file, .. } => todo!(),
+        _ => todo!(),
     }
-    Ok(total_written)
 }
 
 /// Handle syscall `access`

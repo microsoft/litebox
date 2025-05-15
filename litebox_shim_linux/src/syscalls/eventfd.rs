@@ -97,14 +97,12 @@ impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
         if self.get_status().contains(OFlags::NONBLOCK) {
             self.try_write(value)
         } else {
-            // TODO: use poll rather than busy wait
-            loop {
-                match self.try_write(value) {
-                    Err(Errno::EAGAIN) => {}
-                    ret => return ret,
-                }
-                core::hint::spin_loop();
-            }
+            self.pollee.wait_or_timeout(
+                Events::OUT,
+                None,
+                || self.try_write(value),
+                || self.check_io_events(),
+            )
         }
     }
 

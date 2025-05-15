@@ -298,7 +298,7 @@ impl Socket {
         if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
     }
 
-    fn sendto(
+    pub(crate) fn sendto(
         &self,
         buf: &[u8],
         flags: SendFlags,
@@ -307,7 +307,7 @@ impl Socket {
         if let Some(addr) = sockaddr {
             unimplemented!("sendto with addr {addr}");
         }
-        if flags.contains(SendFlags::DONTWAIT) {
+        if self.get_status().contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT) {
             self.try_sendto(buf, flags, sockaddr)
         } else {
             let timeout = self.options.lock().send_timeout;
@@ -333,7 +333,7 @@ impl Socket {
         if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
     }
 
-    fn receive(&self, buf: &mut [u8], flags: ReceiveFlags) -> Result<usize, Errno> {
+    pub(crate) fn receive(&self, buf: &mut [u8], flags: ReceiveFlags) -> Result<usize, Errno> {
         if self.get_status().contains(OFlags::NONBLOCK) || flags.contains(ReceiveFlags::DONTWAIT) {
             self.try_receive(buf, flags)
         } else {
