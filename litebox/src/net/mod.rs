@@ -606,8 +606,7 @@ where
                     Err(tcp::ConnectError::InvalidState) => unreachable!(),
                     Err(tcp::ConnectError::Unaddressable) => todo!(),
                 }
-                let old_port =
-                    core::mem::replace(&mut socket_handle.tcp_mut().local_port, Some(local_port));
+                let old_port = socket_handle.tcp_mut().local_port.replace(local_port);
                 if old_port.is_some() {
                     // Need to think about how to handle this situation
                     unimplemented!()
@@ -645,8 +644,7 @@ where
                         .or(Err(BindError::UnsupportedAddress(*socket_addr)))?,
                 ) {
                     Ok(lp) => {
-                        let old_lp =
-                            core::mem::replace(&mut socket_handle.tcp_mut().local_port, Some(lp));
+                        let old_lp = socket_handle.tcp_mut().local_port.replace(lp);
                         if let Some(old) = old_lp {
                             self.local_port_allocator.deallocate(old);
                             // Currently unsure if the dealloc is sufficient and if we need to do
