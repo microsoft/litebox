@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cfg-if = "1.0.0"
 litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_platform_linux_userland = { path = "../litebox_platform_linux_userland/", version = "0.1.0", optional = true }
 litebox_platform_lvbs = { path = "../litebox_platform_lvbs/", version = "0.1.0", optional = true }
