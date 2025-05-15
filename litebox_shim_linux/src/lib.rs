@@ -281,11 +281,22 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
     let res: Result<usize, Errno> = match request {
         SyscallRequest::Read { fd, buf, count } => {
             let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
-            syscalls::file::sys_read(fd, &mut kernel_buf, None).and_then(|size| {
-                buf.copy_from_slice(0, &kernel_buf[..size])
-                    .map(|()| size)
-                    .ok_or(Errno::EFAULT)
-            })
+            let mut total_read = 0;
+            loop {
+                match syscalls::file::sys_read(fd, &mut kernel_buf, None).and_then(|size| {
+                    buf.copy_from_slice(total_read, &kernel_buf[..size])
+                        .map(|()| size)
+                        .ok_or(Errno::EFAULT)
+                }) {
+                    Ok(n) => {
+                        total_read += n;
+                        if n < kernel_buf.len() || total_read == count {
+                            break Ok(total_read);
+                        }
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
         }
         SyscallRequest::Write { fd, buf, count } => match unsafe { buf.to_cow_slice(count) } {
             Some(buf) => syscalls::file::sys_write(fd, &buf, None),
