@@ -44,8 +44,10 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
         &self,
         old_range: Range<usize>,
         new_range: Range<usize>,
-    ) -> Result<(), crate::platform::page_mgmt::RemapError> {
-        Ok(())
+    ) -> Result<Self::RawMutPointer<u8>, crate::platform::page_mgmt::RemapError> {
+        Ok(unsafe {
+            core::mem::transmute::<*mut u8, TransparentMutPtr<u8>>(new_range.start as *mut u8)
+        })
     }
 
     unsafe fn update_permissions(
@@ -181,7 +183,7 @@ fn test_vmm_mapping() {
     ));
     assert!(
         unsafe { vmm.move_mappings(r, PageRange::new(0, PAGE_SIZE * 4).unwrap()) }
-            .is_ok_and(|v| v == start_addr + 12 * PAGE_SIZE)
+            .is_ok_and(|v| v.as_usize() == start_addr + 12 * PAGE_SIZE)
     );
     assert_eq!(
         collect_mappings(&vmm),

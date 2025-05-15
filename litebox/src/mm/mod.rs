@@ -16,7 +16,10 @@ use linux::{
 
 use crate::{
     LiteBox,
-    platform::{PageManagementProvider, RawConstPointer, page_mgmt::MemoryRegionPermissions},
+    platform::{
+        PageManagementProvider, RawConstPointer,
+        page_mgmt::{MemoryRegionPermissions, RemapError},
+    },
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
 
@@ -38,6 +41,35 @@ where
             .sync()
             .new_rwlock(linux::Vmem::new(litebox.x.platform));
         Self { vmem }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_pages<F>(
+        &self,
+        suggested_addr: usize,
+        len: usize,
+        fixed_addr: bool,
+        is_stack: bool,
+        before_perms: MemoryRegionPermissions,
+        after_perms: MemoryRegionPermissions,
+        op: F,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
+    where
+        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
+    {
+        let suggested_range =
+            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::UnAligned)?;
+        let mut vmem = self.vmem.write();
+        unsafe {
+            vmem.create_pages(
+                suggested_range,
+                fixed_addr,
+                is_stack,
+                before_perms,
+                after_perms,
+                op,
+            )
+        }
     }
 
     /// Create readable and executable pages.
@@ -65,21 +97,17 @@ where
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
-        let suggested_range =
-            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::UnAligned)?;
-        let mut vmem = self.vmem.write();
-        unsafe {
-            vmem.create_pages(
-                suggested_range,
-                fixed_addr,
-                false,
-                // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the code)
-                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-                // keep READ, turn off WRITE and turn on EXEC
-                MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
-                op,
-            )
-        }
+        self.create_pages(
+            suggested_addr,
+            len,
+            fixed_addr,
+            false,
+            // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the code)
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            // keep READ, turn off WRITE and turn on EXEC
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+            op,
+        )
     }
 
     /// Create readable and writable pages.
@@ -107,11 +135,8 @@ where
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
-        let flags = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-        let suggested_range =
-            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::UnAligned)?;
-        let mut vmem = self.vmem.write();
-        unsafe { vmem.create_pages(suggested_range, fixed_addr, false, flags, flags, op) }
+        let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+        self.create_pages(suggested_addr, len, fixed_addr, false, perms, perms, op)
     }
 
     /// Create read-only pages.
@@ -139,21 +164,53 @@ where
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
-        let mut vmem = self.vmem.write();
-        let suggested_range =
-            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::UnAligned)?;
-        unsafe {
-            vmem.create_pages(
-                suggested_range,
-                fixed_addr,
-                false,
-                // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the data)
-                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-                // keep READ, turn off WRITE
-                MemoryRegionPermissions::READ,
-                op,
-            )
-        }
+        self.create_pages(
+            suggested_addr,
+            len,
+            fixed_addr,
+            false,
+            // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the data)
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            // kepp READ, turn off WRITE
+            MemoryRegionPermissions::READ,
+            op,
+        )
+    }
+
+    /// Create inaccessible pages.
+    ///
+    /// `suggested_addr` is the hint address where to create the pages. Provide `0` to let the kernel
+    /// choose an available memory region.
+    ///
+    /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
+    /// existing overlapping mappings being removed.
+    ///
+    /// `op` is a callback for caller to initialize the created pages.
+    ///
+    /// # Safety
+    ///
+    /// If the suggested start address is given (i.e., not zero) and `fixed_addr` is set to `true`,
+    /// the kernel uses it directly without checking if it is available, causing overlapping
+    /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
+    pub unsafe fn create_inaccessible_pages<F>(
+        &self,
+        suggested_addr: usize,
+        len: usize,
+        fixed_addr: bool,
+        op: F,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
+    where
+        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
+    {
+        self.create_pages(
+            suggested_addr,
+            len,
+            fixed_addr,
+            false,
+            MemoryRegionPermissions::empty(),
+            MemoryRegionPermissions::empty(),
+            op,
+        )
     }
 
     /// Create stack pages.
@@ -172,11 +229,67 @@ where
         len: usize,
         fixed_addr: bool,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
-        let flags = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+        let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+        self.create_pages(suggested_addr, len, fixed_addr, true, perms, perms, |_| {
+            Ok(0)
+        })
+    }
+
+    /// Expands (or shrinks) an existing memory mapping
+    ///
+    /// `old_addr` is the old address of the virtual memory block that you want to expand (or shrink).
+    ///
+    /// `old_size` is the size of the old memory block.
+    ///
+    /// `new_size` is the new size of the memory block.
+    ///
+    /// `may_move` indicates whether the memory block can be moved to a new address if there is not sufficient
+    /// space to expand the old memory block at its current location.
+    ///
+    /// ## Returns
+    ///
+    /// If the operation is successful, it returns the new address of the memory block.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the memory region is no longer used by any other.
+    pub unsafe fn remap_pages(
+        &self,
+        old_addr: Platform::RawMutPointer<u8>,
+        old_size: usize,
+        new_size: usize,
+        may_move: bool,
+    ) -> Result<Platform::RawMutPointer<u8>, RemapError> {
         let mut vmem = self.vmem.write();
-        let suggested_range =
-            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::UnAligned)?;
-        unsafe { vmem.create_pages(suggested_range, fixed_addr, true, flags, flags, |_| Ok(0)) }
+        let old_range = PageRange::new(old_addr.as_usize(), old_addr.as_usize() + old_size)
+            .ok_or(RemapError::Unaligned)?;
+        match unsafe {
+            vmem.resize_mapping(
+                old_range,
+                linux::NonZeroPageSize::new(new_size).ok_or(RemapError::Unaligned)?,
+            )
+        } {
+            Ok(()) => Ok(old_addr),
+            Err(linux::VmemResizeError::RangeOccupied(_)) => {
+                // trying to remap a subset of an existing mapping
+                if !may_move {
+                    return Err(RemapError::OutOfMemory);
+                }
+                match unsafe {
+                    vmem.move_mappings(
+                        old_range,
+                        PageRange::new(0, new_size).ok_or(RemapError::Unaligned)?,
+                    )
+                } {
+                    Ok(new_addr) => Ok(new_addr),
+                    Err(linux::VmemMoveError::OutOfMemory) => Err(RemapError::OutOfMemory),
+                    Err(linux::VmemMoveError::UnAligned) => Err(RemapError::Unaligned),
+                    Err(linux::VmemMoveError::RemapError(err)) => Err(err),
+                }
+            }
+            Err(linux::VmemResizeError::NotExist(_)) => Err(RemapError::AlreadyUnallocated),
+            Err(linux::VmemResizeError::InvalidAddr { .. }) => Err(RemapError::AlreadyAllocated),
+        }
     }
 
     /// Remove pages from the mapping.

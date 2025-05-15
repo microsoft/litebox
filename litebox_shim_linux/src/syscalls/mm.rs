@@ -4,7 +4,7 @@ use litebox::{
     mm::linux::{MappingError, PAGE_SIZE, VmemUnmapError},
     platform::{RawConstPointer, RawMutPointer, page_mgmt::DeallocationError},
 };
-use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
+use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
 use crate::{MutPtr, litebox_page_manager};
 
@@ -14,6 +14,11 @@ const PAGE_SHIFT: usize = PAGE_SIZE.trailing_zeros() as usize;
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
+}
+
+#[inline]
+fn align_down(addr: usize, align: usize) -> usize {
+    addr & !(align - 1)
 }
 
 fn do_mmap(
@@ -35,6 +40,9 @@ fn do_mmap(
         },
         ProtFlags::PROT_READ => unsafe {
             pm.create_readable_pages(suggested_addr, len, fixed_addr, op)
+        },
+        ProtFlags::PROT_NONE => unsafe {
+            pm.create_inaccessible_pages(suggested_addr, len, fixed_addr, op)
         },
         _ => todo!("Unsupported prot flags {:?}", prot),
     }
@@ -113,7 +121,6 @@ pub(crate) fn sys_mmap(
             | MapFlags::MAP_32BIT
             | MapFlags::MAP_GROWSDOWN
             | MapFlags::MAP_LOCKED
-            | MapFlags::MAP_NORESERVE
             | MapFlags::MAP_POPULATE
             | MapFlags::MAP_NONBLOCK
             | MapFlags::MAP_SYNC
@@ -190,4 +197,146 @@ pub(crate) fn sys_mprotect(
         _ => todo!("Unsupported prot flags {:?}", prot),
     }
     .map_err(Errno::from)
+}
+
+pub(crate) fn sys_mremap(
+    old_addr: crate::MutPtr<u8>,
+    old_size: usize,
+    new_size: usize,
+    flags: MRemapFlags,
+    new_addr: usize,
+) -> Result<crate::MutPtr<u8>, Errno> {
+    if flags.intersects(
+        (MRemapFlags::MREMAP_FIXED | MRemapFlags::MREMAP_MAYMOVE | MRemapFlags::MREMAP_DONTUNMAP)
+            .complement(),
+    ) {
+        return Err(Errno::EINVAL);
+    }
+    if flags.contains(MRemapFlags::MREMAP_FIXED) && !flags.contains(MRemapFlags::MREMAP_MAYMOVE) {
+        return Err(Errno::EINVAL);
+    }
+    /*
+     * MREMAP_DONTUNMAP is always a move and it does not allow resizing
+     * in the process.
+     */
+    if flags.contains(MRemapFlags::MREMAP_DONTUNMAP)
+        && (!flags.contains(MRemapFlags::MREMAP_MAYMOVE) || old_size != new_size)
+    {
+        return Err(Errno::EINVAL);
+    }
+    if old_addr.as_usize() & !PAGE_MASK != 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    let old_size = align_down(old_size, PAGE_SIZE);
+    let new_size = align_down(new_size, PAGE_SIZE);
+    if new_size == 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    if flags.intersects(MRemapFlags::MREMAP_FIXED | MRemapFlags::MREMAP_DONTUNMAP) {
+        todo!("Unsupported flags {:?}", flags);
+    }
+
+    let pm = litebox_page_manager();
+    unsafe {
+        pm.remap_pages(
+            old_addr,
+            old_size,
+            new_size,
+            flags.contains(MRemapFlags::MREMAP_MAYMOVE),
+        )
+    }
+    .map_err(Errno::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use litebox::{
+        fs::{Mode, OFlags},
+        platform::{RawConstPointer, RawMutPointer},
+    };
+    use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+
+    use crate::syscalls::{
+        file::{sys_close, sys_open, sys_write},
+        mm::sys_munmap,
+        tests::init_platform,
+    };
+
+    use super::{sys_mmap, sys_mremap};
+
+    #[test]
+    fn test_anonymous_mmap() {
+        init_platform(None);
+
+        let addr = sys_mmap(
+            0,
+            0x2000,
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+            -1,
+            0,
+        )
+        .unwrap();
+        unsafe {
+            addr.mutate_subslice_with(..0x2000, |buf| {
+                buf.fill(0xff);
+            })
+            .unwrap();
+        };
+        assert_eq!(
+            unsafe { addr.read_at_offset(0x1000) }.unwrap().into_owned(),
+            0xff,
+        );
+        sys_munmap(addr, 0x2000).unwrap();
+    }
+
+    #[test]
+    fn test_file_backed_mmap() {
+        init_platform(None);
+
+        let content = b"Hello, world!";
+        let fd = sys_open("test.txt", OFlags::RDWR | OFlags::CREAT, Mode::RWXU).unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        assert_eq!(sys_write(fd, content, None).unwrap(), content.len());
+        let addr = sys_mmap(
+            0,
+            0x1000,
+            ProtFlags::PROT_READ,
+            MapFlags::MAP_PRIVATE,
+            fd,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            unsafe { addr.to_cow_slice(content.len()).unwrap() },
+            content.as_slice(),
+        );
+        sys_munmap(addr, 0x1000).unwrap();
+        sys_close(fd).unwrap();
+    }
+
+    #[test]
+    fn test_mremap() {
+        init_platform(None);
+
+        let addr = sys_mmap(
+            0,
+            0x2000,
+            ProtFlags::PROT_READ,
+            MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+            -1,
+            0,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            sys_mremap(addr, 0x1000, 0x2000, MRemapFlags::empty(), 0),
+            Err(Errno::ENOMEM)
+        ),);
+        let new_addr = sys_mremap(addr, 0x1000, 0x2000, MRemapFlags::MREMAP_MAYMOVE, 0).unwrap();
+        sys_munmap(addr, 0x2000).unwrap();
+        sys_munmap(new_addr, 0x2000).unwrap();
+    }
 }
