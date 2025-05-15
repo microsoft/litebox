@@ -1,13 +1,16 @@
 use alloc::collections::btree_map::BTreeMap;
-use litebox::platform::{Instant as _, TimeProvider as _};
-use litebox_common_linux::{IoEvents, errno::Errno};
+use litebox::{
+    event::Events,
+    platform::{Instant as _, TimeProvider as _},
+};
+use litebox_common_linux::errno::Errno;
 
 trait EventsFilter<E>: Send + Sync + 'static {
     fn filter(&self, event: &E) -> bool;
 }
 
-impl EventsFilter<IoEvents> for IoEvents {
-    fn filter(&self, events: &IoEvents) -> bool {
+impl EventsFilter<Events> for Events {
+    fn filter(&self, events: &Events) -> bool {
         self.intersects(*events)
     }
 }
@@ -107,11 +110,11 @@ pub(crate) struct Pollee {
 }
 
 struct PolleeInner {
-    subject: Subject<IoEvents, IoEvents>,
+    subject: Subject<Events, Events>,
 }
 
 impl Pollee {
-    pub(crate) fn new(init_events: IoEvents) -> Self {
+    pub(crate) fn new(init_events: Events) -> Self {
         let inner = alloc::sync::Arc::new(PolleeInner {
             subject: Subject::new(),
         });
@@ -121,14 +124,14 @@ impl Pollee {
     /// Poll the pollee with the given mask of events and register the poller.
     pub(crate) fn poll<F>(
         &self,
-        mask: IoEvents,
-        observer: Option<alloc::sync::Weak<dyn Observer<IoEvents>>>,
+        mask: Events,
+        observer: Option<alloc::sync::Weak<dyn Observer<Events>>>,
         check: F,
-    ) -> IoEvents
+    ) -> Events
     where
-        F: FnOnce() -> IoEvents,
+        F: FnOnce() -> Events,
     {
-        let mask = mask | IoEvents::ALWAYS_POLL;
+        let mask = mask | Events::ALWAYS_POLLED;
 
         if let Some(observer) = observer {
             self.register_observer(observer, mask);
@@ -141,14 +144,14 @@ impl Pollee {
     /// If the `timeout` is None, it will wait indefinitely.
     pub fn wait_or_timeout<F, C, R>(
         &self,
-        mask: IoEvents,
+        mask: Events,
         timeout: Option<core::time::Duration>,
         mut try_op: F,
         check: C,
     ) -> Result<R, Errno>
     where
         F: FnMut() -> Result<R, Errno>,
-        C: FnOnce() -> IoEvents,
+        C: FnOnce() -> Events,
     {
         // Try first without waiting
         match try_op() {
@@ -180,19 +183,19 @@ impl Pollee {
 
     pub(crate) fn register_observer(
         &self,
-        observer: alloc::sync::Weak<dyn Observer<IoEvents>>,
-        filter: IoEvents,
+        observer: alloc::sync::Weak<dyn Observer<Events>>,
+        filter: Events,
     ) {
         self.inner
             .subject
-            .register_observer(observer, filter | IoEvents::ALWAYS_POLL);
+            .register_observer(observer, filter | Events::ALWAYS_POLLED);
     }
 
-    pub(crate) fn unregister_observer(&self, observer: alloc::sync::Weak<dyn Observer<IoEvents>>) {
+    pub(crate) fn unregister_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>) {
         self.inner.subject.unregister_observer(observer);
     }
 
-    pub(crate) fn notify_observers(&self, events: IoEvents) {
+    pub(crate) fn notify_observers(&self, events: Events) {
         self.inner.subject.notify_observers(events);
     }
 }
@@ -238,8 +241,8 @@ impl Poller {
     }
 }
 
-impl Observer<IoEvents> for Poller {
-    fn on_events(&self, events: &IoEvents) {
+impl Observer<Events> for Poller {
+    fn on_events(&self, events: &Events) {
         self.condvar.notify_one();
     }
 }

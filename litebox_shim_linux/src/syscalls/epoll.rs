@@ -5,8 +5,8 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use litebox::LiteBox;
-use litebox_common_linux::{EpollEvent, EpollOp, IoEvents, errno::Errno};
+use litebox::{LiteBox, event::Events};
+use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
 use crate::{
@@ -29,6 +29,7 @@ enum DescriptorRef {
     PipeReader(Weak<crate::channel::Consumer<u8>>),
     PipeWriter(Weak<crate::channel::Producer<u8>>),
     Eventfd(Weak<crate::syscalls::eventfd::EventFile<litebox_platform_multiplex::Platform>>),
+    Socket(Weak<crate::syscalls::net::Socket<litebox_platform_multiplex::Platform>>),
 }
 
 impl DescriptorRef {
@@ -41,6 +42,7 @@ impl DescriptorRef {
                 DescriptorRef::PipeWriter(Arc::downgrade(producer))
             }
             Descriptor::Eventfd { file, .. } => DescriptorRef::Eventfd(Arc::downgrade(file)),
+            Descriptor::Socket(socket) => DescriptorRef::Socket(Arc::downgrade(socket)),
             _ => todo!(),
         }
     }
@@ -63,6 +65,7 @@ impl DescriptorRef {
                 file,
                 close_on_exec: AtomicBool::new(false),
             }),
+            DescriptorRef::Socket(socket) => socket.upgrade().map(Descriptor::Socket),
             _ => todo!(),
         }
     }
@@ -71,11 +74,12 @@ impl DescriptorRef {
 impl Descriptor {
     /// Returns the interesting events now and monitors their occurrence in the future if the
     /// observer is provided.
-    fn poll(&self, mask: IoEvents, observer: Option<Weak<dyn Observer<IoEvents>>>) -> IoEvents {
+    fn poll(&self, mask: Events, observer: Option<Weak<dyn Observer<Events>>>) -> Events {
         match self {
             Descriptor::PipeReader { consumer, .. } => consumer.poll(mask, observer),
             Descriptor::PipeWriter { producer, .. } => producer.poll(mask, observer),
             Descriptor::Eventfd { file, .. } => file.poll(mask, observer),
+            Descriptor::Socket(socket) => socket.poll(mask, observer),
             _ => todo!(),
         }
     }
@@ -106,7 +110,7 @@ impl EpollFile {
     ) -> Result<Vec<EpollEvent>, Errno> {
         let mut events = Vec::new();
         match self.ready.pollee.wait_or_timeout(
-            IoEvents::IN,
+            Events::IN,
             timeout,
             || {
                 self.ready.pop_multiple(maxevents, &mut events);
@@ -153,7 +157,7 @@ impl EpollFile {
             }
             // find stale entry because we don't remove it immediately after the file is closed
         }
-        let mask = IoEvents::from_bits_truncate(event.events);
+        let mask = Events::from_bits_truncate(event.events);
         let entry = EpollEntry::new(
             DescriptorRef::from(file),
             mask,
@@ -193,7 +197,7 @@ impl EpollFile {
             return Err(Errno::EINVAL);
         }
 
-        let mask = IoEvents::from_bits_truncate(event.events);
+        let mask = Events::from_bits_truncate(event.events);
         inner.mask = mask;
         inner.flags = flags;
         inner.data = event.data;
@@ -224,6 +228,7 @@ impl EpollEntryKey {
             Descriptor::PipeWriter { producer, .. } => Arc::as_ptr(producer).cast(),
             Descriptor::Eventfd { file, .. } => Arc::as_ptr(file).cast(),
             Descriptor::Stdio(crate::stdio::StdioFile { inner, .. }) => Arc::as_ptr(inner).cast(),
+            Descriptor::Socket(socket) => Arc::as_ptr(socket).cast(),
             _ => todo!(),
         };
         Self(fd, ptr)
@@ -239,9 +244,8 @@ struct EpollEntry {
     weak_self: Weak<Self>,
 }
 
-#[derive(Debug)]
 struct EpollEntryInner {
-    mask: IoEvents,
+    mask: Events,
     flags: EpollFlags,
     data: u64,
 }
@@ -249,7 +253,7 @@ struct EpollEntryInner {
 impl EpollEntry {
     fn new(
         desc: DescriptorRef,
-        mask: IoEvents,
+        mask: Events,
         flags: EpollFlags,
         data: u64,
         ready: Arc<ReadySet>,
@@ -301,8 +305,8 @@ impl EpollEntry {
     }
 }
 
-impl crate::event::Observer<IoEvents> for EpollEntry {
-    fn on_events(&self, events: &IoEvents) {
+impl crate::event::Observer<Events> for EpollEntry {
+    fn on_events(&self, events: &Events) {
         self.ready.push(self);
     }
 }
@@ -319,7 +323,7 @@ impl ReadySet {
     fn new(litebox: &LiteBox<Platform>) -> Self {
         Self {
             entries: litebox.sync().new_mutex(VecDeque::new()),
-            pollee: Pollee::new(IoEvents::empty()),
+            pollee: Pollee::new(Events::empty()),
         }
     }
 
@@ -338,7 +342,7 @@ impl ReadySet {
         }
         drop(entries);
 
-        self.pollee.notify_observers(IoEvents::IN);
+        self.pollee.notify_observers(Events::IN);
     }
 
     fn pop_multiple(&self, maxevents: usize, events: &mut Vec<EpollEvent>) {
@@ -381,11 +385,11 @@ impl ReadySet {
         }
     }
 
-    fn check_io_events(&self) -> IoEvents {
+    fn check_io_events(&self) -> Events {
         if self.entries.lock().is_empty() {
-            IoEvents::empty()
+            Events::empty()
         } else {
-            IoEvents::IN
+            Events::IN
         }
     }
 }
@@ -393,8 +397,8 @@ impl ReadySet {
 #[cfg(test)]
 mod test {
     use alloc::sync::Arc;
-    use litebox::fs::OFlags;
-    use litebox_common_linux::{EfdFlags, EpollEvent, IoEvents};
+    use litebox::{event::Events, fs::OFlags};
+    use litebox_common_linux::{EfdFlags, EpollEvent};
 
     use super::EpollFile;
 
@@ -422,7 +426,7 @@ mod test {
                     close_on_exec: core::sync::atomic::AtomicBool::new(false),
                 },
                 EpollEvent {
-                    events: IoEvents::IN.bits(),
+                    events: Events::IN.bits(),
                     data: 0,
                 },
             )
@@ -450,7 +454,7 @@ mod test {
                 10,
                 &reader,
                 EpollEvent {
-                    events: IoEvents::IN.bits(),
+                    events: Events::IN.bits(),
                     data: 0,
                 },
             )

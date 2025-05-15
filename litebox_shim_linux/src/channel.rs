@@ -4,8 +4,8 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use alloc::sync::{Arc, Weak};
-use litebox::{LiteBox, fs::OFlags};
-use litebox_common_linux::{IoEvents, errno::Errno};
+use litebox::{LiteBox, event::Events, fs::OFlags};
+use litebox_common_linux::errno::Errno;
 use litebox_platform_multiplex::Platform;
 use ringbuf::{
     HeapCons, HeapProd, HeapRb,
@@ -29,11 +29,7 @@ struct EndPointer<T> {
 }
 
 impl<T> EndPointer<T> {
-    pub fn new(
-        rb: T,
-        init_events: litebox_common_linux::IoEvents,
-        litebox: &LiteBox<Platform>,
-    ) -> Self {
+    pub fn new(rb: T, init_events: Events, litebox: &LiteBox<Platform>) -> Self {
         Self {
             rb: litebox.sync().new_mutex(rb),
             pollee: crate::event::Pollee::new(init_events),
@@ -68,11 +64,7 @@ macro_rules! common_functions_for_channel {
             }
         }
 
-        pub fn poll(
-            &self,
-            mask: IoEvents,
-            observer: Option<Weak<dyn Observer<IoEvents>>>,
-        ) -> IoEvents {
+        pub fn poll(&self, mask: Events, observer: Option<Weak<dyn Observer<Events>>>) -> Events {
             self.endpoint
                 .pollee
                 .poll(mask, observer, || self.check_io_events())
@@ -80,8 +72,8 @@ macro_rules! common_functions_for_channel {
 
         pub(crate) fn register_observer(
             &self,
-            observer: alloc::sync::Weak<dyn Observer<IoEvents>>,
-            filter: IoEvents,
+            observer: alloc::sync::Weak<dyn Observer<Events>>,
+            filter: Events,
         ) {
             self.endpoint.pollee.register_observer(observer, filter);
         }
@@ -98,20 +90,20 @@ pub(crate) struct Producer<T> {
 impl<T> Producer<T> {
     fn new(rb: HeapProd<T>, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
         Self {
-            endpoint: EndPointer::new(rb, litebox_common_linux::IoEvents::OUT, litebox),
+            endpoint: EndPointer::new(rb, Events::OUT, litebox),
             peer: Weak::new(),
             status: AtomicU32::new((flags | OFlags::WRONLY).bits()),
         }
     }
 
-    fn check_io_events(&self) -> IoEvents {
+    fn check_io_events(&self) -> Events {
         let rb = self.endpoint.rb.lock();
-        let mut events = IoEvents::empty();
+        let mut events = Events::empty();
         if self.is_peer_shutdown() {
-            events |= IoEvents::ERR;
+            events |= Events::ERR;
         }
         if !self.is_shutdown() && !rb.is_full() {
-            events |= IoEvents::OUT;
+            events |= Events::OUT;
         }
         events
     }
@@ -139,7 +131,7 @@ impl<T> Producer<T> {
         };
         if write_len > 0 {
             if let Some(peer) = self.peer.upgrade() {
-                peer.endpoint.pollee.notify_observers(IoEvents::IN);
+                peer.endpoint.pollee.notify_observers(Events::IN);
             }
             Ok(write_len)
         } else {
@@ -155,7 +147,7 @@ impl<T> Producer<T> {
             self.try_write(buf)
         } else {
             self.endpoint.pollee.wait_or_timeout(
-                litebox_common_linux::IoEvents::OUT,
+                Events::OUT,
                 None,
                 || self.try_write(buf),
                 || self.check_io_events(),
@@ -174,7 +166,7 @@ impl<T> Drop for Producer<T> {
         if let Some(peer) = self.peer.upgrade() {
             // when reading from a channel such as a pipe or a stream socket, this event
             // merely indicates that the peer closed its end of the channel.
-            peer.endpoint.pollee.notify_observers(IoEvents::HUP);
+            peer.endpoint.pollee.notify_observers(Events::HUP);
         }
     }
 }
@@ -188,20 +180,20 @@ pub(crate) struct Consumer<T> {
 impl<T> Consumer<T> {
     fn new(rb: HeapCons<T>, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
         Self {
-            endpoint: EndPointer::new(rb, litebox_common_linux::IoEvents::empty(), litebox),
+            endpoint: EndPointer::new(rb, Events::empty(), litebox),
             peer: Weak::new(),
             status: AtomicU32::new((flags | OFlags::RDONLY).bits()),
         }
     }
 
-    fn check_io_events(&self) -> IoEvents {
+    fn check_io_events(&self) -> Events {
         let rb = self.endpoint.rb.lock();
-        let mut events = IoEvents::empty();
+        let mut events = Events::empty();
         if self.is_peer_shutdown() {
-            events |= IoEvents::HUP;
+            events |= Events::HUP;
         }
         if !self.is_shutdown() && !rb.is_empty() {
-            events |= IoEvents::IN;
+            events |= Events::IN;
         }
         events
     }
@@ -220,7 +212,7 @@ impl<T> Consumer<T> {
         let read_len = self.endpoint.rb.lock().pop_slice(buf);
         if read_len > 0 {
             if let Some(peer) = self.peer.upgrade() {
-                peer.endpoint.pollee.notify_observers(IoEvents::OUT);
+                peer.endpoint.pollee.notify_observers(Events::OUT);
             }
             Ok(read_len)
         } else {
@@ -241,7 +233,7 @@ impl<T> Consumer<T> {
             self.try_read(buf)
         } else {
             self.endpoint.pollee.wait_or_timeout(
-                litebox_common_linux::IoEvents::IN,
+                Events::IN,
                 None,
                 || self.try_read(buf),
                 || self.check_io_events(),
@@ -260,7 +252,7 @@ impl<T> Drop for Consumer<T> {
         if let Some(peer) = self.peer.upgrade() {
             // This bit is also set for a file descriptor referring to the write end
             // of a pipe when the read end has been closed.
-            peer.endpoint.pollee.notify_observers(IoEvents::ERR);
+            peer.endpoint.pollee.notify_observers(Events::ERR);
         }
     }
 }

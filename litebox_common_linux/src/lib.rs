@@ -1204,31 +1204,6 @@ impl<Platform: litebox::platform::RawPointerProvider> Clone for RobustListHead<P
 }
 
 bitflags::bitflags! {
-    #[derive(Debug, Clone, Copy)]
-    pub struct IoEvents: u32 {
-        /// `POLLIN`: data to read
-        const IN = 0x0001;
-        /// `POLLPRI`: exceptional condition
-        const PRI = 0x0002;
-        /// `POLLOUT`: ready for writing
-        const OUT = 0x0004;
-        /// `POLLERR`: error condition
-        const ERR = 0x0008;
-        /// `POLLHUP`: hang up
-        const HUP = 0x0010;
-        /// `POLLNVAL`: invalid request: fd not open
-        const NVAL = 0x0020;
-        /// `POLLRDHUB`: Stream socket peer closed connection, or shut down writing half of connection
-        const RDHUP = 0x2000;
-        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
-        const _ = !0;
-
-        /// Events that are always polled even without specifying them.
-        const ALWAYS_POLL = Self::ERR.bits() | Self::HUP.bits();
-    }
-}
-
-bitflags::bitflags! {
     #[derive(Debug)]
     pub struct EpollCreateFlags: core::ffi::c_uint {
         const EPOLL_CLOEXEC = litebox::fs::OFlags::CLOEXEC.bits();

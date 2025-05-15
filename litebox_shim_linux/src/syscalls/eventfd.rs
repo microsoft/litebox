@@ -2,8 +2,8 @@
 
 use core::sync::atomic::AtomicU32;
 
-use litebox::{fs::OFlags, sync::RawSyncPrimitivesProvider};
-use litebox_common_linux::{EfdFlags, IoEvents, errno::Errno};
+use litebox::{event::Events, fs::OFlags, sync::RawSyncPrimitivesProvider};
+use litebox_common_linux::{EfdFlags, errno::Errno};
 
 pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider> {
     counter: litebox::sync::Mutex<Platform, u64>,
@@ -22,21 +22,21 @@ impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
             counter: litebox.sync().new_mutex(count),
             status: AtomicU32::new(status.bits()),
             semaphore: flags.contains(EfdFlags::SEMAPHORE),
-            pollee: crate::event::Pollee::new(IoEvents::empty()),
+            pollee: crate::event::Pollee::new(Events::empty()),
         }
     }
 
-    fn check_io_events(&self) -> IoEvents {
+    fn check_io_events(&self) -> Events {
         let counter = self.counter.lock();
-        let mut events = IoEvents::empty();
+        let mut events = Events::empty();
         if *counter != 0 {
-            events |= IoEvents::IN;
+            events |= Events::IN;
         }
         // if it is possible to write a value of at least "1"
         // without blocking, the file is writable
         let is_writable = *counter < u64::MAX - 1;
         if is_writable {
-            events |= IoEvents::OUT;
+            events |= Events::OUT;
         }
 
         events
@@ -44,9 +44,9 @@ impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
 
     pub(crate) fn poll(
         &self,
-        mask: IoEvents,
-        observer: Option<alloc::sync::Weak<dyn crate::event::Observer<IoEvents>>>,
-    ) -> IoEvents {
+        mask: Events,
+        observer: Option<alloc::sync::Weak<dyn crate::event::Observer<Events>>>,
+    ) -> Events {
         self.pollee.poll(mask, observer, || self.check_io_events())
     }
 
@@ -60,7 +60,7 @@ impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
         *counter -= res;
 
         drop(counter);
-        self.pollee.notify_observers(IoEvents::OUT);
+        self.pollee.notify_observers(Events::OUT);
         Ok(res)
     }
 
@@ -69,7 +69,7 @@ impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
             self.try_read()
         } else {
             self.pollee.wait_or_timeout(
-                IoEvents::IN,
+                Events::IN,
                 None,
                 || self.try_read(),
                 || self.check_io_events(),
@@ -85,7 +85,7 @@ impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
             if new_value != u64::MAX {
                 *counter = new_value;
                 drop(counter);
-                self.pollee.notify_observers(IoEvents::IN);
+                self.pollee.notify_observers(Events::IN);
                 return Ok(8);
             }
         }
