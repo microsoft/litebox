@@ -183,21 +183,27 @@ pub fn sys_pwrite64(fd: i32, buf: &[u8], offset: usize) -> Result<usize, Errno> 
     sys_write(fd, buf, Some(offset))
 }
 
+fn do_close(desc: Descriptor) -> Result<(), Errno> {
+    match desc {
+        Descriptor::File(file) => litebox_fs().close(file).map_err(Errno::from),
+        Descriptor::Stdio(crate::stdio::StdioFile { inner, .. }) => {
+            // The actual close happens when the file is dropped
+            Ok(())
+        }
+        Descriptor::Socket(socket) => Ok(()), // The actual close happens when the socket is dropped
+        Descriptor::PipeReader { .. }
+        | Descriptor::PipeWriter { .. }
+        | Descriptor::Eventfd { .. } => Ok(()),
+    }
+}
+
 /// Handle syscall `close`
 pub fn sys_close(fd: i32) -> Result<(), Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
     match file_descriptors().write().remove(fd) {
-        Some(desc) => match desc {
-            Descriptor::File(file) | Descriptor::Stdio(crate::stdio::StdioFile { file, .. }) => {
-                litebox_fs().close(file).map_err(Errno::from)
-            }
-            Descriptor::Socket(socket) => Ok(()), // The actual close happens when the socket is dropped
-            Descriptor::PipeReader { .. }
-            | Descriptor::PipeWriter { .. }
-            | Descriptor::Eventfd { .. } => Ok(()),
-        },
+        Some(desc) => do_close(desc),
         None => Err(Errno::EBADF),
     }
 }
@@ -377,10 +383,10 @@ impl Descriptor {
     fn stat(&self) -> Result<FileStat, Errno> {
         let fstat = match self {
             Descriptor::File(file) => FileStat::from(litebox_fs().fd_file_status(file)?),
-            Descriptor::Stdio(crate::stdio::StdioFile { typ, file, .. }) => {
+            Descriptor::Stdio(crate::stdio::StdioFile { typ, inner, .. }) => {
                 // TODO: we don't have correct values for these fields yet, but ensure there are consistent.
                 // (See <https://github.com/bminor/glibc/blob/e78caeb4ff812ae19d24d65f4d4d48508154277b/sysdeps/unix/sysv/linux/ttyname.h#L35>).
-                let mut fstat = FileStat::from(litebox_fs().fd_file_status(file)?);
+                let mut fstat = FileStat::from(litebox_fs().fd_file_status(inner.file())?);
                 fstat.st_ino = *typ as u64;
                 fstat.st_dev = 0;
                 fstat.st_rdev = 34824;
@@ -526,14 +532,14 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
         FcntlArg::GETFD => {
             let flags: FileDescriptorFlags =
                 match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
-                    Descriptor::File(file)
-                    | Descriptor::Stdio(crate::stdio::StdioFile { file, .. }) => litebox_fs()
+                    Descriptor::File(file) => litebox_fs()
                         .with_metadata(file, |flags: &FileDescriptorFlags| *flags)
                         .unwrap_or(FileDescriptorFlags::empty()),
                     Descriptor::Socket(socket) => todo!(),
                     Descriptor::PipeReader { close_on_exec, .. }
                     | Descriptor::PipeWriter { close_on_exec, .. }
-                    | Descriptor::Eventfd { close_on_exec, .. } => {
+                    | Descriptor::Eventfd { close_on_exec, .. }
+                    | Descriptor::Stdio(crate::stdio::StdioFile { close_on_exec, .. }) => {
                         if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
                             FileDescriptorFlags::FD_CLOEXEC
                         } else {
@@ -545,8 +551,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
         }
         FcntlArg::SETFD(flags) => {
             match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
-                Descriptor::File(file)
-                | Descriptor::Stdio(crate::stdio::StdioFile { file, .. }) => {
+                Descriptor::File(file) => {
                     if litebox_fs().set_fd_metadata(file, flags).is_err() {
                         unreachable!()
                     }
@@ -554,7 +559,8 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                 Descriptor::Socket(socket) => todo!(),
                 Descriptor::PipeReader { close_on_exec, .. }
                 | Descriptor::PipeWriter { close_on_exec, .. }
-                | Descriptor::Eventfd { close_on_exec, .. } => {
+                | Descriptor::Eventfd { close_on_exec, .. }
+                | Descriptor::Stdio(crate::stdio::StdioFile { close_on_exec, .. }) => {
                     close_on_exec.store(
                         flags.contains(FileDescriptorFlags::FD_CLOEXEC),
                         core::sync::atomic::Ordering::Relaxed,
@@ -569,7 +575,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
             Descriptor::PipeReader { consumer, .. } => Ok(consumer.get_status().bits()),
             Descriptor::PipeWriter { producer, .. } => Ok(producer.get_status().bits()),
             Descriptor::Eventfd { file, .. } => Ok(file.get_status().bits()),
-            Descriptor::Stdio(file) => Ok(file.get_status().bits()),
+            Descriptor::Stdio(file) => Ok(file.inner.get_status().bits()),
         },
         FcntlArg::SETFL(flags) => {
             let setfl_mask = OFlags::APPEND
@@ -590,7 +596,8 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
             match desc {
                 Descriptor::File(file) => todo!(),
                 Descriptor::Stdio(file) => {
-                    toggle_flags!(file);
+                    let f = &file.inner;
+                    toggle_flags!(f);
                 }
                 Descriptor::Socket(socket) => todo!(),
                 Descriptor::PipeReader { consumer, .. } => {
@@ -723,7 +730,7 @@ pub fn sys_ioctl(
         match desc {
             Descriptor::File(file) => todo!(),
             Descriptor::Stdio(file) => {
-                file.set_status(OFlags::NONBLOCK, val != 0);
+                file.inner.set_status(OFlags::NONBLOCK, val != 0);
             }
             Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { consumer, .. } => {
@@ -753,5 +760,56 @@ pub fn sys_ioctl(
             file,
             close_on_exec,
         } => todo!(),
+    }
+}
+
+fn do_dup(file: &Descriptor, flags: OFlags) -> Descriptor {
+    match file {
+        Descriptor::Stdio(file) => Descriptor::Stdio(file.dup(flags.contains(OFlags::CLOEXEC))),
+        _ => todo!(),
+    }
+}
+
+/// Handle syscall `dup/dup2/dup3`
+///
+/// The dup() system call creates a copy of the file descriptor oldfd, using the lowest-numbered unused file descriptor for the new descriptor.
+/// The dup2() system call performs the same task as dup(), but instead of using the lowest-numbered unused file descriptor, it uses the file descriptor number specified in newfd.
+/// The dup3() system call is similar to dup2(), but it also takes an additional flags argument that can be used to set the close-on-exec flag for the new file descriptor.
+pub fn sys_dup(oldfd: i32, newfd: Option<i32>, flags: Option<OFlags>) -> Result<u32, Errno> {
+    let Ok(oldfd) = u32::try_from(oldfd) else {
+        return Err(Errno::EBADF);
+    };
+    let new_file = file_descriptors()
+        .read()
+        .get_fd(oldfd)
+        .ok_or(Errno::EBADF)
+        .map(|desc| do_dup(desc, flags.unwrap_or(OFlags::empty())))?;
+    if let Some(newfd) = newfd {
+        // dup2/dup3
+        let Ok(newfd) = u32::try_from(newfd) else {
+            return Err(Errno::EBADF);
+        };
+        if oldfd == newfd {
+            // Different from dup3, if oldfd is a valid file descriptor, and newfd has the same value
+            // as oldfd, then dup2() does nothing.
+            return if flags.is_some() {
+                // dup3
+                Err(Errno::EINVAL)
+            } else {
+                // dup2
+                Ok(oldfd)
+            };
+        }
+
+        if let Some(old_file) = file_descriptors()
+            .write()
+            .insert_at(new_file, newfd as usize)
+        {
+            do_close(old_file)?;
+        }
+        Ok(newfd)
+    } else {
+        // dup
+        Ok(file_descriptors().write().insert(new_file))
     }
 }

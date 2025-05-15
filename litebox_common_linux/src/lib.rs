@@ -484,6 +484,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pathname: Platform::RawConstPointer<i8>,
         mode: AccessFlags,
     },
+    Dup {
+        oldfd: i32,
+        newfd: Option<i32>,
+        flags: Option<litebox::fs::OFlags>,
+    },
     Socket {
         domain: AddressFamily,
         ty: SockType,

@@ -1,8 +1,8 @@
-use litebox::fs::OFlags;
-use litebox_common_linux::{EfdFlags, FcntlArg, FileDescriptorFlags};
+use litebox::fs::{Mode, OFlags};
+use litebox_common_linux::{EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
 use litebox_platform_multiplex::{Platform, set_platform};
 
-use super::file::{sys_eventfd2, sys_fcntl, sys_pipe2};
+use super::file::{sys_dup, sys_eventfd2, sys_fcntl, sys_open, sys_pipe2};
 
 extern crate std;
 
@@ -92,4 +92,30 @@ fn test_fcntl() {
     .expect("Failed to create eventfd");
     let eventfd = i32::try_from(eventfd).unwrap();
     check(eventfd, OFlags::RDWR | OFlags::NONBLOCK, OFlags::RDWR);
+}
+
+#[test]
+fn test_dup() {
+    init_platform(None);
+
+    let fd = sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty()).unwrap();
+    let fd = i32::try_from(fd).unwrap();
+    // test dup
+    let fd2 = sys_dup(fd, None, None).unwrap();
+    let fd2 = i32::try_from(fd2).unwrap();
+    assert_eq!(fd + 1, fd2);
+
+    // test dup2
+    let fd3 = sys_dup(fd2, Some(fd2 + 10), None).unwrap();
+    let fd3 = i32::try_from(fd3).unwrap();
+    assert_eq!(fd2 + 10, fd3);
+
+    // test dup3
+    assert_eq!(
+        sys_dup(fd3, Some(fd3), Some(OFlags::CLOEXEC)),
+        Err(Errno::EINVAL)
+    );
+    let fd4 = sys_dup(fd2, Some(fd2 + 10), Some(OFlags::CLOEXEC)).unwrap();
+    let fd4 = i32::try_from(fd4).unwrap();
+    assert_eq!(fd2 + 10, fd4);
 }
