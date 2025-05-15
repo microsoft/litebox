@@ -131,7 +131,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         &self,
         old_range: PageRange<ALIGN>,
         new_range: PageRange<ALIGN>,
-    ) -> Result<(), page_mgmt::RemapError> {
+    ) -> Result<UserMutPtr<u8>, page_mgmt::RemapError> {
         let mut start: Page<Size4KiB> =
             Page::from_start_address(VirtAddr::new(old_range.start as u64))
                 .or(Err(page_mgmt::RemapError::Unaligned))?;
@@ -190,7 +190,9 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             new_start += 1;
         }
 
-        Ok(())
+        Ok(UserMutPtr {
+            inner: new_range.start as *mut u8,
+        })
     }
 
     pub(crate) unsafe fn mprotect_pages(
