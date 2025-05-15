@@ -31,6 +31,14 @@ pub trait MemoryProvider {
     /// `order` must be the same as the one used during allocation.
     unsafe fn mem_free_pages(ptr: *mut u8, order: u32);
 
+    /// Add a range of memory to global allocator.
+    /// Morally, the global allocator takes ownership of this range of memory.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the memory range is valid and not used by any others.
+    unsafe fn mem_fill_pages(start: usize, size: usize);
+
     /// Obtain physical address (PA) of a page given its VA
     fn va_to_pa(va: VirtAddr) -> PhysAddr {
         PhysAddr::new_truncate(va - Self::GVA_OFFSET)

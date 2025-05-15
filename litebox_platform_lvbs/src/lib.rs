@@ -35,7 +35,7 @@ static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
     page_table: mm::PageTable<4096>,
-    vtl1_phys_frame_range: PhysFrameRange,
+    vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
 }
 
 impl<Host: HostInterface> ExitProvider for LinuxKernel<Host> {
@@ -104,7 +104,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     }
 
     /// This unmaps VTL0 pages from the page table. Allocator does not allocate frames
-    /// for VTL0 pages, so it does not attempt to deallocate them.
+    /// for VTL0 pages (i.e., it is always shared mapping), so it must not attempt to deallocate them.
     pub fn unmap_vtl0_pages(&self, page_range: PageRange<4096>) -> Result<(), DeallocationError> {
         unsafe { self.page_table.unmap_pages_wo_dealloc(page_range) }
     }

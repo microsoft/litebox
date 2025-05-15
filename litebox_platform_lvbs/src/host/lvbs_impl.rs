@@ -49,62 +49,16 @@ mod alloc {
                 LVBS_ALLOCATOR.free_pages(ptr, order);
             }
         }
-    }
 
-    pub(crate) struct MemBlock {
-        free_start: x86_64::VirtAddr,
-        free_end: x86_64::VirtAddr,
-    }
-
-    impl MemBlock {
-        pub fn new(start: x86_64::VirtAddr, end: x86_64::VirtAddr) -> Self {
-            MemBlock {
-                free_start: start,
-                free_end: end,
-            }
-        }
-
-        // One-time allocation. LiteBox allocator should deal with dynamic memory management.
-        pub fn allocate(&mut self, size: usize) -> Option<x86_64::VirtAddr> {
-            if self.free_start + size.try_into().unwrap() <= self.free_end {
-                let addr = self.free_start;
-                self.free_start += size.try_into().unwrap();
-                Some(addr)
-            } else {
-                None
-            }
+        unsafe fn mem_fill_pages(start: usize, size: usize) {
+            crate::debug_serial_println!(
+                "adding a range of memory to the global allocator: start = {:#x}, size = {:#x}",
+                start,
+                size
+            );
+            unsafe { LVBS_ALLOCATOR.fill_pages(start, size) };
         }
     }
-
-    static MEMBLOCK: spin::Once<spin::Mutex<MemBlock>> = spin::Once::new();
-
-    pub(crate) fn mem_block() -> &'static spin::Mutex<MemBlock> {
-        MEMBLOCK
-            .get()
-            .expect("mem_block should be initialized before use")
-    }
-
-    pub fn set_mem_block(
-        start: x86_64::VirtAddr,
-        end: x86_64::VirtAddr,
-    ) -> Result<(), crate::Errno> {
-        let _ = MEMBLOCK.call_once(|| spin::Mutex::new(MemBlock::new(start, end)));
-        Ok(())
-    }
-}
-
-/// This specifies the memory block for the LVBS heap allocator which is reseerved,
-/// static address range. LVBS does not dynamically obtain memory from the host.
-///
-/// # Safety
-///
-/// The caller must ensure that the memory block is valid and not used by
-/// other VTL1 components including kernel code, stack, and static variables.
-pub fn init_heap_mem_block(
-    start: x86_64::VirtAddr,
-    end: x86_64::VirtAddr,
-) -> Result<(), crate::Errno> {
-    alloc::set_mem_block(start, end)
 }
 
 pub struct HostLvbsInterface;
@@ -124,15 +78,8 @@ impl HostInterface for HostLvbsInterface {
         serial_print_string(msg);
     }
 
-    fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
-        let size = core::cmp::max(layout.size().next_power_of_two(), 4096);
-
-        if let Some(addr) = alloc::mem_block().lock().allocate(size) {
-            crate::debug_serial_println!("Allocated {} bytes at {:x}", size, addr);
-            return Some((addr.as_u64().try_into().unwrap(), size));
-        }
-
-        None
+    fn alloc(_layout: &core::alloc::Layout) -> Option<(usize, usize)> {
+        unimplemented!()
     }
 
     unsafe fn free(_addr: usize) {

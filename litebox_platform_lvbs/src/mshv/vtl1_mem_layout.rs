@@ -6,6 +6,7 @@ pub const PTES_PER_PAGE: usize = 512;
 
 pub const VSM_PMD_SIZE: usize = PAGE_SIZE * PTES_PER_PAGE;
 pub const VSM_SK_INITIAL_MAP_SIZE: usize = 16 * 1024 * 1024;
+pub const VSM_SK_INITIAL_MAPPED_FRAMES: usize = VSM_SK_INITIAL_MAP_SIZE / PAGE_SIZE;
 pub const VSM_SK_PTE_PAGES_COUNT: usize = VSM_SK_INITIAL_MAP_SIZE / VSM_PMD_SIZE;
 
 pub const VTL1_TOTAL_MEMORY_SIZE: usize = 128 * 1024 * 1024;
@@ -26,13 +27,17 @@ pub const VTL1_KERNEL_STACK_PAGE: usize = VTL1_PTE_0_PAGE + VSM_SK_PTE_PAGES_COU
 pub const VTL1_BOOT_PARAMS_PAGE: usize = VTL1_KERNEL_STACK_PAGE + 1;
 pub const VTL1_CMDLINE_PAGE: usize = VTL1_BOOT_PARAMS_PAGE + 1;
 
+// initial heap to add the entire VTL1 physical memory to the kernel page table
+// We need ~256 KiB to cover the entire VTL1 physical memory (128 MiB)
+pub const VTL1_INIT_HEAP_START_PAGE: usize = 256;
+pub const VTL1_INIT_HEAP_SIZE: usize = 1024 * 1024;
+
 // VTL1 kernel roughly uses 6 MiB of memory (mostly empty, 2 MB aligned)
 // 2 MiB for page tables and other metadata
 // 2 MiB for kernel text
 // 2 MiB for kernel data (static variables, stacks, ...)
+// We can use the rest of the memory (~122 MiB) for the heap
 pub const PREALLOCATED_AREA_SIZE: usize = 6 * 1024 * 1024;
-pub const VTL1_HEAP_START: usize = PREALLOCATED_AREA_SIZE;
-pub const VTL1_HEAP_SIZE: usize = VTL1_TOTAL_MEMORY_SIZE - VTL1_HEAP_START;
 
 unsafe extern "C" {
     static _memory_base: u8;

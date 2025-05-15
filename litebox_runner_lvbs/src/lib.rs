@@ -3,12 +3,15 @@
 use core::panic::PanicInfo;
 use litebox_platform_lvbs::{
     arch::{gdt, instrs::hlt_loop, interrupts},
-    host::{bootparam::get_vtl1_memory_info, lvbs_impl::init_heap_mem_block},
+    host::bootparam::get_vtl1_memory_info,
     kernel_context::get_core_id,
     mm::MemoryProvider,
     mshv::{
         hvcall,
-        vtl1_mem_layout::{PAGE_SIZE, VTL1_HEAP_SIZE, VTL1_HEAP_START, VTL1_PML4E_PAGE},
+        vtl1_mem_layout::{
+            PAGE_SIZE, PREALLOCATED_AREA_SIZE, VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE,
+            VTL1_PML4E_PAGE,
+        },
     },
     serial_println,
 };
@@ -17,36 +20,48 @@ use litebox_platform_multiplex::{Platform, set_platform};
 /// # Panics
 ///
 /// Panics if it failed to enable Hyper-V hypercall
-pub fn per_core_init() {
+pub fn init() {
     gdt::init();
+
+    // TODO: IDTs are ignored when VTL1 is enabled. We should implement SynIC.
     interrupts::init_idt();
+
+    if get_core_id() == 0 {
+        if let Ok((start, size)) = get_vtl1_memory_info() {
+            let vtl1_start = x86_64::PhysAddr::new(start);
+            let vtl1_end = x86_64::PhysAddr::new(start + size);
+
+            // Add a small range of mapped memory to the global allocator (to populate the kernel page table).
+            unsafe {
+                Platform::mem_fill_pages(
+                    usize::try_from(Platform::pa_to_va(vtl1_start).as_u64()).unwrap()
+                        + VTL1_INIT_HEAP_START_PAGE * PAGE_SIZE,
+                    VTL1_INIT_HEAP_SIZE,
+                );
+            }
+
+            let pml4_table_addr = vtl1_start + u64::try_from(PAGE_SIZE * VTL1_PML4E_PAGE).unwrap();
+            set_platform(Platform::new(pml4_table_addr, vtl1_start, vtl1_end));
+
+            // Add the rest of the VTL1 memory to the global allocator once they are mapped to the kernel page table.
+            unsafe {
+                Platform::mem_fill_pages(
+                    usize::try_from(Platform::pa_to_va(vtl1_start).as_u64()).unwrap()
+                        + PREALLOCATED_AREA_SIZE,
+                    usize::try_from(size).unwrap() - PREALLOCATED_AREA_SIZE,
+                );
+            }
+        } else {
+            panic!("Failed to get memory info");
+        }
+    }
+
+    // VTL1/hypercall must not be enabled until all other static variables are initialized.
+    // This is because enabling VTL1 will turn all DATA/BSS sections into read-only.
+    // If we must modify some static variables after enabling VTL1, we should modify
+    // corresponding EPT/NPT entries to make them writable.
     if let Err(e) = hvcall::init() {
         panic!("Err: {:?}", e);
-    }
-
-    if get_core_id() != 0 {
-        return;
-    }
-
-    if let Ok((start, size)) = get_vtl1_memory_info() {
-        let vtl1_start = x86_64::PhysAddr::new(start);
-        let vtl1_end = x86_64::PhysAddr::new(start + size);
-
-        if init_heap_mem_block(
-            <Platform as MemoryProvider>::pa_to_va(vtl1_start)
-                + VTL1_HEAP_START.try_into().unwrap(),
-            <Platform as MemoryProvider>::pa_to_va(vtl1_start)
-                + (VTL1_HEAP_START + VTL1_HEAP_SIZE).try_into().unwrap(),
-        )
-        .is_err()
-        {
-            serial_println!("Failed to initialize heap memory block");
-        }
-
-        let pml4_table_addr = vtl1_start + u64::try_from(PAGE_SIZE * VTL1_PML4E_PAGE).unwrap();
-        set_platform(Platform::new(pml4_table_addr, vtl1_start, vtl1_end));
-    } else {
-        panic!("Failed to get memory info");
     }
 }
 

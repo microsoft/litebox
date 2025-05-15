@@ -45,9 +45,7 @@ pub fn kernel_main() -> ! {
         dump_cmdline();
     }
 
-    // TODO: common init (e.g., heap, ...)
-
-    litebox_runner_lvbs::per_core_init();
+    litebox_runner_lvbs::init();
 
     vtl_switch_loop_entry()
 }

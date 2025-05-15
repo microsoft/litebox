@@ -273,23 +273,48 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(())
     }
 
+    /// Map physical frame range to the page table
+    ///
+    /// Note it does not rely on the page fault handler based mapping to avoid double faults.
     pub(crate) fn map_phys_frame_range(
         &self,
-        frame_range: PhysFrameRange,
+        frame_range: PhysFrameRange<Size4KiB>,
         is_vtl1: bool,
     ) -> Result<*mut u8, MapToError<Size4KiB>> {
         let mut allocator = PageTableAllocator::<M>::new();
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
 
+        crate::debug_serial_println!("mapping {frame_range:?}");
+
         let mut inner = self.inner.lock();
-        for frame in frame_range {
+        for target_frame in frame_range {
             let page: Page<Size4KiB> = if is_vtl1 {
-                Page::containing_address(M::pa_to_va(frame.start_address()))
+                Page::containing_address(M::pa_to_va(target_frame.start_address()))
             } else {
-                Page::containing_address(M::vtl0_pa_to_va(frame.start_address()))
+                Page::containing_address(M::vtl0_pa_to_va(target_frame.start_address()))
             };
+
+            match inner.translate(page.start_address()) {
+                TranslateResult::Mapped {
+                    frame,
+                    offset: _,
+                    flags: _,
+                } => {
+                    assert!(
+                        target_frame.start_address() == frame.start_address(),
+                        "{page:?} is already mapped to {frame:?} instead of {target_frame:?}"
+                    );
+
+                    continue;
+                }
+                TranslateResult::NotMapped => {}
+                TranslateResult::InvalidFrameAddress(pa) => {
+                    panic!("Invalid frame address: {:#x}", pa);
+                }
+            }
+
             match unsafe {
-                inner.map_to_with_table_flags(page, frame, flags, flags, &mut allocator)
+                inner.map_to_with_table_flags(page, target_frame, flags, flags, &mut allocator)
             } {
                 Ok(fl) => {
                     if FLUSH_TLB {
@@ -300,7 +325,11 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             }
         }
 
-        Ok(M::pa_to_va(frame_range.start.start_address()).as_mut_ptr())
+        if is_vtl1 {
+            Ok(M::pa_to_va(frame_range.start.start_address()).as_mut_ptr())
+        } else {
+            Ok(M::vtl0_pa_to_va(frame_range.start.start_address()).as_mut_ptr())
+        }
     }
 }
 
