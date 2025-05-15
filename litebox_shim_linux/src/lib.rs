@@ -31,6 +31,7 @@ use litebox_platform_multiplex::Platform;
 use syscalls::net::sys_setsockopt;
 
 pub(crate) mod channel;
+pub(crate) mod event;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
@@ -214,6 +215,14 @@ impl Descriptors {
     }
 }
 
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum StdType {
+    Stdin = 0,
+    Stdout = 1,
+    Stderr = 2,
+}
+
 enum Descriptor {
     File(FileFd),
     // Note we are using `Arc` here so that we can hold a reference to the socket
@@ -234,6 +243,10 @@ enum Descriptor {
     },
     // TODO: we may not need this once #31 and #68 are done.
     Stdio(stdio::StdioFile),
+    Epoll {
+        file: alloc::sync::Arc<syscalls::epoll::EpollFile>,
+        close_on_exec: core::sync::atomic::AtomicBool,
+    },
 }
 
 pub(crate) fn file_descriptors<'a>() -> &'a RwLock<Platform, Descriptors> {
@@ -439,6 +452,38 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
                     .map(|()| size)
                     .ok_or(Errno::EFAULT)
             })
+        }
+        SyscallRequest::EpollCtl {
+            epfd,
+            op,
+            fd,
+            event,
+        } => syscalls::file::sys_epoll_ctl(epfd, op, fd, event).map(|()| 0),
+        SyscallRequest::EpollCreate { size } => {
+            syscalls::file::sys_epoll_create(size).map(|fd| fd as usize)
+        }
+        SyscallRequest::EpollCreate1 { flags } => {
+            syscalls::file::sys_epoll_create1(flags).map(|fd| fd as usize)
+        }
+        SyscallRequest::EpollCtl {
+            epfd,
+            op,
+            fd,
+            event,
+        } => syscalls::file::sys_epoll_ctl(epfd, op, fd, event).map(|()| 0),
+        SyscallRequest::EpollPwait {
+            epfd,
+            events,
+            maxevents,
+            timeout,
+            sigmask,
+            sigsetsize,
+        } => syscalls::file::sys_epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize),
+        SyscallRequest::EpollCreate { size } => {
+            syscalls::file::sys_epoll_create(size).map(|fd| fd as usize)
+        }
+        SyscallRequest::EpollCreate1 { flags } => {
+            syscalls::file::sys_epoll_create1(flags).map(|fd| fd as usize)
         }
         SyscallRequest::ArchPrctl { arg } => syscalls::process::sys_arch_prctl(arg).map(|()| 0),
         SyscallRequest::Readlink {

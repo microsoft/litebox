@@ -12,7 +12,7 @@ use super::RawSyncPrimitivesProvider;
 
 /// A spin-enabled wrapper around [`platform::RawMutex`](crate::platform::RawMutex) to reduce the
 /// number of unnecessary calls out to platform.
-struct SpinEnabledRawMutex<Platform: RawSyncPrimitivesProvider> {
+pub(super) struct SpinEnabledRawMutex<Platform: RawSyncPrimitivesProvider> {
     /// 0: unlocked
     /// 1: locked, no other threads waiting
     /// 2: locked, and other threads waiting (contended)
@@ -39,7 +39,7 @@ impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
 
     /// Acquires this mutex, blocking the current thread until it is able to do so.
     #[inline]
-    fn lock(&self) {
+    pub(super) fn lock(&self) {
         if self.try_lock() {
             // Acquired immediately, nice!
         } else {
@@ -114,7 +114,7 @@ impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
     /// This method may only be called if the mutex is held in the current context, i.e. it must be
     /// paired with a successful call to `lock`, `try_lock`, ...
     #[inline]
-    unsafe fn unlock(&self) {
+    pub(super) unsafe fn unlock(&self) {
         if self.raw.underlying_atomic().swap(0, Release) == 2 {
             // We only wake up one thread. When that thread locks the mutex, it
             // will mark the mutex as contended (2) (see lock_contended above),
