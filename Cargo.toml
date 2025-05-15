@@ -14,7 +14,8 @@ members = [
 # exclude binaries which need different toolchain and build target.
 exclude = [
     "litebox_platform_lvbs",
-    "litebox_runner_lvbs"
+    "litebox_platform_lvbs_isr",
+    "litebox_runner_lvbs",
 ]
 
 # Introduce all the pedantic clippy lints and remove ones I (jayb) think are

@@ -2,7 +2,7 @@
 
 use core::panic::PanicInfo;
 use litebox_platform_lvbs::{
-    arch::{gdt, instrs::hlt_loop, interrupts},
+    arch::{gdt, instrs::hlt_loop},
     mshv::hvcall,
     serial_println,
 };
@@ -12,7 +12,7 @@ use litebox_platform_lvbs::{
 /// Panics if it failed to enable Hyper-V hypercall
 pub fn per_core_init() {
     gdt::init();
-    interrupts::init_idt();
+    litebox_platform_lvbs_isr::init_idt();
     if let Err(e) = hvcall::init() {
         panic!("Err: {:?}", e);
     }

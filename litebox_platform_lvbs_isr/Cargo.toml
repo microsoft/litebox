@@ -1,15 +1,16 @@
 [package]
-name = "litebox_runner_lvbs"
+name = "litebox_platform_lvbs_isr"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+
 [dependencies]
-litebox = { version = "0.1.0", path = "../litebox" }
 litebox_platform_lvbs = { version = "0.1.0", path = "../litebox_platform_lvbs" }
-litebox_platform_lvbs_isr = { version = "0.1.0", path = "../litebox_platform_lvbs_isr" }
-litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_multiplex", default-features = false, features = [
-  "platform_lvbs",
-] }
+spin = { version = "0.10.0", default-features = false, features = ["once"] }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = { version = "0.15.2", default-features = false, features = ["abi_x86_interrupt"] }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

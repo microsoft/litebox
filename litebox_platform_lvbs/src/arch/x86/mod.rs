@@ -1,6 +1,5 @@
 pub mod gdt;
 pub mod instrs;
-pub mod interrupts;
 pub mod ioport;
 pub mod mm;
 pub mod msr;

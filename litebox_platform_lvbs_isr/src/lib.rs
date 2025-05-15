@@ -1,6 +1,9 @@
 //! Interrupt Descriptor Table (IDT)
 
-use crate::serial_println;
+#![cfg(target_arch = "x86_64")]
+#![no_std]
+#![feature(abi_x86_interrupt)]
+use litebox_platform_lvbs::serial_println;
 use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
