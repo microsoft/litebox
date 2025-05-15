@@ -43,6 +43,35 @@ where
         Self { vmem }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn create_pages<F>(
+        &self,
+        suggested_addr: usize,
+        len: usize,
+        fixed_addr: bool,
+        is_stack: bool,
+        before_perms: MemoryRegionPermissions,
+        after_perms: MemoryRegionPermissions,
+        op: F,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
+    where
+        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
+    {
+        let suggested_range =
+            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::UnAligned)?;
+        let mut vmem = self.vmem.write();
+        unsafe {
+            vmem.create_pages(
+                suggested_range,
+                fixed_addr,
+                is_stack,
+                before_perms,
+                after_perms,
+                op,
+            )
+        }
+    }
+
     /// Create readable and executable pages.
     ///
     /// The start address of `suggested_range` is the hint address for where to create the pages.
