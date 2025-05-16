@@ -273,30 +273,22 @@ pub extern "C" fn close(fd: i32) -> i32 {
 // has the downside of requiring too many syscalls, while having it be too large allows for massive
 // allocations to be triggered by the userland program. For now, this is set to a
 // hopefully-reasonable middle ground.
-const MAX_KERNEL_BUF_SIZE: usize = 64 * 1024;
+const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 
 /// Entry point for the syscall handler
 #[allow(clippy::too_many_lines)]
 pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
     let res: Result<usize, Errno> = match request {
         SyscallRequest::Read { fd, buf, count } => {
+            // Note some applications (e.g., `node`) seem to assume that getting fewer bytes than
+            // requested indicates EOF.
+            debug_assert!(count <= MAX_KERNEL_BUF_SIZE);
             let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
-            let mut total_read = 0;
-            loop {
-                match syscalls::file::sys_read(fd, &mut kernel_buf, None).and_then(|size| {
-                    buf.copy_from_slice(total_read, &kernel_buf[..size])
-                        .map(|()| size)
-                        .ok_or(Errno::EFAULT)
-                }) {
-                    Ok(n) => {
-                        total_read += n;
-                        if n < kernel_buf.len() || total_read == count {
-                            break Ok(total_read);
-                        }
-                    }
-                    Err(e) => break Err(e),
-                }
-            }
+            syscalls::file::sys_read(fd, &mut kernel_buf, None).and_then(|size| {
+                buf.copy_from_slice(0, &kernel_buf[..size])
+                    .map(|()| size)
+                    .ok_or(Errno::EFAULT)
+            })
         }
         SyscallRequest::Write { fd, buf, count } => match unsafe { buf.to_cow_slice(count) } {
             Some(buf) => syscalls::file::sys_write(fd, &buf, None),
