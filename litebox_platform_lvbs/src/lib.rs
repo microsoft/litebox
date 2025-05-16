@@ -4,6 +4,7 @@
 #![no_std]
 #![feature(abi_x86_interrupt)]
 
+use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};
 
@@ -34,7 +35,7 @@ static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 /// It requires a host that implements the [`HostInterface`] trait.
 pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
-    page_table: mm::PageTable<4096>,
+    page_table: mm::PageTable<PAGE_SIZE>,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
 }
 
@@ -109,8 +110,113 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 
     /// This unmaps VTL0 pages from the page table. Allocator does not allocate frames
     /// for VTL0 pages (i.e., it is always shared mapping), so it must not attempt to deallocate them.
-    pub fn unmap_vtl0_pages(&self, page_range: PageRange<4096>) -> Result<(), DeallocationError> {
+    pub fn unmap_vtl0_pages(
+        &self,
+        page_range: PageRange<PAGE_SIZE>,
+    ) -> Result<(), DeallocationError> {
         unsafe { self.page_table.unmap_pages_wo_dealloc(page_range) }
+    }
+
+    /// This function copies data from VTL0 physical memory to the VTL1 kernel.
+    /// Use this function instead of map/unmap functions to avoid potential TOCTTOU.
+    /// # Safety
+    ///
+    /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address
+    /// # Panics
+    ///
+    /// Panics if phys_addr is invalid
+    pub unsafe fn copy_from_vtl0_phys<T: Copy>(
+        &self,
+        phys_addr: x86_64::PhysAddr,
+    ) -> Option<alloc::boxed::Box<T>> {
+        use alloc::boxed::Box;
+
+        if phys_addr + core::mem::size_of::<T>().try_into().unwrap()
+            < self.vtl1_phys_frame_range.start.start_address()
+            || phys_addr > self.vtl1_phys_frame_range.end.start_address()
+        {
+            if let Ok(addr) = self.map_vtl0_phys_range(
+                phys_addr,
+                phys_addr
+                    + core::mem::size_of::<T>().try_into().unwrap()
+                    + PAGE_SIZE.try_into().unwrap(),
+            ) {
+                let offset = usize::try_from(phys_addr.as_u64()).unwrap() % PAGE_SIZE;
+                let raw = Box::into_raw(Box::new(core::mem::MaybeUninit::<T>::uninit()));
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        addr.wrapping_add(offset) as *const T,
+                        (*raw).as_mut_ptr(),
+                        1,
+                    );
+                }
+
+                self.unmap_vtl0_pages(
+                    PageRange::<PAGE_SIZE>::new(
+                        addr as usize,
+                        (addr as usize)
+                            + ((core::mem::size_of::<T>() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1))
+                            + PAGE_SIZE,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+
+                return Some(unsafe { Box::from_raw((*raw).as_mut_ptr()) });
+            }
+        }
+
+        None
+    }
+
+    /// This function copies data from the VTL1 kernel to VTL0 physical memory.
+    /// Use this function instead of map/unmap functions to avoid potential TOCTTOU.
+    /// # Safety
+    ///
+    /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address
+    /// # Panics
+    ///
+    /// Panics if phys_addr is invalid
+    pub unsafe fn copy_to_vtl0_phys<T: Copy>(
+        &self,
+        phys_addr: x86_64::PhysAddr,
+        value: &T,
+    ) -> bool {
+        if phys_addr + core::mem::size_of::<T>().try_into().unwrap()
+            < self.vtl1_phys_frame_range.start.start_address()
+            || phys_addr > self.vtl1_phys_frame_range.end.start_address()
+        {
+            if let Ok(addr) = self.map_vtl0_phys_range(
+                phys_addr,
+                phys_addr
+                    + core::mem::size_of::<T>().try_into().unwrap()
+                    + PAGE_SIZE.try_into().unwrap(),
+            ) {
+                let offset = usize::try_from(phys_addr.as_u64()).unwrap() % PAGE_SIZE;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        core::ptr::from_ref::<T>(value),
+                        addr.wrapping_add(offset).cast::<T>(),
+                        1,
+                    );
+                }
+
+                self.unmap_vtl0_pages(
+                    PageRange::<PAGE_SIZE>::new(
+                        addr as usize,
+                        (addr as usize)
+                            + ((core::mem::size_of::<T>() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1))
+                            + PAGE_SIZE,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+
+                return true;
+            }
+        }
+
+        false
     }
 }
 
@@ -421,7 +527,7 @@ impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKern
     }
 
     fn access_error(error_code: u64, flags: litebox::mm::linux::VmFlags) -> bool {
-        mm::PageTable::<4096>::access_error(error_code, flags)
+        mm::PageTable::<PAGE_SIZE>::access_error(error_code, flags)
     }
 }
 

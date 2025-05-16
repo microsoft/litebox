@@ -24,7 +24,6 @@ use crate::{
     },
     serial_println,
 };
-use litebox::mm::linux::PageRange;
 use num_enum::TryFromPrimitive;
 
 /// VTL call parameters (param[0]: function ID, param[1-3]: parameters)
@@ -57,32 +56,20 @@ pub fn init() {
 pub fn mshv_vsm_enable_aps(cpu_present_mask_pfn: u64) -> u64 {
     debug_serial_println!("VSM: Enable VTL of APs");
 
-    if let Ok(addr) = crate::platform_low().map_vtl0_phys_range(
-        x86_64::PhysAddr::new(cpu_present_mask_pfn << PAGE_SHIFT),
-        x86_64::PhysAddr::new((cpu_present_mask_pfn + 1) << PAGE_SHIFT),
-    ) {
-        #[expect(clippy::cast_ptr_alignment)]
-        let cpu_mask_ptr = addr as *const CpuMask;
-        let cpu_mask = unsafe { (*cpu_mask_ptr).decode_cpu_mask() };
+    if let Some(cpu_mask) = unsafe {
+        crate::platform_low().copy_from_vtl0_phys::<CpuMask>(x86_64::PhysAddr::new(
+            cpu_present_mask_pfn << PAGE_SHIFT,
+        ))
+    } {
         debug_serial_print!("cpu_present_mask: ");
-        for (i, elem) in cpu_mask.iter().enumerate() {
+        for (i, elem) in cpu_mask.decode_cpu_mask().iter().enumerate() {
             if *elem {
                 debug_serial_print!("{}, ", i);
             }
         }
         debug_serial_println!("");
-
-        if crate::platform_low()
-            .unmap_vtl0_pages(
-                PageRange::<PAGE_SIZE>::new(addr as usize, addr as usize + PAGE_SIZE).unwrap(),
-            )
-            .is_err()
-        {
-            serial_println!("Failed to unmap cpu_present_mask page");
-            return 1;
-        }
     } else {
-        serial_println!("Failed to map cpu_present_mask page");
+        serial_println!("Failed to get cpu_present_mask");
         return 1;
     }
 
@@ -106,63 +93,51 @@ pub fn mshv_vsm_enable_aps(cpu_present_mask_pfn: u64) -> u64 {
 pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> u64 {
     debug_serial_println!("VSM: Boot APs");
 
-    if let Ok(addr) = crate::platform_low().map_vtl0_phys_range(
-        x86_64::PhysAddr::new(cpu_online_mask_pfn << PAGE_SHIFT),
-        x86_64::PhysAddr::new((cpu_online_mask_pfn + 1) << PAGE_SHIFT),
-    ) {
-        #[expect(clippy::cast_ptr_alignment)]
-        let cpu_mask_ptr = addr as *const CpuMask;
-        let cpu_mask = unsafe { (*cpu_mask_ptr).decode_cpu_mask() };
+    if let Some(cpu_mask) = unsafe {
+        crate::platform_low().copy_from_vtl0_phys::<CpuMask>(x86_64::PhysAddr::new(
+            cpu_online_mask_pfn << PAGE_SHIFT,
+        ))
+    } {
         debug_serial_print!("cpu_online_mask: ");
-        for (i, elem) in cpu_mask.iter().enumerate() {
+        for (i, elem) in cpu_mask.decode_cpu_mask().iter().enumerate() {
             if *elem {
                 debug_serial_print!("{}, ", i);
             }
         }
         debug_serial_println!("");
-
-        if crate::platform_low()
-            .unmap_vtl0_pages(
-                PageRange::<PAGE_SIZE>::new(addr as usize, addr as usize + PAGE_SIZE).unwrap(),
-            )
-            .is_err()
-        {
-            serial_println!("Failed to unmap cpu_online_mask page");
-            return 1;
-        }
     } else {
-        serial_println!("Failed to map cpu_online_mask page");
+        serial_println!("Failed to get cpu_online_mask");
         return 1;
     }
 
-    if let Ok(addr) = crate::platform_low().map_vtl0_phys_range(
-        x86_64::PhysAddr::new(boot_signal_pfn << PAGE_SHIFT),
-        x86_64::PhysAddr::new((boot_signal_pfn + 1) << PAGE_SHIFT),
-    ) {
+    // boot_signal is an array of bytes whose length is the number of possible cores. Copy the entire page for now.
+    if let Some(mut boot_signal_page) = unsafe {
+        crate::platform_low().copy_from_vtl0_phys::<[u8; PAGE_SIZE]>(x86_64::PhysAddr::new(
+            boot_signal_pfn << PAGE_SHIFT,
+        ))
+    } {
         // TODO: execute `init_vtl_ap` for each online core and update the corresponding boot signal byte.
         // Currently, we use `init_vtl_aps` to initialize all present cores which is a bad idea
         // if we have a lot of cores and some of them are offline.
         debug_serial_println!("updating boot signal page");
-        let boot_signal_ptr = addr.cast::<[u8; PAGE_SIZE]>();
         for i in 0..get_num_possible_cpus().unwrap_or(0) {
-            unsafe { (*boot_signal_ptr)[i as usize] = HV_SECURE_VTL_BOOT_TOKEN };
+            boot_signal_page[i as usize] = HV_SECURE_VTL_BOOT_TOKEN;
         }
 
-        if crate::platform_low()
-            .unmap_vtl0_pages(
-                PageRange::<PAGE_SIZE>::new(addr as usize, addr as usize + PAGE_SIZE).unwrap(),
+        if !unsafe {
+            crate::platform_low().copy_to_vtl0_phys::<[u8; PAGE_SIZE]>(
+                x86_64::PhysAddr::new(boot_signal_pfn << PAGE_SHIFT),
+                &boot_signal_page,
             )
-            .is_err()
-        {
-            serial_println!("Failed to unmap boot_signal page");
+        } {
+            serial_println!("Failed to copy boot signal page to VTL0");
             return 1;
         }
     } else {
-        serial_println!("Failed to map boot_signal page");
+        serial_println!("Failed to get boot signal page");
         return 1;
     }
 
-    // TODO: update boot signal page accordingly
     0
 }
 
