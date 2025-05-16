@@ -13,7 +13,7 @@ use litebox_platform_lvbs::{
             VTL1_PML4E_PAGE,
         },
     },
-    serial_println,
+    serial_println, set_platform_low,
 };
 use litebox_platform_multiplex::{Platform, set_platform};
 
@@ -41,7 +41,11 @@ pub fn init() {
             }
 
             let pml4_table_addr = vtl1_start + u64::try_from(PAGE_SIZE * VTL1_PML4E_PAGE).unwrap();
-            set_platform(Platform::new(pml4_table_addr, vtl1_start, vtl1_end));
+            let platform = Platform::new(pml4_table_addr, vtl1_start, vtl1_end);
+            set_platform(platform);
+            set_platform_low(platform); // TODO: this is a temporary solution to allow LVBS functions to access the platform (i.e., kernel page table).
+            // set_platform(Platform::new(pml4_table_addr, vtl1_start, vtl1_end));
+            // set_platform_low(Platform::new(pml4_table_addr, vtl1_start, vtl1_end));
 
             // Add the rest of the VTL1 memory to the global allocator once they are mapped to the kernel page table.
             unsafe {

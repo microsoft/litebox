@@ -59,6 +59,7 @@ impl litebox::mm::allocator::MemoryProvider for MockKernel {
 impl super::MemoryProvider for MockKernel {
     const GVA_OFFSET: super::VirtAddr = super::VirtAddr::new(0);
     const PRIVATE_PTE_MASK: u64 = 0;
+    const VTL0_GVA_OFFSET: super::VirtAddr = super::VirtAddr::new(0);
 
     fn mem_allocate_pages(order: u32) -> Option<*mut u8> {
         ALLOCATOR.allocate_pages(order)
@@ -66,6 +67,10 @@ impl super::MemoryProvider for MockKernel {
 
     unsafe fn mem_free_pages(ptr: *mut u8, order: u32) {
         unsafe { ALLOCATOR.free_pages(ptr, order) }
+    }
+
+    unsafe fn mem_fill_pages(start: usize, size: usize) {
+        unsafe { ALLOCATOR.fill_pages(start, size) }
     }
 
     fn va_to_pa(va: VirtAddr) -> PhysAddr {
@@ -225,7 +230,11 @@ fn test_page_table() {
 fn test_vmm_page_fault() {
     let start_addr: usize = 0x1_0000;
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
-    let platform = MockKernel::new(p4.start_address());
+    let platform = MockKernel::new(
+        p4.start_address(),
+        x86_64::PhysAddr::new(0),
+        x86_64::PhysAddr::new(0),
+    );
     let litebox = LiteBox::new(platform);
     let mut vmm = PageManager::<_, PAGE_SIZE>::new(&litebox);
     unsafe {

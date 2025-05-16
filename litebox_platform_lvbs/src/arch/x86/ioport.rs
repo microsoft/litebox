@@ -135,6 +135,11 @@ macro_rules! serial_println {
 }
 
 #[macro_export]
+macro_rules! debug_serial_print {
+    ($($arg:tt)*) => (#[cfg(debug_assertions)] $crate::arch::ioport::print(format_args!($($arg)*)));
+}
+
+#[macro_export]
 macro_rules! debug_serial_println {
     () => (#[cfg(debug_assertions)] $crate::serial_print!("\n"));
     ($($arg:tt)*) => (#[cfg(debug_assertions)] $crate::serial_print!("{}\n", format_args!($($arg)*)));

@@ -1,14 +1,17 @@
 //! VSM functions
 
 use crate::{
-    debug_serial_println,
-    host::bootparam::{get_num_possible_cpus, get_vtl1_memory_info},
+    debug_serial_print, debug_serial_println,
+    host::{
+        bootparam::{get_num_possible_cpus, get_vtl1_memory_info},
+        linux::CpuMask,
+    },
     kernel_context::get_core_id,
     mshv::{
         HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
         HV_REGISTER_CR_INTERCEPT_CR4_MASK, HV_REGISTER_VSM_PARTITION_CONFIG,
-        HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HvCrInterceptControlFlags, HvPageProtFlags,
-        HvRegisterVsmPartitionConfig, HvRegisterVsmVpSecureVtlConfig,
+        HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HV_SECURE_VTL_BOOT_TOKEN, HvCrInterceptControlFlags,
+        HvPageProtFlags, HvRegisterVsmPartitionConfig, HvRegisterVsmVpSecureVtlConfig,
         VSM_VTL_CALL_FUNC_ID_BOOT_APS, VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY,
         VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL, VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT,
         VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE, VSM_VTL_CALL_FUNC_ID_LOAD_KDATA,
@@ -17,10 +20,11 @@ use crate::{
         VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags, X86Cr4Flags,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_set_vp_registers, init_vtl_aps},
-        vtl1_mem_layout::PAGE_SIZE,
+        vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,
 };
+use litebox::mm::linux::PageRange;
 use num_enum::TryFromPrimitive;
 
 /// VTL call parameters (param[0]: function ID, param[1-3]: parameters)
@@ -50,9 +54,39 @@ pub fn init() {
 /// VSM function for enabling VTL of APs
 /// # Panics
 /// Panics if hypercall for initializing VTL for APs fails
-pub fn mshv_vsm_enable_aps(_cpu_present_mask: u64) -> u64 {
+pub fn mshv_vsm_enable_aps(cpu_present_mask_pfn: u64) -> u64 {
     debug_serial_println!("VSM: Enable VTL of APs");
 
+    if let Ok(addr) = crate::platform_low().map_vtl0_phys_range(
+        x86_64::PhysAddr::new(cpu_present_mask_pfn << PAGE_SHIFT),
+        x86_64::PhysAddr::new((cpu_present_mask_pfn + 1) << PAGE_SHIFT),
+    ) {
+        #[expect(clippy::cast_ptr_alignment)]
+        let cpu_mask_ptr = addr as *const CpuMask;
+        let cpu_mask = unsafe { (*cpu_mask_ptr).decode_cpu_mask() };
+        debug_serial_print!("cpu_present_mask: ");
+        for (i, elem) in cpu_mask.iter().enumerate() {
+            if *elem {
+                debug_serial_print!("{}, ", i);
+            }
+        }
+        debug_serial_println!("");
+
+        if crate::platform_low()
+            .unmap_vtl0_pages(
+                PageRange::<PAGE_SIZE>::new(addr as usize, addr as usize + PAGE_SIZE).unwrap(),
+            )
+            .is_err()
+        {
+            serial_println!("Failed to unmap cpu_present_mask page");
+            return 1;
+        }
+    } else {
+        serial_println!("Failed to map cpu_present_mask page");
+        return 1;
+    }
+
+    // TODO: cpu_present_mask vs num_possible_cpus in kernel command line. which one should we use?
     let Ok(num_cores) = get_num_possible_cpus() else {
         serial_println!("Failed to get number of possible cores");
         return 1;
@@ -69,8 +103,65 @@ pub fn mshv_vsm_enable_aps(_cpu_present_mask: u64) -> u64 {
 }
 
 /// VSM function for booting APs
-pub fn mshv_vsm_boot_aps(_cpu_online_mask_pfn: u64, _boot_signal_pfn: u64) -> u64 {
+pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> u64 {
     debug_serial_println!("VSM: Boot APs");
+
+    if let Ok(addr) = crate::platform_low().map_vtl0_phys_range(
+        x86_64::PhysAddr::new(cpu_online_mask_pfn << PAGE_SHIFT),
+        x86_64::PhysAddr::new((cpu_online_mask_pfn + 1) << PAGE_SHIFT),
+    ) {
+        #[expect(clippy::cast_ptr_alignment)]
+        let cpu_mask_ptr = addr as *const CpuMask;
+        let cpu_mask = unsafe { (*cpu_mask_ptr).decode_cpu_mask() };
+        debug_serial_print!("cpu_online_mask: ");
+        for (i, elem) in cpu_mask.iter().enumerate() {
+            if *elem {
+                debug_serial_print!("{}, ", i);
+            }
+        }
+        debug_serial_println!("");
+
+        if crate::platform_low()
+            .unmap_vtl0_pages(
+                PageRange::<PAGE_SIZE>::new(addr as usize, addr as usize + PAGE_SIZE).unwrap(),
+            )
+            .is_err()
+        {
+            serial_println!("Failed to unmap cpu_online_mask page");
+            return 1;
+        }
+    } else {
+        serial_println!("Failed to map cpu_online_mask page");
+        return 1;
+    }
+
+    if let Ok(addr) = crate::platform_low().map_vtl0_phys_range(
+        x86_64::PhysAddr::new(boot_signal_pfn << PAGE_SHIFT),
+        x86_64::PhysAddr::new((boot_signal_pfn + 1) << PAGE_SHIFT),
+    ) {
+        // TODO: execute `init_vtl_ap` for each online core and update the corresponding boot signal byte.
+        // Currently, we use `init_vtl_aps` to initialize all present cores which is a bad idea
+        // if we have a lot of cores and some of them are offline.
+        debug_serial_println!("updating boot signal page");
+        let boot_signal_ptr = addr.cast::<[u8; PAGE_SIZE]>();
+        for i in 0..get_num_possible_cpus().unwrap_or(0) {
+            unsafe { (*boot_signal_ptr)[i as usize] = HV_SECURE_VTL_BOOT_TOKEN };
+        }
+
+        if crate::platform_low()
+            .unmap_vtl0_pages(
+                PageRange::<PAGE_SIZE>::new(addr as usize, addr as usize + PAGE_SIZE).unwrap(),
+            )
+            .is_err()
+        {
+            serial_println!("Failed to unmap boot_signal page");
+            return 1;
+        }
+    } else {
+        serial_println!("Failed to map boot_signal page");
+        return 1;
+    }
+
     // TODO: update boot signal page accordingly
     0
 }

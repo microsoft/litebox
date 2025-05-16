@@ -63,10 +63,14 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         phys_end: x86_64::PhysAddr,
     ) -> &'static Self {
         let pt = unsafe { mm::PageTable::new(init_page_table_addr) };
-        let physframe_start = PhysFrame::from_start_address(phys_start).unwrap();
-        let physframe_end = PhysFrame::from_start_address(phys_end).unwrap();
-        pt.map_phys_frame_range(PhysFrame::range(physframe_start, physframe_end), true)
-            .unwrap();
+        let physframe_start = PhysFrame::containing_address(phys_start);
+        let physframe_end = PhysFrame::containing_address(phys_end);
+        if pt
+            .map_phys_frame_range(PhysFrame::range(physframe_start, physframe_end), true)
+            .is_err()
+        {
+            panic!("Failed to map VTL1 physical memory");
+        }
 
         // There is only one long-running platform ever expected, thus this leak is perfectly ok in
         // order to simplify usage of the platform.
@@ -91,8 +95,8 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         phys_end: x86_64::PhysAddr,
     ) -> Result<*mut u8, MapToError<Size4KiB>> {
         let frame_range = PhysFrame::range(
-            PhysFrame::from_start_address(phys_start).unwrap(),
-            PhysFrame::from_start_address(phys_end).unwrap(),
+            PhysFrame::containing_address(phys_start),
+            PhysFrame::containing_address(phys_end),
         );
         if frame_range.end < self.vtl1_phys_frame_range.start
             || frame_range.start > self.vtl1_phys_frame_range.end
@@ -419,4 +423,34 @@ impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKern
     fn access_error(error_code: u64, flags: litebox::mm::linux::VmFlags) -> bool {
         mm::PageTable::<4096>::access_error(error_code, flags)
     }
+}
+
+// NOTE: The below code is a naive workaround to let LVBS code to access the platform.
+// Rather than doing this, we should implement LVBS interface/provider for the platform.
+
+pub type Platform = crate::host::LvbsLinuxKernel;
+
+static PLATFORM_LOW: once_cell::race::OnceBox<&'static Platform> = once_cell::race::OnceBox::new();
+
+/// # Panics
+///
+/// Panics if invoked more than once
+#[expect(
+    clippy::match_wild_err_arm,
+    reason = "the platform itself is not Debug thus we cannot use `expect`"
+)]
+pub fn set_platform_low(platform: &'static Platform) {
+    match PLATFORM_LOW.set(alloc::boxed::Box::new(platform)) {
+        Ok(()) => {}
+        Err(_) => panic!("set_platform should only be called once per crate"),
+    }
+}
+
+/// # Panics
+///
+/// Panics if [`set_platform_low`] has not been invoked before this
+pub fn platform_low() -> &'static Platform {
+    PLATFORM_LOW
+        .get()
+        .expect("set_platform_low should have already been called before this point")
 }
