@@ -13,26 +13,35 @@ SECTIONS
     /* CONFIG_PHYSICAL_ALIGN=0x200000 */
 
     .text : ALIGN(0x200000) {
-        *(.text._start)
-        *(.text.*)
+        _text_start = .;
+        KEEP(*(.text._start))
+        *(.text .text.*)
         *(.got)
+        _text_end = .;
     }
     .data : ALIGN(0x200000) { 
+        _data_start = .;
         *(.rodata .rodata.*)
         *(.data .data.*)
+
         . = ALIGN(0x1000);
         _hypercall_page = . ;
-        . = ALIGN(0x1000);
-        _ta_data_start = . ;
-        KEEP(*(.binary_data))
-        _ta_data_end = . ;
+
+        _data_end = .;
     }
-    .rela : ALIGN(0x1000) {
-        *(.rela .rela.* )
-    }
-    .bss : ALIGN(0x1000) {
+    .bss : ALIGN(0x200000) {
+        _bss_start = .;
         *(.bss .bss.*)
+        _bss_end = .;
     }
+    .rela : ALIGN(0x200000) {
+        _rela_start = .;
+        *(.rela .rela.* )
+        _rela_end = .;
+    }
+
+    . = ALIGN(0x1000);
+    _heap_start = .;
     
     /DISCARD/ :
     {
