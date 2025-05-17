@@ -37,7 +37,8 @@ pub const VTL1_INIT_HEAP_SIZE: usize = 1024 * 1024;
 // 2 MiB for kernel text
 // 2 MiB for kernel data (static variables, stacks, ...)
 // We can use the rest of the memory (~122 MiB) for the heap
-pub const PREALLOCATED_AREA_SIZE: usize = 6 * 1024 * 1024;
+// pub const PREALLOCATED_AREA_SIZE: usize = 6 * 1024 * 1024;
+pub const PREALLOCATED_AREA_SIZE: usize = 8 * 1024 * 1024;
 
 unsafe extern "C" {
     static _memory_base: u8;

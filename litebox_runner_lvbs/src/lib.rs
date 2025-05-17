@@ -25,6 +25,7 @@ pub fn init() {
 
     // TODO: IDTs are ignored when VTL1 is enabled. We should implement SynIC.
     interrupts::init_idt();
+    x86_64::instructions::interrupts::enable();
 
     if get_core_id() == 0 {
         if let Ok((start, size)) = get_vtl1_memory_info() {
@@ -44,8 +45,6 @@ pub fn init() {
             let platform = Platform::new(pml4_table_addr, vtl1_start, vtl1_end);
             set_platform(platform);
             set_platform_low(platform); // TODO: this is a temporary solution to allow LVBS functions to access the platform (i.e., kernel page table).
-            // set_platform(Platform::new(pml4_table_addr, vtl1_start, vtl1_end));
-            // set_platform_low(Platform::new(pml4_table_addr, vtl1_start, vtl1_end));
 
             // Add the rest of the VTL1 memory to the global allocator once they are mapped to the kernel page table.
             unsafe {
@@ -67,6 +66,7 @@ pub fn init() {
     if let Err(e) = hvcall::init() {
         panic!("Err: {:?}", e);
     }
+    interrupts::init_idt();
 }
 
 #[panic_handler]

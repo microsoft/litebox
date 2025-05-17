@@ -1,5 +1,6 @@
 //! Hyper-V-specific code
 
+mod heki;
 pub mod hvcall;
 mod hvcall_mm;
 mod hvcall_vp;
@@ -36,6 +37,15 @@ pub const HV_X64_MSR_HYPERCALL: u32 = 0x_4000_0001;
 pub const HV_X64_MSR_HYPERCALL_ENABLE: u32 = 0x_0000_0001;
 pub const HV_X64_MSR_VP_ASSIST_PAGE: u32 = 0x_4000_0073;
 pub const HV_X64_MSR_VP_ASSIST_PAGE_ENABLE: u64 = 0x_0000_0001;
+pub const HV_X64_MSR_SCONTROL: u32 = 0x_4000_0080;
+pub const HV_X64_MSR_SCONTROL_ENABLE: u32 = 0x_0000_0001;
+pub const HV_X64_MSR_SIEFP: u32 = 0x_4000_0082;
+pub const HV_X64_MSR_SIEFP_ENABLE: u32 = 0x_0000_0001;
+pub const HV_X64_MSR_SIMP: u32 = 0x_4000_0083;
+pub const HV_X64_MSR_SIMP_ENABLE: u32 = 0x_0000_0001;
+pub const HV_X64_MSR_SINT0: u32 = 0x_4000_0090;
+
+pub const SYNIC_CUSTOM_VECTOR: u8 = 0xf0;
 
 pub const HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS: u32 = 0x_4000_0000;
 pub const HYPERV_CPUID_INTERFACE: u32 = 0x_4000_0001;
@@ -369,6 +379,58 @@ impl HvVpAssistPage {
 impl Default for HvVpAssistPage {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvMessageHeader {
+    pub message_type: u32,
+    pub payload_size: u8,
+    pub message_flags: u16,
+    pub reserved: [u8; 2],
+    pub sender: u64,
+}
+
+impl HvMessageHeader {
+    pub fn new() -> Self {
+        HvMessageHeader {
+            ..Default::default()
+        }
+    }
+}
+
+const HV_MESSAGE_PAYLOAD_QWORD_COUNT: usize = 30;
+
+#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvMessage {
+    pub header: HvMessageHeader,
+    pub payload: [u64; HV_MESSAGE_PAYLOAD_QWORD_COUNT],
+}
+
+impl HvMessage {
+    pub fn new() -> Self {
+        HvMessage {
+            header: HvMessageHeader::new(),
+            payload: [0u64; HV_MESSAGE_PAYLOAD_QWORD_COUNT],
+        }
+    }
+}
+
+const HV_SYNIC_SINT_COUNT: usize = 16;
+
+#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvMessagePage {
+    pub sint_message: [HvMessage; HV_SYNIC_SINT_COUNT],
+}
+
+impl HvMessagePage {
+    pub fn new() -> Self {
+        HvMessagePage {
+            sint_message: [HvMessage::new(); HV_SYNIC_SINT_COUNT],
+        }
     }
 }
 

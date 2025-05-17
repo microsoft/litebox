@@ -1,6 +1,7 @@
 //! Interrupt Descriptor Table (IDT)
 
-use crate::serial_println;
+use crate::{kernel_context, mshv::SYNIC_CUSTOM_VECTOR, serial_println};
+use core::ops::IndexMut;
 use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
@@ -21,6 +22,10 @@ fn idt() -> &'static InterruptDescriptorTable {
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
         idt.general_protection_fault
             .set_handler_fn(general_protection_fault_handler);
+
+        idt.index_mut(SYNIC_CUSTOM_VECTOR)
+            .set_handler_fn(hyperv_sint_handler);
+
         idt
     })
 }
@@ -32,10 +37,12 @@ pub fn init_idt() {
 
 extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: DIVIDE BY ZERO\n{:#?}", stack_frame);
+    panic!("Divide by zero");
 }
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
+    panic!("Breakpoint");
 }
 
 extern "x86-interrupt" fn double_fault_handler(
@@ -51,6 +58,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     _error_code: u64,
 ) {
     serial_println!("EXCEPTION: GENERAL PROTECTION FAULT\n{:#?}", stack_frame);
+    panic!("General protection fault");
 }
 
 extern "x86-interrupt" fn page_fault_handler(
@@ -75,4 +83,20 @@ extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFram
         Cr2::read(),
         stack_frame
     );
+    panic!("Invalid opcode");
+}
+
+extern "x86-interrupt" fn hyperv_sint_handler(_stack_frame: InterruptStackFrame) {
+    serial_println!("EXCEPTION: HYPERV SINT");
+
+    let kernel_context = kernel_context::get_per_core_kernel_context();
+    let simp_page = kernel_context.hv_simp_page_as_mut_ptr();
+
+    unsafe {
+        if (*simp_page).sint_message[0].header.message_type != 0 {
+            serial_println!("SINT MESSAGE: {:?}", (*simp_page).sint_message[0].header);
+            (*simp_page).sint_message[0].header.message_type = 0;
+        }
+    }
+    panic!("Hyper-V SINT handler");
 }

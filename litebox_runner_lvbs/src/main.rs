@@ -47,5 +47,10 @@ pub fn kernel_main() -> ! {
 
     litebox_runner_lvbs::init();
 
+    let ptr = 0x1000 as *const u8;
+    unsafe {
+        serial_println!("*ptr = {:#x}", *ptr);
+    }
+
     vtl_switch_loop_entry()
 }

@@ -13,9 +13,11 @@ use crate::{
         HV_STATUS_INVALID_PARAMETER, HV_STATUS_INVALID_PORT_ID, HV_STATUS_OPERATION_DENIED,
         HV_STATUS_SUCCESS, HV_STATUS_TIME_OUT, HV_STATUS_VTL_ALREADY_ENABLED,
         HV_X64_MSR_GUEST_OS_ID, HV_X64_MSR_HYPERCALL, HV_X64_MSR_HYPERCALL_ENABLE,
-        HV_X64_MSR_VP_ASSIST_PAGE, HV_X64_MSR_VP_ASSIST_PAGE_ENABLE, HYPERV_CPUID_IMPLEMENT_LIMITS,
-        HYPERV_CPUID_INTERFACE, HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS,
-        HYPERV_HYPERVISOR_PRESENT_BIT, vsm,
+        HV_X64_MSR_SCONTROL, HV_X64_MSR_SCONTROL_ENABLE, HV_X64_MSR_SIEFP, HV_X64_MSR_SIEFP_ENABLE,
+        HV_X64_MSR_SIMP, HV_X64_MSR_SIMP_ENABLE, HV_X64_MSR_SINT0, HV_X64_MSR_VP_ASSIST_PAGE,
+        HV_X64_MSR_VP_ASSIST_PAGE_ENABLE, HYPERV_CPUID_IMPLEMENT_LIMITS, HYPERV_CPUID_INTERFACE,
+        HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, HYPERV_HYPERVISOR_PRESENT_BIT, SYNIC_CUSTOM_VECTOR,
+        vsm,
     },
 };
 use core::arch::asm;
@@ -105,6 +107,30 @@ pub fn init() -> Result<(), HypervError> {
 
     debug_serial_println!("HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
 
+    wrmsr(HV_X64_MSR_SCONTROL, u64::from(HV_X64_MSR_SCONTROL_ENABLE));
+
+    wrmsr(
+        HV_X64_MSR_SIMP,
+        kernel_context.hv_simp_page_as_u64() | u64::from(HV_X64_MSR_SIMP_ENABLE),
+    );
+    if rdmsr(HV_X64_MSR_SIMP)
+        != kernel_context.hv_simp_page_as_u64() | u64::from(HV_X64_MSR_SIMP_ENABLE)
+    {
+        return Err(HypervError::InvalidSimpPage);
+    }
+
+    wrmsr(
+        HV_X64_MSR_SIEFP,
+        kernel_context.hv_siefp_page_as_u64() | u64::from(HV_X64_MSR_SIEFP_ENABLE),
+    );
+    if rdmsr(HV_X64_MSR_SIEFP)
+        != kernel_context.hv_siefp_page_as_u64() | u64::from(HV_X64_MSR_SIEFP_ENABLE)
+    {
+        return Err(HypervError::InvalidSiefpPage);
+    }
+
+    wrmsr(HV_X64_MSR_SINT0, u64::from(SYNIC_CUSTOM_VECTOR));
+
     #[cfg(debug_assertions)]
     if get_core_id() == 0 {
         debug_serial_println!(
@@ -116,6 +142,8 @@ pub fn init() -> Result<(), HypervError> {
             rdmsr(HV_X64_MSR_GUEST_OS_ID)
         );
         debug_serial_println!("HV_X64_MSR_HYPERCALL: {:#x}", rdmsr(HV_X64_MSR_HYPERCALL));
+        debug_serial_println!("HV_X64_MSR_SIMP: {:#x}", rdmsr(HV_X64_MSR_SIMP));
+        debug_serial_println!("HV_X64_MSR_SIEFP: {:#x}", rdmsr(HV_X64_MSR_SIEFP));
     }
 
     vsm::init();
@@ -202,6 +230,8 @@ pub enum HypervError {
     InvalidAssistPage,
     InvalidGuestOSID,
     InvalidHypercallPage,
+    InvalidSiefpPage,
+    InvalidSimpPage,
     VPSetupFailed,
     Unknown,
 }
