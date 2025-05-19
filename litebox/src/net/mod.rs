@@ -880,18 +880,37 @@ where
         ret
     }
 
-    /// Invoke the given function with the given socket if it is a valid tcp socket.
-    pub fn call_on_tcp_socket_mut<F, R>(&mut self, fd: &SocketFd, f: F) -> Option<R>
-    where
-        F: FnOnce(&mut smoltcp::socket::tcp::Socket) -> R,
-    {
-        let socket_handle = self.handles[fd.x.as_usize()].as_ref()?;
+    /// Set TCP options
+    ///
+    /// # Panics
+    ///
+    /// This function panics if `data` does not match `option` (they should use the same variant name).
+    pub fn set_tcp_option(
+        &mut self,
+        fd: &SocketFd,
+        option: TcpOptionName,
+        data: TcpOptionData,
+    ) -> Result<(), errors::SetTcpOptionError> {
+        let socket_handle = self.handles[fd.x.as_usize()]
+            .as_mut()
+            .ok_or(errors::SetTcpOptionError::InvalidFd)?;
         match socket_handle.protocol() {
             Protocol::Tcp => {
                 let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
-                Some(f(tcp_socket))
+                match (option, data) {
+                    (TcpOptionName::NODELAY, TcpOptionData::NODELAY(nodelay)) => {
+                        tcp_socket.set_nagle_enabled(!nodelay);
+                    }
+                    (TcpOptionName::KEEPALIVE, TcpOptionData::KEEPALIVE(keepalive)) => {
+                        tcp_socket.set_keep_alive(keepalive.map(smoltcp::time::Duration::from));
+                    }
+                    _ => panic!("TcpOptionData does not match TcpOptionName"),
+                }
+                Ok(())
             }
-            Protocol::Udp | Protocol::Icmp | Protocol::Raw { .. } => None,
+            Protocol::Udp | Protocol::Icmp | Protocol::Raw { .. } => {
+                Err(errors::SetTcpOptionError::NotTcpSocket)
+            }
         }
     }
 }
@@ -949,4 +968,16 @@ bitflags! {
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
     }
+}
+
+#[non_exhaustive]
+pub enum TcpOptionName {
+    NODELAY,
+    KEEPALIVE,
+}
+
+#[non_exhaustive]
+pub enum TcpOptionData {
+    NODELAY(bool),
+    KEEPALIVE(Option<core::time::Duration>),
 }

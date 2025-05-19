@@ -99,6 +99,7 @@ impl<Platform: RawSyncPrimitivesProvider> Socket<Platform> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn setsockopt(
         &self,
         optname: SocketOptionName,
@@ -153,18 +154,23 @@ impl<Platform: RawSyncPrimitivesProvider> Socket<Platform> {
                     }
                     SocketOption::KEEPALIVE => {
                         let keep_alive = val != 0;
-                        // This option probably has no effect on other protocols
-                        let _ = litebox_net().lock().call_on_tcp_socket_mut(
+                        if let Err(err) = litebox_net().lock().set_tcp_option(
                             self.fd.as_ref().unwrap(),
-                            |tcp| {
-                                tcp.set_keep_alive(if keep_alive {
-                                    // default time interval is 2 hours
-                                    Some(smoltcp::time::Duration::from_secs(2 * 60 * 60))
-                                } else {
-                                    None
-                                });
-                            },
-                        );
+                            litebox::net::TcpOptionName::KEEPALIVE,
+                            // default time interval is 2 hours
+                            litebox::net::TcpOptionData::KEEPALIVE(Some(
+                                core::time::Duration::from_secs(2 * 60 * 60),
+                            )),
+                        ) {
+                            match err {
+                                litebox::net::errors::SetTcpOptionError::InvalidFd => {
+                                    return Err(Errno::EBADF);
+                                }
+                                // This option probably has no effect on other protocols
+                                litebox::net::errors::SetTcpOptionError::NotTcpSocket => {}
+                                _ => unimplemented!(),
+                            }
+                        }
                         self.options.lock().keep_alive = keep_alive;
                     }
                     // We use fixed buffer size for now
@@ -182,26 +188,32 @@ impl<Platform: RawSyncPrimitivesProvider> Socket<Platform> {
                     .ok_or(Errno::EFAULT)?
                     .into_owned();
                 match to {
-                    TcpOption::NODELAY => {
-                        litebox_net()
-                            .lock()
-                            .call_on_tcp_socket_mut(self.fd.as_ref().unwrap(), |tcp| {
-                                tcp.set_nagle_enabled(val == 0);
-                            })
-                            .ok_or(Errno::EOPNOTSUPP)?;
-                        Ok(())
-                    }
-                    TcpOption::CORK => {
+                    TcpOption::NODELAY | TcpOption::CORK => {
                         // Some applications use Nagle's Algorithm (via the TCP_NODELAY option) for a similar effect.
                         // However, TCP_CORK offers more fine-grained control, as it's designed for applications that
                         // send variable-length chunks of data that don't necessarily fit nicely into a full TCP segment.
-                        // Because smoltcp does not support TCP_CORK, we emulate it by enabling/disabling Nagle’s Algorithm.
-                        litebox_net()
-                            .lock()
-                            .call_on_tcp_socket_mut(self.fd.as_ref().unwrap(), |tcp| {
-                                tcp.set_nagle_enabled(val != 0);
-                            })
-                            .ok_or(Errno::EOPNOTSUPP)?;
+                        // Because smoltcp does not support TCP_CORK, we emulate it by enabling/disabling Nagle's Algorithm.
+                        let on = if let TcpOption::NODELAY = to {
+                            val != 0
+                        } else {
+                            // CORK is the opposite of NODELAY
+                            val == 0
+                        };
+                        if let Err(err) = litebox_net().lock().set_tcp_option(
+                            self.fd.as_ref().unwrap(),
+                            litebox::net::TcpOptionName::NODELAY,
+                            litebox::net::TcpOptionData::NODELAY(on),
+                        ) {
+                            match err {
+                                litebox::net::errors::SetTcpOptionError::InvalidFd => {
+                                    return Err(Errno::EBADF);
+                                }
+                                litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
+                                    return Err(Errno::EOPNOTSUPP);
+                                }
+                                _ => unimplemented!(),
+                            }
+                        }
                         Ok(())
                     }
                     _ => unimplemented!("TCP option {to:?}"),

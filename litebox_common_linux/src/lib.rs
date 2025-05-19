@@ -466,6 +466,10 @@ impl SocketOptionName {
     }
 }
 
+// Following libc's definition of time_t and suseconds_t.
+// They are not same as isize on all architectures, e.g.,
+// `suseconds_t` is i64 on riscv32:
+// https://github.com/rust-lang/libc/blob/151c3a971e423c76e7acb54aa2d21a6e2706c4e6/src/unix/linux_like/linux/gnu/b32/mod.rs#L22
 cfg_if::cfg_if! {
     if #[cfg(all(target_arch = "x86"))] {
         pub type time_t = i32;

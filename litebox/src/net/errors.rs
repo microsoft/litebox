@@ -99,3 +99,13 @@ pub enum ReceiveError {
     #[error("Operation finished")]
     OperationFinished,
 }
+
+/// Possible errors from [`Network::set_tcp_option`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum SetTcpOptionError {
+    #[error("Not a valid open file descriptor")]
+    InvalidFd,
+    #[error("Not a TCP socket")]
+    NotTcpSocket,
+}
