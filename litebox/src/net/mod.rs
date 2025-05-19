@@ -970,12 +970,21 @@ bitflags! {
     }
 }
 
+/// Socket options for TCP
 #[non_exhaustive]
 pub enum TcpOptionName {
+    /// If set, disable the Nagle algorithm. This means that
+    /// segments are always sent as soon as possible, even if there
+    /// is only a small amount of data.
     NODELAY,
+    /// Enable sending of keep-alive messages.
     KEEPALIVE,
 }
 
+/// Data for TCP options
+///
+/// Note it should be paired with the correct `TcpOptionName` variant.
+/// For example, `TcpOptionName::NODELAY` should be paired with `TcpOptionData::NODELAY(true)`.
 #[non_exhaustive]
 pub enum TcpOptionData {
     NODELAY(bool),
