@@ -3,11 +3,6 @@ name = "litebox_platform_lvbs"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-
-[build-dependencies]
-bindgen = "0.71.0"
-
 [dependencies]
 bitflags = "2.9.0"
 buddy_system_allocator = { version = "0.11.0", default-features = false, features = ["use_spin"] }
@@ -27,11 +22,8 @@ num_enum = { version = "0.7.3", default-features = false }
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
 
-[lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-unreadable_literal = "allow"
-doc_markdown = "allow"
-missing_errors_doc = "allow"
-needless_pass_by_value = "allow"
-redundant_else = "allow"
-must_use_candidate = "allow"
+[features]
+interrupt = ["x86_64/abi_x86_interrupt"]
+
+[lints]
+workspace = true

@@ -2,6 +2,7 @@
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
+#![cfg_attr(feature = "interrupt", feature(abi_x86_interrupt))]
 
 use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};

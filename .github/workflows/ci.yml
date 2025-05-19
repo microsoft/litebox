@@ -77,38 +77,22 @@ jobs:
           rustup default ${RUST_CHANNEL}
           rustup override set ${RUST_CHANNEL}
           rustup show
-      - name: Set up Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt
         run: |
           .github/tools/github_actions_run_cargo fmt --manifest-path=litebox_runner_lvbs/Cargo.toml
-          .github/tools/github_actions_run_cargo fmt --manifest-path=litebox_platform_lvbs/Cargo.toml
-          .github/tools/github_actions_run_cargo fmt --manifest-path=litebox_platform_lvbs_isr/Cargo.toml
       - name: cargo clippy
         run: |
           .github/tools/github_actions_run_cargo clippy --lib --bins --examples --no-deps --all-features -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
-          .github/tools/github_actions_run_cargo clippy --lib --bins --examples --no-deps --all-features -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_platform_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
-          .github/tools/github_actions_run_cargo clippy --lib --bins --examples --no-deps --all-features -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_platform_lvbs_isr/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
       - name: cargo build 
         run: |
           .github/tools/github_actions_run_cargo build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
-          .github/tools/github_actions_run_cargo build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_platform_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
-          .github/tools/github_actions_run_cargo build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_platform_lvbs_isr/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
-      - name: cargo nextest
-        run: |
-          .github/tools/github_actions_run_cargo nextest --no-tests=pass --manifest-path=litebox_platform_lvbs/Cargo.toml
       - name: cargo test --doc
         run: |
           .github/tools/github_actions_run_cargo test --doc -Zdoctest-xcompile -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
-          .github/tools/github_actions_run_cargo test --doc -Zdoctest-xcompile -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_platform_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
-          .github/tools/github_actions_run_cargo test --doc -Zdoctest-xcompile -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_platform_lvbs_isr/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
           # We need to run `cargo test --doc` separately because doc tests
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
-          #
-          # sanghle: I'll to change the directory structure of LVBS later to simplify CI
 
   confirm_no_std:
     name: Confirm no_std
@@ -178,7 +162,6 @@ jobs:
             -not -path './Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
             -not -path './litebox_platform_lvbs/Cargo.toml' \
-            -not -path './litebox_platform_lvbs_isr/Cargo.toml' \
             -not -path './litebox_platform_multiplex/Cargo.toml' \
             -not -path './litebox_runner_linux_userland/Cargo.toml' \
             -not -path './litebox_runner_lvbs/Cargo.toml' \
