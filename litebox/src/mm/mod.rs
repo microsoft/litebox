@@ -43,39 +43,41 @@ where
         Self { vmem }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn create_pages<F>(
-        &self,
-        suggested_addr: usize,
-        len: usize,
-        fixed_addr: bool,
-        is_stack: bool,
-        before_perms: MemoryRegionPermissions,
-        after_perms: MemoryRegionPermissions,
-        op: F,
-    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
-    where
-        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
-    {
-        let suggested_range =
-            PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::UnAligned)?;
-        let mut vmem = self.vmem.write();
-        unsafe {
-            vmem.create_pages(
-                suggested_range,
-                fixed_addr,
-                is_stack,
-                before_perms,
-                after_perms,
-                op,
-            )
-        }
-    }
+    // #[allow(clippy::too_many_arguments)]
+    // fn create_pages<F>(
+    //     &self,
+    //     suggested_addr: usize,
+    //     len: usize,
+    //     fixed_addr: bool,
+    //     is_stack: bool,
+    //     before_perms: MemoryRegionPermissions,
+    //     after_perms: MemoryRegionPermissions,
+    //     op: F,
+    // ) -> Result<Platform::RawMutPointer<u8>, MappingError>
+    // where
+    //     F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
+    // {
+    //     let suggested_range =
+    //         PageRange::new(suggested_addr, suggested_addr + len).ok_or(MappingError::UnAligned)?;
+    //     let mut vmem = self.vmem.write();
+    //     unsafe {
+    //         vmem.create_pages(
+    //             suggested_range,
+    //             fixed_addr,
+    //             is_stack,
+    //             before_perms,
+    //             after_perms,
+    //             op,
+    //         )
+    //     }
+    // }
 
     /// Create readable and executable pages.
     ///
-    /// `suggested_addr` is the hint address where to create the pages. Provide `0` to let the kernel
-    /// choose an available memory region.
+    /// The start address of `suggested_range` is the hint address where to create the pages.
+    /// Provide `0` to let the kernel choose an available memory region.
+    /// The length of `suggested_range` is the size of the pages to be created.
+    ///
     ///
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
     /// existing overlapping mappings being removed.
@@ -89,31 +91,33 @@ where
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     pub unsafe fn create_executable_pages<F>(
         &self,
-        suggested_addr: usize,
-        len: usize,
+        suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
         op: F,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
-        self.create_pages(
-            suggested_addr,
-            len,
-            fixed_addr,
-            false,
-            // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the code)
-            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-            // keep READ, turn off WRITE and turn on EXEC
-            MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
-            op,
-        )
+        let mut vmem = self.vmem.write();
+        unsafe {
+            vmem.create_pages(
+                suggested_range,
+                fixed_addr,
+                false,
+                // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the code)
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                // keep READ, turn off WRITE and turn on EXEC
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+                op,
+            )
+        }
     }
 
     /// Create readable and writable pages.
     ///
-    /// `suggested_addr` is the hint address where to create the pages. Provide `0` to let the kernel
-    /// choose an available memory region.
+    /// The start address of `suggested_range` is the hint address where to create the pages.
+    /// Provide `0` to let the kernel choose an available memory region.
+    /// The length of `suggested_range` is the size of the pages to be created.
     ///
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
     /// existing overlapping mappings being removed.
@@ -127,8 +131,7 @@ where
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     pub unsafe fn create_writable_pages<F>(
         &self,
-        suggested_addr: usize,
-        len: usize,
+        suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
         op: F,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError>
@@ -136,13 +139,15 @@ where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-        self.create_pages(suggested_addr, len, fixed_addr, false, perms, perms, op)
+        let mut vmem = self.vmem.write();
+        unsafe { vmem.create_pages(suggested_range, fixed_addr, false, perms, perms, op) }
     }
 
     /// Create read-only pages.
     ///
-    /// `suggested_addr` is the hint address where to create the pages. Provide `0` to let the kernel
-    /// choose an available memory region.
+    /// The start address of `suggested_range` is the hint address where to create the pages.
+    /// Provide `0` to let the kernel choose an available memory region.
+    /// The length of `suggested_range` is the size of the pages to be created.
     ///
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
     /// existing overlapping mappings being removed.
@@ -156,31 +161,33 @@ where
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     pub unsafe fn create_readable_pages<F>(
         &self,
-        suggested_addr: usize,
-        len: usize,
+        suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
         op: F,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
-        self.create_pages(
-            suggested_addr,
-            len,
-            fixed_addr,
-            false,
-            // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the data)
-            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-            // kepp READ, turn off WRITE
-            MemoryRegionPermissions::READ,
-            op,
-        )
+        let mut vmem = self.vmem.write();
+        unsafe {
+            vmem.create_pages(
+                suggested_range,
+                fixed_addr,
+                false,
+                // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the data)
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                // kepp READ, turn off WRITE
+                MemoryRegionPermissions::READ,
+                op,
+            )
+        }
     }
 
     /// Create inaccessible pages.
     ///
-    /// `suggested_addr` is the hint address where to create the pages. Provide `0` to let the kernel
-    /// choose an available memory region.
+    /// The start address of `suggested_range` is the hint address where to create the pages.
+    /// Provide `0` to let the kernel choose an available memory region.
+    /// The length of `suggested_range` is the size of the pages to be created.
     ///
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
     /// existing overlapping mappings being removed.
@@ -194,29 +201,31 @@ where
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     pub unsafe fn create_inaccessible_pages<F>(
         &self,
-        suggested_addr: usize,
-        len: usize,
+        suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
         op: F,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
-        self.create_pages(
-            suggested_addr,
-            len,
-            fixed_addr,
-            false,
-            MemoryRegionPermissions::empty(),
-            MemoryRegionPermissions::empty(),
-            op,
-        )
+        let mut vmem = self.vmem.write();
+        unsafe {
+            vmem.create_pages(
+                suggested_range,
+                fixed_addr,
+                false,
+                MemoryRegionPermissions::empty(),
+                MemoryRegionPermissions::empty(),
+                op,
+            )
+        }
     }
 
     /// Create stack pages.
     ///
-    /// `suggested_addr` is the hint address where to create the pages. Provide `0` to let the kernel
-    /// choose an available memory region.
+    /// The start address of `suggested_range` is the hint address where to create the pages.
+    /// Provide `0` to let the kernel choose an available memory region.
+    /// The length of `suggested_range` is the size of the pages to be created.
     ///
     /// # Safety
     ///
@@ -225,14 +234,12 @@ where
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     pub unsafe fn create_stack_pages(
         &self,
-        suggested_addr: usize,
-        len: usize,
+        suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-        self.create_pages(suggested_addr, len, fixed_addr, true, perms, perms, |_| {
-            Ok(0)
-        })
+        let mut vmem = self.vmem.write();
+        unsafe { vmem.create_pages(suggested_range, fixed_addr, true, perms, perms, |_| Ok(0)) }
     }
 
     /// Expands (or shrinks) an existing memory mapping

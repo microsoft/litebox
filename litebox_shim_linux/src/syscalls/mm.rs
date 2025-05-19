@@ -13,11 +13,13 @@ const PAGE_SHIFT: usize = PAGE_SIZE.trailing_zeros() as usize;
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
     (addr + align - 1) & !(align - 1)
 }
 
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
     addr & !(align - 1)
 }
 
@@ -30,19 +32,21 @@ fn do_mmap(
 ) -> Result<MutPtr<u8>, MappingError> {
     let fixed_addr = flags.contains(MapFlags::MAP_FIXED);
     let suggested_addr = addr.unwrap_or(0);
+    let suggested_range = litebox::mm::linux::PageRange::new(suggested_addr, suggested_addr + len)
+        .ok_or(MappingError::UnAligned)?;
     let pm = litebox_page_manager();
     match prot {
         ProtFlags::PROT_READ_EXEC => unsafe {
-            pm.create_executable_pages(suggested_addr, len, fixed_addr, op)
+            pm.create_executable_pages(suggested_range, fixed_addr, op)
         },
         ProtFlags::PROT_READ_WRITE => unsafe {
-            pm.create_writable_pages(suggested_addr, len, fixed_addr, op)
+            pm.create_writable_pages(suggested_range, fixed_addr, op)
         },
         ProtFlags::PROT_READ => unsafe {
-            pm.create_readable_pages(suggested_addr, len, fixed_addr, op)
+            pm.create_readable_pages(suggested_range, fixed_addr, op)
         },
         ProtFlags::PROT_NONE => unsafe {
-            pm.create_inaccessible_pages(suggested_addr, len, fixed_addr, op)
+            pm.create_inaccessible_pages(suggested_range, fixed_addr, op)
         },
         _ => todo!("Unsupported prot flags {:?}", prot),
     }
