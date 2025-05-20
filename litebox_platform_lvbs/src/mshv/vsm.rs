@@ -253,11 +253,11 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> u64 {
     if let Some(heki_page) =
         unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(pa)) }
     {
-        for i in 0..nranges {
-            let va = heki_page.ranges[i as usize].va;
-            let pa = heki_page.ranges[i as usize].pa;
-            let epa = heki_page.ranges[i as usize].epa;
-            let attr = heki_page.ranges[i as usize].attributes;
+        for i in 0..usize::try_from(nranges).unwrap() {
+            let va = heki_page.ranges[i].va;
+            let pa = heki_page.ranges[i].pa;
+            let epa = heki_page.ranges[i].epa;
+            let attr = heki_page.ranges[i].attributes;
             debug_serial_println!(
                 "heki_page: range {i}: va {:#x} pa {:#x} epa {:#x} attr {:#x}",
                 va,
@@ -365,15 +365,20 @@ pub fn vsm_handle_intercept() -> u64 {
 
     let msg_type = unsafe { (*simp_page).sint_message[0].header.message_type };
 
-    debug_serial_println!(
-        "Synthetic interrupt: {:?}",
-        HvMessageType::try_from(msg_type).unwrap_or(HvMessageType::Unknown)
-    );
-
     match HvMessageType::try_from(msg_type).unwrap() {
-        HvMessageType::RegisterIntercept | HvMessageType::MsrIntercept => {}
-        HvMessageType::GpaIntercept => {}
-        _ => {}
+        HvMessageType::GpaIntercept => {
+            debug_serial_println!("VSM: GPA intercept");
+        }
+        HvMessageType::RegisterIntercept | HvMessageType::MsrIntercept => {
+            debug_serial_println!("VSM: Register intercept");
+        }
+        _ => {
+            serial_println!(
+                "VSM: Unknown synthetic interrupt message type {:#x}",
+                msg_type
+            );
+            return 1;
+        }
     }
 
     unsafe {
