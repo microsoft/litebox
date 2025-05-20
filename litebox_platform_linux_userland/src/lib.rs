@@ -582,12 +582,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         range: std::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
+        populate_pages: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let flags = MapFlags::MAP_PRIVATE
             | MapFlags::MAP_ANONYMOUS
             | MapFlags::MAP_FIXED
             | (if can_grow_down {
                 MapFlags::MAP_GROWSDOWN
+            } else {
+                MapFlags::empty()
+            } | if populate_pages {
+                MapFlags::MAP_POPULATE
             } else {
                 MapFlags::empty()
             });

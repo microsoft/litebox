@@ -130,23 +130,13 @@ fn check_flags(
 
 fn get_test_pgtable<'a>(
     range: PageRange<PAGE_SIZE>,
-    fault_flags: PageTableFlags,
+    flags: VmFlags,
 ) -> X64PageTable<'a, MockKernel, PAGE_SIZE> {
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
     let pgtable = unsafe { X64PageTable::<MockKernel, PAGE_SIZE>::init(p4.start_address()) };
+    pgtable.map_pages(range, flags, true);
 
-    for page in range {
-        unsafe {
-            pgtable
-                .handle_page_fault(
-                    Page::containing_address(VirtAddr::new(page as _)),
-                    fault_flags,
-                    PageFaultErrorCode::USER_MODE,
-                )
-                .unwrap();
-        }
-    }
-
+    let fault_flags = vmflags_to_pteflags(flags) | PageTableFlags::PRESENT;
     for page in range {
         check_flags(&pgtable, page, fault_flags);
     }
@@ -160,7 +150,7 @@ fn test_page_table() {
     let vmflags = VmFlags::VM_READ;
     let pteflags = vmflags_to_pteflags(vmflags) | PageTableFlags::PRESENT;
     let range = PageRange::new(start_addr, start_addr + 4 * PAGE_SIZE).unwrap();
-    let pgtable = get_test_pgtable(range, pteflags);
+    let pgtable = get_test_pgtable(range, vmflags);
 
     // update flags
     let new_vmflags = VmFlags::empty();
@@ -229,6 +219,7 @@ fn test_vmm_page_fault() {
             vmm.create_writable_pages(
                 PageRange::new(start_addr, start_addr + 4 * PAGE_SIZE).unwrap(),
                 true,
+                false,
                 |_: UserMutPtr<u8>| Ok(0),
             )
             .unwrap()
@@ -267,6 +258,7 @@ fn test_vmm_page_fault() {
             vmm.create_stack_pages(
                 PageRange::new(stack_addr, stack_addr + 4 * PAGE_SIZE).unwrap(),
                 true,
+                false,
             )
             .unwrap()
             .as_usize(),
