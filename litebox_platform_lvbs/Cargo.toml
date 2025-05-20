@@ -14,6 +14,10 @@ spin = { version = "0.10.0", default-features = false, features = [
   "spin_mutex",
   "once",
 ] }
+libc = "0.2.169"
+arrayvec = { version = "0.7.6", default-features = false }
+rangemap = { version = "1.5.1", features = ["const_fn"] }
+thiserror = { version = "2.0.6", default-features = false }
 num_enum = { version = "0.7.3", default-features = false }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
 
