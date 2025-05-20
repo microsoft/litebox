@@ -13,7 +13,7 @@ use litebox::mm::linux::PageRange;
 use litebox::platform::page_mgmt::DeallocationError;
 use litebox::platform::{
     DebugLogProvider, ExitProvider, IPInterfaceProvider, ImmediatelyWokenUp,
-    PageManagementProvider, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
+    PageManagementProvider, RawMutexProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
 };
 use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::errno::Errno;
@@ -159,8 +159,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             self.unmap_vtl0_pages(
                 PageRange::<PAGE_SIZE>::new(
                     addr as usize,
-                    (addr as usize)
-                        + ((core::mem::size_of::<T>() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1))
+                    (addr as usize + core::mem::size_of::<T>()).next_multiple_of(PAGE_SIZE)
                         + PAGE_SIZE,
                 )
                 .unwrap(),
@@ -203,8 +202,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             self.unmap_vtl0_pages(
                 PageRange::<PAGE_SIZE>::new(
                     addr as usize,
-                    (addr as usize)
-                        + ((core::mem::size_of::<T>() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1))
+                    (addr as usize + core::mem::size_of::<T>()).next_multiple_of(PAGE_SIZE)
                         + PAGE_SIZE,
                 )
                 .unwrap(),
@@ -526,6 +524,24 @@ impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKern
 
     fn access_error(error_code: u64, flags: litebox::mm::linux::VmFlags) -> bool {
         mm::PageTable::<PAGE_SIZE>::access_error(error_code, flags)
+    }
+}
+
+impl<Host: HostInterface> StdioProvider for LinuxKernel<Host> {
+    fn read_from_stdin(&self, _buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
+        unimplemented!()
+    }
+
+    fn write_to(
+        &self,
+        _stream: litebox::platform::StdioOutStream,
+        _buf: &[u8],
+    ) -> Result<usize, litebox::platform::StdioWriteError> {
+        unimplemented!()
+    }
+
+    fn is_a_tty(&self, _stream: litebox::platform::StdioStream) -> bool {
+        unimplemented!()
     }
 }
 

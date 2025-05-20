@@ -19,7 +19,7 @@ use crate::{
         VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY, VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT,
         VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE, VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags,
         X86Cr4Flags,
-        heki::{HekiPage, HekiRange},
+        heki::HekiPage,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_set_vp_registers, init_vtl_aps},
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},

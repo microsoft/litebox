@@ -4,7 +4,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use alloc::sync::{Arc, Weak};
-use litebox::{fs::OFlags, sync::Synchronization};
+use litebox::{LiteBox, fs::OFlags};
 use litebox_common_linux::errno::Errno;
 use litebox_platform_multiplex::Platform;
 use ringbuf::{
@@ -18,9 +18,9 @@ struct EndPointer<T> {
 }
 
 impl<T> EndPointer<T> {
-    pub fn new(rb: T, platform: &'static Platform) -> Self {
+    pub fn new(rb: T, litebox: &LiteBox<Platform>) -> Self {
         Self {
-            rb: Synchronization::new(platform).new_mutex(rb),
+            rb: litebox.sync().new_mutex(rb),
             is_shutdown: AtomicBool::new(false),
         }
     }
@@ -51,22 +51,6 @@ macro_rules! common_functions_for_channel {
                 true
             }
         }
-
-        pub(crate) fn get_status(&self) -> OFlags {
-            OFlags::from_bits(self.status.load(core::sync::atomic::Ordering::Relaxed)).unwrap()
-        }
-
-        pub(crate) fn set_status(&self, flag: OFlags, on: bool) {
-            if on {
-                self.status
-                    .fetch_or(flag.bits(), core::sync::atomic::Ordering::Relaxed);
-            } else {
-                self.status.fetch_and(
-                    flag.complement().bits(),
-                    core::sync::atomic::Ordering::Relaxed,
-                );
-            }
-        }
     };
 }
 
@@ -78,11 +62,11 @@ pub(crate) struct Producer<T> {
 }
 
 impl<T> Producer<T> {
-    fn new(rb: HeapProd<T>, flags: OFlags, platform: &'static Platform) -> Self {
+    fn new(rb: HeapProd<T>, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
         Self {
-            endpoint: EndPointer::new(rb, platform),
+            endpoint: EndPointer::new(rb, litebox),
             peer: Weak::new(),
-            status: AtomicU32::new((flags & OFlags::STATUS_FLAGS_MASK).bits()),
+            status: AtomicU32::new((flags | OFlags::WRONLY).bits()),
         }
     }
 
@@ -105,11 +89,11 @@ impl<T> Producer<T> {
         }
     }
 
-    pub(crate) fn write(&self, buf: &[T], is_nonblocking: bool) -> Result<usize, Errno>
+    pub(crate) fn write(&self, buf: &[T]) -> Result<usize, Errno>
     where
         T: Copy,
     {
-        if is_nonblocking {
+        if self.get_status().contains(OFlags::NONBLOCK) {
             self.try_write(buf)
         } else {
             // TODO: use poll rather than busy wait
@@ -124,6 +108,7 @@ impl<T> Producer<T> {
     }
 
     common_functions_for_channel!();
+    crate::syscalls::common_functions_for_file_status!();
 }
 
 impl<T> Drop for Producer<T> {
@@ -139,11 +124,11 @@ pub(crate) struct Consumer<T> {
 }
 
 impl<T> Consumer<T> {
-    fn new(rb: HeapCons<T>, flags: OFlags, platform: &'static Platform) -> Self {
+    fn new(rb: HeapCons<T>, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
         Self {
-            endpoint: EndPointer::new(rb, platform),
+            endpoint: EndPointer::new(rb, litebox),
             peer: Weak::new(),
-            status: AtomicU32::new((flags & OFlags::STATUS_FLAGS_MASK).bits()),
+            status: AtomicU32::new((flags | OFlags::RDONLY).bits()),
         }
     }
 
@@ -171,11 +156,11 @@ impl<T> Consumer<T> {
         }
     }
 
-    pub(crate) fn read(&self, buf: &mut [T], is_nonblocking: bool) -> Result<usize, Errno>
+    pub(crate) fn read(&self, buf: &mut [T]) -> Result<usize, Errno>
     where
         T: Copy,
     {
-        if is_nonblocking {
+        if self.get_status().contains(OFlags::NONBLOCK) {
             self.try_read(buf)
         } else {
             // TODO: use poll rather than busy wait
@@ -190,6 +175,7 @@ impl<T> Consumer<T> {
     }
 
     common_functions_for_channel!();
+    crate::syscalls::common_functions_for_file_status!();
 }
 
 impl<T> Drop for Consumer<T> {
@@ -207,17 +193,17 @@ pub(crate) struct Channel<T> {
 
 impl<T> Channel<T> {
     /// Creates a new channel with the given capacity and flags.
-    pub(crate) fn new(capacity: usize, flags: OFlags, platform: &'static Platform) -> Self {
+    pub(crate) fn new(capacity: usize, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
         let rb: HeapRb<T> = HeapRb::new(capacity);
         let (rb_prod, rb_cons) = rb.split();
 
         // Create the producer and consumer, and set up cyclic references.
-        let mut producer = Arc::new(Producer::new(rb_prod, flags, platform));
+        let mut producer = Arc::new(Producer::new(rb_prod, flags, litebox));
         let consumer = Arc::new_cyclic(|weak_self| {
             // Producer has no other references as it is just created.
             // So we can safely get a mutable reference to it.
             Arc::get_mut(&mut producer).unwrap().peer = weak_self.clone();
-            let mut consumer = Consumer::new(rb_cons, flags, platform);
+            let mut consumer = Consumer::new(rb_cons, flags, litebox);
             consumer.peer = Arc::downgrade(&producer);
             consumer
         });
@@ -237,31 +223,26 @@ impl<T> Channel<T> {
 
 #[cfg(test)]
 mod tests {
-    use litebox::platform::trivial_providers::ImpossiblePunchthroughProvider;
     use litebox_common_linux::errno::Errno;
     use litebox_platform_multiplex::{Platform, set_platform};
 
     extern crate std;
 
     fn init_platform() {
-        set_platform(Platform::new(None, ImpossiblePunchthroughProvider {}));
+        set_platform(Platform::new(None));
     }
 
     #[test]
     fn test_blocking_channel() {
         init_platform();
 
-        let (prod, cons) = super::Channel::<u8>::new(
-            2,
-            litebox::fs::OFlags::empty(),
-            litebox_platform_multiplex::platform(),
-        )
-        .split();
+        let (prod, cons) =
+            super::Channel::<u8>::new(2, litebox::fs::OFlags::empty(), crate::litebox()).split();
         std::thread::spawn(move || {
             let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
             let mut i = 0;
             while i < data.len() {
-                let ret = prod.write(&data[i..], false).unwrap();
+                let ret = prod.write(&data[i..]).unwrap();
                 i += ret;
             }
             prod.shutdown();
@@ -271,7 +252,7 @@ mod tests {
         let mut buf = [0; 10];
         let mut i = 0;
         loop {
-            let ret = cons.read(&mut buf[i..], false).unwrap();
+            let ret = cons.read(&mut buf[i..]).unwrap();
             if ret == 0 {
                 cons.shutdown();
                 break;
@@ -285,17 +266,13 @@ mod tests {
     fn test_nonblocking_channel() {
         init_platform();
 
-        let (prod, cons) = super::Channel::<u8>::new(
-            2,
-            litebox::fs::OFlags::empty(),
-            litebox_platform_multiplex::platform(),
-        )
-        .split();
+        let (prod, cons) =
+            super::Channel::<u8>::new(2, litebox::fs::OFlags::NONBLOCK, crate::litebox()).split();
         std::thread::spawn(move || {
             let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
             let mut i = 0;
             while i < data.len() {
-                match prod.write(&data[i..], true) {
+                match prod.write(&data[i..]) {
                     Ok(n) => {
                         i += n;
                     }
@@ -315,7 +292,7 @@ mod tests {
         let mut buf = [0; 10];
         let mut i = 0;
         loop {
-            match cons.read(&mut buf[i..], true) {
+            match cons.read(&mut buf[i..]) {
                 Ok(n) => {
                     if n == 0 {
                         break;

@@ -79,7 +79,10 @@ impl HostInterface for HostLvbsInterface {
     }
 
     fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
-        crate::debug_serial_println!("allocating memory?? layout = {:?}", layout);
+        crate::debug_serial_println!(
+            "dynamic memory allocation is not supported (layout = {:?})",
+            layout
+        );
         None
     }
 
