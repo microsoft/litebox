@@ -20,6 +20,7 @@ pub struct HekiPage {
     pub next_pa: u64,
     pub nranges: u64,
     pub ranges: [HekiRange; HEKI_MAX_RANGES],
+    pad: u64,
 }
 
 impl HekiPage {

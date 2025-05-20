@@ -32,21 +32,19 @@ pub const VTL1_CMDLINE_PAGE: usize = VTL1_BOOT_PARAMS_PAGE + 1;
 pub const VTL1_INIT_HEAP_START_PAGE: usize = 256;
 pub const VTL1_INIT_HEAP_SIZE: usize = 1024 * 1024;
 
-// VTL1 kernel roughly uses 6 MiB of memory (mostly empty, 2 MB aligned)
-// 2 MiB for page tables and other metadata
-// 2 MiB for kernel text
-// 2 MiB for kernel data (static variables, stacks, ...)
-// We can use the rest of the memory (~122 MiB) for the heap
-// pub const PREALLOCATED_AREA_SIZE: usize = 6 * 1024 * 1024;
-pub const PREALLOCATED_AREA_SIZE: usize = 8 * 1024 * 1024;
-
 unsafe extern "C" {
     static _memory_base: u8;
+    static _heap_start: u8;
 }
 
 #[inline]
 pub fn get_memory_base_address() -> u64 {
     &raw const _memory_base as u64
+}
+
+#[inline]
+pub fn get_heap_start_address() -> u64 {
+    &raw const _heap_start as u64
 }
 
 #[inline]

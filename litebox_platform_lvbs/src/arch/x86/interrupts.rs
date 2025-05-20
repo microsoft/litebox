@@ -1,6 +1,6 @@
 //! Interrupt Descriptor Table (IDT)
 
-use crate::{kernel_context, mshv::SYNIC_CUSTOM_VECTOR, serial_println};
+use crate::{mshv::HYPERVISOR_CALLBACK_VECTOR, serial_println};
 use core::ops::IndexMut;
 use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
@@ -23,7 +23,7 @@ fn idt() -> &'static InterruptDescriptorTable {
         idt.general_protection_fault
             .set_handler_fn(general_protection_fault_handler);
 
-        idt.index_mut(SYNIC_CUSTOM_VECTOR)
+        idt.index_mut(HYPERVISOR_CALLBACK_VECTOR)
             .set_handler_fn(hyperv_sint_handler);
 
         idt
@@ -37,11 +37,13 @@ pub fn init_idt() {
 
 extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: DIVIDE BY ZERO\n{:#?}", stack_frame);
+    #[cfg(debug_assertions)]
     panic!("Divide by zero");
 }
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
+    #[cfg(debug_assertions)]
     panic!("Breakpoint");
 }
 
@@ -57,8 +59,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) {
-    serial_println!("EXCEPTION: GENERAL PROTECTION FAULT\n{:#?}", stack_frame);
-    panic!("General protection fault");
+    panic!("EXCEPTION: GENERAL PROTECTION FAULT\n{:#?}", stack_frame);
 }
 
 extern "x86-interrupt" fn page_fault_handler(
@@ -73,6 +74,8 @@ extern "x86-interrupt" fn page_fault_handler(
         error_code,
         stack_frame
     );
+    #[cfg(debug_assertions)]
+    panic!("Page fault");
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
@@ -83,20 +86,12 @@ extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFram
         Cr2::read(),
         stack_frame
     );
+    #[cfg(debug_assertions)]
     panic!("Invalid opcode");
 }
 
 extern "x86-interrupt" fn hyperv_sint_handler(_stack_frame: InterruptStackFrame) {
-    serial_println!("EXCEPTION: HYPERV SINT");
-
-    let kernel_context = kernel_context::get_per_core_kernel_context();
-    let simp_page = kernel_context.hv_simp_page_as_mut_ptr();
-
-    unsafe {
-        if (*simp_page).sint_message[0].header.message_type != 0 {
-            serial_println!("SINT MESSAGE: {:?}", (*simp_page).sint_message[0].header);
-            (*simp_page).sint_message[0].header.message_type = 0;
-        }
-    }
-    panic!("Hyper-V SINT handler");
+    // Hyper-V invokes this handler when a syntethic interrupt occurs.
+    // Instead of implementing this handler, we let it return to the VTL switch loop
+    // (i.e., the current RIP) immediately and handle synthethic interrupts there.
 }

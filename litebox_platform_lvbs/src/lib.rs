@@ -2,7 +2,7 @@
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
-#![feature(abi_x86_interrupt)]
+#![cfg_attr(feature = "interrupt", feature(abi_x86_interrupt))]
 
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use core::sync::atomic::AtomicU64;
@@ -18,7 +18,9 @@ use litebox::platform::{
 use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::errno::Errno;
 use ptr::{UserConstPtr, UserMutPtr};
-use x86_64::structures::paging::{PhysFrame, Size4KiB, frame::PhysFrameRange, mapper::MapToError};
+use x86_64::structures::paging::{
+    PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange, mapper::MapToError,
+};
 
 extern crate alloc;
 
@@ -67,7 +69,11 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         let physframe_start = PhysFrame::containing_address(phys_start);
         let physframe_end = PhysFrame::containing_address(phys_end);
         if pt
-            .map_phys_frame_range(PhysFrame::range(physframe_start, physframe_end), true)
+            .map_phys_frame_range(
+                PhysFrame::range(physframe_start, physframe_end),
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                true,
+            )
             .is_err()
         {
             panic!("Failed to map VTL1 physical memory");
@@ -94,18 +100,21 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         &self,
         phys_start: x86_64::PhysAddr,
         phys_end: x86_64::PhysAddr,
+        flags: PageTableFlags,
     ) -> Result<*mut u8, MapToError<Size4KiB>> {
         let frame_range = PhysFrame::range(
             PhysFrame::containing_address(phys_start),
             PhysFrame::containing_address(phys_end),
         );
-        if frame_range.end < self.vtl1_phys_frame_range.start
-            || frame_range.start > self.vtl1_phys_frame_range.end
+
+        if frame_range.start < self.vtl1_phys_frame_range.end
+            && self.vtl1_phys_frame_range.start < frame_range.end
         {
-            self.page_table.map_phys_frame_range(frame_range, false)
-        } else {
-            Err(MapToError::FrameAllocationFailed)
+            return Err(MapToError::FrameAllocationFailed);
         }
+
+        self.page_table
+            .map_phys_frame_range(frame_range, flags, false)
     }
 
     /// This unmaps VTL0 pages from the page table. Allocator does not allocate frames
@@ -131,39 +140,34 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ) -> Option<alloc::boxed::Box<T>> {
         use alloc::boxed::Box;
 
-        if phys_addr + core::mem::size_of::<T>().try_into().unwrap()
-            < self.vtl1_phys_frame_range.start.start_address()
-            || phys_addr > self.vtl1_phys_frame_range.end.start_address()
-        {
-            if let Ok(addr) = self.map_vtl0_phys_range(
-                phys_addr,
-                phys_addr
-                    + core::mem::size_of::<T>().try_into().unwrap()
-                    + PAGE_SIZE.try_into().unwrap(),
-            ) {
-                let offset = usize::try_from(phys_addr.as_u64()).unwrap() % PAGE_SIZE;
-                let raw = Box::into_raw(Box::new(core::mem::MaybeUninit::<T>::uninit()));
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        addr.wrapping_add(offset) as *const T,
-                        (*raw).as_mut_ptr(),
-                        1,
-                    );
-                }
+        if let Ok(addr) = self.map_vtl0_phys_range(
+            phys_addr,
+            phys_addr + u64::try_from(core::mem::size_of::<T>() + PAGE_SIZE).unwrap(),
+            PageTableFlags::PRESENT,
+        ) {
+            let offset = usize::try_from(phys_addr.as_u64()).unwrap() % PAGE_SIZE;
+            let raw = Box::into_raw(Box::new(core::mem::MaybeUninit::<T>::uninit()));
 
-                self.unmap_vtl0_pages(
-                    PageRange::<PAGE_SIZE>::new(
-                        addr as usize,
-                        (addr as usize)
-                            + ((core::mem::size_of::<T>() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1))
-                            + PAGE_SIZE,
-                    )
-                    .unwrap(),
-                )
-                .unwrap();
-
-                return Some(unsafe { Box::from_raw((*raw).as_mut_ptr()) });
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    addr.wrapping_add(offset) as *const T,
+                    (*raw).as_mut_ptr(),
+                    1,
+                );
             }
+
+            self.unmap_vtl0_pages(
+                PageRange::<PAGE_SIZE>::new(
+                    addr as usize,
+                    (addr as usize)
+                        + ((core::mem::size_of::<T>() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1))
+                        + PAGE_SIZE,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+            return Some(unsafe { Box::from_raw((*raw).as_mut_ptr()) });
         }
 
         None
@@ -182,38 +186,32 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         phys_addr: x86_64::PhysAddr,
         value: &T,
     ) -> bool {
-        if phys_addr + core::mem::size_of::<T>().try_into().unwrap()
-            < self.vtl1_phys_frame_range.start.start_address()
-            || phys_addr > self.vtl1_phys_frame_range.end.start_address()
-        {
-            if let Ok(addr) = self.map_vtl0_phys_range(
-                phys_addr,
-                phys_addr
-                    + core::mem::size_of::<T>().try_into().unwrap()
-                    + PAGE_SIZE.try_into().unwrap(),
-            ) {
-                let offset = usize::try_from(phys_addr.as_u64()).unwrap() % PAGE_SIZE;
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        core::ptr::from_ref::<T>(value),
-                        addr.wrapping_add(offset).cast::<T>(),
-                        1,
-                    );
-                }
-
-                self.unmap_vtl0_pages(
-                    PageRange::<PAGE_SIZE>::new(
-                        addr as usize,
-                        (addr as usize)
-                            + ((core::mem::size_of::<T>() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1))
-                            + PAGE_SIZE,
-                    )
-                    .unwrap(),
-                )
-                .unwrap();
-
-                return true;
+        if let Ok(addr) = self.map_vtl0_phys_range(
+            phys_addr,
+            phys_addr + u64::try_from(core::mem::size_of::<T>() + PAGE_SIZE).unwrap(),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        ) {
+            let offset = usize::try_from(phys_addr.as_u64()).unwrap() % PAGE_SIZE;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    core::ptr::from_ref::<T>(value),
+                    addr.wrapping_add(offset).cast::<T>(),
+                    1,
+                );
             }
+
+            self.unmap_vtl0_pages(
+                PageRange::<PAGE_SIZE>::new(
+                    addr as usize,
+                    (addr as usize)
+                        + ((core::mem::size_of::<T>() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1))
+                        + PAGE_SIZE,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+            return true;
         }
 
         false

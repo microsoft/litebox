@@ -279,10 +279,10 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     pub(crate) fn map_phys_frame_range(
         &self,
         frame_range: PhysFrameRange<Size4KiB>,
+        flags: PageTableFlags,
         is_vtl1: bool,
     ) -> Result<*mut u8, MapToError<Size4KiB>> {
         let mut allocator = PageTableAllocator::<M>::new();
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
 
         crate::debug_serial_println!("mapping {frame_range:?}");
 

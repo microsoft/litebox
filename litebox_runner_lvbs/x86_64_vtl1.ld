@@ -17,27 +17,24 @@ SECTIONS
         KEEP(*(.text._start))
         *(.text .text.*)
         *(.got)
+
+        . = ALIGN(0x1000);
+        _hypercall_page_start = .;
+        KEEP(*(.hypercall_page))
+        _hypercall_page_end = .;
+
         _text_end = .;
     }
     .data : ALIGN(0x200000) { 
         _data_start = .;
         *(.rodata .rodata.*)
         *(.data .data.*)
+        _data_end = .;
 
         . = ALIGN(0x1000);
-        _hypercall_page = . ;
-
-        _data_end = .;
-    }
-    .bss : ALIGN(0x200000) {
         _bss_start = .;
         *(.bss .bss.*)
         _bss_end = .;
-    }
-    .rela : ALIGN(0x200000) {
-        _rela_start = .;
-        *(.rela .rela.* )
-        _rela_end = .;
     }
 
     . = ALIGN(0x1000);

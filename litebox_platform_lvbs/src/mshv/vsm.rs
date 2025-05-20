@@ -6,18 +6,20 @@ use crate::{
         bootparam::{get_num_possible_cpus, get_vtl1_memory_info},
         linux::CpuMask,
     },
-    kernel_context::get_core_id,
+    kernel_context::{self, get_core_id},
     mshv::{
         HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
         HV_REGISTER_CR_INTERCEPT_CR4_MASK, HV_REGISTER_VSM_PARTITION_CONFIG,
         HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HV_SECURE_VTL_BOOT_TOKEN, HvCrInterceptControlFlags,
-        HvPageProtFlags, HvRegisterVsmPartitionConfig, HvRegisterVsmVpSecureVtlConfig,
-        VSM_VTL_CALL_FUNC_ID_BOOT_APS, VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY,
-        VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL, VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT,
-        VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE, VSM_VTL_CALL_FUNC_ID_LOAD_KDATA,
-        VSM_VTL_CALL_FUNC_ID_LOCK_REGS, VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY,
-        VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT, VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE,
-        VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags, X86Cr4Flags,
+        HvMessageType, HvPageProtFlags, HvRegisterVsmPartitionConfig,
+        HvRegisterVsmVpSecureVtlConfig, VSM_VTL_CALL_FUNC_ID_BOOT_APS,
+        VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY, VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL,
+        VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT, VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE,
+        VSM_VTL_CALL_FUNC_ID_LOAD_KDATA, VSM_VTL_CALL_FUNC_ID_LOCK_REGS,
+        VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY, VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT,
+        VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE, VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags,
+        X86Cr4Flags,
+        heki::{HekiPage, HekiRange},
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_set_vp_registers, init_vtl_aps},
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
@@ -30,11 +32,13 @@ use num_enum::TryFromPrimitive;
 pub const NUM_VTLCALL_PARAMS: usize = 4;
 
 pub fn init() {
-    if get_core_id() == 0 {
-        mshv_vsm_configure_partition();
+    if get_core_id() == 0 && mshv_vsm_configure_partition() != 0 {
+        return;
     }
 
-    mshv_vsm_secure_config_vtl0();
+    if mshv_vsm_secure_config_vtl0() != 0 {
+        return;
+    }
 
     if get_core_id() == 0 {
         if let Ok((start, size)) = get_vtl1_memory_info() {
@@ -195,7 +199,8 @@ pub fn mshv_vsm_lock_regs() -> u64 {
         | HvCrInterceptControlFlags::MSR_SYSENTER_CS_WRITE.bits()
         | HvCrInterceptControlFlags::MSR_SYSENTER_ESP_WRITE.bits()
         | HvCrInterceptControlFlags::MSR_SYSENTER_EIP_WRITE.bits()
-        | HvCrInterceptControlFlags::MSR_SFMASK_WRITE.bits();
+        | HvCrInterceptControlFlags::MSR_SFMASK_WRITE.bits()
+        | HvCrInterceptControlFlags::MSR_LSTAR_READ.bits(); // for SynIC testing
 
     if let Err(result) = hvcall_set_vp_registers(HV_REGISTER_CR_INTERCEPT_CONTROL, flag, 0) {
         serial_println!("Err: {:?}", result);
@@ -241,9 +246,30 @@ pub fn mshv_vsm_protect_memory(_pa: u64, _nranges: u64) -> u64 {
 }
 
 /// VSM function for loading kernel data into VTL1
-pub fn mshv_vsm_load_kdata(_pa: u64, _nranges: u64) -> u64 {
-    debug_serial_println!("VSM: Load kernel data");
+pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> u64 {
+    debug_serial_println!("VSM: Load kernel data {pa:#x} {nranges:?}");
     // TODO: load kernel data
+
+    if let Some(heki_page) =
+        unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(pa)) }
+    {
+        for i in 0..nranges {
+            let va = heki_page.ranges[i as usize].va;
+            let pa = heki_page.ranges[i as usize].pa;
+            let epa = heki_page.ranges[i as usize].epa;
+            let attr = heki_page.ranges[i as usize].attributes;
+            debug_serial_println!(
+                "heki_page: range {i}: va {:#x} pa {:#x} epa {:#x} attr {:#x}",
+                va,
+                pa,
+                epa,
+                attr
+            );
+        }
+    } else {
+        serial_println!("Failed to get pa");
+        return 1;
+    }
     0
 }
 
@@ -331,4 +357,28 @@ pub enum VSMFunction {
     CopySecondaryKey = VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY,
     KexecValidate = VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE,
     Unknown = 0xffff_ffff,
+}
+
+pub fn vsm_handle_intercept() -> u64 {
+    let kernel_context = kernel_context::get_per_core_kernel_context();
+    let simp_page = kernel_context.hv_simp_page_as_mut_ptr();
+
+    let msg_type = unsafe { (*simp_page).sint_message[0].header.message_type };
+
+    debug_serial_println!(
+        "Synthetic interrupt: {:?}",
+        HvMessageType::try_from(msg_type).unwrap_or(HvMessageType::Unknown)
+    );
+
+    match HvMessageType::try_from(msg_type).unwrap() {
+        HvMessageType::RegisterIntercept | HvMessageType::MsrIntercept => {}
+        HvMessageType::GpaIntercept => {}
+        _ => {}
+    }
+
+    unsafe {
+        (*simp_page).sint_message[0].header.message_type = HvMessageType::None.into();
+    }
+
+    0
 }

@@ -140,11 +140,14 @@ pub fn get_per_core_kernel_context() -> &'static mut KernelContext {
 
 // A hypercall page is a shared read-only code page, so it's better not to use heap.
 unsafe extern "C" {
-    static _hypercall_page: u8;
+    static _hypercall_page_start: u8;
 }
+
+#[unsafe(link_section = ".hypercall_page")]
+pub static HYPERCALL_PAGE: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
 
 /// Get the hypercall page address
 #[inline]
 pub fn get_hypercall_page_address() -> u64 {
-    &raw const _hypercall_page as u64
+    &raw const _hypercall_page_start as u64
 }

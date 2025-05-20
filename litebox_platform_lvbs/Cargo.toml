@@ -3,10 +3,6 @@ name = "litebox_platform_lvbs"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-
-[build-dependencies]
-bindgen = "0.71.0"
 
 [dependencies]
 bitflags = "2.9.0"
@@ -18,18 +14,15 @@ spin = { version = "0.10.0", default-features = false, features = [
   "spin_mutex",
   "once",
 ] }
-libc = "0.2.169"
-arrayvec = { version = "0.7.6", default-features = false }
-rangemap = { version = "1.5.1", features = ["const_fn"] }
-thiserror = { version = "2.0.6", default-features = false }
 num_enum = { version = "0.7.3", default-features = false }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-x86_64 = { version = "0.15.2", default-features = false, features = [
-  "abi_x86_interrupt",
-  "instructions",
-] }
+x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
+
+[features]
+default = []
+interrupt = ["x86_64/abi_x86_interrupt"]
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

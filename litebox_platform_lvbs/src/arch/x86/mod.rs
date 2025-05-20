@@ -1,9 +1,11 @@
 pub mod gdt;
 pub mod instrs;
-pub mod interrupts;
 pub mod ioport;
 pub mod mm;
 pub mod msr;
+
+#[cfg(feature = "interrupt")]
+pub mod interrupts;
 
 pub(crate) use x86_64::{
     addr::{PhysAddr, VirtAddr},

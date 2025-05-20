@@ -9,6 +9,7 @@ pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
+use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 pub const HV_HYPERCALL_REP_COMP_MASK: u64 = 0xfff_0000_0000;
 pub const HV_HYPERCALL_REP_COMP_OFFSET: u32 = 32;
@@ -45,7 +46,7 @@ pub const HV_X64_MSR_SIMP: u32 = 0x_4000_0083;
 pub const HV_X64_MSR_SIMP_ENABLE: u32 = 0x_0000_0001;
 pub const HV_X64_MSR_SINT0: u32 = 0x_4000_0090;
 
-pub const SYNIC_CUSTOM_VECTOR: u8 = 0xf0;
+pub const HYPERVISOR_CALLBACK_VECTOR: u8 = 0xf3;
 
 pub const HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS: u32 = 0x_4000_0000;
 pub const HYPERV_CPUID_INTERFACE: u32 = 0x_4000_0001;
@@ -382,58 +383,6 @@ impl Default for HvVpAssistPage {
     }
 }
 
-#[derive(Default, Debug, Clone, Copy)]
-#[repr(C, packed)]
-pub struct HvMessageHeader {
-    pub message_type: u32,
-    pub payload_size: u8,
-    pub message_flags: u16,
-    pub reserved: [u8; 2],
-    pub sender: u64,
-}
-
-impl HvMessageHeader {
-    pub fn new() -> Self {
-        HvMessageHeader {
-            ..Default::default()
-        }
-    }
-}
-
-const HV_MESSAGE_PAYLOAD_QWORD_COUNT: usize = 30;
-
-#[derive(Default, Clone, Copy)]
-#[repr(C, packed)]
-pub struct HvMessage {
-    pub header: HvMessageHeader,
-    pub payload: [u64; HV_MESSAGE_PAYLOAD_QWORD_COUNT],
-}
-
-impl HvMessage {
-    pub fn new() -> Self {
-        HvMessage {
-            header: HvMessageHeader::new(),
-            payload: [0u64; HV_MESSAGE_PAYLOAD_QWORD_COUNT],
-        }
-    }
-}
-
-const HV_SYNIC_SINT_COUNT: usize = 16;
-
-#[derive(Default, Clone, Copy)]
-#[repr(C, packed)]
-pub struct HvMessagePage {
-    pub sint_message: [HvMessage; HV_SYNIC_SINT_COUNT],
-}
-
-impl HvMessagePage {
-    pub fn new() -> Self {
-        HvMessagePage {
-            sint_message: [HvMessage::new(); HV_SYNIC_SINT_COUNT],
-        }
-    }
-}
-
 // We do not support Hyper-V hypercalls with multiple input pages (a large request must be broken down).
 // Thus, the number of maximum GPA pages that each hypercall can protect is restricted like below.
 #[expect(clippy::cast_possible_truncation)]
@@ -500,7 +449,7 @@ impl HvRegisterVsmVpSecureVtlConfig {
     }
 
     #[expect(clippy::used_underscore_binding)]
-    fn set_sub_config(&mut self, shift: u64, mask: u64, value: u64) {
+    fn set_sub_config(&mut self, mask: u64, shift: u64, value: u64) {
         self._as_u64 |= (value << shift) & mask;
     }
 
@@ -732,4 +681,205 @@ bitflags::bitflags! {
 
         const _ = !0;
     }
+}
+
+#[derive(Default, Debug, TryFromPrimitive, IntoPrimitive)]
+#[repr(u32)]
+pub enum HvMessageType {
+    #[default]
+    None = 0x0,
+    UnmappedGpa = 0x8000_0000,
+    GpaIntercept = 0x8000_0001,
+    TimerExpired = 0x8000_0010,
+    InvalidVpRegisterValue = 0x8000_0020,
+    UnrecoverableException = 0x8000_0021,
+    UnsupportedFeature = 0x8000_0022,
+    EventLogBufferComplete = 0x8000_0040,
+    IoPortIntercept = 0x8001_0000,
+    MsrIntercept = 0x8001_0001,
+    CpuidIntercept = 0x8001_0002,
+    ExceptionIntercept = 0x8001_0003,
+    ApicEoi = 0x8001_0004,
+    LegacyFpError = 0x8001_0005,
+    RegisterIntercept = 0x8001_0006,
+    Unknown = 0xffff_ffff,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvMessageHeader {
+    pub message_type: u32,
+    pub payload_size: u8,
+    pub message_flags: u16,
+    pub reserved: [u8; 2],
+    pub sender: u64,
+}
+
+impl HvMessageHeader {
+    pub fn new() -> Self {
+        HvMessageHeader {
+            ..Default::default()
+        }
+    }
+}
+
+const HV_MESSAGE_PAYLOAD_QWORD_COUNT: usize = 30;
+
+#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvMessage {
+    pub header: HvMessageHeader,
+    pub payload: [u64; HV_MESSAGE_PAYLOAD_QWORD_COUNT],
+}
+
+impl HvMessage {
+    pub fn new() -> Self {
+        HvMessage {
+            header: HvMessageHeader::new(),
+            payload: [0u64; HV_MESSAGE_PAYLOAD_QWORD_COUNT],
+        }
+    }
+}
+
+const HV_SYNIC_SINT_COUNT: usize = 16;
+
+#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvMessagePage {
+    pub sint_message: [HvMessage; HV_SYNIC_SINT_COUNT],
+}
+
+impl HvMessagePage {
+    pub fn new() -> Self {
+        HvMessagePage {
+            sint_message: [HvMessage::new(); HV_SYNIC_SINT_COUNT],
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvSynicSint {
+    _as_uint64: u64,
+    // union of
+    // vector: 8;
+    // reserved1: 8;
+    // masked: 1;
+    // auto_eoi: 1;
+    // polling: 1;
+    // reserved2: 45;
+}
+
+impl HvSynicSint {
+    const VECTOR_MASK: u64 = 0xff;
+    const MASKED_MASK: u64 = 0x10000;
+    const AUTO_EOI_MASK: u64 = 0x20000;
+    const POLLING_MASK: u64 = 0x40000;
+    const VECTOR_SHIFT: u64 = 0;
+    const MASKED_SHIFT: u64 = 16;
+    const AUTO_EOI_SHIFT: u64 = 17;
+    const POLLING_SHIFT: u64 = 18;
+
+    pub fn new() -> Self {
+        HvSynicSint {
+            ..Default::default()
+        }
+    }
+
+    #[expect(clippy::used_underscore_binding)]
+    pub fn as_uint64(&self) -> u64 {
+        self._as_uint64
+    }
+
+    #[expect(clippy::used_underscore_binding)]
+    fn set_sub_config(&mut self, mask: u64, shift: u64, value: u64) {
+        self._as_uint64 |= (value << shift) & mask;
+    }
+
+    pub fn set_vector(&mut self, vector: u64) {
+        self.set_sub_config(Self::VECTOR_MASK, Self::VECTOR_SHIFT, vector);
+    }
+
+    pub fn set_masked(&mut self) {
+        self.set_sub_config(Self::MASKED_MASK, Self::MASKED_SHIFT, 1);
+    }
+
+    pub fn set_auto_eoi(&mut self) {
+        self.set_sub_config(Self::AUTO_EOI_MASK, Self::AUTO_EOI_SHIFT, 1);
+    }
+
+    pub fn set_polling(&mut self) {
+        self.set_sub_config(Self::POLLING_MASK, Self::POLLING_SHIFT, 1);
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvInterceptMessageHeader {
+    pub vp_index: u32,
+    pub instruction_length: u8,
+    pub intercept_access_type: u8,
+    pub execution_state: u16,
+    pub cs_segment: HvX64SegmentRegister,
+    pub rip: u64,
+    pub rflags: u64,
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Default, Clone, Copy, PartialEq)]
+    pub struct HvMemoryAccessInfo: u8 {
+        const GVA_VALID = 1 << 0;
+        const GVA_GPA_VALID = 1 << 1;
+        const HYPERCALL_OP_PENDING = 1 << 2;
+        const TLB_BLOCKED = 1 << 3;
+        const SUPERVISOR_SHADOW_STACK = 1 << 4;
+        const VERIFY_PAGE_WR = 1 << 5;
+
+        const _ = !0;
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvMemInterceptMessage {
+    pub hdr: HvInterceptMessageHeader,
+    pub cache_type: u32,
+    pub instruction_byte_count: u8,
+    pub info: HvMemoryAccessInfo,
+    pub tpr_priority: u8,
+    reserved: u8,
+    pub gva: u64,
+    pub gpa: u64,
+    pub instr_bytes: [u8; 16],
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+pub union HvRegisterAccessInfo {
+    pub reg_value_low: u64,
+    pub reg_value_high: u64,
+    pub reg_name: u32,
+    pub src_addr: u64,
+    pub dest_addr: u64,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvInterceptMessage {
+    pub hdr: HvInterceptMessageHeader,
+    pub is_memory_op: u8,
+    reserved_0: u8,
+    reserved_1: u16,
+    pub reg_name: u32,
+    pub info: HvRegisterAccessInfo,
+}
+
+#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvMsrInterceptMessage {
+    pub hdr: HvInterceptMessageHeader,
+    pub msr: u32,
+    reserved_0: u32,
+    pub rdx: u64,
+    pub rax: u64,
 }

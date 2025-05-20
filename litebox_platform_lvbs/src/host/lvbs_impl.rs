@@ -13,7 +13,7 @@ pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
 mod alloc {
     use crate::HostInterface;
 
-    const HEAP_ORDER: usize = 21;
+    const HEAP_ORDER: usize = 23;
     const PGDIR_SHIFT: u64 = 39;
     const LINUX_PAGE_OFFSET: u64 = 0xffff_8880_0000_0000;
     const VTL0_SHARED_PAGE_OFFSET: u64 = LINUX_PAGE_OFFSET + (2 << PGDIR_SHIFT);
@@ -78,8 +78,9 @@ impl HostInterface for HostLvbsInterface {
         serial_print_string(msg);
     }
 
-    fn alloc(_layout: &core::alloc::Layout) -> Option<(usize, usize)> {
-        unimplemented!()
+    fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
+        crate::debug_serial_println!("allocating memory?? layout = {:?}", layout);
+        None
     }
 
     unsafe fn free(_addr: usize) {

@@ -9,8 +9,8 @@ use litebox_platform_lvbs::{
     mshv::{
         hvcall,
         vtl1_mem_layout::{
-            PAGE_SIZE, PREALLOCATED_AREA_SIZE, VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE,
-            VTL1_PML4E_PAGE,
+            PAGE_SIZE, VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE, VTL1_PML4E_PAGE,
+            get_heap_start_address,
         },
     },
     serial_println, set_platform_low,
@@ -49,9 +49,11 @@ pub fn init() {
             // Add the rest of the VTL1 memory to the global allocator once they are mapped to the kernel page table.
             unsafe {
                 Platform::mem_fill_pages(
-                    usize::try_from(Platform::pa_to_va(vtl1_start).as_u64()).unwrap()
-                        + PREALLOCATED_AREA_SIZE,
-                    usize::try_from(size).unwrap() - PREALLOCATED_AREA_SIZE,
+                    usize::try_from(get_heap_start_address()).unwrap(),
+                    usize::try_from(
+                        size - (get_heap_start_address() - Platform::pa_to_va(vtl1_start).as_u64()),
+                    )
+                    .unwrap(),
                 );
             }
         } else {
@@ -59,14 +61,11 @@ pub fn init() {
         }
     }
 
-    // VTL1/hypercall must not be enabled until all other static variables are initialized.
-    // This is because enabling VTL1 will turn all DATA/BSS sections into read-only.
-    // If we must modify some static variables after enabling VTL1, we should modify
-    // corresponding EPT/NPT entries to make them writable.
     if let Err(e) = hvcall::init() {
         panic!("Err: {:?}", e);
     }
     interrupts::init_idt();
+    x86_64::instructions::interrupts::enable();
 }
 
 #[panic_handler]

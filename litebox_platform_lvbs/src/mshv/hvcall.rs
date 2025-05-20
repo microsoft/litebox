@@ -13,11 +13,11 @@ use crate::{
         HV_STATUS_INVALID_PARAMETER, HV_STATUS_INVALID_PORT_ID, HV_STATUS_OPERATION_DENIED,
         HV_STATUS_SUCCESS, HV_STATUS_TIME_OUT, HV_STATUS_VTL_ALREADY_ENABLED,
         HV_X64_MSR_GUEST_OS_ID, HV_X64_MSR_HYPERCALL, HV_X64_MSR_HYPERCALL_ENABLE,
-        HV_X64_MSR_SCONTROL, HV_X64_MSR_SCONTROL_ENABLE, HV_X64_MSR_SIEFP, HV_X64_MSR_SIEFP_ENABLE,
-        HV_X64_MSR_SIMP, HV_X64_MSR_SIMP_ENABLE, HV_X64_MSR_SINT0, HV_X64_MSR_VP_ASSIST_PAGE,
-        HV_X64_MSR_VP_ASSIST_PAGE_ENABLE, HYPERV_CPUID_IMPLEMENT_LIMITS, HYPERV_CPUID_INTERFACE,
-        HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, HYPERV_HYPERVISOR_PRESENT_BIT, SYNIC_CUSTOM_VECTOR,
-        vsm,
+        HV_X64_MSR_SCONTROL, HV_X64_MSR_SCONTROL_ENABLE, HV_X64_MSR_SIMP, HV_X64_MSR_SIMP_ENABLE,
+        HV_X64_MSR_SINT0, HV_X64_MSR_VP_ASSIST_PAGE, HV_X64_MSR_VP_ASSIST_PAGE_ENABLE,
+        HYPERV_CPUID_IMPLEMENT_LIMITS, HYPERV_CPUID_INTERFACE,
+        HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, HYPERV_HYPERVISOR_PRESENT_BIT,
+        HYPERVISOR_CALLBACK_VECTOR, HvSynicSint, vsm,
     },
 };
 use core::arch::asm;
@@ -73,6 +73,8 @@ fn check_hyperv() -> Result<(), HypervError> {
 pub fn init() -> Result<(), HypervError> {
     check_hyperv()?;
 
+    debug_serial_println!("HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
+
     let kernel_context = get_per_core_kernel_context();
 
     wrmsr(
@@ -84,6 +86,10 @@ pub fn init() -> Result<(), HypervError> {
     {
         return Err(HypervError::InvalidAssistPage);
     }
+    debug_serial_println!(
+        "HV_X64_MSR_VP_ASSIST_PAGE: {:#x}",
+        rdmsr(HV_X64_MSR_VP_ASSIST_PAGE)
+    );
 
     let guest_id = generate_guest_id(
         HV_CANONICAL_VENDOR_ID.into(),
@@ -93,6 +99,12 @@ pub fn init() -> Result<(), HypervError> {
     wrmsr(HV_X64_MSR_GUEST_OS_ID, guest_id);
     if guest_id != rdmsr(HV_X64_MSR_GUEST_OS_ID) {
         return Err(HypervError::InvalidGuestOSID);
+    }
+    if get_core_id() == 0 {
+        debug_serial_println!(
+            "HV_X64_MSR_GUEST_OS_ID: {:#x}",
+            rdmsr(HV_X64_MSR_GUEST_OS_ID)
+        );
     }
 
     wrmsr(
@@ -105,10 +117,6 @@ pub fn init() -> Result<(), HypervError> {
         return Err(HypervError::InvalidHypercallPage);
     }
 
-    debug_serial_println!("HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
-
-    wrmsr(HV_X64_MSR_SCONTROL, u64::from(HV_X64_MSR_SCONTROL_ENABLE));
-
     wrmsr(
         HV_X64_MSR_SIMP,
         kernel_context.hv_simp_page_as_u64() | u64::from(HV_X64_MSR_SIMP_ENABLE),
@@ -118,33 +126,18 @@ pub fn init() -> Result<(), HypervError> {
     {
         return Err(HypervError::InvalidSimpPage);
     }
+    debug_serial_println!("HV_X64_MSR_SIMP: {:#x}", rdmsr(HV_X64_MSR_SIMP));
 
-    wrmsr(
-        HV_X64_MSR_SIEFP,
-        kernel_context.hv_siefp_page_as_u64() | u64::from(HV_X64_MSR_SIEFP_ENABLE),
-    );
-    if rdmsr(HV_X64_MSR_SIEFP)
-        != kernel_context.hv_siefp_page_as_u64() | u64::from(HV_X64_MSR_SIEFP_ENABLE)
-    {
-        return Err(HypervError::InvalidSiefpPage);
-    }
+    let mut sint = HvSynicSint::new();
+    sint.set_vector(u64::from(HYPERVISOR_CALLBACK_VECTOR));
+    sint.set_auto_eoi();
 
-    wrmsr(HV_X64_MSR_SINT0, u64::from(SYNIC_CUSTOM_VECTOR));
-
-    #[cfg(debug_assertions)]
+    wrmsr(HV_X64_MSR_SINT0, sint.as_uint64());
     if get_core_id() == 0 {
-        debug_serial_println!(
-            "HV_X64_MSR_VP_ASSIST_PAGE: {:#x}",
-            rdmsr(HV_X64_MSR_VP_ASSIST_PAGE)
-        );
-        debug_serial_println!(
-            "HV_X64_MSR_GUEST_OS_ID: {:#x}",
-            rdmsr(HV_X64_MSR_GUEST_OS_ID)
-        );
-        debug_serial_println!("HV_X64_MSR_HYPERCALL: {:#x}", rdmsr(HV_X64_MSR_HYPERCALL));
-        debug_serial_println!("HV_X64_MSR_SIMP: {:#x}", rdmsr(HV_X64_MSR_SIMP));
-        debug_serial_println!("HV_X64_MSR_SIEFP: {:#x}", rdmsr(HV_X64_MSR_SIEFP));
+        debug_serial_println!("HV_X64_MSR_SINT0: {:#x}", rdmsr(HV_X64_MSR_SINT0));
     }
+
+    wrmsr(HV_X64_MSR_SCONTROL, u64::from(HV_X64_MSR_SCONTROL_ENABLE));
 
     vsm::init();
 
