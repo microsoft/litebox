@@ -45,7 +45,7 @@ where
 
     /// Create readable and executable pages.
     ///
-    /// The start address of `suggested_range` is the hint address where to create the pages.
+    /// The start address of `suggested_range` is the hint address for where to create the pages.
     /// Provide `0` to let the kernel choose an available memory region.
     /// The length of `suggested_range` is the size of the pages to be created.
     ///
@@ -86,7 +86,7 @@ where
 
     /// Create readable and writable pages.
     ///
-    /// The start address of `suggested_range` is the hint address where to create the pages.
+    /// The start address of `suggested_range` is the hint address for where to create the pages.
     /// Provide `0` to let the kernel choose an available memory region.
     /// The length of `suggested_range` is the size of the pages to be created.
     ///
@@ -116,7 +116,7 @@ where
 
     /// Create read-only pages.
     ///
-    /// The start address of `suggested_range` is the hint address where to create the pages.
+    /// The start address of `suggested_range` is the hint address for where to create the pages.
     /// Provide `0` to let the kernel choose an available memory region.
     /// The length of `suggested_range` is the size of the pages to be created.
     ///
@@ -147,7 +147,7 @@ where
                 false,
                 // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the data)
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-                // kepp READ, turn off WRITE
+                // keep READ, turn off WRITE
                 MemoryRegionPermissions::READ,
                 op,
             )
@@ -156,7 +156,7 @@ where
 
     /// Create inaccessible pages.
     ///
-    /// The start address of `suggested_range` is the hint address where to create the pages.
+    /// The start address of `suggested_range` is the hint address for where to create the pages.
     /// Provide `0` to let the kernel choose an available memory region.
     /// The length of `suggested_range` is the size of the pages to be created.
     ///
@@ -194,7 +194,7 @@ where
 
     /// Create stack pages.
     ///
-    /// The start address of `suggested_range` is the hint address where to create the pages.
+    /// The start address of `suggested_range` is the hint address for where to create the pages.
     /// Provide `0` to let the kernel choose an available memory region.
     /// The length of `suggested_range` is the size of the pages to be created.
     ///
