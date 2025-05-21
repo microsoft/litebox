@@ -413,7 +413,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
         let range = PageRange::new(range.start, range.end)
             .ok_or(litebox::platform::page_mgmt::DeallocationError::Unaligned)?;
-        unsafe { self.page_table.unmap_pages(range) }
+        unsafe { self.page_table.unmap_pages(range, true) }
     }
 
     unsafe fn remap_pages(

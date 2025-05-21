@@ -123,7 +123,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         &self,
         page_range: PageRange<PAGE_SIZE>,
     ) -> Result<(), DeallocationError> {
-        unsafe { self.page_table.unmap_pages_wo_dealloc(page_range) }
+        unsafe { self.page_table.unmap_pages(page_range, false) }
     }
 
     /// This function copies data from VTL0 physical memory to the VTL1 kernel.
@@ -478,7 +478,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
         let range = PageRange::new(range.start, range.end)
             .ok_or(litebox::platform::page_mgmt::DeallocationError::Unaligned)?;
-        unsafe { self.page_table.unmap_pages(range) }
+        unsafe { self.page_table.unmap_pages(range, true) }
     }
 
     unsafe fn remap_pages(

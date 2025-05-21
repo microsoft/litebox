@@ -90,31 +90,14 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     }
 
     /// Unmap 4KiB pages from the page table
+    /// Set `dealloc_frames` to `true` to free the corresponding physical frames.
     ///
     /// Note it does not free the allocated frames for page table itself (only those allocated to
     /// user space).
     pub(crate) unsafe fn unmap_pages(
         &self,
         range: PageRange<ALIGN>,
-    ) -> Result<(), page_mgmt::DeallocationError> {
-        unsafe { self.unmap_pages_internal(range, true) }
-    }
-
-    /// Unmap 4KiB pages from the page table without frame deallocation
-    ///
-    /// Note it does not free the allocated frames for page table itself (only those allocated to
-    /// user space).
-    pub(crate) unsafe fn unmap_pages_wo_dealloc(
-        &self,
-        range: PageRange<ALIGN>,
-    ) -> Result<(), page_mgmt::DeallocationError> {
-        unsafe { self.unmap_pages_internal(range, false) }
-    }
-
-    unsafe fn unmap_pages_internal(
-        &self,
-        range: PageRange<ALIGN>,
-        dealloc_frame: bool,
+        dealloc_frames: bool,
     ) -> Result<(), page_mgmt::DeallocationError> {
         let start_va = VirtAddr::new(range.start as _);
         let start = Page::<Size4KiB>::from_start_address(start_va)
@@ -130,7 +113,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         for page in Page::range(start, end) {
             match inner.unmap(page) {
                 Ok((frame, fl)) => {
-                    if dealloc_frame {
+                    if dealloc_frames {
                         unsafe { allocator.deallocate_frame(frame) };
                     }
                     if FLUSH_TLB {
@@ -283,8 +266,6 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         is_vtl1: bool,
     ) -> Result<*mut u8, MapToError<Size4KiB>> {
         let mut allocator = PageTableAllocator::<M>::new();
-
-        crate::debug_serial_println!("mapping {frame_range:?}");
 
         let mut inner = self.inner.lock();
         for target_frame in frame_range {

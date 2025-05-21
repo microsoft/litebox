@@ -89,12 +89,14 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     }
 
     /// Unmap 4KiB pages from the page table
+    /// Set `dealloc_frames` to `true` to free the corresponding physical frames.
     ///
     /// Note it does not free the allocated frames for page table itself (only those allocated to
     /// user space).
     pub(crate) unsafe fn unmap_pages(
         &self,
         range: PageRange<ALIGN>,
+        dealloc_frames: bool,
     ) -> Result<(), page_mgmt::DeallocationError> {
         let start_va = VirtAddr::new(range.start as _);
         let start = Page::<Size4KiB>::from_start_address(start_va)
@@ -110,7 +112,9 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         for page in Page::range(start, end) {
             match inner.unmap(page) {
                 Ok((frame, fl)) => {
-                    unsafe { allocator.deallocate_frame(frame) };
+                    if dealloc_frames {
+                        unsafe { allocator.deallocate_frame(frame) };
+                    }
                     if FLUSH_TLB {
                         fl.flush();
                     }
