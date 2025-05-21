@@ -5,7 +5,6 @@ use core::arch::asm;
 use litebox_platform_lvbs::{
     arch::instrs::hlt_loop,
     kernel_context::{get_core_id, get_per_core_kernel_context},
-    mshv::vtl_switch::vtl_switch_loop_entry,
     serial_println,
 };
 
@@ -45,7 +44,6 @@ pub fn kernel_main() -> ! {
         dump_cmdline();
     }
 
-    litebox_runner_lvbs::init();
-
-    vtl_switch_loop_entry()
+    let platform = litebox_runner_lvbs::init();
+    litebox_runner_lvbs::run(platform)
 }

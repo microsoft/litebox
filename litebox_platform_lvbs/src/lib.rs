@@ -59,7 +59,7 @@ impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
 impl<Host: HostInterface> LinuxKernel<Host> {
     /// # Panics
     ///
-    /// Panics if phys_start or phys_end is not aligned to the page size
+    /// Panics if `phys_start` or `phys_end` is invalid
     pub fn new(
         init_page_table_addr: x86_64::PhysAddr,
         phys_start: x86_64::PhysAddr,
@@ -95,7 +95,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// This maps VTL0 physical memory to the page table
     /// # Panics
     ///
-    /// Panics if phys_start or phys_end is not aligned to the page size
+    /// Panics if `phys_start` or `phys_end` is not aligned to the page size
     pub fn map_vtl0_phys_range(
         &self,
         phys_start: x86_64::PhysAddr,
@@ -107,6 +107,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             PhysFrame::containing_address(phys_end),
         );
 
+        // this function should not be used to map VTL1 memory
         if frame_range.start < self.vtl1_phys_frame_range.end
             && self.vtl1_phys_frame_range.start < frame_range.end
         {
@@ -133,7 +134,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address
     /// # Panics
     ///
-    /// Panics if phys_addr is invalid
+    /// Panics if `phys_addr` is invalid
     pub unsafe fn copy_from_vtl0_phys<T: Copy>(
         &self,
         phys_addr: x86_64::PhysAddr,
@@ -145,7 +146,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             phys_addr + u64::try_from(core::mem::size_of::<T>() + PAGE_SIZE).unwrap(),
             PageTableFlags::PRESENT,
         ) {
-            let offset = usize::try_from(phys_addr.as_u64()).unwrap() % PAGE_SIZE;
+            let offset = usize::try_from(phys_addr.as_u64()).unwrap() & (PAGE_SIZE - 1);
             let raw = Box::into_raw(Box::new(core::mem::MaybeUninit::<T>::uninit()));
 
             unsafe {
@@ -190,7 +191,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             phys_addr + u64::try_from(core::mem::size_of::<T>() + PAGE_SIZE).unwrap(),
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
         ) {
-            let offset = usize::try_from(phys_addr.as_u64()).unwrap() % PAGE_SIZE;
+            let offset = usize::try_from(phys_addr.as_u64()).unwrap() & (PAGE_SIZE - 1);
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     core::ptr::from_ref::<T>(value),

@@ -607,7 +607,7 @@ bitflags::bitflags! {
         const X86_CR4_MCE = 1 << 6;
         const X86_CR4_PGE = 1 << 7;
         const X86_CR4_PCE = 1 << 8;
-        const X86_CR4_OSFXSR = 1 << 8;
+        const X86_CR4_OSFXSR = 1 << 9;
         const X86_CR4_OSXMMEXCPT = 1 << 10;
         const X86_CR4_UMIP = 1 << 11;
         const X86_CR4_LA57 = 1 << 12;
@@ -772,9 +772,9 @@ pub struct HvSynicSint {
 
 impl HvSynicSint {
     const VECTOR_MASK: u64 = 0xff;
-    const MASKED_MASK: u64 = 0x10000;
-    const AUTO_EOI_MASK: u64 = 0x20000;
-    const POLLING_MASK: u64 = 0x40000;
+    const MASKED_MASK: u64 = 0x1_0000;
+    const AUTO_EOI_MASK: u64 = 0x2_0000;
+    const POLLING_MASK: u64 = 0x4_0000;
     const VECTOR_SHIFT: u64 = 0;
     const MASKED_SHIFT: u64 = 16;
     const AUTO_EOI_SHIFT: u64 = 17;

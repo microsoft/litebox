@@ -6,7 +6,6 @@ pub const PTES_PER_PAGE: usize = 512;
 
 pub const VSM_PMD_SIZE: usize = PAGE_SIZE * PTES_PER_PAGE;
 pub const VSM_SK_INITIAL_MAP_SIZE: usize = 16 * 1024 * 1024;
-pub const VSM_SK_INITIAL_MAPPED_FRAMES: usize = VSM_SK_INITIAL_MAP_SIZE / PAGE_SIZE;
 pub const VSM_SK_PTE_PAGES_COUNT: usize = VSM_SK_INITIAL_MAP_SIZE / VSM_PMD_SIZE;
 
 pub const VTL1_TOTAL_MEMORY_SIZE: usize = 128 * 1024 * 1024;

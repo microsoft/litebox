@@ -183,12 +183,14 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                         todo!("return Err(page_mgmt::RemapError::RemapToHugePage);")
                     }
                     Err(X64UnmapError::InvalidFrameAddress(pa)) => {
-                        panic!("Invalid frame address: {:#x}", pa);
+                        // TODO: `panic!()` -> `todo!()` because user-driven interrupts or exceptions must not halt the kernel.
+                        // We should handle this exception carefully (i.e., clean up the context and data structures belonging to an errorneous process).
+                        todo!("Invalid frame address: {:#x}", pa);
                     }
                 },
                 TranslateResult::NotMapped => {}
                 TranslateResult::InvalidFrameAddress(pa) => {
-                    panic!("Invalid frame address: {:#x}", pa);
+                    todo!("Invalid frame address: {:#x}", pa);
                 }
             }
             start += 1;
@@ -248,7 +250,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 }
                 TranslateResult::NotMapped => {}
                 TranslateResult::InvalidFrameAddress(pa) => {
-                    panic!("Invalid frame address: {:#x}", pa);
+                    todo!("Invalid frame address: {:#x}", pa);
                 }
             }
         }
@@ -290,7 +292,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 }
                 TranslateResult::NotMapped => {}
                 TranslateResult::InvalidFrameAddress(pa) => {
-                    panic!("Invalid frame address: {:#x}", pa);
+                    todo!("Invalid frame address: {:#x}", pa);
                 }
             }
 
@@ -361,7 +363,7 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                     return Ok(());
                 }
 
-                panic!("Page fault on present page: {:#x}", page.start_address());
+                todo!("Page fault on present page: {:#x}", page.start_address());
             }
             TranslateResult::NotMapped => {
                 let mut allocator = PageTableAllocator::<M>::new();
@@ -401,7 +403,7 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                 }
             }
             TranslateResult::InvalidFrameAddress(pa) => {
-                panic!("Invalid frame address: {:#x}", pa);
+                todo!("Invalid frame address: {:#x}", pa);
             }
         }
         Ok(())

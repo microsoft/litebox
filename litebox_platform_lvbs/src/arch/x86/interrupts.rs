@@ -1,6 +1,6 @@
 //! Interrupt Descriptor Table (IDT)
 
-use crate::{mshv::HYPERVISOR_CALLBACK_VECTOR, serial_println};
+use crate::mshv::HYPERVISOR_CALLBACK_VECTOR;
 use core::ops::IndexMut;
 use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
@@ -22,10 +22,8 @@ fn idt() -> &'static InterruptDescriptorTable {
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
         idt.general_protection_fault
             .set_handler_fn(general_protection_fault_handler);
-
         idt.index_mut(HYPERVISOR_CALLBACK_VECTOR)
             .set_handler_fn(hyperv_sint_handler);
-
         idt
     })
 }
@@ -35,31 +33,29 @@ pub fn init_idt() {
     idt().load();
 }
 
+// TODO: carefully handle excpetions/interrupts. If an exception or interrupt is due to userspace code,
+// we should destroy the corresponding user context rather than halt the entire kernel.
+
 extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame) {
-    serial_println!("EXCEPTION: DIVIDE BY ZERO\n{:#?}", stack_frame);
-    #[cfg(debug_assertions)]
-    panic!("Divide by zero");
+    todo!("EXCEPTION: DIVIDE BY ZERO\n{:#?}", stack_frame);
 }
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
-    serial_println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
-    #[cfg(debug_assertions)]
-    panic!("Breakpoint");
+    todo!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }
 
 extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) -> ! {
-    serial_println!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
-    panic!("Double fault")
+    panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) {
-    panic!("EXCEPTION: GENERAL PROTECTION FAULT\n{:#?}", stack_frame);
+    todo!("EXCEPTION: GENERAL PROTECTION FAULT\n{:#?}", stack_frame);
 }
 
 extern "x86-interrupt" fn page_fault_handler(
@@ -68,30 +64,26 @@ extern "x86-interrupt" fn page_fault_handler(
 ) {
     use x86_64::registers::control::Cr2;
 
-    serial_println!(
+    todo!(
         "EXCEPTION: PAGE FAULT\nAccessed Address: {:?}\nError Code: {:?}\n{:#?}",
         Cr2::read(),
         error_code,
         stack_frame
     );
-    #[cfg(debug_assertions)]
-    panic!("Page fault");
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
     use x86_64::registers::control::Cr2;
 
-    serial_println!(
+    todo!(
         "EXCEPTION: INVALID OPCODE\nAccessed Address: {:?}\n{:#?}",
         Cr2::read(),
         stack_frame
     );
-    #[cfg(debug_assertions)]
-    panic!("Invalid opcode");
 }
 
 extern "x86-interrupt" fn hyperv_sint_handler(_stack_frame: InterruptStackFrame) {
-    // Hyper-V invokes this handler when a syntethic interrupt occurs.
-    // Instead of implementing this handler, we let it return to the VTL switch loop
-    // (i.e., the current RIP) immediately and handle synthethic interrupts there.
+    // This handler is called when there is a synthetic interrupt.
+    // Instead of implementing this handler, we let it immediately return to the VTL switch loop
+    // (i.e., the current RIP) which will handle synthethic interrupts.
 }

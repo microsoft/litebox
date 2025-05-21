@@ -194,7 +194,11 @@ fn load_vtl1_state() {
     pop_vtl_state(&vtl1_state);
 }
 
-pub fn vtl_switch_loop_entry() -> ! {
+pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
+    if let Some(platform) = platform {
+        crate::set_platform_low(platform);
+    }
+
     save_vtl0_state();
     // This is a dummy call to satisfy load_vtl0_state() with reasonable register values.
     // We do not save VTL0 registers during VTL1 initialization.

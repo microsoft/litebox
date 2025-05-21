@@ -51,11 +51,6 @@ mod alloc {
         }
 
         unsafe fn mem_fill_pages(start: usize, size: usize) {
-            crate::debug_serial_println!(
-                "adding a range of memory to the global allocator: start = {:#x}, size = {:#x}",
-                start,
-                size
-            );
             unsafe { LVBS_ALLOCATOR.fill_pages(start, size) };
         }
     }
@@ -79,11 +74,10 @@ impl HostInterface for HostLvbsInterface {
     }
 
     fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
-        crate::debug_serial_println!(
+        panic!(
             "dynamic memory allocation is not supported (layout = {:?})",
             layout
         );
-        None
     }
 
     unsafe fn free(_addr: usize) {
