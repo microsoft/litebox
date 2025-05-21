@@ -8,7 +8,6 @@ members = [
     "litebox_platform_multiplex",
     "litebox_runner_linux_userland",
     "litebox_shim_linux",
-    "litebox_shim_optee",
     "litebox_syscall_rewriter"
 ]
 
