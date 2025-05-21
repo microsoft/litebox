@@ -1,6 +1,7 @@
 #![no_std]
 
 use core::panic::PanicInfo;
+use litebox_platform_lvbs::{Platform, set_platform_low};
 use litebox_platform_lvbs::{
     arch::{gdt, instrs::hlt_loop, interrupts},
     host::bootparam::get_vtl1_memory_info,
@@ -13,9 +14,8 @@ use litebox_platform_lvbs::{
             get_heap_start_address,
         },
     },
-    serial_println, set_platform_low,
+    serial_println,
 };
-use litebox_platform_multiplex::{Platform, set_platform};
 
 /// # Panics
 ///
@@ -43,8 +43,8 @@ pub fn init() {
 
             let pml4_table_addr = vtl1_start + u64::try_from(PAGE_SIZE * VTL1_PML4E_PAGE).unwrap();
             let platform = Platform::new(pml4_table_addr, vtl1_start, vtl1_end);
-            set_platform(platform);
-            set_platform_low(platform); // TODO: this is a temporary solution to allow LVBS functions to access the platform (i.e., kernel page table).
+            set_platform_low(platform);
+            // TODO: This is a temporary solution to allow LVBS functions to access the platform (i.e., kernel page table). We should use `Self` in the future.
 
             // Add the rest of the VTL1 memory to the global allocator once they are mapped to the kernel page table.
             unsafe {

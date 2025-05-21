@@ -29,16 +29,13 @@ compile_error!(
 );
 
 // Check if no platforms have been specified. If so, compiler error.
-#[cfg(not(any(feature = "platform_linux_userland", feature = "platform_lvbs")))]
+#[cfg(not(any(feature = "platform_linux_userland")))]
 compile_error!(
     r##"No platforms specified.  Please enable the feature for the platform you want."##
 );
 
 #[cfg(feature = "platform_linux_userland")]
 pub type Platform = litebox_platform_linux_userland::LinuxUserland;
-
-#[cfg(feature = "platform_lvbs")]
-pub type Platform = litebox_platform_lvbs::host::LvbsLinuxKernel;
 
 static PLATFORM: once_cell::race::OnceBox<&'static Platform> = once_cell::race::OnceBox::new();
 
