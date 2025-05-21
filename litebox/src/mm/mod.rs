@@ -75,7 +75,7 @@ where
         unsafe {
             vmem.create_pages(
                 suggested_range,
-                CreatePagesFlags::new(fixed_addr, populate_pages),
+                CreatePagesFlags::new(fixed_addr, false, populate_pages),
                 // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the code)
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
                 // keep READ, turn off WRITE and turn on EXEC
@@ -118,7 +118,7 @@ where
         unsafe {
             vmem.create_pages(
                 suggested_range,
-                CreatePagesFlags::new(fixed_addr, populate_pages),
+                CreatePagesFlags::new(fixed_addr, false, populate_pages),
                 perms,
                 perms,
                 op,
@@ -158,7 +158,7 @@ where
         unsafe {
             vmem.create_pages(
                 suggested_range,
-                CreatePagesFlags::new(fixed_addr, populate_pages),
+                CreatePagesFlags::new(fixed_addr, false, populate_pages),
                 // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the data)
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
                 // keep READ, turn off WRITE
@@ -200,7 +200,7 @@ where
         unsafe {
             vmem.create_pages(
                 suggested_range,
-                CreatePagesFlags::new(fixed_addr, populate_pages),
+                CreatePagesFlags::new(fixed_addr, false, populate_pages),
                 MemoryRegionPermissions::empty(),
                 MemoryRegionPermissions::empty(),
                 op,
@@ -235,7 +235,7 @@ where
         unsafe {
             vmem.create_pages(
                 suggested_range,
-                CreatePagesFlags::new(fixed_addr, populate_pages) | CreatePagesFlags::IS_STACK,
+                CreatePagesFlags::new(fixed_addr, true, populate_pages),
                 perms,
                 perms,
                 |_| Ok(0),

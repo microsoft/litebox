@@ -82,9 +82,10 @@ bitflags::bitflags! {
 }
 
 impl CreatePagesFlags {
-    pub(super) fn new(fixed_addr: bool, populate_pages: bool) -> Self {
+    pub(super) fn new(fixed_addr: bool, is_stack: bool, populate_pages: bool) -> Self {
         let mut flags = Self::empty();
         flags.set(Self::FIXED_ADDR, fixed_addr);
+        flags.set(Self::IS_STACK, is_stack);
         flags.set(Self::POPULATE_PAGES, populate_pages);
         flags
     }
@@ -305,9 +306,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
 
     /// Create a new mapping in the virtual address space.
     ///
-    /// `suggested_range` is the range of pages to create. If the start address is not given (i.e., zero), some
-    /// available memory region will be chosen. Otherwise, the range will be created at the given address if it
-    /// is available.
+    /// The start address of `suggested_range` is the hint address for where to create the pages.
+    /// Provide `0` to let the kernel choose an available memory region.
+    /// The length of `suggested_range` is the size of the pages to be created.
     ///
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
     /// existing overlapping mappings being removed.
