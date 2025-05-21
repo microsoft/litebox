@@ -1,13 +1,14 @@
 use std::{arch::global_asm, ffi::CString};
 
 use litebox::{
-    LiteBox,
     fs::{FileSystem as _, Mode, OFlags},
+    platform::trivial_providers::ImpossiblePunchthroughProvider,
 };
 use litebox_platform_multiplex::{Platform, set_platform};
-use litebox_shim_linux::{litebox_fs, loader::load_program, set_fs};
+use litebox_shim_linux::{
+    litebox_fs, loader::load_program, set_fs, syscall_entry, syscalls::file::sys_open,
+};
 
-#[cfg(target_arch = "x86_64")]
 global_asm!(
     "
     .text
@@ -21,76 +22,62 @@ trampoline:
     /* Should not reach. */
     hlt"
 );
-#[cfg(target_arch = "x86")]
-global_asm!(
-    "
-    .text
-    .align  4
-    .globl  trampoline
-    .type   trampoline,@function
-trampoline:
-    xor     edx, edx
-    mov     ebx, [esp + 4]
-    mov     eax, [esp + 8]
-    mov     esp, eax
-    jmp     ebx
-    /* Should not reach. */
-    hlt"
-);
 
 unsafe extern "C" {
     fn trampoline(entry: usize, sp: usize) -> !;
 }
 
-pub fn init_platform(enable_systrap: bool) {
-    let platform = Platform::new(None);
+pub fn init_platform() {
+    let platform = Platform::new(None, ImpossiblePunchthroughProvider {});
     set_platform(platform);
     let platform = litebox_platform_multiplex::platform();
-    let litebox = LiteBox::new(platform);
 
-    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(&litebox);
+    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(platform);
     in_mem_fs.with_root_privileges(|fs| {
         fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to set permissions on root");
     });
-    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&litebox);
+    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(platform);
     let tar_ro_fs =
-        litebox::fs::tar_ro::FileSystem::new(&litebox, litebox::fs::tar_ro::empty_tar_file());
+        litebox::fs::tar_ro::FileSystem::new(platform, litebox::fs::tar_ro::empty_tar_file());
     set_fs(litebox::fs::layered::FileSystem::new(
-        &litebox,
+        platform,
         in_mem_fs,
         litebox::fs::layered::FileSystem::new(
-            &litebox,
+            platform,
             dev_stdio,
             tar_ro_fs,
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     ));
-    if enable_systrap {
-        platform.enable_syscall_interception_with(litebox_shim_linux::syscall_entry);
-    }
+    platform.enable_syscall_interception_with(syscall_entry);
+
+    // set up stdin, stdout, and stderr
+    assert_eq!(
+        sys_open("/stdin", OFlags::RDONLY | OFlags::CREAT, Mode::RWXU).unwrap(),
+        0
+    );
+    assert_eq!(
+        sys_open("/stdout", OFlags::WRONLY | OFlags::CREAT, Mode::RWXU).unwrap(),
+        1
+    );
+    assert_eq!(
+        sys_open("/stderr", OFlags::WRONLY | OFlags::CREAT, Mode::RWXU).unwrap(),
+        2
+    );
 
     install_dir("/lib64");
-    install_dir("/lib32");
     install_dir("/lib");
     install_dir("/lib/x86_64-linux-gnu");
 }
 
-/// Compile C code into an executable
-pub fn compile(input: &str, output: &str, exec_or_lib: bool, nolibc: bool) {
-    let mut args = vec!["-o", output, input];
+pub fn compile(output: &std::path::Path, exec_or_lib: bool) {
+    // Compile the hello.c file to an executable
+    let mut args = vec!["-o", output.to_str().unwrap(), "./tests/hello.c"];
     if exec_or_lib {
         args.push("-static");
     }
-    if nolibc {
-        args.push("-nostdlib");
-    }
-    args.push(match std::env::consts::ARCH {
-        "x86_64" => "-m64",
-        "x86" => "-m32",
-        _ => unimplemented!(),
-    });
     let output = std::process::Command::new("gcc")
         .args(args)
         .output()

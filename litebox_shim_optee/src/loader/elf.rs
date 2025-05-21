@@ -54,7 +54,7 @@ impl ElfObject for ElfFile {
                 Ok(bytes_read) => {
                     if bytes_read == 0 {
                         // reached the end of the file
-                        return Err(elf_loader::Error::MmapError {
+                        return Err(elf_loader::Error::IOError {
                             msg: "failed to fill buffer".to_string(),
                         });
                     } else {
@@ -65,7 +65,7 @@ impl ElfObject for ElfFile {
                 }
                 Err(_) => {
                     // Error occurred
-                    return Err(elf_loader::Error::MmapError {
+                    return Err(elf_loader::Error::IOError {
                         msg: "failed to read from file".to_string(),
                     });
                 }
@@ -184,55 +184,6 @@ pub struct ElfLoadInfo {
     pub user_stack_top: usize,
 }
 
-#[cfg(target_arch = "x86_64")]
-type Ehdr = elf::file::Elf64_Ehdr;
-#[cfg(target_arch = "x86")]
-type Ehdr = elf::file::Elf32_Ehdr;
-#[cfg(target_arch = "x86_64")]
-type Shdr = elf::section::Elf64_Shdr;
-#[cfg(target_arch = "x86")]
-type Shdr = elf::section::Elf32_Shdr;
-
-/// Get the syscall callback placeholder address from the ELF file if it is modified by our syscall
-/// rewriter. The placeholder initially has a magic number that is going to be replaced by the actual
-/// syscall callback.
-fn get_syscall_callback_placeholder(object: &mut ElfFile) -> Option<NonNull<usize>> {
-    let mut buf: [u8; size_of::<Ehdr>()] = [0; size_of::<Ehdr>()];
-    object.read(&mut buf, 0).unwrap();
-    let elfhdr: &Ehdr = unsafe { &*(buf.as_ptr().cast()) };
-
-    // read section headers
-    let shdrs_size = usize::from(elfhdr.e_shentsize) * usize::from(elfhdr.e_shnum.checked_sub(1)?);
-    let mut buf: [u8; size_of::<Shdr>()] = [0; size_of::<Shdr>()];
-    // Read the last section header because our syscall rewriter adds a trampoline section at the end.
-    object
-        .read(
-            &mut buf,
-            usize::try_from(elfhdr.e_shoff).unwrap() + shdrs_size,
-        )
-        .unwrap();
-    let trampoline_shdr: &Shdr = unsafe { &*(buf.as_ptr().cast()) };
-    if trampoline_shdr.sh_type != elf::abi::SHT_PROGBITS
-        || trampoline_shdr.sh_flags != (elf::abi::SHF_ALLOC | elf::abi::SHF_EXECINSTR).into()
-    {
-        return None;
-    }
-
-    let mut placeholder: [u8; 8] = [0; 8];
-    object
-        .read(
-            &mut placeholder,
-            usize::try_from(trampoline_shdr.sh_offset).unwrap(),
-        )
-        .ok()?;
-    let magic_number = u64::from_ne_bytes(placeholder);
-    // TODO: check section name instead of magic number
-    if magic_number != super::REWRITER_MAGIC_NUMBER {
-        return None;
-    }
-    NonNull::new(trampoline_shdr.sh_addr as *mut usize)
-}
-
 /// Loader for ELF files
 pub(super) struct ElfLoader;
 
@@ -266,28 +217,9 @@ impl ElfLoader {
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let elf = {
             let mut loader = Loader::<ElfLoaderMmap>::new();
-            let mut object = ElfFile::new(path).map_err(ElfLoaderError::OpenError)?;
-            // Check if the file is modified by our syscall rewriter. If so, we need to update
-            // the syscall callback pointer.
-            let placeholder = get_syscall_callback_placeholder(&mut object);
-            let elf = loader
-                .easy_load(object)
-                .map_err(ElfLoaderError::LoaderError)?;
-            if let Some(placeholder) = placeholder {
-                // mprotect the memory to make it writable
-                let pm = litebox_page_manager();
-                // `mprotect` requires the address to be page-aligned
-                let start_addr = placeholder.as_ptr() as usize & !(PAGE_SIZE - 1);
-                let ptr = unsafe {
-                    core::mem::transmute::<*mut u8, crate::MutPtr<u8>>(start_addr as *mut u8)
-                };
-                unsafe { pm.make_pages_writable(ptr, 0x1000) }
-                    .expect("failed to make pages writable");
-                unsafe { placeholder.write(crate::syscall_callback as usize) };
-                unsafe { pm.make_pages_executable(ptr, 0x1000) }
-                    .expect("failed to make pages executable");
-            }
-            elf
+            loader
+                .easy_load(ElfFile::new(path).map_err(ElfLoaderError::OpenError)?)
+                .map_err(ElfLoaderError::LoaderError)?
         };
         let interp: Option<Elf> = if let Some(interp_name) = elf.interp() {
             // e.g., /lib64/ld-linux-x86-64.so.2

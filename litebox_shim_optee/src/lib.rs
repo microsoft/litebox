@@ -19,19 +19,15 @@ use alloc::vec::Vec;
 use once_cell::race::OnceBox;
 
 use litebox::{
-    LiteBox,
-    fs::FileSystem,
     mm::{PageManager, linux::PAGE_SIZE},
-    platform::{ExitProvider as _, RawConstPointer as _, RawMutPointer as _},
+    platform::{RawConstPointer as _, RawMutPointer as _},
     sync::RwLock,
-    utils::{ReinterpretSignedExt, TruncateExt as _},
 };
 use litebox_common_linux::{SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
 pub(crate) mod channel;
 pub mod loader;
-pub(crate) mod stdio;
 pub mod syscalls;
 
 type LinuxFS = litebox::fs::layered::FileSystem<
@@ -43,14 +39,6 @@ type LinuxFS = litebox::fs::layered::FileSystem<
         litebox::fs::tar_ro::FileSystem<Platform>,
     >,
 >;
-
-/// Get the global litebox object
-pub fn litebox<'a>() -> &'a LiteBox<Platform> {
-    static LITEBOX: OnceBox<LiteBox<Platform>> = OnceBox::new();
-    LITEBOX.get_or_init(|| {
-        alloc::boxed::Box::new(LiteBox::new(litebox_platform_multiplex::platform()))
-    })
-}
 
 static FS: OnceBox<LinuxFS> = OnceBox::new();
 /// Set the global file system
@@ -76,18 +64,20 @@ pub fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
     FS.get().expect("fs has not yet been set")
 }
 
-pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE> {
-    static VMEM: OnceBox<PageManager<Platform, PAGE_SIZE>> = OnceBox::new();
-    VMEM.get_or_init(|| alloc::boxed::Box::new(PageManager::new(litebox())))
+pub(crate) fn litebox_sync<'a>() -> &'a litebox::sync::Synchronization<Platform> {
+    static SYNC: OnceBox<litebox::sync::Synchronization<Platform>> = OnceBox::new();
+    SYNC.get_or_init(|| {
+        alloc::boxed::Box::new(litebox::sync::Synchronization::new(
+            litebox_platform_multiplex::platform(),
+        ))
+    })
 }
 
-pub(crate) fn litebox_net<'a>()
--> &'a litebox::sync::Mutex<Platform, litebox::net::Network<Platform>> {
-    static NET: OnceBox<litebox::sync::Mutex<Platform, litebox::net::Network<Platform>>> =
-        OnceBox::new();
-    NET.get_or_init(|| {
-        let net = litebox::net::Network::new(litebox());
-        alloc::boxed::Box::new(litebox().sync().new_mutex(net))
+pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE> {
+    static VMEM: OnceBox<PageManager<Platform, PAGE_SIZE>> = OnceBox::new();
+    VMEM.get_or_init(|| {
+        let vmm = PageManager::new(litebox_platform_multiplex::platform());
+        alloc::boxed::Box::new(vmm)
     })
 }
 
@@ -101,42 +91,9 @@ struct Descriptors {
 
 impl Descriptors {
     fn new() -> Self {
+        // TODO: Add stdin/stdout/stderr
         Self {
-            descriptors: vec![
-                Some(Descriptor::Stdio(stdio::StdioFile::new(
-                    litebox::platform::StdioStream::Stdin,
-                    litebox_fs()
-                        .open(
-                            "/dev/stdin",
-                            litebox::fs::OFlags::RDONLY,
-                            litebox::fs::Mode::empty(),
-                        )
-                        .unwrap(),
-                    litebox::fs::OFlags::APPEND | litebox::fs::OFlags::RDWR,
-                ))),
-                Some(Descriptor::Stdio(stdio::StdioFile::new(
-                    litebox::platform::StdioStream::Stdout,
-                    litebox_fs()
-                        .open(
-                            "/dev/stdout",
-                            litebox::fs::OFlags::WRONLY,
-                            litebox::fs::Mode::empty(),
-                        )
-                        .unwrap(),
-                    litebox::fs::OFlags::APPEND | litebox::fs::OFlags::RDWR,
-                ))),
-                Some(Descriptor::Stdio(stdio::StdioFile::new(
-                    litebox::platform::StdioStream::Stderr,
-                    litebox_fs()
-                        .open(
-                            "/dev/stderr",
-                            litebox::fs::OFlags::WRONLY,
-                            litebox::fs::Mode::empty(),
-                        )
-                        .unwrap(),
-                    litebox::fs::OFlags::APPEND | litebox::fs::OFlags::RDWR,
-                ))),
-            ],
+            descriptors: vec![],
         }
     }
     fn insert(&mut self, descriptor: Descriptor) -> u32 {
@@ -156,14 +113,6 @@ impl Descriptors {
             u32::try_from(idx).unwrap()
         }
     }
-    fn insert_at(&mut self, descriptor: Descriptor, idx: usize) -> Option<Descriptor> {
-        if idx >= self.descriptors.len() {
-            self.descriptors.resize_with(idx + 1, Default::default);
-        }
-        self.descriptors
-            .get_mut(idx)
-            .and_then(|v| v.replace(descriptor))
-    }
     fn remove(&mut self, fd: u32) -> Option<Descriptor> {
         let fd = fd as usize;
         self.descriptors.get_mut(fd)?.take()
@@ -180,7 +129,7 @@ impl Descriptors {
             None
         }
     }
-    fn remove_socket(&mut self, fd: u32) -> Option<alloc::sync::Arc<crate::syscalls::net::Socket>> {
+    fn remove_socket(&mut self, fd: u32) -> Option<litebox::fd::SocketFd> {
         let fd = fd as usize;
         if let Some(Descriptor::Socket(socket_fd)) = self
             .descriptors
@@ -202,7 +151,7 @@ impl Descriptors {
             None
         }
     }
-    fn get_socket_fd(&self, fd: u32) -> Option<&crate::syscalls::net::Socket> {
+    fn get_socket_fd(&self, fd: u32) -> Option<&litebox::fd::SocketFd> {
         if let Descriptor::Socket(socket_fd) = self.descriptors.get(fd as usize)?.as_ref()? {
             Some(socket_fd)
         } else {
@@ -213,10 +162,7 @@ impl Descriptors {
 
 enum Descriptor {
     File(litebox::fd::FileFd),
-    // Note we are using `Arc` here so that we can hold a reference to the socket
-    // without holding a lock on the file descriptor (see `sys_accept` for an example).
-    // TODO: this could be addressed by #120.
-    Socket(alloc::sync::Arc<crate::syscalls::net::Socket>),
+    Socket(litebox::fd::SocketFd),
     PipeReader {
         consumer: alloc::sync::Arc<crate::channel::Consumer<u8>>,
         close_on_exec: core::sync::atomic::AtomicBool,
@@ -225,19 +171,13 @@ enum Descriptor {
         producer: alloc::sync::Arc<crate::channel::Producer<u8>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
-    Eventfd {
-        file: alloc::sync::Arc<syscalls::eventfd::EventFile<Platform>>,
-        close_on_exec: core::sync::atomic::AtomicBool,
-    },
-    // TODO: we may not need this once #31 and #68 are done.
-    Stdio(stdio::StdioFile),
 }
 
 pub(crate) fn file_descriptors<'a>() -> &'a RwLock<Platform, Descriptors> {
     static FILE_DESCRIPTORS: once_cell::race::OnceBox<RwLock<Platform, Descriptors>> =
         once_cell::race::OnceBox::new();
     FILE_DESCRIPTORS
-        .get_or_init(|| alloc::boxed::Box::new(litebox().sync().new_rwlock(Descriptors::new())))
+        .get_or_init(|| alloc::boxed::Box::new(litebox_sync().new_rwlock(Descriptors::new())))
 }
 
 /// Open a file
@@ -277,7 +217,7 @@ const MAX_KERNEL_BUF_SIZE: usize = 64 * 1024;
 
 /// Entry point for the syscall handler
 #[allow(clippy::too_many_lines)]
-pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
+pub fn syscall_entry(request: SyscallRequest<Platform>) -> i64 {
     let res: Result<usize, Errno> = match request {
         SyscallRequest::Read { fd, buf, count } => {
             let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
@@ -292,7 +232,6 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
             None => Err(Errno::EFAULT),
         },
         SyscallRequest::Close { fd } => syscalls::file::sys_close(fd).map(|()| 0),
-        SyscallRequest::Ioctl { fd, arg } => syscalls::file::sys_ioctl(fd, arg).map(|v| v as usize),
         SyscallRequest::Pread64 {
             fd,
             buf,
@@ -325,12 +264,6 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
         } => {
             syscalls::mm::sys_mmap(addr, length, prot, flags, fd, offset).map(|ptr| ptr.as_usize())
         }
-        SyscallRequest::Mprotect { addr, length, prot } => {
-            syscalls::mm::sys_mprotect(addr, length, prot).map(|()| 0)
-        }
-        SyscallRequest::Munmap { addr, length } => {
-            syscalls::mm::sys_munmap(addr, length).map(|()| 0)
-        }
         SyscallRequest::Readv { fd, iovec, iovcnt } => syscalls::file::sys_readv(fd, iovec, iovcnt),
         SyscallRequest::Writev { fd, iovec, iovcnt } => {
             syscalls::file::sys_writev(fd, iovec, iovcnt)
@@ -339,52 +272,6 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
             pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                 syscalls::file::sys_access(path, mode).map(|()| 0)
             })
-        }
-        SyscallRequest::Dup {
-            oldfd,
-            newfd,
-            flags,
-        } => syscalls::file::sys_dup(oldfd, newfd, flags).map(|newfd| newfd as usize),
-        SyscallRequest::Socket {
-            domain,
-            ty,
-            flags,
-            protocol,
-        } => syscalls::net::sys_socket(domain, ty, flags, protocol).map(|fd| fd as usize),
-        SyscallRequest::Connect {
-            sockfd,
-            sockaddr,
-            addrlen,
-        } => syscalls::net::sys_connect(sockfd, sockaddr, addrlen).map(|()| 0),
-        SyscallRequest::Accept {
-            sockfd,
-            addr,
-            addrlen,
-            flags,
-        } => syscalls::net::sys_accept(sockfd, addr, addrlen, flags).map(|fd| fd as usize),
-        SyscallRequest::Sendto {
-            sockfd,
-            buf,
-            len,
-            flags,
-            addr,
-            addrlen,
-        } => syscalls::net::sys_sendto(sockfd, buf, len, flags, addr, addrlen),
-        SyscallRequest::Recvfrom {
-            sockfd,
-            buf,
-            len,
-            flags,
-            addr,
-            addrlen,
-        } => syscalls::net::sys_recvfrom(sockfd, buf, len, flags, addr, addrlen),
-        SyscallRequest::Bind {
-            sockfd,
-            sockaddr,
-            addrlen,
-        } => syscalls::net::sys_bind(sockfd, sockaddr, addrlen).map(|()| 0),
-        SyscallRequest::Listen { sockfd, backlog } => {
-            syscalls::net::sys_listen(sockfd, backlog).map(|()| 0)
         }
         SyscallRequest::Fcntl { fd, arg } => syscalls::file::sys_fcntl(fd, arg).map(|v| v as usize),
         SyscallRequest::Getcwd { buf, size: count } => {
@@ -463,9 +350,6 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
                     .map(|()| 0)
             })
         }),
-        SyscallRequest::Eventfd2 { initval, flags } => {
-            syscalls::file::sys_eventfd2(initval, flags).map(|fd| fd as usize)
-        }
         SyscallRequest::Pipe2 { pipefd, flags } => {
             syscalls::file::sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
                 unsafe { pipefd.write_at_offset(0, read_fd).ok_or(Errno::EFAULT) }?;
@@ -479,187 +363,15 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
     };
 
     res.map_or_else(
-        |e| {
-            let e: i32 = e.as_neg();
-            let Ok(e) = isize::try_from(e) else {
-                // On both 32-bit and 64-bit, this should never be triggered
-                unreachable!()
-            };
-            e
-        },
-        |val: usize| {
-            let Ok(v) = isize::try_from(val) else {
-                // Note in case where val is an address (e.g., returned from `mmap`), we currently
-                // assume user space address does not exceed isize::MAX. On 64-bit, the max user
-                // address is 0x7FFF_FFFF_F000, which is below this; for 32-bit, this may not hold,
-                // and we might need to de-restrict this if ever seen in practice. For now, we are
-                // keeping the stricter version.
+        |e| i64::from(e.as_neg()),
+        |val| {
+            let Ok(v) = i64::try_from(val) else {
+                // Note in case where val is an address (e.g., returned from `mmap`), it assumes
+                // user space address does not exceed i64::MAX (0x7FFF_FFFF_FFFF_FFFF).
+                // For Linux the max user address is 0x7FFF_FFFF_F000.
                 unreachable!("invalid user pointer");
             };
             v
         },
     )
-}
-
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    "
-    .text
-    .align  4
-    .globl  syscall_callback
-    .type   syscall_callback,@function
-syscall_callback:
-    /* TODO: save float and vector registers (xsave or fxsave) */
-    /* Save caller-saved registers */
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    pushf
-
-    /* Save the original stack pointer */
-    push rbp
-    mov  rbp, rsp
-
-    /* Align the stack to 16 bytes */
-    and rsp, -16
-
-    /* Reserve space on the stack for syscall arguments */
-    sub rsp, 48
-
-    /* Save syscall arguments (rdi, rsi, rdx, r10, r8, r9) into the reserved space */
-    mov [rsp], rdi
-    mov [rsp + 8], rsi
-    mov [rsp + 16], rdx
-    mov [rsp + 24], r10
-    mov [rsp + 32], r8
-    mov [rsp + 40], r9
-
-    /* Pass the syscall number to the syscall dispatcher */
-    mov rdi, rax
-    /* Pass the pointer to the syscall arguments to syscall_handler */
-    mov rsi, rsp
-
-    /* Call syscall_handler */
-    call syscall_handler
-
-    /* Restore the original stack pointer */
-    mov  rsp, rbp
-    pop  rbp
-
-    /* Restore caller-saved registers */
-    popf
-    pop  r11
-    pop  r10
-    pop  r9
-    pop  r8
-    pop  rdi
-    pop  rsi
-    pop  rdx
-    pop  rcx
-
-    /* Return to the caller */
-    ret
-"
-);
-
-/// Syscall callback function for 32-bit x86
-///
-/// The stack layout at the entry of the callback (see litebox_syscall_rewriter
-/// for more details):
-///
-/// Addr |   data   |
-/// 0    | sysno    |
-/// -4:  | ret addr |  <-- esp
-///
-/// The first two instructions adjust the stack such that it saves one
-/// instruction (i.e., `pop sysno`) from the caller (trampoline code).
-#[cfg(target_arch = "x86")]
-core::arch::global_asm!(
-    "
-    .text
-    .align  4
-    .globl  syscall_callback
-    .type   syscall_callback,@function
-syscall_callback:
-    pop  eax        /* pop ret addr */
-    xchg eax, [esp] /* exchange it with sysno */
-
-    /* Save registers and constructs arguments */
-    push ebp
-    push edi
-    push esi
-    push edx
-    push ecx
-    push ebx
-    push eax
-
-    /* save the pointer to argments in eax */
-    mov eax, esp
-
-    pushf
-    /* Save the original stack pointer */
-    mov ebp, esp
-    /* Align the stack to 16 bytes */
-    and esp, -16
-
-    /* Pass the pointer to the sysno and arguments to syscall_handler_32 */
-    push eax
-
-    call syscall_handler_32
-
-    mov esp, ebp
-    popf
-    pop ebx /* not need to restore eax (sysno) */
-    pop ebx
-    pop ecx
-    pop edx
-    pop esi
-    pop edi
-    pop ebp
-
-    /* Return to the caller */
-    ret
-"
-);
-
-unsafe extern "C" {
-    pub(crate) fn syscall_callback() -> isize;
-}
-
-#[unsafe(no_mangle)]
-#[cfg(target_arch = "x86")]
-unsafe extern "C" fn syscall_handler_32(args: *const usize) -> isize {
-    let syscall_number = unsafe { *args };
-    unsafe { syscall_handler(syscall_number, args.add(1)) }
-}
-
-#[unsafe(no_mangle)]
-unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) -> isize {
-    let syscall_args = unsafe { core::slice::from_raw_parts(args, 6) };
-    let Ok(syscall_number) = u32::try_from(syscall_number) else {
-        return Errno::ENOSYS.as_neg() as isize;
-    };
-    let sysno = ::syscalls::Sysno::from(syscall_number);
-    let dispatcher = match sysno {
-        ::syscalls::Sysno::write => SyscallRequest::Write {
-            fd: syscall_args[0].reinterpret_as_signed().truncate(),
-            buf: unsafe { core::mem::transmute::<usize, ConstPtr<u8>>(syscall_args[1]) },
-            count: syscall_args[2],
-        },
-        ::syscalls::Sysno::exit | ::syscalls::Sysno::exit_group => {
-            litebox_platform_multiplex::platform()
-                .exit(syscall_args[0].reinterpret_as_signed().truncate())
-        }
-        _ => todo!("syscall {sysno} not implemented"),
-    };
-    if let SyscallRequest::Ret(ret) = dispatcher {
-        ret
-    } else {
-        syscall_entry(dispatcher)
-    }
 }
