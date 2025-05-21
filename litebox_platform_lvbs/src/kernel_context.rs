@@ -16,7 +16,6 @@ pub const KERNEL_STACK_SIZE: usize = 8 * PAGE_SIZE;
 pub struct KernelContext {
     pub hv_vp_assist_page: [u8; PAGE_SIZE],
     pub hv_simp_page: [u8; PAGE_SIZE],
-    pub hv_siefp_page: [u8; PAGE_SIZE],
     pub interrupt_stack: [u8; INTERRUPT_STACK_SIZE],
     _guard_page_0: [u8; PAGE_SIZE],
     pub kernel_stack: [u8; KERNEL_STACK_SIZE],
@@ -57,10 +56,6 @@ impl KernelContext {
         &raw const self.hv_simp_page as u64
     }
 
-    pub fn hv_siefp_page_as_u64(&self) -> u64 {
-        &raw const self.hv_siefp_page as u64
-    }
-
     pub fn hv_hypercall_page_as_u64(&self) -> u64 {
         get_hypercall_page_address()
     }
@@ -74,7 +69,6 @@ impl KernelContext {
 static mut PER_CORE_KERNEL_CONTEXT: [KernelContext; MAX_CORES] = [KernelContext {
     hv_vp_assist_page: [0u8; PAGE_SIZE],
     hv_simp_page: [0u8; PAGE_SIZE],
-    hv_siefp_page: [0u8; PAGE_SIZE],
     interrupt_stack: [0u8; INTERRUPT_STACK_SIZE],
     _guard_page_0: [0u8; PAGE_SIZE],
     kernel_stack: [0u8; KERNEL_STACK_SIZE],
