@@ -8,7 +8,7 @@ members = [
     "litebox_platform_multiplex",
     "litebox_runner_linux_userland",
     "litebox_shim_linux",
-    "litebox_syscall_rewriter"
+    "litebox_syscall_rewriter",
 ]
 
 # exclude binaries which need different toolchain and build target.

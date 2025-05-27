@@ -33,7 +33,7 @@ pub fn init_idt() {
     idt().load();
 }
 
-// TODO: carefully handle excpetions/interrupts. If an exception or interrupt is due to userspace code,
+// TODO: carefully handle exceptions/interrupts. If an exception or interrupt is due to userspace code,
 // we should destroy the corresponding user context rather than halt the entire kernel.
 
 extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame) {

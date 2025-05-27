@@ -57,8 +57,16 @@ impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
 }
 
 impl<Host: HostInterface> LinuxKernel<Host> {
+    /// This function initializes the VTL1 kernel platform (mostly the kernel page table).
+    /// `init_page_table_addr` specifies the physical address of the initial page table prepared by the VTL0 kernel.
+    /// `phys_start` and `phys_end` specify the entire range of physical memory that is reserved for the VTL1 kernel.
+    /// Since the VTL0 kernel does not fully maps this physical address range to the initial page table, this function
+    /// creates and maintains a kernel page table covering the entire VTL1 physical memory range. The caller must
+    /// ensure that the heap is enough space for this page table creation.
+    ///
     /// # Panics
     ///
+    /// Panics if the heap is not initialized yet or it does not have enough space to allocate page table entries.
     /// Panics if `phys_start` or `phys_end` is invalid
     pub fn new(
         init_page_table_addr: x86_64::PhysAddr,

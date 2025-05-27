@@ -35,6 +35,8 @@ pub fn init() -> Option<&'static Platform> {
             let vtl1_end = x86_64::PhysAddr::new(start + size);
 
             // Add a small range of mapped memory to the global allocator for populating the kernel page table.
+            // `VTL1_INIT_HEAP_START_PAGE` and `VTL1_INIT_HEP_SIZE` specify a physical address range which is
+            // not used by the VTL1 kernel.
             let mem_fill_start = usize::try_from(Platform::pa_to_va(vtl1_start).as_u64()).unwrap()
                 + VTL1_INIT_HEAP_START_PAGE * PAGE_SIZE;
             let mem_fill_size = VTL1_INIT_HEAP_SIZE;

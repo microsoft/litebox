@@ -242,7 +242,7 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> u64 {
     if let Some(heki_page) =
         unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(pa)) }
     {
-        // TODO: handle multi-paged input
+        // TODO: handle multi-paged input by walking through the pages
         for i in 0..core::cmp::min(usize::try_from(nranges).unwrap(), HEKI_MAX_RANGES) {
             let va = heki_page.ranges[i].va;
             let pa = heki_page.ranges[i].pa;
@@ -250,6 +250,8 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> u64 {
             let attr = heki_page.ranges[i].attributes;
             let attr: MemAttr = MemAttr::from_bits(attr).unwrap_or(MemAttr::empty());
             // TODO: protect memory using hv_modify_protection_mask() once we implement the GPA intercept handler
+            // (without a working GPA intercept handler, this memory protection hangs the kernel).
+            // for now, this function is a no-op and just prints the memory range we should protect.
             debug_serial_println!(
                 "VSM: Protect memory: va {:#x} pa {:#x} epa {:#x} {:?} (size: {})",
                 va,
@@ -271,14 +273,15 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> u64 {
     if let Some(heki_page) =
         unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(pa)) }
     {
-        // TODO: handle multi-paged input
+        // TODO: handle multi-paged input walking through the pages
         for i in 0..core::cmp::min(usize::try_from(nranges).unwrap(), HEKI_MAX_RANGES) {
             let va = heki_page.ranges[i].va;
             let pa = heki_page.ranges[i].pa;
             let epa = heki_page.ranges[i].epa;
             let attr = heki_page.ranges[i].attributes;
             let attr: MemAttr = MemAttr::from_bits(attr).unwrap_or(MemAttr::empty());
-            // TODO: load kernel data
+            // TODO: load kernel data (e.g., into `BTreeMap` or other data structures) once we implement data consumers like `mshv_vsm_validate_guest_module`.
+            // for now, this function is a no-op and just prints the memory range we should load.
             debug_serial_println!(
                 "VSM: Load kernel data: va {:#x} pa {:#x} epa {:#x} {:?} (size: {})",
                 va,
