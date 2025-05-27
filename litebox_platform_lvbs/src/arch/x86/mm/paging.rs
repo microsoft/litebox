@@ -265,17 +265,13 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         &self,
         frame_range: PhysFrameRange<Size4KiB>,
         flags: PageTableFlags,
-        is_vtl1: bool,
     ) -> Result<*mut u8, MapToError<Size4KiB>> {
         let mut allocator = PageTableAllocator::<M>::new();
 
         let mut inner = self.inner.lock();
         for target_frame in frame_range {
-            let page: Page<Size4KiB> = if is_vtl1 {
-                Page::containing_address(M::pa_to_va(target_frame.start_address()))
-            } else {
-                Page::containing_address(M::vtl0_pa_to_va(target_frame.start_address()))
-            };
+            let page: Page<Size4KiB> =
+                Page::containing_address(M::pa_to_va(target_frame.start_address()));
 
             match inner.translate(page.start_address()) {
                 TranslateResult::Mapped {
@@ -308,11 +304,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             }
         }
 
-        if is_vtl1 {
-            Ok(M::pa_to_va(frame_range.start.start_address()).as_mut_ptr())
-        } else {
-            Ok(M::vtl0_pa_to_va(frame_range.start.start_address()).as_mut_ptr())
-        }
+        Ok(M::pa_to_va(frame_range.start.start_address()).as_mut_ptr())
     }
 }
 

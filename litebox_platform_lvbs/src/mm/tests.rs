@@ -59,7 +59,6 @@ impl litebox::mm::allocator::MemoryProvider for MockKernel {
 impl super::MemoryProvider for MockKernel {
     const GVA_OFFSET: super::VirtAddr = super::VirtAddr::new(0);
     const PRIVATE_PTE_MASK: u64 = 0;
-    const VTL0_GVA_OFFSET: super::VirtAddr = super::VirtAddr::new(0);
 
     fn mem_allocate_pages(order: u32) -> Option<*mut u8> {
         ALLOCATOR.allocate_pages(order)

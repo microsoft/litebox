@@ -72,7 +72,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             .map_phys_frame_range(
                 PhysFrame::range(physframe_start, physframe_end),
                 PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-                true,
             )
             .is_err()
         {
@@ -114,8 +113,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             return Err(MapToError::FrameAllocationFailed);
         }
 
-        self.page_table
-            .map_phys_frame_range(frame_range, flags, false)
+        self.page_table.map_phys_frame_range(frame_range, flags)
     }
 
     /// This unmaps VTL0 pages from the page table. Allocator does not allocate frames

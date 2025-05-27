@@ -14,9 +14,6 @@ mod alloc {
     use crate::HostInterface;
 
     const HEAP_ORDER: usize = 23;
-    const PGDIR_SHIFT: u64 = 39;
-    const LINUX_PAGE_OFFSET: u64 = 0xffff_8880_0000_0000;
-    const VTL0_SHARED_PAGE_OFFSET: u64 = LINUX_PAGE_OFFSET + (2 << PGDIR_SHIFT);
 
     #[global_allocator]
     static LVBS_ALLOCATOR: litebox::mm::allocator::SafeZoneAllocator<
@@ -38,7 +35,6 @@ mod alloc {
     impl crate::mm::MemoryProvider for super::LvbsLinuxKernel {
         const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(0);
         const PRIVATE_PTE_MASK: u64 = 0;
-        const VTL0_GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(VTL0_SHARED_PAGE_OFFSET);
 
         fn mem_allocate_pages(order: u32) -> Option<*mut u8> {
             LVBS_ALLOCATOR.allocate_pages(order)
