@@ -60,9 +60,9 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// This function initializes the VTL1 kernel platform (mostly the kernel page table).
     /// `init_page_table_addr` specifies the physical address of the initial page table prepared by the VTL0 kernel.
     /// `phys_start` and `phys_end` specify the entire range of physical memory that is reserved for the VTL1 kernel.
-    /// Since the VTL0 kernel does not fully maps this physical address range to the initial page table, this function
+    /// Since the VTL0 kernel does not fully map this physical address range to the initial page table, this function
     /// creates and maintains a kernel page table covering the entire VTL1 physical memory range. The caller must
-    /// ensure that the heap is enough space for this page table creation.
+    /// ensure that the heap has enough space for this page table creation.
     ///
     /// # Panics
     ///
