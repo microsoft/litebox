@@ -4,7 +4,7 @@ use crate::{
     arch::gdt,
     mshv::{
         HvMessagePage, HvVpAssistPage,
-        vsm::{ControlRegMap, ControlRegMapEntry, NUM_CONTROL_REGS},
+        vsm::{ControlRegMap, NUM_CONTROL_REGS},
         vtl_switch::VtlState,
         vtl1_mem_layout::PAGE_SIZE,
     },
@@ -30,7 +30,7 @@ pub struct KernelContext {
     pub tss: gdt::AlignedTss,
     pub vtl0_state: VtlState,
     pub vtl1_state: VtlState,
-    pub vtl0_locked_regs: ControlRegMap<NUM_CONTROL_REGS>,
+    pub vtl0_locked_regs: ControlRegMap,
     pub gdt: Option<&'static gdt::GdtWrapper>,
 }
 
@@ -124,11 +124,7 @@ static mut PER_CORE_KERNEL_CONTEXT: [KernelContext; MAX_CORES] = [KernelContext 
         r15: 0,
     },
     vtl0_locked_regs: ControlRegMap {
-        entries: [ControlRegMapEntry {
-            reg_name: 0,
-            value: 0,
-        }; NUM_CONTROL_REGS],
-        len: 0,
+        entries: [(0, 0); NUM_CONTROL_REGS],
     },
     gdt: const { None },
 }; MAX_CORES];

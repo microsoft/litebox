@@ -187,23 +187,12 @@ pub fn mshv_vsm_configure_partition() -> u64 {
 pub fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
     let kernel_context = get_per_core_kernel_context();
 
-    let reg_names = [
-        HV_X64_REGISTER_CR0,
-        HV_X64_REGISTER_CR4,
-        HV_X64_REGISTER_LSTAR,
-        HV_X64_REGISTER_STAR,
-        HV_X64_REGISTER_CSTAR,
-        HV_X64_REGISTER_APIC_BASE,
-        HV_X64_REGISTER_EFER,
-        HV_X64_REGISTER_SYSENTER_CS,
-        HV_X64_REGISTER_SYSENTER_ESP,
-        HV_X64_REGISTER_SYSENTER_EIP,
-        HV_X64_REGISTER_SFMASK,
-    ];
+    kernel_context.vtl0_locked_regs.init();
+    let reg_names = kernel_context.vtl0_locked_regs.reg_names();
 
     for reg_name in reg_names {
         match hvcall_get_vp_vtl0_registers(reg_name) {
-            Ok(value) => kernel_context.vtl0_locked_regs.set_once(reg_name, value),
+            Ok(value) => kernel_context.vtl0_locked_regs.set(reg_name, value),
             Err(err) => {
                 return Err(err);
             }
@@ -420,41 +409,61 @@ pub enum VSMFunction {
     Unknown = 0xffff_ffff,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ControlRegMapEntry {
-    pub reg_name: u32,
-    pub value: u64,
-}
-
 pub const NUM_CONTROL_REGS: usize = 11;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
-pub struct ControlRegMap<const N: usize> {
-    pub entries: [ControlRegMapEntry; N],
-    pub len: usize,
+pub struct ControlRegMap {
+    pub entries: [(u32, u64); NUM_CONTROL_REGS],
 }
 
-impl<const N: usize> ControlRegMap<N> {
+impl ControlRegMap {
+    pub fn init(&mut self) {
+        // A list of control registers whose values will be locked.
+        [
+            HV_X64_REGISTER_CR0,
+            HV_X64_REGISTER_CR4,
+            HV_X64_REGISTER_LSTAR,
+            HV_X64_REGISTER_STAR,
+            HV_X64_REGISTER_CSTAR,
+            HV_X64_REGISTER_APIC_BASE,
+            HV_X64_REGISTER_EFER,
+            HV_X64_REGISTER_SYSENTER_CS,
+            HV_X64_REGISTER_SYSENTER_ESP,
+            HV_X64_REGISTER_SYSENTER_EIP,
+            HV_X64_REGISTER_SFMASK,
+        ]
+        .iter()
+        .enumerate()
+        .for_each(|(i, &reg_name)| {
+            self.entries[i] = (reg_name, 0);
+        });
+    }
+
     pub fn get(&self, reg_name: u32) -> Option<u64> {
         for entry in &self.entries {
-            if entry.reg_name == reg_name {
-                return Some(entry.value);
+            if entry.0 == reg_name {
+                return Some(entry.1);
             }
         }
         None
     }
 
-    pub fn set_once(&mut self, reg_name: u32, value: u64) {
-        for entry in &mut self.entries[..self.len] {
-            if entry.reg_name == reg_name {
+    pub fn set(&mut self, reg_name: u32, value: u64) {
+        for entry in &mut self.entries {
+            if entry.0 == reg_name {
+                entry.1 = value;
                 return;
             }
         }
+    }
 
-        if self.len < N {
-            self.entries[self.len] = ControlRegMapEntry { reg_name, value };
-            self.len += 1;
+    // consider implementing a mutable iterator (if we plan to lock many control registers)
+    pub fn reg_names(&self) -> [u32; NUM_CONTROL_REGS] {
+        let mut names = [0; NUM_CONTROL_REGS];
+        for (i, entry) in self.entries.iter().enumerate() {
+            names[i] = entry.0;
         }
+        names
     }
 }
