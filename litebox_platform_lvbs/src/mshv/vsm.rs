@@ -184,24 +184,6 @@ pub fn mshv_vsm_configure_partition() -> u64 {
     0
 }
 
-pub fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
-    let kernel_context = get_per_core_kernel_context();
-
-    kernel_context.vtl0_locked_regs.init();
-    let reg_names = kernel_context.vtl0_locked_regs.reg_names();
-
-    for reg_name in reg_names {
-        match hvcall_get_vp_vtl0_registers(reg_name) {
-            Ok(value) => kernel_context.vtl0_locked_regs.set(reg_name, value),
-            Err(err) => {
-                return Err(err);
-            }
-        }
-    }
-
-    Ok(0)
-}
-
 /// VSM function for locking control registers
 pub fn mshv_vsm_lock_regs() -> u64 {
     debug_serial_println!("VSM: Lock control registers");
@@ -466,4 +448,17 @@ impl ControlRegMap {
         }
         names
     }
+}
+
+fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
+    let kernel_context = get_per_core_kernel_context();
+
+    kernel_context.vtl0_locked_regs.init();
+
+    for reg_name in kernel_context.vtl0_locked_regs.reg_names() {
+        let value = hvcall_get_vp_vtl0_registers(reg_name)?;
+        kernel_context.vtl0_locked_regs.set(reg_name, value);
+    }
+
+    Ok(0)
 }
