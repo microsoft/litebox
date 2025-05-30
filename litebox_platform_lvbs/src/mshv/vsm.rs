@@ -22,7 +22,7 @@ use crate::{
         VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY, VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT,
         VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE, VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags,
         X86Cr4Flags,
-        heki::{HEKI_MAX_RANGES, HekiPage, MemAttr, memattr_to_hvpageprotflags},
+        heki::{HEKI_MAX_RANGES, HekiPage, MemAttr},
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
@@ -203,7 +203,7 @@ pub fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
 
     for reg_name in reg_names {
         match hvcall_get_vp_vtl0_registers(reg_name) {
-            Ok(value) => kernel_context.vtl0_locked_regs.set(reg_name, value),
+            Ok(value) => kernel_context.vtl0_locked_regs.set_once(reg_name, value),
             Err(err) => {
                 return Err(err);
             }
@@ -278,11 +278,8 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> u64 {
     if let Some(heki_page) =
         unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(pa)) }
     {
-        if nranges > HEKI_MAX_RANGES as u64 {
-            todo!("handle multi-page input with nranges > HEKI_MAX_RANGES");
-        }
-
-        for i in 0..usize::try_from(nranges).unwrap() {
+        // TODO: handle multi-paged input by walking through the pages
+        for i in 0..core::cmp::min(usize::try_from(nranges).unwrap(), HEKI_MAX_RANGES) {
             let va = heki_page.ranges[i].va;
             let pa = heki_page.ranges[i].pa;
             let epa = heki_page.ranges[i].epa;
@@ -299,20 +296,6 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> u64 {
                 attr,
                 epa - pa
             );
-
-            let mut prot = memattr_to_hvpageprotflags(attr);
-
-            // CAUTION. This is only for debugging purposes. LVBS prohibits the execution of kernel modules
-            // without validation. Due to this, our current implementation (which lacks module validation)
-            // results in a GP fault if we do not allow kernel code execution.
-            #[cfg(debug_assertions)]
-            prot.set(HvPageProtFlags::HV_PAGE_EXECUTABLE, true);
-
-            if let Err(result) = hv_modify_vtl_protection_mask(pa, (epa - pa) >> PAGE_SHIFT, prot) {
-                serial_println!("Err: {:?}", result);
-                let err: u32 = result.into();
-                return err.into();
-            }
         }
     } else {
         serial_println!("Failed to get VTL0 memory for mshv_vsm_protect_memory");
@@ -326,11 +309,8 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> u64 {
     if let Some(heki_page) =
         unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(pa)) }
     {
-        if nranges > HEKI_MAX_RANGES as u64 {
-            todo!("handle multi-page input with nranges > HEKI_MAX_RANGES");
-        }
-
-        for i in 0..usize::try_from(nranges).unwrap() {
+        // TODO: handle multi-paged input walking through the pages
+        for i in 0..core::cmp::min(usize::try_from(nranges).unwrap(), HEKI_MAX_RANGES) {
             let va = heki_page.ranges[i].va;
             let pa = heki_page.ranges[i].pa;
             let epa = heki_page.ranges[i].epa;
@@ -448,13 +428,14 @@ pub struct ControlRegMapEntry {
 
 pub const NUM_CONTROL_REGS: usize = 11;
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
-pub struct ControlRegMap {
-    pub entries: [ControlRegMapEntry; NUM_CONTROL_REGS],
+pub struct ControlRegMap<const N: usize> {
+    pub entries: [ControlRegMapEntry; N],
+    pub len: usize,
 }
 
-impl ControlRegMap {
+impl<const N: usize> ControlRegMap<N> {
     pub fn get(&self, reg_name: u32) -> Option<u64> {
         for entry in &self.entries {
             if entry.reg_name == reg_name {
@@ -463,15 +444,17 @@ impl ControlRegMap {
         }
         None
     }
-    pub fn set(&mut self, reg_name: u32, value: u64) {
-        for entry in &mut self.entries {
+
+    pub fn set_once(&mut self, reg_name: u32, value: u64) {
+        for entry in &mut self.entries[..self.len] {
             if entry.reg_name == reg_name {
-                entry.value = value;
                 return;
             }
         }
-        // If the register is not found, we can either ignore it or handle it as an error.
-        // For now, we will just ignore it.
-        debug_serial_println!("ControlRegMap: Unknown register name {:#x}", reg_name);
+
+        if self.len < N {
+            self.entries[self.len] = ControlRegMapEntry { reg_name, value };
+            self.len += 1;
+        }
     }
 }

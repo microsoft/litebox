@@ -17,6 +17,7 @@ bitflags::bitflags! {
     }
 }
 
+#[expect(dead_code)]
 pub(crate) fn memattr_to_hvpageprotflags(attr: MemAttr) -> HvPageProtFlags {
     let mut flags = HvPageProtFlags::empty();
 

@@ -54,7 +54,7 @@ pub fn vsm_handle_intercept() -> u64 {
     }
     let payload = unsafe { (*simp_page).sint_message[0].payload };
 
-    let int_msg_hdr: HvInterceptMessageHeader = match HvMessageType::try_from(msg_type).unwrap() {
+    match HvMessageType::try_from(msg_type).unwrap() {
         HvMessageType::GpaIntercept => {
             let int_msg = unsafe {
                 let ptr = payload.as_ptr().cast::<HvMemInterceptMessage>();
@@ -90,7 +90,7 @@ pub fn vsm_handle_intercept() -> u64 {
                 InterceptedMsrName::MsrSysenterEip => HV_X64_REGISTER_SYSENTER_EIP,
                 InterceptedMsrName::Unknown => {
                     panic!(
-                        "Intercepted write to MSR {:#x} that we do not program to intercept",
+                        "Intercepted write to MSR {:#x} that we do not expect",
                         msr_name
                     );
                 }
@@ -105,7 +105,8 @@ pub fn vsm_handle_intercept() -> u64 {
                 return raise_vtl0_gp_fault();
             }
 
-            int_msg.hdr
+            let int_msg_hdr = int_msg.hdr;
+            advance_vtl0_rip(&int_msg_hdr)
         }
         HvMessageType::RegisterIntercept => {
             let int_msg = unsafe {
@@ -133,7 +134,7 @@ pub fn vsm_handle_intercept() -> u64 {
                 }
                 InterceptedRegisterName::Unknown => {
                     panic!(
-                        "Intercepted write to register {:#x} that we do not program to intercept",
+                        "Intercepted write to register {:#x} that we do not expect",
                         reg_name
                     );
                 }
@@ -148,18 +149,19 @@ pub fn vsm_handle_intercept() -> u64 {
                 return raise_vtl0_gp_fault();
             }
 
-            int_msg.hdr
+            let int_msg_hdr = int_msg.hdr;
+            advance_vtl0_rip(&int_msg_hdr)
         }
         _ => {
             serial_println!(
-                "VSM: Unhandled/unknown synthetic interrupt message type {:#x}",
+                "VSM: Ignore unhandled/unknown synthetic interrupt message type {:#x}",
                 msg_type
             );
-            return raise_vtl0_gp_fault();
+            return 0;
         }
     };
 
-    advance_vtl0_rip(&int_msg_hdr)
+    0
 }
 
 #[inline]
@@ -181,7 +183,7 @@ fn raise_vtl0_gp_fault() -> u64 {
     exception.set_vector(u64::from(
         x86_64::structures::idt::ExceptionVector::GeneralProtection as u8,
     ));
-    exception.set_error_code(0x0);
+    exception.set_error_code(0);
 
     if let Err(result) = write_vtl0_register(HV_REGISTER_PENDING_EVENT0, exception.as_u64()) {
         return result;

@@ -3,11 +3,8 @@
 use crate::{
     arch::gdt,
     mshv::{
-        HV_X64_REGISTER_APIC_BASE, HV_X64_REGISTER_CR0, HV_X64_REGISTER_CR4, HV_X64_REGISTER_CSTAR,
-        HV_X64_REGISTER_EFER, HV_X64_REGISTER_LSTAR, HV_X64_REGISTER_SFMASK, HV_X64_REGISTER_STAR,
-        HV_X64_REGISTER_SYSENTER_CS, HV_X64_REGISTER_SYSENTER_EIP, HV_X64_REGISTER_SYSENTER_ESP,
         HvMessagePage, HvVpAssistPage,
-        vsm::{ControlRegMap, ControlRegMapEntry},
+        vsm::{ControlRegMap, ControlRegMapEntry, NUM_CONTROL_REGS},
         vtl_switch::VtlState,
         vtl1_mem_layout::PAGE_SIZE,
     },
@@ -33,7 +30,7 @@ pub struct KernelContext {
     pub tss: gdt::AlignedTss,
     pub vtl0_state: VtlState,
     pub vtl1_state: VtlState,
-    pub vtl0_locked_regs: ControlRegMap,
+    pub vtl0_locked_regs: ControlRegMap<NUM_CONTROL_REGS>,
     pub gdt: Option<&'static gdt::GdtWrapper>,
 }
 
@@ -127,52 +124,11 @@ static mut PER_CORE_KERNEL_CONTEXT: [KernelContext; MAX_CORES] = [KernelContext 
         r15: 0,
     },
     vtl0_locked_regs: ControlRegMap {
-        entries: [
-            ControlRegMapEntry {
-                reg_name: HV_X64_REGISTER_CR0,
-                value: 0,
-            },
-            ControlRegMapEntry {
-                reg_name: HV_X64_REGISTER_CR4,
-                value: 0,
-            },
-            ControlRegMapEntry {
-                reg_name: HV_X64_REGISTER_LSTAR,
-                value: 0,
-            },
-            ControlRegMapEntry {
-                reg_name: HV_X64_REGISTER_STAR,
-                value: 0,
-            },
-            ControlRegMapEntry {
-                reg_name: HV_X64_REGISTER_CSTAR,
-                value: 0,
-            },
-            ControlRegMapEntry {
-                reg_name: HV_X64_REGISTER_APIC_BASE,
-                value: 0,
-            },
-            ControlRegMapEntry {
-                reg_name: HV_X64_REGISTER_EFER,
-                value: 0,
-            },
-            ControlRegMapEntry {
-                reg_name: HV_X64_REGISTER_SYSENTER_CS,
-                value: 0,
-            },
-            ControlRegMapEntry {
-                reg_name: HV_X64_REGISTER_SYSENTER_ESP,
-                value: 0,
-            },
-            ControlRegMapEntry {
-                reg_name: HV_X64_REGISTER_SYSENTER_EIP,
-                value: 0,
-            },
-            ControlRegMapEntry {
-                reg_name: HV_X64_REGISTER_SFMASK,
-                value: 0,
-            },
-        ],
+        entries: [ControlRegMapEntry {
+            reg_name: 0,
+            value: 0,
+        }; NUM_CONTROL_REGS],
+        len: 0,
     },
     gdt: const { None },
 }; MAX_CORES];
