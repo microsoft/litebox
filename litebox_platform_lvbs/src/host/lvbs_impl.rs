@@ -11,33 +11,43 @@ pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
 
 #[cfg(not(test))]
 mod alloc {
-    const HEAP_ORDER: usize = 21;
+    use crate::HostInterface;
+
+    const HEAP_ORDER: usize = 23;
 
     #[global_allocator]
-    static LVBS_ALLOCATOR: crate::mm::alloc::SafeZoneAllocator<
+    static LVBS_ALLOCATOR: litebox::mm::allocator::SafeZoneAllocator<
         'static,
         HEAP_ORDER,
         super::LvbsLinuxKernel,
-    > = crate::mm::alloc::SafeZoneAllocator::new();
+    > = litebox::mm::allocator::SafeZoneAllocator::new();
+
+    impl litebox::mm::allocator::MemoryProvider for super::LvbsLinuxKernel {
+        fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
+            super::HostLvbsInterface::alloc(layout)
+        }
+
+        unsafe fn free(addr: usize) {
+            unsafe { super::HostLvbsInterface::free(addr) }
+        }
+    }
 
     impl crate::mm::MemoryProvider for super::LvbsLinuxKernel {
         const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(0);
         const PRIVATE_PTE_MASK: u64 = 0;
 
-        fn mem_allocate_pages(_order: u32) -> Option<*mut u8> {
-            unimplemented!()
+        fn mem_allocate_pages(order: u32) -> Option<*mut u8> {
+            LVBS_ALLOCATOR.allocate_pages(order)
         }
 
-        unsafe fn mem_free_pages(_ptr: *mut u8, _order: u32) {
-            unimplemented!()
+        unsafe fn mem_free_pages(ptr: *mut u8, order: u32) {
+            unsafe {
+                LVBS_ALLOCATOR.free_pages(ptr, order);
+            }
         }
 
-        fn alloc(_layout: &core::alloc::Layout) -> Result<(usize, usize), crate::Errno> {
-            unimplemented!()
-        }
-
-        unsafe fn free(_addr: usize) {
-            unimplemented!()
+        unsafe fn mem_fill_pages(start: usize, size: usize) {
+            unsafe { LVBS_ALLOCATOR.fill_pages(start, size) };
         }
     }
 }
@@ -59,8 +69,11 @@ impl HostInterface for HostLvbsInterface {
         serial_print_string(msg);
     }
 
-    fn alloc(_layout: &core::alloc::Layout) -> Result<(usize, usize), Errno> {
-        unimplemented!()
+    fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
+        panic!(
+            "dynamic memory allocation is not supported (layout = {:?})",
+            layout
+        );
     }
 
     unsafe fn free(_addr: usize) {

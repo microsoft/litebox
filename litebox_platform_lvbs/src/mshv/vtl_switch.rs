@@ -4,7 +4,7 @@ use crate::{
     kernel_context::get_per_core_kernel_context,
     mshv::{
         VTL_ENTRY_REASON_INTERCEPT, VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL,
-        vsm::{NUM_VTLCALL_PARAMS, VSMFunction, vsm_dispatch},
+        vsm::{NUM_VTLCALL_PARAMS, VSMFunction, vsm_dispatch, vsm_handle_intercept},
     },
     serial_println,
 };
@@ -194,7 +194,11 @@ fn load_vtl1_state() {
     pop_vtl_state(&vtl1_state);
 }
 
-pub fn vtl_switch_loop_entry() -> ! {
+pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
+    if let Some(platform) = platform {
+        crate::set_platform_low(platform);
+    }
+
     save_vtl0_state();
     // This is a dummy call to satisfy load_vtl0_state() with reasonable register values.
     // We do not save VTL0 registers during VTL1 initialization.
@@ -231,8 +235,8 @@ pub fn vtl_switch_loop(result: u64) -> ! {
                 }
             }
             VtlEntryReason::Interrupt => {
-                serial_println!("handle VTL interrupt");
-                vtl_switch_loop(0)
+                let new_result = vsm_handle_intercept();
+                vtl_switch_loop(new_result)
             }
             VtlEntryReason::Intercept => {
                 serial_println!("handle VTL intercept");

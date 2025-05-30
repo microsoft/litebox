@@ -5,7 +5,10 @@ edition = "2024"
 
 [dependencies]
 litebox = { version = "0.1.0", path = "../litebox" }
-litebox_platform_lvbs = { version = "0.1.0", path = "../litebox_platform_lvbs" }
+litebox_platform_lvbs = { version = "0.1.0", path = "../litebox_platform_lvbs", features = ["interrupt"] }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

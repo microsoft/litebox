@@ -1,12 +1,7 @@
-//! Memory management module including:
-//! - Buddy and Slab allocator
-//! - Page table management
-
-use buddy_system_allocator::Heap;
+//! Memory management module
 
 use crate::arch::{PhysAddr, VirtAddr};
 
-pub(crate) mod alloc;
 pub(crate) mod pgtable;
 
 #[cfg(test)]
@@ -21,35 +16,6 @@ pub trait MemoryProvider {
     /// For simplicity, we assume the mask is constant.
     const PRIVATE_PTE_MASK: u64;
 
-    /// For page allocation from host.
-    ///
-    /// Note this is only called by [`Self::rescue_heap`] when the buddy allocator is out of memory.
-    ///
-    /// It can return more than requested size. On success, it returns the start address
-    /// and the size of the allocated memory.
-    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::Errno>;
-
-    /// Returns the memory back to host.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the `addr` is valid and was allocated by [`Self::alloc`].
-    unsafe fn free(addr: usize);
-
-    /// Called to refill the buddy allocator when OOM occurs.
-    fn rescue_heap<const ORDER: usize>(heap: &mut Heap<ORDER>, layout: &core::alloc::Layout) {
-        match Self::alloc(layout) {
-            Ok((start, size)) => {
-                // the returned size might be larger than requested (i.e., layout.size())
-                // TODO: init reference count for allocated pages
-                unsafe { heap.add_to_heap(start, start + size) };
-            }
-            Err(e) => {
-                panic!("OOM: {e}");
-            }
-        }
-    }
-
     /// Allocate (1 << `order`) virtually and physically contiguous pages from global allocator.
     fn mem_allocate_pages(order: u32) -> Option<*mut u8>;
 
@@ -61,6 +27,14 @@ pub trait MemoryProvider {
     ///
     /// `order` must be the same as the one used during allocation.
     unsafe fn mem_free_pages(ptr: *mut u8, order: u32);
+
+    /// Add a range of memory to global allocator.
+    /// Morally, the global allocator takes ownership of this range of memory.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the memory range is valid and not used by any others.
+    unsafe fn mem_fill_pages(start: usize, size: usize);
 
     /// Obtain physical address (PA) of a page given its VA
     fn va_to_pa(va: VirtAddr) -> PhysAddr {

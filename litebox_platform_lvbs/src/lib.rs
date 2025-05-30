@@ -2,20 +2,25 @@
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
-#![feature(abi_x86_interrupt)]
+#![cfg_attr(feature = "interrupt", feature(abi_x86_interrupt))]
 
+use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};
 
 use host::linux::sigset_t;
 use litebox::mm::linux::PageRange;
+use litebox::platform::page_mgmt::DeallocationError;
 use litebox::platform::{
     DebugLogProvider, ExitProvider, IPInterfaceProvider, ImmediatelyWokenUp,
-    PageManagementProvider, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
+    PageManagementProvider, RawMutexProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
 };
 use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::errno::Errno;
 use ptr::{UserConstPtr, UserMutPtr};
+use x86_64::structures::paging::{
+    PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange, mapper::MapToError,
+};
 
 extern crate alloc;
 
@@ -32,7 +37,8 @@ static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 /// It requires a host that implements the [`HostInterface`] trait.
 pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
-    page_table: mm::PageTable<4096>,
+    page_table: mm::PageTable<PAGE_SIZE>,
+    vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
 }
 
 impl<Host: HostInterface> ExitProvider for LinuxKernel<Host> {
@@ -51,18 +57,169 @@ impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
 }
 
 impl<Host: HostInterface> LinuxKernel<Host> {
-    pub fn new(init_page_table_addr: x86_64::PhysAddr) -> &'static Self {
+    /// This function initializes the VTL1 kernel platform (mostly the kernel page table).
+    /// `init_page_table_addr` specifies the physical address of the initial page table prepared by the VTL0 kernel.
+    /// `phys_start` and `phys_end` specify the entire range of physical memory that is reserved for the VTL1 kernel.
+    /// Since the VTL0 kernel does not fully map this physical address range to the initial page table, this function
+    /// creates and maintains a kernel page table covering the entire VTL1 physical memory range. The caller must
+    /// ensure that the heap has enough space for this page table creation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the heap is not initialized yet or it does not have enough space to allocate page table entries.
+    /// Panics if `phys_start` or `phys_end` is invalid
+    pub fn new(
+        init_page_table_addr: x86_64::PhysAddr,
+        phys_start: x86_64::PhysAddr,
+        phys_end: x86_64::PhysAddr,
+    ) -> &'static Self {
+        let pt = unsafe { mm::PageTable::new(init_page_table_addr) };
+        let physframe_start = PhysFrame::containing_address(phys_start);
+        let physframe_end = PhysFrame::containing_address(phys_end);
+        if pt
+            .map_phys_frame_range(
+                PhysFrame::range(physframe_start, physframe_end),
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+            )
+            .is_err()
+        {
+            panic!("Failed to map VTL1 physical memory");
+        }
+
         // There is only one long-running platform ever expected, thus this leak is perfectly ok in
         // order to simplify usage of the platform.
         alloc::boxed::Box::leak(alloc::boxed::Box::new(Self {
             host_and_task: core::marker::PhantomData,
-            // TODO: Update the init physaddr
-            page_table: unsafe { mm::PageTable::new(init_page_table_addr) },
+            page_table: pt,
+            vtl1_phys_frame_range: PhysFrame::range(physframe_start, physframe_end),
         }))
     }
 
     pub fn init(&self, cpu_mhz: u64) {
         CPU_MHZ.store(cpu_mhz, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// This maps VTL0 physical memory to the page table
+    /// # Panics
+    ///
+    /// Panics if `phys_start` or `phys_end` is not aligned to the page size
+    pub fn map_vtl0_phys_range(
+        &self,
+        phys_start: x86_64::PhysAddr,
+        phys_end: x86_64::PhysAddr,
+        flags: PageTableFlags,
+    ) -> Result<*mut u8, MapToError<Size4KiB>> {
+        let frame_range = PhysFrame::range(
+            PhysFrame::containing_address(phys_start),
+            PhysFrame::containing_address(phys_end),
+        );
+
+        // this function should not be used to map VTL1 memory
+        if frame_range.start < self.vtl1_phys_frame_range.end
+            && self.vtl1_phys_frame_range.start < frame_range.end
+        {
+            return Err(MapToError::FrameAllocationFailed);
+        }
+
+        self.page_table.map_phys_frame_range(frame_range, flags)
+    }
+
+    /// This unmaps VTL0 pages from the page table. Allocator does not allocate frames
+    /// for VTL0 pages (i.e., it is always shared mapping), so it must not attempt to deallocate them.
+    pub fn unmap_vtl0_pages(
+        &self,
+        page_range: PageRange<PAGE_SIZE>,
+    ) -> Result<(), DeallocationError> {
+        unsafe { self.page_table.unmap_pages(page_range, false) }
+    }
+
+    /// This function copies data from VTL0 physical memory to the VTL1 kernel.
+    /// Use this function instead of map/unmap functions to avoid potential TOCTTOU.
+    /// # Safety
+    ///
+    /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address
+    /// # Panics
+    ///
+    /// Panics if `phys_addr` is invalid
+    pub unsafe fn copy_from_vtl0_phys<T: Copy>(
+        &self,
+        phys_addr: x86_64::PhysAddr,
+    ) -> Option<alloc::boxed::Box<T>> {
+        use alloc::boxed::Box;
+
+        if let Ok(addr) = self.map_vtl0_phys_range(
+            phys_addr,
+            phys_addr + u64::try_from(core::mem::size_of::<T>() + PAGE_SIZE).unwrap(),
+            PageTableFlags::PRESENT,
+        ) {
+            let offset = usize::try_from(phys_addr.as_u64()).unwrap() & (PAGE_SIZE - 1);
+            let raw = Box::into_raw(Box::new(core::mem::MaybeUninit::<T>::uninit()));
+
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    addr.wrapping_add(offset) as *const T,
+                    (*raw).as_mut_ptr(),
+                    1,
+                );
+            }
+
+            self.unmap_vtl0_pages(
+                PageRange::<PAGE_SIZE>::new(
+                    addr as usize,
+                    (addr as usize + core::mem::size_of::<T>()).next_multiple_of(PAGE_SIZE)
+                        + PAGE_SIZE,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+            return Some(unsafe { Box::from_raw((*raw).as_mut_ptr()) });
+        }
+
+        None
+    }
+
+    /// This function copies data from the VTL1 kernel to VTL0 physical memory.
+    /// Use this function instead of map/unmap functions to avoid potential TOCTTOU.
+    /// # Safety
+    ///
+    /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address
+    /// # Panics
+    ///
+    /// Panics if phys_addr is invalid
+    pub unsafe fn copy_to_vtl0_phys<T: Copy>(
+        &self,
+        phys_addr: x86_64::PhysAddr,
+        value: &T,
+    ) -> bool {
+        if let Ok(addr) = self.map_vtl0_phys_range(
+            phys_addr,
+            phys_addr + u64::try_from(core::mem::size_of::<T>() + PAGE_SIZE).unwrap(),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        ) {
+            let offset = usize::try_from(phys_addr.as_u64()).unwrap() & (PAGE_SIZE - 1);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    core::ptr::from_ref::<T>(value),
+                    addr.wrapping_add(offset).cast::<T>(),
+                    1,
+                );
+            }
+
+            self.unmap_vtl0_pages(
+                PageRange::<PAGE_SIZE>::new(
+                    addr as usize,
+                    (addr as usize + core::mem::size_of::<T>()).next_multiple_of(PAGE_SIZE)
+                        + PAGE_SIZE,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+            return true;
+        }
+
+        false
     }
 }
 
@@ -241,7 +398,7 @@ pub trait HostInterface {
     ///
     /// It can return more than requested size. On success, it returns the start address
     /// and the size of the allocated memory.
-    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), Errno>;
+    fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)>;
     // TODO: leave this for now for testing. LVBS does not allow dynamnic memory allocation,
     // so it should be no-op or removed.
 
@@ -328,7 +485,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
         let range = PageRange::new(range.start, range.end)
             .ok_or(litebox::platform::page_mgmt::DeallocationError::Unaligned)?;
-        unsafe { self.page_table.unmap_pages(range) }
+        unsafe { self.page_table.unmap_pages(range, true) }
     }
 
     unsafe fn remap_pages(
@@ -373,6 +530,54 @@ impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKern
     }
 
     fn access_error(error_code: u64, flags: litebox::mm::linux::VmFlags) -> bool {
-        mm::PageTable::<4096>::access_error(error_code, flags)
+        mm::PageTable::<PAGE_SIZE>::access_error(error_code, flags)
     }
+}
+
+impl<Host: HostInterface> StdioProvider for LinuxKernel<Host> {
+    fn read_from_stdin(&self, _buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
+        unimplemented!()
+    }
+
+    fn write_to(
+        &self,
+        _stream: litebox::platform::StdioOutStream,
+        _buf: &[u8],
+    ) -> Result<usize, litebox::platform::StdioWriteError> {
+        unimplemented!()
+    }
+
+    fn is_a_tty(&self, _stream: litebox::platform::StdioStream) -> bool {
+        unimplemented!()
+    }
+}
+
+// NOTE: The below code is a naive workaround to let LVBS code to access the platform.
+// Rather than doing this, we should implement LVBS interface/provider for the platform.
+
+pub type Platform = crate::host::LvbsLinuxKernel;
+
+static PLATFORM_LOW: once_cell::race::OnceBox<&'static Platform> = once_cell::race::OnceBox::new();
+
+/// # Panics
+///
+/// Panics if invoked more than once
+#[expect(
+    clippy::match_wild_err_arm,
+    reason = "the platform itself is not Debug thus we cannot use `expect`"
+)]
+pub fn set_platform_low(platform: &'static Platform) {
+    match PLATFORM_LOW.set(alloc::boxed::Box::new(platform)) {
+        Ok(()) => {}
+        Err(_) => panic!("set_platform should only be called once per crate"),
+    }
+}
+
+/// # Panics
+///
+/// Panics if [`set_platform_low`] has not been invoked before this
+pub fn platform_low() -> &'static Platform {
+    PLATFORM_LOW
+        .get()
+        .expect("set_platform_low should have already been called before this point")
 }

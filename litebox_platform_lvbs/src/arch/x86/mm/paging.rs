@@ -7,6 +7,7 @@ use x86_64::{
         paging::{
             FrameAllocator, FrameDeallocator, MappedPageTable, Mapper, Page, PageSize, PageTable,
             PageTableFlags, PhysFrame, Size4KiB, Translate,
+            frame::PhysFrameRange,
             mapper::{
                 FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult,
                 UnmapError as X64UnmapError,
@@ -89,12 +90,14 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     }
 
     /// Unmap 4KiB pages from the page table
+    /// Set `dealloc_frames` to `true` to free the corresponding physical frames.
     ///
     /// Note it does not free the allocated frames for page table itself (only those allocated to
     /// user space).
     pub(crate) unsafe fn unmap_pages(
         &self,
         range: PageRange<ALIGN>,
+        dealloc_frames: bool,
     ) -> Result<(), page_mgmt::DeallocationError> {
         let start_va = VirtAddr::new(range.start as _);
         let start = Page::<Size4KiB>::from_start_address(start_va)
@@ -110,7 +113,9 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         for page in Page::range(start, end) {
             match inner.unmap(page) {
                 Ok((frame, fl)) => {
-                    unsafe { allocator.deallocate_frame(frame) };
+                    if dealloc_frames {
+                        unsafe { allocator.deallocate_frame(frame) };
+                    }
                     if FLUSH_TLB {
                         fl.flush();
                     }
@@ -178,12 +183,14 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                         todo!("return Err(page_mgmt::RemapError::RemapToHugePage);")
                     }
                     Err(X64UnmapError::InvalidFrameAddress(pa)) => {
-                        panic!("Invalid frame address: {:#x}", pa);
+                        // TODO: `panic!()` -> `todo!()` because user-driven interrupts or exceptions must not halt the kernel.
+                        // We should handle this exception carefully (i.e., clean up the context and data structures belonging to an errorneous process).
+                        todo!("Invalid frame address: {:#x}", pa);
                     }
                 },
                 TranslateResult::NotMapped => {}
                 TranslateResult::InvalidFrameAddress(pa) => {
-                    panic!("Invalid frame address: {:#x}", pa);
+                    todo!("Invalid frame address: {:#x}", pa);
                 }
             }
             start += 1;
@@ -243,12 +250,61 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 }
                 TranslateResult::NotMapped => {}
                 TranslateResult::InvalidFrameAddress(pa) => {
-                    panic!("Invalid frame address: {:#x}", pa);
+                    todo!("Invalid frame address: {:#x}", pa);
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Map physical frame range to the page table
+    ///
+    /// Note it does not rely on the page fault handler based mapping to avoid double faults.
+    pub(crate) fn map_phys_frame_range(
+        &self,
+        frame_range: PhysFrameRange<Size4KiB>,
+        flags: PageTableFlags,
+    ) -> Result<*mut u8, MapToError<Size4KiB>> {
+        let mut allocator = PageTableAllocator::<M>::new();
+
+        let mut inner = self.inner.lock();
+        for target_frame in frame_range {
+            let page: Page<Size4KiB> =
+                Page::containing_address(M::pa_to_va(target_frame.start_address()));
+
+            match inner.translate(page.start_address()) {
+                TranslateResult::Mapped {
+                    frame,
+                    offset: _,
+                    flags: _,
+                } => {
+                    assert!(
+                        target_frame.start_address() == frame.start_address(),
+                        "{page:?} is already mapped to {frame:?} instead of {target_frame:?}"
+                    );
+
+                    continue;
+                }
+                TranslateResult::NotMapped => {}
+                TranslateResult::InvalidFrameAddress(pa) => {
+                    todo!("Invalid frame address: {:#x}", pa);
+                }
+            }
+
+            match unsafe {
+                inner.map_to_with_table_flags(page, target_frame, flags, flags, &mut allocator)
+            } {
+                Ok(fl) => {
+                    if FLUSH_TLB {
+                        fl.flush();
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(M::pa_to_va(frame_range.start.start_address()).as_mut_ptr())
     }
 }
 
@@ -299,7 +355,7 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                     return Ok(());
                 }
 
-                panic!("Page fault on present page: {:#x}", page.start_address());
+                todo!("Page fault on present page: {:#x}", page.start_address());
             }
             TranslateResult::NotMapped => {
                 let mut allocator = PageTableAllocator::<M>::new();
@@ -339,7 +395,7 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                 }
             }
             TranslateResult::InvalidFrameAddress(pa) => {
-                panic!("Invalid frame address: {:#x}", pa);
+                todo!("Invalid frame address: {:#x}", pa);
             }
         }
         Ok(())

@@ -1,23 +1,28 @@
 //! VSM functions
 
 use crate::{
-    debug_serial_println,
-    host::bootparam::{get_num_possible_cpus, get_vtl1_memory_info},
-    kernel_context::get_core_id,
+    debug_serial_print, debug_serial_println,
+    host::{
+        bootparam::{get_num_possible_cpus, get_vtl1_memory_info},
+        linux::CpuMask,
+    },
+    kernel_context::{get_core_id, get_per_core_kernel_context},
     mshv::{
         HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
         HV_REGISTER_CR_INTERCEPT_CR4_MASK, HV_REGISTER_VSM_PARTITION_CONFIG,
-        HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HvCrInterceptControlFlags, HvPageProtFlags,
-        HvRegisterVsmPartitionConfig, HvRegisterVsmVpSecureVtlConfig,
-        VSM_VTL_CALL_FUNC_ID_BOOT_APS, VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY,
-        VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL, VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT,
-        VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE, VSM_VTL_CALL_FUNC_ID_LOAD_KDATA,
-        VSM_VTL_CALL_FUNC_ID_LOCK_REGS, VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY,
-        VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT, VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE,
-        VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags, X86Cr4Flags,
+        HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HV_SECURE_VTL_BOOT_TOKEN, HvCrInterceptControlFlags,
+        HvMessageType, HvPageProtFlags, HvRegisterVsmPartitionConfig,
+        HvRegisterVsmVpSecureVtlConfig, VSM_VTL_CALL_FUNC_ID_BOOT_APS,
+        VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY, VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL,
+        VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT, VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE,
+        VSM_VTL_CALL_FUNC_ID_LOAD_KDATA, VSM_VTL_CALL_FUNC_ID_LOCK_REGS,
+        VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY, VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT,
+        VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE, VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags,
+        X86Cr4Flags,
+        heki::{HEKI_MAX_RANGES, HekiPage, MemAttr},
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_set_vp_registers, init_vtl_aps},
-        vtl1_mem_layout::PAGE_SIZE,
+        vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,
 };
@@ -27,16 +32,18 @@ use num_enum::TryFromPrimitive;
 pub const NUM_VTLCALL_PARAMS: usize = 4;
 
 pub fn init() {
-    if get_core_id() == 0 {
-        mshv_vsm_configure_partition();
+    if get_core_id() == 0 && mshv_vsm_configure_partition() != 0 {
+        return;
     }
 
-    mshv_vsm_secure_config_vtl0();
+    if mshv_vsm_secure_config_vtl0() != 0 {
+        return;
+    }
 
     if get_core_id() == 0 {
         if let Ok((start, size)) = get_vtl1_memory_info() {
             debug_serial_println!("VSM: Protect GPAs from {:#x} to {:#x}", start, start + size);
-            let num_pages = size / PAGE_SIZE as u64;
+            let num_pages = size >> PAGE_SHIFT;
             let prot = HvPageProtFlags::HV_PAGE_ACCESS_NONE;
             if let Err(result) = hv_modify_vtl_protection_mask(start, num_pages, prot) {
                 serial_println!("Err: {:?}", result);
@@ -50,9 +57,27 @@ pub fn init() {
 /// VSM function for enabling VTL of APs
 /// # Panics
 /// Panics if hypercall for initializing VTL for APs fails
-pub fn mshv_vsm_enable_aps(_cpu_present_mask: u64) -> u64 {
+pub fn mshv_vsm_enable_aps(cpu_present_mask_pfn: u64) -> u64 {
     debug_serial_println!("VSM: Enable VTL of APs");
 
+    if let Some(cpu_mask) = unsafe {
+        crate::platform_low().copy_from_vtl0_phys::<CpuMask>(x86_64::PhysAddr::new(
+            cpu_present_mask_pfn << PAGE_SHIFT,
+        ))
+    } {
+        debug_serial_print!("cpu_present_mask: ");
+        for (i, elem) in cpu_mask.decode_cpu_mask().iter().enumerate() {
+            if *elem {
+                debug_serial_print!("{}, ", i);
+            }
+        }
+        debug_serial_println!("");
+    } else {
+        serial_println!("Failed to get cpu_present_mask");
+        return 1;
+    }
+
+    // TODO: cpu_present_mask vs num_possible_cpus in kernel command line. which one should we use?
     let Ok(num_cores) = get_num_possible_cpus() else {
         serial_println!("Failed to get number of possible cores");
         return 1;
@@ -69,9 +94,54 @@ pub fn mshv_vsm_enable_aps(_cpu_present_mask: u64) -> u64 {
 }
 
 /// VSM function for booting APs
-pub fn mshv_vsm_boot_aps(_cpu_online_mask_pfn: u64, _boot_signal_pfn: u64) -> u64 {
+pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> u64 {
     debug_serial_println!("VSM: Boot APs");
-    // TODO: update boot signal page accordingly
+
+    if let Some(cpu_mask) = unsafe {
+        crate::platform_low().copy_from_vtl0_phys::<CpuMask>(x86_64::PhysAddr::new(
+            cpu_online_mask_pfn << PAGE_SHIFT,
+        ))
+    } {
+        debug_serial_print!("cpu_online_mask: ");
+        for (i, elem) in cpu_mask.decode_cpu_mask().iter().enumerate() {
+            if *elem {
+                debug_serial_print!("{}, ", i);
+            }
+        }
+        debug_serial_println!("");
+    } else {
+        serial_println!("Failed to get cpu_online_mask");
+        return 1;
+    }
+
+    // boot_signal is an array of bytes whose length is the number of possible cores. Copy the entire page for now.
+    if let Some(mut boot_signal_page) = unsafe {
+        crate::platform_low().copy_from_vtl0_phys::<[u8; PAGE_SIZE]>(x86_64::PhysAddr::new(
+            boot_signal_pfn << PAGE_SHIFT,
+        ))
+    } {
+        // TODO: execute `init_vtl_ap` for each online core and update the corresponding boot signal byte.
+        // Currently, we use `init_vtl_aps` to initialize all present cores which
+        // takes a long time if we have a lot of cores.
+        debug_serial_println!("updating boot signal page");
+        for i in 0..get_num_possible_cpus().unwrap_or(0) {
+            boot_signal_page[i as usize] = HV_SECURE_VTL_BOOT_TOKEN;
+        }
+
+        if !unsafe {
+            crate::platform_low().copy_to_vtl0_phys::<[u8; PAGE_SIZE]>(
+                x86_64::PhysAddr::new(boot_signal_pfn << PAGE_SHIFT),
+                &boot_signal_page,
+            )
+        } {
+            serial_println!("Failed to copy boot signal page to VTL0");
+            return 1;
+        }
+    } else {
+        serial_println!("Failed to get boot signal page");
+        return 1;
+    }
+
     0
 }
 
@@ -168,16 +238,63 @@ pub fn mshv_vsm_end_of_boot() -> u64 {
 }
 
 /// VSM function for protecting certain memory range
-pub fn mshv_vsm_protect_memory(_pa: u64, _nranges: u64) -> u64 {
-    debug_serial_println!("VSM: Protect memory");
-    // TODO: protect memory using hv_modify_protection_mask()
+pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> u64 {
+    if let Some(heki_page) =
+        unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(pa)) }
+    {
+        // TODO: handle multi-paged input by walking through the pages
+        for i in 0..core::cmp::min(usize::try_from(nranges).unwrap(), HEKI_MAX_RANGES) {
+            let va = heki_page.ranges[i].va;
+            let pa = heki_page.ranges[i].pa;
+            let epa = heki_page.ranges[i].epa;
+            let attr = heki_page.ranges[i].attributes;
+            let attr: MemAttr = MemAttr::from_bits(attr).unwrap_or(MemAttr::empty());
+            // TODO: protect memory using hv_modify_protection_mask() once we implement the GPA intercept handler
+            // (without a working GPA intercept handler, this memory protection hangs the kernel).
+            // for now, this function is a no-op and just prints the memory range we should protect.
+            debug_serial_println!(
+                "VSM: Protect memory: va {:#x} pa {:#x} epa {:#x} {:?} (size: {})",
+                va,
+                pa,
+                epa,
+                attr,
+                epa - pa
+            );
+        }
+    } else {
+        serial_println!("Failed to get VTL0 memory for mshv_vsm_protect_memory");
+        return 1;
+    }
     0
 }
 
 /// VSM function for loading kernel data into VTL1
-pub fn mshv_vsm_load_kdata(_pa: u64, _nranges: u64) -> u64 {
-    debug_serial_println!("VSM: Load kernel data");
-    // TODO: load kernel data
+pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> u64 {
+    if let Some(heki_page) =
+        unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(pa)) }
+    {
+        // TODO: handle multi-paged input walking through the pages
+        for i in 0..core::cmp::min(usize::try_from(nranges).unwrap(), HEKI_MAX_RANGES) {
+            let va = heki_page.ranges[i].va;
+            let pa = heki_page.ranges[i].pa;
+            let epa = heki_page.ranges[i].epa;
+            let attr = heki_page.ranges[i].attributes;
+            let attr: MemAttr = MemAttr::from_bits(attr).unwrap_or(MemAttr::empty());
+            // TODO: load kernel data (e.g., into `BTreeMap` or other data structures) once we implement data consumers like `mshv_vsm_validate_guest_module`.
+            // for now, this function is a no-op and just prints the memory range we should load.
+            debug_serial_println!(
+                "VSM: Load kernel data: va {:#x} pa {:#x} epa {:#x} {:?} (size: {})",
+                va,
+                pa,
+                epa,
+                attr,
+                epa - pa
+            );
+        }
+    } else {
+        serial_println!("Failed to get VTL0 memory for mshv_vsm_load_kdata");
+        return 1;
+    }
     0
 }
 
@@ -265,4 +382,35 @@ pub enum VSMFunction {
     CopySecondaryKey = VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY,
     KexecValidate = VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE,
     Unknown = 0xffff_ffff,
+}
+
+pub fn vsm_handle_intercept() -> u64 {
+    let kernel_context = get_per_core_kernel_context();
+    let simp_page = kernel_context.hv_simp_page_as_mut_ptr();
+
+    let msg_type = unsafe { (*simp_page).sint_message[0].header.message_type };
+
+    // TODO: handle intercept and advance the VTL0 instruction pointer
+    match HvMessageType::try_from(msg_type).unwrap() {
+        HvMessageType::GpaIntercept => {
+            debug_serial_println!("VSM: GPA intercept");
+        }
+        HvMessageType::RegisterIntercept | HvMessageType::MsrIntercept => {
+            debug_serial_println!("VSM: Register intercept");
+        }
+        _ => {
+            serial_println!(
+                "VSM: Unhandled/unknown synthetic interrupt message type {:#x}",
+                msg_type
+            );
+            return 1;
+        }
+    }
+
+    // clear the handled synthetic interrupt
+    unsafe {
+        (*simp_page).sint_message[0].header.message_type = HvMessageType::None.into();
+    }
+
+    0
 }

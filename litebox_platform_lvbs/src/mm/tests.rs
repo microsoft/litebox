@@ -7,6 +7,7 @@ use litebox::{
     LiteBox,
     mm::{
         PageManager,
+        allocator::SafeZoneAllocator,
         linux::{PAGE_SIZE, PageFaultError, PageRange, VmFlags},
     },
     platform::RawConstPointer,
@@ -26,7 +27,7 @@ use crate::{
     ptr::UserMutPtr,
 };
 
-use super::{alloc::SafeZoneAllocator, pgtable::PageTableImpl};
+use super::pgtable::PageTableImpl;
 
 const MAX_ORDER: usize = 23;
 
@@ -34,11 +35,8 @@ static ALLOCATOR: SafeZoneAllocator<'static, MAX_ORDER, MockKernel> = SafeZoneAl
 /// const Array for VA to PA mapping
 static MAPPING: SpinMutex<ArrayVec<VirtAddr, 1024>> = SpinMutex::new(ArrayVec::new_const());
 
-impl super::MemoryProvider for MockKernel {
-    const GVA_OFFSET: super::VirtAddr = super::VirtAddr::new(0);
-    const PRIVATE_PTE_MASK: u64 = 0;
-
-    fn alloc(layout: &core::alloc::Layout) -> Result<(usize, usize), crate::Errno> {
+impl litebox::mm::allocator::MemoryProvider for MockKernel {
+    fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
         let mut mapping = MAPPING.lock();
         let (start, len) = MockHostInterface::alloc(layout)?;
         let begin = Page::<Size4KiB>::from_start_address(VirtAddr::new(start as _)).unwrap();
@@ -50,8 +48,17 @@ impl super::MemoryProvider for MockKernel {
             }
             mapping.push(page.start_address());
         }
-        Ok((start, len))
+        Some((start, len))
     }
+
+    unsafe fn free(addr: usize) {
+        unsafe { MockHostInterface::free(addr) };
+    }
+}
+
+impl super::MemoryProvider for MockKernel {
+    const GVA_OFFSET: super::VirtAddr = super::VirtAddr::new(0);
+    const PRIVATE_PTE_MASK: u64 = 0;
 
     fn mem_allocate_pages(order: u32) -> Option<*mut u8> {
         ALLOCATOR.allocate_pages(order)
@@ -61,8 +68,8 @@ impl super::MemoryProvider for MockKernel {
         unsafe { ALLOCATOR.free_pages(ptr, order) }
     }
 
-    unsafe fn free(addr: usize) {
-        unsafe { MockHostInterface::free(addr) };
+    unsafe fn mem_fill_pages(start: usize, size: usize) {
+        unsafe { ALLOCATOR.fill_pages(start, size) }
     }
 
     fn va_to_pa(va: VirtAddr) -> PhysAddr {
@@ -208,7 +215,7 @@ fn test_page_table() {
 
     // unmap all pages
     let range = PageRange::new(start_addr, new_addr + 4 * PAGE_SIZE).unwrap();
-    unsafe { pgtable.unmap_pages(range) }.unwrap();
+    unsafe { pgtable.unmap_pages(range, true) }.unwrap();
     for page in PageRange::<PAGE_SIZE>::new(start_addr, new_addr + 4 * PAGE_SIZE).unwrap() {
         assert!(matches!(
             pgtable.translate(VirtAddr::new(page as _)),
@@ -222,7 +229,11 @@ fn test_page_table() {
 fn test_vmm_page_fault() {
     let start_addr: usize = 0x1_0000;
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
-    let platform = MockKernel::new(p4.start_address());
+    let platform = MockKernel::new(
+        p4.start_address(),
+        x86_64::PhysAddr::new(0),
+        x86_64::PhysAddr::new(0),
+    );
     let litebox = LiteBox::new(platform);
     let mut vmm = PageManager::<_, PAGE_SIZE>::new(&litebox);
     unsafe {
