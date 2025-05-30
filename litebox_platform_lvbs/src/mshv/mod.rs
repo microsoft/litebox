@@ -4,7 +4,8 @@ mod heki;
 pub mod hvcall;
 mod hvcall_mm;
 mod hvcall_vp;
-mod vsm;
+pub(crate) mod vsm;
+mod vsm_intercept;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 
@@ -69,12 +70,32 @@ pub const HVCALL_ENABLE_VP_VTL: u16 = 0x_000f;
 pub const HVCALL_GET_VP_REGISTERS: u16 = 0x_0050;
 pub const HVCALL_SET_VP_REGISTERS: u16 = 0x_0051;
 
-pub const HV_REGISTER_VSM_PARTITION_STATUS: u32 = 0x_000d_0004;
-pub const HV_REGISTER_VSM_PARTITION_CONFIG: u32 = 0x_000d_0007;
-pub const HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0: u32 = 0x_000d_0010;
-pub const HV_REGISTER_CR_INTERCEPT_CONTROL: u32 = 0x_000e_0000;
-pub const HV_REGISTER_CR_INTERCEPT_CR0_MASK: u32 = 0x_000e_0001;
-pub const HV_REGISTER_CR_INTERCEPT_CR4_MASK: u32 = 0x_000e_0002;
+// Registers which are only accessible via HvGetVpRegisters
+pub const HV_X64_REGISTER_RIP: u32 = 0x0002_0010;
+pub const HV_X64_REGISTER_CR0: u32 = 0x0004_0000;
+pub const HV_X64_REGISTER_CR4: u32 = 0x0004_0003;
+pub const HV_X64_REGISTER_LDTR: u32 = 0x0006_0006;
+pub const HV_X64_REGISTER_TR: u32 = 0x0006_0007;
+pub const HV_X64_REGISTER_IDTR: u32 = 0x0007_0000;
+pub const HV_X64_REGISTER_GDTR: u32 = 0x0007_0001;
+pub const HV_X64_REGISTER_EFER: u32 = 0x0008_0001;
+pub const HV_X64_REGISTER_APIC_BASE: u32 = 0x0008_0003;
+pub const HV_X64_REGISTER_SYSENTER_CS: u32 = 0x0008_0005;
+pub const HV_X64_REGISTER_SYSENTER_EIP: u32 = 0x0008_0006;
+pub const HV_X64_REGISTER_SYSENTER_ESP: u32 = 0x0008_0007;
+pub const HV_X64_REGISTER_STAR: u32 = 0x0008_0008;
+pub const HV_X64_REGISTER_LSTAR: u32 = 0x0008_0009;
+pub const HV_X64_REGISTER_CSTAR: u32 = 0x0008_000A;
+pub const HV_X64_REGISTER_SFMASK: u32 = 0x0008_000B;
+pub const HV_X64_REGISTER_VSM_VP_STATUS: u32 = 0x000D_0003;
+pub const HV_REGISTER_VSM_CODEPAGE_OFFSETS: u32 = 0x000D_0002;
+pub const HV_REGISTER_VSM_PARTITION_STATUS: u32 = 0x000d_0004;
+pub const HV_REGISTER_VSM_PARTITION_CONFIG: u32 = 0x000d_0007;
+pub const HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0: u32 = 0x000d_0010;
+pub const HV_REGISTER_CR_INTERCEPT_CONTROL: u32 = 0x000e_0000;
+pub const HV_REGISTER_CR_INTERCEPT_CR0_MASK: u32 = 0x000e_0001;
+pub const HV_REGISTER_CR_INTERCEPT_CR4_MASK: u32 = 0x000e_0002;
+pub const HV_REGISTER_PENDING_EVENT0: u32 = 0x0001_0004;
 
 pub const HV_SECURE_VTL_BOOT_TOKEN: u8 = 0xdc;
 
@@ -89,6 +110,18 @@ pub const VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT: u32 = 0x1_ffe7;
 pub const VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE: u32 = 0x1_ffe8;
 pub const VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY: u32 = 0x1_ffe9;
 pub const VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE: u32 = 0x1_ffea;
+
+pub const MSR_EFER: u32 = 0xc000_0080;
+pub const MSR_STAR: u32 = 0xc000_0081;
+pub const MSR_LSTAR: u32 = 0xc000_0082;
+pub const MSR_CSTAR: u32 = 0xc000_0083;
+pub const MSR_SYSCALL_MASK: u32 = 0x0000_0084;
+pub const MSR_IA32_APICBASE: u32 = 0x1b;
+pub const MSR_IA32_SYSENTER_CS: u32 = 0x0000_0174;
+pub const MSR_IA32_SYSENTER_ESP: u32 = 0x0000_0175;
+pub const MSR_IA32_SYSENTER_EIP: u32 = 0x0000_0176;
+
+pub const DEFAULT_REG_PIN_MASK: u64 = u64::MAX;
 
 bitflags::bitflags! {
     #[derive(Debug, PartialEq)]
@@ -282,6 +315,66 @@ impl HvSetVpRegistersInput {
         HvSetVpRegistersInput {
             ..Default::default()
         }
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvGetVpRegistersInputHeader {
+    pub partitionid: u64,
+    pub vpindex: u32,
+    pub inputvtl: u8,
+    padding: [u8; 3],
+}
+
+#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvGetVpRegistersInputElement {
+    pub name0: u32,
+    pub name1: u32,
+}
+
+pub(crate) const HV_GET_VP_MAX_REGISTERS: usize = 1;
+
+#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvGetVpRegistersInput {
+    pub header: HvGetVpRegistersInputHeader,
+    pub element: [HvGetVpRegistersInputElement; HV_GET_VP_MAX_REGISTERS],
+}
+
+impl HvGetVpRegistersInput {
+    pub fn new() -> Self {
+        HvGetVpRegistersInput {
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvGetVpRegistersOutput {
+    value: [u64; 2],
+}
+
+impl HvGetVpRegistersOutput {
+    pub fn new() -> Self {
+        HvGetVpRegistersOutput {
+            ..Default::default()
+        }
+    }
+
+    pub fn as64(&self) -> (u64, u64) {
+        (self.value[0], self.value[1])
+    }
+
+    pub fn as32(&self) -> (u32, u32, u32, u32) {
+        (
+            (self.value[0] & 0xffff_ffff) as u32,
+            ((self.value[0] >> 32) & 0xffff_ffff) as u32,
+            (self.value[1] & 0xffff_ffff) as u32,
+            ((self.value[1] >> 32) & 0xffff_ffff) as u32,
+        )
     }
 }
 
@@ -710,7 +803,7 @@ pub enum HvMessageType {
 pub struct HvMessageHeader {
     pub message_type: u32,
     pub payload_size: u8,
-    pub message_flags: u16,
+    pub message_flags: u8,
     pub reserved: [u8; 2],
     pub sender: u64,
 }
@@ -882,4 +975,82 @@ pub struct HvMsrInterceptMessage {
     reserved_0: u32,
     pub rdx: u64,
     pub rax: u64,
+}
+
+#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvPendingExceptionEvent {
+    _as_u64: u64,
+    // union of
+    // event_pending: 1;
+    // event_type: 3;
+    // reserved_0: 4;
+    // deliver_error_code: 1;
+    // reserved_1: 7;
+    // vector: 16;
+    // error_code: 32;
+}
+
+impl HvPendingExceptionEvent {
+    const EVENT_PENDING_MASK: u64 = 0x1;
+    const EVENT_TYPE_MASK: u64 = 0xe;
+    const DELIVER_ERROR_CODE_MASK: u64 = 0x100;
+    const VECTOR_MASK: u64 = 0xffff_0000;
+    const ERROR_CODE_MASK: u64 = 0xffff_ffff_0000_0000;
+    const EVENT_PENDING_SHIFT: u64 = 0;
+    const EVENT_TYPE_SHIFT: u64 = 1;
+    const DELIVER_ERROR_CODE_SHIFT: u64 = 3;
+    const VECTOR_SHIFT: u64 = 16;
+    const ERROR_CODE_SHIFT: u64 = 32;
+
+    pub fn new() -> Self {
+        HvPendingExceptionEvent {
+            ..Default::default()
+        }
+    }
+
+    #[expect(clippy::used_underscore_binding)]
+    pub fn as_u64(&self) -> u64 {
+        self._as_u64
+    }
+
+    #[expect(clippy::used_underscore_binding)]
+    fn set_sub_config(&mut self, mask: u64, shift: u64, value: u64) {
+        self._as_u64 |= (value << shift) & mask;
+    }
+
+    pub fn set_event_pending(&mut self) {
+        self.set_sub_config(Self::EVENT_PENDING_MASK, Self::EVENT_PENDING_SHIFT, 1);
+    }
+
+    pub fn set_event_type(&mut self, event_type: u64) {
+        self.set_sub_config(Self::EVENT_TYPE_MASK, Self::EVENT_TYPE_SHIFT, event_type);
+    }
+
+    pub fn set_deliver_error_code(&mut self) {
+        self.set_sub_config(
+            Self::DELIVER_ERROR_CODE_MASK,
+            Self::DELIVER_ERROR_CODE_SHIFT,
+            1,
+        );
+    }
+
+    pub fn set_vector(&mut self, vector: u64) {
+        self.set_sub_config(Self::VECTOR_MASK, Self::VECTOR_SHIFT, vector);
+    }
+
+    pub fn set_error_code(&mut self, error_code: u64) {
+        self.set_sub_config(Self::ERROR_CODE_MASK, Self::ERROR_CODE_SHIFT, error_code);
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, PartialEq)]
+    pub struct TargetVtlMask: u8 {
+        const VTL0 = 1 << 4;
+        const VTL1 = 1 << 5;
+        const VTL2 = 1 << 6;
+
+        const _ = !0;
+    }
 }

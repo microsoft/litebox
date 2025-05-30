@@ -10,8 +10,11 @@ use crate::{
     mshv::{
         HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
         HV_REGISTER_CR_INTERCEPT_CR4_MASK, HV_REGISTER_VSM_PARTITION_CONFIG,
-        HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HV_SECURE_VTL_BOOT_TOKEN, HvCrInterceptControlFlags,
-        HvMessageType, HvPageProtFlags, HvRegisterVsmPartitionConfig,
+        HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HV_SECURE_VTL_BOOT_TOKEN, HV_X64_REGISTER_APIC_BASE,
+        HV_X64_REGISTER_CR0, HV_X64_REGISTER_CR4, HV_X64_REGISTER_CSTAR, HV_X64_REGISTER_EFER,
+        HV_X64_REGISTER_LSTAR, HV_X64_REGISTER_SFMASK, HV_X64_REGISTER_STAR,
+        HV_X64_REGISTER_SYSENTER_CS, HV_X64_REGISTER_SYSENTER_EIP, HV_X64_REGISTER_SYSENTER_ESP,
+        HvCrInterceptControlFlags, HvPageProtFlags, HvRegisterVsmPartitionConfig,
         HvRegisterVsmVpSecureVtlConfig, VSM_VTL_CALL_FUNC_ID_BOOT_APS,
         VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY, VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL,
         VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT, VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE,
@@ -19,9 +22,10 @@ use crate::{
         VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY, VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT,
         VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE, VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags,
         X86Cr4Flags,
-        heki::{HEKI_MAX_RANGES, HekiPage, MemAttr},
+        heki::{HEKI_MAX_RANGES, HekiPage, MemAttr, memattr_to_hvpageprotflags},
+        hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
-        hvcall_vp::{hvcall_set_vp_registers, init_vtl_aps},
+        hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,
@@ -153,7 +157,7 @@ pub fn mshv_vsm_secure_config_vtl0() -> u64 {
     config.set_tlb_locked();
 
     if let Err(result) =
-        hvcall_set_vp_registers(HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, config.as_u64(), 0)
+        hvcall_set_vp_registers(HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, config.as_u64())
     {
         serial_println!("Err: {:?}", result);
         let err: u32 = result.into();
@@ -170,8 +174,7 @@ pub fn mshv_vsm_configure_partition() -> u64 {
     config.set_default_vtl_protection_mask(HvPageProtFlags::HV_PAGE_FULL_ACCESS.bits().into());
     config.set_enable_vtl_protection();
 
-    if let Err(result) =
-        hvcall_set_vp_registers(HV_REGISTER_VSM_PARTITION_CONFIG, config.as_u64(), 0)
+    if let Err(result) = hvcall_set_vp_registers(HV_REGISTER_VSM_PARTITION_CONFIG, config.as_u64())
     {
         serial_println!("Err: {:?}", result);
         let err: u32 = result.into();
@@ -179,6 +182,35 @@ pub fn mshv_vsm_configure_partition() -> u64 {
     }
 
     0
+}
+
+pub fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
+    let kernel_context = get_per_core_kernel_context();
+
+    let reg_names = [
+        HV_X64_REGISTER_CR0,
+        HV_X64_REGISTER_CR4,
+        HV_X64_REGISTER_LSTAR,
+        HV_X64_REGISTER_STAR,
+        HV_X64_REGISTER_CSTAR,
+        HV_X64_REGISTER_APIC_BASE,
+        HV_X64_REGISTER_EFER,
+        HV_X64_REGISTER_SYSENTER_CS,
+        HV_X64_REGISTER_SYSENTER_ESP,
+        HV_X64_REGISTER_SYSENTER_EIP,
+        HV_X64_REGISTER_SFMASK,
+    ];
+
+    for reg_name in reg_names {
+        match hvcall_get_vp_vtl0_registers(reg_name) {
+            Ok(value) => kernel_context.vtl0_locked_regs.set(reg_name, value),
+            Err(err) => {
+                return Err(err);
+            }
+        }
+    }
+
+    Ok(0)
 }
 
 /// VSM function for locking control registers
@@ -201,7 +233,13 @@ pub fn mshv_vsm_lock_regs() -> u64 {
         | HvCrInterceptControlFlags::MSR_SYSENTER_EIP_WRITE.bits()
         | HvCrInterceptControlFlags::MSR_SFMASK_WRITE.bits();
 
-    if let Err(result) = hvcall_set_vp_registers(HV_REGISTER_CR_INTERCEPT_CONTROL, flag, 0) {
+    if let Err(result) = save_vtl0_locked_regs() {
+        serial_println!("Err: {:?}", result);
+        let err: u32 = result.into();
+        return err.into();
+    }
+
+    if let Err(result) = hvcall_set_vp_registers(HV_REGISTER_CR_INTERCEPT_CONTROL, flag) {
         serial_println!("Err: {:?}", result);
         let err: u32 = result.into();
         return err.into();
@@ -210,7 +248,6 @@ pub fn mshv_vsm_lock_regs() -> u64 {
     if let Err(result) = hvcall_set_vp_registers(
         HV_REGISTER_CR_INTERCEPT_CR4_MASK,
         X86Cr4Flags::CR4_PIN_MASK.bits().into(),
-        0,
     ) {
         serial_println!("Err: {:?}", result);
         let err: u32 = result.into();
@@ -220,7 +257,6 @@ pub fn mshv_vsm_lock_regs() -> u64 {
     if let Err(result) = hvcall_set_vp_registers(
         HV_REGISTER_CR_INTERCEPT_CR0_MASK,
         X86Cr0Flags::CR0_PIN_MASK.bits().into(),
-        0,
     ) {
         serial_println!("Err: {:?}", result);
         let err: u32 = result.into();
@@ -242,8 +278,11 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> u64 {
     if let Some(heki_page) =
         unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(pa)) }
     {
-        // TODO: handle multi-paged input by walking through the pages
-        for i in 0..core::cmp::min(usize::try_from(nranges).unwrap(), HEKI_MAX_RANGES) {
+        if nranges > HEKI_MAX_RANGES as u64 {
+            todo!("handle multi-page input with nranges > HEKI_MAX_RANGES");
+        }
+
+        for i in 0..usize::try_from(nranges).unwrap() {
             let va = heki_page.ranges[i].va;
             let pa = heki_page.ranges[i].pa;
             let epa = heki_page.ranges[i].epa;
@@ -260,6 +299,20 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> u64 {
                 attr,
                 epa - pa
             );
+
+            let mut prot = memattr_to_hvpageprotflags(attr);
+
+            // CAUTION. This is only for debugging purposes. LVBS prohibits the execution of kernel modules
+            // without validation. Due to this, our current implementation (which lacks module validation)
+            // results in a GP fault if we do not allow kernel code execution.
+            #[cfg(debug_assertions)]
+            prot.set(HvPageProtFlags::HV_PAGE_EXECUTABLE, true);
+
+            if let Err(result) = hv_modify_vtl_protection_mask(pa, (epa - pa) >> PAGE_SHIFT, prot) {
+                serial_println!("Err: {:?}", result);
+                let err: u32 = result.into();
+                return err.into();
+            }
         }
     } else {
         serial_println!("Failed to get VTL0 memory for mshv_vsm_protect_memory");
@@ -273,8 +326,11 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> u64 {
     if let Some(heki_page) =
         unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(pa)) }
     {
-        // TODO: handle multi-paged input walking through the pages
-        for i in 0..core::cmp::min(usize::try_from(nranges).unwrap(), HEKI_MAX_RANGES) {
+        if nranges > HEKI_MAX_RANGES as u64 {
+            todo!("handle multi-page input with nranges > HEKI_MAX_RANGES");
+        }
+
+        for i in 0..usize::try_from(nranges).unwrap() {
             let va = heki_page.ranges[i].va;
             let pa = heki_page.ranges[i].pa;
             let epa = heki_page.ranges[i].epa;
@@ -384,33 +440,38 @@ pub enum VSMFunction {
     Unknown = 0xffff_ffff,
 }
 
-pub fn vsm_handle_intercept() -> u64 {
-    let kernel_context = get_per_core_kernel_context();
-    let simp_page = kernel_context.hv_simp_page_as_mut_ptr();
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ControlRegMapEntry {
+    pub reg_name: u32,
+    pub value: u64,
+}
 
-    let msg_type = unsafe { (*simp_page).sint_message[0].header.message_type };
+pub const NUM_CONTROL_REGS: usize = 11;
 
-    // TODO: handle intercept and advance the VTL0 instruction pointer
-    match HvMessageType::try_from(msg_type).unwrap() {
-        HvMessageType::GpaIntercept => {
-            debug_serial_println!("VSM: GPA intercept");
+#[derive(Debug, Default, Clone, Copy)]
+#[repr(C)]
+pub struct ControlRegMap {
+    pub entries: [ControlRegMapEntry; NUM_CONTROL_REGS],
+}
+
+impl ControlRegMap {
+    pub fn get(&self, reg_name: u32) -> Option<u64> {
+        for entry in &self.entries {
+            if entry.reg_name == reg_name {
+                return Some(entry.value);
+            }
         }
-        HvMessageType::RegisterIntercept | HvMessageType::MsrIntercept => {
-            debug_serial_println!("VSM: Register intercept");
-        }
-        _ => {
-            serial_println!(
-                "VSM: Unhandled/unknown synthetic interrupt message type {:#x}",
-                msg_type
-            );
-            return 1;
-        }
+        None
     }
-
-    // clear the handled synthetic interrupt
-    unsafe {
-        (*simp_page).sint_message[0].header.message_type = HvMessageType::None.into();
+    pub fn set(&mut self, reg_name: u32, value: u64) {
+        for entry in &mut self.entries {
+            if entry.reg_name == reg_name {
+                entry.value = value;
+                return;
+            }
+        }
+        // If the register is not found, we can either ignore it or handle it as an error.
+        // For now, we will just ignore it.
+        debug_serial_println!("ControlRegMap: Unknown register name {:#x}", reg_name);
     }
-
-    0
 }

@@ -2,7 +2,15 @@
 
 use crate::{
     arch::gdt,
-    mshv::{HvMessagePage, HvVpAssistPage, vtl_switch::VtlState, vtl1_mem_layout::PAGE_SIZE},
+    mshv::{
+        HV_X64_REGISTER_APIC_BASE, HV_X64_REGISTER_CR0, HV_X64_REGISTER_CR4, HV_X64_REGISTER_CSTAR,
+        HV_X64_REGISTER_EFER, HV_X64_REGISTER_LSTAR, HV_X64_REGISTER_SFMASK, HV_X64_REGISTER_STAR,
+        HV_X64_REGISTER_SYSENTER_CS, HV_X64_REGISTER_SYSENTER_EIP, HV_X64_REGISTER_SYSENTER_ESP,
+        HvMessagePage, HvVpAssistPage,
+        vsm::{ControlRegMap, ControlRegMapEntry},
+        vtl_switch::VtlState,
+        vtl1_mem_layout::PAGE_SIZE,
+    },
 };
 use x86_64::structures::tss::TaskStateSegment;
 
@@ -21,9 +29,11 @@ pub struct KernelContext {
     pub kernel_stack: [u8; KERNEL_STACK_SIZE],
     _guard_page_1: [u8; PAGE_SIZE],
     pub hvcall_input: [u8; PAGE_SIZE],
+    pub hvcall_output: [u8; PAGE_SIZE],
     pub tss: gdt::AlignedTss,
     pub vtl0_state: VtlState,
     pub vtl1_state: VtlState,
+    pub vtl0_locked_regs: ControlRegMap,
     pub gdt: Option<&'static gdt::GdtWrapper>,
 }
 
@@ -63,6 +73,10 @@ impl KernelContext {
     pub fn hv_hypercall_input_page_as_mut_ptr(&mut self) -> *mut [u8; PAGE_SIZE] {
         &raw mut self.hvcall_input
     }
+
+    pub fn hv_hypercall_output_page_as_mut_ptr(&mut self) -> *mut [u8; PAGE_SIZE] {
+        &raw mut self.hvcall_output
+    }
 }
 
 // TODO: use heap
@@ -74,6 +88,7 @@ static mut PER_CORE_KERNEL_CONTEXT: [KernelContext; MAX_CORES] = [KernelContext 
     kernel_stack: [0u8; KERNEL_STACK_SIZE],
     _guard_page_1: [0u8; PAGE_SIZE],
     hvcall_input: [0u8; PAGE_SIZE],
+    hvcall_output: [0u8; PAGE_SIZE],
     tss: gdt::AlignedTss(TaskStateSegment::new()),
     vtl0_state: VtlState {
         rbp: 0,
@@ -110,6 +125,54 @@ static mut PER_CORE_KERNEL_CONTEXT: [KernelContext; MAX_CORES] = [KernelContext 
         r13: 0,
         r14: 0,
         r15: 0,
+    },
+    vtl0_locked_regs: ControlRegMap {
+        entries: [
+            ControlRegMapEntry {
+                reg_name: HV_X64_REGISTER_CR0,
+                value: 0,
+            },
+            ControlRegMapEntry {
+                reg_name: HV_X64_REGISTER_CR4,
+                value: 0,
+            },
+            ControlRegMapEntry {
+                reg_name: HV_X64_REGISTER_LSTAR,
+                value: 0,
+            },
+            ControlRegMapEntry {
+                reg_name: HV_X64_REGISTER_STAR,
+                value: 0,
+            },
+            ControlRegMapEntry {
+                reg_name: HV_X64_REGISTER_CSTAR,
+                value: 0,
+            },
+            ControlRegMapEntry {
+                reg_name: HV_X64_REGISTER_APIC_BASE,
+                value: 0,
+            },
+            ControlRegMapEntry {
+                reg_name: HV_X64_REGISTER_EFER,
+                value: 0,
+            },
+            ControlRegMapEntry {
+                reg_name: HV_X64_REGISTER_SYSENTER_CS,
+                value: 0,
+            },
+            ControlRegMapEntry {
+                reg_name: HV_X64_REGISTER_SYSENTER_ESP,
+                value: 0,
+            },
+            ControlRegMapEntry {
+                reg_name: HV_X64_REGISTER_SYSENTER_EIP,
+                value: 0,
+            },
+            ControlRegMapEntry {
+                reg_name: HV_X64_REGISTER_SFMASK,
+                value: 0,
+            },
+        ],
     },
     gdt: const { None },
 }; MAX_CORES];
