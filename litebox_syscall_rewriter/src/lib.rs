@@ -138,7 +138,8 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
         .segments
         .get_mut(executable_segment)
         .append_section(builder.sections.get_mut(trampoline_section));
-    let trampoline_base_addr = builder.sections.get(trampoline_section).sh_addr;
+
+    let trampoline_base_addr = find_addr_for_trampoline_code(&builder);
 
     let mut trampoline_data = vec![];
     trampoline_data.extend_from_slice(&trampoline.unwrap_or(0).to_le_bytes());
@@ -168,10 +169,12 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
         return Err(Error::NoSyscallInstructionsFound);
     }
 
-    builder.sections.get_mut(trampoline_section).sh_size =
-        trampoline_data.len().try_into().unwrap();
+    let mut trampoline_vec = Vec::new();
+    trampoline_vec.extend_from_slice(&trampoline_base_addr.to_le_bytes());
+    trampoline_vec.extend_from_slice(&trampoline_data.len().to_le_bytes());
+    builder.sections.get_mut(trampoline_section).sh_size = trampoline_vec.len() as u64;
     builder.sections.get_mut(trampoline_section).data =
-        object::build::elf::SectionData::Data(trampoline_data.into());
+        object::build::elf::SectionData::Data(trampoline_vec.into());
     builder
         .segments
         .get_mut(executable_segment)
@@ -181,6 +184,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
     builder
         .write(&mut out)
         .map_err(|e| Error::GenerateObjFileError(e.to_string()))?;
+    out.extend_from_slice(&trampoline_data);
     Ok(out)
 }
 
@@ -326,4 +330,22 @@ fn hook_syscalls_in_section(
     }
 
     Ok(())
+}
+
+fn find_addr_for_trampoline_code(
+    builder: &object::build::elf::Builder<'_>,
+) -> u64 {
+    let mut max_virtual_addr = 0;
+
+    // Find the highest virtual address among all sections in executable segments
+    for seg in &builder.segments {
+        if seg.p_type == object::elf::PT_LOAD {
+            let end_addr = seg.p_vaddr + seg.p_memsz;
+            if end_addr > max_virtual_addr {
+                max_virtual_addr = end_addr;
+            }
+        }
+    }
+    // Round up to the nearest page (assume 0x1000 page size)
+    max_virtual_addr.div_ceil(0x1000) * 0x1000
 }
