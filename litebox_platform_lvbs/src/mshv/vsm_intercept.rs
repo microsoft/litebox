@@ -16,9 +16,10 @@ use crate::{
 };
 use num_enum::TryFromPrimitive;
 
+/// A list of MSR indexes that VSM prevents VTL0 from writing to.
 #[derive(Debug, PartialEq, TryFromPrimitive)]
 #[repr(u32)]
-pub enum InterceptedMsrName {
+pub enum InterceptedMsrIndex {
     MsrEfer = MSR_EFER,
     MsrStar = MSR_STAR,
     MsrLstar = MSR_LSTAR,
@@ -31,6 +32,7 @@ pub enum InterceptedMsrName {
     Unknown = 0xffff_ffff,
 }
 
+/// A list of control registers that VSM prevents VTL0 from writing to.
 #[derive(Debug, PartialEq, TryFromPrimitive)]
 #[repr(u32)]
 pub enum InterceptedRegisterName {
@@ -71,27 +73,26 @@ pub fn vsm_handle_intercept() -> u64 {
                 &(*ptr) as &HvMsrInterceptMessage
             };
 
-            let msr_name = int_msg.msr;
+            let msr_index = int_msg.msr;
             let value = (int_msg.rdx << 32) | (int_msg.rax & 0xffff_ffff);
 
-            // `msr_name` has an architectural MSR index. Hyper-V uses different register indexes for accessing MSRs through
-            // `HVCALL_GET_VP_REGISTERS/HVCALL_SET_VP_REGISTERS`
-            let reg_name = match InterceptedMsrName::try_from(msr_name)
-                .unwrap_or(InterceptedMsrName::Unknown)
+            // `msr_index` contains an intercepted architectural MSR index. Translate it to the corresponding Hyper-V register name.
+            let reg_name = match InterceptedMsrIndex::try_from(msr_index)
+                .unwrap_or(InterceptedMsrIndex::Unknown)
             {
-                InterceptedMsrName::MsrEfer => HV_X64_REGISTER_EFER,
-                InterceptedMsrName::MsrStar => HV_X64_REGISTER_STAR,
-                InterceptedMsrName::MsrLstar => HV_X64_REGISTER_LSTAR,
-                InterceptedMsrName::MsrCstar => HV_X64_REGISTER_CSTAR,
-                InterceptedMsrName::MsrSyscallMask => HV_X64_REGISTER_SFMASK,
-                InterceptedMsrName::MsrApicBase => HV_X64_REGISTER_APIC_BASE,
-                InterceptedMsrName::MsrSysenterCs => HV_X64_REGISTER_SYSENTER_CS,
-                InterceptedMsrName::MsrSysenterEsp => HV_X64_REGISTER_SYSENTER_ESP,
-                InterceptedMsrName::MsrSysenterEip => HV_X64_REGISTER_SYSENTER_EIP,
-                InterceptedMsrName::Unknown => {
+                InterceptedMsrIndex::MsrEfer => HV_X64_REGISTER_EFER,
+                InterceptedMsrIndex::MsrStar => HV_X64_REGISTER_STAR,
+                InterceptedMsrIndex::MsrLstar => HV_X64_REGISTER_LSTAR,
+                InterceptedMsrIndex::MsrCstar => HV_X64_REGISTER_CSTAR,
+                InterceptedMsrIndex::MsrSyscallMask => HV_X64_REGISTER_SFMASK,
+                InterceptedMsrIndex::MsrApicBase => HV_X64_REGISTER_APIC_BASE,
+                InterceptedMsrIndex::MsrSysenterCs => HV_X64_REGISTER_SYSENTER_CS,
+                InterceptedMsrIndex::MsrSysenterEsp => HV_X64_REGISTER_SYSENTER_ESP,
+                InterceptedMsrIndex::MsrSysenterEip => HV_X64_REGISTER_SYSENTER_EIP,
+                InterceptedMsrIndex::Unknown => {
                     panic!(
                         "Intercepted write to MSR {:#x} that we do not expect",
-                        msr_name
+                        msr_index,
                     );
                 }
             };
@@ -100,7 +101,7 @@ pub fn vsm_handle_intercept() -> u64 {
                 serial_println!(
                     "VSM: Writing a value ({:#x}) to MSR {:#x} is disallowed",
                     value,
-                    msr_name,
+                    msr_index,
                 );
                 return raise_vtl0_gp_fault();
             }
@@ -130,6 +131,7 @@ pub fn vsm_handle_intercept() -> u64 {
                 | InterceptedRegisterName::HvX64RegisterIdtr
                 | InterceptedRegisterName::HvX64RegisterLdtr
                 | InterceptedRegisterName::HvX64RegisterTr => {
+                    // any write attempts to these registers are disallowed
                     return raise_vtl0_gp_fault();
                 }
                 InterceptedRegisterName::Unknown => {

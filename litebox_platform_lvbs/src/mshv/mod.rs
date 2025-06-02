@@ -244,10 +244,19 @@ impl HvInputVtl {
     const USE_TARGET_VTL_MASK: u8 = 0x10;
     const USE_TARGET_VTL_SHIFT: u8 = 4;
 
-    pub fn new() -> Self {
-        HvInputVtl {
-            ..Default::default()
-        }
+    /// `target_vtl` specifies the VTL (0-15) that a Hyper-V hypercall works at.
+    pub fn new(target_vtl: u8) -> Self {
+        let mut vtl = HvInputVtl { _as_uint8: 0 };
+        vtl.set_target_vtl(target_vtl);
+        vtl.set_use_target_vtl(true);
+        vtl
+    }
+
+    /// use the current VTL
+    pub fn current() -> Self {
+        let mut vtl = HvInputVtl { _as_uint8: 0 };
+        vtl.set_use_target_vtl(false);
+        vtl
     }
 
     #[expect(clippy::used_underscore_binding)]
@@ -255,10 +264,15 @@ impl HvInputVtl {
         self._as_uint8 |= target_vtl & Self::TARGET_VTL_MASK;
     }
 
+    /// set `use_target_vtl` to `true` to let a hypercall work at the target VTL specified by `set_target_vtl`.
+    /// set `use_target_vtl` to `false` to let a hypercall work at the current VTL.
     #[expect(clippy::used_underscore_binding)]
-    pub fn set_use_target_vtl(&mut self, use_target_vtl: u8) {
-        self._as_uint8 |=
-            (use_target_vtl << Self::USE_TARGET_VTL_SHIFT) & Self::USE_TARGET_VTL_MASK;
+    pub fn set_use_target_vtl(&mut self, use_target_vtl: bool) {
+        if use_target_vtl {
+            self._as_uint8 |= (1 << Self::USE_TARGET_VTL_SHIFT) & Self::USE_TARGET_VTL_MASK;
+        } else {
+            self._as_uint8 &= !((1 << Self::USE_TARGET_VTL_SHIFT) & Self::USE_TARGET_VTL_MASK);
+        }
     }
 }
 
@@ -286,7 +300,7 @@ impl HvEnableVpVtl {
 pub struct HvSetVpRegistersInputHeader {
     pub partitionid: u64,
     pub vpindex: u32,
-    pub inputvtl: u8,
+    pub target_vtl: HvInputVtl,
     padding: [u8; 3],
 }
 
@@ -322,7 +336,7 @@ impl HvSetVpRegistersInput {
 pub struct HvGetVpRegistersInputHeader {
     pub partitionid: u64,
     pub vpindex: u32,
-    pub inputvtl: u8,
+    pub target_vtl: HvInputVtl,
     padding: [u8; 3],
 }
 
@@ -499,7 +513,7 @@ impl HvInputModifyVtlProtectionMask {
         HvInputModifyVtlProtectionMask {
             partition_id: 0,
             map_flags: 0,
-            target_vtl: HvInputVtl::new(),
+            target_vtl: HvInputVtl::current(),
             reserved8_z: 0,
             reserved16_z: 0,
             gpa_page_list: [0u64; HV_MODIFY_MAX_PAGES],
@@ -1040,16 +1054,5 @@ impl HvPendingExceptionEvent {
 
     pub fn set_error_code(&mut self, error_code: u64) {
         self.set_sub_config(Self::ERROR_CODE_MASK, Self::ERROR_CODE_SHIFT, error_code);
-    }
-}
-
-bitflags::bitflags! {
-    #[derive(Debug, PartialEq)]
-    pub struct TargetVtlMask: u8 {
-        const VTL0 = 1 << 4;
-        const VTL1 = 1 << 5;
-        const VTL2 = 1 << 6;
-
-        const _ = !0;
     }
 }
