@@ -26,7 +26,7 @@ use litebox::{
     sync::RwLock,
     utils::{ReinterpretSignedExt, TruncateExt as _},
 };
-use litebox_common_linux::{SyscallRequest, errno::Errno};
+use litebox_common_linux::{ArchPrctlArg, ArchPrctlCode, SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
 use syscalls::net::sys_setsockopt;
 
@@ -408,6 +408,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
                     .ok_or(Errno::EFAULT)
             })
         }
+        SyscallRequest::ArchPrctl { arg } => syscalls::process::sys_arch_prctl(arg).map(|()| 0),
         SyscallRequest::Readlink {
             pathname,
             buf,
@@ -667,6 +668,28 @@ unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) 
         ::syscalls::Sysno::exit | ::syscalls::Sysno::exit_group => {
             litebox_platform_multiplex::platform()
                 .exit(syscall_args[0].reinterpret_as_signed().truncate())
+        }
+        ::syscalls::Sysno::arch_prctl => {
+            let code: u32 = syscall_args[0].truncate();
+            if let Ok(code) = ArchPrctlCode::try_from(code) {
+                let arg = match code {
+                    #[cfg(target_arch = "x86_64")]
+                    ArchPrctlCode::SetFs => ArchPrctlArg::SetFs(unsafe {
+                        core::mem::transmute::<usize, ConstPtr<u8>>(syscall_args[1])
+                    }),
+                    #[cfg(target_arch = "x86_64")]
+                    ArchPrctlCode::GetFs => ArchPrctlArg::GetFs(unsafe {
+                        core::mem::transmute::<usize, MutPtr<usize>>(syscall_args[1])
+                    }),
+                    ArchPrctlCode::CETStatus => ArchPrctlArg::CETStatus,
+                    ArchPrctlCode::CETDisable => ArchPrctlArg::CETDisable,
+                    ArchPrctlCode::CETLock => ArchPrctlArg::CETLock,
+                    _ => unimplemented!(),
+                };
+                SyscallRequest::ArchPrctl { arg }
+            } else {
+                todo!("Unsupported arch_prctl syscall: {syscall_args:?}")
+            }
         }
         _ => todo!("syscall {sysno} not implemented"),
     };

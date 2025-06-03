@@ -5,8 +5,8 @@ use core::ffi::{c_int, c_uint};
 use litebox::net::{ReceiveFlags, SendFlags};
 use litebox::platform::RawMutPointer as _;
 use litebox::platform::trivial_providers::{TransparentConstPtr, TransparentMutPtr};
-use litebox::utils::{ReinterpretSignedExt as _, TruncateExt as _};
-use litebox_common_linux::{IoctlArg, SockFlags, SyscallRequest};
+use litebox::utils::{ReinterpretSignedExt as _, TruncateExt};
+use litebox_common_linux::{ArchPrctlArg, ArchPrctlCode, IoctlArg, SockFlags, SyscallRequest};
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 
 // Define a custom structure to reinterpret siginfo_t
@@ -400,6 +400,26 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             },
             size: syscall_args[1],
         },
+        libc::SYS_arch_prctl => {
+            let code: u32 = syscall_args[0].truncate();
+            if let Ok(code) = ArchPrctlCode::try_from(code) {
+                let arg = match code {
+                    ArchPrctlCode::SetFs => ArchPrctlArg::SetFs(TransparentConstPtr {
+                        inner: syscall_args[1] as *const u8,
+                    }),
+                    ArchPrctlCode::GetFs => ArchPrctlArg::GetFs(TransparentMutPtr {
+                        inner: syscall_args[1] as *mut usize,
+                    }),
+                    ArchPrctlCode::CETStatus => ArchPrctlArg::CETStatus,
+                    ArchPrctlCode::CETDisable => ArchPrctlArg::CETDisable,
+                    ArchPrctlCode::CETLock => ArchPrctlArg::CETLock,
+                    _ => unimplemented!(),
+                };
+                SyscallRequest::ArchPrctl { arg }
+            } else {
+                todo!("Unsupported arch_prctl syscall: {syscall_args:?}")
+            }
+        }
         libc::SYS_readlink => SyscallRequest::Readlink {
             pathname: TransparentConstPtr {
                 inner: syscall_args[0] as *const i8,
@@ -514,7 +534,7 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             };
             SyscallRequest::Ret(ret)
         }
-        _ => todo!("Currently unimplemented syscall: {syscall_number}"),
+        _ => todo!("Currently unimplemented syscall: {syscall_number} {syscall_args:?}"),
     };
     if let SyscallRequest::Ret(v) = dispatcher {
         v
@@ -724,7 +744,22 @@ fn register_seccomp_filter() {
         (libc::SYS_geteuid, vec![]),
         (libc::SYS_getegid, vec![]),
         (libc::SYS_sigaltstack, vec![]),
-        (libc::SYS_arch_prctl, vec![]),
+        (
+            libc::SYS_arch_prctl,
+            vec![
+                // A backdoor to allow invoking arch_prctl.
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        2,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::Eq,
+                        SYSCALL_ARG_MAGIC as u64,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            ],
+        ),
         (libc::SYS_gettid, vec![]),
         (libc::SYS_futex, vec![]),
         (libc::SYS_set_tid_address, vec![]),
