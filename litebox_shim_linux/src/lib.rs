@@ -389,6 +389,10 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
         SyscallRequest::Listen { sockfd, backlog } => {
             syscalls::net::sys_listen(sockfd, backlog).map(|()| 0)
         }
+        SyscallRequest::Exit { code } => litebox_platform_multiplex::platform().exit(code, false),
+        SyscallRequest::ExitGroup { code } => {
+            litebox_platform_multiplex::platform().exit(code, true)
+        }
         SyscallRequest::Fcntl { fd, arg } => syscalls::file::sys_fcntl(fd, arg).map(|v| v as usize),
         SyscallRequest::Getcwd { buf, size: count } => {
             let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
@@ -654,10 +658,12 @@ unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) 
             buf: unsafe { core::mem::transmute::<usize, ConstPtr<u8>>(syscall_args[1]) },
             count: syscall_args[2],
         },
-        ::syscalls::Sysno::exit | ::syscalls::Sysno::exit_group => {
-            litebox_platform_multiplex::platform()
-                .exit(syscall_args[0].reinterpret_as_signed().truncate())
-        }
+        ::syscalls::Sysno::exit => SyscallRequest::Exit {
+            code: syscall_args[0].reinterpret_as_signed().truncate(),
+        },
+        ::syscalls::Sysno::exit_group => SyscallRequest::ExitGroup {
+            code: syscall_args[0].reinterpret_as_signed().truncate(),
+        },
         _ => todo!("syscall {sysno} not implemented"),
     };
     if let SyscallRequest::Ret(ret) = dispatcher {

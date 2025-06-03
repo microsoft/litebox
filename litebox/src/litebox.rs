@@ -33,7 +33,7 @@ impl<Platform: RawSyncPrimitivesProvider + ExitProvider> LiteBox<Platform> {
         // TODO(jayb): After #24, #31, we will be able to pass along clean-up operations to
         // subcomponents, to request a clean-up. For now, there is no clean-up necessary, we can
         // just exit.
-        self.x.platform.exit(exit_code)
+        self.x.platform.exit(exit_code, true)
     }
 }
 

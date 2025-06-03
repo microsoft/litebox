@@ -45,7 +45,7 @@ impl<Host: HostInterface> ExitProvider for LinuxKernel<Host> {
     type ExitCode = i32;
     const EXIT_SUCCESS: Self::ExitCode = 0;
     const EXIT_FAILURE: Self::ExitCode = 1;
-    fn exit(&self, _code: Self::ExitCode) -> ! {
+    fn exit(&self, _code: Self::ExitCode, _is_exit_group: bool) -> ! {
         // TODO: We should probably expand the host to handle an error code?
         Host::exit()
     }

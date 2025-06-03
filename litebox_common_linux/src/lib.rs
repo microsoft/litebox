@@ -546,6 +546,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         sockfd: i32,
         backlog: u16,
     },
+    Exit {
+        code: i32,
+    },
+    ExitGroup {
+        code: i32,
+    },
     Fcntl {
         fd: i32,
         arg: FcntlArg,

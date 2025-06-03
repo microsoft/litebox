@@ -47,7 +47,9 @@ pub trait ExitProvider: Sized {
     const EXIT_SUCCESS: Self::ExitCode;
     const EXIT_FAILURE: Self::ExitCode;
     /// Exits the program with the given exit code.
-    fn exit(&self, code: Self::ExitCode) -> !;
+    ///
+    /// `is_exit_group` indicates whether it terminates all threads in the process or just the current thread.
+    fn exit(&self, code: Self::ExitCode, is_exit_group: bool) -> !;
 }
 
 /// Punch through any functionality for a particular platform that is not explicitly part of the

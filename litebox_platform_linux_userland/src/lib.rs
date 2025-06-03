@@ -116,17 +116,40 @@ impl litebox::platform::ExitProvider for LinuxUserland {
     const EXIT_SUCCESS: Self::ExitCode = 0;
     const EXIT_FAILURE: Self::ExitCode = 1;
 
-    fn exit(&self, code: Self::ExitCode) -> ! {
-        let Self {
-            tun_socket_fd,
-            interception_enabled: _,
-        } = self;
-        // We don't need to explicitly drop this, but doing so clarifies our intent that we want to
-        // close it out :). The type itself is re-specified here to make sure we look at this
-        // particular function in case we decide to change up the types within `LinuxUserland`.
-        drop::<Option<std::os::fd::OwnedFd>>(tun_socket_fd.write().unwrap().take());
-        // And then we actually exit
-        std::process::exit(code)
+    fn exit(&self, code: Self::ExitCode, is_exit_group: bool) -> ! {
+        /*
+          The following code is commented out because in a multi-threaded environment, another
+          thread may still be using the TUN socket. Even in the case where we'd like to terminate
+          the process, we should not close the TUN socket immediately, as it still leaves a small
+          window for the other thread to use the TUN socket after it has been dropped.
+        */
+        // let Self {
+        //     tun_socket_fd,
+        //     interception_enabled: _,
+        // } = self;
+        // // We don't need to explicitly drop this, but doing so clarifies our intent that we want to
+        // // close it out :). The type itself is re-specified here to make sure we look at this
+        // // particular function in case we decide to change up the types within `LinuxUserland`.
+        // drop::<Option<std::os::fd::OwnedFd>>(tun_socket_fd.write().unwrap().take());
+        // // And then we actually exit
+        unsafe {
+            syscalls::syscall2(
+                if is_exit_group {
+                    syscalls::Sysno::exit_group
+                } else {
+                    syscalls::Sysno::exit
+                },
+                (code as isize).reinterpret_as_unsigned(),
+                // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+            )
+        }
+        .expect("Failed to exit group");
+
+        // should not reach here
+        loop {
+            unsafe { core::arch::asm!("hlt") };
+        }
     }
 }
 
