@@ -881,14 +881,9 @@ where
     }
 
     /// Set TCP options
-    ///
-    /// # Panics
-    ///
-    /// This function panics if `data` does not match `option` (they should use the same variant name).
     pub fn set_tcp_option(
         &mut self,
         fd: &SocketFd,
-        option: TcpOptionName,
         data: TcpOptionData,
     ) -> Result<(), errors::SetTcpOptionError> {
         let socket_handle = self.handles[fd.x.as_usize()]
@@ -897,14 +892,13 @@ where
         match socket_handle.protocol() {
             Protocol::Tcp => {
                 let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
-                match (option, data) {
-                    (TcpOptionName::NODELAY, TcpOptionData::NODELAY(nodelay)) => {
+                match data {
+                    TcpOptionData::NODELAY(nodelay) => {
                         tcp_socket.set_nagle_enabled(!nodelay);
                     }
-                    (TcpOptionName::KEEPALIVE, TcpOptionData::KEEPALIVE(keepalive)) => {
+                    TcpOptionData::KEEPALIVE(keepalive) => {
                         tcp_socket.set_keep_alive(keepalive.map(smoltcp::time::Duration::from));
                     }
-                    _ => panic!("TcpOptionData does not match TcpOptionName"),
                 }
                 Ok(())
             }

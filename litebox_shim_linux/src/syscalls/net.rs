@@ -156,7 +156,6 @@ impl<Platform: RawSyncPrimitivesProvider> Socket<Platform> {
                         let keep_alive = val != 0;
                         if let Err(err) = litebox_net().lock().set_tcp_option(
                             self.fd.as_ref().unwrap(),
-                            litebox::net::TcpOptionName::KEEPALIVE,
                             // default time interval is 2 hours
                             litebox::net::TcpOptionData::KEEPALIVE(Some(
                                 core::time::Duration::from_secs(2 * 60 * 60),
@@ -166,8 +165,11 @@ impl<Platform: RawSyncPrimitivesProvider> Socket<Platform> {
                                 litebox::net::errors::SetTcpOptionError::InvalidFd => {
                                     return Err(Errno::EBADF);
                                 }
-                                // This option probably has no effect on other protocols
-                                litebox::net::errors::SetTcpOptionError::NotTcpSocket => {}
+                                litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
+                                    unimplemented!(
+                                        "SO_KEEPALIVE is not supported for non-TCP sockets"
+                                    )
+                                }
                                 _ => unimplemented!(),
                             }
                         }
@@ -201,7 +203,6 @@ impl<Platform: RawSyncPrimitivesProvider> Socket<Platform> {
                         };
                         if let Err(err) = litebox_net().lock().set_tcp_option(
                             self.fd.as_ref().unwrap(),
-                            litebox::net::TcpOptionName::NODELAY,
                             litebox::net::TcpOptionData::NODELAY(on),
                         ) {
                             match err {
