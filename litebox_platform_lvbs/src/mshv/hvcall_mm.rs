@@ -3,14 +3,16 @@
 use crate::{
     kernel_context::get_per_core_kernel_context,
     mshv::{
-        HV_PARTITION_ID_SELF, HV_VTL_SECURE, HVCALL_MODIFY_VTL_PROTECTION_MASK,
-        HvInputModifyVtlProtectionMask, HvPageProtFlags,
+        HV_PARTITION_ID_SELF, HVCALL_MODIFY_VTL_PROTECTION_MASK, HvInputModifyVtlProtectionMask,
+        HvInputVtl, HvPageProtFlags,
         hvcall::{HypervCallError, hv_do_rep_hypercall},
         vtl1_mem_layout::PAGE_SHIFT,
     },
     serial_println,
 };
 
+/// Hyper-V Hypercall to prevent lower VTLs (i.e., VTL0) from accessing a specified range of
+/// guest physical memory pages with a given protection flag.
 pub fn hv_modify_vtl_protection_mask(
     start: u64,
     num_pages: u64,
@@ -25,7 +27,7 @@ pub fn hv_modify_vtl_protection_mask(
     *hvin = HvInputModifyVtlProtectionMask::new();
 
     hvin.partition_id = HV_PARTITION_ID_SELF;
-    hvin.target_vtl.set_target_vtl(HV_VTL_SECURE);
+    hvin.target_vtl = HvInputVtl::current();
     hvin.map_flags = page_access.bits();
 
     let mut total_protected: u64 = 0;

@@ -7,9 +7,9 @@ use crate::{
     },
     kernel_context::{MAX_CORES, get_per_core_kernel_context},
     mshv::{
-        HV_PARTITION_ID_SELF, HV_VP_INDEX_SELF, HV_VTL_SECURE, HVCALL_ENABLE_VP_VTL,
-        HVCALL_SET_VP_REGISTERS, HvEnableVpVtl, HvSetVpRegistersInput,
-        SegmentRegisterAttributeFlags,
+        HV_PARTITION_ID_SELF, HV_VP_INDEX_SELF, HV_VTL_NORMAL, HV_VTL_SECURE, HVCALL_ENABLE_VP_VTL,
+        HVCALL_GET_VP_REGISTERS, HVCALL_SET_VP_REGISTERS, HvEnableVpVtl, HvGetVpRegistersInput,
+        HvGetVpRegistersOutput, HvInputVtl, HvSetVpRegistersInput, SegmentRegisterAttributeFlags,
         hvcall::{HypervCallError, hv_do_hypercall, hv_do_rep_hypercall},
         vtl1_mem_layout::{
             PAGE_SIZE, VTL1_KERNEL_STACK_PAGE, VTL1_TSS_PAGE, get_address_of_special_page,
@@ -22,11 +22,10 @@ use x86_64::{
     structures::{gdt::SegmentSelector, tss::TaskStateSegment},
 };
 
-/// Hyper-V Hypercall to set virtual processor (VP) registers
-pub fn hvcall_set_vp_registers(
+fn hvcall_set_vp_registers_internal(
     reg_name: u32,
     value: u64,
-    input_vtl: u8,
+    target_vtl: HvInputVtl,
 ) -> Result<u64, HypervCallError> {
     let kernel_context = get_per_core_kernel_context();
     let hvin = unsafe {
@@ -38,7 +37,7 @@ pub fn hvcall_set_vp_registers(
 
     hvin.header.partitionid = HV_PARTITION_ID_SELF;
     hvin.header.vpindex = HV_VP_INDEX_SELF;
-    hvin.header.inputvtl = input_vtl;
+    hvin.header.target_vtl = target_vtl;
     hvin.element[0].name = reg_name;
     hvin.element[0].valuelow = value;
 
@@ -49,6 +48,67 @@ pub fn hvcall_set_vp_registers(
         (&raw const *hvin).cast::<core::ffi::c_void>(),
         core::ptr::null_mut(),
     )
+}
+
+/// Hyper-V Hypercall to set current VTL (i.e., VTL1)'s registers. It can program Hyper-V registers
+/// like `HV_REGISTER_VSM_PARTITION_CONFIG`.
+#[inline]
+pub fn hvcall_set_vp_registers(reg_name: u32, value: u64) -> Result<u64, HypervCallError> {
+    hvcall_set_vp_registers_internal(reg_name, value, HvInputVtl::current())
+}
+
+/// Hyper-V Hypercall to set VTL0's registers like MSR and control registers.
+#[inline]
+pub fn hvcall_set_vp_vtl0_registers(reg_name: u32, value: u64) -> Result<u64, HypervCallError> {
+    hvcall_set_vp_registers_internal(reg_name, value, HvInputVtl::new(HV_VTL_NORMAL))
+}
+
+fn hvcall_get_vp_registers_internal(
+    reg_name: u32,
+    target_vtl: HvInputVtl,
+) -> Result<u64, HypervCallError> {
+    let kernel_context = get_per_core_kernel_context();
+    let hvin = unsafe {
+        &mut *kernel_context
+            .hv_hypercall_input_page_as_mut_ptr()
+            .cast::<HvGetVpRegistersInput>()
+    };
+    *hvin = HvGetVpRegistersInput::new();
+    let hvout = unsafe {
+        &mut *kernel_context
+            .hv_hypercall_output_page_as_mut_ptr()
+            .cast::<HvGetVpRegistersOutput>()
+    };
+    *hvout = HvGetVpRegistersOutput::new();
+
+    hvin.header.partitionid = HV_PARTITION_ID_SELF;
+    hvin.header.vpindex = HV_VP_INDEX_SELF;
+    hvin.header.target_vtl = target_vtl;
+    hvin.element[0].name0 = reg_name;
+
+    hv_do_rep_hypercall(
+        HVCALL_GET_VP_REGISTERS,
+        1,
+        0,
+        (&raw const *hvin).cast::<core::ffi::c_void>(),
+        (&raw mut *hvout).cast::<core::ffi::c_void>(),
+    )?;
+
+    Ok(hvout.as64().0)
+}
+
+/// Hyper-V Hypercall to get current VTL (i.e., VTL1)'s registers. It can access Hyper-V registers
+/// like `HV_REGISTER_VSM_PARTITION_CONFIG`.
+#[expect(dead_code)]
+#[inline]
+pub fn hvcall_get_vp_registers(reg_name: u32) -> Result<u64, HypervCallError> {
+    hvcall_get_vp_registers_internal(reg_name, HvInputVtl::current())
+}
+
+/// Hyper-V Hypercall to get VTL0's registers like MSR and control registers.
+#[inline]
+pub fn hvcall_get_vp_vtl0_registers(reg_name: u32) -> Result<u64, HypervCallError> {
+    hvcall_get_vp_registers_internal(reg_name, HvInputVtl::new(HV_VTL_NORMAL))
 }
 
 /// Populate the VP context for VTL1
@@ -116,7 +176,7 @@ fn hv_vtl_populate_vp_context(input: &mut HvEnableVpVtl, tss: u64, rip: u64, rsp
 #[expect(clippy::similar_names)]
 fn hvcall_enable_vp_vtl(
     core_id: u32,
-    target_vtl: u8,
+    new_vtl: u8,
     tss: u64,
     rip: u64,
     rsp: u64,
@@ -125,7 +185,11 @@ fn hvcall_enable_vp_vtl(
 
     hvin.partition_id = HV_PARTITION_ID_SELF;
     hvin.vp_index = core_id;
-    hvin.target_vtl.set_target_vtl(target_vtl);
+
+    // `HVCALL_ENABLE_VP_VTL` uses `HvInputVtl` differently. It expects the `target_vtl` field specifies
+    // a new VTL to enable and the `use_target_vtl` field is `false`.
+    hvin.target_vtl.set_target_vtl(new_vtl);
+    hvin.target_vtl.set_use_target_vtl(false);
 
     hv_vtl_populate_vp_context(&mut hvin, tss, rip, rsp);
 

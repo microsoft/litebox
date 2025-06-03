@@ -3,8 +3,9 @@
 use crate::{
     kernel_context::get_per_core_kernel_context,
     mshv::{
-        VTL_ENTRY_REASON_INTERCEPT, VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL,
-        vsm::{NUM_VTLCALL_PARAMS, VSMFunction, vsm_dispatch, vsm_handle_intercept},
+        VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL,
+        vsm::{NUM_VTLCALL_PARAMS, VSMFunction, vsm_dispatch},
+        vsm_intercept::vsm_handle_intercept,
     },
     serial_println,
 };
@@ -238,10 +239,6 @@ pub fn vtl_switch_loop(result: u64) -> ! {
                 let new_result = vsm_handle_intercept();
                 vtl_switch_loop(new_result)
             }
-            VtlEntryReason::Intercept => {
-                serial_println!("handle VTL intercept");
-                vtl_switch_loop(0)
-            }
             VtlEntryReason::Unknown => {
                 serial_println!("Unknown VTL entry reason");
                 vtl_switch_loop(0)
@@ -257,6 +254,5 @@ pub fn vtl_switch_loop(result: u64) -> ! {
 pub enum VtlEntryReason {
     VtlCall = VTL_ENTRY_REASON_LOWER_VTL_CALL,
     Interrupt = VTL_ENTRY_REASON_INTERRUPT,
-    Intercept = VTL_ENTRY_REASON_INTERCEPT,
     Unknown = 0xffff_ffff,
 }
