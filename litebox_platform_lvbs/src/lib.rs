@@ -5,7 +5,7 @@
 #![cfg_attr(feature = "interrupt", feature(abi_x86_interrupt))]
 
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicBool, AtomicU64};
 use core::{arch::asm, sync::atomic::AtomicU32};
 
 use host::linux::sigset_t;
@@ -39,6 +39,8 @@ pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
     page_table: mm::PageTable<PAGE_SIZE>,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
+    vtl0_module_memory: crate::mshv::vsm::ModuleMemoryMap,
+    vtl0_boot_done: AtomicBool,
 }
 
 impl<Host: HostInterface> ExitProvider for LinuxKernel<Host> {
@@ -92,6 +94,8 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             host_and_task: core::marker::PhantomData,
             page_table: pt,
             vtl1_phys_frame_range: PhysFrame::range(physframe_start, physframe_end),
+            vtl0_module_memory: crate::mshv::vsm::ModuleMemoryMap::new(),
+            vtl0_boot_done: AtomicBool::new(false),
         }))
     }
 
@@ -220,6 +224,19 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         }
 
         false
+    }
+
+    /// This function records the end of the VTL0 boot process.
+    pub fn set_end_of_boot(&self) {
+        self.vtl0_boot_done
+            .store(true, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// This function checks whether the VTL0 boot process is done. VTL1 kernel relies on this function
+    /// to lock down certain security-critical VSM functions.
+    pub fn check_end_of_boot(&self) -> bool {
+        self.vtl0_boot_done
+            .load(core::sync::atomic::Ordering::SeqCst)
     }
 }
 

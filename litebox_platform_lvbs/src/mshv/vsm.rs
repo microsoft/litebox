@@ -22,7 +22,10 @@ use crate::{
         VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY, VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT,
         VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE, VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags,
         X86Cr4Flags,
-        heki::{HEKI_MAX_RANGES, HekiPage, MemAttr},
+        heki::{
+            HekiKdataType, HekiPage, MemAttr, ModMemType, mem_attr_to_hv_page_prot_flags,
+            mod_mem_type_to_mem_attr,
+        },
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
@@ -30,10 +33,15 @@ use crate::{
     },
     serial_println,
 };
+use alloc::{collections::BTreeMap, vec, vec::Vec};
+use core::sync::atomic::{AtomicU64, Ordering};
 use num_enum::TryFromPrimitive;
+use x86_64::structures::paging::{PhysFrame, Size4KiB, frame::PhysFrameRange};
 
 /// VTL call parameters (param[0]: function ID, param[1-3]: parameters)
 pub const NUM_VTLCALL_PARAMS: usize = 4;
+
+const EINVAL: u64 = u64::MAX - 22 + 1;
 
 pub fn init() {
     if get_core_id() == 0 && mshv_vsm_configure_partition() != 0 {
@@ -78,21 +86,20 @@ pub fn mshv_vsm_enable_aps(cpu_present_mask_pfn: u64) -> u64 {
         debug_serial_println!("");
     } else {
         serial_println!("Failed to get cpu_present_mask");
-        return 1;
+        return EINVAL;
     }
 
     // TODO: cpu_present_mask vs num_possible_cpus in kernel command line. which one should we use?
     let Ok(num_cores) = get_num_possible_cpus() else {
         serial_println!("Failed to get number of possible cores");
-        return 1;
+        return EINVAL;
     };
 
     debug_serial_println!("the number of possible cores: {}", num_cores);
 
     if let Err(result) = init_vtl_aps(num_cores) {
         serial_println!("Err: {:?}", result);
-        let err: u32 = result.into();
-        return err.into();
+        return EINVAL;
     }
     0
 }
@@ -115,7 +122,7 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> u64 
         debug_serial_println!("");
     } else {
         serial_println!("Failed to get cpu_online_mask");
-        return 1;
+        return EINVAL;
     }
 
     // boot_signal is an array of bytes whose length is the number of possible cores. Copy the entire page for now.
@@ -139,11 +146,11 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> u64 
             )
         } {
             serial_println!("Failed to copy boot signal page to VTL0");
-            return 1;
+            return EINVAL;
         }
     } else {
         serial_println!("Failed to get boot signal page");
-        return 1;
+        return EINVAL;
     }
 
     0
@@ -160,8 +167,7 @@ pub fn mshv_vsm_secure_config_vtl0() -> u64 {
         hvcall_set_vp_registers(HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, config.as_u64())
     {
         serial_println!("Err: {:?}", result);
-        let err: u32 = result.into();
-        return err.into();
+        return EINVAL;
     }
 
     0
@@ -177,8 +183,7 @@ pub fn mshv_vsm_configure_partition() -> u64 {
     if let Err(result) = hvcall_set_vp_registers(HV_REGISTER_VSM_PARTITION_CONFIG, config.as_u64())
     {
         serial_println!("Err: {:?}", result);
-        let err: u32 = result.into();
-        return err.into();
+        return EINVAL;
     }
 
     0
@@ -187,6 +192,10 @@ pub fn mshv_vsm_configure_partition() -> u64 {
 /// VSM function for locking control registers
 pub fn mshv_vsm_lock_regs() -> u64 {
     debug_serial_println!("VSM: Lock control registers");
+
+    if crate::platform_low().check_end_of_boot() {
+        return EINVAL;
+    }
 
     let flag = HvCrInterceptControlFlags::CR0_WRITE.bits()
         | HvCrInterceptControlFlags::CR4_WRITE.bits()
@@ -206,14 +215,12 @@ pub fn mshv_vsm_lock_regs() -> u64 {
 
     if let Err(result) = save_vtl0_locked_regs() {
         serial_println!("Err: {:?}", result);
-        let err: u32 = result.into();
-        return err.into();
+        return EINVAL;
     }
 
     if let Err(result) = hvcall_set_vp_registers(HV_REGISTER_CR_INTERCEPT_CONTROL, flag) {
         serial_println!("Err: {:?}", result);
-        let err: u32 = result.into();
-        return err.into();
+        return EINVAL;
     }
 
     if let Err(result) = hvcall_set_vp_registers(
@@ -221,8 +228,7 @@ pub fn mshv_vsm_lock_regs() -> u64 {
         X86Cr4Flags::CR4_PIN_MASK.bits().into(),
     ) {
         serial_println!("Err: {:?}", result);
-        let err: u32 = result.into();
-        return err.into();
+        return EINVAL;
     }
 
     if let Err(result) = hvcall_set_vp_registers(
@@ -230,8 +236,7 @@ pub fn mshv_vsm_lock_regs() -> u64 {
         X86Cr0Flags::CR0_PIN_MASK.bits().into(),
     ) {
         serial_println!("Err: {:?}", result);
-        let err: u32 = result.into();
-        return err.into();
+        return EINVAL;
     }
 
     0
@@ -240,53 +245,82 @@ pub fn mshv_vsm_lock_regs() -> u64 {
 /// VSM function for signaling end of boot
 pub fn mshv_vsm_end_of_boot() -> u64 {
     debug_serial_println!("VSM: End of boot");
-    // TODO: update global data structure
+    crate::platform_low().set_end_of_boot();
     0
 }
 
 /// VSM function for protecting certain memory range
 pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> u64 {
-    if let Some(heki_page) =
-        unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(pa)) }
-    {
-        // TODO: handle multi-paged input by walking through the pages
-        for i in 0..core::cmp::min(usize::try_from(nranges).unwrap(), HEKI_MAX_RANGES) {
+    debug_serial_println!("VSM: protect memory pa {:#x} nranges {}", pa, nranges);
+
+    if crate::platform_low().check_end_of_boot() {
+        return EINVAL;
+    }
+
+    let mut next_pa: u64 = pa;
+    let mut range: u64 = 0;
+    while range < nranges {
+        let Some(heki_page) = (unsafe {
+            crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(next_pa))
+        }) else {
+            serial_println!("Failed to get VTL0 memory for mshv_vsm_protect_memory");
+            return EINVAL;
+        };
+
+        for i in 0..usize::try_from(heki_page.nranges).unwrap_or(0) {
             let va = heki_page.ranges[i].va;
             let pa = heki_page.ranges[i].pa;
             let epa = heki_page.ranges[i].epa;
             let attr = heki_page.ranges[i].attributes;
-            let attr: MemAttr = MemAttr::from_bits(attr).unwrap_or(MemAttr::empty());
-            // TODO: protect memory using hv_modify_protection_mask() once we implement the GPA intercept handler
-            // (without a working GPA intercept handler, this memory protection hangs the kernel).
-            // for now, this function is a no-op and just prints the memory range we should protect.
+            let mem_attr: MemAttr = MemAttr::from_bits(attr).unwrap_or(MemAttr::empty());
             debug_serial_println!(
                 "VSM: Protect memory: va {:#x} pa {:#x} epa {:#x} {:?} (size: {})",
                 va,
                 pa,
                 epa,
-                attr,
+                mem_attr,
                 epa - pa
             );
+            if let Err(result) = hv_modify_vtl_protection_mask(
+                pa,
+                (epa - pa) >> PAGE_SHIFT,
+                mem_attr_to_hv_page_prot_flags(mem_attr),
+            ) {
+                serial_println!("Err: {:?}", result);
+                return EINVAL;
+            }
         }
-    } else {
-        serial_println!("Failed to get VTL0 memory for mshv_vsm_protect_memory");
-        return 1;
+
+        range += heki_page.nranges;
+        next_pa = heki_page.next_pa;
     }
     0
 }
 
 /// VSM function for loading kernel data into VTL1
 pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> u64 {
-    if let Some(heki_page) =
-        unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(pa)) }
-    {
-        // TODO: handle multi-paged input walking through the pages
-        for i in 0..core::cmp::min(usize::try_from(nranges).unwrap(), HEKI_MAX_RANGES) {
+    debug_serial_println!("VSM: Load kernel data pa {:#x} nranges {}", pa, nranges);
+
+    if crate::platform_low().check_end_of_boot() {
+        return EINVAL;
+    }
+
+    let mut next_pa: u64 = pa;
+    let mut range: u64 = 0;
+    while range < nranges {
+        let Some(heki_page) = (unsafe {
+            crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(next_pa))
+        }) else {
+            serial_println!("Failed to get VTL0 memory for mshv_vsm_protect_memory");
+            return EINVAL;
+        };
+
+        for i in 0..usize::try_from(heki_page.nranges).unwrap_or(0) {
             let va = heki_page.ranges[i].va;
             let pa = heki_page.ranges[i].pa;
             let epa = heki_page.ranges[i].epa;
             let attr = heki_page.ranges[i].attributes;
-            let attr: MemAttr = MemAttr::from_bits(attr).unwrap_or(MemAttr::empty());
+            let kdata_type = HekiKdataType::try_from(attr).unwrap_or(HekiKdataType::Unknown);
             // TODO: load kernel data (e.g., into `BTreeMap` or other data structures) once we implement data consumers like `mshv_vsm_validate_guest_module`.
             // for now, this function is a no-op and just prints the memory range we should load.
             debug_serial_println!(
@@ -294,35 +328,157 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> u64 {
                 va,
                 pa,
                 epa,
-                attr,
+                kdata_type,
                 epa - pa
             );
         }
-    } else {
-        serial_println!("Failed to get VTL0 memory for mshv_vsm_load_kdata");
-        return 1;
+
+        range += heki_page.nranges;
+        next_pa = heki_page.next_pa;
     }
+
+    // TODO: create trusted keys
+    // TODO: create blocklist keys
+    // TODO: save blocklist hashes
+    // TODO: get kernel info
+
     0
 }
 
 /// VSM function for validating guest kernel module
-pub fn mshv_vsm_validate_guest_module(_pa: u64, _nranges: u64, _flags: u64) -> u64 {
-    debug_serial_println!("VSM: Validate kernel module");
-    // TODO: validate kernel module
-    0
+pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> u64 {
+    let token = crate::platform_low().vtl0_module_memory.gen_unique_key();
+
+    debug_serial_println!(
+        "VSM: Validate kernel module pa {:#x} nranges {} token {}",
+        pa,
+        nranges,
+        token
+    );
+
+    let mut next_pa: u64 = pa;
+    let mut range: u64 = 0;
+    while range < nranges {
+        let Some(heki_page) = (unsafe {
+            crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(next_pa))
+        }) else {
+            serial_println!("Failed to get VTL0 memory for mshv_vsm_protect_memory");
+            return EINVAL;
+        };
+
+        for i in 0..usize::try_from(heki_page.nranges).unwrap_or(0) {
+            // let va = heki_page.ranges[i].va;
+            let pa = heki_page.ranges[i].pa;
+            let epa = heki_page.ranges[i].epa;
+            let attr = heki_page.ranges[i].attributes;
+            let mod_mem_type = ModMemType::try_from(attr).unwrap_or(ModMemType::Invalid);
+            if mod_mem_type == ModMemType::Invalid {
+                serial_println!(
+                    "VSM: Invalid module memory type for pa {:#x} epa {:#x}",
+                    pa,
+                    epa
+                );
+                return EINVAL;
+            }
+
+            // debug_serial_println!(
+            //     "VSM: Validate guest module : va {:#x} pa {:#x} epa {:#x} {:?} (size: {})",
+            //     va,
+            //     pa,
+            //     epa,
+            //     mod_mem_type,
+            //     epa - pa
+            // );
+
+            // TODO: validate a kernel module by analyzing its ELF binary and memory layout. For now, we just assume the module is valid.
+            // This validity check should reconstruct the virtual address space layout of the module.
+
+            if mod_mem_type == ModMemType::ElfBuffer {
+                continue;
+            }
+
+            let page_range: PhysFrameRange<Size4KiB> = PhysFrame::range(
+                PhysFrame::containing_address(x86_64::PhysAddr::new(pa)),
+                PhysFrame::containing_address(x86_64::PhysAddr::new(epa)),
+            );
+
+            if let Err(result) =
+                protect_module_pa_range(&page_range, mod_mem_type_to_mem_attr(mod_mem_type))
+            {
+                serial_println!("Err: {:?}", result);
+                return result;
+            }
+
+            crate::platform_low()
+                .vtl0_module_memory
+                .insert_pages(token, page_range, mod_mem_type);
+        }
+
+        range += heki_page.nranges;
+        next_pa = heki_page.next_pa;
+    }
+    token
 }
 
 /// VSM function for initializing guest kernel module
-pub fn mshv_vsm_free_guest_module_init(_token: u64) -> u64 {
-    debug_serial_println!("VSM: Free kernel module init");
-    // TODO: free kernel module
+pub fn mshv_vsm_free_guest_module_init(token: u64) -> u64 {
+    debug_serial_println!("VSM: Free kernel module init (token: {})", token);
+
+    if let Some(entry) = crate::platform_low().vtl0_module_memory.iter_entry(token) {
+        for page_range in entry.iter_init_pages() {
+            if let Err(result) = protect_module_pa_range(
+                page_range,
+                MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE,
+            ) {
+                return result;
+            }
+        }
+
+        for page_range in entry.iter_ro_after_init_pages() {
+            if let Err(result) = protect_module_pa_range(page_range, MemAttr::MEM_ATTR_READ) {
+                return result;
+            }
+        }
+    }
+
     0
 }
 
 /// VSM function for unloading guest kernel module
-pub fn mshv_vsm_unload_guest_module(_token: u64) -> u64 {
-    debug_serial_println!("VSM: Unload kernel module");
-    // TODO: unload kernel module
+pub fn mshv_vsm_unload_guest_module(token: u64) -> u64 {
+    debug_serial_println!("VSM: Unload kernel module (token: {})", token);
+
+    if let Some(entry) = crate::platform_low().vtl0_module_memory.iter_entry(token) {
+        for page_range in entry.iter_init_pages() {
+            if let Err(result) = protect_module_pa_range(
+                page_range,
+                MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE,
+            ) {
+                return result;
+            }
+        }
+
+        for page_range in entry.iter_ro_after_init_pages() {
+            if let Err(result) = protect_module_pa_range(
+                page_range,
+                MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE,
+            ) {
+                return result;
+            }
+        }
+
+        for page_range in entry.iter_pages() {
+            if let Err(result) = protect_module_pa_range(
+                page_range,
+                MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE,
+            ) {
+                return result;
+            }
+        }
+    }
+
+    crate::platform_low().vtl0_module_memory.remove(token);
+
     0
 }
 
@@ -346,7 +502,7 @@ pub fn mshv_vsm_kexec_validate(_pa: u64, _nranges: u64, _crash: u64) -> u64 {
 pub fn vsm_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> u64 {
     if params[0] > u32::MAX.into() {
         serial_println!("VSM: Unknown function ID {:#x}", params[0]);
-        return 1;
+        return EINVAL;
     }
 
     match VSMFunction::try_from(u32::try_from(params[0]).expect("VTL call param 0"))
@@ -367,8 +523,7 @@ pub fn vsm_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> u64 {
         VSMFunction::KexecValidate => mshv_vsm_kexec_validate(params[1], params[2], params[3]),
         VSMFunction::Unknown => {
             serial_println!("VSM: Unknown function ID {:#x}", params[0]);
-
-            1
+            EINVAL
         }
     }
 }
@@ -393,15 +548,15 @@ pub enum VSMFunction {
 
 pub const NUM_CONTROL_REGS: usize = 11;
 
+/// Data structure for maintaining MSRs and control registers whose values are locked.
+/// This structure is expected to be stored in per-core kernel context, so we do not protect it with a lock.
 #[derive(Debug, Clone, Copy)]
-#[repr(C)]
 pub struct ControlRegMap {
     pub entries: [(u32, u64); NUM_CONTROL_REGS],
 }
 
 impl ControlRegMap {
     pub fn init(&mut self) {
-        // A list of control registers whose values will be locked.
         [
             HV_X64_REGISTER_CR0,
             HV_X64_REGISTER_CR4,
@@ -461,4 +616,160 @@ fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
     }
 
     Ok(0)
+}
+
+/// Data structure for maintaining guest physical addresses of each VTL0 kernel module to
+/// remove protection applied to them once a module is initialized (`mshv_vsm_free_guest_module_init`) or
+/// a module is unloaded (`mshv_vsm_unload_guest_module`).
+pub struct ModuleMemoryMap {
+    inner: spin::mutex::SpinMutex<BTreeMap<u64, ModuleMemoryMapInner>>,
+    key_gen: AtomicU64,
+}
+
+pub struct ModuleMemoryMapInner {
+    init_pages: Vec<PhysFrameRange<Size4KiB>>, // `init_text`, `init_data`, or `init_rodata` sections of a module which will be freed after initialization.
+    ro_after_init_pages: Vec<PhysFrameRange<Size4KiB>>, // `ro_after_init` section of a module which will be read-only after initialization.
+    pages: Vec<PhysFrameRange<Size4KiB>>,
+}
+
+impl ModuleMemoryMap {
+    pub fn new() -> Self {
+        Self {
+            inner: spin::mutex::SpinMutex::new(BTreeMap::new()),
+            key_gen: AtomicU64::new(0),
+        }
+    }
+
+    pub fn gen_unique_key(&self) -> u64 {
+        self.key_gen.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn insert_pages(
+        &self,
+        key: u64,
+        page_range: PhysFrameRange<Size4KiB>,
+        mod_mem_type: ModMemType,
+    ) -> bool {
+        if self.key_gen.load(Ordering::Relaxed) < key {
+            return false;
+        }
+
+        let mut map = self.inner.lock();
+
+        match mod_mem_type {
+            ModMemType::InitText | ModMemType::InitData | ModMemType::InitRoData => {
+                map.entry(key)
+                    .and_modify(|inner| {
+                        inner.init_pages.push(page_range);
+                    })
+                    .or_insert_with(|| ModuleMemoryMapInner {
+                        init_pages: vec![page_range],
+                        ro_after_init_pages: vec![],
+                        pages: vec![],
+                    });
+            }
+            ModMemType::RoAfterInit => {
+                map.entry(key)
+                    .and_modify(|inner| {
+                        inner.ro_after_init_pages.push(page_range);
+                    })
+                    .or_insert_with(|| ModuleMemoryMapInner {
+                        init_pages: vec![],
+                        ro_after_init_pages: vec![page_range],
+                        pages: vec![],
+                    });
+            }
+            ModMemType::Text | ModMemType::Data | ModMemType::RoData => {
+                map.entry(key)
+                    .and_modify(|inner| {
+                        inner.pages.push(page_range);
+                    })
+                    .or_insert_with(|| ModuleMemoryMapInner {
+                        init_pages: vec![],
+                        ro_after_init_pages: vec![],
+                        pages: vec![page_range],
+                    });
+            }
+            _ => {
+                panic!("{mod_mem_type:?} is not expected to be inserted into ModuleMemoryMap");
+            }
+        }
+
+        true
+    }
+
+    pub fn remove(&self, key: u64) -> bool {
+        let mut map = self.inner.lock();
+        map.remove(&key).is_some()
+    }
+}
+
+impl Default for ModuleMemoryMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct ModuleMemoryIters<'a> {
+    guard: spin::mutex::SpinMutexGuard<'a, BTreeMap<u64, ModuleMemoryMapInner>>,
+    key: u64,
+    phantom: core::marker::PhantomData<(
+        &'a PhysFrameRange<Size4KiB>,
+        &'a PhysFrameRange<Size4KiB>,
+        &'a PhysFrameRange<Size4KiB>,
+    )>,
+}
+
+impl<'a> ModuleMemoryIters<'a> {
+    pub fn iter_init_pages(&'a self) -> impl Iterator<Item = &'a PhysFrameRange<Size4KiB>> {
+        self.guard.get(&self.key).unwrap().init_pages.iter()
+    }
+
+    pub fn iter_ro_after_init_pages(
+        &'a self,
+    ) -> impl Iterator<Item = &'a PhysFrameRange<Size4KiB>> {
+        self.guard
+            .get(&self.key)
+            .unwrap()
+            .ro_after_init_pages
+            .iter()
+    }
+
+    pub fn iter_pages(&'a self) -> impl Iterator<Item = &'a PhysFrameRange<Size4KiB>> {
+        self.guard.get(&self.key).unwrap().pages.iter()
+    }
+}
+
+impl ModuleMemoryMap {
+    pub fn iter_entry(&self, key: u64) -> Option<ModuleMemoryIters> {
+        let guard = self.inner.lock();
+
+        if guard.contains_key(&key) {
+            Some(ModuleMemoryIters {
+                guard,
+                key,
+                phantom: core::marker::PhantomData,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+#[inline]
+fn protect_module_pa_range(page_range: &PhysFrameRange, mem_attr: MemAttr) -> Result<(), u64> {
+    let pa = page_range.start.start_address().as_u64();
+    let num_pages = u64::try_from(page_range.count()).unwrap_or(0);
+    if num_pages == 0 {
+        return Ok(());
+    }
+
+    if let Err(result) =
+        hv_modify_vtl_protection_mask(pa, num_pages, mem_attr_to_hv_page_prot_flags(mem_attr))
+    {
+        serial_println!("Err: {:?}", result);
+        Err(EINVAL)
+    } else {
+        Ok(())
+    }
 }

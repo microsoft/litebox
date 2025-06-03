@@ -15,11 +15,11 @@ use num_enum::TryFromPrimitive;
 /// Return to VTL0
 #[expect(clippy::inline_always)]
 #[inline(always)]
-pub fn vtl_return(result: u64) {
+pub fn vtl_return() {
     unsafe {
         asm!(
             "vmcall",
-            in("rax") 0x0, in("rcx") 0x12, in("r8") result
+            in("rax") 0x0, in("rcx") 0x12
         );
     }
 }
@@ -204,18 +204,18 @@ pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
     // This is a dummy call to satisfy load_vtl0_state() with reasonable register values.
     // We do not save VTL0 registers during VTL1 initialization.
 
-    vtl_switch_loop(0);
+    vtl_switch_loop();
 }
 
 /// VTL switch loop
 /// # Panics
 /// Panics if VTL call parameter 0 is greater than u32::MAX
-pub fn vtl_switch_loop(result: u64) -> ! {
+pub fn vtl_switch_loop() -> ! {
     loop {
         save_vtl1_state();
         load_vtl0_state();
 
-        vtl_return(result);
+        vtl_return();
 
         save_vtl0_state();
         load_vtl1_state();
@@ -229,19 +229,19 @@ pub fn vtl_switch_loop(result: u64) -> ! {
                     .unwrap_or(VSMFunction::Unknown)
                     == VSMFunction::Unknown
                 {
-                    serial_println!("unknown function ID = {:#x}", params[0]);
+                    todo!("unknown function ID = {:#x}", params[0]);
                 } else {
                     let new_result = vsm_dispatch(&params);
-                    vtl_switch_loop(new_result)
+                    kernel_context.set_vtl_return_value(new_result);
                 }
             }
             VtlEntryReason::Interrupt => {
                 let new_result = vsm_handle_intercept();
-                vtl_switch_loop(new_result)
+                kernel_context.set_vtl_return_value(new_result);
             }
             VtlEntryReason::Unknown => {
                 serial_println!("Unknown VTL entry reason");
-                vtl_switch_loop(0)
+                kernel_context.set_vtl_return_value(0);
             }
         }
         // do not put any code which might corrupt registers

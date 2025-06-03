@@ -1,4 +1,5 @@
 use crate::mshv::{HvPageProtFlags, vtl1_mem_layout::PAGE_SIZE};
+use num_enum::TryFromPrimitive;
 
 bitflags::bitflags! {
     #[derive(Debug, PartialEq)]
@@ -17,8 +18,7 @@ bitflags::bitflags! {
     }
 }
 
-#[expect(dead_code)]
-pub(crate) fn memattr_to_hvpageprotflags(attr: MemAttr) -> HvPageProtFlags {
+pub(crate) fn mem_attr_to_hv_page_prot_flags(attr: MemAttr) -> HvPageProtFlags {
     let mut flags = HvPageProtFlags::empty();
 
     if attr.contains(MemAttr::MEM_ATTR_READ) {
@@ -35,13 +35,73 @@ pub(crate) fn memattr_to_hvpageprotflags(attr: MemAttr) -> HvPageProtFlags {
     flags
 }
 
+#[derive(Default, Debug, TryFromPrimitive)]
+#[repr(u64)]
+pub enum HekiKdataType {
+    SystemCerts = 0,
+    RevocationCerts = 1,
+    BlocklistHashes = 2,
+    KernelInfo = 3,
+    KernelData = 4,
+    KdataMax = 5,
+    #[default]
+    Unknown = 0xffff_ffff_ffff_ffff,
+}
+
+#[derive(Default, Debug, TryFromPrimitive)]
+#[repr(u64)]
+pub enum HekiKexecType {
+    KexecImage = 0,
+    KexecKernelBlob = 1,
+    KexecPages = 2,
+    KexecMax = 3,
+    #[default]
+    Unknown = 0xffff_ffff_ffff_ffff,
+}
+
+#[derive(Clone, Copy, Default, Debug, TryFromPrimitive, PartialEq)]
+#[repr(u64)]
+pub enum ModMemType {
+    Text = 0,
+    Data = 1,
+    RoData = 2,
+    RoAfterInit = 3,
+    InitText = 4,
+    InitData = 5,
+    InitRoData = 6,
+    ElfBuffer = 7,
+    #[default]
+    Invalid = 0xffff_ffff_ffff_ffff,
+}
+
+pub(crate) fn mod_mem_type_to_mem_attr(mod_mem_type: ModMemType) -> MemAttr {
+    let mut mem_attr = MemAttr::empty();
+
+    match mod_mem_type {
+        ModMemType::Text | ModMemType::InitText => {
+            mem_attr.set(MemAttr::MEM_ATTR_READ, true);
+            mem_attr.set(MemAttr::MEM_ATTR_EXEC, true);
+        }
+        ModMemType::Data | ModMemType::RoAfterInit | ModMemType::InitData => {
+            mem_attr.set(MemAttr::MEM_ATTR_READ, true);
+            mem_attr.set(MemAttr::MEM_ATTR_WRITE, true);
+        }
+        ModMemType::RoData | ModMemType::InitRoData => {
+            mem_attr.set(MemAttr::MEM_ATTR_READ, true);
+        }
+        _ => {}
+    }
+
+    mem_attr
+}
+
 #[derive(Default, Clone, Copy)]
 #[repr(C, packed)]
 pub struct HekiRange {
     pub va: u64,
     pub pa: u64,
     pub epa: u64,
-    pub attributes: u64,
+    pub attributes: u64, // MemAttr, KdataType, ModMemType, or KexecType depending on which VSM function is using it
 }
 
 #[expect(clippy::cast_possible_truncation)]

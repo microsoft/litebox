@@ -74,6 +74,10 @@ impl KernelContext {
     pub fn hv_hypercall_output_page_as_mut_ptr(&mut self) -> *mut [u8; PAGE_SIZE] {
         &raw mut self.hvcall_output
     }
+
+    pub fn set_vtl_return_value(&mut self, value: u64) {
+        self.vtl0_state.r8 = value; // LVBS uses R8 to return a value from VTL1 to VTL0
+    }
 }
 
 // TODO: use heap
