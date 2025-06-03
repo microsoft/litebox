@@ -1,4 +1,4 @@
-use litebox::fs::{Mode, OFlags};
+use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox_common_linux::{EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
 use litebox_platform_multiplex::{Platform, set_platform};
 
@@ -14,7 +14,11 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) {
         set_platform(Platform::new(tun_device_name));
 
         let litebox = crate::litebox();
-        let in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+        let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+        in_mem_fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to set permissions on root");
+        });
         let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(litebox);
         let tar_ro_fs =
             litebox::fs::tar_ro::FileSystem::new(litebox, litebox::fs::tar_ro::empty_tar_file());

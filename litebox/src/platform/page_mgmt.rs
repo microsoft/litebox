@@ -45,6 +45,10 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
 
     /// Remap pages from `old_range` to `new_range`.
     ///
+    /// ## Returns
+    ///
+    /// On success it returns a pointer to the new virtual memory area.
+    ///
     /// # Safety
     ///
     /// The caller must ensure that it is safe to move the `old_range` (i.e., these pages are not in
@@ -53,7 +57,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         &self,
         old_range: Range<usize>,
         new_range: Range<usize>,
-    ) -> Result<(), RemapError>;
+    ) -> Result<Self::RawMutPointer<u8>, RemapError>;
 
     /// Update the permissions on pages in `range` to `new_permissions`.
     ///

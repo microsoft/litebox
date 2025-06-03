@@ -605,7 +605,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 prot_flags(initial_permissions)
                     .bits()
                     .reinterpret_as_unsigned() as usize,
-                flags.bits().reinterpret_as_unsigned() as usize,
+                (flags.bits().reinterpret_as_unsigned()
+                    // This is to ensure it won't be intercepted by Seccomp if enabled.
+                    | syscall_intercept::systrap::MMAP_FLAG_MAGIC) as usize,
                 usize::MAX,
                 0,
             )
@@ -637,14 +639,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         &self,
         old_range: std::ops::Range<usize>,
         new_range: std::ops::Range<usize>,
-    ) -> Result<(), litebox::platform::page_mgmt::RemapError> {
+    ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
         let res = unsafe {
             syscalls::syscall6(
                 syscalls::Sysno::mremap,
                 old_range.start,
                 old_range.len(),
                 new_range.len(),
-                MRemapFlags::MREMAP_FIXED.bits() as usize,
+                (MRemapFlags::MREMAP_FIXED | MRemapFlags::MREMAP_MAYMOVE).bits() as usize,
                 new_range.start,
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
                 syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
@@ -652,7 +654,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             .expect("mremap failed")
         };
         assert_eq!(res, new_range.start);
-        Ok(())
+        Ok(litebox::platform::trivial_providers::TransparentMutPtr {
+            inner: res as *mut u8,
+        })
     }
 
     unsafe fn update_permissions(
@@ -750,9 +754,11 @@ impl litebox::mm::allocator::MemoryProvider for LinuxUserland {
                 0,
                 size,
                 ProtFlags::PROT_READ_WRITE.bits().reinterpret_as_unsigned() as usize,
-                (MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON)
+                ((MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON)
                     .bits()
-                    .reinterpret_as_unsigned() as usize,
+                    .reinterpret_as_unsigned()
+                    // This is to ensure it won't be intercepted by Seccomp if enabled.
+                    | syscall_intercept::systrap::MMAP_FLAG_MAGIC) as usize,
                 usize::MAX,
                 0,
             )

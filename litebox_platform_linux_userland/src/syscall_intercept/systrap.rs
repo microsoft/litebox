@@ -108,6 +108,7 @@ static FS_BASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsiz
 /// Certain syscalls with this magic argument are allowed.
 /// This is useful for syscall interception where we need to invoke the original syscall.
 pub(crate) const SYSCALL_ARG_MAGIC: usize = usize::from_le_bytes(*b"LITE BOX");
+pub(crate) const MMAP_FLAG_MAGIC: u32 = 1 << 31;
 
 /// Get fs register value via syscall `arch_prctl`.
 fn get_fs_base_arch_prctl() -> usize {
@@ -261,6 +262,17 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
                 inner: syscall_args[0] as *mut u8,
             },
             length: syscall_args[1],
+        },
+        libc::SYS_mremap => SyscallRequest::Mremap {
+            old_addr: TransparentMutPtr {
+                inner: syscall_args[0] as *mut u8,
+            },
+            old_size: syscall_args[1],
+            new_size: syscall_args[2],
+            flags: litebox_common_linux::MRemapFlags::from_bits_truncate(
+                syscall_args[3].truncate(),
+            ),
+            new_addr: syscall_args[4],
         },
         libc::SYS_ioctl => SyscallRequest::Ioctl {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
@@ -654,15 +666,13 @@ fn register_seccomp_filter() {
         (
             libc::SYS_mmap,
             vec![
-                // Allow mmap with MAP_ANONYMOUS (i.e., non-file-backed)
+                // A backdoor to allow invoking mmap.
                 SeccompRule::new(vec![
                     SeccompCondition::new(
                         3,
                         SeccompCmpArgLen::Dword,
-                        SeccompCmpOp::MaskedEq(
-                            u64::try_from(nix::sys::mman::MapFlags::MAP_ANONYMOUS.bits()).unwrap(),
-                        ),
-                        u64::try_from(nix::sys::mman::MapFlags::MAP_ANONYMOUS.bits()).unwrap(),
+                        SeccompCmpOp::MaskedEq(u64::from(MMAP_FLAG_MAGIC)),
+                        u64::from(MMAP_FLAG_MAGIC),
                     )
                     .unwrap(),
                 ])
@@ -746,6 +756,22 @@ fn register_seccomp_filter() {
         ),
         (libc::SYS_rt_sigreturn, vec![]),
         (libc::SYS_sched_yield, vec![]),
+        (
+            libc::SYS_mremap,
+            vec![
+                // A backdoor to allow invoking mremap.
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        5,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::Eq,
+                        SYSCALL_ARG_MAGIC as u64,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            ],
+        ),
         (libc::SYS_getpid, vec![]),
         (libc::SYS_uname, vec![]),
         (libc::SYS_getuid, vec![]),

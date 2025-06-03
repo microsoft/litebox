@@ -372,6 +372,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     }
 
     /// Move a range from `old_range` to `suggested_new_range`.
+    /// Use it together with [`Vmem::resize_mapping`] to achieve `mremap`.
     ///
     /// The `suggested_new_range.start` is used as a hint for the new address.
     /// If it is zero, kernel will choose a new suitable address freely.
@@ -385,16 +386,16 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ///
     /// # Panics
     ///
-    /// Panics if `new_size` is smaller than the current size of the range.
-    /// Panics if range is not within exact one mapping.
+    /// Panics if the size of `suggested_new_range` is smaller than the size of `old_range`.
+    /// Panics if the `old_range` is not covered by exactly one mapping.
     pub(super) unsafe fn move_mappings(
         &mut self,
         old_range: PageRange<ALIGN>,
         suggested_new_range: PageRange<ALIGN>,
-    ) -> Result<usize, VmemMoveError> {
+    ) -> Result<Platform::RawMutPointer<u8>, VmemMoveError> {
         assert!(suggested_new_range.len() >= old_range.len());
 
-        // Check if the given range is within one mapping
+        // Check if the given range is covered by exactly one mapping
         let (cur_range, vma) = self
             .vmas
             .get_key_value(&old_range.start)
@@ -406,11 +407,12 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .ok_or(VmemMoveError::OutOfMemory)?;
         let new_range =
             PageRange::<ALIGN>::new(new_addr, new_addr + suggested_new_range.len()).unwrap();
-        unsafe {
+        let new_addr = unsafe {
             self.platform
                 .remap_pages(old_range.into(), new_range.into())
         }
         .map_err(VmemMoveError::RemapError)?;
+        assert_eq!(new_addr.as_usize(), new_range.start);
         self.vmas.insert(new_range.into(), *vma);
         self.vmas.remove(old_range.into());
         Ok(new_addr)
