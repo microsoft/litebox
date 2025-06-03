@@ -513,7 +513,6 @@ fn futex_timeout(
             .unwrap();
         libc::timespec { tv_sec, tv_nsec }
     });
-    let timeout: *const libc::timespec = timeout.map_or(std::ptr::null(), |t| &t);
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
     unsafe {
         syscalls::syscall6(
@@ -521,7 +520,11 @@ fn futex_timeout(
             uaddr as usize,
             usize::try_from(futex_op).unwrap(),
             val as usize,
-            timeout as usize,
+            if let Some(t) = timeout.as_ref() {
+                core::ptr::from_ref(t) as usize
+            } else {
+                0 // No timeout
+            },
             uaddr2 as usize,
             val3 as usize,
         )
