@@ -327,7 +327,7 @@ impl ElfLoader {
                 assert_eq!(
                     unsafe { version_number.read() },
                     super::REWRITER_VERSION_NUMBER,
-                    "trampoline section magic number mismatch"
+                    "trampoline section version number mismatch"
                 );
                 let placeholder = (start_addr + 8) as *mut usize;
                 unsafe { placeholder.write(crate::syscall_callback as usize) };
