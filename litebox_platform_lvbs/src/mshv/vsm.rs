@@ -314,8 +314,6 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> u64 {
 /// `pa` and `nranges` specify a memory area containing the information about the memory ranges to load.
 /// VTL0 is not allowed to call this function after the end of boot process.
 pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> u64 {
-    debug_serial_println!("VSM: Load kernel data pa {:#x} nranges {}", pa, nranges);
-
     if crate::platform_low().check_end_of_boot() {
         return EINVAL;
     }
@@ -348,7 +346,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> u64 {
     // TODO: create trusted keys
     // TODO: create blocklist keys
     // TODO: save blocklist hashes
-    // TODO: get kernel info
+    // TODO: get kernel info (i.e., kernel symbols)
 }
 
 /// VSM function for validating guest kernel module.
@@ -399,26 +397,13 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> u64
                             );
                     }
                 }
-
-                // debugging/development purposes. print out the information of tiny modules.
-                if nranges < 10 {
-                    debug_serial_println!(
-                        "VSM: Validate kernel module: va {:#x} pa {:#x} epa {:#x} {:?} (size: {})",
-                        va,
-                        pa,
-                        epa,
-                        mod_mem_type,
-                        epa - pa
-                    );
-                }
             }
         }
     } else {
         return EINVAL;
     }
 
-    // TODO: validate a kernel module by analyzing its ELF binary and memory layout. For now, we just assume the module is valid.
-    // This validity check should reconstruct the virtual address space layout of the module.
+    // TODO: validate a kernel module by analyzing its ELF binary and memory content. For now, we just assume the module is valid.
 
     let mut result: u64 = 0;
     if let Some(entry) = crate::platform_low().vtl0_module_memory.iter_entry(token) {
