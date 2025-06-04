@@ -273,6 +273,18 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> u64 {
                 let attr = heki_page.ranges[i].attributes;
                 let mem_attr: MemAttr = MemAttr::from_bits(attr).unwrap_or(MemAttr::empty());
 
+                if !va.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096))
+                    || !pa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096))
+                    || !epa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096))
+                {
+                    serial_println!("VSM: input addresses must be page-aligned");
+                    return EINVAL;
+                }
+                if mem_attr == MemAttr::empty() {
+                    serial_println!("VSM: invalid memory attributes");
+                    return EINVAL;
+                }
+
                 debug_serial_println!(
                     "VSM: Protect memory: va {:#x} pa {:#x} epa {:#x} {:?} (size: {})",
                     va,
@@ -347,7 +359,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> u64
     let token = crate::platform_low().vtl0_module_memory.gen_unique_key();
 
     debug_serial_println!(
-        "VSM: Validate kernel module pa {:#x} nranges {} token {}",
+        "VSM: Validate kernel module: pa {:#x} nranges {} token {}",
         pa,
         nranges,
         token
@@ -361,19 +373,37 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> u64
                 let epa = heki_page.ranges[i].epa;
                 let attr = heki_page.ranges[i].attributes;
                 let mod_mem_type = ModMemType::try_from(attr).unwrap_or(ModMemType::Invalid);
-                if mod_mem_type == ModMemType::Invalid {
-                    serial_println!(
-                        "VSM: Invalid module memory type for pa {:#x} epa {:#x}",
-                        pa,
-                        epa
-                    );
-                    crate::platform_low().vtl0_module_memory.remove(token);
-                    return EINVAL;
+                match mod_mem_type {
+                    ModMemType::Invalid => {
+                        serial_println!("VSM: Invalid module memory type");
+                        crate::platform_low().vtl0_module_memory.remove(token);
+                        return EINVAL;
+                    }
+                    ModMemType::ElfBuffer => { // TODO: store the ElfBuffer in a local data structure for validation.
+                    }
+                    _ => {
+                        // if input memory range's type is neither `Invalid` nor `ElfBuffer`, its addresses must be page-aligned
+                        if !va.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096))
+                            || !pa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096))
+                            || !epa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096))
+                        {
+                            serial_println!("VSM: input addresses must be page-aligned");
+                            return EINVAL;
+                        }
+
+                        crate::platform_low()
+                            .vtl0_module_memory
+                            .insert_memory_range(
+                                token,
+                                ModuleMemoryRange::new(va, pa, epa, mod_mem_type),
+                            );
+                    }
                 }
 
+                // debugging/development purposes. print out the information of tiny modules.
                 if nranges < 10 {
                     debug_serial_println!(
-                        "VSM: Validate guest module : va {:#x} pa {:#x} epa {:#x} {:?} (size: {})",
+                        "VSM: Validate kernel module: va {:#x} pa {:#x} epa {:#x} {:?} (size: {})",
                         va,
                         pa,
                         epa,
@@ -381,15 +411,6 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> u64
                         epa - pa
                     );
                 }
-
-                if mod_mem_type == ModMemType::ElfBuffer {
-                    // TODO: store the ElfBuffer in a local data structure for validation.
-                    continue;
-                }
-
-                crate::platform_low()
-                    .vtl0_module_memory
-                    .insert_memory_range(token, ModuleMemoryRange::new(va, pa, epa, mod_mem_type));
             }
         }
     } else {
@@ -425,7 +446,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> u64
 /// VSM function for supporting the initialization of a guest kernel module.
 /// `token` is the unique identifier for the module.
 pub fn mshv_vsm_free_guest_module_init(token: u64) -> u64 {
-    debug_serial_println!("VSM: Free kernel module init (token: {})", token);
+    debug_serial_println!("VSM: Free kernel module's init (token: {})", token);
 
     if let Some(entry) = crate::platform_low().vtl0_module_memory.iter_entry(token) {
         for mod_mem_range in entry.iter_mem_ranges() {
