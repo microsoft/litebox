@@ -143,7 +143,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
 
     let mut trampoline_data = vec![];
     // The magic prefix for the trampoline section
-    trampoline_data.extend_from_slice("LITEBOX0".as_bytes());
+    trampoline_data.extend_from_slice("LITE BOX".as_bytes());
     // The placeholder for the address of the new syscall entry point
     trampoline_data.extend_from_slice(&trampoline.unwrap_or(0).to_le_bytes());
 
@@ -173,6 +173,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
     }
 
     let mut trampoline_vec = Vec::new();
+    trampoline_vec.extend_from_slice("LITE BOX".as_bytes());
     trampoline_vec.extend_from_slice(&trampoline_base_addr.to_le_bytes());
     trampoline_vec.extend_from_slice(&trampoline_data.len().to_le_bytes());
     builder.sections.get_mut(trampoline_section).sh_size = trampoline_vec.len() as u64;
@@ -187,6 +188,9 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
     builder
         .write(&mut out)
         .map_err(|e| Error::GenerateObjFileError(e.to_string()))?;
+    // ensure the start address of the trampoline code is page-aligned
+    let remain = out.len() % 0x1000;
+    out.extend_from_slice(&vec![0; if remain == 0 { 0 } else { 0x1000 - remain }]);
     out.extend_from_slice(&trampoline_data);
     Ok(out)
 }
