@@ -259,7 +259,7 @@ pub fn mshv_vsm_lock_regs() -> u64 {
     0
 }
 
-/// VSM function for signaling end of VTL0 boot process
+/// VSM function for signaling the end of VTL0 boot process
 pub fn mshv_vsm_end_of_boot() -> u64 {
     debug_serial_println!("VSM: End of boot");
     crate::platform_low().set_end_of_boot();
@@ -330,7 +330,7 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> u64 {
 }
 
 /// VSM function for loading kernel data (e.g., certificates, blocklist, kernel symbols) into VTL1.
-/// `pa` and `nranges` specify a memory area containing the information about the memory ranges to load.
+/// `pa` and `nranges` specify memory areas containing the information about the memory ranges to load.
 pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> u64 {
     if !pa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096)) || nranges == 0 {
         serial_println!("VSM: invalid input address");
@@ -375,8 +375,8 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> u64 {
     // TODO: get kernel info (i.e., kernel symbols)
 }
 
-/// VSM function for validating guest kernel module.
-/// `pa` and `nranges` specify a memory area containing the information about the kernel module to validate.
+/// VSM function for validating a guest kernel module and applying specified protection to its memory ranges after validation.
+/// `pa` and `nranges` specify a memory area containing the information about the kernel module to validate or protect.
 /// `flags` controls the validation process (unused for now).
 /// This function returns a unique `token` to VTL0, which is used to identify the module in subsequent calls.
 pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> u64 {
@@ -473,7 +473,7 @@ pub fn mshv_vsm_free_guest_module_init(token: u64) -> u64 {
         for mod_mem_range in entry.iter_mem_ranges() {
             match mod_mem_range.mod_mem_type {
                 ModMemType::InitText | ModMemType::InitData | ModMemType::InitRoData => {
-                    // remove protection applied to this memory range after module initialization
+                    // make this memory range readable, writable, and non-executable after initialization to let the VTL0 kernel free it
                     if let Err(result) = protect_physical_memory_range(
                         mod_mem_range.phys_frame_range,
                         MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE,
@@ -482,7 +482,7 @@ pub fn mshv_vsm_free_guest_module_init(token: u64) -> u64 {
                     }
                 }
                 ModMemType::RoAfterInit => {
-                    // make this memory range read-only after module initialization
+                    // make this memory range read-only after initialization
                     if let Err(result) = protect_physical_memory_range(
                         mod_mem_range.phys_frame_range,
                         MemAttr::MEM_ATTR_READ,
@@ -512,7 +512,7 @@ pub fn mshv_vsm_unload_guest_module(token: u64) -> u64 {
     }
 
     if let Some(entry) = crate::platform_low().vtl0_module_memory.iter_entry(token) {
-        // remove protection applied to the memory ranges of a module to be unloaded
+        // make the memory ranges of a module readable, writable, and non-executable to let the VTL0 kernel unload the module
         for mod_mem_range in entry.iter_mem_ranges() {
             if let Err(result) = protect_physical_memory_range(
                 mod_mem_range.phys_frame_range,
@@ -661,9 +661,7 @@ fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
     Ok(0)
 }
 
-/// Data structure for maintaining guest physical addresses of each VTL0 kernel module to
-/// remove protection applied to them once a module is initialized (`mshv_vsm_free_guest_module_init`) or
-/// a module is unloaded (`mshv_vsm_unload_guest_module`).
+/// Data structure for maintaining the memory ranges of each VTL0 kernel module and their types
 pub struct ModuleMemoryMap {
     inner: spin::mutex::SpinMutex<BTreeMap<u64, ModuleMemoryMapInner>>,
     key_gen: AtomicU64,
@@ -802,7 +800,7 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<Box<HekiPage>>
     Some(heki_pages)
 }
 
-/// This function protects a physical memory range. It works as a safe wrapper for `hv_modify_vtl_protection_mask`.
+/// This function protects a physical memory range. It is a safe wrapper for `hv_modify_vtl_protection_mask`.
 /// `phys_frame_range` specifies the physical frame range to protect
 /// `mem_attr` specifies the memory attributes to be applied to the range
 #[inline]
