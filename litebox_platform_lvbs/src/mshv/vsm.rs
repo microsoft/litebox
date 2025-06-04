@@ -44,24 +44,32 @@ pub const NUM_VTLCALL_PARAMS: usize = 4;
 const EINVAL: u64 = u64::MAX - 22 + 1;
 
 pub fn init() {
-    if get_core_id() == 0 && mshv_vsm_configure_partition() != 0 {
-        return;
-    }
+    assert!(
+        !(get_core_id() == 0 && mshv_vsm_configure_partition() != 0),
+        "Failed to configure VSM partition"
+    );
 
-    if mshv_vsm_secure_config_vtl0() != 0 {
-        return;
-    }
+    assert!(
+        (mshv_vsm_secure_config_vtl0() == 0),
+        "Failed to secure VTL0 configuration"
+    );
 
     if get_core_id() == 0 {
         if let Ok((start, size)) = get_vtl1_memory_info() {
             debug_serial_println!("VSM: Protect GPAs from {:#x} to {:#x}", start, start + size);
-            let num_pages = size >> PAGE_SHIFT;
-            let prot = HvPageProtFlags::HV_PAGE_ACCESS_NONE;
-            if let Err(result) = hv_modify_vtl_protection_mask(start, num_pages, prot) {
-                serial_println!("Err: {:?}", result);
+            if protect_physical_memory_range(
+                PhysFrame::range(
+                    PhysFrame::containing_address(x86_64::PhysAddr::new(start)),
+                    PhysFrame::containing_address(x86_64::PhysAddr::new(start + size)),
+                ),
+                MemAttr::empty(),
+            )
+            .is_err()
+            {
+                panic!("Failed to protect VTL1 memory");
             }
         } else {
-            serial_println!("Failed to get memory info");
+            panic!("Failed to get VTL1 memory info");
         }
     }
 }
@@ -280,17 +288,16 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> u64 {
                 let pa = heki_page.ranges[i].pa;
                 let epa = heki_page.ranges[i].epa;
                 let attr = heki_page.ranges[i].attributes;
-                let mem_attr: MemAttr = MemAttr::from_bits(attr).unwrap_or(MemAttr::empty());
+                let Some(mem_attr) = MemAttr::from_bits(attr) else {
+                    serial_println!("VSM: Invalid memory attributes");
+                    return EINVAL;
+                };
 
                 if !va.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096))
                     || !pa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096))
                     || !epa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096))
                 {
                     serial_println!("VSM: input address must be page-aligned");
-                    return EINVAL;
-                }
-                if mem_attr == MemAttr::empty() {
-                    serial_println!("VSM: invalid memory attributes");
                     return EINVAL;
                 }
 
@@ -303,12 +310,15 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> u64 {
                     epa - pa
                 );
 
-                if let Err(result) = hv_modify_vtl_protection_mask(
-                    pa,
-                    (epa - pa) >> PAGE_SHIFT,
-                    mem_attr_to_hv_page_prot_flags(mem_attr),
-                ) {
-                    serial_println!("Err: {:?}", result);
+                if protect_physical_memory_range(
+                    PhysFrame::range(
+                        PhysFrame::containing_address(x86_64::PhysAddr::new(pa)),
+                        PhysFrame::containing_address(x86_64::PhysAddr::new(epa)),
+                    ),
+                    mem_attr,
+                )
+                .is_err()
+                {
                     return EINVAL;
                 }
             }
@@ -426,7 +436,6 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> u64
 
     // TODO: validate a kernel module by analyzing its ELF binary and memory content. For now, we just assume the module is valid.
 
-    let mut result: u64 = 0;
     if let Some(entry) = crate::platform_low().vtl0_module_memory.iter_entry(token) {
         // protect the memory ranges of a module based on their section types
         for mod_mem_range in entry.iter_mem_ranges() {
@@ -436,16 +445,14 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> u64
             )
             .is_err()
             {
-                result = EINVAL;
-                break;
+                crate::platform_low().vtl0_module_memory.remove(token);
+                return EINVAL;
             }
         }
-    }
-    if result == 0 {
+
         token
     } else {
-        crate::platform_low().vtl0_module_memory.remove(token);
-        result
+        EINVAL
     }
 }
 
@@ -795,7 +802,7 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<Box<HekiPage>>
     Some(heki_pages)
 }
 
-/// This function protects a physical memory range using `hv_modify_vtl_protection_mask`
+/// This function protects a physical memory range. It works as a safe wrapper for `hv_modify_vtl_protection_mask`.
 /// `phys_frame_range` specifies the physical frame range to protect
 /// `mem_attr` specifies the memory attributes to be applied to the range
 #[inline]

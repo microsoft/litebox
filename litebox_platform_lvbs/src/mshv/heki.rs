@@ -10,11 +10,6 @@ bitflags::bitflags! {
         const MEM_ATTR_IMMUTABLE = 1 << 3;
 
         const _ = !0;
-
-        const MEM_ATTR_PROT = Self::MEM_ATTR_READ.bits()
-            | Self::MEM_ATTR_WRITE.bits()
-            | Self::MEM_ATTR_EXEC.bits()
-            | Self::MEM_ATTR_IMMUTABLE.bits();
     }
 }
 
