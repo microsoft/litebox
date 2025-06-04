@@ -251,8 +251,6 @@ fn get_trampoline_hdr(object: &mut ElfFile) -> Option<TrampolineHdr> {
     let file_size = crate::syscalls::file::sys_fstat(object.as_fd().unwrap())
         .expect("failed to get file stat")
         .st_size;
-    let file_end =
-        usize::try_from(elfhdr.e_shoff).ok()? + usize::from(elfhdr.e_shentsize * elfhdr.e_shnum);
     Some(TrampolineHdr {
         vaddr: usize::try_from(trampoline.trampoline_addr).ok()?,
         file_offset: usize::try_from(file_size).unwrap() - trampoline.trampoline_size,
