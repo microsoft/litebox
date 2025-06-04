@@ -15,3 +15,4 @@ pub fn load_program(
 /// The magic number used to identify the LiteBox rewriter and where we should
 /// update the syscall callback pointer.
 pub const REWRITER_MAGIC_NUMBER: u64 = u64::from_le_bytes(*b"LITE BOX");
+pub const REWRITER_VERSION_NUMBER: u64 = u64::from_le_bytes(*b"LITEBOX0");

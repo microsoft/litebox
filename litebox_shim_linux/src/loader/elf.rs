@@ -323,10 +323,10 @@ impl ElfLoader {
                 }
                 .expect("failed to mmap trampoline section");
                 // The first 8 bytes of the data is the magic number,
-                let magic_number = start_addr as *const u64;
+                let version_number = start_addr as *const u64;
                 assert_eq!(
-                    unsafe { magic_number.read() },
-                    super::REWRITER_MAGIC_NUMBER,
+                    unsafe { version_number.read() },
+                    super::REWRITER_VERSION_NUMBER,
                     "trampoline section magic number mismatch"
                 );
                 let placeholder = (start_addr + 8) as *mut usize;

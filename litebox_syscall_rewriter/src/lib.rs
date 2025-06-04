@@ -143,7 +143,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
 
     let mut trampoline_data = vec![];
     // The magic prefix for the trampoline section
-    trampoline_data.extend_from_slice("LITE BOX".as_bytes());
+    trampoline_data.extend_from_slice("LITEBOX0".as_bytes());
     // The placeholder for the address of the new syscall entry point
     trampoline_data.extend_from_slice(&trampoline.unwrap_or(0).to_le_bytes());
 
