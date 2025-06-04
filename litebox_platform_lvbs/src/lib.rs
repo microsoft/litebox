@@ -4,7 +4,7 @@
 #![no_std]
 #![cfg_attr(feature = "interrupt", feature(abi_x86_interrupt))]
 
-use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
+use crate::mshv::{vsm::ModuleMemoryMap, vtl1_mem_layout::PAGE_SIZE};
 use core::sync::atomic::{AtomicBool, AtomicU64};
 use core::{arch::asm, sync::atomic::AtomicU32};
 
@@ -39,7 +39,7 @@ pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
     page_table: mm::PageTable<PAGE_SIZE>,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
-    vtl0_module_memory: crate::mshv::vsm::ModuleMemoryMap,
+    vtl0_module_memory: ModuleMemoryMap,
     vtl0_boot_done: AtomicBool,
 }
 
@@ -94,7 +94,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             host_and_task: core::marker::PhantomData,
             page_table: pt,
             vtl1_phys_frame_range: PhysFrame::range(physframe_start, physframe_end),
-            vtl0_module_memory: crate::mshv::vsm::ModuleMemoryMap::new(),
+            vtl0_module_memory: ModuleMemoryMap::new(),
             vtl0_boot_done: AtomicBool::new(false),
         }))
     }

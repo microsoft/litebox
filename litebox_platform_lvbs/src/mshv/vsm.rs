@@ -196,11 +196,13 @@ pub fn mshv_vsm_configure_partition() -> u64 {
 }
 
 /// VSM function for locking VTL0's control registers.
-/// VTL0 is not allowed to call this function after the end of boot process.
 pub fn mshv_vsm_lock_regs() -> u64 {
     debug_serial_println!("VSM: Lock control registers");
 
     if crate::platform_low().check_end_of_boot() {
+        serial_println!(
+            "VSM: VTL0 is not allowed to change control register locking after the end of boot process"
+        );
         return EINVAL;
     }
 
@@ -258,16 +260,23 @@ pub fn mshv_vsm_end_of_boot() -> u64 {
 
 /// VSM function for protecting certain memory ranges (e.g., kernel text, data, heap).
 /// `pa` and `nranges` specify a memory area containing the information about the memory ranges to protect.
-/// VTL0 is not allowed to call this function after the end of boot process.
 pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> u64 {
+    if !pa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096)) || nranges == 0 {
+        serial_println!("VSM: invalid input address");
+        return EINVAL;
+    }
+
     if crate::platform_low().check_end_of_boot() {
+        serial_println!(
+            "VSM: VTL0 is not allowed to change kernel memory protection after the end of boot process"
+        );
         return EINVAL;
     }
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         for heki_page in heki_pages {
             for i in 0..usize::try_from(heki_page.nranges).unwrap_or(0) {
-                let va: u64 = heki_page.ranges[i].va;
+                let va = heki_page.ranges[i].va;
                 let pa = heki_page.ranges[i].pa;
                 let epa = heki_page.ranges[i].epa;
                 let attr = heki_page.ranges[i].attributes;
@@ -277,7 +286,7 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> u64 {
                     || !pa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096))
                     || !epa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096))
                 {
-                    serial_println!("VSM: input addresses must be page-aligned");
+                    serial_println!("VSM: input address must be page-aligned");
                     return EINVAL;
                 }
                 if mem_attr == MemAttr::empty() {
@@ -312,9 +321,16 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> u64 {
 
 /// VSM function for loading kernel data (e.g., certificates, blocklist, kernel symbols) into VTL1.
 /// `pa` and `nranges` specify a memory area containing the information about the memory ranges to load.
-/// VTL0 is not allowed to call this function after the end of boot process.
 pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> u64 {
+    if !pa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096)) || nranges == 0 {
+        serial_println!("VSM: invalid input address");
+        return EINVAL;
+    }
+
     if crate::platform_low().check_end_of_boot() {
+        serial_println!(
+            "VSM: VTL0 is not allowed to load kernel data after the end of boot process"
+        );
         return EINVAL;
     }
 
@@ -354,6 +370,11 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> u64 {
 /// `flags` controls the validation process (unused for now).
 /// This function returns a unique `token` to VTL0, which is used to identify the module in subsequent calls.
 pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> u64 {
+    if !pa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096)) || nranges == 0 {
+        serial_println!("VSM: invalid input address");
+        return EINVAL;
+    }
+
     let token = crate::platform_low().vtl0_module_memory.gen_unique_key();
 
     debug_serial_println!(
@@ -370,9 +391,9 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> u64
                 let pa = heki_page.ranges[i].pa;
                 let epa = heki_page.ranges[i].epa;
                 let attr = heki_page.ranges[i].attributes;
-                let mod_mem_type = ModMemType::try_from(attr).unwrap_or(ModMemType::Invalid);
+                let mod_mem_type = ModMemType::try_from(attr).unwrap_or(ModMemType::Unknown);
                 match mod_mem_type {
-                    ModMemType::Invalid => {
+                    ModMemType::Unknown => {
                         serial_println!("VSM: Invalid module memory type");
                         crate::platform_low().vtl0_module_memory.remove(token);
                         return EINVAL;
@@ -380,12 +401,12 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> u64
                     ModMemType::ElfBuffer => { // TODO: store the ElfBuffer in a local data structure for validation.
                     }
                     _ => {
-                        // if input memory range's type is neither `Invalid` nor `ElfBuffer`, its addresses must be page-aligned
+                        // if input memory range's type is neither `Unknown` nor `ElfBuffer`, its addresses must be page-aligned
                         if !va.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096))
                             || !pa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096))
                             || !epa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap_or(4096))
                         {
-                            serial_println!("VSM: input addresses must be page-aligned");
+                            serial_println!("VSM: input address must be page-aligned");
                             return EINVAL;
                         }
 
@@ -433,6 +454,14 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> u64
 pub fn mshv_vsm_free_guest_module_init(token: u64) -> u64 {
     debug_serial_println!("VSM: Free kernel module's init (token: {})", token);
 
+    if crate::platform_low()
+        .vtl0_module_memory
+        .is_invalid_key(token)
+    {
+        serial_println!("VSM: invalid module token");
+        return EINVAL;
+    }
+
     if let Some(entry) = crate::platform_low().vtl0_module_memory.iter_entry(token) {
         for mod_mem_range in entry.iter_mem_ranges() {
             match mod_mem_range.mod_mem_type {
@@ -467,6 +496,14 @@ pub fn mshv_vsm_free_guest_module_init(token: u64) -> u64 {
 pub fn mshv_vsm_unload_guest_module(token: u64) -> u64 {
     debug_serial_println!("VSM: Unload kernel module (token: {})", token);
 
+    if crate::platform_low()
+        .vtl0_module_memory
+        .is_invalid_key(token)
+    {
+        serial_println!("VSM: invalid module token");
+        return EINVAL;
+    }
+
     if let Some(entry) = crate::platform_low().vtl0_module_memory.iter_entry(token) {
         // remove protection applied to the memory ranges of a module to be unloaded
         for mod_mem_range in entry.iter_mem_ranges() {
@@ -498,15 +535,13 @@ pub fn mshv_vsm_kexec_validate(_pa: u64, _nranges: u64, _crash: u64) -> u64 {
 }
 
 /// VSM function dispatcher
-/// # Panics
-/// Panics if VTL call parameter 0 is greater than u32::MAX
 pub fn vsm_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> u64 {
     if params[0] > u32::MAX.into() {
         serial_println!("VSM: Unknown function ID {:#x}", params[0]);
         return EINVAL;
     }
 
-    match VSMFunction::try_from(u32::try_from(params[0]).expect("VTL call param 0"))
+    match VSMFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
         .unwrap_or(VSMFunction::Unknown)
     {
         VSMFunction::EnableAPsVtl => mshv_vsm_enable_aps(params[1]),
@@ -619,29 +654,6 @@ fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
     Ok(0)
 }
 
-/// This function copies `HekiPage` structures from VTL0 and returns a vector of them.
-/// `pa` and `nranges` specify the physical address range containing one or more `HekiPage` structures.
-fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<Box<HekiPage>>> {
-    let mut next_pa: u64 = pa;
-    let mut heki_pages = Vec::new();
-    let mut range: u64 = 0;
-
-    while range < nranges {
-        let Some(heki_page) = (unsafe {
-            crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(next_pa))
-        }) else {
-            serial_println!("Failed to get VTL0 memory for heki page");
-            return None;
-        };
-
-        range += heki_page.nranges;
-        next_pa = heki_page.next_pa;
-        heki_pages.push(heki_page);
-    }
-
-    Some(heki_pages)
-}
-
 /// Data structure for maintaining guest physical addresses of each VTL0 kernel module to
 /// remove protection applied to them once a module is initialized (`mshv_vsm_free_guest_module_init`) or
 /// a module is unloaded (`mshv_vsm_unload_guest_module`).
@@ -681,7 +693,7 @@ impl Default for ModuleMemoryRange {
             0,
             0,
             u64::try_from(PAGE_SIZE).unwrap_or(0),
-            ModMemType::Invalid,
+            ModMemType::Unknown,
         )
     }
 }
@@ -698,8 +710,13 @@ impl ModuleMemoryMap {
         self.key_gen.fetch_add(1, Ordering::Relaxed)
     }
 
+    pub fn is_invalid_key(&self, key: u64) -> bool {
+        self.key_gen.load(Ordering::Relaxed) < key
+    }
+
     pub fn insert_memory_range(&self, key: u64, mem_range: ModuleMemoryRange) -> bool {
-        if self.key_gen.load(Ordering::Relaxed) < key {
+        if self.is_invalid_key(key) {
+            debug_serial_println!("VSM: Invalid key {:#x} for inserting memory range", key);
             return false;
         }
 
@@ -755,7 +772,32 @@ impl ModuleMemoryMap {
     }
 }
 
-// Protect a physical memory range
+/// This function copies `HekiPage` structures from VTL0 and returns a vector of them.
+/// `pa` and `nranges` specify the physical address range containing one or more than one `HekiPage` structures.
+fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<Box<HekiPage>>> {
+    let mut next_pa: u64 = pa;
+    let mut heki_pages = Vec::new();
+    let mut range: u64 = 0;
+
+    while range < nranges {
+        let Some(heki_page) = (unsafe {
+            crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(next_pa))
+        }) else {
+            serial_println!("Failed to get VTL0 memory for heki page");
+            return None;
+        };
+
+        range += heki_page.nranges;
+        next_pa = heki_page.next_pa;
+        heki_pages.push(heki_page);
+    }
+
+    Some(heki_pages)
+}
+
+/// This function protects a physical memory range using `hv_modify_vtl_protection_mask`
+/// `phys_frame_range` specifies the physical frame range to protect
+/// `mem_attr` specifies the memory attributes to be applied to the range
 #[inline]
 fn protect_physical_memory_range(
     phys_frame_range: PhysFrameRange<Size4KiB>,

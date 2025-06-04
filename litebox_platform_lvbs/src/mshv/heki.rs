@@ -71,7 +71,7 @@ pub enum ModMemType {
     InitRoData = 6,
     ElfBuffer = 7,
     #[default]
-    Invalid = 0xffff_ffff_ffff_ffff,
+    Unknown = 0xffff_ffff_ffff_ffff,
 }
 
 pub(crate) fn mod_mem_type_to_mem_attr(mod_mem_type: ModMemType) -> MemAttr {
