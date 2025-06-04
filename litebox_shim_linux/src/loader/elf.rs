@@ -201,8 +201,8 @@ struct TrampolineSection {
 }
 
 struct TrampolineHdr {
-    /// The virtual memory offset of the trampoline code.
-    mem_offset: usize,
+    /// The virtual memory of the trampoline code.
+    vaddr: usize,
     /// The file offset of the trampoline code in the ELF file.
     file_offset: usize,
     /// Size of the trampoline code in the ELF file.
@@ -247,13 +247,15 @@ fn get_trampoline_hdr(object: &mut ElfFile) -> Option<TrampolineHdr> {
     if trampoline.magic_number != super::REWRITER_MAGIC_NUMBER {
         return None;
     }
-    // Section header is put at the end of the file, and the trampoline section is
-    // placed after the section header with page alignement.
+    // The trampoline code is placed at the end of the file.
+    let file_size = crate::syscalls::file::sys_fstat(object.as_fd().unwrap())
+        .expect("failed to get file stat")
+        .st_size;
     let file_end =
         usize::try_from(elfhdr.e_shoff).ok()? + usize::from(elfhdr.e_shentsize * elfhdr.e_shnum);
     Some(TrampolineHdr {
-        mem_offset: usize::try_from(trampoline.trampoline_addr).ok()?,
-        file_offset: file_end.next_multiple_of(PAGE_SIZE),
+        vaddr: usize::try_from(trampoline.trampoline_addr).ok()?,
+        file_offset: usize::try_from(file_size).unwrap() - trampoline.trampoline_size,
         size: trampoline.trampoline_size,
     })
 }
@@ -302,10 +304,10 @@ impl ElfLoader {
 
             if let Some(trampoline) = trampoline {
                 assert!(
-                    trampoline.mem_offset % PAGE_SIZE == 0,
+                    trampoline.vaddr % PAGE_SIZE == 0,
                     "trampoline address must be page-aligned"
                 );
-                let start_addr = elf.base() + trampoline.mem_offset;
+                let start_addr = elf.base() + trampoline.vaddr;
                 let end_addr = (start_addr + trampoline.size).next_multiple_of(0x1000);
                 let mut need_copy = false;
                 unsafe {
@@ -331,11 +333,11 @@ impl ElfLoader {
                 );
                 let placeholder = (start_addr + 8) as *mut usize;
                 unsafe { placeholder.write(crate::syscall_callback as usize) };
-                let pm = litebox_page_manager();
                 // `mprotect` requires the address to be page-aligned
                 let ptr = unsafe {
                     core::mem::transmute::<*mut u8, crate::MutPtr<u8>>(start_addr as *mut u8)
                 };
+                let pm = litebox_page_manager();
                 unsafe { pm.make_pages_executable(ptr, end_addr - start_addr) }
                     .expect("failed to make pages executable");
             }
