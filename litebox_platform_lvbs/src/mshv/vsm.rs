@@ -461,10 +461,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> u64
 pub fn mshv_vsm_free_guest_module_init(token: u64) -> u64 {
     debug_serial_println!("VSM: Free kernel module's init (token: {})", token);
 
-    if crate::platform_low()
-        .vtl0_module_memory
-        .is_invalid_key(token)
-    {
+    if !crate::platform_low().vtl0_module_memory.contains_key(token) {
         serial_println!("VSM: invalid module token");
         return EINVAL;
     }
@@ -503,10 +500,7 @@ pub fn mshv_vsm_free_guest_module_init(token: u64) -> u64 {
 pub fn mshv_vsm_unload_guest_module(token: u64) -> u64 {
     debug_serial_println!("VSM: Unload kernel module (token: {})", token);
 
-    if crate::platform_low()
-        .vtl0_module_memory
-        .is_invalid_key(token)
-    {
+    if !crate::platform_low().vtl0_module_memory.contains_key(token) {
         serial_println!("VSM: invalid module token");
         return EINVAL;
     }
@@ -715,12 +709,12 @@ impl ModuleMemoryMap {
         self.key_gen.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub fn is_invalid_key(&self, key: u64) -> bool {
-        self.key_gen.load(Ordering::Relaxed) < key
+    pub fn contains_key(&self, key: u64) -> bool {
+        self.inner.lock().contains_key(&key)
     }
 
     pub fn insert_memory_range(&self, key: u64, mem_range: ModuleMemoryRange) -> bool {
-        if self.is_invalid_key(key) {
+        if self.key_gen.load(Ordering::Relaxed) < key {
             debug_serial_println!("VSM: Invalid key {:#x} for inserting memory range", key);
             return false;
         }
