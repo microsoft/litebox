@@ -2,7 +2,7 @@ use crate::mshv::{HvPageProtFlags, vtl1_mem_layout::PAGE_SIZE};
 use num_enum::TryFromPrimitive;
 
 bitflags::bitflags! {
-    #[derive(Debug, PartialEq)]
+    #[derive(Clone, Copy, Debug, PartialEq)]
     pub struct MemAttr: u64 {
         const MEM_ATTR_READ = 1 << 0;
         const MEM_ATTR_WRITE = 1 << 1;
