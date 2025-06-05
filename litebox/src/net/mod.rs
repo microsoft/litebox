@@ -879,6 +879,34 @@ where
         self.automated_platform_interaction(PollDirection::Ingress);
         ret
     }
+
+    /// Set TCP options
+    pub fn set_tcp_option(
+        &mut self,
+        fd: &SocketFd,
+        data: TcpOptionData,
+    ) -> Result<(), errors::SetTcpOptionError> {
+        let socket_handle = self.handles[fd.x.as_usize()]
+            .as_mut()
+            .ok_or(errors::SetTcpOptionError::InvalidFd)?;
+        match socket_handle.protocol() {
+            Protocol::Tcp => {
+                let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
+                match data {
+                    TcpOptionData::NODELAY(nodelay) => {
+                        tcp_socket.set_nagle_enabled(!nodelay);
+                    }
+                    TcpOptionData::KEEPALIVE(keepalive) => {
+                        tcp_socket.set_keep_alive(keepalive.map(smoltcp::time::Duration::from));
+                    }
+                }
+                Ok(())
+            }
+            Protocol::Udp | Protocol::Icmp | Protocol::Raw { .. } => {
+                Err(errors::SetTcpOptionError::NotTcpSocket)
+            }
+        }
+    }
 }
 
 /// Protocols for sockets supported by LiteBox
@@ -934,4 +962,25 @@ bitflags! {
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
     }
+}
+
+/// Socket options for TCP
+#[non_exhaustive]
+pub enum TcpOptionName {
+    /// If set, disable the Nagle algorithm. This means that
+    /// segments are always sent as soon as possible, even if there
+    /// is only a small amount of data.
+    NODELAY,
+    /// Enable sending of keep-alive messages.
+    KEEPALIVE,
+}
+
+/// Data for TCP options
+///
+/// Note it should be paired with the correct [`TcpOptionName`] variant.
+/// For example, `TcpOptionName::NODELAY` should be paired with `TcpOptionData::NODELAY(true)`.
+#[non_exhaustive]
+pub enum TcpOptionData {
+    NODELAY(bool),
+    KEEPALIVE(Option<core::time::Duration>),
 }
