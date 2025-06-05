@@ -30,13 +30,13 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// `can_grow_down` specifies if the region is allowed to grow "downward" (i.e., towards zero),
     /// upon a page fault.
     ///
-    /// `populate_pages` specifies if the pages should be populated immediately or lazily.
+    /// `populate_pages_immediately` specifies if the pages should be populated immediately or lazily.
     fn allocate_pages(
         &self,
         range: Range<usize>,
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
-        populate_pages: bool,
+        populate_pages_immediately: bool,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError>;
 
     /// De-allocated all pages in the given `range`.

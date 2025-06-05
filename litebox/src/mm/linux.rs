@@ -77,16 +77,16 @@ bitflags::bitflags! {
     pub(super) struct CreatePagesFlags: u8 {
         const FIXED_ADDR     = 1 << 0;
         const IS_STACK       = 1 << 1;
-        const POPULATE_PAGES = 1 << 2;
+        const POPULATE_PAGES_IMMEDIATELY = 1 << 2;
     }
 }
 
 impl CreatePagesFlags {
-    pub(super) fn new(fixed_addr: bool, is_stack: bool, populate_pages: bool) -> Self {
+    pub(super) fn new(fixed_addr: bool, is_stack: bool, populate_pages_immediately: bool) -> Self {
         let mut flags = Self::empty();
         flags.set(Self::FIXED_ADDR, fixed_addr);
         flags.set(Self::IS_STACK, is_stack);
-        flags.set(Self::POPULATE_PAGES, populate_pages);
+        flags.set(Self::POPULATE_PAGES_IMMEDIATELY, populate_pages_immediately);
         flags
     }
 }
@@ -268,7 +268,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         &mut self,
         range: PageRange<ALIGN>,
         vma: VmArea,
-        populate_pages: bool,
+        populate_pages_immediately: bool,
     ) -> Option<Platform::RawMutPointer<u8>> {
         let (start, end) = (range.start, range.end);
         if start < Self::TASK_ADDR_MIN || end > Self::TASK_ADDR_MAX {
@@ -296,7 +296,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 range.into(),
                 MemoryRegionPermissions::from_bits(permissions).unwrap(),
                 vma.flags.contains(VmFlags::VM_GROWSDOWN),
-                populate_pages,
+                populate_pages_immediately,
             )
         }
         .ok()?;
@@ -311,10 +311,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// The length of `suggested_range` is the size of the pages to be created.
     ///
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
-    /// existing overlapping mappings being removed.
+    /// existing overlapping mappings being removed. Otherwise, the kernel will choose an available memory region
+    /// if the suggested address is not available.
     ///
     /// By default, the pages are not populated until they are accessed.
-    /// Set `populate_pages` to `true` to populate the pages immediately.
+    /// Set `populate_pages_immediately` to `true` to populate the pages immediately.
     ///
     /// Return `Some(new_addr)` if the mapping is created successfully.
     /// The returned address is `ALIGN`-aligned.
@@ -329,12 +330,12 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         suggested_range: PageRange<ALIGN>,
         vma: VmArea,
         fixed_addr: bool,
-        populate_pages: bool,
+        populate_pages_immediately: bool,
     ) -> Option<Platform::RawMutPointer<u8>> {
         let new_addr = self.get_unmmaped_area(suggested_range, fixed_addr)?;
         // new_addr must be ALIGN aligned
         let new_range = PageRange::new(new_addr, new_addr + suggested_range.len()).unwrap();
-        unsafe { self.insert_mapping(new_range, vma, populate_pages) }
+        unsafe { self.insert_mapping(new_range, vma, populate_pages_immediately) }
     }
 
     /// Resize a range in the virtual address space.
@@ -559,7 +560,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                         },
                 ),
                 flags.contains(CreatePagesFlags::FIXED_ADDR),
-                flags.contains(CreatePagesFlags::POPULATE_PAGES),
+                flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
             )
         }
         .ok_or(MappingError::OutOfMemory)?;

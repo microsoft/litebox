@@ -52,7 +52,7 @@ where
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
     /// existing overlapping mappings being removed.
     ///
-    /// Set `populate_pages` to `true` to populate the pages immediately.
+    /// Set `populate_pages_immediately` to `true` to populate the pages immediately.
     ///
     /// `op` is a callback for caller to initialize the created pages.
     ///
@@ -65,7 +65,7 @@ where
         &self,
         suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
-        populate_pages: bool,
+        populate_pages_immediately: bool,
         op: F,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
@@ -75,7 +75,7 @@ where
         unsafe {
             vmem.create_pages(
                 suggested_range,
-                CreatePagesFlags::new(fixed_addr, false, populate_pages),
+                CreatePagesFlags::new(fixed_addr, false, populate_pages_immediately),
                 // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the code)
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
                 // keep READ, turn off WRITE and turn on EXEC
@@ -94,7 +94,7 @@ where
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
     /// existing overlapping mappings being removed.
     ///
-    /// Set `populate_pages` to `true` to populate the pages immediately.
+    /// Set `populate_pages_immediately` to `true` to populate the pages immediately.
     ///
     /// `op` is a callback for caller to initialize the created pages.
     ///
@@ -107,7 +107,7 @@ where
         &self,
         suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
-        populate_pages: bool,
+        populate_pages_immediately: bool,
         op: F,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
@@ -118,7 +118,7 @@ where
         unsafe {
             vmem.create_pages(
                 suggested_range,
-                CreatePagesFlags::new(fixed_addr, false, populate_pages),
+                CreatePagesFlags::new(fixed_addr, false, populate_pages_immediately),
                 perms,
                 perms,
                 op,
@@ -135,7 +135,7 @@ where
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
     /// existing overlapping mappings being removed.
     ///
-    /// Set `populate_pages` to `true` to populate the pages immediately.
+    /// Set `populate_pages_immediately` to `true` to populate the pages immediately.
     ///
     /// `op` is a callback for caller to initialize the created pages.
     ///
@@ -148,7 +148,7 @@ where
         &self,
         suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
-        populate_pages: bool,
+        populate_pages_immediately: bool,
         op: F,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
@@ -158,7 +158,7 @@ where
         unsafe {
             vmem.create_pages(
                 suggested_range,
-                CreatePagesFlags::new(fixed_addr, false, populate_pages),
+                CreatePagesFlags::new(fixed_addr, false, populate_pages_immediately),
                 // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the data)
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
                 // keep READ, turn off WRITE
@@ -177,7 +177,7 @@ where
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
     /// existing overlapping mappings being removed.
     ///
-    /// Set `populate_pages` to `true` to populate the pages immediately.
+    /// Set `populate_pages_immediately` to `true` to populate the pages immediately.
     ///
     /// `op` is a callback for caller to initialize the created pages.
     ///
@@ -190,7 +190,7 @@ where
         &self,
         suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
-        populate_pages: bool,
+        populate_pages_immediately: bool,
         op: F,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
@@ -200,7 +200,7 @@ where
         unsafe {
             vmem.create_pages(
                 suggested_range,
-                CreatePagesFlags::new(fixed_addr, false, populate_pages),
+                CreatePagesFlags::new(fixed_addr, false, populate_pages_immediately),
                 MemoryRegionPermissions::empty(),
                 MemoryRegionPermissions::empty(),
                 op,
@@ -217,7 +217,7 @@ where
     /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
     /// existing overlapping mappings being removed.
     ///
-    /// Set `populate_pages` to `true` to populate the pages immediately.
+    /// Set `populate_pages_immediately` to `true` to populate the pages immediately.
     ///
     /// # Safety
     ///
@@ -228,14 +228,14 @@ where
         &self,
         suggested_range: PageRange<ALIGN>,
         fixed_addr: bool,
-        populate_pages: bool,
+        populate_pages_immediately: bool,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         let mut vmem = self.vmem.write();
         unsafe {
             vmem.create_pages(
                 suggested_range,
-                CreatePagesFlags::new(fixed_addr, true, populate_pages),
+                CreatePagesFlags::new(fixed_addr, true, populate_pages_immediately),
                 perms,
                 perms,
                 |_| Ok(0),
