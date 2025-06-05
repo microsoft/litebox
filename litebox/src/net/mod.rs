@@ -977,7 +977,7 @@ pub enum TcpOptionName {
 
 /// Data for TCP options
 ///
-/// Note it should be paired with the correct `TcpOptionName` variant.
+/// Note it should be paired with the correct [`TcpOptionName`] variant.
 /// For example, `TcpOptionName::NODELAY` should be paired with `TcpOptionData::NODELAY(true)`.
 #[non_exhaustive]
 pub enum TcpOptionData {
