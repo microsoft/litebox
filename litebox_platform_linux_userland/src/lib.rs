@@ -427,7 +427,7 @@ const HWCAP2_FSGSBASE: u64 = 1 << 1;
 
 /// Get the current fs base register value.
 ///
-/// Depending on whether `fsgsbase` instructions are enabled, we can choose
+/// Depending on whether `fsgsbase` instructions are enabled, we choose
 /// between `arch_prctl` or `rdfsbase` to get the fs base.
 #[cfg(target_arch = "x86_64")]
 fn get_fs_base() -> Result<usize, litebox_common_linux::errno::Errno> {
@@ -445,7 +445,7 @@ fn get_fs_base() -> Result<usize, litebox_common_linux::errno::Errno> {
 
 /// Set the fs base register value.
 ///
-/// Depending on whether `fsgsbase` instructions are enabled, we can choose
+/// Depending on whether `fsgsbase` instructions are enabled, we choose
 /// between `arch_prctl` or `wrfsbase` to set the fs base.
 #[cfg(target_arch = "x86_64")]
 fn set_fs_base(fs_base: usize) -> Result<usize, litebox_common_linux::errno::Errno> {

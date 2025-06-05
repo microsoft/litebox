@@ -521,7 +521,7 @@ pub enum ArchPrctlCode {
     #[cfg(target_arch = "x86_64")]
     GetFs = 0x1003,
 
-    /* CET (Control-flow Enforcement Technology) ralated operations */
+    /* CET (Control-flow Enforcement Technology) ralated operations; each of these simply will return EINVAL */
     CETStatus = 0x3001,
     CETDisable = 0x3002,
     CETLock = 0x3003,
