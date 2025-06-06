@@ -31,22 +31,23 @@ fn do_mmap(
     op: impl FnOnce(MutPtr<u8>) -> Result<usize, MappingError>,
 ) -> Result<MutPtr<u8>, MappingError> {
     let fixed_addr = flags.contains(MapFlags::MAP_FIXED);
+    let populate_pages = flags.contains(MapFlags::MAP_POPULATE);
     let suggested_addr = addr.unwrap_or(0);
     let suggested_range = litebox::mm::linux::PageRange::new(suggested_addr, suggested_addr + len)
         .ok_or(MappingError::UnAligned)?;
     let pm = litebox_page_manager();
     match prot {
         ProtFlags::PROT_READ_EXEC => unsafe {
-            pm.create_executable_pages(suggested_range, fixed_addr, op)
+            pm.create_executable_pages(suggested_range, fixed_addr, populate_pages, op)
         },
         ProtFlags::PROT_READ_WRITE => unsafe {
-            pm.create_writable_pages(suggested_range, fixed_addr, op)
+            pm.create_writable_pages(suggested_range, fixed_addr, populate_pages, op)
         },
         ProtFlags::PROT_READ => unsafe {
-            pm.create_readable_pages(suggested_range, fixed_addr, op)
+            pm.create_readable_pages(suggested_range, fixed_addr, populate_pages, op)
         },
         ProtFlags::PROT_NONE => unsafe {
-            pm.create_inaccessible_pages(suggested_range, fixed_addr, op)
+            pm.create_inaccessible_pages(suggested_range, fixed_addr, populate_pages, op)
         },
         _ => todo!("Unsupported prot flags {:?}", prot),
     }
@@ -70,7 +71,6 @@ fn do_mmap_file(
     fd: i32,
     offset: usize,
 ) -> Result<MutPtr<u8>, MappingError> {
-    let fixed_addr = flags.contains(MapFlags::MAP_FIXED);
     let op = |ptr: MutPtr<u8>| -> Result<usize, MappingError> {
         // Note a malicious user may unmap ptr while we are reading.
         // `sys_read` does not handle page faults, so we need to use a
@@ -125,7 +125,6 @@ pub(crate) fn sys_mmap(
             | MapFlags::MAP_32BIT
             | MapFlags::MAP_GROWSDOWN
             | MapFlags::MAP_LOCKED
-            | MapFlags::MAP_POPULATE
             | MapFlags::MAP_NONBLOCK
             | MapFlags::MAP_SYNC
             | MapFlags::MAP_HUGETLB

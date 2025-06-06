@@ -313,7 +313,7 @@ impl ElfLoader {
             let suggested_range = litebox::mm::linux::PageRange::new(0, Self::DEFAULT_STACK_SIZE)
                 .expect("DEFAULT_STACK_SIZE is not page-aligned");
             litebox_page_manager()
-                .create_stack_pages(suggested_range, false)
+                .create_stack_pages(suggested_range, false, false)
                 .map_err(ElfLoaderError::MappingError)?
         };
         let mut stack =

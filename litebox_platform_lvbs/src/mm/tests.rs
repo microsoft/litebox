@@ -241,6 +241,7 @@ fn test_vmm_page_fault() {
             vmm.create_writable_pages(
                 PageRange::new(start_addr, start_addr + 4 * PAGE_SIZE).unwrap(),
                 true,
+                false,
                 |_: UserMutPtr<u8>| Ok(0),
             )
             .unwrap()
@@ -279,6 +280,7 @@ fn test_vmm_page_fault() {
             vmm.create_stack_pages(
                 PageRange::new(stack_addr, stack_addr + 4 * PAGE_SIZE).unwrap(),
                 true,
+                false,
             )
             .unwrap()
             .as_usize(),

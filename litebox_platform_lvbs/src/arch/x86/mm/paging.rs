@@ -81,9 +81,23 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         unsafe { Self::init(item) }
     }
 
-    #[expect(clippy::unused_self, reason = "for consistency with unmap/remap/...")]
-    pub(crate) fn map_pages(&self, range: PageRange<ALIGN>, _flags: VmFlags) -> UserMutPtr<u8> {
-        // leave it to page fault handler
+    pub(crate) fn map_pages(
+        &self,
+        range: PageRange<ALIGN>,
+        flags: VmFlags,
+        populate_pages: bool,
+    ) -> UserMutPtr<u8> {
+        if populate_pages {
+            let flags = vmflags_to_pteflags(flags);
+            for page in range {
+                let page =
+                    Page::<Size4KiB>::from_start_address(VirtAddr::new(page as u64)).unwrap();
+                unsafe {
+                    PageTableImpl::handle_page_fault(self, page, flags, PageFaultErrorCode::empty())
+                }
+                .expect("Failed to handle page fault");
+            }
+        }
         UserMutPtr {
             inner: range.start as *mut u8,
         }
