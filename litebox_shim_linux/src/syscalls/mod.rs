@@ -4,6 +4,7 @@ pub(crate) mod eventfd;
 pub mod file;
 pub(crate) mod mm;
 pub(crate) mod net;
+pub(crate) mod process;
 
 #[cfg(test)]
 pub(crate) mod tests;

@@ -509,6 +509,79 @@ impl TryFrom<TimeVal> for core::time::Duration {
     }
 }
 
+/// Codes for the `arch_prctl` syscall.
+#[repr(u32)]
+#[non_exhaustive]
+#[derive(Debug, IntEnum)]
+pub enum ArchPrctlCode {
+    /// Set the 64-bit base for the FS register
+    #[cfg(target_arch = "x86_64")]
+    SetFs = 0x1002,
+    /// Return the 64-bit base value for the FS register of the calling thread
+    #[cfg(target_arch = "x86_64")]
+    GetFs = 0x1003,
+
+    /* CET (Control-flow Enforcement Technology) ralated operations; each of these simply will return EINVAL */
+    CETStatus = 0x3001,
+    CETDisable = 0x3002,
+    CETLock = 0x3003,
+}
+
+/// Argument for the `arch_prctl` syscall, corresponding to the [`ArchPrctlCode`] enum.
+#[non_exhaustive]
+pub enum ArchPrctlArg<Platform: litebox::platform::RawPointerProvider> {
+    #[cfg(target_arch = "x86_64")]
+    SetFs(Platform::RawConstPointer<u8>),
+    #[cfg(target_arch = "x86_64")]
+    GetFs(Platform::RawMutPointer<usize>),
+
+    CETStatus,
+    CETDisable,
+    CETLock,
+
+    #[doc(hidden)]
+    #[allow(non_camel_case_types)]
+    __Phantom(core::marker::PhantomData<Platform>),
+}
+
+/// Reads the FS segment base address
+///
+/// ## Safety
+///
+/// If `CR4.FSGSBASE` is not set, calling this instruction from user land will throw an `#UD`.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rdfsbase() -> usize {
+    let ret: usize;
+    unsafe {
+        core::arch::asm!(
+            "rdfsbase {}",
+            out(reg) ret,
+            options(nostack, nomem)
+        );
+    }
+    ret
+}
+
+/// Writes the FS segment base address
+///
+/// ## Safety
+///
+/// If `CR4.FSGSBASE` is not set, calling this instruction from user land will throw an `#UD`.
+///
+/// The caller must ensure that this write operation has no unsafe side
+/// effects, as the FS segment base address is often used for thread
+/// local storage.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn wrfsbase(fs_base: usize) {
+    unsafe {
+        core::arch::asm!(
+            "wrfsbase {}",
+            in(reg) fs_base,
+            options(nostack, nomem)
+        );
+    }
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
@@ -656,6 +729,9 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         buf: Platform::RawMutPointer<u8>,
         size: usize,
     },
+    ArchPrctl {
+        arg: ArchPrctlArg<Platform>,
+    },
     Readlink {
         pathname: Platform::RawConstPointer<i8>,
         buf: Platform::RawMutPointer<u8>,
@@ -716,6 +792,14 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
         old_set: Platform::RawMutPointer<u8>,
         /// Specifies the size in bytes of the signal sets in `set` and `oldset`.
         sigsetsize: usize,
+    },
+    /// Set the FS base register to the value in `addr`.
+    #[cfg(target_arch = "x86_64")]
+    SetFsBase { addr: Platform::RawConstPointer<u8> },
+    /// Get the current value of the FS base register and store it in `addr`.
+    #[cfg(target_arch = "x86_64")]
+    GetFsBase {
+        addr: Platform::RawMutPointer<usize>,
     },
 }
 

@@ -421,6 +421,88 @@ impl litebox::platform::Instant for Instant {
     }
 }
 
+// from asm/hwcap2.h
+#[cfg(target_arch = "x86_64")]
+const HWCAP2_FSGSBASE: u64 = 1 << 1;
+
+/// Get the current fs base register value.
+///
+/// Depending on whether `fsgsbase` instructions are enabled, we choose
+/// between `arch_prctl` or `rdfsbase` to get the fs base.
+#[cfg(target_arch = "x86_64")]
+fn get_fs_base() -> Result<usize, litebox_common_linux::errno::Errno> {
+    /// Function pointer to get the current fs base.
+    static GET_FS_BASE: spin::Once<fn() -> Result<usize, litebox_common_linux::errno::Errno>> =
+        spin::Once::new();
+    GET_FS_BASE.call_once(|| {
+        if unsafe { libc::getauxval(libc::AT_HWCAP2) } & HWCAP2_FSGSBASE != 0 {
+            || Ok(unsafe { litebox_common_linux::rdfsbase() })
+        } else {
+            get_fs_base_arch_prctl
+        }
+    })()
+}
+
+/// Set the fs base register value.
+///
+/// Depending on whether `fsgsbase` instructions are enabled, we choose
+/// between `arch_prctl` or `wrfsbase` to set the fs base.
+#[cfg(target_arch = "x86_64")]
+fn set_fs_base(fs_base: usize) -> Result<usize, litebox_common_linux::errno::Errno> {
+    static SET_FS_BASE: spin::Once<fn(usize) -> Result<usize, litebox_common_linux::errno::Errno>> =
+        spin::Once::new();
+    SET_FS_BASE.call_once(|| {
+        if unsafe { libc::getauxval(libc::AT_HWCAP2) } & HWCAP2_FSGSBASE != 0 {
+            |fs_base| {
+                unsafe { litebox_common_linux::wrfsbase(fs_base) };
+                Ok(0)
+            }
+        } else {
+            set_fs_base_arch_prctl
+        }
+    })(fs_base)
+}
+
+/// Get fs register value via syscall `arch_prctl`.
+#[cfg(target_arch = "x86_64")]
+fn get_fs_base_arch_prctl() -> Result<usize, litebox_common_linux::errno::Errno> {
+    let mut fs_base = core::mem::MaybeUninit::<usize>::uninit();
+    unsafe {
+        syscalls::syscall3(
+            syscalls::Sysno::arch_prctl,
+            litebox_common_linux::ArchPrctlCode::GetFs as usize,
+            fs_base.as_mut_ptr() as usize,
+            // Unused by the syscall but would be checked by Seccomp filter if enabled.
+            syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+        )
+    }
+    .map_err(|err| match err {
+        syscalls::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
+        syscalls::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
+        _ => unimplemented!("unexpected error {err}"),
+    })?;
+    Ok(unsafe { fs_base.assume_init() })
+}
+
+/// Set fs register value via syscall `arch_prctl`.
+#[cfg(target_arch = "x86_64")]
+fn set_fs_base_arch_prctl(fs_base: usize) -> Result<usize, litebox_common_linux::errno::Errno> {
+    unsafe {
+        syscalls::syscall3(
+            syscalls::Sysno::arch_prctl,
+            litebox_common_linux::ArchPrctlCode::SetFs as usize,
+            fs_base,
+            // Unused by the syscall but would be checked by Seccomp filter if enabled.
+            syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+        )
+    }
+    .map_err(|err| match err {
+        syscalls::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
+        syscalls::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
+        _ => unimplemented!("unexpected error {err}"),
+    })
+}
+
 pub struct PunchthroughToken {
     punchthrough: PunchthroughSyscall<LinuxUserland>,
 }
@@ -441,6 +523,23 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 // to introduce the "backdoor" argument or not. For now, we just trigger a panic.
                 todo!()
             }
+            #[cfg(target_arch = "x86_64")]
+            PunchthroughSyscall::SetFsBase { addr } => {
+                use litebox::platform::RawConstPointer as _;
+                set_fs_base(addr.as_usize()).map_err(litebox::platform::PunchthroughError::Failure)
+            }
+            #[cfg(target_arch = "x86_64")]
+            PunchthroughSyscall::GetFsBase { addr } => {
+                use litebox::platform::RawMutPointer as _;
+                let fs_base =
+                    get_fs_base().map_err(litebox::platform::PunchthroughError::Failure)?;
+                unsafe { addr.write_at_offset(0, fs_base) }.ok_or(
+                    litebox::platform::PunchthroughError::Failure(
+                        litebox_common_linux::errno::Errno::EFAULT,
+                    ),
+                )?;
+                Ok(0)
+            }
         }
     }
 }
@@ -451,10 +550,7 @@ impl litebox::platform::PunchthroughProvider for LinuxUserland {
         &self,
         punchthrough: <Self::PunchthroughToken as litebox::platform::PunchthroughToken>::Punchthrough,
     ) -> Option<Self::PunchthroughToken> {
-        // TODO(jayb): Currently, we are disabling all punchthroughs. Once we get the backend
-        // parametricity working, we can switch this out to enable the punchthrough.
-        let _ = punchthrough;
-        None
+        Some(PunchthroughToken { punchthrough })
     }
 }
 
