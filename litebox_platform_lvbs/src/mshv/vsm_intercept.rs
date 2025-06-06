@@ -46,7 +46,7 @@ pub enum InterceptedRegisterName {
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn vsm_handle_intercept() -> u64 {
+pub fn vsm_handle_intercept() -> i64 {
     let kernel_context = get_per_core_kernel_context();
     let simp_page = kernel_context.hv_simp_page_as_mut_ptr();
 
@@ -167,7 +167,7 @@ pub fn vsm_handle_intercept() -> u64 {
 }
 
 #[inline]
-fn advance_vtl0_rip(int_msg_hdr: &HvInterceptMessageHeader) -> u64 {
+fn advance_vtl0_rip(int_msg_hdr: &HvInterceptMessageHeader) -> i64 {
     let new_vtl0_rip = int_msg_hdr.rip + u64::from(int_msg_hdr.instruction_length);
 
     if let Err(result) = write_vtl0_register(HV_X64_REGISTER_RIP, new_vtl0_rip) {
@@ -177,7 +177,7 @@ fn advance_vtl0_rip(int_msg_hdr: &HvInterceptMessageHeader) -> u64 {
 }
 
 #[inline]
-fn raise_vtl0_gp_fault() -> u64 {
+fn raise_vtl0_gp_fault() -> i64 {
     let mut exception = HvPendingExceptionEvent::new();
     exception.set_event_pending();
     exception.set_event_type(0);
@@ -194,7 +194,7 @@ fn raise_vtl0_gp_fault() -> u64 {
 }
 
 #[inline]
-fn write_vtl0_register(reg_name: u32, value: u64) -> Result<(), u64> {
+fn write_vtl0_register(reg_name: u32, value: u64) -> Result<(), i64> {
     if let Err(result) = hvcall_set_vp_vtl0_registers(reg_name, value) {
         serial_println!("Err: {:?}", result);
         let err: u32 = result.into();

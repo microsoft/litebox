@@ -223,6 +223,7 @@ pub fn vtl_switch_loop() -> ! {
         let kernel_context = get_per_core_kernel_context();
         let reason = unsafe { (*kernel_context.hv_vp_assist_page_as_ptr()).vtl_entry_reason };
         match VtlEntryReason::try_from(reason).unwrap_or(VtlEntryReason::Unknown) {
+            #[allow(clippy::cast_sign_loss)]
             VtlEntryReason::VtlCall => {
                 let params = kernel_context.vtl0_state.get_vtlcall_params();
                 if VSMFunction::try_from(u32::try_from(params[0]).expect("VTL call param 0"))
@@ -232,12 +233,13 @@ pub fn vtl_switch_loop() -> ! {
                     todo!("unknown function ID = {:#x}", params[0]);
                 } else {
                     let new_result = vsm_dispatch(&params);
-                    kernel_context.set_vtl_return_value(new_result);
+                    kernel_context.set_vtl_return_value(new_result as u64);
                 }
             }
+            #[allow(clippy::cast_sign_loss)]
             VtlEntryReason::Interrupt => {
                 let new_result = vsm_handle_intercept();
-                kernel_context.set_vtl_return_value(new_result);
+                kernel_context.set_vtl_return_value(new_result as u64);
             }
             VtlEntryReason::Unknown => {
                 serial_println!("Unknown VTL entry reason");
