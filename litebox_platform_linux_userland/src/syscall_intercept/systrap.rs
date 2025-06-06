@@ -202,6 +202,11 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             ),
             new_addr: syscall_args[4],
         },
+        libc::SYS_brk => SyscallRequest::Brk {
+            addr: TransparentMutPtr {
+                inner: syscall_args[0] as *mut u8,
+            },
+        },
         libc::SYS_ioctl => SyscallRequest::Ioctl {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
             arg: to_ioctl_arg(syscall_args[1].truncate(), syscall_args[2]),
@@ -673,7 +678,6 @@ fn register_seccomp_filter() {
                 .unwrap(),
             ],
         ),
-        (libc::SYS_brk, vec![]),
         (
             libc::SYS_rt_sigaction,
             vec![

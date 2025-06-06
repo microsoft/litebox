@@ -243,6 +243,55 @@ where
         }
     }
 
+    /// Set the program break to the given address.
+    ///
+    /// Increasing the program break has the effect of allocating memory to the process;
+    /// decreasing the break deallocates memory.
+    ///
+    /// Note the initial program break is set to zero and the first call to `brk` would set it
+    /// to the given address, which is usually the end of the data segment.
+    ///
+    /// # Safety
+    ///
+    /// If shrinking the program break, the caller must ensure that the released memory region is no longer used.
+    pub unsafe fn brk(&self, brk: usize) -> Result<usize, MappingError> {
+        let mut vmem = self.vmem.write();
+        let old_brk = vmem.brk;
+        if old_brk == 0 {
+            // If the old brk is not set yet, we set it to the new brk
+            // Note the first call should be made by the loader to set the initial brk
+            // to the end of the data segment.
+            vmem.brk = brk;
+            return Ok(brk);
+        } else if brk == 0 {
+            // Calling `brk` with 0 can be used to find the current location of the program break.
+            return Ok(vmem.brk);
+        } else if old_brk >= brk {
+            // If the old brk is already greater than or equal to the new brk, we can just return
+            // TODO: shrink the memory region
+            return Ok(brk);
+        }
+        let old_brk = old_brk.next_multiple_of(linux::PAGE_SIZE);
+        let new_brk = brk.next_multiple_of(linux::PAGE_SIZE);
+        if vmem.overlapping(old_brk..new_brk).next().is_some() {
+            return Err(MappingError::OutOfMemory);
+        }
+        if let Some(range) = PageRange::<ALIGN>::new(old_brk, new_brk) {
+            let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+            unsafe {
+                vmem.create_pages(
+                    range,
+                    CreatePagesFlags::new(true, false, false),
+                    perms,
+                    perms,
+                    |_| Ok(0),
+                )
+            }?;
+        }
+        vmem.brk = brk;
+        Ok(brk)
+    }
+
     /// Expands (or shrinks) an existing memory mapping
     ///
     /// `old_addr` is the old address of the virtual memory block that you want to expand (or shrink).

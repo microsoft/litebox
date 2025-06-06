@@ -194,6 +194,8 @@ impl VmArea {
 pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> {
     /// Memory backend that provides the actual memory.
     pub(super) platform: &'static Platform,
+    /// Current program break address.
+    pub(super) brk: usize,
     /// Virtual memory areas.
     vmas: RangeMap<usize, VmArea>,
 }
@@ -207,11 +209,21 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) const STACK_GUARD_GAP: usize = 256 << 12;
 
     /// Create a new [`Vmem`] instance with the given memory [backend](PageManagementProvider).
-    pub(super) const fn new(platform: &'static Platform) -> Self {
-        Self {
+    pub(super) fn new(platform: &'static Platform) -> Self {
+        let mut vmem = Self {
             vmas: RangeMap::new(),
+            brk: 0,
             platform,
+        };
+        for each in platform.reserved_pages() {
+            vmem.vmas.insert(
+                each.start..each.end,
+                VmArea {
+                    flags: VmFlags::empty(),
+                },
+            );
         }
+        vmem
     }
 
     /// Gets an iterator over all pairs of ([`Range<usize>`], [`VmArea`]),
@@ -615,23 +627,30 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let (low_limit, high_limit) = (Self::TASK_ADDR_MIN, Self::TASK_ADDR_MAX - size);
         let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
         if last_end <= high_limit {
-            return Some(last_end);
+            return Some(high_limit);
         }
 
         // 2. check gaps between ranges
-        for (r, _) in self.vmas.iter().rev().skip(1) {
-            if !self.vmas.overlaps(&(r.end..r.end + size)) {
-                return Some(r.end);
+        for (r, flags) in self.vmas.iter().rev() {
+            let start = r.start.checked_sub(
+                size + if flags.flags.contains(VmFlags::VM_GROWSDOWN) {
+                    // If it is a stack, we need to leave enough space for the stack to grow downwards.
+                    Self::STACK_GUARD_GAP << 1
+                } else {
+                    0
+                },
+            )?;
+            if start < low_limit {
+                return None;
             }
-        }
-
-        // 3. check [low_limit, first_start)
-        let first_start = self
-            .vmas
-            .first_range_value()
-            .map_or(high_limit, |r| r.0.start);
-        if low_limit + size <= first_start {
-            return Some(first_start - size);
+            if start > high_limit {
+                // Note we may have pre-allocated memory that are higher than `TASK_ADDR_MAX`
+                // (See [`Vmem::new`]) and thus `start` may be larger than `high_limit`.
+                continue;
+            }
+            if !self.vmas.overlaps(&(start..start + size)) {
+                return Some(start);
+            }
         }
 
         None

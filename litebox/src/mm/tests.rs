@@ -184,8 +184,13 @@ fn test_vmm_mapping() {
         Err(VmemResizeError::RangeOccupied(_))
     ));
     assert!(
-        unsafe { vmm.move_mappings(r, PageRange::new(0, PAGE_SIZE * 4).unwrap()) }
-            .is_ok_and(|v| v.as_usize() == start_addr + 12 * PAGE_SIZE)
+        unsafe {
+            vmm.move_mappings(
+                r,
+                PageRange::new(start_addr + 12 * PAGE_SIZE, start_addr + 16 * PAGE_SIZE).unwrap(),
+            )
+        }
+        .is_ok_and(|v| v.as_usize() == start_addr + 12 * PAGE_SIZE)
     );
     assert_eq!(
         collect_mappings(&vmm),
@@ -208,7 +213,7 @@ fn test_vmm_mapping() {
         }
         .unwrap()
         .as_usize(),
-        start_addr + 16 * PAGE_SIZE
+        Vmem::<DummyVmemBackend, PAGE_SIZE>::TASK_ADDR_MAX - PAGE_SIZE,
     );
     assert_eq!(
         collect_mappings(&vmm),
@@ -216,7 +221,8 @@ fn test_vmm_mapping() {
             start_addr..start_addr + 2 * PAGE_SIZE,
             start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            start_addr + 16 * PAGE_SIZE..start_addr + 17 * PAGE_SIZE,
+            Vmem::<DummyVmemBackend, PAGE_SIZE>::TASK_ADDR_MAX - PAGE_SIZE
+                ..Vmem::<DummyVmemBackend, PAGE_SIZE>::TASK_ADDR_MAX,
         ]
     );
 
@@ -241,7 +247,8 @@ fn test_vmm_mapping() {
             start_addr + PAGE_SIZE..start_addr + 3 * PAGE_SIZE,
             start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            start_addr + 16 * PAGE_SIZE..start_addr + 17 * PAGE_SIZE,
+            Vmem::<DummyVmemBackend, PAGE_SIZE>::TASK_ADDR_MAX - PAGE_SIZE
+                ..Vmem::<DummyVmemBackend, PAGE_SIZE>::TASK_ADDR_MAX,
         ]
     );
 
@@ -263,7 +270,8 @@ fn test_vmm_mapping() {
             start_addr + 4 * PAGE_SIZE..start_addr + 6 * PAGE_SIZE,
             start_addr + 8 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            start_addr + 16 * PAGE_SIZE..start_addr + 17 * PAGE_SIZE,
+            Vmem::<DummyVmemBackend, PAGE_SIZE>::TASK_ADDR_MAX - PAGE_SIZE
+                ..Vmem::<DummyVmemBackend, PAGE_SIZE>::TASK_ADDR_MAX,
         ]
     );
 }

@@ -77,9 +77,20 @@ pub fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
     FS.get().expect("fs has not yet been set")
 }
 
+static VMEM: OnceBox<PageManager<Platform, PAGE_SIZE>> = OnceBox::new();
+/// Set the global page manager
+///
+/// # Panics
+///
+/// Panics if this is called more than once
+pub fn set_page_manager(page_manager: PageManager<Platform, PAGE_SIZE>) {
+    VMEM.set(alloc::boxed::Box::new(page_manager))
+        .map_err(|_| {})
+        .expect("page manager is already set");
+}
+
 pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE> {
-    static VMEM: OnceBox<PageManager<Platform, PAGE_SIZE>> = OnceBox::new();
-    VMEM.get_or_init(|| alloc::boxed::Box::new(PageManager::new(litebox())))
+    VMEM.get().expect("page manager has not yet been set")
 }
 
 pub(crate) fn litebox_net<'a>()
@@ -362,6 +373,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
         SyscallRequest::Munmap { addr, length } => {
             syscalls::mm::sys_munmap(addr, length).map(|()| 0)
         }
+        SyscallRequest::Brk { addr } => syscalls::mm::sys_brk(addr),
         SyscallRequest::Readv { fd, iovec, iovcnt } => syscalls::file::sys_readv(fd, iovec, iovcnt),
         SyscallRequest::Writev { fd, iovec, iovcnt } => {
             syscalls::file::sys_writev(fd, iovec, iovcnt)
@@ -717,6 +729,9 @@ unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) 
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
             buf: unsafe { transmute_ptr(syscall_args[1] as *const u8) },
             count: syscall_args[2],
+        },
+        ::syscalls::Sysno::brk => SyscallRequest::Brk {
+            addr: unsafe { transmute_ptr_mut(syscall_args[0] as *mut u8) },
         },
         ::syscalls::Sysno::rt_sigprocmask => {
             let how: i32 = syscall_args[0].reinterpret_as_signed().truncate();
