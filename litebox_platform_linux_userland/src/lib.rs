@@ -540,6 +540,22 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 )?;
                 Ok(0)
             }
+            #[cfg(target_arch = "x86")]
+            PunchthroughSyscall::SetThreadArea { user_desc } => {
+                use litebox::platform::RawConstPointer as _;
+                unsafe {
+                    syscalls::syscall1(syscalls::Sysno::set_thread_area, user_desc.as_usize())
+                }
+                .map_err(|err| {
+                    litebox::platform::PunchthroughError::Failure(match err {
+                        syscalls::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
+                        syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
+                        syscalls::Errno::ENOSYS => litebox_common_linux::errno::Errno::ENOSYS,
+                        syscalls::Errno::ESRCH => litebox_common_linux::errno::Errno::ESRCH,
+                        _ => panic!("unexpected error {err}"),
+                    })
+                })
+            }
         }
     }
 }
