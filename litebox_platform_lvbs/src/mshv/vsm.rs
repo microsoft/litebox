@@ -44,12 +44,12 @@ pub const NUM_VTLCALL_PARAMS: usize = 4;
 
 pub fn init() {
     assert!(
-        !(get_core_id() == 0 && mshv_vsm_configure_partition() != 0),
+        !(get_core_id() == 0 && mshv_vsm_configure_partition().is_err()),
         "Failed to configure VSM partition"
     );
 
     assert!(
-        (mshv_vsm_secure_config_vtl0() == 0),
+        (mshv_vsm_secure_config_vtl0().is_ok()),
         "Failed to secure VTL0 configuration"
     );
 
@@ -78,7 +78,7 @@ pub fn init() {
 ///
 /// # Panics
 /// Panics if hypercall for initializing VTL for APs fails
-pub fn mshv_vsm_enable_aps(cpu_present_mask_pfn: u64) -> i64 {
+pub fn mshv_vsm_enable_aps(cpu_present_mask_pfn: u64) -> Result<i64, Errno> {
     debug_serial_println!("VSM: Enable VTL of APs");
 
     if let Some(cpu_mask) = unsafe {
@@ -95,28 +95,23 @@ pub fn mshv_vsm_enable_aps(cpu_present_mask_pfn: u64) -> i64 {
         debug_serial_println!("");
     } else {
         serial_println!("Failed to get cpu_present_mask");
-        return Errno::EINVAL.as_neg().into();
+        return Err(Errno::EINVAL);
     }
 
     // TODO: cpu_present_mask vs num_possible_cpus in kernel command line. which one should we use?
-    let Ok(num_cores) = get_num_possible_cpus() else {
-        serial_println!("Failed to get number of possible cores");
-        return Errno::EINVAL.as_neg().into();
-    };
-
-    debug_serial_println!("the number of possible cores: {}", num_cores);
-
-    if let Err(result) = init_vtl_aps(num_cores) {
-        serial_println!("Err: {:?}", result);
-        return Errno::EINVAL.as_neg().into();
+    if let Ok(num_cores) = get_num_possible_cpus() {
+        debug_serial_println!("the number of possible cores: {num_cores}");
+        init_vtl_aps(num_cores).map_err(|_| Errno::EINVAL)?;
+        Ok(0)
+    } else {
+        Err(Errno::EINVAL)
     }
-    0
 }
 
 /// VSM function for booting APs
 /// `cpu_online_mask_pfn` indicates the page containing the VTL0's CPU online mask.
 /// `boot_signal_pfn` indicates the boot signal page to let VTL0 know that VTL1 is ready.
-pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> i64 {
+pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Result<i64, Errno> {
     debug_serial_println!("VSM: Boot APs");
 
     if let Some(cpu_mask) = unsafe {
@@ -133,7 +128,7 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> i64 
         debug_serial_println!("");
     } else {
         serial_println!("Failed to get cpu_online_mask");
-        return Errno::EINVAL.as_neg().into();
+        return Err(Errno::EINVAL);
     }
 
     // boot_signal is an array of bytes whose length is the number of possible cores. Copy the entire page for now.
@@ -150,67 +145,60 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> i64 
             boot_signal_page[i as usize] = HV_SECURE_VTL_BOOT_TOKEN;
         }
 
-        if !unsafe {
+        if unsafe {
             crate::platform_low().copy_to_vtl0_phys::<[u8; PAGE_SIZE]>(
                 x86_64::PhysAddr::new(boot_signal_pfn << PAGE_SHIFT),
                 &boot_signal_page,
             )
         } {
+            Ok(0)
+        } else {
             serial_println!("Failed to copy boot signal page to VTL0");
-            return Errno::EINVAL.as_neg().into();
+            Err(Errno::EINVAL)
         }
     } else {
         serial_println!("Failed to get boot signal page");
-        return Errno::EINVAL.as_neg().into();
+        Err(Errno::EINVAL)
     }
-
-    0
 }
 
 /// VSM function for enforcing certain security features of VTL0
-pub fn mshv_vsm_secure_config_vtl0() -> i64 {
+pub fn mshv_vsm_secure_config_vtl0() -> Result<i64, Errno> {
     debug_serial_println!("VSM: Secure VTL0 configuration");
 
     let mut config = HvRegisterVsmVpSecureVtlConfig::new();
     config.set_mbec_enabled();
     config.set_tlb_locked();
 
-    if let Err(result) =
-        hvcall_set_vp_registers(HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, config.as_u64())
-    {
-        serial_println!("Err: {:?}", result);
-        return Errno::EFAULT.as_neg().into();
-    }
+    hvcall_set_vp_registers(HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, config.as_u64())
+        .map_err(|_| Errno::EFAULT)?;
 
-    0
+    Ok(0)
 }
 
 /// VSM function to configure a VSM partition for VTL1
-pub fn mshv_vsm_configure_partition() -> i64 {
+pub fn mshv_vsm_configure_partition() -> Result<i64, Errno> {
     debug_serial_println!("VSM: Configure partition");
 
     let mut config = HvRegisterVsmPartitionConfig::new();
     config.set_default_vtl_protection_mask(HvPageProtFlags::HV_PAGE_FULL_ACCESS.bits().into());
     config.set_enable_vtl_protection();
 
-    if let Err(result) = hvcall_set_vp_registers(HV_REGISTER_VSM_PARTITION_CONFIG, config.as_u64())
-    {
-        serial_println!("Err: {:?}", result);
-        return Errno::EFAULT.as_neg().into();
-    }
+    hvcall_set_vp_registers(HV_REGISTER_VSM_PARTITION_CONFIG, config.as_u64())
+        .map_err(|_| Errno::EFAULT)?;
 
-    0
+    Ok(0)
 }
 
 /// VSM function for locking VTL0's control registers.
-pub fn mshv_vsm_lock_regs() -> i64 {
+pub fn mshv_vsm_lock_regs() -> Result<i64, Errno> {
     debug_serial_println!("VSM: Lock control registers");
 
     if crate::platform_low().check_end_of_boot() {
         serial_println!(
             "VSM: VTL0 is not allowed to change control register locking after the end of boot process"
         );
-        return Errno::EINVAL.as_neg().into();
+        return Err(Errno::EINVAL);
     }
 
     let flag = HvCrInterceptControlFlags::CR0_WRITE.bits()
@@ -229,33 +217,23 @@ pub fn mshv_vsm_lock_regs() -> i64 {
         | HvCrInterceptControlFlags::MSR_SYSENTER_EIP_WRITE.bits()
         | HvCrInterceptControlFlags::MSR_SFMASK_WRITE.bits();
 
-    if let Err(result) = save_vtl0_locked_regs() {
-        serial_println!("Err: {:?}", result);
-        return Errno::EFAULT.as_neg().into();
-    }
+    save_vtl0_locked_regs().map_err(|_| Errno::EFAULT)?;
 
-    if let Err(result) = hvcall_set_vp_registers(HV_REGISTER_CR_INTERCEPT_CONTROL, flag) {
-        serial_println!("Err: {:?}", result);
-        return Errno::EFAULT.as_neg().into();
-    }
+    hvcall_set_vp_registers(HV_REGISTER_CR_INTERCEPT_CONTROL, flag).map_err(|_| Errno::EFAULT)?;
 
-    if let Err(result) = hvcall_set_vp_registers(
+    hvcall_set_vp_registers(
         HV_REGISTER_CR_INTERCEPT_CR4_MASK,
         X86Cr4Flags::CR4_PIN_MASK.bits().into(),
-    ) {
-        serial_println!("Err: {:?}", result);
-        return Errno::EFAULT.as_neg().into();
-    }
+    )
+    .map_err(|_| Errno::EFAULT)?;
 
-    if let Err(result) = hvcall_set_vp_registers(
+    hvcall_set_vp_registers(
         HV_REGISTER_CR_INTERCEPT_CR0_MASK,
         X86Cr0Flags::CR0_PIN_MASK.bits().into(),
-    ) {
-        serial_println!("Err: {:?}", result);
-        return Errno::EFAULT.as_neg().into();
-    }
+    )
+    .map_err(|_| Errno::EFAULT)?;
 
-    0
+    Ok(0)
 }
 
 /// VSM function for signaling the end of VTL0 boot process
@@ -267,17 +245,17 @@ pub fn mshv_vsm_end_of_boot() -> i64 {
 
 /// VSM function for protecting certain memory ranges (e.g., kernel text, data, heap).
 /// `pa` and `nranges` specify a memory area containing the information about the memory ranges to protect.
-pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> i64 {
+pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, Errno> {
     if !pa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap()) || nranges == 0 {
         serial_println!("VSM: invalid input address");
-        return Errno::EINVAL.as_neg().into();
+        return Err(Errno::EINVAL);
     }
 
     if crate::platform_low().check_end_of_boot() {
         serial_println!(
             "VSM: VTL0 is not allowed to change kernel memory protection after the end of boot process"
         );
-        return Errno::EINVAL.as_neg().into();
+        return Err(Errno::EINVAL);
     }
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
@@ -289,7 +267,7 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> i64 {
                 let attr = heki_page.ranges[i].attributes;
                 let Some(mem_attr) = MemAttr::from_bits(attr) else {
                     serial_println!("VSM: Invalid memory attributes");
-                    return Errno::EINVAL.as_neg().into();
+                    return Err(Errno::EINVAL);
                 };
 
                 if !va.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap())
@@ -297,7 +275,7 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> i64 {
                     || !epa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap())
                 {
                     serial_println!("VSM: input address must be page-aligned");
-                    return Errno::EINVAL.as_neg().into();
+                    return Err(Errno::EINVAL);
                 }
 
                 debug_serial_println!(
@@ -309,38 +287,34 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> i64 {
                     epa - pa
                 );
 
-                if protect_physical_memory_range(
+                protect_physical_memory_range(
                     PhysFrame::range(
                         PhysFrame::containing_address(x86_64::PhysAddr::new(pa)),
                         PhysFrame::containing_address(x86_64::PhysAddr::new(epa)),
                     ),
                     mem_attr,
-                )
-                .is_err()
-                {
-                    return Errno::EFAULT.as_neg().into();
-                }
+                )?;
             }
         }
-        0
+        Ok(0)
     } else {
-        Errno::EINVAL.as_neg().into()
+        Err(Errno::EINVAL)
     }
 }
 
 /// VSM function for loading kernel data (e.g., certificates, blocklist, kernel symbols) into VTL1.
 /// `pa` and `nranges` specify memory areas containing the information about the memory ranges to load.
-pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> i64 {
+pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
     if !pa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap()) || nranges == 0 {
         serial_println!("VSM: invalid input address");
-        return Errno::EINVAL.as_neg().into();
+        return Err(Errno::EINVAL);
     }
 
     if crate::platform_low().check_end_of_boot() {
         serial_println!(
             "VSM: VTL0 is not allowed to load kernel data after the end of boot process"
         );
-        return Errno::EINVAL.as_neg().into();
+        return Err(Errno::EINVAL);
     }
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
@@ -363,9 +337,9 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> i64 {
                 );
             }
         }
-        0
+        Ok(0)
     } else {
-        Errno::EINVAL.as_neg().into()
+        Err(Errno::EINVAL)
     }
 
     // TODO: create trusted keys
@@ -378,10 +352,10 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> i64 {
 /// `pa` and `nranges` specify a memory area containing the information about the kernel module to validate or protect.
 /// `flags` controls the validation process (unused for now).
 /// This function returns a unique `token` to VTL0, which is used to identify the module in subsequent calls.
-pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> i64 {
+pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Result<i64, Errno> {
     if !pa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap()) || nranges == 0 {
         serial_println!("VSM: invalid input address");
-        return Errno::EINVAL.as_neg().into();
+        return Err(Errno::EINVAL);
     }
 
     debug_serial_println!(
@@ -404,7 +378,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> i64
                 match mod_mem_type {
                     ModMemType::Unknown => {
                         serial_println!("VSM: Invalid module memory type");
-                        return Errno::EINVAL.as_neg().into();
+                        return Err(Errno::EINVAL);
                     }
                     ModMemType::ElfBuffer => { // TODO: store the ElfBuffer in a local data structure for validation.
                     }
@@ -415,7 +389,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> i64
                             || !epa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap())
                         {
                             serial_println!("VSM: input address must be page-aligned");
-                            return Errno::EINVAL.as_neg().into();
+                            return Err(Errno::EINVAL);
                         }
 
                         module_memory.insert_memory_range(ModuleMemoryRange::new(
@@ -429,37 +403,34 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> i64
             }
         }
     } else {
-        return Errno::EINVAL.as_neg().into();
+        return Err(Errno::EINVAL);
     }
 
     // TODO: validate a kernel module by analyzing its ELF binary and memory content. For now, we just assume the module is valid.
 
     // protect the memory ranges of a module based on their section types
     for mod_mem_range in &module_memory {
-        if protect_physical_memory_range(
+        protect_physical_memory_range(
             mod_mem_range.phys_frame_range,
             mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type),
-        )
-        .is_err()
-        {
-            return Errno::EFAULT.as_neg().into();
-        }
+        )?;
     }
 
     // register the module memory in the global map and obtain a unique token for it
-    crate::platform_low()
+    let token = crate::platform_low()
         .vtl0_module_memory
-        .register_module_memory(module_memory)
+        .register_module_memory(module_memory);
+    Ok(token)
 }
 
 /// VSM function for supporting the initialization of a guest kernel module.
 /// `token` is the unique identifier for the module.
-pub fn mshv_vsm_free_guest_module_init(token: i64) -> i64 {
+pub fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, Errno> {
     debug_serial_println!("VSM: Free kernel module's init (token: {})", token);
 
     if !crate::platform_low().vtl0_module_memory.contains_key(token) {
         serial_println!("VSM: invalid module token");
-        return Errno::EINVAL.as_neg().into();
+        return Err(Errno::EINVAL);
     }
 
     if let Some(entry) = crate::platform_low().vtl0_module_memory.iter_entry(token) {
@@ -467,68 +438,64 @@ pub fn mshv_vsm_free_guest_module_init(token: i64) -> i64 {
             match mod_mem_range.mod_mem_type {
                 ModMemType::InitText | ModMemType::InitData | ModMemType::InitRoData => {
                     // make this memory range readable, writable, and non-executable after initialization to let the VTL0 kernel free it
-                    if let Err(result) = protect_physical_memory_range(
+                    protect_physical_memory_range(
                         mod_mem_range.phys_frame_range,
                         MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE,
-                    ) {
-                        return result;
-                    }
+                    )?;
                 }
                 ModMemType::RoAfterInit => {
                     // make this memory range read-only after initialization
-                    if let Err(result) = protect_physical_memory_range(
+                    protect_physical_memory_range(
                         mod_mem_range.phys_frame_range,
                         MemAttr::MEM_ATTR_READ,
-                    ) {
-                        return result;
-                    }
+                    )?;
                 }
                 _ => {}
             }
         }
     }
 
-    0
+    Ok(0)
 }
 
 /// VSM function for supporting the unloading of a guest kernel module.
 /// `token` is the unique identifier for the module.
-pub fn mshv_vsm_unload_guest_module(token: i64) -> i64 {
+pub fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, Errno> {
     debug_serial_println!("VSM: Unload kernel module (token: {})", token);
 
     if !crate::platform_low().vtl0_module_memory.contains_key(token) {
         serial_println!("VSM: invalid module token");
-        return Errno::EINVAL.as_neg().into();
+        return Err(Errno::EINVAL);
     }
 
     if let Some(entry) = crate::platform_low().vtl0_module_memory.iter_entry(token) {
         // make the memory ranges of a module readable, writable, and non-executable to let the VTL0 kernel unload the module
         for mod_mem_range in entry.iter_mem_ranges() {
-            if let Err(result) = protect_physical_memory_range(
+            protect_physical_memory_range(
                 mod_mem_range.phys_frame_range,
                 MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE,
-            ) {
-                return result;
-            }
+            )?;
         }
     }
 
     crate::platform_low().vtl0_module_memory.remove(token);
-    0
+    Ok(0)
 }
 
 /// VSM function for copying secondary key
-pub fn mshv_vsm_copy_secondary_key(_pa: u64, _nranges: u64) -> i64 {
+#[allow(clippy::unnecessary_wraps)]
+pub fn mshv_vsm_copy_secondary_key(_pa: u64, _nranges: u64) -> Result<i64, Errno> {
     debug_serial_println!("VSM: Copy secondary key");
     // TODO: copy secondary key
-    0
+    Ok(0)
 }
 
 /// VSM function for validating kexec
-pub fn mshv_vsm_kexec_validate(_pa: u64, _nranges: u64, _crash: u64) -> i64 {
+#[allow(clippy::unnecessary_wraps)]
+pub fn mshv_vsm_kexec_validate(_pa: u64, _nranges: u64, _crash: u64) -> Result<i64, Errno> {
     debug_serial_println!("VSM: Validate kexec");
     // TODO: validate kexec
-    0
+    Ok(0)
 }
 
 /// VSM function dispatcher
@@ -538,13 +505,13 @@ pub fn vsm_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
         return Errno::EINVAL.as_neg().into();
     }
 
-    match VSMFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
+    let result = match VSMFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
         .unwrap_or(VSMFunction::Unknown)
     {
         VSMFunction::EnableAPsVtl => mshv_vsm_enable_aps(params[1]),
         VSMFunction::BootAPs => mshv_vsm_boot_aps(params[1], params[2]),
         VSMFunction::LockRegs => mshv_vsm_lock_regs(),
-        VSMFunction::SignalEndOfBoot => mshv_vsm_end_of_boot(),
+        VSMFunction::SignalEndOfBoot => Ok(mshv_vsm_end_of_boot()),
         VSMFunction::ProtectMemory => mshv_vsm_protect_memory(params[1], params[2]),
         VSMFunction::LoadKData => mshv_vsm_load_kdata(params[1], params[2]),
         VSMFunction::ValidateModule => {
@@ -558,8 +525,12 @@ pub fn vsm_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
         VSMFunction::KexecValidate => mshv_vsm_kexec_validate(params[1], params[2], params[3]),
         VSMFunction::Unknown => {
             serial_println!("VSM: Unknown function ID {:#x}", params[0]);
-            Errno::EINVAL.as_neg().into()
+            Err(Errno::EINVAL)
         }
+    };
+    match result {
+        Ok(value) => value,
+        Err(errno) => errno.as_neg().into(),
     }
 }
 
@@ -816,19 +787,15 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<Box<HekiPage>>
 fn protect_physical_memory_range(
     phys_frame_range: PhysFrameRange<Size4KiB>,
     mem_attr: MemAttr,
-) -> Result<(), i64> {
+) -> Result<(), Errno> {
     let pa = phys_frame_range.start.start_address().as_u64();
     let num_pages = u64::try_from(phys_frame_range.count()).unwrap_or(0);
     if num_pages == 0 {
         return Ok(());
     }
 
-    if let Err(result) =
-        hv_modify_vtl_protection_mask(pa, num_pages, mem_attr_to_hv_page_prot_flags(mem_attr))
-    {
-        serial_println!("Err: {:?}", result);
-        Err(Errno::EFAULT.as_neg().into())
-    } else {
-        Ok(())
-    }
+    hv_modify_vtl_protection_mask(pa, num_pages, mem_attr_to_hv_page_prot_flags(mem_attr))
+        .map_err(|_| Errno::EFAULT)?;
+
+    Ok(())
 }
