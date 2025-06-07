@@ -9,9 +9,9 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
-use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
+use litebox::platform::{ImmediatelyWokenUp, RawConstPointer};
 use litebox::utils::ReinterpretUnsignedExt as _;
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
 
@@ -518,10 +518,41 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
         >,
     > {
         match self.punchthrough {
-            PunchthroughSyscall::RtSigprocmask { .. } => {
-                // TODO(jayb): Based on the specific backend of the Linux userland platform, we need
-                // to introduce the "backdoor" argument or not. For now, we just trigger a panic.
-                todo!()
+            PunchthroughSyscall::RtSigprocmask { how, set, oldset } => {
+                let set = match set {
+                    Some(ptr) => {
+                        let mut set = unsafe { ptr.read_at_offset(0) }
+                            .ok_or(litebox::platform::PunchthroughError::Failure(
+                                litebox_common_linux::errno::Errno::EFAULT,
+                            ))?
+                            .into_owned();
+                        // never block SIGSYS (required by Seccomp to intercept syscalls)
+                        set.remove(litebox_common_linux::Signal::SIGSYS);
+                        Some(set)
+                    }
+                    None => None,
+                };
+                unsafe {
+                    syscalls::syscall5(
+                        syscalls::Sysno::rt_sigprocmask,
+                        how as usize,
+                        if let Some(set) = set.as_ref() {
+                            core::ptr::from_ref(set) as usize
+                        } else {
+                            0
+                        },
+                        oldset.map_or(0, |ptr| ptr.as_usize()),
+                        size_of::<litebox_common_linux::SigSet>(),
+                        // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                        syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                    )
+                }
+                .map_err(|err| match err {
+                    syscalls::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
+                    syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
+                    _ => panic!("unexpected error {err}"),
+                })
+                .map_err(litebox::platform::PunchthroughError::Failure)
             }
             #[cfg(target_arch = "x86_64")]
             PunchthroughSyscall::SetFsBase { addr } => {

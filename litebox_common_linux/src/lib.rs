@@ -509,6 +509,79 @@ impl TryFrom<TimeVal> for core::time::Duration {
     }
 }
 
+#[repr(i32)]
+#[derive(Debug, IntEnum, PartialEq)]
+/// Signal numbers used in Linux.
+pub enum Signal {
+    SIGHUP = 1,
+    SIGINT = 2,
+    SIGQUIT = 3,
+    SIGILL = 4,
+    SIGTRAP = 5,
+    SIGABRT = 6,
+    // SIGIOT = 6, // Alias for SIGABRT
+    SIGBUS = 7,
+    SIGFPE = 8,
+    SIGKILL = 9,
+    SIGUSR1 = 10,
+    SIGSEGV = 11,
+    SIGUSR2 = 12,
+    SIGPIPE = 13,
+    SIGALRM = 14,
+    SIGTERM = 15,
+    SIGSTKFLT = 16,
+    SIGCHLD = 17,
+    SIGCONT = 18,
+    SIGSTOP = 19,
+    SIGTSTP = 20,
+    SIGTTIN = 21,
+    SIGTTOU = 22,
+    SIGURG = 23,
+    SIGXCPU = 24,
+    SIGXFSZ = 25,
+    SIGVTALRM = 26,
+    SIGPROF = 27,
+    SIGWINCH = 28,
+    SIGIO = 29,
+    // SIGPOLL = 29, // Alias for SIGIO
+    SIGPWR = 30,
+    SIGSYS = 31,
+}
+
+pub const SIGIOT: Signal = Signal::SIGABRT;
+pub const SIGPOLL: Signal = Signal::SIGIO;
+pub const SIGUNUSED: Signal = Signal::SIGSYS;
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct SigSet(usize);
+
+impl SigSet {
+    pub fn empty() -> Self {
+        Self(0)
+    }
+
+    pub fn add(&mut self, signum: Signal) {
+        self.0 |= 1 << (signum as usize - 1);
+    }
+
+    pub fn remove(&mut self, signum: Signal) {
+        self.0 &= !(1 << (signum as usize - 1));
+    }
+
+    pub fn contains(&self, signum: Signal) -> bool {
+        (self.0 & (1 << (signum as usize - 1))) != 0
+    }
+}
+
+#[repr(i32)]
+#[derive(Debug, IntEnum)]
+pub enum SigmaskHow {
+    SIG_BLOCK = 0,
+    SIG_UNBLOCK = 1,
+    SIG_SETMASK = 2,
+}
+
 /// Codes for the `arch_prctl` syscall.
 #[repr(u32)]
 #[non_exhaustive]
@@ -642,6 +715,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         new_size: usize,
         flags: MRemapFlags,
         new_addr: usize,
+    },
+    RtSigprocmask {
+        how: SigmaskHow,
+        set: Option<Platform::RawConstPointer<SigSet>>,
+        oldset: Option<Platform::RawMutPointer<SigSet>>,
+        sigsetsize: usize,
     },
     Ioctl {
         fd: i32,
@@ -797,15 +876,13 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
         ///   signals. It is permissible to attempt to unblock a signal which is not blocked.
         ///
         /// * `SIG_SETMASK` (2): The set of blocked signals is set to the argument `set`.
-        how: i32,
+        how: SigmaskHow,
         /// If `set` is NULL, then the signal mask is unchanged (i.e., `how` is ignored), but the
         /// current value of the signal mask is nevertheless returned in `oldset` (if it is not
         /// NULL).
-        set: Platform::RawConstPointer<u8>,
+        set: Option<Platform::RawConstPointer<SigSet>>,
         /// If `oldset` is non-NULL, the previous value of the signal mask is stored in `oldset`.
-        old_set: Platform::RawMutPointer<u8>,
-        /// Specifies the size in bytes of the signal sets in `set` and `oldset`.
-        sigsetsize: usize,
+        oldset: Option<Platform::RawMutPointer<SigSet>>,
     },
     /// Set the FS base register to the value in `addr`.
     #[cfg(target_arch = "x86_64")]
