@@ -226,24 +226,24 @@ pub fn vtl_switch_loop() -> ! {
             #[allow(clippy::cast_sign_loss)]
             VtlEntryReason::VtlCall => {
                 let params = kernel_context.vtl0_state.get_vtlcall_params();
-                if VSMFunction::try_from(u32::try_from(params[0]).expect("VTL call param 0"))
+                if VSMFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
                     .unwrap_or(VSMFunction::Unknown)
                     == VSMFunction::Unknown
                 {
                     todo!("unknown function ID = {:#x}", params[0]);
                 } else {
-                    let new_result = vsm_dispatch(&params);
-                    kernel_context.set_vtl_return_value(new_result as u64);
+                    let result = vsm_dispatch(&params);
+                    kernel_context.set_vtl_return_value(result as u64);
                 }
             }
-            #[allow(clippy::cast_sign_loss)]
             VtlEntryReason::Interrupt => {
-                let new_result = vsm_handle_intercept();
-                kernel_context.set_vtl_return_value(new_result as u64);
+                vsm_handle_intercept();
+                let result = kernel_context.vtl0_state.r8;
+                kernel_context.set_vtl_return_value(result); // dummy operation for alignment
             }
             VtlEntryReason::Unknown => {
                 serial_println!("Unknown VTL entry reason");
-                kernel_context.set_vtl_return_value(0);
+                kernel_context.set_vtl_return_value(u64::MAX); // dummy operation for alignment
             }
         }
         // do not put any code which might corrupt registers

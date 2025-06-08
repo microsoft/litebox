@@ -9,7 +9,7 @@ use crate::{
         HV_X64_REGISTER_TR, HvInterceptMessage, HvInterceptMessageHeader, HvMemInterceptMessage,
         HvMessageType, HvMsrInterceptMessage, HvPendingExceptionEvent, MSR_CSTAR, MSR_EFER,
         MSR_IA32_APICBASE, MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_EIP, MSR_IA32_SYSENTER_ESP,
-        MSR_LSTAR, MSR_STAR, MSR_SYSCALL_MASK, X86Cr0Flags, X86Cr4Flags,
+        MSR_LSTAR, MSR_STAR, MSR_SYSCALL_MASK, X86Cr0Flags, X86Cr4Flags, hvcall::HypervCallError,
         hvcall_vp::hvcall_set_vp_vtl0_registers,
     },
     serial_println,
@@ -45,8 +45,7 @@ pub enum InterceptedRegisterName {
     Unknown = 0xffff_ffff,
 }
 
-#[allow(clippy::too_many_lines)]
-pub fn vsm_handle_intercept() -> i64 {
+pub fn vsm_handle_intercept() {
     let kernel_context = get_per_core_kernel_context();
     let simp_page = kernel_context.hv_simp_page_as_mut_ptr();
 
@@ -64,8 +63,8 @@ pub fn vsm_handle_intercept() -> i64 {
             };
 
             let gpa = int_msg.gpa;
-            serial_println!("VSM: GPA intercept on {:#x}", gpa);
-            return raise_vtl0_gp_fault();
+            serial_println!("VSM: GPA intercept on {gpa:#x}");
+            raise_vtl0_gp_fault().expect("Failed to raise VTL0 GP fault on GPA intercept");
         }
         HvMessageType::MsrIntercept => {
             let int_msg = unsafe {
@@ -90,24 +89,16 @@ pub fn vsm_handle_intercept() -> i64 {
                 InterceptedMsrIndex::MsrSysenterEsp => HV_X64_REGISTER_SYSENTER_ESP,
                 InterceptedMsrIndex::MsrSysenterEip => HV_X64_REGISTER_SYSENTER_EIP,
                 InterceptedMsrIndex::Unknown => {
-                    panic!(
-                        "Intercepted write to MSR {:#x} that we do not expect",
-                        msr_index,
-                    );
+                    panic!("Intercepted write to unexpected MSR {msr_index:#x}");
                 }
             };
 
-            if !check_and_write_vtl0_register(reg_name, value, DEFAULT_REG_PIN_MASK) {
-                serial_println!(
-                    "VSM: Writing a value ({:#x}) to MSR {:#x} is disallowed",
-                    value,
-                    msr_index,
-                );
-                return raise_vtl0_gp_fault();
-            }
-
-            let int_msg_hdr = int_msg.hdr;
-            advance_vtl0_rip(&int_msg_hdr)
+            validate_and_continue_vtl0_register_write(
+                reg_name,
+                value,
+                DEFAULT_REG_PIN_MASK,
+                &int_msg.hdr,
+            );
         }
         HvMessageType::RegisterIntercept => {
             let int_msg = unsafe {
@@ -118,66 +109,43 @@ pub fn vsm_handle_intercept() -> i64 {
             let reg_name = int_msg.reg_name;
             let value = unsafe { int_msg.info.reg_value_low };
 
-            let mask = match InterceptedRegisterName::try_from(reg_name)
+            match InterceptedRegisterName::try_from(reg_name)
                 .unwrap_or(InterceptedRegisterName::Unknown)
             {
                 InterceptedRegisterName::HvX64RegisterCr0 => {
-                    u64::from(X86Cr0Flags::CR0_PIN_MASK.bits())
+                    let mask = u64::from(X86Cr0Flags::CR0_PIN_MASK.bits());
+                    validate_and_continue_vtl0_register_write(reg_name, value, mask, &int_msg.hdr);
                 }
                 InterceptedRegisterName::HvX64RegisterCr4 => {
-                    u64::from(X86Cr4Flags::CR4_PIN_MASK.bits())
+                    let mask = u64::from(X86Cr4Flags::CR4_PIN_MASK.bits());
+                    validate_and_continue_vtl0_register_write(reg_name, value, mask, &int_msg.hdr);
                 }
                 InterceptedRegisterName::HvX64RegisterGdtr
                 | InterceptedRegisterName::HvX64RegisterIdtr
                 | InterceptedRegisterName::HvX64RegisterLdtr
                 | InterceptedRegisterName::HvX64RegisterTr => {
                     // any write attempts to these registers are disallowed
-                    return raise_vtl0_gp_fault();
+                    raise_vtl0_gp_fault().expect("Failed to raise VTL0 GP fault");
                 }
                 InterceptedRegisterName::Unknown => {
-                    panic!(
-                        "Intercepted write to register {:#x} that we do not expect",
-                        reg_name
-                    );
+                    panic!("Intercepted write to unexpected register {reg_name:#x}");
                 }
-            };
-
-            if !check_and_write_vtl0_register(reg_name, value, mask) {
-                serial_println!(
-                    "VSM: Writing a value ({:#x}) to reg {:#x} is disallowed",
-                    value,
-                    reg_name
-                );
-                return raise_vtl0_gp_fault();
             }
-
-            let int_msg_hdr = int_msg.hdr;
-            advance_vtl0_rip(&int_msg_hdr)
         }
         _ => {
-            serial_println!(
-                "VSM: Ignore unhandled/unknown synthetic interrupt message type {:#x}",
-                msg_type
-            );
-            return 0;
+            serial_println!("VSM: Ignore unknown synthetic interrupt message type {msg_type:#x}");
         }
-    };
-
-    0
-}
-
-#[inline]
-fn advance_vtl0_rip(int_msg_hdr: &HvInterceptMessageHeader) -> i64 {
-    let new_vtl0_rip = int_msg_hdr.rip + u64::from(int_msg_hdr.instruction_length);
-
-    if let Err(result) = write_vtl0_register(HV_X64_REGISTER_RIP, new_vtl0_rip) {
-        return result;
     }
-    0
 }
 
 #[inline]
-fn raise_vtl0_gp_fault() -> i64 {
+fn advance_vtl0_rip(int_msg_hdr: &HvInterceptMessageHeader) -> Result<u64, HypervCallError> {
+    let new_vtl0_rip = int_msg_hdr.rip + u64::from(int_msg_hdr.instruction_length);
+    hvcall_set_vp_vtl0_registers(HV_X64_REGISTER_RIP, new_vtl0_rip)
+}
+
+#[inline]
+fn raise_vtl0_gp_fault() -> Result<u64, HypervCallError> {
     let mut exception = HvPendingExceptionEvent::new();
     exception.set_event_pending();
     exception.set_event_type(0);
@@ -187,33 +155,26 @@ fn raise_vtl0_gp_fault() -> i64 {
     ));
     exception.set_error_code(0);
 
-    if let Err(result) = write_vtl0_register(HV_REGISTER_PENDING_EVENT0, exception.as_u64()) {
-        return result;
-    }
-    0
+    hvcall_set_vp_vtl0_registers(HV_REGISTER_PENDING_EVENT0, exception.as_u64())
 }
 
 #[inline]
-fn write_vtl0_register(reg_name: u32, value: u64) -> Result<(), i64> {
-    if let Err(result) = hvcall_set_vp_vtl0_registers(reg_name, value) {
-        serial_println!("Err: {:?}", result);
-        let err: u32 = result.into();
-        return Err(err.into());
-    }
-
-    Ok(())
-}
-
-#[inline]
-fn check_and_write_vtl0_register(reg_name: u32, value: u64, mask: u64) -> bool {
+fn validate_and_continue_vtl0_register_write(
+    reg_name: u32,
+    value: u64,
+    mask: u64,
+    int_msg_hdr: &HvInterceptMessageHeader,
+) {
     let kernel_context = get_per_core_kernel_context();
     if let Some(allowed_value) = kernel_context.vtl0_locked_regs.get(reg_name) {
-        if value & mask == allowed_value && write_vtl0_register(reg_name, value).is_ok() {
-            return true;
+        if value & mask == allowed_value {
+            hvcall_set_vp_vtl0_registers(reg_name, value).expect("Failed to write VTL0 register");
+            advance_vtl0_rip(int_msg_hdr).expect("Failed to advance VTL0 RIP");
+        } else {
+            serial_println!("VSM: Writing {value:#x} to reg {reg_name:#x} is disallowed");
+            raise_vtl0_gp_fault().expect("Failed to raise VTL0 GP fault");
         }
     } else {
-        panic!("vtl0_locked_regs does not contain register {:#x}", reg_name);
+        panic!("vtl0_locked_regs does not contain register {reg_name:#x}");
     }
-
-    false
 }
