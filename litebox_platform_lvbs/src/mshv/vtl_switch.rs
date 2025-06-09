@@ -7,7 +7,6 @@ use crate::{
         vsm::{NUM_VTLCALL_PARAMS, VSMFunction, vsm_dispatch},
         vsm_intercept::vsm_handle_intercept,
     },
-    serial_println,
 };
 use core::{arch::asm, mem};
 use num_enum::TryFromPrimitive;
@@ -15,7 +14,7 @@ use num_enum::TryFromPrimitive;
 /// Return to VTL0
 #[expect(clippy::inline_always)]
 #[inline(always)]
-pub fn vtl_return() {
+fn vtl_return() {
     unsafe {
         asm!(
             "vmcall",
@@ -27,8 +26,8 @@ pub fn vtl_return() {
 // The following registers are shared between different VTLs.
 // If VTL entry is due to VTL call, we don't need to worry about VTL0 registers because
 // the caller saves them. However, if VTL entry is due to interrupt or intercept,
-// we should save/restore VTL0 registers. For now, we conservately save/restore all
-// VTL0/VTL1 registers (results in performance degradation)
+// we should save/restore VTL0 registers. For now, we conservatively save/restore all
+// VTL0/VTL1 registers (results in performance degradation) but we can optimize it later.
 /// Struct to save VTL state (general-purpose registers)
 #[derive(Default, Clone, Copy)]
 #[repr(C)]
@@ -136,13 +135,13 @@ fn drop_vtl_state_from_stack() {
 
 #[expect(clippy::inline_always)]
 #[inline(always)]
-fn assert_rsp_eq(exected_rsp: u64) {
+fn assert_rsp_eq(expected_rsp: u64) {
     let mut match_flag: u8;
     unsafe {
         asm!(
             "cmp rsp, rax",
             "sete al",
-            in("rax") exected_rsp,
+            in("rax") expected_rsp,
             lateout("al") match_flag,
             options(nostack, preserves_flags)
         );
@@ -204,18 +203,38 @@ pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
     // This is a dummy call to satisfy load_vtl0_state() with reasonable register values.
     // We do not save VTL0 registers during VTL1 initialization.
 
-    vtl_switch_loop();
+    jump_vtl_switch_loop_with_stack_cleanup();
+}
+
+/// This function lets VTL1 return to VTL0. Before returning to VTL0, it re-initializes
+/// the VTL1 kernel stack to discard any leftovers (e.g., unwind, panic, ...).
+#[allow(clippy::inline_always)]
+#[inline(always)]
+pub(crate) fn jump_vtl_switch_loop_with_stack_cleanup() -> ! {
+    let kernel_context = get_per_core_kernel_context();
+    let stack_top = kernel_context.kernel_stack_top();
+    unsafe {
+        asm!(
+            "mov rsp, rax",
+            "and rsp, -16",
+            "jmp {loop}",
+            in("rax") stack_top, loop = sym vtl_switch_loop,
+            options(noreturn)
+        );
+    }
 }
 
 /// VTL switch loop
+///
 /// # Panics
-/// Panics if VTL call parameter 0 is greater than u32::MAX
-pub fn vtl_switch_loop() -> ! {
+/// Panic if it encounters an unknown VTL entry reason.
+fn vtl_switch_loop() -> ! {
     loop {
         save_vtl1_state();
         load_vtl0_state();
 
         vtl_return();
+        // VTL calls and intercepts (i.e., returns from synthetic interrupt handlers) land here.
 
         save_vtl0_state();
         load_vtl1_state();
@@ -234,16 +253,15 @@ pub fn vtl_switch_loop() -> ! {
                 } else {
                     let result = vsm_dispatch(&params);
                     kernel_context.set_vtl_return_value(result as u64);
+                    jump_vtl_switch_loop_with_stack_cleanup();
                 }
             }
             VtlEntryReason::Interrupt => {
                 vsm_handle_intercept();
-                let result = kernel_context.vtl0_state.r8;
-                kernel_context.set_vtl_return_value(result); // dummy operation for alignment
+                jump_vtl_switch_loop_with_stack_cleanup();
             }
             VtlEntryReason::Unknown => {
-                serial_println!("Unknown VTL entry reason");
-                kernel_context.set_vtl_return_value(u64::MAX); // dummy operation for alignment
+                panic!("Unknown VTL entry reason");
             }
         }
         // do not put any code which might corrupt registers

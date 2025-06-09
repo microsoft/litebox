@@ -37,7 +37,10 @@ use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
 use core::sync::atomic::{AtomicI64, Ordering};
 use litebox_common_linux::errno::Errno;
 use num_enum::TryFromPrimitive;
-use x86_64::structures::paging::{PhysFrame, Size4KiB, frame::PhysFrameRange};
+use x86_64::{
+    PhysAddr, VirtAddr,
+    structures::paging::{PhysFrame, Size4KiB, frame::PhysFrameRange},
+};
 
 /// VTL call parameters (param[0]: function ID, param[1-3]: parameters)
 pub const NUM_VTLCALL_PARAMS: usize = 4;
@@ -58,8 +61,8 @@ pub fn init() {
             debug_serial_println!("VSM: Protect GPAs from {:#x} to {:#x}", start, start + size);
             if protect_physical_memory_range(
                 PhysFrame::range(
-                    PhysFrame::containing_address(x86_64::PhysAddr::new(start)),
-                    PhysFrame::containing_address(x86_64::PhysAddr::new(start + size)),
+                    PhysFrame::containing_address(PhysAddr::new(start)),
+                    PhysFrame::containing_address(PhysAddr::new(start + size)),
                 ),
                 MemAttr::empty(),
             )
@@ -82,9 +85,8 @@ pub fn mshv_vsm_enable_aps(cpu_present_mask_pfn: u64) -> Result<i64, Errno> {
     debug_serial_println!("VSM: Enable VTL of APs");
 
     if let Some(cpu_mask) = unsafe {
-        crate::platform_low().copy_from_vtl0_phys::<CpuMask>(x86_64::PhysAddr::new(
-            cpu_present_mask_pfn << PAGE_SHIFT,
-        ))
+        crate::platform_low()
+            .copy_from_vtl0_phys::<CpuMask>(PhysAddr::new(cpu_present_mask_pfn << PAGE_SHIFT))
     } {
         debug_serial_print!("cpu_present_mask: ");
         for (i, elem) in cpu_mask.decode_cpu_mask().iter().enumerate() {
@@ -115,9 +117,8 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
     debug_serial_println!("VSM: Boot APs");
 
     if let Some(cpu_mask) = unsafe {
-        crate::platform_low().copy_from_vtl0_phys::<CpuMask>(x86_64::PhysAddr::new(
-            cpu_online_mask_pfn << PAGE_SHIFT,
-        ))
+        crate::platform_low()
+            .copy_from_vtl0_phys::<CpuMask>(PhysAddr::new(cpu_online_mask_pfn << PAGE_SHIFT))
     } {
         debug_serial_print!("cpu_online_mask: ");
         for (i, elem) in cpu_mask.decode_cpu_mask().iter().enumerate() {
@@ -133,9 +134,8 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
 
     // boot_signal is an array of bytes whose length is the number of possible cores. Copy the entire page for now.
     if let Some(mut boot_signal_page) = unsafe {
-        crate::platform_low().copy_from_vtl0_phys::<[u8; PAGE_SIZE]>(x86_64::PhysAddr::new(
-            boot_signal_pfn << PAGE_SHIFT,
-        ))
+        crate::platform_low()
+            .copy_from_vtl0_phys::<[u8; PAGE_SIZE]>(PhysAddr::new(boot_signal_pfn << PAGE_SHIFT))
     } {
         // TODO: execute `init_vtl_ap` for each online core and update the corresponding boot signal byte.
         // Currently, we use `init_vtl_aps` to initialize all present cores which
@@ -147,7 +147,7 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
 
         if unsafe {
             crate::platform_low().copy_to_vtl0_phys::<[u8; PAGE_SIZE]>(
-                x86_64::PhysAddr::new(boot_signal_pfn << PAGE_SHIFT),
+                PhysAddr::new(boot_signal_pfn << PAGE_SHIFT),
                 &boot_signal_page,
             )
         } {
@@ -289,8 +289,8 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, Errno> {
 
                 protect_physical_memory_range(
                     PhysFrame::range(
-                        PhysFrame::containing_address(x86_64::PhysAddr::new(pa)),
-                        PhysFrame::containing_address(x86_64::PhysAddr::new(epa)),
+                        PhysFrame::containing_address(PhysAddr::new(pa)),
+                        PhysFrame::containing_address(PhysAddr::new(epa)),
                     ),
                     mem_attr,
                 )?;
@@ -661,7 +661,7 @@ impl<'a> IntoIterator for &'a ModuleMemory {
 
 #[derive(Clone, Copy)]
 pub struct ModuleMemoryRange {
-    pub virt_addr: x86_64::VirtAddr,
+    pub virt_addr: VirtAddr,
     pub phys_frame_range: PhysFrameRange<Size4KiB>,
     pub mod_mem_type: ModMemType,
 }
@@ -669,10 +669,10 @@ pub struct ModuleMemoryRange {
 impl ModuleMemoryRange {
     pub fn new(virt_addr: u64, phys_start: u64, phys_end: u64, mod_mem_type: ModMemType) -> Self {
         Self {
-            virt_addr: x86_64::VirtAddr::new(virt_addr),
+            virt_addr: VirtAddr::new(virt_addr),
             phys_frame_range: PhysFrame::range(
-                PhysFrame::containing_address(x86_64::PhysAddr::new(phys_start)),
-                PhysFrame::containing_address(x86_64::PhysAddr::new(phys_end)),
+                PhysFrame::containing_address(PhysAddr::new(phys_start)),
+                PhysFrame::containing_address(PhysAddr::new(phys_end)),
             ),
             mod_mem_type,
         }
@@ -681,12 +681,7 @@ impl ModuleMemoryRange {
 
 impl Default for ModuleMemoryRange {
     fn default() -> Self {
-        Self::new(
-            0,
-            0,
-            u64::try_from(PAGE_SIZE).unwrap_or(0),
-            ModMemType::Unknown,
-        )
+        Self::new(0, 0, 0, ModMemType::Unknown)
     }
 }
 
@@ -766,7 +761,7 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<Box<HekiPage>>
 
     while range < nranges {
         let Some(heki_page) = (unsafe {
-            crate::platform_low().copy_from_vtl0_phys::<HekiPage>(x86_64::PhysAddr::new(next_pa))
+            crate::platform_low().copy_from_vtl0_phys::<HekiPage>(PhysAddr::new(next_pa))
         }) else {
             serial_println!("Failed to get VTL0 memory for heki page");
             return None;
@@ -789,13 +784,10 @@ fn protect_physical_memory_range(
     mem_attr: MemAttr,
 ) -> Result<(), Errno> {
     let pa = phys_frame_range.start.start_address().as_u64();
-    let num_pages = u64::try_from(phys_frame_range.count()).unwrap_or(0);
-    if num_pages == 0 {
-        return Ok(());
+    let num_pages = u64::try_from(phys_frame_range.count()).unwrap();
+    if num_pages > 0 {
+        hv_modify_vtl_protection_mask(pa, num_pages, mem_attr_to_hv_page_prot_flags(mem_attr))
+            .map_err(|_| Errno::EFAULT)?;
     }
-
-    hv_modify_vtl_protection_mask(pa, num_pages, mem_attr_to_hv_page_prot_flags(mem_attr))
-        .map_err(|_| Errno::EFAULT)?;
-
     Ok(())
 }
