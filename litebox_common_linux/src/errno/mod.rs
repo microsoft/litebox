@@ -57,7 +57,7 @@ impl Errno {
         -i32::from(self)
     }
 
-    /// (Private-only) Helper function that makes the associated [`constants`] significantly more
+    /// (Private-only) Helper function that makes the associated constants on [`Errno`] significantly more
     /// readable. Not intended to be used outside this crate, or even this module.
     const fn from_const(v: u8) -> Self {
         Self {

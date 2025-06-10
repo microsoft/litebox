@@ -44,7 +44,7 @@ impl<Platform> RawSyncPrimitivesProvider for Platform where
 }
 
 /// The `Synchronization` provides access to all synchronization-related functionality provided by
-/// LiteBox.
+/// [`crate::LiteBox`].
 ///
 /// A LiteBox `Synchronization` is parametric in the platform it runs on.
 pub struct Synchronization<Platform: RawSyncPrimitivesProvider> {
