@@ -772,6 +772,8 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pipefd: Platform::RawMutPointer<u32>,
         flags: litebox::fs::OFlags,
     },
+    /// Manipulate thread-local storage information.
+    /// Returns `ENOSYS` on 64-bit.
     SetThreadArea {
         user_desc: Platform::RawMutPointer<UserDesc>,
     },
