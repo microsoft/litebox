@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
-capstone = { version = "0.13.0", default-features = false }
+capstone = "0.13.0"
 clap = { version = "4.5.32", features = ["derive"] }
 memmap2 = "0.9"
 object = { version = "0.36.7", default-features = false, features = ["elf", "build", "std"] }

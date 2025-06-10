@@ -11,6 +11,7 @@
 //!
 //! This crate currently only supports x86-64 (i.e., amd64) ELFs.
 
+use capstone::arch::x86::X86InsnGroup::{X86_GRP_CALL, X86_GRP_JUMP, X86_GRP_RET};
 use thiserror::Error;
 
 /// Possible errors during hooking of `syscall` instructions
@@ -254,6 +255,7 @@ enum Arch {
 }
 
 /// (private) Hook all syscalls in `section`, possibly extending `trampoline_data` to do so.
+#[allow(clippy::too_many_lines)]
 fn hook_syscalls_in_section(
     arch: Arch,
     section_base_addr: u64,
@@ -272,6 +274,7 @@ fn hook_syscalls_in_section(
             Arch::X86_64 => capstone::arch::x86::ArchMode::Mode64,
         })
         .syntax(capstone::arch::x86::ArchSyntax::Intel)
+        .detail(true)
         .build()?;
     let instructions = cs.disasm_all(section_data, section_base_addr)?;
 
@@ -302,11 +305,42 @@ fn hook_syscalls_in_section(
             .address()
             .checked_add(inst.bytes().len().try_into().unwrap())
             .unwrap();
-        let replace_start = (0..=i)
-            .rev()
-            .map(|idx| instructions[idx].address())
-            .find(|addr| replace_end - addr >= 5)
-            .ok_or_else(|| Error::InsufficientBytesBefore(inst.address()))?;
+
+        let mut replace_start = None;
+        for inst_id in (0..=i).rev() {
+            let prev_inst = &instructions[inst_id];
+            let prev_inst_detail = cs.insn_detail(prev_inst).unwrap();
+            // Check if the instruction is an instruction-relative control transfer
+            let is_control_transfer = prev_inst_detail.groups().iter().any(|&grp| {
+                grp.0 == u8::try_from(X86_GRP_JUMP).unwrap()
+                    || grp.0 == u8::try_from(X86_GRP_CALL).unwrap()
+                    || grp.0 == u8::try_from(X86_GRP_RET).unwrap()
+            });
+            if is_control_transfer {
+                // If it's a control transfer, we don't want to cross it
+                break;
+            }
+            if replace_end - prev_inst.address() >= 5 {
+                replace_start = Some(prev_inst.address());
+                break;
+            }
+        }
+
+        if replace_start.is_none() {
+            hook_syscall_and_after(
+                arch,
+                section_base_addr,
+                section_data,
+                trampoline_base_addr,
+                trampoline_data,
+                &cs,
+                &instructions,
+                i,
+            )?;
+            continue;
+        }
+
+        let replace_start = replace_start.unwrap();
         let replace_len = usize::try_from(replace_end - replace_start).unwrap();
 
         let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
@@ -385,4 +419,99 @@ fn get_symbols(builder: &object::build::elf::Builder<'_>) -> Option<u64> {
         }
     }
     dl_sysinfo_int80
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hook_syscall_and_after(
+    arch: Arch,
+    section_base_addr: u64,
+    section_data: &mut [u8],
+    trampoline_base_addr: u64,
+    trampoline_data: &mut Vec<u8>,
+    cs: &capstone::Capstone,
+    instructions: &[capstone::Insn],
+    inst_index: usize,
+) -> Result<()> {
+    let syscall_inst = &instructions[inst_index];
+
+    let replace_start = syscall_inst.address();
+
+    let mut replace_end = None;
+
+    for next_inst in instructions.iter().skip(inst_index) {
+        let next_inst_detail = cs.insn_detail(next_inst).unwrap();
+        // Check if the instruction is an instruction-relative control transfer
+        let is_control_transfer = next_inst_detail.groups().iter().any(|&grp| {
+            grp.0 == u8::try_from(X86_GRP_JUMP).unwrap()
+                || grp.0 == u8::try_from(X86_GRP_CALL).unwrap()
+                || grp.0 == u8::try_from(X86_GRP_RET).unwrap()
+        });
+        if is_control_transfer {
+            // If it's a control transfer, we don't want to cross it
+            break;
+        }
+        let next_end = next_inst
+            .address()
+            .checked_add(next_inst.bytes().len().try_into().unwrap())
+            .unwrap();
+
+        if next_end - syscall_inst.address() >= 5 {
+            replace_end = Some(next_end);
+            break;
+        }
+    }
+
+    let replace_end =
+        replace_end.ok_or_else(|| Error::InsufficientBytesBefore(syscall_inst.address()))?;
+
+    let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
+
+    // Add call [rip + offset_to_shared_target]
+    if arch == Arch::X86_64 {
+        trampoline_data.extend_from_slice(&[0xFF, 0x15]);
+        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() + 4);
+        trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+    } else {
+        // For 32-bit, use a different approach to simulate `call [rip + disp32]`
+        trampoline_data.push(0x50); // PUSH EAX
+        trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
+        trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
+        trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
+        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
+        trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+        // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
+        // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
+    }
+
+    // Copy the original instructions to the trampoline
+    let syscall_inst_end = syscall_inst
+        .address()
+        .checked_add(syscall_inst.bytes().len().try_into().unwrap())
+        .unwrap();
+    trampoline_data.extend_from_slice(
+        &section_data[usize::try_from(syscall_inst_end - section_base_addr).unwrap()
+            ..usize::try_from(replace_end - section_base_addr).unwrap()],
+    );
+
+    // Add jmp back to original after syscall
+    let jmp_back_offset = i64::try_from(replace_end).unwrap()
+        - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 5).unwrap();
+    trampoline_data.push(0xE9);
+    trampoline_data.extend_from_slice(&(i32::try_from(jmp_back_offset).unwrap().to_le_bytes()));
+
+    // Replace original instructions with jump to trampoline
+    let replace_offset = usize::try_from(replace_start - section_base_addr).unwrap();
+    section_data[replace_offset] = 0xE9; // JMP rel32
+    let jump_offset =
+        i64::try_from(target_addr).unwrap() - i64::try_from(replace_start + 5).unwrap();
+    section_data[replace_offset + 1..replace_offset + 5]
+        .copy_from_slice(&(i32::try_from(jump_offset).unwrap().to_le_bytes()));
+
+    // Fill remaining bytes with NOP
+    let replace_len = usize::try_from(replace_end - replace_start).unwrap();
+    for idx in 5..replace_len {
+        section_data[replace_offset + idx] = 0x90;
+    }
+
+    Ok(())
 }
