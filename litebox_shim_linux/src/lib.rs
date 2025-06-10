@@ -703,7 +703,7 @@ unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) 
     let dispatcher = match sysno {
         ::syscalls::Sysno::write => SyscallRequest::Write {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
-            buf: unsafe { core::mem::transmute::<usize, ConstPtr<u8>>(syscall_args[1]) },
+            buf: unsafe { transmute_ptr(syscall_args[1] as *const u8) },
             count: syscall_args[2],
         },
         ::syscalls::Sysno::rt_sigprocmask => {
@@ -757,9 +757,7 @@ unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) 
         }
         ::syscalls::Sysno::set_thread_area => SyscallRequest::SetThreadArea {
             user_desc: unsafe {
-                core::mem::transmute::<usize, MutPtr<litebox_common_linux::UserDesc>>(
-                    syscall_args[0],
-                )
+                transmute_ptr_mut(syscall_args[0] as *mut litebox_common_linux::UserDesc)
             },
         },
         _ => todo!("syscall {sysno} not implemented"),
