@@ -59,6 +59,12 @@ case "$COMMAND" in
             exit 1
         fi
         ;;
+    doc)
+        if ! cargo doc --message-format json --verbose "$@" | to_gha; then
+            echo '::error title=Documentation issue::"cargo doc" failed'
+            exit 1
+        fi
+        ;;
     *)
         echo "Unsupported command: $COMMAND"
         exit 1

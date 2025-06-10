@@ -38,6 +38,8 @@ jobs:
           # We need to run `cargo test --doc` separately because doc tests
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
+      - name: Build documentation (fail on warnings)
+        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items -- -D warnings
 
   build_and_test_32bit:
     name: Build and Test (32-bit)
@@ -110,6 +112,8 @@ jobs:
           # https://github.com/nextest-rs/nextest/issues/16
           #
           # sanghle: I'll to change the directory structure of LVBS later to simplify CI
+      - name: Build documentation (fail on warnings)
+        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items -- -D warnings
 
   confirm_no_std:
     name: Confirm no_std
