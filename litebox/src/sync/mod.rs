@@ -56,7 +56,7 @@ pub struct Synchronization<Platform: RawSyncPrimitivesProvider> {
 
 impl<Platform: RawSyncPrimitivesProvider> Synchronization<Platform> {
     /// Construct a new `Synchronization` instance. This is expected to be invoked only by
-    /// [`LiteBox`]'s creation method, and should not be invoked anywhere else in the codebase.
+    /// [`crate::LiteBox`]'s creation method, and should not be invoked anywhere else in the codebase.
     pub(crate) fn new_from_platform(platform: &'static Platform) -> Self {
         Self {
             platform,

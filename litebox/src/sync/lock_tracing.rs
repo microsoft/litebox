@@ -233,7 +233,7 @@ macro_rules! debug_log_println {
 impl<Platform: RawSyncPrimitivesProvider> LockTracker<Platform> {
     /// Mark the `lock_type` (at `lock_addr`) as being attempted to be locked. It is the caller's
     /// job to make sure `#[track_caller]` is inserted, and that things are kept in sync with the
-    /// actual [`mark_lock`] invocations.
+    /// actual [`LockTracker::mark_lock`] invocations.
     #[must_use]
     #[track_caller]
     pub(crate) fn begin_lock_attempt<T>(
