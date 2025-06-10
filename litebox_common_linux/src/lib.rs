@@ -582,6 +582,15 @@ pub unsafe fn wrfsbase(fs_base: usize) {
     }
 }
 
+#[repr(C, packed)]
+#[derive(Debug, Clone)]
+pub struct UserDesc {
+    pub entry_number: i32,
+    pub base_addr: i32,
+    pub limit: i32,
+    pub flags: i32,
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
@@ -763,6 +772,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pipefd: Platform::RawMutPointer<u32>,
         flags: litebox::fs::OFlags,
     },
+    /// Manipulate thread-local storage information.
+    /// Returns `ENOSYS` on 64-bit.
+    SetThreadArea {
+        user_desc: Platform::RawMutPointer<UserDesc>,
+    },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(isize),
 }
@@ -800,6 +814,10 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
     #[cfg(target_arch = "x86_64")]
     GetFsBase {
         addr: Platform::RawMutPointer<usize>,
+    },
+    #[cfg(target_arch = "x86")]
+    SetThreadArea {
+        user_desc: Platform::RawMutPointer<UserDesc>,
     },
 }
 

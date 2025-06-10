@@ -37,6 +37,28 @@ pub(crate) fn sys_arch_prctl(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn set_thread_area(
+    user_desc: crate::MutPtr<litebox_common_linux::UserDesc>,
+) -> Result<(), Errno> {
+    Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
+}
+
+#[cfg(target_arch = "x86")]
+pub(crate) fn set_thread_area(
+    user_desc: crate::MutPtr<litebox_common_linux::UserDesc>,
+) -> Result<(), Errno> {
+    use litebox::platform::{PunchthroughProvider as _, PunchthroughToken as _};
+    let punchthrough = litebox_common_linux::PunchthroughSyscall::SetThreadArea { user_desc };
+    let token = litebox_platform_multiplex::platform()
+        .get_punchthrough_token_for(punchthrough)
+        .expect("Failed to get punchthrough token for SET_THREAD_AREA");
+    token.execute().map(|_| ()).map_err(|e| match e {
+        litebox::platform::PunchthroughError::Failure(errno) => errno,
+        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_arch = "x86_64")]
