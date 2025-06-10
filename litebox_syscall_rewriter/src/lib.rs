@@ -138,9 +138,15 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
         .segments
         .get_mut(executable_segment)
         .append_section(builder.sections.get_mut(trampoline_section));
-    let trampoline_base_addr = builder.sections.get(trampoline_section).sh_addr;
+
+    let trampoline_base_addr = find_addr_for_trampoline_code(&builder);
 
     let mut trampoline_data = vec![];
+    // The magic prefix for the trampoline section
+    // This constant should be consistent with the definitions in the shim
+    // (litebox_shim_linux/src/loader/mod.rs)
+    trampoline_data.extend_from_slice("LITEBOX0".as_bytes());
+    // The placeholder for the address of the new syscall entry point
     trampoline_data.extend_from_slice(&trampoline.unwrap_or(0).to_le_bytes());
 
     let mut syscall_insns_found = false;
@@ -168,10 +174,15 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
         return Err(Error::NoSyscallInstructionsFound);
     }
 
-    builder.sections.get_mut(trampoline_section).sh_size =
-        trampoline_data.len().try_into().unwrap();
+    let mut trampoline_vec = Vec::new();
+    // This constant should be consistent with the definitions in the shim
+    // (litebox_shim_linux/src/loader/mod.rs)
+    trampoline_vec.extend_from_slice("LITE BOX".as_bytes());
+    trampoline_vec.extend_from_slice(&trampoline_base_addr.to_le_bytes());
+    trampoline_vec.extend_from_slice(&(trampoline_data.len() as u64).to_le_bytes());
+    builder.sections.get_mut(trampoline_section).sh_size = trampoline_vec.len() as u64;
     builder.sections.get_mut(trampoline_section).data =
-        object::build::elf::SectionData::Data(trampoline_data.into());
+        object::build::elf::SectionData::Data(trampoline_vec.into());
     builder
         .segments
         .get_mut(executable_segment)
@@ -181,6 +192,10 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
     builder
         .write(&mut out)
         .map_err(|e| Error::GenerateObjFileError(e.to_string()))?;
+    // ensure the start address of the trampoline code is page-aligned
+    let remain = out.len() % 0x1000;
+    out.extend_from_slice(&vec![0; if remain == 0 { 0 } else { 0x1000 - remain }]);
+    out.extend_from_slice(&trampoline_data);
     Ok(out)
 }
 
@@ -290,7 +305,7 @@ fn hook_syscalls_in_section(
         // Add call [rip + offset_to_shared_target]
         if arch == Arch::X86_64 {
             trampoline_data.extend_from_slice(&[0xFF, 0x15]);
-            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() + 4);
+            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 4);
             trampoline_data.extend_from_slice(&disp32.to_le_bytes());
         } else {
             // For 32-bit, use a different approach to simulate `call [rip + disp32]`
@@ -298,7 +313,7 @@ fn hook_syscalls_in_section(
             trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
             trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
             trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
+            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 11);
             trampoline_data.extend_from_slice(&disp32.to_le_bytes());
             // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
             // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
@@ -326,4 +341,18 @@ fn hook_syscalls_in_section(
     }
 
     Ok(())
+}
+
+fn find_addr_for_trampoline_code(builder: &object::build::elf::Builder<'_>) -> u64 {
+    // Find the highest virtual address among all sections in executable segments
+    let max_virtual_addr = builder
+        .segments
+        .iter()
+        .filter(|seg| seg.p_type == object::elf::PT_LOAD)
+        .map(|seg| seg.p_vaddr + seg.p_memsz)
+        .max()
+        .unwrap();
+
+    // Round up to the nearest page (assume 0x1000 page size)
+    max_virtual_addr.next_multiple_of(0x1000)
 }

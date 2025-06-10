@@ -6,7 +6,7 @@ use alloc::{collections::btree_map::BTreeMap, ffi::CString, string::ToString, ve
 use elf_loader::{
     Elf, Loader,
     arch::ElfPhdr,
-    mmap::{MapFlags, ProtFlags},
+    mmap::{MapFlags, Mmap, ProtFlags},
     object::ElfObject,
 };
 use litebox::{
@@ -193,10 +193,24 @@ type Shdr = elf::section::Elf64_Shdr;
 #[cfg(target_arch = "x86")]
 type Shdr = elf::section::Elf32_Shdr;
 
-/// Get the syscall callback placeholder address from the ELF file if it is modified by our syscall
-/// rewriter. The placeholder initially has a magic number that is going to be replaced by the actual
-/// syscall callback.
-fn get_syscall_callback_placeholder(object: &mut ElfFile) -> Option<NonNull<usize>> {
+#[repr(C, packed)]
+struct TrampolineSection {
+    magic_number: u64,
+    trampoline_addr: u64,
+    trampoline_size: u64,
+}
+
+struct TrampolineHdr {
+    /// The virtual memory of the trampoline code.
+    vaddr: usize,
+    /// The file offset of the trampoline code in the ELF file.
+    file_offset: usize,
+    /// Size of the trampoline code in the ELF file.
+    size: usize,
+}
+
+/// Get the trampoline header from the ELF file.
+fn get_trampoline_hdr(object: &mut ElfFile) -> Option<TrampolineHdr> {
     let mut buf: [u8; size_of::<Ehdr>()] = [0; size_of::<Ehdr>()];
     object.read(&mut buf, 0).unwrap();
     let elfhdr: &Ehdr = unsafe { &*(buf.as_ptr().cast()) };
@@ -218,19 +232,31 @@ fn get_syscall_callback_placeholder(object: &mut ElfFile) -> Option<NonNull<usiz
         return None;
     }
 
-    let mut placeholder: [u8; 8] = [0; 8];
+    if trampoline_shdr.sh_size < size_of::<TrampolineSection>() as _ {
+        return None;
+    }
+    let mut buf: [u8; size_of::<TrampolineSection>()] = [0; size_of::<TrampolineSection>()];
     object
         .read(
-            &mut placeholder,
+            &mut buf,
             usize::try_from(trampoline_shdr.sh_offset).unwrap(),
         )
         .ok()?;
-    let magic_number = u64::from_ne_bytes(placeholder);
+    let trampoline: TrampolineSection = unsafe { core::mem::transmute(buf) };
     // TODO: check section name instead of magic number
-    if magic_number != super::REWRITER_MAGIC_NUMBER {
+    if trampoline.magic_number != super::REWRITER_MAGIC_NUMBER {
         return None;
     }
-    NonNull::new(trampoline_shdr.sh_addr as *mut usize)
+    // The trampoline code is placed at the end of the file.
+    let file_size = crate::syscalls::file::sys_fstat(object.as_fd().unwrap())
+        .expect("failed to get file stat")
+        .st_size;
+    Some(TrampolineHdr {
+        vaddr: usize::try_from(trampoline.trampoline_addr).ok()?,
+        file_offset: usize::try_from(file_size).unwrap()
+            - usize::try_from(trampoline.trampoline_size).unwrap(),
+        size: usize::try_from(trampoline.trampoline_size).unwrap(),
+    })
 }
 
 /// Loader for ELF files
@@ -267,24 +293,51 @@ impl ElfLoader {
         let elf = {
             let mut loader = Loader::<ElfLoaderMmap>::new();
             let mut object = ElfFile::new(path).map_err(ElfLoaderError::OpenError)?;
+            let file_fd = object.as_fd().unwrap();
             // Check if the file is modified by our syscall rewriter. If so, we need to update
             // the syscall callback pointer.
-            let placeholder = get_syscall_callback_placeholder(&mut object);
+            let trampoline = get_trampoline_hdr(&mut object);
             let elf = loader
                 .easy_load(object)
                 .map_err(ElfLoaderError::LoaderError)?;
-            if let Some(placeholder) = placeholder {
-                // mprotect the memory to make it writable
-                let pm = litebox_page_manager();
+
+            if let Some(trampoline) = trampoline {
+                assert!(
+                    trampoline.vaddr % PAGE_SIZE == 0,
+                    "trampoline address must be page-aligned"
+                );
+                let start_addr = elf.base() + trampoline.vaddr;
+                let end_addr = (start_addr + trampoline.size).next_multiple_of(0x1000);
+                let mut need_copy = false;
+                unsafe {
+                    ElfLoaderMmap::mmap(
+                        Some(start_addr),
+                        end_addr - start_addr,
+                        elf_loader::mmap::ProtFlags::PROT_READ
+                            | elf_loader::mmap::ProtFlags::PROT_WRITE,
+                        elf_loader::mmap::MapFlags::MAP_PRIVATE
+                            | elf_loader::mmap::MapFlags::MAP_FIXED,
+                        trampoline.file_offset,
+                        Some(file_fd),
+                        &mut need_copy,
+                    )
+                }
+                .expect("failed to mmap trampoline section");
+                // The first 8 bytes of the data is the magic number,
+                let version_number = start_addr as *const u64;
+                assert_eq!(
+                    unsafe { version_number.read() },
+                    super::REWRITER_VERSION_NUMBER,
+                    "trampoline section version number mismatch"
+                );
+                let placeholder = (start_addr + 8) as *mut usize;
+                unsafe { placeholder.write(crate::syscall_callback as usize) };
                 // `mprotect` requires the address to be page-aligned
-                let start_addr = placeholder.as_ptr() as usize & !(PAGE_SIZE - 1);
                 let ptr = unsafe {
                     core::mem::transmute::<*mut u8, crate::MutPtr<u8>>(start_addr as *mut u8)
                 };
-                unsafe { pm.make_pages_writable(ptr, 0x1000) }
-                    .expect("failed to make pages writable");
-                unsafe { placeholder.write(crate::syscall_callback as usize) };
-                unsafe { pm.make_pages_executable(ptr, 0x1000) }
+                let pm = litebox_page_manager();
+                unsafe { pm.make_pages_executable(ptr, end_addr - start_addr) }
                     .expect("failed to make pages executable");
             }
             elf
