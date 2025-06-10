@@ -197,7 +197,7 @@ type Shdr = elf::section::Elf32_Shdr;
 struct TrampolineSection {
     magic_number: u64,
     trampoline_addr: u64,
-    trampoline_size: usize,
+    trampoline_size: u64,
 }
 
 struct TrampolineHdr {
@@ -253,8 +253,9 @@ fn get_trampoline_hdr(object: &mut ElfFile) -> Option<TrampolineHdr> {
         .st_size;
     Some(TrampolineHdr {
         vaddr: usize::try_from(trampoline.trampoline_addr).ok()?,
-        file_offset: usize::try_from(file_size).unwrap() - trampoline.trampoline_size,
-        size: trampoline.trampoline_size,
+        file_offset: usize::try_from(file_size).unwrap()
+            - usize::try_from(trampoline.trampoline_size).unwrap(),
+        size: usize::try_from(trampoline.trampoline_size).unwrap(),
     })
 }
 

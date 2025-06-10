@@ -143,6 +143,8 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
 
     let mut trampoline_data = vec![];
     // The magic prefix for the trampoline section
+    // This constant should be consistent with the definitions in the shim
+    // (litebox_shim_linux/src/loader/mod.rs)
     trampoline_data.extend_from_slice("LITEBOX0".as_bytes());
     // The placeholder for the address of the new syscall entry point
     trampoline_data.extend_from_slice(&trampoline.unwrap_or(0).to_le_bytes());
@@ -173,9 +175,11 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
     }
 
     let mut trampoline_vec = Vec::new();
+    // This constant should be consistent with the definitions in the shim
+    // (litebox_shim_linux/src/loader/mod.rs)
     trampoline_vec.extend_from_slice("LITE BOX".as_bytes());
     trampoline_vec.extend_from_slice(&trampoline_base_addr.to_le_bytes());
-    trampoline_vec.extend_from_slice(&trampoline_data.len().to_le_bytes());
+    trampoline_vec.extend_from_slice(&(trampoline_data.len() as u64).to_le_bytes());
     builder.sections.get_mut(trampoline_section).sh_size = trampoline_vec.len() as u64;
     builder.sections.get_mut(trampoline_section).data =
         object::build::elf::SectionData::Data(trampoline_vec.into());
