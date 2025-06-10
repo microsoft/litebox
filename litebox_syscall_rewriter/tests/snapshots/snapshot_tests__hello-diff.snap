@@ -1,7 +1,6 @@
 ---
 source: litebox_syscall_rewriter/tests/snapshot_tests.rs
 expression: diff
-snapshot_kind: text
 ---
 --- original
 +++ rewritten
@@ -1013,111 +1012,112 @@ snapshot_kind: text
    45c737:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    45c73d:	77 31                	ja     45c770 <__libc_openat64+0xf0>
    45c73f:	44 89 c7             	mov    %r8d,%edi
-@@ -94093,9 +94170,8 @@
- 000000000045c790 <__libc_read>:
-   45c790:	f3 0f 1e fa          	endbr64
+@@ -94095,8 +94172,10 @@
    45c794:	80 3d fd e2 04 00 00 	cmpb   $0x0,0x4e2fd(%rip)        # 4aaa98 <__libc_single_threaded>
--  45c79b:	74 13                	je     45c7b0 <__libc_read+0x20>
--  45c79d:	31 c0                	xor    %eax,%eax
+   45c79b:	74 13                	je     45c7b0 <__libc_read+0x20>
+   45c79d:	31 c0                	xor    %eax,%eax
 -  45c79f:	0f 05                	syscall
-+  45c79b:	e9 cd 5d 05 00       	jmp    4b256d <_end+0x1345>
-+  45c7a0:	90                   	nop
-   45c7a1:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
+-  45c7a1:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
++  45c79f:	e9 c9 5d 05 00       	jmp    4b256d <_end+0x1345>
++  45c7a4:	90                   	nop
++  45c7a5:	90                   	nop
++  45c7a6:	90                   	nop
    45c7a7:	77 4f                	ja     45c7f8 <__libc_read+0x68>
    45c7a9:	c3                   	ret
-@@ -94110,9 +94186,9 @@
+   45c7aa:	66 0f 1f 44 00 00    	nopw   0x0(%rax,%rax,1)
+@@ -94110,9 +94189,9 @@
    45c7c8:	48 8b 55 e8          	mov    -0x18(%rbp),%rdx
    45c7cc:	48 8b 75 f0          	mov    -0x10(%rbp),%rsi
    45c7d0:	41 89 c0             	mov    %eax,%r8d
 -  45c7d3:	8b 7d f8             	mov    -0x8(%rbp),%edi
 -  45c7d6:	31 c0                	xor    %eax,%eax
 -  45c7d8:	0f 05                	syscall
-+  45c7d3:	e9 a4 5d 05 00       	jmp    4b257c <_end+0x1354>
++  45c7d3:	e9 a6 5d 05 00       	jmp    4b257e <_end+0x1356>
 +  45c7d8:	90                   	nop
 +  45c7d9:	90                   	nop
    45c7da:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    45c7e0:	77 2e                	ja     45c810 <__libc_read+0x80>
    45c7e2:	44 89 c7             	mov    %r8d,%edi
-@@ -94151,8 +94227,9 @@
+@@ -94151,8 +94230,9 @@
    45c850:	f3 0f 1e fa          	endbr64
    45c854:	80 3d 3d e2 04 00 00 	cmpb   $0x0,0x4e23d(%rip)        # 4aaa98 <__libc_single_threaded>
    45c85b:	74 13                	je     45c870 <__libc_write+0x20>
 -  45c85d:	b8 01 00 00 00       	mov    $0x1,%eax
 -  45c862:	0f 05                	syscall
-+  45c85d:	e9 2a 5d 05 00       	jmp    4b258c <_end+0x1364>
++  45c85d:	e9 2c 5d 05 00       	jmp    4b258e <_end+0x1366>
 +  45c862:	90                   	nop
 +  45c863:	90                   	nop
    45c864:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    45c86a:	77 54                	ja     45c8c0 <__libc_write+0x70>
    45c86c:	c3                   	ret
-@@ -94168,8 +94245,9 @@
+@@ -94168,8 +94248,9 @@
    45c88c:	48 8b 75 f0          	mov    -0x10(%rbp),%rsi
    45c890:	41 89 c0             	mov    %eax,%r8d
    45c893:	8b 7d f8             	mov    -0x8(%rbp),%edi
 -  45c896:	b8 01 00 00 00       	mov    $0x1,%eax
 -  45c89b:	0f 05                	syscall
-+  45c896:	e9 01 5d 05 00       	jmp    4b259c <_end+0x1374>
++  45c896:	e9 03 5d 05 00       	jmp    4b259e <_end+0x1376>
 +  45c89b:	90                   	nop
 +  45c89c:	90                   	nop
    45c89d:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    45c8a3:	77 33                	ja     45c8d8 <__libc_write+0x88>
    45c8a5:	44 89 c7             	mov    %r8d,%edi
-@@ -94210,8 +94288,9 @@
+@@ -94210,8 +94291,9 @@
    45c919:	f7 d0                	not    %eax
    45c91b:	a9 00 00 41 00       	test   $0x410000,%eax
    45c920:	74 26                	je     45c948 <__openat64_nocancel+0x58>
 -  45c922:	b8 01 01 00 00       	mov    $0x101,%eax
 -  45c927:	0f 05                	syscall
-+  45c922:	e9 85 5c 05 00       	jmp    4b25ac <_end+0x1384>
++  45c922:	e9 87 5c 05 00       	jmp    4b25ae <_end+0x1386>
 +  45c927:	90                   	nop
 +  45c928:	90                   	nop
    45c929:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    45c92f:	77 37                	ja     45c968 <__openat64_nocancel+0x78>
    45c931:	48 8b 55 c8          	mov    -0x38(%rbp),%rdx
-@@ -94239,8 +94318,9 @@
+@@ -94239,8 +94321,9 @@
  000000000045c980 <__pread64_nocancel>:
    45c980:	f3 0f 1e fa          	endbr64
    45c984:	49 89 ca             	mov    %rcx,%r10
 -  45c987:	b8 11 00 00 00       	mov    $0x11,%eax
 -  45c98c:	0f 05                	syscall
-+  45c987:	e9 30 5c 05 00       	jmp    4b25bc <_end+0x1394>
++  45c987:	e9 32 5c 05 00       	jmp    4b25be <_end+0x1396>
 +  45c98c:	90                   	nop
 +  45c98d:	90                   	nop
    45c98e:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    45c994:	77 0a                	ja     45c9a0 <__pread64_nocancel+0x20>
    45c996:	c3                   	ret
-@@ -94257,8 +94337,9 @@
+@@ -94257,8 +94340,9 @@
  
  000000000045c9c0 <__write_nocancel>:
    45c9c0:	f3 0f 1e fa          	endbr64
 -  45c9c4:	b8 01 00 00 00       	mov    $0x1,%eax
 -  45c9c9:	0f 05                	syscall
-+  45c9c4:	e9 03 5c 05 00       	jmp    4b25cc <_end+0x13a4>
++  45c9c4:	e9 05 5c 05 00       	jmp    4b25ce <_end+0x13a6>
 +  45c9c9:	90                   	nop
 +  45c9ca:	90                   	nop
    45c9cb:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    45c9d1:	77 05                	ja     45c9d8 <__write_nocancel+0x18>
    45c9d3:	c3                   	ret
-@@ -94282,8 +94363,9 @@
+@@ -94282,8 +94366,9 @@
    45ca0d:	48 89 45 f8          	mov    %rax,-0x8(%rbp)
    45ca11:	31 c0                	xor    %eax,%eax
    45ca13:	48 8d 55 d0          	lea    -0x30(%rbp),%rdx
 -  45ca17:	b8 10 00 00 00       	mov    $0x10,%eax
 -  45ca1c:	0f 05                	syscall
-+  45ca17:	e9 c0 5b 05 00       	jmp    4b25dc <_end+0x13b4>
++  45ca17:	e9 c2 5b 05 00       	jmp    4b25de <_end+0x13b6>
 +  45ca1c:	90                   	nop
 +  45ca1d:	90                   	nop
    45ca1e:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    45ca24:	77 6a                	ja     45ca90 <__tcgetattr+0xa0>
    45ca26:	89 c2                	mov    %eax,%edx
-@@ -94329,9 +94411,11 @@
+@@ -94329,9 +94414,11 @@
    45cab4:	49 89 f2             	mov    %rsi,%r10
    45cab7:	31 d2                	xor    %edx,%edx
    45cab9:	89 fe                	mov    %edi,%esi
 -  45cabb:	b8 2e 01 00 00       	mov    $0x12e,%eax
 -  45cac0:	31 ff                	xor    %edi,%edi
 -  45cac2:	0f 05                	syscall
-+  45cabb:	e9 2c 5b 05 00       	jmp    4b25ec <_end+0x13c4>
++  45cabb:	e9 2e 5b 05 00       	jmp    4b25ee <_end+0x13c6>
 +  45cac0:	90                   	nop
 +  45cac1:	90                   	nop
 +  45cac2:	90                   	nop
@@ -1125,45 +1125,45 @@ snapshot_kind: text
    45cac4:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    45caca:	77 04                	ja     45cad0 <__GI___getrlimit+0x20>
    45cacc:	c3                   	ret
-@@ -97928,8 +98012,9 @@
+@@ -97928,8 +98015,9 @@
    45ff97:	64 48 8b 04 25 10 00 	mov    %fs:0x10,%rax
    45ff9e:	00 00
    45ffa0:	48 8d 78 1c          	lea    0x1c(%rax),%rdi
 -  45ffa4:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  45ffa9:	0f 05                	syscall
-+  45ffa4:	e9 55 26 05 00       	jmp    4b25fe <_end+0x13d6>
++  45ffa4:	e9 57 26 05 00       	jmp    4b2600 <_end+0x13d8>
 +  45ffa9:	90                   	nop
 +  45ffaa:	90                   	nop
    45ffab:	48 8d 3d 6e ab 04 00 	lea    0x4ab6e(%rip),%rdi        # 4aab20 <_dl_load_lock>
    45ffb2:	44 89 8d 44 ff ff ff 	mov    %r9d,-0xbc(%rbp)
    45ffb9:	4c 89 85 48 ff ff ff 	mov    %r8,-0xb8(%rbp)
-@@ -100864,8 +100949,7 @@
+@@ -100864,8 +100952,7 @@
    463062:	45 31 d2             	xor    %r10d,%r10d
    463065:	ba 02 00 00 00       	mov    $0x2,%edx
    46306a:	be 80 00 00 00       	mov    $0x80,%esi
 -  46306f:	44 89 c8             	mov    %r9d,%eax
 -  463072:	0f 05                	syscall
-+  46306f:	e9 9a f5 04 00       	jmp    4b260e <_end+0x13e6>
++  46306f:	e9 9c f5 04 00       	jmp    4b2610 <_end+0x13e8>
    463074:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    46307a:	76 dc                	jbe    463058 <__thread_gscope_wait+0x88>
    46307c:	83 f8 f5             	cmp    $0xfffffff5,%eax
-@@ -100904,8 +100988,7 @@
+@@ -100904,8 +100991,7 @@
    463102:	45 31 d2             	xor    %r10d,%r10d
    463105:	ba 02 00 00 00       	mov    $0x2,%edx
    46310a:	be 80 00 00 00       	mov    $0x80,%esi
 -  46310f:	44 89 c8             	mov    %r9d,%eax
 -  463112:	0f 05                	syscall
-+  46310f:	e9 08 f5 04 00       	jmp    4b261c <_end+0x13f4>
++  46310f:	e9 0a f5 04 00       	jmp    4b261e <_end+0x13f6>
    463114:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    46311a:	76 dc                	jbe    4630f8 <__thread_gscope_wait+0x128>
    46311c:	83 f8 f5             	cmp    $0xfffffff5,%eax
-@@ -104731,8 +104814,11 @@
+@@ -104731,8 +104817,11 @@
    4669cc:	0f 1f 40 00          	nopl   0x0(%rax)
  
  00000000004669d0 <__restore_rt>:
 -  4669d0:	48 c7 c0 0f 00 00 00 	mov    $0xf,%rax
 -  4669d7:	0f 05                	syscall
-+  4669d0:	e9 55 bc 04 00       	jmp    4b262a <_end+0x1402>
++  4669d0:	e9 57 bc 04 00       	jmp    4b262c <_end+0x1404>
 +  4669d5:	90                   	nop
 +  4669d6:	90                   	nop
 +  4669d7:	90                   	nop
@@ -1171,123 +1171,123 @@ snapshot_kind: text
    4669d9:	0f 1f 80 00 00 00 00 	nopl   0x0(%rax)
  
  00000000004669e0 <__libc_sigaction>:
-@@ -104776,8 +104862,9 @@
+@@ -104776,8 +104865,9 @@
    466a9f:	0f 11 b5 38 ff ff ff 	movups %xmm6,-0xc8(%rbp)
    466aa6:	0f 11 bd 48 ff ff ff 	movups %xmm7,-0xb8(%rbp)
    466aad:	41 ba 08 00 00 00    	mov    $0x8,%r10d
 -  466ab3:	b8 0d 00 00 00       	mov    $0xd,%eax
 -  466ab8:	0f 05                	syscall
-+  466ab3:	e9 84 bb 04 00       	jmp    4b263c <_end+0x1414>
++  466ab3:	e9 86 bb 04 00       	jmp    4b263e <_end+0x1416>
 +  466ab8:	90                   	nop
 +  466ab9:	90                   	nop
    466aba:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    466ac0:	0f 87 ba 00 00 00    	ja     466b80 <__libc_sigaction+0x1a0>
    466ac6:	89 c2                	mov    %eax,%edx
-@@ -111544,8 +111631,7 @@
+@@ -111544,8 +111634,7 @@
    46cb11:	45 31 d2             	xor    %r10d,%r10d
    46cb14:	89 ca                	mov    %ecx,%edx
    46cb16:	be 80 00 00 00       	mov    $0x80,%esi
 -  46cb1b:	44 89 c0             	mov    %r8d,%eax
 -  46cb1e:	0f 05                	syscall
-+  46cb1b:	e9 2c 5b 04 00       	jmp    4b264c <_end+0x1424>
++  46cb1b:	e9 2e 5b 04 00       	jmp    4b264e <_end+0x1426>
    46cb20:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    46cb26:	77 0d                	ja     46cb35 <__pthread_disable_asynccancel+0x65>
    46cb28:	8b 0f                	mov    (%rdi),%ecx
-@@ -111701,8 +111787,7 @@
+@@ -111701,8 +111790,7 @@
    46ccd5:	81 f6 00 01 00 00    	xor    $0x100,%esi
    46ccdb:	40 80 ce 89          	or     $0x89,%sil
    46ccdf:	44 31 c6             	xor    %r8d,%esi
 -  46cce2:	45 31 c0             	xor    %r8d,%r8d
 -  46cce5:	0f 05                	syscall
-+  46cce2:	e9 73 59 04 00       	jmp    4b265a <_end+0x1432>
++  46cce2:	e9 75 59 04 00       	jmp    4b265c <_end+0x1434>
    46cce7:	85 c0                	test   %eax,%eax
    46cce9:	7f 27                	jg     46cd12 <__futex_abstimed_wait64+0x62>
    46cceb:	83 f8 ea             	cmp    $0xffffffea,%eax
-@@ -111756,8 +111841,9 @@
+@@ -111756,8 +111844,9 @@
    46cd83:	45 31 c0             	xor    %r8d,%r8d
    46cd86:	49 89 ca             	mov    %rcx,%r10
    46cd89:	44 89 e2             	mov    %r12d,%edx
 -  46cd8c:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  46cd91:	0f 05                	syscall
-+  46cd8c:	e9 d7 58 04 00       	jmp    4b2668 <_end+0x1440>
++  46cd8c:	e9 d9 58 04 00       	jmp    4b266a <_end+0x1442>
 +  46cd91:	90                   	nop
 +  46cd92:	90                   	nop
    46cd93:	48 89 c3             	mov    %rax,%rbx
    46cd96:	89 d8                	mov    %ebx,%eax
    46cd98:	85 db                	test   %ebx,%ebx
-@@ -111802,8 +111888,9 @@
+@@ -111802,8 +111891,9 @@
    46ce0d:	48 8b 7d d0          	mov    -0x30(%rbp),%rdi
    46ce11:	41 b9 ff ff ff ff    	mov    $0xffffffff,%r9d
    46ce17:	44 89 e2             	mov    %r12d,%edx
 -  46ce1a:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  46ce1f:	0f 05                	syscall
-+  46ce1a:	e9 59 58 04 00       	jmp    4b2678 <_end+0x1450>
++  46ce1a:	e9 5b 58 04 00       	jmp    4b267a <_end+0x1452>
 +  46ce1f:	90                   	nop
 +  46ce20:	90                   	nop
    46ce21:	44 89 ef             	mov    %r13d,%edi
    46ce24:	48 89 c3             	mov    %rax,%rbx
    46ce27:	e8 a4 fc ff ff       	call   46cad0 <__pthread_disable_asynccancel>
-@@ -111827,8 +111914,9 @@
+@@ -111827,8 +111917,9 @@
    46ce66:	48 85 d2             	test   %rdx,%rdx
    46ce69:	0f 45 f1             	cmovne %ecx,%esi
    46ce6c:	31 d2                	xor    %edx,%edx
 -  46ce6e:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  46ce73:	0f 05                	syscall
-+  46ce6e:	e9 15 58 04 00       	jmp    4b2688 <_end+0x1460>
++  46ce6e:	e9 17 58 04 00       	jmp    4b268a <_end+0x1462>
 +  46ce73:	90                   	nop
 +  46ce74:	90                   	nop
    46ce75:	83 f8 da             	cmp    $0xffffffda,%eax
    46ce78:	74 26                	je     46cea0 <__futex_lock_pi64+0x50>
    46ce7a:	83 f8 92             	cmp    $0xffffff92,%eax
-@@ -114436,8 +114524,9 @@
+@@ -114436,8 +114527,9 @@
  000000000046f340 <__GI___fstatat>:
    46f340:	f3 0f 1e fa          	endbr64
    46f344:	41 89 ca             	mov    %ecx,%r10d
 -  46f347:	b8 06 01 00 00       	mov    $0x106,%eax
 -  46f34c:	0f 05                	syscall
-+  46f347:	e9 4c 33 04 00       	jmp    4b2698 <_end+0x1470>
++  46f347:	e9 4e 33 04 00       	jmp    4b269a <_end+0x1472>
 +  46f34c:	90                   	nop
 +  46f34d:	90                   	nop
    46f34e:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
    46f353:	77 0b                	ja     46f360 <__GI___fstatat+0x20>
    46f355:	31 c0                	xor    %eax,%eax
-@@ -117945,8 +118034,9 @@
+@@ -117945,8 +118037,9 @@
    47296c:	64 48 8b 04 25 10 00 	mov    %fs:0x10,%rax
    472973:	00 00
    472975:	48 8d 78 1c          	lea    0x1c(%rax),%rdi
 -  472979:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  47297e:	0f 05                	syscall
-+  472979:	e9 2a fd 03 00       	jmp    4b26a8 <_end+0x1480>
++  472979:	e9 2c fd 03 00       	jmp    4b26aa <_end+0x1482>
 +  47297e:	90                   	nop
 +  47297f:	90                   	nop
    472980:	eb 8c                	jmp    47290e <_dl_fixup+0x10e>
    472982:	66 0f 1f 44 00 00    	nopw   0x0(%rax,%rax,1)
    472988:	31 c0                	xor    %eax,%eax
-@@ -122353,8 +122443,9 @@
+@@ -122353,8 +122446,9 @@
    476c07:	64 48 8b 04 25 10 00 	mov    %fs:0x10,%rax
    476c0e:	00 00
    476c10:	48 8d 78 1c          	lea    0x1c(%rax),%rdi
 -  476c14:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  476c19:	0f 05                	syscall
-+  476c14:	e9 9f ba 03 00       	jmp    4b26b8 <_end+0x1490>
++  476c14:	e9 a1 ba 03 00       	jmp    4b26ba <_end+0x1492>
 +  476c19:	90                   	nop
 +  476c1a:	90                   	nop
    476c1b:	48 83 7d 98 00       	cmpq   $0x0,-0x68(%rbp)
    476c20:	48 8b 4d b0          	mov    -0x50(%rbp),%rcx
    476c24:	0f 84 ae fd ff ff    	je     4769d8 <_dl_vsym+0xb8>
-@@ -122513,8 +122604,9 @@
+@@ -122513,8 +122607,9 @@
    476e41:	64 48 8b 04 25 10 00 	mov    %fs:0x10,%rax
    476e48:	00 00
    476e4a:	48 8d 78 1c          	lea    0x1c(%rax),%rdi
 -  476e4e:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  476e53:	0f 05                	syscall
-+  476e4e:	e9 75 b8 03 00       	jmp    4b26c8 <_end+0x14a0>
++  476e4e:	e9 77 b8 03 00       	jmp    4b26ca <_end+0x14a2>
 +  476e53:	90                   	nop
 +  476e54:	90                   	nop
    476e55:	48 83 7d 98 00       	cmpq   $0x0,-0x68(%rbp)
    476e5a:	48 8b 4d b0          	mov    -0x50(%rbp),%rcx
    476e5e:	0f 84 3c fe ff ff    	je     476ca0 <_dl_sym+0x60>
-@@ -130847,4 +130939,20 @@
+@@ -130847,4 +130942,20 @@
    47e780:	f3 0f 1e fa          	endbr64
    47e784:	48 83 ec 08          	sub    $0x8,%rsp
    47e788:	48 83 c4 08          	add    $0x8,%rsp
@@ -1305,7 +1305,7 @@ snapshot_kind: text
 +  47e798:	00 20                	add    %ah,(%rax)
 +  47e79a:	4b 00 00             	rex.WXB add %al,(%r8)
 +  47e79d:	00 00                	add    %al,(%rax)
-+  47e79f:	00 d8                	add    %bl,%al
++  47e79f:	00 da                	add    %bl,%dl
 +  47e7a1:	06                   	(bad)
 +  47e7a2:	00 00                	add    %al,(%rax)
 +  47e7a4:	00 00                	add    %al,(%rax)

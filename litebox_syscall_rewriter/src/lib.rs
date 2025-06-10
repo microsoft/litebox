@@ -33,7 +33,7 @@ pub enum Error {
     #[error("failed to disassemble: {0}")]
     DisassemblyFailure(String),
     #[error("insufficient bytes before syscall at {0:#x}")]
-    InsufficientBytesBefore(u64),
+    InsufficientBytesBeforeOrAfter(u64),
 }
 
 impl From<capstone::Error> for Error {
@@ -310,8 +310,9 @@ fn hook_syscalls_in_section(
         for inst_id in (0..=i).rev() {
             let prev_inst = &instructions[inst_id];
             let prev_inst_detail = cs.insn_detail(prev_inst).unwrap();
-            // Check if the instruction is an instruction-relative control transfer
-            let is_control_transfer = prev_inst_detail.groups().iter().any(|&grp| {
+            // Check if the instruction does control transfer
+            // TODO: Check if the instruction is an instruction-relative control transfer
+            let is_control_transfer = inst_id != i && prev_inst_detail.groups().iter().any(|&grp| {
                 grp.0 == u8::try_from(X86_GRP_JUMP).unwrap()
                     || grp.0 == u8::try_from(X86_GRP_CALL).unwrap()
                     || grp.0 == u8::try_from(X86_GRP_RET).unwrap()
@@ -440,8 +441,9 @@ fn hook_syscall_and_after(
 
     for next_inst in instructions.iter().skip(inst_index) {
         let next_inst_detail = cs.insn_detail(next_inst).unwrap();
-        // Check if the instruction is an instruction-relative control transfer
-        let is_control_transfer = next_inst_detail.groups().iter().any(|&grp| {
+        // Check if the instruction does control transfer
+        // TODO: Check if the instruction is an instruction-relative control transfer
+        let is_control_transfer = next_inst.id() != syscall_inst.id() && next_inst_detail.groups().iter().any(|&grp| {
             grp.0 == u8::try_from(X86_GRP_JUMP).unwrap()
                 || grp.0 == u8::try_from(X86_GRP_CALL).unwrap()
                 || grp.0 == u8::try_from(X86_GRP_RET).unwrap()
@@ -462,7 +464,7 @@ fn hook_syscall_and_after(
     }
 
     let replace_end =
-        replace_end.ok_or_else(|| Error::InsufficientBytesBefore(syscall_inst.address()))?;
+        replace_end.ok_or_else(|| Error::InsufficientBytesBeforeOrAfter(syscall_inst.address()))?;
 
     let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
 
