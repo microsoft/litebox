@@ -492,10 +492,12 @@ fn hook_syscall_and_after(
         .address()
         .checked_add(syscall_inst.bytes().len().try_into().unwrap())
         .unwrap();
-    trampoline_data.extend_from_slice(
-        &section_data[usize::try_from(syscall_inst_end - section_base_addr).unwrap()
-            ..usize::try_from(replace_end - section_base_addr).unwrap()],
-    );
+    if syscall_inst_end < replace_end {
+        trampoline_data.extend_from_slice(
+            &section_data[usize::try_from(syscall_inst_end - section_base_addr).unwrap()
+                ..usize::try_from(replace_end - section_base_addr).unwrap()],
+        );
+    }
 
     // Add jmp back to original after syscall
     let jmp_back_offset = i64::try_from(replace_end).unwrap()
