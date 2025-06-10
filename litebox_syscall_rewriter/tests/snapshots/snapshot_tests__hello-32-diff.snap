@@ -1,7 +1,6 @@
 ---
 source: litebox_syscall_rewriter/tests/snapshot_tests.rs
 expression: diff
-snapshot_kind: text
 ---
 --- original
 +++ rewritten
@@ -159,7 +158,7 @@ snapshot_kind: text
  
  08098e40 <__libc_sigaction>:
   8098e40:	55                   	push   %ebp
-@@ -124321,4 +124331,19 @@
+@@ -124321,4 +124331,21 @@
   80ae605:	81 c3 ef 49 03 00    	add    $0x349ef,%ebx
   80ae60b:	83 c4 08             	add    $0x8,%esp
   80ae60e:	5b                   	pop    %ebx
@@ -180,5 +179,7 @@ snapshot_kind: text
 + 80ae61b:	08 00                	or     %al,(%eax)
 + 80ae61d:	00 00                	add    %al,(%eax)
 + 80ae61f:	00 4c 01 00          	add    %cl,0x0(%ecx,%eax,1)
++ 80ae623:	00 00                	add    %al,(%eax)
++ 80ae625:	00 00                	add    %al,(%eax)
 +	...
 \ No newline at end of file
