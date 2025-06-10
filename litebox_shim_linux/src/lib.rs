@@ -299,6 +299,18 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
             None => Err(Errno::EFAULT),
         },
         SyscallRequest::Close { fd } => syscalls::file::sys_close(fd).map(|()| 0),
+        SyscallRequest::RtSigprocmask {
+            how,
+            set,
+            oldset,
+            sigsetsize,
+        } => {
+            if sigsetsize == size_of::<litebox_common_linux::SigSet>() {
+                syscalls::process::sys_rt_sigprocmask(how, set, oldset).map(|()| 0)
+            } else {
+                Err(Errno::EINVAL)
+            }
+        }
         SyscallRequest::Ioctl { fd, arg } => syscalls::file::sys_ioctl(fd, arg).map(|v| v as usize),
         SyscallRequest::Pread64 {
             fd,
@@ -655,6 +667,32 @@ unsafe extern "C" fn syscall_handler_32(args: *const usize) -> isize {
     unsafe { syscall_handler(syscall_number, args.add(1)) }
 }
 
+/// Transmute a constant pointer to a constant pointer type
+///
+/// # Safety
+///
+/// This should only be used by [`syscall_handler`] to convert a raw pointer
+/// to a `ConstPtr<T>`, and should not be used in other contexts.
+unsafe fn transmute_ptr<T>(ptr: *const T) -> ConstPtr<T>
+where
+    T: Clone,
+{
+    unsafe { core::mem::transmute::<*const T, ConstPtr<T>>(ptr) }
+}
+
+/// Transmute a mutable pointer to a mutable pointer type
+///
+/// # Safety
+///
+/// This should only be used by [`syscall_handler`] to convert a raw pointer
+/// to a `MutPtr<T>`, and should not be used in other contexts.
+unsafe fn transmute_ptr_mut<T>(ptr: *mut T) -> MutPtr<T>
+where
+    T: Clone,
+{
+    unsafe { core::mem::transmute::<*mut T, MutPtr<T>>(ptr) }
+}
+
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) -> isize {
     let syscall_args = unsafe { core::slice::from_raw_parts(args, 6) };
@@ -665,9 +703,32 @@ unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) 
     let dispatcher = match sysno {
         ::syscalls::Sysno::write => SyscallRequest::Write {
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
-            buf: unsafe { core::mem::transmute::<usize, ConstPtr<u8>>(syscall_args[1]) },
+            buf: unsafe { transmute_ptr(syscall_args[1] as *const u8) },
             count: syscall_args[2],
         },
+        ::syscalls::Sysno::rt_sigprocmask => {
+            let how: i32 = syscall_args[0].reinterpret_as_signed().truncate();
+            if let Ok(how) = litebox_common_linux::SigmaskHow::try_from(how) {
+                let set = syscall_args[1] as *const litebox_common_linux::SigSet;
+                let oldset = syscall_args[2] as *mut litebox_common_linux::SigSet;
+                SyscallRequest::RtSigprocmask {
+                    how,
+                    set: if set.is_null() {
+                        None
+                    } else {
+                        Some(unsafe { transmute_ptr(set) })
+                    },
+                    oldset: if oldset.is_null() {
+                        None
+                    } else {
+                        Some(unsafe { transmute_ptr_mut(oldset) })
+                    },
+                    sigsetsize: syscall_args[3],
+                }
+            } else {
+                SyscallRequest::Ret(Errno::EINVAL.as_neg() as isize)
+            }
+        }
         ::syscalls::Sysno::exit | ::syscalls::Sysno::exit_group => {
             litebox_platform_multiplex::platform()
                 .exit(syscall_args[0].reinterpret_as_signed().truncate())
@@ -677,12 +738,12 @@ unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) 
             if let Ok(code) = ArchPrctlCode::try_from(code) {
                 let arg = match code {
                     #[cfg(target_arch = "x86_64")]
-                    ArchPrctlCode::SetFs => ArchPrctlArg::SetFs(unsafe {
-                        core::mem::transmute::<usize, ConstPtr<u8>>(syscall_args[1])
-                    }),
+                    ArchPrctlCode::SetFs => {
+                        ArchPrctlArg::SetFs(unsafe { transmute_ptr(syscall_args[1] as *const u8) })
+                    }
                     #[cfg(target_arch = "x86_64")]
                     ArchPrctlCode::GetFs => ArchPrctlArg::GetFs(unsafe {
-                        core::mem::transmute::<usize, MutPtr<usize>>(syscall_args[1])
+                        transmute_ptr_mut(syscall_args[1] as *mut usize)
                     }),
                     ArchPrctlCode::CETStatus => ArchPrctlArg::CETStatus,
                     ArchPrctlCode::CETDisable => ArchPrctlArg::CETDisable,
@@ -696,9 +757,7 @@ unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) 
         }
         ::syscalls::Sysno::set_thread_area => SyscallRequest::SetThreadArea {
             user_desc: unsafe {
-                core::mem::transmute::<usize, MutPtr<litebox_common_linux::UserDesc>>(
-                    syscall_args[0],
-                )
+                transmute_ptr_mut(syscall_args[0] as *mut litebox_common_linux::UserDesc)
             },
         },
         _ => todo!("syscall {sysno} not implemented"),

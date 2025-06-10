@@ -6,13 +6,11 @@
 use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};
 
-use host::linux::sigset_t;
 use litebox::mm::linux::PageRange;
 use litebox::platform::{
     DebugLogProvider, ExitProvider, IPInterfaceProvider, ImmediatelyWokenUp,
-    PageManagementProvider, Provider, Punchthrough, PunchthroughError, PunchthroughProvider,
-    PunchthroughToken, RawConstPointer, RawMutPointer, RawMutexProvider, TimeProvider,
-    UnblockedOrTimedOut,
+    PageManagementProvider, Provider, Punchthrough, PunchthroughProvider, PunchthroughToken,
+    RawConstPointer, RawMutPointer, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
 };
 use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::PunchthroughSyscall;
@@ -50,12 +48,9 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
         litebox::platform::PunchthroughError<<Self::Punchthrough as Punchthrough>::ReturnFailure>,
     > {
         let r = match self.punchthrough {
-            PunchthroughSyscall::RtSigprocmask {
-                how,
-                set,
-                old_set,
-                sigsetsize,
-            } => Host::rt_sigprocmask(how, set.cast(), old_set.cast(), sigsetsize),
+            PunchthroughSyscall::RtSigprocmask { how, set, oldset } => {
+                Host::rt_sigprocmask(how, set, oldset)
+            }
             PunchthroughSyscall::SetFsBase { addr } => {
                 unsafe { litebox_common_linux::wrfsbase(addr.as_usize()) };
                 Ok(0)
@@ -119,55 +114,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 
     pub fn init(&self, cpu_mhz: u64) {
         CPU_MHZ.store(cpu_mhz, core::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// rt_sigprocmask: examine and change blocked signals.
-    /// sigprocmask() is used to fetch and/or change the signal mask of the calling thread.
-    /// The signal mask is the set of signals whose delivery is currently blocked for the
-    /// caller (see also signal(7) for more details).
-    ///
-    ///The behavior of the call is dependent on the value of how, as follows.
-    ///
-    /// *SIG_BLOCK*
-    /// The set of blocked signals is the union of the current set and the set argument.
-    ///
-    /// *SIG_UNBLOCK*
-    /// The signals in set are removed from the current set of blocked signals. It is permissible to attempt to unblock a signal which is not blocked.
-    ///
-    /// *SIG_SETMASK*
-    /// The set of blocked signals is set to the argument set.
-    /// If oldset is non-NULL, the previous value of the signal mask is stored in oldset.
-    /// If set is NULL, then the signal mask is unchanged (i.e., how is ignored), but the current value of the signal mask is nevertheless returned in oldset (if it is not NULL).
-    /// The use of sigprocmask() is unspecified in a multithreaded process; see pthread_sigmask(3).
-    ///
-    /// **Return Value**
-    ///
-    /// sigprocmask() returns 0 on success and -1 on error.
-    ///
-    /// **Errors**
-    ///
-    /// *EFAULT* the set or oldset argument points outside the process's allocated address space.
-    ///
-    /// *EINVAL* The value specified in how was invalid.
-    ///
-    /// set and old_set are pointers in user space
-    pub fn rt_sigprocmask(
-        &mut self,
-        how: i32,
-        set: UserConstPtr<sigset_t>,
-        old_set: UserMutPtr<sigset_t>,
-        sigsetsize: usize,
-    ) -> Result<usize, PunchthroughError<Errno>> {
-        let punchthrough = PunchthroughSyscall::RtSigprocmask {
-            how,
-            set: set.cast(),
-            old_set: old_set.cast(),
-            sigsetsize,
-        };
-        let token = self
-            .get_punchthrough_token_for(punchthrough)
-            .ok_or(PunchthroughError::Unsupported)?;
-        token.execute()
     }
 
     pub fn exit(&self) -> ! {
@@ -377,10 +323,9 @@ pub trait HostInterface {
 
     /// For Punchthrough
     fn rt_sigprocmask(
-        how: i32,
-        set: UserConstPtr<sigset_t>,
-        old_set: UserMutPtr<sigset_t>,
-        sigsetsize: usize,
+        how: litebox_common_linux::SigmaskHow,
+        set: Option<UserConstPtr<litebox_common_linux::SigSet>>,
+        old_set: Option<UserMutPtr<litebox_common_linux::SigSet>>,
     ) -> Result<usize, Errno>;
 
     fn wake_many(mutex: &AtomicU32, n: usize) -> Result<usize, Errno>;

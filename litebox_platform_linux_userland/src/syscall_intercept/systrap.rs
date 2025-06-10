@@ -515,24 +515,27 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             SyscallRequest::Ret(isize::try_from(ret).unwrap())
         }
         libc::SYS_rt_sigprocmask => {
-            // never block SIGSYS
-            let mut set = unsafe { *(syscall_args[1] as *const libc::sigset_t) };
-            unsafe { libc::sigdelset(&raw mut set, libc::SIGSYS) };
-            let ret: isize = match unsafe {
-                syscalls::syscall5(
-                    syscalls::Sysno::rt_sigprocmask,
-                    syscall_args[0],
-                    &raw const set as usize,
-                    syscall_args[2],
-                    syscall_args[3],
-                    // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                    SYSCALL_ARG_MAGIC,
-                )
-            } {
-                Ok(_) => 0,
-                Err(e) => e.into_raw() as isize,
-            };
-            SyscallRequest::Ret(ret)
+            let how: i32 = syscall_args[0].reinterpret_as_signed().truncate();
+            if let Ok(how) = litebox_common_linux::SigmaskHow::try_from(how) {
+                let set = syscall_args[1] as *const litebox_common_linux::SigSet;
+                let oldset = syscall_args[2] as *mut litebox_common_linux::SigSet;
+                SyscallRequest::RtSigprocmask {
+                    how,
+                    set: if set.is_null() {
+                        None
+                    } else {
+                        Some(TransparentConstPtr { inner: set })
+                    },
+                    oldset: if oldset.is_null() {
+                        None
+                    } else {
+                        Some(TransparentMutPtr { inner: oldset })
+                    },
+                    sigsetsize: syscall_args[3],
+                }
+            } else {
+                SyscallRequest::Ret(isize::try_from(-libc::EINVAL).unwrap())
+            }
         }
         _ => todo!("Currently unimplemented syscall: {syscall_number} {syscall_args:?}"),
     };

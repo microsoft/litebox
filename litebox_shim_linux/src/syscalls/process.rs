@@ -59,6 +59,23 @@ pub(crate) fn set_thread_area(
     })
 }
 
+pub(crate) fn sys_rt_sigprocmask(
+    how: litebox_common_linux::SigmaskHow,
+    set: Option<crate::ConstPtr<litebox_common_linux::SigSet>>,
+    oldset: Option<crate::MutPtr<litebox_common_linux::SigSet>>,
+) -> Result<(), Errno> {
+    use litebox::platform::{PunchthroughProvider as _, PunchthroughToken as _};
+    let punchthrough =
+        litebox_common_linux::PunchthroughSyscall::RtSigprocmask { how, set, oldset };
+    let token = litebox_platform_multiplex::platform()
+        .get_punchthrough_token_for(punchthrough)
+        .expect("Failed to get punchthrough token for RT_SIGPROCMASK");
+    token.execute().map(|_| ()).map_err(|e| match e {
+        litebox::platform::PunchthroughError::Failure(errno) => errno,
+        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_arch = "x86_64")]

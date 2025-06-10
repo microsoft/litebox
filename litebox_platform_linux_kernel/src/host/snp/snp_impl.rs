@@ -2,10 +2,12 @@
 
 use core::arch::asm;
 
+use litebox::platform::{RawConstPointer, RawMutPointer};
+use litebox_common_linux::{SigSet, SigmaskHow};
+
 use super::ghcb::ghcb_prints;
 use crate::{
     Errno, HostInterface,
-    host::linux::{self, sigset_t},
     ptr::{UserConstPtr, UserMutPtr},
 };
 
@@ -237,36 +239,42 @@ impl HostInterface for HostSnpInterface {
     }
 
     fn rt_sigprocmask(
-        how: i32,
-        set: UserConstPtr<sigset_t>,
-        oldset: UserMutPtr<sigset_t>,
-        sigsetsize: usize,
+        how: SigmaskHow,
+        set: Option<UserConstPtr<SigSet>>,
+        oldset: Option<UserMutPtr<SigSet>>,
     ) -> Result<usize, Errno> {
         // Instead of passing the user space pointers to host, here we perform extra read and write
         // and pass kernel pointers to host. As long as we don't have large data to deal with, this
         // scheme is more straightforward. Alternative solution from previous implementation requires
         // the user space memory has mapped to physical pages as host operates on physical pages.
         // For kernel memory, it is always mapped to physical pages.
-        let kset: Option<sigset_t> = if set.is_null() {
+        let kset: Option<SigSet> = match set {
+            Some(s) => Some(
+                unsafe { s.read_at_offset(0) }
+                    .ok_or(Errno::EFAULT)?
+                    .into_owned(),
+            ),
+            None => None,
+        };
+        let mut koldset: Option<SigSet> = if oldset.is_none() {
             None
         } else {
-            Some(set.from_user_at_offset(0).ok_or(Errno::EFAULT)?)
+            Some(SigSet::empty())
         };
-        let mut koldset: Option<sigset_t> = if oldset.is_null() { None } else { Some(0) };
         let args = SyscallN::<4, NR_SYSCALL_RT_SIGPROCMASK> {
             args: [
-                u64::from(u32::try_from(how).unwrap()),
+                u64::try_from(how as i32).unwrap(),
                 // TODO: sandbox driver needs to be updated to accept a kernel pointer from the guest
                 kset.as_ref().map_or(0, |v| core::ptr::from_ref(v) as u64),
                 koldset
                     .as_mut()
                     .map_or(0, |v| core::ptr::from_mut(v) as u64),
-                sigsetsize as _,
+                size_of::<SigSet>() as _,
             ],
         };
         let r = Self::syscalls(args)?;
         if let Some(v) = koldset {
-            oldset.to_user_at_offset(0, v).ok_or(Errno::EFAULT)?;
+            unsafe { oldset.unwrap().write_at_offset(0, v) }.ok_or(Errno::EFAULT)?;
         }
         Ok(r)
     }
@@ -283,7 +291,7 @@ impl HostInterface for HostSnpInterface {
         val: u32,
         timeout: Option<core::time::Duration>,
     ) -> Result<(), Errno> {
-        let timeout = timeout.map(|t| linux::Timespec {
+        let timeout = timeout.map(|t| crate::host::linux::Timespec {
             tv_sec: i64::try_from(t.as_secs()).unwrap(),
             tv_nsec: i64::from(t.subsec_nanos()),
         });
