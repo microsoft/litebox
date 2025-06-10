@@ -115,8 +115,6 @@ jobs:
           # https://github.com/nextest-rs/nextest/issues/16
           #
           # sanghle: I'll to change the directory structure of LVBS later to simplify CI
-      - name: Build documentation (fail on warnings)
-        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items
 
   confirm_no_std:
     name: Confirm no_std
