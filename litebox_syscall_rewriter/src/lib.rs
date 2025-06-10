@@ -77,6 +77,7 @@ pub const TRAMPOLINE_SECTION_NAME: &str = ".trampolineLB0";
     clippy::missing_panics_doc,
     reason = "any panics in here are not part of the public contract and should be fixed within this module"
 )]
+#[allow(clippy::too_many_lines)]
 pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> Result<Vec<u8>> {
     let mut input_workaround: Vec<u64>;
     let input_binary: &[u8] = if (&raw const input_binary[0] as usize) % 8 != 0 {
@@ -111,6 +112,13 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
         Arch::X86_64
     } else {
         Arch::X86_32
+    };
+
+    // Get symbols
+    let dl_sysinfo_int80 = if arch == Arch::X86_32 {
+        get_symbols(&builder)
+    } else {
+        None
     };
 
     let text_sections = text_sections(&builder)?;
@@ -160,6 +168,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
             s.sh_addr,
             data.to_mut(),
             trampoline_base_addr,
+            dl_sysinfo_int80,
             &mut trampoline_data,
         ) {
             Ok(()) => {
@@ -250,6 +259,7 @@ fn hook_syscalls_in_section(
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
+    dl_sysinfo_int80: Option<u64>,
     trampoline_data: &mut Vec<u8>,
 ) -> Result<()> {
     use capstone::prelude::*;
@@ -266,11 +276,16 @@ fn hook_syscalls_in_section(
     let instructions = cs.disasm_all(section_data, section_base_addr)?;
 
     for (i, inst) in instructions.iter().enumerate() {
-        // Forward search for `syscall` / `int 0x80`
+        // Forward search for `syscall` / `int 0x80` / `call DWORD PTR gs:0x10`
         match arch {
             Arch::X86_32 => {
-                // `int 0x80` (the 32-bit Linux "syscall" instruction).
-                if inst.bytes() != [0xcd, 0x80] {
+                if dl_sysinfo_int80.is_some_and(|x| x == inst.address()) {
+                    continue; // Skip the `dl_sysinfo_int80` instruction
+                }
+                // `call DWORD PTR gs:0x10` or `int 0x80`
+                if inst.bytes() != [0x65, 0xff, 0x15, 0x10, 0x00, 0x00, 0x00]
+                    && inst.bytes() != [0xcd, 0x80]
+                {
                     continue;
                 }
             }
@@ -297,10 +312,12 @@ fn hook_syscalls_in_section(
         let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
 
         // Copy the original instructions to the trampoline
-        trampoline_data.extend_from_slice(
-            &section_data[usize::try_from(replace_start - section_base_addr).unwrap()
-                ..usize::try_from(inst.address() - section_base_addr).unwrap()],
-        );
+        if replace_start < inst.address() {
+            trampoline_data.extend_from_slice(
+                &section_data[usize::try_from(replace_start - section_base_addr).unwrap()
+                    ..usize::try_from(inst.address() - section_base_addr).unwrap()],
+            );
+        }
 
         // Add call [rip + offset_to_shared_target]
         if arch == Arch::X86_64 {
@@ -355,4 +372,17 @@ fn find_addr_for_trampoline_code(builder: &object::build::elf::Builder<'_>) -> u
 
     // Round up to the nearest page (assume 0x1000 page size)
     max_virtual_addr.next_multiple_of(0x1000)
+}
+
+fn get_symbols(builder: &object::build::elf::Builder<'_>) -> Option<u64> {
+    let mut dl_sysinfo_int80 = None;
+    for sym in &builder.symbols {
+        if sym.st_type() == object::elf::STT_FUNC {
+            let name = sym.name.to_string();
+            if name == "_dl_sysinfo_int80" {
+                dl_sysinfo_int80 = Some(sym.st_value);
+            }
+        }
+    }
+    dl_sysinfo_int80
 }
