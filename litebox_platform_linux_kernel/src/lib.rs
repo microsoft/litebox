@@ -51,6 +51,11 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
             PunchthroughSyscall::RtSigprocmask { how, set, oldset } => {
                 Host::rt_sigprocmask(how, set, oldset)
             }
+            PunchthroughSyscall::RtSigaction {
+                signum: _,
+                act: _,
+                oldact: _,
+            } => todo!(),
             PunchthroughSyscall::SetFsBase { addr } => {
                 unsafe { litebox_common_linux::wrfsbase(addr.as_usize()) };
                 Ok(0)

@@ -1,5 +1,6 @@
 //! Process/thread related syscalls.
 
+use litebox::platform::{PunchthroughProvider as _, PunchthroughToken as _};
 use litebox_common_linux::{ArchPrctlArg, errno::Errno};
 
 pub(crate) fn sys_arch_prctl(
@@ -8,7 +9,6 @@ pub(crate) fn sys_arch_prctl(
     match arg {
         #[cfg(target_arch = "x86_64")]
         ArchPrctlArg::SetFs(addr) => {
-            use litebox::platform::{PunchthroughProvider as _, PunchthroughToken as _};
             let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase { addr };
             let token = litebox_platform_multiplex::platform()
                 .get_punchthrough_token_for(punchthrough)
@@ -20,7 +20,6 @@ pub(crate) fn sys_arch_prctl(
         }
         #[cfg(target_arch = "x86_64")]
         ArchPrctlArg::GetFs(addr) => {
-            use litebox::platform::{PunchthroughProvider as _, PunchthroughToken as _};
             let punchthrough = litebox_common_linux::PunchthroughSyscall::GetFsBase { addr };
             let token = litebox_platform_multiplex::platform()
                 .get_punchthrough_token_for(punchthrough)
@@ -64,12 +63,30 @@ pub(crate) fn sys_rt_sigprocmask(
     set: Option<crate::ConstPtr<litebox_common_linux::SigSet>>,
     oldset: Option<crate::MutPtr<litebox_common_linux::SigSet>>,
 ) -> Result<(), Errno> {
-    use litebox::platform::{PunchthroughProvider as _, PunchthroughToken as _};
     let punchthrough =
         litebox_common_linux::PunchthroughSyscall::RtSigprocmask { how, set, oldset };
     let token = litebox_platform_multiplex::platform()
         .get_punchthrough_token_for(punchthrough)
         .expect("Failed to get punchthrough token for RT_SIGPROCMASK");
+    token.execute().map(|_| ()).map_err(|e| match e {
+        litebox::platform::PunchthroughError::Failure(errno) => errno,
+        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+    })
+}
+
+pub(crate) fn sys_rt_sigaction(
+    signum: litebox_common_linux::Signal,
+    act: Option<crate::ConstPtr<litebox_common_linux::SigAction>>,
+    oldact: Option<crate::MutPtr<litebox_common_linux::SigAction>>,
+) -> Result<(), Errno> {
+    let punchthrough = litebox_common_linux::PunchthroughSyscall::RtSigaction {
+        signum,
+        act,
+        oldact,
+    };
+    let token = litebox_platform_multiplex::platform()
+        .get_punchthrough_token_for(punchthrough)
+        .expect("Failed to get punchthrough token for RT_SIGACTION");
     token.execute().map(|_| ()).map_err(|e| match e {
         litebox::platform::PunchthroughError::Failure(errno) => errno,
         _ => unimplemented!("Unsupported punchthrough error {:?}", e),

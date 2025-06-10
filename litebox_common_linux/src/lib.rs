@@ -576,6 +576,29 @@ impl SigSet {
     }
 }
 
+bitflags::bitflags! {
+    #[derive(Clone)]
+    pub struct SaFlags: u32 {
+        const NOCLDSTOP = 1;
+        const NOCLDWAIT = 2;
+        const SIGINFO = 4;
+        const ONSTACK   = 0x08000000;
+        const RESTART   = 0x10000000;
+        const NODEFER   = 0x40000000;
+        const RESETHAND = 0x80000000;
+    }
+}
+
+/// Linux's `sigaction` struct used by the `rt_sigaction` syscall.
+#[repr(C)]
+#[derive(Clone)]
+pub struct SigAction {
+    pub sigaction: usize,
+    pub flags: SaFlags,
+    pub restorer: Option<extern "C" fn()>,
+    pub mask: SigSet,
+}
+
 #[repr(i32)]
 #[derive(Debug, IntEnum)]
 pub enum SigmaskHow {
@@ -722,6 +745,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         how: SigmaskHow,
         set: Option<Platform::RawConstPointer<SigSet>>,
         oldset: Option<Platform::RawMutPointer<SigSet>>,
+        sigsetsize: usize,
+    },
+    RtSigaction {
+        signum: Signal,
+        act: Option<Platform::RawConstPointer<SigAction>>,
+        oldact: Option<Platform::RawMutPointer<SigAction>>,
         sigsetsize: usize,
     },
     Ioctl {
@@ -884,6 +913,15 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
         set: Option<Platform::RawConstPointer<SigSet>>,
         /// If `oldset` is not None, the previous value of the signal mask is stored in `oldset`.
         oldset: Option<Platform::RawMutPointer<SigSet>>,
+    },
+    /// Change the action taken by a process on receipt of a specific signal
+    RtSigaction {
+        /// The signal number to change the action for.
+        signum: Signal,
+        /// If `act` is None, the new action for signal `signum` is installed from `act`.
+        act: Option<Platform::RawConstPointer<SigAction>>,
+        /// If `oldact` is not None, the previous action for the signal is stored in `oldact`.
+        oldact: Option<Platform::RawMutPointer<SigAction>>,
     },
     /// Set the FS base register to the value in `addr`.
     #[cfg(target_arch = "x86_64")]
