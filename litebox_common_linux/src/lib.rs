@@ -918,7 +918,7 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
     RtSigaction {
         /// The signal number to change the action for.
         signum: Signal,
-        /// If `act` is None, the new action for signal `signum` is installed from `act`.
+        /// If `act` is not None, the new action for signal `signum` is installed from `act`.
         act: Option<Platform::RawConstPointer<SigAction>>,
         /// If `oldact` is not None, the previous action for the signal is stored in `oldact`.
         oldact: Option<Platform::RawMutPointer<SigAction>>,
