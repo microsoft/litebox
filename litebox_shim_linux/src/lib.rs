@@ -667,6 +667,12 @@ unsafe extern "C" fn syscall_handler_32(args: *const usize) -> isize {
     unsafe { syscall_handler(syscall_number, args.add(1)) }
 }
 
+/// Transmute a constant pointer to a constant pointer type
+///
+/// # Safety
+///
+/// This should only be used by [`syscall_handler`] to convert a raw pointer
+/// to a `ConstPtr<T>`, and should not be used in other contexts.
 unsafe fn transmute_ptr<T>(ptr: *const T) -> ConstPtr<T>
 where
     T: Clone,
@@ -674,6 +680,12 @@ where
     unsafe { core::mem::transmute::<*const T, ConstPtr<T>>(ptr) }
 }
 
+/// Transmute a mutable pointer to a mutable pointer type
+///
+/// # Safety
+///
+/// This should only be used by [`syscall_handler`] to convert a raw pointer
+/// to a `MutPtr<T>`, and should not be used in other contexts.
 unsafe fn transmute_ptr_mut<T>(ptr: *mut T) -> MutPtr<T>
 where
     T: Clone,

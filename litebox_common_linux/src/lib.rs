@@ -548,9 +548,11 @@ pub enum Signal {
     SIGSYS = 31,
 }
 
-pub const SIGIOT: Signal = Signal::SIGABRT;
-pub const SIGPOLL: Signal = Signal::SIGIO;
-pub const SIGUNUSED: Signal = Signal::SIGSYS;
+impl Signal {
+    pub const SIGIOT: Signal = Signal::SIGABRT;
+    pub const SIGPOLL: Signal = Signal::SIGIO;
+    pub const SIGUNUSED: Signal = Signal::SIGSYS;
+}
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
@@ -877,11 +879,10 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
         ///
         /// * `SIG_SETMASK` (2): The set of blocked signals is set to the argument `set`.
         how: SigmaskHow,
-        /// If `set` is NULL, then the signal mask is unchanged (i.e., `how` is ignored), but the
-        /// current value of the signal mask is nevertheless returned in `oldset` (if it is not
-        /// NULL).
+        /// If `set` is None, then the signal mask is unchanged (i.e., `how` is ignored), but the
+        /// current value of the signal mask is nevertheless returned in `oldset` (if it is not None).
         set: Option<Platform::RawConstPointer<SigSet>>,
-        /// If `oldset` is non-NULL, the previous value of the signal mask is stored in `oldset`.
+        /// If `oldset` is not None, the previous value of the signal mask is stored in `oldset`.
         oldset: Option<Platform::RawMutPointer<SigSet>>,
     },
     /// Set the FS base register to the value in `addr`.
