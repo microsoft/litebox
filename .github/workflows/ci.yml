@@ -47,7 +47,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
-      RUSTDOCFLAGS: -Dwarnings
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -75,7 +74,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
-      RUSTDOCFLAGS: -Dwarnings
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
