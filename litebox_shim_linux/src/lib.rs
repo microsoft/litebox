@@ -487,7 +487,6 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
                 Ok(0)
             })
         }
-        #[cfg(target_arch = "x86")]
         SyscallRequest::SetThreadArea { user_desc } => {
             syscalls::process::set_thread_area(user_desc).map(|()| 0)
         }
@@ -695,7 +694,6 @@ unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) 
                 todo!("Unsupported arch_prctl syscall: {syscall_args:?}")
             }
         }
-        #[cfg(target_arch = "x86")]
         ::syscalls::Sysno::set_thread_area => SyscallRequest::SetThreadArea {
             user_desc: unsafe {
                 core::mem::transmute::<usize, MutPtr<litebox_common_linux::UserDesc>>(

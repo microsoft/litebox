@@ -772,7 +772,6 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pipefd: Platform::RawMutPointer<u32>,
         flags: litebox::fs::OFlags,
     },
-    #[cfg(target_arch = "x86")]
     SetThreadArea {
         user_desc: Platform::RawMutPointer<UserDesc>,
     },

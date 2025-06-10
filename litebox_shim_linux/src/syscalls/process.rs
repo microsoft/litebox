@@ -37,6 +37,13 @@ pub(crate) fn sys_arch_prctl(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn set_thread_area(
+    user_desc: crate::MutPtr<litebox_common_linux::UserDesc>,
+) -> Result<(), Errno> {
+    Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
+}
+
 #[cfg(target_arch = "x86")]
 pub(crate) fn set_thread_area(
     user_desc: crate::MutPtr<litebox_common_linux::UserDesc>,
