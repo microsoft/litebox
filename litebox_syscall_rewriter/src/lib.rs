@@ -312,11 +312,12 @@ fn hook_syscalls_in_section(
             let prev_inst_detail = cs.insn_detail(prev_inst).unwrap();
             // Check if the instruction does control transfer
             // TODO: Check if the instruction is an instruction-relative control transfer
-            let is_control_transfer = inst_id != i && prev_inst_detail.groups().iter().any(|&grp| {
-                grp.0 == u8::try_from(X86_GRP_JUMP).unwrap()
-                    || grp.0 == u8::try_from(X86_GRP_CALL).unwrap()
-                    || grp.0 == u8::try_from(X86_GRP_RET).unwrap()
-            });
+            let is_control_transfer = inst_id != i
+                && prev_inst_detail.groups().iter().any(|&grp| {
+                    grp.0 == u8::try_from(X86_GRP_JUMP).unwrap()
+                        || grp.0 == u8::try_from(X86_GRP_CALL).unwrap()
+                        || grp.0 == u8::try_from(X86_GRP_RET).unwrap()
+                });
             if is_control_transfer {
                 // If it's a control transfer, we don't want to cross it
                 break;
@@ -443,11 +444,12 @@ fn hook_syscall_and_after(
         let next_inst_detail = cs.insn_detail(next_inst).unwrap();
         // Check if the instruction does control transfer
         // TODO: Check if the instruction is an instruction-relative control transfer
-        let is_control_transfer = next_inst.id() != syscall_inst.id() && next_inst_detail.groups().iter().any(|&grp| {
-            grp.0 == u8::try_from(X86_GRP_JUMP).unwrap()
-                || grp.0 == u8::try_from(X86_GRP_CALL).unwrap()
-                || grp.0 == u8::try_from(X86_GRP_RET).unwrap()
-        });
+        let is_control_transfer = next_inst.id() != syscall_inst.id()
+            && next_inst_detail.groups().iter().any(|&grp| {
+                grp.0 == u8::try_from(X86_GRP_JUMP).unwrap()
+                    || grp.0 == u8::try_from(X86_GRP_CALL).unwrap()
+                    || grp.0 == u8::try_from(X86_GRP_RET).unwrap()
+            });
         if is_control_transfer {
             // If it's a control transfer, we don't want to cross it
             break;
