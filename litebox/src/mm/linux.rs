@@ -1,5 +1,5 @@
 //! This module implements a virtual memory manager `Vmem` that manages virtual address spaces
-//! backed by a memory [backend](`PageManagementProvider`). It provides functionality to create, remove, resize,
+//! backed by a memory [backend](PageManagementProvider). It provides functionality to create, remove, resize,
 //! move, and protect memory mappings within a process's virtual address space.
 
 use core::ops::Range;
@@ -189,7 +189,7 @@ impl VmArea {
 
 /// Virtual Memory Manager
 ///
-/// This struct mantains the virtual memory ranges backed by a memory [backend](`VmemBackend`).
+/// This struct mantains the virtual memory ranges backed by a memory [backend](PageManagementProvider).
 /// Each range needs to be `ALIGN`-aligned.
 pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> {
     /// Memory backend that provides the actual memory.
@@ -206,7 +206,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) const TASK_ADDR_MAX: usize = 0xC000_0000; // 3 GiB (see arch/x86/include/asm/page_32_types.h)
     pub(super) const STACK_GUARD_GAP: usize = 256 << 12;
 
-    /// Create a new [`Vmem`] instance with the given memory [backend](`VmemBackend`).
+    /// Create a new [`Vmem`] instance with the given memory [backend](PageManagementProvider).
     pub(super) const fn new(platform: &'static Platform) -> Self {
         Self {
             vmas: RangeMap::new(),
