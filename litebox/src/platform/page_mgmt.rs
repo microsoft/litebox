@@ -75,6 +75,8 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ) -> Result<(), PermissionUpdateError>;
 
     /// Return reserved pages that are not available for allocation.
+    ///
+    /// Note that the returned ranges should be `ALIGN`-aligned.
     fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>>;
 }
 
