@@ -3,11 +3,9 @@
 use core::arch::global_asm;
 use core::ffi::{c_int, c_uint};
 use litebox::net::{ReceiveFlags, SendFlags};
-use litebox::platform::RawMutPointer as _;
 use litebox::platform::trivial_providers::{TransparentConstPtr, TransparentMutPtr};
 use litebox::utils::{ReinterpretSignedExt as _, TruncateExt};
 use litebox_common_linux::{ArchPrctlArg, ArchPrctlCode, IoctlArg, SockFlags, SyscallRequest};
-use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 
 // Define a custom structure to reinterpret siginfo_t
 #[repr(C)]
@@ -480,39 +478,27 @@ unsafe extern "C" fn syscall_dispatcher(syscall_number: i64, args: *const usize)
             flags: litebox::fs::OFlags::from_bits_truncate(syscall_args[1].truncate()),
         },
         libc::SYS_rt_sigaction => {
-            let mut ret = 0;
-            let signo: i32 = syscall_args[0].reinterpret_as_signed().truncate();
-            debug_assert_eq!(signo, libc::SIGSYS);
-            let newaction = syscall_args[1] as *const libc::sigaction;
-            if newaction.is_null() {
-                let oldaction = syscall_args[2] as *mut libc::sigaction;
-                if !oldaction.is_null() {
-                    // return our registered handler
-                    let oldaction = TransparentMutPtr { inner: oldaction };
-                    let mut sigset = core::mem::MaybeUninit::uninit();
-                    let _ = unsafe { libc::sigemptyset(sigset.as_mut_ptr()) };
-                    if unsafe {
-                        oldaction.write_at_offset(
-                            0,
-                            libc::sigaction {
-                                sa_sigaction: sigsys_handler as usize,
-                                sa_flags: libc::SA_SIGINFO,
-                                // SAFETY: Initialized by `libc::sigemptyset`
-                                sa_mask: sigset.assume_init(),
-                                sa_restorer: None,
-                            },
-                        )
-                    }
-                    .is_none()
-                    {
-                        ret = -libc::EFAULT;
-                    }
+            let signum: i32 = syscall_args[0].reinterpret_as_signed().truncate();
+            if let Ok(signum) = litebox_common_linux::Signal::try_from(signum) {
+                let act = syscall_args[1] as *const litebox_common_linux::SigAction;
+                let oldact = syscall_args[2] as *mut litebox_common_linux::SigAction;
+                SyscallRequest::RtSigaction {
+                    signum,
+                    act: if act.is_null() {
+                        None
+                    } else {
+                        Some(TransparentConstPtr { inner: act })
+                    },
+                    oldact: if oldact.is_null() {
+                        None
+                    } else {
+                        Some(TransparentMutPtr { inner: oldact })
+                    },
+                    sigsetsize: syscall_args[3],
                 }
             } else {
-                // don't allow changing the SIGSYS handler
-                ret = -libc::EINVAL;
+                SyscallRequest::Ret(isize::try_from(-libc::EINVAL).unwrap())
             }
-            SyscallRequest::Ret(isize::try_from(ret).unwrap())
         }
         libc::SYS_rt_sigprocmask => {
             let how: i32 = syscall_args[0].reinterpret_as_signed().truncate();
@@ -577,15 +563,23 @@ extern "C" fn sigsys_handler(sig: c_int, info: *mut libc::siginfo_t, context: *m
 }
 
 fn register_sigsys_handler() {
-    let sig_action = SigAction::new(
-        SigHandler::SigAction(sigsys_handler),
-        SaFlags::SA_SIGINFO,
-        SigSet::empty(),
-    );
+    // TODO: reimplement signal trampoline so that we can use raw syscalls.
+    // See https://codebrowser.dev/glibc/glibc/sysdeps/unix/sysv/linux/x86_64/libc_sigaction.c.html#70
+    // for reference.
+    let mut sig_mask = core::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    unsafe { libc::sigemptyset(sig_mask.as_mut_ptr()) };
+    let sig_action = libc::sigaction {
+        sa_sigaction: sigsys_handler as usize,
+        sa_flags: litebox_common_linux::SaFlags::SIGINFO
+            .bits()
+            .reinterpret_as_signed(),
+        // SAFETY: Initialized by `libc::sigemptyset`
+        sa_mask: unsafe { sig_mask.assume_init() },
+        sa_restorer: None,
+    };
 
-    unsafe {
-        signal::sigaction(Signal::SIGSYS, &sig_action).expect("Failed to register SIGSYS handler");
-    }
+    let ret = unsafe { libc::sigaction(libc::SIGSYS, &raw const sig_action, std::ptr::null_mut()) };
+    assert_eq!(ret, 0, "Failed to register SIGSYS handler: {ret}");
 }
 
 #[allow(clippy::too_many_lines)]
@@ -689,9 +683,14 @@ fn register_seccomp_filter() {
                         0,
                         SeccompCmpArgLen::Dword,
                         SeccompCmpOp::Ne,
-                        Signal::SIGSYS as u64,
+                        litebox_common_linux::Signal::SIGSYS as u64,
                     )
                     .unwrap(),
+                ])
+                .unwrap(),
+                SeccompRule::new(vec![
+                    // The second argument `act` is null, so it does not change the signal handler.
+                    SeccompCondition::new(1, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0).unwrap(),
                 ])
                 .unwrap(),
             ],

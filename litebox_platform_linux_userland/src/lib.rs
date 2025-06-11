@@ -554,6 +554,36 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 })
                 .map_err(litebox::platform::PunchthroughError::Failure)
             }
+            PunchthroughSyscall::RtSigaction {
+                signum,
+                act,
+                oldact,
+            } => {
+                if signum == litebox_common_linux::Signal::SIGSYS && act.is_some() {
+                    // don't allow changing the SIGSYS handler
+                    return Err(litebox::platform::PunchthroughError::Failure(
+                        litebox_common_linux::errno::Errno::EINVAL,
+                    ));
+                }
+
+                let act = act.map_or(0, |ptr| ptr.as_usize());
+                let oldact = oldact.map_or(0, |ptr| ptr.as_usize());
+                unsafe {
+                    syscalls::syscall4(
+                        syscalls::Sysno::rt_sigaction,
+                        signum as usize,
+                        act,
+                        oldact,
+                        size_of::<litebox_common_linux::SigSet>(),
+                    )
+                }
+                .map_err(|err| match err {
+                    syscalls::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
+                    syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
+                    _ => panic!("unexpected error {err}"),
+                })
+                .map_err(litebox::platform::PunchthroughError::Failure)
+            }
             #[cfg(target_arch = "x86_64")]
             PunchthroughSyscall::SetFsBase { addr } => {
                 use litebox::platform::RawConstPointer as _;

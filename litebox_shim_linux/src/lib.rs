@@ -311,6 +311,18 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
                 Err(Errno::EINVAL)
             }
         }
+        SyscallRequest::RtSigaction {
+            signum,
+            act,
+            oldact,
+            sigsetsize,
+        } => {
+            if sigsetsize == size_of::<litebox_common_linux::SigSet>() {
+                syscalls::process::sys_rt_sigaction(signum, act, oldact).map(|()| 0)
+            } else {
+                Err(Errno::EINVAL)
+            }
+        }
         SyscallRequest::Ioctl { fd, arg } => syscalls::file::sys_ioctl(fd, arg).map(|v| v as usize),
         SyscallRequest::Pread64 {
             fd,
@@ -722,6 +734,29 @@ unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) 
                         None
                     } else {
                         Some(unsafe { transmute_ptr_mut(oldset) })
+                    },
+                    sigsetsize: syscall_args[3],
+                }
+            } else {
+                SyscallRequest::Ret(Errno::EINVAL.as_neg() as isize)
+            }
+        }
+        ::syscalls::Sysno::rt_sigaction => {
+            let signum: i32 = syscall_args[0].reinterpret_as_signed().truncate();
+            if let Ok(signum) = litebox_common_linux::Signal::try_from(signum) {
+                let act = syscall_args[1] as *const litebox_common_linux::SigAction;
+                let oldact = syscall_args[2] as *mut litebox_common_linux::SigAction;
+                SyscallRequest::RtSigaction {
+                    signum,
+                    act: if act.is_null() {
+                        None
+                    } else {
+                        Some(unsafe { transmute_ptr(act) })
+                    },
+                    oldact: if oldact.is_null() {
+                        None
+                    } else {
+                        Some(unsafe { transmute_ptr_mut(oldact) })
                     },
                     sigsetsize: syscall_args[3],
                 }
