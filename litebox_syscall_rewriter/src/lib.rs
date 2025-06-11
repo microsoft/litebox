@@ -335,7 +335,13 @@ fn hook_syscalls_in_section(
             if replace_end - prev_inst.address() >= 5 {
                 replace_start = Some(prev_inst.address());
                 break;
-            } else if libc_start_call_main.is_none_or(|(addr, size)| {
+            }
+            // We ignore this check inside the __libc_start_call_main function
+            // because it has a redundant backward jmp to repeat the exit syscall
+            // which is not supposed to be returned from the kernel.
+            // Our current patching approach cannot handle this case yet.
+            // A potential solution is to patch both before and after the syscall instruction.
+            else if libc_start_call_main.is_none_or(|(addr, size)| {
                 prev_inst.address() < addr || prev_inst.address() >= addr + size
             }) && control_transfer_targets.contains(&prev_inst.address())
             {
@@ -554,7 +560,7 @@ fn hook_syscall_and_after(
     // Add call [rip + offset_to_shared_target]
     if arch == Arch::X86_64 {
         trampoline_data.extend_from_slice(&[0xFF, 0x15]);
-        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() + 4);
+        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 4);
         trampoline_data.extend_from_slice(&disp32.to_le_bytes());
     } else {
         // For 32-bit, use a different approach to simulate `call [rip + disp32]`
@@ -562,7 +568,7 @@ fn hook_syscall_and_after(
         trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
         trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
         trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
+        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 11);
         trampoline_data.extend_from_slice(&disp32.to_le_bytes());
         // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
         // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
