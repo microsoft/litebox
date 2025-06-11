@@ -423,7 +423,9 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     Ok(token)
 }
 
-/// VSM function for supporting the initialization of a guest kernel module.
+/// VSM function for supporting the initialization of a guest kernel module including
+/// freeing the memory ranges that were used only for initialization and
+/// write-protecting the memory ranges that should be read-only after initialization.
 /// `token` is the unique identifier for the module.
 pub fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, Errno> {
     debug_serial_println!("VSM: Free kernel module's init (token: {})", token);
@@ -693,6 +695,8 @@ impl ModuleMemoryMap {
         }
     }
 
+    /// Generate a unique key for representing each loaded kernel module.
+    /// It assumes a 64-bit atomic counter is sufficient and there is no run out of keys.
     fn gen_unique_key(&self) -> i64 {
         self.key_gen.fetch_add(1, Ordering::Relaxed)
     }
