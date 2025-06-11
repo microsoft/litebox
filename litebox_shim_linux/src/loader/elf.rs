@@ -15,7 +15,7 @@ use elf_loader::{
 use litebox::{
     fs::{Mode, OFlags},
     mm::linux::{MappingError, PAGE_SIZE},
-    platform::RawConstPointer as _,
+    platform::{RawConstPointer as _, SystemInfoProvider as _},
 };
 use litebox_common_linux::errno::Errno;
 use thiserror::Error;
@@ -354,7 +354,10 @@ impl ElfLoader {
                     "trampoline section version number mismatch"
                 );
                 let placeholder = (start_addr + 8) as *mut usize;
-                unsafe { placeholder.write(crate::syscall_callback as usize) };
+                unsafe {
+                    placeholder
+                        .write(litebox_platform_multiplex::Platform::get_syscall_entry_point());
+                }
                 // `mprotect` requires the address to be page-aligned
                 let ptr = unsafe {
                     core::mem::transmute::<*mut u8, crate::MutPtr<u8>>(start_addr as *mut u8)
