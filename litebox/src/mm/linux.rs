@@ -216,6 +216,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             platform,
         };
         for each in platform.reserved_pages() {
+            assert!(
+                each.start % ALIGN == 0 && each.end % ALIGN == 0,
+                "Vmem: reserved range is not aligned to {ALIGN} bytes"
+            );
             vmem.vmas.insert(
                 each.start..each.end,
                 VmArea {

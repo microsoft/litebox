@@ -5,7 +5,7 @@ use litebox::{
     fs::{FileSystem as _, Mode, OFlags},
 };
 use litebox_platform_multiplex::{Platform, set_platform};
-use litebox_shim_linux::{litebox_fs, loader::load_program, set_fs, set_page_manager};
+use litebox_shim_linux::{litebox_fs, loader::load_program, set_fs};
 
 #[cfg(target_arch = "x86_64")]
 global_asm!(
@@ -47,9 +47,6 @@ pub fn init_platform(enable_systrap: bool) {
     set_platform(platform);
     let platform = litebox_platform_multiplex::platform();
     let litebox = LiteBox::new(platform);
-
-    let pm = litebox::mm::PageManager::new(&litebox);
-    set_page_manager(pm);
 
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(&litebox);
     in_mem_fs.with_root_privileges(|fs| {

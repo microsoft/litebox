@@ -77,20 +77,9 @@ pub fn litebox_fs<'a>() -> &'a impl litebox::fs::FileSystem {
     FS.get().expect("fs has not yet been set")
 }
 
-static VMEM: OnceBox<PageManager<Platform, PAGE_SIZE>> = OnceBox::new();
-/// Set the global page manager
-///
-/// # Panics
-///
-/// Panics if this is called more than once
-pub fn set_page_manager(page_manager: PageManager<Platform, PAGE_SIZE>) {
-    VMEM.set(alloc::boxed::Box::new(page_manager))
-        .map_err(|_| {})
-        .expect("page manager is already set");
-}
-
 pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE> {
-    VMEM.get().expect("page manager has not yet been set")
+    static VMEM: OnceBox<PageManager<Platform, PAGE_SIZE>> = OnceBox::new();
+    VMEM.get_or_init(|| alloc::boxed::Box::new(PageManager::new(litebox())))
 }
 
 pub(crate) fn litebox_net<'a>()

@@ -95,8 +95,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new(None);
     let litebox = LiteBox::new(platform);
-    let pm = litebox::mm::PageManager::new(&litebox);
-    litebox_shim_linux::set_page_manager(pm);
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
         in_mem.with_root_privileges(|fs| {

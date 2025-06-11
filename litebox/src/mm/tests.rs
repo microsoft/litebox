@@ -58,6 +58,10 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
     ) -> Result<(), crate::platform::page_mgmt::PermissionUpdateError> {
         Ok(())
     }
+
+    fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>> {
+        core::iter::empty()
+    }
 }
 
 fn collect_mappings(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<Range<usize>> {

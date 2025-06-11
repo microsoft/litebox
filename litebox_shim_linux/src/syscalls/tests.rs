@@ -14,9 +14,6 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) {
         set_platform(Platform::new(tun_device_name));
 
         let litebox = crate::litebox();
-        let pm = litebox::mm::PageManager::new(litebox);
-        crate::set_page_manager(pm);
-
         let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
         in_mem_fs.with_root_privileges(|fs| {
             fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)

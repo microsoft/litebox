@@ -292,6 +292,7 @@ impl ElfLoader {
     }
 
     /// Load an ELF file and prepare the stack for the new process.
+    #[allow(clippy::too_many_lines)]
     pub(super) fn load(
         path: &str,
         argv: Vec<CString>,
@@ -323,7 +324,7 @@ impl ElfLoader {
                 .easy_load(object)
                 .map_err(ElfLoaderError::LoaderError)?;
 
-            if let Some(trampoline) = trampoline {
+            let end_of_trampoline = if let Some(trampoline) = trampoline {
                 assert!(
                     trampoline.vaddr % PAGE_SIZE == 0,
                     "trampoline address must be page-aligned"
@@ -361,7 +362,10 @@ impl ElfLoader {
                 let pm = litebox_page_manager();
                 unsafe { pm.make_pages_executable(ptr, end_addr - start_addr) }
                     .expect("failed to make pages executable");
-            }
+                end_addr
+            } else {
+                0
+            };
             let base = elf.base();
             let brk = elf
                 .user_data()
@@ -370,7 +374,8 @@ impl ElfLoader {
                 .downcast_ref::<AtomicUsize>()
                 .unwrap()
                 .load(Ordering::Relaxed);
-            let init_brk = (base + brk).next_multiple_of(PAGE_SIZE);
+            let init_brk =
+                core::cmp::max((base + brk).next_multiple_of(PAGE_SIZE), end_of_trampoline);
             unsafe { litebox_page_manager().brk(init_brk) }.expect("failed to set brk");
             elf
         };
