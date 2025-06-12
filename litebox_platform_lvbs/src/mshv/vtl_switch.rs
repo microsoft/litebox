@@ -7,7 +7,6 @@ use crate::{
         vsm::{NUM_VTLCALL_PARAMS, VSMFunction, vsm_dispatch},
         vsm_intercept::vsm_handle_intercept,
     },
-    serial_println,
 };
 use core::{arch::asm, mem};
 use num_enum::TryFromPrimitive;
@@ -15,11 +14,11 @@ use num_enum::TryFromPrimitive;
 /// Return to VTL0
 #[expect(clippy::inline_always)]
 #[inline(always)]
-pub fn vtl_return(result: u64) {
+fn vtl_return() {
     unsafe {
         asm!(
             "vmcall",
-            in("rax") 0x0, in("rcx") 0x12, in("r8") result
+            in("rax") 0x0, in("rcx") 0x12
         );
     }
 }
@@ -27,8 +26,8 @@ pub fn vtl_return(result: u64) {
 // The following registers are shared between different VTLs.
 // If VTL entry is due to VTL call, we don't need to worry about VTL0 registers because
 // the caller saves them. However, if VTL entry is due to interrupt or intercept,
-// we should save/restore VTL0 registers. For now, we conservately save/restore all
-// VTL0/VTL1 registers (results in performance degradation)
+// we should save/restore VTL0 registers. For now, we conservatively save/restore all
+// VTL0/VTL1 registers (results in performance degradation) but we can optimize it later.
 /// Struct to save VTL state (general-purpose registers)
 #[derive(Default, Clone, Copy)]
 #[repr(C)]
@@ -136,13 +135,13 @@ fn drop_vtl_state_from_stack() {
 
 #[expect(clippy::inline_always)]
 #[inline(always)]
-fn assert_rsp_eq(exected_rsp: u64) {
+fn assert_rsp_eq(expected_rsp: u64) {
     let mut match_flag: u8;
     unsafe {
         asm!(
             "cmp rsp, rax",
             "sete al",
-            in("rax") exected_rsp,
+            in("rax") expected_rsp,
             lateout("al") match_flag,
             options(nostack, preserves_flags)
         );
@@ -204,18 +203,38 @@ pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
     // This is a dummy call to satisfy load_vtl0_state() with reasonable register values.
     // We do not save VTL0 registers during VTL1 initialization.
 
-    vtl_switch_loop(0);
+    jump_vtl_switch_loop_with_stack_cleanup();
+}
+
+/// This function lets VTL1 return to VTL0. Before returning to VTL0, it re-initializes
+/// the VTL1 kernel stack to discard any leftovers (e.g., unwind, panic, ...).
+#[allow(clippy::inline_always)]
+#[inline(always)]
+pub(crate) fn jump_vtl_switch_loop_with_stack_cleanup() -> ! {
+    let kernel_context = get_per_core_kernel_context();
+    let stack_top = kernel_context.kernel_stack_top();
+    unsafe {
+        asm!(
+            "mov rsp, rax",
+            "and rsp, -16",
+            "jmp {loop}",
+            in("rax") stack_top, loop = sym vtl_switch_loop,
+            options(noreturn)
+        );
+    }
 }
 
 /// VTL switch loop
+///
 /// # Panics
-/// Panics if VTL call parameter 0 is greater than u32::MAX
-pub fn vtl_switch_loop(result: u64) -> ! {
+/// Panic if it encounters an unknown VTL entry reason.
+fn vtl_switch_loop() -> ! {
     loop {
         save_vtl1_state();
         load_vtl0_state();
 
-        vtl_return(result);
+        vtl_return();
+        // VTL calls and intercepts (i.e., returns from synthetic interrupt handlers) land here.
 
         save_vtl0_state();
         load_vtl1_state();
@@ -223,25 +242,26 @@ pub fn vtl_switch_loop(result: u64) -> ! {
         let kernel_context = get_per_core_kernel_context();
         let reason = unsafe { (*kernel_context.hv_vp_assist_page_as_ptr()).vtl_entry_reason };
         match VtlEntryReason::try_from(reason).unwrap_or(VtlEntryReason::Unknown) {
+            #[allow(clippy::cast_sign_loss)]
             VtlEntryReason::VtlCall => {
                 let params = kernel_context.vtl0_state.get_vtlcall_params();
-                if VSMFunction::try_from(u32::try_from(params[0]).expect("VTL call param 0"))
+                if VSMFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
                     .unwrap_or(VSMFunction::Unknown)
                     == VSMFunction::Unknown
                 {
-                    serial_println!("unknown function ID = {:#x}", params[0]);
+                    todo!("unknown function ID = {:#x}", params[0]);
                 } else {
-                    let new_result = vsm_dispatch(&params);
-                    vtl_switch_loop(new_result)
+                    let result = vsm_dispatch(&params);
+                    kernel_context.set_vtl_return_value(result as u64);
+                    jump_vtl_switch_loop_with_stack_cleanup();
                 }
             }
             VtlEntryReason::Interrupt => {
-                let new_result = vsm_handle_intercept();
-                vtl_switch_loop(new_result)
+                vsm_handle_intercept();
+                jump_vtl_switch_loop_with_stack_cleanup();
             }
             VtlEntryReason::Unknown => {
-                serial_println!("Unknown VTL entry reason");
-                vtl_switch_loop(0)
+                panic!("Unknown VTL entry reason");
             }
         }
         // do not put any code which might corrupt registers
