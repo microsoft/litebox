@@ -4,10 +4,12 @@
 #![no_std]
 #![cfg_attr(feature = "interrupt", feature(abi_x86_interrupt))]
 
-use crate::mshv::{vsm::ModuleMemoryMap, vtl1_mem_layout::PAGE_SIZE};
-use core::sync::atomic::{AtomicBool, AtomicU64};
-use core::{arch::asm, sync::atomic::AtomicU32};
+use crate::mshv::{vsm::Vtl0KernelInfo, vtl1_mem_layout::PAGE_SIZE};
 
+use core::{
+    arch::asm,
+    sync::atomic::{AtomicU32, AtomicU64},
+};
 use host::linux::sigset_t;
 use litebox::mm::linux::PageRange;
 use litebox::platform::page_mgmt::DeallocationError;
@@ -39,8 +41,7 @@ pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
     page_table: mm::PageTable<PAGE_SIZE>,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
-    vtl0_module_memory: ModuleMemoryMap,
-    vtl0_boot_done: AtomicBool,
+    vtl0_kernel_info: Vtl0KernelInfo,
 }
 
 impl<Host: HostInterface> ExitProvider for LinuxKernel<Host> {
@@ -94,8 +95,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             host_and_task: core::marker::PhantomData,
             page_table: pt,
             vtl1_phys_frame_range: PhysFrame::range(physframe_start, physframe_end),
-            vtl0_module_memory: ModuleMemoryMap::new(),
-            vtl0_boot_done: AtomicBool::new(false),
+            vtl0_kernel_info: Vtl0KernelInfo::new(),
         }))
     }
 
@@ -224,19 +224,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         }
 
         false
-    }
-
-    /// This function records the end of the VTL0 boot process.
-    pub fn set_end_of_boot(&self) {
-        self.vtl0_boot_done
-            .store(true, core::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// This function checks whether the VTL0 boot process is done. VTL1 kernel relies on this function
-    /// to lock down certain security-critical VSM functions.
-    pub fn check_end_of_boot(&self) -> bool {
-        self.vtl0_boot_done
-            .load(core::sync::atomic::Ordering::SeqCst)
     }
 }
 
