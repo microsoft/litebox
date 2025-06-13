@@ -349,9 +349,9 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
                     HekiKdataType::KernelInfo => {
                         if heki_kernel_info_mem
                             .write_vtl0_phys_bytes(
-                                x86_64::VirtAddr::new(va),
-                                x86_64::PhysAddr::new(pa),
-                                x86_64::PhysAddr::new(epa),
+                                VirtAddr::new(va),
+                                PhysAddr::new(pa),
+                                PhysAddr::new(epa),
                             )
                             .is_err()
                         {
@@ -362,9 +362,9 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
                     HekiKdataType::KernelData => {
                         if heki_kernel_data_mem
                             .write_vtl0_phys_bytes(
-                                x86_64::VirtAddr::new(va),
-                                x86_64::PhysAddr::new(pa),
-                                x86_64::PhysAddr::new(epa),
+                                VirtAddr::new(va),
+                                PhysAddr::new(pa),
+                                PhysAddr::new(epa),
                             )
                             .is_err()
                         {
@@ -450,9 +450,9 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                     ModMemType::ElfBuffer => {
                         if kernel_module_mem
                             .write_vtl0_phys_bytes(
-                                x86_64::VirtAddr::new(va),
-                                x86_64::PhysAddr::new(pa),
-                                x86_64::PhysAddr::new(epa),
+                                VirtAddr::new(va),
+                                PhysAddr::new(pa),
+                                PhysAddr::new(epa),
                             )
                             .is_err()
                         {
@@ -475,9 +475,9 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
 
                         if kernel_module_mem
                             .write_vtl0_phys_bytes(
-                                x86_64::VirtAddr::new(va),
-                                x86_64::PhysAddr::new(pa),
-                                x86_64::PhysAddr::new(epa),
+                                VirtAddr::new(va),
+                                PhysAddr::new(pa),
+                                PhysAddr::new(epa),
                             )
                             .is_err()
                         {
@@ -1027,9 +1027,9 @@ fn protect_physical_memory_range(
 /// their target addresses. We could implement ASLR to mitigate this but ASLR is in general meaningless
 /// against local adversaries.
 pub struct MemoryMapWithContent {
-    pages: BTreeMap<x86_64::VirtAddr, Box<[u8; PAGE_SIZE]>>,
-    start: Option<x86_64::VirtAddr>,
-    end: Option<x86_64::VirtAddr>,
+    pages: BTreeMap<VirtAddr, Box<[u8; PAGE_SIZE]>>,
+    start: Option<VirtAddr>,
+    end: Option<VirtAddr>,
 }
 
 impl MemoryMapWithContent {
@@ -1041,16 +1041,16 @@ impl MemoryMapWithContent {
         }
     }
 
-    pub fn start(&self) -> Option<x86_64::VirtAddr> {
+    pub fn start(&self) -> Option<VirtAddr> {
         self.start
     }
 
     #[expect(dead_code)]
-    pub fn end(&self) -> Option<x86_64::VirtAddr> {
+    pub fn end(&self) -> Option<VirtAddr> {
         self.end
     }
 
-    fn set_start(&mut self, addr: x86_64::VirtAddr) {
+    fn set_start(&mut self, addr: VirtAddr) {
         if self.start.is_none() {
             self.start = Some(addr);
         } else {
@@ -1058,7 +1058,7 @@ impl MemoryMapWithContent {
         }
     }
 
-    fn set_end(&mut self, addr: x86_64::VirtAddr) {
+    fn set_end(&mut self, addr: VirtAddr) {
         if self.end.is_none() {
             self.end = Some(addr);
         } else {
@@ -1066,7 +1066,7 @@ impl MemoryMapWithContent {
         }
     }
 
-    pub fn get_or_alloc_page(&mut self, addr: x86_64::VirtAddr) -> &mut Box<[u8; PAGE_SIZE]> {
+    pub fn get_or_alloc_page(&mut self, addr: VirtAddr) -> &mut Box<[u8; PAGE_SIZE]> {
         let page_base = addr.align_down(u64::try_from(PAGE_SIZE).unwrap_or(4096));
         self.pages
             .entry(page_base)
@@ -1074,7 +1074,7 @@ impl MemoryMapWithContent {
     }
 
     #[expect(dead_code)]
-    pub fn write_byte(&mut self, addr: x86_64::VirtAddr, value: u8) {
+    pub fn write_byte(&mut self, addr: VirtAddr, value: u8) {
         let page_offset: usize = addr.page_offset().into();
         self.get_or_alloc_page(addr)[page_offset] = value;
 
@@ -1084,9 +1084,9 @@ impl MemoryMapWithContent {
 
     pub fn write_vtl0_phys_bytes(
         &mut self,
-        addr: x86_64::VirtAddr,
-        phys_start: x86_64::PhysAddr,
-        phys_end: x86_64::PhysAddr,
+        addr: VirtAddr,
+        phys_start: PhysAddr,
+        phys_end: PhysAddr,
     ) -> Result<(), ()> {
         let mut phys_cur = phys_start;
         while phys_cur < phys_end {
@@ -1112,13 +1112,13 @@ impl MemoryMapWithContent {
     }
 
     #[expect(dead_code)]
-    pub fn read_byte(&self, addr: x86_64::VirtAddr) -> Option<u8> {
+    pub fn read_byte(&self, addr: VirtAddr) -> Option<u8> {
         let page_base = addr.align_down(u64::try_from(PAGE_SIZE).unwrap_or(4096));
         let page_offset: usize = addr.page_offset().into();
         self.pages.get(&page_base).map(|page| page[page_offset])
     }
 
-    pub fn preallocate_pages(&mut self, start: x86_64::VirtAddr, end: x86_64::VirtAddr) {
+    pub fn preallocate_pages(&mut self, start: VirtAddr, end: VirtAddr) {
         let start_page = start.align_down(u64::try_from(PAGE_SIZE).unwrap_or(4096));
         let end_page = end.align_up(u64::try_from(PAGE_SIZE).unwrap_or(4096));
 
@@ -1129,7 +1129,7 @@ impl MemoryMapWithContent {
         }
     }
 
-    pub fn write_bytes(&mut self, addr: x86_64::VirtAddr, data: &[u8]) -> Result<(), ()> {
+    pub fn write_bytes(&mut self, addr: VirtAddr, data: &[u8]) -> Result<(), ()> {
         self.preallocate_pages(addr, addr + data.len() as u64);
 
         let start = addr;
@@ -1173,7 +1173,7 @@ impl MemoryMapWithContent {
         }
     }
 
-    pub fn read_value<T: Copy>(&self, addr: x86_64::VirtAddr) -> Option<T> {
+    pub fn read_value<T: Copy>(&self, addr: VirtAddr) -> Option<T> {
         let mut buf = vec![0u8; core::mem::size_of::<T>()];
         if self.read_bytes(addr, &mut buf).is_err() {
             return None;
@@ -1186,7 +1186,7 @@ impl MemoryMapWithContent {
         }
     }
 
-    pub fn read_bytes(&self, addr: x86_64::VirtAddr, buf: &mut [u8]) -> Result<(), ()> {
+    pub fn read_bytes(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<(), ()> {
         let start = addr;
         let end = addr + buf.len() as u64;
 
