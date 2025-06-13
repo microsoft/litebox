@@ -56,6 +56,7 @@ pub fn validate_module_elf(
                 if i + 5 < text_loaded.len()
                     && text_reloc[i..=i + 5] == [0xc3, 0xcc, 0xcc, 0xcc, 0xcc]
                 {
+                    // this is a patched jump 0, which we allow to mismatch for now
                     i += 5;
                     continue;
                 }
@@ -112,15 +113,10 @@ pub fn load_elf(
     let mut symbol_map = HashMap::new();
     for sym in &elf.syms {
         if let Some(name) = elf.strtab.get_at(sym.st_name) {
-            let addr = if sym.st_value != 0 {
-                sym.st_value
-            } else if let Some(global_addr) = ksymtab.get(name) {
-                global_addr.as_u64()
-            } else if let Some(global_addr) = ksymtab_gpl.get(name) {
-                global_addr.as_u64()
-            } else {
-                0
-            };
+            if name.is_empty() {
+                continue;
+            }
+            let addr = sym.st_value;
             symbol_map.insert(name.to_string(), addr);
             debug_serial_println!("Symbol: {:30} -> {:#x}", name, addr,);
         }
@@ -161,14 +157,15 @@ pub fn load_elf(
             ..usize::try_from(text_offset + text_size).unwrap()],
     );
 
+    let rela_section_name = [".rela", section_name].join("");
+
     for (shndx, relocations) in &elf.shdr_relocs {
         let target_section = &elf.section_headers[*shndx];
-        let section_name = elf
+        let cur_section_name = elf
             .shdr_strtab
             .get_at(target_section.sh_name)
             .unwrap_or("unknown");
-        let rela_section_name = [".rela", section_name].join("");
-        if section_name != rela_section_name {
+        if cur_section_name != rela_section_name {
             continue;
         }
 
@@ -179,56 +176,65 @@ pub fn load_elf(
                 .get(reloc.r_sym)
                 .ok_or_else(|| alloc::format!("Invalid symbol index: {}", reloc.r_sym));
             let sym_name = elf.strtab.get_at(sym.unwrap().st_name).unwrap();
+            if sym_name.starts_with("__") {
+                continue; // skip internal symbols
+            }
             let Some(sym_val) = symbol_map.get(sym_name).copied() else {
-                continue;
+                continue; // skip symbols that are not found in the symbol map
+            };
+            let symbol_addr = if sym_val != 0 {
+                section_base_addr + sym_val
+            } else {
+                // if a symbol is undefined (`st_value == 0`), check whether it is a symbol defined in the kernel.
+                if let Some(external_addr) = ksymtab.get(sym_name) {
+                    external_addr.as_u64()
+                } else if let Some(external_addr) = ksymtab_gpl.get(sym_name) {
+                    external_addr.as_u64()
+                } else {
+                    section_base_addr
+                }
             };
 
-            let r_offset = reloc.r_offset;
+            let r_offset = usize::try_from(reloc.r_offset).unwrap();
             let r_addend = reloc.r_addend.unwrap_or(0);
             let r_type = reloc.r_type;
 
             #[allow(clippy::cast_possible_truncation)]
             #[allow(clippy::cast_possible_wrap)]
             #[allow(clippy::cast_sign_loss)]
-            let result = match r_type {
-                R_X86_64_64 | R_X86_64_32S => (sym_val as isize + r_addend as isize) as u64,
-                R_X86_64_PC32 => {
-                    let pc = section_base_addr + reloc.r_offset;
-                    (sym_val as isize + r_addend as isize).wrapping_sub(pc as isize) as u64
+            match r_type {
+                R_X86_64_64 => {
+                    assert!(r_offset + 8 <= text_vec.len());
+                    let value = (symbol_addr as i64).wrapping_add(r_addend);
+                    let value_u64 = value as u64;
+                    text_vec[r_offset..r_offset + 8].copy_from_slice(&value_u64.to_le_bytes());
                 }
-                R_X86_64_PLT32 => {
-                    let relocation_address = section_base_addr + r_offset;
-                    let relocation_address_plus_4 = relocation_address + 4;
-                    let symbol_address = if sym_val != 0 {
-                        section_base_addr + sym_val
-                    } else {
-                        todo!(
-                            "checks whether {:?} is in the ksymtabs of the kernel text and get the address from it (if exists)",
-                            sym_name
-                        );
-                    };
-
-                    let rel32 =
-                        (symbol_address as i64 + r_addend) - relocation_address_plus_4 as i64;
-
-                    rel32 as u64
+                R_X86_64_32 => {
+                    assert!(r_offset + 4 <= text_vec.len());
+                    let value = (symbol_addr as i64).wrapping_add(r_addend);
+                    assert!(u32::try_from(value).is_ok());
+                    let value_u32 = value as u32;
+                    text_vec[r_offset..r_offset + 4].copy_from_slice(&value_u32.to_le_bytes());
                 }
-                R_X86_64_32 => (sym_val as isize).wrapping_add(r_addend as isize) as u64,
+                R_X86_64_32S => {
+                    assert!(r_offset + 4 <= text_vec.len());
+                    let value = symbol_addr as i64 + r_addend;
+                    assert!(i32::try_from(value).is_ok());
+                    let value_i32 = value as i32;
+                    text_vec[r_offset..r_offset + 4].copy_from_slice(&value_i32.to_le_bytes());
+                }
+                R_X86_64_PLT32 | R_X86_64_PC32 => {
+                    assert!(r_offset + 4 <= text_vec.len());
+                    let reloc_address = section_base_addr + r_offset as u64;
+                    let value = (symbol_addr as i64 + r_addend) - reloc_address as i64;
+                    assert!(i32::try_from(value).is_ok());
+                    let value_i32 = value as i32;
+                    text_vec[r_offset..r_offset + 4].copy_from_slice(&value_i32.to_le_bytes());
+                }
                 _ => {
-                    debug_serial_println!("Unsupported relocation type: {}", r_type);
-                    continue;
+                    todo!("Unsupported relocation type: {r_type}");
                 }
-            };
-
-            debug_serial_println!(
-                "r_offset {:#x} r_type {:#x} r_addend {:#x} sym_name: {} sym_val {:#x} result {:#x}",
-                r_offset,
-                r_type,
-                r_addend,
-                sym_name,
-                sym_val,
-                result,
-            );
+            }
         }
     }
 
