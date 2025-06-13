@@ -39,10 +39,10 @@ use core::{
     ops::Range,
     sync::atomic::{AtomicBool, AtomicI64, Ordering},
 };
+use hashbrown::HashMap;
 use litebox_common_linux::errno::Errno;
 use memoffset::offset_of;
 use num_enum::TryFromPrimitive;
-use once_cell::race::OnceBox;
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{PageOffset, PhysFrame, Size4KiB, frame::PhysFrameRange},
@@ -398,11 +398,11 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
             );
 
         debug_serial_println!(
-            "ksymtab: {:#x?}",
+            "ksymtab: irq_fpu_usable is at {:?}",
             crate::platform_low()
                 .vtl0_kernel_info
-                .ksymtab
-                .get()
+                .ksymtab_map
+                .get("irq_fpu_usable")
                 .unwrap()
         );
     }
@@ -745,8 +745,8 @@ fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
 pub struct Vtl0KernelInfo {
     module_memory: ModuleMemoryMap,
     boot_done: AtomicBool,
-    ksymtab: OnceBox<BTreeMap<String, VirtAddr>>,
-    ksymtab_gpl: OnceBox<BTreeMap<String, VirtAddr>>,
+    ksymtab_map: KernelSymbolMap,
+    ksymtab_gpl_map: KernelSymbolMap,
     // TODO: certificates, blocklist, etc.
 }
 
@@ -755,8 +755,8 @@ impl Vtl0KernelInfo {
         Self {
             module_memory: ModuleMemoryMap::new(),
             boot_done: AtomicBool::new(false),
-            ksymtab: OnceBox::new(),
-            ksymtab_gpl: OnceBox::new(),
+            ksymtab_map: KernelSymbolMap::new(),
+            ksymtab_gpl_map: KernelSymbolMap::new(),
         }
     }
 
@@ -773,15 +773,15 @@ impl Vtl0KernelInfo {
     }
 
     /// This function implements Linux kernel's `offset_to_ptr` macro to identify
-    /// the addresses of kernel symbols and their null-terminated names and
+    /// the addresses of kernel symbols and their null-terminated names, and
     /// returns a map of symbol names to their addresses. `offset_to_ptr` is needed
     /// only if `CONFIG_HAVE_ARCH_PREL32_RELOCATIONS=y`.
     #[allow(clippy::unused_self)]
-    fn populate_kernel_symbol_map(
+    fn parse_ksymtab(
         &self,
         ksymtab_range: Range<VirtAddr>,
         kernel_data_mem: &MemoryMapWithContent,
-        ksymtab_map: &mut BTreeMap<String, VirtAddr>,
+        ksymtab_map: &mut HashMap<String, VirtAddr>,
     ) {
         let mut current = ksymtab_range.start;
         while current < ksymtab_range.end {
@@ -822,7 +822,7 @@ impl Vtl0KernelInfo {
                 ksymtab_map.insert(String::from(name), value_addr);
             }
 
-            // unclear whether we need the `namespace` field to suppor the relocation.
+            // unclear whether we need the `namespace` field to support the relocation.
             // We can add it later if needed.
 
             current += core::mem::size_of::<KernelSymbol>() as u64;
@@ -835,24 +835,20 @@ impl Vtl0KernelInfo {
         ksymtab_gpl_range: Range<VirtAddr>,
         kernel_data_mem: &MemoryMapWithContent,
     ) {
-        let mut ksymtab_map: BTreeMap<String, VirtAddr> = BTreeMap::new();
-        let mut ksymtab_gpl_map: BTreeMap<String, VirtAddr> = BTreeMap::new();
+        let mut ksymtab_map: HashMap<String, VirtAddr> = HashMap::new();
+        let mut ksymtab_gpl_map: HashMap<String, VirtAddr> = HashMap::new();
 
-        self.populate_kernel_symbol_map(ksymtab_range, kernel_data_mem, &mut ksymtab_map);
-        self.ksymtab
-            .set(Box::new(ksymtab_map))
-            .expect("Reinitialization of kernel symbol map is not allowed");
+        self.parse_ksymtab(ksymtab_range, kernel_data_mem, &mut ksymtab_map);
+        self.ksymtab_map.populate(&mut ksymtab_map);
 
-        self.populate_kernel_symbol_map(ksymtab_gpl_range, kernel_data_mem, &mut ksymtab_gpl_map);
-        self.ksymtab_gpl
-            .set(Box::new(ksymtab_gpl_map))
-            .expect("Reinitialization of kernel symbol map is not allowed");
+        self.parse_ksymtab(ksymtab_gpl_range, kernel_data_mem, &mut ksymtab_gpl_map);
+        self.ksymtab_gpl_map.populate(&mut ksymtab_gpl_map);
     }
 }
 
 /// Data structure for maintaining the memory ranges of each VTL0 kernel module and their types
 pub struct ModuleMemoryMap {
-    inner: spin::mutex::SpinMutex<BTreeMap<i64, ModuleMemory>>,
+    inner: spin::mutex::SpinMutex<HashMap<i64, ModuleMemory>>,
     key_gen: AtomicI64,
 }
 
@@ -914,7 +910,7 @@ impl Default for ModuleMemoryRange {
 impl ModuleMemoryMap {
     pub fn new() -> Self {
         Self {
-            inner: spin::mutex::SpinMutex::new(BTreeMap::new()),
+            inner: spin::mutex::SpinMutex::new(HashMap::new()),
             key_gen: AtomicI64::new(0),
         }
     }
@@ -969,7 +965,7 @@ impl Default for ModuleMemoryMap {
 }
 
 pub struct ModuleMemoryIters<'a> {
-    guard: spin::mutex::SpinMutexGuard<'a, BTreeMap<i64, ModuleMemory>>,
+    guard: spin::mutex::SpinMutexGuard<'a, HashMap<i64, ModuleMemory>>,
     key: i64,
     phantom: core::marker::PhantomData<&'a PhysFrameRange<Size4KiB>>,
 }
@@ -1020,9 +1016,34 @@ fn protect_physical_memory_range(
     Ok(())
 }
 
+/// Data structure for maintaining kernel symbols and their addresses, populated by parsing `ksymtab` and `ksymtab_gpl`.
+/// We should re-populate these kernel symbol maps after each `kexec` call.
+pub struct KernelSymbolMap {
+    inner: spin::rwlock::RwLock<HashMap<String, VirtAddr>>,
+}
+
+impl KernelSymbolMap {
+    pub fn new() -> Self {
+        Self {
+            inner: spin::rwlock::RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn populate(&self, other_map: &mut HashMap<String, VirtAddr>) {
+        let mut inner = self.inner.write();
+        inner.clear();
+        inner.extend(other_map.drain());
+    }
+
+    pub fn get(&self, symbol: &str) -> Option<VirtAddr> {
+        let inner = self.inner.read();
+        inner.get(symbol).copied()
+    }
+}
+
 /// Data structure for abstracting addressable paged memory. Unlike `ModuleMemoryMap` which maintains
-/// physical/virtual address ranges and their access permissions, this strucure contain actual data in memory pages.
-/// This structure allows us to handle data copied from VTL0 without explicit memory mapping.
+/// physical/virtual address ranges and their access permissions, this structure contain actual data in memory pages.
+/// This structure allows us to handle data copied from VTL0 without mapping them at VTL1 (e.g., for virtual-address-based page sorting).
 /// The memory mapping is faster than this data structure but it lets the adversaries guess or even control
 /// their target addresses. We could implement ASLR to mitigate this but ASLR is in general meaningless
 /// against local adversaries.
