@@ -483,7 +483,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         range: core::ops::Range<usize>,
         initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
         can_grow_down: bool,
-        populate_pages: bool,
+        populate_pages_immediately: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let range = PageRange::new(range.start, range.end)
             .ok_or(litebox::platform::page_mgmt::AllocationError::Unaligned)?;
@@ -494,7 +494,9 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
                 0
             };
         let flags = litebox::mm::linux::VmFlags::from_bits(flags).unwrap();
-        Ok(self.page_table.map_pages(range, flags, populate_pages))
+        Ok(self
+            .page_table
+            .map_pages(range, flags, populate_pages_immediately))
     }
 
     unsafe fn deallocate_pages(

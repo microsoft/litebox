@@ -4,7 +4,7 @@ use crate::{
     debug_serial_print, debug_serial_println,
     host::{
         bootparam::{get_num_possible_cpus, get_vtl1_memory_info},
-        linux::CpuMask,
+        linux::{CpuMask, KSYM_NAME_LEN, KernelSymbol},
     },
     kernel_context::{get_core_id, get_per_core_kernel_context},
     mshv::{
@@ -23,8 +23,8 @@ use crate::{
         VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE, VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags,
         X86Cr4Flags,
         heki::{
-            HekiKdataType, HekiPage, MemAttr, ModMemType, mem_attr_to_hv_page_prot_flags,
-            mod_mem_type_to_mem_attr,
+            HekiKdataType, HekiKinfo, HekiPage, MemAttr, ModMemType,
+            mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr,
         },
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
@@ -33,13 +33,15 @@ use crate::{
     },
     serial_println,
 };
-use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, string::String, vec, vec::Vec};
+use core::ffi::{CStr, c_char};
 use core::sync::atomic::{AtomicI64, Ordering};
 use litebox_common_linux::errno::Errno;
+use memoffset::offset_of;
 use num_enum::TryFromPrimitive;
 use x86_64::{
     PhysAddr, VirtAddr,
-    structures::paging::{PhysFrame, Size4KiB, frame::PhysFrameRange},
+    structures::paging::{PageOffset, PhysFrame, Size4KiB, frame::PhysFrameRange},
 };
 
 /// VTL call parameters (param[0]: function ID, param[1-3]: parameters)
@@ -317,6 +319,9 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
         return Err(Errno::EINVAL);
     }
 
+    let mut kernel_info_mem = MemoryMapWithContent::new();
+    let mut kernel_data_mem = MemoryMapWithContent::new();
+
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         for heki_page in heki_pages {
             for i in 0..usize::try_from(heki_page.nranges).unwrap_or(0) {
@@ -335,17 +340,118 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
                     kdata_type,
                     epa - pa
                 );
+
+                match kdata_type {
+                    HekiKdataType::KernelInfo => {
+                        if kernel_info_mem
+                            .write_vtl0_phys_bytes(
+                                x86_64::VirtAddr::new(va),
+                                x86_64::PhysAddr::new(pa),
+                                x86_64::PhysAddr::new(epa),
+                            )
+                            .is_err()
+                        {
+                            serial_println!("VSM: Failed to get VTL0 kernel info at {:#x}", pa);
+                            return Err(Errno::EINVAL);
+                        }
+                    }
+                    HekiKdataType::KernelData => {
+                        if kernel_data_mem
+                            .write_vtl0_phys_bytes(
+                                x86_64::VirtAddr::new(va),
+                                x86_64::PhysAddr::new(pa),
+                                x86_64::PhysAddr::new(epa),
+                            )
+                            .is_err()
+                        {
+                            serial_println!("VSM: Failed to get VTL0 kernel data at {:#x}", pa);
+                            return Err(Errno::EINVAL);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
-        Ok(0)
     } else {
-        Err(Errno::EINVAL)
+        return Err(Errno::EINVAL);
+    }
+
+    let mut ksymtab_map: BTreeMap<String, u64> = BTreeMap::new();
+    let mut ksymtab_gpl_map: BTreeMap<String, u64> = BTreeMap::new();
+
+    if let Some(kernel_info) =
+        kernel_info_mem.read_value::<HekiKinfo>(kernel_info_mem.start().unwrap())
+    {
+        construct_kernel_symbol_map(
+            kernel_info.ksymtab_start as u64,
+            kernel_info.ksymtab_end as u64,
+            &kernel_data_mem,
+            &mut ksymtab_map,
+        );
+
+        construct_kernel_symbol_map(
+            kernel_info.ksymtab_gpl_start as u64,
+            kernel_info.ksymtab_gpl_end as u64,
+            &kernel_data_mem,
+            &mut ksymtab_gpl_map,
+        );
+
+        debug_serial_println!("ksymtab_map: {:#x?}", ksymtab_map);
     }
 
     // TODO: create trusted keys
     // TODO: create blocklist keys
     // TODO: save blocklist hashes
-    // TODO: get kernel info (i.e., kernel symbols)
+
+    Ok(0)
+}
+
+fn construct_kernel_symbol_map(
+    ksymtab_start: u64,
+    ksymtab_end: u64,
+    kernel_data_mem: &MemoryMapWithContent,
+    ksymtab_map: &mut BTreeMap<String, u64>,
+) {
+    let mut current = ksymtab_start;
+    while current < ksymtab_end {
+        let value_offset = kernel_data_mem
+            .read_value::<i32>(x86_64::VirtAddr::new(
+                current + u64::try_from(offset_of!(KernelSymbol, value_offset)).unwrap(),
+            ))
+            .unwrap();
+        let name_offset = kernel_data_mem
+            .read_value::<i32>(x86_64::VirtAddr::new(
+                current + u64::try_from(offset_of!(KernelSymbol, name_offset)).unwrap(),
+            ))
+            .unwrap();
+
+        #[allow(clippy::cast_possible_truncation)]
+        #[allow(clippy::cast_possible_wrap)]
+        #[allow(clippy::cast_sign_loss)]
+        let value_addr = (current as isize)
+            .wrapping_add(offset_of!(KernelSymbol, value_offset) as isize)
+            .wrapping_add(value_offset as isize) as u64;
+
+        #[allow(clippy::cast_possible_truncation)]
+        #[allow(clippy::cast_possible_wrap)]
+        #[allow(clippy::cast_sign_loss)]
+        let name_addr = (current as isize)
+            .wrapping_add(offset_of!(KernelSymbol, name_offset) as isize)
+            .wrapping_add(name_offset as isize) as u64;
+
+        let mut buf = [0u8; KSYM_NAME_LEN];
+        kernel_data_mem
+            .read_bytes(x86_64::VirtAddr::new(name_addr), &mut buf)
+            .unwrap();
+        if let Some(name) = unsafe { CStr::from_ptr(buf.as_ptr().cast::<c_char>()).to_str().ok() } {
+            ksymtab_map.insert(String::from(name), value_addr);
+        }
+
+        // unclear whether we need the `namespace` field to suppor the relocation.
+        // We can deal with it later if needed.
+
+        current += core::mem::size_of::<KernelSymbol>() as u64;
+    }
 }
 
 /// VSM function for validating a guest kernel module and applying specified protection to its memory ranges after validation.
@@ -366,6 +472,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
 
     // collect and maintain the memory ranges of a module locally until the module is validated and registered in the global map
     let mut module_memory = ModuleMemory::new();
+    let mut kernel_module_mem = MemoryMapWithContent::new();
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         for heki_page in heki_pages {
@@ -380,7 +487,21 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                         serial_println!("VSM: Invalid module memory type");
                         return Err(Errno::EINVAL);
                     }
-                    ModMemType::ElfBuffer => { // TODO: store the ElfBuffer in a local data structure for validation.
+                    ModMemType::ElfBuffer => {
+                        if kernel_module_mem
+                            .write_vtl0_phys_bytes(
+                                x86_64::VirtAddr::new(va),
+                                x86_64::PhysAddr::new(pa),
+                                x86_64::PhysAddr::new(epa),
+                            )
+                            .is_err()
+                        {
+                            serial_println!(
+                                "VSM: Failed to get VTL0 kernel module memory at {:#x}",
+                                pa
+                            );
+                            return Err(Errno::EINVAL);
+                        }
                     }
                     _ => {
                         // if input memory range's type is neither `Unknown` nor `ElfBuffer`, its addresses must be page-aligned
@@ -389,6 +510,21 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                             || !epa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap())
                         {
                             serial_println!("VSM: input address must be page-aligned");
+                            return Err(Errno::EINVAL);
+                        }
+
+                        if kernel_module_mem
+                            .write_vtl0_phys_bytes(
+                                x86_64::VirtAddr::new(va),
+                                x86_64::PhysAddr::new(pa),
+                                x86_64::PhysAddr::new(epa),
+                            )
+                            .is_err()
+                        {
+                            serial_println!(
+                                "VSM: Failed to get VTL0 kernel module memory at {:#x}",
+                                pa
+                            );
                             return Err(Errno::EINVAL);
                         }
 
@@ -794,4 +930,211 @@ fn protect_physical_memory_range(
             .map_err(|_| Errno::EFAULT)?;
     }
     Ok(())
+}
+
+/// Data structure for abstracting addressable paged memory. Unlike `ModuleMemoryMap` which maintains
+/// physical/virtual address ranges and their access permissions, this strucure contain actual data in memory pages.
+/// This structure allows us to handle data copied from VTL0 without explicit memory mapping.
+/// The memory mapping is faster than this data structure but it lets the adversaries guess or even control
+/// their target addresses. We could implement ASLR to mitigate this but ASLR is in general meaningless
+/// against local adversaries.
+pub struct MemoryMapWithContent {
+    pages: BTreeMap<x86_64::VirtAddr, Box<[u8; PAGE_SIZE]>>,
+    start: Option<x86_64::VirtAddr>,
+    end: Option<x86_64::VirtAddr>,
+}
+
+impl MemoryMapWithContent {
+    pub fn new() -> Self {
+        Self {
+            pages: BTreeMap::new(),
+            start: None,
+            end: None,
+        }
+    }
+
+    pub fn start(&self) -> Option<x86_64::VirtAddr> {
+        self.start
+    }
+
+    #[expect(dead_code)]
+    pub fn end(&self) -> Option<x86_64::VirtAddr> {
+        self.end
+    }
+
+    fn set_start(&mut self, addr: x86_64::VirtAddr) {
+        if self.start.is_none() {
+            self.start = Some(addr);
+        } else {
+            self.start = Some(core::cmp::min(self.start.unwrap(), addr));
+        }
+    }
+
+    fn set_end(&mut self, addr: x86_64::VirtAddr) {
+        if self.end.is_none() {
+            self.end = Some(addr);
+        } else {
+            self.end = Some(core::cmp::max(self.end.unwrap(), addr));
+        }
+    }
+
+    pub fn get_or_alloc_page(&mut self, addr: x86_64::VirtAddr) -> &mut Box<[u8; PAGE_SIZE]> {
+        let page_base = addr.align_down(u64::try_from(PAGE_SIZE).unwrap_or(4096));
+        self.pages
+            .entry(page_base)
+            .or_insert_with(|| Box::new([0; PAGE_SIZE]))
+    }
+
+    #[expect(dead_code)]
+    pub fn write_byte(&mut self, addr: x86_64::VirtAddr, value: u8) {
+        let page_offset: usize = addr.page_offset().into();
+        self.get_or_alloc_page(addr)[page_offset] = value;
+
+        self.set_start(addr);
+        self.set_end(addr + 1);
+    }
+
+    pub fn write_vtl0_phys_bytes(
+        &mut self,
+        addr: x86_64::VirtAddr,
+        phys_start: x86_64::PhysAddr,
+        phys_end: x86_64::PhysAddr,
+    ) -> Result<(), ()> {
+        let mut phys_cur = phys_start;
+        while phys_cur < phys_end {
+            if let Some(data) =
+                unsafe { crate::platform_low().copy_from_vtl0_phys::<[u8; PAGE_SIZE]>(phys_cur) }
+            {
+                let to_write = if phys_cur + u64::try_from(PAGE_SIZE).unwrap() < phys_end {
+                    PAGE_SIZE
+                } else {
+                    usize::try_from(phys_end - phys_cur).unwrap()
+                };
+
+                self.write_bytes(addr + (phys_cur - phys_start), &data[..to_write])?;
+                phys_cur += u64::try_from(to_write).unwrap();
+            } else {
+                return Err(());
+            }
+        }
+
+        self.set_start(addr);
+        self.set_end(addr + (phys_end - phys_start));
+        Ok(())
+    }
+
+    #[expect(dead_code)]
+    pub fn read_byte(&self, addr: x86_64::VirtAddr) -> Option<u8> {
+        let page_base = addr.align_down(u64::try_from(PAGE_SIZE).unwrap_or(4096));
+        let page_offset: usize = addr.page_offset().into();
+        self.pages.get(&page_base).map(|page| page[page_offset])
+    }
+
+    pub fn preallocate_pages(&mut self, start: x86_64::VirtAddr, end: x86_64::VirtAddr) {
+        let start_page = start.align_down(u64::try_from(PAGE_SIZE).unwrap_or(4096));
+        let end_page = end.align_up(u64::try_from(PAGE_SIZE).unwrap_or(4096));
+
+        let mut page_addr = start_page;
+        while page_addr < end_page {
+            let _ = self.get_or_alloc_page(page_addr);
+            page_addr += u64::try_from(PAGE_SIZE).unwrap_or(4096);
+        }
+    }
+
+    pub fn write_bytes(&mut self, addr: x86_64::VirtAddr, data: &[u8]) -> Result<(), ()> {
+        self.preallocate_pages(addr, addr + data.len() as u64);
+
+        let start = addr;
+        let end = addr + data.len() as u64;
+
+        let mut num_bytes = 0;
+
+        for (&page_addr, page) in self.pages.range_mut(
+            start.align_down(u64::try_from(PAGE_SIZE).unwrap_or(4096))
+                ..end.align_up(u64::try_from(PAGE_SIZE).unwrap_or(4096)),
+        ) {
+            let page_start = page_addr;
+            let page_end = page_addr + u64::try_from(PAGE_SIZE).unwrap_or(4096);
+
+            let copy_start = core::cmp::max(start, page_start);
+            let copy_end = core::cmp::min(end, page_end);
+
+            let len = usize::try_from(copy_end - copy_start).unwrap_or(0);
+            if len == 0 {
+                break;
+            }
+
+            let page_offset: usize =
+                PageOffset::new_truncate(u16::try_from(copy_start - page_start).unwrap_or(0))
+                    .into();
+
+            let data_offset = usize::try_from(copy_start - start).expect("data offset error");
+
+            page[page_offset..page_offset + len]
+                .copy_from_slice(&data[data_offset..data_offset + len]);
+
+            num_bytes += len;
+        }
+
+        if num_bytes == data.len() {
+            self.set_start(start);
+            self.set_end(end);
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    pub fn read_value<T: Copy>(&self, addr: x86_64::VirtAddr) -> Option<T> {
+        let mut buf = vec![0u8; core::mem::size_of::<T>()];
+        if self.read_bytes(addr, &mut buf).is_err() {
+            return None;
+        }
+
+        let mut value = core::mem::MaybeUninit::<T>::uninit();
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf.as_ptr().cast::<T>(), value.as_mut_ptr(), 1);
+            Some(value.assume_init())
+        }
+    }
+
+    pub fn read_bytes(&self, addr: x86_64::VirtAddr, buf: &mut [u8]) -> Result<(), ()> {
+        let start = addr;
+        let end = addr + buf.len() as u64;
+
+        let mut num_bytes = 0;
+
+        for (&page_addr, page) in self.pages.range(
+            start.align_down(u64::try_from(PAGE_SIZE).unwrap_or(4096))
+                ..end.align_up(u64::try_from(PAGE_SIZE).unwrap_or(4096)),
+        ) {
+            let page_start = page_addr;
+            let page_end = page_addr + u64::try_from(PAGE_SIZE).unwrap_or(4096);
+
+            let copy_start = core::cmp::max(start, page_start);
+            let copy_end = core::cmp::min(end, page_end);
+
+            let len = usize::try_from(copy_end - copy_start).unwrap_or(0);
+            if len == 0 {
+                break;
+            }
+
+            let page_offset: usize =
+                PageOffset::new_truncate(u16::try_from(copy_start - page_start).unwrap_or(0))
+                    .into();
+
+            let buf_offset = usize::try_from(copy_start - start).expect("buffer offset error");
+
+            buf[buf_offset..buf_offset + len]
+                .copy_from_slice(&page[page_offset..page_offset + len]);
+
+            num_bytes += len;
+        }
+
+        if num_bytes == buf.len() {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
 }
