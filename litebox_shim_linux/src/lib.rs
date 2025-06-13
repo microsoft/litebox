@@ -14,7 +14,6 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use litebox_common_linux::IoctlArg;
 // TODO(jayb) Replace out all uses of once_cell and such with our own implementation that uses
 // platform-specific things within it.
 use once_cell::race::OnceBox;
@@ -25,9 +24,8 @@ use litebox::{
     mm::{PageManager, linux::PAGE_SIZE},
     platform::{ExitProvider as _, RawConstPointer as _, RawMutPointer as _},
     sync::RwLock,
-    utils::{ReinterpretSignedExt, TruncateExt as _},
 };
-use litebox_common_linux::{ArchPrctlArg, ArchPrctlCode, SyscallRequest, errno::Errno};
+use litebox_common_linux::{SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
 use syscalls::net::sys_setsockopt;
 
@@ -284,6 +282,14 @@ const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 #[allow(clippy::too_many_lines)]
 fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
     let res: Result<usize, Errno> = match request {
+        SyscallRequest::Ret(errno) => Err(errno),
+        SyscallRequest::Exit { status } => {
+            // XXX: Currently, this terminates the entire process rather than a single thread. See
+            // https://github.com/MSRSSP/litebox/pull/138#issuecomment-2946597758 for how
+            // `ThreadProvider` will provide an interface that can be used at this point.
+            litebox_platform_multiplex::platform().exit(status)
+        }
+        SyscallRequest::ExitGroup { status } => litebox_platform_multiplex::platform().exit(status),
         SyscallRequest::Read { fd, buf, count } => {
             // Note some applications (e.g., `node`) seem to assume that getting fewer bytes than
             // requested indicates EOF.
@@ -544,20 +550,6 @@ fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
     )
 }
 
-fn to_ioctl_arg(cmd: u32, arg: usize) -> IoctlArg<litebox_platform_multiplex::Platform> {
-    match cmd {
-        litebox_common_linux::TCGETS => IoctlArg::TCGETS(MutPtr::from_usize(arg)),
-        litebox_common_linux::TCSETS => IoctlArg::TCSETS(ConstPtr::from_usize(arg)),
-        litebox_common_linux::TIOCGWINSZ => IoctlArg::TIOCGWINSZ(MutPtr::from_usize(arg)),
-        litebox_common_linux::TIOCGPTN => IoctlArg::TIOCGPTN(MutPtr::from_usize(arg)),
-        litebox_common_linux::FIONBIO => IoctlArg::FIONBIO(ConstPtr::from_usize(arg)),
-        _ => IoctlArg::Raw {
-            cmd,
-            arg: MutPtr::from_usize(arg),
-        },
-    }
-}
-
 /// Handles Linux syscalls and dispatches them to LiteBox implementations.
 ///
 /// # Safety
@@ -568,380 +560,13 @@ fn to_ioctl_arg(cmd: u32, arg: usize) -> IoctlArg<litebox_platform_multiplex::Pl
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-#[allow(clippy::too_many_lines)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) -> isize {
-    let syscall_args = unsafe { core::slice::from_raw_parts(args, 6) };
-    let Ok(syscall_number) = u32::try_from(syscall_number) else {
-        return Errno::ENOSYS.as_neg() as isize;
-    };
-    let sysno = ::syscalls::Sysno::from(syscall_number);
-    let dispatcher = match sysno {
-        ::syscalls::Sysno::read => SyscallRequest::Read {
-            fd: syscall_args[0].reinterpret_as_signed().truncate(),
-            buf: MutPtr::from_usize(syscall_args[1]),
-            count: syscall_args[2],
-        },
-        ::syscalls::Sysno::write => SyscallRequest::Write {
-            fd: syscall_args[0].reinterpret_as_signed().truncate(),
-            buf: ConstPtr::from_usize(syscall_args[1]),
-            count: syscall_args[2],
-        },
-        ::syscalls::Sysno::close => SyscallRequest::Close {
-            fd: syscall_args[0].reinterpret_as_signed().truncate(),
-        },
-        ::syscalls::Sysno::stat => SyscallRequest::Stat {
-            pathname: ConstPtr::from_usize(syscall_args[0]),
-            buf: MutPtr::from_usize(syscall_args[1]),
-        },
-        ::syscalls::Sysno::fstat => SyscallRequest::Fstat {
-            fd: syscall_args[0].reinterpret_as_signed().truncate(),
-            buf: MutPtr::from_usize(syscall_args[1]),
-        },
-        ::syscalls::Sysno::lstat => SyscallRequest::Lstat {
-            pathname: ConstPtr::from_usize(syscall_args[0]),
-            buf: MutPtr::from_usize(syscall_args[1]),
-        },
-        #[cfg(target_arch = "x86_64")]
-        ::syscalls::Sysno::mmap => SyscallRequest::Mmap {
-            addr: syscall_args[0],
-            length: syscall_args[1],
-            prot: litebox_common_linux::ProtFlags::from_bits_truncate(
-                syscall_args[2].reinterpret_as_signed().truncate(),
-            ),
-            flags: litebox_common_linux::MapFlags::from_bits_truncate(
-                syscall_args[3].reinterpret_as_signed().truncate(),
-            ),
-            fd: syscall_args[4].reinterpret_as_signed().truncate(),
-            offset: syscall_args[5],
-        },
-        #[cfg(target_arch = "x86")]
-        ::syscalls::Sysno::mmap2 => SyscallRequest::Mmap {
-            addr: syscall_args[0],
-            length: syscall_args[1],
-            prot: litebox_common_linux::ProtFlags::from_bits_truncate(
-                syscall_args[2].reinterpret_as_signed().truncate(),
-            ),
-            flags: litebox_common_linux::MapFlags::from_bits_truncate(
-                syscall_args[3].reinterpret_as_signed().truncate(),
-            ),
-            fd: syscall_args[4].reinterpret_as_signed().truncate(),
-            offset: syscall_args[5],
-        },
-        ::syscalls::Sysno::mprotect => SyscallRequest::Mprotect {
-            addr: MutPtr::from_usize(syscall_args[0]),
-            length: syscall_args[1],
-            prot: litebox_common_linux::ProtFlags::from_bits_truncate(
-                syscall_args[2].reinterpret_as_signed().truncate(),
-            ),
-        },
-        ::syscalls::Sysno::munmap => SyscallRequest::Munmap {
-            addr: MutPtr::from_usize(syscall_args[0]),
-            length: syscall_args[1],
-        },
-        ::syscalls::Sysno::brk => SyscallRequest::Brk {
-            addr: MutPtr::from_usize(syscall_args[0]),
-        },
-        ::syscalls::Sysno::mremap => SyscallRequest::Mremap {
-            old_addr: MutPtr::from_usize(syscall_args[0]),
-            old_size: syscall_args[1],
-            new_size: syscall_args[2],
-            flags: litebox_common_linux::MRemapFlags::from_bits_truncate(
-                syscall_args[3].truncate(),
-            ),
-            new_addr: syscall_args[4],
-        },
-        ::syscalls::Sysno::rt_sigprocmask => {
-            let how: i32 = syscall_args[0].reinterpret_as_signed().truncate();
-            if let Ok(how) = litebox_common_linux::SigmaskHow::try_from(how) {
-                SyscallRequest::RtSigprocmask {
-                    how,
-                    set: if syscall_args[1] == 0 {
-                        None
-                    } else {
-                        Some(ConstPtr::from_usize(syscall_args[1]))
-                    },
-                    oldset: if syscall_args[2] == 0 {
-                        None
-                    } else {
-                        Some(MutPtr::from_usize(syscall_args[2]))
-                    },
-                    sigsetsize: syscall_args[3],
-                }
-            } else {
-                SyscallRequest::Ret(Errno::EINVAL)
-            }
-        }
-        ::syscalls::Sysno::rt_sigaction => {
-            let signum: i32 = syscall_args[0].reinterpret_as_signed().truncate();
-            if let Ok(signum) = litebox_common_linux::Signal::try_from(signum) {
-                SyscallRequest::RtSigaction {
-                    signum,
-                    act: if syscall_args[1] == 0 {
-                        None
-                    } else {
-                        Some(ConstPtr::from_usize(syscall_args[1]))
-                    },
-                    oldact: if syscall_args[2] == 0 {
-                        None
-                    } else {
-                        Some(MutPtr::from_usize(syscall_args[2]))
-                    },
-                    sigsetsize: syscall_args[3],
-                }
-            } else {
-                SyscallRequest::Ret(Errno::EINVAL)
-            }
-        }
-        ::syscalls::Sysno::ioctl => SyscallRequest::Ioctl {
-            fd: syscall_args[0].reinterpret_as_signed().truncate(),
-            arg: to_ioctl_arg(syscall_args[1].truncate(), syscall_args[2]),
-        },
-        #[cfg(target_arch = "x86_64")]
-        ::syscalls::Sysno::pread64 => SyscallRequest::Pread64 {
-            fd: syscall_args[0].reinterpret_as_signed().truncate(),
-            buf: MutPtr::from_usize(syscall_args[1]),
-            count: syscall_args[2],
-            offset: syscall_args[3].reinterpret_as_signed() as i64,
-        },
-        #[cfg(target_arch = "x86")]
-        ::syscalls::Sysno::pread64 => SyscallRequest::Pread64 {
-            fd: syscall_args[0].reinterpret_as_signed().truncate(),
-            buf: MutPtr::from_usize(syscall_args[1]),
-            count: syscall_args[2],
-            offset: syscall_args[3].reinterpret_as_signed() as i64
-                | ((syscall_args[4].reinterpret_as_signed() as i64) << 32),
-        },
-        ::syscalls::Sysno::readv => SyscallRequest::Readv {
-            fd: syscall_args[0].reinterpret_as_signed().truncate(),
-            iovec: ConstPtr::from_usize(syscall_args[1]),
-            iovcnt: syscall_args[2],
-        },
-        ::syscalls::Sysno::writev => SyscallRequest::Writev {
-            fd: syscall_args[0].reinterpret_as_signed().truncate(),
-            iovec: ConstPtr::from_usize(syscall_args[1]),
-            iovcnt: syscall_args[2],
-        },
-        ::syscalls::Sysno::access => SyscallRequest::Access {
-            pathname: ConstPtr::from_usize(syscall_args[0]),
-            mode: litebox_common_linux::AccessFlags::from_bits_truncate(
-                syscall_args[1].reinterpret_as_signed().truncate(),
-            ),
-        },
-        ::syscalls::Sysno::pipe => SyscallRequest::Pipe2 {
-            pipefd: MutPtr::from_usize(syscall_args[0]),
-            flags: litebox::fs::OFlags::empty(),
-        },
-        ::syscalls::Sysno::pipe2 => SyscallRequest::Pipe2 {
-            pipefd: MutPtr::from_usize(syscall_args[0]),
-            flags: litebox::fs::OFlags::from_bits_truncate(syscall_args[1].truncate()),
-        },
-        ::syscalls::Sysno::dup => SyscallRequest::Dup {
-            oldfd: syscall_args[0].reinterpret_as_signed().truncate(),
-            newfd: None,
-            flags: None,
-        },
-        ::syscalls::Sysno::dup2 => SyscallRequest::Dup {
-            oldfd: syscall_args[0].reinterpret_as_signed().truncate(),
-            newfd: Some(syscall_args[1].reinterpret_as_signed().truncate()),
-            flags: None,
-        },
-        ::syscalls::Sysno::dup3 => SyscallRequest::Dup {
-            oldfd: syscall_args[0].reinterpret_as_signed().truncate(),
-            newfd: Some(syscall_args[1].reinterpret_as_signed().truncate()),
-            flags: Some(litebox::fs::OFlags::from_bits_truncate(
-                syscall_args[2].truncate(),
-            )),
-        },
-        ::syscalls::Sysno::socket => {
-            let domain: u32 = syscall_args[0].truncate();
-            let type_and_flags: u32 = syscall_args[1].truncate();
-            SyscallRequest::Socket {
-                domain: litebox_common_linux::AddressFamily::try_from(domain)
-                    .expect("Invalid domain"),
-                ty: litebox_common_linux::SockType::try_from(type_and_flags & 0x0f)
-                    .expect("Invalid sock type"),
-                flags: litebox_common_linux::SockFlags::from_bits_truncate(type_and_flags & !0x0f),
-                protocol: if syscall_args[2] == 0 {
-                    None
-                } else {
-                    let protocol: u8 = syscall_args[2].truncate();
-                    Some(
-                        litebox_common_linux::Protocol::try_from(protocol)
-                            .expect("Invalid protocol"),
-                    )
-                },
-            }
-        }
-        ::syscalls::Sysno::connect => SyscallRequest::Connect {
-            sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
-            sockaddr: ConstPtr::from_usize(syscall_args[1]),
-            addrlen: syscall_args[2],
-        },
-        #[cfg(target_arch = "x86_64")]
-        ::syscalls::Sysno::accept => SyscallRequest::Accept {
-            sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
-            addr: if syscall_args[1] == 0 {
-                None
-            } else {
-                Some(MutPtr::from_usize(syscall_args[1]))
-            },
-            addrlen: if syscall_args[2] == 0 {
-                None
-            } else {
-                Some(MutPtr::from_usize(syscall_args[2]))
-            },
-            flags: litebox_common_linux::SockFlags::empty(),
-        },
-        ::syscalls::Sysno::accept4 => SyscallRequest::Accept {
-            sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
-            addr: if syscall_args[1] == 0 {
-                None
-            } else {
-                Some(MutPtr::from_usize(syscall_args[1]))
-            },
-            addrlen: if syscall_args[2] == 0 {
-                None
-            } else {
-                Some(MutPtr::from_usize(syscall_args[2]))
-            },
-            flags: litebox_common_linux::SockFlags::from_bits_truncate(syscall_args[3].truncate()),
-        },
-        ::syscalls::Sysno::sendto => SyscallRequest::Sendto {
-            sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
-            buf: ConstPtr::from_usize(syscall_args[1]),
-            len: syscall_args[2],
-            flags: litebox::net::SendFlags::from_bits_truncate(syscall_args[3].truncate()),
-            addr: if syscall_args[4] == 0 {
-                None
-            } else {
-                Some(ConstPtr::from_usize(syscall_args[4]))
-            },
-            addrlen: syscall_args[5].truncate(),
-        },
-        ::syscalls::Sysno::recvfrom => SyscallRequest::Recvfrom {
-            sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
-            buf: MutPtr::from_usize(syscall_args[1]),
-            len: syscall_args[2],
-            flags: litebox::net::ReceiveFlags::from_bits_truncate(syscall_args[3].truncate()),
-            addr: if syscall_args[4] == 0 {
-                None
-            } else {
-                Some(MutPtr::from_usize(syscall_args[4]))
-            },
-            addrlen: if syscall_args[5] == 0 {
-                None
-            } else {
-                Some(MutPtr::from_usize(syscall_args[5]))
-            },
-        },
-        ::syscalls::Sysno::bind => SyscallRequest::Bind {
-            sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
-            sockaddr: ConstPtr::from_usize(syscall_args[1]),
-            addrlen: syscall_args[2],
-        },
-        ::syscalls::Sysno::listen => SyscallRequest::Listen {
-            sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
-            backlog: syscall_args[1].truncate(),
-        },
-        ::syscalls::Sysno::setsockopt => {
-            let optname = litebox_common_linux::SocketOptionName::from(
-                syscall_args[1].truncate(),
-                syscall_args[2].truncate(),
-            );
-            if let Some(optname) = optname {
-                SyscallRequest::Setsockopt {
-                    sockfd: syscall_args[0].reinterpret_as_signed().truncate(),
-                    optname,
-                    optval: ConstPtr::from_usize(syscall_args[3]),
-                    optlen: syscall_args[4],
-                }
-            } else {
-                SyscallRequest::Ret(Errno::EINVAL)
-            }
-        }
-        ::syscalls::Sysno::exit | ::syscalls::Sysno::exit_group => {
-            litebox_platform_multiplex::platform()
-                .exit(syscall_args[0].reinterpret_as_signed().truncate())
-        }
-        ::syscalls::Sysno::fcntl => SyscallRequest::Fcntl {
-            fd: syscall_args[0].reinterpret_as_signed().truncate(),
-            arg: litebox_common_linux::FcntlArg::from(
-                syscall_args[1].reinterpret_as_signed().truncate(),
-                syscall_args[2],
-            ),
-        },
-        ::syscalls::Sysno::getcwd => SyscallRequest::Getcwd {
-            buf: MutPtr::from_usize(syscall_args[0]),
-            size: syscall_args[1],
-        },
-        ::syscalls::Sysno::readlink => SyscallRequest::Readlink {
-            pathname: ConstPtr::from_usize(syscall_args[0]),
-            buf: MutPtr::from_usize(syscall_args[1]),
-            bufsiz: syscall_args[2],
-        },
-        ::syscalls::Sysno::readlinkat => SyscallRequest::Readlinkat {
-            dirfd: syscall_args[0].reinterpret_as_signed().truncate(),
-            pathname: ConstPtr::from_usize(syscall_args[1]),
-            buf: MutPtr::from_usize(syscall_args[2]),
-            bufsiz: syscall_args[3],
-        },
-        ::syscalls::Sysno::arch_prctl => {
-            let code: u32 = syscall_args[0].truncate();
-            if let Ok(code) = ArchPrctlCode::try_from(code) {
-                let arg = match code {
-                    #[cfg(target_arch = "x86_64")]
-                    ArchPrctlCode::SetFs => {
-                        ArchPrctlArg::SetFs(ConstPtr::from_usize(syscall_args[1]))
-                    }
-                    #[cfg(target_arch = "x86_64")]
-                    ArchPrctlCode::GetFs => {
-                        ArchPrctlArg::GetFs(MutPtr::from_usize(syscall_args[1]))
-                    }
-                    ArchPrctlCode::CETStatus => ArchPrctlArg::CETStatus,
-                    ArchPrctlCode::CETDisable => ArchPrctlArg::CETDisable,
-                    ArchPrctlCode::CETLock => ArchPrctlArg::CETLock,
-                    _ => todo!("Unsupported arch_prctl syscall: {code:?}"),
-                };
-                SyscallRequest::ArchPrctl { arg }
-            } else {
-                todo!("Unsupported arch_prctl syscall: {syscall_args:?}")
-            }
-        }
-        ::syscalls::Sysno::set_thread_area => SyscallRequest::SetThreadArea {
-            user_desc: MutPtr::from_usize(syscall_args[0]),
-        },
-        ::syscalls::Sysno::openat => SyscallRequest::Openat {
-            dirfd: syscall_args[0].reinterpret_as_signed().truncate(),
-            pathname: ConstPtr::from_usize(syscall_args[1]),
-            flags: litebox::fs::OFlags::from_bits_truncate(syscall_args[2].truncate()),
-            mode: litebox::fs::Mode::from_bits_truncate(syscall_args[3].truncate()),
-        },
-        #[cfg(target_arch = "x86_64")]
-        ::syscalls::Sysno::newfstatat => SyscallRequest::Newfstatat {
-            dirfd: syscall_args[0].reinterpret_as_signed().truncate(),
-            pathname: ConstPtr::from_usize(syscall_args[1]),
-            buf: MutPtr::from_usize(syscall_args[2]),
-            flags: litebox_common_linux::AtFlags::from_bits_truncate(
-                syscall_args[3].reinterpret_as_signed().truncate(),
-            ),
-        },
-        ::syscalls::Sysno::eventfd => SyscallRequest::Eventfd2 {
-            initval: syscall_args[0].truncate(),
-            flags: litebox_common_linux::EfdFlags::empty(),
-        },
-        ::syscalls::Sysno::eventfd2 => SyscallRequest::Eventfd2 {
-            initval: syscall_args[0].truncate(),
-            flags: litebox_common_linux::EfdFlags::from_bits_truncate(syscall_args[1].truncate()),
-        },
-        ::syscalls::Sysno::statx | ::syscalls::Sysno::io_uring_setup | ::syscalls::Sysno::rseq => {
-            SyscallRequest::Ret(Errno::ENOSYS)
-        }
-        _ => todo!("syscall {sysno} not implemented"),
-    };
-    if let SyscallRequest::Ret(err) = dispatcher {
-        err.as_neg() as isize
-    } else {
-        syscall_entry(dispatcher)
+    let syscall_args: &[usize; 6] = unsafe { core::slice::from_raw_parts(args, 6) }
+        .try_into()
+        .unwrap();
+    match SyscallRequest::try_from_raw(syscall_number, syscall_args) {
+        Ok(d) => syscall_entry(d),
+        Err(err) => err.as_neg() as isize,
     }
 }
