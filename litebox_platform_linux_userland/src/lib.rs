@@ -149,7 +149,7 @@ impl LinuxUserland {
             }
             total_read += n;
         }
-        assert!(total_read != buf.len(), "buffer too small");
+        assert!(total_read < buf.len(), "buffer too small");
 
         let mut reserved_pages = alloc::vec::Vec::new();
         let s = core::str::from_utf8(&buf[..total_read]).expect("invalid UTF-8");
