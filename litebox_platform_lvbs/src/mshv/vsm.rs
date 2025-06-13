@@ -34,11 +34,15 @@ use crate::{
     serial_println,
 };
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec, vec::Vec};
-use core::ffi::{CStr, c_char};
-use core::sync::atomic::{AtomicI64, Ordering};
+use core::{
+    ffi::{CStr, c_char},
+    ops::Range,
+    sync::atomic::{AtomicBool, AtomicI64, Ordering},
+};
 use litebox_common_linux::errno::Errno;
 use memoffset::offset_of;
 use num_enum::TryFromPrimitive;
+use once_cell::race::OnceBox;
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{PageOffset, PhysFrame, Size4KiB, frame::PhysFrameRange},
@@ -196,7 +200,7 @@ pub fn mshv_vsm_configure_partition() -> Result<i64, Errno> {
 pub fn mshv_vsm_lock_regs() -> Result<i64, Errno> {
     debug_serial_println!("VSM: Lock control registers");
 
-    if crate::platform_low().check_end_of_boot() {
+    if crate::platform_low().vtl0_kernel_info.check_end_of_boot() {
         serial_println!(
             "VSM: VTL0 is not allowed to change control register locking after the end of boot process"
         );
@@ -241,7 +245,7 @@ pub fn mshv_vsm_lock_regs() -> Result<i64, Errno> {
 /// VSM function for signaling the end of VTL0 boot process
 pub fn mshv_vsm_end_of_boot() -> i64 {
     debug_serial_println!("VSM: End of boot");
-    crate::platform_low().set_end_of_boot();
+    crate::platform_low().vtl0_kernel_info.set_end_of_boot();
     0
 }
 
@@ -253,7 +257,7 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, Errno> {
         return Err(Errno::EINVAL);
     }
 
-    if crate::platform_low().check_end_of_boot() {
+    if crate::platform_low().vtl0_kernel_info.check_end_of_boot() {
         serial_println!(
             "VSM: VTL0 is not allowed to change kernel memory protection after the end of boot process"
         );
@@ -312,15 +316,15 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
         return Err(Errno::EINVAL);
     }
 
-    if crate::platform_low().check_end_of_boot() {
+    if crate::platform_low().vtl0_kernel_info.check_end_of_boot() {
         serial_println!(
             "VSM: VTL0 is not allowed to load kernel data after the end of boot process"
         );
         return Err(Errno::EINVAL);
     }
 
-    let mut kernel_info_mem = MemoryMapWithContent::new();
-    let mut kernel_data_mem = MemoryMapWithContent::new();
+    let mut heki_kernel_info_mem = MemoryMapWithContent::new();
+    let mut heki_kernel_data_mem = MemoryMapWithContent::new();
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         for heki_page in heki_pages {
@@ -343,7 +347,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
 
                 match kdata_type {
                     HekiKdataType::KernelInfo => {
-                        if kernel_info_mem
+                        if heki_kernel_info_mem
                             .write_vtl0_phys_bytes(
                                 x86_64::VirtAddr::new(va),
                                 x86_64::PhysAddr::new(pa),
@@ -356,7 +360,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
                         }
                     }
                     HekiKdataType::KernelData => {
-                        if kernel_data_mem
+                        if heki_kernel_data_mem
                             .write_vtl0_phys_bytes(
                                 x86_64::VirtAddr::new(va),
                                 x86_64::PhysAddr::new(pa),
@@ -376,27 +380,31 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
         return Err(Errno::EINVAL);
     }
 
-    let mut ksymtab_map: BTreeMap<String, u64> = BTreeMap::new();
-    let mut ksymtab_gpl_map: BTreeMap<String, u64> = BTreeMap::new();
-
-    if let Some(kernel_info) =
-        kernel_info_mem.read_value::<HekiKinfo>(kernel_info_mem.start().unwrap())
+    if let Some(heki_kernel_info) =
+        heki_kernel_info_mem.read_value::<HekiKinfo>(heki_kernel_info_mem.start().unwrap())
     {
-        construct_kernel_symbol_map(
-            kernel_info.ksymtab_start as u64,
-            kernel_info.ksymtab_end as u64,
-            &kernel_data_mem,
-            &mut ksymtab_map,
-        );
+        crate::platform_low()
+            .vtl0_kernel_info
+            .populate_kernel_symbol_maps(
+                Range {
+                    start: VirtAddr::new(heki_kernel_info.ksymtab_start as u64),
+                    end: VirtAddr::new(heki_kernel_info.ksymtab_end as u64),
+                },
+                Range {
+                    start: VirtAddr::new(heki_kernel_info.ksymtab_gpl_start as u64),
+                    end: VirtAddr::new(heki_kernel_info.ksymtab_gpl_end as u64),
+                },
+                &heki_kernel_data_mem,
+            );
 
-        construct_kernel_symbol_map(
-            kernel_info.ksymtab_gpl_start as u64,
-            kernel_info.ksymtab_gpl_end as u64,
-            &kernel_data_mem,
-            &mut ksymtab_gpl_map,
+        debug_serial_println!(
+            "ksymtab: {:#x?}",
+            crate::platform_low()
+                .vtl0_kernel_info
+                .ksymtab
+                .get()
+                .unwrap()
         );
-
-        debug_serial_println!("ksymtab_map: {:#x?}", ksymtab_map);
     }
 
     // TODO: create trusted keys
@@ -404,54 +412,6 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
     // TODO: save blocklist hashes
 
     Ok(0)
-}
-
-fn construct_kernel_symbol_map(
-    ksymtab_start: u64,
-    ksymtab_end: u64,
-    kernel_data_mem: &MemoryMapWithContent,
-    ksymtab_map: &mut BTreeMap<String, u64>,
-) {
-    let mut current = ksymtab_start;
-    while current < ksymtab_end {
-        let value_offset = kernel_data_mem
-            .read_value::<i32>(x86_64::VirtAddr::new(
-                current + u64::try_from(offset_of!(KernelSymbol, value_offset)).unwrap(),
-            ))
-            .unwrap();
-        let name_offset = kernel_data_mem
-            .read_value::<i32>(x86_64::VirtAddr::new(
-                current + u64::try_from(offset_of!(KernelSymbol, name_offset)).unwrap(),
-            ))
-            .unwrap();
-
-        #[allow(clippy::cast_possible_truncation)]
-        #[allow(clippy::cast_possible_wrap)]
-        #[allow(clippy::cast_sign_loss)]
-        let value_addr = (current as isize)
-            .wrapping_add(offset_of!(KernelSymbol, value_offset) as isize)
-            .wrapping_add(value_offset as isize) as u64;
-
-        #[allow(clippy::cast_possible_truncation)]
-        #[allow(clippy::cast_possible_wrap)]
-        #[allow(clippy::cast_sign_loss)]
-        let name_addr = (current as isize)
-            .wrapping_add(offset_of!(KernelSymbol, name_offset) as isize)
-            .wrapping_add(name_offset as isize) as u64;
-
-        let mut buf = [0u8; KSYM_NAME_LEN];
-        kernel_data_mem
-            .read_bytes(x86_64::VirtAddr::new(name_addr), &mut buf)
-            .unwrap();
-        if let Some(name) = unsafe { CStr::from_ptr(buf.as_ptr().cast::<c_char>()).to_str().ok() } {
-            ksymtab_map.insert(String::from(name), value_addr);
-        }
-
-        // unclear whether we need the `namespace` field to suppor the relocation.
-        // We can deal with it later if needed.
-
-        current += core::mem::size_of::<KernelSymbol>() as u64;
-    }
 }
 
 /// VSM function for validating a guest kernel module and applying specified protection to its memory ranges after validation.
@@ -554,7 +514,8 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
 
     // register the module memory in the global map and obtain a unique token for it
     let token = crate::platform_low()
-        .vtl0_module_memory
+        .vtl0_kernel_info
+        .module_memory
         .register_module_memory(module_memory);
     Ok(token)
 }
@@ -566,12 +527,20 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
 pub fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, Errno> {
     debug_serial_println!("VSM: Free kernel module's init (token: {})", token);
 
-    if !crate::platform_low().vtl0_module_memory.contains_key(token) {
+    if !crate::platform_low()
+        .vtl0_kernel_info
+        .module_memory
+        .contains_key(token)
+    {
         serial_println!("VSM: invalid module token");
         return Err(Errno::EINVAL);
     }
 
-    if let Some(entry) = crate::platform_low().vtl0_module_memory.iter_entry(token) {
+    if let Some(entry) = crate::platform_low()
+        .vtl0_kernel_info
+        .module_memory
+        .iter_entry(token)
+    {
         for mod_mem_range in entry.iter_mem_ranges() {
             match mod_mem_range.mod_mem_type {
                 ModMemType::InitText | ModMemType::InitData | ModMemType::InitRoData => {
@@ -601,12 +570,20 @@ pub fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, Errno> {
 pub fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, Errno> {
     debug_serial_println!("VSM: Unload kernel module (token: {})", token);
 
-    if !crate::platform_low().vtl0_module_memory.contains_key(token) {
+    if !crate::platform_low()
+        .vtl0_kernel_info
+        .module_memory
+        .contains_key(token)
+    {
         serial_println!("VSM: invalid module token");
         return Err(Errno::EINVAL);
     }
 
-    if let Some(entry) = crate::platform_low().vtl0_module_memory.iter_entry(token) {
+    if let Some(entry) = crate::platform_low()
+        .vtl0_kernel_info
+        .module_memory
+        .iter_entry(token)
+    {
         // make the memory ranges of a module readable, writable, and non-executable to let the VTL0 kernel unload the module
         for mod_mem_range in entry.iter_mem_ranges() {
             protect_physical_memory_range(
@@ -616,7 +593,10 @@ pub fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, Errno> {
         }
     }
 
-    crate::platform_low().vtl0_module_memory.remove(token);
+    crate::platform_low()
+        .vtl0_kernel_info
+        .module_memory
+        .remove(token);
     Ok(0)
 }
 
@@ -760,6 +740,114 @@ fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
     }
 
     Ok(0)
+}
+
+pub struct Vtl0KernelInfo {
+    module_memory: ModuleMemoryMap,
+    boot_done: AtomicBool,
+    ksymtab: OnceBox<BTreeMap<String, VirtAddr>>,
+    ksymtab_gpl: OnceBox<BTreeMap<String, VirtAddr>>,
+    // TODO: certificates, blocklist, etc.
+}
+
+impl Vtl0KernelInfo {
+    pub fn new() -> Self {
+        Self {
+            module_memory: ModuleMemoryMap::new(),
+            boot_done: AtomicBool::new(false),
+            ksymtab: OnceBox::new(),
+            ksymtab_gpl: OnceBox::new(),
+        }
+    }
+
+    /// This function records the end of the VTL0 boot process.
+    pub fn set_end_of_boot(&self) {
+        self.boot_done
+            .store(true, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// This function checks whether the VTL0 boot process is done. VTL1 kernel relies on this function
+    /// to lock down certain security-critical VSM functions.
+    pub fn check_end_of_boot(&self) -> bool {
+        self.boot_done.load(core::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// This function implements Linux kernel's `offset_to_ptr` macro to identify
+    /// the addresses of kernel symbols and their null-terminated names and
+    /// returns a map of symbol names to their addresses. `offset_to_ptr` is needed
+    /// only if `CONFIG_HAVE_ARCH_PREL32_RELOCATIONS=y`.
+    #[allow(clippy::unused_self)]
+    fn populate_kernel_symbol_map(
+        &self,
+        ksymtab_range: Range<VirtAddr>,
+        kernel_data_mem: &MemoryMapWithContent,
+        ksymtab_map: &mut BTreeMap<String, VirtAddr>,
+    ) {
+        let mut current = ksymtab_range.start;
+        while current < ksymtab_range.end {
+            let value_offset = kernel_data_mem
+                .read_value::<i32>(
+                    current + u64::try_from(offset_of!(KernelSymbol, value_offset)).unwrap(),
+                )
+                .unwrap();
+            let name_offset = kernel_data_mem
+                .read_value::<i32>(
+                    current + u64::try_from(offset_of!(KernelSymbol, name_offset)).unwrap(),
+                )
+                .unwrap();
+
+            #[allow(clippy::cast_possible_truncation)]
+            #[allow(clippy::cast_possible_wrap)]
+            #[allow(clippy::cast_sign_loss)]
+            let value_addr = VirtAddr::new(
+                (current.as_u64() as isize)
+                    .wrapping_add(offset_of!(KernelSymbol, value_offset) as isize)
+                    .wrapping_add(value_offset as isize) as u64,
+            );
+
+            #[allow(clippy::cast_possible_truncation)]
+            #[allow(clippy::cast_possible_wrap)]
+            #[allow(clippy::cast_sign_loss)]
+            let name_addr = VirtAddr::new(
+                (current.as_u64() as isize)
+                    .wrapping_add(offset_of!(KernelSymbol, name_offset) as isize)
+                    .wrapping_add(name_offset as isize) as u64,
+            );
+
+            let mut buf = [0u8; KSYM_NAME_LEN];
+            kernel_data_mem.read_bytes(name_addr, &mut buf).unwrap();
+            if let Some(name) =
+                unsafe { CStr::from_ptr(buf.as_ptr().cast::<c_char>()).to_str().ok() }
+            {
+                ksymtab_map.insert(String::from(name), value_addr);
+            }
+
+            // unclear whether we need the `namespace` field to suppor the relocation.
+            // We can add it later if needed.
+
+            current += core::mem::size_of::<KernelSymbol>() as u64;
+        }
+    }
+
+    pub fn populate_kernel_symbol_maps(
+        &self,
+        ksymtab_range: Range<VirtAddr>,
+        ksymtab_gpl_range: Range<VirtAddr>,
+        kernel_data_mem: &MemoryMapWithContent,
+    ) {
+        let mut ksymtab_map: BTreeMap<String, VirtAddr> = BTreeMap::new();
+        let mut ksymtab_gpl_map: BTreeMap<String, VirtAddr> = BTreeMap::new();
+
+        self.populate_kernel_symbol_map(ksymtab_range, kernel_data_mem, &mut ksymtab_map);
+        self.ksymtab
+            .set(Box::new(ksymtab_map))
+            .expect("Reinitialization of kernel symbol map is not allowed");
+
+        self.populate_kernel_symbol_map(ksymtab_gpl_range, kernel_data_mem, &mut ksymtab_gpl_map);
+        self.ksymtab_gpl
+            .set(Box::new(ksymtab_gpl_map))
+            .expect("Reinitialization of kernel symbol map is not allowed");
+    }
 }
 
 /// Data structure for maintaining the memory ranges of each VTL0 kernel module and their types
