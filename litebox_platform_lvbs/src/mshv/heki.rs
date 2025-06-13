@@ -1,4 +1,7 @@
-use crate::mshv::{HvPageProtFlags, vtl1_mem_layout::PAGE_SIZE};
+use crate::{
+    host::linux::KernelSymbol,
+    mshv::{HvPageProtFlags, vtl1_mem_layout::PAGE_SIZE},
+};
 use num_enum::TryFromPrimitive;
 
 bitflags::bitflags! {
@@ -126,4 +129,15 @@ impl Default for HekiPage {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct HekiKinfo {
+    pub ksymtab_start: *const KernelSymbol,
+    pub ksymtab_end: *const KernelSymbol,
+    pub ksymtab_gpl_start: *const KernelSymbol,
+    pub ksymtab_gpl_end: *const KernelSymbol,
+    // arch: HekiArchKinfo // TODO: add it later. it depends on a lot of data structures
 }
