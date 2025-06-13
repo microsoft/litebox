@@ -29,6 +29,7 @@ use crate::{
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
+        kernel_elf,
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,
@@ -418,6 +419,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
 /// `pa` and `nranges` specify a memory area containing the information about the kernel module to validate or protect.
 /// `flags` controls the validation process (unused for now).
 /// This function returns a unique `token` to VTL0, which is used to identify the module in subsequent calls.
+#[allow(clippy::too_many_lines)]
 pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Result<i64, Errno> {
     if !pa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap()) || nranges == 0 {
         serial_println!("VSM: invalid input address");
@@ -432,7 +434,10 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
 
     // collect and maintain the memory ranges of a module locally until the module is validated and registered in the global map
     let mut module_memory = ModuleMemory::new();
-    let mut kernel_module_mem = MemoryMapWithContent::new();
+
+    let mut kernel_module_mem_elf = MemoryMapWithContent::new();
+    let mut kernel_module_mem_text = MemoryMapWithContent::new();
+    let mut kernel_module_mem_init_text = MemoryMapWithContent::new();
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         for heki_page in heki_pages {
@@ -448,7 +453,8 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                         return Err(Errno::EINVAL);
                     }
                     ModMemType::ElfBuffer => {
-                        if kernel_module_mem
+                        // this capture the original ELF binary in memory which is provided by the VTL0 kernel for validation.
+                        if kernel_module_mem_elf
                             .write_vtl0_phys_bytes(
                                 VirtAddr::new(va),
                                 PhysAddr::new(pa),
@@ -473,13 +479,30 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                             return Err(Errno::EINVAL);
                         }
 
-                        if kernel_module_mem
-                            .write_vtl0_phys_bytes(
-                                VirtAddr::new(va),
-                                PhysAddr::new(pa),
-                                PhysAddr::new(epa),
-                            )
-                            .is_err()
+                        if mod_mem_type == ModMemType::Text
+                            && kernel_module_mem_text
+                                .write_vtl0_phys_bytes(
+                                    VirtAddr::new(va),
+                                    PhysAddr::new(pa),
+                                    PhysAddr::new(epa),
+                                )
+                                .is_err()
+                        {
+                            serial_println!(
+                                "VSM: Failed to get VTL0 kernel module memory at {:#x}",
+                                pa
+                            );
+                            return Err(Errno::EINVAL);
+                        }
+
+                        if mod_mem_type == ModMemType::InitText
+                            && kernel_module_mem_init_text
+                                .write_vtl0_phys_bytes(
+                                    VirtAddr::new(va),
+                                    PhysAddr::new(pa),
+                                    PhysAddr::new(epa),
+                                )
+                                .is_err()
                         {
                             serial_println!(
                                 "VSM: Failed to get VTL0 kernel module memory at {:#x}",
@@ -503,6 +526,16 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     }
 
     // TODO: validate a kernel module by analyzing its ELF binary and memory content. For now, we just assume the module is valid.
+    let _ = kernel_elf::validate_module_elf(
+        &kernel_module_mem_elf,
+        &kernel_module_mem_text,
+        &kernel_module_mem_init_text,
+        crate::platform_low().vtl0_kernel_info.ksymtab_map.as_ref(),
+        crate::platform_low()
+            .vtl0_kernel_info
+            .ksymtab_gpl_map
+            .as_ref(),
+    );
 
     // protect the memory ranges of a module based on their section types
     for mod_mem_range in &module_memory {
@@ -742,6 +775,9 @@ fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
     Ok(0)
 }
 
+/// Data structure for maintaining the kernel information in VTL0.
+/// It should be prepared by copying kernel data from VTL0 to VTL1 instead of
+/// relying on shared memory access to VTL0 which suffers from security issues.
 pub struct Vtl0KernelInfo {
     module_memory: ModuleMemoryMap,
     boot_done: AtomicBool,
@@ -1039,6 +1075,10 @@ impl KernelSymbolMap {
         let inner = self.inner.read();
         inner.get(symbol).copied()
     }
+
+    pub fn as_ref(&self) -> &KernelSymbolMap {
+        self
+    }
 }
 
 /// Data structure for abstracting addressable paged memory. Unlike `ModuleMemoryMap` which maintains
@@ -1066,7 +1106,6 @@ impl MemoryMapWithContent {
         self.start
     }
 
-    #[expect(dead_code)]
     pub fn end(&self) -> Option<VirtAddr> {
         self.end
     }

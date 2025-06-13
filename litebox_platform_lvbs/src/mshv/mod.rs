@@ -4,6 +4,7 @@ mod heki;
 pub mod hvcall;
 mod hvcall_mm;
 mod hvcall_vp;
+mod kernel_elf;
 pub(crate) mod vsm;
 mod vsm_intercept;
 pub mod vtl1_mem_layout;

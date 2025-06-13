@@ -23,6 +23,7 @@ num_enum = { version = "0.7.3", default-features = false }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
 memoffset = "0.9.1"
 hashbrown = "0.15.2"
+goblin = { version = "0.10.0", default-features = false, features = ["elf32", "elf64", "endian_fd"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
