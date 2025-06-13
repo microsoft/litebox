@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
+use litebox::fs::OFlags;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer};
@@ -17,6 +18,8 @@ use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall
 
 mod syscall_intercept;
 
+extern crate alloc;
+
 /// The userland Linux platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
@@ -24,6 +27,8 @@ mod syscall_intercept;
 pub struct LinuxUserland {
     tun_socket_fd: std::sync::RwLock<Option<std::os::fd::OwnedFd>>,
     interception_enabled: std::sync::atomic::AtomicBool,
+    /// Reserved pages that are not available for guest programs to use.
+    reserved_pages: Vec<core::ops::Range<usize>>,
 }
 
 impl LinuxUserland {
@@ -79,6 +84,7 @@ impl LinuxUserland {
         Box::leak(Box::new(Self {
             tun_socket_fd,
             interception_enabled: std::sync::atomic::AtomicBool::new(false),
+            reserved_pages: Self::read_proc_self_maps(),
         }))
     }
 
@@ -107,6 +113,58 @@ impl LinuxUserland {
         // TODO: have better signature and registration of the syscall handler.
         syscall_intercept::init_sys_intercept(syscall_handler);
     }
+
+    fn read_proc_self_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
+        // TODO: this function is not guaranteed to return all allocated pages, as it may
+        // allocate more pages after the mapping file is read. Missing allocated pages may
+        // cause the program to crash when calling `mmap` or `mremap` with the `MAP_FIXED` flag later.
+        // We should either fix `mmap` to handle this error, or let global allocator call this function
+        // whenever it get more pages from the host.
+        let path = "/proc/self/maps";
+        let fd = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::open,
+                path.as_ptr() as usize,
+                OFlags::RDONLY.bits() as usize,
+                0,
+            )
+        };
+        let Ok(fd) = fd else {
+            return alloc::vec::Vec::new();
+        };
+        let mut buf = [0u8; 8192];
+        let mut total_read = 0;
+        while total_read < buf.len() {
+            let n = unsafe {
+                syscalls::syscall3(
+                    syscalls::Sysno::read,
+                    fd,
+                    buf.as_mut_ptr() as usize + total_read,
+                    buf.len() - total_read,
+                )
+            }
+            .expect("read failed");
+            if n == 0 {
+                break;
+            }
+            total_read += n;
+        }
+        assert!(total_read < buf.len(), "buffer too small");
+
+        let mut reserved_pages = alloc::vec::Vec::new();
+        let s = core::str::from_utf8(&buf[..total_read]).expect("invalid UTF-8");
+        for line in s.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 5 {
+                continue;
+            }
+            let range = parts[0].split('-').collect::<Vec<&str>>();
+            let start = usize::from_str_radix(range[0], 16).expect("invalid start address");
+            let end = usize::from_str_radix(range[1], 16).expect("invalid end address");
+            reserved_pages.push(start..end);
+        }
+        reserved_pages
+    }
 }
 
 impl litebox::platform::Provider for LinuxUserland {}
@@ -120,6 +178,7 @@ impl litebox::platform::ExitProvider for LinuxUserland {
         let Self {
             tun_socket_fd,
             interception_enabled: _,
+            reserved_pages: _,
         } = self;
         // We don't need to explicitly drop this, but doing so clarifies our intent that we want to
         // close it out :). The type itself is re-specified here to make sure we look at this
@@ -752,7 +811,7 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for LinuxUserland {
     fn allocate_pages(
         &self,
-        range: std::ops::Range<usize>,
+        range: core::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages: bool,
@@ -801,7 +860,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 
     unsafe fn deallocate_pages(
         &self,
-        range: std::ops::Range<usize>,
+        range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
         let _ = unsafe {
             syscalls::syscall3(
@@ -818,8 +877,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 
     unsafe fn remap_pages(
         &self,
-        old_range: std::ops::Range<usize>,
-        new_range: std::ops::Range<usize>,
+        old_range: core::ops::Range<usize>,
+        new_range: core::ops::Range<usize>,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
         let res = unsafe {
             syscalls::syscall6(
@@ -842,7 +901,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 
     unsafe fn update_permissions(
         &self,
-        range: std::ops::Range<usize>,
+        range: core::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
         unsafe {
@@ -857,6 +916,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         }
         .expect("mprotect failed");
         Ok(())
+    }
+
+    fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
+        self.reserved_pages.iter()
     }
 }
 
@@ -960,6 +1023,9 @@ mod tests {
 
     use litebox::platform::RawMutex;
 
+    use crate::LinuxUserland;
+    use litebox::platform::PageManagementProvider;
+
     extern crate std;
 
     #[test]
@@ -976,5 +1042,20 @@ mod tests {
         });
 
         assert!(mutex.block(0).is_ok());
+    }
+
+    #[test]
+    fn test_reserved_pages() {
+        let platform = LinuxUserland::new(None);
+        let reserved_pages: Vec<_> =
+            <LinuxUserland as PageManagementProvider<4096>>::reserved_pages(platform).collect();
+
+        // Check that the reserved pages are in order and non-overlapping
+        let mut prev = 0;
+        for page in reserved_pages {
+            assert!(page.start >= prev);
+            assert!(page.end > page.start);
+            prev = page.end;
+        }
     }
 }

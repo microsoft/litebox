@@ -405,6 +405,10 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             litebox::mm::linux::VmFlags::from_bits(new_permissions.bits().into()).unwrap();
         unsafe { self.page_table.mprotect_pages(range, new_flags) }
     }
+
+    fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
+        core::iter::empty()
+    }
 }
 
 impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKernel<Host> {

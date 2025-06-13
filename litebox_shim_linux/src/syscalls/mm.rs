@@ -253,6 +253,12 @@ pub(crate) fn sys_mremap(
     .map_err(Errno::from)
 }
 
+/// Handle syscall `brk`
+pub(crate) fn sys_brk(addr: MutPtr<u8>) -> Result<usize, Errno> {
+    let pm = litebox_page_manager();
+    unsafe { pm.brk(addr.as_usize()) }.map_err(Errno::from)
+}
+
 #[cfg(test)]
 mod tests {
     use litebox::{

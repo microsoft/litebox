@@ -362,6 +362,7 @@ pub fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
         SyscallRequest::Munmap { addr, length } => {
             syscalls::mm::sys_munmap(addr, length).map(|()| 0)
         }
+        SyscallRequest::Brk { addr } => syscalls::mm::sys_brk(addr),
         SyscallRequest::Readv { fd, iovec, iovcnt } => syscalls::file::sys_readv(fd, iovec, iovcnt),
         SyscallRequest::Writev { fd, iovec, iovcnt } => {
             syscalls::file::sys_writev(fd, iovec, iovcnt)
@@ -717,6 +718,9 @@ unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) 
             fd: syscall_args[0].reinterpret_as_signed().truncate(),
             buf: unsafe { transmute_ptr(syscall_args[1] as *const u8) },
             count: syscall_args[2],
+        },
+        ::syscalls::Sysno::brk => SyscallRequest::Brk {
+            addr: unsafe { transmute_ptr_mut(syscall_args[0] as *mut u8) },
         },
         ::syscalls::Sysno::rt_sigprocmask => {
             let how: i32 = syscall_args[0].reinterpret_as_signed().truncate();

@@ -1,6 +1,9 @@
 //! ELF loader for LiteBox
 
-use core::ptr::NonNull;
+use core::{
+    ptr::NonNull,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use alloc::{collections::btree_map::BTreeMap, ffi::CString, string::ToString, vec::Vec};
 use elf_loader::{
@@ -12,7 +15,7 @@ use elf_loader::{
 use litebox::{
     fs::{Mode, OFlags},
     mm::linux::{MappingError, PAGE_SIZE},
-    platform::RawConstPointer,
+    platform::RawConstPointer as _,
 };
 use litebox_common_linux::errno::Errno;
 use thiserror::Error;
@@ -95,7 +98,9 @@ impl ElfLoaderMmap {
         // in which case the file is copied multiple times. To reduce the overhead, we
         // could convert some `mmap` calls to `mprotect` calls whenever possible.
         match crate::syscalls::mm::sys_mmap(
-            addr.unwrap_or(0),
+            // A default low address is used for the binary (which grows upwards) to avoid
+            // conflicts with the kernel's memory mappings (which grows downwards).
+            addr.unwrap_or(0x1000_0000),
             len,
             litebox_common_linux::ProtFlags::from_bits_truncate(prot.bits()),
             litebox_common_linux::MapFlags::from_bits(flags.bits()).expect("unsupported flags"),
@@ -259,6 +264,8 @@ fn get_trampoline_hdr(object: &mut ElfFile) -> Option<TrampolineHdr> {
     })
 }
 
+const KEY_BRK: u8 = 0x01;
+
 /// Loader for ELF files
 pub(super) struct ElfLoader;
 
@@ -285,6 +292,7 @@ impl ElfLoader {
     }
 
     /// Load an ELF file and prepare the stack for the new process.
+    #[allow(clippy::too_many_lines)]
     pub(super) fn load(
         path: &str,
         argv: Vec<CString>,
@@ -292,6 +300,21 @@ impl ElfLoader {
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let elf = {
             let mut loader = Loader::<ElfLoaderMmap>::new();
+            // Set a hook to get the brk address (i.e., the end of the program's data segment) from the ELF file.
+            loader.set_hook(alloc::boxed::Box::new(|name, phdr, segment, data| {
+                let end: usize = usize::try_from(phdr.p_vaddr + phdr.p_memsz).unwrap();
+                if let Some(elf_brk) = data.get(KEY_BRK) {
+                    let elf_brk = elf_brk.downcast_ref::<AtomicUsize>().unwrap();
+                    if elf_brk.load(Ordering::Relaxed) < end {
+                        // Update the brk to the end of the segment
+                        elf_brk.store(end, Ordering::Relaxed);
+                    }
+                } else {
+                    // Create a new brk for the segment
+                    data.insert(KEY_BRK, alloc::boxed::Box::new(AtomicUsize::new(end)));
+                }
+                Ok(())
+            }));
             let mut object = ElfFile::new(path).map_err(ElfLoaderError::OpenError)?;
             let file_fd = object.as_fd().unwrap();
             // Check if the file is modified by our syscall rewriter. If so, we need to update
@@ -301,7 +324,7 @@ impl ElfLoader {
                 .easy_load(object)
                 .map_err(ElfLoaderError::LoaderError)?;
 
-            if let Some(trampoline) = trampoline {
+            let end_of_trampoline = if let Some(trampoline) = trampoline {
                 assert!(
                     trampoline.vaddr % PAGE_SIZE == 0,
                     "trampoline address must be page-aligned"
@@ -339,7 +362,21 @@ impl ElfLoader {
                 let pm = litebox_page_manager();
                 unsafe { pm.make_pages_executable(ptr, end_addr - start_addr) }
                     .expect("failed to make pages executable");
-            }
+                end_addr
+            } else {
+                0
+            };
+            let base = elf.base();
+            let brk = elf
+                .user_data()
+                .get(KEY_BRK)
+                .unwrap()
+                .downcast_ref::<AtomicUsize>()
+                .unwrap()
+                .load(Ordering::Relaxed);
+            let init_brk =
+                core::cmp::max((base + brk).next_multiple_of(PAGE_SIZE), end_of_trampoline);
+            unsafe { litebox_page_manager().brk(init_brk) }.expect("failed to set brk");
             elf
         };
         let interp: Option<Elf> = if let Some(interp_name) = elf.interp() {

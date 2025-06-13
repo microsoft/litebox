@@ -741,6 +741,9 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         flags: MRemapFlags,
         new_addr: usize,
     },
+    Brk {
+        addr: Platform::RawMutPointer<u8>,
+    },
     RtSigprocmask {
         how: SigmaskHow,
         set: Option<Platform::RawConstPointer<SigSet>>,
