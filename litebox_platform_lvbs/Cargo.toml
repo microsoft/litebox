@@ -13,6 +13,7 @@ litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
 spin = { version = "0.10.0", default-features = false, features = [
   "spin_mutex",
   "once",
+  "rwlock",
 ] }
 libc = "0.2.169"
 arrayvec = { version = "0.7.6", default-features = false }
@@ -21,6 +22,7 @@ thiserror = { version = "2.0.6", default-features = false }
 num_enum = { version = "0.7.3", default-features = false }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
 memoffset = "0.9.1"
+hashbrown = "0.15.2"
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
