@@ -29,7 +29,7 @@ use crate::{
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
-        kernel_elf,
+        kernel_elf::validate_module_elf,
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,
@@ -435,9 +435,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     // collect and maintain the memory ranges of a module locally until the module is validated and registered in the global map
     let mut module_memory = ModuleMemory::new();
 
-    let mut kernel_module_mem_elf = MemoryMapWithContent::new();
-    let mut kernel_module_mem_text = MemoryMapWithContent::new();
-    let mut kernel_module_mem_init_text = MemoryMapWithContent::new();
+    let mut module_memory_with_content = ModuleMemoryWithContent::new();
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         for heki_page in heki_pages {
@@ -454,20 +452,14 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                     }
                     ModMemType::ElfBuffer => {
                         // this capture the original ELF binary in memory which is provided by the VTL0 kernel for validation.
-                        if kernel_module_mem_elf
+                        module_memory_with_content
+                            .elf
                             .write_vtl0_phys_bytes(
                                 VirtAddr::new(va),
                                 PhysAddr::new(pa),
                                 PhysAddr::new(epa),
                             )
-                            .is_err()
-                        {
-                            serial_println!(
-                                "VSM: Failed to get VTL0 kernel module memory at {:#x}",
-                                pa
-                            );
-                            return Err(Errno::EINVAL);
-                        }
+                            .expect("VSM: Failed to get VTL0 kernel module memory");
                     }
                     _ => {
                         // if input memory range's type is neither `Unknown` nor `ElfBuffer`, its addresses must be page-aligned
@@ -479,36 +471,80 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                             return Err(Errno::EINVAL);
                         }
 
-                        if mod_mem_type == ModMemType::Text
-                            && kernel_module_mem_text
-                                .write_vtl0_phys_bytes(
-                                    VirtAddr::new(va),
-                                    PhysAddr::new(pa),
-                                    PhysAddr::new(epa),
-                                )
-                                .is_err()
-                        {
-                            serial_println!(
-                                "VSM: Failed to get VTL0 kernel module memory at {:#x}",
-                                pa
-                            );
-                            return Err(Errno::EINVAL);
-                        }
-
-                        if mod_mem_type == ModMemType::InitText
-                            && kernel_module_mem_init_text
-                                .write_vtl0_phys_bytes(
-                                    VirtAddr::new(va),
-                                    PhysAddr::new(pa),
-                                    PhysAddr::new(epa),
-                                )
-                                .is_err()
-                        {
-                            serial_println!(
-                                "VSM: Failed to get VTL0 kernel module memory at {:#x}",
-                                pa
-                            );
-                            return Err(Errno::EINVAL);
+                        match mod_mem_type {
+                            ModMemType::Text => {
+                                module_memory_with_content
+                                    .text
+                                    .write_vtl0_phys_bytes(
+                                        VirtAddr::new(va),
+                                        PhysAddr::new(pa),
+                                        PhysAddr::new(epa),
+                                    )
+                                    .expect("VSM: Failed to get VTL0 kernel module memory");
+                            }
+                            ModMemType::InitText => {
+                                module_memory_with_content
+                                    .init_text
+                                    .write_vtl0_phys_bytes(
+                                        VirtAddr::new(va),
+                                        PhysAddr::new(pa),
+                                        PhysAddr::new(epa),
+                                    )
+                                    .expect("VSM: Failed to get VTL0 kernel module memory");
+                            }
+                            ModMemType::Data => {
+                                module_memory_with_content
+                                    .data
+                                    .write_vtl0_phys_bytes(
+                                        VirtAddr::new(va),
+                                        PhysAddr::new(pa),
+                                        PhysAddr::new(epa),
+                                    )
+                                    .expect("VSM: Failed to get VTL0 kernel module memory");
+                            }
+                            ModMemType::RoData => {
+                                module_memory_with_content
+                                    .ro_data
+                                    .write_vtl0_phys_bytes(
+                                        VirtAddr::new(va),
+                                        PhysAddr::new(pa),
+                                        PhysAddr::new(epa),
+                                    )
+                                    .expect("VSM: Failed to get VTL0 kernel module memory");
+                            }
+                            ModMemType::RoAfterInit => {
+                                module_memory_with_content
+                                    .ro_after_init
+                                    .write_vtl0_phys_bytes(
+                                        VirtAddr::new(va),
+                                        PhysAddr::new(pa),
+                                        PhysAddr::new(epa),
+                                    )
+                                    .expect("VSM: Failed to get VTL0 kernel module memory");
+                            }
+                            ModMemType::InitData => {
+                                module_memory_with_content
+                                    .init_data
+                                    .write_vtl0_phys_bytes(
+                                        VirtAddr::new(va),
+                                        PhysAddr::new(pa),
+                                        PhysAddr::new(epa),
+                                    )
+                                    .expect("VSM: Failed to get VTL0 kernel module memory");
+                            }
+                            ModMemType::InitRoData => {
+                                module_memory_with_content
+                                    .init_ro_data
+                                    .write_vtl0_phys_bytes(
+                                        VirtAddr::new(va),
+                                        PhysAddr::new(pa),
+                                        PhysAddr::new(epa),
+                                    )
+                                    .expect("VSM: Failed to get VTL0 kernel module memory");
+                            }
+                            _ => {
+                                panic!("VSM: Unsupported module memory type for validation");
+                            }
                         }
 
                         module_memory.insert_memory_range(ModuleMemoryRange::new(
@@ -526,10 +562,8 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     }
 
     // TODO: validate a kernel module by analyzing its ELF binary and memory content. For now, we just assume the module is valid.
-    let _ = kernel_elf::validate_module_elf(
-        &kernel_module_mem_elf,
-        &kernel_module_mem_text,
-        &kernel_module_mem_init_text,
+    let _ = validate_module_elf(
+        &module_memory_with_content,
         crate::platform_low().vtl0_kernel_info.ksymtab_map.as_ref(),
         crate::platform_low()
             .vtl0_kernel_info
@@ -1078,6 +1112,32 @@ impl KernelSymbolMap {
 
     pub fn as_ref(&self) -> &KernelSymbolMap {
         self
+    }
+}
+
+pub struct ModuleMemoryWithContent {
+    pub text: MemoryMapWithContent,
+    pub init_text: MemoryMapWithContent,
+    pub data: MemoryMapWithContent,
+    pub ro_data: MemoryMapWithContent,
+    pub ro_after_init: MemoryMapWithContent,
+    pub init_data: MemoryMapWithContent,
+    pub init_ro_data: MemoryMapWithContent,
+    pub elf: MemoryMapWithContent,
+}
+
+impl ModuleMemoryWithContent {
+    pub fn new() -> Self {
+        Self {
+            text: MemoryMapWithContent::new(),
+            init_text: MemoryMapWithContent::new(),
+            data: MemoryMapWithContent::new(),
+            ro_data: MemoryMapWithContent::new(),
+            ro_after_init: MemoryMapWithContent::new(),
+            init_data: MemoryMapWithContent::new(),
+            init_ro_data: MemoryMapWithContent::new(),
+            elf: MemoryMapWithContent::new(),
+        }
     }
 }
 
