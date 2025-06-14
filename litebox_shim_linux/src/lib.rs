@@ -992,7 +992,7 @@ pub unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usi
             initval: syscall_args[0].truncate(),
             flags: litebox_common_linux::EfdFlags::from_bits_truncate(syscall_args[1].truncate()),
         },
-        ::syscalls::Sysno::statx | ::syscalls::Sysno::io_uring_setup => {
+        ::syscalls::Sysno::statx | ::syscalls::Sysno::io_uring_setup | ::syscalls::Sysno::rseq => {
             SyscallRequest::Ret(Errno::ENOSYS)
         }
         _ => todo!("syscall {sysno} not implemented"),

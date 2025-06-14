@@ -258,7 +258,6 @@ fn register_seccomp_filter() {
         (libc::SYS_set_robust_list, vec![]),
         (libc::SYS_prlimit64, vec![]),
         (libc::SYS_getrandom, vec![]),
-        (libc::SYS_rseq, vec![]),
     ];
     let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> = rules.into_iter().collect();
 
