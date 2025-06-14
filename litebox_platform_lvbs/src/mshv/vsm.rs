@@ -434,8 +434,8 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
 
     // collect and maintain the memory ranges of a module locally until the module is validated and registered in the global map
     let mut module_memory = ModuleMemory::new();
-
     let mut module_memory_with_content = ModuleMemoryWithContent::new();
+    let mut memory_elf = MemoryMapWithContent::new();
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         for heki_page in heki_pages {
@@ -452,8 +452,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                     }
                     ModMemType::ElfBuffer => {
                         // this capture the original ELF binary in memory which is provided by the VTL0 kernel for validation.
-                        module_memory_with_content
-                            .elf
+                        memory_elf
                             .write_vtl0_phys_bytes(
                                 VirtAddr::new(va),
                                 PhysAddr::new(pa),
@@ -561,15 +560,35 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         return Err(Errno::EINVAL);
     }
 
-    // TODO: validate a kernel module by analyzing its ELF binary and memory content. For now, we just assume the module is valid.
-    let _ = validate_module_elf(
-        &module_memory_with_content,
-        crate::platform_low().vtl0_kernel_info.ksymtab_map.as_ref(),
-        crate::platform_low()
-            .vtl0_kernel_info
-            .ksymtab_gpl_map
-            .as_ref(),
-    );
+    // TODO: validate a kernel module by analyzing its ELF binary and memory content.
+    let elf_buf_to_validate = {
+        let elf_size = memory_elf.len();
+
+        // TODO: For now, we ignore large kernel modules, but we should consider how to handle them.
+        if elf_size > 256 * 1024 {
+            let mut elf_buf = vec![0u8; elf_size];
+            memory_elf
+                .read_bytes(memory_elf.start().unwrap(), &mut elf_buf)
+                .expect("Failed to read kernel module ELF buffer");
+            memory_elf.clear();
+            Some(elf_buf)
+        } else {
+            memory_elf.clear();
+            None
+        }
+    };
+
+    if let Some(elf_buf) = elf_buf_to_validate {
+        let _ = validate_module_elf(
+            &elf_buf,
+            &module_memory_with_content,
+            crate::platform_low().vtl0_kernel_info.ksymtab_map.as_ref(),
+            crate::platform_low()
+                .vtl0_kernel_info
+                .ksymtab_gpl_map
+                .as_ref(),
+        );
+    }
 
     // protect the memory ranges of a module based on their section types
     for mod_mem_range in &module_memory {
@@ -1123,7 +1142,6 @@ pub struct ModuleMemoryWithContent {
     pub ro_after_init: MemoryMapWithContent,
     pub init_data: MemoryMapWithContent,
     pub init_ro_data: MemoryMapWithContent,
-    pub elf: MemoryMapWithContent,
 }
 
 impl ModuleMemoryWithContent {
@@ -1136,7 +1154,6 @@ impl ModuleMemoryWithContent {
             ro_after_init: MemoryMapWithContent::new(),
             init_data: MemoryMapWithContent::new(),
             init_ro_data: MemoryMapWithContent::new(),
-            elf: MemoryMapWithContent::new(),
         }
     }
 }
@@ -1345,5 +1362,13 @@ impl MemoryMapWithContent {
         } else {
             Err(())
         }
+    }
+
+    pub fn clear(&mut self) {
+        self.pages.clear();
+        self.range = Range {
+            start: VirtAddr::new(0),
+            end: VirtAddr::new(0),
+        };
     }
 }
