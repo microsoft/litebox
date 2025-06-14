@@ -29,17 +29,17 @@ pub fn validate_module_elf(
     mod_mem: &ModuleMemoryWithContent,
     ksymtab: &KernelSymbolMap,
     ksymtab_gpl: &KernelSymbolMap,
-) -> Result<(), ()> {
+) -> Result<bool, KernelElfError> {
     if let Ok(text_reloc) = relocate_elf_section(elf_buf, ".text", mod_mem, ksymtab, ksymtab_gpl) {
         let mut text_loaded = vec![0u8; text_reloc.iter().len()];
         mod_mem
             .text
             .read_bytes(mod_mem.text.start().unwrap(), &mut text_loaded)
-            .expect("Failed to read kernel module .text section");
+            .map_err(|_| KernelElfError::SectionReadFailed)?;
 
         let _ = match_relocation(&text_reloc, &text_loaded);
     } else {
-        return Err(());
+        return Err(KernelElfError::SectionRelocationFailed);
     }
 
     if let Ok(text_reloc) =
@@ -49,24 +49,22 @@ pub fn validate_module_elf(
         mod_mem
             .init_text
             .read_bytes(mod_mem.init_text.start().unwrap(), &mut text_loaded)
-            .expect("Failed to read kernel module .init.text section");
+            .map_err(|_| KernelElfError::SectionReadFailed)?;
 
         let _ = match_relocation(&text_reloc, &text_loaded);
     } else {
-        return Err(());
+        return Err(KernelElfError::SectionRelocationFailed);
     }
 
-    Ok(())
+    Ok(true)
 }
 
 /// This function checks whether the relocated section matches the loaded section.
 /// Due to our relocation logic's incompleteness, we allow some mismatches with heuristics.
-fn match_relocation(text_reloc: &[u8], text_loaded: &[u8]) -> Result<(), ()> {
-    assert_eq!(
-        text_reloc.len(),
-        text_loaded.len(),
-        "Relocation and loaded data lengths do not match"
-    );
+fn match_relocation(text_reloc: &[u8], text_loaded: &[u8]) -> Result<bool, KernelElfError> {
+    if text_reloc.is_empty() || text_reloc.len() != text_loaded.len() {
+        return Err(KernelElfError::InvalidInput);
+    }
 
     let mut matched = true;
 
@@ -96,7 +94,7 @@ fn match_relocation(text_reloc: &[u8], text_loaded: &[u8]) -> Result<(), ()> {
         i += 1;
     }
 
-    if matched { Ok(()) } else { Err(()) }
+    Ok(matched)
 }
 
 /// This function relocates the specified section of a kernel module ELF file
@@ -110,9 +108,9 @@ pub fn relocate_elf_section(
     mod_mem: &ModuleMemoryWithContent,
     ksymtab: &KernelSymbolMap,
     ksymtab_gpl: &KernelSymbolMap,
-) -> Result<Vec<u8>, i64> {
+) -> Result<Vec<u8>, KernelElfError> {
     let Ok(elf) = Elf::parse(elf_slice) else {
-        return Err(-1);
+        return Err(KernelElfError::ElfParseFailed);
     };
 
     let mut symbol_map = HashMap::new();
@@ -129,13 +127,11 @@ pub fn relocate_elf_section(
         ".text" => mod_mem.text.start().unwrap().as_u64(),
         ".init.text" => mod_mem.init_text.start().unwrap().as_u64(),
         _ => {
-            debug_serial_println!("Unsupported section name: {section_name}");
-            return Err(-1);
+            return Err(KernelElfError::UnsupportedSection);
         }
     };
 
     let mut target_section: Option<&SectionHeader> = None;
-
     for section in &elf.section_headers {
         if section.sh_flags & u64::from(goblin::elf64::section_header::SHF_ALLOC) != 0
             && section.sh_size > 0
@@ -154,11 +150,7 @@ pub fn relocate_elf_section(
             }
         }
     }
-
-    assert!(
-        target_section.is_some(),
-        "No {section_name:?} section found in the ELF file"
-    );
+    target_section.ok_or(KernelElfError::SectionNotFound)?;
 
     let sect_offset = target_section.unwrap().sh_offset;
     let sect_size = target_section.unwrap().sh_size;
@@ -301,4 +293,15 @@ fn patch_jmp0_to_ret(buf: &mut [u8]) {
             i += 1;
         }
     }
+}
+
+/// Error for Kernel ELF validation and relocation failures.
+#[derive(Debug, PartialEq)]
+pub enum KernelElfError {
+    SectionReadFailed,
+    SectionRelocationFailed,
+    ElfParseFailed,
+    UnsupportedSection,
+    SectionNotFound,
+    InvalidInput,
 }

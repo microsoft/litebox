@@ -348,30 +348,22 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
 
                 match kdata_type {
                     HekiKdataType::KernelInfo => {
-                        if heki_kernel_info_mem
+                        heki_kernel_info_mem
                             .write_vtl0_phys_bytes(
                                 VirtAddr::new(va),
                                 PhysAddr::new(pa),
                                 PhysAddr::new(epa),
                             )
-                            .is_err()
-                        {
-                            serial_println!("VSM: Failed to get VTL0 kernel info at {:#x}", pa);
-                            return Err(Errno::EINVAL);
-                        }
+                            .expect("VSM: Failed to get VTL0 kernel module memory");
                     }
                     HekiKdataType::KernelData => {
-                        if heki_kernel_data_mem
+                        heki_kernel_data_mem
                             .write_vtl0_phys_bytes(
                                 VirtAddr::new(va),
                                 PhysAddr::new(pa),
                                 PhysAddr::new(epa),
                             )
-                            .is_err()
-                        {
-                            serial_println!("VSM: Failed to get VTL0 kernel data at {:#x}", pa);
-                            return Err(Errno::EINVAL);
-                        }
+                            .expect("VSM: Failed to get VTL0 kernel module memory");
                     }
                     _ => {}
                 }
@@ -397,15 +389,6 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
                 },
                 &heki_kernel_data_mem,
             );
-
-        debug_serial_println!(
-            "ksymtab: irq_fpu_usable is at {:?}",
-            crate::platform_low()
-                .vtl0_kernel_info
-                .ksymtab_map
-                .get("irq_fpu_usable")
-                .unwrap()
-        );
     }
 
     // TODO: create trusted keys
@@ -1227,7 +1210,7 @@ impl MemoryMapWithContent {
         addr: VirtAddr,
         phys_start: PhysAddr,
         phys_end: PhysAddr,
-    ) -> Result<(), ()> {
+    ) -> Result<(), MemoryMapWithContentError> {
         let mut phys_cur = phys_start;
         while phys_cur < phys_end {
             if let Some(data) =
@@ -1242,7 +1225,7 @@ impl MemoryMapWithContent {
                 self.write_bytes(addr + (phys_cur - phys_start), &data[..to_write])?;
                 phys_cur += u64::try_from(to_write).unwrap();
             } else {
-                return Err(());
+                return Err(MemoryMapWithContentError::Copy);
             }
         }
 
@@ -1268,7 +1251,11 @@ impl MemoryMapWithContent {
         }
     }
 
-    pub fn write_bytes(&mut self, addr: VirtAddr, data: &[u8]) -> Result<(), ()> {
+    pub fn write_bytes(
+        &mut self,
+        addr: VirtAddr,
+        data: &[u8],
+    ) -> Result<(), MemoryMapWithContentError> {
         self.preallocate_pages(addr, addr + data.len() as u64);
 
         let start = addr;
@@ -1307,7 +1294,7 @@ impl MemoryMapWithContent {
             self.extend_range(start, end);
             Ok(())
         } else {
-            Err(())
+            Err(MemoryMapWithContentError::Write)
         }
     }
 
@@ -1324,7 +1311,11 @@ impl MemoryMapWithContent {
         }
     }
 
-    pub fn read_bytes(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<(), ()> {
+    pub fn read_bytes(
+        &self,
+        addr: VirtAddr,
+        buf: &mut [u8],
+    ) -> Result<(), MemoryMapWithContentError> {
         let start = addr;
         let end = addr + buf.len() as u64;
 
@@ -1360,7 +1351,7 @@ impl MemoryMapWithContent {
         if num_bytes == buf.len() {
             Ok(())
         } else {
-            Err(())
+            Err(MemoryMapWithContentError::Read)
         }
     }
 
@@ -1371,4 +1362,11 @@ impl MemoryMapWithContent {
             end: VirtAddr::new(0),
         };
     }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum MemoryMapWithContentError {
+    Copy,
+    Read,
+    Write,
 }
