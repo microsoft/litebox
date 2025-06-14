@@ -114,23 +114,23 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new(None);
     let litebox = LiteBox::new(platform);
+    let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
         in_mem.with_root_privileges(|fs| {
-            let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
-            let ancestors: Vec<_> = prog.ancestors().collect();
-            for (path, &mode) in ancestors
-                .into_iter()
-                .skip(1)
-                .rev()
-                .skip(1)
-                .zip(&ancestor_modes)
-            {
-                fs.mkdir(path.to_str().unwrap(), mode).unwrap();
-            }
+            // let ancestors: Vec<_> = prog.ancestors().collect();
+            // for (path, &mode) in ancestors
+            //     .into_iter()
+            //     .skip(1)
+            //     .rev()
+            //     .skip(1)
+            //     .zip(&ancestor_modes)
+            // {
+            //     fs.mkdir(path.to_str().unwrap(), mode).unwrap();
+            // }
             let fd = fs
                 .open(
-                    prog.to_str().unwrap(),
+                    prog.file_name().unwrap().to_str().unwrap(),
                     litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
                     *ancestor_modes.last().unwrap(),
                 )
@@ -190,9 +190,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let loaded_program =
-        litebox_shim_linux::loader::load_program(&cli_args.program_and_arguments[0], argv, envp)
-            .unwrap();
+    let loaded_program = litebox_shim_linux::loader::load_program(
+        prog.file_name().unwrap().to_str().unwrap(),
+        argv,
+        envp,
+    )
+    .unwrap();
 
     unsafe {
         trampoline::jump_to_entry_point(loaded_program.entry_point, loaded_program.user_stack_top)
