@@ -764,7 +764,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         fd: i32,
         buf: Platform::RawMutPointer<u8>,
         count: usize,
-        offset: usize,
+        offset: i64,
     },
     Pwrite64 {
         fd: i32,
@@ -891,7 +891,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         user_desc: Platform::RawMutPointer<UserDesc>,
     },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
-    Ret(isize),
+    Ret(errno::Errno),
 }
 
 /// A set of syscalls that are allowed to be punched through to platforms that work with the Linux

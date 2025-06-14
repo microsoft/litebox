@@ -42,8 +42,14 @@ unsafe extern "C" {
     fn trampoline(entry: usize, sp: usize) -> !;
 }
 
-pub fn init_platform(enable_systrap: bool) {
-    let platform = Platform::new(None);
+pub fn init_platform(
+    tar_data: &[u8],
+    initial_dirs: &[&str],
+    initial_files: &[&str],
+    tun_device_name: Option<&str>,
+    enable_syscall_interception: bool,
+) {
+    let platform = Platform::new(tun_device_name);
     set_platform(platform);
     let platform = litebox_platform_multiplex::platform();
     let litebox = LiteBox::new(platform);
@@ -54,8 +60,14 @@ pub fn init_platform(enable_systrap: bool) {
             .expect("Failed to set permissions on root");
     });
     let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&litebox);
-    let tar_ro_fs =
-        litebox::fs::tar_ro::FileSystem::new(&litebox, litebox::fs::tar_ro::empty_tar_file());
+    let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(
+        &litebox,
+        if tar_data.is_empty() {
+            litebox::fs::tar_ro::empty_tar_file()
+        } else {
+            tar_data.into()
+        },
+    );
     set_fs(litebox::fs::layered::FileSystem::new(
         &litebox,
         in_mem_fs,
@@ -67,14 +79,18 @@ pub fn init_platform(enable_systrap: bool) {
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     ));
-    if enable_systrap {
-        platform.enable_syscall_interception_with(litebox_shim_linux::syscall_entry);
+
+    for each in initial_dirs {
+        install_dir(each);
+    }
+    for each in initial_files {
+        let data = std::fs::read(each).unwrap();
+        install_file(data, each);
     }
 
-    install_dir("/lib64");
-    install_dir("/lib32");
-    install_dir("/lib");
-    install_dir("/lib/x86_64-linux-gnu");
+    if enable_syscall_interception {
+        platform.enable_syscall_interception_with();
+    }
 }
 
 /// Compile C code into an executable

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 mod common;
 
 #[test]
@@ -20,17 +18,13 @@ fn test_load_exec_dynamic() {
     #[cfg(target_arch = "x86")]
     let files_to_install = ["/lib/ld-linux.so.2", "/lib32/libc.so.6"];
 
-    let files: HashMap<&str, Vec<u8>> = files_to_install
-        .into_iter()
-        .map(|f| (f, std::fs::read(f).unwrap()))
-        .collect();
-
-    common::init_platform(true);
-
+    common::init_platform(
+        &[],
+        &["lib64", "lib32", "lib", "lib/x86_64-linux-gnu"],
+        &files_to_install,
+        None,
+        true,
+    );
     common::install_file(executable_data, executable_path);
-    for (path, data) in files {
-        common::install_file(data, path);
-    }
-
     common::test_load_exec_common(executable_path);
 }

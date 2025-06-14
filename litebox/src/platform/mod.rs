@@ -523,3 +523,12 @@ pub trait StdioProvider {
     /// Check if a stream is connected to a TTY.
     fn is_a_tty(&self, stream: StdioStream) -> bool;
 }
+
+/// A provider for system information.
+pub trait SystemInfoProvider {
+    /// Returns the address of the syscall entry point for the platform.
+    ///
+    /// The entry point address is typically used by the runtime or kernel to save/restore
+    /// execution context and transfer control to the syscall handler.
+    fn get_syscall_entry_point() -> usize;
+}

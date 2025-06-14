@@ -168,11 +168,9 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
 }
 
 /// Handle syscall `pread64`
-pub fn sys_pread64(fd: i32, buf: &mut [u8], offset: usize) -> Result<usize, Errno> {
-    if offset > isize::MAX as usize {
-        return Err(Errno::EINVAL);
-    }
-    sys_read(fd, buf, Some(offset))
+pub fn sys_pread64(fd: i32, buf: &mut [u8], offset: i64) -> Result<usize, Errno> {
+    let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+    sys_read(fd, buf, Some(pos))
 }
 
 /// Handle syscall `pwrite64`
