@@ -139,7 +139,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
     litebox_shim_linux::set_fs(initial_file_system);
     litebox_platform_multiplex::set_platform(platform);
-    platform.enable_syscall_interception_with(litebox_shim_linux::syscall_entry);
+    platform.enable_syscall_interception_with();
 
     let argv = cli_args
         .program_and_arguments

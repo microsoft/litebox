@@ -5,14 +5,10 @@ pub(crate) mod systrap;
 
 #[cfg(target_arch = "x86")]
 pub(crate) mod systrap {
-    use litebox_common_linux::SyscallRequest;
-
     pub(crate) const SYSCALL_ARG_MAGIC: usize = usize::from_le_bytes(*b"LtBx");
     pub(crate) const MMAP_FLAG_MAGIC: u32 = 1 << 31;
 
-    pub(crate) fn init_sys_intercept(
-        _handler: impl Fn(SyscallRequest<crate::LinuxUserland>) -> isize + Send + Sync + 'static,
-    ) {
+    pub(crate) fn init_sys_intercept() {
         // TODO: Actually start intercepting syscalls on 32-bit Linux.
         //
         // Temporarily, we are not setting anything up, while getting things compiling onto 32-bit Linux.
