@@ -112,12 +112,12 @@ impl<Platform: RawSyncPrimitivesProvider> Socket<Platform> {
             },
             SocketOptionName::Socket(so) => {
                 let read_timeval_as_duration =
-                    |optval| -> Result<Option<core::time::Duration>, Errno> {
+                    |optval: ConstPtr<_>| -> Result<Option<core::time::Duration>, Errno> {
                         if optlen < size_of::<litebox_common_linux::TimeVal>() {
                             return Err(Errno::EINVAL);
                         }
                         let optval: ConstPtr<litebox_common_linux::TimeVal> =
-                            unsafe { core::mem::transmute(optval) };
+                            ConstPtr::from_usize(optval.as_usize());
                         let timeval = unsafe { optval.read_at_offset(0) }
                             .ok_or(Errno::EFAULT)?
                             .into_owned();
@@ -139,7 +139,7 @@ impl<Platform: RawSyncPrimitivesProvider> Socket<Platform> {
                 if optlen < size_of::<u32>() {
                     return Err(Errno::EINVAL);
                 }
-                let optval: ConstPtr<u32> = unsafe { core::mem::transmute(optval) };
+                let optval: ConstPtr<u32> = ConstPtr::from_usize(optval.as_usize());
                 let val = unsafe { optval.read_at_offset(0) }
                     .ok_or(Errno::EFAULT)?
                     .into_owned();
@@ -185,7 +185,7 @@ impl<Platform: RawSyncPrimitivesProvider> Socket<Platform> {
                 Ok(())
             }
             SocketOptionName::TCP(to) => {
-                let optval: ConstPtr<u32> = unsafe { core::mem::transmute(optval) };
+                let optval: ConstPtr<u32> = ConstPtr::from_usize(optval.as_usize());
                 let val = unsafe { optval.read_at_offset(0) }
                     .ok_or(Errno::EFAULT)?
                     .into_owned();
@@ -380,7 +380,7 @@ fn read_sockaddr_from_user(sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<Soc
         return Err(Errno::EINVAL);
     }
 
-    let ptr: ConstPtr<u16> = unsafe { core::mem::transmute(sockaddr) };
+    let ptr: ConstPtr<u16> = ConstPtr::from_usize(sockaddr.as_usize());
     let family = unsafe { ptr.read_at_offset(0) }
         .ok_or(Errno::EFAULT)?
         .into_owned();
@@ -390,7 +390,7 @@ fn read_sockaddr_from_user(sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<Soc
             if addrlen < size_of::<CSockInetAddr>() {
                 return Err(Errno::EINVAL);
             }
-            let ptr: ConstPtr<CSockInetAddr> = unsafe { core::mem::transmute(sockaddr) };
+            let ptr: ConstPtr<CSockInetAddr> = ConstPtr::from_usize(sockaddr.as_usize());
             // Note it reads the first 2 bytes (i.e., sa_family) again, but it is not used.
             // SocketAddrV4 only needs the port and addr.
             let inet_addr = unsafe { ptr.read_at_offset(0) }
@@ -580,6 +580,7 @@ pub(crate) fn sys_setsockopt(
 mod tests {
     use alloc::string::ToString as _;
     use litebox::net::SendFlags;
+    use litebox::platform::RawConstPointer as _;
     use litebox_common_linux::{AddressFamily, SockFlags, SockType, errno::Errno};
 
     use crate::{ConstPtr, syscalls::file::sys_close};
@@ -629,7 +630,8 @@ mod tests {
         .unwrap();
         let server = i32::try_from(server).unwrap();
         let sockaddr = create_inet_addr(ip, port);
-        let addr: ConstPtr<u8> = unsafe { core::mem::transmute(&sockaddr) };
+        let addr: ConstPtr<u8> =
+            ConstPtr::from_usize(core::ptr::from_ref(&sockaddr).expose_provenance());
         sys_bind(server, addr, core::mem::size_of::<CSockInetAddr>())
             .expect("Failed to bind socket");
         sys_listen(server, 1).expect("Failed to listen on socket");
@@ -652,7 +654,7 @@ mod tests {
         };
         let client_fd = i32::try_from(client_fd).unwrap();
         let buf = "Hello, world!";
-        let ptr = unsafe { core::mem::transmute::<*const _, ConstPtr<u8>>(buf.as_ptr()) };
+        let ptr = ConstPtr::from_usize(buf.as_ptr().expose_provenance());
         let n = if is_nonblocking {
             loop {
                 match sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None, 0) {
