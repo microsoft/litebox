@@ -2,7 +2,7 @@
 
 use crate::{
     debug_serial_println,
-    mshv::vsm::{KernelSymbolMap, MemoryMapWithContent},
+    mshv::vsm::{KernelSymbolMap, ModuleMemoryWithContent},
 };
 use alloc::{string::ToString, vec, vec::Vec};
 use goblin::elf::{
@@ -12,19 +12,16 @@ use goblin::elf::{
 };
 use hashbrown::HashMap;
 
-// handle `.text` section first and consider other sections (`.init.text`, `.rodata`) later.
-// apply `.rela.call_sites`, `.rela.return_sites`, and `.rela__patchable_function_entries` to update
-// `.call_sites`, `.return_sites`, and `__patchable_function_entries` sections, and
-// use them together with `.rela.text`, `ksymtabs`, and `ksymtabs_gpl` to patch the `.text` section.
+// focusing on basic `.rela.<section_name>` stuffs for now. Linux kernel does have many other custom relocations
+// like `rela.call_sites`, `rela.return_sites`, and `rela__patchable_function_entries`.
 
 pub fn validate_module_elf(
-    mem_elf: &MemoryMapWithContent,
-    mem_text: &MemoryMapWithContent,
-    mem_init_text: &MemoryMapWithContent,
+    mod_mem: &ModuleMemoryWithContent,
     ksymtab: &KernelSymbolMap,
     ksymtab_gpl: &KernelSymbolMap,
 ) -> Result<(), ()> {
-    let elf_size = usize::try_from(mem_elf.end().unwrap() - mem_elf.start().unwrap()).unwrap();
+    let elf_size =
+        usize::try_from(mod_mem.elf.end().unwrap() - mod_mem.elf.start().unwrap()).unwrap();
 
     // TODO: There are many kernel modules whose size exceeds VTL1's memory limit. We should consider how to handle them.
     if elf_size > 256 * 1024 {
@@ -33,21 +30,16 @@ pub fn validate_module_elf(
     }
 
     let mut elf_buf = vec![0u8; elf_size];
-    mem_elf
-        .read_bytes(mem_elf.start().unwrap(), &mut elf_buf)
+    mod_mem
+        .elf
+        .read_bytes(mod_mem.elf.start().unwrap(), &mut elf_buf)
         .expect("Failed to read kernel module ELF buffer");
 
-    let text_section_base_addr = mem_text.start().unwrap();
-    if let Ok(text_reloc) = load_elf(
-        &elf_buf,
-        ".text",
-        text_section_base_addr.as_u64(),
-        ksymtab,
-        ksymtab_gpl,
-    ) {
+    if let Ok(text_reloc) = load_elf(&elf_buf, ".text", mod_mem, ksymtab, ksymtab_gpl) {
         let mut text_loaded = vec![0u8; text_reloc.iter().len()];
-        mem_text
-            .read_bytes(text_section_base_addr, &mut text_loaded)
+        mod_mem
+            .text
+            .read_bytes(mod_mem.text.start().unwrap(), &mut text_loaded)
             .expect("Failed to read kernel module .text section");
 
         let mut i = 0;
@@ -66,17 +58,11 @@ pub fn validate_module_elf(
         }
     }
 
-    let init_text_section_base_addr = mem_init_text.start().unwrap();
-    if let Ok(text_reloc) = load_elf(
-        &elf_buf,
-        ".init.text",
-        init_text_section_base_addr.as_u64(),
-        ksymtab,
-        ksymtab_gpl,
-    ) {
+    if let Ok(text_reloc) = load_elf(&elf_buf, ".init.text", mod_mem, ksymtab, ksymtab_gpl) {
         let mut text_loaded = vec![0u8; text_reloc.iter().len()];
-        mem_init_text
-            .read_bytes(init_text_section_base_addr, &mut text_loaded)
+        mod_mem
+            .init_text
+            .read_bytes(mod_mem.init_text.start().unwrap(), &mut text_loaded)
             .expect("Failed to read kernel module .init.text section");
 
         let mut i = 0;
@@ -103,7 +89,7 @@ pub fn validate_module_elf(
 pub fn load_elf(
     elf_slice: &[u8],
     section_name: &str,
-    section_base_addr: u64,
+    mod_mem: &ModuleMemoryWithContent,
     ksymtab: &KernelSymbolMap,
     ksymtab_gpl: &KernelSymbolMap,
 ) -> Result<Vec<u8>, i64> {
@@ -121,6 +107,15 @@ pub fn load_elf(
             debug_serial_println!("Symbol: {:30} -> {:#x}", name, addr,);
         }
     }
+
+    let section_base_addr: u64 = match section_name {
+        ".text" => mod_mem.text.start().unwrap().as_u64(),
+        ".init.text" => mod_mem.init_text.start().unwrap().as_u64(),
+        _ => {
+            debug_serial_println!("Unsupported section name: {section_name}");
+            return Err(-1);
+        }
+    };
 
     let mut target_section: Option<&SectionHeader> = None;
 
@@ -170,34 +165,69 @@ pub fn load_elf(
         }
 
         for reloc in relocations {
+            let r_offset = usize::try_from(reloc.r_offset).unwrap();
+            let r_sym = reloc.r_sym;
+            let r_addend = reloc.r_addend.unwrap_or(0);
+            let r_type = reloc.r_type;
+
+            debug_serial_println!(
+                "Relocation: r_offset {:#x}, r_sym {}, r_addend {}, r_type {}",
+                r_offset,
+                r_sym,
+                r_addend,
+                r_type
+            );
+
             // symbol relocation
             let sym = elf
                 .syms
                 .get(reloc.r_sym)
                 .ok_or_else(|| alloc::format!("Invalid symbol index: {}", reloc.r_sym));
-            let sym_name = elf.strtab.get_at(sym.unwrap().st_name).unwrap();
-            if sym_name.starts_with("__") {
-                continue; // skip internal symbols
-            }
-            let Some(sym_val) = symbol_map.get(sym_name).copied() else {
-                continue; // skip symbols that are not found in the symbol map
-            };
-            let symbol_addr = if sym_val != 0 {
-                section_base_addr + sym_val
-            } else {
-                // if a symbol is undefined (`st_value == 0`), check whether it is a symbol defined in the kernel.
-                if let Some(external_addr) = ksymtab.get(sym_name) {
-                    external_addr.as_u64()
-                } else if let Some(external_addr) = ksymtab_gpl.get(sym_name) {
-                    external_addr.as_u64()
-                } else {
-                    section_base_addr
-                }
-            };
 
-            let r_offset = usize::try_from(reloc.r_offset).unwrap();
-            let r_addend = reloc.r_addend.unwrap_or(0);
-            let r_type = reloc.r_type;
+            let mut symbol_addr: Option<u64> = None;
+
+            let section = &elf.section_headers[sym.as_ref().unwrap().st_shndx];
+            let name_offset = section.sh_name;
+            let section_name = elf
+                .shdr_strtab
+                .get_at(name_offset)
+                .unwrap_or("unknown section");
+            match section_name {
+                ".text" => {
+                    symbol_addr = Some(mod_mem.text.start().unwrap().as_u64());
+                }
+                ".data" => {
+                    symbol_addr = Some(mod_mem.data.start().unwrap().as_u64());
+                }
+                ".rodata" => {
+                    symbol_addr = Some(mod_mem.ro_data.start().unwrap().as_u64());
+                }
+                _ => {}
+            }
+            if symbol_addr.is_none() {
+                let sym_name = elf.strtab.get_at(sym.unwrap().st_name).unwrap();
+
+                if !sym_name.starts_with("__") {
+                    if let Some(sym_val) = symbol_map.get(sym_name).copied() {
+                        if sym_val != 0 {
+                            symbol_addr = Some(section_base_addr + sym_val);
+                        } else {
+                            // if a symbol is undefined (`st_value == 0`), check whether it is a symbol defined in the kernel.
+                            if let Some(external_addr) = ksymtab.get(sym_name) {
+                                symbol_addr = Some(external_addr.as_u64());
+                            } else if let Some(external_addr) = ksymtab_gpl.get(sym_name) {
+                                symbol_addr = Some(external_addr.as_u64());
+                            } else {
+                                symbol_addr = Some(section_base_addr);
+                            }
+                        }
+                    }
+                }
+            }
+            if symbol_addr.is_none() {
+                continue;
+            }
+            let symbol_addr = symbol_addr.unwrap();
 
             #[allow(clippy::cast_possible_truncation)]
             #[allow(clippy::cast_possible_wrap)]
@@ -224,6 +254,7 @@ pub fn load_elf(
                     text_vec[r_offset..r_offset + 4].copy_from_slice(&value_i32.to_le_bytes());
                 }
                 R_X86_64_PLT32 | R_X86_64_PC32 => {
+                    // debug_serial_println!("r_offset: {r_offset}, sym_name: {sym_name}");
                     assert!(r_offset + 4 <= text_vec.len());
                     let reloc_address = section_base_addr + r_offset as u64;
                     let value = (symbol_addr as i64 + r_addend) - reloc_address as i64;
