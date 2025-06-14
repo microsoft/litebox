@@ -20,8 +20,7 @@ pub fn validate_module_elf(
     ksymtab: &KernelSymbolMap,
     ksymtab_gpl: &KernelSymbolMap,
 ) -> Result<(), ()> {
-    let elf_size =
-        usize::try_from(mod_mem.elf.end().unwrap() - mod_mem.elf.start().unwrap()).unwrap();
+    let elf_size = mod_mem.elf.len();
 
     // TODO: There are many kernel modules whose size exceeds VTL1's memory limit. We should consider how to handle them.
     if elf_size > 256 * 1024 {
@@ -46,7 +45,8 @@ pub fn validate_module_elf(
         while i < text_loaded.len() {
             if text_reloc[i] != text_loaded[i] {
                 if i + 5 < text_loaded.len()
-                    && text_reloc[i..=i + 5] == [0xc3, 0xcc, 0xcc, 0xcc, 0xcc]
+                    && text_reloc[i..i + 5] == [0xc3, 0xcc, 0xcc, 0xcc, 0xcc]
+                    && text_loaded[i..i + 5] == [0xff, 0xe7, 0xcc, 0x66, 0x90]
                 {
                     // this is a patched jump 0, which we allow to mismatch for now
                     i += 5;
@@ -69,7 +69,8 @@ pub fn validate_module_elf(
         while i < text_loaded.len() {
             if text_reloc[i] != text_loaded[i] {
                 if i + 5 < text_loaded.len()
-                    && text_reloc[i..=i + 5] == [0xc3, 0xcc, 0xcc, 0xcc, 0xcc]
+                    && text_reloc[i..i + 5] == [0xc3, 0xcc, 0xcc, 0xcc, 0xcc]
+                    && text_loaded[i..i + 5] == [0xff, 0xe7, 0xcc, 0x66, 0x90]
                 {
                     i += 5;
                     continue;
@@ -186,47 +187,53 @@ pub fn load_elf(
 
             let mut symbol_addr: Option<u64> = None;
 
-            let section = &elf.section_headers[sym.as_ref().unwrap().st_shndx];
-            let name_offset = section.sh_name;
-            let section_name = elf
-                .shdr_strtab
-                .get_at(name_offset)
-                .unwrap_or("unknown section");
-            match section_name {
-                ".text" => {
-                    symbol_addr = Some(mod_mem.text.start().unwrap().as_u64());
-                }
-                ".data" => {
-                    symbol_addr = Some(mod_mem.data.start().unwrap().as_u64());
-                }
-                ".rodata" => {
-                    symbol_addr = Some(mod_mem.ro_data.start().unwrap().as_u64());
-                }
-                _ => {}
-            }
-            if symbol_addr.is_none() {
-                let sym_name = elf.strtab.get_at(sym.unwrap().st_name).unwrap();
+            if u32::try_from(sym.as_ref().unwrap().st_shndx).unwrap()
+                == goblin::elf::section_header::SHN_ABS
+            {
+                symbol_addr = Some(section_base_addr + sym.as_ref().unwrap().st_value);
+            } else {
+                let sym_name = elf.strtab.get_at(sym.clone().unwrap().st_name).unwrap();
 
-                if !sym_name.starts_with("__") {
-                    if let Some(sym_val) = symbol_map.get(sym_name).copied() {
-                        if sym_val != 0 {
-                            symbol_addr = Some(section_base_addr + sym_val);
-                        } else {
-                            // if a symbol is undefined (`st_value == 0`), check whether it is a symbol defined in the kernel.
-                            if let Some(external_addr) = ksymtab.get(sym_name) {
-                                symbol_addr = Some(external_addr.as_u64());
-                            } else if let Some(external_addr) = ksymtab_gpl.get(sym_name) {
-                                symbol_addr = Some(external_addr.as_u64());
-                            } else {
-                                symbol_addr = Some(section_base_addr);
-                            }
+                if let Some(sym_val) = symbol_map.get(sym_name).copied() {
+                    if sym_val != 0 {
+                        symbol_addr = Some(section_base_addr + sym_val);
+                    }
+                }
+
+                if symbol_addr.is_none() && !sym_name.starts_with("__") {
+                    if let Some(external_addr) = ksymtab.get(sym_name) {
+                        symbol_addr = Some(external_addr.as_u64());
+                    } else if let Some(external_addr) = ksymtab_gpl.get(sym_name) {
+                        symbol_addr = Some(external_addr.as_u64());
+                    }
+                }
+
+                if symbol_addr.is_none() {
+                    let section = &elf.section_headers[sym.as_ref().unwrap().st_shndx];
+                    let name_offset = section.sh_name;
+                    let section_name = elf
+                        .shdr_strtab
+                        .get_at(name_offset)
+                        .unwrap_or("unknown section");
+                    match section_name {
+                        ".text" => {
+                            symbol_addr = Some(mod_mem.text.start().unwrap().as_u64());
                         }
+                        ".data" => {
+                            symbol_addr = Some(mod_mem.data.start().unwrap().as_u64());
+                        }
+                        ".rodata" => {
+                            symbol_addr = Some(mod_mem.ro_data.start().unwrap().as_u64());
+                        }
+                        _ => {}
                     }
                 }
             }
+
             if symbol_addr.is_none() {
                 continue;
             }
+
             let symbol_addr = symbol_addr.unwrap();
 
             #[allow(clippy::cast_possible_truncation)]
@@ -254,7 +261,6 @@ pub fn load_elf(
                     text_vec[r_offset..r_offset + 4].copy_from_slice(&value_i32.to_le_bytes());
                 }
                 R_X86_64_PLT32 | R_X86_64_PC32 => {
-                    // debug_serial_println!("r_offset: {r_offset}, sym_name: {sym_name}");
                     assert!(r_offset + 4 <= text_vec.len());
                     let reloc_address = section_base_addr + r_offset as u64;
                     let value = (symbol_addr as i64 + r_addend) - reloc_address as i64;
@@ -274,15 +280,17 @@ pub fn load_elf(
     Ok(text_vec)
 }
 
-// for simplicity, we replace every jump 0 (`[0xe9, 0x0, 0x0, 0x0, 0x0]`) with `[0xc3, 0xcc, 0xcc, 0xcc, 0xcc]` and
-// allow binary sequence mismatch only if it is `[0xff, 0xe7, 0xcc, 0x66, 0x90]`
+// jump 0 (`[0xe9, 0x0, 0x0, 0x0, 0x0]`) can be replaced with
+// either `[0xc3, 0xcc, 0xcc, 0xcc, 0xcc]` or `[0xff, 0xe7, 0xcc, 0x66, 0x90]`.
+// for simplicity, we replace every jump 0 with `[0xc3, 0xcc, 0xcc, 0xcc, 0xcc]`.
+// We allow binary sequence mismatch if it is `[0xff, 0xe7, 0xcc, 0x66, 0x90]`.
 fn patch_jmp0_to_ret(buf: &mut [u8]) {
     let mut i = 0;
     while i + 4 < buf.len() {
-        if buf[i] == 0xe9 && buf[i + 1..=i + 4] == [0x0, 0x0, 0x0, 0x0] {
+        if buf[i] == 0xe9 && buf[i + 1..i + 5] == [0x0, 0x0, 0x0, 0x0] {
             buf[i] = 0xc3;
-            buf[i + 1..=i + 4].fill(0xcc);
-            i += 1;
+            buf[i + 1..i + 5].fill(0xcc);
+            i += 5;
         } else {
             i += 1;
         }

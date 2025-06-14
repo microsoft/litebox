@@ -1149,40 +1149,44 @@ impl ModuleMemoryWithContent {
 /// against local adversaries.
 pub struct MemoryMapWithContent {
     pages: BTreeMap<VirtAddr, Box<[u8; PAGE_SIZE]>>,
-    start: Option<VirtAddr>,
-    end: Option<VirtAddr>,
+    range: Range<VirtAddr>,
 }
 
 impl MemoryMapWithContent {
     pub fn new() -> Self {
         Self {
             pages: BTreeMap::new(),
-            start: None,
-            end: None,
+            range: Range {
+                start: VirtAddr::new(0),
+                end: VirtAddr::new(0),
+            },
         }
     }
 
     pub fn start(&self) -> Option<VirtAddr> {
-        self.start
-    }
-
-    pub fn end(&self) -> Option<VirtAddr> {
-        self.end
-    }
-
-    fn set_start(&mut self, addr: VirtAddr) {
-        if self.start.is_none() {
-            self.start = Some(addr);
+        if self.range.is_empty() {
+            None
         } else {
-            self.start = Some(core::cmp::min(self.start.unwrap(), addr));
+            Some(self.range.start)
         }
     }
 
-    fn set_end(&mut self, addr: VirtAddr) {
-        if self.end.is_none() {
-            self.end = Some(addr);
+    pub fn len(&self) -> usize {
+        if self.range.is_empty() {
+            0
         } else {
-            self.end = Some(core::cmp::max(self.end.unwrap(), addr));
+            usize::try_from(self.range.end - self.range.start).unwrap()
+        }
+    }
+
+    fn extend_range(&mut self, start: VirtAddr, end: VirtAddr) {
+        assert!(start <= end, "Invalid range: start > end");
+        if self.range.is_empty() {
+            self.range.start = start;
+            self.range.end = end;
+        } else {
+            self.range.start = core::cmp::min(self.range.start, start);
+            self.range.end = core::cmp::max(self.range.end, end);
         }
     }
 
@@ -1198,8 +1202,7 @@ impl MemoryMapWithContent {
         let page_offset: usize = addr.page_offset().into();
         self.get_or_alloc_page(addr)[page_offset] = value;
 
-        self.set_start(addr);
-        self.set_end(addr + 1);
+        self.extend_range(addr, addr + 1);
     }
 
     pub fn write_vtl0_phys_bytes(
@@ -1226,8 +1229,7 @@ impl MemoryMapWithContent {
             }
         }
 
-        self.set_start(addr);
-        self.set_end(addr + (phys_end - phys_start));
+        self.extend_range(addr, addr + (phys_end - phys_start));
         Ok(())
     }
 
@@ -1285,8 +1287,7 @@ impl MemoryMapWithContent {
         }
 
         if num_bytes == data.len() {
-            self.set_start(start);
-            self.set_end(end);
+            self.extend_range(start, end);
             Ok(())
         } else {
             Err(())
