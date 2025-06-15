@@ -354,7 +354,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
                                 PhysAddr::new(pa),
                                 PhysAddr::new(epa),
                             )
-                            .expect("VSM: Failed to get VTL0 kernel module memory");
+                            .map_err(|_| Errno::EINVAL)?;
                     }
                     HekiKdataType::KernelData => {
                         heki_kernel_data_mem
@@ -363,13 +363,18 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
                                 PhysAddr::new(pa),
                                 PhysAddr::new(epa),
                             )
-                            .expect("VSM: Failed to get VTL0 kernel module memory");
+                            .map_err(|_| Errno::EINVAL)?;
                     }
                     _ => {}
                 }
             }
         }
     } else {
+        return Err(Errno::EINVAL);
+    }
+
+    if heki_kernel_info_mem.len() == 0 || heki_kernel_data_mem.len() == 0 {
+        serial_println!("VSM: No kernel info or data loaded");
         return Err(Errno::EINVAL);
     }
 
@@ -388,7 +393,10 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
                     end: VirtAddr::new(heki_kernel_info.ksymtab_gpl_end as u64),
                 },
                 &heki_kernel_data_mem,
-            );
+            )
+            .map_err(|_| Errno::EINVAL)?;
+    } else {
+        return Err(Errno::EINVAL);
     }
 
     // TODO: create trusted keys
@@ -441,7 +449,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                                 PhysAddr::new(pa),
                                 PhysAddr::new(epa),
                             )
-                            .expect("VSM: Failed to get VTL0 kernel module memory");
+                            .map_err(|_| Errno::EINVAL)?;
                     }
                     _ => {
                         // if input memory range's type is neither `Unknown` nor `ElfBuffer`, its addresses must be page-aligned
@@ -462,7 +470,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                                         PhysAddr::new(pa),
                                         PhysAddr::new(epa),
                                     )
-                                    .expect("VSM: Failed to get VTL0 kernel module memory");
+                                    .map_err(|_| Errno::EINVAL)?;
                             }
                             ModMemType::InitText => {
                                 module_memory_with_content
@@ -472,7 +480,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                                         PhysAddr::new(pa),
                                         PhysAddr::new(epa),
                                     )
-                                    .expect("VSM: Failed to get VTL0 kernel module memory");
+                                    .map_err(|_| Errno::EINVAL)?;
                             }
                             ModMemType::Data => {
                                 module_memory_with_content
@@ -482,7 +490,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                                         PhysAddr::new(pa),
                                         PhysAddr::new(epa),
                                     )
-                                    .expect("VSM: Failed to get VTL0 kernel module memory");
+                                    .map_err(|_| Errno::EINVAL)?;
                             }
                             ModMemType::RoData => {
                                 module_memory_with_content
@@ -492,7 +500,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                                         PhysAddr::new(pa),
                                         PhysAddr::new(epa),
                                     )
-                                    .expect("VSM: Failed to get VTL0 kernel module memory");
+                                    .map_err(|_| Errno::EINVAL)?;
                             }
                             ModMemType::RoAfterInit => {
                                 module_memory_with_content
@@ -502,7 +510,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                                         PhysAddr::new(pa),
                                         PhysAddr::new(epa),
                                     )
-                                    .expect("VSM: Failed to get VTL0 kernel module memory");
+                                    .map_err(|_| Errno::EINVAL)?;
                             }
                             ModMemType::InitData => {
                                 module_memory_with_content
@@ -512,7 +520,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                                         PhysAddr::new(pa),
                                         PhysAddr::new(epa),
                                     )
-                                    .expect("VSM: Failed to get VTL0 kernel module memory");
+                                    .map_err(|_| Errno::EINVAL)?;
                             }
                             ModMemType::InitRoData => {
                                 module_memory_with_content
@@ -522,7 +530,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                                         PhysAddr::new(pa),
                                         PhysAddr::new(epa),
                                     )
-                                    .expect("VSM: Failed to get VTL0 kernel module memory");
+                                    .map_err(|_| Errno::EINVAL)?;
                             }
                             _ => {
                                 panic!("VSM: Unsupported module memory type for validation");
@@ -552,7 +560,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
             let mut elf_buf = vec![0u8; elf_size];
             memory_elf
                 .read_bytes(memory_elf.start().unwrap(), &mut elf_buf)
-                .expect("Failed to read kernel module ELF buffer");
+                .map_err(|_| Errno::EINVAL)?;
             memory_elf.clear();
             Some(elf_buf)
         } else {
@@ -854,19 +862,19 @@ impl Vtl0KernelInfo {
         ksymtab_range: Range<VirtAddr>,
         kernel_data_mem: &MemoryMapWithContent,
         ksymtab_map: &mut HashMap<String, VirtAddr>,
-    ) {
+    ) -> Result<(), Vtl0KernelInfoError> {
         let mut current = ksymtab_range.start;
         while current < ksymtab_range.end {
             let value_offset = kernel_data_mem
                 .read_value::<i32>(
                     current + u64::try_from(offset_of!(KernelSymbol, value_offset)).unwrap(),
                 )
-                .unwrap();
+                .ok_or(Vtl0KernelInfoError::MemoryError)?;
             let name_offset = kernel_data_mem
                 .read_value::<i32>(
                     current + u64::try_from(offset_of!(KernelSymbol, name_offset)).unwrap(),
                 )
-                .unwrap();
+                .ok_or(Vtl0KernelInfoError::MemoryError)?;
 
             #[allow(clippy::cast_possible_truncation)]
             #[allow(clippy::cast_possible_wrap)]
@@ -887,11 +895,15 @@ impl Vtl0KernelInfo {
             );
 
             let mut buf = [0u8; KSYM_NAME_LEN];
-            kernel_data_mem.read_bytes(name_addr, &mut buf).unwrap();
+            kernel_data_mem
+                .read_bytes(name_addr, &mut buf)
+                .map_err(|_| Vtl0KernelInfoError::MemoryError)?;
             if let Some(name) =
                 unsafe { CStr::from_ptr(buf.as_ptr().cast::<c_char>()).to_str().ok() }
             {
                 ksymtab_map.insert(String::from(name), value_addr);
+            } else {
+                return Err(Vtl0KernelInfoError::MemoryError);
             }
 
             // unclear whether we need the `namespace` field to support the relocation.
@@ -899,6 +911,8 @@ impl Vtl0KernelInfo {
 
             current += core::mem::size_of::<KernelSymbol>() as u64;
         }
+
+        Ok(())
     }
 
     pub fn populate_kernel_symbol_maps(
@@ -906,16 +920,23 @@ impl Vtl0KernelInfo {
         ksymtab_range: Range<VirtAddr>,
         ksymtab_gpl_range: Range<VirtAddr>,
         kernel_data_mem: &MemoryMapWithContent,
-    ) {
+    ) -> Result<(), Vtl0KernelInfoError> {
         let mut ksymtab_map: HashMap<String, VirtAddr> = HashMap::new();
         let mut ksymtab_gpl_map: HashMap<String, VirtAddr> = HashMap::new();
 
-        self.parse_ksymtab(ksymtab_range, kernel_data_mem, &mut ksymtab_map);
+        self.parse_ksymtab(ksymtab_range, kernel_data_mem, &mut ksymtab_map)?;
         self.ksymtab_map.populate(&mut ksymtab_map);
 
-        self.parse_ksymtab(ksymtab_gpl_range, kernel_data_mem, &mut ksymtab_gpl_map);
+        self.parse_ksymtab(ksymtab_gpl_range, kernel_data_mem, &mut ksymtab_gpl_map)?;
         self.ksymtab_gpl_map.populate(&mut ksymtab_gpl_map);
+
+        Ok(())
     }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Vtl0KernelInfoError {
+    MemoryError,
 }
 
 /// Data structure for maintaining the memory ranges of each VTL0 kernel module and their types
