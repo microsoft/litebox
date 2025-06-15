@@ -29,7 +29,7 @@ use crate::{
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
-        kernel_elf::validate_module_elf,
+        kernel_elf::{parse_modinfo, validate_module_elf},
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,
@@ -556,7 +556,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         let elf_size = memory_elf.len();
 
         // TODO: For now, we ignore large kernel modules, but we should consider how to handle them.
-        if elf_size > 256 * 1024 {
+        if elf_size <= 300 * 1024 {
             let mut elf_buf = vec![0u8; elf_size];
             memory_elf
                 .read_bytes(memory_elf.start().unwrap(), &mut elf_buf)
@@ -570,6 +570,8 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     };
 
     if let Some(elf_buf) = elf_buf_to_validate {
+        parse_modinfo(&elf_buf);
+
         let _ = validate_module_elf(
             &elf_buf,
             &module_memory_with_content,
