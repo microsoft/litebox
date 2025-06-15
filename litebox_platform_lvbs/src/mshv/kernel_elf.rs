@@ -8,7 +8,6 @@ use alloc::{string::ToString, vec, vec::Vec};
 use goblin::elf::{
     Elf,
     reloc::{R_X86_64_32, R_X86_64_32S, R_X86_64_64, R_X86_64_PC32, R_X86_64_PLT32},
-    section_header::SectionHeader,
 };
 use hashbrown::HashMap;
 
@@ -22,6 +21,30 @@ use hashbrown::HashMap;
 
 // focusing on basic `.rela.<section_name>` stuffs for now. Linux kernel does have many other custom relocations
 // like `rela.call_sites`, `rela.return_sites`, and `rela__patchable_function_entries`.
+
+pub fn parse_modinfo(elf_buf: &[u8]) {
+    let Ok(elf) = Elf::parse(elf_buf) else {
+        return;
+    };
+
+    if let Some(section) = elf
+        .section_headers
+        .iter()
+        .find(|s| s.sh_size > 0 && elf.shdr_strtab.get_at(s.sh_name) == Some(".modinfo"))
+    {
+        let start = usize::try_from(section.sh_offset).unwrap();
+        let end = start + usize::try_from(section.sh_size).unwrap();
+        let modinfo_data = &elf_buf[start..end];
+
+        for entry in modinfo_data.split(|&b| b == 0) {
+            if let Ok(s) = str::from_utf8(entry) {
+                if let Some((k, v)) = s.split_once('=') {
+                    debug_serial_println!("Modinfo: {} = {}", k, v);
+                }
+            }
+        }
+    }
+}
 
 /// This function validates the kernel module ELF file and its sections.
 pub fn validate_module_elf(
@@ -40,6 +63,11 @@ pub fn validate_module_elf(
         let _ = match_relocation(&text_reloc, &text_loaded);
     } else {
         return Err(KernelElfError::SectionRelocationFailed);
+    }
+
+    if mod_mem.init_text.len() == 0 {
+        // if the module does not have `.init.text`, we skip the validation.
+        return Ok(true);
     }
 
     if let Ok(text_reloc) =
@@ -76,19 +104,38 @@ fn match_relocation(text_reloc: &[u8], text_loaded: &[u8]) -> Result<bool, Kerne
                 && text_loaded[i..i + 5] == [0xff, 0xe7, 0xcc, 0x66, 0x90]
             {
                 // this is a jump 0 patch, which we allow to subtle mismatch
+                // we should handle `.call_sites`, `.return_sites`, and other sections
+                // to do not rely on this heuristic.
                 i += 5;
                 continue;
-            } else if i + 4 < text_loaded.len()
-                && text_reloc[i + 1] & 0xe0 == text_loaded[i + 1] & 0xe0
+            }
+            if i + 4 < text_loaded.len()
+                && text_reloc[i + 1] & 0xc0 == text_loaded[i + 1] & 0xc0
                 && text_reloc[i + 2..i + 4] == text_loaded[i + 2..i + 4]
             {
                 // this mismatch must be allowed only for section header relocations.
-                // we require relocation information (i.e., offset & size) to clarify this.
+                // we require relocation information (i.e., offset & size) to properly handle this.
+                i += 4;
+                continue;
+            }
+            if i + 4 < text_loaded.len()
+                && text_reloc[i..i + 4] == [0xf3, 0x0f, 0x1e, 0xfa]
+                && (text_loaded[i..i + 4] == [0x66, 0x0f, 0x1f, 0xfa]
+                    || text_loaded[i..i + 4] == [0x66, 0x0f, 0x1f, 0x00]
+                    || text_loaded[i..i + 4] == [0x0f, 0x1f, 0x40, 0x00])
+            {
+                // ENDBR64 is replaced by 4-byte NOP because the VTL0 kernel thinks that
+                // this machine does not support CET/IBT.
                 i += 4;
                 continue;
             }
 
-            debug_serial_println!("{:#x}: {:#x} {:#x}", i, text_reloc[i], text_loaded[i]);
+            debug_serial_println!(
+                "Mismatch? {:#x}: {:#x} {:#x}",
+                i,
+                text_reloc[i],
+                text_loaded[i]
+            );
             matched = false;
         }
         i += 1;
@@ -131,29 +178,15 @@ pub fn relocate_elf_section(
         }
     };
 
-    let mut target_section: Option<&SectionHeader> = None;
-    for section in &elf.section_headers {
-        if section.sh_flags & u64::from(goblin::elf64::section_header::SHF_ALLOC) != 0
-            && section.sh_size > 0
-        {
-            if let Some(name) = elf.shdr_strtab.get_at(section.sh_name) {
-                if name == section_name {
-                    debug_serial_println!(
-                        "Found {:?} section: offset {:#x}, size {:#x}",
-                        section_name,
-                        section.sh_offset,
-                        section.sh_size
-                    );
-                    target_section = Some(section);
-                    break;
-                }
-            }
-        }
-    }
-    target_section.ok_or(KernelElfError::SectionNotFound)?;
-
-    let sect_offset = target_section.unwrap().sh_offset;
-    let sect_size = target_section.unwrap().sh_size;
+    let Some(section) = elf.section_headers.iter().find(|s| {
+        s.sh_flags & u64::from(goblin::elf64::section_header::SHF_ALLOC) != 0
+            && s.sh_size > 0
+            && elf.shdr_strtab.get_at(s.sh_name) == Some(section_name)
+    }) else {
+        return Err(KernelElfError::SectionNotFound);
+    };
+    let sect_offset = section.sh_offset;
+    let sect_size = section.sh_size;
 
     let mut reloc_buf = vec![0u8; usize::try_from(sect_size).unwrap()];
     reloc_buf.copy_from_slice(
@@ -187,7 +220,7 @@ pub fn relocate_elf_section(
                 r_type
             );
 
-            let Some(sym) = elf.syms.get(reloc.r_sym) else {
+            let Some(sym) = elf.syms.get(r_sym) else {
                 continue;
             };
             let sym_name = elf.strtab.get_at(sym.st_name).unwrap();
