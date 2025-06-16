@@ -50,7 +50,7 @@ pub fn validate_module_elf(
         return Err(KernelElfError::SectionRelocationFailed);
     }
 
-    if mod_mem.init_text.len() == 0 {
+    if mod_mem.init_text.is_empty() {
         // if the module does not have `.init.text`, we skip the validation.
         return Ok(true);
     }

@@ -373,7 +373,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
         return Err(Errno::EINVAL);
     }
 
-    if heki_kernel_info_mem.len() == 0 || heki_kernel_data_mem.len() == 0 {
+    if heki_kernel_info_mem.is_empty() || heki_kernel_data_mem.is_empty() {
         serial_println!("VSM: No kernel info or data loaded");
         return Err(Errno::EINVAL);
     }
@@ -1165,6 +1165,10 @@ impl MemoryContent {
         } else {
             usize::try_from(self.range.end - self.range.start).unwrap()
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.range.is_empty()
     }
 
     #[expect(dead_code)]
