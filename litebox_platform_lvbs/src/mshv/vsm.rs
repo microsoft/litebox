@@ -488,10 +488,11 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
 
     // TODO: validate a kernel module by analyzing its ELF binary and memory content.
     let elf_buf_to_validate = {
-        let elf_size = memory_elf.len();
-
         // TODO: For now, we ignore large kernel modules, but we should consider how to handle them.
-        if elf_size <= 300 * 1024 {
+        const MODULE_VALIDATION_MAX_SIZE: usize = 300 * 1024;
+
+        let elf_size = memory_elf.len();
+        if elf_size < MODULE_VALIDATION_MAX_SIZE {
             let mut elf_buf = vec![0u8; elf_size];
             memory_elf
                 .read_bytes(memory_elf.start().unwrap(), &mut elf_buf)
@@ -1171,7 +1172,6 @@ impl MemoryContent {
         self.range.is_empty()
     }
 
-    #[expect(dead_code)]
     pub fn contains(&self, addr: VirtAddr) -> bool {
         self.range.contains(&addr)
             && self
@@ -1233,7 +1233,6 @@ impl MemoryContent {
         Ok(())
     }
 
-    #[expect(dead_code)]
     pub fn read_byte(&self, addr: VirtAddr) -> Option<u8> {
         let page_base = addr.align_down(u64::try_from(PAGE_SIZE).unwrap_or(4096));
         let page_offset: usize = addr.page_offset().into();
