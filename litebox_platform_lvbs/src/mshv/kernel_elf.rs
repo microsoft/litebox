@@ -2,7 +2,7 @@
 
 use crate::{
     debug_serial_println,
-    mshv::vsm::{KernelSymbolMap, ModuleMemoryWithContent},
+    mshv::vsm::{KernelSymbolMap, ModuleMemoryContent},
 };
 use alloc::{string::ToString, vec, vec::Vec};
 use goblin::elf::{
@@ -22,34 +22,19 @@ use hashbrown::HashMap;
 // focusing on basic `.rela.<section_name>` stuffs for now. Linux kernel does have many other custom relocations
 // like `rela.call_sites`, `rela.return_sites`, and `rela__patchable_function_entries`.
 
-pub fn parse_modinfo(elf_buf: &[u8]) {
-    let Ok(elf) = Elf::parse(elf_buf) else {
-        return;
-    };
+// TODO: our goal is not to make a kernel module loader which is 100% compatible with that of Linux kernel.
+// Instead, we check individual symbol/section relocation and ensure their relocated addresses are
+// within a valid range including 1) memory type and 2) minor offset differences.
+// This is slightly less strict but we don't need to worry about implementation errors, corner cases, and
+// never-ending maintenance.
 
-    if let Some(section) = elf
-        .section_headers
-        .iter()
-        .find(|s| s.sh_size > 0 && elf.shdr_strtab.get_at(s.sh_name) == Some(".modinfo"))
-    {
-        let start = usize::try_from(section.sh_offset).unwrap();
-        let end = start + usize::try_from(section.sh_size).unwrap();
-        let modinfo_data = &elf_buf[start..end];
-
-        for entry in modinfo_data.split(|&b| b == 0) {
-            if let Ok(s) = str::from_utf8(entry) {
-                if let Some((k, v)) = s.split_once('=') {
-                    debug_serial_println!("Modinfo: {} = {}", k, v);
-                }
-            }
-        }
-    }
-}
+// key: module name or ID, value: a list of exported symbols
+// module symbol table: key - symbol name, value - symbol address
 
 /// This function validates the kernel module ELF file and its sections.
 pub fn validate_module_elf(
     elf_buf: &[u8],
-    mod_mem: &ModuleMemoryWithContent,
+    mod_mem: &ModuleMemoryContent,
     ksymtab: &KernelSymbolMap,
     ksymtab_gpl: &KernelSymbolMap,
 ) -> Result<bool, KernelElfError> {
@@ -100,19 +85,18 @@ fn match_relocation(text_reloc: &[u8], text_loaded: &[u8]) -> Result<bool, Kerne
     while i < text_loaded.len() {
         if text_reloc[i] != text_loaded[i] {
             if i + 5 < text_loaded.len()
-                && text_reloc[i..i + 5] == [0xc3, 0xcc, 0xcc, 0xcc, 0xcc]
-                && text_loaded[i..i + 5] == [0xff, 0xe7, 0xcc, 0x66, 0x90]
+                && (text_loaded[i..i + 5] == [0xc3, 0xcc, 0xcc, 0xcc, 0xcc]
+                    || text_loaded[i..i + 5] == [0xff, 0xe7, 0xcc, 0x66, 0x90])
             {
+                // && text_reloc[i..i + 5] == [0xc3, 0xcc, 0xcc, 0xcc, 0xcc]
+                // && text_loaded[i..i + 5] == [0xff, 0xe7, 0xcc, 0x66, 0x90]
                 // this is a jump 0 patch, which we allow to subtle mismatch
                 // we should handle `.call_sites`, `.return_sites`, and other sections
                 // to do not rely on this heuristic.
                 i += 5;
                 continue;
             }
-            if i + 4 < text_loaded.len()
-                && text_reloc[i + 1] & 0xc0 == text_loaded[i + 1] & 0xc0
-                && text_reloc[i + 2..i + 4] == text_loaded[i + 2..i + 4]
-            {
+            if i + 4 < text_loaded.len() && text_reloc[i + 2..i + 4] == text_loaded[i + 2..i + 4] {
                 // this mismatch must be allowed only for section header relocations.
                 // we require relocation information (i.e., offset & size) to properly handle this.
                 i += 4;
@@ -152,7 +136,7 @@ fn match_relocation(text_reloc: &[u8], text_loaded: &[u8]) -> Result<bool, Kerne
 pub fn relocate_elf_section(
     elf_slice: &[u8],
     section_name: &str,
-    mod_mem: &ModuleMemoryWithContent,
+    mod_mem: &ModuleMemoryContent,
     ksymtab: &KernelSymbolMap,
     ksymtab_gpl: &KernelSymbolMap,
 ) -> Result<Vec<u8>, KernelElfError> {
@@ -212,13 +196,13 @@ pub fn relocate_elf_section(
             let r_addend = reloc.r_addend.unwrap_or(0);
             let r_type = reloc.r_type;
 
-            debug_serial_println!(
-                "Relocation: r_offset {:#x}, r_sym {}, r_addend {}, r_type {}",
-                r_offset,
-                r_sym,
-                r_addend,
-                r_type
-            );
+            // debug_serial_println!(
+            //     "Relocation: r_offset {:#x}, r_sym {}, r_addend {}, r_type {}",
+            //     r_offset,
+            //     r_sym,
+            //     r_addend,
+            //     r_type
+            // );
 
             let Some(sym) = elf.syms.get(r_sym) else {
                 continue;
@@ -253,12 +237,23 @@ pub fn relocate_elf_section(
                     .get_at(name_offset)
                     .unwrap_or("unknown section");
 
-                symbol_addr = match section_name {
-                    ".text" => Some(mod_mem.text.start().unwrap().as_u64()),
-                    ".init.text" => Some(mod_mem.init_text.start().unwrap().as_u64()),
-                    ".rodata" => Some(mod_mem.ro_data.start().unwrap().as_u64()),
-                    ".data" => Some(mod_mem.data.start().unwrap().as_u64()),
-                    _ => None,
+                if !section_name.is_empty() {
+                    symbol_addr = match section_name {
+                        ".text" => Some(mod_mem.text.start().unwrap().as_u64()),
+                        ".init.text" => Some(mod_mem.init_text.start().unwrap().as_u64()),
+                        ".init.data" => Some(mod_mem.init_data.start().unwrap().as_u64()),
+                        s if s.starts_with(".rodata.") => {
+                            Some(mod_mem.ro_data.start().unwrap().as_u64())
+                        }
+                        s if s.starts_with(".data.") || s == ".bss" => {
+                            Some(mod_mem.data.start().unwrap().as_u64())
+                        }
+                        _ => None,
+                    };
+
+                    if symbol_addr.is_none() {
+                        debug_serial_println!("don't know the loaded address of {section_name}");
+                    }
                 }
             }
 
@@ -324,6 +319,30 @@ fn patch_jmp0_to_ret(buf: &mut [u8]) {
             i += 5;
         } else {
             i += 1;
+        }
+    }
+}
+
+pub fn parse_modinfo(elf_buf: &[u8]) {
+    let Ok(elf) = Elf::parse(elf_buf) else {
+        return;
+    };
+
+    if let Some(section) = elf
+        .section_headers
+        .iter()
+        .find(|s| s.sh_size > 0 && elf.shdr_strtab.get_at(s.sh_name) == Some(".modinfo"))
+    {
+        let start = usize::try_from(section.sh_offset).unwrap();
+        let end = start + usize::try_from(section.sh_size).unwrap();
+        let modinfo_data = &elf_buf[start..end];
+
+        for entry in modinfo_data.split(|&b| b == 0) {
+            if let Ok(s) = str::from_utf8(entry) {
+                if let Some((k, v)) = s.split_once('=') {
+                    debug_serial_println!("Modinfo: {} = {}", k, v);
+                }
+            }
         }
     }
 }
