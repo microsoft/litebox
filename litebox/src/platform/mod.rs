@@ -312,6 +312,13 @@ where
     /// Get the address of the pointer as a `usize`.
     fn as_usize(&self) -> usize;
 
+    /// Convert a `usize` to a pointer with that address.
+    ///
+    /// Note: this can have tricky implications on exotic hardware. Implementors of this trait are
+    /// encouraged to read about [Exposed
+    /// Provenance](https://doc.rust-lang.org/std/ptr/index.html#exposed-provenance).
+    fn from_usize(addr: usize) -> Self;
+
     /// Read the value of the pointer at signed offset from it.
     ///
     /// Returns `None` if the provided pointer is invalid, or such an offset is known (in advance)

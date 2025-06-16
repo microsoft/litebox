@@ -359,9 +359,7 @@ impl ElfLoader {
                         .write(litebox_platform_multiplex::Platform::get_syscall_entry_point());
                 }
                 // `mprotect` requires the address to be page-aligned
-                let ptr = unsafe {
-                    core::mem::transmute::<*mut u8, crate::MutPtr<u8>>(start_addr as *mut u8)
-                };
+                let ptr = crate::MutPtr::from_usize(start_addr);
                 let pm = litebox_page_manager();
                 unsafe { pm.make_pages_executable(ptr, end_addr - start_addr) }
                     .expect("failed to make pages executable");

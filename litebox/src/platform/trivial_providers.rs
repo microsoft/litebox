@@ -129,7 +129,12 @@ impl<T: Clone> RawConstPointer<T> for TransparentConstPtr<T> {
     }
 
     fn as_usize(&self) -> usize {
-        self.inner as usize
+        self.inner.expose_provenance()
+    }
+    fn from_usize(addr: usize) -> Self {
+        Self {
+            inner: core::ptr::with_exposed_provenance(addr),
+        }
     }
 }
 
@@ -161,7 +166,12 @@ impl<T: Clone> RawConstPointer<T> for TransparentMutPtr<T> {
     }
 
     fn as_usize(&self) -> usize {
-        self.inner as usize
+        self.inner.expose_provenance()
+    }
+    fn from_usize(addr: usize) -> Self {
+        Self {
+            inner: core::ptr::with_exposed_provenance_mut(addr),
+        }
     }
 }
 impl<T: Clone> RawMutPointer<T> for TransparentMutPtr<T> {
