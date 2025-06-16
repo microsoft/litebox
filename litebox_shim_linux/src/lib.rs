@@ -561,7 +561,7 @@ fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) -> isize {
+unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) -> isize {
     let syscall_args: &[usize; 6] = unsafe { core::slice::from_raw_parts(args, 6) }
         .try_into()
         .unwrap();
@@ -569,4 +569,13 @@ pub unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usi
         Ok(d) => syscall_entry(d),
         Err(err) => err.as_neg() as isize,
     }
+}
+
+/// Handle Linux syscalls and dispatch them to LiteBox implementations.
+///
+/// # Panics
+///
+/// Unsupported syscalls or arguments would trigger a panic for development purposes.
+pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
+    syscall_entry(request)
 }

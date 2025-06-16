@@ -7,6 +7,7 @@ use std::os::linux::fs::MetadataExt as _;
 use std::path::PathBuf;
 
 /// Run Linux programs with LiteBox on unmodified Linux
+#[expect(clippy::struct_excessive_bools, reason = "CLI flags")]
 #[derive(Parser, Debug)]
 pub struct CliArgs {
     /// The program and arguments passed to it (e.g., `python3 --version`)
@@ -40,6 +41,15 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub rewrite_syscalls: bool,
+    /// Use SECCOMP-based syscall-interception backend
+    ///
+    /// If this is not set, it implies using only the rewriter backend
+    #[arg(
+        long = "intercept-with-seccomp",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub intercept_with_seccomp: bool,
 }
 
 /// Run Linux programs with LiteBox on unmodified Linux
@@ -139,7 +149,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
     litebox_shim_linux::set_fs(initial_file_system);
     litebox_platform_multiplex::set_platform(platform);
-    platform.enable_syscall_interception_with();
+    platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
+    if cli_args.intercept_with_seccomp {
+        platform.enable_seccomp_based_syscall_interception();
+    }
 
     let argv = cli_args
         .program_and_arguments

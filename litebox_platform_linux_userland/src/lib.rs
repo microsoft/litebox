@@ -20,13 +20,19 @@ mod syscall_intercept;
 
 extern crate alloc;
 
+/// Connector to a shim-exposed syscall-handling interface.
+pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<LinuxUserland>) -> isize;
+
+/// The syscall handler passed down from the shim.
+static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
+
 /// The userland Linux platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
 /// traits.
 pub struct LinuxUserland {
     tun_socket_fd: std::sync::RwLock<Option<std::os::fd::OwnedFd>>,
-    interception_enabled: std::sync::atomic::AtomicBool,
+    seccomp_interception_enabled: std::sync::atomic::AtomicBool,
     /// Reserved pages that are not available for guest programs to use.
     reserved_pages: Vec<core::ops::Range<usize>>,
 }
@@ -83,9 +89,22 @@ impl LinuxUserland {
 
         Box::leak(Box::new(Self {
             tun_socket_fd,
-            interception_enabled: std::sync::atomic::AtomicBool::new(false),
+            seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages: Self::read_proc_self_maps(),
         }))
+    }
+
+    /// Register the syscall handler (provided by the Linux shim)
+    ///
+    /// # Panics
+    ///
+    /// Panics if the function has already been invoked earlier.
+    pub fn register_syscall_handler(&self, syscall_handler: SyscallHandler) {
+        let old = SYSCALL_HANDLER.write().unwrap().replace(syscall_handler);
+        assert!(
+            old.is_none(),
+            "Should not register more than one syscall_handler"
+        );
     }
 
     /// Enable seccomp syscall interception on the platform.
@@ -93,9 +112,9 @@ impl LinuxUserland {
     /// # Panics
     ///
     /// Panics if this function has already been invoked on the platform earlier.
-    pub fn enable_syscall_interception_with(&self) {
+    pub fn enable_seccomp_based_syscall_interception(&self) {
         assert!(
-            self.interception_enabled
+            self.seccomp_interception_enabled
                 .compare_exchange(
                     false,
                     true,
@@ -170,7 +189,7 @@ impl litebox::platform::ExitProvider for LinuxUserland {
     fn exit(&self, code: Self::ExitCode) -> ! {
         let Self {
             tun_socket_fd,
-            interception_enabled: _,
+            seccomp_interception_enabled: _,
             reserved_pages: _,
         } = self;
         // We don't need to explicitly drop this, but doing so clarifies our intent that we want to
@@ -1009,6 +1028,12 @@ impl litebox::mm::allocator::MemoryProvider for LinuxUserland {
     }
 }
 
+#[unsafe(no_mangle)]
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" fn syscall_handler_64(syscall_number: usize, args: *const usize) -> isize {
+    unsafe { syscall_handler(syscall_number, args) }
+}
+
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     "
@@ -1075,6 +1100,13 @@ syscall_callback:
 "
 );
 
+#[unsafe(no_mangle)]
+#[cfg(target_arch = "x86")]
+unsafe extern "C" fn syscall_handler_32(args: *const usize) -> isize {
+    let syscall_number = unsafe { *args };
+    unsafe { syscall_handler(syscall_number, args.add(1)) }
+}
+
 /*
  * Syscall callback function for 32-bit x86
  *
@@ -1138,21 +1170,35 @@ syscall_callback:
 );
 
 unsafe extern "C" {
+    // Defined in asm blocks above
     fn syscall_callback() -> isize;
-    pub fn syscall_handler(syscall_number: usize, args: *const usize) -> isize;
 }
 
-#[unsafe(no_mangle)]
-#[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn syscall_handler_64(syscall_number: usize, args: *const usize) -> isize {
-    unsafe { syscall_handler(syscall_number, args) }
-}
-
-#[unsafe(no_mangle)]
-#[cfg(target_arch = "x86")]
-unsafe extern "C" fn syscall_handler_32(args: *const usize) -> isize {
-    let syscall_number = unsafe { *args };
-    unsafe { syscall_handler(syscall_number, args.add(1)) }
+/// Handles Linux syscalls and dispatches them to LiteBox implementations.
+///
+/// # Safety
+///
+/// - The `args` pointer must be valid and point to at least 6 `usize` values.
+/// - If any syscall argument is a pointer, it must be valid.
+///
+/// # Panics
+///
+/// Unsupported syscalls or arguments would trigger a panic for development purposes.
+unsafe fn syscall_handler(syscall_number: usize, args: *const usize) -> isize {
+    // SAFETY: By the requirements of this function, such a slice must be safe to form from raw.
+    let syscall_args: &[usize; 6] = unsafe { core::slice::from_raw_parts(args, 6) }
+        .try_into()
+        .unwrap();
+    match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, syscall_args) {
+        Ok(d) => {
+            let syscall_handler: SyscallHandler = SYSCALL_HANDLER
+                .read()
+                .unwrap()
+                .expect("Should have run `register_syscall_handler` by now");
+            syscall_handler(d)
+        }
+        Err(err) => err.as_neg() as isize,
+    }
 }
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
