@@ -324,8 +324,8 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
         return Err(Errno::EINVAL);
     }
 
-    let mut heki_kernel_info_mem = MemoryMapWithContent::new();
-    let mut heki_kernel_data_mem = MemoryMapWithContent::new();
+    let mut heki_kernel_info_mem = MemoryContent::new();
+    let mut heki_kernel_data_mem = MemoryContent::new();
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         for heki_page in heki_pages {
@@ -423,10 +423,12 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         nranges,
     );
 
-    // collect and maintain the memory ranges of a module locally until the module is validated and registered in the global map
-    let mut module_memory = ModuleMemory::new();
-    let mut module_memory_with_content = ModuleMemoryWithContent::new();
-    let mut memory_elf = MemoryMapWithContent::new();
+    let mut module_memory_metadata = ModuleMemoryMetadata::new();
+
+    // collect and maintain the memory ranges of a module locally until the module is validated and its metadata is registered in the global map
+    // we don't matain this content in the global map due to memory overhead. Instead, we could add its hash value to the global map to check the integrity.
+    let mut module_memory_content = ModuleMemoryContent::new();
+    let mut memory_elf = MemoryContent::new();
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         for heki_page in heki_pages {
@@ -461,83 +463,16 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                             return Err(Errno::EINVAL);
                         }
 
-                        match mod_mem_type {
-                            ModMemType::Text => {
-                                module_memory_with_content
-                                    .text
-                                    .write_vtl0_phys_bytes(
-                                        VirtAddr::new(va),
-                                        PhysAddr::new(pa),
-                                        PhysAddr::new(epa),
-                                    )
-                                    .map_err(|_| Errno::EINVAL)?;
-                            }
-                            ModMemType::InitText => {
-                                module_memory_with_content
-                                    .init_text
-                                    .write_vtl0_phys_bytes(
-                                        VirtAddr::new(va),
-                                        PhysAddr::new(pa),
-                                        PhysAddr::new(epa),
-                                    )
-                                    .map_err(|_| Errno::EINVAL)?;
-                            }
-                            ModMemType::Data => {
-                                module_memory_with_content
-                                    .data
-                                    .write_vtl0_phys_bytes(
-                                        VirtAddr::new(va),
-                                        PhysAddr::new(pa),
-                                        PhysAddr::new(epa),
-                                    )
-                                    .map_err(|_| Errno::EINVAL)?;
-                            }
-                            ModMemType::RoData => {
-                                module_memory_with_content
-                                    .ro_data
-                                    .write_vtl0_phys_bytes(
-                                        VirtAddr::new(va),
-                                        PhysAddr::new(pa),
-                                        PhysAddr::new(epa),
-                                    )
-                                    .map_err(|_| Errno::EINVAL)?;
-                            }
-                            ModMemType::RoAfterInit => {
-                                module_memory_with_content
-                                    .ro_after_init
-                                    .write_vtl0_phys_bytes(
-                                        VirtAddr::new(va),
-                                        PhysAddr::new(pa),
-                                        PhysAddr::new(epa),
-                                    )
-                                    .map_err(|_| Errno::EINVAL)?;
-                            }
-                            ModMemType::InitData => {
-                                module_memory_with_content
-                                    .init_data
-                                    .write_vtl0_phys_bytes(
-                                        VirtAddr::new(va),
-                                        PhysAddr::new(pa),
-                                        PhysAddr::new(epa),
-                                    )
-                                    .map_err(|_| Errno::EINVAL)?;
-                            }
-                            ModMemType::InitRoData => {
-                                module_memory_with_content
-                                    .init_ro_data
-                                    .write_vtl0_phys_bytes(
-                                        VirtAddr::new(va),
-                                        PhysAddr::new(pa),
-                                        PhysAddr::new(epa),
-                                    )
-                                    .map_err(|_| Errno::EINVAL)?;
-                            }
-                            _ => {
-                                panic!("VSM: Unsupported module memory type for validation");
-                            }
-                        }
+                        module_memory_content
+                            .write_vtl0_phys_bytes_by_type(
+                                VirtAddr::new(va),
+                                PhysAddr::new(pa),
+                                PhysAddr::new(epa),
+                                mod_mem_type,
+                            )
+                            .map_err(|_| Errno::EINVAL)?;
 
-                        module_memory.insert_memory_range(ModuleMemoryRange::new(
+                        module_memory_metadata.insert_memory_range(ModuleMemoryRange::new(
                             va,
                             pa,
                             epa,
@@ -574,7 +509,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
 
         let _ = validate_module_elf(
             &elf_buf,
-            &module_memory_with_content,
+            &module_memory_content,
             crate::platform_low().vtl0_kernel_info.ksymtab_map.as_ref(),
             crate::platform_low()
                 .vtl0_kernel_info
@@ -584,7 +519,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     }
 
     // protect the memory ranges of a module based on their section types
-    for mod_mem_range in &module_memory {
+    for mod_mem_range in &module_memory_metadata {
         protect_physical_memory_range(
             mod_mem_range.phys_frame_range,
             mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type),
@@ -594,8 +529,8 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     // register the module memory in the global map and obtain a unique token for it
     let token = crate::platform_low()
         .vtl0_kernel_info
-        .module_memory
-        .register_module_memory(module_memory);
+        .module_memory_metadata
+        .register_module_memory_metadata(module_memory_metadata);
     Ok(token)
 }
 
@@ -608,7 +543,7 @@ pub fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, Errno> {
 
     if !crate::platform_low()
         .vtl0_kernel_info
-        .module_memory
+        .module_memory_metadata
         .contains_key(token)
     {
         serial_println!("VSM: invalid module token");
@@ -617,7 +552,7 @@ pub fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, Errno> {
 
     if let Some(entry) = crate::platform_low()
         .vtl0_kernel_info
-        .module_memory
+        .module_memory_metadata
         .iter_entry(token)
     {
         for mod_mem_range in entry.iter_mem_ranges() {
@@ -651,7 +586,7 @@ pub fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, Errno> {
 
     if !crate::platform_low()
         .vtl0_kernel_info
-        .module_memory
+        .module_memory_metadata
         .contains_key(token)
     {
         serial_println!("VSM: invalid module token");
@@ -660,7 +595,7 @@ pub fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, Errno> {
 
     if let Some(entry) = crate::platform_low()
         .vtl0_kernel_info
-        .module_memory
+        .module_memory_metadata
         .iter_entry(token)
     {
         // make the memory ranges of a module readable, writable, and non-executable to let the VTL0 kernel unload the module
@@ -674,7 +609,7 @@ pub fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, Errno> {
 
     crate::platform_low()
         .vtl0_kernel_info
-        .module_memory
+        .module_memory_metadata
         .remove(token);
     Ok(0)
 }
@@ -825,7 +760,7 @@ fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
 /// It should be prepared by copying kernel data from VTL0 to VTL1 instead of
 /// relying on shared memory access to VTL0 which suffers from security issues.
 pub struct Vtl0KernelInfo {
-    module_memory: ModuleMemoryMap,
+    module_memory_metadata: ModuleMemoryMetadataMap,
     boot_done: AtomicBool,
     ksymtab_map: KernelSymbolMap,
     ksymtab_gpl_map: KernelSymbolMap,
@@ -835,7 +770,7 @@ pub struct Vtl0KernelInfo {
 impl Vtl0KernelInfo {
     pub fn new() -> Self {
         Self {
-            module_memory: ModuleMemoryMap::new(),
+            module_memory_metadata: ModuleMemoryMetadataMap::new(),
             boot_done: AtomicBool::new(false),
             ksymtab_map: KernelSymbolMap::new(),
             ksymtab_gpl_map: KernelSymbolMap::new(),
@@ -862,7 +797,7 @@ impl Vtl0KernelInfo {
     fn parse_ksymtab(
         &self,
         ksymtab_range: Range<VirtAddr>,
-        kernel_data_mem: &MemoryMapWithContent,
+        kernel_data_mem: &MemoryContent,
         ksymtab_map: &mut HashMap<String, VirtAddr>,
     ) -> Result<(), Vtl0KernelInfoError> {
         let mut current = ksymtab_range.start;
@@ -921,7 +856,7 @@ impl Vtl0KernelInfo {
         &self,
         ksymtab_range: Range<VirtAddr>,
         ksymtab_gpl_range: Range<VirtAddr>,
-        kernel_data_mem: &MemoryMapWithContent,
+        kernel_data_mem: &MemoryContent,
     ) -> Result<(), Vtl0KernelInfoError> {
         let mut ksymtab_map: HashMap<String, VirtAddr> = HashMap::new();
         let mut ksymtab_gpl_map: HashMap<String, VirtAddr> = HashMap::new();
@@ -942,16 +877,17 @@ pub enum Vtl0KernelInfoError {
 }
 
 /// Data structure for maintaining the memory ranges of each VTL0 kernel module and their types
-pub struct ModuleMemoryMap {
-    inner: spin::mutex::SpinMutex<HashMap<i64, ModuleMemory>>,
+pub struct ModuleMemoryMetadataMap {
+    inner: spin::mutex::SpinMutex<HashMap<i64, ModuleMemoryMetadata>>,
     key_gen: AtomicI64,
 }
 
-pub struct ModuleMemory {
+pub struct ModuleMemoryMetadata {
     ranges: Vec<ModuleMemoryRange>,
+    // exported symbols?
 }
 
-impl ModuleMemory {
+impl ModuleMemoryMetadata {
     pub fn new() -> Self {
         Self { ranges: Vec::new() }
     }
@@ -961,13 +897,13 @@ impl ModuleMemory {
     }
 }
 
-impl Default for ModuleMemory {
+impl Default for ModuleMemoryMetadata {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'a> IntoIterator for &'a ModuleMemory {
+impl<'a> IntoIterator for &'a ModuleMemoryMetadata {
     type Item = &'a ModuleMemoryRange;
     type IntoIter = core::slice::Iter<'a, ModuleMemoryRange>;
 
@@ -1002,7 +938,7 @@ impl Default for ModuleMemoryRange {
     }
 }
 
-impl ModuleMemoryMap {
+impl ModuleMemoryMetadataMap {
     pub fn new() -> Self {
         Self {
             inner: spin::mutex::SpinMutex::new(HashMap::new()),
@@ -1020,8 +956,8 @@ impl ModuleMemoryMap {
         self.inner.lock().contains_key(&key)
     }
 
-    /// Register a new module memory structure in the map and return a unique key/token for it.
-    pub fn register_module_memory(&self, module_memory: ModuleMemory) -> i64 {
+    /// Register a new module memory metadata structure in the map and return a unique key/token for it.
+    pub fn register_module_memory_metadata(&self, module_memory: ModuleMemoryMetadata) -> i64 {
         let key = self.gen_unique_key();
 
         let mut map = self.inner.lock();
@@ -1053,14 +989,14 @@ impl ModuleMemoryMap {
     }
 }
 
-impl Default for ModuleMemoryMap {
+impl Default for ModuleMemoryMetadataMap {
     fn default() -> Self {
         Self::new()
     }
 }
 
 pub struct ModuleMemoryIters<'a> {
-    guard: spin::mutex::SpinMutexGuard<'a, HashMap<i64, ModuleMemory>>,
+    guard: spin::mutex::SpinMutexGuard<'a, HashMap<i64, ModuleMemoryMetadata>>,
     key: i64,
     phantom: core::marker::PhantomData<&'a PhysFrameRange<Size4KiB>>,
 }
@@ -1140,42 +1076,71 @@ impl KernelSymbolMap {
     }
 }
 
-pub struct ModuleMemoryWithContent {
-    pub text: MemoryMapWithContent,
-    pub init_text: MemoryMapWithContent,
-    pub data: MemoryMapWithContent,
-    pub ro_data: MemoryMapWithContent,
-    pub ro_after_init: MemoryMapWithContent,
-    pub init_data: MemoryMapWithContent,
-    pub init_ro_data: MemoryMapWithContent,
+pub struct ModuleMemoryContent {
+    pub text: MemoryContent,
+    pub init_text: MemoryContent,
+    pub data: MemoryContent,
+    pub ro_data: MemoryContent,
+    pub ro_after_init: MemoryContent,
+    pub init_data: MemoryContent,
+    pub init_ro_data: MemoryContent,
 }
 
-impl ModuleMemoryWithContent {
+impl ModuleMemoryContent {
     pub fn new() -> Self {
         Self {
-            text: MemoryMapWithContent::new(),
-            init_text: MemoryMapWithContent::new(),
-            data: MemoryMapWithContent::new(),
-            ro_data: MemoryMapWithContent::new(),
-            ro_after_init: MemoryMapWithContent::new(),
-            init_data: MemoryMapWithContent::new(),
-            init_ro_data: MemoryMapWithContent::new(),
+            text: MemoryContent::new(),
+            init_text: MemoryContent::new(),
+            data: MemoryContent::new(),
+            ro_data: MemoryContent::new(),
+            ro_after_init: MemoryContent::new(),
+            init_data: MemoryContent::new(),
+            init_ro_data: MemoryContent::new(),
+        }
+    }
+
+    pub fn write_vtl0_phys_bytes_by_type(
+        &mut self,
+        addr: VirtAddr,
+        phys_start: PhysAddr,
+        phys_end: PhysAddr,
+        mod_mem_type: ModMemType,
+    ) -> Result<(), MemoryContentError> {
+        match mod_mem_type {
+            ModMemType::Text => self.text.write_vtl0_phys_bytes(addr, phys_start, phys_end),
+            ModMemType::InitText => self
+                .init_text
+                .write_vtl0_phys_bytes(addr, phys_start, phys_end),
+            ModMemType::Data => self.data.write_vtl0_phys_bytes(addr, phys_start, phys_end),
+            ModMemType::RoData => self
+                .ro_data
+                .write_vtl0_phys_bytes(addr, phys_start, phys_end),
+            ModMemType::RoAfterInit => self
+                .ro_after_init
+                .write_vtl0_phys_bytes(addr, phys_start, phys_end),
+            ModMemType::InitData => self
+                .init_data
+                .write_vtl0_phys_bytes(addr, phys_start, phys_end),
+            ModMemType::InitRoData => self
+                .init_ro_data
+                .write_vtl0_phys_bytes(addr, phys_start, phys_end),
+            _ => Err(MemoryContentError::Unknown),
         }
     }
 }
 
-/// Data structure for abstracting addressable paged memory. Unlike `ModuleMemoryMap` which maintains
+/// Data structure for abstracting addressable paged memory. Unlike `ModuleMemoryMetadataMap` which maintains
 /// physical/virtual address ranges and their access permissions, this structure contain actual data in memory pages.
 /// This structure allows us to handle data copied from VTL0 without mapping them at VTL1 (e.g., for virtual-address-based page sorting).
 /// The memory mapping is faster than this data structure but it lets the adversaries guess or even control
 /// their target addresses. We could implement ASLR to mitigate this but ASLR is in general meaningless
 /// against local adversaries.
-pub struct MemoryMapWithContent {
+pub struct MemoryContent {
     pages: BTreeMap<VirtAddr, Box<[u8; PAGE_SIZE]>>,
     range: Range<VirtAddr>,
 }
 
-impl MemoryMapWithContent {
+impl MemoryContent {
     pub fn new() -> Self {
         Self {
             pages: BTreeMap::new(),
@@ -1200,6 +1165,14 @@ impl MemoryMapWithContent {
         } else {
             usize::try_from(self.range.end - self.range.start).unwrap()
         }
+    }
+
+    #[expect(dead_code)]
+    pub fn contains(&self, addr: VirtAddr) -> bool {
+        self.range.contains(&addr)
+            && self
+                .pages
+                .contains_key(&addr.align_down(u64::try_from(PAGE_SIZE).unwrap()))
     }
 
     fn extend_range(&mut self, start: VirtAddr, end: VirtAddr) {
@@ -1233,7 +1206,7 @@ impl MemoryMapWithContent {
         addr: VirtAddr,
         phys_start: PhysAddr,
         phys_end: PhysAddr,
-    ) -> Result<(), MemoryMapWithContentError> {
+    ) -> Result<(), MemoryContentError> {
         let mut phys_cur = phys_start;
         while phys_cur < phys_end {
             if let Some(data) =
@@ -1248,7 +1221,7 @@ impl MemoryMapWithContent {
                 self.write_bytes(addr + (phys_cur - phys_start), &data[..to_write])?;
                 phys_cur += u64::try_from(to_write).unwrap();
             } else {
-                return Err(MemoryMapWithContentError::Copy);
+                return Err(MemoryContentError::Copy);
             }
         }
 
@@ -1274,11 +1247,7 @@ impl MemoryMapWithContent {
         }
     }
 
-    pub fn write_bytes(
-        &mut self,
-        addr: VirtAddr,
-        data: &[u8],
-    ) -> Result<(), MemoryMapWithContentError> {
+    pub fn write_bytes(&mut self, addr: VirtAddr, data: &[u8]) -> Result<(), MemoryContentError> {
         self.preallocate_pages(addr, addr + data.len() as u64);
 
         let start = addr;
@@ -1317,7 +1286,7 @@ impl MemoryMapWithContent {
             self.extend_range(start, end);
             Ok(())
         } else {
-            Err(MemoryMapWithContentError::Write)
+            Err(MemoryContentError::Write)
         }
     }
 
@@ -1334,11 +1303,7 @@ impl MemoryMapWithContent {
         }
     }
 
-    pub fn read_bytes(
-        &self,
-        addr: VirtAddr,
-        buf: &mut [u8],
-    ) -> Result<(), MemoryMapWithContentError> {
+    pub fn read_bytes(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<(), MemoryContentError> {
         let start = addr;
         let end = addr + buf.len() as u64;
 
@@ -1374,7 +1339,7 @@ impl MemoryMapWithContent {
         if num_bytes == buf.len() {
             Ok(())
         } else {
-            Err(MemoryMapWithContentError::Read)
+            Err(MemoryContentError::Read)
         }
     }
 
@@ -1388,8 +1353,9 @@ impl MemoryMapWithContent {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum MemoryMapWithContentError {
+pub enum MemoryContentError {
     Copy,
     Read,
     Write,
+    Unknown,
 }
