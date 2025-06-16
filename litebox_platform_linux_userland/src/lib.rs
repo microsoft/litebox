@@ -1156,7 +1156,7 @@ unsafe extern "C" fn syscall_handler_32(args: *const usize) -> isize {
 }
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
-    fn get_syscall_entry_point() -> usize {
+    fn get_syscall_entry_point(&self) -> usize {
         syscall_callback as usize
     }
 }

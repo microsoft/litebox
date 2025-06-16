@@ -356,7 +356,7 @@ impl ElfLoader {
                 let placeholder = (start_addr + 8) as *mut usize;
                 unsafe {
                     placeholder
-                        .write(litebox_platform_multiplex::Platform::get_syscall_entry_point());
+                        .write(litebox_platform_multiplex::platform().get_syscall_entry_point());
                 }
                 // `mprotect` requires the address to be page-aligned
                 let ptr = crate::MutPtr::from_usize(start_addr);
