@@ -20,6 +20,14 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
+      - name: "Ratchet: ensure number of 'transmute's in codebase is not increasing"
+        run: |
+          if [ $(find . -name \*.rs -print0 | xargs -0 grep 'transmute' | wc -l) -eq 5 ]; then \
+            echo 'Ratchet maintained'; \
+          else \
+            echo 'Ratchet failed'; \
+            false; \
+          fi
       - name: Set up Rust
         run: |
           rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy
@@ -97,7 +105,7 @@ jobs:
         run: |
           .github/tools/github_actions_run_cargo clippy --lib --bins --examples --no-deps --all-features -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
           .github/tools/github_actions_run_cargo clippy --lib --bins --examples --no-deps --all-features -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_platform_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
-      - name: cargo build 
+      - name: cargo build
         run: |
           .github/tools/github_actions_run_cargo build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
           .github/tools/github_actions_run_cargo build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_platform_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
