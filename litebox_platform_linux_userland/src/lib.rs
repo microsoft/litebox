@@ -1053,7 +1053,7 @@ syscall_callback:
     mov rsi, rsp
 
     /* Call syscall_handler */
-    call syscall_handler
+    call syscall_handler_64
 
     /* Restore the original stack pointer */
     mov  rsp, rbp
@@ -1140,6 +1140,12 @@ syscall_callback:
 unsafe extern "C" {
     fn syscall_callback() -> isize;
     pub fn syscall_handler(syscall_number: usize, args: *const usize) -> isize;
+}
+
+#[unsafe(no_mangle)]
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" fn syscall_handler_64(syscall_number: usize, args: *const usize) -> isize {
+    unsafe { syscall_handler(syscall_number, args) }
 }
 
 #[unsafe(no_mangle)]
