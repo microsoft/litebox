@@ -701,6 +701,21 @@ pub struct Utsname {
     pub domainname: [u8; 65],
 }
 
+bitflags::bitflags! {
+    #[derive(Debug)]
+    /// Flags for the `getrandom` syscall.
+    pub struct RngFlags: i32 {
+        /// When reading from the random source, getrandom() blocks if no random bytes are available,
+        /// and when reading from the urandom source, it blocks if the entropy pool has not yet been initialized.
+        const NONBLOCK = 1;
+        /// Random bytes are drawn from the random source (i.e., same as `/dev/random`)
+        /// instead of the urandom source.
+        const RANDOM = 2;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
@@ -910,6 +925,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     /// Returns `ENOSYS` on 64-bit.
     SetThreadArea {
         user_desc: Platform::RawMutPointer<UserDesc>,
+    },
+    GetRandom {
+        buf: Platform::RawMutPointer<u8>,
+        count: usize,
+        flags: RngFlags,
     },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
@@ -1276,6 +1296,11 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::eventfd2 => SyscallRequest::Eventfd2 {
                 initval: args[0].truncate(),
                 flags: EfdFlags::from_bits_truncate(args[1].truncate()),
+            },
+            Sysno::getrandom => SyscallRequest::GetRandom {
+                buf: Platform::RawMutPointer::from_usize(args[0]),
+                count: args[1],
+                flags: RngFlags::from_bits_truncate(args[2].reinterpret_as_signed().truncate()),
             },
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq => {
                 SyscallRequest::Ret(errno::Errno::ENOSYS)
