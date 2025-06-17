@@ -685,4 +685,134 @@ mod tests {
             "Parent TID mismatch"
         );
     }
+
+    static mut TLS: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+    static mut CHILD_TID: i32 = 0;
+
+    #[test]
+    #[expect(clippy::too_many_lines)]
+    fn test_thread_spawn() {
+        crate::syscalls::tests::init_platform(None);
+
+        let stack_size = 8 * 1024 * 1024; // 8 MiB
+        let stack = crate::syscalls::mm::sys_mmap(
+            0,
+            stack_size,
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+        .expect("Failed to allocate stack");
+
+        let mut parent_tid = MaybeUninit::<u32>::uninit();
+        let parent_tid_ptr: crate::MutPtr<u32> =
+            unsafe { core::mem::transmute(parent_tid.as_mut_ptr()) };
+
+        #[allow(static_mut_refs)]
+        let child_tid_ptr: crate::MutPtr<i32> = unsafe { core::mem::transmute(&raw mut CHILD_TID) };
+
+        let flags = CloneFlags::THREAD
+            | CloneFlags::VM
+            | CloneFlags::FS
+            | CloneFlags::FILES
+            | CloneFlags::SIGHAND
+            | CloneFlags::PARENT_SETTID
+            | CloneFlags::CHILD_SETTID
+            | CloneFlags::CHILD_CLEARTID
+            | CloneFlags::SYSVSEM;
+
+        // Call sys_clone
+        #[cfg(target_arch = "x86_64")]
+        let pt_regs = litebox_common_linux::PtRegs {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            rbp: 0,
+            rbx: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            rax: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            orig_rax: syscalls::Sysno::clone3 as u64,
+            rip: 0,
+            cs: 0x33, // __USER_CS
+            eflags: 0,
+            rsp: 0,
+            ss: 0x2b, // __USER_DS
+        };
+        #[cfg(target_arch = "x86")]
+        let pt_regs = litebox_common_linux::PtRegs {
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+            esi: 0,
+            edi: 0,
+            ebp: 0,
+            eax: 0,
+            xds: 0,
+            xes: 0,
+            xfs: 0,
+            xgs: 0,
+            orig_eax: syscalls::Sysno::clone3 as u32,
+            eip: 0,
+            xcs: 0x23, // __USER_CS
+            eflags: 0,
+            esp: 0,
+            xss: 0x2b, // __USER_DS
+        };
+        crate::syscalls::tests::log_println!("stack allocated at: {:#x}", stack.as_usize());
+        let main: fn() = || {
+            crate::syscalls::tests::log_println!("Child started");
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut current_fs_base = MaybeUninit::<usize>::uninit();
+                super::sys_arch_prctl(litebox_common_linux::ArchPrctlArg::GetFs(unsafe {
+                    core::mem::transmute::<*mut usize, crate::MutPtr<usize>>(
+                        current_fs_base.as_mut_ptr(),
+                    )
+                }))
+                .expect("Failed to get FS base");
+                #[allow(static_mut_refs)]
+                let addr = unsafe { TLS.as_ptr() } as usize;
+                assert_eq!(
+                    addr,
+                    unsafe { current_fs_base.assume_init() },
+                    "FS base should match TLS pointer"
+                );
+            }
+
+            assert!(unsafe { CHILD_TID } > 0, "Child TID should be set");
+            crate::syscalls::tests::log_println!("Child TID: {}", unsafe { CHILD_TID });
+            super::sys_exit(0);
+        };
+        let result = super::sys_clone(
+            flags,
+            Some(parent_tid_ptr),
+            Some(stack),
+            stack_size,
+            Some(child_tid_ptr),
+            Some(crate::MutPtr {
+                #[allow(static_mut_refs)]
+                inner: unsafe { TLS.as_mut_ptr() },
+            }),
+            &pt_regs,
+            main as usize,
+        )
+        .expect("sys_clone failed");
+        crate::syscalls::tests::log_println!("sys_clone returned: {}", result);
+        assert!(result > 0, "sys_clone should return a positive PID");
+        assert_eq!(
+            unsafe { parent_tid.assume_init() } as usize,
+            result,
+            "Parent TID mismatch"
+        );
+    }
 }
