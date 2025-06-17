@@ -2,13 +2,14 @@
 
 use crate::{
     debug_serial_println,
-    mshv::vsm::{KernelSymbolMap, ModuleMemoryContent},
+    mshv::vsm::{KernelSymbolMap, MemoryContent, ModuleMemoryContent},
 };
 use alloc::{vec, vec::Vec};
 use goblin::elf::{
     Elf,
     reloc::{R_X86_64_32, R_X86_64_32S, R_X86_64_64, R_X86_64_PC32, R_X86_64_PLT32},
 };
+use rangemap::set::RangeSet;
 
 // Currently, our VTL1 kernel does not know the exact loaded addresses of each section of a kernel module.
 // We only know their page-aligned addresses. Linux-based VTL1 kernel does not suffer from this problem
@@ -44,7 +45,11 @@ pub fn validate_module_elf(
             .read_bytes(mod_mem.text.start().unwrap(), &mut text_loaded)
             .map_err(|_| KernelElfError::SectionReadFailed)?;
 
-        let _ = match_relocation(&text_reloc, &text_loaded);
+        for (i, (&r, &l)) in text_reloc.iter().zip(text_loaded.iter()).enumerate() {
+            if r != l {
+                debug_serial_println!("Difference at index {}: r = {}, l = {}", i, r, l);
+            }
+        }
     } else {
         return Err(KernelElfError::SectionRelocationFailed);
     }
@@ -63,78 +68,16 @@ pub fn validate_module_elf(
             .read_bytes(mod_mem.init_text.start().unwrap(), &mut text_loaded)
             .map_err(|_| KernelElfError::SectionReadFailed)?;
 
-        let _ = match_relocation(&text_reloc, &text_loaded);
+        for (i, (&r, &l)) in text_reloc.iter().zip(text_loaded.iter()).enumerate() {
+            if r != l {
+                debug_serial_println!("Difference at index {}: r = {}, l = {}", i, r, l);
+            }
+        }
     } else {
         return Err(KernelElfError::SectionRelocationFailed);
     }
 
     Ok(true)
-}
-
-/// This function checks whether the relocated section matches the loaded section.
-/// Due to our relocation logic's incompleteness, we allow some mismatches with heuristics.
-fn match_relocation(text_reloc: &[u8], text_loaded: &[u8]) -> Result<bool, KernelElfError> {
-    if text_reloc.is_empty() || text_reloc.len() != text_loaded.len() {
-        return Err(KernelElfError::InvalidInput);
-    }
-
-    let mut matched = true;
-
-    let mut i = 0;
-    while i < text_loaded.len() {
-        if text_reloc[i] != text_loaded[i] {
-            if i + 5 < text_loaded.len()
-                && (text_loaded[i..i + 5] == [0xc3, 0xcc, 0xcc, 0xcc, 0xcc]
-                    || text_loaded[i..i + 5] == [0xff, 0xe7, 0xcc, 0x66, 0x90])
-            {
-                // this is a jump 0 patch, which we allow to subtle mismatch
-                // we should handle `.call_sites`, `.return_sites`, and other sections
-                // to do not rely on this heuristic.
-                i += 5;
-                continue;
-            }
-            if i + 4 < text_loaded.len()
-                && text_reloc[i..i + 4] == [0xf3, 0x0f, 0x1e, 0xfa]
-                && (text_loaded[i..i + 4] == [0x66, 0x0f, 0x1f, 0xfa]
-                    || text_loaded[i..i + 4] == [0x66, 0x0f, 0x1f, 0x00]
-                    || text_loaded[i..i + 4] == [0x0f, 0x1f, 0x40, 0x00])
-            {
-                // ENDBR64 is replaced by 4-byte NOP because the VTL0 kernel thinks that
-                // this machine does not support CET/IBT.
-                i += 4;
-                continue;
-            }
-
-            debug_serial_println!(
-                "Mismatch? {:#x}: {:#x} {:#x}",
-                i,
-                text_reloc[i],
-                text_loaded[i]
-            );
-            matched = false;
-        }
-        i += 1;
-    }
-
-    Ok(matched)
-}
-
-/// This function patches jump 0 (`[0xe9, 0x0, 0x0, 0x0, 0x0]`) to a return instruction.
-/// jump 0 can be replaced with either `[0xc3, 0xcc, 0xcc, 0xcc, 0xcc]` or `[0xff, 0xe7, 0xcc, 0x66, 0x90]`.
-/// for simplicity, we replace every jump 0 with `[0xc3, 0xcc, 0xcc, 0xcc, 0xcc]`.
-/// We allow binary sequence mismatch if it is `[0xff, 0xe7, 0xcc, 0x66, 0x90]`.
-#[expect(dead_code)]
-fn patch_jmp0_to_ret(buf: &mut [u8]) {
-    let mut i = 0;
-    while i + 4 < buf.len() {
-        if buf[i] == 0xe9 && buf[i + 1..i + 5] == [0x0, 0x0, 0x0, 0x0] {
-            buf[i] = 0xc3;
-            buf[i + 1..i + 5].fill(0xcc);
-            i += 5;
-        } else {
-            i += 1;
-        }
-    }
 }
 
 /// This function parses the `.modinfo` section of the kernel module ELF file and prints its contents.
@@ -170,7 +113,6 @@ pub enum KernelElfError {
     ElfParseFailed,
     UnsupportedSection,
     SectionNotFound,
-    InvalidInput,
 }
 
 /// This function relocates the specified section of a kernel module ELF file using both ELF itself and loaded data.
@@ -180,8 +122,7 @@ pub enum KernelElfError {
 /// - all relocations must be already specified in the ELF sections like `.rela.text` and `.rela.call_sites`
 /// - symbol addresses must be within the kernel's or known kernel module's address ranges with matching memory types (i.e., `.text`, `.data`, `.rodata`, etc.)
 /// - patched instructions must be expected, safe ones like NOPs.
-/// - accept known, special relocations like `__x86_return_thunk` without validation
-#[expect(clippy::too_many_lines)]
+/// - accept known, special relocations like `__x86_return_thunk` with minimal validation
 pub fn relocate_elf_section(
     elf_buf: &[u8],
     section_name: &str,
@@ -189,14 +130,13 @@ pub fn relocate_elf_section(
     ksymtab: &KernelSymbolMap,
     ksymtab_gpl: &KernelSymbolMap,
 ) -> Result<Vec<u8>, KernelElfError> {
-    // ) -> Result<bool, KernelElfError> {
-    let section_base_addr: u64 = match section_name {
-        ".text" => mod_mem.text.start().unwrap().as_u64(),
-        ".init.text" => mod_mem.init_text.start().unwrap().as_u64(),
+    match section_name {
+        ".text" | ".init.text" => {}
         _ => {
             return Err(KernelElfError::UnsupportedSection);
         }
-    };
+    }
+
     let mem_to_validate = match section_name {
         ".text" => &mod_mem.text,
         ".init.text" => &mod_mem.init_text,
@@ -224,6 +164,41 @@ pub fn relocate_elf_section(
         &elf_buf[usize::try_from(sect_offset).unwrap()
             ..usize::try_from(sect_offset + sect_size).unwrap()],
     );
+
+    relocate_symbols(
+        &elf,
+        section_name,
+        &mut reloc_buf,
+        mem_to_validate,
+        mod_mem,
+        ksymtab,
+        ksymtab_gpl,
+    )
+    .map_err(|_| KernelElfError::SectionRelocationFailed)?;
+
+    accept_patchables(&elf, section_name, &mut reloc_buf, mem_to_validate)
+        .map_err(|_| KernelElfError::SectionRelocationFailed)?;
+
+    Ok(reloc_buf)
+}
+
+#[allow(clippy::too_many_lines)]
+fn relocate_symbols(
+    elf: &Elf,
+    section_name: &str,
+    reloc_buf: &mut [u8],
+    mem_to_validate: &MemoryContent,
+    mod_mem: &ModuleMemoryContent,
+    ksymtab: &KernelSymbolMap,
+    ksymtab_gpl: &KernelSymbolMap,
+) -> Result<(), KernelElfError> {
+    let section_base_addr: u64 = match section_name {
+        ".text" => mod_mem.text.start().unwrap().as_u64(),
+        ".init.text" => mod_mem.init_text.start().unwrap().as_u64(),
+        _ => {
+            return Err(KernelElfError::UnsupportedSection);
+        }
+    };
 
     for (shndx, relocations) in &elf.shdr_relocs {
         let cur_section = &elf.section_headers[*shndx];
@@ -307,9 +282,8 @@ pub fn relocate_elf_section(
             let sym_name = elf.strtab.get_at(sym.st_name).unwrap();
             let mut sym_section_name = "";
 
-            // NOTE. These are special cases. We accept these relocations without validation (add more)
+            // NOTE. These are special cases. We accept these relocations with minimal validation
             if is_special_control_relocation(sym_name) {
-                // 5-byte instructions
                 match r_type {
                     R_X86_64_32 | R_X86_64_32S | R_X86_64_PLT32 | R_X86_64_PC32 => {
                         reloc_buf[r_offset - 1] = mem_to_validate
@@ -319,6 +293,7 @@ pub fn relocate_elf_section(
                             )
                             .unwrap();
                         reloc_buf[r_offset..r_offset + 4].copy_from_slice(&buffer[0..4]);
+                        // TODO: check whether `reloc_buf[r_offset - 1..r_offset + 4]` contains an expected instruction.
                     }
                     _ => {
                         todo!("Unsupported relocation type: {r_type}");
@@ -328,10 +303,14 @@ pub fn relocate_elf_section(
             }
 
             let sym_addr = if sym.is_import() {
-                ksymtab
-                    .get(sym_name)
-                    .map(x86_64::VirtAddr::as_u64)
-                    .or_else(|| ksymtab_gpl.get(sym_name).map(x86_64::VirtAddr::as_u64))
+                if is_ignored_global_symbol(sym_name) {
+                    Some(section_base_addr + sym.st_value)
+                } else {
+                    ksymtab
+                        .get(sym_name)
+                        .map(x86_64::VirtAddr::as_u64)
+                        .or_else(|| ksymtab_gpl.get(sym_name).map(x86_64::VirtAddr::as_u64))
+                }
             } else if sym.st_shndx
                 != usize::try_from(goblin::elf64::section_header::SHN_UNDEF).unwrap()
             {
@@ -349,9 +328,6 @@ pub fn relocate_elf_section(
 
             if let Some(sym_addr) = sym_addr {
                 if sym.is_import() && value_to_validate != sym_addr {
-                    debug_serial_println!(
-                        "Mismatch? {sym_section_name}/{sym_name} at {r_offset:#x}: expected {sym_addr:#x}, got {value_to_validate:#x}"
-                    );
                     continue;
                 }
                 if !sym.is_import()
@@ -361,9 +337,6 @@ pub fn relocate_elf_section(
                         x86_64::VirtAddr::new(sym_addr),
                     )
                 {
-                    debug_serial_println!(
-                        "Mismatch? {sym_section_name}/{sym_name} at {r_offset:#x}: expected ~{sym_addr:#x}, got {value_to_validate:#x}"
-                    );
                     continue;
                 }
 
@@ -386,7 +359,76 @@ pub fn relocate_elf_section(
         }
     }
 
-    Ok(reloc_buf)
+    Ok(())
+}
+
+/// This functions simply accept most patchable relocations which could be insecure.
+fn accept_patchables(
+    elf: &Elf,
+    section_name: &str,
+    reloc_buf: &mut [u8],
+    mem_to_validate: &MemoryContent,
+) -> Result<(), KernelElfError> {
+    let mut patchable = RangeSet::<i64>::new();
+
+    let rela_sect_names = [
+        ".rela.altinstructions",
+        ".rela.call_sites",
+        ".rela.ibt_endbr_seal",
+        ".rela.parainstructions",
+        ".rela.retpoline_sites",
+        ".rela.return_sites",
+        ".rela__patchable_function_entries",
+    ];
+
+    // detect all patch candidates and copy them
+    for (shndx, relocations) in &elf.shdr_relocs {
+        let cur_section = &elf.section_headers[*shndx];
+        let cur_section_name = elf
+            .shdr_strtab
+            .get_at(cur_section.sh_name)
+            .unwrap_or("unknown");
+        if !rela_sect_names.contains(&cur_section_name) {
+            continue;
+        }
+
+        for reloc in relocations {
+            let r_sym = reloc.r_sym;
+            let r_addend = reloc.r_addend.unwrap_or(0);
+            let r_type = reloc.r_type;
+
+            let sym = elf.syms.get(r_sym).unwrap();
+            let sym_name = elf.strtab.get_at(sym.st_name).unwrap();
+            if !sym_name.is_empty() {
+                continue;
+            }
+            let sym_section = &elf.section_headers[sym.st_shndx];
+            let name_offset = sym_section.sh_name;
+            let sym_section_name = elf
+                .shdr_strtab
+                .get_at(name_offset)
+                .unwrap_or("unknown section");
+            if sym_section_name == section_name {
+                if r_type == R_X86_64_64 {
+                    patchable.insert(r_addend..r_addend + 8);
+                } else {
+                    patchable.insert(r_addend..r_addend + 4);
+                }
+            }
+        }
+    }
+
+    for range in patchable.iter() {
+        mem_to_validate
+            .read_bytes(
+                mem_to_validate.start().unwrap() + u64::try_from(range.start).unwrap(),
+                &mut reloc_buf
+                    [usize::try_from(range.start).unwrap()..usize::try_from(range.end).unwrap()],
+            )
+            .map_err(|_| KernelElfError::SectionReadFailed)?;
+    }
+
+    Ok(())
 }
 
 /// This function returns the loaded address of the specified section in the module memory.
@@ -423,6 +465,13 @@ fn is_valid_section_address(
         }
         _ => false,
     }
+}
+
+#[inline]
+fn is_ignored_global_symbol(sym_name: &str) -> bool {
+    // We ignore some global symbols which are not referred in the kernel module including some architecture-specific symbols.
+    let ignored_symbols = ["pv_ops"];
+    ignored_symbols.contains(&sym_name)
 }
 
 #[inline]
