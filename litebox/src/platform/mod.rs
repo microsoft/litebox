@@ -539,3 +539,18 @@ pub trait SystemInfoProvider {
     /// execution context and transfer control to the syscall handler.
     fn get_syscall_entry_point(&self) -> usize;
 }
+
+/// A provider for thread-local storage.
+pub trait ThreadLocalStorageProvider {
+    type ThreadLocalStorage;
+
+    /// Get a thread-local storage value for the current thread.
+    fn get_thread_local(&self) -> *mut Self::ThreadLocalStorage;
+
+    /// Set a thread-local storage value for the current thread.
+    fn set_thread_local(&self, value: Self::ThreadLocalStorage);
+
+    /// Release the thread-local storage value for the current thread
+    /// and invoke the provided callback function on it.
+    fn release_thread_local(&self, f: fn(&mut Self::ThreadLocalStorage));
+}

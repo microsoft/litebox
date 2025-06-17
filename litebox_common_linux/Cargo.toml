@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bitfield = "0.19.1"
 bitflags = "2.9.0"
 cfg-if = "1.0.0"
 litebox = { path = "../litebox/", version = "0.1.0" }
