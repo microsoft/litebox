@@ -690,6 +690,17 @@ pub struct UserDesc {
     pub flags: i32,
 }
 
+#[repr(C)]
+#[derive(Clone)]
+pub struct Utsname {
+    pub sysname: [u8; 65],
+    pub nodename: [u8; 65],
+    pub release: [u8; 65],
+    pub version: [u8; 65],
+    pub machine: [u8; 65],
+    pub domainname: [u8; 65],
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
@@ -849,6 +860,9 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         optname: SocketOptionName,
         optval: Platform::RawConstPointer<u8>,
         optlen: usize,
+    },
+    Uname {
+        buf: Platform::RawMutPointer<Utsname>,
     },
     Fcntl {
         fd: i32,
@@ -1195,6 +1209,9 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             },
             Sysno::exit_group => SyscallRequest::ExitGroup {
                 status: args[0].reinterpret_as_signed().truncate(),
+            },
+            ::syscalls::Sysno::uname => SyscallRequest::Uname {
+                buf: Platform::RawMutPointer::from_usize(args[0]),
             },
             Sysno::fcntl => SyscallRequest::Fcntl {
                 fd: args[0].reinterpret_as_signed().truncate(),
