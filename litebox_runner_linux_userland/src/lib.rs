@@ -40,6 +40,25 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub rewrite_syscalls: bool,
+    /// Choice of interception backend
+    #[arg(
+        value_enum,
+        long = "interception-backend",
+        requires = "unstable",
+        help_heading = "Unstable Options",
+        default_value = "seccomp"
+    )]
+    pub interception_backend: InterceptionBackend,
+}
+
+/// Backends supported for intercepting syscalls
+#[non_exhaustive]
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum InterceptionBackend {
+    /// Use seccomp-based syscall interception
+    Seccomp,
+    /// Depend purely on rewriten syscalls to intercept them
+    Rewriter,
 }
 
 /// Run Linux programs with LiteBox on unmodified Linux
@@ -139,7 +158,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
     litebox_shim_linux::set_fs(initial_file_system);
     litebox_platform_multiplex::set_platform(platform);
-    platform.enable_syscall_interception_with();
+    platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
+    match cli_args.interception_backend {
+        InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
+        InterceptionBackend::Rewriter => {}
+    }
 
     let argv = cli_args
         .program_and_arguments

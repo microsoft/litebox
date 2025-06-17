@@ -88,8 +88,10 @@ pub fn init_platform(
         install_file(data, each);
     }
 
+    platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
+
     if enable_syscall_interception {
-        platform.enable_syscall_interception_with();
+        platform.enable_seccomp_based_syscall_interception();
     }
 }
 

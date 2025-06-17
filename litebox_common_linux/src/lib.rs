@@ -8,8 +8,9 @@ use litebox::{
     fs::OFlags,
     net::{ReceiveFlags, SendFlags},
     platform::{RawConstPointer, RawMutPointer},
-    utils::TruncateExt,
+    utils::{ReinterpretSignedExt as _, TruncateExt},
 };
+use syscalls::Sysno;
 
 pub mod errno;
 
@@ -692,6 +693,12 @@ pub struct UserDesc {
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
+    Exit {
+        status: i32,
+    },
+    ExitGroup {
+        status: i32,
+    },
     Read {
         fd: i32,
         buf: Platform::RawMutPointer<u8>,
@@ -892,6 +899,374 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
+}
+
+impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
+    /// Take the raw syscall number and arguments, and provide a stronger-typed `SyscallRequest`.
+    ///
+    /// Returns `Ok` if a valid translation exists, if no such translation exists, returns the [`Errno`](errno::Errno) for it.
+    ///
+    /// # Panics
+    ///
+    /// Ideally, this function would not panic. However, since it is currently under development, it
+    /// is allowed to panic upon receiving a syscall number (or arguments) that it does not know how
+    /// to handle.
+    #[expect(clippy::too_many_lines)]
+    pub fn try_from_raw(syscall_number: usize, args: &[usize; 6]) -> Result<Self, errno::Errno> {
+        let sysno = Sysno::from(u32::try_from(syscall_number).map_err(|_| errno::Errno::ENOSYS)?);
+        let dispatcher = match sysno {
+            Sysno::read => SyscallRequest::Read {
+                fd: args[0].reinterpret_as_signed().truncate(),
+                buf: Platform::RawMutPointer::from_usize(args[1]),
+                count: args[2],
+            },
+            Sysno::write => SyscallRequest::Write {
+                fd: args[0].reinterpret_as_signed().truncate(),
+                buf: Platform::RawConstPointer::from_usize(args[1]),
+                count: args[2],
+            },
+            Sysno::close => SyscallRequest::Close {
+                fd: args[0].reinterpret_as_signed().truncate(),
+            },
+            Sysno::stat => SyscallRequest::Stat {
+                pathname: Platform::RawConstPointer::from_usize(args[0]),
+                buf: Platform::RawMutPointer::from_usize(args[1]),
+            },
+            Sysno::fstat => SyscallRequest::Fstat {
+                fd: args[0].reinterpret_as_signed().truncate(),
+                buf: Platform::RawMutPointer::from_usize(args[1]),
+            },
+            Sysno::lstat => SyscallRequest::Lstat {
+                pathname: Platform::RawConstPointer::from_usize(args[0]),
+                buf: Platform::RawMutPointer::from_usize(args[1]),
+            },
+            #[cfg(target_arch = "x86_64")]
+            Sysno::mmap => SyscallRequest::Mmap {
+                addr: args[0],
+                length: args[1],
+                prot: ProtFlags::from_bits_truncate(args[2].reinterpret_as_signed().truncate()),
+                flags: MapFlags::from_bits_truncate(args[3].reinterpret_as_signed().truncate()),
+                fd: args[4].reinterpret_as_signed().truncate(),
+                offset: args[5],
+            },
+            #[cfg(target_arch = "x86")]
+            Sysno::mmap2 => SyscallRequest::Mmap {
+                addr: args[0],
+                length: args[1],
+                prot: ProtFlags::from_bits_truncate(args[2].reinterpret_as_signed().truncate()),
+                flags: MapFlags::from_bits_truncate(args[3].reinterpret_as_signed().truncate()),
+                fd: args[4].reinterpret_as_signed().truncate(),
+                offset: args[5],
+            },
+            Sysno::mprotect => SyscallRequest::Mprotect {
+                addr: Platform::RawMutPointer::from_usize(args[0]),
+                length: args[1],
+                prot: ProtFlags::from_bits_truncate(args[2].reinterpret_as_signed().truncate()),
+            },
+            Sysno::munmap => SyscallRequest::Munmap {
+                addr: Platform::RawMutPointer::from_usize(args[0]),
+                length: args[1],
+            },
+            Sysno::brk => SyscallRequest::Brk {
+                addr: Platform::RawMutPointer::from_usize(args[0]),
+            },
+            Sysno::mremap => SyscallRequest::Mremap {
+                old_addr: Platform::RawMutPointer::from_usize(args[0]),
+                old_size: args[1],
+                new_size: args[2],
+                flags: MRemapFlags::from_bits_truncate(args[3].truncate()),
+                new_addr: args[4],
+            },
+            Sysno::rt_sigprocmask => {
+                let how: i32 = args[0].reinterpret_as_signed().truncate();
+                if let Ok(how) = SigmaskHow::try_from(how) {
+                    SyscallRequest::RtSigprocmask {
+                        how,
+                        set: if args[1] == 0 {
+                            None
+                        } else {
+                            Some(Platform::RawConstPointer::from_usize(args[1]))
+                        },
+                        oldset: if args[2] == 0 {
+                            None
+                        } else {
+                            Some(Platform::RawMutPointer::from_usize(args[2]))
+                        },
+                        sigsetsize: args[3],
+                    }
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
+            }
+            Sysno::rt_sigaction => {
+                let signum: i32 = args[0].reinterpret_as_signed().truncate();
+                if let Ok(signum) = Signal::try_from(signum) {
+                    SyscallRequest::RtSigaction {
+                        signum,
+                        act: if args[1] == 0 {
+                            None
+                        } else {
+                            Some(Platform::RawConstPointer::from_usize(args[1]))
+                        },
+                        oldact: if args[2] == 0 {
+                            None
+                        } else {
+                            Some(Platform::RawMutPointer::from_usize(args[2]))
+                        },
+                        sigsetsize: args[3],
+                    }
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
+            }
+            Sysno::ioctl => SyscallRequest::Ioctl {
+                fd: args[0].reinterpret_as_signed().truncate(),
+                arg: {
+                    let cmd = args[1].truncate();
+                    let arg = args[2];
+                    match cmd {
+                        TCGETS => IoctlArg::TCGETS(Platform::RawMutPointer::from_usize(arg)),
+                        TCSETS => IoctlArg::TCSETS(Platform::RawConstPointer::from_usize(arg)),
+                        TIOCGWINSZ => {
+                            IoctlArg::TIOCGWINSZ(Platform::RawMutPointer::from_usize(arg))
+                        }
+                        TIOCGPTN => IoctlArg::TIOCGPTN(Platform::RawMutPointer::from_usize(arg)),
+                        FIONBIO => IoctlArg::FIONBIO(Platform::RawConstPointer::from_usize(arg)),
+                        _ => IoctlArg::Raw {
+                            cmd,
+                            arg: Platform::RawMutPointer::from_usize(arg),
+                        },
+                    }
+                },
+            },
+            #[cfg(target_arch = "x86_64")]
+            Sysno::pread64 => SyscallRequest::Pread64 {
+                fd: args[0].reinterpret_as_signed().truncate(),
+                buf: Platform::RawMutPointer::from_usize(args[1]),
+                count: args[2],
+                offset: args[3].reinterpret_as_signed() as i64,
+            },
+            #[cfg(target_arch = "x86")]
+            Sysno::pread64 => SyscallRequest::Pread64 {
+                fd: args[0].reinterpret_as_signed().truncate(),
+                buf: Platform::RawMutPointer::from_usize(args[1]),
+                count: args[2],
+                offset: args[3].reinterpret_as_signed() as i64
+                    | ((args[4].reinterpret_as_signed() as i64) << 32),
+            },
+            Sysno::readv => SyscallRequest::Readv {
+                fd: args[0].reinterpret_as_signed().truncate(),
+                iovec: Platform::RawConstPointer::from_usize(args[1]),
+                iovcnt: args[2],
+            },
+            Sysno::writev => SyscallRequest::Writev {
+                fd: args[0].reinterpret_as_signed().truncate(),
+                iovec: Platform::RawConstPointer::from_usize(args[1]),
+                iovcnt: args[2],
+            },
+            Sysno::access => SyscallRequest::Access {
+                pathname: Platform::RawConstPointer::from_usize(args[0]),
+                mode: AccessFlags::from_bits_truncate(args[1].reinterpret_as_signed().truncate()),
+            },
+            Sysno::pipe => SyscallRequest::Pipe2 {
+                pipefd: Platform::RawMutPointer::from_usize(args[0]),
+                flags: litebox::fs::OFlags::empty(),
+            },
+            Sysno::pipe2 => SyscallRequest::Pipe2 {
+                pipefd: Platform::RawMutPointer::from_usize(args[0]),
+                flags: litebox::fs::OFlags::from_bits_truncate(args[1].truncate()),
+            },
+            Sysno::dup => SyscallRequest::Dup {
+                oldfd: args[0].reinterpret_as_signed().truncate(),
+                newfd: None,
+                flags: None,
+            },
+            Sysno::dup2 => SyscallRequest::Dup {
+                oldfd: args[0].reinterpret_as_signed().truncate(),
+                newfd: Some(args[1].reinterpret_as_signed().truncate()),
+                flags: None,
+            },
+            Sysno::dup3 => SyscallRequest::Dup {
+                oldfd: args[0].reinterpret_as_signed().truncate(),
+                newfd: Some(args[1].reinterpret_as_signed().truncate()),
+                flags: Some(litebox::fs::OFlags::from_bits_truncate(args[2].truncate())),
+            },
+            Sysno::socket => {
+                let domain: u32 = args[0].truncate();
+                let type_and_flags: u32 = args[1].truncate();
+                SyscallRequest::Socket {
+                    domain: AddressFamily::try_from(domain).expect("Invalid domain"),
+                    ty: SockType::try_from(type_and_flags & 0x0f).expect("Invalid sock type"),
+                    flags: SockFlags::from_bits_truncate(type_and_flags & !0x0f),
+                    protocol: if args[2] == 0 {
+                        None
+                    } else {
+                        let protocol: u8 = args[2].truncate();
+                        Some(Protocol::try_from(protocol).expect("Invalid protocol"))
+                    },
+                }
+            }
+            Sysno::connect => SyscallRequest::Connect {
+                sockfd: args[0].reinterpret_as_signed().truncate(),
+                sockaddr: Platform::RawConstPointer::from_usize(args[1]),
+                addrlen: args[2],
+            },
+            #[cfg(target_arch = "x86_64")]
+            Sysno::accept => SyscallRequest::Accept {
+                sockfd: args[0].reinterpret_as_signed().truncate(),
+                addr: if args[1] == 0 {
+                    None
+                } else {
+                    Some(Platform::RawMutPointer::from_usize(args[1]))
+                },
+                addrlen: if args[2] == 0 {
+                    None
+                } else {
+                    Some(Platform::RawMutPointer::from_usize(args[2]))
+                },
+                flags: SockFlags::empty(),
+            },
+            Sysno::accept4 => SyscallRequest::Accept {
+                sockfd: args[0].reinterpret_as_signed().truncate(),
+                addr: if args[1] == 0 {
+                    None
+                } else {
+                    Some(Platform::RawMutPointer::from_usize(args[1]))
+                },
+                addrlen: if args[2] == 0 {
+                    None
+                } else {
+                    Some(Platform::RawMutPointer::from_usize(args[2]))
+                },
+                flags: SockFlags::from_bits_truncate(args[3].truncate()),
+            },
+            Sysno::sendto => SyscallRequest::Sendto {
+                sockfd: args[0].reinterpret_as_signed().truncate(),
+                buf: Platform::RawConstPointer::from_usize(args[1]),
+                len: args[2],
+                flags: litebox::net::SendFlags::from_bits_truncate(args[3].truncate()),
+                addr: if args[4] == 0 {
+                    None
+                } else {
+                    Some(Platform::RawConstPointer::from_usize(args[4]))
+                },
+                addrlen: args[5].truncate(),
+            },
+            Sysno::recvfrom => SyscallRequest::Recvfrom {
+                sockfd: args[0].reinterpret_as_signed().truncate(),
+                buf: Platform::RawMutPointer::from_usize(args[1]),
+                len: args[2],
+                flags: litebox::net::ReceiveFlags::from_bits_truncate(args[3].truncate()),
+                addr: if args[4] == 0 {
+                    None
+                } else {
+                    Some(Platform::RawMutPointer::from_usize(args[4]))
+                },
+                addrlen: if args[5] == 0 {
+                    None
+                } else {
+                    Some(Platform::RawMutPointer::from_usize(args[5]))
+                },
+            },
+            Sysno::bind => SyscallRequest::Bind {
+                sockfd: args[0].reinterpret_as_signed().truncate(),
+                sockaddr: Platform::RawConstPointer::from_usize(args[1]),
+                addrlen: args[2],
+            },
+            Sysno::listen => SyscallRequest::Listen {
+                sockfd: args[0].reinterpret_as_signed().truncate(),
+                backlog: args[1].truncate(),
+            },
+            Sysno::setsockopt => {
+                let optname = SocketOptionName::from(args[1].truncate(), args[2].truncate());
+                if let Some(optname) = optname {
+                    SyscallRequest::Setsockopt {
+                        sockfd: args[0].reinterpret_as_signed().truncate(),
+                        optname,
+                        optval: Platform::RawConstPointer::from_usize(args[3]),
+                        optlen: args[4],
+                    }
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
+            }
+            Sysno::exit => SyscallRequest::Exit {
+                status: args[0].reinterpret_as_signed().truncate(),
+            },
+            Sysno::exit_group => SyscallRequest::ExitGroup {
+                status: args[0].reinterpret_as_signed().truncate(),
+            },
+            Sysno::fcntl => SyscallRequest::Fcntl {
+                fd: args[0].reinterpret_as_signed().truncate(),
+                arg: FcntlArg::from(args[1].reinterpret_as_signed().truncate(), args[2]),
+            },
+            Sysno::getcwd => SyscallRequest::Getcwd {
+                buf: Platform::RawMutPointer::from_usize(args[0]),
+                size: args[1],
+            },
+            Sysno::readlink => SyscallRequest::Readlink {
+                pathname: Platform::RawConstPointer::from_usize(args[0]),
+                buf: Platform::RawMutPointer::from_usize(args[1]),
+                bufsiz: args[2],
+            },
+            Sysno::readlinkat => SyscallRequest::Readlinkat {
+                dirfd: args[0].reinterpret_as_signed().truncate(),
+                pathname: Platform::RawConstPointer::from_usize(args[1]),
+                buf: Platform::RawMutPointer::from_usize(args[2]),
+                bufsiz: args[3],
+            },
+            Sysno::arch_prctl => {
+                let code: u32 = args[0].truncate();
+                if let Ok(code) = ArchPrctlCode::try_from(code) {
+                    let arg = match code {
+                        #[cfg(target_arch = "x86_64")]
+                        ArchPrctlCode::SetFs => {
+                            ArchPrctlArg::SetFs(Platform::RawConstPointer::from_usize(args[1]))
+                        }
+                        #[cfg(target_arch = "x86_64")]
+                        ArchPrctlCode::GetFs => {
+                            ArchPrctlArg::GetFs(Platform::RawMutPointer::from_usize(args[1]))
+                        }
+                        ArchPrctlCode::CETStatus => ArchPrctlArg::CETStatus,
+                        ArchPrctlCode::CETDisable => ArchPrctlArg::CETDisable,
+                        ArchPrctlCode::CETLock => ArchPrctlArg::CETLock,
+                    };
+                    SyscallRequest::ArchPrctl { arg }
+                } else {
+                    todo!("Unsupported arch_prctl syscall: {args:?}")
+                }
+            }
+            Sysno::set_thread_area => SyscallRequest::SetThreadArea {
+                user_desc: Platform::RawMutPointer::from_usize(args[0]),
+            },
+            Sysno::openat => SyscallRequest::Openat {
+                dirfd: args[0].reinterpret_as_signed().truncate(),
+                pathname: Platform::RawConstPointer::from_usize(args[1]),
+                flags: litebox::fs::OFlags::from_bits_truncate(args[2].truncate()),
+                mode: litebox::fs::Mode::from_bits_truncate(args[3].truncate()),
+            },
+            #[cfg(target_arch = "x86_64")]
+            Sysno::newfstatat => SyscallRequest::Newfstatat {
+                dirfd: args[0].reinterpret_as_signed().truncate(),
+                pathname: Platform::RawConstPointer::from_usize(args[1]),
+                buf: Platform::RawMutPointer::from_usize(args[2]),
+                flags: AtFlags::from_bits_truncate(args[3].reinterpret_as_signed().truncate()),
+            },
+            Sysno::eventfd => SyscallRequest::Eventfd2 {
+                initval: args[0].truncate(),
+                flags: EfdFlags::empty(),
+            },
+            Sysno::eventfd2 => SyscallRequest::Eventfd2 {
+                initval: args[0].truncate(),
+                flags: EfdFlags::from_bits_truncate(args[1].truncate()),
+            },
+            Sysno::statx | Sysno::io_uring_setup | Sysno::rseq => {
+                SyscallRequest::Ret(errno::Errno::ENOSYS)
+            }
+            _ => unimplemented!("Translation for {sysno} is not (yet) currently supported"),
+        };
+        Ok(dispatcher)
+    }
 }
 
 /// A set of syscalls that are allowed to be punched through to platforms that work with the Linux
