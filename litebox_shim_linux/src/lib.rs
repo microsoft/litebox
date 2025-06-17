@@ -278,9 +278,13 @@ pub extern "C" fn close(fd: i32) -> i32 {
 // hopefully-reasonable middle ground.
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 
-/// Entry point for the syscall handler
+/// Handle Linux syscalls and dispatch them to LiteBox implementations.
+///
+/// # Panics
+///
+/// Unsupported syscalls or arguments would trigger a panic for development purposes.
 #[allow(clippy::too_many_lines)]
-fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
+pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
     let res: Result<usize, Errno> = match request {
         SyscallRequest::Ret(errno) => Err(errno),
         SyscallRequest::Exit { status } => {
@@ -548,34 +552,4 @@ fn syscall_entry(request: SyscallRequest<Platform>) -> isize {
             v
         },
     )
-}
-
-/// Handles Linux syscalls and dispatches them to LiteBox implementations.
-///
-/// # Safety
-///
-/// - The `args` pointer must be valid and point to at least 6 `usize` values.
-/// - If any syscall argument is a pointer, it must be valid.
-///
-/// # Panics
-///
-/// Unsupported syscalls or arguments would trigger a panic for development purposes.
-#[unsafe(no_mangle)]
-unsafe extern "C" fn syscall_handler(syscall_number: usize, args: *const usize) -> isize {
-    let syscall_args: &[usize; 6] = unsafe { core::slice::from_raw_parts(args, 6) }
-        .try_into()
-        .unwrap();
-    match SyscallRequest::try_from_raw(syscall_number, syscall_args) {
-        Ok(d) => syscall_entry(d),
-        Err(err) => err.as_neg() as isize,
-    }
-}
-
-/// Handle Linux syscalls and dispatch them to LiteBox implementations.
-///
-/// # Panics
-///
-/// Unsupported syscalls or arguments would trigger a panic for development purposes.
-pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
-    syscall_entry(request)
 }
