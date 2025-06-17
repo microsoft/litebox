@@ -50,6 +50,46 @@ pub trait ExitProvider: Sized {
     fn exit(&self, code: Self::ExitCode) -> !;
 }
 
+/// Thread management provider.
+pub trait ThreadProvider: RawPointerProvider {
+    /// Exit code for [`ThreadProvider::terminate_thread`].
+    type ExitCode;
+    /// Execution context for the current thread of the guest program.
+    type ExecutionContext;
+    /// Arguments to the callback function for the new thread.
+    type ThreadArgs;
+    /// Error type for [`ThreadProvider::spawn_thread`].
+    type ThreadSpawnError: core::error::Error;
+    /// Thread identifier type for the spawned thread.
+    type ThreadId: Send + 'static;
+
+    /// Spawn a new thread with the given entry point.
+    ///
+    /// `stack` is an optional pointer to the stack for the new thread, and `stack_size` is the
+    /// size of the stack.
+    ///
+    /// `entry_point` is the address of the first instruction that will be executed in the new thread.
+    ///
+    /// `new_thread_callback` would be invoked with the given `thread_args` in the new thread after
+    /// it is spawned.
+    ///
+    /// # Safety
+    ///
+    /// The `entry_point` must be a valid entry point for the new thread.
+    unsafe fn spawn_thread(
+        &self,
+        ctx: &Self::ExecutionContext,
+        stack: Option<<Self as RawPointerProvider>::RawMutPointer<u8>>,
+        stack_size: usize,
+        entry_point: usize,
+        thread_args: alloc::boxed::Box<Self::ThreadArgs>,
+        new_thread_callback: extern "C" fn(&Self::ThreadArgs),
+    ) -> Result<Self::ThreadId, Self::ThreadSpawnError>;
+
+    /// Terminate the current thread with the given exit code.
+    fn terminate_thread(&self, code: Self::ExitCode) -> !;
+}
+
 /// Punch through any functionality for a particular platform that is not explicitly part of the
 /// common _shared_ platform interface.
 ///

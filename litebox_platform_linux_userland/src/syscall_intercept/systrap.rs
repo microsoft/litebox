@@ -231,6 +231,7 @@ fn register_seccomp_filter() {
         (libc::SYS_getgid, vec![]),
         (libc::SYS_geteuid, vec![]),
         (libc::SYS_getegid, vec![]),
+        (libc::SYS_capget, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (
             libc::SYS_arch_prctl,
@@ -248,14 +249,58 @@ fn register_seccomp_filter() {
                 .unwrap(),
             ],
         ),
-        (libc::SYS_gettid, vec![]),
         (libc::SYS_futex, vec![]),
-        (libc::SYS_set_tid_address, vec![]),
-        (libc::SYS_exit, vec![]),
-        (libc::SYS_exit_group, vec![]),
+        (
+            libc::SYS_exit,
+            vec![
+                // A backdoor to allow invoking exit.
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        1,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::Eq,
+                        SYSCALL_ARG_MAGIC as u64,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            ],
+        ),
+        (
+            libc::SYS_exit_group,
+            vec![
+                // A backdoor to allow invoking exit_group.
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        1,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::Eq,
+                        SYSCALL_ARG_MAGIC as u64,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            ],
+        ),
         (libc::SYS_tgkill, vec![]),
         (libc::SYS_set_robust_list, vec![]),
         (libc::SYS_prlimit64, vec![]),
+        (
+            libc::SYS_clone3,
+            vec![
+                // A backdoor to allow invoking clone3.
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        2,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::Eq,
+                        SYSCALL_ARG_MAGIC as u64,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            ],
+        ),
     ];
     let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> = rules.into_iter().collect();
 
