@@ -227,7 +227,6 @@ fn register_seccomp_filter() {
             ],
         ),
         (libc::SYS_getpid, vec![]),
-        (libc::SYS_uname, vec![]),
         (libc::SYS_getuid, vec![]),
         (libc::SYS_getgid, vec![]),
         (libc::SYS_geteuid, vec![]),

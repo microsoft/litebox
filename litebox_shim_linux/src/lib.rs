@@ -278,6 +278,36 @@ pub extern "C" fn close(fd: i32) -> i32 {
 // hopefully-reasonable middle ground.
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 
+/// A const function to convert a str to a fixed-size array of bytes
+///
+/// Note the fixed-size array is terminated with a null byte, so the string must be
+/// at most `N - 1` bytes long.
+const fn to_fixed_size_array<const N: usize>(s: &str) -> [u8; N] {
+    assert!(
+        s.len() < N,
+        "String is too long to fit in the fixed-size array"
+    );
+    let bytes = s.as_bytes();
+    let mut arr = [0u8; N];
+    let mut i = 0;
+    while i < bytes.len() && i < N - 1 {
+        arr[i] = bytes[i];
+        i += 1;
+    }
+    arr
+}
+const SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
+    sysname: to_fixed_size_array::<65>("LiteBox"),
+    nodename: to_fixed_size_array::<65>("litebox"),
+    release: to_fixed_size_array::<65>("5.11.0"), // libc seems to expect this to be not too old
+    version: to_fixed_size_array::<65>("5.11.0"),
+    #[cfg(target_arch = "x86_64")]
+    machine: to_fixed_size_array::<65>("x86_64"),
+    #[cfg(target_arch = "x86")]
+    machine: to_fixed_size_array::<65>("x86"),
+    domainname: to_fixed_size_array::<65>(""),
+};
+
 /// Handle Linux syscalls and dispatch them to LiteBox implementations.
 ///
 /// # Panics
@@ -435,6 +465,9 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
             optval,
             optlen,
         } => sys_setsockopt(sockfd, optname, optval, optlen).map(|()| 0),
+        SyscallRequest::Uname { buf } => unsafe { buf.write_at_offset(0, SYS_INFO) }
+            .ok_or(Errno::EFAULT)
+            .map(|()| 0usize),
         SyscallRequest::Fcntl { fd, arg } => syscalls::file::sys_fcntl(fd, arg).map(|v| v as usize),
         SyscallRequest::Getcwd { buf, size: count } => {
             let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
