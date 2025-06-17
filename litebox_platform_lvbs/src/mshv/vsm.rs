@@ -29,7 +29,7 @@ use crate::{
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
-        kernel_elf::{parse_modinfo, validate_module_elf},
+        kernel_elf::{get_symbol_exports, parse_modinfo, validate_module_elf},
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,
@@ -489,7 +489,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     // TODO: validate a kernel module by analyzing its ELF binary and memory content.
     let elf_buf_to_validate = {
         // TODO: For now, we ignore large kernel modules, but we should consider how to handle them.
-        const MODULE_VALIDATION_MAX_SIZE: usize = 300 * 1024;
+        const MODULE_VALIDATION_MAX_SIZE: usize = 5 * 1024 * 1024;
 
         let elf_size = memory_elf.len();
         if elf_size < MODULE_VALIDATION_MAX_SIZE {
@@ -511,12 +511,28 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         let _ = validate_module_elf(
             &elf_buf,
             &module_memory_content,
-            crate::platform_low().vtl0_kernel_info.ksymtab_map.as_ref(),
+            KernelSymbolMaps {
+                ksymtab: crate::platform_low().vtl0_kernel_info.ksymtab_map.as_ref(),
+                ksymtab_gpl: crate::platform_low()
+                    .vtl0_kernel_info
+                    .ksymtab_gpl_map
+                    .as_ref(),
+                module_symbols: crate::platform_low()
+                    .vtl0_kernel_info
+                    .module_symbol_map
+                    .as_ref(),
+            },
+        );
+
+        if let Ok(module_symbol_map) =
+            get_symbol_exports(&elf_buf, module_memory_content.text.start().unwrap())
+        {
+            module_memory_metadata.register_symbols(&module_symbol_map);
+
             crate::platform_low()
                 .vtl0_kernel_info
-                .ksymtab_gpl_map
-                .as_ref(),
-        );
+                .extend_module_symbol_map(module_symbol_map);
+        }
     }
 
     // protect the memory ranges of a module based on their section types
@@ -606,6 +622,11 @@ pub fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, Errno> {
                 MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE,
             )?;
         }
+
+        let symbols = entry.get_symbols();
+        crate::platform_low()
+            .vtl0_kernel_info
+            .shrink_module_symbol_map(symbols);
     }
 
     crate::platform_low()
@@ -765,6 +786,7 @@ pub struct Vtl0KernelInfo {
     boot_done: AtomicBool,
     ksymtab_map: KernelSymbolMap,
     ksymtab_gpl_map: KernelSymbolMap,
+    module_symbol_map: KernelSymbolMap,
     // TODO: certificates, blocklist, etc.
 }
 
@@ -775,6 +797,7 @@ impl Vtl0KernelInfo {
             boot_done: AtomicBool::new(false),
             ksymtab_map: KernelSymbolMap::new(),
             ksymtab_gpl_map: KernelSymbolMap::new(),
+            module_symbol_map: KernelSymbolMap::new(),
         }
     }
 
@@ -870,6 +893,14 @@ impl Vtl0KernelInfo {
 
         Ok(())
     }
+
+    pub fn extend_module_symbol_map(&self, module_symbol_map: HashMap<String, VirtAddr>) {
+        self.module_symbol_map.extend(&module_symbol_map);
+    }
+
+    pub fn shrink_module_symbol_map(&self, module_symbol_map: &HashMap<String, VirtAddr>) {
+        self.module_symbol_map.shrink(module_symbol_map);
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -885,16 +916,28 @@ pub struct ModuleMemoryMetadataMap {
 
 pub struct ModuleMemoryMetadata {
     ranges: Vec<ModuleMemoryRange>,
-    // exported symbols?
+    symbols: HashMap<String, VirtAddr>,
 }
 
 impl ModuleMemoryMetadata {
     pub fn new() -> Self {
-        Self { ranges: Vec::new() }
+        Self {
+            ranges: Vec::new(),
+            symbols: HashMap::new(),
+        }
     }
 
     pub fn insert_memory_range(&mut self, mem_range: ModuleMemoryRange) {
         self.ranges.push(mem_range);
+    }
+
+    pub fn register_symbols(&mut self, symbols: &HashMap<String, VirtAddr>) {
+        self.symbols
+            .extend(symbols.iter().map(|(k, v)| (k.clone(), *v)));
+    }
+
+    pub fn get_symbols(&self) -> &HashMap<String, VirtAddr> {
+        &self.symbols
     }
 }
 
@@ -1006,6 +1049,10 @@ impl<'a> ModuleMemoryIters<'a> {
     pub fn iter_mem_ranges(&'a self) -> impl Iterator<Item = &'a ModuleMemoryRange> {
         self.guard.get(&self.key).unwrap().ranges.iter()
     }
+
+    pub fn get_symbols(&'a self) -> &'a HashMap<String, VirtAddr> {
+        self.guard.get(&self.key).unwrap().get_symbols()
+    }
 }
 
 /// This function copies `HekiPage` structures from VTL0 and returns a vector of them.
@@ -1048,6 +1095,23 @@ fn protect_physical_memory_range(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+pub struct KernelSymbolMaps<'a> {
+    ksymtab: &'a KernelSymbolMap,
+    ksymtab_gpl: &'a KernelSymbolMap,
+    module_symbols: &'a KernelSymbolMap,
+}
+
+impl KernelSymbolMaps<'_> {
+    pub fn get_address(&self, sym_name: &str) -> Option<VirtAddr> {
+        self.ksymtab.get(sym_name).or_else(|| {
+            self.ksymtab_gpl
+                .get(sym_name)
+                .or_else(|| self.module_symbols.get(sym_name))
+        })
+    }
+}
+
 /// Data structure for maintaining kernel symbols and their addresses, populated by parsing `ksymtab` and `ksymtab_gpl`.
 /// We should re-populate these kernel symbol maps after each `kexec` call.
 pub struct KernelSymbolMap {
@@ -1067,6 +1131,18 @@ impl KernelSymbolMap {
         inner.extend(other_map.drain());
     }
 
+    pub fn extend(&self, other_map: &HashMap<String, VirtAddr>) {
+        let mut inner = self.inner.write();
+        inner.extend(other_map.iter().map(|(k, v)| (k.clone(), *v)));
+    }
+
+    pub fn shrink(&self, other_map: &HashMap<String, VirtAddr>) {
+        let mut inner = self.inner.write();
+        for key in other_map.keys() {
+            inner.remove(key);
+        }
+    }
+
     pub fn get(&self, symbol: &str) -> Option<VirtAddr> {
         let inner = self.inner.read();
         inner.get(symbol).copied()
@@ -1081,10 +1157,10 @@ pub struct ModuleMemoryContent {
     pub text: MemoryContent,
     pub init_text: MemoryContent,
     pub data: MemoryContent,
-    pub ro_data: MemoryContent,
+    pub rodata: MemoryContent,
     pub ro_after_init: MemoryContent,
     pub init_data: MemoryContent,
-    pub init_ro_data: MemoryContent,
+    pub init_rodata: MemoryContent,
 }
 
 impl ModuleMemoryContent {
@@ -1093,10 +1169,10 @@ impl ModuleMemoryContent {
             text: MemoryContent::new(),
             init_text: MemoryContent::new(),
             data: MemoryContent::new(),
-            ro_data: MemoryContent::new(),
+            rodata: MemoryContent::new(),
             ro_after_init: MemoryContent::new(),
             init_data: MemoryContent::new(),
-            init_ro_data: MemoryContent::new(),
+            init_rodata: MemoryContent::new(),
         }
     }
 
@@ -1114,7 +1190,7 @@ impl ModuleMemoryContent {
                 .write_vtl0_phys_bytes(addr, phys_start, phys_end),
             ModMemType::Data => self.data.write_vtl0_phys_bytes(addr, phys_start, phys_end),
             ModMemType::RoData => self
-                .ro_data
+                .rodata
                 .write_vtl0_phys_bytes(addr, phys_start, phys_end),
             ModMemType::RoAfterInit => self
                 .ro_after_init
@@ -1123,7 +1199,7 @@ impl ModuleMemoryContent {
                 .init_data
                 .write_vtl0_phys_bytes(addr, phys_start, phys_end),
             ModMemType::InitRoData => self
-                .init_ro_data
+                .init_rodata
                 .write_vtl0_phys_bytes(addr, phys_start, phys_end),
             _ => Err(MemoryContentError::Unknown),
         }
