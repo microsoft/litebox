@@ -4,6 +4,7 @@ use crate::{
     debug_serial_print, debug_serial_println,
     host::{
         bootparam::{get_num_possible_cpus, get_vtl1_memory_info},
+        kernel_elf::{get_symbol_exports, parse_modinfo},
         linux::{CpuMask, KSYM_NAME_LEN, KernelSymbol},
     },
     kernel_context::{get_core_id, get_per_core_kernel_context},
@@ -29,7 +30,6 @@ use crate::{
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
-        kernel_elf::{get_symbol_exports, parse_modinfo},
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,

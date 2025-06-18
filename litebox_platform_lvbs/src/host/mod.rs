@@ -1,5 +1,6 @@
 //! Different host implementations of [`super::HostInterface`]
 pub mod bootparam;
+pub(crate) mod kernel_elf;
 pub mod linux;
 pub mod lvbs_impl;
 
