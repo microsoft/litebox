@@ -88,7 +88,7 @@ impl CpuMask {
 
 pub const KSYM_NAME_LEN: usize = 512;
 
-// Linux kernel maintains two arrays (`ksymtabs`, `ksymtabs_gpl`) of this data structure for each kernel symbol.
+// Linux kernel maintains two arrays (`ksymtab`, `ksymtab_gpl`) of this data structure for each kernel symbol.
 // We need these to relocate kernel symbols within each kernel module.
 // For now we assume our VTL0 Linux kernel is built with `CONFIG_HAVE_ARCH_PREL32_RELOCATIONS=y`.
 // Otherwise, this data structure will have a different layout.
