@@ -36,7 +36,6 @@ use crate::{
 };
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec, vec::Vec};
 use core::{
-    ffi::{CStr, c_char},
     ops::Range,
     sync::atomic::{AtomicBool, AtomicI64, Ordering},
 };
@@ -859,9 +858,8 @@ impl Vtl0KernelInfo {
             kernel_data_mem
                 .read_bytes(name_addr, &mut buf)
                 .map_err(|_| Vtl0KernelInfoError::MemoryError)?;
-            if let Some(name) =
-                unsafe { CStr::from_ptr(buf.as_ptr().cast::<c_char>()).to_str().ok() }
-            {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            if let Ok(name) = core::str::from_utf8(&buf[0..end]) {
                 ksymtab_map.insert(String::from(name), value_addr);
             } else {
                 return Err(Vtl0KernelInfoError::MemoryError);
