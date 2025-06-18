@@ -5,7 +5,7 @@ use core::num::{NonZeroU16, NonZeroU64};
 use hashbrown::HashMap;
 use thiserror::Error;
 
-use crate::utilities::rng::FastRng;
+use crate::utils::rng::FastRng;
 
 /// An allocator for local ports, making sure that no already-allocated ports are given out either
 /// in case of ephemeral port allocation, or in the case of asking for a specific port.
