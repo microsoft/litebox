@@ -706,11 +706,14 @@ mod tests {
         .expect("Failed to allocate stack");
 
         let mut parent_tid = MaybeUninit::<u32>::uninit();
-        let parent_tid_ptr: crate::MutPtr<u32> =
-            unsafe { core::mem::transmute(parent_tid.as_mut_ptr()) };
+        let parent_tid_ptr = crate::MutPtr {
+            inner: parent_tid.as_mut_ptr(),
+        };
 
         #[allow(static_mut_refs)]
-        let child_tid_ptr: crate::MutPtr<i32> = unsafe { core::mem::transmute(&raw mut CHILD_TID) };
+        let child_tid_ptr = crate::MutPtr {
+            inner: &raw mut CHILD_TID,
+        };
 
         let flags = CloneFlags::THREAD
             | CloneFlags::VM
@@ -774,10 +777,8 @@ mod tests {
             #[cfg(target_arch = "x86_64")]
             {
                 let mut current_fs_base = MaybeUninit::<usize>::uninit();
-                super::sys_arch_prctl(litebox_common_linux::ArchPrctlArg::GetFs(unsafe {
-                    core::mem::transmute::<*mut usize, crate::MutPtr<usize>>(
-                        current_fs_base.as_mut_ptr(),
-                    )
+                super::sys_arch_prctl(litebox_common_linux::ArchPrctlArg::GetFs(crate::MutPtr {
+                    inner: current_fs_base.as_mut_ptr(),
                 }))
                 .expect("Failed to get FS base");
                 #[allow(static_mut_refs)]
@@ -793,6 +794,25 @@ mod tests {
             crate::syscalls::tests::log_println!("Child TID: {}", unsafe { CHILD_TID });
             super::sys_exit(0);
         };
+
+        #[cfg(target_arch = "x86")]
+        let mut user_desc = {
+            let mut flags = litebox_common_linux::UserDescFlags(0);
+            flags.set_seg_32bit(true);
+            flags.set_useable(true);
+            litebox_common_linux::UserDesc {
+                entry_number: u32::MAX,
+                #[allow(static_mut_refs)]
+                base_addr: unsafe { TLS.as_mut_ptr() } as u32,
+                limit: u32::try_from(core::mem::size_of::<
+                    litebox_common_linux::ThreadLocalStorage<litebox_platform_multiplex::Platform>,
+                >())
+                .unwrap()
+                    - 1,
+                flags,
+            }
+        };
+
         let result = super::sys_clone(
             flags,
             Some(parent_tid_ptr),
@@ -800,8 +820,11 @@ mod tests {
             stack_size,
             Some(child_tid_ptr),
             Some(crate::MutPtr {
+                #[cfg(target_arch = "x86_64")]
                 #[allow(static_mut_refs)]
                 inner: unsafe { TLS.as_mut_ptr() },
+                #[cfg(target_arch = "x86")]
+                inner: &mut user_desc,
             }),
             &pt_regs,
             main as usize,
