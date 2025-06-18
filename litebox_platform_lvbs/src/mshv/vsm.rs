@@ -1278,7 +1278,7 @@ impl MemoryContent {
     }
 
     pub fn get_or_alloc_page(&mut self, addr: VirtAddr) -> &mut Box<[u8; PAGE_SIZE]> {
-        let page_base = addr.align_down(u64::try_from(PAGE_SIZE).unwrap_or(4096));
+        let page_base = addr.align_down(u64::try_from(PAGE_SIZE).unwrap());
         self.pages
             .entry(page_base)
             .or_insert_with(|| Box::new([0; PAGE_SIZE]))
@@ -1321,19 +1321,19 @@ impl MemoryContent {
     }
 
     pub fn read_byte(&self, addr: VirtAddr) -> Option<u8> {
-        let page_base = addr.align_down(u64::try_from(PAGE_SIZE).unwrap_or(4096));
+        let page_base = addr.align_down(u64::try_from(PAGE_SIZE).unwrap());
         let page_offset: usize = addr.page_offset().into();
         self.pages.get(&page_base).map(|page| page[page_offset])
     }
 
     pub fn preallocate_pages(&mut self, start: VirtAddr, end: VirtAddr) {
-        let start_page = start.align_down(u64::try_from(PAGE_SIZE).unwrap_or(4096));
-        let end_page = end.align_up(u64::try_from(PAGE_SIZE).unwrap_or(4096));
+        let start_page = start.align_down(u64::try_from(PAGE_SIZE).unwrap());
+        let end_page = end.align_up(u64::try_from(PAGE_SIZE).unwrap());
 
         let mut page_addr = start_page;
         while page_addr < end_page {
             let _ = self.get_or_alloc_page(page_addr);
-            page_addr += u64::try_from(PAGE_SIZE).unwrap_or(4096);
+            page_addr += u64::try_from(PAGE_SIZE).unwrap();
         }
     }
 
@@ -1346,11 +1346,11 @@ impl MemoryContent {
         let mut num_bytes = 0;
 
         for (&page_addr, page) in self.pages.range_mut(
-            start.align_down(u64::try_from(PAGE_SIZE).unwrap_or(4096))
-                ..end.align_up(u64::try_from(PAGE_SIZE).unwrap_or(4096)),
+            start.align_down(u64::try_from(PAGE_SIZE).unwrap())
+                ..end.align_up(u64::try_from(PAGE_SIZE).unwrap()),
         ) {
             let page_start = page_addr;
-            let page_end = page_addr + u64::try_from(PAGE_SIZE).unwrap_or(4096);
+            let page_end = page_addr + u64::try_from(PAGE_SIZE).unwrap();
 
             let copy_start = core::cmp::max(start, page_start);
             let copy_end = core::cmp::min(end, page_end);
@@ -1400,11 +1400,11 @@ impl MemoryContent {
         let mut num_bytes = 0;
 
         for (&page_addr, page) in self.pages.range(
-            start.align_down(u64::try_from(PAGE_SIZE).unwrap_or(4096))
-                ..end.align_up(u64::try_from(PAGE_SIZE).unwrap_or(4096)),
+            start.align_down(u64::try_from(PAGE_SIZE).unwrap())
+                ..end.align_up(u64::try_from(PAGE_SIZE).unwrap()),
         ) {
             let page_start = page_addr;
-            let page_end = page_addr + u64::try_from(PAGE_SIZE).unwrap_or(4096);
+            let page_end = page_addr + u64::try_from(PAGE_SIZE).unwrap();
 
             let copy_start = core::cmp::max(start, page_start);
             let copy_end = core::cmp::min(end, page_end);
