@@ -1212,25 +1212,12 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
 #[repr(i32)]
-#[non_exhaustive]
+#[derive(Debug, IntEnum, PartialEq, Eq)]
 pub enum EpollOp {
     EpollCtlAdd = 1,
     EpollCtlDel = 2,
     EpollCtlMod = 3,
-    Invalid = -1,
-}
-
-impl From<i32> for EpollOp {
-    fn from(value: i32) -> Self {
-        match value {
-            1 => Self::EpollCtlAdd,
-            2 => Self::EpollCtlDel,
-            3 => Self::EpollCtlMod,
-            _ => Self::Invalid,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1426,9 +1413,8 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         sigsetsize: usize,
     },
     EpollCreate {
+        // the `size` argument is ignored, but must be greater than zero;
         size: i32,
-    },
-    EpollCreate1 {
         flags: EpollCreateFlags,
     },
     ArchPrctl {
@@ -1928,15 +1914,19 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
             Sysno::getegid => SyscallRequest::Getegid,
-            Sysno::epoll_ctl => SyscallRequest::EpollCtl {
-                epfd: ctx.get_arg(0).reinterpret_as_signed().truncate(),
-                op: {
-                    let op: i32 = ctx.get_arg(1).reinterpret_as_signed().truncate();
-                    EpollOp::from(op)
-                },
-                fd: ctx.get_arg(2).reinterpret_as_signed().truncate(),
-                event: Platform::RawConstPointer::from_usize(ctx.get_arg(3)),
-            },
+            Sysno::epoll_ctl => {
+                let op: i32 = ctx.get_arg(1).reinterpret_as_signed().truncate();
+                if let Ok(op) = EpollOp::try_from(op) {
+                    SyscallRequest::EpollCtl {
+                        epfd: ctx.get_arg(0).reinterpret_as_signed().truncate(),
+                        op,
+                        fd: ctx.get_arg(2).reinterpret_as_signed().truncate(),
+                        event: Platform::RawConstPointer::from_usize(ctx.get_arg(3)),
+                    }
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
+            }
             Sysno::epoll_wait => SyscallRequest::EpollPwait {
                 epfd: ctx.get_arg(0).reinterpret_as_signed().truncate(),
                 events: Platform::RawMutPointer::from_usize(ctx.get_arg(1)),
@@ -1959,11 +1949,11 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             },
             Sysno::epoll_create => SyscallRequest::EpollCreate {
                 size: ctx.get_arg(0).reinterpret_as_signed().truncate(),
+                flags: EpollCreateFlags::empty(),
             },
-            Sysno::epoll_create1 => SyscallRequest::EpollCreate1 {
-                flags: EpollCreateFlags::from_bits_truncate(
-                    ctx.get_arg(0).truncate(),
-                ),
+            Sysno::epoll_create1 => SyscallRequest::EpollCreate {
+                size: 1,
+                flags: EpollCreateFlags::from_bits_truncate(ctx.get_arg(0).truncate()),
             },
             Sysno::arch_prctl => {
                 let code: u32 = ctx.syscall_arg(0).truncate();

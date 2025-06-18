@@ -35,4 +35,3 @@ elf_loader = { version = "=0.10.0", default-features = false, features = ["rel"]
 workspace = true
 
 [dev-dependencies]
-spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }

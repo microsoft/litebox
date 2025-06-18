@@ -144,7 +144,6 @@ impl EpollFile {
                     .ok_or(Errno::ENOENT)?;
                 Ok(())
             }
-            _ => unreachable!(),
         }
     }
 

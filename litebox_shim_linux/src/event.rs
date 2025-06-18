@@ -1,4 +1,6 @@
 use alloc::collections::btree_map::BTreeMap;
+use litebox::platform::RawMutex as _;
+use litebox::platform::RawMutexProvider;
 use litebox::{
     event::Events,
     platform::{Instant as _, TimeProvider as _},
@@ -201,20 +203,18 @@ impl Pollee {
 }
 
 pub(crate) struct Poller {
-    condvar: litebox::sync::RawCondvar<litebox_platform_multiplex::Platform>,
+    condvar: <litebox_platform_multiplex::Platform as RawMutexProvider>::RawMutex,
 }
 
 impl Poller {
     fn new() -> Self {
         Self {
-            condvar: litebox::sync::RawCondvar::new_from_platform(
-                litebox_platform_multiplex::platform(),
-            ),
+            condvar: litebox_platform_multiplex::platform().new_raw_mutex(),
         }
     }
 
     fn wait(&self) -> bool {
-        unsafe { self.condvar.simple_wait() }
+        self.do_wait(None)
     }
 
     /// Wait for the poller to be notified.
@@ -227,7 +227,7 @@ impl Poller {
                 }
 
                 let start_time = litebox_platform_multiplex::platform().now();
-                let res = unsafe { self.condvar.simple_wait_optional_timeout(Some(*timeout)) };
+                let res = unsafe { self.do_wait(Some(*timeout)) };
                 *timeout = timeout
                     .checked_sub(
                         start_time.duration_since(&litebox_platform_multiplex::platform().now()),
@@ -239,10 +239,31 @@ impl Poller {
         };
         if ret { Ok(()) } else { Err(Errno::ETIMEDOUT) }
     }
+
+    fn do_wait(&self, timeout: Option<core::time::Duration>) -> bool {
+        let futex = self.condvar.underlying_atomic();
+        if futex.swap(0, core::sync::atomic::Ordering::Relaxed) == 0 {
+            if let Some(timeout) = timeout {
+                match self.condvar.block_or_timeout(0, timeout) {
+                    Ok(litebox::platform::UnblockedOrTimedOut::TimedOut) => false,
+                    Ok(litebox::platform::UnblockedOrTimedOut::Unblocked)
+                    | Err(litebox::platform::ImmediatelyWokenUp) => true,
+                }
+            } else {
+                let _ = self.condvar.block(0);
+                true
+            }
+        } else {
+            true
+        }
+    }
 }
 
 impl Observer<Events> for Poller {
     fn on_events(&self, events: &Events) {
-        self.condvar.notify_one();
+        self.condvar
+            .underlying_atomic()
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.condvar.wake_one();
     }
 }

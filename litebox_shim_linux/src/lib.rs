@@ -215,14 +215,6 @@ impl Descriptors {
     }
 }
 
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum StdType {
-    Stdin = 0,
-    Stdout = 1,
-    Stderr = 2,
-}
-
 enum Descriptor {
     File(FileFd),
     // Note we are using `Arc` here so that we can hold a reference to the socket
@@ -459,18 +451,9 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
             fd,
             event,
         } => syscalls::file::sys_epoll_ctl(epfd, op, fd, event).map(|()| 0),
-        SyscallRequest::EpollCreate { size } => {
-            syscalls::file::sys_epoll_create(size).map(|fd| fd as usize)
+        SyscallRequest::EpollCreate { size, flags } => {
+            syscalls::file::sys_epoll_create(size, flags).map(|fd| fd as usize)
         }
-        SyscallRequest::EpollCreate1 { flags } => {
-            syscalls::file::sys_epoll_create1(flags).map(|fd| fd as usize)
-        }
-        SyscallRequest::EpollCtl {
-            epfd,
-            op,
-            fd,
-            event,
-        } => syscalls::file::sys_epoll_ctl(epfd, op, fd, event).map(|()| 0),
         SyscallRequest::EpollPwait {
             epfd,
             events,
@@ -479,12 +462,6 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
             sigmask,
             sigsetsize,
         } => syscalls::file::sys_epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize),
-        SyscallRequest::EpollCreate { size } => {
-            syscalls::file::sys_epoll_create(size).map(|fd| fd as usize)
-        }
-        SyscallRequest::EpollCreate1 { flags } => {
-            syscalls::file::sys_epoll_create1(flags).map(|fd| fd as usize)
-        }
         SyscallRequest::ArchPrctl { arg } => syscalls::process::sys_arch_prctl(arg).map(|()| 0),
         SyscallRequest::Readlink {
             pathname,

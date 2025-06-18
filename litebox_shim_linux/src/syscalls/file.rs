@@ -328,7 +328,7 @@ pub fn sys_writev(
                 socket.sendto(buf, litebox::net::SendFlags::empty(), None)
             })
         }
-        Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
+        Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
         Descriptor::PipeWriter { producer, .. } => todo!(),
         Descriptor::Eventfd { file, .. } => todo!(),
         _ => todo!(),
@@ -820,15 +820,11 @@ pub fn sys_ioctl(
     }
 }
 
-pub fn sys_epoll_create(size: i32) -> Result<u32, Errno> {
+/// Handle syscall `epoll_create` and `epoll_create1`
+pub fn sys_epoll_create(size: i32, flags: EpollCreateFlags) -> Result<u32, Errno> {
     if size <= 0 {
         return Err(Errno::EINVAL);
     }
-
-    sys_epoll_create1(EpollCreateFlags::empty())
-}
-
-pub fn sys_epoll_create1(flags: EpollCreateFlags) -> Result<u32, Errno> {
     if flags.contains(EpollCreateFlags::EPOLL_CLOEXEC.complement()) {
         return Err(Errno::EINVAL);
     }
@@ -843,6 +839,7 @@ pub fn sys_epoll_create1(flags: EpollCreateFlags) -> Result<u32, Errno> {
     Ok(fd)
 }
 
+/// Handle syscall `epoll_ctl`
 pub fn sys_epoll_ctl(
     epfd: i32,
     op: litebox_common_linux::EpollOp,
@@ -855,9 +852,6 @@ pub fn sys_epoll_ctl(
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
-    if op == litebox_common_linux::EpollOp::Invalid {
-        return Err(Errno::EINVAL);
-    }
     if epfd == fd {
         return Err(Errno::EINVAL);
     }
@@ -881,6 +875,7 @@ pub fn sys_epoll_ctl(
     epoll.epoll_ctl(op, fd, file, event)
 }
 
+/// Handle syscall `epoll_pwait`
 pub fn sys_epoll_pwait(
     epfd: i32,
     events: MutPtr<litebox_common_linux::EpollEvent>,
