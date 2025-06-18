@@ -1174,6 +1174,19 @@ impl ModuleMemoryContent {
         }
     }
 
+    pub fn find_section_by_name(&self, name: &str) -> Option<&MemoryContent> {
+        match name {
+            ".text" => Some(&self.text),
+            ".init.text" => Some(&self.init_text),
+            ".init.data" => Some(&self.init_data),
+            ".init.rodata" => Some(&self.init_rodata),
+            ".data..ro_after_init" => Some(&self.ro_after_init),
+            s if s == ".rodata" || s.starts_with(".rodata.") => Some(&self.rodata),
+            s if s == ".data" || s == ".bss" || s.starts_with(".data.") => Some(&self.data),
+            _ => None,
+        }
+    }
+
     pub fn write_vtl0_phys_bytes_by_type(
         &mut self,
         addr: VirtAddr,
