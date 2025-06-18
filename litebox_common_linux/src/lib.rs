@@ -816,6 +816,7 @@ bitflags::bitflags! {
     }
 }
 
+/// Arguments for the `clone3` syscall.
 #[repr(C, align(8))]
 #[derive(Clone, Debug)]
 pub struct CloneArgs {
@@ -832,9 +833,14 @@ pub struct CloneArgs {
     pub cgroup: u64,
 }
 
+#[cfg(target_arch = "x86_64")]
+pub type ThreadLocalDescriptor = u8;
+#[cfg(target_arch = "x86")]
+pub type ThreadLocalDescriptor = UserDesc;
+
 pub struct NewThreadArgs<Platform: litebox::platform::RawPointerProvider> {
     pub child_tid: i32,
-    pub tls: Option<Platform::RawMutPointer<u8>>,
+    pub tls: Option<Platform::RawMutPointer<ThreadLocalDescriptor>>,
     pub set_child_tid: Option<Platform::RawMutPointer<i32>>,
     pub clear_child_tid: Option<Platform::RawMutPointer<i32>>,
 }
@@ -863,14 +869,13 @@ impl<Platform: litebox::platform::RawPointerProvider> ThreadLocalStorage<Platfor
 pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     /// Thread ID
     pub tid: i32,
-    /// When a thread whose `clear_child_tid` is not None terminates, then, if the thread
-    /// is sharing memory with other threads, then 0 is written at the address specified in
-    /// `clear_child_tid` and the kernel performs the following operation:
+    /// When a thread whose `clear_child_tid` is not `None` terminates, and it shares memory with other threads,
+    /// the kernel writes 0 to the address specified by `clear_child_tid` and then executes:
     ///
     /// futex(clear_child_tid, FUTEX_WAKE, 1, NULL, NULL, 0);
     ///
-    /// The effect of this operation is to wake a single thread that is performing a futex wait
-    /// on the memory location. Errors from the futex wake operation are ignored.
+    /// This operation wakes a single thread waiting on the specified memory location via futex.
+    /// Any errors from the futex wake operation are
     pub clear_child_tid: Option<Platform::RawMutPointer<i32>>,
 }
 
