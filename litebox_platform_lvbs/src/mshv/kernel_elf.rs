@@ -2,7 +2,7 @@
 
 use crate::{
     debug_serial_println,
-    mshv::vsm::{KernelSymbolMaps, MemoryContent, ModuleMemoryContent},
+    mshv::vsm::{KernelSymbolMaps, ModuleMemoryContent},
 };
 use alloc::{
     string::{String, ToString},
@@ -43,54 +43,34 @@ pub fn validate_module_elf(
     mod_mem: &ModuleMemoryContent,
     symbol_maps: KernelSymbolMaps,
 ) -> Result<bool, KernelElfError> {
-    if let Ok(text_reloc) = relocate_elf_section(elf_buf, ".text", mod_mem, symbol_maps) {
-        let mut text_loaded = vec![0u8; text_reloc.iter().len()];
-        mod_mem
-            .text
-            .read_bytes(mod_mem.text.start().unwrap(), &mut text_loaded)
-            .map_err(|_| KernelElfError::SectionReadFailed)?;
+    let mut result = true;
 
-        for (i, (&r, &l)) in text_reloc.iter().zip(text_loaded.iter()).enumerate() {
-            if r != l {
-                debug_serial_println!("Mismatch at {:#x}: reloc = {:#x}, loaded = {:#x}", i, r, l);
-            }
+    for section in [".text", ".init.text"] {
+        let sect_mem = mod_mem.find_section_by_name(section).unwrap();
+        if sect_mem.is_empty() {
+            return Ok(result);
         }
-    } else {
-        return Err(KernelElfError::SectionRelocationFailed);
-    }
 
-    if mod_mem.init_text.is_empty() {
-        // if the module does not have `.init.text`, we skip the validation.
-        return Ok(true);
-    }
+        if let Ok(text_reloc) = relocate_elf_section(elf_buf, section, mod_mem, symbol_maps) {
+            let mut text_loaded = vec![0u8; text_reloc.iter().len()];
+            sect_mem
+                .read_bytes(sect_mem.start().unwrap(), &mut text_loaded)
+                .map_err(|_| KernelElfError::SectionReadFailed)?;
 
-    if let Ok(text_reloc) = relocate_elf_section(elf_buf, ".init.text", mod_mem, symbol_maps) {
-        let mut text_loaded = vec![0u8; text_reloc.iter().len()];
-        mod_mem
-            .init_text
-            .read_bytes(mod_mem.init_text.start().unwrap(), &mut text_loaded)
-            .map_err(|_| KernelElfError::SectionReadFailed)?;
-
-        for (i, (&r, &l)) in text_reloc.iter().zip(text_loaded.iter()).enumerate() {
-            if r != l {
-                debug_serial_println!("Mismatch at {:#x}: r = {:#x}, l = {:#x}", i, r, l);
+            for (i, (&r, &l)) in text_reloc.iter().zip(text_loaded.iter()).enumerate() {
+                if r != l {
+                    debug_serial_println!(
+                        "Mismatch: reloc[{i:#x}] = {r:#x}, loaded[{i:#x}] = {l:#x}"
+                    );
+                    result = false;
+                }
             }
+        } else {
+            return Err(KernelElfError::SectionRelocationFailed);
         }
-    } else {
-        return Err(KernelElfError::SectionRelocationFailed);
     }
 
-    Ok(true)
-}
-
-/// Error for Kernel ELF validation and relocation failures.
-#[derive(Debug, PartialEq)]
-pub enum KernelElfError {
-    SectionReadFailed,
-    SectionRelocationFailed,
-    ElfParseFailed,
-    UnsupportedSection,
-    SectionNotFound,
+    Ok(result)
 }
 
 /// This function relocates the specified section of a kernel module ELF file using both ELF itself and loaded data.
@@ -114,14 +94,6 @@ pub fn relocate_elf_section(
         }
     }
 
-    let mem_to_validate = match section_name {
-        ".text" => &mod_mem.text,
-        ".init.text" => &mod_mem.init_text,
-        _ => {
-            return Err(KernelElfError::UnsupportedSection);
-        }
-    };
-
     let Ok(elf) = Elf::parse(elf_buf) else {
         return Err(KernelElfError::ElfParseFailed);
     };
@@ -133,26 +105,17 @@ pub fn relocate_elf_section(
     }) else {
         return Err(KernelElfError::SectionNotFound);
     };
-    let sect_offset = section.sh_offset;
-    let sect_size = section.sh_size;
 
-    let mut reloc_buf = vec![0u8; usize::try_from(sect_size).unwrap()];
+    let mut reloc_buf = vec![0u8; usize::try_from(section.sh_size).unwrap()];
     reloc_buf.copy_from_slice(
-        &elf_buf[usize::try_from(sect_offset).unwrap()
-            ..usize::try_from(sect_offset + sect_size).unwrap()],
+        &elf_buf[usize::try_from(section.sh_offset).unwrap()
+            ..usize::try_from(section.sh_offset + section.sh_size).unwrap()],
     );
 
-    relocate_symbols(
-        &elf,
-        section_name,
-        &mut reloc_buf,
-        mem_to_validate,
-        mod_mem,
-        symbol_maps,
-    )
-    .map_err(|_| KernelElfError::SectionRelocationFailed)?;
+    relocate_symbols(&elf, section_name, &mut reloc_buf, mod_mem, symbol_maps)
+        .map_err(|_| KernelElfError::SectionRelocationFailed)?;
 
-    accept_patchables(&elf, section_name, &mut reloc_buf, mem_to_validate)
+    accept_patchables(&elf, section_name, &mut reloc_buf, mod_mem)
         .map_err(|_| KernelElfError::SectionRelocationFailed)?;
 
     Ok(reloc_buf)
@@ -163,17 +126,13 @@ fn relocate_symbols(
     elf: &Elf,
     section_name: &str,
     reloc_buf: &mut [u8],
-    mem_to_validate: &MemoryContent,
     mod_mem: &ModuleMemoryContent,
     symbol_maps: KernelSymbolMaps,
 ) -> Result<(), KernelElfError> {
-    let section_base_addr: u64 = match section_name {
-        ".text" => mod_mem.text.start().unwrap().as_u64(),
-        ".init.text" => mod_mem.init_text.start().unwrap().as_u64(),
-        _ => {
-            return Err(KernelElfError::UnsupportedSection);
-        }
+    let Some(mem_to_validate) = mod_mem.find_section_by_name(section_name) else {
+        return Err(KernelElfError::UnsupportedSection);
     };
+    let section_base_addr = mem_to_validate.start().unwrap().as_u64();
 
     for (shndx, relocations) in &elf.shdr_relocs {
         let cur_section = &elf.section_headers[*shndx];
@@ -304,6 +263,7 @@ fn relocate_symbols(
                 (None, None)
             };
 
+            // Reject known bad symbol relocations
             if let Some(sym_addr) = sym_addr {
                 if sym.is_import() && value_to_validate != sym_addr {
                     continue;
@@ -317,19 +277,13 @@ fn relocate_symbols(
                 {
                     continue;
                 }
+            }
 
-                if r_type == R_X86_64_64 {
-                    reloc_buf[r_offset..r_offset + 8].copy_from_slice(&buffer[0..8]);
-                } else {
-                    reloc_buf[r_offset..r_offset + 4].copy_from_slice(&buffer[0..4]);
-                }
+            // Accept all unhandled symbol relocations for now
+            if r_type == R_X86_64_64 {
+                reloc_buf[r_offset..r_offset + 8].copy_from_slice(&buffer[0..8]);
             } else {
-                // TODO: check special local symbol names like `__this_module`
-                if r_type == R_X86_64_64 {
-                    reloc_buf[r_offset..r_offset + 8].copy_from_slice(&buffer[0..8]);
-                } else {
-                    reloc_buf[r_offset..r_offset + 4].copy_from_slice(&buffer[0..4]);
-                }
+                reloc_buf[r_offset..r_offset + 4].copy_from_slice(&buffer[0..4]);
             }
         }
     }
@@ -343,7 +297,7 @@ fn accept_patchables(
     elf: &Elf,
     section_name: &str,
     reloc_buf: &mut [u8],
-    mem_to_validate: &MemoryContent,
+    mod_mem: &ModuleMemoryContent,
 ) -> Result<(), KernelElfError> {
     let mut patchable = RangeSet::<i64>::new();
 
@@ -356,6 +310,10 @@ fn accept_patchables(
         ".rela.return_sites",
         ".rela__patchable_function_entries",
     ];
+
+    let Some(mem_to_validate) = mod_mem.find_section_by_name(section_name) else {
+        return Err(KernelElfError::UnsupportedSection);
+    };
 
     // detect all patch candidates and copy them
     for (shndx, relocations) in &elf.shdr_relocs {
@@ -418,15 +376,9 @@ fn get_section_loaded_address(
     section_name: &str,
     mod_mem: &ModuleMemoryContent,
 ) -> Option<VirtAddr> {
-    match section_name {
-        ".text" => mod_mem.text.start(),
-        ".init.text" => mod_mem.init_text.start(),
-        ".init.data" => mod_mem.init_data.start(),
-        ".init.rodata" => mod_mem.init_rodata.start(),
-        s if s == ".rodata" || s.starts_with(".rodata.") => mod_mem.rodata.start(),
-        s if s == ".data" || s == ".bss" || s.starts_with(".data.") => mod_mem.data.start(),
-        _ => None,
-    }
+    mod_mem
+        .find_section_by_name(section_name)
+        .map(|s| s.start().unwrap())
 }
 
 #[inline]
@@ -435,17 +387,9 @@ fn is_valid_section_address(
     mod_mem: &ModuleMemoryContent,
     address: VirtAddr,
 ) -> bool {
-    match section_name {
-        ".text" => mod_mem.text.contains(address),
-        ".init.text" => mod_mem.init_text.contains(address),
-        ".init.data" => mod_mem.init_data.contains(address),
-        ".init.rodata" => mod_mem.init_rodata.contains(address),
-        s if s == ".rodata" || s.starts_with(".rodata.") => mod_mem.rodata.contains(address),
-        s if s == ".data" || s == ".bss" || s.starts_with(".data.") => {
-            mod_mem.data.contains(address)
-        }
-        _ => false,
-    }
+    mod_mem
+        .find_section_by_name(section_name)
+        .is_some_and(|s| s.contains(address))
 }
 
 #[inline]
@@ -565,4 +509,14 @@ pub fn get_symbol_exports(
     }
 
     Ok(symbol_map)
+}
+
+/// Error for Kernel ELF validation and relocation failures.
+#[derive(Debug, PartialEq)]
+pub enum KernelElfError {
+    SectionReadFailed,
+    SectionRelocationFailed,
+    ElfParseFailed,
+    UnsupportedSection,
+    SectionNotFound,
 }
