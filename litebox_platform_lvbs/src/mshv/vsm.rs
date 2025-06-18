@@ -29,7 +29,7 @@ use crate::{
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
-        kernel_elf::{get_symbol_exports, parse_modinfo, validate_module_elf},
+        kernel_elf::{get_symbol_exports, parse_modinfo},
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,
@@ -487,8 +487,9 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
 
     // TODO: validate a kernel module by analyzing its ELF binary and memory content.
     let elf_buf_to_validate = {
-        // TODO: For now, we ignore large kernel modules, but we should consider how to handle them.
-        const MODULE_VALIDATION_MAX_SIZE: usize = 5 * 1024 * 1024;
+        // TODO: For now, we ignore large kernel modules because VTL1 has limited memory and our allocator
+        // doesn't allow us to allocate a large buffer. We must handle these issues soon.
+        const MODULE_VALIDATION_MAX_SIZE: usize = 8 * 1024 * 1024;
 
         let elf_size = memory_elf.len();
         if elf_size < MODULE_VALIDATION_MAX_SIZE {
@@ -507,25 +508,10 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     if let Some(elf_buf) = elf_buf_to_validate {
         parse_modinfo(&elf_buf);
 
-        let _ = validate_module_elf(
-            &elf_buf,
-            &module_memory_content,
-            KernelSymbolMaps {
-                ksymtab: crate::platform_low().vtl0_kernel_info.ksymtab_map.as_ref(),
-                ksymtab_gpl: crate::platform_low()
-                    .vtl0_kernel_info
-                    .ksymtab_gpl_map
-                    .as_ref(),
-                module_symbols: crate::platform_low()
-                    .vtl0_kernel_info
-                    .module_symbol_map
-                    .as_ref(),
-            },
-        );
-
         if let Ok(module_symbol_map) =
             get_symbol_exports(&elf_buf, module_memory_content.text.start().unwrap())
         {
+            debug_serial_println!("{:?}", module_symbol_map);
             module_memory_metadata.register_symbols(&module_symbol_map);
 
             crate::platform_low()
@@ -1093,23 +1079,6 @@ fn protect_physical_memory_range(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-pub struct KernelSymbolMaps<'a> {
-    ksymtab: &'a KernelSymbolMap,
-    ksymtab_gpl: &'a KernelSymbolMap,
-    module_symbols: &'a KernelSymbolMap,
-}
-
-impl KernelSymbolMaps<'_> {
-    pub fn get_address(&self, sym_name: &str) -> Option<VirtAddr> {
-        self.ksymtab.get(sym_name).or_else(|| {
-            self.ksymtab_gpl
-                .get(sym_name)
-                .or_else(|| self.module_symbols.get(sym_name))
-        })
-    }
-}
-
 /// Data structure for maintaining kernel symbols and their addresses, populated by parsing `ksymtab` and `ksymtab_gpl`.
 /// We should re-populate these kernel symbol maps after each `kexec` call.
 pub struct KernelSymbolMap {
@@ -1141,11 +1110,13 @@ impl KernelSymbolMap {
         }
     }
 
+    #[expect(dead_code)]
     pub fn get(&self, symbol: &str) -> Option<VirtAddr> {
         let inner = self.inner.read();
         inner.get(symbol).copied()
     }
 
+    #[expect(dead_code)]
     pub fn as_ref(&self) -> &KernelSymbolMap {
         self
     }
@@ -1174,6 +1145,7 @@ impl ModuleMemoryContent {
         }
     }
 
+    #[expect(dead_code)]
     pub fn find_section_by_name(&self, name: &str) -> Option<&MemoryContent> {
         match name {
             ".text" => Some(&self.text),
@@ -1259,6 +1231,7 @@ impl MemoryContent {
         self.range.is_empty()
     }
 
+    #[expect(dead_code)]
     pub fn contains(&self, addr: VirtAddr) -> bool {
         self.range.contains(&addr)
             && self
@@ -1320,6 +1293,7 @@ impl MemoryContent {
         Ok(())
     }
 
+    #[expect(dead_code)]
     pub fn read_byte(&self, addr: VirtAddr) -> Option<u8> {
         let page_base = addr.align_down(u64::try_from(PAGE_SIZE).unwrap());
         let page_offset: usize = addr.page_offset().into();
