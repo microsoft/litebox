@@ -425,7 +425,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     let mut module_memory_metadata = ModuleMemoryMetadata::new();
 
     // collect and maintain the memory ranges of a module locally until the module is validated and its metadata is registered in the global map
-    // we don't matain this content in the global map due to memory overhead. Instead, we could add its hash value to the global map to check the integrity.
+    // we don't maintain this content in the global map due to memory overhead. Instead, we could add its hash value to the global map to check the integrity.
     let mut module_memory_content = ModuleMemoryContent::new();
     let mut memory_elf = MemoryContent::new();
 
