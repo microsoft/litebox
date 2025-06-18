@@ -324,13 +324,7 @@ fn relocate_symbols(
                     reloc_buf[r_offset..r_offset + 4].copy_from_slice(&buffer[0..4]);
                 }
             } else {
-                // check special local symbol names like `__this_module`
-                if sym_name != "__this_module" {
-                    debug_serial_println!(
-                        "Validating undefined symbol {sym_name}/{:?}: {value_to_validate:#x} at {r_offset:#x} (in another module?)",
-                        sym_section_name
-                    );
-                }
+                // TODO: check special local symbol names like `__this_module`
                 if r_type == R_X86_64_64 {
                     reloc_buf[r_offset..r_offset + 8].copy_from_slice(&buffer[0..8]);
                 } else {
@@ -538,7 +532,9 @@ pub fn parse_modinfo(elf_buf: &[u8]) {
         for entry in modinfo_data.split(|&b| b == 0) {
             if let Ok(s) = str::from_utf8(entry) {
                 if let Some((k, v)) = s.split_once('=') {
-                    debug_serial_println!("Modinfo: {} = {}", k, v);
+                    if k == "name" {
+                        debug_serial_println!("Modinfo: {} = {}", k, v);
+                    }
                 }
             }
         }
