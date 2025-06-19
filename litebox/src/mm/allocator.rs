@@ -35,7 +35,7 @@ pub trait MemoryProvider {
 /// Allocator that uses buddy allocator for pages and slab allocator for small objects.
 ///
 /// `ORDER` is the maximum order of the buddy allocator, specifying the maximum size of the
-/// allocation that can be done using the buddy allocator -- i.e., 2^ORDER * PAGE_SIZE.
+/// allocation that can be done using the buddy allocator -- i.e., 1 << (ORDER - 1).
 pub struct SafeZoneAllocator<'a, const ORDER: usize, M: MemoryProvider> {
     buddy_allocator: LockedHeapWithRescue<ORDER>,
     slab_allocator: SpinMutex<ZoneAllocator<'a>>,
@@ -61,7 +61,7 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
         Self {
             buddy_allocator: LockedHeapWithRescue::new(|heap, layout| {
                 let page_aligned_size = layout.size().next_power_of_two();
-                if page_aligned_size.trailing_zeros() as usize > ORDER {
+                if page_aligned_size.trailing_zeros() as usize >= ORDER {
                     unimplemented!("requested size {page_aligned_size:#} is too large");
                 }
                 let Ok(layout) = Layout::from_size_align(page_aligned_size, page_aligned_size)
