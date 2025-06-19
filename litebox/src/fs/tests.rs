@@ -185,7 +185,7 @@ mod in_mem {
             Err(crate::fs::errors::ChownError::NotTheOwner) => {
                 // Expected behavior
             }
-            Ok(_) => panic!("Non-owner should not be able to chown"),
+            Ok(()) => panic!("Non-owner should not be able to chown"),
             Err(e) => panic!("Unexpected error: {:?}", e),
         }
         
@@ -196,7 +196,7 @@ mod in_mem {
             )) => {
                 // Expected behavior
             }
-            Ok(_) => panic!("Should not be able to chown non-existent file"),
+            Ok(()) => panic!("Should not be able to chown non-existent file"),
             Err(e) => panic!("Unexpected error: {:?}", e),
         }
     }
