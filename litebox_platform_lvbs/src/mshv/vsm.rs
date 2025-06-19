@@ -4,7 +4,7 @@ use crate::{
     debug_serial_print, debug_serial_println,
     host::{
         bootparam::{get_num_possible_cpus, get_vtl1_memory_info},
-        linux::{CpuMask, KSYM_NAME_LEN, KernelSymbol},
+        linux::CpuMask,
     },
     kernel_context::{get_core_id, get_per_core_kernel_context},
     mshv::{
@@ -23,25 +23,24 @@ use crate::{
         VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE, VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags,
         X86Cr4Flags,
         heki::{
-            HekiKdataType, HekiKinfo, HekiPage, MemAttr, ModMemType,
-            mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr,
+            HekiKdataType, HekiPage, MemAttr, ModMemType, mem_attr_to_hv_page_prot_flags,
+            mod_mem_type_to_mem_attr,
         },
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
-        kernel_elf::{get_symbol_exports, parse_modinfo, validate_module_elf},
+        kernel_elf::{parse_modinfo, validate_module_elf},
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,
 };
-use alloc::{boxed::Box, collections::BTreeMap, string::String, vec, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, vec, vec::Vec};
 use core::{
     ops::Range,
     sync::atomic::{AtomicBool, AtomicI64, Ordering},
 };
 use hashbrown::HashMap;
 use litebox_common_linux::errno::Errno;
-use memoffset::offset_of;
 use num_enum::TryFromPrimitive;
 use x86_64::{
     PhysAddr, VirtAddr,
@@ -50,6 +49,9 @@ use x86_64::{
 
 /// VTL call parameters (param[0]: function ID, param[1-3]: parameters)
 pub const NUM_VTLCALL_PARAMS: usize = 4;
+
+// For now, we do not validate too large kernel modules
+const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
 
 pub fn init() {
     assert!(
@@ -308,7 +310,7 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, Errno> {
     }
 }
 
-/// VSM function for loading kernel data (e.g., certificates, blocklist, kernel symbols) into VTL1.
+/// VSM function for loading kernel data (e.g., certificates, blocklist) into VTL1.
 /// `pa` and `nranges` specify memory areas containing the information about the memory ranges to load.
 pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
     if !pa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap()) || nranges == 0 {
@@ -374,27 +376,6 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
 
     if heki_kernel_info_mem.is_empty() || heki_kernel_data_mem.is_empty() {
         serial_println!("VSM: No kernel info or data loaded");
-        return Err(Errno::EINVAL);
-    }
-
-    if let Some(heki_kernel_info) =
-        heki_kernel_info_mem.read_value::<HekiKinfo>(heki_kernel_info_mem.start().unwrap())
-    {
-        crate::platform_low()
-            .vtl0_kernel_info
-            .populate_kernel_symbol_maps(
-                Range {
-                    start: VirtAddr::new(heki_kernel_info.ksymtab_start as u64),
-                    end: VirtAddr::new(heki_kernel_info.ksymtab_end as u64),
-                },
-                Range {
-                    start: VirtAddr::new(heki_kernel_info.ksymtab_gpl_start as u64),
-                    end: VirtAddr::new(heki_kernel_info.ksymtab_gpl_end as u64),
-                },
-                &heki_kernel_data_mem,
-            )
-            .map_err(|_| Errno::EINVAL)?;
-    } else {
         return Err(Errno::EINVAL);
     }
 
@@ -485,54 +466,20 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         return Err(Errno::EINVAL);
     }
 
-    // TODO: validate a kernel module by analyzing its ELF binary and memory content.
-    let elf_buf_to_validate = {
-        // TODO: For now, we ignore large kernel modules, but we should consider how to handle them.
-        const MODULE_VALIDATION_MAX_SIZE: usize = 5 * 1024 * 1024;
+    let elf_size = memory_elf.len();
+    assert!(
+        elf_size <= MODULE_VALIDATION_MAX_SIZE,
+        "Module ELF size exceeds the maximum allowed size"
+    );
 
-        let elf_size = memory_elf.len();
-        if elf_size < MODULE_VALIDATION_MAX_SIZE {
-            let mut elf_buf = vec![0u8; elf_size];
-            memory_elf
-                .read_bytes(memory_elf.start().unwrap(), &mut elf_buf)
-                .map_err(|_| Errno::EINVAL)?;
-            memory_elf.clear();
-            Some(elf_buf)
-        } else {
-            memory_elf.clear();
-            None
-        }
-    };
+    let mut elf_buf = vec![0u8; elf_size];
+    memory_elf
+        .read_bytes(memory_elf.start().unwrap(), &mut elf_buf)
+        .map_err(|_| Errno::EINVAL)?;
+    memory_elf.clear();
 
-    if let Some(elf_buf) = elf_buf_to_validate {
-        parse_modinfo(&elf_buf);
-
-        let _ = validate_module_elf(
-            &elf_buf,
-            &module_memory_content,
-            KernelSymbolMaps {
-                ksymtab: crate::platform_low().vtl0_kernel_info.ksymtab_map.as_ref(),
-                ksymtab_gpl: crate::platform_low()
-                    .vtl0_kernel_info
-                    .ksymtab_gpl_map
-                    .as_ref(),
-                module_symbols: crate::platform_low()
-                    .vtl0_kernel_info
-                    .module_symbol_map
-                    .as_ref(),
-            },
-        );
-
-        if let Ok(module_symbol_map) =
-            get_symbol_exports(&elf_buf, module_memory_content.text.start().unwrap())
-        {
-            module_memory_metadata.register_symbols(&module_symbol_map);
-
-            crate::platform_low()
-                .vtl0_kernel_info
-                .extend_module_symbol_map(module_symbol_map);
-        }
-    }
+    let _ = parse_modinfo(&elf_buf);
+    let _ = validate_module_elf(&elf_buf, &module_memory_content);
 
     // protect the memory ranges of a module based on their section types
     for mod_mem_range in &module_memory_metadata {
@@ -621,11 +568,6 @@ pub fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, Errno> {
                 MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE,
             )?;
         }
-
-        let symbols = entry.get_symbols();
-        crate::platform_low()
-            .vtl0_kernel_info
-            .shrink_module_symbol_map(symbols);
     }
 
     crate::platform_low()
@@ -783,9 +725,6 @@ fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
 pub struct Vtl0KernelInfo {
     module_memory_metadata: ModuleMemoryMetadataMap,
     boot_done: AtomicBool,
-    ksymtab_map: KernelSymbolMap,
-    ksymtab_gpl_map: KernelSymbolMap,
-    module_symbol_map: KernelSymbolMap,
     // TODO: certificates, blocklist, etc.
 }
 
@@ -794,9 +733,6 @@ impl Vtl0KernelInfo {
         Self {
             module_memory_metadata: ModuleMemoryMetadataMap::new(),
             boot_done: AtomicBool::new(false),
-            ksymtab_map: KernelSymbolMap::new(),
-            ksymtab_gpl_map: KernelSymbolMap::new(),
-            module_symbol_map: KernelSymbolMap::new(),
         }
     }
 
@@ -811,99 +747,6 @@ impl Vtl0KernelInfo {
     pub fn check_end_of_boot(&self) -> bool {
         self.boot_done.load(core::sync::atomic::Ordering::SeqCst)
     }
-
-    /// This function implements Linux kernel's `offset_to_ptr` macro to identify
-    /// the addresses of kernel symbols and their null-terminated names, and
-    /// returns a map of symbol names to their addresses. `offset_to_ptr` is needed
-    /// only if `CONFIG_HAVE_ARCH_PREL32_RELOCATIONS=y`.
-    #[allow(clippy::unused_self)]
-    fn parse_ksymtab(
-        &self,
-        ksymtab_range: Range<VirtAddr>,
-        kernel_data_mem: &MemoryContent,
-        ksymtab_map: &mut HashMap<String, VirtAddr>,
-    ) -> Result<(), Vtl0KernelInfoError> {
-        let mut current = ksymtab_range.start;
-        while current < ksymtab_range.end {
-            let value_offset = kernel_data_mem
-                .read_value::<i32>(
-                    current + u64::try_from(offset_of!(KernelSymbol, value_offset)).unwrap(),
-                )
-                .ok_or(Vtl0KernelInfoError::MemoryError)?;
-            let name_offset = kernel_data_mem
-                .read_value::<i32>(
-                    current + u64::try_from(offset_of!(KernelSymbol, name_offset)).unwrap(),
-                )
-                .ok_or(Vtl0KernelInfoError::MemoryError)?;
-
-            #[allow(clippy::cast_possible_truncation)]
-            #[allow(clippy::cast_possible_wrap)]
-            #[allow(clippy::cast_sign_loss)]
-            let value_addr = VirtAddr::new(
-                (current.as_u64() as isize)
-                    .wrapping_add(offset_of!(KernelSymbol, value_offset) as isize)
-                    .wrapping_add(value_offset as isize) as u64,
-            );
-
-            #[allow(clippy::cast_possible_truncation)]
-            #[allow(clippy::cast_possible_wrap)]
-            #[allow(clippy::cast_sign_loss)]
-            let name_addr = VirtAddr::new(
-                (current.as_u64() as isize)
-                    .wrapping_add(offset_of!(KernelSymbol, name_offset) as isize)
-                    .wrapping_add(name_offset as isize) as u64,
-            );
-
-            let mut buf = [0u8; KSYM_NAME_LEN];
-            kernel_data_mem
-                .read_bytes(name_addr, &mut buf)
-                .map_err(|_| Vtl0KernelInfoError::MemoryError)?;
-            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            if let Ok(name) = core::str::from_utf8(&buf[0..end]) {
-                ksymtab_map.insert(String::from(name), value_addr);
-            } else {
-                return Err(Vtl0KernelInfoError::MemoryError);
-            }
-
-            // unclear whether we need the `namespace` field to support the relocation.
-            // We can add it later if needed.
-
-            current += core::mem::size_of::<KernelSymbol>() as u64;
-        }
-
-        Ok(())
-    }
-
-    pub fn populate_kernel_symbol_maps(
-        &self,
-        ksymtab_range: Range<VirtAddr>,
-        ksymtab_gpl_range: Range<VirtAddr>,
-        kernel_data_mem: &MemoryContent,
-    ) -> Result<(), Vtl0KernelInfoError> {
-        let mut ksymtab_map: HashMap<String, VirtAddr> = HashMap::new();
-        let mut ksymtab_gpl_map: HashMap<String, VirtAddr> = HashMap::new();
-
-        self.parse_ksymtab(ksymtab_range, kernel_data_mem, &mut ksymtab_map)?;
-        self.ksymtab_map.populate(&mut ksymtab_map);
-
-        self.parse_ksymtab(ksymtab_gpl_range, kernel_data_mem, &mut ksymtab_gpl_map)?;
-        self.ksymtab_gpl_map.populate(&mut ksymtab_gpl_map);
-
-        Ok(())
-    }
-
-    pub fn extend_module_symbol_map(&self, module_symbol_map: HashMap<String, VirtAddr>) {
-        self.module_symbol_map.extend(&module_symbol_map);
-    }
-
-    pub fn shrink_module_symbol_map(&self, module_symbol_map: &HashMap<String, VirtAddr>) {
-        self.module_symbol_map.shrink(module_symbol_map);
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub enum Vtl0KernelInfoError {
-    MemoryError,
 }
 
 /// Data structure for maintaining the memory ranges of each VTL0 kernel module and their types
@@ -914,28 +757,15 @@ pub struct ModuleMemoryMetadataMap {
 
 pub struct ModuleMemoryMetadata {
     ranges: Vec<ModuleMemoryRange>,
-    symbols: HashMap<String, VirtAddr>,
 }
 
 impl ModuleMemoryMetadata {
     pub fn new() -> Self {
-        Self {
-            ranges: Vec::new(),
-            symbols: HashMap::new(),
-        }
+        Self { ranges: Vec::new() }
     }
 
     pub fn insert_memory_range(&mut self, mem_range: ModuleMemoryRange) {
         self.ranges.push(mem_range);
-    }
-
-    pub fn register_symbols(&mut self, symbols: &HashMap<String, VirtAddr>) {
-        self.symbols
-            .extend(symbols.iter().map(|(k, v)| (k.clone(), *v)));
-    }
-
-    pub fn get_symbols(&self) -> &HashMap<String, VirtAddr> {
-        &self.symbols
     }
 }
 
@@ -1047,10 +877,6 @@ impl<'a> ModuleMemoryIters<'a> {
     pub fn iter_mem_ranges(&'a self) -> impl Iterator<Item = &'a ModuleMemoryRange> {
         self.guard.get(&self.key).unwrap().ranges.iter()
     }
-
-    pub fn get_symbols(&'a self) -> &'a HashMap<String, VirtAddr> {
-        self.guard.get(&self.key).unwrap().get_symbols()
-    }
 }
 
 /// This function copies `HekiPage` structures from VTL0 and returns a vector of them.
@@ -1093,72 +919,9 @@ fn protect_physical_memory_range(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-pub struct KernelSymbolMaps<'a> {
-    ksymtab: &'a KernelSymbolMap,
-    ksymtab_gpl: &'a KernelSymbolMap,
-    module_symbols: &'a KernelSymbolMap,
-}
-
-impl KernelSymbolMaps<'_> {
-    pub fn get_address(&self, sym_name: &str) -> Option<VirtAddr> {
-        self.ksymtab.get(sym_name).or_else(|| {
-            self.ksymtab_gpl
-                .get(sym_name)
-                .or_else(|| self.module_symbols.get(sym_name))
-        })
-    }
-}
-
-/// Data structure for maintaining kernel symbols and their addresses, populated by parsing `ksymtab` and `ksymtab_gpl`.
-/// We should re-populate these kernel symbol maps after each `kexec` call.
-pub struct KernelSymbolMap {
-    inner: spin::rwlock::RwLock<HashMap<String, VirtAddr>>,
-}
-
-impl KernelSymbolMap {
-    pub fn new() -> Self {
-        Self {
-            inner: spin::rwlock::RwLock::new(HashMap::new()),
-        }
-    }
-
-    pub fn populate(&self, other_map: &mut HashMap<String, VirtAddr>) {
-        let mut inner = self.inner.write();
-        inner.clear();
-        inner.extend(other_map.drain());
-    }
-
-    pub fn extend(&self, other_map: &HashMap<String, VirtAddr>) {
-        let mut inner = self.inner.write();
-        inner.extend(other_map.iter().map(|(k, v)| (k.clone(), *v)));
-    }
-
-    pub fn shrink(&self, other_map: &HashMap<String, VirtAddr>) {
-        let mut inner = self.inner.write();
-        for key in other_map.keys() {
-            inner.remove(key);
-        }
-    }
-
-    pub fn get(&self, symbol: &str) -> Option<VirtAddr> {
-        let inner = self.inner.read();
-        inner.get(symbol).copied()
-    }
-
-    pub fn as_ref(&self) -> &KernelSymbolMap {
-        self
-    }
-}
-
 pub struct ModuleMemoryContent {
     pub text: MemoryContent,
     pub init_text: MemoryContent,
-    pub data: MemoryContent,
-    pub rodata: MemoryContent,
-    pub ro_after_init: MemoryContent,
-    pub init_data: MemoryContent,
-    pub init_rodata: MemoryContent,
 }
 
 impl ModuleMemoryContent {
@@ -1166,11 +929,6 @@ impl ModuleMemoryContent {
         Self {
             text: MemoryContent::new(),
             init_text: MemoryContent::new(),
-            data: MemoryContent::new(),
-            rodata: MemoryContent::new(),
-            ro_after_init: MemoryContent::new(),
-            init_data: MemoryContent::new(),
-            init_rodata: MemoryContent::new(),
         }
     }
 
@@ -1178,11 +936,6 @@ impl ModuleMemoryContent {
         match name {
             ".text" => Some(&self.text),
             ".init.text" => Some(&self.init_text),
-            ".init.data" => Some(&self.init_data),
-            ".init.rodata" => Some(&self.init_rodata),
-            ".data..ro_after_init" => Some(&self.ro_after_init),
-            s if s == ".rodata" || s.starts_with(".rodata.") => Some(&self.rodata),
-            s if s == ".data" || s == ".bss" || s.starts_with(".data.") => Some(&self.data),
             _ => None,
         }
     }
@@ -1199,19 +952,11 @@ impl ModuleMemoryContent {
             ModMemType::InitText => self
                 .init_text
                 .write_vtl0_phys_bytes(addr, phys_start, phys_end),
-            ModMemType::Data => self.data.write_vtl0_phys_bytes(addr, phys_start, phys_end),
-            ModMemType::RoData => self
-                .rodata
-                .write_vtl0_phys_bytes(addr, phys_start, phys_end),
-            ModMemType::RoAfterInit => self
-                .ro_after_init
-                .write_vtl0_phys_bytes(addr, phys_start, phys_end),
-            ModMemType::InitData => self
-                .init_data
-                .write_vtl0_phys_bytes(addr, phys_start, phys_end),
-            ModMemType::InitRoData => self
-                .init_rodata
-                .write_vtl0_phys_bytes(addr, phys_start, phys_end),
+            ModMemType::Data
+            | ModMemType::RoData
+            | ModMemType::RoAfterInit
+            | ModMemType::InitData
+            | ModMemType::InitRoData => Ok(()), // we don't care/validate other memory types for now
             _ => Err(MemoryContentError::Unknown),
         }
     }
@@ -1259,13 +1004,6 @@ impl MemoryContent {
         self.range.is_empty()
     }
 
-    pub fn contains(&self, addr: VirtAddr) -> bool {
-        self.range.contains(&addr)
-            && self
-                .pages
-                .contains_key(&addr.align_down(u64::try_from(PAGE_SIZE).unwrap()))
-    }
-
     fn extend_range(&mut self, start: VirtAddr, end: VirtAddr) {
         assert!(start <= end, "Invalid range: start > end");
         if self.range.is_empty() {
@@ -1282,14 +1020,6 @@ impl MemoryContent {
         self.pages
             .entry(page_base)
             .or_insert_with(|| Box::new([0; PAGE_SIZE]))
-    }
-
-    #[expect(dead_code)]
-    pub fn write_byte(&mut self, addr: VirtAddr, value: u8) {
-        let page_offset: usize = addr.page_offset().into();
-        self.get_or_alloc_page(addr)[page_offset] = value;
-
-        self.extend_range(addr, addr + 1);
     }
 
     pub fn write_vtl0_phys_bytes(
@@ -1320,12 +1050,6 @@ impl MemoryContent {
         Ok(())
     }
 
-    pub fn read_byte(&self, addr: VirtAddr) -> Option<u8> {
-        let page_base = addr.align_down(u64::try_from(PAGE_SIZE).unwrap());
-        let page_offset: usize = addr.page_offset().into();
-        self.pages.get(&page_base).map(|page| page[page_offset])
-    }
-
     pub fn preallocate_pages(&mut self, start: VirtAddr, end: VirtAddr) {
         let start_page = start.align_down(u64::try_from(PAGE_SIZE).unwrap());
         let end_page = end.align_up(u64::try_from(PAGE_SIZE).unwrap());
@@ -1335,6 +1059,14 @@ impl MemoryContent {
             let _ = self.get_or_alloc_page(page_addr);
             page_addr += u64::try_from(PAGE_SIZE).unwrap();
         }
+    }
+
+    #[expect(dead_code)]
+    pub fn write_byte(&mut self, addr: VirtAddr, value: u8) {
+        let page_offset: usize = addr.page_offset().into();
+        self.get_or_alloc_page(addr)[page_offset] = value;
+
+        self.extend_range(addr, addr + 1);
     }
 
     pub fn write_bytes(&mut self, addr: VirtAddr, data: &[u8]) -> Result<(), MemoryContentError> {
@@ -1380,17 +1112,10 @@ impl MemoryContent {
         }
     }
 
-    pub fn read_value<T: Copy>(&self, addr: VirtAddr) -> Option<T> {
-        let mut buf = vec![0u8; core::mem::size_of::<T>()];
-        if self.read_bytes(addr, &mut buf).is_err() {
-            return None;
-        }
-
-        let mut value = core::mem::MaybeUninit::<T>::uninit();
-        unsafe {
-            core::ptr::copy_nonoverlapping(buf.as_ptr().cast::<T>(), value.as_mut_ptr(), 1);
-            Some(value.assume_init())
-        }
+    pub fn read_byte(&self, addr: VirtAddr) -> Option<u8> {
+        let page_base = addr.align_down(u64::try_from(PAGE_SIZE).unwrap());
+        let page_offset: usize = addr.page_offset().into();
+        self.pages.get(&page_base).map(|page| page[page_offset])
     }
 
     pub fn read_bytes(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<(), MemoryContentError> {

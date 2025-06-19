@@ -85,18 +85,3 @@ impl CpuMask {
         cpu_mask
     }
 }
-
-pub const KSYM_NAME_LEN: usize = 512;
-
-// Linux kernel maintains two arrays (`ksymtabs`, `ksymtabs_gpl`) of this data structure for each kernel symbol.
-// We need these to relocate kernel symbols within each kernel module.
-// For now we assume our VTL0 Linux kernel is built with `CONFIG_HAVE_ARCH_PREL32_RELOCATIONS=y`.
-// Otherwise, this data structure will have a different layout.
-#[allow(clippy::struct_field_names)]
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct KernelSymbol {
-    pub value_offset: i32,
-    pub name_offset: i32,
-    pub namespace_offset: i32,
-}

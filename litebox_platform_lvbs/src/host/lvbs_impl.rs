@@ -13,7 +13,7 @@ pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
 mod alloc {
     use crate::HostInterface;
 
-    const HEAP_ORDER: usize = 23;
+    const HEAP_ORDER: usize = 25;
 
     #[global_allocator]
     static LVBS_ALLOCATOR: litebox::mm::allocator::SafeZoneAllocator<
