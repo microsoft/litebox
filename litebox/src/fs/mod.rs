@@ -19,7 +19,7 @@ pub mod tar_ro;
 mod tests;
 
 use errors::{
-    ChmodError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError, ReadError,
+    ChmodError, ChownError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError, ReadError,
     RmdirError, SeekError, SetMetadataError, UnlinkError, WriteError,
 };
 
@@ -64,6 +64,8 @@ pub trait FileSystem: private::Sealed {
     fn seek(&self, fd: &FileFd, offset: isize, whence: SeekWhence) -> Result<usize, SeekError>;
     /// Change the permissions of a file
     fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
+    /// Change the owner of a file
+    fn chown(&self, path: impl path::Arg, user: u16, group: u16) -> Result<(), ChownError>;
     /// Unlink a file
     fn unlink(&self, path: impl path::Arg) -> Result<(), UnlinkError>;
     /// Create a new directory

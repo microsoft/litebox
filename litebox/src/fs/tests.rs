@@ -161,6 +161,45 @@ mod in_mem {
             "Directory should not exist"
         );
     }
+
+    #[test]
+    fn chown_test() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        
+        // Create a test file as root
+        fs.with_root_privileges(|fs| {
+            let path = "/testfile";
+            let fd = fs
+                .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .expect("Failed to create file");
+            fs.close(fd).expect("Failed to close file");
+            
+            // Test chown as root (should succeed)
+            fs.chown(path, 123, 456).expect("Failed to chown as root");
+        });
+        
+        // Test that non-owner cannot chown (should fail)
+        let path = "/testfile";
+        match fs.chown(path, 789, 101) {
+            Err(crate::fs::errors::ChownError::NotTheOwner) => {
+                // Expected behavior
+            }
+            Ok(_) => panic!("Non-owner should not be able to chown"),
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        }
+        
+        // Test chown on non-existent file (should fail)
+        match fs.chown("/nonexistent", 123, 456) {
+            Err(crate::fs::errors::ChownError::PathError(
+                crate::fs::errors::PathError::NoSuchFileOrDirectory
+            )) => {
+                // Expected behavior
+            }
+            Ok(_) => panic!("Should not be able to chown non-existent file"),
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        }
+    }
 }
 
 mod tar_ro {

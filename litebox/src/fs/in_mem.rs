@@ -11,7 +11,7 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError, PathError,
+    ChmodError, ChownError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError, PathError,
     ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError, WriteError,
 };
 use super::{FileStatus, Mode, SeekWhence};
@@ -308,6 +308,35 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     return Err(ChmodError::NotTheOwner);
                 }
                 perms.mode = mode;
+                Ok(())
+            }
+        }
+    }
+
+    fn chown(&self, path: impl crate::path::Arg, user: u16, group: u16) -> Result<(), ChownError> {
+        let path = self.absolute_path(path)?;
+        let mut root = self.root.write();
+        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let Some(entry) = entry else {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        };
+        match entry {
+            Entry::File(file) => {
+                let perms = &mut file.write().perms;
+                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                    return Err(ChownError::NotTheOwner);
+                }
+                perms.userinfo.user = user;
+                perms.userinfo.group = group;
+                Ok(())
+            }
+            Entry::Dir(dir) => {
+                let perms = &mut dir.write().perms;
+                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                    return Err(ChownError::NotTheOwner);
+                }
+                perms.userinfo.user = user;
+                perms.userinfo.group = group;
                 Ok(())
             }
         }
