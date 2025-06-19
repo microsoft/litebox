@@ -13,7 +13,6 @@ litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
 spin = { version = "0.10.0", default-features = false, features = [
   "spin_mutex",
   "once",
-  "rwlock",
 ] }
 libc = "0.2.169"
 arrayvec = { version = "0.7.6", default-features = false }

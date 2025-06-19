@@ -310,7 +310,7 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, Errno> {
     }
 }
 
-/// VSM function for loading kernel data (e.g., certificates, blocklist) into VTL1.
+/// VSM function for loading kernel data (e.g., certificates, blocklist, kernel symbols) into VTL1.
 /// `pa` and `nranges` specify memory areas containing the information about the memory ranges to load.
 pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
     if !pa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap()) || nranges == 0 {
@@ -324,9 +324,6 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
         );
         return Err(Errno::EINVAL);
     }
-
-    let mut heki_kernel_info_mem = MemoryContent::new();
-    let mut heki_kernel_data_mem = MemoryContent::new();
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         for heki_page in heki_pages {
@@ -346,42 +343,16 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
                     kdata_type,
                     epa - pa
                 );
-
-                match kdata_type {
-                    HekiKdataType::KernelInfo => {
-                        heki_kernel_info_mem
-                            .write_vtl0_phys_bytes(
-                                VirtAddr::new(va),
-                                PhysAddr::new(pa),
-                                PhysAddr::new(epa),
-                            )
-                            .map_err(|_| Errno::EINVAL)?;
-                    }
-                    HekiKdataType::KernelData => {
-                        heki_kernel_data_mem
-                            .write_vtl0_phys_bytes(
-                                VirtAddr::new(va),
-                                PhysAddr::new(pa),
-                                PhysAddr::new(epa),
-                            )
-                            .map_err(|_| Errno::EINVAL)?;
-                    }
-                    _ => {}
-                }
             }
         }
     } else {
         return Err(Errno::EINVAL);
     }
 
-    if heki_kernel_info_mem.is_empty() || heki_kernel_data_mem.is_empty() {
-        serial_println!("VSM: No kernel info or data loaded");
-        return Err(Errno::EINVAL);
-    }
-
     // TODO: create trusted keys
     // TODO: create blocklist keys
     // TODO: save blocklist hashes
+    // TODO: get kernel info (i.e., kernel symbols)
 
     Ok(0)
 }
@@ -390,7 +361,6 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
 /// `pa` and `nranges` specify a memory area containing the information about the kernel module to validate or protect.
 /// `flags` controls the validation process (unused for now).
 /// This function returns a unique `token` to VTL0, which is used to identify the module in subsequent calls.
-#[allow(clippy::too_many_lines)]
 pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Result<i64, Errno> {
     if !pa.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap()) || nranges == 0 {
         serial_println!("VSM: invalid input address");
@@ -1059,14 +1029,6 @@ impl MemoryContent {
             let _ = self.get_or_alloc_page(page_addr);
             page_addr += u64::try_from(PAGE_SIZE).unwrap();
         }
-    }
-
-    #[expect(dead_code)]
-    pub fn write_byte(&mut self, addr: VirtAddr, value: u8) {
-        let page_offset: usize = addr.page_offset().into();
-        self.get_or_alloc_page(addr)[page_offset] = value;
-
-        self.extend_range(addr, addr + 1);
     }
 
     pub fn write_bytes(&mut self, addr: VirtAddr, data: &[u8]) -> Result<(), MemoryContentError> {
