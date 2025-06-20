@@ -140,16 +140,20 @@ fn symbol_relocation(
             .section_data_as_relas(&rela_shdr)
             .map_err(|_| KernelElfError::ElfParseFailed)?;
         for rela in relas {
-            let mut control_relocation = false;
             if let Ok(sym) = elf_params.symtab.get(usize::try_from(rela.r_sym).unwrap()) {
                 if let Ok(sym_name) = elf_params
                     .sym_strtab
                     .get(usize::try_from(sym.st_name).unwrap())
                 {
-                    if sym_name.is_empty() {
+                    if sym_name.is_empty()
+                        && elf_params
+                            .shdr_strtab
+                            .get(usize::from(sym.st_shndx))
+                            .is_err()
+                    {
+                        // neither symbol nor section relocation
                         continue;
                     }
-                    control_relocation = is_control_relocation(sym_name);
                 }
             }
 
@@ -168,19 +172,27 @@ fn symbol_relocation(
                             ..usize::try_from(rela.r_offset + patch_size).unwrap()],
                     )
                     .map_err(|_| KernelElfError::SectionRelocationFailed)?;
-
-                if rela.r_offset != 0 && patch_size == 4 && control_relocation {
-                    // 5-byte control relocation
-                    reloc_buf[usize::try_from(rela.r_offset - 1).unwrap()] = sect_mem
-                        .read_byte(sect_mem.start().unwrap() + rela.r_offset - 1)
-                        .ok_or(KernelElfError::SectionRelocationFailed)?;
-                }
             }
         }
     } else {
         return Err(KernelElfError::SectionNotFound);
     }
     Ok(())
+}
+
+// Allowed list of relocation sections. We do not consider other relocation sections like `.rela.debug_*`
+#[inline]
+fn is_allowed_rela_section(name: &str) -> bool {
+    matches!(
+        name,
+        ".rela.altinstructions"
+            | ".rela.call_sites"
+            | ".rela.ibt_endbr_seal"
+            | ".rela.parainstructions"
+            | ".rela.retpoline_sites"
+            | ".rela.return_sites"
+            | ".rela__patchable_function_entries"
+    )
 }
 
 // This function handles `.rela.*` sections which can relocate `.text` or `.init.text` (section-based relocations).
@@ -198,7 +210,7 @@ fn section_relocation(
             && elf_params
                 .shdr_strtab
                 .get(usize::try_from(s.sh_name).unwrap())
-                .is_ok_and(|n| !n.starts_with(".rela.debug_"))
+                .is_ok_and(is_allowed_rela_section)
     }) {
         let relas = elf_params
             .elf
@@ -219,9 +231,15 @@ fn section_relocation(
             }
 
             if elf_params
-                .shdr_strtab
+                .shdrs
                 .get(usize::from(sym.st_shndx))
-                .is_ok_and(|n| n == target_section)
+                .and_then(|s| {
+                    elf_params
+                        .shdr_strtab
+                        .get(usize::try_from(s.sh_name).unwrap())
+                        .map(|n| n == target_section)
+                })
+                .is_ok()
             {
                 let patch_size: u64 = match rela.r_type {
                     R_X86_64_64 => 8,
@@ -231,78 +249,44 @@ fn section_relocation(
                     }
                 };
 
-                if usize::try_from(rela.r_offset + patch_size).unwrap() <= reloc_buf.iter().len() {
+                // section-based relocation uses `r_addend` to specify the offset
+                if rela.r_addend >= 0
+                    && usize::try_from(u64::try_from(rela.r_addend).unwrap() + patch_size).unwrap()
+                        <= reloc_buf.iter().len()
+                {
                     sect_mem
                         .read_bytes(
-                            sect_mem.start().unwrap() + rela.r_offset,
-                            &mut reloc_buf[usize::try_from(rela.r_offset).unwrap()
-                                ..usize::try_from(rela.r_offset + patch_size).unwrap()],
+                            sect_mem.start().unwrap() + u64::try_from(rela.r_addend).unwrap(),
+                            &mut reloc_buf[usize::try_from(rela.r_addend).unwrap()
+                                ..usize::try_from(
+                                    u64::try_from(rela.r_addend).unwrap() + patch_size,
+                                )
+                                .unwrap()],
                         )
                         .map_err(|_| KernelElfError::SectionRelocationFailed)?;
+
+                    // exceptions.
+                    let section_name = elf_params
+                        .shdr_strtab
+                        .get(usize::try_from(shdr.sh_name).unwrap())
+                        .map_err(|_| KernelElfError::ElfParseFailed)?;
+                    // `.rela.altinstructions` could patch `nop` which is 1-byte prior to the specified relocation.
+                    if section_name == ".rela.altinstructions"
+                        && rela.r_addend > 0
+                        && reloc_buf[usize::try_from(rela.r_addend - 1).unwrap()] == 0x90
+                    {
+                        reloc_buf[usize::try_from(rela.r_addend - 1).unwrap()] = sect_mem
+                            .read_byte(
+                                sect_mem.start().unwrap()
+                                    + u64::try_from(rela.r_addend - 1).unwrap(),
+                            )
+                            .unwrap();
+                    }
                 }
             }
         }
     }
     Ok(())
-}
-
-#[inline]
-fn is_control_relocation(sym_name: &str) -> bool {
-    let special_relocs = [
-        "__x86_return_thunk",
-        "__x86_indirect_thunk_array",
-        "__x86_indirect_thunk_rax",
-        "__x86_indirect_thunk_rcx",
-        "__x86_indirect_thunk_rdx",
-        "__x86_indirect_thunk_rbx",
-        "__x86_indirect_thunk_rsp",
-        "__x86_indirect_thunk_rbp",
-        "__x86_indirect_thunk_rsi",
-        "__x86_indirect_thunk_rdi",
-        "__x86_indirect_thunk_r8",
-        "__x86_indirect_thunk_r9",
-        "__x86_indirect_thunk_r10",
-        "__x86_indirect_thunk_r11",
-        "__x86_indirect_thunk_r12",
-        "__x86_indirect_thunk_r13",
-        "__x86_indirect_thunk_r14",
-        "__x86_indirect_thunk_r15",
-        "__x86_indirect_call_thunk_array",
-        "__x86_indirect_call_thunk_rax",
-        "__x86_indirect_call_thunk_rcx",
-        "__x86_indirect_call_thunk_rdx",
-        "__x86_indirect_call_thunk_rbx",
-        "__x86_indirect_call_thunk_rsp",
-        "__x86_indirect_call_thunk_rbp",
-        "__x86_indirect_call_thunk_rsi",
-        "__x86_indirect_call_thunk_rdi",
-        "__x86_indirect_call_thunk_r8",
-        "__x86_indirect_call_thunk_r9",
-        "__x86_indirect_call_thunk_r10",
-        "__x86_indirect_call_thunk_r11",
-        "__x86_indirect_call_thunk_r12",
-        "__x86_indirect_call_thunk_r13",
-        "__x86_indirect_call_thunk_r14",
-        "__x86_indirect_call_thunk_r15",
-        "__x86_indirect_jump_thunk_array",
-        "__x86_indirect_jump_thunk_rax",
-        "__x86_indirect_jump_thunk_rcx",
-        "__x86_indirect_jump_thunk_rdx",
-        "__x86_indirect_jump_thunk_rbx",
-        "__x86_indirect_jump_thunk_rsp",
-        "__x86_indirect_jump_thunk_rbp",
-        "__x86_indirect_jump_thunk_rsi",
-        "__x86_indirect_jump_thunk_rdi",
-        "__x86_indirect_jump_thunk_r8",
-        "__x86_indirect_jump_thunk_r9",
-        "__x86_indirect_jump_thunk_r10",
-        "__x86_indirect_jump_thunk_r11",
-        "__x86_indirect_jump_thunk_r12",
-        "__x86_indirect_jump_thunk_r13",
-        "__x86_indirect_jump_thunk_r14",
-        "__x86_indirect_jump_thunk_r15",
-    ];
-    special_relocs.contains(&sym_name)
 }
 
 /// This function parses the `.modinfo` section of the kernel module ELF file and prints its contents.
@@ -330,7 +314,9 @@ pub fn parse_modinfo(elf_buf: &[u8]) -> Result<(), KernelElfError> {
         for entry in modinfo_data.split(|&b| b == 0) {
             if let Ok(s) = str::from_utf8(entry) {
                 if let Some((k, v)) = s.split_once('=') {
-                    debug_serial_println!("Modinfo: {} = {}", k, v);
+                    if k == "name" {
+                        debug_serial_println!("Modinfo: {} = {}", k, v);
+                    }
                 }
             }
         }
