@@ -15,10 +15,10 @@ use elf::{
 };
 use rangemap::set::RangeSet;
 
-/// This function validates the code sections (`.text` and `.init.text`) of a kernel module ELF file.
+/// This function validates the code sections (`.text` and `.init.text`) of a kernel module ELF.
 /// In particular, this function checks the integrity of "non-relocatable bytes" in ELF. We check the
-/// signature of the entire ELF file (including relocation information) before calling this function,
-/// so what the adversary can do is limited.
+/// signature of the entire ELF (including relocation information) before calling this function,
+/// so what the adversary can do with relocatable bytes is limited.
 pub fn validate_module_elf(
     elf_buf: &[u8],
     module_memory: &ModuleMemoryContent,
@@ -68,20 +68,21 @@ pub fn validate_module_elf(
                 ..usize::try_from(target_shdr.sh_offset + target_shdr.sh_size).unwrap()],
         );
 
+        // figure out relocatable ranges
         let mut reloc_ranges = RangeSet::<usize>::new();
         get_symbol_relocations(elf_params, target_section, &section_buf, &mut reloc_ranges)?;
         get_section_relocations(elf_params, target_section, &section_buf, &mut reloc_ranges)?;
 
-        // compare the loaded section (relocated by VTL0) with the original section
-        let mut loaded = vec![0u8; section_buf.len()];
+        let mut to_validate = vec![0u8; section_buf.len()];
         section_memory
-            .read_bytes(section_memory.start().unwrap(), &mut loaded)
+            .read_bytes(section_memory.start().unwrap(), &mut to_validate)
             .map_err(|_| KernelElfError::SectionReadFailed)?;
 
+        // check whether non-relocatable bytes are modified
         let mut diffs = Vec::new();
         for non_reloc in reloc_ranges.gaps(&(0..section_buf.len())) {
             for i in non_reloc {
-                if section_buf[i] != loaded[i] {
+                if section_buf[i] != to_validate[i] {
                     diffs.push(i);
                 }
             }
@@ -124,7 +125,6 @@ fn get_symbol_relocations(
                 .get(usize::try_from(s.sh_name).unwrap())
                 .is_ok_and(|n| n == [".rela", target_section].join(""))
     }) {
-        // accept known relocations. additional security checks could be applied.
         let relas = elf_params
             .elf
             .section_data_as_relas(&rela_shdr)
@@ -183,7 +183,7 @@ fn is_allowed_rela_section(name: &str) -> bool {
 }
 
 // This function handles `.rela.*` sections which can relocate `.text` or `.init.text` (section-based relocations).
-// In particular, a rela section can relocate `.text` or `init.text` if it has unnamed symbols which belong to them.
+// A rela section can relocate `.text` or `init.text` sections if it has unnamed symbols which belong to these sections.
 fn get_section_relocations(
     elf_params: ElfParams<'_>,
     target_section: &str,
@@ -211,7 +211,6 @@ fn get_section_relocations(
                 .get(usize::try_from(sym.st_name).unwrap())
             {
                 if !sym_name.is_empty() {
-                    // symbol name is not empty, so it isn't a section-based relocation
                     continue;
                 }
             }
@@ -269,7 +268,7 @@ fn get_section_relocations(
     Ok(())
 }
 
-/// This function parses the `.modinfo` section of a kernel module ELF file
+/// This function parses the `.modinfo` section of a kernel module ELF
 pub fn parse_modinfo(elf_buf: &[u8]) -> Result<(), KernelElfError> {
     let elf = ElfBytes::<AnyEndian>::minimal_parse(elf_buf)
         .map_err(|_| KernelElfError::ElfParseFailed)?;
