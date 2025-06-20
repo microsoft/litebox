@@ -1,3 +1,5 @@
+//! Functions for validating kernel module ELFs
+
 use crate::{debug_serial_println, mshv::vsm::ModuleMemoryContent, serial_println};
 use alloc::{vec, vec::Vec};
 use elf::{
@@ -114,7 +116,6 @@ fn get_symbol_relocations(
     reloc_ranges: &mut RangeSet<usize>,
 ) -> Result<(), KernelElfError> {
     assert!(matches!(target_section, ".text" | ".init.text"));
-
     if let Some(rela_shdr) = elf_params.shdrs.iter().find(|s| {
         s.sh_size > 0
             && s.sh_type == SHT_RELA

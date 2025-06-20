@@ -892,6 +892,8 @@ fn protect_physical_memory_range(
     Ok(())
 }
 
+/// Data structure for maintaining the memory content of a kernel module. Currently, it only maintains
+/// the `.text` and `.init.text` sections which are needed for module validation.
 pub struct ModuleMemoryContent {
     pub text: MemoryContent,
     pub init_text: MemoryContent,
@@ -936,11 +938,10 @@ impl ModuleMemoryContent {
 }
 
 /// Data structure for abstracting addressable paged memory. Unlike `ModuleMemoryMetadataMap` which maintains
-/// physical/virtual address ranges and their access permissions, this structure contain actual data in memory pages.
-/// This structure allows us to handle data copied from VTL0 without mapping them at VTL1 (e.g., for virtual-address-based page sorting).
-/// The memory mapping is faster than this data structure but it lets the adversaries guess or even control
-/// their target addresses. We could implement ASLR to mitigate this but ASLR is in general meaningless
-/// against local adversaries.
+/// physical/virtual address ranges and their access permissions, this structure stores actual data in memory pages.
+/// This structure allows us to handle data copied from VTL0 (e.g., for virtual-address-based page sorting) without
+/// explicit page mappings at VTL1.
+/// This structure is expected to be used locally and temporarily, so we do not protect it with a lock.
 pub struct MemoryContent {
     pages: BTreeMap<VirtAddr, Box<[u8; PAGE_SIZE]>>,
     range: Range<VirtAddr>,
@@ -988,7 +989,7 @@ impl MemoryContent {
         }
     }
 
-    pub fn get_or_alloc_page(&mut self, addr: VirtAddr) -> &mut Box<[u8; PAGE_SIZE]> {
+    fn get_or_alloc_page(&mut self, addr: VirtAddr) -> &mut Box<[u8; PAGE_SIZE]> {
         let page_base = addr.align_down(u64::try_from(PAGE_SIZE).unwrap());
         self.pages
             .entry(page_base)
@@ -1011,7 +1012,6 @@ impl MemoryContent {
                 } else {
                     usize::try_from(phys_end - phys_cur).unwrap()
                 };
-
                 self.write_bytes(addr + (phys_cur - phys_start), &data[..to_write])?;
                 phys_cur += u64::try_from(to_write).unwrap();
             } else {
@@ -1023,7 +1023,7 @@ impl MemoryContent {
         Ok(())
     }
 
-    pub fn preallocate_pages(&mut self, start: VirtAddr, end: VirtAddr) {
+    fn preallocate_pages(&mut self, start: VirtAddr, end: VirtAddr) {
         let start_page = start.align_down(u64::try_from(PAGE_SIZE).unwrap());
         let end_page = end.align_up(u64::try_from(PAGE_SIZE).unwrap());
 
@@ -1035,11 +1035,10 @@ impl MemoryContent {
     }
 
     pub fn write_bytes(&mut self, addr: VirtAddr, data: &[u8]) -> Result<(), MemoryContentError> {
-        self.preallocate_pages(addr, addr + data.len() as u64);
+        self.preallocate_pages(addr, addr + u64::try_from(data.len()).unwrap());
 
         let start = addr;
-        let end = addr + data.len() as u64;
-
+        let end = addr + u64::try_from(data.len()).unwrap();
         let mut num_bytes = 0;
 
         for (&page_addr, page) in self.pages.range_mut(
@@ -1060,12 +1059,10 @@ impl MemoryContent {
             let page_offset: usize =
                 PageOffset::new_truncate(u16::try_from(copy_start - page_start).unwrap_or(0))
                     .into();
-
             let data_offset = usize::try_from(copy_start - start).expect("data offset error");
 
             page[page_offset..page_offset + len]
                 .copy_from_slice(&data[data_offset..data_offset + len]);
-
             num_bytes += len;
         }
 
@@ -1080,7 +1077,6 @@ impl MemoryContent {
     pub fn read_bytes(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<(), MemoryContentError> {
         let start = addr;
         let end = addr + buf.len() as u64;
-
         let mut num_bytes = 0;
 
         for (&page_addr, page) in self.pages.range(
@@ -1101,12 +1097,10 @@ impl MemoryContent {
             let page_offset: usize =
                 PageOffset::new_truncate(u16::try_from(copy_start - page_start).unwrap_or(0))
                     .into();
-
             let buf_offset = usize::try_from(copy_start - start).expect("buffer offset error");
 
             buf[buf_offset..buf_offset + len]
                 .copy_from_slice(&page[page_offset..page_offset + len]);
-
             num_bytes += len;
         }
 
