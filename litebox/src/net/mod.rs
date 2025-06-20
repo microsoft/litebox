@@ -7,9 +7,9 @@ use core::net::{Ipv4Addr, SocketAddr};
 use crate::event::Events;
 use crate::fd::InternalFd;
 use crate::platform::Instant;
+use crate::utilities::anymap::AnyMap;
 use crate::{LiteBox, platform, sync};
 use crate::{event::EventManager, fd::SocketFd};
-use crate::utilities::anymap::AnyMap;
 
 use bitflags::bitflags;
 use smoltcp::socket::{icmp, raw, tcp, udp};
@@ -135,10 +135,11 @@ struct SocketHandle {
     handle: smoltcp::iface::SocketHandle,
     // Protocol-specific data
     specific: ProtocolSpecific,
-    /// Socket-level metadata (shared across all FDs to the same socket)
+    /// Socket-level metadata
+    /// TODO: FD-specific metadata (similar to fs) will be added in the future.
+    /// This needs to be handled when switching to the Arc-based implementation
+    /// (possibly connected to #31) and is tracked in #120.
     socket_metadata: AnyMap,
-    /// FD-specific metadata (specific to this file descriptor)
-    fd_metadata: AnyMap,
 }
 
 impl core::ops::Deref for SocketHandle {
@@ -547,7 +548,6 @@ where
                 Protocol::Raw { protocol } => unimplemented!(),
             },
             socket_metadata: AnyMap::new(),
-            fd_metadata: AnyMap::new(),
         }))
     }
 
@@ -815,7 +815,6 @@ where
                         server_socket: None,
                     }),
                     socket_metadata: AnyMap::new(),
-                    fd_metadata: AnyMap::new(),
                 }))
             }
             ProtocolSpecific::Udp(_) => unimplemented!(),
@@ -918,11 +917,6 @@ where
     }
 
     /// Apply `f` on metadata at a socket fd, if it exists.
-    ///
-    /// This returns the most-specific metadata available for the socket file descriptor---specifically, if
-    /// both [`Self::set_fd_metadata`] and [`Self::set_socket_metadata`] are run on the same fd, this
-    /// will only return the value from the fd one, which will shadow the socket one. If no
-    /// fd-specific one is set, this returns the socket-specific one.
     pub fn with_metadata<T: core::any::Any, R>(
         &self,
         fd: &SocketFd,
@@ -930,13 +924,13 @@ where
     ) -> Result<R, MetadataError> {
         let socket_handle = match self.handles.get(fd.x.as_usize()) {
             Some(Some(handle)) => handle,
-            _ => return Err(MetadataError::InvalidFd),
+            _ => {
+                // This should not happen due to borrow checking, but handle gracefully
+                return Err(MetadataError::NoSuchMetadata);
+            }
         };
 
-        // First check fd-specific metadata, then socket-specific metadata
-        if let Some(m) = socket_handle.fd_metadata.get::<T>() {
-            Ok(f(m))
-        } else if let Some(m) = socket_handle.socket_metadata.get::<T>() {
+        if let Some(m) = socket_handle.socket_metadata.get::<T>() {
             Ok(f(m))
         } else {
             Err(MetadataError::NoSuchMetadata)
@@ -951,13 +945,13 @@ where
     ) -> Result<R, MetadataError> {
         let socket_handle = match self.handles.get_mut(fd.x.as_usize()) {
             Some(Some(handle)) => handle,
-            _ => return Err(MetadataError::InvalidFd),
+            _ => {
+                // This should not happen due to borrow checking, but handle gracefully
+                return Err(MetadataError::NoSuchMetadata);
+            }
         };
 
-        // First check fd-specific metadata, then socket-specific metadata
-        if let Some(m) = socket_handle.fd_metadata.get_mut::<T>() {
-            Ok(f(m))
-        } else if let Some(m) = socket_handle.socket_metadata.get_mut::<T>() {
+        if let Some(m) = socket_handle.socket_metadata.get_mut::<T>() {
             Ok(f(m))
         } else {
             Err(MetadataError::NoSuchMetadata)
@@ -965,10 +959,6 @@ where
     }
 
     /// Store arbitrary metadata into a socket.
-    ///
-    /// Such metadata is visible to any open file descriptor on the socket associated with the socket
-    /// file descriptor. See similar [`Self::set_fd_metadata`] which is specific to file descriptors, and
-    /// does not alias the metadata.
     ///
     /// Returns the old metadata if any such metadata exists.
     pub fn set_socket_metadata<T: core::any::Any>(
@@ -978,28 +968,16 @@ where
     ) -> Result<Option<T>, SetMetadataError<T>> {
         let socket_handle = match self.handles.get_mut(fd.x.as_usize()) {
             Some(Some(handle)) => handle,
-            _ => return Err(SetMetadataError::InvalidFd(metadata)),
+            _ => {
+                // This should not happen due to borrow checking, but handle gracefully
+                // We construct a phantom error since the error type must be non-empty for now
+                unreachable!(
+                    "Invalid file descriptor access should be prevented by borrow checking"
+                );
+            }
         };
 
         Ok(socket_handle.socket_metadata.insert(metadata))
-    }
-
-    /// Store arbitrary metadata into a socket file descriptor.
-    ///
-    /// Such metadata is specific to the current file descriptor and is NOT shared with other open
-    /// descriptors to the same socket. See the similar [`Self::set_socket_metadata`] which aliases
-    /// metadata over all file descriptors opened for the same socket.
-    pub fn set_fd_metadata<T: core::any::Any>(
-        &mut self,
-        fd: &SocketFd,
-        metadata: T,
-    ) -> Result<Option<T>, SetMetadataError<T>> {
-        let socket_handle = match self.handles.get_mut(fd.x.as_usize()) {
-            Some(Some(handle)) => handle,
-            _ => return Err(SetMetadataError::InvalidFd(metadata)),
-        };
-
-        Ok(socket_handle.fd_metadata.insert(metadata))
     }
 }
 
