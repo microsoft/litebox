@@ -11,8 +11,8 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError, PathError,
-    ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError,
+    PathError, ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError, WriteError,
 };
 use super::{FileStatus, Mode, SeekWhence};
 use crate::utilities::anymap::AnyMap;
@@ -71,6 +71,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         f(self);
         let root_again = core::mem::replace(&mut self.current_user, original_user);
         if root_again.user != ROOT.user || root_again.group != ROOT.group {
+            unreachable!()
+        }
+    }
+
+    /// Execute `f` as a specific user (for testing purposes).
+    #[cfg(test)]
+    pub fn with_user<F>(&mut self, user: u16, group: u16, f: F)
+    where
+        F: FnOnce(&mut Self),
+    {
+        let test_user = UserInfo { user, group };
+        let original_user = core::mem::replace(&mut self.current_user, test_user);
+        f(self);
+        let test_user_again = core::mem::replace(&mut self.current_user, original_user);
+        if test_user_again.user != test_user.user || test_user_again.group != test_user.group {
             unreachable!()
         }
     }
@@ -308,6 +323,48 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     return Err(ChmodError::NotTheOwner);
                 }
                 perms.mode = mode;
+                Ok(())
+            }
+        }
+    }
+
+    fn chown(
+        &self,
+        path: impl crate::path::Arg,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        let path = self.absolute_path(path)?;
+        let mut root = self.root.write();
+        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let Some(entry) = entry else {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        };
+        match entry {
+            Entry::File(file) => {
+                let perms = &mut file.write().perms;
+                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                    return Err(ChownError::NotTheOwner);
+                }
+                if let Some(new_user) = user {
+                    perms.userinfo.user = new_user;
+                }
+                if let Some(new_group) = group {
+                    perms.userinfo.group = new_group;
+                }
+                Ok(())
+            }
+            Entry::Dir(dir) => {
+                let perms = &mut dir.write().perms;
+                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                    return Err(ChownError::NotTheOwner);
+                }
+                if let Some(new_user) = user {
+                    perms.userinfo.user = new_user;
+                }
+                if let Some(new_group) = group {
+                    perms.userinfo.group = new_group;
+                }
                 Ok(())
             }
         }

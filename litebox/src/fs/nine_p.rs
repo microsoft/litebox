@@ -74,6 +74,15 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
         todo!()
     }
 
+    fn chown(
+        &self,
+        path: impl crate::path::Arg,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), super::errors::ChownError> {
+        todo!()
+    }
+
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), super::errors::UnlinkError> {
         todo!()
     }

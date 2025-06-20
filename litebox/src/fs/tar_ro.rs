@@ -31,8 +31,8 @@ use crate::{LiteBox, path::Arg as _, sync, utilities::anymap::AnyMap};
 use super::{
     Mode, OFlags, SeekWhence,
     errors::{
-        ChmodError, CloseError, MkdirError, OpenError, PathError, ReadError, RmdirError, SeekError,
-        UnlinkError, WriteError,
+        ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadError,
+        RmdirError, SeekError, UnlinkError, WriteError,
     },
 };
 
@@ -239,6 +239,29 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             })
         {
             Err(ChmodError::ReadOnlyFileSystem)
+        } else {
+            Err(PathError::NoSuchFileOrDirectory)?
+        }
+    }
+
+    fn chown(
+        &self,
+        path: impl crate::path::Arg,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        let path = self.absolute_path(path)?;
+        assert!(path.starts_with('/'));
+        let path = &path[1..];
+        if self
+            .tar_data
+            .entries()
+            .any(|entry| match entry.filename().as_str() {
+                Ok(p) => p == path || contains_dir(p, path),
+                Err(_) => false,
+            })
+        {
+            Err(ChownError::ReadOnlyFileSystem)
         } else {
             Err(PathError::NoSuchFileOrDirectory)?
         }

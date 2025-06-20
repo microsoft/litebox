@@ -19,8 +19,8 @@ pub mod tar_ro;
 mod tests;
 
 use errors::{
-    ChmodError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError, ReadError,
-    RmdirError, SeekError, SetMetadataError, UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError,
+    ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -64,6 +64,13 @@ pub trait FileSystem: private::Sealed {
     fn seek(&self, fd: &FileFd, offset: isize, whence: SeekWhence) -> Result<usize, SeekError>;
     /// Change the permissions of a file
     fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
+    /// Change the owner of a file
+    fn chown(
+        &self,
+        path: impl path::Arg,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError>;
     /// Unlink a file
     fn unlink(&self, path: impl path::Arg) -> Result<(), UnlinkError>;
     /// Create a new directory
