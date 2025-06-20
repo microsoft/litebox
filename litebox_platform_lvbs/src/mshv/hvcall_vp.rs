@@ -60,7 +60,7 @@ pub fn hvcall_set_vp_registers(reg_name: u32, value: u64) -> Result<u64, HypervC
 /// Hyper-V Hypercall to set VTL0's registers like MSR and control registers.
 #[inline]
 pub fn hvcall_set_vp_vtl0_registers(reg_name: u32, value: u64) -> Result<u64, HypervCallError> {
-    hvcall_set_vp_registers_internal(reg_name, value, HvInputVtl::new(HV_VTL_NORMAL))
+    hvcall_set_vp_registers_internal(reg_name, value, HvInputVtl::new_for_vtl(HV_VTL_NORMAL))
 }
 
 fn hvcall_get_vp_registers_internal(
@@ -108,7 +108,7 @@ pub fn hvcall_get_vp_registers(reg_name: u32) -> Result<u64, HypervCallError> {
 /// Hyper-V Hypercall to get VTL0's registers like MSR and control registers.
 #[inline]
 pub fn hvcall_get_vp_vtl0_registers(reg_name: u32) -> Result<u64, HypervCallError> {
-    hvcall_get_vp_registers_internal(reg_name, HvInputVtl::new(HV_VTL_NORMAL))
+    hvcall_get_vp_registers_internal(reg_name, HvInputVtl::new_for_vtl(HV_VTL_NORMAL))
 }
 
 /// Populate the VP context for VTL1

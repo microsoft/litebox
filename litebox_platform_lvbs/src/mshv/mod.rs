@@ -11,6 +11,7 @@ pub mod vtl_switch;
 
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use modular_bitfield::prelude::*;
 
 pub const HV_HYPERCALL_REP_COMP_MASK: u64 = 0xfff_0000_0000;
 pub const HV_HYPERCALL_REP_COMP_OFFSET: u32 = 32;
@@ -229,49 +230,38 @@ pub struct HvInitVpContext {
     pub msr_cr_pat: u64,
 }
 
-#[derive(Default, Clone, Copy)]
-#[repr(C, packed)]
+#[bitfield]
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
 pub struct HvInputVtl {
-    _as_uint8: u8,
-    // union of
-    // target_vtl: 4, use_target_vtl: 1,
-    // reserved_z: 3
+    pub target_vtl: B4,
+    pub use_target_vtl: bool,
+    #[skip]
+    __: B3,
 }
 
 impl HvInputVtl {
-    const TARGET_VTL_MASK: u8 = 0xf;
-    const USE_TARGET_VTL_MASK: u8 = 0x10;
-    const USE_TARGET_VTL_SHIFT: u8 = 4;
-
     /// `target_vtl` specifies the VTL (0-15) that a Hyper-V hypercall works at.
-    pub fn new(target_vtl: u8) -> Self {
-        let mut vtl = HvInputVtl { _as_uint8: 0 };
-        vtl.set_target_vtl(target_vtl);
-        vtl.set_use_target_vtl(true);
-        vtl
+    pub fn new_for_vtl(target_vtl: u8) -> Self {
+        Self::new()
+            .with_target_vtl(target_vtl.into())
+            .with_use_target_vtl(true)
     }
 
     /// use the current VTL
     pub fn current() -> Self {
-        let mut vtl = HvInputVtl { _as_uint8: 0 };
-        vtl.set_use_target_vtl(false);
-        vtl
+        Self::new()
+            .with_use_target_vtl(false)
     }
 
-    #[expect(clippy::used_underscore_binding)]
-    pub fn set_target_vtl(&mut self, target_vtl: u8) {
-        self._as_uint8 |= target_vtl & Self::TARGET_VTL_MASK;
+    /// Gets the target VTL as a u8 value
+    pub fn target_vtl_value(&self) -> u8 {
+        self.target_vtl() as u8
     }
 
-    /// set `use_target_vtl` to `true` to let a hypercall work at the target VTL specified by `set_target_vtl`.
-    /// set `use_target_vtl` to `false` to let a hypercall work at the current VTL.
-    #[expect(clippy::used_underscore_binding)]
-    pub fn set_use_target_vtl(&mut self, use_target_vtl: bool) {
-        if use_target_vtl {
-            self._as_uint8 |= (1 << Self::USE_TARGET_VTL_SHIFT) & Self::USE_TARGET_VTL_MASK;
-        } else {
-            self._as_uint8 &= !((1 << Self::USE_TARGET_VTL_SHIFT) & Self::USE_TARGET_VTL_MASK);
-        }
+    /// Sets the target VTL from a u8 value
+    pub fn set_target_vtl_value(&mut self, target_vtl: u8) {
+        self.set_target_vtl(target_vtl.into());
     }
 }
 
@@ -1053,5 +1043,43 @@ impl HvPendingExceptionEvent {
 
     pub fn set_error_code(&mut self, error_code: u64) {
         self.set_sub_config(Self::ERROR_CODE_MASK, Self::ERROR_CODE_SHIFT, error_code);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hv_input_vtl_bitfield() {
+        // Test the new bitfield-based HvInputVtl implementation
+        
+        // Test new_for_vtl constructor
+        let vtl = HvInputVtl::new_for_vtl(5);
+        assert_eq!(vtl.target_vtl_value(), 5);
+        assert_eq!(vtl.use_target_vtl(), true);
+        
+        // Test current constructor
+        let current_vtl = HvInputVtl::current();
+        assert_eq!(current_vtl.use_target_vtl(), false);
+        
+        // Test individual field manipulation
+        let mut vtl = HvInputVtl::new();
+        vtl.set_target_vtl_value(10);
+        vtl.set_use_target_vtl(true);
+        assert_eq!(vtl.target_vtl_value(), 10);
+        assert_eq!(vtl.use_target_vtl(), true);
+        
+        // Test size - should be 1 byte
+        assert_eq!(core::mem::size_of::<HvInputVtl>(), 1);
+        
+        // Test that VTL values are properly bounded to 4 bits (0-15)
+        let vtl = HvInputVtl::new_for_vtl(15);
+        assert_eq!(vtl.target_vtl_value(), 15);
+        
+        // Test that Default trait works
+        let default_vtl = HvInputVtl::default();
+        assert_eq!(default_vtl.target_vtl_value(), 0);
+        assert_eq!(default_vtl.use_target_vtl(), false);
     }
 }
