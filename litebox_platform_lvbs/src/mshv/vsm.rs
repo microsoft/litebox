@@ -448,8 +448,11 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         .map_err(|_| Errno::EINVAL)?;
     memory_elf.clear();
 
-    let _ = parse_modinfo(&elf_buf);
-    let _ = validate_module_elf(&elf_buf, &module_memory_content);
+    parse_modinfo(&elf_buf).map_err(|_| Errno::EINVAL)?;
+    if !validate_module_elf(&elf_buf, &module_memory_content).map_err(|_| Errno::EINVAL)? {
+        serial_println!("VSM: Found unexpected relocations in the loaded module");
+        // return Err(Errno::EINVAL);
+    }
 
     // protect the memory ranges of a module based on their section types
     for mod_mem_range in &module_memory_metadata {
@@ -927,7 +930,7 @@ impl ModuleMemoryContent {
             | ModMemType::RoAfterInit
             | ModMemType::InitData
             | ModMemType::InitRoData => Ok(()), // we don't care/validate other memory types for now
-            _ => Err(MemoryContentError::Unknown),
+            _ => Err(MemoryContentError::InvalidType),
         }
     }
 }
@@ -1012,7 +1015,7 @@ impl MemoryContent {
                 self.write_bytes(addr + (phys_cur - phys_start), &data[..to_write])?;
                 phys_cur += u64::try_from(to_write).unwrap();
             } else {
-                return Err(MemoryContentError::Copy);
+                return Err(MemoryContentError::CopyFromVtl0Failed);
             }
         }
 
@@ -1070,14 +1073,8 @@ impl MemoryContent {
             self.extend_range(start, end);
             Ok(())
         } else {
-            Err(MemoryContentError::Write)
+            Err(MemoryContentError::WriteFailed)
         }
-    }
-
-    pub fn read_byte(&self, addr: VirtAddr) -> Option<u8> {
-        let page_base = addr.align_down(u64::try_from(PAGE_SIZE).unwrap());
-        let page_offset: usize = addr.page_offset().into();
-        self.pages.get(&page_base).map(|page| page[page_offset])
     }
 
     pub fn read_bytes(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<(), MemoryContentError> {
@@ -1116,7 +1113,7 @@ impl MemoryContent {
         if num_bytes == buf.len() {
             Ok(())
         } else {
-            Err(MemoryContentError::Read)
+            Err(MemoryContentError::ReadFailed)
         }
     }
 
@@ -1131,8 +1128,8 @@ impl MemoryContent {
 
 #[derive(Debug, PartialEq)]
 pub enum MemoryContentError {
-    Copy,
-    Read,
-    Write,
-    Unknown,
+    CopyFromVtl0Failed,
+    ReadFailed,
+    WriteFailed,
+    InvalidType,
 }
