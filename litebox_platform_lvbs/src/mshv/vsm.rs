@@ -181,8 +181,8 @@ pub fn mshv_vsm_configure_partition() -> Result<i64, Errno> {
     debug_serial_println!("VSM: Configure partition");
 
     let mut config = HvRegisterVsmPartitionConfig::new();
-    config.set_default_vtl_protection_mask(HvPageProtFlags::HV_PAGE_FULL_ACCESS.bits().into());
-    config.set_enable_vtl_protection();
+    config.set_default_vtl_protection_mask_value(HvPageProtFlags::HV_PAGE_FULL_ACCESS.bits().into());
+    config.set_enable_vtl_protection(true);
 
     hvcall_set_vp_registers(HV_REGISTER_VSM_PARTITION_CONFIG, config.as_u64())
         .map_err(|_| Errno::EFAULT)?;

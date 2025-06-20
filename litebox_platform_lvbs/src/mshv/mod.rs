@@ -12,6 +12,7 @@ pub mod vtl_switch;
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use modular_bitfield::prelude::*;
+use modular_bitfield::specifiers::{B4, B51};
 
 pub const HV_HYPERCALL_REP_COMP_MASK: u64 = 0xfff_0000_0000;
 pub const HV_HYPERCALL_REP_COMP_OFFSET: u32 = 32;
@@ -557,136 +558,44 @@ impl HvRegisterVsmVpSecureVtlConfig {
     }
 }
 
-#[derive(Default, Clone, Copy)]
-#[repr(C, packed)]
+#[bitfield]
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
 pub struct HvRegisterVsmPartitionConfig {
-    _as_u64: u64,
-    // union of
-    // enable_vtl_protection : 1,
-    // default_vtl_protection_mask : 4,
-    // zero_memory_on_reset : 1,
-    // deny_lower_vtl_startup : 1,
-    // intercept_acceptance : 1,
-    // intercept_enable_vtl_protection : 1,
-    // intercept_vp_startup : 1,
-    // intercept_cpuid_unimplemented : 1,
-    // intercept_unrecoverable_exception : 1,
-    // intercept_page : 1,
-    // mbz : 51,
+    pub enable_vtl_protection: bool,
+    pub default_vtl_protection_mask: B4,
+    pub zero_memory_on_reset: bool,
+    pub deny_lower_vtl_startup: bool,
+    pub intercept_acceptance: bool,
+    pub intercept_enable_vtl_protection: bool,
+    pub intercept_vp_startup: bool,
+    pub intercept_cpuid_unimplemented: bool,
+    pub intercept_unrecoverable_exception: bool,
+    pub intercept_page: bool,
+    #[skip]
+    __: B51,
 }
 
 impl HvRegisterVsmPartitionConfig {
-    const ENABLE_VTL_PROTECTION_MASK: u64 = 0x1;
-    const DEFAULT_VTL_PROTECTION_MASK_MASK: u64 = 0x1e;
-    const ZERO_MEMORY_ON_RESET_MASK: u64 = 0x20;
-    const DENY_LOWER_VTL_STARTUP_MASK: u64 = 0x40;
-    const INTERCEPT_ACCEPTANCE_MASK: u64 = 0x80;
-    const INTERCEPT_ENABLE_VTL_PROTECTION_MASK: u64 = 0x100;
-    const INTERCEPT_VP_STARTUP_MASK: u64 = 0x200;
-    const INTERCEPT_CPUID_UNIMPLEMENTED_MASK: u64 = 0x400;
-    const INTERCEPT_UNRECOVERABLE_EXCEPTION_MASK: u64 = 0x800;
-    const INTERCEPT_PAGE_MASK: u64 = 0x1000;
-    const ENABLE_VTL_PROTECTION_SHIFT: u64 = 0;
-    const DEFAULT_VTL_PROTECTION_MASK_SHIFT: u64 = 1;
-    const ZERO_MEMORY_ON_RESET_SHIFT: u64 = 5;
-    const DENY_LOWER_VTL_STARTUP_SHIFT: u64 = 6;
-    const INTERCEPT_ACCEPTANCE_SHIFT: u64 = 7;
-    const INTERCEPT_ENABLE_VTL_PROTECTION_SHIFT: u64 = 8;
-    const INTERCEPT_VP_STARTUP_SHIFT: u64 = 9;
-    const INTERCEPT_CPUID_UNIMPLEMENTED_SHIFT: u64 = 10;
-    const INTERCEPT_UNRECOVERABLE_EXCEPTION_SHIFT: u64 = 11;
-    const INTERCEPT_PAGE_SHIFT: u64 = 12;
-
-    pub fn new() -> Self {
-        HvRegisterVsmPartitionConfig {
-            ..Default::default()
-        }
-    }
-
-    #[expect(clippy::used_underscore_binding)]
+    /// Get the raw u64 value for compatibility with existing code
     pub fn as_u64(&self) -> u64 {
-        self._as_u64
+        // Convert the 8-byte array to u64
+        u64::from_le_bytes(self.into_bytes())
     }
 
-    #[expect(clippy::used_underscore_binding)]
-    fn set_sub_config(&mut self, mask: u64, shift: u64, value: u64) {
-        self._as_u64 |= (value << shift) & mask;
+    /// Create from a u64 value for compatibility with existing code  
+    pub fn from_u64(value: u64) -> Self {
+        Self::from_bytes(value.to_le_bytes())
     }
 
-    pub fn set_enable_vtl_protection(&mut self) {
-        self.set_sub_config(
-            Self::ENABLE_VTL_PROTECTION_MASK,
-            Self::ENABLE_VTL_PROTECTION_SHIFT,
-            1,
-        );
+    /// Set the default VTL protection mask from a u64 value
+    pub fn set_default_vtl_protection_mask_value(&mut self, mask: u64) {
+        self.set_default_vtl_protection_mask((mask as u8).into());
     }
 
-    pub fn set_default_vtl_protection_mask(&mut self, mask: u64) {
-        self.set_sub_config(
-            Self::DEFAULT_VTL_PROTECTION_MASK_MASK,
-            Self::DEFAULT_VTL_PROTECTION_MASK_SHIFT,
-            mask,
-        );
-    }
-
-    pub fn set_zero_memory_on_reset(&mut self) {
-        self.set_sub_config(
-            Self::ZERO_MEMORY_ON_RESET_MASK,
-            Self::ZERO_MEMORY_ON_RESET_SHIFT,
-            1,
-        );
-    }
-
-    pub fn set_deny_lower_vtl_startup(&mut self) {
-        self.set_sub_config(
-            Self::DENY_LOWER_VTL_STARTUP_MASK,
-            Self::DENY_LOWER_VTL_STARTUP_SHIFT,
-            1,
-        );
-    }
-
-    pub fn set_intercept_acceptance(&mut self) {
-        self.set_sub_config(
-            Self::INTERCEPT_ACCEPTANCE_MASK,
-            Self::INTERCEPT_ACCEPTANCE_SHIFT,
-            1,
-        );
-    }
-
-    pub fn set_intercept_enable_vtl_protection(&mut self) {
-        self.set_sub_config(
-            Self::INTERCEPT_ENABLE_VTL_PROTECTION_MASK,
-            Self::INTERCEPT_ENABLE_VTL_PROTECTION_SHIFT,
-            1,
-        );
-    }
-
-    pub fn set_intercept_vp_startup(&mut self) {
-        self.set_sub_config(
-            Self::INTERCEPT_VP_STARTUP_MASK,
-            Self::INTERCEPT_VP_STARTUP_SHIFT,
-            1,
-        );
-    }
-
-    pub fn set_intercept_cpuid_unimplemented(&mut self) {
-        self.set_sub_config(
-            Self::INTERCEPT_CPUID_UNIMPLEMENTED_MASK,
-            Self::INTERCEPT_CPUID_UNIMPLEMENTED_SHIFT,
-            1,
-        );
-    }
-
-    pub fn set_intercept_unrecoverable_exception(&mut self) {
-        self.set_sub_config(
-            Self::INTERCEPT_UNRECOVERABLE_EXCEPTION_MASK,
-            Self::INTERCEPT_UNRECOVERABLE_EXCEPTION_SHIFT,
-            1,
-        );
-    }
-
-    pub fn set_intercept_page(&mut self) {
-        self.set_sub_config(Self::INTERCEPT_PAGE_MASK, Self::INTERCEPT_PAGE_SHIFT, 1);
+    /// Get the default VTL protection mask as a u64 value
+    pub fn default_vtl_protection_mask_value(&self) -> u64 {
+        self.default_vtl_protection_mask() as u64
     }
 }
 
@@ -1081,5 +990,54 @@ mod tests {
         let default_vtl = HvInputVtl::default();
         assert_eq!(default_vtl.target_vtl_value(), 0);
         assert_eq!(default_vtl.use_target_vtl(), false);
+    }
+
+    #[test]
+    fn test_hv_register_vsm_partition_config_bitfield() {
+        // Test the new bitfield-based HvRegisterVsmPartitionConfig implementation
+        
+        let mut config = HvRegisterVsmPartitionConfig::new();
+        
+        // Test individual boolean flags
+        config.set_enable_vtl_protection(true);
+        assert_eq!(config.enable_vtl_protection(), true);
+        
+        config.set_zero_memory_on_reset(true);
+        assert_eq!(config.zero_memory_on_reset(), true);
+        
+        config.set_intercept_page(true);
+        assert_eq!(config.intercept_page(), true);
+        
+        // Test the 4-bit protection mask field
+        config.set_default_vtl_protection_mask_value(0b1010);
+        assert_eq!(config.default_vtl_protection_mask_value(), 0b1010);
+        
+        // Test size - should be 8 bytes (64 bits)
+        assert_eq!(core::mem::size_of::<HvRegisterVsmPartitionConfig>(), 8);
+        
+        // Test as_u64 and from_u64 round-trip
+        let original = config.as_u64();
+        let restored = HvRegisterVsmPartitionConfig::from_u64(original);
+        
+        assert_eq!(restored.enable_vtl_protection(), true);
+        assert_eq!(restored.zero_memory_on_reset(), true);
+        assert_eq!(restored.intercept_page(), true);
+        assert_eq!(restored.default_vtl_protection_mask_value(), 0b1010);
+        
+        // Test that Default trait works
+        let default_config = HvRegisterVsmPartitionConfig::default();
+        assert_eq!(default_config.enable_vtl_protection(), false);
+        assert_eq!(default_config.as_u64(), 0);
+        
+        // Test chaining builder-style methods (generated by bitfield macro)
+        let chained_config = HvRegisterVsmPartitionConfig::new()
+            .with_enable_vtl_protection(true)
+            .with_intercept_acceptance(true)
+            .with_intercept_vp_startup(true);
+            
+        assert_eq!(chained_config.enable_vtl_protection(), true);
+        assert_eq!(chained_config.intercept_acceptance(), true);
+        assert_eq!(chained_config.intercept_vp_startup(), true);
+        assert_eq!(chained_config.zero_memory_on_reset(), false);
     }
 }
