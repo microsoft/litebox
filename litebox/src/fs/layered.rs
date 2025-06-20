@@ -11,8 +11,8 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, CloseError, FileStatusError, MkdirError, OpenError, PathError, ReadError,
-    RmdirError, SeekError, UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
+    ReadError, RmdirError, SeekError, UnlinkError, WriteError,
 };
 use super::{FileStatus, FileType, Mode, OFlags, SeekWhence};
 
@@ -621,6 +621,44 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
         self.chmod(path, mode)
+    }
+
+    fn chown(
+        &self,
+        path: impl crate::path::Arg,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        let path = self.absolute_path(path)?;
+        match self.upper.chown(path.as_str(), user, group) {
+            Ok(()) => return Ok(()),
+            Err(e) => match e {
+                ChownError::NotTheOwner
+                | ChownError::ReadOnlyFileSystem
+                | ChownError::PathError(
+                    PathError::ComponentNotADirectory
+                    | PathError::InvalidPathname
+                    | PathError::NoSearchPerms { .. },
+                ) => {
+                    return Err(e);
+                }
+                ChownError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                ) => {
+                    // fallthrough
+                }
+            },
+        }
+        self.ensure_lower_contains(&path)?;
+        match self.migrate_file_up(&path) {
+            Ok(()) => {}
+            Err(MigrationError::NoReadPerms) => unimplemented!(),
+            Err(MigrationError::NotAFile) => unimplemented!(),
+            Err(MigrationError::PathError(e)) => unreachable!(),
+        }
+        // Since it has been migrated, we can just re-trigger, causing it to apply to the
+        // upper layer
+        self.chown(path, user, group)
     }
 
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {

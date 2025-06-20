@@ -8,8 +8,8 @@ use crate::{
     fs::{
         FileStatus, FileType, Mode, OFlags, SeekWhence,
         errors::{
-            ChmodError, CloseError, FileStatusError, MkdirError, OpenError, PathError, ReadError,
-            RmdirError, SeekError, UnlinkError, WriteError,
+            ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
+            ReadError, RmdirError, SeekError, UnlinkError, WriteError,
         },
     },
     path::Arg,
@@ -133,6 +133,15 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem for File
     }
 
     fn chmod(&self, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
+        unimplemented!()
+    }
+
+    fn chown(
+        &self,
+        path: impl Arg,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
         unimplemented!()
     }
 

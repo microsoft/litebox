@@ -72,6 +72,21 @@ pub enum ChmodError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`FileSystem::chown`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum ChownError {
+    #[error(
+        "the effective UID does not match the owner of the file, \
+         and the process is not privileged"
+    )]
+    NotTheOwner,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`FileSystem::unlink`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
