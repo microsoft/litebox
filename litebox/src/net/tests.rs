@@ -4,6 +4,7 @@ use super::*;
 
 use core::net::SocketAddrV4;
 use core::str::FromStr;
+use alloc::string::String;
 
 extern crate std;
 
@@ -96,4 +97,142 @@ fn test_bidirectional_tcp_communication_automatic() {
     let mut network = Network::new(&litebox);
     network.set_platform_interaction(PlatformInteraction::Automatic);
     bidi_tcp_comms(network, |_| {});
+}
+
+#[test]
+fn test_socket_metadata() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+
+    // Create a socket
+    let socket_fd = network
+        .socket(Protocol::Tcp)
+        .expect("Failed to create TCP socket");
+
+    // Test setting and getting socket metadata
+    let test_data = String::from("socket-level metadata");
+    let old_metadata = network
+        .set_socket_metadata(&socket_fd, test_data.clone())
+        .expect("Failed to set socket metadata");
+    assert!(old_metadata.is_none(), "Expected no previous metadata");
+
+    // Test reading socket metadata
+    let retrieved_data = network
+        .with_metadata(&socket_fd, |data: &String| data.clone())
+        .expect("Failed to get socket metadata");
+    assert_eq!(retrieved_data, test_data, "Retrieved metadata should match");
+
+    // Test overwriting socket metadata
+    let new_test_data = String::from("updated socket metadata");
+    let old_metadata = network
+        .set_socket_metadata(&socket_fd, new_test_data.clone())
+        .expect("Failed to update socket metadata");
+    assert_eq!(
+        old_metadata, Some(test_data),
+        "Should return previous metadata"
+    );
+
+    // Test retrieving updated metadata
+    let updated_data = network
+        .with_metadata(&socket_fd, |data: &String| data.clone())
+        .expect("Failed to get updated socket metadata");
+    assert_eq!(updated_data, new_test_data, "Updated metadata should match");
+
+    // Close the socket
+    network.close(socket_fd).expect("Failed to close socket");
+}
+
+#[test]
+fn test_fd_metadata() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+
+    // Create a socket
+    let socket_fd = network
+        .socket(Protocol::Tcp)
+        .expect("Failed to create TCP socket");
+
+    // Test setting and getting fd-specific metadata
+    let test_data = 42u32;
+    let old_metadata = network
+        .set_fd_metadata(&socket_fd, test_data)
+        .expect("Failed to set fd metadata");
+    assert!(old_metadata.is_none(), "Expected no previous metadata");
+
+    // Test reading fd metadata
+    let retrieved_data = network
+        .with_metadata(&socket_fd, |data: &u32| *data)
+        .expect("Failed to get fd metadata");
+    assert_eq!(retrieved_data, test_data, "Retrieved metadata should match");
+
+    // Test that mutable access works
+    network
+        .with_metadata_mut(&socket_fd, |data: &mut u32| {
+            *data += 1;
+        })
+        .expect("Failed to modify fd metadata");
+
+    let modified_data = network
+        .with_metadata(&socket_fd, |data: &u32| *data)
+        .expect("Failed to get modified fd metadata");
+    assert_eq!(modified_data, test_data + 1, "Modified metadata should be incremented");
+
+    // Close the socket
+    network.close(socket_fd).expect("Failed to close socket");
+}
+
+#[test]
+fn test_metadata_priority() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+
+    // Create a socket
+    let socket_fd = network
+        .socket(Protocol::Tcp)
+        .expect("Failed to create TCP socket");
+
+    // Set socket-level metadata
+    let socket_data = String::from("socket level");
+    network
+        .set_socket_metadata(&socket_fd, socket_data.clone())
+        .expect("Failed to set socket metadata");
+
+    // Verify socket metadata is accessible
+    let retrieved_socket_data = network
+        .with_metadata(&socket_fd, |data: &String| data.clone())
+        .expect("Failed to get socket metadata");
+    assert_eq!(retrieved_socket_data, socket_data, "Socket metadata should match");
+
+    // Set fd-level metadata of the same type - this should shadow socket metadata
+    let fd_data = String::from("fd level");
+    network
+        .set_fd_metadata(&socket_fd, fd_data.clone())
+        .expect("Failed to set fd metadata");
+
+    // Verify fd metadata shadows socket metadata
+    let retrieved_data = network
+        .with_metadata(&socket_fd, |data: &String| data.clone())
+        .expect("Failed to get metadata");
+    assert_eq!(retrieved_data, fd_data, "FD metadata should shadow socket metadata");
+
+    // Close the socket
+    network.close(socket_fd).expect("Failed to close socket");
+}
+
+#[test]
+fn test_metadata_errors() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+
+    // Create a socket 
+    let socket_fd = network
+        .socket(Protocol::Tcp)
+        .expect("Failed to create TCP socket");
+
+    // Test nonexistent metadata type
+    let result = network.with_metadata(&socket_fd, |_data: &String| ());
+    assert!(matches!(result, Err(MetadataError::NoSuchMetadata)), "Should return NoSuchMetadata error");
+
+    // Close the socket
+    network.close(socket_fd).expect("Failed to close socket");
 }

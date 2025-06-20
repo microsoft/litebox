@@ -109,3 +109,21 @@ pub enum SetTcpOptionError {
     #[error("Not a TCP socket")]
     NotTcpSocket,
 }
+
+/// Possible errors from [`Network::with_metadata`] and [`Network::with_metadata_mut`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum MetadataError {
+    #[error("Not a valid open file descriptor")]
+    InvalidFd,
+    #[error("no such metadata available")]
+    NoSuchMetadata,
+}
+
+/// Possible errors from [`Network::set_socket_metadata`] and [`Network::set_fd_metadata`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum SetMetadataError<T> {
+    #[error("Not a valid open file descriptor")]
+    InvalidFd(T),
+}
