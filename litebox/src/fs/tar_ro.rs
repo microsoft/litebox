@@ -31,8 +31,8 @@ use crate::{LiteBox, path::Arg as _, sync, utilities::anymap::AnyMap};
 use super::{
     Mode, OFlags, SeekWhence,
     errors::{
-        ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadError, RmdirError, SeekError,
-        UnlinkError, WriteError,
+        ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadError,
+        RmdirError, SeekError, UnlinkError, WriteError,
     },
 };
 
@@ -244,7 +244,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
-    fn chown(&self, path: impl crate::path::Arg, user: Option<u16>, group: Option<u16>) -> Result<(), ChownError> {
+    fn chown(
+        &self,
+        path: impl crate::path::Arg,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
         assert!(path.starts_with('/'));
         let path = &path[1..];

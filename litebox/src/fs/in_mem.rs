@@ -11,8 +11,8 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError, PathError,
-    ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError,
+    PathError, ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError, WriteError,
 };
 use super::{FileStatus, Mode, SeekWhence};
 use crate::utilities::anymap::AnyMap;
@@ -328,7 +328,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
-    fn chown(&self, path: impl crate::path::Arg, user: Option<u16>, group: Option<u16>) -> Result<(), ChownError> {
+    fn chown(
+        &self,
+        path: impl crate::path::Arg,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
         let (_, entry) = root.parent_and_entry(&path, self.current_user)?;

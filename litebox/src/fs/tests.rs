@@ -166,7 +166,7 @@ mod in_mem {
     fn chown_test() {
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);
-        
+
         // Create a test file as root
         fs.with_root_privileges(|fs| {
             let path = "/testfile";
@@ -174,17 +174,19 @@ mod in_mem {
                 .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to create file");
             fs.close(fd).expect("Failed to close file");
-            
+
             // First chown to 1000:1000 as root (should succeed)
-            fs.chown(path, Some(1000), Some(1000)).expect("Failed to chown as root");
+            fs.chown(path, Some(1000), Some(1000))
+                .expect("Failed to chown as root");
         });
-        
+
         // Switch to user 1000 and test that owner can chown (should succeed)
         let path = "/testfile";
         fs.with_user(1000, 1000, |fs| {
-            fs.chown(path, Some(123), Some(456)).expect("Failed to chown as owner");
+            fs.chown(path, Some(123), Some(456))
+                .expect("Failed to chown as owner");
         });
-        
+
         // Switch to a different user and test that non-owner cannot chown (should fail)
         fs.with_user(500, 500, |fs| {
             match fs.chown(path, Some(789), Some(101)) {
@@ -195,26 +197,28 @@ mod in_mem {
                 Err(e) => panic!("Unexpected error: {:?}", e),
             }
         });
-        
+
         // Test chown on non-existent file (should fail)
         match fs.chown("/nonexistent", Some(123), Some(456)) {
             Err(crate::fs::errors::ChownError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
+                crate::fs::errors::PathError::NoSuchFileOrDirectory,
             )) => {
                 // Expected behavior
             }
             Ok(()) => panic!("Should not be able to chown non-existent file"),
             Err(e) => panic!("Unexpected error: {:?}", e),
         }
-        
+
         // Test partial chown (change only user, leave group unchanged)
         fs.with_root_privileges(|fs| {
-            fs.chown(path, Some(999), None).expect("Failed to chown user only");
+            fs.chown(path, Some(999), None)
+                .expect("Failed to chown user only");
         });
-        
-        // Test partial chown (change only group, leave user unchanged)  
+
+        // Test partial chown (change only group, leave user unchanged)
         fs.with_root_privileges(|fs| {
-            fs.chown(path, None, Some(888)).expect("Failed to chown group only");
+            fs.chown(path, None, Some(888))
+                .expect("Failed to chown group only");
         });
     }
 }

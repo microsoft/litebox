@@ -11,8 +11,8 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError, ReadError,
-    RmdirError, SeekError, UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
+    ReadError, RmdirError, SeekError, UnlinkError, WriteError,
 };
 use super::{FileStatus, FileType, Mode, OFlags, SeekWhence};
 
@@ -623,7 +623,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         self.chmod(path, mode)
     }
 
-    fn chown(&self, path: impl crate::path::Arg, user: Option<u16>, group: Option<u16>) -> Result<(), ChownError> {
+    fn chown(
+        &self,
+        path: impl crate::path::Arg,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
         match self.upper.chown(path.as_str(), user, group) {
             Ok(()) => return Ok(()),

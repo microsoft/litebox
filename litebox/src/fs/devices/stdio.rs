@@ -8,8 +8,8 @@ use crate::{
     fs::{
         FileStatus, FileType, Mode, OFlags, SeekWhence,
         errors::{
-            ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError, ReadError,
-            RmdirError, SeekError, UnlinkError, WriteError,
+            ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
+            ReadError, RmdirError, SeekError, UnlinkError, WriteError,
         },
     },
     path::Arg,
@@ -136,7 +136,12 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem for File
         unimplemented!()
     }
 
-    fn chown(&self, path: impl Arg, user: Option<u16>, group: Option<u16>) -> Result<(), ChownError> {
+    fn chown(
+        &self,
+        path: impl Arg,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
         unimplemented!()
     }
 
