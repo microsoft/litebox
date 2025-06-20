@@ -29,7 +29,7 @@ use crate::{
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
-        kernel_elf::{parse_modinfo, validate_module_elf},
+        kernel_elf::{parse_modinfo, validate_kernel_module_elf},
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,
@@ -449,7 +449,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     memory_elf.clear();
 
     parse_modinfo(&elf_buf).map_err(|_| Errno::EINVAL)?;
-    if !validate_module_elf(&elf_buf, &module_memory_content).map_err(|_| Errno::EINVAL)? {
+    if !validate_kernel_module_elf(&elf_buf, &module_memory_content).map_err(|_| Errno::EINVAL)? {
         serial_println!("VSM: Found unexpected relocations in the loaded module");
         // return Err(Errno::EINVAL);
     }

@@ -19,7 +19,7 @@ use rangemap::set::RangeSet;
 /// In particular, this function checks the integrity of "non-relocatable bytes" in ELF. We check the
 /// signature of the entire ELF (including relocation information) before calling this function,
 /// so what the adversary can do with relocatable bytes is limited.
-pub fn validate_module_elf(
+pub fn validate_kernel_module_elf(
     elf_buf: &[u8],
     module_memory: &ModuleMemoryContent,
 ) -> Result<bool, KernelElfError> {
