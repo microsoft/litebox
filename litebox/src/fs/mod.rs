@@ -65,7 +65,7 @@ pub trait FileSystem: private::Sealed {
     /// Change the permissions of a file
     fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
     /// Change the owner of a file
-    fn chown(&self, path: impl path::Arg, user: u16, group: u16) -> Result<(), ChownError>;
+    fn chown(&self, path: impl path::Arg, user: Option<u16>, group: Option<u16>) -> Result<(), ChownError>;
     /// Unlink a file
     fn unlink(&self, path: impl path::Arg) -> Result<(), UnlinkError>;
     /// Create a new directory

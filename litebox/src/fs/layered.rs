@@ -623,7 +623,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         self.chmod(path, mode)
     }
 
-    fn chown(&self, path: impl crate::path::Arg, user: u16, group: u16) -> Result<(), ChownError> {
+    fn chown(&self, path: impl crate::path::Arg, user: Option<u16>, group: Option<u16>) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
         match self.upper.chown(path.as_str(), user, group) {
             Ok(()) => return Ok(()),

@@ -74,6 +74,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
             unreachable!()
         }
     }
+
+    /// Execute `f` as a specific user (for testing purposes).
+    #[cfg(test)]
+    pub fn with_user<F>(&mut self, user: u16, group: u16, f: F)
+    where
+        F: FnOnce(&mut Self),
+    {
+        let test_user = UserInfo { user, group };
+        let original_user = core::mem::replace(&mut self.current_user, test_user);
+        f(self);
+        let test_user_again = core::mem::replace(&mut self.current_user, original_user);
+        if test_user_again.user != test_user.user || test_user_again.group != test_user.group {
+            unreachable!()
+        }
+    }
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> super::private::Sealed for FileSystem<Platform> {}
@@ -313,7 +328,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
-    fn chown(&self, path: impl crate::path::Arg, user: u16, group: u16) -> Result<(), ChownError> {
+    fn chown(&self, path: impl crate::path::Arg, user: Option<u16>, group: Option<u16>) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
         let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
@@ -326,8 +341,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
                     return Err(ChownError::NotTheOwner);
                 }
-                perms.userinfo.user = user;
-                perms.userinfo.group = group;
+                if let Some(new_user) = user {
+                    perms.userinfo.user = new_user;
+                }
+                if let Some(new_group) = group {
+                    perms.userinfo.group = new_group;
+                }
                 Ok(())
             }
             Entry::Dir(dir) => {
@@ -335,8 +354,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
                     return Err(ChownError::NotTheOwner);
                 }
-                perms.userinfo.user = user;
-                perms.userinfo.group = group;
+                if let Some(new_user) = user {
+                    perms.userinfo.user = new_user;
+                }
+                if let Some(new_group) = group {
+                    perms.userinfo.group = new_group;
+                }
                 Ok(())
             }
         }

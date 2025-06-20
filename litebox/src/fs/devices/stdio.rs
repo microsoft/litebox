@@ -136,7 +136,7 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem for File
         unimplemented!()
     }
 
-    fn chown(&self, path: impl Arg, user: u16, group: u16) -> Result<(), ChownError> {
+    fn chown(&self, path: impl Arg, user: Option<u16>, group: Option<u16>) -> Result<(), ChownError> {
         unimplemented!()
     }
 

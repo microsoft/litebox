@@ -77,8 +77,8 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
     fn chown(
         &self,
         path: impl crate::path::Arg,
-        user: u16,
-        group: u16,
+        user: Option<u16>,
+        group: Option<u16>,
     ) -> Result<(), super::errors::ChownError> {
         todo!()
     }

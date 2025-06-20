@@ -244,7 +244,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
-    fn chown(&self, path: impl crate::path::Arg, user: u16, group: u16) -> Result<(), ChownError> {
+    fn chown(&self, path: impl crate::path::Arg, user: Option<u16>, group: Option<u16>) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
         assert!(path.starts_with('/'));
         let path = &path[1..];
