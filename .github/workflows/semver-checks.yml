@@ -25,15 +25,30 @@ jobs:
         uses: actions/checkout@v4
       - name: Ensure that the main branch is fetched
         run: git fetch origin main:main
+      - name: Check for changed .rs files
+        id: check_rs_changes
+        run: |
+          git fetch origin main:main
+          CHANGED_RS_FILES=$(git diff --name-only origin/main...HEAD | grep '\.rs$' || true)
+          echo "Changed .rs files:"
+          echo "$CHANGED_RS_FILES"
+          if [ -z "$CHANGED_RS_FILES" ]; then
+            echo "rs_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "rs_changes=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Set up Rust
+        if: steps.check_rs_changes.outputs.rs_changes == 'true'
         run: |
           rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update
       - name: Set up cargo-semver-checks
+        if: steps.check_rs_changes.outputs.rs_changes == 'true'
         run: |
           curl -L --proto '=https' --tlsv1.2 -sSf https://github.com/obi1kenobi/cargo-semver-checks/releases/latest/download/cargo-semver-checks-x86_64-unknown-linux-gnu.tar.gz | tar xzvf -
           mv cargo-semver-checks ~/.cargo/bin
       - name: Check semver match against the main branch
         id: semver_check
+        if: steps.check_rs_changes.outputs.rs_changes == 'true'
         run: |
           # TODO(jayb): we are temporarily preventing a failure in semver-checks
           # from showing up as a `X`, but instead triggering a comment on the
