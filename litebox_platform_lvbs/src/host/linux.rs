@@ -85,3 +85,24 @@ impl CpuMask {
         cpu_mask
     }
 }
+
+#[allow(non_camel_case_types)]
+pub type __be32 = u32;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ModuleSignature {
+    pub algo: u8,
+    pub hash: u8,
+    pub id_type: u8,
+    pub signer_len: u8,
+    pub key_id_len: u8,
+    _pad: [u8; 3],
+    sig_len: __be32,
+}
+
+impl ModuleSignature {
+    pub fn sig_len(&self) -> u32 {
+        u32::from_be(self.sig_len)
+    }
+}
