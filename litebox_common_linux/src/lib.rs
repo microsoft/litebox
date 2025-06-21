@@ -751,7 +751,11 @@ bitfield::bitfield! {
     pub lm, set_lm: 7;
 }
 
+/// Struct for thread-local storage.
 pub struct ThreadLocalStorage<Platform: litebox::platform::RawPointerProvider> {
+    /// Indicates whether the TLS is being borrowed.
+    pub borrowed: bool,
+
     #[cfg(target_arch = "x86")]
     pub self_ptr: *mut ThreadLocalStorage<Platform>,
     pub current_task: alloc::boxed::Box<Task>,
@@ -759,7 +763,21 @@ pub struct ThreadLocalStorage<Platform: litebox::platform::RawPointerProvider> {
     pub __phantom: core::marker::PhantomData<Platform>,
 }
 
+impl<Platform: litebox::platform::RawPointerProvider> ThreadLocalStorage<Platform> {
+    pub const fn new(task: alloc::boxed::Box<Task>) -> Self {
+        Self {
+            borrowed: false,
+            #[cfg(target_arch = "x86")]
+            self_ptr: core::ptr::null_mut(),
+            current_task: task,
+            __phantom: core::marker::PhantomData,
+        }
+    }
+}
+
+/// A task associated with a thread in LiteBox.
 pub struct Task {
+    /// Thread identifier
     pub tid: u32,
 }
 

@@ -544,13 +544,28 @@ pub trait SystemInfoProvider {
 pub trait ThreadLocalStorageProvider {
     type ThreadLocalStorage;
 
-    /// Get a thread-local storage value for the current thread.
-    fn get_thread_local(&self) -> *mut Self::ThreadLocalStorage;
-
     /// Set a thread-local storage value for the current thread.
-    fn set_thread_local(&self, value: Self::ThreadLocalStorage);
+    ///
+    /// # Panics
+    ///
+    /// Panics if TLS is set already.
+    fn set_thread_local_storage(&self, value: Self::ThreadLocalStorage);
+
+    /// Invokes the provided callback function with the thread-local storage value for the current thread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if TLS is not set yet.
+    /// Panics if TLS is borrowed already (e.g., recursive call to [`Self::release_thread_local_storage`]).
+    fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Self::ThreadLocalStorage) -> R;
 
     /// Release the thread-local storage value for the current thread
-    /// and invoke the provided callback function on it.
-    fn release_thread_local(&self, f: fn(&mut Self::ThreadLocalStorage));
+    ///
+    /// # Panics
+    ///
+    /// Panics if TLS is not set yet.
+    /// Panics if TLS is being used by [`Self::with_thread_local_storage_mut`].
+    fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage;
 }
