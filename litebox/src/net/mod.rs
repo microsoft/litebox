@@ -922,13 +922,9 @@ where
         fd: &SocketFd,
         f: impl FnOnce(&T) -> R,
     ) -> Result<R, MetadataError> {
-        let socket_handle = match self.handles.get(fd.x.as_usize()) {
-            Some(Some(handle)) => handle,
-            _ => {
-                // This should not happen due to borrow checking, but handle gracefully
-                return Err(MetadataError::NoSuchMetadata);
-            }
-        };
+        let socket_handle = self.handles[fd.x.as_usize()]
+            .as_ref()
+            .ok_or(MetadataError::InvalidFd)?;
 
         if let Some(m) = socket_handle.socket_metadata.get::<T>() {
             Ok(f(m))
@@ -943,13 +939,9 @@ where
         fd: &SocketFd,
         f: impl FnOnce(&mut T) -> R,
     ) -> Result<R, MetadataError> {
-        let socket_handle = match self.handles.get_mut(fd.x.as_usize()) {
-            Some(Some(handle)) => handle,
-            _ => {
-                // This should not happen due to borrow checking, but handle gracefully
-                return Err(MetadataError::NoSuchMetadata);
-            }
-        };
+        let socket_handle = self.handles[fd.x.as_usize()]
+            .as_mut()
+            .ok_or(MetadataError::InvalidFd)?;
 
         if let Some(m) = socket_handle.socket_metadata.get_mut::<T>() {
             Ok(f(m))
@@ -966,15 +958,8 @@ where
         fd: &SocketFd,
         metadata: T,
     ) -> Result<Option<T>, SetMetadataError<T>> {
-        let socket_handle = match self.handles.get_mut(fd.x.as_usize()) {
-            Some(Some(handle)) => handle,
-            _ => {
-                // This should not happen due to borrow checking, but handle gracefully
-                // We construct a phantom error since the error type must be non-empty for now
-                unreachable!(
-                    "Invalid file descriptor access should be prevented by borrow checking"
-                );
-            }
+        let Some(socket_handle) = self.handles[fd.x.as_usize()].as_mut() else {
+            return Err(SetMetadataError::InvalidFd(metadata));
         };
 
         Ok(socket_handle.socket_metadata.insert(metadata))

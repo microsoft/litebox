@@ -125,8 +125,6 @@ pub enum MetadataError {
 #[derive(Error, Debug)]
 pub enum SetMetadataError<T> {
     #[error("Not a valid open file descriptor")]
-    InvalidFd(T), // Note: we return the T just so we are not dropping data
-    #[doc(hidden)]
-    #[error("internal phantom type")]
-    _Phantom(core::marker::PhantomData<T>),
+    // Note: we return the T just so we are not dropping data
+    InvalidFd(T),
 }
