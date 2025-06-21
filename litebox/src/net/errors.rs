@@ -114,6 +114,8 @@ pub enum SetTcpOptionError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum MetadataError {
+    #[error("Not a valid open file descriptor")]
+    InvalidFd,
     #[error("no such metadata available")]
     NoSuchMetadata,
 }
@@ -122,7 +124,9 @@ pub enum MetadataError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum SetMetadataError<T> {
-    // Note: we return the T just so we are not dropping data
+    #[error("Not a valid open file descriptor")]
+    InvalidFd(T), // Note: we return the T just so we are not dropping data
     #[doc(hidden)]
+    #[error("internal phantom type")]
     _Phantom(core::marker::PhantomData<T>),
 }
