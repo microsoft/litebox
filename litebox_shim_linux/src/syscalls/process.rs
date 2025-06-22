@@ -115,14 +115,13 @@ fn futex_wake(addr: MutPtr<i32>) {
 }
 
 pub(crate) fn sys_exit(status: i32) -> ! {
-    litebox_platform_multiplex::platform().release_thread_local(|tls| {
-        if let Some(clear_child_tid) = tls.current_task.clear_child_tid.take() {
-            // Clear the child TID if requested
-            // TODO: if we are the last thread, we don't need to clear it
-            let _ = unsafe { clear_child_tid.write_at_offset(0, 0) };
-            futex_wake(clear_child_tid);
-        }
-    });
+    let mut tls = litebox_platform_multiplex::platform().release_thread_local_storage();
+    if let Some(clear_child_tid) = tls.current_task.clear_child_tid.take() {
+        // Clear the child TID if requested
+        // TODO: if we are the last thread, we don't need to clear it
+        let _ = unsafe { clear_child_tid.write_at_offset(0, 0) };
+        futex_wake(clear_child_tid);
+    }
 
     litebox_platform_multiplex::platform().terminate_thread(status)
 }
@@ -238,19 +237,20 @@ pub(crate) fn sys_clone(
 
 /// Handle syscall `set_tid_address`.
 pub(crate) fn sys_set_tid_address(tidptr: crate::MutPtr<i32>) -> i32 {
-    let tls = litebox_platform_multiplex::platform().get_thread_local();
-    assert!(!tls.is_null(), "TLS is null");
-    let tls = unsafe { &mut *tls };
-    tls.current_task.clear_child_tid = Some(tidptr);
-    tls.current_task.tid
+    unsafe {
+        litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| {
+            tls.current_task.clear_child_tid = Some(tidptr);
+            tls.current_task.tid
+        })
+    }
 }
 
 /// Handle syscall `gettid`.
 pub(crate) fn sys_gettid() -> i32 {
-    let tls = litebox_platform_multiplex::platform().get_thread_local();
-    assert!(!tls.is_null(), "TLS is null");
-    let tls = unsafe { &*tls };
-    tls.current_task.tid
+    unsafe {
+        litebox_platform_multiplex::platform()
+            .with_thread_local_storage_mut(|tls| tls.current_task.tid)
+    }
 }
 
 #[cfg(test)]

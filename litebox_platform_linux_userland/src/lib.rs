@@ -1651,13 +1651,12 @@ mod tests {
     fn test_tls() {
         let platform = LinuxUserland::new(None);
         let tls = LinuxUserland::get_thread_local_storage();
-        assert!(tls.is_null(), "TLS should be null in the main thread");
-        platform.set_thread_local_storage(litebox_common_linux::ThreadLocalStorage::new(Box::new(
-            litebox_common_linux::Task { tid: 0xffff },
-        )));
+        assert!(!tls.is_null(), "TLS should not be null");
+        let tid = unsafe { (*tls).current_task.tid };
+
         platform.with_thread_local_storage_mut(|tls| {
             assert_eq!(
-                tls.current_task.tid, 0xffff,
+                tls.current_task.tid, tid,
                 "TLS should have the correct task ID"
             );
             tls.current_task.tid = 0x1234; // Change the task ID
