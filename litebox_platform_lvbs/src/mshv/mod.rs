@@ -142,7 +142,7 @@ bitflags::bitflags! {
 }
 
 bitflags::bitflags! {
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Clone, Copy, Default)]
     pub struct SegmentRegisterAttributeFlags: u16 {
         const ACCESSED = 1 << 0;
         const WRITABLE = 1 << 1;
@@ -166,13 +166,7 @@ pub struct HvX64SegmentRegister {
     pub base: u64,
     pub limit: u32,
     pub selector: u16,
-
-    _attributes: u16,
-    // union of
-    // segment_type: 4, non_system_segment: 1,
-    // descriptor_privilege_level: 2, present: 1,
-    // reserved: 4, available: 1, _long: 1,
-    // _default: 1, granularity: 1
+    pub attributes: SegmentRegisterAttributeFlags,
 }
 
 impl HvX64SegmentRegister {
@@ -183,9 +177,12 @@ impl HvX64SegmentRegister {
         }
     }
 
-    #[expect(clippy::used_underscore_binding)]
-    pub fn set_attributes(&mut self, attrs: u16) {
-        self._attributes = attrs;
+    pub fn set_attributes(&mut self, attrs: SegmentRegisterAttributeFlags) {
+        self.attributes = attrs;
+    }
+
+    pub fn get_attributes(&self) -> SegmentRegisterAttributeFlags {
+        self.attributes
     }
 }
 
@@ -258,11 +255,6 @@ impl HvInputVtl {
     /// Gets the target VTL as a u8 value
     pub fn target_vtl_value(&self) -> u8 {
         self.target_vtl() as u8
-    }
-
-    /// Sets the target VTL from a u8 value
-    pub fn set_target_vtl_value(&mut self, target_vtl: u8) {
-        self.set_target_vtl(target_vtl.into());
     }
 }
 
@@ -390,13 +382,6 @@ pub struct HvNestedEnlightenmentsControlFeatures {
     __: B31,
 }
 
-impl HvNestedEnlightenmentsControlFeatures {
-    /// Set direct hypercall flag from u32 (for compatibility)
-    pub fn set_direct_hypercall_u32(&mut self, direct_hypercall: u32) {
-        self.set_direct_hypercall(direct_hypercall != 0);
-    }
-}
-
 #[bitfield]
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -404,13 +389,6 @@ pub struct HvNestedEnlightenmentsControlHypercallControls {
     pub inter_partition_comm: bool,
     #[skip]
     __: B31,
-}
-
-impl HvNestedEnlightenmentsControlHypercallControls {
-    /// Set inter partition comm flag from u32 (for compatibility)
-    pub fn set_inter_partition_comm_u32(&mut self, inter_partition_comm: u32) {
-        self.set_inter_partition_comm(inter_partition_comm != 0);
-    }
 }
 
 #[expect(non_snake_case)]
@@ -523,16 +501,6 @@ impl HvRegisterVsmVpSecureVtlConfig {
     pub fn as_u64(&self) -> u64 {
         u64::from_le_bytes(self.into_bytes())
     }
-
-    /// Enable MBEC (for compatibility)
-    pub fn set_mbec_enabled_flag(&mut self) {
-        self.set_mbec_enabled(true);
-    }
-
-    /// Enable TLB locked (for compatibility)
-    pub fn set_tlb_locked_flag(&mut self) {
-        self.set_tlb_locked(true);
-    }
 }
 
 #[bitfield]
@@ -563,11 +531,6 @@ impl HvRegisterVsmPartitionConfig {
     /// Create from a u64 value for compatibility with existing code  
     pub fn from_u64(value: u64) -> Self {
         Self::from_bytes(value.to_le_bytes())
-    }
-
-    /// Set the default VTL protection mask from a u64 value
-    pub fn set_default_vtl_protection_mask_value(&mut self, mask: u64) {
-        self.set_default_vtl_protection_mask((mask as u8).into());
     }
 
     /// Get the default VTL protection mask as a u64 value
@@ -756,26 +719,6 @@ impl HvSynicSint {
     pub fn as_uint64(&self) -> u64 {
         u64::from_le_bytes(self.into_bytes())
     }
-
-    /// Set vector from u64 (for compatibility)
-    pub fn set_vector_u64(&mut self, vector: u64) {
-        self.set_vector((vector as u8).into());
-    }
-
-    /// Set masked flag (for compatibility)
-    pub fn set_masked_flag(&mut self) {
-        self.set_masked(true);
-    }
-
-    /// Set auto_eoi flag (for compatibility)
-    pub fn set_auto_eoi_flag(&mut self) {
-        self.set_auto_eoi(true);
-    }
-
-    /// Set polling flag (for compatibility)
-    pub fn set_polling_flag(&mut self) {
-        self.set_polling(true);
-    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -868,31 +811,6 @@ impl HvPendingExceptionEvent {
     pub fn as_u64(&self) -> u64 {
         u64::from_le_bytes(self.into_bytes())
     }
-
-    /// Set event pending flag (for compatibility)
-    pub fn set_event_pending_flag(&mut self) {
-        self.set_event_pending(true);
-    }
-
-    /// Set event type from u64 (for compatibility)
-    pub fn set_event_type_u64(&mut self, event_type: u64) {
-        self.set_event_type((event_type as u8).into());
-    }
-
-    /// Set deliver error code flag (for compatibility)
-    pub fn set_deliver_error_code_flag(&mut self) {
-        self.set_deliver_error_code(true);
-    }
-
-    /// Set vector from u64 (for compatibility)
-    pub fn set_vector_u64(&mut self, vector: u64) {
-        self.set_vector((vector as u16).into());
-    }
-
-    /// Set error code from u64 (for compatibility)
-    pub fn set_error_code_u64(&mut self, error_code: u64) {
-        self.set_error_code((error_code as u32).into());
-    }
 }
 
 #[cfg(test)]
@@ -914,7 +832,7 @@ mod tests {
         
         // Test individual field manipulation
         let mut vtl = HvInputVtl::new();
-        vtl.set_target_vtl_value(10);
+        vtl.set_target_vtl(10_u8.into());
         vtl.set_use_target_vtl(true);
         assert_eq!(vtl.target_vtl_value(), 10);
         assert_eq!(vtl.use_target_vtl(), true);
@@ -949,7 +867,7 @@ mod tests {
         assert_eq!(config.intercept_page(), true);
         
         // Test the 4-bit protection mask field
-        config.set_default_vtl_protection_mask_value(0b1010);
+        config.set_default_vtl_protection_mask((0b1010_u8).into());
         assert_eq!(config.default_vtl_protection_mask_value(), 0b1010);
         
         // Test size - should be 8 bytes (64 bits)
@@ -991,12 +909,12 @@ mod tests {
         features.set_direct_hypercall(true);
         assert_eq!(features.direct_hypercall(), true);
         
-        // Test compatibility method
+        // Test direct method
         let mut features2 = HvNestedEnlightenmentsControlFeatures::new();
-        features2.set_direct_hypercall_u32(1);
+        features2.set_direct_hypercall(true);
         assert_eq!(features2.direct_hypercall(), true);
         
-        features2.set_direct_hypercall_u32(0);
+        features2.set_direct_hypercall(false);
         assert_eq!(features2.direct_hypercall(), false);
         
         // Test size - should be 4 bytes (32 bits)
@@ -1017,12 +935,12 @@ mod tests {
         controls.set_inter_partition_comm(true);
         assert_eq!(controls.inter_partition_comm(), true);
         
-        // Test compatibility method
+        // Test direct method
         let mut controls2 = HvNestedEnlightenmentsControlHypercallControls::new();
-        controls2.set_inter_partition_comm_u32(1);
+        controls2.set_inter_partition_comm(true);
         assert_eq!(controls2.inter_partition_comm(), true);
         
-        controls2.set_inter_partition_comm_u32(0);
+        controls2.set_inter_partition_comm(false);
         assert_eq!(controls2.inter_partition_comm(), false);
         
         // Test size - should be 4 bytes (32 bits)
@@ -1046,12 +964,12 @@ mod tests {
         config.set_tlb_locked(true);
         assert_eq!(config.tlb_locked(), true);
         
-        // Test compatibility methods
+        // Test direct methods
         let mut config2 = HvRegisterVsmVpSecureVtlConfig::new();
-        config2.set_mbec_enabled_flag();
+        config2.set_mbec_enabled(true);
         assert_eq!(config2.mbec_enabled(), true);
         
-        config2.set_tlb_locked_flag();
+        config2.set_tlb_locked(true);
         assert_eq!(config2.tlb_locked(), true);
         
         // Test size - should be 8 bytes (64 bits)
@@ -1088,18 +1006,18 @@ mod tests {
         sint.set_polling(true);
         assert_eq!(sint.polling(), true);
         
-        // Test compatibility methods
+        // Test direct methods
         let mut sint2 = HvSynicSint::new();
-        sint2.set_vector_u64(0xf3);
+        sint2.set_vector((0xf3_u8).into());
         assert_eq!(sint2.vector() as u8, 0xf3);
         
-        sint2.set_masked_flag();
+        sint2.set_masked(true);
         assert_eq!(sint2.masked(), true);
         
-        sint2.set_auto_eoi_flag();
+        sint2.set_auto_eoi(true);
         assert_eq!(sint2.auto_eoi(), true);
         
-        sint2.set_polling_flag();
+        sint2.set_polling(true);
         assert_eq!(sint2.polling(), true);
         
         // Test size - should be 8 bytes (64 bits)
@@ -1140,21 +1058,21 @@ mod tests {
         exception.set_error_code(0x87654321_u32.into());  // 32 bits
         assert_eq!(exception.error_code() as u32, 0x87654321);
         
-        // Test compatibility methods
+        // Test direct methods
         let mut exception2 = HvPendingExceptionEvent::new();
-        exception2.set_event_pending_flag();
+        exception2.set_event_pending(true);
         assert_eq!(exception2.event_pending(), true);
         
-        exception2.set_deliver_error_code_flag();
+        exception2.set_deliver_error_code(true);
         assert_eq!(exception2.deliver_error_code(), true);
         
-        exception2.set_event_type_u64(7);
+        exception2.set_event_type((7_u8).into());
         assert_eq!(exception2.event_type() as u8, 7);
         
-        exception2.set_vector_u64(0xabcd);
+        exception2.set_vector((0xabcd_u16).into());
         assert_eq!(exception2.vector() as u16, 0xabcd);
         
-        exception2.set_error_code_u64(0x12345678);
+        exception2.set_error_code((0x12345678_u32).into());
         assert_eq!(exception2.error_code() as u32, 0x12345678);
         
         // Test size - should be 8 bytes (64 bits)

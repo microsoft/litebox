@@ -167,8 +167,8 @@ pub fn mshv_vsm_secure_config_vtl0() -> Result<i64, Errno> {
     debug_serial_println!("VSM: Secure VTL0 configuration");
 
     let mut config = HvRegisterVsmVpSecureVtlConfig::new();
-    config.set_mbec_enabled_flag();
-    config.set_tlb_locked_flag();
+    config.set_mbec_enabled(true);
+    config.set_tlb_locked(true);
 
     hvcall_set_vp_registers(HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, config.as_u64())
         .map_err(|_| Errno::EFAULT)?;
@@ -181,7 +181,7 @@ pub fn mshv_vsm_configure_partition() -> Result<i64, Errno> {
     debug_serial_println!("VSM: Configure partition");
 
     let mut config = HvRegisterVsmPartitionConfig::new();
-    config.set_default_vtl_protection_mask_value(HvPageProtFlags::HV_PAGE_FULL_ACCESS.bits().into());
+    config.set_default_vtl_protection_mask((HvPageProtFlags::HV_PAGE_FULL_ACCESS.bits() as u8).into());
     config.set_enable_vtl_protection(true);
 
     hvcall_set_vp_registers(HV_REGISTER_VSM_PARTITION_CONFIG, config.as_u64())

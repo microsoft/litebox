@@ -142,22 +142,22 @@ fn hv_vtl_populate_vp_context(input: &mut HvEnableVpVtl, tss: u64, rip: u64, rsp
     // We only support 64-bit long mode for now, so most of the segment register fields are ignored.
     input.vp_context.cs.selector = SegmentSelector::new(1, PrivilegeLevel::Ring0).0;
     input.vp_context.cs.set_attributes(
-        SegmentRegisterAttributeFlags::ACCESSED.bits()
-            | SegmentRegisterAttributeFlags::WRITABLE.bits()
-            | SegmentRegisterAttributeFlags::EXECUTABLE.bits()
-            | SegmentRegisterAttributeFlags::USER_SEGMENT.bits()
-            | SegmentRegisterAttributeFlags::PRESENT.bits()
-            | SegmentRegisterAttributeFlags::AVAILABLE.bits()
-            | SegmentRegisterAttributeFlags::LONG_MODE.bits(),
+        SegmentRegisterAttributeFlags::ACCESSED
+            | SegmentRegisterAttributeFlags::WRITABLE
+            | SegmentRegisterAttributeFlags::EXECUTABLE
+            | SegmentRegisterAttributeFlags::USER_SEGMENT
+            | SegmentRegisterAttributeFlags::PRESENT
+            | SegmentRegisterAttributeFlags::AVAILABLE
+            | SegmentRegisterAttributeFlags::LONG_MODE,
     );
 
     input.vp_context.ss.selector = SegmentSelector::new(2, PrivilegeLevel::Ring0).0;
     input.vp_context.ss.set_attributes(
-        SegmentRegisterAttributeFlags::ACCESSED.bits()
-            | SegmentRegisterAttributeFlags::WRITABLE.bits()
-            | SegmentRegisterAttributeFlags::USER_SEGMENT.bits()
-            | SegmentRegisterAttributeFlags::PRESENT.bits()
-            | SegmentRegisterAttributeFlags::AVAILABLE.bits(),
+        SegmentRegisterAttributeFlags::ACCESSED
+            | SegmentRegisterAttributeFlags::WRITABLE
+            | SegmentRegisterAttributeFlags::USER_SEGMENT
+            | SegmentRegisterAttributeFlags::PRESENT
+            | SegmentRegisterAttributeFlags::AVAILABLE,
     );
 
     input.vp_context.tr.selector = SegmentSelector::new(3, PrivilegeLevel::Ring0).0;
@@ -165,10 +165,10 @@ fn hv_vtl_populate_vp_context(input: &mut HvEnableVpVtl, tss: u64, rip: u64, rsp
     input.vp_context.tr.limit =
         u32::try_from(core::mem::size_of::<TaskStateSegment>()).unwrap() - 1;
     input.vp_context.tr.set_attributes(
-        SegmentRegisterAttributeFlags::ACCESSED.bits()
-            | SegmentRegisterAttributeFlags::WRITABLE.bits()
-            | SegmentRegisterAttributeFlags::EXECUTABLE.bits()
-            | SegmentRegisterAttributeFlags::PRESENT.bits(),
+        SegmentRegisterAttributeFlags::ACCESSED
+            | SegmentRegisterAttributeFlags::WRITABLE
+            | SegmentRegisterAttributeFlags::EXECUTABLE
+            | SegmentRegisterAttributeFlags::PRESENT,
     );
 }
 
