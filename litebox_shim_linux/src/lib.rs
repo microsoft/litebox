@@ -598,6 +598,27 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
             new_limit,
             old_limit,
         } => syscalls::process::sys_prlimit(pid, resource, new_limit, old_limit).map(|()| 0),
+        SyscallRequest::SetRobustList { head } => {
+            syscalls::process::sys_set_robust_list(head);
+            Ok(0)
+        }
+        SyscallRequest::GetRobustList { pid, head, len } => {
+            syscalls::process::sys_get_robust_list(pid, head)
+                .and_then(|()| {
+                    unsafe {
+                        len.write_at_offset(
+                            0,
+                            size_of::<
+                                litebox_common_linux::RobustListHead<
+                                    litebox_platform_multiplex::Platform,
+                                >,
+                            >(),
+                        )
+                    }
+                    .ok_or(Errno::EFAULT)
+                })
+                .map(|()| 0)
+        }
         SyscallRequest::GetRandom { buf, count, flags } => {
             syscalls::misc::sys_getrandom(buf, count, flags)
         }

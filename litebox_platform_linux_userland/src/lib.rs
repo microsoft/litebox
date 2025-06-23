@@ -188,6 +188,7 @@ impl LinuxUserland {
         let task = alloc::boxed::Box::new(litebox_common_linux::Task {
             tid: i32::try_from(tid).expect("tid should fit in i32"),
             clear_child_tid: None,
+            robust_list: None,
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         self.set_thread_local_storage(tls);

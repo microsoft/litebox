@@ -1,5 +1,7 @@
 //! Process/thread related syscalls.
 
+use core::mem::offset_of;
+
 use alloc::boxed::Box;
 use litebox::platform::{ExitProvider as _, RawMutPointer, ThreadProvider};
 use litebox::platform::{
@@ -115,6 +117,78 @@ fn futex_wake(addr: MutPtr<i32>) {
     });
 }
 
+const ROBUST_LIST_LIMIT: isize = 2048;
+
+/*
+ * Process a futex-list entry, check whether it's owned by the
+ * dying task, and do notification if so:
+ */
+fn handle_futex_death(
+    futex_addr: crate::ConstPtr<u32>,
+    pi: bool,
+    pending_op: bool,
+) -> Result<(), Errno> {
+    if futex_addr.as_usize() % 4 != 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    todo!("handle_futex_death is not implemented yet");
+}
+
+fn fetch_robust_entry(
+    head: crate::ConstPtr<litebox_common_linux::RobustList<litebox_platform_multiplex::Platform>>,
+) -> (
+    crate::ConstPtr<litebox_common_linux::RobustList<litebox_platform_multiplex::Platform>>,
+    bool,
+) {
+    let next = head.as_usize();
+    (crate::ConstPtr::from_usize(next & !1), next & 1 != 0)
+}
+
+fn wake_robust_list(
+    head: crate::ConstPtr<
+        litebox_common_linux::RobustListHead<litebox_platform_multiplex::Platform>,
+    >,
+) -> Result<(), Errno> {
+    let mut limit = ROBUST_LIST_LIMIT;
+    let head_ptr = head.as_usize();
+    let head = unsafe { head.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+    let (mut entry, mut pi) = fetch_robust_entry(head.list.next);
+    let (pending, ppi) = fetch_robust_entry(head.list_op_pending);
+    let futex_offset = head.futex_offset;
+    let entry_head = head_ptr
+        + offset_of!(
+            litebox_common_linux::RobustListHead<litebox_platform_multiplex::Platform>,
+            list
+        );
+    while entry.as_usize() != entry_head && limit > 0 {
+        let nxt = unsafe { entry.read_at_offset(0) }.map(|e| fetch_robust_entry(e.next));
+        if entry.as_usize() != pending.as_usize() {
+            handle_futex_death(
+                crate::ConstPtr::from_usize(entry.as_usize() + futex_offset),
+                pi,
+                false,
+            )?;
+        }
+        let Some((next_entry, next_pi)) = nxt else {
+            return Err(Errno::EFAULT);
+        };
+
+        entry = next_entry;
+        pi = next_pi;
+        limit -= 1;
+    }
+
+    if pending.as_usize() != 0 {
+        let _ = handle_futex_death(
+            crate::ConstPtr::from_usize(pending.as_usize() + futex_offset),
+            ppi,
+            true,
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn sys_exit(status: i32) -> ! {
     let mut tls = litebox_platform_multiplex::platform().release_thread_local_storage();
     if let Some(clear_child_tid) = tls.current_task.clear_child_tid.take() {
@@ -122,6 +196,9 @@ pub(crate) fn sys_exit(status: i32) -> ! {
         // TODO: if we are the last thread, we don't need to clear it
         let _ = unsafe { clear_child_tid.write_at_offset(0, 0) };
         futex_wake(clear_child_tid);
+    }
+    if let Some(robust_list) = tls.current_task.robust_list.take() {
+        let _ = wake_robust_list(robust_list);
     }
 
     litebox_platform_multiplex::platform().terminate_thread(status)
@@ -232,6 +309,7 @@ pub(crate) fn sys_clone(
                     } else {
                         None
                     },
+                    robust_list: None,
                 }),
                 callback: new_thread_callback,
             }),
@@ -337,6 +415,31 @@ pub(crate) fn sys_setrlimit(
         .into_owned();
     let _ = do_prlimit(None, resource, Some(new_limit));
     Ok(())
+}
+
+/// Handle syscall `set_robust_list`.
+pub(crate) fn sys_set_robust_list(
+    head: crate::ConstPtr<
+        litebox_common_linux::RobustListHead<litebox_platform_multiplex::Platform>,
+    >,
+) {
+    litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| {
+        tls.current_task.robust_list = Some(head);
+    });
+}
+
+/// Handle syscall `get_robust_list`.
+pub(crate) fn sys_get_robust_list(
+    pid: Option<i32>,
+    head_ptr: crate::MutPtr<usize>,
+) -> Result<(), Errno> {
+    if pid.is_some() {
+        unimplemented!("Getting robust list for a specific PID is not supported yet");
+    }
+    let head = litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| {
+        tls.current_task.robust_list.map_or(0, |ptr| ptr.as_usize())
+    });
+    unsafe { head_ptr.write_at_offset(0, head) }.ok_or(Errno::EFAULT)
 }
 
 #[cfg(test)]
