@@ -58,18 +58,8 @@ impl_truncate! { i32, i16 }
 impl_truncate! { i32, i8 }
 impl_truncate! { i16, i8 }
 
-macro_rules! impl_truncate_same {
-    ($ty:ty) => {
-        impl TruncateExt<$ty> for $ty {
-            #[inline(always)]
-            fn truncate(self) -> $ty {
-                self
-            }
-        }
-    };
-}
-impl_truncate_same! { u32 }
-impl_truncate_same! { i32 }
+impl_truncate! { u32, u32 }
+impl_truncate! { i32, i32 }
 
 /// An extension trait that adds `reinterpret_as_signed` to unsigned integers.
 pub trait ReinterpretSignedExt {

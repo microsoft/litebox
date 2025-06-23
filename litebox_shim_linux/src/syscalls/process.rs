@@ -1,6 +1,8 @@
 //! Process/thread related syscalls.
 
 use alloc::boxed::Box;
+#[cfg(target_arch = "x86_64")]
+use litebox::platform::RawConstPointer;
 use litebox::platform::{ExitProvider as _, RawMutPointer, ThreadProvider};
 use litebox::platform::{
     PunchthroughProvider as _, PunchthroughToken as _, ThreadLocalStorageProvider as _,
@@ -134,6 +136,7 @@ extern "C" fn new_thread_callback(
     args: &litebox_common_linux::NewThreadArgs<litebox_platform_multiplex::Platform>,
 ) {
     let task = Box::new(litebox_common_linux::Task {
+        // Assume the underlying platform will handle the thread ID allocation
         tid: args.child_tid,
         clear_child_tid: args.clear_child_tid,
     });
@@ -148,7 +151,7 @@ extern "C" fn new_thread_callback(
         set_thread_area(tls);
 
         #[cfg(target_arch = "x86_64")]
-        sys_arch_prctl(ArchPrctlArg::SetFs(tls));
+        sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()));
     }
 
     if let Some(set_child_tid) = args.set_child_tid {
@@ -207,7 +210,7 @@ pub(crate) fn sys_clone(
     let child_tid = unsafe {
         platform.spawn_thread(
             ctx,
-            stack,
+            stack.expect("Stack pointer is required for thread creation"),
             stack_size,
             main,
             Box::new(litebox_common_linux::NewThreadArgs {
@@ -283,7 +286,7 @@ mod tests {
         let ptr = crate::MutPtr {
             inner: new_fs_base.as_mut_ptr(),
         };
-        sys_arch_prctl(ArchPrctlArg::SetFs(ptr)).expect("Failed to set FS base");
+        sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize())).expect("Failed to set FS base");
 
         // Verify new FS base
         let mut current_fs_base = MaybeUninit::<usize>::uninit();
@@ -295,8 +298,8 @@ mod tests {
         assert_eq!(current_fs_base, new_fs_base.as_ptr() as usize);
 
         // Restore old FS base
-        let ptr = crate::MutPtr::from_usize(old_fs_base);
-        sys_arch_prctl(ArchPrctlArg::SetFs(ptr)).expect("Failed to restore FS base");
+        let ptr: crate::MutPtr<u8> = crate::MutPtr::from_usize(old_fs_base);
+        sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize())).expect("Failed to restore FS base");
     }
 
     static mut TLS: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
@@ -356,7 +359,7 @@ mod tests {
             rdx: 0,
             rsi: 0,
             rdi: 0,
-            orig_rax: syscalls::Sysno::clone3 as u64,
+            orig_rax: syscalls::Sysno::clone3 as usize,
             rip: 0,
             cs: 0x33, // __USER_CS
             eflags: 0,
@@ -376,7 +379,7 @@ mod tests {
             xes: 0,
             xfs: 0,
             xgs: 0,
-            orig_eax: syscalls::Sysno::clone3 as u32,
+            orig_eax: syscalls::Sysno::clone3 as usize,
             eip: 0,
             xcs: 0x23, // __USER_CS
             eflags: 0,

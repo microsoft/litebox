@@ -51,9 +51,7 @@ pub trait ExitProvider: Sized {
 }
 
 /// Thread management provider.
-pub trait ThreadProvider: RawPointerProvider {
-    /// Exit code for [`ThreadProvider::terminate_thread`].
-    type ExitCode;
+pub trait ThreadProvider: RawPointerProvider + ExitProvider {
     /// Execution context for the current thread of the guest program.
     type ExecutionContext;
     /// Arguments to the callback function for the new thread.
@@ -61,17 +59,17 @@ pub trait ThreadProvider: RawPointerProvider {
     /// Error type for [`ThreadProvider::spawn_thread`].
     type ThreadSpawnError: core::error::Error;
     /// Thread identifier type for the spawned thread.
-    type ThreadId: Send + 'static;
+    type ThreadId: Clone + Send + Sync + 'static;
 
     /// Spawn a new thread with the given entry point.
     ///
-    /// `stack` is an optional pointer to the stack for the new thread, and `stack_size` is the
-    /// size of the stack.
+    /// `stack` is a pointer to the stack for the new thread, and `stack_size` is the size of the stack.
     ///
-    /// `entry_point` is the address of the first instruction that will be executed in the new thread.
+    /// `entry_point` is the address of the first instruction in the guest program that will be executed
+    /// in the new thread.
     ///
     /// `new_thread_callback` would be invoked with the given `thread_args` in the new thread after
-    /// it is spawned.
+    /// it is spawned, allowing the upper shim layers to perform any necessary initialization
     ///
     /// # Safety
     ///
@@ -79,7 +77,7 @@ pub trait ThreadProvider: RawPointerProvider {
     unsafe fn spawn_thread(
         &self,
         ctx: &Self::ExecutionContext,
-        stack: Option<<Self as RawPointerProvider>::RawMutPointer<u8>>,
+        stack: <Self as RawPointerProvider>::RawMutPointer<u8>,
         stack_size: usize,
         entry_point: usize,
         thread_args: alloc::boxed::Box<Self::ThreadArgs>,

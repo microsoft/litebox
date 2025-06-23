@@ -295,7 +295,6 @@ extern "C" fn thread_start(
 }
 
 impl litebox::platform::ThreadProvider for LinuxUserland {
-    type ExitCode = i32;
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadArgs = litebox_common_linux::NewThreadArgs<LinuxUserland>;
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
@@ -304,7 +303,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
     unsafe fn spawn_thread(
         &self,
         ctx: &litebox_common_linux::PtRegs,
-        stack: Option<TransparentMutPtr<u8>>,
+        stack: TransparentMutPtr<u8>,
         stack_size: usize,
         entry_point: usize,
         thread_args: Box<Self::ThreadArgs>,
@@ -332,7 +331,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
                 ) as u64,
             parent_tid: 0,
             exit_signal: 0,
-            stack: stack.map_or(0, |ptr| ptr.as_usize() as u64),
+            stack: stack.as_usize() as u64,
             stack_size: stack_size as u64,
             tls: 0,
             set_tid: 0,
@@ -908,7 +907,7 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
             }
             #[cfg(target_arch = "x86_64")]
             PunchthroughSyscall::SetFsBase { addr } => {
-                set_fs_base(addr.as_usize()).map_err(litebox::platform::PunchthroughError::Failure)
+                set_fs_base(addr).map_err(litebox::platform::PunchthroughError::Failure)
             }
             #[cfg(target_arch = "x86_64")]
             PunchthroughSyscall::GetFsBase { addr } => {
