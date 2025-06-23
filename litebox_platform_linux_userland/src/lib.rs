@@ -240,6 +240,14 @@ extern "C" fn thread_start(
     let copied = *pt_regs;
     drop(pt_regs);
 
+    // Reset TLS for the new thread
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        litebox_common_linux::wrgsbase(0);
+    }
+    #[cfg(target_arch = "x86")]
+    LinuxUserland::set_fs_selector(0);
+
     // Allow caller to run some code before we return to the new thread.
     let thread_args = unsafe { alloc::boxed::Box::from_raw(thread_args) };
     cb(&thread_args);
@@ -1502,6 +1510,17 @@ impl LinuxUserland {
         }
         addr as *mut litebox_common_linux::ThreadLocalStorage<LinuxUserland>
     }
+
+    #[cfg(target_arch = "x86")]
+    fn set_fs_selector(fss: u16) {
+        unsafe {
+            core::arch::asm!(
+                "mov fs, {0:x}",
+                in(reg) fss,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
 }
 
 /// Similar to libc, we use fs/gs registers to store thread-local storage (TLS).
@@ -1548,14 +1567,7 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
         set_thread_area(user_desc_ptr).expect("Failed to set thread area for TLS");
 
         let new_fs_selector = ((user_desc.entry_number & 0xfff) << 3) | 0x3; // user mode
-        // set fs selector
-        unsafe {
-            core::arch::asm!(
-                "mov fs, {0:x}",
-                in(reg) new_fs_selector,
-                options(nostack, preserves_flags)
-            );
-        }
+        Self::set_fs_selector(new_fs_selector.truncate());
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1575,13 +1587,7 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
         let tls = Self::get_thread_local_storage();
         assert!(!tls.is_null(), "TLS must be set before releasing it");
-        unsafe {
-            core::arch::asm!(
-                "mov fs, {0}",
-                in(reg) 0,
-                options(nostack, preserves_flags)
-            );
-        }
+        Self::set_fs_selector(0); // reset fs selector
 
         let tls = unsafe { Box::from_raw(tls) };
         assert!(!tls.borrowed, "TLS must not be borrowed when releasing it");

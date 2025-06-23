@@ -1,8 +1,6 @@
 //! Process/thread related syscalls.
 
 use alloc::boxed::Box;
-#[cfg(target_arch = "x86_64")]
-use litebox::platform::RawConstPointer;
 use litebox::platform::{ExitProvider as _, RawMutPointer, ThreadProvider};
 use litebox::platform::{
     PunchthroughProvider as _, PunchthroughToken as _, ThreadLocalStorageProvider as _,
@@ -151,7 +149,10 @@ extern "C" fn new_thread_callback(
         set_thread_area(tls);
 
         #[cfg(target_arch = "x86_64")]
-        sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()));
+        {
+            use litebox::platform::RawConstPointer as _;
+            sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()));
+        }
     }
 
     if let Some(set_child_tid) = args.set_child_tid {
