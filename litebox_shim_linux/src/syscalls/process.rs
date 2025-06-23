@@ -3,8 +3,6 @@
 use core::mem::offset_of;
 
 use alloc::boxed::Box;
-#[cfg(target_arch = "x86_64")]
-use litebox::platform::RawConstPointer;
 use litebox::platform::{ExitProvider as _, RawMutPointer, ThreadProvider};
 use litebox::platform::{
     PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _,
