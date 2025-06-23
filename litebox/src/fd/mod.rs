@@ -296,3 +296,32 @@ impl Drop for OwnedFd {
         }
     }
 }
+
+/// Enable FD support for a particular subsystem conveniently
+#[doc(hidden)]
+macro_rules! enable_fds_for_subsystem {
+    (
+        $(@ $($sys_param:ident $(: { $($sys_constraint:tt)* })?),*;)?
+        $system:ty;
+        $(@ $($ent_param:ident $(: { $($ent_constraint:tt)* })?),*;)?
+        $entry:ty;
+    ) => {
+        #[allow(unused, reason = "NOTE(jayb): remove this lint before merging the PR")]
+        #[doc(hidden)]
+        // This wrapper type exists just to make sure `$entry` itself is not public, but we can
+        // still satisfy requirements for `FdEnabledSubsystem`.
+        pub struct DescriptorEntry $(< $($ent_param $(: $($ent_constraint)*)?),* >)? {
+            entry: $entry,
+        }
+        impl $(< $($sys_param $(: $($sys_constraint)*)?),* >)? $crate::fd::FdEnabledSubsystem
+            for $system
+        {
+            type Entry = DescriptorEntry $(< $($ent_param),* >)?;
+        }
+        impl $(< $($ent_param $(: $($ent_constraint)*)?),* >)? $crate::fd::FdEnabledSubsystemEntry
+            for DescriptorEntry $(< $($ent_param),* >)?
+        {
+        }
+    };
+}
+pub(crate) use enable_fds_for_subsystem;

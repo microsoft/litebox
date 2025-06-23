@@ -147,3 +147,9 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
         todo!()
     }
 }
+
+crate::fd::enable_fds_for_subsystem! {
+    @Platform: { platform::Provider + 'static };
+    FileSystem<Platform>;
+    ();
+}

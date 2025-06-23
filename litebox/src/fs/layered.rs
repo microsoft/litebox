@@ -988,3 +988,9 @@ enum EntryX {
     // this is marked as deleted. RIP (x_x)
     Tombstone,
 }
+
+crate::fd::enable_fds_for_subsystem! {
+    @Platform: { sync::RawSyncPrimitivesProvider }, Upper: { super::FileSystem }, Lower: { super::FileSystem };
+    FileSystem<Platform, Upper, Lower>;
+    Descriptor;
+}

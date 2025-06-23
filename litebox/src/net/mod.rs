@@ -1048,3 +1048,9 @@ pub enum TcpOptionData {
     NODELAY(bool),
     KEEPALIVE(Option<core::time::Duration>),
 }
+
+crate::fd::enable_fds_for_subsystem! {
+    @Platform: { platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider };
+    Network<Platform>;
+    SocketHandle;
+}
