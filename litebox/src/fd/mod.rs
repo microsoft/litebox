@@ -16,7 +16,7 @@ use core::marker::PhantomData;
 use thiserror::Error;
 
 use crate::LiteBox;
-use crate::sync::RawSyncPrimitivesProvider;
+use crate::sync::{RawSyncPrimitivesProvider, RwLock};
 
 /// Storage of file descriptors and their entries.
 ///
@@ -26,7 +26,7 @@ use crate::sync::RawSyncPrimitivesProvider;
 /// conversion.
 pub struct Descriptors<Platform: RawSyncPrimitivesProvider> {
     litebox: LiteBox<Platform>,
-    entries: Vec<Option<Arc<DescriptorEntry>>>,
+    entries: Vec<Option<Arc<RwLock<Platform, DescriptorEntry>>>>,
     /// Stored FDs are used to provide raw integer values in a safer way.
     stored_fds: Vec<Option<OwnedFd>>,
 }
@@ -54,7 +54,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 self.entries.push(None);
                 self.entries.len() - 1
             });
-        let old = self.entries[idx].replace(Arc::new(entry));
+        let old = self.entries[idx].replace(Arc::new(self.litebox.sync().new_rwlock(entry)));
         assert!(old.is_none());
         OwnedFd::new(idx)
     }
@@ -68,21 +68,33 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             unreachable!();
         };
         fd.mark_as_closed();
-        Arc::into_inner(old)
+        Arc::into_inner(old).map(RwLock::into_inner)
     }
 
-    /// Get the entry at `fd`.
-    pub(crate) fn get<Subsystem: FdEnabledSubsystem>(
-        &self,
-        fd: &TypedFd<Subsystem>,
-    ) -> impl core::ops::Deref<Target = Subsystem::Entry> {
+    /// Use the entry at `fd` as read-only.
+    pub(crate) fn with_entry<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> R
+    where
+        Subsystem: FdEnabledSubsystem,
+        F: FnOnce(&Subsystem::Entry) -> R,
+    {
         // Since the typed FD should not have been created unless we had the correct subsystem in
         // the first place, none of this should panic---if it does, someone has done a bad transmute
         // somewhere.
-        self.entries[fd.x.as_usize()]
-            .as_ref()
-            .unwrap()
-            .as_subsystem::<Subsystem>()
+        let entry = self.entries[fd.x.as_usize()].as_ref().unwrap().read();
+        f(entry.as_subsystem::<Subsystem>())
+    }
+
+    /// Use the entry at `fd` as mutably.
+    pub(crate) fn with_entry_mut<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> R
+    where
+        Subsystem: FdEnabledSubsystem,
+        F: FnOnce(&mut Subsystem::Entry) -> R,
+    {
+        // Since the typed FD should not have been created unless we had the correct subsystem in
+        // the first place, none of this should panic---if it does, someone has done a bad transmute
+        // somewhere.
+        let mut entry = self.entries[fd.x.as_usize()].as_ref().unwrap().write();
+        f(entry.as_subsystem_mut::<Subsystem>())
     }
 
     /// Get the corresponding integer value of the provided `fd`.
@@ -97,7 +109,10 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         fd: TypedFd<Subsystem>,
     ) -> usize {
         let raw = fd.x.as_usize();
-        debug_assert_eq!(self.entries[raw].as_ref().unwrap().kind(), Subsystem::KIND);
+        debug_assert_eq!(
+            self.entries[raw].as_ref().unwrap().read().kind(),
+            Subsystem::KIND
+        );
         if self.stored_fds.len() <= raw {
             self.stored_fds.resize_with(raw + 1, || None);
         }
@@ -123,7 +138,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         let Some(Some(entry)) = self.entries.get(fd) else {
             return Err(ErrRawIntFd::NotFound);
         };
-        if entry.kind() != Subsystem::KIND {
+        if entry.read().kind() != Subsystem::KIND {
             return Err(ErrRawIntFd::InvalidSubsystem);
         }
         let Some(Some(stored_fd)) = self.stored_fds.get(fd) else {
@@ -152,7 +167,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         let Some(Some(entry)) = self.entries.get(fd) else {
             return Err(ErrRawIntFd::NotFound);
         };
-        if entry.kind() != Subsystem::KIND {
+        if entry.read().kind() != Subsystem::KIND {
             return Err(ErrRawIntFd::InvalidSubsystem);
         }
         let Some(stored_fd) = self.stored_fds.get_mut(fd) else {
@@ -220,6 +235,23 @@ impl DescriptorEntry {
         }
         // SAFETY: We just confirmed they are the same type.
         unsafe { &*core::ptr::from_ref(self.entry.as_ref()).cast() }
+    }
+
+    /// Obtains `self` as the subsystem's entry type, mutably.
+    ///
+    /// Panics if invalid for the particular subsystem.
+    fn as_subsystem_mut<Subsystem: FdEnabledSubsystem>(&mut self) -> &mut Subsystem::Entry {
+        if core::any::TypeId::of::<&mut Subsystem::Entry>()
+            != core::any::Any::type_id(self.entry.as_mut())
+        {
+            unreachable!(
+                "\
+                The types in `FdEnabledSubsystem` must be perfectly \
+                in sync with `DescriptorEntry`."
+            )
+        }
+        // SAFETY: We just confirmed they are the same type.
+        unsafe { &mut *core::ptr::from_mut(self.entry.as_mut()).cast() }
     }
 }
 
