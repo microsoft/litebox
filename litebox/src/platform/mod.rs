@@ -54,7 +54,7 @@ pub trait ExitProvider: Sized {
 pub trait ThreadProvider: RawPointerProvider + ExitProvider {
     /// Execution context for the current thread of the guest program.
     type ExecutionContext;
-    /// Arguments to the callback function for the new thread.
+    /// Platform-specific argument needed for the new thread to start
     type ThreadArgs;
     /// Error type for [`ThreadProvider::spawn_thread`].
     type ThreadSpawnError: core::error::Error;
@@ -68,8 +68,7 @@ pub trait ThreadProvider: RawPointerProvider + ExitProvider {
     /// `entry_point` is the address of the first instruction in the guest program that will be executed
     /// in the new thread.
     ///
-    /// `new_thread_callback` would be invoked with the given `thread_args` in the new thread after
-    /// it is spawned, allowing the upper shim layers to perform any necessary initialization
+    /// `thread_args` is the additional platform-specific argument needed for the new thread to start
     ///
     /// # Safety
     ///
