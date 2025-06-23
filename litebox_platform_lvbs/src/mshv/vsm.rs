@@ -167,8 +167,8 @@ pub fn mshv_vsm_secure_config_vtl0() -> Result<i64, Errno> {
     debug_serial_println!("VSM: Secure VTL0 configuration");
 
     let mut config = HvRegisterVsmVpSecureVtlConfig::new();
-    config.set_mbec_enabled();
-    config.set_tlb_locked();
+    config.set_mbec_enabled_flag();
+    config.set_tlb_locked_flag();
 
     hvcall_set_vp_registers(HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, config.as_u64())
         .map_err(|_| Errno::EFAULT)?;

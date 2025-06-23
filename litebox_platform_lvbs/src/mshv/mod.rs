@@ -12,7 +12,7 @@ pub mod vtl_switch;
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use modular_bitfield::prelude::*;
-use modular_bitfield::specifiers::{B4, B51};
+use modular_bitfield::specifiers::{B3, B4, B7, B8, B16, B31, B32, B45, B51, B62};
 
 pub const HV_HYPERCALL_REP_COMP_MASK: u64 = 0xfff_0000_0000;
 pub const HV_HYPERCALL_REP_COMP_OFFSET: u32 = 32;
@@ -381,43 +381,35 @@ impl HvGetVpRegistersOutput {
     }
 }
 
-#[derive(Default, Clone, Copy)]
-#[repr(C, packed)]
+#[bitfield]
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
 pub struct HvNestedEnlightenmentsControlFeatures {
-    _raw: u32,
-    // union of
-    // directhypercall: 1, reserved: 31
+    pub direct_hypercall: bool,
+    #[skip]
+    __: B31,
 }
 
 impl HvNestedEnlightenmentsControlFeatures {
-    const DIRECTHYPERCALL_MASK: u32 = 0x1;
-    pub fn new() -> Self {
-        HvNestedEnlightenmentsControlFeatures { _raw: 0 }
-    }
-
-    #[expect(clippy::used_underscore_binding)]
-    pub fn set_direct_hypercall(&mut self, direct_hypercall: u32) {
-        self._raw |= direct_hypercall & Self::DIRECTHYPERCALL_MASK;
+    /// Set direct hypercall flag from u32 (for compatibility)
+    pub fn set_direct_hypercall_u32(&mut self, direct_hypercall: u32) {
+        self.set_direct_hypercall(direct_hypercall != 0);
     }
 }
 
-#[derive(Default, Clone, Copy)]
-#[repr(C, packed)]
+#[bitfield]
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
 pub struct HvNestedEnlightenmentsControlHypercallControls {
-    _raw: u32,
-    // union of
-    // inter_partition_comm: 1, reserved: 31
+    pub inter_partition_comm: bool,
+    #[skip]
+    __: B31,
 }
 
 impl HvNestedEnlightenmentsControlHypercallControls {
-    const INTER_PARTITION_COMM_MASK: u32 = 0x1;
-    pub fn new() -> Self {
-        HvNestedEnlightenmentsControlHypercallControls { _raw: 0 }
-    }
-
-    #[expect(clippy::used_underscore_binding)]
-    pub fn set_inter_partition_comm(&mut self, inter_partition_comm: u32) {
-        self._raw |= inter_partition_comm & Self::INTER_PARTITION_COMM_MASK;
+    /// Set inter partition comm flag from u32 (for compatibility)
+    pub fn set_inter_partition_comm_u32(&mut self, inter_partition_comm: u32) {
+        self.set_inter_partition_comm(inter_partition_comm != 0);
     }
 }
 
@@ -517,44 +509,29 @@ impl Default for HvInputModifyVtlProtectionMask {
     }
 }
 
-#[derive(Default, Clone, Copy)]
-#[repr(C, packed)]
+#[bitfield]
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
 pub struct HvRegisterVsmVpSecureVtlConfig {
-    _as_u64: u64,
-    // union of
-    // mbec_enabled : 1;
-    // tlb_locked : 1;
-    // reserved: 62;
+    pub mbec_enabled: bool,
+    pub tlb_locked: bool,
+    #[skip]
+    __: B62,
 }
 
 impl HvRegisterVsmVpSecureVtlConfig {
-    const MBEC_ENABLED_MASK: u64 = 0x1;
-    const TLB_LOCKED_MASK: u64 = 0x2;
-    const MBEC_ENABLED_SHIFT: u64 = 0;
-    const TLB_LOCKED_SHIFT: u64 = 1;
-
-    pub fn new() -> Self {
-        HvRegisterVsmVpSecureVtlConfig {
-            ..Default::default()
-        }
-    }
-
-    #[expect(clippy::used_underscore_binding)]
     pub fn as_u64(&self) -> u64 {
-        self._as_u64
+        u64::from_le_bytes(self.into_bytes())
     }
 
-    #[expect(clippy::used_underscore_binding)]
-    fn set_sub_config(&mut self, mask: u64, shift: u64, value: u64) {
-        self._as_u64 |= (value << shift) & mask;
+    /// Enable MBEC (for compatibility)
+    pub fn set_mbec_enabled_flag(&mut self) {
+        self.set_mbec_enabled(true);
     }
 
-    pub fn set_mbec_enabled(&mut self) {
-        self.set_sub_config(Self::MBEC_ENABLED_MASK, Self::MBEC_ENABLED_SHIFT, 1);
-    }
-
-    pub fn set_tlb_locked(&mut self) {
-        self.set_sub_config(Self::TLB_LOCKED_MASK, Self::TLB_LOCKED_SHIFT, 1);
+    /// Enable TLB locked (for compatibility)
+    pub fn set_tlb_locked_flag(&mut self) {
+        self.set_tlb_locked(true);
     }
 }
 
@@ -761,59 +738,43 @@ impl HvMessagePage {
     }
 }
 
-#[derive(Default, Clone, Copy)]
-#[repr(C, packed)]
+#[bitfield]
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
 pub struct HvSynicSint {
-    _as_uint64: u64,
-    // union of
-    // vector: 8;
-    // reserved1: 8;
-    // masked: 1;
-    // auto_eoi: 1;
-    // polling: 1;
-    // reserved2: 45;
+    pub vector: B8,
+    #[skip]
+    __reserved1: B8,
+    pub masked: bool,
+    pub auto_eoi: bool,
+    pub polling: bool,
+    #[skip]
+    __reserved2: B45,
 }
 
 impl HvSynicSint {
-    const VECTOR_MASK: u64 = 0xff;
-    const MASKED_MASK: u64 = 0x1_0000;
-    const AUTO_EOI_MASK: u64 = 0x2_0000;
-    const POLLING_MASK: u64 = 0x4_0000;
-    const VECTOR_SHIFT: u64 = 0;
-    const MASKED_SHIFT: u64 = 16;
-    const AUTO_EOI_SHIFT: u64 = 17;
-    const POLLING_SHIFT: u64 = 18;
-
-    pub fn new() -> Self {
-        HvSynicSint {
-            ..Default::default()
-        }
-    }
-
-    #[expect(clippy::used_underscore_binding)]
     pub fn as_uint64(&self) -> u64 {
-        self._as_uint64
+        u64::from_le_bytes(self.into_bytes())
     }
 
-    #[expect(clippy::used_underscore_binding)]
-    fn set_sub_config(&mut self, mask: u64, shift: u64, value: u64) {
-        self._as_uint64 |= (value << shift) & mask;
+    /// Set vector from u64 (for compatibility)
+    pub fn set_vector_u64(&mut self, vector: u64) {
+        self.set_vector((vector as u8).into());
     }
 
-    pub fn set_vector(&mut self, vector: u64) {
-        self.set_sub_config(Self::VECTOR_MASK, Self::VECTOR_SHIFT, vector);
+    /// Set masked flag (for compatibility)
+    pub fn set_masked_flag(&mut self) {
+        self.set_masked(true);
     }
 
-    pub fn set_masked(&mut self) {
-        self.set_sub_config(Self::MASKED_MASK, Self::MASKED_SHIFT, 1);
+    /// Set auto_eoi flag (for compatibility)
+    pub fn set_auto_eoi_flag(&mut self) {
+        self.set_auto_eoi(true);
     }
 
-    pub fn set_auto_eoi(&mut self) {
-        self.set_sub_config(Self::AUTO_EOI_MASK, Self::AUTO_EOI_SHIFT, 1);
-    }
-
-    pub fn set_polling(&mut self) {
-        self.set_sub_config(Self::POLLING_MASK, Self::POLLING_SHIFT, 1);
+    /// Set polling flag (for compatibility)
+    pub fn set_polling_flag(&mut self) {
+        self.set_polling(true);
     }
 }
 
@@ -888,70 +849,49 @@ pub struct HvMsrInterceptMessage {
     pub rax: u64,
 }
 
-#[derive(Default, Clone, Copy)]
-#[repr(C, packed)]
+#[bitfield]
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
 pub struct HvPendingExceptionEvent {
-    _as_u64: u64,
-    // union of
-    // event_pending: 1;
-    // event_type: 3;
-    // reserved_0: 4;
-    // deliver_error_code: 1;
-    // reserved_1: 7;
-    // vector: 16;
-    // error_code: 32;
+    pub event_pending: bool,
+    pub event_type: B3,
+    #[skip]
+    __reserved_0: B4,
+    pub deliver_error_code: bool,
+    #[skip]
+    __reserved_1: B7,
+    pub vector: B16,
+    pub error_code: B32,
 }
 
 impl HvPendingExceptionEvent {
-    const EVENT_PENDING_MASK: u64 = 0x1;
-    const EVENT_TYPE_MASK: u64 = 0xe;
-    const DELIVER_ERROR_CODE_MASK: u64 = 0x100;
-    const VECTOR_MASK: u64 = 0xffff_0000;
-    const ERROR_CODE_MASK: u64 = 0xffff_ffff_0000_0000;
-    const EVENT_PENDING_SHIFT: u64 = 0;
-    const EVENT_TYPE_SHIFT: u64 = 1;
-    const DELIVER_ERROR_CODE_SHIFT: u64 = 3;
-    const VECTOR_SHIFT: u64 = 16;
-    const ERROR_CODE_SHIFT: u64 = 32;
-
-    pub fn new() -> Self {
-        HvPendingExceptionEvent {
-            ..Default::default()
-        }
-    }
-
-    #[expect(clippy::used_underscore_binding)]
     pub fn as_u64(&self) -> u64 {
-        self._as_u64
+        u64::from_le_bytes(self.into_bytes())
     }
 
-    #[expect(clippy::used_underscore_binding)]
-    fn set_sub_config(&mut self, mask: u64, shift: u64, value: u64) {
-        self._as_u64 |= (value << shift) & mask;
+    /// Set event pending flag (for compatibility)
+    pub fn set_event_pending_flag(&mut self) {
+        self.set_event_pending(true);
     }
 
-    pub fn set_event_pending(&mut self) {
-        self.set_sub_config(Self::EVENT_PENDING_MASK, Self::EVENT_PENDING_SHIFT, 1);
+    /// Set event type from u64 (for compatibility)
+    pub fn set_event_type_u64(&mut self, event_type: u64) {
+        self.set_event_type((event_type as u8).into());
     }
 
-    pub fn set_event_type(&mut self, event_type: u64) {
-        self.set_sub_config(Self::EVENT_TYPE_MASK, Self::EVENT_TYPE_SHIFT, event_type);
+    /// Set deliver error code flag (for compatibility)
+    pub fn set_deliver_error_code_flag(&mut self) {
+        self.set_deliver_error_code(true);
     }
 
-    pub fn set_deliver_error_code(&mut self) {
-        self.set_sub_config(
-            Self::DELIVER_ERROR_CODE_MASK,
-            Self::DELIVER_ERROR_CODE_SHIFT,
-            1,
-        );
+    /// Set vector from u64 (for compatibility)
+    pub fn set_vector_u64(&mut self, vector: u64) {
+        self.set_vector((vector as u16).into());
     }
 
-    pub fn set_vector(&mut self, vector: u64) {
-        self.set_sub_config(Self::VECTOR_MASK, Self::VECTOR_SHIFT, vector);
-    }
-
-    pub fn set_error_code(&mut self, error_code: u64) {
-        self.set_sub_config(Self::ERROR_CODE_MASK, Self::ERROR_CODE_SHIFT, error_code);
+    /// Set error code from u64 (for compatibility)
+    pub fn set_error_code_u64(&mut self, error_code: u64) {
+        self.set_error_code((error_code as u32).into());
     }
 }
 
@@ -1039,5 +979,198 @@ mod tests {
         assert_eq!(chained_config.intercept_acceptance(), true);
         assert_eq!(chained_config.intercept_vp_startup(), true);
         assert_eq!(chained_config.zero_memory_on_reset(), false);
+    }
+
+    #[test]
+    fn test_hv_nested_enlightenments_control_features_bitfield() {
+        // Test the new bitfield-based HvNestedEnlightenmentsControlFeatures implementation
+        
+        let mut features = HvNestedEnlightenmentsControlFeatures::new();
+        
+        // Test setting direct hypercall flag
+        features.set_direct_hypercall(true);
+        assert_eq!(features.direct_hypercall(), true);
+        
+        // Test compatibility method
+        let mut features2 = HvNestedEnlightenmentsControlFeatures::new();
+        features2.set_direct_hypercall_u32(1);
+        assert_eq!(features2.direct_hypercall(), true);
+        
+        features2.set_direct_hypercall_u32(0);
+        assert_eq!(features2.direct_hypercall(), false);
+        
+        // Test size - should be 4 bytes (32 bits)
+        assert_eq!(core::mem::size_of::<HvNestedEnlightenmentsControlFeatures>(), 4);
+        
+        // Test that Default trait works
+        let default_features = HvNestedEnlightenmentsControlFeatures::default();
+        assert_eq!(default_features.direct_hypercall(), false);
+    }
+
+    #[test]
+    fn test_hv_nested_enlightenments_control_hypercall_controls_bitfield() {
+        // Test the new bitfield-based HvNestedEnlightenmentsControlHypercallControls implementation
+        
+        let mut controls = HvNestedEnlightenmentsControlHypercallControls::new();
+        
+        // Test setting inter partition comm flag
+        controls.set_inter_partition_comm(true);
+        assert_eq!(controls.inter_partition_comm(), true);
+        
+        // Test compatibility method
+        let mut controls2 = HvNestedEnlightenmentsControlHypercallControls::new();
+        controls2.set_inter_partition_comm_u32(1);
+        assert_eq!(controls2.inter_partition_comm(), true);
+        
+        controls2.set_inter_partition_comm_u32(0);
+        assert_eq!(controls2.inter_partition_comm(), false);
+        
+        // Test size - should be 4 bytes (32 bits)
+        assert_eq!(core::mem::size_of::<HvNestedEnlightenmentsControlHypercallControls>(), 4);
+        
+        // Test that Default trait works
+        let default_controls = HvNestedEnlightenmentsControlHypercallControls::default();
+        assert_eq!(default_controls.inter_partition_comm(), false);
+    }
+
+    #[test]
+    fn test_hv_register_vsm_vp_secure_vtl_config_bitfield() {
+        // Test the new bitfield-based HvRegisterVsmVpSecureVtlConfig implementation
+        
+        let mut config = HvRegisterVsmVpSecureVtlConfig::new();
+        
+        // Test individual boolean flags
+        config.set_mbec_enabled(true);
+        assert_eq!(config.mbec_enabled(), true);
+        
+        config.set_tlb_locked(true);
+        assert_eq!(config.tlb_locked(), true);
+        
+        // Test compatibility methods
+        let mut config2 = HvRegisterVsmVpSecureVtlConfig::new();
+        config2.set_mbec_enabled_flag();
+        assert_eq!(config2.mbec_enabled(), true);
+        
+        config2.set_tlb_locked_flag();
+        assert_eq!(config2.tlb_locked(), true);
+        
+        // Test size - should be 8 bytes (64 bits)
+        assert_eq!(core::mem::size_of::<HvRegisterVsmVpSecureVtlConfig>(), 8);
+        
+        // Test as_u64 method
+        let config_u64 = config.as_u64();
+        assert_ne!(config_u64, 0);  // Should have some bits set
+        
+        // Test that Default trait works
+        let default_config = HvRegisterVsmVpSecureVtlConfig::default();
+        assert_eq!(default_config.mbec_enabled(), false);
+        assert_eq!(default_config.tlb_locked(), false);
+        assert_eq!(default_config.as_u64(), 0);
+    }
+
+    #[test]
+    fn test_hv_synic_sint_bitfield() {
+        // Test the new bitfield-based HvSynicSint implementation
+        
+        let mut sint = HvSynicSint::new();
+        
+        // Test vector field (8 bits)
+        sint.set_vector(0xf3_u8.into());
+        assert_eq!(sint.vector() as u8, 0xf3);
+        
+        // Test boolean flags
+        sint.set_masked(true);
+        assert_eq!(sint.masked(), true);
+        
+        sint.set_auto_eoi(true);
+        assert_eq!(sint.auto_eoi(), true);
+        
+        sint.set_polling(true);
+        assert_eq!(sint.polling(), true);
+        
+        // Test compatibility methods
+        let mut sint2 = HvSynicSint::new();
+        sint2.set_vector_u64(0xf3);
+        assert_eq!(sint2.vector() as u8, 0xf3);
+        
+        sint2.set_masked_flag();
+        assert_eq!(sint2.masked(), true);
+        
+        sint2.set_auto_eoi_flag();
+        assert_eq!(sint2.auto_eoi(), true);
+        
+        sint2.set_polling_flag();
+        assert_eq!(sint2.polling(), true);
+        
+        // Test size - should be 8 bytes (64 bits)
+        assert_eq!(core::mem::size_of::<HvSynicSint>(), 8);
+        
+        // Test as_uint64 method
+        let sint_u64 = sint.as_uint64();
+        assert_ne!(sint_u64, 0);  // Should have some bits set
+        
+        // Test that Default trait works
+        let default_sint = HvSynicSint::default();
+        assert_eq!(default_sint.vector() as u8, 0);
+        assert_eq!(default_sint.masked(), false);
+        assert_eq!(default_sint.auto_eoi(), false);
+        assert_eq!(default_sint.polling(), false);
+    }
+
+    #[test]
+    fn test_hv_pending_exception_event_bitfield() {
+        // Test the new bitfield-based HvPendingExceptionEvent implementation
+        
+        let mut exception = HvPendingExceptionEvent::new();
+        
+        // Test boolean flags
+        exception.set_event_pending(true);
+        assert_eq!(exception.event_pending(), true);
+        
+        exception.set_deliver_error_code(true);
+        assert_eq!(exception.deliver_error_code(), true);
+        
+        // Test multi-bit fields
+        exception.set_event_type(0b101_u8.into());  // 3 bits
+        assert_eq!(exception.event_type() as u8, 0b101);
+        
+        exception.set_vector(0x1234_u16.into());  // 16 bits
+        assert_eq!(exception.vector() as u16, 0x1234);
+        
+        exception.set_error_code(0x87654321_u32.into());  // 32 bits
+        assert_eq!(exception.error_code() as u32, 0x87654321);
+        
+        // Test compatibility methods
+        let mut exception2 = HvPendingExceptionEvent::new();
+        exception2.set_event_pending_flag();
+        assert_eq!(exception2.event_pending(), true);
+        
+        exception2.set_deliver_error_code_flag();
+        assert_eq!(exception2.deliver_error_code(), true);
+        
+        exception2.set_event_type_u64(7);
+        assert_eq!(exception2.event_type() as u8, 7);
+        
+        exception2.set_vector_u64(0xabcd);
+        assert_eq!(exception2.vector() as u16, 0xabcd);
+        
+        exception2.set_error_code_u64(0x12345678);
+        assert_eq!(exception2.error_code() as u32, 0x12345678);
+        
+        // Test size - should be 8 bytes (64 bits)
+        assert_eq!(core::mem::size_of::<HvPendingExceptionEvent>(), 8);
+        
+        // Test as_u64 method
+        let exception_u64 = exception.as_u64();
+        assert_ne!(exception_u64, 0);  // Should have some bits set
+        
+        // Test that Default trait works
+        let default_exception = HvPendingExceptionEvent::default();
+        assert_eq!(default_exception.event_pending(), false);
+        assert_eq!(default_exception.deliver_error_code(), false);
+        assert_eq!(default_exception.event_type() as u8, 0);
+        assert_eq!(default_exception.vector() as u16, 0);
+        assert_eq!(default_exception.error_code() as u32, 0);
+        assert_eq!(default_exception.as_u64(), 0);
     }
 }
