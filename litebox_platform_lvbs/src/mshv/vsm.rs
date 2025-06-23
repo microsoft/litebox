@@ -1,5 +1,7 @@
 //! VSM functions
 
+#[cfg(debug_assertions)]
+use crate::mshv::kernel_elf::parse_modinfo;
 use crate::{
     debug_serial_print, debug_serial_println,
     host::{
@@ -29,7 +31,7 @@ use crate::{
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
-        kernel_elf::{parse_modinfo, validate_kernel_module_elf},
+        kernel_elf::validate_kernel_module_elf,
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,
@@ -377,8 +379,8 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
 
     // collect and maintain the memory ranges of a module locally until the module is validated and its metadata is registered in the global map
     // we don't maintain this content in the global map due to memory overhead. Instead, we could add its hash value to the global map to check the integrity.
-    let mut module_memory_content = ModuleMemoryContent::new();
-    let mut memory_elf = MemoryContent::new();
+    let mut module_memory_sections = ModuleMemoryBySection::new();
+    let mut memory_elf = MemoryContainer::new();
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         for heki_page in heki_pages {
@@ -413,7 +415,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                             return Err(Errno::EINVAL);
                         }
 
-                        module_memory_content
+                        module_memory_sections
                             .write_vtl0_phys_bytes_by_type(
                                 VirtAddr::new(va),
                                 PhysAddr::new(pa),
@@ -448,10 +450,12 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         .map_err(|_| Errno::EINVAL)?;
     memory_elf.clear();
 
+    #[cfg(debug_assertions)]
     parse_modinfo(&elf_buf).map_err(|_| Errno::EINVAL)?;
-    if !validate_kernel_module_elf(&elf_buf, &module_memory_content).map_err(|_| Errno::EINVAL)? {
+
+    if !validate_kernel_module_elf(&elf_buf, &module_memory_sections).map_err(|_| Errno::EINVAL)? {
         serial_println!("VSM: Found unexpected relocations in the loaded module");
-        // return Err(Errno::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     // protect the memory ranges of a module based on their section types
@@ -894,20 +898,20 @@ fn protect_physical_memory_range(
 
 /// Data structure for maintaining the memory content of a kernel module. Currently, it only maintains
 /// the `.text` and `.init.text` sections which are needed for module validation.
-pub struct ModuleMemoryContent {
-    pub text: MemoryContent,
-    pub init_text: MemoryContent,
+pub struct ModuleMemoryBySection {
+    text: MemoryContainer,
+    init_text: MemoryContainer,
 }
 
-impl ModuleMemoryContent {
+impl ModuleMemoryBySection {
     pub fn new() -> Self {
         Self {
-            text: MemoryContent::new(),
-            init_text: MemoryContent::new(),
+            text: MemoryContainer::new(),
+            init_text: MemoryContainer::new(),
         }
     }
 
-    pub fn find_section_by_name(&self, name: &str) -> Option<&MemoryContent> {
+    pub fn find_section_by_name(&self, name: &str) -> Option<&MemoryContainer> {
         match name {
             ".text" => Some(&self.text),
             ".init.text" => Some(&self.init_text),
@@ -915,13 +919,13 @@ impl ModuleMemoryContent {
         }
     }
 
-    pub fn write_vtl0_phys_bytes_by_type(
+    pub(crate) fn write_vtl0_phys_bytes_by_type(
         &mut self,
         addr: VirtAddr,
         phys_start: PhysAddr,
         phys_end: PhysAddr,
         mod_mem_type: ModMemType,
-    ) -> Result<(), MemoryContentError> {
+    ) -> Result<(), MemoryContainerError> {
         match mod_mem_type {
             ModMemType::Text => self.text.write_vtl0_phys_bytes(addr, phys_start, phys_end),
             ModMemType::InitText => self
@@ -932,7 +936,7 @@ impl ModuleMemoryContent {
             | ModMemType::RoAfterInit
             | ModMemType::InitData
             | ModMemType::InitRoData => Ok(()), // we don't care/validate other memory types for now
-            _ => Err(MemoryContentError::InvalidType),
+            _ => Err(MemoryContainerError::InvalidType),
         }
     }
 }
@@ -942,12 +946,12 @@ impl ModuleMemoryContent {
 /// This structure allows us to handle data copied from VTL0 (e.g., for virtual-address-based page sorting) without
 /// explicit page mappings at VTL1.
 /// This structure is expected to be used locally and temporarily, so we do not protect it with a lock.
-pub struct MemoryContent {
+pub struct MemoryContainer {
     pages: BTreeMap<VirtAddr, Box<[u8; PAGE_SIZE]>>,
     range: Range<VirtAddr>,
 }
 
-impl MemoryContent {
+impl MemoryContainer {
     pub fn new() -> Self {
         Self {
             pages: BTreeMap::new(),
@@ -1001,7 +1005,7 @@ impl MemoryContent {
         addr: VirtAddr,
         phys_start: PhysAddr,
         phys_end: PhysAddr,
-    ) -> Result<(), MemoryContentError> {
+    ) -> Result<(), MemoryContainerError> {
         let mut phys_cur = phys_start;
         while phys_cur < phys_end {
             if let Some(data) =
@@ -1015,7 +1019,7 @@ impl MemoryContent {
                 self.write_bytes(addr + (phys_cur - phys_start), &data[..to_write])?;
                 phys_cur += u64::try_from(to_write).unwrap();
             } else {
-                return Err(MemoryContentError::CopyFromVtl0Failed);
+                return Err(MemoryContainerError::CopyFromVtl0Failed);
             }
         }
 
@@ -1034,7 +1038,7 @@ impl MemoryContent {
         }
     }
 
-    pub fn write_bytes(&mut self, addr: VirtAddr, data: &[u8]) -> Result<(), MemoryContentError> {
+    pub fn write_bytes(&mut self, addr: VirtAddr, data: &[u8]) -> Result<(), MemoryContainerError> {
         self.preallocate_pages(addr, addr + u64::try_from(data.len()).unwrap());
 
         let start = addr;
@@ -1070,11 +1074,11 @@ impl MemoryContent {
             self.extend_range(start, end);
             Ok(())
         } else {
-            Err(MemoryContentError::WriteFailed)
+            Err(MemoryContainerError::WriteFailed)
         }
     }
 
-    pub fn read_bytes(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<(), MemoryContentError> {
+    pub fn read_bytes(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<(), MemoryContainerError> {
         let start = addr;
         let end = addr + buf.len() as u64;
         let mut num_bytes = 0;
@@ -1107,7 +1111,7 @@ impl MemoryContent {
         if num_bytes == buf.len() {
             Ok(())
         } else {
-            Err(MemoryContentError::ReadFailed)
+            Err(MemoryContainerError::ReadFailed)
         }
     }
 
@@ -1121,7 +1125,7 @@ impl MemoryContent {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum MemoryContentError {
+pub enum MemoryContainerError {
     CopyFromVtl0Failed,
     ReadFailed,
     WriteFailed,

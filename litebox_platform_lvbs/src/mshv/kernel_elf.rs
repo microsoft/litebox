@@ -1,6 +1,6 @@
 //! Functions for validating kernel module ELFs
 
-use crate::{debug_serial_println, mshv::vsm::ModuleMemoryContent, serial_println};
+use crate::{debug_serial_println, mshv::vsm::ModuleMemoryBySection, serial_println};
 use alloc::{vec, vec::Vec};
 use elf::{
     ElfBytes,
@@ -16,12 +16,12 @@ use elf::{
 use rangemap::set::RangeSet;
 
 /// This function validates the code sections (`.text` and `.init.text`) of a kernel module ELF.
-/// In particular, this function checks the integrity of "non-relocatable bytes" in ELF. We check the
-/// signature of the entire ELF (including relocation information) before calling this function,
-/// so what the adversary can do with relocatable bytes is limited.
+/// In particular, this function checks the integrity of "non-relocatable/patchable bytes" in ELF. We check the
+/// signature of the entire ELF (including relocation and patch information) before calling this function,
+/// so the number of relocatable/patchable bytes under the adversary's control is limited.
 pub fn validate_kernel_module_elf(
     elf_buf: &[u8],
-    module_memory: &ModuleMemoryContent,
+    module_memory: &ModuleMemoryBySection,
 ) -> Result<bool, KernelElfError> {
     let mut result = true;
 
@@ -35,7 +35,7 @@ pub fn validate_kernel_module_elf(
     };
 
     for target_section in [".text", ".init.text"] {
-        // in-memory ELF section (with VTL0's relocations applied)
+        // in-memory ELF section (with VTL0's relocations and patches applied)
         let section_memory = module_memory
             .find_section_by_name(target_section)
             .expect("Section not found in module memory");
@@ -46,6 +46,7 @@ pub fn validate_kernel_module_elf(
         let Some(target_shdr) = shdrs.iter().find(|s| {
             s.sh_flags & u64::from(SHF_ALLOC) != 0
                 && s.sh_size > 0
+                && usize::try_from(s.sh_name).is_ok()
                 && shdr_strtab
                     .get(usize::try_from(s.sh_name).unwrap())
                     .is_ok_and(|n| n == target_section)
@@ -61,21 +62,30 @@ pub fn validate_kernel_module_elf(
             sym_strtab: &sym_strtab,
         };
 
-        // load original ELF section (no relocation applied)
-        let mut section_buf = vec![0u8; usize::try_from(target_shdr.sh_size).unwrap()];
-        section_buf.copy_from_slice(
-            &elf_buf[usize::try_from(target_shdr.sh_offset).unwrap()
-                ..usize::try_from(target_shdr.sh_offset + target_shdr.sh_size).unwrap()],
-        );
+        // load original ELF section (no relocation and patch applied)
+        let start =
+            usize::try_from(target_shdr.sh_offset).map_err(|_| KernelElfError::ElfParseFailed)?;
+        let end = start
+            .checked_add(
+                usize::try_from(target_shdr.sh_size).map_err(|_| KernelElfError::ElfParseFailed)?,
+            )
+            .ok_or(KernelElfError::ElfParseFailed)?;
+        let mut section_buf = vec![0u8; end - start];
+        section_buf.copy_from_slice(&elf_buf[start..end]);
 
         // figure out relocatable ranges
         let mut reloc_ranges = RangeSet::<usize>::new();
         get_symbol_relocations(elf_params, target_section, &section_buf, &mut reloc_ranges)?;
-        get_section_relocations(elf_params, target_section, &section_buf, &mut reloc_ranges)?;
+        get_binary_patches(elf_params, target_section, &section_buf, &mut reloc_ranges)?;
 
         let mut to_validate = vec![0u8; section_buf.len()];
         section_memory
-            .read_bytes(section_memory.start().unwrap(), &mut to_validate)
+            .read_bytes(
+                section_memory
+                    .start()
+                    .ok_or(KernelElfError::SectionReadFailed)?,
+                &mut to_validate,
+            )
             .map_err(|_| KernelElfError::SectionReadFailed)?;
 
         // check whether non-relocatable bytes are modified
@@ -120,6 +130,7 @@ fn get_symbol_relocations(
     if let Some(rela_shdr) = elf_params.shdrs.iter().find(|s| {
         s.sh_size > 0
             && s.sh_type == SHT_RELA
+            && usize::try_from(s.sh_name).is_ok()
             && elf_params
                 .shdr_strtab
                 .get(usize::try_from(s.sh_name).unwrap())
@@ -130,35 +141,35 @@ fn get_symbol_relocations(
             .section_data_as_relas(&rela_shdr)
             .map_err(|_| KernelElfError::ElfParseFailed)?;
         for rela in relas {
-            if let Ok(sym) = elf_params.symtab.get(usize::try_from(rela.r_sym).unwrap()) {
-                if let Ok(sym_name) = elf_params
-                    .sym_strtab
-                    .get(usize::try_from(sym.st_name).unwrap())
-                {
-                    if sym_name.is_empty()
-                        && elf_params
-                            .shdr_strtab
-                            .get(usize::from(sym.st_shndx))
-                            .is_err()
-                    {
-                        // neither symbol nor section relocation
-                        continue;
+            let r_sym = usize::try_from(rela.r_sym).map_err(|_| KernelElfError::ElfParseFailed)?;
+            let r_offset =
+                usize::try_from(rela.r_offset).map_err(|_| KernelElfError::ElfParseFailed)?;
+            if elf_params
+                .symtab
+                .get(r_sym)
+                .and_then(|sym| {
+                    if let Ok(name_offset) = usize::try_from(sym.st_name) {
+                        elf_params.sym_strtab.get(name_offset)
+                    } else {
+                        Err(elf::ParseError::IntegerOverflow)
                     }
+                })
+                .is_ok()
+            {
+                let reloc_size: usize = match rela.r_type {
+                    R_X86_64_64 => 8,
+                    R_X86_64_32 | R_X86_64_32S | R_X86_64_PLT32 | R_X86_64_PC32 => 4,
+                    _ => {
+                        todo!("Unsupported relocation type {:?}", rela.r_type);
+                    }
+                };
+                let start = r_offset;
+                if let Some(end) = start
+                    .checked_add(reloc_size)
+                    .filter(|&end| end <= section_buf.len())
+                {
+                    reloc_ranges.insert(start..end);
                 }
-            }
-
-            let reloc_size: u64 = match rela.r_type {
-                R_X86_64_64 => 8,
-                R_X86_64_32 | R_X86_64_32S | R_X86_64_PLT32 | R_X86_64_PC32 => 4,
-                _ => {
-                    todo!("Unsupported relocation type {:?}", rela.r_type);
-                }
-            };
-            if usize::try_from(rela.r_offset + reloc_size).unwrap() <= section_buf.len() {
-                reloc_ranges.insert(
-                    usize::try_from(rela.r_offset).unwrap()
-                        ..usize::try_from(rela.r_offset + reloc_size).unwrap(),
-                );
             }
         }
     } else {
@@ -182,9 +193,9 @@ fn is_allowed_rela_section(name: &str) -> bool {
     )
 }
 
-// This function handles `.rela.*` sections which can relocate `.text` or `.init.text` (section-based relocations).
+// This function handles `.rela.*` sections which can patch `.text` or `.init.text`.
 // A rela section can relocate `.text` or `init.text` sections if it has unnamed symbols which belong to these sections.
-fn get_section_relocations(
+fn get_binary_patches(
     elf_params: ElfParams<'_>,
     target_section: &str,
     section_buf: &[u8],
@@ -193,6 +204,7 @@ fn get_section_relocations(
     for shdr in elf_params.shdrs.iter().filter(|s| {
         s.sh_size > 0
             && s.sh_type == SHT_RELA
+            && usize::try_from(s.sh_name).is_ok()
             && elf_params
                 .shdr_strtab
                 .get(usize::try_from(s.sh_name).unwrap())
@@ -203,12 +215,15 @@ fn get_section_relocations(
             .section_data_as_relas(&shdr)
             .map_err(|_| KernelElfError::ElfParseFailed)?;
         for rela in relas {
-            let Ok(sym) = elf_params.symtab.get(usize::try_from(rela.r_sym).unwrap()) else {
+            let r_sym = usize::try_from(rela.r_sym).map_err(|_| KernelElfError::ElfParseFailed)?;
+            let r_addend =
+                usize::try_from(rela.r_addend).map_err(|_| KernelElfError::ElfParseFailed)?;
+            let Ok(sym) = elf_params.symtab.get(r_sym) else {
                 continue;
             };
             if let Ok(sym_name) = elf_params
                 .sym_strtab
-                .get(usize::try_from(sym.st_name).unwrap())
+                .get(usize::try_from(sym.st_name).map_err(|_| KernelElfError::ElfParseFailed)?)
             {
                 if !sym_name.is_empty() {
                     continue;
@@ -220,14 +235,18 @@ fn get_section_relocations(
                 .shdrs
                 .get(usize::from(sym.st_shndx))
                 .and_then(|s| {
-                    elf_params
-                        .shdr_strtab
-                        .get(usize::try_from(s.sh_name).unwrap())
-                        .map(|n| n == target_section)
+                    if let Ok(sh_name) = usize::try_from(s.sh_name) {
+                        elf_params
+                            .shdr_strtab
+                            .get(sh_name)
+                            .map(|n| n == target_section)
+                    } else {
+                        Err(elf::ParseError::IntegerOverflow)
+                    }
                 })
                 .is_ok()
             {
-                let reloc_size: u64 = match rela.r_type {
+                let reloc_size: usize = match rela.r_type {
                     R_X86_64_64 => 8,
                     R_X86_64_32 | R_X86_64_32S | R_X86_64_PLT32 | R_X86_64_PC32 => 4,
                     _ => {
@@ -235,31 +254,28 @@ fn get_section_relocations(
                     }
                 };
 
-                // section-based relocation relies on `r_addend` to specify the relocation offset
-                if rela.r_addend >= 0
-                    && usize::try_from(u64::try_from(rela.r_addend).unwrap() + reloc_size).unwrap()
-                        <= section_buf.len()
+                // section-based binary patching relies on `r_addend` to specify the offsets to patch
+                let start = r_addend;
+                if let Some(end) = start
+                    .checked_add(reloc_size)
+                    .filter(|&end| end <= section_buf.len())
                 {
-                    reloc_ranges.insert(
-                        usize::try_from(rela.r_addend).unwrap()
-                            ..usize::try_from(u64::try_from(rela.r_addend).unwrap() + reloc_size)
-                                .unwrap(),
-                    );
+                    reloc_ranges.insert(start..end);
 
                     // handle some exceptions which depend on sections
                     let section_name = elf_params
                         .shdr_strtab
-                        .get(usize::try_from(shdr.sh_name).unwrap())
+                        .get(
+                            usize::try_from(shdr.sh_name)
+                                .map_err(|_| KernelElfError::ElfParseFailed)?,
+                        )
                         .map_err(|_| KernelElfError::ElfParseFailed)?;
                     // `.rela.altinstructions` could patch `nop` which is one byte prior to the specified relocation.
                     if section_name == ".rela.altinstructions"
-                        && rela.r_addend > 0
-                        && section_buf[usize::try_from(rela.r_addend - 1).unwrap()] == 0x90
+                        && start > 0
+                        && section_buf[start - 1] == 0x90
                     {
-                        reloc_ranges.insert(
-                            usize::try_from(rela.r_addend - 1).unwrap()
-                                ..usize::try_from(rela.r_addend).unwrap(),
-                        );
+                        reloc_ranges.insert(start - 1..start);
                     }
                 }
             }
@@ -269,6 +285,7 @@ fn get_section_relocations(
 }
 
 /// This function parses the `.modinfo` section of a kernel module ELF
+#[cfg(debug_assertions)]
 pub fn parse_modinfo(elf_buf: &[u8]) -> Result<(), KernelElfError> {
     let elf = ElfBytes::<AnyEndian>::minimal_parse(elf_buf)
         .map_err(|_| KernelElfError::ElfParseFailed)?;
@@ -282,12 +299,15 @@ pub fn parse_modinfo(elf_buf: &[u8]) -> Result<(), KernelElfError> {
     if let Some(shdr) = shdrs.iter().find(|s| {
         s.sh_flags & u64::from(SHF_ALLOC) != 0
             && s.sh_size > 0
+            && usize::try_from(s.sh_name).is_ok()
             && shdr_strtab
                 .get(usize::try_from(s.sh_name).unwrap())
                 .is_ok_and(|n| n == ".modinfo")
     }) {
-        let start = usize::try_from(shdr.sh_offset).unwrap();
-        let end = start + usize::try_from(shdr.sh_size).unwrap();
+        let start = usize::try_from(shdr.sh_offset).map_err(|_| KernelElfError::ElfParseFailed)?;
+        let end = start
+            .checked_add(usize::try_from(shdr.sh_size).map_err(|_| KernelElfError::ElfParseFailed)?)
+            .ok_or(KernelElfError::ElfParseFailed)?;
         let modinfo_data = &elf_buf[start..end];
 
         for entry in modinfo_data.split(|&b| b == 0) {
