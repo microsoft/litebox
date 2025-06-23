@@ -1,7 +1,10 @@
 //! Functions for validating kernel module ELFs
 
+#[cfg(debug_assertions)]
+use alloc::vec::Vec;
+
 use crate::{debug_serial_println, mshv::vsm::ModuleMemoryBySection, serial_println};
-use alloc::{vec, vec::Vec};
+use alloc::vec;
 use elf::{
     ElfBytes,
     abi::{
@@ -89,21 +92,34 @@ pub fn validate_kernel_module_elf(
             .map_err(|_| KernelElfError::SectionReadFailed)?;
 
         // check whether non-relocatable bytes are modified
-        let mut diffs = Vec::new();
-        for non_reloc in reloc_ranges.gaps(&(0..section_buf.len())) {
-            for i in non_reloc {
-                if section_buf[i] != to_validate[i] {
-                    diffs.push(i);
-                }
+        #[cfg(not(debug_assertions))]
+        {
+            for reloc in reloc_ranges {
+                section_buf[reloc.clone()].copy_from_slice(&to_validate[reloc.clone()]);
+            }
+            if section_buf != to_validate {
+                serial_println!("Found {} mismatches in {target_section}", target_section);
+                result = false;
             }
         }
-        if !diffs.is_empty() {
-            serial_println!(
-                "Found {} mismatches in {target_section} at {:?}",
-                diffs.len(),
-                diffs
-            );
-            result = false;
+        #[cfg(debug_assertions)]
+        {
+            let mut diffs = Vec::new();
+            for non_reloc in reloc_ranges.gaps(&(0..section_buf.len())) {
+                for i in non_reloc {
+                    if section_buf[i] != to_validate[i] {
+                        diffs.push(i);
+                    }
+                }
+            }
+            if !diffs.is_empty() {
+                serial_println!(
+                    "Found {} mismatches in {target_section} at {:?}",
+                    diffs.len(),
+                    diffs
+                );
+                result = false;
+            }
         }
     }
     Ok(result)
