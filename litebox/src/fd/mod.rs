@@ -26,7 +26,7 @@ use crate::sync::RawSyncPrimitivesProvider;
 /// conversion.
 pub struct Descriptors<Platform: RawSyncPrimitivesProvider> {
     litebox: LiteBox<Platform>,
-    entries: Vec<Option<Arc<DescriptorEntry<Platform>>>>,
+    entries: Vec<Option<Arc<DescriptorEntry>>>,
     /// Stored FDs are used to provide raw integer values in a safer way.
     stored_fds: Vec<Option<OwnedFd>>,
 }
@@ -45,7 +45,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     }
 
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
-    pub(crate) fn insert(&mut self, entry: DescriptorEntry<Platform>) -> OwnedFd {
+    pub(crate) fn insert(&mut self, entry: DescriptorEntry) -> OwnedFd {
         let idx = self
             .entries
             .iter()
@@ -63,7 +63,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ///
     /// Returns the descriptor entry if it is unique (i.e., it was not duplicated, or all duplicates
     /// have been cleared out).
-    pub(crate) fn remove(&mut self, mut fd: OwnedFd) -> Option<DescriptorEntry<Platform>> {
+    pub(crate) fn remove(&mut self, mut fd: OwnedFd) -> Option<DescriptorEntry> {
         let Some(old) = self.entries[fd.as_usize()].take() else {
             unreachable!();
         };
@@ -90,7 +90,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// This explicitly consumes the `fd`.
     #[expect(
         clippy::missing_panics_doc,
-        reason = "panics are only wthin assertions"
+        reason = "panics are only within assertions"
     )]
     pub fn fd_into_raw_integer<Subsystem: FdEnabledSubsystem>(
         &mut self,
@@ -171,9 +171,18 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
 /// LiteBox subsystems that support having file descriptors.
 pub trait FdEnabledSubsystem {
     #[doc(hidden)]
-    type Entry: 'static;
+    type Entry: FdEnabledSubsystemEntry + 'static;
     #[doc(hidden)]
     const KIND: EntryKind;
+}
+
+/// Entries for a specific [`FdEnabledSubsystem`]
+#[doc(hidden)]
+pub trait FdEnabledSubsystemEntry {
+    /// This returns the [`EntryKind`] of the entry. This is expected to be a constant function (we
+    /// would ideally define this as an associated constant; it is maintained as a function taking
+    /// `&self` only for dyn-compatibility reasons).
+    fn kind(&self) -> EntryKind;
 }
 
 /// Possible errors from [`Descriptors::fd_from_raw_integer`] and
@@ -187,51 +196,30 @@ pub enum ErrRawIntFd {
 }
 
 /// A crate-internal entry for a descriptor.
-///
-/// Any new introduction of a file-system or network or similar would need its own entry to be
-/// provided here in order to be able to store descriptors.
-pub(crate) enum DescriptorEntry<Platform: RawSyncPrimitivesProvider> {
-    Socket(crate::net::SocketHandle),
-    InMemFS(crate::fs::in_mem::Descriptor<Platform>),
+pub(crate) struct DescriptorEntry {
+    entry: alloc::boxed::Box<dyn FdEnabledSubsystemEntry>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider> DescriptorEntry<Platform> {
+impl DescriptorEntry {
     fn kind(&self) -> EntryKind {
-        match self {
-            DescriptorEntry::Socket(_) => EntryKind::Socket,
-            DescriptorEntry::InMemFS(_) => EntryKind::InMemFS,
-        }
+        self.entry.kind()
     }
 
     /// Obtains `self` as the subsystem's entry type.
     ///
     /// Panics if invalid for the particular subsystem.
     fn as_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> &Subsystem::Entry {
-        macro_rules! kind {
-            ($($id:ident),*) => {
-                match Subsystem::KIND {
-                    $(
-                        EntryKind::$id => match self {
-                            DescriptorEntry::$id(x) => {
-                                if
-                                    core::any::TypeId::of::<Subsystem::Entry>() !=
-                                    core::any::Any::type_id(x)
-                                {
-                                    unreachable!("\
-                                        The types in `FdEnabledSubsystem` must be perfectly \
-                                        in sync with `DescriptorEntry`."
-                                    )
-                                }
-                                // SAFETY: We just confirmed they are the same type.
-                                unsafe { &*core::ptr::from_ref(x).cast() }
-                            }
-                            _ => unreachable!(),
-                        }
-                    )*
-                }
-            };
+        if core::any::TypeId::of::<&Subsystem::Entry>()
+            != core::any::Any::type_id(self.entry.as_ref())
+        {
+            unreachable!(
+                "\
+                The types in `FdEnabledSubsystem` must be perfectly \
+                in sync with `DescriptorEntry`."
+            )
         }
-        kind!(Socket, InMemFS)
+        // SAFETY: We just confirmed they are the same type.
+        unsafe { &*core::ptr::from_ref(self.entry.as_ref()).cast() }
     }
 }
 
