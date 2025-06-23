@@ -6,7 +6,6 @@
 )]
 
 mod temp_old_stuff;
-pub(crate) use temp_old_stuff::InternalFd;
 pub use temp_old_stuff::{FileFd, SocketFd};
 
 use alloc::sync::Arc;
@@ -246,6 +245,28 @@ impl DescriptorEntry {
 pub struct TypedFd<Subsystem: FdEnabledSubsystem> {
     _phantom: PhantomData<Subsystem>,
     x: OwnedFd,
+}
+
+impl<Subsystem: FdEnabledSubsystem> TypedFd<Subsystem> {
+    /// Get the "internal FD"
+    pub(crate) fn as_internal_fd(&self) -> InternalFd {
+        assert!(!self.x.is_closed());
+        InternalFd {
+            raw: self.x.raw,
+            __kind: 0xff,
+        }
+    }
+}
+
+/// A crate-internal representation of file descriptors that supports cloning/copying, and does
+/// *not* indicate validity/existence/ownership.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct InternalFd {
+    pub(crate) raw: u32,
+    // XXX(jayb): This `__kind` field must go away before the PR is made. This is purely a temporary
+    // artifact to make some of the migration simpler to manage, because there are a large number of
+    // changes happening, and introducing this for a bit makes those changes easier to handle.
+    pub(crate) __kind: u8,
 }
 
 /// An explicitly-private shared-common element of [`TypedFd`], denoting an owned (non-clonable)

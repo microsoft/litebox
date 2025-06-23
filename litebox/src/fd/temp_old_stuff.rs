@@ -1,14 +1,7 @@
 //! Transitional module, that is intended to be removed before making the PR.
 
+use super::InternalFd;
 use super::OwnedFd;
-
-/// A crate-internal representation of file descriptors that supports cloning/copying, and does
-/// *not* indicate validity/existence/ownership.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum InternalFd {
-    File(u32),
-    Socket(u32),
-}
 
 /// An owned file descriptor for files.
 ///
@@ -22,7 +15,10 @@ impl FileFd {
     /// Get the equivalent internal-fd
     pub(crate) fn as_internal_fd(&self) -> InternalFd {
         assert!(!self.x.is_closed());
-        InternalFd::File(self.x.raw)
+        InternalFd {
+            raw: self.x.raw,
+            __kind: 0,
+        }
     }
 }
 
@@ -38,6 +34,9 @@ impl SocketFd {
     /// Get the equivalent internal-fd
     pub(crate) fn as_internal_fd(&self) -> InternalFd {
         assert!(!self.x.is_closed());
-        InternalFd::Socket(self.x.raw)
+        InternalFd {
+            raw: self.x.raw,
+            __kind: 1,
+        }
     }
 }

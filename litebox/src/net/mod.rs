@@ -453,7 +453,10 @@ where
             .enumerate()
             .filter_map(|(i, h)| h.as_ref().map(|h| (i, h)))
         {
-            let internal_fd = InternalFd::Socket(raw_fd.try_into().unwrap());
+            let internal_fd = InternalFd {
+                raw: raw_fd.try_into().unwrap(),
+                __kind: 1,
+            };
             match socket_handle.protocol() {
                 Protocol::Tcp => {
                     let socket: &tcp::Socket = self.socket_set.get(socket_handle.handle);
