@@ -272,9 +272,6 @@ const KEY_BRK: u8 = 0x01;
 pub(super) struct ElfLoader;
 
 impl ElfLoader {
-    // TODO: set a guard page for the stack
-    const DEFAULT_STACK_SIZE: usize = 2048 * PAGE_SIZE; // 8MB
-
     fn init_auxvec(elf: &Elf) -> BTreeMap<AuxKey, usize> {
         let mut aux = BTreeMap::new();
         let phdrs = elf.phdrs();
@@ -403,14 +400,14 @@ impl ElfLoader {
         };
 
         let sp = unsafe {
-            let suggested_range = litebox::mm::linux::PageRange::new(0, Self::DEFAULT_STACK_SIZE)
+            let suggested_range = litebox::mm::linux::PageRange::new(0, super::DEFAULT_STACK_SIZE)
                 .expect("DEFAULT_STACK_SIZE is not page-aligned");
             litebox_page_manager()
                 .create_stack_pages(suggested_range, false, false)
                 .map_err(ElfLoaderError::MappingError)?
         };
-        let mut stack =
-            UserStack::new(sp, Self::DEFAULT_STACK_SIZE).ok_or(ElfLoaderError::InvalidStackAddr)?;
+        let mut stack = UserStack::new(sp, super::DEFAULT_STACK_SIZE)
+            .ok_or(ElfLoaderError::InvalidStackAddr)?;
         stack
             .init(argv, envp, aux)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;

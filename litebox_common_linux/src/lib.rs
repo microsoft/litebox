@@ -913,6 +913,92 @@ bitflags::bitflags! {
     }
 }
 
+#[cfg(not(target_arch = "riscv32"))]
+pub type rlim_t = usize;
+
+/// Used by getrlimit and setrlimit syscalls
+#[repr(C)]
+#[derive(Clone)]
+pub struct Rlimit {
+    pub rlim_cur: rlim_t,
+    pub rlim_max: rlim_t,
+}
+
+/// Used by prlimit64 syscall
+#[repr(C)]
+#[derive(Clone)]
+pub struct Rlimit64 {
+    pub rlim_cur: u64,
+    pub rlim_max: u64,
+}
+
+pub fn rlimit_to_rlimit64(rlim: Rlimit) -> Rlimit64 {
+    Rlimit64 {
+        rlim_cur: if rlim.rlim_cur == rlim_t::MAX {
+            u64::MAX
+        } else {
+            rlim.rlim_cur as u64
+        },
+        rlim_max: if rlim.rlim_max == rlim_t::MAX {
+            u64::MAX
+        } else {
+            rlim.rlim_max as u64
+        },
+    }
+}
+
+pub fn rlimit64_to_rlimit(rlim: Rlimit64) -> Rlimit {
+    Rlimit {
+        rlim_cur: if rlim.rlim_cur == u64::MAX {
+            rlim_t::MAX
+        } else {
+            rlim.rlim_cur as rlim_t
+        },
+        rlim_max: if rlim.rlim_max == u64::MAX {
+            rlim_t::MAX
+        } else {
+            rlim.rlim_max as rlim_t
+        },
+    }
+}
+
+#[repr(u32)]
+#[derive(Debug, IntEnum)]
+pub enum RlimitResource {
+    /// CPU time in sec
+    CPU = 0,
+    /// Max filesize
+    FSIZE = 1,
+    /// Max data size
+    DATA = 2,
+    /// Max stack size
+    STACK = 3,
+    /// Max core file size
+    CORE = 4,
+    /// Max resident set size
+    RSS = 5,
+    /// Max number of processes
+    NPROC = 6,
+    /// Max number of open files
+    NOFILE = 7,
+    /// Max number of locked memory
+    MEMLOCK = 8,
+    /// Max address space
+    AS = 9,
+    /// Max number of file locks held
+    LOCKS = 10,
+    /// Max number of pending signals
+    SIGPENDING = 11,
+    /// Max bytes in POSIX mqueues
+    MSGQUEUE = 12,
+    /// max nice prio allowed to raise to 0-39 for nice level 19 .. -20
+    NICE = 13,
+    /// Max realtime priority
+    RTPRIO = 14,
+    /// timeout for RT tasks in us
+    RTTIME = 15,
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
@@ -1127,6 +1213,25 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     /// Returns `ENOSYS` on 64-bit.
     SetThreadArea {
         user_desc: Platform::RawMutPointer<UserDesc>,
+    },
+    Getrlimit {
+        resource: RlimitResource,
+        rlim: Platform::RawMutPointer<Rlimit>,
+    },
+    Setrlimit {
+        resource: RlimitResource,
+        rlim: Platform::RawConstPointer<Rlimit>,
+    },
+    Prlimit {
+        pid: Option<i32>,
+        /// The resource for which the limit is being queried.
+        resource: RlimitResource,
+        /// If the new_limit argument is a not None, then the rlimit structure to which it points
+        /// is used to set new values for the soft and hard limits for resource.
+        new_limit: Option<Platform::RawConstPointer<Rlimit64>>,
+        /// If the old_limit argument is a not None, then a successful call to prlimit() places the
+        /// previous soft and hard limits for resource in the rlimit structure pointed to by old_limit.
+        old_limit: Option<Platform::RawMutPointer<Rlimit64>>,
     },
     SetTidAddress {
         tidptr: Platform::RawMutPointer<i32>,
@@ -1480,6 +1585,65 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
                 bufsiz: ctx.syscall_arg(3),
             },
+            #[cfg(target_arch = "x86_64")]
+            Sysno::getrlimit => {
+                let resource: u32 = ctx.syscall_arg(0).truncate();
+                if let Ok(resource) = RlimitResource::try_from(resource) {
+                    SyscallRequest::Getrlimit {
+                        resource,
+                        rlim: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+                    }
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
+            }
+            #[cfg(target_arch = "x86")]
+            Sysno::ugetrlimit => {
+                let resource: u32 = ctx.syscall_arg(0).truncate();
+                if let Ok(resource) = RlimitResource::try_from(resource) {
+                    SyscallRequest::Getrlimit {
+                        resource,
+                        rlim: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+                    }
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
+            }
+            ::syscalls::Sysno::setrlimit => {
+                let resource: u32 = ctx.syscall_arg(0).truncate();
+                if let Ok(resource) = RlimitResource::try_from(resource) {
+                    SyscallRequest::Setrlimit {
+                        resource,
+                        rlim: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
+                    }
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
+            }
+            Sysno::prlimit64 => {
+                let pid: i32 = ctx.syscall_arg(0).reinterpret_as_signed().truncate();
+                let resource: u32 = ctx.syscall_arg(1).truncate();
+                let new_limit = ctx.syscall_arg(2);
+                let old_limit = ctx.syscall_arg(3);
+                if let Ok(resource) = RlimitResource::try_from(resource) {
+                    SyscallRequest::Prlimit {
+                        pid: if pid == 0 { None } else { Some(pid) },
+                        resource,
+                        new_limit: if new_limit == 0 {
+                            None
+                        } else {
+                            Some(Platform::RawConstPointer::from_usize(new_limit))
+                        },
+                        old_limit: if old_limit == 0 {
+                            None
+                        } else {
+                            Some(Platform::RawMutPointer::from_usize(old_limit))
+                        },
+                    }
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
+            }
             Sysno::arch_prctl => {
                 let code: u32 = ctx.syscall_arg(0).truncate();
                 if let Ok(code) = ArchPrctlCode::try_from(code) {
