@@ -194,7 +194,7 @@ pub trait FdEnabledSubsystem {
 
 /// Entries for a specific [`FdEnabledSubsystem`]
 #[doc(hidden)]
-pub trait FdEnabledSubsystemEntry {}
+pub trait FdEnabledSubsystemEntry: core::any::Any {}
 
 /// Possible errors from [`Descriptors::fd_from_raw_integer`] and
 /// [`Descriptors::fd_consume_raw_integer`].
@@ -220,24 +220,24 @@ impl DescriptorEntry {
 
     /// Obtains `self` as the subsystem's entry type.
     ///
+    /// # Panics
+    ///
     /// Panics if invalid for the particular subsystem.
     fn as_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> &Subsystem::Entry {
-        if !self.matches_subsystem::<Subsystem>() {
-            unreachable!()
-        }
-        // SAFETY: We just confirmed they are the same type.
-        unsafe { &*core::ptr::from_ref(self.entry.as_ref()).cast() }
+        (self.entry.as_ref() as &dyn core::any::Any)
+            .downcast_ref()
+            .unwrap()
     }
 
     /// Obtains `self` as the subsystem's entry type, mutably.
     ///
+    /// # Panics
+    ///
     /// Panics if invalid for the particular subsystem.
     fn as_subsystem_mut<Subsystem: FdEnabledSubsystem>(&mut self) -> &mut Subsystem::Entry {
-        if !self.matches_subsystem::<Subsystem>() {
-            unreachable!()
-        }
-        // SAFETY: We just confirmed they are the same type.
-        unsafe { &mut *core::ptr::from_mut(self.entry.as_mut()).cast() }
+        (self.entry.as_mut() as &mut dyn core::any::Any)
+            .downcast_mut()
+            .unwrap()
     }
 }
 
