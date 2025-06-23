@@ -24,6 +24,15 @@ use crate::litebox_page_manager;
 
 use super::stack::{AuxKey, UserStack};
 
+use arrayvec::ArrayString;
+use core::fmt::Write;
+
+fn number_to_hex(n: u64) -> ArrayString<16> {
+    let mut buf = ArrayString::<16>::new(); // <-- constant generic
+    write!(&mut buf, "{n:x}").unwrap();
+    buf
+}
+
 // An opened elf file
 struct ElfFile {
     name: CString,
@@ -399,6 +408,13 @@ impl ElfLoader {
         } else {
             elf.entry()
         };
+
+        // Add an environment variable to pass the syscall entry point to the program.
+        let syscall_entry = litebox_platform_multiplex::platform().get_syscall_entry_point();
+        let mut envp = envp;
+        let mut env_var = "LITEBOX_SYSCALL_ENTRY=0x".to_string();
+        env_var.push_str(number_to_hex(u64::try_from(syscall_entry).unwrap()).as_str());
+        envp.push(CString::new(env_var).unwrap());
 
         let sp = unsafe {
             let suggested_range = litebox::mm::linux::PageRange::new(0, Self::DEFAULT_STACK_SIZE)
