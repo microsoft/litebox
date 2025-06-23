@@ -109,9 +109,12 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         fd: TypedFd<Subsystem>,
     ) -> usize {
         let raw = fd.x.as_usize();
-        debug_assert_eq!(
-            self.entries[raw].as_ref().unwrap().read().kind(),
-            Subsystem::KIND
+        debug_assert!(
+            self.entries[raw]
+                .as_ref()
+                .unwrap()
+                .read()
+                .matches_subsystem::<Subsystem>()
         );
         if self.stored_fds.len() <= raw {
             self.stored_fds.resize_with(raw + 1, || None);
@@ -138,7 +141,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         let Some(Some(entry)) = self.entries.get(fd) else {
             return Err(ErrRawIntFd::NotFound);
         };
-        if entry.read().kind() != Subsystem::KIND {
+        if !entry.read().matches_subsystem::<Subsystem>() {
             return Err(ErrRawIntFd::InvalidSubsystem);
         }
         let Some(Some(stored_fd)) = self.stored_fds.get(fd) else {
@@ -167,7 +170,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         let Some(Some(entry)) = self.entries.get(fd) else {
             return Err(ErrRawIntFd::NotFound);
         };
-        if entry.read().kind() != Subsystem::KIND {
+        if !entry.read().matches_subsystem::<Subsystem>() {
             return Err(ErrRawIntFd::InvalidSubsystem);
         }
         let Some(stored_fd) = self.stored_fds.get_mut(fd) else {
@@ -187,18 +190,11 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
 pub trait FdEnabledSubsystem {
     #[doc(hidden)]
     type Entry: FdEnabledSubsystemEntry + 'static;
-    #[doc(hidden)]
-    const KIND: EntryKind;
 }
 
 /// Entries for a specific [`FdEnabledSubsystem`]
 #[doc(hidden)]
-pub trait FdEnabledSubsystemEntry {
-    /// This returns the [`EntryKind`] of the entry. This is expected to be a constant function (we
-    /// would ideally define this as an associated constant; it is maintained as a function taking
-    /// `&self` only for dyn-compatibility reasons).
-    fn kind(&self) -> EntryKind;
-}
+pub trait FdEnabledSubsystemEntry {}
 
 /// Possible errors from [`Descriptors::fd_from_raw_integer`] and
 /// [`Descriptors::fd_consume_raw_integer`].
@@ -216,22 +212,18 @@ pub(crate) struct DescriptorEntry {
 }
 
 impl DescriptorEntry {
-    fn kind(&self) -> EntryKind {
-        self.entry.kind()
+    /// Check if this entry matches the specified subsystem
+    #[must_use]
+    fn matches_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> bool {
+        core::any::TypeId::of::<&Subsystem::Entry>() == core::any::Any::type_id(self.entry.as_ref())
     }
 
     /// Obtains `self` as the subsystem's entry type.
     ///
     /// Panics if invalid for the particular subsystem.
     fn as_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> &Subsystem::Entry {
-        if core::any::TypeId::of::<&Subsystem::Entry>()
-            != core::any::Any::type_id(self.entry.as_ref())
-        {
-            unreachable!(
-                "\
-                The types in `FdEnabledSubsystem` must be perfectly \
-                in sync with `DescriptorEntry`."
-            )
+        if !self.matches_subsystem::<Subsystem>() {
+            unreachable!()
         }
         // SAFETY: We just confirmed they are the same type.
         unsafe { &*core::ptr::from_ref(self.entry.as_ref()).cast() }
@@ -241,29 +233,12 @@ impl DescriptorEntry {
     ///
     /// Panics if invalid for the particular subsystem.
     fn as_subsystem_mut<Subsystem: FdEnabledSubsystem>(&mut self) -> &mut Subsystem::Entry {
-        if core::any::TypeId::of::<&mut Subsystem::Entry>()
-            != core::any::Any::type_id(self.entry.as_mut())
-        {
-            unreachable!(
-                "\
-                The types in `FdEnabledSubsystem` must be perfectly \
-                in sync with `DescriptorEntry`."
-            )
+        if !self.matches_subsystem::<Subsystem>() {
+            unreachable!()
         }
         // SAFETY: We just confirmed they are the same type.
         unsafe { &mut *core::ptr::from_mut(self.entry.as_mut()).cast() }
     }
-}
-
-/// A crate-internal entry-kind for a descriptor.
-///
-/// We are forced to keep this `pub` because of [`FdEnabledSubsystem`]. We'd ideally keep this
-/// `pub(crate)`, but must instead live with just the `#[doc(hidden)]` instead.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum EntryKind {
-    Socket,
-    InMemFS,
 }
 
 /// A file descriptor that refers to entries by the `Subsystem`.
