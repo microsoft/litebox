@@ -1915,45 +1915,45 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::geteuid => SyscallRequest::Geteuid,
             Sysno::getegid => SyscallRequest::Getegid,
             Sysno::epoll_ctl => {
-                let op: i32 = ctx.get_arg(1).reinterpret_as_signed().truncate();
+                let op: i32 = ctx.syscall_arg(1).reinterpret_as_signed().truncate();
                 if let Ok(op) = EpollOp::try_from(op) {
                     SyscallRequest::EpollCtl {
-                        epfd: ctx.get_arg(0).reinterpret_as_signed().truncate(),
+                        epfd: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
                         op,
-                        fd: ctx.get_arg(2).reinterpret_as_signed().truncate(),
-                        event: Platform::RawConstPointer::from_usize(ctx.get_arg(3)),
+                        fd: ctx.syscall_arg(2).reinterpret_as_signed().truncate(),
+                        event: Platform::RawConstPointer::from_usize(ctx.syscall_arg(3)),
                     }
                 } else {
                     SyscallRequest::Ret(errno::Errno::EINVAL)
                 }
             }
             Sysno::epoll_wait => SyscallRequest::EpollPwait {
-                epfd: ctx.get_arg(0).reinterpret_as_signed().truncate(),
-                events: Platform::RawMutPointer::from_usize(ctx.get_arg(1)),
-                maxevents: ctx.get_arg(2).truncate(),
-                timeout: ctx.get_arg(3).reinterpret_as_signed().truncate(),
+                epfd: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                events: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+                maxevents: ctx.syscall_arg(2).truncate(),
+                timeout: ctx.syscall_arg(3).reinterpret_as_signed().truncate(),
                 sigmask: None,
                 sigsetsize: 0,
             },
             Sysno::epoll_pwait => SyscallRequest::EpollPwait {
-                epfd: ctx.get_arg(0).reinterpret_as_signed().truncate(),
-                events: Platform::RawMutPointer::from_usize(ctx.get_arg(1)),
-                maxevents: ctx.get_arg(2).truncate(),
-                timeout: ctx.get_arg(3).reinterpret_as_signed().truncate(),
-                sigmask: if ctx.get_arg(4) == 0 {
+                epfd: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                events: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+                maxevents: ctx.syscall_arg(2).truncate(),
+                timeout: ctx.syscall_arg(3).reinterpret_as_signed().truncate(),
+                sigmask: if ctx.syscall_arg(4) == 0 {
                     None
                 } else {
-                    Some(Platform::RawConstPointer::from_usize(ctx.get_arg(4)))
+                    Some(Platform::RawConstPointer::from_usize(ctx.syscall_arg(4)))
                 },
-                sigsetsize: ctx.get_arg(5),
+                sigsetsize: ctx.syscall_arg(5),
             },
             Sysno::epoll_create => SyscallRequest::EpollCreate {
-                size: ctx.get_arg(0).reinterpret_as_signed().truncate(),
+                size: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
                 flags: EpollCreateFlags::empty(),
             },
             Sysno::epoll_create1 => SyscallRequest::EpollCreate {
                 size: 1,
-                flags: EpollCreateFlags::from_bits_truncate(ctx.get_arg(0).truncate()),
+                flags: EpollCreateFlags::from_bits_truncate(ctx.syscall_arg(0).truncate()),
             },
             Sysno::arch_prctl => {
                 let code: u32 = ctx.syscall_arg(0).truncate();

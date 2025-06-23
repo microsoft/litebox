@@ -154,7 +154,8 @@ impl EpollFile {
             if entry.desc.upgrade().is_some() {
                 return Err(Errno::EEXIST);
             }
-            // find stale entry because we don't remove it immediately after the file is closed
+            // find stale entry because we don't remove it immediately after the file is closed;
+            // `insert` below will replace it with a new entry.
         }
         let mask = Events::from_bits_truncate(event.events);
         let entry = EpollEntry::new(
