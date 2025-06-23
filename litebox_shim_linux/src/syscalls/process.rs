@@ -130,20 +130,23 @@ pub(crate) fn sys_exit_group(status: i32) -> ! {
     litebox_platform_multiplex::platform().exit(status)
 }
 
-extern "C" fn new_thread_callback(
-    args: &litebox_common_linux::NewThreadArgs<litebox_platform_multiplex::Platform>,
+fn new_thread_callback(
+    args: litebox_common_linux::NewThreadArgs<litebox_platform_multiplex::Platform>,
 ) {
-    let task = Box::new(litebox_common_linux::Task {
-        // Assume the underlying platform will handle the thread ID allocation
-        tid: args.child_tid,
-        clear_child_tid: args.clear_child_tid,
-    });
+    let litebox_common_linux::NewThreadArgs {
+        mut task,
+        tls,
+        set_child_tid,
+        callback: _,
+    } = args;
+    let child_tid = task.tid;
+
     // Set the TLS for the platform itself
-    let tls = litebox_common_linux::ThreadLocalStorage::new(task);
-    litebox_platform_multiplex::platform().set_thread_local_storage(tls);
+    let litebox_tls = litebox_common_linux::ThreadLocalStorage::new(task);
+    litebox_platform_multiplex::platform().set_thread_local_storage(litebox_tls);
 
     // Set the TLS for the guest program
-    if let Some(tls) = args.tls {
+    if let Some(tls) = tls {
         // Set the TLS base pointer for the new thread
         #[cfg(target_arch = "x86")]
         set_thread_area(tls);
@@ -155,9 +158,9 @@ extern "C" fn new_thread_callback(
         }
     }
 
-    if let Some(set_child_tid) = args.set_child_tid {
+    if let Some(set_child_tid) = set_child_tid {
         // Set the child TID if requested
-        let _ = unsafe { set_child_tid.write_at_offset(0, args.child_tid) };
+        let _ = unsafe { set_child_tid.write_at_offset(0, child_tid) };
     }
 }
 
@@ -215,20 +218,22 @@ pub(crate) fn sys_clone(
             stack_size,
             main,
             Box::new(litebox_common_linux::NewThreadArgs {
-                child_tid: 0,
                 tls,
                 set_child_tid: if flags.contains(CloneFlags::CHILD_SETTID) {
                     child_tid
                 } else {
                     None
                 },
-                clear_child_tid: if flags.contains(CloneFlags::CHILD_CLEARTID) {
-                    child_tid
-                } else {
-                    None
-                },
+                task: Box::new(litebox_common_linux::Task {
+                    tid: 0, // The actual TID will be set by the platform
+                    clear_child_tid: if flags.contains(CloneFlags::CHILD_CLEARTID) {
+                        child_tid
+                    } else {
+                        None
+                    },
+                }),
+                callback: new_thread_callback,
             }),
-            new_thread_callback,
         )
     }?;
     if flags.contains(CloneFlags::PARENT_SETTID) {
@@ -389,7 +394,8 @@ mod tests {
         };
         crate::syscalls::tests::log_println!("stack allocated at: {:#x}", stack.as_usize());
         let main: fn() = || {
-            crate::syscalls::tests::log_println!("Child started");
+            let tid = super::sys_gettid();
+            crate::syscalls::tests::log_println!("Child started {tid}");
 
             #[cfg(target_arch = "x86_64")]
             {
@@ -408,6 +414,11 @@ mod tests {
             }
 
             assert!(unsafe { CHILD_TID } > 0, "Child TID should be set");
+            assert_eq!(
+                unsafe { CHILD_TID },
+                tid,
+                "Child TID should match sys_gettid result"
+            );
             crate::syscalls::tests::log_println!("Child TID: {}", unsafe { CHILD_TID });
             super::sys_exit(0);
         };

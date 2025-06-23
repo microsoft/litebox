@@ -839,10 +839,10 @@ pub type ThreadLocalDescriptor = u8;
 pub type ThreadLocalDescriptor = UserDesc;
 
 pub struct NewThreadArgs<Platform: litebox::platform::RawPointerProvider> {
-    pub child_tid: i32,
     pub tls: Option<Platform::RawMutPointer<ThreadLocalDescriptor>>,
     pub set_child_tid: Option<Platform::RawMutPointer<i32>>,
-    pub clear_child_tid: Option<Platform::RawMutPointer<i32>>,
+    pub task: alloc::boxed::Box<Task<Platform>>,
+    pub callback: fn(Self),
 }
 
 /// Struct for thread-local storage.

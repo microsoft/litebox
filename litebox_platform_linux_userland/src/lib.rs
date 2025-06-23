@@ -10,10 +10,10 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
 use litebox::fs::OFlags;
+use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer, ThreadLocalStorageProvider};
-use litebox::platform::{ThreadProvider, UnblockedOrTimedOut};
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_common_linux::{CloneFlags, MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
 
@@ -233,7 +233,6 @@ impl litebox::platform::ExitProvider for LinuxUserland {
 extern "C" fn thread_start(
     pt_regs: *mut litebox_common_linux::PtRegs,
     thread_args: *mut litebox_common_linux::NewThreadArgs<LinuxUserland>,
-    cb: extern "C" fn(&<LinuxUserland as ThreadProvider>::ThreadArgs),
 ) -> ! {
     let pt_regs = unsafe { alloc::boxed::Box::from_raw(pt_regs) };
     // copy pt_regs from heap to stack
@@ -250,7 +249,7 @@ extern "C" fn thread_start(
 
     // Allow caller to run some code before we return to the new thread.
     let thread_args = unsafe { alloc::boxed::Box::from_raw(thread_args) };
-    cb(&thread_args);
+    (thread_args.callback)(*thread_args);
 
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -314,9 +313,10 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         stack: TransparentMutPtr<u8>,
         stack_size: usize,
         entry_point: usize,
-        thread_args: Box<Self::ThreadArgs>,
-        new_thread_callback: extern "C" fn(&Self::ThreadArgs),
+        mut thread_args: Box<Self::ThreadArgs>,
     ) -> Result<usize, Self::ThreadSpawnError> {
+        let child_tid_ptr = core::ptr::from_mut(thread_args.task.as_mut()) as u64
+            + core::mem::offset_of!(litebox_common_linux::Task<LinuxUserland>, tid) as u64;
         // new process/thread may have a different stack and thus does not have access to
         // the pt_regs (on the original stack), so we need to copy it to heap.
         let new_pt_regs = Box::into_raw(Box::new(*ctx));
@@ -332,11 +332,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         let clone_args = litebox_common_linux::CloneArgs {
             flags,
             pidfd: 0,
-            child_tid: thread_args as u64
-                + core::mem::offset_of!(
-                    litebox_common_linux::NewThreadArgs<LinuxUserland>,
-                    child_tid
-                ) as u64,
+            child_tid: child_tid_ptr,
             parent_tid: 0,
             exit_signal: 0,
             stack: stack.as_usize() as u64,
@@ -357,7 +353,6 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
                 "mov rdi, {1}",
                 "mov [rdi + {rsp_offset}], rsp",    // save the current stack pointer to pt_regs.rsp
                 "mov rsi, {2}",
-                "mov rdx, {3}",
                 "jmp thread_start",
                 // should never return
                 "hlt",
@@ -365,7 +360,6 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
                 in(reg) entry_point,
                 in(reg) new_pt_regs,
                 in(reg) thread_args,
-                in(reg) new_thread_callback as usize,
                 rsp_offset = const core::mem::offset_of!(litebox_common_linux::PtRegs, rsp),
                 inlateout("rax") syscalls::Sysno::clone3 as usize => ret,
                 in("rdi") &raw const clone_args,
@@ -387,7 +381,6 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
                 "mov ebx, {1}",
                 "mov [ebx + {esp_offset}], esp", // save the current stack pointer to pt_regs.esp
                 "push {2}",
-                "push {3}",
                 "push ebx",
                 "call thread_start",
                 // should never return
@@ -395,7 +388,6 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
                 "2:",
                 in(reg) entry_point,
                 in(reg) new_pt_regs,
-                in(reg) new_thread_callback as usize,
                 in(reg) thread_args,
                 esp_offset = const core::mem::offset_of!(litebox_common_linux::PtRegs, esp),
                 inlateout("eax") syscalls::Sysno::clone3 as usize => ret,

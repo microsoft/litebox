@@ -81,7 +81,6 @@ pub trait ThreadProvider: RawPointerProvider + ExitProvider {
         stack_size: usize,
         entry_point: usize,
         thread_args: alloc::boxed::Box<Self::ThreadArgs>,
-        new_thread_callback: extern "C" fn(&Self::ThreadArgs),
     ) -> Result<Self::ThreadId, Self::ThreadSpawnError>;
 
     /// Terminate the current thread with the given exit code.
