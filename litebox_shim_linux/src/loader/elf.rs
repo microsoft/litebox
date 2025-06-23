@@ -28,7 +28,7 @@ use arrayvec::ArrayString;
 use core::fmt::Write;
 
 fn number_to_hex(n: u64) -> ArrayString<16> {
-    let mut buf = ArrayString::<16>::new(); // <-- constant generic
+    let mut buf = ArrayString::<16>::new();
     write!(&mut buf, "{n:x}").unwrap();
     buf
 }
