@@ -3,7 +3,7 @@
 #[cfg(debug_assertions)]
 use alloc::vec::Vec;
 
-use crate::{debug_serial_println, mshv::vsm::ModuleMemoryBySection, serial_println};
+use crate::{debug_serial_println, mshv::vsm::ModuleMemory, serial_println};
 use alloc::vec;
 use elf::{
     ElfBytes,
@@ -18,13 +18,13 @@ use elf::{
 };
 use rangemap::set::RangeSet;
 
-/// This function validates the code sections (`.text` and `.init.text`) of a kernel module ELF.
-/// In particular, this function checks the integrity of "non-relocatable/patchable bytes" in ELF. We check the
-/// signature of the entire ELF (including relocation and patch information) before calling this function,
-/// so the number of relocatable/patchable bytes under the adversary's control is limited.
+/// This function validates certain code (`.text`, `.init.text`) and data (`.init.rodata`, `.data..ro_after_init`)
+/// sections of a kernel module ELF. It checks the integrity of "non-relocatable/patchable bytes" in ELF. Since
+/// we check the signature of the entire ELF (including relocation and patch information) before calling this function,
+/// the number of relocatable/patchable bytes under the adversary's control is limited.
 pub fn validate_kernel_module_elf(
     elf_buf: &[u8],
-    module_memory: &ModuleMemoryBySection,
+    module_memory: &ModuleMemory,
 ) -> Result<bool, KernelElfError> {
     let mut result = true;
 
@@ -37,7 +37,7 @@ pub fn validate_kernel_module_elf(
         return Err(KernelElfError::ElfParseFailed);
     };
 
-    for target_section in [".text", ".init.text"] {
+    for target_section in sections_to_validate() {
         // in-memory ELF section (with VTL0's relocations and patches applied)
         let section_memory = module_memory
             .find_section_by_name(target_section)
@@ -125,6 +125,16 @@ pub fn validate_kernel_module_elf(
     Ok(result)
 }
 
+// a list of sections which we validate
+fn sections_to_validate() -> [&'static str; 4] {
+    [
+        ".text",
+        ".init.text",
+        ".init.rodata",
+        ".data..ro_after_init",
+    ]
+}
+
 // for passing ELF-related parameters around local functions
 #[derive(Copy, Clone)]
 struct ElfParams<'a> {
@@ -135,14 +145,16 @@ struct ElfParams<'a> {
     sym_strtab: &'a StringTable<'a>,
 }
 
-// This function handles symbol-based relocations in `.rela.text` or `.rela.init.text` sections.
+// This function handles symbol-based relocations in `.rela.<target_section>` sections.
 fn get_symbol_relocations(
     elf_params: ElfParams<'_>,
     target_section: &str,
     section_buf: &[u8],
     reloc_ranges: &mut RangeSet<usize>,
 ) -> Result<(), KernelElfError> {
-    assert!(matches!(target_section, ".text" | ".init.text"));
+    if !sections_to_validate().contains(&target_section) {
+        return Err(KernelElfError::SectionNotFound);
+    }
     if let Some(rela_shdr) = elf_params.shdrs.iter().find(|s| {
         s.sh_size > 0
             && s.sh_type == SHT_RELA
@@ -160,18 +172,7 @@ fn get_symbol_relocations(
             let r_sym = usize::try_from(rela.r_sym).map_err(|_| KernelElfError::ElfParseFailed)?;
             let r_offset =
                 usize::try_from(rela.r_offset).map_err(|_| KernelElfError::ElfParseFailed)?;
-            if elf_params
-                .symtab
-                .get(r_sym)
-                .and_then(|sym| {
-                    if let Ok(name_offset) = usize::try_from(sym.st_name) {
-                        elf_params.sym_strtab.get(name_offset)
-                    } else {
-                        Err(elf::ParseError::IntegerOverflow)
-                    }
-                })
-                .is_ok()
-            {
+            if elf_params.symtab.get(r_sym).is_ok() {
                 let reloc_size: usize = match rela.r_type {
                     R_X86_64_64 => 8,
                     R_X86_64_32 | R_X86_64_32S | R_X86_64_PLT32 | R_X86_64_PC32 => 4,
@@ -209,8 +210,8 @@ fn is_allowed_rela_section(name: &str) -> bool {
     )
 }
 
-// This function handles `.rela.*` sections which can patch `.text` or `.init.text`.
-// A rela section can relocate `.text` or `init.text` sections if it has unnamed symbols which belong to these sections.
+// This function handles `.rela.*` sections which can patch our target sections. For example,
+// a rela section can relocate `.text` if it has unnamed symbols which belong to `.text`.
 fn get_binary_patches(
     elf_params: ElfParams<'_>,
     target_section: &str,

@@ -379,7 +379,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
 
     // collect and maintain the memory ranges of a module locally until the module is validated and its metadata is registered in the global map
     // we don't maintain this content in the global map due to memory overhead. Instead, we could add its hash value to the global map to check the integrity.
-    let mut module_memory_sections = ModuleMemoryBySection::new();
+    let mut module_memory = ModuleMemory::new();
     let mut memory_elf = MemoryContainer::new();
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
@@ -397,6 +397,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                     }
                     ModMemType::ElfBuffer => {
                         // this capture the original ELF binary in memory which is provided by the VTL0 kernel for validation.
+                        // this original ELF binary is cryptographically signed by the kernel build pipeline.
                         memory_elf
                             .write_vtl0_phys_bytes(
                                 VirtAddr::new(va),
@@ -415,7 +416,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                             return Err(Errno::EINVAL);
                         }
 
-                        module_memory_sections
+                        module_memory
                             .write_vtl0_phys_bytes_by_type(
                                 VirtAddr::new(va),
                                 PhysAddr::new(pa),
@@ -453,7 +454,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     #[cfg(debug_assertions)]
     parse_modinfo(&elf_buf).map_err(|_| Errno::EINVAL)?;
 
-    if !validate_kernel_module_elf(&elf_buf, &module_memory_sections).map_err(|_| Errno::EINVAL)? {
+    if !validate_kernel_module_elf(&elf_buf, &module_memory).map_err(|_| Errno::EINVAL)? {
         serial_println!("VSM: Found unexpected relocations in the loaded module");
         return Err(Errno::EINVAL);
     }
@@ -824,10 +825,10 @@ impl ModuleMemoryMetadataMap {
         map.remove(&key).is_some()
     }
 
-    pub fn iter_entry(&self, key: i64) -> Option<ModuleMemoryIters> {
+    pub fn iter_entry(&self, key: i64) -> Option<ModuleMemoryMetadataIters> {
         let guard = self.inner.lock();
         if guard.contains_key(&key) {
-            Some(ModuleMemoryIters {
+            Some(ModuleMemoryMetadataIters {
                 guard,
                 key,
                 phantom: core::marker::PhantomData,
@@ -844,13 +845,13 @@ impl Default for ModuleMemoryMetadataMap {
     }
 }
 
-pub struct ModuleMemoryIters<'a> {
+pub struct ModuleMemoryMetadataIters<'a> {
     guard: spin::mutex::SpinMutexGuard<'a, HashMap<i64, ModuleMemoryMetadata>>,
     key: i64,
     phantom: core::marker::PhantomData<&'a PhysFrameRange<Size4KiB>>,
 }
 
-impl<'a> ModuleMemoryIters<'a> {
+impl<'a> ModuleMemoryMetadataIters<'a> {
     pub fn iter_mem_ranges(&'a self) -> impl Iterator<Item = &'a ModuleMemoryRange> {
         self.guard.get(&self.key).unwrap().ranges.iter()
     }
@@ -898,16 +899,20 @@ fn protect_physical_memory_range(
 
 /// Data structure for maintaining the memory content of a kernel module. Currently, it only maintains
 /// the `.text` and `.init.text` sections which are needed for module validation.
-pub struct ModuleMemoryBySection {
+pub struct ModuleMemory {
     text: MemoryContainer,
     init_text: MemoryContainer,
+    init_rodata: MemoryContainer,
+    ro_after_init: MemoryContainer,
 }
 
-impl ModuleMemoryBySection {
+impl ModuleMemory {
     pub fn new() -> Self {
         Self {
             text: MemoryContainer::new(),
             init_text: MemoryContainer::new(),
+            init_rodata: MemoryContainer::new(),
+            ro_after_init: MemoryContainer::new(),
         }
     }
 
@@ -915,6 +920,8 @@ impl ModuleMemoryBySection {
         match name {
             ".text" => Some(&self.text),
             ".init.text" => Some(&self.init_text),
+            ".init.rodata" => Some(&self.init_rodata),
+            ".data..ro_after_init" => Some(&self.ro_after_init),
             _ => None,
         }
     }
@@ -931,12 +938,17 @@ impl ModuleMemoryBySection {
             ModMemType::InitText => self
                 .init_text
                 .write_vtl0_phys_bytes(addr, phys_start, phys_end),
-            ModMemType::Data
+            ModMemType::InitRoData => self
+                .init_rodata
+                .write_vtl0_phys_bytes(addr, phys_start, phys_end),
+            ModMemType::RoAfterInit => self
+                .ro_after_init
+                .write_vtl0_phys_bytes(addr, phys_start, phys_end),
+            ModMemType::ElfBuffer
+            | ModMemType::Data
             | ModMemType::RoData
-            | ModMemType::RoAfterInit
-            | ModMemType::InitData
-            | ModMemType::InitRoData => Ok(()), // we don't care/validate other memory types for now
-            _ => Err(MemoryContainerError::InvalidType),
+            | ModMemType::InitData => Ok(()), // we don't care/validate other memory types for now
+            ModMemType::Unknown => Err(MemoryContainerError::InvalidType),
         }
     }
 }
