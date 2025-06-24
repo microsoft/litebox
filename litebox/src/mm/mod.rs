@@ -459,6 +459,36 @@ where
         self.change_page_permissions(ptr, len, MemoryRegionPermissions::empty())
     }
 
+    /// Make pages readable, writable and executable.
+    ///
+    /// # Safety
+    ///
+    /// This operation is inherently dangerous and should be used with extreme caution.
+    /// Allowing pages to be both writable and executable can lead to severe security vulnerabilities,
+    /// such as code injection attacks or exploitation of memory corruption bugs.
+    ///
+    /// The caller must ensure the following:
+    /// 1. The memory region is only used for legitimate purposes, such as JIT compilation,
+    ///    where writable and executable permissions are strictly necessary.
+    /// 2. The memory region is properly sanitized and does not contain malicious or unintended code.
+    ///
+    /// It is highly recommended to minimize the use of this function and to prefer safer alternatives
+    /// whenever possible. If this function must be used, ensure that the memory region is locked down
+    /// and access is strictly controlled.
+    pub unsafe fn make_pages_rw_exec(
+        &self,
+        ptr: Platform::RawMutPointer<u8>,
+        len: usize,
+    ) -> Result<(), VmemProtectError> {
+        self.change_page_permissions(
+            ptr,
+            len,
+            MemoryRegionPermissions::READ
+                | MemoryRegionPermissions::WRITE
+                | MemoryRegionPermissions::EXEC,
+        )
+    }
+
     /// Returns all mappings in a vector.
     pub fn mappings(&self) -> Vec<(Range<usize>, VmFlags)> {
         self.vmem
