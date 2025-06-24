@@ -6,7 +6,6 @@
 )]
 
 mod temp_old_stuff;
-pub use temp_old_stuff::FileFd;
 
 use alloc::sync::Arc;
 use alloc::vec;

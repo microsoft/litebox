@@ -4,7 +4,6 @@ use alloc::string::String;
 
 use crate::{
     LiteBox,
-    fd::{FileFd, OwnedFd},
     fs::{
         FileStatus, FileType, Mode, OFlags, SeekWhence,
         errors::{
@@ -13,14 +12,16 @@ use crate::{
         },
     },
     path::Arg,
-    platform::{StdioOutStream, StdioReadError, StdioWriteError},
+    platform::{StdioOutStream, StdioReadError, StdioStream, StdioWriteError},
 };
 
 /// A backing implementation for [`FileSystem`](super::super::FileSystem).
 ///
 /// This provider provides only `/dev/stdin`, `/dev/stdout`, and `/dev/stderr`.
-pub struct FileSystem<Platform: crate::platform::StdioProvider + 'static> {
-    platform: &'static Platform,
+pub struct FileSystem<
+    Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider + 'static,
+> {
+    litebox: LiteBox<Platform>,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
 }
@@ -36,18 +37,20 @@ impl<Platform: crate::platform::StdioProvider + crate::sync::RawSyncPrimitivesPr
     #[must_use]
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
         Self {
-            platform: litebox.x.platform,
+            litebox: litebox.clone(),
             current_working_dir: "/".into(),
         }
     }
 }
 
-impl<Platform: crate::platform::StdioProvider> super::super::private::Sealed
-    for FileSystem<Platform>
+impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider>
+    super::super::private::Sealed for FileSystem<Platform>
 {
 }
 
-impl<Platform: crate::platform::StdioProvider> FileSystem<Platform> {
+impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider>
+    FileSystem<Platform>
+{
     // Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
     // for any relative paths from current working directory.
     //
@@ -65,30 +68,43 @@ impl<Platform: crate::platform::StdioProvider> FileSystem<Platform> {
     }
 }
 
-impl<Platform: crate::platform::StdioProvider> super::super::FileSystem for FileSystem<Platform> {
-    // NOTE: The counters inside this are purely internal to this module, so we are just using the
-    // regular convention of 0,1,2 for stdin,stdout,stderr. This does NOT need to account for
-    // anything externally, so as long as we are internally consistent, we are good.
-    fn open(&self, path: impl Arg, flags: OFlags, mode: Mode) -> Result<FileFd, OpenError> {
+impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider>
+    super::super::FileSystem for FileSystem<Platform>
+{
+    fn open(
+        &self,
+        path: impl Arg,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<FileFd<Platform>, OpenError> {
         let path = self.absolute_path(path)?;
         match path.as_str() {
             "/dev/stdin" => {
                 if flags == OFlags::RDONLY && mode.is_empty() {
-                    Ok(FileFd { x: OwnedFd::new(0) })
+                    Ok(self
+                        .litebox
+                        .descriptor_table_mut()
+                        .insert(StdioStream::Stdin))
                 } else {
                     unimplemented!()
                 }
             }
             "/dev/stdout" => {
                 if flags == OFlags::WRONLY && mode.is_empty() {
-                    Ok(FileFd { x: OwnedFd::new(1) })
+                    Ok(self
+                        .litebox
+                        .descriptor_table_mut()
+                        .insert(StdioStream::Stdout))
                 } else {
                     unimplemented!()
                 }
             }
             "/dev/stderr" => {
                 if flags == OFlags::WRONLY && mode.is_empty() {
-                    Ok(FileFd { x: OwnedFd::new(2) })
+                    Ok(self
+                        .litebox
+                        .descriptor_table_mut()
+                        .insert(StdioStream::Stderr))
                 } else {
                     unimplemented!()
                 }
@@ -97,39 +113,62 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem for File
         }
     }
 
-    fn close(&self, mut fd: FileFd) -> Result<(), CloseError> {
-        fd.x.mark_as_closed();
+    fn close(&self, mut fd: FileFd<Platform>) -> Result<(), CloseError> {
+        self.litebox.descriptor_table_mut().remove(fd);
         Ok(())
     }
 
-    fn read(&self, fd: &FileFd, buf: &mut [u8], offset: Option<usize>) -> Result<usize, ReadError> {
-        if fd.x.as_usize() != 0 {
+    fn read(
+        &self,
+        fd: &FileFd<Platform>,
+        buf: &mut [u8],
+        offset: Option<usize>,
+    ) -> Result<usize, ReadError> {
+        if self.litebox.descriptor_table().get_entry(fd).entry != StdioStream::Stdin {
             return Err(ReadError::NotForReading);
         }
         if offset.is_some() {
             unimplemented!()
         }
-        self.platform.read_from_stdin(buf).map_err(|e| match e {
-            StdioReadError::Closed => unimplemented!(),
-        })
+        self.litebox
+            .x
+            .platform
+            .read_from_stdin(buf)
+            .map_err(|e| match e {
+                StdioReadError::Closed => unimplemented!(),
+            })
     }
 
-    fn write(&self, fd: &FileFd, buf: &[u8], offset: Option<usize>) -> Result<usize, WriteError> {
-        let stream = match fd.x.as_usize() {
-            1 => StdioOutStream::Stdout,
-            2 => StdioOutStream::Stderr,
-            _ => return Err(WriteError::NotForWriting),
+    fn write(
+        &self,
+        fd: &FileFd<Platform>,
+        buf: &[u8],
+        offset: Option<usize>,
+    ) -> Result<usize, WriteError> {
+        let stream = match &self.litebox.descriptor_table().get_entry(fd).entry {
+            StdioStream::Stdin => return Err(WriteError::NotForWriting),
+            StdioStream::Stdout => StdioOutStream::Stdout,
+            StdioStream::Stderr => StdioOutStream::Stderr,
         };
         if offset.is_some() {
             unimplemented!()
         }
-        self.platform.write_to(stream, buf).map_err(|e| match e {
-            StdioWriteError::Closed => unimplemented!(),
-        })
+        self.litebox
+            .x
+            .platform
+            .write_to(stream, buf)
+            .map_err(|e| match e {
+                StdioWriteError::Closed => unimplemented!(),
+            })
     }
 
     #[expect(unused_variables, reason = "unimplemented")]
-    fn seek(&self, fd: &FileFd, offset: isize, whence: SeekWhence) -> Result<usize, SeekError> {
+    fn seek(
+        &self,
+        fd: &FileFd<Platform>,
+        offset: isize,
+        whence: SeekWhence,
+    ) -> Result<usize, SeekError> {
         unimplemented!()
     }
 
@@ -176,8 +215,7 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem for File
         }
     }
 
-    fn fd_file_status(&self, fd: &FileFd) -> Result<FileStatus, FileStatusError> {
-        assert!(matches!(fd.x.as_usize(), 0..=2));
+    fn fd_file_status(&self, fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
         Ok(FileStatus {
             file_type: FileType::CharacterDevice,
             mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
@@ -188,7 +226,7 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem for File
     #[expect(unused_variables, reason = "unimplemented")]
     fn with_metadata<T: core::any::Any, R>(
         &self,
-        fd: &FileFd,
+        fd: &FileFd<Platform>,
         f: impl FnOnce(&T) -> R,
     ) -> Result<R, crate::fs::errors::MetadataError> {
         unimplemented!()
@@ -197,7 +235,7 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem for File
     #[expect(unused_variables, reason = "unimplemented")]
     fn with_metadata_mut<T: core::any::Any, R>(
         &self,
-        fd: &FileFd,
+        fd: &FileFd<Platform>,
         f: impl FnOnce(&mut T) -> R,
     ) -> Result<R, crate::fs::errors::MetadataError> {
         unimplemented!()
@@ -206,7 +244,7 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem for File
     #[expect(unused_variables, reason = "unimplemented")]
     fn set_file_metadata<T: core::any::Any>(
         &self,
-        fd: &FileFd,
+        fd: &FileFd<Platform>,
         metadata: T,
     ) -> Result<Option<T>, crate::fs::errors::SetMetadataError<T>> {
         unimplemented!()
@@ -215,9 +253,16 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem for File
     #[expect(unused_variables, reason = "unimplemented")]
     fn set_fd_metadata<T: core::any::Any>(
         &self,
-        fd: &FileFd,
+        fd: &FileFd<Platform>,
         metadata: T,
     ) -> Result<Option<T>, crate::fs::errors::SetMetadataError<T>> {
         unimplemented!()
     }
+}
+
+crate::fd::enable_fds_for_subsystem! {
+    @ Platform: { crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider };
+    FileSystem<Platform>;
+    StdioStream;
+    -> FileFd<Platform>;
 }

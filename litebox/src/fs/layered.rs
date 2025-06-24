@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use hashbrown::HashMap;
 
 use crate::LiteBox;
-use crate::fd::FileFd;
+use crate::fd::TypedFd;
 use crate::path::Arg;
 use crate::sync;
 
@@ -47,18 +47,18 @@ pub enum LayeringSemantics {
 /// Future versions of the layering might support other configurable options for the layering.
 pub struct FileSystem<
     Platform: sync::RawSyncPrimitivesProvider,
-    Upper: super::FileSystem,
-    Lower: super::FileSystem,
+    Upper: super::FileSystem + 'static,
+    Lower: super::FileSystem + 'static,
 > {
+    litebox: LiteBox<Platform>,
     upper: Upper,
     lower: Lower,
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
     // sync-primitives platform, as well as cost of mutexes and such?
-    root: sync::RwLock<Platform, RootDir>,
+    root: sync::RwLock<Platform, RootDir<Upper, Lower>>,
     layering_semantics: LayeringSemantics,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
-    descriptors: sync::RwLock<Platform, Descriptors>,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower: super::FileSystem>
@@ -74,13 +74,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     ) -> Self {
         let sync = litebox.sync();
         let root = sync.new_rwlock(RootDir::new());
-        let descriptors = sync.new_rwlock(Descriptors::new());
         Self {
+            litebox: litebox.clone(),
             upper,
             lower,
             root,
             current_working_dir: "/".into(),
-            descriptors,
             layering_semantics,
         }
     }
@@ -187,66 +186,66 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         let RootDir {
             entries: root_entries,
         } = &mut *self.root.write();
-        self.descriptors
-            .write()
-            .iter_mut()
-            .filter(|Descriptor { path: p, .. }| p == path)
-            .for_each(
-                |Descriptor {
-                     path: _,
-                     flags,
-                     entry,
-                     position,
-                 }| {
-                    match entry.as_ref() {
-                        EntryX::Upper { fd: _ } => {
-                            // Need to do nothing, jump to next
-                            return;
-                        }
-                        EntryX::Lower { fd: _ } => {
-                            // fallthrough: we need to change this up to an upper-level entry
-                        }
-                        EntryX::Tombstone => unreachable!(),
+        self.litebox
+            .descriptor_table_mut()
+            .iter_mut::<Self>()
+            .map(|(_, e)| e)
+            .filter(|e| e.entry.path == path)
+            .for_each(|mut e| {
+                let Descriptor {
+                    path: _,
+                    flags,
+                    entry,
+                    position,
+                } = &mut e.entry;
+                match entry.as_ref() {
+                    EntryX::Upper { fd: _ } => {
+                        // Need to do nothing, jump to next
+                        return;
                     }
-                    // First, we set up the upper entry we'll be swapping/placing in.
-                    let upper_fd = self.upper.open(path, *flags, Mode::empty()).unwrap();
-                    let position = position.load(SeqCst);
-                    if position > 0 {
-                        self.upper
-                            .seek(
-                                &upper_fd,
-                                isize::try_from(position).unwrap(),
-                                SeekWhence::RelativeToBeginning,
-                            )
-                            .unwrap();
+                    EntryX::Lower { fd: _ } => {
+                        // fallthrough: we need to change this up to an upper-level entry
                     }
-                    let upper_entry = Arc::new(EntryX::Upper { fd: upper_fd });
-                    match Arc::strong_count(entry) {
-                        0 | 1 => unreachable!(), // We are holding one, and also there must be an entry in `root`
-                        2 => {
-                            // Perfect amount to trigger a `close` on the lower level, and remove
-                            // the underlying root entry, since further syncing is no longer
-                            // necessary.
-                            let old_entry = core::mem::replace(entry, upper_entry);
-                            let root_entry = root_entries.remove(path).unwrap();
-                            assert!(Arc::ptr_eq(&old_entry, &root_entry));
-                            drop(root_entry);
-                            let entry = Arc::into_inner(old_entry).unwrap();
-                            match entry {
-                                EntryX::Upper { .. } | EntryX::Tombstone => unreachable!(),
-                                EntryX::Lower { fd } => {
-                                    self.lower.close(fd).unwrap();
-                                }
+                    EntryX::Tombstone => unreachable!(),
+                }
+                // First, we set up the upper entry we'll be swapping/placing in.
+                let upper_fd = self.upper.open(path, *flags, Mode::empty()).unwrap();
+                let position = position.load(SeqCst);
+                if position > 0 {
+                    self.upper
+                        .seek(
+                            &upper_fd,
+                            isize::try_from(position).unwrap(),
+                            SeekWhence::RelativeToBeginning,
+                        )
+                        .unwrap();
+                }
+                let upper_entry = Arc::new(EntryX::Upper { fd: upper_fd });
+                match Arc::strong_count(entry) {
+                    0 | 1 => unreachable!(), // We are holding one, and also there must be an entry in `root`
+                    2 => {
+                        // Perfect amount to trigger a `close` on the lower level, and remove
+                        // the underlying root entry, since further syncing is no longer
+                        // necessary.
+                        let old_entry = core::mem::replace(entry, upper_entry);
+                        let root_entry = root_entries.remove(path).unwrap();
+                        assert!(Arc::ptr_eq(&old_entry, &root_entry));
+                        drop(root_entry);
+                        let entry = Arc::into_inner(old_entry).unwrap();
+                        match entry {
+                            EntryX::Upper { .. } | EntryX::Tombstone => unreachable!(),
+                            EntryX::Lower { fd } => {
+                                self.lower.close(fd).unwrap();
                             }
                         }
-                        _ => {
-                            // Other FDs are open with the same file too. We'll handle the open one
-                            // here locally, and a future FD will take care of the relevant closing.
-                            *entry = upper_entry;
-                        }
                     }
-                },
-            );
+                    _ => {
+                        // Other FDs are open with the same file too. We'll handle the open one
+                        // here locally, and a future FD will take care of the relevant closing.
+                        *entry = upper_entry;
+                    }
+                }
+            });
 
         Ok(())
     }
@@ -284,15 +283,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
 {
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower: super::FileSystem>
-    super::FileSystem for FileSystem<Platform, Upper, Lower>
+impl<
+    Platform: sync::RawSyncPrimitivesProvider,
+    Upper: super::FileSystem + 'static,
+    Lower: super::FileSystem + 'static,
+> super::FileSystem for FileSystem<Platform, Upper, Lower>
 {
     fn open(
         &self,
         path: impl crate::path::Arg,
         flags: OFlags,
         mode: Mode,
-    ) -> Result<crate::fd::FileFd, OpenError> {
+    ) -> Result<FileFd<Platform, Upper, Lower>, OpenError> {
         let currently_supported_oflags: OFlags =
             OFlags::CREAT | OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR;
         if flags.contains(currently_supported_oflags.complement()) {
@@ -321,7 +323,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     // same flags, and since it indicates that there is no such file at the upper
                     // level, we can just return that directly (with the "real" flags being wrapped
                     // up in the layered descriptor).
-                    return Ok(self.descriptors.write().insert(Descriptor {
+                    return Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
                         path,
                         flags,
                         entry: Arc::clone(entry),
@@ -345,7 +347,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         match self.upper.open(&*path, flags, mode) {
             Ok(fd) => {
                 let entry = Arc::new(EntryX::Upper { fd });
-                return Ok(self.descriptors.write().insert(Descriptor {
+                return Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
                     path,
                     flags,
                     entry,
@@ -401,7 +403,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             .entries
             .insert(path.clone(), Arc::clone(&entry));
         assert!(old.is_none());
-        Ok(self.descriptors.write().insert(Descriptor {
+        Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
             path,
             flags: original_flags,
             entry,
@@ -409,13 +411,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         }))
     }
 
-    fn close(&self, fd: crate::fd::FileFd) -> Result<(), CloseError> {
+    fn close(&self, fd: FileFd<Platform, Upper, Lower>) -> Result<(), CloseError> {
+        let Some(removed_entry) = self.litebox.descriptor_table_mut().remove(fd) else {
+            // Was duplicated, don't need to do anything.
+            return Ok(());
+        };
         let Descriptor {
             path,
             entry,
             flags: _,
             position: _,
-        } = self.descriptors.write().remove(fd);
+        } = removed_entry.entry;
         // We can first sanity check that we don't have a tombstone: none of the other operations
         // should ever cause the entry _at_ an fd to become a tombstone, even if the entry at the
         // path becomes a tombstone due to a file removal.
@@ -502,7 +508,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
 
     fn read(
         &self,
-        fd: &crate::fd::FileFd,
+        fd: &FileFd<Platform, Upper, Lower>,
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
@@ -510,8 +516,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         // upper-level file, we don't actually need to worry about a desync; a write to lower-level
         // file will successfully be seen as just being an upper level file. Thus, it is sufficient
         // just to delegate this operation based whether the entry points to upper or lower layers.
-        let descriptors = self.descriptors.read();
-        let descriptor = descriptors.get(fd);
+        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor = &descriptor_table.get_entry(fd).entry;
         if !descriptor.flags.contains(OFlags::RDONLY) && !descriptor.flags.contains(OFlags::RDWR) {
             return Err(ReadError::NotForReading);
         }
@@ -526,15 +532,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
 
     fn write(
         &self,
-        fd: &crate::fd::FileFd,
+        fd: &FileFd<Platform, Upper, Lower>,
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
         // Writing needs to be careful of how it is performing the write. Any upper-level file can
         // instantly be written to; but a lower-level file must become a upper-level file, before
         // actually being written to.
-        let descriptors = self.descriptors.read();
-        let descriptor = descriptors.get(fd);
+        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor_entry = descriptor_table.get_entry(fd);
+        let descriptor = &descriptor_entry.entry;
         if !descriptor.flags.contains(OFlags::WRONLY) && !descriptor.flags.contains(OFlags::RDWR) {
             return Err(WriteError::NotForWriting);
         }
@@ -563,7 +570,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         let path = descriptor.path.clone();
         // Drop the relevant lock, so we don't end up locking ourselves out when attempting to
         // migrate up
-        drop(descriptors);
+        drop(descriptor_entry);
+        drop(descriptor_table);
         // Change it to an upper-level file, also altering the file descriptor.
         match self.migrate_file_up(&path) {
             Ok(()) => {}
@@ -576,9 +584,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         self.write(fd, buf, offset)
     }
 
-    fn seek(&self, fd: &FileFd, offset: isize, whence: SeekWhence) -> Result<usize, SeekError> {
-        let descriptors = self.descriptors.read();
-        let descriptor = descriptors.get(fd);
+    fn seek(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+        offset: isize,
+        whence: SeekWhence,
+    ) -> Result<usize, SeekError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor = &descriptor_table.get_entry(fd).entry;
         // Perform the seek, and update the position info
         let position = match descriptor.entry.as_ref() {
             EntryX::Upper { fd } => self.upper.seek(fd, offset, whence)?,
@@ -874,9 +887,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         })
     }
 
-    fn fd_file_status(&self, fd: &FileFd) -> Result<FileStatus, FileStatusError> {
-        let descriptors = self.descriptors.read();
-        let descriptor = descriptors.get(fd);
+    fn fd_file_status(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+    ) -> Result<FileStatus, FileStatusError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor = &descriptor_table.get_entry(fd).entry;
         let FileStatus {
             file_type,
             mode,
@@ -897,11 +913,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
 
     fn with_metadata<T: core::any::Any, R>(
         &self,
-        fd: &FileFd,
+        fd: &FileFd<Platform, Upper, Lower>,
         f: impl FnOnce(&T) -> R,
     ) -> Result<R, super::errors::MetadataError> {
-        let descriptors = self.descriptors.read();
-        let descriptor = descriptors.get(fd);
+        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor = &descriptor_table.get_entry(fd).entry;
         match descriptor.entry.as_ref() {
             EntryX::Upper { fd } => self.upper.with_metadata(fd, f),
             EntryX::Lower { fd } => self.lower.with_metadata(fd, f),
@@ -911,11 +927,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
 
     fn with_metadata_mut<T: core::any::Any, R>(
         &self,
-        fd: &FileFd,
+        fd: &FileFd<Platform, Upper, Lower>,
         f: impl FnOnce(&mut T) -> R,
     ) -> Result<R, super::errors::MetadataError> {
-        let descriptors = self.descriptors.read();
-        let descriptor = descriptors.get(fd);
+        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor = &descriptor_table.get_entry(fd).entry;
         match descriptor.entry.as_ref() {
             EntryX::Upper { fd } => self.upper.with_metadata_mut(fd, f),
             EntryX::Lower { fd } => self.lower.with_metadata_mut(fd, f),
@@ -925,11 +941,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
 
     fn set_file_metadata<T: core::any::Any>(
         &self,
-        fd: &FileFd,
+        fd: &FileFd<Platform, Upper, Lower>,
         metadata: T,
     ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
-        let descriptors = self.descriptors.read();
-        let descriptor = descriptors.get(fd);
+        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor = &descriptor_table.get_entry(fd).entry;
         match descriptor.entry.as_ref() {
             EntryX::Upper { fd } => self.upper.set_file_metadata(fd, metadata),
             EntryX::Lower { fd } => self.lower.set_file_metadata(fd, metadata),
@@ -939,11 +955,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
 
     fn set_fd_metadata<T: core::any::Any>(
         &self,
-        fd: &FileFd,
+        fd: &FileFd<Platform, Upper, Lower>,
         metadata: T,
     ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
-        let descriptors = self.descriptors.read();
-        let descriptor = descriptors.get(fd);
+        let descriptor_table = self.litebox.descriptor_table();
+        let descriptor = &descriptor_table.get_entry(fd).entry;
         match descriptor.entry.as_ref() {
             EntryX::Upper { fd } => self.upper.set_fd_metadata(fd, metadata),
             EntryX::Lower { fd } => self.lower.set_fd_metadata(fd, metadata),
@@ -952,24 +968,22 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     }
 }
 
-type Descriptors = super::shared::Descriptors<Descriptor>;
-
-struct Descriptor {
+struct Descriptor<Upper: super::FileSystem + 'static, Lower: super::FileSystem + 'static> {
     path: String,
     flags: OFlags,
-    entry: Entry,
+    entry: Entry<Upper, Lower>,
     position: AtomicUsize,
 }
 
-struct RootDir {
+struct RootDir<Upper: super::FileSystem + 'static, Lower: super::FileSystem + 'static> {
     // keys are normalized paths; directories do not have the final `/` (thus the root would be at
     // the empty-string key "")
     //
     // Invariant: this only stores lower+tombstone entries, no upper entries will show up here.
-    entries: HashMap<String, Entry>,
+    entries: HashMap<String, Entry<Upper, Lower>>,
 }
 
-impl RootDir {
+impl<Upper: super::FileSystem, Lower: super::FileSystem> RootDir<Upper, Lower> {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
@@ -977,20 +991,22 @@ impl RootDir {
     }
 }
 
-type Entry = Arc<EntryX>;
+type Entry<Upper, Lower> = Arc<EntryX<Upper, Lower>>;
 
-enum EntryX {
+enum EntryX<Upper: super::FileSystem + 'static, Lower: super::FileSystem + 'static> {
     // This file should be considered a purely upper-level file, independent of whether lower level file exists or not.
-    Upper { fd: FileFd },
+    Upper { fd: TypedFd<Upper> },
     // This file is a lower-level file and does NOT exist in the upper level file.
-    Lower { fd: FileFd },
+    Lower { fd: TypedFd<Lower> },
     // This file exists in the lower level, but as far as the layered architecture is concerned,
     // this is marked as deleted. RIP (x_x)
     Tombstone,
 }
 
 crate::fd::enable_fds_for_subsystem! {
-    @Platform: { sync::RawSyncPrimitivesProvider }, Upper: { super::FileSystem }, Lower: { super::FileSystem };
+    @Platform: { sync::RawSyncPrimitivesProvider }, Upper: { super::FileSystem + 'static }, Lower: { super::FileSystem + 'static };
     FileSystem<Platform, Upper, Lower>;
-    Descriptor;
+    @Upper: { super::FileSystem + 'static }, Lower: { super::FileSystem + 'static };
+    Descriptor<Upper, Lower>;
+    -> FileFd<Platform, Upper, Lower>;
 }
