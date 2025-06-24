@@ -31,7 +31,7 @@ use crate::{
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
-        kernel_elf::validate_kernel_module_elf,
+        kernel_elf::validate_kernel_module_against_elf,
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,
@@ -375,12 +375,14 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         nranges,
     );
 
-    let mut module_memory_metadata = ModuleMemoryMetadata::new();
-
     // collect and maintain the memory ranges of a module locally until the module is validated and its metadata is registered in the global map
     // we don't maintain this content in the global map due to memory overhead. Instead, we could add its hash value to the global map to check the integrity.
-    let mut module_memory = ModuleMemory::new();
-    let mut memory_elf = MemoryContainer::new();
+    let mut module_memory_metadata = ModuleMemoryMetadata::new();
+
+    // a kernel module loaded in memory with relocations and patches
+    let mut module_in_memory = ModuleMemory::new();
+    // the kernel module's original ELF binary which is signed by the kernel build pipeline
+    let mut module_as_elf = MemoryContainer::new();
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         for heki_page in heki_pages {
@@ -396,9 +398,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                         return Err(Errno::EINVAL);
                     }
                     ModMemType::ElfBuffer => {
-                        // this capture the original ELF binary in memory which is provided by the VTL0 kernel for validation.
-                        // this original ELF binary is cryptographically signed by the kernel build pipeline.
-                        memory_elf
+                        module_as_elf
                             .write_vtl0_phys_bytes(
                                 VirtAddr::new(va),
                                 PhysAddr::new(pa),
@@ -416,7 +416,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                             return Err(Errno::EINVAL);
                         }
 
-                        module_memory
+                        module_in_memory
                             .write_vtl0_phys_bytes_by_type(
                                 VirtAddr::new(va),
                                 PhysAddr::new(pa),
@@ -439,22 +439,24 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         return Err(Errno::EINVAL);
     }
 
-    let elf_size = memory_elf.len();
+    let elf_size = module_as_elf.len();
     assert!(
         elf_size <= MODULE_VALIDATION_MAX_SIZE,
         "Module ELF size exceeds the maximum allowed size"
     );
 
-    let mut elf_buf = vec![0u8; elf_size];
-    memory_elf
-        .read_bytes(memory_elf.start().unwrap(), &mut elf_buf)
+    let mut original_elf_data = vec![0u8; elf_size];
+    module_as_elf
+        .read_bytes(module_as_elf.start().unwrap(), &mut original_elf_data)
         .map_err(|_| Errno::EINVAL)?;
-    memory_elf.clear();
+    module_as_elf.clear();
 
     #[cfg(debug_assertions)]
-    parse_modinfo(&elf_buf).map_err(|_| Errno::EINVAL)?;
+    parse_modinfo(&original_elf_data).map_err(|_| Errno::EINVAL)?;
 
-    if !validate_kernel_module_elf(&elf_buf, &module_memory).map_err(|_| Errno::EINVAL)? {
+    if !validate_kernel_module_against_elf(&module_in_memory, &original_elf_data)
+        .map_err(|_| Errno::EINVAL)?
+    {
         serial_println!("VSM: Found unexpected relocations in the loaded module");
         return Err(Errno::EINVAL);
     }
@@ -903,7 +905,6 @@ pub struct ModuleMemory {
     text: MemoryContainer,
     init_text: MemoryContainer,
     init_rodata: MemoryContainer,
-    ro_after_init: MemoryContainer,
 }
 
 impl ModuleMemory {
@@ -912,7 +913,6 @@ impl ModuleMemory {
             text: MemoryContainer::new(),
             init_text: MemoryContainer::new(),
             init_rodata: MemoryContainer::new(),
-            ro_after_init: MemoryContainer::new(),
         }
     }
 
@@ -921,7 +921,6 @@ impl ModuleMemory {
             ".text" => Some(&self.text),
             ".init.text" => Some(&self.init_text),
             ".init.rodata" => Some(&self.init_rodata),
-            ".data..ro_after_init" => Some(&self.ro_after_init),
             _ => None,
         }
     }
@@ -941,12 +940,10 @@ impl ModuleMemory {
             ModMemType::InitRoData => self
                 .init_rodata
                 .write_vtl0_phys_bytes(addr, phys_start, phys_end),
-            ModMemType::RoAfterInit => self
-                .ro_after_init
-                .write_vtl0_phys_bytes(addr, phys_start, phys_end),
             ModMemType::ElfBuffer
             | ModMemType::Data
             | ModMemType::RoData
+            | ModMemType::RoAfterInit
             | ModMemType::InitData => Ok(()), // we don't care/validate other memory types for now
             ModMemType::Unknown => Err(MemoryContainerError::InvalidType),
         }
