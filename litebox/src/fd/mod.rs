@@ -33,8 +33,9 @@ pub struct Descriptors<Platform: RawSyncPrimitivesProvider> {
 impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// Explicitly crate-internal: Create a new empty descriptor table.
     ///
-    /// This should only be invoked once per LiteBox system.
-    pub(crate) fn new(litebox: &LiteBox<Platform>) -> Self {
+    /// This is expected to be invoked only by [`crate::LiteBox`]'s creation method, and should not
+    /// be invoked anywhere else in the codebase.
+    pub(crate) fn new_from_litebox_creation(litebox: &LiteBox<Platform>) -> Self {
         let litebox = litebox.clone();
         Self {
             litebox,
