@@ -6,7 +6,7 @@
 )]
 
 mod temp_old_stuff;
-pub use temp_old_stuff::{FileFd, SocketFd};
+pub use temp_old_stuff::FileFd;
 
 use alloc::sync::Arc;
 use alloc::vec;
@@ -415,6 +415,7 @@ macro_rules! enable_fds_for_subsystem {
         $system:ty;
         $(@ $($ent_param:ident $(: { $($ent_constraint:tt)* })?),*;)?
         $entry:ty;
+        $(-> $fd:ident $(<$($fd_param:ident),*>)?;)?
     ) => {
         #[allow(unused, reason = "NOTE(jayb): remove this lint before merging the PR")]
         #[doc(hidden)]
@@ -439,6 +440,9 @@ macro_rules! enable_fds_for_subsystem {
                 Self { entry }
             }
         }
+        $(
+            pub type $fd $(<$($fd_param),*>)? = $crate::fd::TypedFd<$system>;
+        )?
     };
 }
 pub(crate) use enable_fds_for_subsystem;

@@ -70,7 +70,9 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         clippy::missing_panics_doc,
         reason = "after initialization, this will never panic"
     )]
-    pub fn descriptor_table(&self) -> impl core::ops::Deref<Target = Descriptors<Platform>> {
+    pub fn descriptor_table(
+        &self,
+    ) -> impl core::ops::Deref<Target = Descriptors<Platform>> + use<'_, Platform> {
         crate::sync::RwLockReadGuard::map(self.x.descriptors.read(), |x| x.as_ref().unwrap())
     }
 
@@ -82,7 +84,9 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         clippy::missing_panics_doc,
         reason = "after initialization, this will never panic"
     )]
-    pub fn descriptor_table_mut(&self) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> {
+    pub fn descriptor_table_mut(
+        &self,
+    ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {
         crate::sync::RwLockWriteGuard::map(self.x.descriptors.write(), |x| x.as_mut().unwrap())
     }
 }

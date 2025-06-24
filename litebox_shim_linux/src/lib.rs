@@ -181,10 +181,7 @@ impl Descriptors {
             None
         }
     }
-    fn remove_socket(
-        &mut self,
-        fd: u32,
-    ) -> Option<alloc::sync::Arc<crate::syscalls::net::Socket<Platform>>> {
+    fn remove_socket(&mut self, fd: u32) -> Option<alloc::sync::Arc<crate::syscalls::net::Socket>> {
         let fd = fd as usize;
         if let Some(Descriptor::Socket(socket_fd)) = self
             .descriptors
@@ -206,7 +203,7 @@ impl Descriptors {
             None
         }
     }
-    fn get_socket_fd(&self, fd: u32) -> Option<&crate::syscalls::net::Socket<Platform>> {
+    fn get_socket_fd(&self, fd: u32) -> Option<&crate::syscalls::net::Socket> {
         if let Descriptor::Socket(socket_fd) = self.descriptors.get(fd as usize)?.as_ref()? {
             Some(socket_fd)
         } else {
@@ -220,7 +217,7 @@ enum Descriptor {
     // Note we are using `Arc` here so that we can hold a reference to the socket
     // without holding a lock on the file descriptor (see `sys_accept` for an example).
     // TODO: this could be addressed by #120.
-    Socket(alloc::sync::Arc<crate::syscalls::net::Socket<Platform>>),
+    Socket(alloc::sync::Arc<crate::syscalls::net::Socket>),
     PipeReader {
         consumer: alloc::sync::Arc<crate::channel::Consumer<u8>>,
         close_on_exec: core::sync::atomic::AtomicBool,

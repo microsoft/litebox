@@ -21,22 +21,3 @@ impl FileFd {
         }
     }
 }
-
-/// An owned file descriptor for sockets.
-///
-/// This file descriptor **must** be consumed by a `close` operation. Otherwise, (when using crate
-/// feature `panic_on_unclosed_fd_drop`), will panic if dropped without closing.
-pub struct SocketFd {
-    pub(crate) x: OwnedFd,
-}
-
-impl SocketFd {
-    /// Get the equivalent internal-fd
-    pub(crate) fn as_internal_fd(&self) -> InternalFd {
-        assert!(!self.x.is_closed());
-        InternalFd {
-            raw: self.x.raw,
-            __kind: 1,
-        }
-    }
-}

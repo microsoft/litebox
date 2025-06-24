@@ -6,16 +6,15 @@ use core::{
 };
 
 use litebox::{
-    fd::SocketFd,
     fs::OFlags,
-    net::{ReceiveFlags, SendFlags},
+    net::{ReceiveFlags, SendFlags, SocketFd},
     platform::{RawConstPointer, RawMutPointer},
-    sync::RawSyncPrimitivesProvider,
 };
 use litebox_common_linux::{
     AddressFamily, SockFlags, SockType, SocketOption, SocketOptionName, TcpOption, errno::Errno,
 };
 
+use crate::Platform;
 use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox_net};
 
 const ADDR_MAX_LEN: usize = 128;
@@ -65,15 +64,17 @@ pub(super) struct SocketOptions {
 }
 
 // TODO: move `status` and `close_on_exec` to litebox once #119 is completed
-pub(crate) struct Socket<Platform: RawSyncPrimitivesProvider> {
-    pub(crate) fd: Option<SocketFd>,
+//
+// TODO: remove this once the full dup-supported descriptors in litebox are set up.
+pub(crate) struct Socket {
+    pub(crate) fd: Option<SocketFd<Platform>>,
     /// File status flags (see [`litebox::fs::OFlags::STATUS_FLAGS_MASK`])
     pub(crate) status: AtomicU32,
     pub(crate) close_on_exec: AtomicBool,
     options: litebox::sync::Mutex<Platform, SocketOptions>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider> Drop for Socket<Platform> {
+impl Drop for Socket {
     fn drop(&mut self) {
         if let Some(sockfd) = self.fd.take() {
             litebox_net().lock().close(sockfd);
@@ -81,9 +82,9 @@ impl<Platform: RawSyncPrimitivesProvider> Drop for Socket<Platform> {
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider> Socket<Platform> {
+impl Socket {
     pub(crate) fn new(
-        fd: SocketFd,
+        fd: SocketFd<Platform>,
         flags: SockFlags,
         litebox: &litebox::LiteBox<Platform>,
     ) -> Self {
@@ -223,14 +224,14 @@ impl<Platform: RawSyncPrimitivesProvider> Socket<Platform> {
         }
     }
 
-    fn try_accept(&self) -> Result<SocketFd, Errno> {
+    fn try_accept(&self) -> Result<SocketFd<Platform>, Errno> {
         litebox_net()
             .lock()
             .accept(self.fd.as_ref().unwrap())
             .map_err(Errno::from)
     }
 
-    fn accept(&self) -> Result<SocketFd, Errno> {
+    fn accept(&self) -> Result<SocketFd<Platform>, Errno> {
         if self.get_status().contains(OFlags::NONBLOCK) {
             self.try_accept()
         } else {
