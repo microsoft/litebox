@@ -1456,6 +1456,15 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
         syscall_callback as usize
     }
+
+    fn get_vdso_address(&self) -> Option<usize> {
+        let vdso_addr = unsafe { libc::getauxval(libc::AT_SYSINFO_EHDR) };
+        if vdso_addr == 0 {
+            None
+        } else {
+            Some(usize::try_from(vdso_addr).unwrap())
+        }
+    }
 }
 
 impl LinuxUserland {
