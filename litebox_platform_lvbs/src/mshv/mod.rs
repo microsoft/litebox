@@ -231,6 +231,7 @@ pub struct HvInitVpContext {
 #[bitfield]
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
+#[must_use]
 pub struct HvInputVtl {
     pub target_vtl: B4,
     pub use_target_vtl: bool,
@@ -375,6 +376,7 @@ impl HvGetVpRegistersOutput {
 #[bitfield]
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
+#[must_use]
 pub struct HvNestedEnlightenmentsControlFeatures {
     pub direct_hypercall: bool,
     #[skip]
@@ -384,6 +386,7 @@ pub struct HvNestedEnlightenmentsControlFeatures {
 #[bitfield]
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
+#[must_use]
 pub struct HvNestedEnlightenmentsControlHypercallControls {
     pub inter_partition_comm: bool,
     #[skip]
@@ -489,6 +492,7 @@ impl Default for HvInputModifyVtlProtectionMask {
 #[bitfield]
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
+#[must_use]
 pub struct HvRegisterVsmVpSecureVtlConfig {
     pub mbec_enabled: bool,
     pub tlb_locked: bool,
@@ -505,6 +509,7 @@ impl HvRegisterVsmVpSecureVtlConfig {
 #[bitfield]
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
+#[must_use]
 pub struct HvRegisterVsmPartitionConfig {
     pub enable_vtl_protection: bool,
     pub default_vtl_protection_mask: B4,
@@ -534,7 +539,7 @@ impl HvRegisterVsmPartitionConfig {
 
     /// Get the default VTL protection mask as a u64 value
     pub fn default_vtl_protection_mask_value(&self) -> u64 {
-        self.default_vtl_protection_mask() as u64
+        u64::from(self.default_vtl_protection_mask())
     }
 }
 
@@ -703,6 +708,7 @@ impl HvMessagePage {
 #[bitfield]
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
+#[must_use]
 pub struct HvSynicSint {
     pub vector: B8,
     #[skip]
@@ -794,6 +800,7 @@ pub struct HvMsrInterceptMessage {
 #[bitfield]
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
+#[must_use]
 pub struct HvPendingExceptionEvent {
     pub event_pending: bool,
     pub event_type: B3,
