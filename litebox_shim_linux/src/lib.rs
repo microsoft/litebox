@@ -511,6 +511,19 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
                     .map(|()| 0)
             })
         }),
+        #[cfg(target_arch = "x86")]
+        SyscallRequest::Fstatat64 {
+            dirfd,
+            pathname,
+            buf,
+            flags,
+        } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+            syscalls::file::sys_newfstatat(dirfd, path, flags).and_then(|stat| {
+                unsafe { buf.write_at_offset(0, stat.into()) }
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            })
+        }),
         SyscallRequest::Eventfd2 { initval, flags } => {
             syscalls::file::sys_eventfd2(initval, flags).map(|fd| fd as usize)
         }
