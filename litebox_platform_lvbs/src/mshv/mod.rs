@@ -125,7 +125,7 @@ pub const DEFAULT_REG_PIN_MASK: u64 = u64::MAX;
 
 bitflags::bitflags! {
     #[derive(Debug, PartialEq)]
-    pub struct HvPageProtFlags: u32 {
+    pub struct HvPageProtFlags: u8 {
         const HV_PAGE_ACCESS_NONE = 0x0;
         const HV_PAGE_READABLE = 0x1;
         const HV_PAGE_WRITABLE = 0x2;
