@@ -47,10 +47,10 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
     pub(crate) fn insert<Subsystem: FdEnabledSubsystem>(
         &mut self,
-        entry: Subsystem::Entry,
+        entry: impl Into<Subsystem::Entry>,
     ) -> TypedFd<Subsystem> {
         let entry = DescriptorEntry {
-            entry: alloc::boxed::Box::new(entry),
+            entry: alloc::boxed::Box::new(entry.into()),
         };
         let idx = self
             .entries
@@ -264,7 +264,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
 }
 
 /// LiteBox subsystems that support having file descriptors.
-pub trait FdEnabledSubsystem {
+pub trait FdEnabledSubsystem: Sized {
     #[doc(hidden)]
     type Entry: FdEnabledSubsystemEntry + 'static;
 }

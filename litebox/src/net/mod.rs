@@ -552,9 +552,7 @@ where
 
     /// Creates a new [`SocketFd`] for a newly-created [`SocketHandle`].
     fn new_socket_fd_for(&mut self, socket_handle: SocketHandle) -> SocketFd<Platform> {
-        self.litebox
-            .descriptor_table_mut()
-            .insert(socket_handle.into())
+        self.litebox.descriptor_table_mut().insert(socket_handle)
     }
 
     /// Close the socket at `fd`
