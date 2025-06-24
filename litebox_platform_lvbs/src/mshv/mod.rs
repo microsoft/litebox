@@ -231,7 +231,6 @@ pub struct HvInitVpContext {
 #[bitfield]
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
-#[must_use]
 pub struct HvInputVtl {
     pub target_vtl: B4,
     pub use_target_vtl: bool,
@@ -250,11 +249,6 @@ impl HvInputVtl {
     /// use the current VTL
     pub fn current() -> Self {
         Self::new().with_use_target_vtl(false)
-    }
-
-    /// Gets the target VTL as a u8 value
-    pub fn target_vtl_value(&self) -> u8 {
-        self.target_vtl()
     }
 }
 
@@ -376,7 +370,6 @@ impl HvGetVpRegistersOutput {
 #[bitfield]
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
-#[must_use]
 pub struct HvNestedEnlightenmentsControlFeatures {
     pub direct_hypercall: bool,
     #[skip]
@@ -386,7 +379,6 @@ pub struct HvNestedEnlightenmentsControlFeatures {
 #[bitfield]
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
-#[must_use]
 pub struct HvNestedEnlightenmentsControlHypercallControls {
     pub inter_partition_comm: bool,
     #[skip]
@@ -492,7 +484,6 @@ impl Default for HvInputModifyVtlProtectionMask {
 #[bitfield]
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
-#[must_use]
 pub struct HvRegisterVsmVpSecureVtlConfig {
     pub mbec_enabled: bool,
     pub tlb_locked: bool,
@@ -509,7 +500,6 @@ impl HvRegisterVsmVpSecureVtlConfig {
 #[bitfield]
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
-#[must_use]
 pub struct HvRegisterVsmPartitionConfig {
     pub enable_vtl_protection: bool,
     pub default_vtl_protection_mask: B4,
@@ -535,11 +525,6 @@ impl HvRegisterVsmPartitionConfig {
     /// Create from a u64 value for compatibility with existing code  
     pub fn from_u64(value: u64) -> Self {
         Self::from_bytes(value.to_le_bytes())
-    }
-
-    /// Get the default VTL protection mask as a u64 value
-    pub fn default_vtl_protection_mask_value(&self) -> u64 {
-        u64::from(self.default_vtl_protection_mask())
     }
 }
 
@@ -708,7 +693,6 @@ impl HvMessagePage {
 #[bitfield]
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
-#[must_use]
 pub struct HvSynicSint {
     pub vector: B8,
     #[skip]
@@ -800,7 +784,6 @@ pub struct HvMsrInterceptMessage {
 #[bitfield]
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
-#[must_use]
 pub struct HvPendingExceptionEvent {
     pub event_pending: bool,
     pub event_type: B3,
@@ -829,7 +812,7 @@ mod tests {
 
         // Test new_for_vtl constructor
         let vtl = HvInputVtl::new_for_vtl(5);
-        assert_eq!(vtl.target_vtl_value(), 5);
+        assert_eq!(vtl.target_vtl(), 5);
         assert!(vtl.use_target_vtl());
 
         // Test current constructor
@@ -840,7 +823,7 @@ mod tests {
         let mut vtl = HvInputVtl::new();
         vtl.set_target_vtl(10_u8);
         vtl.set_use_target_vtl(true);
-        assert_eq!(vtl.target_vtl_value(), 10);
+        assert_eq!(vtl.target_vtl(), 10);
         assert!(vtl.use_target_vtl());
 
         // Test size - should be 1 byte
@@ -848,11 +831,11 @@ mod tests {
 
         // Test that VTL values are properly bounded to 4 bits (0-15)
         let vtl = HvInputVtl::new_for_vtl(15);
-        assert_eq!(vtl.target_vtl_value(), 15);
+        assert_eq!(vtl.target_vtl(), 15);
 
         // Test that Default trait works
         let default_vtl = HvInputVtl::default();
-        assert_eq!(default_vtl.target_vtl_value(), 0);
+        assert_eq!(default_vtl.target_vtl(), 0);
         assert!(!default_vtl.use_target_vtl());
     }
 
@@ -874,7 +857,7 @@ mod tests {
 
         // Test the 4-bit protection mask field
         config.set_default_vtl_protection_mask(0b1010_u8);
-        assert_eq!(config.default_vtl_protection_mask_value(), 0b1010);
+        assert_eq!(u64::from(config.default_vtl_protection_mask()), 0b1010);
 
         // Test size - should be 8 bytes (64 bits)
         assert_eq!(core::mem::size_of::<HvRegisterVsmPartitionConfig>(), 8);
@@ -886,7 +869,7 @@ mod tests {
         assert!(restored.enable_vtl_protection());
         assert!(restored.zero_memory_on_reset());
         assert!(restored.intercept_page());
-        assert_eq!(restored.default_vtl_protection_mask_value(), 0b1010);
+        assert_eq!(u64::from(restored.default_vtl_protection_mask()), 0b1010);
 
         // Test that Default trait works
         let default_config = HvRegisterVsmPartitionConfig::default();
