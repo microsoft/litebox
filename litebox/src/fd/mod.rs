@@ -120,6 +120,41 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         })
     }
 
+    /// An iterator of descriptors and (mutable) entries for a subsystem
+    ///
+    /// Note: each of the entries take locks, thus should not be held on to for too long, in order
+    /// to prevent dead-locks.
+    pub(crate) fn iter_mut<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+    ) -> impl Iterator<
+        Item = (
+            InternalFd,
+            impl core::ops::DerefMut<Target = Subsystem::Entry>,
+        ),
+    > {
+        self.entries
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, entry)| {
+                entry.as_mut().and_then(|e| {
+                    let entry = e.write();
+                    if entry.matches_subsystem::<Subsystem>() {
+                        Some((
+                            InternalFd {
+                                raw: i.try_into().unwrap(),
+                                __kind: 0x42, // XXX(jayb): temporary hack to be removed before the PR
+                            },
+                            crate::sync::RwLockWriteGuard::map(entry, |e| {
+                                e.as_subsystem_mut::<Subsystem>()
+                            }),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+            })
+    }
+
     /// Use the entry at `fd` as read-only.
     pub(crate) fn with_entry<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> R
     where
