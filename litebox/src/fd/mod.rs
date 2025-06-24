@@ -45,7 +45,13 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     }
 
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
-    pub(crate) fn insert(&mut self, entry: DescriptorEntry) -> OwnedFd {
+    pub(crate) fn insert<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        entry: Subsystem::Entry,
+    ) -> TypedFd<Subsystem> {
+        let entry = DescriptorEntry {
+            entry: alloc::boxed::Box::new(entry),
+        };
         let idx = self
             .entries
             .iter()
@@ -56,19 +62,37 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             });
         let old = self.entries[idx].replace(Arc::new(self.litebox.sync().new_rwlock(entry)));
         assert!(old.is_none());
-        OwnedFd::new(idx)
+        TypedFd {
+            _phantom: PhantomData,
+            x: OwnedFd::new(idx),
+        }
     }
 
     /// Removes the entry at `fd`, closing out the file descriptor.
     ///
     /// Returns the descriptor entry if it is unique (i.e., it was not duplicated, or all duplicates
     /// have been cleared out).
-    pub(crate) fn remove(&mut self, mut fd: OwnedFd) -> Option<DescriptorEntry> {
+    ///
+    /// Prefer using [`Self::remove`] when possible, since it gives a simpler subsystem-specific
+    /// interface to this.
+    pub(crate) fn remove_owned(&mut self, mut fd: OwnedFd) -> Option<DescriptorEntry> {
         let Some(old) = self.entries[fd.as_usize()].take() else {
             unreachable!();
         };
         fd.mark_as_closed();
         Arc::into_inner(old).map(RwLock::into_inner)
+    }
+
+    /// Removes the entry at `fd`, closing out the file descriptor.
+    ///
+    /// Returns the descriptor entry if it is unique (i.e., it was not duplicated, or all duplicates
+    /// have been cleared out).
+    pub(crate) fn remove<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        fd: TypedFd<Subsystem>,
+    ) -> Option<Subsystem::Entry> {
+        self.remove_owned(fd.x)
+            .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
     }
 
     /// An iterator of descriptors and entries for a subsystem
@@ -120,6 +144,34 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         // somewhere.
         let mut entry = self.entries[fd.x.as_usize()].as_ref().unwrap().write();
         f(entry.as_subsystem_mut::<Subsystem>())
+    }
+
+    /// Get the entry at `fd`.
+    ///
+    /// Note: this grabs a lock, thus the result should not be held for too long, to prevent
+    /// deadlocks. Prefer using [`Self::with_entry`] when possible, to make life easier.
+    pub(crate) fn get_entry<Subsystem: FdEnabledSubsystem>(
+        &self,
+        fd: &TypedFd<Subsystem>,
+    ) -> impl core::ops::Deref<Target = Subsystem::Entry> + use<'_, Platform, Subsystem> {
+        crate::sync::RwLockReadGuard::map(
+            self.entries[fd.x.as_usize()].as_ref().unwrap().read(),
+            |e| e.as_subsystem::<Subsystem>(),
+        )
+    }
+
+    /// Get the entry at `fd`, mutably.
+    ///
+    /// Note: this grabs a lock, thus the result should not be held for too long, to prevent
+    /// deadlocks. Prefer using [`Self::with_entry_mut`] when possible, to make life easier.
+    pub(crate) fn get_entry_mut<Subsystem: FdEnabledSubsystem>(
+        &self,
+        fd: &TypedFd<Subsystem>,
+    ) -> impl core::ops::DerefMut<Target = Subsystem::Entry> + use<'_, Platform, Subsystem> {
+        crate::sync::RwLockWriteGuard::map(
+            self.entries[fd.x.as_usize()].as_ref().unwrap().write(),
+            |e| e.as_subsystem_mut::<Subsystem>(),
+        )
     }
 
     /// Get the corresponding integer value of the provided `fd`.
@@ -264,6 +316,17 @@ impl DescriptorEntry {
             .downcast_mut()
             .unwrap()
     }
+
+    /// Obtains `self` as the subsystem's entry type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if invalid for the particular subsystem.
+    fn into_subsystem_entry<Subsystem: FdEnabledSubsystem>(self) -> Subsystem::Entry {
+        *(self.entry as alloc::boxed::Box<dyn core::any::Any>)
+            .downcast()
+            .unwrap()
+    }
 }
 
 /// A file descriptor that refers to entries by the `Subsystem`.
@@ -368,6 +431,13 @@ macro_rules! enable_fds_for_subsystem {
         impl $(< $($ent_param $(: $($ent_constraint)*)?),* >)? $crate::fd::FdEnabledSubsystemEntry
             for DescriptorEntry $(< $($ent_param),* >)?
         {
+        }
+        impl $(< $($ent_param $(: $($ent_constraint)*)?),* >)? From<$entry>
+            for DescriptorEntry $(< $($ent_param),* >)?
+        {
+            fn from(entry: $entry) -> Self {
+                Self { entry }
+            }
         }
     };
 }
