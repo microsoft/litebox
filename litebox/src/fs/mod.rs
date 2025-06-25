@@ -14,8 +14,8 @@ pub mod layered;
 pub mod nine_p;
 pub mod tar_ro;
 
-// #[cfg(test)]
-// mod tests;
+#[cfg(test)]
+mod tests;
 
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError,
