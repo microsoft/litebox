@@ -14,6 +14,9 @@ use thiserror::Error;
 use crate::LiteBox;
 use crate::sync::{RawSyncPrimitivesProvider, RwLock};
 
+#[cfg(test)]
+mod tests;
+
 /// Storage of file descriptors and their entries.
 ///
 /// This particular object is also able to turn safely-typed file descriptors to/from unsafely-typed
