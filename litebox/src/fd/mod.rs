@@ -324,7 +324,7 @@ impl DescriptorEntry {
     /// Check if this entry matches the specified subsystem
     #[must_use]
     fn matches_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> bool {
-        core::any::TypeId::of::<&Subsystem::Entry>() == core::any::Any::type_id(self.entry.as_ref())
+        core::any::TypeId::of::<Subsystem::Entry>() == core::any::Any::type_id(self.entry.as_ref())
     }
 
     /// Obtains `self` as the subsystem's entry type.
