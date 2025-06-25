@@ -94,6 +94,7 @@ pub fn validate_kernel_module_against_elf(
             &mut reloc_ranges,
         )?;
 
+        // load relocated/patched section
         let mut section_in_memory = vec![0u8; section_from_elf.len()];
         section_memory_container
             .read_bytes(
@@ -282,7 +283,7 @@ fn identify_indirect_relocations(
                     }
                 };
 
-                // section-based binary patching relies on `r_addend` to specify the offsets to patch
+                // indirect relocations rely on `r_addend` to specify the offsets to patch
                 let start = r_addend;
                 if let Some(end) = start
                     .checked_add(reloc_size)

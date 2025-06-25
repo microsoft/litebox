@@ -384,6 +384,64 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     // the kernel module's original ELF binary which is signed by the kernel build pipeline
     let mut module_as_elf = MemoryContainer::new();
 
+    prepare_data_for_module_validation(
+        pa,
+        nranges,
+        &mut module_memory_metadata,
+        &mut module_in_memory,
+        &mut module_as_elf,
+    )?;
+
+    let elf_size = module_as_elf.len();
+    assert!(
+        elf_size <= MODULE_VALIDATION_MAX_SIZE,
+        "Module ELF size exceeds the maximum allowed size"
+    );
+
+    let mut original_elf_data = vec![0u8; elf_size];
+    module_as_elf
+        .read_bytes(module_as_elf.start().unwrap(), &mut original_elf_data)
+        .map_err(|_| Errno::EINVAL)?;
+    module_as_elf.clear();
+
+    #[cfg(debug_assertions)]
+    parse_modinfo(&original_elf_data).map_err(|_| Errno::EINVAL)?;
+
+    if !validate_kernel_module_against_elf(&module_in_memory, &original_elf_data)
+        .map_err(|_| Errno::EINVAL)?
+    {
+        serial_println!("VSM: Found unexpected relocations in the loaded module");
+        return Err(Errno::EINVAL);
+    }
+
+    // protect the memory ranges of a module based on their section types
+    for mod_mem_range in &module_memory_metadata {
+        protect_physical_memory_range(
+            mod_mem_range.phys_frame_range,
+            mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type),
+        )?;
+    }
+
+    // register the module memory in the global map and obtain a unique token for it
+    let token = crate::platform_low()
+        .vtl0_kernel_info
+        .module_memory_metadata
+        .register_module_memory_metadata(module_memory_metadata);
+    Ok(token)
+}
+
+// TODO: several VSM functions have similar VTL0 page walking and copying code. Combine them to avoid redundancy.
+/// This function copies data for module validation from VTL0 to VTL1
+///
+/// # Safety
+/// The caller must ensure that the provided `pa` and `nranges` are valid.
+fn prepare_data_for_module_validation(
+    pa: u64,
+    nranges: u64,
+    module_memory_metadata: &mut ModuleMemoryMetadata,
+    module_in_memory: &mut ModuleMemory,
+    module_as_elf: &mut MemoryContainer,
+) -> Result<(), Errno> {
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         for heki_page in heki_pages {
             for i in 0..usize::try_from(heki_page.nranges).unwrap_or(0) {
@@ -435,46 +493,10 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                 }
             }
         }
+        Ok(())
     } else {
-        return Err(Errno::EINVAL);
+        Err(Errno::EINVAL)
     }
-
-    let elf_size = module_as_elf.len();
-    assert!(
-        elf_size <= MODULE_VALIDATION_MAX_SIZE,
-        "Module ELF size exceeds the maximum allowed size"
-    );
-
-    let mut original_elf_data = vec![0u8; elf_size];
-    module_as_elf
-        .read_bytes(module_as_elf.start().unwrap(), &mut original_elf_data)
-        .map_err(|_| Errno::EINVAL)?;
-    module_as_elf.clear();
-
-    #[cfg(debug_assertions)]
-    parse_modinfo(&original_elf_data).map_err(|_| Errno::EINVAL)?;
-
-    if !validate_kernel_module_against_elf(&module_in_memory, &original_elf_data)
-        .map_err(|_| Errno::EINVAL)?
-    {
-        serial_println!("VSM: Found unexpected relocations in the loaded module");
-        return Err(Errno::EINVAL);
-    }
-
-    // protect the memory ranges of a module based on their section types
-    for mod_mem_range in &module_memory_metadata {
-        protect_physical_memory_range(
-            mod_mem_range.phys_frame_range,
-            mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type),
-        )?;
-    }
-
-    // register the module memory in the global map and obtain a unique token for it
-    let token = crate::platform_low()
-        .vtl0_kernel_info
-        .module_memory_metadata
-        .register_module_memory_metadata(module_memory_metadata);
-    Ok(token)
 }
 
 /// VSM function for supporting the initialization of a guest kernel module including
