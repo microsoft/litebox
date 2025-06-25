@@ -31,7 +31,7 @@ use crate::{
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
-        kernel_elf::{validate_kernel_module_against_elf, verify_module_signature},
+        kernel_elf::{validate_kernel_module_against_elf, verify_kernel_module_signature},
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,

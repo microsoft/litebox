@@ -4,7 +4,10 @@
 use alloc::vec::Vec;
 
 use crate::{
-    debug_serial_println, host::linux::ModuleSignature, mshv::vsm::ModuleMemory, serial_println,
+    debug_serial_println,
+    host::linux::{ModuleSignature, PkeyIdType},
+    mshv::vsm::ModuleMemory,
+    serial_println,
 };
 use alloc::vec;
 use cms::{content_info::ContentInfo, signed_data::SignedData};
@@ -20,8 +23,11 @@ use elf::{
     symbol::Symbol,
 };
 use rangemap::set::RangeSet;
-use rsa::{RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs1v15::Signature, signature::Verifier};
-use sha2::Sha512;
+use rsa::{
+    RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs1v15::Signature, pkcs8::AssociatedOid,
+    signature::Verifier,
+};
+use sha2::{OidSha512, Sha512};
 use x509_cert::{
     Certificate,
     der::{Decode, Encode, oid::ObjectIdentifier},
@@ -362,43 +368,91 @@ pub fn parse_modinfo(original_elf_data: &[u8]) -> Result<(), KernelElfError> {
 }
 
 /// This function verifies the signature of a Linux kernel module.
-/// When module signing is configured (which is mandatory for UEFI Secure Boot), the Linux kernel build pipeline
-/// signs each kernel module and appends the signature to it. This function extracts the signature and
-/// verifies it using the system certificate containing the pubic portion of the build pipeline key.
-/// A signed kernel module has the following layout:
-/// [message (module ELF)][variable-length signature (DER format)][`ModuleSignature`][`MODULE_SIGNATURE_MAGIC`][...]
+/// When module signing is configured, the Linux kernel build pipeline signs each kernel module and appends
+/// the signature to it. This function extracts the signature and verifies it using the system certificate which
+/// contains the pubic portion of the build pipeline key. VTL0 does not have access to the private portion.
 ///
-/// Note: Currently, this function is slow because it uses the `sha2` crate with the `force-soft` feature.
+/// Currently, this function is slow because it uses the `sha2` crate with the `force-soft` feature.
 /// We should consider using HW-accelerated SHA-512 in the future (need to save/restore vector registers).
-pub fn verify_module_signature(
-    module_data: &[u8],
+pub fn verify_kernel_module_signature(
+    signed_module: &[u8],
     cert: &Certificate,
 ) -> Result<(), VerificationError> {
-    const MODULE_SIGNATURE_MAGIC: &[u8] = b"~Module signature appended~";
-    const OID_SHA512: &str = "2.16.840.1.101.3.4.2.3";
     const OID_RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
 
-    let magic_offset = module_data
+    let (module_data, signature_der) = extract_data_and_signature(signed_module)?;
+    let (signature, digest_alg, signature_alg) = decode_signature(signature_der)?;
+
+    // We only support RSA with SHA-512 for now as most Linux distributions (including Azure Linux) use this combination.
+    if digest_alg != OidSha512::OID
+        || signature_alg != OID_RSA_ENCRYPTION.parse::<ObjectIdentifier>().unwrap()
+    {
+        todo!(
+            "Unsupported digest or signature algorithm: {:?}, {:?}",
+            digest_alg,
+            signature_alg
+        );
+    }
+
+    let key_info = &cert.tbs_certificate.subject_public_key_info;
+    let rsa_pubkey = RsaPublicKey::from_pkcs1_der(key_info.subject_public_key.raw_bytes())
+        .map_err(|_| VerificationError::InvalidCertificate)?;
+    let verifying_key = rsa::pkcs1v15::VerifyingKey::<Sha512>::new(rsa_pubkey);
+
+    if verifying_key.verify(module_data, &signature).is_ok() {
+        debug_serial_println!("VSM: Module signature verification succeeded");
+        Ok(())
+    } else {
+        serial_println!("VSM: Module signature verification failed");
+        Err(VerificationError::AuthenticationFailed)
+    }
+}
+
+/// This function extracts the module data and signature from a signed kernel module.
+/// A signed kernel module has the following layout:
+/// [module data (ELF)][signature (PKCS#7/DER)][`ModuleSignature`][`MODULE_SIGNATURE_MAGIC`]
+fn extract_data_and_signature(signed_module: &[u8]) -> Result<(&[u8], &[u8]), VerificationError> {
+    const MODULE_SIGNATURE_MAGIC: &[u8] = b"~Module signature appended~\n";
+
+    let magic_offset = signed_module
         .windows(MODULE_SIGNATURE_MAGIC.len())
         .rposition(|w| w == MODULE_SIGNATURE_MAGIC)
         .ok_or(VerificationError::SignatureNotFound)?;
     let sig_header_offset = magic_offset
         .checked_sub(core::mem::size_of::<ModuleSignature>())
         .ok_or(VerificationError::SignatureNotFound)?;
+
     #[expect(clippy::cast_ptr_alignment)]
     let module_signature = unsafe {
-        &*(module_data
+        &*(signed_module
             .as_ptr()
             .add(sig_header_offset)
             .cast::<ModuleSignature>())
     };
+    if module_signature.algo != 0
+        || module_signature.hash != 0
+        || module_signature.id_type != PkeyIdType::PkeyIdPkcs7 as u8
+        || module_signature.signer_len != 0
+        || module_signature.key_id_len != 0
+    {
+        return Err(VerificationError::InvalidSignature);
+    }
     let sig_len = usize::try_from(module_signature.sig_len())
-        .map_err(|_| VerificationError::SignatureNotFound)?;
+        .map_err(|_| VerificationError::InvalidSignature)?;
     let sig_offset = sig_header_offset
         .checked_sub(sig_len)
-        .ok_or(VerificationError::SignatureNotFound)?;
+        .ok_or(VerificationError::InvalidSignature)?;
 
-    let signature_der = &module_data[sig_offset..sig_header_offset];
+    let (module_data, rest) = signed_module.split_at(sig_offset);
+    let (signature_der, _) = rest.split_at(sig_len);
+    Ok((module_data, signature_der))
+}
+
+/// This function decodes the DER-encoded signature from a kernel module and returns the decoded signature
+/// along with the digest algorithm and signature algorithm OIDs.
+fn decode_signature(
+    signature_der: &[u8],
+) -> Result<(Signature, ObjectIdentifier, ObjectIdentifier), VerificationError> {
     let content_info =
         ContentInfo::from_der(signature_der).map_err(|_| VerificationError::InvalidSignature)?;
     let signed_data = SignedData::from_der(
@@ -416,34 +470,13 @@ pub fn verify_module_signature(
         .get(0)
         .ok_or(VerificationError::InvalidSignature)?;
 
-    // Most Linux distributions (including Azure Linux) use RSA with SHA-512 for module signing
-    if signer_info.digest_alg.oid != OID_SHA512.parse::<ObjectIdentifier>().unwrap()
-        || signer_info.signature_algorithm.oid
-            != OID_RSA_ENCRYPTION.parse::<ObjectIdentifier>().unwrap()
-    {
-        todo!(
-            "Unsupported digest or signature algorithm: {:?}, {:?}",
-            signer_info.digest_alg.oid,
-            signer_info.signature_algorithm.oid
-        );
-    }
-
     let signature = Signature::try_from(signer_info.signature.as_bytes())
         .map_err(|_| VerificationError::InvalidSignature)?;
-
-    let spki = &cert.tbs_certificate.subject_public_key_info;
-    let public_key = RsaPublicKey::from_pkcs1_der(spki.subject_public_key.raw_bytes())
-        .map_err(|_| VerificationError::InvalidCertificate)?;
-    let verifying_key = rsa::pkcs1v15::VerifyingKey::<Sha512>::new(public_key);
-
-    let message = &module_data[..sig_offset];
-    if verifying_key.verify(message, &signature).is_ok() {
-        debug_serial_println!("VSM: Module signature verification succeeded");
-        Ok(())
-    } else {
-        serial_println!("VSM: Module signature verification failed");
-        Err(VerificationError::AuthenticationFailed)
-    }
+    Ok((
+        signature,
+        signer_info.digest_alg.oid,
+        signer_info.signature_algorithm.oid,
+    ))
 }
 
 /// Error for Kernel ELF validation and relocation failures.
@@ -454,6 +487,7 @@ pub enum KernelElfError {
     SectionNotFound,
 }
 
+/// Errors for module signature verification failures.
 #[derive(Debug, PartialEq)]
 pub enum VerificationError {
     SignatureNotFound,

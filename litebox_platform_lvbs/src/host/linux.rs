@@ -89,6 +89,16 @@ impl CpuMask {
 #[allow(non_camel_case_types)]
 pub type __be32 = u32;
 
+#[repr(u8)]
+pub enum PkeyIdType {
+    PkeyIdPgp = 0,
+    PkeyIdX509 = 1,
+    PkeyIdPkcs7 = 2,
+}
+
+/// `module_signature` from [Linux](https://elixir.bootlin.com/linux/v6.6.85/source/include/linux/module_signature.h#L33)
+/// Linux kernel only supports PKCS#7 signatures, so `id_type` is always `PkeyIdType::PkeyIdPkcs7`. Also, other fields
+/// except for `sig_len` are always zero.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleSignature {
