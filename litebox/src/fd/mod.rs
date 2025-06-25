@@ -178,6 +178,34 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         f(entry.as_subsystem_mut::<Subsystem>())
     }
 
+    /// Use the entry at `internal_fd` as mutably.
+    ///
+    /// NOTE: Ideally, prefer using [`Self::with_entry_mut`] instead of this, since it provides a
+    /// nicer experience with respect to types. This current function is only to be used with
+    /// specialized usages that involve dealing with stuff around [`Self::iter`] and locking
+    /// disciplines, and thus should be considered an "advanced" usage.
+    ///
+    /// `f` is run iff it is the correct subsystem. Returns `Some` iff it is the correct subsystem.
+    pub(crate) fn with_entry_mut_via_internal_fd<Subsystem, F, R>(
+        &self,
+        internal_fd: InternalFd,
+        f: F,
+    ) -> Option<R>
+    where
+        Subsystem: FdEnabledSubsystem,
+        F: FnOnce(&mut Subsystem::Entry) -> R,
+    {
+        let mut entry = self.entries[usize::try_from(internal_fd.raw).unwrap()]
+            .as_ref()
+            .unwrap()
+            .write();
+        if entry.matches_subsystem::<Subsystem>() {
+            Some(f(entry.as_subsystem_mut::<Subsystem>()))
+        } else {
+            None
+        }
+    }
+
     /// Get the entry at `fd`.
     ///
     /// Note: this grabs a lock, thus the result should not be held for too long, to prevent
