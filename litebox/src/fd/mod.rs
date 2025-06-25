@@ -69,26 +69,16 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ///
     /// Returns the descriptor entry if it is unique (i.e., it was not duplicated, or all duplicates
     /// have been cleared out).
-    ///
-    /// Prefer using [`Self::remove`] when possible, since it gives a simpler subsystem-specific
-    /// interface to this.
-    pub(crate) fn remove_owned(&mut self, mut fd: OwnedFd) -> Option<DescriptorEntry> {
-        let Some(old) = self.entries[fd.as_usize()].take() else {
-            unreachable!();
-        };
-        fd.mark_as_closed();
-        Arc::into_inner(old).map(RwLock::into_inner)
-    }
-
-    /// Removes the entry at `fd`, closing out the file descriptor.
-    ///
-    /// Returns the descriptor entry if it is unique (i.e., it was not duplicated, or all duplicates
-    /// have been cleared out).
     pub(crate) fn remove<Subsystem: FdEnabledSubsystem>(
         &mut self,
-        fd: TypedFd<Subsystem>,
+        mut fd: TypedFd<Subsystem>,
     ) -> Option<Subsystem::Entry> {
-        self.remove_owned(fd.x)
+        let Some(old) = self.entries[fd.x.as_usize()].take() else {
+            unreachable!();
+        };
+        fd.x.mark_as_closed();
+        Arc::into_inner(old)
+            .map(RwLock::into_inner)
             .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
     }
 
@@ -420,7 +410,7 @@ pub(crate) struct InternalFd {
 
 /// An explicitly-private shared-common element of [`TypedFd`], denoting an owned (non-clonable)
 /// token of ownership over a file descriptor.
-pub(crate) struct OwnedFd {
+struct OwnedFd {
     raw: u32,
     closed: bool,
 }
