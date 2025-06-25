@@ -234,7 +234,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             let upper_entry = Arc::new(EntryX::Upper { fd: upper_fd });
             // Then we check up on replacing entries
             match Arc::strong_count(&entry) {
-                0 | 1 | 2 => {
+                0..=2 => {
                     // We are holding one, and also there must be an entry in `root` and the file
                     // descriptor table.
                     unreachable!()

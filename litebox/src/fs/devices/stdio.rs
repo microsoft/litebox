@@ -113,7 +113,7 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         }
     }
 
-    fn close(&self, mut fd: FileFd<Platform>) -> Result<(), CloseError> {
+    fn close(&self, fd: FileFd<Platform>) -> Result<(), CloseError> {
         self.litebox.descriptor_table_mut().remove(fd);
         Ok(())
     }
@@ -215,7 +215,7 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         }
     }
 
-    fn fd_file_status(&self, fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
+    fn fd_file_status(&self, _fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
         Ok(FileStatus {
             file_type: FileType::CharacterDevice,
             mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
