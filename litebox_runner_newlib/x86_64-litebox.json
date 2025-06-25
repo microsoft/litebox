@@ -1,0 +1,22 @@
+{
+  "arch": "x86_64",
+  "cpu": "x86-64",
+  "data-layout": "e-m:e-i64:64-f80:128-n8:16:32:64-S128",
+  "dynamic-linking": false,
+  "env": "gnu",
+  "executables": true,
+  "has-rpath": false,
+  "llvm-target": "x86_64-unknown-linux-gnu",
+  "linker-flavor": "gcc",
+  "linker-is-gnu": true,
+  "os": "none",
+  "position-independent-executables": false,
+  "pre-link-args": {
+    "gcc": ["-nostdlib", "-static"]
+  },
+  "relocation-model": "static",
+  "target-c-int-width": "32",
+  "target-endian": "little",
+  "target-pointer-width": "64",
+  "vendor": "unknown"
+}
