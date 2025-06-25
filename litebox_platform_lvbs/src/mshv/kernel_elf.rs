@@ -373,7 +373,7 @@ pub fn parse_modinfo(original_elf_data: &[u8]) -> Result<(), KernelElfError> {
 pub fn verify_module_signature(
     module_data: &[u8],
     cert: &Certificate,
-) -> Result<(), ValidationError> {
+) -> Result<(), VerificationError> {
     const MODULE_SIGNATURE_MAGIC: &[u8] = b"~Module signature appended~";
     const OID_SHA512: &str = "2.16.840.1.101.3.4.2.3";
     const OID_RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
@@ -381,10 +381,10 @@ pub fn verify_module_signature(
     let magic_offset = module_data
         .windows(MODULE_SIGNATURE_MAGIC.len())
         .rposition(|w| w == MODULE_SIGNATURE_MAGIC)
-        .ok_or(ValidationError::SignatureNotFound)?;
+        .ok_or(VerificationError::SignatureNotFound)?;
     let sig_header_offset = magic_offset
         .checked_sub(core::mem::size_of::<ModuleSignature>())
-        .ok_or(ValidationError::SignatureNotFound)?;
+        .ok_or(VerificationError::SignatureNotFound)?;
     #[expect(clippy::cast_ptr_alignment)]
     let module_signature = unsafe {
         &*(module_data
@@ -393,28 +393,28 @@ pub fn verify_module_signature(
             .cast::<ModuleSignature>())
     };
     let sig_len = usize::try_from(module_signature.sig_len())
-        .map_err(|_| ValidationError::SignatureNotFound)?;
+        .map_err(|_| VerificationError::SignatureNotFound)?;
     let sig_offset = sig_header_offset
         .checked_sub(sig_len)
-        .ok_or(ValidationError::SignatureNotFound)?;
+        .ok_or(VerificationError::SignatureNotFound)?;
 
     let signature_der = &module_data[sig_offset..sig_header_offset];
     let content_info =
-        ContentInfo::from_der(signature_der).map_err(|_| ValidationError::InvalidSignature)?;
+        ContentInfo::from_der(signature_der).map_err(|_| VerificationError::InvalidSignature)?;
     let signed_data = SignedData::from_der(
         &content_info
             .content
             .to_der()
-            .map_err(|_| ValidationError::InvalidSignature)?,
+            .map_err(|_| VerificationError::InvalidSignature)?,
     )
-    .map_err(|_| ValidationError::InvalidSignature)?;
+    .map_err(|_| VerificationError::InvalidSignature)?;
 
-    // `SignedData` can have multiple `SignerInfo`s. Linux kernel modules typically have only one `SignerInfo`.
+    // `SignedData` can have multiple `SignerInfo`s. A Linux kernel module typically has one `SignerInfo`.
     let signer_info = signed_data
         .signer_infos
         .0
         .get(0)
-        .ok_or(ValidationError::InvalidSignature)?;
+        .ok_or(VerificationError::InvalidSignature)?;
 
     // Most Linux distributions (including Azure Linux) use RSA with SHA-512 for module signing
     if signer_info.digest_alg.oid != OID_SHA512.parse::<ObjectIdentifier>().unwrap()
@@ -429,11 +429,11 @@ pub fn verify_module_signature(
     }
 
     let signature = Signature::try_from(signer_info.signature.as_bytes())
-        .map_err(|_| ValidationError::InvalidSignature)?;
+        .map_err(|_| VerificationError::InvalidSignature)?;
 
     let spki = &cert.tbs_certificate.subject_public_key_info;
     let public_key = RsaPublicKey::from_pkcs1_der(spki.subject_public_key.raw_bytes())
-        .map_err(|_| ValidationError::InvalidCertificate)?;
+        .map_err(|_| VerificationError::InvalidCertificate)?;
     let verifying_key = rsa::pkcs1v15::VerifyingKey::<Sha512>::new(public_key);
 
     let message = &module_data[..sig_offset];
@@ -442,7 +442,7 @@ pub fn verify_module_signature(
         Ok(())
     } else {
         serial_println!("VSM: Module signature verification failed");
-        Err(ValidationError::AuthenticationFailed)
+        Err(VerificationError::AuthenticationFailed)
     }
 }
 
@@ -455,7 +455,7 @@ pub enum KernelElfError {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum ValidationError {
+pub enum VerificationError {
     SignatureNotFound,
     InvalidSignature,
     InvalidCertificate,
