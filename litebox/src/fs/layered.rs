@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use hashbrown::HashMap;
 
 use crate::LiteBox;
-use crate::fd::TypedFd;
+use crate::fd::{InternalFd, TypedFd};
 use crate::path::Arg;
 use crate::sync;
 
@@ -186,66 +186,97 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         let RootDir {
             entries: root_entries,
         } = &mut *self.root.write();
-        self.litebox
-            .descriptor_table_mut()
-            .iter_mut::<Self>()
-            .map(|(_, e)| e)
-            .filter(|e| e.entry.path == path)
-            .for_each(|mut e| {
-                let Descriptor {
-                    path: _,
-                    flags,
-                    entry,
-                    position,
-                } = &mut e.entry;
-                match entry.as_ref() {
+        // First we figure out which entries need to be moved up. These entries are arc-cloned into
+        // a `Vec` so that we can release the lock the file descriptor table when setting things up
+        // within the upper layer.
+        let to_migrate: alloc::vec::Vec<(InternalFd, usize, OFlags, Entry<Upper, Lower>)> = self
+            .litebox
+            .descriptor_table()
+            .iter::<Self>()
+            .filter_map(|(internal_fd, e)| {
+                if e.entry.path != path {
+                    // Skip any that do not match the path
+                    return None;
+                }
+                match &*e.entry.entry {
                     EntryX::Upper { fd: _ } => {
                         // Need to do nothing, jump to next
-                        return;
+                        None
                     }
                     EntryX::Lower { fd: _ } => {
-                        // fallthrough: we need to change this up to an upper-level entry
+                        // We need to change this up to an upper-level entry.
+                        Some((
+                            internal_fd,
+                            e.entry.position.load(SeqCst),
+                            e.entry.flags,
+                            Arc::clone(&e.entry.entry),
+                        ))
                     }
                     EntryX::Tombstone => unreachable!(),
                 }
-                // First, we set up the upper entry we'll be swapping/placing in.
-                let upper_fd = self.upper.open(path, *flags, Mode::empty()).unwrap();
-                let position = position.load(SeqCst);
-                if position > 0 {
-                    self.upper
-                        .seek(
-                            &upper_fd,
-                            isize::try_from(position).unwrap(),
-                            SeekWhence::RelativeToBeginning,
-                        )
-                        .unwrap();
+            })
+            .collect();
+        // Now we can actually perform the migration, since we've unlocked the lock on the
+        // file-descriptor table, which allows us to actually access things within the upper/lower
+        // levels without trouble.
+        for (internal_fd, position, flags, entry) in to_migrate {
+            // First, we set up the upper entry we'll be swapping/placing in.
+            let upper_fd = self.upper.open(path, flags, Mode::empty()).unwrap();
+            if position > 0 {
+                self.upper
+                    .seek(
+                        &upper_fd,
+                        isize::try_from(position).unwrap(),
+                        SeekWhence::RelativeToBeginning,
+                    )
+                    .unwrap();
+            }
+            let upper_entry = Arc::new(EntryX::Upper { fd: upper_fd });
+            // Then we check up on replacing entries
+            match Arc::strong_count(&entry) {
+                0 | 1 | 2 => {
+                    // We are holding one, and also there must be an entry in `root` and the file
+                    // descriptor table.
+                    unreachable!()
                 }
-                let upper_entry = Arc::new(EntryX::Upper { fd: upper_fd });
-                match Arc::strong_count(entry) {
-                    0 | 1 => unreachable!(), // We are holding one, and also there must be an entry in `root`
-                    2 => {
-                        // Perfect amount to trigger a `close` on the lower level, and remove
-                        // the underlying root entry, since further syncing is no longer
-                        // necessary.
-                        let old_entry = core::mem::replace(entry, upper_entry);
-                        let root_entry = root_entries.remove(path).unwrap();
-                        assert!(Arc::ptr_eq(&old_entry, &root_entry));
-                        drop(root_entry);
-                        let entry = Arc::into_inner(old_entry).unwrap();
-                        match entry {
-                            EntryX::Upper { .. } | EntryX::Tombstone => unreachable!(),
-                            EntryX::Lower { fd } => {
-                                self.lower.close(fd).unwrap();
-                            }
+                3 => {
+                    // Perfect amount to trigger a `close` on the lower level, and remove
+                    // the underlying root entry, since further syncing is no longer
+                    // necessary.
+                    let old_entry = self
+                        .litebox
+                        .descriptor_table_mut()
+                        .with_entry_mut_via_internal_fd::<Self, _, _>(internal_fd, |entry| {
+                            core::mem::replace(&mut entry.entry.entry, upper_entry)
+                        })
+                        .expect("nothing should have changed the existing entry");
+                    assert!(Arc::ptr_eq(&old_entry, &entry));
+                    drop(entry);
+                    let root_entry = root_entries.remove(path).unwrap();
+                    assert!(Arc::ptr_eq(&old_entry, &root_entry));
+                    drop(root_entry);
+                    let entry = Arc::into_inner(old_entry).unwrap();
+                    match entry {
+                        EntryX::Upper { .. } | EntryX::Tombstone => unreachable!(),
+                        EntryX::Lower { fd } => {
+                            self.lower.close(fd).unwrap();
                         }
                     }
-                    _ => {
-                        // Other FDs are open with the same file too. We'll handle the open one
-                        // here locally, and a future FD will take care of the relevant closing.
-                        *entry = upper_entry;
-                    }
                 }
-            });
+                _ => {
+                    // Other FDs are open with the same file too. We'll handle the open one
+                    // here locally, and a future FD will take care of the relevant closing.
+                    let old_entry = self
+                        .litebox
+                        .descriptor_table_mut()
+                        .with_entry_mut_via_internal_fd::<Self, _, _>(internal_fd, |entry| {
+                            core::mem::replace(&mut entry.entry.entry, upper_entry)
+                        })
+                        .expect("nothing should have changed the existing entry");
+                    assert!(Arc::ptr_eq(&old_entry, &entry));
+                }
+            }
+        }
 
         Ok(())
     }
@@ -605,6 +636,11 @@ impl<
             Err(MigrationError::NotAFile) => return Err(WriteError::NotAFile),
             Err(MigrationError::PathError(_e)) => unreachable!(),
         }
+        // As a sanity check, in debug mode, confirm that it is now an upper file
+        debug_assert!(matches!(
+            *self.litebox.descriptor_table().get_entry(fd).entry.entry,
+            EntryX::Upper { .. }
+        ));
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
         self.write(fd, buf, offset)
