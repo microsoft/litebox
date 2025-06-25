@@ -96,7 +96,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                     Some((
                         InternalFd {
                             raw: i.try_into().unwrap(),
-                            __kind: 0x42, // XXX(jayb): temporary hack to be removed before the PR
                         },
                         crate::sync::RwLockReadGuard::map(entry, |e| e.as_subsystem::<Subsystem>()),
                     ))
@@ -129,7 +128,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                         Some((
                             InternalFd {
                                 raw: i.try_into().unwrap(),
-                                __kind: 0x42, // XXX(jayb): temporary hack to be removed before the PR
                             },
                             crate::sync::RwLockWriteGuard::map(entry, |e| {
                                 e.as_subsystem_mut::<Subsystem>()
@@ -390,10 +388,7 @@ impl<Subsystem: FdEnabledSubsystem> TypedFd<Subsystem> {
     /// Get the "internal FD"
     pub(crate) fn as_internal_fd(&self) -> InternalFd {
         assert!(!self.x.is_closed());
-        InternalFd {
-            raw: self.x.raw,
-            __kind: 0xff,
-        }
+        InternalFd { raw: self.x.raw }
     }
 }
 
@@ -402,10 +397,6 @@ impl<Subsystem: FdEnabledSubsystem> TypedFd<Subsystem> {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct InternalFd {
     pub(crate) raw: u32,
-    // XXX(jayb): This `__kind` field must go away before the PR is made. This is purely a temporary
-    // artifact to make some of the migration simpler to manage, because there are a large number of
-    // changes happening, and introducing this for a bit makes those changes easier to handle.
-    pub(crate) __kind: u8,
 }
 
 /// An explicitly-private shared-common element of [`TypedFd`], denoting an owned (non-clonable)
