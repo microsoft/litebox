@@ -594,7 +594,7 @@ where
             return Err(ConnectError::UnsupportedAddress(*addr));
         };
 
-        let descriptor_table = self.litebox.descriptor_table_mut();
+        let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table.get_entry_mut(fd);
         let socket_handle = &mut table_entry.entry;
 
@@ -637,7 +637,7 @@ where
             return Err(BindError::UnsupportedAddress(*socket_addr));
         };
 
-        let descriptor_table = self.litebox.descriptor_table_mut();
+        let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table.get_entry_mut(fd);
         let socket_handle = &mut table_entry.entry;
 
@@ -702,7 +702,7 @@ where
     /// the `fd` may grow. This function is allowed to silently cap the value to a reasonable upper
     /// bound.
     pub fn listen(&mut self, fd: &SocketFd<Platform>, backlog: u16) -> Result<(), ListenError> {
-        let descriptor_table = self.litebox.descriptor_table_mut();
+        let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table.get_entry_mut(fd);
         let socket_handle = &mut table_entry.entry;
 
@@ -780,7 +780,7 @@ where
     /// Accept a new incoming connection on a listening socket.
     pub fn accept(&mut self, fd: &SocketFd<Platform>) -> Result<SocketFd<Platform>, AcceptError> {
         self.automated_platform_interaction(PollDirection::Both);
-        let descriptor_table = self.litebox.descriptor_table_mut();
+        let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table.get_entry_mut(fd);
         let socket_handle = &mut table_entry.entry;
 
@@ -843,7 +843,7 @@ where
         buf: &[u8],
         flags: SendFlags,
     ) -> Result<usize, SendError> {
-        let descriptor_table = self.litebox.descriptor_table_mut();
+        let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table.get_entry_mut(fd);
         let socket_handle = &mut table_entry.entry;
 
@@ -880,7 +880,7 @@ where
         // doesn't hurt to do this too often (other than wasting energy), and this allows us to
         // possibly get packets where we might otherwise return with size 0 on the `receive`.
         self.automated_platform_interaction(PollDirection::Ingress);
-        let descriptor_table = self.litebox.descriptor_table_mut();
+        let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table.get_entry_mut(fd);
         let socket_handle = &mut table_entry.entry;
 
@@ -915,7 +915,7 @@ where
         fd: &SocketFd<Platform>,
         data: TcpOptionData,
     ) -> Result<(), errors::SetTcpOptionError> {
-        let descriptor_table = self.litebox.descriptor_table_mut();
+        let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table.get_entry_mut(fd);
         let socket_handle = &mut table_entry.entry;
         match socket_handle.protocol() {

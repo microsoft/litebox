@@ -159,7 +159,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         buf: &mut [u8],
         mut offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        let descriptor_table = self.litebox.descriptor_table_mut();
+        let descriptor_table = self.litebox.descriptor_table();
         let Descriptor::File {
             idx,
             position,
@@ -197,7 +197,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         offset: isize,
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
-        let descriptor_table = self.litebox.descriptor_table_mut();
+        let descriptor_table = self.litebox.descriptor_table();
         let Descriptor::File {
             idx,
             position,
@@ -374,7 +374,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         fd: &FileFd<Platform>,
         m: T,
     ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
-        match &mut self.litebox.descriptor_table_mut().get_entry_mut(fd).entry {
+        match &mut self.litebox.descriptor_table().get_entry_mut(fd).entry {
             Descriptor::File { metadata, .. } | Descriptor::Dir { metadata, .. } => {
                 Ok(metadata.insert(m))
             }

@@ -203,7 +203,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         buf: &mut [u8],
         mut offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        let descriptor_table = self.litebox.descriptor_table_mut();
+        let descriptor_table = self.litebox.descriptor_table();
         let Descriptor::File {
             file,
             read_allowed,
@@ -237,7 +237,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         buf: &[u8],
         mut offset: Option<usize>,
     ) -> Result<usize, WriteError> {
-        let descriptor_table = self.litebox.descriptor_table_mut();
+        let descriptor_table = self.litebox.descriptor_table();
         let Descriptor::File {
             file,
             read_allowed: _,
@@ -277,7 +277,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         offset: isize,
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
-        let descriptor_table = self.litebox.descriptor_table_mut();
+        let descriptor_table = self.litebox.descriptor_table();
         let Descriptor::File {
             file,
             read_allowed: _,

@@ -245,7 +245,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     // necessary.
                     let old_entry = self
                         .litebox
-                        .descriptor_table_mut()
+                        .descriptor_table()
                         .with_entry_mut_via_internal_fd::<Self, _, _>(internal_fd, |entry| {
                             core::mem::replace(&mut entry.entry.entry, upper_entry)
                         })
@@ -268,7 +268,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     // here locally, and a future FD will take care of the relevant closing.
                     let old_entry = self
                         .litebox
-                        .descriptor_table_mut()
+                        .descriptor_table()
                         .with_entry_mut_via_internal_fd::<Self, _, _>(internal_fd, |entry| {
                             core::mem::replace(&mut entry.entry.entry, upper_entry)
                         })
