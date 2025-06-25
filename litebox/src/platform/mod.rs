@@ -539,3 +539,33 @@ pub trait SystemInfoProvider {
     /// execution context and transfer control to the syscall handler.
     fn get_syscall_entry_point(&self) -> usize;
 }
+
+/// A provider for thread-local storage.
+pub trait ThreadLocalStorageProvider {
+    type ThreadLocalStorage;
+
+    /// Set a thread-local storage value for the current thread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if TLS is set already.
+    fn set_thread_local_storage(&self, value: Self::ThreadLocalStorage);
+
+    /// Invokes the provided callback function with the thread-local storage value for the current thread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if TLS is not set yet.
+    /// Panics if TLS is borrowed already (e.g., recursive call).
+    fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Self::ThreadLocalStorage) -> R;
+
+    /// Release the thread-local storage value for the current thread
+    ///
+    /// # Panics
+    ///
+    /// Panics if TLS is not set yet.
+    /// Panics if TLS is being used by [`Self::with_thread_local_storage_mut`].
+    fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage;
+}

@@ -14,6 +14,8 @@ use syscalls::Sysno;
 
 pub mod errno;
 
+extern crate alloc;
+
 // TODO(jayb): Should errno::Errno be publicly re-exported?
 
 bitflags::bitflags! {
@@ -681,13 +683,102 @@ pub unsafe fn wrfsbase(fs_base: usize) {
     }
 }
 
+/// Reads the GS segment base address
+///
+/// ## Safety
+///
+/// If `CR4.FSGSBASE` is not set, this instruction will throw an `#UD`.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rdgsbase() -> usize {
+    let ret: usize;
+    unsafe {
+        core::arch::asm!(
+            "rdgsbase {}",
+            out(reg) ret,
+            options(nostack, nomem)
+        );
+    }
+    ret
+}
+
+/// Writes the GS segment base address
+///
+/// ## Safety
+///
+/// If `CR4.FSGSBASE` is not set, this instruction will throw an `#UD`.
+///
+/// The caller must ensure that this write operation has no unsafe side
+/// effects, as the GS segment base address might be in use.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn wrgsbase(gs_base: usize) {
+    unsafe {
+        core::arch::asm!(
+            "wrgsbase {}",
+            in(reg) gs_base,
+            options(nostack, nomem)
+        );
+    }
+}
+
+/// Linux's `user_desc` struct used by the `set_thread_area` syscall.
 #[repr(C, packed)]
 #[derive(Debug, Clone)]
 pub struct UserDesc {
-    pub entry_number: i32,
-    pub base_addr: i32,
-    pub limit: i32,
-    pub flags: i32,
+    pub entry_number: u32,
+    pub base_addr: u32,
+    pub limit: u32,
+    pub flags: UserDescFlags,
+}
+
+bitfield::bitfield! {
+    /// Flags for the `user_desc` struct.
+    #[derive(Clone, Copy)]
+    pub struct UserDescFlags(u32);
+    impl Debug;
+    /// 1 if the segment is 32-bit
+    pub seg_32bit, set_seg_32bit: 0;
+    /// Contents of the segment
+    pub contents, set_contents: 1, 2;
+    /// Read-exec only
+    pub read_exec_only, set_read_exec_only: 3;
+    /// Limit in pages
+    pub limit_in_pages, set_limit_in_pages: 4;
+    /// Segment not present
+    pub seg_not_present, set_seg_not_present: 5;
+    /// Usable by userland
+    pub useable, set_useable: 6;
+    /// 1 if the segment is 64-bit (x86_64 only)
+    pub lm, set_lm: 7;
+}
+
+/// Struct for thread-local storage.
+pub struct ThreadLocalStorage<Platform: litebox::platform::RawPointerProvider> {
+    /// Indicates whether the TLS is being borrowed.
+    pub borrowed: bool,
+
+    #[cfg(target_arch = "x86")]
+    pub self_ptr: *mut ThreadLocalStorage<Platform>,
+    pub current_task: alloc::boxed::Box<Task>,
+
+    pub __phantom: core::marker::PhantomData<Platform>,
+}
+
+impl<Platform: litebox::platform::RawPointerProvider> ThreadLocalStorage<Platform> {
+    pub const fn new(task: alloc::boxed::Box<Task>) -> Self {
+        Self {
+            borrowed: false,
+            #[cfg(target_arch = "x86")]
+            self_ptr: core::ptr::null_mut(),
+            current_task: task,
+            __phantom: core::marker::PhantomData,
+        }
+    }
+}
+
+/// A task associated with a thread in LiteBox.
+pub struct Task {
+    /// Thread identifier
+    pub tid: u32,
 }
 
 #[repr(C)]
