@@ -391,6 +391,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
 /// `pa` and `nranges` specify a memory area containing the information about the kernel module to validate or protect.
 /// `flags` controls the validation process (unused for now).
 /// This function returns a unique `token` to VTL0, which is used to identify the module in subsequent calls.
+#[allow(clippy::too_many_lines)]
 pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Result<i64, Errno> {
     if !PhysAddr::new(pa).is_aligned(Size4KiB::SIZE) || nranges == 0 {
         serial_println!("VSM: invalid input address");
@@ -437,7 +438,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     #[cfg(debug_assertions)]
     parse_modinfo(&original_elf_data).map_err(|_| Errno::EINVAL)?;
 
-    verify_module_signature(
+    verify_kernel_module_signature(
         &original_elf_data,
         crate::platform_low()
             .vtl0_kernel_info

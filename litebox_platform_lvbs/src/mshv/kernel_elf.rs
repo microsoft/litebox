@@ -399,13 +399,9 @@ pub fn verify_kernel_module_signature(
         .map_err(|_| VerificationError::InvalidCertificate)?;
     let verifying_key = rsa::pkcs1v15::VerifyingKey::<Sha512>::new(rsa_pubkey);
 
-    if verifying_key.verify(module_data, &signature).is_ok() {
-        debug_serial_println!("VSM: Module signature verification succeeded");
-        Ok(())
-    } else {
-        serial_println!("VSM: Module signature verification failed");
-        Err(VerificationError::AuthenticationFailed)
-    }
+    verifying_key
+        .verify(module_data, &signature)
+        .map_err(|_| VerificationError::AuthenticationFailed)
 }
 
 /// This function extracts the module data and signature from a signed kernel module.
