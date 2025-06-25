@@ -5,8 +5,6 @@
     reason = "still under development, remove before merging PR"
 )]
 
-mod temp_old_stuff;
-
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
