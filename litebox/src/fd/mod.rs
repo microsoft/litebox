@@ -159,7 +159,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         F: FnOnce(&Subsystem::Entry) -> R,
     {
         // Since the typed FD should not have been created unless we had the correct subsystem in
-        // the first place, none of this should panic---if it does, someone has done a bad transmute
+        // the first place, none of this should panic---if it does, someone has done a bad cast
         // somewhere.
         let entry = self.entries[fd.x.as_usize()].as_ref().unwrap().read();
         f(entry.as_subsystem::<Subsystem>())
@@ -172,7 +172,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         F: FnOnce(&mut Subsystem::Entry) -> R,
     {
         // Since the typed FD should not have been created unless we had the correct subsystem in
-        // the first place, none of this should panic---if it does, someone has done a bad transmute
+        // the first place, none of this should panic---if it does, someone has done a bad cast
         // somewhere.
         let mut entry = self.entries[fd.x.as_usize()].as_ref().unwrap().write();
         f(entry.as_subsystem_mut::<Subsystem>())
@@ -285,9 +285,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             return Err(ErrRawIntFd::NotFound);
         };
         let owned_fd: &OwnedFd = stored_fd;
-        // SAFETY: Since `TypedFd` is `#[repr(transparent)]`, we can safety transmute the type over
-        // (it is essentially the correct type, we simply want to expose a wrapped-type variant of
-        // it). We've just confirmed that it is the correct subsystem too.
+        // SAFETY: Since `TypedFd` is `#[repr(transparent)]`, we can safety cast the type over (it
+        // is essentially the correct type, we simply want to expose a wrapped-type variant of it).
+        // We've just confirmed that it is the correct subsystem too.
         let typed_fd: &TypedFd<Subsystem> = unsafe { &*core::ptr::from_ref(owned_fd).cast() };
         Ok(typed_fd)
     }
@@ -390,7 +390,7 @@ impl DescriptorEntry {
 }
 
 /// A file descriptor that refers to entries by the `Subsystem`.
-#[repr(transparent)] // this allows us to transmute safely
+#[repr(transparent)] // this allows us to cast safely
 pub struct TypedFd<Subsystem: FdEnabledSubsystem> {
     _phantom: PhantomData<Subsystem>,
     x: OwnedFd,
