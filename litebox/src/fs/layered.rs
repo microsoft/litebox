@@ -516,17 +516,30 @@ impl<
         // upper-level file, we don't actually need to worry about a desync; a write to lower-level
         // file will successfully be seen as just being an upper level file. Thus, it is sufficient
         // just to delegate this operation based whether the entry points to upper or lower layers.
-        let descriptor_table = self.litebox.descriptor_table();
-        let descriptor = &descriptor_table.get_entry(fd).entry;
-        if !descriptor.flags.contains(OFlags::RDONLY) && !descriptor.flags.contains(OFlags::RDWR) {
-            return Err(ReadError::NotForReading);
-        }
-        let num_bytes = match descriptor.entry.as_ref() {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| {
+                if !descriptor.entry.flags.contains(OFlags::RDONLY)
+                    && !descriptor.entry.flags.contains(OFlags::RDWR)
+                {
+                    Err(ReadError::NotForReading)
+                } else {
+                    Ok(Arc::clone(&descriptor.entry.entry))
+                }
+            })?;
+        // Perform the actual operation
+        let num_bytes = match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.read(fd, buf, offset)?,
             EntryX::Lower { fd } => self.lower.read(fd, buf, offset)?,
             EntryX::Tombstone => unreachable!(),
         };
-        descriptor.position.fetch_add(num_bytes, SeqCst);
+        self.litebox
+            .descriptor_table()
+            .get_entry(fd)
+            .entry
+            .position
+            .fetch_add(num_bytes, SeqCst);
         Ok(num_bytes)
     }
 
@@ -539,39 +552,52 @@ impl<
         // Writing needs to be careful of how it is performing the write. Any upper-level file can
         // instantly be written to; but a lower-level file must become a upper-level file, before
         // actually being written to.
-        let descriptor_table = self.litebox.descriptor_table();
-        let descriptor_entry = descriptor_table.get_entry(fd);
-        let descriptor = &descriptor_entry.entry;
-        if !descriptor.flags.contains(OFlags::WRONLY) && !descriptor.flags.contains(OFlags::RDWR) {
-            return Err(WriteError::NotForWriting);
-        }
-        match descriptor.entry.as_ref() {
-            EntryX::Upper { fd } => {
-                let num_bytes = self.upper.write(fd, buf, offset)?;
-                descriptor.position.fetch_add(num_bytes, SeqCst);
+        let (entry, path) = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| {
+                if !descriptor.entry.flags.contains(OFlags::WRONLY)
+                    && !descriptor.entry.flags.contains(OFlags::RDWR)
+                {
+                    Err(WriteError::NotForWriting)
+                } else {
+                    Ok((
+                        Arc::clone(&descriptor.entry.entry),
+                        descriptor.entry.path.clone(),
+                    ))
+                }
+            })?;
+        match entry.as_ref() {
+            EntryX::Upper { fd: upper_fd } => {
+                let num_bytes = self.upper.write(upper_fd, buf, offset)?;
+                self.litebox
+                    .descriptor_table()
+                    .get_entry(fd)
+                    .entry
+                    .position
+                    .fetch_add(num_bytes, SeqCst);
                 return Ok(num_bytes);
             }
-            EntryX::Lower { fd } => {
+            EntryX::Lower { fd: lower_fd } => {
                 match self.layering_semantics {
                     LayeringSemantics::LowerLayerReadOnly => {
                         // fallthrough
                     }
                     LayeringSemantics::LowerLayerWritableFiles => {
                         // Allow direct write to lower layer
-                        let num_bytes = self.lower.write(fd, buf, offset)?;
-                        descriptor.position.fetch_add(num_bytes, SeqCst);
+                        let num_bytes = self.lower.write(lower_fd, buf, offset)?;
+                        self.litebox
+                            .descriptor_table()
+                            .get_entry(fd)
+                            .entry
+                            .position
+                            .fetch_add(num_bytes, SeqCst);
                         return Ok(num_bytes);
                     }
                 }
             }
             EntryX::Tombstone => unreachable!(),
         }
-        // Get the path, since we are gonna drop the mutexes
-        let path = descriptor.path.clone();
-        // Drop the relevant lock, so we don't end up locking ourselves out when attempting to
-        // migrate up
-        drop(descriptor_entry);
-        drop(descriptor_table);
         // Change it to an upper-level file, also altering the file descriptor.
         match self.migrate_file_up(&path) {
             Ok(()) => {}
@@ -590,15 +616,22 @@ impl<
         offset: isize,
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let descriptor = &descriptor_table.get_entry(fd).entry;
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry));
         // Perform the seek, and update the position info
-        let position = match descriptor.entry.as_ref() {
+        let position = match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.seek(fd, offset, whence)?,
             EntryX::Lower { fd } => self.lower.seek(fd, offset, whence)?,
             EntryX::Tombstone => unreachable!(),
         };
-        descriptor.position.store(position, SeqCst);
+        self.litebox
+            .descriptor_table()
+            .get_entry(fd)
+            .entry
+            .position
+            .store(position, SeqCst);
         Ok(position)
     }
 
@@ -891,13 +924,15 @@ impl<
         &self,
         fd: &FileFd<Platform, Upper, Lower>,
     ) -> Result<FileStatus, FileStatusError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let descriptor = &descriptor_table.get_entry(fd).entry;
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry));
         let FileStatus {
             file_type,
             mode,
             size,
-        } = match descriptor.entry.as_ref() {
+        } = match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.fd_file_status(fd)?,
             EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
             EntryX::Tombstone => unreachable!(),
@@ -916,9 +951,11 @@ impl<
         fd: &FileFd<Platform, Upper, Lower>,
         f: impl FnOnce(&T) -> R,
     ) -> Result<R, super::errors::MetadataError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let descriptor = &descriptor_table.get_entry(fd).entry;
-        match descriptor.entry.as_ref() {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry));
+        match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.with_metadata(fd, f),
             EntryX::Lower { fd } => self.lower.with_metadata(fd, f),
             EntryX::Tombstone => unreachable!(),
@@ -930,9 +967,11 @@ impl<
         fd: &FileFd<Platform, Upper, Lower>,
         f: impl FnOnce(&mut T) -> R,
     ) -> Result<R, super::errors::MetadataError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let descriptor = &descriptor_table.get_entry(fd).entry;
-        match descriptor.entry.as_ref() {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry));
+        match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.with_metadata_mut(fd, f),
             EntryX::Lower { fd } => self.lower.with_metadata_mut(fd, f),
             EntryX::Tombstone => unreachable!(),
@@ -944,9 +983,11 @@ impl<
         fd: &FileFd<Platform, Upper, Lower>,
         metadata: T,
     ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let descriptor = &descriptor_table.get_entry(fd).entry;
-        match descriptor.entry.as_ref() {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry));
+        match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.set_file_metadata(fd, metadata),
             EntryX::Lower { fd } => self.lower.set_file_metadata(fd, metadata),
             EntryX::Tombstone => unreachable!(),
@@ -958,9 +999,11 @@ impl<
         fd: &FileFd<Platform, Upper, Lower>,
         metadata: T,
     ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let descriptor = &descriptor_table.get_entry(fd).entry;
-        match descriptor.entry.as_ref() {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry));
+        match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.set_fd_metadata(fd, metadata),
             EntryX::Lower { fd } => self.lower.set_fd_metadata(fd, metadata),
             EntryX::Tombstone => unreachable!(),
