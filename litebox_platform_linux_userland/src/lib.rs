@@ -222,10 +222,7 @@ impl litebox::platform::ExitProvider for LinuxUserland {
         }
         .expect("Failed to exit group");
 
-        // should not reach here
-        loop {
-            unsafe { core::arch::asm!("hlt") };
-        }
+        unreachable!("exit_group should not return");
     }
 }
 
@@ -1447,7 +1444,7 @@ unsafe extern "C" fn syscall_handler(
     syscall_number: usize,
     ctx: *mut litebox_common_linux::PtRegs,
 ) -> isize {
-    // SAFETY: By the requirements of this function, it's to dereference a valid pointer to `PtRegs`.
+    // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
     let ctx = unsafe { &mut *ctx };
     match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
         Ok(d) => {

@@ -833,8 +833,16 @@ pub struct CloneArgs {
     pub cgroup: u64,
 }
 
+/// A descriptor for thread-local storage (TLS).
+///
+/// On `x86_64`, this is represented as a `u8`. The TLS pointer can point to
+/// an arbitrary-sized memory region.
 #[cfg(target_arch = "x86_64")]
 pub type ThreadLocalDescriptor = u8;
+/// A descriptor for thread-local storage (TLS).
+///
+/// On `x86`, this is represented as a `UserDesc`, which provides a more
+/// structured descriptor (e.g., base address, limit, flags).
 #[cfg(target_arch = "x86")]
 pub type ThreadLocalDescriptor = UserDesc;
 
@@ -875,7 +883,7 @@ pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     /// futex(clear_child_tid, FUTEX_WAKE, 1, NULL, NULL, 0);
     ///
     /// This operation wakes a single thread waiting on the specified memory location via futex.
-    /// Any errors from the futex wake operation are
+    /// Any errors from the futex wake operation are ignored.
     pub clear_child_tid: Option<Platform::RawMutPointer<i32>>,
 }
 
