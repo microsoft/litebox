@@ -76,14 +76,20 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     }
 
-    let (ancestor_modes, prog_data): (Vec<litebox::fs::Mode>, Vec<u8>) = {
+    let (ancestor_modes_and_users, prog_data): (Vec<(litebox::fs::Mode, u32)>, Vec<u8>) = {
         let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
         let ancestors: Vec<_> = prog.ancestors().collect();
         let modes: Vec<_> = ancestors
             .into_iter()
             .rev()
             .skip(1)
-            .map(|path| litebox::fs::Mode::from_bits(path.metadata().unwrap().st_mode()).unwrap())
+            .map(|path| {
+                let metadata = path.metadata().unwrap();
+                (
+                    litebox::fs::Mode::from_bits(metadata.st_mode()).unwrap(),
+                    metadata.st_uid(),
+                )
+            })
             .collect();
         let data = std::fs::read(prog).unwrap();
         let data = if cli_args.rewrite_syscalls {
@@ -116,32 +122,66 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let litebox = LiteBox::new(platform);
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
-        in_mem.with_root_privileges(|fs| {
-            let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
-            let ancestors: Vec<_> = prog.ancestors().collect();
-            for (path, &mode) in ancestors
-                .into_iter()
-                .skip(1)
-                .rev()
-                .skip(1)
-                .zip(&ancestor_modes)
-            {
-                fs.mkdir(path.to_str().unwrap(), mode).unwrap();
+        let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
+        let ancestors: Vec<_> = prog.ancestors().collect();
+        let mut prev_user = 0;
+        for (path, &mode_and_user) in ancestors
+            .into_iter()
+            .skip(1)
+            .rev()
+            .skip(1)
+            .zip(&ancestor_modes_and_users)
+        {
+            if prev_user == 0 {
+                // require root user
+                in_mem.with_root_privileges(|fs| {
+                    fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
+                    if mode_and_user.1 != 0 {
+                        // This file is owned by a non-root user, so we need to set the ownership to our default user
+                        fs.chown(path.to_str().unwrap(), Some(1000), Some(1000))
+                            .unwrap();
+                    }
+                });
+            } else {
+                in_mem
+                    .mkdir(path.to_str().unwrap(), mode_and_user.0)
+                    .unwrap();
             }
-            let fd = fs
-                .open(
-                    prog.to_str().unwrap(),
-                    litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
-                    *ancestor_modes.last().unwrap(),
-                )
-                .unwrap();
-            let mut data = prog_data.as_slice();
-            while !data.is_empty() {
-                let len = fs.write(&fd, data, None).unwrap();
-                data = &data[len..];
-            }
-            fs.close(fd).unwrap();
-        });
+            prev_user = mode_and_user.1;
+        }
+
+        let open_file =
+            |fs: &mut litebox::fs::in_mem::FileSystem<litebox_platform_multiplex::Platform>,
+             path,
+             mode| {
+                let fd = fs
+                    .open(
+                        path,
+                        litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                        mode,
+                    )
+                    .unwrap();
+                let mut data = prog_data.as_slice();
+                while !data.is_empty() {
+                    let len = fs.write(&fd, data, None).unwrap();
+                    data = &data[len..];
+                }
+                fs.close(fd).unwrap();
+            };
+        let last = ancestor_modes_and_users.last().unwrap();
+        if prev_user == 0 {
+            in_mem.with_root_privileges(|fs| {
+                open_file(fs, prog.to_str().unwrap(), last.0);
+                if last.1 != 0 {
+                    // This file is owned by a non-root user, so we need to set the ownership to our default user
+                    fs.chown(prog.to_str().unwrap(), Some(1000), Some(1000))
+                        .unwrap();
+                }
+            });
+        } else {
+            open_file(&mut in_mem, prog.to_str().unwrap(), last.0);
+        }
+
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(&litebox, tar_data);
         let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&litebox);
         litebox::fs::layered::FileSystem::new(
