@@ -410,19 +410,20 @@ pub fn verify_kernel_module_signature(
 fn extract_data_and_signature(signed_module: &[u8]) -> Result<(&[u8], &[u8]), VerificationError> {
     const MODULE_SIGNATURE_MAGIC: &[u8] = b"~Module signature appended~\n";
 
-    let magic_offset = signed_module
-        .windows(MODULE_SIGNATURE_MAGIC.len())
-        .rposition(|w| w == MODULE_SIGNATURE_MAGIC)
-        .ok_or(VerificationError::SignatureNotFound)?;
-    let sig_header_offset = magic_offset
-        .checked_sub(core::mem::size_of::<ModuleSignature>())
+    let module_signature_offset = signed_module
+        .len()
+        .checked_sub(core::mem::size_of::<ModuleSignature>() + MODULE_SIGNATURE_MAGIC.len())
+        .filter(|offset| {
+            &signed_module[offset + core::mem::size_of::<ModuleSignature>()..]
+                == MODULE_SIGNATURE_MAGIC
+        })
         .ok_or(VerificationError::SignatureNotFound)?;
 
     #[expect(clippy::cast_ptr_alignment)]
     let module_signature = unsafe {
         &*(signed_module
             .as_ptr()
-            .add(sig_header_offset)
+            .add(module_signature_offset)
             .cast::<ModuleSignature>())
     };
     if module_signature.algo != 0
@@ -435,11 +436,11 @@ fn extract_data_and_signature(signed_module: &[u8]) -> Result<(&[u8], &[u8]), Ve
     }
     let sig_len = usize::try_from(module_signature.sig_len())
         .map_err(|_| VerificationError::InvalidSignature)?;
-    let sig_offset = sig_header_offset
+    let signature_offset = module_signature_offset
         .checked_sub(sig_len)
         .ok_or(VerificationError::InvalidSignature)?;
 
-    let (module_data, rest) = signed_module.split_at(sig_offset);
+    let (module_data, rest) = signed_module.split_at(signature_offset);
     let (signature_der, _) = rest.split_at(sig_len);
     Ok((module_data, signature_der))
 }
