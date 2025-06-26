@@ -592,7 +592,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
         #[cfg(feature = "lock_tracing")]
         let attempt = self
             .tracker
-            .begin_lock_attempt(LockType::RwLockRead, &self.raw.state);
+            .begin_lock_attempt(LockType::RwLockRead, &raw const self.raw.state);
         self.raw.read();
         RwLockReadGuard {
             rwlock: self,
@@ -607,7 +607,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
         #[cfg(feature = "lock_tracing")]
         let attempt = self
             .tracker
-            .begin_lock_attempt(LockType::RwLockWrite, &self.raw.state);
+            .begin_lock_attempt(LockType::RwLockWrite, &raw const self.raw.state);
         self.raw.write();
         RwLockWriteGuard {
             rwlock: self,
