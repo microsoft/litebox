@@ -1,5 +1,6 @@
 use crate::mshv::{HvPageProtFlags, vtl1_mem_layout::PAGE_SIZE};
 use num_enum::TryFromPrimitive;
+use x86_64::{PhysAddr, VirtAddr};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -90,13 +91,57 @@ pub(crate) fn mod_mem_type_to_mem_attr(mod_mem_type: ModMemType) -> MemAttr {
     mem_attr
 }
 
+/// `HekiRange` is a generic container for various types of memory ranges.
+/// It has an `attributes` field which can be interpreted differently based on the context like
+/// `MemAttr`, `KdataType`, `ModMemType`, or `KexecType`.
 #[derive(Default, Clone, Copy)]
 #[repr(C, packed)]
 pub struct HekiRange {
     pub va: u64,
     pub pa: u64,
     pub epa: u64,
-    pub attributes: u64, // MemAttr, KdataType, ModMemType, or KexecType depending on which VSM function is using it
+    pub attributes: u64,
+}
+
+impl HekiRange {
+    #[inline]
+    pub fn is_aligned<U>(&self, align: U) -> bool
+    where
+        U: Into<u64> + Copy,
+    {
+        let va = self.va;
+        let pa = self.pa;
+        let epa = self.epa;
+
+        VirtAddr::new(va).is_aligned(align)
+            && PhysAddr::new(pa).is_aligned(align)
+            && PhysAddr::new(epa).is_aligned(align)
+    }
+
+    #[inline]
+    pub fn mem_attr(&self) -> Option<MemAttr> {
+        let attr = self.attributes;
+        MemAttr::from_bits(attr)
+    }
+
+    #[inline]
+    pub fn mod_mem_type(&self) -> ModMemType {
+        let attr = self.attributes;
+        ModMemType::try_from(attr).unwrap_or(ModMemType::Unknown)
+    }
+
+    #[inline]
+    pub fn heki_kdata_type(&self) -> HekiKdataType {
+        let attr = self.attributes;
+        HekiKdataType::try_from(attr).unwrap_or(HekiKdataType::Unknown)
+    }
+
+    #[expect(dead_code)]
+    #[inline]
+    pub fn heki_kexec_type(&self) -> HekiKexecType {
+        let attr = self.attributes;
+        HekiKexecType::try_from(attr).unwrap_or(HekiKexecType::Unknown)
+    }
 }
 
 #[expect(clippy::cast_possible_truncation)]
