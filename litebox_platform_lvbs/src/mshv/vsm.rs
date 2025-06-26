@@ -25,8 +25,8 @@ use crate::{
         VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE, VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags,
         X86Cr4Flags,
         heki::{
-            HekiPage, HekiRange, MemAttr, ModMemType, mem_attr_to_hv_page_prot_flags,
-            mod_mem_type_to_mem_attr,
+            HekiKdataType, HekiPage, HekiRange, MemAttr, ModMemType,
+            mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr,
         },
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
@@ -335,7 +335,6 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
                 let va = heki_range.va;
                 let pa = heki_range.pa;
                 let epa = heki_range.epa;
-                let kdata_type = heki_range.heki_kdata_type();
                 // TODO: load kernel data (e.g., into `BTreeMap` or other data structures) once we implement data consumers like `mshv_vsm_validate_guest_module`.
                 // for now, this function is a no-op and just prints the memory range we should load.
                 debug_serial_println!(
@@ -343,29 +342,24 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
                     va,
                     pa,
                     epa,
-                    kdata_type,
+                    heki_range.heki_kdata_type(),
                     epa - pa
                 );
 
-                if let HekiKdataType::SystemCerts = kdata_type {
+                if let HekiKdataType::SystemCerts = heki_range.heki_kdata_type() {
                     system_certs_mem
-                        .write_vtl0_phys_bytes(
-                            VirtAddr::new(va),
-                            PhysAddr::new(pa),
-                            PhysAddr::new(epa),
-                        )
+                        .write_bytes_from_heki_range(&heki_range)
                         .map_err(|_| Errno::EINVAL)?;
                 }
             }
         }
-        Ok(0)
     } else {
-        Err(Errno::EINVAL)
+        return Err(Errno::EINVAL);
     }
 
     if system_certs_mem.is_empty() {
         serial_println!("VSM: No system certificate found");
-        return Err(Errno::EINVAL);
+        Err(Errno::EINVAL)
     } else {
         let mut cert_buf = vec![0u8; system_certs_mem.len()];
         system_certs_mem
@@ -376,9 +370,10 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
             crate::platform_low()
                 .vtl0_kernel_info
                 .set_system_certificate(cert);
+            Ok(0)
         } else {
             serial_println!("VSM: Failed to parse system certificate");
-            return Err(Errno::EINVAL);
+            Err(Errno::EINVAL)
         }
     }
 
@@ -391,7 +386,6 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
 /// `pa` and `nranges` specify a memory area containing the information about the kernel module to validate or protect.
 /// `flags` controls the validation process (unused for now).
 /// This function returns a unique `token` to VTL0, which is used to identify the module in subsequent calls.
-#[allow(clippy::too_many_lines)]
 pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Result<i64, Errno> {
     if !PhysAddr::new(pa).is_aligned(Size4KiB::SIZE) || nranges == 0 {
         serial_println!("VSM: invalid input address");
@@ -438,14 +432,18 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     #[cfg(debug_assertions)]
     parse_modinfo(&original_elf_data).map_err(|_| Errno::EINVAL)?;
 
-    verify_kernel_module_signature(
+    if verify_kernel_module_signature(
         &original_elf_data,
         crate::platform_low()
             .vtl0_kernel_info
             .get_system_certificate()
             .unwrap(),
     )
-    .map_err(|_| Errno::EINVAL)?;
+    .is_err()
+    {
+        serial_println!("VSM: Failed to verify the module signature");
+        return Err(Errno::EINVAL);
+    }
 
     if !validate_kernel_module_against_elf(&module_in_memory, &original_elf_data)
         .map_err(|_| Errno::EINVAL)?
