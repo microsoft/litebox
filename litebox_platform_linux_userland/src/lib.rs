@@ -293,9 +293,7 @@ extern "C" fn thread_start(
         );
     }
 
-    loop {
-        unsafe { core::arch::asm!("hlt") }
-    }
+    unreachable!();
 }
 
 impl litebox::platform::ThreadProvider for LinuxUserland {
@@ -424,10 +422,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         }
         .expect("Failed to exit");
 
-        // should not reach here
-        loop {
-            unsafe { core::arch::asm!("hlt") };
-        }
+        unreachable!("exit should not return");
     }
 }
 
