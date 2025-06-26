@@ -22,8 +22,9 @@ use litebox::{
     LiteBox,
     fs::FileSystem,
     mm::{PageManager, linux::PAGE_SIZE},
-    platform::{ExitProvider as _, RawConstPointer as _, RawMutPointer as _},
+    platform::{RawConstPointer as _, RawMutPointer as _},
     sync::RwLock,
+    utils::ReinterpretUnsignedExt,
 };
 use litebox_common_linux::{SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
@@ -287,13 +288,8 @@ const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
     let res: Result<usize, Errno> = match request {
         SyscallRequest::Ret(errno) => Err(errno),
-        SyscallRequest::Exit { status } => {
-            // XXX: Currently, this terminates the entire process rather than a single thread. See
-            // https://github.com/MSRSSP/litebox/pull/138#issuecomment-2946597758 for how
-            // `ThreadProvider` will provide an interface that can be used at this point.
-            litebox_platform_multiplex::platform().exit(status)
-        }
-        SyscallRequest::ExitGroup { status } => litebox_platform_multiplex::platform().exit(status),
+        SyscallRequest::Exit { status } => syscalls::process::sys_exit(status),
+        SyscallRequest::ExitGroup { status } => syscalls::process::sys_exit_group(status),
         SyscallRequest::Read { fd, buf, count } => {
             // Note some applications (e.g., `node`) seem to assume that getting fewer bytes than
             // requested indicates EOF.
@@ -502,6 +498,7 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
                 .ok_or(Errno::EFAULT)
                 .map(|()| 0)
         }),
+        #[cfg(target_arch = "x86_64")]
         SyscallRequest::Newfstatat {
             dirfd,
             pathname,
@@ -524,8 +521,70 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
                 Ok(0)
             })
         }
+        SyscallRequest::Clone { args, ctx } => {
+            if let Some(clone_args) = unsafe { args.read_at_offset(0) } {
+                let clone_args = clone_args.into_owned();
+                if clone_args.cgroup != 0 {
+                    unimplemented!("Clone with cgroup is not supported");
+                }
+                if clone_args.set_tid != 0 {
+                    unimplemented!("Clone with set_tid is not supported");
+                }
+                if clone_args.exit_signal != 0 {
+                    unimplemented!("Clone with exit_signal is not supported");
+                }
+                let parent_tid = if clone_args.parent_tid == 0 {
+                    None
+                } else {
+                    Some(MutPtr::from_usize(
+                        usize::try_from(clone_args.parent_tid).unwrap(),
+                    ))
+                };
+                let stack = if clone_args.stack == 0 {
+                    None
+                } else {
+                    Some(MutPtr::from_usize(
+                        usize::try_from(clone_args.stack).unwrap(),
+                    ))
+                };
+                let child_tid = if clone_args.child_tid == 0 {
+                    None
+                } else {
+                    Some(MutPtr::from_usize(
+                        usize::try_from(clone_args.child_tid).unwrap(),
+                    ))
+                };
+                let tls = if clone_args.tls != 0 {
+                    Some(MutPtr::from_usize(usize::try_from(clone_args.tls).unwrap()))
+                } else {
+                    None
+                };
+                usize::try_from(clone_args.stack_size)
+                    .map_err(|_| Errno::EINVAL)
+                    .and_then(|stack_size| {
+                        syscalls::process::sys_clone(
+                            clone_args.flags,
+                            parent_tid,
+                            stack,
+                            stack_size,
+                            child_tid,
+                            tls,
+                            ctx,
+                            ctx.get_ip(),
+                        )
+                    })
+            } else {
+                Err(Errno::EFAULT)
+            }
+        }
         SyscallRequest::SetThreadArea { user_desc } => {
             syscalls::process::set_thread_area(user_desc).map(|()| 0)
+        }
+        SyscallRequest::SetTidAddress { tidptr } => {
+            Ok(syscalls::process::sys_set_tid_address(tidptr).reinterpret_as_unsigned() as usize)
+        }
+        SyscallRequest::Gettid => {
+            Ok(syscalls::process::sys_gettid().reinterpret_as_unsigned() as usize)
         }
         SyscallRequest::GetRandom { buf, count, flags } => {
             syscalls::misc::sys_getrandom(buf, count, flags)

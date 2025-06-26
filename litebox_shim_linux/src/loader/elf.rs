@@ -16,6 +16,7 @@ use litebox::{
     fs::{Mode, OFlags},
     mm::linux::{MappingError, PAGE_SIZE},
     platform::{RawConstPointer as _, SystemInfoProvider as _},
+    utils::TruncateExt,
 };
 use litebox_common_linux::errno::Errno;
 use thiserror::Error;
@@ -231,13 +232,14 @@ fn get_trampoline_hdr(object: &mut ElfFile) -> Option<TrampolineHdr> {
         )
         .unwrap();
     let trampoline_shdr: &Shdr = unsafe { &*(buf.as_ptr().cast()) };
+    let trampoline_shdr_flags: u32 = trampoline_shdr.sh_flags.truncate();
     if trampoline_shdr.sh_type != elf::abi::SHT_PROGBITS
-        || trampoline_shdr.sh_flags != (elf::abi::SHF_ALLOC | elf::abi::SHF_EXECINSTR).into()
+        || trampoline_shdr_flags != elf::abi::SHF_ALLOC | elf::abi::SHF_EXECINSTR
     {
         return None;
     }
 
-    if trampoline_shdr.sh_size < size_of::<TrampolineSection>() as _ {
+    if trampoline_shdr.sh_size < size_of::<TrampolineSection>().try_into().unwrap() {
         return None;
     }
     let mut buf: [u8; size_of::<TrampolineSection>()] = [0; size_of::<TrampolineSection>()];

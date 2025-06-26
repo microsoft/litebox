@@ -12,9 +12,10 @@ use std::time::Duration;
 use litebox::fs::OFlags;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
-use litebox::platform::{ImmediatelyWokenUp, RawConstPointer};
-use litebox::utils::ReinterpretUnsignedExt as _;
-use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
+use litebox::platform::trivial_providers::TransparentMutPtr;
+use litebox::platform::{ImmediatelyWokenUp, RawConstPointer, ThreadLocalStorageProvider};
+use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
+use litebox_common_linux::{CloneFlags, MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
 
 mod syscall_intercept;
 
@@ -87,11 +88,13 @@ impl LinuxUserland {
             })
             .into();
 
-        Box::leak(Box::new(Self {
+        let platform = Self {
             tun_socket_fd,
             seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages: Self::read_proc_self_maps(),
-        }))
+        };
+        platform.set_init_tls();
+        Box::leak(Box::new(platform))
     }
 
     /// Register the syscall handler (provided by the Linux shim)
@@ -177,6 +180,18 @@ impl LinuxUserland {
         }
         reserved_pages
     }
+
+    fn set_init_tls(&self) {
+        let tid =
+            unsafe { syscalls::syscall!(syscalls::Sysno::gettid) }.expect("Failed to get TID");
+
+        let task = alloc::boxed::Box::new(litebox_common_linux::Task {
+            tid: i32::try_from(tid).expect("tid should fit in i32"),
+            clear_child_tid: None,
+        });
+        let tls = litebox_common_linux::ThreadLocalStorage::new(task);
+        self.set_thread_local_storage(tls);
+    }
 }
 
 impl litebox::platform::Provider for LinuxUserland {}
@@ -197,7 +212,217 @@ impl litebox::platform::ExitProvider for LinuxUserland {
         // particular function in case we decide to change up the types within `LinuxUserland`.
         drop::<Option<std::os::fd::OwnedFd>>(tun_socket_fd.write().unwrap().take());
         // And then we actually exit
-        std::process::exit(code)
+        unsafe {
+            syscalls::syscall2(
+                syscalls::Sysno::exit_group,
+                (code as isize).reinterpret_as_unsigned(),
+                // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+            )
+        }
+        .expect("Failed to exit group");
+
+        unreachable!("exit_group should not return");
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn thread_start(
+    pt_regs: *mut litebox_common_linux::PtRegs,
+    thread_args: *mut litebox_common_linux::NewThreadArgs<LinuxUserland>,
+) -> ! {
+    let pt_regs = unsafe { alloc::boxed::Box::from_raw(pt_regs) };
+    // copy pt_regs from heap to stack
+    let copied = *pt_regs;
+    drop(pt_regs);
+
+    // Reset TLS for the new thread
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        litebox_common_linux::wrgsbase(0);
+    }
+    #[cfg(target_arch = "x86")]
+    LinuxUserland::set_fs_selector(0);
+
+    // Allow caller to run some code before we return to the new thread.
+    let thread_args = unsafe { alloc::boxed::Box::from_raw(thread_args) };
+    (thread_args.callback)(*thread_args);
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "xor rax, rax",
+            "mov rsp, {0}",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rcx",      // skip pt_regs.rax
+            "pop rcx",
+            "pop rdx",
+            "pop rsi",
+            "pop rdi",
+            "add rsp, 24",  // skip orig_rax, rip, cs, eflags
+            "popfq",
+            "pop rsp",      // restore the stack pointer (which points to the entry point of the thread)
+            "ret",
+            in(reg) &raw const copied.r11, // restore registers, starting from r11
+            out("rax") _,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    #[cfg(target_arch = "x86")]
+    unsafe {
+        core::arch::asm!(
+            "xor eax, eax",
+            "mov esp, {0}",
+            "pop ebx",
+            "pop ecx",
+            "pop edx",
+            "pop esi",
+            "pop edi",
+            "pop ebp",
+            "add esp, 32", // skip eax, xds, xes, xfs, xgs, orig_eax, eip, xcs,
+            "popfd",
+            "pop esp", // restore the stack pointer (which points to the entry point of the thread
+            "ret",
+            in(reg) &raw const copied,
+            out("eax") _,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    unreachable!();
+}
+
+impl litebox::platform::ThreadProvider for LinuxUserland {
+    type ExecutionContext = litebox_common_linux::PtRegs;
+    type ThreadArgs = litebox_common_linux::NewThreadArgs<LinuxUserland>;
+    type ThreadSpawnError = litebox_common_linux::errno::Errno;
+    type ThreadId = usize;
+
+    unsafe fn spawn_thread(
+        &self,
+        ctx: &litebox_common_linux::PtRegs,
+        stack: TransparentMutPtr<u8>,
+        stack_size: usize,
+        entry_point: usize,
+        mut thread_args: Box<Self::ThreadArgs>,
+    ) -> Result<usize, Self::ThreadSpawnError> {
+        let child_tid_ptr = core::ptr::from_mut(thread_args.task.as_mut()) as u64
+            + core::mem::offset_of!(litebox_common_linux::Task<LinuxUserland>, tid) as u64;
+        // new process/thread may have a different stack and thus does not have access to
+        // the pt_regs (on the original stack), so we need to copy it to heap.
+        let new_pt_regs = Box::into_raw(Box::new(*ctx));
+        let thread_args = Box::into_raw(thread_args);
+        let flags = CloneFlags::THREAD
+            | CloneFlags::VM
+            | CloneFlags::FS
+            | CloneFlags::FILES
+            | CloneFlags::SIGHAND
+            | CloneFlags::SYSVSEM
+            | CloneFlags::CHILD_SETTID;
+
+        let clone_args = litebox_common_linux::CloneArgs {
+            flags,
+            pidfd: 0,
+            child_tid: child_tid_ptr,
+            parent_tid: 0,
+            exit_signal: 0,
+            stack: stack.as_usize() as u64,
+            stack_size: stack_size as u64,
+            tls: 0,
+            set_tid: 0,
+            set_tid_size: 0,
+            cgroup: 0,
+        };
+        let mut ret: usize;
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                "cmp rax, 0",
+                "jne 2f",
+                "push {0}", // push the return address
+                "mov rdi, {1}",
+                "mov [rdi + {rsp_offset}], rsp",    // save the current stack pointer to pt_regs.rsp
+                "mov rsi, {2}",
+                "jmp thread_start",
+                // should never return
+                "hlt",
+                "2:",
+                in(reg) entry_point,
+                in(reg) new_pt_regs,
+                in(reg) thread_args,
+                rsp_offset = const core::mem::offset_of!(litebox_common_linux::PtRegs, rsp),
+                inlateout("rax") syscalls::Sysno::clone3 as usize => ret,
+                in("rdi") &raw const clone_args,
+                in("rsi") size_of::<litebox_common_linux::CloneArgs>(),
+                // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                in("rdx") syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                out("rcx") _, // rcx is used to store old rip
+                out("r11") _, // r11 is used to store old rflags
+                options(nostack, preserves_flags)
+            );
+        }
+        #[cfg(target_arch = "x86")]
+        unsafe {
+            core::arch::asm!(
+                "int 0x80",
+                "cmp eax, 0",
+                "jne 2f",
+                "push {0}", // save the return address
+                "mov ebx, {1}",
+                "mov [ebx + {esp_offset}], esp", // save the current stack pointer to pt_regs.esp
+                "push {2}",
+                "push ebx",
+                "call thread_start",
+                // should never return
+                "hlt",
+                "2:",
+                in(reg) entry_point,
+                in(reg) new_pt_regs,
+                in(reg) thread_args,
+                esp_offset = const core::mem::offset_of!(litebox_common_linux::PtRegs, esp),
+                inlateout("eax") syscalls::Sysno::clone3 as usize => ret,
+                in("ebx") &raw const clone_args,
+                in("ecx") size_of::<litebox_common_linux::CloneArgs>(),
+                options(nostack, preserves_flags)
+            );
+        }
+        if ret > (-4096isize).reinterpret_as_unsigned() {
+            drop(unsafe { alloc::boxed::Box::from_raw(new_pt_regs) });
+            drop(unsafe { alloc::boxed::Box::from_raw(thread_args) });
+            let errno: i32 = ret.reinterpret_as_signed().truncate();
+            let err = syscalls::Errno::new(-errno);
+            return Err(match err {
+                syscalls::Errno::EACCES => litebox_common_linux::errno::Errno::EACCES,
+                syscalls::Errno::EAGAIN => litebox_common_linux::errno::Errno::EAGAIN,
+                syscalls::Errno::EBUSY => litebox_common_linux::errno::Errno::EBUSY,
+                syscalls::Errno::EEXIST => litebox_common_linux::errno::Errno::EEXIST,
+                syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
+                syscalls::Errno::ENOMEM => litebox_common_linux::errno::Errno::ENOMEM,
+                syscalls::Errno::ENOSPC => litebox_common_linux::errno::Errno::ENOSPC,
+                syscalls::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
+                _ => panic!("unexpected error {err}"),
+            });
+        }
+        Ok(ret)
+    }
+
+    fn terminate_thread(&self, code: Self::ExitCode) -> ! {
+        unsafe {
+            syscalls::syscall2(
+                syscalls::Sysno::exit,
+                (code as isize).reinterpret_as_unsigned(),
+                // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+            )
+        }
+        .expect("Failed to exit");
+
+        unreachable!("exit should not return");
     }
 }
 
@@ -674,8 +899,7 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
             }
             #[cfg(target_arch = "x86_64")]
             PunchthroughSyscall::SetFsBase { addr } => {
-                use litebox::platform::RawConstPointer as _;
-                set_fs_base(addr.as_usize()).map_err(litebox::platform::PunchthroughError::Failure)
+                set_fs_base(addr).map_err(litebox::platform::PunchthroughError::Failure)
             }
             #[cfg(target_arch = "x86_64")]
             PunchthroughSyscall::GetFsBase { addr } => {
@@ -693,6 +917,22 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
             PunchthroughSyscall::SetThreadArea { user_desc } => {
                 set_thread_area(user_desc).map_err(litebox::platform::PunchthroughError::Failure)
             }
+            PunchthroughSyscall::WakeByAddress { addr } => unsafe {
+                syscalls::syscall6(
+                    syscalls::Sysno::futex,
+                    addr.as_usize(),
+                    usize::try_from(FutexOperation::Wake as i32).unwrap(),
+                    1,
+                    0,
+                    0,
+                    0,
+                )
+            }
+            .map_err(|err| match err {
+                syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
+                _ => panic!("unexpected error {err}"),
+            })
+            .map_err(litebox::platform::PunchthroughError::Failure),
         }
     }
 }
@@ -733,6 +973,7 @@ impl litebox::platform::RawPointerProvider for LinuxUserland {
 enum FutexOperation {
     Wait = libc::FUTEX_WAIT,
     Requeue = libc::FUTEX_REQUEUE,
+    Wake = libc::FUTEX_WAKE,
 }
 
 /// Safer invocation of the Linux futex syscall, with the "timeout" variant of the arguments.
@@ -1033,12 +1274,6 @@ impl litebox::mm::allocator::MemoryProvider for LinuxUserland {
     }
 }
 
-#[unsafe(no_mangle)]
-#[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn syscall_handler_64(syscall_number: usize, args: *const usize) -> isize {
-    unsafe { syscall_handler(syscall_number, args) }
-}
-
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     "
@@ -1049,68 +1284,68 @@ core::arch::global_asm!(
 syscall_callback:
     /* TODO: save float and vector registers (xsave or fxsave) */
     /* Save caller-saved registers */
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    pushf
+    push    0x2b       /* pt_regs->ss = __USER_DS */
+    push    rsp        /* pt_regs->sp */
+    pushf              /* pt_regs->eflags */
+    push    0x33       /* pt_regs->cs = __USER_CS */
+    push    rcx
+    mov     rcx, [rsp + 0x28] /* get the return address from the stack */
+    xchg    rcx, [rsp] /* pt_regs->ip */
+    push    rax        /* pt_regs->orig_ax */
+
+    push    rdi         /* pt_regs->di */
+    push    rsi         /* pt_regs->si */
+    push    rdx         /* pt_regs->dx */
+    push    rcx         /* pt_regs->cx */
+    push    -38         /* pt_regs->ax = ENOSYS */
+    push    r8          /* pt_regs->r8 */
+    push    r9          /* pt_regs->r9 */
+    push    r10         /* pt_regs->r10 */
+    push    r11         /* pt_regs->r11 */
+    push    rbx         /* pt_regs->bx */
+    push    rbp         /* pt_regs->bp */
+
+    sub rsp, 32         /* skip r12-r15 */
 
     /* Save the original stack pointer */
-    push rbp
     mov  rbp, rsp
 
     /* Align the stack to 16 bytes */
     and rsp, -16
 
-    /* Reserve space on the stack for syscall arguments */
-    sub rsp, 48
-
-    /* Save syscall arguments (rdi, rsi, rdx, r10, r8, r9) into the reserved space */
-    mov [rsp], rdi
-    mov [rsp + 8], rsi
-    mov [rsp + 16], rdx
-    mov [rsp + 24], r10
-    mov [rsp + 32], r8
-    mov [rsp + 40], r9
-
     /* Pass the syscall number to the syscall dispatcher */
     mov rdi, rax
-    /* Pass the pointer to the syscall arguments to syscall_handler */
-    mov rsi, rsp
+    /* Pass pt_regs saved on stack to syscall_dispatcher */
+    mov rsi, rbp
 
     /* Call syscall_handler */
-    call syscall_handler_64
+    call syscall_handler
 
     /* Restore the original stack pointer */
     mov  rsp, rbp
-    pop  rbp
+    add  rsp, 32         /* skip r12-r15 */
 
     /* Restore caller-saved registers */
-    popf
+    pop  rbp
+    pop  rbx
     pop  r11
     pop  r10
     pop  r9
     pop  r8
-    pop  rdi
-    pop  rsi
-    pop  rdx
+    pop  rcx             /* skip pt_regs->ax */
     pop  rcx
+    pop  rdx
+    pop  rsi
+    pop  rdi
+
+    add  rsp, 24         /* skip orig_rax, rip, cs */
+    popf
+    add  rsp, 16         /* skip rsp, ss */
 
     /* Return to the caller */
     ret
 "
 );
-
-#[unsafe(no_mangle)]
-#[cfg(target_arch = "x86")]
-unsafe extern "C" fn syscall_handler_32(args: *const usize) -> isize {
-    let syscall_number = unsafe { *args };
-    unsafe { syscall_handler(syscall_number, args.add(1)) }
-}
 
 /*
  * Syscall callback function for 32-bit x86
@@ -1136,38 +1371,48 @@ syscall_callback:
     pop  eax        /* pop ret addr */
     xchg eax, [esp] /* exchange it with sysno */
 
-    /* Save registers and constructs arguments */
-    push ebp
-    push edi
-    push esi
-    push edx
-    push ecx
-    push ebx
-    push eax
+    /* Save registers and constructs pt_regs */
+    push    0x2b       /* pt_regs->xss = __USER_DS */
+    push    esp        /* pt_regs->esp */
+    pushf              /* pt_regs->eflags */
+    push    0x33       /* pt_regs->xcs = __USER_CS */
+    push    ecx
+    mov     ecx, [esp + 0x14] /* get the return address from the stack */
+    xchg    ecx, [esp] /* pt_regs->eip */
+    push    eax        /* pt_regs->orig_ax */
 
-    /* save the pointer to argments in eax */
-    mov eax, esp
+    sub esp, 16         /* skip xgs, fs, xes, and xds */
 
-    pushf
+    push    -38         /* pt_regs->eax = ENOSYS */
+    push    ebp          /* pt_regs->ebp */
+    push    edi         /* pt_regs->edi */
+    push    esi         /* pt_regs->esi */
+    push    edx         /* pt_regs->edx */
+    push    ecx         /* pt_regs->ecx */
+    push    ebx         /* pt_regs->ebx */
+
     /* Save the original stack pointer */
     mov ebp, esp
     /* Align the stack to 16 bytes */
     and esp, -16
 
-    /* Pass the pointer to the sysno and arguments to syscall_handler_32 */
+    /* Pass the sysno and pointer to pt_regs to syscall_handler */
+    push ebp
     push eax
 
-    call syscall_handler_32
+    call syscall_handler
 
     mov esp, ebp
-    popf
-    pop ebx /* not need to restore eax (sysno) */
     pop ebx
     pop ecx
     pop edx
     pop esi
     pop edi
     pop ebp
+
+    add esp, 32         /* skip eax, xds, xes, xfs, xgs, orig_eax, eip, xcs */
+    popf
+    add  esp, 8         /* skip esp, ss */
 
     /* Return to the caller */
     ret
@@ -1183,18 +1428,20 @@ unsafe extern "C" {
 ///
 /// # Safety
 ///
-/// - The `args` pointer must be valid and point to at least 6 `usize` values.
+/// - The `ctx` pointer must be valid pointer to a `litebox_common_linux::PtRegs` structure.
 /// - If any syscall argument is a pointer, it must be valid.
 ///
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-unsafe fn syscall_handler(syscall_number: usize, args: *const usize) -> isize {
-    // SAFETY: By the requirements of this function, such a slice must be safe to form from raw.
-    let syscall_args: &[usize; 6] = unsafe { core::slice::from_raw_parts(args, 6) }
-        .try_into()
-        .unwrap();
-    match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, syscall_args) {
+#[unsafe(no_mangle)]
+unsafe extern "C" fn syscall_handler(
+    syscall_number: usize,
+    ctx: *mut litebox_common_linux::PtRegs,
+) -> isize {
+    // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
+    let ctx = unsafe { &mut *ctx };
+    match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
         Ok(d) => {
             let syscall_handler: SyscallHandler = SYSCALL_HANDLER
                 .read()
@@ -1247,6 +1494,17 @@ impl LinuxUserland {
         }
         addr as *mut litebox_common_linux::ThreadLocalStorage<LinuxUserland>
     }
+
+    #[cfg(target_arch = "x86")]
+    fn set_fs_selector(fss: u16) {
+        unsafe {
+            core::arch::asm!(
+                "mov fs, {0:x}",
+                in(reg) fss,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
 }
 
 /// Similar to libc, we use fs/gs registers to store thread-local storage (TLS).
@@ -1293,14 +1551,7 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
         set_thread_area(user_desc_ptr).expect("Failed to set thread area for TLS");
 
         let new_fs_selector = ((user_desc.entry_number & 0xfff) << 3) | 0x3; // user mode
-        // set fs selector
-        unsafe {
-            core::arch::asm!(
-                "mov fs, {0:x}",
-                in(reg) new_fs_selector,
-                options(nostack, preserves_flags)
-            );
-        }
+        Self::set_fs_selector(new_fs_selector.truncate());
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1320,13 +1571,7 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
         let tls = Self::get_thread_local_storage();
         assert!(!tls.is_null(), "TLS must be set before releasing it");
-        unsafe {
-            core::arch::asm!(
-                "mov fs, {0}",
-                in(reg) 0,
-                options(nostack, preserves_flags)
-            );
-        }
+        Self::set_fs_selector(0); // reset fs selector
 
         let tls = unsafe { Box::from_raw(tls) };
         assert!(!tls.borrowed, "TLS must not be borrowed when releasing it");
@@ -1395,13 +1640,12 @@ mod tests {
     fn test_tls() {
         let platform = LinuxUserland::new(None);
         let tls = LinuxUserland::get_thread_local_storage();
-        assert!(tls.is_null(), "TLS should be null in the main thread");
-        platform.set_thread_local_storage(litebox_common_linux::ThreadLocalStorage::new(Box::new(
-            litebox_common_linux::Task { tid: 0xffff },
-        )));
+        assert!(!tls.is_null(), "TLS should not be null");
+        let tid = unsafe { (*tls).current_task.tid };
+
         platform.with_thread_local_storage_mut(|tls| {
             assert_eq!(
-                tls.current_task.tid, 0xffff,
+                tls.current_task.tid, tid,
                 "TLS should have the correct task ID"
             );
             tls.current_task.tid = 0x1234; // Change the task ID

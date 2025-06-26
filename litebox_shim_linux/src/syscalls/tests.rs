@@ -6,6 +6,19 @@ use super::file::{sys_dup, sys_eventfd2, sys_fcntl, sys_open, sys_pipe2};
 
 extern crate std;
 
+macro_rules! log_println {
+    ($($tt:tt)*) => {{
+        use core::fmt::Write;
+        let mut t: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
+        writeln!(t, $($tt)*).unwrap();
+        litebox::platform::DebugLogProvider::debug_log_print(
+            litebox_platform_multiplex::platform(),
+            t.as_str(),
+        );
+    }};
+}
+pub(crate) use log_println;
+
 // Ensure we only init the platform once
 static INIT_FUNC: spin::Once = spin::Once::new();
 
