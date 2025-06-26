@@ -949,20 +949,20 @@ pub fn rlimit_to_rlimit64(rlim: Rlimit) -> Rlimit64 {
 
 pub fn rlimit64_to_rlimit(rlim: Rlimit64) -> Rlimit {
     Rlimit {
-        rlim_cur: if rlim.rlim_cur == u64::MAX {
+        rlim_cur: if rlim.rlim_cur >= rlim_t::MAX as u64 {
             rlim_t::MAX
         } else {
-            rlim.rlim_cur as rlim_t
+            rlim.rlim_cur.truncate()
         },
-        rlim_max: if rlim.rlim_max == u64::MAX {
+        rlim_max: if rlim.rlim_max >= rlim_t::MAX as u64 {
             rlim_t::MAX
         } else {
-            rlim.rlim_max as rlim_t
+            rlim.rlim_max.truncate()
         },
     }
 }
 
-#[repr(u32)]
+#[repr(i32)]
 #[derive(Debug, IntEnum)]
 pub enum RlimitResource {
     /// CPU time in sec
@@ -1226,10 +1226,10 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         pid: Option<i32>,
         /// The resource for which the limit is being queried.
         resource: RlimitResource,
-        /// If the new_limit argument is a not None, then the rlimit structure to which it points
+        /// If the new_limit argument is not a None, then the rlimit structure to which it points
         /// is used to set new values for the soft and hard limits for resource.
         new_limit: Option<Platform::RawConstPointer<Rlimit64>>,
-        /// If the old_limit argument is a not None, then a successful call to prlimit() places the
+        /// If the old_limit argument is not a None, then a successful call to prlimit() places the
         /// previous soft and hard limits for resource in the rlimit structure pointed to by old_limit.
         old_limit: Option<Platform::RawMutPointer<Rlimit64>>,
     },
@@ -1587,7 +1587,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             },
             #[cfg(target_arch = "x86_64")]
             Sysno::getrlimit => {
-                let resource: u32 = ctx.syscall_arg(0).truncate();
+                let resource: i32 = ctx.syscall_arg(0).reinterpret_as_signed().truncate();
                 if let Ok(resource) = RlimitResource::try_from(resource) {
                     SyscallRequest::Getrlimit {
                         resource,
@@ -1599,7 +1599,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             }
             #[cfg(target_arch = "x86")]
             Sysno::ugetrlimit => {
-                let resource: u32 = ctx.syscall_arg(0).truncate();
+                let resource: i32 = ctx.syscall_arg(0).reinterpret_as_signed().truncate();
                 if let Ok(resource) = RlimitResource::try_from(resource) {
                     SyscallRequest::Getrlimit {
                         resource,
@@ -1610,7 +1610,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 }
             }
             ::syscalls::Sysno::setrlimit => {
-                let resource: u32 = ctx.syscall_arg(0).truncate();
+                let resource: i32 = ctx.syscall_arg(0).reinterpret_as_signed().truncate();
                 if let Ok(resource) = RlimitResource::try_from(resource) {
                     SyscallRequest::Setrlimit {
                         resource,
@@ -1622,7 +1622,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             }
             Sysno::prlimit64 => {
                 let pid: i32 = ctx.syscall_arg(0).reinterpret_as_signed().truncate();
-                let resource: u32 = ctx.syscall_arg(1).truncate();
+                let resource: i32 = ctx.syscall_arg(1).reinterpret_as_signed().truncate();
                 let new_limit = ctx.syscall_arg(2);
                 let old_limit = ctx.syscall_arg(3);
                 if let Ok(resource) = RlimitResource::try_from(resource) {
