@@ -345,16 +345,15 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
                 );
             }
         }
+        Ok(0)
     } else {
-        return Err(Errno::EINVAL);
+        Err(Errno::EINVAL)
     }
 
     // TODO: create trusted keys
     // TODO: create blocklist keys
     // TODO: save blocklist hashes
     // TODO: get kernel info (i.e., kernel symbols)
-
-    Ok(0)
 }
 
 /// VSM function for validating a guest kernel module and applying specified protection to its memory ranges after validation.
