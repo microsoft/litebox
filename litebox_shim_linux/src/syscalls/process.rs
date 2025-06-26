@@ -452,7 +452,7 @@ mod tests {
                 #[allow(static_mut_refs)]
                 inner: unsafe { TLS.as_mut_ptr() },
                 #[cfg(target_arch = "x86")]
-                inner: &mut user_desc,
+                inner: &raw mut user_desc,
             }),
             &pt_regs,
             main as usize,
