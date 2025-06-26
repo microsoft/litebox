@@ -21,7 +21,7 @@ use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::errno::Errno;
 use ptr::{UserConstPtr, UserMutPtr};
 use x86_64::structures::paging::{
-    PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange, mapper::MapToError,
+    PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange, mapper::MapToError,
 };
 
 extern crate alloc;
@@ -156,7 +156,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             phys_addr + u64::try_from(core::mem::size_of::<T>() + PAGE_SIZE).unwrap(),
             PageTableFlags::PRESENT,
         ) {
-            let offset = usize::try_from(phys_addr.as_u64()).unwrap() & (PAGE_SIZE - 1);
+            let offset = usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
             let raw = Box::into_raw(Box::new(core::mem::MaybeUninit::<T>::uninit()));
 
             unsafe {
@@ -201,7 +201,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             phys_addr + u64::try_from(core::mem::size_of::<T>() + PAGE_SIZE).unwrap(),
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
         ) {
-            let offset = usize::try_from(phys_addr.as_u64()).unwrap() & (PAGE_SIZE - 1);
+            let offset = usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     core::ptr::from_ref::<T>(value),
@@ -403,7 +403,7 @@ pub trait HostInterface {
     /// It can return more than requested size. On success, it returns the start address
     /// and the size of the allocated memory.
     fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)>;
-    // TODO: leave this for now for testing. LVBS does not allow dynamnic memory allocation,
+    // TODO: leave this for now for testing. LVBS does not allow dynamic memory allocation,
     // so it should be no-op or removed.
 
     /// Returns the memory back to host.
@@ -415,7 +415,7 @@ pub trait HostInterface {
     ///
     /// The caller must ensure that the `addr` is valid and was allocated by this [`Self::alloc`].
     unsafe fn free(addr: usize);
-    // TODO: leave this for now for testing. LVBS does not allow dynamnic memory allocation,
+    // TODO: leave this for now for testing. LVBS does not allow dynamic memory allocation,
     // so it should be no-op or removed.
 
     /// Exit

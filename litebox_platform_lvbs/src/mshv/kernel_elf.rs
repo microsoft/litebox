@@ -1,4 +1,4 @@
-//! Functions for validating kernel module ELFs
+//! Functions for checking the integrity of VTL0 kernel modules
 
 #[cfg(debug_assertions)]
 use alloc::vec::Vec;
