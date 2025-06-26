@@ -80,6 +80,7 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
         }
     }
 
+    #[expect(dead_code, reason = "we may need this eventually for RwLock::try_read")]
     #[inline]
     fn try_read(&self) -> bool {
         self.state
@@ -171,6 +172,10 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
         }
     }
 
+    #[expect(
+        dead_code,
+        reason = "we may need this eventually for RwLock::try_write"
+    )]
     #[inline]
     fn try_write(&self) -> bool {
         self.state
@@ -532,7 +537,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider, T> RwLockReadGuard<'a, Platform, T
         // to be held to the right duration.
         let data_u: &U = f(unsafe { &*data_t });
         let data = core::ptr::NonNull::from(data_u);
-        let mut orig = core::mem::ManuallyDrop::new(orig);
+        let orig = core::mem::ManuallyDrop::new(orig);
         MappedRwLockReadGuard {
             data,
             raw_lock: &orig.rwlock.raw,
@@ -560,7 +565,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider, T> RwLockWriteGuard<'a, Platform, 
         // to be held to the right duration.
         let data_u: &mut U = f(unsafe { &mut *data_t });
         let data = core::ptr::NonNull::from(data_u);
-        let mut orig = core::mem::ManuallyDrop::new(orig);
+        let orig = core::mem::ManuallyDrop::new(orig);
         MappedRwLockWriteGuard {
             data,
             raw_lock: &orig.rwlock.raw,

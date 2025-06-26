@@ -50,7 +50,6 @@ pub struct FileSystem<
     Upper: super::FileSystem,
     Lower: super::FileSystem,
 > {
-    litebox: LiteBox<Platform>,
     upper: Upper,
     lower: Lower,
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
@@ -73,12 +72,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         lower: Lower,
         layering_semantics: LayeringSemantics,
     ) -> Self {
-        let litebox = litebox.clone();
         let sync = litebox.sync();
         let root = sync.new_rwlock(RootDir::new());
         let descriptors = sync.new_rwlock(Descriptors::new());
         Self {
-            litebox,
             upper,
             lower,
             root,
@@ -160,7 +157,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     }
                     let upper_fd = upper_fd.as_ref().unwrap();
                     if size > 0 {
-                        self.upper.write(upper_fd, &temp_buf[..size], None);
+                        self.upper.write(upper_fd, &temp_buf[..size], None).expect(
+                            "writing to upper layer must succeed, or layered file migration is in serious trouble",
+                        );
                     } else {
                         // EOF
                         break;
@@ -204,7 +203,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                             // Need to do nothing, jump to next
                             return;
                         }
-                        EntryX::Lower { fd } => {
+                        EntryX::Lower { fd: _ } => {
                             // fallthrough: we need to change this up to an upper-level entry
                         }
                         EntryX::Tombstone => unreachable!(),
@@ -570,7 +569,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => return Err(WriteError::NotAFile),
-            Err(MigrationError::PathError(e)) => unreachable!(),
+            Err(MigrationError::PathError(_e)) => unreachable!(),
         }
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
@@ -616,7 +615,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => unimplemented!(),
-            Err(MigrationError::PathError(e)) => unreachable!(),
+            Err(MigrationError::PathError(_e)) => unreachable!(),
         }
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
@@ -654,7 +653,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => unimplemented!(),
-            Err(MigrationError::PathError(e)) => unreachable!(),
+            Err(MigrationError::PathError(_e)) => unreachable!(),
         }
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
@@ -802,6 +801,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         unreachable!()
     }
 
+    #[expect(unused_variables, reason = "unimplemented")]
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
         // Roughly identical to `unlink` except we need to worry about directories, thus need to
         // check for whether there are any sub-entries in the directories. This does require us to

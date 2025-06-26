@@ -128,14 +128,17 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem for File
         })
     }
 
+    #[expect(unused_variables, reason = "unimplemented")]
     fn seek(&self, fd: &FileFd, offset: isize, whence: SeekWhence) -> Result<usize, SeekError> {
         unimplemented!()
     }
 
+    #[expect(unused_variables, reason = "unimplemented")]
     fn chmod(&self, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
         unimplemented!()
     }
 
+    #[expect(unused_variables, reason = "unimplemented")]
     fn chown(
         &self,
         path: impl Arg,
@@ -145,14 +148,17 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem for File
         unimplemented!()
     }
 
+    #[expect(unused_variables, reason = "unimplemented")]
     fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {
         unimplemented!()
     }
 
+    #[expect(unused_variables, reason = "unimplemented")]
     fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
         unimplemented!()
     }
 
+    #[expect(unused_variables, reason = "unimplemented")]
     fn rmdir(&self, path: impl Arg) -> Result<(), RmdirError> {
         unimplemented!()
     }
@@ -179,6 +185,7 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem for File
         })
     }
 
+    #[expect(unused_variables, reason = "unimplemented")]
     fn with_metadata<T: core::any::Any, R>(
         &self,
         fd: &FileFd,
@@ -187,6 +194,7 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem for File
         unimplemented!()
     }
 
+    #[expect(unused_variables, reason = "unimplemented")]
     fn with_metadata_mut<T: core::any::Any, R>(
         &self,
         fd: &FileFd,
@@ -195,6 +203,7 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem for File
         unimplemented!()
     }
 
+    #[expect(unused_variables, reason = "unimplemented")]
     fn set_file_metadata<T: core::any::Any>(
         &self,
         fd: &FileFd,
@@ -203,6 +212,7 @@ impl<Platform: crate::platform::StdioProvider> super::super::FileSystem for File
         unimplemented!()
     }
 
+    #[expect(unused_variables, reason = "unimplemented")]
     fn set_fd_metadata<T: core::any::Any>(
         &self,
         fd: &FileFd,

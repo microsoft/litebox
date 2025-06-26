@@ -14,7 +14,7 @@ impl PunchthroughProvider for ImpossiblePunchthroughProvider {
     type PunchthroughToken = ImpossiblePunchthroughToken;
     fn get_punchthrough_token_for(
         &self,
-        punchthrough: <Self::PunchthroughToken as PunchthroughToken>::Punchthrough,
+        _punchthrough: <Self::PunchthroughToken as PunchthroughToken>::Punchthrough,
     ) -> Option<Self::PunchthroughToken> {
         // Since `ImpossiblePunchthrough` is an empty enum, it is impossible to actually invoke
         // `execute` upon it, meaning that the implementation here is irrelevant, since anything

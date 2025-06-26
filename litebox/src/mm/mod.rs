@@ -461,8 +461,9 @@ where
 
     /// Returns all mappings in a vector.
     pub fn mappings(&self) -> Vec<(Range<usize>, VmFlags)> {
-        let mut vmem = self.vmem.read();
-        vmem.iter()
+        self.vmem
+            .read()
+            .iter()
             .map(|(r, vma)| (r.start..r.end, vma.flags()))
             .collect()
     }

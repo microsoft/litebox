@@ -12,7 +12,7 @@ use crate::{LiteBox, platform, sync};
 use crate::{event::EventManager, fd::SocketFd};
 
 use bitflags::bitflags;
-use smoltcp::socket::{icmp, raw, tcp, udp};
+use smoltcp::socket::{icmp, tcp, udp};
 
 pub mod errors;
 mod local_ports;
@@ -35,9 +35,6 @@ const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 // TODO: Make this configurable
 const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
-/// Maximum number of sockets that can ever be active
-const MAX_NUMBER_OF_SOCKETS: usize = 1024;
-
 /// Maximum size of rx/tx buffers for sockets
 const SOCKET_BUFFER_SIZE: usize = 65536;
 
@@ -59,7 +56,6 @@ where
     Platform:
         platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
 {
-    platform: &'static Platform,
     /// Events, and their manager
     // TODO(jayb): Figure out a way to structure this better (currently, we are using it as a line, but
     // eventually we might want to handle the DAG, how do we handle it then?)
@@ -115,7 +111,6 @@ where
             _ => unreachable!(),
         }
         Self {
-            platform: litebox.x.platform,
             event_manager: EventManager::new(litebox),
             socket_set: smoltcp::iface::SocketSet::new(vec![]),
             handles: vec![],
@@ -155,6 +150,10 @@ impl core::ops::DerefMut for SocketHandle {
 }
 
 /// The [`ProtocolSpecific`] stores socket-type-specific data
+#[expect(
+    dead_code,
+    reason = "these might eventually get used, they exist for completeness sake"
+)]
 enum ProtocolSpecific {
     Tcp(TcpSpecific),
     Udp(UdpSpecific),
@@ -217,6 +216,10 @@ struct RawSpecific {
     protocol: u8,
 }
 
+#[expect(
+    dead_code,
+    reason = "the dead ones exist for completeness sake, might eventually get used"
+)]
 impl ProtocolSpecific {
     /// Get the [`Protocol`] for this socket
     fn protocol(&self) -> Protocol {
@@ -521,18 +524,18 @@ where
                 // questions should be resolved; for now I am disallowing everything else.
                 return Err(SocketError::UnsupportedProtocol(protocol));
 
-                self.socket_set.add(raw::Socket::new(
-                    smoltcp::wire::IpVersion::Ipv4,
-                    smoltcp::wire::IpProtocol::from(protocol),
-                    smoltcp::storage::PacketBuffer::new(
-                        vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
-                        vec![0u8; SOCKET_BUFFER_SIZE],
-                    ),
-                    smoltcp::storage::PacketBuffer::new(
-                        vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
-                        vec![0u8; SOCKET_BUFFER_SIZE],
-                    ),
-                ))
+                // self.socket_set.add(raw::Socket::new(
+                //     smoltcp::wire::IpVersion::Ipv4,
+                //     smoltcp::wire::IpProtocol::from(protocol),
+                //     smoltcp::storage::PacketBuffer::new(
+                //         vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
+                //         vec![0u8; SOCKET_BUFFER_SIZE],
+                //     ),
+                //     smoltcp::storage::PacketBuffer::new(
+                //         vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
+                //         vec![0u8; SOCKET_BUFFER_SIZE],
+                //     ),
+                // ))
             }
         };
 
@@ -545,7 +548,7 @@ where
                 }),
                 Protocol::Udp => unimplemented!(),
                 Protocol::Icmp => unimplemented!(),
-                Protocol::Raw { protocol } => unimplemented!(),
+                Protocol::Raw { protocol: _ } => unimplemented!(),
             },
             socket_metadata: AnyMap::new(),
         }))
@@ -621,7 +624,7 @@ where
             }
             Protocol::Udp => unimplemented!(),
             Protocol::Icmp => unimplemented!(),
-            Protocol::Raw { protocol } => unimplemented!(),
+            Protocol::Raw { protocol: _ } => unimplemented!(),
         }
 
         self.automated_platform_interaction(PollDirection::Both);
@@ -682,7 +685,7 @@ where
             }
             Protocol::Udp => unimplemented!(),
             Protocol::Icmp => unimplemented!(),
-            Protocol::Raw { protocol } => unimplemented!(),
+            Protocol::Raw { protocol: _ } => unimplemented!(),
         }
 
         self.automated_platform_interaction(PollDirection::Both);
@@ -846,7 +849,7 @@ where
                 .map_err(|tcp::SendError::InvalidState| SendError::SocketInInvalidState),
             Protocol::Udp => unimplemented!(),
             Protocol::Icmp => unimplemented!(),
-            Protocol::Raw { protocol } => unimplemented!(),
+            Protocol::Raw { protocol: _ } => unimplemented!(),
         };
         self.automated_platform_interaction(PollDirection::Egress);
         ret
@@ -882,7 +885,7 @@ where
                 }),
             Protocol::Udp => unimplemented!(),
             Protocol::Icmp => unimplemented!(),
-            Protocol::Raw { protocol } => unimplemented!(),
+            Protocol::Raw { protocol: _ } => unimplemented!(),
         };
         self.automated_platform_interaction(PollDirection::Ingress);
         ret
