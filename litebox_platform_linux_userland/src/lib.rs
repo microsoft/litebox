@@ -1286,7 +1286,7 @@ syscall_callback:
     /* Save caller-saved registers */
     push    0x2b       /* pt_regs->ss = __USER_DS */
     push    rsp        /* pt_regs->sp */
-    pushf              /* pt_regs->eflags */
+    pushfq             /* pt_regs->eflags */
     push    0x33       /* pt_regs->cs = __USER_CS */
     push    rcx
     mov     rcx, [rsp + 0x28] /* get the return address from the stack */
@@ -1339,7 +1339,7 @@ syscall_callback:
     pop  rdi
 
     add  rsp, 24         /* skip orig_rax, rip, cs */
-    popf
+    popfq
     add  rsp, 16         /* skip rsp, ss */
 
     /* Return to the caller */
@@ -1374,7 +1374,7 @@ syscall_callback:
     /* Save registers and constructs pt_regs */
     push    0x2b       /* pt_regs->xss = __USER_DS */
     push    esp        /* pt_regs->esp */
-    pushf              /* pt_regs->eflags */
+    pushfd             /* pt_regs->eflags */
     push    0x33       /* pt_regs->xcs = __USER_CS */
     push    ecx
     mov     ecx, [esp + 0x14] /* get the return address from the stack */
@@ -1411,7 +1411,7 @@ syscall_callback:
     pop ebp
 
     add esp, 32         /* skip eax, xds, xes, xfs, xgs, orig_eax, eip, xcs */
-    popf
+    popfd
     add  esp, 8         /* skip esp, ss */
 
     /* Return to the caller */
