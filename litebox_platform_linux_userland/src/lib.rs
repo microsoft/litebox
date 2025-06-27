@@ -38,6 +38,51 @@ pub struct LinuxUserland {
     reserved_pages: Vec<core::ops::Range<usize>>,
 }
 
+const IF_NAMESIZE: usize = 16;
+/// Use TUN device
+const IFF_TUN: i32 = 0x0001;
+/// Do not provide packet information
+const IFF_NO_PI: i32 = 0x1000;
+/// libc `ifreq` structure, used for TUN/TAP devices.
+#[repr(C)]
+struct Ifreq {
+    /// interface name, e.g. "en0"
+    pub ifr_name: [i8; IF_NAMESIZE],
+    pub ifr_ifru: Ifru,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Ifmap {
+    mem_start: usize,
+    mem_end: usize,
+    base_addr: u16,
+    irq: u8,
+    dma: u8,
+    port: u8,
+}
+
+/// libc `ifreq.ifr_ifru` union, used for TUN/TAP devices.
+///
+/// We only need `ifru_flags` for now; `ifru_map` is to ensure the size of the union
+/// matches libc.
+#[repr(C)]
+pub union Ifru {
+    // pub ifru_addr: crate::sockaddr,
+    // pub ifru_dstaddr: crate::sockaddr,
+    // pub ifru_broadaddr: crate::sockaddr,
+    // pub ifru_netmask: crate::sockaddr,
+    // pub ifru_hwaddr: crate::sockaddr,
+    ifru_flags: i16,
+    // pub ifru_ifindex: i32,
+    // pub ifru_metric: i32,
+    // pub ifru_mtu: i32,
+    ifru_map: Ifmap,
+    // pub ifru_slave: [i8; IF_NAMESIZE],
+    // pub ifru_newname: [i8; IF_NAMESIZE],
+    // pub ifru_data: *mut i8,
+}
+
 impl LinuxUserland {
     /// Create a new userland-Linux platform for use in `LiteBox`.
     ///
@@ -50,17 +95,29 @@ impl LinuxUserland {
     pub fn new(tun_device_name: Option<&str>) -> &'static Self {
         let tun_socket_fd = tun_device_name
             .map(|tun_device_name| {
-                let tun_fd = nix::fcntl::open(
-                    "/dev/net/tun",
-                    nix::fcntl::OFlag::O_RDWR
-                        | nix::fcntl::OFlag::O_CLOEXEC
-                        | nix::fcntl::OFlag::O_NONBLOCK,
-                    nix::sys::stat::Mode::empty(),
-                )
-                .unwrap();
+                let tun_path = "/dev/net/tun\0";
+                let tun_fd = unsafe {
+                    syscalls::syscall3(
+                        syscalls::Sysno::open,
+                        tun_path.as_ptr() as usize,
+                        (litebox::fs::OFlags::RDWR
+                            | litebox::fs::OFlags::CLOEXEC
+                            | litebox::fs::OFlags::NONBLOCK)
+                            .bits() as usize,
+                        litebox::fs::Mode::empty().bits() as usize,
+                    )
+                }
+                .expect("failed to open tun device");
 
-                nix::ioctl_write_ptr!(tunsetiff, b'T', 202, ::core::ffi::c_int);
-                let ifreq = libc::ifreq {
+                let tunsetiff = |fd: usize, ifreq: *const Ifreq| {
+                    let cmd =
+                        litebox_common_linux::iow!(b'T', 202, size_of::<::core::ffi::c_int>());
+                    unsafe {
+                        syscalls::syscall3(syscalls::Sysno::ioctl, fd, cmd as usize, ifreq as usize)
+                    }
+                    .expect("failed to set TUN interface flags");
+                };
+                let ifreq = Ifreq {
                     ifr_name: {
                         let mut name = [0i8; 16];
                         assert!(tun_device_name.len() < 16); // Note: strictly-less-than 16, to ensure it fits
@@ -71,20 +128,19 @@ impl LinuxUserland {
                         }
                         name
                     },
-                    ifr_ifru: nix::libc::__c_anonymous_ifr_ifru {
+                    ifr_ifru: Ifru {
                         // IFF_NO_PI: no tun header
                         // IFF_TUN: create tun (i.e., IP)
-                        ifru_flags: i16::try_from(nix::libc::IFF_TUN | nix::libc::IFF_NO_PI)
-                            .unwrap(),
+                        ifru_flags: i16::try_from(IFF_TUN | IFF_NO_PI).unwrap(),
                     },
                 };
-                let ifreq: *const libc::ifreq = &ifreq as _;
-                let ifreq: *const i32 = ifreq.cast();
-                unsafe { tunsetiff(tun_fd, ifreq) }.unwrap();
+                tunsetiff(tun_fd, &raw const ifreq);
 
                 // By taking ownership, we are letting the drop handler automatically run `libc::close`
                 // when necessary.
-                unsafe { std::os::fd::OwnedFd::from_raw_fd(tun_fd) }
+                unsafe {
+                    std::os::fd::OwnedFd::from_raw_fd(tun_fd.reinterpret_as_signed().truncate())
+                }
             })
             .into();
 

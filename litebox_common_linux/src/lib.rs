@@ -18,6 +18,48 @@ extern crate alloc;
 
 // TODO(jayb): Should errno::Errno be publicly re-exported?
 
+/// The number of bits used for the number field.
+pub const NRBITS: u32 = 8;
+/// The number of bits used for the type field.
+pub const TYPEBITS: u32 = 8;
+/// The number of bits used for the size field.
+pub const SIZEBITS: u32 = 14;
+/// Offset of the number field.
+pub const NRSHIFT: u32 = 0;
+/// Offset of the type field.
+pub const TYPESHIFT: u32 = NRSHIFT + NRBITS;
+/// Offset of the size field.
+pub const SIZESHIFT: u32 = TYPESHIFT + TYPEBITS;
+/// Offset of the direction field.
+pub const DIRSHIFT: u32 = SIZESHIFT + SIZEBITS;
+/// Neither direction.
+pub const NONE: u32 = 0;
+/// The write direction.
+pub const WRITE: u32 = 1;
+/// The read direction.
+pub const READ: u32 = 2;
+
+/// Creates the ioctl number for the given data.
+///
+/// `io`, `ior`, `iow` and `iowr` are preferred over this macro.
+#[macro_export]
+macro_rules! ioc {
+    ($dr:expr, $ty:expr, $nr:expr, $sz:expr) => {
+        (($dr as u32) << $crate::DIRSHIFT)
+            | (($ty as u32) << $crate::TYPESHIFT)
+            | (($nr as u32) << $crate::NRSHIFT)
+            | (($sz as u32) << $crate::SIZESHIFT)
+    };
+}
+
+/// Creates the ioctl number for a write-only operation.
+#[macro_export]
+macro_rules! iow {
+    ($ty:expr, $nr:expr, $sz:expr) => {
+        $crate::ioc!($crate::WRITE, $ty, $nr, $sz)
+    };
+}
+
 bitflags::bitflags! {
     /// Desired memory protection of a memory mapping.
     #[derive(PartialEq, Debug)]
