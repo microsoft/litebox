@@ -33,6 +33,7 @@ static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::R
 /// traits.
 pub struct LinuxUserland {
     tun_socket_fd: std::sync::RwLock<Option<std::os::fd::OwnedFd>>,
+    #[cfg(feature = "seccomp")]
     seccomp_interception_enabled: std::sync::atomic::AtomicBool,
     /// Reserved pages that are not available for guest programs to use.
     reserved_pages: Vec<core::ops::Range<usize>>,
@@ -146,6 +147,7 @@ impl LinuxUserland {
 
         let platform = Self {
             tun_socket_fd,
+            #[cfg(feature = "seccomp")]
             seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages: Self::read_proc_self_maps(),
         };
@@ -171,6 +173,7 @@ impl LinuxUserland {
     /// # Panics
     ///
     /// Panics if this function has already been invoked on the platform earlier.
+    #[cfg(feature = "seccomp")]
     pub fn enable_seccomp_based_syscall_interception(&self) {
         assert!(
             self.seccomp_interception_enabled
@@ -274,7 +277,8 @@ impl litebox::platform::ExitProvider for LinuxUserland {
     fn exit(&self, code: Self::ExitCode) -> ! {
         let Self {
             tun_socket_fd,
-            seccomp_interception_enabled: _,
+            #[cfg(feature = "seccomp")]
+                seccomp_interception_enabled: _,
             reserved_pages: _,
         } = self;
         // We don't need to explicitly drop this, but doing so clarifies our intent that we want to
@@ -287,7 +291,7 @@ impl litebox::platform::ExitProvider for LinuxUserland {
                 syscalls::Sysno::exit_group,
                 (code as isize).reinterpret_as_unsigned(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         }
         .expect("Failed to exit group");
@@ -430,7 +434,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
                 in("rdi") &raw const clone_args,
                 in("rsi") size_of::<litebox_common_linux::CloneArgs>(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                in("rdx") syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                in("rdx") syscall_intercept::SYSCALL_ARG_MAGIC,
                 out("rcx") _, // rcx is used to store old rip
                 out("r11") _, // r11 is used to store old rflags
                 options(nostack, preserves_flags)
@@ -487,7 +491,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
                 syscalls::Sysno::exit,
                 (code as isize).reinterpret_as_unsigned(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         }
         .expect("Failed to exit");
@@ -724,7 +728,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                 packet.as_ptr() as usize,
                 packet.len(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         } {
             Ok(n) => {
@@ -754,7 +758,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                 packet.as_mut_ptr() as usize,
                 packet.len(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         }
         .map_err(|errno| match errno {
@@ -845,7 +849,7 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                         oldset.map_or(0, |ptr| ptr.as_usize()),
                         size_of::<litebox_common_linux::SigSet>(),
                         // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                        syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                        syscall_intercept::SYSCALL_ARG_MAGIC,
                     )
                 }
                 .map_err(|err| match err {
@@ -944,7 +948,7 @@ impl litebox::platform::DebugLogProvider for LinuxUserland {
                 msg.as_ptr() as usize,
                 msg.len(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         };
     }
@@ -1093,7 +1097,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                     .reinterpret_as_unsigned() as usize,
                 (flags.bits().reinterpret_as_unsigned()
                     // This is to ensure it won't be intercepted by Seccomp if enabled.
-                    | syscall_intercept::systrap::MMAP_FLAG_MAGIC) as usize,
+                    | syscall_intercept::MMAP_FLAG_MAGIC) as usize,
                 usize::MAX,
                 0,
             )
@@ -1114,7 +1118,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 range.start,
                 range.len(),
                 // This is to ensure it won't be intercepted by Seccomp if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         }
         .expect("munmap failed");
@@ -1135,7 +1139,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 (MRemapFlags::MREMAP_FIXED | MRemapFlags::MREMAP_MAYMOVE).bits() as usize,
                 new_range.start,
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
             .expect("mremap failed")
         };
@@ -1157,7 +1161,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 range.len(),
                 prot_flags(new_permissions).bits().reinterpret_as_unsigned() as usize,
                 // This is to ensure it won't be intercepted by Seccomp if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         }
         .expect("mprotect failed");
@@ -1201,7 +1205,7 @@ impl litebox::platform::StdioProvider for LinuxUserland {
                 buf.as_ptr() as usize,
                 buf.len(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         } {
             Ok(n) => Ok(n),
@@ -1252,7 +1256,7 @@ impl litebox::mm::allocator::MemoryProvider for LinuxUserland {
                     .bits()
                     .reinterpret_as_unsigned()
                     // This is to ensure it won't be intercepted by Seccomp if enabled.
-                    | syscall_intercept::systrap::MMAP_FLAG_MAGIC) as usize,
+                    | syscall_intercept::MMAP_FLAG_MAGIC) as usize,
                 usize::MAX,
                 0,
             )
