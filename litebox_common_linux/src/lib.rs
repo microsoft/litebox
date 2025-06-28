@@ -18,6 +18,15 @@ extern crate alloc;
 
 // TODO(jayb): Should errno::Errno be publicly re-exported?
 
+pub const STDIN_FILENO: i32 = 0;
+pub const STDOUT_FILENO: i32 = 1;
+pub const STDERR_FILENO: i32 = 2;
+
+// linux/futex.h
+pub const FUTEX_WAIT: i32 = 0;
+pub const FUTEX_WAKE: i32 = 1;
+pub const FUTEX_REQUEUE: i32 = 3;
+
 /// The number of bits used for the number field.
 pub const NRBITS: u32 = 8;
 /// The number of bits used for the type field.
@@ -612,6 +621,18 @@ cfg_if::cfg_if! {
     } else {
         compile_error!("Unsupported architecture");
     }
+}
+
+// From libc's `timespec` definition.
+//
+// linux x32 compatibility
+// See https://sourceware.org/bugzilla/show_bug.cgi?id=16437
+pub struct timespec {
+    pub tv_sec: time_t,
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "32"))]
+    pub tv_nsec: i64,
+    #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "32")))]
+    pub tv_nsec: isize,
 }
 
 #[repr(C)]
