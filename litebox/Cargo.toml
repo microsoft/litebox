@@ -17,6 +17,8 @@ rangemap = { version = "1.5.1", features = ["const_fn"] }
 buddy_system_allocator = { version = "0.11.0", default-features = false, features = ["use_spin"] }
 # Depend on (currently unreleased) slabmalloc `main`, which contains some fixes on top of `0.11.0`
 slabmalloc = { git = "https://github.com/gz/rust-slabmalloc.git", rev = "19480b2e82704210abafe575fb9699184c1be110" }
+# todo(chuqi): support my mock-nostd platform's debuglog
+syscalls = { version = "0.6", default-features = false }
 
 [features]
 lock_tracing = ["dep:arrayvec", "spin/mutex"]
