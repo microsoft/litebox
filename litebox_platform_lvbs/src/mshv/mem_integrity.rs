@@ -1,4 +1,4 @@
-//! Functions for checking the integrity of VTL0 kernel modules
+//! Functions for checking the memory integrity of VTL0 kernel image and modules
 
 #[cfg(debug_assertions)]
 use alloc::vec::Vec;
@@ -8,6 +8,7 @@ use crate::{
 };
 use alloc::vec;
 use cms::{content_info::ContentInfo, signed_data::SignedData};
+use const_oid::db::rfc5912::{ID_SHA_256, ID_SHA_512, RSA_ENCRYPTION};
 use elf::{
     ElfBytes,
     abi::{
@@ -20,11 +21,8 @@ use elf::{
     symbol::Symbol,
 };
 use rangemap::set::RangeSet;
-use rsa::{
-    RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs1v15::Signature, pkcs8::AssociatedOid,
-    signature::Verifier,
-};
-use sha2::{OidSha512, Sha512};
+use rsa::{RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs1v15::Signature, signature::Verifier};
+use sha2::{Sha256, Sha512};
 use x509_cert::{
     Certificate,
     der::{Decode, Encode, oid::ObjectIdentifier},
@@ -375,15 +373,11 @@ pub fn verify_kernel_module_signature(
     signed_module: &[u8],
     cert: &Certificate,
 ) -> Result<(), VerificationError> {
-    const OID_RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
-
     let (module_data, signature_der) = extract_data_and_signature(signed_module)?;
     let (signature, digest_alg, signature_alg) = decode_signature(signature_der)?;
 
-    // We only support RSA with SHA-512 for now as most Linux distributions (including Azure Linux) use this combination.
-    if digest_alg != OidSha512::OID
-        || signature_alg != OID_RSA_ENCRYPTION.parse::<ObjectIdentifier>().unwrap()
-    {
+    // We only support RSA with SHA-256 or SHA-512 for now as most Linux distributions use this combination.
+    if (digest_alg != ID_SHA_256 && digest_alg != ID_SHA_512) || (signature_alg != RSA_ENCRYPTION) {
         todo!(
             "Unsupported digest or signature algorithm: {:?}, {:?}",
             digest_alg,
@@ -394,11 +388,44 @@ pub fn verify_kernel_module_signature(
     let key_info = &cert.tbs_certificate.subject_public_key_info;
     let rsa_pubkey = RsaPublicKey::from_pkcs1_der(key_info.subject_public_key.raw_bytes())
         .map_err(|_| VerificationError::InvalidCertificate)?;
-    let verifying_key = rsa::pkcs1v15::VerifyingKey::<Sha512>::new(rsa_pubkey);
-
-    verifying_key
+    let rsa_verifier = RsaPkcs1v15Verifier::new(rsa_pubkey, digest_alg)?;
+    rsa_verifier
         .verify(module_data, &signature)
         .map_err(|_| VerificationError::AuthenticationFailed)
+}
+
+// Wrapper for RSA PKCS#1 v1.5 verifier with a specified digest algorithm
+enum RsaPkcs1v15Verifier {
+    RsaSha256(rsa::pkcs1v15::VerifyingKey<Sha256>),
+    RsaSha512(rsa::pkcs1v15::VerifyingKey<Sha512>),
+}
+
+impl RsaPkcs1v15Verifier {
+    fn new(
+        rsa_pubkey: RsaPublicKey,
+        digest_alg: ObjectIdentifier,
+    ) -> Result<Self, VerificationError> {
+        match digest_alg {
+            ID_SHA_256 => Ok(RsaPkcs1v15Verifier::RsaSha256(
+                rsa::pkcs1v15::VerifyingKey::<Sha256>::new(rsa_pubkey),
+            )),
+            ID_SHA_512 => Ok(RsaPkcs1v15Verifier::RsaSha512(
+                rsa::pkcs1v15::VerifyingKey::<Sha512>::new(rsa_pubkey),
+            )),
+            _ => Err(VerificationError::Unsupported),
+        }
+    }
+
+    fn verify(&self, data: &[u8], signature: &Signature) -> Result<(), VerificationError> {
+        match self {
+            RsaPkcs1v15Verifier::RsaSha256(verifier) => verifier
+                .verify(data, signature)
+                .map_err(|_| VerificationError::AuthenticationFailed),
+            RsaPkcs1v15Verifier::RsaSha512(verifier) => verifier
+                .verify(data, signature)
+                .map_err(|_| VerificationError::AuthenticationFailed),
+        }
+    }
 }
 
 /// This function extracts the module data and signature from a signed kernel module.
@@ -483,4 +510,5 @@ pub enum VerificationError {
     InvalidSignature,
     InvalidCertificate,
     AuthenticationFailed,
+    Unsupported,
 }
