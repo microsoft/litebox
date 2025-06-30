@@ -1,7 +1,7 @@
 //! VSM functions
 
 #[cfg(debug_assertions)]
-use crate::mshv::kernel_elf::parse_modinfo;
+use crate::mshv::mem_integrity::parse_modinfo;
 use crate::{
     debug_serial_print, debug_serial_println,
     host::{
@@ -31,7 +31,7 @@ use crate::{
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
-        kernel_elf::{validate_kernel_module_against_elf, verify_kernel_module_signature},
+        mem_integrity::{validate_kernel_module_against_elf, verify_kernel_module_signature},
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,
@@ -366,9 +366,9 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
             .read_bytes(system_certs_mem.start().unwrap(), &mut cert_buf)
             .map_err(|_| Errno::EINVAL)?;
 
-        // The system certificate is loaded into VTL1 before `end_of_boot` is signaled. That is, its authenticity
-        // depends on UEFI Secure Boot. Since our VTL1 kernel does not have root certificates, it cannot
-        // cryptographically verify the system certificate.
+        // The system certificate is loaded into VTL1 and locked down before `end_of_boot` is signaled.
+        // Its integrity depends on UEFI Secure Boot which ensures only trusted software is loaded during
+        // the boot process.
         if let Ok(cert) = Certificate::from_der(&cert_buf) {
             crate::platform_low()
                 .vtl0_kernel_info
