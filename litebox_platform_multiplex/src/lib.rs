@@ -29,12 +29,15 @@ compile_error!(
 );
 
 // Check if no platforms have been specified. If so, compiler error.
-#[cfg(not(any(feature = "platform_linux_userland")))]
+#[cfg(not(any(feature = "platform_linux_userland", feature = "platform_mock_nostd")))]
 compile_error!(
     r##"No platforms specified.  Please enable the feature for the platform you want."##
 );
 
-#[cfg(feature = "platform_linux_userland")]
+#[cfg(feature = "platform_mock_nostd")]
+pub type Platform = litebox_platform_mock_nostd::MockNoStdPlatform;
+
+#[cfg(all(feature = "platform_linux_userland", not(feature = "platform_mock_nostd")))]
 pub type Platform = litebox_platform_linux_userland::LinuxUserland;
 
 static PLATFORM: once_cell::race::OnceBox<&'static Platform> = once_cell::race::OnceBox::new();
