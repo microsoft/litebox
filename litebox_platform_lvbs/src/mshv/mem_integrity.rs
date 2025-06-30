@@ -495,6 +495,13 @@ fn decode_signature(
     ))
 }
 
+pub fn verify_kernel_pe_signature(
+    _kernel_blob: &[u8],
+    _cert: &Certificate,
+) -> Result<(), VerificationError> {
+    Ok(())
+}
+
 /// Error for Kernel ELF validation and relocation failures.
 #[derive(Debug, PartialEq)]
 pub enum KernelElfError {

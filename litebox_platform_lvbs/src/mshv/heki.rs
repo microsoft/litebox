@@ -136,7 +136,6 @@ impl HekiRange {
         HekiKdataType::try_from(attr).unwrap_or(HekiKdataType::Unknown)
     }
 
-    #[expect(dead_code)]
     #[inline]
     pub fn heki_kexec_type(&self) -> HekiKexecType {
         let attr = self.attributes;

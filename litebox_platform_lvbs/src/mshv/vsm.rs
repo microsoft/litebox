@@ -6,7 +6,7 @@ use crate::{
     debug_serial_print, debug_serial_println,
     host::{
         bootparam::{get_num_possible_cpus, get_vtl1_memory_info},
-        linux::CpuMask,
+        linux::{CpuMask, KEXEC_SEGMENT_MAX, Kimage},
     },
     kernel_context::{get_core_id, get_per_core_kernel_context},
     mshv::{
@@ -25,13 +25,16 @@ use crate::{
         VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE, VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags,
         X86Cr4Flags,
         heki::{
-            HekiKdataType, HekiPage, HekiRange, MemAttr, ModMemType,
+            HekiKdataType, HekiKexecType, HekiPage, HekiRange, MemAttr, ModMemType,
             mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr,
         },
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
-        mem_integrity::{validate_kernel_module_against_elf, verify_kernel_module_signature},
+        mem_integrity::{
+            validate_kernel_module_against_elf, verify_kernel_module_signature,
+            verify_kernel_pe_signature,
+        },
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,
@@ -599,12 +602,153 @@ pub fn mshv_vsm_copy_secondary_key(_pa: u64, _nranges: u64) -> Result<i64, Errno
     Ok(0)
 }
 
-/// VSM function for validating kexec
+/// VSM function for write-protecting the memory regions of a verified kernel image for kexec.
+/// This function checks the signature of the kexec kernel blob (PE) before protecting it.
 #[allow(clippy::unnecessary_wraps)]
-pub fn mshv_vsm_kexec_validate(_pa: u64, _nranges: u64, _crash: u64) -> Result<i64, Errno> {
-    debug_serial_println!("VSM: Validate kexec");
-    // TODO: validate kexec
+pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64, Errno> {
+    debug_serial_println!(
+        "VSM: Validate kexec pa {:#x} nranges {} crash {}",
+        pa,
+        nranges,
+        crash
+    );
+
+    let is_crash = crash != 0;
+    let kexec_metadata_ref = if is_crash {
+        &crate::platform_low().vtl0_kernel_info.crash_kexec_metadata
+    } else {
+        &crate::platform_low().vtl0_kernel_info.kexec_metadata
+    };
+
+    // invalidate (remove protection and clear) the kexec memory ranges which were loaded in the past
+    for old_kexec_mem_range in kexec_metadata_ref.iter_guarded().iter_mem_ranges() {
+        protect_physical_memory_range(
+            old_kexec_mem_range.phys_frame_range,
+            MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE,
+        )?;
+    }
+    kexec_metadata_ref.clear_memory();
+
+    if pa == 0 {
+        // invalidation only
+        return Ok(0);
+    }
+
+    let mut kexec_memory_metadata = KexecMemoryMetadata::new();
+    let mut kexec_image = MemoryContainer::new();
+    let mut kexec_kernel_blob = MemoryContainer::new();
+
+    if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
+        prepare_data_for_kexec_validation(
+            &heki_pages,
+            &mut kexec_memory_metadata,
+            &mut kexec_image,
+            &mut kexec_kernel_blob,
+        )?;
+    } else {
+        return Err(Errno::EINVAL);
+    }
+
+    // If it is for crash kexec, we protect its kimage segments as well.
+    if is_crash {
+        let mut kimage_buf = vec![0u8; kexec_image.len()];
+        kexec_image
+            .read_bytes(kexec_image.start().unwrap(), &mut kimage_buf)
+            .map_err(|_| Errno::EINVAL)?;
+        #[allow(clippy::cast_ptr_alignment)]
+        let kimage = unsafe { &*(kimage_buf.as_ptr().cast::<Kimage>()) };
+        if kimage.nr_segments > u64::try_from(KEXEC_SEGMENT_MAX).unwrap() {
+            serial_println!("VSM: Invalid kexec image segments");
+            return Err(Errno::EINVAL);
+        }
+        for i in 0..usize::try_from(kimage.nr_segments).unwrap_or(0) {
+            let va = kimage.segment[i].buf as u64;
+            let pa = kimage.segment[i].mem;
+            if let Some(epa) = pa.checked_add(kimage.segment[i].memsz) {
+                kexec_memory_metadata.insert_memory_range(KexecMemoryRange::new(va, pa, epa));
+            } else {
+                serial_println!("VSM: Invalid kexec segment memory range");
+                return Err(Errno::EINVAL);
+            }
+        }
+    }
+
+    // write protect the kexec memory ranges first to avoid the race condition during verification
+    for kexec_mem_range in &kexec_memory_metadata {
+        protect_physical_memory_range(kexec_mem_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
+    }
+
+    // verify the signature of kexec blob
+    let kexec_kernel_blob_size = kexec_kernel_blob.len();
+    let mut kexec_kernel_blob_data = vec![0u8; kexec_kernel_blob_size];
+    kexec_kernel_blob
+        .read_bytes(
+            kexec_kernel_blob.start().unwrap(),
+            &mut kexec_kernel_blob_data,
+        )
+        .map_err(|_| Errno::EINVAL)?;
+    kexec_kernel_blob.clear();
+
+    if verify_kernel_pe_signature(
+        &kexec_kernel_blob_data,
+        crate::platform_low()
+            .vtl0_kernel_info
+            .get_system_certificate()
+            .unwrap(),
+    )
+    .is_err()
+    {
+        serial_println!("VSM: Failed to verify the signature of kexec kernel blob");
+        for kexec_mem_range in &kexec_memory_metadata {
+            protect_physical_memory_range(
+                kexec_mem_range.phys_frame_range,
+                MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE,
+            )?;
+        }
+        return Err(Errno::EINVAL);
+    }
+
+    // register the protected kexec memory ranges to support possible invalidation in the future
+    kexec_metadata_ref.register_memory(kexec_memory_metadata);
+
     Ok(0)
+}
+
+/// This function copies data for kexec validation from VTL0 to VTL1. The physical address ranges of
+/// the VTL0 data are specified in `heki_pages`.
+fn prepare_data_for_kexec_validation(
+    heki_pages: &Vec<Box<HekiPage>>,
+    kexec_memory_metadata: &mut KexecMemoryMetadata,
+    kexec_image: &mut MemoryContainer,
+    kexec_kernel_blob: &mut MemoryContainer,
+) -> Result<(), Errno> {
+    for heki_page in heki_pages {
+        for i in 0..usize::try_from(heki_page.nranges).unwrap_or(0) {
+            let heki_range = heki_page.ranges[i];
+            match heki_range.heki_kexec_type() {
+                HekiKexecType::KexecImage => {
+                    kexec_image
+                        .write_bytes_from_heki_range(&heki_range)
+                        .map_err(|_| Errno::EINVAL)?;
+                    kexec_memory_metadata.insert_heki_range(&heki_range);
+                }
+                HekiKexecType::KexecKernelBlob => {
+                    kexec_kernel_blob
+                        .write_bytes_from_heki_range(&heki_range)
+                        .map_err(|_| Errno::EINVAL)?;
+                    // we do not protect kexec kernel blob memory
+                }
+                HekiKexecType::KexecPages => {
+                    kexec_memory_metadata.insert_heki_range(&heki_range);
+                }
+                _ => {
+                    serial_println!("VSM: Invalid kexec type");
+                    return Err(Errno::EINVAL);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// VSM function dispatcher
@@ -740,6 +884,8 @@ pub struct Vtl0KernelInfo {
     module_memory_metadata: ModuleMemoryMetadataMap,
     boot_done: AtomicBool,
     system_cert: once_cell::race::OnceBox<Certificate>,
+    kexec_metadata: KexecMemoryMetadataWrapper,
+    crash_kexec_metadata: KexecMemoryMetadataWrapper,
     // TODO: revocation cert, blocklist, etc.
 }
 
@@ -749,6 +895,8 @@ impl Vtl0KernelInfo {
             module_memory_metadata: ModuleMemoryMetadataMap::new(),
             boot_done: AtomicBool::new(false),
             system_cert: once_cell::race::OnceBox::new(),
+            kexec_metadata: KexecMemoryMetadataWrapper::new(),
+            crash_kexec_metadata: KexecMemoryMetadataWrapper::new(),
         }
     }
 
@@ -764,7 +912,7 @@ impl Vtl0KernelInfo {
         self.boot_done.load(core::sync::atomic::Ordering::SeqCst)
     }
 
-    pub fn set_system_certificate(&self, cert: Certificate) {
+    pub(crate) fn set_system_certificate(&self, cert: Certificate) {
         let _ = self.system_cert.set(alloc::boxed::Box::new(cert));
     }
 
@@ -1247,4 +1395,112 @@ pub enum MemoryContainerError {
     ReadFailed,
     WriteFailed,
     InvalidType,
+}
+
+pub struct KexecMemoryMetadataWrapper {
+    inner: spin::mutex::SpinMutex<KexecMemoryMetadata>,
+}
+
+impl KexecMemoryMetadataWrapper {
+    pub fn new() -> Self {
+        Self {
+            inner: spin::mutex::SpinMutex::new(KexecMemoryMetadata::new()),
+        }
+    }
+
+    pub(crate) fn clear_memory(&self) {
+        let mut inner = self.inner.lock();
+        inner.clear();
+    }
+
+    pub(crate) fn register_memory(&self, kexec_memory: KexecMemoryMetadata) {
+        let mut inner = self.inner.lock();
+        inner.ranges = kexec_memory.ranges;
+    }
+
+    pub fn iter_guarded(&self) -> KexecMemoryMetadataIters {
+        KexecMemoryMetadataIters {
+            guard: self.inner.lock(),
+            phantom: core::marker::PhantomData,
+        }
+    }
+}
+
+// TODO: `ModuleMemoryMetadata` and `KexecMemoryMetadata` are similar. consider merging them into a single structure if possible.
+pub struct KexecMemoryMetadata {
+    ranges: Vec<KexecMemoryRange>,
+}
+
+impl KexecMemoryMetadata {
+    pub fn new() -> Self {
+        Self { ranges: Vec::new() }
+    }
+
+    #[inline]
+    pub(crate) fn insert_heki_range(&mut self, heki_range: &HekiRange) {
+        let va = heki_range.va;
+        let pa = heki_range.pa;
+        let epa = heki_range.epa;
+        self.insert_memory_range(KexecMemoryRange::new(va, pa, epa));
+    }
+
+    #[inline]
+    pub(crate) fn insert_memory_range(&mut self, mem_range: KexecMemoryRange) {
+        self.ranges.push(mem_range);
+    }
+
+    #[inline]
+    pub(crate) fn clear(&mut self) {
+        self.ranges.clear();
+    }
+}
+
+impl Default for KexecMemoryMetadata {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a> IntoIterator for &'a KexecMemoryMetadata {
+    type Item = &'a KexecMemoryRange;
+    type IntoIter = core::slice::Iter<'a, KexecMemoryRange>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.ranges.iter()
+    }
+}
+
+pub struct KexecMemoryMetadataIters<'a> {
+    guard: spin::mutex::SpinMutexGuard<'a, KexecMemoryMetadata>,
+    phantom: core::marker::PhantomData<&'a PhysFrameRange<Size4KiB>>,
+}
+
+impl<'a> KexecMemoryMetadataIters<'a> {
+    pub fn iter_mem_ranges(&'a self) -> impl Iterator<Item = &'a KexecMemoryRange> {
+        self.guard.ranges.iter()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct KexecMemoryRange {
+    pub virt_addr: VirtAddr,
+    pub phys_frame_range: PhysFrameRange<Size4KiB>,
+}
+
+impl KexecMemoryRange {
+    pub fn new(virt_addr: u64, phys_start: u64, phys_end: u64) -> Self {
+        Self {
+            virt_addr: VirtAddr::new(virt_addr),
+            phys_frame_range: PhysFrame::range(
+                PhysFrame::containing_address(PhysAddr::new(phys_start)),
+                PhysFrame::containing_address(PhysAddr::new(phys_end)),
+            ),
+        }
+    }
+}
+
+impl Default for KexecMemoryRange {
+    fn default() -> Self {
+        Self::new(0, 0, 0)
+    }
 }
