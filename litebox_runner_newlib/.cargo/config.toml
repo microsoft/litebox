@@ -1,5 +1,5 @@
-# [build]
-# target = "x86_64-unknown-none"
+[build.cfg]
+target = { value = "x86_64-unknown-none", condition = "cfg(feature = \"platform_mock_nostd\")" }
 
 # [unstable]
 # build-std = ["core", "compiler_builtins", "alloc"]
