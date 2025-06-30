@@ -21,6 +21,7 @@ use elf::{
     string_table::StringTable,
     symbol::Symbol,
 };
+use litebox_common_linux::errno::Errno;
 use object::read::pe::PeFile64;
 use rangemap::set::RangeSet;
 use rsa::{RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs1v15::Signature, signature::Verifier};
@@ -497,13 +498,17 @@ fn decode_signature(
     ))
 }
 
+/// This function verifies the signature of a Linux kernel blob PE for kexec. Unlike kernel module signing
+/// (which signs the whole module ELF file), kernel PE signing computes
+/// [Authenticode PE image hash](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format)
+/// over the PE image, signs the Authenticode digest with other attributes, and embeds the signature in the PE header.
 pub fn verify_kernel_pe_signature(
     kernel_blob: &[u8],
     cert: &Certificate,
 ) -> Result<(), VerificationError> {
     // extract the Authenticode signature and its signed attributes from the kernel blob PE
-    let authenticode_signature = extract_authenticode_signature(kernel_blob)
-        .map_err(|_| VerificationError::PeParseFailed)?;
+    let authenticode_signature =
+        extract_authenticode_signature(kernel_blob).map_err(|_| VerificationError::ParseFailed)?;
     let signature = Signature::try_from(authenticode_signature.signature())
         .map_err(|_| VerificationError::InvalidSignature)?;
     let signed_attrs_der = authenticode_signature
@@ -535,26 +540,27 @@ pub fn verify_kernel_pe_signature(
     }
 }
 
-/// This function extracts the Authenticode signature from a kernel blob PE. Currently, it focus on the primary Authenticode signature.
+/// This function extracts the Authenticode signature from a kernel blob PE.
 fn extract_authenticode_signature(
     kernel_blob: &[u8],
 ) -> Result<AuthenticodeSignature, VerificationError> {
-    let pe = PeFile64::parse(kernel_blob).map_err(|_| VerificationError::PeParseFailed)?;
+    let pe = PeFile64::parse(kernel_blob).map_err(|_| VerificationError::ParseFailed)?;
     let mut authenticode_signatures = Vec::new();
 
     let Ok(Some(attr_cert_iter)) = AttributeCertificateIterator::new(&pe) else {
-        return Err(VerificationError::PeParseFailed);
+        return Err(VerificationError::ParseFailed);
     };
     for attr_cert in attr_cert_iter {
-        let acert = attr_cert.map_err(|_| VerificationError::PeParseFailed)?;
-        let authenticode_signature = acert
-            .get_authenticode_signature()
-            .map_err(|_| VerificationError::PeParseFailed)?;
-        authenticode_signatures.push(authenticode_signature);
+        if let Ok(acert) = attr_cert
+            && let Ok(authenticode_signature) = acert.get_authenticode_signature()
+        {
+            authenticode_signatures.push(authenticode_signature);
+        }
     }
     if authenticode_signatures.is_empty() {
-        Err(VerificationError::PeParseFailed)
+        Err(VerificationError::InvalidSignature)
     } else {
+        // focus on the primary Authenticode signature for now
         Ok(authenticode_signatures[0].clone())
     }
 }
@@ -564,15 +570,15 @@ fn compute_authenticode_digest(
     kernel_blob: &[u8],
     digest_alg: ObjectIdentifier,
 ) -> Result<Vec<u8>, VerificationError> {
-    let pe = PeFile64::parse(kernel_blob).map_err(|_| VerificationError::PeParseFailed)?;
+    let pe = PeFile64::parse(kernel_blob).map_err(|_| VerificationError::ParseFailed)?;
 
     if digest_alg == ID_SHA_256 {
         let mut hasher = AuthenticodeHasher::<Sha256>::default();
-        authenticode_digest(&pe, &mut hasher).map_err(|_| VerificationError::PeParseFailed)?;
+        authenticode_digest(&pe, &mut hasher).map_err(|_| VerificationError::ParseFailed)?;
         Ok(hasher.hasher.finalize().to_vec())
     } else if digest_alg == ID_SHA_512 {
         let mut hasher = AuthenticodeHasher::<Sha512>::default();
-        authenticode_digest(&pe, &mut hasher).map_err(|_| VerificationError::PeParseFailed)?;
+        authenticode_digest(&pe, &mut hasher).map_err(|_| VerificationError::ParseFailed)?;
         Ok(hasher.hasher.finalize().to_vec())
     } else {
         Err(VerificationError::Unsupported)
@@ -605,6 +611,18 @@ pub enum VerificationError {
     InvalidSignature,
     InvalidCertificate,
     AuthenticationFailed,
-    PeParseFailed,
+    ParseFailed,
     Unsupported,
+}
+
+impl From<VerificationError> for Errno {
+    fn from(e: VerificationError) -> Self {
+        match e {
+            VerificationError::AuthenticationFailed => Errno::EKEYREJECTED,
+            VerificationError::SignatureNotFound => Errno::ENODATA,
+            VerificationError::Unsupported => Errno::ENOPKG,
+            VerificationError::InvalidCertificate => Errno::ENOKEY,
+            VerificationError::InvalidSignature | VerificationError::ParseFailed => Errno::ELIBBAD,
+        }
+    }
 }

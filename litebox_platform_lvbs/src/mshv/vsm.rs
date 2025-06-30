@@ -330,6 +330,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
     }
 
     let mut system_certs_mem = MemoryContainer::new();
+    let mut kexec_trampoline_metadata = KexecMemoryMetadata::new();
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         for heki_page in heki_pages {
@@ -349,10 +350,16 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
                     epa - pa
                 );
 
-                if let HekiKdataType::SystemCerts = heki_range.heki_kdata_type() {
-                    system_certs_mem
-                        .write_bytes_from_heki_range(&heki_range)
-                        .map_err(|_| Errno::EINVAL)?;
+                match heki_range.heki_kdata_type() {
+                    HekiKdataType::SystemCerts => {
+                        system_certs_mem
+                            .write_bytes_from_heki_range(&heki_range)
+                            .map_err(|_| Errno::EINVAL)?;
+                    }
+                    HekiKdataType::KexecTrampoline => {
+                        kexec_trampoline_metadata.insert_heki_range(&heki_range);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -362,7 +369,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
 
     if system_certs_mem.is_empty() {
         serial_println!("VSM: No system certificate found");
-        Err(Errno::EINVAL)
+        return Err(Errno::EINVAL);
     } else {
         let mut cert_buf = vec![0u8; system_certs_mem.len()];
         system_certs_mem
@@ -376,13 +383,20 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
             crate::platform_low()
                 .vtl0_kernel_info
                 .set_system_certificate(cert);
-            Ok(0)
         } else {
             serial_println!("VSM: Failed to parse system certificate");
-            Err(Errno::EINVAL)
+            return Err(Errno::EINVAL);
         }
     }
 
+    for kexec_trampoline_range in &kexec_trampoline_metadata {
+        protect_physical_memory_range(
+            kexec_trampoline_range.phys_frame_range,
+            MemAttr::MEM_ATTR_READ,
+        )?;
+    }
+
+    Ok(0)
     // TODO: create blocklist keys
     // TODO: save blocklist hashes
     // TODO: get kernel info (i.e., kernel symbols)
@@ -438,17 +452,15 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     #[cfg(debug_assertions)]
     parse_modinfo(&original_elf_data).map_err(|_| Errno::EINVAL)?;
 
-    if verify_kernel_module_signature(
+    if let Err(result) = verify_kernel_module_signature(
         &original_elf_data,
         crate::platform_low()
             .vtl0_kernel_info
             .get_system_certificate()
             .unwrap(),
-    )
-    .is_err()
-    {
+    ) {
         serial_println!("VSM: Failed to verify the module signature");
-        return Err(Errno::EINVAL);
+        return Err(result.into());
     }
 
     if !validate_kernel_module_against_elf(&module_in_memory, &original_elf_data)
@@ -689,15 +701,13 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
         .map_err(|_| Errno::EINVAL)?;
     kexec_kernel_blob.clear();
 
-    if verify_kernel_pe_signature(
+    if let Err(result) = verify_kernel_pe_signature(
         &kexec_kernel_blob_data,
         crate::platform_low()
             .vtl0_kernel_info
             .get_system_certificate()
             .unwrap(),
-    )
-    .is_err()
-    {
+    ) {
         serial_println!("VSM: Failed to verify the signature of kexec kernel blob");
         for kexec_mem_range in &kexec_memory_metadata {
             protect_physical_memory_range(
@@ -705,7 +715,7 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
                 MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE,
             )?;
         }
-        return Err(Errno::EINVAL);
+        return Err(result.into());
     }
 
     // register the protected kexec memory ranges to support possible invalidation in the future

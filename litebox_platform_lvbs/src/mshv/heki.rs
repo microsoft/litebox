@@ -39,7 +39,9 @@ pub enum HekiKdataType {
     BlocklistHashes = 2,
     KernelInfo = 3,
     KernelData = 4,
-    KdataMax = 5,
+    PatchInfo = 5,
+    KexecTrampoline = 6,
+    KdataMax = 7,
     #[default]
     Unknown = 0xffff_ffff_ffff_ffff,
 }
