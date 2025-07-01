@@ -12,7 +12,7 @@ spin = "0.9.8"
 syscalls = { version = "0.6", default-features = false }
 
 [features]
-seccomp = ["seccompiler", "dep:libc"]
+systrap_backend = ["dep:seccompiler", "dep:libc"]
 
 [lints]
 workspace = true

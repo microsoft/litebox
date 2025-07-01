@@ -33,7 +33,7 @@ static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::R
 /// traits.
 pub struct LinuxUserland {
     tun_socket_fd: std::sync::RwLock<Option<std::os::fd::OwnedFd>>,
-    #[cfg(feature = "seccomp")]
+    #[cfg(feature = "systrap_backend")]
     seccomp_interception_enabled: std::sync::atomic::AtomicBool,
     /// Reserved pages that are not available for guest programs to use.
     reserved_pages: Vec<core::ops::Range<usize>>,
@@ -147,7 +147,7 @@ impl LinuxUserland {
 
         let platform = Self {
             tun_socket_fd,
-            #[cfg(feature = "seccomp")]
+            #[cfg(feature = "systrap_backend")]
             seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages: Self::read_proc_self_maps(),
         };
@@ -173,7 +173,7 @@ impl LinuxUserland {
     /// # Panics
     ///
     /// Panics if this function has already been invoked on the platform earlier.
-    #[cfg(feature = "seccomp")]
+    #[cfg(feature = "systrap_backend")]
     pub fn enable_seccomp_based_syscall_interception(&self) {
         assert!(
             self.seccomp_interception_enabled
@@ -277,7 +277,7 @@ impl litebox::platform::ExitProvider for LinuxUserland {
     fn exit(&self, code: Self::ExitCode) -> ! {
         let Self {
             tun_socket_fd,
-            #[cfg(feature = "seccomp")]
+            #[cfg(feature = "systrap_backend")]
                 seccomp_interception_enabled: _,
             reserved_pages: _,
         } = self;

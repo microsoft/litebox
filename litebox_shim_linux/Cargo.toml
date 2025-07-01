@@ -29,12 +29,12 @@ elf_loader = { version = "=0.10.0", default-features = false, features = ["rel"]
 
 [features]
 unstable-testing = []
-seccomp = ["litebox_platform_multiplex/seccomp"]
+systrap_backend = ["litebox_platform_multiplex/systrap_backend"]
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 arrayvec = { version = "0.7.6", default-features = false }
-litebox_shim_linux = { path = ".", features = ["unstable-testing", "seccomp"] }
+litebox_shim_linux = { path = ".", features = ["unstable-testing", "systrap_backend"] }
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }

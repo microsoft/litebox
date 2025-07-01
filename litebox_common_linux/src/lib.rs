@@ -27,41 +27,40 @@ pub const FUTEX_WAIT: i32 = 0;
 pub const FUTEX_WAKE: i32 = 1;
 pub const FUTEX_REQUEUE: i32 = 3;
 
-/// The number of bits used for the number field.
+/* constants for encoding ioctl commands (see the macro `ioc`) */
+/// The number of bits allocated for the ioctl command number field.
 pub const NRBITS: u32 = 8;
-/// The number of bits used for the type field.
+/// The number of bits allocated for the ioctl command type field.
 pub const TYPEBITS: u32 = 8;
-/// The number of bits used for the size field.
+/// The number of bits allocated for the ioctl command size field.
 pub const SIZEBITS: u32 = 14;
-/// Offset of the number field.
+/// The bit offset for the ioctl command number field.
 pub const NRSHIFT: u32 = 0;
-/// Offset of the type field.
+/// The bit offset for the ioctl command type field.
 pub const TYPESHIFT: u32 = NRSHIFT + NRBITS;
-/// Offset of the size field.
+/// The bit offset for the ioctl command size field.
 pub const SIZESHIFT: u32 = TYPESHIFT + TYPEBITS;
-/// Offset of the direction field.
+/// The bit offset for the ioctl command direction field.
 pub const DIRSHIFT: u32 = SIZESHIFT + SIZEBITS;
-/// Neither direction.
+/// Represents no data transfer direction for the ioctl command.
 pub const NONE: u32 = 0;
-/// The write direction.
+/// Represents the write data transfer direction for the ioctl command.
 pub const WRITE: u32 = 1;
-/// The read direction.
+/// Represents the read data transfer direction for the ioctl command.
 pub const READ: u32 = 2;
 
-/// Creates the ioctl number for the given data.
-///
-/// `io`, `ior`, `iow` and `iowr` are preferred over this macro.
+/// Encode an ioctl command.
 #[macro_export]
 macro_rules! ioc {
-    ($dr:expr, $ty:expr, $nr:expr, $sz:expr) => {
-        (($dr as u32) << $crate::DIRSHIFT)
-            | (($ty as u32) << $crate::TYPESHIFT)
-            | (($nr as u32) << $crate::NRSHIFT)
-            | (($sz as u32) << $crate::SIZESHIFT)
+    ($direction:expr, $type:expr, $number:expr, $size:expr) => {
+        (($direction as u32) << $crate::DIRSHIFT)
+            | (($type as u32) << $crate::TYPESHIFT)
+            | (($number as u32) << $crate::NRSHIFT)
+            | (($size as u32) << $crate::SIZESHIFT)
     };
 }
 
-/// Creates the ioctl number for a write-only operation.
+/// Encode an ioctl command that writes.
 #[macro_export]
 macro_rules! iow {
     ($ty:expr, $nr:expr, $sz:expr) => {
@@ -623,7 +622,7 @@ cfg_if::cfg_if! {
     }
 }
 
-// From libc's `timespec` definition.
+// From libc crate's `timespec` definition.
 //
 // linux x32 compatibility
 // See https://sourceware.org/bugzilla/show_bug.cgi?id=16437

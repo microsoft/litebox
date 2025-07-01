@@ -1,9 +1,9 @@
 //! Implementation of syscall interception for Linux userland.
 
-#[cfg(all(target_arch = "x86_64", feature = "seccomp"))]
+#[cfg(all(target_arch = "x86_64", feature = "systrap_backend"))]
 pub(crate) mod systrap;
 
-#[cfg(all(target_arch = "x86_64", feature = "seccomp"))]
+#[cfg(all(target_arch = "x86_64", feature = "systrap_backend"))]
 pub(crate) use systrap::init_sys_intercept;
 
 #[cfg(target_arch = "x86")]
