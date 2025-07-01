@@ -83,7 +83,7 @@ pub unsafe extern "C" fn _start(argc: ffi::c_int, argv: *const *const ffi::c_cha
     let envp = argv.add((argc + 1) as usize) as *const *const ffi::c_char;
     
     // Initialize the LiteBox environment
-    __init_litebox_runtime();
+    unsafe {__init_litebox_runtime(); }
     
     // // Call newlib's initialization functions
     // __libc_init_array();
@@ -268,7 +268,7 @@ pub unsafe extern "C" fn getpid() -> i32 {
 pub unsafe extern "C" fn kill(pid: i32, sig: i32) -> i32 {
     if pid == 1 && sig == 9 {
         // SIGKILL to our own process - exit
-        _exit(1);
+        unsafe { _exit(1); }
     }
     // For other cases, just return success
     0
