@@ -376,7 +376,7 @@ pub fn verify_kernel_module_signature(
     signed_module: &[u8],
     cert: &Certificate,
 ) -> Result<(), VerificationError> {
-    let (module_data, signature_der) = extract_data_and_signature(signed_module)?;
+    let (module_data, signature_der) = extract_module_data_and_signature(signed_module)?;
     let (signature, digest_alg, signature_alg) = decode_signature(signature_der)?;
 
     // We only support RSA with SHA-256 or SHA-512 for now as most Linux distributions use this combination.
@@ -434,7 +434,9 @@ impl RsaPkcs1v15Verifier {
 /// This function extracts the module data and signature from a signed kernel module.
 /// A signed kernel module has the following layout:
 /// [module data (ELF)][signature (PKCS#7/DER)][`ModuleSignature`][`MODULE_SIGNATURE_MAGIC`]
-fn extract_data_and_signature(signed_module: &[u8]) -> Result<(&[u8], &[u8]), VerificationError> {
+fn extract_module_data_and_signature(
+    signed_module: &[u8],
+) -> Result<(&[u8], &[u8]), VerificationError> {
     const MODULE_SIGNATURE_MAGIC: &[u8] = b"~Module signature appended~\n";
 
     let module_signature_offset = signed_module
