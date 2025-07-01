@@ -58,6 +58,9 @@ impl_truncate! { i32, i16 }
 impl_truncate! { i32, i8 }
 impl_truncate! { i16, i8 }
 
+impl_truncate! { u32, u32 }
+impl_truncate! { i32, i32 }
+
 /// An extension trait that adds `reinterpret_as_signed` to unsigned integers.
 pub trait ReinterpretSignedExt {
     type Signed;

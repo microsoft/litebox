@@ -10,7 +10,7 @@ use litebox::mm::linux::PageRange;
 use litebox::platform::{
     DebugLogProvider, ExitProvider, IPInterfaceProvider, ImmediatelyWokenUp,
     PageManagementProvider, Provider, Punchthrough, PunchthroughProvider, PunchthroughToken,
-    RawConstPointer, RawMutPointer, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
+    RawMutPointer, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
 };
 use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::PunchthroughSyscall;
@@ -57,7 +57,7 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
                 oldact: _,
             } => todo!(),
             PunchthroughSyscall::SetFsBase { addr } => {
-                unsafe { litebox_common_linux::wrfsbase(addr.as_usize()) };
+                unsafe { litebox_common_linux::wrfsbase(addr) };
                 Ok(0)
             }
             PunchthroughSyscall::GetFsBase { addr } => {
@@ -67,6 +67,7 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
                     .map(|()| 0)
                     .ok_or(Errno::EFAULT)
             }
+            PunchthroughSyscall::WakeByAddress { .. } => todo!(),
         };
         match r {
             Ok(v) => Ok(v),

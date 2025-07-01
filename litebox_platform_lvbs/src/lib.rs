@@ -4,10 +4,12 @@
 #![no_std]
 #![cfg_attr(feature = "interrupt", feature(abi_x86_interrupt))]
 
-use crate::mshv::{vsm::ModuleMemoryMap, vtl1_mem_layout::PAGE_SIZE};
-use core::sync::atomic::{AtomicBool, AtomicU64};
-use core::{arch::asm, sync::atomic::AtomicU32};
+use crate::mshv::{vsm::Vtl0KernelInfo, vtl1_mem_layout::PAGE_SIZE};
 
+use core::{
+    arch::asm,
+    sync::atomic::{AtomicU32, AtomicU64},
+};
 use host::linux::sigset_t;
 use litebox::mm::linux::PageRange;
 use litebox::platform::page_mgmt::DeallocationError;
@@ -19,7 +21,7 @@ use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::errno::Errno;
 use ptr::{UserConstPtr, UserMutPtr};
 use x86_64::structures::paging::{
-    PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange, mapper::MapToError,
+    PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange, mapper::MapToError,
 };
 
 extern crate alloc;
@@ -39,8 +41,7 @@ pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
     page_table: mm::PageTable<PAGE_SIZE>,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
-    vtl0_module_memory: ModuleMemoryMap,
-    vtl0_boot_done: AtomicBool,
+    vtl0_kernel_info: Vtl0KernelInfo,
 }
 
 impl<Host: HostInterface> ExitProvider for LinuxKernel<Host> {
@@ -94,8 +95,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             host_and_task: core::marker::PhantomData,
             page_table: pt,
             vtl1_phys_frame_range: PhysFrame::range(physframe_start, physframe_end),
-            vtl0_module_memory: ModuleMemoryMap::new(),
-            vtl0_boot_done: AtomicBool::new(false),
+            vtl0_kernel_info: Vtl0KernelInfo::new(),
         }))
     }
 
@@ -156,7 +156,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             phys_addr + u64::try_from(core::mem::size_of::<T>() + PAGE_SIZE).unwrap(),
             PageTableFlags::PRESENT,
         ) {
-            let offset = usize::try_from(phys_addr.as_u64()).unwrap() & (PAGE_SIZE - 1);
+            let offset = usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
             let raw = Box::into_raw(Box::new(core::mem::MaybeUninit::<T>::uninit()));
 
             unsafe {
@@ -201,7 +201,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             phys_addr + u64::try_from(core::mem::size_of::<T>() + PAGE_SIZE).unwrap(),
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
         ) {
-            let offset = usize::try_from(phys_addr.as_u64()).unwrap() & (PAGE_SIZE - 1);
+            let offset = usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     core::ptr::from_ref::<T>(value),
@@ -224,19 +224,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         }
 
         false
-    }
-
-    /// This function records the end of the VTL0 boot process.
-    pub fn set_end_of_boot(&self) {
-        self.vtl0_boot_done
-            .store(true, core::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// This function checks whether the VTL0 boot process is done. VTL1 kernel relies on this function
-    /// to lock down certain security-critical VSM functions.
-    pub fn check_end_of_boot(&self) -> bool {
-        self.vtl0_boot_done
-            .load(core::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -416,7 +403,7 @@ pub trait HostInterface {
     /// It can return more than requested size. On success, it returns the start address
     /// and the size of the allocated memory.
     fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)>;
-    // TODO: leave this for now for testing. LVBS does not allow dynamnic memory allocation,
+    // TODO: leave this for now for testing. LVBS does not allow dynamic memory allocation,
     // so it should be no-op or removed.
 
     /// Returns the memory back to host.
@@ -428,7 +415,7 @@ pub trait HostInterface {
     ///
     /// The caller must ensure that the `addr` is valid and was allocated by this [`Self::alloc`].
     unsafe fn free(addr: usize);
-    // TODO: leave this for now for testing. LVBS does not allow dynamnic memory allocation,
+    // TODO: leave this for now for testing. LVBS does not allow dynamic memory allocation,
     // so it should be no-op or removed.
 
     /// Exit
@@ -483,7 +470,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         range: core::ops::Range<usize>,
         initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
         can_grow_down: bool,
-        populate_pages: bool,
+        populate_pages_immediately: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let range = PageRange::new(range.start, range.end)
             .ok_or(litebox::platform::page_mgmt::AllocationError::Unaligned)?;
@@ -494,7 +481,9 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
                 0
             };
         let flags = litebox::mm::linux::VmFlags::from_bits(flags).unwrap();
-        Ok(self.page_table.map_pages(range, flags, populate_pages))
+        Ok(self
+            .page_table
+            .map_pages(range, flags, populate_pages_immediately))
     }
 
     unsafe fn deallocate_pages(
