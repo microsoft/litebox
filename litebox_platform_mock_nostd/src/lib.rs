@@ -198,15 +198,6 @@ const HWCAP2_FSGSBASE: u64 = 1 << 1;
 #[cfg(target_arch = "x86_64")]
 fn get_fs_base() -> Result<usize, litebox_common_linux::errno::Errno> {
     /// Function pointer to get the current fs base.
-    // static GET_FS_BASE: spin::Once<fn() -> Result<usize, litebox_common_linux::errno::Errno>> =
-    //     spin::Once::new();
-    // GET_FS_BASE.call_once(|| {
-    //     if unsafe { libc::getauxval(libc::AT_HWCAP2) } & HWCAP2_FSGSBASE != 0 {
-    //         || Ok(unsafe { litebox_common_linux::rdfsbase() })
-    //     } else {
-    //         get_fs_base_arch_prctl
-    //     }
-    // })()
     get_fs_base_arch_prctl()
 }
 
@@ -216,18 +207,6 @@ fn get_fs_base() -> Result<usize, litebox_common_linux::errno::Errno> {
 /// between `arch_prctl` or `wrfsbase` to set the fs base.
 #[cfg(target_arch = "x86_64")]
 fn set_fs_base(fs_base: usize) -> Result<usize, litebox_common_linux::errno::Errno> {
-    // static SET_FS_BASE: spin::Once<fn(usize) -> Result<usize, litebox_common_linux::errno::Errno>> =
-    //     spin::Once::new();
-    // SET_FS_BASE.call_once(|| {
-    //     if unsafe { libc::getauxval(libc::AT_HWCAP2) } & HWCAP2_FSGSBASE != 0 {
-    //         |fs_base| {
-    //             unsafe { litebox_common_linux::wrfsbase(fs_base) };
-    //             Ok(0)
-    //         }
-    //     } else {
-    //         set_fs_base_arch_prctl
-    //     }
-    // })(fs_base)
     set_fs_base_arch_prctl(fs_base)
 }
 
