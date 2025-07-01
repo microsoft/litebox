@@ -1,7 +1,7 @@
 //! VSM functions
 
 #[cfg(debug_assertions)]
-use crate::mshv::kernel_elf::parse_modinfo;
+use crate::mshv::mem_integrity::parse_modinfo;
 use crate::{
     debug_serial_print, debug_serial_println,
     host::{
@@ -25,13 +25,13 @@ use crate::{
         VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE, VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags,
         X86Cr4Flags,
         heki::{
-            HekiPage, HekiRange, MemAttr, ModMemType, mem_attr_to_hv_page_prot_flags,
-            mod_mem_type_to_mem_attr,
+            HekiKdataType, HekiPage, HekiRange, MemAttr, ModMemType,
+            mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr,
         },
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
-        kernel_elf::validate_kernel_module_against_elf,
+        mem_integrity::{validate_kernel_module_against_elf, verify_kernel_module_signature},
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,
@@ -48,6 +48,7 @@ use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{PageSize, PhysFrame, Size4KiB, frame::PhysFrameRange},
 };
+use x509_cert::{Certificate, der::Decode};
 
 /// VTL call parameters (param[0]: function ID, param[1-3]: parameters)
 pub const NUM_VTLCALL_PARAMS: usize = 4;
@@ -325,6 +326,8 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
         return Err(Errno::EINVAL);
     }
 
+    let mut system_certs_mem = MemoryContainer::new();
+
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         for heki_page in heki_pages {
             for i in 0..usize::try_from(heki_page.nranges).unwrap_or(0) {
@@ -332,7 +335,6 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
                 let va = heki_range.va;
                 let pa = heki_range.pa;
                 let epa = heki_range.epa;
-                let kdata_type = heki_range.heki_kdata_type();
                 // TODO: load kernel data (e.g., into `BTreeMap` or other data structures) once we implement data consumers like `mshv_vsm_validate_guest_module`.
                 // for now, this function is a no-op and just prints the memory range we should load.
                 debug_serial_println!(
@@ -340,17 +342,44 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
                     va,
                     pa,
                     epa,
-                    kdata_type,
+                    heki_range.heki_kdata_type(),
                     epa - pa
                 );
+
+                if let HekiKdataType::SystemCerts = heki_range.heki_kdata_type() {
+                    system_certs_mem
+                        .write_bytes_from_heki_range(&heki_range)
+                        .map_err(|_| Errno::EINVAL)?;
+                }
             }
         }
-        Ok(0)
     } else {
-        Err(Errno::EINVAL)
+        return Err(Errno::EINVAL);
     }
 
-    // TODO: create trusted keys
+    if system_certs_mem.is_empty() {
+        serial_println!("VSM: No system certificate found");
+        Err(Errno::EINVAL)
+    } else {
+        let mut cert_buf = vec![0u8; system_certs_mem.len()];
+        system_certs_mem
+            .read_bytes(system_certs_mem.start().unwrap(), &mut cert_buf)
+            .map_err(|_| Errno::EINVAL)?;
+
+        // The system certificate is loaded into VTL1 and locked down before `end_of_boot` is signaled.
+        // Its integrity depends on UEFI Secure Boot which ensures only trusted software is loaded during
+        // the boot process.
+        if let Ok(cert) = Certificate::from_der(&cert_buf) {
+            crate::platform_low()
+                .vtl0_kernel_info
+                .set_system_certificate(cert);
+            Ok(0)
+        } else {
+            serial_println!("VSM: Failed to parse system certificate");
+            Err(Errno::EINVAL)
+        }
+    }
+
     // TODO: create blocklist keys
     // TODO: save blocklist hashes
     // TODO: get kernel info (i.e., kernel symbols)
@@ -405,6 +434,19 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
 
     #[cfg(debug_assertions)]
     parse_modinfo(&original_elf_data).map_err(|_| Errno::EINVAL)?;
+
+    if verify_kernel_module_signature(
+        &original_elf_data,
+        crate::platform_low()
+            .vtl0_kernel_info
+            .get_system_certificate()
+            .unwrap(),
+    )
+    .is_err()
+    {
+        serial_println!("VSM: Failed to verify the module signature");
+        return Err(Errno::EINVAL);
+    }
 
     if !validate_kernel_module_against_elf(&module_in_memory, &original_elf_data)
         .map_err(|_| Errno::EINVAL)?
@@ -697,7 +739,8 @@ fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
 pub struct Vtl0KernelInfo {
     module_memory_metadata: ModuleMemoryMetadataMap,
     boot_done: AtomicBool,
-    // TODO: certificates, blocklist, etc.
+    system_cert: once_cell::race::OnceBox<Certificate>,
+    // TODO: revocation cert, blocklist, etc.
 }
 
 impl Vtl0KernelInfo {
@@ -705,6 +748,7 @@ impl Vtl0KernelInfo {
         Self {
             module_memory_metadata: ModuleMemoryMetadataMap::new(),
             boot_done: AtomicBool::new(false),
+            system_cert: once_cell::race::OnceBox::new(),
         }
     }
 
@@ -718,6 +762,14 @@ impl Vtl0KernelInfo {
     /// to lock down certain security-critical VSM functions.
     pub fn check_end_of_boot(&self) -> bool {
         self.boot_done.load(core::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn set_system_certificate(&self, cert: Certificate) {
+        let _ = self.system_cert.set(alloc::boxed::Box::new(cert));
+    }
+
+    pub fn get_system_certificate(&self) -> Option<&Certificate> {
+        self.system_cert.get()
     }
 }
 

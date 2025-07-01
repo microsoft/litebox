@@ -13,7 +13,7 @@ use x86_64::structures::tss::TaskStateSegment;
 
 pub const MAX_CORES: usize = 8; // TODO: use cpumask
 pub const INTERRUPT_STACK_SIZE: usize = 2 * PAGE_SIZE;
-pub const KERNEL_STACK_SIZE: usize = 8 * PAGE_SIZE;
+pub const KERNEL_STACK_SIZE: usize = 10 * PAGE_SIZE;
 
 /// Per-core VTL1 kernel context
 #[repr(align(4096))]

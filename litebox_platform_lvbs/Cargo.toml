@@ -23,6 +23,11 @@ once_cell = { version = "1.20.2", default-features = false, features = ["alloc",
 modular-bitfield = { version = "0.12.0", default-features = false }
 hashbrown = "0.15.2"
 elf = { version = "0.7.4", default-features = false }
+cms = { version = "0.2.3", default-features = false, features = ["alloc"] }
+rsa = { version = "0.9.8", default-features = false }
+sha2 = { version = "0.10.9", default-features = false, features = ["force-soft", "oid"] }
+x509-cert = { version = "0.2.5", default-features = false }
+const-oid = { version = "0.9.6", default-features = false, features = ["db"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
