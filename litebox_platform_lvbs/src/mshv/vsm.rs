@@ -614,8 +614,8 @@ pub fn mshv_vsm_copy_secondary_key(_pa: u64, _nranges: u64) -> Result<i64, Errno
     Ok(0)
 }
 
-/// VSM function for write-protecting the memory regions of a verified kernel image for kexec.
-/// This function checks the signature of the kexec kernel blob (PE) before protecting it.
+/// VSM function for write protecting the memory regions of a verified kernel image for kexec.
+/// This function protects the kexec kernel blob (PE) only if it has a valid signature.
 #[allow(clippy::unnecessary_wraps)]
 pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64, Errno> {
     debug_serial_println!(
@@ -632,7 +632,7 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
         &crate::platform_low().vtl0_kernel_info.kexec_metadata
     };
 
-    // invalidate (remove protection and clear) the kexec memory ranges which were loaded in the past
+    // invalidate (i.e., remove protection and clear) the kexec memory ranges which were loaded in the past
     for old_kexec_mem_range in kexec_metadata_ref.iter_guarded().iter_mem_ranges() {
         protect_physical_memory_range(
             old_kexec_mem_range.phys_frame_range,
@@ -661,7 +661,7 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
         return Err(Errno::EINVAL);
     }
 
-    // If it is for crash kexec, we protect its kimage segments as well.
+    // If this function is called for crash kexec, we protect its kimage segments as well.
     if is_crash {
         let mut kimage_buf = vec![0u8; kexec_image.len()];
         kexec_image

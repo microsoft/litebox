@@ -499,9 +499,9 @@ fn decode_signature(
 }
 
 /// This function verifies the signature of a Linux kernel blob PE for kexec. Unlike kernel module signing
-/// (which signs the whole module ELF file), kernel PE signing computes
+/// (which signs the whole module ELF file and appends it at the end of the file), kernel PE signing computes
 /// [Authenticode PE image hash](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format)
-/// over the PE image, signs the Authenticode digest with other attributes, and embeds the signature in the PE header.
+/// over the PE image, signs the Authenticode digest with other attributes, and embeds the signature within the PE header.
 pub fn verify_kernel_pe_signature(
     kernel_blob: &[u8],
     cert: &Certificate,
