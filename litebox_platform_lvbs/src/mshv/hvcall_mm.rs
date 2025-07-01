@@ -28,7 +28,7 @@ pub fn hv_modify_vtl_protection_mask(
 
     hvin.partition_id = HV_PARTITION_ID_SELF;
     hvin.target_vtl = HvInputVtl::current();
-    hvin.map_flags = page_access.bits();
+    hvin.map_flags = u32::from(page_access.bits());
 
     let mut total_protected: u64 = 0;
     while total_protected < num_pages {

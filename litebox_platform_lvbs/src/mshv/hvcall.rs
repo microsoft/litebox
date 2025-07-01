@@ -129,8 +129,8 @@ pub fn init() -> Result<(), HypervError> {
     debug_serial_println!("HV_X64_MSR_SIMP: {:#x}", rdmsr(HV_X64_MSR_SIMP));
 
     let mut sint = HvSynicSint::new();
-    sint.set_vector(u64::from(HYPERVISOR_CALLBACK_VECTOR));
-    sint.set_auto_eoi();
+    sint.set_vector(HYPERVISOR_CALLBACK_VECTOR);
+    sint.set_auto_eoi(true);
 
     wrmsr(HV_X64_MSR_SINT0, sint.as_uint64());
     if get_core_id() == 0 {

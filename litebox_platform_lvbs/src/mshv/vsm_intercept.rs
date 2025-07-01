@@ -147,13 +147,13 @@ fn advance_vtl0_rip(int_msg_hdr: &HvInterceptMessageHeader) -> Result<u64, Hyper
 #[inline]
 fn raise_vtl0_gp_fault() -> Result<u64, HypervCallError> {
     let mut exception = HvPendingExceptionEvent::new();
-    exception.set_event_pending();
-    exception.set_event_type(0);
-    exception.set_deliver_error_code();
-    exception.set_vector(u64::from(
+    exception.set_event_pending(true);
+    exception.set_event_type(0_u8);
+    exception.set_deliver_error_code(true);
+    exception.set_vector(u16::from(
         x86_64::structures::idt::ExceptionVector::GeneralProtection as u8,
     ));
-    exception.set_error_code(0);
+    exception.set_error_code(0_u32);
 
     hvcall_set_vp_vtl0_registers(HV_REGISTER_PENDING_EVENT0, exception.as_u64())
 }
