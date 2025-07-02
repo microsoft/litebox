@@ -223,7 +223,7 @@ struct TrampolineHdr {
     size: usize,
 }
 
-const MAX_SIZE_OF_TRAMPOLINE: usize = 0x2000;
+const MAX_SIZE_OF_TRAMPOLINE: usize = 0x3000;
 
 /// Get the trampoline header from the ELF file.
 fn get_trampoline_hdr(object: &mut ElfFile) -> Option<TrampolineHdr> {
@@ -275,7 +275,7 @@ fn get_trampoline_hdr(object: &mut ElfFile) -> Option<TrampolineHdr> {
     })
 }
 
-fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize {
+fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) {
     assert!(
         trampoline.vaddr % PAGE_SIZE == 0,
         "trampoline address must be page-aligned"
@@ -315,7 +315,6 @@ fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize
     let pm = litebox_page_manager();
     unsafe { pm.make_pages_executable(ptr, end_addr - start_addr) }
         .expect("failed to make pages executable");
-    end_addr
 }
 
 const KEY_BRK: u8 = 0x01;
@@ -375,11 +374,9 @@ impl ElfLoader {
                 .easy_load(object)
                 .map_err(ElfLoaderError::LoaderError)?;
 
-            let end_of_trampoline = if let Some(trampoline) = trampoline {
-                load_trampoline(trampoline, elf.base(), file_fd)
-            } else {
-                0
-            };
+            if let Some(trampoline) = trampoline {
+                load_trampoline(trampoline, elf.base(), file_fd);
+            }
             let base = elf.base();
             let brk = elf
                 .user_data()
@@ -403,7 +400,7 @@ impl ElfLoader {
                 .map_err(ElfLoaderError::LoaderError)?;
 
             if let Some(trampoline) = trampoline {
-                let _ = load_trampoline(trampoline, interp.base(), file_fd);
+                load_trampoline(trampoline, interp.base(), file_fd);
             }
             Some(interp)
         } else {
