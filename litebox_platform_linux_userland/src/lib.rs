@@ -9,7 +9,6 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
-use litebox::fs::OFlags;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
@@ -140,7 +139,7 @@ impl LinuxUserland {
             syscalls::syscall3(
                 syscalls::Sysno::open,
                 path.as_ptr() as usize,
-                OFlags::RDONLY.bits() as usize,
+                libc::O_RDONLY as usize,
                 0,
             )
         };
