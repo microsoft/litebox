@@ -616,6 +616,8 @@ pub fn mshv_vsm_copy_secondary_key(_pa: u64, _nranges: u64) -> Result<i64, Errno
 
 /// VSM function for write protecting the memory regions of a verified kernel image for kexec.
 /// This function protects the kexec kernel blob (PE) only if it has a valid signature.
+/// Note: this function does not make kexec kernel pages executable, which should be done by
+/// another VTL1 method that can intercept the kexec/reset signal.
 #[allow(clippy::unnecessary_wraps)]
 pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64, Errno> {
     debug_serial_println!(

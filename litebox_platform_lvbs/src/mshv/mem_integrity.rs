@@ -500,10 +500,11 @@ fn decode_signature(
     ))
 }
 
-/// This function verifies the signature of a Linux kernel blob PE for kexec. Unlike kernel module signing
-/// (which signs the whole module ELF file and appends it at the end of the file), kernel PE signing computes
-/// [Authenticode PE image hash](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format)
-/// over the PE image, signs the Authenticode digest with other attributes, and embeds the signature within the PE header.
+/// This function verifies the signature of a Linux kernel blob (`bzImage`) for kexec. In addition to
+/// the ELF header, a Linux kernel blob has the PE header to be loaded by the UEFI firmware, known as
+/// [EFI boot stub](https://docs.kernel.org/admin-guide/efi-stub.html)). This PE header embeds
+/// [Authenticode signature](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format) for UEFI
+/// Secure Boot. The Authenticode signature is computed over the PE image digest and other attributes.
 pub fn verify_kernel_pe_signature(
     kernel_blob: &[u8],
     cert: &Certificate,
@@ -547,24 +548,21 @@ fn extract_authenticode_signature(
     kernel_blob: &[u8],
 ) -> Result<AuthenticodeSignature, VerificationError> {
     let pe = PeFile64::parse(kernel_blob).map_err(|_| VerificationError::ParseFailed)?;
-    let mut authenticode_signatures = Vec::new();
+    let mut authenticode_signature: Option<AuthenticodeSignature> = None;
+    // focus on the primary Authenticode signature for now
 
     let Ok(Some(attr_cert_iter)) = AttributeCertificateIterator::new(&pe) else {
         return Err(VerificationError::ParseFailed);
     };
     for attr_cert in attr_cert_iter {
         if let Ok(acert) = attr_cert
-            && let Ok(authenticode_signature) = acert.get_authenticode_signature()
+            && let Ok(auth_sig) = acert.get_authenticode_signature()
         {
-            authenticode_signatures.push(authenticode_signature);
+            authenticode_signature = Some(auth_sig);
+            break;
         }
     }
-    if authenticode_signatures.is_empty() {
-        Err(VerificationError::InvalidSignature)
-    } else {
-        // focus on the primary Authenticode signature for now
-        Ok(authenticode_signatures[0].clone())
-    }
+    authenticode_signature.ok_or(VerificationError::InvalidSignature)
 }
 
 /// This function computes an Authenticode digest over a kernel blob PE.
