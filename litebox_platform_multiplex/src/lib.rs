@@ -29,14 +29,24 @@ compile_error!(
 );
 
 // Check if no platforms have been specified. If so, compiler error.
-#[cfg(not(any(feature = "platform_linux_userland")))]
+#[cfg(not(any(
+    all(feature = "platform_linux_userland", target_os = "linux"),
+    all(feature = "platform_freebsd_userland", target_os = "freebsd")
+)))]
 compile_error!(
-    r##"No platforms specified.  Please enable the feature for the platform you want."##
+    r##"No platforms specified. Please enable the feature for the platform you want."##
 );
 
-#[cfg(feature = "platform_linux_userland")]
+#[cfg(all(feature = "platform_linux_userland", target_os = "linux"))]
 pub type Platform = litebox_platform_linux_userland::LinuxUserland;
 
+#[cfg(all(feature = "platform_freebsd_userland", target_os = "freebsd"))]
+pub type Platform = litebox_platform_freebsd_userland::FreeBSDUserland;
+
+#[cfg(any(
+    all(feature = "platform_linux_userland", target_os = "linux"),
+    all(feature = "platform_freebsd_userland", target_os = "freebsd")
+))]
 static PLATFORM: once_cell::race::OnceBox<&'static Platform> = once_cell::race::OnceBox::new();
 
 /// Initialize the shim by providing a [LiteBox platform](../litebox/platform/index.html).
@@ -51,6 +61,10 @@ static PLATFORM: once_cell::race::OnceBox<&'static Platform> = once_cell::race::
     clippy::match_wild_err_arm,
     reason = "the platform itself is not Debug thus we cannot use `expect`"
 )]
+#[cfg(any(
+    all(feature = "platform_linux_userland", target_os = "linux"),
+    all(feature = "platform_freebsd_userland", target_os = "freebsd")
+))]
 pub fn set_platform(platform: &'static Platform) {
     match PLATFORM.set(alloc::boxed::Box::new(platform)) {
         Ok(()) => {}
@@ -63,6 +77,10 @@ pub fn set_platform(platform: &'static Platform) {
 /// # Panics
 ///
 /// Panics if [`set_platform`] has not been invoked before this
+#[cfg(any(
+    all(feature = "platform_linux_userland", target_os = "linux"),
+    all(feature = "platform_freebsd_userland", target_os = "freebsd")
+))]
 pub fn platform() -> &'static Platform {
     PLATFORM
         .get()
