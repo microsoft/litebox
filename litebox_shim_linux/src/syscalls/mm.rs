@@ -1,7 +1,4 @@
 //! Implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
-
-use core::panic;
-
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE, VmemUnmapError},
     platform::{RawConstPointer, RawMutPointer, page_mgmt::DeallocationError},
@@ -114,7 +111,6 @@ pub(crate) fn sys_mmap(
 ) -> Result<MutPtr<u8>, Errno> {
     // check alignment
     if offset & !PAGE_MASK != 0 {
-        panic!("offset {:#x} is not aligned to page size", offset);
         return Err(Errno::EINVAL);
     }
     if addr & !PAGE_MASK != 0 {
