@@ -1,8 +1,7 @@
 //! ELF loader for LiteBox
 
 use core::{
-    ptr::NonNull,
-    sync::atomic::{AtomicUsize, Ordering},
+    ptr::NonNull, sync::atomic::{AtomicUsize, Ordering}
 };
 
 use alloc::{collections::btree_map::BTreeMap, ffi::CString, string::ToString, vec::Vec};
@@ -334,6 +333,7 @@ impl ElfLoader {
                 let start_addr = elf.base() + trampoline.vaddr;
                 let end_addr = (start_addr + trampoline.size).next_multiple_of(0x1000);
                 let mut need_copy = false;
+
                 unsafe {
                     ElfLoaderMmap::mmap(
                         Some(start_addr),

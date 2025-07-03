@@ -10,6 +10,22 @@ pub(crate) mod process;
 #[cfg(test)]
 pub(crate) mod tests;
 
+
+macro_rules! nontest_log_println {
+    ($($tt:tt)*) => {{
+        use core::fmt::Write;
+        let mut t: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
+        writeln!(t, $($tt)*).unwrap();
+        litebox::platform::DebugLogProvider::debug_log_print(
+            litebox_platform_multiplex::platform(),
+            t.as_str(),
+        );
+    }};
+}
+
+#[allow(unused)]
+pub(crate) use nontest_log_println;
+
 macro_rules! common_functions_for_file_status {
     () => {
         pub(crate) fn get_status(&self) -> litebox::fs::OFlags {
