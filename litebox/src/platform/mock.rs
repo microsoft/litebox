@@ -1,5 +1,10 @@
 //! Crate-local test-only mock platform for easily running tests in the various modules.
 
+#![expect(
+    unused_variables,
+    reason = "mock platform might ignore some parts / not yet implement them"
+)]
+
 // Pull in `std` for the test-only world, so that we have a nicer/easier time writing tests
 extern crate std;
 

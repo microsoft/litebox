@@ -10,10 +10,6 @@
 //! the modules in this crate.
 
 #![no_std]
-// NOTE(jayb): Allowing this only until the API design is fleshed out, once that is complete, this
-// suppressed warning should be removed.
-#![allow(dead_code, unused)]
-#![warn(unused_imports)]
 
 extern crate alloc;
 

@@ -236,7 +236,7 @@ mod tar_ro {
     #[test]
     fn file_read() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
         let fd = fs
             .open("foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
@@ -260,7 +260,7 @@ mod tar_ro {
     #[test]
     fn dir_and_nonexist_checks() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
         assert!(matches!(
             fs.open("bar/ba", OFlags::RDONLY, Mode::empty()),
             Err(crate::fs::errors::OpenError::PathError(
@@ -287,7 +287,7 @@ mod layered {
     #[test]
     fn file_read_from_lower() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = layered::FileSystem::new(
+        let fs = layered::FileSystem::new(
             &litebox,
             in_mem::FileSystem::new(&litebox),
             tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
@@ -327,7 +327,7 @@ mod layered {
     #[test]
     fn dir_and_nonexist_checks() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = layered::FileSystem::new(
+        let fs = layered::FileSystem::new(
             &litebox,
             in_mem::FileSystem::new(&litebox),
             tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
@@ -363,7 +363,7 @@ mod layered {
                 .expect("Failed to chmod /");
         });
 
-        let mut fs = layered::FileSystem::new(
+        let fs = layered::FileSystem::new(
             &litebox,
             in_mem_fs,
             tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
@@ -414,7 +414,7 @@ mod layered {
                 .expect("Failed to chmod /");
         });
 
-        let mut fs = layered::FileSystem::new(
+        let fs = layered::FileSystem::new(
             &litebox,
             in_mem_fs,
             tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
@@ -450,7 +450,7 @@ mod layered {
     fn file_deletion() {
         let litebox = LiteBox::new(MockPlatform::new());
 
-        let mut fs = layered::FileSystem::new(
+        let fs = layered::FileSystem::new(
             &litebox,
             in_mem::FileSystem::new(&litebox),
             tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),

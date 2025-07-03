@@ -6,6 +6,7 @@ use crate::{LiteBox, platform};
 /// system.
 // TODO(jayb): Reduce the requirements necessary on `Platform` to the most precise one possible.
 pub struct FileSystem<Platform: platform::Provider + 'static> {
+    #[expect(dead_code, reason = "placeholder, currently nine_p is unimplemented")]
     litebox: LiteBox<Platform>,
 }
 
@@ -25,6 +26,7 @@ impl<Platform: platform::Provider + 'static> FileSystem<Platform> {
 
 impl<Platform: platform::Provider> super::private::Sealed for FileSystem<Platform> {}
 
+#[expect(unused_variables, reason = "unimplemented")]
 impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
     fn open(
         &self,

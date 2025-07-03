@@ -181,7 +181,7 @@ pub enum PathError {
 }
 
 impl From<crate::path::ConversionError> for PathError {
-    fn from(value: crate::path::ConversionError) -> Self {
+    fn from(_value: crate::path::ConversionError) -> Self {
         Self::InvalidPathname
     }
 }

@@ -21,6 +21,7 @@ impl crate::platform::RawPointerProvider for DummyVmemBackend {
     type RawMutPointer<T: Clone> = TransparentMutPtr<T>;
 }
 
+#[expect(unused_variables, reason = "dummy/mock backend")]
 impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
     fn allocate_pages(
         &self,
@@ -92,8 +93,9 @@ fn test_vmm_mapping() {
     unsafe {
         vmm.remove_mapping(
             PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap(),
-        );
+        )
     }
+    .unwrap();
     // [(0x1_0000, 0x1_2000), (0x1_4000, 0x1_c000)]
     assert_eq!(
         collect_mappings(&vmm),
