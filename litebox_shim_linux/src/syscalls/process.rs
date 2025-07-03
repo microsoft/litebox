@@ -418,11 +418,8 @@ pub(crate) fn sys_setrlimit(
 }
 
 /// Handle syscall `set_robust_list`.
-pub(crate) fn sys_set_robust_list(
-    head: crate::ConstPtr<
-        litebox_common_linux::RobustListHead<litebox_platform_multiplex::Platform>,
-    >,
-) {
+pub(crate) fn sys_set_robust_list(head: usize) {
+    let head = crate::ConstPtr::from_usize(head);
     litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| {
         tls.current_task.robust_list = Some(head);
     });

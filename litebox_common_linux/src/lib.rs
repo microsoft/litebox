@@ -1017,27 +1017,21 @@ impl<Platform: litebox::platform::RawPointerProvider> Clone for RobustList<Platf
 
 #[repr(C)]
 pub struct RobustListHead<Platform: litebox::platform::RawPointerProvider> {
-    /*
-     * The head of the list. Points back to itself if empty:
-     */
+    /// The head of the list. Points back to itself if empty.
     pub list: RobustList<Platform>,
-    /*
-     * This relative offset is set by user-space, it gives the kernel
-     * the relative position of the futex field to examine. This way
-     * we keep userspace flexible, to freely shape its data-structure,
-     * without hardcoding any particular offset into the kernel:
-     */
+    /// This relative offset is set by user-space, it gives the kernel
+    /// the relative position of the futex field to examine. This way
+    /// we keep userspace flexible, to freely shape its data-structure,
+    /// without hardcoding any particular offset into the kernel.
     pub futex_offset: usize,
-    /*
-     * The death of the thread may race with userspace setting
-     * up a lock's links. So to handle this race, userspace first
-     * sets this field to the address of the to-be-taken lock,
-     * then does the lock acquire, and then adds itself to the
-     * list, and then clears this field. Hence the kernel will
-     * always have full knowledge of all locks that the thread
-     * _might_ have taken. We check the owner TID in any case,
-     * so only truly owned locks will be handled.
-     */
+    /// The death of the thread may race with userspace setting
+    /// up a lock's links. So to handle this race, userspace first
+    /// sets this field to the address of the to-be-taken lock,
+    /// then does the lock acquire, and then adds itself to the
+    /// list, and then clears this field. Hence the kernel will
+    /// always have full knowledge of all locks that the thread
+    /// _might_ have taken. We check the owner TID in any case,
+    /// so only truly owned locks will be handled.
     pub list_op_pending: Platform::RawConstPointer<RobustList<Platform>>,
 }
 
@@ -1290,7 +1284,7 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     },
     Gettid,
     SetRobustList {
-        head: Platform::RawConstPointer<RobustListHead<Platform>>,
+        head: usize,
     },
     GetRobustList {
         pid: Option<i32>,
@@ -1774,7 +1768,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::set_robust_list => {
                 if ctx.syscall_arg(1) == size_of::<RobustListHead<Platform>>() {
                     SyscallRequest::SetRobustList {
-                        head: Platform::RawConstPointer::from_usize(ctx.syscall_arg(0)),
+                        head: ctx.syscall_arg(0),
                     }
                 } else {
                     SyscallRequest::Ret(errno::Errno::EINVAL)
