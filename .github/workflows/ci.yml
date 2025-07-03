@@ -20,6 +20,7 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
+      - run: sudo apt install -y musl-tools
       - name: "Ratchet: ensure number of 'transmute's in codebase is not increasing"
         run: |
           if [ $(find . -name \*.rs -print0 | xargs -0 grep 'transmute' | wc -l) -eq 5 ]; then \
@@ -30,7 +31,7 @@ jobs:
           fi
       - name: Set up Rust
         run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl
       - name: Set up Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
@@ -58,10 +59,10 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
-      - run: sudo apt install -y gcc-multilib
+      - run: sudo apt install -y gcc-multilib musl-tools
       - name: Set up Rust
         run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target i686-unknown-linux-gnu
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target i686-unknown-linux-gnu,i686-unknown-linux-musl
       - name: Set up Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
