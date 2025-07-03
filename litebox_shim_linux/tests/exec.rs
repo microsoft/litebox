@@ -1,5 +1,12 @@
 mod common;
 
+fn this_source_dir() -> std::path::PathBuf {
+    // Get the crate root directory and join with "tests" since we know this file is in tests/
+    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("tests");
+    path
+}
+
 #[test]
 fn test_load_exec_static() {
     let dir_path = std::env::var("OUT_DIR").unwrap();
@@ -115,6 +122,50 @@ fn test_syscall_rewriter() {
 
     // rewrite the hello_exec_nolibc
     let hooked_path = std::path::Path::new(dir_path.as_str()).join("hello_exec_nolibc.hooked");
+    let _ = std::fs::remove_file(hooked_path.clone());
+    let output = std::process::Command::new("cargo")
+        .args([
+            "run",
+            "-p",
+            "litebox_syscall_rewriter",
+            "--",
+            "--trampoline-addr",
+            litebox_shim_linux::loader::REWRITER_MAGIC_NUMBER
+                .to_string()
+                .as_str(),
+            "-o",
+            hooked_path.to_str().unwrap(),
+            path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run syscall rewriter");
+    assert!(
+        output.status.success(),
+        "failed to run syscall rewriter {:?}",
+        std::str::from_utf8(output.stderr.as_slice()).unwrap()
+    );
+
+    let executable_path = "/hello_exec_nolibc.hooked";
+    let executable_data = std::fs::read(hooked_path).unwrap();
+
+    common::init_platform(&[], &[], &[], None, false);
+    common::install_file(executable_data, executable_path);
+    common::test_load_exec_common(executable_path);
+}
+
+#[test]
+fn test_syscall_rewriter_curdir() {
+    // Use the already compiled executable from the tests folder (same dir as this file)
+    let test_dir = this_source_dir();
+    let path = test_dir.join("hello_exec_nolibc");
+    
+    // print path
+    println!("Using hello_exec_nolibc from: {}", path.display());
+    // Verify the executable exists
+    assert!(path.exists(), "hello_exec_nolibc executable not found in tests directory");
+
+    // rewrite the hello_exec_nolibc
+    let hooked_path = test_dir.join("hello_exec_nolibc.hooked");
     let _ = std::fs::remove_file(hooked_path.clone());
     let output = std::process::Command::new("cargo")
         .args([
