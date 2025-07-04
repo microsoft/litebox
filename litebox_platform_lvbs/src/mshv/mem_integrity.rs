@@ -502,7 +502,7 @@ fn decode_signature(
 
 /// This function verifies the signature of a Linux kernel blob (`bzImage`) for kexec. In addition to
 /// the ELF header, a Linux kernel blob has the PE header to be loaded by the UEFI firmware, known as
-/// [EFI boot stub](https://docs.kernel.org/admin-guide/efi-stub.html)). This PE header embeds
+/// [EFI boot stub](https://docs.kernel.org/admin-guide/efi-stub.html). This PE header embeds
 /// [Authenticode signature](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format) for UEFI
 /// Secure Boot. The Authenticode signature is computed over the PE image digest and other attributes.
 pub fn verify_kernel_pe_signature(
