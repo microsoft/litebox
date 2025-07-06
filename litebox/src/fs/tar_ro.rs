@@ -39,7 +39,6 @@ use super::{
 /// A backing implementation for [`FileSystem`](super::FileSystem), storing all files in-memory, via
 /// a read-only `.tar` file.
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
-    litebox: LiteBox<Platform>,
     tar_data: TarArchive,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
@@ -69,10 +68,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// Panics if the provided `tar_data` is found to be an invalid `.tar` file.
     #[must_use]
     pub fn new(litebox: &LiteBox<Platform>, tar_data: Vec<u8>) -> Self {
-        let litebox = litebox.clone();
         let descriptors = litebox.sync().new_rwlock(Descriptors::new());
         Self {
-            litebox,
             tar_data: TarArchive::new(tar_data.into_boxed_slice()).unwrap(),
             current_working_dir: "/".into(),
             descriptors,
@@ -108,7 +105,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         &self,
         path: impl crate::path::Arg,
         flags: OFlags,
-        mode: Mode,
+        _mode: Mode,
     ) -> Result<crate::fd::FileFd, OpenError> {
         use super::OFlags;
         let currently_supported_oflags: OFlags = OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR;
@@ -185,8 +182,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn write(
         &self,
         fd: &crate::fd::FileFd,
-        buf: &[u8],
-        offset: Option<usize>,
+        _buf: &[u8],
+        _offset: Option<usize>,
     ) -> Result<usize, WriteError> {
         match self.descriptors.read().get(fd) {
             Descriptor::File { .. } => Err(WriteError::NotForWriting),
@@ -226,7 +223,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
-    fn chmod(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), ChmodError> {
+    fn chmod(&self, path: impl crate::path::Arg, _mode: Mode) -> Result<(), ChmodError> {
         let path = self.absolute_path(path)?;
         assert!(path.starts_with('/'));
         let path = &path[1..];
@@ -247,8 +244,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn chown(
         &self,
         path: impl crate::path::Arg,
-        user: Option<u16>,
-        group: Option<u16>,
+        _user: Option<u16>,
+        _group: Option<u16>,
     ) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
         assert!(path.starts_with('/'));
@@ -281,17 +278,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         match entry {
             None => Err(PathError::NoSuchFileOrDirectory)?,
             Some(p) if p.filename().as_str().unwrap() != path => Err(UnlinkError::IsADirectory),
-            Some(p) => Err(UnlinkError::ReadOnlyFileSystem),
+            Some(_) => Err(UnlinkError::ReadOnlyFileSystem),
         }
     }
 
-    fn mkdir(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {
+    fn mkdir(&self, _path: impl crate::path::Arg, _mode: Mode) -> Result<(), MkdirError> {
         // TODO: Do we need to do the type of checks that are happening in the other functions, or
         // should the other functions be simplified to this?
         Err(MkdirError::ReadOnlyFileSystem)
     }
 
-    fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
+    fn rmdir(&self, _path: impl crate::path::Arg) -> Result<(), RmdirError> {
         // TODO: Do we need to do the type of checks that are happening in the other functions, or
         // should the other functions be simplified to this?
         Err(RmdirError::ReadOnlyFileSystem)
@@ -348,16 +345,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn with_metadata<T: core::any::Any, R>(
         &self,
-        fd: &crate::fd::FileFd,
-        f: impl FnOnce(&T) -> R,
+        _fd: &crate::fd::FileFd,
+        _f: impl FnOnce(&T) -> R,
     ) -> Result<R, super::errors::MetadataError> {
         Err(super::errors::MetadataError::NoSuchMetadata)
     }
 
     fn with_metadata_mut<T: core::any::Any, R>(
         &self,
-        fd: &crate::fd::FileFd,
-        f: impl FnOnce(&mut T) -> R,
+        _fd: &crate::fd::FileFd,
+        _f: impl FnOnce(&mut T) -> R,
     ) -> Result<R, super::errors::MetadataError> {
         Err(super::errors::MetadataError::NoSuchMetadata)
     }
@@ -412,6 +409,10 @@ enum Descriptor {
         metadata: AnyMap,
     },
     Dir {
+        #[expect(
+            dead_code,
+            reason = "mostly used for debugging; we might consider removing this in the future"
+        )]
         path: String,
         metadata: AnyMap,
     },

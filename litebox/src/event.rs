@@ -1,5 +1,10 @@
 //! Events related functionality
 
+#![expect(
+    dead_code,
+    reason = "the public/private split is not yet fully stabilized here, thus the dead_code lint is not going to be particularly helpful"
+)]
+
 // TODO(jayb): Is the private/public split in this module a good split? I think we can either
 // increase or decrease the amount that is exposed publicly outside this module, depending on how
 // much we want to expose to the outside world (i.e., outside this crate). If changing things from

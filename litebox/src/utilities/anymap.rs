@@ -45,6 +45,10 @@ impl AnyMap {
         Some(v.downcast_mut().expect(GUARANTEED))
     }
 
+    #[expect(
+        dead_code,
+        reason = "currently unused, but perfectly reasonable to use in future"
+    )]
     /// Remove and return the value of type `T` if it exists.
     pub(crate) fn remove<T: Any>(&mut self) -> Option<T> {
         let v = self.storage.remove(&TypeId::of::<T>())?;

@@ -307,15 +307,15 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // The `max_permissions` is tracked by `VMem::protect_mapping` and thus doesn't need to be
         // passed to `allocate_pages`.
         let _ = max_permissions;
-        let ret = unsafe {
-            self.platform.allocate_pages(
+        let ret = self
+            .platform
+            .allocate_pages(
                 range.into(),
                 MemoryRegionPermissions::from_bits(permissions).unwrap(),
                 vma.flags.contains(VmFlags::VM_GROWSDOWN),
                 populate_pages_immediately,
             )
-        }
-        .ok()?;
+            .ok()?;
         self.vmas.insert(start..end, vma);
         Some(ret)
     }
@@ -388,7 +388,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             core::cmp::Ordering::Less => {
                 // shrink
                 let range = PageRange::new(new_end, range.end).unwrap();
-                unsafe { self.remove_mapping(range) };
+                unsafe { self.remove_mapping(range) }.unwrap();
                 return Ok(());
             }
             core::cmp::Ordering::Greater => {}

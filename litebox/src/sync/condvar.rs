@@ -1,5 +1,7 @@
 //! Condition variables
 
+#![expect(unused, reason = "currently unimplemented")]
+
 use crate::platform::RawMutexProvider;
 
 /// Condition variables, roughly analogous to Rust's

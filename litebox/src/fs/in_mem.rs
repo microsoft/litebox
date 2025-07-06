@@ -277,7 +277,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let Descriptor::File {
             file,
             read_allowed: _,
-            write_allowed,
+            write_allowed: _,
             position,
             metadata: _,
         } = descriptors.get_mut(fd)
@@ -303,7 +303,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn chmod(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), ChmodError> {
         let path = self.absolute_path(path)?;
-        let mut root = self.root.write();
+        let root = self.root.read();
         let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
@@ -335,7 +335,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         group: Option<u16>,
     ) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
-        let mut root = self.root.write();
+        let root = self.root.read();
         let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
@@ -399,7 +399,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
         let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
-        let Some((parent_path, parent)) = parent else {
+        let Some((_parent_path, parent)) = parent else {
             // Attempted to make `/`
             return Err(MkdirError::AlreadyExists);
         };

@@ -36,7 +36,7 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
 
     fn receive(
         &mut self,
-        timestamp: smoltcp::time::Instant,
+        _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         match self.platform.receive_ip_packet(&mut self.receive_buffer) {
             Ok(size) => Some((
@@ -49,11 +49,10 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
                 },
             )),
             Err(platform::ReceiveError::WouldBlock) => None,
-            Err(err) => panic!("{}", err),
         }
     }
 
-    fn transmit(&mut self, timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+    fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
         Some(TxToken {
             platform: self.platform,
             buffer: &mut self.send_buffer,

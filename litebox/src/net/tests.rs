@@ -69,9 +69,9 @@ fn bidi_tcp_comms(mut network: Network<MockPlatform>, comms: fn(&mut Network<Moc
         .expect("Failed to receive data");
     assert_eq!(&client_buffer[..bytes_received], server_to_client_data);
 
-    network.close(client_fd);
-    network.close(server_fd);
-    network.close(listener_fd);
+    network.close(client_fd).unwrap();
+    network.close(server_fd).unwrap();
+    network.close(listener_fd).unwrap();
 }
 
 #[test]
