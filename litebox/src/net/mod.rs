@@ -12,7 +12,7 @@ use crate::{LiteBox, platform, sync};
 use crate::{event::EventManager, fd::SocketFd};
 
 use bitflags::bitflags;
-use smoltcp::socket::{icmp, tcp, udp};
+use smoltcp::socket::{icmp, raw, tcp, udp};
 
 pub mod errors;
 mod local_ports;
@@ -524,18 +524,22 @@ where
                 // questions should be resolved; for now I am disallowing everything else.
                 return Err(SocketError::UnsupportedProtocol(protocol));
 
-                // self.socket_set.add(raw::Socket::new(
-                //     smoltcp::wire::IpVersion::Ipv4,
-                //     smoltcp::wire::IpProtocol::from(protocol),
-                //     smoltcp::storage::PacketBuffer::new(
-                //         vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
-                //         vec![0u8; SOCKET_BUFFER_SIZE],
-                //     ),
-                //     smoltcp::storage::PacketBuffer::new(
-                //         vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
-                //         vec![0u8; SOCKET_BUFFER_SIZE],
-                //     ),
-                // ))
+                #[expect(
+                    unreachable_code,
+                    reason = "currently raw is just directly disallowed; we might bring this code back in the future"
+                )]
+                self.socket_set.add(raw::Socket::new(
+                    smoltcp::wire::IpVersion::Ipv4,
+                    smoltcp::wire::IpProtocol::from(protocol),
+                    smoltcp::storage::PacketBuffer::new(
+                        vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
+                        vec![0u8; SOCKET_BUFFER_SIZE],
+                    ),
+                    smoltcp::storage::PacketBuffer::new(
+                        vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
+                        vec![0u8; SOCKET_BUFFER_SIZE],
+                    ),
+                ))
             }
         };
 
