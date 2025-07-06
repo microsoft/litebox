@@ -60,7 +60,7 @@ pub fn hvcall_set_vp_registers(reg_name: u32, value: u64) -> Result<u64, HypervC
 /// Hyper-V Hypercall to set VTL0's registers like MSR and control registers.
 #[inline]
 pub fn hvcall_set_vp_vtl0_registers(reg_name: u32, value: u64) -> Result<u64, HypervCallError> {
-    hvcall_set_vp_registers_internal(reg_name, value, HvInputVtl::new(HV_VTL_NORMAL))
+    hvcall_set_vp_registers_internal(reg_name, value, HvInputVtl::new_for_vtl(HV_VTL_NORMAL))
 }
 
 fn hvcall_get_vp_registers_internal(
@@ -108,7 +108,7 @@ pub fn hvcall_get_vp_registers(reg_name: u32) -> Result<u64, HypervCallError> {
 /// Hyper-V Hypercall to get VTL0's registers like MSR and control registers.
 #[inline]
 pub fn hvcall_get_vp_vtl0_registers(reg_name: u32) -> Result<u64, HypervCallError> {
-    hvcall_get_vp_registers_internal(reg_name, HvInputVtl::new(HV_VTL_NORMAL))
+    hvcall_get_vp_registers_internal(reg_name, HvInputVtl::new_for_vtl(HV_VTL_NORMAL))
 }
 
 /// Populate the VP context for VTL1
@@ -142,22 +142,22 @@ fn hv_vtl_populate_vp_context(input: &mut HvEnableVpVtl, tss: u64, rip: u64, rsp
     // We only support 64-bit long mode for now, so most of the segment register fields are ignored.
     input.vp_context.cs.selector = SegmentSelector::new(1, PrivilegeLevel::Ring0).0;
     input.vp_context.cs.set_attributes(
-        SegmentRegisterAttributeFlags::ACCESSED.bits()
-            | SegmentRegisterAttributeFlags::WRITABLE.bits()
-            | SegmentRegisterAttributeFlags::EXECUTABLE.bits()
-            | SegmentRegisterAttributeFlags::USER_SEGMENT.bits()
-            | SegmentRegisterAttributeFlags::PRESENT.bits()
-            | SegmentRegisterAttributeFlags::AVAILABLE.bits()
-            | SegmentRegisterAttributeFlags::LONG_MODE.bits(),
+        SegmentRegisterAttributeFlags::ACCESSED
+            | SegmentRegisterAttributeFlags::WRITABLE
+            | SegmentRegisterAttributeFlags::EXECUTABLE
+            | SegmentRegisterAttributeFlags::USER_SEGMENT
+            | SegmentRegisterAttributeFlags::PRESENT
+            | SegmentRegisterAttributeFlags::AVAILABLE
+            | SegmentRegisterAttributeFlags::LONG_MODE,
     );
 
     input.vp_context.ss.selector = SegmentSelector::new(2, PrivilegeLevel::Ring0).0;
     input.vp_context.ss.set_attributes(
-        SegmentRegisterAttributeFlags::ACCESSED.bits()
-            | SegmentRegisterAttributeFlags::WRITABLE.bits()
-            | SegmentRegisterAttributeFlags::USER_SEGMENT.bits()
-            | SegmentRegisterAttributeFlags::PRESENT.bits()
-            | SegmentRegisterAttributeFlags::AVAILABLE.bits(),
+        SegmentRegisterAttributeFlags::ACCESSED
+            | SegmentRegisterAttributeFlags::WRITABLE
+            | SegmentRegisterAttributeFlags::USER_SEGMENT
+            | SegmentRegisterAttributeFlags::PRESENT
+            | SegmentRegisterAttributeFlags::AVAILABLE,
     );
 
     input.vp_context.tr.selector = SegmentSelector::new(3, PrivilegeLevel::Ring0).0;
@@ -165,10 +165,10 @@ fn hv_vtl_populate_vp_context(input: &mut HvEnableVpVtl, tss: u64, rip: u64, rsp
     input.vp_context.tr.limit =
         u32::try_from(core::mem::size_of::<TaskStateSegment>()).unwrap() - 1;
     input.vp_context.tr.set_attributes(
-        SegmentRegisterAttributeFlags::ACCESSED.bits()
-            | SegmentRegisterAttributeFlags::WRITABLE.bits()
-            | SegmentRegisterAttributeFlags::EXECUTABLE.bits()
-            | SegmentRegisterAttributeFlags::PRESENT.bits(),
+        SegmentRegisterAttributeFlags::ACCESSED
+            | SegmentRegisterAttributeFlags::WRITABLE
+            | SegmentRegisterAttributeFlags::EXECUTABLE
+            | SegmentRegisterAttributeFlags::PRESENT,
     );
 }
 
