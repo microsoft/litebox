@@ -300,9 +300,15 @@ fn get_trampoline_hdr(object: &mut ElfFile) -> Option<TrampolineHdr> {
 }
 
 fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) {
+    // Our rewriter ensures that both `trampoline.vaddr` and `trampoline.file_offset` are page-aligned.
+    // Otherwise, `ElfLoaderMmap::mmap` will fail and panic.
     assert!(
         trampoline.vaddr % PAGE_SIZE == 0,
         "trampoline address must be page-aligned"
+    );
+    assert!(
+        trampoline.file_offset % PAGE_SIZE == 0,
+        "trampoline file offset must be page-aligned"
     );
     let start_addr = relo_off + trampoline.vaddr;
     let end_addr = (start_addr + trampoline.size).next_multiple_of(0x1000);
@@ -330,7 +336,6 @@ fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) {
     unsafe {
         placeholder.write(litebox_platform_multiplex::platform().get_syscall_entry_point());
     }
-    // `mprotect` requires the address to be page-aligned
     let ptr = crate::MutPtr::from_usize(start_addr);
     let pm = litebox_page_manager();
     unsafe { pm.make_pages_executable(ptr, end_addr - start_addr) }
@@ -412,6 +417,7 @@ impl ElfLoader {
             let trampoline = get_trampoline_hdr(&mut object);
             if let Some(trampoline) = trampoline.as_ref() {
                 // store the trampoline size so that [`ElfLoaderMmap`] can use it
+                // `end_addr` is only used by the main ELF file to compute `brk` address and thus we don't need to reset it.
                 loader_manager()
                     .lock()
                     .get_mut(&tid)
