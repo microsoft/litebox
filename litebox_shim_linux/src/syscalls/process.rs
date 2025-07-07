@@ -3,7 +3,8 @@
 use alloc::boxed::Box;
 use litebox::platform::{ExitProvider as _, RawMutPointer, ThreadProvider};
 use litebox::platform::{
-    PunchthroughProvider as _, PunchthroughToken as _, ThreadLocalStorageProvider as _,
+    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _,
+    ThreadLocalStorageProvider as _,
 };
 use litebox::utils::TruncateExt;
 use litebox_common_linux::CloneFlags;
@@ -260,6 +261,82 @@ pub(crate) fn sys_gettid() -> i32 {
         litebox_platform_multiplex::platform()
             .with_thread_local_storage_mut(|tls| tls.current_task.tid)
     }
+}
+
+// TODO: enforce the following limits:
+const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
+const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
+
+fn do_prlimit(
+    pid: Option<i32>,
+    resource: litebox_common_linux::RlimitResource,
+    new_limit: Option<litebox_common_linux::Rlimit>,
+) -> litebox_common_linux::Rlimit {
+    if new_limit.is_some() {
+        unimplemented!("Setting new limits is not supported yet");
+    }
+    if pid.is_some() {
+        unimplemented!("prlimit for a specific PID is not supported yet");
+    }
+
+    match resource {
+        litebox_common_linux::RlimitResource::STACK => litebox_common_linux::Rlimit {
+            rlim_cur: crate::loader::DEFAULT_STACK_SIZE,
+            rlim_max: litebox_common_linux::rlim_t::MAX,
+        },
+        litebox_common_linux::RlimitResource::NOFILE => litebox_common_linux::Rlimit {
+            rlim_cur: RLIMIT_NOFILE_CUR,
+            rlim_max: RLIMIT_NOFILE_MAX,
+        },
+        _ => unimplemented!("Unsupported resource for prlimit: {:?}", resource),
+    }
+}
+
+/// Handle syscall `prlimit64`.
+///
+/// Note for now setting new limits is not supported yet, and thus returning constant values
+/// for the requested resource. Getting resources for a specific PID is also not supported yet.
+pub(crate) fn sys_prlimit(
+    pid: Option<i32>,
+    resource: litebox_common_linux::RlimitResource,
+    new_rlim: Option<crate::ConstPtr<litebox_common_linux::Rlimit64>>,
+    old_rlim: Option<crate::MutPtr<litebox_common_linux::Rlimit64>>,
+) -> Result<(), Errno> {
+    let new_limit = match new_rlim {
+        Some(rlim) => {
+            let rlim = unsafe { rlim.read_at_offset(0) }
+                .ok_or(Errno::EINVAL)?
+                .into_owned();
+            Some(litebox_common_linux::rlimit64_to_rlimit(rlim))
+        }
+        None => None,
+    };
+    let old_limit = litebox_common_linux::rlimit_to_rlimit64(do_prlimit(pid, resource, new_limit));
+    if let Some(old_rlim) = old_rlim {
+        unsafe { old_rlim.write_at_offset(0, old_limit) }.ok_or(Errno::EINVAL)?;
+    }
+    Ok(())
+}
+
+/// Handle syscall `setrlimit`.
+pub(crate) fn sys_getrlimit(
+    resource: litebox_common_linux::RlimitResource,
+    rlim: crate::MutPtr<litebox_common_linux::Rlimit>,
+) -> Result<(), Errno> {
+    let old_limit = do_prlimit(None, resource, None);
+    unsafe { rlim.write_at_offset(0, old_limit) }.ok_or(Errno::EINVAL)
+}
+
+/// Handle syscall `setrlimit`.
+pub(crate) fn sys_setrlimit(
+    resource: litebox_common_linux::RlimitResource,
+    rlim: crate::ConstPtr<litebox_common_linux::Rlimit>,
+) -> Result<(), Errno> {
+    let new_limit = unsafe { rlim.read_at_offset(0) }
+        .ok_or(Errno::EFAULT)?
+        .into_owned();
+    let _ = do_prlimit(None, resource, Some(new_limit));
+    Ok(())
 }
 
 #[cfg(test)]

@@ -586,6 +586,18 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
         SyscallRequest::Gettid => {
             Ok(syscalls::process::sys_gettid().reinterpret_as_unsigned() as usize)
         }
+        SyscallRequest::Getrlimit { resource, rlim } => {
+            syscalls::process::sys_getrlimit(resource, rlim).map(|()| 0)
+        }
+        SyscallRequest::Setrlimit { resource, rlim } => {
+            syscalls::process::sys_setrlimit(resource, rlim).map(|()| 0)
+        }
+        SyscallRequest::Prlimit {
+            pid,
+            resource,
+            new_limit,
+            old_limit,
+        } => syscalls::process::sys_prlimit(pid, resource, new_limit, old_limit).map(|()| 0),
         SyscallRequest::GetRandom { buf, count, flags } => {
             syscalls::misc::sys_getrandom(buf, count, flags)
         }

@@ -37,6 +37,7 @@ impl_truncate! { u128, u64 }
 impl_truncate! { u128, u32 }
 impl_truncate! { u128, u16 }
 impl_truncate! { u128, u8 }
+impl_truncate! { u64, usize }
 impl_truncate! { u64, u32 }
 impl_truncate! { u64, u16 }
 impl_truncate! { u64, u8 }
