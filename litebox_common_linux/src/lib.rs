@@ -945,6 +945,15 @@ pub struct ThreadLocalStorage<Platform: litebox::platform::RawPointerProvider> {
     pub current_task: alloc::boxed::Box<Task<Platform>>,
 }
 
+/// Credentials of a process
+#[derive(Clone)]
+pub struct Credentials {
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+}
+
 impl<Platform: litebox::platform::RawPointerProvider> ThreadLocalStorage<Platform> {
     pub const fn new(task: alloc::boxed::Box<Task<Platform>>) -> Self {
         Self {
@@ -972,6 +981,8 @@ pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     /// of the futex has died. This notification consists of two pieces: the FUTEX_OWNER_DIED bit is set in the futex word,
     /// and the kernel performs a futex(2) FUTEX_WAKE operation on one of the threads waiting on the futex.
     pub robust_list: Option<Platform::RawConstPointer<RobustListHead<Platform>>>,
+    /// Shared process credentials.
+    pub credentials: alloc::sync::Arc<Credentials>,
 }
 
 #[repr(C)]
@@ -1385,6 +1396,10 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         count: usize,
         flags: RngFlags,
     },
+    Getuid,
+    Geteuid,
+    Getgid,
+    Getegid,
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
 }
@@ -1787,6 +1802,10 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     SyscallRequest::Ret(errno::Errno::EINVAL)
                 }
             }
+            Sysno::getuid => SyscallRequest::Getuid,
+            Sysno::getgid => SyscallRequest::Getgid,
+            Sysno::geteuid => SyscallRequest::Geteuid,
+            Sysno::getegid => SyscallRequest::Getegid,
             Sysno::arch_prctl => {
                 let code: u32 = ctx.syscall_arg(0).truncate();
                 if let Ok(code) = ArchPrctlCode::try_from(code) {

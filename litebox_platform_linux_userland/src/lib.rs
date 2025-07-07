@@ -181,6 +181,24 @@ impl LinuxUserland {
         reserved_pages
     }
 
+    fn get_user_info() -> litebox_common_linux::Credentials {
+        litebox_common_linux::Credentials {
+            // Alternatively, we could read those from `/proc/self/aux`
+            uid: unsafe { syscalls::syscall0(syscalls::Sysno::getuid) }
+                .expect("failed to get UID")
+                .truncate(),
+            euid: unsafe { syscalls::syscall0(syscalls::Sysno::geteuid) }
+                .expect("failed to get EUID")
+                .truncate(),
+            gid: unsafe { syscalls::syscall0(syscalls::Sysno::getgid) }
+                .expect("failed to get GID")
+                .truncate(),
+            egid: unsafe { syscalls::syscall0(syscalls::Sysno::getegid) }
+                .expect("failed to get EGID")
+                .truncate(),
+        }
+    }
+
     fn set_init_tls(&self) {
         let tid =
             unsafe { syscalls::syscall!(syscalls::Sysno::gettid) }.expect("Failed to get TID");
@@ -189,6 +207,7 @@ impl LinuxUserland {
             tid: i32::try_from(tid).expect("tid should fit in i32"),
             clear_child_tid: None,
             robust_list: None,
+            credentials: alloc::sync::Arc::new(Self::get_user_info()),
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         self.set_thread_local_storage(tls);
