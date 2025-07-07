@@ -9,6 +9,7 @@ use litebox::{
     fs::{FileSystem as _, Mode, OFlags},
     path,
     platform::{RawConstPointer, RawMutPointer},
+    utils::TruncateExt as _,
 };
 use litebox_common_linux::{
     AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec, IoWriteVec, IoctlArg,
@@ -385,7 +386,7 @@ impl Descriptor {
                 // TODO: we don't have correct values for these fields yet, but ensure there are consistent.
                 // (See <https://github.com/bminor/glibc/blob/e78caeb4ff812ae19d24d65f4d4d48508154277b/sysdeps/unix/sysv/linux/ttyname.h#L35>).
                 let mut fstat = FileStat::from(litebox_fs().fd_file_status(inner.file())?);
-                fstat.st_ino = *typ as u64;
+                fstat.st_ino = *typ as _;
                 fstat.st_dev = 0;
                 fstat.st_rdev = 34824;
                 fstat.st_blksize = 1024;
@@ -397,7 +398,8 @@ impl Descriptor {
                 st_dev: 0,
                 st_ino: 0,
                 st_nlink: 1,
-                st_mode: Mode::RUSR.bits() | litebox_common_linux::InodeType::NamedPipe as u32,
+                st_mode: (Mode::RUSR.bits() | litebox_common_linux::InodeType::NamedPipe as u32)
+                    .truncate(),
                 st_uid: 0,
                 st_gid: 0,
                 st_rdev: 0,
@@ -411,7 +413,8 @@ impl Descriptor {
                 st_dev: 0,
                 st_ino: 0,
                 st_nlink: 1,
-                st_mode: Mode::WUSR.bits() | litebox_common_linux::InodeType::NamedPipe as u32,
+                st_mode: (Mode::WUSR.bits() | litebox_common_linux::InodeType::NamedPipe as u32)
+                    .truncate(),
                 st_uid: 0,
                 st_gid: 0,
                 st_rdev: 0,
@@ -425,7 +428,7 @@ impl Descriptor {
                 st_dev: 0,
                 st_ino: 0,
                 st_nlink: 1,
-                st_mode: (Mode::RUSR | Mode::WUSR).bits(),
+                st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
                 st_uid: 0,
                 st_gid: 0,
                 st_rdev: 0,
@@ -458,7 +461,7 @@ fn do_stat(pathname: impl path::Arg, follow_symlink: bool) -> Result<FileStat, E
     if let Some(typ) = stdio_typ {
         // TODO: we don't have correct values for these fields yet, but ensure there are consistent.
         // (See <https://github.com/bminor/glibc/blob/e78caeb4ff812ae19d24d65f4d4d48508154277b/sysdeps/unix/sysv/linux/ttyname.h#L35>).
-        fstat.st_ino = typ as u64;
+        fstat.st_ino = typ as _;
         fstat.st_dev = 0;
         fstat.st_rdev = 34824;
         fstat.st_blksize = 1024;
