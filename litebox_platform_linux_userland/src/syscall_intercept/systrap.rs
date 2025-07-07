@@ -283,7 +283,6 @@ fn register_seccomp_filter() {
             ],
         ),
         (libc::SYS_tgkill, vec![]),
-        (libc::SYS_set_robust_list, vec![]),
         (
             libc::SYS_clone3,
             vec![
