@@ -665,12 +665,17 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
 
     // If this function is called for crash kexec, we protect its kimage segments as well.
     if is_crash {
-        let mut kimage_buf = vec![0u8; kexec_image.len()];
+        let mut kimage = core::mem::MaybeUninit::<Kimage>::uninit();
+        let kimage_slice: &mut [u8] = unsafe {
+            core::slice::from_raw_parts_mut(
+                kimage.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of::<Kimage>(),
+            )
+        };
         kexec_image
-            .read_bytes(kexec_image.start().unwrap(), &mut kimage_buf)
+            .read_bytes(kexec_image.start().unwrap(), kimage_slice)
             .map_err(|_| Errno::EINVAL)?;
-        #[allow(clippy::cast_ptr_alignment)]
-        let kimage = unsafe { &*(kimage_buf.as_ptr().cast::<Kimage>()) };
+        let kimage = unsafe { kimage.assume_init() };
         if kimage.nr_segments > u64::try_from(KEXEC_SEGMENT_MAX).unwrap() {
             serial_println!("VSM: Invalid kexec image segments");
             return Err(Errno::EINVAL);

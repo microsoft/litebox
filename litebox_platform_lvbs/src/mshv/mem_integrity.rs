@@ -448,13 +448,18 @@ fn extract_module_data_and_signature(
         })
         .ok_or(VerificationError::SignatureNotFound)?;
 
-    #[expect(clippy::cast_ptr_alignment)]
-    let module_signature = unsafe {
-        &*(signed_module
-            .as_ptr()
-            .add(module_signature_offset)
-            .cast::<ModuleSignature>())
-    };
+    let mut module_signature = core::mem::MaybeUninit::<ModuleSignature>::uninit();
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            signed_module
+                .as_ptr()
+                .add(module_signature_offset)
+                .cast::<u8>(),
+            module_signature.as_mut_ptr().cast::<u8>(),
+            core::mem::size_of::<ModuleSignature>(),
+        );
+    }
+    let module_signature = unsafe { module_signature.assume_init() };
     if !module_signature.is_valid() {
         return Err(VerificationError::InvalidSignature);
     }
