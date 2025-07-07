@@ -1019,7 +1019,7 @@ where
             }
             Protocol::Udp => unimplemented!(),
             Protocol::Icmp => unimplemented!(),
-            Protocol::Raw { protocol } => unimplemented!(),
+            Protocol::Raw { protocol: _ } => unimplemented!(),
         }
     }
 }

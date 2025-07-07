@@ -470,10 +470,11 @@ impl Descriptor {
                 ..Default::default()
             },
             Descriptor::Epoll { .. } => FileStat {
+                // TODO: give correct values
                 st_dev: 0,
                 st_ino: 0,
                 st_nlink: 1,
-                st_mode: (Mode::RUSR | Mode::WUSR).bits(),
+                st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
                 st_uid: 0,
                 st_gid: 0,
                 st_rdev: 0,
