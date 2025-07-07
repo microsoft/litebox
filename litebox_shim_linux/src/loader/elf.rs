@@ -260,8 +260,7 @@ fn get_trampoline_hdr(object: &mut ElfFile) -> Option<TrampolineHdr> {
         .st_size;
     Some(TrampolineHdr {
         vaddr: usize::try_from(trampoline.trampoline_addr).ok()?,
-        file_offset: usize::try_from(file_size).unwrap()
-            - usize::try_from(trampoline.trampoline_size).unwrap(),
+        file_offset: file_size - usize::try_from(trampoline.trampoline_size).unwrap(),
         size: usize::try_from(trampoline.trampoline_size).unwrap(),
     })
 }

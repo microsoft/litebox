@@ -172,6 +172,7 @@ impl From<litebox::fs::FileType> for InodeType {
 }
 
 /// Linux's `stat` struct
+#[cfg(target_arch = "x86_64")]
 #[repr(C, packed)]
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct FileStat {
@@ -184,8 +185,8 @@ pub struct FileStat {
     #[expect(clippy::pub_underscore_fields)]
     pub __pad0: core::ffi::c_int,
     pub st_rdev: u64,
-    pub st_size: i64,
-    pub st_blksize: i64,
+    pub st_size: usize,
+    pub st_blksize: usize,
     pub st_blocks: i64,
     pub st_atime: i64,
     pub st_atime_nsec: i64,
@@ -195,6 +196,87 @@ pub struct FileStat {
     pub st_ctime_nsec: i64,
     #[expect(clippy::pub_underscore_fields)]
     pub __unused: [i64; 3],
+}
+
+/// Linux's `stat` struct
+#[cfg(target_arch = "x86")]
+#[repr(C)]
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct FileStat {
+    pub st_dev: u32,
+    pub st_ino: u32,
+    pub st_nlink: u16,
+    pub st_mode: u16,
+    pub st_uid: u16,
+    pub st_gid: u16,
+    pub st_rdev: u32,
+    pub st_size: usize,
+    pub st_blksize: usize,
+    pub st_blocks: u32,
+    pub st_atime: u32,
+    pub st_atime_nsec: u32,
+    pub st_mtime: u32,
+    pub st_mtime_nsec: u32,
+    pub st_ctime: u32,
+    pub st_ctime_nsec: u32,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __unused: [u32; 2],
+}
+
+/// Linux's `stat64` struct
+#[cfg(target_arch = "x86")]
+#[repr(C, packed)]
+#[derive(Clone)]
+pub struct FileStat64 {
+    pub st_dev: u64,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __pad1: core::ffi::c_uint,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __st_ino: u32,
+    pub st_mode: u32,
+    pub st_nlink: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u64,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __pad2: core::ffi::c_uint,
+    pub st_size: u64,
+    pub st_blksize: usize,
+    pub st_blocks: u64,
+    pub st_atime: u32,
+    pub st_atime_nsec: u32,
+    pub st_mtime: u32,
+    pub st_mtime_nsec: u32,
+    pub st_ctime: u32,
+    pub st_ctime_nsec: u32,
+    pub st_ino: u64,
+}
+
+#[cfg(target_arch = "x86")]
+impl From<FileStat> for FileStat64 {
+    fn from(stat: FileStat) -> Self {
+        FileStat64 {
+            st_dev: u64::from(stat.st_dev),
+            __pad1: 0,
+            __st_ino: stat.st_ino,
+            st_mode: u32::from(stat.st_mode),
+            st_nlink: u32::from(stat.st_nlink),
+            st_uid: u32::from(stat.st_uid),
+            st_gid: u32::from(stat.st_gid),
+            st_rdev: u64::from(stat.st_rdev),
+            __pad2: 0,
+            st_size: stat.st_size as u64,
+            st_blksize: stat.st_blksize,
+            st_blocks: u64::from(stat.st_blocks),
+            st_atime: stat.st_atime,
+            st_atime_nsec: stat.st_atime_nsec,
+            st_mtime: stat.st_mtime,
+            st_mtime_nsec: stat.st_mtime_nsec,
+            st_ctime: stat.st_ctime,
+            st_ctime_nsec: stat.st_ctime_nsec,
+            st_ino: u64::from(stat.st_ino),
+        }
+    }
 }
 
 /// Linux's `iovec` struct for `writev`
@@ -246,14 +328,14 @@ impl From<litebox::fs::FileStatus> for FileStat {
             // TODO: st_dev and st_ino are used by ld.so to unique identify
             // shared libraries. Give a random value for now.
             st_dev: 0,
-            st_ino: unsafe { INO },
+            st_ino: unsafe { INO }.truncate(),
             st_nlink: 1,
-            st_mode: mode.bits() | InodeType::from(file_type) as u32,
+            st_mode: (mode.bits() | InodeType::from(file_type) as u32).truncate(),
             st_uid: 0,
             st_gid: 0,
             st_rdev: 0,
             #[allow(clippy::cast_possible_wrap)]
-            st_size: size as i64,
+            st_size: size,
             st_blksize: 0,
             st_blocks: 0,
             ..Default::default()
@@ -1243,6 +1325,13 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         buf: Platform::RawMutPointer<FileStat>,
         flags: AtFlags,
     },
+    #[cfg(target_arch = "x86")]
+    Fstatat64 {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        buf: Platform::RawMutPointer<FileStat64>,
+        flags: AtFlags,
+    },
     Eventfd2 {
         initval: u32,
         flags: EfdFlags,
@@ -1732,6 +1821,15 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             },
             #[cfg(target_arch = "x86_64")]
             Sysno::newfstatat => SyscallRequest::Newfstatat {
+                dirfd: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                pathname: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
+                buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
+                flags: AtFlags::from_bits_truncate(
+                    ctx.syscall_arg(3).reinterpret_as_signed().truncate(),
+                ),
+            },
+            #[cfg(target_arch = "x86")]
+            Sysno::fstatat64 => SyscallRequest::Fstatat64 {
                 dirfd: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
                 pathname: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
