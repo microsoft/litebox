@@ -676,54 +676,80 @@ pub mod syscalls {
 #[cfg(not(target_arch = "x86_64"))]
 pub mod syscalls {
     use super::SyscallTable;
-    
+
     /// Syscall number alias for compatibility
     #[allow(dead_code)]
     pub type Sysno = SyscallTable;
-    
+
     /// Result type for syscalls
     pub type SyscallResult = Result<usize, isize>;
-    
+
     // Stub implementations that panic - FreeBSD syscalls are only supported on x86_64
-    
+
     #[allow(dead_code)]
     #[inline]
     pub unsafe fn syscall0(_num: SyscallTable) -> SyscallResult {
         panic!("FreeBSD syscalls are only supported on x86_64 architecture")
     }
-    
+
     #[allow(dead_code)]
     #[inline]
     pub unsafe fn syscall1(_num: SyscallTable, _arg1: usize) -> SyscallResult {
         panic!("FreeBSD syscalls are only supported on x86_64 architecture")
     }
-    
+
     #[allow(dead_code)]
     #[inline]
     pub unsafe fn syscall2(_num: SyscallTable, _arg1: usize, _arg2: usize) -> SyscallResult {
         panic!("FreeBSD syscalls are only supported on x86_64 architecture")
     }
-    
+
     #[inline]
-    pub unsafe fn syscall3(_num: SyscallTable, _arg1: usize, _arg2: usize, _arg3: usize) -> SyscallResult {
+    pub unsafe fn syscall3(
+        _num: SyscallTable,
+        _arg1: usize,
+        _arg2: usize,
+        _arg3: usize,
+    ) -> SyscallResult {
         panic!("FreeBSD syscalls are only supported on x86_64 architecture")
     }
-    
+
     #[allow(dead_code)]
     #[inline]
-    pub unsafe fn syscall4(_num: SyscallTable, _arg1: usize, _arg2: usize, _arg3: usize, _arg4: usize) -> SyscallResult {
+    pub unsafe fn syscall4(
+        _num: SyscallTable,
+        _arg1: usize,
+        _arg2: usize,
+        _arg3: usize,
+        _arg4: usize,
+    ) -> SyscallResult {
         panic!("FreeBSD syscalls are only supported on x86_64 architecture")
     }
-    
+
     #[allow(dead_code)]
     #[inline]
-    pub unsafe fn syscall5(_num: SyscallTable, _arg1: usize, _arg2: usize, _arg3: usize, _arg4: usize, _arg5: usize) -> SyscallResult {
+    pub unsafe fn syscall5(
+        _num: SyscallTable,
+        _arg1: usize,
+        _arg2: usize,
+        _arg3: usize,
+        _arg4: usize,
+        _arg5: usize,
+    ) -> SyscallResult {
         panic!("FreeBSD syscalls are only supported on x86_64 architecture")
     }
-    
+
     #[allow(dead_code)]
     #[inline]
-    pub unsafe fn syscall6(_num: SyscallTable, _arg1: usize, _arg2: usize, _arg3: usize, _arg4: usize, _arg5: usize, _arg6: usize) -> SyscallResult {
+    pub unsafe fn syscall6(
+        _num: SyscallTable,
+        _arg1: usize,
+        _arg2: usize,
+        _arg3: usize,
+        _arg4: usize,
+        _arg5: usize,
+        _arg6: usize,
+    ) -> SyscallResult {
         panic!("FreeBSD syscalls are only supported on x86_64 architecture")
     }
 }
