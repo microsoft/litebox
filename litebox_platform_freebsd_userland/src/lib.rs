@@ -417,8 +417,6 @@ impl litebox::platform::PunchthroughProvider for FreeBSDUserland {
 
 impl litebox::platform::DebugLogProvider for FreeBSDUserland {
     fn debug_log_print(&self, msg: &str) {
-        println!("Do debuglog!!!: {}\n", msg);
-
         let _ = unsafe {
             syscalls::syscall3(
                 syscalls::Sysno::Write,
@@ -806,8 +804,8 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
 mod tests {
     // use core::sync::atomic::AtomicU32;
     // use std::thread::sleep;
-
     // use litebox::platform::{RawMutex, ThreadLocalStorageProvider as _};
+    use litebox::platform::ThreadLocalStorageProvider as _;
 
     use crate::FreeBSDUserland;
     use litebox::platform::{DebugLogProvider, PageManagementProvider};
@@ -848,27 +846,27 @@ mod tests {
         }
     }
 
-    // #[test]
-    // fn test_tls() {
-    //     let platform = LinuxUserland::new(None);
-    //     let tls = LinuxUserland::get_thread_local_storage();
-    //     assert!(!tls.is_null(), "TLS should not be null");
-    //     let tid = unsafe { (*tls).current_task.tid };
+    #[test]
+    fn test_tls() {
+        let platform = FreeBSDUserland::new(None);
+        let tls = FreeBSDUserland::get_thread_local_storage();
+        assert!(!tls.is_null(), "TLS should not be null");
+        let tid = unsafe { (*tls).current_task.tid };
 
-    //     platform.with_thread_local_storage_mut(|tls| {
-    //         assert_eq!(
-    //             tls.current_task.tid, tid,
-    //             "TLS should have the correct task ID"
-    //         );
-    //         tls.current_task.tid = 0x1234; // Change the task ID
-    //     });
-    //     let tls = platform.release_thread_local_storage();
-    //     assert_eq!(
-    //         tls.current_task.tid, 0x1234,
-    //         "TLS should have the correct task ID"
-    //     );
+        platform.with_thread_local_storage_mut(|tls| {
+            assert_eq!(
+                tls.current_task.tid, tid,
+                "TLS should have the correct task ID"
+            );
+            tls.current_task.tid = 0x1234; // Change the task ID
+        });
+        let tls = platform.release_thread_local_storage();
+        assert_eq!(
+            tls.current_task.tid, 0x1234,
+            "TLS should have the correct task ID"
+        );
 
-    //     let tls = LinuxUserland::get_thread_local_storage();
-    //     assert!(tls.is_null(), "TLS should be null after releasing it");
-    // }
+        let tls = FreeBSDUserland::get_thread_local_storage();
+        assert!(tls.is_null(), "TLS should be null after releasing it");
+    }
 }
