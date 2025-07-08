@@ -948,10 +948,10 @@ pub struct ThreadLocalStorage<Platform: litebox::platform::RawPointerProvider> {
 /// Credentials of a process
 #[derive(Clone)]
 pub struct Credentials {
-    pub uid: u32,
-    pub euid: u32,
-    pub gid: u32,
-    pub egid: u32,
+    pub uid: usize,
+    pub euid: usize,
+    pub gid: usize,
+    pub egid: usize,
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> ThreadLocalStorage<Platform> {

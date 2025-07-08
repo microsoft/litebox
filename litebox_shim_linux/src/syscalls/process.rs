@@ -443,25 +443,25 @@ pub(crate) fn sys_get_robust_list(
 }
 
 /// Handle syscall `getuid`.
-pub(crate) fn sys_getuid() -> u32 {
+pub(crate) fn sys_getuid() -> usize {
     litebox_platform_multiplex::platform()
         .with_thread_local_storage_mut(|tls| tls.current_task.credentials.uid)
 }
 
 /// Handle syscall `geteuid`.
-pub(crate) fn sys_geteuid() -> u32 {
+pub(crate) fn sys_geteuid() -> usize {
     litebox_platform_multiplex::platform()
         .with_thread_local_storage_mut(|tls| tls.current_task.credentials.euid)
 }
 
 /// Handle syscall `getgid`.
-pub(crate) fn sys_getgid() -> u32 {
+pub(crate) fn sys_getgid() -> usize {
     litebox_platform_multiplex::platform()
         .with_thread_local_storage_mut(|tls| tls.current_task.credentials.gid)
 }
 
 /// Handle syscall `getegid`.
-pub(crate) fn sys_getegid() -> u32 {
+pub(crate) fn sys_getegid() -> usize {
     litebox_platform_multiplex::platform()
         .with_thread_local_storage_mut(|tls| tls.current_task.credentials.egid)
 }

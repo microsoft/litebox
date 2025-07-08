@@ -447,10 +447,10 @@ impl ElfLoader {
 
         let user_info = litebox_platform_multiplex::platform()
             .with_thread_local_storage_mut(|tls| (*tls.current_task.credentials).clone());
-        aux.insert(AuxKey::AT_UID, user_info.uid as usize);
-        aux.insert(AuxKey::AT_EUID, user_info.euid as usize);
-        aux.insert(AuxKey::AT_GID, user_info.gid as usize);
-        aux.insert(AuxKey::AT_EGID, user_info.egid as usize);
+        aux.insert(AuxKey::AT_UID, user_info.uid);
+        aux.insert(AuxKey::AT_EUID, user_info.euid);
+        aux.insert(AuxKey::AT_GID, user_info.gid);
+        aux.insert(AuxKey::AT_EGID, user_info.egid);
 
         let sp = unsafe {
             let suggested_range = litebox::mm::linux::PageRange::new(0, super::DEFAULT_STACK_SIZE)

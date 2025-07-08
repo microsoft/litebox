@@ -184,18 +184,12 @@ impl LinuxUserland {
     fn get_user_info() -> litebox_common_linux::Credentials {
         litebox_common_linux::Credentials {
             // Alternatively, we could read those from `/proc/self/aux`
-            uid: unsafe { syscalls::syscall0(syscalls::Sysno::getuid) }
-                .expect("failed to get UID")
-                .truncate(),
+            uid: unsafe { syscalls::syscall0(syscalls::Sysno::getuid) }.expect("failed to get UID"),
             euid: unsafe { syscalls::syscall0(syscalls::Sysno::geteuid) }
-                .expect("failed to get EUID")
-                .truncate(),
-            gid: unsafe { syscalls::syscall0(syscalls::Sysno::getgid) }
-                .expect("failed to get GID")
-                .truncate(),
+                .expect("failed to get EUID"),
+            gid: unsafe { syscalls::syscall0(syscalls::Sysno::getgid) }.expect("failed to get GID"),
             egid: unsafe { syscalls::syscall0(syscalls::Sysno::getegid) }
-                .expect("failed to get EGID")
-                .truncate(),
+                .expect("failed to get EGID"),
         }
     }
 
