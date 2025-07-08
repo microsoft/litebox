@@ -37,7 +37,7 @@ pub(crate) fn mem_attr_to_hv_page_prot_flags(attr: MemAttr) -> HvPageProtFlags {
     flags
 }
 
-#[derive(Default, Debug, TryFromPrimitive)]
+#[derive(Default, Debug, TryFromPrimitive, PartialEq)]
 #[repr(u64)]
 pub enum HekiKdataType {
     SystemCerts = 0,
@@ -51,7 +51,7 @@ pub enum HekiKdataType {
     Unknown = 0xffff_ffff_ffff_ffff,
 }
 
-#[derive(Default, Debug, TryFromPrimitive)]
+#[derive(Default, Debug, TryFromPrimitive, PartialEq)]
 #[repr(u64)]
 pub enum HekiKexecType {
     KexecImage = 0,
@@ -148,6 +148,24 @@ impl HekiRange {
         let attr = self.attributes;
         HekiKexecType::try_from(attr).unwrap_or(HekiKexecType::Unknown)
     }
+
+    pub fn is_valid(&self) -> bool {
+        let va = self.va;
+        let pa = self.pa;
+        let epa = self.epa;
+        let Ok(pa) = PhysAddr::try_new(pa) else {
+            return false;
+        };
+        let Ok(epa) = PhysAddr::try_new(epa) else {
+            return false;
+        };
+        !(VirtAddr::try_new(va).is_err()
+            || epa < pa
+            || (self.mem_attr().is_none()
+                && self.heki_kdata_type() == HekiKdataType::Unknown
+                && self.heki_kexec_type() == HekiKexecType::Unknown
+                && self.mod_mem_type() == ModMemType::Unknown))
+    }
 }
 
 #[expect(clippy::cast_possible_truncation)]
@@ -171,11 +189,38 @@ impl HekiPage {
             ..Default::default()
         }
     }
+
+    pub fn is_valid(&self) -> bool {
+        if PhysAddr::try_new(self.next_pa).is_err() {
+            return false;
+        }
+        let Some(nranges) = usize::try_from(self.nranges)
+            .ok()
+            .filter(|&n| n <= HEKI_MAX_RANGES)
+        else {
+            return false;
+        };
+        for heki_range in &self.ranges[..nranges] {
+            if !heki_range.is_valid() {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl Default for HekiPage {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<'a> IntoIterator for &'a HekiPage {
+    type Item = &'a HekiRange;
+    type IntoIter = core::slice::Iter<'a, HekiRange>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.ranges[..usize::try_from(self.nranges).unwrap_or(0)].iter()
     }
 }
 
@@ -189,42 +234,31 @@ pub struct HekiPatch {
 pub const POKE_MAX_OPCODE_SIZE: usize = 5;
 
 impl HekiPatch {
-    /// Creates a new `HekiPatch` with the given buffer. Returns `None` if any field is invalid.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != core::mem::size_of::<HekiPatch>() {
-            return None;
-        }
-        let mut heki_patch = core::mem::MaybeUninit::<HekiPatch>::uninit();
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                bytes.as_ptr().cast::<u8>(),
-                heki_patch.as_mut_ptr().cast::<u8>(),
-                core::mem::size_of::<HekiPatch>(),
-            );
-        }
-        let heki_patch = unsafe { heki_patch.assume_init() };
-        if heki_patch.is_valid() {
-            Some(heki_patch)
-        } else {
-            None
-        }
-    }
-
     pub fn is_valid(&self) -> bool {
-        let bytes_in_first_page = usize::try_from(
-            PhysAddr::new(self.pa[0]).align_up(Size4KiB::SIZE) - PhysAddr::new(self.pa[0]),
-        )
-        .unwrap();
+        let Some(pa_0) = PhysAddr::try_new(self.pa[0])
+            .ok()
+            .filter(|&pa| !pa.is_null())
+        else {
+            return false;
+        };
+        let Some(pa_1) = PhysAddr::try_new(self.pa[1])
+            .ok()
+            .filter(|&pa| pa.is_null() || pa.is_aligned(Size4KiB::SIZE))
+        else {
+            return false;
+        };
+        let bytes_in_first_page = usize::try_from(pa_0.align_up(Size4KiB::SIZE) - pa_0).unwrap();
 
-        !(usize::from(self.size) > POKE_MAX_OPCODE_SIZE
-            || (self.pa[0] != 0 && self.pa[0] == self.pa[1])
-            || (self.pa[1] == 0 && bytes_in_first_page < usize::from(self.size))
-            || (self.pa[1] != 0 && bytes_in_first_page > usize::from(self.size)))
+        !(self.size == 0
+            || usize::from(self.size) > POKE_MAX_OPCODE_SIZE
+            || (pa_0 == pa_1)
+            || (pa_1.is_null() && bytes_in_first_page < usize::from(self.size))
+            || (!pa_1.is_null() && bytes_in_first_page > usize::from(self.size)))
     }
 }
 
 #[expect(dead_code)]
-#[derive(Default, Clone, Copy, Debug)]
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
 #[repr(u32)]
 pub enum HekiPatchType {
     JumpLabel = 0,

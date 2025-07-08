@@ -1,12 +1,9 @@
 //! Functions for checking the memory integrity of VTL0 kernel image and modules
 
-#[cfg(debug_assertions)]
-use alloc::vec::Vec;
-
 use crate::{
     debug_serial_println, host::linux::ModuleSignature, mshv::vsm::ModuleMemory, serial_println,
 };
-use alloc::vec;
+use alloc::{vec, vec::Vec};
 use authenticode::{AttributeCertificateIterator, AuthenticodeSignature, authenticode_digest};
 use cms::{content_info::ContentInfo, signed_data::SignedData};
 use const_oid::db::rfc5912::{ID_SHA_256, ID_SHA_512, RSA_ENCRYPTION};

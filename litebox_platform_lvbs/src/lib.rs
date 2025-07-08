@@ -186,9 +186,9 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    page_addr.wrapping_add(page_offset) as *const T,
-                    (*raw).as_mut_ptr(),
-                    1,
+                    page_addr.wrapping_add(page_offset).cast::<u8>(),
+                    (*raw).as_mut_ptr().cast::<u8>(),
+                    core::mem::size_of::<T>(),
                 );
             }
 
@@ -225,9 +225,9 @@ impl<Host: HostInterface> LinuxKernel<Host> {
                 usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    core::ptr::from_ref::<T>(value),
-                    page_addr.wrapping_add(page_offset).cast::<T>(),
-                    1,
+                    core::ptr::from_ref::<T>(value).cast::<u8>(),
+                    page_addr.wrapping_add(page_offset).cast::<u8>(),
+                    core::mem::size_of::<T>(),
                 );
             }
             assert!(
@@ -264,9 +264,9 @@ impl<Host: HostInterface> LinuxKernel<Host> {
                 usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    value.as_ptr(),
-                    page_addr.wrapping_add(page_offset).cast::<T>(),
-                    value.len(),
+                    value.as_ptr().cast::<u8>(),
+                    page_addr.wrapping_add(page_offset).cast::<u8>(),
+                    core::mem::size_of_val(value),
                 );
             }
 
@@ -305,9 +305,9 @@ impl<Host: HostInterface> LinuxKernel<Host> {
                 usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    page_addr.wrapping_add(page_offset).cast::<T>(),
-                    buf.as_mut_ptr(),
-                    buf.len(),
+                    page_addr.wrapping_add(page_offset).cast::<u8>(),
+                    buf.as_mut_ptr().cast::<u8>(),
+                    core::mem::size_of_val(buf),
                 );
             }
 
