@@ -443,7 +443,9 @@ pub(crate) fn sys_get_robust_list(
 mod tests {
     use core::mem::MaybeUninit;
 
-    use litebox::{mm::linux::PAGE_SIZE, platform::RawConstPointer as _};
+    use litebox::{
+        mm::linux::PAGE_SIZE, platform::DebugLogProvider as _, platform::RawConstPointer as _,
+    };
     use litebox_common_linux::{CloneFlags, MapFlags, ProtFlags};
 
     #[cfg(target_arch = "x86_64")]
@@ -569,10 +571,17 @@ mod tests {
             esp: 0,
             xss: 0x2b, // __USER_DS
         };
-        crate::syscalls::tests::log_println!("stack allocated at: {:#x}", stack.as_usize());
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "stack allocated at: {:#x}",
+            stack.as_usize()
+        );
         let main: fn() = || {
             let tid = super::sys_gettid();
-            crate::syscalls::tests::log_println!("Child started {tid}");
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "Child started {tid}"
+            );
 
             #[cfg(target_arch = "x86_64")]
             {
@@ -596,7 +605,11 @@ mod tests {
                 tid,
                 "Child TID should match sys_gettid result"
             );
-            crate::syscalls::tests::log_println!("Child TID: {}", unsafe { CHILD_TID });
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "Child TID: {}",
+                unsafe { CHILD_TID }
+            );
             super::sys_exit(0);
         };
 
@@ -635,7 +648,11 @@ mod tests {
             main as usize,
         )
         .expect("sys_clone failed");
-        crate::syscalls::tests::log_println!("sys_clone returned: {}", result);
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "sys_clone returned: {}",
+            result
+        );
         assert!(result > 0, "sys_clone should return a positive PID");
         assert_eq!(
             unsafe { parent_tid.assume_init() } as usize,
