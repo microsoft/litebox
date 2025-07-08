@@ -1,3 +1,5 @@
+#![cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+
 use litebox_platform_freebsd_userland::syscall_raw::{SyscallTable, syscalls};
 use std::ffi::CString;
 
