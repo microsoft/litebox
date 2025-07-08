@@ -227,10 +227,6 @@ fn register_seccomp_filter() {
             ],
         ),
         (libc::SYS_getpid, vec![]),
-        (libc::SYS_getuid, vec![]),
-        (libc::SYS_getgid, vec![]),
-        (libc::SYS_geteuid, vec![]),
-        (libc::SYS_getegid, vec![]),
         (libc::SYS_capget, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (

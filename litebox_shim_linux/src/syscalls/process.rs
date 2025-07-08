@@ -289,6 +289,8 @@ pub(crate) fn sys_clone(
     }
 
     let platform = litebox_platform_multiplex::platform();
+    let credentials =
+        platform.with_thread_local_storage_mut(|tls| tls.current_task.credentials.clone());
     let child_tid = unsafe {
         platform.spawn_thread(
             ctx,
@@ -310,6 +312,7 @@ pub(crate) fn sys_clone(
                         None
                     },
                     robust_list: None,
+                    credentials,
                 }),
                 callback: new_thread_callback,
             }),
@@ -437,6 +440,30 @@ pub(crate) fn sys_get_robust_list(
         tls.current_task.robust_list.map_or(0, |ptr| ptr.as_usize())
     });
     unsafe { head_ptr.write_at_offset(0, head) }.ok_or(Errno::EFAULT)
+}
+
+/// Handle syscall `getuid`.
+pub(crate) fn sys_getuid() -> usize {
+    litebox_platform_multiplex::platform()
+        .with_thread_local_storage_mut(|tls| tls.current_task.credentials.uid)
+}
+
+/// Handle syscall `geteuid`.
+pub(crate) fn sys_geteuid() -> usize {
+    litebox_platform_multiplex::platform()
+        .with_thread_local_storage_mut(|tls| tls.current_task.credentials.euid)
+}
+
+/// Handle syscall `getgid`.
+pub(crate) fn sys_getgid() -> usize {
+    litebox_platform_multiplex::platform()
+        .with_thread_local_storage_mut(|tls| tls.current_task.credentials.gid)
+}
+
+/// Handle syscall `getegid`.
+pub(crate) fn sys_getegid() -> usize {
+    litebox_platform_multiplex::platform()
+        .with_thread_local_storage_mut(|tls| tls.current_task.credentials.egid)
 }
 
 #[cfg(test)]
