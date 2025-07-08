@@ -443,9 +443,7 @@ pub(crate) fn sys_get_robust_list(
 mod tests {
     use core::mem::MaybeUninit;
 
-    use litebox::{
-        mm::linux::PAGE_SIZE, platform::DebugLogProvider as _, platform::RawConstPointer as _,
-    };
+    use litebox::{mm::linux::PAGE_SIZE, platform::RawConstPointer as _};
     use litebox_common_linux::{CloneFlags, MapFlags, ProtFlags};
 
     #[cfg(target_arch = "x86_64")]
