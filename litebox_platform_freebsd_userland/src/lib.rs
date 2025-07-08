@@ -6,6 +6,7 @@
     target_os = "freebsd",
     any(target_arch = "x86_64", target_arch = "x86")
 ))]
+use core::num;
 // use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use core::sync::atomic::AtomicU32;
 // use std::sync::atomic::Ordering::SeqCst;
@@ -25,7 +26,6 @@ pub mod syscall_raw;
 use syscall_raw::syscalls;
 
 mod freebsd_types;
-
 // todo(chuqi): we do not use systrap for now as there's no sccomp interception on FreeBSD.
 // mod syscall_intercept;
 
@@ -313,11 +313,94 @@ impl RawMutex {
         val: u32,
         timeout: Option<Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        unimplemented!(
-            "block_or_maybe_timeout is not implemented for FreeBSD yet. val: {}, timeout: {:?}",
-            val,
-            timeout
-        );
+        use core::sync::atomic::Ordering::SeqCst;
+        
+        // We immediately wake up (without even hitting syscalls) if we can clearly see that the
+        // value is different.
+        if self.inner.load(SeqCst) != val {
+            return Err(ImmediatelyWokenUp);
+        }
+
+        // Track some initial information.
+        let mut first_time = true;
+        let start = std::time::Instant::now();
+
+        // We'll be looping unless we find a good reason to exit out of the loop, either due to a
+        // wake-up or a time-out. We do a singular (only as a one-off) check for the
+        // immediate-wake-up purely as an optimization, but otherwise, the only way to exit this
+        // loop is to actually hit an `Ok` state out for this function.
+        loop {
+            let remaining_time = match timeout {
+                None => None,
+                Some(timeout) => match timeout.checked_sub(start.elapsed()) {
+                    None => {
+                        break Ok(UnblockedOrTimedOut::TimedOut);
+                    }
+                    Some(remaining_time) => Some(remaining_time),
+                },
+            };
+
+            // We wait on the umtx_op, with a timeout if needed; the timeout is based on how much time
+            // remains to be elapsed.
+            match umtx_op_operation_timeout(
+                &self.num_to_wake_up,
+                freebsd_types::UmtxOpOperation::UMTX_OP_WAIT_UINT,
+                /* expected value */ 0,
+                remaining_time,
+            ) {
+                Ok(0) => {
+                    // Fallthrough: check if spurious.
+                    println!("UMTX_OP_WAIT_UINT returned 0, checking for spurious wake-up");
+                }
+                // todo(chuqi): don't use magic numbers here
+                Err(-35) => { // EAGAIN equivalent on FreeBSD
+                    // A wake-up was already in progress when we attempted to wait. Has someone
+                    // already touched inner value? We only check this on the first time around,
+                    // anything else could be a true wake.
+                    if first_time && self.inner.load(SeqCst) != val {
+                        // Ah, we seem to have actually been immediately woken up! Let us not
+                        // miss this.
+                        return Err(ImmediatelyWokenUp);
+                    } else {
+                        // Fallthrough: check if spurious. A wake-up was already in progress
+                        // when we attempted to wait, so we can do a proper check.
+                    }
+                }
+                Err(e) => {
+                    panic!("Unexpected errno={e} for UMTX_OP_WAIT")
+                }
+                _ => unreachable!(),
+            }
+
+            // We have either been woken up, or this is spurious. Let us check if we were
+            // actually woken up.
+            match self.num_to_wake_up.fetch_update(SeqCst, SeqCst, |n| {
+                if n & (1 << 31) == 0 {
+                    // No waker in play, do nothing to the value
+                    println!("No waker in play. n = 0x{:x}", n);
+                    None
+                } else if n & ((1 << 30) - 1) > 0 {
+                    // There is a waker, and there is still capacity to wake up
+                    println!("There is a waker, and there is still capacity to wake up. n = 0x{:x}", n);
+                    Some(n - 1)
+                } else {
+                    // There is a waker, but capacity is gone
+                    println!("There is a waker, but capacity is gone. n = 0x{:x}", n);
+                    None
+                }
+            }) {
+                Ok(_) => {
+                    // We marked ourselves as having woken up, we can exit, marking
+                    // ourselves as no longer waiting.
+                    break Ok(UnblockedOrTimedOut::Unblocked);
+                }
+                Err(_) => {
+                    // We have not yet been asked to wake up, this is spurious. Spin that
+                    // loop again.
+                    first_time = false;
+                }
+            }
+        }
     }
 }
 
@@ -327,7 +410,73 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 
     fn wake_many(&self, n: usize) -> usize {
-        unimplemented!("wake_many is not implemented for FreeBSD yet. n: {}", n);
+        use core::sync::atomic::Ordering::SeqCst;
+        
+        assert!(n > 0);
+        let n: u32 = n.try_into().unwrap();
+
+        // We restrict ourselves to a max of ~1 billion waiters being woken up at once, which should
+        // be good enough, but makes sure we are not clobbering the "lock bits".
+        let n = n.min((1 << 30) - 1);
+
+        // For FreeBSD, we can't do the same requeue trick as Linux futex, so we implement
+        // a simpler version that directly sets the wake count and wakes threads
+        
+        // Set the number of waiters we want allowed to know that they can wake up, while
+        // also grabbing the "lock bit"s.
+        while self
+            .num_to_wake_up
+            .compare_exchange(0, n | (0b11 << 30), SeqCst, SeqCst)
+            .is_err()
+        {
+            // If someone else is _also_ attempting to wake waiters up, then we should just spin
+            // until the other waker is done with their job and brings the value down.
+            core::hint::spin_loop();
+        }
+
+        println!(
+            "Waking up 0x{:x} threads, setting 'num_to_wake_up' to 0x{:x}",
+            n,
+            n | (0b11 << 30)
+        );
+
+        // Now we can actually wake them up using FreeBSD's umtx_op
+        let _ = match umtx_op_operation_timeout(
+            &self.num_to_wake_up,
+            freebsd_types::UmtxOpOperation::UMTX_OP_WAKE,
+            n, // number of threads to wake
+            None, // no timeout for wake operations
+        ) {
+            Ok(woken) => core::cmp::min(n, u32::try_from(woken).unwrap_or(0)),
+            Err(_) => 0, // If wake fails, assume 0 were woken
+        };
+
+        // Unlock the lock bits, allowing other wakers to run.
+        let num_woken_up = 1;
+        let remain = n - num_woken_up;
+
+        println!("Woken up 0x{:x} threads, remaining to wake: 0x{:x}", 
+                    num_woken_up, remain);
+
+        while let Err(v) = self.num_to_wake_up.fetch_update(SeqCst, SeqCst, |v| {
+            // Due to spurious or immediate wake-ups (i.e., unexpected wakeups that may decrease `num_to_wake_up`),
+            // `num_to_wake_up` might end up being less than expected. Thus, we check `<=` rather than `==`.
+            if v & ((1 << 30) - 1) <= remain {
+                println!("Orig num_to_wake_up was 0x{:x}, setting to 0. remain = 0x{:x}", v, remain);
+                Some(0)
+            } else {
+                println!("Orig num_to_wake_up was 0x{:x}. no change. remain = 0x{:x}", v, remain);
+                None
+            }
+        }) {
+            // Confirm that no one has clobbered the lock bits (which would indicate an implementation
+            // failure somewhere).
+            debug_assert_eq!(v >> 30, 0b11, "lock bits should remain unclobbered");
+            core::hint::spin_loop();
+        }
+
+        // Return the number that were actually woken up
+        num_woken_up.try_into().unwrap()
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
@@ -427,6 +576,58 @@ impl litebox::platform::DebugLogProvider for FreeBSDUserland {
         };
     }
 }
+
+// Several _umtx_op() operations allow the blocking time to
+// be limited, failing the request if it cannot be satisfied
+// in the specified time period. The timeout is specified
+// by passing either the address of struct timespec, or its
+// extended variant, struct _umtx_time, as the uaddr2 argu-
+// ment of _umtx_op(). They are distinguished by the uaddr
+// value, which must be equal to the size of the structure
+// pointed to by uaddr2, casted to uintptr_t.
+fn umtx_op_operation_timeout(
+    obj: &AtomicU32,
+    op: freebsd_types::UmtxOpOperation,
+    val: u32,
+    timeout: Option<Duration>,
+) -> Result<usize, isize> {
+    let obj_ptr = obj as *const AtomicU32 as usize;
+    let op: i32 = op as _;
+    let timeout_spec = timeout.map(|t| {
+        const TEN_POWER_NINE: u128 = 1_000_000_000;
+        let nanos: u128 = t.as_nanos();
+        let tv_sec = nanos
+            .checked_div(TEN_POWER_NINE)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let tv_nsec = nanos
+            .checked_rem(TEN_POWER_NINE)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        libc::timespec { tv_sec, tv_nsec }
+    });
+    
+    let (uaddr, uaddr2) = if let Some(ref ts) = timeout_spec {
+        // When timeout is provided, uaddr must be size of timespec
+        (core::mem::size_of::<libc::timespec>(), ts as *const libc::timespec as usize)
+    } else {
+        (obj_ptr, 0)
+    };
+    
+    unsafe {
+        syscalls::syscall5(
+            syscalls::Sysno::UmtxOp,
+            if timeout_spec.is_some() { obj_ptr } else { uaddr },
+            op as usize,
+            val as usize,
+            uaddr,
+            uaddr2,
+        )
+    }
+}
+
 
 impl litebox::platform::RawPointerProvider for FreeBSDUserland {
     type RawConstPointer<T: Clone> = litebox::platform::trivial_providers::TransparentConstPtr<T>;
@@ -802,31 +1003,30 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
 
 #[cfg(test)]
 mod tests {
-    // use core::sync::atomic::AtomicU32;
-    // use std::thread::sleep;
-    // use litebox::platform::{RawMutex, ThreadLocalStorageProvider as _};
-    use litebox::platform::ThreadLocalStorageProvider as _;
+    use core::sync::atomic::AtomicU32;
+    use std::thread::sleep;
+    use litebox::platform::{RawMutex, ThreadLocalStorageProvider as _};
 
     use crate::FreeBSDUserland;
     use litebox::platform::{DebugLogProvider, PageManagementProvider};
 
     extern crate std;
 
-    // #[test]
-    // fn test_raw_mutex() {
-    //     let mutex = std::sync::Arc::new(super::RawMutex {
-    //         inner: AtomicU32::new(0),
-    //         num_to_wake_up: AtomicU32::new(0),
-    //     });
+    #[test]
+    fn test_raw_mutex() {
+        let mutex = std::sync::Arc::new(super::RawMutex {
+            inner: AtomicU32::new(0),
+            num_to_wake_up: AtomicU32::new(0),
+        });
 
-    //     let copied_mutex = mutex.clone();
-    //     std::thread::spawn(move || {
-    //         sleep(core::time::Duration::from_millis(500));
-    //         copied_mutex.wake_many(10);
-    //     });
+        let copied_mutex = mutex.clone();
+        std::thread::spawn(move || {
+            sleep(core::time::Duration::from_millis(500));
+            copied_mutex.wake_many(10);
+        });
 
-    //     assert!(mutex.block(0).is_ok());
-    // }
+        assert!(mutex.block(0).is_ok());
+    }
 
     #[test]
     fn test_reserved_pages() {
