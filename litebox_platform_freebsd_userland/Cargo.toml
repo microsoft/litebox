@@ -7,7 +7,6 @@ edition = "2024"
 libc = { version = "0.2.169", default-features = false }
 litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux", version = "0.1.0" }
-nix = { version = "0.29.0", default-features = false, features = ["fs", "ioctl", "mman", "signal"] }
 spin = "0.9.8"
 bitflags = "2.6.0"
 
