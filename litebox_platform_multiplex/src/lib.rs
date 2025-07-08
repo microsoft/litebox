@@ -33,9 +33,7 @@ compile_error!(
     all(feature = "platform_linux_userland", target_os = "linux"),
     all(feature = "platform_freebsd_userland", target_os = "freebsd")
 )))]
-compile_error!(
-    r##"No platforms specified. Please enable the feature for the platform you want."##
-);
+compile_error!(r##"No platforms specified. Please enable the feature for the platform you want."##);
 
 #[cfg(all(feature = "platform_linux_userland", target_os = "linux"))]
 pub type Platform = litebox_platform_linux_userland::LinuxUserland;

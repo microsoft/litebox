@@ -1,5 +1,5 @@
 // Automatically generated — do not edit.
-// Since the Rust package "syscalls" does not support FreeBSD, 
+// Since the Rust package "syscalls" does not support FreeBSD,
 // we define the syscall table manually here.
 
 #[repr(i32)]
@@ -448,21 +448,21 @@ pub enum SyscallTable {
 /// Direct syscall wrappers for FreeBSD x86_64
 pub mod syscalls {
     use super::SyscallTable;
-    
+
     /// Syscall number alias for compatibility
     #[allow(dead_code)]
     pub type Sysno = SyscallTable;
-    
+
     /// Result type for syscalls
     pub type SyscallResult = Result<usize, isize>;
-    
+
     /// Perform a syscall with no arguments
     #[allow(dead_code)]
     #[inline]
     pub unsafe fn syscall0(num: SyscallTable) -> SyscallResult {
         let ret: usize;
         let carry: u8;
-        unsafe{
+        unsafe {
             core::arch::asm!(
                 "syscall",
                 "setc {}",
@@ -479,14 +479,14 @@ pub mod syscalls {
             Ok(ret)
         }
     }
-    
+
     /// Perform a syscall with one argument
     #[allow(dead_code)]
     #[inline]
     pub unsafe fn syscall1(num: SyscallTable, arg1: usize) -> SyscallResult {
         let ret: usize;
         let carry: u8;
-        unsafe{
+        unsafe {
             core::arch::asm!(
                 "syscall",
                 "setc {}",
@@ -504,14 +504,14 @@ pub mod syscalls {
             Ok(ret)
         }
     }
-    
+
     /// Perform a syscall with two arguments
     #[allow(dead_code)]
     #[inline]
     pub unsafe fn syscall2(num: SyscallTable, arg1: usize, arg2: usize) -> SyscallResult {
         let ret: usize;
         let carry: u8;
-        unsafe{
+        unsafe {
             core::arch::asm!(
                 "syscall",
                 "setc {}",
@@ -530,13 +530,18 @@ pub mod syscalls {
             Ok(ret)
         }
     }
-    
+
     /// Perform a syscall with three arguments
     #[inline]
-    pub unsafe fn syscall3(num: SyscallTable, arg1: usize, arg2: usize, arg3: usize) -> SyscallResult {
+    pub unsafe fn syscall3(
+        num: SyscallTable,
+        arg1: usize,
+        arg2: usize,
+        arg3: usize,
+    ) -> SyscallResult {
         let ret: usize;
         let carry: u8;
-        unsafe{
+        unsafe {
             core::arch::asm!(
                 "syscall",
                 "setc {}",
@@ -556,14 +561,20 @@ pub mod syscalls {
             Ok(ret)
         }
     }
-    
+
     /// Perform a syscall with four arguments
     #[allow(dead_code)]
     #[inline]
-    pub unsafe fn syscall4(num: SyscallTable, arg1: usize, arg2: usize, arg3: usize, arg4: usize) -> SyscallResult {
+    pub unsafe fn syscall4(
+        num: SyscallTable,
+        arg1: usize,
+        arg2: usize,
+        arg3: usize,
+        arg4: usize,
+    ) -> SyscallResult {
         let ret: usize;
         let carry: u8;
-        unsafe{
+        unsafe {
             core::arch::asm!(
                 "syscall",
                 "setc {}",
@@ -584,11 +595,18 @@ pub mod syscalls {
             Ok(ret)
         }
     }
-    
+
     /// Perform a syscall with five arguments
     #[allow(dead_code)]
     #[inline]
-    pub unsafe fn syscall5(num: SyscallTable, arg1: usize, arg2: usize, arg3: usize, arg4: usize, arg5: usize) -> SyscallResult {
+    pub unsafe fn syscall5(
+        num: SyscallTable,
+        arg1: usize,
+        arg2: usize,
+        arg3: usize,
+        arg4: usize,
+        arg5: usize,
+    ) -> SyscallResult {
         let ret: usize;
         let carry: u8;
         unsafe {
@@ -613,14 +631,22 @@ pub mod syscalls {
             Ok(ret)
         }
     }
-    
+
     /// Perform a syscall with six arguments
     #[allow(dead_code)]
     #[inline]
-    pub unsafe fn syscall6(num: SyscallTable, arg1: usize, arg2: usize, arg3: usize, arg4: usize, arg5: usize, arg6: usize) -> SyscallResult {
+    pub unsafe fn syscall6(
+        num: SyscallTable,
+        arg1: usize,
+        arg2: usize,
+        arg3: usize,
+        arg4: usize,
+        arg5: usize,
+        arg6: usize,
+    ) -> SyscallResult {
         let ret: usize;
         let carry: u8;
-        unsafe{
+        unsafe {
             core::arch::asm!(
                 "syscall",
                 "setc {}",

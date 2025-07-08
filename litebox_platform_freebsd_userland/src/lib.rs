@@ -2,18 +2,21 @@
 
 // Restrict this crate to only work on FreeBSD. For now, we are restricting this to only x86/x86-64
 // FreeBSD, but we _may_ allow for more in the future, if we find it useful to do so.
-#![cfg(all(target_os = "freebsd", any(target_arch = "x86_64", target_arch = "x86")))]
+#![cfg(all(
+    target_os = "freebsd",
+    any(target_arch = "x86_64", target_arch = "x86")
+))]
 // use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::sync::atomic::AtomicU32;
 // use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
-use litebox::platform::{ThreadLocalStorageProvider, UnblockedOrTimedOut};
+use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
-use litebox::platform::{ImmediatelyWokenUp};
+use litebox::platform::{ThreadLocalStorageProvider, UnblockedOrTimedOut};
 // use litebox::platform::{ImmediatelyWokenUp, RawConstPointer, ThreadLocalStorageProvider};
-use litebox::utils::{ReinterpretUnsignedExt as _};
+use litebox::utils::ReinterpretUnsignedExt as _;
 use litebox_common_linux::{ProtFlags, PunchthroughSyscall};
 // use litebox_common_linux::{CloneFlags, MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
 
@@ -65,7 +68,7 @@ impl FreeBSDUserland {
             // seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages: Self::read_proc_self_maps(),
         };
-        
+
         platform.set_init_tls();
         Box::leak(Box::new(platform))
     }
@@ -99,14 +102,14 @@ impl FreeBSDUserland {
         // cause the program to crash when calling `mmap` or `mremap` with the `MAP_FIXED` flag later.
         // We should either fix `mmap` to handle this error, or let global allocator call this function
         // whenever it get more pages from the host.
-        
+
         let path = SELFPROC_MAPS_PATH;
-        
+
         let c_path = match std::ffi::CString::new(path) {
             Ok(p) => p,
             Err(_) => return alloc::vec::Vec::new(),
         };
-        
+
         let fd = unsafe {
             syscalls::syscall3(
                 syscalls::Sysno::Open,
@@ -115,7 +118,7 @@ impl FreeBSDUserland {
                 0,
             )
         };
-        
+
         let fd = match fd {
             Ok(fd) => fd,
             Err(_) => return alloc::vec::Vec::new(),
@@ -123,12 +126,12 @@ impl FreeBSDUserland {
 
         let mut buf = [0u8; 8192];
         let mut total_read = 0;
-        
+
         loop {
             if total_read >= buf.len() {
                 break;
             }
-            
+
             let remaining = buf.len() - total_read;
             let n = unsafe {
                 syscalls::syscall3(
@@ -138,7 +141,7 @@ impl FreeBSDUserland {
                     remaining,
                 )
             };
-            
+
             match n {
                 Ok(0) => break,
                 Ok(bytes_read) => {
@@ -150,19 +153,15 @@ impl FreeBSDUserland {
                 }
                 Err(_) => {
                     // Close the file descriptor before returning
-                    let _ = unsafe {
-                        syscalls::syscall1(syscalls::Sysno::Close, fd)
-                    };
+                    let _ = unsafe { syscalls::syscall1(syscalls::Sysno::Close, fd) };
                     return alloc::vec::Vec::new();
                 }
             }
         }
-        
+
         // Close the file descriptor
-        let _ = unsafe {
-            syscalls::syscall1(syscalls::Sysno::Close, fd)
-        };
-        
+        let _ = unsafe { syscalls::syscall1(syscalls::Sysno::Close, fd) };
+
         if total_read == 0 {
             return alloc::vec::Vec::new();
         }
@@ -173,18 +172,18 @@ impl FreeBSDUserland {
         };
 
         let mut reserved_pages = alloc::vec::Vec::new();
-        
+
         for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
             }
 
             let parts: alloc::vec::Vec<&str> = line.split_whitespace().collect();
-            
+
             if parts.len() < 2 {
                 continue;
             }
-            
+
             // Parse FreeBSD format: start_addr end_addr ...other_fields...
             let start_str = parts[0].strip_prefix("0x").unwrap_or(parts[0]);
             let end_str = parts[1].strip_prefix("0x").unwrap_or(parts[1]);
@@ -193,7 +192,7 @@ impl FreeBSDUserland {
                 Ok(addr) => addr,
                 Err(_) => continue,
             };
-            
+
             let end = match usize::from_str_radix(end_str, 16) {
                 Ok(addr) => addr,
                 Err(_) => continue,
@@ -203,17 +202,15 @@ impl FreeBSDUserland {
                 reserved_pages.push(start..end);
             }
         }
-        
+
         reserved_pages
     }
 
     fn set_init_tls(&self) {
         let mut tid: isize = 0;
         unsafe {
-            syscalls::syscall1(
-                syscalls::Sysno::ThrSelf,
-                &mut tid as *mut isize as usize
-            ).expect("thr_self failed");
+            syscalls::syscall1(syscalls::Sysno::ThrSelf, &mut tid as *mut isize as usize)
+                .expect("thr_self failed");
         }
 
         let task = alloc::boxed::Box::new(litebox_common_linux::Task {
@@ -240,17 +237,12 @@ impl litebox::platform::ExitProvider for FreeBSDUserland {
             reserved_pages: _,
         } = self;
 
-        // todo(chuqi): ignore tun device for now 
+        // todo(chuqi): ignore tun device for now
         // drop::<Option<std::os::fd::OwnedFd>>(tun_socket_fd.write().unwrap().take());
 
         // And then we actually exit
-        unsafe {
-            syscalls::syscall1(
-                syscalls::Sysno::Exit,
-                code as usize
-            )
-        }
-        .expect("Failed to exit group");
+        unsafe { syscalls::syscall1(syscalls::Sysno::Exit, code as usize) }
+            .expect("Failed to exit group");
 
         unreachable!("exit_group should not return");
     }
@@ -276,7 +268,10 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
     }
 
     fn terminate_thread(&self, code: Self::ExitCode) -> ! {
-        unimplemented!("terminate_thread is not implemented for FreeBSD yet. code: {}", code);
+        unimplemented!(
+            "terminate_thread is not implemented for FreeBSD yet. code: {}",
+            code
+        );
     }
 }
 
@@ -317,7 +312,11 @@ impl RawMutex {
         val: u32,
         timeout: Option<Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        unimplemented!("block_or_maybe_timeout is not implemented for FreeBSD yet. val: {}, timeout: {:?}", val, timeout);
+        unimplemented!(
+            "block_or_maybe_timeout is not implemented for FreeBSD yet. val: {}, timeout: {:?}",
+            val,
+            timeout
+        );
     }
 }
 
@@ -349,14 +348,20 @@ impl litebox::platform::RawMutex for RawMutex {
 
 impl litebox::platform::IPInterfaceProvider for FreeBSDUserland {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        unimplemented!("send_ip_packet is not implemented for FreeBSD yet. packet length: {}", packet.len());
+        unimplemented!(
+            "send_ip_packet is not implemented for FreeBSD yet. packet length: {}",
+            packet.len()
+        );
     }
 
     fn receive_ip_packet(
         &self,
         packet: &mut [u8],
     ) -> Result<usize, litebox::platform::ReceiveError> {
-        unimplemented!("receive_ip_packet is not implemented for FreeBSD yet. packet length: {}", packet.len());
+        unimplemented!(
+            "receive_ip_packet is not implemented for FreeBSD yet. packet length: {}",
+            packet.len()
+        );
     }
 }
 
@@ -411,7 +416,6 @@ impl litebox::platform::PunchthroughProvider for FreeBSDUserland {
 
 impl litebox::platform::DebugLogProvider for FreeBSDUserland {
     fn debug_log_print(&self, msg: &str) {
-
         println!("Do debuglog!!!: {}\n", msg);
 
         let _ = unsafe {
@@ -429,8 +433,6 @@ impl litebox::platform::RawPointerProvider for FreeBSDUserland {
     type RawConstPointer<T: Clone> = litebox::platform::trivial_providers::TransparentConstPtr<T>;
     type RawMutPointer<T: Clone> = litebox::platform::trivial_providers::TransparentMutPtr<T>;
 }
-
-
 
 fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
     let mut res = ProtFlags::PROT_NONE;
@@ -460,7 +462,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Fr
         can_grow_down: bool,
         populate_pages: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
-        
         // Use FreeBSD's mmap flags
         let map_flags = freebsd_types::MapFlags::MAP_PRIVATE
             | freebsd_types::MapFlags::MAP_ANONYMOUS
@@ -474,7 +475,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Fr
             } else {
                 freebsd_types::MapFlags::empty()
             });
-        
+
         let ptr = unsafe {
             syscalls::syscall6(
                 // todo(chuqi): add x86 support
@@ -484,8 +485,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Fr
                 prot_flags(initial_permissions)
                     .bits()
                     .reinterpret_as_unsigned() as usize,
-                map_flags.bits()
-                         .reinterpret_as_unsigned() as usize,
+                map_flags.bits().reinterpret_as_unsigned() as usize,
                 usize::MAX, // -1 for anonymous mapping
                 0,
             )
@@ -501,14 +501,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Fr
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
-        let _ = unsafe {
-            syscalls::syscall2(
-                syscalls::Sysno::Munmap,
-                range.start,
-                range.len(),
-            )
-        }
-        .expect("munmap failed");
+        let _ = unsafe { syscalls::syscall2(syscalls::Sysno::Munmap, range.start, range.len()) }
+            .expect("munmap failed");
         Ok(())
     }
 
@@ -517,8 +511,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Fr
         old_range: core::ops::Range<usize>,
         new_range: core::ops::Range<usize>,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
-        unimplemented!("remap_pages is not implemented for FreeBSDUserland. old_range: {:?}, new_range: {:?}", 
-                            old_range, new_range);
+        unimplemented!(
+            "remap_pages is not implemented for FreeBSDUserland. old_range: {:?}, new_range: {:?}",
+            old_range,
+            new_range
+        );
     }
 
     unsafe fn update_permissions(
@@ -531,7 +528,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Fr
                 syscalls::Sysno::Mprotect,
                 range.start,
                 range.len(),
-                prot_flags(new_permissions).bits().reinterpret_as_unsigned() as usize
+                prot_flags(new_permissions).bits().reinterpret_as_unsigned() as usize,
             )
         }
         .expect("mprotect failed");
@@ -569,7 +566,7 @@ impl litebox::platform::StdioProvider for FreeBSDUserland {
                 })
                 .unwrap(),
                 buf.as_ptr() as usize,
-                buf.len()
+                buf.len(),
             )
         } {
             Ok(n) => Ok(n),
@@ -739,10 +736,9 @@ impl litebox::platform::SystemInfoProvider for FreeBSDUserland {
 
 impl FreeBSDUserland {
     // todo(chuqi): support x86
-    fn get_thread_local_storage() -> *mut litebox_common_linux::ThreadLocalStorage<FreeBSDUserland> {
-        let tls = unsafe {
-            litebox_common_linux::rdgsbase()
-        };
+    fn get_thread_local_storage() -> *mut litebox_common_linux::ThreadLocalStorage<FreeBSDUserland>
+    {
+        let tls = unsafe { litebox_common_linux::rdgsbase() };
         if tls == 0 {
             return core::ptr::null_mut();
         }
@@ -836,7 +832,7 @@ mod tests {
     #[test]
     fn test_reserved_pages() {
         let platform = FreeBSDUserland::new(None);
-        
+
         platform.debug_log_print("msg from FreeBSDUserland test_reserved_pages\n");
 
         let reserved_pages: Vec<_> =

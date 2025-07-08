@@ -10,7 +10,6 @@ pub(crate) mod process;
 #[cfg(test)]
 pub(crate) mod tests;
 
-
 macro_rules! nontest_log_println {
     ($($tt:tt)*) => {{
         use core::fmt::Write;

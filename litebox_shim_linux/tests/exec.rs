@@ -158,11 +158,14 @@ fn test_syscall_rewriter_curdir() {
     // Use the already compiled executable from the tests folder (same dir as this file)
     let test_dir = this_source_dir();
     let path = test_dir.join("hello_exec_nolibc");
-    
+
     // print path
     println!("Using hello_exec_nolibc from: {}", path.display());
     // Verify the executable exists
-    assert!(path.exists(), "hello_exec_nolibc executable not found in tests directory");
+    assert!(
+        path.exists(),
+        "hello_exec_nolibc executable not found in tests directory"
+    );
 
     // rewrite the hello_exec_nolibc
     let hooked_path = test_dir.join("hello_exec_nolibc.hooked");
