@@ -15,6 +15,17 @@ use thiserror::Error;
 
 pub use page_mgmt::PageManagementProvider;
 
+#[macro_export]
+macro_rules! log_println {
+    ($platform:expr, $($tt:tt)*) => {{
+        use core::fmt::Write as _;
+        use $crate::platform::DebugLogProvider as _;
+        let mut t: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
+        writeln!(t, $($tt)*).unwrap();
+        $platform.debug_log_print(&t);
+    }};
+}
+
 /// A provider of a platform upon which LiteBox can execute.
 ///
 /// Ideally, a [`Provider`] is zero-sized, and only exists to provide access to functionality
