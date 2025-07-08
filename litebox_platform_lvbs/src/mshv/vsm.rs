@@ -17,15 +17,9 @@ use crate::{
         HV_X64_REGISTER_LSTAR, HV_X64_REGISTER_SFMASK, HV_X64_REGISTER_STAR,
         HV_X64_REGISTER_SYSENTER_CS, HV_X64_REGISTER_SYSENTER_EIP, HV_X64_REGISTER_SYSENTER_ESP,
         HvCrInterceptControlFlags, HvPageProtFlags, HvRegisterVsmPartitionConfig,
-        HvRegisterVsmVpSecureVtlConfig, VSM_VTL_CALL_FUNC_ID_BOOT_APS,
-        VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY, VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL,
-        VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT, VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE,
-        VSM_VTL_CALL_FUNC_ID_LOAD_KDATA, VSM_VTL_CALL_FUNC_ID_LOCK_REGS,
-        VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY, VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT,
-        VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE, VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, X86Cr0Flags,
-        X86Cr4Flags,
+        HvRegisterVsmVpSecureVtlConfig, VsmFunction, X86Cr0Flags, X86Cr4Flags,
         heki::{
-            HekiKdataType, HekiKexecType, HekiPage, HekiRange, MemAttr, ModMemType,
+            HekiKdataType, HekiKexecType, HekiPage, HekiPatch, HekiRange, MemAttr, ModMemType,
             mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr,
         },
         hvcall::HypervCallError,
@@ -46,7 +40,6 @@ use core::{
 };
 use hashbrown::HashMap;
 use litebox_common_linux::errno::Errno;
-use num_enum::TryFromPrimitive;
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{PageSize, PhysFrame, Size4KiB, frame::PhysFrameRange},
@@ -425,6 +418,8 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     let mut module_in_memory = ModuleMemory::new();
     // the kernel module's original ELF binary which is signed by the kernel build pipeline
     let mut module_as_elf = MemoryContainer::new();
+    // patch for the kernel module (placeholder for now)
+    let mut patch_for_module = MemoryContainer::new();
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         prepare_data_for_module_validation(
@@ -432,6 +427,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
             &mut module_memory_metadata,
             &mut module_in_memory,
             &mut module_as_elf,
+            &mut patch_for_module,
         )?;
     } else {
         return Err(Errno::EINVAL);
@@ -494,6 +490,7 @@ fn prepare_data_for_module_validation(
     module_memory_metadata: &mut ModuleMemoryMetadata,
     module_in_memory: &mut ModuleMemory,
     module_as_elf: &mut MemoryContainer,
+    patch_for_module: &mut MemoryContainer,
 ) -> Result<(), Errno> {
     for heki_page in heki_pages {
         for i in 0..usize::try_from(heki_page.nranges).unwrap_or(0) {
@@ -505,6 +502,11 @@ fn prepare_data_for_module_validation(
                 }
                 ModMemType::ElfBuffer => {
                     module_as_elf
+                        .write_bytes_from_heki_range(&heki_range)
+                        .map_err(|_| Errno::EINVAL)?;
+                }
+                ModMemType::Patch => {
+                    patch_for_module
                         .write_bytes_from_heki_range(&heki_range)
                         .map_err(|_| Errno::EINVAL)?;
                 }
@@ -758,10 +760,99 @@ fn prepare_data_for_kexec_validation(
                 HekiKexecType::KexecPages => {
                     kexec_memory_metadata.insert_heki_range(&heki_range);
                 }
-                _ => {
+                HekiKexecType::Unknown => {
                     serial_println!("VSM: Invalid kexec type");
                     return Err(Errno::EINVAL);
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// VSM function for patching kernel or module text. VTL0 kernel calls this function to patch certain kernel or module
+/// text region (which it does not have a permission to modify). It passes `HekiPatch` structure which can be stored
+/// within one or across two likely non-contiguous physical pages.
+pub fn mshv_vsm_patch_text(patch_pa_0: u64, patch_pa_1: u64) -> Result<i64, Errno> {
+    let heki_patch = copy_patch_data_from_vtl0(patch_pa_0, patch_pa_1)?;
+    debug_serial_println!("VSM: {:?}", heki_patch);
+    // TODO: validate the patch data before applying it
+    apply_vtl0_text_patch(heki_patch)?;
+    Ok(0)
+}
+
+/// This function copies patch data in `HekiPatch` structure from VTL0 to VTL1. This patch data can be
+/// stored within a physical page or across two likely non-contiguous physical pages.
+fn copy_patch_data_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPatch, Errno> {
+    let bytes_in_first_page = usize::try_from(
+        PhysAddr::new(patch_pa_0).align_up(Size4KiB::SIZE) - PhysAddr::new(patch_pa_0),
+    )
+    .unwrap();
+
+    if (patch_pa_0 != 0 && patch_pa_0 == patch_pa_1)
+        || (patch_pa_1 == 0 && bytes_in_first_page < core::mem::size_of::<HekiPatch>())
+        || (patch_pa_1 != 0 && bytes_in_first_page >= core::mem::size_of::<HekiPatch>())
+    {
+        return Err(Errno::EINVAL);
+    }
+
+    if patch_pa_1 == 0
+        || (PhysAddr::new(patch_pa_0).align_up(Size4KiB::SIZE)
+            == PhysAddr::new(patch_pa_1).align_down(Size4KiB::SIZE))
+    {
+        unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPatch>(PhysAddr::new(patch_pa_0)) }
+            .map(|boxed| *boxed)
+            .ok_or(Errno::EINVAL)
+    } else {
+        let mut patch_data_buf = [0u8; core::mem::size_of::<HekiPatch>()];
+        unsafe {
+            if !crate::platform_low().copy_slice_from_vtl0_phys(
+                PhysAddr::new(patch_pa_0),
+                patch_data_buf.get_mut(..bytes_in_first_page).unwrap(),
+            ) || !crate::platform_low().copy_slice_from_vtl0_phys(
+                PhysAddr::new(patch_pa_1),
+                patch_data_buf.get_mut(bytes_in_first_page..).unwrap(),
+            ) {
+                return Err(Errno::EINVAL);
+            }
+        }
+        HekiPatch::from_bytes(&patch_data_buf).ok_or(Errno::EINVAL)
+    }
+}
+
+/// This function apply the given `HekiPatch` patch data to VTL0 text.
+/// It assumes the caller has confirmed the validity of `HekiPatch` by invoking the `is_valid()` member function.
+fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), Errno> {
+    let patch_target_page_offset = usize::try_from(
+        PhysAddr::new(heki_patch.pa[0])
+            - PhysAddr::new(heki_patch.pa[0]).align_down(Size4KiB::SIZE),
+    )
+    .unwrap();
+    let bytes_in_first_page = PAGE_SIZE - patch_target_page_offset;
+
+    if heki_patch.pa[1] == 0
+        || (PhysAddr::new(heki_patch.pa[0]).align_up(Size4KiB::SIZE)
+            == PhysAddr::new(heki_patch.pa[1]).align_down(Size4KiB::SIZE))
+    {
+        if !unsafe {
+            crate::platform_low().copy_slice_to_vtl0_phys(
+                PhysAddr::new(heki_patch.pa[0]),
+                &heki_patch.code[..usize::from(heki_patch.size)],
+            )
+        } {
+            return Err(Errno::EINVAL);
+        }
+    } else {
+        let (patch_first, patch_second) = heki_patch.code.split_at(bytes_in_first_page);
+
+        unsafe {
+            if !crate::platform_low().copy_slice_to_vtl0_phys(
+                PhysAddr::new(heki_patch.pa[0] + u64::try_from(patch_target_page_offset).unwrap()),
+                patch_first,
+            ) || !crate::platform_low()
+                .copy_slice_to_vtl0_phys(PhysAddr::new(heki_patch.pa[1]), patch_second)
+            {
+                return Err(Errno::EINVAL);
             }
         }
     }
@@ -775,25 +866,26 @@ pub fn vsm_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
         return Errno::EINVAL.as_neg().into();
     }
 
-    let result = match VSMFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
-        .unwrap_or(VSMFunction::Unknown)
+    let result = match VsmFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
+        .unwrap_or(VsmFunction::Unknown)
     {
-        VSMFunction::EnableAPsVtl => mshv_vsm_enable_aps(params[1]),
-        VSMFunction::BootAPs => mshv_vsm_boot_aps(params[1], params[2]),
-        VSMFunction::LockRegs => mshv_vsm_lock_regs(),
-        VSMFunction::SignalEndOfBoot => Ok(mshv_vsm_end_of_boot()),
-        VSMFunction::ProtectMemory => mshv_vsm_protect_memory(params[1], params[2]),
-        VSMFunction::LoadKData => mshv_vsm_load_kdata(params[1], params[2]),
-        VSMFunction::ValidateModule => {
+        VsmFunction::EnableAPsVtl => mshv_vsm_enable_aps(params[1]),
+        VsmFunction::BootAPs => mshv_vsm_boot_aps(params[1], params[2]),
+        VsmFunction::LockRegs => mshv_vsm_lock_regs(),
+        VsmFunction::SignalEndOfBoot => Ok(mshv_vsm_end_of_boot()),
+        VsmFunction::ProtectMemory => mshv_vsm_protect_memory(params[1], params[2]),
+        VsmFunction::LoadKData => mshv_vsm_load_kdata(params[1], params[2]),
+        VsmFunction::ValidateModule => {
             mshv_vsm_validate_guest_module(params[1], params[2], params[3])
         }
         #[allow(clippy::cast_possible_wrap)]
-        VSMFunction::FreeModuleInit => mshv_vsm_free_guest_module_init(params[1] as i64),
+        VsmFunction::FreeModuleInit => mshv_vsm_free_guest_module_init(params[1] as i64),
         #[allow(clippy::cast_possible_wrap)]
-        VSMFunction::UnloadModule => mshv_vsm_unload_guest_module(params[1] as i64),
-        VSMFunction::CopySecondaryKey => mshv_vsm_copy_secondary_key(params[1], params[2]),
-        VSMFunction::KexecValidate => mshv_vsm_kexec_validate(params[1], params[2], params[3]),
-        VSMFunction::Unknown => {
+        VsmFunction::UnloadModule => mshv_vsm_unload_guest_module(params[1] as i64),
+        VsmFunction::CopySecondaryKey => mshv_vsm_copy_secondary_key(params[1], params[2]),
+        VsmFunction::KexecValidate => mshv_vsm_kexec_validate(params[1], params[2], params[3]),
+        VsmFunction::PatchText => mshv_vsm_patch_text(params[1], params[2]),
+        VsmFunction::Unknown => {
             serial_println!("VSM: Unknown function ID {:#x}", params[0]);
             Err(Errno::EINVAL)
         }
@@ -802,24 +894,6 @@ pub fn vsm_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
         Ok(value) => value,
         Err(errno) => errno.as_neg().into(),
     }
-}
-
-/// VSM Functions
-#[derive(Debug, PartialEq, TryFromPrimitive)]
-#[repr(u32)]
-pub enum VSMFunction {
-    EnableAPsVtl = VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL,
-    BootAPs = VSM_VTL_CALL_FUNC_ID_BOOT_APS,
-    LockRegs = VSM_VTL_CALL_FUNC_ID_LOCK_REGS,
-    SignalEndOfBoot = VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT,
-    ProtectMemory = VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY,
-    LoadKData = VSM_VTL_CALL_FUNC_ID_LOAD_KDATA,
-    ValidateModule = VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE,
-    FreeModuleInit = VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT,
-    UnloadModule = VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE,
-    CopySecondaryKey = VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY,
-    KexecValidate = VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE,
-    Unknown = 0xffff_ffff,
 }
 
 pub const NUM_CONTROL_REGS: usize = 11;
@@ -1188,6 +1262,7 @@ impl ModuleMemory {
                 .init_rodata
                 .write_vtl0_phys_bytes(addr, phys_start, phys_end),
             ModMemType::ElfBuffer
+            | ModMemType::Patch
             | ModMemType::Data
             | ModMemType::RoData
             | ModMemType::RoAfterInit

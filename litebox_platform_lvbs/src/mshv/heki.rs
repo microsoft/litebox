@@ -1,6 +1,12 @@
-use crate::mshv::{HvPageProtFlags, vtl1_mem_layout::PAGE_SIZE};
+use crate::{
+    host::linux::ListHead,
+    mshv::{HvPageProtFlags, vtl1_mem_layout::PAGE_SIZE},
+};
 use num_enum::TryFromPrimitive;
-use x86_64::{PhysAddr, VirtAddr};
+use x86_64::{
+    PhysAddr, VirtAddr,
+    structures::paging::{PageSize, Size4KiB},
+};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -41,7 +47,6 @@ pub enum HekiKdataType {
     KernelData = 4,
     PatchInfo = 5,
     KexecTrampoline = 6,
-    KdataMax = 7,
     #[default]
     Unknown = 0xffff_ffff_ffff_ffff,
 }
@@ -52,7 +57,6 @@ pub enum HekiKexecType {
     KexecImage = 0,
     KexecKernelBlob = 1,
     KexecPages = 2,
-    KexecMax = 3,
     #[default]
     Unknown = 0xffff_ffff_ffff_ffff,
 }
@@ -68,6 +72,7 @@ pub enum ModMemType {
     InitData = 5,
     InitRoData = 6,
     ElfBuffer = 7,
+    Patch = 8,
     #[default]
     Unknown = 0xffff_ffff_ffff_ffff,
 }
@@ -172,4 +177,69 @@ impl Default for HekiPage {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+#[repr(C)]
+pub struct HekiPatch {
+    pub pa: [u64; 2],
+    pub size: u8,
+    pub code: [u8; POKE_MAX_OPCODE_SIZE],
+}
+pub const POKE_MAX_OPCODE_SIZE: usize = 5;
+
+impl HekiPatch {
+    /// Creates a new `HekiPatch` with the given buffer. Returns `None` if any field is invalid.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != core::mem::size_of::<HekiPatch>() {
+            return None;
+        }
+        let mut heki_patch = core::mem::MaybeUninit::<HekiPatch>::uninit();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr().cast::<u8>(),
+                heki_patch.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of::<HekiPatch>(),
+            );
+        }
+        let heki_patch = unsafe { heki_patch.assume_init() };
+        if heki_patch.is_valid() {
+            Some(heki_patch)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        let bytes_in_first_page = usize::try_from(
+            PhysAddr::new(self.pa[0]).align_up(Size4KiB::SIZE) - PhysAddr::new(self.pa[0]),
+        )
+        .unwrap();
+
+        !(usize::from(self.size) > POKE_MAX_OPCODE_SIZE
+            || (self.pa[0] != 0 && self.pa[0] == self.pa[1])
+            || (self.pa[1] == 0 && bytes_in_first_page < usize::from(self.size))
+            || (self.pa[1] != 0 && bytes_in_first_page > usize::from(self.size)))
+    }
+}
+
+#[expect(dead_code)]
+#[derive(Default, Clone, Copy, Debug)]
+#[repr(u32)]
+pub enum HekiPatchType {
+    JumpLabel = 0,
+    #[default]
+    Unknown = 0xffff_ffff,
+}
+
+#[expect(dead_code)]
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct HekiPatchInfo {
+    pub typ_: HekiPatchType,
+    list: ListHead,
+    mod_: *const core::ffi::c_void, // *const `struct module`
+    pub patch_index: u64,
+    pub max_patch_count: u64,
+    // pub patch: [HekiPatch; *]
 }

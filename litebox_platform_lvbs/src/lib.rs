@@ -21,7 +21,8 @@ use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::errno::Errno;
 use ptr::{UserConstPtr, UserMutPtr};
 use x86_64::structures::paging::{
-    PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange, mapper::MapToError,
+    PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
+    mapper::MapToError,
 };
 
 extern crate alloc;
@@ -78,7 +79,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ) -> &'static Self {
         let pt = unsafe { mm::PageTable::new(init_page_table_addr) };
         let physframe_start = PhysFrame::containing_address(phys_start);
-        let physframe_end = PhysFrame::containing_address(phys_end);
+        let physframe_end = PhysFrame::containing_address(phys_end.align_up(Size4KiB::SIZE));
         if pt
             .map_phys_frame_range(
                 PhysFrame::range(physframe_start, physframe_end),
@@ -103,42 +104,65 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         CPU_MHZ.store(cpu_mhz, core::sync::atomic::Ordering::Relaxed);
     }
 
-    /// This maps VTL0 physical memory to the page table
-    /// # Panics
-    ///
-    /// Panics if `phys_start` or `phys_end` is not aligned to the page size
-    pub fn map_vtl0_phys_range(
+    /// This function maps VTL0 physical page frames containing the physical addresses
+    /// from `phys_start` to `phys_end` to the VTL1 kernel page table. It internally page aligns
+    /// the input addresses to ensure the mapped memory area covers the entire input addresses
+    /// at the page level. It returns a page-aligned address (as `mmap` does) and the length of the mapped memory.
+    fn map_vtl0_phys_range(
         &self,
         phys_start: x86_64::PhysAddr,
         phys_end: x86_64::PhysAddr,
         flags: PageTableFlags,
-    ) -> Result<*mut u8, MapToError<Size4KiB>> {
+    ) -> Result<(*mut u8, usize), MapToError<Size4KiB>> {
         let frame_range = PhysFrame::range(
             PhysFrame::containing_address(phys_start),
-            PhysFrame::containing_address(phys_end),
+            PhysFrame::containing_address(phys_end.align_up(Size4KiB::SIZE)),
         );
 
-        // this function should not be used to map VTL1 memory
+        // ensure the input address range does not overlap with VTL1 memory
         if frame_range.start < self.vtl1_phys_frame_range.end
             && self.vtl1_phys_frame_range.start < frame_range.end
         {
             return Err(MapToError::FrameAllocationFailed);
         }
 
-        self.page_table.map_phys_frame_range(frame_range, flags)
+        Ok((
+            self.page_table.map_phys_frame_range(frame_range, flags)?,
+            usize::try_from(frame_range.len()).unwrap() * PAGE_SIZE,
+        ))
     }
 
     /// This unmaps VTL0 pages from the page table. Allocator does not allocate frames
     /// for VTL0 pages (i.e., it is always shared mapping), so it must not attempt to deallocate them.
-    pub fn unmap_vtl0_pages(
+    fn unmap_vtl0_pages(
         &self,
-        page_range: PageRange<PAGE_SIZE>,
+        page_addr: *const u8,
+        length: usize,
     ) -> Result<(), DeallocationError> {
-        unsafe { self.page_table.unmap_pages(page_range, false) }
+        let page_addr = x86_64::VirtAddr::new(page_addr as u64);
+        if page_addr.page_offset() != PageOffset::new(0) {
+            return Err(DeallocationError::Unaligned);
+        }
+        unsafe {
+            self.page_table.unmap_pages(
+                PageRange::<PAGE_SIZE>::new(
+                    usize::try_from(page_addr.as_u64()).unwrap(),
+                    usize::try_from(
+                        (page_addr + u64::try_from(length).unwrap())
+                            .align_up(Size4KiB::SIZE)
+                            .as_u64(),
+                    )
+                    .unwrap(),
+                )
+                .ok_or(DeallocationError::Unaligned)?,
+                false,
+            )
+        }
     }
 
-    /// This function copies data from VTL0 physical memory to the VTL1 kernel.
+    /// This function copies data from VTL0 physical memory to the VTL1 kernel through `Box`.
     /// Use this function instead of map/unmap functions to avoid potential TOCTTOU.
+    /// Better to replace this function with `<data type>::from_bytes()` or similar
     /// # Safety
     ///
     /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address
@@ -151,31 +175,27 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ) -> Option<alloc::boxed::Box<T>> {
         use alloc::boxed::Box;
 
-        if let Ok(addr) = self.map_vtl0_phys_range(
+        if let Ok((page_addr, length)) = self.map_vtl0_phys_range(
             phys_addr,
-            phys_addr + u64::try_from(core::mem::size_of::<T>() + PAGE_SIZE).unwrap(),
+            phys_addr + u64::try_from(core::mem::size_of::<T>()).unwrap(),
             PageTableFlags::PRESENT,
         ) {
-            let offset = usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
+            let page_offset =
+                usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
             let raw = Box::into_raw(Box::new(core::mem::MaybeUninit::<T>::uninit()));
 
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    addr.wrapping_add(offset) as *const T,
+                    page_addr.wrapping_add(page_offset) as *const T,
                     (*raw).as_mut_ptr(),
                     1,
                 );
             }
 
-            self.unmap_vtl0_pages(
-                PageRange::<PAGE_SIZE>::new(
-                    addr as usize,
-                    (addr as usize + core::mem::size_of::<T>()).next_multiple_of(PAGE_SIZE)
-                        + PAGE_SIZE,
-                )
-                .unwrap(),
-            )
-            .unwrap();
+            assert!(
+                self.unmap_vtl0_pages(page_addr, length).is_ok(),
+                "Failed to unmap VTL0 pages"
+            );
 
             return Some(unsafe { Box::from_raw((*raw).as_mut_ptr()) });
         }
@@ -196,29 +216,105 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         phys_addr: x86_64::PhysAddr,
         value: &T,
     ) -> bool {
-        if let Ok(addr) = self.map_vtl0_phys_range(
+        if let Ok((page_addr, length)) = self.map_vtl0_phys_range(
             phys_addr,
-            phys_addr + u64::try_from(core::mem::size_of::<T>() + PAGE_SIZE).unwrap(),
+            phys_addr + u64::try_from(core::mem::size_of::<T>()).unwrap(),
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
         ) {
-            let offset = usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
+            let page_offset =
+                usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     core::ptr::from_ref::<T>(value),
-                    addr.wrapping_add(offset).cast::<T>(),
+                    page_addr.wrapping_add(page_offset).cast::<T>(),
                     1,
                 );
             }
+            assert!(
+                self.unmap_vtl0_pages(page_addr, length).is_ok(),
+                "Failed to unmap VTL0 pages"
+            );
+            true
+        } else {
+            false
+        }
+    }
 
-            self.unmap_vtl0_pages(
-                PageRange::<PAGE_SIZE>::new(
-                    addr as usize,
-                    (addr as usize + core::mem::size_of::<T>()).next_multiple_of(PAGE_SIZE)
-                        + PAGE_SIZE,
-                )
-                .unwrap(),
-            )
-            .unwrap();
+    /// This function copies a slice from the VTL1 kernel to VTL0 physical memory.
+    /// Use this function instead of map/unmap functions to avoid potential TOCTTOU.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address.
+    ///
+    /// # Panics
+    ///
+    /// Panics if phys_addr is invalid
+    pub unsafe fn copy_slice_to_vtl0_phys<T: Copy>(
+        &self,
+        phys_addr: x86_64::PhysAddr,
+        value: &[T],
+    ) -> bool {
+        if let Ok((page_addr, length)) = self.map_vtl0_phys_range(
+            phys_addr,
+            phys_addr + u64::try_from(core::mem::size_of_val(value)).unwrap(),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        ) {
+            let page_offset =
+                usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    value.as_ptr(),
+                    page_addr.wrapping_add(page_offset).cast::<T>(),
+                    value.len(),
+                );
+            }
+
+            assert!(
+                self.unmap_vtl0_pages(page_addr, length).is_ok(),
+                "Failed to unmap VTL0 pages"
+            );
+
+            return true;
+        }
+
+        false
+    }
+
+    /// This function copies a slice from VTL0 physical memory to the VTL1 kernel.
+    /// Use this function instead of map/unmap functions to avoid potential TOCTTOU.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address.
+    ///
+    /// # Panics
+    ///
+    /// Panics if phys_addr is invalid
+    pub unsafe fn copy_slice_from_vtl0_phys<T: Copy>(
+        &self,
+        phys_addr: x86_64::PhysAddr,
+        buf: &mut [T],
+    ) -> bool {
+        if let Ok((page_addr, length)) = self.map_vtl0_phys_range(
+            phys_addr,
+            phys_addr + u64::try_from(core::mem::size_of_val(buf)).unwrap(),
+            PageTableFlags::PRESENT,
+        ) {
+            let page_offset =
+                usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    page_addr.wrapping_add(page_offset).cast::<T>(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                );
+            }
+
+            assert!(
+                self.unmap_vtl0_pages(page_addr, length).is_ok(),
+                "Failed to unmap VTL0 pages"
+            );
 
             return true;
         }
