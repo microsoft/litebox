@@ -3,13 +3,12 @@
 // Restrict this crate to only work on FreeBSD. For now, we are restricting this to only x86/x86-64
 // FreeBSD, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "freebsd", any(target_arch = "x86_64", target_arch = "x86")))]
-
 // use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::sync::atomic::AtomicU32;
 // use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
-use litebox::platform::UnblockedOrTimedOut;
+use litebox::platform::{ThreadLocalStorageProvider, UnblockedOrTimedOut};
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox::platform::{ImmediatelyWokenUp};
@@ -66,8 +65,8 @@ impl FreeBSDUserland {
             // seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages: Self::read_proc_self_maps(),
         };
-        // todo(chuqi): ignore threads/tls for now
-        // platform.set_init_tls();
+        
+        platform.set_init_tls();
         Box::leak(Box::new(platform))
     }
 
@@ -208,9 +207,24 @@ impl FreeBSDUserland {
         reserved_pages
     }
 
-    // fn set_init_tls(&self) {
-    //     // todo(chuqi): ignore threads/tls for now
-    // }
+    fn set_init_tls(&self) {
+        let mut tid: isize = 0;
+        unsafe {
+            syscalls::syscall1(
+                syscalls::Sysno::ThrSelf,
+                &mut tid as *mut isize as usize
+            ).expect("thr_self failed");
+        }
+
+        let task = alloc::boxed::Box::new(litebox_common_linux::Task {
+            tid: i32::try_from(tid).expect("tid should fit in i32"),
+            clear_child_tid: None,
+            robust_list: None,
+        });
+
+        let tls = litebox_common_linux::ThreadLocalStorage::new(task);
+        self.set_thread_local_storage(tls);
+    }
 }
 
 impl litebox::platform::Provider for FreeBSDUserland {}
@@ -478,12 +492,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Fr
         }
         .expect("mmap failed");
 
-        // debug print all
-        println!(
-            "Allocated pages: start: {:#x}, len: {}, ptr: {:#x}, permissions: {:?}, can_grow_down: {}, populate_pages: {}. returned pointer: {:#x}",
-            range.start, range.len(), ptr, initial_permissions, can_grow_down, populate_pages, ptr
-        );
-
         Ok(litebox::platform::trivial_providers::TransparentMutPtr {
             inner: ptr as *mut u8,
         })
@@ -729,33 +737,71 @@ impl litebox::platform::SystemInfoProvider for FreeBSDUserland {
     }
 }
 
-#[allow(unused)]
 impl FreeBSDUserland {
+    // todo(chuqi): support x86
     fn get_thread_local_storage() -> *mut litebox_common_linux::ThreadLocalStorage<FreeBSDUserland> {
-        unimplemented!("get_thread_local_storage is not implemented for FreeBSDUserland yet");
+        let tls = unsafe {
+            litebox_common_linux::rdgsbase()
+        };
+        if tls == 0 {
+            return core::ptr::null_mut();
+        }
+        tls as *mut litebox_common_linux::ThreadLocalStorage<FreeBSDUserland>
     }
+
+    // // todo(chuqi): support x86
+    // fn set_fs_selector(fss: u16) {
+    //     unsafe {
+    //         // Set the fs selector to the given value
+    //         core::arch::asm!(
+    //             "mov fs, {0:x}",
+    //             in(reg) fss,
+    //             options(nostack, preserves_flags)
+    //         );
+    //     }
+    // }
 }
 
 /// Similar to libc, we use fs/gs registers to store thread-local storage (TLS).
 /// To avoid conflicts with libc's TLS, we choose to use gs on x86_64 and fs on x86
 /// as libc uses fs on x86_64 and gs on x86.
-#[allow(unused_variables)]
 impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
+    // todo(chuqi): we may change the TLS type later on to adapt FreeBSD's robust_list
+    // tbd anyways
     type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<FreeBSDUserland>;
 
+    // todo(chuqi): support x86
     fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
-        unimplemented!("set_thread_local_storage is not implemented for FreeBSDUserland yet");
+        let old_gs_base = unsafe { litebox_common_linux::rdgsbase() };
+        assert!(old_gs_base == 0, "TLS already set for this thread");
+        let tls = Box::new(tls);
+        unsafe { litebox_common_linux::wrgsbase(Box::into_raw(tls) as usize) };
     }
 
+    // todo(chuqi): support x86
     fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
-        unimplemented!("release_thread_local_storage is not implemented for FreeBSDUserland yet");
+        let tls = Self::get_thread_local_storage();
+        assert!(!tls.is_null(), "TLS must be set before releasing it");
+        unsafe {
+            litebox_common_linux::wrgsbase(0);
+        }
+        let tls = unsafe { Box::from_raw(tls) };
+        assert!(!tls.borrowed, "TLS must not be borrowed when releasing it");
+        *tls
     }
 
     fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
     {
-        unimplemented!("with_thread_local_storage_mut is not implemented for FreeBSDUserland yet");
+        let tls = Self::get_thread_local_storage();
+        assert!(!tls.is_null(), "TLS must be set before accessing it");
+        let tls = unsafe { &mut *tls };
+        assert!(!tls.borrowed, "TLS is already borrowed");
+        tls.borrowed = true; // Mark as borrowed
+        let res = f(tls);
+        tls.borrowed = false; // Mark as not borrowed anymore
+        res
     }
 }
 
