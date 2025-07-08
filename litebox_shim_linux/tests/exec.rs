@@ -1,12 +1,5 @@
 mod common;
 
-fn this_source_dir() -> std::path::PathBuf {
-    // Get the crate root directory and join with "tests" since we know this file is in tests/
-    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("tests");
-    path
-}
-
 #[test]
 fn test_load_exec_static() {
     let dir_path = std::env::var("OUT_DIR").unwrap();
@@ -157,7 +150,8 @@ fn test_syscall_rewriter() {
 #[cfg(all(target_arch = "x86_64", target_os = "freebsd"))]
 fn test_syscall_rewriter_curdir() {
     // Use the already compiled executable from the tests folder (same dir as this file)
-    let test_dir = this_source_dir();
+    let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    test_dir.push("tests");
     let path = test_dir.join("hello_exec_nolibc");
 
     // print path
