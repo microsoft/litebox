@@ -3,9 +3,11 @@ resolver = "2"
 members = [
     "litebox", 
     "litebox_common_linux",
+    "litebox_platform_linux_kernel",
     "litebox_platform_linux_userland",
     "litebox_platform_freebsd_userland",
     "litebox_platform_multiplex",
+    "litebox_runner_linux_userland",
     "litebox_shim_linux",
     "litebox_syscall_rewriter",
 ]
@@ -14,8 +16,6 @@ members = [
 exclude = [
     "litebox_platform_lvbs",
     "litebox_runner_lvbs",
-    "litebox_platform_linux_kernel", # just temporarily from from the workspace to test freebsd
-    "litebox_runner_linux_userland", # just temporarily from from the workspace to test freebsd
 ]
 
 # Introduce all the pedantic clippy lints and remove ones I (jayb) think are

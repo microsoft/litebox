@@ -5,16 +5,12 @@ edition = "2024"
 
 [dependencies]
 litebox = { path = "../litebox/", version = "0.1.0" }
+litebox_platform_linux_userland = { path = "../litebox_platform_linux_userland/", version = "0.1.0", optional = true }
+litebox_platform_freebsd_userland = { path = "../litebox_platform_freebsd_userland/", version = "0.1.0", optional = true }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-litebox_platform_linux_userland = { path = "../litebox_platform_linux_userland/", version = "0.1.0", optional = true }
-
-[target.'cfg(target_os = "freebsd")'.dependencies]
-litebox_platform_freebsd_userland = { path = "../litebox_platform_freebsd_userland/", version = "0.1.0", optional = true }
-
 [features]
-default = ["platform_freebsd_userland"]
+default = ["platform_linux_userland"]
 platform_linux_userland = ["dep:litebox_platform_linux_userland"]
 platform_freebsd_userland = ["dep:litebox_platform_freebsd_userland"]
 
