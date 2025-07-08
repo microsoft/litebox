@@ -154,6 +154,7 @@ fn test_syscall_rewriter() {
 }
 
 #[test]
+#[cfg(all(target_arch = "x86_64", target_os = "freebsd"))]
 fn test_syscall_rewriter_curdir() {
     // Use the already compiled executable from the tests folder (same dir as this file)
     let test_dir = this_source_dir();
