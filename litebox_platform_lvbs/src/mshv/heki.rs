@@ -234,6 +234,23 @@ pub struct HekiPatch {
 pub const POKE_MAX_OPCODE_SIZE: usize = 5;
 
 impl HekiPatch {
+    /// Creates a new `HekiPatch` with the given buffer. Returns `None` if any field is invalid.
+    pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != core::mem::size_of::<HekiPatch>() {
+            return None;
+        }
+        let mut patch = core::mem::MaybeUninit::<HekiPatch>::uninit();
+        let patch = unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr().cast::<u8>(),
+                patch.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of::<HekiPatch>(),
+            );
+            patch.assume_init()
+        };
+        if patch.is_valid() { Some(patch) } else { None }
+    }
+
     pub fn is_valid(&self) -> bool {
         let Some(pa_0) = PhysAddr::try_new(self.pa[0])
             .ok()
@@ -257,7 +274,6 @@ impl HekiPatch {
     }
 }
 
-#[expect(dead_code)]
 #[derive(Default, Clone, Copy, Debug, PartialEq)]
 #[repr(u32)]
 pub enum HekiPatchType {
@@ -266,7 +282,6 @@ pub enum HekiPatchType {
     Unknown = 0xffff_ffff,
 }
 
-#[expect(dead_code)]
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct HekiPatchInfo {
@@ -276,4 +291,29 @@ pub struct HekiPatchInfo {
     pub patch_index: u64,
     pub max_patch_count: u64,
     // pub patch: [HekiPatch; *]
+}
+
+impl HekiPatchInfo {
+    /// Creates a new `HekiPatchInfo` with the given buffer. Returns `None` if any field is invalid.
+    pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != core::mem::size_of::<HekiPatchInfo>() {
+            return None;
+        }
+        let mut info = core::mem::MaybeUninit::<HekiPatchInfo>::uninit();
+        let info = unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr().cast::<u8>(),
+                info.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of::<HekiPatchInfo>(),
+            );
+            info.assume_init()
+        };
+        if info.is_valid() { Some(info) } else { None }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !(self.typ_ != HekiPatchType::JumpLabel
+            || self.patch_index == 0
+            || self.patch_index > self.max_patch_count)
+    }
 }

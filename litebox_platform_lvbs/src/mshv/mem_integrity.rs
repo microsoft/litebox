@@ -1,7 +1,13 @@
 //! Functions for checking the memory integrity of VTL0 kernel image and modules
 
 use crate::{
-    debug_serial_println, host::linux::ModuleSignature, mshv::vsm::ModuleMemory, serial_println,
+    debug_serial_println,
+    host::linux::ModuleSignature,
+    mshv::{
+        heki::{HekiPatch, POKE_MAX_OPCODE_SIZE},
+        vsm::ModuleMemory,
+    },
+    serial_println,
 };
 use alloc::{vec, vec::Vec};
 use authenticode::{AttributeCertificateIterator, AuthenticodeSignature, authenticode_digest};
@@ -23,6 +29,7 @@ use object::read::pe::PeFile64;
 use rangemap::set::RangeSet;
 use rsa::{RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs1v15::Signature, signature::Verifier};
 use sha2::{Digest, Sha256, Sha512};
+use x86_64::structures::paging::{PageSize, Size4KiB};
 use x509_cert::{
     Certificate,
     der::{Decode, Encode, oid::ObjectIdentifier},
@@ -596,6 +603,69 @@ impl<T: digest::Update> digest::Update for AuthenticodeHasher<T> {
     fn update(&mut self, data: &[u8]) {
         digest::Update::update(&mut self.hasher, data);
     }
+}
+
+// Linux kernel uses the below 1-5 bytes x86 NOPs
+const X86_NOPS: [[u8; POKE_MAX_OPCODE_SIZE]; POKE_MAX_OPCODE_SIZE] = [
+    [0x90, 0x00, 0x00, 0x00, 0x00],
+    [0x66, 0x90, 0x00, 0x00, 0x00],
+    [0x0f, 0x1f, 0x00, 0x00, 0x00],
+    [0x0f, 0x1f, 0x40, 0x00, 0x00],
+    [0x0f, 0x1f, 0x44, 0x00, 0x00],
+];
+
+const INT3_INSN_OPCODE: u8 = 0xcc;
+const JMP8_INSN_SIZE: u8 = 2;
+const JMP32_INSN_SIZE: u8 = 5;
+
+/// This function validates an invocation of `text_poke_bp_batch` for patching jump labels.
+/// `text_poke_bp_batch` patches target opcode (1-5 bytes) with the following steps:
+/// - patch the first byte of a target with breakpoint (INT3) to stall others which attempt to execute it
+/// - patch all but the first byte with pre-computed opcode or right-sized NOP
+/// - patch the first byte with the actual one (and resume the stalled execution)
+///
+/// Each invocation does one of the above steps, so there are up to three invocations for each target opcode.
+/// Refer [Linux](https://elixir.bootlin.com/linux/v6.6.85/source/arch/x86/kernel/alternative.c#L2164)
+pub fn validate_text_poke_bp_batch(patch_data: &HekiPatch, precomputed_patch: &HekiPatch) -> bool {
+    // step 1
+    if patch_data.size == 1 && patch_data.code[0] == INT3_INSN_OPCODE {
+        return true;
+    }
+
+    let offset: usize = if patch_data.size == 1 && patch_data.pa[0] == precomputed_patch.pa[0] {
+        0 // step 3
+    } else if patch_data.size == precomputed_patch.size - 1
+        && (patch_data.pa[0] == precomputed_patch.pa[0] + 1
+            || (patch_data.pa[0] == precomputed_patch.pa[1]
+                && (precomputed_patch.pa[0] + 1).is_multiple_of(Size4KiB::SIZE)))
+    {
+        1 // step 2
+    } else {
+        return false;
+    };
+
+    // step 2 or 3 (with precomputed patch)
+    if patch_data.code[..usize::from(patch_data.size)]
+        == precomputed_patch.code[offset..offset + usize::from(patch_data.size)]
+    {
+        return true;
+    }
+    // step 2 or 3 (with right-sized NOP)
+    if (precomputed_patch.size == JMP8_INSN_SIZE || precomputed_patch.size == JMP32_INSN_SIZE)
+        && patch_data.code[..usize::from(patch_data.size)]
+            == X86_NOPS[usize::from(precomputed_patch.size) - 1]
+                [offset..offset + usize::from(patch_data.size)]
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Thus function validates whether the patch data is valid for the given target
+pub fn validate_text_patch(patch_data: &HekiPatch, precomputed_patch: &HekiPatch) -> bool {
+    validate_text_poke_bp_batch(patch_data, precomputed_patch)
+    // TODO: support other patching methods
 }
 
 /// Error for Kernel ELF validation and relocation failures.

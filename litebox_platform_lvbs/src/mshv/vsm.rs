@@ -19,15 +19,15 @@ use crate::{
         HvCrInterceptControlFlags, HvPageProtFlags, HvRegisterVsmPartitionConfig,
         HvRegisterVsmVpSecureVtlConfig, VsmFunction, X86Cr0Flags, X86Cr4Flags,
         heki::{
-            HekiKdataType, HekiKexecType, HekiPage, HekiPatch, HekiRange, MemAttr, ModMemType,
-            mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr,
+            HekiKdataType, HekiKexecType, HekiPage, HekiPatch, HekiPatchInfo, HekiRange, MemAttr,
+            ModMemType, mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr,
         },
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
         mem_integrity::{
-            validate_kernel_module_against_elf, verify_kernel_module_signature,
-            verify_kernel_pe_signature,
+            validate_kernel_module_against_elf, validate_text_patch,
+            verify_kernel_module_signature, verify_kernel_pe_signature,
         },
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
@@ -334,7 +334,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
 
     let mut system_certs_mem = MemoryContainer::new();
     let mut kexec_trampoline_metadata = KexecMemoryMetadata::new();
-    let mut patch_info_mem = MemoryContainer::new(); // placeholder for now
+    let mut patch_info_mem = MemoryContainer::new();
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         for heki_page in heki_pages {
@@ -408,6 +408,19 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
         )?;
     }
 
+    // pre-computed patch data for the kernel text
+    if !patch_info_mem.is_empty() {
+        let mut patch_info_buf = vec![0u8; patch_info_mem.len()];
+        patch_info_mem
+            .read_bytes(patch_info_mem.start().unwrap(), &mut patch_info_buf)
+            .map_err(|_| Errno::EINVAL)?;
+        crate::platform_low()
+            .vtl0_kernel_info
+            .precomputed_patches
+            .insert_patch_data_from_bytes(&patch_info_buf, None)
+            .map_err(|_| Errno::EINVAL)?;
+    }
+
     Ok(0)
     // TODO: create blocklist keys
     // TODO: save blocklist hashes
@@ -442,8 +455,8 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     let mut module_in_memory = ModuleMemory::new();
     // the kernel module's original ELF binary which is signed by the kernel build pipeline
     let mut module_as_elf = MemoryContainer::new();
-    // patch for the kernel module (placeholder for now)
-    let mut patch_for_module = MemoryContainer::new();
+    // patch info for the kernel module
+    let mut patch_info_for_module = MemoryContainer::new();
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         prepare_data_for_module_validation(
@@ -451,7 +464,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
             &mut module_memory_metadata,
             &mut module_in_memory,
             &mut module_as_elf,
-            &mut patch_for_module,
+            &mut patch_info_for_module,
         )?;
     } else {
         return Err(Errno::EINVAL);
@@ -490,6 +503,19 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         return Err(Errno::EINVAL);
     }
 
+    // pre-computed patch data for a module
+    if !patch_info_for_module.is_empty() {
+        let mut patch_info_buf = vec![0u8; patch_info_for_module.len()];
+        patch_info_for_module
+            .read_bytes(patch_info_for_module.start().unwrap(), &mut patch_info_buf)
+            .map_err(|_| Errno::EINVAL)?;
+        crate::platform_low()
+            .vtl0_kernel_info
+            .precomputed_patches
+            .insert_patch_data_from_bytes(&patch_info_buf, Some(&mut module_memory_metadata))
+            .map_err(|_| Errno::EINVAL)?;
+    }
+
     // once a module is verified and validated, change the permission of its memory ranges based on their types
     for mod_mem_range in &module_memory_metadata {
         protect_physical_memory_range(
@@ -514,7 +540,7 @@ fn prepare_data_for_module_validation(
     module_memory_metadata: &mut ModuleMemoryMetadata,
     module_in_memory: &mut ModuleMemory,
     module_as_elf: &mut MemoryContainer,
-    patch_for_module: &mut MemoryContainer,
+    patch_info_for_module: &mut MemoryContainer,
 ) -> Result<(), Errno> {
     for heki_page in heki_pages {
         for heki_range in heki_page {
@@ -529,7 +555,7 @@ fn prepare_data_for_module_validation(
                         .map_err(|_| Errno::EINVAL)?;
                 }
                 ModMemType::Patch => {
-                    patch_for_module
+                    patch_info_for_module
                         .write_bytes_from_heki_range(heki_range)
                         .map_err(|_| Errno::EINVAL)?;
                 }
@@ -622,6 +648,17 @@ pub fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, Errno> {
                 MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE,
             )?;
         }
+    }
+
+    if let Some(patch_targets) = crate::platform_low()
+        .vtl0_kernel_info
+        .module_memory_metadata
+        .get_patch_targets(token)
+    {
+        crate::platform_low()
+            .vtl0_kernel_info
+            .precomputed_patches
+            .remove_patch_data(&patch_targets);
     }
 
     crate::platform_low()
@@ -798,7 +835,24 @@ fn prepare_data_for_kexec_validation(
 pub fn mshv_vsm_patch_text(patch_pa_0: u64, patch_pa_1: u64) -> Result<i64, Errno> {
     let heki_patch = copy_heki_patch_from_vtl0(patch_pa_0, patch_pa_1)?;
     debug_serial_println!("VSM: {:?}", heki_patch);
-    // TODO: validate the patch data before applying it
+
+    let Some(precomputed_patch) = crate::platform_low()
+        .vtl0_kernel_info
+        .find_precomputed_patch(&heki_patch)
+    else {
+        serial_println!("VSM: precomputed patch data not found");
+        return Err(Errno::ENOENT);
+    };
+
+    if !validate_text_patch(&heki_patch, &precomputed_patch) {
+        serial_println!(
+            "VSM: text patch looks suspicious. current: {:?}, precomputed: {:?}",
+            heki_patch,
+            precomputed_patch
+        );
+        return Err(Errno::EINVAL);
+    }
+
     apply_vtl0_text_patch(heki_patch)?;
     Ok(0)
 }
@@ -1007,6 +1061,7 @@ pub struct Vtl0KernelInfo {
     system_cert: once_cell::race::OnceBox<Certificate>,
     kexec_metadata: KexecMemoryMetadataWrapper,
     crash_kexec_metadata: KexecMemoryMetadataWrapper,
+    precomputed_patches: PatchDataMap,
     // TODO: revocation cert, blocklist, etc.
 }
 
@@ -1018,6 +1073,7 @@ impl Vtl0KernelInfo {
             system_cert: once_cell::race::OnceBox::new(),
             kexec_metadata: KexecMemoryMetadataWrapper::new(),
             crash_kexec_metadata: KexecMemoryMetadataWrapper::new(),
+            precomputed_patches: PatchDataMap::new(),
         }
     }
 
@@ -1040,6 +1096,23 @@ impl Vtl0KernelInfo {
     pub fn get_system_certificate(&self) -> Option<&Certificate> {
         self.system_cert.get()
     }
+
+    // This function finds the precomputed patch data corresponding to the input patch data.
+    // We need this because each step of `mshv_vsm_patch_data`/`text_poke_bp_batch` only
+    // provides a part of the patch data and addresses (`patch[0]` or `patch[1..patch_size-1]`).
+    pub fn find_precomputed_patch(&self, patch_data: &HekiPatch) -> Option<HekiPatch> {
+        self.precomputed_patches
+            .get(PhysAddr::new(patch_data.pa[0]))
+            .or_else(|| {
+                self.precomputed_patches
+                    .get(PhysAddr::new(patch_data.pa[0].saturating_sub(1)))
+            })
+            .or_else(|| {
+                self.precomputed_patches
+                    .get(PhysAddr::new(patch_data.pa[1]))
+            })
+            .or(None)
+    }
 }
 
 /// Data structure for maintaining the memory ranges of each VTL0 kernel module and their types
@@ -1050,11 +1123,15 @@ pub struct ModuleMemoryMetadataMap {
 
 pub struct ModuleMemoryMetadata {
     ranges: Vec<ModuleMemoryRange>,
+    patch_targets: Vec<PhysAddr>,
 }
 
 impl ModuleMemoryMetadata {
     pub fn new() -> Self {
-        Self { ranges: Vec::new() }
+        Self {
+            ranges: Vec::new(),
+            patch_targets: Vec::new(),
+        }
     }
 
     #[inline]
@@ -1073,6 +1150,18 @@ impl ModuleMemoryMetadata {
     #[inline]
     pub(crate) fn insert_memory_range(&mut self, mem_range: ModuleMemoryRange) {
         self.ranges.push(mem_range);
+    }
+
+    #[inline]
+    pub(crate) fn insert_patch_target(&mut self, patch_target: PhysAddr) {
+        self.patch_targets.push(patch_target);
+    }
+
+    // This function returns patch targets belonging to this module to remove them
+    // from the precomputed patch data map when the module is unloaded.
+    #[inline]
+    pub(crate) fn get_patch_targets(&self) -> &Vec<PhysAddr> {
+        &self.patch_targets
     }
 }
 
@@ -1155,6 +1244,14 @@ impl ModuleMemoryMetadataMap {
     pub(crate) fn remove(&self, key: i64) -> bool {
         let mut map = self.inner.lock();
         map.remove(&key).is_some()
+    }
+
+    /// Return the addresses of patch targets belonging to a module identified by `key`
+    pub(crate) fn get_patch_targets(&self, key: i64) -> Option<Vec<PhysAddr>> {
+        let guard = self.inner.lock();
+        guard
+            .get(&key)
+            .map(|metadata| metadata.get_patch_targets().clone())
     }
 
     pub fn iter_entry(&self, key: i64) -> Option<ModuleMemoryMetadataIters> {
@@ -1628,4 +1725,120 @@ impl Default for KexecMemoryRange {
     fn default() -> Self {
         Self::new(0, 0, 0)
     }
+}
+
+pub struct PatchDataMap {
+    inner: spin::rwlock::RwLock<HashMap<PhysAddr, HekiPatch>>,
+}
+
+impl PatchDataMap {
+    pub fn new() -> Self {
+        Self {
+            inner: spin::rwlock::RwLock::new(HashMap::new()),
+        }
+    }
+
+    #[inline]
+    pub fn remove_patch_data(&self, patch_targets: &Vec<PhysAddr>) {
+        let mut inner = self.inner.write();
+        for key in patch_targets {
+            inner.remove(key);
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, addr: PhysAddr) -> Option<HekiPatch> {
+        let inner = self.inner.read();
+        inner.get(&addr).copied()
+    }
+
+    // Add patch data from a buffer containing `HekiPatchInfo` and `HekiPatch` structures.
+    // If this patch data is from a module (`module_memory_metadata` is `Some`), this function
+    // denies any patch target addresses not within the module's executable memory ranges.
+    pub fn insert_patch_data_from_bytes(
+        &self,
+        patch_info_buf: &[u8],
+        mut module_memory_metadata: Option<&mut ModuleMemoryMetadata>,
+    ) -> Result<(), PatchDataMapError> {
+        if patch_info_buf.len() < core::mem::size_of::<HekiPatchInfo>() {
+            return Err(PatchDataMapError::InvalidHekiPatchInfo);
+        }
+        let mut inner = self.inner.write();
+
+        // the buffer looks like below:
+        // [`HekiPatchInfo`, [`HekiPatch`, ...], `HekiPatchInfo`, [`HekiPatch`, ...], ...]
+        // each `HekiPatchInfo` contains the number of `HekiPatch` structures that follow it.
+        let mut index: usize = 0;
+        while index <= patch_info_buf.len() - core::mem::size_of::<HekiPatchInfo>() {
+            let patch_info = HekiPatchInfo::try_from_bytes(
+                &patch_info_buf[index..index + core::mem::size_of::<HekiPatchInfo>()],
+            )
+            .ok_or(PatchDataMapError::InvalidHekiPatchInfo)?;
+
+            let Some(total_patch_size) = core::mem::size_of::<HekiPatch>()
+                .checked_mul(usize::try_from(patch_info.patch_index).unwrap())
+            else {
+                return Err(PatchDataMapError::InvalidHekiPatchInfo);
+            };
+            index = index
+                .checked_add(core::mem::size_of::<HekiPatchInfo>() + total_patch_size)
+                .filter(|&x| x <= patch_info_buf.len())
+                .ok_or(PatchDataMapError::InvalidHekiPatchInfo)?;
+
+            for patch in patch_info_buf[index - total_patch_size..index]
+                .chunks(core::mem::size_of::<HekiPatch>())
+                .map(HekiPatch::try_from_bytes)
+            {
+                let patch = patch.ok_or(PatchDataMapError::InvalidHekiPatch)?;
+                let patch_target_pa_0 = PhysAddr::new(patch.pa[0]);
+                let patch_target_pa_1 = PhysAddr::new(patch.pa[1]);
+
+                if let Some(ref mut mod_mem_meta) = module_memory_metadata {
+                    for mod_mem_range in &**mod_mem_meta {
+                        let in_range = |pa: PhysAddr| {
+                            mod_mem_range.phys_frame_range.start.start_address() <= pa
+                                && mod_mem_range.phys_frame_range.end.start_address() > pa
+                        };
+                        if matches!(
+                            mod_mem_range.mod_mem_type,
+                            ModMemType::Text | ModMemType::InitText
+                        ) && in_range(patch_target_pa_0)
+                            && (patch_target_pa_1.is_null() || in_range(patch_target_pa_1))
+                        {
+                            mod_mem_meta.insert_patch_target(patch_target_pa_0);
+                            inner.insert(patch_target_pa_0, patch);
+
+                            // If the first byte of a patch target is in the first (physical) page while the remaining bytes
+                            // are in the second page, we use the second page as an additional key for the patch to deal with
+                            // Step 2 of `text_poke_bp_batch` where we only know the second to last bytes of the patch such
+                            // that cannot know the address of the first page. Details are in `validate_text_poke_bp_batch`.
+                            if !patch_target_pa_1.is_null()
+                                && (patch_target_pa_0 + 1).is_aligned(Size4KiB::SIZE)
+                            {
+                                mod_mem_meta.insert_patch_target(patch_target_pa_1);
+                                inner.insert(patch_target_pa_1, patch);
+                            }
+                            break;
+                        }
+                    }
+                } else {
+                    inner.insert(patch_target_pa_0, patch);
+                    if !patch_target_pa_1.is_null()
+                        && (patch_target_pa_0 + 1).is_aligned(Size4KiB::SIZE)
+                    {
+                        inner.insert(patch_target_pa_1, patch);
+                    }
+                }
+            }
+            index += total_patch_size;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum PatchDataMapError {
+    InvalidHekiPatchInfo,
+    InvalidHekiPatch,
 }
