@@ -125,3 +125,34 @@ impl ModuleSignature {
             && self.key_id_len == 0
     }
 }
+
+/// `kexec_segment` from [Linux](https://elixir.bootlin.com/linux/v6.6.85/source/include/linux/kexec.h#L82)
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct KexecSegment {
+    pub buf: *const core::ffi::c_void,
+    pub bufsz: u64,
+    pub mem: u64,
+    pub memsz: u64,
+}
+
+/// `kimage` from [Linux](https://elixir.bootlin.com/linux/v6.6.85/source/include/linux/kexec.h#L296)
+/// Note that this is a part of the original `kimage` structure. It only contains some fields that
+/// we need for our use case, such as `nr_segments` and `segment`, and
+/// are not affected by the kernel build configurations like `CONFIG_KEXEC_FILE` and `CONFIG_IMA_KEXEC`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Kimage {
+    head: u64,
+    entry: *const u64,
+    last_entry: *const u64,
+    start: u64,
+    control_code_page: *const core::ffi::c_void, // struct page*
+    swap_page: *const core::ffi::c_void,         // struct page*
+    vmcoreinfo_page: *const core::ffi::c_void,   // struct page*
+    vmcoreinfo_data_copy: *const core::ffi::c_void,
+    pub nr_segments: u64,
+    pub segment: [KexecSegment; KEXEC_SEGMENT_MAX],
+    // we do not need the rest of the fields for now
+}
+pub const KEXEC_SEGMENT_MAX: usize = 16;

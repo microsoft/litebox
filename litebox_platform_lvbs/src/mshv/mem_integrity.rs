@@ -7,6 +7,7 @@ use crate::{
     debug_serial_println, host::linux::ModuleSignature, mshv::vsm::ModuleMemory, serial_println,
 };
 use alloc::vec;
+use authenticode::{AttributeCertificateIterator, AuthenticodeSignature, authenticode_digest};
 use cms::{content_info::ContentInfo, signed_data::SignedData};
 use const_oid::db::rfc5912::{ID_SHA_256, ID_SHA_512, RSA_ENCRYPTION};
 use elf::{
@@ -20,9 +21,11 @@ use elf::{
     string_table::StringTable,
     symbol::Symbol,
 };
+use litebox_common_linux::errno::Errno;
+use object::read::pe::PeFile64;
 use rangemap::set::RangeSet;
 use rsa::{RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs1v15::Signature, signature::Verifier};
-use sha2::{Sha256, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 use x509_cert::{
     Certificate,
     der::{Decode, Encode, oid::ObjectIdentifier},
@@ -373,7 +376,7 @@ pub fn verify_kernel_module_signature(
     signed_module: &[u8],
     cert: &Certificate,
 ) -> Result<(), VerificationError> {
-    let (module_data, signature_der) = extract_data_and_signature(signed_module)?;
+    let (module_data, signature_der) = extract_module_data_and_signature(signed_module)?;
     let (signature, digest_alg, signature_alg) = decode_signature(signature_der)?;
 
     // We only support RSA with SHA-256 or SHA-512 for now as most Linux distributions use this combination.
@@ -431,7 +434,9 @@ impl RsaPkcs1v15Verifier {
 /// This function extracts the module data and signature from a signed kernel module.
 /// A signed kernel module has the following layout:
 /// [module data (ELF)][signature (PKCS#7/DER)][`ModuleSignature`][`MODULE_SIGNATURE_MAGIC`]
-fn extract_data_and_signature(signed_module: &[u8]) -> Result<(&[u8], &[u8]), VerificationError> {
+fn extract_module_data_and_signature(
+    signed_module: &[u8],
+) -> Result<(&[u8], &[u8]), VerificationError> {
     const MODULE_SIGNATURE_MAGIC: &[u8] = b"~Module signature appended~\n";
 
     let module_signature_offset = signed_module
@@ -443,13 +448,18 @@ fn extract_data_and_signature(signed_module: &[u8]) -> Result<(&[u8], &[u8]), Ve
         })
         .ok_or(VerificationError::SignatureNotFound)?;
 
-    #[expect(clippy::cast_ptr_alignment)]
-    let module_signature = unsafe {
-        &*(signed_module
-            .as_ptr()
-            .add(module_signature_offset)
-            .cast::<ModuleSignature>())
-    };
+    let mut module_signature = core::mem::MaybeUninit::<ModuleSignature>::uninit();
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            signed_module
+                .as_ptr()
+                .add(module_signature_offset)
+                .cast::<u8>(),
+            module_signature.as_mut_ptr().cast::<u8>(),
+            core::mem::size_of::<ModuleSignature>(),
+        );
+    }
+    let module_signature = unsafe { module_signature.assume_init() };
     if !module_signature.is_valid() {
         return Err(VerificationError::InvalidSignature);
     }
@@ -495,6 +505,102 @@ fn decode_signature(
     ))
 }
 
+/// This function verifies the signature of a Linux kernel blob (`bzImage`) for kexec. In addition to
+/// the ELF header, a Linux kernel blob has the PE header to be loaded by the UEFI firmware, known as
+/// [EFI boot stub](https://docs.kernel.org/admin-guide/efi-stub.html). This PE header embeds
+/// [Authenticode signature](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format) for UEFI
+/// Secure Boot. The Authenticode signature is computed over the PE image digest and other attributes.
+pub fn verify_kernel_pe_signature(
+    kernel_blob: &[u8],
+    cert: &Certificate,
+) -> Result<(), VerificationError> {
+    // extract the Authenticode signature and its signed attributes from the kernel blob PE
+    let authenticode_signature =
+        extract_authenticode_signature(kernel_blob).map_err(|_| VerificationError::ParseFailed)?;
+    let signature = Signature::try_from(authenticode_signature.signature())
+        .map_err(|_| VerificationError::InvalidSignature)?;
+    let signed_attrs_der = authenticode_signature
+        .signer_info()
+        .signed_attrs
+        .to_der()
+        .map_err(|_| VerificationError::InvalidSignature)?;
+    let digest_algorithm_oid = authenticode_signature.signer_info().digest_alg.oid;
+    if digest_algorithm_oid != ID_SHA_256 && digest_algorithm_oid != ID_SHA_512 {
+        todo!("Unsupported digest algorithm: {:?}", digest_algorithm_oid);
+    }
+
+    // verify the authenticity of the signed attributes using the system certificate
+    let key_info = &cert.tbs_certificate.subject_public_key_info;
+    let rsa_pubkey = RsaPublicKey::from_pkcs1_der(key_info.subject_public_key.raw_bytes())
+        .map_err(|_| VerificationError::InvalidCertificate)?;
+    let rsa_verifier = RsaPkcs1v15Verifier::new(rsa_pubkey, digest_algorithm_oid)
+        .map_err(|_| VerificationError::Unsupported)?;
+    rsa_verifier
+        .verify(&signed_attrs_der, &signature)
+        .map_err(|_| VerificationError::AuthenticationFailed)?;
+
+    // check whether the computed digest matches the one in the Authenticode signature
+    let computed_digest = compute_authenticode_digest(kernel_blob, digest_algorithm_oid)?;
+    if authenticode_signature.digest() == computed_digest {
+        Ok(())
+    } else {
+        Err(VerificationError::AuthenticationFailed)
+    }
+}
+
+/// This function extracts the Authenticode signature from a kernel blob PE.
+fn extract_authenticode_signature(
+    kernel_blob: &[u8],
+) -> Result<AuthenticodeSignature, VerificationError> {
+    let pe = PeFile64::parse(kernel_blob).map_err(|_| VerificationError::ParseFailed)?;
+    let mut authenticode_signature: Option<AuthenticodeSignature> = None;
+    // focus on the primary Authenticode signature for now
+
+    let Ok(Some(attr_cert_iter)) = AttributeCertificateIterator::new(&pe) else {
+        return Err(VerificationError::ParseFailed);
+    };
+    for attr_cert in attr_cert_iter {
+        if let Ok(acert) = attr_cert
+            && let Ok(auth_sig) = acert.get_authenticode_signature()
+        {
+            authenticode_signature = Some(auth_sig);
+            break;
+        }
+    }
+    authenticode_signature.ok_or(VerificationError::InvalidSignature)
+}
+
+/// This function computes an Authenticode digest over a kernel blob PE.
+fn compute_authenticode_digest(
+    kernel_blob: &[u8],
+    digest_alg: ObjectIdentifier,
+) -> Result<Vec<u8>, VerificationError> {
+    let pe = PeFile64::parse(kernel_blob).map_err(|_| VerificationError::ParseFailed)?;
+
+    if digest_alg == ID_SHA_256 {
+        let mut hasher = AuthenticodeHasher::<Sha256>::default();
+        authenticode_digest(&pe, &mut hasher).map_err(|_| VerificationError::ParseFailed)?;
+        Ok(hasher.hasher.finalize().to_vec())
+    } else if digest_alg == ID_SHA_512 {
+        let mut hasher = AuthenticodeHasher::<Sha512>::default();
+        authenticode_digest(&pe, &mut hasher).map_err(|_| VerificationError::ParseFailed)?;
+        Ok(hasher.hasher.finalize().to_vec())
+    } else {
+        Err(VerificationError::Unsupported)
+    }
+}
+
+#[derive(Default)]
+struct AuthenticodeHasher<T> {
+    hasher: T,
+}
+
+impl<T: digest::Update> digest::Update for AuthenticodeHasher<T> {
+    fn update(&mut self, data: &[u8]) {
+        digest::Update::update(&mut self.hasher, data);
+    }
+}
+
 /// Error for Kernel ELF validation and relocation failures.
 #[derive(Debug, PartialEq)]
 pub enum KernelElfError {
@@ -510,5 +616,18 @@ pub enum VerificationError {
     InvalidSignature,
     InvalidCertificate,
     AuthenticationFailed,
+    ParseFailed,
     Unsupported,
+}
+
+impl From<VerificationError> for Errno {
+    fn from(e: VerificationError) -> Self {
+        match e {
+            VerificationError::AuthenticationFailed => Errno::EKEYREJECTED,
+            VerificationError::SignatureNotFound => Errno::ENODATA,
+            VerificationError::Unsupported => Errno::ENOPKG,
+            VerificationError::InvalidCertificate => Errno::ENOKEY,
+            VerificationError::InvalidSignature | VerificationError::ParseFailed => Errno::ELIBBAD,
+        }
+    }
 }

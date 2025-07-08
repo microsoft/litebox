@@ -1,9 +1,12 @@
 //! Process/thread related syscalls.
 
+use core::mem::offset_of;
+
 use alloc::boxed::Box;
 use litebox::platform::{ExitProvider as _, RawMutPointer, ThreadProvider};
 use litebox::platform::{
-    PunchthroughProvider as _, PunchthroughToken as _, ThreadLocalStorageProvider as _,
+    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _,
+    ThreadLocalStorageProvider as _,
 };
 use litebox::utils::TruncateExt;
 use litebox_common_linux::CloneFlags;
@@ -114,6 +117,78 @@ fn futex_wake(addr: MutPtr<i32>) {
     });
 }
 
+const ROBUST_LIST_LIMIT: isize = 2048;
+
+/*
+ * Process a futex-list entry, check whether it's owned by the
+ * dying task, and do notification if so:
+ */
+fn handle_futex_death(
+    futex_addr: crate::ConstPtr<u32>,
+    pi: bool,
+    pending_op: bool,
+) -> Result<(), Errno> {
+    if futex_addr.as_usize() % 4 != 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    todo!("handle_futex_death is not implemented yet");
+}
+
+fn fetch_robust_entry(
+    head: crate::ConstPtr<litebox_common_linux::RobustList<litebox_platform_multiplex::Platform>>,
+) -> (
+    crate::ConstPtr<litebox_common_linux::RobustList<litebox_platform_multiplex::Platform>>,
+    bool,
+) {
+    let next = head.as_usize();
+    (crate::ConstPtr::from_usize(next & !1), next & 1 != 0)
+}
+
+fn wake_robust_list(
+    head: crate::ConstPtr<
+        litebox_common_linux::RobustListHead<litebox_platform_multiplex::Platform>,
+    >,
+) -> Result<(), Errno> {
+    let mut limit = ROBUST_LIST_LIMIT;
+    let head_ptr = head.as_usize();
+    let head = unsafe { head.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+    let (mut entry, mut pi) = fetch_robust_entry(head.list.next);
+    let (pending, ppi) = fetch_robust_entry(head.list_op_pending);
+    let futex_offset = head.futex_offset;
+    let entry_head = head_ptr
+        + offset_of!(
+            litebox_common_linux::RobustListHead<litebox_platform_multiplex::Platform>,
+            list
+        );
+    while entry.as_usize() != entry_head && limit > 0 {
+        let nxt = unsafe { entry.read_at_offset(0) }.map(|e| fetch_robust_entry(e.next));
+        if entry.as_usize() != pending.as_usize() {
+            handle_futex_death(
+                crate::ConstPtr::from_usize(entry.as_usize() + futex_offset),
+                pi,
+                false,
+            )?;
+        }
+        let Some((next_entry, next_pi)) = nxt else {
+            return Err(Errno::EFAULT);
+        };
+
+        entry = next_entry;
+        pi = next_pi;
+        limit -= 1;
+    }
+
+    if pending.as_usize() != 0 {
+        let _ = handle_futex_death(
+            crate::ConstPtr::from_usize(pending.as_usize() + futex_offset),
+            ppi,
+            true,
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn sys_exit(status: i32) -> ! {
     let mut tls = litebox_platform_multiplex::platform().release_thread_local_storage();
     if let Some(clear_child_tid) = tls.current_task.clear_child_tid.take() {
@@ -121,6 +196,9 @@ pub(crate) fn sys_exit(status: i32) -> ! {
         // TODO: if we are the last thread, we don't need to clear it
         let _ = unsafe { clear_child_tid.write_at_offset(0, 0) };
         futex_wake(clear_child_tid);
+    }
+    if let Some(robust_list) = tls.current_task.robust_list.take() {
+        let _ = wake_robust_list(robust_list);
     }
 
     litebox_platform_multiplex::platform().terminate_thread(status)
@@ -231,6 +309,7 @@ pub(crate) fn sys_clone(
                     } else {
                         None
                     },
+                    robust_list: None,
                 }),
                 callback: new_thread_callback,
             }),
@@ -260,6 +339,104 @@ pub(crate) fn sys_gettid() -> i32 {
         litebox_platform_multiplex::platform()
             .with_thread_local_storage_mut(|tls| tls.current_task.tid)
     }
+}
+
+// TODO: enforce the following limits:
+const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
+const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
+
+fn do_prlimit(
+    pid: Option<i32>,
+    resource: litebox_common_linux::RlimitResource,
+    new_limit: Option<litebox_common_linux::Rlimit>,
+) -> litebox_common_linux::Rlimit {
+    if new_limit.is_some() {
+        unimplemented!("Setting new limits is not supported yet");
+    }
+    if pid.is_some() {
+        unimplemented!("prlimit for a specific PID is not supported yet");
+    }
+
+    match resource {
+        litebox_common_linux::RlimitResource::STACK => litebox_common_linux::Rlimit {
+            rlim_cur: crate::loader::DEFAULT_STACK_SIZE,
+            rlim_max: litebox_common_linux::rlim_t::MAX,
+        },
+        litebox_common_linux::RlimitResource::NOFILE => litebox_common_linux::Rlimit {
+            rlim_cur: RLIMIT_NOFILE_CUR,
+            rlim_max: RLIMIT_NOFILE_MAX,
+        },
+        _ => unimplemented!("Unsupported resource for prlimit: {:?}", resource),
+    }
+}
+
+/// Handle syscall `prlimit64`.
+///
+/// Note for now setting new limits is not supported yet, and thus returning constant values
+/// for the requested resource. Getting resources for a specific PID is also not supported yet.
+pub(crate) fn sys_prlimit(
+    pid: Option<i32>,
+    resource: litebox_common_linux::RlimitResource,
+    new_rlim: Option<crate::ConstPtr<litebox_common_linux::Rlimit64>>,
+    old_rlim: Option<crate::MutPtr<litebox_common_linux::Rlimit64>>,
+) -> Result<(), Errno> {
+    let new_limit = match new_rlim {
+        Some(rlim) => {
+            let rlim = unsafe { rlim.read_at_offset(0) }
+                .ok_or(Errno::EINVAL)?
+                .into_owned();
+            Some(litebox_common_linux::rlimit64_to_rlimit(rlim))
+        }
+        None => None,
+    };
+    let old_limit = litebox_common_linux::rlimit_to_rlimit64(do_prlimit(pid, resource, new_limit));
+    if let Some(old_rlim) = old_rlim {
+        unsafe { old_rlim.write_at_offset(0, old_limit) }.ok_or(Errno::EINVAL)?;
+    }
+    Ok(())
+}
+
+/// Handle syscall `setrlimit`.
+pub(crate) fn sys_getrlimit(
+    resource: litebox_common_linux::RlimitResource,
+    rlim: crate::MutPtr<litebox_common_linux::Rlimit>,
+) -> Result<(), Errno> {
+    let old_limit = do_prlimit(None, resource, None);
+    unsafe { rlim.write_at_offset(0, old_limit) }.ok_or(Errno::EINVAL)
+}
+
+/// Handle syscall `setrlimit`.
+pub(crate) fn sys_setrlimit(
+    resource: litebox_common_linux::RlimitResource,
+    rlim: crate::ConstPtr<litebox_common_linux::Rlimit>,
+) -> Result<(), Errno> {
+    let new_limit = unsafe { rlim.read_at_offset(0) }
+        .ok_or(Errno::EFAULT)?
+        .into_owned();
+    let _ = do_prlimit(None, resource, Some(new_limit));
+    Ok(())
+}
+
+/// Handle syscall `set_robust_list`.
+pub(crate) fn sys_set_robust_list(head: usize) {
+    let head = crate::ConstPtr::from_usize(head);
+    litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| {
+        tls.current_task.robust_list = Some(head);
+    });
+}
+
+/// Handle syscall `get_robust_list`.
+pub(crate) fn sys_get_robust_list(
+    pid: Option<i32>,
+    head_ptr: crate::MutPtr<usize>,
+) -> Result<(), Errno> {
+    if pid.is_some() {
+        unimplemented!("Getting robust list for a specific PID is not supported yet");
+    }
+    let head = litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| {
+        tls.current_task.robust_list.map_or(0, |ptr| ptr.as_usize())
+    });
+    unsafe { head_ptr.write_at_offset(0, head) }.ok_or(Errno::EFAULT)
 }
 
 #[cfg(test)]

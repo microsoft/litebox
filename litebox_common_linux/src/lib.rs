@@ -172,6 +172,7 @@ impl From<litebox::fs::FileType> for InodeType {
 }
 
 /// Linux's `stat` struct
+#[cfg(target_arch = "x86_64")]
 #[repr(C, packed)]
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct FileStat {
@@ -184,8 +185,8 @@ pub struct FileStat {
     #[expect(clippy::pub_underscore_fields)]
     pub __pad0: core::ffi::c_int,
     pub st_rdev: u64,
-    pub st_size: i64,
-    pub st_blksize: i64,
+    pub st_size: usize,
+    pub st_blksize: usize,
     pub st_blocks: i64,
     pub st_atime: i64,
     pub st_atime_nsec: i64,
@@ -195,6 +196,87 @@ pub struct FileStat {
     pub st_ctime_nsec: i64,
     #[expect(clippy::pub_underscore_fields)]
     pub __unused: [i64; 3],
+}
+
+/// Linux's `stat` struct
+#[cfg(target_arch = "x86")]
+#[repr(C)]
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct FileStat {
+    pub st_dev: u32,
+    pub st_ino: u32,
+    pub st_nlink: u16,
+    pub st_mode: u16,
+    pub st_uid: u16,
+    pub st_gid: u16,
+    pub st_rdev: u32,
+    pub st_size: usize,
+    pub st_blksize: usize,
+    pub st_blocks: u32,
+    pub st_atime: u32,
+    pub st_atime_nsec: u32,
+    pub st_mtime: u32,
+    pub st_mtime_nsec: u32,
+    pub st_ctime: u32,
+    pub st_ctime_nsec: u32,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __unused: [u32; 2],
+}
+
+/// Linux's `stat64` struct
+#[cfg(target_arch = "x86")]
+#[repr(C, packed)]
+#[derive(Clone)]
+pub struct FileStat64 {
+    pub st_dev: u64,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __pad1: core::ffi::c_uint,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __st_ino: u32,
+    pub st_mode: u32,
+    pub st_nlink: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u64,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __pad2: core::ffi::c_uint,
+    pub st_size: u64,
+    pub st_blksize: usize,
+    pub st_blocks: u64,
+    pub st_atime: u32,
+    pub st_atime_nsec: u32,
+    pub st_mtime: u32,
+    pub st_mtime_nsec: u32,
+    pub st_ctime: u32,
+    pub st_ctime_nsec: u32,
+    pub st_ino: u64,
+}
+
+#[cfg(target_arch = "x86")]
+impl From<FileStat> for FileStat64 {
+    fn from(stat: FileStat) -> Self {
+        FileStat64 {
+            st_dev: u64::from(stat.st_dev),
+            __pad1: 0,
+            __st_ino: stat.st_ino,
+            st_mode: u32::from(stat.st_mode),
+            st_nlink: u32::from(stat.st_nlink),
+            st_uid: u32::from(stat.st_uid),
+            st_gid: u32::from(stat.st_gid),
+            st_rdev: u64::from(stat.st_rdev),
+            __pad2: 0,
+            st_size: stat.st_size as u64,
+            st_blksize: stat.st_blksize,
+            st_blocks: u64::from(stat.st_blocks),
+            st_atime: stat.st_atime,
+            st_atime_nsec: stat.st_atime_nsec,
+            st_mtime: stat.st_mtime,
+            st_mtime_nsec: stat.st_mtime_nsec,
+            st_ctime: stat.st_ctime,
+            st_ctime_nsec: stat.st_ctime_nsec,
+            st_ino: u64::from(stat.st_ino),
+        }
+    }
 }
 
 /// Linux's `iovec` struct for `writev`
@@ -246,14 +328,14 @@ impl From<litebox::fs::FileStatus> for FileStat {
             // TODO: st_dev and st_ino are used by ld.so to unique identify
             // shared libraries. Give a random value for now.
             st_dev: 0,
-            st_ino: unsafe { INO },
+            st_ino: unsafe { INO }.truncate(),
             st_nlink: 1,
-            st_mode: mode.bits() | InodeType::from(file_type) as u32,
+            st_mode: (mode.bits() | InodeType::from(file_type) as u32).truncate(),
             st_uid: 0,
             st_gid: 0,
             st_rdev: 0,
             #[allow(clippy::cast_possible_wrap)]
-            st_size: size as i64,
+            st_size: size,
             st_blksize: 0,
             st_blocks: 0,
             ..Default::default()
@@ -885,6 +967,11 @@ pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     /// This operation wakes a single thread waiting on the specified memory location via futex.
     /// Any errors from the futex wake operation are ignored.
     pub clear_child_tid: Option<Platform::RawMutPointer<i32>>,
+    /// The purpose of the robust futex list is to ensure that if a thread accidentally fails to unlock a futex before
+    /// terminating or calling execve(2), another thread that is waiting on that futex is notified that the former owner
+    /// of the futex has died. This notification consists of two pieces: the FUTEX_OWNER_DIED bit is set in the futex word,
+    /// and the kernel performs a futex(2) FUTEX_WAKE operation on one of the threads waiting on the futex.
+    pub robust_list: Option<Platform::RawConstPointer<RobustListHead<Platform>>>,
 }
 
 #[repr(C)]
@@ -910,6 +997,133 @@ bitflags::bitflags! {
         const RANDOM = 2;
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
+    }
+}
+
+#[cfg(not(target_arch = "riscv32"))]
+pub type rlim_t = usize;
+
+/// Used by getrlimit and setrlimit syscalls
+#[repr(C)]
+#[derive(Clone)]
+pub struct Rlimit {
+    pub rlim_cur: rlim_t,
+    pub rlim_max: rlim_t,
+}
+
+/// Used by prlimit64 syscall
+#[repr(C)]
+#[derive(Clone)]
+pub struct Rlimit64 {
+    pub rlim_cur: u64,
+    pub rlim_max: u64,
+}
+
+pub fn rlimit_to_rlimit64(rlim: Rlimit) -> Rlimit64 {
+    Rlimit64 {
+        rlim_cur: if rlim.rlim_cur == rlim_t::MAX {
+            u64::MAX
+        } else {
+            rlim.rlim_cur as u64
+        },
+        rlim_max: if rlim.rlim_max == rlim_t::MAX {
+            u64::MAX
+        } else {
+            rlim.rlim_max as u64
+        },
+    }
+}
+
+pub fn rlimit64_to_rlimit(rlim: Rlimit64) -> Rlimit {
+    Rlimit {
+        rlim_cur: if rlim.rlim_cur >= rlim_t::MAX as u64 {
+            rlim_t::MAX
+        } else {
+            rlim.rlim_cur.truncate()
+        },
+        rlim_max: if rlim.rlim_max >= rlim_t::MAX as u64 {
+            rlim_t::MAX
+        } else {
+            rlim.rlim_max.truncate()
+        },
+    }
+}
+
+#[repr(i32)]
+#[derive(Debug, IntEnum)]
+pub enum RlimitResource {
+    /// CPU time in sec
+    CPU = 0,
+    /// Max filesize
+    FSIZE = 1,
+    /// Max data size
+    DATA = 2,
+    /// Max stack size
+    STACK = 3,
+    /// Max core file size
+    CORE = 4,
+    /// Max resident set size
+    RSS = 5,
+    /// Max number of processes
+    NPROC = 6,
+    /// Max number of open files
+    NOFILE = 7,
+    /// Max number of locked memory
+    MEMLOCK = 8,
+    /// Max address space
+    AS = 9,
+    /// Max number of file locks held
+    LOCKS = 10,
+    /// Max number of pending signals
+    SIGPENDING = 11,
+    /// Max bytes in POSIX mqueues
+    MSGQUEUE = 12,
+    /// max nice prio allowed to raise to 0-39 for nice level 19 .. -20
+    NICE = 13,
+    /// Max realtime priority
+    RTPRIO = 14,
+    /// timeout for RT tasks in us
+    RTTIME = 15,
+}
+
+#[repr(C)]
+pub struct RobustList<Platform: litebox::platform::RawPointerProvider> {
+    pub next: Platform::RawConstPointer<RobustList<Platform>>,
+}
+
+impl<Platform: litebox::platform::RawPointerProvider> Clone for RobustList<Platform> {
+    fn clone(&self) -> Self {
+        Self { next: self.next }
+    }
+}
+
+#[repr(C)]
+pub struct RobustListHead<Platform: litebox::platform::RawPointerProvider> {
+    /// The head of the list. Points back to itself if empty.
+    pub list: RobustList<Platform>,
+    /// This relative offset is set by user-space, it gives the kernel
+    /// the relative position of the futex field to examine. This way
+    /// we keep userspace flexible, to freely shape its data-structure,
+    /// without hardcoding any particular offset into the kernel.
+    pub futex_offset: usize,
+    /// The death of the thread may race with userspace setting
+    /// up a lock's links. So to handle this race, userspace first
+    /// sets this field to the address of the to-be-taken lock,
+    /// then does the lock acquire, and then adds itself to the
+    /// list, and then clears this field. Hence the kernel will
+    /// always have full knowledge of all locks that the thread
+    /// _might_ have taken. We check the owner TID in any case,
+    /// so only truly owned locks will be handled.
+    pub list_op_pending: Platform::RawConstPointer<RobustList<Platform>>,
+}
+
+impl<Platform: litebox::platform::RawPointerProvider> Clone for RobustListHead<Platform> {
+    fn clone(&self) -> Self {
+        Self {
+            list: self.list.clone(),
+            futex_offset: self.futex_offset,
+            list_op_pending: self.list_op_pending,
+        }
     }
 }
 
@@ -1111,6 +1325,13 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         buf: Platform::RawMutPointer<FileStat>,
         flags: AtFlags,
     },
+    #[cfg(target_arch = "x86")]
+    Fstatat64 {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        buf: Platform::RawMutPointer<FileStat64>,
+        flags: AtFlags,
+    },
     Eventfd2 {
         initval: u32,
         flags: EfdFlags,
@@ -1128,10 +1349,37 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     SetThreadArea {
         user_desc: Platform::RawMutPointer<UserDesc>,
     },
+    Getrlimit {
+        resource: RlimitResource,
+        rlim: Platform::RawMutPointer<Rlimit>,
+    },
+    Setrlimit {
+        resource: RlimitResource,
+        rlim: Platform::RawConstPointer<Rlimit>,
+    },
+    Prlimit {
+        pid: Option<i32>,
+        /// The resource for which the limit is being queried.
+        resource: RlimitResource,
+        /// If the new_limit argument is not a None, then the rlimit structure to which it points
+        /// is used to set new values for the soft and hard limits for resource.
+        new_limit: Option<Platform::RawConstPointer<Rlimit64>>,
+        /// If the old_limit argument is not a None, then a successful call to prlimit() places the
+        /// previous soft and hard limits for resource in the rlimit structure pointed to by old_limit.
+        old_limit: Option<Platform::RawMutPointer<Rlimit64>>,
+    },
     SetTidAddress {
         tidptr: Platform::RawMutPointer<i32>,
     },
     Gettid,
+    SetRobustList {
+        head: usize,
+    },
+    GetRobustList {
+        pid: Option<i32>,
+        head: Platform::RawMutPointer<usize>,
+        len: Platform::RawMutPointer<usize>,
+    },
     GetRandom {
         buf: Platform::RawMutPointer<u8>,
         count: usize,
@@ -1480,6 +1728,65 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
                 bufsiz: ctx.syscall_arg(3),
             },
+            #[cfg(target_arch = "x86_64")]
+            Sysno::getrlimit => {
+                let resource: i32 = ctx.syscall_arg(0).reinterpret_as_signed().truncate();
+                if let Ok(resource) = RlimitResource::try_from(resource) {
+                    SyscallRequest::Getrlimit {
+                        resource,
+                        rlim: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+                    }
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
+            }
+            #[cfg(target_arch = "x86")]
+            Sysno::ugetrlimit => {
+                let resource: i32 = ctx.syscall_arg(0).reinterpret_as_signed().truncate();
+                if let Ok(resource) = RlimitResource::try_from(resource) {
+                    SyscallRequest::Getrlimit {
+                        resource,
+                        rlim: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+                    }
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
+            }
+            ::syscalls::Sysno::setrlimit => {
+                let resource: i32 = ctx.syscall_arg(0).reinterpret_as_signed().truncate();
+                if let Ok(resource) = RlimitResource::try_from(resource) {
+                    SyscallRequest::Setrlimit {
+                        resource,
+                        rlim: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
+                    }
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
+            }
+            Sysno::prlimit64 => {
+                let pid: i32 = ctx.syscall_arg(0).reinterpret_as_signed().truncate();
+                let resource: i32 = ctx.syscall_arg(1).reinterpret_as_signed().truncate();
+                let new_limit = ctx.syscall_arg(2);
+                let old_limit = ctx.syscall_arg(3);
+                if let Ok(resource) = RlimitResource::try_from(resource) {
+                    SyscallRequest::Prlimit {
+                        pid: if pid == 0 { None } else { Some(pid) },
+                        resource,
+                        new_limit: if new_limit == 0 {
+                            None
+                        } else {
+                            Some(Platform::RawConstPointer::from_usize(new_limit))
+                        },
+                        old_limit: if old_limit == 0 {
+                            None
+                        } else {
+                            Some(Platform::RawMutPointer::from_usize(old_limit))
+                        },
+                    }
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
+            }
             Sysno::arch_prctl => {
                 let code: u32 = ctx.syscall_arg(0).truncate();
                 if let Ok(code) = ArchPrctlCode::try_from(code) {
@@ -1521,6 +1828,15 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     ctx.syscall_arg(3).reinterpret_as_signed().truncate(),
                 ),
             },
+            #[cfg(target_arch = "x86")]
+            Sysno::fstatat64 => SyscallRequest::Fstatat64 {
+                dirfd: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                pathname: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
+                buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
+                flags: AtFlags::from_bits_truncate(
+                    ctx.syscall_arg(3).reinterpret_as_signed().truncate(),
+                ),
+            },
             Sysno::eventfd => SyscallRequest::Eventfd2 {
                 initval: ctx.syscall_arg(0).truncate(),
                 flags: EfdFlags::empty(),
@@ -1545,6 +1861,27 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 SyscallRequest::Clone {
                     args: Platform::RawConstPointer::from_usize(ctx.syscall_arg(0)),
                     ctx,
+                }
+            }
+            Sysno::set_robust_list => {
+                if ctx.syscall_arg(1) == size_of::<RobustListHead<Platform>>() {
+                    SyscallRequest::SetRobustList {
+                        head: ctx.syscall_arg(0),
+                    }
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
+            }
+            Sysno::get_robust_list => {
+                let pid = ctx.syscall_arg(0);
+                SyscallRequest::GetRobustList {
+                    pid: if pid == 0 {
+                        None
+                    } else {
+                        Some(pid.reinterpret_as_signed().truncate())
+                    },
+                    head: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+                    len: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
                 }
             }
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq => {

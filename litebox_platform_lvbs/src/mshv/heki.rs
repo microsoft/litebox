@@ -39,7 +39,9 @@ pub enum HekiKdataType {
     BlocklistHashes = 2,
     KernelInfo = 3,
     KernelData = 4,
-    KdataMax = 5,
+    PatchInfo = 5,
+    KexecTrampoline = 6,
+    KdataMax = 7,
     #[default]
     Unknown = 0xffff_ffff_ffff_ffff,
 }
@@ -136,7 +138,6 @@ impl HekiRange {
         HekiKdataType::try_from(attr).unwrap_or(HekiKdataType::Unknown)
     }
 
-    #[expect(dead_code)]
     #[inline]
     pub fn heki_kexec_type(&self) -> HekiKexecType {
         let attr = self.attributes;
