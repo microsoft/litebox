@@ -7,10 +7,11 @@
     any(target_arch = "x86_64", target_arch = "x86")
 ))]
 // use std::os::fd::{AsRawFd as _, FromRawFd as _};
-use std::sync::atomic::AtomicU32;
+use core::sync::atomic::AtomicU32;
 // use std::sync::atomic::Ordering::SeqCst;
-use std::time::Duration;
+use core::time::Duration;
 
+use litebox::fs::OFlags;
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
@@ -114,7 +115,7 @@ impl FreeBSDUserland {
             syscalls::syscall3(
                 syscalls::Sysno::Open,
                 c_path.as_ptr() as usize,
-                libc::O_RDONLY as usize,
+                OFlags::RDONLY.bits() as usize,
                 0,
             )
         };
@@ -421,7 +422,7 @@ impl litebox::platform::DebugLogProvider for FreeBSDUserland {
         let _ = unsafe {
             syscalls::syscall3(
                 syscalls::Sysno::Write,
-                libc::STDERR_FILENO as usize,
+                freebsd_types::STDERR_FILENO as usize,
                 msg.as_ptr() as usize,
                 msg.len(),
             )
@@ -561,8 +562,8 @@ impl litebox::platform::StdioProvider for FreeBSDUserland {
             syscalls::syscall3(
                 syscalls::Sysno::Write,
                 usize::try_from(match stream {
-                    litebox::platform::StdioOutStream::Stdout => libc::STDOUT_FILENO,
-                    litebox::platform::StdioOutStream::Stderr => libc::STDERR_FILENO,
+                    litebox::platform::StdioOutStream::Stdout => freebsd_types::STDOUT_FILENO,
+                    litebox::platform::StdioOutStream::Stderr => freebsd_types::STDERR_FILENO,
                 })
                 .unwrap(),
                 buf.as_ptr() as usize,

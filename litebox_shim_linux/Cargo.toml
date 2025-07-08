@@ -39,5 +39,5 @@ workspace = true
 
 [dev-dependencies]
 arrayvec = { version = "0.7.6", default-features = false }
-litebox_shim_linux = { path = ".", features = ["unstable-testing"] }
+litebox_shim_linux = { path = ".", default-features = false, features = ["unstable-testing"] }
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }

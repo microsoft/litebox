@@ -1,4 +1,10 @@
+#![allow(non_camel_case_types)]
+
 use bitflags;
+
+// pub const STDIN_FILENO: i32 = 0;
+pub const STDOUT_FILENO: i32 = 1;
+pub const STDERR_FILENO: i32 = 2;
 
 bitflags::bitflags! {
     /// Desired memory protection of a memory mapping.
