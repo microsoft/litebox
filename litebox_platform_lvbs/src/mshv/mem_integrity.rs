@@ -618,13 +618,15 @@ const INT3_INSN_OPCODE: u8 = 0xcc;
 const JMP8_INSN_SIZE: u8 = 2;
 const JMP32_INSN_SIZE: u8 = 5;
 
-/// This function validates an invocation of `text_poke_bp_batch` for patching jump labels.
-/// `text_poke_bp_batch` patches target opcode (1-5 bytes) with the following steps:
-/// - patch the first byte of a target with breakpoint (INT3) to stall others which attempt to execute it
-/// - patch all but the first byte with pre-computed opcode or right-sized NOP
-/// - patch the first byte with the actual one (and resume the stalled execution)
+/// This function validates an invocation of `text_poke_bp_batch` for jump label patching.
+/// `text_poke_bp_batch` patches target address (1-5 bytes) with the following steps:
+/// - patch the first byte of the target address with breakpoint (INT3) to prevent other cores from
+///   executing the address (Linux kernel assumes that one-byte write is atomic)
+/// - patch all but the first byte of the target address with actual code or right-sized NOP
+/// - patch the first byte with the actual code (and resume stalled execution)
 ///
-/// Each invocation does one of the above steps, so there are up to three invocations for each target opcode.
+/// Each invocation of `text_poke_bp_batch` does one of the steps with a portion of the code (1 or n-1 bytes),
+/// so there are up to three invocations for each target target address.
 /// Refer [Linux](https://elixir.bootlin.com/linux/v6.6.85/source/arch/x86/kernel/alternative.c#L2164)
 pub fn validate_text_poke_bp_batch(patch_data: &HekiPatch, precomputed_patch: &HekiPatch) -> bool {
     // step 1
@@ -662,7 +664,7 @@ pub fn validate_text_poke_bp_batch(patch_data: &HekiPatch, precomputed_patch: &H
     false
 }
 
-/// Thus function validates whether the patch data is valid for the given target
+/// This function checks whether the patch data is valid for a given target
 pub fn validate_text_patch(patch_data: &HekiPatch, precomputed_patch: &HekiPatch) -> bool {
     validate_text_poke_bp_batch(patch_data, precomputed_patch)
     // TODO: support other patching methods

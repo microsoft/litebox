@@ -1767,7 +1767,7 @@ impl PatchDataMap {
 
         // the buffer looks like below:
         // [`HekiPatchInfo`, [`HekiPatch`, ...], `HekiPatchInfo`, [`HekiPatch`, ...], ...]
-        // each `HekiPatchInfo` contains the number of `HekiPatch` structures that follow it.
+        // each `HekiPatchInfo` contains the number of `HekiPatch` structures (`patch_index`) that follow it.
         let mut index: usize = 0;
         while index <= patch_info_buf.len() - core::mem::size_of::<HekiPatchInfo>() {
             let patch_info = HekiPatchInfo::try_from_bytes(

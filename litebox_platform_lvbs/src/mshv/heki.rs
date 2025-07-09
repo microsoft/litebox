@@ -234,7 +234,7 @@ pub struct HekiPatch {
 pub const POKE_MAX_OPCODE_SIZE: usize = 5;
 
 impl HekiPatch {
-    /// Creates a new `HekiPatch` with the given buffer. Returns `None` if any field is invalid.
+    /// Creates a new `HekiPatch` with a given buffer. Returns `None` if any field is invalid.
     pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != core::mem::size_of::<HekiPatch>() {
             return None;
@@ -294,7 +294,7 @@ pub struct HekiPatchInfo {
 }
 
 impl HekiPatchInfo {
-    /// Creates a new `HekiPatchInfo` with the given buffer. Returns `None` if any field is invalid.
+    /// Creates a new `HekiPatchInfo` with a given buffer. Returns `None` if any field is invalid.
     pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != core::mem::size_of::<HekiPatchInfo>() {
             return None;
