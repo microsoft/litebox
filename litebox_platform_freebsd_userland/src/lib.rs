@@ -284,7 +284,7 @@ impl litebox::platform::RawMutexProvider for FreeBSDUserland {
     fn new_raw_mutex(&self) -> Self::RawMutex {
         RawMutex {
             inner: AtomicU32::new(0),
-            num_to_wake_up: AtomicU32::new(0),        
+            num_to_wake_up: AtomicU32::new(0),
         }
     }
 }
@@ -316,7 +316,7 @@ impl RawMutex {
         timeout: Option<Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
         use core::sync::atomic::Ordering::SeqCst;
-        
+
         // We immediately wake up (without even hitting syscalls) if we can clearly see that the
         // value is different.
         if self.inner.load(SeqCst) != val {
@@ -382,7 +382,10 @@ impl RawMutex {
                     None
                 } else if n & ((1 << 30) - 1) > 0 {
                     // There is a waker, and there is still capacity to wake up
-                    println!("There is a waker, and there is still capacity to wake up. n = 0x{:x}", n);
+                    println!(
+                        "There is a waker, and there is still capacity to wake up. n = 0x{:x}",
+                        n
+                    );
                     Some(n - 1)
                 } else {
                     // There is a waker, but capacity is gone
@@ -412,7 +415,7 @@ impl litebox::platform::RawMutex for RawMutex {
 
     fn wake_many(&self, n: usize) -> usize {
         use core::sync::atomic::Ordering::SeqCst;
-        
+
         assert!(n > 0);
         let n: u32 = n.try_into().unwrap();
 
@@ -423,7 +426,7 @@ impl litebox::platform::RawMutex for RawMutex {
         // For FreeBSD, we can't do the same requeue trick as Linux futex, nor can we infer
         // the actually woken up count, so we always clear the `num_to_wake_up` value
         // and let the kernel decide the number of threads to wake up.
-        
+
         // Set the number of waiters we want allowed to know that they can wake up, while
         // also grabbing the "lock bit"s.
         while self
@@ -447,7 +450,7 @@ impl litebox::platform::RawMutex for RawMutex {
         let num_woken_up = match umtx_op_operation_timeout(
             &self.num_to_wake_up,
             freebsd_types::UmtxOpOperation::UMTX_OP_WAKE,
-            n, // number of threads to wake
+            n,    // number of threads to wake
             None, // no timeout for wake operations
         ) {
             Ok(_) => n,  // todo(chuqi): always assume all were woken up on success returns.
@@ -457,8 +460,10 @@ impl litebox::platform::RawMutex for RawMutex {
         // Unlock the lock bits, allowing other wakers to run.
         let remain = n - num_woken_up;
 
-        println!("Woken up 0x{:x} threads, remaining to wake: 0x{:x}", 
-                    num_woken_up, remain);
+        println!(
+            "Woken up 0x{:x} threads, remaining to wake: 0x{:x}",
+            num_woken_up, remain
+        );
 
         while let Err(v) = self.num_to_wake_up.fetch_update(SeqCst, SeqCst, |v| {
             // Due to spurious or immediate wake-ups (i.e., unexpected wakeups that may decrease `num_to_wake_up`),
@@ -467,12 +472,18 @@ impl litebox::platform::RawMutex for RawMutex {
             // condition will be triggered.
             // The waker will spin until `num_to_wake_up` is decremented by the wait thread.
             if v & ((1 << 30) - 1) <= remain {
-                println!("Orig num_to_wake_up was 0x{:x}, setting to 0. remain = 0x{:x}", v, remain);
+                println!(
+                    "Orig num_to_wake_up was 0x{:x}, setting to 0. remain = 0x{:x}",
+                    v, remain
+                );
                 Some(0)
             } else {
                 // If the waker successfully woke up some threads, we just fall through here
                 // and wait for the wait thread to decrement the `num_to_wake_up` value.
-                println!("Orig num_to_wake_up was 0x{:x}. no change. remain = 0x{:x}", v, remain);
+                println!(
+                    "Orig num_to_wake_up was 0x{:x}. no change. remain = 0x{:x}",
+                    v, remain
+                );
                 None
             }
         }) {
@@ -615,18 +626,25 @@ fn umtx_op_operation_timeout(
             .unwrap();
         libc::timespec { tv_sec, tv_nsec }
     });
-    
+
     let (uaddr, uaddr2) = if let Some(ref ts) = timeout_spec {
         // When timeout is provided, uaddr must be size of timespec
-        (core::mem::size_of::<libc::timespec>(), ts as *const libc::timespec as usize)
+        (
+            core::mem::size_of::<libc::timespec>(),
+            ts as *const libc::timespec as usize,
+        )
     } else {
         (obj_ptr, 0)
     };
-    
+
     unsafe {
         syscalls::syscall5(
             syscalls::Sysno::UmtxOp,
-            if timeout_spec.is_some() { obj_ptr } else { uaddr },
+            if timeout_spec.is_some() {
+                obj_ptr
+            } else {
+                uaddr
+            },
             op as usize,
             val as usize,
             uaddr,
@@ -634,7 +652,6 @@ fn umtx_op_operation_timeout(
         )
     }
 }
-
 
 impl litebox::platform::RawPointerProvider for FreeBSDUserland {
     type RawConstPointer<T: Clone> = litebox::platform::trivial_providers::TransparentConstPtr<T>;
@@ -1011,8 +1028,8 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::AtomicU32;
-    use std::thread::sleep;
     use litebox::platform::{RawMutex, ThreadLocalStorageProvider as _};
+    use std::thread::sleep;
 
     use crate::FreeBSDUserland;
     use litebox::platform::{DebugLogProvider, PageManagementProvider};

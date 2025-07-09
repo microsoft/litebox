@@ -3,7 +3,7 @@
 //! This particular module itself is private, but defines all of the below within the public
 //! [`super::Errno`] type, so as to have them all be exposed, but still keep the auto-generated code
 //! restricted to this single file.
-//! 
+//!
 
 impl super::Errno {
     /// Human-friendly readable version of `self`.
@@ -309,12 +309,12 @@ impl super::Errno {
     pub const EOWNERDEAD: Self = Self::from_const(96);
     /// Integrity check failed
     pub const EINTEGRITY: Self = Self::from_const(97);
-    
+
     /// Resource temporarily unavailable (alias for EAGAIN)
     pub const EWOULDBLOCK: Self = Self::from_const(35);
     /// Operation not supported (alias for EOPNOTSUPP)
     pub const ENOTSUP: Self = Self::from_const(45);
-    
+
     /// The maximum supported Errno
     pub const MAX: Self = Self::from_const(97);
 }
