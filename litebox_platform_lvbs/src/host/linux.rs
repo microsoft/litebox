@@ -156,3 +156,11 @@ pub struct Kimage {
     // we do not need the rest of the fields for now
 }
 pub const KEXEC_SEGMENT_MAX: usize = 16;
+
+/// `list_head` from [Linux](https://elixir.bootlin.com/linux/v6.6.85/source/include/linux/types.h#L190)
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct ListHead {
+    pub next: *mut ListHead,
+    pub prev: *mut ListHead,
+}
