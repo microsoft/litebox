@@ -99,9 +99,7 @@ impl ElfLoaderMmap {
         // in which case the file is copied multiple times. To reduce the overhead, we
         // could convert some `mmap` calls to `mprotect` calls whenever possible.
         match crate::syscalls::mm::sys_mmap(
-            // A default low address is used for the binary (which grows upwards) to avoid
-            // conflicts with the kernel's memory mappings (which grows downwards).
-            addr.unwrap_or(0x1000_0000),
+            addr.unwrap_or(super::DEFAULT_LOW_ADDR),
             len,
             litebox_common_linux::ProtFlags::from_bits_truncate(prot.bits()),
             litebox_common_linux::MapFlags::from_bits(flags.bits()).expect("unsupported flags"),
@@ -146,6 +144,16 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
         fd: Option<i32>,
         need_copy: &mut bool,
     ) -> elf_loader::Result<NonNull<core::ffi::c_void>> {
+        #[cfg(debug_assertions)]
+        crate::syscalls::log_println!(
+            "ElfLoaderMmap::mmap(addr: {:x?}, len: {}, prot: {:x?}, flags: {:x?}, offset: {}, fd: {:?})",
+            addr,
+            len,
+            prot.bits(),
+            flags.bits(),
+            offset,
+            fd
+        );
         let ptr = if let Some(fd) = fd {
             Self::do_mmap_file(addr, len, prot, flags, fd, offset)?
         } else {
