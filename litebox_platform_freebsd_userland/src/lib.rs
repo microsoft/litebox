@@ -209,6 +209,15 @@ impl FreeBSDUserland {
         reserved_pages
     }
 
+    fn get_user_info() -> litebox_common_linux::Credentials {
+        litebox_common_linux::Credentials {
+            uid: unsafe { syscalls::syscall0(syscalls::Sysno::Getuid) }.expect("getuid failed"),
+            euid: unsafe { syscalls::syscall0(syscalls::Sysno::Geteuid) }.expect("geteuid failed"),
+            gid: unsafe { syscalls::syscall0(syscalls::Sysno::Getgid) }.expect("getgid failed"),
+            egid: unsafe { syscalls::syscall0(syscalls::Sysno::Getegid) }.expect("getegid failed"),
+        }
+    }
+
     fn set_init_tls(&self) {
         let mut tid: isize = 0;
         unsafe {
@@ -220,6 +229,7 @@ impl FreeBSDUserland {
             tid: i32::try_from(tid).expect("tid should fit in i32"),
             clear_child_tid: None,
             robust_list: None,
+            credentials: alloc::sync::Arc::new(Self::get_user_info()),
         });
 
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
