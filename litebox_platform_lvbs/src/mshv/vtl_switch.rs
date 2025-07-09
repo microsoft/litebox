@@ -3,8 +3,8 @@
 use crate::{
     kernel_context::get_per_core_kernel_context,
     mshv::{
-        VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL,
-        vsm::{NUM_VTLCALL_PARAMS, VSMFunction, vsm_dispatch},
+        VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction,
+        vsm::{NUM_VTLCALL_PARAMS, vsm_dispatch},
         vsm_intercept::vsm_handle_intercept,
     },
 };
@@ -245,9 +245,9 @@ fn vtl_switch_loop() -> ! {
             #[allow(clippy::cast_sign_loss)]
             VtlEntryReason::VtlCall => {
                 let params = kernel_context.vtl0_state.get_vtlcall_params();
-                if VSMFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
-                    .unwrap_or(VSMFunction::Unknown)
-                    == VSMFunction::Unknown
+                if VsmFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
+                    .unwrap_or(VsmFunction::Unknown)
+                    == VsmFunction::Unknown
                 {
                     todo!("unknown function ID = {:#x}", params[0]);
                 } else {

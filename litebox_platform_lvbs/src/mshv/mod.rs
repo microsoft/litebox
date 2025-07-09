@@ -111,6 +111,26 @@ pub const VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT: u32 = 0x1_ffe7;
 pub const VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE: u32 = 0x1_ffe8;
 pub const VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY: u32 = 0x1_ffe9;
 pub const VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE: u32 = 0x1_ffea;
+pub const VSM_VTL_CALL_FUNC_ID_PATCH_TEXT: u32 = 0x1_ffeb;
+
+/// VSM Functions
+#[derive(Debug, PartialEq, TryFromPrimitive)]
+#[repr(u32)]
+pub enum VsmFunction {
+    EnableAPsVtl = VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL,
+    BootAPs = VSM_VTL_CALL_FUNC_ID_BOOT_APS,
+    LockRegs = VSM_VTL_CALL_FUNC_ID_LOCK_REGS,
+    SignalEndOfBoot = VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT,
+    ProtectMemory = VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY,
+    LoadKData = VSM_VTL_CALL_FUNC_ID_LOAD_KDATA,
+    ValidateModule = VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE,
+    FreeModuleInit = VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT,
+    UnloadModule = VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE,
+    CopySecondaryKey = VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY,
+    KexecValidate = VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE,
+    PatchText = VSM_VTL_CALL_FUNC_ID_PATCH_TEXT,
+    Unknown = 0xffff_ffff,
+}
 
 pub const MSR_EFER: u32 = 0xc000_0080;
 pub const MSR_STAR: u32 = 0xc000_0081;
