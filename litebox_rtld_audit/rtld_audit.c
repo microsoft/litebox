@@ -147,8 +147,8 @@ void print_hex(uint64_t data) {
 #endif
 }
 
-/// @brief Set the syscall entry point, obtained from the trampoline section in
-/// the main binary.
+/// @brief Parse the main object (the executable binary) to find the syscall entry
+/// point and the interpreter path.
 ///
 /// Different from the elf loader in the `litebox_shim_linux` crate, this
 /// function does not read the trampoline section from the section headers
@@ -291,9 +291,6 @@ unsigned int la_objopen(struct link_map *map,
     }
 
     const uint64_t *tramp = (const uint64_t *)tramp_addr;
-    // printf("[audit] trampoline addr=0x%lx size=0x%lx\n", tramp_addr,
-    // tramp_size);
-
     if (tramp[0] != TRAMP_MAGIC) {
       syscall_print("[audit] invalid trampoline magic\n", 33);
       break;
