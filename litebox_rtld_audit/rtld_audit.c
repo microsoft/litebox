@@ -28,6 +28,7 @@
 
 typedef long (*syscall_stub_t)(void);
 static syscall_stub_t syscall_entry = 0;
+static char interp[256] = {0}; // Buffer for interpreter path
 
 #ifdef DEBUG
 #define syscall_print(str, len)                                                \
@@ -105,6 +106,18 @@ int strcmp(const char *s1, const char *s2) {
   return *(unsigned char *)s1 - *(unsigned char *)s2;
 }
 
+char *strncpy(char *dest, const char *src, size_t n) {
+  char *d = dest;
+  const char *s = src;
+  while (n-- && *s) {
+    *d++ = *s++;
+  }
+  while (n--) {
+    *d++ = '\0';
+  }
+  return dest;
+}
+
 static uint64_t read_u64(const void *p) {
   uint64_t v;
   __builtin_memcpy(&v, p, 8);
@@ -144,7 +157,7 @@ void print_hex(uint64_t data) {
 /// can read the trampoline section from the end of the binary. The trampoline
 /// section is expected to contain a magic number and the address of the syscall
 /// entry point.
-int set_syscall_entry(const struct link_map *map) {
+int parse_main_object(const struct link_map *map) {
   unsigned long max_addr = 0;
   Elf64_Ehdr *eh = (Elf64_Ehdr *)map->l_addr;
   if (memcmp(eh->e_ident,
@@ -161,6 +174,10 @@ int set_syscall_entry(const struct link_map *map) {
       if (vaddr_end > max_addr) {
         max_addr = vaddr_end;
       }
+    } else if (phdrs[i].p_type == PT_INTERP) {
+      strncpy(interp, (char *)map->l_addr + phdrs[i].p_vaddr,
+              sizeof(interp) - 1);
+      interp[sizeof(interp) - 1] = '\0'; // Ensure null termination
     }
   }
   max_addr = align_up(max_addr, 0x1000);
@@ -182,11 +199,15 @@ unsigned int la_objopen(struct link_map *map,
 
   if (!path || path[0] == '\0') {
     // main binary should be called first
-    set_syscall_entry(map);
+    parse_main_object(map);
     syscall_print("[audit] main binary is patched by libOS\n", 40);
+    syscall_print("[audit] interp=", 15);
+    syscall_print(interp, sizeof(interp) - 1);
+    syscall_print("\n", 1);
     return 0; // main binary is patched by libOS
-  } else if (strcmp(path, "/lib64/ld-linux-x86-64.so.2") == 0) {
-    syscall_print("[audit] /lib64/ld-linux-x86-64.so.2 is patched by libOS\n", 56);
+  }
+  if (strcmp(path, interp) == 0) {
+    syscall_print("[audit] ld-*.so is patched by libOS\n", 36);
     return 0; // ld.so is patched by libOS
   } else {
     // print path
