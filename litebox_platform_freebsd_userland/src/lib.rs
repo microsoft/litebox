@@ -362,7 +362,6 @@ impl RawMutex {
             ) {
                 Ok(0) => {
                     // Fallthrough: check if spurious.
-                    println!("UMTX_OP_WAIT_UINT returned 0, checking for spurious wake-up");
                 }
                 Err(e) if e == i32::from(errno::Errno::EAGAIN) as isize => {
                     // A wake-up was already in progress when we attempted to wait. Has someone
@@ -388,18 +387,12 @@ impl RawMutex {
             match self.num_to_wake_up.fetch_update(SeqCst, SeqCst, |n| {
                 if n & (1 << 31) == 0 {
                     // No waker in play, do nothing to the value
-                    println!("No waker in play. n = 0x{:x}", n);
                     None
                 } else if n & ((1 << 30) - 1) > 0 {
                     // There is a waker, and there is still capacity to wake up
-                    println!(
-                        "There is a waker, and there is still capacity to wake up. n = 0x{:x}",
-                        n
-                    );
                     Some(n - 1)
                 } else {
                     // There is a waker, but capacity is gone
-                    println!("There is a waker, but capacity is gone. n = 0x{:x}", n);
                     None
                 }
             }) {
@@ -448,13 +441,6 @@ impl litebox::platform::RawMutex for RawMutex {
             // until the other waker is done with their job and brings the value down.
             core::hint::spin_loop();
         }
-
-        println!(
-            "Waking up 0x{:x} threads, setting 'num_to_wake_up' to 0x{:x}",
-            n,
-            n | (0b11 << 30)
-        );
-
         // Now we can actually wake them up using FreeBSD's umtx_op and it always returns 0
         // on success, so we cannot ask the kernel how many were woken up.
         let num_woken_up = match umtx_op_operation_timeout(
@@ -470,11 +456,6 @@ impl litebox::platform::RawMutex for RawMutex {
         // Unlock the lock bits, allowing other wakers to run.
         let remain = n - num_woken_up;
 
-        println!(
-            "Woken up 0x{:x} threads, remaining to wake: 0x{:x}",
-            num_woken_up, remain
-        );
-
         while let Err(v) = self.num_to_wake_up.fetch_update(SeqCst, SeqCst, |v| {
             // Due to spurious or immediate wake-ups (i.e., unexpected wakeups that may decrease `num_to_wake_up`),
             // `num_to_wake_up` might end up being less than expected. Thus, we check `<=` rather than `==`.
@@ -482,18 +463,10 @@ impl litebox::platform::RawMutex for RawMutex {
             // condition will be triggered.
             // The waker will spin until `num_to_wake_up` is decremented by the wait thread.
             if v & ((1 << 30) - 1) <= remain {
-                println!(
-                    "Orig num_to_wake_up was 0x{:x}, setting to 0. remain = 0x{:x}",
-                    v, remain
-                );
                 Some(0)
             } else {
                 // If the waker successfully woke up some threads, we just fall through here
                 // and wait for the wait thread to decrement the `num_to_wake_up` value.
-                println!(
-                    "Orig num_to_wake_up was 0x{:x}. no change. remain = 0x{:x}",
-                    v, remain
-                );
                 None
             }
         }) {
