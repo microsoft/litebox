@@ -6,7 +6,7 @@
     target_os = "freebsd",
     any(target_arch = "x86_64", target_arch = "x86")
 ))]
-use core::num;
+// use core::num;
 // use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use core::sync::atomic::AtomicU32;
 // use std::sync::atomic::Ordering::SeqCst;
@@ -24,6 +24,8 @@ use litebox_common_linux::{ProtFlags, PunchthroughSyscall};
 
 pub mod syscall_raw;
 use syscall_raw::syscalls;
+
+pub mod errno;
 
 mod freebsd_types;
 // todo(chuqi): we do not use systrap for now as there's no sccomp interception on FreeBSD.
@@ -282,7 +284,7 @@ impl litebox::platform::RawMutexProvider for FreeBSDUserland {
     fn new_raw_mutex(&self) -> Self::RawMutex {
         RawMutex {
             inner: AtomicU32::new(0),
-            num_to_wake_up: AtomicU32::new(0),
+            num_to_wake_up: AtomicU32::new(0),        
         }
     }
 }
@@ -352,8 +354,7 @@ impl RawMutex {
                     // Fallthrough: check if spurious.
                     println!("UMTX_OP_WAIT_UINT returned 0, checking for spurious wake-up");
                 }
-                // todo(chuqi): don't use magic numbers here
-                Err(-35) => { // EAGAIN equivalent on FreeBSD
+                Err(e) if e == i32::from(errno::Errno::EAGAIN) as isize => {
                     // A wake-up was already in progress when we attempted to wait. Has someone
                     // already touched inner value? We only check this on the first time around,
                     // anything else could be a true wake.
@@ -419,8 +420,9 @@ impl litebox::platform::RawMutex for RawMutex {
         // be good enough, but makes sure we are not clobbering the "lock bits".
         let n = n.min((1 << 30) - 1);
 
-        // For FreeBSD, we can't do the same requeue trick as Linux futex, so we implement
-        // a simpler version that directly sets the wake count and wakes threads
+        // For FreeBSD, we can't do the same requeue trick as Linux futex, nor can we infer
+        // the actually woken up count, so we always clear the `num_to_wake_up` value
+        // and let the kernel decide the number of threads to wake up.
         
         // Set the number of waiters we want allowed to know that they can wake up, while
         // also grabbing the "lock bit"s.
@@ -440,19 +442,19 @@ impl litebox::platform::RawMutex for RawMutex {
             n | (0b11 << 30)
         );
 
-        // Now we can actually wake them up using FreeBSD's umtx_op
-        let _ = match umtx_op_operation_timeout(
+        // Now we can actually wake them up using FreeBSD's umtx_op and it always returns 0
+        // on success, so we cannot ask the kernel how many were woken up.
+        let num_woken_up = match umtx_op_operation_timeout(
             &self.num_to_wake_up,
             freebsd_types::UmtxOpOperation::UMTX_OP_WAKE,
             n, // number of threads to wake
             None, // no timeout for wake operations
         ) {
-            Ok(woken) => core::cmp::min(n, u32::try_from(woken).unwrap_or(0)),
+            Ok(_) => n,  // todo(chuqi): always assume all were woken up on success returns.
             Err(_) => 0, // If wake fails, assume 0 were woken
         };
 
         // Unlock the lock bits, allowing other wakers to run.
-        let num_woken_up = 1;
         let remain = n - num_woken_up;
 
         println!("Woken up 0x{:x} threads, remaining to wake: 0x{:x}", 
@@ -461,10 +463,15 @@ impl litebox::platform::RawMutex for RawMutex {
         while let Err(v) = self.num_to_wake_up.fetch_update(SeqCst, SeqCst, |v| {
             // Due to spurious or immediate wake-ups (i.e., unexpected wakeups that may decrease `num_to_wake_up`),
             // `num_to_wake_up` might end up being less than expected. Thus, we check `<=` rather than `==`.
+            // If some threads are successfully woken up, `num_to_wake_up` should be larger than remain, the `else`
+            // condition will be triggered.
+            // The waker will spin until `num_to_wake_up` is decremented by the wait thread.
             if v & ((1 << 30) - 1) <= remain {
                 println!("Orig num_to_wake_up was 0x{:x}, setting to 0. remain = 0x{:x}", v, remain);
                 Some(0)
             } else {
+                // If the waker successfully woke up some threads, we just fall through here
+                // and wait for the wait thread to decrement the `num_to_wake_up` value.
                 println!("Orig num_to_wake_up was 0x{:x}. no change. remain = 0x{:x}", v, remain);
                 None
             }
