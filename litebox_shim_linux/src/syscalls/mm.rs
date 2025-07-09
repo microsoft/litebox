@@ -1,7 +1,9 @@
 //! Implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
 
 use litebox::{
-    mm::linux::{MappingError, PAGE_SIZE, VmemUnmapError},
+    mm::linux::{
+        CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmemUnmapError,
+    },
     platform::{RawConstPointer, RawMutPointer, page_mgmt::DeallocationError},
 };
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
@@ -24,30 +26,44 @@ fn align_down(addr: usize, align: usize) -> usize {
 }
 
 fn do_mmap(
-    addr: Option<usize>,
+    suggested_addr: Option<usize>,
     len: usize,
     prot: ProtFlags,
     flags: MapFlags,
+    ensure_space_after: bool,
     op: impl FnOnce(MutPtr<u8>) -> Result<usize, MappingError>,
 ) -> Result<MutPtr<u8>, MappingError> {
-    let fixed_addr = flags.contains(MapFlags::MAP_FIXED);
-    let populate_pages = flags.contains(MapFlags::MAP_POPULATE);
-    let suggested_addr = addr.unwrap_or(0);
-    let suggested_range = litebox::mm::linux::PageRange::new(suggested_addr, suggested_addr + len)
-        .ok_or(MappingError::UnAligned)?;
+    let flags = {
+        let mut create_flags = CreatePagesFlags::empty();
+        create_flags.set(
+            CreatePagesFlags::FIXED_ADDR,
+            flags.contains(MapFlags::MAP_FIXED),
+        );
+        create_flags.set(
+            CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+            flags.contains(MapFlags::MAP_POPULATE),
+        );
+        create_flags.set(CreatePagesFlags::ENSURE_SPACE_AFTER, ensure_space_after);
+        create_flags
+    };
+    let suggested_addr = match suggested_addr {
+        Some(addr) => Some(NonZeroAddress::new(addr).ok_or(MappingError::UnAligned)?),
+        None => None,
+    };
+    let length = NonZeroPageSize::new(len).ok_or(MappingError::UnAligned)?;
     let pm = litebox_page_manager();
     match prot {
         ProtFlags::PROT_READ_EXEC => unsafe {
-            pm.create_executable_pages(suggested_range, fixed_addr, populate_pages, op)
+            pm.create_executable_pages(suggested_addr, length, flags, op)
         },
         ProtFlags::PROT_READ_WRITE => unsafe {
-            pm.create_writable_pages(suggested_range, fixed_addr, populate_pages, op)
+            pm.create_writable_pages(suggested_addr, length, flags, op)
         },
         ProtFlags::PROT_READ => unsafe {
-            pm.create_readable_pages(suggested_range, fixed_addr, populate_pages, op)
+            pm.create_readable_pages(suggested_addr, length, flags, op)
         },
         ProtFlags::PROT_NONE => unsafe {
-            pm.create_inaccessible_pages(suggested_range, fixed_addr, populate_pages, op)
+            pm.create_inaccessible_pages(suggested_addr, length, flags, op)
         },
         _ => todo!("Unsupported prot flags {:?}", prot),
     }
@@ -60,7 +76,7 @@ fn do_mmap_anonymous(
     flags: MapFlags,
 ) -> Result<MutPtr<u8>, MappingError> {
     let op = |_| Ok(0);
-    do_mmap(suggested_addr, len, prot, flags, op)
+    do_mmap(suggested_addr, len, prot, flags, false, op)
 }
 
 fn do_mmap_file(
@@ -98,7 +114,17 @@ fn do_mmap_file(
         }
         Ok(copied)
     };
-    do_mmap(suggested_addr, len, prot, flags, op)
+    let fixed_addr = flags.contains(MapFlags::MAP_FIXED);
+    do_mmap(
+        suggested_addr,
+        len,
+        prot,
+        flags,
+        // Note we need to ensure that the space after the mapping is available
+        // so that we could load trampoline code right after the mapping.
+        offset == 0 && !fixed_addr,
+        op,
+    )
 }
 
 /// Handle syscall `mmap`
