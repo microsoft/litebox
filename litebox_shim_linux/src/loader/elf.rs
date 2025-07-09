@@ -145,7 +145,8 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
         need_copy: &mut bool,
     ) -> elf_loader::Result<NonNull<core::ffi::c_void>> {
         #[cfg(debug_assertions)]
-        crate::syscalls::log_println!(
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
             "ElfLoaderMmap::mmap(addr: {:x?}, len: {}, prot: {:x?}, flags: {:x?}, offset: {}, fd: {:?})",
             addr,
             len,
