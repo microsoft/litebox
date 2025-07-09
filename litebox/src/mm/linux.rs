@@ -114,6 +114,17 @@ impl<const ALIGN: usize> IntoIterator for PageRange<ALIGN> {
     }
 }
 
+impl<const ALIGN: usize> From<PageRange<ALIGN>>
+    for (NonZeroAddress<ALIGN>, NonZeroPageSize<ALIGN>)
+{
+    fn from(val: PageRange<ALIGN>) -> Self {
+        (
+            NonZeroAddress::new(val.start).unwrap(),
+            NonZeroPageSize::new(val.len()).unwrap(),
+        )
+    }
+}
+
 impl<const ALIGN: usize> PageRange<ALIGN> {
     /// Create a new [`PageRange`].
     ///
