@@ -128,7 +128,7 @@ fn do_mmap_file(
 }
 
 /// Handle syscall `mmap`
-pub(crate) fn sys_mmap(
+pub fn sys_mmap(
     addr: usize,
     len: usize,
     prot: ProtFlags,

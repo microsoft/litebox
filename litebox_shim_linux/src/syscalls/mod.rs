@@ -3,7 +3,7 @@
 pub(crate) mod eventfd;
 pub mod file;
 pub(crate) mod misc;
-pub(crate) mod mm;
+pub mod mm;
 pub(crate) mod net;
 pub(crate) mod process;
 
@@ -33,3 +33,18 @@ macro_rules! common_functions_for_file_status {
 }
 
 pub(crate) use common_functions_for_file_status;
+
+#[cfg(debug_assertions)]
+macro_rules! log_println {
+    ($($tt:tt)*) => {{
+        use core::fmt::Write;
+        let mut t: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
+        writeln!(t, $($tt)*).unwrap();
+        litebox::platform::DebugLogProvider::debug_log_print(
+            litebox_platform_multiplex::platform(),
+            t.as_str(),
+        );
+    }};
+}
+#[cfg(debug_assertions)]
+pub(crate) use log_println;
