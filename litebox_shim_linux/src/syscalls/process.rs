@@ -289,6 +289,8 @@ pub(crate) fn sys_clone(
     }
 
     let platform = litebox_platform_multiplex::platform();
+    let credentials =
+        platform.with_thread_local_storage_mut(|tls| tls.current_task.credentials.clone());
     let child_tid = unsafe {
         platform.spawn_thread(
             ctx,
@@ -310,6 +312,7 @@ pub(crate) fn sys_clone(
                         None
                     },
                     robust_list: None,
+                    credentials,
                 }),
                 callback: new_thread_callback,
             }),
@@ -437,6 +440,30 @@ pub(crate) fn sys_get_robust_list(
         tls.current_task.robust_list.map_or(0, |ptr| ptr.as_usize())
     });
     unsafe { head_ptr.write_at_offset(0, head) }.ok_or(Errno::EFAULT)
+}
+
+/// Handle syscall `getuid`.
+pub(crate) fn sys_getuid() -> usize {
+    litebox_platform_multiplex::platform()
+        .with_thread_local_storage_mut(|tls| tls.current_task.credentials.uid)
+}
+
+/// Handle syscall `geteuid`.
+pub(crate) fn sys_geteuid() -> usize {
+    litebox_platform_multiplex::platform()
+        .with_thread_local_storage_mut(|tls| tls.current_task.credentials.euid)
+}
+
+/// Handle syscall `getgid`.
+pub(crate) fn sys_getgid() -> usize {
+    litebox_platform_multiplex::platform()
+        .with_thread_local_storage_mut(|tls| tls.current_task.credentials.gid)
+}
+
+/// Handle syscall `getegid`.
+pub(crate) fn sys_getegid() -> usize {
+    litebox_platform_multiplex::platform()
+        .with_thread_local_storage_mut(|tls| tls.current_task.credentials.egid)
 }
 
 #[cfg(test)]
@@ -569,10 +596,17 @@ mod tests {
             esp: 0,
             xss: 0x2b, // __USER_DS
         };
-        crate::syscalls::tests::log_println!("stack allocated at: {:#x}", stack.as_usize());
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "stack allocated at: {:#x}",
+            stack.as_usize()
+        );
         let main: fn() = || {
             let tid = super::sys_gettid();
-            crate::syscalls::tests::log_println!("Child started {tid}");
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "Child started {tid}"
+            );
 
             #[cfg(target_arch = "x86_64")]
             {
@@ -596,7 +630,11 @@ mod tests {
                 tid,
                 "Child TID should match sys_gettid result"
             );
-            crate::syscalls::tests::log_println!("Child TID: {}", unsafe { CHILD_TID });
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "Child TID: {}",
+                unsafe { CHILD_TID }
+            );
             super::sys_exit(0);
         };
 
@@ -635,7 +673,11 @@ mod tests {
             main as usize,
         )
         .expect("sys_clone failed");
-        crate::syscalls::tests::log_println!("sys_clone returned: {}", result);
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "sys_clone returned: {}",
+            result
+        );
         assert!(result > 0, "sys_clone should return a positive PID");
         assert_eq!(
             unsafe { parent_tid.assume_init() } as usize,
