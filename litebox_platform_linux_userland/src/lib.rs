@@ -208,18 +208,6 @@ impl LinuxUserland {
             )
         };
         let Ok(fd) = fd else {
-            #[cfg(test)]
-            {
-                // Due to retrict permissions in CI, we cannot read `/proc/self/maps`.
-                // To pass CI, we rely on `getauxval` (which we should avoid #142) to get the VDSO
-                // address when failing to read `/proc/self/maps`.
-                let vdso_address = unsafe { libc::getauxval(libc::AT_SYSINFO_EHDR) };
-                return (
-                    alloc::vec::Vec::new(),
-                    Some(usize::try_from(vdso_address).unwrap()),
-                );
-            }
-            #[cfg(not(test))]
             return (alloc::vec::Vec::new(), None);
         };
         let mut buf = [0u8; 8192];
@@ -1627,7 +1615,7 @@ mod tests {
     use core::sync::atomic::AtomicU32;
     use std::thread::sleep;
 
-    use litebox::platform::{RawMutex, SystemInfoProvider as _, ThreadLocalStorageProvider as _};
+    use litebox::platform::{RawMutex, ThreadLocalStorageProvider as _};
 
     use crate::LinuxUserland;
     use litebox::platform::PageManagementProvider;
@@ -1663,20 +1651,6 @@ mod tests {
             assert!(page.end > page.start);
             prev = page.end;
         }
-    }
-
-    #[test]
-    fn test_vdso_address() {
-        let platform = LinuxUserland::new(None);
-        let vdso_address = platform.get_vdso_address();
-        assert!(vdso_address.is_some(), "VDSO address should be set");
-
-        let vdso_addr_auxv = unsafe { libc::getauxval(libc::AT_SYSINFO_EHDR) };
-        assert_eq!(
-            vdso_address.unwrap(),
-            usize::try_from(vdso_addr_auxv).unwrap(),
-            "VDSO address should match the one from getauxval"
-        );
     }
 
     #[test]

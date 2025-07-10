@@ -428,6 +428,18 @@ impl ElfLoader {
 
         if let Some(vdso_base) = litebox_platform_multiplex::platform().get_vdso_address() {
             aux.insert(AuxKey::AT_SYSINFO_EHDR, vdso_base);
+        } else {
+            #[cfg(feature = "unstable-testing")]
+            {
+                // Due to retrict permissions in CI, we cannot read `/proc/self/maps`.
+                // To pass CI, we rely on `getauxval` (which we should avoid #142) to get the VDSO
+                // address when failing to read `/proc/self/maps`.
+                let vdso_address = unsafe { libc::getauxval(libc::AT_SYSINFO_EHDR) };
+                aux.insert(
+                    AuxKey::AT_SYSINFO_EHDR,
+                    usize::try_from(vdso_address).unwrap(),
+                );
+            }
         }
 
         let sp = unsafe {
