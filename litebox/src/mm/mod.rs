@@ -475,7 +475,7 @@ where
     /// It is highly recommended to minimize the use of this function and to prefer safer alternatives
     /// whenever possible. If this function must be used, ensure that the memory region is locked down
     /// and access is strictly controlled.
-    pub unsafe fn make_pages_rw_exec(
+    pub unsafe fn make_pages_rwx(
         &self,
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
