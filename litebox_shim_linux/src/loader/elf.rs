@@ -426,10 +426,9 @@ impl ElfLoader {
         aux.insert(AuxKey::AT_GID, user_info.gid);
         aux.insert(AuxKey::AT_EGID, user_info.egid);
 
-        let Some(vdso_base) = litebox_platform_multiplex::platform().get_vdso_address() else {
-            todo!("map vdso and get its base addr");
-        };
-        aux.insert(AuxKey::AT_SYSINFO_EHDR, vdso_base);
+        if let Some(vdso_base) = litebox_platform_multiplex::platform().get_vdso_address() {
+            aux.insert(AuxKey::AT_SYSINFO_EHDR, vdso_base);
+        }
 
         let sp = unsafe {
             let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
