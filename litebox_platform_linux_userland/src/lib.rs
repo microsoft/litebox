@@ -208,6 +208,18 @@ impl LinuxUserland {
             )
         };
         let Ok(fd) = fd else {
+            #[cfg(test)]
+            {
+                // Due to retrict permissions in CI, we cannot read `/proc/self/maps`.
+                // To pass CI, we rely on `getauxval` (which we should avoid #142) to get the VDSO
+                // address when failing to read `/proc/self/maps`.
+                let vdso_address = unsafe { libc::getauxval(libc::AT_SYSINFO_EHDR) };
+                return (
+                    alloc::vec::Vec::new(),
+                    Some(usize::try_from(vdso_address).unwrap()),
+                );
+            }
+            #[cfg(not(test))]
             return (alloc::vec::Vec::new(), None);
         };
         let mut buf = [0u8; 8192];
