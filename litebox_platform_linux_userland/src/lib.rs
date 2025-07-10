@@ -147,7 +147,7 @@ impl LinuxUserland {
             })
             .into();
 
-        let (reserved_pages, vdso_address) = Self::read_proc_self_maps();
+        let (reserved_pages, vdso_address) = Self::read_maps_and_vdso();
         let platform = Self {
             tun_socket_fd,
             #[cfg(feature = "systrap_backend")]
@@ -192,7 +192,7 @@ impl LinuxUserland {
         syscall_intercept::init_sys_intercept();
     }
 
-    fn read_proc_self_maps() -> (alloc::vec::Vec<core::ops::Range<usize>>, Option<usize>) {
+    fn read_maps_and_vdso() -> (alloc::vec::Vec<core::ops::Range<usize>>, Option<usize>) {
         // TODO: this function is not guaranteed to return all allocated pages, as it may
         // allocate more pages after the mapping file is read. Missing allocated pages may
         // cause the program to crash when calling `mmap` or `mremap` with the `MAP_FIXED` flag later.
