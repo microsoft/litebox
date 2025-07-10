@@ -434,11 +434,20 @@ impl ElfLoader {
                 // Due to retrict permissions in CI, we cannot read `/proc/self/maps`.
                 // To pass CI, we rely on `getauxval` (which we should avoid #142) to get the VDSO
                 // address when failing to read `/proc/self/maps`.
-                let vdso_address = unsafe { libc::getauxval(libc::AT_SYSINFO_EHDR) };
-                aux.insert(
-                    AuxKey::AT_SYSINFO_EHDR,
-                    usize::try_from(vdso_address).unwrap(),
-                );
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let vdso_address = unsafe { libc::getauxval(libc::AT_SYSINFO_EHDR) };
+                    aux.insert(
+                        AuxKey::AT_SYSINFO_EHDR,
+                        usize::try_from(vdso_address).unwrap(),
+                    );
+                }
+                #[cfg(target_arch = "x86")]
+                {
+                    // AT_SYSINFO = 32
+                    let vdso_address = unsafe { libc::getauxval(32) };
+                    aux.insert(AuxKey::AT_SYSINFO, usize::try_from(vdso_address).unwrap());
+                }
             }
         }
 
