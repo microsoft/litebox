@@ -431,7 +431,7 @@ impl ElfLoader {
         } else {
             #[cfg(feature = "unstable-testing")]
             {
-                // Due to retrict permissions in CI, we cannot read `/proc/self/maps`.
+                // Due to restrict permissions in CI, we cannot read `/proc/self/maps`.
                 // To pass CI, we rely on `getauxval` (which we should avoid #142) to get the VDSO
                 // address when failing to read `/proc/self/maps`.
                 #[cfg(target_arch = "x86_64")]
