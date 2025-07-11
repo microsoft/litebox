@@ -133,27 +133,20 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
     let control_transfer_targets =
         get_control_transfer_targets(arch, &builder, &text_sections).unwrap();
 
-    let executable_segment = {
-        let mut s: Vec<_> = builder
+    let first_executable_segment_id = {
+        let s: Vec<_> = builder
             .segments
             .iter()
             .filter(|seg| seg.p_flags & object::elf::PF_X != 0)
             .collect();
-        if s.len() != 1 {
-            unimplemented!()
+        if s.is_empty() {
+            return Err(Error::NoTextSectionFound);
         }
-        s.pop().unwrap().id()
+        s[0].id()
     };
-    assert!(text_sections.iter().all(|s| {
-        builder
-            .segments
-            .get(executable_segment)
-            .sections
-            .contains(s)
-    }));
     builder
         .segments
-        .get_mut(executable_segment)
+        .get_mut(first_executable_segment_id)
         .append_section(builder.sections.get_mut(trampoline_section));
 
     let trampoline_base_addr = find_addr_for_trampoline_code(&builder);
@@ -205,7 +198,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
         object::build::elf::SectionData::Data(trampoline_vec.into());
     builder
         .segments
-        .get_mut(executable_segment)
+        .get_mut(first_executable_segment_id)
         .recalculate_ranges(&builder.sections);
 
     let mut out = vec![];
