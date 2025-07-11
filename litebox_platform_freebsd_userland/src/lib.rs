@@ -68,16 +68,6 @@ impl FreeBSDUserland {
         );
     }
 
-    /// Enable seccomp syscall interception on the platform.
-    ///
-    /// # Panics
-    ///
-    /// Panics if this function has already been invoked on the platform earlier.
-    pub fn enable_seccomp_based_syscall_interception(&self) {
-        // todo(chuqi): we do not support seccomp for FreeBSD
-        unimplemented!("seccomp interception is not supported on FreeBSD");
-    }
-
     fn read_proc_self_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
         // TODO: this function is same as the on in LinuxUserland and might have
         // similar issues to be resolved.
