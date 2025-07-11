@@ -32,7 +32,6 @@ static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::R
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
 /// traits.
-#[allow(dead_code)]
 pub struct FreeBSDUserland {
     /// Reserved pages that are not available for guest programs to use.
     reserved_pages: Vec<core::ops::Range<usize>>,
