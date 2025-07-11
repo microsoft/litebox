@@ -38,23 +38,23 @@ bitflags::bitflags! {
         /// don't use a file (FreeBSD uses MAP_ANON)
         const MAP_ANON = 0x1000;
         /// Synonym for [`MAP_ANON`] (FreeBSD style)
-        const MAP_ANONYMOUS = 0x1000;
+        const MAP_ANONYMOUS = Self::MAP_ANON.bits();
         /// Reserve address space without allocating memory
-        const MAP_GUARD = 0x00002000;
+        const MAP_GUARD = 0x2000;
         /// For use with MAP_FIXED, don't replace existing mappings
-        const MAP_EXCL = 0x00004000;
+        const MAP_EXCL = 0x4000;
         /// Do not include this mapping in core dumps
-        const MAP_NOCORE = 0x00020000;
+        const MAP_NOCORE = 0x20000;
         /// Prefault read pages (FreeBSD equivalent of MAP_POPULATE?)
-        const MAP_PREFAULT_READ = 0x00040000;
+        const MAP_PREFAULT_READ = 0x40000;
         /// Don't sync to backing store
-        const MAP_NOSYNC = 0x00000800;
+        const MAP_NOSYNC = 0x800;
         /// Use 2MB super pages if possible
-        const MAP_ALIGNED_SUPER = 0x01000000;
+        const MAP_ALIGNED_SUPER = 0x1000000;
         /// Align to specific boundary (used with MAP_ALIGNED_SUPER)
         const MAP_ALIGNMENT_SHIFT = 24;
         /// Region grows down, like a stack
-        const MAP_STACK = 0x00000400;
+        const MAP_STACK = 0x400;
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
     }
