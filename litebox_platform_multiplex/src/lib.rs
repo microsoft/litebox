@@ -48,10 +48,6 @@ static PLATFORM: once_cell::race::OnceBox<&'static Platform> = once_cell::race::
     clippy::match_wild_err_arm,
     reason = "the platform itself is not Debug thus we cannot use `expect`"
 )]
-#[cfg(any(
-    all(feature = "platform_linux_userland", target_os = "linux"),
-    all(feature = "platform_freebsd_userland", target_os = "freebsd")
-))]
 pub fn set_platform(platform: &'static Platform) {
     match PLATFORM.set(alloc::boxed::Box::new(platform)) {
         Ok(()) => {}
