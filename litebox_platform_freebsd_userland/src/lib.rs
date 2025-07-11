@@ -487,7 +487,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Fr
 
         let ptr = unsafe {
             syscalls::syscall6(
-                // todo(chuqi): add x86 support
                 syscalls::Sysno::Mmap,
                 range.start,
                 range.len(),
@@ -495,7 +494,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Fr
                     .bits()
                     .reinterpret_as_unsigned() as usize,
                 map_flags.bits().reinterpret_as_unsigned() as usize,
-                usize::MAX, // -1 for anonymous mapping
+                -1isize as usize,
                 0,
             )
         }
@@ -579,8 +578,6 @@ impl litebox::platform::StdioProvider for FreeBSDUserland {
             )
         } {
             Ok(n) => Ok(n),
-            // todo(chuqi): handle EPIPE
-            // Err(syscalls::Errno::EPIPE) => Err(litebox::platform::StdioWriteError::Closed),
             Err(err) => panic!("unhandled error {err}"),
         }
     }
@@ -744,7 +741,6 @@ impl litebox::platform::SystemInfoProvider for FreeBSDUserland {
 }
 
 impl FreeBSDUserland {
-    // todo(chuqi): support x86
     fn get_thread_local_storage() -> *mut litebox_common_linux::ThreadLocalStorage<FreeBSDUserland>
     {
         let tls = unsafe { litebox_common_linux::rdgsbase() };
@@ -753,18 +749,6 @@ impl FreeBSDUserland {
         }
         tls as *mut litebox_common_linux::ThreadLocalStorage<FreeBSDUserland>
     }
-
-    // // todo(chuqi): support x86
-    // fn set_fs_selector(fss: u16) {
-    //     unsafe {
-    //         // Set the fs selector to the given value
-    //         core::arch::asm!(
-    //             "mov fs, {0:x}",
-    //             in(reg) fss,
-    //             options(nostack, preserves_flags)
-    //         );
-    //     }
-    // }
 }
 
 /// Similar to libc, we use fs/gs registers to store thread-local storage (TLS).
@@ -775,7 +759,6 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
     // tbd anyways
     type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<FreeBSDUserland>;
 
-    // todo(chuqi): support x86
     fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
         let old_gs_base = unsafe { litebox_common_linux::rdgsbase() };
         assert!(old_gs_base == 0, "TLS already set for this thread");
@@ -812,31 +795,31 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
 
 #[cfg(test)]
 mod tests {
-    // use core::sync::atomic::AtomicU32;
-    // use std::thread::sleep;
-    // use litebox::platform::{RawMutex, ThreadLocalStorageProvider as _};
+    use core::sync::atomic::AtomicU32;
     use litebox::platform::ThreadLocalStorageProvider as _;
+    use litebox::platform::{RawMutex};
+    use std::thread::sleep;
 
     use crate::FreeBSDUserland;
     use litebox::platform::{DebugLogProvider, PageManagementProvider};
 
     extern crate std;
 
-    // #[test]
-    // fn test_raw_mutex() {
-    //     let mutex = std::sync::Arc::new(super::RawMutex {
-    //         inner: AtomicU32::new(0),
-    //         num_to_wake_up: AtomicU32::new(0),
-    //     });
+    #[test]
+    fn test_raw_mutex() {
+        let mutex = std::sync::Arc::new(super::RawMutex {
+            inner: AtomicU32::new(0),
+            num_to_wake_up: AtomicU32::new(0),
+        });
 
-    //     let copied_mutex = mutex.clone();
-    //     std::thread::spawn(move || {
-    //         sleep(core::time::Duration::from_millis(500));
-    //         copied_mutex.wake_many(10);
-    //     });
+        let copied_mutex = mutex.clone();
+        std::thread::spawn(move || {
+            sleep(core::time::Duration::from_millis(500));
+            copied_mutex.wake_many(10);
+        });
 
-    //     assert!(mutex.block(0).is_ok());
-    // }
+        assert!(mutex.block(0).is_ok());
+    }
 
     #[test]
     fn test_reserved_pages() {
