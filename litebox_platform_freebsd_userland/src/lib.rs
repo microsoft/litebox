@@ -274,23 +274,11 @@ impl litebox::platform::RawMutexProvider for FreeBSDUserland {
     }
 }
 
-// This raw-mutex design takes up more space than absolutely ideal and may possibly be optimized if
-// we can allow for spurious wake-ups. However, the current design makes sure that spurious wake-ups
-// do not actually occur, and that something that is `block`ed can only be woken up by a `wake`.
+// A skeleton of a raw mutex for FreeBSD.
 #[allow(dead_code)]
 pub struct RawMutex {
     // The `inner` is the value shown to the outside world as an underlying atomic.
     inner: AtomicU32,
-    // The `num_to_wake_up` is the actually what the futexes rely upon, and is a bit-field.
-    //
-    // The uppermost two bits (1<<31, and 1<<30) act as a "lock bit" for the waker (we use two of
-    // them to make it easier to catch accidental integer wrapping bugs more easily, at the cost of
-    // supporting "only" 1-billion waiters being woken up at once), preventing multiple wakers from
-    // running at the same time.
-    //
-    // The lower 30 bits indicate how many waiters the waker wants to wake up. The waiters
-    // themselves will decrement this number as they wake up, but should make sure not to overflow
-    // (this is why we use two bits for the lock bit---to catch implementation bugs of this kind).
     num_to_wake_up: AtomicU32,
 }
 
