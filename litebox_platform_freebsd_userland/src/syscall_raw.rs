@@ -2,7 +2,10 @@
 
 #[repr(i32)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-#[allow(dead_code, reason = "For comprehension we added an over-approximated syscall list. To be removed.")]
+#[allow(
+    dead_code,
+    reason = "For comprehension we added an over-approximated syscall list. To be removed."
+)]
 pub enum SyscallTable {
     Exit = 1,
     Read = 3,
@@ -39,7 +42,10 @@ pub mod syscalls {
     pub type SyscallResult = Result<usize, isize>;
 
     /// Perform a syscall with no arguments
-    #[allow(dead_code, reason = "For comprehension we added all syscall interfaces for now. To be removed.")]
+    #[allow(
+        dead_code,
+        reason = "For comprehension we added all syscall interfaces for now. To be removed."
+    )]
     #[inline]
     pub unsafe fn syscall0(num: SyscallTable) -> SyscallResult {
         let ret: usize;
@@ -63,7 +69,10 @@ pub mod syscalls {
     }
 
     /// Perform a syscall with one argument
-    #[allow(dead_code, reason = "For comprehension we added all syscall interfaces for now. To be removed.")]
+    #[allow(
+        dead_code,
+        reason = "For comprehension we added all syscall interfaces for now. To be removed."
+    )]
     #[inline]
     pub unsafe fn syscall1(num: SyscallTable, arg1: usize) -> SyscallResult {
         let ret: usize;
@@ -88,7 +97,10 @@ pub mod syscalls {
     }
 
     /// Perform a syscall with two arguments
-    #[allow(dead_code, reason = "For comprehension we added all syscall interfaces for now. To be removed.")]
+    #[allow(
+        dead_code,
+        reason = "For comprehension we added all syscall interfaces for now. To be removed."
+    )]
     #[inline]
     pub unsafe fn syscall2(num: SyscallTable, arg1: usize, arg2: usize) -> SyscallResult {
         let ret: usize;
@@ -114,7 +126,10 @@ pub mod syscalls {
     }
 
     /// Perform a syscall with three arguments
-    #[allow(dead_code, reason = "For comprehension we added all syscall interfaces for now. To be removed.")]
+    #[allow(
+        dead_code,
+        reason = "For comprehension we added all syscall interfaces for now. To be removed."
+    )]
     #[inline]
     pub unsafe fn syscall3(
         num: SyscallTable,
@@ -146,7 +161,10 @@ pub mod syscalls {
     }
 
     /// Perform a syscall with four arguments
-    #[allow(dead_code, reason = "For comprehension we added all syscall interfaces for now. To be removed.")]
+    #[allow(
+        dead_code,
+        reason = "For comprehension we added all syscall interfaces for now. To be removed."
+    )]
     #[inline]
     pub unsafe fn syscall4(
         num: SyscallTable,
@@ -180,7 +198,10 @@ pub mod syscalls {
     }
 
     /// Perform a syscall with five arguments
-    #[allow(dead_code, reason = "For comprehension we added all syscall interfaces for now. To be removed.")]
+    #[allow(
+        dead_code,
+        reason = "For comprehension we added all syscall interfaces for now. To be removed."
+    )]
     #[inline]
     pub unsafe fn syscall5(
         num: SyscallTable,
@@ -216,7 +237,10 @@ pub mod syscalls {
     }
 
     /// Perform a syscall with six arguments
-    #[allow(dead_code, reason = "For comprehension we added all syscall interfaces for now. To be removed.")]
+    #[allow(
+        dead_code,
+        reason = "For comprehension we added all syscall interfaces for now. To be removed."
+    )]
     #[inline]
     pub unsafe fn syscall6(
         num: SyscallTable,
