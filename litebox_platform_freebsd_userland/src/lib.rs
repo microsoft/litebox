@@ -23,9 +23,6 @@ use syscall_raw::syscalls;
 
 mod freebsd_types;
 
-// todo(chuqi): we do not use systrap for now as there's no sccomp interception on FreeBSD.
-// mod syscall_intercept;
-
 extern crate alloc;
 
 /// Connector to a shim-exposed syscall-handling interface.
