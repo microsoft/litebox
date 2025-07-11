@@ -6,9 +6,8 @@
     target_os = "freebsd",
     any(target_arch = "x86_64", target_arch = "x86")
 ))]
-// use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
 use core::sync::atomic::AtomicU32;
-// use std::sync::atomic::Ordering::SeqCst;
 use core::time::Duration;
 
 use litebox::fs::OFlags;
@@ -16,10 +15,8 @@ use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox::platform::{ThreadLocalStorageProvider, UnblockedOrTimedOut};
-// use litebox::platform::{ImmediatelyWokenUp, RawConstPointer, ThreadLocalStorageProvider};
 use litebox::utils::ReinterpretUnsignedExt as _;
 use litebox_common_linux::{ProtFlags, PunchthroughSyscall};
-// use litebox_common_linux::{CloneFlags, MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
 
 pub mod syscall_raw;
 use syscall_raw::syscalls;
@@ -43,8 +40,6 @@ static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::R
 /// traits.
 #[allow(dead_code)]
 pub struct FreeBSDUserland {
-    tun_socket_fd: std::sync::RwLock<Option<std::os::fd::OwnedFd>>,
-    // seccomp_interception_enabled: std::sync::atomic::AtomicBool,
     /// Reserved pages that are not available for guest programs to use.
     reserved_pages: Vec<core::ops::Range<usize>>,
 }
@@ -54,19 +49,11 @@ const SELFPROC_MAPS_PATH: &str = "/proc/curproc/map";
 impl FreeBSDUserland {
     /// Create a new userland-FreeBSD platform for use in `LiteBox`.
     ///
-    /// Takes an optional tun device name (such as `"tun0"` or `"tun99"`) to connect networking (if
-    /// not specified, networking is disabled).
-    ///
     /// # Panics
     ///
     /// Panics if the tun device could not be successfully opened.
     pub fn new(_tun_device_name: Option<&str>) -> &'static Self {
-        // todo(chuqi): ignore tun device for now
-        let tun_socket_fd = std::sync::RwLock::new(None);
-
         let platform = Self {
-            tun_socket_fd,
-            // seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages: Self::read_proc_self_maps(),
         };
 
@@ -98,11 +85,8 @@ impl FreeBSDUserland {
     }
 
     fn read_proc_self_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
-        // TODO: this function is not guaranteed to return all allocated pages, as it may
-        // allocate more pages after the mapping file is read. Missing allocated pages may
-        // cause the program to crash when calling `mmap` or `mremap` with the `MAP_FIXED` flag later.
-        // We should either fix `mmap` to handle this error, or let global allocator call this function
-        // whenever it get more pages from the host.
+        // TODO: this function is same as the on in LinuxUserland and might have
+        // similar issues to be resolved.
 
         let path = SELFPROC_MAPS_PATH;
 
@@ -243,15 +227,8 @@ impl litebox::platform::ExitProvider for FreeBSDUserland {
     const EXIT_FAILURE: Self::ExitCode = 1;
 
     fn exit(&self, code: Self::ExitCode) -> ! {
-        let Self {
-            tun_socket_fd: _,
-            reserved_pages: _,
-        } = self;
+        let Self { reserved_pages: _ } = self;
 
-        // todo(chuqi): ignore tun device for now
-        // drop::<Option<std::os::fd::OwnedFd>>(tun_socket_fd.write().unwrap().take());
-
-        // And then we actually exit
         unsafe { syscalls::syscall1(syscalls::Sysno::Exit, code as usize) }
             .expect("Failed to exit group");
 
@@ -265,8 +242,8 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
     type ThreadId = usize;
 
-    #[allow(unused_variables)]
-    #[allow(unused_mut)]
+    #[expect(unused_variables)]
+    #[expect(unused_mut)]
     unsafe fn spawn_thread(
         &self,
         ctx: &litebox_common_linux::PtRegs,
