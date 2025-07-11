@@ -269,16 +269,14 @@ impl<Host: HostInterface> LinuxKernel<Host> {
                     core::mem::size_of_val(value),
                 );
             }
-
             assert!(
                 self.unmap_vtl0_pages(page_addr, length).is_ok(),
                 "Failed to unmap VTL0 pages"
             );
-
-            return true;
+            true
+        } else {
+            false
         }
-
-        false
     }
 
     /// This function copies a slice from VTL0 physical memory to the VTL1 kernel.
