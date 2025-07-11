@@ -607,7 +607,7 @@ impl litebox::mm::allocator::MemoryProvider for FreeBSDUserland {
         );
         unsafe {
             syscalls::syscall6(
-                syscalls::Sysno::Mmap, // todo(chuqi): add x86 support
+                syscalls::Sysno::Mmap,
                 0,
                 size,
                 ProtFlags::PROT_READ_WRITE.bits().reinterpret_as_unsigned() as usize,
@@ -627,7 +627,6 @@ impl litebox::mm::allocator::MemoryProvider for FreeBSDUserland {
     }
 }
 
-// todo(chuqi): differentiate between x86 and x86_64
 core::arch::global_asm!(
     "
     .text
@@ -766,7 +765,6 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
         unsafe { litebox_common_linux::wrgsbase(Box::into_raw(tls) as usize) };
     }
 
-    // todo(chuqi): support x86
     fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
         let tls = Self::get_thread_local_storage();
         assert!(!tls.is_null(), "TLS must be set before releasing it");
