@@ -6,7 +6,7 @@
     dead_code,
     reason = "For comprehension we added an over-approximated syscall list. To be removed."
 )]
-pub enum SyscallTable {
+pub(crate) enum SyscallTable {
     Exit = 1,
     Read = 3,
     Write = 4,
@@ -32,14 +32,14 @@ pub enum SyscallTable {
 
 /// Direct syscall wrappers for FreeBSD x86_64
 #[cfg(target_arch = "x86_64")]
-pub mod syscalls {
+pub(crate) mod syscalls {
     use super::SyscallTable;
 
     /// Syscall number alias for compatibility
-    pub type Sysno = SyscallTable;
+    pub(crate) type Sysno = SyscallTable;
 
     /// Result type for syscalls
-    pub type SyscallResult = Result<usize, isize>;
+    pub(crate) type SyscallResult = Result<usize, isize>;
 
     /// Perform a syscall with no arguments
     #[allow(
@@ -47,7 +47,7 @@ pub mod syscalls {
         reason = "For comprehension we added all syscall interfaces for now. To be removed."
     )]
     #[inline]
-    pub unsafe fn syscall0(num: SyscallTable) -> SyscallResult {
+    pub(crate) unsafe fn syscall0(num: SyscallTable) -> SyscallResult {
         let ret: usize;
         let carry: u8;
         unsafe {
@@ -74,7 +74,7 @@ pub mod syscalls {
         reason = "For comprehension we added all syscall interfaces for now. To be removed."
     )]
     #[inline]
-    pub unsafe fn syscall1(num: SyscallTable, arg1: usize) -> SyscallResult {
+    pub(crate) unsafe fn syscall1(num: SyscallTable, arg1: usize) -> SyscallResult {
         let ret: usize;
         let carry: u8;
         unsafe {
@@ -102,7 +102,7 @@ pub mod syscalls {
         reason = "For comprehension we added all syscall interfaces for now. To be removed."
     )]
     #[inline]
-    pub unsafe fn syscall2(num: SyscallTable, arg1: usize, arg2: usize) -> SyscallResult {
+    pub(crate) unsafe fn syscall2(num: SyscallTable, arg1: usize, arg2: usize) -> SyscallResult {
         let ret: usize;
         let carry: u8;
         unsafe {
@@ -131,7 +131,7 @@ pub mod syscalls {
         reason = "For comprehension we added all syscall interfaces for now. To be removed."
     )]
     #[inline]
-    pub unsafe fn syscall3(
+    pub(crate) unsafe fn syscall3(
         num: SyscallTable,
         arg1: usize,
         arg2: usize,
@@ -166,7 +166,7 @@ pub mod syscalls {
         reason = "For comprehension we added all syscall interfaces for now. To be removed."
     )]
     #[inline]
-    pub unsafe fn syscall4(
+    pub(crate) unsafe fn syscall4(
         num: SyscallTable,
         arg1: usize,
         arg2: usize,
@@ -203,7 +203,7 @@ pub mod syscalls {
         reason = "For comprehension we added all syscall interfaces for now. To be removed."
     )]
     #[inline]
-    pub unsafe fn syscall5(
+    pub(crate) unsafe fn syscall5(
         num: SyscallTable,
         arg1: usize,
         arg2: usize,
@@ -242,7 +242,7 @@ pub mod syscalls {
         reason = "For comprehension we added all syscall interfaces for now. To be removed."
     )]
     #[inline]
-    pub unsafe fn syscall6(
+    pub(crate) unsafe fn syscall6(
         num: SyscallTable,
         arg1: usize,
         arg2: usize,
