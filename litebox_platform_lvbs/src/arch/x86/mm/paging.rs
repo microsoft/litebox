@@ -322,6 +322,36 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
         Ok(M::pa_to_va(frame_range.start.start_address()).as_mut_ptr())
     }
+
+    /// This function creates a new empty page table while allocating a new frame for it.
+    pub(crate) unsafe fn new_empty() -> Self {
+        let frame = PageTableAllocator::<M>::allocate_frame(true)
+            .expect("Failed to allocate a new page table frame");
+        unsafe { Self::init(frame.start_address()) }
+    }
+
+    /// This function switches the address space of the current processor/core using the given page table (e.g., its CR3 register) and
+    /// returns the physical frame of the old page table.
+    ///
+    /// # Safety
+    /// The caller must ensure that the page table is valid and maps the entire VTL1 kernel address space.
+    /// Currently, we do not support KPTI-like kernel/user space page table separation.
+    ///
+    /// # Panics
+    /// Panics if the page table is invalid
+    #[allow(clippy::similar_names)]
+    pub(crate) fn switch_address_space(&self) -> PhysFrame {
+        let p4_va = core::ptr::from_ref::<PageTable>(self.inner.lock().level_4_table());
+        let p4_pa = M::va_to_pa(VirtAddr::new(p4_va as u64));
+        let p4_frame = PhysFrame::containing_address(p4_pa);
+
+        let (frame, flags) = x86_64::registers::control::Cr3::read();
+        unsafe {
+            x86_64::registers::control::Cr3::write(p4_frame, flags);
+        }
+
+        frame
+    }
 }
 
 impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTable<'_, M, ALIGN> {

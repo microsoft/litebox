@@ -16,7 +16,7 @@ use litebox_platform_lvbs::{
             get_heap_start_address,
         },
     },
-    serial_println,
+    serial_println, syscall_handle,
 };
 
 /// # Panics
@@ -77,6 +77,7 @@ pub fn init() -> Option<&'static Platform> {
     }
     interrupts::init_idt();
     x86_64::instructions::interrupts::enable();
+    syscall_handle::init();
 
     ret
 }

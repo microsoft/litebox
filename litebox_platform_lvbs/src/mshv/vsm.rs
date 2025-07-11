@@ -32,6 +32,7 @@ use crate::{
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,
+    user_context::UserSpace,
 };
 use alloc::{boxed::Box, collections::BTreeMap, vec, vec::Vec};
 use core::{
@@ -688,6 +689,16 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
         nranges,
         crash
     );
+
+    // THIS IS JUST FOR TESTING PURPOSES. DEFINE A NEW VSM FUNCTION FOR THIS
+    if let Ok(userspace_id) = crate::platform_low().create_userspace() {
+        debug_serial_println!("VSM: Created userspace with ID {}", userspace_id);
+        let _ = crate::platform_low().load_program(userspace_id, &[0; 1], 4096);
+        debug_serial_println!("VSM: Loaded program into userspace");
+        crate::platform_low().enter_userspace(userspace_id);
+    } else {
+        debug_serial_println!("VSM: Failed to create userspace for kexec validation");
+    }
 
     let is_crash = crash != 0;
     let kexec_metadata_ref = if is_crash {

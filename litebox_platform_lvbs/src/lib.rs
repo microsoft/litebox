@@ -5,6 +5,7 @@
 #![cfg_attr(feature = "interrupt", feature(abi_x86_interrupt))]
 
 use crate::mshv::{vsm::Vtl0KernelInfo, vtl1_mem_layout::PAGE_SIZE};
+use crate::user_context::UserContextMap;
 
 use core::{
     arch::asm,
@@ -34,6 +35,9 @@ pub mod mm;
 pub mod mshv;
 pub mod ptr;
 
+pub mod syscall_handle;
+pub(crate) mod user_context;
+
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 
 /// This is the platform for running LiteBox in kernel mode.
@@ -43,6 +47,7 @@ pub struct LinuxKernel<Host: HostInterface> {
     page_table: mm::PageTable<PAGE_SIZE>,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
     vtl0_kernel_info: Vtl0KernelInfo,
+    user_contexts: UserContextMap,
 }
 
 impl<Host: HostInterface> ExitProvider for LinuxKernel<Host> {
@@ -97,6 +102,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             page_table: pt,
             vtl1_phys_frame_range: PhysFrame::range(physframe_start, physframe_end),
             vtl0_kernel_info: Vtl0KernelInfo::new(),
+            user_contexts: UserContextMap::new(),
         }))
     }
 
@@ -318,6 +324,25 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         }
 
         false
+    }
+
+    /// Create a new page table for VTL1 user space. Currently, it maps the entire VTL1 kernel memory for
+    /// proper operations (e.g., syscall handling). We should consider implementing
+    /// partial mapping to mitigate side-channel attacks and shallow copying to get rid of redudant
+    /// page table data structures for kernel space.
+    pub(crate) fn new_user_page_table(&self) -> mm::PageTable<PAGE_SIZE> {
+        let pt = unsafe { mm::PageTable::new_empty() };
+        if pt
+            .map_phys_frame_range(
+                self.vtl1_phys_frame_range,
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+            )
+            .is_err()
+        {
+            panic!("Failed to map VTL1 physical memory");
+        }
+
+        pt
     }
 }
 
