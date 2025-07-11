@@ -3,15 +3,16 @@
 use litebox::fs::{FileSystem as _, OFlags};
 use litebox_common_linux::errno::Errno;
 
+use crate::FileFd;
 use crate::litebox_fs;
 
 pub(crate) struct StdioFileInner {
-    file: Option<litebox::fd::FileFd>,
+    file: Option<FileFd>,
     status: core::sync::atomic::AtomicU32,
 }
 
 impl StdioFileInner {
-    pub(crate) fn file(&self) -> &litebox::fd::FileFd {
+    pub(crate) fn file(&self) -> &FileFd {
         self.file.as_ref().expect("File descriptor is not set")
     }
 
@@ -34,11 +35,7 @@ pub(crate) struct StdioFile {
 }
 
 impl StdioFile {
-    pub(crate) fn new(
-        typ: litebox::platform::StdioStream,
-        file: litebox::fd::FileFd,
-        flags: OFlags,
-    ) -> Self {
+    pub(crate) fn new(typ: litebox::platform::StdioStream, file: FileFd, flags: OFlags) -> Self {
         let flags = flags | OFlags::RDWR | OFlags::APPEND;
         Self {
             typ,

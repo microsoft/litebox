@@ -41,6 +41,7 @@ bitflags::bitflags! {
 
         const PROT_READ_EXEC = Self::PROT_READ.bits() | Self::PROT_EXEC.bits();
         const PROT_READ_WRITE = Self::PROT_READ.bits() | Self::PROT_WRITE.bits();
+        const PROT_READ_WRITE_EXEC = Self::PROT_READ.bits() | Self::PROT_WRITE.bits() | Self::PROT_EXEC.bits();
     }
 }
 
