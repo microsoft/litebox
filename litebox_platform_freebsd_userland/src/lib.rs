@@ -2,10 +2,7 @@
 
 // Restrict this crate to only work on FreeBSD. For now, we are restricting this to only x86/x86-64
 // FreeBSD, but we _may_ allow for more in the future, if we find it useful to do so.
-#![cfg(all(
-    target_os = "freebsd",
-    any(target_arch = "x86_64", target_arch = "x86")
-))]
+#![cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
 
 use core::sync::atomic::AtomicU32;
 use core::time::Duration;
