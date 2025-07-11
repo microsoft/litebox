@@ -28,10 +28,10 @@ compile_error!(
     r##"Too many platforms specified. Are you sure you have marked 'default-features = false'?"##
 );
 
-#[cfg(feature = "platform_linux_userland")]
+#[cfg(all(feature = "platform_linux_userland", target_os = "linux"))]
 pub type Platform = litebox_platform_linux_userland::LinuxUserland;
 
-#[cfg(feature = "platform_freebsd_userland")]
+#[cfg(all(feature = "platform_freebsd_userland", target_os = "freebsd"))]
 pub type Platform = litebox_platform_freebsd_userland::FreeBSDUserland;
 
 static PLATFORM: once_cell::race::OnceBox<&'static Platform> = once_cell::race::OnceBox::new();
