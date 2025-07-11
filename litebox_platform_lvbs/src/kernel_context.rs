@@ -78,6 +78,14 @@ impl KernelContext {
     pub fn set_vtl_return_value(&mut self, value: u64) {
         self.vtl0_state.r8 = value; // LVBS uses R8 to return a value from VTL1 to VTL0
     }
+
+    pub fn get_kernel_user_code_segments(&self) -> Option<(u16, u16)> {
+        if let Some(gdt) = self.gdt {
+            gdt.get_kernel_user_code_segments()
+        } else {
+            None
+        }
+    }
 }
 
 // TODO: use heap

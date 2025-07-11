@@ -20,12 +20,12 @@ use x86_64::{
 pub struct AlignedTss(pub TaskStateSegment);
 
 #[derive(Clone, Copy)]
-pub struct Selectors {
-    pub kernel_code: SegmentSelector,
-    pub kernel_data: SegmentSelector,
-    pub tss: SegmentSelector,
-    pub user_data: SegmentSelector,
-    pub user_code: SegmentSelector,
+struct Selectors {
+    kernel_code: SegmentSelector,
+    kernel_data: SegmentSelector,
+    tss: SegmentSelector,
+    user_data: SegmentSelector,
+    user_code: SegmentSelector,
 }
 
 impl Selectors {
@@ -49,7 +49,7 @@ impl Default for Selectors {
 /// Package GDT and selectors
 pub struct GdtWrapper {
     gdt: GlobalDescriptorTable,
-    pub selectors: Selectors,
+    selectors: Selectors,
 }
 
 impl GdtWrapper {
@@ -58,6 +58,10 @@ impl GdtWrapper {
             gdt: GlobalDescriptorTable::new(),
             selectors: Selectors::new(),
         }
+    }
+
+    pub fn get_kernel_user_code_segments(&self) -> Option<(u16, u16)> {
+        Some((self.selectors.kernel_code.0, self.selectors.user_code.0))
     }
 }
 

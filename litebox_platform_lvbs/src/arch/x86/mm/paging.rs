@@ -352,6 +352,16 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
         frame
     }
+
+    /// This function returns the physical frame of the active top-level page table. We need this function
+    /// when we handle a system call or interrupt to locate the data structure for the current user context
+    /// and store the context including user return address and user stack pointer into the structure.
+    #[allow(clippy::similar_names)]
+    pub(crate) fn get_physical_frame(&self) -> PhysFrame {
+        let p4_va = core::ptr::from_ref::<PageTable>(self.inner.lock().level_4_table());
+        let p4_pa = M::va_to_pa(VirtAddr::new(p4_va as u64));
+        PhysFrame::containing_address(p4_pa)
+    }
 }
 
 impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTable<'_, M, ALIGN> {

@@ -8,7 +8,10 @@ use crate::{
         vsm_intercept::vsm_handle_intercept,
     },
 };
-use core::{arch::asm, mem};
+use core::{
+    arch::{asm, naked_asm},
+    mem,
+};
 use num_enum::TryFromPrimitive;
 
 /// Return to VTL0
@@ -222,6 +225,15 @@ pub(crate) fn jump_vtl_switch_loop_with_stack_cleanup() -> ! {
             options(noreturn)
         );
     }
+}
+
+/// This function lets VTL1 return to VTL0.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn jump_vtl_switch_loop() -> ! {
+    naked_asm!(
+        "jmp {loop}",
+        loop = sym vtl_switch_loop,
+    );
 }
 
 /// VTL switch loop

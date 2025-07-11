@@ -690,10 +690,11 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
         crash
     );
 
-    // THIS IS JUST FOR TESTING PURPOSES. DEFINE A NEW VSM FUNCTION FOR THIS
+    // REPURPOSE THIS FOR NOW FOR TESTING USERSPACE AND SYSCALLS FOR NOW.
+    // DEFINE A NEW VSM FUNCTION FOR THIS LATER.
     if let Ok(userspace_id) = crate::platform_low().create_userspace() {
         debug_serial_println!("VSM: Created userspace with ID {}", userspace_id);
-        let _ = crate::platform_low().load_program(userspace_id, &[0; 1], 4096);
+        let _ = crate::platform_low().load_program(userspace_id, &[0; 1]);
         debug_serial_println!("VSM: Loaded program into userspace");
         crate::platform_low().enter_userspace(userspace_id);
     } else {
