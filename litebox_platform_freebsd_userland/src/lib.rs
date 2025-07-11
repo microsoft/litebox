@@ -794,8 +794,8 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::AtomicU32;
+    use litebox::platform::RawMutex;
     use litebox::platform::ThreadLocalStorageProvider as _;
-    use litebox::platform::{RawMutex};
     use std::thread::sleep;
 
     use crate::FreeBSDUserland;

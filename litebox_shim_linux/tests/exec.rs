@@ -124,7 +124,8 @@ fn test_syscall_rewriter() {
                 true,
                 true,
             );
-            let hooked_path = std::path::Path::new(dir_path.as_str()).join("hello_exec_nolibc.hooked");
+            let hooked_path =
+                std::path::Path::new(dir_path.as_str()).join("hello_exec_nolibc.hooked");
             (path, hooked_path)
         }
     };
