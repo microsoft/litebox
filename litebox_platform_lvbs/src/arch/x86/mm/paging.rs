@@ -9,7 +9,7 @@ use x86_64::{
             PageTableFlags, PhysFrame, Size4KiB, Translate,
             frame::PhysFrameRange,
             mapper::{
-                FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult,
+                CleanUp, FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult,
                 UnmapError as X64UnmapError,
             },
         },
@@ -361,6 +361,33 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         let p4_va = core::ptr::from_ref::<PageTable>(self.inner.lock().level_4_table());
         let p4_pa = M::va_to_pa(VirtAddr::new(p4_va as u64));
         PhysFrame::containing_address(p4_pa)
+    }
+
+    /// Deallocate physical frames of all page tables except for the top-level page table.
+    ///
+    /// # Safety
+    /// The caller must unmap all non-page-table pages before calling this function to avoid memory leaks.
+    /// Also, the caller must ensure no page table frame is shared with other page tables.
+    /// TODO: consider merging this function with `Drop` if it is reliable enough.
+    pub(crate) unsafe fn clean_up(&self) {
+        let mut allocator = PageTableAllocator::<M>::new();
+        unsafe {
+            self.inner.lock().clean_up(&mut allocator);
+        }
+    }
+}
+
+impl<M: MemoryProvider, const ALIGN: usize> Drop for X64PageTable<'_, M, ALIGN> {
+    /// Deallocate the physical frame of the top-level page table
+    #[allow(clippy::similar_names)]
+    fn drop(&mut self) {
+        let mut allocator = PageTableAllocator::<M>::new();
+        let p4_va =
+            core::ptr::from_mut::<PageTable>(self.inner.lock().level_4_table_mut()).cast::<u8>();
+        let p4_pa = M::va_to_pa(VirtAddr::new(p4_va as u64));
+        unsafe {
+            allocator.deallocate_frame(PhysFrame::containing_address(p4_pa));
+        }
     }
 }
 

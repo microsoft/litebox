@@ -63,6 +63,10 @@ impl GdtWrapper {
     pub fn get_kernel_user_code_segments(&self) -> Option<(u16, u16)> {
         Some((self.selectors.kernel_code.0, self.selectors.user_code.0))
     }
+
+    pub fn get_user_code_data_segments(&self) -> Option<(u16, u16)> {
+        Some((self.selectors.user_code.0, self.selectors.user_data.0))
+    }
 }
 
 impl Default for GdtWrapper {
@@ -106,24 +110,4 @@ fn setup_gdt_tss() {
 /// Set up GDT and TSS (for a core)
 pub fn init() {
     setup_gdt_tss();
-}
-
-/// # Panics
-///
-/// Panics if this function is called when GDT is not initialized for the current core.
-pub fn set_usermode_segs() -> (u16, u16) {
-    use x86_64::instructions::segmentation::{DS, Segment};
-
-    let kernel_context = get_per_core_kernel_context();
-
-    if let Some(gdt) = kernel_context.gdt {
-        let cs = gdt.selectors.user_code;
-        let ds = gdt.selectors.user_data;
-        unsafe {
-            DS::set_reg(ds);
-        }
-        (cs.0, ds.0)
-    } else {
-        panic!("GDT not initialized");
-    }
 }

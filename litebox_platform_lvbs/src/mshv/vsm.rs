@@ -681,7 +681,7 @@ pub fn mshv_vsm_copy_secondary_key(_pa: u64, _nranges: u64) -> Result<i64, Errno
 /// This function protects the kexec kernel blob (PE) only if it has a valid signature.
 /// Note: this function does not make kexec kernel pages executable, which should be done by
 /// another VTL1 method that can intercept the kexec/reset signal.
-#[allow(clippy::unnecessary_wraps)]
+#[allow(clippy::too_many_lines)]
 pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64, Errno> {
     debug_serial_println!(
         "VSM: Validate kexec pa {:#x} nranges {} crash {}",
@@ -694,6 +694,10 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
     // DEFINE A NEW VSM FUNCTION FOR THIS LATER.
     if let Ok(userspace_id) = crate::platform_low().create_userspace() {
         debug_serial_println!("VSM: Created userspace with ID {}", userspace_id);
+        if userspace_id > 1 {
+            let _ = crate::platform_low().delete_userspace(userspace_id - 1);
+            debug_serial_println!("VSM: Deleted userspace with ID {}", userspace_id - 1);
+        }
         let _ = crate::platform_low().load_program(userspace_id, &[0; 1]);
         debug_serial_println!("VSM: Loaded program into userspace");
         crate::platform_low().enter_userspace(userspace_id);

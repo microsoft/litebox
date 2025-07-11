@@ -1,22 +1,24 @@
 //! VTL1 user context
 //! A user context is created for process, TA session, task, or something like that.
 
-use crate::arch::gdt;
 use crate::debug_serial_println;
-use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
-use crate::{HostInterface, LinuxKernel};
+use crate::{
+    HostInterface, LinuxKernel, kernel_context::get_per_core_kernel_context,
+    mshv::vtl1_mem_layout::PAGE_SIZE,
+};
 use core::arch::asm;
 use hashbrown::HashMap;
 use litebox::mm::linux::{PageRange, VmFlags};
 use litebox_common_linux::errno::Errno;
-use x86_64::registers::{control::Cr3, rflags::RFlags};
-use x86_64::{PhysAddr, VirtAddr};
+use x86_64::{
+    VirtAddr,
+    registers::{control::Cr3, rflags::RFlags},
+};
 
-// Let us strictly confine the VTL1 user space for now.
-// This should be fine because we do not plan to arbitrarily general purpose programs
-// in the VTL1 user space.
+// Let us confine the size of the VTL1 user space for now (1 GiB).
+// This would be fine because we only run tiny programs in the VTL1 user space.
 const VTL1_USER_BASE: u64 = 0x1_0000_0000;
-const VTL1_USER_TOP: u64 = 0x10_0000_0000;
+const VTL1_USER_TOP: u64 = 0x1_4000_0000;
 
 // fixed-size user stack for an OP-TEE TA
 // pub const USER_STACK_SIZE: usize = 16 * PAGE_SIZE;
@@ -39,7 +41,6 @@ pub trait UserSpace {
 
     /// Delete any resources associated with the userspace (`userspace_id`).
     /// TODO: it should remove all physical frames solely owned by the userspace to be deleted.
-    #[expect(dead_code)]
     fn delete_userspace(&self, userspace_id: u64) -> Result<(), Errno>;
 
     /// Check whether the userspace with the given `userspace_id` exists.
@@ -75,18 +76,16 @@ pub struct UserContext {
     pub rip: VirtAddr,
     pub rsp: VirtAddr,
     pub rflags: RFlags,
-    pub cr3: PhysAddr,
 }
 
 impl UserContext {
-    /// Create a new user context with the given user page table and CR3 value.
-    pub fn new(user_pt: crate::mm::PageTable<PAGE_SIZE>, cr3: PhysAddr) -> Self {
+    /// Create a new user context with the given user page table
+    pub fn new(user_pt: crate::mm::PageTable<PAGE_SIZE>) -> Self {
         UserContext {
             page_table: user_pt,
             rip: VirtAddr::new(0),
             rsp: VirtAddr::new(0),
             rflags: RFlags::INTERRUPT_FLAG,
-            cr3,
         }
     }
 }
@@ -116,15 +115,33 @@ impl<Host: HostInterface> UserSpace for LinuxKernel<Host> {
             None => 1,
         };
         let user_pt = self.new_user_page_table();
-        let cr3 = user_pt.get_physical_frame();
 
-        let user_ctx: UserContext = UserContext::new(user_pt, cr3.start_address());
+        let user_ctx: UserContext = UserContext::new(user_pt);
         inner.insert(userspace_id, user_ctx);
         Ok(userspace_id)
     }
 
     fn delete_userspace(&self, userspace_id: u64) -> Result<(), Errno> {
-        todo!("Delete userspace with ID: {}", userspace_id);
+        let mut inner = self.user_contexts.inner.lock();
+        let user_pt = inner.get(&userspace_id).unwrap();
+        unsafe {
+            // TODO: make this unmap efficient by maintaining a list of mapped pages
+            user_pt
+                .page_table
+                .unmap_pages(
+                    PageRange::<PAGE_SIZE>::new(
+                        usize::try_from(Self::GVA_USER_BASE.as_u64()).unwrap(),
+                        usize::try_from(Self::GVA_USER_TOP.as_u64()).unwrap(),
+                    )
+                    .unwrap(),
+                    true,
+                )
+                .expect("Failed to unmap user pages");
+            user_pt.page_table.clean_up();
+        }
+
+        let _ = inner.remove(&userspace_id);
+        Ok(())
     }
 
     fn check_userspace(&self, userspace_id: u64) -> bool {
@@ -149,7 +166,11 @@ impl<Host: HostInterface> UserSpace for LinuxKernel<Host> {
                     user_ctx.rip,
                     user_ctx.rsp,
                     user_ctx.rflags,
-                    user_ctx.cr3,
+                    user_ctx
+                        .page_table
+                        .get_physical_frame()
+                        .start_address()
+                        .as_u64()
                 );
                 rsp = user_ctx.rsp;
                 rip = user_ctx.rip;
@@ -159,7 +180,10 @@ impl<Host: HostInterface> UserSpace for LinuxKernel<Host> {
                 panic!("Userspace with ID: {} does not exist", userspace_id);
             }
         } // release the lock before entering userspace
-        let (cs_idx, ds_idx) = gdt::set_usermode_segs();
+        let Some((cs_idx, ds_idx)) = get_per_core_kernel_context().get_user_code_data_segments()
+        else {
+            panic!("GDT not initialized");
+        };
         unsafe {
             asm!(
                 "push r10",
@@ -235,7 +259,7 @@ impl<Host: HostInterface> UserSpace for LinuxKernel<Host> {
         let (cr3, _) = Cr3::read_raw();
         let mut inner = self.user_contexts.inner.lock();
         for (id, user_ctx) in inner.iter_mut() {
-            if user_ctx.cr3 == cr3.start_address() {
+            if cr3 == user_ctx.page_table.get_physical_frame() {
                 user_ctx.rsp = user_stack_ptr;
                 user_ctx.rip = user_ret_addr;
                 user_ctx.rflags = rflags;

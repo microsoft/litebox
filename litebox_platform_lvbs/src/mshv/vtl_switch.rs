@@ -213,7 +213,7 @@ pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
 /// the VTL1 kernel stack to discard any leftovers (e.g., unwind, panic, ...).
 #[allow(clippy::inline_always)]
 #[inline(always)]
-pub(crate) fn jump_vtl_switch_loop_with_stack_cleanup() -> ! {
+fn jump_vtl_switch_loop_with_stack_cleanup() -> ! {
     let kernel_context = get_per_core_kernel_context();
     let stack_top = kernel_context.kernel_stack_top();
     unsafe {
@@ -227,7 +227,7 @@ pub(crate) fn jump_vtl_switch_loop_with_stack_cleanup() -> ! {
     }
 }
 
-/// This function lets VTL1 return to VTL0.
+/// expose `vtl_switch_loop` to the outside (e.g., the syscall handler)
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn jump_vtl_switch_loop() -> ! {
     naked_asm!(

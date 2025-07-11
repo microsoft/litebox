@@ -1,6 +1,8 @@
 use crate::debug_serial_println;
-use crate::user_context::UserSpace;
-use crate::{kernel_context::get_per_core_kernel_context, mshv::vtl_switch::jump_vtl_switch_loop};
+use crate::{
+    kernel_context::get_per_core_kernel_context, mshv::vtl_switch::jump_vtl_switch_loop,
+    user_context::UserSpace,
+};
 use core::arch::{asm, naked_asm};
 use x86_64::{
     VirtAddr,
@@ -27,7 +29,7 @@ fn handle_syscall(
     sysnr: u64,
 ) -> ! {
     debug_serial_println!(
-        "syscall {:#x} invoked with arguments:\n\t{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}",
+        "syscall {:#x} invoked with arguments:\n  {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}",
         sysnr,
         arg0,
         arg1,
