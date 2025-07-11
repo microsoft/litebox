@@ -1,6 +1,6 @@
 //! File-system related functionality
 
-use crate::fd::FileFd;
+use crate::fd::{FdEnabledSubsystem, TypedFd};
 use crate::path;
 
 use bitflags::bitflags;
@@ -12,7 +12,6 @@ pub mod errors;
 pub mod in_mem;
 pub mod layered;
 pub mod nine_p;
-pub(crate) mod shared;
 pub mod tar_ro;
 
 #[cfg(test)]
@@ -39,29 +38,49 @@ mod private {
 /// (e.g., [`in_mem::FileSystem`]), each of which are parametric in the platform they run on.
 /// However, users of any of these file systems might find benefit in having most of their code
 /// depend on this trait, rather than on any individual file system.
-pub trait FileSystem: private::Sealed {
+pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Opens a file
     ///
     /// The `mode` is only significant when creating a file
-    fn open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<FileFd, OpenError>;
+    fn open(
+        &self,
+        path: impl path::Arg,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<TypedFd<Self>, OpenError>;
     /// Close the file at `fd`
-    fn close(&self, fd: FileFd) -> Result<(), CloseError>;
+    fn close(&self, fd: TypedFd<Self>) -> Result<(), CloseError>;
     /// Read from a file descriptor at `offset` into a buffer
     ///
     /// If `offset` is None, the read will start at the current file offset and update the file offset
     /// to the end of the read.
     /// If `offset` is Some, the file offset is not changed.
-    fn read(&self, fd: &FileFd, buf: &mut [u8], offset: Option<usize>) -> Result<usize, ReadError>;
+    fn read(
+        &self,
+        fd: &TypedFd<Self>,
+        buf: &mut [u8],
+        offset: Option<usize>,
+    ) -> Result<usize, ReadError>;
     /// Write from a buffer to a file descriptor at `offset`
     ///
     /// If `offset` is None, the write will start at the current file offset and update the file offset
     /// to the end of the write.
     /// If `offset` is Some, the file offset is not changed.
-    fn write(&self, fd: &FileFd, buf: &[u8], offset: Option<usize>) -> Result<usize, WriteError>;
+    fn write(
+        &self,
+        fd: &TypedFd<Self>,
+        buf: &[u8],
+        offset: Option<usize>,
+    ) -> Result<usize, WriteError>;
     /// Reposition read/write file offset, by changing it to `offset` relative to `whence`.
     ///
     /// Returns the resulting offset (in bytes from start of file) on success.
-    fn seek(&self, fd: &FileFd, offset: isize, whence: SeekWhence) -> Result<usize, SeekError>;
+    fn seek(
+        &self,
+        fd: &TypedFd<Self>,
+        offset: isize,
+        whence: SeekWhence,
+    ) -> Result<usize, SeekError>;
     /// Change the permissions of a file
     fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
     /// Change the owner of a file
@@ -80,7 +99,7 @@ pub trait FileSystem: private::Sealed {
     /// Obtain the status of a file/directory/... on the file-system.
     fn file_status(&self, path: impl path::Arg) -> Result<FileStatus, FileStatusError>;
     /// Equivalent to [`Self::file_status`], but open an open `fd` instead.
-    fn fd_file_status(&self, fd: &FileFd) -> Result<FileStatus, FileStatusError>;
+    fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<FileStatus, FileStatusError>;
     /// Apply `f` on metadata at an fd, if it exists.
     ///
     /// This returns the most-specific metadata available for the file descriptor---specifically, if
@@ -89,13 +108,13 @@ pub trait FileSystem: private::Sealed {
     /// fd-specific one is set, this returns the file-specific one.
     fn with_metadata<T: core::any::Any, R>(
         &self,
-        fd: &FileFd,
+        fd: &TypedFd<Self>,
         f: impl FnOnce(&T) -> R,
     ) -> Result<R, MetadataError>;
     /// Similar to [`Self::with_metadata`] but mutable.
     fn with_metadata_mut<T: core::any::Any, R>(
         &self,
-        fd: &FileFd,
+        fd: &TypedFd<Self>,
         f: impl FnOnce(&mut T) -> R,
     ) -> Result<R, MetadataError>;
     /// Store arbitrary metadata into a file.
@@ -107,7 +126,7 @@ pub trait FileSystem: private::Sealed {
     /// Returns the old metadata if any such metadata exists.
     fn set_file_metadata<T: core::any::Any>(
         &self,
-        fd: &FileFd,
+        fd: &TypedFd<Self>,
         metadata: T,
     ) -> Result<Option<T>, SetMetadataError<T>>;
     /// Store arbitrary metdata into a file descriptor.
@@ -117,7 +136,7 @@ pub trait FileSystem: private::Sealed {
     /// metadata over all file descriptors opened for the same file.
     fn set_fd_metadata<T: core::any::Any>(
         &self,
-        fd: &FileFd,
+        fd: &TypedFd<Self>,
         metadata: T,
     ) -> Result<Option<T>, SetMetadataError<T>>;
 }

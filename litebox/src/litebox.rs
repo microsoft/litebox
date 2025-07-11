@@ -3,8 +3,9 @@
 use alloc::sync::Arc;
 
 use crate::{
+    fd::Descriptors,
     platform::ExitProvider,
-    sync::{RawSyncPrimitivesProvider, Synchronization},
+    sync::{RawSyncPrimitivesProvider, RwLock, Synchronization},
 };
 
 /// A full LiteBox system.
@@ -23,9 +24,22 @@ impl<Platform: RawSyncPrimitivesProvider + ExitProvider> LiteBox<Platform> {
     /// Create a new (empty) [`LiteBox`] instance for the given `platform`.
     pub fn new(platform: &'static Platform) -> Self {
         let sync = Synchronization::new_from_platform(platform);
-        Self {
-            x: Arc::new(LiteBoxX { platform, sync }),
-        }
+        // We set `descriptors` to `None` and replace it out with a `Some` after creation due to a
+        // circular dependency between the two types for their initialization. The public interfaces
+        // here do not need to deal with any of this though; see the post-creation invariant
+        // guarantee written on `LiteBoxX::descriptors`.
+        let descriptors = sync.new_rwlock(None);
+        let ret = Self {
+            x: Arc::new(LiteBoxX {
+                platform,
+                sync,
+                descriptors,
+            }),
+        };
+        let descriptors = Descriptors::new_from_litebox_creation(&ret);
+        let old = ret.x.descriptors.write().replace(descriptors);
+        debug_assert!(old.is_none());
+        ret
     }
 
     /// Clean up and exit the current process running within the [`LiteBox`] instance.
@@ -51,10 +65,42 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     pub fn sync(&self) -> &Synchronization<Platform> {
         &self.x.sync
     }
+
+    /// Access to the file descriptor table.
+    ///
+    /// Note: this takes a lock, and thus should ideally not be held on to for too long to prevent
+    /// potential deadlocks.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "after initialization, this will never panic"
+    )]
+    pub fn descriptor_table(
+        &self,
+    ) -> impl core::ops::Deref<Target = Descriptors<Platform>> + use<'_, Platform> {
+        crate::sync::RwLockReadGuard::map(self.x.descriptors.read(), |x| x.as_ref().unwrap())
+    }
+
+    /// Mutable access to the file descriptor table.
+    ///
+    /// Note: this takes a lock, and thus should ideally not be held on to for too long to prevent
+    /// potential deadlocks.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "after initialization, this will never panic"
+    )]
+    pub fn descriptor_table_mut(
+        &self,
+    ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {
+        crate::sync::RwLockWriteGuard::map(self.x.descriptors.write(), |x| x.as_mut().unwrap())
+    }
 }
 
 /// The actual body of [`LiteBox`], containing any components that might be shared.
 pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
     pub(crate) platform: &'static Platform,
     pub(crate) sync: Synchronization<Platform>,
+    // This `Option` is guaranteed to be `Some` after initialization of the `LiteBox` object. It
+    // should only be accessed via the `descriptor_table` and `descriptor_table_mut` methods, which
+    // not only give a nicer interface, but also do the necessary checks.
+    descriptors: RwLock<Platform, Option<Descriptors<Platform>>>,
 }

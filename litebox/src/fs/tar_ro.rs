@@ -39,12 +39,10 @@ use super::{
 /// A backing implementation for [`FileSystem`](super::FileSystem), storing all files in-memory, via
 /// a read-only `.tar` file.
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
+    litebox: LiteBox<Platform>,
     tar_data: TarArchive,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
-    // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
-    // sync-primitives platform, as well as cost of mutexes and such?
-    descriptors: sync::RwLock<Platform, Descriptors>,
 }
 
 /// An empty tar file to support an empty file system.
@@ -68,11 +66,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// Panics if the provided `tar_data` is found to be an invalid `.tar` file.
     #[must_use]
     pub fn new(litebox: &LiteBox<Platform>, tar_data: Vec<u8>) -> Self {
-        let descriptors = litebox.sync().new_rwlock(Descriptors::new());
         Self {
+            litebox: litebox.clone(),
             tar_data: TarArchive::new(tar_data.into_boxed_slice()).unwrap(),
             current_working_dir: "/".into(),
-            descriptors,
         }
     }
 
@@ -106,7 +103,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         path: impl crate::path::Arg,
         flags: OFlags,
         _mode: Mode,
-    ) -> Result<crate::fd::FileFd, OpenError> {
+    ) -> Result<FileFd<Platform>, OpenError> {
         use super::OFlags;
         let currently_supported_oflags: OFlags = OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR;
         if flags.contains(currently_supported_oflags.complement()) {
@@ -134,37 +131,40 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         assert!(flags.contains(OFlags::RDONLY));
         if entry.filename().as_str().unwrap() == path {
             // it is a file
-            Ok(self.descriptors.write().insert(Descriptor::File {
-                idx,
-                position: 0,
-                metadata: AnyMap::new(),
-            }))
+            Ok(self
+                .litebox
+                .descriptor_table_mut()
+                .insert(Descriptor::File {
+                    idx,
+                    position: 0,
+                    metadata: AnyMap::new(),
+                }))
         } else {
             // it is a dir
-            Ok(self.descriptors.write().insert(Descriptor::Dir {
+            Ok(self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
                 path: path.to_owned(),
                 metadata: AnyMap::new(),
             }))
         }
     }
 
-    fn close(&self, fd: crate::fd::FileFd) -> Result<(), CloseError> {
-        self.descriptors.write().remove(fd);
+    fn close(&self, fd: FileFd<Platform>) -> Result<(), CloseError> {
+        self.litebox.descriptor_table_mut().remove(fd);
         Ok(())
     }
 
     fn read(
         &self,
-        fd: &crate::fd::FileFd,
+        fd: &FileFd<Platform>,
         buf: &mut [u8],
         mut offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        let mut descriptors = self.descriptors.write();
+        let descriptor_table = self.litebox.descriptor_table();
         let Descriptor::File {
             idx,
             position,
             metadata: _,
-        } = descriptors.get_mut(fd)
+        } = &mut descriptor_table.get_entry_mut(fd).entry
         else {
             return Err(ReadError::NotAFile);
         };
@@ -181,11 +181,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn write(
         &self,
-        fd: &crate::fd::FileFd,
+        fd: &FileFd<Platform>,
         _buf: &[u8],
         _offset: Option<usize>,
     ) -> Result<usize, WriteError> {
-        match self.descriptors.read().get(fd) {
+        match self.litebox.descriptor_table().get_entry(fd).entry {
             Descriptor::File { .. } => Err(WriteError::NotForWriting),
             Descriptor::Dir { .. } => Err(WriteError::NotAFile),
         }
@@ -193,16 +193,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn seek(
         &self,
-        fd: &crate::fd::FileFd,
+        fd: &FileFd<Platform>,
         offset: isize,
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
-        let mut descriptors = self.descriptors.write();
+        let descriptor_table = self.litebox.descriptor_table();
         let Descriptor::File {
             idx,
             position,
             metadata: _,
-        } = descriptors.get_mut(fd)
+        } = &mut descriptor_table.get_entry_mut(fd).entry
         else {
             return Err(SeekError::NotAFile);
         };
@@ -324,9 +324,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn fd_file_status(
         &self,
-        fd: &crate::fd::FileFd,
+        fd: &FileFd<Platform>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        match self.descriptors.read().get(fd) {
+        match &self.litebox.descriptor_table().get_entry(fd).entry {
             Descriptor::File { idx, .. } => {
                 let entry = self.tar_data.entries().nth(*idx).unwrap();
                 Ok(super::FileStatus {
@@ -345,7 +345,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn with_metadata<T: core::any::Any, R>(
         &self,
-        _fd: &crate::fd::FileFd,
+        _fd: &FileFd<Platform>,
         _f: impl FnOnce(&T) -> R,
     ) -> Result<R, super::errors::MetadataError> {
         Err(super::errors::MetadataError::NoSuchMetadata)
@@ -353,7 +353,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn with_metadata_mut<T: core::any::Any, R>(
         &self,
-        _fd: &crate::fd::FileFd,
+        _fd: &FileFd<Platform>,
         _f: impl FnOnce(&mut T) -> R,
     ) -> Result<R, super::errors::MetadataError> {
         Err(super::errors::MetadataError::NoSuchMetadata)
@@ -361,7 +361,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn set_file_metadata<T: core::any::Any>(
         &self,
-        _fd: &crate::fd::FileFd,
+        _fd: &FileFd<Platform>,
         metadata: T,
     ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
         Err(super::errors::SetMetadataError::ReadOnlyFileSystem(
@@ -371,10 +371,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn set_fd_metadata<T: core::any::Any>(
         &self,
-        fd: &crate::fd::FileFd,
+        fd: &FileFd<Platform>,
         m: T,
     ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
-        match self.descriptors.write().get_mut(fd) {
+        match &mut self.litebox.descriptor_table().get_entry_mut(fd).entry {
             Descriptor::File { metadata, .. } | Descriptor::Dir { metadata, .. } => {
                 Ok(metadata.insert(m))
             }
@@ -400,8 +400,6 @@ fn mode_of_modeflags(perms: tar_no_std::ModeFlags) -> Mode {
     mode
 }
 
-type Descriptors = super::shared::Descriptors<Descriptor>;
-
 enum Descriptor {
     File {
         idx: usize,
@@ -416,4 +414,11 @@ enum Descriptor {
         path: String,
         metadata: AnyMap,
     },
+}
+
+crate::fd::enable_fds_for_subsystem! {
+    @ Platform: { sync::RawSyncPrimitivesProvider };
+    FileSystem<Platform>;
+    Descriptor;
+    -> FileFd<Platform>;
 }

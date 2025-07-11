@@ -33,17 +33,17 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
         path: impl crate::path::Arg,
         flags: super::OFlags,
         mode: super::Mode,
-    ) -> Result<crate::fd::FileFd, super::errors::OpenError> {
+    ) -> Result<FileFd<Platform>, super::errors::OpenError> {
         todo!()
     }
 
-    fn close(&self, fd: crate::fd::FileFd) -> Result<(), super::errors::CloseError> {
+    fn close(&self, fd: FileFd<Platform>) -> Result<(), super::errors::CloseError> {
         todo!()
     }
 
     fn read(
         &self,
-        fd: &crate::fd::FileFd,
+        fd: &FileFd<Platform>,
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::ReadError> {
@@ -52,7 +52,7 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
 
     fn write(
         &self,
-        fd: &crate::fd::FileFd,
+        fd: &FileFd<Platform>,
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::WriteError> {
@@ -61,7 +61,7 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
 
     fn seek(
         &self,
-        fd: &crate::fd::FileFd,
+        fd: &FileFd<Platform>,
         offset: isize,
         whence: super::SeekWhence,
     ) -> Result<usize, super::errors::SeekError> {
@@ -110,14 +110,14 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
 
     fn fd_file_status(
         &self,
-        fd: &crate::fd::FileFd,
+        fd: &FileFd<Platform>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         todo!()
     }
 
     fn with_metadata<T: core::any::Any, R>(
         &self,
-        fd: &crate::fd::FileFd,
+        fd: &FileFd<Platform>,
         f: impl FnOnce(&T) -> R,
     ) -> Result<R, super::errors::MetadataError> {
         todo!()
@@ -125,7 +125,7 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
 
     fn with_metadata_mut<T: core::any::Any, R>(
         &self,
-        fd: &crate::fd::FileFd,
+        fd: &FileFd<Platform>,
         f: impl FnOnce(&mut T) -> R,
     ) -> Result<R, super::errors::MetadataError> {
         todo!()
@@ -133,7 +133,7 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
 
     fn set_file_metadata<T: core::any::Any>(
         &self,
-        fd: &crate::fd::FileFd,
+        fd: &FileFd<Platform>,
         metadata: T,
     ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
         todo!()
@@ -141,9 +141,16 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
 
     fn set_fd_metadata<T: core::any::Any>(
         &self,
-        fd: &crate::fd::FileFd,
+        fd: &FileFd<Platform>,
         metadata: T,
     ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
         todo!()
     }
+}
+
+crate::fd::enable_fds_for_subsystem! {
+    @Platform: { platform::Provider + 'static };
+    FileSystem<Platform>;
+    ();
+    -> FileFd<Platform>;
 }

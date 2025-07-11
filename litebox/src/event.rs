@@ -18,7 +18,7 @@ use thiserror::Error;
 
 use crate::{
     LiteBox,
-    fd::{FileFd, InternalFd, SocketFd},
+    fd::{FdEnabledSubsystem, InternalFd, TypedFd},
     platform::{ImmediatelyWokenUp, RawMutex, RawMutexProvider, UnblockedOrTimedOut},
     sync::RawSyncPrimitivesProvider,
     utilities::array_index_map::{ArrayIndexMap, Index},
@@ -153,19 +153,9 @@ pub struct WaitableBuilder {
 }
 
 impl WaitableBuilder {
-    /// Begin building a waitable for events on a file
+    /// Begin building a waitable for events on `fd`
     #[must_use]
-    pub fn on_file(fd: &FileFd) -> Self {
-        Self {
-            internal_fd: fd.as_internal_fd(),
-            events: Events::empty(),
-            spurious_wakeups: SpuriousWakeups::Allowed,
-        }
-    }
-
-    /// Begin building a waitable for events on a socket
-    #[must_use]
-    pub fn on_socket(fd: &SocketFd) -> Self {
+    pub fn on_fd<Subsystem: FdEnabledSubsystem>(fd: &TypedFd<Subsystem>) -> Self {
         Self {
             internal_fd: fd.as_internal_fd(),
             events: Events::empty(),
