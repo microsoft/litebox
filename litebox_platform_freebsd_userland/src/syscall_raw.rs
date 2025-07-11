@@ -455,7 +455,7 @@ pub mod syscalls {
     pub type Sysno = SyscallTable;
 
     /// Result type for syscalls
-    pub type SyscallResult = Result<usize, isize>;
+    pub type SyscallResult = Result<usize, crate::errno::Errno>;
 
     /// Perform a syscall with no arguments
     #[allow(dead_code)]
@@ -475,7 +475,7 @@ pub mod syscalls {
             );
         }
         if carry != 0 {
-            Err(ret as isize)
+            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
@@ -500,7 +500,7 @@ pub mod syscalls {
             );
         }
         if carry != 0 {
-            Err(ret as isize)
+            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
@@ -526,7 +526,7 @@ pub mod syscalls {
             );
         }
         if carry != 0 {
-            Err(ret as isize)
+            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
@@ -557,7 +557,7 @@ pub mod syscalls {
             );
         }
         if carry != 0 {
-            Err(ret as isize)
+            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
@@ -591,7 +591,7 @@ pub mod syscalls {
             );
         }
         if carry != 0 {
-            Err(ret as isize)
+            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
@@ -627,7 +627,7 @@ pub mod syscalls {
             );
         }
         if carry != 0 {
-            Err(ret as isize)
+            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
@@ -665,7 +665,7 @@ pub mod syscalls {
             );
         }
         if carry != 0 {
-            Err(ret as isize)
+            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
@@ -682,7 +682,7 @@ pub mod syscalls {
     pub type Sysno = SyscallTable;
 
     /// Result type for syscalls
-    pub type SyscallResult = Result<usize, isize>;
+    pub type SyscallResult = Result<usize, crate::errno::Errno>;
 
     // Stub implementations that panic - FreeBSD syscalls are only supported on x86_64
 

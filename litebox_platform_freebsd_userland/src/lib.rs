@@ -6,16 +6,18 @@
     target_os = "freebsd",
     any(target_arch = "x86_64", target_arch = "x86")
 ))]
+use core::panic;
 // use core::num;
 // use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use core::sync::atomic::AtomicU32;
 // use std::sync::atomic::Ordering::SeqCst;
+use core::mem::size_of;
 use core::time::Duration;
 
 use litebox::fs::OFlags;
-use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
+use litebox::platform::{ImmediatelyWokenUp, RawConstPointer, RawMutPointer};
 use litebox::platform::{ThreadLocalStorageProvider, UnblockedOrTimedOut};
 // use litebox::platform::{ImmediatelyWokenUp, RawConstPointer, ThreadLocalStorageProvider};
 use litebox::utils::ReinterpretUnsignedExt as _;
@@ -99,6 +101,8 @@ impl FreeBSDUserland {
         unimplemented!("seccomp interception is not supported on FreeBSD");
     }
 
+    // todo(chuqi): the /procfs is not guaranteed to be mounted for FreeBSD,
+    // in the future, we should use `sysctl` syscall to do this.
     fn read_proc_self_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
         // TODO: this function is not guaranteed to return all allocated pages, as it may
         // allocate more pages after the mapping file is read. Missing allocated pages may
@@ -107,7 +111,6 @@ impl FreeBSDUserland {
         // whenever it get more pages from the host.
 
         let path = SELFPROC_MAPS_PATH;
-
         let c_path = match std::ffi::CString::new(path) {
             Ok(p) => p,
             Err(_) => return alloc::vec::Vec::new(),
@@ -261,14 +264,74 @@ impl litebox::platform::ExitProvider for FreeBSDUserland {
     }
 }
 
+/// The arguments passed to the thread start function.
+pub struct ThreadStartArgs {
+    pub pt_regs: Box<litebox_common_linux::PtRegs>,
+    pub thread_args: Box<litebox_common_linux::NewThreadArgs<FreeBSDUserland>>,
+    pub entry_point: usize,
+}
+
+/// Thread start trampoline function for FreeBSD.
+/// This is called by FreeBSD's thr_new and unpacks the thread arguments.
+extern "C" fn thread_start(arg: *mut ThreadStartArgs) {
+    // SAFETY: The arg pointer is guaranteed to be valid and point to a ThreadStartArgs
+    // that was created via Box::into_raw in spawn_thread.
+    let thread_start_args = unsafe { Box::from_raw(arg) };
+
+    // SAFETY: Similarly, the pointers inside ThreadStartArgs are valid and were created
+    // via Box::into_raw in spawn_thread.
+    let pt_regs = thread_start_args.pt_regs;
+    let thread_args = thread_start_args.thread_args;
+
+    let entry_point = thread_start_args.entry_point;
+    let pt_regs_stack = *pt_regs;
+
+    // Reset TLS for the new thread
+    // todo(chuqi): support x86
+    unsafe {
+        litebox_common_linux::wrgsbase(0);
+    }
+
+    // Set up thread-local storage for the new thread. This is done by
+    // calling the actual thread callback with the unpacked arguments
+    (thread_args.callback)(*thread_args);
+
+    // Restore the context
+    // todo(chuqi): support x86
+    unsafe {
+        core::arch::asm!(
+            "mov rbx, {0}",
+            "xor rax, rax",
+            "mov rsp, {1}",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rcx",      // skip pt_regs.rax
+            "pop rcx",
+            "pop rdx",
+            "pop rsi",
+            "pop rdi",
+            "add rsp, 24",  // skip orig_rax, rip, cs, eflags
+            "popfq",
+            "pop rsp",      // restore the stack pointer (which points to the entry point of the thread)
+            "jmp rbx",
+            in(reg) entry_point,
+            in(reg) &raw const pt_regs_stack.r11, // restore registers, starting from r11
+            out("rax") _,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+pub type ThreadLocalDescriptor = u8;
+
 impl litebox::platform::ThreadProvider for FreeBSDUserland {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadArgs = litebox_common_linux::NewThreadArgs<FreeBSDUserland>;
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
     type ThreadId = usize;
 
-    #[allow(unused_variables)]
-    #[allow(unused_mut)]
     unsafe fn spawn_thread(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -277,14 +340,73 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
         entry_point: usize,
         mut thread_args: Box<Self::ThreadArgs>,
     ) -> Result<usize, Self::ThreadSpawnError> {
-        unimplemented!("spawn_thread is not implemented for FreeBSD yet.");
+        let child_tid_ptr = core::ptr::from_mut(thread_args.task.as_mut()) as u64
+            + core::mem::offset_of!(litebox_common_linux::Task<FreeBSDUserland>, tid) as u64;
+
+        let mut copied_pt_regs = Box::new(*ctx);
+
+        // Reset the child stack pointer to the top of the allocated thread stack.
+        copied_pt_regs.rsp = stack.as_usize() + stack_size - 0x8;
+
+        let thread_args = thread_args;
+
+        let thread_start_args = ThreadStartArgs {
+            pt_regs: copied_pt_regs,
+            thread_args: thread_args,
+            entry_point: entry_point,
+        };
+
+        // we should use heap to pass the parameter to avoid using the parents'
+        // stack, which may be freed (race-condition) before the thread starts.
+        let thread_start_arg_ptr = Box::into_raw(Box::new(thread_start_args));
+
+        let thr_param = freebsd_types::ThrParam {
+            start_func: thread_start as usize as u64,
+            arg: thread_start_arg_ptr as u64,
+            stack_base: stack.as_usize() as u64,
+            stack_size: stack_size as u64,
+            tls_base: 0, // set by our callback
+            tls_size: 0, // no need to specify it
+            child_tid: child_tid_ptr,
+            parent_tid: 0,
+            flags: 0,
+            _pad: 0,
+            rtp: 0, // we do not use real-time priority for now
+        };
+
+        // todo(chuqi): distinguish between x86 and x86_64
+        let result = unsafe {
+            syscalls::syscall2(
+                syscalls::Sysno::ThrNew,
+                &raw const thr_param as usize,
+                size_of::<freebsd_types::ThrParam>(),
+            )
+        };
+
+        match result {
+            Ok(_) => {
+                // FreeBSD thr_new returns 0 on success. The actual thread ID will be written
+                // to child_tid_ptr by the kernel. We need to read it from the structure.
+                Ok(unsafe { *(child_tid_ptr as *const i32) as usize })
+            }
+            Err(errno) => {
+                // todo(chuqi): handle errno properly
+                Err(
+                    litebox_common_linux::errno::Errno::try_from(i32::from(errno))
+                        .unwrap_or(litebox_common_linux::errno::Errno::EINVAL),
+                )
+            }
+        }
     }
 
-    fn terminate_thread(&self, code: Self::ExitCode) -> ! {
-        unimplemented!(
-            "terminate_thread is not implemented for FreeBSD yet. code: {}",
-            code
-        );
+    fn terminate_thread(&self, _code: Self::ExitCode) -> ! {
+        // Use thr_exit to terminate the current thread
+        unsafe {
+            syscalls::syscall1(syscalls::Sysno::ThrExit, core::ptr::null::<()>() as usize)
+                .expect("thr_exit should not fail");
+        }
+        // This should never be reached as thr_exit does not return
+        unreachable!("thr_exit should not return")
     }
 }
 
@@ -363,7 +485,7 @@ impl RawMutex {
                 Ok(0) => {
                     // Fallthrough: check if spurious.
                 }
-                Err(e) if e == i32::from(errno::Errno::EAGAIN) as isize => {
+                Err(e) if e == i32::from(crate::errno::Errno::EAGAIN) as isize => {
                     // A wake-up was already in progress when we attempted to wait. Has someone
                     // already touched inner value? We only check this on the first time around,
                     // anything else could be a true wake.
@@ -536,6 +658,112 @@ impl litebox::platform::Instant for Instant {
     }
 }
 
+/// Check if the CPU supports FSGSBASE instructions on FreeBSD.
+///
+/// On FreeBSD, we can detect this using the CPUID instruction directly
+/// or fall back to sysctl if available. For now, we'll use a conservative
+/// approach and try the instruction with error handling.
+// todo(chuqi): x86 support
+fn has_fsgsbase_support() -> bool {
+    // On FreeBSD, we can check for FSGSBASE support using CPUID
+    // FSGSBASE is indicated by CPUID.(EAX=07H, ECX=0):EBX[bit 0]
+    unsafe {
+        let eax = 7u32;
+        let ecx = 0u32;
+        let ebx: u32;
+
+        // Save and restore rbx since it's used by LLVM
+        core::arch::asm!(
+            "mov {rbx_save}, rbx",
+            "cpuid",
+            "mov {ebx_out:e}, ebx",
+            "mov rbx, {rbx_save}",
+            rbx_save = out(reg) _,
+            ebx_out = out(reg) ebx,
+            in("eax") eax,
+            in("ecx") ecx,
+            out("edx") _,
+        );
+
+        // FSGSBASE is bit 0 of EBX when EAX=7, ECX=0
+        (ebx & 1) != 0
+    }
+}
+
+/// Get the current fs base register value.
+///
+/// Depending on whether `fsgsbase` instructions are enabled, we choose
+/// between `arch_prctl` or `rdfsbase` to get the fs base.
+#[cfg(target_arch = "x86_64")]
+fn get_fs_base() -> Result<usize, litebox_common_linux::errno::Errno> {
+    /// Function pointer to get the current fs base.
+    static GET_FS_BASE: spin::Once<fn() -> Result<usize, litebox_common_linux::errno::Errno>> =
+        spin::Once::new();
+    GET_FS_BASE.call_once(|| {
+        if has_fsgsbase_support() {
+            || Ok(unsafe { litebox_common_linux::rdfsbase() })
+        } else {
+            get_fs_base_arch_prctl
+        }
+    })()
+}
+
+/// Set the fs base register value.
+///
+/// Depending on whether `fsgsbase` instructions are enabled, we choose
+/// between `arch_prctl` or `wrfsbase` to set the fs base.
+#[cfg(target_arch = "x86_64")]
+fn set_fs_base(fs_base: usize) -> Result<usize, litebox_common_linux::errno::Errno> {
+    static SET_FS_BASE: spin::Once<fn(usize) -> Result<usize, litebox_common_linux::errno::Errno>> =
+        spin::Once::new();
+    SET_FS_BASE.call_once(|| {
+        if has_fsgsbase_support() {
+            |fs_base| {
+                unsafe { litebox_common_linux::wrfsbase(fs_base) };
+                Ok(0)
+            }
+        } else {
+            set_fs_base_arch_prctl
+        }
+    })(fs_base)
+}
+
+/// Get fs register value via syscall `sysarch` (FreeBSD equivalent of Linux arch_prctl).
+// todo(chuqi): x86 support
+fn get_fs_base_arch_prctl() -> Result<usize, litebox_common_linux::errno::Errno> {
+    let mut fs_base = core::mem::MaybeUninit::<usize>::uninit();
+    unsafe {
+        syscalls::syscall2(
+            syscall_raw::SyscallTable::Sysarch,
+            freebsd_types::AMD64_GET_FSBASE as usize,
+            fs_base.as_mut_ptr() as usize,
+        )
+    }
+    .map_err(|err| match err {
+        errno::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
+        errno::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
+        _ => unimplemented!("unexpected error {err}"),
+    })?;
+    Ok(unsafe { fs_base.assume_init() })
+}
+
+/// Set fs register value via syscall `arch_prctl`.
+// todo(chuqi): x86 support
+fn set_fs_base_arch_prctl(fs_base: usize) -> Result<usize, litebox_common_linux::errno::Errno> {
+    unsafe {
+        syscalls::syscall2(
+            syscall_raw::SyscallTable::Sysarch,
+            freebsd_types::AMD64_SET_FSBASE as usize,
+            fs_base,
+        )
+    }
+    .map_err(|err| match err {
+        errno::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
+        errno::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
+        _ => unimplemented!("unexpected error {err}"),
+    })
+}
+
 #[allow(dead_code)]
 pub struct PunchthroughToken {
     punchthrough: PunchthroughSyscall<FreeBSDUserland>,
@@ -551,7 +779,108 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
             <Self::Punchthrough as litebox::platform::Punchthrough>::ReturnFailure,
         >,
     > {
-        unimplemented!("punchthrough is not implemented for FreeBSDUserland");
+        match self.punchthrough {
+            PunchthroughSyscall::RtSigprocmask { how, set, oldset } => {
+                // FreeBSD uses sigprocmask instead of rt_sigprocmask
+                // and doesn't need sigsetsize parameter
+                
+                // Convert Linux SigmaskHow to FreeBSD values (they should be the same)
+                let how_val = how as usize;
+                
+                // Handle the set parameter
+                let set_ptr = if let Some(set) = set {
+                    // Read the signal set from the provided pointer
+                    let sig_set = unsafe { set.read_at_offset(0) }
+                        .ok_or(litebox::platform::PunchthroughError::Failure(
+                            litebox_common_linux::errno::Errno::EFAULT,
+                        ))?
+                        .into_owned();
+                    
+                    // Note: FreeBSD doesn't require special handling of SIGSYS
+                    // since it doesn't use Seccomp
+                    core::ptr::from_ref(&sig_set) as usize
+                } else {
+                    0
+                };
+                
+                // Handle the oldset parameter
+                let oldset_ptr = oldset.map_or(0, |ptr| ptr.as_usize());
+                
+                // Call FreeBSD's sigprocmask syscall
+                unsafe {
+                    syscalls::syscall3(
+                        syscall_raw::SyscallTable::Sigprocmask,
+                        how_val,
+                        set_ptr,
+                        oldset_ptr,
+                    )
+                }
+                .map_err(|err| match err {
+                    errno::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
+                    errno::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
+                    _ => panic!("unexpected error {err}"),
+                })
+                .map_err(litebox::platform::PunchthroughError::Failure)
+            }
+            PunchthroughSyscall::RtSigaction {
+                signum,
+                act,
+                oldact,
+            } => {
+                // FreeBSD uses sigaction instead of rt_sigaction
+                let act_ptr = act.map_or(0, |ptr| ptr.as_usize());
+                let oldact_ptr = oldact.map_or(0, |ptr| ptr.as_usize());
+                
+                unsafe {
+                    syscalls::syscall3(
+                        syscall_raw::SyscallTable::Sigaction,
+                        signum as usize,
+                        act_ptr,
+                        oldact_ptr,
+                    )
+                }
+                .map_err(|err| match err {
+                    errno::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
+                    errno::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
+                    _ => panic!("unexpected error {err}"),
+                })
+                .map_err(litebox::platform::PunchthroughError::Failure)
+            }
+            PunchthroughSyscall::SetFsBase { addr } => {
+                set_fs_base(addr).map_err(litebox::platform::PunchthroughError::Failure)
+            }
+            PunchthroughSyscall::GetFsBase { addr } => {
+                let fs_base =
+                    get_fs_base().map_err(litebox::platform::PunchthroughError::Failure)?;
+                unsafe { addr.write_at_offset(0, fs_base) }.ok_or(
+                    litebox::platform::PunchthroughError::Failure(
+                        litebox_common_linux::errno::Errno::EFAULT,
+                    ),
+                )?;
+                Ok(0)
+            }
+            PunchthroughSyscall::WakeByAddress { addr } => unsafe {
+                syscalls::syscall5(
+                    syscalls::Sysno::UmtxOp,
+                    addr.as_usize(),
+                    freebsd_types::UmtxOpOperation::UMTX_OP_WAKE as usize,
+                    1,
+                    addr.as_usize(),
+                    0,
+                )
+            }
+            .map_err(|err| match err {
+                errno::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
+                _ => panic!("unexpected error {err}"),
+            })
+            .map_err(litebox::platform::PunchthroughError::Failure),
+            // todo(chuqi): add more punchthroughs
+            _ => {
+                unimplemented!(
+                    "PunchthroughToken for FreeBSDUserland is not fully implemented yet"
+                );
+            }
+        }
     }
 }
 
@@ -612,6 +941,7 @@ fn umtx_op_operation_timeout(
 
     let (uaddr, uaddr2) = if let Some(ref ts) = timeout_spec {
         // When timeout is provided, uaddr must be size of timespec
+        // and uddr2 must point to the timespec structure.
         (
             core::mem::size_of::<libc::timespec>(),
             ts as *const libc::timespec as usize,
@@ -634,6 +964,7 @@ fn umtx_op_operation_timeout(
             uaddr2,
         )
     }
+    .map_err(|err| i32::from(err) as isize)
 }
 
 impl litebox::platform::RawPointerProvider for FreeBSDUserland {
@@ -975,8 +1306,11 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
 
     // todo(chuqi): support x86
     fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
-        let old_gs_base = unsafe { litebox_common_linux::rdgsbase() };
-        assert!(old_gs_base == 0, "TLS already set for this thread");
+        // todo(chuqi): temporarily disable the check for FreeBSD, because FreeBSD's
+        // child thread (from thr_new) creation will inherit the parent's gs
+
+        // let old_gs_base = unsafe { litebox_common_linux::rdgsbase() };
+        // assert!(old_gs_base == 0, "TLS already set for this thread");
         let tls = Box::new(tls);
         unsafe { litebox_common_linux::wrgsbase(Box::into_raw(tls) as usize) };
     }
@@ -1043,6 +1377,8 @@ mod tests {
 
         let reserved_pages: Vec<_> =
             <FreeBSDUserland as PageManagementProvider<4096>>::reserved_pages(platform).collect();
+
+        println!("SASS, reserved pages: {:?}", reserved_pages);
 
         // Check that the reserved pages are in order and non-overlapping
         let mut prev = 0;
