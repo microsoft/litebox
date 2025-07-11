@@ -102,19 +102,34 @@ void _start() {
 
 #[test]
 fn test_syscall_rewriter() {
-    let dir_path = std::env::var("OUT_DIR").unwrap();
-    let src_path = std::path::Path::new(dir_path.as_str()).join("hello_exec_nolibc.c");
-    std::fs::write(src_path.clone(), HELLO_WORLD_NOLIBC).unwrap();
-    let path = std::path::Path::new(dir_path.as_str()).join("hello_exec_nolibc");
-    common::compile(
-        src_path.to_str().unwrap(),
-        path.to_str().unwrap(),
-        true,
-        true,
-    );
+    let (path, hooked_path) = {
+        #[cfg(target_os = "freebsd")]
+        {
+            // Use the already compiled executable from the tests folder (same dir as this file)
+            let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            test_dir.push("tests");
+            let path = test_dir.join("hello_exec_nolibc");
+            let hooked_path = test_dir.join("hello_exec_nolibc.hooked");
+            (path, hooked_path)
+        }
+        #[cfg(not(target_os = "freebsd"))]
+        {
+            let dir_path = std::env::var("OUT_DIR").unwrap();
+            let src_path = std::path::Path::new(dir_path.as_str()).join("hello_exec_nolibc.c");
+            std::fs::write(src_path.clone(), HELLO_WORLD_NOLIBC).unwrap();
+            let path = std::path::Path::new(dir_path.as_str()).join("hello_exec_nolibc");
+            common::compile(
+                src_path.to_str().unwrap(),
+                path.to_str().unwrap(),
+                true,
+                true,
+            );
+            let hooked_path = std::path::Path::new(dir_path.as_str()).join("hello_exec_nolibc.hooked");
+            (path, hooked_path)
+        }
+    };
 
     // rewrite the hello_exec_nolibc
-    let hooked_path = std::path::Path::new(dir_path.as_str()).join("hello_exec_nolibc.hooked");
     let _ = std::fs::remove_file(hooked_path.clone());
     let output = std::process::Command::new("cargo")
         .args([
