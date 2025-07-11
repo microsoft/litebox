@@ -54,7 +54,7 @@ impl FreeBSDUserland {
         Box::leak(Box::new(platform))
     }
 
-    /// Register the syscall handler (provided by the FreeBSD shim)
+    /// Register the syscall handler (provided by the Linux shim)
     ///
     /// # Panics
     ///
