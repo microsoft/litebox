@@ -24,6 +24,10 @@ impl<Platform: RawSyncPrimitivesProvider + ExitProvider> LiteBox<Platform> {
     /// Create a new (empty) [`LiteBox`] instance for the given `platform`.
     pub fn new(platform: &'static Platform) -> Self {
         let sync = Synchronization::new_from_platform(platform);
+        // We set `descriptors` to `None` and replace it out with a `Some` after creation due to a
+        // circular dependency between the two types for their initialization. The public interfaces
+        // here do not need to deal with any of this though; see the post-creation invariant
+        // guarantee written on `LiteBoxX::descriptors`.
         let descriptors = sync.new_rwlock(None);
         let ret = Self {
             x: Arc::new(LiteBoxX {
