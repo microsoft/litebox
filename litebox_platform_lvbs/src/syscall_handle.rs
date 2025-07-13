@@ -40,19 +40,21 @@ use x86_64::{
 
 type SyscallHandler = fn(SyscallRequest<crate::host::LvbsLinuxKernel>) -> isize;
 static SYSCALL_HANDLER: spin::Once<SyscallHandler> = spin::Once::new();
-const MAX_SYSCALL_ARGS: usize = 8;
 
 pub fn optee_syscall_entry(request: SyscallRequest<crate::Platform>) -> isize {
-    let _res: Result<usize, Errno> = match request {
-        SyscallRequest::Return { ret: _ } => Ok(0),
-        SyscallRequest::Log { buf: _, len: _ } => Ok(0),
+    let _res: Result<isize, Errno> = match request {
+        SyscallRequest::Log { buf: _, len: _ } | SyscallRequest::Return { ret: _ } => Ok(0),
+        SyscallRequest::Debug { ctx } => {
+            debug_serial_println!("Debug syscall invoked with context: {:#x?}", ctx);
+            Ok(0)
+        }
     };
 
     0
 }
 
 #[non_exhaustive]
-pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
+pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     Return {
         ret: i64,
     },
@@ -60,39 +62,100 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         buf: Platform::RawConstPointer<u8>,
         len: usize,
     },
+    Debug {
+        ctx: &'a SyscallContext,
+    },
 }
 
-// assume OP-TEE syscall
-#[allow(clippy::too_many_arguments)]
-fn handle_syscall(
-    arg0: u64,
-    arg1: u64,
-    arg2: u64,
-    arg3: u64,
-    arg4: u64,
-    arg5: u64,
-    arg6: u64,
-    arg7: u64,
-    sysnr: u64,
-) -> ! {
-    debug_serial_println!(
-        "syscall {:#x} invoked with arguments:\n  {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}",
-        sysnr,
-        arg0,
-        arg1,
-        arg2,
-        arg3,
-        arg4,
-        arg5,
-        arg6,
-        arg7
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct SyscallContext {
+    rdi: u64, // arg0
+    rsi: u64, // arg1
+    rdx: u64, // arg2
+    r10: u64, // arg3
+    r8: u64,  // arg4
+    r9: u64,  // arg5
+    r12: u64, // arg6
+    r13: u64, // arg7
+    rcx: u64, // userspace return address
+    r11: u64, // userspace rflags
+    rsp: u64, // userspace stack pointer
+}
+
+impl SyscallContext {
+    /// # Panics
+    /// Panics if the index is out of bounds (greater than 7).
+    pub fn arg_index(&self, index: usize) -> u64 {
+        match index {
+            0 => self.rdi,
+            1 => self.rsi,
+            2 => self.rdx,
+            3 => self.r10,
+            4 => self.r8,
+            5 => self.r9,
+            6 => self.r12,
+            7 => self.r13,
+            _ => panic!("BUG: Invalid syscall argument index: {}", index),
+        }
+    }
+
+    pub fn user_rip(&self) -> Option<VirtAddr> {
+        VirtAddr::try_new(self.rcx).ok()
+    }
+
+    pub fn user_rflags(&self) -> RFlags {
+        RFlags::from_bits_truncate(self.r11)
+    }
+
+    pub fn user_rsp(&self) -> Option<VirtAddr> {
+        VirtAddr::try_new(self.rsp).ok()
+    }
+}
+
+#[allow(clippy::similar_names)]
+#[allow(unreachable_code)]
+fn syscall_dispatcher(sysnr: u64, ctx: *const SyscallContext) -> isize {
+    let syscall_handler: SyscallHandler = *SYSCALL_HANDLER
+        .get()
+        .expect("Syscall handler should be initialized");
+
+    debug_serial_println!("sysnr = {:#x}, ctx = {:#x}", sysnr, ctx as usize);
+    let ctx = unsafe { &*ctx };
+
+    assert!(
+        ctx.user_rip().is_some() && ctx.user_rsp().is_some(),
+        "BUG: userspace RIP or RSP is invalid"
     );
 
-    // TODO: check syscall number and its handling result to determine whether we should
+    // assume OP-TEE syscall
+    let sysret = match sysnr {
+        0xdeadbeef => syscall_handler(SyscallRequest::Debug { ctx }),
+        _ => {
+            panic!("BUG: syscall_dispatcher called with sysnr = {:#x}", sysnr)
+        }
+    };
+
+    // TODO: check syscall number and its result to determine whether it should
     // return to the user space or switch to VTL0
-    let sysret = 0;
+
+    // return to the user space
+    if sysnr != 0xdeadbeef {
+        return sysret;
+    }
+
+    // save user context before switching to VTL0
+    crate::platform_low()
+        .save_user_context(
+            ctx.user_rip().unwrap(),
+            ctx.user_rsp().unwrap(),
+            ctx.user_rflags(),
+        )
+        .expect("Failed to save user context");
 
     let kernel_context = get_per_core_kernel_context();
+    kernel_context.set_vtl_return_value(0);
     let stack_top = kernel_context.kernel_stack_top();
     unsafe {
         asm!(
@@ -101,38 +164,18 @@ fn handle_syscall(
             in("rax") stack_top
         );
     }
-    kernel_context.set_vtl_return_value(sysret);
 
     crate::platform_low().page_table.switch_address_space();
     unsafe { jump_vtl_switch_loop() }
-}
-
-fn syscall_dispatcher() {
-    let syscall_handler: SyscallHandler = *SYSCALL_HANDLER
-        .get()
-        .expect("Syscall handler should be initialized");
-
-    syscall_handler(SyscallRequest::Return { ret: 0 });
-
-    let rip: u64 = 0;
-    let rsp: u64 = 0;
-    let rflags: u64 = RFlags::INTERRUPT_FLAG.bits();
-    let sysret: u64 = 0;
-
-    unsafe {
-        asm!(
-            "mov rsp, rdi",
-            "sysretq",
-            in("rcx") rip, in("rdi") rsp, in("r11") rflags,
-            in("rax") sysret
-        );
-    }
+    unreachable!()
 }
 
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_dispatcher_wrapper() {
     naked_asm!(
-        "push rax",
+        "push rsp",
+        "push r11",
+        "push rcx",
         "push r13",
         "push r12",
         "push r9",
@@ -141,42 +184,22 @@ unsafe extern "C" fn syscall_dispatcher_wrapper() {
         "push rdx",
         "push rsi",
         "push rdi",
-        "mov rdi, rcx",
+        "mov rdi, rax",
         "mov rsi, rsp",
-        "mov rdx, r11",
-        "call {save_user_state}",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
+        "and rsp, -16",
+        "call {syscall_dispatcher}",
+        "add rsp, 0x40", // 8 64-bit registers
         "pop rcx",
-        "pop r8",
-        "pop r9",
-        "call {handle_syscall}",
-        save_user_state = sym save_user_state,
-        handle_syscall = sym handle_syscall,
+        "pop r11",
+        "pop rbp",
+        "sysretq",
+        syscall_dispatcher = sym syscall_dispatcher,
     );
-}
-
-fn save_user_state(user_ret_addr: u64, user_stack_ptr: u64, user_rflags: u64) {
-    if crate::platform_low()
-        .save_user_context(
-            VirtAddr::new(user_ret_addr),
-            VirtAddr::new(
-                user_stack_ptr
-                    + u64::try_from(core::mem::size_of::<u64>() * (MAX_SYSCALL_ARGS + 1)).unwrap(),
-            ),
-            RFlags::from_bits_truncate(user_rflags),
-        )
-        .is_err()
-    {
-        debug_serial_println!("Failed to save user context in the syscall handler");
-    }
 }
 
 /// This function enables 64-bit syscall extensions and sets up the necessary MSRs.
 /// It must be called for each core.
 /// # Panics
-///
 /// Panics if GDT is not initialized for the current core.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn init(syscall_handler: SyscallHandler) {

@@ -19,10 +19,8 @@ use x86_64::{
 // This would be fine because we only run tiny programs in the VTL1 user space.
 const VTL1_USER_BASE: u64 = 0x1_0000_0000;
 const VTL1_USER_TOP: u64 = 0x1_4000_0000;
-
 // fixed-size user stack for an OP-TEE TA
-// pub const USER_STACK_SIZE: usize = 16 * PAGE_SIZE;
-pub const VTL1_USER_STACK_SIZE: usize = PAGE_SIZE;
+pub const VTL1_USER_STACK_SIZE: usize = 16 * PAGE_SIZE;
 
 pub trait UserSpace {
     /// Global virtual address base for VTL1 user space
