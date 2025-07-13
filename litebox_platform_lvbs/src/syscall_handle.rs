@@ -4,6 +4,7 @@ use crate::{
     user_context::UserSpace,
 };
 use core::arch::{asm, naked_asm};
+use litebox_common_linux::errno::Errno;
 use x86_64::{
     VirtAddr,
     registers::{
@@ -12,8 +13,54 @@ use x86_64::{
     },
 };
 
-// the maximum number of arguments of OP-TEE syscall is 8
+// OP-TEE-IA system call register setup
+//
+// OP-TEE supports up to 8 arguments for system calls. OP-TEE-IA uses two additional
+// registers (r12 and r13) to pass the 6th and 7th arguments.
+//
+// rax: system call number
+// rdi: arg0
+// rsi: arg1
+// rdx: arg2
+// r10: arg3
+// r8:  arg4
+// r9:  arg5
+// r12: arg6 (*)
+// r13: arg7 (*)
+//
+// the `syscall` instruction automatically sets the following registers:
+// rcx: userspace return address (note. arg3 for normal func call)
+// r11: userspace rflags
+//
+// the `sysretq` instruction uses the following registers:
+// rax: syscall return value
+// rcx: userspace return address
+// r11: userspace rflags
+// Note. rsp should point to the userspace stack before calling `sysretq`
+
+type SyscallHandler = fn(SyscallRequest<crate::host::LvbsLinuxKernel>) -> isize;
+static SYSCALL_HANDLER: spin::Once<SyscallHandler> = spin::Once::new();
 const MAX_SYSCALL_ARGS: usize = 8;
+
+pub fn optee_syscall_entry(request: SyscallRequest<crate::Platform>) -> isize {
+    let _res: Result<usize, Errno> = match request {
+        SyscallRequest::Return { ret: _ } => Ok(0),
+        SyscallRequest::Log { buf: _, len: _ } => Ok(0),
+    };
+
+    0
+}
+
+#[non_exhaustive]
+pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
+    Return {
+        ret: i64,
+    },
+    Log {
+        buf: Platform::RawConstPointer<u8>,
+        len: usize,
+    },
+}
 
 // assume OP-TEE syscall
 #[allow(clippy::too_many_arguments)]
@@ -58,6 +105,28 @@ fn handle_syscall(
 
     crate::platform_low().page_table.switch_address_space();
     unsafe { jump_vtl_switch_loop() }
+}
+
+fn syscall_dispatcher() {
+    let syscall_handler: SyscallHandler = *SYSCALL_HANDLER
+        .get()
+        .expect("Syscall handler should be initialized");
+
+    syscall_handler(SyscallRequest::Return { ret: 0 });
+
+    let rip: u64 = 0;
+    let rsp: u64 = 0;
+    let rflags: u64 = RFlags::INTERRUPT_FLAG.bits();
+    let sysret: u64 = 0;
+
+    unsafe {
+        asm!(
+            "mov rsp, rdi",
+            "sysretq",
+            in("rcx") rip, in("rdi") rsp, in("r11") rflags,
+            in("rax") sysret
+        );
+    }
 }
 
 #[unsafe(naked)]
@@ -110,14 +179,16 @@ fn save_user_state(user_ret_addr: u64, user_stack_ptr: u64, user_rflags: u64) {
 ///
 /// Panics if GDT is not initialized for the current core.
 #[cfg(target_arch = "x86_64")]
-pub fn init() {
+pub(crate) fn init(syscall_handler: SyscallHandler) {
+    SYSCALL_HANDLER.call_once(|| syscall_handler);
+
     // enable 64-bit syscall/sysret
     let mut efer = Efer::read();
     efer.insert(EferFlags::SYSTEM_CALL_EXTENSIONS);
     unsafe { Efer::write(efer) };
 
-    let handler_addr = syscall_dispatcher_wrapper as *const () as u64;
-    LStar::write(VirtAddr::new(handler_addr));
+    let dispatcher_addr = syscall_dispatcher_wrapper as *const () as u64;
+    LStar::write(VirtAddr::new(dispatcher_addr));
 
     let rflags = RFlags::INTERRUPT_FLAG;
     SFMask::write(rflags);
@@ -131,7 +202,7 @@ pub fn init() {
 }
 
 #[cfg(target_arch = "x86")]
-pub fn init() {
+pub(crate) fn init(_syscall_handler: SyscallHandler) {
     todo!("we don't support 32-bit mode syscalls for now");
     // AMD and Intel CPUs have different syscall mechanisms in 32-bit mode.
 }

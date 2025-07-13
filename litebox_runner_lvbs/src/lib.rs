@@ -77,7 +77,7 @@ pub fn init() -> Option<&'static Platform> {
     }
     interrupts::init_idt();
     x86_64::instructions::interrupts::enable();
-    syscall_handle::init();
+    Platform::register_syscall_handler(syscall_handle::optee_syscall_entry);
 
     ret
 }

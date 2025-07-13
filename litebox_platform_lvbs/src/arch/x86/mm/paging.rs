@@ -330,8 +330,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         unsafe { Self::init(frame.start_address()) }
     }
 
-    /// This function switches the address space of the current processor/core using the given page table (e.g., its CR3 register) and
-    /// returns the physical frame of the old page table.
+    /// This function switches the address space of the current processor/core using the given page table
+    /// (e.g., its CR3 register) and returns the physical frame of the old page table.
     ///
     /// # Safety
     /// The caller must ensure that the page table is valid and maps the entire VTL1 kernel address space.

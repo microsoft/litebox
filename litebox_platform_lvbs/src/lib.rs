@@ -344,6 +344,15 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 
         pt
     }
+
+    /// Register `syscall_handler` to handle syscalls. This function must be called for each core.
+    pub fn register_syscall_handler(
+        syscall_handler: fn(
+            syscall_handle::SyscallRequest<LinuxKernel<host::lvbs_impl::HostLvbsInterface>>,
+        ) -> isize,
+    ) {
+        syscall_handle::init(syscall_handler);
+    }
 }
 
 impl<Host: HostInterface> RawMutexProvider for LinuxKernel<Host> {
