@@ -3,15 +3,16 @@
 use crate::{
     kernel_context::get_per_core_kernel_context,
     mshv::{
-        VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction,
-        vsm::{NUM_VTLCALL_PARAMS, vsm_dispatch},
-        vsm_intercept::vsm_handle_intercept,
+        NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL,
+        VsmFunction, vsm::vsm_dispatch, vsm_intercept::vsm_handle_intercept,
+        vsm_optee::vsm_optee_dispatch,
     },
 };
 use core::{
     arch::{asm, naked_asm},
     mem,
 };
+use litebox_common_linux::errno::Errno;
 use num_enum::TryFromPrimitive;
 
 /// Return to VTL0
@@ -263,7 +264,7 @@ fn vtl_switch_loop() -> ! {
                 {
                     todo!("unknown function ID = {:#x}", params[0]);
                 } else {
-                    let result = vsm_dispatch(&params);
+                    let result = vtlcall_dispatch(&params);
                     kernel_context.set_vtl_return_value(result as u64);
                     jump_vtl_switch_loop_with_stack_cleanup();
                 }
@@ -277,6 +278,32 @@ fn vtl_switch_loop() -> ! {
             }
         }
         // do not put any code which might corrupt registers
+    }
+}
+
+fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
+    let func_id = VsmFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
+        .unwrap_or(VsmFunction::Unknown);
+    match func_id {
+        VsmFunction::EnableAPsVtl
+        | VsmFunction::BootAPs
+        | VsmFunction::LockRegs
+        | VsmFunction::SignalEndOfBoot
+        | VsmFunction::ProtectMemory
+        | VsmFunction::LoadKData
+        | VsmFunction::ValidateModule
+        | VsmFunction::FreeModuleInit
+        | VsmFunction::UnloadModule
+        | VsmFunction::CopySecondaryKey
+        | VsmFunction::KexecValidate
+        | VsmFunction::PatchText => vsm_dispatch(func_id, &params[1..]),
+        VsmFunction::OpteeOpenSession
+        | VsmFunction::OpteeInvokeCommand
+        | VsmFunction::OpteeCloseSession
+        | VsmFunction::OpteeCancel
+        | VsmFunction::OpteeRegisterShm
+        | VsmFunction::OpteeUnregisterShm => vsm_optee_dispatch(func_id, &params[1..]),
+        VsmFunction::Unknown => Errno::EINVAL.as_neg().into(),
     }
 }
 

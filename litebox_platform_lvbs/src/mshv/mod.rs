@@ -7,6 +7,7 @@ mod hvcall_vp;
 mod mem_integrity;
 pub(crate) mod vsm;
 mod vsm_intercept;
+mod vsm_optee;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 
@@ -100,6 +101,9 @@ pub const HV_REGISTER_PENDING_EVENT0: u32 = 0x0001_0004;
 
 pub const HV_SECURE_VTL_BOOT_TOKEN: u8 = 0xdc;
 
+/// VTL call parameters (param[0]: function ID, param[1-3]: parameters)
+pub const NUM_VTLCALL_PARAMS: usize = 4;
+
 pub const VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL: u32 = 0x1_ffe0;
 pub const VSM_VTL_CALL_FUNC_ID_BOOT_APS: u32 = 0x1_ffe1;
 pub const VSM_VTL_CALL_FUNC_ID_LOCK_REGS: u32 = 0x1_ffe2;
@@ -113,10 +117,19 @@ pub const VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY: u32 = 0x1_ffe9;
 pub const VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE: u32 = 0x1_ffea;
 pub const VSM_VTL_CALL_FUNC_ID_PATCH_TEXT: u32 = 0x1_ffeb;
 
+// These OP-TEE function IDs are not fixed and can be changed
+pub const VSM_VTL_CALL_FUNC_ID_OPTEE_OPEN_SESSION: u32 = 0x10_0000;
+pub const VSM_VTL_CALL_FUNC_ID_OPTEE_INVOKE_COMMAND: u32 = 0x10_0001;
+pub const VSM_VTL_CALL_FUNC_ID_OPTEE_CLOSE_SESSION: u32 = 0x10_0002;
+pub const VSM_VTL_CALL_FUNC_ID_OPTEE_CANCEL: u32 = 0x10_0003;
+pub const VSM_VTL_CALL_FUNC_ID_OPTEE_REGISTER_SHM: u32 = 0x10_0004;
+pub const VSM_VTL_CALL_FUNC_ID_OPTEE_UNREGISTER_SHM: u32 = 0x10_0005;
+
 /// VSM Functions
 #[derive(Debug, PartialEq, TryFromPrimitive)]
 #[repr(u32)]
 pub enum VsmFunction {
+    // VSM/Heki functions
     EnableAPsVtl = VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL,
     BootAPs = VSM_VTL_CALL_FUNC_ID_BOOT_APS,
     LockRegs = VSM_VTL_CALL_FUNC_ID_LOCK_REGS,
@@ -129,6 +142,13 @@ pub enum VsmFunction {
     CopySecondaryKey = VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY,
     KexecValidate = VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE,
     PatchText = VSM_VTL_CALL_FUNC_ID_PATCH_TEXT,
+    // OP-TEE functions
+    OpteeOpenSession = VSM_VTL_CALL_FUNC_ID_OPTEE_OPEN_SESSION,
+    OpteeInvokeCommand = VSM_VTL_CALL_FUNC_ID_OPTEE_INVOKE_COMMAND,
+    OpteeCloseSession = VSM_VTL_CALL_FUNC_ID_OPTEE_CLOSE_SESSION,
+    OpteeCancel = VSM_VTL_CALL_FUNC_ID_OPTEE_CANCEL,
+    OpteeRegisterShm = VSM_VTL_CALL_FUNC_ID_OPTEE_REGISTER_SHM,
+    OpteeUnregisterShm = VSM_VTL_CALL_FUNC_ID_OPTEE_UNREGISTER_SHM,
     Unknown = 0xffff_ffff,
 }
 
