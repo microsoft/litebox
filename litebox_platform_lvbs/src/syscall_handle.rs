@@ -38,7 +38,8 @@ use x86_64::{
 // r11: userspace rflags
 // Note. rsp should point to the userspace stack before calling `sysretq`
 
-type SyscallHandler = fn(SyscallRequest<crate::host::LvbsLinuxKernel>) -> isize;
+// TODO: move OP-TEE-specific syscall handling code/data to the `litebox_shim_optee` crate
+pub type SyscallHandler = fn(SyscallRequest<crate::host::LvbsLinuxKernel>) -> isize;
 static SYSCALL_HANDLER: spin::Once<SyscallHandler> = spin::Once::new();
 
 pub fn optee_syscall_entry(request: SyscallRequest<crate::Platform>) -> isize {
@@ -186,16 +187,20 @@ unsafe extern "C" fn syscall_dispatcher_wrapper() {
         "push rdi",
         "mov rdi, rax",
         "mov rsi, rsp",
-        "and rsp, -16",
+        "and rsp, {stack_alignment}",
         "call {syscall_dispatcher}",
-        "add rsp, 0x40", // 8 64-bit registers
+        "add rsp, {register_space}",
         "pop rcx",
         "pop r11",
         "pop rbp",
         "sysretq",
+        stack_alignment = const STACK_ALIGNMENT,
         syscall_dispatcher = sym syscall_dispatcher,
+        register_space = const core::mem::size_of::<SyscallContext>() - core::mem::size_of::<u64>() * NUM_REGISTERS_TO_POP,
     );
 }
+const NUM_REGISTERS_TO_POP: usize = 3;
+const STACK_ALIGNMENT: isize = -16;
 
 /// This function enables 64-bit syscall extensions and sets up the necessary MSRs.
 /// It must be called for each core.

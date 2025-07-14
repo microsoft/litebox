@@ -331,7 +331,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// partial mapping to mitigate side-channel attacks and shallow copying to get rid of redudant
     /// page table data structures for kernel space.
     pub(crate) fn new_user_page_table(&self) -> mm::PageTable<PAGE_SIZE> {
-        let pt = unsafe { mm::PageTable::new_empty() };
+        let pt = unsafe { mm::PageTable::new_top_level() };
         if pt
             .map_phys_frame_range(
                 self.vtl1_phys_frame_range,
@@ -346,11 +346,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     }
 
     /// Register `syscall_handler` to handle syscalls. This function must be called for each core.
-    pub fn register_syscall_handler(
-        syscall_handler: fn(
-            syscall_handle::SyscallRequest<LinuxKernel<host::lvbs_impl::HostLvbsInterface>>,
-        ) -> isize,
-    ) {
+    pub fn register_syscall_handler(syscall_handler: syscall_handle::SyscallHandler) {
         syscall_handle::init(syscall_handler);
     }
 }

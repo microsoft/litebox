@@ -323,15 +323,16 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(M::pa_to_va(frame_range.start.start_address()).as_mut_ptr())
     }
 
-    /// This function creates a new empty page table while allocating a new frame for it.
-    pub(crate) unsafe fn new_empty() -> Self {
+    /// This function creates a new empty top-level page table.
+    pub(crate) unsafe fn new_top_level() -> Self {
         let frame = PageTableAllocator::<M>::allocate_frame(true)
             .expect("Failed to allocate a new page table frame");
         unsafe { Self::init(frame.start_address()) }
     }
 
     /// This function switches the address space of the current processor/core using the given page table
-    /// (e.g., its CR3 register) and returns the physical frame of the old page table.
+    /// (e.g., its CR3 register) and returns the physical frame of the previous top-level page table.
+    /// It preserves the CR3 flags.
     ///
     /// # Safety
     /// The caller must ensure that the page table is valid and maps the entire VTL1 kernel address space.
@@ -353,9 +354,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         frame
     }
 
-    /// This function returns the physical frame of the active top-level page table. We need this function
-    /// when we handle a system call or interrupt to locate the data structure for the current user context
-    /// and store the context including user return address and user stack pointer into the structure.
+    /// This function returns the physical frame containing the current top-level page table.
+    /// When we handle a system call or interrupt, it is difficult to figure out the corresponding user context
+    /// since kernel and user contexts are not tightly coupled. Thus, we store the return value of this function
+    /// in the user context data structure when we create it. Later, when we handle a system call or interrupt,
+    /// we match the value of the CR3 register with the value stored in the user context data structure
+    /// (as a secondary key).
     #[allow(clippy::similar_names)]
     pub(crate) fn get_physical_frame(&self) -> PhysFrame {
         let p4_va = core::ptr::from_ref::<PageTable>(self.inner.lock().level_4_table());
@@ -366,7 +370,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// Deallocate physical frames of all page tables except for the top-level page table.
     ///
     /// # Safety
-    /// The caller must unmap all non-page-table pages before calling this function to avoid memory leaks.
+    /// The caller is expected to unmap all non-page-table pages before calling this function.
     /// Also, the caller must ensure no page table frame is shared with other page tables.
     /// TODO: consider merging this function with `Drop` if it is reliable enough.
     pub(crate) unsafe fn clean_up(&self) {
