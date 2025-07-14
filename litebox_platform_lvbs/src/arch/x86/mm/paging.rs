@@ -354,12 +354,11 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         frame
     }
 
-    /// This function returns the physical frame containing the current top-level page table.
+    /// This function returns the physical frame containing a top-level page table.
     /// When we handle a system call or interrupt, it is difficult to figure out the corresponding user context
-    /// since kernel and user contexts are not tightly coupled. Thus, we store the return value of this function
-    /// in the user context data structure when we create it. Later, when we handle a system call or interrupt,
-    /// we match the value of the CR3 register with the value stored in the user context data structure
-    /// (as a secondary key).
+    /// because kernel and user contexts are not tightly coupled (i.e., we do not know `userspace_id`).
+    /// To this end, we use this function to match the physical frame of the page table contained in each user
+    /// context structure with the CR3 value in a system call context (before switching the page table).
     #[allow(clippy::similar_names)]
     pub(crate) fn get_physical_frame(&self) -> PhysFrame {
         let p4_va = core::ptr::from_ref::<PageTable>(self.inner.lock().level_4_table());

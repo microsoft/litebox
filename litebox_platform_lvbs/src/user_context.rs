@@ -22,7 +22,7 @@ const VTL1_USER_TOP: u64 = 0x1_4000_0000;
 // fixed-size user stack for an OP-TEE TA
 pub const VTL1_USER_STACK_SIZE: usize = 16 * PAGE_SIZE;
 
-pub trait UserSpace {
+pub trait UserSpaceManagement {
     /// Global virtual address base for VTL1 user space
     const GVA_USER_BASE: VirtAddr;
 
@@ -35,31 +35,32 @@ pub trait UserSpace {
     /// Create a new user address space (i.e., a new user page table) and context, and returns `userspace_id` for it.
     /// The page table also maps the kernel address space (the entire space for now, a portion of it in the future)
     /// for handling system calls.
-    fn create_userspace(&self) -> Result<u64, Errno>;
+    fn create_userspace(&self) -> Result<i64, Errno>;
 
     /// Delete any resources associated with the userspace (`userspace_id`).
-    /// TODO: it should remove all physical frames solely owned by the userspace to be deleted.
-    fn delete_userspace(&self, userspace_id: u64) -> Result<(), Errno>;
+    fn delete_userspace(&self, userspace_id: i64) -> Result<(), Errno>;
 
     /// Check whether the userspace with the given `userspace_id` exists.
-    /// We don't often need this function, but it might be useful before invoking `enter_userspace`
-    /// which never returns and panics if `userspace_id` is invalid.
-    #[expect(dead_code)]
-    fn check_userspace(&self, userspace_id: u64) -> bool;
+    fn check_userspace(&self, userspace_id: i64) -> bool;
 
     /// Enter userspace with the given `userspace_id`. This function never returns.
+    /// It retrieves the user context (return address, stack pointer, and rflags) from a global data
+    /// structure, `UserContextMap`.
     ///
     /// # Panics
     ///
     /// Panics if `userspace_id` does not exist. The caller must ensure that `userspace_id` is valid.
-    fn enter_userspace(&self, userspace_id: u64) -> !;
+    fn enter_userspace(&self, userspace_id: i64, arguments: Option<&[u64]>) -> !;
 
     /// Load a program into the userspace. Currently, it memory copies a dummy syscall function
-    /// to the entry point of the userspace. We must support loading a TA ELF binary in the future.
-    fn load_program(&self, userspace_id: u64, binary: &[u8]) -> Result<(), Errno>;
+    /// to the entry point of the userspace.
+    /// TODO: Support loading a TA ELF binary.
+    fn load_program(&self, userspace_id: i64, binary: &[u8]) -> Result<(), Errno>;
 
-    /// Save the user context (return address, stack pointer, and RFlags) when there is user-to-kernel
-    /// transition (syscall, interrupt). It leverages the `CR3` register to find the user context struct.
+    /// Save the user context when there is user-to-kernel transition.
+    /// This function is expected to be called by the system call or interrupt handler which does not
+    /// know `userspace_id` of the current user context. Thus, it internally uses the current value of
+    /// the CR3 register to find the corresponding user context struct.
     fn save_user_context(
         &self,
         user_ret_addr: VirtAddr,
@@ -90,7 +91,7 @@ impl UserContext {
 
 /// Data structure to hold a map of user contexts indexed by their ID.
 pub struct UserContextMap {
-    inner: spin::mutex::SpinMutex<HashMap<u64, UserContext>>,
+    inner: spin::mutex::SpinMutex<HashMap<i64, UserContext>>,
 }
 
 impl UserContextMap {
@@ -101,12 +102,12 @@ impl UserContextMap {
     }
 }
 
-impl<Host: HostInterface> UserSpace for LinuxKernel<Host> {
+impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
     const GVA_USER_BASE: VirtAddr = x86_64::VirtAddr::new(VTL1_USER_BASE);
     const GVA_USER_TOP: VirtAddr = x86_64::VirtAddr::new(VTL1_USER_TOP);
     const BASE_STACK_SIZE: usize = VTL1_USER_STACK_SIZE;
 
-    fn create_userspace(&self) -> Result<u64, Errno> {
+    fn create_userspace(&self) -> Result<i64, Errno> {
         let mut inner = self.user_contexts.inner.lock();
         let userspace_id = match inner.keys().max() {
             Some(&id) => id + 1,
@@ -119,11 +120,11 @@ impl<Host: HostInterface> UserSpace for LinuxKernel<Host> {
         Ok(userspace_id)
     }
 
-    fn delete_userspace(&self, userspace_id: u64) -> Result<(), Errno> {
+    fn delete_userspace(&self, userspace_id: i64) -> Result<(), Errno> {
         let mut inner = self.user_contexts.inner.lock();
         let user_pt = inner.get(&userspace_id).unwrap();
         unsafe {
-            // TODO: make this unmap efficient by maintaining a list of mapped pages
+            // TODO: selectively unmap mapped pages instead of unmapping the entire user space
             user_pt
                 .page_table
                 .unmap_pages(
@@ -142,7 +143,7 @@ impl<Host: HostInterface> UserSpace for LinuxKernel<Host> {
         Ok(())
     }
 
-    fn check_userspace(&self, userspace_id: u64) -> bool {
+    fn check_userspace(&self, userspace_id: i64) -> bool {
         let inner = self.user_contexts.inner.lock();
         if inner.contains_key(&userspace_id) {
             return true;
@@ -151,7 +152,7 @@ impl<Host: HostInterface> UserSpace for LinuxKernel<Host> {
     }
 
     #[allow(clippy::similar_names)]
-    fn enter_userspace(&self, userspace_id: u64) -> ! {
+    fn enter_userspace(&self, userspace_id: i64, _arguments: Option<&[u64]>) -> ! {
         let rsp;
         let rip;
         let rflags;
@@ -178,7 +179,7 @@ impl<Host: HostInterface> UserSpace for LinuxKernel<Host> {
                 panic!("Userspace with ID: {} does not exist", userspace_id);
             }
         } // release the lock before entering userspace
-        let Some((cs_idx, ds_idx)) = get_per_core_kernel_context().get_user_code_data_segments()
+        let Some((_, cs_idx, ds_idx)) = get_per_core_kernel_context().get_segment_selectors()
         else {
             panic!("GDT not initialized");
         };
@@ -197,22 +198,24 @@ impl<Host: HostInterface> UserSpace for LinuxKernel<Host> {
         panic!("IRETQ failed to enter userspace");
     }
 
-    fn load_program(&self, userspace_id: u64, _binary: &[u8]) -> Result<(), Errno> {
-        // entry point and program size must be determined by analyzing the ELF binary.
+    // Note. This is not a real `load_program` function which should be able to handle TA ELF.
+    // It is written for testing purposes.
+    fn load_program(&self, userspace_id: i64, _binary: &[u8]) -> Result<(), Errno> {
+        // TODO: entry point and program size must be determined by analyzing the ELF binary.
         // For now, let us use these dummy values for testing purposes.
         let entry_point = usize::try_from(Self::GVA_USER_BASE.as_u64()).unwrap();
         let program_size = PAGE_SIZE;
 
         let mut inner = self.user_contexts.inner.lock();
         if let Some(user_ctx) = inner.get_mut(&userspace_id) {
-            // code page
+            // code pages (should not be executable yet)
             let _ = user_ctx.page_table.map_pages(
                 PageRange::<PAGE_SIZE>::new(entry_point, entry_point + program_size).unwrap(),
                 VmFlags::VM_READ | VmFlags::VM_WRITE,
                 true,
             );
 
-            // we cannot copy memory pages without mapping. Use the target user page table temporarily for this.
+            // Since we cannot copy memory pages without mapping, we use the user page table for this memory copy.
             user_ctx.page_table.switch_address_space();
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -223,7 +226,7 @@ impl<Host: HostInterface> UserSpace for LinuxKernel<Host> {
             }
             self.page_table.switch_address_space(); // reload the kernel page table
 
-            // W ^ X
+            // make code pages executable and non-writable
             let _ = unsafe {
                 user_ctx.page_table.mprotect_pages(
                     PageRange::<PAGE_SIZE>::new(entry_point, entry_point + program_size).unwrap(),
@@ -240,6 +243,7 @@ impl<Host: HostInterface> UserSpace for LinuxKernel<Host> {
                 true,
             );
 
+            // initial instruction and stack pointers
             user_ctx.rip = VirtAddr::new(u64::try_from(entry_point).unwrap());
             user_ctx.rsp = VirtAddr::new(Self::GVA_USER_TOP.as_u64() & !0xf);
             Ok(())
@@ -256,6 +260,7 @@ impl<Host: HostInterface> UserSpace for LinuxKernel<Host> {
     ) -> Result<(), Errno> {
         let (cr3, _) = Cr3::read_raw();
         let mut inner = self.user_contexts.inner.lock();
+        // TODO: to avoid the below linear search, we can maintain cr3 to `userspace_id` mapping.
         for (id, user_ctx) in inner.iter_mut() {
             if cr3 == user_ctx.page_table.get_physical_frame() {
                 user_ctx.rsp = user_stack_ptr;
@@ -276,7 +281,7 @@ impl<Host: HostInterface> UserSpace for LinuxKernel<Host> {
 }
 
 // This dummy syscall function is used for testing purposes.
-// It follows our customized utee syscall wrapper which uses `syscall/sysret`
+// It follows our customized OP-TEE syscall wrapper which uses `syscall/sysret`
 #[expect(unused_assignments)]
 #[expect(unused_variables)]
 #[unsafe(no_mangle)]
@@ -306,6 +311,7 @@ extern "C" fn dummy_syscall_fn() {
             "pop r15",
             "pop rbx",
             "pop rbp",
+            "ret",
             in("rax") sysnr, in("rdi") arg0, in("rsi") arg1, in("rdx") arg2, in("r10") arg3,
             in("r8") arg4, in("r9") arg5, in("r12") arg6, in("r13") arg7, lateout("rax") ret,
         );

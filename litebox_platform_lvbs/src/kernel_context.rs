@@ -76,20 +76,9 @@ impl KernelContext {
         self.vtl0_state.r8 = value; // LVBS uses R8 to return a value from VTL1 to VTL0
     }
 
-    pub(crate) fn get_kernel_user_code_segments(&self) -> Option<(u16, u16)> {
-        if let Some(gdt) = self.gdt {
-            gdt.get_kernel_user_code_segments()
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn get_user_code_data_segments(&self) -> Option<(u16, u16)> {
-        if let Some(gdt) = self.gdt {
-            gdt.get_user_code_data_segments()
-        } else {
-            None
-        }
+    /// Return kernel code, user code, and user data segment selectors
+    pub(crate) fn get_segment_selectors(&self) -> Option<(u16, u16, u16)> {
+        self.gdt.map(gdt::GdtWrapper::get_segment_selectors)
     }
 }
 

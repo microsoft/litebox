@@ -60,12 +60,13 @@ impl GdtWrapper {
         }
     }
 
-    pub fn get_kernel_user_code_segments(&self) -> Option<(u16, u16)> {
-        Some((self.selectors.kernel_code.0, self.selectors.user_code.0))
-    }
-
-    pub fn get_user_code_data_segments(&self) -> Option<(u16, u16)> {
-        Some((self.selectors.user_code.0, self.selectors.user_data.0))
+    /// Return kernel code, user code, and user data segment selectors
+    pub fn get_segment_selectors(&self) -> (u16, u16, u16) {
+        (
+            self.selectors.kernel_code.0,
+            self.selectors.user_code.0,
+            self.selectors.user_data.0,
+        )
     }
 }
 

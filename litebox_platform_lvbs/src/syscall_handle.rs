@@ -1,7 +1,7 @@
 use crate::debug_serial_println;
 use crate::{
     kernel_context::get_per_core_kernel_context, mshv::vtl_switch::jump_vtl_switch_loop,
-    user_context::UserSpace,
+    user_context::UserSpaceManagement,
 };
 use core::arch::{asm, naked_asm};
 use litebox_common_linux::errno::Errno;
@@ -223,8 +223,8 @@ pub(crate) fn init(syscall_handler: SyscallHandler) {
 
     // configure STAR MSR for CS/SS selectors
     let kernel_context = get_per_core_kernel_context();
-    let (kernel_cs, user_cs) = kernel_context
-        .get_kernel_user_code_segments()
+    let (kernel_cs, user_cs, _) = kernel_context
+        .get_segment_selectors()
         .expect("GDT not initialized for the current core");
     unsafe { Star::write_raw(user_cs, kernel_cs) };
 }
