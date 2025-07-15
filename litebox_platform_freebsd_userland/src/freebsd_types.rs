@@ -55,8 +55,6 @@ bitflags::bitflags! {
         const MAP_NOSYNC = 0x800;
         /// Use 2MB super pages if possible
         const MAP_ALIGNED_SUPER = 0x1000000;
-        /// Align to specific boundary (used with MAP_ALIGNED_SUPER)
-        const MAP_ALIGNMENT_SHIFT = 24;
         /// Region grows down, like a stack
         const MAP_STACK = 0x400;
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>

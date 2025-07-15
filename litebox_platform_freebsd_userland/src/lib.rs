@@ -19,10 +19,10 @@ use litebox::platform::{ThreadLocalStorageProvider, UnblockedOrTimedOut};
 use litebox::utils::ReinterpretUnsignedExt as _;
 use litebox_common_linux::{ProtFlags, PunchthroughSyscall};
 
-pub mod syscall_raw;
+mod syscall_raw;
 use syscall_raw::syscalls;
 
-pub mod errno;
+mod errno;
 
 mod freebsd_types;
 
@@ -47,11 +47,7 @@ const SELFPROC_MAPS_PATH: &str = "/proc/curproc/map";
 
 impl FreeBSDUserland {
     /// Create a new userland-FreeBSD platform for use in `LiteBox`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tun device could not be successfully opened.
-    pub fn new(_tun_device_name: Option<&str>) -> &'static Self {
+    pub fn new(_name: Option<&str>) -> &'static Self {
         let platform = Self {
             reserved_pages: Self::read_proc_self_maps(),
         };
@@ -606,113 +602,7 @@ impl litebox::platform::Instant for Instant {
     }
 }
 
-/// Check if the CPU supports FSGSBASE instructions on FreeBSD.
-///
-/// On FreeBSD, we can detect this using the CPUID instruction directly
-/// or fall back to sysctl if available. For now, we'll use a conservative
-/// approach and try the instruction with error handling.
-// todo(chuqi): x86 support
-fn has_fsgsbase_support() -> bool {
-    // On FreeBSD, we can check for FSGSBASE support using CPUID
-    // FSGSBASE is indicated by CPUID.(EAX=07H, ECX=0):EBX[bit 0]
-    unsafe {
-        let eax = 7u32;
-        let ecx = 0u32;
-        let ebx: u32;
-
-        // Save and restore rbx since it's used by LLVM
-        core::arch::asm!(
-            "mov {rbx_save}, rbx",
-            "cpuid",
-            "mov {ebx_out:e}, ebx",
-            "mov rbx, {rbx_save}",
-            rbx_save = out(reg) _,
-            ebx_out = out(reg) ebx,
-            in("eax") eax,
-            in("ecx") ecx,
-            out("edx") _,
-        );
-
-        // FSGSBASE is bit 0 of EBX when EAX=7, ECX=0
-        (ebx & 1) != 0
-    }
-}
-
-/// Get the current fs base register value.
-///
-/// Depending on whether `fsgsbase` instructions are enabled, we choose
-/// between `arch_prctl` or `rdfsbase` to get the fs base.
-#[cfg(target_arch = "x86_64")]
-fn get_fs_base() -> Result<usize, litebox_common_linux::errno::Errno> {
-    /// Function pointer to get the current fs base.
-    static GET_FS_BASE: spin::Once<fn() -> Result<usize, litebox_common_linux::errno::Errno>> =
-        spin::Once::new();
-    GET_FS_BASE.call_once(|| {
-        if has_fsgsbase_support() {
-            || Ok(unsafe { litebox_common_linux::rdfsbase() })
-        } else {
-            get_fs_base_arch_prctl
-        }
-    })()
-}
-
-/// Set the fs base register value.
-///
-/// Depending on whether `fsgsbase` instructions are enabled, we choose
-/// between `arch_prctl` or `wrfsbase` to set the fs base.
-#[cfg(target_arch = "x86_64")]
-fn set_fs_base(fs_base: usize) -> Result<usize, litebox_common_linux::errno::Errno> {
-    static SET_FS_BASE: spin::Once<fn(usize) -> Result<usize, litebox_common_linux::errno::Errno>> =
-        spin::Once::new();
-    SET_FS_BASE.call_once(|| {
-        if has_fsgsbase_support() {
-            |fs_base| {
-                unsafe { litebox_common_linux::wrfsbase(fs_base) };
-                Ok(0)
-            }
-        } else {
-            set_fs_base_arch_prctl
-        }
-    })(fs_base)
-}
-
-/// Get fs register value via syscall `sysarch` (FreeBSD equivalent of Linux arch_prctl).
-// todo(chuqi): x86 support
-fn get_fs_base_arch_prctl() -> Result<usize, litebox_common_linux::errno::Errno> {
-    let mut fs_base = core::mem::MaybeUninit::<usize>::uninit();
-    unsafe {
-        syscalls::syscall2(
-            syscall_raw::SyscallTable::Sysarch,
-            freebsd_types::AMD64_GET_FSBASE as usize,
-            fs_base.as_mut_ptr() as usize,
-        )
-    }
-    .map_err(|err| match err {
-        errno::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
-        errno::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
-        _ => unimplemented!("unexpected error {err}"),
-    })?;
-    Ok(unsafe { fs_base.assume_init() })
-}
-
-/// Set fs register value via syscall `arch_prctl`.
-// todo(chuqi): x86 support
-fn set_fs_base_arch_prctl(fs_base: usize) -> Result<usize, litebox_common_linux::errno::Errno> {
-    unsafe {
-        syscalls::syscall2(
-            syscall_raw::SyscallTable::Sysarch,
-            freebsd_types::AMD64_SET_FSBASE as usize,
-            fs_base,
-        )
-    }
-    .map_err(|err| match err {
-        errno::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
-        errno::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
-        _ => unimplemented!("unexpected error {err}"),
-    })
-}
-
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub struct PunchthroughToken {
     punchthrough: PunchthroughSyscall<FreeBSDUserland>,
 }
@@ -728,85 +618,6 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
         >,
     > {
         match self.punchthrough {
-            PunchthroughSyscall::RtSigprocmask { how, set, oldset } => {
-                // FreeBSD uses sigprocmask instead of rt_sigprocmask
-                // and doesn't need sigsetsize parameter
-                
-                // Convert Linux SigmaskHow to FreeBSD values (they should be the same)
-                let how_val = how as usize;
-                
-                // Handle the set parameter
-                let set_ptr = if let Some(set) = set {
-                    // Read the signal set from the provided pointer
-                    let sig_set = unsafe { set.read_at_offset(0) }
-                        .ok_or(litebox::platform::PunchthroughError::Failure(
-                            litebox_common_linux::errno::Errno::EFAULT,
-                        ))?
-                        .into_owned();
-                    
-                    // Note: FreeBSD doesn't require special handling of SIGSYS
-                    // since it doesn't use Seccomp
-                    core::ptr::from_ref(&sig_set) as usize
-                } else {
-                    0
-                };
-                
-                // Handle the oldset parameter
-                let oldset_ptr = oldset.map_or(0, |ptr| ptr.as_usize());
-                
-                // Call FreeBSD's sigprocmask syscall
-                unsafe {
-                    syscalls::syscall3(
-                        syscall_raw::SyscallTable::Sigprocmask,
-                        how_val,
-                        set_ptr,
-                        oldset_ptr,
-                    )
-                }
-                .map_err(|err| match err {
-                    errno::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
-                    errno::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
-                    _ => panic!("unexpected error {err}"),
-                })
-                .map_err(litebox::platform::PunchthroughError::Failure)
-            }
-            PunchthroughSyscall::RtSigaction {
-                signum,
-                act,
-                oldact,
-            } => {
-                // FreeBSD uses sigaction instead of rt_sigaction
-                let act_ptr = act.map_or(0, |ptr| ptr.as_usize());
-                let oldact_ptr = oldact.map_or(0, |ptr| ptr.as_usize());
-                
-                unsafe {
-                    syscalls::syscall3(
-                        syscall_raw::SyscallTable::Sigaction,
-                        signum as usize,
-                        act_ptr,
-                        oldact_ptr,
-                    )
-                }
-                .map_err(|err| match err {
-                    errno::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
-                    errno::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
-                    _ => panic!("unexpected error {err}"),
-                })
-                .map_err(litebox::platform::PunchthroughError::Failure)
-            }
-            PunchthroughSyscall::SetFsBase { addr } => {
-                set_fs_base(addr).map_err(litebox::platform::PunchthroughError::Failure)
-            }
-            PunchthroughSyscall::GetFsBase { addr } => {
-                let fs_base =
-                    get_fs_base().map_err(litebox::platform::PunchthroughError::Failure)?;
-                unsafe { addr.write_at_offset(0, fs_base) }.ok_or(
-                    litebox::platform::PunchthroughError::Failure(
-                        litebox_common_linux::errno::Errno::EFAULT,
-                    ),
-                )?;
-                Ok(0)
-            }
             PunchthroughSyscall::WakeByAddress { addr } => unsafe {
                 syscalls::syscall5(
                     syscalls::Sysno::UmtxOp,
@@ -822,7 +633,6 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 _ => panic!("unexpected error {err}"),
             })
             .map_err(litebox::platform::PunchthroughError::Failure),
-            // todo(chuqi): add more punchthroughs
             _ => {
                 unimplemented!(
                     "PunchthroughToken for FreeBSDUserland is not fully implemented yet"
@@ -1274,12 +1084,8 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::AtomicU32;
-<<<<<<< HEAD
-    use litebox::platform::{RawMutex, ThreadLocalStorageProvider as _};
-=======
     use litebox::platform::RawMutex;
     use litebox::platform::ThreadLocalStorageProvider as _;
->>>>>>> d57fd01d0ee4fbd9bfaff77275cf275fd951cb1a
     use std::thread::sleep;
 
     use crate::FreeBSDUserland;

@@ -18,7 +18,6 @@ elf_loader = { version = "=0.10.0", default-features = false, features = [] }
 thiserror = { version = "2.0.6", default-features = false }
 ringbuf = { version = "0.4.8", default-features = false, features = ["alloc"] }
 syscalls = { version = "0.6", default-features = false }
-arrayvec = { version = "0.7.6", default-features = false }
 
 [target.'cfg(target_arch = "x86")'.dependencies]
 # ELF loader requires us to enable the `rel` dependency on 32-bit to work.
@@ -31,6 +30,7 @@ elf_loader = { version = "=0.10.0", default-features = false, features = ["rel"]
 [features]
 unstable-testing = []
 default = ["platform_linux_userland"]
+systrap_backend = ["litebox_platform_multiplex/systrap_backend"]
 platform_freebsd_userland = ["litebox_platform_multiplex/platform_freebsd_userland"]
 platform_linux_userland = ["litebox_platform_multiplex/platform_linux_userland"]
 

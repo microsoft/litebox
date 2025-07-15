@@ -46,10 +46,6 @@ pub(crate) mod syscalls {
 >>>>>>> d57fd01d0ee4fbd9bfaff77275cf275fd951cb1a
 
     /// Perform a syscall with no arguments
-    #[allow(
-        dead_code,
-        reason = "For comprehension we added all syscall interfaces for now. To be removed."
-    )]
     #[inline]
     pub(crate) unsafe fn syscall0(num: SyscallTable) -> SyscallResult {
         let ret: usize;
@@ -73,10 +69,6 @@ pub(crate) mod syscalls {
     }
 
     /// Perform a syscall with one argument
-    #[allow(
-        dead_code,
-        reason = "For comprehension we added all syscall interfaces for now. To be removed."
-    )]
     #[inline]
     pub(crate) unsafe fn syscall1(num: SyscallTable, arg1: usize) -> SyscallResult {
         let ret: usize;
@@ -101,10 +93,6 @@ pub(crate) mod syscalls {
     }
 
     /// Perform a syscall with two arguments
-    #[allow(
-        dead_code,
-        reason = "For comprehension we added all syscall interfaces for now. To be removed."
-    )]
     #[inline]
     pub(crate) unsafe fn syscall2(num: SyscallTable, arg1: usize, arg2: usize) -> SyscallResult {
         let ret: usize;
@@ -130,10 +118,6 @@ pub(crate) mod syscalls {
     }
 
     /// Perform a syscall with three arguments
-    #[allow(
-        dead_code,
-        reason = "For comprehension we added all syscall interfaces for now. To be removed."
-    )]
     #[inline]
     pub(crate) unsafe fn syscall3(
         num: SyscallTable,
@@ -165,9 +149,9 @@ pub(crate) mod syscalls {
     }
 
     /// Perform a syscall with four arguments
-    #[allow(
+    #[expect(
         dead_code,
-        reason = "For comprehension we added all syscall interfaces for now. To be removed."
+        reason = "To be comprehensive, we added all syscall interfaces for now. To be removed later on."
     )]
     #[inline]
     pub(crate) unsafe fn syscall4(
@@ -202,9 +186,9 @@ pub(crate) mod syscalls {
     }
 
     /// Perform a syscall with five arguments
-    #[allow(
+    #[expect(
         dead_code,
-        reason = "For comprehension we added all syscall interfaces for now. To be removed."
+        reason = "To be comprehensive, we added all syscall interfaces for now. To be removed later on."
     )]
     #[inline]
     pub(crate) unsafe fn syscall5(
@@ -241,10 +225,6 @@ pub(crate) mod syscalls {
     }
 
     /// Perform a syscall with six arguments
-    #[allow(
-        dead_code,
-        reason = "For comprehension we added all syscall interfaces for now. To be removed."
-    )]
     #[inline]
     pub(crate) unsafe fn syscall6(
         num: SyscallTable,
