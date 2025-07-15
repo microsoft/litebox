@@ -39,7 +39,7 @@ pub(crate) mod syscalls {
     pub(crate) type Sysno = SyscallTable;
 
     /// Result type for syscalls
-    pub type SyscallResult = Result<usize, crate::errno::Errno>;
+    pub(crate) type SyscallResult = Result<usize, crate::errno::Errno>;
 
     /// Perform a syscall with no arguments
     #[inline]
