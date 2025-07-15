@@ -7,7 +7,7 @@ mod generated;
 /// This is a transparent wrapper around FreeBSD error numbers (i.e., `i32`s) intended
 /// to provide some type safety by expecting explicit conversions to/from `i32`s.
 #[derive(PartialEq, Eq, Clone, Copy, Error)]
-pub struct Errno {
+pub(crate) struct Errno {
     value: core::num::NonZeroU8,
 }
 
@@ -38,7 +38,8 @@ impl Errno {
     /// // Direct conversion to i32 will give the positive variant
     /// assert_eq!(1, Errno::EPERM.into());
     /// ```
-    pub fn as_neg(self) -> i32 {
+    #[expect(dead_code, reason = "Unused in the current context, but useful for error handling later on.")]
+    pub(crate) fn as_neg(self) -> i32 {
         -i32::from(self)
     }
 
@@ -53,7 +54,7 @@ impl Errno {
 
 /// Errors when converting to an [`Errno`]
 #[derive(Error, Debug)]
-pub enum ErrnoConversionError {
+pub(crate) enum ErrnoConversionError {
     #[error("Expected positive error number")]
     ExpectedPositive,
     #[error("Error number cannot be zero")]

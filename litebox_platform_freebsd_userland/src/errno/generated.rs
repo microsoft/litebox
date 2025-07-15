@@ -14,7 +14,7 @@ impl super::Errno {
         clippy::too_many_lines,
         reason = "auto-generated code that needs to reference a large number of values"
     )]
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self.value.get() {
             1 => "EPERM: Operation not permitted",
             2 => "ENOENT: No such file or directory",
@@ -118,203 +118,204 @@ impl super::Errno {
 
 /// The associated constants for [`super::Errno`] are generated from FreeBSD errno values
 /// https://man.freebsd.org/cgi/man.cgi?errno
+#[expect(unused, reason = "Generated code that is not used in the current context, but useful for error handling later on.")]
 impl super::Errno {
     /// Operation not permitted
-    pub const EPERM: Self = Self::from_const(1);
+    pub(crate) const EPERM: Self = Self::from_const(1);
     /// No such file or directory
-    pub const ENOENT: Self = Self::from_const(2);
+    pub(crate) const ENOENT: Self = Self::from_const(2);
     /// No such process
-    pub const ESRCH: Self = Self::from_const(3);
+    pub(crate) const ESRCH: Self = Self::from_const(3);
     /// Interrupted system call
-    pub const EINTR: Self = Self::from_const(4);
+    pub(crate) const EINTR: Self = Self::from_const(4);
     /// Input/output error
-    pub const EIO: Self = Self::from_const(5);
+    pub(crate) const EIO: Self = Self::from_const(5);
     /// Device not configured
-    pub const ENXIO: Self = Self::from_const(6);
+    pub(crate) const ENXIO: Self = Self::from_const(6);
     /// Argument list too long
-    pub const E2BIG: Self = Self::from_const(7);
+    pub(crate) const E2BIG: Self = Self::from_const(7);
     /// Exec format error
-    pub const ENOEXEC: Self = Self::from_const(8);
+    pub(crate) const ENOEXEC: Self = Self::from_const(8);
     /// Bad file descriptor
-    pub const EBADF: Self = Self::from_const(9);
+    pub(crate) const EBADF: Self = Self::from_const(9);
     /// No child processes
-    pub const ECHILD: Self = Self::from_const(10);
+    pub(crate) const ECHILD: Self = Self::from_const(10);
     /// Resource deadlock avoided
-    pub const EDEADLK: Self = Self::from_const(11);
+    pub(crate) const EDEADLK: Self = Self::from_const(11);
     /// Cannot allocate memory
-    pub const ENOMEM: Self = Self::from_const(12);
+    pub(crate) const ENOMEM: Self = Self::from_const(12);
     /// Permission denied
-    pub const EACCES: Self = Self::from_const(13);
+    pub(crate) const EACCES: Self = Self::from_const(13);
     /// Bad address
-    pub const EFAULT: Self = Self::from_const(14);
+    pub(crate) const EFAULT: Self = Self::from_const(14);
     /// Block device required
-    pub const ENOTBLK: Self = Self::from_const(15);
+    pub(crate) const ENOTBLK: Self = Self::from_const(15);
     /// Device busy
-    pub const EBUSY: Self = Self::from_const(16);
+    pub(crate) const EBUSY: Self = Self::from_const(16);
     /// File exists
-    pub const EEXIST: Self = Self::from_const(17);
+    pub(crate) const EEXIST: Self = Self::from_const(17);
     /// Cross-device link
-    pub const EXDEV: Self = Self::from_const(18);
+    pub(crate) const EXDEV: Self = Self::from_const(18);
     /// Operation not supported by device
-    pub const ENODEV: Self = Self::from_const(19);
+    pub(crate) const ENODEV: Self = Self::from_const(19);
     /// Not a directory
-    pub const ENOTDIR: Self = Self::from_const(20);
+    pub(crate) const ENOTDIR: Self = Self::from_const(20);
     /// Is a directory
-    pub const EISDIR: Self = Self::from_const(21);
+    pub(crate) const EISDIR: Self = Self::from_const(21);
     /// Invalid argument
-    pub const EINVAL: Self = Self::from_const(22);
+    pub(crate) const EINVAL: Self = Self::from_const(22);
     /// Too many open files in system
-    pub const ENFILE: Self = Self::from_const(23);
+    pub(crate) const ENFILE: Self = Self::from_const(23);
     /// Too many open files
-    pub const EMFILE: Self = Self::from_const(24);
+    pub(crate) const EMFILE: Self = Self::from_const(24);
     /// Inappropriate ioctl for device
-    pub const ENOTTY: Self = Self::from_const(25);
+    pub(crate) const ENOTTY: Self = Self::from_const(25);
     /// Text file busy
-    pub const ETXTBSY: Self = Self::from_const(26);
+    pub(crate) const ETXTBSY: Self = Self::from_const(26);
     /// File too large
-    pub const EFBIG: Self = Self::from_const(27);
+    pub(crate) const EFBIG: Self = Self::from_const(27);
     /// No space left on device
-    pub const ENOSPC: Self = Self::from_const(28);
+    pub(crate) const ENOSPC: Self = Self::from_const(28);
     /// Illegal seek
-    pub const ESPIPE: Self = Self::from_const(29);
+    pub(crate) const ESPIPE: Self = Self::from_const(29);
     /// Read-only file system
-    pub const EROFS: Self = Self::from_const(30);
+    pub(crate) const EROFS: Self = Self::from_const(30);
     /// Too many links
-    pub const EMLINK: Self = Self::from_const(31);
+    pub(crate) const EMLINK: Self = Self::from_const(31);
     /// Broken pipe
-    pub const EPIPE: Self = Self::from_const(32);
+    pub(crate) const EPIPE: Self = Self::from_const(32);
     /// Numerical argument out of domain
-    pub const EDOM: Self = Self::from_const(33);
+    pub(crate) const EDOM: Self = Self::from_const(33);
     /// Result too large
-    pub const ERANGE: Self = Self::from_const(34);
+    pub(crate) const ERANGE: Self = Self::from_const(34);
     /// Resource temporarily unavailable
-    pub const EAGAIN: Self = Self::from_const(35);
+    pub(crate) const EAGAIN: Self = Self::from_const(35);
     /// Operation now in progress
-    pub const EINPROGRESS: Self = Self::from_const(36);
+    pub(crate) const EINPROGRESS: Self = Self::from_const(36);
     /// Operation already in progress
-    pub const EALREADY: Self = Self::from_const(37);
+    pub(crate) const EALREADY: Self = Self::from_const(37);
     /// Socket operation on non-socket
-    pub const ENOTSOCK: Self = Self::from_const(38);
+    pub(crate) const ENOTSOCK: Self = Self::from_const(38);
     /// Destination address required
-    pub const EDESTADDRREQ: Self = Self::from_const(39);
+    pub(crate) const EDESTADDRREQ: Self = Self::from_const(39);
     /// Message too long
-    pub const EMSGSIZE: Self = Self::from_const(40);
+    pub(crate) const EMSGSIZE: Self = Self::from_const(40);
     /// Protocol wrong type for socket
-    pub const EPROTOTYPE: Self = Self::from_const(41);
+    pub(crate) const EPROTOTYPE: Self = Self::from_const(41);
     /// Protocol not available
-    pub const ENOPROTOOPT: Self = Self::from_const(42);
+    pub(crate) const ENOPROTOOPT: Self = Self::from_const(42);
     /// Protocol not supported
-    pub const EPROTONOSUPPORT: Self = Self::from_const(43);
+    pub(crate) const EPROTONOSUPPORT: Self = Self::from_const(43);
     /// Socket type not supported
-    pub const ESOCKTNOSUPPORT: Self = Self::from_const(44);
+    pub(crate) const ESOCKTNOSUPPORT: Self = Self::from_const(44);
     /// Operation not supported
-    pub const EOPNOTSUPP: Self = Self::from_const(45);
+    pub(crate) const EOPNOTSUPP: Self = Self::from_const(45);
     /// Protocol family not supported
-    pub const EPFNOSUPPORT: Self = Self::from_const(46);
+    pub(crate) const EPFNOSUPPORT: Self = Self::from_const(46);
     /// Address family not supported by protocol family
-    pub const EAFNOSUPPORT: Self = Self::from_const(47);
+    pub(crate) const EAFNOSUPPORT: Self = Self::from_const(47);
     /// Address already in use
-    pub const EADDRINUSE: Self = Self::from_const(48);
+    pub(crate) const EADDRINUSE: Self = Self::from_const(48);
     /// Can't assign requested address
-    pub const EADDRNOTAVAIL: Self = Self::from_const(49);
+    pub(crate) const EADDRNOTAVAIL: Self = Self::from_const(49);
     /// Network is down
-    pub const ENETDOWN: Self = Self::from_const(50);
+    pub(crate) const ENETDOWN: Self = Self::from_const(50);
     /// Network is unreachable
-    pub const ENETUNREACH: Self = Self::from_const(51);
+    pub(crate) const ENETUNREACH: Self = Self::from_const(51);
     /// Network dropped connection on reset
-    pub const ENETRESET: Self = Self::from_const(52);
+    pub(crate) const ENETRESET: Self = Self::from_const(52);
     /// Software caused connection abort
-    pub const ECONNABORTED: Self = Self::from_const(53);
+    pub(crate) const ECONNABORTED: Self = Self::from_const(53);
     /// Connection reset by peer
-    pub const ECONNRESET: Self = Self::from_const(54);
+    pub(crate) const ECONNRESET: Self = Self::from_const(54);
     /// No buffer space available
-    pub const ENOBUFS: Self = Self::from_const(55);
+    pub(crate) const ENOBUFS: Self = Self::from_const(55);
     /// Socket is already connected
-    pub const EISCONN: Self = Self::from_const(56);
+    pub(crate) const EISCONN: Self = Self::from_const(56);
     /// Socket is not connected
-    pub const ENOTCONN: Self = Self::from_const(57);
+    pub(crate) const ENOTCONN: Self = Self::from_const(57);
     /// Can't send after socket shutdown
-    pub const ESHUTDOWN: Self = Self::from_const(58);
+    pub(crate) const ESHUTDOWN: Self = Self::from_const(58);
     /// Operation timed out
-    pub const ETIMEDOUT: Self = Self::from_const(60);
+    pub(crate) const ETIMEDOUT: Self = Self::from_const(60);
     /// Connection refused
-    pub const ECONNREFUSED: Self = Self::from_const(61);
+    pub(crate) const ECONNREFUSED: Self = Self::from_const(61);
     /// Too many levels of symbolic links
-    pub const ELOOP: Self = Self::from_const(62);
+    pub(crate) const ELOOP: Self = Self::from_const(62);
     /// File name too long
-    pub const ENAMETOOLONG: Self = Self::from_const(63);
+    pub(crate) const ENAMETOOLONG: Self = Self::from_const(63);
     /// Host is down
-    pub const EHOSTDOWN: Self = Self::from_const(64);
+    pub(crate) const EHOSTDOWN: Self = Self::from_const(64);
     /// No route to host
-    pub const EHOSTUNREACH: Self = Self::from_const(65);
+    pub(crate) const EHOSTUNREACH: Self = Self::from_const(65);
     /// Directory not empty
-    pub const ENOTEMPTY: Self = Self::from_const(66);
+    pub(crate) const ENOTEMPTY: Self = Self::from_const(66);
     /// Too many processes
-    pub const EPROCLIM: Self = Self::from_const(67);
+    pub(crate) const EPROCLIM: Self = Self::from_const(67);
     /// Too many users
-    pub const EUSERS: Self = Self::from_const(68);
+    pub(crate) const EUSERS: Self = Self::from_const(68);
     /// Disc quota exceeded
-    pub const EDQUOT: Self = Self::from_const(69);
+    pub(crate) const EDQUOT: Self = Self::from_const(69);
     /// Stale NFS file handle
-    pub const ESTALE: Self = Self::from_const(70);
+    pub(crate) const ESTALE: Self = Self::from_const(70);
     /// RPC struct is bad
-    pub const EBADRPC: Self = Self::from_const(72);
+    pub(crate) const EBADRPC: Self = Self::from_const(72);
     /// RPC version wrong
-    pub const ERPCMISMATCH: Self = Self::from_const(73);
+    pub(crate) const ERPCMISMATCH: Self = Self::from_const(73);
     /// RPC prog. not avail
-    pub const EPROGUNAVAIL: Self = Self::from_const(74);
+    pub(crate) const EPROGUNAVAIL: Self = Self::from_const(74);
     /// Program version wrong
-    pub const EPROGMISMATCH: Self = Self::from_const(75);
+    pub(crate) const EPROGMISMATCH: Self = Self::from_const(75);
     /// Bad procedure for program
-    pub const EPROCUNAVAIL: Self = Self::from_const(76);
+    pub(crate) const EPROCUNAVAIL: Self = Self::from_const(76);
     /// No locks available
-    pub const ENOLCK: Self = Self::from_const(77);
+    pub(crate) const ENOLCK: Self = Self::from_const(77);
     /// Function not implemented
-    pub const ENOSYS: Self = Self::from_const(78);
+    pub(crate) const ENOSYS: Self = Self::from_const(78);
     /// Inappropriate file type or format
-    pub const EFTYPE: Self = Self::from_const(79);
+    pub(crate) const EFTYPE: Self = Self::from_const(79);
     /// Authentication error
-    pub const EAUTH: Self = Self::from_const(80);
+    pub(crate) const EAUTH: Self = Self::from_const(80);
     /// Need authenticator
-    pub const ENEEDAUTH: Self = Self::from_const(81);
+    pub(crate) const ENEEDAUTH: Self = Self::from_const(81);
     /// Identifier removed
-    pub const EIDRM: Self = Self::from_const(82);
+    pub(crate) const EIDRM: Self = Self::from_const(82);
     /// No message of desired type
-    pub const ENOMSG: Self = Self::from_const(83);
+    pub(crate) const ENOMSG: Self = Self::from_const(83);
     /// Value too large to be stored in data type
-    pub const EOVERFLOW: Self = Self::from_const(84);
+    pub(crate) const EOVERFLOW: Self = Self::from_const(84);
     /// Operation canceled
-    pub const ECANCELED: Self = Self::from_const(85);
+    pub(crate) const ECANCELED: Self = Self::from_const(85);
     /// Illegal byte sequence
-    pub const EILSEQ: Self = Self::from_const(86);
+    pub(crate) const EILSEQ: Self = Self::from_const(86);
     /// Attribute not found
-    pub const ENOATTR: Self = Self::from_const(87);
+    pub(crate) const ENOATTR: Self = Self::from_const(87);
     /// Programming error
-    pub const EDOOFUS: Self = Self::from_const(88);
+    pub(crate) const EDOOFUS: Self = Self::from_const(88);
     /// Bad message
-    pub const EBADMSG: Self = Self::from_const(89);
+    pub(crate) const EBADMSG: Self = Self::from_const(89);
     /// Multihop attempted
-    pub const EMULTIHOP: Self = Self::from_const(90);
+    pub(crate) const EMULTIHOP: Self = Self::from_const(90);
     /// Link has been severed
-    pub const ENOLINK: Self = Self::from_const(91);
+    pub(crate) const ENOLINK: Self = Self::from_const(91);
     /// Protocol error
-    pub const EPROTO: Self = Self::from_const(92);
+    pub(crate) const EPROTO: Self = Self::from_const(92);
     /// Capabilities insufficient
-    pub const ENOTCAPABLE: Self = Self::from_const(93);
+    pub(crate) const ENOTCAPABLE: Self = Self::from_const(93);
     /// Not permitted in capability mode
-    pub const ECAPMODE: Self = Self::from_const(94);
+    pub(crate) const ECAPMODE: Self = Self::from_const(94);
     /// State not recoverable
-    pub const ENOTRECOVERABLE: Self = Self::from_const(95);
+    pub(crate) const ENOTRECOVERABLE: Self = Self::from_const(95);
     /// Previous owner died
-    pub const EOWNERDEAD: Self = Self::from_const(96);
+    pub(crate) const EOWNERDEAD: Self = Self::from_const(96);
     /// Integrity check failed
-    pub const EINTEGRITY: Self = Self::from_const(97);
+    pub(crate) const EINTEGRITY: Self = Self::from_const(97);
 
     /// Resource temporarily unavailable (alias for EAGAIN)
-    pub const EWOULDBLOCK: Self = Self::from_const(35);
+    pub(crate) const EWOULDBLOCK: Self = Self::from_const(35);
     /// Operation not supported (alias for EOPNOTSUPP)
-    pub const ENOTSUP: Self = Self::from_const(45);
+    pub(crate) const ENOTSUP: Self = Self::from_const(45);
 
     /// The maximum supported Errno
-    pub const MAX: Self = Self::from_const(97);
+    pub(crate) const MAX: Self = Self::from_const(97);
 }
