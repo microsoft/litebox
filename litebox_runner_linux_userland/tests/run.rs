@@ -29,7 +29,7 @@ fn compile(input: &str, output: &str, exec_or_lib: bool) {
     );
 }
 
-#[expect(dead_code)]
+#[allow(dead_code)]
 enum Backend {
     Rewriter,
     Seccomp,
@@ -37,10 +37,15 @@ enum Backend {
 
 #[allow(clippy::too_many_lines)]
 fn test_runner_with_dynamic_lib(backend: Backend) {
+    let backend_str = match backend {
+        Backend::Rewriter => "rewriter",
+        Backend::Seccomp => "seccomp",
+    };
     let dir_path = std::env::var("OUT_DIR").unwrap();
-    let src_path = std::path::Path::new(dir_path.as_str()).join("hello_exec.c");
+    let src_path =
+        std::path::Path::new(dir_path.as_str()).join(format!("hello_exec_{backend_str}.c"));
     std::fs::write(src_path.clone(), HELLO_WORLD_C).unwrap();
-    let path = std::path::Path::new(dir_path.as_str()).join("hello_dylib");
+    let path = std::path::Path::new(dir_path.as_str()).join(format!("hello_dylib_{backend_str}"));
     compile(src_path.to_str().unwrap(), path.to_str().unwrap(), false);
     let path = match backend {
         Backend::Seccomp => path,
@@ -60,12 +65,13 @@ fn test_runner_with_dynamic_lib(backend: Backend) {
                 "failed to run litebox_syscall_rewriter {:?}",
                 std::str::from_utf8(output.stderr.as_slice()).unwrap()
             );
-            std::path::Path::new(dir_path.as_str()).join("hello_dylib.hooked")
+            std::path::Path::new(dir_path.as_str())
+                .join(format!("hello_dylib_{backend_str}.hooked"))
         }
     };
 
     // create tar file containing all dependencies
-    let tar_dir = std::path::Path::new(dir_path.as_str()).join("tar_files");
+    let tar_dir = std::path::Path::new(dir_path.as_str()).join(format!("tar_files_{backend_str}"));
     let dirs_to_create = ["lib64", "lib/x86_64-linux-gnu", "lib32"];
     for dir in dirs_to_create {
         std::fs::create_dir_all(tar_dir.join(dir)).unwrap();
@@ -116,10 +122,54 @@ fn test_runner_with_dynamic_lib(backend: Backend) {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    let target = "--target=x86_64-unknown-linux-musl";
+    #[cfg(target_arch = "x86")]
+    let target = "--target=i686-unknown-linux-musl";
+
+    // build litebox_runner_linux_userland to get the latest `litebox_rtld_audit.so`
+    let output = std::process::Command::new("cargo")
+        .args(["build", "-p", "litebox_runner_linux_userland", target])
+        .output()
+        .expect("Failed to build litebox_runner_linux_userland");
+    assert!(
+        output.status.success(),
+        "failed to build litebox_runner_linux_userland {:?}",
+        std::str::from_utf8(output.stderr.as_slice()).unwrap()
+    );
+
+    match backend {
+        Backend::Rewriter => {
+            println!(
+                "Copying {} to {}",
+                std::path::Path::new(dir_path.as_str())
+                    .join("litebox_rtld_audit.so")
+                    .to_str()
+                    .unwrap(),
+                tar_dir
+                    .join("lib64/litebox_rtld_audit.so")
+                    .to_str()
+                    .unwrap()
+            );
+            std::fs::copy(
+                std::path::Path::new(dir_path.as_str()).join("litebox_rtld_audit.so"),
+                tar_dir.join("lib64/litebox_rtld_audit.so"),
+            )
+            .unwrap();
+        }
+        Backend::Seccomp => {}
+    }
+
     // create tar file using `tar` command
-    let tar_file = std::path::Path::new(dir_path.as_str()).join("rootfs.tar");
+    let tar_file =
+        std::path::Path::new(dir_path.as_str()).join(format!("rootfs_{backend_str}.tar"));
     let tar_data = std::process::Command::new("tar")
-        .args(["-cvf", "../rootfs.tar", "lib", "lib64"])
+        .args([
+            "-cvf",
+            format!("../rootfs_{backend_str}.tar").as_str(),
+            "lib",
+            "lib64",
+        ])
         .current_dir(&tar_dir)
         .output()
         .expect("Failed to create tar file");
@@ -130,41 +180,37 @@ fn test_runner_with_dynamic_lib(backend: Backend) {
     );
     println!("Tar file created at: {}", tar_file.to_str().unwrap());
 
-    #[cfg(target_arch = "x86_64")]
-    let target = "--target=x86_64-unknown-linux-musl";
-    #[cfg(target_arch = "x86")]
-    let target = "--target=i686-unknown-linux-musl";
-    let backend = match backend {
-        Backend::Rewriter => "rewriter",
-        Backend::Seccomp => "seccomp",
-    };
-    println!(
-        "Running `cargo run -p litebox_runner_linux_userland {} -- --unstable --interception-backend {} --initial-files {} --env LD_LIBRARY_PATH=/lib64:/lib32:/lib {}`",
-        target,
-        backend,
-        tar_file.to_str().unwrap(),
-        path.to_str().unwrap()
-    );
     // run litebox_runner_linux_userland with the tar file and the compiled executable
+    let mut args = vec![
+        "run",
+        "-p",
+        "litebox_runner_linux_userland",
+        target,
+        "--",
+        "--unstable",
+        "--interception-backend",
+        backend_str,
+        // Tell ld where to find the libraries.
+        // See https://man7.org/linux/man-pages/man8/ld.so.8.html for how ld works.
+        // Alternatively, we could add a `/etc/ld.so.cache` file to the rootfs.
+        "--env",
+        "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
+        "--initial-files",
+        tar_file.to_str().unwrap(),
+    ];
+    match backend {
+        Backend::Rewriter => {
+            args.push("--env");
+            args.push("LD_AUDIT=/lib64/litebox_rtld_audit.so");
+        }
+        Backend::Seccomp => {
+            // No need to set LD_AUDIT for seccomp backend
+        }
+    }
+    args.push(path.to_str().unwrap());
+    println!("Running `cargo {}`", args.join(" "));
     let output = std::process::Command::new("cargo")
-        .args([
-            "run",
-            "-p",
-            "litebox_runner_linux_userland",
-            target,
-            "--",
-            "--unstable",
-            "--interception-backend",
-            backend,
-            // Tell ld where to find the libraries.
-            // See https://man7.org/linux/man-pages/man8/ld.so.8.html for how ld works.
-            // Alternatively, we could add a `/etc/ld.so.cache` file to the rootfs.
-            "--env",
-            "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
-            "--initial-files",
-            tar_file.to_str().unwrap(),
-            path.to_str().unwrap(),
-        ])
+        .args(args)
         .output()
         .expect("Failed to run litebox_runner_linux_userland");
     assert!(
@@ -174,11 +220,11 @@ fn test_runner_with_dynamic_lib(backend: Backend) {
     );
 }
 
-// TODO: enable this test once the rewriter is working.
-// #[test]
-// fn test_runner_with_dynamic_lib_rewriter() {
-//     test_runner_with_dynamic_lib(Backend::Rewriter);
-// }
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_runner_with_dynamic_lib_rewriter() {
+    test_runner_with_dynamic_lib(Backend::Rewriter);
+}
 
 #[test]
 fn test_runner_with_dynamic_lib_seccomp() {

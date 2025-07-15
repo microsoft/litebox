@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
                 + ".hooked",
         )
     });
-    let mut file = std::fs::File::create_new(output_path)?;
+    let mut file = std::fs::File::create(output_path)?;
     file.set_permissions(std::fs::Permissions::from_mode(
         input_binary.metadata()?.mode(),
     ))?;
