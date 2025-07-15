@@ -15,7 +15,7 @@ use litebox::platform::{ThreadLocalStorageProvider, UnblockedOrTimedOut};
 use litebox::utils::ReinterpretUnsignedExt as _;
 use litebox_common_linux::{ProtFlags, PunchthroughSyscall};
 
-pub mod syscall_raw;
+mod syscall_raw;
 use syscall_raw::syscalls;
 
 mod freebsd_types;
