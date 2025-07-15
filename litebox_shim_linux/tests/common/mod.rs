@@ -42,6 +42,7 @@ unsafe extern "C" {
     fn trampoline(entry: usize, sp: usize) -> !;
 }
 
+#[expect(unused_variables)]
 pub fn init_platform(
     tar_data: &[u8],
     initial_dirs: &[&str],
@@ -90,8 +91,11 @@ pub fn init_platform(
 
     platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
 
-    if enable_syscall_interception {
-        platform.enable_seccomp_based_syscall_interception();
+    #[cfg(target_os = "linux")]
+    {
+        if enable_syscall_interception {
+            platform.enable_seccomp_based_syscall_interception();
+        }
     }
 }
 
