@@ -933,8 +933,6 @@ mod tests {
         let reserved_pages: Vec<_> =
             <FreeBSDUserland as PageManagementProvider<4096>>::reserved_pages(platform).collect();
 
-        println!("SASS, reserved pages: {:?}", reserved_pages);
-
         // Check that the reserved pages are in order and non-overlapping
         let mut prev = 0;
         for page in reserved_pages {
