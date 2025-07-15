@@ -22,8 +22,9 @@ const VTL1_USER_TOP: u64 = 0x1_4000_0000;
 // fixed-size user stack for an OP-TEE TA
 pub const VTL1_USER_STACK_SIZE: usize = 16 * PAGE_SIZE;
 
+/// UserSpace provider trait for OP-TEE Trusted Applications (TAs) with fixed-size heap and stack.
 #[allow(dead_code)]
-pub trait UserSpaceManagement {
+pub trait UserSpaceProvider {
     /// Global virtual address base for VTL1 user space
     const GVA_USER_BASE: VirtAddr;
 
@@ -103,7 +104,7 @@ impl UserContextMap {
     }
 }
 
-impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
+impl<Host: HostInterface> UserSpaceProvider for LinuxKernel<Host> {
     const GVA_USER_BASE: VirtAddr = x86_64::VirtAddr::new(VTL1_USER_BASE);
     const GVA_USER_TOP: VirtAddr = x86_64::VirtAddr::new(VTL1_USER_TOP);
     const BASE_STACK_SIZE: usize = VTL1_USER_STACK_SIZE;

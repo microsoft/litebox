@@ -1,7 +1,7 @@
 use crate::debug_serial_println;
 use crate::{
     kernel_context::get_per_core_kernel_context, mshv::vtl_switch::jump_vtl_switch_loop,
-    user_context::UserSpaceManagement,
+    user_context::UserSpaceProvider,
 };
 use core::arch::{asm, naked_asm};
 use x86_64::{
