@@ -414,12 +414,8 @@ impl Descriptor {
     fn stat(&self) -> Result<FileStat, Errno> {
         let fstat = match self {
             Descriptor::File(file) => FileStat::from(litebox_fs().fd_file_status(file)?),
-            Descriptor::Stdio(crate::stdio::StdioFile { typ, inner, .. }) => {
-                // TODO: we don't have correct values for these fields yet, but ensure there are consistent.
-                // (See <https://github.com/bminor/glibc/blob/e78caeb4ff812ae19d24d65f4d4d48508154277b/sysdeps/unix/sysv/linux/ttyname.h#L35>).
-                let mut fstat = FileStat::from(litebox_fs().fd_file_status(inner.file())?);
-                fstat.st_blksize = 1024;
-                fstat
+            Descriptor::Stdio(crate::stdio::StdioFile { inner, .. }) => {
+                FileStat::from(litebox_fs().fd_file_status(inner.file())?)
             }
             Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { .. } => FileStat {

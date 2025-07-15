@@ -373,6 +373,7 @@ impl From<litebox::fs::FileStatus> for FileStat {
             size,
             owner: litebox::fs::UserInfo { user, group },
             node_info: litebox::fs::NodeInfo { dev, ino, rdev },
+            blksize,
             ..
         } = value;
         Self {
@@ -387,7 +388,7 @@ impl From<litebox::fs::FileStatus> for FileStat {
                 .unwrap_or_default(),
             #[allow(clippy::cast_possible_wrap)]
             st_size: size,
-            st_blksize: 0,
+            st_blksize: blksize,
             st_blocks: 0,
             ..Default::default()
         }
