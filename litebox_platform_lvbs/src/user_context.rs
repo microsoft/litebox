@@ -35,13 +35,13 @@ pub trait UserSpaceManagement {
     /// Create a new user address space (i.e., a new user page table) and context, and returns `userspace_id` for it.
     /// The page table also maps the kernel address space (the entire space for now, a portion of it in the future)
     /// for handling system calls.
-    fn create_userspace(&self) -> Result<i64, Errno>;
+    fn create_userspace(&self) -> Result<u32, Errno>;
 
     /// Delete any resources associated with the userspace (`userspace_id`).
-    fn delete_userspace(&self, userspace_id: i64) -> Result<(), Errno>;
+    fn delete_userspace(&self, userspace_id: u32) -> Result<(), Errno>;
 
     /// Check whether the userspace with the given `userspace_id` exists.
-    fn check_userspace(&self, userspace_id: i64) -> bool;
+    fn check_userspace(&self, userspace_id: u32) -> bool;
 
     /// Enter userspace with the given `userspace_id`. This function never returns.
     /// It retrieves the user context (return address, stack pointer, and rflags) from a global data
@@ -50,12 +50,12 @@ pub trait UserSpaceManagement {
     /// # Panics
     ///
     /// Panics if `userspace_id` does not exist. The caller must ensure that `userspace_id` is valid.
-    fn enter_userspace(&self, userspace_id: i64, arguments: Option<&[u64]>) -> !;
+    fn enter_userspace(&self, userspace_id: u32, arguments: Option<&[u64]>) -> !;
 
     /// Load a program into the userspace. Currently, it memory copies a dummy syscall function
     /// to the entry point of the userspace.
     /// TODO: Support loading a TA ELF binary.
-    fn load_program(&self, userspace_id: i64, binary: &[u8]) -> Result<(), Errno>;
+    fn load_program(&self, userspace_id: u32, binary: &[u8]) -> Result<(), Errno>;
 
     /// Save the user context when there is user-to-kernel transition.
     /// This function is expected to be called by the system call or interrupt handler which does not
@@ -91,7 +91,7 @@ impl UserContext {
 
 /// Data structure to hold a map of user contexts indexed by their ID.
 pub struct UserContextMap {
-    inner: spin::mutex::SpinMutex<HashMap<i64, UserContext>>,
+    inner: spin::mutex::SpinMutex<HashMap<u32, UserContext>>,
 }
 
 impl UserContextMap {
@@ -107,7 +107,7 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
     const GVA_USER_TOP: VirtAddr = x86_64::VirtAddr::new(VTL1_USER_TOP);
     const BASE_STACK_SIZE: usize = VTL1_USER_STACK_SIZE;
 
-    fn create_userspace(&self) -> Result<i64, Errno> {
+    fn create_userspace(&self) -> Result<u32, Errno> {
         let mut inner = self.user_contexts.inner.lock();
         let userspace_id = match inner.keys().max() {
             Some(&id) => id + 1,
@@ -120,7 +120,7 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
         Ok(userspace_id)
     }
 
-    fn delete_userspace(&self, userspace_id: i64) -> Result<(), Errno> {
+    fn delete_userspace(&self, userspace_id: u32) -> Result<(), Errno> {
         let mut inner = self.user_contexts.inner.lock();
         let user_pt = inner.get(&userspace_id).unwrap();
         unsafe {
@@ -143,7 +143,7 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
         Ok(())
     }
 
-    fn check_userspace(&self, userspace_id: i64) -> bool {
+    fn check_userspace(&self, userspace_id: u32) -> bool {
         let inner = self.user_contexts.inner.lock();
         if inner.contains_key(&userspace_id) {
             return true;
@@ -152,7 +152,7 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
     }
 
     #[allow(clippy::similar_names)]
-    fn enter_userspace(&self, userspace_id: i64, _arguments: Option<&[u64]>) -> ! {
+    fn enter_userspace(&self, userspace_id: u32, _arguments: Option<&[u64]>) -> ! {
         let rsp;
         let rip;
         let rflags;
@@ -200,7 +200,7 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
 
     // Note. This is not a real `load_program` function which should be able to handle TA ELF.
     // It is written for testing purposes.
-    fn load_program(&self, userspace_id: i64, _binary: &[u8]) -> Result<(), Errno> {
+    fn load_program(&self, userspace_id: u32, _binary: &[u8]) -> Result<(), Errno> {
         // TODO: entry point and program size must be determined by analyzing the ELF binary.
         // For now, let us use these dummy values for testing purposes.
         let entry_point = usize::try_from(Self::GVA_USER_BASE.as_u64()).unwrap();

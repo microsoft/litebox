@@ -4,8 +4,10 @@ use crate::{
     kernel_context::get_per_core_kernel_context,
     mshv::{
         HV_VTL_NORMAL, HV_VTL_SECURE, NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT,
-        VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction, vsm::vsm_dispatch,
-        vsm_intercept::vsm_handle_intercept, vsm_optee::vsm_optee_dispatch,
+        VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction,
+        vsm::vsm_dispatch,
+        vsm_intercept::vsm_handle_intercept,
+        vsm_optee::{OpteeMessageCommand, optee_dispatch},
     },
 };
 use core::arch::{asm, naked_asm};
@@ -288,25 +290,14 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
     let func_id = VsmFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
         .unwrap_or(VsmFunction::Unknown);
     match func_id {
-        VsmFunction::EnableAPsVtl
-        | VsmFunction::BootAPs
-        | VsmFunction::LockRegs
-        | VsmFunction::SignalEndOfBoot
-        | VsmFunction::ProtectMemory
-        | VsmFunction::LoadKData
-        | VsmFunction::ValidateModule
-        | VsmFunction::FreeModuleInit
-        | VsmFunction::UnloadModule
-        | VsmFunction::CopySecondaryKey
-        | VsmFunction::KexecValidate
-        | VsmFunction::PatchText => vsm_dispatch(func_id, &params[1..]),
-        VsmFunction::OpteeOpenSession
-        | VsmFunction::OpteeInvokeCommand
-        | VsmFunction::OpteeCloseSession
-        | VsmFunction::OpteeCancel
-        | VsmFunction::OpteeRegisterShm
-        | VsmFunction::OpteeUnregisterShm => vsm_optee_dispatch(func_id, &params[1..]),
         VsmFunction::Unknown => Errno::EINVAL.as_neg().into(),
+        VsmFunction::OpteeMessage => {
+            let msg_cmd_id =
+                OpteeMessageCommand::try_from(u32::try_from(params[1]).unwrap_or(u32::MAX))
+                    .unwrap_or(OpteeMessageCommand::Unknown);
+            optee_dispatch(msg_cmd_id, &params[2..])
+        }
+        _ => vsm_dispatch(func_id, &params[1..]),
     }
 }
 

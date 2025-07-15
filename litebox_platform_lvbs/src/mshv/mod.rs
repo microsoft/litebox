@@ -117,13 +117,8 @@ pub const VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY: u32 = 0x1_ffe9;
 pub const VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE: u32 = 0x1_ffea;
 pub const VSM_VTL_CALL_FUNC_ID_PATCH_TEXT: u32 = 0x1_ffeb;
 
-// These OP-TEE function IDs are not fixed and can be changed
-pub const VSM_VTL_CALL_FUNC_ID_OPTEE_OPEN_SESSION: u32 = 0x10_0000;
-pub const VSM_VTL_CALL_FUNC_ID_OPTEE_INVOKE_COMMAND: u32 = 0x10_0001;
-pub const VSM_VTL_CALL_FUNC_ID_OPTEE_CLOSE_SESSION: u32 = 0x10_0002;
-pub const VSM_VTL_CALL_FUNC_ID_OPTEE_CANCEL: u32 = 0x10_0003;
-pub const VSM_VTL_CALL_FUNC_ID_OPTEE_REGISTER_SHM: u32 = 0x10_0004;
-pub const VSM_VTL_CALL_FUNC_ID_OPTEE_UNREGISTER_SHM: u32 = 0x10_0005;
+// This VSM function ID for OP-TEE messages is subject to change
+pub const VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE: u32 = 0x1f_ffff;
 
 /// VSM Functions
 #[derive(Debug, PartialEq, TryFromPrimitive)]
@@ -142,13 +137,7 @@ pub enum VsmFunction {
     CopySecondaryKey = VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY,
     KexecValidate = VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE,
     PatchText = VSM_VTL_CALL_FUNC_ID_PATCH_TEXT,
-    // OP-TEE functions
-    OpteeOpenSession = VSM_VTL_CALL_FUNC_ID_OPTEE_OPEN_SESSION,
-    OpteeInvokeCommand = VSM_VTL_CALL_FUNC_ID_OPTEE_INVOKE_COMMAND,
-    OpteeCloseSession = VSM_VTL_CALL_FUNC_ID_OPTEE_CLOSE_SESSION,
-    OpteeCancel = VSM_VTL_CALL_FUNC_ID_OPTEE_CANCEL,
-    OpteeRegisterShm = VSM_VTL_CALL_FUNC_ID_OPTEE_REGISTER_SHM,
-    OpteeUnregisterShm = VSM_VTL_CALL_FUNC_ID_OPTEE_UNREGISTER_SHM,
+    OpteeMessage = VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE,
     Unknown = 0xffff_ffff,
 }
 
