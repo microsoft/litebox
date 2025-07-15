@@ -2,9 +2,9 @@ use thiserror::Error;
 
 mod generated;
 
-/// Linux error numbers
+/// FreeBSD error numbers
 ///
-/// This is a transparent wrapper around Linux error numbers (i.e., `i32`s) intended
+/// This is a transparent wrapper around FreeBSD error numbers (i.e., `i32`s) intended
 /// to provide some type safety by expecting explicit conversions to/from `i32`s.
 #[derive(PartialEq, Eq, Clone, Copy, Error)]
 pub struct Errno {
@@ -33,7 +33,7 @@ impl Errno {
     /// Provide the negative integer representation of the error
     ///
     /// ```
-    /// # use litebox_common_linux::errno::Errno;
+    /// # use crate::errno::Errno;
     /// assert_eq!(-1, Errno::EPERM.as_neg());
     /// // Direct conversion to i32 will give the positive variant
     /// assert_eq!(1, Errno::EPERM.into());
