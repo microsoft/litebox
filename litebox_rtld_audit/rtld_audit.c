@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <assert.h>
 #include <elf.h>
 #include <link.h>
 #include <stdint.h>
@@ -16,6 +17,7 @@
 #define SYS_mmap 9
 #define SYS_mprotect 10
 #define SYS_munmap 11
+#define SYS_exit_group 231
 #define AT_FDCWD -100
 
 // Linux flags
@@ -147,8 +149,8 @@ void print_hex(uint64_t data) {
 #endif
 }
 
-/// @brief Parse the main object (the executable binary) to find the syscall entry
-/// point and the interpreter path.
+/// @brief Parse object to find the syscall entry point and the interpreter
+/// path.
 ///
 /// Different from the elf loader in the `litebox_shim_linux` crate, this
 /// function does not read the trampoline section from the section headers
@@ -157,7 +159,7 @@ void print_hex(uint64_t data) {
 /// can read the trampoline section from the end of the binary. The trampoline
 /// section is expected to contain a magic number and the address of the syscall
 /// entry point.
-int parse_main_object(const struct link_map *map) {
+int parse_object(const struct link_map *map) {
   unsigned long max_addr = 0;
   Elf64_Ehdr *eh = (Elf64_Ehdr *)map->l_addr;
   if (memcmp(eh->e_ident,
@@ -198,23 +200,39 @@ unsigned int la_objopen(struct link_map *map,
   const char *path = map->l_name;
 
   if (!path || path[0] == '\0') {
-    // main binary should be called first
-    parse_main_object(map);
-    syscall_print("[audit] main binary is patched by libOS\n", 40);
-    syscall_print("[audit] interp=", 15);
-    syscall_print(interp, sizeof(interp) - 1);
-    syscall_print("\n", 1);
+    // main binary should be called first.
+    if (map->l_addr != 0) {
+      // `map->l_addr` is zero for the main binary if it is not position
+      // independent.
+      assert(parse_object(map) == 0);
+      syscall_print("[audit] main binary is patched by libOS\n", 40);
+      syscall_print("[audit] interp=", 15);
+      syscall_print(interp, sizeof(interp) - 1);
+      syscall_print("\n", 1);
+    }
     return 0; // main binary is patched by libOS
   }
-  if (strcmp(path, interp) == 0) {
-    syscall_print("[audit] ld-*.so is patched by libOS\n", 36);
-    return 0; // ld.so is patched by libOS
-  } else {
-    // print path
-    syscall_print("[audit] la_objopen: path=", 25);
+
+  if (syscall_entry == 0) {
+    // failed to get the syscall entry point from the main binary
+    // fall back to get it from ld-*.so, which should be called next.
+    assert(parse_object(map) == 0);
+    syscall_print("[audit] ld is patched by libOS: \n", 33);
     syscall_print(path, 32);
     syscall_print("\n", 1);
+    return 0; // ld.so is patched by libOS
   }
+
+  if (interp[0] != '\0' && strcmp(path, interp) == 0) {
+    // successfully get the entry point and interpreter from the main binary
+    syscall_print("[audit] ld-*.so is patched by libOS\n", 36);
+    return 0; // ld.so is patched by libOS
+  }
+
+  // Other shared libraries
+  syscall_print("[audit] la_objopen: path=", 25);
+  syscall_print(path, 32);
+  syscall_print("\n", 1);
 
   if (!syscall_entry) {
     return 0;
