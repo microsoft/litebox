@@ -29,12 +29,21 @@ use tar_no_std::TarArchive;
 use crate::{LiteBox, path::Arg as _, sync, utilities::anymap::AnyMap};
 
 use super::{
-    Mode, OFlags, SeekWhence, UserInfo,
+    Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     errors::{
         ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadError,
         RmdirError, SeekError, UnlinkError, WriteError,
     },
 };
+
+/// Just a random constant that is distinct from other file systems. In this case, it is
+/// `b'Taro'.hex()`.
+const DEVICE_ID: usize = 0x5461726f;
+
+/// TODO(jayb): Replace this proper auto-incrementing inode number storage (although that will
+/// require migrating to the hashmap based tar entry storage). This is ok for now, until something
+/// is actually checking for real inode numbers.
+const TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER: usize = 0xFACE;
 
 /// A backing implementation for [`FileSystem`](super::FileSystem), storing all files in-memory, via
 /// a read-only `.tar` file.
@@ -314,12 +323,22 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 mode: DEFAULT_DIR_MODE,
                 size: super::DEFAULT_DIRECTORY_SIZE,
                 owner: owner_from_posix_header(p.posix_header()),
+                node_info: NodeInfo {
+                    dev: DEVICE_ID,
+                    ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                    rdev: None,
+                },
             }),
             Some(p) => Ok(super::FileStatus {
                 file_type: super::FileType::RegularFile,
                 mode: mode_of_modeflags(p.posix_header().mode.to_flags().unwrap()),
                 size: p.size(),
                 owner: owner_from_posix_header(p.posix_header()),
+                node_info: NodeInfo {
+                    dev: DEVICE_ID,
+                    ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                    rdev: None,
+                },
             }),
         }
     }
@@ -336,6 +355,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     mode: mode_of_modeflags(entry.posix_header().mode.to_flags().unwrap()),
                     size: entry.size(),
                     owner: owner_from_posix_header(entry.posix_header()),
+                    node_info: NodeInfo {
+                        dev: DEVICE_ID,
+                        ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                        rdev: None,
+                    },
                 })
             }
             Descriptor::Dir { .. } => Ok(super::FileStatus {
@@ -343,6 +367,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 mode: DEFAULT_DIR_MODE,
                 size: super::DEFAULT_DIRECTORY_SIZE,
                 owner: DEFAULT_DIRECTORY_OWNER,
+                node_info: NodeInfo {
+                    dev: DEVICE_ID,
+                    ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                    rdev: None,
+                },
             }),
         }
     }

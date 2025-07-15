@@ -14,7 +14,11 @@ use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
     ReadError, RmdirError, SeekError, UnlinkError, WriteError,
 };
-use super::{FileStatus, FileType, Mode, OFlags, SeekWhence};
+use super::{FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
+
+/// Just a random constant that is distinct from other file systems. In this case, it is
+/// `b'Lyrs'.hex()`.
+const DEVICE_ID: usize = 0x4c797273;
 
 /// Possible semantics for layering file systems together
 #[non_exhaustive]
@@ -59,6 +63,7 @@ pub struct FileSystem<
     layering_semantics: LayeringSemantics,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
+    node_info_lookup: sync::RwLock<Platform, HashMap<NodeInfo, usize>>,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower: super::FileSystem>
@@ -74,6 +79,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     ) -> Self {
         let sync = litebox.sync();
         let root = sync.new_rwlock(RootDir::new());
+        let node_info_lookup = sync.new_rwlock(HashMap::new());
         Self {
             litebox: litebox.clone(),
             upper,
@@ -81,6 +87,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             root,
             current_working_dir: "/".into(),
             layering_semantics,
+            node_info_lookup,
         }
     }
 
@@ -294,6 +301,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         } else {
             // Relative path
             Ok((self.current_working_dir.clone() + path.as_rust_str()?).normalized()?)
+        }
+    }
+
+    // Converts a `NodeInfo` from any of the layers into a layered `NodeInfo`
+    fn get_layered_nodeinfo(&self, node_info: NodeInfo) -> NodeInfo {
+        let mut node_info_lookup = self.node_info_lookup.write();
+        let rdev = node_info.rdev;
+        let new_id = node_info_lookup.len();
+        let ino = *node_info_lookup.entry(node_info).or_insert(new_id);
+        NodeInfo {
+            dev: DEVICE_ID,
+            ino,
+            rdev,
         }
     }
 }
@@ -903,6 +923,7 @@ impl<
                 mode,
                 size,
                 owner,
+                node_info,
             } = match entry.as_ref() {
                 EntryX::Upper { fd } => self.upper.fd_file_status(fd)?,
                 EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
@@ -915,6 +936,7 @@ impl<
                 mode,
                 size,
                 owner,
+                node_info: self.get_layered_nodeinfo(node_info),
             });
         }
         // The file is not open, we must look at the levels themselves.
@@ -924,12 +946,14 @@ impl<
                 mode,
                 size,
                 owner,
+                node_info,
             }) => {
                 return Ok(FileStatus {
                     file_type,
                     mode,
                     size,
                     owner,
+                    node_info: self.get_layered_nodeinfo(node_info),
                 });
             }
             Err(e) => match e {
@@ -953,12 +977,14 @@ impl<
             mode,
             size,
             owner,
+            node_info,
         } = self.lower.file_status(path)?;
         Ok(FileStatus {
             file_type,
             mode,
             size,
             owner,
+            node_info: self.get_layered_nodeinfo(node_info),
         })
     }
 
@@ -975,6 +1001,7 @@ impl<
             mode,
             size,
             owner,
+            node_info,
         } = match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.fd_file_status(fd)?,
             EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
@@ -987,6 +1014,7 @@ impl<
             mode,
             size,
             owner,
+            node_info: self.get_layered_nodeinfo(node_info),
         })
     }
 

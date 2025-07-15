@@ -6,6 +6,7 @@ use crate::path;
 use bitflags::bitflags;
 
 use core::ffi::c_uint;
+use core::num::NonZeroUsize;
 
 pub mod devices;
 pub mod errors;
@@ -304,6 +305,8 @@ pub struct FileStatus {
     pub size: usize,
     /// Owner of the file
     pub owner: UserInfo,
+    /// Information about this particular node
+    pub node_info: NodeInfo,
 }
 
 /// User information
@@ -313,6 +316,17 @@ pub struct UserInfo {
     pub user: u16,
     /// Group ID for the owner
     pub group: u16,
+}
+
+/// Device/Inode information
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+pub struct NodeInfo {
+    /// Device number
+    pub dev: usize,
+    /// Inode number
+    pub ino: usize,
+    /// Device that is being referred to (will be `Some(...)` only if special file)
+    pub rdev: Option<NonZeroUsize>,
 }
 
 impl UserInfo {
