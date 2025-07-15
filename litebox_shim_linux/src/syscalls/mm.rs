@@ -1,4 +1,5 @@
 //! Implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
+
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE, VmemUnmapError},
     platform::{RawConstPointer, RawMutPointer, page_mgmt::DeallocationError},
@@ -196,6 +197,7 @@ pub(crate) fn sys_mprotect(
         ProtFlags::PROT_READ_WRITE => unsafe { pm.make_pages_writable(addr, len) },
         ProtFlags::PROT_READ => unsafe { pm.make_pages_readable(addr, len) },
         ProtFlags::PROT_NONE => unsafe { pm.make_pages_inaccessible(addr, len) },
+        ProtFlags::PROT_READ_WRITE_EXEC => unsafe { pm.make_pages_rwx(addr, len) },
         _ => todo!("Unsupported prot flags {:?}", prot),
     }
     .map_err(Errno::from)

@@ -1,17 +1,14 @@
 //! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox on userland FreeBSD.
 
-// Restrict this crate to only work on FreeBSD. For now, we are restricting this to only x86/x86-64
+// Restrict this crate to only work on FreeBSD. For now, we are restricting this to only x86-64
 // FreeBSD, but we _may_ allow for more in the future, if we find it useful to do so.
-#![cfg(all(
-    target_os = "freebsd",
-    any(target_arch = "x86_64", target_arch = "x86")
-))]
+#![cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
 use core::panic;
-// use core::num;
-// use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use core::sync::atomic::AtomicU32;
-// use std::sync::atomic::Ordering::SeqCst;
 use core::mem::size_of;
+
+
+use core::sync::atomic::AtomicU32;
 use core::time::Duration;
 
 use litebox::fs::OFlags;
@@ -19,10 +16,8 @@ use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer, RawMutPointer};
 use litebox::platform::{ThreadLocalStorageProvider, UnblockedOrTimedOut};
-// use litebox::platform::{ImmediatelyWokenUp, RawConstPointer, ThreadLocalStorageProvider};
 use litebox::utils::ReinterpretUnsignedExt as _;
 use litebox_common_linux::{ProtFlags, PunchthroughSyscall};
-// use litebox_common_linux::{CloneFlags, MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
 
 pub mod syscall_raw;
 use syscall_raw::syscalls;
@@ -30,8 +25,6 @@ use syscall_raw::syscalls;
 pub mod errno;
 
 mod freebsd_types;
-// todo(chuqi): we do not use systrap for now as there's no sccomp interception on FreeBSD.
-// mod syscall_intercept;
 
 extern crate alloc;
 
@@ -45,10 +38,7 @@ static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::R
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
 /// traits.
-#[allow(dead_code)]
 pub struct FreeBSDUserland {
-    tun_socket_fd: std::sync::RwLock<Option<std::os::fd::OwnedFd>>,
-    // seccomp_interception_enabled: std::sync::atomic::AtomicBool,
     /// Reserved pages that are not available for guest programs to use.
     reserved_pages: Vec<core::ops::Range<usize>>,
 }
@@ -58,19 +48,11 @@ const SELFPROC_MAPS_PATH: &str = "/proc/curproc/map";
 impl FreeBSDUserland {
     /// Create a new userland-FreeBSD platform for use in `LiteBox`.
     ///
-    /// Takes an optional tun device name (such as `"tun0"` or `"tun99"`) to connect networking (if
-    /// not specified, networking is disabled).
-    ///
     /// # Panics
     ///
     /// Panics if the tun device could not be successfully opened.
     pub fn new(_tun_device_name: Option<&str>) -> &'static Self {
-        // todo(chuqi): ignore tun device for now
-        let tun_socket_fd = std::sync::RwLock::new(None);
-
         let platform = Self {
-            tun_socket_fd,
-            // seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages: Self::read_proc_self_maps(),
         };
 
@@ -78,7 +60,7 @@ impl FreeBSDUserland {
         Box::leak(Box::new(platform))
     }
 
-    /// Register the syscall handler (provided by the FreeBSD shim)
+    /// Register the syscall handler (provided by the Linux shim)
     ///
     /// # Panics
     ///
@@ -91,24 +73,9 @@ impl FreeBSDUserland {
         );
     }
 
-    /// Enable seccomp syscall interception on the platform.
-    ///
-    /// # Panics
-    ///
-    /// Panics if this function has already been invoked on the platform earlier.
-    pub fn enable_seccomp_based_syscall_interception(&self) {
-        // todo(chuqi): we do not support seccomp for FreeBSD
-        unimplemented!("seccomp interception is not supported on FreeBSD");
-    }
-
-    // todo(chuqi): the /procfs is not guaranteed to be mounted for FreeBSD,
-    // in the future, we should use `sysctl` syscall to do this.
     fn read_proc_self_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
-        // TODO: this function is not guaranteed to return all allocated pages, as it may
-        // allocate more pages after the mapping file is read. Missing allocated pages may
-        // cause the program to crash when calling `mmap` or `mremap` with the `MAP_FIXED` flag later.
-        // We should either fix `mmap` to handle this error, or let global allocator call this function
-        // whenever it get more pages from the host.
+        // TODO: this function is same as the on in LinuxUserland and might have
+        // similar issues to be resolved.
 
         let path = SELFPROC_MAPS_PATH;
         let c_path = match std::ffi::CString::new(path) {
@@ -248,15 +215,8 @@ impl litebox::platform::ExitProvider for FreeBSDUserland {
     const EXIT_FAILURE: Self::ExitCode = 1;
 
     fn exit(&self, code: Self::ExitCode) -> ! {
-        let Self {
-            tun_socket_fd: _,
-            reserved_pages: _,
-        } = self;
+        let Self { reserved_pages: _ } = self;
 
-        // todo(chuqi): ignore tun device for now
-        // drop::<Option<std::os::fd::OwnedFd>>(tun_socket_fd.write().unwrap().take());
-
-        // And then we actually exit
         unsafe { syscalls::syscall1(syscalls::Sysno::Exit, code as usize) }
             .expect("Failed to exit group");
 
@@ -421,23 +381,11 @@ impl litebox::platform::RawMutexProvider for FreeBSDUserland {
     }
 }
 
-// This raw-mutex design takes up more space than absolutely ideal and may possibly be optimized if
-// we can allow for spurious wake-ups. However, the current design makes sure that spurious wake-ups
-// do not actually occur, and that something that is `block`ed can only be woken up by a `wake`.
+// A skeleton of a raw mutex for FreeBSD.
 #[allow(dead_code)]
 pub struct RawMutex {
     // The `inner` is the value shown to the outside world as an underlying atomic.
     inner: AtomicU32,
-    // The `num_to_wake_up` is the actually what the futexes rely upon, and is a bit-field.
-    //
-    // The uppermost two bits (1<<31, and 1<<30) act as a "lock bit" for the waker (we use two of
-    // them to make it easier to catch accidental integer wrapping bugs more easily, at the cost of
-    // supporting "only" 1-billion waiters being woken up at once), preventing multiple wakers from
-    // running at the same time.
-    //
-    // The lower 30 bits indicate how many waiters the waker wants to wake up. The waiters
-    // themselves will decrement this number as they wake up, but should make sure not to overflow
-    // (this is why we use two bits for the lock bit---to catch implementation bugs of this kind).
     num_to_wake_up: AtomicU32,
 }
 
@@ -1016,7 +964,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Fr
 
         let ptr = unsafe {
             syscalls::syscall6(
-                // todo(chuqi): add x86 support
                 syscalls::Sysno::Mmap,
                 range.start,
                 range.len(),
@@ -1024,7 +971,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Fr
                     .bits()
                     .reinterpret_as_unsigned() as usize,
                 map_flags.bits().reinterpret_as_unsigned() as usize,
-                usize::MAX, // -1 for anonymous mapping
+                -1isize as usize,
                 0,
             )
         }
@@ -1108,8 +1055,6 @@ impl litebox::platform::StdioProvider for FreeBSDUserland {
             )
         } {
             Ok(n) => Ok(n),
-            // todo(chuqi): handle EPIPE
-            // Err(syscalls::Errno::EPIPE) => Err(litebox::platform::StdioWriteError::Closed),
             Err(err) => panic!("unhandled error {err}"),
         }
     }
@@ -1139,7 +1084,7 @@ impl litebox::mm::allocator::MemoryProvider for FreeBSDUserland {
         );
         unsafe {
             syscalls::syscall6(
-                syscalls::Sysno::Mmap, // todo(chuqi): add x86 support
+                syscalls::Sysno::Mmap,
                 0,
                 size,
                 ProtFlags::PROT_READ_WRITE.bits().reinterpret_as_unsigned() as usize,
@@ -1159,7 +1104,6 @@ impl litebox::mm::allocator::MemoryProvider for FreeBSDUserland {
     }
 }
 
-// todo(chuqi): differentiate between x86 and x86_64
 core::arch::global_asm!(
     "
     .text
@@ -1273,7 +1217,6 @@ impl litebox::platform::SystemInfoProvider for FreeBSDUserland {
 }
 
 impl FreeBSDUserland {
-    // todo(chuqi): support x86
     fn get_thread_local_storage() -> *mut litebox_common_linux::ThreadLocalStorage<FreeBSDUserland>
     {
         let tls = unsafe { litebox_common_linux::rdgsbase() };
@@ -1282,18 +1225,6 @@ impl FreeBSDUserland {
         }
         tls as *mut litebox_common_linux::ThreadLocalStorage<FreeBSDUserland>
     }
-
-    // // todo(chuqi): support x86
-    // fn set_fs_selector(fss: u16) {
-    //     unsafe {
-    //         // Set the fs selector to the given value
-    //         core::arch::asm!(
-    //             "mov fs, {0:x}",
-    //             in(reg) fss,
-    //             options(nostack, preserves_flags)
-    //         );
-    //     }
-    // }
 }
 
 /// Similar to libc, we use fs/gs registers to store thread-local storage (TLS).
@@ -1304,7 +1235,6 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
     // tbd anyways
     type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<FreeBSDUserland>;
 
-    // todo(chuqi): support x86
     fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
         // todo(chuqi): temporarily disable the check for FreeBSD, because FreeBSD's
         // child thread (from thr_new) creation will inherit the parent's gs
@@ -1315,7 +1245,6 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
         unsafe { litebox_common_linux::wrgsbase(Box::into_raw(tls) as usize) };
     }
 
-    // todo(chuqi): support x86
     fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
         let tls = Self::get_thread_local_storage();
         assert!(!tls.is_null(), "TLS must be set before releasing it");
@@ -1345,7 +1274,12 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::AtomicU32;
+<<<<<<< HEAD
     use litebox::platform::{RawMutex, ThreadLocalStorageProvider as _};
+=======
+    use litebox::platform::RawMutex;
+    use litebox::platform::ThreadLocalStorageProvider as _;
+>>>>>>> d57fd01d0ee4fbd9bfaff77275cf275fd951cb1a
     use std::thread::sleep;
 
     use crate::FreeBSDUserland;

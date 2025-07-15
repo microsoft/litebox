@@ -1,6 +1,12 @@
-use crate::mshv::{HvPageProtFlags, vtl1_mem_layout::PAGE_SIZE};
+use crate::{
+    host::linux::ListHead,
+    mshv::{HvPageProtFlags, vtl1_mem_layout::PAGE_SIZE},
+};
 use num_enum::TryFromPrimitive;
-use x86_64::{PhysAddr, VirtAddr};
+use x86_64::{
+    PhysAddr, VirtAddr,
+    structures::paging::{PageSize, Size4KiB},
+};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -31,7 +37,7 @@ pub(crate) fn mem_attr_to_hv_page_prot_flags(attr: MemAttr) -> HvPageProtFlags {
     flags
 }
 
-#[derive(Default, Debug, TryFromPrimitive)]
+#[derive(Default, Debug, TryFromPrimitive, PartialEq)]
 #[repr(u64)]
 pub enum HekiKdataType {
     SystemCerts = 0,
@@ -41,18 +47,16 @@ pub enum HekiKdataType {
     KernelData = 4,
     PatchInfo = 5,
     KexecTrampoline = 6,
-    KdataMax = 7,
     #[default]
     Unknown = 0xffff_ffff_ffff_ffff,
 }
 
-#[derive(Default, Debug, TryFromPrimitive)]
+#[derive(Default, Debug, TryFromPrimitive, PartialEq)]
 #[repr(u64)]
 pub enum HekiKexecType {
     KexecImage = 0,
     KexecKernelBlob = 1,
     KexecPages = 2,
-    KexecMax = 3,
     #[default]
     Unknown = 0xffff_ffff_ffff_ffff,
 }
@@ -68,6 +72,7 @@ pub enum ModMemType {
     InitData = 5,
     InitRoData = 6,
     ElfBuffer = 7,
+    Patch = 8,
     #[default]
     Unknown = 0xffff_ffff_ffff_ffff,
 }
@@ -143,6 +148,24 @@ impl HekiRange {
         let attr = self.attributes;
         HekiKexecType::try_from(attr).unwrap_or(HekiKexecType::Unknown)
     }
+
+    pub fn is_valid(&self) -> bool {
+        let va = self.va;
+        let pa = self.pa;
+        let epa = self.epa;
+        let Ok(pa) = PhysAddr::try_new(pa) else {
+            return false;
+        };
+        let Ok(epa) = PhysAddr::try_new(epa) else {
+            return false;
+        };
+        !(VirtAddr::try_new(va).is_err()
+            || epa < pa
+            || (self.mem_attr().is_none()
+                && self.heki_kdata_type() == HekiKdataType::Unknown
+                && self.heki_kexec_type() == HekiKexecType::Unknown
+                && self.mod_mem_type() == ModMemType::Unknown))
+    }
 }
 
 #[expect(clippy::cast_possible_truncation)]
@@ -166,10 +189,131 @@ impl HekiPage {
             ..Default::default()
         }
     }
+
+    pub fn is_valid(&self) -> bool {
+        if PhysAddr::try_new(self.next_pa).is_err() {
+            return false;
+        }
+        let Some(nranges) = usize::try_from(self.nranges)
+            .ok()
+            .filter(|&n| n <= HEKI_MAX_RANGES)
+        else {
+            return false;
+        };
+        for heki_range in &self.ranges[..nranges] {
+            if !heki_range.is_valid() {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl Default for HekiPage {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<'a> IntoIterator for &'a HekiPage {
+    type Item = &'a HekiRange;
+    type IntoIter = core::slice::Iter<'a, HekiRange>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.ranges[..usize::try_from(self.nranges).unwrap_or(0)].iter()
+    }
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+#[repr(C)]
+pub struct HekiPatch {
+    pub pa: [u64; 2],
+    pub size: u8,
+    pub code: [u8; POKE_MAX_OPCODE_SIZE],
+}
+pub const POKE_MAX_OPCODE_SIZE: usize = 5;
+
+impl HekiPatch {
+    /// Creates a new `HekiPatch` with a given buffer. Returns `None` if any field is invalid.
+    pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != core::mem::size_of::<HekiPatch>() {
+            return None;
+        }
+        let mut patch = core::mem::MaybeUninit::<HekiPatch>::uninit();
+        let patch = unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr().cast::<u8>(),
+                patch.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of::<HekiPatch>(),
+            );
+            patch.assume_init()
+        };
+        if patch.is_valid() { Some(patch) } else { None }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        let Some(pa_0) = PhysAddr::try_new(self.pa[0])
+            .ok()
+            .filter(|&pa| !pa.is_null())
+        else {
+            return false;
+        };
+        let Some(pa_1) = PhysAddr::try_new(self.pa[1])
+            .ok()
+            .filter(|&pa| pa.is_null() || pa.is_aligned(Size4KiB::SIZE))
+        else {
+            return false;
+        };
+        let bytes_in_first_page = usize::try_from(pa_0.align_up(Size4KiB::SIZE) - pa_0).unwrap();
+
+        !(self.size == 0
+            || usize::from(self.size) > POKE_MAX_OPCODE_SIZE
+            || (pa_0 == pa_1)
+            || (pa_1.is_null() && bytes_in_first_page < usize::from(self.size))
+            || (!pa_1.is_null() && bytes_in_first_page > usize::from(self.size)))
+    }
+}
+
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+#[repr(u32)]
+pub enum HekiPatchType {
+    JumpLabel = 0,
+    #[default]
+    Unknown = 0xffff_ffff,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct HekiPatchInfo {
+    pub typ_: HekiPatchType,
+    list: ListHead,
+    mod_: *const core::ffi::c_void, // *const `struct module`
+    pub patch_index: u64,
+    pub max_patch_count: u64,
+    // pub patch: [HekiPatch; *]
+}
+
+impl HekiPatchInfo {
+    /// Creates a new `HekiPatchInfo` with a given buffer. Returns `None` if any field is invalid.
+    pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != core::mem::size_of::<HekiPatchInfo>() {
+            return None;
+        }
+        let mut info = core::mem::MaybeUninit::<HekiPatchInfo>::uninit();
+        let info = unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr().cast::<u8>(),
+                info.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of::<HekiPatchInfo>(),
+            );
+            info.assume_init()
+        };
+        if info.is_valid() { Some(info) } else { None }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !(self.typ_ != HekiPatchType::JumpLabel
+            || self.patch_index == 0
+            || self.patch_index > self.max_patch_count)
     }
 }
