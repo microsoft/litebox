@@ -59,7 +59,7 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
-      - run: sudo apt install -y gcc-multilib musl-tools
+      - run: sudo apt update && sudo apt install -y gcc-multilib musl-tools
       - name: Set up Rust
         run: |
           rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target i686-unknown-linux-gnu,i686-unknown-linux-musl
