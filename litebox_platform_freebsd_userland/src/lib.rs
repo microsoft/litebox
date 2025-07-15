@@ -335,7 +335,7 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 
     /// Wake up multiple waiters.
-    /// Always returns `n`` on success, and `0` on failure. 
+    /// Always returns `n`` on success, and `0` on failure.
     fn wake_many(&self, n: usize) -> usize {
         use core::sync::atomic::Ordering::SeqCst;
 
@@ -364,12 +364,12 @@ impl litebox::platform::RawMutex for RawMutex {
         match umtx_op_operation_timeout(
             &self.num_to_wake_up,
             freebsd_types::UmtxOpOperation::UMTX_OP_WAKE,
-            n as usize,    // Number of threads to wake
-            None, // No timeout for wake operations
+            n as usize, // Number of threads to wake
+            None,       // No timeout for wake operations
         ) {
             Err(_) => {
                 return 0; // Wake failed
-            },
+            }
             Ok(_) => {} // On success, continue with unlocking
         };
 
