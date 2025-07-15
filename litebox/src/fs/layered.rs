@@ -902,6 +902,7 @@ impl<
                 file_type,
                 mode,
                 size,
+                owner,
             } = match entry.as_ref() {
                 EntryX::Upper { fd } => self.upper.fd_file_status(fd)?,
                 EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
@@ -913,6 +914,7 @@ impl<
                 file_type,
                 mode,
                 size,
+                owner,
             });
         }
         // The file is not open, we must look at the levels themselves.
@@ -921,11 +923,13 @@ impl<
                 file_type,
                 mode,
                 size,
+                owner,
             }) => {
                 return Ok(FileStatus {
                     file_type,
                     mode,
                     size,
+                    owner,
                 });
             }
             Err(e) => match e {
@@ -948,11 +952,13 @@ impl<
             file_type,
             mode,
             size,
+            owner,
         } = self.lower.file_status(path)?;
         Ok(FileStatus {
             file_type,
             mode,
             size,
+            owner,
         })
     }
 
@@ -968,6 +974,7 @@ impl<
             file_type,
             mode,
             size,
+            owner,
         } = match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.fd_file_status(fd)?,
             EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
@@ -979,6 +986,7 @@ impl<
             file_type,
             mode,
             size,
+            owner,
         })
     }
 

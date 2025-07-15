@@ -302,6 +302,22 @@ pub struct FileStatus {
     pub mode: Mode,
     /// Size of the file, in bytes. This value considered informative if this is a regular file.
     pub size: usize,
+    /// Owner of the file
+    pub owner: UserInfo,
+}
+
+/// User information
+#[derive(Clone, Copy, Debug)]
+pub struct UserInfo {
+    /// User ID for the owner
+    pub user: u16,
+    /// Group ID for the owner
+    pub group: u16,
+}
+
+impl UserInfo {
+    /// The root user
+    pub const ROOT: Self = Self { user: 0, group: 0 };
 }
 
 /// The size reported as the size of a directory.

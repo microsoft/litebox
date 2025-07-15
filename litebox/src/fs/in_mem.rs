@@ -13,7 +13,7 @@ use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError,
     PathError, ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError, WriteError,
 };
-use super::{FileStatus, Mode, SeekWhence};
+use super::{FileStatus, Mode, SeekWhence, UserInfo};
 use crate::utilities::anymap::AnyMap;
 
 /// A backing implementation for [`FileSystem`](super::FileSystem) storing all files in-memory.
@@ -62,11 +62,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     where
         F: FnOnce(&mut Self),
     {
-        const ROOT: UserInfo = UserInfo { user: 0, group: 0 };
-        let original_user = core::mem::replace(&mut self.current_user, ROOT);
+        let original_user = core::mem::replace(&mut self.current_user, UserInfo::ROOT);
         f(self);
         let root_again = core::mem::replace(&mut self.current_user, original_user);
-        if root_again.user != ROOT.user || root_again.group != ROOT.group {
+        if root_again.user != UserInfo::ROOT.user || root_again.group != UserInfo::ROOT.group {
             unreachable!()
         }
     }
@@ -484,6 +483,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             file_type,
             mode: perms.mode,
             size,
+            owner: perms.userinfo,
         })
     }
 
@@ -507,6 +507,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             file_type,
             mode: perms.mode,
             size,
+            owner: perms.userinfo,
         })
     }
 
@@ -703,12 +704,6 @@ pub(crate) struct FileX {
 struct Permissions {
     mode: Mode,
     userinfo: UserInfo,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct UserInfo {
-    user: u16,
-    group: u16,
 }
 
 impl UserInfo {

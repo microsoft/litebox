@@ -5,7 +5,7 @@ use alloc::string::String;
 use crate::{
     LiteBox,
     fs::{
-        FileStatus, FileType, Mode, OFlags, SeekWhence,
+        FileStatus, FileType, Mode, OFlags, SeekWhence, UserInfo,
         errors::{
             ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
             ReadError, RmdirError, SeekError, UnlinkError, WriteError,
@@ -209,6 +209,7 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
                 file_type: FileType::CharacterDevice,
                 mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
                 size: 0,
+                owner: UserInfo::ROOT,
             })
         } else {
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
@@ -220,6 +221,7 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
             file_type: FileType::CharacterDevice,
             mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
             size: 0,
+            owner: UserInfo::ROOT,
         })
     }
 
