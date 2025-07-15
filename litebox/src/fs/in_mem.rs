@@ -20,6 +20,10 @@ use crate::utilities::anymap::AnyMap;
 /// `b'IMem'.hex()`.
 const DEVICE_ID: usize = 0x494d656d;
 
+/// Block size for file system I/O operations
+// TODO(jayb): Determine appropriate block size
+const BLOCK_SIZE: usize = 0;
+
 /// A backing implementation for [`FileSystem`](super::FileSystem) storing all files in-memory.
 ///
 /// # Warning
@@ -516,6 +520,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 ino: unique_id,
                 rdev: None,
             },
+            blksize: BLOCK_SIZE,
         })
     }
 
@@ -551,6 +556,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 ino: unique_id,
                 rdev: None,
             },
+            blksize: BLOCK_SIZE,
         })
     }
 

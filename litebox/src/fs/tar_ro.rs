@@ -45,6 +45,10 @@ const DEVICE_ID: usize = 0x5461726f;
 /// is actually checking for real inode numbers.
 const TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER: usize = 0xFACE;
 
+/// Block size for file system I/O operations
+// TODO(jayb): Determine appropriate block size
+const BLOCK_SIZE: usize = 0;
+
 /// A backing implementation for [`FileSystem`](super::FileSystem), storing all files in-memory, via
 /// a read-only `.tar` file.
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
@@ -328,6 +332,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
                     rdev: None,
                 },
+                blksize: BLOCK_SIZE,
             }),
             Some(p) => Ok(super::FileStatus {
                 file_type: super::FileType::RegularFile,
@@ -339,6 +344,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
                     rdev: None,
                 },
+                blksize: BLOCK_SIZE,
             }),
         }
     }
@@ -360,6 +366,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                         ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
                         rdev: None,
                     },
+                    blksize: BLOCK_SIZE,
                 })
             }
             Descriptor::Dir { .. } => Ok(super::FileStatus {
@@ -372,6 +379,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
                     rdev: None,
                 },
+                blksize: BLOCK_SIZE,
             }),
         }
     }

@@ -15,6 +15,9 @@ use crate::{
     platform::{StdioOutStream, StdioReadError, StdioStream, StdioWriteError},
 };
 
+/// Block size for stdio devices
+const STDIO_BLOCK_SIZE: usize = 1024;
+
 /// Constant node information for all 3 stdio devices:
 /// ```console
 /// $ stat -L --format 'name=%-11n dev=%d ino=%i rdev=%r' /dev/stdin /dev/stdout /dev/stderr
@@ -224,6 +227,7 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
                 size: 0,
                 owner: UserInfo::ROOT,
                 node_info: STDIO_NODE_INFO,
+                blksize: STDIO_BLOCK_SIZE,
             })
         } else {
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
@@ -237,6 +241,7 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
             size: 0,
             owner: UserInfo::ROOT,
             node_info: STDIO_NODE_INFO,
+            blksize: STDIO_BLOCK_SIZE,
         })
     }
 

@@ -307,6 +307,8 @@ pub struct FileStatus {
     pub owner: UserInfo,
     /// Information about this particular node
     pub node_info: NodeInfo,
+    /// Block size for file system I/O
+    pub blksize: usize,
 }
 
 /// User information

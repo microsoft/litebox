@@ -924,6 +924,7 @@ impl<
                 size,
                 owner,
                 node_info,
+                blksize,
             } = match entry.as_ref() {
                 EntryX::Upper { fd } => self.upper.fd_file_status(fd)?,
                 EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
@@ -937,6 +938,7 @@ impl<
                 size,
                 owner,
                 node_info: self.get_layered_nodeinfo(node_info),
+                blksize,
             });
         }
         // The file is not open, we must look at the levels themselves.
@@ -947,6 +949,7 @@ impl<
                 size,
                 owner,
                 node_info,
+                blksize,
             }) => {
                 return Ok(FileStatus {
                     file_type,
@@ -954,6 +957,7 @@ impl<
                     size,
                     owner,
                     node_info: self.get_layered_nodeinfo(node_info),
+                    blksize,
                 });
             }
             Err(e) => match e {
@@ -978,6 +982,7 @@ impl<
             size,
             owner,
             node_info,
+            blksize,
         } = self.lower.file_status(path)?;
         Ok(FileStatus {
             file_type,
@@ -985,6 +990,7 @@ impl<
             size,
             owner,
             node_info: self.get_layered_nodeinfo(node_info),
+            blksize,
         })
     }
 
@@ -1002,6 +1008,7 @@ impl<
             size,
             owner,
             node_info,
+            blksize,
         } = match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.fd_file_status(fd)?,
             EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
@@ -1015,6 +1022,7 @@ impl<
             size,
             owner,
             node_info: self.get_layered_nodeinfo(node_info),
+            blksize,
         })
     }
 
