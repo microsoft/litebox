@@ -254,7 +254,7 @@ impl litebox::platform::RawMutexProvider for FreeBSDUserland {
 }
 
 // A skeleton of a raw mutex for FreeBSD.
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub struct RawMutex {
     // The `inner` is the value shown to the outside world as an underlying atomic.
     inner: AtomicU32,
@@ -698,8 +698,6 @@ impl FreeBSDUserland {
 /// To avoid conflicts with libc's TLS, we choose to use gs on x86_64 and fs on x86
 /// as libc uses fs on x86_64 and gs on x86.
 impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
-    // todo(chuqi): we may change the TLS type later on to adapt FreeBSD's robust_list
-    // tbd anyways
     type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<FreeBSDUserland>;
 
     fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
