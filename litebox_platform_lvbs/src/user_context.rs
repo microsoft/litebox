@@ -22,6 +22,7 @@ const VTL1_USER_TOP: u64 = 0x1_4000_0000;
 // fixed-size user stack for an OP-TEE TA
 pub const VTL1_USER_STACK_SIZE: usize = 16 * PAGE_SIZE;
 
+#[allow(dead_code)]
 pub trait UserSpaceManagement {
     /// Global virtual address base for VTL1 user space
     const GVA_USER_BASE: VirtAddr;

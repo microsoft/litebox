@@ -7,7 +7,6 @@ mod hvcall_vp;
 mod mem_integrity;
 pub(crate) mod vsm;
 mod vsm_intercept;
-mod vsm_optee;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 

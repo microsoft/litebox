@@ -4,10 +4,8 @@ use crate::{
     kernel_context::get_per_core_kernel_context,
     mshv::{
         HV_VTL_NORMAL, HV_VTL_SECURE, NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT,
-        VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction,
-        vsm::vsm_dispatch,
+        VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction, vsm::vsm_dispatch,
         vsm_intercept::vsm_handle_intercept,
-        vsm_optee::{OpteeMessageCommand, optee_dispatch},
     },
 };
 use core::arch::{asm, naked_asm};
@@ -291,12 +289,7 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
         .unwrap_or(VsmFunction::Unknown);
     match func_id {
         VsmFunction::Unknown => Errno::EINVAL.as_neg().into(),
-        VsmFunction::OpteeMessage => {
-            let msg_cmd_id =
-                OpteeMessageCommand::try_from(u32::try_from(params[1]).unwrap_or(u32::MAX))
-                    .unwrap_or(OpteeMessageCommand::Unknown);
-            optee_dispatch(msg_cmd_id, &params[2..])
-        }
+        VsmFunction::OpteeMessage => todo!("VSM function call for OP-TEE message"),
         _ => vsm_dispatch(func_id, &params[1..]),
     }
 }

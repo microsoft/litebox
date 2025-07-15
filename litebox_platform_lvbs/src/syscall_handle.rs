@@ -12,10 +12,8 @@ use x86_64::{
     },
 };
 
-// OP-TEE-IA system call register setup
-//
-// OP-TEE supports up to 8 arguments for system calls. OP-TEE-IA uses two additional
-// registers (r12 and r13) to pass the 6th and 7th arguments.
+// Generic x86_64 syscall support with a minor extension for realizing OP-TEE's
+// up to 8 syscall arguments (r12 and r13 for the 6th and 7th arguments).
 //
 // rax: system call number
 // rdi: arg0
