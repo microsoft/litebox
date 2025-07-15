@@ -27,45 +27,47 @@ pub const FUTEX_WAIT: i32 = 0;
 pub const FUTEX_WAKE: i32 = 1;
 pub const FUTEX_REQUEUE: i32 = 3;
 
-/* constants for encoding ioctl commands (see the macro `ioc`) */
-/// The number of bits allocated for the ioctl command number field.
-pub const NRBITS: u32 = 8;
-/// The number of bits allocated for the ioctl command type field.
-pub const TYPEBITS: u32 = 8;
-/// The number of bits allocated for the ioctl command size field.
-pub const SIZEBITS: u32 = 14;
-/// The bit offset for the ioctl command number field.
-pub const NRSHIFT: u32 = 0;
-/// The bit offset for the ioctl command type field.
-pub const TYPESHIFT: u32 = NRSHIFT + NRBITS;
-/// The bit offset for the ioctl command size field.
-pub const SIZESHIFT: u32 = TYPESHIFT + TYPEBITS;
-/// The bit offset for the ioctl command direction field.
-pub const DIRSHIFT: u32 = SIZESHIFT + SIZEBITS;
-/// Represents no data transfer direction for the ioctl command.
-pub const NONE: u32 = 0;
-/// Represents the write data transfer direction for the ioctl command.
-pub const WRITE: u32 = 1;
-/// Represents the read data transfer direction for the ioctl command.
-pub const READ: u32 = 2;
+/// Encoding for ioctl commands.
+pub mod ioctl {
+    /// The number of bits allocated for the ioctl command number field.
+    pub const NRBITS: u32 = 8;
+    /// The number of bits allocated for the ioctl command type field.
+    pub const TYPEBITS: u32 = 8;
+    /// The number of bits allocated for the ioctl command size field.
+    pub const SIZEBITS: u32 = 14;
+    /// The bit offset for the ioctl command number field.
+    pub const NRSHIFT: u32 = 0;
+    /// The bit offset for the ioctl command type field.
+    pub const TYPESHIFT: u32 = NRSHIFT + NRBITS;
+    /// The bit offset for the ioctl command size field.
+    pub const SIZESHIFT: u32 = TYPESHIFT + TYPEBITS;
+    /// The bit offset for the ioctl command direction field.
+    pub const DIRSHIFT: u32 = SIZESHIFT + SIZEBITS;
+    /// Represents no data transfer direction for the ioctl command.
+    pub const NONE: u32 = 0;
+    /// Represents the write data transfer direction for the ioctl command.
+    pub const WRITE: u32 = 1;
+    /// Represents the read data transfer direction for the ioctl command.
+    pub const READ: u32 = 2;
 
-/// Encode an ioctl command.
-#[macro_export]
-macro_rules! ioc {
-    ($direction:expr, $type:expr, $number:expr, $size:expr) => {
-        (($direction as u32) << $crate::DIRSHIFT)
-            | (($type as u32) << $crate::TYPESHIFT)
-            | (($number as u32) << $crate::NRSHIFT)
-            | (($size as u32) << $crate::SIZESHIFT)
-    };
-}
+    /// Encode an ioctl command.
+    #[macro_export]
+    macro_rules! ioc {
+        ($direction:expr, $type:expr, $number:expr, $size:expr) => {
+            (($direction as u32) << $crate::ioctl::DIRSHIFT)
+                | (($type as u32) << $crate::ioctl::TYPESHIFT)
+                | (($number as u32) << $crate::ioctl::NRSHIFT)
+                | (($size as u32) << $crate::ioctl::SIZESHIFT)
+        };
+    }
 
-/// Encode an ioctl command that writes.
-#[macro_export]
-macro_rules! iow {
-    ($ty:expr, $nr:expr, $sz:expr) => {
-        $crate::ioc!($crate::WRITE, $ty, $nr, $sz)
-    };
+    /// Encode an ioctl command that writes.
+    #[macro_export]
+    macro_rules! iow {
+        ($ty:expr, $nr:expr, $sz:expr) => {
+            $crate::ioc!($crate::ioctl::WRITE, $ty, $nr, $sz)
+        };
+    }
 }
 
 bitflags::bitflags! {

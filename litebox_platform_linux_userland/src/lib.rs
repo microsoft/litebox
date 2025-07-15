@@ -96,7 +96,7 @@ impl LinuxUserland {
     pub fn new(tun_device_name: Option<&str>) -> &'static Self {
         let tun_socket_fd = tun_device_name
             .map(|tun_device_name| {
-                let tun_path = "/dev/net/tun\0";
+                let tun_path = b"/dev/net/tun\0";
                 let tun_fd = unsafe {
                     syscalls::syscall3(
                         syscalls::Sysno::open,
