@@ -360,8 +360,9 @@ impl litebox::platform::RawMutex for RawMutex {
             // until the other waker is done with their job and brings the value down.
             core::hint::spin_loop();
         }
+
         // Now we can actually wake them up using FreeBSD's umtx_op and it always returns 0
-        // on success, so we cannot ask the kernel how many were woken up.
+        // on success. We cannot ask the kernel how many were woken up.
         match umtx_op_operation_timeout(
             &self.num_to_wake_up,
             freebsd_types::UmtxOpOperation::UMTX_OP_WAKE,
@@ -369,16 +370,15 @@ impl litebox::platform::RawMutex for RawMutex {
             None,       // No timeout for wake operations
         ) {
             Err(_) => {
-                return 0; // Wake failed
+                // Wake failed.
+                return 0;
             }
-            Ok(_) => {} // On success, continue with unlocking
+            Ok(_) => {
+                // Unlock the lock bits and clean up the value, allowing other wakers to run.
+                self.num_to_wake_up.store(0, SeqCst);
+                return n as usize;
+            }
         };
-
-        // Unlock the lock bits and clean up the value, allowing other wakers to run.
-        self.num_to_wake_up.store(0, SeqCst);
-
-        // Return: always n on success, 0 on failure
-        n as usize
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
