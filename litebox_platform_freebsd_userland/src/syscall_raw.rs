@@ -2,9 +2,9 @@
 
 #[repr(i32)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-#[allow(
+#[expect(
     dead_code,
-    reason = "For comprehension we added an over-approximated syscall list. To be removed."
+    reason = "To be comprehensive, we added an over-approximated syscall list. To be removed."
 )]
 pub(crate) enum SyscallTable {
     Exit = 1,
