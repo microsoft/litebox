@@ -496,16 +496,7 @@ fn do_stat(pathname: impl path::Arg, follow_symlink: bool) -> Result<FileStat, E
         _ => None,
     };
     let status = litebox_fs().file_status(path)?;
-    let mut fstat = FileStat::from(status);
-    if let Some(typ) = stdio_typ {
-        // TODO: we don't have correct values for these fields yet, but ensure there are consistent.
-        // (See <https://github.com/bminor/glibc/blob/e78caeb4ff812ae19d24d65f4d4d48508154277b/sysdeps/unix/sysv/linux/ttyname.h#L35>).
-        fstat.st_ino = typ as _;
-        fstat.st_dev = 0;
-        fstat.st_rdev = 34824;
-        fstat.st_blksize = 1024;
-    }
-    Ok(fstat)
+    Ok(FileStat::from(status))
 }
 
 /// Handle syscall `stat`
