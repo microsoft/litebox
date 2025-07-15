@@ -42,7 +42,7 @@ unsafe extern "C" {
     fn trampoline(entry: usize, sp: usize) -> !;
 }
 
-#[expect(unused_variables)]
+#[cfg_attr(not(target_os = "linux"), expect(unused_variables))]
 pub fn init_platform(
     tar_data: &[u8],
     initial_dirs: &[&str],
