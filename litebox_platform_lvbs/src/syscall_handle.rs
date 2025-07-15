@@ -4,7 +4,6 @@ use crate::{
     user_context::UserSpaceManagement,
 };
 use core::arch::{asm, naked_asm};
-use litebox_common_linux::errno::Errno;
 use x86_64::{
     VirtAddr,
     registers::{
@@ -38,35 +37,9 @@ use x86_64::{
 // r11: userspace rflags
 // Note. rsp should point to the userspace stack before calling `sysretq`
 
-// TODO: move OP-TEE-specific syscall handling code/data to the `litebox_shim_optee` crate
-pub type SyscallHandler = fn(SyscallRequest<crate::host::LvbsLinuxKernel>) -> isize;
+// placholder for the syscall handler function type
+pub type SyscallHandler = fn() -> isize;
 static SYSCALL_HANDLER: spin::Once<SyscallHandler> = spin::Once::new();
-
-pub fn optee_syscall_entry(request: SyscallRequest<crate::Platform>) -> isize {
-    let _res: Result<isize, Errno> = match request {
-        SyscallRequest::Log { buf: _, len: _ } | SyscallRequest::Return { ret: _ } => Ok(0),
-        SyscallRequest::Debug { ctx } => {
-            debug_serial_println!("Debug syscall invoked with context: {:#x?}", ctx);
-            Ok(0)
-        }
-    };
-
-    0
-}
-
-#[non_exhaustive]
-pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
-    Return {
-        ret: i64,
-    },
-    Log {
-        buf: Platform::RawConstPointer<u8>,
-        len: usize,
-    },
-    Debug {
-        ctx: &'a SyscallContext,
-    },
-}
 
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug)]
@@ -130,19 +103,14 @@ fn syscall_dispatcher(sysnr: u64, ctx: *const SyscallContext) -> isize {
         "BUG: userspace RIP or RSP is invalid"
     );
 
-    // assume OP-TEE syscall
-    let sysret = match sysnr {
-        0xdeadbeef => syscall_handler(SyscallRequest::Debug { ctx }),
-        _ => {
-            panic!("BUG: syscall_dispatcher called with sysnr = {:#x}", sysnr)
-        }
-    };
+    // placeholder for the syscall handler
+    let sysret = syscall_handler();
 
     // TODO: check syscall number and its result to determine whether it should
     // return to the user space or switch to VTL0
 
-    // return to the user space
-    if sysnr != 0xdeadbeef {
+    // placeholder for returning to the user space
+    if sysret != 0 {
         return sysret;
     }
 

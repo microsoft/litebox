@@ -16,7 +16,7 @@ use litebox_platform_lvbs::{
             VTL1_PRE_POPULATED_MEMORY_SIZE, get_heap_start_address,
         },
     },
-    serial_println, syscall_handle,
+    serial_println,
 };
 
 /// # Panics
@@ -92,7 +92,6 @@ pub fn init() -> Option<&'static Platform> {
     }
     interrupts::init_idt();
     x86_64::instructions::interrupts::enable();
-    Platform::register_syscall_handler(syscall_handle::optee_syscall_entry);
 
     ret
 }

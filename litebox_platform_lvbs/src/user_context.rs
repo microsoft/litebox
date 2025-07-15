@@ -281,7 +281,6 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
 }
 
 // This dummy syscall function is used for testing purposes.
-// It follows our customized OP-TEE syscall wrapper which uses `syscall/sysret`
 #[expect(unused_assignments)]
 #[expect(unused_variables)]
 #[unsafe(no_mangle)]
