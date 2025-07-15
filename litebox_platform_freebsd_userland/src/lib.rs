@@ -71,6 +71,7 @@ impl FreeBSDUserland {
         // similar issues to be resolved.
 
         let path = SELFPROC_MAPS_PATH;
+        
         let c_path = match std::ffi::CString::new(path) {
             Ok(p) => p,
             Err(_) => return alloc::vec::Vec::new(),
