@@ -72,22 +72,21 @@ impl From<MemoryRegionPermissions> for VmFlags {
     }
 }
 
+const DEFAULT_RESERVED_SPACE_SIZE: usize = 0x100_0000; // 16 MiB
+
 bitflags::bitflags! {
     /// Options for page creation.
-    pub(super) struct CreatePagesFlags: u8 {
+    pub struct CreatePagesFlags: u8 {
+        /// Force the mapping to be created at the given address, resulting in any
+        /// existing overlapping mappings being removed.
         const FIXED_ADDR     = 1 << 0;
+        /// The mapping is used for stack.
         const IS_STACK       = 1 << 1;
+        /// Populate the pages immediately.
         const POPULATE_PAGES_IMMEDIATELY = 1 << 2;
-    }
-}
-
-impl CreatePagesFlags {
-    pub(super) fn new(fixed_addr: bool, is_stack: bool, populate_pages_immediately: bool) -> Self {
-        let mut flags = Self::empty();
-        flags.set(Self::FIXED_ADDR, fixed_addr);
-        flags.set(Self::IS_STACK, is_stack);
-        flags.set(Self::POPULATE_PAGES_IMMEDIATELY, populate_pages_immediately);
-        flags
+        /// Ensure there is more space (i.e., `DEFAULT_RESERVED_SPACE_SIZE`) after the
+        /// mapping so that user can grow the mapping later.
+        const ENSURE_SPACE_AFTER = 1 << 3;
     }
 }
 
@@ -140,11 +139,23 @@ impl<const ALIGN: usize> PageRange<ALIGN> {
     pub fn is_empty(&self) -> bool {
         false
     }
+
+    /// Get the start address and length of this range as a tuple.
+    #[allow(
+        clippy::missing_panics_doc,
+        reason = "This function should not fail as the range is guaranteed to be non-empty and aligned."
+    )]
+    pub fn start_and_length(&self) -> (NonZeroAddress<ALIGN>, NonZeroPageSize<ALIGN>) {
+        (
+            NonZeroAddress::new(self.start).unwrap(),
+            NonZeroPageSize::new(self.len()).unwrap(),
+        )
+    }
 }
 
 /// A non-zero `ALIGN`-aligned size in bytes.
 #[derive(Clone, Copy)]
-pub(super) struct NonZeroPageSize<const ALIGN: usize> {
+pub struct NonZeroPageSize<const ALIGN: usize> {
     size: usize,
 }
 
@@ -152,7 +163,7 @@ impl<const ALIGN: usize> NonZeroPageSize<ALIGN> {
     /// Create a new non-zero `ALIGN`-aligned size.
     ///
     /// Returns `None` if the size is zero or not `ALIGN`-aligned.
-    pub(super) fn new(size: usize) -> Option<Self> {
+    pub fn new(size: usize) -> Option<Self> {
         if size == 0 || size % ALIGN != 0 {
             return None;
         }
@@ -161,8 +172,35 @@ impl<const ALIGN: usize> NonZeroPageSize<ALIGN> {
 
     /// Get the size
     #[inline]
-    pub(super) fn as_usize(self) -> usize {
+    pub fn as_usize(self) -> usize {
         self.size
+    }
+}
+
+impl<const ALIGN: usize> core::ops::Add<usize> for NonZeroPageSize<ALIGN> {
+    type Output = Option<Self>;
+
+    fn add(self, rhs: usize) -> Self::Output {
+        NonZeroPageSize::new(self.size + rhs)
+    }
+}
+
+/// A non-zero address that is `ALIGN`-aligned.
+pub struct NonZeroAddress<const ALIGN: usize>(usize);
+
+impl<const ALIGN: usize> NonZeroAddress<ALIGN> {
+    /// Create a new `NonZeroAddress`, if the address is non-zero and aligned.
+    pub fn new(address: usize) -> Option<Self> {
+        if address == 0 || address % ALIGN != 0 {
+            return None;
+        }
+        Some(Self(address))
+    }
+
+    /// Get the address
+    #[inline]
+    pub fn as_usize(self) -> usize {
+        self.0
     }
 }
 
@@ -322,16 +360,12 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
 
     /// Create a new mapping in the virtual address space.
     ///
-    /// The start address of `suggested_range` is the hint address for where to create the pages.
-    /// Provide `0` to let the kernel choose an available memory region.
-    /// The length of `suggested_range` is the size of the pages to be created.
+    /// `suggested_address` is the hint address for where to create the pages if it is not `None`.
+    /// Otherwise, let the kernel choose an available memory region.
     ///
-    /// Set `fixed_addr` to `true` to force the mapping to be created at the given address, resulting in any
-    /// existing overlapping mappings being removed. Otherwise, the kernel will choose an available memory region
-    /// if the suggested address is not available.
+    /// `length` is the size of the pages to be created.
     ///
-    /// By default, the pages are not populated until they are accessed.
-    /// Set `populate_pages_immediately` to `true` to populate the pages immediately.
+    /// Set `flags` to control options such as fixed address, stack, and populate pages.
     ///
     /// Return `Some(new_addr)` if the mapping is created successfully.
     /// The returned address is `ALIGN`-aligned.
@@ -343,19 +377,36 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     pub(super) unsafe fn create_mapping(
         &mut self,
-        suggested_range: PageRange<ALIGN>,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
         vma: VmArea,
-        fixed_addr: bool,
-        populate_pages_immediately: bool,
+        flags: CreatePagesFlags,
     ) -> Option<Platform::RawMutPointer<u8>> {
-        let new_addr = self.get_unmmaped_area(suggested_range, fixed_addr)?;
+        let total_length = (length
+            + if flags.contains(CreatePagesFlags::ENSURE_SPACE_AFTER) {
+                DEFAULT_RESERVED_SPACE_SIZE
+            } else {
+                0
+            })
+        .unwrap();
+        let new_addr = self.get_unmmaped_area(
+            suggested_address,
+            total_length,
+            flags.contains(CreatePagesFlags::FIXED_ADDR),
+        )?;
         // new_addr must be ALIGN aligned
-        let new_range = PageRange::new(new_addr, new_addr + suggested_range.len()).unwrap();
-        unsafe { self.insert_mapping(new_range, vma, populate_pages_immediately) }
+        let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
+        unsafe {
+            self.insert_mapping(
+                new_range,
+                vma,
+                flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
+            )
+        }
     }
 
     /// Resize a range in the virtual address space.
-    /// Shrinks the range if it is larger than `new_size`.
+    /// Shrink the range if it is larger than `new_size`.
     /// Enlarge the range if it is smaller than `new_size` and will not overlap with
     /// next mapping after the expansion.
     ///
@@ -438,9 +489,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) unsafe fn move_mappings(
         &mut self,
         old_range: PageRange<ALIGN>,
-        suggested_new_range: PageRange<ALIGN>,
+        suggested_new_address: Option<NonZeroAddress<ALIGN>>,
+        new_size: NonZeroPageSize<ALIGN>,
     ) -> Result<Platform::RawMutPointer<u8>, VmemMoveError> {
-        assert!(suggested_new_range.len() >= old_range.len());
+        assert!(new_size.as_usize() >= old_range.len());
 
         // Check if the given range is covered by exactly one mapping
         let (cur_range, vma) = self
@@ -450,10 +502,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         assert!(cur_range.contains(&(old_range.end - 1)));
 
         let new_addr = self
-            .get_unmmaped_area(suggested_new_range, false)
+            .get_unmmaped_area(suggested_new_address, new_size, false)
             .ok_or(VmemMoveError::OutOfMemory)?;
-        let new_range =
-            PageRange::<ALIGN>::new(new_addr, new_addr + suggested_new_range.len()).unwrap();
+        let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
         let new_addr = unsafe {
             self.platform
                 .remap_pages(old_range.into(), new_range.into())
@@ -535,9 +586,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
 
     /// Create a mapping with the given flags.
     ///
-    /// `suggested_range` is the range of pages to create. If the start address is not given (i.e., zero), some
-    /// available memory region will be chosen. Otherwise, the range will be created at the given address if it
-    /// is available.
+    /// `suggested_new_address` is the hint address for where to create the pages if it is not `None`.
+    /// Otherwise, let the kernel choose an available memory region.
+    ///
+    /// `length` is the size of the pages to be created.
     ///
     /// Set `flags` to control options such as fixed address, stack, and populate pages.
     ///
@@ -554,7 +606,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// Also, caller must ensure flags are set correctly.
     pub(super) unsafe fn create_pages<F>(
         &mut self,
-        suggested_range: PageRange<ALIGN>,
+        suggested_new_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
         flags: CreatePagesFlags,
         before_perms: MemoryRegionPermissions,
         after_perms: MemoryRegionPermissions,
@@ -565,7 +618,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     {
         let addr = unsafe {
             self.create_mapping(
-                suggested_range,
+                suggested_new_address,
+                length,
                 VmArea::new(
                     VmFlags::from(before_perms)
                         | VmFlags::VM_MAY_ACCESS_FLAGS
@@ -575,8 +629,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                             VmFlags::empty()
                         },
                 ),
-                flags.contains(CreatePagesFlags::FIXED_ADDR),
-                flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
+                flags,
             )
         }
         .ok_or(MappingError::OutOfMemory)?;
@@ -585,8 +638,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // remove the mapping if the user function fails
             unsafe {
                 self.remove_mapping(
-                    PageRange::new(addr.as_usize(), addr.as_usize() + suggested_range.len())
-                        .unwrap(),
+                    PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap(),
                 )
             }
             .unwrap();
@@ -594,7 +646,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         }
         if before_perms != after_perms {
             let range =
-                PageRange::new(addr.as_usize(), addr.as_usize() + suggested_range.len()).unwrap();
+                PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap();
             // `protect` should succeed, as we just created the mapping.
             unsafe { self.protect_mapping(range, after_perms) }.expect("failed to protect mapping");
         }
@@ -610,25 +662,31 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// Returns `None` if no area found. Otherwise, returns the start address of a page-aligned area.
     fn get_unmmaped_area(
         &self,
-        suggested_range: PageRange<ALIGN>,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
         fixed_addr: bool,
     ) -> Option<usize> {
-        let size = suggested_range.len();
+        let size = length.as_usize();
         if size > Self::TASK_ADDR_MAX {
             return None;
         }
-        if suggested_range.start != 0 {
-            if (Self::TASK_ADDR_MAX - size) < suggested_range.start {
+        if let Some(suggested_address) = suggested_address {
+            if (Self::TASK_ADDR_MAX - size) < suggested_address.0 {
                 return None;
             }
-            if fixed_addr || !self.vmas.overlaps(&suggested_range.into()) {
-                return Some(suggested_range.start);
+            if fixed_addr
+                || !self
+                    .vmas
+                    .overlaps(&(suggested_address.0..(suggested_address.0 + size)))
+            {
+                return Some(suggested_address.0);
             }
         }
 
         // top down
         // 1. check [last_end, TASK_SIZE_MAX)
-        let (low_limit, high_limit) = (Self::TASK_ADDR_MIN, Self::TASK_ADDR_MAX - size);
+        let (low_limit, high_limit) =
+            (Self::TASK_ADDR_MIN, Self::TASK_ADDR_MAX - length.as_usize());
         let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
         if last_end <= high_limit {
             return Some(high_limit);

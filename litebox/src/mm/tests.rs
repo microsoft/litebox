@@ -3,10 +3,13 @@ use core::ops::Range;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::platform::{
-    RawConstPointer,
-    page_mgmt::MemoryRegionPermissions,
-    trivial_providers::{TransparentConstPtr, TransparentMutPtr},
+use crate::{
+    mm::linux::{CreatePagesFlags, NonZeroAddress},
+    platform::{
+        RawConstPointer,
+        page_mgmt::MemoryRegionPermissions,
+        trivial_providers::{TransparentConstPtr, TransparentMutPtr},
+    },
 };
 
 use super::linux::{
@@ -193,7 +196,8 @@ fn test_vmm_mapping() {
         unsafe {
             vmm.move_mappings(
                 r,
-                PageRange::new(start_addr + 12 * PAGE_SIZE, start_addr + 16 * PAGE_SIZE).unwrap(),
+                Some(NonZeroAddress::new(start_addr + 12 * PAGE_SIZE).unwrap()),
+                NonZeroPageSize::new(PAGE_SIZE * 4).unwrap(),
             )
         }
         .is_ok_and(|v| v.as_usize() == start_addr + 12 * PAGE_SIZE)
@@ -211,10 +215,10 @@ fn test_vmm_mapping() {
     assert_eq!(
         unsafe {
             vmm.create_mapping(
-                PageRange::new(0, PAGE_SIZE).unwrap(),
+                None,
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
                 VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD),
-                false,
-                false,
+                CreatePagesFlags::empty(),
             )
         }
         .unwrap()
@@ -236,10 +240,10 @@ fn test_vmm_mapping() {
     assert_eq!(
         unsafe {
             vmm.create_mapping(
-                PageRange::new(start_addr + PAGE_SIZE, start_addr + 3 * PAGE_SIZE).unwrap(),
+                Some(NonZeroAddress::new(start_addr + PAGE_SIZE).unwrap()),
+                NonZeroPageSize::new(2 * PAGE_SIZE).unwrap(),
                 VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD),
-                true,
-                false,
+                CreatePagesFlags::FIXED_ADDR,
             )
         }
         .unwrap()

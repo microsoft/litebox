@@ -1,6 +1,9 @@
 //! ELF loader for LiteBox
 
-use core::ptr::NonNull;
+use core::{
+    ptr::NonNull,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use alloc::{collections::btree_map::BTreeMap, ffi::CString, string::ToString, vec::Vec};
 use elf_loader::{
@@ -11,34 +14,16 @@ use elf_loader::{
 };
 use litebox::{
     fs::{Mode, OFlags},
-    mm::linux::{MappingError, PAGE_SIZE},
+    mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE},
     platform::{RawConstPointer as _, SystemInfoProvider as _, ThreadLocalStorageProvider as _},
     utils::TruncateExt,
 };
 use litebox_common_linux::errno::Errno;
-use once_cell::race::OnceBox;
 use thiserror::Error;
 
-use crate::{litebox, litebox_page_manager};
+use crate::litebox_page_manager;
 
 use super::stack::{AuxKey, UserStack};
-
-struct ElfLoaderInfo {
-    trampoline_size: usize,
-    end_addr: usize,
-}
-
-/// A mapping from thread ID to the loader info.
-///
-/// This is used to pass the trampoline size to [`ElfLoaderMmap`] as it does not have `self` as a parameter.
-/// Also, the `end_addr` computed by [`ElfLoaderMmap`] can be passed back to the loader.
-fn loader_manager<'a>()
--> &'a litebox::sync::Mutex<litebox_platform_multiplex::Platform, BTreeMap<i32, ElfLoaderInfo>> {
-    static LOADER: OnceBox<
-        litebox::sync::Mutex<litebox_platform_multiplex::Platform, BTreeMap<i32, ElfLoaderInfo>>,
-    > = OnceBox::new();
-    LOADER.get_or_init(|| alloc::boxed::Box::new(litebox().sync().new_mutex(BTreeMap::new())))
-}
 
 // An opened elf file
 struct ElfFile {
@@ -109,25 +94,11 @@ impl ElfLoaderMmap {
         fd: i32,
         offset: usize,
     ) -> elf_loader::Result<usize> {
-        let tid = litebox_platform_multiplex::platform()
-            .with_thread_local_storage_mut(|tls| tls.current_task.tid);
-        let mut loader_mapper = loader_manager().lock();
-        let info = loader_mapper.get_mut(&tid).expect("loader info not found");
-        let len = len
-            + if addr.is_none() {
-                // The elf loader we use calls `mmap` to load all segments with the `PT_LOAD` type at once,
-                // and then invokes `mmap` again to change the memory protection. Thus, only the first
-                // call to `mmap` does not have the `MAP_FIXED` flag, and we need to reserve extra pages
-                // for trampoline code.
-                info.trampoline_size.next_multiple_of(PAGE_SIZE)
-            } else {
-                0
-            };
         // TODO: we copy the file to the memory to support file-backed mmap.
         // Loader may rely on `mmap` instead of `mprotect` to change the memory protection,
         // in which case the file is copied multiple times. To reduce the overhead, we
         // could convert some `mmap` calls to `mprotect` calls whenever possible.
-        let addr = match crate::syscalls::mm::sys_mmap(
+        match crate::syscalls::mm::sys_mmap(
             // A default low address is used for the binary (which grows upwards) to avoid
             // conflicts with the kernel's memory mappings (which grows downwards).
             addr.unwrap_or(0x1000_0000),
@@ -139,12 +110,7 @@ impl ElfLoaderMmap {
         ) {
             Ok(addr) => Ok(addr.as_usize()),
             Err(e) => Err(elf_loader::Error::MmapError { msg: e.to_string() }),
-        }?;
-
-        // compute the end address of the mapping for brk
-        info.end_addr = core::cmp::max(info.end_addr, addr + len);
-
-        Ok(addr)
+        }
     }
 
     fn do_mmap_anonymous(
@@ -299,7 +265,7 @@ fn get_trampoline_hdr(object: &mut ElfFile) -> Option<TrampolineHdr> {
     })
 }
 
-fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) {
+fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize {
     // Our rewriter ensures that both `trampoline.vaddr` and `trampoline.file_offset` are page-aligned.
     // Otherwise, `ElfLoaderMmap::mmap` will fail and panic.
     assert!(
@@ -340,7 +306,10 @@ fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) {
     let pm = litebox_page_manager();
     unsafe { pm.make_pages_executable(ptr, end_addr - start_addr) }
         .expect("failed to make pages executable");
+    end_addr
 }
+
+const KEY_BRK: u8 = 0x01;
 
 /// Loader for ELF files
 pub(super) struct ElfLoader;
@@ -371,43 +340,48 @@ impl ElfLoader {
         argv: Vec<CString>,
         envp: Vec<CString>,
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
-        let tid = litebox_platform_multiplex::platform()
-            .with_thread_local_storage_mut(|tls| tls.current_task.tid);
         let elf = {
             let mut loader = Loader::<ElfLoaderMmap>::new();
+            // Set a hook to get the brk address (i.e., the end of the program's data segment) from the ELF file.
+            loader.set_hook(alloc::boxed::Box::new(|name, phdr, segment, data| {
+                let end: usize = usize::try_from(phdr.p_vaddr + phdr.p_memsz).unwrap();
+                if let Some(elf_brk) = data.get(KEY_BRK) {
+                    let elf_brk = elf_brk.downcast_ref::<AtomicUsize>().unwrap();
+                    if elf_brk.load(Ordering::Relaxed) < end {
+                        // Update the brk to the end of the segment
+                        elf_brk.store(end, Ordering::Relaxed);
+                    }
+                } else {
+                    // Create a new brk for the segment
+                    data.insert(KEY_BRK, alloc::boxed::Box::new(AtomicUsize::new(end)));
+                }
+                Ok(())
+            }));
             let mut object = ElfFile::new(path).map_err(ElfLoaderError::OpenError)?;
             let file_fd = object.as_fd().unwrap();
             // Check if the file is modified by our syscall rewriter. If so, we need to update
             // the syscall callback pointer.
             let trampoline = get_trampoline_hdr(&mut object);
-            let old = loader_manager().lock().insert(
-                tid,
-                ElfLoaderInfo {
-                    trampoline_size: if let Some(trampoline) = trampoline.as_ref() {
-                        // store the trampoline size so that [`ElfLoaderMmap`] can use it
-                        trampoline.size
-                    } else {
-                        0
-                    },
-                    end_addr: 0, // will be computed and set by [`ElfLoaderMmap`]
-                },
-            );
-            assert!(old.is_none(), "loader info already exists for this thread");
-
             let elf = loader
                 .easy_load(object)
                 .map_err(ElfLoaderError::LoaderError)?;
 
-            if let Some(trampoline) = trampoline {
-                load_trampoline(trampoline, elf.base(), file_fd);
-            }
+            let end_of_trampoline = if let Some(trampoline) = trampoline {
+                load_trampoline(trampoline, elf.base(), file_fd)
+            } else {
+                0
+            };
             let base = elf.base();
-            let end_addr = loader_manager()
-                .lock()
-                .get(&tid)
-                .expect("loader info not found")
-                .end_addr;
-            unsafe { litebox_page_manager().brk(end_addr) }.expect("failed to set brk");
+            let brk = elf
+                .user_data()
+                .get(KEY_BRK)
+                .unwrap()
+                .downcast_ref::<AtomicUsize>()
+                .unwrap()
+                .load(Ordering::Relaxed);
+            let init_brk =
+                core::cmp::max((base + brk).next_multiple_of(PAGE_SIZE), end_of_trampoline);
+            unsafe { litebox_page_manager().brk(init_brk) }.expect("failed to set brk");
             elf
         };
         let interp: Option<Elf> = if let Some(interp_name) = elf.interp() {
@@ -415,15 +389,6 @@ impl ElfLoader {
             let mut loader = Loader::<ElfLoaderMmap>::new();
             let mut object = ElfFile::new(interp_name).map_err(ElfLoaderError::OpenError)?;
             let trampoline = get_trampoline_hdr(&mut object);
-            if let Some(trampoline) = trampoline.as_ref() {
-                // store the trampoline size so that [`ElfLoaderMmap`] can use it
-                // `end_addr` is only used by the main ELF file to compute `brk` address and thus we don't need to reset it.
-                loader_manager()
-                    .lock()
-                    .get_mut(&tid)
-                    .expect("loader info not found")
-                    .trampoline_size = trampoline.size;
-            }
             let file_fd = object.as_fd().unwrap();
             let interp = loader
                 .easy_load(object)
@@ -453,10 +418,10 @@ impl ElfLoader {
         aux.insert(AuxKey::AT_EGID, user_info.egid);
 
         let sp = unsafe {
-            let suggested_range = litebox::mm::linux::PageRange::new(0, super::DEFAULT_STACK_SIZE)
+            let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
                 .expect("DEFAULT_STACK_SIZE is not page-aligned");
             litebox_page_manager()
-                .create_stack_pages(suggested_range, false, false)
+                .create_stack_pages(None, length, CreatePagesFlags::empty())
                 .map_err(ElfLoaderError::MappingError)?
         };
         let mut stack = UserStack::new(sp, super::DEFAULT_STACK_SIZE)
@@ -464,8 +429,6 @@ impl ElfLoader {
         stack
             .init(argv, envp, aux)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
-
-        loader_manager().lock().remove(&tid);
 
         Ok(ElfLoadInfo {
             entry_point: entry,
