@@ -276,7 +276,7 @@ where
             return Err(MappingError::OutOfMemory);
         }
         if let Some(range) = PageRange::<ALIGN>::new(old_brk, new_brk) {
-            let (suggested_address, length) = range.into();
+            let (suggested_address, length) = range.start_and_length();
             let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
             unsafe {
                 vmem.create_pages(

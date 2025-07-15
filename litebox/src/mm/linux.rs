@@ -114,17 +114,6 @@ impl<const ALIGN: usize> IntoIterator for PageRange<ALIGN> {
     }
 }
 
-impl<const ALIGN: usize> From<PageRange<ALIGN>>
-    for (NonZeroAddress<ALIGN>, NonZeroPageSize<ALIGN>)
-{
-    fn from(val: PageRange<ALIGN>) -> Self {
-        (
-            NonZeroAddress::new(val.start).unwrap(),
-            NonZeroPageSize::new(val.len()).unwrap(),
-        )
-    }
-}
-
 impl<const ALIGN: usize> PageRange<ALIGN> {
     /// Create a new [`PageRange`].
     ///
@@ -149,6 +138,18 @@ impl<const ALIGN: usize> PageRange<ALIGN> {
     /// Note this range is never empty.
     pub fn is_empty(&self) -> bool {
         false
+    }
+
+    /// Get the start address and length of this range as a tuple.
+    #[allow(
+        clippy::missing_panics_doc,
+        reason = "This function should not fail as the range is guaranteed to be non-empty and aligned."
+    )]
+    pub fn start_and_length(&self) -> (NonZeroAddress<ALIGN>, NonZeroPageSize<ALIGN>) {
+        (
+            NonZeroAddress::new(self.start).unwrap(),
+            NonZeroPageSize::new(self.len()).unwrap(),
+        )
     }
 }
 
@@ -184,7 +185,7 @@ impl<const ALIGN: usize> core::ops::Add<usize> for NonZeroPageSize<ALIGN> {
     }
 }
 
-/// An address that is `ALIGN`-aligned.
+/// A non-zero address that is `ALIGN`-aligned.
 pub struct NonZeroAddress<const ALIGN: usize>(usize);
 
 impl<const ALIGN: usize> NonZeroAddress<ALIGN> {
