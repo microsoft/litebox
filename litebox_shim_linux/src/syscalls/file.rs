@@ -418,9 +418,6 @@ impl Descriptor {
                 // TODO: we don't have correct values for these fields yet, but ensure there are consistent.
                 // (See <https://github.com/bminor/glibc/blob/e78caeb4ff812ae19d24d65f4d4d48508154277b/sysdeps/unix/sysv/linux/ttyname.h#L35>).
                 let mut fstat = FileStat::from(litebox_fs().fd_file_status(inner.file())?);
-                fstat.st_ino = *typ as _;
-                fstat.st_dev = 0;
-                fstat.st_rdev = 34824;
                 fstat.st_blksize = 1024;
                 fstat
             }

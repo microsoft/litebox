@@ -366,27 +366,25 @@ impl<P: RawMutPointer<u8>> Clone for IoReadVec<P> {
 
 impl From<litebox::fs::FileStatus> for FileStat {
     fn from(value: litebox::fs::FileStatus) -> Self {
-        static mut INO: u64 = 0x1245;
         // TODO: add more fields
         let litebox::fs::FileStatus {
             file_type,
             mode,
             size,
+            owner: litebox::fs::UserInfo { user, group },
+            node_info: litebox::fs::NodeInfo { dev, ino, rdev },
             ..
         } = value;
-        unsafe {
-            INO += 1;
-        }
         Self {
-            // TODO: st_dev and st_ino are used by ld.so to unique identify
-            // shared libraries. Give a random value for now.
-            st_dev: 0,
-            st_ino: unsafe { INO }.truncate(),
+            st_dev: u64::try_from(dev).unwrap(),
+            st_ino: u64::try_from(ino).unwrap(),
             st_nlink: 1,
             st_mode: (mode.bits() | InodeType::from(file_type) as u32).truncate(),
-            st_uid: 0,
-            st_gid: 0,
-            st_rdev: 0,
+            st_uid: u32::from(user),
+            st_gid: u32::from(group),
+            st_rdev: rdev
+                .map(|r| u64::try_from(r.get()).unwrap())
+                .unwrap_or_default(),
             #[allow(clippy::cast_possible_wrap)]
             st_size: size,
             st_blksize: 0,
