@@ -1,6 +1,6 @@
 //! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox on userland FreeBSD.
 
-// Restrict this crate to only work on FreeBSD. For now, we are restricting this to only x86/x86-64
+// Restrict this crate to only work on FreeBSD. For now, we are restricting this to only x86-64
 // FreeBSD, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
 
