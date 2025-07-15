@@ -5,7 +5,6 @@
 #![cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
 use core::panic;
 use core::sync::atomic::AtomicU32;
-
 use core::time::Duration;
 
 use litebox::fs::OFlags;
