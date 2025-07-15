@@ -15,11 +15,6 @@ struct SyscallSiginfo {
     arch: c_uint,
 }
 
-/// Certain syscalls with this magic argument are allowed.
-/// This is useful for syscall interception where we need to invoke the original syscall.
-pub(crate) const SYSCALL_ARG_MAGIC: usize = usize::from_le_bytes(*b"LITE BOX");
-pub(crate) const MMAP_FLAG_MAGIC: u32 = 1 << 31;
-
 /// Signal handler for SIGSYS.
 ///
 /// Note: only async-signal-safe functions should be used in this handler.
@@ -90,7 +85,7 @@ fn register_seccomp_filter() {
                         3,
                         SeccompCmpArgLen::Qword,
                         SeccompCmpOp::Eq,
-                        SYSCALL_ARG_MAGIC as u64,
+                        super::SYSCALL_ARG_MAGIC as u64,
                     )
                     .unwrap(),
                 ])
@@ -106,7 +101,7 @@ fn register_seccomp_filter() {
                         3,
                         SeccompCmpArgLen::Qword,
                         SeccompCmpOp::Eq,
-                        SYSCALL_ARG_MAGIC as u64,
+                        super::SYSCALL_ARG_MAGIC as u64,
                     )
                     .unwrap(),
                 ])
@@ -121,8 +116,8 @@ fn register_seccomp_filter() {
                     SeccompCondition::new(
                         3,
                         SeccompCmpArgLen::Dword,
-                        SeccompCmpOp::MaskedEq(u64::from(MMAP_FLAG_MAGIC)),
-                        u64::from(MMAP_FLAG_MAGIC),
+                        SeccompCmpOp::MaskedEq(u64::from(super::MMAP_FLAG_MAGIC)),
+                        u64::from(super::MMAP_FLAG_MAGIC),
                     )
                     .unwrap(),
                 ])
@@ -138,7 +133,7 @@ fn register_seccomp_filter() {
                         3,
                         SeccompCmpArgLen::Qword,
                         SeccompCmpOp::Eq,
-                        SYSCALL_ARG_MAGIC as u64,
+                        super::SYSCALL_ARG_MAGIC as u64,
                     )
                     .unwrap(),
                 ])
@@ -154,7 +149,7 @@ fn register_seccomp_filter() {
                         2,
                         SeccompCmpArgLen::Qword,
                         SeccompCmpOp::Eq,
-                        SYSCALL_ARG_MAGIC as u64,
+                        super::SYSCALL_ARG_MAGIC as u64,
                     )
                     .unwrap(),
                 ])
@@ -194,7 +189,7 @@ fn register_seccomp_filter() {
                         4,
                         SeccompCmpArgLen::Qword,
                         SeccompCmpOp::Eq,
-                        SYSCALL_ARG_MAGIC as u64,
+                        super::SYSCALL_ARG_MAGIC as u64,
                     )
                     .unwrap(),
                 ])
@@ -219,7 +214,7 @@ fn register_seccomp_filter() {
                         5,
                         SeccompCmpArgLen::Qword,
                         SeccompCmpOp::Eq,
-                        SYSCALL_ARG_MAGIC as u64,
+                        super::SYSCALL_ARG_MAGIC as u64,
                     )
                     .unwrap(),
                 ])
@@ -238,7 +233,7 @@ fn register_seccomp_filter() {
                         2,
                         SeccompCmpArgLen::Qword,
                         SeccompCmpOp::Eq,
-                        SYSCALL_ARG_MAGIC as u64,
+                        super::SYSCALL_ARG_MAGIC as u64,
                     )
                     .unwrap(),
                 ])
@@ -255,7 +250,7 @@ fn register_seccomp_filter() {
                         1,
                         SeccompCmpArgLen::Qword,
                         SeccompCmpOp::Eq,
-                        SYSCALL_ARG_MAGIC as u64,
+                        super::SYSCALL_ARG_MAGIC as u64,
                     )
                     .unwrap(),
                 ])
@@ -271,7 +266,7 @@ fn register_seccomp_filter() {
                         1,
                         SeccompCmpArgLen::Qword,
                         SeccompCmpOp::Eq,
-                        SYSCALL_ARG_MAGIC as u64,
+                        super::SYSCALL_ARG_MAGIC as u64,
                     )
                     .unwrap(),
                 ])
@@ -288,7 +283,7 @@ fn register_seccomp_filter() {
                         2,
                         SeccompCmpArgLen::Qword,
                         SeccompCmpOp::Eq,
-                        SYSCALL_ARG_MAGIC as u64,
+                        super::SYSCALL_ARG_MAGIC as u64,
                     )
                     .unwrap(),
                 ])

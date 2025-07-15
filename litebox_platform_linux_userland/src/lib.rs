@@ -33,9 +33,55 @@ static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::R
 /// traits.
 pub struct LinuxUserland {
     tun_socket_fd: std::sync::RwLock<Option<std::os::fd::OwnedFd>>,
+    #[cfg(feature = "systrap_backend")]
     seccomp_interception_enabled: std::sync::atomic::AtomicBool,
     /// Reserved pages that are not available for guest programs to use.
     reserved_pages: Vec<core::ops::Range<usize>>,
+}
+
+const IF_NAMESIZE: usize = 16;
+/// Use TUN device
+const IFF_TUN: i32 = 0x0001;
+/// Do not provide packet information
+const IFF_NO_PI: i32 = 0x1000;
+/// libc `ifreq` structure, used for TUN/TAP devices.
+#[repr(C)]
+struct Ifreq {
+    /// interface name, e.g. "en0"
+    pub ifr_name: [i8; IF_NAMESIZE],
+    pub ifr_ifru: Ifru,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Ifmap {
+    mem_start: usize,
+    mem_end: usize,
+    base_addr: u16,
+    irq: u8,
+    dma: u8,
+    port: u8,
+}
+
+/// libc `ifreq.ifr_ifru` union, used for TUN/TAP devices.
+///
+/// We only need `ifru_flags` for now; `ifru_map` is to ensure the size of the union
+/// matches libc.
+#[repr(C)]
+pub union Ifru {
+    // pub ifru_addr: crate::sockaddr,
+    // pub ifru_dstaddr: crate::sockaddr,
+    // pub ifru_broadaddr: crate::sockaddr,
+    // pub ifru_netmask: crate::sockaddr,
+    // pub ifru_hwaddr: crate::sockaddr,
+    ifru_flags: i16,
+    // pub ifru_ifindex: i32,
+    // pub ifru_metric: i32,
+    // pub ifru_mtu: i32,
+    ifru_map: Ifmap,
+    // pub ifru_slave: [i8; IF_NAMESIZE],
+    // pub ifru_newname: [i8; IF_NAMESIZE],
+    // pub ifru_data: *mut i8,
 }
 
 impl LinuxUserland {
@@ -50,17 +96,29 @@ impl LinuxUserland {
     pub fn new(tun_device_name: Option<&str>) -> &'static Self {
         let tun_socket_fd = tun_device_name
             .map(|tun_device_name| {
-                let tun_fd = nix::fcntl::open(
-                    "/dev/net/tun",
-                    nix::fcntl::OFlag::O_RDWR
-                        | nix::fcntl::OFlag::O_CLOEXEC
-                        | nix::fcntl::OFlag::O_NONBLOCK,
-                    nix::sys::stat::Mode::empty(),
-                )
-                .unwrap();
+                let tun_path = b"/dev/net/tun\0";
+                let tun_fd = unsafe {
+                    syscalls::syscall3(
+                        syscalls::Sysno::open,
+                        tun_path.as_ptr() as usize,
+                        (litebox::fs::OFlags::RDWR
+                            | litebox::fs::OFlags::CLOEXEC
+                            | litebox::fs::OFlags::NONBLOCK)
+                            .bits() as usize,
+                        litebox::fs::Mode::empty().bits() as usize,
+                    )
+                }
+                .expect("failed to open tun device");
 
-                nix::ioctl_write_ptr!(tunsetiff, b'T', 202, ::core::ffi::c_int);
-                let ifreq = libc::ifreq {
+                let tunsetiff = |fd: usize, ifreq: *const Ifreq| {
+                    let cmd =
+                        litebox_common_linux::iow!(b'T', 202, size_of::<::core::ffi::c_int>());
+                    unsafe {
+                        syscalls::syscall3(syscalls::Sysno::ioctl, fd, cmd as usize, ifreq as usize)
+                    }
+                    .expect("failed to set TUN interface flags");
+                };
+                let ifreq = Ifreq {
                     ifr_name: {
                         let mut name = [0i8; 16];
                         assert!(tun_device_name.len() < 16); // Note: strictly-less-than 16, to ensure it fits
@@ -71,25 +129,25 @@ impl LinuxUserland {
                         }
                         name
                     },
-                    ifr_ifru: nix::libc::__c_anonymous_ifr_ifru {
+                    ifr_ifru: Ifru {
                         // IFF_NO_PI: no tun header
                         // IFF_TUN: create tun (i.e., IP)
-                        ifru_flags: i16::try_from(nix::libc::IFF_TUN | nix::libc::IFF_NO_PI)
-                            .unwrap(),
+                        ifru_flags: i16::try_from(IFF_TUN | IFF_NO_PI).unwrap(),
                     },
                 };
-                let ifreq: *const libc::ifreq = &ifreq as _;
-                let ifreq: *const i32 = ifreq.cast();
-                unsafe { tunsetiff(tun_fd, ifreq) }.unwrap();
+                tunsetiff(tun_fd, &raw const ifreq);
 
                 // By taking ownership, we are letting the drop handler automatically run `libc::close`
                 // when necessary.
-                unsafe { std::os::fd::OwnedFd::from_raw_fd(tun_fd) }
+                unsafe {
+                    std::os::fd::OwnedFd::from_raw_fd(tun_fd.reinterpret_as_signed().truncate())
+                }
             })
             .into();
 
         let platform = Self {
             tun_socket_fd,
+            #[cfg(feature = "systrap_backend")]
             seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages: Self::read_proc_self_maps(),
         };
@@ -115,6 +173,7 @@ impl LinuxUserland {
     /// # Panics
     ///
     /// Panics if this function has already been invoked on the platform earlier.
+    #[cfg(feature = "systrap_backend")]
     pub fn enable_seccomp_based_syscall_interception(&self) {
         assert!(
             self.seccomp_interception_enabled
@@ -218,7 +277,8 @@ impl litebox::platform::ExitProvider for LinuxUserland {
     fn exit(&self, code: Self::ExitCode) -> ! {
         let Self {
             tun_socket_fd,
-            seccomp_interception_enabled: _,
+            #[cfg(feature = "systrap_backend")]
+                seccomp_interception_enabled: _,
             reserved_pages: _,
         } = self;
         // We don't need to explicitly drop this, but doing so clarifies our intent that we want to
@@ -231,7 +291,7 @@ impl litebox::platform::ExitProvider for LinuxUserland {
                 syscalls::Sysno::exit_group,
                 (code as isize).reinterpret_as_unsigned(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         }
         .expect("Failed to exit group");
@@ -374,7 +434,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
                 in("rdi") &raw const clone_args,
                 in("rsi") size_of::<litebox_common_linux::CloneArgs>(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                in("rdx") syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                in("rdx") syscall_intercept::SYSCALL_ARG_MAGIC,
                 out("rcx") _, // rcx is used to store old rip
                 out("r11") _, // r11 is used to store old rflags
                 options(nostack, preserves_flags)
@@ -431,7 +491,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
                 syscalls::Sysno::exit,
                 (code as isize).reinterpret_as_unsigned(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         }
         .expect("Failed to exit");
@@ -668,7 +728,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                 packet.as_ptr() as usize,
                 packet.len(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         } {
             Ok(n) => {
@@ -698,7 +758,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                 packet.as_mut_ptr() as usize,
                 packet.len(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         }
         .map_err(|errno| match errno {
@@ -729,88 +789,6 @@ impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
         self.inner.checked_duration_since(earlier.inner)
     }
-}
-
-// from asm/hwcap2.h
-#[cfg(target_arch = "x86_64")]
-const HWCAP2_FSGSBASE: u64 = 1 << 1;
-
-/// Get the current fs base register value.
-///
-/// Depending on whether `fsgsbase` instructions are enabled, we choose
-/// between `arch_prctl` or `rdfsbase` to get the fs base.
-#[cfg(target_arch = "x86_64")]
-fn get_fs_base() -> Result<usize, litebox_common_linux::errno::Errno> {
-    /// Function pointer to get the current fs base.
-    static GET_FS_BASE: spin::Once<fn() -> Result<usize, litebox_common_linux::errno::Errno>> =
-        spin::Once::new();
-    GET_FS_BASE.call_once(|| {
-        if unsafe { libc::getauxval(libc::AT_HWCAP2) } & HWCAP2_FSGSBASE != 0 {
-            || Ok(unsafe { litebox_common_linux::rdfsbase() })
-        } else {
-            get_fs_base_arch_prctl
-        }
-    })()
-}
-
-/// Set the fs base register value.
-///
-/// Depending on whether `fsgsbase` instructions are enabled, we choose
-/// between `arch_prctl` or `wrfsbase` to set the fs base.
-#[cfg(target_arch = "x86_64")]
-fn set_fs_base(fs_base: usize) -> Result<usize, litebox_common_linux::errno::Errno> {
-    static SET_FS_BASE: spin::Once<fn(usize) -> Result<usize, litebox_common_linux::errno::Errno>> =
-        spin::Once::new();
-    SET_FS_BASE.call_once(|| {
-        if unsafe { libc::getauxval(libc::AT_HWCAP2) } & HWCAP2_FSGSBASE != 0 {
-            |fs_base| {
-                unsafe { litebox_common_linux::wrfsbase(fs_base) };
-                Ok(0)
-            }
-        } else {
-            set_fs_base_arch_prctl
-        }
-    })(fs_base)
-}
-
-/// Get fs register value via syscall `arch_prctl`.
-#[cfg(target_arch = "x86_64")]
-fn get_fs_base_arch_prctl() -> Result<usize, litebox_common_linux::errno::Errno> {
-    let mut fs_base = core::mem::MaybeUninit::<usize>::uninit();
-    unsafe {
-        syscalls::syscall3(
-            syscalls::Sysno::arch_prctl,
-            litebox_common_linux::ArchPrctlCode::GetFs as usize,
-            fs_base.as_mut_ptr() as usize,
-            // Unused by the syscall but would be checked by Seccomp filter if enabled.
-            syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
-        )
-    }
-    .map_err(|err| match err {
-        syscalls::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
-        syscalls::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
-        _ => unimplemented!("unexpected error {err}"),
-    })?;
-    Ok(unsafe { fs_base.assume_init() })
-}
-
-/// Set fs register value via syscall `arch_prctl`.
-#[cfg(target_arch = "x86_64")]
-fn set_fs_base_arch_prctl(fs_base: usize) -> Result<usize, litebox_common_linux::errno::Errno> {
-    unsafe {
-        syscalls::syscall3(
-            syscalls::Sysno::arch_prctl,
-            litebox_common_linux::ArchPrctlCode::SetFs as usize,
-            fs_base,
-            // Unused by the syscall but would be checked by Seccomp filter if enabled.
-            syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
-        )
-    }
-    .map_err(|err| match err {
-        syscalls::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
-        syscalls::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
-        _ => unimplemented!("unexpected error {err}"),
-    })
 }
 
 #[cfg(target_arch = "x86")]
@@ -871,7 +849,7 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                         oldset.map_or(0, |ptr| ptr.as_usize()),
                         size_of::<litebox_common_linux::SigSet>(),
                         // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                        syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                        syscall_intercept::SYSCALL_ARG_MAGIC,
                     )
                 }
                 .map_err(|err| match err {
@@ -913,13 +891,13 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
             }
             #[cfg(target_arch = "x86_64")]
             PunchthroughSyscall::SetFsBase { addr } => {
-                set_fs_base(addr).map_err(litebox::platform::PunchthroughError::Failure)
+                unsafe { litebox_common_linux::wrfsbase(addr) };
+                Ok(0)
             }
             #[cfg(target_arch = "x86_64")]
             PunchthroughSyscall::GetFsBase { addr } => {
                 use litebox::platform::RawMutPointer as _;
-                let fs_base =
-                    get_fs_base().map_err(litebox::platform::PunchthroughError::Failure)?;
+                let fs_base = unsafe { litebox_common_linux::rdfsbase() };
                 unsafe { addr.write_at_offset(0, fs_base) }.ok_or(
                     litebox::platform::PunchthroughError::Failure(
                         litebox_common_linux::errno::Errno::EFAULT,
@@ -966,11 +944,11 @@ impl litebox::platform::DebugLogProvider for LinuxUserland {
         let _ = unsafe {
             syscalls::syscall4(
                 syscalls::Sysno::write,
-                libc::STDERR_FILENO as usize,
+                litebox_common_linux::STDERR_FILENO as usize,
                 msg.as_ptr() as usize,
                 msg.len(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         };
     }
@@ -985,9 +963,9 @@ impl litebox::platform::RawPointerProvider for LinuxUserland {
 /// ([`futex_timeout`] and [`futex_val2`]).
 #[repr(i32)]
 enum FutexOperation {
-    Wait = libc::FUTEX_WAIT,
-    Requeue = libc::FUTEX_REQUEUE,
-    Wake = libc::FUTEX_WAKE,
+    Wait = litebox_common_linux::FUTEX_WAIT,
+    Requeue = litebox_common_linux::FUTEX_REQUEUE,
+    Wake = litebox_common_linux::FUTEX_WAKE,
 }
 
 /// Safer invocation of the Linux futex syscall, with the "timeout" variant of the arguments.
@@ -1015,7 +993,7 @@ fn futex_timeout(
             .unwrap()
             .try_into()
             .unwrap();
-        libc::timespec { tv_sec, tv_nsec }
+        litebox_common_linux::timespec { tv_sec, tv_nsec }
     });
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
     unsafe {
@@ -1119,7 +1097,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                     .reinterpret_as_unsigned() as usize,
                 (flags.bits().reinterpret_as_unsigned()
                     // This is to ensure it won't be intercepted by Seccomp if enabled.
-                    | syscall_intercept::systrap::MMAP_FLAG_MAGIC) as usize,
+                    | syscall_intercept::MMAP_FLAG_MAGIC) as usize,
                 usize::MAX,
                 0,
             )
@@ -1140,7 +1118,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 range.start,
                 range.len(),
                 // This is to ensure it won't be intercepted by Seccomp if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         }
         .expect("munmap failed");
@@ -1161,7 +1139,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 (MRemapFlags::MREMAP_FIXED | MRemapFlags::MREMAP_MAYMOVE).bits() as usize,
                 new_range.start,
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
             .expect("mremap failed")
         };
@@ -1183,7 +1161,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 range.len(),
                 prot_flags(new_permissions).bits().reinterpret_as_unsigned() as usize,
                 // This is to ensure it won't be intercepted by Seccomp if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         }
         .expect("mprotect failed");
@@ -1216,14 +1194,18 @@ impl litebox::platform::StdioProvider for LinuxUserland {
             syscalls::syscall4(
                 syscalls::Sysno::write,
                 usize::try_from(match stream {
-                    litebox::platform::StdioOutStream::Stdout => libc::STDOUT_FILENO,
-                    litebox::platform::StdioOutStream::Stderr => libc::STDERR_FILENO,
+                    litebox::platform::StdioOutStream::Stdout => {
+                        litebox_common_linux::STDOUT_FILENO
+                    }
+                    litebox::platform::StdioOutStream::Stderr => {
+                        litebox_common_linux::STDERR_FILENO
+                    }
                 })
                 .unwrap(),
                 buf.as_ptr() as usize,
                 buf.len(),
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::systrap::SYSCALL_ARG_MAGIC,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         } {
             Ok(n) => Ok(n),
@@ -1274,7 +1256,7 @@ impl litebox::mm::allocator::MemoryProvider for LinuxUserland {
                     .bits()
                     .reinterpret_as_unsigned()
                     // This is to ensure it won't be intercepted by Seccomp if enabled.
-                    | syscall_intercept::systrap::MMAP_FLAG_MAGIC) as usize,
+                    | syscall_intercept::MMAP_FLAG_MAGIC) as usize,
                 usize::MAX,
                 0,
             )

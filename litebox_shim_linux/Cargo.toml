@@ -30,6 +30,7 @@ elf_loader = { version = "=0.10.0", default-features = false, features = ["rel"]
 [features]
 unstable-testing = []
 default = ["platform_linux_userland"]
+systrap_backend = ["litebox_platform_multiplex/systrap_backend"]
 platform_freebsd_userland = ["litebox_platform_multiplex/platform_freebsd_userland"]
 platform_linux_userland = ["litebox_platform_multiplex/platform_linux_userland"]
 
