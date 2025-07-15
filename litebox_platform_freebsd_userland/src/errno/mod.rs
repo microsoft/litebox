@@ -38,7 +38,10 @@ impl Errno {
     /// // Direct conversion to i32 will give the positive variant
     /// assert_eq!(1, Errno::EPERM.into());
     /// ```
-    #[expect(dead_code, reason = "Unused in the current context, but useful for error handling later on.")]
+    #[expect(
+        dead_code,
+        reason = "Unused in the current context, but useful for error handling later on."
+    )]
     pub(crate) fn as_neg(self) -> i32 {
         -i32::from(self)
     }

@@ -118,7 +118,10 @@ impl super::Errno {
 
 /// The associated constants for [`super::Errno`] are generated from FreeBSD errno values
 /// https://man.freebsd.org/cgi/man.cgi?errno
-#[expect(unused, reason = "Generated code that is not used in the current context, but useful for error handling later on.")]
+#[expect(
+    unused,
+    reason = "Generated code that is not used in the current context, but useful for error handling later on."
+)]
 impl super::Errno {
     /// Operation not permitted
     pub(crate) const EPERM: Self = Self::from_const(1);
