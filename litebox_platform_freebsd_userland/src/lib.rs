@@ -41,11 +41,7 @@ const SELFPROC_MAPS_PATH: &str = "/proc/curproc/map";
 
 impl FreeBSDUserland {
     /// Create a new userland-FreeBSD platform for use in `LiteBox`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tun device could not be successfully opened.
-    pub fn new(_tun_device_name: Option<&str>) -> &'static Self {
+    pub fn new(_name: Option<&str>) -> &'static Self {
         let platform = Self {
             reserved_pages: Self::read_proc_self_maps(),
         };
@@ -344,7 +340,7 @@ impl litebox::platform::Instant for Instant {
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub struct PunchthroughToken {
     punchthrough: PunchthroughSyscall<FreeBSDUserland>,
 }
