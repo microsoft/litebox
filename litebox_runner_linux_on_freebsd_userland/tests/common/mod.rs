@@ -7,7 +7,6 @@ use litebox::{
 use litebox_platform_multiplex::{Platform, set_platform};
 use litebox_shim_linux::{litebox_fs, loader::load_program, set_fs};
 
-#[cfg(target_arch = "x86_64")]
 global_asm!(
     "
     .text
@@ -18,22 +17,6 @@ trampoline:
     xor rdx, rdx
     mov	rsp, rsi
     jmp	rdi
-    /* Should not reach. */
-    hlt"
-);
-#[cfg(target_arch = "x86")]
-global_asm!(
-    "
-    .text
-    .align  4
-    .globl  trampoline
-    .type   trampoline,@function
-trampoline:
-    xor     edx, edx
-    mov     ebx, [esp + 4]
-    mov     eax, [esp + 8]
-    mov     esp, eax
-    jmp     ebx
     /* Should not reach. */
     hlt"
 );
