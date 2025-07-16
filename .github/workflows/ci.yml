@@ -160,6 +160,9 @@ jobs:
           # - `litebox_platform_linux_userland` is allowed to have `std` access,
           #   since it is a purely-userland implementation.
           #
+          # - `litebox_platform_freebsd_userland` is allowed to have `std` access,
+          #   since it is a purely-userland implementation.
+          #
           # - `litebox_platform_lvbs` has a custom target (`no_std`), so it does
           #   not work with the current no_std checker.
           #
@@ -190,6 +193,7 @@ jobs:
           find . -type f -name 'Cargo.toml' \
             -not -path './Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
+            -not -path './litebox_platform_freebsd_userland/Cargo.toml' \
             -not -path './litebox_platform_lvbs/Cargo.toml' \
             -not -path './litebox_platform_multiplex/Cargo.toml' \
             -not -path './litebox_runner_linux_userland/Cargo.toml' \

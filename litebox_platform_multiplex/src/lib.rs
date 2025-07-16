@@ -28,14 +28,11 @@ compile_error!(
     r##"Too many platforms specified. Are you sure you have marked 'default-features = false'?"##
 );
 
-// Check if no platforms have been specified. If so, compiler error.
-#[cfg(not(any(feature = "platform_linux_userland")))]
-compile_error!(
-    r##"No platforms specified.  Please enable the feature for the platform you want."##
-);
-
-#[cfg(feature = "platform_linux_userland")]
+#[cfg(all(feature = "platform_linux_userland", target_os = "linux"))]
 pub type Platform = litebox_platform_linux_userland::LinuxUserland;
+
+#[cfg(all(feature = "platform_freebsd_userland", target_os = "freebsd"))]
+pub type Platform = litebox_platform_freebsd_userland::FreeBSDUserland;
 
 static PLATFORM: once_cell::race::OnceBox<&'static Platform> = once_cell::race::OnceBox::new();
 
