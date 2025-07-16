@@ -987,8 +987,10 @@ where
     }
 
     /// Get the [`Events`] for a socket.
-    pub fn check_events(&self, fd: &SocketFd) -> Option<Events> {
-        let socket_handle = self.handles[fd.x.as_usize()].as_ref()?;
+    pub fn check_events(&self, fd: &SocketFd<Platform>) -> Option<Events> {
+        let descriptor_table = self.litebox.descriptor_table_mut();
+        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let socket_handle = &mut table_entry.entry;
         match socket_handle.protocol() {
             Protocol::Tcp => {
                 let tcp_socket = self.socket_set.get::<tcp::Socket>(socket_handle.handle);

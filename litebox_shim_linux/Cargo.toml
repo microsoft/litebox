@@ -33,5 +33,3 @@ elf_loader = { version = "=0.10.0", default-features = false, features = ["rel"]
 
 [lints]
 workspace = true
-
-[dev-dependencies]

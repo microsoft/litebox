@@ -29,7 +29,7 @@ enum DescriptorRef {
     PipeReader(Weak<crate::channel::Consumer<u8>>),
     PipeWriter(Weak<crate::channel::Producer<u8>>),
     Eventfd(Weak<crate::syscalls::eventfd::EventFile<litebox_platform_multiplex::Platform>>),
-    Socket(Weak<crate::syscalls::net::Socket<litebox_platform_multiplex::Platform>>),
+    Socket(Weak<crate::syscalls::net::Socket>),
 }
 
 impl DescriptorRef {
