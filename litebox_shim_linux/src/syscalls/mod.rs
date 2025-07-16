@@ -1,5 +1,6 @@
 //! Syscalls Handlers
 
+pub(crate) mod epoll;
 pub(crate) mod eventfd;
 pub mod file;
 pub(crate) mod misc;
