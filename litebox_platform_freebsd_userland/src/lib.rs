@@ -843,6 +843,10 @@ impl litebox::platform::SystemInfoProvider for FreeBSDUserland {
     fn get_syscall_entry_point(&self) -> usize {
         syscall_callback as usize
     }
+
+    fn get_vdso_address(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl FreeBSDUserland {
