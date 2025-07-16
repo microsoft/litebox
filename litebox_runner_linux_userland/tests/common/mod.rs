@@ -3,6 +3,7 @@ use std::{arch::global_asm, ffi::CString};
 use litebox::{
     LiteBox,
     fs::{FileSystem as _, Mode, OFlags},
+    platform::SystemInfoProvider as _,
 };
 use litebox_platform_multiplex::{Platform, set_platform};
 use litebox_shim_linux::{litebox_fs, loader::load_program, set_fs};
@@ -144,7 +145,33 @@ pub fn test_load_exec_common(executable_path: &str) {
         CString::new("hello").unwrap(),
     ];
     let envp = vec![CString::new("PATH=/bin").unwrap()];
-    let info = load_program(executable_path, argv, envp).unwrap();
+    let mut aux = litebox_shim_linux::loader::auxv::init_auxv();
+    if litebox_platform_multiplex::platform()
+        .get_vdso_address()
+        .is_none()
+    {
+        // Due to restrict permissions in CI, we cannot read `/proc/self/maps`.
+        // To pass CI, we rely on `getauxval` (which we should avoid #142) to get the VDSO
+        // address when failing to read `/proc/self/maps`.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let vdso_address = unsafe { libc::getauxval(libc::AT_SYSINFO_EHDR) };
+            aux.insert(
+                litebox_shim_linux::loader::auxv::AuxKey::AT_SYSINFO_EHDR,
+                usize::try_from(vdso_address).unwrap(),
+            );
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            // AT_SYSINFO = 32
+            let vdso_address = unsafe { libc::getauxval(32) };
+            aux.insert(
+                litebox_shim_linux::loader::auxv::AuxKey::AT_SYSINFO,
+                usize::try_from(vdso_address).unwrap(),
+            );
+        }
+    }
+    let info = load_program(executable_path, argv, envp, aux).unwrap();
 
     unsafe { trampoline(info.entry_point, info.user_stack_top) };
 }
