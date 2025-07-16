@@ -88,6 +88,7 @@ void _start() {
 }
 "#;
 
+#[cfg(target_os = "freebsd")]
 #[test]
 fn test_syscall_rewriter() {
     // Use the already compiled executable from the tests folder (same dir as this file)
