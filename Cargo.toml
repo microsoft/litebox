@@ -8,6 +8,7 @@ members = [
     "litebox_platform_freebsd_userland",
     "litebox_platform_multiplex",
     "litebox_runner_linux_userland",
+    "litebox_runner_linux_on_freebsd_userland",
     "litebox_shim_linux",
     "litebox_syscall_rewriter",
 ]
