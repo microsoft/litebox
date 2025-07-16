@@ -31,6 +31,7 @@ use litebox_platform_multiplex::Platform;
 use syscalls::net::sys_setsockopt;
 
 pub(crate) mod channel;
+pub(crate) mod event;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
@@ -234,6 +235,10 @@ enum Descriptor {
     },
     // TODO: we may not need this once #31 and #68 are done.
     Stdio(stdio::StdioFile),
+    Epoll {
+        file: alloc::sync::Arc<syscalls::epoll::EpollFile>,
+        close_on_exec: core::sync::atomic::AtomicBool,
+    },
 }
 
 pub(crate) fn file_descriptors<'a>() -> &'a RwLock<Platform, Descriptors> {
@@ -440,6 +445,23 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
                     .ok_or(Errno::EFAULT)
             })
         }
+        SyscallRequest::EpollCtl {
+            epfd,
+            op,
+            fd,
+            event,
+        } => syscalls::file::sys_epoll_ctl(epfd, op, fd, event).map(|()| 0),
+        SyscallRequest::EpollCreate { flags } => {
+            syscalls::file::sys_epoll_create(flags).map(|fd| fd as usize)
+        }
+        SyscallRequest::EpollPwait {
+            epfd,
+            events,
+            maxevents,
+            timeout,
+            sigmask,
+            sigsetsize,
+        } => syscalls::file::sys_epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize),
         SyscallRequest::ArchPrctl { arg } => syscalls::process::sys_arch_prctl(arg).map(|()| 0),
         SyscallRequest::Readlink {
             pathname,

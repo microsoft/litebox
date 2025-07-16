@@ -2,7 +2,7 @@
 
 use core::sync::atomic::AtomicU32;
 
-use litebox::{fs::OFlags, sync::RawSyncPrimitivesProvider};
+use litebox::{event::Events, fs::OFlags, sync::RawSyncPrimitivesProvider};
 use litebox_common_linux::{EfdFlags, errno::Errno};
 
 pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider> {
@@ -10,6 +10,7 @@ pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider> {
     /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
     status: AtomicU32,
     semaphore: bool,
+    pollee: crate::event::Pollee,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
@@ -21,7 +22,32 @@ impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
             counter: litebox.sync().new_mutex(count),
             status: AtomicU32::new(status.bits()),
             semaphore: flags.contains(EfdFlags::SEMAPHORE),
+            pollee: crate::event::Pollee::new(Events::empty()),
         }
+    }
+
+    fn check_io_events(&self) -> Events {
+        let counter = self.counter.lock();
+        let mut events = Events::empty();
+        if *counter != 0 {
+            events |= Events::IN;
+        }
+        // if it is possible to write a value of at least "1"
+        // without blocking, the file is writable
+        let is_writable = *counter < u64::MAX - 1;
+        if is_writable {
+            events |= Events::OUT;
+        }
+
+        events
+    }
+
+    pub(crate) fn poll(
+        &self,
+        mask: Events,
+        observer: Option<alloc::sync::Weak<dyn crate::event::Observer<Events>>>,
+    ) -> Events {
+        self.pollee.poll(mask, observer, || self.check_io_events())
     }
 
     fn try_read(&self) -> Result<u64, Errno> {
@@ -32,6 +58,9 @@ impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
 
         let res = if self.semaphore { 1 } else { *counter };
         *counter -= res;
+
+        drop(counter);
+        self.pollee.notify_observers(Events::OUT);
         Ok(res)
     }
 
@@ -39,14 +68,12 @@ impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
         if self.get_status().contains(OFlags::NONBLOCK) {
             self.try_read()
         } else {
-            // TODO: use poll rather than busy wait
-            loop {
-                match self.try_read() {
-                    Err(Errno::EAGAIN) => {}
-                    ret => return ret,
-                }
-                core::hint::spin_loop();
-            }
+            self.pollee.wait_or_timeout(
+                Events::IN,
+                None,
+                || self.try_read(),
+                || self.check_io_events(),
+            )
         }
     }
 
@@ -57,6 +84,8 @@ impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
             // 64-bit value minus 1 (i.e., 0xfffffffffffffffe)
             if new_value != u64::MAX {
                 *counter = new_value;
+                drop(counter);
+                self.pollee.notify_observers(Events::IN);
                 return Ok(8);
             }
         }
@@ -68,14 +97,12 @@ impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
         if self.get_status().contains(OFlags::NONBLOCK) {
             self.try_write(value)
         } else {
-            // TODO: use poll rather than busy wait
-            loop {
-                match self.try_write(value) {
-                    Err(Errno::EAGAIN) => {}
-                    ret => return ret,
-                }
-                core::hint::spin_loop();
-            }
+            self.pollee.wait_or_timeout(
+                Events::OUT,
+                None,
+                || self.try_write(value),
+                || self.check_io_events(),
+            )
         }
     }
 
@@ -85,17 +112,12 @@ impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
 #[cfg(test)]
 mod tests {
     use litebox_common_linux::{EfdFlags, errno::Errno};
-    use litebox_platform_multiplex::{Platform, set_platform};
 
     extern crate std;
 
-    fn init_platform() {
-        set_platform(Platform::new(None));
-    }
-
     #[test]
     fn test_semaphore_eventfd() {
-        init_platform();
+        crate::syscalls::tests::init_platform(None);
 
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,
@@ -116,7 +138,7 @@ mod tests {
 
     #[test]
     fn test_blocking_eventfd() {
-        init_platform();
+        crate::syscalls::tests::init_platform(None);
 
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,
@@ -141,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_nonblocking_eventfd() {
-        init_platform();
+        crate::syscalls::tests::init_platform(None);
 
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,

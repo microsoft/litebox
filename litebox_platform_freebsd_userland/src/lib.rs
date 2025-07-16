@@ -43,7 +43,7 @@ const SELFPROC_MAPS_PATH: &str = "/proc/curproc/map";
 
 impl FreeBSDUserland {
     /// Create a new userland-FreeBSD platform for use in `LiteBox`.
-    pub fn new(_name: Option<&str>) -> &'static Self {
+    pub fn new() -> &'static Self {
         let platform = Self {
             reserved_pages: Self::read_proc_self_maps(),
         };
@@ -925,7 +925,7 @@ mod tests {
 
     #[test]
     fn test_reserved_pages() {
-        let platform = FreeBSDUserland::new(None);
+        let platform = FreeBSDUserland::new();
 
         platform.debug_log_print("msg from FreeBSDUserland test_reserved_pages\n");
 
@@ -943,7 +943,7 @@ mod tests {
 
     #[test]
     fn test_tls() {
-        let platform = FreeBSDUserland::new(None);
+        let platform = FreeBSDUserland::new();
         let tls = FreeBSDUserland::get_thread_local_storage();
         assert!(!tls.is_null(), "TLS should not be null");
         let tid = unsafe { (*tls).current_task.tid };

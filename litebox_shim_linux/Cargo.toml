@@ -29,15 +29,9 @@ syscalls = { version = "0.6", default-features = false }
 elf_loader = { version = "=0.10.0", default-features = false, features = ["rel"] }
 
 [features]
-unstable-testing = []
-default = ["platform_linux_userland"]
-systrap_backend = ["litebox_platform_multiplex/systrap_backend"]
-platform_freebsd_userland = ["litebox_platform_multiplex/platform_freebsd_userland"]
-platform_linux_userland = ["litebox_platform_multiplex/platform_linux_userland"]
+
+[dev-dependencies]
+spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-litebox_shim_linux = { path = ".", default-features = false, features = ["unstable-testing"] }
-spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }

@@ -985,6 +985,45 @@ where
 
         Ok(socket_handle.socket_metadata.insert(metadata))
     }
+
+    /// Get the [`Events`] for a socket.
+    pub fn check_events(&self, fd: &SocketFd<Platform>) -> Option<Events> {
+        let descriptor_table = self.litebox.descriptor_table_mut();
+        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let socket_handle = &mut table_entry.entry;
+        match socket_handle.protocol() {
+            Protocol::Tcp => {
+                let tcp_socket = self.socket_set.get::<tcp::Socket>(socket_handle.handle);
+                let mut events = Events::empty();
+                if tcp_socket.can_recv() {
+                    events |= Events::IN;
+                }
+                if tcp_socket.can_send() {
+                    events |= Events::OUT;
+                }
+                if !tcp_socket.is_open() {
+                    events |= Events::HUP;
+                } else if !events.contains(Events::IN) {
+                    // A server socket should have `Events::IN` if any of its listening sockets is connected.
+                    if let Some(server_socket) = socket_handle.specific.tcp().server_socket.as_ref()
+                    {
+                        server_socket
+                            .socket_set_handles
+                            .iter()
+                            .any(|&h| {
+                                let socket: &tcp::Socket = self.socket_set.get(h);
+                                socket.state() == tcp::State::Established
+                            })
+                            .then(|| events.insert(Events::IN));
+                    }
+                }
+                Some(events)
+            }
+            Protocol::Udp => unimplemented!(),
+            Protocol::Icmp => unimplemented!(),
+            Protocol::Raw { protocol: _ } => unimplemented!(),
+        }
+    }
 }
 
 /// Protocols for sockets supported by LiteBox
