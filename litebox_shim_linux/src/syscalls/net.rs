@@ -6,6 +6,7 @@ use core::{
 };
 
 use litebox::{
+    event::Events,
     fs::OFlags,
     net::{ReceiveFlags, SendFlags, SocketFd},
     platform::{RawConstPointer, RawMutPointer},
@@ -72,6 +73,7 @@ pub(crate) struct Socket {
     pub(crate) status: AtomicU32,
     pub(crate) close_on_exec: AtomicBool,
     options: litebox::sync::Mutex<Platform, SocketOptions>,
+    pollee: crate::event::Pollee,
 }
 
 impl Drop for Socket {
@@ -87,6 +89,7 @@ impl Socket {
         fd: SocketFd<Platform>,
         flags: SockFlags,
         litebox: &litebox::LiteBox<Platform>,
+        init_events: Events,
     ) -> Self {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
@@ -97,7 +100,23 @@ impl Socket {
             status: AtomicU32::new(flags.bits()),
             close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
             options: litebox.sync().new_mutex(SocketOptions::default()),
+            pollee: crate::event::Pollee::new(init_events),
         }
+    }
+
+    fn check_io_events(&self) -> Events {
+        litebox_net()
+            .lock()
+            .check_events(self.fd.as_ref().unwrap())
+            .expect("Invalid socket fd")
+    }
+
+    pub(crate) fn poll(
+        &self,
+        mask: Events,
+        observer: Option<alloc::sync::Weak<dyn crate::event::Observer<Events>>>,
+    ) -> Events {
+        self.pollee.poll(mask, observer, || self.check_io_events())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -279,7 +298,7 @@ impl Socket {
         if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
     }
 
-    fn sendto(
+    pub(crate) fn sendto(
         &self,
         buf: &[u8],
         flags: SendFlags,
@@ -288,7 +307,7 @@ impl Socket {
         if let Some(addr) = sockaddr {
             unimplemented!("sendto with addr {addr}");
         }
-        if flags.contains(SendFlags::DONTWAIT) {
+        if self.get_status().contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT) {
             self.try_sendto(buf, flags, sockaddr)
         } else {
             let timeout = self.options.lock().send_timeout;
@@ -314,7 +333,7 @@ impl Socket {
         if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
     }
 
-    fn receive(&self, buf: &mut [u8], flags: ReceiveFlags) -> Result<usize, Errno> {
+    pub(crate) fn receive(&self, buf: &mut [u8], flags: ReceiveFlags) -> Result<usize, Errno> {
         if self.get_status().contains(OFlags::NONBLOCK) || flags.contains(ReceiveFlags::DONTWAIT) {
             self.try_receive(buf, flags)
         } else {
@@ -367,6 +386,7 @@ pub(crate) fn sys_socket(
                 socket,
                 flags,
                 crate::litebox(),
+                Events::empty(),
             )))
         }
         AddressFamily::UNIX => todo!(),
@@ -432,6 +452,7 @@ pub(crate) fn sys_accept(
                 fd,
                 flags,
                 crate::litebox(),
+                Events::empty(),
             )))
         }
         _ => return Err(Errno::ENOTSOCK),

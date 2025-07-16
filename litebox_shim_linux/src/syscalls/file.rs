@@ -12,8 +12,8 @@ use litebox::{
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
-    AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec, IoWriteVec, IoctlArg,
-    errno::Errno,
+    AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
+    IoWriteVec, IoctlArg, errno::Errno,
 };
 
 use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox_fs};
@@ -120,23 +120,32 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
-    match file_descriptors().read().get_fd(fd) {
-        Some(desc) => match desc {
-            Descriptor::File(file) => litebox_fs().read(file, buf, offset).map_err(Errno::from),
-            Descriptor::Stdio(file) => file.read(buf, offset),
-            Descriptor::Socket(socket) => todo!(),
-            Descriptor::PipeReader { consumer, .. } => consumer.read(buf),
-            Descriptor::PipeWriter { .. } => Err(Errno::EINVAL),
-            Descriptor::Eventfd { file, .. } => {
-                if buf.len() < size_of::<u64>() {
-                    return Err(Errno::EINVAL);
-                }
-                let value = file.read()?;
-                buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
-                Ok(size_of::<u64>())
+    let file_table = file_descriptors().read();
+    let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
+    match desc {
+        Descriptor::File(file) => litebox_fs().read(file, buf, offset).map_err(Errno::from),
+        Descriptor::Stdio(file) => file.read(buf, offset),
+        Descriptor::Socket(socket) => {
+            let socket = socket.clone();
+            drop(file_table);
+            socket.receive(buf, litebox::net::ReceiveFlags::empty())
+        }
+        Descriptor::PipeReader { consumer, .. } => {
+            let consumer = consumer.clone();
+            drop(file_table);
+            consumer.read(buf)
+        }
+        Descriptor::PipeWriter { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
+        Descriptor::Eventfd { file, .. } => {
+            let file = file.clone();
+            drop(file_table);
+            if buf.len() < size_of::<u64>() {
+                return Err(Errno::EINVAL);
             }
-        },
-        None => Err(Errno::EBADF),
+            let value = file.read()?;
+            buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+            Ok(size_of::<u64>())
+        }
     }
 }
 
@@ -148,23 +157,32 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
-    match file_descriptors().read().get_fd(fd) {
-        Some(desc) => match desc {
-            Descriptor::File(file) => litebox_fs().write(file, buf, offset).map_err(Errno::from),
-            Descriptor::Stdio(file) => file.write(buf, offset),
-            Descriptor::Socket(socket) => todo!(),
-            Descriptor::PipeReader { .. } => Err(Errno::EINVAL),
-            Descriptor::PipeWriter { producer, .. } => producer.write(buf),
-            Descriptor::Eventfd { file, .. } => {
-                let value: u64 = u64::from_le_bytes(
-                    buf[..size_of::<u64>()]
-                        .try_into()
-                        .map_err(|_| Errno::EINVAL)?,
-                );
-                file.write(value)
-            }
-        },
-        None => Err(Errno::EBADF),
+    let file_table = file_descriptors().read();
+    let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
+    match desc {
+        Descriptor::File(file) => litebox_fs().write(file, buf, offset).map_err(Errno::from),
+        Descriptor::Stdio(file) => file.write(buf, offset),
+        Descriptor::Socket(socket) => {
+            let socket = socket.clone();
+            drop(file_table);
+            socket.sendto(buf, litebox::net::SendFlags::empty(), None)
+        }
+        Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
+        Descriptor::PipeWriter { producer, .. } => {
+            let producer = producer.clone();
+            drop(file_table);
+            producer.write(buf)
+        }
+        Descriptor::Eventfd { file, .. } => {
+            let file = file.clone();
+            drop(file_table);
+            let value: u64 = u64::from_le_bytes(
+                buf[..size_of::<u64>()]
+                    .try_into()
+                    .map_err(|_| Errno::EINVAL)?,
+            );
+            file.write(value)
+        }
     }
 }
 
@@ -192,7 +210,8 @@ fn do_close(desc: Descriptor) -> Result<(), Errno> {
         Descriptor::Socket(socket) => Ok(()), // The actual close happens when the socket is dropped
         Descriptor::PipeReader { .. }
         | Descriptor::PipeWriter { .. }
-        | Descriptor::Eventfd { .. } => Ok(()),
+        | Descriptor::Eventfd { .. }
+        | Descriptor::Epoll { .. } => Ok(()),
     }
 }
 
@@ -246,7 +265,7 @@ pub fn sys_readv(
             Descriptor::Stdio(file) => file.read(&mut kernel_buffer, None)?,
             Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { consumer, .. } => todo!(),
-            Descriptor::PipeWriter { .. } => return Err(Errno::EINVAL),
+            Descriptor::PipeWriter { .. } | Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
             Descriptor::Eventfd { file, .. } => todo!(),
         };
         iov.iov_base
@@ -259,6 +278,26 @@ pub fn sys_readv(
         }
     }
     Ok(total_read)
+}
+
+fn write_to_iovec<F>(iovs: &[IoWriteVec<ConstPtr<u8>>], write_fn: F) -> Result<usize, Errno>
+where
+    F: Fn(&[u8]) -> Result<usize, Errno>,
+{
+    let mut total_written = 0;
+    for iov in iovs {
+        if iov.iov_len == 0 {
+            continue;
+        }
+        let slice = unsafe { iov.iov_base.to_cow_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
+        let size = write_fn(&slice)?;
+        total_written += size;
+        if size < iov.iov_len {
+            // Okay to transfer fewer bytes than requested
+            break;
+        }
+    }
+    Ok(total_written)
 }
 
 /// Handle syscall `writev`
@@ -274,33 +313,26 @@ pub fn sys_writev(
         unsafe { &iovec.to_cow_slice(iovcnt).ok_or(Errno::EFAULT)? };
     let locked_file_descriptors = file_descriptors().read();
     let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
-    let mut total_written = 0;
-    for iov in iovs {
-        if iov.iov_len == 0 {
-            continue;
-        }
-        let slice = unsafe { iov.iov_base.to_cow_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
+    match desc {
         // TODO: The data transfers performed by readv() and writev() are atomic: the data
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
-        let size = match desc {
-            Descriptor::File(file) => litebox_fs()
-                .write(file, &slice, None)
-                .map_err(Errno::from)?,
-            Descriptor::Stdio(file) => file.write(&slice, None)?,
-            Descriptor::Socket(socket) => todo!(),
-            Descriptor::PipeReader { .. } => return Err(Errno::EINVAL),
-            Descriptor::PipeWriter { producer, .. } => todo!(),
-            Descriptor::Eventfd { file, .. } => todo!(),
-        };
-
-        total_written += size;
-        if size < iov.iov_len {
-            // Okay to transfer fewer bytes than requested
-            break;
+        Descriptor::File(file) => write_to_iovec(iovs, |buf: &[u8]| {
+            litebox_fs().write(file, buf, None).map_err(Errno::from)
+        }),
+        Descriptor::Stdio(file) => write_to_iovec(iovs, |buf: &[u8]| file.write(buf, None)),
+        Descriptor::Socket(socket) => {
+            let socket = socket.clone();
+            drop(locked_file_descriptors);
+            write_to_iovec(iovs, |buf: &[u8]| {
+                socket.sendto(buf, litebox::net::SendFlags::empty(), None)
+            })
         }
+        Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
+        Descriptor::PipeWriter { producer, .. } => todo!(),
+        Descriptor::Eventfd { file, .. } => todo!(),
+        _ => todo!(),
     }
-    Ok(total_written)
 }
 
 /// Handle syscall `access`
@@ -437,6 +469,20 @@ impl Descriptor {
                 st_blocks: 0,
                 ..Default::default()
             },
+            Descriptor::Epoll { .. } => FileStat {
+                // TODO: give correct values
+                st_dev: 0,
+                st_ino: 0,
+                st_nlink: 1,
+                st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
+                st_uid: 0,
+                st_gid: 0,
+                st_rdev: 0,
+                st_size: 0,
+                st_blksize: 0,
+                st_blocks: 0,
+                ..Default::default()
+            },
         };
         Ok(fstat)
     }
@@ -540,6 +586,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                     Descriptor::PipeReader { close_on_exec, .. }
                     | Descriptor::PipeWriter { close_on_exec, .. }
                     | Descriptor::Eventfd { close_on_exec, .. }
+                    | Descriptor::Epoll { close_on_exec, .. }
                     | Descriptor::Stdio(crate::stdio::StdioFile { close_on_exec, .. }) => {
                         if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
                             FileDescriptorFlags::FD_CLOEXEC
@@ -561,6 +608,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                 Descriptor::PipeReader { close_on_exec, .. }
                 | Descriptor::PipeWriter { close_on_exec, .. }
                 | Descriptor::Eventfd { close_on_exec, .. }
+                | Descriptor::Epoll { close_on_exec, .. }
                 | Descriptor::Stdio(crate::stdio::StdioFile { close_on_exec, .. }) => {
                     close_on_exec.store(
                         flags.contains(FileDescriptorFlags::FD_CLOEXEC),
@@ -576,6 +624,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
             Descriptor::PipeReader { consumer, .. } => Ok(consumer.get_status().bits()),
             Descriptor::PipeWriter { producer, .. } => Ok(producer.get_status().bits()),
             Descriptor::Eventfd { file, .. } => Ok(file.get_status().bits()),
+            Descriptor::Epoll { file, .. } => Ok(file.get_status().bits()),
             Descriptor::Stdio(file) => Ok(file.inner.get_status().bits()),
         },
         FcntlArg::SETFL(flags) => {
@@ -610,6 +659,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                 Descriptor::Eventfd { file, .. } => {
                     toggle_flags!(file);
                 }
+                Descriptor::Epoll { file, .. } => todo!(),
             }
             Ok(0)
         }
@@ -741,6 +791,9 @@ pub fn sys_ioctl(
                 producer.set_status(OFlags::NONBLOCK, val != 0);
             }
             Descriptor::Eventfd { file, .. } => file.set_status(OFlags::NONBLOCK, val != 0),
+            Descriptor::Epoll { file, .. } => {
+                file.set_status(OFlags::NONBLOCK, val != 0);
+            }
         }
         return Ok(0);
     }
@@ -761,7 +814,106 @@ pub fn sys_ioctl(
             file,
             close_on_exec,
         } => todo!(),
+        Descriptor::Epoll {
+            file,
+            close_on_exec,
+        } => todo!(),
     }
+}
+
+/// Handle syscall `epoll_create` and `epoll_create1`
+pub fn sys_epoll_create(flags: EpollCreateFlags) -> Result<u32, Errno> {
+    if flags.contains(EpollCreateFlags::EPOLL_CLOEXEC.complement()) {
+        return Err(Errno::EINVAL);
+    }
+
+    let epoll_file = super::epoll::EpollFile::new(crate::litebox());
+    let fd = file_descriptors().write().insert(Descriptor::Epoll {
+        file: alloc::sync::Arc::new(epoll_file),
+        close_on_exec: core::sync::atomic::AtomicBool::new(
+            flags.contains(EpollCreateFlags::EPOLL_CLOEXEC),
+        ),
+    });
+    Ok(fd)
+}
+
+/// Handle syscall `epoll_ctl`
+pub fn sys_epoll_ctl(
+    epfd: i32,
+    op: litebox_common_linux::EpollOp,
+    fd: i32,
+    event: ConstPtr<litebox_common_linux::EpollEvent>,
+) -> Result<(), Errno> {
+    let Ok(epfd) = u32::try_from(epfd) else {
+        return Err(Errno::EBADF);
+    };
+    let Ok(fd) = u32::try_from(fd) else {
+        return Err(Errno::EBADF);
+    };
+    if epfd == fd {
+        return Err(Errno::EINVAL);
+    }
+
+    let locked_file_descriptors = file_descriptors().read();
+    let epoll_entry = locked_file_descriptors.get_fd(epfd).ok_or(Errno::EBADF)?;
+    let Descriptor::Epoll { file: epoll, .. } = epoll_entry else {
+        return Err(Errno::EBADF);
+    };
+
+    let file = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
+    let event = if op == litebox_common_linux::EpollOp::EpollCtlDel {
+        None
+    } else {
+        Some(
+            unsafe { event.read_at_offset(0) }
+                .ok_or(Errno::EFAULT)?
+                .into_owned(),
+        )
+    };
+    epoll.epoll_ctl(op, fd, file, event)
+}
+
+/// Handle syscall `epoll_pwait`
+pub fn sys_epoll_pwait(
+    epfd: i32,
+    events: MutPtr<litebox_common_linux::EpollEvent>,
+    maxevents: u32,
+    timeout: i32,
+    sigmask: Option<ConstPtr<litebox_common_linux::SigSet>>,
+    _sigsetsize: usize,
+) -> Result<usize, Errno> {
+    if sigmask.is_some() {
+        todo!("sigmask not supported");
+    }
+    let Ok(epfd) = u32::try_from(epfd) else {
+        return Err(Errno::EBADF);
+    };
+    let maxevents = maxevents as usize;
+    if maxevents == 0
+        || maxevents > i32::MAX as usize / size_of::<litebox_common_linux::EpollEvent>()
+    {
+        return Err(Errno::EINVAL);
+    }
+    let timeout = if timeout >= 0 {
+        #[allow(clippy::cast_sign_loss, reason = "timeout is a positive integer")]
+        Some(core::time::Duration::from_millis(timeout as u64))
+    } else {
+        None
+    };
+    let epoll_file = {
+        let locked_file_descriptors = file_descriptors().read();
+        match locked_file_descriptors.get_fd(epfd).ok_or(Errno::EBADF)? {
+            Descriptor::Epoll { file, .. } => file.clone(),
+            _ => return Err(Errno::EBADF),
+        }
+    };
+    let epoll_events = epoll_file.wait(maxevents, timeout)?;
+    if !epoll_events.is_empty() {
+        events
+            .copy_from_slice(0, &epoll_events)
+            .ok_or(Errno::EFAULT)?;
+    }
+    Ok(epoll_events.len())
 }
 
 fn do_dup(file: &Descriptor, flags: OFlags) -> Descriptor {
