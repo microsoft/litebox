@@ -13,7 +13,7 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) {
     INIT_FUNC.call_once(|| {
         #[cfg(target_os = "linux")]
         set_platform(Platform::new(tun_device_name));
-        
+
         #[cfg(not(target_os = "linux"))]
         set_platform(Platform::new());
 
