@@ -585,6 +585,12 @@ pub trait SystemInfoProvider {
     /// The entry point address is typically used by the runtime or kernel to save/restore
     /// execution context and transfer control to the syscall handler.
     fn get_syscall_entry_point(&self) -> usize;
+
+    /// Get the address of the VDSO (Virtual Dynamic Shared Object).
+    ///
+    /// Return `Some(address)` if the VDSO is available on the platform, or `None`
+    /// if the platform does not support or provide a VDSO.
+    fn get_vdso_address(&self) -> Option<usize>;
 }
 
 /// A provider for thread-local storage.

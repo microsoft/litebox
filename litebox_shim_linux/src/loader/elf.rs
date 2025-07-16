@@ -5,7 +5,7 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use alloc::{collections::btree_map::BTreeMap, ffi::CString, string::ToString, vec::Vec};
+use alloc::{ffi::CString, string::ToString, vec::Vec};
 use elf_loader::{
     Elf, Loader,
     arch::ElfPhdr,
@@ -15,15 +15,18 @@ use elf_loader::{
 use litebox::{
     fs::{Mode, OFlags},
     mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE},
-    platform::{RawConstPointer as _, SystemInfoProvider as _, ThreadLocalStorageProvider as _},
+    platform::{RawConstPointer as _, SystemInfoProvider as _},
     utils::TruncateExt,
 };
 use litebox_common_linux::errno::Errno;
 use thiserror::Error;
 
-use crate::litebox_page_manager;
+use crate::{
+    litebox_page_manager,
+    loader::auxv::{AuxKey, AuxVec},
+};
 
-use super::stack::{AuxKey, UserStack};
+use super::stack::UserStack;
 
 // An opened elf file
 struct ElfFile {
@@ -324,8 +327,7 @@ const KEY_BRK: u8 = 0x01;
 pub(super) struct ElfLoader;
 
 impl ElfLoader {
-    fn init_auxvec(elf: &Elf) -> BTreeMap<AuxKey, usize> {
-        let mut aux = BTreeMap::new();
+    fn init_auxvec_with_elf(aux: &mut AuxVec, elf: &Elf) {
         let phdrs = elf.phdrs();
         aux.insert(AuxKey::AT_PAGESZ, PAGE_SIZE);
         aux.insert(
@@ -339,7 +341,6 @@ impl ElfLoader {
         aux.insert(AuxKey::AT_PHENT, core::mem::size_of::<ElfPhdr>());
         aux.insert(AuxKey::AT_PHNUM, phdrs.len());
         aux.insert(AuxKey::AT_ENTRY, elf.entry());
-        aux
     }
 
     /// Load an ELF file and prepare the stack for the new process.
@@ -348,6 +349,7 @@ impl ElfLoader {
         path: &str,
         argv: Vec<CString>,
         envp: Vec<CString>,
+        mut aux: AuxVec,
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let elf = {
             let mut loader = Loader::<ElfLoaderMmap>::new();
@@ -411,20 +413,13 @@ impl ElfLoader {
             None
         };
 
-        let mut aux = Self::init_auxvec(&elf);
+        Self::init_auxvec_with_elf(&mut aux, &elf);
         let entry = if let Some(ld) = interp {
             aux.insert(AuxKey::AT_BASE, ld.base());
             ld.entry()
         } else {
             elf.entry()
         };
-
-        let user_info = litebox_platform_multiplex::platform()
-            .with_thread_local_storage_mut(|tls| (*tls.current_task.credentials).clone());
-        aux.insert(AuxKey::AT_UID, user_info.uid);
-        aux.insert(AuxKey::AT_EUID, user_info.euid);
-        aux.insert(AuxKey::AT_GID, user_info.gid);
-        aux.insert(AuxKey::AT_EGID, user_info.egid);
 
         let sp = unsafe {
             let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)

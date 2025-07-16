@@ -37,6 +37,8 @@ pub struct LinuxUserland {
     seccomp_interception_enabled: std::sync::atomic::AtomicBool,
     /// Reserved pages that are not available for guest programs to use.
     reserved_pages: Vec<core::ops::Range<usize>>,
+    /// The base address of the VDSO.
+    vdso_address: Option<usize>,
 }
 
 const IF_NAMESIZE: usize = 16;
@@ -145,11 +147,13 @@ impl LinuxUserland {
             })
             .into();
 
+        let (reserved_pages, vdso_address) = Self::read_maps_and_vdso();
         let platform = Self {
             tun_socket_fd,
             #[cfg(feature = "systrap_backend")]
             seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
-            reserved_pages: Self::read_proc_self_maps(),
+            reserved_pages,
+            vdso_address,
         };
         platform.set_init_tls();
         Box::leak(Box::new(platform))
@@ -188,7 +192,7 @@ impl LinuxUserland {
         syscall_intercept::init_sys_intercept();
     }
 
-    fn read_proc_self_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
+    fn read_maps_and_vdso() -> (alloc::vec::Vec<core::ops::Range<usize>>, Option<usize>) {
         // TODO: this function is not guaranteed to return all allocated pages, as it may
         // allocate more pages after the mapping file is read. Missing allocated pages may
         // cause the program to crash when calling `mmap` or `mremap` with the `MAP_FIXED` flag later.
@@ -204,7 +208,7 @@ impl LinuxUserland {
             )
         };
         let Ok(fd) = fd else {
-            return alloc::vec::Vec::new();
+            return (alloc::vec::Vec::new(), None);
         };
         let mut buf = [0u8; 8192];
         let mut total_read = 0;
@@ -226,6 +230,7 @@ impl LinuxUserland {
         assert!(total_read < buf.len(), "buffer too small");
 
         let mut reserved_pages = alloc::vec::Vec::new();
+        let mut vdso_address = None;
         let s = core::str::from_utf8(&buf[..total_read]).expect("invalid UTF-8");
         for line in s.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -236,8 +241,16 @@ impl LinuxUserland {
             let start = usize::from_str_radix(range[0], 16).expect("invalid start address");
             let end = usize::from_str_radix(range[1], 16).expect("invalid end address");
             reserved_pages.push(start..end);
+
+            // Check if the line corresponds to the vdso
+            // Alternatively, we could read it from `/proc/self/auxv`
+            if let Some(last) = parts.last() {
+                if *last == "[vdso]" {
+                    vdso_address = Some(start);
+                }
+            }
         }
-        reserved_pages
+        (reserved_pages, vdso_address)
     }
 
     fn get_user_info() -> litebox_common_linux::Credentials {
@@ -280,6 +293,7 @@ impl litebox::platform::ExitProvider for LinuxUserland {
             #[cfg(feature = "systrap_backend")]
                 seccomp_interception_enabled: _,
             reserved_pages: _,
+            vdso_address: _,
         } = self;
         // We don't need to explicitly drop this, but doing so clarifies our intent that we want to
         // close it out :). The type itself is re-specified here to make sure we look at this
@@ -1455,6 +1469,10 @@ unsafe extern "C" fn syscall_handler(
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
         syscall_callback as usize
+    }
+
+    fn get_vdso_address(&self) -> Option<usize> {
+        self.vdso_address
     }
 }
 
