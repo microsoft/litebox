@@ -1203,6 +1203,30 @@ impl<Platform: litebox::platform::RawPointerProvider> Clone for RobustListHead<P
     }
 }
 
+bitflags::bitflags! {
+    #[derive(Debug)]
+    pub struct EpollCreateFlags: core::ffi::c_uint {
+        const EPOLL_CLOEXEC = litebox::fs::OFlags::CLOEXEC.bits();
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+#[repr(i32)]
+#[derive(Debug, IntEnum, PartialEq, Eq)]
+pub enum EpollOp {
+    EpollCtlAdd = 1,
+    EpollCtlDel = 2,
+    EpollCtlMod = 3,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C, packed)]
+pub struct EpollEvent {
+    pub events: u32,
+    pub data: u64,
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
@@ -1373,6 +1397,23 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     Getcwd {
         buf: Platform::RawMutPointer<u8>,
         size: usize,
+    },
+    EpollCtl {
+        epfd: i32,
+        op: EpollOp,
+        fd: i32,
+        event: Platform::RawConstPointer<EpollEvent>,
+    },
+    EpollPwait {
+        epfd: i32,
+        events: Platform::RawMutPointer<EpollEvent>,
+        maxevents: u32,
+        timeout: i32,
+        sigmask: Option<Platform::RawConstPointer<SigSet>>,
+        sigsetsize: usize,
+    },
+    EpollCreate {
+        flags: EpollCreateFlags,
     },
     ArchPrctl {
         arg: ArchPrctlArg<Platform>,
@@ -1871,6 +1912,53 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
             Sysno::getegid => SyscallRequest::Getegid,
+            Sysno::epoll_ctl => {
+                let op: i32 = ctx.syscall_arg(1).reinterpret_as_signed().truncate();
+                if let Ok(op) = EpollOp::try_from(op) {
+                    SyscallRequest::EpollCtl {
+                        epfd: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                        op,
+                        fd: ctx.syscall_arg(2).reinterpret_as_signed().truncate(),
+                        event: Platform::RawConstPointer::from_usize(ctx.syscall_arg(3)),
+                    }
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
+            }
+            Sysno::epoll_wait => SyscallRequest::EpollPwait {
+                epfd: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                events: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+                maxevents: ctx.syscall_arg(2).truncate(),
+                timeout: ctx.syscall_arg(3).reinterpret_as_signed().truncate(),
+                sigmask: None,
+                sigsetsize: 0,
+            },
+            Sysno::epoll_pwait => SyscallRequest::EpollPwait {
+                epfd: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                events: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+                maxevents: ctx.syscall_arg(2).truncate(),
+                timeout: ctx.syscall_arg(3).reinterpret_as_signed().truncate(),
+                sigmask: if ctx.syscall_arg(4) == 0 {
+                    None
+                } else {
+                    Some(Platform::RawConstPointer::from_usize(ctx.syscall_arg(4)))
+                },
+                sigsetsize: ctx.syscall_arg(5),
+            },
+            Sysno::epoll_create => {
+                // the `size` argument is ignored, but must be greater than zero;
+                let size: i32 = ctx.syscall_arg(0).reinterpret_as_signed().truncate();
+                if size > 0 {
+                    SyscallRequest::EpollCreate {
+                        flags: EpollCreateFlags::empty(),
+                    }
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
+            }
+            Sysno::epoll_create1 => SyscallRequest::EpollCreate {
+                flags: EpollCreateFlags::from_bits_truncate(ctx.syscall_arg(0).truncate()),
+            },
             Sysno::arch_prctl => {
                 let code: u32 = ctx.syscall_arg(0).truncate();
                 if let Ok(code) = ArchPrctlCode::try_from(code) {
