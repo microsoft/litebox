@@ -63,6 +63,7 @@ pub enum AuxKey {
 
 pub type AuxVec = alloc::collections::btree_map::BTreeMap<AuxKey, usize>;
 
+/// Initialize the auxiliary vector with user information and VDSO address.
 pub fn init_auxv() -> AuxVec {
     let mut aux = AuxVec::new();
     let platform = litebox_platform_multiplex::platform();
