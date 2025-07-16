@@ -65,7 +65,7 @@ pub(crate) enum UmtxOpOperation {
     UMTX_OP_WAKE = 3,
 }
 
-/// FreeBSD thread creation parameters structure
+/// FreeBSD thread creation parameters structure.
 /// Matches the C `struct thr_param` from <sys/thr.h>
 #[repr(C)]
 #[derive(Clone, Debug)]

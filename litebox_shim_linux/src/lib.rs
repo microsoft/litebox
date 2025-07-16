@@ -383,6 +383,11 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
                 syscalls::file::sys_access(path, mode).map(|()| 0)
             })
         }
+        SyscallRequest::Madvise {
+            addr,
+            length,
+            behavior,
+        } => syscalls::mm::sys_madvise(addr, length, behavior).map(|()| 0),
         SyscallRequest::Dup {
             oldfd,
             newfd,
