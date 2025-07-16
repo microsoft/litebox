@@ -83,7 +83,10 @@ fn test_vmm_mapping() {
     unsafe {
         vmm.insert_mapping(
             range,
-            VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE),
+            VmArea::new(
+                VmFlags::VM_READ | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE,
+                false,
+            ),
             false,
         );
     }
@@ -217,7 +220,7 @@ fn test_vmm_mapping() {
             vmm.create_mapping(
                 None,
                 NonZeroPageSize::new(PAGE_SIZE).unwrap(),
-                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
                 CreatePagesFlags::empty(),
             )
         }
@@ -242,7 +245,7 @@ fn test_vmm_mapping() {
             vmm.create_mapping(
                 Some(NonZeroAddress::new(start_addr + PAGE_SIZE).unwrap()),
                 NonZeroPageSize::new(2 * PAGE_SIZE).unwrap(),
-                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
                 CreatePagesFlags::FIXED_ADDR,
             )
         }
