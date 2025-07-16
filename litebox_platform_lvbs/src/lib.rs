@@ -4,8 +4,11 @@
 #![no_std]
 #![cfg_attr(feature = "interrupt", feature(abi_x86_interrupt))]
 
-use crate::mshv::{vsm::Vtl0KernelInfo, vtl1_mem_layout::PAGE_SIZE};
-use crate::user_context::UserContextMap;
+use crate::{
+    mshv::{vsm::Vtl0KernelInfo, vtl1_mem_layout::PAGE_SIZE},
+    syscall_handler::SyscallHandler,
+    user_context::UserContextMap,
+};
 
 use core::{
     arch::asm,
@@ -35,7 +38,7 @@ pub mod mm;
 pub mod mshv;
 pub mod ptr;
 
-pub mod syscall_handle;
+pub mod syscall_handler;
 pub(crate) mod user_context;
 
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
@@ -346,8 +349,8 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     }
 
     /// Register `syscall_handler` to handle syscalls. This function must be called for each core.
-    pub fn register_syscall_handler(syscall_handler: syscall_handle::SyscallHandler) {
-        syscall_handle::init(syscall_handler);
+    pub fn register_syscall_handler(syscall_handler: SyscallHandler) {
+        syscall_handler::init(syscall_handler);
     }
 }
 
