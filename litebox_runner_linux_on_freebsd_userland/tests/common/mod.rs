@@ -1,3 +1,5 @@
+#![cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+
 use std::{arch::global_asm, ffi::CString};
 
 use litebox::{

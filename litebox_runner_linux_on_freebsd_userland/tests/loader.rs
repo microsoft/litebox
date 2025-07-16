@@ -1,3 +1,5 @@
+#![cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+
 mod common;
 
 #[expect(
@@ -88,7 +90,6 @@ void _start() {
 }
 "#;
 
-#[cfg(target_os = "freebsd")]
 #[test]
 fn test_syscall_rewriter() {
     // Use the already compiled executable from the tests folder (same dir as this file)
