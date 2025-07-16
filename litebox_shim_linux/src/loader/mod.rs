@@ -1,15 +1,18 @@
 //! This module contains the loader for the LiteBox shim.
 
 #![cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+pub mod auxv;
 mod elf;
 mod stack;
 
+/// Load a program into the LiteBox shim.
 pub fn load_program(
     path: &str,
     argv: alloc::vec::Vec<alloc::ffi::CString>,
     envp: alloc::vec::Vec<alloc::ffi::CString>,
+    aux: auxv::AuxVec,
 ) -> Result<elf::ElfLoadInfo, elf::ElfLoaderError> {
-    elf::ElfLoader::load(path, argv, envp)
+    elf::ElfLoader::load(path, argv, envp, aux)
 }
 
 /// The magic number used to identify the LiteBox rewriter and where we should

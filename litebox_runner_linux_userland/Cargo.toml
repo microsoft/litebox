@@ -13,7 +13,7 @@ litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux" }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }
 
 [dev-dependencies]
-litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux", features = ["unstable-testing"] }
+libc = { version = "0.2.169", default-features = false }
 
 [lints]
 workspace = true
