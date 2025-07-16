@@ -1413,8 +1413,6 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         sigsetsize: usize,
     },
     EpollCreate {
-        // the `size` argument is ignored, but must be greater than zero;
-        size: i32,
         flags: EpollCreateFlags,
     },
     ArchPrctl {
@@ -1947,12 +1945,18 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 },
                 sigsetsize: ctx.syscall_arg(5),
             },
-            Sysno::epoll_create => SyscallRequest::EpollCreate {
-                size: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
-                flags: EpollCreateFlags::empty(),
-            },
+            Sysno::epoll_create => {
+                // the `size` argument is ignored, but must be greater than zero;
+                let size: i32 = ctx.syscall_arg(0).reinterpret_as_signed().truncate();
+                if size > 0 {
+                    SyscallRequest::EpollCreate {
+                        flags: EpollCreateFlags::empty(),
+                    }
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
+            }
             Sysno::epoll_create1 => SyscallRequest::EpollCreate {
-                size: 1,
                 flags: EpollCreateFlags::from_bits_truncate(ctx.syscall_arg(0).truncate()),
             },
             Sysno::arch_prctl => {

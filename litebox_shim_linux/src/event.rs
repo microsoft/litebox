@@ -57,7 +57,8 @@ impl<E> ObserverKey<E> {
 /// A Subject notifies interesting events to registered observers.
 struct Subject<E, F: EventsFilter<E>> {
     /// A table that maintains all interesting observers.
-    observers: spin::Mutex<BTreeMap<ObserverKey<E>, F>>,
+    observers:
+        litebox::sync::Mutex<litebox_platform_multiplex::Platform, BTreeMap<ObserverKey<E>, F>>,
     /// Number of observers.
     nums: core::sync::atomic::AtomicUsize,
 }
@@ -65,7 +66,7 @@ struct Subject<E, F: EventsFilter<E>> {
 impl<E, F: EventsFilter<E>> Subject<E, F> {
     fn new() -> Self {
         Self {
-            observers: spin::Mutex::new(BTreeMap::new()),
+            observers: crate::litebox().sync().new_mutex(BTreeMap::new()),
             nums: core::sync::atomic::AtomicUsize::new(0),
         }
     }

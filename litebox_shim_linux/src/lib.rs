@@ -451,8 +451,8 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
             fd,
             event,
         } => syscalls::file::sys_epoll_ctl(epfd, op, fd, event).map(|()| 0),
-        SyscallRequest::EpollCreate { size, flags } => {
-            syscalls::file::sys_epoll_create(size, flags).map(|fd| fd as usize)
+        SyscallRequest::EpollCreate { flags } => {
+            syscalls::file::sys_epoll_create(flags).map(|fd| fd as usize)
         }
         SyscallRequest::EpollPwait {
             epfd,

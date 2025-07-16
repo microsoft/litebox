@@ -822,10 +822,7 @@ pub fn sys_ioctl(
 }
 
 /// Handle syscall `epoll_create` and `epoll_create1`
-pub fn sys_epoll_create(size: i32, flags: EpollCreateFlags) -> Result<u32, Errno> {
-    if size <= 0 {
-        return Err(Errno::EINVAL);
-    }
+pub fn sys_epoll_create(flags: EpollCreateFlags) -> Result<u32, Errno> {
     if flags.contains(EpollCreateFlags::EPOLL_CLOEXEC.complement()) {
         return Err(Errno::EINVAL);
     }
