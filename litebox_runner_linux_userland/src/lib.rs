@@ -230,9 +230,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let loaded_program =
-        litebox_shim_linux::loader::load_program(&cli_args.program_and_arguments[0], argv, envp)
-            .unwrap();
+    let loaded_program = litebox_shim_linux::loader::load_program(
+        &cli_args.program_and_arguments[0],
+        argv,
+        envp,
+        litebox_shim_linux::loader::auxv::init_auxv(),
+    )
+    .unwrap();
 
     unsafe {
         trampoline::jump_to_entry_point(loaded_program.entry_point, loaded_program.user_stack_top)
