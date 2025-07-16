@@ -1,7 +1,7 @@
 use crate::debug_serial_println;
 use crate::{
-    kernel_context::get_per_core_kernel_context, mshv::vtl_switch::jump_vtl_switch_loop,
-    user_context::UserSpaceProvider,
+    kernel_context::get_per_core_kernel_context, mshv::vtl_switch::jump_to_vtl_switch_loop,
+    user_context::UserSpaceManagement,
 };
 use core::arch::{asm, naked_asm};
 use x86_64::{
@@ -104,11 +104,18 @@ fn syscall_dispatcher(sysnr: u64, ctx: *const SyscallContext) -> isize {
     // placeholder for the syscall handler
     let sysret = syscall_handler();
 
-    // TODO: check syscall number and its result to determine whether it should
-    // return to the user space or switch to VTL0
+    // TODO: We should determine whether we should place this function here, OP-TEE shim, or separate it into
+    // multiple functions and place them in the appropriate places.
+    // In OP-TEE TAs, a system call can have three different return paths:
+    // 1. Return to the user space to resume its execution: This means a TA is in the middle of its execution.
+    // It does not yet complete a request from a VTL0 client (e.g., sign a message) and makes several syscalls to do so.
+    // 2. Switch to VTL0 with a final outcome: a TA completes a client's request and returns a final outcome to VTL0.
+    // 3. Switch to VTL0 to interact with VTL0: a TA can initiate an RPC to VTL0 to interact with its client app or services.
+    // OP-TEE Shim is expected to host a logic to decide a return path, Platform is expected to host a logic to change
+    // address spaces, and LVBS Runner is expected to host a logic to switch to VTL0.
 
     // placeholder for returning to the user space
-    if sysret != 0 {
+    if sysret == 0 {
         return sysret;
     }
 
@@ -132,8 +139,8 @@ fn syscall_dispatcher(sysnr: u64, ctx: *const SyscallContext) -> isize {
         );
     }
 
-    crate::platform_low().page_table.switch_address_space();
-    unsafe { jump_vtl_switch_loop() }
+    crate::platform_low().page_table.change_address_space();
+    unsafe { jump_to_vtl_switch_loop() }
     unreachable!()
 }
 

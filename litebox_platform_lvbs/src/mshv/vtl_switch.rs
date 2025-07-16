@@ -205,14 +205,14 @@ pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
     // This is a dummy call to satisfy load_vtl0_state() with reasonable register values.
     // We do not save VTL0 registers during VTL1 initialization.
 
-    jump_vtl_switch_loop_with_stack_cleanup();
+    jump_to_vtl_switch_loop_with_stack_cleanup();
 }
 
 /// This function lets VTL1 return to VTL0. Before returning to VTL0, it re-initializes
 /// the VTL1 kernel stack to discard any leftovers (e.g., unwind, panic, ...).
 #[allow(clippy::inline_always)]
 #[inline(always)]
-fn jump_vtl_switch_loop_with_stack_cleanup() -> ! {
+fn jump_to_vtl_switch_loop_with_stack_cleanup() -> ! {
     let kernel_context = get_per_core_kernel_context();
     let stack_top = kernel_context.kernel_stack_top();
     unsafe {
@@ -229,7 +229,7 @@ fn jump_vtl_switch_loop_with_stack_cleanup() -> ! {
 
 /// expose `vtl_switch_loop` to the outside (e.g., the syscall handler)
 #[unsafe(naked)]
-pub(crate) unsafe extern "C" fn jump_vtl_switch_loop() -> ! {
+pub(crate) unsafe extern "C" fn jump_to_vtl_switch_loop() -> ! {
     naked_asm!(
         "jmp {loop}",
         loop = sym vtl_switch_loop,
@@ -269,12 +269,12 @@ fn vtl_switch_loop() -> ! {
                 } else {
                     let result = vtlcall_dispatch(&params);
                     kernel_context.set_vtl_return_value(result as u64);
-                    jump_vtl_switch_loop_with_stack_cleanup();
+                    jump_to_vtl_switch_loop_with_stack_cleanup();
                 }
             }
             VtlEntryReason::Interrupt => {
                 vsm_handle_intercept();
-                jump_vtl_switch_loop_with_stack_cleanup();
+                jump_to_vtl_switch_loop_with_stack_cleanup();
             }
             VtlEntryReason::Unknown => {
                 panic!("Unknown VTL entry reason");

@@ -330,7 +330,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         unsafe { Self::init(frame.start_address()) }
     }
 
-    /// This function switches the address space of the current processor/core using the given page table
+    /// This function changes the address space of the current processor/core using the given page table
     /// (e.g., its CR3 register) and returns the physical frame of the previous top-level page table.
     /// It preserves the CR3 flags.
     ///
@@ -341,7 +341,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// # Panics
     /// Panics if the page table is invalid
     #[allow(clippy::similar_names)]
-    pub(crate) fn switch_address_space(&self) -> PhysFrame {
+    pub(crate) fn change_address_space(&self) -> PhysFrame {
         let p4_va = core::ptr::from_ref::<PageTable>(self.inner.lock().level_4_table());
         let p4_pa = M::va_to_pa(VirtAddr::new(p4_va as u64));
         let p4_frame = PhysFrame::containing_address(p4_pa);
