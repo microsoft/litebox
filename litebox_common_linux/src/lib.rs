@@ -377,14 +377,14 @@ impl From<litebox::fs::FileStatus> for FileStat {
             ..
         } = value;
         Self {
-            st_dev: u64::try_from(dev).unwrap(),
-            st_ino: u64::try_from(ino).unwrap(),
+            st_dev: <_>::try_from(dev).unwrap(),
+            st_ino: <_>::try_from(ino).unwrap(),
             st_nlink: 1,
             st_mode: (mode.bits() | InodeType::from(file_type) as u32).truncate(),
-            st_uid: u32::from(user),
-            st_gid: u32::from(group),
+            st_uid: <_>::from(user),
+            st_gid: <_>::from(group),
             st_rdev: rdev
-                .map(|r| u64::try_from(r.get()).unwrap())
+                .map(|r| <_>::try_from(r.get()).unwrap())
                 .unwrap_or_default(),
             #[allow(clippy::cast_possible_wrap)]
             st_size: size,
