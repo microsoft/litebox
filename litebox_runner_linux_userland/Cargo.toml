@@ -12,5 +12,8 @@ litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_mu
 litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux" }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }
 
+[dev-dependencies]
+litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux", features = ["unstable-testing"] }
+
 [lints]
 workspace = true
