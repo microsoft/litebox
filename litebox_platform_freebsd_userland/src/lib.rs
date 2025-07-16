@@ -18,8 +18,6 @@ use litebox_common_linux::{ProtFlags, PunchthroughSyscall};
 mod syscall_raw;
 use syscall_raw::syscalls;
 
-use crate::errno::Errno;
-
 mod errno;
 
 mod freebsd_types;
@@ -241,7 +239,9 @@ extern "C" fn thread_start(arg: *mut ThreadStartArgs) {
     let pt_regs_stack = *pt_regs;
 
     // Reset TLS for the new thread
-    unsafe { litebox_common_linux::wrgsbase(0); }
+    unsafe {
+        litebox_common_linux::wrgsbase(0);
+    }
 
     // Set up thread-local storage for the new thread. This is done by
     // calling the actual thread callback with the unpacked arguments
@@ -309,8 +309,8 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
         let thread_start_arg_ptr = Box::into_raw(Box::new(thread_start_args));
 
         let thr_param = freebsd_types::ThrParam {
-            start_func: thread_start as usize as u64,  // the child will enter `thread_start`
-            arg: thread_start_arg_ptr as u64,   // thread start arguments
+            start_func: thread_start as usize as u64, // the child will enter `thread_start`
+            arg: thread_start_arg_ptr as u64,         // thread start arguments
             stack_base: stack.as_usize() as u64,
             stack_size: stack_size as u64,
             tls_base: 0, // set by our callback
@@ -337,19 +337,17 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
                 // be written to child_tid_ptr by the kernel. We need to read it from the structure.
                 Ok(unsafe { *(child_tid_ptr as *const i32) as usize })
             }
-            Err(errno) => {
-                Err(match errno {
-                    crate::errno::Errno::EACCES => litebox_common_linux::errno::Errno::EACCES,
-                    crate::errno::Errno::EAGAIN => litebox_common_linux::errno::Errno::EAGAIN,
-                    crate::errno::Errno::EBUSY => litebox_common_linux::errno::Errno::EBUSY,
-                    crate::errno::Errno::EEXIST => litebox_common_linux::errno::Errno::EEXIST,
-                    crate::errno::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
-                    crate::errno::Errno::ENOMEM => litebox_common_linux::errno::Errno::ENOMEM,
-                    crate::errno::Errno::ENOSPC => litebox_common_linux::errno::Errno::ENOSPC,
-                    crate::errno::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
-                    _ => panic!("Unexpected error from thr_new: {}", errno),
-                })
-            }
+            Err(errno) => Err(match errno {
+                crate::errno::Errno::EACCES => litebox_common_linux::errno::Errno::EACCES,
+                crate::errno::Errno::EAGAIN => litebox_common_linux::errno::Errno::EAGAIN,
+                crate::errno::Errno::EBUSY => litebox_common_linux::errno::Errno::EBUSY,
+                crate::errno::Errno::EEXIST => litebox_common_linux::errno::Errno::EEXIST,
+                crate::errno::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
+                crate::errno::Errno::ENOMEM => litebox_common_linux::errno::Errno::ENOMEM,
+                crate::errno::Errno::ENOSPC => litebox_common_linux::errno::Errno::ENOSPC,
+                crate::errno::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
+                _ => panic!("Unexpected error from thr_new: {}", errno),
+            }),
         }
     }
 

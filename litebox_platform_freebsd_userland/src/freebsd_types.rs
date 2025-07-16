@@ -5,9 +5,6 @@ use bitflags;
 pub(crate) const STDOUT_FILENO: i32 = 1;
 pub(crate) const STDERR_FILENO: i32 = 2;
 
-pub const AMD64_GET_FSBASE: u32 = 128;
-pub const AMD64_SET_FSBASE: u32 = 129;
-
 bitflags::bitflags! {
     /// Desired memory protection of a memory mapping.
     #[derive(PartialEq, Debug)]
