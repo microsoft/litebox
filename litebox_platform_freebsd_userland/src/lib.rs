@@ -3,7 +3,7 @@
 // Restrict this crate to only work on FreeBSD. For now, we are restricting this to only x86-64
 // FreeBSD, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
-use core::panic;
+
 use core::sync::atomic::AtomicU32;
 use core::time::Duration;
 
@@ -453,7 +453,7 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 
     /// Wake up multiple waiters.
-    /// Always returns `n`` on success, and `0` on failure.
+    /// Always returns `n` on success, and `0` on failure.
     fn wake_many(&self, n: usize) -> usize {
         use core::sync::atomic::Ordering::SeqCst;
 
