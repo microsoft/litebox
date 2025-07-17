@@ -1227,6 +1227,19 @@ pub struct EpollEvent {
     pub data: u64,
 }
 
+#[repr(i32)]
+#[derive(Debug, IntEnum)]
+pub enum MadviseBehavior {
+    /// Normal behavior, no special treatment
+    Normal = 0,
+    /// Do not expect access in the near future
+    DontNeed = 4,
+    /// Don't inherit across fork
+    DontFork = 10,
+    /// Do inherit across fork
+    DoFork = 11,
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
@@ -1329,6 +1342,11 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     Access {
         pathname: Platform::RawConstPointer<i8>,
         mode: AccessFlags,
+    },
+    Madvise {
+        addr: Platform::RawMutPointer<u8>,
+        length: usize,
+        behavior: MadviseBehavior,
     },
     Dup {
         oldfd: i32,
@@ -1697,6 +1715,16 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 pipefd: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
                 flags: litebox::fs::OFlags::from_bits_truncate(ctx.syscall_arg(1).truncate()),
             },
+            Sysno::madvise => {
+                let behavior: i32 = ctx.syscall_arg(2).reinterpret_as_signed().truncate();
+                let behavior =
+                    MadviseBehavior::try_from(behavior).expect("Invalid madvise behavior");
+                SyscallRequest::Madvise {
+                    addr: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
+                    length: ctx.syscall_arg(1),
+                    behavior,
+                }
+            }
             Sysno::dup => SyscallRequest::Dup {
                 oldfd: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
                 newfd: None,

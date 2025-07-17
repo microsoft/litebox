@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::platform::PageManagementProvider;
 use crate::platform::RawConstPointer;
+use crate::platform::page_mgmt::DeallocationError;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
 
 /// Page size in bytes
@@ -87,6 +88,8 @@ bitflags::bitflags! {
         /// Ensure there is more space (i.e., `DEFAULT_RESERVED_SPACE_SIZE`) after the
         /// mapping so that user can grow the mapping later.
         const ENSURE_SPACE_AFTER = 1 << 3;
+        // This flag indicates that the mapping is backed by a file.
+        const MAP_FILE = 1 << 4;
     }
 }
 
@@ -209,6 +212,8 @@ impl<const ALIGN: usize> NonZeroAddress<ALIGN> {
 pub(super) struct VmArea {
     /// Flags describing the properties of the memory region.
     flags: VmFlags,
+    /// Whether this area is backed by a file
+    is_file_backed: bool,
 }
 
 impl VmArea {
@@ -218,10 +223,19 @@ impl VmArea {
         self.flags
     }
 
+    /// Check if this area is backed by a file.
+    #[inline]
+    pub(super) fn is_file_backed(self) -> bool {
+        self.is_file_backed
+    }
+
     /// Create a new [`VmArea`] with the given flags.
     #[inline]
-    pub(super) fn new(flags: VmFlags) -> Self {
-        Self { flags }
+    pub(super) fn new(flags: VmFlags, is_file_backed: bool) -> Self {
+        Self {
+            flags,
+            is_file_backed,
+        }
     }
 }
 
@@ -262,6 +276,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 each.start..each.end,
                 VmArea {
                     flags: VmFlags::empty(),
+                    is_file_backed: false,
                 },
             );
         }
@@ -302,6 +317,45 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         }
         self.vmas.remove(range.into());
         Ok(())
+    }
+
+    /// Reset pages without removing its mapping (i.e., `madvise` with `DontNeed`).
+    ///
+    /// The current implementation effectively re-inserts the mapping with the same
+    /// `VmArea` properties, which will cause the pages to be unmapped and mapped again.
+    ///
+    /// # Panics
+    ///
+    /// File-backed mapping is not supported yet.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the memory contents in the affected region are no longer accessed or
+    /// relied upon. Any pointers or references to the previous contents become invalid.
+    pub(super) unsafe fn reset_pages(
+        &mut self,
+        range: PageRange<ALIGN>,
+    ) -> Result<(), VmemUnmapError> {
+        let range: Range<usize> = range.into();
+        let unmapped_error = self.vmas.gaps(&range).next().is_some();
+        let overlapping_ranges: Vec<(Range<usize>, VmArea)> = self
+            .overlapping(range.clone())
+            .map(|(r, vma)| (r.clone(), *vma))
+            .collect();
+        for (r, vma) in overlapping_ranges {
+            assert!(!vma.is_file_backed(), "Cannot reset file-backed mappings");
+            let start = r.start.max(range.start);
+            let end = r.end.min(range.end);
+            let new_range = PageRange::new(start, end).unwrap();
+            unsafe { self.insert_mapping(new_range, vma, false) }.expect("failed to reset pages");
+        }
+        if unmapped_error {
+            Err(VmemUnmapError::UnmapError(
+                DeallocationError::AlreadyUnallocated,
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// Insert a range to its virtual address space.
@@ -572,7 +626,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 VmemProtectError::ProtectError(e)
             })?;
 
-            self.vmas.insert(intersection, VmArea { flags: new_flags });
+            self.vmas.insert(
+                intersection,
+                VmArea {
+                    flags: new_flags,
+                    is_file_backed: vma.is_file_backed,
+                },
+            );
             if !before.is_empty() {
                 self.vmas.insert(before, vma);
             }
@@ -628,6 +688,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                         } else {
                             VmFlags::empty()
                         },
+                    flags.contains(CreatePagesFlags::MAP_FILE),
                 ),
                 flags,
             )
