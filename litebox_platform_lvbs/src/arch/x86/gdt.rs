@@ -59,6 +59,15 @@ impl GdtWrapper {
             selectors: Selectors::new(),
         }
     }
+
+    /// Return kernel code, user code, and user data segment selectors
+    pub fn get_segment_selectors(&self) -> (u16, u16, u16) {
+        (
+            self.selectors.kernel_code.0,
+            self.selectors.user_code.0,
+            self.selectors.user_data.0,
+        )
+    }
 }
 
 impl Default for GdtWrapper {
