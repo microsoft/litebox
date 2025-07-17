@@ -338,3 +338,9 @@ impl UserInfo {
 
 /// The size reported as the size of a directory.
 const DEFAULT_DIRECTORY_SIZE: usize = 4096;
+
+/// An explicit zero-sized type, used solely to obtain a globally fresh inode whenever an inode
+/// number is needed. This reduces the need for complexity during layering. It does mean that inode
+/// numbers are not re-used even across devices, but it simplifies overall implementation (and is
+/// not an issue, unless 2^32 files are set up on 32-bit, or 2^64 files are set up on 64-bit).
+pub(crate) struct FileSystemInodeFreshness;

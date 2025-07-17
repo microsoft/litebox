@@ -38,8 +38,6 @@ pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
     current_user: UserInfo,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
-    // a source of freshness for providing unique IDs
-    unique_id_freshness: core::sync::atomic::AtomicUsize,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
@@ -51,8 +49,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     #[must_use]
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
         let litebox = litebox.clone();
-        let sync = litebox.sync();
-        let root = sync.new_rwlock(RootDir::new(sync));
+        let root = litebox.sync().new_rwlock(RootDir::new(&litebox));
         Self {
             litebox,
             root,
@@ -61,7 +58,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
                 group: 1000,
             },
             current_working_dir: "/".into(),
-            unique_id_freshness: 1.into(), // the root dir gets unique ID of 0
         }
     }
 
@@ -94,19 +90,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         if test_user_again.user != test_user.user || test_user_again.group != test_user.group {
             unreachable!()
         }
-    }
-
-    /// (Private) Provide a fresh unique ID
-    fn fresh_id(&self) -> usize {
-        let res = self
-            .unique_id_freshness
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        assert_ne!(
-            res,
-            usize::MAX,
-            "we never expect to hit this, but if we do, someone has made way too many files in this session"
-        );
-        res
     }
 }
 
@@ -161,15 +144,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     return Err(OpenError::NoWritePerms);
                 }
                 parent.children_count = parent.children_count.checked_add(1).unwrap();
-                let entry = Entry::File(Arc::new(self.litebox.sync().new_rwlock(FileX {
-                    perms: Permissions {
-                        mode,
-                        userinfo: self.current_user,
-                    },
-                    data: Vec::new(),
-                    metadata: AnyMap::new(),
-                    unique_id: self.fresh_id(),
-                })));
+                let entry = Entry::File(Arc::new(
+                    self.litebox.sync().new_rwlock(FileX {
+                        perms: Permissions {
+                            mode,
+                            userinfo: self.current_user,
+                        },
+                        data: Vec::new(),
+                        metadata: AnyMap::new(),
+                        unique_id: self
+                            .litebox
+                            .get_freshness::<crate::fs::FileSystemInodeFreshness>(),
+                    }),
+                ));
                 let old = root.entries.insert(path, entry.clone());
                 assert!(old.is_none());
                 entry
@@ -441,15 +428,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         parent.children_count = parent.children_count.checked_add(1).unwrap();
         let old = root.entries.insert(
             path,
-            Entry::Dir(Arc::new(self.litebox.sync().new_rwlock(DirX {
-                perms: Permissions {
-                    mode,
-                    userinfo: self.current_user,
-                },
-                children_count: 0,
-                metadata: AnyMap::new(),
-                unique_id: self.fresh_id(),
-            }))),
+            Entry::Dir(Arc::new(
+                self.litebox.sync().new_rwlock(DirX {
+                    perms: Permissions {
+                        mode,
+                        userinfo: self.current_user,
+                    },
+                    children_count: 0,
+                    metadata: AnyMap::new(),
+                    unique_id: self
+                        .litebox
+                        .get_freshness::<crate::fs::FileSystemInodeFreshness>(),
+                }),
+            )),
         );
         assert!(old.is_none());
         Ok(())
@@ -650,18 +641,18 @@ struct RootDir<Platform: sync::RawSyncPrimitivesProvider> {
 type ParentAndEntry<'a, D, E> = Result<(Option<(&'a str, D)>, Option<E>), PathError>;
 
 impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
-    fn new(sync: &sync::Synchronization<Platform>) -> Self {
+    fn new(litebox: &LiteBox<Platform>) -> Self {
         Self {
             entries: [(
                 String::new(),
-                Entry::Dir(Arc::new(sync.new_rwlock(DirX {
+                Entry::Dir(Arc::new(litebox.sync().new_rwlock(DirX {
                     perms: Permissions {
                         mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                         userinfo: UserInfo { user: 0, group: 0 },
                     },
                     children_count: 0,
                     metadata: AnyMap::new(),
-                    unique_id: 0,
+                    unique_id: litebox.get_freshness::<crate::fs::FileSystemInodeFreshness>(),
                 }))),
             )]
             .into_iter()
