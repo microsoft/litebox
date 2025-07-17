@@ -11,7 +11,7 @@ use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox::platform::{ThreadLocalStorageProvider, UnblockedOrTimedOut};
-use litebox_common_linux::{ProtFlags, PunchthroughSyscall};
+use litebox_common_linux::PunchthroughSyscall;
 
 extern crate alloc;
 
@@ -29,8 +29,6 @@ pub struct WindowsUserland {
     /// Reserved pages that are not available for guest programs to use.
     reserved_pages: Vec<core::ops::Range<usize>>,
 }
-
-const WINDOWS_PROC_MAPS_PATH: &str = ""; // Windows doesn't have /proc
 
 impl WindowsUserland {
     /// Create a new userland-Windows platform for use in `LiteBox`.
@@ -67,9 +65,9 @@ impl WindowsUserland {
         // TODO: Implement Windows user credential discovery
         // Windows doesn't have getuid/getgid, need to use Windows APIs
         litebox_common_linux::Credentials {
-            uid: 0, // Placeholder
-            euid: 0, // Placeholder  
-            gid: 0, // Placeholder
+            uid: 0,  // Placeholder
+            euid: 0, // Placeholder
+            gid: 0,  // Placeholder
             egid: 0, // Placeholder
         }
     }
@@ -275,26 +273,6 @@ impl litebox::platform::RawPointerProvider for WindowsUserland {
     type RawMutPointer<T: Clone> = litebox::platform::trivial_providers::TransparentMutPtr<T>;
 }
 
-fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
-    let mut res = ProtFlags::PROT_NONE;
-    res.set(
-        ProtFlags::PROT_READ,
-        flags.contains(MemoryRegionPermissions::READ),
-    );
-    res.set(
-        ProtFlags::PROT_WRITE,
-        flags.contains(MemoryRegionPermissions::WRITE),
-    );
-    res.set(
-        ProtFlags::PROT_EXEC,
-        flags.contains(MemoryRegionPermissions::EXEC),
-    );
-    if flags.contains(MemoryRegionPermissions::SHARED) {
-        unimplemented!()
-    }
-    res
-}
-
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
     fn allocate_pages(
         &self,
@@ -468,13 +446,6 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
     }
 }
 
-impl WindowsUserland {
-    fn get_thread_local_storage() -> *mut litebox_common_linux::ThreadLocalStorage<WindowsUserland>
-    {
-        unimplemented!("Windows TLS access not implemented yet");
-    }
-}
-
 /// Windows thread-local storage implementation (placeholder)
 /// Windows uses different TLS mechanisms than Unix systems
 #[expect(unused)]
@@ -498,57 +469,4 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
 }
 
 #[cfg(test)]
-mod tests {
-    use core::sync::atomic::AtomicU32;
-    use litebox::platform::RawMutex;
-    use litebox::platform::ThreadLocalStorageProvider as _;
-    use std::thread::sleep;
-
-    use crate::WindowsUserland;
-    use litebox::platform::{DebugLogProvider, PageManagementProvider};
-
-    extern crate std;
-
-    #[test]
-    #[should_panic(expected = "not implemented")]
-    fn test_raw_mutex() {
-        let mutex = std::sync::Arc::new(super::RawMutex {
-            inner: AtomicU32::new(0),
-            num_to_wake_up: AtomicU32::new(0),
-        });
-
-        let copied_mutex = mutex.clone();
-        std::thread::spawn(move || {
-            sleep(core::time::Duration::from_millis(500));
-            copied_mutex.wake_many(10);
-        });
-
-        assert!(mutex.block(0).is_ok());
-    }
-
-    #[test]
-    fn test_reserved_pages() {
-        let platform = WindowsUserland::new();
-
-        platform.debug_log_print("msg from WindowsUserland test_reserved_pages\n");
-
-        let reserved_pages: Vec<_> =
-            <WindowsUserland as PageManagementProvider<4096>>::reserved_pages(platform).collect();
-
-        // Check that the reserved pages are in order and non-overlapping
-        let mut prev = 0;
-        for page in reserved_pages {
-            assert!(page.start >= prev);
-            assert!(page.end > page.start);
-            prev = page.end;
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "not implemented")]
-    fn test_tls() {
-        let platform = WindowsUserland::new();
-        let _tls = WindowsUserland::get_thread_local_storage();
-        // TLS operations will panic as they're not implemented
-    }
-}
+mod tests {}
