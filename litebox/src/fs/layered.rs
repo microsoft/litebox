@@ -182,7 +182,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 },
             }
         }
-        // Now that we've migrated the data over, we can close out both of the file descriptors.
+        // After migrating the data, we also use these FDs to migrate the node-info over, so that
+        // any caller that tries to get the inode before/after the migration sees the same inode.
+        if let Some(&layered_id) = self
+            .node_info_lookup
+            .read()
+            .get(&self.lower.fd_file_status(&lower_fd).unwrap().node_info)
+        {
+            let old = self.node_info_lookup.write().insert(
+                self.upper
+                    .fd_file_status(upper_fd.as_ref().unwrap())
+                    .unwrap()
+                    .node_info,
+                layered_id,
+            );
+            assert!(old.is_none());
+        }
+        // Now that we've migrated the data (and node-info) over, we can close out both of the file
+        // descriptors.
         self.upper.close(upper_fd.unwrap()).unwrap();
         self.lower.close(lower_fd).unwrap();
 
