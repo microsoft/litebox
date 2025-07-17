@@ -104,10 +104,10 @@ fn syscall_dispatcher(sysnr: u64, ctx: *const SyscallContext) -> isize {
     // placeholder for the syscall handler
     let sysret = syscall_handler();
 
-    // TODO: We should determine whether we should place this function here, OP-TEE shim, or separate it into
+    // TODO: We should decide whether we place this function here, OP-TEE shim, or separate it into
     // multiple functions and place them in the appropriate places.
     // In OP-TEE TAs, a system call can have three different return paths:
-    // 1. Return to the user space to resume its execution: This means a TA is in the middle of its execution.
+    // 1. Return to the user space to resume its execution: This implies a TA is in the middle of its execution.
     // It does not yet complete a request from a VTL0 client (e.g., sign a message) and makes several syscalls to do so.
     // 2. Switch to VTL0 with a final outcome: a TA completes a client's request and returns a final outcome to VTL0.
     // 3. Switch to VTL0 to interact with VTL0: a TA can initiate an RPC to VTL0 to interact with its client app or services.

@@ -358,7 +358,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// When we handle a system call or interrupt, it is difficult to figure out the corresponding user context
     /// because kernel and user contexts are not tightly coupled (i.e., we do not know `userspace_id`).
     /// To this end, we use this function to match the physical frame of the page table contained in each user
-    /// context structure with the CR3 value in a system call context (before switching the page table).
+    /// context structure with the CR3 value in a system call context (before changing the page table).
     #[allow(clippy::similar_names)]
     pub(crate) fn get_physical_frame(&self) -> PhysFrame {
         let p4_va = core::ptr::from_ref::<PageTable>(self.inner.lock().level_4_table());
@@ -366,12 +366,14 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         PhysFrame::containing_address(p4_pa)
     }
 
-    /// Deallocate physical frames of all page tables except for the top-level page table.
+    /// Deallocate physical frames of all level 1--3 page tables except for the top-level page table.
+    /// This is a wrapper function for `MappedPageTable::clean_up()`.
     ///
     /// # Safety
     /// The caller is expected to unmap all non-page-table pages before calling this function.
     /// Also, the caller must ensure no page table frame is shared with other page tables.
-    /// TODO: consider merging this function with `Drop` if it is reliable enough.
+    /// This function expects that `Drop` will deallocate the top-level page table frame. It does not
+    /// deallocate the top-level page table frame because this can result in an undefined behavior.
     pub(crate) unsafe fn clean_up(&self) {
         let mut allocator = PageTableAllocator::<M>::new();
         unsafe {
