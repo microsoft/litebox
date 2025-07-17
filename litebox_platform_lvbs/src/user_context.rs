@@ -8,42 +8,30 @@ use crate::{
 };
 use core::arch::asm;
 use hashbrown::HashMap;
-use litebox::mm::linux::PageRange;
 use litebox_common_linux::errno::Errno;
 use x86_64::{
     VirtAddr,
     registers::{control::Cr3, rflags::RFlags},
 };
 
-// Let us confine the size of the VTL1 user space for now (1 GiB).
-// This would be fine because we only run tiny programs in the VTL1 user space.
-const VTL1_USER_BASE: u64 = 0x1_0000_0000;
-const VTL1_USER_TOP: u64 = 0x1_4000_0000;
-// fixed-size user stack for an OP-TEE TA
-pub const VTL1_USER_STACK_SIZE: usize = 16 * PAGE_SIZE;
-
-/// UserSpace provider trait for OP-TEE Trusted Applications (TAs) with fixed-size heap and stack.
+/// UserSpace management trait for creating and managing a separate address space for a user process, task, or session.
 #[allow(dead_code)]
 pub trait UserSpaceManagement {
-    /// Global virtual address base for VTL1 user space
-    const GVA_USER_BASE: VirtAddr;
-
-    /// Global virtual address top for VTL1 user space
-    const GVA_USER_TOP: VirtAddr;
-
-    /// Base size of a VTL1 user stack
-    const BASE_STACK_SIZE: usize;
-
     /// Create a new user address space (i.e., a new user page table) and context, and returns `userspace_id` for it.
-    /// The page table also maps the kernel address space (the entire space for now, a portion of it in the future)
+    /// The page table also maps the kernel address space (the entire physical space for now, a portion of it in the future)
     /// for handling system calls.
-    fn create_userspace(&self) -> Result<u32, Errno>;
+    fn create_userspace(&self) -> Result<usize, Errno>;
 
-    /// Delete any resources associated with the userspace (`userspace_id`).
-    fn delete_userspace(&self, userspace_id: u32) -> Result<(), Errno>;
+    /// Delete resources associated with the userspace (`userspace_id`) including its context and page tables.
+    ///
+    /// # Safety
+    /// The caller must ensure that any virtual address pages assigned to this userspace must be unmapped through
+    /// `LiteBox::PageManager` before calling this function. Otherwise, there will be a memory leak. `PageManager`
+    /// manages every virtual address page allocated through or for the Shim and apps.
+    fn delete_userspace(&self, userspace_id: usize) -> Result<(), Errno>;
 
     /// Check whether the userspace with the given `userspace_id` exists.
-    fn check_userspace(&self, userspace_id: u32) -> bool;
+    fn check_userspace(&self, userspace_id: usize) -> bool;
 
     /// Enter userspace with the given `userspace_id`. This function never returns.
     /// It retrieves the user context (return address, stack pointer, and rflags) from a global data
@@ -52,7 +40,7 @@ pub trait UserSpaceManagement {
     /// # Panics
     ///
     /// Panics if `userspace_id` does not exist. The caller must ensure that `userspace_id` is valid.
-    fn enter_userspace(&self, userspace_id: u32, arguments: Option<&[u64]>) -> !;
+    fn enter_userspace(&self, userspace_id: usize, arguments: Option<&[usize]>) -> !;
 
     /// Save the user context when there is user-to-kernel transition.
     /// This function is expected to be called by the system call or interrupt handler which does not
@@ -67,7 +55,9 @@ pub trait UserSpaceManagement {
 }
 
 /// Data structure to hold user context information. All other registers will be stored into a user stack
-/// (pointed by `rsp`) and restored by the system call handler.
+/// (pointed by `rsp`) and restored by the system call or interrupt handler.
+/// TODO: Since the user stack might have no space to store all registers, we can extend this structure in
+/// the future to store those registers.
 pub struct UserContext {
     pub page_table: crate::mm::PageTable<PAGE_SIZE>,
     pub rip: VirtAddr,
@@ -89,7 +79,7 @@ impl UserContext {
 
 /// Data structure to hold a map of user contexts indexed by their ID.
 pub struct UserContextMap {
-    inner: spin::mutex::SpinMutex<HashMap<u32, UserContext>>,
+    inner: spin::mutex::SpinMutex<HashMap<usize, UserContext>>,
 }
 
 impl UserContextMap {
@@ -101,15 +91,11 @@ impl UserContextMap {
 }
 
 impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
-    const GVA_USER_BASE: VirtAddr = x86_64::VirtAddr::new(VTL1_USER_BASE);
-    const GVA_USER_TOP: VirtAddr = x86_64::VirtAddr::new(VTL1_USER_TOP);
-    const BASE_STACK_SIZE: usize = VTL1_USER_STACK_SIZE;
-
-    fn create_userspace(&self) -> Result<u32, Errno> {
+    fn create_userspace(&self) -> Result<usize, Errno> {
         let mut inner = self.user_contexts.inner.lock();
         let userspace_id = match inner.keys().max() {
-            Some(&id) => id + 1,
-            None => 1,
+            Some(&id) => id.checked_add(1).ok_or(Errno::ENOMEM)?,
+            None => 1usize,
         };
         let user_pt = self.new_user_page_table();
 
@@ -118,26 +104,11 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
         Ok(userspace_id)
     }
 
-    fn delete_userspace(&self, userspace_id: u32) -> Result<(), Errno> {
+    fn delete_userspace(&self, userspace_id: usize) -> Result<(), Errno> {
         let mut inner = self.user_contexts.inner.lock();
         let user_pt = inner.get(&userspace_id).unwrap();
 
-        // TODO: we should decide a proper way to implement `delete_userspace`. Before deallocating physical frames of
-        // all user page tables, we should deallocate all virtual addresses assigned to this user space through `MemoryProvider`.
-
         unsafe {
-            // TODO: selectively unmap mapped pages instead of unmapping the entire user space
-            user_pt
-                .page_table
-                .unmap_pages(
-                    PageRange::<PAGE_SIZE>::new(
-                        usize::try_from(Self::GVA_USER_BASE.as_u64()).unwrap(),
-                        usize::try_from(Self::GVA_USER_TOP.as_u64()).unwrap(),
-                    )
-                    .unwrap(),
-                    true,
-                )
-                .expect("Failed to unmap user pages");
             user_pt.page_table.clean_up();
         }
 
@@ -145,7 +116,7 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
         Ok(())
     }
 
-    fn check_userspace(&self, userspace_id: u32) -> bool {
+    fn check_userspace(&self, userspace_id: usize) -> bool {
         let inner = self.user_contexts.inner.lock();
         if inner.contains_key(&userspace_id) {
             return true;
@@ -154,7 +125,7 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
     }
 
     #[allow(clippy::similar_names)]
-    fn enter_userspace(&self, userspace_id: u32, _arguments: Option<&[u64]>) -> ! {
+    fn enter_userspace(&self, userspace_id: usize, _arguments: Option<&[usize]>) -> ! {
         let rsp;
         let rip;
         let rflags;
@@ -183,7 +154,7 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
         } // release the lock before entering userspace
         let Some((_, cs_idx, ds_idx)) = get_per_core_kernel_context().get_segment_selectors()
         else {
-            panic!("GDT not initialized");
+            panic!("GDT is not initialized");
         };
         unsafe {
             asm!(
@@ -208,7 +179,7 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
     ) -> Result<(), Errno> {
         let (cr3, _) = Cr3::read_raw();
         let mut inner = self.user_contexts.inner.lock();
-        // TODO: to avoid the below linear search, we can maintain cr3 to `userspace_id` mapping.
+        // TODO: to avoid the below linear search, we can maintain CR3 to `userspace_id` mapping.
         for (id, user_ctx) in inner.iter_mut() {
             if cr3 == user_ctx.page_table.get_physical_frame() {
                 user_ctx.rsp = user_stack_ptr;
@@ -228,7 +199,7 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
     }
 }
 
-// This dummy syscall function is used for testing purposes.
+// This dummy syscall function is used for testing purposes. We will remove this once the OP-TEE Shim is implemented.
 #[expect(unused_assignments)]
 #[expect(unused_variables)]
 #[unsafe(no_mangle)]
