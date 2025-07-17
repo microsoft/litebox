@@ -1,6 +1,9 @@
 //! A module to house all the code for the top-level [`LiteBox`] object.
 
 use alloc::sync::Arc;
+use core::any::TypeId;
+use core::sync::atomic::AtomicUsize;
+use hashbrown::HashMap;
 
 use crate::{
     fd::Descriptors,
@@ -29,11 +32,13 @@ impl<Platform: RawSyncPrimitivesProvider + ExitProvider> LiteBox<Platform> {
         // here do not need to deal with any of this though; see the post-creation invariant
         // guarantee written on `LiteBoxX::descriptors`.
         let descriptors = sync.new_rwlock(None);
+        let freshness_source = sync.new_rwlock(HashMap::new());
         let ret = Self {
             x: Arc::new(LiteBoxX {
                 platform,
                 sync,
                 descriptors,
+                freshness_source,
             }),
         };
         let descriptors = Descriptors::new_from_litebox_creation(&ret);
@@ -93,6 +98,47 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {
         crate::sync::RwLockWriteGuard::map(self.x.descriptors.write(), |x| x.as_mut().unwrap())
     }
+
+    /// Get a new fresh `usize` value associated with the given type `T`.
+    ///
+    /// The intended usage of this is that `T` is a zero-sized newtype, only used as a key to
+    /// receive freshness values.
+    ///
+    /// # Panics
+    ///
+    /// This panics if the freshness value overflows, which means that there are too many freshness
+    /// calls. This is an unlikely case to be hit unless billions of freshness calls with the same
+    /// type of freshness are requested.
+    pub(crate) fn get_freshness<T: 'static>(&self) -> usize {
+        let type_id = TypeId::of::<T>();
+
+        // Fast-path: if it is already in the map, we can just increment it, taking a cheaper
+        // read-lock that doesn't need anything to be blocked. This is the common case.
+        if let Some(freshness) = self.x.freshness_source.read().get(&type_id) {
+            let result = freshness.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            assert!(
+                result < usize::MAX,
+                "If this overflows, there are too many freshness calls, and no more guarantees on freshness can be made. Thus, this panics."
+            );
+            return result;
+        }
+
+        // Otherwise, we need to go with the slow path, which requires a write-lock. This is
+        // expected to only happen once when the absolute first freshness shows up, so there should
+        // not be contention later on.
+        let result = self
+            .x
+            .freshness_source
+            .write()
+            .entry(type_id)
+            .or_insert_with(|| AtomicUsize::new(0))
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        assert!(
+            result < usize::MAX,
+            "If this overflows, there are too many freshness calls, and no more guarantees on freshness can be made. Thus, this panics."
+        );
+        result
+    }
 }
 
 /// The actual body of [`LiteBox`], containing any components that might be shared.
@@ -103,4 +149,5 @@ pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
     // should only be accessed via the `descriptor_table` and `descriptor_table_mut` methods, which
     // not only give a nicer interface, but also do the necessary checks.
     descriptors: RwLock<Platform, Option<Descriptors<Platform>>>,
+    freshness_source: RwLock<Platform, HashMap<TypeId, AtomicUsize>>,
 }
