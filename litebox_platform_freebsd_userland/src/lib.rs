@@ -231,12 +231,8 @@ extern "C" fn thread_start(arg: *mut ThreadStartArgs) {
     // that was created via Box::into_raw in spawn_thread.
     let thread_start_args = unsafe { Box::from_raw(arg) };
 
-    let pt_regs = thread_start_args.pt_regs;
-    let thread_args = thread_start_args.thread_args;
-    let entry_point = thread_start_args.entry_point;
-
     // Store the pt_regs onto the stack (for restoration later)
-    let pt_regs_stack = *pt_regs;
+    let pt_regs_stack = *(thread_start_args.pt_regs);
 
     // Reset TLS for the new thread
     unsafe {
@@ -245,7 +241,7 @@ extern "C" fn thread_start(arg: *mut ThreadStartArgs) {
 
     // Set up thread-local storage for the new thread. This is done by
     // calling the actual thread callback with the unpacked arguments
-    (thread_args.callback)(*thread_args);
+    (thread_start_args.thread_args.callback)(*(thread_start_args.thread_args));
 
     // Restore the context
     unsafe {
@@ -266,7 +262,7 @@ extern "C" fn thread_start(arg: *mut ThreadStartArgs) {
             "popfq",
             "pop rsp",      // restore the stack pointer (which points to the entry point of the thread)
             "jmp rbx",
-            in(reg) entry_point,
+            in(reg) thread_start_args.entry_point,
             in(reg) &raw const pt_regs_stack.r11, // restore registers, starting from r11
             out("rax") _,
             options(nostack, preserves_flags)
