@@ -1227,6 +1227,7 @@ pub struct EpollEvent {
     pub data: u64,
 }
 
+#[non_exhaustive]
 #[repr(i32)]
 #[derive(Debug, IntEnum)]
 pub enum MadviseBehavior {
@@ -1718,7 +1719,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::madvise => {
                 let behavior: i32 = ctx.syscall_arg(2).reinterpret_as_signed().truncate();
                 let behavior =
-                    MadviseBehavior::try_from(behavior).expect("Invalid madvise behavior");
+                    MadviseBehavior::try_from(behavior).expect("unsupported madvise behavior");
                 SyscallRequest::Madvise {
                     addr: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
                     length: ctx.syscall_arg(1),

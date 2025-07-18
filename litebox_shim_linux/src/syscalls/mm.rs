@@ -325,15 +325,9 @@ pub(crate) fn sys_madvise(
             // and shmem-based techniques such as System V shared memory segments) or zero-fill-on-demand pages for anonymous private mappings.
             //
             // Note we do not support shared memory yet, so this is just to discard the pages without removing the mapping.
-            unsafe { litebox_page_manager().reset_pages(addr, len) }.map_err(|err| match err {
-                VmemUnmapError::UnAligned => Errno::EINVAL,
-                VmemUnmapError::UnmapError(e) => match e {
-                    DeallocationError::Unaligned => Errno::EINVAL,
-                    DeallocationError::AlreadyUnallocated => Errno::ENOMEM,
-                    _ => unimplemented!(),
-                },
-            })
+            unsafe { litebox_page_manager().reset_pages(addr, len) }.map_err(Errno::from)
         }
+        _ => unimplemented!("unsupported madvise behavior"),
     }
 }
 

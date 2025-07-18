@@ -337,13 +337,18 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         range: PageRange<ALIGN>,
     ) -> Result<(), VmemUnmapError> {
         let range: Range<usize> = range.into();
+        // Any unmapped regions in the original range will result in this function returning `DeallocationError::AlreadyUnallocated`
+        // while still resetting all of the existing vmas in the range.
         let unmapped_error = self.vmas.gaps(&range).next().is_some();
         let overlapping_ranges: Vec<(Range<usize>, VmArea)> = self
             .overlapping(range.clone())
             .map(|(r, vma)| (r.clone(), *vma))
             .collect();
         for (r, vma) in overlapping_ranges {
-            assert!(!vma.is_file_backed(), "Cannot reset file-backed mappings");
+            assert!(
+                !vma.is_file_backed(),
+                "resetting file-backed mappings is not supported yet"
+            );
             let start = r.start.max(range.start);
             let end = r.end.min(range.end);
             let new_range = PageRange::new(start, end).unwrap();
