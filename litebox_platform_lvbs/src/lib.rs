@@ -6,7 +6,7 @@
 
 use crate::{
     mshv::{vsm::Vtl0KernelInfo, vtl1_mem_layout::PAGE_SIZE},
-    syscall_handler::SyscallHandler,
+    syscall_callback::SyscallHandler,
     user_context::UserContextMap,
 };
 
@@ -38,7 +38,7 @@ pub mod mm;
 pub mod mshv;
 pub mod ptr;
 
-pub mod syscall_handler;
+pub mod syscall_callback;
 pub(crate) mod user_context;
 
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
@@ -348,9 +348,10 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         pt
     }
 
-    /// Register `syscall_handler` to handle syscalls. This function must be called for each core.
+    /// Register a callback for `syscall_handler` passed down from the shim. This function must be called
+    /// for each core to program its MSRs.
     pub fn register_syscall_handler(syscall_handler: SyscallHandler) {
-        syscall_handler::init(syscall_handler);
+        syscall_callback::init(syscall_handler);
     }
 }
 
