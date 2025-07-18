@@ -41,6 +41,12 @@ pub struct LinuxUserland {
     vdso_address: Option<usize>,
 }
 
+impl core::fmt::Debug for LinuxUserland {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinuxUserland").finish_non_exhaustive()
+    }
+}
+
 const IF_NAMESIZE: usize = 16;
 /// Use TUN device
 const IFF_TUN: i32 = 0x0001;

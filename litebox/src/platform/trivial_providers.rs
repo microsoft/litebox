@@ -110,6 +110,11 @@ pub struct TransparentConstPtr<T> {
     pub inner: *const T,
 }
 impl<T: Clone> Copy for TransparentConstPtr<T> {}
+impl<T: Clone> core::fmt::Debug for TransparentConstPtr<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:#x?}", self.inner)
+    }
+}
 impl<T: Clone> RawConstPointer<T> for TransparentConstPtr<T> {
     unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
         if self.inner.is_null() || !self.inner.is_aligned() {
@@ -147,6 +152,11 @@ pub struct TransparentMutPtr<T> {
     pub inner: *mut T,
 }
 impl<T: Clone> Copy for TransparentMutPtr<T> {}
+impl<T: Clone> core::fmt::Debug for TransparentMutPtr<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:#x?}", self.inner)
+    }
+}
 impl<T: Clone> RawConstPointer<T> for TransparentMutPtr<T> {
     unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
         if self.inner.is_null() || !self.inner.is_aligned() {

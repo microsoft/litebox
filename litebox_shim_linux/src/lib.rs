@@ -289,7 +289,12 @@ const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
 #[allow(clippy::too_many_lines)]
+// #[tracing::instrument(level = "error")]
 pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
+    {
+        extern crate std;
+        std::dbg!(">X< {}", tracing::dispatcher::has_been_set());
+    }
     let res: Result<usize, Errno> = match request {
         SyscallRequest::Ret(errno) => Err(errno),
         SyscallRequest::Exit { status } => syscalls::process::sys_exit(status),

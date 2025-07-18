@@ -18,6 +18,9 @@ pub struct CliArgs {
     /// Forward the existing environment variables
     #[arg(long = "forward-env")]
     pub forward_environment_variables: bool,
+    /// Increase verbosity for the logging (pass multiple times to increase)
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
     /// Allow using unstable options
     #[arg(short = 'Z', long = "unstable")]
     pub unstable: bool,
@@ -70,6 +73,30 @@ pub enum InterceptionBackend {
 /// message could be thrown instead.
 #[expect(clippy::too_many_lines)]
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::uptime())
+        .with_level(true)
+        // .with_env_filter(
+        //     tracing_subscriber::EnvFilter::builder()
+        //         .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+        //         .with_env_var("LITEBOX_LOG")
+        //         .from_env()?,
+        // )
+        .with_max_level(match cli_args.verbose {
+            0 => tracing::Level::ERROR,
+            1 => tracing::Level::WARN,
+            2 => tracing::Level::INFO,
+            3 => tracing::Level::DEBUG,
+            _ => tracing::Level::TRACE,
+        })
+        .init();
+    if cli_args.verbose > 4 {
+        tracing::warn!(
+            verbosity = cli_args.verbose,
+            "Too much verbosity, capping to TRACE (equivalent to -vv)"
+        );
+    }
+
     if !cli_args.insert_files.is_empty() {
         unimplemented!(
             "this should (hopefully soon) have a nicer interface to support loading in files"

@@ -19,6 +19,7 @@ elf_loader = { version = "=0.10.0", default-features = false, features = [] }
 thiserror = { version = "2.0.6", default-features = false }
 ringbuf = { version = "0.4.8", default-features = false, features = ["alloc"] }
 syscalls = { version = "0.6", default-features = false }
+tracing = { version = "0.1.41", default-features = false, features = ["attributes"] }
 
 [target.'cfg(target_arch = "x86")'.dependencies]
 # ELF loader requires us to enable the `rel` dependency on 32-bit to work.

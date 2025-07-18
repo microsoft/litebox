@@ -10,6 +10,11 @@ pub struct UserConstPtr<T> {
 }
 
 impl<T: Clone> Copy for UserConstPtr<T> {}
+impl<T: Clone> core::fmt::Debug for UserConstPtr<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "u{:#x?}", self.inner)
+    }
+}
 impl<T: Clone> RawConstPointer<T> for UserConstPtr<T> {
     unsafe fn read_at_offset<'a>(self, _count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
         todo!()
@@ -56,6 +61,11 @@ pub struct UserMutPtr<T> {
 }
 
 impl<T: Clone> Copy for UserMutPtr<T> {}
+impl<T: Clone> core::fmt::Debug for UserMutPtr<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "u{:#x?}", self.inner)
+    }
+}
 impl<T: Clone> RawConstPointer<T> for UserMutPtr<T> {
     unsafe fn read_at_offset<'a>(self, _count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
         todo!()
