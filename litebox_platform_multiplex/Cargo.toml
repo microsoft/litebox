@@ -10,6 +10,7 @@ litebox_platform_freebsd_userland = { path = "../litebox_platform_freebsd_userla
 litebox_platform_windows_userland = { path = "../litebox_platform_windows_userland/", version = "0.1.0", default-features = false, optional = true }
 litebox_platform_lvbs = { path = "../litebox_platform_lvbs/", version = "0.1.0", default-features = false, optional = true }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
+cfg-if = "1.0.0"
 
 [features]
 default = ["platform_linux_userland"]
