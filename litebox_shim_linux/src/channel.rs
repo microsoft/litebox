@@ -6,7 +6,11 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use alloc::sync::{Arc, Weak};
 use litebox::{
     LiteBox,
-    event::{Events, observer::Observer},
+    event::{
+        Events,
+        observer::Observer,
+        polling::{Pollee, TryOpError},
+    },
     fs::OFlags,
 };
 use litebox_common_linux::errno::Errno;
@@ -26,15 +30,16 @@ const PIPE_BUF: usize = 2;
 
 struct EndPointer<T> {
     rb: litebox::sync::Mutex<Platform, T>,
-    pollee: crate::event::Pollee,
+    pollee: Pollee<Platform>,
     is_shutdown: AtomicBool,
 }
 
 impl<T> EndPointer<T> {
     pub fn new(rb: T, init_events: Events, litebox: &LiteBox<Platform>) -> Self {
+        let _ = init_events; // TODO: The `init_events` were being ignored before, what are we actually supposed to do with them?
         Self {
             rb: litebox.sync().new_mutex(rb),
-            pollee: crate::event::Pollee::new(init_events),
+            pollee: Pollee::new(crate::litebox()),
             is_shutdown: AtomicBool::new(false),
         }
     }
@@ -110,12 +115,12 @@ impl<T> Producer<T> {
         events
     }
 
-    fn try_write(&self, buf: &[T]) -> Result<usize, Errno>
+    fn try_write(&self, buf: &[T]) -> Result<usize, TryOpError<Errno>>
     where
         T: Copy,
     {
         if self.is_shutdown() || self.is_peer_shutdown() {
-            return Err(Errno::EPIPE);
+            return Err(TryOpError::Other(Errno::EPIPE));
         }
         if buf.is_empty() {
             return Ok(0);
@@ -137,7 +142,7 @@ impl<T> Producer<T> {
             }
             Ok(write_len)
         } else {
-            Err(Errno::EAGAIN)
+            Err(TryOpError::TryAgain)
         }
     }
 
@@ -145,7 +150,7 @@ impl<T> Producer<T> {
     where
         T: Copy,
     {
-        if self.get_status().contains(OFlags::NONBLOCK) {
+        Ok(if self.get_status().contains(OFlags::NONBLOCK) {
             self.try_write(buf)
         } else {
             self.endpoint.pollee.wait_or_timeout(
@@ -154,7 +159,7 @@ impl<T> Producer<T> {
                 || self.try_write(buf),
                 || self.check_io_events(),
             )
-        }
+        }?)
     }
 
     common_functions_for_channel!();
@@ -200,12 +205,12 @@ impl<T> Consumer<T> {
         events
     }
 
-    fn try_read(&self, buf: &mut [T]) -> Result<usize, Errno>
+    fn try_read(&self, buf: &mut [T]) -> Result<usize, TryOpError<Errno>>
     where
         T: Copy,
     {
         if self.is_shutdown() {
-            return Err(Errno::EPIPE);
+            return Err(TryOpError::Other(Errno::EPIPE));
         }
         if buf.is_empty() {
             return Ok(0);
@@ -223,7 +228,7 @@ impl<T> Consumer<T> {
                 // and `is_peer_shutdown` are lost.
                 return Ok(self.endpoint.rb.lock().pop_slice(buf));
             }
-            Err(Errno::EAGAIN)
+            Err(TryOpError::TryAgain)
         }
     }
 
@@ -231,7 +236,7 @@ impl<T> Consumer<T> {
     where
         T: Copy,
     {
-        if self.get_status().contains(OFlags::NONBLOCK) {
+        Ok(if self.get_status().contains(OFlags::NONBLOCK) {
             self.try_read(buf)
         } else {
             self.endpoint.pollee.wait_or_timeout(
@@ -240,7 +245,7 @@ impl<T> Consumer<T> {
                 || self.try_read(buf),
                 || self.check_io_events(),
             )
-        }
+        }?)
     }
 
     common_functions_for_channel!();

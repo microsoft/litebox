@@ -1,6 +1,7 @@
 //! Events related functionality
 
 pub mod observer;
+pub mod polling;
 
 bitflags::bitflags! {
     #[derive(Clone, Copy)]

@@ -6,7 +6,7 @@ use core::{
 };
 
 use litebox::{
-    event::{Events, observer::Observer},
+    event::{Events, observer::Observer, polling::Pollee},
     fs::OFlags,
     net::{ReceiveFlags, SendFlags, SocketFd},
     platform::{RawConstPointer, RawMutPointer},
@@ -73,7 +73,7 @@ pub(crate) struct Socket {
     pub(crate) status: AtomicU32,
     pub(crate) close_on_exec: AtomicBool,
     options: litebox::sync::Mutex<Platform, SocketOptions>,
-    pollee: crate::event::Pollee,
+    pollee: Pollee<Platform>,
 }
 
 impl Drop for Socket {
@@ -91,6 +91,8 @@ impl Socket {
         litebox: &litebox::LiteBox<Platform>,
         init_events: Events,
     ) -> Self {
+        let _ = init_events; // TODO: `init_events` were being ignored before this PR, what to do?
+
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
 
@@ -100,7 +102,7 @@ impl Socket {
             status: AtomicU32::new(flags.bits()),
             close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
             options: litebox.sync().new_mutex(SocketOptions::default()),
-            pollee: crate::event::Pollee::new(init_events),
+            pollee: Pollee::new(litebox),
         }
     }
 

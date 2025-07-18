@@ -7,12 +7,12 @@ use alloc::{
 };
 use litebox::{
     LiteBox,
-    event::{Events, observer::Observer},
+    event::{Events, observer::Observer, polling::Pollee},
 };
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
-use crate::{Descriptor, event::Pollee};
+use crate::Descriptor;
 
 bitflags::bitflags! {
     /// Linux's epoll flags.
@@ -115,14 +115,14 @@ impl EpollFile {
             || {
                 self.ready.pop_multiple(maxevents, &mut events);
                 if events.is_empty() {
-                    return Err(Errno::EAGAIN);
+                    return Err(litebox::event::polling::TryOpError::TryAgain);
                 }
                 Ok(())
             },
             || self.ready.check_io_events(),
         ) {
-            Ok(()) | Err(Errno::ETIMEDOUT) => {}
-            Err(e) => return Err(e),
+            Ok(()) | Err(litebox::event::polling::TryOpError::TimedOut) => {}
+            Err(e) => return Err(e.into()),
         }
         Ok(events)
     }
@@ -316,14 +316,14 @@ struct ReadySet {
         litebox_platform_multiplex::Platform,
         VecDeque<alloc::sync::Weak<EpollEntry>>,
     >,
-    pollee: Pollee,
+    pollee: Pollee<Platform>,
 }
 
 impl ReadySet {
     fn new(litebox: &LiteBox<Platform>) -> Self {
         Self {
             entries: litebox.sync().new_mutex(VecDeque::new()),
-            pollee: Pollee::new(Events::empty()),
+            pollee: Pollee::new(litebox),
         }
     }
 
