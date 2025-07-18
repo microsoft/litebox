@@ -1,5 +1,7 @@
 //! Events related functionality
 
+pub mod observer;
+
 bitflags::bitflags! {
     #[derive(Clone, Copy)]
     pub struct Events: u32 {

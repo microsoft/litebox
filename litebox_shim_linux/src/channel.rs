@@ -4,15 +4,17 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use alloc::sync::{Arc, Weak};
-use litebox::{LiteBox, event::Events, fs::OFlags};
+use litebox::{
+    LiteBox,
+    event::{Events, observer::Observer},
+    fs::OFlags,
+};
 use litebox_common_linux::errno::Errno;
 use litebox_platform_multiplex::Platform;
 use ringbuf::{
     HeapCons, HeapProd, HeapRb,
     traits::{Consumer as _, Observer as _, Producer as _, Split as _},
 };
-
-use crate::event::Observer;
 
 /// The maximum number of bytes for atomic write.
 ///

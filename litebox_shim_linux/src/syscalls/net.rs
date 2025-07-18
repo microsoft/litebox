@@ -6,7 +6,7 @@ use core::{
 };
 
 use litebox::{
-    event::Events,
+    event::{Events, observer::Observer},
     fs::OFlags,
     net::{ReceiveFlags, SendFlags, SocketFd},
     platform::{RawConstPointer, RawMutPointer},
@@ -114,7 +114,7 @@ impl Socket {
     pub(crate) fn poll(
         &self,
         mask: Events,
-        observer: Option<alloc::sync::Weak<dyn crate::event::Observer<Events>>>,
+        observer: Option<alloc::sync::Weak<dyn Observer<Events>>>,
     ) -> Events {
         self.pollee.poll(mask, observer, || self.check_io_events())
     }

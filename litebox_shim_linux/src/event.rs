@@ -1,125 +1,26 @@
-use alloc::collections::btree_map::BTreeMap;
 use litebox::platform::RawMutex as _;
 use litebox::platform::RawMutexProvider;
 use litebox::{
-    event::Events,
+    event::{
+        Events,
+        observer::{Observer, Subject},
+    },
     platform::{Instant as _, TimeProvider as _},
 };
 use litebox_common_linux::errno::Errno;
-
-trait EventsFilter<E>: Send + Sync + 'static {
-    fn filter(&self, event: &E) -> bool;
-}
-
-impl EventsFilter<Events> for Events {
-    fn filter(&self, events: &Events) -> bool {
-        self.intersects(*events)
-    }
-}
-
-pub(crate) trait Observer<E>: Send + Sync {
-    fn on_events(&self, events: &E);
-}
-
-struct ObserverKey<E> {
-    observer: alloc::sync::Weak<dyn Observer<E>>,
-}
-
-impl<E> PartialEq for ObserverKey<E> {
-    fn eq(&self, other: &Self) -> bool {
-        self.observer.ptr_eq(&other.observer)
-    }
-}
-
-impl<E> Eq for ObserverKey<E> {}
-
-impl<E> PartialOrd for ObserverKey<E> {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<E> Ord for ObserverKey<E> {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        self.observer
-            .as_ptr()
-            .cast::<()>()
-            .cmp(&other.observer.as_ptr().cast::<()>())
-    }
-}
-
-impl<E> ObserverKey<E> {
-    fn upgrade(&self) -> Option<alloc::sync::Arc<dyn Observer<E>>> {
-        self.observer.upgrade()
-    }
-}
-
-/// A Subject notifies interesting events to registered observers.
-struct Subject<E, F: EventsFilter<E>> {
-    /// A table that maintains all interesting observers.
-    observers:
-        litebox::sync::Mutex<litebox_platform_multiplex::Platform, BTreeMap<ObserverKey<E>, F>>,
-    /// Number of observers.
-    nums: core::sync::atomic::AtomicUsize,
-}
-
-impl<E, F: EventsFilter<E>> Subject<E, F> {
-    fn new() -> Self {
-        Self {
-            observers: crate::litebox().sync().new_mutex(BTreeMap::new()),
-            nums: core::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<E>>, filter: F) {
-        let mut observers = self.observers.lock();
-        if observers.insert(ObserverKey { observer }, filter).is_none() {
-            self.nums
-                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    fn unregister_observer(&self, observer: alloc::sync::Weak<dyn Observer<E>>) {
-        let mut observers = self.observers.lock();
-        if observers.remove(&ObserverKey { observer }).is_some() {
-            self.nums
-                .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    fn notify_observers(&self, events: E) {
-        if self.nums.load(core::sync::atomic::Ordering::Relaxed) == 0 {
-            return;
-        }
-
-        let mut observers = self.observers.lock();
-        observers.retain(|observer, filter| {
-            if let Some(observer) = observer.upgrade() {
-                if filter.filter(&events) {
-                    observer.on_events(&events);
-                }
-                true
-            } else {
-                self.nums
-                    .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-                false
-            }
-        });
-    }
-}
 
 pub(crate) struct Pollee {
     inner: alloc::sync::Arc<PolleeInner>,
 }
 
 struct PolleeInner {
-    subject: Subject<Events, Events>,
+    subject: Subject<Events, Events, litebox_platform_multiplex::Platform>,
 }
 
 impl Pollee {
     pub(crate) fn new(init_events: Events) -> Self {
         let inner = alloc::sync::Arc::new(PolleeInner {
-            subject: Subject::new(),
+            subject: Subject::new(crate::litebox().sync()),
         });
         Self { inner }
     }

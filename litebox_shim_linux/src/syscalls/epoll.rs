@@ -5,14 +5,14 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use litebox::{LiteBox, event::Events};
+use litebox::{
+    LiteBox,
+    event::{Events, observer::Observer},
+};
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
-use crate::{
-    Descriptor,
-    event::{Observer, Pollee},
-};
+use crate::{Descriptor, event::Pollee};
 
 bitflags::bitflags! {
     /// Linux's epoll flags.
@@ -305,7 +305,7 @@ impl EpollEntry {
     }
 }
 
-impl crate::event::Observer<Events> for EpollEntry {
+impl Observer<Events> for EpollEntry {
     fn on_events(&self, events: &Events) {
         self.ready.push(self);
     }

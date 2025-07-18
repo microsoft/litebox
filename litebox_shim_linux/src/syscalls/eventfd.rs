@@ -2,7 +2,11 @@
 
 use core::sync::atomic::AtomicU32;
 
-use litebox::{event::Events, fs::OFlags, sync::RawSyncPrimitivesProvider};
+use litebox::{
+    event::{Events, observer::Observer},
+    fs::OFlags,
+    sync::RawSyncPrimitivesProvider,
+};
 use litebox_common_linux::{EfdFlags, errno::Errno};
 
 pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider> {
@@ -45,7 +49,7 @@ impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
     pub(crate) fn poll(
         &self,
         mask: Events,
-        observer: Option<alloc::sync::Weak<dyn crate::event::Observer<Events>>>,
+        observer: Option<alloc::sync::Weak<dyn Observer<Events>>>,
     ) -> Events {
         self.pollee.poll(mask, observer, || self.check_io_events())
     }
