@@ -172,6 +172,25 @@ impl From<litebox::platform::page_mgmt::AllocationError> for Errno {
     }
 }
 
+impl From<litebox::platform::page_mgmt::DeallocationError> for Errno {
+    fn from(value: litebox::platform::page_mgmt::DeallocationError) -> Self {
+        match value {
+            litebox::platform::page_mgmt::DeallocationError::Unaligned => Errno::EINVAL,
+            litebox::platform::page_mgmt::DeallocationError::AlreadyUnallocated => Errno::ENOMEM,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::mm::linux::VmemUnmapError> for Errno {
+    fn from(value: litebox::mm::linux::VmemUnmapError) -> Self {
+        match value {
+            litebox::mm::linux::VmemUnmapError::UnAligned => Errno::EINVAL,
+            litebox::mm::linux::VmemUnmapError::UnmapError(e) => e.into(),
+        }
+    }
+}
+
 impl From<litebox::mm::linux::MappingError> for Errno {
     fn from(value: litebox::mm::linux::MappingError) -> Self {
         match value {

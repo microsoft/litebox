@@ -44,6 +44,10 @@ fn do_mmap(
             flags.contains(MapFlags::MAP_POPULATE),
         );
         create_flags.set(CreatePagesFlags::ENSURE_SPACE_AFTER, ensure_space_after);
+        create_flags.set(
+            CreatePagesFlags::MAP_FILE,
+            !flags.contains(MapFlags::MAP_ANONYMOUS),
+        );
         create_flags
     };
     let suggested_addr = match suggested_addr {
@@ -286,6 +290,47 @@ pub(crate) fn sys_brk(addr: MutPtr<u8>) -> Result<usize, Errno> {
     unsafe { pm.brk(addr.as_usize()) }.map_err(Errno::from)
 }
 
+/// Handle syscall `madvise`
+pub(crate) fn sys_madvise(
+    addr: MutPtr<u8>,
+    len: usize,
+    advice: litebox_common_linux::MadviseBehavior,
+) -> Result<(), Errno> {
+    if addr.as_usize() & !PAGE_MASK != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if len == 0 {
+        return Ok(());
+    }
+    let aligned_len = len.next_multiple_of(PAGE_SIZE);
+    if aligned_len == 0 {
+        // overflow
+        return Err(Errno::EINVAL);
+    }
+    let Some(end) = addr.as_usize().checked_add(aligned_len) else {
+        return Err(Errno::EINVAL);
+    };
+
+    match advice {
+        litebox_common_linux::MadviseBehavior::Normal
+        | litebox_common_linux::MadviseBehavior::DontFork
+        | litebox_common_linux::MadviseBehavior::DoFork => {
+            // No-op for now, as we don't support fork yet.
+            Ok(())
+        }
+        litebox_common_linux::MadviseBehavior::DontNeed => {
+            // After a successful MADV_DONTNEED operation, the semantics of memory access in the specified region are changed:
+            // subsequent accesses of pages in the range will succeed, but will result in either repopulating the memory contents
+            // from the up-to-date contents of the underlying mapped file (for shared file mappings, shared anonymous mappings,
+            // and shmem-based techniques such as System V shared memory segments) or zero-fill-on-demand pages for anonymous private mappings.
+            //
+            // Note we do not support shared memory yet, so this is just to discard the pages without removing the mapping.
+            unsafe { litebox_page_manager().reset_pages(addr, len) }.map_err(Errno::from)
+        }
+        _ => unimplemented!("unsupported madvise behavior"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use litebox::{
@@ -300,7 +345,7 @@ mod tests {
         tests::init_platform,
     };
 
-    use super::{sys_mmap, sys_mremap};
+    use super::{sys_madvise, sys_mmap, sys_mremap};
 
     #[test]
     fn test_anonymous_mmap() {
@@ -374,5 +419,46 @@ mod tests {
         let new_addr = sys_mremap(addr, 0x1000, 0x2000, MRemapFlags::MREMAP_MAYMOVE, 0).unwrap();
         sys_munmap(addr, 0x2000).unwrap();
         sys_munmap(new_addr, 0x2000).unwrap();
+    }
+
+    #[test]
+    fn test_madvise() {
+        init_platform(None);
+
+        let addr = sys_mmap(
+            0,
+            0x2000,
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+            -1,
+            0,
+        )
+        .unwrap();
+
+        addr.mutate_subslice_with(..0x10, |buf| {
+            buf.fill(0xff);
+        })
+        .unwrap();
+
+        // Test MADV_NORMAL
+        assert!(sys_madvise(addr, 0x2000, litebox_common_linux::MadviseBehavior::Normal).is_ok());
+
+        // Test MADV_DONTNEED
+        assert!(
+            sys_madvise(
+                addr,
+                0x2000,
+                litebox_common_linux::MadviseBehavior::DontNeed
+            )
+            .is_ok()
+        );
+
+        unsafe {
+            addr.to_cow_slice(0x10).unwrap().iter().for_each(|&x| {
+                assert_eq!(x, 0); // Should be zeroed after MADV_DONTNEED
+            });
+        }
+
+        sys_munmap(addr, 0x2000).unwrap();
     }
 }

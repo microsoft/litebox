@@ -367,6 +367,28 @@ where
         unsafe { vmem.remove_mapping(range) }
     }
 
+    /// Reset pages without removing its mapping.
+    ///
+    /// After calling this function, the memory region remains mapped, but its contents are invalidated.
+    /// Subsequent accesses to the region will result in repopulating the memory contents, either from
+    /// the underlying mapped file (for file-backed mappings, which is supported) or as zero-filled pages
+    /// (for anonymous mappings).
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the memory contents in the affected region are no longer accessed or
+    /// relied upon. Any pointers or references to the previous contents become invalid.
+    pub unsafe fn reset_pages(
+        &self,
+        ptr: Platform::RawMutPointer<u8>,
+        len: usize,
+    ) -> Result<(), VmemUnmapError> {
+        let mut vmem = self.vmem.write();
+        let start = ptr.as_usize();
+        let range = PageRange::new(start, start + len).ok_or(VmemUnmapError::UnAligned)?;
+        unsafe { vmem.reset_pages(range) }
+    }
+
     /// Internal common function used by `make_pages_*` to change page permissions.
     fn change_page_permissions(
         &self,
