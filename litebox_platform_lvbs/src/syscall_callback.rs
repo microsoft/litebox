@@ -88,7 +88,7 @@ impl SyscallContext {
 
 #[allow(clippy::similar_names)]
 #[allow(unreachable_code)]
-fn syscall_dispatcher(sysnr: u64, ctx: *const SyscallContext) -> isize {
+fn syscall_callback(sysnr: u64, ctx: *const SyscallContext) -> isize {
     let syscall_handler: SyscallHandler = *SYSCALL_HANDLER
         .get()
         .expect("Syscall handler should be initialized");
@@ -101,7 +101,7 @@ fn syscall_dispatcher(sysnr: u64, ctx: *const SyscallContext) -> isize {
         "BUG: userspace RIP or RSP is invalid"
     );
 
-    // placeholder for the syscall handler
+    // call the syscall handler passed down from the shim
     let sysret = syscall_handler();
 
     // TODO: We should decide whether we place this function here, OP-TEE shim, or separate it into
@@ -145,7 +145,7 @@ fn syscall_dispatcher(sysnr: u64, ctx: *const SyscallContext) -> isize {
 }
 
 #[unsafe(naked)]
-unsafe extern "C" fn syscall_dispatcher_wrapper() {
+unsafe extern "C" fn syscall_callback_wrapper() {
     naked_asm!(
         "push rsp",
         "push r11",
@@ -161,14 +161,14 @@ unsafe extern "C" fn syscall_dispatcher_wrapper() {
         "mov rdi, rax",
         "mov rsi, rsp",
         "and rsp, {stack_alignment}",
-        "call {syscall_dispatcher}",
+        "call {syscall_callback}",
         "add rsp, {register_space}",
         "pop rcx",
         "pop r11",
         "pop rbp",
         "sysretq",
         stack_alignment = const STACK_ALIGNMENT,
-        syscall_dispatcher = sym syscall_dispatcher,
+        syscall_callback = sym syscall_callback,
         register_space = const core::mem::size_of::<SyscallContext>() - core::mem::size_of::<u64>() * NUM_REGISTERS_TO_POP,
     );
 }
@@ -188,8 +188,8 @@ pub(crate) fn init(syscall_handler: SyscallHandler) {
     efer.insert(EferFlags::SYSTEM_CALL_EXTENSIONS);
     unsafe { Efer::write(efer) };
 
-    let dispatcher_addr = syscall_dispatcher_wrapper as *const () as u64;
-    LStar::write(VirtAddr::new(dispatcher_addr));
+    let syscall_callback_addr = syscall_callback_wrapper as *const () as u64;
+    LStar::write(VirtAddr::new(syscall_callback_addr));
 
     let rflags = RFlags::INTERRUPT_FLAG;
     SFMask::write(rflags);
