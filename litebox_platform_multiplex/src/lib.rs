@@ -37,6 +37,9 @@ pub type Platform = litebox_platform_freebsd_userland::FreeBSDUserland;
 #[cfg(all(feature = "platform_windows_userland", target_os = "windows"))]
 pub type Platform = litebox_platform_windows_userland::WindowsUserland;
 
+#[cfg(feature = "platform_lvbs")]
+pub type Platform = litebox_platform_lvbs::host::LvbsLinuxKernel;
+
 static PLATFORM: once_cell::race::OnceBox<&'static Platform> = once_cell::race::OnceBox::new();
 
 /// Initialize the shim by providing a [LiteBox platform](../litebox/platform/index.html).
