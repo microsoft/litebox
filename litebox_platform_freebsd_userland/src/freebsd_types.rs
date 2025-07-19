@@ -57,3 +57,10 @@ bitflags::bitflags! {
         const _ = !0;
     }
 }
+
+/// Operations currently supported by the safer variants of the FreeBSD _umtx_op syscall
+#[repr(i32)]
+pub(crate) enum UmtxOpOperation {
+    UMTX_OP_WAIT_UINT = 11,
+    UMTX_OP_WAKE = 3,
+}

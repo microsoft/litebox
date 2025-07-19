@@ -39,7 +39,7 @@ pub(crate) mod syscalls {
     pub(crate) type Sysno = SyscallTable;
 
     /// Result type for syscalls
-    pub(crate) type SyscallResult = Result<usize, isize>;
+    pub(crate) type SyscallResult = Result<usize, crate::errno::Errno>;
 
     /// Perform a syscall with no arguments
     #[inline]
@@ -58,7 +58,7 @@ pub(crate) mod syscalls {
             );
         }
         if carry != 0 {
-            Err(ret as isize)
+            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
@@ -82,7 +82,7 @@ pub(crate) mod syscalls {
             );
         }
         if carry != 0 {
-            Err(ret as isize)
+            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
@@ -107,7 +107,7 @@ pub(crate) mod syscalls {
             );
         }
         if carry != 0 {
-            Err(ret as isize)
+            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
@@ -138,7 +138,7 @@ pub(crate) mod syscalls {
             );
         }
         if carry != 0 {
-            Err(ret as isize)
+            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
@@ -175,17 +175,13 @@ pub(crate) mod syscalls {
             );
         }
         if carry != 0 {
-            Err(ret as isize)
+            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
     }
 
     /// Perform a syscall with five arguments
-    #[expect(
-        dead_code,
-        reason = "To be comprehensive, we added all syscall interfaces for now. To be removed later on."
-    )]
     #[inline]
     pub(crate) unsafe fn syscall5(
         num: SyscallTable,
@@ -214,7 +210,7 @@ pub(crate) mod syscalls {
             );
         }
         if carry != 0 {
-            Err(ret as isize)
+            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
@@ -251,7 +247,7 @@ pub(crate) mod syscalls {
             );
         }
         if carry != 0 {
-            Err(ret as isize)
+            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
