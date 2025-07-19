@@ -40,7 +40,7 @@ jobs:
           sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh
       - uses: Swatinem/rust-cache@v2
       - run: ./.github/tools/github_actions_run_cargo fmt
-      - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features
+      - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_platform_lvbs --exclude litebox_runner_lvbs
       - run: ./.github/tools/github_actions_run_cargo build
       - run: ./.github/tools/github_actions_run_cargo nextest
       - run: |
@@ -101,6 +101,7 @@ jobs:
       - name: cargo clippy
         run: |
           .github/tools/github_actions_run_cargo clippy --lib --bins --examples --no-deps --all-features -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
+          .github/tools/github_actions_run_cargo clippy --lib --bins --examples --no-deps --all-features -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_platform_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
       - name: cargo build
         run: |
           .github/tools/github_actions_run_cargo build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
