@@ -88,7 +88,7 @@ impl SyscallContext {
 
 #[allow(clippy::similar_names)]
 #[allow(unreachable_code)]
-fn syscall_callback(sysnr: u64, ctx: *const SyscallContext) -> isize {
+fn syscall_entry(sysnr: u64, ctx: *const SyscallContext) -> isize {
     let syscall_handler: SyscallHandler = *SYSCALL_HANDLER
         .get()
         .expect("Syscall handler should be initialized");
@@ -145,7 +145,7 @@ fn syscall_callback(sysnr: u64, ctx: *const SyscallContext) -> isize {
 }
 
 #[unsafe(naked)]
-unsafe extern "C" fn syscall_callback_wrapper() {
+unsafe extern "C" fn syscall_entry_wrapper() {
     naked_asm!(
         "push rsp",
         "push r11",
@@ -161,14 +161,14 @@ unsafe extern "C" fn syscall_callback_wrapper() {
         "mov rdi, rax",
         "mov rsi, rsp",
         "and rsp, {stack_alignment}",
-        "call {syscall_callback}",
+        "call {syscall_entry}",
         "add rsp, {register_space}",
         "pop rcx",
         "pop r11",
         "pop rbp",
         "sysretq",
         stack_alignment = const STACK_ALIGNMENT,
-        syscall_callback = sym syscall_callback,
+        syscall_entry = sym syscall_entry,
         register_space = const core::mem::size_of::<SyscallContext>() - core::mem::size_of::<u64>() * NUM_REGISTERS_TO_POP,
     );
 }
@@ -188,8 +188,8 @@ pub(crate) fn init(syscall_handler: SyscallHandler) {
     efer.insert(EferFlags::SYSTEM_CALL_EXTENSIONS);
     unsafe { Efer::write(efer) };
 
-    let syscall_callback_addr = syscall_callback_wrapper as *const () as u64;
-    LStar::write(VirtAddr::new(syscall_callback_addr));
+    let syscall_entry_addr = syscall_entry_wrapper as *const () as u64;
+    LStar::write(VirtAddr::new(syscall_entry_addr));
 
     let rflags = RFlags::INTERRUPT_FLAG;
     SFMask::write(rflags);
