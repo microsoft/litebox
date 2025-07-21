@@ -4,23 +4,35 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use alloc::sync::{Arc, Weak};
-use litebox::{fs::OFlags, sync::Synchronization};
+use litebox::{LiteBox, event::Events, fs::OFlags};
 use litebox_common_linux::errno::Errno;
 use litebox_platform_multiplex::Platform;
 use ringbuf::{
     HeapCons, HeapProd, HeapRb,
-    traits::{Consumer as _, Producer as _, Split as _},
+    traits::{Consumer as _, Observer as _, Producer as _, Split as _},
 };
+
+use crate::event::Observer;
+
+/// The maximum number of bytes for atomic write.
+///
+/// See <https://man7.org/linux/man-pages/man7/pipe.7.html> for more details.
+#[cfg(not(test))]
+const PIPE_BUF: usize = 4096;
+#[cfg(test)]
+const PIPE_BUF: usize = 2;
 
 struct EndPointer<T> {
     rb: litebox::sync::Mutex<Platform, T>,
+    pollee: crate::event::Pollee,
     is_shutdown: AtomicBool,
 }
 
 impl<T> EndPointer<T> {
-    pub fn new(rb: T, platform: &'static Platform) -> Self {
+    pub fn new(rb: T, init_events: Events, litebox: &LiteBox<Platform>) -> Self {
         Self {
-            rb: Synchronization::new(platform).new_mutex(rb),
+            rb: litebox.sync().new_mutex(rb),
+            pollee: crate::event::Pollee::new(init_events),
             is_shutdown: AtomicBool::new(false),
         }
     }
@@ -52,20 +64,18 @@ macro_rules! common_functions_for_channel {
             }
         }
 
-        pub(crate) fn get_status(&self) -> OFlags {
-            OFlags::from_bits(self.status.load(core::sync::atomic::Ordering::Relaxed)).unwrap()
+        pub fn poll(&self, mask: Events, observer: Option<Weak<dyn Observer<Events>>>) -> Events {
+            self.endpoint
+                .pollee
+                .poll(mask, observer, || self.check_io_events())
         }
 
-        pub(crate) fn set_status(&self, flag: OFlags, on: bool) {
-            if on {
-                self.status
-                    .fetch_or(flag.bits(), core::sync::atomic::Ordering::Relaxed);
-            } else {
-                self.status.fetch_and(
-                    flag.complement().bits(),
-                    core::sync::atomic::Ordering::Relaxed,
-                );
-            }
+        pub(crate) fn register_observer(
+            &self,
+            observer: alloc::sync::Weak<dyn Observer<Events>>,
+            filter: Events,
+        ) {
+            self.endpoint.pollee.register_observer(observer, filter);
         }
     };
 }
@@ -78,12 +88,24 @@ pub(crate) struct Producer<T> {
 }
 
 impl<T> Producer<T> {
-    fn new(rb: HeapProd<T>, flags: OFlags, platform: &'static Platform) -> Self {
+    fn new(rb: HeapProd<T>, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
         Self {
-            endpoint: EndPointer::new(rb, platform),
+            endpoint: EndPointer::new(rb, Events::OUT, litebox),
             peer: Weak::new(),
-            status: AtomicU32::new((flags & OFlags::STATUS_FLAGS_MASK).bits()),
+            status: AtomicU32::new((flags | OFlags::WRONLY).bits()),
         }
+    }
+
+    fn check_io_events(&self) -> Events {
+        let rb = self.endpoint.rb.lock();
+        let mut events = Events::empty();
+        if self.is_peer_shutdown() {
+            events |= Events::ERR;
+        }
+        if !self.is_shutdown() && !rb.is_full() {
+            events |= Events::OUT;
+        }
+        events
     }
 
     fn try_write(&self, buf: &[T]) -> Result<usize, Errno>
@@ -97,38 +119,55 @@ impl<T> Producer<T> {
             return Ok(0);
         }
 
-        let write_len = self.endpoint.rb.lock().push_slice(buf);
+        let write_len = {
+            let mut rb = self.endpoint.rb.lock();
+            let total_size = core::mem::size_of_val(buf);
+            if rb.vacant_len() < total_size && total_size <= PIPE_BUF {
+                // No sufficient space for an atomic write
+                0
+            } else {
+                rb.push_slice(buf)
+            }
+        };
         if write_len > 0 {
+            if let Some(peer) = self.peer.upgrade() {
+                peer.endpoint.pollee.notify_observers(Events::IN);
+            }
             Ok(write_len)
         } else {
             Err(Errno::EAGAIN)
         }
     }
 
-    pub(crate) fn write(&self, buf: &[T], is_nonblocking: bool) -> Result<usize, Errno>
+    pub(crate) fn write(&self, buf: &[T]) -> Result<usize, Errno>
     where
         T: Copy,
     {
-        if is_nonblocking {
+        if self.get_status().contains(OFlags::NONBLOCK) {
             self.try_write(buf)
         } else {
-            // TODO: use poll rather than busy wait
-            loop {
-                match self.try_write(buf) {
-                    Err(Errno::EAGAIN) => {}
-                    ret => return ret,
-                }
-                core::hint::spin_loop();
-            }
+            self.endpoint.pollee.wait_or_timeout(
+                Events::OUT,
+                None,
+                || self.try_write(buf),
+                || self.check_io_events(),
+            )
         }
     }
 
     common_functions_for_channel!();
+    crate::syscalls::common_functions_for_file_status!();
 }
 
 impl<T> Drop for Producer<T> {
     fn drop(&mut self) {
         self.shutdown();
+
+        if let Some(peer) = self.peer.upgrade() {
+            // when reading from a channel such as a pipe or a stream socket, this event
+            // merely indicates that the peer closed its end of the channel.
+            peer.endpoint.pollee.notify_observers(Events::HUP);
+        }
     }
 }
 
@@ -139,12 +178,24 @@ pub(crate) struct Consumer<T> {
 }
 
 impl<T> Consumer<T> {
-    fn new(rb: HeapCons<T>, flags: OFlags, platform: &'static Platform) -> Self {
+    fn new(rb: HeapCons<T>, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
         Self {
-            endpoint: EndPointer::new(rb, platform),
+            endpoint: EndPointer::new(rb, Events::empty(), litebox),
             peer: Weak::new(),
-            status: AtomicU32::new((flags & OFlags::STATUS_FLAGS_MASK).bits()),
+            status: AtomicU32::new((flags | OFlags::RDONLY).bits()),
         }
+    }
+
+    fn check_io_events(&self) -> Events {
+        let rb = self.endpoint.rb.lock();
+        let mut events = Events::empty();
+        if self.is_peer_shutdown() {
+            events |= Events::HUP;
+        }
+        if !self.is_shutdown() && !rb.is_empty() {
+            events |= Events::IN;
+        }
+        events
     }
 
     fn try_read(&self, buf: &mut [T]) -> Result<usize, Errno>
@@ -160,6 +211,9 @@ impl<T> Consumer<T> {
 
         let read_len = self.endpoint.rb.lock().pop_slice(buf);
         if read_len > 0 {
+            if let Some(peer) = self.peer.upgrade() {
+                peer.endpoint.pollee.notify_observers(Events::OUT);
+            }
             Ok(read_len)
         } else {
             if self.is_peer_shutdown() {
@@ -171,30 +225,35 @@ impl<T> Consumer<T> {
         }
     }
 
-    pub(crate) fn read(&self, buf: &mut [T], is_nonblocking: bool) -> Result<usize, Errno>
+    pub(crate) fn read(&self, buf: &mut [T]) -> Result<usize, Errno>
     where
         T: Copy,
     {
-        if is_nonblocking {
+        if self.get_status().contains(OFlags::NONBLOCK) {
             self.try_read(buf)
         } else {
-            // TODO: use poll rather than busy wait
-            loop {
-                match self.try_read(buf) {
-                    Err(Errno::EAGAIN) => {}
-                    ret => return ret,
-                }
-                core::hint::spin_loop();
-            }
+            self.endpoint.pollee.wait_or_timeout(
+                Events::IN,
+                None,
+                || self.try_read(buf),
+                || self.check_io_events(),
+            )
         }
     }
 
     common_functions_for_channel!();
+    crate::syscalls::common_functions_for_file_status!();
 }
 
 impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
         self.shutdown();
+
+        if let Some(peer) = self.peer.upgrade() {
+            // This bit is also set for a file descriptor referring to the write end
+            // of a pipe when the read end has been closed.
+            peer.endpoint.pollee.notify_observers(Events::ERR);
+        }
     }
 }
 
@@ -207,17 +266,17 @@ pub(crate) struct Channel<T> {
 
 impl<T> Channel<T> {
     /// Creates a new channel with the given capacity and flags.
-    pub(crate) fn new(capacity: usize, flags: OFlags, platform: &'static Platform) -> Self {
+    pub(crate) fn new(capacity: usize, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
         let rb: HeapRb<T> = HeapRb::new(capacity);
         let (rb_prod, rb_cons) = rb.split();
 
         // Create the producer and consumer, and set up cyclic references.
-        let mut producer = Arc::new(Producer::new(rb_prod, flags, platform));
+        let mut producer = Arc::new(Producer::new(rb_prod, flags, litebox));
         let consumer = Arc::new_cyclic(|weak_self| {
             // Producer has no other references as it is just created.
             // So we can safely get a mutable reference to it.
             Arc::get_mut(&mut producer).unwrap().peer = weak_self.clone();
-            let mut consumer = Consumer::new(rb_cons, flags, platform);
+            let mut consumer = Consumer::new(rb_cons, flags, litebox);
             consumer.peer = Arc::downgrade(&producer);
             consumer
         });
@@ -237,31 +296,21 @@ impl<T> Channel<T> {
 
 #[cfg(test)]
 mod tests {
-    use litebox::platform::trivial_providers::ImpossiblePunchthroughProvider;
     use litebox_common_linux::errno::Errno;
-    use litebox_platform_multiplex::{Platform, set_platform};
 
     extern crate std;
 
-    fn init_platform() {
-        set_platform(Platform::new(None, ImpossiblePunchthroughProvider {}));
-    }
-
     #[test]
     fn test_blocking_channel() {
-        init_platform();
+        crate::syscalls::tests::init_platform(None);
 
-        let (prod, cons) = super::Channel::<u8>::new(
-            2,
-            litebox::fs::OFlags::empty(),
-            litebox_platform_multiplex::platform(),
-        )
-        .split();
+        let (prod, cons) =
+            super::Channel::<u8>::new(2, litebox::fs::OFlags::empty(), crate::litebox()).split();
         std::thread::spawn(move || {
             let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
             let mut i = 0;
             while i < data.len() {
-                let ret = prod.write(&data[i..], false).unwrap();
+                let ret = prod.write(&data[i..]).unwrap();
                 i += ret;
             }
             prod.shutdown();
@@ -271,7 +320,7 @@ mod tests {
         let mut buf = [0; 10];
         let mut i = 0;
         loop {
-            let ret = cons.read(&mut buf[i..], false).unwrap();
+            let ret = cons.read(&mut buf[i..]).unwrap();
             if ret == 0 {
                 cons.shutdown();
                 break;
@@ -283,19 +332,15 @@ mod tests {
 
     #[test]
     fn test_nonblocking_channel() {
-        init_platform();
+        crate::syscalls::tests::init_platform(None);
 
-        let (prod, cons) = super::Channel::<u8>::new(
-            2,
-            litebox::fs::OFlags::empty(),
-            litebox_platform_multiplex::platform(),
-        )
-        .split();
+        let (prod, cons) =
+            super::Channel::<u8>::new(2, litebox::fs::OFlags::NONBLOCK, crate::litebox()).split();
         std::thread::spawn(move || {
             let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
             let mut i = 0;
             while i < data.len() {
-                match prod.write(&data[i..], true) {
+                match prod.write(&data[i..]) {
                     Ok(n) => {
                         i += n;
                     }
@@ -315,7 +360,7 @@ mod tests {
         let mut buf = [0; 10];
         let mut i = 0;
         loop {
-            match cons.read(&mut buf[i..], true) {
+            match cons.read(&mut buf[i..]) {
                 Ok(n) => {
                     if n == 0 {
                         break;
