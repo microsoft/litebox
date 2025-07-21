@@ -23,7 +23,7 @@ jobs:
       - run: sudo apt update && sudo apt install -y musl-tools
       - name: "Ratchet: ensure number of 'transmute's in codebase is not increasing"
         run: |
-          if [ $(find . -name \*.rs -print0 | xargs -0 grep 'transmute' | wc -l) -eq 6 ]; then \
+          if [ $(find . -name \*.rs -print0 | xargs -0 grep 'transmute' | wc -l) -eq 5 ]; then \
             echo 'Ratchet maintained'; \
           else \
             echo 'Ratchet failed'; \
