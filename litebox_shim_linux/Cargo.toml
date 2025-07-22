@@ -15,7 +15,7 @@ elf = { version = "0.7.4", default-features = false }
 # https://github.com/weizhiao/rust-elfloader/ causes trouble on the latest
 # released version of elf-loader, thus we limit ourselves to the released
 # version right before it.
-elf_loader = { version = "=0.10.0", default-features = false, features = [] }
+elf_loader = { version = "=0.12.0", default-features = false, features = [] }
 thiserror = { version = "2.0.6", default-features = false }
 ringbuf = { version = "0.4.8", default-features = false, features = ["alloc"] }
 syscalls = { version = "0.6", default-features = false }
@@ -26,7 +26,7 @@ syscalls = { version = "0.6", default-features = false }
 # we need to do it as a target-specific dependency.
 #
 # NOTE: We must keep this in sync with the version above.
-elf_loader = { version = "=0.10.0", default-features = false, features = ["rel"] }
+elf_loader = { version = "=0.12.0", default-features = false, features = ["rel"] }
 
 [features]
 default = ["platform_linux_userland"]
