@@ -25,18 +25,32 @@ bitflags::bitflags! {
 /// `ALIGN` as a parameter. In the future, this may be changed to an associated constant, since each
 /// platform has only one canonical alignment.
 pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
-    /// Allocate new memory pages at given `range` with `initial_permissions`.
+    /// Allocates new memory pages at the specified `suggested_range` with the given `initial_permissions`.
     ///
-    /// `can_grow_down` specifies if the region is allowed to grow "downward" (i.e., towards zero),
-    /// upon a page fault.
+    /// # Parameters
     ///
-    /// `populate_pages_immediately` specifies if the pages should be populated immediately or lazily.
+    /// - `suggested_range`: A suggested address range for the allocation.
+    /// - `initial_permissions`: The permissions to apply to the allocated memory region.
+    /// - `can_grow_down`: If `true`, the region is allowed to grow downward (towards zero) upon
+    ///   a page fault.
+    /// - `populate_pages_immediately`: If `true`, the pages are populated immediately; otherwise,
+    ///   they are populated lazily.
+    /// - `fixed_address`: If `true`, the allocation must occur at the `suggested_range`.
+    ///
+    /// # Returns
+    ///
+    /// On success, returns a raw mutable pointer to the start of the allocated memory region.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`AllocationError`] if the allocation fails.
     fn allocate_pages(
         &self,
-        range: Range<usize>,
+        suggested_range: Range<usize>,
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
+        fixed_address: bool,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError>;
 
     /// De-allocated all pages in the given `range`.

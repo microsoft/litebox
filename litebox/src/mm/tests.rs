@@ -32,6 +32,7 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
         initial_permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages: bool,
+        fixed_address: bool,
     ) -> Result<Self::RawMutPointer<u8>, crate::platform::page_mgmt::AllocationError> {
         Ok(TransparentMutPtr {
             inner: range.start as *mut u8,
@@ -88,6 +89,7 @@ fn test_vmm_mapping() {
                 false,
             ),
             false,
+            true,
         );
     }
     // [(0x1_0000, 0x1_c000)]

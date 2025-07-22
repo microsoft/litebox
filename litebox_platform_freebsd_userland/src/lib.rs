@@ -704,12 +704,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Fr
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages: bool,
+        fixed_address: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         // Use FreeBSD's mmap flags
         let map_flags = freebsd_types::MapFlags::MAP_PRIVATE
             | freebsd_types::MapFlags::MAP_ANONYMOUS
-            | freebsd_types::MapFlags::MAP_FIXED
-            | (if can_grow_down {
+            | (if fixed_address {
+                freebsd_types::MapFlags::MAP_FIXED
+            } else {
+                freebsd_types::MapFlags::empty()
+            } | if can_grow_down {
                 freebsd_types::MapFlags::MAP_STACK
             } else {
                 freebsd_types::MapFlags::empty()

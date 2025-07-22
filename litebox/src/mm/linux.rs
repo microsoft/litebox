@@ -352,7 +352,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             let start = r.start.max(range.start);
             let end = r.end.min(range.end);
             let new_range = PageRange::new(start, end).unwrap();
-            unsafe { self.insert_mapping(new_range, vma, false) }.expect("failed to reset pages");
+            unsafe { self.insert_mapping(new_range, vma, false, true) }
+                .expect("failed to reset pages");
         }
         if unmapped_error {
             Err(VmemUnmapError::UnmapError(
@@ -382,14 +383,19 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         range: PageRange<ALIGN>,
         vma: VmArea,
         populate_pages_immediately: bool,
+        fixed_address: bool,
     ) -> Option<Platform::RawMutPointer<u8>> {
         let (start, end) = (range.start, range.end);
         if start < Self::TASK_ADDR_MIN || end > Self::TASK_ADDR_MAX {
             return None;
         }
-        for (r, _) in self.vmas.overlapping(start..end) {
-            let intersection = r.start.max(start)..r.end.min(end);
-            unsafe { self.platform.deallocate_pages(intersection) }.ok()?;
+        if !fixed_address {
+            // If the given address is not fixed, the underlying platform will find a suitable address
+            // that does not overlap with existing mappings, so we don't need to check for overlaps.
+            for (r, _) in self.vmas.overlapping(start..end) {
+                let intersection = r.start.max(start)..r.end.min(end);
+                unsafe { self.platform.deallocate_pages(intersection) }.ok()?;
+            }
         }
         let permissions: u8 = vma
             .flags
@@ -411,9 +417,12 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 MemoryRegionPermissions::from_bits(permissions).unwrap(),
                 vma.flags.contains(VmFlags::VM_GROWSDOWN),
                 populate_pages_immediately,
+                fixed_address,
             )
             .ok()?;
-        self.vmas.insert(start..end, vma);
+        let new_start = ret.as_usize();
+        let new_end = new_start + range.len();
+        self.vmas.insert(new_start..new_end, vma);
         Some(ret)
     }
 
@@ -460,6 +469,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 new_range,
                 vma,
                 flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
+                flags.contains(CreatePagesFlags::FIXED_ADDR),
             )
         }
     }
@@ -520,7 +530,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 return Err(VmemResizeError::RangeOccupied(r));
             }
             let range = PageRange::new(range.end, new_end).unwrap();
-            unsafe { self.insert_mapping(range, *cur_vma, false) };
+            unsafe { self.insert_mapping(range, *cur_vma, false, true) };
             return Ok(());
         }
 
@@ -569,8 +579,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 .remap_pages(old_range.into(), new_range.into())
         }
         .map_err(VmemMoveError::RemapError)?;
-        assert_eq!(new_addr.as_usize(), new_range.start);
-        self.vmas.insert(new_range.into(), *vma);
+
+        let new_start = new_addr.as_usize();
+        let new_end = new_start + new_size.as_usize();
+        self.vmas.insert(new_start..new_end, *vma);
         self.vmas.remove(old_range.into());
         Ok(new_addr)
     }
