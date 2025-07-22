@@ -4,6 +4,8 @@
 // from the shim `event.rs` and migrate all of those over. I also need to add/fix doc comments
 // across everything here.
 
+use thiserror::Error;
+
 use super::{
     Events,
     observer::{Observer, Subject},
@@ -16,6 +18,9 @@ use crate::{
     sync::RawSyncPrimitivesProvider,
 };
 
+/// A pollable entity that can be observed for events.
+///
+/// This supports polling, waiting (with optional timeouts), and notifications for observers.
 pub struct Pollee<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     inner: alloc::sync::Arc<PolleeInner<Platform>>,
     litebox: LiteBox<Platform>,
@@ -25,13 +30,19 @@ struct PolleeInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     subject: Subject<Events, Events, Platform>,
 }
 
+/// The result of a tried operation.
+#[derive(Error, Debug)]
 pub enum TryOpError<E> {
+    #[error("operation should be retried")]
     TryAgain,
+    #[error("operation timed out")]
     TimedOut,
+    #[error(transparent)]
     Other(E),
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
+    /// Create a new pollee.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
         let inner = alloc::sync::Arc::new(PolleeInner {
             subject: Subject::new(litebox.sync()),
@@ -42,19 +53,22 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
         }
     }
 
-    /// Poll the pollee with the given mask of events and register the poller.
+    /// Register the `observer` (if specified) and then poll for `check` with the given `mask`.
     ///
-    /// NOTE(jb): I am not sure I am happy with the design of this interface, need to fix it up
-    /// before making the PR.
-    pub fn poll<F>(
+    /// NOTE(jb): I am not sure I am happy with this function, but this is what was in the shim.
+    /// Currently, it does not seem obvious why this cannot just be inlined into places that use it.
+    /// Inlining it into all such places does cause some duplication, but more effort seems to be
+    /// needed to actually figure out a good interface here, rather than just one that removes the
+    /// duplication in the trivial way, because at least as it stands, this is _too_ specific to
+    /// seem useful.
+    ///
+    /// TODO(jb): Rename before making the PR.
+    pub fn poll(
         &self,
         mask: Events,
         observer: Option<alloc::sync::Weak<dyn Observer<Events>>>,
-        check: F,
-    ) -> Events
-    where
-        F: FnOnce() -> Events,
-    {
+        check: impl FnOnce() -> Events,
+    ) -> Events {
         let mask = mask | Events::ALWAYS_POLLED;
 
         if let Some(observer) = observer {
@@ -67,19 +81,19 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     /// Wait until `try_op` returns a non-EAGAIN result or timeout.
     /// If the `timeout` is None, it will wait indefinitely.
     ///
-    /// NOTE(jb): I am not sure I am happy with the design of this interface, need to fix it up
-    /// before making the PR.
-    pub fn wait_or_timeout<F, C, R, E>(
+    /// NOTE(jb): I am not sure I am happy with this function, but this is what was in the shim.
+    /// Currently, the semantics of the operations it does are not clear whatsoever from their
+    /// interface, and improved design seems necessary.
+    ///
+    /// TODO(jb): I think there may be a bug here because `check` is never re-run; it _is_ marked as
+    /// `FnOnce` but then again, the interface just seems not ideal, so clean-up is needed.
+    pub fn wait_or_timeout<R, E>(
         &self,
         mask: Events,
         timeout: Option<core::time::Duration>,
-        mut try_op: F,
-        check: C,
-    ) -> Result<R, TryOpError<E>>
-    where
-        F: FnMut() -> Result<R, TryOpError<E>>,
-        C: FnOnce() -> Events,
-    {
+        mut try_op: impl FnMut() -> Result<R, TryOpError<E>>,
+        check: impl FnOnce() -> Events,
+    ) -> Result<R, TryOpError<E>> {
         // Try first without waiting
         match try_op() {
             Err(TryOpError::TryAgain) => {}
@@ -112,6 +126,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
         }
     }
 
+    /// Register an observer for events that satisfy the given `filter`.
     pub fn register_observer(
         &self,
         observer: alloc::sync::Weak<dyn Observer<Events>>,
@@ -122,16 +137,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
             .register_observer(observer, filter | Events::ALWAYS_POLLED);
     }
 
+    /// Unregister an observer.
     pub fn unregister_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>) {
         self.inner.subject.unregister_observer(observer);
     }
 
+    /// Notify all registered observers with the given events.
     pub fn notify_observers(&self, events: Events) {
         self.inner.subject.notify_observers(events);
     }
 }
 
-pub struct Poller<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+struct Poller<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     condvar: Platform::RawMutex,
     litebox: LiteBox<Platform>,
 }
@@ -139,6 +156,7 @@ pub struct Poller<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 struct TimedOut;
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Poller<Platform> {
+    /// Create a new poller.
     fn new(litebox: &LiteBox<Platform>) -> Self {
         Self {
             condvar: litebox.x.platform.new_raw_mutex(),
@@ -146,12 +164,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Poller<Platform> {
         }
     }
 
+    /// Wait for the poller to be notified.
     fn wait(&self) -> bool {
         self.do_wait(None)
     }
 
     /// Wait for the poller to be notified.
-    /// If the timeout is not None, it will be updated to the remaining time after waiting.
+    ///
+    /// If the timeout is not `None`, it will be updated to the remaining time after waiting.
     fn wait_or_timeout(&self, timeout: &mut Option<core::time::Duration>) -> Result<(), TimedOut> {
         let ret = match timeout {
             Some(timeout) => {
