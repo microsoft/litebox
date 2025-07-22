@@ -10,7 +10,7 @@ use core::time::Duration;
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
-use litebox::platform::{ThreadLocalStorageProvider, UnblockedOrTimedOut};
+use litebox::platform::{UnblockedOrTimedOut};
 use litebox_common_linux::PunchthroughSyscall;
 
 extern crate alloc;
@@ -37,7 +37,6 @@ impl WindowsUserland {
             reserved_pages: Self::read_memory_maps(),
         };
 
-        platform.set_init_tls();
         Box::leak(Box::new(platform))
     }
 
@@ -59,33 +58,6 @@ impl WindowsUserland {
         // Windows doesn't have /proc, need to use Windows APIs like VirtualQuery
         // For now, return empty vector as placeholder
         alloc::vec::Vec::new()
-    }
-
-    fn get_user_info() -> litebox_common_linux::Credentials {
-        // TODO: Implement Windows user credential discovery
-        // Windows doesn't have getuid/getgid, need to use Windows APIs
-        litebox_common_linux::Credentials {
-            uid: 0,  // Placeholder
-            euid: 0, // Placeholder
-            gid: 0,  // Placeholder
-            egid: 0, // Placeholder
-        }
-    }
-
-    fn set_init_tls(&self) {
-        // TODO: Implement Windows thread ID discovery
-        // Windows doesn't have thr_self, need to use GetCurrentThreadId()
-        let tid: i32 = 0; // Placeholder
-
-        let task = alloc::boxed::Box::new(litebox_common_linux::Task {
-            tid,
-            clear_child_tid: None,
-            robust_list: None,
-            credentials: alloc::sync::Arc::new(Self::get_user_info()),
-        });
-
-        let tls = litebox_common_linux::ThreadLocalStorage::new(task);
-        self.set_thread_local_storage(tls);
     }
 }
 
@@ -380,37 +352,17 @@ impl litebox::platform::StdioProvider for WindowsUserland {
     }
 }
 
-#[global_allocator]
-static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 28, WindowsUserland> =
-    litebox::mm::allocator::SafeZoneAllocator::new();
+// TODO: currently we do not have a global allocator, will implement it by
+// finishing Windows's MemoryProvider trait.
 
 impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
-    fn alloc(layout: &std::alloc::Layout) -> Option<(usize, usize)> {
-        unimplemented!(
-            "Memory allocation is not implemented for Windows yet. layout: {:?}",
-            layout
-        );
+    fn alloc(_layout: &std::alloc::Layout) -> Option<(usize, usize)> {
+        unimplemented!();
     }
 
     unsafe fn free(_addr: usize) {
         unimplemented!("Memory deallocation is not implemented for Windows yet.");
     }
-}
-
-// TODO: Windows syscall assembly callback - needs Windows-specific implementation
-// Windows uses different calling conventions and syscall mechanisms
-/*
-core::arch::global_asm!(
-    "
-    // Windows x64 calling convention syscall callback would go here
-    // This needs to be implemented with Windows-specific assembly
-    "
-);
-*/
-
-unsafe extern "C" {
-    // TODO: Define Windows syscall callback when assembly is implemented
-    // fn syscall_callback() -> isize;
 }
 
 /// Windows syscall handler (placeholder - needs Windows implementation)
