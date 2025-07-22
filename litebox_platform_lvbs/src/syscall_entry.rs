@@ -4,6 +4,7 @@ use crate::{
     user_context::UserSpaceManagement,
 };
 use core::arch::{asm, naked_asm};
+use litebox_shim_optee::{SyscallContext, SyscallRequest};
 use x86_64::{
     VirtAddr,
     registers::{
@@ -36,13 +37,13 @@ use x86_64::{
 // Note. rsp should point to the userspace stack before calling `sysretq`
 
 // placholder for the syscall handler function type
-pub type SyscallHandler = fn() -> isize;
+pub type SyscallHandler = fn(SyscallRequest<crate::host::LvbsLinuxKernel>) -> isize;
 static SYSCALL_HANDLER: spin::Once<SyscallHandler> = spin::Once::new();
 
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct SyscallContext {
+pub struct SyscallContextRaw {
     rdi: u64, // arg0
     rsi: u64, // arg1
     rdx: u64, // arg2
@@ -56,7 +57,7 @@ pub struct SyscallContext {
     rsp: u64, // userspace stack pointer
 }
 
-impl SyscallContext {
+impl SyscallContextRaw {
     /// # Panics
     /// Panics if the index is out of bounds (greater than 7).
     pub fn arg_index(&self, index: usize) -> u64 {
@@ -84,25 +85,45 @@ impl SyscallContext {
     pub fn user_rsp(&self) -> Option<VirtAddr> {
         VirtAddr::try_new(self.rsp).ok()
     }
+
+    /// # Panics
+    /// Panics if the conversion from `u64` to `usize` fails.
+    pub fn syscall_context(&self) -> SyscallContext {
+        SyscallContext::new(&[
+            usize::try_from(self.rdi).unwrap(),
+            usize::try_from(self.rsi).unwrap(),
+            usize::try_from(self.rdx).unwrap(),
+            usize::try_from(self.r10).unwrap(),
+            usize::try_from(self.r8).unwrap(),
+            usize::try_from(self.r9).unwrap(),
+            usize::try_from(self.r12).unwrap(),
+            usize::try_from(self.r13).unwrap(),
+        ])
+    }
 }
 
 #[allow(clippy::similar_names)]
 #[allow(unreachable_code)]
-fn syscall_entry(sysnr: u64, ctx: *const SyscallContext) -> isize {
+fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> isize {
     let syscall_handler: SyscallHandler = *SYSCALL_HANDLER
         .get()
         .expect("Syscall handler should be initialized");
 
-    debug_serial_println!("sysnr = {:#x}, ctx = {:#x}", sysnr, ctx as usize);
-    let ctx = unsafe { &*ctx };
+    debug_serial_println!("sysnr = {:#x}, ctx_raw = {:#x}", sysnr, ctx_raw as usize);
+    let ctx_raw = unsafe { &*ctx_raw };
 
     assert!(
-        ctx.user_rip().is_some() && ctx.user_rsp().is_some(),
+        ctx_raw.user_rip().is_some() && ctx_raw.user_rsp().is_some(),
         "BUG: userspace RIP or RSP is invalid"
     );
 
+    let ctx = ctx_raw.syscall_context();
+
     // call the syscall handler passed down from the shim
-    let sysret = syscall_handler();
+    let sysret = syscall_handler(
+        SyscallRequest::try_from_raw(usize::try_from(sysnr).unwrap(), &ctx)
+            .expect("Failed to convert syscall request"),
+    );
 
     // TODO: We should decide whether we place this function here, OP-TEE shim, or separate it into
     // multiple functions and place them in the appropriate places.
@@ -169,7 +190,7 @@ unsafe extern "C" fn syscall_entry_wrapper() {
         "sysretq",
         stack_alignment = const STACK_ALIGNMENT,
         syscall_entry = sym syscall_entry,
-        register_space = const core::mem::size_of::<SyscallContext>() - core::mem::size_of::<u64>() * NUM_REGISTERS_TO_POP,
+        register_space = const core::mem::size_of::<SyscallContextRaw>() - core::mem::size_of::<u64>() * NUM_REGISTERS_TO_POP,
     );
 }
 const NUM_REGISTERS_TO_POP: usize = 3;
