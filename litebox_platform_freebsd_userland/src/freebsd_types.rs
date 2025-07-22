@@ -57,3 +57,28 @@ bitflags::bitflags! {
         const _ = !0;
     }
 }
+
+/// Operations currently supported by the safer variants of the FreeBSD _umtx_op syscall
+#[repr(i32)]
+pub(crate) enum UmtxOpOperation {
+    UMTX_OP_WAIT_UINT = 11,
+    UMTX_OP_WAKE = 3,
+}
+
+/// FreeBSD thread creation parameters structure.
+/// Matches the C `struct thr_param` from <sys/thr.h>
+#[repr(C)]
+#[derive(Clone, Debug)]
+pub struct ThrParam {
+    pub start_func: u64, // void (*start_func)(void *)
+    pub arg: u64,        // void *arg
+    pub stack_base: u64, // char *stack_base
+    pub stack_size: u64, // size_t stack_size
+    pub tls_base: u64,   // char *tls_base
+    pub tls_size: u64,   // size_t tls_size
+    pub child_tid: u64,  // long *child_tid
+    pub parent_tid: u64, // long *parent_tid
+    pub flags: i32,      // int flags
+    pub _pad: i32,       // padding for 8-byte alignment
+    pub rtp: u64,        // struct rtprio *rtp
+}
