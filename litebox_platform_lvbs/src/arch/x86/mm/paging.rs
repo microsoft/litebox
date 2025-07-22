@@ -9,7 +9,7 @@ use x86_64::{
             PageTableFlags, PhysFrame, Size4KiB, Translate,
             frame::PhysFrameRange,
             mapper::{
-                FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult,
+                CleanUp, FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult,
                 UnmapError as X64UnmapError,
             },
         },
@@ -321,6 +321,78 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         }
 
         Ok(M::pa_to_va(frame_range.start.start_address()).as_mut_ptr())
+    }
+
+    /// This function creates a new empty top-level page table.
+    pub(crate) unsafe fn new_top_level() -> Self {
+        let frame = PageTableAllocator::<M>::allocate_frame(true)
+            .expect("Failed to allocate a new page table frame");
+        unsafe { Self::init(frame.start_address()) }
+    }
+
+    /// This function changes the address space of the current processor/core using the given page table
+    /// (e.g., its CR3 register) and returns the physical frame of the previous top-level page table.
+    /// It preserves the CR3 flags.
+    ///
+    /// # Safety
+    /// The caller must ensure that the page table is valid and maps the entire VTL1 kernel address space.
+    /// Currently, we do not support KPTI-like kernel/user space page table separation.
+    ///
+    /// # Panics
+    /// Panics if the page table is invalid
+    #[allow(clippy::similar_names)]
+    pub(crate) fn change_address_space(&self) -> PhysFrame {
+        let p4_va = core::ptr::from_ref::<PageTable>(self.inner.lock().level_4_table());
+        let p4_pa = M::va_to_pa(VirtAddr::new(p4_va as u64));
+        let p4_frame = PhysFrame::containing_address(p4_pa);
+
+        let (frame, flags) = x86_64::registers::control::Cr3::read();
+        unsafe {
+            x86_64::registers::control::Cr3::write(p4_frame, flags);
+        }
+
+        frame
+    }
+
+    /// This function returns the physical frame containing a top-level page table.
+    /// When we handle a system call or interrupt, it is difficult to figure out the corresponding user context
+    /// because kernel and user contexts are not tightly coupled (i.e., we do not know `userspace_id`).
+    /// To this end, we use this function to match the physical frame of the page table contained in each user
+    /// context structure with the CR3 value in a system call context (before changing the page table).
+    #[allow(clippy::similar_names)]
+    pub(crate) fn get_physical_frame(&self) -> PhysFrame {
+        let p4_va = core::ptr::from_ref::<PageTable>(self.inner.lock().level_4_table());
+        let p4_pa = M::va_to_pa(VirtAddr::new(p4_va as u64));
+        PhysFrame::containing_address(p4_pa)
+    }
+
+    /// Deallocate physical frames of all level 1--3 page tables except for the top-level page table.
+    /// This is a wrapper function for `MappedPageTable::clean_up()`.
+    ///
+    /// # Safety
+    /// The caller is expected to unmap all non-page-table pages before calling this function.
+    /// Also, the caller must ensure no page table frame is shared with other page tables.
+    /// This function expects that `Drop` will deallocate the top-level page table frame. It does not
+    /// deallocate the top-level page table frame because this can result in an undefined behavior.
+    pub(crate) unsafe fn clean_up(&self) {
+        let mut allocator = PageTableAllocator::<M>::new();
+        unsafe {
+            self.inner.lock().clean_up(&mut allocator);
+        }
+    }
+}
+
+impl<M: MemoryProvider, const ALIGN: usize> Drop for X64PageTable<'_, M, ALIGN> {
+    /// Deallocate the physical frame of the top-level page table
+    #[allow(clippy::similar_names)]
+    fn drop(&mut self) {
+        let mut allocator = PageTableAllocator::<M>::new();
+        let p4_va =
+            core::ptr::from_mut::<PageTable>(self.inner.lock().level_4_table_mut()).cast::<u8>();
+        let p4_pa = M::va_to_pa(VirtAddr::new(p4_va as u64));
+        unsafe {
+            allocator.deallocate_frame(PhysFrame::containing_address(p4_pa));
+        }
     }
 }
 

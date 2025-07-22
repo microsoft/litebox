@@ -46,9 +46,6 @@ use x86_64::{
 };
 use x509_cert::{Certificate, der::Decode};
 
-/// VTL call parameters (param[0]: function ID, param[1-3]: parameters)
-pub const NUM_VTLCALL_PARAMS: usize = 4;
-
 // For now, we do not validate large kernel modules due to the VTL1's memory size limitation.
 const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
 
@@ -680,7 +677,6 @@ pub fn mshv_vsm_copy_secondary_key(_pa: u64, _nranges: u64) -> Result<i64, Errno
 /// This function protects the kexec kernel blob (PE) only if it has a valid signature.
 /// Note: this function does not make kexec kernel pages executable, which should be done by
 /// another VTL1 method that can intercept the kexec/reset signal.
-#[allow(clippy::unnecessary_wraps)]
 pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64, Errno> {
     debug_serial_println!(
         "VSM: Validate kexec pa {:#x} nranges {} crash {}",
@@ -944,33 +940,26 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), Errno> {
 }
 
 /// VSM function dispatcher
-pub fn vsm_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
-    if params[0] > u32::MAX.into() {
-        serial_println!("VSM: Unknown function ID {:#x}", params[0]);
-        return Errno::EINVAL.as_neg().into();
-    }
-
-    let result = match VsmFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
-        .unwrap_or(VsmFunction::Unknown)
-    {
-        VsmFunction::EnableAPsVtl => mshv_vsm_enable_aps(params[1]),
-        VsmFunction::BootAPs => mshv_vsm_boot_aps(params[1], params[2]),
+pub fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
+    let result = match func_id {
+        VsmFunction::EnableAPsVtl => mshv_vsm_enable_aps(params[0]),
+        VsmFunction::BootAPs => mshv_vsm_boot_aps(params[0], params[1]),
         VsmFunction::LockRegs => mshv_vsm_lock_regs(),
         VsmFunction::SignalEndOfBoot => Ok(mshv_vsm_end_of_boot()),
-        VsmFunction::ProtectMemory => mshv_vsm_protect_memory(params[1], params[2]),
-        VsmFunction::LoadKData => mshv_vsm_load_kdata(params[1], params[2]),
+        VsmFunction::ProtectMemory => mshv_vsm_protect_memory(params[0], params[1]),
+        VsmFunction::LoadKData => mshv_vsm_load_kdata(params[0], params[1]),
         VsmFunction::ValidateModule => {
-            mshv_vsm_validate_guest_module(params[1], params[2], params[3])
+            mshv_vsm_validate_guest_module(params[0], params[1], params[2])
         }
         #[allow(clippy::cast_possible_wrap)]
-        VsmFunction::FreeModuleInit => mshv_vsm_free_guest_module_init(params[1] as i64),
+        VsmFunction::FreeModuleInit => mshv_vsm_free_guest_module_init(params[0] as i64),
         #[allow(clippy::cast_possible_wrap)]
-        VsmFunction::UnloadModule => mshv_vsm_unload_guest_module(params[1] as i64),
-        VsmFunction::CopySecondaryKey => mshv_vsm_copy_secondary_key(params[1], params[2]),
-        VsmFunction::KexecValidate => mshv_vsm_kexec_validate(params[1], params[2], params[3]),
-        VsmFunction::PatchText => mshv_vsm_patch_text(params[1], params[2]),
-        VsmFunction::Unknown => {
-            serial_println!("VSM: Unknown function ID {:#x}", params[0]);
+        VsmFunction::UnloadModule => mshv_vsm_unload_guest_module(params[0] as i64),
+        VsmFunction::CopySecondaryKey => mshv_vsm_copy_secondary_key(params[0], params[1]),
+        VsmFunction::KexecValidate => mshv_vsm_kexec_validate(params[0], params[1], params[2]),
+        VsmFunction::PatchText => mshv_vsm_patch_text(params[0], params[1]),
+        _ => {
+            serial_println!("VSM: Unknown function ID {:?}", func_id);
             Err(Errno::EINVAL)
         }
     };

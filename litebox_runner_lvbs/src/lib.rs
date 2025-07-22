@@ -13,7 +13,7 @@ use litebox_platform_lvbs::{
         vtl_switch::vtl_switch_loop_entry,
         vtl1_mem_layout::{
             PAGE_SIZE, VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE, VTL1_PML4E_PAGE,
-            get_heap_start_address,
+            VTL1_PRE_POPULATED_MEMORY_SIZE, get_heap_start_address,
         },
     },
     serial_println,
@@ -49,14 +49,29 @@ pub fn init() -> Option<&'static Platform> {
                 mem_fill_size
             );
 
+            // Add remaining mapped but non-used memory pages (between `get_heap_start_address()` and
+            // `vtl1_start + VTL1_PRE_POPULATED_MEMORY_SIZE`) to the global allocator.
+            let mem_fill_start = usize::try_from(get_heap_start_address()).unwrap();
+            let mem_fill_size = VTL1_PRE_POPULATED_MEMORY_SIZE
+                - usize::try_from(get_heap_start_address() - start).unwrap();
+            unsafe {
+                Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
+            }
+            debug_serial_println!(
+                "adding a range of memory to the global allocator: start = {:#x}, size = {:#x}",
+                mem_fill_start,
+                mem_fill_size
+            );
+
             let pml4_table_addr = vtl1_start + u64::try_from(PAGE_SIZE * VTL1_PML4E_PAGE).unwrap();
             let platform = Platform::new(pml4_table_addr, vtl1_start, vtl1_end);
             ret = Some(platform);
 
             // Add the rest of the VTL1 memory to the global allocator once they are mapped to the kernel page table.
-            let mem_fill_start = usize::try_from(get_heap_start_address()).unwrap();
+            let mem_fill_start = mem_fill_start + mem_fill_size;
             let mem_fill_size = usize::try_from(
-                size - (get_heap_start_address() - Platform::pa_to_va(vtl1_start).as_u64()),
+                size - (u64::try_from(mem_fill_start).unwrap()
+                    - Platform::pa_to_va(vtl1_start).as_u64()),
             )
             .unwrap();
             unsafe {

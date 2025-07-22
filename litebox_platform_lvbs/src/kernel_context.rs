@@ -19,14 +19,14 @@ pub const KERNEL_STACK_SIZE: usize = 10 * PAGE_SIZE;
 #[repr(align(4096))]
 #[derive(Clone, Copy)]
 pub struct KernelContext {
-    pub hv_vp_assist_page: [u8; PAGE_SIZE],
-    pub hv_simp_page: [u8; PAGE_SIZE],
-    pub interrupt_stack: [u8; INTERRUPT_STACK_SIZE],
+    hv_vp_assist_page: [u8; PAGE_SIZE],
+    hv_simp_page: [u8; PAGE_SIZE],
+    interrupt_stack: [u8; INTERRUPT_STACK_SIZE],
     _guard_page_0: [u8; PAGE_SIZE],
-    pub kernel_stack: [u8; KERNEL_STACK_SIZE],
+    kernel_stack: [u8; KERNEL_STACK_SIZE],
     _guard_page_1: [u8; PAGE_SIZE],
-    pub hvcall_input: [u8; PAGE_SIZE],
-    pub hvcall_output: [u8; PAGE_SIZE],
+    hvcall_input: [u8; PAGE_SIZE],
+    hvcall_output: [u8; PAGE_SIZE],
     pub tss: gdt::AlignedTss,
     pub vtl0_state: VtlState,
     pub vtl1_state: VtlState,
@@ -39,44 +39,46 @@ impl KernelContext {
         &raw const self.kernel_stack as u64 + (self.kernel_stack.len() - 1) as u64
     }
 
-    pub fn interrupt_stack_top(&self) -> u64 {
+    pub(crate) fn interrupt_stack_top(&self) -> u64 {
         &raw const self.interrupt_stack as u64 + (self.interrupt_stack.len() - 1) as u64
     }
 
-    pub fn hv_vp_assist_page_as_ptr(&self) -> *const HvVpAssistPage {
+    pub(crate) fn hv_vp_assist_page_as_ptr(&self) -> *const HvVpAssistPage {
         (&raw const self.hv_vp_assist_page).cast::<HvVpAssistPage>()
     }
 
-    pub fn hv_vp_assist_page_as_mut_ptr(&mut self) -> *mut HvVpAssistPage {
-        (&raw mut self.hv_vp_assist_page).cast::<HvVpAssistPage>()
-    }
-
-    pub fn hv_vp_assist_page_as_u64(&self) -> u64 {
+    pub(crate) fn hv_vp_assist_page_as_u64(&self) -> u64 {
         &raw const self.hv_vp_assist_page as u64
     }
 
-    pub fn hv_simp_page_as_mut_ptr(&mut self) -> *mut HvMessagePage {
+    pub(crate) fn hv_simp_page_as_mut_ptr(&mut self) -> *mut HvMessagePage {
         (&raw mut self.hv_simp_page).cast::<HvMessagePage>()
     }
 
-    pub fn hv_simp_page_as_u64(&self) -> u64 {
+    pub(crate) fn hv_simp_page_as_u64(&self) -> u64 {
         &raw const self.hv_simp_page as u64
     }
 
-    pub fn hv_hypercall_page_as_u64(&self) -> u64 {
+    #[allow(clippy::unused_self)]
+    pub(crate) fn hv_hypercall_page_as_u64(&self) -> u64 {
         get_hypercall_page_address()
     }
 
-    pub fn hv_hypercall_input_page_as_mut_ptr(&mut self) -> *mut [u8; PAGE_SIZE] {
+    pub(crate) fn hv_hypercall_input_page_as_mut_ptr(&mut self) -> *mut [u8; PAGE_SIZE] {
         &raw mut self.hvcall_input
     }
 
-    pub fn hv_hypercall_output_page_as_mut_ptr(&mut self) -> *mut [u8; PAGE_SIZE] {
+    pub(crate) fn hv_hypercall_output_page_as_mut_ptr(&mut self) -> *mut [u8; PAGE_SIZE] {
         &raw mut self.hvcall_output
     }
 
-    pub fn set_vtl_return_value(&mut self, value: u64) {
+    pub(crate) fn set_vtl_return_value(&mut self, value: u64) {
         self.vtl0_state.r8 = value; // LVBS uses R8 to return a value from VTL1 to VTL0
+    }
+
+    /// Return kernel code, user code, and user data segment selectors
+    pub(crate) fn get_segment_selectors(&self) -> Option<(u16, u16, u16)> {
+        self.gdt.map(gdt::GdtWrapper::get_segment_selectors)
     }
 }
 
