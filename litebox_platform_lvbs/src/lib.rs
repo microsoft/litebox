@@ -599,7 +599,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
-        /* ignored because the suggested address is always used */
+        /* ignored because the suggested address is guaranteed to be available when running in kernel mode */
         _fixed_address: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let range = PageRange::new(suggested_range.start, suggested_range.end)
