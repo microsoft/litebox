@@ -97,13 +97,10 @@ pub fn init_platform(
 }
 
 /// Compile C code into an executable
-pub fn compile(input: &str, output: &str, exec_or_lib: bool, nolibc: bool) {
+pub fn compile(input: &str, output: &str, exec_or_lib: bool) {
     let mut args = vec!["-o", output, input];
     if exec_or_lib {
         args.push("-static");
-    }
-    if nolibc {
-        args.push("-nostdlib");
     }
     args.push(match std::env::consts::ARCH {
         "x86_64" => "-m64",

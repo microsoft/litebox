@@ -1,12 +1,3 @@
-const HELLO_WORLD_C: &str = r#"
-#include <stdio.h>
-
-int main() {
-    printf("Hello, World!\n");
-    return 0;
-}
-"#;
-
 /// Compile C code into an executable
 fn compile(input: &str, output: &str, exec_or_lib: bool) {
     let mut args = vec!["-o", output, input];
@@ -42,11 +33,8 @@ fn test_runner_with_dynamic_lib(backend: Backend) {
         Backend::Seccomp => "seccomp",
     };
     let dir_path = std::env::var("OUT_DIR").unwrap();
-    let src_path =
-        std::path::Path::new(dir_path.as_str()).join(format!("hello_exec_{backend_str}.c"));
-    std::fs::write(src_path.clone(), HELLO_WORLD_C).unwrap();
     let path = std::path::Path::new(dir_path.as_str()).join(format!("hello_dylib_{backend_str}"));
-    compile(src_path.to_str().unwrap(), path.to_str().unwrap(), false);
+    compile("./tests/hello.c", path.to_str().unwrap(), false);
     let path = match backend {
         Backend::Seccomp => path,
         Backend::Rewriter => {
