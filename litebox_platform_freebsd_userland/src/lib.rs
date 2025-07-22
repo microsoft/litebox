@@ -217,14 +217,65 @@ impl litebox::platform::ExitProvider for FreeBSDUserland {
     }
 }
 
+/// The arguments passed to the thread start function.
+struct ThreadStartArgs {
+    pt_regs: Box<litebox_common_linux::PtRegs>,
+    thread_args: Box<litebox_common_linux::NewThreadArgs<FreeBSDUserland>>,
+    entry_point: usize,
+}
+
+/// Thread start trampoline function for FreeBSD.
+/// This is called by FreeBSD's thr_new and it unpacks the thread arguments.
+extern "C" fn thread_start(arg: *mut ThreadStartArgs) {
+    // SAFETY: The arg pointer is guaranteed to be valid and point to a ThreadStartArgs
+    // that was created via Box::into_raw in spawn_thread.
+    let thread_start_args = unsafe { Box::from_raw(arg) };
+
+    // Store the pt_regs onto the stack (for restoration later)
+    let pt_regs_stack = *(thread_start_args.pt_regs);
+
+    // Reset TLS for the new thread
+    unsafe {
+        litebox_common_linux::wrgsbase(0);
+    }
+
+    // Set up thread-local storage for the new thread. This is done by
+    // calling the actual thread callback with the unpacked arguments
+    (thread_start_args.thread_args.callback)(*(thread_start_args.thread_args));
+
+    // Restore the context
+    unsafe {
+        core::arch::asm!(
+            "mov rbx, {0}",
+            "xor rax, rax",
+            "mov rsp, {1}",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rcx",      // skip pt_regs.rax
+            "pop rcx",
+            "pop rdx",
+            "pop rsi",
+            "pop rdi",
+            "add rsp, 24",  // skip orig_rax, rip, cs, eflags
+            "popfq",
+            "pop rsp",      // restore the stack pointer (which points to the entry point of the thread)
+            "jmp rbx",
+            in(reg) thread_start_args.entry_point,
+            in(reg) &raw const pt_regs_stack.r11, // restore registers, starting from r11
+            out("rax") _,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
 impl litebox::platform::ThreadProvider for FreeBSDUserland {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadArgs = litebox_common_linux::NewThreadArgs<FreeBSDUserland>;
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
     type ThreadId = usize;
 
-    #[expect(unused_variables)]
-    #[expect(unused_mut)]
     unsafe fn spawn_thread(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -233,14 +284,77 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
         entry_point: usize,
         mut thread_args: Box<Self::ThreadArgs>,
     ) -> Result<usize, Self::ThreadSpawnError> {
-        unimplemented!("spawn_thread is not implemented for FreeBSD yet.");
+        let child_tid_ptr = core::ptr::from_mut(thread_args.task.as_mut()) as u64
+            + core::mem::offset_of!(litebox_common_linux::Task<FreeBSDUserland>, tid) as u64;
+
+        let mut copied_pt_regs = Box::new(*ctx);
+
+        // Reset the child stack pointer to the top of the allocated thread stack.
+        copied_pt_regs.rsp = stack.as_usize() + stack_size - 0x8;
+
+        let thread_args = thread_args;
+
+        let thread_start_args = ThreadStartArgs {
+            pt_regs: copied_pt_regs,
+            thread_args: thread_args,
+            entry_point: entry_point,
+        };
+
+        // We should always use heap to pass the parameter to `thr_new`. This is to avoid using the parents'
+        // stack, which may be freed (race-condition) before the child thread starts.
+        let thread_start_arg_ptr = Box::into_raw(Box::new(thread_start_args));
+
+        let thr_param = freebsd_types::ThrParam {
+            start_func: thread_start as usize as u64, // the child will enter `thread_start`
+            arg: thread_start_arg_ptr as u64,         // thread start arguments
+            stack_base: stack.as_usize() as u64,
+            stack_size: stack_size as u64,
+            tls_base: 0, // set by our callback
+            tls_size: 0, // no need to specify it
+            child_tid: child_tid_ptr,
+            parent_tid: 0,
+            flags: 0,
+            _pad: 0,
+            rtp: 0, // we do not use real-time priority for now
+        };
+
+        // The parent will resume execution after this syscall `thr_new`.
+        let result = unsafe {
+            syscalls::syscall2(
+                syscalls::Sysno::ThrNew,
+                &raw const thr_param as usize,
+                size_of::<freebsd_types::ThrParam>(),
+            )
+        };
+
+        match result {
+            Ok(_) => {
+                // FreeBSD `thr_new` returns 0 (to the parent) on success. The actual thread ID will
+                // be written to child_tid_ptr by the kernel. We need to read it from the structure.
+                Ok(unsafe { *(child_tid_ptr as *const i32) as usize })
+            }
+            Err(errno) => Err(match errno {
+                crate::errno::Errno::EACCES => litebox_common_linux::errno::Errno::EACCES,
+                crate::errno::Errno::EAGAIN => litebox_common_linux::errno::Errno::EAGAIN,
+                crate::errno::Errno::EBUSY => litebox_common_linux::errno::Errno::EBUSY,
+                crate::errno::Errno::EEXIST => litebox_common_linux::errno::Errno::EEXIST,
+                crate::errno::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
+                crate::errno::Errno::ENOMEM => litebox_common_linux::errno::Errno::ENOMEM,
+                crate::errno::Errno::ENOSPC => litebox_common_linux::errno::Errno::ENOSPC,
+                crate::errno::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
+                _ => panic!("Unexpected error from thr_new: {}", errno),
+            }),
+        }
     }
 
-    fn terminate_thread(&self, code: Self::ExitCode) -> ! {
-        unimplemented!(
-            "terminate_thread is not implemented for FreeBSD yet. code: {}",
-            code
-        );
+    fn terminate_thread(&self, _code: Self::ExitCode) -> ! {
+        // Use thr_exit to terminate the current thread
+        unsafe {
+            syscalls::syscall1(syscalls::Sysno::ThrExit, core::ptr::null::<()>() as usize)
+                .expect("thr_exit should not fail");
+        }
+        // This should never be reached as thr_exit does not return
+        unreachable!("thr_exit should not return")
     }
 }
 
@@ -451,6 +565,20 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
         >,
     > {
         match self.punchthrough {
+            PunchthroughSyscall::SetFsBase { addr } => {
+                unsafe { litebox_common_linux::wrfsbase(addr) };
+                Ok(0)
+            }
+            PunchthroughSyscall::GetFsBase { addr } => {
+                use litebox::platform::RawMutPointer as _;
+                let fs_base = unsafe { litebox_common_linux::rdfsbase() };
+                unsafe { addr.write_at_offset(0, fs_base) }.ok_or(
+                    litebox::platform::PunchthroughError::Failure(
+                        litebox_common_linux::errno::Errno::EFAULT,
+                    ),
+                )?;
+                Ok(0)
+            }
             PunchthroughSyscall::WakeByAddress { addr } => unsafe {
                 syscalls::syscall5(
                     syscalls::Sysno::UmtxOp,
