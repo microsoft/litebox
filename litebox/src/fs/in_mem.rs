@@ -13,8 +13,16 @@ use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError,
     PathError, ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError, WriteError,
 };
-use super::{FileStatus, Mode, SeekWhence};
+use super::{FileStatus, Mode, NodeInfo, SeekWhence, UserInfo};
 use crate::utilities::anymap::AnyMap;
+
+/// Just a random constant that is distinct from other file systems. In this case, it is
+/// `b'IMem'.hex()`.
+const DEVICE_ID: usize = 0x494d656d;
+
+/// Block size for file system I/O operations
+// TODO(jayb): Determine appropriate block size
+const BLOCK_SIZE: usize = 0;
 
 /// A backing implementation for [`FileSystem`](super::FileSystem) storing all files in-memory.
 ///
@@ -30,6 +38,8 @@ pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
     current_user: UserInfo,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
+    // a source of freshness for providing unique IDs
+    unique_id_freshness: core::sync::atomic::AtomicUsize,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
@@ -51,6 +61,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
                 group: 1000,
             },
             current_working_dir: "/".into(),
+            unique_id_freshness: 1.into(), // the root dir gets unique ID of 0
         }
     }
 
@@ -62,11 +73,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     where
         F: FnOnce(&mut Self),
     {
-        const ROOT: UserInfo = UserInfo { user: 0, group: 0 };
-        let original_user = core::mem::replace(&mut self.current_user, ROOT);
+        let original_user = core::mem::replace(&mut self.current_user, UserInfo::ROOT);
         f(self);
         let root_again = core::mem::replace(&mut self.current_user, original_user);
-        if root_again.user != ROOT.user || root_again.group != ROOT.group {
+        if root_again.user != UserInfo::ROOT.user || root_again.group != UserInfo::ROOT.group {
             unreachable!()
         }
     }
@@ -84,6 +94,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         if test_user_again.user != test_user.user || test_user_again.group != test_user.group {
             unreachable!()
         }
+    }
+
+    /// (Private) Provide a fresh unique ID
+    fn fresh_id(&self) -> usize {
+        let res = self
+            .unique_id_freshness
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        assert_ne!(
+            res,
+            usize::MAX,
+            "we never expect to hit this, but if we do, someone has made way too many files in this session"
+        );
+        res
     }
 }
 
@@ -145,6 +168,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     },
                     data: Vec::new(),
                     metadata: AnyMap::new(),
+                    unique_id: self.fresh_id(),
                 })));
                 let old = root.entries.insert(path, entry.clone());
                 assert!(old.is_none());
@@ -424,6 +448,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 },
                 children_count: 0,
                 metadata: AnyMap::new(),
+                unique_id: self.fresh_id(),
             }))),
         );
         assert!(old.is_none());
@@ -465,48 +490,73 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
-        let (file_type, perms, size) = match entry {
+        let (file_type, perms, size, unique_id) = match entry {
             Entry::File(file) => {
                 let file = file.read();
                 (
                     super::FileType::RegularFile,
                     file.perms.clone(),
                     file.data.len(),
+                    file.unique_id,
                 )
             }
-            Entry::Dir(dir) => (
-                super::FileType::Directory,
-                dir.read().perms.clone(),
-                super::DEFAULT_DIRECTORY_SIZE,
-            ),
+            Entry::Dir(dir) => {
+                let dir = dir.read();
+                (
+                    super::FileType::Directory,
+                    dir.perms.clone(),
+                    super::DEFAULT_DIRECTORY_SIZE,
+                    dir.unique_id,
+                )
+            }
         };
         Ok(FileStatus {
             file_type,
             mode: perms.mode,
             size,
+            owner: perms.userinfo,
+            node_info: NodeInfo {
+                dev: DEVICE_ID,
+                ino: unique_id,
+                rdev: None,
+            },
+            blksize: BLOCK_SIZE,
         })
     }
 
     fn fd_file_status(&self, fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
-        let (file_type, perms, size) = match &self.litebox.descriptor_table().get_entry(fd).entry {
-            Descriptor::File { file, .. } => {
-                let file = file.read();
-                (
-                    super::FileType::RegularFile,
-                    file.perms.clone(),
-                    file.data.len(),
-                )
-            }
-            Descriptor::Dir { dir, .. } => (
-                super::FileType::Directory,
-                dir.read().perms.clone(),
-                super::DEFAULT_DIRECTORY_SIZE,
-            ),
-        };
+        let (file_type, perms, size, unique_id) =
+            match &self.litebox.descriptor_table().get_entry(fd).entry {
+                Descriptor::File { file, .. } => {
+                    let file = file.read();
+                    (
+                        super::FileType::RegularFile,
+                        file.perms.clone(),
+                        file.data.len(),
+                        file.unique_id,
+                    )
+                }
+                Descriptor::Dir { dir, .. } => {
+                    let dir = dir.read();
+                    (
+                        super::FileType::Directory,
+                        dir.perms.clone(),
+                        super::DEFAULT_DIRECTORY_SIZE,
+                        dir.unique_id,
+                    )
+                }
+            };
         Ok(FileStatus {
             file_type,
             mode: perms.mode,
             size,
+            owner: perms.userinfo,
+            node_info: NodeInfo {
+                dev: DEVICE_ID,
+                ino: unique_id,
+                rdev: None,
+            },
+            blksize: BLOCK_SIZE,
         })
     }
 
@@ -611,6 +661,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
                     },
                     children_count: 0,
                     metadata: AnyMap::new(),
+                    unique_id: 0,
                 }))),
             )]
             .into_iter()
@@ -689,6 +740,7 @@ pub(crate) struct DirX {
     perms: Permissions,
     children_count: u32,
     metadata: AnyMap,
+    unique_id: usize,
 }
 
 type File<Platform> = Arc<sync::RwLock<Platform, FileX>>;
@@ -697,18 +749,13 @@ pub(crate) struct FileX {
     perms: Permissions,
     data: Vec<u8>,
     metadata: AnyMap,
+    unique_id: usize,
 }
 
 #[derive(Clone, Debug)]
 struct Permissions {
     mode: Mode,
     userinfo: UserInfo,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct UserInfo {
-    user: u16,
-    group: u16,
 }
 
 impl UserInfo {

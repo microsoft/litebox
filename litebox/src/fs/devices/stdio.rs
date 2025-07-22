@@ -5,7 +5,7 @@ use alloc::string::String;
 use crate::{
     LiteBox,
     fs::{
-        FileStatus, FileType, Mode, OFlags, SeekWhence,
+        FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
         errors::{
             ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
             ReadError, RmdirError, SeekError, UnlinkError, WriteError,
@@ -13,6 +13,22 @@ use crate::{
     },
     path::Arg,
     platform::{StdioOutStream, StdioReadError, StdioStream, StdioWriteError},
+};
+
+/// Block size for stdio devices
+const STDIO_BLOCK_SIZE: usize = 1024;
+
+/// Constant node information for all 3 stdio devices:
+/// ```console
+/// $ stat -L --format 'name=%-11n dev=%d ino=%i rdev=%r' /dev/stdin /dev/stdout /dev/stderr
+/// name=/dev/stdin  dev=64 ino=9 rdev=34822
+/// name=/dev/stdout dev=64 ino=9 rdev=34822
+/// name=/dev/stderr dev=64 ino=9 rdev=34822
+/// ```
+const STDIO_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 64,
+    ino: 9,
+    rdev: core::num::NonZeroUsize::new(34822),
 };
 
 /// A backing implementation for [`FileSystem`](super::super::FileSystem).
@@ -209,6 +225,9 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
                 file_type: FileType::CharacterDevice,
                 mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
                 size: 0,
+                owner: UserInfo::ROOT,
+                node_info: STDIO_NODE_INFO,
+                blksize: STDIO_BLOCK_SIZE,
             })
         } else {
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
@@ -220,6 +239,9 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
             file_type: FileType::CharacterDevice,
             mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
             size: 0,
+            owner: UserInfo::ROOT,
+            node_info: STDIO_NODE_INFO,
+            blksize: STDIO_BLOCK_SIZE,
         })
     }
 

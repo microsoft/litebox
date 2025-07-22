@@ -6,6 +6,7 @@ use crate::path;
 use bitflags::bitflags;
 
 use core::ffi::c_uint;
+use core::num::NonZeroUsize;
 
 pub mod devices;
 pub mod errors;
@@ -48,8 +49,10 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         flags: OFlags,
         mode: Mode,
     ) -> Result<TypedFd<Self>, OpenError>;
+
     /// Close the file at `fd`
     fn close(&self, fd: TypedFd<Self>) -> Result<(), CloseError>;
+
     /// Read from a file descriptor at `offset` into a buffer
     ///
     /// If `offset` is None, the read will start at the current file offset and update the file offset
@@ -61,6 +64,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, ReadError>;
+
     /// Write from a buffer to a file descriptor at `offset`
     ///
     /// If `offset` is None, the write will start at the current file offset and update the file offset
@@ -72,6 +76,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, WriteError>;
+
     /// Reposition read/write file offset, by changing it to `offset` relative to `whence`.
     ///
     /// Returns the resulting offset (in bytes from start of file) on success.
@@ -81,8 +86,10 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         offset: isize,
         whence: SeekWhence,
     ) -> Result<usize, SeekError>;
+
     /// Change the permissions of a file
     fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
+
     /// Change the owner of a file
     fn chown(
         &self,
@@ -90,16 +97,22 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError>;
+
     /// Unlink a file
     fn unlink(&self, path: impl path::Arg) -> Result<(), UnlinkError>;
+
     /// Create a new directory
     fn mkdir(&self, path: impl path::Arg, mode: Mode) -> Result<(), MkdirError>;
+
     /// Remove a directory
     fn rmdir(&self, path: impl path::Arg) -> Result<(), RmdirError>;
+
     /// Obtain the status of a file/directory/... on the file-system.
     fn file_status(&self, path: impl path::Arg) -> Result<FileStatus, FileStatusError>;
+
     /// Equivalent to [`Self::file_status`], but open an open `fd` instead.
     fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<FileStatus, FileStatusError>;
+
     /// Apply `f` on metadata at an fd, if it exists.
     ///
     /// This returns the most-specific metadata available for the file descriptor---specifically, if
@@ -111,12 +124,14 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         fd: &TypedFd<Self>,
         f: impl FnOnce(&T) -> R,
     ) -> Result<R, MetadataError>;
+
     /// Similar to [`Self::with_metadata`] but mutable.
     fn with_metadata_mut<T: core::any::Any, R>(
         &self,
         fd: &TypedFd<Self>,
         f: impl FnOnce(&mut T) -> R,
     ) -> Result<R, MetadataError>;
+
     /// Store arbitrary metadata into a file.
     ///
     /// Such metadata is visible to any open file descriptor on the file associated with the file
@@ -129,6 +144,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         fd: &TypedFd<Self>,
         metadata: T,
     ) -> Result<Option<T>, SetMetadataError<T>>;
+
     /// Store arbitrary metdata into a file descriptor.
     ///
     /// Such metadata is specific to the current file descriptor and is NOT shared with other open
@@ -287,6 +303,37 @@ pub struct FileStatus {
     pub mode: Mode,
     /// Size of the file, in bytes. This value considered informative if this is a regular file.
     pub size: usize,
+    /// Owner of the file
+    pub owner: UserInfo,
+    /// Information about this particular node
+    pub node_info: NodeInfo,
+    /// Block size for file system I/O
+    pub blksize: usize,
+}
+
+/// User information
+#[derive(Clone, Copy, Debug)]
+pub struct UserInfo {
+    /// User ID for the owner
+    pub user: u16,
+    /// Group ID for the owner
+    pub group: u16,
+}
+
+/// Device/Inode information
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+pub struct NodeInfo {
+    /// Device number
+    pub dev: usize,
+    /// Inode number
+    pub ino: usize,
+    /// Device that is being referred to (will be `Some(...)` only if special file)
+    pub rdev: Option<NonZeroUsize>,
+}
+
+impl UserInfo {
+    /// The root user
+    pub const ROOT: Self = Self { user: 0, group: 0 };
 }
 
 /// The size reported as the size of a directory.
