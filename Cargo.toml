@@ -29,7 +29,9 @@ default-members = [
     "litebox_shim_linux",
     "litebox_syscall_rewriter"
 ]
-# exclude `litebox_runner_lvbs` from default-members because it requires a nightly toolchain.
+# We exclude `litebox_runner_lvbs` from `default-members` because its interrupt handling
+# depends on the unstable `abi_x86_interrupt` feature, which requires a nightly toolchain.
+# Once this feature stabilizes, we can add `litebox_runner_lvbs` to `default-members`.
 
 # Introduce all the pedantic clippy lints and remove ones I (jayb) think are
 # pushing it too far; this way we get something even further than default clippy

@@ -34,7 +34,7 @@ cfg_if::cfg_if! {
         pub type Platform = litebox_platform_lvbs::host::LvbsLinuxKernel;
     } else {
         compile_error!(
-            r##"Too many platforms specified. Are you sure you have marked 'default-features = false'?"##
+            r##"Hint: you might have forgotten to mark 'default-features = false'."##
         );
     }
 }
