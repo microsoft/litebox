@@ -380,18 +380,22 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// to unmap all overlapping mappings if any).
     pub(super) unsafe fn insert_mapping(
         &mut self,
-        range: PageRange<ALIGN>,
+        suggested_range: PageRange<ALIGN>,
         vma: VmArea,
         populate_pages_immediately: bool,
         fixed_address: bool,
     ) -> Option<Platform::RawMutPointer<u8>> {
-        let (start, end) = (range.start, range.end);
+        let (start, end) = (suggested_range.start, suggested_range.end);
         if start < Self::TASK_ADDR_MIN || end > Self::TASK_ADDR_MAX {
             return None;
         }
-        if !fixed_address {
-            // If the given address is not fixed, the underlying platform will find a suitable address
-            // that does not overlap with existing mappings, so we don't need to check for overlaps.
+        if fixed_address {
+            // If the given address is fixed (i.e., must use), we need to remove any existing mappings that overlap
+            // with the given range.
+            // If the given address is not fixed (i.e., just a hint for allocation), either the chosen address is
+            // guaranteed to be available (when running in kernel mode) or the following call `platform.allocate_pages`
+            // will check it and choose an available address (when running in user mode).
+            // Note we don't need to update `vmas` here as `insert` at the end will take care of the overlaps for us.
             for (r, _) in self.vmas.overlapping(start..end) {
                 let intersection = r.start.max(start)..r.end.min(end);
                 unsafe { self.platform.deallocate_pages(intersection) }.ok()?;
@@ -413,7 +417,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let ret = self
             .platform
             .allocate_pages(
-                range.into(),
+                suggested_range.into(),
                 MemoryRegionPermissions::from_bits(permissions).unwrap(),
                 vma.flags.contains(VmFlags::VM_GROWSDOWN),
                 populate_pages_immediately,
@@ -421,7 +425,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             )
             .ok()?;
         let new_start = ret.as_usize();
-        let new_end = new_start + range.len();
+        let new_end = new_start + suggested_range.len();
         self.vmas.insert(new_start..new_end, vma);
         Some(ret)
     }
