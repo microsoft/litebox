@@ -88,6 +88,7 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
+      - run: sudo apt update && sudo apt install -y musl-tools
       - name: Set up Rust
         run: |
           RUST_CHANNEL=$(awk -F'"' '/channel/{print $2}' litebox_runner_lvbs/rust-toolchain.toml)
@@ -95,6 +96,7 @@ jobs:
           rustup component add rust-src --toolchain ${RUST_CHANNEL}-x86_64-unknown-linux-gnu
           rustup default ${RUST_CHANNEL}
           rustup override set ${RUST_CHANNEL}
+          rustup target add x86_64-unknown-linux-musl
           rustup show
       - name: Set up Nextest
         run: |
