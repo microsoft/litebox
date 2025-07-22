@@ -609,8 +609,8 @@ impl litebox::platform::RawMutex for RawMutex {
             &self.inner,
             FutexOperation::Wake,
             /* number to wake up */ n,
-            0,
-            None,
+            /* val2: ignored */ 0,
+            /* uaddr2: ignored */ None,
             /* val3: ignored */ 0,
         )
         .expect("failed to wake up waiters")

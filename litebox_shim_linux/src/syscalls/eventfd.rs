@@ -162,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn test_blocking_eventfd_race_conditions() {
+    fn test_blocking_eventfd_no_race_on_massive_readwrite() {
         crate::syscalls::tests::init_platform(None);
 
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
