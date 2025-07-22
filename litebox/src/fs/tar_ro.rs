@@ -29,12 +29,25 @@ use tar_no_std::TarArchive;
 use crate::{LiteBox, path::Arg as _, sync, utilities::anymap::AnyMap};
 
 use super::{
-    Mode, OFlags, SeekWhence,
+    Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     errors::{
         ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadError,
         RmdirError, SeekError, UnlinkError, WriteError,
     },
 };
+
+/// Just a random constant that is distinct from other file systems. In this case, it is
+/// `b'Taro'.hex()`.
+const DEVICE_ID: usize = 0x5461726f;
+
+/// TODO(jayb): Replace this proper auto-incrementing inode number storage (although that will
+/// require migrating to the hashmap based tar entry storage). This is ok for now, until something
+/// is actually checking for real inode numbers.
+const TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER: usize = 0xFACE;
+
+/// Block size for file system I/O operations
+// TODO(jayb): Determine appropriate block size
+const BLOCK_SIZE: usize = 0;
 
 /// A backing implementation for [`FileSystem`](super::FileSystem), storing all files in-memory, via
 /// a read-only `.tar` file.
@@ -313,11 +326,25 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 file_type: super::FileType::Directory,
                 mode: DEFAULT_DIR_MODE,
                 size: super::DEFAULT_DIRECTORY_SIZE,
+                owner: owner_from_posix_header(p.posix_header()),
+                node_info: NodeInfo {
+                    dev: DEVICE_ID,
+                    ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                    rdev: None,
+                },
+                blksize: BLOCK_SIZE,
             }),
             Some(p) => Ok(super::FileStatus {
                 file_type: super::FileType::RegularFile,
                 mode: mode_of_modeflags(p.posix_header().mode.to_flags().unwrap()),
                 size: p.size(),
+                owner: owner_from_posix_header(p.posix_header()),
+                node_info: NodeInfo {
+                    dev: DEVICE_ID,
+                    ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                    rdev: None,
+                },
+                blksize: BLOCK_SIZE,
             }),
         }
     }
@@ -333,12 +360,26 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     file_type: super::FileType::RegularFile,
                     mode: mode_of_modeflags(entry.posix_header().mode.to_flags().unwrap()),
                     size: entry.size(),
+                    owner: owner_from_posix_header(entry.posix_header()),
+                    node_info: NodeInfo {
+                        dev: DEVICE_ID,
+                        ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                        rdev: None,
+                    },
+                    blksize: BLOCK_SIZE,
                 })
             }
             Descriptor::Dir { .. } => Ok(super::FileStatus {
                 file_type: super::FileType::Directory,
                 mode: DEFAULT_DIR_MODE,
                 size: super::DEFAULT_DIRECTORY_SIZE,
+                owner: DEFAULT_DIRECTORY_OWNER,
+                node_info: NodeInfo {
+                    dev: DEVICE_ID,
+                    ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                    rdev: None,
+                },
+                blksize: BLOCK_SIZE,
             }),
         }
     }
@@ -385,6 +426,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 const DEFAULT_DIR_MODE: Mode =
     Mode::from_bits(Mode::RWXU.bits() | Mode::RWXG.bits() | Mode::RWXO.bits()).unwrap();
 
+const DEFAULT_DIRECTORY_OWNER: UserInfo = UserInfo {
+    user: 1000,
+    group: 1000,
+};
+
 fn mode_of_modeflags(perms: tar_no_std::ModeFlags) -> Mode {
     use tar_no_std::ModeFlags;
     let mut mode = Mode::empty();
@@ -398,6 +444,13 @@ fn mode_of_modeflags(perms: tar_no_std::ModeFlags) -> Mode {
     mode.set(Mode::WOTH, perms.contains(ModeFlags::OthersWrite));
     mode.set(Mode::XOTH, perms.contains(ModeFlags::OthersExec));
     mode
+}
+
+fn owner_from_posix_header(posix_header: &tar_no_std::PosixHeader) -> UserInfo {
+    UserInfo {
+        user: posix_header.uid.as_number().unwrap(),
+        group: posix_header.gid.as_number().unwrap(),
+    }
 }
 
 enum Descriptor {
