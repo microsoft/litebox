@@ -80,8 +80,8 @@ jobs:
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
 
-  build_and_test_nightly:
-    name: Build and Test LVBS (nightly)
+  build_and_test_lvbs:
+    name: Build and Test LVBS
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
