@@ -520,7 +520,6 @@ impl litebox::platform::RawMutexProvider for LinuxUserland {
     fn new_raw_mutex(&self) -> Self::RawMutex {
         RawMutex {
             inner: AtomicU32::new(0),
-            num_to_wake_up: AtomicU32::new(0),
         }
     }
 }
@@ -531,17 +530,6 @@ impl litebox::platform::RawMutexProvider for LinuxUserland {
 pub struct RawMutex {
     // The `inner` is the value shown to the outside world as an underlying atomic.
     inner: AtomicU32,
-    // The `num_to_wake_up` is the actually what the futexes rely upon, and is a bit-field.
-    //
-    // The uppermost two bits (1<<31, and 1<<30) act as a "lock bit" for the waker (we use two of
-    // them to make it easier to catch accidental integer wrapping bugs more easily, at the cost of
-    // supporting "only" 1-billion waiters being woken up at once), preventing multiple wakers from
-    // running at the same time.
-    //
-    // The lower 30 bits indicate how many waiters the waker wants to wake up. The waiters
-    // themselves will decrement this number as they wake up, but should make sure not to overflow
-    // (this is why we use two bits for the lock bit---to catch implementation bugs of this kind).
-    num_to_wake_up: AtomicU32,
 }
 
 impl RawMutex {
@@ -557,7 +545,6 @@ impl RawMutex {
         }
 
         // Track some initial information.
-        let mut first_time = true;
         let start = std::time::Instant::now();
 
         // We'll be looping unless we find a good reason to exit out of the loop, either due to a
@@ -578,27 +565,23 @@ impl RawMutex {
             // We wait on the futex, with a timeout if needed; the timeout is based on how much time
             // remains to be elapsed.
             match futex_timeout(
-                &self.num_to_wake_up,
+                &self.inner,
                 FutexOperation::Wait,
-                /* expected value */ 0,
+                /* expected value */ val,
                 remaining_time,
                 /* ignored */ None,
                 /* ignored */ 0,
             ) {
                 Ok(0) => {
-                    // Fallthrough: check if spurious.
+                    if self.inner.load(SeqCst) != val {
+                        return Ok(UnblockedOrTimedOut::Unblocked);
+                    }
                 }
                 Err(syscalls::Errno::EAGAIN) => {
-                    // A wake-up was already in progress when we attempted to wait. Has someone
-                    // already touched inner value? We only check this on the first time around,
-                    // anything else could be a true wake.
-                    if first_time && self.inner.load(SeqCst) != val {
+                    if self.inner.load(SeqCst) != val {
                         // Ah, we seem to have actually been immediately woken up! Let us not
                         // miss this.
                         return Err(ImmediatelyWokenUp);
-                    } else {
-                        // Fallthrough: check if spurious. A wake-up was already in progress
-                        // when we attempted to wait, so we can do a proper check.
                     }
                 }
                 Err(syscalls::Errno::ETIMEDOUT) => {
@@ -608,32 +591,6 @@ impl RawMutex {
                     panic!("Unexpected errno={e} for FUTEX_WAIT")
                 }
                 _ => unreachable!(),
-            }
-
-            // We have either been woken up, or this is spurious. Let us check if we were
-            // actually woken up.
-            match self.num_to_wake_up.fetch_update(SeqCst, SeqCst, |n| {
-                if n & (1 << 31) == 0 {
-                    // No waker in play, do nothing to the value
-                    None
-                } else if n & ((1 << 30) - 1) > 0 {
-                    // There is a waker, and there is still capacity to wake up
-                    Some(n - 1)
-                } else {
-                    // There is a waker, but capacity is gone
-                    None
-                }
-            }) {
-                Ok(_) => {
-                    // We marked ourselves as having woken up, we can exit, marking
-                    // ourselves as no longer waiting.
-                    break Ok(UnblockedOrTimedOut::Unblocked);
-                }
-                Err(_) => {
-                    // We have not yet been asked to wake up, this is spurious. Spin that
-                    // loop again.
-                    first_time = false;
-                }
             }
         }
     }
@@ -648,71 +605,15 @@ impl litebox::platform::RawMutex for RawMutex {
         assert!(n > 0);
         let n: u32 = n.try_into().unwrap();
 
-        // We restrict ourselves to a max of ~1 billion waiters being woken up at once, which should
-        // be good enough, but makes sure we are not clobbering the "lock bits".
-        let n = n.min((1 << 30) - 1);
-
-        // We first requeue all the waiters into a temporary queue, so that anyone else showing up
-        // to block is not going to be impacted.
-        let temp_q = AtomicU32::new(0);
-        match futex_val2(
-            &self.num_to_wake_up,
-            FutexOperation::Requeue,
-            /* number to wake up */ 0,
-            /* number to requeue */ i32::MAX as u32,
-            Some(&temp_q),
-            /* val3: ignored */ 0,
-        ) {
-            Ok(_) => {
-                // On success, returns the number of tasks requeued or woken, which we ignore
-            }
-            _ => unreachable!(),
-        }
-
-        // Then, we set the number of waiters we want allowed to know that they can wake up, while
-        // also grabbing the "lock bit"s.
-        while self
-            .num_to_wake_up
-            .compare_exchange(0, n | (0b11 << 30), SeqCst, SeqCst)
-            .is_err()
-        {
-            // If someone else is _also_ attempting to wake waiters up, then we should just spin
-            // until the other waker is done with their job and brings the value down.
-            core::hint::spin_loop();
-        }
-
-        // Now we can actually wake them up; if anyone is left unwoken though, we should move them
-        // back into the main queue.
-        let num_woken_or_requeued = futex_val2(
-            &temp_q,
-            FutexOperation::Requeue,
+        futex_val2(
+            &self.inner,
+            FutexOperation::Wake,
             /* number to wake up */ n,
-            /* number to requeue */ i32::MAX as u32,
-            Some(&self.num_to_wake_up),
+            /* val2: ignored */ 0,
+            /* uaddr2: ignored */ None,
             /* val3: ignored */ 0,
         )
-        .unwrap();
-        let num_woken_up = core::cmp::min(n, u32::try_from(num_woken_or_requeued).unwrap());
-
-        // Unlock the lock bits, allowing other wakers to run.
-        let remain = n - num_woken_up;
-        while let Err(v) = self.num_to_wake_up.fetch_update(SeqCst, SeqCst, |v| {
-            // Due to spurious or immediate wake-ups (i.e., unexpected wakeups that may decrease `num_to_wake_up`),
-            // `num_to_wake_up` might end up being less than expected. Thus, we check `<=` rather than `==`.
-            if v & ((1 << 30) - 1) <= remain {
-                Some(0)
-            } else {
-                None
-            }
-        }) {
-            // Confirm that no one has clobbered the lock bits (which would indicate an implementation
-            // failure somewhere).
-            debug_assert_eq!(v >> 30, 0b11, "lock bits should remain unclobbered");
-            core::hint::spin_loop();
-        }
-
-        // Return the number that were actually woken up
-        num_woken_up.try_into().unwrap()
+        .expect("failed to wake up waiters")
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
@@ -981,7 +882,6 @@ impl litebox::platform::RawPointerProvider for LinuxUserland {
 #[repr(i32)]
 enum FutexOperation {
     Wait = litebox_common_linux::FUTEX_WAIT,
-    Requeue = litebox_common_linux::FUTEX_REQUEUE,
     Wake = litebox_common_linux::FUTEX_WAKE,
 }
 
@@ -1626,12 +1526,14 @@ mod tests {
     fn test_raw_mutex() {
         let mutex = std::sync::Arc::new(super::RawMutex {
             inner: AtomicU32::new(0),
-            num_to_wake_up: AtomicU32::new(0),
         });
 
         let copied_mutex = mutex.clone();
         std::thread::spawn(move || {
             sleep(core::time::Duration::from_millis(500));
+            copied_mutex
+                .inner
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             copied_mutex.wake_many(10);
         });
 
