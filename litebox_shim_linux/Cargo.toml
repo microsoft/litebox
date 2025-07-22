@@ -32,6 +32,7 @@ elf_loader = { version = "=0.12.0", default-features = false, features = ["rel"]
 default = ["platform_linux_userland"]
 platform_freebsd_userland = ["litebox_platform_multiplex/platform_freebsd_userland"]
 platform_linux_userland = ["litebox_platform_multiplex/platform_linux_userland"]
+platform_windows_userland = ["litebox_platform_multiplex/platform_windows_userland"]
 
 [dev-dependencies]
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
