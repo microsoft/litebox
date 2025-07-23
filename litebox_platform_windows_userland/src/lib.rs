@@ -8,9 +8,9 @@ use core::sync::atomic::AtomicU32;
 use core::time::Duration;
 
 use litebox::platform::ImmediatelyWokenUp;
+use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
-use litebox::platform::{UnblockedOrTimedOut};
 use litebox_common_linux::PunchthroughSyscall;
 
 extern crate alloc;

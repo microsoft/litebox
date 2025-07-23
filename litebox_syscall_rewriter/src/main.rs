@@ -20,14 +20,19 @@ struct CliArgs {
     trampoline_addr: Option<usize>,
 }
 
-fn copy_file_permissions(input_file: &std::fs::File, output_file: &std::fs::File) -> anyhow::Result<()> {
-    #[cfg(unix)] {
+fn copy_file_permissions(
+    input_file: &std::fs::File,
+    output_file: &std::fs::File,
+) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
         output_file.set_permissions(std::fs::Permissions::from_mode(
             input_file.metadata()?.mode(),
         ))?;
     }
-    #[cfg(windows)] {
-        let input_metadata = input_file.metadata()?;    
+    #[cfg(windows)]
+    {
+        let input_metadata = input_file.metadata()?;
         let perms = input_metadata.permissions();
         output_file.set_permissions(perms)?;
     }
