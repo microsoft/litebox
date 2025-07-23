@@ -162,6 +162,28 @@ mod tests {
     }
 
     #[test]
+    fn test_blocking_eventfd_no_race_on_massive_readwrite() {
+        crate::syscalls::tests::init_platform(None);
+
+        let eventfd = alloc::sync::Arc::new(super::EventFile::new(
+            0,
+            EfdFlags::empty(),
+            crate::litebox(),
+        ));
+        let copied_eventfd = eventfd.clone();
+        std::thread::spawn(move || {
+            for _ in 0..10000 {
+                copied_eventfd.write(u64::MAX - 1).unwrap();
+            }
+        });
+
+        for _ in 0..10000 {
+            let ret = eventfd.read().unwrap();
+            assert_eq!(ret, u64::MAX - 1);
+        }
+    }
+
+    #[test]
     fn test_nonblocking_eventfd() {
         crate::syscalls::tests::init_platform(None);
 
