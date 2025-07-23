@@ -38,6 +38,8 @@ pub type Platform = litebox_platform_freebsd_userland::FreeBSDUserland;
 pub type Platform = litebox_platform_windows_userland::WindowsUserland;
 
 static PLATFORM: once_cell::race::OnceBox<&'static Platform> = once_cell::race::OnceBox::new();
+static BOOT_TIME: once_cell::race::OnceBox<<Platform as litebox::platform::TimeProvider>::Instant> =
+    once_cell::race::OnceBox::new();
 
 /// Initialize the shim by providing a [LiteBox platform](../litebox/platform/index.html).
 ///
@@ -52,6 +54,11 @@ static PLATFORM: once_cell::race::OnceBox<&'static Platform> = once_cell::race::
     reason = "the platform itself is not Debug thus we cannot use `expect`"
 )]
 pub fn set_platform(platform: &'static Platform) {
+    use litebox::platform::TimeProvider as _;
+    match BOOT_TIME.set(alloc::boxed::Box::new(platform.now())) {
+        Ok(()) => {}
+        Err(_) => panic!("set_platform should only be called once per crate"),
+    }
     match PLATFORM.set(alloc::boxed::Box::new(platform)) {
         Ok(()) => {}
         Err(_) => panic!("set_platform should only be called once per crate"),
@@ -65,6 +72,17 @@ pub fn set_platform(platform: &'static Platform) {
 /// Panics if [`set_platform`] has not been invoked before this
 pub fn platform() -> &'static Platform {
     PLATFORM
+        .get()
+        .expect("set_platform should have already been called before this point")
+}
+
+/// Get the `Instant` representing the boot time of the platform.
+///
+/// # Panics
+///
+/// Panics if [`set_platform`] has not been invoked before this
+pub fn boot_time() -> &'static <Platform as litebox::platform::TimeProvider>::Instant {
+    BOOT_TIME
         .get()
         .expect("set_platform should have already been called before this point")
 }

@@ -664,6 +664,12 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
         SyscallRequest::Getgid => Ok(syscalls::process::sys_getgid()),
         SyscallRequest::Geteuid => Ok(syscalls::process::sys_geteuid()),
         SyscallRequest::Getegid => Ok(syscalls::process::sys_getegid()),
+        SyscallRequest::Sysinfo { buf } => {
+            let sysinfo = syscalls::misc::sys_sysinfo();
+            unsafe { buf.write_at_offset(0, sysinfo) }
+                .ok_or(Errno::EFAULT)
+                .map(|()| 0)
+        }
         _ => {
             todo!()
         }
