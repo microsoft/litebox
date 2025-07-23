@@ -107,14 +107,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
             return Err(TryOpError::TimedOut);
         }
 
-        let mut remaining_time = timeout;
+        let start_time = self.litebox.x.platform.now();
         let poller = Arc::new(Poller::new(&self.litebox));
         self.register_observer(Arc::downgrade(&poller) as _, Events::all());
 
         loop {
             if !check() {
+                let remaining_time = timeout.map(|t| {
+                    t.saturating_sub(self.litebox.x.platform.now().duration_since(&start_time))
+                });
                 poller
-                    .wait_or_timeout(&mut remaining_time)
+                    .wait_or_timeout(remaining_time)
                     .map_err(|TimedOut| TryOpError::TimedOut)?;
             }
             // We always run `try_op` whether `check` returns true or false; we simply delay running
@@ -144,68 +147,47 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     }
 }
 
-struct Poller<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+/// Private observer, used solely to help implement `Pollee::wait_or_timeout`
+struct Poller<Platform: RawSyncPrimitivesProvider> {
     condvar: Platform::RawMutex,
-    litebox: LiteBox<Platform>,
 }
 
+/// A trivial zero-sized error returned by `Poller::wait_or_timeout`
 struct TimedOut;
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Poller<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> Poller<Platform> {
     /// Create a new poller.
     fn new(litebox: &LiteBox<Platform>) -> Self {
         Self {
             condvar: litebox.x.platform.new_raw_mutex(),
-            litebox: litebox.clone(),
         }
-    }
-
-    /// Wait for the poller to be notified.
-    fn wait(&self) -> bool {
-        self.do_wait(None)
     }
 
     /// Wait for the poller to be notified.
     ///
     /// If the timeout is not `None`, it will be updated to the remaining time after waiting.
-    fn wait_or_timeout(&self, timeout: &mut Option<core::time::Duration>) -> Result<(), TimedOut> {
-        let ret = match timeout {
-            Some(timeout) => {
-                if timeout.is_zero() {
-                    return Err(TimedOut);
-                }
-
-                let start_time = self.litebox.x.platform.now();
-                let res = self.do_wait(Some(*timeout));
-                *timeout = timeout
-                    .checked_sub(start_time.duration_since(&self.litebox.x.platform.now()))
-                    .unwrap_or_default();
-                res
-            }
-            None => self.wait(),
-        };
-        if ret { Ok(()) } else { Err(TimedOut) }
-    }
-
-    fn do_wait(&self, timeout: Option<core::time::Duration>) -> bool {
+    fn wait_or_timeout(&self, timeout: Option<core::time::Duration>) -> Result<(), TimedOut> {
+        if timeout.is_some_and(|t| t.is_zero()) {
+            return Err(TimedOut);
+        }
         let futex = self.condvar.underlying_atomic();
         if futex.swap(0, core::sync::atomic::Ordering::Relaxed) == 0 {
             if let Some(timeout) = timeout {
                 match self.condvar.block_or_timeout(0, timeout) {
-                    Ok(UnblockedOrTimedOut::TimedOut) => false,
-                    Ok(UnblockedOrTimedOut::Unblocked) | Err(ImmediatelyWokenUp) => true,
+                    Ok(UnblockedOrTimedOut::TimedOut) => Err(TimedOut),
+                    Ok(UnblockedOrTimedOut::Unblocked) | Err(ImmediatelyWokenUp) => Ok(()),
                 }
             } else {
                 let _ = self.condvar.block(0);
-                true
+                Ok(())
             }
         } else {
-            true
+            Ok(())
         }
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Observer<Events> for Poller<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> Observer<Events> for Poller<Platform> {
     fn on_events(&self, _events: &Events) {
         self.condvar
             .underlying_atomic()
