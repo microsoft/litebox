@@ -54,7 +54,7 @@ static BOOT_TIME: once_cell::race::OnceBox<<Platform as litebox::platform::TimeP
 ///
 /// # Panics
 ///
-/// Panics if [`litebox`] has not been invoked before this
+/// Panics if [`litebox()`] has not been invoked before this
 pub(crate) fn boot_time() -> &'static <Platform as litebox::platform::TimeProvider>::Instant {
     BOOT_TIME
         .get()
