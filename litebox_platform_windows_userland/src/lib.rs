@@ -13,10 +13,12 @@ use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox_common_linux::PunchthroughSyscall;
+use litebox::platform::ThreadLocalStorageProvider;
 
 use windows_sys::Win32::{
+    Foundation::{GetLastError, WIN32_ERROR},
     System::Memory::{self as Win32_Memory, VirtualAlloc2},
-    System::Threading::GetCurrentProcess,
+    System::Threading::{self as Win32_Threading, TlsAlloc, TlsFree, TlsGetValue, TlsSetValue, GetCurrentProcess},
 };
 
 extern crate alloc;
@@ -27,6 +29,30 @@ pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<WindowsUserlan
 /// The syscall handler passed down from the shim.
 static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
 
+struct TlsSlot {
+    dwtlsindex: u32,
+}
+
+impl TlsSlot {
+    fn new() -> Result<Self, u32> {
+        let tls_index = unsafe { TlsAlloc() };
+        if tls_index == Win32_Threading::TLS_OUT_OF_INDEXES {
+            Err(unsafe { GetLastError() })
+        } else {
+            Ok(Self { dwtlsindex: tls_index })
+        }
+    }
+}
+
+impl Drop for TlsSlot {
+    fn drop(&mut self) {
+        // Free the TLS index when the slot is dropped
+        unsafe {
+            TlsFree(self.dwtlsindex);
+        }
+    }
+}
+
 /// The userland Windows platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
@@ -34,6 +60,7 @@ static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::R
 pub struct WindowsUserland {
     /// Reserved pages that are not available for guest programs to use.
     reserved_pages: Vec<core::ops::Range<usize>>,
+    tls_slot: TlsSlot,
 }
 
 impl WindowsUserland {
@@ -41,8 +68,14 @@ impl WindowsUserland {
     pub fn new() -> &'static Self {
         let platform = Self {
             reserved_pages: Self::read_memory_maps(),
+            tls_slot: unsafe {
+                match TlsSlot::new() {
+                    Ok(slot) => slot,
+                    Err(_) => panic!("Failed to create TLS slot: {}", GetLastError()),
+                }
+            },
         };
-
+        platform.set_init_tls();
         Box::leak(Box::new(platform))
     }
 
@@ -65,6 +98,26 @@ impl WindowsUserland {
         // For now, return empty vector as placeholder
         alloc::vec::Vec::new()
     }
+
+    fn set_init_tls(&self) {
+        let tid = 1;
+        let creds = litebox_common_linux::Credentials { 
+            uid: 0, 
+            gid: 0, 
+            euid: 0, 
+            egid: 0 
+        };
+        let task = alloc::boxed::Box::new(
+            litebox_common_linux::Task::<WindowsUserland> {
+                tid: tid,
+                clear_child_tid: None,
+                robust_list: None,
+                credentials: alloc::sync::Arc::new(creds),
+            }
+        );
+        let tls = litebox_common_linux::ThreadLocalStorage::new(task);
+        self.set_thread_local_storage(tls);
+    }
 }
 
 impl litebox::platform::Provider for WindowsUserland {}
@@ -75,7 +128,7 @@ impl litebox::platform::ExitProvider for WindowsUserland {
     const EXIT_FAILURE: Self::ExitCode = 1;
 
     fn exit(&self, code: Self::ExitCode) -> ! {
-        let Self { reserved_pages: _ } = self;
+        let Self { reserved_pages: _ , tls_slot: _ } = self;
 
         // TODO: Implement Windows process exit
         // For now, use standard process exit
@@ -450,27 +503,88 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
     }
 }
 
+impl WindowsUserland {
+    fn get_thread_local_storage(&self) -> *mut litebox_common_linux::ThreadLocalStorage<WindowsUserland> {
+        let tls_ptr = unsafe {
+            TlsGetValue(self.tls_slot.dwtlsindex)
+        };
+        if tls_ptr.is_null() {
+            return core::ptr::null_mut();
+        }
+        tls_ptr as *mut litebox_common_linux::ThreadLocalStorage<WindowsUserland>
+    }
+}
+
 /// Windows thread-local storage implementation (placeholder)
 /// Windows uses different TLS mechanisms than Unix systems
-#[expect(unused)]
 impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
     type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<WindowsUserland>;
 
     fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
-        unimplemented!("Windows TLS setting not implemented yet");
+        let mut tls = Box::new(tls);
+        let tls_ptr = Box::into_raw(tls) as *const core::ffi::c_void;
+        let succ = unsafe {
+            TlsSetValue(self.tls_slot.dwtlsindex, tls_ptr)
+        };
+
+        if succ == 0 {
+            panic!("Failed to set TLS value: {}", unsafe { GetLastError() });
+        }
     }
 
     fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
-        unimplemented!("Windows TLS release not implemented yet");
+        let tls = self.get_thread_local_storage();
+        assert!(!tls.is_null(), "TLS must be set before releasing it");
+        // reset the TLS slot
+        unsafe {
+            TlsSetValue(self.tls_slot.dwtlsindex, core::ptr::null_mut());
+        }
+        let tls = unsafe {Box::from_raw(tls)};
+        assert!(!tls.borrowed, "TLS must not be borrowed when releasing it");
+        *tls
     }
 
     fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
     {
-        unimplemented!("Windows TLS access not implemented yet");
+        let tls = self.get_thread_local_storage();
+        assert!(!tls.is_null(), "TLS must be set before accessing it");
+        let tls = unsafe { &mut *tls };
+        assert!(!tls.borrowed, "TLS must not be borrowed when accessing it");
+        tls.borrowed = true;
+        let ret = f(tls);
+        tls.borrowed = false;
+        ret
     }
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use crate::WindowsUserland;
+    use litebox::platform::{RawMutex, ThreadLocalStorageProvider as _};
+
+    #[test]
+    fn test_tls() {
+        let platform = WindowsUserland::new();
+        let tls = platform.get_thread_local_storage();
+        assert!(!tls.is_null(), "TLS should not be null");
+        let tid = unsafe { (*tls).current_task.tid };
+
+        platform.with_thread_local_storage_mut(|tls| {
+            assert_eq!(
+                tls.current_task.tid, tid,
+                "TLS should have the correct task ID"
+            );
+            tls.current_task.tid = 0x1234; // Change the task ID
+        });
+        let tls = platform.release_thread_local_storage();
+        assert_eq!(
+            tls.current_task.tid, 0x1234,
+            "TLS should have the correct task ID"
+        );
+
+        let tls = platform.get_thread_local_storage();
+        assert!(tls.is_null(), "TLS should be null after releasing it");
+    }
+}
