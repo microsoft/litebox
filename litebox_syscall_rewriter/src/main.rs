@@ -3,8 +3,8 @@
 use clap::Parser;
 use std::io::Read as _;
 use std::io::Write as _;
-use std::os::unix::fs::MetadataExt as _;
-use std::os::unix::fs::PermissionsExt as _;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 
 /// Rewrite ELF files to hook syscalls
@@ -18,6 +18,20 @@ struct CliArgs {
     /// Absolute address to set in the trampoline (default = 0)
     #[arg(long)]
     trampoline_addr: Option<usize>,
+}
+
+fn copy_file_permissions(input_file: &std::fs::File, output_file: &std::fs::File) -> anyhow::Result<()> {
+    #[cfg(unix)] {
+        output_file.set_permissions(std::fs::Permissions::from_mode(
+            input_file.metadata()?.mode(),
+        ))?;
+    }
+    #[cfg(windows)] {
+        let input_metadata = input_file.metadata()?;    
+        let perms = input_metadata.permissions();
+        output_file.set_permissions(perms)?;
+    }
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -41,9 +55,7 @@ fn main() -> anyhow::Result<()> {
         )
     });
     let mut file = std::fs::File::create(output_path)?;
-    file.set_permissions(std::fs::Permissions::from_mode(
-        input_binary.metadata()?.mode(),
-    ))?;
+    copy_file_permissions(&input_binary, &file)?;
     file.write_all(&output_binary)?;
     Ok(())
 }
