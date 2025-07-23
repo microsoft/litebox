@@ -4,8 +4,15 @@
 
 extern crate alloc;
 
+// TODO(jayb) Replace out all uses of once_cell and such with our own implementation that uses
+// platform-specific things within it.
+use once_cell::race::OnceBox;
+
 use alloc::vec;
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox::{
+    LiteBox,
+    platform::{RawConstPointer as _, RawMutPointer as _},
+};
 use litebox_common_linux::errno::Errno;
 use litebox_platform_multiplex::Platform;
 use num_enum::TryFromPrimitive;
@@ -14,6 +21,14 @@ use syscalls::syscall_nr::TeeSyscallNr;
 pub(crate) mod syscalls;
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
+
+/// Get the global litebox object
+pub fn litebox<'a>() -> &'a LiteBox<Platform> {
+    static LITEBOX: OnceBox<LiteBox<Platform>> = OnceBox::new();
+    LITEBOX.get_or_init(|| {
+        alloc::boxed::Box::new(LiteBox::new(litebox_platform_multiplex::platform()))
+    })
+}
 
 /// Handle OP-TEE syscalls
 ///
@@ -461,9 +476,14 @@ bitflags::bitflags! {
 }
 
 // from `optee_os/lib/libutee/include/tee_api_defines.h`
-// TODO: add more algorithms as needed (IMO we should not provide DES-like algorithms)
+// TODO: add more algorithms as needed. IMO we should not provide weak algorithms like
+// DES and MD5. Also, KMPP doesn't use this crypto API (it uses its own SymCrypt).
 const TEE_ALG_AES_CTR: u32 = 0x1000_0210;
 const TEE_ALG_AES_GCM: u32 = 0x4000_0810;
+const TEE_ALG_RSASSA_PKCS1_V1_5_SHA256: u32 = 0x7000_4830;
+const TEE_ALG_RSASSA_PKCS1_V1_5_SHA512: u32 = 0x7000_6830;
+const TEE_ALG_HMAC_SHA256: u32 = 0x3000_0004;
+const TEE_ALG_HMAC_SHA512: u32 = 0x3000_0006;
 const TEE_ALG_ILLEGAL_VALUE: u32 = 0xefff_ffff;
 
 #[non_exhaustive]
@@ -472,6 +492,10 @@ const TEE_ALG_ILLEGAL_VALUE: u32 = 0xefff_ffff;
 pub enum TeeAlgorithm {
     AesCtr = TEE_ALG_AES_CTR,
     AesGcm = TEE_ALG_AES_GCM,
+    RsaPkcs1Sha256 = TEE_ALG_RSASSA_PKCS1_V1_5_SHA256,
+    RsaPkcs1Sha512 = TEE_ALG_RSASSA_PKCS1_V1_5_SHA512,
+    HmacSha256 = TEE_ALG_HMAC_SHA256,
+    HmacSha512 = TEE_ALG_HMAC_SHA512,
     IllegalValue = TEE_ALG_ILLEGAL_VALUE,
 }
 

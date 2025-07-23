@@ -117,6 +117,15 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> isize {
         "BUG: userspace RIP or RSP is invalid"
     );
 
+    // save user context
+    crate::platform_low()
+        .save_user_context(
+            ctx_raw.user_rip().unwrap(),
+            ctx_raw.user_rsp().unwrap(),
+            ctx_raw.user_rflags(),
+        )
+        .expect("Failed to save user context");
+
     let ctx = ctx_raw.syscall_context();
 
     // call the syscall handler passed down from the shim
@@ -139,15 +148,6 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> isize {
     if sysret == 0 {
         return sysret;
     }
-
-    // save user context before switching to VTL0
-    crate::platform_low()
-        .save_user_context(
-            ctx_raw.user_rip().unwrap(),
-            ctx_raw.user_rsp().unwrap(),
-            ctx_raw.user_rflags(),
-        )
-        .expect("Failed to save user context");
 
     let kernel_context = get_per_core_kernel_context();
     kernel_context.set_vtl_return_value(0);
