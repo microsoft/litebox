@@ -28,14 +28,14 @@ impl crate::platform::RawPointerProvider for DummyVmemBackend {
 impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
     fn allocate_pages(
         &self,
-        range: Range<usize>,
+        suggested_range: Range<usize>,
         initial_permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
         can_grow_down: bool,
-        populate_pages: bool,
+        populate_pages_immediately: bool,
         fixed_address: bool,
     ) -> Result<Self::RawMutPointer<u8>, crate::platform::page_mgmt::AllocationError> {
         Ok(TransparentMutPtr {
-            inner: range.start as *mut u8,
+            inner: suggested_range.start as *mut u8,
         })
     }
 
