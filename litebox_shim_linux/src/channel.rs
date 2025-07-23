@@ -37,8 +37,7 @@ struct EndPointer<T> {
 }
 
 impl<T> EndPointer<T> {
-    pub fn new(rb: T, init_events: Events, litebox: &LiteBox<Platform>) -> Self {
-        let _ = init_events; // TODO: The `init_events` were being ignored before, what are we actually supposed to do with them?
+    pub fn new(rb: T, litebox: &LiteBox<Platform>) -> Self {
         Self {
             rb: litebox.sync().new_mutex(rb),
             pollee: Pollee::new(crate::litebox()),
@@ -85,7 +84,7 @@ pub(crate) struct Producer<T> {
 impl<T> Producer<T> {
     fn new(rb: HeapProd<T>, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
         Self {
-            endpoint: EndPointer::new(rb, Events::OUT, litebox),
+            endpoint: EndPointer::new(rb, litebox),
             peer: Weak::new(),
             status: AtomicU32::new((flags | OFlags::WRONLY).bits()),
         }
@@ -198,7 +197,7 @@ impl<T> IOPollable for Consumer<T> {
 impl<T> Consumer<T> {
     fn new(rb: HeapCons<T>, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
         Self {
-            endpoint: EndPointer::new(rb, Events::empty(), litebox),
+            endpoint: EndPointer::new(rb, litebox),
             peer: Weak::new(),
             status: AtomicU32::new((flags | OFlags::RDONLY).bits()),
         }
