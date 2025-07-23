@@ -4,7 +4,7 @@ use crate::{
     user_context::UserSpaceManagement,
 };
 use core::arch::{asm, naked_asm};
-use litebox_shim_optee::{SyscallContext, SyscallRequest};
+use litebox_common_optee::{SyscallContext, SyscallRequest};
 use x86_64::{
     VirtAddr,
     registers::{

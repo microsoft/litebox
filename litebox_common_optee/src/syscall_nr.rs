@@ -57,6 +57,13 @@ pub const SYSCALL_STORAGE_OBJ_SEEK: u32 = 53;
 pub const SYSCALL_OBJ_GENERATE_KEY: u32 = 54;
 pub const SYSCALL_CACHE_OPERATION: u32 = 70;
 
+/// OP-TEE TEE syscall numbers.
+/// OP-TEE provides two types of syscalls: TEE syscalls and LDELF syscalls.
+/// This works like when OP-TEE runs LDELF (a TA ELF loader in the user space)
+/// with a processor core, it loads the LDELF syscall handler into the core's
+/// MSR instead of the TEE syscall handler. TEE syscalls and LDELF syscalls
+/// share certain system call numbers so their handlers should be separated.
+/// Since LiteBox has its own ELF loader, we do not consider LDELF syscalls here.
 #[derive(Debug, PartialEq, TryFromPrimitive)]
 #[repr(u32)]
 pub enum TeeSyscallNr {
