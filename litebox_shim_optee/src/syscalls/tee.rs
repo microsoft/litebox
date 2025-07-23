@@ -2,7 +2,7 @@ use litebox_common_linux::errno::Errno;
 
 // placeholder
 #[allow(clippy::unnecessary_wraps)]
-pub fn sys_return(_ret: usize) -> ! {
+pub fn sys_return(_ret_value: usize) -> ! {
     todo!("switch to VTL0");
 }
 

@@ -8,6 +8,7 @@ use alloc::vec;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox_common_linux::errno::Errno;
 use litebox_platform_multiplex::Platform;
+use num_enum::TryFromPrimitive;
 use syscalls::syscall_nr::TeeSyscallNr;
 
 pub(crate) mod syscalls;
@@ -21,7 +22,7 @@ const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
 pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
     let res: Result<usize, Errno> = match request {
-        SyscallRequest::Return { ret } => syscalls::tee::sys_return(ret),
+        SyscallRequest::Return { ret_value } => syscalls::tee::sys_return(ret_value),
         SyscallRequest::Log { buf, len } => match unsafe { buf.to_cow_slice(len) } {
             Some(buf) => syscalls::tee::sys_log(&buf),
             None => Err(Errno::EFAULT),
@@ -61,11 +62,11 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
     )
 }
 
-// From`optee_os/lib/libutee/include/utee_syscalls.h`
+// Based on `optee_os/lib/libutee/include/utee_syscalls.h`
 #[non_exhaustive]
 pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Return {
-        ret: usize,
+        ret_value: usize,
     },
     Log {
         buf: Platform::RawConstPointer<u8>,
@@ -76,82 +77,82 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     OpenTaSession {
         ta_uuid: Platform::RawConstPointer<TeeUuid>,
-        cancel_req_to: u32,
-        usr_params: Platform::RawConstPointer<UteeParams>,
-        ta_sess_id: Platform::RawMutPointer<u32>,
-        ret_orig: Platform::RawMutPointer<u32>,
+        timeout: u32,
+        user_params: Platform::RawConstPointer<UteeParams>,
+        ta_session_id: Platform::RawMutPointer<TaSessionId>,
+        ret_origin: Platform::RawMutPointer<TeeOrigin>,
     },
     CloseTaSession {
-        ta_sess_id: Platform::RawMutPointer<u32>,
+        ta_session_id: Platform::RawMutPointer<TaSessionId>,
     },
     InvokeTaCommand {
-        ta_sess_id: u32,
-        cancel_req_to: u32,
-        cmd_id: u32,
-        params: Platform::RawConstPointer<UteeParams>,
-        ret_orig: Platform::RawMutPointer<u32>,
+        ta_session_id: TaSessionId,
+        timeout: u32,
+        cmd_id: CommandId,
+        user_params: Platform::RawConstPointer<UteeParams>,
+        ret_origin: Platform::RawMutPointer<TeeOrigin>,
     },
     CheckAccessRights {
-        flags: u32,
+        flags: TeeMemoryAccessRights,
         buf: Platform::RawConstPointer<u8>,
         len: usize,
     },
     CrypStateAlloc {
-        algo: usize,
+        algo: TeeAlgorithm,
         op_mode: TeeOperationMode,
-        key1: usize,
-        key2: usize,
-        state_id: Platform::RawMutPointer<u32>,
+        obj_id_1: TeeObjHandle,
+        obj_id_2: TeeObjHandle,
+        state_id: Platform::RawMutPointer<TeeCrypStateHandle>,
     },
     CrypStateCopy {
-        dst_state_id: u32,
-        src_state_id: u32,
+        dst_state_id: TeeCrypStateHandle,
+        src_state_id: TeeCrypStateHandle,
     },
     CrypStateFree {
-        state_id: u32,
+        state_id: TeeCrypStateHandle,
     },
     CipherInit {
-        state_id: u32,
+        state_id: TeeCrypStateHandle,
         iv: Platform::RawConstPointer<u8>,
         iv_len: usize,
     },
     CipherUpdate {
-        state_id: u32,
+        state_id: TeeCrypStateHandle,
         src: Platform::RawConstPointer<u8>,
         src_len: usize,
         dst: Platform::RawMutPointer<u8>,
         dst_len: Platform::RawMutPointer<u64>,
     },
     CipherFinal {
-        state_id: u32,
+        state_id: TeeCrypStateHandle,
         src: Platform::RawConstPointer<u8>,
         src_len: usize,
         dst: Platform::RawMutPointer<u8>,
         dst_len: Platform::RawMutPointer<u64>,
     },
     CrypObjGetInfo {
-        obj_id: u32,
+        obj_id: TeeObjHandle,
         info: Platform::RawMutPointer<TeeObjectInfo>,
     },
     CrypObjAlloc {
-        obj_type: u32,
+        obj_type: TeeObjectType,
         max_key_size: usize,
-        obj_id: Platform::RawMutPointer<u32>,
+        obj_id: Platform::RawMutPointer<TeeObjHandle>,
     },
     CrypObjClose {
-        obj_id: u32,
+        obj_id: TeeObjHandle,
     },
     CrypObjReset {
-        obj_id: u32,
+        obj_id: TeeObjHandle,
     },
     CrypObjPopulate {
-        obj_id: u32,
+        obj_id: TeeObjHandle,
         usr_attrs: Platform::RawMutPointer<UteeAttribute>,
         attr_count: usize,
     },
     CrypObjCopy {
-        dst_obj_id: u32,
-        src_obj_id: u32,
+        dst_obj_id: TeeObjHandle,
+        src_obj_id: TeeObjHandle,
     },
     CrypRandomNumberGenerate {
         buf: Platform::RawMutPointer<u8>,
@@ -164,7 +165,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
         let sysnr = u32::try_from(syscall_number).map_err(|_| Errno::ENOSYS)?;
         let dispatcher = match TeeSyscallNr::try_from(sysnr).unwrap_or(TeeSyscallNr::Unknown) {
             TeeSyscallNr::Return => SyscallRequest::Return {
-                ret: ctx.syscall_arg(0),
+                ret_value: ctx.syscall_arg(0),
             },
             TeeSyscallNr::Log => SyscallRequest::Log {
                 buf: Platform::RawConstPointer::from_usize(ctx.syscall_arg(0)),
@@ -172,6 +173,56 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             },
             TeeSyscallNr::Panic => SyscallRequest::Panic {
                 code: ctx.syscall_arg(0),
+            },
+            TeeSyscallNr::CrypStateAlloc => SyscallRequest::CrypStateAlloc {
+                algo: TeeAlgorithm::try_from_usize(ctx.syscall_arg(0))?,
+                op_mode: TeeOperationMode::try_from_usize(ctx.syscall_arg(1))?,
+                obj_id_1: TeeObjHandle::try_from_usize(ctx.syscall_arg(2))?,
+                obj_id_2: TeeObjHandle::try_from_usize(ctx.syscall_arg(3))?,
+                state_id: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
+            },
+            TeeSyscallNr::CrypStateFree => SyscallRequest::CrypStateFree {
+                state_id: TeeCrypStateHandle::try_from_usize(ctx.syscall_arg(0))?,
+            },
+            TeeSyscallNr::CipherInit => SyscallRequest::CipherInit {
+                state_id: TeeCrypStateHandle::try_from_usize(ctx.syscall_arg(0))?,
+                iv: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
+                iv_len: ctx.syscall_arg(2),
+            },
+            TeeSyscallNr::CipherUpdate => SyscallRequest::CipherUpdate {
+                state_id: TeeCrypStateHandle::try_from_usize(ctx.syscall_arg(0))?,
+                src: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
+                src_len: ctx.syscall_arg(2),
+                dst: Platform::RawMutPointer::from_usize(ctx.syscall_arg(3)),
+                dst_len: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
+            },
+            TeeSyscallNr::CrypObjGetInfo => SyscallRequest::CrypObjGetInfo {
+                obj_id: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
+                info: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+            },
+            TeeSyscallNr::CrypObjAlloc => SyscallRequest::CrypObjAlloc {
+                obj_type: TeeObjectType::try_from_usize(ctx.syscall_arg(0))?,
+                max_key_size: ctx.syscall_arg(1),
+                obj_id: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
+            },
+            TeeSyscallNr::CrypObjClose => SyscallRequest::CrypObjClose {
+                obj_id: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
+            },
+            TeeSyscallNr::CrypObjReset => SyscallRequest::CrypObjReset {
+                obj_id: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
+            },
+            TeeSyscallNr::CrypObjPopulate => SyscallRequest::CrypObjPopulate {
+                obj_id: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
+                usr_attrs: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+                attr_count: ctx.syscall_arg(2),
+            },
+            TeeSyscallNr::CrypObjCopy => SyscallRequest::CrypObjCopy {
+                dst_obj_id: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
+                src_obj_id: TeeObjHandle::try_from_usize(ctx.syscall_arg(1))?,
+            },
+            TeeSyscallNr::CrypRandomNumberGenerate => SyscallRequest::CrypRandomNumberGenerate {
+                buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
+                blen: ctx.syscall_arg(1),
             },
             TeeSyscallNr::Unknown => {
                 return Err(Errno::ENOSYS);
@@ -184,8 +235,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
 }
 
 // a subset of `SyscallContext` for shim's operation
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct SyscallContext {
     args: [usize; MAX_SYSCALL_ARGS],
 }
@@ -207,18 +257,148 @@ impl SyscallContext {
     }
 }
 
-const TEE_NUM_PARAMS: usize = 4;
+/// A handle for `TeeObj`
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct TeeObjHandle(pub u32);
+
+impl TeeObjHandle {
+    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+        u32::try_from(value)
+            .map_err(|_| Errno::EINVAL)
+            .map(TeeObjHandle)
+    }
+}
+
+#[derive(Clone)]
+pub struct TeeObj<'a> {
+    pub info: TeeObjectInfo,
+    pub busy: bool,
+    pub have_attrs: u32, // bitfield
+    pub attr: *const u8,
+    pub ds_pos: usize,
+    pub pobj: &'a TeePersistentObj,
+}
+
+#[derive(Clone)]
+pub struct TeePersistentObj {
+    pub refcnt: usize,
+    pub uuid: TeeUuid,
+    pub obj_id: alloc::boxed::Box<[u8]>,
+    pub flags: u32,
+    pub temporary: bool,
+    pub creating: bool,
+}
+
+/// A handle for `TeeCrypState`
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct TeeCrypStateHandle(pub u32);
+
+impl TeeCrypStateHandle {
+    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+        u32::try_from(value)
+            .map_err(|_| Errno::EINVAL)
+            .map(TeeCrypStateHandle)
+    }
+}
+
+const CRYP_STATE_INITIALIZED: u32 = 0x1;
+const CRYP_STATE_UNINITIALIZED: u32 = 0x2;
+
+#[expect(dead_code)]
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum CrypState {
+    Initialized = CRYP_STATE_INITIALIZED,
+    Uninitialized = CRYP_STATE_UNINITIALIZED,
+}
+
+#[expect(dead_code)]
+#[derive(Clone, Copy)]
+struct TeeCrypState {
+    algo: TeeAlgorithm,
+    mode: TeeOperationMode,
+    key1: TeeObjHandle,
+    key2: TeeObjHandle,
+    // ctx: *const u8,
+    // ctx_finalize: function pointer
+    state: CrypState,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct TaSessionId(pub u32);
+
+impl TaSessionId {
+    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+        u32::try_from(value)
+            .map_err(|_| Errno::EINVAL)
+            .map(TaSessionId)
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct CommandId(pub u32);
+
+impl CommandId {
+    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+        u32::try_from(value)
+            .map_err(|_| Errno::EINVAL)
+            .map(CommandId)
+    }
+}
 
 // `utee_params` from `optee_os/lib/libutee/include/utee_types.h`
-#[derive(PartialEq, Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct UteeParams {
     pub types: u64,
     pub vals: [u64; TEE_NUM_PARAMS * 2],
 }
+const TEE_NUM_PARAMS: usize = 4;
+
+const TEE_PARAM_TYPE_NONE: u8 = 0;
+const TEE_PARAM_TYPE_VALUE_INPUT: u8 = 1;
+const TEE_PARAM_TYPE_VALUE_OUTPUT: u8 = 2;
+const TEE_PARAM_TYPE_VALUE_INOUT: u8 = 3;
+const TEE_PARAM_TYPE_MEMREF_INPUT: u8 = 4;
+const TEE_PARAM_TYPE_MEMREF_OUTPUT: u8 = 5;
+const TEE_PARAM_TYPE_MEMREF_INOUT: u8 = 6;
+
+#[derive(Clone, Copy, TryFromPrimitive)]
+#[repr(u8)]
+pub enum TeeParamType {
+    None = TEE_PARAM_TYPE_NONE,
+    ValueInput = TEE_PARAM_TYPE_VALUE_INPUT,
+    ValueOutput = TEE_PARAM_TYPE_VALUE_OUTPUT,
+    ValueInout = TEE_PARAM_TYPE_VALUE_INOUT,
+    MemrefInput = TEE_PARAM_TYPE_MEMREF_INPUT,
+    MemrefOutput = TEE_PARAM_TYPE_MEMREF_OUTPUT,
+    MemrefInout = TEE_PARAM_TYPE_MEMREF_INOUT,
+}
+
+impl UteeParams {
+    pub fn get_type(&self, index: usize) -> Result<TeeParamType, Errno> {
+        if index >= TEE_NUM_PARAMS {
+            return Err(Errno::EINVAL);
+        }
+        let type_byte = self.types.to_le_bytes()[index];
+        TeeParamType::try_from(type_byte).map_err(|_| Errno::EINVAL)
+    }
+
+    pub fn get_values(&self, index: usize) -> Result<(u64, u64), Errno> {
+        if index >= TEE_NUM_PARAMS {
+            return Err(Errno::EINVAL);
+        }
+        let base_index = index * 2;
+        Ok((self.vals[base_index], self.vals[base_index + 1]))
+    }
+}
 
 // `utee_attribute` from `optee_os/lib/libutee/include/utee_types.h`
-#[derive(PartialEq, Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct UteeAttribute {
     pub a: u64,
@@ -238,7 +418,7 @@ pub struct TeeUuid {
 
 // `TEE_ObjectInfo` from `optee_os/lib/libutee/include/tee_api_types.h`
 // assume 1.1.1 spec
-#[derive(PartialEq, Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct TeeObjectInfo {
     pub object_type: u32,
@@ -250,16 +430,16 @@ pub struct TeeObjectInfo {
     pub handle_flags: u32,
 }
 
-const TEE_MODE_ENCRYPT: usize = 0;
-const TEE_MODE_DECRYPT: usize = 1;
-const TEE_MODE_SIGN: usize = 2;
-const TEE_MODE_VERIFY: usize = 3;
-const TEE_MODE_MAC: usize = 4;
-const TEE_MODE_DIGEST: usize = 5;
-const TEE_MODE_DERIVE: usize = 6;
+const TEE_MODE_ENCRYPT: u32 = 0;
+const TEE_MODE_DECRYPT: u32 = 1;
+const TEE_MODE_SIGN: u32 = 2;
+const TEE_MODE_VERIFY: u32 = 3;
+const TEE_MODE_MAC: u32 = 4;
+const TEE_MODE_DIGEST: u32 = 5;
+const TEE_MODE_DERIVE: u32 = 6;
 
-#[derive(Debug, PartialEq)]
-#[repr(usize)]
+#[derive(Clone, Copy, TryFromPrimitive)]
+#[repr(u32)]
 pub enum TeeOperationMode {
     Encrypt = TEE_MODE_ENCRYPT,
     Decrypt = TEE_MODE_DECRYPT,
@@ -268,4 +448,112 @@ pub enum TeeOperationMode {
     Mac = TEE_MODE_MAC,
     Digest = TEE_MODE_DIGEST,
     Derive = TEE_MODE_DERIVE,
+}
+
+impl TeeOperationMode {
+    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+        u32::try_from(value)
+            .map_err(|_| Errno::EINVAL)
+            .and_then(|v| Self::try_from(v).map_err(|_| Errno::EINVAL))
+    }
+}
+
+const TEE_ORIGIN_API: u32 = 0;
+const TEE_ORIGIN_COMMS: u32 = 1;
+const TEE_ORIGIN_TEE: u32 = 2;
+const TEE_ORIGIN_TRUTED_APP: u32 = 3;
+
+#[derive(Clone, Copy, TryFromPrimitive)]
+#[repr(u32)]
+pub enum TeeOrigin {
+    Api = TEE_ORIGIN_API,
+    Comms = TEE_ORIGIN_COMMS,
+    Tee = TEE_ORIGIN_TEE,
+    TrustedApp = TEE_ORIGIN_TRUTED_APP,
+}
+
+impl TeeOrigin {
+    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+        u32::try_from(value)
+            .map_err(|_| Errno::EINVAL)
+            .and_then(|v| Self::try_from(v).map_err(|_| Errno::EINVAL))
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy)]
+    pub struct TeeMemoryAccessRights: u32 {
+        const TEE_MEMORY_ACCESS_READ = 0x1;
+        const TEE_MEMORY_ACCESS_WRITE = 0x2;
+        const TEE_MEMORY_ACCESS_ANY_OWNER = 0x4;
+
+        const _ = !0;
+    }
+}
+
+// from `optee_os/lib/libutee/include/tee_api_defines.h`
+// TODO: add more algorithms as needed
+const TEE_ALG_AES_CTR: u32 = 0x1000_0210;
+const TEE_ALG_AES_GCM: u32 = 0x4000_0810;
+const TEE_ALG_ILLEGAL_VALUE: u32 = 0xefff_ffff;
+
+#[non_exhaustive]
+#[derive(Clone, Copy, TryFromPrimitive)]
+#[repr(u32)]
+pub enum TeeAlgorithm {
+    AesCtr = TEE_ALG_AES_CTR,
+    AesGcm = TEE_ALG_AES_GCM,
+    IllegalValue = TEE_ALG_ILLEGAL_VALUE,
+}
+
+impl TeeAlgorithm {
+    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+        u32::try_from(value)
+            .map_err(|_| Errno::EINVAL)
+            .and_then(|v| Self::try_from(v).map_err(|_| Errno::EINVAL))
+    }
+}
+
+// from `optee_os/lib/libutee/include/tee_api_defines.h`
+// TODO: add more object types as needed
+const TEE_TYPE_AES: u32 = 0xa000_0010;
+const TEE_TYPE_HMAC_SHA256: u32 = 0xa000_0004;
+const TEE_TYPE_HMAC_SHA512: u32 = 0xa000_0006;
+const TEE_TYPE_RSA_PUBLIC_KEY: u32 = 0xa000_0030;
+const TEE_TYPE_RSA_KEYPAIR: u32 = 0xa100_0030;
+const TEE_TYPE_GENERIC_SECRET: u32 = 0xa000_0000;
+const TEE_TYPE_CORRUPTED_OBJECT: u32 = 0xa000_00be;
+const TEE_TYPE_DATA: u32 = 0xa000_00bf;
+
+#[non_exhaustive]
+#[derive(Clone, Copy, TryFromPrimitive)]
+#[repr(u32)]
+pub enum TeeObjectType {
+    Aes = TEE_TYPE_AES,
+    HmacSha256 = TEE_TYPE_HMAC_SHA256,
+    HmacSha512 = TEE_TYPE_HMAC_SHA512,
+    RsaPublicKey = TEE_TYPE_RSA_PUBLIC_KEY,
+    RsaKeypair = TEE_TYPE_RSA_KEYPAIR,
+    GenericSecret = TEE_TYPE_GENERIC_SECRET,
+    CorruptedObject = TEE_TYPE_CORRUPTED_OBJECT,
+    Data = TEE_TYPE_DATA,
+    Unknown = 0xffff_ffff,
+}
+
+impl TeeObjectType {
+    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+        u32::try_from(value)
+            .map_err(|_| Errno::EINVAL)
+            .and_then(|v| Self::try_from(v).map_err(|_| Errno::EINVAL))
+    }
+}
+
+// TODO: add more attributes as needed
+const TEE_ATTR_SECRET_VALUE: u32 = 0xc000_0000;
+
+#[non_exhaustive]
+#[derive(Clone, Copy)]
+#[repr(u32)]
+pub enum TeeAttribute {
+    SecretValue = TEE_ATTR_SECRET_VALUE,
 }
