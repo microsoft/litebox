@@ -1,9 +1,5 @@
 //! Polling-related functionality
 
-// TODO(jayb|2025/07/18): Check all the `pub` declarations here, and then start removing the things
-// from the shim `event.rs` and migrate all of those over. I also need to add/fix doc comments
-// across everything here.
-
 use alloc::sync::{Arc, Weak};
 use thiserror::Error;
 
