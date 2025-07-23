@@ -40,11 +40,6 @@ use super::{
 /// `b'Taro'.hex()`.
 const DEVICE_ID: usize = 0x5461726f;
 
-/// TODO(jayb): Replace this proper auto-incrementing inode number storage (although that will
-/// require migrating to the hashmap based tar entry storage). This is ok for now, until something
-/// is actually checking for real inode numbers.
-const TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER: usize = 0xFACE;
-
 /// Block size for file system I/O operations
 // TODO(jayb): Determine appropriate block size
 const BLOCK_SIZE: usize = 0;
@@ -155,6 +150,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         } else {
             // it is a dir
             Ok(self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
+                idx,
                 path: path.to_owned(),
                 metadata: AnyMap::new(),
             }))
@@ -313,35 +309,34 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         let path = self.absolute_path(path)?;
         let path = &path[1..];
-        let entry = self
-            .tar_data
-            .entries()
-            .find(|entry| match entry.filename().as_str() {
+        let entry = self.tar_data.entries().enumerate().find(|(_, entry)| {
+            match entry.filename().as_str() {
                 Ok(p) => p == path || contains_dir(p, path),
                 Err(_) => false,
-            });
+            }
+        });
         match entry {
             None => Err(PathError::NoSuchFileOrDirectory)?,
-            Some(p) if p.filename().as_str().unwrap() != path => Ok(super::FileStatus {
+            Some((idx, p)) if p.filename().as_str().unwrap() != path => Ok(super::FileStatus {
                 file_type: super::FileType::Directory,
                 mode: DEFAULT_DIR_MODE,
                 size: super::DEFAULT_DIRECTORY_SIZE,
                 owner: owner_from_posix_header(p.posix_header()),
                 node_info: NodeInfo {
                     dev: DEVICE_ID,
-                    ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                    ino: idx,
                     rdev: None,
                 },
                 blksize: BLOCK_SIZE,
             }),
-            Some(p) => Ok(super::FileStatus {
+            Some((idx, p)) => Ok(super::FileStatus {
                 file_type: super::FileType::RegularFile,
                 mode: mode_of_modeflags(p.posix_header().mode.to_flags().unwrap()),
                 size: p.size(),
                 owner: owner_from_posix_header(p.posix_header()),
                 node_info: NodeInfo {
                     dev: DEVICE_ID,
-                    ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                    ino: idx,
                     rdev: None,
                 },
                 blksize: BLOCK_SIZE,
@@ -363,20 +358,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     owner: owner_from_posix_header(entry.posix_header()),
                     node_info: NodeInfo {
                         dev: DEVICE_ID,
-                        ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                        ino: *idx,
                         rdev: None,
                     },
                     blksize: BLOCK_SIZE,
                 })
             }
-            Descriptor::Dir { .. } => Ok(super::FileStatus {
+            Descriptor::Dir { idx, .. } => Ok(super::FileStatus {
                 file_type: super::FileType::Directory,
                 mode: DEFAULT_DIR_MODE,
                 size: super::DEFAULT_DIRECTORY_SIZE,
                 owner: DEFAULT_DIRECTORY_OWNER,
                 node_info: NodeInfo {
                     dev: DEVICE_ID,
-                    ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                    ino: *idx,
                     rdev: None,
                 },
                 blksize: BLOCK_SIZE,
@@ -460,6 +455,7 @@ enum Descriptor {
         metadata: AnyMap,
     },
     Dir {
+        idx: usize,
         #[expect(
             dead_code,
             reason = "mostly used for debugging; we might consider removing this in the future"
