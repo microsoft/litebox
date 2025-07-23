@@ -106,21 +106,6 @@ impl Socket {
         }
     }
 
-    fn check_io_events(&self) -> Events {
-        litebox_net()
-            .lock()
-            .check_events(self.fd.as_ref().unwrap())
-            .expect("Invalid socket fd")
-    }
-
-    pub(crate) fn poll(
-        &self,
-        mask: Events,
-        observer: Option<alloc::sync::Weak<dyn Observer<Events>>>,
-    ) -> Events {
-        self.pollee.poll(mask, observer, || self.check_io_events())
-    }
-
     #[allow(clippy::too_many_lines)]
     fn setsockopt(
         &self,
@@ -356,6 +341,19 @@ impl Socket {
     }
 
     crate::syscalls::common_functions_for_file_status!();
+}
+
+impl crate::syscalls::epoll::IOPollable for Socket {
+    fn check_io_events(&self) -> Events {
+        litebox_net()
+            .lock()
+            .check_events(self.fd.as_ref().unwrap())
+            .expect("Invalid socket fd")
+    }
+
+    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
+        self.pollee.register_observer(observer, mask);
+    }
 }
 
 /// Handle syscall `socket`

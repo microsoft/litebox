@@ -54,31 +54,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
         }
     }
 
-    /// Register the `observer` (if specified) and then poll for `check` with the given `mask`.
-    ///
-    /// NOTE(jb): I am not sure I am happy with this function, but this is what was in the shim.
-    /// Currently, it does not seem obvious why this cannot just be inlined into places that use it.
-    /// Inlining it into all such places does cause some duplication, but more effort seems to be
-    /// needed to actually figure out a good interface here, rather than just one that removes the
-    /// duplication in the trivial way, because at least as it stands, this is _too_ specific to
-    /// seem useful.
-    ///
-    /// TODO(jb): Rename before making the PR.
-    pub fn poll(
-        &self,
-        mask: Events,
-        observer: Option<Weak<dyn Observer<Events>>>,
-        check: impl FnOnce() -> Events,
-    ) -> Events {
-        let mask = mask | Events::ALWAYS_POLLED;
-
-        if let Some(observer) = observer {
-            self.register_observer(observer, mask);
-        }
-
-        check() & mask
-    }
-
     /// Run `try_op` until it returns a non-`TryAgain` result.
     ///
     /// This function runs indefinitely unless a `timeout` is provided, in which case, it can return

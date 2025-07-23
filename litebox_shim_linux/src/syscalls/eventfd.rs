@@ -1,5 +1,6 @@
 //! Event file for notification
 
+use crate::syscalls::epoll::IOPollable;
 use core::sync::atomic::AtomicU32;
 
 use litebox::{
@@ -33,30 +34,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             semaphore: flags.contains(EfdFlags::SEMAPHORE),
             pollee: Pollee::new(litebox),
         }
-    }
-
-    fn check_io_events(&self) -> Events {
-        let counter = self.counter.lock();
-        let mut events = Events::empty();
-        if *counter != 0 {
-            events |= Events::IN;
-        }
-        // if it is possible to write a value of at least "1"
-        // without blocking, the file is writable
-        let is_writable = *counter < u64::MAX - 1;
-        if is_writable {
-            events |= Events::OUT;
-        }
-
-        events
-    }
-
-    pub(crate) fn poll(
-        &self,
-        mask: Events,
-        observer: Option<alloc::sync::Weak<dyn Observer<Events>>>,
-    ) -> Events {
-        self.pollee.poll(mask, observer, || self.check_io_events())
     }
 
     fn try_read(&self) -> Result<u64, TryOpError<Errno>> {
@@ -114,6 +91,28 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     }
 
     crate::syscalls::common_functions_for_file_status!();
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFile<Platform> {
+    fn check_io_events(&self) -> Events {
+        let counter = self.counter.lock();
+        let mut events = Events::empty();
+        if *counter != 0 {
+            events |= Events::IN;
+        }
+        // if it is possible to write a value of at least "1"
+        // without blocking, the file is writable
+        let is_writable = *counter < u64::MAX - 1;
+        if is_writable {
+            events |= Events::OUT;
+        }
+
+        events
+    }
+
+    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
+        self.pollee.register_observer(observer, mask);
+    }
 }
 
 #[cfg(test)]

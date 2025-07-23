@@ -20,6 +20,8 @@ use ringbuf::{
     traits::{Consumer as _, Observer as _, Producer as _, Split as _},
 };
 
+use crate::syscalls::epoll::IOPollable;
+
 /// The maximum number of bytes for atomic write.
 ///
 /// See <https://man7.org/linux/man-pages/man7/pipe.7.html> for more details.
@@ -70,20 +72,6 @@ macro_rules! common_functions_for_channel {
                 true
             }
         }
-
-        pub fn poll(&self, mask: Events, observer: Option<Weak<dyn Observer<Events>>>) -> Events {
-            self.endpoint
-                .pollee
-                .poll(mask, observer, || self.check_io_events())
-        }
-
-        pub(crate) fn register_observer(
-            &self,
-            observer: alloc::sync::Weak<dyn Observer<Events>>,
-            filter: Events,
-        ) {
-            self.endpoint.pollee.register_observer(observer, filter);
-        }
     };
 }
 
@@ -101,18 +89,6 @@ impl<T> Producer<T> {
             peer: Weak::new(),
             status: AtomicU32::new((flags | OFlags::WRONLY).bits()),
         }
-    }
-
-    fn check_io_events(&self) -> Events {
-        let rb = self.endpoint.rb.lock();
-        let mut events = Events::empty();
-        if self.is_peer_shutdown() {
-            events |= Events::ERR;
-        }
-        if !self.is_shutdown() && !rb.is_full() {
-            events |= Events::OUT;
-        }
-        events
     }
 
     fn try_write(&self, buf: &[T]) -> Result<usize, TryOpError<Errno>>
@@ -165,6 +141,24 @@ impl<T> Producer<T> {
     crate::syscalls::common_functions_for_file_status!();
 }
 
+impl<T> IOPollable for Producer<T> {
+    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, filter: Events) {
+        self.endpoint.pollee.register_observer(observer, filter);
+    }
+
+    fn check_io_events(&self) -> Events {
+        let rb = self.endpoint.rb.lock();
+        let mut events = Events::empty();
+        if self.is_peer_shutdown() {
+            events |= Events::ERR;
+        }
+        if !self.is_shutdown() && !rb.is_full() {
+            events |= Events::OUT;
+        }
+        events
+    }
+}
+
 impl<T> Drop for Producer<T> {
     fn drop(&mut self) {
         self.shutdown();
@@ -183,13 +177,9 @@ pub(crate) struct Consumer<T> {
     status: AtomicU32,
 }
 
-impl<T> Consumer<T> {
-    fn new(rb: HeapCons<T>, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
-        Self {
-            endpoint: EndPointer::new(rb, Events::empty(), litebox),
-            peer: Weak::new(),
-            status: AtomicU32::new((flags | OFlags::RDONLY).bits()),
-        }
+impl<T> IOPollable for Consumer<T> {
+    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, filter: Events) {
+        self.endpoint.pollee.register_observer(observer, filter);
     }
 
     fn check_io_events(&self) -> Events {
@@ -202,6 +192,16 @@ impl<T> Consumer<T> {
             events |= Events::IN;
         }
         events
+    }
+}
+
+impl<T> Consumer<T> {
+    fn new(rb: HeapCons<T>, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
+        Self {
+            endpoint: EndPointer::new(rb, Events::empty(), litebox),
+            peer: Weak::new(),
+            status: AtomicU32::new((flags | OFlags::RDONLY).bits()),
+        }
     }
 
     fn try_read(&self, buf: &mut [T]) -> Result<usize, TryOpError<Errno>>
