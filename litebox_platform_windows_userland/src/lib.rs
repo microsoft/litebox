@@ -6,12 +6,18 @@
 
 use core::sync::atomic::AtomicU32;
 use core::time::Duration;
+use std::os::raw::c_void;
 
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox_common_linux::PunchthroughSyscall;
+
+use windows_sys::Win32::{
+    System::Memory::{self as Win32_Memory, VirtualAlloc2},
+    System::Threading::GetCurrentProcess,
+};
 
 extern crate alloc;
 
@@ -245,6 +251,32 @@ impl litebox::platform::RawPointerProvider for WindowsUserland {
     type RawMutPointer<T: Clone> = litebox::platform::trivial_providers::TransparentMutPtr<T>;
 }
 
+#[expect(dead_code, reason = "Will be added for PageManagementProvider soon.")]
+fn prot_flags(flags: MemoryRegionPermissions) -> Win32_Memory::PAGE_PROTECTION_FLAGS {
+    match (
+        flags.contains(MemoryRegionPermissions::READ),
+        flags.contains(MemoryRegionPermissions::WRITE),
+        flags.contains(MemoryRegionPermissions::EXEC),
+    ) {
+        // no permissions
+        (false, false, false) => Win32_Memory::PAGE_NOACCESS,
+        // read-only
+        (true, false, false) => Win32_Memory::PAGE_READONLY,
+        // write-only (Windows doesn't have write-only, so we use r+w)
+        (false, true, false) => Win32_Memory::PAGE_READWRITE,
+        // read-write
+        (true, true, false) => Win32_Memory::PAGE_READWRITE,
+        // exeute-only (Windows doesn't have execute-only, so we use r+x)
+        (false, false, true) => Win32_Memory::PAGE_EXECUTE_READ,
+        // read-execute
+        (true, false, true) => Win32_Memory::PAGE_EXECUTE_READ,
+        // write-execute (Windows doesn't have write-execute, so we use rwx)
+        (false, true, true) => Win32_Memory::PAGE_EXECUTE_READWRITE,
+        // read-write-execute
+        (true, true, true) => Win32_Memory::PAGE_EXECUTE_READWRITE,
+    }
+}
+
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
     fn allocate_pages(
         &self,
@@ -352,12 +384,32 @@ impl litebox::platform::StdioProvider for WindowsUserland {
     }
 }
 
-// TODO: currently we do not have a global allocator, will implement it by
-// finishing Windows's MemoryProvider trait.
+#[global_allocator]
+static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 28, WindowsUserland> =
+    litebox::mm::allocator::SafeZoneAllocator::new();
 
 impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
-    fn alloc(_layout: &std::alloc::Layout) -> Option<(usize, usize)> {
-        unimplemented!();
+    fn alloc(layout: &std::alloc::Layout) -> Option<(usize, usize)> {
+        let size = core::cmp::max(
+            layout.size().next_power_of_two(),
+            core::cmp::max(layout.align(), 0x1000) << 1,
+        );
+
+        let addr: *mut c_void = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                core::ptr::null_mut(),
+                size,
+                Win32_Memory::MEM_COMMIT,
+                Win32_Memory::PAGE_READWRITE,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if addr.is_null() {
+            return None;
+        }
+        Some((addr as usize, size))
     }
 
     unsafe fn free(_addr: usize) {
