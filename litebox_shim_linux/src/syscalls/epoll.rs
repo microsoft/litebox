@@ -110,7 +110,6 @@ impl EpollFile {
     ) -> Result<Vec<EpollEvent>, Errno> {
         let mut events = Vec::new();
         match self.ready.pollee.wait_or_timeout(
-            Events::IN,
             timeout,
             || {
                 self.ready.pop_multiple(maxevents, &mut events);
@@ -119,7 +118,7 @@ impl EpollFile {
                 }
                 Ok(())
             },
-            || self.ready.check_io_events(),
+            || self.ready.check_io_events().contains(Events::IN),
         ) {
             Ok(()) | Err(litebox::event::polling::TryOpError::TimedOut) => {}
             Err(e) => return Err(e.into()),

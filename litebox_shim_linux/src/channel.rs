@@ -154,10 +154,9 @@ impl<T> Producer<T> {
             self.try_write(buf)
         } else {
             self.endpoint.pollee.wait_or_timeout(
-                Events::OUT,
                 None,
                 || self.try_write(buf),
-                || self.check_io_events(),
+                || self.check_io_events().contains(Events::OUT),
             )
         }?)
     }
@@ -240,10 +239,9 @@ impl<T> Consumer<T> {
             self.try_read(buf)
         } else {
             self.endpoint.pollee.wait_or_timeout(
-                Events::IN,
                 None,
                 || self.try_read(buf),
-                || self.check_io_events(),
+                || self.check_io_events().contains(Events::IN),
             )
         }?)
     }

@@ -78,10 +78,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             self.try_read()
         } else {
             self.pollee.wait_or_timeout(
-                Events::IN,
                 None,
                 || self.try_read(),
-                || self.check_io_events(),
+                || self.check_io_events().contains(Events::IN),
             )
         }?)
     }
@@ -107,10 +106,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             self.try_write(value)
         } else {
             self.pollee.wait_or_timeout(
-                Events::OUT,
                 None,
                 || self.try_write(value),
-                || self.check_io_events(),
+                || self.check_io_events().contains(Events::OUT),
             )
         }?)
     }

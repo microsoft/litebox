@@ -4,6 +4,7 @@
 // from the shim `event.rs` and migrate all of those over. I also need to add/fix doc comments
 // across everything here.
 
+use alloc::sync::{Arc, Weak};
 use thiserror::Error;
 
 use super::{
@@ -22,7 +23,7 @@ use crate::{
 ///
 /// This supports polling, waiting (with optional timeouts), and notifications for observers.
 pub struct Pollee<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    inner: alloc::sync::Arc<PolleeInner<Platform>>,
+    inner: Arc<PolleeInner<Platform>>,
     litebox: LiteBox<Platform>,
 }
 
@@ -44,7 +45,7 @@ pub enum TryOpError<E> {
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     /// Create a new pollee.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
-        let inner = alloc::sync::Arc::new(PolleeInner {
+        let inner = Arc::new(PolleeInner {
             subject: Subject::new(litebox.sync()),
         });
         Self {
@@ -66,7 +67,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     pub fn poll(
         &self,
         mask: Events,
-        observer: Option<alloc::sync::Weak<dyn Observer<Events>>>,
+        observer: Option<Weak<dyn Observer<Events>>>,
         check: impl FnOnce() -> Events,
     ) -> Events {
         let mask = mask | Events::ALWAYS_POLLED;
@@ -78,21 +79,22 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
         check() & mask
     }
 
-    /// Wait until `try_op` returns a non-EAGAIN result or timeout.
-    /// If the `timeout` is None, it will wait indefinitely.
+    /// Run `try_op` until it returns a non-`TryAgain` result.
     ///
-    /// NOTE(jb): I am not sure I am happy with this function, but this is what was in the shim.
-    /// Currently, the semantics of the operations it does are not clear whatsoever from their
-    /// interface, and improved design seems necessary.
+    /// This function runs indefinitely unless a `timeout` is provided, in which case, it can return
+    /// with a `TimedOut` error.
     ///
-    /// TODO(jb): I think there may be a bug here because `check` is never re-run; it _is_ marked as
-    /// `FnOnce` but then again, the interface just seems not ideal, so clean-up is needed.
+    /// The `check` function is used to reduce the number of times `try_op` is run. Specifically, if
+    /// `check` returns `false`, then it means that it is not worth attempting to run `try_op` and
+    /// that we can wait (for a notification to arrive, via [`Self::notify_observers`]) until
+    /// `check` returns `true` again. Note that `try_op` can be (sometimes) run even if `check` is
+    /// false; it is not to be taken as a pre-requisite to running `try_op` but merely used as a way
+    /// to reduce the number of times `try_op` is invoked.
     pub fn wait_or_timeout<R, E>(
         &self,
-        mask: Events,
         timeout: Option<core::time::Duration>,
         mut try_op: impl FnMut() -> Result<R, TryOpError<E>>,
-        check: impl FnOnce() -> Events,
+        check: impl Fn() -> bool,
     ) -> Result<R, TryOpError<E>> {
         // Try first without waiting
         match try_op() {
@@ -106,39 +108,33 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
         }
 
         let mut remaining_time = timeout;
-        let poller = alloc::sync::Arc::new(Poller::new(&self.litebox));
-        let revents = self.poll(mask, Some(alloc::sync::Arc::downgrade(&poller) as _), check);
-        if revents.is_empty() {
-            poller
-                .wait_or_timeout(&mut remaining_time)
-                .map_err(|TimedOut| TryOpError::TimedOut)?;
-        }
+        let poller = Arc::new(Poller::new(&self.litebox));
+        self.register_observer(Arc::downgrade(&poller) as _, Events::all());
 
         loop {
+            if !check() {
+                poller
+                    .wait_or_timeout(&mut remaining_time)
+                    .map_err(|TimedOut| TryOpError::TimedOut)?;
+            }
+            // We always run `try_op` whether `check` returns true or false; we simply delay running
+            // `try_op` for a little while if `check` has returned `false`.
             match try_op() {
                 Err(TryOpError::TryAgain) => {}
                 ret => return ret,
             }
-
-            poller
-                .wait_or_timeout(&mut remaining_time)
-                .map_err(|TimedOut| TryOpError::TimedOut)?;
         }
     }
 
     /// Register an observer for events that satisfy the given `filter`.
-    pub fn register_observer(
-        &self,
-        observer: alloc::sync::Weak<dyn Observer<Events>>,
-        filter: Events,
-    ) {
+    pub fn register_observer(&self, observer: Weak<dyn Observer<Events>>, filter: Events) {
         self.inner
             .subject
             .register_observer(observer, filter | Events::ALWAYS_POLLED);
     }
 
     /// Unregister an observer.
-    pub fn unregister_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>) {
+    pub fn unregister_observer(&self, observer: Weak<dyn Observer<Events>>) {
         self.inner.subject.unregister_observer(observer);
     }
 
