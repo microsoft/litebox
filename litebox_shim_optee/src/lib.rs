@@ -234,7 +234,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
     }
 }
 
-// a subset of `SyscallContext` for shim's operation
+// A data structure for containing syscall arguments.
 #[derive(Clone, Copy)]
 pub struct SyscallContext {
     args: [usize; MAX_SYSCALL_ARGS],
@@ -257,7 +257,9 @@ impl SyscallContext {
     }
 }
 
-/// A handle for `TeeObj`
+/// A handle for `TeeObj`. In OP-TEE, the kernel creates/maintains secret objects and
+/// provides handles for them to TAs in the user space. This lets them refer to
+/// the objects in subsequent syscalls.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct TeeObjHandle(pub u32);
@@ -270,27 +272,21 @@ impl TeeObjHandle {
     }
 }
 
-#[derive(Clone)]
-pub struct TeeObj<'a> {
+/// A data structure to represent a TEE object refered by `TeeObjHandle`.
+/// This is an in-kernel data structure such that we can have our own
+/// representation (i.e., doesn't have to match the original OP-TEE data structure).
+#[expect(dead_code)]
+#[derive(Clone, Copy)]
+struct TeeObj<'a> {
     pub info: TeeObjectInfo,
-    pub busy: bool,
     pub have_attrs: u32, // bitfield
     pub attr: *const u8,
-    pub ds_pos: usize,
-    pub pobj: &'a TeePersistentObj,
+    pub key: &'a [u8],
+    pub iv: &'a [u8],
 }
 
-#[derive(Clone)]
-pub struct TeePersistentObj {
-    pub refcnt: usize,
-    pub uuid: TeeUuid,
-    pub obj_id: alloc::boxed::Box<[u8]>,
-    pub flags: u32,
-    pub temporary: bool,
-    pub creating: bool,
-}
-
-/// A handle for `TeeCrypState`
+/// A handle for `TeeCrypState`. Like `TeeObjHandle`, this is a handle for
+/// a cryptographic state to be provided to TA in the user space.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct TeeCrypStateHandle(pub u32);
@@ -303,29 +299,19 @@ impl TeeCrypStateHandle {
     }
 }
 
-const CRYP_STATE_INITIALIZED: u32 = 0x1;
-const CRYP_STATE_UNINITIALIZED: u32 = 0x2;
-
-#[expect(dead_code)]
-#[derive(Clone, Copy)]
-#[repr(u32)]
-enum CrypState {
-    Initialized = CRYP_STATE_INITIALIZED,
-    Uninitialized = CRYP_STATE_UNINITIALIZED,
-}
-
+/// A data structure to represent a cryptographic state refered by `TeeCrypStateHandle`.
+/// This is an in-kernel data structure such that we can have our own representation.
 #[expect(dead_code)]
 #[derive(Clone, Copy)]
 struct TeeCrypState {
     algo: TeeAlgorithm,
     mode: TeeOperationMode,
-    key1: TeeObjHandle,
-    key2: TeeObjHandle,
-    // ctx: *const u8,
-    // ctx_finalize: function pointer
-    state: CrypState,
+    obj_id_1: TeeObjHandle,
+    obj_id_2: TeeObjHandle,
+    initialized: bool,
 }
 
+/// TA session ID which is equivalent to a process ID.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct TaSessionId(pub u32);
@@ -338,6 +324,7 @@ impl TaSessionId {
     }
 }
 
+/// Command ID to be passed to a TA. Each TA can provide an arbitrary number of commands.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct CommandId(pub u32);
@@ -350,7 +337,9 @@ impl CommandId {
     }
 }
 
-// `utee_params` from `optee_os/lib/libutee/include/utee_types.h`
+/// `utee_params` from `optee_os/lib/libutee/include/utee_types.h`
+/// It contains up to 4 parameters where each of them is a collection of
+/// type (1 byte) and two 8-byte data (value or address).
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct UteeParams {
@@ -367,7 +356,7 @@ const TEE_PARAM_TYPE_MEMREF_INPUT: u8 = 4;
 const TEE_PARAM_TYPE_MEMREF_OUTPUT: u8 = 5;
 const TEE_PARAM_TYPE_MEMREF_INOUT: u8 = 6;
 
-#[derive(Clone, Copy, TryFromPrimitive)]
+#[derive(Clone, Copy, TryFromPrimitive, PartialEq)]
 #[repr(u8)]
 pub enum TeeParamType {
     None = TEE_PARAM_TYPE_NONE,
@@ -388,12 +377,17 @@ impl UteeParams {
         TeeParamType::try_from(type_byte).map_err(|_| Errno::EINVAL)
     }
 
-    pub fn get_values(&self, index: usize) -> Result<(u64, u64), Errno> {
+    pub fn get_values(&self, index: usize) -> Result<Option<(u64, u64)>, Errno> {
         if index >= TEE_NUM_PARAMS {
             return Err(Errno::EINVAL);
         }
-        let base_index = index * 2;
-        Ok((self.vals[base_index], self.vals[base_index + 1]))
+        let type_byte = self.types.to_le_bytes()[index];
+        if TeeParamType::try_from(type_byte).map_err(|_| Errno::EINVAL)? == TeeParamType::None {
+            Ok(None)
+        } else {
+            let base_index = index * 2;
+            Ok(Some((self.vals[base_index], self.vals[base_index + 1])))
+        }
     }
 }
 
@@ -492,7 +486,7 @@ bitflags::bitflags! {
 }
 
 // from `optee_os/lib/libutee/include/tee_api_defines.h`
-// TODO: add more algorithms as needed
+// TODO: add more algorithms as needed (IMO we should not provide DES-like algorithms)
 const TEE_ALG_AES_CTR: u32 = 0x1000_0210;
 const TEE_ALG_AES_GCM: u32 = 0x4000_0810;
 const TEE_ALG_ILLEGAL_VALUE: u32 = 0xefff_ffff;
@@ -546,14 +540,4 @@ impl TeeObjectType {
             .map_err(|_| Errno::EINVAL)
             .and_then(|v| Self::try_from(v).map_err(|_| Errno::EINVAL))
     }
-}
-
-// TODO: add more attributes as needed
-const TEE_ATTR_SECRET_VALUE: u32 = 0xc000_0000;
-
-#[non_exhaustive]
-#[derive(Clone, Copy)]
-#[repr(u32)]
-pub enum TeeAttribute {
-    SecretValue = TEE_ATTR_SECRET_VALUE,
 }

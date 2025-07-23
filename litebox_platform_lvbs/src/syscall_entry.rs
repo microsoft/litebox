@@ -143,9 +143,9 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> isize {
     // save user context before switching to VTL0
     crate::platform_low()
         .save_user_context(
-            ctx.user_rip().unwrap(),
-            ctx.user_rsp().unwrap(),
-            ctx.user_rflags(),
+            ctx_raw.user_rip().unwrap(),
+            ctx_raw.user_rsp().unwrap(),
+            ctx_raw.user_rflags(),
         )
         .expect("Failed to save user context");
 
