@@ -1015,7 +1015,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 (flags.bits().reinterpret_as_unsigned()
                     // This is to ensure it won't be intercepted by Seccomp if enabled.
                     | syscall_intercept::MMAP_FLAG_MAGIC) as usize,
-                usize::MAX,
+                -1isize as usize,
                 0,
             )
         }
@@ -1174,7 +1174,7 @@ impl litebox::mm::allocator::MemoryProvider for LinuxUserland {
                     .reinterpret_as_unsigned()
                     // This is to ensure it won't be intercepted by Seccomp if enabled.
                     | syscall_intercept::MMAP_FLAG_MAGIC) as usize,
-                usize::MAX,
+                -1isize as usize,
                 0,
             )
         }
