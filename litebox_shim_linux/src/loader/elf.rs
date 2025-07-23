@@ -291,18 +291,23 @@ fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize
     let start_addr = relo_off + trampoline.vaddr;
     let end_addr = (start_addr + trampoline.size).next_multiple_of(0x1000);
     let mut need_copy = false;
-    unsafe {
+    let ret = unsafe {
         ElfLoaderMmap::mmap(
             Some(start_addr),
             end_addr - start_addr,
             elf_loader::mmap::ProtFlags::PROT_READ | elf_loader::mmap::ProtFlags::PROT_WRITE,
-            elf_loader::mmap::MapFlags::MAP_PRIVATE | elf_loader::mmap::MapFlags::MAP_FIXED,
+            elf_loader::mmap::MapFlags::MAP_PRIVATE,
             trampoline.file_offset,
             Some(fd),
             &mut need_copy,
         )
     }
     .expect("failed to mmap trampoline section");
+    assert_eq!(
+        start_addr,
+        ret.as_ptr() as usize,
+        "trampoline mapping address is taken"
+    );
     // The first 8 bytes of the data is the magic number,
     let version_number = start_addr as *const u64;
     assert_eq!(
