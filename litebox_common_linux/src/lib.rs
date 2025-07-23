@@ -1240,7 +1240,7 @@ pub enum MadviseBehavior {
     DoFork = 11,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Sysinfo {
     /// Seconds since boot
     pub uptime: usize,

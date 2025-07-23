@@ -84,10 +84,7 @@ pub(crate) fn sys_uname(buf: crate::MutPtr<litebox_common_linux::Utsname>) -> Re
 pub(crate) fn sys_sysinfo() -> litebox_common_linux::Sysinfo {
     let now = litebox_platform_multiplex::platform().now();
     litebox_common_linux::Sysinfo {
-        uptime: now
-            .duration_since(litebox_platform_multiplex::boot_time())
-            .as_secs()
-            .truncate(),
+        uptime: now.duration_since(crate::boot_time()).as_secs().truncate(),
         // TODO: Populate these fields with actual values
         loads: [0; 3],
         #[cfg(target_arch = "x86_64")]
@@ -100,11 +97,10 @@ pub(crate) fn sys_sysinfo() -> litebox_common_linux::Sysinfo {
         totalswap: 0,
         freeswap: 0,
         procs: super::process::NR_THREADS.load(core::sync::atomic::Ordering::Relaxed),
-        pad: 0,
         totalhigh: 0,
         freehigh: 0,
         mem_unit: 1,
-        _f: [0; 20 - 2 * core::mem::size_of::<usize>() - core::mem::size_of::<u32>()],
+        ..Default::default()
     }
 }
 

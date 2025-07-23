@@ -47,11 +47,28 @@ type LinuxFS = litebox::fs::layered::FileSystem<
 
 type FileFd = litebox::fd::TypedFd<LinuxFS>;
 
+static BOOT_TIME: once_cell::race::OnceBox<<Platform as litebox::platform::TimeProvider>::Instant> =
+    once_cell::race::OnceBox::new();
+
+/// Get the `Instant` representing the boot time of the platform.
+///
+/// # Panics
+///
+/// Panics if [`litebox`] has not been invoked before this
+pub(crate) fn boot_time() -> &'static <Platform as litebox::platform::TimeProvider>::Instant {
+    BOOT_TIME
+        .get()
+        .expect("set_platform should have already been called before this point")
+}
+
 /// Get the global litebox object
 pub fn litebox<'a>() -> &'a LiteBox<Platform> {
     static LITEBOX: OnceBox<LiteBox<Platform>> = OnceBox::new();
     LITEBOX.get_or_init(|| {
-        alloc::boxed::Box::new(LiteBox::new(litebox_platform_multiplex::platform()))
+        use litebox::platform::TimeProvider as _;
+        let platform = litebox_platform_multiplex::platform();
+        let _ = BOOT_TIME.get_or_init(|| alloc::boxed::Box::new(platform.now()));
+        alloc::boxed::Box::new(LiteBox::new(platform))
     })
 }
 
