@@ -15,21 +15,16 @@ pub fn sys_cryp_random_number_generate(buf: &mut [u8]) -> Result<(), Errno> {
         unsafe {
             rdrand64_step(&mut val);
         }
-        let bytes = val.to_be_bytes();
-        for j in 0..8 {
-            buf[i * 8 + j] = bytes[j];
-        }
+        buf[i * 8..(i + 1) * 8].copy_from_slice(&val.to_be_bytes());
     }
 
-    if buf.len() % 8 != 0 {
+    let remainder = buf.len() % 8;
+    if remainder != 0 {
         let mut val: u64 = 0;
         unsafe {
             rdrand64_step(&mut val);
         }
-        let bytes = val.to_be_bytes();
-        for j in 0..(buf.len() % 8) {
-            buf[blen8 * 8 + j] = bytes[j];
-        }
+        buf[blen8 * 8..blen8 * 8 + remainder].copy_from_slice(&val.to_be_bytes()[..remainder]);
     }
 
     Ok(())
