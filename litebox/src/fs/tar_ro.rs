@@ -40,6 +40,11 @@ use super::{
 /// `b'Taro'.hex()`.
 const DEVICE_ID: usize = 0x5461726f;
 
+/// TODO(jayb): Replace this proper auto-incrementing inode number storage (although that will
+/// require migrating to the hashmap based tar entry storage). This is ok for now, until something
+/// is actually checking for real inode numbers.
+const TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER: usize = 0xFACE;
+
 /// Block size for file system I/O operations
 // TODO(jayb): Determine appropriate block size
 const BLOCK_SIZE: usize = 0;
@@ -150,7 +155,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         } else {
             // it is a dir
             Ok(self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
-                idx,
                 path: path.to_owned(),
                 metadata: AnyMap::new(),
             }))
@@ -317,14 +321,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         });
         match entry {
             None => Err(PathError::NoSuchFileOrDirectory)?,
-            Some((idx, p)) if p.filename().as_str().unwrap() != path => Ok(super::FileStatus {
+            Some((_, p)) if p.filename().as_str().unwrap() != path => Ok(super::FileStatus {
                 file_type: super::FileType::Directory,
                 mode: DEFAULT_DIR_MODE,
                 size: super::DEFAULT_DIRECTORY_SIZE,
                 owner: owner_from_posix_header(p.posix_header()),
                 node_info: NodeInfo {
                     dev: DEVICE_ID,
-                    ino: idx,
+                    ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
                     rdev: None,
                 },
                 blksize: BLOCK_SIZE,
@@ -364,14 +368,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     blksize: BLOCK_SIZE,
                 })
             }
-            Descriptor::Dir { idx, .. } => Ok(super::FileStatus {
+            Descriptor::Dir { .. } => Ok(super::FileStatus {
                 file_type: super::FileType::Directory,
                 mode: DEFAULT_DIR_MODE,
                 size: super::DEFAULT_DIRECTORY_SIZE,
                 owner: DEFAULT_DIRECTORY_OWNER,
                 node_info: NodeInfo {
                     dev: DEVICE_ID,
-                    ino: *idx,
+                    ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
                     rdev: None,
                 },
                 blksize: BLOCK_SIZE,
@@ -455,7 +459,6 @@ enum Descriptor {
         metadata: AnyMap,
     },
     Dir {
-        idx: usize,
         #[expect(
             dead_code,
             reason = "mostly used for debugging; we might consider removing this in the future"
