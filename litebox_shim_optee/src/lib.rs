@@ -272,19 +272,6 @@ impl TeeObjHandle {
     }
 }
 
-/// A data structure to represent a TEE object refered by `TeeObjHandle`.
-/// This is an in-kernel data structure such that we can have our own
-/// representation (i.e., doesn't have to match the original OP-TEE data structure).
-#[expect(dead_code)]
-#[derive(Clone, Copy)]
-struct TeeObj<'a> {
-    pub info: TeeObjectInfo,
-    pub have_attrs: u32, // bitfield
-    pub attr: *const u8,
-    pub key: &'a [u8],
-    pub iv: &'a [u8],
-}
-
 /// A handle for `TeeCrypState`. Like `TeeObjHandle`, this is a handle for
 /// a cryptographic state to be provided to TA in the user space.
 #[derive(Clone, Copy)]
@@ -297,18 +284,6 @@ impl TeeCrypStateHandle {
             .map_err(|_| Errno::EINVAL)
             .map(TeeCrypStateHandle)
     }
-}
-
-/// A data structure to represent a cryptographic state refered by `TeeCrypStateHandle`.
-/// This is an in-kernel data structure such that we can have our own representation.
-#[expect(dead_code)]
-#[derive(Clone, Copy)]
-struct TeeCrypState {
-    algo: TeeAlgorithm,
-    mode: TeeOperationMode,
-    obj_id_1: TeeObjHandle,
-    obj_id_2: TeeObjHandle,
-    initialized: bool,
 }
 
 /// TA session ID which is equivalent to a process ID.
