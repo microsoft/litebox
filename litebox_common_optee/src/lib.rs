@@ -11,11 +11,13 @@ use syscall_nr::TeeSyscallNr;
 
 pub mod syscall_nr;
 
+type Timeout = u32;
+
 // Based on `optee_os/lib/libutee/include/utee_syscalls.h`
 #[non_exhaustive]
 pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Return {
-        ret_value: usize,
+        ret: usize,
     },
     Log {
         buf: Platform::RawConstPointer<u8>,
@@ -25,21 +27,21 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         code: usize,
     },
     OpenTaSession {
-        ta_uuid: Platform::RawConstPointer<TeeUuid>,
-        timeout: u32,
-        user_params: Platform::RawConstPointer<UteeParams>,
-        ta_session_id: Platform::RawMutPointer<TaSessionId>,
-        ret_origin: Platform::RawMutPointer<TeeOrigin>,
+        dest: Platform::RawConstPointer<TeeUuid>,
+        cancel_req_to: Timeout,
+        params: Platform::RawConstPointer<UteeParams>,
+        sess: Platform::RawMutPointer<TaSessionId>,
+        ret_orig: Platform::RawMutPointer<TeeOrigin>,
     },
     CloseTaSession {
-        ta_session_id: Platform::RawMutPointer<TaSessionId>,
+        sess: Platform::RawMutPointer<TaSessionId>,
     },
     InvokeTaCommand {
-        ta_session_id: TaSessionId,
-        timeout: u32,
+        sess: TaSessionId,
+        cancel_req_to: Timeout,
         cmd_id: CommandId,
-        user_params: Platform::RawConstPointer<UteeParams>,
-        ret_origin: Platform::RawMutPointer<TeeOrigin>,
+        params: Platform::RawConstPointer<UteeParams>,
+        ret_orig: Platform::RawMutPointer<TeeOrigin>,
     },
     CheckAccessRights {
         flags: TeeMemoryAccessRights,
@@ -49,59 +51,59 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     CrypStateAlloc {
         algo: TeeAlgorithm,
         op_mode: TeeOperationMode,
-        obj_id_1: TeeObjHandle,
-        obj_id_2: TeeObjHandle,
-        state_id: Platform::RawMutPointer<TeeCrypStateHandle>,
+        key1: TeeObjHandle,
+        key2: TeeObjHandle,
+        state: Platform::RawMutPointer<TeeCrypStateHandle>,
     },
     CrypStateCopy {
-        dst_state_id: TeeCrypStateHandle,
-        src_state_id: TeeCrypStateHandle,
+        dst: TeeCrypStateHandle,
+        src: TeeCrypStateHandle,
     },
     CrypStateFree {
-        state_id: TeeCrypStateHandle,
+        state: TeeCrypStateHandle,
     },
     CipherInit {
-        state_id: TeeCrypStateHandle,
+        state: TeeCrypStateHandle,
         iv: Platform::RawConstPointer<u8>,
         iv_len: usize,
     },
     CipherUpdate {
-        state_id: TeeCrypStateHandle,
+        state: TeeCrypStateHandle,
         src: Platform::RawConstPointer<u8>,
         src_len: usize,
         dst: Platform::RawMutPointer<u8>,
         dst_len: Platform::RawMutPointer<u64>,
     },
     CipherFinal {
-        state_id: TeeCrypStateHandle,
+        state: TeeCrypStateHandle,
         src: Platform::RawConstPointer<u8>,
         src_len: usize,
         dst: Platform::RawMutPointer<u8>,
         dst_len: Platform::RawMutPointer<u64>,
     },
     CrypObjGetInfo {
-        obj_id: TeeObjHandle,
+        obj: TeeObjHandle,
         info: Platform::RawMutPointer<TeeObjectInfo>,
     },
     CrypObjAlloc {
-        obj_type: TeeObjectType,
-        max_key_size: usize,
-        obj_id: Platform::RawMutPointer<TeeObjHandle>,
+        typ: TeeObjectType,
+        max_size: usize,
+        obj: Platform::RawMutPointer<TeeObjHandle>,
     },
     CrypObjClose {
-        obj_id: TeeObjHandle,
+        obj: TeeObjHandle,
     },
     CrypObjReset {
-        obj_id: TeeObjHandle,
+        obj: TeeObjHandle,
     },
     CrypObjPopulate {
-        obj_id: TeeObjHandle,
-        usr_attrs: Platform::RawMutPointer<UteeAttribute>,
+        obj: TeeObjHandle,
+        attrs: Platform::RawMutPointer<UteeAttribute>,
         attr_count: usize,
     },
     CrypObjCopy {
-        dst_obj_id: TeeObjHandle,
-        src_obj_id: TeeObjHandle,
+        dst_obj: TeeObjHandle,
+        src_obj: TeeObjHandle,
     },
     CrypRandomNumberGenerate {
         buf: Platform::RawMutPointer<u8>,
@@ -114,7 +116,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
         let sysnr = u32::try_from(syscall_number).map_err(|_| Errno::ENOSYS)?;
         let dispatcher = match TeeSyscallNr::try_from(sysnr).unwrap_or(TeeSyscallNr::Unknown) {
             TeeSyscallNr::Return => SyscallRequest::Return {
-                ret_value: ctx.syscall_arg(0),
+                ret: ctx.syscall_arg(0),
             },
             TeeSyscallNr::Log => SyscallRequest::Log {
                 buf: Platform::RawConstPointer::from_usize(ctx.syscall_arg(0)),
@@ -126,48 +128,48 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             TeeSyscallNr::CrypStateAlloc => SyscallRequest::CrypStateAlloc {
                 algo: TeeAlgorithm::try_from_usize(ctx.syscall_arg(0))?,
                 op_mode: TeeOperationMode::try_from_usize(ctx.syscall_arg(1))?,
-                obj_id_1: TeeObjHandle::try_from_usize(ctx.syscall_arg(2))?,
-                obj_id_2: TeeObjHandle::try_from_usize(ctx.syscall_arg(3))?,
-                state_id: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
+                key1: TeeObjHandle::try_from_usize(ctx.syscall_arg(2))?,
+                key2: TeeObjHandle::try_from_usize(ctx.syscall_arg(3))?,
+                state: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
             },
             TeeSyscallNr::CrypStateFree => SyscallRequest::CrypStateFree {
-                state_id: TeeCrypStateHandle::try_from_usize(ctx.syscall_arg(0))?,
+                state: TeeCrypStateHandle::try_from_usize(ctx.syscall_arg(0))?,
             },
             TeeSyscallNr::CipherInit => SyscallRequest::CipherInit {
-                state_id: TeeCrypStateHandle::try_from_usize(ctx.syscall_arg(0))?,
+                state: TeeCrypStateHandle::try_from_usize(ctx.syscall_arg(0))?,
                 iv: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
                 iv_len: ctx.syscall_arg(2),
             },
             TeeSyscallNr::CipherUpdate => SyscallRequest::CipherUpdate {
-                state_id: TeeCrypStateHandle::try_from_usize(ctx.syscall_arg(0))?,
+                state: TeeCrypStateHandle::try_from_usize(ctx.syscall_arg(0))?,
                 src: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
                 src_len: ctx.syscall_arg(2),
                 dst: Platform::RawMutPointer::from_usize(ctx.syscall_arg(3)),
                 dst_len: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
             },
             TeeSyscallNr::CrypObjGetInfo => SyscallRequest::CrypObjGetInfo {
-                obj_id: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
+                obj: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
                 info: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
             },
             TeeSyscallNr::CrypObjAlloc => SyscallRequest::CrypObjAlloc {
-                obj_type: TeeObjectType::try_from_usize(ctx.syscall_arg(0))?,
-                max_key_size: ctx.syscall_arg(1),
-                obj_id: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
+                typ: TeeObjectType::try_from_usize(ctx.syscall_arg(0))?,
+                max_size: ctx.syscall_arg(1),
+                obj: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
             },
             TeeSyscallNr::CrypObjClose => SyscallRequest::CrypObjClose {
-                obj_id: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
+                obj: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
             },
             TeeSyscallNr::CrypObjReset => SyscallRequest::CrypObjReset {
-                obj_id: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
+                obj: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
             },
             TeeSyscallNr::CrypObjPopulate => SyscallRequest::CrypObjPopulate {
-                obj_id: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
-                usr_attrs: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+                obj: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
+                attrs: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
                 attr_count: ctx.syscall_arg(2),
             },
             TeeSyscallNr::CrypObjCopy => SyscallRequest::CrypObjCopy {
-                dst_obj_id: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
-                src_obj_id: TeeObjHandle::try_from_usize(ctx.syscall_arg(1))?,
+                dst_obj: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
+                src_obj: TeeObjHandle::try_from_usize(ctx.syscall_arg(1))?,
             },
             TeeSyscallNr::CrypRandomNumberGenerate => SyscallRequest::CrypRandomNumberGenerate {
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),

@@ -1,7 +1,7 @@
 use litebox_common_linux::errno::Errno;
 
 // placeholder
-pub fn sys_return(_ret_value: usize) -> ! {
+pub fn sys_return(_ret: usize) -> ! {
     todo!("switch to VTL0");
 }
 

@@ -36,7 +36,7 @@ pub fn litebox<'a>() -> &'a LiteBox<Platform> {
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
 pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
     let res: Result<usize, Errno> = match request {
-        SyscallRequest::Return { ret_value } => syscalls::tee::sys_return(ret_value),
+        SyscallRequest::Return { ret } => syscalls::tee::sys_return(ret),
         SyscallRequest::Log { buf, len } => match unsafe { buf.to_cow_slice(len) } {
             Some(buf) => syscalls::tee::sys_log(&buf),
             None => Err(Errno::EFAULT),
