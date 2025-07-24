@@ -6,12 +6,18 @@
 
 use core::sync::atomic::AtomicU32;
 use core::time::Duration;
+use std::os::raw::c_void;
 
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox_common_linux::PunchthroughSyscall;
+
+use windows_sys::Win32::{
+    System::Memory::{self as Win32_Memory, VirtualAlloc2},
+    System::Threading::GetCurrentProcess,
+};
 
 extern crate alloc;
 
@@ -113,7 +119,6 @@ impl litebox::platform::RawMutexProvider for WindowsUserland {
 }
 
 // A skeleton of a raw mutex for Windows.
-#[expect(dead_code)]
 pub struct RawMutex {
     // The `inner` is the value shown to the outside world as an underlying atomic.
     inner: AtomicU32,
@@ -241,20 +246,48 @@ impl litebox::platform::RawPointerProvider for WindowsUserland {
     type RawMutPointer<T: Clone> = litebox::platform::trivial_providers::TransparentMutPtr<T>;
 }
 
+#[expect(dead_code, reason = "Will be added for PageManagementProvider soon.")]
+fn prot_flags(flags: MemoryRegionPermissions) -> Win32_Memory::PAGE_PROTECTION_FLAGS {
+    match (
+        flags.contains(MemoryRegionPermissions::READ),
+        flags.contains(MemoryRegionPermissions::WRITE),
+        flags.contains(MemoryRegionPermissions::EXEC),
+    ) {
+        // no permissions
+        (false, false, false) => Win32_Memory::PAGE_NOACCESS,
+        // read-only
+        (true, false, false) => Win32_Memory::PAGE_READONLY,
+        // write-only (Windows doesn't have write-only, so we use r+w)
+        (false, true, false) => Win32_Memory::PAGE_READWRITE,
+        // read-write
+        (true, true, false) => Win32_Memory::PAGE_READWRITE,
+        // exeute-only (Windows doesn't have execute-only, so we use r+x)
+        (false, false, true) => Win32_Memory::PAGE_EXECUTE_READ,
+        // read-execute
+        (true, false, true) => Win32_Memory::PAGE_EXECUTE_READ,
+        // write-execute (Windows doesn't have write-execute, so we use rwx)
+        (false, true, true) => Win32_Memory::PAGE_EXECUTE_READWRITE,
+        // read-write-execute
+        (true, true, true) => Win32_Memory::PAGE_EXECUTE_READWRITE,
+    }
+}
+
+#[expect(unused, reason = "Will be added for PageManagementProvider soon.")]
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
     fn allocate_pages(
         &self,
-        range: core::ops::Range<usize>,
+        suggested_range: core::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
-        populate_pages: bool,
+        populate_pages_immediately: bool,
+        fixed_address: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         unimplemented!(
             "allocate_pages is not implemented for Windows yet. range: {:?}, permissions: {:?}, can_grow_down: {}, populate_pages: {}",
-            range,
+            suggested_range,
             initial_permissions,
             can_grow_down,
-            populate_pages
+            populate_pages_immediately
         );
     }
 
@@ -292,8 +325,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         );
     }
 
-    fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
-        self.reserved_pages.iter()
+    fn reserved_pages(&self) -> impl Iterator<Item = &std::ops::Range<usize>> {
+        std::iter::empty()
     }
 }
 
@@ -348,12 +381,34 @@ impl litebox::platform::StdioProvider for WindowsUserland {
     }
 }
 
-// TODO: currently we do not have a global allocator, will implement it by
-// finishing Windows's MemoryProvider trait.
+#[global_allocator]
+static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 28, WindowsUserland> =
+    litebox::mm::allocator::SafeZoneAllocator::new();
 
 impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
-    fn alloc(_layout: &std::alloc::Layout) -> Option<(usize, usize)> {
-        unimplemented!();
+    fn alloc(layout: &std::alloc::Layout) -> Option<(usize, usize)> {
+        let size = core::cmp::max(
+            layout.size().next_power_of_two(),
+            // Note `mmap` provides no guarantee of alignment, so we double the size to ensure we
+            // can always find a required chunk within the returned memory region.
+            core::cmp::max(layout.align(), 0x1000) << 1,
+        );
+
+        let addr: *mut c_void = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                core::ptr::null_mut(),
+                size,
+                Win32_Memory::MEM_COMMIT,
+                Win32_Memory::PAGE_READWRITE,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if addr.is_null() {
+            return None;
+        }
+        Some((addr as usize, size))
     }
 
     unsafe fn free(_addr: usize) {
