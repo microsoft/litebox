@@ -2,7 +2,10 @@
 //!
 //! Examples of syscalls handled here include `getrandom`, `uname`, and similar operations.
 
-use litebox::platform::RawMutPointer as _;
+use litebox::{
+    platform::{Instant as _, RawMutPointer as _, TimeProvider as _},
+    utils::TruncateExt as _,
+};
 use litebox_common_linux::errno::Errno;
 
 /// Handle syscall `getrandom`.
@@ -75,6 +78,30 @@ const SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
 /// Handle syscall `uname`.
 pub(crate) fn sys_uname(buf: crate::MutPtr<litebox_common_linux::Utsname>) -> Result<(), Errno> {
     unsafe { buf.write_at_offset(0, SYS_INFO) }.ok_or(Errno::EFAULT)
+}
+
+/// Handle syscall `sysinfo`.
+pub(crate) fn sys_sysinfo() -> litebox_common_linux::Sysinfo {
+    let now = litebox_platform_multiplex::platform().now();
+    litebox_common_linux::Sysinfo {
+        uptime: now.duration_since(crate::boot_time()).as_secs().truncate(),
+        // TODO: Populate these fields with actual values
+        loads: [0; 3],
+        #[cfg(target_arch = "x86_64")]
+        totalram: 4 * 1024 * 1024 * 1024,
+        #[cfg(target_arch = "x86")]
+        totalram: 3 * 1024 * 1024 * 1024,
+        freeram: 2 * 1024 * 1024 * 1024,
+        sharedram: 0, // We don't support shared memory
+        bufferram: 0,
+        totalswap: 0,
+        freeswap: 0,
+        procs: super::process::NR_THREADS.load(core::sync::atomic::Ordering::Relaxed),
+        totalhigh: 0,
+        freehigh: 0,
+        mem_unit: 1,
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]

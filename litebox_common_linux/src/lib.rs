@@ -1240,6 +1240,39 @@ pub enum MadviseBehavior {
     DoFork = 11,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct Sysinfo {
+    /// Seconds since boot
+    pub uptime: usize,
+    /// 1, 5, and 15 minute load averages
+    pub loads: [usize; 3],
+    /// Total usable main memory size
+    pub totalram: usize,
+    /// Available memory size
+    pub freeram: usize,
+    /// Amount of shared memory
+    pub sharedram: usize,
+    /// Memory used by buffers
+    pub bufferram: usize,
+    /// Total swap space size
+    pub totalswap: usize,
+    /// swap space still available
+    pub freeswap: usize,
+    /// Number of current processes
+    pub procs: u16,
+    /// Explicit padding for m68k
+    pub pad: u16,
+    /// Total high memory size
+    pub totalhigh: usize,
+    /// Available high memory size
+    pub freehigh: usize,
+    /// Memory unit size in bytes
+    pub mem_unit: u32,
+    /// Padding: libc5 uses this..
+    #[allow(clippy::pub_underscore_fields)]
+    pub _f: [u8; 20 - 2 * core::mem::size_of::<usize>() - core::mem::size_of::<u32>()],
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
@@ -1524,6 +1557,9 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     Geteuid,
     Getgid,
     Getegid,
+    Sysinfo {
+        buf: Platform::RawMutPointer<Sysinfo>,
+    },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
 }
@@ -2084,6 +2120,9 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     len: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
                 }
             }
+            Sysno::sysinfo => SyscallRequest::Sysinfo {
+                buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
+            },
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq => {
                 SyscallRequest::Ret(errno::Errno::ENOSYS)
             }

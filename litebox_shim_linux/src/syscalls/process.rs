@@ -14,6 +14,9 @@ use litebox_common_linux::{ArchPrctlArg, errno::Errno};
 
 use crate::MutPtr;
 
+/// A global counter for the number of threads in the system.
+pub(super) static NR_THREADS: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(1);
+
 pub(crate) fn sys_arch_prctl(
     arg: ArchPrctlArg<litebox_platform_multiplex::Platform>,
 ) -> Result<(), Errno> {
@@ -201,6 +204,7 @@ pub(crate) fn sys_exit(status: i32) -> ! {
         let _ = wake_robust_list(robust_list);
     }
 
+    NR_THREADS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     litebox_platform_multiplex::platform().terminate_thread(status)
 }
 
@@ -323,6 +327,7 @@ pub(crate) fn sys_clone(
             let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid.truncate()) };
         }
     }
+    NR_THREADS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Ok(child_tid)
 }
 
