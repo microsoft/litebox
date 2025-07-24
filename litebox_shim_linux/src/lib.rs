@@ -677,6 +677,9 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
         SyscallRequest::GetRandom { buf, count, flags } => {
             syscalls::misc::sys_getrandom(buf, count, flags)
         }
+        SyscallRequest::Getpid => {
+            Ok(syscalls::process::sys_getpid().reinterpret_as_unsigned() as usize)
+        }
         SyscallRequest::Getuid => Ok(syscalls::process::sys_getuid()),
         SyscallRequest::Getgid => Ok(syscalls::process::sys_getgid()),
         SyscallRequest::Geteuid => Ok(syscalls::process::sys_geteuid()),

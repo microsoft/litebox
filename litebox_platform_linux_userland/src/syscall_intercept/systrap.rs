@@ -221,7 +221,6 @@ fn register_seccomp_filter() {
                 .unwrap(),
             ],
         ),
-        (libc::SYS_getpid, vec![]),
         (libc::SYS_capget, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (
