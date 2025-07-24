@@ -558,7 +558,7 @@ where
             let Some(range) = PageRange::new(fault_addr, start) else {
                 unreachable!()
             };
-            unsafe { vmem.insert_mapping(range, vma, false) };
+            unsafe { vmem.insert_mapping(range, vma, false, true) };
         }
 
         if <Platform as VmemPageFaultHandler>::access_error(error_code, vma.flags()) {

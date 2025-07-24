@@ -700,20 +700,24 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for FreeBSDUserland {
     fn allocate_pages(
         &self,
-        range: core::ops::Range<usize>,
+        suggested_range: core::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
-        populate_pages: bool,
+        populate_pages_immediately: bool,
+        fixed_address: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         // Use FreeBSD's mmap flags
         let map_flags = freebsd_types::MapFlags::MAP_PRIVATE
             | freebsd_types::MapFlags::MAP_ANONYMOUS
-            | freebsd_types::MapFlags::MAP_FIXED
-            | (if can_grow_down {
+            | (if fixed_address {
+                freebsd_types::MapFlags::MAP_FIXED
+            } else {
+                freebsd_types::MapFlags::empty()
+            } | if can_grow_down {
                 freebsd_types::MapFlags::MAP_STACK
             } else {
                 freebsd_types::MapFlags::empty()
-            } | if populate_pages {
+            } | if populate_pages_immediately {
                 freebsd_types::MapFlags::MAP_PREFAULT_READ
             } else {
                 freebsd_types::MapFlags::empty()
@@ -722,8 +726,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Fr
         let ptr = unsafe {
             syscalls::syscall6(
                 syscalls::Sysno::Mmap,
-                range.start,
-                range.len(),
+                suggested_range.start,
+                suggested_range.len(),
                 prot_flags(initial_permissions)
                     .bits()
                     .reinterpret_as_unsigned() as usize,

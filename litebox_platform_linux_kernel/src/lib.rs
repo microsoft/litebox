@@ -354,12 +354,14 @@ pub trait HostInterface {
 impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
     fn allocate_pages(
         &self,
-        range: core::ops::Range<usize>,
+        suggested_range: core::ops::Range<usize>,
         initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
         can_grow_down: bool,
-        populate_pages: bool,
+        populate_pages_immediately: bool,
+        /* ignored because the suggested address is guaranteed to be available when running in kernel mode */
+        _fixed_address: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
-        let range = PageRange::new(range.start, range.end)
+        let range = PageRange::new(suggested_range.start, suggested_range.end)
             .ok_or(litebox::platform::page_mgmt::AllocationError::Unaligned)?;
         let flags = u32::from(initial_permissions.bits())
             | if can_grow_down {
@@ -368,7 +370,9 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
                 0
             };
         let flags = litebox::mm::linux::VmFlags::from_bits(flags).unwrap();
-        Ok(self.page_table.map_pages(range, flags, populate_pages))
+        Ok(self
+            .page_table
+            .map_pages(range, flags, populate_pages_immediately))
     }
 
     unsafe fn deallocate_pages(
