@@ -58,7 +58,7 @@ static BOOT_TIME: once_cell::race::OnceBox<<Platform as litebox::platform::TimeP
 pub(crate) fn boot_time() -> &'static <Platform as litebox::platform::TimeProvider>::Instant {
     BOOT_TIME
         .get()
-        .expect("set_platform should have already been called before this point")
+        .expect("litebox() should have already been called before this point")
 }
 
 /// Get the global litebox object
