@@ -111,6 +111,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
 }
 
+// `litebox_common_optee` does use error codes for OP-TEE-like world (TAs) and Linux-like world (the LVBS platform).
+// for the below syscall handling, we use Linux error codes (i.e., `Errno`) because any errors will be returned
+// to the LVBS platform or runner.
+
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
     pub fn try_from_raw(syscall_number: usize, ctx: &SyscallContext) -> Result<Self, Errno> {
         let sysnr = u32::try_from(syscall_number).map_err(|_| Errno::ENOSYS)?;
@@ -362,6 +366,7 @@ const TEE_MODE_MAC: u32 = 4;
 const TEE_MODE_DIGEST: u32 = 5;
 const TEE_MODE_DERIVE: u32 = 6;
 
+/// `TEE_OperationMode` from `optee_os/lib/libutee/include/tee_api_types.h`
 #[derive(Clone, Copy, TryFromPrimitive)]
 #[repr(u32)]
 pub enum TeeOperationMode {
@@ -387,6 +392,7 @@ const TEE_ORIGIN_COMMS: u32 = 1;
 const TEE_ORIGIN_TEE: u32 = 2;
 const TEE_ORIGIN_TRUTED_APP: u32 = 3;
 
+/// Origin code constants from `optee_os/lib/libutee/include/tee_api_defines.h`
 #[derive(Clone, Copy, TryFromPrimitive)]
 #[repr(u32)]
 pub enum TeeOrigin {
@@ -405,6 +411,7 @@ impl TeeOrigin {
 }
 
 bitflags::bitflags! {
+    /// Memory access rights constants from `optee_os/lib/libutee/include/tee_api_defines.h`
     #[derive(Clone, Copy)]
     pub struct TeeMemoryAccessRights: u32 {
         const TEE_MEMORY_ACCESS_READ = 0x1;
@@ -415,9 +422,6 @@ bitflags::bitflags! {
     }
 }
 
-// from `optee_os/lib/libutee/include/tee_api_defines.h`
-// TODO: add more algorithms as needed. IMO we should not provide weak algorithms like
-// DES and MD5. Also, KMPP doesn't use this crypto API (it uses its own SymCrypt).
 const TEE_ALG_AES_CTR: u32 = 0x1000_0210;
 const TEE_ALG_AES_GCM: u32 = 0x4000_0810;
 const TEE_ALG_RSASSA_PKCS1_V1_5_SHA256: u32 = 0x7000_4830;
@@ -426,6 +430,9 @@ const TEE_ALG_HMAC_SHA256: u32 = 0x3000_0004;
 const TEE_ALG_HMAC_SHA512: u32 = 0x3000_0006;
 const TEE_ALG_ILLEGAL_VALUE: u32 = 0xefff_ffff;
 
+/// Algorithm identifiers from `optee_os/lib/libutee/include/tee_api_defines.h`
+/// TODO: add more algorithms as needed. IMO we should not provide weak algorithms like
+/// DES and MD5. Also, KMPP doesn't use this crypto API (it uses its own SymCrypt).
 #[non_exhaustive]
 #[derive(Clone, Copy, TryFromPrimitive)]
 #[repr(u32)]
@@ -447,8 +454,6 @@ impl TeeAlgorithm {
     }
 }
 
-// from `optee_os/lib/libutee/include/tee_api_defines.h`
-// TODO: add more object types as needed
 const TEE_TYPE_AES: u32 = 0xa000_0010;
 const TEE_TYPE_HMAC_SHA256: u32 = 0xa000_0004;
 const TEE_TYPE_HMAC_SHA512: u32 = 0xa000_0006;
@@ -458,6 +463,8 @@ const TEE_TYPE_GENERIC_SECRET: u32 = 0xa000_0000;
 const TEE_TYPE_CORRUPTED_OBJECT: u32 = 0xa000_00be;
 const TEE_TYPE_DATA: u32 = 0xa000_00bf;
 
+/// Object types `optee_os/lib/libutee/include/tee_api_defines.h`
+/// TODO: add more object types as needed
 #[non_exhaustive]
 #[derive(Clone, Copy, TryFromPrimitive)]
 #[repr(u32)]
@@ -478,5 +485,80 @@ impl TeeObjectType {
         u32::try_from(value)
             .map_err(|_| Errno::EINVAL)
             .and_then(|v| Self::try_from(v).map_err(|_| Errno::EINVAL))
+    }
+}
+
+const TEE_SUCCESS: u32 = 0x0000_0000;
+const TEE_ERROR_CORRUPT_OBJECT: u32 = 0xf010_0001;
+const TEE_ERROR_CORRUPT_OBJECT_2: u32 = 0xf010_0002;
+const TEE_ERROR_STORAGE_NOT_AVAILABLE: u32 = 0xf010_0003;
+const TEE_ERROR_STORAGE_NOT_AVAILABLE_2: u32 = 0xf010_0004;
+const TEE_ERROR_CIPHERTEXT_INVALID: u32 = 0xf010_0006;
+const TEE_ERROR_GENERIC: u32 = 0xfff_0000;
+const TEE_ERROR_ACCESS_DENIED: u32 = 0xfff_0001;
+const TEE_ERROR_CANCEL: u32 = 0xfff_0002;
+const TEE_ERROR_ACCESS_CONFLICT: u32 = 0xfff_0003;
+const TEE_ERROR_EXCESS_DATA: u32 = 0xfff_0004;
+const TEE_ERROR_BAD_FORMAT: u32 = 0xfff_0005;
+const TEE_ERROR_BAD_PARAMETERS: u32 = 0xfff_0006;
+const TEE_ERROR_BAD_STATE: u32 = 0xfff_0007;
+const TEE_ERROR_ITEM_NOT_FOUND: u32 = 0xfff_0008;
+const TEE_ERROR_NOT_IMPLEMENTED: u32 = 0xfff_0009;
+const TEE_ERROR_NOT_SUPPORTED: u32 = 0xfff_000a;
+const TEE_ERROR_NO_DATA: u32 = 0xfff_000b;
+const TEE_ERROR_OUT_OF_MEMORY: u32 = 0xfff_000c;
+const TEE_ERROR_BUSY: u32 = 0xfff_000d;
+const TEE_ERROR_COMMUNICATION: u32 = 0xfff_000e;
+const TEE_ERROR_SECURITY: u32 = 0xfff_000f;
+const TEE_ERROR_SHORT_BUFFER: u32 = 0xfff_0010;
+const TEE_ERROR_EXTERNAL_CANCEL: u32 = 0xfff_0011;
+const TEE_ERROR_OVERFLOW: u32 = 0xfff_300f;
+const TEE_ERROR_TARGET_DEAD: u32 = 0xfff_3024;
+const TEE_ERROR_STORAGE_NO_SPACE: u32 = 0xfff_3041;
+const TEE_ERROR_MAC_INVALID: u32 = 0xfff_3071;
+const TEE_ERROR_SIGNATURE_INVALID: u32 = 0xfff_3072;
+const TEE_ERROR_TIME_NOT_SET: u32 = 0xfff_5000;
+const TEE_ERROR_TIME_NEEDS_RESET: u32 = 0xfff_5001;
+
+/// `TEE_Result` (API error codes) from `optee_os/lib/libutee/include/tee_api_defines.h`
+#[derive(Clone, Copy, TryFromPrimitive)]
+#[repr(u32)]
+pub enum TeeResult {
+    Success = TEE_SUCCESS,
+    CorruptObject = TEE_ERROR_CORRUPT_OBJECT,
+    CorruptObject2 = TEE_ERROR_CORRUPT_OBJECT_2,
+    StorageNotAvailable = TEE_ERROR_STORAGE_NOT_AVAILABLE,
+    StorageNotAvailable2 = TEE_ERROR_STORAGE_NOT_AVAILABLE_2,
+    CiphertextInvalid = TEE_ERROR_CIPHERTEXT_INVALID,
+    GenericError = TEE_ERROR_GENERIC,
+    AccessDenied = TEE_ERROR_ACCESS_DENIED,
+    Cancel = TEE_ERROR_CANCEL,
+    AccessConflict = TEE_ERROR_ACCESS_CONFLICT,
+    ExcessData = TEE_ERROR_EXCESS_DATA,
+    BadFormat = TEE_ERROR_BAD_FORMAT,
+    BadParameters = TEE_ERROR_BAD_PARAMETERS,
+    BadState = TEE_ERROR_BAD_STATE,
+    ItemNotFound = TEE_ERROR_ITEM_NOT_FOUND,
+    NotImplemented = TEE_ERROR_NOT_IMPLEMENTED,
+    NotSupported = TEE_ERROR_NOT_SUPPORTED,
+    NoData = TEE_ERROR_NO_DATA,
+    OutOfMemory = TEE_ERROR_OUT_OF_MEMORY,
+    Busy = TEE_ERROR_BUSY,
+    CommunicationError = TEE_ERROR_COMMUNICATION,
+    SecurityError = TEE_ERROR_SECURITY,
+    ShortBuffer = TEE_ERROR_SHORT_BUFFER,
+    ExternalCancel = TEE_ERROR_EXTERNAL_CANCEL,
+    Overflow = TEE_ERROR_OVERFLOW,
+    TargetDead = TEE_ERROR_TARGET_DEAD,
+    StorageNoSpace = TEE_ERROR_STORAGE_NO_SPACE,
+    MacInvalid = TEE_ERROR_MAC_INVALID,
+    SignatureInvalid = TEE_ERROR_SIGNATURE_INVALID,
+    TimeNotSet = TEE_ERROR_TIME_NOT_SET,
+    TimeNeedsReset = TEE_ERROR_TIME_NEEDS_RESET,
+}
+
+impl From<TeeResult> for u32 {
+    fn from(res: TeeResult) -> Self {
+        res as u32
     }
 }

@@ -1,11 +1,11 @@
-use litebox_common_linux::errno::Errno;
+use litebox_common_optee::TeeResult;
 
 // Use RDRAND instruction for now for testing. We should decide whether we want to use this RNG or Rust one.
 // This heavily depends on the source of entropy we have (and whether we can trust it).
-pub fn sys_cryp_random_number_generate(buf: &mut [u8]) -> Result<(), Errno> {
+pub fn sys_cryp_random_number_generate(buf: &mut [u8]) -> Result<(), TeeResult> {
     use core::arch::x86_64::_rdrand64_step as rdrand64_step;
     if buf.is_empty() {
-        return Err(Errno::EINVAL);
+        return Err(TeeResult::BadParameters);
     }
 
     let blen8 = buf.len() >> 3;

@@ -86,18 +86,17 @@ impl SyscallContextRaw {
         VirtAddr::try_new(self.rsp).ok()
     }
 
-    /// # Panics
-    /// Panics if the conversion from `u64` to `usize` fails.
+    #[expect(clippy::cast_possible_truncation)]
     pub fn syscall_context(&self) -> SyscallContext {
         SyscallContext::new(&[
-            usize::try_from(self.rdi).unwrap(),
-            usize::try_from(self.rsi).unwrap(),
-            usize::try_from(self.rdx).unwrap(),
-            usize::try_from(self.r10).unwrap(),
-            usize::try_from(self.r8).unwrap(),
-            usize::try_from(self.r9).unwrap(),
-            usize::try_from(self.r12).unwrap(),
-            usize::try_from(self.r13).unwrap(),
+            self.rdi as usize,
+            self.rsi as usize,
+            self.rdx as usize,
+            self.r10 as usize,
+            self.r8 as usize,
+            self.r9 as usize,
+            self.r12 as usize,
+            self.r13 as usize,
         ])
     }
 }
