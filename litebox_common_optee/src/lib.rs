@@ -11,8 +11,6 @@ use syscall_nr::TeeSyscallNr;
 
 pub mod syscall_nr;
 
-type Timeout = u32;
-
 // Based on `optee_os/lib/libutee/include/utee_syscalls.h`
 #[non_exhaustive]
 pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
@@ -26,38 +24,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Panic {
         code: usize,
     },
-    OpenTaSession {
-        dest: Platform::RawConstPointer<TeeUuid>,
-        cancel_req_to: Timeout,
-        params: Platform::RawConstPointer<UteeParams>,
-        sess: Platform::RawMutPointer<TaSessionId>,
-        ret_orig: Platform::RawMutPointer<TeeOrigin>,
-    },
-    CloseTaSession {
-        sess: Platform::RawMutPointer<TaSessionId>,
-    },
-    InvokeTaCommand {
-        sess: TaSessionId,
-        cancel_req_to: Timeout,
-        cmd_id: CommandId,
-        params: Platform::RawConstPointer<UteeParams>,
-        ret_orig: Platform::RawMutPointer<TeeOrigin>,
-    },
-    CheckAccessRights {
-        flags: TeeMemoryAccessRights,
-        buf: Platform::RawConstPointer<u8>,
-        len: usize,
-    },
     CrypStateAlloc {
         algo: TeeAlgorithm,
         op_mode: TeeOperationMode,
         key1: TeeObjHandle,
         key2: TeeObjHandle,
         state: Platform::RawMutPointer<TeeCrypStateHandle>,
-    },
-    CrypStateCopy {
-        dst: TeeCrypStateHandle,
-        src: TeeCrypStateHandle,
     },
     CrypStateFree {
         state: TeeCrypStateHandle,
@@ -68,13 +40,6 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         iv_len: usize,
     },
     CipherUpdate {
-        state: TeeCrypStateHandle,
-        src: Platform::RawConstPointer<u8>,
-        src_len: usize,
-        dst: Platform::RawMutPointer<u8>,
-        dst_len: Platform::RawMutPointer<u64>,
-    },
-    CipherFinal {
         state: TeeCrypStateHandle,
         src: Platform::RawConstPointer<u8>,
         src_len: usize,
