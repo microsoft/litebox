@@ -15,11 +15,12 @@ use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox_common_linux::PunchthroughSyscall;
 
-use windows_sys::Win32::System::Memory::VirtualFree;
-use windows_sys::Win32::System::Memory::VirtualProtect;
 use windows_sys::Win32::{
     Foundation::{GetLastError, WIN32_ERROR},
-    System::Memory::{self as Win32_Memory, VirtualAlloc2},
+    System::Memory::{
+        self as Win32_Memory, PrefetchVirtualMemory, VirtualAlloc2, VirtualFree, VirtualProtect,
+    },
+    System::SystemInformation::{self as Win32_SysInfo},
     System::Threading::{
         self as Win32_Threading, GetCurrentProcess, TlsAlloc, TlsFree, TlsGetValue, TlsSetValue,
     },
@@ -65,7 +66,15 @@ impl Drop for TlsSlot {
 /// traits.
 pub struct WindowsUserland {
     tls_slot: TlsSlot,
+    sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
 }
+
+// Safety: Given that SYSTEM_INFO is not Send/Sync (it contains *mut c_void), we use RwLock to
+// ensure that the sys_info is only accessed in a thread-safe manner.
+// Moreover, SYSTEM_INFO is only initialized once during platform creation, and it is read-only
+// after that.
+unsafe impl Send for WindowsUserland {}
+unsafe impl Sync for WindowsUserland {}
 
 impl WindowsUserland {
     /// Create a new userland-Windows platform for use in `LiteBox`.
@@ -74,10 +83,15 @@ impl WindowsUserland {
     ///
     /// Panics if the TLS slot cannot be created.
     pub fn new() -> &'static Self {
+        let mut sys_info = Win32_SysInfo::SYSTEM_INFO::default();
+        Self::get_system_information(&mut sys_info);
+
         let platform = Self {
             tls_slot: TlsSlot::new().expect("Failed to create TLS slot!"),
+            sys_info: std::sync::RwLock::new(sys_info),
         };
         platform.set_init_tls();
+
         Box::leak(Box::new(platform))
     }
 
@@ -123,6 +137,23 @@ impl WindowsUserland {
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         self.set_thread_local_storage(tls);
     }
+
+    /// Retrieves information about the host platform (Windows).
+    fn get_system_information(sys_info: &mut Win32_SysInfo::SYSTEM_INFO) {
+        unsafe {
+            Win32_SysInfo::GetSystemInfo(sys_info);
+        }
+    }
+
+    fn round_up_to_granu(&self, x: usize) -> usize {
+        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
+        (x + gran - 1) & !(gran - 1)
+    }
+
+    fn round_down_to_granu(&self, x: usize) -> usize {
+        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
+        x & !(gran - 1)
+    }
 }
 
 impl litebox::platform::Provider for WindowsUserland {}
@@ -133,8 +164,10 @@ impl litebox::platform::ExitProvider for WindowsUserland {
     const EXIT_FAILURE: Self::ExitCode = 1;
 
     fn exit(&self, code: Self::ExitCode) -> ! {
-        let Self { tls_slot: _ } = self;
-
+        let Self {
+            tls_slot: _,
+            sys_info: _,
+        } = self;
         // TODO: Implement Windows process exit
         // For now, use standard process exit
         std::process::exit(code);
@@ -332,16 +365,23 @@ fn prot_flags(flags: MemoryRegionPermissions) -> Win32_Memory::PAGE_PROTECTION_F
     }
 }
 
-fn round_up_to_64k(x: usize) -> usize {
-    // Round up to the next 64KB boundary
-    const GRAN: usize = 64 * 1024;
-    (x + GRAN - 1) & !(GRAN - 1)
-}
-
-fn round_down_to_64k(x: usize) -> usize {
-    // Round down to the previous 64KB boundary
-    const GRAN: usize = 64 * 1024;
-    x & !(GRAN - 1)
+fn do_prefetch_on_range(start: usize, size: usize) {
+    println!(
+        "Prefetching memory range: {:p} - {:p}, size: {}",
+        start as *const c_void,
+        (start + size) as *const c_void,
+        size
+    );
+    let ok = unsafe {
+        let prefetch_entry = Win32_Memory::WIN32_MEMORY_RANGE_ENTRY {
+            VirtualAddress: start as *mut c_void,
+            NumberOfBytes: size,
+        };
+        PrefetchVirtualMemory(GetCurrentProcess(), 1, &raw const prefetch_entry, 0) != 0
+    };
+    assert!(ok, "PrefetchVirtualMemory failed with error: {}", unsafe {
+        GetLastError()
+    });
 }
 
 #[expect(unused, reason = "Will be added for PageManagementProvider soon.")]
@@ -356,44 +396,35 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let mut base_addr = suggested_range.start as *mut c_void;
         let mut size = suggested_range.len();
-        
         // TODO: For Windows, there is no MAP_GROWDOWN features so far.
-        // Thus, we allocate a larger size for enough memory for now.
         if can_grow_down {
             println!("Warning: can_grow_down is not supported on Windows, ignoring it.");
-            // size = size.next_power_of_two();
         }
-
-        if populate_pages_immediately {
-            println!("Warning: populate_pages_immediately is not supported on Windows, ignoring it.");
-        }
-
         if fixed_address {
             println!("Warning: fixed_address is not supported on Windows, ignoring it.");
         }
-       
-        println!("Start allocating pages at address: {:p}, size: {}, permissions: {:?}, prot_flags: {:x}", 
-            base_addr, size, initial_permissions, prot_flags(initial_permissions));
 
+        // 1) In case we have a suggested VA range, we first check and deal with the case
+        // that the address is already reserved.
         if suggested_range.start != 0 {
-            // check if the address is already reserved (but not committed yet)
             let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
             let query_value = unsafe {
                 Win32_Memory::VirtualQuery(
                     base_addr,
-                    &mut mbi,
+                    &raw mut mbi,
                     core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
                 )
             };
-            assert!(query_value != 0, "VirtualQuery failed: {}", unsafe { GetLastError() });
-            
-            // just need to commit this memory
+            assert!(query_value != 0, "VirtualQuery failed: {}", unsafe {
+                GetLastError()
+            });
+
+            // For already-reserved memory, we just need to commit it.
             if mbi.State == Win32_Memory::MEM_RESERVE {
-                println!("Memory: {:p} is reserved, but not committed. Committing it now.", base_addr);
                 let addr = unsafe {
                     VirtualAlloc2(
                         GetCurrentProcess(),
-                        base_addr as *mut c_void,
+                        base_addr.cast::<c_void>(),
                         size,
                         Win32_Memory::MEM_COMMIT,
                         prot_flags(initial_permissions),
@@ -401,49 +432,51 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                         0,
                     )
                 };
-                assert!(!addr.is_null(), "VirtualAlloc2 failed: {}", unsafe { GetLastError() });
-                println!("VirtualAlloc2(commit) succeed. Address range: {:p} - {:p}, Size: {}, Permissions: {:?}",
-                    addr, unsafe { addr.add(size) }, size, initial_permissions);
+                assert!(!addr.is_null(), "VirtualAlloc2 failed: {}", unsafe {
+                    GetLastError()
+                });
+
+                // Prefetch the memory range if requested
+                if populate_pages_immediately {
+                    do_prefetch_on_range(suggested_range.start, suggested_range.len());
+                }
+
                 return Ok(litebox::platform::trivial_providers::TransparentMutPtr {
-                        inner: addr as *mut u8,
-                    });
+                    inner: addr.cast::<u8>(),
+                });
             }
 
-            // if the address is committed, we just change permissions
+            // For already-committed memory, we just need to overlay its permissions.
             if mbi.State == Win32_Memory::MEM_COMMIT {
-                println!("Memory: {:p} is already committed, changing permissions now.", base_addr);
                 let mut old_protect: u32 = 0;
-                let ret = unsafe {
+                let ok = unsafe {
                     VirtualProtect(
                         base_addr,
                         size,
                         prot_flags(initial_permissions),
-                        &mut old_protect,
-                    )
+                        &raw mut old_protect,
+                    ) != 0
                 };
-                assert!(ret != 0, "VirtualProtect failed: {}", unsafe { GetLastError() });
-                println!("VirtualProtect succeed. Address range: {:p} - {:p}, Size: {}, Permissions: {:?}",
-                    base_addr, unsafe { base_addr.add(size) }, size, initial_permissions);
+                assert!(ok, "VirtualProtect failed: {}", unsafe { GetLastError() });
+
+                // Prefetch the memory range if requested
+                if populate_pages_immediately {
+                    do_prefetch_on_range(suggested_range.start, suggested_range.len());
+                }
+
                 return Ok(litebox::platform::trivial_providers::TransparentMutPtr {
-                        inner: base_addr as *mut u8,
-                    });
+                    inner: base_addr.cast::<u8>(),
+                });
             }
         }
-        
-        // Allocate unreserved memory
-        println!("Memory: {:p} is not reserved, allocating it now.", base_addr);
-        // align size to 64KB
-        let aligned_size = round_up_to_64k(size);
-        if (size != aligned_size) {
-            println!("Aligning size to 64KB: {} => {}", size, aligned_size);
-        }
-        // check and make 64KB aligned
-        let mut aligned_base_addr = round_down_to_64k(base_addr as usize) as *mut c_void;
-        if aligned_base_addr != base_addr {
-            println!("Aligning address {:p} => {:p}", 
-                base_addr, aligned_base_addr);
-        }
 
+        // 2) In case that the (indicated) VA is not reserved, we have to reserve & commit it.
+
+        // Align the size and base address to the allocation granularity.
+        let aligned_size = self.round_up_to_granu(size);
+        let mut aligned_base_addr = self.round_down_to_granu(base_addr as usize) as *mut c_void;
+
+        // Reserve and commit the memory.
         let addr: *mut c_void = unsafe {
             VirtualAlloc2(
                 GetCurrentProcess(),
@@ -455,15 +488,21 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 0,
             )
         };
-        assert!(!addr.is_null(), "VirtualAlloc2 failed. Address: {:p}, Size: {}, Permissions: {:?}. Error: {}",
-            aligned_base_addr, aligned_size, initial_permissions, unsafe { GetLastError() });
-        
-        println!(
-            "VirtualAlloc2(reserve+commit) succeed. Address range: {:p} - {:p}, Size: {}, Permissions: {:?}",
-            addr, unsafe { addr.add(aligned_size) }, aligned_size, initial_permissions
+        assert!(
+            !addr.is_null(),
+            "VirtualAlloc2 failed. Address: {:p}, Size: {}, Permissions: {:?}. Error: {}",
+            aligned_base_addr,
+            aligned_size,
+            initial_permissions,
+            unsafe { GetLastError() }
         );
+
+        // Prefetch the memory range if requested
+        if populate_pages_immediately {
+            do_prefetch_on_range(addr as usize, aligned_size);
+        }
         Ok(litebox::platform::trivial_providers::TransparentMutPtr {
-            inner: addr as *mut u8,
+            inner: addr.cast::<u8>(),
         })
     }
 
@@ -471,12 +510,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
-        let ret = unsafe {
-            VirtualFree(range.start as *mut c_void, 
-                    range.len(), 
-                    Win32_Memory::MEM_DECOMMIT)
+        let ok = unsafe {
+            VirtualFree(
+                range.start as *mut c_void,
+                range.len(),
+                Win32_Memory::MEM_DECOMMIT,
+            ) != 0
         };
-        assert!(ret != 0, "VirtualFree failed: {}", unsafe { GetLastError() });
+        assert!(ok, "VirtualFree failed: {}", unsafe { GetLastError() });
         Ok(())
     }
 
@@ -497,22 +538,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         range: core::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
-        let mut _old_protect: u32 = 0;
-        let ret = unsafe {
+        let mut old_protect: u32 = 0;
+        let ok = unsafe {
             VirtualProtect(
                 range.start as *mut c_void,
                 range.len(),
                 prot_flags(new_permissions),
-                &mut _old_protect,
-            )
+                &raw mut old_protect,
+            ) != 0
         };
-        assert!(ret != 0, "VirtualProtect failed: {}", unsafe { GetLastError() });
-        println!("update_permissions succeed. Address range: {:p} - {:p}, Size: {}, new_permissions: {:?}, prot_flags: {:x}",
-            range.start as *mut c_void, 
-            (range.start + range.len()) as *mut c_void, 
-            range.len(), 
-            new_permissions,
-            prot_flags(new_permissions));
+        assert!(ok, "VirtualProtect failed: {}", unsafe { GetLastError() });
         Ok(())
     }
 
@@ -585,7 +620,7 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
             core::cmp::max(layout.align(), 0x1000) << 1,
         );
 
-        let addr: *mut c_void = unsafe {
+        match unsafe {
             VirtualAlloc2(
                 GetCurrentProcess(),
                 core::ptr::null_mut(),
@@ -595,17 +630,10 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
                 core::ptr::null_mut(),
                 0,
             )
-        };
-        if addr.is_null() {
-            assert!(!addr.is_null(), "VirtualAlloc2 failed.");
-            return None;
+        } {
+            addr if addr.is_null() => None,
+            addr => Some((addr as usize, size)),
         }
-        // println!(
-        //     "Allocated {} bytes at address {:p}",
-        //     size,
-        //     addr
-        // );
-        Some((addr as usize, size))
     }
 
     unsafe fn free(_addr: usize) {
@@ -652,7 +680,7 @@ syscall_callback:
 
     /* Pass the syscall number to the syscall dispatcher */
     mov rcx, rax
-    /* Pass pt_regs saved on stack to syscall_dispatcher */
+    /* Pass pt_regs saved on stack to syscall dispatcher */
     mov rdx, rbp
 
     /* Call syscall_handler */

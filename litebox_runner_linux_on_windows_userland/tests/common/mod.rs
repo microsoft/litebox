@@ -10,19 +10,6 @@ use litebox::{
 use litebox_platform_multiplex::{Platform, set_platform};
 use litebox_shim_linux::{litebox_fs, loader::load_program, set_fs};
 
-// global_asm!(
-//     "
-//     .text
-//     .align	4
-//     .globl	trampoline
-// trampoline:
-//     xor rdx, rdx
-//     mov	rsp, rsi
-//     jmp	rdi
-//     /* Should not reach. */
-//     hlt"
-// );
-
 global_asm!(
     "
     .text
@@ -35,7 +22,6 @@ trampoline:
     /* Should not reach. */
     hlt"
 );
-
 
 unsafe extern "C" {
     fn trampoline(entry: usize, sp: usize) -> !;
