@@ -69,12 +69,7 @@ impl WindowsUserland {
     /// Create a new userland-Windows platform for use in `LiteBox`.
     pub fn new() -> &'static Self {
         let platform = Self {
-            tls_slot: unsafe {
-                match TlsSlot::new() {
-                    Ok(slot) => slot,
-                    Err(_) => panic!("Failed to create TLS slot: {}", GetLastError()),
-                }
-            },
+            tls_slot: TlsSlot::new().expect("Failed to create TLS slot!")
         };
         platform.set_init_tls();
         Box::leak(Box::new(platform))
@@ -308,6 +303,7 @@ impl litebox::platform::RawPointerProvider for WindowsUserland {
 }
 
 #[expect(dead_code, reason = "Will be added for PageManagementProvider soon.")]
+#[allow(clippy::match_same_arms, reason = "Iterate over all cases for prot_flags.")]
 fn prot_flags(flags: MemoryRegionPermissions) -> Win32_Memory::PAGE_PROTECTION_FLAGS {
     match (
         flags.contains(MemoryRegionPermissions::READ),
@@ -518,7 +514,7 @@ impl WindowsUserland {
         if tls_ptr.is_null() {
             return core::ptr::null_mut();
         }
-        tls_ptr as *mut litebox_common_linux::ThreadLocalStorage<WindowsUserland>
+        tls_ptr.cast::<litebox_common_linux::ThreadLocalStorage<WindowsUserland>>()
     }
 }
 
