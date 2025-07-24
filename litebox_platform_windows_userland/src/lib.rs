@@ -69,7 +69,7 @@ impl WindowsUserland {
     /// Create a new userland-Windows platform for use in `LiteBox`.
     pub fn new() -> &'static Self {
         let platform = Self {
-            tls_slot: TlsSlot::new().expect("Failed to create TLS slot!")
+            tls_slot: TlsSlot::new().expect("Failed to create TLS slot!"),
         };
         platform.set_init_tls();
         Box::leak(Box::new(platform))
@@ -127,9 +127,7 @@ impl litebox::platform::ExitProvider for WindowsUserland {
     const EXIT_FAILURE: Self::ExitCode = 1;
 
     fn exit(&self, code: Self::ExitCode) -> ! {
-        let Self {
-            tls_slot: _,
-        } = self;
+        let Self { tls_slot: _ } = self;
 
         // TODO: Implement Windows process exit
         // For now, use standard process exit
@@ -303,7 +301,10 @@ impl litebox::platform::RawPointerProvider for WindowsUserland {
 }
 
 #[expect(dead_code, reason = "Will be added for PageManagementProvider soon.")]
-#[allow(clippy::match_same_arms, reason = "Iterate over all cases for prot_flags.")]
+#[allow(
+    clippy::match_same_arms,
+    reason = "Iterate over all cases for prot_flags."
+)]
 fn prot_flags(flags: MemoryRegionPermissions) -> Win32_Memory::PAGE_PROTECTION_FLAGS {
     match (
         flags.contains(MemoryRegionPermissions::READ),
@@ -526,7 +527,9 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
     fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
         let tls_ptr = Box::into_raw(Box::new(tls)) as *const core::ffi::c_void;
         let succ = unsafe { TlsSetValue(self.tls_slot.dwtlsindex, tls_ptr) };
-        assert!(succ != 0, "Failed to set TLS value. Error={}.", unsafe { GetLastError() });
+        assert!(succ != 0, "Failed to set TLS value. Error={}.", unsafe {
+            GetLastError()
+        });
     }
 
     fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
