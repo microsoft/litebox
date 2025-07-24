@@ -1,19 +1,29 @@
 //! Event file for notification
 
+use crate::syscalls::epoll::IOPollable;
 use core::sync::atomic::AtomicU32;
 
-use litebox::{event::Events, fs::OFlags, sync::RawSyncPrimitivesProvider};
+use litebox::{
+    event::{
+        Events,
+        observer::Observer,
+        polling::{Pollee, TryOpError},
+    },
+    fs::OFlags,
+    platform::TimeProvider,
+    sync::RawSyncPrimitivesProvider,
+};
 use litebox_common_linux::{EfdFlags, errno::Errno};
 
-pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider> {
+pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     counter: litebox::sync::Mutex<Platform, u64>,
     /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
     status: AtomicU32,
     semaphore: bool,
-    pollee: crate::event::Pollee,
+    pollee: Pollee<Platform>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     pub(crate) fn new(count: u64, flags: EfdFlags, litebox: &litebox::LiteBox<Platform>) -> Self {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(EfdFlags::NONBLOCK));
@@ -22,10 +32,68 @@ impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
             counter: litebox.sync().new_mutex(count),
             status: AtomicU32::new(status.bits()),
             semaphore: flags.contains(EfdFlags::SEMAPHORE),
-            pollee: crate::event::Pollee::new(Events::empty()),
+            pollee: Pollee::new(litebox),
         }
     }
 
+    fn try_read(&self) -> Result<u64, TryOpError<Errno>> {
+        let mut counter = self.counter.lock();
+        if *counter == 0 {
+            return Err(TryOpError::TryAgain);
+        }
+
+        let res = if self.semaphore { 1 } else { *counter };
+        *counter -= res;
+
+        drop(counter);
+        self.pollee.notify_observers(Events::OUT);
+        Ok(res)
+    }
+
+    pub(crate) fn read(&self) -> Result<u64, Errno> {
+        Ok(if self.get_status().contains(OFlags::NONBLOCK) {
+            self.try_read()
+        } else {
+            self.pollee.wait_or_timeout(
+                None,
+                || self.try_read(),
+                || self.check_io_events().contains(Events::IN),
+            )
+        }?)
+    }
+
+    fn try_write(&self, value: u64) -> Result<usize, TryOpError<Errno>> {
+        let mut counter = self.counter.lock();
+        if let Some(new_value) = (*counter).checked_add(value) {
+            // The maximum value that may be stored in the counter is the largest unsigned
+            // 64-bit value minus 1 (i.e., 0xfffffffffffffffe)
+            if new_value != u64::MAX {
+                *counter = new_value;
+                drop(counter);
+                self.pollee.notify_observers(Events::IN);
+                return Ok(8);
+            }
+        }
+
+        Err(TryOpError::TryAgain)
+    }
+
+    pub(crate) fn write(&self, value: u64) -> Result<usize, Errno> {
+        Ok(if self.get_status().contains(OFlags::NONBLOCK) {
+            self.try_write(value)
+        } else {
+            self.pollee.wait_or_timeout(
+                None,
+                || self.try_write(value),
+                || self.check_io_events().contains(Events::OUT),
+            )
+        }?)
+    }
+
+    crate::syscalls::common_functions_for_file_status!();
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFile<Platform> {
     fn check_io_events(&self) -> Events {
         let counter = self.counter.lock();
         let mut events = Events::empty();
@@ -42,71 +110,9 @@ impl<Platform: RawSyncPrimitivesProvider> EventFile<Platform> {
         events
     }
 
-    pub(crate) fn poll(
-        &self,
-        mask: Events,
-        observer: Option<alloc::sync::Weak<dyn crate::event::Observer<Events>>>,
-    ) -> Events {
-        self.pollee.poll(mask, observer, || self.check_io_events())
+    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
+        self.pollee.register_observer(observer, mask);
     }
-
-    fn try_read(&self) -> Result<u64, Errno> {
-        let mut counter = self.counter.lock();
-        if *counter == 0 {
-            return Err(Errno::EAGAIN);
-        }
-
-        let res = if self.semaphore { 1 } else { *counter };
-        *counter -= res;
-
-        drop(counter);
-        self.pollee.notify_observers(Events::OUT);
-        Ok(res)
-    }
-
-    pub(crate) fn read(&self) -> Result<u64, Errno> {
-        if self.get_status().contains(OFlags::NONBLOCK) {
-            self.try_read()
-        } else {
-            self.pollee.wait_or_timeout(
-                Events::IN,
-                None,
-                || self.try_read(),
-                || self.check_io_events(),
-            )
-        }
-    }
-
-    fn try_write(&self, value: u64) -> Result<usize, Errno> {
-        let mut counter = self.counter.lock();
-        if let Some(new_value) = (*counter).checked_add(value) {
-            // The maximum value that may be stored in the counter is the largest unsigned
-            // 64-bit value minus 1 (i.e., 0xfffffffffffffffe)
-            if new_value != u64::MAX {
-                *counter = new_value;
-                drop(counter);
-                self.pollee.notify_observers(Events::IN);
-                return Ok(8);
-            }
-        }
-
-        Err(Errno::EAGAIN)
-    }
-
-    pub(crate) fn write(&self, value: u64) -> Result<usize, Errno> {
-        if self.get_status().contains(OFlags::NONBLOCK) {
-            self.try_write(value)
-        } else {
-            self.pollee.wait_or_timeout(
-                Events::OUT,
-                None,
-                || self.try_write(value),
-                || self.check_io_events(),
-            )
-        }
-    }
-
-    crate::syscalls::common_functions_for_file_status!();
 }
 
 #[cfg(test)]

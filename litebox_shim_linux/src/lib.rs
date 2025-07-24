@@ -31,7 +31,6 @@ use litebox_platform_multiplex::Platform;
 use syscalls::net::sys_setsockopt;
 
 pub(crate) mod channel;
-pub(crate) mod event;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;

@@ -4,7 +4,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, SocketAddr};
 
-use crate::event::EventManager;
 use crate::event::Events;
 use crate::platform::Instant;
 use crate::utilities::anymap::AnyMap;
@@ -56,10 +55,6 @@ where
         platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
 {
     litebox: LiteBox<Platform>,
-    /// Events, and their manager
-    // TODO(jayb): Figure out a way to structure this better (currently, we are using it as a line, but
-    // eventually we might want to handle the DAG, how do we handle it then?)
-    pub event_manager: EventManager<Platform>,
     /// The set of sockets
     socket_set: smoltcp::iface::SocketSet<'static>,
     /// The actual "physical" device, that connects to the platform
@@ -108,7 +103,6 @@ where
         }
         Self {
             litebox: litebox.clone(),
-            event_manager: EventManager::new(litebox),
             socket_set: smoltcp::iface::SocketSet::new(vec![]),
             device,
             interface,
@@ -442,17 +436,26 @@ where
     }
 
     /// (Internal-only API) Socket states could have changed, update events
+    #[expect(
+        unused_variables,
+        reason = "this implementation is undergoing change due to change in underlying interfaces for events"
+    )]
     fn check_and_update_events(&mut self) {
         for (internal_fd, socket_handle) in
             self.litebox.descriptor_table().iter::<Network<Platform>>()
         {
             match socket_handle.entry.protocol() {
                 Protocol::Tcp => {
-                    let socket: &tcp::Socket = self.socket_set.get(socket_handle.entry.handle);
-                    self.event_manager
-                        .set_events(internal_fd, Events::IN, socket.can_recv());
-                    self.event_manager
-                        .set_events(internal_fd, Events::OUT, socket.can_send());
+                    // TODO: We need to actually update events here; with the previous event-manager interfaces we had, this could be done with:
+                    // ```
+                    // let socket: &tcp::Socket = self.socket_set.get(socket_handle.entry.handle);
+                    // self.event_manager
+                    //     .set_events(internal_fd, Events::IN, socket.can_recv());
+                    // self.event_manager
+                    //     .set_events(internal_fd, Events::OUT, socket.can_send());
+                    // ```
+                    //
+                    // We need to migrate this to the newer interfaces that use observers.
                 }
                 Protocol::Udp => unimplemented!(),
                 Protocol::Icmp => unimplemented!(),
@@ -557,7 +560,6 @@ where
 
     /// Close the socket at `fd`
     pub fn close(&mut self, fd: SocketFd<Platform>) -> Result<(), CloseError> {
-        let internal_fd = fd.as_internal_fd();
         let Some(mut socket_handle) = self.litebox.descriptor_table_mut().remove(fd) else {
             // There might be other duplicates around (e.g., due to `dup`), so we don't want to do
             // any deallocations and such. We just return.
@@ -577,7 +579,12 @@ where
                 }
                 // TODO: Should we `.close()` or should we `.abort()`?
                 socket.abort();
-                self.event_manager.mark_events(internal_fd, Events::HUP);
+                // TODO: We need to actually update events here; with the previous event-manager interfaces we had, this could be done with:
+                // ```
+                // self.event_manager.mark_events(internal_fd, Events::HUP);
+                // ```
+                //
+                // We need to migrate this to the newer interfaces that use observers.
             }
         }
         self.automated_platform_interaction(PollDirection::Both);

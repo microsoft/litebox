@@ -1,5 +1,10 @@
 //! An array-backed indexed map
 
+#![expect(
+    dead_code,
+    reason = "this was previously used by the events (Waitable) implementation; it is not needed anymore, but this as a utility might be useful in the future, so we're keeping it around"
+)]
+
 use core::num::NonZeroU32;
 
 /// Generational-indexing-based array-backed storage area with strongly-typed indexes.
