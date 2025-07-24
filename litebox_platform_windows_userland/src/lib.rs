@@ -9,16 +9,18 @@ use core::time::Duration;
 use std::os::raw::c_void;
 
 use litebox::platform::ImmediatelyWokenUp;
+use litebox::platform::ThreadLocalStorageProvider;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox_common_linux::PunchthroughSyscall;
-use litebox::platform::ThreadLocalStorageProvider;
 
 use windows_sys::Win32::{
     Foundation::{GetLastError, WIN32_ERROR},
     System::Memory::{self as Win32_Memory, VirtualAlloc2},
-    System::Threading::{self as Win32_Threading, TlsAlloc, TlsFree, TlsGetValue, TlsSetValue, GetCurrentProcess},
+    System::Threading::{
+        self as Win32_Threading, GetCurrentProcess, TlsAlloc, TlsFree, TlsGetValue, TlsSetValue,
+    },
 };
 
 extern crate alloc;
@@ -34,12 +36,14 @@ struct TlsSlot {
 }
 
 impl TlsSlot {
-    fn new() -> Result<Self, u32> {
+    fn new() -> Result<Self, WIN32_ERROR> {
         let tls_index = unsafe { TlsAlloc() };
         if tls_index == Win32_Threading::TLS_OUT_OF_INDEXES {
             Err(unsafe { GetLastError() })
         } else {
-            Ok(Self { dwtlsindex: tls_index })
+            Ok(Self {
+                dwtlsindex: tls_index,
+            })
         }
     }
 }
@@ -101,20 +105,18 @@ impl WindowsUserland {
 
     fn set_init_tls(&self) {
         let tid = 1;
-        let creds = litebox_common_linux::Credentials { 
-            uid: 0, 
-            gid: 0, 
-            euid: 0, 
-            egid: 0 
+        let creds = litebox_common_linux::Credentials {
+            uid: 0,
+            gid: 0,
+            euid: 0,
+            egid: 0,
         };
-        let task = alloc::boxed::Box::new(
-            litebox_common_linux::Task::<WindowsUserland> {
-                tid: tid,
-                clear_child_tid: None,
-                robust_list: None,
-                credentials: alloc::sync::Arc::new(creds),
-            }
-        );
+        let task = alloc::boxed::Box::new(litebox_common_linux::Task::<WindowsUserland> {
+            tid: tid,
+            clear_child_tid: None,
+            robust_list: None,
+            credentials: alloc::sync::Arc::new(creds),
+        });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         self.set_thread_local_storage(tls);
     }
@@ -128,7 +130,10 @@ impl litebox::platform::ExitProvider for WindowsUserland {
     const EXIT_FAILURE: Self::ExitCode = 1;
 
     fn exit(&self, code: Self::ExitCode) -> ! {
-        let Self { reserved_pages: _ , tls_slot: _ } = self;
+        let Self {
+            reserved_pages: _,
+            tls_slot: _,
+        } = self;
 
         // TODO: Implement Windows process exit
         // For now, use standard process exit
@@ -504,10 +509,10 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
 }
 
 impl WindowsUserland {
-    fn get_thread_local_storage(&self) -> *mut litebox_common_linux::ThreadLocalStorage<WindowsUserland> {
-        let tls_ptr = unsafe {
-            TlsGetValue(self.tls_slot.dwtlsindex)
-        };
+    fn get_thread_local_storage(
+        &self,
+    ) -> *mut litebox_common_linux::ThreadLocalStorage<WindowsUserland> {
+        let tls_ptr = unsafe { TlsGetValue(self.tls_slot.dwtlsindex) };
         if tls_ptr.is_null() {
             return core::ptr::null_mut();
         }
@@ -521,11 +526,8 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
     type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<WindowsUserland>;
 
     fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
-        let mut tls = Box::new(tls);
-        let tls_ptr = Box::into_raw(tls) as *const core::ffi::c_void;
-        let succ = unsafe {
-            TlsSetValue(self.tls_slot.dwtlsindex, tls_ptr)
-        };
+        let tls_ptr = Box::into_raw(Box::new(tls)) as *const core::ffi::c_void;
+        let succ = unsafe { TlsSetValue(self.tls_slot.dwtlsindex, tls_ptr) };
 
         if succ == 0 {
             panic!("Failed to set TLS value: {}", unsafe { GetLastError() });
@@ -539,7 +541,7 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
         unsafe {
             TlsSetValue(self.tls_slot.dwtlsindex, core::ptr::null_mut());
         }
-        let tls = unsafe {Box::from_raw(tls)};
+        let tls = unsafe { Box::from_raw(tls) };
         assert!(!tls.borrowed, "TLS must not be borrowed when releasing it");
         *tls
     }
@@ -562,7 +564,7 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
 #[cfg(test)]
 mod tests {
     use crate::WindowsUserland;
-    use litebox::platform::{RawMutex, ThreadLocalStorageProvider as _};
+    use litebox::platform::ThreadLocalStorageProvider as _;
 
     #[test]
     fn test_tls() {
