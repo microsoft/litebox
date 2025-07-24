@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 const HELLO_WORLD_C: &str = r#"
 #include <stdio.h>
 
@@ -8,7 +10,14 @@ int main() {
 "#;
 
 /// Compile C code into an executable
-fn compile(input: &str, output: &str, exec_or_lib: bool) {
+fn compile(source: &str, unique_name: &str, exec_or_lib: bool) -> PathBuf {
+    let dir_path = std::env::var("OUT_DIR").unwrap();
+    let src_path = std::path::Path::new(dir_path.as_str()).join(format!("{unique_name}.c"));
+    std::fs::write(src_path.clone(), source).unwrap();
+    let path = std::path::Path::new(dir_path.as_str()).join(unique_name);
+    let input = src_path.to_str().unwrap();
+    let output = path.to_str().unwrap();
+
     let mut args = vec!["-o", output, input];
     if exec_or_lib {
         args.push("-static");
@@ -27,6 +36,7 @@ fn compile(input: &str, output: &str, exec_or_lib: bool) {
         "failed to compile hello.c {:?}",
         std::str::from_utf8(output.stderr.as_slice()).unwrap()
     );
+    path
 }
 
 #[allow(dead_code)]
@@ -36,27 +46,35 @@ enum Backend {
 }
 
 #[allow(clippy::too_many_lines)]
-fn test_runner_with_dynamic_lib(backend: Backend) {
+fn test_runner_with_dynamic_lib(
+    backend: Backend,
+    libs: &[&str],
+    target: &Path,
+    cmd_args: &[&str],
+    install_files: fn(PathBuf),
+) {
     let backend_str = match backend {
         Backend::Rewriter => "rewriter",
         Backend::Seccomp => "seccomp",
     };
     let dir_path = std::env::var("OUT_DIR").unwrap();
-    let src_path =
-        std::path::Path::new(dir_path.as_str()).join(format!("hello_exec_{backend_str}.c"));
-    std::fs::write(src_path.clone(), HELLO_WORLD_C).unwrap();
-    let path = std::path::Path::new(dir_path.as_str()).join(format!("hello_dylib_{backend_str}"));
-    compile(src_path.to_str().unwrap(), path.to_str().unwrap(), false);
     let path = match backend {
-        Backend::Seccomp => path,
+        Backend::Seccomp => target.to_path_buf(),
         Backend::Rewriter => {
+            // new path in out_dir with .hooked suffix
+            let out_path = std::path::Path::new(dir_path.as_str()).join(format!(
+                "{}.hooked",
+                target.file_name().unwrap().to_str().unwrap()
+            ));
             let output = std::process::Command::new("cargo")
                 .args([
                     "run",
                     "-p",
                     "litebox_syscall_rewriter",
                     "--",
-                    path.to_str().unwrap(),
+                    target.to_str().unwrap(),
+                    "-o",
+                    out_path.to_str().unwrap(),
                 ])
                 .output()
                 .expect("Failed to run litebox_syscall_rewriter");
@@ -65,8 +83,7 @@ fn test_runner_with_dynamic_lib(backend: Backend) {
                 "failed to run litebox_syscall_rewriter {:?}",
                 std::str::from_utf8(output.stderr.as_slice()).unwrap()
             );
-            std::path::Path::new(dir_path.as_str())
-                .join(format!("hello_dylib_{backend_str}.hooked"))
+            out_path
         }
     };
 
@@ -76,14 +93,8 @@ fn test_runner_with_dynamic_lib(backend: Backend) {
     for dir in dirs_to_create {
         std::fs::create_dir_all(tar_dir.join(dir)).unwrap();
     }
-    #[cfg(target_arch = "x86_64")]
-    let files_to_install = [
-        "/lib64/ld-linux-x86-64.so.2",
-        "/lib/x86_64-linux-gnu/libc.so.6",
-    ];
-    #[cfg(target_arch = "x86")]
-    let files_to_install = ["/lib/ld-linux.so.2", "/lib32/libc.so.6"];
-    for file in files_to_install {
+    std::fs::create_dir_all(tar_dir.join("out")).unwrap();
+    for file in libs {
         let file_path = std::path::Path::new(file);
         let dest_path = tar_dir.join(&file[1..]);
         match backend {
@@ -121,6 +132,7 @@ fn test_runner_with_dynamic_lib(backend: Backend) {
             }
         }
     }
+    install_files(tar_dir.join("out"));
 
     #[cfg(target_arch = "x86_64")]
     let target = "--target=x86_64-unknown-linux-musl";
@@ -168,7 +180,9 @@ fn test_runner_with_dynamic_lib(backend: Backend) {
             "-cvf",
             format!("../rootfs_{backend_str}.tar").as_str(),
             "lib",
+            "lib32",
             "lib64",
+            "out",
         ])
         .current_dir(&tar_dir)
         .output()
@@ -208,6 +222,7 @@ fn test_runner_with_dynamic_lib(backend: Backend) {
         }
     }
     args.push(path.to_str().unwrap());
+    args.extend_from_slice(cmd_args);
     println!("Running `cargo {}`", args.join(" "));
     let output = std::process::Command::new("cargo")
         .args(args)
@@ -221,12 +236,77 @@ fn test_runner_with_dynamic_lib(backend: Backend) {
 }
 
 #[cfg(target_arch = "x86_64")]
+const HELLO_WORLD_INIT_FILES: [&str; 2] = [
+    "/lib64/ld-linux-x86-64.so.2",
+    "/lib/x86_64-linux-gnu/libc.so.6",
+];
+#[cfg(target_arch = "x86")]
+const HELLO_WORLD_INIT_FILES: [&str; 2] = ["/lib/ld-linux.so.2", "/lib32/libc.so.6"];
+
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn test_runner_with_dynamic_lib_rewriter() {
-    test_runner_with_dynamic_lib(Backend::Rewriter);
+    let target = compile(HELLO_WORLD_C, "hello_lib_rewriter", false);
+    test_runner_with_dynamic_lib(
+        Backend::Rewriter,
+        &HELLO_WORLD_INIT_FILES,
+        &target,
+        &[],
+        |_| {},
+    );
 }
 
 #[test]
 fn test_runner_with_dynamic_lib_seccomp() {
-    test_runner_with_dynamic_lib(Backend::Seccomp);
+    let target = compile(HELLO_WORLD_C, "hello_lib_seccomp", false);
+    test_runner_with_dynamic_lib(
+        Backend::Seccomp,
+        &HELLO_WORLD_INIT_FILES,
+        &target,
+        &[],
+        |_| {},
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_runner_with_nodejs() {
+    const HELLO_WORLD_JS: &str = r"
+const fs = require('node:fs');
+
+const content = 'Hello World!';
+console.log(content);
+";
+
+    let initial_files = [
+        "/lib/x86_64-linux-gnu/libdl.so.2",
+        "/lib/x86_64-linux-gnu/libstdc++.so.6",
+        "/lib/x86_64-linux-gnu/libm.so.6",
+        "/lib/x86_64-linux-gnu/libgcc_s.so.1",
+        "/lib/x86_64-linux-gnu/libpthread.so.0",
+        "/lib64/ld-linux-x86-64.so.2",
+        "/lib/x86_64-linux-gnu/libc.so.6",
+    ];
+    // get node path via `which node`
+    let node_path_str = std::process::Command::new("which")
+        .arg("node")
+        .output()
+        .expect("Failed to find node binary")
+        .stdout;
+    let node_path_str = String::from_utf8(node_path_str).unwrap().trim().to_string();
+    let node_path = std::path::Path::new(&node_path_str);
+    assert!(
+        node_path.exists(),
+        "Node binary not found at {node_path_str}",
+    );
+    test_runner_with_dynamic_lib(
+        Backend::Seccomp,
+        &initial_files,
+        node_path,
+        &["/out/hello_world.js"],
+        |out_dir| {
+            // write the test js file to the output directory
+            std::fs::write(out_dir.join("hello_world.js"), HELLO_WORLD_JS).unwrap();
+        },
+    );
 }
