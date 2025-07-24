@@ -331,3 +331,13 @@ impl From<litebox::net::errors::ReceiveError> for Errno {
         }
     }
 }
+
+impl From<litebox::event::polling::TryOpError<Errno>> for Errno {
+    fn from(value: litebox::event::polling::TryOpError<Errno>) -> Self {
+        match value {
+            litebox::event::polling::TryOpError::TryAgain => Errno::EAGAIN,
+            litebox::event::polling::TryOpError::TimedOut => Errno::ETIMEDOUT,
+            litebox::event::polling::TryOpError::Other(e) => e,
+        }
+    }
+}

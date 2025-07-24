@@ -100,7 +100,7 @@ pub const HV_REGISTER_PENDING_EVENT0: u32 = 0x0001_0004;
 
 pub const HV_SECURE_VTL_BOOT_TOKEN: u8 = 0xdc;
 
-/// VTL call parameters (param[0]: function ID, param[1-3]: parameters)
+/// VTL call parameters (`param[0]`: function ID, `param[1..4]`: parameters)
 pub const NUM_VTLCALL_PARAMS: usize = 4;
 
 pub const VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL: u32 = 0x1_ffe0;

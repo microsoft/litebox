@@ -1243,7 +1243,7 @@ impl ModuleMemoryMetadataMap {
             .map(|metadata| metadata.get_patch_targets().clone())
     }
 
-    pub fn iter_entry(&self, key: i64) -> Option<ModuleMemoryMetadataIters> {
+    pub fn iter_entry(&self, key: i64) -> Option<ModuleMemoryMetadataIters<'_>> {
         let guard = self.inner.lock();
         if guard.contains_key(&key) {
             Some(ModuleMemoryMetadataIters {
@@ -1629,7 +1629,7 @@ impl KexecMemoryMetadataWrapper {
         inner.ranges = kexec_memory.ranges;
     }
 
-    pub fn iter_guarded(&self) -> KexecMemoryMetadataIters {
+    pub fn iter_guarded(&self) -> KexecMemoryMetadataIters<'_> {
         KexecMemoryMetadataIters {
             guard: self.inner.lock(),
             phantom: core::marker::PhantomData,

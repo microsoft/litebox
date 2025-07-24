@@ -5,14 +5,14 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use litebox::{LiteBox, event::Events};
+use litebox::{
+    LiteBox,
+    event::{Events, observer::Observer, polling::Pollee},
+};
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
-use crate::{
-    Descriptor,
-    event::{Observer, Pollee},
-};
+use crate::Descriptor;
 
 bitflags::bitflags! {
     /// Linux's epoll flags.
@@ -75,13 +75,30 @@ impl Descriptor {
     /// Returns the interesting events now and monitors their occurrence in the future if the
     /// observer is provided.
     fn poll(&self, mask: Events, observer: Option<Weak<dyn Observer<Events>>>) -> Events {
-        match self {
-            Descriptor::PipeReader { consumer, .. } => consumer.poll(mask, observer),
-            Descriptor::PipeWriter { producer, .. } => producer.poll(mask, observer),
-            Descriptor::Eventfd { file, .. } => file.poll(mask, observer),
-            Descriptor::Socket(socket) => socket.poll(mask, observer),
+        let io_pollable: &dyn IOPollable = match self {
+            Descriptor::PipeReader { consumer, .. } => consumer,
+            Descriptor::PipeWriter { producer, .. } => producer,
+            Descriptor::Eventfd { file, .. } => file,
+            Descriptor::Socket(socket) => socket,
             _ => todo!(),
+        };
+        if let Some(observer) = observer {
+            io_pollable.register_observer(observer, mask);
         }
+        io_pollable.check_io_events() & (mask | Events::ALWAYS_POLLED)
+    }
+}
+
+pub(crate) trait IOPollable {
+    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events);
+    fn check_io_events(&self) -> Events;
+}
+impl<T: IOPollable> IOPollable for Arc<T> {
+    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
+        self.as_ref().register_observer(observer, mask);
+    }
+    fn check_io_events(&self) -> Events {
+        self.as_ref().check_io_events()
     }
 }
 
@@ -110,19 +127,18 @@ impl EpollFile {
     ) -> Result<Vec<EpollEvent>, Errno> {
         let mut events = Vec::new();
         match self.ready.pollee.wait_or_timeout(
-            Events::IN,
             timeout,
             || {
                 self.ready.pop_multiple(maxevents, &mut events);
                 if events.is_empty() {
-                    return Err(Errno::EAGAIN);
+                    return Err(litebox::event::polling::TryOpError::TryAgain);
                 }
                 Ok(())
             },
-            || self.ready.check_io_events(),
+            || self.ready.check_io_events().contains(Events::IN),
         ) {
-            Ok(()) | Err(Errno::ETIMEDOUT) => {}
-            Err(e) => return Err(e),
+            Ok(()) | Err(litebox::event::polling::TryOpError::TimedOut) => {}
+            Err(e) => return Err(e.into()),
         }
         Ok(events)
     }
@@ -305,7 +321,7 @@ impl EpollEntry {
     }
 }
 
-impl crate::event::Observer<Events> for EpollEntry {
+impl Observer<Events> for EpollEntry {
     fn on_events(&self, events: &Events) {
         self.ready.push(self);
     }
@@ -316,14 +332,14 @@ struct ReadySet {
         litebox_platform_multiplex::Platform,
         VecDeque<alloc::sync::Weak<EpollEntry>>,
     >,
-    pollee: Pollee,
+    pollee: Pollee<Platform>,
 }
 
 impl ReadySet {
     fn new(litebox: &LiteBox<Platform>) -> Self {
         Self {
             entries: litebox.sync().new_mutex(VecDeque::new()),
-            pollee: Pollee::new(Events::empty()),
+            pollee: Pollee::new(litebox),
         }
     }
 
