@@ -67,6 +67,10 @@ pub struct WindowsUserland {
 
 impl WindowsUserland {
     /// Create a new userland-Windows platform for use in `LiteBox`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the TLS slot cannot be created.
     pub fn new() -> &'static Self {
         let platform = Self {
             tls_slot: TlsSlot::new().expect("Failed to create TLS slot!"),
@@ -179,16 +183,13 @@ pub struct RawMutex {
 }
 
 impl RawMutex {
+    #[expect(unused, reason = "This is a placeholder for future implementation.")]
     fn block_or_maybe_timeout(
         &self,
         val: u32,
         timeout: Option<Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        unimplemented!(
-            "block_or_maybe_timeout is not implemented for Windows yet. val: {}, timeout: {:?}",
-            val,
-            timeout
-        );
+        unimplemented!("block_or_maybe_timeout is not implemented for Windows yet.");
     }
 }
 
