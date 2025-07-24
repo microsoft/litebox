@@ -19,6 +19,7 @@ members = [
 default-members = [
     "litebox",
     "litebox_common_linux",
+    "litebox_common_optee",
     "litebox_platform_linux_kernel",
     "litebox_platform_linux_userland",
     "litebox_platform_freebsd_userland",

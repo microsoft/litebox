@@ -36,8 +36,7 @@ use x86_64::{
 // r11: userspace rflags
 // Note. rsp should point to the userspace stack before calling `sysretq`
 
-// placholder for the syscall handler function type
-pub type SyscallHandler = fn(SyscallRequest<crate::host::LvbsLinuxKernel>) -> isize;
+pub type SyscallHandler = fn(SyscallRequest<crate::host::LvbsLinuxKernel>) -> u32;
 static SYSCALL_HANDLER: spin::Once<SyscallHandler> = spin::Once::new();
 
 #[cfg(target_arch = "x86_64")]
@@ -103,7 +102,7 @@ impl SyscallContextRaw {
 
 #[allow(clippy::similar_names)]
 #[allow(unreachable_code)]
-fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> isize {
+fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> u32 {
     let syscall_handler: SyscallHandler = *SYSCALL_HANDLER
         .get()
         .expect("Syscall handler should be initialized");
