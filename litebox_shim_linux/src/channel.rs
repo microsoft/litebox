@@ -131,7 +131,10 @@ impl<T> Producer<T> {
             self.endpoint.pollee.wait_or_timeout(
                 None,
                 || self.try_write(buf),
-                || self.check_io_events().contains(Events::OUT),
+                || {
+                    self.check_io_events()
+                        .intersects(Events::OUT | Events::ALWAYS_POLLED)
+                },
             )
         }?)
     }
@@ -240,7 +243,10 @@ impl<T> Consumer<T> {
             self.endpoint.pollee.wait_or_timeout(
                 None,
                 || self.try_read(buf),
-                || self.check_io_events().contains(Events::IN),
+                || {
+                    self.check_io_events()
+                        .intersects(Events::IN | Events::ALWAYS_POLLED)
+                },
             )
         }?)
     }
