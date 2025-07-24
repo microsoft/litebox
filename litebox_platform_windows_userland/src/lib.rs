@@ -8,9 +8,9 @@ use core::sync::atomic::AtomicU32;
 use core::time::Duration;
 
 use litebox::platform::ImmediatelyWokenUp;
+use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
-use litebox::platform::{UnblockedOrTimedOut};
 use litebox_common_linux::PunchthroughSyscall;
 
 extern crate alloc;
@@ -25,18 +25,12 @@ static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::R
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
 /// traits.
-pub struct WindowsUserland {
-    /// Reserved pages that are not available for guest programs to use.
-    reserved_pages: Vec<core::ops::Range<usize>>,
-}
+pub struct WindowsUserland {}
 
 impl WindowsUserland {
     /// Create a new userland-Windows platform for use in `LiteBox`.
     pub fn new() -> &'static Self {
-        let platform = Self {
-            reserved_pages: Self::read_memory_maps(),
-        };
-
+        let platform = Self {};
         Box::leak(Box::new(platform))
     }
 
@@ -53,6 +47,10 @@ impl WindowsUserland {
         );
     }
 
+    #[expect(
+        unused,
+        reason = "This is a placeholder for future implementation for `reserved_pages`."
+    )]
     fn read_memory_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
         // TODO: Implement Windows memory mapping discovery
         // Windows doesn't have /proc, need to use Windows APIs like VirtualQuery
@@ -69,7 +67,7 @@ impl litebox::platform::ExitProvider for WindowsUserland {
     const EXIT_FAILURE: Self::ExitCode = 1;
 
     fn exit(&self, code: Self::ExitCode) -> ! {
-        let Self { reserved_pages: _ } = self;
+        let Self {} = self;
 
         // TODO: Implement Windows process exit
         // For now, use standard process exit
@@ -110,7 +108,6 @@ impl litebox::platform::RawMutexProvider for WindowsUserland {
     fn new_raw_mutex(&self) -> Self::RawMutex {
         RawMutex {
             inner: AtomicU32::new(0),
-            num_to_wake_up: AtomicU32::new(0),
         }
     }
 }
@@ -120,7 +117,6 @@ impl litebox::platform::RawMutexProvider for WindowsUserland {
 pub struct RawMutex {
     // The `inner` is the value shown to the outside world as an underlying atomic.
     inner: AtomicU32,
-    num_to_wake_up: AtomicU32,
 }
 
 impl RawMutex {
@@ -419,6 +415,3 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
         unimplemented!("Windows TLS access not implemented yet");
     }
 }
-
-#[cfg(test)]
-mod tests {}
