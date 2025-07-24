@@ -389,6 +389,8 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
     fn alloc(layout: &std::alloc::Layout) -> Option<(usize, usize)> {
         let size = core::cmp::max(
             layout.size().next_power_of_two(),
+            // Note `mmap` provides no guarantee of alignment, so we double the size to ensure we
+            // can always find a required chunk within the returned memory region.
             core::cmp::max(layout.align(), 0x1000) << 1,
         );
 
