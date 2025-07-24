@@ -3,7 +3,10 @@
 use crate::mshv::HYPERVISOR_CALLBACK_VECTOR;
 use core::ops::IndexMut;
 use spin::Once;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::structures::idt::{
+    HandlerFuncType, HandlerFuncWithErrCode, InterruptDescriptorTable, InterruptStackFrame,
+    PageFaultErrorCode,
+};
 
 const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
@@ -14,8 +17,13 @@ fn idt() -> &'static InterruptDescriptorTable {
         idt.divide_error.set_handler_fn(divide_error_handler);
         idt.breakpoint.set_handler_fn(breakpoint_handler);
         unsafe {
+            // Rust no longer allows a function with the custom ABI to have a return type.
+            // Unfortunately, the `x86_64` crate has not caught up this change.
+            // the below is a workaround mentioned in [link](https://github.com/rust-lang/rust/issues/143072).
+            let addr =
+                HandlerFuncType::to_virt_addr(double_fault_handler as HandlerFuncWithErrCode);
             idt.double_fault
-                .set_handler_fn(double_fault_handler)
+                .set_handler_addr(addr)
                 .set_stack_index(DOUBLE_FAULT_IST_INDEX);
         }
         idt.page_fault.set_handler_fn(page_fault_handler);
@@ -44,10 +52,7 @@ extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     todo!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }
 
-extern "x86-interrupt" fn double_fault_handler(
-    stack_frame: InterruptStackFrame,
-    _error_code: u64,
-) -> ! {
+extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame, _error_code: u64) {
     panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
 }
 

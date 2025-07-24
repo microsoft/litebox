@@ -437,7 +437,7 @@ impl RsaPkcs1v15Verifier {
 
 /// This function extracts the module data and signature from a signed kernel module.
 /// A signed kernel module has the following layout:
-/// [module data (ELF)][signature (PKCS#7/DER)][`ModuleSignature`][`MODULE_SIGNATURE_MAGIC`]
+/// <`module_data` (ELF)|`signature_der` (PKCS#7/DER)|`ModuleSignature`|`MODULE_SIGNATURE_MAGIC`>
 fn extract_module_data_and_signature(
     signed_module: &[u8],
 ) -> Result<(&[u8], &[u8]), VerificationError> {

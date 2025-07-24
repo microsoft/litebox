@@ -1,7 +1,6 @@
 #![no_std]
 
 use core::panic::PanicInfo;
-use litebox_platform_lvbs::Platform; // TODO: use `litebox_platform_multiplex::Platform`
 use litebox_platform_lvbs::{
     arch::{gdt, instrs::hlt_loop, interrupts},
     debug_serial_println,
@@ -18,6 +17,7 @@ use litebox_platform_lvbs::{
     },
     serial_println,
 };
+use litebox_platform_multiplex::Platform;
 
 /// # Panics
 ///
