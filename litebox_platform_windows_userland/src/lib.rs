@@ -105,15 +105,16 @@ impl WindowsUserland {
     }
 
     fn set_init_tls(&self) {
-        let tid = 1;
+        // TODO: Currently we are using a static thread ID and credentials (faked).
+        // This is a placeholder for future implementation to use passthrough.
         let creds = litebox_common_linux::Credentials {
-            uid: 0,
-            gid: 0,
-            euid: 0,
-            egid: 0,
+            uid: 1000,
+            gid: 1000,
+            euid: 1000,
+            egid: 1000,
         };
         let task = alloc::boxed::Box::new(litebox_common_linux::Task::<WindowsUserland> {
-            tid: tid,
+            tid: 1000,
             clear_child_tid: None,
             robust_list: None,
             credentials: alloc::sync::Arc::new(creds),
