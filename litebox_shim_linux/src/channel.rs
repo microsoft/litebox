@@ -4,7 +4,15 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use alloc::sync::{Arc, Weak};
-use litebox::{LiteBox, event::Events, fs::OFlags};
+use litebox::{
+    LiteBox,
+    event::{
+        Events,
+        observer::Observer,
+        polling::{Pollee, TryOpError},
+    },
+    fs::OFlags,
+};
 use litebox_common_linux::errno::Errno;
 use litebox_platform_multiplex::Platform;
 use ringbuf::{
@@ -12,7 +20,7 @@ use ringbuf::{
     traits::{Consumer as _, Observer as _, Producer as _, Split as _},
 };
 
-use crate::event::Observer;
+use crate::syscalls::epoll::IOPollable;
 
 /// The maximum number of bytes for atomic write.
 ///
@@ -24,15 +32,15 @@ const PIPE_BUF: usize = 2;
 
 struct EndPointer<T> {
     rb: litebox::sync::Mutex<Platform, T>,
-    pollee: crate::event::Pollee,
+    pollee: Pollee<Platform>,
     is_shutdown: AtomicBool,
 }
 
 impl<T> EndPointer<T> {
-    pub fn new(rb: T, init_events: Events, litebox: &LiteBox<Platform>) -> Self {
+    pub fn new(rb: T, litebox: &LiteBox<Platform>) -> Self {
         Self {
             rb: litebox.sync().new_mutex(rb),
-            pollee: crate::event::Pollee::new(init_events),
+            pollee: Pollee::new(crate::litebox()),
             is_shutdown: AtomicBool::new(false),
         }
     }
@@ -63,20 +71,6 @@ macro_rules! common_functions_for_channel {
                 true
             }
         }
-
-        pub fn poll(&self, mask: Events, observer: Option<Weak<dyn Observer<Events>>>) -> Events {
-            self.endpoint
-                .pollee
-                .poll(mask, observer, || self.check_io_events())
-        }
-
-        pub(crate) fn register_observer(
-            &self,
-            observer: alloc::sync::Weak<dyn Observer<Events>>,
-            filter: Events,
-        ) {
-            self.endpoint.pollee.register_observer(observer, filter);
-        }
     };
 }
 
@@ -90,30 +84,18 @@ pub(crate) struct Producer<T> {
 impl<T> Producer<T> {
     fn new(rb: HeapProd<T>, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
         Self {
-            endpoint: EndPointer::new(rb, Events::OUT, litebox),
+            endpoint: EndPointer::new(rb, litebox),
             peer: Weak::new(),
             status: AtomicU32::new((flags | OFlags::WRONLY).bits()),
         }
     }
 
-    fn check_io_events(&self) -> Events {
-        let rb = self.endpoint.rb.lock();
-        let mut events = Events::empty();
-        if self.is_peer_shutdown() {
-            events |= Events::ERR;
-        }
-        if !self.is_shutdown() && !rb.is_full() {
-            events |= Events::OUT;
-        }
-        events
-    }
-
-    fn try_write(&self, buf: &[T]) -> Result<usize, Errno>
+    fn try_write(&self, buf: &[T]) -> Result<usize, TryOpError<Errno>>
     where
         T: Copy,
     {
         if self.is_shutdown() || self.is_peer_shutdown() {
-            return Err(Errno::EPIPE);
+            return Err(TryOpError::Other(Errno::EPIPE));
         }
         if buf.is_empty() {
             return Ok(0);
@@ -135,7 +117,7 @@ impl<T> Producer<T> {
             }
             Ok(write_len)
         } else {
-            Err(Errno::EAGAIN)
+            Err(TryOpError::TryAgain)
         }
     }
 
@@ -143,20 +125,40 @@ impl<T> Producer<T> {
     where
         T: Copy,
     {
-        if self.get_status().contains(OFlags::NONBLOCK) {
+        Ok(if self.get_status().contains(OFlags::NONBLOCK) {
             self.try_write(buf)
         } else {
             self.endpoint.pollee.wait_or_timeout(
-                Events::OUT,
                 None,
                 || self.try_write(buf),
-                || self.check_io_events(),
+                || {
+                    self.check_io_events()
+                        .intersects(Events::OUT | Events::ALWAYS_POLLED)
+                },
             )
-        }
+        }?)
     }
 
     common_functions_for_channel!();
     crate::syscalls::common_functions_for_file_status!();
+}
+
+impl<T> IOPollable for Producer<T> {
+    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, filter: Events) {
+        self.endpoint.pollee.register_observer(observer, filter);
+    }
+
+    fn check_io_events(&self) -> Events {
+        let rb = self.endpoint.rb.lock();
+        let mut events = Events::empty();
+        if self.is_peer_shutdown() {
+            events |= Events::ERR;
+        }
+        if !self.is_shutdown() && !rb.is_full() {
+            events |= Events::OUT;
+        }
+        events
+    }
 }
 
 impl<T> Drop for Producer<T> {
@@ -177,13 +179,9 @@ pub(crate) struct Consumer<T> {
     status: AtomicU32,
 }
 
-impl<T> Consumer<T> {
-    fn new(rb: HeapCons<T>, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
-        Self {
-            endpoint: EndPointer::new(rb, Events::empty(), litebox),
-            peer: Weak::new(),
-            status: AtomicU32::new((flags | OFlags::RDONLY).bits()),
-        }
+impl<T> IOPollable for Consumer<T> {
+    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, filter: Events) {
+        self.endpoint.pollee.register_observer(observer, filter);
     }
 
     fn check_io_events(&self) -> Events {
@@ -197,13 +195,23 @@ impl<T> Consumer<T> {
         }
         events
     }
+}
 
-    fn try_read(&self, buf: &mut [T]) -> Result<usize, Errno>
+impl<T> Consumer<T> {
+    fn new(rb: HeapCons<T>, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
+        Self {
+            endpoint: EndPointer::new(rb, litebox),
+            peer: Weak::new(),
+            status: AtomicU32::new((flags | OFlags::RDONLY).bits()),
+        }
+    }
+
+    fn try_read(&self, buf: &mut [T]) -> Result<usize, TryOpError<Errno>>
     where
         T: Copy,
     {
         if self.is_shutdown() {
-            return Err(Errno::EPIPE);
+            return Err(TryOpError::Other(Errno::EPIPE));
         }
         if buf.is_empty() {
             return Ok(0);
@@ -221,7 +229,7 @@ impl<T> Consumer<T> {
                 // and `is_peer_shutdown` are lost.
                 return Ok(self.endpoint.rb.lock().pop_slice(buf));
             }
-            Err(Errno::EAGAIN)
+            Err(TryOpError::TryAgain)
         }
     }
 
@@ -229,16 +237,18 @@ impl<T> Consumer<T> {
     where
         T: Copy,
     {
-        if self.get_status().contains(OFlags::NONBLOCK) {
+        Ok(if self.get_status().contains(OFlags::NONBLOCK) {
             self.try_read(buf)
         } else {
             self.endpoint.pollee.wait_or_timeout(
-                Events::IN,
                 None,
                 || self.try_read(buf),
-                || self.check_io_events(),
+                || {
+                    self.check_io_events()
+                        .intersects(Events::IN | Events::ALWAYS_POLLED)
+                },
             )
-        }
+        }?)
     }
 
     common_functions_for_channel!();

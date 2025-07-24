@@ -313,16 +313,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         let path = self.absolute_path(path)?;
         let path = &path[1..];
-        let entry = self
-            .tar_data
-            .entries()
-            .find(|entry| match entry.filename().as_str() {
+        let entry = self.tar_data.entries().enumerate().find(|(_, entry)| {
+            match entry.filename().as_str() {
                 Ok(p) => p == path || contains_dir(p, path),
                 Err(_) => false,
-            });
+            }
+        });
         match entry {
             None => Err(PathError::NoSuchFileOrDirectory)?,
-            Some(p) if p.filename().as_str().unwrap() != path => Ok(super::FileStatus {
+            Some((_, p)) if p.filename().as_str().unwrap() != path => Ok(super::FileStatus {
                 file_type: super::FileType::Directory,
                 mode: DEFAULT_DIR_MODE,
                 size: super::DEFAULT_DIRECTORY_SIZE,
@@ -334,14 +333,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 },
                 blksize: BLOCK_SIZE,
             }),
-            Some(p) => Ok(super::FileStatus {
+            Some((idx, p)) => Ok(super::FileStatus {
                 file_type: super::FileType::RegularFile,
                 mode: mode_of_modeflags(p.posix_header().mode.to_flags().unwrap()),
                 size: p.size(),
                 owner: owner_from_posix_header(p.posix_header()),
                 node_info: NodeInfo {
                     dev: DEVICE_ID,
-                    ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                    ino: idx,
                     rdev: None,
                 },
                 blksize: BLOCK_SIZE,
@@ -363,7 +362,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     owner: owner_from_posix_header(entry.posix_header()),
                     node_info: NodeInfo {
                         dev: DEVICE_ID,
-                        ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                        ino: *idx,
                         rdev: None,
                     },
                     blksize: BLOCK_SIZE,

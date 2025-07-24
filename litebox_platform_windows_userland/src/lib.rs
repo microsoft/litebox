@@ -31,18 +31,12 @@ static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::R
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
 /// traits.
-pub struct WindowsUserland {
-    /// Reserved pages that are not available for guest programs to use.
-    reserved_pages: Vec<core::ops::Range<usize>>,
-}
+pub struct WindowsUserland {}
 
 impl WindowsUserland {
     /// Create a new userland-Windows platform for use in `LiteBox`.
     pub fn new() -> &'static Self {
-        let platform = Self {
-            reserved_pages: Self::read_memory_maps(),
-        };
-
+        let platform = Self {};
         Box::leak(Box::new(platform))
     }
 
@@ -59,6 +53,10 @@ impl WindowsUserland {
         );
     }
 
+    #[expect(
+        unused,
+        reason = "This is a placeholder for future implementation for `reserved_pages`."
+    )]
     fn read_memory_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
         // TODO: Implement Windows memory mapping discovery
         // Windows doesn't have /proc, need to use Windows APIs like VirtualQuery
@@ -75,7 +73,7 @@ impl litebox::platform::ExitProvider for WindowsUserland {
     const EXIT_FAILURE: Self::ExitCode = 1;
 
     fn exit(&self, code: Self::ExitCode) -> ! {
-        let Self { reserved_pages: _ } = self;
+        let Self {} = self;
 
         // TODO: Implement Windows process exit
         // For now, use standard process exit
@@ -116,17 +114,14 @@ impl litebox::platform::RawMutexProvider for WindowsUserland {
     fn new_raw_mutex(&self) -> Self::RawMutex {
         RawMutex {
             inner: AtomicU32::new(0),
-            num_to_wake_up: AtomicU32::new(0),
         }
     }
 }
 
 // A skeleton of a raw mutex for Windows.
-#[expect(dead_code)]
 pub struct RawMutex {
     // The `inner` is the value shown to the outside world as an underlying atomic.
     inner: AtomicU32,
-    num_to_wake_up: AtomicU32,
 }
 
 impl RawMutex {
@@ -277,20 +272,22 @@ fn prot_flags(flags: MemoryRegionPermissions) -> Win32_Memory::PAGE_PROTECTION_F
     }
 }
 
+#[expect(unused, reason = "Will be added for PageManagementProvider soon.")]
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
     fn allocate_pages(
         &self,
-        range: core::ops::Range<usize>,
+        suggested_range: core::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
-        populate_pages: bool,
+        populate_pages_immediately: bool,
+        fixed_address: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         unimplemented!(
             "allocate_pages is not implemented for Windows yet. range: {:?}, permissions: {:?}, can_grow_down: {}, populate_pages: {}",
-            range,
+            suggested_range,
             initial_permissions,
             can_grow_down,
-            populate_pages
+            populate_pages_immediately
         );
     }
 
@@ -328,8 +325,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         );
     }
 
-    fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
-        self.reserved_pages.iter()
+    fn reserved_pages(&self) -> impl Iterator<Item = &std::ops::Range<usize>> {
+        std::iter::empty()
     }
 }
 
@@ -471,6 +468,3 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
         unimplemented!("Windows TLS access not implemented yet");
     }
 }
-
-#[cfg(test)]
-mod tests {}

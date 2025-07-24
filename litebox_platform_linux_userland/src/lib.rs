@@ -978,19 +978,23 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for LinuxUserland {
     fn allocate_pages(
         &self,
-        range: core::ops::Range<usize>,
+        suggested_range: core::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
-        populate_pages: bool,
+        populate_pages_immediately: bool,
+        fixed_address: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let flags = MapFlags::MAP_PRIVATE
             | MapFlags::MAP_ANONYMOUS
-            | MapFlags::MAP_FIXED
-            | (if can_grow_down {
+            | (if fixed_address {
+                MapFlags::MAP_FIXED
+            } else {
+                MapFlags::empty()
+            } | if can_grow_down {
                 MapFlags::MAP_GROWSDOWN
             } else {
                 MapFlags::empty()
-            } | if populate_pages {
+            } | if populate_pages_immediately {
                 MapFlags::MAP_POPULATE
             } else {
                 MapFlags::empty()
@@ -1007,8 +1011,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                         syscalls::Sysno::mmap2
                     }
                 },
-                range.start,
-                range.len(),
+                suggested_range.start,
+                suggested_range.len(),
                 prot_flags(initial_permissions)
                     .bits()
                     .reinterpret_as_unsigned() as usize,
@@ -1053,14 +1057,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 old_range.start,
                 old_range.len(),
                 new_range.len(),
-                (MRemapFlags::MREMAP_FIXED | MRemapFlags::MREMAP_MAYMOVE).bits() as usize,
+                MRemapFlags::MREMAP_MAYMOVE.bits() as usize,
                 new_range.start,
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
                 syscall_intercept::SYSCALL_ARG_MAGIC,
             )
             .expect("mremap failed")
         };
-        assert_eq!(res, new_range.start);
         Ok(litebox::platform::trivial_providers::TransparentMutPtr {
             inner: res as *mut u8,
         })
