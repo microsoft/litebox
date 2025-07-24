@@ -293,8 +293,9 @@ pub(crate) fn sys_clone(
     }
 
     let platform = litebox_platform_multiplex::platform();
-    let (credentials, pid) =
-        platform.with_thread_local_storage_mut(|tls| (tls.current_task.credentials.clone(), tls.current_task.pid));
+    let (credentials, pid) = platform.with_thread_local_storage_mut(|tls| {
+        (tls.current_task.credentials.clone(), tls.current_task.pid)
+    });
     let child_tid = unsafe {
         platform.spawn_thread(
             ctx,
@@ -450,8 +451,7 @@ pub(crate) fn sys_get_robust_list(
 
 /// Handle syscall `getpid`.
 pub(crate) fn sys_getpid() -> i32 {
-    litebox_platform_multiplex::platform()
-        .with_thread_local_storage_mut(|tls| tls.current_task.pid)
+    litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| tls.current_task.pid)
 }
 
 /// Handle syscall `getuid`.
