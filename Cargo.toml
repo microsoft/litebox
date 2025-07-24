@@ -29,7 +29,7 @@ default-members = [
     "litebox_runner_linux_on_windows_userland",
     "litebox_shim_linux",
     "litebox_shim_optee",
-    "litebox_syscall_rewriter",
+    "litebox_syscall_rewriter"
 ]
 # We exclude `litebox_runner_lvbs` from `default-members` because its interrupt handling
 # depends on the unstable `abi_x86_interrupt` feature, which requires a nightly toolchain.
