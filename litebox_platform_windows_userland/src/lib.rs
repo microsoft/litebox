@@ -529,10 +529,7 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
     fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
         let tls_ptr = Box::into_raw(Box::new(tls)) as *const core::ffi::c_void;
         let succ = unsafe { TlsSetValue(self.tls_slot.dwtlsindex, tls_ptr) };
-
-        if succ == 0 {
-            panic!("Failed to set TLS value: {}", unsafe { GetLastError() });
-        }
+        assert!(succ != 0, "Failed to set TLS value. Error={}.", unsafe { GetLastError() });
     }
 
     fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
