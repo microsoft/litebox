@@ -133,7 +133,7 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
         Descriptor::PipeReader { consumer, .. } => {
             let consumer = consumer.clone();
             drop(file_table);
-            consumer.read(buf)
+            Ok(consumer.read(buf)?)
         }
         Descriptor::PipeWriter { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
         Descriptor::Eventfd { file, .. } => {
@@ -171,7 +171,7 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
         Descriptor::PipeWriter { producer, .. } => {
             let producer = producer.clone();
             drop(file_table);
-            producer.write(buf)
+            Ok(producer.write(buf)?)
         }
         Descriptor::Eventfd { file, .. } => {
             let file = file.clone();
@@ -712,7 +712,7 @@ pub fn sys_pipe2(flags: OFlags) -> Result<(u32, u32), Errno> {
     }
 
     let (writer, reader) =
-        crate::channel::Channel::new(DEFAULT_PIPE_BUF_SIZE, flags, crate::litebox()).split();
+        litebox::pipes::new_channel(crate::litebox(), DEFAULT_PIPE_BUF_SIZE, flags);
     let close_on_exec = flags.contains(OFlags::CLOEXEC);
     let read_fd = file_descriptors().write().insert(Descriptor::PipeReader {
         consumer: reader,

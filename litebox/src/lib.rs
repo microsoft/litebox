@@ -21,6 +21,7 @@ pub mod net;
 pub mod path;
 pub mod platform;
 pub mod sync;
+pub mod pipes;
 
 // The core [`LiteBox`] object itself, re-exported here publicly, just to keep management of the
 // code cleaner.
