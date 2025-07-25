@@ -115,20 +115,21 @@ impl WindowsUserland {
     fn read_memory_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
         let mut reserved_pages = alloc::vec::Vec::new();
         let mut address = 0usize;
-        
+
         loop {
             let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
             let ok = unsafe {
                 Win32_Memory::VirtualQuery(
-                    address as *const c_void, 
-                    &mut mbi, 
-                    core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>() as usize
+                    address as *const c_void,
+                    &mut mbi,
+                    core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>() as usize,
                 ) != 0
             };
-            if !ok { break; }
+            if !ok {
+                break;
+            }
 
-            if mbi.State == Win32_Memory::MEM_RESERVE || 
-               mbi.State == Win32_Memory::MEM_COMMIT {
+            if mbi.State == Win32_Memory::MEM_RESERVE || mbi.State == Win32_Memory::MEM_COMMIT {
                 reserved_pages.push(core::ops::Range {
                     start: mbi.BaseAddress as usize,
                     end: (mbi.BaseAddress as usize + mbi.RegionSize) as usize,
@@ -136,7 +137,9 @@ impl WindowsUserland {
             }
 
             address = (mbi.BaseAddress as usize + mbi.RegionSize) as usize;
-            if address == 0 { break; }
+            if address == 0 {
+                break;
+            }
         }
 
         reserved_pages
@@ -439,9 +442,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
                 ) != 0
             };
-            assert!(ok, "VirtualQuery failed: {}", unsafe {
-                GetLastError()
-            });
+            assert!(ok, "VirtualQuery failed: {}", unsafe { GetLastError() });
 
             // For already-reserved memory, we just need to commit it.
             if mbi.State == Win32_Memory::MEM_RESERVE {
@@ -836,8 +837,8 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
 #[cfg(test)]
 mod tests {
     use crate::WindowsUserland;
-    use litebox::platform::ThreadLocalStorageProvider as _;
     use litebox::platform::PageManagementProvider;
+    use litebox::platform::ThreadLocalStorageProvider as _;
 
     #[test]
     fn test_reserved_pages() {
