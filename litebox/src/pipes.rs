@@ -1,8 +1,11 @@
 //! Unidirectional communication channels
 
-use core::sync::atomic::{
-    AtomicBool, AtomicU32,
-    Ordering::{self, Relaxed},
+use core::{
+    num::NonZeroUsize,
+    sync::atomic::{
+        AtomicBool, AtomicU32,
+        Ordering::{self, Relaxed},
+    },
 };
 
 use alloc::sync::{Arc, Weak};
@@ -23,14 +26,6 @@ use crate::{
     platform::TimeProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
-
-/// The maximum number of bytes for atomic write.
-///
-/// See <https://man7.org/linux/man-pages/man7/pipe.7.html> for more details.
-#[cfg(not(test))]
-const PIPE_BUF: usize = 4096;
-#[cfg(test)]
-const PIPE_BUF: usize = 2;
 
 struct EndPointer<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
     rb: Mutex<Platform, T>,
@@ -93,6 +88,8 @@ pub struct Producer<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
     peer: Weak<Consumer<Platform, T>>,
     /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
     status: AtomicU32,
+    /// Slice length that is guaranteed to be an atomic write (i.e., non-interleaved).
+    atomic_slice_guarantee_size: usize,
 }
 
 #[derive(Error, Debug)]
@@ -115,11 +112,17 @@ impl From<TryOpError<PipeError>> for PipeError {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Producer<Platform, T> {
-    fn new(rb: HeapProd<T>, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
+    fn new(
+        rb: HeapProd<T>,
+        flags: OFlags,
+        atomic_slice_guarantee_size: usize,
+        litebox: &LiteBox<Platform>,
+    ) -> Self {
         Self {
             endpoint: EndPointer::new(rb, litebox),
             peer: Weak::new(),
             status: AtomicU32::new((flags | OFlags::WRONLY).bits()),
+            atomic_slice_guarantee_size,
         }
     }
 
@@ -136,8 +139,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Producer<Platform, T
 
         let write_len = {
             let mut rb = self.endpoint.rb.lock();
-            let total_size = core::mem::size_of_val(buf);
-            if rb.vacant_len() < total_size && total_size <= PIPE_BUF {
+            let total_size = buf.len();
+            if rb.vacant_len() < total_size && total_size <= self.atomic_slice_guarantee_size {
                 // No sufficient space for an atomic write
                 0
             } else {
@@ -307,6 +310,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Drop for Consumer<Pl
 ///
 /// `flags` sets up the initial flags for the channel. An important flag is `OFlags::NONBLOCK` which
 /// impacts what happens when the channel is full, and an attempt is made to write to it.
+///
+/// `atomic_slice_guarantee_size` (if provided) is the number of elements that are guaranteed to be
+/// written atomically (i.e., not interleaved with other writes) if a slice of those many (or fewer)
+/// elements are passed at once. Slices longer than this length have no guarantees on atomicity of
+/// writes and might be interleaved with other writes.
 #[expect(
     clippy::type_complexity,
     reason = "clippy believes this result type to be complex, but factoring it out into a type def would not help readability in any way"
@@ -315,12 +323,20 @@ pub fn new_channel<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
     litebox: &LiteBox<Platform>,
     capacity: usize,
     flags: OFlags,
+    atomic_slice_guarantee_size: Option<NonZeroUsize>,
 ) -> (Arc<Producer<Platform, T>>, Arc<Consumer<Platform, T>>) {
     let rb: HeapRb<T> = HeapRb::new(capacity);
     let (rb_prod, rb_cons) = rb.split();
 
     // Create the producer and consumer, and set up cyclic references.
-    let mut producer = Arc::new(Producer::new(rb_prod, flags, litebox));
+    let mut producer = Arc::new(Producer::new(
+        rb_prod,
+        flags,
+        atomic_slice_guarantee_size
+            .map(NonZeroUsize::get)
+            .unwrap_or_default(),
+        litebox,
+    ));
     let consumer = Arc::new_cyclic(|weak_self| {
         #[expect(
             clippy::missing_panics_doc,
@@ -348,7 +364,7 @@ mod tests {
         let platform = crate::platform::mock::MockPlatform::new();
         let litebox = crate::LiteBox::new(platform);
 
-        let (prod, cons) = super::new_channel(&litebox, 2, crate::fs::OFlags::empty());
+        let (prod, cons) = super::new_channel(&litebox, 2, crate::fs::OFlags::empty(), None);
         std::thread::spawn(move || {
             let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
             let mut i = 0;
@@ -378,7 +394,7 @@ mod tests {
         let platform = crate::platform::mock::MockPlatform::new();
         let litebox = crate::LiteBox::new(platform);
 
-        let (prod, cons) = super::new_channel(&litebox, 2, crate::fs::OFlags::NONBLOCK);
+        let (prod, cons) = super::new_channel(&litebox, 2, crate::fs::OFlags::NONBLOCK, None);
         std::thread::spawn(move || {
             let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
             let mut i = 0;

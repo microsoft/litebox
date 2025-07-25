@@ -448,7 +448,7 @@ mod test {
     fn test_epoll_with_pipe() {
         let epoll = setup_epoll();
         let (producer, consumer) =
-            litebox::pipes::new_channel::<_, u8>(crate::litebox(), 2, OFlags::empty());
+            litebox::pipes::new_channel::<_, u8>(crate::litebox(), 2, OFlags::empty(), None);
         let reader = crate::Descriptor::PipeReader {
             consumer,
             close_on_exec: core::sync::atomic::AtomicBool::new(false),

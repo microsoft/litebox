@@ -711,8 +711,13 @@ pub fn sys_pipe2(flags: OFlags) -> Result<(u32, u32), Errno> {
         todo!("O_DIRECT not supported");
     }
 
-    let (writer, reader) =
-        litebox::pipes::new_channel(crate::litebox(), DEFAULT_PIPE_BUF_SIZE, flags);
+    let (writer, reader) = litebox::pipes::new_channel(
+        crate::litebox(),
+        DEFAULT_PIPE_BUF_SIZE,
+        flags,
+        // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
+        4096.try_into().ok(),
+    );
     let close_on_exec = flags.contains(OFlags::CLOEXEC);
     let read_fd = file_descriptors().write().insert(Descriptor::PipeReader {
         consumer: reader,
