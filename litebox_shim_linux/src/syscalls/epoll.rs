@@ -7,7 +7,7 @@ use alloc::{
 };
 use litebox::{
     LiteBox,
-    event::{Events, observer::Observer, polling::Pollee},
+    event::{Events, IOPollable, observer::Observer, polling::Pollee},
 };
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
 use litebox_platform_multiplex::Platform;
@@ -86,19 +86,6 @@ impl Descriptor {
             io_pollable.register_observer(observer, mask);
         }
         io_pollable.check_io_events() & (mask | Events::ALWAYS_POLLED)
-    }
-}
-
-pub(crate) trait IOPollable {
-    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events);
-    fn check_io_events(&self) -> Events;
-}
-impl<T: IOPollable> IOPollable for Arc<T> {
-    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
-        self.as_ref().register_observer(observer, mask);
-    }
-    fn check_io_events(&self) -> Events {
-        self.as_ref().check_io_events()
     }
 }
 

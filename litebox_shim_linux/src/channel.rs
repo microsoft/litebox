@@ -7,7 +7,7 @@ use alloc::sync::{Arc, Weak};
 use litebox::{
     LiteBox,
     event::{
-        Events,
+        Events, IOPollable,
         observer::Observer,
         polling::{Pollee, TryOpError},
     },
@@ -19,8 +19,6 @@ use ringbuf::{
     HeapCons, HeapProd, HeapRb,
     traits::{Consumer as _, Observer as _, Producer as _, Split as _},
 };
-
-use crate::syscalls::epoll::IOPollable;
 
 /// The maximum number of bytes for atomic write.
 ///
