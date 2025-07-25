@@ -3,7 +3,7 @@
 //! Examples of syscalls handled here include `getrandom`, `uname`, and similar operations.
 
 use litebox::{
-    platform::{Instant as _, RawMutPointer as _, TimeProvider as _},
+    platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider as _},
     utils::TruncateExt as _,
 };
 use litebox_common_linux::errno::Errno;
@@ -109,9 +109,12 @@ const _LINUX_CAPABILITY_VERSION_2: u32 = 0x20071026; /* deprecated - use v3 */
 const _LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 
 /// Handle syscall `capget`.
-/// 
-/// Note we don't support capabilities in LiteBox, so this is a no-op that returns empty capabilities.
-pub(crate) fn sys_capget(header: crate::MutPtr<litebox_common_linux::CapHeader>, data: Option<crate::MutPtr<litebox_common_linux::CapData>>) -> Result<(), Errno> {
+///
+/// Note we don't support capabilities in LiteBox, so this returns empty capabilities.
+pub(crate) fn sys_capget(
+    header: crate::MutPtr<litebox_common_linux::CapHeader>,
+    data: Option<crate::MutPtr<litebox_common_linux::CapData>>,
+) -> Result<(), Errno> {
     let hdr = unsafe { header.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
     match hdr.version {
         _LINUX_CAPABILITY_VERSION_1 => {
@@ -138,16 +141,22 @@ pub(crate) fn sys_capget(header: crate::MutPtr<litebox_common_linux::CapHeader>,
             Ok(())
         }
         _ => {
-            unsafe { header.write_at_offset(0, litebox_common_linux::CapHeader {
-                version: _LINUX_CAPABILITY_VERSION_3,
-                pid: hdr.pid,
-            }) }.ok_or(Errno::EFAULT)?;
+            unsafe {
+                header.write_at_offset(
+                    0,
+                    litebox_common_linux::CapHeader {
+                        version: _LINUX_CAPABILITY_VERSION_3,
+                        pid: hdr.pid,
+                    },
+                )
+            }
+            .ok_or(Errno::EFAULT)?;
             if data.is_none() {
                 Ok(())
             } else {
                 Err(Errno::EINVAL)
             }
-        },
+        }
     }
 }
 

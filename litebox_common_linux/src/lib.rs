@@ -1275,12 +1275,16 @@ pub struct Sysinfo {
     pub _f: [u8; 20 - 2 * core::mem::size_of::<usize>() - core::mem::size_of::<u32>()],
 }
 
+/// Header structure used for the `capget` and `capset` syscalls.
+#[repr(C)]
 #[derive(Clone, Debug)]
 pub struct CapHeader {
     pub version: u32,
     pub pid: u32,
 }
 
+/// Data structure used for the `capget` and `capset` syscalls.
+#[repr(C)]
 #[derive(Clone, Debug)]
 pub struct CapData {
     pub effective: u32,
@@ -2154,7 +2158,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                         Some(Platform::RawMutPointer::from_usize(data_ptr))
                     },
                 }
-            },
+            }
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq => {
                 SyscallRequest::Ret(errno::Errno::ENOSYS)
             }

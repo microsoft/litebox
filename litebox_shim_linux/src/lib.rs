@@ -690,7 +690,9 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
                 .ok_or(Errno::EFAULT)
                 .map(|()| 0)
         }
-        SyscallRequest::CapGet { header, data } => syscalls::misc::sys_capget(header, data).map(|()| 0),
+        SyscallRequest::CapGet { header, data } => {
+            syscalls::misc::sys_capget(header, data).map(|()| 0)
+        }
         _ => {
             todo!()
         }
