@@ -66,6 +66,7 @@ impl Drop for TlsSlot {
 /// traits.
 pub struct WindowsUserland {
     tls_slot: TlsSlot,
+    reserved_pages: alloc::vec::Vec<core::ops::Range<usize>>,
     sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
 }
 
@@ -86,8 +87,11 @@ impl WindowsUserland {
         let mut sys_info = Win32_SysInfo::SYSTEM_INFO::default();
         Self::get_system_information(&mut sys_info);
 
+        let reserved_pages = Self::read_memory_maps();
+
         let platform = Self {
             tls_slot: TlsSlot::new().expect("Failed to create TLS slot!"),
+            reserved_pages: reserved_pages,
             sys_info: std::sync::RwLock::new(sys_info),
         };
         platform.set_init_tls();
@@ -108,15 +112,34 @@ impl WindowsUserland {
         );
     }
 
-    #[expect(
-        unused,
-        reason = "This is a placeholder for future implementation for `reserved_pages`."
-    )]
     fn read_memory_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
-        // TODO: Implement Windows memory mapping discovery
-        // Windows doesn't have /proc, need to use Windows APIs like VirtualQuery
-        // For now, return empty vector as placeholder
-        alloc::vec::Vec::new()
+        let mut reserved_pages = alloc::vec::Vec::new();
+        let mut address = 0usize;
+        
+        loop {
+            let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+            let ok = unsafe {
+                Win32_Memory::VirtualQuery(
+                    address as *const c_void, 
+                    &mut mbi, 
+                    core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>() as usize
+                ) != 0
+            };
+            if !ok { break; }
+
+            if mbi.State == Win32_Memory::MEM_RESERVE || 
+               mbi.State == Win32_Memory::MEM_COMMIT {
+                reserved_pages.push(core::ops::Range {
+                    start: mbi.BaseAddress as usize,
+                    end: (mbi.BaseAddress as usize + mbi.RegionSize) as usize,
+                });
+            }
+
+            address = (mbi.BaseAddress as usize + mbi.RegionSize) as usize;
+            if address == 0 { break; }
+        }
+
+        reserved_pages
     }
 
     fn set_init_tls(&self) {
@@ -167,6 +190,7 @@ impl litebox::platform::ExitProvider for WindowsUserland {
         let Self {
             tls_slot: _,
             sys_info: _,
+            reserved_pages: _,
         } = self;
         // TODO: Implement Windows process exit
         // For now, use standard process exit
@@ -408,14 +432,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // that the address is already reserved.
         if suggested_range.start != 0 {
             let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
-            let query_value = unsafe {
+            let ok = unsafe {
                 Win32_Memory::VirtualQuery(
                     base_addr,
                     &raw mut mbi,
                     core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
-                )
+                ) != 0
             };
-            assert!(query_value != 0, "VirtualQuery failed: {}", unsafe {
+            assert!(ok, "VirtualQuery failed: {}", unsafe {
                 GetLastError()
             });
 
@@ -552,7 +576,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     }
 
     fn reserved_pages(&self) -> impl Iterator<Item = &std::ops::Range<usize>> {
-        std::iter::empty()
+        self.reserved_pages.iter()
     }
 }
 
@@ -813,6 +837,25 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
 mod tests {
     use crate::WindowsUserland;
     use litebox::platform::ThreadLocalStorageProvider as _;
+    use litebox::platform::PageManagementProvider;
+
+    #[test]
+    fn test_reserved_pages() {
+        let platform = WindowsUserland::new();
+        let reserved_pages: Vec<_> =
+            <WindowsUserland as PageManagementProvider<4096>>::reserved_pages(platform).collect();
+
+        // Check that the reserved pages are not empty
+        assert!(!reserved_pages.is_empty(), "No reserved pages found");
+
+        // Check that the reserved pages are in order and non-overlapping
+        let mut prev = 0;
+        for page in reserved_pages {
+            assert!(page.start >= prev);
+            assert!(page.end > page.start);
+            prev = page.end;
+        }
+    }
 
     #[test]
     fn test_tls() {
