@@ -92,6 +92,7 @@ pub fn init() -> Option<&'static Platform> {
     }
     interrupts::init_idt();
     x86_64::instructions::interrupts::enable();
+    Platform::register_syscall_handler(litebox_shim_optee::handle_syscall_request);
 
     ret
 }
