@@ -17,7 +17,6 @@ use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox_common_linux::PunchthroughSyscall;
 
 use windows_sys::Win32::Foundation as Win32_Foundation;
-use windows_sys::Win32::System::Threading::{WakeByAddressAll, WakeByAddressSingle};
 use windows_sys::Win32::{
     Foundation::{GetLastError, WIN32_ERROR},
     System::Memory::{
@@ -337,11 +336,15 @@ impl litebox::platform::RawMutex for RawMutex {
 
         unsafe {
             if n as usize == usize::MAX {
-                WakeByAddressAll(self.underlying_atomic().as_ptr() as *const c_void);
+                Win32_Threading::WakeByAddressAll(
+                    self.underlying_atomic().as_ptr() as *const c_void
+                );
             } else {
                 // Wake up `n` threads iteratively
                 for _ in 0..n {
-                    WakeByAddressSingle(self.underlying_atomic().as_ptr() as *const c_void);
+                    Win32_Threading::WakeByAddressSingle(
+                        self.underlying_atomic().as_ptr() as *const c_void
+                    );
                 }
             }
         }
