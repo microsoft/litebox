@@ -268,9 +268,10 @@ impl LinuxUserland {
     fn set_init_tls(&self) {
         let tid =
             unsafe { syscalls::syscall!(syscalls::Sysno::gettid) }.expect("Failed to get TID");
-
+        let tid: i32 = i32::try_from(tid).expect("tid should fit in i32");
         let task = alloc::boxed::Box::new(litebox_common_linux::Task {
-            tid: i32::try_from(tid).expect("tid should fit in i32"),
+            pid: tid,
+            tid,
             clear_child_tid: None,
             robust_list: None,
             credentials: alloc::sync::Arc::new(Self::get_user_info()),
