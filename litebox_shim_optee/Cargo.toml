@@ -6,11 +6,26 @@ edition = "2024"
 [dependencies]
 arrayvec = { version = "0.7.6", default-features = false }
 bitflags = "2.9.0"
+elf = { version = "0.7.4", default-features = false }
+elf_loader = { version = "0.12.0", default-features = false, features = [] }
 litebox = { path = "../litebox/", version = "0.1.0" }
+litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
 litebox_common_optee = { path = "../litebox_common_optee/", version = "0.1.0" }
-litebox_platform_multiplex = { path = "../litebox_platform_multiplex/", version = "0.1.0", default-features = false, features = ["platform_lvbs"] }
+litebox_platform_multiplex = { path = "../litebox_platform_multiplex/", version = "0.1.0", default-features = false }
 num_enum = { version = "0.7.3", default-features = false }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
+thiserror = { version = "2.0.6", default-features = false }
+
+[target.'cfg(target_arch = "x86")'.dependencies]
+# ELF loader requires us to enable the `rel` dependency on 32-bit to work.
+# Enabling it on 64-bit on the other hand is incorrect and would not work. Thus,
+# we need to do it as a target-specific dependency.
+#
+# NOTE: We must keep this in sync with the version above.
+elf_loader = { version = "0.12.0", default-features = false, features = ["rel"] }
+
+[features]
+default = ["litebox_platform_multiplex/platform_lvbs"]
 
 [lints]
 workspace = true
