@@ -509,8 +509,8 @@ mod stdio {
         fs.write(&fd_stdout, data, None)
             .expect("Failed to write to /dev/stdout");
         fs.close(fd_stdout).expect("Failed to close /dev/stdout");
-        assert_eq!(platform.stdout_queue.borrow().len(), 1);
-        assert_eq!(platform.stdout_queue.borrow()[0], data);
+        assert_eq!(platform.stdout_queue.read().unwrap().len(), 1);
+        assert_eq!(platform.stdout_queue.read().unwrap()[0], data);
 
         // Test opening and writing to /dev/stderr
         let fd_stderr = fs
@@ -520,13 +520,14 @@ mod stdio {
         fs.write(&fd_stderr, data, None)
             .expect("Failed to write to /dev/stderr");
         fs.close(fd_stderr).expect("Failed to close /dev/stderr");
-        assert_eq!(platform.stderr_queue.borrow().len(), 1);
-        assert_eq!(platform.stderr_queue.borrow()[0], data);
+        assert_eq!(platform.stderr_queue.read().unwrap().len(), 1);
+        assert_eq!(platform.stderr_queue.read().unwrap()[0], data);
 
         // Test opening and reading from /dev/stdin
         platform
             .stdin_queue
-            .borrow_mut()
+            .write()
+            .unwrap()
             .push_back(b"Hello, stdin!".to_vec());
         let fd_stdin = fs
             .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
@@ -587,8 +588,8 @@ mod layered_stdio {
         layered_fs
             .close(fd_stdout)
             .expect("Failed to close /dev/stdout");
-        assert_eq!(platform.stdout_queue.borrow().len(), 1);
-        assert_eq!(platform.stdout_queue.borrow()[0], data);
+        assert_eq!(platform.stdout_queue.read().unwrap().len(), 1);
+        assert_eq!(platform.stdout_queue.read().unwrap()[0], data);
 
         // Test opening and writing to /dev/stderr
         let fd_stderr = layered_fs
@@ -601,13 +602,14 @@ mod layered_stdio {
         layered_fs
             .close(fd_stderr)
             .expect("Failed to close /dev/stderr");
-        assert_eq!(platform.stderr_queue.borrow().len(), 1);
-        assert_eq!(platform.stderr_queue.borrow()[0], data);
+        assert_eq!(platform.stderr_queue.read().unwrap().len(), 1);
+        assert_eq!(platform.stderr_queue.read().unwrap()[0], data);
 
         // Test opening and reading from /dev/stdin
         platform
             .stdin_queue
-            .borrow_mut()
+            .write()
+            .unwrap()
             .push_back(b"Hello, layered stdin!".to_vec());
         let fd_stdin = layered_fs
             .open("/dev/stdin", OFlags::RDONLY, Mode::empty())

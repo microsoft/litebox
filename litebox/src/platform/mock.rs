@@ -8,8 +8,8 @@
 // Pull in `std` for the test-only world, so that we have a nicer/easier time writing tests
 extern crate std;
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::vec::Vec;
 
@@ -29,10 +29,10 @@ use super::*;
 /// - It will not mock you for using it during tests
 pub(crate) struct MockPlatform {
     current_time: AtomicU64,
-    ip_packets: RefCell<VecDeque<Vec<u8>>>,
-    pub(crate) stdin_queue: RefCell<VecDeque<Vec<u8>>>,
-    pub(crate) stdout_queue: RefCell<VecDeque<Vec<u8>>>,
-    pub(crate) stderr_queue: RefCell<VecDeque<Vec<u8>>>,
+    ip_packets: RwLock<VecDeque<Vec<u8>>>,
+    pub(crate) stdin_queue: RwLock<VecDeque<Vec<u8>>>,
+    pub(crate) stdout_queue: RwLock<VecDeque<Vec<u8>>>,
+    pub(crate) stderr_queue: RwLock<VecDeque<Vec<u8>>>,
 }
 
 impl MockPlatform {
@@ -41,10 +41,10 @@ impl MockPlatform {
         //  order to give ourselves a statically lived platform easily.
         alloc::boxed::Box::leak(alloc::boxed::Box::new(MockPlatform {
             current_time: AtomicU64::new(0),
-            ip_packets: RefCell::new(VecDeque::new()),
-            stdin_queue: RefCell::new(VecDeque::new()),
-            stdout_queue: RefCell::new(VecDeque::new()),
-            stderr_queue: RefCell::new(VecDeque::new()),
+            ip_packets: RwLock::new(VecDeque::new()),
+            stdin_queue: RwLock::new(VecDeque::new()),
+            stdout_queue: RwLock::new(VecDeque::new()),
+            stderr_queue: RwLock::new(VecDeque::new()),
         }))
     }
 }
@@ -98,15 +98,15 @@ impl RawMutexProvider for MockPlatform {
 
 impl IPInterfaceProvider for MockPlatform {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), SendError> {
-        self.ip_packets.borrow_mut().push_back(packet.into());
+        self.ip_packets.write().unwrap().push_back(packet.into());
         Ok(())
     }
 
     fn receive_ip_packet(&self, packet: &mut [u8]) -> Result<usize, ReceiveError> {
-        if self.ip_packets.borrow().is_empty() {
+        if self.ip_packets.read().unwrap().is_empty() {
             Err(ReceiveError::WouldBlock)
         } else {
-            let mut ipp = self.ip_packets.borrow_mut();
+            let mut ipp = self.ip_packets.write().unwrap();
             let v = ipp.pop_front().unwrap();
             assert!(v.len() <= packet.len());
             packet[..v.len()].copy_from_slice(&v);
@@ -162,14 +162,15 @@ impl RawPointerProvider for MockPlatform {
 
 impl StdioProvider for MockPlatform {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, StdioReadError> {
-        let Some(front) = self.stdin_queue.borrow_mut().pop_front() else {
+        let Some(front) = self.stdin_queue.write().unwrap().pop_front() else {
             return Err(StdioReadError::Closed);
         };
         let len = front.len().min(buf.len());
         buf[..len].copy_from_slice(&front[..len]);
         if front.len() > len {
             self.stdin_queue
-                .borrow_mut()
+                .write()
+                .unwrap()
                 .push_front(front.into_iter().skip(len).collect());
         }
         Ok(len)
@@ -180,7 +181,8 @@ impl StdioProvider for MockPlatform {
             StdioOutStream::Stdout => &self.stdout_queue,
             StdioOutStream::Stderr => &self.stderr_queue,
         }
-        .borrow_mut()
+        .write()
+        .unwrap()
         .push_back(buf.to_vec());
         Ok(buf.len())
     }
