@@ -26,8 +26,8 @@ bitflags::bitflags! {
 }
 
 enum DescriptorRef {
-    PipeReader(Weak<litebox::pipes::ReadEnd<Platform, u8>>),
-    PipeWriter(Weak<litebox::pipes::WriteEnd<Platform, u8>>),
+    PipeReader(Weak<litebox::pipes::PipeEnd<Platform, litebox::pipes::Read, u8>>),
+    PipeWriter(Weak<litebox::pipes::PipeEnd<Platform, litebox::pipes::Write, u8>>),
     Eventfd(Weak<crate::syscalls::eventfd::EventFile<litebox_platform_multiplex::Platform>>),
     Socket(Weak<crate::syscalls::net::Socket>),
 }

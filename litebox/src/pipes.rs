@@ -34,7 +34,7 @@ struct EndPointer<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> EndPointer<Platform, T> {
-    fn new(rb: T, litebox: &LiteBox<Platform>) -> Self {
+    fn new(litebox: &LiteBox<Platform>, rb: T) -> Self {
         Self {
             rb: litebox.sync().new_mutex(rb),
             pollee: Pollee::new(litebox),
@@ -49,53 +49,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> EndPointer<Platform,
     fn shutdown(&self) {
         self.is_shutdown.store(true, Ordering::Release);
     }
-}
-
-macro_rules! common_functions_for_channel {
-    () => {
-        /// Get the status flags for this channel
-        pub fn get_status(&self) -> OFlags {
-            OFlags::from_bits(self.status.load(Relaxed)).unwrap() & OFlags::STATUS_FLAGS_MASK
-        }
-
-        /// Update the status flags for `mask` to `on`.
-        pub fn set_status(&self, mask: OFlags, on: bool) {
-            if on {
-                self.status.fetch_or(mask.bits(), Relaxed);
-            } else {
-                self.status.fetch_and(mask.complement().bits(), Relaxed);
-            }
-        }
-
-        /// Has this been shut down?
-        pub fn is_shutdown(&self) -> bool {
-            self.endpoint.is_shutdown()
-        }
-
-        /// Shut this channel down.
-        pub fn shutdown(&self) {
-            self.endpoint.shutdown();
-        }
-
-        /// Has the peer (i.e., other end) been shut down?
-        pub fn is_peer_shutdown(&self) -> bool {
-            if let Some(peer) = self.peer.upgrade() {
-                peer.endpoint.is_shutdown()
-            } else {
-                true
-            }
-        }
-    };
-}
-
-/// The "writer" (aka producer or transmit) side of a pipe
-pub struct WriteEnd<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
-    endpoint: EndPointer<Platform, HeapProd<T>>,
-    peer: Weak<ReadEnd<Platform, T>>,
-    /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
-    status: AtomicU32,
-    /// Slice length that is guaranteed to be an atomic write (i.e., non-interleaved).
-    atomic_slice_guarantee_size: usize,
 }
 
 /// Potential errors when writing or reading from a pipe
@@ -118,18 +71,57 @@ impl From<TryOpError<PipeError>> for PipeError {
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T> {
+/// The read [`EndType`]
+pub struct Read {
+    __private: (),
+}
+/// The write [`EndType`]
+pub struct Write {
+    /// Slice length that is guaranteed to be an atomic write (i.e., non-interleaved).
+    atomic_slice_guarantee_size: usize,
+}
+/// Specifies the particular end of a pipe (see [`PipeEnd`]).
+pub trait EndType {
+    type Peer: EndType;
+    const IS_READER_SIDE: bool;
+    type EndTWrap<T>: ringbuf::traits::Observer;
+}
+impl EndType for Read {
+    type Peer = Write;
+    const IS_READER_SIDE: bool = true;
+    type EndTWrap<T> = HeapCons<T>;
+}
+impl EndType for Write {
+    type Peer = Read;
+    const IS_READER_SIDE: bool = false;
+    type EndTWrap<T> = HeapProd<T>;
+}
+
+/// One of the ends of a pipe produced by [`new_pipe`].
+///
+/// Which end of the pipe is specified by `ET` and impacts which side of the functionality is available.
+pub struct PipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider, ET: EndType, T> {
+    endpoint: EndPointer<Platform, ET::EndTWrap<T>>,
+    peer: Weak<PipeEnd<Platform, ET::Peer, T>>,
+    /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
+    status: AtomicU32,
+    et_data: ET,
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> PipeEnd<Platform, Write, T> {
     fn new(
+        litebox: &LiteBox<Platform>,
         rb: HeapProd<T>,
         flags: OFlags,
         atomic_slice_guarantee_size: usize,
-        litebox: &LiteBox<Platform>,
     ) -> Self {
         Self {
-            endpoint: EndPointer::new(rb, litebox),
+            endpoint: EndPointer::new(litebox, rb),
             peer: Weak::new(),
             status: AtomicU32::new((flags | OFlags::WRONLY).bits()),
-            atomic_slice_guarantee_size,
+            et_data: Write {
+                atomic_slice_guarantee_size,
+            },
         }
     }
 
@@ -147,7 +139,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T
         let write_len = {
             let mut rb = self.endpoint.rb.lock();
             let total_size = buf.len();
-            if rb.vacant_len() < total_size && total_size <= self.atomic_slice_guarantee_size {
+            if rb.vacant_len() < total_size
+                && total_size <= self.et_data.atomic_slice_guarantee_size
+            {
                 // No sufficient space for an atomic write
                 0
             } else {
@@ -184,71 +178,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T
             )
         }?)
     }
-
-    common_functions_for_channel!();
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> IOPollable for WriteEnd<Platform, T> {
-    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, filter: Events) {
-        self.endpoint.pollee.register_observer(observer, filter);
-    }
-
-    fn check_io_events(&self) -> Events {
-        let rb = self.endpoint.rb.lock();
-        let mut events = Events::empty();
-        if self.is_peer_shutdown() {
-            events |= Events::ERR;
-        }
-        if !self.is_shutdown() && !rb.is_full() {
-            events |= Events::OUT;
-        }
-        events
-    }
-}
-
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Drop for WriteEnd<Platform, T> {
-    fn drop(&mut self) {
-        self.shutdown();
-
-        if let Some(peer) = self.peer.upgrade() {
-            // when reading from a channel such as a pipe or a stream socket, this event
-            // merely indicates that the peer closed its end of the channel.
-            peer.endpoint.pollee.notify_observers(Events::HUP);
-        }
-    }
-}
-
-/// The "reader" (aka consumer or receive) side of a pipe
-pub struct ReadEnd<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
-    endpoint: EndPointer<Platform, HeapCons<T>>,
-    peer: Weak<WriteEnd<Platform, T>>,
-    status: AtomicU32,
-}
-
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> IOPollable for ReadEnd<Platform, T> {
-    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, filter: Events) {
-        self.endpoint.pollee.register_observer(observer, filter);
-    }
-
-    fn check_io_events(&self) -> Events {
-        let rb = self.endpoint.rb.lock();
-        let mut events = Events::empty();
-        if self.is_peer_shutdown() {
-            events |= Events::HUP;
-        }
-        if !self.is_shutdown() && !rb.is_empty() {
-            events |= Events::IN;
-        }
-        events
-    }
-}
-
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> ReadEnd<Platform, T> {
-    fn new(rb: HeapCons<T>, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> PipeEnd<Platform, Read, T> {
+    fn new(litebox: &LiteBox<Platform>, rb: HeapCons<T>, flags: OFlags) -> Self {
         Self {
-            endpoint: EndPointer::new(rb, litebox),
+            endpoint: EndPointer::new(litebox, rb),
             peer: Weak::new(),
             status: AtomicU32::new((flags | OFlags::RDONLY).bits()),
+            et_data: Read { __private: () },
         }
     }
 
@@ -299,21 +237,93 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> ReadEnd<Platform, T>
             )
         }?)
     }
-
-    common_functions_for_channel!();
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Drop for ReadEnd<Platform, T> {
-    fn drop(&mut self) {
-        self.shutdown();
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider, ET: EndType, T> PipeEnd<Platform, ET, T> {
+    /// Get the status flags for this channel
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "we only store values that are valid bits"
+    )]
+    pub fn get_status(&self) -> OFlags {
+        OFlags::from_bits(self.status.load(Relaxed)).unwrap() & OFlags::STATUS_FLAGS_MASK
+    }
 
+    /// Update the status flags for `mask` to `on`.
+    pub fn set_status(&self, mask: OFlags, on: bool) {
+        if on {
+            self.status.fetch_or(mask.bits(), Relaxed);
+        } else {
+            self.status.fetch_and(mask.complement().bits(), Relaxed);
+        }
+    }
+
+    /// Has this been shut down?
+    pub fn is_shutdown(&self) -> bool {
+        self.endpoint.is_shutdown()
+    }
+
+    /// Shut this channel down.
+    pub fn shutdown(&self) {
+        self.endpoint.shutdown();
+    }
+
+    /// Has the peer (i.e., other end) been shut down?
+    pub fn is_peer_shutdown(&self) -> bool {
         if let Some(peer) = self.peer.upgrade() {
-            // This bit is also set for a file descriptor referring to the write end
-            // of a pipe when the read end has been closed.
-            peer.endpoint.pollee.notify_observers(Events::ERR);
+            peer.endpoint.is_shutdown()
+        } else {
+            true
         }
     }
 }
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider, ET: EndType, T> IOPollable
+    for PipeEnd<Platform, ET, T>
+{
+    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, filter: Events) {
+        self.endpoint.pollee.register_observer(observer, filter);
+    }
+
+    fn check_io_events(&self) -> Events {
+        let rb = self.endpoint.rb.lock();
+        let mut events = Events::empty();
+        events.set(
+            if ET::IS_READER_SIDE {
+                Events::HUP
+            } else {
+                Events::ERR
+            },
+            self.is_peer_shutdown(),
+        );
+        if !self.is_shutdown() {
+            events.set(Events::IN, !rb.is_empty() && ET::IS_READER_SIDE);
+            events.set(Events::OUT, !rb.is_full() && !ET::IS_READER_SIDE);
+        }
+        events
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider, ET: EndType, T> Drop
+    for PipeEnd<Platform, ET, T>
+{
+    fn drop(&mut self) {
+        self.shutdown();
+        if let Some(peer) = self.peer.upgrade() {
+            let notification_event = if ET::Peer::IS_READER_SIDE {
+                // The reader end must be told that the writing peer closed its end.
+                Events::HUP
+            } else {
+                // The writing end must be told that the read end has been closed.
+                Events::ERR
+            };
+            peer.endpoint.pollee.notify_observers(notification_event);
+        }
+    }
+}
+
+pub type Writer<Platform, T> = Arc<PipeEnd<Platform, Write, T>>;
+pub type Reader<Platform, T> = Arc<PipeEnd<Platform, Read, T>>;
 
 /// Create a unidirectional communication channel that sending messages of (slices of) type `T`.
 ///
@@ -329,27 +339,23 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Drop for ReadEnd<Pla
 /// written atomically (i.e., not interleaved with other writes) if a slice of those many (or fewer)
 /// elements are passed at once. Slices longer than this length have no guarantees on atomicity of
 /// writes and might be interleaved with other writes.
-#[expect(
-    clippy::type_complexity,
-    reason = "clippy believes this result type to be complex, but factoring it out into a type def would not help readability in any way"
-)]
 pub fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
     litebox: &LiteBox<Platform>,
     capacity: usize,
     flags: OFlags,
     atomic_slice_guarantee_size: Option<NonZeroUsize>,
-) -> (Arc<WriteEnd<Platform, T>>, Arc<ReadEnd<Platform, T>>) {
+) -> (Writer<Platform, T>, Reader<Platform, T>) {
     let rb: HeapRb<T> = HeapRb::new(capacity);
     let (rb_prod, rb_cons) = rb.split();
 
     // Create the producer and consumer, and set up cyclic references.
-    let mut producer = Arc::new(WriteEnd::new(
+    let mut producer = Arc::new(PipeEnd::<_, Write, _>::new(
+        litebox,
         rb_prod,
         flags,
         atomic_slice_guarantee_size
             .map(NonZeroUsize::get)
             .unwrap_or_default(),
-        litebox,
     ));
     let consumer = Arc::new_cyclic(|weak_self| {
         #[expect(
@@ -359,7 +365,7 @@ pub fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
         {
             Arc::get_mut(&mut producer).unwrap().peer = weak_self.clone();
         }
-        let mut consumer = ReadEnd::new(rb_cons, flags, litebox);
+        let mut consumer = PipeEnd::<_, Read, _>::new(litebox, rb_cons, flags);
         consumer.peer = Arc::downgrade(&producer);
         consumer
     });
