@@ -711,7 +711,7 @@ pub fn sys_pipe2(flags: OFlags) -> Result<(u32, u32), Errno> {
         todo!("O_DIRECT not supported");
     }
 
-    let (writer, reader) = litebox::pipes::new_channel(
+    let (writer, reader) = litebox::pipes::new_pipe(
         crate::litebox(),
         DEFAULT_PIPE_BUF_SIZE,
         flags,

@@ -26,8 +26,8 @@ bitflags::bitflags! {
 }
 
 enum DescriptorRef {
-    PipeReader(Weak<litebox::pipes::Consumer<Platform, u8>>),
-    PipeWriter(Weak<litebox::pipes::Producer<Platform, u8>>),
+    PipeReader(Weak<litebox::pipes::ReadEnd<Platform, u8>>),
+    PipeWriter(Weak<litebox::pipes::WriteEnd<Platform, u8>>),
     Eventfd(Weak<crate::syscalls::eventfd::EventFile<litebox_platform_multiplex::Platform>>),
     Socket(Weak<crate::syscalls::net::Socket>),
 }
@@ -448,7 +448,7 @@ mod test {
     fn test_epoll_with_pipe() {
         let epoll = setup_epoll();
         let (producer, consumer) =
-            litebox::pipes::new_channel::<_, u8>(crate::litebox(), 2, OFlags::empty(), None);
+            litebox::pipes::new_pipe::<_, u8>(crate::litebox(), 2, OFlags::empty(), None);
         let reader = crate::Descriptor::PipeReader {
             consumer,
             close_on_exec: core::sync::atomic::AtomicBool::new(false),

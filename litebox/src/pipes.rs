@@ -89,9 +89,9 @@ macro_rules! common_functions_for_channel {
 }
 
 /// The "writer" (aka producer or transmit) side of a pipe
-pub struct Producer<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
+pub struct WriteEnd<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
     endpoint: EndPointer<Platform, HeapProd<T>>,
-    peer: Weak<Consumer<Platform, T>>,
+    peer: Weak<ReadEnd<Platform, T>>,
     /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
     status: AtomicU32,
     /// Slice length that is guaranteed to be an atomic write (i.e., non-interleaved).
@@ -118,7 +118,7 @@ impl From<TryOpError<PipeError>> for PipeError {
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Producer<Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T> {
     fn new(
         rb: HeapProd<T>,
         flags: OFlags,
@@ -166,7 +166,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Producer<Platform, T
 
     /// Write the values in `buf` into the pipe, returning the number of elements written.
     ///
-    /// See [`new_channel`] for details on blocking and atomicity of writes.
+    /// See [`new_pipe`] for details on blocking and atomicity of writes.
     pub fn write(&self, buf: &[T]) -> Result<usize, PipeError>
     where
         T: Copy,
@@ -188,7 +188,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Producer<Platform, T
     common_functions_for_channel!();
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> IOPollable for Producer<Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> IOPollable for WriteEnd<Platform, T> {
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, filter: Events) {
         self.endpoint.pollee.register_observer(observer, filter);
     }
@@ -206,7 +206,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> IOPollable for Produ
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Drop for Producer<Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Drop for WriteEnd<Platform, T> {
     fn drop(&mut self) {
         self.shutdown();
 
@@ -219,13 +219,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Drop for Producer<Pl
 }
 
 /// The "reader" (aka consumer or receive) side of a pipe
-pub struct Consumer<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
+pub struct ReadEnd<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
     endpoint: EndPointer<Platform, HeapCons<T>>,
-    peer: Weak<Producer<Platform, T>>,
+    peer: Weak<WriteEnd<Platform, T>>,
     status: AtomicU32,
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> IOPollable for Consumer<Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> IOPollable for ReadEnd<Platform, T> {
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, filter: Events) {
         self.endpoint.pollee.register_observer(observer, filter);
     }
@@ -243,7 +243,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> IOPollable for Consu
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Consumer<Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> ReadEnd<Platform, T> {
     fn new(rb: HeapCons<T>, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
         Self {
             endpoint: EndPointer::new(rb, litebox),
@@ -281,7 +281,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Consumer<Platform, T
 
     /// Read values in the pipe into `buf`, returning the number of elements read.
     ///
-    /// See [`new_channel`] for details on blocking behavior.
+    /// See [`new_pipe`] for details on blocking behavior.
     pub fn read(&self, buf: &mut [T]) -> Result<usize, PipeError>
     where
         T: Copy,
@@ -303,7 +303,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Consumer<Platform, T
     common_functions_for_channel!();
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Drop for Consumer<Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Drop for ReadEnd<Platform, T> {
     fn drop(&mut self) {
         self.shutdown();
 
@@ -333,17 +333,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Drop for Consumer<Pl
     clippy::type_complexity,
     reason = "clippy believes this result type to be complex, but factoring it out into a type def would not help readability in any way"
 )]
-pub fn new_channel<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
+pub fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
     litebox: &LiteBox<Platform>,
     capacity: usize,
     flags: OFlags,
     atomic_slice_guarantee_size: Option<NonZeroUsize>,
-) -> (Arc<Producer<Platform, T>>, Arc<Consumer<Platform, T>>) {
+) -> (Arc<WriteEnd<Platform, T>>, Arc<ReadEnd<Platform, T>>) {
     let rb: HeapRb<T> = HeapRb::new(capacity);
     let (rb_prod, rb_cons) = rb.split();
 
     // Create the producer and consumer, and set up cyclic references.
-    let mut producer = Arc::new(Producer::new(
+    let mut producer = Arc::new(WriteEnd::new(
         rb_prod,
         flags,
         atomic_slice_guarantee_size
@@ -359,7 +359,7 @@ pub fn new_channel<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
         {
             Arc::get_mut(&mut producer).unwrap().peer = weak_self.clone();
         }
-        let mut consumer = Consumer::new(rb_cons, flags, litebox);
+        let mut consumer = ReadEnd::new(rb_cons, flags, litebox);
         consumer.peer = Arc::downgrade(&producer);
         consumer
     });
@@ -378,7 +378,7 @@ mod tests {
         let platform = crate::platform::mock::MockPlatform::new();
         let litebox = crate::LiteBox::new(platform);
 
-        let (prod, cons) = super::new_channel(&litebox, 2, crate::fs::OFlags::empty(), None);
+        let (prod, cons) = super::new_pipe(&litebox, 2, crate::fs::OFlags::empty(), None);
         std::thread::spawn(move || {
             let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
             let mut i = 0;
@@ -408,7 +408,7 @@ mod tests {
         let platform = crate::platform::mock::MockPlatform::new();
         let litebox = crate::LiteBox::new(platform);
 
-        let (prod, cons) = super::new_channel(&litebox, 2, crate::fs::OFlags::NONBLOCK, None);
+        let (prod, cons) = super::new_pipe(&litebox, 2, crate::fs::OFlags::NONBLOCK, None);
         std::thread::spawn(move || {
             let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
             let mut i = 0;
