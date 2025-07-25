@@ -4,15 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+arrayvec = { version = "0.7.6", default-features = false }
+bitflags = "2.9.0"
 litebox = { path = "../litebox/", version = "0.1.0" }
-litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
-litebox_platform_multiplex = { path = "../litebox_platform_multiplex/", version = "0.1.0" }
-
-[features]
-unstable-testing = []
+litebox_common_optee = { path = "../litebox_common_optee/", version = "0.1.0" }
+litebox_platform_multiplex = { path = "../litebox_platform_multiplex/", version = "0.1.0", default-features = false, features = ["platform_lvbs"] }
+num_enum = { version = "0.7.3", default-features = false }
+once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-litebox_shim_optee = { path = ".", features = ["unstable-testing"] }
+spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
+litebox_platform_multiplex = { path = "../litebox_platform_multiplex/", version = "0.1.0", default-features = false, features = ["platform_linux_userland"] }

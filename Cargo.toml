@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "litebox", 
     "litebox_common_linux",
+    "litebox_common_optee",
     "litebox_platform_linux_kernel",
     "litebox_platform_linux_userland",
     "litebox_platform_freebsd_userland",
@@ -18,6 +19,7 @@ members = [
 default-members = [
     "litebox",
     "litebox_common_linux",
+    "litebox_common_optee",
     "litebox_platform_linux_kernel",
     "litebox_platform_linux_userland",
     "litebox_platform_freebsd_userland",
@@ -27,6 +29,7 @@ default-members = [
     "litebox_runner_linux_userland",
     "litebox_runner_linux_on_windows_userland",
     "litebox_shim_linux",
+    "litebox_shim_optee",
     "litebox_syscall_rewriter"
 ]
 # We exclude `litebox_runner_lvbs` from `default-members` because its interrupt handling

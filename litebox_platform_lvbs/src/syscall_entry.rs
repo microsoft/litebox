@@ -4,6 +4,7 @@ use crate::{
     user_context::UserSpaceManagement,
 };
 use core::arch::{asm, naked_asm};
+use litebox_common_optee::{SyscallContext, SyscallRequest};
 use x86_64::{
     VirtAddr,
     registers::{
@@ -35,14 +36,13 @@ use x86_64::{
 // r11: userspace rflags
 // Note. rsp should point to the userspace stack before calling `sysretq`
 
-// placholder for the syscall handler function type
-pub type SyscallHandler = fn() -> isize;
+pub type SyscallHandler = fn(SyscallRequest<crate::host::LvbsLinuxKernel>) -> u32;
 static SYSCALL_HANDLER: spin::Once<SyscallHandler> = spin::Once::new();
 
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct SyscallContext {
+pub struct SyscallContextRaw {
     rdi: u64, // arg0
     rsi: u64, // arg1
     rdx: u64, // arg2
@@ -56,7 +56,7 @@ pub struct SyscallContext {
     rsp: u64, // userspace stack pointer
 }
 
-impl SyscallContext {
+impl SyscallContextRaw {
     /// # Panics
     /// Panics if the index is out of bounds (greater than 7).
     pub fn arg_index(&self, index: usize) -> u64 {
@@ -84,25 +84,53 @@ impl SyscallContext {
     pub fn user_rsp(&self) -> Option<VirtAddr> {
         VirtAddr::try_new(self.rsp).ok()
     }
+
+    #[expect(clippy::cast_possible_truncation)]
+    pub fn syscall_context(&self) -> SyscallContext {
+        SyscallContext::new(&[
+            self.rdi as usize,
+            self.rsi as usize,
+            self.rdx as usize,
+            self.r10 as usize,
+            self.r8 as usize,
+            self.r9 as usize,
+            self.r12 as usize,
+            self.r13 as usize,
+        ])
+    }
 }
 
 #[allow(clippy::similar_names)]
 #[allow(unreachable_code)]
-fn syscall_entry(sysnr: u64, ctx: *const SyscallContext) -> isize {
+fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> u32 {
     let syscall_handler: SyscallHandler = *SYSCALL_HANDLER
         .get()
         .expect("Syscall handler should be initialized");
 
-    debug_serial_println!("sysnr = {:#x}, ctx = {:#x}", sysnr, ctx as usize);
-    let ctx = unsafe { &*ctx };
+    debug_serial_println!("sysnr = {:#x}, ctx_raw = {:#x}", sysnr, ctx_raw as usize);
+    let ctx_raw = unsafe { &*ctx_raw };
 
     assert!(
-        ctx.user_rip().is_some() && ctx.user_rsp().is_some(),
+        ctx_raw.user_rip().is_some() && ctx_raw.user_rsp().is_some(),
         "BUG: userspace RIP or RSP is invalid"
     );
 
+    // save user context
+    crate::platform_low()
+        .save_user_context(
+            ctx_raw.user_rip().unwrap(),
+            ctx_raw.user_rsp().unwrap(),
+            ctx_raw.user_rflags(),
+        )
+        .expect("Failed to save user context");
+
+    let ctx = ctx_raw.syscall_context();
+
     // call the syscall handler passed down from the shim
-    let sysret = syscall_handler();
+    let sysret = syscall_handler(
+        SyscallRequest::try_from_raw(usize::try_from(sysnr).unwrap(), &ctx)
+            .expect("Failed to convert syscall request"),
+    );
 
     // TODO: We should decide whether we place this function here, OP-TEE shim, or separate it into
     // multiple functions and place them in the appropriate places.
@@ -118,15 +146,6 @@ fn syscall_entry(sysnr: u64, ctx: *const SyscallContext) -> isize {
     if sysret == 0 {
         return sysret;
     }
-
-    // save user context before switching to VTL0
-    crate::platform_low()
-        .save_user_context(
-            ctx.user_rip().unwrap(),
-            ctx.user_rsp().unwrap(),
-            ctx.user_rflags(),
-        )
-        .expect("Failed to save user context");
 
     let kernel_context = get_per_core_kernel_context();
     kernel_context.set_vtl_return_value(0);
@@ -169,7 +188,7 @@ unsafe extern "C" fn syscall_entry_wrapper() {
         "sysretq",
         stack_alignment = const STACK_ALIGNMENT,
         syscall_entry = sym syscall_entry,
-        register_space = const core::mem::size_of::<SyscallContext>() - core::mem::size_of::<u64>() * NUM_REGISTERS_TO_POP,
+        register_space = const core::mem::size_of::<SyscallContextRaw>() - core::mem::size_of::<u64>() * NUM_REGISTERS_TO_POP,
     );
 }
 const NUM_REGISTERS_TO_POP: usize = 3;
