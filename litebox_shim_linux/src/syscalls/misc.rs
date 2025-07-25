@@ -118,23 +118,23 @@ pub(crate) fn sys_capget(
     let hdr = unsafe { header.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
     match hdr.version {
         _LINUX_CAPABILITY_VERSION_1 => {
-            let cap = litebox_common_linux::CapData {
-                effective: 0,
-                permitted: 0,
-                inheritable: 0,
-            };
             if let Some(data_ptr) = data {
+                let cap = litebox_common_linux::CapData {
+                    effective: 0,
+                    permitted: 0,
+                    inheritable: 0,
+                };
                 unsafe { data_ptr.write_at_offset(0, cap) }.ok_or(Errno::EFAULT)?;
             }
             Ok(())
         }
         _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => {
-            let cap = litebox_common_linux::CapData {
-                effective: 0,
-                permitted: 0,
-                inheritable: 0,
-            };
             if let Some(data_ptr) = data {
+                let cap = litebox_common_linux::CapData {
+                    effective: 0,
+                    permitted: 0,
+                    inheritable: 0,
+                };
                 unsafe { data_ptr.write_at_offset(0, cap.clone()) }.ok_or(Errno::EFAULT)?;
                 unsafe { data_ptr.write_at_offset(1, cap) }.ok_or(Errno::EFAULT)?;
             }
