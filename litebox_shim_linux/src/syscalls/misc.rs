@@ -104,6 +104,53 @@ pub(crate) fn sys_sysinfo() -> litebox_common_linux::Sysinfo {
     }
 }
 
+const _LINUX_CAPABILITY_VERSION_1: u32 = 0x19980330;
+const _LINUX_CAPABILITY_VERSION_2: u32 = 0x20071026; /* deprecated - use v3 */
+const _LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+
+/// Handle syscall `capget`.
+/// 
+/// Note we don't support capabilities in LiteBox, so this is a no-op that returns empty capabilities.
+pub(crate) fn sys_capget(header: crate::MutPtr<litebox_common_linux::CapHeader>, data: Option<crate::MutPtr<litebox_common_linux::CapData>>) -> Result<(), Errno> {
+    let hdr = unsafe { header.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+    match hdr.version {
+        _LINUX_CAPABILITY_VERSION_1 => {
+            let cap = litebox_common_linux::CapData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            };
+            if let Some(data_ptr) = data {
+                unsafe { data_ptr.write_at_offset(0, cap) }.ok_or(Errno::EFAULT)?;
+            }
+            Ok(())
+        }
+        _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => {
+            let cap = litebox_common_linux::CapData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            };
+            if let Some(data_ptr) = data {
+                unsafe { data_ptr.write_at_offset(0, cap.clone()) }.ok_or(Errno::EFAULT)?;
+                unsafe { data_ptr.write_at_offset(1, cap) }.ok_or(Errno::EFAULT)?;
+            }
+            Ok(())
+        }
+        _ => {
+            unsafe { header.write_at_offset(0, litebox_common_linux::CapHeader {
+                version: _LINUX_CAPABILITY_VERSION_3,
+                pid: hdr.pid,
+            }) }.ok_or(Errno::EFAULT)?;
+            if data.is_none() {
+                Ok(())
+            } else {
+                Err(Errno::EINVAL)
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::mem::MaybeUninit;

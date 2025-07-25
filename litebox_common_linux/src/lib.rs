@@ -1275,6 +1275,19 @@ pub struct Sysinfo {
     pub _f: [u8; 20 - 2 * core::mem::size_of::<usize>() - core::mem::size_of::<u32>()],
 }
 
+#[derive(Clone, Debug)]
+pub struct CapHeader {
+    pub version: u32,
+    pub pid: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct CapData {
+    pub effective: u32,
+    pub permitted: u32,
+    pub inheritable: u32,
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
@@ -1562,6 +1575,10 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     Getegid,
     Sysinfo {
         buf: Platform::RawMutPointer<Sysinfo>,
+    },
+    CapGet {
+        header: Platform::RawMutPointer<CapHeader>,
+        data: Option<Platform::RawMutPointer<CapData>>,
     },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
@@ -2126,6 +2143,17 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             }
             Sysno::sysinfo => SyscallRequest::Sysinfo {
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
+            },
+            Sysno::capget => {
+                let data_ptr = ctx.syscall_arg(1);
+                SyscallRequest::CapGet {
+                    header: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
+                    data: if data_ptr == 0 {
+                        None
+                    } else {
+                        Some(Platform::RawMutPointer::from_usize(data_ptr))
+                    },
+                }
             },
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq => {
                 SyscallRequest::Ret(errno::Errno::ENOSYS)
