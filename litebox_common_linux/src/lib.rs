@@ -495,6 +495,23 @@ pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     },
 }
 
+impl<Platform: litebox::platform::RawPointerProvider> alloc::fmt::Debug for IoctlArg<Platform> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::TCGETS(arg0) => f.debug_tuple("TCGETS").field(&arg0.as_usize()).finish(),
+            Self::TCSETS(arg0) => f.debug_tuple("TCSETS").field(&arg0.as_usize()).finish(),
+            Self::TIOCGWINSZ(arg0) => f.debug_tuple("TIOCGWINSZ").field(&arg0.as_usize()).finish(),
+            Self::TIOCGPTN(arg0) => f.debug_tuple("TIOCGPTN").field(&arg0.as_usize()).finish(),
+            Self::FIONBIO(arg0) => f.debug_tuple("FIONBIO").field(&arg0.as_usize()).finish(),
+            Self::Raw { cmd, arg } => f
+                .debug_struct("Raw")
+                .field("cmd", cmd)
+                .field("arg", &arg.as_usize())
+                .finish(),
+        }
+    }
+}
+
 bitflags::bitflags! {
     #[derive(Debug)]
     pub struct MRemapFlags: u32 {
@@ -541,7 +558,7 @@ bitflags::bitflags! {
 
 #[repr(u8)]
 #[non_exhaustive]
-#[derive(IntEnum, PartialEq)]
+#[derive(Debug, IntEnum, PartialEq)]
 pub enum Protocol {
     ICMP = 1,
     TCP = 6,
@@ -790,6 +807,21 @@ pub enum ArchPrctlArg<Platform: litebox::platform::RawPointerProvider> {
     #[doc(hidden)]
     #[allow(non_camel_case_types)]
     __Phantom(core::marker::PhantomData<Platform>),
+}
+
+impl<Platform: litebox::platform::RawPointerProvider> alloc::fmt::Debug for ArchPrctlArg<Platform> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            #[cfg(target_arch = "x86_64")]
+            Self::SetFs(addr) => f.debug_tuple("SET_FS").field(addr).finish(),
+            #[cfg(target_arch = "x86_64")]
+            Self::GetFs(addr) => f.debug_tuple("GET_FS").field(&addr.as_usize()).finish(),
+            Self::CETStatus => f.debug_tuple("CET_STATUS").finish(),
+            Self::CETDisable => f.debug_tuple("CET_DISABLE").finish(),
+            Self::CETLock => f.debug_tuple("CET_LOCK").finish(),
+            Self::__Phantom(_) => f.debug_tuple("__Phantom").finish(),
+        }
+    }
 }
 
 /// Reads the FS segment base address
@@ -2341,5 +2373,548 @@ impl PtRegs {
     #[cfg(target_arch = "x86")]
     pub fn get_ip(&self) -> usize {
         self.eip
+    }
+}
+
+impl<Platform: litebox::platform::RawPointerProvider> alloc::fmt::Debug
+    for SyscallRequest<'_, Platform>
+{
+    #[allow(clippy::too_many_lines)]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Madvise {
+                addr,
+                length,
+                behavior,
+            } => f
+                .debug_struct("Madvise")
+                .field("addr", &addr.as_usize())
+                .field("length", length)
+                .field("behavior", behavior)
+                .finish(),
+            Self::SetThreadArea { user_desc } => f
+                .debug_struct("SetThreadArea")
+                .field("user_desc", &user_desc.as_usize())
+                .finish(),
+            Self::Getuid => f.debug_struct("Getuid").finish(),
+            Self::Getgid => f.debug_struct("Getgid").finish(),
+            Self::Geteuid => f.debug_struct("Geteuid").finish(),
+            Self::Getegid => f.debug_struct("Getegid").finish(),
+            Self::Gettid => f.debug_struct("Gettid").finish(),
+            Self::GetRobustList { pid, head, len } => f
+                .debug_struct("GetRobustList")
+                .field("pid", &pid.map_or(0, |p| p))
+                .field("head", &head.as_usize())
+                .field("len", &len.as_usize())
+                .finish(),
+            Self::Read { fd, buf, count } => f
+                .debug_struct("Read")
+                .field("fd", fd)
+                .field("buf", &buf.as_usize())
+                .field("count", count)
+                .finish(),
+            Self::Write { fd, buf, count } => f
+                .debug_struct("Write")
+                .field("fd", fd)
+                .field("buf", &buf.as_usize())
+                .field("count", count)
+                .finish(),
+            Self::Close { fd } => f.debug_struct("Close").field("fd", fd).finish(),
+            Self::Stat { pathname, buf } => f
+                .debug_struct("Stat")
+                .field(
+                    "pathname",
+                    &unsafe { pathname.to_cow_cstr() }.map(alloc::borrow::Cow::into_owned),
+                )
+                .field("buf", &buf.as_usize())
+                .finish(),
+            Self::Fstat { fd, buf } => f
+                .debug_struct("Fstat")
+                .field("fd", fd)
+                .field("buf", &buf.as_usize())
+                .finish(),
+            Self::Lstat { pathname, buf } => f
+                .debug_struct("Lstat")
+                .field(
+                    "pathname",
+                    &unsafe { pathname.to_cow_cstr() }.map(alloc::borrow::Cow::into_owned),
+                )
+                .field("buf", &buf.as_usize())
+                .finish(),
+            Self::Mmap {
+                addr,
+                length,
+                prot,
+                flags,
+                fd,
+                offset,
+            } => f
+                .debug_struct("Mmap")
+                .field("addr", &format_args!("{addr:#x}"))
+                .field("length", length)
+                .field("prot", prot)
+                .field("flags", flags)
+                .field("fd", fd)
+                .field("offset", offset)
+                .finish(),
+            Self::Mprotect { addr, length, prot } => f
+                .debug_struct("Mprotect")
+                // `addr` is a pointer, so we use `as_usize()` to print it in hex
+                .field("addr", &format_args!("{:#x}", addr.as_usize()))
+                .field("length", length)
+                .field("prot", prot)
+                .finish(),
+            Self::Munmap { addr, length } => f
+                .debug_struct("Munmap")
+                .field("addr", &addr.as_usize())
+                .field("length", length)
+                .finish(),
+            Self::Mremap {
+                old_addr,
+                old_size,
+                new_size,
+                flags,
+                new_addr,
+            } => f
+                .debug_struct("Mremap")
+                .field("old_addr", &old_addr.as_usize())
+                .field("old_size", old_size)
+                .field("new_size", new_size)
+                .field("flags", flags)
+                .field("new_addr", new_addr)
+                .finish(),
+            Self::Brk { addr } => f
+                .debug_struct("Brk")
+                .field("addr", &addr.as_usize())
+                .finish(),
+            Self::RtSigprocmask {
+                how,
+                set,
+                oldset,
+                sigsetsize,
+            } => f
+                .debug_struct("RtSigprocmask")
+                .field("how", how)
+                .field(
+                    "set",
+                    &if let Some(set) = set {
+                        set.as_usize()
+                    } else {
+                        0
+                    },
+                )
+                .field(
+                    "old_set",
+                    &if let Some(oldset) = oldset {
+                        oldset.as_usize()
+                    } else {
+                        0
+                    },
+                )
+                .field("sigsetsize", sigsetsize)
+                .finish(),
+            Self::RtSigaction {
+                signum,
+                act,
+                oldact,
+                sigsetsize,
+            } => f
+                .debug_struct("RtSigaction")
+                .field("signum", signum)
+                .field(
+                    "act",
+                    &if let Some(act) = act {
+                        act.as_usize()
+                    } else {
+                        0
+                    },
+                )
+                .field(
+                    "oldact",
+                    &if let Some(oldact) = oldact {
+                        oldact.as_usize()
+                    } else {
+                        0
+                    },
+                )
+                .field("sigsetsize", sigsetsize) // sigsetsize is always 8 for this syscall
+                .finish(),
+            Self::Ioctl { fd, arg } => f
+                .debug_struct("Ioctl")
+                .field("fd", fd)
+                .field("arg", arg)
+                .finish(),
+            Self::Pread64 {
+                fd,
+                buf,
+                count,
+                offset,
+            } => f
+                .debug_struct("Pread64")
+                .field("fd", fd)
+                .field("buf", &buf.as_usize())
+                .field("count", count)
+                .field("offset", offset)
+                .finish(),
+            Self::Pwrite64 {
+                fd,
+                buf,
+                count,
+                offset,
+            } => f
+                .debug_struct("Pwrite64")
+                .field("fd", fd)
+                .field("buf", &buf.as_usize())
+                .field("count", count)
+                .field("offset", offset)
+                .finish(),
+            Self::Readv { fd, iovec, iovcnt } => f
+                .debug_struct("Readv")
+                .field("fd", fd)
+                .field("iovec", &iovec.as_usize())
+                .field("iovcnt", iovcnt)
+                .finish(),
+            Self::Writev { fd, iovec, iovcnt } => f
+                .debug_struct("Writev")
+                .field("fd", fd)
+                .field("iovec", &iovec.as_usize())
+                .field("iovcnt", iovcnt)
+                .finish(),
+            Self::Access { pathname, mode } => f
+                .debug_struct("Access")
+                .field(
+                    "pathname",
+                    &unsafe { pathname.to_cow_cstr() }.map(alloc::borrow::Cow::into_owned),
+                )
+                .field("mode", mode)
+                .finish(),
+            Self::Dup {
+                oldfd,
+                newfd,
+                flags,
+            } => f
+                .debug_struct("Dup")
+                .field("oldfd", oldfd)
+                .field("newfd", &if let Some(newfd) = newfd { *newfd } else { 0 })
+                .field(
+                    "flags",
+                    &if let Some(flags) = flags {
+                        flags.bits() as usize
+                    } else {
+                        0
+                    },
+                )
+                .finish(),
+            Self::Socket {
+                domain,
+                ty,
+                flags,
+                protocol,
+            } => f
+                .debug_struct("Socket")
+                .field("domain", domain)
+                .field("ty", ty)
+                .field("flags", flags)
+                .field("protocol", protocol)
+                .finish(),
+            Self::Connect {
+                sockfd,
+                sockaddr,
+                addrlen,
+            } => f
+                .debug_struct("Connect")
+                .field("sockfd", sockfd)
+                .field("sockaddr", &sockaddr.as_usize())
+                .field("addrlen", addrlen)
+                .finish(),
+            Self::Accept {
+                sockfd,
+                addr,
+                addrlen,
+                flags,
+            } => f
+                .debug_struct("Accept")
+                .field("sockfd", sockfd)
+                .field(
+                    "addr",
+                    &if let Some(addr) = addr {
+                        addr.as_usize()
+                    } else {
+                        0
+                    },
+                )
+                .field(
+                    "addrlen",
+                    &if let Some(addrlen) = addrlen {
+                        addrlen.as_usize()
+                    } else {
+                        0
+                    },
+                )
+                .field("flags", flags)
+                .finish(),
+            Self::Setsockopt {
+                sockfd,
+                optname,
+                optval,
+                optlen,
+            } => f
+                .debug_struct("Setsockopt")
+                .field("sockfd", sockfd)
+                .field("optname", optname)
+                .field("optval", &optval.as_usize())
+                .field("optlen", optlen)
+                .finish(),
+            Self::Sendto {
+                sockfd,
+                buf,
+                len,
+                flags,
+                addr,
+                addrlen,
+            } => f
+                .debug_struct("Sendto")
+                .field("sockfd", sockfd)
+                .field("buf", &buf.as_usize())
+                .field("len", len)
+                .field("flags", flags)
+                .field(
+                    "addr",
+                    &if let Some(addr) = addr {
+                        addr.as_usize()
+                    } else {
+                        0
+                    },
+                )
+                .field("addrlen", addrlen)
+                .finish(),
+            Self::Recvfrom {
+                sockfd,
+                buf,
+                len,
+                flags,
+                addr,
+                addrlen,
+            } => f
+                .debug_struct("Recvfrom")
+                .field("sockfd", sockfd)
+                .field("buf", &buf.as_usize())
+                .field("len", len)
+                .field("flags", flags)
+                .field(
+                    "addr",
+                    &if let Some(addr) = addr {
+                        addr.as_usize()
+                    } else {
+                        0
+                    },
+                )
+                .field(
+                    "addrlen",
+                    &if let Some(addrlen) = addrlen {
+                        addrlen.as_usize()
+                    } else {
+                        0
+                    },
+                )
+                .finish(),
+            Self::Bind {
+                sockfd,
+                sockaddr,
+                addrlen,
+            } => f
+                .debug_struct("Bind")
+                .field("sockfd", sockfd)
+                .field("sockaddr", &sockaddr.as_usize())
+                .field("addrlen", addrlen)
+                .finish(),
+            Self::Listen { sockfd, backlog } => f
+                .debug_struct("Listen")
+                .field("sockfd", sockfd)
+                .field("backlog", backlog)
+                .finish(),
+            Self::Exit { status } => f.debug_struct("Exit").field("code", status).finish(),
+            Self::ExitGroup { status } => {
+                f.debug_struct("ExitGroup").field("code", status).finish()
+            }
+            Self::Uname { buf } => f
+                .debug_struct("Uname")
+                .field("buf", &buf.as_usize())
+                .finish(),
+            Self::Fcntl { fd, arg } => f
+                .debug_struct("Fcntl")
+                .field("fd", fd)
+                .field("arg", arg)
+                .finish(),
+            Self::Getcwd { buf, size } => f
+                .debug_struct("Getcwd")
+                .field("buf", &buf.as_usize())
+                .field("size", size)
+                .finish(),
+            Self::Readlink {
+                pathname,
+                buf,
+                bufsiz,
+            } => f
+                .debug_struct("Readlink")
+                .field("pathname", &unsafe { pathname.to_cow_cstr() })
+                .field("buf", &buf.as_usize())
+                .field("bufsiz", bufsiz)
+                .finish(),
+            Self::Readlinkat {
+                dirfd,
+                pathname,
+                buf,
+                bufsiz,
+            } => f
+                .debug_struct("Readlinkat")
+                .field("dirfd", dirfd)
+                .field(
+                    "pathname",
+                    &unsafe { pathname.to_cow_cstr() }.map(alloc::borrow::Cow::into_owned),
+                )
+                .field("buf", &buf.as_usize())
+                .field("bufsiz", bufsiz)
+                .finish(),
+            Self::Openat {
+                dirfd,
+                pathname,
+                flags,
+                mode,
+            } => f
+                .debug_struct("Openat")
+                .field("dirfd", dirfd)
+                .field(
+                    "pathname",
+                    &unsafe { pathname.to_cow_cstr() }.map(alloc::borrow::Cow::into_owned),
+                )
+                .field("flags", flags)
+                .field("mode", mode)
+                .finish(),
+            #[cfg(target_arch = "x86_64")]
+            Self::Newfstatat {
+                dirfd,
+                pathname,
+                buf,
+                flags,
+            } => f
+                .debug_struct("Newfstatat")
+                .field("dirfd", dirfd)
+                .field(
+                    "pathname",
+                    &unsafe { pathname.to_cow_cstr() }.map(alloc::borrow::Cow::into_owned),
+                )
+                .field("buf", &buf.as_usize())
+                .field("flags", flags)
+                .finish(),
+            Self::Eventfd2 { initval, flags } => f
+                .debug_struct("Eventfd2")
+                .field("initval", initval)
+                .field("flags", flags)
+                .finish(),
+            Self::Pipe2 { pipefd, flags } => f
+                .debug_struct("Pipe2")
+                .field("pipefd", &pipefd.as_usize())
+                .field("flags", flags)
+                .finish(),
+            Self::Ret(arg0) => f.debug_tuple("Ret").field(arg0).finish(),
+            Self::EpollCtl {
+                epfd,
+                op,
+                fd,
+                event,
+            } => f
+                .debug_struct("EpollCtl")
+                .field("epfd", epfd)
+                .field("op", op)
+                .field("fd", fd)
+                .field("event", &event.as_usize())
+                .finish(),
+            Self::EpollPwait {
+                epfd,
+                events,
+                maxevents,
+                timeout,
+                sigmask,
+                sigsetsize,
+            } => f
+                .debug_struct("EpollPwait")
+                .field("epfd", epfd)
+                .field("events", &events.as_usize())
+                .field("maxevents", maxevents)
+                .field("timeout", timeout)
+                .field("sigmask", &sigmask.map(|v| v.as_usize()))
+                .field("sigsetsize", sigsetsize)
+                .finish(),
+            Self::EpollCreate { flags } => {
+                f.debug_struct("EpollCreate").field("flags", flags).finish()
+            }
+            Self::ArchPrctl { arg } => f.debug_struct("ArchPrctl").field("arg", arg).finish(),
+            Self::Clone { args, ctx: _ } => f
+                .debug_struct("Clone")
+                .field("args", &args.as_usize())
+                .finish_non_exhaustive(),
+            Self::SetTidAddress { tidptr } => f
+                .debug_struct("SetTidAddress")
+                .field("tid", &tidptr.as_usize())
+                .finish(),
+            Self::SetRobustList { head } => {
+                f.debug_struct("SetRobustList").field("head", head).finish()
+            }
+            Self::Getrlimit { resource, rlim } => f
+                .debug_struct("Getrlimit")
+                .field("resource", resource)
+                .field("rlim", &rlim.as_usize())
+                .finish(),
+            Self::Setrlimit { resource, rlim } => f
+                .debug_struct("Setrlimit")
+                .field("resource", resource)
+                .field("rlim", &rlim.as_usize())
+                .finish(),
+            Self::Prlimit {
+                pid,
+                resource,
+                new_limit,
+                old_limit,
+            } => f
+                .debug_struct("Prlimit")
+                .field("pid", &pid.map(|p| p))
+                .field("resource", resource)
+                .field("new_limit", &new_limit.map(|l| l.as_usize()).unwrap_or(0))
+                .field("old_limit", &old_limit.map(|l| l.as_usize()).unwrap_or(0))
+                .finish(),
+            Self::GetRandom { buf, count, flags } => f
+                .debug_struct("GetRandom")
+                .field("buf", &buf.as_usize())
+                .field("count", count)
+                .field("flags", flags)
+                .finish(),
+            Self::Sysinfo { buf } => f
+                .debug_struct("Sysinfo")
+                .field("buf", &buf.as_usize())
+                .finish(),
+            Self::Getpid => f.debug_struct("Getpid").finish(),
+            #[cfg(target_arch = "x86")]
+            Self::Fstatat64 {
+                dirfd,
+                pathname,
+                buf,
+                flags,
+            } => f
+                .debug_struct("Fstatat64")
+                .field("dirfd", dirfd)
+                .field(
+                    "pathname",
+                    &unsafe { pathname.to_cow_cstr() }.map(alloc::borrow::Cow::into_owned),
+                )
+                .field("buf", &buf.as_usize())
+                .field("flags", flags)
+                .finish(),
+            Self::CapGet { header, data } => f
+                .debug_struct("CapGet")
+                .field("header", &header.as_usize())
+                .field("data", &data.map_or(0, |d| d.as_usize()))
+                .finish(),
+        }
     }
 }
