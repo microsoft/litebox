@@ -283,7 +283,7 @@ impl RawMutex {
                     }
                     Some(remaining_time) => {
                         let ms = remaining_time.as_millis();
-                        ms.min(u32::MAX as u128) as u32
+                        ms.min((u32::MAX - 1) as u128) as u32
                     }
                 },
             };
@@ -335,7 +335,7 @@ impl litebox::platform::RawMutex for RawMutex {
         let waiting = self.waiter_count.load(SeqCst);
 
         unsafe {
-            if n as usize == usize::MAX {
+            if (n as usize) >= waiting {
                 Win32_Threading::WakeByAddressAll(
                     self.underlying_atomic().as_ptr() as *const c_void
                 );
