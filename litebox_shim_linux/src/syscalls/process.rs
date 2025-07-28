@@ -614,6 +614,13 @@ mod tests {
             stack.as_usize()
         );
         let main: fn() = || {
+            let startfsbase = unsafe { litebox_common_linux::rdfsbase() };
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "Child started with FS base: {:#x}",
+                startfsbase
+            );
+
             let tid = super::sys_gettid();
             litebox::log_println!(
                 litebox_platform_multiplex::platform(),
@@ -629,6 +636,40 @@ mod tests {
                 .expect("Failed to get FS base");
                 #[allow(static_mut_refs)]
                 let addr = unsafe { TLS.as_ptr() } as usize;
+
+                // // use assembly code to wrfsbase
+                // unsafe {
+                //     core::arch::asm!(
+                //         "wrfsbase {0}",
+                //         in(reg) addr,
+                //         options(nostack, preserves_flags)
+                //     );
+                // }
+
+                // use assembly to rdfsbase
+                let mut test_fsbase: u64 = 1115;
+                unsafe {
+                    core::arch::asm!(
+                        "rdfsbase {0}",
+                        out(reg) test_fsbase,
+                        options(nostack, preserves_flags)
+                    );
+                }
+                litebox::log_println!(
+                    litebox_platform_multiplex::platform(),
+                    "just got FS base: {:#x}",
+                    test_fsbase,
+                );
+
+                litebox::log_println!(
+                    litebox_platform_multiplex::platform(),
+                    "FS_base: {:#x} {}, TLS pointer: {:#x} {}",
+                    unsafe { current_fs_base.assume_init() },
+                    unsafe { current_fs_base.assume_init() },
+                    addr,
+                    addr
+                );
+
                 assert_eq!(
                     addr,
                     unsafe { current_fs_base.assume_init() },
