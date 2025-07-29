@@ -93,6 +93,7 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         flags: OFlags,
         mode: Mode,
     ) -> Result<FileFd<Platform>, OpenError> {
+        let flags = flags - OFlags::NOCTTY; // ignore NOCTTY
         let path = self.absolute_path(path)?;
         match path.as_str() {
             "/dev/stdin" => {
