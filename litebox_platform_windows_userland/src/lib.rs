@@ -145,25 +145,6 @@ impl WindowsUserland {
         reserved_pages
     }
 
-    fn set_init_tls(&self) {
-        // TODO: Currently we are using a static thread ID and credentials (faked).
-        // This is a placeholder for future implementation to use passthrough.
-        let creds = litebox_common_linux::Credentials {
-            uid: 1000,
-            gid: 1000,
-            euid: 1000,
-            egid: 1000,
-        };
-        let task = alloc::boxed::Box::new(litebox_common_linux::Task::<WindowsUserland> {
-            tid: 1000,
-            clear_child_tid: None,
-            robust_list: None,
-            credentials: alloc::sync::Arc::new(creds),
-        });
-        let tls = litebox_common_linux::ThreadLocalStorage::new(task);
-        self.set_thread_local_storage(tls);
-    }
-
     /// Retrieves information about the host platform (Windows).
     fn get_system_information(sys_info: &mut Win32_SysInfo::SYSTEM_INFO) {
         unsafe {
@@ -191,6 +172,7 @@ impl WindowsUserland {
             egid: 1000,
         };
         let task = alloc::boxed::Box::new(litebox_common_linux::Task::<WindowsUserland> {
+            pid: 1000,
             tid: 1000,
             clear_child_tid: None,
             robust_list: None,
@@ -412,12 +394,6 @@ fn prot_flags(flags: MemoryRegionPermissions) -> Win32_Memory::PAGE_PROTECTION_F
 }
 
 fn do_prefetch_on_range(start: usize, size: usize) {
-    println!(
-        "Prefetching memory range: {:p} - {:p}, size: {}",
-        start as *const c_void,
-        (start + size) as *const c_void,
-        size
-    );
     let ok = unsafe {
         let prefetch_entry = Win32_Memory::WIN32_MEMORY_RANGE_ENTRY {
             VirtualAddress: start as *mut c_void,
@@ -436,19 +412,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         &self,
         suggested_range: core::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
-        can_grow_down: bool,
+        _can_grow_down: bool,
         populate_pages_immediately: bool,
-        fixed_address: bool,
+        _fixed_address: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let mut base_addr = suggested_range.start as *mut c_void;
         let mut size = suggested_range.len();
         // TODO: For Windows, there is no MAP_GROWDOWN features so far.
-        if can_grow_down {
-            println!("Warning: can_grow_down is not supported on Windows, ignoring it.");
-        }
-        if fixed_address {
-            println!("Warning: fixed_address is not supported on Windows, ignoring it.");
-        }
 
         // 1) In case we have a suggested VA range, we first check and deal with the case
         // that the address is already reserved.
