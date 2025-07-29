@@ -10,6 +10,13 @@ use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
 use crate::{MutPtr, litebox_page_manager};
 
+/// `litebox_shim_optee` memory management
+/// OP-TEE OS does have `ldelf_*` syscalls for memory management, but they are for LDELF (an ELF loader) not TAs.
+/// These syscalls are not exposed to TAs. Further, LiteBox uses its own ELF loader.
+/// To this end, we don't need to implement `ldelf_*` syscalls for memory management and, instead, can use
+/// existing Linux kernel-style `mmap*` syscalls (or kernel functions because they are not exposed to the user space).
+/// For now, `litebox_shim_optee` only needs `mmap`, `munmap`, and `mprotect` syscalls.
+
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 
 #[inline]

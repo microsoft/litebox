@@ -38,5 +38,12 @@ fn test_loader() {
         HELLO_TA_ELF.len()
     );
 
-    let _ = crate::loader::load_elf_buffer(&HELLO_TA_ELF, (&[]).to_vec());
+    let loaded_elf = crate::loader::load_elf_buffer(&HELLO_TA_ELF).expect("Failed to load TA ELF");
+
+    litebox::log_println!(
+        litebox_platform_multiplex::platform(),
+        "TA ELF entry point: {:#x}, user stack top: {:#x}",
+        loaded_elf.entry_point,
+        loaded_elf.user_stack_top,
+    );
 }
