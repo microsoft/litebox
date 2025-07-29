@@ -1,24 +1,18 @@
 //! ELF loader for LiteBox
 
-use core::{
-    ptr::NonNull,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use core::ptr::NonNull;
 
-use alloc::{alloc::alloc, ffi::CString, string::ToString, vec, vec::Vec};
+use alloc::{ffi::CString, string::ToString, vec, vec::Vec};
 use bitflags::Flags;
 use elf_loader::{
-    Elf, Loader,
-    arch::ElfPhdr,
-    mmap::{MapFlags, Mmap, ProtFlags},
+    Loader,
+    mmap::{MapFlags, ProtFlags},
     object::ElfObject,
 };
 use hashbrown::HashMap;
 use litebox::{
-    fs::{Mode, OFlags},
-    mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE},
-    platform::{RawConstPointer as _, SystemInfoProvider as _},
-    utils::TruncateExt,
+    mm::linux::{CreatePagesFlags, MappingError},
+    platform::RawConstPointer as _,
 };
 use litebox_common_linux::errno::Errno;
 use once_cell::race::OnceBox;
@@ -37,10 +31,6 @@ impl FdElfMap {
         Self {
             inner: spin::mutex::SpinMutex::new(HashMap::new()),
         }
-    }
-
-    fn insert(&self, fd: i32, elf: ElfFileInMemory) {
-        self.inner.lock().insert(fd, elf);
     }
 
     // FIX: this function does redundant memory copying.
