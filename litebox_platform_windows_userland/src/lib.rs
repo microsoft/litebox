@@ -147,6 +147,23 @@ impl WindowsUserland {
         reserved_pages
     }
 
+    /// Retrieves information about the host platform (Windows).
+    fn get_system_information(sys_info: &mut Win32_SysInfo::SYSTEM_INFO) {
+        unsafe {
+            Win32_SysInfo::GetSystemInfo(sys_info);
+        }
+    }
+
+    fn round_up_to_granu(&self, x: usize) -> usize {
+        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
+        (x + gran - 1) & !(gran - 1)
+    }
+
+    fn round_down_to_granu(&self, x: usize) -> usize {
+        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
+        x & !(gran - 1)
+    }
+
     fn set_init_tls(&self) {
         // TODO: Currently we are using a static thread ID and credentials (faked).
         // This is a placeholder for future implementation to use passthrough.
@@ -165,23 +182,6 @@ impl WindowsUserland {
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         self.set_thread_local_storage(tls);
-    }
-
-    /// Retrieves information about the host platform (Windows).
-    fn get_system_information(sys_info: &mut Win32_SysInfo::SYSTEM_INFO) {
-        unsafe {
-            Win32_SysInfo::GetSystemInfo(sys_info);
-        }
-    }
-
-    fn round_up_to_granu(&self, x: usize) -> usize {
-        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
-        (x + gran - 1) & !(gran - 1)
-    }
-
-    fn round_down_to_granu(&self, x: usize) -> usize {
-        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
-        x & !(gran - 1)
     }
 }
 
@@ -335,7 +335,11 @@ impl litebox::platform::RawMutex for RawMutex {
         let waiting = self.waiter_count.load(SeqCst);
 
         unsafe {
-            if (n as usize) >= waiting {
+            if n == 1 {
+                Win32_Threading::WakeByAddressSingle(
+                    self.underlying_atomic().as_ptr() as *const c_void
+                );
+            } else if (n as usize) >= waiting {
                 Win32_Threading::WakeByAddressAll(
                     self.underlying_atomic().as_ptr() as *const c_void
                 );
@@ -483,12 +487,6 @@ fn prot_flags(flags: MemoryRegionPermissions) -> Win32_Memory::PAGE_PROTECTION_F
 }
 
 fn do_prefetch_on_range(start: usize, size: usize) {
-    println!(
-        "Prefetching memory range: {:p} - {:p}, size: {}",
-        start as *const c_void,
-        (start + size) as *const c_void,
-        size
-    );
     let ok = unsafe {
         let prefetch_entry = Win32_Memory::WIN32_MEMORY_RANGE_ENTRY {
             VirtualAddress: start as *mut c_void,
@@ -507,19 +505,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         &self,
         suggested_range: core::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
-        can_grow_down: bool,
+        _can_grow_down: bool,
         populate_pages_immediately: bool,
-        fixed_address: bool,
+        _fixed_address: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let mut base_addr = suggested_range.start as *mut c_void;
         let mut size = suggested_range.len();
         // TODO: For Windows, there is no MAP_GROWDOWN features so far.
-        if can_grow_down {
-            println!("Warning: can_grow_down is not supported on Windows, ignoring it.");
-        }
-        if fixed_address {
-            println!("Warning: fixed_address is not supported on Windows, ignoring it.");
-        }
 
         // 1) In case we have a suggested VA range, we first check and deal with the case
         // that the address is already reserved.
