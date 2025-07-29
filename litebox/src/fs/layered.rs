@@ -365,7 +365,7 @@ impl<
     ) -> Result<FileFd<Platform, Upper, Lower>, OpenError> {
         let currently_supported_oflags: OFlags =
             OFlags::CREAT | OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR;
-        if flags.contains(currently_supported_oflags.complement()) {
+        if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!()
         }
         let path = self.absolute_path(path)?;
