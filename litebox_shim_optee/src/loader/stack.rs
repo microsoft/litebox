@@ -1,6 +1,6 @@
 //! This module manages the stack layout for the user process.
 
-use alloc::{collections::btree_map::BTreeMap, ffi::CString, vec::Vec};
+use alloc::{ffi::CString, vec::Vec};
 use litebox::platform::{RawConstPointer, RawMutPointer};
 
 use crate::MutPtr;
