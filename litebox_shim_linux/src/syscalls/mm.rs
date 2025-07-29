@@ -414,10 +414,23 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            super::sys_mremap(addr, 0x1000, 0x2000, litebox_common_linux::MRemapFlags::empty(), 0),
-            Err(errno::Errno::ENOMEM)
+            super::sys_mremap(
+                addr,
+                0x1000,
+                0x2000,
+                litebox_common_linux::MRemapFlags::empty(),
+                0
+            ),
+            Err(litebox_common_linux::errno::Errno::ENOMEM)
         ),);
-        let new_addr = super::sys_mremap(addr, 0x1000, 0x2000, litebox_common_linux::MRemapFlags::MREMAP_MAYMOVE, 0).unwrap();
+        let new_addr = super::sys_mremap(
+            addr,
+            0x1000,
+            0x2000,
+            litebox_common_linux::MRemapFlags::MREMAP_MAYMOVE,
+            0,
+        )
+        .unwrap();
         sys_munmap(addr, 0x2000).unwrap();
         sys_munmap(new_addr, 0x2000).unwrap();
     }
