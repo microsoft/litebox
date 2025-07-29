@@ -337,7 +337,7 @@ mod tests {
         fs::{Mode, OFlags},
         platform::{RawConstPointer, RawMutPointer},
     };
-    use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+    use litebox_common_linux::{MapFlags, ProtFlags};
 
     use crate::syscalls::{
         file::{sys_close, sys_open, sys_write},
@@ -345,7 +345,7 @@ mod tests {
         tests::init_platform,
     };
 
-    use super::{sys_madvise, sys_mmap, sys_mremap};
+    use super::{sys_madvise, sys_mmap};
 
     #[test]
     fn test_anonymous_mmap() {
@@ -398,6 +398,7 @@ mod tests {
         sys_close(fd).unwrap();
     }
 
+    #[cfg(not(feature = "platform_freebsd_userland"))]
     #[test]
     fn test_mremap() {
         init_platform(None);
@@ -413,10 +414,10 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            sys_mremap(addr, 0x1000, 0x2000, MRemapFlags::empty(), 0),
-            Err(Errno::ENOMEM)
+            super::sys_mremap(addr, 0x1000, 0x2000, litebox_common_linux::MRemapFlags::empty(), 0),
+            Err(errno::Errno::ENOMEM)
         ),);
-        let new_addr = sys_mremap(addr, 0x1000, 0x2000, MRemapFlags::MREMAP_MAYMOVE, 0).unwrap();
+        let new_addr = super::sys_mremap(addr, 0x1000, 0x2000, litebox_common_linux::MRemapFlags::MREMAP_MAYMOVE, 0).unwrap();
         sys_munmap(addr, 0x2000).unwrap();
         sys_munmap(new_addr, 0x2000).unwrap();
     }
