@@ -12,6 +12,13 @@ mod stack;
 //     elf::ElfLoader::load(path, argv, envp, aux)
 // }
 
+pub fn load_elf_buffer(
+    elf_buf: &[u8],
+    argv: alloc::vec::Vec<alloc::ffi::CString>,
+) -> Result<elf::ElfLoadInfo, elf::ElfLoaderError> {
+    elf::ElfLoader::load_buffer(elf_buf, argv)
+}
+
 /// The magic number used to identify the LiteBox rewriter and where we should
 /// update the syscall callback pointer.
 pub const REWRITER_MAGIC_NUMBER: u64 = u64::from_le_bytes(*b"LITE BOX");

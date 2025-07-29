@@ -25,3 +25,18 @@ fn test_cryp_random_number_generate() {
     let result = sys_cryp_random_number_generate(&mut buf);
     assert!(result.is_ok() && buf != [0u8; 16]);
 }
+
+const HELLO_TA_ELF: &[u8] = include_bytes!("hello-ta.elf");
+
+#[test]
+fn test_loader() {
+    init_platform();
+
+    litebox::log_println!(
+        litebox_platform_multiplex::platform(),
+        "TA ELF size: {}",
+        HELLO_TA_ELF.len()
+    );
+
+    let _ = crate::loader::load_elf_buffer(&HELLO_TA_ELF, (&[]).to_vec());
+}

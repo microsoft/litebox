@@ -5,13 +5,15 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use alloc::{ffi::CString, string::ToString, vec::Vec};
+use alloc::{alloc::alloc, ffi::CString, string::ToString, vec, vec::Vec};
+use bitflags::Flags;
 use elf_loader::{
     Elf, Loader,
     arch::ElfPhdr,
     mmap::{MapFlags, Mmap, ProtFlags},
     object::ElfObject,
 };
+use hashbrown::HashMap;
 use litebox::{
     fs::{Mode, OFlags},
     mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE},
@@ -19,28 +21,68 @@ use litebox::{
     utils::TruncateExt,
 };
 use litebox_common_linux::errno::Errno;
+use once_cell::race::OnceBox;
 use thiserror::Error;
 
-use crate::litebox_page_manager;
+use crate::{MutPtr, litebox_page_manager};
 
 use super::stack::UserStack;
 
+struct FdElfMap {
+    inner: spin::mutex::SpinMutex<HashMap<i32, ElfFileInMemory>>,
+}
+
+impl FdElfMap {
+    fn new() -> Self {
+        Self {
+            inner: spin::mutex::SpinMutex::new(HashMap::new()),
+        }
+    }
+
+    fn insert(&self, fd: i32, elf: ElfFileInMemory) {
+        self.inner.lock().insert(fd, elf);
+    }
+
+    // FIX: this function does redundant memory copying.
+    fn get(&self, fd: i32) -> Option<ElfFileInMemory> {
+        self.inner.lock().get(&fd).cloned()
+    }
+
+    fn remove(&self, fd: i32) -> Option<ElfFileInMemory> {
+        self.inner.lock().remove(&fd)
+    }
+
+    fn new_elf(&self, elf_buf: &[u8]) -> Result<i32, Errno> {
+        let mut inner = self.inner.lock();
+        let name = CString::new("/DUMMY").unwrap();
+        let fd = match inner.keys().max() {
+            Some(&id) => id.checked_add(1).ok_or(Errno::ENOMEM)?,
+            None => 1,
+        };
+        inner.insert(fd, ElfFileInMemory::new(elf_buf, fd)?);
+        Ok(fd)
+    }
+}
+
+fn fd_elf_map() -> &'static FdElfMap {
+    static FD_ELF_MAP: OnceBox<FdElfMap> = OnceBox::new();
+    FD_ELF_MAP.get_or_init(|| alloc::boxed::Box::new(FdElfMap::new()))
+}
+
+#[derive(Clone)]
 // An opened elf file
 struct ElfFileInMemory {
-    addr: usize,
-    len: usize,
-    name: CString, // dummy name
-    fd: i32,       // dummy fd
+    buffer: alloc::vec::Vec<u8>,
+    name: CString,
+    fd: i32,
 }
 
 impl ElfFileInMemory {
     #[allow(clippy::unnecessary_wraps)]
-    fn new(addr: usize, len: usize) -> Result<Self, Errno> {
+    fn new(elf_buf: &[u8], fd: i32) -> Result<Self, Errno> {
         let name = CString::new("/DUMMY").unwrap();
-        let fd = 0;
         Ok(Self {
-            addr,
-            len,
+            buffer: elf_buf.to_vec(),
             name,
             fd,
         })
@@ -52,8 +94,15 @@ impl ElfObject for ElfFileInMemory {
         &self.name
     }
 
-    fn read(&mut self, mut buf: &mut [u8], mut offset: usize) -> elf_loader::Result<()> {
-        todo!()
+    fn read(&mut self, buf: &mut [u8], offset: usize) -> elf_loader::Result<()> {
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "buflen {} offset {}",
+            buf.len(),
+            offset
+        );
+        buf.copy_from_slice(&self.buffer[offset..offset + buf.len()]);
+        Ok(())
     }
 
     fn as_fd(&self) -> Option<i32> {
@@ -110,7 +159,39 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
             fd
         );
         let ptr = if let Some(fd) = fd {
-            todo!()
+            // the below imitates Self::do_mmap_file(addr, len, prot, flags, fd, offset) by preloading the file content into memory
+            let mut temp_prot = elf_loader::mmap::ProtFlags::empty();
+            temp_prot.set(elf_loader::mmap::ProtFlags::PROT_READ, true);
+            temp_prot.set(elf_loader::mmap::ProtFlags::PROT_WRITE, true);
+
+            let mapped_addr = Self::do_mmap_anonymous(addr, len, temp_prot, flags)?;
+
+            let fd_elf_map = fd_elf_map();
+            let mut object = fd_elf_map
+                .get(fd)
+                .expect("fd_elf_map.get(fd) should return Some(ElfFileInMemory)");
+
+            let mut buf = vec![0u8; len];
+            let _ = object.read(&mut buf, offset);
+
+            unsafe {
+                litebox::log_println!(
+                    litebox_platform_multiplex::platform(),
+                    "memcpy: src = {:x?}, dst = {:x?}, len = {}",
+                    buf.as_ptr(),
+                    mapped_addr,
+                    len
+                );
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), mapped_addr as *mut u8, len);
+            }
+            crate::syscalls::mm::sys_mprotect(
+                MutPtr::from_usize(mapped_addr),
+                len,
+                litebox_common_linux::ProtFlags::from_bits_truncate(prot.bits()),
+            )
+            .expect("sys_mprotect failed");
+
+            mapped_addr
         } else {
             // No file provided because it is a blob.
             // Set `need_copy` so that the loader will copy the memory
@@ -118,6 +199,8 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
             *need_copy = true;
             Self::do_mmap_anonymous(addr, len, prot, flags)?
         };
+        #[cfg(debug_assertions)]
+        litebox::log_println!(litebox_platform_multiplex::platform(), "ptr = {:x?}", ptr);
         Ok(NonNull::new(ptr as _).expect("null pointer"))
     }
 
@@ -166,12 +249,55 @@ type Shdr = elf::section::Elf32_Shdr;
 pub(super) struct ElfLoader;
 
 impl ElfLoader {
-    /// Load an ELF file and prepare the stack for the new process.
-    #[allow(clippy::too_many_lines)]
-    pub(super) fn load(path: &str, argv: Vec<CString>) -> Result<ElfLoadInfo, ElfLoaderError> {
+    // Load an ELF file and prepare the stack for the new process.
+    pub(super) fn load_buffer(
+        elf_buf: &[u8],
+        argv: Vec<CString>,
+    ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let mut loader = Loader::<ElfLoaderMmap>::new();
 
-        todo!()
+        let fd_elf_map = fd_elf_map();
+        let fd = fd_elf_map
+            .new_elf(elf_buf)
+            .map_err(ElfLoaderError::OpenError)?;
+        let object = fd_elf_map
+            .get(fd)
+            .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
+
+        let elf = loader
+            .easy_load(object)
+            .map_err(ElfLoaderError::LoaderError)?;
+
+        fd_elf_map
+            .remove(fd)
+            .expect("fd_elf_map.remove(fd) should return Some(ElfFileInMemory)");
+
+        let entry = elf.entry();
+        let base = elf.base();
+
+        #[cfg(debug_assertions)]
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "entry = {:#x}, base = {:#x}",
+            entry,
+            base
+        );
+
+        let sp = unsafe {
+            let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
+                .expect("DEFAULT_STACK_SIZE is not page-aligned");
+            litebox_page_manager()
+                .create_stack_pages(None, length, CreatePagesFlags::empty())
+                .map_err(ElfLoaderError::MappingError)?
+        };
+        let mut stack = UserStack::new(sp, super::DEFAULT_STACK_SIZE)
+            .ok_or(ElfLoaderError::InvalidStackAddr)?;
+        stack.init(argv).ok_or(ElfLoaderError::InvalidStackAddr)?;
+
+        Ok(ElfLoadInfo {
+            entry_point: entry,
+            user_stack_top: stack.get_cur_stack_top(),
+        })
     }
 }
 
