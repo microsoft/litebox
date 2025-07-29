@@ -180,6 +180,25 @@ impl WindowsUserland {
         let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
         x & !(gran - 1)
     }
+
+    fn set_init_tls(&self) {
+        // TODO: Currently we are using a static thread ID and credentials (faked).
+        // This is a placeholder for future implementation to use passthrough.
+        let creds = litebox_common_linux::Credentials {
+            uid: 1000,
+            gid: 1000,
+            euid: 1000,
+            egid: 1000,
+        };
+        let task = alloc::boxed::Box::new(litebox_common_linux::Task::<WindowsUserland> {
+            tid: 1000,
+            clear_child_tid: None,
+            robust_list: None,
+            credentials: alloc::sync::Arc::new(creds),
+        });
+        let tls = litebox_common_linux::ThreadLocalStorage::new(task);
+        self.set_thread_local_storage(tls);
+    }
 }
 
 impl litebox::platform::Provider for WindowsUserland {}
