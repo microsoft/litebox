@@ -1,10 +1,15 @@
 //! ELF loader for LiteBox
 
-use alloc::{ffi::CString, string::ToString, vec::Vec};
+use alloc::{ffi::CString, string::ToString};
 use bitflags::Flags;
 use core::{arch::asm, ptr::NonNull};
+use elf::{
+    ElfBytes, endian::AnyEndian, parse::ParsingTable, section::SectionHeader,
+    string_table::StringTable, symbol::Symbol,
+};
 use elf_loader::{
     Loader,
+    arch::ElfPhdr,
     mmap::{MapFlags, ProtFlags},
     object::ElfObject,
 };
@@ -61,7 +66,7 @@ impl FdElfMap {
         let mut inner = self.inner.lock();
         let fd = match inner.keys().max() {
             Some(&id) => id.checked_add(1).ok_or(Errno::ENOMEM)?,
-            None => 1,
+            None => 3, // 0, 1, 2 have special meanings (stdin, stdout, stderr)
         };
         inner.insert(fd, ElfFileInMemory::new(elf_buf, fd)?);
         Ok(fd)
@@ -229,14 +234,121 @@ pub struct ElfLoadInfo {
     pub user_stack_top: usize,
 }
 
-#[cfg(target_arch = "x86_64")]
-type Ehdr = elf::file::Elf64_Ehdr;
-#[cfg(target_arch = "x86")]
-type Ehdr = elf::file::Elf32_Ehdr;
-#[cfg(target_arch = "x86_64")]
-type Shdr = elf::section::Elf64_Shdr;
-#[cfg(target_arch = "x86")]
-type Shdr = elf::section::Elf32_Shdr;
+// `dl_phdr_info` from optee_os/lib/libutee/include/link.h
+// Note: the `libc` crate defines it but we can't use `libc` with `litebox_runner_lvbs` due to `no_std` issues.
+#[allow(clippy::struct_field_names)]
+#[derive(Debug)]
+#[repr(C)]
+struct DlPhdrInfo {
+    pub dlpi_addr: u64,
+    pub dlpi_name: *const i8,
+    pub dlpi_phdr: *const ElfPhdr,
+    pub dlpi_phnum: u16,
+    pub dlpi_adds: u64,
+    pub dlpi_subs: u64,
+    pub dlpi_tls_modid: usize,
+    pub dlpi_tls_data: *mut u8,
+}
+
+impl DlPhdrInfo {
+    pub fn new() -> Self {
+        Self {
+            dlpi_addr: 0,
+            dlpi_name: core::ptr::null(),
+            dlpi_phdr: core::ptr::null(),
+            dlpi_phnum: 0,
+            dlpi_adds: 0,
+            dlpi_subs: 0,
+            dlpi_tls_modid: 0,
+            dlpi_tls_data: core::ptr::null_mut(),
+        }
+    }
+}
+
+/// `elf_phdr_info` from optee_os/lib/libutee/include/user_ta_header.h
+#[derive(Debug)]
+#[repr(C)]
+struct ElfPhdrInfo {
+    pub reserved: u32,
+    pub count: u16,
+    pub reserved2: u8,
+    pub zero: i8,
+    pub dlpi: *mut DlPhdrInfo,
+}
+
+impl ElfPhdrInfo {
+    pub fn new(dlpi: *mut DlPhdrInfo, count: u16) -> Self {
+        Self {
+            reserved: 0,
+            reserved2: 0,
+            zero: 0,
+            dlpi,
+            count,
+        }
+    }
+}
+
+/// This function populates the `__elf_phdr_info` section of a TA ELF loaded in memory.
+/// We should call this function once the ELF file is loaded into memory because it require
+/// the base address of the loaded ELF file.
+/// `__elf_phdr_info` is an OP-TEE-specific section that contains the `DlPhdrInfo` structure.
+/// Since this is a custom section, [`elf_loader`] does not handle it.
+/// For now, this population is mostly with minimal data just for enabling loading.
+/// This function can be extended later if needed.
+///
+/// # Safety
+/// This function is unsafe because it directly modifies the memory content of a loaded ELF file.
+unsafe fn ta_elf_set_elf_phdr_info(elf_buf: &[u8], base: usize) {
+    let elf = ElfBytes::<AnyEndian>::minimal_parse(elf_buf).expect("Failed to parse ELF data");
+    let Ok(Some((symtab, sym_strtab))) = elf.symbol_table() else {
+        panic!("ELF file does not contain a symbol table");
+    };
+
+    let mut elf_phdr_info_addr: Option<usize> = None;
+    for s in symtab {
+        if s.st_bind() == elf::abi::STB_GLOBAL
+            && s.st_symtype() == elf::abi::STT_OBJECT
+            && let Ok(sym_name) = sym_strtab.get(s.st_name as usize)
+        {
+            if sym_name == "__elf_phdr_info" {
+                elf_phdr_info_addr =
+                    base.checked_add(usize::try_from(s.st_value).expect("st_value overflow"));
+                break;
+            }
+        }
+    }
+
+    if let Some(elf_phdr_info_addr) = elf_phdr_info_addr {
+        #[cfg(debug_assertions)]
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "elf_phdr_info_addr = {:#x}",
+            elf_phdr_info_addr
+        );
+
+        // TODO: unmap this page once the TA exits
+        let ptr = crate::syscalls::mm::sys_mmap(
+            0,
+            core::mem::size_of::<ElfPhdrInfo>(),
+            litebox_common_linux::ProtFlags::PROT_READ
+                | litebox_common_linux::ProtFlags::PROT_WRITE,
+            litebox_common_linux::MapFlags::MAP_ANONYMOUS
+                | litebox_common_linux::MapFlags::MAP_PRIVATE,
+            -1,
+            0,
+        )
+        .expect("sys_mmap failed");
+        let dl_phdr_info = unsafe { &mut *(ptr.as_usize() as *mut DlPhdrInfo) };
+        *dl_phdr_info = DlPhdrInfo::new();
+
+        let elf_phdr_info = unsafe { &mut *(elf_phdr_info_addr as *mut ElfPhdrInfo) };
+        *elf_phdr_info = ElfPhdrInfo::new(dl_phdr_info as *mut DlPhdrInfo, 1);
+
+        dl_phdr_info.dlpi_addr = u64::try_from(base).expect("base address overflow");
+        dl_phdr_info.dlpi_name = elf_phdr_info.zero as *const i8;
+        dl_phdr_info.dlpi_adds = 1;
+    }
+}
 
 /// Loader for ELF files
 pub(super) struct ElfLoader;
@@ -245,17 +357,6 @@ impl ElfLoader {
     // Load an ELF file and prepare the stack for the new process.
     pub(super) fn load_buffer(elf_buf: &[u8]) -> Result<ElfLoadInfo, ElfLoaderError> {
         let mut loader = Loader::<ElfLoaderMmap>::new();
-        loader.set_hook(alloc::boxed::Box::new(|name, phdr, segment, data| {
-            #[cfg(debug_assertions)]
-            litebox::log_println!(
-                litebox_platform_multiplex::platform(),
-                "name = {}, phdr = {:?}, segment = {:?}",
-                name.to_string_lossy(),
-                phdr,
-                segment,
-            );
-            Ok(())
-        }));
 
         let fd_elf_map = fd_elf_map();
         let fd = fd_elf_map
@@ -269,12 +370,14 @@ impl ElfLoader {
             .easy_load(object)
             .map_err(ElfLoaderError::LoaderError)?;
 
+        let entry = elf.entry();
+        let base = elf.base();
+
+        unsafe { ta_elf_set_elf_phdr_info(elf_buf, base) };
+
         fd_elf_map
             .remove(fd)
             .expect("fd_elf_map.remove(fd) should return Some(ElfFileInMemory)");
-
-        let entry = elf.entry();
-        let base = elf.base();
 
         let sp = unsafe {
             let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
