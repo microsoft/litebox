@@ -524,7 +524,7 @@ mod tests {
         sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize())).expect("Failed to restore FS base");
     }
 
-    static mut TLS: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+    static mut TLS: [u8; PAGE_SIZE] = [1; PAGE_SIZE];
     static mut CHILD_TID: i32 = 0;
 
     #[test]
@@ -614,13 +614,6 @@ mod tests {
             stack.as_usize()
         );
         let main: fn() = || {
-            let startfsbase = unsafe { litebox_common_linux::rdfsbase() };
-            litebox::log_println!(
-                litebox_platform_multiplex::platform(),
-                "Child started with FS base: {:#x}",
-                startfsbase
-            );
-
             let tid = super::sys_gettid();
             litebox::log_println!(
                 litebox_platform_multiplex::platform(),
@@ -636,44 +629,24 @@ mod tests {
                 .expect("Failed to get FS base");
                 #[allow(static_mut_refs)]
                 let addr = unsafe { TLS.as_ptr() } as usize;
-
-                // // use assembly code to wrfsbase
-                // unsafe {
-                //     core::arch::asm!(
-                //         "wrfsbase {0}",
-                //         in(reg) addr,
-                //         options(nostack, preserves_flags)
-                //     );
-                // }
-
-                // use assembly to rdfsbase
-                let mut test_fsbase: u64 = 1115;
-                unsafe {
-                    core::arch::asm!(
-                        "rdfsbase {0}",
-                        out(reg) test_fsbase,
-                        options(nostack, preserves_flags)
-                    );
-                }
-                litebox::log_println!(
-                    litebox_platform_multiplex::platform(),
-                    "just got FS base: {:#x}",
-                    test_fsbase,
-                );
-
-                litebox::log_println!(
-                    litebox_platform_multiplex::platform(),
-                    "FS_base: {:#x} {}, TLS pointer: {:#x} {}",
-                    unsafe { current_fs_base.assume_init() },
-                    unsafe { current_fs_base.assume_init() },
-                    addr,
-                    addr
-                );
-
                 assert_eq!(
                     addr,
                     unsafe { current_fs_base.assume_init() },
                     "FS base should match TLS pointer"
+                );
+            }
+
+            // For Windows: check the TLS value from FS base
+            #[cfg(target_os = "windows")]
+            {
+                let mut fs_0: u8;
+                unsafe {
+                    core::arch::asm!("mov {0}, fs:0", out(reg_byte) fs_0);
+                }
+
+                assert_eq!(
+                    fs_0, 0x1,
+                    "TLS value from FS base should match the initialized value"
                 );
             }
 
