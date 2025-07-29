@@ -499,7 +499,6 @@ fn do_prefetch_on_range(start: usize, size: usize) {
     });
 }
 
-#[expect(unused, reason = "Will be added for PageManagementProvider soon.")]
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
     fn allocate_pages(
         &self,
@@ -509,8 +508,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         populate_pages_immediately: bool,
         _fixed_address: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
-        let mut base_addr = suggested_range.start as *mut c_void;
-        let mut size = suggested_range.len();
+        let base_addr = suggested_range.start as *mut c_void;
+        let size = suggested_range.len();
         // TODO: For Windows, there is no MAP_GROWDOWN features so far.
 
         // 1) In case we have a suggested VA range, we first check and deal with the case
@@ -581,7 +580,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
         // Align the size and base address to the allocation granularity.
         let aligned_size = self.round_up_to_granu(size);
-        let mut aligned_base_addr = self.round_down_to_granu(base_addr as usize) as *mut c_void;
+        let aligned_base_addr = self.round_down_to_granu(base_addr as usize) as *mut c_void;
 
         // Reserve and commit the memory.
         let addr: *mut c_void = unsafe {
