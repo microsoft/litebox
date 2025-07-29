@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use crate::{
     mm::linux::{CreatePagesFlags, NonZeroAddress},
     platform::{
-        RawConstPointer,
+        PageManagementProvider, RawConstPointer,
         page_mgmt::MemoryRegionPermissions,
         trivial_providers::{TransparentConstPtr, TransparentMutPtr},
     },
@@ -26,6 +26,12 @@ impl crate::platform::RawPointerProvider for DummyVmemBackend {
 
 #[expect(unused_variables, reason = "dummy/mock backend")]
 impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
+    const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
+    #[cfg(target_arch = "x86_64")]
+    const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+    #[cfg(target_arch = "x86")]
+    const TASK_ADDR_MAX: usize = 0xC000_0000; // 3 GiB (see arch/x86/include/asm/page_32_types.h)
+
     fn allocate_pages(
         &self,
         suggested_range: Range<usize>,
@@ -228,7 +234,7 @@ fn test_vmm_mapping() {
         }
         .unwrap()
         .as_usize(),
-        Vmem::<DummyVmemBackend, PAGE_SIZE>::TASK_ADDR_MAX - PAGE_SIZE,
+        DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE,
     );
     assert_eq!(
         collect_mappings(&vmm),
@@ -236,8 +242,7 @@ fn test_vmm_mapping() {
             start_addr..start_addr + 2 * PAGE_SIZE,
             start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            Vmem::<DummyVmemBackend, PAGE_SIZE>::TASK_ADDR_MAX - PAGE_SIZE
-                ..Vmem::<DummyVmemBackend, PAGE_SIZE>::TASK_ADDR_MAX,
+            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
         ]
     );
 
@@ -262,8 +267,7 @@ fn test_vmm_mapping() {
             start_addr + PAGE_SIZE..start_addr + 3 * PAGE_SIZE,
             start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            Vmem::<DummyVmemBackend, PAGE_SIZE>::TASK_ADDR_MAX - PAGE_SIZE
-                ..Vmem::<DummyVmemBackend, PAGE_SIZE>::TASK_ADDR_MAX,
+            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
         ]
     );
 
@@ -285,8 +289,7 @@ fn test_vmm_mapping() {
             start_addr + 4 * PAGE_SIZE..start_addr + 6 * PAGE_SIZE,
             start_addr + 8 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            Vmem::<DummyVmemBackend, PAGE_SIZE>::TASK_ADDR_MAX - PAGE_SIZE
-                ..Vmem::<DummyVmemBackend, PAGE_SIZE>::TASK_ADDR_MAX,
+            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
         ]
     );
 }

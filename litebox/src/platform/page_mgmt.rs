@@ -25,6 +25,9 @@ bitflags::bitflags! {
 /// `ALIGN` as a parameter. In the future, this may be changed to an associated constant, since each
 /// platform has only one canonical alignment.
 pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
+    const TASK_ADDR_MIN: usize;
+    const TASK_ADDR_MAX: usize;
+
     /// Allocates new memory pages at the specified `suggested_range` with the given `initial_permissions`.
     ///
     /// # Parameters

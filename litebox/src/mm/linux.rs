@@ -253,11 +253,6 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
 }
 
 impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem<Platform, ALIGN> {
-    pub(super) const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
-    #[cfg(target_arch = "x86_64")]
-    pub(super) const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
-    #[cfg(target_arch = "x86")]
-    pub(super) const TASK_ADDR_MAX: usize = 0xC000_0000; // 3 GiB (see arch/x86/include/asm/page_32_types.h)
     pub(super) const STACK_GUARD_GAP: usize = 256 << 12;
 
     /// Create a new [`Vmem`] instance with the given memory [backend](PageManagementProvider).
@@ -386,7 +381,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         fixed_address: bool,
     ) -> Option<Platform::RawMutPointer<u8>> {
         let (start, end) = (suggested_range.start, suggested_range.end);
-        if start < Self::TASK_ADDR_MIN || end > Self::TASK_ADDR_MAX {
+        if start < Platform::TASK_ADDR_MIN || end > Platform::TASK_ADDR_MAX {
             return None;
         }
         if fixed_address {
@@ -427,6 +422,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let new_start = ret.as_usize();
         let new_end = new_start + suggested_range.len();
         self.vmas.insert(new_start..new_end, vma);
+        debug_assert!(new_start >= Platform::TASK_ADDR_MIN);
+        debug_assert!(new_end <= Platform::TASK_ADDR_MAX);
         Some(ret)
     }
 
@@ -749,11 +746,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         fixed_addr: bool,
     ) -> Option<usize> {
         let size = length.as_usize();
-        if size > Self::TASK_ADDR_MAX {
+        if size > Platform::TASK_ADDR_MAX {
             return None;
         }
         if let Some(suggested_address) = suggested_address {
-            if (Self::TASK_ADDR_MAX - size) < suggested_address.0 {
+            if (Platform::TASK_ADDR_MAX - size) < suggested_address.0 {
                 return None;
             }
             if fixed_addr
@@ -767,8 +764,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
 
         // top down
         // 1. check [last_end, TASK_SIZE_MAX)
-        let (low_limit, high_limit) =
-            (Self::TASK_ADDR_MIN, Self::TASK_ADDR_MAX - length.as_usize());
+        let (low_limit, high_limit) = (
+            Platform::TASK_ADDR_MIN,
+            Platform::TASK_ADDR_MAX - length.as_usize(),
+        );
         let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
         if last_end <= high_limit {
             return Some(high_limit);
