@@ -1188,45 +1188,6 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
     }
 }
 
-pub fn fs_testing() {
-        // get current thread's TID
-        let tid = unsafe { 
-            Win32_Threading::GetThreadId(
-            Win32_Threading::GetCurrentThread()
-            ) 
-        };
-        println!("Current thread TID: {}", tid);
-        // get the current fsbase
-        let fsbase = unsafe { litebox_common_linux::rdfsbase() };
-        println!("0. FS base: {:#x}", fsbase);
-
-        // set to fsbase 1000
-        let gsbase = unsafe{ litebox_common_linux::rdgsbase() };
-        WindowsUserland::set_thread_fs_base(gsbase);
-
-        // test: getfsbase again (3 times)
-        // also getgsbase
-        let mut fsbase = unsafe { litebox_common_linux::rdfsbase() };
-        println!("1. FS base: {:#x}", fsbase);
-        println!("1. GS base: {:#x}", unsafe { litebox_common_linux::rdgsbase() });
-
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        fsbase = unsafe { litebox_common_linux::rdfsbase() };
-
-        // try load sth
-        let mut val: u8;
-        unsafe {
-            core::arch::asm!("mov {0}, fs:0", out(reg_byte) val);
-        }
-        println!("fs:0 value: {}", val);
-        println!("2. FS base: {:#x}", fsbase);
-        println!("2. GS base: {:#x}", unsafe { litebox_common_linux::rdgsbase() });
-
-        fsbase = unsafe { litebox_common_linux::rdfsbase() };
-        println!("3. FS base: {:#x}", fsbase);
-        println!("3. GS base: {:#x}", unsafe { litebox_common_linux::rdgsbase() });
-}
-
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::{AtomicU32, AtomicUsize};
@@ -1295,10 +1256,5 @@ mod tests {
 
         let tls = platform.get_thread_local_storage();
         assert!(tls.is_null(), "TLS should be null after releasing it");
-    }
-    #[test]
-    fn test_set_get_fsbase() {
-        let platform = WindowsUserland::new();
-        crate::fs_testing();
     }
 }
