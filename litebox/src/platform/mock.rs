@@ -8,8 +8,9 @@
 // Pull in `std` for the test-only world, so that we have a nicer/easier time writing tests
 extern crate std;
 
-use std::cell::RefCell;
+use core::sync::atomic::AtomicU32;
 use std::collections::VecDeque;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::vec::Vec;
 
@@ -29,10 +30,10 @@ use super::*;
 /// - It will not mock you for using it during tests
 pub(crate) struct MockPlatform {
     current_time: AtomicU64,
-    ip_packets: RefCell<VecDeque<Vec<u8>>>,
-    pub(crate) stdin_queue: RefCell<VecDeque<Vec<u8>>>,
-    pub(crate) stdout_queue: RefCell<VecDeque<Vec<u8>>>,
-    pub(crate) stderr_queue: RefCell<VecDeque<Vec<u8>>>,
+    ip_packets: RwLock<VecDeque<Vec<u8>>>,
+    pub(crate) stdin_queue: RwLock<VecDeque<Vec<u8>>>,
+    pub(crate) stdout_queue: RwLock<VecDeque<Vec<u8>>>,
+    pub(crate) stderr_queue: RwLock<VecDeque<Vec<u8>>>,
 }
 
 impl MockPlatform {
@@ -41,10 +42,10 @@ impl MockPlatform {
         //  order to give ourselves a statically lived platform easily.
         alloc::boxed::Box::leak(alloc::boxed::Box::new(MockPlatform {
             current_time: AtomicU64::new(0),
-            ip_packets: RefCell::new(VecDeque::new()),
-            stdin_queue: RefCell::new(VecDeque::new()),
-            stdout_queue: RefCell::new(VecDeque::new()),
-            stderr_queue: RefCell::new(VecDeque::new()),
+            ip_packets: RwLock::new(VecDeque::new()),
+            stdin_queue: RwLock::new(VecDeque::new()),
+            stdout_queue: RwLock::new(VecDeque::new()),
+            stderr_queue: RwLock::new(VecDeque::new()),
         }))
     }
 }
@@ -61,28 +62,110 @@ impl ExitProvider for MockPlatform {
 }
 
 pub(crate) struct MockRawMutex {
-    atomic: core::sync::atomic::AtomicU32,
+    inner: AtomicU32,
+    internal_state: std::sync::RwLock<MockRawMutexInternalState>,
+}
+
+struct MockRawMutexInternalState {
+    number_to_wake_up: usize,
+    number_blocked: usize,
+}
+
+impl MockRawMutex {
+    fn block_or_maybe_timeout(
+        &self,
+        val: u32,
+        timeout: Option<core::time::Duration>,
+    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
+        // We immediately wake up (without even hitting syscalls) if we can clearly see that the
+        // value is different.
+        if self.inner.load(core::sync::atomic::Ordering::SeqCst) != val {
+            return Err(ImmediatelyWokenUp);
+        }
+
+        // Track some initial information.
+        let start = std::time::Instant::now();
+
+        self.internal_state.write().unwrap().number_blocked += 1;
+
+        // We'll be looping unless we find a good reason to exit out of the loop, either due to a
+        // wake-up or a time-out. We do a singular (only as a one-off) check for the
+        // immediate-wake-up purely as an optimization, but otherwise, the only way to exit this
+        // loop is to actually hit an `Ok` state out for this function.
+        loop {
+            core::hint::spin_loop();
+
+            let remaining_time = match timeout {
+                None => None,
+                Some(timeout) => match timeout.checked_sub(start.elapsed()) {
+                    None => {
+                        break Ok(UnblockedOrTimedOut::TimedOut);
+                    }
+                    Some(remaining_time) => Some(remaining_time),
+                },
+            };
+
+            // Fast-path check first
+            if self.internal_state.read().unwrap().number_to_wake_up == 0 {
+                continue;
+            }
+
+            // Seems like there may actually be stuff to wake up. We re-lock writably.
+            let mut internal_state = self.internal_state.write().unwrap();
+
+            // Now we can actually check and do things without anyone else interfering.
+            if internal_state.number_to_wake_up == 0 {
+                // Seems like someone else picked it up before us, go back to blocking
+                continue;
+            }
+
+            internal_state.number_to_wake_up -= 1;
+
+            if self.inner.load(Ordering::SeqCst) != val {
+                internal_state.number_blocked -= 1;
+                return Ok(UnblockedOrTimedOut::Unblocked);
+            }
+        }
+    }
 }
 
 impl RawMutex for MockRawMutex {
-    fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32 {
-        &self.atomic
+    fn underlying_atomic(&self) -> &AtomicU32 {
+        &self.inner
     }
 
     fn wake_many(&self, n: usize) -> usize {
-        unimplemented!("raw mutex for MockPlatform")
+        let mut internal_state = loop {
+            let internal_state = self.internal_state.write().unwrap();
+            if internal_state.number_to_wake_up > 0 {
+                // Someone is already waking things up right now, let us not mess with it, and wait for our turn.
+                drop(internal_state);
+                continue;
+            }
+            break internal_state;
+        };
+        let num_to_wake_up = internal_state.number_blocked.min(n);
+        internal_state.number_to_wake_up = num_to_wake_up;
+        drop(internal_state); // actually allow the blocked things to wake up
+
+        // we assume everyone we requested will actually wake up
+        num_to_wake_up
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
-        unimplemented!("raw mutex for MockPlatform")
+        match self.block_or_maybe_timeout(val, None) {
+            Ok(UnblockedOrTimedOut::Unblocked) => Ok(()),
+            Ok(UnblockedOrTimedOut::TimedOut) => unreachable!(),
+            Err(ImmediatelyWokenUp) => Err(ImmediatelyWokenUp),
+        }
     }
 
     fn block_or_timeout(
         &self,
         val: u32,
-        time: core::time::Duration,
+        timeout: core::time::Duration,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        unimplemented!("raw mutex for MockPlatform")
+        self.block_or_maybe_timeout(val, Some(timeout))
     }
 }
 
@@ -91,22 +174,26 @@ impl RawMutexProvider for MockPlatform {
 
     fn new_raw_mutex(&self) -> Self::RawMutex {
         MockRawMutex {
-            atomic: core::sync::atomic::AtomicU32::new(0),
+            inner: AtomicU32::new(0),
+            internal_state: std::sync::RwLock::new(MockRawMutexInternalState {
+                number_to_wake_up: 0,
+                number_blocked: 0,
+            }),
         }
     }
 }
 
 impl IPInterfaceProvider for MockPlatform {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), SendError> {
-        self.ip_packets.borrow_mut().push_back(packet.into());
+        self.ip_packets.write().unwrap().push_back(packet.into());
         Ok(())
     }
 
     fn receive_ip_packet(&self, packet: &mut [u8]) -> Result<usize, ReceiveError> {
-        if self.ip_packets.borrow().is_empty() {
+        if self.ip_packets.read().unwrap().is_empty() {
             Err(ReceiveError::WouldBlock)
         } else {
-            let mut ipp = self.ip_packets.borrow_mut();
+            let mut ipp = self.ip_packets.write().unwrap();
             let v = ipp.pop_front().unwrap();
             assert!(v.len() <= packet.len());
             packet[..v.len()].copy_from_slice(&v);
@@ -162,14 +249,15 @@ impl RawPointerProvider for MockPlatform {
 
 impl StdioProvider for MockPlatform {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, StdioReadError> {
-        let Some(front) = self.stdin_queue.borrow_mut().pop_front() else {
+        let Some(front) = self.stdin_queue.write().unwrap().pop_front() else {
             return Err(StdioReadError::Closed);
         };
         let len = front.len().min(buf.len());
         buf[..len].copy_from_slice(&front[..len]);
         if front.len() > len {
             self.stdin_queue
-                .borrow_mut()
+                .write()
+                .unwrap()
                 .push_front(front.into_iter().skip(len).collect());
         }
         Ok(len)
@@ -180,7 +268,8 @@ impl StdioProvider for MockPlatform {
             StdioOutStream::Stdout => &self.stdout_queue,
             StdioOutStream::Stderr => &self.stderr_queue,
         }
-        .borrow_mut()
+        .write()
+        .unwrap()
         .push_back(buf.to_vec());
         Ok(buf.len())
     }
