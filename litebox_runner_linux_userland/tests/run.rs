@@ -89,7 +89,7 @@ fn test_runner_with_dynamic_lib(
 
     // create tar file containing all dependencies
     let tar_dir = std::path::Path::new(dir_path.as_str()).join(format!("tar_files_{backend_str}"));
-    let dirs_to_create = ["lib64", "lib/x86_64-linux-gnu", "lib32"];
+    let dirs_to_create = ["lib64", "lib/x86_64-linux-gnu", "lib32", "usr/lib/python3.10"];
     for dir in dirs_to_create {
         std::fs::create_dir_all(tar_dir.join(dir)).unwrap();
     }
@@ -182,6 +182,7 @@ fn test_runner_with_dynamic_lib(
             "lib",
             "lib32",
             "lib64",
+            "usr",
             "out",
         ])
         .current_dir(&tar_dir)
@@ -308,6 +309,46 @@ console.log(content);
         |out_dir| {
             // write the test js file to the output directory
             std::fs::write(out_dir.join("hello_world.js"), HELLO_WORLD_JS).unwrap();
+        },
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_runner_with_python() {
+    const HELLO_WORLD_PY: &str = r"
+print('Hello World!')
+";
+
+    let initial_files = [
+        "/lib/x86_64-linux-gnu/libm.so.6",
+        "/lib/x86_64-linux-gnu/libexpat.so.1",
+        "/lib/x86_64-linux-gnu/libz.so.1",
+        "/lib64/ld-linux-x86-64.so.2",
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        // python3 dependencies
+        "/usr/lib/python3.10/os.py",
+    ];
+    // get python3 path via `which python3`
+    let python_path_str = std::process::Command::new("which")
+        .arg("python3")
+        .output()
+        .expect("Failed to find python3 binary")
+        .stdout;
+    let python_path_str = String::from_utf8(python_path_str).unwrap().trim().to_string();
+    let python_path = std::path::Path::new(&python_path_str);
+    assert!(
+        python_path.exists(),
+        "Python binary not found at {python_path_str}",
+    );
+    test_runner_with_dynamic_lib(
+        Backend::Seccomp,
+        &initial_files,
+        python_path,
+        &["/out/hello_world.py"],
+        |out_dir| {
+            // write the test python file to the output directory
+            std::fs::write(out_dir.join("hello_world.py"), HELLO_WORLD_PY).unwrap();
         },
     );
 }
