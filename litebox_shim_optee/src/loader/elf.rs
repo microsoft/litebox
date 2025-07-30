@@ -285,9 +285,9 @@ impl ElfPhdrInfo {
 }
 
 /// This function populates the `__elf_phdr_info` section of a TA ELF loaded in memory.
-/// We should call this function once the ELF file is loaded into memory because it require
-/// the base address of the loaded ELF file.
 /// `__elf_phdr_info` is an OP-TEE-specific section that contains the `DlPhdrInfo` structure.
+/// We should call this function once the ELF file is loaded into memory because it requires
+/// the base address of the loaded ELF file.
 /// Since this is a custom section, [`elf_loader`] does not handle it.
 /// For now, this population is mostly with minimal data just for enabling loading.
 /// This function can be extended later if needed.
