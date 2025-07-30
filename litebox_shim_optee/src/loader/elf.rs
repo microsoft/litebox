@@ -1,12 +1,8 @@
 //! ELF loader for LiteBox
 
 use alloc::{ffi::CString, string::ToString};
-use bitflags::Flags;
-use core::{arch::asm, ptr::NonNull};
-use elf::{
-    ElfBytes, endian::AnyEndian, parse::ParsingTable, section::SectionHeader,
-    string_table::StringTable, symbol::Symbol,
-};
+use core::ptr::NonNull;
+use elf::{ElfBytes, endian::AnyEndian};
 use elf_loader::{
     Loader,
     arch::ElfPhdr,
@@ -361,7 +357,7 @@ impl ElfLoader {
         let fd = fd_elf_map
             .register_elf(elf_buf)
             .map_err(ElfLoaderError::OpenError)?;
-        let mut object = fd_elf_map
+        let object = fd_elf_map
             .get(fd)
             .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
 

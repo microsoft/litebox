@@ -4,18 +4,18 @@ use litebox::{
     mm::linux::{
         CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmemUnmapError,
     },
-    platform::{RawConstPointer, RawMutPointer, page_mgmt::DeallocationError},
+    platform::{RawConstPointer, page_mgmt::DeallocationError},
 };
-use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 
 use crate::{MutPtr, litebox_page_manager};
 
-/// `litebox_shim_optee` memory management
-/// OP-TEE OS does have `ldelf_*` syscalls for memory management, but they are for LDELF (an ELF loader) not TAs.
-/// These syscalls are not exposed to TAs. Further, LiteBox uses its own ELF loader.
-/// To this end, we don't need to implement `ldelf_*` syscalls for memory management and, instead, can use
-/// existing Linux kernel-style `mmap*` syscalls (or kernel functions because they are not exposed to the user space).
-/// For now, `litebox_shim_optee` only needs `mmap`, `munmap`, and `mprotect` syscalls.
+// `litebox_shim_optee` memory management
+// OP-TEE OS does have `ldelf_*` syscalls for memory management, but they are for LDELF (an ELF loader) not TAs.
+// These syscalls are not exposed to TAs. Further, LiteBox uses its own ELF loader.
+// To this end, we don't need to implement `ldelf_*` syscalls for memory management and, instead, can use
+// existing Linux kernel-style `mmap*` syscalls (or kernel functions because they are not exposed to the user space).
+// For now, `litebox_shim_optee` only needs `mmap`, `munmap`, and `mprotect` syscalls.
 
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 
@@ -89,7 +89,7 @@ pub(crate) fn sys_mmap(
     len: usize,
     prot: ProtFlags,
     flags: MapFlags,
-    fd: i32,
+    _fd: i32,
     offset: usize,
 ) -> Result<MutPtr<u8>, Errno> {
     // check alignment
