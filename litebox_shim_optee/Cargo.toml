@@ -29,7 +29,9 @@ thiserror = { version = "2.0.6", default-features = false }
 elf_loader = { version = "0.12.0", default-features = false, features = ["rel"] }
 
 [features]
-default = ["litebox_platform_multiplex/platform_lvbs"]
+default = ["platform_lvbs"]
+platform_linux_userland = ["litebox_platform_multiplex/platform_linux_userland"]
+platform_lvbs = ["litebox_platform_multiplex/platform_lvbs"]
 
 [lints]
 workspace = true
