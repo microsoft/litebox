@@ -7,10 +7,8 @@ edition = "2024"
 anyhow = "1.0.97"
 clap = { version = "4.5.33", features = ["derive"] }
 libc = { version = "0.2.169", default-features = false }
-litebox = { version = "0.1.0", path = "../litebox" }
 litebox_platform_linux_userland = { version = "0.1.0", path = "../litebox_platform_linux_userland", default-features = false, features = ["optee_syscall"] }
 litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_multiplex", default-features = false, features = ["platform_linux_userland", "systrap_backend", "optee_syscall"] }
-litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux", default-features = false }
 litebox_shim_optee = { version = "0.1.0", path = "../litebox_shim_optee" }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }
 

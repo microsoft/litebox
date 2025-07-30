@@ -1,6 +1,5 @@
 //! This module manages the stack layout for the user process.
 
-use alloc::{ffi::CString, vec::Vec};
 use litebox::platform::{RawConstPointer, RawMutPointer};
 
 use crate::MutPtr;
@@ -22,7 +21,7 @@ pub(super) struct UserStack {
     /// The top of the stack (base address)
     stack_top: MutPtr<u8>,
     /// The length of the stack
-    len: usize,
+    _len: usize,
     /// The current position of the stack pointer
     pos: usize,
 }
@@ -43,7 +42,7 @@ impl UserStack {
         }
         Some(Self {
             stack_top,
-            len,
+            _len: len,
             pos: len,
         })
     }

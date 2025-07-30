@@ -17,7 +17,7 @@ use litebox::{
 use litebox_common_optee::{SyscallRequest, TeeResult};
 use litebox_platform_multiplex::Platform;
 
-pub(crate) mod loader;
+pub mod loader;
 pub(crate) mod syscalls;
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
@@ -36,7 +36,6 @@ pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE>
 }
 
 // Convenience type aliases
-type ConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
 /// Handle OP-TEE syscalls
