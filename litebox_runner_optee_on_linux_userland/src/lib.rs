@@ -43,7 +43,7 @@ pub enum InterceptionBackend {
     Rewriter,
 }
 
-/// Run Linux programs with LiteBox on unmodified Linux
+/// Test OP-TEE TAs with LiteBox on unmodified Linux
 ///
 /// # Panics
 ///
