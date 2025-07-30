@@ -19,6 +19,7 @@ platform_freebsd_userland = ["dep:litebox_platform_freebsd_userland"]
 platform_windows_userland = ["dep:litebox_platform_windows_userland"]
 platform_lvbs = ["dep:litebox_platform_lvbs"]
 systrap_backend = ["platform_linux_userland", "litebox_platform_linux_userland/systrap_backend"]
+optee_syscall = ["platform_linux_userland", "litebox_platform_linux_userland/optee_syscall"]
 
 [lints]
 workspace = true

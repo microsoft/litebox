@@ -309,12 +309,11 @@ unsafe fn ta_elf_set_elf_phdr_info(elf_buf: &[u8], base: usize) {
         if s.st_bind() == elf::abi::STB_GLOBAL
             && s.st_symtype() == elf::abi::STT_OBJECT
             && let Ok(sym_name) = sym_strtab.get(s.st_name as usize)
+            && sym_name == "__elf_phdr_info"
         {
-            if sym_name == "__elf_phdr_info" {
-                elf_phdr_info_addr =
-                    base.checked_add(usize::try_from(s.st_value).expect("st_value overflow"));
-                break;
-            }
+            elf_phdr_info_addr =
+                base.checked_add(usize::try_from(s.st_value).expect("st_value overflow"));
+            break;
         }
     }
 
@@ -342,7 +341,7 @@ unsafe fn ta_elf_set_elf_phdr_info(elf_buf: &[u8], base: usize) {
         *dl_phdr_info = DlPhdrInfo::new();
 
         let elf_phdr_info = unsafe { &mut *(elf_phdr_info_addr as *mut ElfPhdrInfo) };
-        *elf_phdr_info = ElfPhdrInfo::new(dl_phdr_info as *mut DlPhdrInfo, 1);
+        *elf_phdr_info = ElfPhdrInfo::new(core::ptr::from_mut::<DlPhdrInfo>(dl_phdr_info), 1);
 
         dl_phdr_info.dlpi_addr = u64::try_from(base).expect("base address overflow");
         dl_phdr_info.dlpi_name = elf_phdr_info.zero as *const i8;

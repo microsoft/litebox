@@ -29,6 +29,7 @@ default = ["platform_linux_userland"]
 platform_freebsd_userland = ["litebox_platform_multiplex/platform_freebsd_userland"]
 platform_linux_userland = ["litebox_platform_multiplex/platform_linux_userland"]
 platform_windows_userland = ["litebox_platform_multiplex/platform_windows_userland"]
+optee_syscall = ["litebox_platform_multiplex/optee_syscall"]
 
 [dev-dependencies]
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
