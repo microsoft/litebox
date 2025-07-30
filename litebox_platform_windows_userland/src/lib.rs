@@ -4,9 +4,10 @@
 // Windows, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, AtomicUsize};
 use core::time::Duration;
 use std::os::raw::c_void;
+use std::sync::atomic::Ordering::SeqCst;
 
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::ThreadLocalStorageProvider;
@@ -15,6 +16,7 @@ use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox_common_linux::PunchthroughSyscall;
 
+use windows_sys::Win32::Foundation as Win32_Foundation;
 use windows_sys::Win32::{
     Foundation::{GetLastError, WIN32_ERROR},
     System::Memory::{
@@ -235,6 +237,7 @@ impl litebox::platform::RawMutexProvider for WindowsUserland {
     fn new_raw_mutex(&self) -> Self::RawMutex {
         RawMutex {
             inner: AtomicU32::new(0),
+            waiter_count: AtomicUsize::new(0),
         }
     }
 }
@@ -243,16 +246,81 @@ impl litebox::platform::RawMutexProvider for WindowsUserland {
 pub struct RawMutex {
     // The `inner` is the value shown to the outside world as an underlying atomic.
     inner: AtomicU32,
+    waiter_count: AtomicUsize,
 }
 
 impl RawMutex {
-    #[expect(unused, reason = "This is a placeholder for future implementation.")]
     fn block_or_maybe_timeout(
         &self,
         val: u32,
         timeout: Option<Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        unimplemented!("block_or_maybe_timeout is not implemented for Windows yet.");
+        // We immediately wake up (without even hitting syscalls) if we can clearly see that the
+        // value is different.
+        if self.inner.load(SeqCst) != val {
+            return Err(ImmediatelyWokenUp);
+        }
+
+        // Track some initial information.
+        let start = std::time::Instant::now();
+
+        // Indicate we are about to wait.
+        self.waiter_count.fetch_add(1, SeqCst);
+
+        let result = loop {
+            // Check if value changed before waiting
+            if self.inner.load(SeqCst) != val {
+                break Err(ImmediatelyWokenUp);
+            }
+
+            // Compute timeout in ms
+            let timeout_ms = match timeout {
+                None => Win32_Threading::INFINITE, // no timeout
+                Some(timeout) => match timeout.checked_sub(start.elapsed()) {
+                    None => {
+                        // Already timed out
+                        break Ok(UnblockedOrTimedOut::TimedOut);
+                    }
+                    Some(remaining_time) => {
+                        let ms = remaining_time.as_millis();
+                        ms.min((u32::MAX - 1) as u128) as u32
+                    }
+                },
+            };
+
+            let ok = unsafe {
+                Win32_Threading::WaitOnAddress(
+                    &self.inner as *const AtomicU32 as *const c_void,
+                    &val as *const u32 as *const c_void,
+                    std::mem::size_of::<u32>(),
+                    timeout_ms,
+                ) != 0
+            };
+
+            if ok {
+                if self.inner.load(SeqCst) != val {
+                    break Ok(UnblockedOrTimedOut::Unblocked);
+                }
+            } else {
+                // Check why WaitOnAddress failed
+                let err = unsafe { GetLastError() };
+                match err {
+                    Win32_Foundation::WAIT_TIMEOUT => {
+                        // Timed out
+                        break Ok(UnblockedOrTimedOut::TimedOut);
+                    }
+                    e => {
+                        // Other error, possibly spurious wakeup or value changed
+                        // Continue the loop to check the value again
+                        panic!("Unexpected error={} for WaitOnAddress", e);
+                    }
+                }
+            }
+        };
+
+        // Decrement waiter count before returning
+        self.waiter_count.fetch_sub(1, SeqCst);
+        result
     }
 }
 
@@ -262,7 +330,32 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 
     fn wake_many(&self, n: usize) -> usize {
-        unimplemented!("wake_many is not implemented for Windows yet. n: {}", n);
+        assert!(n > 0, "wake_many should be called with n > 0");
+        let n: u32 = n.try_into().unwrap();
+        let waiting = self.waiter_count.load(SeqCst);
+
+        unsafe {
+            if n == 1 {
+                Win32_Threading::WakeByAddressSingle(
+                    self.underlying_atomic().as_ptr() as *const c_void
+                );
+            } else if (n as usize) >= waiting {
+                Win32_Threading::WakeByAddressAll(
+                    self.underlying_atomic().as_ptr() as *const c_void
+                );
+            } else {
+                // Wake up `n` threads iteratively
+                for _ in 0..n {
+                    Win32_Threading::WakeByAddressSingle(
+                        self.underlying_atomic().as_ptr() as *const c_void
+                    );
+                }
+            }
+        }
+
+        // For windows, the OS kernel does not tell us how many threads were actually woken up,
+        // so we just return the minimum of `n` and the current number of waiters
+        waiting.min(n as usize)
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
@@ -406,7 +499,6 @@ fn do_prefetch_on_range(start: usize, size: usize) {
     });
 }
 
-#[expect(unused, reason = "Will be added for PageManagementProvider soon.")]
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
     fn allocate_pages(
         &self,
@@ -416,8 +508,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         populate_pages_immediately: bool,
         _fixed_address: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
-        let mut base_addr = suggested_range.start as *mut c_void;
-        let mut size = suggested_range.len();
+        let base_addr = suggested_range.start as *mut c_void;
+        let size = suggested_range.len();
         // TODO: For Windows, there is no MAP_GROWDOWN features so far.
 
         // 1) In case we have a suggested VA range, we first check and deal with the case
@@ -488,7 +580,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
         // Align the size and base address to the allocation granularity.
         let aligned_size = self.round_up_to_granu(size);
-        let mut aligned_base_addr = self.round_down_to_granu(base_addr as usize) as *mut c_void;
+        let aligned_base_addr = self.round_down_to_granu(base_addr as usize) as *mut c_void;
 
         // Reserve and commit the memory.
         let addr: *mut c_void = unsafe {
@@ -825,9 +917,31 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
 
 #[cfg(test)]
 mod tests {
+    use core::sync::atomic::{AtomicU32, AtomicUsize};
+    use std::thread::sleep;
+
     use crate::WindowsUserland;
     use litebox::platform::PageManagementProvider;
-    use litebox::platform::ThreadLocalStorageProvider as _;
+    use litebox::platform::{RawMutex, ThreadLocalStorageProvider as _};
+
+    #[test]
+    fn test_raw_mutex() {
+        let mutex = std::sync::Arc::new(super::RawMutex {
+            inner: AtomicU32::new(0),
+            waiter_count: AtomicUsize::new(0),
+        });
+
+        let copied_mutex = mutex.clone();
+        std::thread::spawn(move || {
+            sleep(core::time::Duration::from_millis(500));
+            copied_mutex
+                .inner
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            copied_mutex.wake_many(10);
+        });
+
+        assert!(mutex.block(0).is_ok());
+    }
 
     #[test]
     fn test_reserved_pages() {
