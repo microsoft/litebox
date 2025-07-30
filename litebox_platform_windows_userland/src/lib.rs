@@ -6,31 +6,32 @@
 
 use core::sync::atomic::{AtomicU32, AtomicUsize};
 use core::time::Duration;
+use std::cell::Cell;
 use std::os::raw::c_void;
 use std::sync::atomic::Ordering::SeqCst;
-use std::cell::Cell;
 
 use litebox::platform::ImmediatelyWokenUp;
+use litebox::platform::RawConstPointer;
 use litebox::platform::ThreadLocalStorageProvider;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
-use litebox::platform::RawConstPointer;
 use litebox_common_linux::PunchthroughSyscall;
 
 use windows_sys::Win32::Foundation as Win32_Foundation;
 use windows_sys::Win32::{
     Foundation::{GetLastError, WIN32_ERROR},
+    System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+        EXCEPTION_POINTERS,
+    },
     System::Memory::{
         self as Win32_Memory, PrefetchVirtualMemory, VirtualAlloc2, VirtualFree, VirtualProtect,
     },
     System::SystemInformation::{self as Win32_SysInfo},
     System::Threading::{
-        self as Win32_Threading, GetCurrentProcess, TlsAlloc, TlsFree, TlsGetValue, TlsSetValue, CreateThread
-    },
-    System::Diagnostics::Debug::{
-        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
-        EXCEPTION_POINTERS,
+        self as Win32_Threading, CreateThread, GetCurrentProcess, TlsAlloc, TlsFree, TlsGetValue,
+        TlsSetValue,
     },
 };
 
@@ -43,21 +44,15 @@ struct ThreadFsBaseState {
     fs_base: usize,
     /// Whether the FS base has been explicitly set by the guest
     is_set: bool,
-    /// Thread ID for debugging purposes
-    thread_id: u32,
 }
 
 impl ThreadFsBaseState {
     fn new() -> Self {
-        let thread_id = unsafe { 
-            Win32_Threading::GetThreadId(Win32_Threading::GetCurrentThread()) 
-        };
         let current_fs_base = unsafe { litebox_common_linux::rdfsbase() };
-        
+
         Self {
             fs_base: current_fs_base,
             is_set: false,
-            thread_id,
         }
     }
 
@@ -68,21 +63,13 @@ impl ThreadFsBaseState {
             litebox_common_linux::wrfsbase(new_base);
         }
     }
-    
-    fn get_fs_base(&self) -> usize {
-        self.fs_base
-    }
-    
+
     fn restore_fs_base(&self) {
         if self.is_set {
             unsafe {
                 litebox_common_linux::wrfsbase(self.fs_base);
             }
         }
-    }
-    
-    fn update_from_current(&mut self) {
-        self.fs_base = unsafe { litebox_common_linux::rdfsbase() };
     }
 }
 
@@ -146,7 +133,7 @@ impl WindowsUserland {
     fn get_thread_fs_base_state() -> ThreadFsBaseState {
         THREAD_FS_BASE.with(|state| state.get())
     }
-    
+
     /// Set the current thread's FS base
     fn set_thread_fs_base(new_base: usize) {
         THREAD_FS_BASE.with(|state| {
@@ -155,28 +142,14 @@ impl WindowsUserland {
             state.set(current_state);
         });
     }
-    
-    /// Get the current thread's FS base value
-    fn get_thread_fs_base() -> usize {
-        THREAD_FS_BASE.with(|state| state.get().get_fs_base())
-    }
-    
+
     /// Restore the current thread's FS base from saved state
     fn restore_thread_fs_base() {
         THREAD_FS_BASE.with(|state| {
             state.get().restore_fs_base();
         });
     }
-    
-    /// Update the saved FS base state from the current hardware register
-    fn update_thread_fs_base_from_current() {
-        THREAD_FS_BASE.with(|state| {
-            let mut current_state = state.get();
-            current_state.update_from_current();
-            state.set(current_state);
-        });
-    }
-    
+
     /// Initialize FS base state for a new thread
     fn init_thread_fs_base() {
         THREAD_FS_BASE.with(|state| {
@@ -195,9 +168,8 @@ unsafe extern "system" fn exception_handler(exception_info: *mut EXCEPTION_POINT
             // Get the saved FS base from the per-thread FS state
             let thread_state = WindowsUserland::get_thread_fs_base_state();
 
-            if current_fsbase == 0 && thread_state.is_set {
-                println!("> FS violation detected! Current: {:#x}, Restoring to: {:#x} (Thread: {})", 
-                         current_fsbase, thread_state.fs_base, thread_state.thread_id);
+            if current_fsbase == 0 && current_fsbase != thread_state.fs_base && thread_state.is_set
+            {
                 // Restore the FS base from the saved state
                 WindowsUserland::restore_thread_fs_base();
 
@@ -284,6 +256,23 @@ impl WindowsUserland {
         reserved_pages
     }
 
+    /// Retrieves information about the host platform (Windows).
+    fn get_system_information(sys_info: &mut Win32_SysInfo::SYSTEM_INFO) {
+        unsafe {
+            Win32_SysInfo::GetSystemInfo(sys_info);
+        }
+    }
+
+    fn round_up_to_granu(&self, x: usize) -> usize {
+        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
+        (x + gran - 1) & !(gran - 1)
+    }
+
+    fn round_down_to_granu(&self, x: usize) -> usize {
+        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
+        x & !(gran - 1)
+    }
+
     fn set_init_tls(&self) {
         // TODO: Currently we are using a static thread ID and credentials (faked).
         // This is a placeholder for future implementation to use passthrough.
@@ -302,23 +291,6 @@ impl WindowsUserland {
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         self.set_thread_local_storage(tls);
-    }
-
-    /// Retrieves information about the host platform (Windows).
-    fn get_system_information(sys_info: &mut Win32_SysInfo::SYSTEM_INFO) {
-        unsafe {
-            Win32_SysInfo::GetSystemInfo(sys_info);
-        }
-    }
-
-    fn round_up_to_granu(&self, x: usize) -> usize {
-        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
-        (x + gran - 1) & !(gran - 1)
-    }
-
-    fn round_down_to_granu(&self, x: usize) -> usize {
-        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
-        x & !(gran - 1)
     }
 }
 
@@ -346,8 +318,8 @@ unsafe extern "system" fn thread_start(param: *mut c_void) -> u32 {
     // Initialize FS base state for this new thread
     WindowsUserland::init_thread_fs_base();
 
-    let thread_start_args = unsafe {Box::from_raw(param as *mut ThreadStartArgs)};
-    
+    let thread_start_args = unsafe { Box::from_raw(param as *mut ThreadStartArgs) };
+
     // store the guest pt_regs onto the stack (for restoration later on)
     let pt_regs_stack = *thread_start_args.pt_regs;
 
@@ -405,16 +377,16 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
     ) -> Result<usize, Self::ThreadSpawnError> {
         let child_tid_ptr = core::ptr::from_mut(thread_args.task.as_mut()) as u64
             + core::mem::offset_of!(litebox_common_linux::Task<WindowsUserland>, tid) as u64;
-    
+
         let mut copied_pt_regs = Box::new(*ctx);
 
         // Reset the child stack pointer to the top of the allocated thread stack.
         copied_pt_regs.rsp = stack.as_usize() + stack_size - 0x8;
-    
+
         let thread_args = thread_args;
 
         let thread_start_args = ThreadStartArgs {
-            pt_regs:copied_pt_regs,
+            pt_regs: copied_pt_regs,
             thread_args: thread_args,
             entry_point: entry_point,
         };
@@ -422,7 +394,7 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         // We should always use heap to pass the parameter to `CreateThread`. This is to avoid using the parents'
         // stack, which may be freed (race-condition) before the child thread starts.
         let thread_start_arg_ptr = Box::into_raw(Box::new(thread_start_args));
-    
+
         let handle: Win32_Foundation::HANDLE = unsafe {
             CreateThread(
                 core::ptr::null_mut(),
@@ -439,6 +411,7 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         Ok(unsafe { *(child_tid_ptr as *const i32) as usize })
     }
 
+    #[allow(unreachable_code)]
     fn terminate_thread(&self, code: Self::ExitCode) -> ! {
         unsafe {
             Win32_Threading::ExitThread(code as u32);
@@ -500,7 +473,7 @@ impl RawMutex {
                     }
                     Some(remaining_time) => {
                         let ms = remaining_time.as_millis();
-                        ms.min(u32::MAX as u128) as u32
+                        ms.min((u32::MAX - 1) as u128) as u32
                     }
                 },
             };
@@ -529,7 +502,7 @@ impl RawMutex {
                     e => {
                         // Other error, possibly spurious wakeup or value changed
                         // Continue the loop to check the value again
-                        panic!("Unexpected error={} for WaitOnAddress", e);
+                        panic!("Unexpected error={e} for WaitOnAddress");
                     }
                 }
             }
@@ -552,7 +525,11 @@ impl litebox::platform::RawMutex for RawMutex {
         let waiting = self.waiter_count.load(SeqCst);
 
         unsafe {
-            if n as usize == usize::MAX {
+            if n == 1 {
+                Win32_Threading::WakeByAddressSingle(
+                    self.underlying_atomic().as_ptr() as *const c_void
+                );
+            } else if (n as usize) >= waiting {
                 Win32_Threading::WakeByAddressAll(
                     self.underlying_atomic().as_ptr() as *const c_void
                 );
@@ -645,19 +622,14 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
             PunchthroughSyscall::SetFsBase { addr } => {
                 // Use WindowsUserland's per-thread FS base management system
                 WindowsUserland::set_thread_fs_base(addr);
-                
-                // Verify the value was set correctly
-                let fs_base = WindowsUserland::get_thread_fs_base();
-                println!("[debug] SetFsBase to: {:#x} (desired: {:#x})", fs_base, addr);
-                
                 Ok(0)
             }
             PunchthroughSyscall::GetFsBase { addr } => {
                 use litebox::platform::RawMutPointer as _;
-                
+
                 // Read from the per-thread FS base storage to get the current value
                 let thread_state = WindowsUserland::get_thread_fs_base_state();
-                
+
                 // Use the stored FS base value from our per-thread storage
                 let fs_base = if thread_state.is_set {
                     // If the FS base has been explicitly set by the guest, use the stored value
@@ -666,10 +638,7 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                     // If not set by guest, read the current hardware register value
                     unsafe { litebox_common_linux::rdfsbase() }
                 };
-                
-                println!("[debug] GetFsBase returning: {:#x} (is_set: {}, thread_id: {})", 
-                         fs_base, thread_state.is_set, thread_state.thread_id);
-                
+
                 unsafe { addr.write_at_offset(0, fs_base) }.ok_or(
                     litebox::platform::PunchthroughError::Failure(
                         litebox_common_linux::errno::Errno::EFAULT,
@@ -678,13 +647,13 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 Ok(0)
             }
             PunchthroughSyscall::WakeByAddress { addr } => unsafe {
-                Win32_Threading::WakeByAddressAll(
-                    addr.as_usize() as *const c_void,
-                );
+                Win32_Threading::WakeByAddressAll(addr.as_usize() as *const c_void);
                 Ok(0)
-            }
+            },
             _ => {
-                unimplemented!("PunchthroughToken for WindowsUserland is not fully implemented yet");
+                unimplemented!(
+                    "PunchthroughToken for WindowsUserland is not fully implemented yet"
+                );
             }
         }
     }
@@ -744,12 +713,6 @@ fn prot_flags(flags: MemoryRegionPermissions) -> Win32_Memory::PAGE_PROTECTION_F
 }
 
 fn do_prefetch_on_range(start: usize, size: usize) {
-    println!(
-        "Prefetching memory range: {:p} - {:p}, size: {}",
-        start as *const c_void,
-        (start + size) as *const c_void,
-        size
-    );
     let ok = unsafe {
         let prefetch_entry = Win32_Memory::WIN32_MEMORY_RANGE_ENTRY {
             VirtualAddress: start as *mut c_void,
@@ -762,25 +725,18 @@ fn do_prefetch_on_range(start: usize, size: usize) {
     });
 }
 
-#[expect(unused, reason = "Will be added for PageManagementProvider soon.")]
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
-        can_grow_down: bool,
+        _can_grow_down: bool,
         populate_pages_immediately: bool,
-        fixed_address: bool,
+        _fixed_address: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
-        let mut base_addr = suggested_range.start as *mut c_void;
-        let mut size = suggested_range.len();
+        let base_addr = suggested_range.start as *mut c_void;
+        let size = suggested_range.len();
         // TODO: For Windows, there is no MAP_GROWDOWN features so far.
-        if can_grow_down {
-            println!("Warning: can_grow_down is not supported on Windows, ignoring it.");
-        }
-        if fixed_address {
-            println!("Warning: fixed_address is not supported on Windows, ignoring it.");
-        }
 
         // 1) In case we have a suggested VA range, we first check and deal with the case
         // that the address is already reserved.
@@ -850,7 +806,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
         // Align the size and base address to the allocation granularity.
         let aligned_size = self.round_up_to_granu(size);
-        let mut aligned_base_addr = self.round_down_to_granu(base_addr as usize) as *mut c_void;
+        let aligned_base_addr = self.round_down_to_granu(base_addr as usize) as *mut c_void;
 
         // Reserve and commit the memory.
         let addr: *mut c_void = unsafe {
@@ -1110,14 +1066,6 @@ unsafe extern "C" fn syscall_handler(
 ) -> isize {
     // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
     let ctx = unsafe { &mut *ctx };
-
-    // Note: For Windows x64, the OS kernel will clear userspace fs register at every
-    // context switch (e.g., syscall handling). Therefore, we must manually save and
-    // restore it, as the guest thread's fs register is used for thread-local storage.
-
-    // Update our saved FS base state from the current hardware register
-    WindowsUserland::update_thread_fs_base_from_current();
-
     let res = match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
         Ok(d) => {
             let syscall_handler: SyscallHandler = SYSCALL_HANDLER
@@ -1129,7 +1077,9 @@ unsafe extern "C" fn syscall_handler(
         Err(err) => err.as_neg() as isize,
     };
 
-    // Restore the guest thread's fs register from our saved state
+    // Note: For Windows x64, the OS kernel will clear userspace fs register at every
+    // context switch (e.g., task scheduling). Therefore, we must manually restore it
+    // before returning to the guest, as the guest thread's fs register is used for thread-local storage
     WindowsUserland::restore_thread_fs_base();
 
     res
@@ -1195,45 +1145,6 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
         tls.borrowed = false;
         ret
     }
-}
-
-pub fn fs_testing() {
-        // get current thread's TID
-        let tid = unsafe { 
-            Win32_Threading::GetThreadId(
-            Win32_Threading::GetCurrentThread()
-            ) 
-        };
-        println!("Current thread TID: {}", tid);
-        // get the current fsbase
-        let fsbase = unsafe { litebox_common_linux::rdfsbase() };
-        println!("0. FS base: {:#x}", fsbase);
-
-        // set to fsbase 1000
-        let gsbase = unsafe{ litebox_common_linux::rdgsbase() };
-        WindowsUserland::set_thread_fs_base(gsbase);
-
-        // test: getfsbase again (3 times)
-        // also getgsbase
-        let mut fsbase = unsafe { litebox_common_linux::rdfsbase() };
-        println!("1. FS base: {:#x}", fsbase);
-        println!("1. GS base: {:#x}", unsafe { litebox_common_linux::rdgsbase() });
-
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        fsbase = unsafe { litebox_common_linux::rdfsbase() };
-
-        // try load sth
-        let mut val: u8;
-        unsafe {
-            core::arch::asm!("mov {0}, fs:0", out(reg_byte) val);
-        }
-        println!("fs:0 value: {}", val);
-        println!("2. FS base: {:#x}", fsbase);
-        println!("2. GS base: {:#x}", unsafe { litebox_common_linux::rdgsbase() });
-
-        fsbase = unsafe { litebox_common_linux::rdfsbase() };
-        println!("3. FS base: {:#x}", fsbase);
-        println!("3. GS base: {:#x}", unsafe { litebox_common_linux::rdgsbase() });
 }
 
 #[cfg(test)]
@@ -1304,10 +1215,5 @@ mod tests {
 
         let tls = platform.get_thread_local_storage();
         assert!(tls.is_null(), "TLS should be null after releasing it");
-    }
-    #[test]
-    fn test_set_get_fsbase() {
-        let platform = WindowsUserland::new();
-        crate::fs_testing();
     }
 }
