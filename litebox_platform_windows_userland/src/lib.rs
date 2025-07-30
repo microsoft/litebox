@@ -133,7 +133,7 @@ impl WindowsUserland {
     fn get_thread_fs_base_state() -> ThreadFsBaseState {
         THREAD_FS_BASE.with(|state| state.get())
     }
-    
+
     /// Set the current thread's FS base
     fn set_thread_fs_base(new_base: usize) {
         THREAD_FS_BASE.with(|state| {
