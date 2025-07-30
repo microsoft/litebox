@@ -182,6 +182,10 @@ jobs:
           # - `litebox_runner_lvbs` has a custom target (`no_std`), so it does
           #   not work with the current no_std checker.
           #
+          # - `litebox_runner_optee_on_linux_userland` is allowed to have `std`
+          #   access since it needs to actually access the file-system, pull in
+          #   relevant files, and then actually trigger LiteBox itself.
+          #
           # - `litebox_shim_linux` (in its default feature set) depends on
           #   `litebox_platform_multiplex`; similarly, ideally we'd do a more
           #   precise check.
@@ -202,6 +206,7 @@ jobs:
             -not -path './litebox_platform_multiplex/Cargo.toml' \
             -not -path './litebox_runner_linux_userland/Cargo.toml' \
             -not -path './litebox_runner_lvbs/Cargo.toml' \
+            -not -path './litebox_runner_optee_on_linux_userland/Cargo.toml' \
             -not -path './litebox_shim_linux/Cargo.toml' \
             -not -path './litebox_shim_optee/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
