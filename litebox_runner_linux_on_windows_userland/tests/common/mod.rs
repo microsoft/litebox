@@ -16,9 +16,9 @@ global_asm!(
     .align	4
     .globl	trampoline
 trampoline:
-    xor rdx, rdx
-    mov	rsp, rsi
-    jmp	rdi
+    xor r8, r8
+    mov	rsp, rdx
+    jmp	rcx
     /* Should not reach. */
     hlt"
 );
