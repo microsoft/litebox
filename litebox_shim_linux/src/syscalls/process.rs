@@ -613,6 +613,7 @@ mod tests {
             "stack allocated at: {:#x}",
             stack.as_usize()
         );
+        let main: fn() = || {
             let tid = super::sys_gettid();
             litebox::log_println!(
                 litebox_platform_multiplex::platform(),
