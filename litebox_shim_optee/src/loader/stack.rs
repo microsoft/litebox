@@ -1,6 +1,7 @@
 //! This module manages the stack layout for the user process.
 
 use litebox::platform::{RawConstPointer, RawMutPointer};
+use litebox_common_optee::UteeParams;
 
 use crate::MutPtr;
 
@@ -50,15 +51,24 @@ impl UserStack {
     /// Push `bytes` to the stack.
     ///
     /// Returns `None` if stack has no enough space.
-    #[expect(dead_code)]
     fn push_bytes(&mut self, bytes: &[u8]) -> Option<()> {
         self.pos = self.pos.checked_sub(bytes.len())?;
         self.stack_top.copy_from_slice(self.pos, bytes)?;
         Some(())
     }
 
+    fn push_utee_params(&mut self, params: &UteeParams) -> Option<()> {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::from_ref(params).cast::<u8>(),
+                core::mem::size_of::<UteeParams>(),
+            )
+        };
+        self.push_bytes(bytes)
+    }
+
     /// Initialize the stack for the new process.
-    pub(super) fn init(&mut self) -> Option<()> {
+    pub(super) fn init(&mut self, params: &UteeParams) -> Option<()> {
         // end markers
         self.pos = self.pos.checked_sub(size_of::<usize>())?;
         unsafe {
@@ -66,8 +76,21 @@ impl UserStack {
                 .write_at_offset(isize::try_from(self.pos).ok()?, 0)?;
         }
 
+        // TODO: generate a random value
+        self.push_bytes(&[
+            0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD,
+            0xBE, 0xEF,
+        ])?;
+
         // ensure stack is aligned
         self.pos = align_down(self.pos, Self::STACK_ALIGNMENT);
+        let size = core::mem::size_of::<UteeParams>();
+        let final_pos = self.pos.checked_sub(size)?;
+        self.pos -= final_pos - align_down(final_pos, Self::STACK_ALIGNMENT);
+
+        self.push_utee_params(params)?;
+
+        assert_eq!(self.pos, align_down(self.pos, Self::STACK_ALIGNMENT));
         Some(())
     }
 }

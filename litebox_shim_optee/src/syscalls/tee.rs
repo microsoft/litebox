@@ -1,5 +1,8 @@
 use litebox_common_optee::TeeResult;
 
+#[cfg(feature = "platform_linux_userland")]
+use litebox::platform::ThreadProvider;
+
 // placeholder
 pub fn sys_return(ret: usize) -> ! {
     #[cfg(debug_assertions)]
@@ -8,7 +11,18 @@ pub fn sys_return(ret: usize) -> ! {
         "sys_return: ret {}",
         ret
     );
-    todo!("switch to VTL0");
+
+    // TODO: terminate thread for now. This should be replaced with a proper mechanism to switch to
+    // the main event loop inside the runner.
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "platform_linux_userland")] {
+            litebox_platform_multiplex::platform().terminate_thread(i32::try_from(ret).unwrap_or(0));
+        } else if #[cfg(feature = "platform_lvbs")] {
+            todo!("switch to VTL0");
+        } else {
+            compile_error!(r##"No platform specified."##);
+        }
+    }
 }
 
 pub fn sys_log(buf: &[u8]) -> Result<(), TeeResult> {
@@ -30,5 +44,14 @@ pub fn sys_panic(code: usize) -> ! {
         "panic with code {}",
         code,
     );
-    todo!("switch to VTL0");
+
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "platform_linux_userland")] {
+            litebox_platform_multiplex::platform().terminate_thread(i32::try_from(code).unwrap_or(0));
+        } else if #[cfg(feature = "platform_lvbs")] {
+            todo!("switch to VTL0");
+        } else {
+            compile_error!(r##"No platform specified."##);
+        }
+    }
 }

@@ -1403,7 +1403,7 @@ cfg_if::cfg_if! {
         ) -> u32 {
             // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `SyscallContext`.
             let ctx = unsafe { &mut *ctx };
-            let syscall_ctx = litebox_common_optee::SyscallContext::new(&[ctx.rdi, ctx.rsi, ctx.rdx, ctx.r10, ctx.r8, ctx.r9, ctx.r12, ctx.r13]);
+            let syscall_ctx = litebox_common_optee::SyscallContext::from_pt_regs(ctx);
             match litebox_common_optee::SyscallRequest::try_from_raw(syscall_number, &syscall_ctx) {
                 Ok(d) => {
                     let syscall_handler: SyscallHandler = SYSCALL_HANDLER
