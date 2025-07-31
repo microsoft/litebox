@@ -4,7 +4,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 use crate::LiteBox;
 use crate::fd::{InternalFd, TypedFd};
@@ -943,16 +943,41 @@ impl<
     }
 
     fn read_dir(&self, fd: &FileFd<Platform, Upper, Lower>) -> Result<Vec<DirEntry>, ReadDirError> {
-        let entry = self
+        let (entry, path) = self
             .litebox
             .descriptor_table()
-            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry));
+            .with_entry(fd, |descriptor| {
+                (
+                    Arc::clone(&descriptor.entry.entry),
+                    descriptor.entry.path.clone(),
+                )
+            });
+
         match entry.as_ref() {
             EntryX::Upper { fd } => {
-                // TODO(jayb): What happens if there was already a directory on a lower level, but then more
-                // files were added to upper level. The current approach may possibly be incorrect in such
-                // edge cases.
-                self.upper.read_dir(fd)
+                // Get entries from upper layer
+                let mut upper_entries = self.upper.read_dir(fd)?;
+
+                // Try to get entries from lower layer for the same path
+                if let Ok(lower_fd) = self
+                    .lower
+                    .open(path.as_str(), OFlags::RDONLY, Mode::empty())
+                {
+                    if let Ok(lower_entries) = self.lower.read_dir(&lower_fd) {
+                        // Merge entries, avoiding duplicates (upper layer takes precedence)
+                        let upper_names: HashSet<String> =
+                            upper_entries.iter().map(|e| e.name.clone()).collect();
+
+                        for lower_entry in lower_entries {
+                            if !upper_names.contains(&lower_entry.name) {
+                                upper_entries.push(lower_entry);
+                            }
+                        }
+                    }
+                    let _ = self.lower.close(lower_fd);
+                }
+
+                Ok(upper_entries)
             }
             EntryX::Lower { fd } => {
                 // This is the easy case, nothing to deal with upper entries.
