@@ -52,7 +52,9 @@ jobs:
       - run: |
           ./.github/tools/github_actions_run_cargo build
           ./.github/tools/github_actions_run_cargo build -p litebox_runner_optee_on_linux_userland
-      - run: ./.github/tools/github_actions_run_cargo nextest
+      - run: |
+          ./.github/tools/github_actions_run_cargo nextest
+          ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_optee_on_linux_userland
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc
           # We need to run `cargo test --doc` separately because doc tests
