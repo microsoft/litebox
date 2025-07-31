@@ -626,16 +626,54 @@ cfg_if::cfg_if! {
     }
 }
 
-// From libc crate's `timespec` definition.
-//
-// linux x32 compatibility
-// See https://sourceware.org/bugzilla/show_bug.cgi?id=16437
-pub struct timespec {
-    pub tv_sec: time_t,
-    #[cfg(all(target_arch = "x86_64", target_pointer_width = "32"))]
-    pub tv_nsec: i64,
-    #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "32")))]
-    pub tv_nsec: isize,
+/// timespec from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/include/uapi/linux/time.h#L11)
+#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq)]
+#[repr(C)]
+pub struct Timespec {
+    /// Seconds.
+    pub tv_sec: i64,
+
+    /// Nanoseconds. Must be less than 1_000_000_000.
+    pub tv_nsec: u64,
+}
+
+impl Timespec {
+    /// Subtract another `Timespec` from self
+    pub fn sub_timespec(&self, other: &Timespec) -> Result<core::time::Duration, errno::Errno> {
+        if self >= other {
+            let (secs, nsec) = if self.tv_nsec >= other.tv_nsec {
+                (
+                    self.tv_sec
+                        .checked_sub(other.tv_sec)
+                        .ok_or(errno::Errno::EDOM)?,
+                    self.tv_nsec - other.tv_nsec,
+                )
+            } else {
+                (
+                    self.tv_sec
+                        .checked_sub(other.tv_sec + 1)
+                        .ok_or(errno::Errno::EDOM)?,
+                    self.tv_nsec + 1_000_000_000 - other.tv_nsec,
+                )
+            };
+
+            Ok(core::time::Duration::new(
+                u64::try_from(secs).map_err(|_| errno::Errno::EDOM)?,
+                nsec.truncate(),
+            ))
+        } else {
+            Err(errno::Errno::EINVAL)
+        }
+    }
+}
+
+impl From<Timespec> for core::time::Duration {
+    fn from(timespec: Timespec) -> Self {
+        core::time::Duration::new(
+            u64::try_from(timespec.tv_sec).unwrap(),
+            timespec.tv_nsec.truncate(),
+        )
+    }
 }
 
 #[repr(C)]

@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 cfg-if = "1.0.0"
-libc = { version = "0.2.169", default-features = false, optional = true }
+libc = { version = "0.2.169", default-features = false }
 litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux", version = "0.1.0" }
 litebox_common_optee = { path = "../litebox_common_optee", version = "0.1.0", default-features = false, optional = true }
@@ -17,7 +17,7 @@ syscalls = { version = "0.6", default-features = false }
 default = ["linux_syscall"]
 linux_syscall = []
 optee_syscall = ["dep:litebox_common_optee"]
-systrap_backend = ["dep:seccompiler", "dep:libc"]
+systrap_backend = ["dep:seccompiler"]
 
 [lints]
 workspace = true
