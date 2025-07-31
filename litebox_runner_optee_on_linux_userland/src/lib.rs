@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use litebox_common_optee::UteeParams;
 use litebox_platform_multiplex::Platform;
 use std::path::PathBuf;
 
@@ -82,45 +83,34 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let loaded_program = litebox_shim_optee::loader::load_elf_buffer(prog_data.as_slice()).unwrap();
 
-    // TODO: we need an event loop here, because TAs expect repetitive entrances with different arguments.
-    // TA is not a stand alone application.
+    // TODO: we need an event loop here, because TAs expect repetitive entrances with
+    // different arguments (i.e., different function ID, different command ID, and different `UteeParams`).
+    // session ID is determined by the kernel (this runner in this case).
     unsafe {
-        trampoline::jump_to_entry_point(loaded_program.entry_point, loaded_program.user_stack_top)
+        jump_to_entry_point(
+            0xdeadbeef, // non-existent function ID which results in `TEE_Panic(0)`
+            0,
+            loaded_program.user_stack_top - core::mem::size_of::<UteeParams>(),
+            0,
+            loaded_program.entry_point,
+            loaded_program.user_stack_top,
+        );
     }
 }
 
-mod trampoline {
-    #[cfg(target_arch = "x86_64")]
-    core::arch::global_asm!(
-        "
-    .text
-    .align  4
-    .globl  jump_to_entry_point
-    .type   jump_to_entry_point,@function
-jump_to_entry_point:
-    xor rdx, rdx
-    mov     rsp, rsi
-    jmp     rdi
-    /* Should not reach. */
-    hlt"
-    );
-    #[cfg(target_arch = "x86")]
-    core::arch::global_asm!(
-        "
-    .text
-    .align  4
-    .globl  jump_to_entry_point
-    .type   jump_to_entry_point,@function
-jump_to_entry_point:
-    xor     edx, edx
-    mov     ebx, [esp + 4]
-    mov     eax, [esp + 8]
-    mov     esp, eax
-    jmp     ebx
-    /* Should not reach. */
-    hlt"
-    );
-    unsafe extern "C" {
-        pub(crate) fn jump_to_entry_point(entry_point: usize, stack_pointer: usize) -> !;
-    }
+/// TAs obtain four arguments through CPU registers:
+/// - rdi: function ID
+/// - rsi: session ID
+/// - rdx: the address of parameters
+/// - rcx: command ID
+#[unsafe(naked)]
+unsafe extern "C" fn jump_to_entry_point(
+    func: usize,
+    session_id: usize,
+    params: usize,
+    cmd_id: usize,
+    entry_point: usize,
+    user_stack_top: usize,
+) -> ! {
+    core::arch::naked_asm!("mov rsp, r9", "jmp r8", "hlt");
 }
