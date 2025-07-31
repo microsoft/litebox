@@ -536,19 +536,33 @@ impl litebox::platform::TimeProvider for FreeBSDUserland {
     type Instant = Instant;
 
     fn now(&self) -> Self::Instant {
+        let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, t.as_mut_ptr()) };
+        let t = unsafe { t.assume_init() };
         Instant {
             inner: std::time::Instant::now(),
+            #[allow(clippy::useless_conversion, reason = "conversion is needed for 32bit")]
+            inner: litebox_common_linux::Timespec {
+                tv_sec: i64::from(t.tv_sec),
+                tv_nsec: u64::from(t.tv_nsec.reinterpret_as_unsigned()),
+            },
         }
     }
 }
 
 pub struct Instant {
-    inner: std::time::Instant,
+    inner: litebox_common_linux::Timespec,
 }
 
 impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
-        self.inner.checked_duration_since(earlier.inner)
+        self.inner.sub_timespec(&earlier.inner).ok()
+    }
+}
+
+impl From<litebox_common_linux::Timespec> for Instant {
+    fn from(inner: litebox_common_linux::Timespec) -> Self {
+        Instant { inner }
     }
 }
 
