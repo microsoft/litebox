@@ -133,20 +133,37 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
     let control_transfer_targets =
         get_control_transfer_targets(arch, &builder, &text_sections).unwrap();
 
-    let first_executable_segment_id = {
+    let last_segment_id = {
         let s: Vec<_> = builder
             .segments
             .iter()
-            .filter(|seg| seg.p_flags & object::elf::PF_X != 0)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|seg| {
+                // ensure the segment is okay to insert the trampoline section
+                if seg[0].p_type != object::elf::PT_LOAD
+                    || seg[0].p_flags & object::elf::PF_R == 0
+                    || seg[0].p_filesz != seg[0].p_memsz
+                {
+                    return false;
+                }
+                // ensure the segment has enough space for the trampoline section (0x18 bytes)
+                let end_offset = seg[0].p_offset + seg[0].p_filesz;
+                if seg[1].p_type == object::elf::PT_LOAD && seg[1].p_offset - end_offset < 0x18 {
+                    return false;
+                }
+                true
+            })
+            .map(|seg| seg[0])
             .collect();
         if s.is_empty() {
             return Err(Error::NoTextSectionFound);
         }
-        s[0].id()
+        s[s.len() - 1].id()
     };
     builder
         .segments
-        .get_mut(first_executable_segment_id)
+        .get_mut(last_segment_id)
         .append_section(builder.sections.get_mut(trampoline_section));
 
     let trampoline_base_addr = find_addr_for_trampoline_code(&builder);
@@ -198,7 +215,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
         object::build::elf::SectionData::Data(trampoline_vec.into());
     builder
         .segments
-        .get_mut(first_executable_segment_id)
+        .get_mut(last_segment_id)
         .recalculate_ranges(&builder.sections);
 
     let mut out = vec![];
@@ -246,7 +263,7 @@ fn setup_trampoline_section(
     let s = builder.sections.add();
     *s.name.to_mut() = TRAMPOLINE_SECTION_NAME.into();
     s.sh_type = object::elf::SHT_PROGBITS;
-    s.sh_flags = (object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR).into();
+    s.sh_flags = object::elf::SHF_ALLOC.into();
     s.sh_addralign = 8;
     Ok(s.id())
 }

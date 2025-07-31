@@ -246,7 +246,7 @@ fn get_trampoline_hdr(object: &mut ElfFile) -> Option<TrampolineHdr> {
     let trampoline_shdr: &Shdr = unsafe { &*(buf.as_ptr().cast()) };
     let trampoline_shdr_flags: u32 = trampoline_shdr.sh_flags.truncate();
     if trampoline_shdr.sh_type != elf::abi::SHT_PROGBITS
-        || trampoline_shdr_flags != elf::abi::SHF_ALLOC | elf::abi::SHF_EXECINSTR
+        || trampoline_shdr_flags != elf::abi::SHF_ALLOC
     {
         return None;
     }

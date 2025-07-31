@@ -1,6 +1,7 @@
 ---
 source: litebox_syscall_rewriter/tests/snapshot_tests.rs
 expression: diff
+snapshot_kind: text
 ---
 --- original
 +++ rewritten
@@ -1289,27 +1290,3 @@ expression: diff
    476e55:	48 83 7d 98 00       	cmpq   $0x0,-0x68(%rbp)
    476e5a:	48 8b 4d b0          	mov    -0x50(%rbp),%rcx
    476e5e:	0f 84 3c fe ff ff    	je     476ca0 <_dl_sym+0x60>
-@@ -130847,4 +130946,20 @@
-   47e780:	f3 0f 1e fa          	endbr64
-   47e784:	48 83 ec 08          	sub    $0x8,%rsp
-   47e788:	48 83 c4 08          	add    $0x8,%rsp
--  47e78c:	c3                   	ret
-\ No newline at end of file
-+  47e78c:	c3                   	ret
-+
-+Disassembly of section .trampolineLB0:
-+
-+000000000047e790 <.trampolineLB0>:
-+  47e790:	4c                   	rex.WR
-+  47e791:	49 54                	rex.WB push %r12
-+  47e793:	45 20 42 4f          	and    %r8b,0x4f(%r10)
-+  47e797:	58                   	pop    %rax
-+  47e798:	00 20                	add    %ah,(%rax)
-+  47e79a:	4b 00 00             	rex.WXB add %al,(%r8)
-+  47e79d:	00 00                	add    %al,(%rax)
-+  47e79f:	00 dd                	add    %bl,%ch
-+  47e7a1:	06                   	(bad)
-+  47e7a2:	00 00                	add    %al,(%rax)
-+  47e7a4:	00 00                	add    %al,(%rax)
-+	...
-\ No newline at end of file
