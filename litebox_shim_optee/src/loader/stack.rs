@@ -12,11 +12,6 @@ fn align_down(addr: usize, align: usize) -> usize {
 
 /// the user stack for OP-TEE TAs. Unlike Linux/libc, OP-TEE TAs do not have
 ///  argc and argv. Also, they do not have a notion of environment variables.
-/// They obtain four arguments through CPU registers:
-/// - rdi: function ID
-/// - rsi: session ID
-/// - rdx: the address of parameters
-/// - rcx: command ID
 pub(super) struct UserStack {
     /// The top of the stack (base address)
     stack_top: MutPtr<u8>,
@@ -50,6 +45,16 @@ impl UserStack {
     /// Get the current stack pointer.
     pub(super) fn get_cur_stack_top(&self) -> usize {
         self.stack_top.as_usize() + self.pos
+    }
+
+    /// Push `bytes` to the stack.
+    ///
+    /// Returns `None` if stack has no enough space.
+    #[expect(dead_code)]
+    fn push_bytes(&mut self, bytes: &[u8]) -> Option<()> {
+        self.pos = self.pos.checked_sub(bytes.len())?;
+        self.stack_top.copy_from_slice(self.pos, bytes)?;
+        Some(())
     }
 
     /// Initialize the stack for the new process.

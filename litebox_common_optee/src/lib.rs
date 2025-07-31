@@ -1,5 +1,6 @@
 //! Common elements to enable OP-TEE-like functionalities
 
+#![cfg(target_arch = "x86_64")]
 #![no_std]
 
 extern crate alloc;

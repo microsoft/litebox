@@ -284,6 +284,8 @@ impl ElfPhdrInfo {
     }
 }
 
+const ELF_PHDR_INFO_SECTION_NAME: &str = "__elf_phdr_info";
+
 /// This function populates the `__elf_phdr_info` section of a TA ELF loaded in memory.
 /// `__elf_phdr_info` is an OP-TEE-specific section that contains the `DlPhdrInfo` structure.
 /// We should call this function once the ELF file is loaded into memory because it requires
@@ -305,7 +307,7 @@ unsafe fn ta_elf_set_elf_phdr_info(elf_buf: &[u8], base: usize) {
         if s.st_bind() == elf::abi::STB_GLOBAL
             && s.st_symtype() == elf::abi::STT_OBJECT
             && let Ok(sym_name) = sym_strtab.get(s.st_name as usize)
-            && sym_name == "__elf_phdr_info"
+            && sym_name == ELF_PHDR_INFO_SECTION_NAME
         {
             elf_phdr_info_addr =
                 base.checked_add(usize::try_from(s.st_value).expect("st_value overflow"));
