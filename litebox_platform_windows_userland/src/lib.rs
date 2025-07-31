@@ -38,7 +38,7 @@ use windows_sys::Win32::{
 extern crate alloc;
 
 /// Per-thread FS base storage structure
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct ThreadFsBaseState {
     /// The current FS base value for this thread
     fs_base: usize,
@@ -202,7 +202,8 @@ impl WindowsUserland {
         // Initialize it's own fs-base (for the main thread)
         WindowsUserland::init_thread_fs_base();
 
-        // Register the exception handler
+        // Windows sets FS_BASE to 0 regularly upon scheduling; we register an exception handler
+        // to set FS_BASE back to a "stored" value whenever we notice that it has become 0.
         unsafe {
             let _ = AddVectoredExceptionHandler(0, Some(exception_handler));
         }
@@ -789,7 +790,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                         &raw mut old_protect,
                     ) != 0
                 };
-                assert!(ok, "VirtualProtect failed: {}", unsafe { GetLastError() });
+                assert!(ok, "VirtualProtect(addr: {:p}, len: 0x{:x}, flags: {:?}) failed: {}", 
+                        base_addr, size, prot_flags(initial_permissions), unsafe { GetLastError() });
 
                 // Prefetch the memory range if requested
                 if populate_pages_immediately {
