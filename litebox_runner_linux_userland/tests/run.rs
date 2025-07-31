@@ -57,38 +57,48 @@ fn test_runner_with_dynamic_lib(
         Backend::Rewriter => "rewriter",
         Backend::Seccomp => "seccomp",
     };
+    let target_name = target.file_name().unwrap().to_str().unwrap();
     let dir_path = std::env::var("OUT_DIR").unwrap();
     let path = match backend {
         Backend::Seccomp => target.to_path_buf(),
         Backend::Rewriter => {
-            // new path in out_dir with .hooked suffix
-            let out_path = std::path::Path::new(dir_path.as_str()).join(format!(
-                "{}.hooked",
-                target.file_name().unwrap().to_str().unwrap()
-            ));
-            let output = std::process::Command::new("cargo")
-                .args([
-                    "run",
-                    "-p",
-                    "litebox_syscall_rewriter",
-                    "--",
-                    target.to_str().unwrap(),
-                    "-o",
-                    out_path.to_str().unwrap(),
-                ])
-                .output()
-                .expect("Failed to run litebox_syscall_rewriter");
-            assert!(
-                output.status.success(),
-                "failed to run litebox_syscall_rewriter {:?}",
-                std::str::from_utf8(output.stderr.as_slice()).unwrap()
-            );
-            out_path
+            if target.extension().is_some_and(|ext| ext == "hooked") {
+                let out_path = std::path::Path::new(dir_path.as_str())
+                    .join(target.file_name().unwrap().to_str().unwrap());
+                // If the target is already a hooked file, copy it to the output directory
+                std::fs::copy(target, out_path.clone()).expect("failed to copy hooked file");
+                out_path
+            } else {
+                // new path in out_dir with .hooked suffix
+                let out_path = std::path::Path::new(dir_path.as_str()).join(format!(
+                    "{}.hooked",
+                    target.file_name().unwrap().to_str().unwrap()
+                ));
+                let output = std::process::Command::new("cargo")
+                    .args([
+                        "run",
+                        "-p",
+                        "litebox_syscall_rewriter",
+                        "--",
+                        target.to_str().unwrap(),
+                        "-o",
+                        out_path.to_str().unwrap(),
+                    ])
+                    .output()
+                    .expect("Failed to run litebox_syscall_rewriter");
+                assert!(
+                    output.status.success(),
+                    "failed to run litebox_syscall_rewriter {:?}",
+                    std::str::from_utf8(output.stderr.as_slice()).unwrap()
+                );
+                out_path
+            }
         }
     };
 
     // create tar file containing all dependencies
-    let tar_dir = std::path::Path::new(dir_path.as_str()).join(format!("tar_files_{backend_str}"));
+    let tar_dir = std::path::Path::new(dir_path.as_str())
+        .join(format!("tar_files_{backend_str}_{target_name}"));
     let dirs_to_create = ["lib64", "lib/x86_64-linux-gnu", "lib32"];
     for dir in dirs_to_create {
         std::fs::create_dir_all(tar_dir.join(dir)).unwrap();
@@ -173,12 +183,12 @@ fn test_runner_with_dynamic_lib(
     }
 
     // create tar file using `tar` command
-    let tar_file =
-        std::path::Path::new(dir_path.as_str()).join(format!("rootfs_{backend_str}.tar"));
+    let tar_file = std::path::Path::new(dir_path.as_str())
+        .join(format!("rootfs_{backend_str}_{target_name}.tar"));
     let tar_data = std::process::Command::new("tar")
         .args([
             "-cvf",
-            format!("../rootfs_{backend_str}.tar").as_str(),
+            format!("../rootfs_{backend_str}_{target_name}.tar").as_str(),
             "lib",
             "lib32",
             "lib64",
@@ -300,8 +310,20 @@ console.log(content);
         node_path.exists(),
         "Node binary not found at {node_path_str}",
     );
+
     test_runner_with_dynamic_lib(
         Backend::Seccomp,
+        &initial_files,
+        node_path,
+        &["/out/hello_world.js"],
+        |out_dir| {
+            // write the test js file to the output directory
+            std::fs::write(out_dir.join("hello_world.js"), HELLO_WORLD_JS).unwrap();
+        },
+    );
+
+    test_runner_with_dynamic_lib(
+        Backend::Rewriter,
         &initial_files,
         node_path,
         &["/out/hello_world.js"],

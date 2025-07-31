@@ -10,10 +10,10 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
 use litebox::fs::OFlags;
-use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
-use litebox::platform::trivial_providers::TransparentMutPtr;
-use litebox::platform::{ImmediatelyWokenUp, RawConstPointer, ThreadLocalStorageProvider};
+use litebox::platform::trivial_providers::{TransparentConstPtr, TransparentMutPtr};
+use litebox::platform::{RawConstPointer, ThreadLocalStorageProvider};
+use litebox::platform::{RawMutexBlockError, UnblockedOrTimedOut};
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_common_linux::{CloneFlags, MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
 
@@ -517,11 +517,55 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
 
 impl litebox::platform::RawMutexProvider for LinuxUserland {
     type RawMutex = RawMutex;
+    type UserRawMutex = UserRawMutex;
 
     fn new_raw_mutex(&self) -> Self::RawMutex {
         RawMutex {
             inner: AtomicU32::new(0),
         }
+    }
+
+    fn from_raw_ptr(ptr: Self::RawConstPointer<u32>) -> Option<Self::UserRawMutex> {
+        if ptr.as_usize() % core::mem::align_of::<AtomicU32>() != 0 {
+            return None;
+        }
+        Some(UserRawMutex(ptr))
+    }
+}
+
+pub struct UserRawMutex(TransparentConstPtr<u32>);
+
+impl litebox::platform::UserRawMutex for UserRawMutex {
+    fn wake_many(&self, n: usize) -> usize {
+        assert!(n > 0);
+        let n: u32 = n.try_into().unwrap();
+
+        let mutex = unsafe { &*(self.0.as_usize() as *const AtomicU32) };
+        futex_val2(
+            mutex,
+            FutexOperation::Wake,
+            /* number to wake up */ n,
+            /* val2: ignored */ 0,
+            /* uaddr2: ignored */ None,
+        )
+        .expect("failed to wake up waiters")
+    }
+
+    fn block(&self, val: u32) -> Result<(), RawMutexBlockError> {
+        let mutex = unsafe { &*(self.0.as_usize() as *const AtomicU32) };
+        match block_or_maybe_timeout(mutex, val, None)? {
+            UnblockedOrTimedOut::Unblocked => Ok(()),
+            UnblockedOrTimedOut::TimedOut => unreachable!(),
+        }
+    }
+
+    fn block_or_timeout(
+        &self,
+        val: u32,
+        timeout: Duration,
+    ) -> Result<UnblockedOrTimedOut, RawMutexBlockError> {
+        let mutex = unsafe { &*(self.0.as_usize() as *const AtomicU32) };
+        block_or_maybe_timeout(mutex, val, Some(timeout))
     }
 }
 
@@ -533,75 +577,68 @@ pub struct RawMutex {
     inner: AtomicU32,
 }
 
-impl RawMutex {
-    fn block_or_maybe_timeout(
-        &self,
-        val: u32,
-        timeout: Option<Duration>,
-    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        // We immediately wake up (without even hitting syscalls) if we can clearly see that the
-        // value is different.
-        if self.inner.load(SeqCst) != val {
-            return Err(ImmediatelyWokenUp);
-        }
+fn block_or_maybe_timeout(
+    mutex: &AtomicU32,
+    val: u32,
+    timeout: Option<Duration>,
+) -> Result<UnblockedOrTimedOut, RawMutexBlockError> {
+    // We immediately wake up (without even hitting syscalls) if we can clearly see that the
+    // value is different.
+    if mutex.load(SeqCst) != val {
+        return Err(RawMutexBlockError::ImmediatelyWokenUp);
+    }
 
-        // Track some initial information.
-        let start = std::time::Instant::now();
+    // Track some initial information.
+    let start = std::time::Instant::now();
 
-        // We'll be looping unless we find a good reason to exit out of the loop, either due to a
-        // wake-up or a time-out. We do a singular (only as a one-off) check for the
-        // immediate-wake-up purely as an optimization, but otherwise, the only way to exit this
-        // loop is to actually hit an `Ok` state out for this function.
-        loop {
-            let remaining_time = match timeout {
-                None => None,
-                Some(timeout) => match timeout.checked_sub(start.elapsed()) {
-                    None => {
-                        break Ok(UnblockedOrTimedOut::TimedOut);
-                    }
-                    Some(remaining_time) => Some(remaining_time),
-                },
-            };
+    // We'll be looping unless we find a good reason to exit out of the loop, either due to a
+    // wake-up or a time-out. We do a singular (only as a one-off) check for the
+    // immediate-wake-up purely as an optimization, but otherwise, the only way to exit this
+    // loop is to actually hit an `Ok` state out for this function.
+    loop {
+        let remaining_time = match timeout {
+            None => None,
+            Some(timeout) => match timeout.checked_sub(start.elapsed()) {
+                None => {
+                    break Ok(UnblockedOrTimedOut::TimedOut);
+                }
+                Some(remaining_time) => Some(remaining_time),
+            },
+        };
 
-            // We wait on the futex, with a timeout if needed; the timeout is based on how much time
-            // remains to be elapsed.
-            match futex_timeout(
-                &self.inner,
-                FutexOperation::Wait,
-                /* expected value */ val,
-                remaining_time,
-                /* ignored */ None,
-                /* ignored */ 0,
-            ) {
-                Ok(0) => {
-                    if self.inner.load(SeqCst) != val {
-                        return Ok(UnblockedOrTimedOut::Unblocked);
-                    }
+        // We wait on the futex, with a timeout if needed; the timeout is based on how much time
+        // remains to be elapsed.
+        match futex_timeout(
+            mutex,
+            FutexOperation::Wait,
+            /* expected value */ val,
+            remaining_time,
+            /* ignored */ None,
+        ) {
+            Ok(0) => {
+                if mutex.load(SeqCst) != val {
+                    return Ok(UnblockedOrTimedOut::Unblocked);
                 }
-                Err(syscalls::Errno::EAGAIN) => {
-                    if self.inner.load(SeqCst) != val {
-                        // Ah, we seem to have actually been immediately woken up! Let us not
-                        // miss this.
-                        return Err(ImmediatelyWokenUp);
-                    }
-                }
-                Err(syscalls::Errno::ETIMEDOUT) => {
-                    return Ok(UnblockedOrTimedOut::TimedOut);
-                }
-                Err(e) => {
-                    panic!("Unexpected errno={e} for FUTEX_WAIT")
-                }
-                _ => unreachable!(),
             }
+            Err(syscalls::Errno::EAGAIN) => {
+                if mutex.load(SeqCst) != val {
+                    // Ah, we seem to have actually been immediately woken up! Let us not
+                    // miss this.
+                    return Err(RawMutexBlockError::ImmediatelyWokenUp);
+                }
+            }
+            Err(syscalls::Errno::ETIMEDOUT) => {
+                return Ok(UnblockedOrTimedOut::TimedOut);
+            }
+            Err(e) => {
+                panic!("Unexpected errno={e} for FUTEX_WAIT")
+            }
+            _ => unreachable!(),
         }
     }
 }
 
-impl litebox::platform::RawMutex for RawMutex {
-    fn underlying_atomic(&self) -> &AtomicU32 {
-        &self.inner
-    }
-
+impl litebox::platform::UserRawMutex for RawMutex {
     fn wake_many(&self, n: usize) -> usize {
         assert!(n > 0);
         let n: u32 = n.try_into().unwrap();
@@ -612,16 +649,14 @@ impl litebox::platform::RawMutex for RawMutex {
             /* number to wake up */ n,
             /* val2: ignored */ 0,
             /* uaddr2: ignored */ None,
-            /* val3: ignored */ 0,
         )
         .expect("failed to wake up waiters")
     }
 
-    fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
-        match self.block_or_maybe_timeout(val, None) {
-            Ok(UnblockedOrTimedOut::Unblocked) => Ok(()),
-            Ok(UnblockedOrTimedOut::TimedOut) => unreachable!(),
-            Err(ImmediatelyWokenUp) => Err(ImmediatelyWokenUp),
+    fn block(&self, val: u32) -> Result<(), RawMutexBlockError> {
+        match block_or_maybe_timeout(&self.inner, val, None)? {
+            UnblockedOrTimedOut::Unblocked => Ok(()),
+            UnblockedOrTimedOut::TimedOut => unreachable!(),
         }
     }
 
@@ -629,8 +664,14 @@ impl litebox::platform::RawMutex for RawMutex {
         &self,
         val: u32,
         timeout: Duration,
-    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        self.block_or_maybe_timeout(val, Some(timeout))
+    ) -> Result<UnblockedOrTimedOut, RawMutexBlockError> {
+        block_or_maybe_timeout(&self.inner, val, Some(timeout))
+    }
+}
+
+impl litebox::platform::RawMutex for RawMutex {
+    fn underlying_atomic(&self) -> &AtomicU32 {
+        &self.inner
     }
 }
 
@@ -841,22 +882,6 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
             PunchthroughSyscall::SetThreadArea { user_desc } => {
                 set_thread_area(user_desc).map_err(litebox::platform::PunchthroughError::Failure)
             }
-            PunchthroughSyscall::WakeByAddress { addr } => unsafe {
-                syscalls::syscall6(
-                    syscalls::Sysno::futex,
-                    addr.as_usize(),
-                    usize::try_from(FutexOperation::Wake as i32).unwrap(),
-                    1,
-                    0,
-                    0,
-                    0,
-                )
-            }
-            .map_err(|err| match err {
-                syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
-                _ => panic!("unexpected error {err}"),
-            })
-            .map_err(litebox::platform::PunchthroughError::Failure),
         }
     }
 }
@@ -907,7 +932,6 @@ fn futex_timeout(
     val: u32,
     timeout: Option<Duration>,
     uaddr2: Option<&AtomicU32>,
-    val3: u32,
 ) -> Result<usize, syscalls::Errno> {
     let uaddr: *const AtomicU32 = uaddr as _;
     let futex_op: i32 = futex_op as _;
@@ -939,7 +963,7 @@ fn futex_timeout(
                 0 // No timeout
             },
             uaddr2 as usize,
-            val3 as usize,
+            syscall_intercept::SYSCALL_ARG_MAGIC,
         )
     }
 }
@@ -951,7 +975,6 @@ fn futex_val2(
     val: u32,
     val2: u32,
     uaddr2: Option<&AtomicU32>,
-    val3: u32,
 ) -> Result<usize, syscalls::Errno> {
     let uaddr: *const AtomicU32 = uaddr as _;
     let futex_op: i32 = futex_op as _;
@@ -964,7 +987,7 @@ fn futex_val2(
             val as usize,
             val2 as usize,
             uaddr2 as usize,
-            val3 as usize,
+            syscall_intercept::SYSCALL_ARG_MAGIC,
         )
     }
 }
@@ -1532,7 +1555,7 @@ mod tests {
     use core::sync::atomic::AtomicU32;
     use std::thread::sleep;
 
-    use litebox::platform::{RawMutex, ThreadLocalStorageProvider as _};
+    use litebox::platform::{RawMutex, ThreadLocalStorageProvider as _, UserRawMutex as _};
 
     use crate::LinuxUserland;
     use litebox::platform::PageManagementProvider;
@@ -1554,7 +1577,7 @@ mod tests {
             copied_mutex.wake_many(10);
         });
 
-        assert!(mutex.block(0).is_ok());
+        assert!(RawMutex::block(mutex.as_ref(), 0).is_ok());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use crate::platform::RawMutex as _;
+use crate::platform::{RawMutex, UserRawMutex as _};
 
 #[cfg(feature = "lock_tracing")]
 use crate::sync::lock_tracing::{LockTracker, LockType, LockedWitness};
@@ -20,7 +20,7 @@ struct SpinEnabledRawMutex<Platform: RawSyncPrimitivesProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
-    /// Create a new [`SpinEnabledRawMutex`] from a [`RawMutex`](crate::platform::RawMutex).
+    /// Create a new [`SpinEnabledRawMutex`] from a [`RawMutex`].
     #[inline]
     fn new(raw: Platform::RawMutex) -> Self {
         Self { raw }
@@ -76,7 +76,7 @@ impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
 
             // Wait for change in state, assuming it is still 2.
             // ignore the error code as it is non-interruptible
-            let _ = self.raw.block(2);
+            let _ = RawMutex::block(&self.raw, 2);
 
             // Spin again after waking up
             state = self.spin();

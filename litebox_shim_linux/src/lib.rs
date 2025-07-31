@@ -693,6 +693,7 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
         SyscallRequest::CapGet { header, data } => {
             syscalls::misc::sys_capget(header, data).map(|()| 0)
         }
+        SyscallRequest::Futex { args } => syscalls::process::sys_futex(args),
         _ => {
             todo!()
         }

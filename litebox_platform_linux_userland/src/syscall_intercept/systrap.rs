@@ -238,7 +238,45 @@ fn register_seccomp_filter() {
                 .unwrap(),
             ],
         ),
-        (libc::SYS_futex, vec![]),
+        (
+            libc::SYS_futex,
+            vec![
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        1,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::MaskedEq(0x7f),
+                        libc::FUTEX_WAIT as u64,
+                    )
+                    .unwrap(),
+                    SeccompCondition::new(
+                        5,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::Eq,
+                        super::SYSCALL_ARG_MAGIC as u64,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        1,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::MaskedEq(0x7f),
+                        libc::FUTEX_WAKE as u64,
+                    )
+                    .unwrap(),
+                    SeccompCondition::new(
+                        5,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::Eq,
+                        super::SYSCALL_ARG_MAGIC as u64,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            ],
+        ),
         (
             libc::SYS_exit,
             vec![
