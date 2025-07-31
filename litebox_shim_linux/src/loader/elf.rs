@@ -218,6 +218,7 @@ struct TrampolineSection {
     trampoline_size: u64,
 }
 
+#[derive(Debug)]
 struct TrampolineHdr {
     /// The virtual memory of the trampoline code.
     vaddr: usize,
@@ -280,6 +281,12 @@ fn get_trampoline_hdr(object: &mut ElfFile) -> Option<TrampolineHdr> {
 fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize {
     // Our rewriter ensures that both `trampoline.vaddr` and `trampoline.file_offset` are page-aligned.
     // Otherwise, `ElfLoaderMmap::mmap` will fail and panic.
+    #[cfg(debug_assertions)]
+    litebox::log_println!(
+        litebox_platform_multiplex::platform(),
+        "Loading trampoline {:?}",
+        trampoline
+    );
     assert!(
         trampoline.vaddr % PAGE_SIZE == 0,
         "trampoline address must be page-aligned"

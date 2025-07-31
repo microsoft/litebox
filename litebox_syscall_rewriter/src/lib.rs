@@ -152,6 +152,9 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
                 if seg[1].p_type == object::elf::PT_LOAD && seg[1].p_offset - end_offset < 0x18 {
                     return false;
                 }
+                if end_offset.next_multiple_of(0x1000) - end_offset < 0x18 {
+                    return false;
+                }
                 true
             })
             .map(|seg| seg[0])
