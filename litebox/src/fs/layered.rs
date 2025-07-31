@@ -2,6 +2,7 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use hashbrown::HashMap;
 
@@ -12,9 +13,9 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadError, RmdirError, SeekError, UnlinkError, WriteError,
+    ReadDirError, ReadError, RmdirError, SeekError, UnlinkError, WriteError,
 };
-use super::{FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
 
 /// Just a random constant that is distinct from other file systems. In this case, it is
 /// `b'Lyrs'.hex()`.
@@ -939,6 +940,26 @@ impl<
         // do at least a "number of entries" check on both upper and lower level at all times.
         // However, in terms of functionality, we will be placing tombstone entries.
         todo!()
+    }
+
+    fn read_dir(&self, fd: &FileFd<Platform, Upper, Lower>) -> Result<Vec<DirEntry>, ReadDirError> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry));
+        match entry.as_ref() {
+            EntryX::Upper { fd } => {
+                // TODO(jayb): What happens if there was already a directory on a lower level, but then more
+                // files were added to upper level. The current approach may possibly be incorrect in such
+                // edge cases.
+                self.upper.read_dir(fd)
+            }
+            EntryX::Lower { fd } => {
+                // This is the easy case, nothing to deal with upper entries.
+                self.lower.read_dir(fd)
+            }
+            EntryX::Tombstone => unreachable!(),
+        }
     }
 
     fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {

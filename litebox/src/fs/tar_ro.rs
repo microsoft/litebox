@@ -24,15 +24,22 @@
 use alloc::borrow::ToOwned as _;
 use alloc::string::String;
 use alloc::vec::Vec;
+use hashbrown::HashMap;
 use tar_no_std::TarArchive;
 
-use crate::{LiteBox, path::Arg as _, sync, utilities::anymap::AnyMap};
+use crate::{
+    LiteBox,
+    fs::{DirEntry, FileType},
+    path::Arg as _,
+    sync,
+    utilities::anymap::AnyMap,
+};
 
 use super::{
     Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     errors::{
-        ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadError,
-        RmdirError, SeekError, UnlinkError, WriteError,
+        ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadDirError,
+        ReadError, RmdirError, SeekError, UnlinkError, WriteError,
     },
 };
 
@@ -315,6 +322,37 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Err(RmdirError::ReadOnlyFileSystem)
     }
 
+    fn read_dir(&self, fd: &FileFd<Platform>) -> Result<Vec<DirEntry>, ReadDirError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let Descriptor::Dir { path, metadata: _ } = &descriptor_table.get_entry(fd).entry else {
+            return Err(ReadDirError::NotADirectory);
+        };
+        // Store into a hashmap to collapse together the entries we end up with for multiple files
+        // within a sub-dir.
+        let entries: HashMap<String, FileType> = self
+            .tar_data
+            .entries()
+            .map(|entry| entry.filename())
+            .filter_map(|p| {
+                let p = p.as_str().ok()?;
+                contains_dir(p, path).then(|| {
+                    // Drop the directory path from `p`
+                    let suffix = p.trim_start_matches(path).trim_start_matches('/');
+                    // Then drop everything after the first `/`; if there is any then it was a dir,
+                    // otherwise it was a file.
+                    match suffix.split_once('/') {
+                        Some((dir, _)) => (String::from(dir), FileType::Directory),
+                        None => (String::from(suffix), FileType::RegularFile),
+                    }
+                })
+            })
+            .collect();
+        Ok(entries
+            .into_iter()
+            .map(|(name, file_type)| DirEntry { name, file_type })
+            .collect())
+    }
+
     fn file_status(
         &self,
         path: impl crate::path::Arg,
@@ -467,10 +505,6 @@ enum Descriptor {
         metadata: AnyMap,
     },
     Dir {
-        #[expect(
-            dead_code,
-            reason = "mostly used for debugging; we might consider removing this in the future"
-        )]
         path: String,
         metadata: AnyMap,
     },
