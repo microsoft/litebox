@@ -13,6 +13,7 @@ use litebox::{
     platform::RawConstPointer as _,
 };
 use litebox_common_linux::errno::Errno;
+use litebox_common_optee::UteeParams;
 use once_cell::race::OnceBox;
 use thiserror::Error;
 
@@ -226,6 +227,7 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
 pub struct ElfLoadInfo {
     pub entry_point: usize,
     pub user_stack_top: usize,
+    pub params_address: usize,
 }
 
 /// Loader for ELF files
@@ -233,7 +235,10 @@ pub(super) struct ElfLoader;
 
 impl ElfLoader {
     // Load an ELF file and prepare the stack for the new process.
-    pub(super) fn load_buffer(elf_buf: &[u8]) -> Result<ElfLoadInfo, ElfLoaderError> {
+    pub(super) fn load_buffer(
+        elf_buf: &[u8],
+        params: &UteeParams,
+    ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let mut loader = Loader::<ElfLoaderMmap>::new();
 
         let fd_elf_map = fd_elf_map();
@@ -268,7 +273,7 @@ impl ElfLoader {
         };
         let mut stack = UserStack::new(sp, super::DEFAULT_STACK_SIZE)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
-        stack.init().ok_or(ElfLoaderError::InvalidStackAddr)?;
+        stack.init(params).ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         #[cfg(debug_assertions)]
         litebox::log_println!(
@@ -279,9 +284,12 @@ impl ElfLoader {
             stack.get_cur_stack_top(),
         );
 
+        // For now, we store the input UTEE parameters in the user stack. Another option is
+        // to allocate a dedicated page for the parameters.
         Ok(ElfLoadInfo {
             entry_point: entry,
             user_stack_top: stack.get_cur_stack_top(),
+            params_address: stack.get_cur_stack_top(),
         })
     }
 }

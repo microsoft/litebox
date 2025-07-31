@@ -6,7 +6,7 @@
 extern crate alloc;
 
 use litebox::platform::RawConstPointer as _;
-use litebox_common_linux::errno::Errno;
+use litebox_common_linux::{PtRegs, errno::Errno};
 use num_enum::TryFromPrimitive;
 use syscall_nr::TeeSyscallNr;
 
@@ -176,6 +176,22 @@ impl SyscallContext {
     pub fn new(args: &[usize; MAX_SYSCALL_ARGS]) -> Self {
         SyscallContext { args: *args }
     }
+
+    /// Create OP-TEE TA's `SyscallContext` from `PtRegs`.
+    pub fn from_pt_regs(pt_regs: &PtRegs) -> Self {
+        SyscallContext {
+            args: [
+                pt_regs.rdi,
+                pt_regs.rsi,
+                pt_regs.rdx,
+                pt_regs.r10,
+                pt_regs.r8,
+                pt_regs.r9,
+                pt_regs.r12,
+                pt_regs.r13,
+            ],
+        }
+    }
 }
 
 /// A handle for `TeeObj`. OP-TEE kernel creates secret objects (e.g., via `CrypObjAlloc`)
@@ -240,7 +256,7 @@ impl CommandId {
 /// `utee_params` from `optee_os/lib/libutee/include/utee_types.h`
 /// It contains up to 4 parameters where each of them is a collection of
 /// type (1 byte) and two 8-byte data (values or addresses).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct UteeParams {
     pub types: u64,
@@ -288,6 +304,30 @@ impl UteeParams {
             let base_index = index * 2;
             Ok(Some((self.vals[base_index], self.vals[base_index + 1])))
         }
+    }
+
+    pub fn set_type(&mut self, index: usize, param_type: TeeParamType) -> Result<(), Errno> {
+        if index >= TEE_NUM_PARAMS {
+            return Err(Errno::EINVAL);
+        }
+        let mut types_bytes = self.types.to_le_bytes();
+        types_bytes[index] = param_type as u8;
+        self.types = u64::from_le_bytes(types_bytes);
+        Ok(())
+    }
+
+    pub fn set_values(&mut self, index: usize, value1: u64, value2: u64) -> Result<(), Errno> {
+        if index >= TEE_NUM_PARAMS {
+            return Err(Errno::EINVAL);
+        }
+        let base_index = index * 2;
+        self.vals[base_index] = value1;
+        self.vals[base_index + 1] = value2;
+        Ok(())
+    }
+
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
