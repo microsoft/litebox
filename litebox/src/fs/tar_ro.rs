@@ -118,8 +118,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         _mode: Mode,
     ) -> Result<FileFd<Platform>, OpenError> {
         use super::OFlags;
-        let currently_supported_oflags: OFlags = OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR;
-        if flags.contains(currently_supported_oflags.complement()) {
+        let currently_supported_oflags: OFlags =
+            OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR | OFlags::NOCTTY;
+        if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!()
         }
         let path = self.absolute_path(path)?;
