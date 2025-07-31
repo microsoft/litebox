@@ -521,10 +521,24 @@ pub enum TeeResult {
     SignatureInvalid = TEE_ERROR_SIGNATURE_INVALID,
     TimeNotSet = TEE_ERROR_TIME_NOT_SET,
     TimeNeedsReset = TEE_ERROR_TIME_NEEDS_RESET,
+    Unknown = 0xffff_ffff,
 }
 
 impl From<TeeResult> for u32 {
     fn from(res: TeeResult) -> Self {
         res as u32
     }
+}
+
+const UTEE_ENTRY_FUNC_OPEN_SESSION: u32 = 0;
+const UTEE_ENTRY_FUNC_CLOSE_SESSION: u32 = 1;
+const UTEE_ENTRY_FUNC_INVOKE_COMMEND: u32 = 2;
+
+#[derive(Clone, Copy, TryFromPrimitive)]
+#[repr(u32)]
+pub enum UteeEntryFunc {
+    OpenSession = UTEE_ENTRY_FUNC_OPEN_SESSION,
+    CloseSession = UTEE_ENTRY_FUNC_CLOSE_SESSION,
+    InvokeCommand = UTEE_ENTRY_FUNC_INVOKE_COMMEND,
+    Unknown = 0xffff_ffff,
 }

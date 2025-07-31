@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use litebox_common_optee::UteeParams;
+use litebox_common_optee::{UteeEntryFunc, UteeParams};
 use litebox_platform_multiplex::Platform;
 use std::path::PathBuf;
 
@@ -88,8 +88,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // session ID is determined by the kernel (this runner in this case).
     unsafe {
         jump_to_entry_point(
-            0xdeadbeef, // non-existent function ID which results in `TEE_Panic(0)`
-            0,
+            usize::try_from(UteeEntryFunc::OpenSession as u32)
+                .expect("UteeEntryFunc should fit in usize"),
+            1,
             loaded_program.user_stack_top - core::mem::size_of::<UteeParams>(),
             0,
             loaded_program.entry_point,
