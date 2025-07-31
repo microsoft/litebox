@@ -113,6 +113,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
 impl<Platform: sync::RawSyncPrimitivesProvider> super::private::Sealed for FileSystem<Platform> {}
 
 fn contains_dir(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
     assert!(!needle.ends_with('/'));
     haystack.starts_with(needle) && haystack.as_bytes().get(needle.len()) == Some(&b'/')
 }
@@ -135,6 +138,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             unimplemented!()
         }
         let path = self.absolute_path(path)?;
+        if path.is_empty() {
+            // We are at the root directory, we should just return early.
+            return Ok(self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
+                path: path.clone(),
+                metadata: AnyMap::new(),
+            }));
+        }
         assert!(path.starts_with('/'));
         let path = &path[1..];
         let Some((idx, entry)) =
