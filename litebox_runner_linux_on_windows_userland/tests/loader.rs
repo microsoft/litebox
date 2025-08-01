@@ -94,8 +94,22 @@ void _start() {
     unused,
     reason = "This code snippet is just used to illustrate the source code of the `hello_thread_static` test."
 )]
+const HELLO_WORLD_STATIC: &str = r#"
+// gcc -o hello_world_static hello_world_static.c -static
+#include <stdio.h>
+
+int main() {
+    printf("Hello, World!\n");
+    return 0;
+}
+"#;
+
+#[expect(
+    unused,
+    reason = "This code snippet is just used to illustrate the source code of the `hello_thread_static` test."
+)]
 const HELLO_THREAD_STATIC: &str = r#"
-// gcc hello_thread.c -o hello_thread_static -static                                                                                                     7,36          Top
+// gcc hello_thread.c -o hello_thread_static -static
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -130,7 +144,7 @@ fn test_syscall_rewriter() {
     println!("Running syscall rewriter test...");
     // Use the already compiled executable from the tests folder (same dir as this file)
     let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_dir.push("tests");
+    test_dir.push("tests/test-bins");
     let path = test_dir.join("hello_exec_nolibc");
     let hooked_path = test_dir.join("hello_exec_nolibc.hooked");
 
@@ -167,19 +181,25 @@ fn test_syscall_rewriter() {
 }
 
 #[test]
-fn test_hello_thread_static_rewriter() {
-    println!("Running hello_thread static + rewriter test...");
+fn test_static_linked_prog_with_rewriter() {
+    println!("Running statically linked binary + rewriter test...");
     // Use the already compiled executable from the tests folder (same dir as this file)
     let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_dir.push("tests");
-    let path = test_dir.join("hello_thread_static");
-    let hooked_path = test_dir.join("hello_thread_static.hooked");
+    test_dir.push("tests/test-bins");
+
+    let prog_name = "hello_world_static";
+    let prog_name_hooked = format!("{}.hooked", prog_name);
+
+    let path = test_dir.join(prog_name);
+    let hooked_path = test_dir.join(&prog_name_hooked);
 
     // rewrite the hello_thread_static
     let _ = std::fs::remove_file(hooked_path.clone());
-    println!("Running `cargo run -p litebox_syscall_rewriter -- -o {} {}`",
-                hooked_path.to_str().unwrap(),
-                path.to_str().unwrap());
+    println!(
+        "Running `cargo run -p litebox_syscall_rewriter -- -o {} {}`",
+        hooked_path.to_str().unwrap(),
+        path.to_str().unwrap()
+    );
     let output = std::process::Command::new("cargo")
         .args([
             "run",
@@ -198,12 +218,12 @@ fn test_hello_thread_static_rewriter() {
         std::str::from_utf8(output.stderr.as_slice()).unwrap()
     );
 
-    let executable_path = "/hello_thread_static.hooked";
+    let executable_path = format!("/{}", prog_name_hooked);
     let executable_data = std::fs::read(hooked_path).unwrap();
 
     common::init_platform(&[], &[], &[]);
-    common::install_file(executable_data, executable_path);
-    common::test_load_exec_common(executable_path);
+    common::install_file(executable_data, &executable_path);
+    common::test_load_exec_common(&executable_path);
 }
 
 const HELLO_THREAD_INIT_FILES: [(&str, &str); 2] = [
@@ -238,10 +258,6 @@ fn test_dynamic_lib_rewriter() {
         "failed to run syscall rewriter {:?}",
         std::str::from_utf8(output.stderr.as_slice()).unwrap()
     );
-
-    let executable_path = "/hello_exec_nolibc.hooked";
-    let executable_data = std::fs::read(hooked_path).unwrap();
-
     // create tar file containing all dependencies
     let tar_dir = test_dir.join("hello_thread_tar");
     std::fs::create_dir_all(tar_dir.join("out")).unwrap();
