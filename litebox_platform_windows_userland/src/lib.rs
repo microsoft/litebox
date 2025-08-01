@@ -8,7 +8,6 @@ use core::panic;
 use core::sync::atomic::{AtomicU32, AtomicUsize};
 use core::time::Duration;
 use std::cell::Cell;
-use std::ops::Range;
 use std::os::raw::c_void;
 use std::sync::atomic::Ordering::SeqCst;
 
@@ -20,7 +19,7 @@ use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox_common_linux::PunchthroughSyscall;
 
-use windows_sys::Win32::{self, Foundation as Win32_Foundation};
+use windows_sys::Win32::{Foundation as Win32_Foundation};
 use windows_sys::Win32::{
     Foundation::{GetLastError, WIN32_ERROR},
     System::Diagnostics::Debug::{
@@ -45,8 +44,6 @@ extern crate alloc;
 struct ThreadFsBaseState {
     /// The current FS base value for this thread
     fs_base: usize,
-    /// Whether the FS base has been explicitly set by the guest
-    is_set: bool,
 }
 
 impl ThreadFsBaseState {
@@ -55,23 +52,19 @@ impl ThreadFsBaseState {
 
         Self {
             fs_base: current_fs_base,
-            is_set: false,
         }
     }
 
     fn set_fs_base(&mut self, new_base: usize) {
         self.fs_base = new_base;
-        self.is_set = true;
         unsafe {
             litebox_common_linux::wrfsbase(new_base);
         }
     }
 
     fn restore_fs_base(&self) {
-        if self.is_set {
-            unsafe {
-                litebox_common_linux::wrfsbase(self.fs_base);
-            }
+        unsafe {
+            litebox_common_linux::wrfsbase(self.fs_base);
         }
     }
 }
@@ -171,7 +164,7 @@ unsafe extern "system" fn exception_handler(exception_info: *mut EXCEPTION_POINT
             // Get the saved FS base from the per-thread FS state
             let thread_state = WindowsUserland::get_thread_fs_base_state();
 
-            if current_fsbase == 0 && current_fsbase != thread_state.fs_base && thread_state.is_set
+            if current_fsbase == 0 && current_fsbase != thread_state.fs_base
             {
                 // Restore the FS base from the saved state
                 WindowsUserland::restore_thread_fs_base();
@@ -640,13 +633,7 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 let thread_state = WindowsUserland::get_thread_fs_base_state();
 
                 // Use the stored FS base value from our per-thread storage
-                let fs_base = if thread_state.is_set {
-                    // If the FS base has been explicitly set by the guest, use the stored value
-                    thread_state.fs_base
-                } else {
-                    // If not set by guest, read the current hardware register value
-                    unsafe { litebox_common_linux::rdfsbase() }
-                };
+                let fs_base = thread_state.fs_base;
 
                 unsafe { addr.write_at_offset(0, fs_base) }.ok_or(
                     litebox::platform::PunchthroughError::Failure(
