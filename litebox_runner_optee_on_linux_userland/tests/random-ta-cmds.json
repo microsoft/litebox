@@ -1,0 +1,23 @@
+[
+  {
+    "func_id": 0,
+    "cmd_id": 0,
+    "args": []
+  },
+  {
+    "func_id": 2,
+    "cmd_id": 0,
+    "args": [
+      {
+        "param_type": 6,
+        "value_a": 0,
+        "value_b": 64 
+      }
+    ]
+  },
+  {
+    "func_id": 1,
+    "cmd_id": 0,
+    "args": []
+  }
+]

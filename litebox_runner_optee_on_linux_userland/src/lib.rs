@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use litebox_common_optee::{TeeParamType, UteeEntryFunc, UteeParams};
 use litebox_platform_multiplex::Platform;
-use litebox_shim_optee::{add_optee_command, add_session_id_elf_load_info};
+use litebox_shim_optee::{add_optee_command, add_session_id_elf_load_info, allocate_param_buffer};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -110,12 +110,19 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         InterceptionBackend::Rewriter => {}
     }
 
-    let mut params = UteeParams::new();
+    let params = UteeParams::new(); // dummy to secure an area in the stack
     let loaded_program =
         litebox_shim_optee::loader::load_elf_buffer(prog_data.as_slice(), &params).unwrap();
 
-    let session_id = 1; // use a fixed session ID for now
+    // Currently, this runner only supports a single TA session.
+    let session_id = 1;
     add_session_id_elf_load_info(session_id, &loaded_program);
+    populate_optee_command_queue(session_id, &ta_commands);
+    litebox_shim_optee::optee_command_loop();
+}
+
+fn populate_optee_command_queue(session_id: u32, ta_commands: &[TaCommand]) {
+    let mut params = UteeParams::new();
 
     for ta_command in ta_commands {
         if ta_command.args.len() > 4 {
@@ -124,7 +131,23 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         for (i, arg) in ta_command.args.iter().enumerate() {
             let param_type = TeeParamType::try_from(arg.param_type).expect("Invalid param type");
             params.set_type(i, param_type).unwrap();
-            params.set_values(i, arg.value_a, arg.value_b).unwrap();
+            match param_type {
+                TeeParamType::ValueInput | TeeParamType::ValueOutput | TeeParamType::ValueInout => {
+                    params.set_values(i, arg.value_a, arg.value_b).unwrap();
+                }
+                TeeParamType::MemrefOutput => {
+                    let param_buf_addr =
+                        allocate_param_buffer(usize::try_from(arg.value_b).unwrap())
+                            .expect("Failed to allocate memory for MemrefOutput");
+                    params
+                        .set_values(i, u64::try_from(param_buf_addr).unwrap(), arg.value_b)
+                        .unwrap();
+                }
+                TeeParamType::MemrefInput | TeeParamType::MemrefInout => {
+                    todo!("revise JSON format to handle MemrefInput and MemrefInout types.");
+                }
+                TeeParamType::None => {}
+            }
         }
         for i in ta_command.args.len()..4 {
             params.set_type(i, TeeParamType::None).unwrap();
@@ -137,6 +160,4 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             ta_command.cmd_id,
         );
     }
-
-    litebox_shim_optee::optee_command_loop();
 }

@@ -147,6 +147,7 @@ pub(crate) fn optee_command_queue() -> &'static OpteeCommandQueue {
     QUEUE.get_or_init(|| alloc::boxed::Box::new(OpteeCommandQueue::new()))
 }
 
+/// Push or enqueue an OP-TEE command to the command queue which will be consumed by `optee_command_loop`.
 pub fn add_optee_command(session_id: u32, func: UteeEntryFunc, params: &UteeParams, cmd_id: u32) {
     let cmd = OpteeCommand {
         func,
@@ -156,6 +157,11 @@ pub fn add_optee_command(session_id: u32, func: UteeEntryFunc, params: &UteePara
     optee_command_queue().push(session_id, &cmd);
 }
 
+/// OP-TEE command loop that dequeues commands from the command queue and handles each of them
+/// by interacting with loaded TAs.
+/// For now, it terminates the thread if there is no commands left in the queue.
+/// Instead, it can be an infinite loop with sleep to continously handle commands
+/// (i.e., `UteeEntryFunc::InvokeCommand`) until it gets `UteeEntryFunc::CloseSession` from the queue.
 pub fn optee_command_loop() -> ! {
     if let Some(cmd) = optee_command_queue().pop(1) {
         let elf_load_info = session_id_elf_load_info_map().get(1);
@@ -199,4 +205,21 @@ unsafe extern "C" fn jump_to_entry_point(
     user_stack_top: usize,
 ) -> ! {
     core::arch::naked_asm!("mov rsp, r9", "jmp r8", "hlt");
+}
+
+/// Allocate a buffer for OP-TEE parameters
+/// Currently, we do not deallocate or unmap this buffer (memory leak).
+pub fn allocate_param_buffer(size: usize) -> Option<usize> {
+    if let Ok(addr) = crate::syscalls::mm::sys_mmap(
+        0,
+        size,
+        litebox_common_linux::ProtFlags::PROT_READ | litebox_common_linux::ProtFlags::PROT_WRITE,
+        litebox_common_linux::MapFlags::MAP_ANONYMOUS,
+        -1,
+        0,
+    ) {
+        Some(addr.as_usize())
+    } else {
+        None
+    }
 }

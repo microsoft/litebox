@@ -269,9 +269,9 @@ const TEE_PARAM_TYPE_NONE: u8 = 0;
 const TEE_PARAM_TYPE_VALUE_INPUT: u8 = 1;
 const TEE_PARAM_TYPE_VALUE_OUTPUT: u8 = 2;
 const TEE_PARAM_TYPE_VALUE_INOUT: u8 = 3;
-const TEE_PARAM_TYPE_MEMREF_INPUT: u8 = 4;
-const TEE_PARAM_TYPE_MEMREF_OUTPUT: u8 = 5;
-const TEE_PARAM_TYPE_MEMREF_INOUT: u8 = 6;
+const TEE_PARAM_TYPE_MEMREF_INPUT: u8 = 5;
+const TEE_PARAM_TYPE_MEMREF_OUTPUT: u8 = 6;
+const TEE_PARAM_TYPE_MEMREF_INOUT: u8 = 7;
 
 #[derive(Clone, Copy, TryFromPrimitive, PartialEq)]
 #[repr(u8)]
