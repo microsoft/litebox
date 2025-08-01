@@ -286,8 +286,10 @@ pub enum TeeParamType {
 }
 
 impl UteeParams {
+    pub const TEE_NUM_PARAMS: usize = TEE_NUM_PARAMS;
+
     pub fn get_type(&self, index: usize) -> Result<TeeParamType, Errno> {
-        if index >= TEE_NUM_PARAMS {
+        if index >= Self::TEE_NUM_PARAMS {
             return Err(Errno::EINVAL);
         }
         let type_byte = self.types.to_le_bytes()[index];
@@ -295,7 +297,7 @@ impl UteeParams {
     }
 
     pub fn get_values(&self, index: usize) -> Result<Option<(u64, u64)>, Errno> {
-        if index >= TEE_NUM_PARAMS {
+        if index >= Self::TEE_NUM_PARAMS {
             return Err(Errno::EINVAL);
         }
         let type_byte = self.types.to_le_bytes()[index];
@@ -308,7 +310,7 @@ impl UteeParams {
     }
 
     pub fn set_type(&mut self, index: usize, param_type: TeeParamType) -> Result<(), Errno> {
-        if index >= TEE_NUM_PARAMS {
+        if index >= Self::TEE_NUM_PARAMS {
             return Err(Errno::EINVAL);
         }
         let mut types_bytes = self.types.to_le_bytes();
@@ -318,7 +320,7 @@ impl UteeParams {
     }
 
     pub fn set_values(&mut self, index: usize, value1: u64, value2: u64) -> Result<(), Errno> {
-        if index >= TEE_NUM_PARAMS {
+        if index >= Self::TEE_NUM_PARAMS {
             return Err(Errno::EINVAL);
         }
         let base_index = index * 2;

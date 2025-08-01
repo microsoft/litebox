@@ -2,7 +2,9 @@ use anyhow::Result;
 use clap::Parser;
 use litebox_common_optee::{TeeParamType, UteeEntryFunc, UteeParams};
 use litebox_platform_multiplex::Platform;
-use litebox_shim_optee::{add_optee_command, add_session_id_elf_load_info, allocate_param_buffer};
+use litebox_shim_optee::{
+    allocate_param_buffer, register_session_id_elf_load_info, submit_optee_command,
+};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -132,7 +134,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     // Currently, this runner only supports a single TA session.
     let session_id = 1;
-    add_session_id_elf_load_info(session_id, &loaded_program);
+    register_session_id_elf_load_info(session_id, &loaded_program);
     populate_optee_command_queue(session_id, &ta_commands);
     litebox_shim_optee::optee_command_loop();
 }
@@ -141,7 +143,7 @@ fn populate_optee_command_queue(session_id: u32, ta_commands: &[TaCommand]) {
     let mut params = UteeParams::new();
 
     for ta_command in ta_commands {
-        if ta_command.args.len() > 4 {
+        if ta_command.args.len() > UteeParams::TEE_NUM_PARAMS {
             panic!("Warning: ta_command has more than four arguments!");
         }
         for (i, arg) in ta_command.args.iter().enumerate() {
@@ -254,11 +256,11 @@ fn populate_optee_command_queue(session_id: u32, ta_commands: &[TaCommand]) {
                 }
             }
         }
-        for i in ta_command.args.len()..4 {
+        for i in ta_command.args.len()..UteeParams::TEE_NUM_PARAMS {
             params.set_type(i, TeeParamType::None).unwrap();
         }
 
-        add_optee_command(
+        submit_optee_command(
             session_id,
             UteeEntryFunc::try_from(ta_command.func_id).expect("Invalid function ID"),
             &params,

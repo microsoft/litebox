@@ -16,7 +16,7 @@ use litebox::{
     mm::{PageManager, linux::PAGE_SIZE},
     platform::{RawConstPointer as _, RawMutPointer as _, ThreadProvider as _},
 };
-use litebox_common_optee::{SyscallRequest, TeeResult, UteeEntryFunc, UteeParams};
+use litebox_common_optee::{SyscallRequest, TeeParamType, TeeResult, UteeEntryFunc, UteeParams};
 use litebox_platform_multiplex::Platform;
 
 use crate::loader::elf::ElfLoadInfo;
@@ -100,7 +100,7 @@ fn session_id_elf_load_info_map() -> &'static SessionIdElfLoadInfoMap {
     SESS_ID_ELF_LOAD_INFO_MAP.get_or_init(|| alloc::boxed::Box::new(SessionIdElfLoadInfoMap::new()))
 }
 
-pub fn add_session_id_elf_load_info(session_id: u32, elf_load_info: &ElfLoadInfo) {
+pub fn register_session_id_elf_load_info(session_id: u32, elf_load_info: &ElfLoadInfo) {
     session_id_elf_load_info_map().insert(session_id, elf_load_info);
 }
 
@@ -142,19 +142,29 @@ impl OpteeCommandQueue {
     }
 }
 
-pub(crate) fn optee_command_queue() -> &'static OpteeCommandQueue {
+pub(crate) fn optee_command_submission_queue() -> &'static OpteeCommandQueue {
     static QUEUE: OnceBox<OpteeCommandQueue> = OnceBox::new();
     QUEUE.get_or_init(|| alloc::boxed::Box::new(OpteeCommandQueue::new()))
 }
 
+pub(crate) fn optee_command_completion_queue() -> &'static OpteeCommandQueue {
+    static COMPLETE_QUEUE: OnceBox<OpteeCommandQueue> = OnceBox::new();
+    COMPLETE_QUEUE.get_or_init(|| alloc::boxed::Box::new(OpteeCommandQueue::new()))
+}
+
 /// Push or enqueue an OP-TEE command to the command queue which will be consumed by `optee_command_loop`.
-pub fn add_optee_command(session_id: u32, func: UteeEntryFunc, params: &UteeParams, cmd_id: u32) {
+pub fn submit_optee_command(
+    session_id: u32,
+    func: UteeEntryFunc,
+    params: &UteeParams,
+    cmd_id: u32,
+) {
     let cmd = OpteeCommand {
         func,
         params: *params,
         cmd_id,
     };
-    optee_command_queue().push(session_id, &cmd);
+    optee_command_submission_queue().push(session_id, &cmd);
 }
 
 /// OP-TEE command loop that dequeues commands from the command queue and handles each of them
@@ -163,8 +173,10 @@ pub fn add_optee_command(session_id: u32, func: UteeEntryFunc, params: &UteePara
 /// Instead, it can be an infinite loop with sleep to continously handle commands
 /// (i.e., `UteeEntryFunc::InvokeCommand`) until it gets `UteeEntryFunc::CloseSession` from the queue.
 pub fn optee_command_loop() -> ! {
-    if let Some(cmd) = optee_command_queue().pop(1) {
-        let elf_load_info = session_id_elf_load_info_map().get(1);
+    let session_id = 1; // For now, we only support a single session ID (1).
+
+    if let Some(cmd) = optee_command_submission_queue().pop(session_id) {
+        let elf_load_info = session_id_elf_load_info_map().get(session_id);
         let Some(elf_load_info) = elf_load_info else {
             litebox_platform_multiplex::platform().terminate_thread(0);
         };
@@ -172,10 +184,22 @@ pub fn optee_command_loop() -> ! {
             unsafe { &mut *(elf_load_info.params_address as *mut usize).cast::<UteeParams>() };
         *params = cmd.params;
 
+        for idx in 0..UteeParams::TEE_NUM_PARAMS {
+            if matches!(
+                cmd.params.get_type(idx).unwrap_or(TeeParamType::None),
+                TeeParamType::MemrefOutput | TeeParamType::MemrefInout
+            ) {
+                // the command is not yet complete, but we will retrieve its result once the TA
+                // finishes its execution.
+                optee_command_completion_queue().push(session_id, &cmd);
+                break;
+            }
+        }
+
         unsafe {
             jump_to_entry_point(
                 cmd.func as u32 as usize,
-                1,
+                session_id as usize,
                 elf_load_info.params_address,
                 cmd.cmd_id as usize,
                 elf_load_info.entry_point,
@@ -183,9 +207,32 @@ pub fn optee_command_loop() -> ! {
             );
         }
     } else {
+        while let Some(cmd) = optee_command_completion_queue().pop(session_id) {
+            for idx in 0..UteeParams::TEE_NUM_PARAMS {
+                if cmd.params.get_type(idx) == Ok(TeeParamType::MemrefOutput)
+                    && let Ok(Some((addr, len))) = cmd.params.get_values(idx)
+                {
+                    let slice = unsafe {
+                        &*core::ptr::slice_from_raw_parts(
+                            addr as *const u8,
+                            usize::try_from(len).unwrap_or(0),
+                        )
+                    };
+                    #[cfg(debug_assertions)]
+                    litebox::log_println!(
+                        litebox_platform_multiplex::platform(),
+                        "output (index: {}): {:?}",
+                        idx,
+                        slice,
+                    );
+                }
+            }
+        }
+
         // no command left. terminate the thread for now (or sleep until next command comes)
-        session_id_elf_load_info_map().remove(1);
-        optee_command_queue().remove(1);
+        session_id_elf_load_info_map().remove(session_id);
+        optee_command_submission_queue().remove(session_id);
+        optee_command_completion_queue().remove(session_id);
         litebox_platform_multiplex::platform().terminate_thread(0);
     }
 }
