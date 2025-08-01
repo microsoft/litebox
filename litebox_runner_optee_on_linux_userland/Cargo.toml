@@ -14,6 +14,8 @@ litebox_platform_linux_userland = { version = "0.1.0", path = "../litebox_platfo
 litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_multiplex", default-features = false, features = ["platform_linux_userland_with_optee_syscall", "systrap_backend"] }
 litebox_shim_optee = { version = "0.1.0", path = "../litebox_shim_optee", default-features = false, features = ["platform_linux_userland"] }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }
+serde = { version = "1.0.142", features = ["derive"] }
+serde_json = "1.0.142"
 
 [dev-dependencies]
 
