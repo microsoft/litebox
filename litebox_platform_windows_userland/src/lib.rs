@@ -1146,11 +1146,6 @@ unsafe extern "C" fn syscall_handler(
         Err(err) => err.as_neg() as isize,
     };
 
-    // Note: For Windows x64, the OS kernel will clear userspace fs register at every
-    // context switch (e.g., task scheduling). Therefore, we must manually restore it
-    // before returning to the guest, as the guest thread's fs register is used for thread-local storage
-    WindowsUserland::restore_thread_fs_base();
-
     res
 }
 
