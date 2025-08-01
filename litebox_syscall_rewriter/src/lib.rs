@@ -71,6 +71,9 @@ pub const TRAMPOLINE_SECTION_NAME_PREFIX: &str = ".trampolineLB";
 /// to know that they have a trampoline that satisfies the expected version.
 pub const TRAMPOLINE_SECTION_NAME: &str = ".trampolineLB0";
 
+/// The size of the trampoline section, which includes the magic number, the trampoline address, and the size of the trampoline data.
+const TRAMPOLINE_SECTION_SIZE: usize = 0x18;
+
 /// Update the `input_binary` with a call to `trampoline` instead of any `syscall` instructions.
 ///
 /// The `trampoline` must be an absolute address if specified; if unspecified, it will be set to
@@ -147,12 +150,15 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
                 {
                     return false;
                 }
-                // ensure the segment has enough space for the trampoline section (0x18 bytes)
+                // ensure the segment has enough space for the trampoline section
                 let end_offset = seg[0].p_offset + seg[0].p_filesz;
-                if seg[1].p_type == object::elf::PT_LOAD && seg[1].p_offset - end_offset < 0x18 {
+                if seg[1].p_type == object::elf::PT_LOAD
+                    && seg[1].p_offset - end_offset < TRAMPOLINE_SECTION_SIZE as u64
+                {
                     return false;
                 }
-                if end_offset.next_multiple_of(0x1000) - end_offset < 0x18 {
+                if end_offset.next_multiple_of(0x1000) - end_offset < TRAMPOLINE_SECTION_SIZE as u64
+                {
                     return false;
                 }
                 true
@@ -213,6 +219,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
     trampoline_vec.extend_from_slice("LITE BOX".as_bytes());
     trampoline_vec.extend_from_slice(&trampoline_base_addr.to_le_bytes());
     trampoline_vec.extend_from_slice(&(trampoline_data.len() as u64).to_le_bytes());
+    assert_eq!(trampoline_vec.len(), TRAMPOLINE_SECTION_SIZE);
     builder.sections.get_mut(trampoline_section).sh_size = trampoline_vec.len() as u64;
     builder.sections.get_mut(trampoline_section).data =
         object::build::elf::SectionData::Data(trampoline_vec.into());
