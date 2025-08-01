@@ -61,10 +61,26 @@ struct TaCommand {
 /// An argument of OP-TEE/TA message command. It consists of a type and
 /// two 64-bit values/references.
 #[derive(Debug, Deserialize)]
-struct TaCommandArgument {
-    param_type: u8,
-    value_a: u64,
-    value_b: u64,
+#[serde(untagged)]
+enum TaCommandArgument {
+    Value {
+        param_type: u8,
+        value_a: u64,
+        value_b: u64,
+    },
+    MemrefInput {
+        param_type: u8,
+        data_base64: String,
+    },
+    MemrefInout {
+        param_type: u8,
+        data_base64: String,
+        buffer_size: u64,
+    },
+    MemrefOutput {
+        param_type: u8,
+        buffer_size: u64,
+    },
 }
 
 /// Test OP-TEE TAs with LiteBox on unmodified Linux
@@ -126,27 +142,116 @@ fn populate_optee_command_queue(session_id: u32, ta_commands: &[TaCommand]) {
 
     for ta_command in ta_commands {
         if ta_command.args.len() > 4 {
-            eprintln!("Warning: ta_command has more than four arguments!");
+            panic!("Warning: ta_command has more than four arguments!");
         }
         for (i, arg) in ta_command.args.iter().enumerate() {
-            let param_type = TeeParamType::try_from(arg.param_type).expect("Invalid param type");
-            params.set_type(i, param_type).unwrap();
-            match param_type {
-                TeeParamType::ValueInput | TeeParamType::ValueOutput | TeeParamType::ValueInout => {
-                    params.set_values(i, arg.value_a, arg.value_b).unwrap();
+            match arg {
+                TaCommandArgument::Value {
+                    param_type,
+                    value_a,
+                    value_b,
+                } => {
+                    let param_type =
+                        TeeParamType::try_from(*param_type).expect("Invalid param type");
+                    if !matches!(
+                        param_type,
+                        TeeParamType::ValueInput
+                            | TeeParamType::ValueOutput
+                            | TeeParamType::ValueInout
+                    ) {
+                        panic!("Invalid param type");
+                    }
+                    params.set_type(i, param_type).unwrap();
+                    params.set_values(i, *value_a, *value_b).unwrap();
                 }
-                TeeParamType::MemrefOutput => {
+                TaCommandArgument::MemrefInput {
+                    param_type,
+                    data_base64,
+                } => {
+                    let param_type =
+                        TeeParamType::try_from(*param_type).expect("Invalid param type");
+                    if !matches!(param_type, TeeParamType::MemrefInput) {
+                        panic!("Invalid param type");
+                    }
+                    params.set_type(i, param_type).unwrap();
+
+                    let decode_buf_size = base64::decoded_len_estimate(data_base64.len());
                     let param_buf_addr =
-                        allocate_param_buffer(usize::try_from(arg.value_b).unwrap())
-                            .expect("Failed to allocate memory for MemrefOutput");
+                        allocate_param_buffer(usize::try_from(decode_buf_size).unwrap())
+                            .expect("Failed to allocate memory for MemrefInput argument");
+                    let length = base64::engine::Engine::decode_slice(
+                        &base64::engine::general_purpose::STANDARD,
+                        data_base64.as_bytes(),
+                        unsafe {
+                            &mut *core::ptr::slice_from_raw_parts_mut(
+                                param_buf_addr as *mut u8,
+                                decode_buf_size,
+                            )
+                        },
+                    )
+                    .expect("Failed to decode base64 data");
+
                     params
-                        .set_values(i, u64::try_from(param_buf_addr).unwrap(), arg.value_b)
+                        .set_values(
+                            i,
+                            u64::try_from(param_buf_addr).unwrap(),
+                            u64::try_from(length).unwrap(),
+                        )
                         .unwrap();
                 }
-                TeeParamType::MemrefInput | TeeParamType::MemrefInout => {
-                    todo!("revise JSON format to handle MemrefInput and MemrefInout types.");
+                TaCommandArgument::MemrefInout {
+                    param_type,
+                    data_base64,
+                    buffer_size,
+                } => {
+                    let param_type =
+                        TeeParamType::try_from(*param_type).expect("Invalid param type");
+                    if !matches!(param_type, TeeParamType::MemrefInout) {
+                        panic!("Invalid param type");
+                    }
+                    params.set_type(i, param_type).unwrap();
+
+                    let decode_buf_size = base64::decoded_len_estimate(data_base64.len());
+                    let param_buf_addr = allocate_param_buffer(core::cmp::max(
+                        usize::try_from(*buffer_size).unwrap(),
+                        decode_buf_size,
+                    ))
+                    .expect("Failed to allocate memory for MemrefInout argument");
+                    let length = base64::engine::Engine::decode_slice(
+                        &base64::engine::general_purpose::STANDARD,
+                        data_base64.as_bytes(),
+                        unsafe {
+                            &mut *core::ptr::slice_from_raw_parts_mut(
+                                param_buf_addr as *mut u8,
+                                decode_buf_size,
+                            )
+                        },
+                    )
+                    .expect("Failed to decode base64 data");
+                    if *buffer_size < u64::try_from(length).unwrap() {
+                        panic!("Buffer size is smaller than input data size");
+                    }
+
+                    params
+                        .set_values(i, u64::try_from(param_buf_addr).unwrap(), *buffer_size)
+                        .unwrap();
                 }
-                TeeParamType::None => {}
+                TaCommandArgument::MemrefOutput {
+                    param_type,
+                    buffer_size,
+                } => {
+                    let param_type =
+                        TeeParamType::try_from(*param_type).expect("Invalid param type");
+                    if !matches!(param_type, TeeParamType::MemrefOutput) {
+                        panic!("Invalid param type");
+                    }
+                    params.set_type(i, param_type).unwrap();
+                    let param_buf_addr = allocate_param_buffer(*buffer_size as usize)
+                        .expect("Failed to allocate memory for MemrefOutput argument");
+                    params
+                        .set_values(i, u64::try_from(param_buf_addr).unwrap(), *buffer_size)
+                        .unwrap();
+                }
             }
         }
         for i in ta_command.args.len()..4 {

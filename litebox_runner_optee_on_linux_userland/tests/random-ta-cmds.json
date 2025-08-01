@@ -10,8 +10,7 @@
     "args": [
       {
         "param_type": 6,
-        "value_a": 0,
-        "value_b": 64 
+        "buffer_size": 64
       }
     ]
   },
