@@ -97,6 +97,9 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         let path = self.absolute_path(path)?;
         match path.as_str() {
             "/dev/stdin" => {
+                if flags.contains(OFlags::DIRECTORY) {
+                    return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+                }
                 if flags == OFlags::RDONLY && mode.is_empty() {
                     Ok(self
                         .litebox
@@ -107,6 +110,9 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
                 }
             }
             "/dev/stdout" => {
+                if flags.contains(OFlags::DIRECTORY) {
+                    return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+                }
                 if flags == OFlags::WRONLY && mode.is_empty() {
                     Ok(self
                         .litebox
@@ -117,6 +123,9 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
                 }
             }
             "/dev/stderr" => {
+                if flags.contains(OFlags::DIRECTORY) {
+                    return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+                }
                 if flags == OFlags::WRONLY && mode.is_empty() {
                     Ok(self
                         .litebox

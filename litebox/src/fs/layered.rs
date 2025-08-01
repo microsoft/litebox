@@ -364,7 +364,8 @@ impl<
         mode: Mode,
     ) -> Result<FileFd<Platform, Upper, Lower>, OpenError> {
         let currently_supported_oflags: OFlags =
-            OFlags::CREAT | OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR | OFlags::NOCTTY;
+            OFlags::CREAT | OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR | OFlags::NOCTTY
+            | OFlags::DIRECTORY;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!()
         }

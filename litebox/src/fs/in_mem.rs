@@ -134,12 +134,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn open(
         &self,
         path: impl crate::path::Arg,
-        flags: super::OFlags,
+        mut flags: super::OFlags,
         mode: super::Mode,
     ) -> Result<FileFd<Platform>, OpenError> {
         use super::OFlags;
         let currently_supported_oflags: OFlags =
-            OFlags::CREAT | OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR | OFlags::NOCTTY;
+            OFlags::CREAT | OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR | OFlags::NOCTTY
+            | OFlags::DIRECTORY;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!()
         }
@@ -160,6 +161,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 if !self.current_user.can_write(&parent.perms) {
                     return Err(OpenError::NoWritePerms);
                 }
+                // When both O_CREAT and O_DIRECTORY are specified in flags and the
+                // file specified by pathname does not exist, open() will create a
+                // regular file (i.e., O_DIRECTORY is ignored).
+                flags.remove(OFlags::DIRECTORY);
                 parent.children_count = parent.children_count.checked_add(1).unwrap();
                 let entry = Entry::File(Arc::new(self.litebox.sync().new_rwlock(FileX {
                     perms: Permissions {
@@ -199,16 +204,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             false
         };
         match entry {
-            Entry::File(file) => Ok(self
-                .litebox
-                .descriptor_table_mut()
-                .insert(Descriptor::File {
-                    file: file.clone(),
-                    read_allowed,
-                    write_allowed,
-                    position: 0,
-                    metadata: AnyMap::new(),
-                })),
+            Entry::File(file) => {
+                if flags.contains(OFlags::DIRECTORY) {
+                    return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+                }
+                Ok(self
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert(Descriptor::File {
+                        file: file.clone(),
+                        read_allowed,
+                        write_allowed,
+                        position: 0,
+                        metadata: AnyMap::new(),
+                    }))
+            }
             Entry::Dir(dir) => Ok(self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
                 dir: dir.clone(),
                 metadata: AnyMap::new(),
