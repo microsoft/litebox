@@ -98,9 +98,6 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         let path = self.absolute_path(path)?;
         let stream = match path.as_str() {
             "/dev/stdin" => {
-                if flags.contains(OFlags::DIRECTORY) {
-                    return Err(OpenError::PathError(PathError::ComponentNotADirectory));
-                }
                 if flags == OFlags::RDONLY && mode.is_empty() {
                     StdioStream::Stdin
                 } else {
@@ -108,9 +105,6 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
                 }
             }
             "/dev/stdout" => {
-                if flags.contains(OFlags::DIRECTORY) {
-                    return Err(OpenError::PathError(PathError::ComponentNotADirectory));
-                }
                 if flags == OFlags::WRONLY && mode.is_empty() {
                     StdioStream::Stdout
                 } else {
@@ -118,9 +112,6 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
                 }
             }
             "/dev/stderr" => {
-                if flags.contains(OFlags::DIRECTORY) {
-                    return Err(OpenError::PathError(PathError::ComponentNotADirectory));
-                }
                 if flags == OFlags::WRONLY && mode.is_empty() {
                     StdioStream::Stderr
                 } else {
