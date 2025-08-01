@@ -221,6 +221,82 @@ mod in_mem {
                 .expect("Failed to chown group only");
         });
     }
+
+    #[test]
+    fn o_directory_flag_tests() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+        // Create test directory and file
+        fs.mkdir("/testdir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .expect("Failed to create directory");
+
+        let fd = fs
+            .open("/testfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        fs.close(fd).expect("Failed to close file");
+
+        // Test O_DIRECTORY on a directory (should succeed)
+        let fd = fs
+            .open(
+                "/testdir",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .expect("Failed to open directory with O_DIRECTORY");
+        fs.close(fd).expect("Failed to close directory");
+
+        // Test O_DIRECTORY on a regular file (should fail)
+        assert!(matches!(
+            fs.open(
+                "/testfile",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty()
+            ),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::ComponentNotADirectory
+            ))
+        ));
+
+        // Test O_DIRECTORY on non-existent path (should fail)
+        assert!(matches!(
+            fs.open(
+                "/nonexistent",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty()
+            ),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::NoSuchFileOrDirectory
+            ))
+        ));
+
+        // Test O_DIRECTORY with O_CREAT on non-existent path
+        // According to the implementation, O_DIRECTORY should be ignored when O_CREAT is specified
+        let fd = fs
+            .open(
+                "/newfile",
+                OFlags::CREAT | OFlags::WRONLY | OFlags::DIRECTORY,
+                Mode::RWXU,
+            )
+            .expect("Failed to create file with O_CREAT | O_DIRECTORY");
+        fs.close(fd).expect("Failed to close file");
+
+        // Verify it created a regular file, not a directory
+        let stat = fs
+            .file_status("/newfile")
+            .expect("Failed to get file status");
+        assert_eq!(stat.file_type, crate::fs::FileType::RegularFile);
+
+        // Test O_DIRECTORY with various access modes
+        let fd = fs
+            .open("/testdir", OFlags::RDWR | OFlags::DIRECTORY, Mode::empty())
+            .expect("Failed to open directory with O_RDWR | O_DIRECTORY");
+        fs.close(fd).expect("Failed to close directory");
+    }
 }
 
 mod tar_ro {
@@ -271,6 +347,46 @@ mod tar_ro {
             .open("bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open dir");
         fs.close(fd).expect("Failed to close dir");
+    }
+
+    #[test]
+    fn o_directory_flag_tests() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+
+        // Test O_DIRECTORY on a directory (should succeed)
+        let fd = fs
+            .open("bar", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+            .expect("Failed to open directory with O_DIRECTORY");
+        fs.close(fd).expect("Failed to close directory");
+
+        // Test O_DIRECTORY on a regular file (should fail)
+        assert!(matches!(
+            fs.open("foo", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::ComponentNotADirectory
+            ))
+        ));
+
+        // Test O_DIRECTORY on non-existent path (should fail)
+        assert!(matches!(
+            fs.open(
+                "nonexistent",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty()
+            ),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::NoSuchFileOrDirectory
+            ))
+        ));
+
+        // Test O_DIRECTORY on nested file (should fail)
+        assert!(matches!(
+            fs.open("bar/baz", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::ComponentNotADirectory
+            ))
+        ));
     }
 }
 
@@ -484,6 +600,90 @@ mod layered {
             Err(crate::fs::errors::OpenError::PathError(
                 crate::fs::errors::PathError::NoSuchFileOrDirectory
             )),
+        ));
+    }
+
+    #[test]
+    fn o_directory_flag_tests() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
+
+        in_mem_fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+        // Create a test directory in the upper layer
+        in_mem_fs
+            .mkdir("/upperdir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .expect("Failed to create directory");
+
+        // Create a test file in the upper layer
+        let fd = in_mem_fs
+            .open("/upperfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        in_mem_fs.close(fd).expect("Failed to close file");
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem_fs,
+            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Test O_DIRECTORY on directory from lower layer (tar)
+        let fd = fs
+            .open("bar", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+            .expect("Failed to open lower layer directory with O_DIRECTORY");
+        fs.close(fd).expect("Failed to close directory");
+
+        // Test O_DIRECTORY on directory from upper layer (in_mem)
+        let fd = fs
+            .open(
+                "/upperdir",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .expect("Failed to open upper layer directory with O_DIRECTORY");
+        fs.close(fd).expect("Failed to close directory");
+
+        // Test O_DIRECTORY on file from lower layer (should fail)
+        assert!(matches!(
+            fs.open("foo", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::ComponentNotADirectory
+            ))
+        ));
+
+        // Test O_DIRECTORY on file from upper layer (should fail)
+        assert!(matches!(
+            fs.open(
+                "/upperfile",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty()
+            ),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::ComponentNotADirectory
+            ))
+        ));
+
+        // Test O_DIRECTORY on nested file from lower layer (should fail)
+        assert!(matches!(
+            fs.open("bar/baz", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::ComponentNotADirectory
+            ))
+        ));
+
+        // Test O_DIRECTORY on non-existent path (should fail)
+        assert!(matches!(
+            fs.open(
+                "nonexistent",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty()
+            ),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::NoSuchFileOrDirectory
+            ))
         ));
     }
 }

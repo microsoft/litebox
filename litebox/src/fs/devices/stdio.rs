@@ -93,50 +93,37 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         flags: OFlags,
         mode: Mode,
     ) -> Result<FileFd<Platform>, OpenError> {
-        let flags = flags - OFlags::NOCTTY; // ignore NOCTTY
+        let open_directory = flags.contains(OFlags::DIRECTORY);
+        let flags = flags - OFlags::DIRECTORY - OFlags::NOCTTY; // ignore NOCTTY
         let path = self.absolute_path(path)?;
-        match path.as_str() {
+        let stream = match path.as_str() {
             "/dev/stdin" => {
-                if flags.contains(OFlags::DIRECTORY) {
-                    return Err(OpenError::PathError(PathError::ComponentNotADirectory));
-                }
                 if flags == OFlags::RDONLY && mode.is_empty() {
-                    Ok(self
-                        .litebox
-                        .descriptor_table_mut()
-                        .insert(StdioStream::Stdin))
+                    StdioStream::Stdin
                 } else {
                     unimplemented!()
                 }
             }
             "/dev/stdout" => {
-                if flags.contains(OFlags::DIRECTORY) {
-                    return Err(OpenError::PathError(PathError::ComponentNotADirectory));
-                }
                 if flags == OFlags::WRONLY && mode.is_empty() {
-                    Ok(self
-                        .litebox
-                        .descriptor_table_mut()
-                        .insert(StdioStream::Stdout))
+                    StdioStream::Stdout
                 } else {
                     unimplemented!()
                 }
             }
             "/dev/stderr" => {
-                if flags.contains(OFlags::DIRECTORY) {
-                    return Err(OpenError::PathError(PathError::ComponentNotADirectory));
-                }
                 if flags == OFlags::WRONLY && mode.is_empty() {
-                    Ok(self
-                        .litebox
-                        .descriptor_table_mut()
-                        .insert(StdioStream::Stderr))
+                    StdioStream::Stderr
                 } else {
                     unimplemented!()
                 }
             }
-            _ => Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
+            _ => return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
+        };
+        if open_directory {
+            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
+        Ok(self.litebox.descriptor_table_mut().insert(stream))
     }
 
     fn close(&self, fd: FileFd<Platform>) -> Result<(), CloseError> {
