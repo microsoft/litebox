@@ -94,7 +94,8 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         mode: Mode,
     ) -> Result<FileFd<Platform>, OpenError> {
         let open_directory = flags.contains(OFlags::DIRECTORY);
-        let flags = flags - OFlags::DIRECTORY - OFlags::NOCTTY; // ignore NOCTTY
+        let nodelay = flags.contains(OFlags::NDELAY);
+        let flags = flags - OFlags::DIRECTORY - OFlags::NDELAY - OFlags::NOCTTY; // ignore NOCTTY
         let path = self.absolute_path(path)?;
         let stream = match path.as_str() {
             "/dev/stdin" => {
@@ -123,6 +124,7 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         if open_directory {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
+        assert!(!nodelay, "NDELAY is not supported for stdio streams");
         Ok(self.litebox.descriptor_table_mut().insert(stream))
     }
 

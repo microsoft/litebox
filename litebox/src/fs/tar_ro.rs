@@ -118,8 +118,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         _mode: Mode,
     ) -> Result<FileFd<Platform>, OpenError> {
         use super::OFlags;
-        let currently_supported_oflags: OFlags =
-            OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR | OFlags::NOCTTY | OFlags::DIRECTORY;
+        let currently_supported_oflags: OFlags = OFlags::RDONLY
+            | OFlags::WRONLY
+            | OFlags::RDWR
+            | OFlags::NOCTTY
+            | OFlags::DIRECTORY
+            | OFlags::NDELAY;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!()
         }
