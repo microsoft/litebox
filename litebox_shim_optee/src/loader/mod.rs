@@ -2,7 +2,7 @@
 
 use litebox_common_optee::UteeParams;
 
-mod elf;
+pub(crate) mod elf;
 mod stack;
 
 pub fn load_elf_buffer(

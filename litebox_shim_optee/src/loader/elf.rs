@@ -224,6 +224,7 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
 
 /// Struct to hold the information needed to start the program
 /// (entry point and user stack top).
+#[derive(Clone, Copy)]
 pub struct ElfLoadInfo {
     pub entry_point: usize,
     pub user_stack_top: usize,

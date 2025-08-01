@@ -12,11 +12,9 @@ pub fn sys_return(ret: usize) -> ! {
         ret
     );
 
-    // TODO: terminate thread for now. This should be replaced with a proper mechanism to switch to
-    // the main event loop inside the runner.
     cfg_if::cfg_if! {
         if #[cfg(feature = "platform_linux_userland")] {
-            litebox_platform_multiplex::platform().terminate_thread(i32::try_from(ret).unwrap_or(0));
+            crate::optee_command_loop();
         } else if #[cfg(feature = "platform_lvbs")] {
             todo!("switch to VTL0");
         } else {

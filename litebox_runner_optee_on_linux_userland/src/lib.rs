@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use litebox_common_optee::{TeeParamType, UteeEntryFunc, UteeParams};
 use litebox_platform_multiplex::Platform;
+use litebox_shim_optee::{add_optee_command, add_session_id_elf_load_info};
 use std::path::PathBuf;
 
 /// Test OP-TEE TAs with LiteBox on unmodified Linux
@@ -84,44 +85,27 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // TODO: obtain these parameters, function ID, and command ID from the command line arguments or
     // some other means (e.g., config file).
     let mut params = UteeParams::new();
+    let loaded_program =
+        litebox_shim_optee::loader::load_elf_buffer(prog_data.as_slice(), &params).unwrap();
+
+    add_session_id_elf_load_info(1, &loaded_program);
+
     params.set_type(0, TeeParamType::None).unwrap();
     params.set_type(1, TeeParamType::None).unwrap();
     params.set_type(2, TeeParamType::None).unwrap();
     params.set_type(3, TeeParamType::None).unwrap();
-    let params = params;
+    add_optee_command(1, UteeEntryFunc::OpenSession, &params, 0);
 
-    let loaded_program =
-        litebox_shim_optee::loader::load_elf_buffer(prog_data.as_slice(), &params).unwrap();
+    params.set_type(0, TeeParamType::ValueInout).unwrap();
+    params.set_values(0, 100, 0).unwrap();
+    add_optee_command(1, UteeEntryFunc::InvokeCommand, &params, 0);
 
-    // TODO: we need an event loop here, because TAs expect repetitive entrances with
-    // different arguments (i.e., different function ID, different command ID, and different `UteeParams`).
-    // session ID is determined by the kernel (this runner in this case).
-    unsafe {
-        jump_to_entry_point(
-            usize::try_from(UteeEntryFunc::OpenSession as u32)
-                .expect("UteeEntryFunc should fit in usize"),
-            1,
-            loaded_program.params_address,
-            0,
-            loaded_program.entry_point,
-            loaded_program.user_stack_top,
-        );
-    }
-}
+    params.set_type(0, TeeParamType::ValueInout).unwrap();
+    params.set_values(0, 200, 0).unwrap();
+    add_optee_command(1, UteeEntryFunc::InvokeCommand, &params, 1);
 
-/// TAs obtain four arguments through CPU registers:
-/// - rdi: function ID
-/// - rsi: session ID
-/// - rdx: the address of parameters
-/// - rcx: command ID
-#[unsafe(naked)]
-unsafe extern "C" fn jump_to_entry_point(
-    func: usize,
-    session_id: usize,
-    params: usize,
-    cmd_id: usize,
-    entry_point: usize,
-    user_stack_top: usize,
-) -> ! {
-    core::arch::naked_asm!("mov rsp, r9", "jmp r8", "hlt");
+    params.set_type(0, TeeParamType::None).unwrap();
+    add_optee_command(1, UteeEntryFunc::CloseSession, &params, 0);
+
+    litebox_shim_optee::optee_command_loop();
 }
