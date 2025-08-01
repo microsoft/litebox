@@ -19,7 +19,7 @@ use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox_common_linux::PunchthroughSyscall;
 
-use windows_sys::Win32::{Foundation as Win32_Foundation};
+use windows_sys::Win32::Foundation as Win32_Foundation;
 use windows_sys::Win32::{
     Foundation::{GetLastError, WIN32_ERROR},
     System::Diagnostics::Debug::{
@@ -164,8 +164,7 @@ unsafe extern "system" fn exception_handler(exception_info: *mut EXCEPTION_POINT
             // Get the saved FS base from the per-thread FS state
             let thread_state = WindowsUserland::get_thread_fs_base_state();
 
-            if current_fsbase == 0 && current_fsbase != thread_state.fs_base
-            {
+            if current_fsbase == 0 && current_fsbase != thread_state.fs_base {
                 // Restore the FS base from the saved state
                 WindowsUserland::restore_thread_fs_base();
 
