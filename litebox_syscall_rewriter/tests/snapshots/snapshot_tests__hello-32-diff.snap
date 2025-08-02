@@ -1,6 +1,7 @@
 ---
 source: litebox_syscall_rewriter/tests/snapshot_tests.rs
 expression: diff
+snapshot_kind: text
 ---
 --- original
 +++ rewritten
@@ -1109,28 +1110,3 @@ expression: diff
   80a719b:	8b 44 24 1c          	mov    0x1c(%esp),%eax
   80a719f:	8b 4c 24 24          	mov    0x24(%esp),%ecx
   80a71a3:	85 c0                	test   %eax,%eax
-@@ -124321,4 +124506,21 @@
-  80ae605:	81 c3 ef 49 03 00    	add    $0x349ef,%ebx
-  80ae60b:	83 c4 08             	add    $0x8,%esp
-  80ae60e:	5b                   	pop    %ebx
-- 80ae60f:	c3                   	ret
-\ No newline at end of file
-+ 80ae60f:	c3                   	ret
-+
-+Disassembly of section .trampolineLB0:
-+
-+080ae610 <.trampolineLB0>:
-+ 80ae610:	4c                   	dec    %esp
-+ 80ae611:	49                   	dec    %ecx
-+ 80ae612:	54                   	push   %esp
-+ 80ae613:	45                   	inc    %ebp
-+ 80ae614:	20 42 4f             	and    %al,0x4f(%edx)
-+ 80ae617:	58                   	pop    %eax
-+ 80ae618:	00 70 0e             	add    %dh,0xe(%eax)
-+ 80ae61b:	08 00                	or     %al,(%eax)
-+ 80ae61d:	00 00                	add    %al,(%eax)
-+ 80ae61f:	00 67 07             	add    %ah,0x7(%edi)
-+ 80ae622:	00 00                	add    %al,(%eax)
-+ 80ae624:	00 00                	add    %al,(%eax)
-+	...
-\ No newline at end of file
