@@ -144,7 +144,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::RDWR
             | OFlags::NOCTTY
             | OFlags::DIRECTORY
-            | OFlags::NDELAY;
+            | OFlags::NONBLOCK;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!()
         }
