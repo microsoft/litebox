@@ -119,7 +119,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     ) -> Result<FileFd<Platform>, OpenError> {
         use super::OFlags;
         let currently_supported_oflags: OFlags =
-            OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR | OFlags::NOCTTY;
+            OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR | OFlags::NOCTTY | OFlags::DIRECTORY;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!()
         }
@@ -145,6 +145,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         assert!(flags.contains(OFlags::RDONLY));
         if entry.filename().as_str().unwrap() == path {
             // it is a file
+            if flags.contains(OFlags::DIRECTORY) {
+                return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+            }
             Ok(self
                 .litebox
                 .descriptor_table_mut()
