@@ -21,7 +21,6 @@ mod syscall_intercept;
 
 extern crate alloc;
 
-// Connector to a shim-exposed syscall-handling interface.
 cfg_if::cfg_if! {
     if #[cfg(feature = "linux_syscall")] {
         use litebox_common_linux::SyscallRequest;
@@ -33,6 +32,7 @@ cfg_if::cfg_if! {
         compile_error!(r##"No syscall handler specified."##);
     }
 }
+/// Connector to a shim-exposed syscall-handling interface.
 pub type SyscallHandler = fn(SyscallRequest<LinuxUserland>) -> SyscallReturnType;
 
 /// The syscall handler passed down from the shim.
@@ -1368,6 +1368,7 @@ unsafe extern "C" {
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
+#[allow(clippy::cast_sign_loss)]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_handler(
     syscall_number: usize,
