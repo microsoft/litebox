@@ -1075,6 +1075,8 @@ pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     pub pid: i32,
     /// Thread ID
     pub tid: i32,
+    /// Parent Process ID
+    pub ppid: i32,
     /// When a thread whose `clear_child_tid` is not `None` terminates, and it shares memory with other threads,
     /// the kernel writes 0 to the address specified by `clear_child_tid` and then executes:
     ///
@@ -1614,6 +1616,7 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         flags: RngFlags,
     },
     Getpid,
+    Getppid,
     Getuid,
     Geteuid,
     Getgid,
@@ -2038,6 +2041,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 }
             }
             Sysno::getpid => SyscallRequest::Getpid,
+            Sysno::getppid => SyscallRequest::Getppid,
             Sysno::getuid => SyscallRequest::Getuid,
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
