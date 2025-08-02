@@ -144,10 +144,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
         assert!(flags.contains(OFlags::RDONLY));
         if entry.filename().as_str().unwrap() == path {
+            // it is a file
             if flags.contains(OFlags::DIRECTORY) {
                 return Err(OpenError::PathError(PathError::ComponentNotADirectory));
             }
-            // it is a file
             Ok(self
                 .litebox
                 .descriptor_table_mut()
