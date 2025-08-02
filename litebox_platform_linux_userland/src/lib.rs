@@ -23,14 +23,17 @@ extern crate alloc;
 
 // Connector to a shim-exposed syscall-handling interface.
 cfg_if::cfg_if! {
-    if #[cfg(all(feature = "linux_syscall", target_os = "linux"))] {
-        pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<LinuxUserland>) -> isize;
-    } else if #[cfg(all(feature = "optee_syscall", target_os = "linux"))] {
-        pub type SyscallHandler = fn(litebox_common_optee::SyscallRequest<LinuxUserland>) -> u32;
+    if #[cfg(feature = "linux_syscall")] {
+        use litebox_common_linux::SyscallRequest;
+        pub type SyscallReturnType = isize;
+    } else if #[cfg(feature = "optee_syscall")] {
+        use litebox_common_optee::SyscallRequest;
+        pub type SyscallReturnType = u32;
     } else {
         compile_error!(r##"No syscall handler specified."##);
     }
 }
+pub type SyscallHandler = fn(SyscallRequest<LinuxUserland>) -> SyscallReturnType;
 
 /// The syscall handler passed down from the shim.
 static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
@@ -1349,68 +1352,42 @@ unsafe extern "C" {
     fn syscall_callback() -> isize;
 }
 
-cfg_if::cfg_if! {
-    if #[cfg(all(feature = "linux_syscall", target_os = "linux"))] {
-        /// Handles Linux syscalls and dispatches them to LiteBox implementations.
-        ///
-        /// # Safety
-        ///
-        /// - The `ctx` pointer must be valid pointer to a `litebox_common_linux::PtRegs` structure.
-        /// - If any syscall argument is a pointer, it must be valid.
-        ///
-        /// # Panics
-        ///
-        /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-        #[unsafe(no_mangle)]
-        unsafe extern "C" fn syscall_handler(
-            syscall_number: usize,
-            ctx: *mut litebox_common_linux::PtRegs,
-        ) -> isize {
-            // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
-            let ctx = unsafe { &mut *ctx };
-            match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
-                Ok(d) => {
-                    let syscall_handler: SyscallHandler = SYSCALL_HANDLER
-                        .read()
-                        .unwrap()
-                        .expect("Should have run `register_syscall_handler` by now");
-                    syscall_handler(d)
-                }
-                Err(err) => err.as_neg() as isize,
-            }
+/// Handles Linux syscalls and dispatches them to LiteBox implementations.
+///
+/// # Safety
+///
+/// - The `ctx` pointer must be valid pointer to a `litebox_common_linux::PtRegs` structure.
+/// - If any syscall argument is a pointer, it must be valid.
+///
+/// # Panics
+///
+/// Unsupported syscalls or arguments would trigger a panic for development purposes.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn syscall_handler(
+    syscall_number: usize,
+    ctx: *mut litebox_common_linux::PtRegs,
+) -> SyscallReturnType {
+    // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
+    let ctx = unsafe { &mut *ctx };
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "linux_syscall")] {
+            let syscall_request = SyscallRequest::try_from_raw(syscall_number, ctx);
+        } else if #[cfg(feature = "optee_syscall")] {
+            let ctx = &litebox_common_optee::SyscallContext::from_pt_regs(ctx);
+            let syscall_request = SyscallRequest::try_from_raw(syscall_number, ctx);
+        } else {
+            compile_error!(r##"No syscall handler specified."##);
         }
-    } else if #[cfg(all(feature = "optee_syscall", target_os = "linux"))] {
-        /// Handles OP-TEE syscalls and dispatches them to LiteBox implementations.
-        ///
-        /// # Safety
-        ///
-        /// - The `ctx` pointer must be valid pointer to a `litebox_common_optee::SyscallContext` structure.
-        /// - If any syscall argument is a pointer, it must be valid.
-        ///
-        /// # Panics
-        ///
-        /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-        #[unsafe(no_mangle)]
-        unsafe extern "C" fn syscall_handler(
-            syscall_number: usize,
-            ctx: *mut litebox_common_linux::PtRegs,
-        ) -> u32 {
-            // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `SyscallContext`.
-            let ctx = unsafe { &mut *ctx };
-            let syscall_ctx = litebox_common_optee::SyscallContext::from_pt_regs(ctx);
-            match litebox_common_optee::SyscallRequest::try_from_raw(syscall_number, &syscall_ctx) {
-                Ok(d) => {
-                    let syscall_handler: SyscallHandler = SYSCALL_HANDLER
-                        .read()
-                        .unwrap()
-                        .expect("Should have run `register_syscall_handler` by now");
-                    syscall_handler(d)
-                }
-                Err(err) => (err.as_neg() as isize).try_into().unwrap(),
-            }
+    }
+    match syscall_request {
+        Ok(d) => {
+            let syscall_handler: SyscallHandler = SYSCALL_HANDLER
+                .read()
+                .unwrap()
+                .expect("Should have run `register_syscall_handler` by now");
+            syscall_handler(d)
         }
-    } else {
-        compile_error!(r##"No syscall handler specified."##);
+        Err(err) => err.as_neg() as SyscallReturnType,
     }
 }
 
