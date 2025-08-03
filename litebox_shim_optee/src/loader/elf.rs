@@ -8,18 +8,12 @@ use elf_loader::{
     object::ElfObject,
 };
 use hashbrown::HashMap;
-use litebox::{
-    mm::linux::{CreatePagesFlags, MappingError},
-    platform::RawConstPointer as _,
-};
+use litebox::{mm::linux::MappingError, platform::RawConstPointer as _};
 use litebox_common_linux::errno::Errno;
-use litebox_common_optee::UteeParams;
 use once_cell::race::OnceBox;
 use thiserror::Error;
 
-use crate::{MutPtr, litebox_page_manager};
-
-use super::stack::UserStack;
+use crate::MutPtr;
 
 /// Data structure to maintain a mapping of fd to in-memory TA ELF files.
 /// This is needed because [`elf_loader`] uses file- or fd-backed `mmap` to load ELF files
@@ -223,23 +217,18 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
 }
 
 /// Struct to hold the information needed to start the program
-/// (entry point and user stack top).
+/// (entry point).
 #[derive(Clone, Copy)]
 pub struct ElfLoadInfo {
     pub entry_point: usize,
-    pub user_stack_top: usize,
-    pub params_address: usize,
 }
 
 /// Loader for ELF files
 pub(super) struct ElfLoader;
 
 impl ElfLoader {
-    // Load an ELF file and prepare the stack for the new process.
-    pub(super) fn load_buffer(
-        elf_buf: &[u8],
-        params: &UteeParams,
-    ) -> Result<ElfLoadInfo, ElfLoaderError> {
+    // Load an ELF file for the new process.
+    pub(super) fn load_buffer(elf_buf: &[u8]) -> Result<ElfLoadInfo, ElfLoaderError> {
         let mut loader = Loader::<ElfLoaderMmap>::new();
 
         let fd_elf_map = fd_elf_map();
@@ -265,44 +254,25 @@ impl ElfLoader {
             .remove(fd)
             .expect("fd_elf_map.remove(fd) should return Some(ElfFileInMemory)");
 
-        let sp = unsafe {
-            let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
-                .expect("DEFAULT_STACK_SIZE is not page-aligned");
-            litebox_page_manager()
-                .create_stack_pages(None, length, CreatePagesFlags::empty())
-                .map_err(ElfLoaderError::MappingError)?
-        };
-        let mut stack = UserStack::new(sp, super::DEFAULT_STACK_SIZE)
-            .ok_or(ElfLoaderError::InvalidStackAddr)?;
-        stack.init(params).ok_or(ElfLoaderError::InvalidStackAddr)?;
-
         #[cfg(debug_assertions)]
         litebox::log_println!(
             litebox_platform_multiplex::platform(),
-            "entry = {:#x}, base = {:#x}, stack = {:#x}",
+            "entry = {:#x}, base = {:#x}",
             entry,
             base,
-            stack.get_cur_stack_top(),
         );
 
-        // For now, we store the input UTEE parameters in the user stack. Another option is
-        // to allocate a dedicated page for the parameters.
-        Ok(ElfLoadInfo {
-            entry_point: entry,
-            user_stack_top: stack.get_cur_stack_top(),
-            params_address: stack.get_cur_stack_top(),
-        })
+        Ok(ElfLoadInfo { entry_point: entry })
     }
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Error, Debug)]
 pub enum ElfLoaderError {
     #[error("failed to open the ELF file: {0}")]
     OpenError(#[from] Errno),
     #[error("failed to load the ELF file: {0}")]
     LoaderError(#[from] elf_loader::Error),
-    #[error("invalid stack")]
-    InvalidStackAddr,
     #[error("failed to mmap: {0}")]
     MappingError(#[from] MappingError),
 }
@@ -312,9 +282,7 @@ impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
         match value {
             ElfLoaderError::OpenError(e) => e,
             ElfLoaderError::LoaderError(_) => litebox_common_linux::errno::Errno::EINVAL,
-            ElfLoaderError::InvalidStackAddr | ElfLoaderError::MappingError(_) => {
-                litebox_common_linux::errno::Errno::ENOMEM
-            }
+            ElfLoaderError::MappingError(_) => litebox_common_linux::errno::Errno::ENOMEM,
         }
     }
 }

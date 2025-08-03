@@ -1,10 +1,6 @@
 The TA binaries included in this directory are subject to the following license terms.
 https://optee.readthedocs.io/en/latest/building/gits/optee_examples/optee_examples.html
 
-
-Unless it has its own copyright/license embedded in its body, each source file
-is subject to the following license terms:
-
 Copyright (c) 2018, Linaro Limited
 All rights reserved.
 

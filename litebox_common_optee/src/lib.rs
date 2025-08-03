@@ -319,13 +319,13 @@ impl UteeParams {
         Ok(())
     }
 
-    pub fn set_values(&mut self, index: usize, value1: u64, value2: u64) -> Result<(), Errno> {
+    pub fn set_values(&mut self, index: usize, value_a: u64, value_b: u64) -> Result<(), Errno> {
         if index >= Self::TEE_NUM_PARAMS {
             return Err(Errno::EINVAL);
         }
         let base_index = index * 2;
-        self.vals[base_index] = value1;
-        self.vals[base_index + 1] = value2;
+        self.vals[base_index] = value_a;
+        self.vals[base_index + 1] = value_b;
         Ok(())
     }
 
