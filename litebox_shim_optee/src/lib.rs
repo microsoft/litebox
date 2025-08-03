@@ -195,6 +195,7 @@ impl OpteeResultQueue {
             .push_back(result);
     }
 
+    #[allow(dead_code)]
     pub fn pop(&self, session_id: u32) -> Option<usize> {
         self.inner
             .lock()
@@ -241,9 +242,7 @@ pub fn submit_optee_command(
 /// from the queue.
 /// # Panics
 /// This function panics if it cannot allocate a stack
-pub fn optee_command_loop() -> ! {
-    let session_id = 1; // For now, we only support a single session ID (1).
-
+pub fn optee_command_loop_entry(session_id: u32) -> ! {
     if let Some(cmd) = optee_command_submission_queue().pop(session_id) {
         let elf_load_info = session_id_elf_load_info_map().get(session_id);
         let Some(elf_load_info) = elf_load_info else {
@@ -253,9 +252,10 @@ pub fn optee_command_loop() -> ! {
         // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
         // loaded binary and heap. In that sense, we can create (and destroy) a stack
         // for each command freely.
-        let mut stack = crate::loader::ta_stack::allocate_stack().unwrap_or_else(|| {
-            panic!("Failed to allocate stack for session ID: {}", session_id);
-        });
+        let mut stack = crate::loader::ta_stack::allocate_stack(Some(elf_load_info.stack_base))
+            .unwrap_or_else(|| {
+                panic!("Failed to allocate stack for session ID: {}", session_id);
+            });
         stack
             .init(cmd.params.as_slice())
             .expect("Failed to initialize stack with parameters");
@@ -273,49 +273,6 @@ pub fn optee_command_loop() -> ! {
             );
         }
     } else {
-        while let Some(result) = optee_command_completion_queue().pop(session_id) {
-            let params = unsafe { &*(result as *const UteeParams) };
-            for idx in 0..UteeParams::TEE_NUM_PARAMS {
-                let param_type = params.get_type(idx).expect("Failed to get parameter type");
-                match param_type {
-                    TeeParamType::ValueOutput | TeeParamType::ValueInout => {
-                        if let Ok(Some((value_a, value_b))) = params.get_values(idx) {
-                            #[cfg(debug_assertions)]
-                            litebox::log_println!(
-                                litebox_platform_multiplex::platform(),
-                                "output (index: {}): {:#x} {:#x}",
-                                idx,
-                                value_a,
-                                value_b,
-                            );
-                            // TODO: return the outcome
-                        }
-                    }
-                    TeeParamType::MemrefOutput | TeeParamType::MemrefInout => {
-                        if let Ok(Some((addr, len))) = params.get_values(idx) {
-                            let slice = unsafe {
-                                &*core::ptr::slice_from_raw_parts(
-                                    addr as *const u8,
-                                    usize::try_from(len).unwrap_or(0),
-                                )
-                            };
-                            #[cfg(debug_assertions)]
-                            litebox::log_println!(
-                                litebox_platform_multiplex::platform(),
-                                "output (index: {}): {:#x} {:?}",
-                                idx,
-                                addr,
-                                slice,
-                            );
-                            // TODO: return the outcome
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // deallocate the stack here?
-        }
-
         // no command left. terminate the thread for now (or sleep until next command comes)
         session_id_elf_load_info_map().remove(session_id);
         optee_command_submission_queue().remove(session_id);
@@ -339,4 +296,56 @@ unsafe extern "C" fn jump_to_entry_point(
     user_stack_top: usize,
 ) -> ! {
     core::arch::naked_asm!("mov rsp, r9", "jmp r8", "hlt");
+}
+
+/// A function to retrieve the results of the OP-TEE TA command execution and
+/// re-enter the command loop to handle the next command if exists.
+/// This function is expected to be called by `sys_return` once the TA has
+/// processed a command.
+#[allow(dead_code)]
+pub(crate) fn optee_command_loop_return(session_id: u32) -> ! {
+    // TA stores results in the `UteeParams` structure and/or buffers it refers to.
+    while let Some(param_addr) = optee_command_completion_queue().pop(session_id) {
+        let params = unsafe { &*(param_addr as *const UteeParams) };
+        for idx in 0..UteeParams::TEE_NUM_PARAMS {
+            let param_type = params.get_type(idx).expect("Failed to get parameter type");
+            match param_type {
+                TeeParamType::ValueOutput | TeeParamType::ValueInout => {
+                    if let Ok(Some((value_a, value_b))) = params.get_values(idx) {
+                        #[cfg(debug_assertions)]
+                        litebox::log_println!(
+                            litebox_platform_multiplex::platform(),
+                            "output (index: {}): {:#x} {:#x}",
+                            idx,
+                            value_a,
+                            value_b,
+                        );
+                        // TODO: return the outcome
+                    }
+                }
+                TeeParamType::MemrefOutput | TeeParamType::MemrefInout => {
+                    if let Ok(Some((addr, len))) = params.get_values(idx) {
+                        let slice = unsafe {
+                            &*core::ptr::slice_from_raw_parts(
+                                addr as *const u8,
+                                usize::try_from(len).unwrap_or(0),
+                            )
+                        };
+                        #[cfg(debug_assertions)]
+                        litebox::log_println!(
+                            litebox_platform_multiplex::platform(),
+                            "output (index: {}): {:#x} {:?}",
+                            idx,
+                            addr,
+                            slice,
+                        );
+                        // TODO: return the outcome
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    optee_command_loop_entry(session_id)
 }

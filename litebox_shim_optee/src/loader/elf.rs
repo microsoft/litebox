@@ -221,6 +221,7 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
 #[derive(Clone, Copy)]
 pub struct ElfLoadInfo {
     pub entry_point: usize,
+    pub stack_base: usize,
 }
 
 /// Loader for ELF files
@@ -254,15 +255,23 @@ impl ElfLoader {
             .remove(fd)
             .expect("fd_elf_map.remove(fd) should return Some(ElfFileInMemory)");
 
+        let stack = crate::loader::ta_stack::allocate_stack(None).unwrap_or_else(|| {
+            panic!("Failed to allocate stack");
+        });
+
         #[cfg(debug_assertions)]
         litebox::log_println!(
             litebox_platform_multiplex::platform(),
-            "entry = {:#x}, base = {:#x}",
+            "entry = {:#x}, base = {:#x}, stack_base = {:#x}",
             entry,
             base,
+            stack.get_stack_base()
         );
 
-        Ok(ElfLoadInfo { entry_point: entry })
+        Ok(ElfLoadInfo {
+            entry_point: entry,
+            stack_base: stack.get_stack_base(),
+        })
     }
 }
 

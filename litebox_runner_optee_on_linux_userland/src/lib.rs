@@ -1,9 +1,11 @@
 use anyhow::Result;
 use clap::Parser;
+use litebox::platform::ThreadLocalStorageProvider;
 use litebox_common_optee::{TeeParamType, UteeEntryFunc};
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::{
-    UteeParamsTyped, register_session_id_elf_load_info, submit_optee_command,
+    UteeParamsTyped, optee_command_loop_entry, register_session_id_elf_load_info,
+    submit_optee_command,
 };
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -97,11 +99,18 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let loaded_program = litebox_shim_optee::loader::load_elf_buffer(prog_data.as_slice()).unwrap();
 
-    // Currently, this runner only supports a single TA session.
-    let session_id = 1;
+    // Currently, this runner supports a single TA session. Also, for simplicity,
+    // it uses tid stored in LiteBox's TLS as the session ID.
+    let tid = litebox_platform_multiplex::platform()
+        .with_thread_local_storage_mut(|tls| tls.current_task.tid);
+    #[allow(clippy::cast_sign_loss)]
+    let session_id = tid as u32;
+
+    // we can use TLS instead of this global data structure.
     register_session_id_elf_load_info(session_id, loaded_program);
+
     populate_optee_command_queue(session_id, &ta_commands);
-    litebox_shim_optee::optee_command_loop();
+    optee_command_loop_entry(session_id);
 }
 
 /// OP-TEE/TA message command (base64 encoded). It consists of a function ID,

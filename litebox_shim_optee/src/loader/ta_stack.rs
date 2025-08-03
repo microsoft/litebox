@@ -86,6 +86,10 @@ impl TaStack {
         self.stack_top.as_usize() + self.pos
     }
 
+    pub(crate) fn get_stack_base(&self) -> usize {
+        self.stack_top.as_usize()
+    }
+
     /// Get the address of `UteeParams` on the stack.
     pub(crate) fn get_params_address(&self) -> usize {
         self.stack_top.as_usize() + self.len - core::mem::size_of::<UteeParams>()
@@ -247,13 +251,24 @@ impl TaStack {
     }
 }
 
-pub(crate) fn allocate_stack() -> Option<TaStack> {
-    let sp = unsafe {
-        let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
-            .expect("DEFAULT_STACK_SIZE is not page-aligned");
-        litebox_page_manager()
-            .create_stack_pages(None, length, CreatePagesFlags::empty())
-            .ok()?
+/// Allocate stack pages for a TA session. if `sp` is `Some`, it re-uses the allocated stack pages.
+///
+/// # Safety
+/// The caller must ensure that `sp` is a valid stack pointer and is not concurrently used.
+/// Normally, `sp` should be the return value of this function's previous call (with `None`).
+pub(crate) fn allocate_stack(stack_base: Option<usize>) -> Option<TaStack> {
+    let sp = if let Some(stack_base) = stack_base {
+        MutPtr {
+            inner: stack_base as *mut u8,
+        }
+    } else {
+        unsafe {
+            let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
+                .expect("DEFAULT_STACK_SIZE is not page-aligned");
+            litebox_page_manager()
+                .create_stack_pages(None, length, CreatePagesFlags::empty())
+                .ok()?
+        }
     };
     let stack = TaStack::new(sp, super::DEFAULT_STACK_SIZE)?;
 
