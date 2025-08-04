@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
 
+use litebox::path::Arg;
+mod common;
+
 const HELLO_WORLD_C: &str = r#"
 #include <stdio.h>
 
@@ -43,6 +46,50 @@ fn compile(source: &str, unique_name: &str, exec_or_lib: bool) -> PathBuf {
 enum Backend {
     Rewriter,
     Seccomp,
+}
+
+#[test]
+fn test_static_linked_prog_with_rewriter() {
+    println!("Running statically linked binary + rewriter test...");
+    // Use the already compiled executable from the tests folder (same dir as this file)
+    let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    test_dir.push("tests");
+
+    let prog_name = "hello_world_static";
+    let prog_name_hooked = format!("{}.hooked", prog_name);
+
+    let path = test_dir.join(prog_name);
+    let hooked_path = test_dir.join(&prog_name_hooked);
+
+    // rewrite the binary
+    let _ = std::fs::remove_file(hooked_path.clone());
+    println!("Running `cargo run -p litebox_syscall_rewriter -- -o {} {}`",
+                hooked_path.to_str().unwrap(),
+                path.to_str().unwrap());
+    let output = std::process::Command::new("cargo")
+        .args([
+            "run",
+            "-p",
+            "litebox_syscall_rewriter",
+            "--",
+            path.to_str().unwrap(),
+            "-o",
+            hooked_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run syscall rewriter");
+    assert!(
+        output.status.success(),
+        "failed to run syscall rewriter {:?}",
+        std::str::from_utf8(output.stderr.as_slice()).unwrap()
+    );
+
+    let executable_path = format!("/{}", prog_name_hooked);
+    let executable_data = std::fs::read(hooked_path).unwrap();
+
+    common::init_platform(&[], &[], &[], None, false);
+    common::install_file(executable_data, &executable_path);
+    common::test_load_exec_common(&executable_path);
 }
 
 #[allow(clippy::too_many_lines)]
