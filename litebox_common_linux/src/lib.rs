@@ -623,7 +623,7 @@ cfg_if::cfg_if! {
     }
 }
 
-/// timespec from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/include/uapi/linux/time.h#L11)
+/// timespec from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/include/uapi/linux/time_types.h#L7)
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq)]
 #[repr(C)]
 pub struct Timespec {
