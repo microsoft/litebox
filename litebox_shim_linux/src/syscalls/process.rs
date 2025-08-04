@@ -644,6 +644,7 @@ mod tests {
                 core::arch::asm!("mov {0}, fs:0", out(reg_byte) fs_0);
             }
 
+            // Verify that the TLS value is initialized to its correct value (`1`).
             assert_eq!(
                 fs_0, 0x1,
                 "TLS value from FS base should match the initialized value"
