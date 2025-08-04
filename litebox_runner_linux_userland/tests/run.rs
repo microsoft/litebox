@@ -134,14 +134,9 @@ fn test_runner_with_dynamic_lib(
     }
     install_files(tar_dir.join("out"));
 
-    #[cfg(target_arch = "x86_64")]
-    let target = "--target=x86_64-unknown-linux-musl";
-    #[cfg(target_arch = "x86")]
-    let target = "--target=i686-unknown-linux-musl";
-
     // build litebox_runner_linux_userland to get the latest `litebox_rtld_audit.so`
     let output = std::process::Command::new("cargo")
-        .args(["build", "-p", "litebox_runner_linux_userland", target])
+        .args(["build", "-p", "litebox_runner_linux_userland"])
         .output()
         .expect("Failed to build litebox_runner_linux_userland");
     assert!(
@@ -199,7 +194,6 @@ fn test_runner_with_dynamic_lib(
         "run",
         "-p",
         "litebox_runner_linux_userland",
-        target,
         "--",
         "--unstable",
         "--interception-backend",
