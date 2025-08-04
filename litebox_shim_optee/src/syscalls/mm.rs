@@ -1,11 +1,6 @@
 //! Implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
 
-use litebox::{
-    mm::linux::{
-        CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmemUnmapError,
-    },
-    platform::{RawConstPointer, page_mgmt::DeallocationError},
-};
+use litebox::mm::linux::{MappingError, PAGE_SIZE};
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 
 use crate::{MutPtr, litebox_page_manager};
@@ -25,54 +20,7 @@ fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
 }
 
-fn do_mmap(
-    suggested_addr: Option<usize>,
-    len: usize,
-    prot: ProtFlags,
-    flags: MapFlags,
-    ensure_space_after: bool,
-    op: impl FnOnce(MutPtr<u8>) -> Result<usize, MappingError>,
-) -> Result<MutPtr<u8>, MappingError> {
-    let flags = {
-        let mut create_flags = CreatePagesFlags::empty();
-        create_flags.set(
-            CreatePagesFlags::FIXED_ADDR,
-            flags.contains(MapFlags::MAP_FIXED),
-        );
-        create_flags.set(
-            CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-            flags.contains(MapFlags::MAP_POPULATE),
-        );
-        create_flags.set(CreatePagesFlags::ENSURE_SPACE_AFTER, ensure_space_after);
-        create_flags.set(
-            CreatePagesFlags::MAP_FILE,
-            !flags.contains(MapFlags::MAP_ANONYMOUS),
-        );
-        create_flags
-    };
-    let suggested_addr = match suggested_addr {
-        Some(addr) => Some(NonZeroAddress::new(addr).ok_or(MappingError::UnAligned)?),
-        None => None,
-    };
-    let length = NonZeroPageSize::new(len).ok_or(MappingError::UnAligned)?;
-    let pm = litebox_page_manager();
-    match prot {
-        ProtFlags::PROT_READ_EXEC => unsafe {
-            pm.create_executable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_READ_WRITE => unsafe {
-            pm.create_writable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_READ => unsafe {
-            pm.create_readable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_NONE => unsafe {
-            pm.create_inaccessible_pages(suggested_addr, length, flags, op)
-        },
-        _ => todo!("Unsupported prot flags {:?}", prot),
-    }
-}
-
+#[inline]
 fn do_mmap_anonymous(
     suggested_addr: Option<usize>,
     len: usize,
@@ -80,7 +28,15 @@ fn do_mmap_anonymous(
     flags: MapFlags,
 ) -> Result<MutPtr<u8>, MappingError> {
     let op = |_| Ok(0);
-    do_mmap(suggested_addr, len, prot, flags, false, op)
+    litebox_common_linux::mm::do_mmap(
+        litebox_page_manager(),
+        suggested_addr,
+        len,
+        prot,
+        flags,
+        false,
+        op,
+    )
 }
 
 /// Handle syscall `mmap`
@@ -137,51 +93,17 @@ pub(crate) fn sys_mmap(
 /// Handle syscall `munmap`
 #[expect(dead_code)]
 pub(crate) fn sys_munmap(addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
-    if addr.as_usize() & !PAGE_MASK != 0 {
-        return Err(Errno::EINVAL);
-    }
-    if len == 0 {
-        return Err(Errno::EINVAL);
-    }
-    let aligned_len = align_up(len, PAGE_SIZE);
-    if addr.as_usize().checked_add(aligned_len).is_none() {
-        return Err(Errno::EINVAL);
-    }
-
     let pm = litebox_page_manager();
-    match unsafe { pm.remove_pages(addr, aligned_len) } {
-        Err(VmemUnmapError::UnAligned) => Err(Errno::EINVAL),
-        Err(VmemUnmapError::UnmapError(e)) => match e {
-            DeallocationError::Unaligned => Err(Errno::EINVAL),
-            // It is not an error if the indicated range does not contain any mapped pages.
-            DeallocationError::AlreadyUnallocated => Ok(()),
-            _ => unimplemented!(),
-        },
-        Ok(()) => Ok(()),
-    }
+    litebox_common_linux::mm::sys_munmap(pm, addr, len)
 }
 
 /// Handle syscall `mprotect`
+#[inline]
 pub(crate) fn sys_mprotect(
     addr: crate::MutPtr<u8>,
     len: usize,
     prot: ProtFlags,
 ) -> Result<(), Errno> {
-    if addr.as_usize() & !PAGE_MASK != 0 {
-        return Err(Errno::EINVAL);
-    }
-    if len == 0 {
-        return Ok(());
-    }
-
     let pm = litebox_page_manager();
-    match prot {
-        ProtFlags::PROT_READ_EXEC => unsafe { pm.make_pages_executable(addr, len) },
-        ProtFlags::PROT_READ_WRITE => unsafe { pm.make_pages_writable(addr, len) },
-        ProtFlags::PROT_READ => unsafe { pm.make_pages_readable(addr, len) },
-        ProtFlags::PROT_NONE => unsafe { pm.make_pages_inaccessible(addr, len) },
-        ProtFlags::PROT_READ_WRITE_EXEC => unsafe { pm.make_pages_rwx(addr, len) },
-        _ => todo!("Unsupported prot flags {:?}", prot),
-    }
-    .map_err(Errno::from)
+    litebox_common_linux::mm::sys_mprotect(pm, addr, len, prot)
 }
