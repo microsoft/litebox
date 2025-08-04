@@ -1,21 +1,21 @@
 [
   {
-    "func_id": 0,
+    "func_id": "open_session",
     "cmd_id": 0,
     "args": []
   },
   {
-    "func_id": 2,
+    "func_id": "invoke_command",
     "cmd_id": 0,
     "args": [
       {
-        "param_type": 6,
+        "param_type": "memref_output",
         "buffer_size": 64
       }
     ]
   },
   {
-    "func_id": 1,
+    "func_id": "close_session",
     "cmd_id": 0,
     "args": []
   }

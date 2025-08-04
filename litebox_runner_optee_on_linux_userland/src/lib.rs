@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use litebox::platform::ThreadLocalStorageProvider;
-use litebox_common_optee::{TeeParamType, UteeEntryFunc};
+use litebox_common_optee::UteeEntryFunc;
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::{
     UteeParamsTyped, optee_command_loop_entry, register_session_id_elf_load_info,
@@ -118,7 +118,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 /// JSON-formatted input files.
 #[derive(Debug, Deserialize)]
 struct TaCommandBase64 {
-    func_id: u32,
+    func_id: String,
     cmd_id: u32,
     args: Vec<TaCommandParamsBase64>,
 }
@@ -130,21 +130,21 @@ struct TaCommandBase64 {
 #[serde(untagged)]
 enum TaCommandParamsBase64 {
     Value {
-        param_type: u8,
+        param_type: String,
         value_a: u64,
         value_b: u64,
     },
     MemrefInput {
-        param_type: u8,
+        param_type: String,
         data_base64: String,
     },
     MemrefInout {
-        param_type: u8,
+        param_type: String,
         data_base64: String,
         buffer_size: u64,
     },
     MemrefOutput {
-        param_type: u8,
+        param_type: String,
         buffer_size: u64,
     },
 }
@@ -156,30 +156,23 @@ impl TaCommandParamsBase64 {
                 param_type,
                 value_a,
                 value_b,
-            } => {
-                let param_type = TeeParamType::try_from(*param_type).expect("Invalid param type");
-                match param_type {
-                    TeeParamType::ValueInput => UteeParamsTyped::ValueInput {
-                        value_a: *value_a,
-                        value_b: *value_b,
-                    },
-                    TeeParamType::ValueInout => UteeParamsTyped::ValueInout {
-                        value_a: *value_a,
-                        value_b: *value_b,
-                    },
-                    TeeParamType::ValueOutput => UteeParamsTyped::ValueOutput {},
-                    _ => panic!("Invalid param type"),
-                }
-            }
+            } => match param_type.as_str() {
+                "value_input" => UteeParamsTyped::ValueInput {
+                    value_a: *value_a,
+                    value_b: *value_b,
+                },
+                "value_output" => UteeParamsTyped::ValueOutput {},
+                "value_inout" => UteeParamsTyped::ValueInout {
+                    value_a: *value_a,
+                    value_b: *value_b,
+                },
+                _ => panic!("Invalid param type"),
+            },
             TaCommandParamsBase64::MemrefInput {
                 param_type,
                 data_base64,
             } => {
-                let param_type = TeeParamType::try_from(*param_type).expect("Invalid param type");
-                assert!(
-                    !(param_type != TeeParamType::MemrefInput),
-                    "Invalid param type"
-                );
+                assert!(param_type.as_str() == "memref_input", "Invalid param type");
                 let decoded_data = Self::decode_base64(data_base64);
                 UteeParamsTyped::MemrefInput { data: decoded_data }
             }
@@ -188,11 +181,7 @@ impl TaCommandParamsBase64 {
                 data_base64,
                 buffer_size,
             } => {
-                let param_type = TeeParamType::try_from(*param_type).expect("Invalid param type");
-                assert!(
-                    !(param_type != TeeParamType::MemrefInout),
-                    "Invalid param type"
-                );
+                assert!(param_type.as_str() == "memref_inout", "Invalid param type");
                 let decoded_data = Self::decode_base64(data_base64);
                 assert!(
                     (*buffer_size >= u64::try_from(decoded_data.len()).unwrap()),
@@ -207,12 +196,7 @@ impl TaCommandParamsBase64 {
                 param_type,
                 buffer_size,
             } => {
-                let param_type = TeeParamType::try_from(*param_type).expect("Invalid param type");
-                assert!(
-                    !(param_type != TeeParamType::MemrefOutput),
-                    "Invalid param type"
-                );
-
+                assert!(param_type.as_str() == "memref_output", "Invalid param type");
                 UteeParamsTyped::MemrefOutput {
                     buffer_size: usize::try_from(*buffer_size).unwrap(),
                 }
@@ -250,11 +234,13 @@ fn populate_optee_command_queue(session_id: u32, ta_commands: &[TaCommandBase64]
             *param = UteeParamsTyped::None;
         }
 
-        submit_optee_command(
-            session_id,
-            UteeEntryFunc::try_from(ta_command.func_id).expect("Invalid function ID"),
-            params,
-            ta_command.cmd_id,
-        );
+        let func_id = match ta_command.func_id.as_str() {
+            "open_session" => UteeEntryFunc::OpenSession,
+            "close_session" => UteeEntryFunc::CloseSession,
+            "invoke_command" => UteeEntryFunc::InvokeCommand,
+            _ => panic!("Unknown function ID: {}", ta_command.func_id),
+        };
+
+        submit_optee_command(session_id, func_id, params, ta_command.cmd_id);
     }
 }
