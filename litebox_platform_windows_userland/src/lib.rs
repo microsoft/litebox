@@ -8,7 +8,6 @@ use core::panic;
 use core::sync::atomic::{AtomicU32, AtomicUsize};
 use core::time::Duration;
 use std::cell::Cell;
-use std::cell::Cell;
 use std::os::raw::c_void;
 use std::sync::atomic::Ordering::SeqCst;
 
