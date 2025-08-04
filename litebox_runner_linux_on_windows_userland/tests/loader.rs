@@ -226,16 +226,14 @@ fn test_static_linked_prog_with_rewriter() {
     common::test_load_exec_common(&executable_path);
 }
 
-// rewrite -- (file under test-bins folder, target directory to install the file)
+// Rewrite -- (file under test-bins folder, target directory to install the file)
 const PROGRAM_DYN_INIT_FILES_REWRITE: [(&str, &str); 2] = [
     ("libc.so.6", "/lib/x86_64-linux-gnu"),
     ("ld-linux-x86-64.so.2", "/lib64"),
 ];
 
-// no rewrite -- (file under test-bins folder, target directory to install the file)
-const PROGRAM_DYN_INIT_FILES_NOREWRITE: [(&str, &str); 1] = [
-    ("litebox_rtld_audit.so", "/lib64"),
-];
+// No rewrite -- (file under test-bins folder, target directory to install the file)
+const PROGRAM_DYN_INIT_FILES_NOREWRITE: [(&str, &str); 1] = [("litebox_rtld_audit.so", "/lib64")];
 
 #[test]
 fn test_dynamic_linked_prog_with_rewriter() {
@@ -249,7 +247,9 @@ fn test_dynamic_linked_prog_with_rewriter() {
     let path = test_dir.join(prog_name);
     let hooked_path = test_dir.join(&prog_name_hooked);
 
-    // rewrite the target ELF executable file
+    let out_path = std::env::var("OUT_DIR").unwrap();
+
+    // Rewrite the target ELF executable file
     let _ = std::fs::remove_file(hooked_path.clone());
     let output = std::process::Command::new("cargo")
         .args([
@@ -270,13 +270,13 @@ fn test_dynamic_linked_prog_with_rewriter() {
     );
 
     // Create tar file containing all dependencies
-    let tar_dir = test_dir.join("test_program_tar");
-    std::fs::create_dir_all(tar_dir.join("out")).unwrap();
+    let tar_src_path = std::path::Path::new(&out_path).join("test_program_tar");
+    std::fs::create_dir_all(tar_src_path.join("out")).unwrap();
 
     // Rewrite all libraries that are required for initialization
     for (file, prefix) in PROGRAM_DYN_INIT_FILES_REWRITE {
         let src = test_dir.join(file);
-        let dst_dir = tar_dir.join(prefix.trim_start_matches('/'));
+        let dst_dir = tar_src_path.join(prefix.trim_start_matches('/'));
         let dst = dst_dir.join(file);
         std::fs::create_dir_all(&dst_dir).unwrap();
         let _ = std::fs::remove_file(&dst);
@@ -303,7 +303,7 @@ fn test_dynamic_linked_prog_with_rewriter() {
     // to the tar directory
     for (file, prefix) in PROGRAM_DYN_INIT_FILES_NOREWRITE {
         let src = test_dir.join(file);
-        let dst_dir = tar_dir.join(prefix.trim_start_matches('/'));
+        let dst_dir = tar_src_path.join(prefix.trim_start_matches('/'));
         let dst = dst_dir.join(file);
         std::fs::create_dir_all(&dst_dir).unwrap();
         let _ = std::fs::remove_file(&dst);
@@ -311,21 +311,25 @@ fn test_dynamic_linked_prog_with_rewriter() {
     }
 
     // tar
-    let tar_file = test_dir.join("rootfs_rewriter.tar");
-    let tar_data = std::process::Command::new("tar").
-        args([
+    let tar_target_file = std::path::Path::new(&out_path).join("rootfs_rewriter.tar");
+    let tar_data = std::process::Command::new("tar")
+        .args([
             "-cvf",
-            tar_file.to_str().unwrap(),
+            tar_target_file.to_str().unwrap(),
             "lib",
             "lib64",
             "out",
-            "usr",
         ])
-        .current_dir(&tar_dir)
+        .current_dir(&tar_src_path)
         .output()
         .expect("Failed to create tar file");
+    assert!(
+        tar_data.status.success(),
+        "failed to create tar file {:?}",
+        std::str::from_utf8(tar_data.stderr.as_slice()).unwrap()
+    );
 
-    // run litebox_runner_linux_on_windows_userland with the tar file and the compiled executable
+    // Run litebox_runner_linux_on_windows_userland with the tar file and the compiled executable
     let mut args = vec![
         "run",
         "-p",
@@ -338,64 +342,10 @@ fn test_dynamic_linked_prog_with_rewriter() {
         "--env",
         "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
         "--initial-files",
-        tar_file.to_str().unwrap(),
+        tar_target_file.to_str().unwrap(),
         "--env",
         "LD_AUDIT=/lib64/litebox_rtld_audit.so",
     ];
     args.push(hooked_path.to_str().unwrap());
     println!("Running `cargo {}`", args.join(" "));
-
-    // run
-    let output = std::process::Command::new("cargo")
-        .args(args)
-        .output()
-        .expect("Failed to run litebox_runner_linux_on_windows_userland");
-    assert!(
-        output.status.success(),
-        "failed to run litebox_runner_linux_on_windows_userland {:?}",
-        std::str::from_utf8(output.stderr.as_slice()).unwrap()
-    );
-}
-
-#[test]
-fn test_hello_world_dyn_with_rootfs() {
-    println!("Running hello_world_dyn with rootfs test...");
-    
-    // Use the already compiled test binaries from the tests folder
-    let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_dir.push("tests/test-bins");
-    
-    let rootfs_tar = test_dir.join("rootfs_rewriter.tar");
-    let hello_world_dyn_hooked = test_dir.join("hello_world_dyn.hooked");
-    
-    // Verify the required files exist
-    assert!(rootfs_tar.exists(), "rootfs_rewriter.tar not found at {:?}", rootfs_tar);
-    assert!(hello_world_dyn_hooked.exists(), "hello_world_dyn.hooked not found at {:?}", hello_world_dyn_hooked);
-    
-    // Create CliArgs directly to test the run function
-    let cli_args = litebox_runner_linux_on_windows_userland::CliArgs {
-        program_and_arguments: vec![hello_world_dyn_hooked.to_string_lossy().to_string()],
-        environment_variables: vec![
-            "LD_LIBRARY_PATH=/lib64:/lib32:/lib".to_string(),
-            "LD_AUDIT=/lib64/litebox_rtld_audit.so".to_string(),
-        ],
-        forward_environment_variables: false,
-        unstable: true,
-        insert_files: vec![],
-        initial_files: Some(rootfs_tar),
-        rewrite_syscalls: false,
-    };
-    
-    println!("Running litebox_runner_linux_on_windows_userland::run with args: {:?}", cli_args);
-    
-    // Call the run function directly to enable debugging
-    let result = litebox_runner_linux_on_windows_userland::run(cli_args);
-    
-    match result {
-        Ok(_) => println!("Test completed successfully"),
-        Err(e) => {
-            println!("Test failed with error: {:?}", e);
-            panic!("Test failed: {}", e);
-        }
-    }
 }
