@@ -26,8 +26,12 @@ bitflags::bitflags! {
 /// platform has only one canonical alignment.
 pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// The lower bound (inclusive) for virtual addresses that can be allocated for task memory.
+    ///
+    /// Note it must be aligned to `ALIGN`.
     const TASK_ADDR_MIN: usize;
     /// The upper bound (exclusive) for virtual addresses that can be allocated for task memory.
+    ///
+    /// Note it must be aligned to `ALIGN`.
     const TASK_ADDR_MAX: usize;
 
     /// Allocates new memory pages at the specified `suggested_range` with the given `initial_permissions`.
