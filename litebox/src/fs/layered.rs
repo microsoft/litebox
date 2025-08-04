@@ -374,6 +374,13 @@ impl<
             unimplemented!()
         }
         let path = self.absolute_path(path)?;
+        if flags.contains(OFlags::CREAT) {
+            // We must first attempt to open the file _without_ creating it, and only if that fails,
+            // do we fall-through and end up creating it (which will happen on the upper layer).
+            if let Ok(fd) = self.open(path.as_str(), flags - OFlags::CREAT, mode) {
+                return Ok(fd);
+            }
+        }
         let mut tombstone_removal = false;
         // If we already have an entry saying it is a tombstone, then we need to quit out early;
         // otherwise, we'll check the levels.

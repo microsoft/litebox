@@ -686,6 +686,35 @@ mod layered {
             ))
         ));
     }
+
+    #[test]
+    // Regression test for #250: a file that already exists in the lower layer should not be
+    // shadowed by an attempt to create a file.
+    fn file_create_exist_in_lower() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
+        in_mem_fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem_fs,
+            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+        let fd = fs
+            .open("foo", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+            .expect("Failed to open file");
+        let mut buffer = vec![0; 4];
+
+        // The file exists, and is readable
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
+        assert_eq!(&buffer[..bytes_read], b"test");
+    }
 }
 
 mod stdio {
