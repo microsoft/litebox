@@ -20,7 +20,6 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
-      - run: sudo apt update && sudo apt install -y musl-tools
       - name: Use Node.js
         uses: actions/setup-node@v4
       - name: "Ratchet: ensure number of 'transmute's in codebase is not increasing"
@@ -33,7 +32,7 @@ jobs:
           fi
       - name: Set up Rust
         run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-unknown-linux-gnu
       - name: Set up Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
@@ -63,10 +62,10 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
-      - run: sudo apt update && sudo apt install -y gcc-multilib musl-tools
+      - run: sudo apt update && sudo apt install -y gcc-multilib
       - name: Set up Rust
         run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target i686-unknown-linux-gnu,i686-unknown-linux-musl
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target i686-unknown-linux-gnu
       - name: Set up Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
@@ -90,7 +89,6 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
-      - run: sudo apt update && sudo apt install -y musl-tools
       - name: Set up Rust
         run: |
           RUST_CHANNEL=$(awk -F'"' '/channel/{print $2}' litebox_runner_lvbs/rust-toolchain.toml)
@@ -98,7 +96,6 @@ jobs:
           rustup component add rust-src --toolchain ${RUST_CHANNEL}-x86_64-unknown-linux-gnu
           rustup default ${RUST_CHANNEL}
           rustup override set ${RUST_CHANNEL}
-          rustup target add x86_64-unknown-linux-musl
           rustup show
       - name: Set up Nextest
         run: |
