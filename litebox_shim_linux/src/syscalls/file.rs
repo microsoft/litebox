@@ -77,7 +77,7 @@ pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, 
         _ => None,
     };
     litebox_fs()
-        .open(path, flags, mode)
+        .open(path, flags - OFlags::CLOEXEC, mode)
         .map(|file| {
             let file = if let Some(typ) = stdio_typ {
                 Descriptor::Stdio(crate::stdio::StdioFile::new(typ, file, flags))

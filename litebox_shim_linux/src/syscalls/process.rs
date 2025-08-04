@@ -524,6 +524,8 @@ mod tests {
         sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize())).expect("Failed to restore FS base");
     }
 
+    // Initialize a static TLS area with value `1`. This value is later on used to verify that
+    // the TLS is set up correctly.
     static mut TLS: [u8; PAGE_SIZE] = [1; PAGE_SIZE];
     static mut CHILD_TID: i32 = 0;
 
@@ -636,19 +638,16 @@ mod tests {
                 );
             }
 
-            // For Windows: check the TLS value from FS base
-            #[cfg(target_os = "windows")]
-            {
-                let mut fs_0: u8;
-                unsafe {
-                    core::arch::asm!("mov {0}, fs:0", out(reg_byte) fs_0);
-                }
-
-                assert_eq!(
-                    fs_0, 0x1,
-                    "TLS value from FS base should match the initialized value"
-                );
+            // Check the TLS value from FS base
+            let mut fs_0: u8;
+            unsafe {
+                core::arch::asm!("mov {0}, fs:0", out(reg_byte) fs_0);
             }
+
+            assert_eq!(
+                fs_0, 0x1,
+                "TLS value from FS base should match the initialized value"
+            );
 
             assert!(unsafe { CHILD_TID } > 0, "Child TID should be set");
             assert_eq!(

@@ -93,40 +93,41 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         flags: OFlags,
         mode: Mode,
     ) -> Result<FileFd<Platform>, OpenError> {
+        let open_directory = flags.contains(OFlags::DIRECTORY);
+        let nonblocking = flags.contains(OFlags::NONBLOCK);
+        let flags = flags - OFlags::DIRECTORY - OFlags::NONBLOCK - OFlags::NOCTTY; // ignore NOCTTY
         let path = self.absolute_path(path)?;
-        match path.as_str() {
+        let stream = match path.as_str() {
             "/dev/stdin" => {
                 if flags == OFlags::RDONLY && mode.is_empty() {
-                    Ok(self
-                        .litebox
-                        .descriptor_table_mut()
-                        .insert(StdioStream::Stdin))
+                    StdioStream::Stdin
                 } else {
                     unimplemented!()
                 }
             }
             "/dev/stdout" => {
                 if flags == OFlags::WRONLY && mode.is_empty() {
-                    Ok(self
-                        .litebox
-                        .descriptor_table_mut()
-                        .insert(StdioStream::Stdout))
+                    StdioStream::Stdout
                 } else {
                     unimplemented!()
                 }
             }
             "/dev/stderr" => {
                 if flags == OFlags::WRONLY && mode.is_empty() {
-                    Ok(self
-                        .litebox
-                        .descriptor_table_mut()
-                        .insert(StdioStream::Stderr))
+                    StdioStream::Stderr
                 } else {
                     unimplemented!()
                 }
             }
-            _ => Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
+            _ => return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
+        };
+        if open_directory {
+            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
+        if nonblocking {
+            unimplemented!("Non-blocking I/O is not supported for stdio streams");
+        }
+        Ok(self.litebox.descriptor_table_mut().insert(stream))
     }
 
     fn close(&self, fd: FileFd<Platform>) -> Result<(), CloseError> {
