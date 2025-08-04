@@ -92,9 +92,9 @@ void _start() {
 
 #[expect(
     unused,
-    reason = "This code snippet is just used to illustrate the source code of the `hello_thread_static` test."
+    reason = "This code snippet is just used to illustrate the source code of the `hello_thread_static/dynamic` test."
 )]
-const HELLO_WORLD_STATIC: &str = r#"
+const HELLO_WORLD: &str = r#"
 // gcc -o hello_world_static hello_world_static.c -static
 #include <stdio.h>
 
@@ -106,9 +106,9 @@ int main() {
 
 #[expect(
     unused,
-    reason = "This code snippet is just used to illustrate the source code of the `hello_thread_static` test."
+    reason = "This code snippet is just used to illustrate the source code of the `hello_thread_static/dynamic` test."
 )]
-const HELLO_THREAD_STATIC: &str = r#"
+const HELLO_THREAD: &str = r#"
 // gcc hello_thread.c -o hello_thread_static -static
 #include <stdio.h>
 #include <stdlib.h>
@@ -193,7 +193,7 @@ fn test_static_linked_prog_with_rewriter() {
     let path = test_dir.join(prog_name);
     let hooked_path = test_dir.join(&prog_name_hooked);
 
-    // rewrite the hello_thread_static
+    // rewrite the target ELF executable file
     let _ = std::fs::remove_file(hooked_path.clone());
     println!(
         "Running `cargo run -p litebox_syscall_rewriter -- -o {} {}`",
@@ -226,20 +226,26 @@ fn test_static_linked_prog_with_rewriter() {
     common::test_load_exec_common(&executable_path);
 }
 
-const HELLO_THREAD_INIT_FILES: [(&str, &str); 2] = [
+// (file under test-bins folder, target directory to install the file)
+const PROGRAM_DYN_INIT_FILES: [(&str, &str); 3] = [
     ("libc.so.6", "/lib/x86_64-linux-gnu"),
     ("ld-linux-x86-64.so.2", "/lib64"),
+    ("litebox_rtld_audit.so", "/lib64"),
 ];
 
 #[test]
-fn test_dynamic_lib_rewriter() {
+fn test_dynamic_linked_prog_with_rewriter() {
     // Use the already compiled executable from the tests folder (same dir as this file)
     let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_dir.push("tests");
-    let path = test_dir.join("hello_thread");
-    let hooked_path = test_dir.join("hello_thread.hooked");
+    test_dir.push("tests/test-bins");
 
-    // rewrite the hello_thread
+    let prog_name = "hello_world_dyn";
+    let prog_name_hooked = format!("{}.hooked", prog_name);
+
+    let path = test_dir.join(prog_name);
+    let hooked_path = test_dir.join(&prog_name_hooked);
+
+    // rewrite the target ELF executable file
     let _ = std::fs::remove_file(hooked_path.clone());
     let output = std::process::Command::new("cargo")
         .args([
@@ -258,15 +264,105 @@ fn test_dynamic_lib_rewriter() {
         "failed to run syscall rewriter {:?}",
         std::str::from_utf8(output.stderr.as_slice()).unwrap()
     );
+
     // create tar file containing all dependencies
-    let tar_dir = test_dir.join("hello_thread_tar");
+    let tar_dir = test_dir.join("test_program_tar");
     std::fs::create_dir_all(tar_dir.join("out")).unwrap();
 
-    for (file, prefix) in HELLO_THREAD_INIT_FILES {
+    for (file, prefix) in PROGRAM_DYN_INIT_FILES {
         let src = test_dir.join(file);
         let dst_dir = tar_dir.join(prefix.trim_start_matches('/'));
         let dst = dst_dir.join(file);
         std::fs::create_dir_all(&dst_dir).unwrap();
         std::fs::copy(&src, &dst).unwrap();
+    }
+
+    // tar
+    let tar_file = test_dir.join("rootfs_rewriter.tar");
+    let tar_data = std::process::Command::new("tar").
+        args([
+            "-cvf",
+            tar_file.to_str().unwrap(),
+            "lib",
+            "lib64",
+            "out",
+            "usr",
+        ])
+        .current_dir(&tar_dir)
+        .output()
+        .expect("Failed to create tar file");
+
+    // run litebox_runner_linux_on_windows_userland with the tar file and the compiled executable
+    let mut args = vec![
+        "run",
+        "-p",
+        "litebox_runner_linux_on_windows_userland",
+        "--",
+        "--unstable",
+        // Tell ld where to find the libraries.
+        // See https://man7.org/linux/man-pages/man8/ld.so.8.html for how ld works.
+        // Alternatively, we could add a `/etc/ld.so.cache` file to the rootfs.
+        "--env",
+        "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
+        "--initial-files",
+        tar_file.to_str().unwrap(),
+        "--env",
+        "LD_AUDIT=/lib64/litebox_rtld_audit.so",
+    ];
+    args.push(hooked_path.to_str().unwrap());
+    println!("Running `cargo {}`", args.join(" "));
+
+    // run
+    let output = std::process::Command::new("cargo")
+        .args(args)
+        .output()
+        .expect("Failed to run litebox_runner_linux_on_windows_userland");
+    assert!(
+        output.status.success(),
+        "failed to run litebox_runner_linux_on_windows_userland {:?}",
+        std::str::from_utf8(output.stderr.as_slice()).unwrap()
+    );
+}
+
+#[test]
+fn test_hello_world_dyn_with_rootfs() {
+    println!("Running hello_world_dyn with rootfs test...");
+    
+    // Use the already compiled test binaries from the tests folder
+    let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    test_dir.push("tests/test-bins");
+    
+    let rootfs_tar = test_dir.join("rootfs_rewriter.tar");
+    let hello_world_dyn_hooked = test_dir.join("hello_world_dyn.hooked");
+    
+    // Verify the required files exist
+    assert!(rootfs_tar.exists(), "rootfs_rewriter.tar not found at {:?}", rootfs_tar);
+    assert!(hello_world_dyn_hooked.exists(), "hello_world_dyn.hooked not found at {:?}", hello_world_dyn_hooked);
+    
+    // Create CliArgs directly to test the run function
+    let cli_args = litebox_runner_linux_on_windows_userland::CliArgs {
+        program_and_arguments: vec![hello_world_dyn_hooked.to_string_lossy().to_string()],
+        environment_variables: vec![
+            "LD_LIBRARY_PATH=/lib64:/lib32:/lib".to_string(),
+            "LD_AUDIT=/lib64/litebox_rtld_audit.so".to_string(),
+        ],
+        forward_environment_variables: false,
+        unstable: true,
+        insert_files: vec![],
+        initial_files: Some(rootfs_tar),
+        rewrite_syscalls: false,
+    };
+    
+    println!("Running litebox_runner_linux_on_windows_userland::run with args: {:?}", cli_args);
+    
+    // Call the run function directly to enable debugging
+    let result = litebox_runner_linux_on_windows_userland::run(cli_args);
+    
+    match result {
+        Ok(_) => println!("Test completed successfully"),
+        Err(e) => {
+            println!("Test failed with error: {:?}", e);
+            panic!("Test failed: {}", e);
+        }
     }
 }
