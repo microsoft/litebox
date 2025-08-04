@@ -226,10 +226,14 @@ fn test_static_linked_prog_with_rewriter() {
     common::test_load_exec_common(&executable_path);
 }
 
-// (file under test-bins folder, target directory to install the file)
-const PROGRAM_DYN_INIT_FILES: [(&str, &str); 3] = [
+// rewrite -- (file under test-bins folder, target directory to install the file)
+const PROGRAM_DYN_INIT_FILES_REWRITE: [(&str, &str); 2] = [
     ("libc.so.6", "/lib/x86_64-linux-gnu"),
     ("ld-linux-x86-64.so.2", "/lib64"),
+];
+
+// no rewrite -- (file under test-bins folder, target directory to install the file)
+const PROGRAM_DYN_INIT_FILES_NOREWRITE: [(&str, &str); 1] = [
     ("litebox_rtld_audit.so", "/lib64"),
 ];
 
@@ -265,15 +269,44 @@ fn test_dynamic_linked_prog_with_rewriter() {
         std::str::from_utf8(output.stderr.as_slice()).unwrap()
     );
 
-    // create tar file containing all dependencies
+    // Create tar file containing all dependencies
     let tar_dir = test_dir.join("test_program_tar");
     std::fs::create_dir_all(tar_dir.join("out")).unwrap();
 
-    for (file, prefix) in PROGRAM_DYN_INIT_FILES {
+    // Rewrite all libraries that are required for initialization
+    for (file, prefix) in PROGRAM_DYN_INIT_FILES_REWRITE {
         let src = test_dir.join(file);
         let dst_dir = tar_dir.join(prefix.trim_start_matches('/'));
         let dst = dst_dir.join(file);
         std::fs::create_dir_all(&dst_dir).unwrap();
+        let _ = std::fs::remove_file(&dst);
+        let output = std::process::Command::new("cargo")
+            .args([
+                "run",
+                "-p",
+                "litebox_syscall_rewriter",
+                "--",
+                &src.to_str().unwrap(),
+                "-o",
+                &dst.to_str().unwrap(),
+            ])
+            .output()
+            .expect("Failed to run syscall rewriter");
+        assert!(
+            output.status.success(),
+            "failed to run syscall rewriter {:?}",
+            std::str::from_utf8(output.stderr.as_slice()).unwrap()
+        );
+    }
+
+    // Copy libraries that are not needed to be rewritten (`litebox_rtld_audit.so`)
+    // to the tar directory
+    for (file, prefix) in PROGRAM_DYN_INIT_FILES_NOREWRITE {
+        let src = test_dir.join(file);
+        let dst_dir = tar_dir.join(prefix.trim_start_matches('/'));
+        let dst = dst_dir.join(file);
+        std::fs::create_dir_all(&dst_dir).unwrap();
+        let _ = std::fs::remove_file(&dst);
         std::fs::copy(&src, &dst).unwrap();
     }
 

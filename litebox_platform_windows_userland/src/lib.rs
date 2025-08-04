@@ -185,6 +185,12 @@ impl WindowsUserland {
         let mut sys_info = Win32_SysInfo::SYSTEM_INFO::default();
         Self::get_system_information(&mut sys_info);
 
+        // todo(chuqi): debug print system information
+        println!("System information.");
+        println!("=> Max user address: {:#x}", sys_info.lpMaximumApplicationAddress as usize);
+        println!("=> Min user address: {:#x}", sys_info.lpMinimumApplicationAddress as usize);
+        println!("=> Allocation granularity: {:#x}", sys_info.dwAllocationGranularity as usize);
+
         let reserved_pages = Self::read_memory_maps();
 
         let platform = Self {
