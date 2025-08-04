@@ -398,6 +398,7 @@ mod tests {
         sys_close(fd).unwrap();
     }
 
+    // `mremap` is not implemented for freebsd yet.
     #[cfg(not(feature = "platform_freebsd_userland"))]
     #[test]
     fn test_mremap() {
