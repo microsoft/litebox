@@ -768,6 +768,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             Platform::TASK_ADDR_MIN,
             Platform::TASK_ADDR_MAX - length.as_usize(),
         );
+        debug_assert!(Platform::TASK_ADDR_MIN % ALIGN == 0);
+        debug_assert!(Platform::TASK_ADDR_MAX % ALIGN == 0);
         let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
         if last_end <= high_limit {
             return Some(high_limit);
