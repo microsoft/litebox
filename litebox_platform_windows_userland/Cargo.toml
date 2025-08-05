@@ -7,11 +7,7 @@ edition = "2024"
 litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux", version = "0.1.0" }
 
-<<<<<<< HEAD
 windows-sys = { version = "0.60.2", features = [ "Win32_Foundation", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_Security", "Win32_System_Diagnostics", "Win32_System_Kernel", "Win32_System_Diagnostics_Debug" ] }
-=======
-windows-sys = { version = "0.60.2", features = [ "Win32_Foundation", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_System_Performance" ] }
->>>>>>> c16a97d3b295176225b2ffe350ea68fcc125fa37
 
 [lints]
 workspace = true
