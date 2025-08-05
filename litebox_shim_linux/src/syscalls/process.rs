@@ -636,19 +636,18 @@ mod tests {
                     unsafe { current_fs_base.assume_init() },
                     "FS base should match TLS pointer"
                 );
-            }
 
-            // Check the TLS value from FS base
-            let mut fs_0: u8;
-            unsafe {
-                core::arch::asm!("mov {0}, fs:0", out(reg_byte) fs_0);
+                // Check the TLS value from FS base
+                let mut fs_0: u8;
+                unsafe {
+                    core::arch::asm!("mov {0}, fs:0", out(reg_byte) fs_0);
+                }
+                // Verify that the TLS value is initialized to its correct value (`1`).
+                assert_eq!(
+                    fs_0, 0x1,
+                    "TLS value from FS base should match the initialized value"
+                );
             }
-
-            // Verify that the TLS value is initialized to its correct value (`1`).
-            assert_eq!(
-                fs_0, 0x1,
-                "TLS value from FS base should match the initialized value"
-            );
 
             assert!(unsafe { CHILD_TID } > 0, "Child TID should be set");
             assert_eq!(
