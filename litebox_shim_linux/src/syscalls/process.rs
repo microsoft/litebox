@@ -524,7 +524,9 @@ mod tests {
         sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize())).expect("Failed to restore FS base");
     }
 
-    static mut TLS: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+    // Initialize a static TLS area with value `1`. This value is later on used to verify that
+    // the TLS is set up correctly.
+    static mut TLS: [u8; PAGE_SIZE] = [1; PAGE_SIZE];
     static mut CHILD_TID: i32 = 0;
 
     #[test]
@@ -633,6 +635,17 @@ mod tests {
                     addr,
                     unsafe { current_fs_base.assume_init() },
                     "FS base should match TLS pointer"
+                );
+
+                // Check the TLS value from FS base
+                let mut fs_0: u8;
+                unsafe {
+                    core::arch::asm!("mov {0}, fs:0", out(reg_byte) fs_0);
+                }
+                // Verify that the TLS value is initialized to its correct value (`1`).
+                assert_eq!(
+                    fs_0, 0x1,
+                    "TLS value from FS base should match the initialized value"
                 );
             }
 
