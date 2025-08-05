@@ -700,6 +700,9 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
 }
 
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for FreeBSDUserland {
+    const TASK_ADDR_MIN: usize = 0x1000;
+    const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
