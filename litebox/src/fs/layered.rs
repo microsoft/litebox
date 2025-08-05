@@ -2,8 +2,9 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 use crate::LiteBox;
 use crate::fd::{InternalFd, TypedFd};
@@ -12,9 +13,9 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadError, RmdirError, SeekError, UnlinkError, WriteError,
+    ReadDirError, ReadError, RmdirError, SeekError, UnlinkError, WriteError,
 };
-use super::{FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
 
 /// Just a random constant that is distinct from other file systems. In this case, it is
 /// `b'Lyrs'.hex()`.
@@ -939,6 +940,51 @@ impl<
         // do at least a "number of entries" check on both upper and lower level at all times.
         // However, in terms of functionality, we will be placing tombstone entries.
         todo!()
+    }
+
+    fn read_dir(&self, fd: &FileFd<Platform, Upper, Lower>) -> Result<Vec<DirEntry>, ReadDirError> {
+        let (entry, path) = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| {
+                (
+                    Arc::clone(&descriptor.entry.entry),
+                    descriptor.entry.path.clone(),
+                )
+            });
+
+        match entry.as_ref() {
+            EntryX::Upper { fd } => {
+                // Get entries from upper layer
+                let mut upper_entries = self.upper.read_dir(fd)?;
+
+                // Try to get entries from lower layer for the same path
+                if let Ok(lower_fd) = self
+                    .lower
+                    .open(path.as_str(), OFlags::RDONLY, Mode::empty())
+                {
+                    if let Ok(lower_entries) = self.lower.read_dir(&lower_fd) {
+                        // Merge entries, avoiding duplicates (upper layer takes precedence)
+                        let upper_names: HashSet<String> =
+                            upper_entries.iter().map(|e| e.name.clone()).collect();
+
+                        for lower_entry in lower_entries {
+                            if !upper_names.contains(&lower_entry.name) {
+                                upper_entries.push(lower_entry);
+                            }
+                        }
+                    }
+                    let _ = self.lower.close(lower_fd);
+                }
+
+                Ok(upper_entries)
+            }
+            EntryX::Lower { fd } => {
+                // This is the easy case, nothing to deal with upper entries.
+                self.lower.read_dir(fd)
+            }
+            EntryX::Tombstone => unreachable!(),
+        }
     }
 
     fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {

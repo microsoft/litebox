@@ -8,7 +8,7 @@ use crate::{
         FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
         errors::{
             ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-            ReadError, RmdirError, SeekError, UnlinkError, WriteError,
+            ReadDirError, ReadError, RmdirError, SeekError, UnlinkError, WriteError,
         },
     },
     path::Arg,
@@ -217,6 +217,13 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
     #[expect(unused_variables, reason = "unimplemented")]
     fn rmdir(&self, path: impl Arg) -> Result<(), RmdirError> {
         unimplemented!()
+    }
+
+    fn read_dir(
+        &self,
+        _fd: &FileFd<Platform>,
+    ) -> Result<alloc::vec::Vec<crate::fs::DirEntry>, ReadDirError> {
+        Err(ReadDirError::NotADirectory)
     }
 
     fn file_status(&self, path: impl Arg) -> Result<FileStatus, FileStatusError> {

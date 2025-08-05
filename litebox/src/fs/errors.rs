@@ -135,6 +135,14 @@ pub enum RmdirError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`FileSystem::read_dir`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum ReadDirError {
+    #[error("fd does not point to a directory")]
+    NotADirectory,
+}
+
 /// Possible errors from [`FileSystem::file_status`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
