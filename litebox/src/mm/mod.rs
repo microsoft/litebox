@@ -520,9 +520,7 @@ where
         error_code: u64,
     ) -> Result<(), PageFaultError> {
         let fault_addr = fault_addr & !(ALIGN - 1);
-        if !(Vmem::<Platform, ALIGN>::TASK_ADDR_MIN..Vmem::<Platform, ALIGN>::TASK_ADDR_MAX)
-            .contains(&fault_addr)
-        {
+        if !(Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX).contains(&fault_addr) {
             return Err(PageFaultError::AccessError("Invalid address"));
         }
 
@@ -530,7 +528,7 @@ where
         // Find the range closest to the fault address
         let (start, vma) = {
             let (r, vma) = vmem
-                .overlapping(fault_addr..Vmem::<Platform, ALIGN>::TASK_ADDR_MAX)
+                .overlapping(fault_addr..Platform::TASK_ADDR_MAX)
                 .next()
                 .ok_or(PageFaultError::AccessError("no mapping"))?;
             (r.start, *vma)
@@ -542,7 +540,7 @@ where
             }
 
             if !vmem
-                .overlapping(Vmem::<Platform, ALIGN>::TASK_ADDR_MIN..fault_addr)
+                .overlapping(Platform::TASK_ADDR_MIN..fault_addr)
                 .next_back()
                 .is_none_or(|(prev_range, prev_vma)| {
                     // Enforce gap between stack and other preceding non-stack mappings.

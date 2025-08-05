@@ -598,6 +598,7 @@ pub(crate) fn sys_setsockopt(
     }
 }
 
+#[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
     use alloc::string::ToString as _;

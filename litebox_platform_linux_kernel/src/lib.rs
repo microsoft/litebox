@@ -352,6 +352,9 @@ pub trait HostInterface {
 }
 
 impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
+    const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
+    const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
