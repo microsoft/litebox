@@ -7,7 +7,7 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use crate::platform::RawMutex;
+use crate::platform::{RawMutex, UserRawMutex as _};
 
 #[cfg(feature = "lock_tracing")]
 use crate::sync::lock_tracing::{LockTracker, LockType, LockedWitness};
@@ -165,7 +165,7 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
 
             // Wait for the state to change.
             // ignore the error code as it is non-interruptible
-            let _ = self.state.block(state | READERS_WAITING);
+            let _ = RawMutex::block(&self.state, state | READERS_WAITING);
 
             // Spin again after waking up.
             state = self.spin_read();
@@ -266,7 +266,7 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
 
             // Wait for the state to change.
             // ignore the error code as it is non-interruptible
-            let _ = self.writer_notify.block(seq);
+            let _ = RawMutex::block(&self.writer_notify, seq);
 
             // Spin again after waking up.
             state = self.spin_write();

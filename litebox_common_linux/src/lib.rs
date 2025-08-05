@@ -623,16 +623,54 @@ cfg_if::cfg_if! {
     }
 }
 
-// From libc crate's `timespec` definition.
-//
-// linux x32 compatibility
-// See https://sourceware.org/bugzilla/show_bug.cgi?id=16437
-pub struct timespec {
-    pub tv_sec: time_t,
-    #[cfg(all(target_arch = "x86_64", target_pointer_width = "32"))]
-    pub tv_nsec: i64,
-    #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "32")))]
-    pub tv_nsec: isize,
+/// timespec from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/include/uapi/linux/time_types.h#L7)
+#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq)]
+#[repr(C)]
+pub struct Timespec {
+    /// Seconds.
+    pub tv_sec: i64,
+
+    /// Nanoseconds. Must be less than 1_000_000_000.
+    pub tv_nsec: u64,
+}
+
+impl Timespec {
+    /// Subtract another `Timespec` from self
+    pub fn sub_timespec(&self, other: &Timespec) -> Result<core::time::Duration, errno::Errno> {
+        if self >= other {
+            let (secs, nsec) = if self.tv_nsec >= other.tv_nsec {
+                (
+                    self.tv_sec
+                        .checked_sub(other.tv_sec)
+                        .ok_or(errno::Errno::EDOM)?,
+                    self.tv_nsec - other.tv_nsec,
+                )
+            } else {
+                (
+                    self.tv_sec
+                        .checked_sub(other.tv_sec + 1)
+                        .ok_or(errno::Errno::EDOM)?,
+                    self.tv_nsec + 1_000_000_000 - other.tv_nsec,
+                )
+            };
+
+            Ok(core::time::Duration::new(
+                u64::try_from(secs).map_err(|_| errno::Errno::EDOM)?,
+                nsec.truncate(),
+            ))
+        } else {
+            Err(errno::Errno::EINVAL)
+        }
+    }
+}
+
+impl From<Timespec> for core::time::Duration {
+    fn from(timespec: Timespec) -> Self {
+        core::time::Duration::new(
+            u64::try_from(timespec.tv_sec).unwrap(),
+            timespec.tv_nsec.truncate(),
+        )
+    }
 }
 
 #[repr(C)]
@@ -1292,6 +1330,52 @@ pub struct CapData {
     pub inheritable: u32,
 }
 
+#[non_exhaustive]
+#[repr(i32)]
+#[derive(Debug, IntEnum, PartialEq)]
+pub enum FutexOperation {
+    WAIT = 0,
+    WAKE = 1,
+    WAIT_BITSET = 9,
+}
+
+bitflags::bitflags! {
+    #[derive(Debug)]
+    pub struct FutexFlags: i32 {
+        const PRIVATE = 0x80; // FUTEX_PRIVATE_FLAG
+        const CLOCK_REALTIME = 0x100; // FUTEX_CLOCK_REALTIME
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+
+        const FUTEX_CMD_MASK = !(FutexFlags::PRIVATE.bits() | FutexFlags::CLOCK_REALTIME.bits());
+    }
+}
+
+#[non_exhaustive]
+pub enum FutexArgs<Platform: litebox::platform::RawPointerProvider> {
+    WAIT {
+        addr: Platform::RawConstPointer<u32>,
+        flags: FutexFlags,
+        val: u32,
+        // Note: for FUTEX_WAIT, timeout is interpreted as a relative
+        //   value.  This differs from other futex operations, where
+        //   timeout is interpreted as an absolute value.
+        timeout: Option<Platform::RawConstPointer<Timespec>>,
+    },
+    WAIT_BITSET {
+        addr: Platform::RawConstPointer<u32>,
+        flags: FutexFlags,
+        val: u32,
+        timeout: Option<Platform::RawConstPointer<Timespec>>,
+        bitmask: u32,
+    },
+    WAKE {
+        addr: Platform::RawConstPointer<u32>,
+        flags: FutexFlags,
+        count: u32,
+    },
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
@@ -1583,6 +1667,9 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     CapGet {
         header: Platform::RawMutPointer<CapHeader>,
         data: Option<Platform::RawMutPointer<CapData>>,
+    },
+    Futex {
+        args: FutexArgs<Platform>,
     },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
@@ -2159,6 +2246,40 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     },
                 }
             }
+            Sysno::futex => {
+                let op: i32 = ctx.syscall_arg(1).reinterpret_as_signed().truncate();
+                let cmd = FutexOperation::try_from(op & FutexFlags::FUTEX_CMD_MASK.bits())
+                    .expect("Invalid futex operation");
+                let flags = FutexFlags::from_bits(op & !FutexFlags::FUTEX_CMD_MASK.bits()).unwrap();
+                let addr = Platform::RawConstPointer::from_usize(ctx.syscall_arg(0));
+                let val = ctx.syscall_arg(2).truncate();
+                let timeout = if ctx.syscall_arg(3) == 0 {
+                    None
+                } else {
+                    Some(Platform::RawConstPointer::from_usize(ctx.syscall_arg(3)))
+                };
+                let args = match cmd {
+                    FutexOperation::WAIT => FutexArgs::WAIT {
+                        addr,
+                        flags,
+                        val,
+                        timeout,
+                    },
+                    FutexOperation::WAIT_BITSET => FutexArgs::WAIT_BITSET {
+                        addr,
+                        flags,
+                        val,
+                        timeout,
+                        bitmask: ctx.syscall_arg(5).truncate(),
+                    },
+                    FutexOperation::WAKE => FutexArgs::WAKE {
+                        addr,
+                        flags,
+                        count: val,
+                    },
+                };
+                SyscallRequest::Futex { args }
+            }
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq => {
                 SyscallRequest::Ret(errno::Errno::ENOSYS)
             }
@@ -2202,9 +2323,7 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
     },
     /// Set the FS base register to the value in `addr`.
     #[cfg(target_arch = "x86_64")]
-    SetFsBase {
-        addr: usize,
-    },
+    SetFsBase { addr: usize },
     /// Get the current value of the FS base register and store it in `addr`.
     #[cfg(target_arch = "x86_64")]
     GetFsBase {
@@ -2213,9 +2332,6 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
     #[cfg(target_arch = "x86")]
     SetThreadArea {
         user_desc: Platform::RawMutPointer<UserDesc>,
-    },
-    WakeByAddress {
-        addr: Platform::RawMutPointer<i32>,
     },
 }
 

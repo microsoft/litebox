@@ -3,6 +3,7 @@
 use core::arch::asm;
 
 use litebox::platform::{RawConstPointer, RawMutPointer};
+use litebox::utils::ReinterpretUnsignedExt as _;
 use litebox_common_linux::{SigSet, SigmaskHow};
 
 use super::ghcb::ghcb_prints;
@@ -98,9 +99,6 @@ const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 
 const NR_SYSCALL_FUTEX: u32 = 202;
 const NR_SYSCALL_RT_SIGPROCMASK: u32 = 14;
-
-const FUTEX_WAIT: i32 = 0;
-const FUTEX_WAKE: i32 = 1;
 
 /// Punchthrough for syscalls
 ///
@@ -282,7 +280,18 @@ impl HostInterface for HostSnpInterface {
     fn wake_many(mutex: &core::sync::atomic::AtomicU32, n: usize) -> Result<usize, Errno> {
         // TODO: sandbox driver needs to be updated to accept a kernel pointer from the guest
         Self::syscalls(SyscallN::<6, NR_SYSCALL_FUTEX> {
-            args: [mutex.as_ptr() as u64, FUTEX_WAKE as u64, n as u64, 0, 0, 0],
+            args: [
+                core::ptr::from_ref(mutex) as u64,
+                u64::from(
+                    (litebox_common_linux::FutexOperation::WAKE as i32
+                        | litebox_common_linux::FutexFlags::PRIVATE.bits())
+                    .reinterpret_as_unsigned(),
+                ),
+                n as u64,
+                0,
+                0,
+                0,
+            ],
         })
     }
 
@@ -291,15 +300,19 @@ impl HostInterface for HostSnpInterface {
         val: u32,
         timeout: Option<core::time::Duration>,
     ) -> Result<(), Errno> {
-        let timeout = timeout.map(|t| crate::host::linux::Timespec {
+        let timeout = timeout.map(|t| litebox_common_linux::Timespec {
             tv_sec: i64::try_from(t.as_secs()).unwrap(),
-            tv_nsec: i64::from(t.subsec_nanos()),
+            tv_nsec: u64::from(t.subsec_nanos()),
         });
         // TODO: sandbox driver needs to be updated to accept a kernel pointer from the guest
         Self::syscalls(SyscallN::<6, NR_SYSCALL_FUTEX> {
             args: [
-                mutex.as_ptr() as u64,
-                FUTEX_WAIT as u64,
+                core::ptr::from_ref(mutex) as u64,
+                u64::from(
+                    (litebox_common_linux::FutexOperation::WAIT as i32
+                        | litebox_common_linux::FutexFlags::PRIVATE.bits())
+                    .reinterpret_as_unsigned(),
+                ),
                 u64::from(val),
                 timeout
                     .as_ref()
