@@ -152,7 +152,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             //
             // For now, we always use root privilege to create directories and then `chown`.
             // Created another branch to reproduce the issue for me and Weiteng to debug:
-            // https://github.com/microsoft/litebox/blob/chuqiz/windows-debug-chown-mkdir.
+            // https://github.com/microsoft/litebox/tree/chuqiz/windows-debug-chown-mkdir.
             println!(
                 "Creating dir: {:?} with permissions: {:?}, user: {:?}. prev_user: {:?}",
                 path, mode_and_user.0, mode_and_user.1, prev_user
