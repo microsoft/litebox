@@ -3,17 +3,17 @@ use clap::Parser;
 use litebox::LiteBox;
 use litebox::fs::FileSystem as _;
 use litebox_platform_multiplex::Platform;
-use std::path::PathBuf;
 use std::os::windows::fs::MetadataExt;
+use std::path::PathBuf;
 
 /// Get file permissions and owner ID in a cross-platform way
 fn get_file_mode_and_uid(metadata: &std::fs::Metadata) -> (litebox::fs::Mode, u32) {
     // On Windows, determine permissions based on file attributes
     let mut mode = litebox::fs::Mode::empty();
-    
+
     // Check if file is read-only
     let is_readonly = metadata.file_attributes() & 0x1 != 0; // FILE_ATTRIBUTE_READONLY
-    
+
     if metadata.is_dir() {
         // Directories need full permissions to allow creating subdirectories and files
         // Even if marked read-only, we need write access for directory operations
@@ -26,7 +26,7 @@ fn get_file_mode_and_uid(metadata: &std::fs::Metadata) -> (litebox::fs::Mode, u3
         mode |= litebox::fs::Mode::RUSR | litebox::fs::Mode::RGRP | litebox::fs::Mode::ROTH;
         mode |= litebox::fs::Mode::XUSR | litebox::fs::Mode::XGRP | litebox::fs::Mode::XOTH;
     }
-    
+
     // Always use default user ID 1000 on Windows since there's no direct equivalent to Unix UID
     (mode, 1000u32)
 }
@@ -145,6 +145,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .skip(1)
             .zip(&ancestor_modes_and_users)
         {
+            // TODO(chuqi): fix this weird litebox fs chown/mkdir behavior
+            // Currently we always use root privilege to create directories and then `chown`.
+            // Created another branch for Weiteng.
+            println!(
+                "Creating dir: {:?} with permissions: {:?}, user: {:?}. prev_user: {:?}",
+                path, mode_and_user.0, mode_and_user.1, prev_user
+            );
             // if prev_user == 0 {
             //     // require root user
             //     in_mem.with_root_privileges(|fs| {
@@ -156,11 +163,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             //         }
             //     });
             // } else {
+            //     println!("Creating dir with permissions: {:?}", mode_and_user.0);
             //     in_mem
             //         .mkdir(path.to_str().unwrap(), mode_and_user.0)
             //         .unwrap();
             // }
-                        // Always use root privileges for directory creation to avoid permission issues
+            // Always use root privileges for directory creation to avoid permission issues
             in_mem.with_root_privileges(|fs| {
                 fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
                 if mode_and_user.1 != 0 {
@@ -252,28 +260,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let mut aux = litebox_shim_linux::loader::auxv::init_auxv();
-    // if litebox_platform_multiplex::platform()
-    //     .get_vdso_address()
-    //     .is_none()
-    // {
-    //     // Due to restrict permissions in CI, we cannot read `/proc/self/maps`.
-    //     // To pass CI, we rely on `getauxval` (which we should avoid #142) to get the VDSO
-    //     // address when failing to read `/proc/self/maps`.
-    //     #[cfg(target_arch = "x86_64")]
-    //     {
-    //         let vdso_address = unsafe { libc::getauxval(libc::AT_SYSINFO_EHDR) };
-    //         aux.insert(
-    //             litebox_shim_linux::loader::auxv::AuxKey::AT_SYSINFO_EHDR,
-    //             usize::try_from(vdso_address).unwrap(),
-    //         );
-    //     }
-    // }
     let loaded_program = litebox_shim_linux::loader::load_program(
         &cli_args.program_and_arguments[0],
         argv,
         envp,
-        aux,
+        litebox_shim_linux::loader::auxv::init_auxv(),
     )
     .unwrap();
 
