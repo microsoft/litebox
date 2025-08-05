@@ -174,7 +174,9 @@ impl TaCommandParamsBase64 {
             } => {
                 assert!(param_type.as_str() == "memref_input", "Invalid param type");
                 let decoded_data = Self::decode_base64(data_base64);
-                UteeParamsTyped::MemrefInput { data: decoded_data }
+                UteeParamsTyped::MemrefInput {
+                    data: decoded_data.into_boxed_slice(),
+                }
             }
             TaCommandParamsBase64::MemrefInout {
                 param_type,
@@ -188,7 +190,7 @@ impl TaCommandParamsBase64 {
                     "Buffer size is smaller than input data size"
                 );
                 UteeParamsTyped::MemrefInout {
-                    data: decoded_data,
+                    data: decoded_data.into_boxed_slice(),
                     buffer_size: usize::try_from(*buffer_size).unwrap(),
                 }
             }

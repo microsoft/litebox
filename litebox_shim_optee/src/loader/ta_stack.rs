@@ -216,18 +216,10 @@ impl TaStack {
                     self.push_param_values(TeeParamType::ValueInout, Some((*value_a, *value_b)))?;
                 }
                 UteeParamsTyped::MemrefInput { data } => {
-                    self.push_param_bytes(
-                        TeeParamType::MemrefInput,
-                        Some(data.as_slice()),
-                        data.len(),
-                    )?;
+                    self.push_param_bytes(TeeParamType::MemrefInput, Some(data), data.len())?;
                 }
                 UteeParamsTyped::MemrefInout { data, buffer_size } => {
-                    self.push_param_bytes(
-                        TeeParamType::MemrefInout,
-                        Some(data.as_slice()),
-                        *buffer_size,
-                    )?;
+                    self.push_param_bytes(TeeParamType::MemrefInout, Some(data), *buffer_size)?;
                 }
                 UteeParamsTyped::MemrefOutput { buffer_size } => {
                     self.push_param_bytes(TeeParamType::MemrefOutput, None, *buffer_size)?;

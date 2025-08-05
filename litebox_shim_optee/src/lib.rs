@@ -128,13 +128,13 @@ pub enum UteeParamsTyped {
         value_b: u64,
     },
     MemrefInput {
-        data: alloc::vec::Vec<u8>,
+        data: alloc::boxed::Box<[u8]>,
     },
     MemrefOutput {
         buffer_size: usize,
     },
     MemrefInout {
-        data: alloc::vec::Vec<u8>,
+        data: alloc::boxed::Box<[u8]>,
         buffer_size: usize,
     },
 }
