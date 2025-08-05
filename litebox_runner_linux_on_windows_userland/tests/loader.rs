@@ -348,4 +348,13 @@ fn test_dynamic_linked_prog_with_rewriter() {
     ];
     args.push(hooked_path.to_str().unwrap());
     println!("Running `cargo {}`", args.join(" "));
+    let output = std::process::Command::new("cargo")
+        .args(args)
+        .output()
+        .expect("Failed to run litebox_runner_linux_on_windows_userland");
+    assert!(
+        output.status.success(),
+        "failed to run litebox_runner_linux_on_windows_userland {:?}",
+        std::str::from_utf8(output.stderr.as_slice()).unwrap()
+    );
 }

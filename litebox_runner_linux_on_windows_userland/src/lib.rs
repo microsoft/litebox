@@ -145,9 +145,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .skip(1)
             .zip(&ancestor_modes_and_users)
         {
-            // TODO(chuqi): fix this weird litebox fs chown/mkdir behavior
-            // Currently we always use root privilege to create directories and then `chown`.
-            // Created another branch for Weiteng.
+            // TODO(chuqi): Currently the litebox in_mem fs's chown/mkdir behavior is weird:
+            // Whenever creating a directory by `in_mem.with_root_privileges`, the last
+            // `fs.chown(..., 1000, 1000)` somehow didn't change the ownership of the directory 
+            // properly: the later retrieval of the directory's uid still shows 0.
+            // 
+            // For now, we always use root privilege to create directories and then `chown`.
+            // Created another branch to reproduce the issue for me and Weiteng to debug:
+            // https://github.com/microsoft/litebox/blob/chuqiz/windows-debug-chown-mkdir.
             println!(
                 "Creating dir: {:?} with permissions: {:?}, user: {:?}. prev_user: {:?}",
                 path, mode_and_user.0, mode_and_user.1, prev_user
