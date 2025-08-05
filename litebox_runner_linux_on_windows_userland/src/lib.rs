@@ -152,22 +152,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 "Creating dir: {:?} with permissions: {:?}, user: {:?}. prev_user: {:?}",
                 path, mode_and_user.0, mode_and_user.1, prev_user
             );
-            // if prev_user == 0 {
-            //     // require root user
-            //     in_mem.with_root_privileges(|fs| {
-            //         fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
-            //         if mode_and_user.1 != 0 {
-            //             // This file is owned by a non-root user, so we need to set the ownership to our default user
-            //             fs.chown(path.to_str().unwrap(), Some(1000), Some(1000))
-            //                 .unwrap();
-            //         }
-            //     });
-            // } else {
-            //     println!("Creating dir with permissions: {:?}", mode_and_user.0);
-            //     in_mem
-            //         .mkdir(path.to_str().unwrap(), mode_and_user.0)
-            //         .unwrap();
-            // }
             // Always use root privileges for directory creation to avoid permission issues
             in_mem.with_root_privileges(|fs| {
                 fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
