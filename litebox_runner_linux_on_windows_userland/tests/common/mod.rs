@@ -10,6 +10,11 @@ use litebox::{
 use litebox_platform_multiplex::{Platform, set_platform};
 use litebox_shim_linux::{litebox_fs, loader::load_program, set_fs};
 
+// According to glibc's ABI (https://github.com/lattera/glibc/blob/master/sysdeps/x86_64/start.S#L79),
+// when entering the _start function, %rdx will move to %r9, which is the 6th argument of the function
+// __libc_start_main. This argument `rtld_fini` is used to register a cleanup function (`atexit`).
+// However, today's Linux kernel by default does not set it. So we will need to clear %rdx before jumping
+// to the _start function.
 global_asm!(
     "
     .text
@@ -18,6 +23,9 @@ global_asm!(
 trampoline:
     xor r8, r8
     mov	rsp, rdx
+    /* Clear rdx (will move to r9 according to glibc's ABI) */
+    xor rdx, rdx
+    /* Jump to glibc's _start */
     jmp	rcx
     /* Should not reach. */
     hlt"
