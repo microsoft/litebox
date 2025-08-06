@@ -1376,17 +1376,7 @@ unsafe extern "C" fn syscall_handler(
 ) -> SyscallReturnType {
     // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
     let ctx = unsafe { &mut *ctx };
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "linux_syscall")] {
-            let syscall_request = SyscallRequest::try_from_raw(syscall_number, ctx);
-        } else if #[cfg(feature = "optee_syscall")] {
-            let ctx = &litebox_common_optee::SyscallContext::from_pt_regs(ctx);
-            let syscall_request = SyscallRequest::try_from_raw(syscall_number, ctx);
-        } else {
-            compile_error!(r##"No syscall handler specified."##);
-        }
-    }
-    match syscall_request {
+    match SyscallRequest::try_from_raw(syscall_number, ctx) {
         Ok(d) => {
             let syscall_handler: SyscallHandler = SYSCALL_HANDLER
                 .read()

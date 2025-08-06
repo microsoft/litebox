@@ -82,7 +82,8 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
 // to the LVBS platform or runner.
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
-    pub fn try_from_raw(syscall_number: usize, ctx: &SyscallContext) -> Result<Self, Errno> {
+    pub fn try_from_raw(syscall_number: usize, ctx: &PtRegs) -> Result<Self, Errno> {
+        let ctx = SyscallContext::from_pt_regs(ctx);
         let sysnr = u32::try_from(syscall_number).map_err(|_| Errno::ENOSYS)?;
         let dispatcher = match TeeSyscallNr::try_from(sysnr).unwrap_or(TeeSyscallNr::Unknown) {
             TeeSyscallNr::Return => SyscallRequest::Return {
