@@ -261,6 +261,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     )
     .unwrap();
 
+    // todo(chuqi) debug
+    println!("[DEBUG] enter the program: {}", &cli_args.program_and_arguments[0]);
+
     unsafe {
         trampoline::jump_to_entry_point(loaded_program.entry_point, loaded_program.user_stack_top)
     }
