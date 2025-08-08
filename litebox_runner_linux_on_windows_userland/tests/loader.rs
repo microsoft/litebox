@@ -420,7 +420,7 @@ fn test_nodejs_with_rewriter() {
 }
 
 #[test]
-
+fn debug_testcase() {
     println!("Debug test...");
 
     // Use the already compiled test binaries from the tests folder
