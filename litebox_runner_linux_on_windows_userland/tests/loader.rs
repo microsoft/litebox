@@ -370,8 +370,8 @@ fn run_dynamic_linked_prog_with_rewriter(
 }
 
 #[test]
-fn test_helloworld_dynamic_with_rewriter() {
-    let exec_name = "hello_world_dyn";
+fn test_testcase_dynamic_with_rewriter() {
+    let exec_name = "hello_thread";
     let libs_to_rewrite = [
         ("libc.so.6", "/lib/x86_64-linux-gnu"),
         ("ld-linux-x86-64.so.2", "/lib64"),
@@ -420,8 +420,8 @@ fn test_nodejs_with_rewriter() {
 }
 
 #[test]
-fn debug_hello_dyn() {
-    println!("Debug hello_world_dyn test...");
+
+    println!("Debug test...");
 
     // Use the already compiled test binaries from the tests folder
     let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -430,7 +430,7 @@ fn debug_hello_dyn() {
     let rootfs_tar_path = "C:\\Users\\t-chuqizhang\\GitHub\\litebox\\target\\debug\\build\\litebox_runner_linux_on_windows_userland-77ce16ea9e7ec59a\\out\\rootfs_rewriter.tar";
 
     let rootfs_tar = std::path::PathBuf::from(&rootfs_tar_path);
-    let hello_world_dyn_hooked = test_dir.join("hello_world_dyn.hooked");
+    let testcase_hooked = test_dir.join("hello_thread.hooked");
 
     // Verify the required files exist
     assert!(
@@ -439,15 +439,15 @@ fn debug_hello_dyn() {
         rootfs_tar
     );
     assert!(
-        hello_world_dyn_hooked.exists(),
-        "hello_world_dyn.hooked not found at {:?}",
-        hello_world_dyn_hooked
+        testcase_hooked.exists(),
+        "hello_thread.hooked not found at {:?}",
+        testcase_hooked
     );
     
     // Create CliArgs directly to test the run function
     let cli_args = litebox_runner_linux_on_windows_userland::CliArgs {
         program_and_arguments: vec![
-            hello_world_dyn_hooked.to_string_lossy().to_string(),
+            testcase_hooked.to_string_lossy().to_string(),
         ],
         environment_variables: vec![
             "LD_LIBRARY_PATH=/lib64:/lib32:/lib".to_string(),

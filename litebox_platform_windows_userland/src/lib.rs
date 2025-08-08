@@ -109,12 +109,14 @@ impl Drop for TlsSlot {
     }
 }
 
-/// Information about a 64KB-aligned allocation region
+/// Information about a system allocation-granularity (64KB)-aligned allocation region
 #[derive(Debug, Clone)]
 struct AllocationInfo {
-    /// The actual 64KB-aligned range allocated by VirtualAlloc2
-    actual_range: core::ops::Range<usize>,
-    /// Set of subranges currently in use within this allocation (automatically merges adjacent ranges)
+    /// The 64KB granularity-aligned range that this AllocationInfo represents
+    current_granularity_range: core::ops::Range<usize>,
+    /// The actual full range reserved by VirtualAlloc2 that contains this granularity range
+    full_reserved_range: core::ops::Range<usize>,
+    /// Set of subranges currently in use within this granularity range (automatically merges adjacent ranges)
     used_subranges: RangeSet<usize>,
 }
 
@@ -328,57 +330,23 @@ impl WindowsUserland {
         self.set_thread_local_storage(tls);
     }
 
-    /// Find the 64KB-aligned allocation that contains the given address
-    fn find_containing_allocation(&self, addr: usize) -> Option<AllocationInfo> {
-        let tracker = self.allocation_tracker.read().unwrap();
-        
-        // Align the address to granularity to get the potential key
-        let aligned_addr = self.round_down_to_granu(addr);
-        println!("[find_containing_allocation] Looking for allocation containing address: {:#x}, aligned to: {:#x}", addr, aligned_addr);
-        
-        // Lookup by aligned address key
-        if let Some(info) = tracker.get(&aligned_addr) {
-            assert!(addr >= info.actual_range.start && addr < info.actual_range.end,
-                    "Address {:#x} is not within the AllocationInfo range {:#x} - {:#x}",
-                    addr, info.actual_range.start, info.actual_range.end);
-            return Some(info.clone());
-        }
-        
-        None
-    }
-
-    /// Track a new 64KB-aligned allocation
-    fn track_allocation(&self, actual_range: core::ops::Range<usize>, used_subrange: core::ops::Range<usize>) {
-        // assert!(used_subrange.start >= actual_range.start && used_subrange.end <= actual_range.end,
-        //         "[track_allocation] used_subrange: ({:#x} - {:#x}) must be within the actual allocation range ({:#x} - {:#x})",
-        //         used_subrange.start, used_subrange.end, actual_range.start, actual_range.end);
-        println!("[track_allocation] Start tracking allocation: {:p} - {:p}, used: {:p} - {:p}",
-                 actual_range.start as *const c_void,
-                 actual_range.end as *const c_void,
-                 used_subrange.start as *const c_void,
-                 used_subrange.end as *const c_void);
-
+    /// Track a new platform allocation granularity (64KB)-aligned allocation
+    fn track_allocation(&self, current_granularity_range: core::ops::Range<usize>, full_reserved_range: core::ops::Range<usize>, used_subrange: core::ops::Range<usize>) {
 
         let mut tracker = self.allocation_tracker.write().unwrap();
         let mut used_subranges = RangeSet::new();
         used_subranges.insert(used_subrange.clone());
         
         let info = AllocationInfo {
-            actual_range: actual_range.clone(),
+            current_granularity_range: current_granularity_range.clone(),
+            full_reserved_range: full_reserved_range.clone(),
             used_subranges,
         };
         
-        tracker.insert(actual_range.start, info);
-        
-        // Access the info from the tracker after inserting it
-        let inserted_info = tracker.get(&actual_range.start).unwrap();
-        println!("[track_allocation] Tracked new allocation: {:#x} - {:#x}, all subranges: {:?}",
-             actual_range.start,
-             actual_range.end,
-            inserted_info.used_subranges.iter().map(|range| format!("{:#x}..{:#x}", range.start, range.end)).collect::<Vec<_>>());
+        tracker.insert(current_granularity_range.start, info);
     }
 
-    /// Add a subrange to existing allocations (may span multiple allocation's granularity-aligned regions)
+    /// Add a subrange to existing allocations (may span multiple platform_allocation_granularity-aligned regions)
     fn add_subrange_to_allocations(&self, subrange: core::ops::Range<usize>) {
         println!("[add_subrange] Adding subrange: {:p} - {:p}",
             subrange.start as *const c_void,
@@ -393,22 +361,17 @@ impl WindowsUserland {
         // Process all potential allocation regions that the subrange might span
         while current_addr < subrange_end {
             if let Some(info) = tracker.get_mut(&current_addr) {
-                // Calculate the portion of the subrange that overlaps with this allocation
-                let overlap_start = subrange.start.max(info.actual_range.start);
-                let overlap_end = subrange_end.min(info.actual_range.end);
+                // Calculate the portion of the subrange that overlaps with this granularity range
+                let overlap_start = subrange.start.max(info.current_granularity_range.start);
+                let overlap_end = subrange_end.min(info.current_granularity_range.end);
                 
                 if overlap_start < overlap_end {
                     let overlap_range = overlap_start..overlap_end;
                     info.used_subranges.insert(overlap_range.clone());
-
-                    println!("[add_subrange] AllocationInfo ({:#x} - {:#x}) now has all subranges: {:?}",
-                        info.actual_range.start,
-                        info.actual_range.end,
-                        info.used_subranges.iter().map(|range| format!("{:#x}..{:#x}", range.start, range.end)).collect::<Vec<_>>());
                 }
                 
                 // Move to the next potential allocation region
-                current_addr = info.actual_range.end;
+                current_addr = info.current_granularity_range.end;
             } else {
                 // No allocation at this address, move to the next granularity-aligned address
                 panic!("No allocation found for address: {:#x}", current_addr);
@@ -416,14 +379,15 @@ impl WindowsUserland {
         }
     }
 
-    /// Remove a subrange from allocation(s) and return ranges that should be freed
+    /// Remove a subrange from allocation(s) and return reserved ranges that should be freed
     fn remove_subrange_from_allocations(&self, range: core::ops::Range<usize>) -> Vec<core::ops::Range<usize>> {
         println!("[remove_subrange] Removing subrange: {:p} - {:p}",
             range.start as *const c_void,
             range.end as *const c_void);
-
+        let granularity = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
         let mut tracker = self.allocation_tracker.write().unwrap();
-        let mut allocations_to_free = Vec::new();
+        let mut reserved_ranges_to_check = std::collections::HashSet::new();
+        let mut reserved_ranges_to_free = Vec::new();
         
         // Start from the aligned address of the range start
         let mut current_addr = self.round_down_to_granu(range.start);
@@ -432,46 +396,74 @@ impl WindowsUserland {
         // Process all potential allocation regions that the range might span
         while current_addr < range_end {
             if let Some(info) = tracker.get_mut(&current_addr) {
-                // Calculate the portion of the range that overlaps with this allocation
-                let overlap_start = range.start.max(info.actual_range.start);
-                let overlap_end = range_end.min(info.actual_range.end);
+                // Calculate the portion of the range that overlaps with this granularity range
+                let overlap_start = range.start.max(info.current_granularity_range.start);
+                let overlap_end = range_end.min(info.current_granularity_range.end);
                 
                 if overlap_start < overlap_end {
                     let overlap_range = overlap_start..overlap_end;
                     
+                    // Record the reserved range for later checking
+                    reserved_ranges_to_check.insert(info.full_reserved_range.clone());
+                    
                     // Directly remove the overlap range from RangeSet (it handles all the complexity)
                     info.used_subranges.remove(overlap_range.clone());
-
-                    println!("[remove_subrange] Removed from allocationInfo ({:#x} - {:#x}) now has all subranges: {:?}",
-                        info.actual_range.start,
-                        info.actual_range.end,
-                        info.used_subranges.iter().map(|range| format!("{:#x}..{:#x}", range.start, range.end)).collect::<Vec<_>>());
-
-                    // If no more subranges are in use, mark for freeing
-                    if info.used_subranges.is_empty() {
-                        let allocation_to_free = info.actual_range.clone();
-                        println!("[remove_subrange] Marking allocation {:p} - {:p} for freeing",
-                                    info.actual_range.start as *const c_void,
-                                    info.actual_range.end as *const c_void);
-                        
-                        allocations_to_free.push(allocation_to_free);
-                    }
                 }
                 
                 // Move to the next potential allocation region
-                current_addr = info.actual_range.end;
+                current_addr = info.current_granularity_range.end;
             } else {
                 // No allocation at this address, move to the next granularity-aligned address
                 current_addr += self.sys_info.read().unwrap().dwAllocationGranularity as usize;
             }
         }
         
-        // // Remove the allocations that should be freed from the tracker
-        // for allocation in &allocations_to_free {
-        //     tracker.remove(&allocation.start);
-        // }
+        // Check each reserved range to see if it's completely empty
+        for reserved_range in reserved_ranges_to_check {
+            let mut is_reserved_range_empty = true;
+            
+            // Check all granularity chunks within this reserved range
+            let mut check_addr = reserved_range.start;
+            
+            while check_addr < reserved_range.end {
+                if let Some(info) = tracker.get(&check_addr) {
+                    assert!(info.full_reserved_range == reserved_range);
+                    if !info.used_subranges.is_empty() {
+                        is_reserved_range_empty = false;
+                        break;
+                    }
+                }
+                check_addr += granularity;
+            }
+            
+            // If the entire reserved range is empty, mark it for freeing and remove all its allocations
+            if is_reserved_range_empty {
+                println!("[remove_subrange] Reserved range {:p} - {:p} is completely empty, marking for freeing",
+                        reserved_range.start as *const c_void,
+                        reserved_range.end as *const c_void);
+                
+                // Remove all allocation entries for this reserved range
+                let mut addrs_to_remove = Vec::new();
+                check_addr = reserved_range.start;
+                while check_addr < reserved_range.end {
+                    if let Some(info) = tracker.get(&check_addr) {
+                        if info.full_reserved_range == reserved_range {
+                            addrs_to_remove.push(check_addr);
+                        }
+                    }
+                    check_addr += granularity;
+                }
+                
+                for addr in addrs_to_remove {
+                    tracker.remove(&addr);
+                }
+                
+                // Add to the list of reserved ranges to be freed
+                reserved_ranges_to_free.push(reserved_range);
+            }
+        }
         
-        allocations_to_free
+        reserved_ranges_to_free
     }
 }
 
@@ -1194,7 +1186,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             let used_size_in_chunk = core::cmp::min(remaining_size, granularity);
             let used_subrange = current_actual..(current_actual + used_size_in_chunk);
             
-            self.track_allocation(current_chunk, used_subrange);
+            self.track_allocation(current_chunk.clone(), actual_range.clone(), used_subrange);
             
             remaining_size -= used_size_in_chunk;
             current_actual = chunk_end;
@@ -1222,11 +1214,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                  range.start as *mut c_void, range.end as *mut c_void);
         
         // Use our tracking mechanism to handle proper deallocation
-        let regions_to_free = self.remove_subrange_from_allocations(range.clone());
+        let reserved_regions_to_free = self.remove_subrange_from_allocations(range.clone());
         
-        if !regions_to_free.is_empty() {
+        // if false { // debug
+        if !reserved_regions_to_free.is_empty() {
             // Free all 64KB regions that are now completely unused
-            for region_to_free in regions_to_free {
+            for region_to_free in reserved_regions_to_free {
                 println!("[deallocate_pages] Freeing entire region: {:p} - {:p}",
                          region_to_free.start as *mut c_void, 
                          region_to_free.end as *mut c_void);
@@ -1234,8 +1227,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 let ok = unsafe {
                     VirtualFree(
                         region_to_free.start as *mut c_void,
-                        region_to_free.len(),
-                        Win32_Memory::MEM_DECOMMIT,
+                        0,
+                        Win32_Memory::MEM_RELEASE,
                     ) != 0
                 };
                 assert!(ok, "VirtualFree(MEM_RELEASE) failed: {}", unsafe { GetLastError() });
@@ -1480,11 +1473,18 @@ unsafe extern "C" fn syscall_handler(
                 .read()
                 .unwrap()
                 .expect("Should have run `register_syscall_handler` by now");
+            // check if d is Futex
+            if syscall_number == 202 {
+                println!("futex happened");
+            }
             syscall_handler(d)
         }
         Err(err) => err.as_neg() as isize,
     };
-
+    println!(
+        "[syscall_handler] syscall_number: {}, res: {}",
+        syscall_number, res
+    );
     res
 }
 
