@@ -381,7 +381,9 @@ impl From<litebox::fs::FileStatus> for FileStat {
             st_ino: <_>::try_from(ino).unwrap(),
             st_nlink: 1,
             st_mode: (mode.bits() | InodeType::from(file_type) as u32).truncate(),
+            #[cfg_attr(target_arch = "x86", expect(clippy::useless_conversion))]
             st_uid: <_>::from(user),
+            #[cfg_attr(target_arch = "x86", expect(clippy::useless_conversion))]
             st_gid: <_>::from(group),
             st_rdev: rdev
                 .map(|r| <_>::try_from(r.get()).unwrap())

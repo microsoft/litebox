@@ -324,10 +324,10 @@ pub(crate) fn sys_clone(
             }),
         )
     }?;
-    if flags.contains(CloneFlags::PARENT_SETTID) {
-        if let Some(parent_tid_ptr) = parent_tid {
-            let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid.truncate()) };
-        }
+    if flags.contains(CloneFlags::PARENT_SETTID)
+        && let Some(parent_tid_ptr) = parent_tid
+    {
+        let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid.truncate()) };
     }
     NR_THREADS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Ok(child_tid)

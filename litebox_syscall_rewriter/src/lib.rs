@@ -508,10 +508,10 @@ fn get_control_transfer_targets(
             if ops.len() != 1 {
                 continue; // We expect a single operand when it's a direct control transfer
             }
-            if let capstone::arch::ArchOperand::X86Operand(op) = &ops[0] {
-                if let capstone::arch::x86::X86OperandType::Imm(imm) = op.op_type {
-                    control_transfer_targets.insert(u64::try_from(imm).unwrap());
-                }
+            if let capstone::arch::ArchOperand::X86Operand(op) = &ops[0]
+                && let capstone::arch::x86::X86OperandType::Imm(imm) = op.op_type
+            {
+                control_transfer_targets.insert(u64::try_from(imm).unwrap());
             }
         }
     }
