@@ -603,7 +603,7 @@ impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
         // On windows there's a threshold below which we consider two timestamps
         // equivalent due to measurement error. For more details + doc link,
-        // check the docs on epsilon.
+        // check the docs on [epsilon](perf_counter::PerformanceCounterInstant::epsilon).
         let epsilon = perf_counter::PerformanceCounterInstant::epsilon();
         if earlier.inner > self.inner && earlier.inner - self.inner <= epsilon {
             Some(Duration::new(0, 0))

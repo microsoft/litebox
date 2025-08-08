@@ -540,8 +540,7 @@ impl litebox::platform::TimeProvider for FreeBSDUserland {
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, t.as_mut_ptr()) };
         let t = unsafe { t.assume_init() };
         Instant {
-            inner: std::time::Instant::now(),
-            #[allow(clippy::useless_conversion, reason = "conversion is needed for 32bit")]
+            #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
             inner: litebox_common_linux::Timespec {
                 tv_sec: i64::from(t.tv_sec),
                 tv_nsec: u64::from(t.tv_nsec.reinterpret_as_unsigned()),
