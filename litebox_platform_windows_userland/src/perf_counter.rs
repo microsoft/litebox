@@ -101,23 +101,25 @@ pub fn mul_div_u64(value: u64, numer: u64, denom: u64) -> u64 {
 /// Returns (seconds, nanoseconds)
 pub fn get_timespec(clock_id: litebox::platform::ClockType) -> (i64, i64) {
     match clock_id {
-        litebox::platform::ClockType::Realtime => { // CLOCK_REALTIME
+        litebox::platform::ClockType::Realtime => {
+            // CLOCK_REALTIME
             unsafe {
                 let mut ft: u64 = 0;
                 GetSystemTimeAsFileTime(&mut ft as *mut u64 as *mut _);
-                
+
                 // Windows FILETIME is 100-nanosecond intervals since January 1, 1601
                 // Unix epoch starts January 1, 1970
                 const FILETIME_TO_UNIX_EPOCH: u64 = 116444736000000000; // 100ns units
-                
+
                 let unix_time_100ns = ft - FILETIME_TO_UNIX_EPOCH;
                 let seconds = unix_time_100ns / 10_000_000; // 100ns to seconds
                 let nanoseconds = (unix_time_100ns % 10_000_000) * 100; // remaining 100ns to ns
-                
+
                 (seconds as i64, nanoseconds as i64)
             }
         }
-        litebox::platform::ClockType::Monotonic => { // CLOCK_MONOTONIC
+        litebox::platform::ClockType::Monotonic => {
+            // CLOCK_MONOTONIC
             let instant = PerformanceCounterInstant::now();
             instant.to_timespec_monotonic()
         }

@@ -12,11 +12,11 @@ use std::os::raw::c_void;
 use std::sync::atomic::Ordering::SeqCst;
 
 use litebox::platform::RawConstPointer;
+use litebox::platform::RawMutexBlockError;
 use litebox::platform::ThreadLocalStorageProvider;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
-use litebox::platform::RawMutexBlockError;
 use litebox_common_linux::PunchthroughSyscall;
 use rangemap::RangeSet;
 
@@ -273,10 +273,12 @@ impl WindowsUserland {
                     end: (mbi.BaseAddress as usize + mbi.RegionSize) as usize,
                 });
                 // todo(chuqi): debug log
-                println!("[read_memory_map] Found reserved page: 0x{:#x} - 0x{:#x} (state: {:?})", 
-                         mbi.BaseAddress as usize, 
-                         mbi.BaseAddress as usize + mbi.RegionSize as usize,
-                         mbi.State);
+                println!(
+                    "[read_memory_map] Found reserved page: 0x{:#x} - 0x{:#x} (state: {:?})",
+                    mbi.BaseAddress as usize,
+                    mbi.BaseAddress as usize + mbi.RegionSize as usize,
+                    mbi.State
+                );
             }
 
             address = (mbi.BaseAddress as usize + mbi.RegionSize) as usize;
@@ -331,45 +333,50 @@ impl WindowsUserland {
     }
 
     /// Track a new platform allocation granularity (64KB)-aligned allocation
-    fn track_allocation(&self, current_granularity_range: core::ops::Range<usize>, full_reserved_range: core::ops::Range<usize>, used_subrange: core::ops::Range<usize>) {
-
+    fn track_allocation(
+        &self,
+        current_granularity_range: core::ops::Range<usize>,
+        full_reserved_range: core::ops::Range<usize>,
+        used_subrange: core::ops::Range<usize>,
+    ) {
         let mut tracker = self.allocation_tracker.write().unwrap();
         let mut used_subranges = RangeSet::new();
         used_subranges.insert(used_subrange.clone());
-        
+
         let info = AllocationInfo {
             current_granularity_range: current_granularity_range.clone(),
             full_reserved_range: full_reserved_range.clone(),
             used_subranges,
         };
-        
+
         tracker.insert(current_granularity_range.start, info);
     }
 
     /// Add a subrange to existing allocations (may span multiple platform_allocation_granularity-aligned regions)
     fn add_subrange_to_allocations(&self, subrange: core::ops::Range<usize>) {
-        println!("[add_subrange] Adding subrange: {:p} - {:p}",
-            subrange.start as *const c_void,
-            subrange.end as *const c_void);
-        
+        println!(
+            "[add_subrange] Adding subrange: {:p} - {:p}",
+            subrange.start as *const c_void, subrange.end as *const c_void
+        );
+
         let mut tracker = self.allocation_tracker.write().unwrap();
-        
+
         // Start from the aligned address of the subrange start
         let mut current_addr = self.round_down_to_granu(subrange.start);
         let subrange_end = subrange.end;
-        
+
         // Process all potential allocation regions that the subrange might span
         while current_addr < subrange_end {
             if let Some(info) = tracker.get_mut(&current_addr) {
                 // Calculate the portion of the subrange that overlaps with this granularity range
                 let overlap_start = subrange.start.max(info.current_granularity_range.start);
                 let overlap_end = subrange_end.min(info.current_granularity_range.end);
-                
+
                 if overlap_start < overlap_end {
                     let overlap_range = overlap_start..overlap_end;
                     info.used_subranges.insert(overlap_range.clone());
                 }
-                
+
                 // Move to the next potential allocation region
                 current_addr = info.current_granularity_range.end;
             } else {
@@ -380,36 +387,40 @@ impl WindowsUserland {
     }
 
     /// Remove a subrange from allocation(s) and return reserved ranges that should be freed
-    fn remove_subrange_from_allocations(&self, range: core::ops::Range<usize>) -> Vec<core::ops::Range<usize>> {
-        println!("[remove_subrange] Removing subrange: {:p} - {:p}",
-            range.start as *const c_void,
-            range.end as *const c_void);
+    fn remove_subrange_from_allocations(
+        &self,
+        range: core::ops::Range<usize>,
+    ) -> Vec<core::ops::Range<usize>> {
+        println!(
+            "[remove_subrange] Removing subrange: {:p} - {:p}",
+            range.start as *const c_void, range.end as *const c_void
+        );
         let granularity = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
         let mut tracker = self.allocation_tracker.write().unwrap();
         let mut reserved_ranges_to_check = std::collections::HashSet::new();
         let mut reserved_ranges_to_free = Vec::new();
-        
+
         // Start from the aligned address of the range start
         let mut current_addr = self.round_down_to_granu(range.start);
         let range_end = range.end;
-        
+
         // Process all potential allocation regions that the range might span
         while current_addr < range_end {
             if let Some(info) = tracker.get_mut(&current_addr) {
                 // Calculate the portion of the range that overlaps with this granularity range
                 let overlap_start = range.start.max(info.current_granularity_range.start);
                 let overlap_end = range_end.min(info.current_granularity_range.end);
-                
+
                 if overlap_start < overlap_end {
                     let overlap_range = overlap_start..overlap_end;
-                    
+
                     // Record the reserved range for later checking
                     reserved_ranges_to_check.insert(info.full_reserved_range.clone());
-                    
+
                     // Directly remove the overlap range from RangeSet (it handles all the complexity)
                     info.used_subranges.remove(overlap_range.clone());
                 }
-                
+
                 // Move to the next potential allocation region
                 current_addr = info.current_granularity_range.end;
             } else {
@@ -417,14 +428,14 @@ impl WindowsUserland {
                 current_addr += self.sys_info.read().unwrap().dwAllocationGranularity as usize;
             }
         }
-        
+
         // Check each reserved range to see if it's completely empty
         for reserved_range in reserved_ranges_to_check {
             let mut is_reserved_range_empty = true;
-            
+
             // Check all granularity chunks within this reserved range
             let mut check_addr = reserved_range.start;
-            
+
             while check_addr < reserved_range.end {
                 if let Some(info) = tracker.get(&check_addr) {
                     assert!(info.full_reserved_range == reserved_range);
@@ -435,13 +446,14 @@ impl WindowsUserland {
                 }
                 check_addr += granularity;
             }
-            
+
             // If the entire reserved range is empty, mark it for freeing and remove all its allocations
             if is_reserved_range_empty {
-                println!("[remove_subrange] Reserved range {:p} - {:p} is completely empty, marking for freeing",
-                        reserved_range.start as *const c_void,
-                        reserved_range.end as *const c_void);
-                
+                println!(
+                    "[remove_subrange] Reserved range {:p} - {:p} is completely empty, marking for freeing",
+                    reserved_range.start as *const c_void, reserved_range.end as *const c_void
+                );
+
                 // Remove all allocation entries for this reserved range
                 let mut addrs_to_remove = Vec::new();
                 check_addr = reserved_range.start;
@@ -453,16 +465,16 @@ impl WindowsUserland {
                     }
                     check_addr += granularity;
                 }
-                
+
                 for addr in addrs_to_remove {
                     tracker.remove(&addr);
                 }
-                
+
                 // Add to the list of reserved ranges to be freed
                 reserved_ranges_to_free.push(reserved_range);
             }
         }
-        
+
         reserved_ranges_to_free
     }
 }
@@ -1088,8 +1100,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     // In case of cross-region allocation, we must ensure that the virtual address
                     // returned by VirtualAlloc2 is the expected start address (contiguous with the
                     // already reserved region).
-                    println!("Start cross-region alloc: {:p} - {:p}", 
-                                region_end as *mut c_void, request_end as *mut c_void);
+                    println!(
+                        "Start cross-region alloc: {:p} - {:p}",
+                        region_end as *mut c_void, request_end as *mut c_void
+                    );
                     <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
                             self,
                             region_end..request_end,
@@ -1098,8 +1112,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                             populate_pages_immediately,
                             true,
                         )?;
-                    println!("End cross-region alloc: {:p} - {:p}",
-                                region_end as *mut c_void, request_end as *mut c_void);
+                    println!(
+                        "End cross-region alloc: {:p} - {:p}",
+                        region_end as *mut c_void, request_end as *mut c_void
+                    );
                 }
                 // Prefetch the memory range if requested
                 if populate_pages_immediately {
@@ -1108,8 +1124,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
                 println!(
                     "[allocate_pages end] Successfully allocated pages at {:p} with size {}",
-                    base_addr,
-                    size
+                    base_addr, size
                 );
                 return Ok(litebox::platform::trivial_providers::TransparentMutPtr {
                     inner: base_addr.cast::<u8>(),
@@ -1133,12 +1148,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             println!("Trigger dbg point");
         }
         if suggested_range.start == 0x7ffffd3a4000 {
-            println!("Suggested range: {:p} - {:p}, aligned range: {:p} - {:p}, size: {}",
-                base_addr, 
+            println!(
+                "Suggested range: {:p} - {:p}, aligned range: {:p} - {:p}, size: {}",
+                base_addr,
                 (base_addr as usize + size) as *mut c_void,
                 aligned_base_addr,
                 (aligned_base_addr as usize + aligned_size) as *mut c_void,
-                aligned_size);
+                aligned_size
+            );
             println!("Bug trigger.");
         }
 
@@ -1178,7 +1195,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             );
         }
 
-        // Track the new allocation - break down to allocation_granularity-sized chunk. This is to avoid the 
+        // Track the new allocation - break down to allocation_granularity-sized chunk. This is to avoid the
         // gap when tracking `AllocationInformation` in huge memory chunks such as 4 * 64KB sizes.
         let granularity = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
         let actual_range = (addr as usize)..(addr as usize + aligned_size);
@@ -1190,13 +1207,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             assert!(current_actual + granularity <= actual_range.end);
             let chunk_end = current_actual + granularity;
             let current_chunk = current_actual..chunk_end;
-            
+
             // Calculate how much of this chunk is actually used
             let used_size_in_chunk = core::cmp::min(remaining_size, granularity);
             let used_subrange = current_actual..(current_actual + used_size_in_chunk);
-            
+
             self.track_allocation(current_chunk.clone(), actual_range.clone(), used_subrange);
-            
+
             remaining_size -= used_size_in_chunk;
             current_actual = chunk_end;
         }
@@ -1207,8 +1224,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         }
         println!(
             "[allocate_pages end] Successfully allocated pages at {:p} with size {}",
-            addr,
-            aligned_size
+            addr, aligned_size
         );
         Ok(litebox::platform::trivial_providers::TransparentMutPtr {
             inner: addr.cast::<u8>(),
@@ -1219,20 +1235,23 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
-        println!("[deallocate_pages] Deallocating range: {:p} - {:p}",
-                 range.start as *mut c_void, range.end as *mut c_void);
-        
+        println!(
+            "[deallocate_pages] Deallocating range: {:p} - {:p}",
+            range.start as *mut c_void, range.end as *mut c_void
+        );
+
         // Use our tracking mechanism to handle proper deallocation
         let reserved_regions_to_free = self.remove_subrange_from_allocations(range.clone());
-        
+
         // if false { // debug
         if !reserved_regions_to_free.is_empty() {
             // Free all 64KB regions that are now completely unused
             for region_to_free in reserved_regions_to_free {
-                println!("[deallocate_pages] Freeing entire region: {:p} - {:p}",
-                         region_to_free.start as *mut c_void, 
-                         region_to_free.end as *mut c_void);
-                
+                println!(
+                    "[deallocate_pages] Freeing entire region: {:p} - {:p}",
+                    region_to_free.start as *mut c_void, region_to_free.end as *mut c_void
+                );
+
                 let ok = unsafe {
                     VirtualFree(
                         region_to_free.start as *mut c_void,
@@ -1240,13 +1259,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                         Win32_Memory::MEM_RELEASE,
                     ) != 0
                 };
-                assert!(ok, "VirtualFree(MEM_RELEASE) failed: {}", unsafe { GetLastError() });
+                assert!(ok, "VirtualFree(MEM_RELEASE) failed: {}", unsafe {
+                    GetLastError()
+                });
             }
         } else {
             // Just decommit the requested range, don't release any entire regions
-            println!("[deallocate_pages] Decommitting range: {:p} - {:p}",
-                     range.start as *mut c_void, range.end as *mut c_void);
-            
+            println!(
+                "[deallocate_pages] Decommitting range: {:p} - {:p}",
+                range.start as *mut c_void, range.end as *mut c_void
+            );
+
             let ok = unsafe {
                 VirtualFree(
                     range.start as *mut c_void,
@@ -1254,7 +1277,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     Win32_Memory::MEM_DECOMMIT,
                 ) != 0
             };
-            assert!(ok, "VirtualFree(MEM_DECOMMIT) failed: {}", unsafe { GetLastError() });
+            assert!(ok, "VirtualFree(MEM_DECOMMIT) failed: {}", unsafe {
+                GetLastError()
+            });
         }
         println!("Done.");
         if range.start == 0x7ffffbb40000 && range.end == 0x7ffffbd62000 {
@@ -1566,7 +1591,7 @@ mod tests {
 
     use crate::WindowsUserland;
     use litebox::platform::PageManagementProvider;
-    use litebox::platform::{RawMutex, UserRawMutex as _, ThreadLocalStorageProvider as _};
+    use litebox::platform::{RawMutex, ThreadLocalStorageProvider as _, UserRawMutex as _};
 
     #[test]
     fn test_raw_mutex() {
