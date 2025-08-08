@@ -578,8 +578,10 @@ impl litebox::platform::TimeProvider for FreeBSDUserland {
     }
 
     fn get_timespec(&self, clock_type: litebox::platform::ClockType) -> Self::Timespec {
-        unimplemented!("get_timespec is not implemented for FreeBSD yet. Clock type: {:?}", 
-                        clock_type);
+        unimplemented!(
+            "get_timespec is not implemented for FreeBSD yet. Clock type: {:?}",
+            clock_type
+        );
     }
 }
 

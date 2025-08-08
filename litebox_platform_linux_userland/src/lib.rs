@@ -8,7 +8,6 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
-use std::unimplemented;
 
 use litebox::fs::OFlags;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
@@ -750,8 +749,10 @@ impl litebox::platform::TimeProvider for LinuxUserland {
     }
 
     fn get_timespec(&self, clock_type: litebox::platform::ClockType) -> Self::Timespec {
-        unimplemented!("get_timespec is not implemented for Linux userland (vdso is assumed as available). clock_type: {:?}", 
-                        clock_type);
+        unimplemented!(
+            "get_timespec is not implemented for Linux userland (vdso is assumed as available). clock_type: {:?}",
+            clock_type
+        );
     }
 }
 

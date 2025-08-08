@@ -450,10 +450,29 @@ pub(crate) fn sys_clock_gettime(
         _ => panic!("Unsupported clock ID: {}", clockid),
     };
 
-    let timespec = litebox_platform_multiplex::platform().get_timespec(
-        clocktype
-    );
+    let timespec = litebox_platform_multiplex::platform().get_timespec(clocktype);
     unsafe { tp.write_at_offset(0, timespec) }.ok_or(Errno::EFAULT)
+}
+
+/// Handle syscall `gettimeofday`.
+pub(crate) fn sys_gettimeofday(
+    tv: crate::MutPtr<litebox_common_linux::TimeVal>,
+    tz: crate::MutPtr<litebox_common_linux::TimeZone>,
+) -> Result<(), Errno> {
+    // Get current realtime (wall clock time)
+    let timespec =
+        litebox_platform_multiplex::platform().get_timespec(litebox::platform::ClockType::Realtime);
+
+    // Convert to TimeVal if requested.
+    let timeval = litebox_common_linux::TimeVal::from(timespec);
+    unsafe { tv.write_at_offset(0, timeval) };
+
+    // Handle timezone parameter (usually NULL and deprecated)
+    // Return timezone as UTC (0 minutes west, no DST)
+    let timezone = litebox_common_linux::TimeZone::new(0, 0);
+    unsafe { tz.write_at_offset(0, timezone) };
+
+    Ok(())
 }
 
 /// Handle syscall `getpid`.

@@ -680,6 +680,30 @@ pub struct TimeVal {
     tv_usec: suseconds_t,
 }
 
+impl TimeVal {
+    /// Create a new TimeVal with the given seconds and microseconds
+    pub fn new(tv_sec: time_t, tv_usec: suseconds_t) -> Self {
+        Self { tv_sec, tv_usec }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TimeZone {
+    tz_minuteswest: i32,
+    tz_dsttime: i32,
+}
+
+impl TimeZone {
+    /// Create a new TimeZone with the given minutes west of UTC and DST time flag
+    pub fn new(tz_minuteswest: i32, tz_dsttime: i32) -> Self {
+        Self {
+            tz_minuteswest,
+            tz_dsttime,
+        }
+    }
+}
+
 const MICROS_PER_SEC: i32 = 1_000_000;
 impl TryFrom<TimeVal> for core::time::Duration {
     type Error = errno::Errno;
@@ -694,6 +718,14 @@ impl TryFrom<TimeVal> for core::time::Duration {
                 u32::try_from(value.tv_usec * 1000).map_err(|_| errno::Errno::EDOM)?,
             ))
         }
+    }
+}
+
+impl From<Timespec> for TimeVal {
+    fn from(timespec: Timespec) -> Self {
+        let tv_sec = timespec.tv_sec as time_t;
+        let tv_usec = (timespec.tv_nsec / 1000) as suseconds_t; // Convert nanoseconds to microseconds
+        Self::new(tv_sec, tv_usec)
     }
 }
 
@@ -1621,8 +1653,12 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         user_desc: Platform::RawMutPointer<UserDesc>,
     },
     ClockGettime {
-        clockid: i32, 
+        clockid: i32,
         tp: Platform::RawMutPointer<Timespec>,
+    },
+    Gettimeofday {
+        tv: Platform::RawMutPointer<TimeVal>,
+        tz: Platform::RawMutPointer<TimeZone>,
     },
     Getrlimit {
         resource: RlimitResource,
@@ -2027,6 +2063,10 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 pathname: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
                 bufsiz: ctx.syscall_arg(3),
+            },
+            Sysno::gettimeofday => SyscallRequest::Gettimeofday {
+                tv: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
+                tz: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
             },
             Sysno::clock_gettime => SyscallRequest::ClockGettime {
                 clockid: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),

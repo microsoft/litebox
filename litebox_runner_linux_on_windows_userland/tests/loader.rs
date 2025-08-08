@@ -230,7 +230,7 @@ fn test_static_linked_prog_with_rewriter() {
 fn run_dynamic_linked_prog_with_rewriter(
     libs_to_rewrite: &[(&str, &str)],
     libs_no_rewrite: &[(&str, &str)],
-    exec_name: &str, 
+    exec_name: &str,
     cmd_args: &[&str],
     install_files: fn(std::path::PathBuf),
 ) {
@@ -268,7 +268,10 @@ fn run_dynamic_linked_prog_with_rewriter(
 
     // Create tar file containing all dependencies
     let tar_src_path = std::path::Path::new(&out_path).join("test_program_tar");
-    println!("Creating tar source directory path: {}", tar_src_path.to_str().unwrap());
+    println!(
+        "Creating tar source directory path: {}",
+        tar_src_path.to_str().unwrap()
+    );
 
     std::fs::create_dir_all(tar_src_path.join("out")).unwrap();
 
@@ -279,10 +282,11 @@ fn run_dynamic_linked_prog_with_rewriter(
         let dst = dst_dir.join(file);
         std::fs::create_dir_all(&dst_dir).unwrap();
         let _ = std::fs::remove_file(&dst);
-        println!("Running `cargo run -p litebox_syscall_rewriter -- {} -o {}`",
-                 src.to_str().unwrap(),
-                 dst.to_str().unwrap(),
-                );
+        println!(
+            "Running `cargo run -p litebox_syscall_rewriter -- {} -o {}`",
+            src.to_str().unwrap(),
+            dst.to_str().unwrap(),
+        );
         let output = std::process::Command::new("cargo")
             .args([
                 "run",
@@ -310,7 +314,11 @@ fn run_dynamic_linked_prog_with_rewriter(
         let dst = dst_dir.join(file);
         std::fs::create_dir_all(&dst_dir).unwrap();
         let _ = std::fs::remove_file(&dst);
-        println!("Copying {} to {}", src.to_str().unwrap(), dst.to_str().unwrap());
+        println!(
+            "Copying {} to {}",
+            src.to_str().unwrap(),
+            dst.to_str().unwrap()
+        );
         std::fs::copy(&src, &dst).unwrap();
     }
 
@@ -380,11 +388,12 @@ fn test_testcase_dynamic_with_rewriter() {
 
     // Run
     run_dynamic_linked_prog_with_rewriter(
-        &libs_to_rewrite, 
-        &libs_no_rewrite, 
-        exec_name, 
-        &[], 
-        |_| {});
+        &libs_to_rewrite,
+        &libs_no_rewrite,
+        exec_name,
+        &[],
+        |_| {},
+    );
 }
 
 #[test]
@@ -400,22 +409,22 @@ fn test_nodejs_with_rewriter() {
         ("ld-linux-x86-64.so.2", "/lib64"),
     ];
     let libs_no_rewrite = [("litebox_rtld_audit.so", "/lib64")];
-    
+
     const HELLO_WORLD_JS: &str = r"
         const fs = require('node:fs');
 
         const content = 'Hello World!';
         console.log(content);
         ";
-    
+
     run_dynamic_linked_prog_with_rewriter(
-        &libs_to_rewrite, 
-        &libs_no_rewrite, 
+        &libs_to_rewrite,
+        &libs_no_rewrite,
         &exec_name,
         &["/out/hello_world.js"],
         |out_dir| {
             std::fs::write(out_dir.join("hello_world.js"), HELLO_WORLD_JS).unwrap();
-        }
+        },
     );
 }
 
@@ -443,12 +452,10 @@ fn debug_testcase() {
         "hello_thread.hooked not found at {:?}",
         testcase_hooked
     );
-    
+
     // Create CliArgs directly to test the run function
     let cli_args = litebox_runner_linux_on_windows_userland::CliArgs {
-        program_and_arguments: vec![
-            testcase_hooked.to_string_lossy().to_string(),
-        ],
+        program_and_arguments: vec![testcase_hooked.to_string_lossy().to_string()],
         environment_variables: vec![
             "LD_LIBRARY_PATH=/lib64:/lib32:/lib".to_string(),
             "LD_AUDIT=/lib64/litebox_rtld_audit.so".to_string(),
@@ -459,15 +466,15 @@ fn debug_testcase() {
         initial_files: Some(rootfs_tar),
         rewrite_syscalls: false,
     };
-    
+
     println!(
         "Running litebox_runner_linux_on_windows_userland::run with args: {:?}",
         cli_args
     );
-    
+
     // Call the run function directly to enable debugging
     let result = litebox_runner_linux_on_windows_userland::run(cli_args);
-    
+
     match result {
         Ok(_) => println!("Test completed successfully"),
         Err(e) => {
@@ -480,7 +487,7 @@ fn debug_testcase() {
 #[test]
 fn debug_nodejs() {
     println!("Debug nodejs test...");
-    
+
     // Use the already compiled test binaries from the tests folder
     let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     test_dir.push("tests/test-bins");
@@ -489,7 +496,7 @@ fn debug_nodejs() {
 
     let rootfs_tar = std::path::PathBuf::from(&rootfs_tar_path);
     let node_hooked = test_dir.join("node.hooked");
-    
+
     // Verify the required files exist
     assert!(
         rootfs_tar.exists(),
@@ -501,7 +508,7 @@ fn debug_nodejs() {
         "node.hooked not found at {:?}",
         node_hooked
     );
-    
+
     // Create CliArgs directly to test the run function
     let cli_args = litebox_runner_linux_on_windows_userland::CliArgs {
         program_and_arguments: vec![
@@ -518,15 +525,15 @@ fn debug_nodejs() {
         initial_files: Some(rootfs_tar),
         rewrite_syscalls: false,
     };
-    
+
     println!(
         "Running litebox_runner_linux_on_windows_userland::run with args: {:?}",
         cli_args
     );
-    
+
     // Call the run function directly to enable debugging
     let result = litebox_runner_linux_on_windows_userland::run(cli_args);
-    
+
     match result {
         Ok(_) => println!("Test completed successfully"),
         Err(e) => {
