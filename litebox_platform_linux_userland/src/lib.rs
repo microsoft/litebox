@@ -8,6 +8,7 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
+use std::unimplemented;
 
 use litebox::fs::OFlags;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
@@ -733,6 +734,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
 
 impl litebox::platform::TimeProvider for LinuxUserland {
     type Instant = Instant;
+    type Timespec = litebox_common_linux::Timespec;
 
     fn now(&self) -> Self::Instant {
         let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
@@ -745,6 +747,11 @@ impl litebox::platform::TimeProvider for LinuxUserland {
                 tv_nsec: u64::from(t.tv_nsec.reinterpret_as_unsigned()),
             },
         }
+    }
+
+    fn get_timespec(&self, clock_type: litebox::platform::ClockType) -> Self::Timespec {
+        unimplemented!("get_timespec is not implemented for Linux userland (vdso is assumed as available). clock_type: {:?}", 
+                        clock_type);
     }
 }
 

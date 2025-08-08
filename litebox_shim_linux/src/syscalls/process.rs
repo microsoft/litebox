@@ -439,6 +439,23 @@ pub(crate) fn sys_get_robust_list(
     unsafe { head_ptr.write_at_offset(0, head) }.ok_or(Errno::EFAULT)
 }
 
+/// Handle syscall `clock_gettime`.
+pub(crate) fn sys_clock_gettime(
+    clockid: i32,
+    tp: crate::MutPtr<litebox_common_linux::Timespec>,
+) -> Result<(), Errno> {
+    let clocktype = match clockid {
+        0 => litebox::platform::ClockType::Realtime,
+        1 => litebox::platform::ClockType::Monotonic,
+        _ => panic!("Unsupported clock ID: {}", clockid),
+    };
+
+    let timespec = litebox_platform_multiplex::platform().get_timespec(
+        clocktype
+    );
+    unsafe { tp.write_at_offset(0, timespec) }.ok_or(Errno::EFAULT)
+}
+
 /// Handle syscall `getpid`.
 pub(crate) fn sys_getpid() -> i32 {
     litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| tls.current_task.pid)

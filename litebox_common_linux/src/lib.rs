@@ -1620,6 +1620,10 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     SetThreadArea {
         user_desc: Platform::RawMutPointer<UserDesc>,
     },
+    ClockGettime {
+        clockid: i32, 
+        tp: Platform::RawMutPointer<Timespec>,
+    },
     Getrlimit {
         resource: RlimitResource,
         rlim: Platform::RawMutPointer<Rlimit>,
@@ -2023,6 +2027,10 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 pathname: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
                 bufsiz: ctx.syscall_arg(3),
+            },
+            Sysno::clock_gettime => SyscallRequest::ClockGettime {
+                clockid: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                tp: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
             },
             #[cfg(target_arch = "x86_64")]
             Sysno::getrlimit => {
