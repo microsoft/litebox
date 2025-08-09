@@ -1,0 +1,34 @@
+[
+  {
+    "func_id": "open_session",
+    "cmd_id": 0,
+    "args": []
+  },
+  {
+    "func_id": "invoke_command",
+    "cmd_id": 0,
+    "args": [
+      {
+        "param_type": "value_inout",
+        "value_a": 100,
+        "value_b": 0
+      }
+    ]
+  },
+  {
+    "func_id": "invoke_command",
+    "cmd_id": 1,
+    "args": [
+      {
+        "param_type": "value_inout",
+        "value_a": 200,
+        "value_b": 0
+      }
+    ]
+  },
+  {
+    "func_id": "close_session",
+    "cmd_id": 0,
+    "args": []
+  }
+]
