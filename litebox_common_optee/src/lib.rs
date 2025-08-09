@@ -7,6 +7,8 @@ extern crate alloc;
 
 use litebox::platform::RawConstPointer as _;
 use litebox_common_linux::{PtRegs, errno::Errno};
+use modular_bitfield::prelude::*;
+use modular_bitfield::specifiers::{B4, B48};
 use num_enum::TryFromPrimitive;
 use syscall_nr::TeeSyscallNr;
 
@@ -266,14 +268,26 @@ impl CommandId {
 
 /// `utee_params` from `optee_os/lib/libutee/include/utee_types.h`
 /// It contains up to 4 parameters where each of them is a collection of
-/// type (1 byte) and two 8-byte data (values or addresses).
+/// type (4 bits) and two 8-byte data (values or addresses).
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct UteeParams {
-    pub types: u64,
+    pub types: UteeParamsTypes,
     pub vals: [u64; TEE_NUM_PARAMS * 2],
 }
 const TEE_NUM_PARAMS: usize = 4;
+
+#[bitfield]
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct UteeParamsTypes {
+    pub type_0: B4,
+    pub type_1: B4,
+    pub type_2: B4,
+    pub type_3: B4,
+    #[skip]
+    __: B48,
+}
 
 const TEE_PARAM_TYPE_NONE: u8 = 0;
 const TEE_PARAM_TYPE_VALUE_INPUT: u8 = 1;
@@ -298,30 +312,19 @@ pub enum TeeParamType {
 impl UteeParams {
     pub const TEE_NUM_PARAMS: usize = TEE_NUM_PARAMS;
 
-    fn get_type_nibble(&self, index: usize) -> u8 {
-        ((self.types >> (index * 4)) & 0xf) as u8
-    }
-
-    fn set_type_nibble(&mut self, index: usize, nibble: u8) {
-        let mask = !(0xf_u64 << (index * 4));
-        let new_bits = (u64::from(nibble) & 0xf) << (index * 4);
-        self.types = (self.types & mask) | new_bits;
-    }
-
     pub fn get_type(&self, index: usize) -> Result<TeeParamType, Errno> {
-        if index >= Self::TEE_NUM_PARAMS {
-            return Err(Errno::EINVAL);
-        }
-        let type_byte = self.get_type_nibble(index);
+        let type_byte = match index {
+            0 => self.types.type_0(),
+            1 => self.types.type_1(),
+            2 => self.types.type_2(),
+            3 => self.types.type_3(),
+            _ => return Err(Errno::EINVAL),
+        };
         TeeParamType::try_from(type_byte).map_err(|_| Errno::EINVAL)
     }
 
     pub fn get_values(&self, index: usize) -> Result<Option<(u64, u64)>, Errno> {
-        if index >= Self::TEE_NUM_PARAMS {
-            return Err(Errno::EINVAL);
-        }
-        let type_byte = self.get_type_nibble(index);
-        if TeeParamType::try_from(type_byte).map_err(|_| Errno::EINVAL)? == TeeParamType::None {
+        if self.get_type(index)? == TeeParamType::None {
             Ok(None)
         } else {
             let base_index = index * 2;
@@ -330,10 +333,13 @@ impl UteeParams {
     }
 
     pub fn set_type(&mut self, index: usize, param_type: TeeParamType) -> Result<(), Errno> {
-        if index >= Self::TEE_NUM_PARAMS {
-            return Err(Errno::EINVAL);
+        match index {
+            0 => self.types.set_type_0(param_type as u8),
+            1 => self.types.set_type_1(param_type as u8),
+            2 => self.types.set_type_2(param_type as u8),
+            3 => self.types.set_type_3(param_type as u8),
+            _ => return Err(Errno::EINVAL),
         }
-        self.set_type_nibble(index, param_type as u8);
         Ok(())
     }
 

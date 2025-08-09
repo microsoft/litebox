@@ -66,10 +66,9 @@ impl TaStack {
     ///
     /// `stack_top` and `len` must be aligned to [`Self::STACK_ALIGNMENT`]
     pub(super) fn new(stack_top: MutPtr<u8>, len: usize) -> Option<Self> {
-        if stack_top.as_usize() % Self::STACK_ALIGNMENT != 0 {
-            return None;
-        }
-        if len % Self::STACK_ALIGNMENT != 0 {
+        if !stack_top.as_usize().is_multiple_of(Self::STACK_ALIGNMENT)
+            || !len.is_multiple_of(Self::STACK_ALIGNMENT)
+        {
             return None;
         }
         Some(Self {
@@ -144,7 +143,7 @@ impl TaStack {
     }
 
     /// Push a parameter whose type is `TeeParamType::Memref*` (i.e., buffer) to the stack.
-    fn push_param_bytes(
+    fn push_param_memref(
         &mut self,
         param_type: TeeParamType,
         bytes: Option<&[u8]>,
@@ -216,13 +215,13 @@ impl TaStack {
                     self.push_param_values(TeeParamType::ValueInout, Some((*value_a, *value_b)))?;
                 }
                 UteeParamsTyped::MemrefInput { data } => {
-                    self.push_param_bytes(TeeParamType::MemrefInput, Some(data), data.len())?;
+                    self.push_param_memref(TeeParamType::MemrefInput, Some(data), data.len())?;
                 }
                 UteeParamsTyped::MemrefInout { data, buffer_size } => {
-                    self.push_param_bytes(TeeParamType::MemrefInout, Some(data), *buffer_size)?;
+                    self.push_param_memref(TeeParamType::MemrefInout, Some(data), *buffer_size)?;
                 }
                 UteeParamsTyped::MemrefOutput { buffer_size } => {
-                    self.push_param_bytes(TeeParamType::MemrefOutput, None, *buffer_size)?;
+                    self.push_param_memref(TeeParamType::MemrefOutput, None, *buffer_size)?;
                 }
                 UteeParamsTyped::None => self.push_param_none()?,
             }
@@ -246,7 +245,7 @@ impl TaStack {
 /// Allocate stack pages for a TA session. if `sp` is `Some`, it re-uses the allocated stack pages.
 ///
 /// # Safety
-/// The caller must ensure that `sp` is a valid stack pointer and is not concurrently used.
+/// The caller must ensure that `sp` is a valid stack pointer and is not currently used.
 /// Normally, `sp` should be the return value of this function's previous call (with `None`).
 pub(crate) fn allocate_stack(stack_base: Option<usize>) -> Option<TaStack> {
     let sp = if let Some(stack_base) = stack_base {
@@ -254,9 +253,9 @@ pub(crate) fn allocate_stack(stack_base: Option<usize>) -> Option<TaStack> {
             inner: stack_base as *mut u8,
         }
     } else {
+        let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
+            .expect("DEFAULT_STACK_SIZE is not page-aligned");
         unsafe {
-            let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
-                .expect("DEFAULT_STACK_SIZE is not page-aligned");
             litebox_page_manager()
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
                 .ok()?

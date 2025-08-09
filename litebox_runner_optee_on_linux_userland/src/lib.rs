@@ -77,7 +77,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         data
     };
 
-    // This runner supports JSON-formatted OPTEE TA command sequence for ease of development and testing.
+    // This runner supports JSON-formatted OP-TEE TA command sequence for ease of development and testing.
     let ta_commands: Vec<TaCommandBase64> = {
         let json_path = PathBuf::from(&cli_args.command_sequence);
         let json_str = std::fs::read_to_string(json_path)?;
@@ -100,13 +100,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let loaded_program = litebox_shim_optee::loader::load_elf_buffer(prog_data.as_slice()).unwrap();
 
     // Currently, this runner supports a single TA session. Also, for simplicity,
-    // it uses tid stored in LiteBox's TLS as the session ID.
+    // it uses `tid` stored in LiteBox's TLS as a session ID.
     let tid = litebox_platform_multiplex::platform()
         .with_thread_local_storage_mut(|tls| tls.current_task.tid);
     #[allow(clippy::cast_sign_loss)]
     let session_id = tid as u32;
 
-    // we can use TLS instead of this global data structure.
     register_session_id_elf_load_info(session_id, loaded_program);
 
     populate_optee_command_queue(session_id, &ta_commands);
@@ -114,37 +113,49 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 }
 
 /// OP-TEE/TA message command (base64 encoded). It consists of a function ID,
-/// command ID, and up to four arguments. This is base64 encoded to have
+/// command ID, and up to four arguments. This is base64 encoded to enable
 /// JSON-formatted input files.
+/// TODO: use JSON Schema if we need to validate JSON or we could use Protobuf instead
 #[derive(Debug, Deserialize)]
 struct TaCommandBase64 {
-    func_id: String,
+    func_id: TaEntryFunc,
+    #[serde(default)]
     cmd_id: u32,
+    #[serde(default)]
     args: Vec<TaCommandParamsBase64>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaEntryFunc {
+    OpenSession,
+    CloseSession,
+    InvokeCommand,
+}
+
 /// An argument of OP-TEE/TA message command (base64 encoded). It consists of
-/// a type and two 64-bit values/references. This is base64 encoded to have
+/// a type and two 64-bit values/references. This is base64 encoded to enable
 /// JSON-formatted input files.
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "param_type", rename_all = "snake_case")]
 enum TaCommandParamsBase64 {
-    Value {
-        param_type: String,
+    ValueInput {
+        value_a: u64,
+        value_b: u64,
+    },
+    ValueOutput {},
+    ValueInout {
         value_a: u64,
         value_b: u64,
     },
     MemrefInput {
-        param_type: String,
         data_base64: String,
-    },
-    MemrefInout {
-        param_type: String,
-        data_base64: String,
-        buffer_size: u64,
     },
     MemrefOutput {
-        param_type: String,
+        buffer_size: u64,
+    },
+    MemrefInout {
+        data_base64: String,
         buffer_size: u64,
     },
 }
@@ -152,55 +163,34 @@ enum TaCommandParamsBase64 {
 impl TaCommandParamsBase64 {
     pub fn as_utee_params_typed(&self) -> UteeParamsTyped {
         match self {
-            TaCommandParamsBase64::Value {
-                param_type,
-                value_a,
-                value_b,
-            } => match param_type.as_str() {
-                "value_input" => UteeParamsTyped::ValueInput {
-                    value_a: *value_a,
-                    value_b: *value_b,
-                },
-                "value_output" => UteeParamsTyped::ValueOutput {},
-                "value_inout" => UteeParamsTyped::ValueInout {
-                    value_a: *value_a,
-                    value_b: *value_b,
-                },
-                _ => panic!("Invalid param type"),
+            TaCommandParamsBase64::ValueInput { value_a, value_b } => UteeParamsTyped::ValueInput {
+                value_a: *value_a,
+                value_b: *value_b,
             },
-            TaCommandParamsBase64::MemrefInput {
-                param_type,
-                data_base64,
-            } => {
-                assert!(param_type.as_str() == "memref_input", "Invalid param type");
-                let decoded_data = Self::decode_base64(data_base64);
-                UteeParamsTyped::MemrefInput {
-                    data: decoded_data.into_boxed_slice(),
-                }
-            }
+            TaCommandParamsBase64::ValueOutput {} => UteeParamsTyped::ValueOutput {},
+            TaCommandParamsBase64::ValueInout { value_a, value_b } => UteeParamsTyped::ValueInout {
+                value_a: *value_a,
+                value_b: *value_b,
+            },
+            TaCommandParamsBase64::MemrefInput { data_base64 } => UteeParamsTyped::MemrefInput {
+                data: Self::decode_base64(data_base64).into_boxed_slice(),
+            },
+            TaCommandParamsBase64::MemrefOutput { buffer_size } => UteeParamsTyped::MemrefOutput {
+                buffer_size: usize::try_from(*buffer_size).unwrap(),
+            },
             TaCommandParamsBase64::MemrefInout {
-                param_type,
                 data_base64,
                 buffer_size,
             } => {
-                assert!(param_type.as_str() == "memref_inout", "Invalid param type");
                 let decoded_data = Self::decode_base64(data_base64);
+                let buffer_size = usize::try_from(*buffer_size).unwrap();
                 assert!(
-                    (*buffer_size >= u64::try_from(decoded_data.len()).unwrap()),
+                    buffer_size >= decoded_data.len(),
                     "Buffer size is smaller than input data size"
                 );
                 UteeParamsTyped::MemrefInout {
                     data: decoded_data.into_boxed_slice(),
-                    buffer_size: usize::try_from(*buffer_size).unwrap(),
-                }
-            }
-            TaCommandParamsBase64::MemrefOutput {
-                param_type,
-                buffer_size,
-            } => {
-                assert!(param_type.as_str() == "memref_output", "Invalid param type");
-                UteeParamsTyped::MemrefOutput {
-                    buffer_size: usize::try_from(*buffer_size).unwrap(),
+                    buffer_size,
                 }
             }
         }
@@ -224,23 +214,18 @@ fn populate_optee_command_queue(session_id: u32, ta_commands: &[TaCommandBase64]
     for ta_command in ta_commands {
         assert!(
             (ta_command.args.len() <= UteeParamsTyped::TEE_NUM_PARAMS),
-            "ta_command has more than four arguments!"
+            "ta_command has more than four arguments."
         );
 
         let mut params = [const { UteeParamsTyped::None }; UteeParamsTyped::TEE_NUM_PARAMS];
-
-        for (i, arg) in ta_command.args.iter().enumerate() {
-            params[i] = arg.as_utee_params_typed();
-        }
-        for param in params.iter_mut().skip(ta_command.args.len()) {
-            *param = UteeParamsTyped::None;
+        for (param, arg) in params.iter_mut().zip(&ta_command.args) {
+            *param = arg.as_utee_params_typed();
         }
 
-        let func_id = match ta_command.func_id.as_str() {
-            "open_session" => UteeEntryFunc::OpenSession,
-            "close_session" => UteeEntryFunc::CloseSession,
-            "invoke_command" => UteeEntryFunc::InvokeCommand,
-            _ => panic!("Unknown function ID: {}", ta_command.func_id),
+        let func_id = match ta_command.func_id {
+            TaEntryFunc::OpenSession => UteeEntryFunc::OpenSession,
+            TaEntryFunc::CloseSession => UteeEntryFunc::CloseSession,
+            TaEntryFunc::InvokeCommand => UteeEntryFunc::InvokeCommand,
         };
 
         submit_optee_command(session_id, func_id, params, ta_command.cmd_id);
