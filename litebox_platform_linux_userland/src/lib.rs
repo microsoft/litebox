@@ -21,8 +21,19 @@ mod syscall_intercept;
 
 extern crate alloc;
 
+cfg_if::cfg_if! {
+    if #[cfg(feature = "linux_syscall")] {
+        use litebox_common_linux::SyscallRequest;
+        pub type SyscallReturnType = isize;
+    } else if #[cfg(feature = "optee_syscall")] {
+        use litebox_common_optee::SyscallRequest;
+        pub type SyscallReturnType = u32;
+    } else {
+        compile_error!(r##"No syscall handler specified."##);
+    }
+}
 /// Connector to a shim-exposed syscall-handling interface.
-pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<LinuxUserland>) -> isize;
+pub type SyscallHandler = fn(SyscallRequest<LinuxUserland>) -> SyscallReturnType;
 
 /// The syscall handler passed down from the shim.
 static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
@@ -1357,14 +1368,15 @@ unsafe extern "C" {
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
+#[allow(clippy::cast_sign_loss)]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_handler(
     syscall_number: usize,
     ctx: *mut litebox_common_linux::PtRegs,
-) -> isize {
+) -> SyscallReturnType {
     // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
     let ctx = unsafe { &mut *ctx };
-    match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
+    match SyscallRequest::try_from_raw(syscall_number, ctx) {
         Ok(d) => {
             let syscall_handler: SyscallHandler = SYSCALL_HANDLER
                 .read()
@@ -1372,7 +1384,7 @@ unsafe extern "C" fn syscall_handler(
                 .expect("Should have run `register_syscall_handler` by now");
             syscall_handler(d)
         }
-        Err(err) => err.as_neg() as isize,
+        Err(err) => err.as_neg() as SyscallReturnType,
     }
 }
 
