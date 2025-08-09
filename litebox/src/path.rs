@@ -36,7 +36,7 @@ pub trait Arg: private::Sealed {
     ///
     /// If the contents are a valid C string, returns a borrowed string (cheap), otherwise returns a
     /// copied owned string (costs roughly a memcpy).
-    fn to_c_str(&self) -> Result<Cow<CStr>>;
+    fn to_c_str(&self) -> Result<Cow<'_, CStr>>;
 
     /// Convert to a Rust string
     fn as_rust_str(&self) -> Result<&str>;
@@ -45,7 +45,7 @@ pub trait Arg: private::Sealed {
     ///
     // If the contents are a valid UTF-8 string, returns a borrowed string (cheap), otherwise
     // returns a copied owned string (costs roughly a memcpy).
-    fn to_rust_str_lossy(&self) -> Cow<str>;
+    fn to_rust_str_lossy(&self) -> Cow<'_, str>;
 
     /// Separate the path into components
     ///
@@ -135,7 +135,7 @@ pub trait Arg: private::Sealed {
 }
 
 impl Arg for &str {
-    fn to_c_str(&self) -> Result<Cow<CStr>> {
+    fn to_c_str(&self) -> Result<Cow<'_, CStr>> {
         CString::new(self.as_bytes())
             .map(Cow::Owned)
             .or(Err(ConversionError::FailedToConvertTo("c string")))
@@ -145,13 +145,13 @@ impl Arg for &str {
         Ok(self)
     }
 
-    fn to_rust_str_lossy(&self) -> Cow<str> {
+    fn to_rust_str_lossy(&self) -> Cow<'_, str> {
         Cow::Borrowed(self)
     }
 }
 
 impl Arg for String {
-    fn to_c_str(&self) -> Result<Cow<CStr>> {
+    fn to_c_str(&self) -> Result<Cow<'_, CStr>> {
         CString::new(self.as_bytes())
             .map(Cow::Owned)
             .or(Err(ConversionError::FailedToConvertTo("c string")))
@@ -161,13 +161,13 @@ impl Arg for String {
         Ok(self)
     }
 
-    fn to_rust_str_lossy(&self) -> Cow<str> {
+    fn to_rust_str_lossy(&self) -> Cow<'_, str> {
         Cow::Borrowed(self)
     }
 }
 
 impl Arg for &CStr {
-    fn to_c_str(&self) -> Result<Cow<CStr>> {
+    fn to_c_str(&self) -> Result<Cow<'_, CStr>> {
         Ok(Cow::Borrowed(self))
     }
 
@@ -176,13 +176,13 @@ impl Arg for &CStr {
             .or(Err(ConversionError::FailedToConvertTo("rust string")))
     }
 
-    fn to_rust_str_lossy(&self) -> Cow<str> {
+    fn to_rust_str_lossy(&self) -> Cow<'_, str> {
         self.to_string_lossy()
     }
 }
 
 impl Arg for CString {
-    fn to_c_str(&self) -> Result<Cow<CStr>> {
+    fn to_c_str(&self) -> Result<Cow<'_, CStr>> {
         Ok(Cow::Borrowed(self))
     }
 
@@ -191,13 +191,13 @@ impl Arg for CString {
             .or(Err(ConversionError::FailedToConvertTo("rust string")))
     }
 
-    fn to_rust_str_lossy(&self) -> Cow<str> {
+    fn to_rust_str_lossy(&self) -> Cow<'_, str> {
         self.to_string_lossy()
     }
 }
 
 impl Arg for Cow<'_, str> {
-    fn to_c_str(&self) -> Result<Cow<CStr>> {
+    fn to_c_str(&self) -> Result<Cow<'_, CStr>> {
         match self {
             Cow::Borrowed(s) => s.to_c_str(),
             Cow::Owned(s) => s.to_c_str(),
@@ -209,7 +209,7 @@ impl Arg for Cow<'_, str> {
             Cow::Owned(s) => s.as_rust_str(),
         }
     }
-    fn to_rust_str_lossy(&self) -> Cow<str> {
+    fn to_rust_str_lossy(&self) -> Cow<'_, str> {
         match self {
             Cow::Borrowed(s) => s.to_rust_str_lossy(),
             Cow::Owned(s) => s.to_rust_str_lossy(),
@@ -218,7 +218,7 @@ impl Arg for Cow<'_, str> {
 }
 
 impl Arg for Cow<'_, CStr> {
-    fn to_c_str(&self) -> Result<Cow<CStr>> {
+    fn to_c_str(&self) -> Result<Cow<'_, CStr>> {
         match self {
             Cow::Borrowed(s) => s.to_c_str(),
             Cow::Owned(s) => s.to_c_str(),
@@ -230,7 +230,7 @@ impl Arg for Cow<'_, CStr> {
             Cow::Owned(s) => s.as_rust_str(),
         }
     }
-    fn to_rust_str_lossy(&self) -> Cow<str> {
+    fn to_rust_str_lossy(&self) -> Cow<'_, str> {
         match self {
             Cow::Borrowed(s) => s.to_rust_str_lossy(),
             Cow::Owned(s) => s.to_rust_str_lossy(),

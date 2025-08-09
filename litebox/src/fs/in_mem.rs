@@ -720,7 +720,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
         &self,
         path: &str,
         current_user: UserInfo,
-    ) -> ParentAndEntry<Dir<Platform>, Entry<Platform>> {
+    ) -> ParentAndEntry<'_, Dir<Platform>, Entry<Platform>> {
         let mut real_components_seen = false;
         let mut collected = String::new();
         let mut parent_dir = None;

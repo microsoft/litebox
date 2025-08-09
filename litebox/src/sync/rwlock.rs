@@ -151,16 +151,16 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
             );
 
             // Make sure the readers waiting bit is set before we go to sleep.
-            if !has_readers_waiting(state) {
-                if let Err(s) = self.state.underlying_atomic().compare_exchange(
+            if !has_readers_waiting(state)
+                && let Err(s) = self.state.underlying_atomic().compare_exchange(
                     state,
                     state | READERS_WAITING,
                     Relaxed,
                     Relaxed,
-                ) {
-                    state = s;
-                    continue;
-                }
+                )
+            {
+                state = s;
+                continue;
             }
 
             // Wait for the state to change.
@@ -237,16 +237,16 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
             }
 
             // Set the waiting bit indicating that we're waiting on it.
-            if !has_writers_waiting(state) {
-                if let Err(s) = self.state.underlying_atomic().compare_exchange(
+            if !has_writers_waiting(state)
+                && let Err(s) = self.state.underlying_atomic().compare_exchange(
                     state,
                     state | WRITERS_WAITING,
                     Relaxed,
                     Relaxed,
-                ) {
-                    state = s;
-                    continue;
-                }
+                )
+            {
+                state = s;
+                continue;
             }
 
             // Other writers might be waiting now too, so we should make sure

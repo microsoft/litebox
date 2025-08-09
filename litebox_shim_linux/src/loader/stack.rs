@@ -66,7 +66,7 @@ impl UserStack {
         if stack_top.as_usize() % Self::STACK_ALIGNMENT != 0 {
             return None;
         }
-        if len % Self::STACK_ALIGNMENT != 0 {
+        if !len.is_multiple_of(Self::STACK_ALIGNMENT) {
             return None;
         }
         Some(Self {
