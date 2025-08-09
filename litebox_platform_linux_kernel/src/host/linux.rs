@@ -40,14 +40,3 @@ pub struct pt_regs {
     pub ss: u64,
     /* top of stack page */
 }
-
-/// timespec from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/include/uapi/linux/time.h#L11)
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct Timespec {
-    /// Seconds.
-    pub tv_sec: i64,
-
-    /// Nanoseconds. Must be less than 1_000_000_000.
-    pub tv_nsec: i64,
-}
