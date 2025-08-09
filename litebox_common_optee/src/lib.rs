@@ -279,9 +279,9 @@ const TEE_PARAM_TYPE_NONE: u8 = 0;
 const TEE_PARAM_TYPE_VALUE_INPUT: u8 = 1;
 const TEE_PARAM_TYPE_VALUE_OUTPUT: u8 = 2;
 const TEE_PARAM_TYPE_VALUE_INOUT: u8 = 3;
-const TEE_PARAM_TYPE_MEMREF_INPUT: u8 = 4;
-const TEE_PARAM_TYPE_MEMREF_OUTPUT: u8 = 5;
-const TEE_PARAM_TYPE_MEMREF_INOUT: u8 = 6;
+const TEE_PARAM_TYPE_MEMREF_INPUT: u8 = 5;
+const TEE_PARAM_TYPE_MEMREF_OUTPUT: u8 = 6;
+const TEE_PARAM_TYPE_MEMREF_INOUT: u8 = 7;
 
 #[derive(Clone, Copy, TryFromPrimitive, PartialEq)]
 #[repr(u8)]
@@ -296,19 +296,31 @@ pub enum TeeParamType {
 }
 
 impl UteeParams {
+    pub const TEE_NUM_PARAMS: usize = TEE_NUM_PARAMS;
+
+    fn get_type_nibble(&self, index: usize) -> u8 {
+        ((self.types >> (index * 4)) & 0xf) as u8
+    }
+
+    fn set_type_nibble(&mut self, index: usize, nibble: u8) {
+        let mask = !(0xf_u64 << (index * 4));
+        let new_bits = (u64::from(nibble) & 0xf) << (index * 4);
+        self.types = (self.types & mask) | new_bits;
+    }
+
     pub fn get_type(&self, index: usize) -> Result<TeeParamType, Errno> {
-        if index >= TEE_NUM_PARAMS {
+        if index >= Self::TEE_NUM_PARAMS {
             return Err(Errno::EINVAL);
         }
-        let type_byte = self.types.to_le_bytes()[index];
+        let type_byte = self.get_type_nibble(index);
         TeeParamType::try_from(type_byte).map_err(|_| Errno::EINVAL)
     }
 
     pub fn get_values(&self, index: usize) -> Result<Option<(u64, u64)>, Errno> {
-        if index >= TEE_NUM_PARAMS {
+        if index >= Self::TEE_NUM_PARAMS {
             return Err(Errno::EINVAL);
         }
-        let type_byte = self.types.to_le_bytes()[index];
+        let type_byte = self.get_type_nibble(index);
         if TeeParamType::try_from(type_byte).map_err(|_| Errno::EINVAL)? == TeeParamType::None {
             Ok(None)
         } else {
@@ -318,22 +330,20 @@ impl UteeParams {
     }
 
     pub fn set_type(&mut self, index: usize, param_type: TeeParamType) -> Result<(), Errno> {
-        if index >= TEE_NUM_PARAMS {
+        if index >= Self::TEE_NUM_PARAMS {
             return Err(Errno::EINVAL);
         }
-        let mut types_bytes = self.types.to_le_bytes();
-        types_bytes[index] = param_type as u8;
-        self.types = u64::from_le_bytes(types_bytes);
+        self.set_type_nibble(index, param_type as u8);
         Ok(())
     }
 
-    pub fn set_values(&mut self, index: usize, value1: u64, value2: u64) -> Result<(), Errno> {
-        if index >= TEE_NUM_PARAMS {
+    pub fn set_values(&mut self, index: usize, value_a: u64, value_b: u64) -> Result<(), Errno> {
+        if index >= Self::TEE_NUM_PARAMS {
             return Err(Errno::EINVAL);
         }
         let base_index = index * 2;
-        self.vals[base_index] = value1;
-        self.vals[base_index + 1] = value2;
+        self.vals[base_index] = value_a;
+        self.vals[base_index + 1] = value_b;
         Ok(())
     }
 
