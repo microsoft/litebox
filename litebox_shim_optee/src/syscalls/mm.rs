@@ -12,8 +12,6 @@ use crate::{MutPtr, litebox_page_manager};
 // existing Linux kernel-style `mmap*` syscalls (or kernel functions because they are not exposed to the user space).
 // For now, `litebox_shim_optee` only needs `mmap`, `munmap`, and `mprotect` syscalls.
 
-const PAGE_MASK: usize = !(PAGE_SIZE - 1);
-
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
@@ -49,13 +47,7 @@ pub(crate) fn sys_mmap(
     offset: usize,
 ) -> Result<MutPtr<u8>, Errno> {
     // check alignment
-    if offset & !PAGE_MASK != 0 {
-        return Err(Errno::EINVAL);
-    }
-    if addr & !PAGE_MASK != 0 {
-        return Err(Errno::EINVAL);
-    }
-    if len == 0 {
+    if !offset.is_multiple_of(PAGE_SIZE) || !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
         return Err(Errno::EINVAL);
     }
     if flags.intersects(

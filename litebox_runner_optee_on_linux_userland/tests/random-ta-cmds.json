@@ -1,8 +1,6 @@
 [
   {
-    "func_id": "open_session",
-    "cmd_id": 0,
-    "args": []
+    "func_id": "open_session"
   },
   {
     "func_id": "invoke_command",
@@ -15,8 +13,7 @@
     ]
   },
   {
-    "func_id": "close_session",
-    "cmd_id": 0,
-    "args": []
+    "func_id": "close_session"
   }
 ]
+
