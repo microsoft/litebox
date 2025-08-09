@@ -6,15 +6,34 @@ edition = "2024"
 [dependencies]
 arrayvec = { version = "0.7.6", default-features = false }
 bitflags = "2.9.0"
+cfg-if = "1.0.0"
+elf = { version = "0.7.4", default-features = false }
+elf_loader = { version = "0.12.0", default-features = false }
+hashbrown = "0.15.2"
 litebox = { path = "../litebox/", version = "0.1.0" }
+litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
 litebox_common_optee = { path = "../litebox_common_optee/", version = "0.1.0" }
-litebox_platform_multiplex = { path = "../litebox_platform_multiplex/", version = "0.1.0", default-features = false, features = ["platform_lvbs"] }
+litebox_platform_multiplex = { path = "../litebox_platform_multiplex/", version = "0.1.0", default-features = false }
 num_enum = { version = "0.7.3", default-features = false }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
+spin = { version = "0.10.0", default-features = false, features = ["spin_mutex"] }
+thiserror = { version = "2.0.6", default-features = false }
+
+[target.'cfg(target_arch = "x86")'.dependencies]
+# ELF loader requires us to enable the `rel` dependency on 32-bit to work.
+# Enabling it on 64-bit on the other hand is incorrect and would not work. Thus,
+# we need to do it as a target-specific dependency.
+#
+# NOTE: We must keep this in sync with the version above.
+elf_loader = { version = "0.12.0", default-features = false, features = ["rel"] }
+
+[features]
+default = ["platform_lvbs"]
+platform_linux_userland = ["litebox_platform_multiplex/platform_linux_userland_with_optee_syscall"]
+platform_lvbs = ["litebox_platform_multiplex/platform_lvbs"]
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
-litebox_platform_multiplex = { path = "../litebox_platform_multiplex/", version = "0.1.0", default-features = false, features = ["platform_linux_userland"] }
+litebox_platform_multiplex = { path = "../litebox_platform_multiplex/", version = "0.1.0", default-features = false, features = ["platform_linux_userland_with_optee_syscall"] }

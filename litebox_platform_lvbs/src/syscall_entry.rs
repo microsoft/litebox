@@ -4,6 +4,7 @@ use crate::{
     user_context::UserSpaceManagement,
 };
 use core::arch::{asm, naked_asm};
+use litebox_common_linux::PtRegs;
 use litebox_common_optee::{SyscallContext, SyscallRequest};
 use x86_64::{
     VirtAddr,
@@ -98,6 +99,33 @@ impl SyscallContextRaw {
             self.r13 as usize,
         ])
     }
+
+    #[expect(clippy::cast_possible_truncation)]
+    pub fn to_pt_regs(&self) -> PtRegs {
+        PtRegs {
+            r15: 0,
+            r14: 0,
+            r13: self.r13 as usize,
+            r12: self.r12 as usize,
+            rbp: 0,
+            rbx: 0,
+            r11: self.r11 as usize,
+            r10: self.r10 as usize,
+            r9: self.r9 as usize,
+            r8: self.r8 as usize,
+            rax: 0,
+            rcx: self.rcx as usize,
+            rdx: self.rdx as usize,
+            rsi: self.rsi as usize,
+            rdi: self.rdi as usize,
+            orig_rax: 0,
+            rip: 0,
+            cs: 0,
+            eflags: 0,
+            rsp: self.rsp as usize,
+            ss: 0,
+        }
+    }
 }
 
 #[allow(clippy::similar_names)]
@@ -124,7 +152,7 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> u32 {
         )
         .expect("Failed to save user context");
 
-    let ctx = ctx_raw.syscall_context();
+    let ctx = ctx_raw.to_pt_regs();
 
     // call the syscall handler passed down from the shim
     let sysret = syscall_handler(

@@ -1,5 +1,6 @@
 //! A shim that provides an OP-TEE-compatible ABI via LiteBox
 
+#![cfg(target_arch = "x86_64")]
 #![no_std]
 
 extern crate alloc;
@@ -11,11 +12,13 @@ use once_cell::race::OnceBox;
 use alloc::vec;
 use litebox::{
     LiteBox,
+    mm::{PageManager, linux::PAGE_SIZE},
     platform::{RawConstPointer as _, RawMutPointer as _},
 };
 use litebox_common_optee::{SyscallRequest, TeeResult};
 use litebox_platform_multiplex::Platform;
 
+pub mod loader;
 pub(crate) mod syscalls;
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
@@ -27,6 +30,14 @@ pub fn litebox<'a>() -> &'a LiteBox<Platform> {
         alloc::boxed::Box::new(LiteBox::new(litebox_platform_multiplex::platform()))
     })
 }
+
+pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE> {
+    static VMEM: OnceBox<PageManager<Platform, PAGE_SIZE>> = OnceBox::new();
+    VMEM.get_or_init(|| alloc::boxed::Box::new(PageManager::new(litebox())))
+}
+
+// Convenience type aliases
+type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
 /// Handle OP-TEE syscalls
 ///
