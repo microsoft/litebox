@@ -14,10 +14,16 @@ use hashbrown::HashMap;
 use litebox::{
     LiteBox,
     mm::{PageManager, linux::PAGE_SIZE},
-    platform::{RawConstPointer as _, RawMutPointer as _, ThreadProvider as _},
+    platform::{RawConstPointer as _, RawMutPointer as _},
 };
 use litebox_common_optee::{SyscallRequest, TeeParamType, TeeResult, UteeEntryFunc, UteeParams};
 use litebox_platform_multiplex::Platform;
+
+cfg_if::cfg_if! {
+    if #[cfg(feature = "platform_linux_userland")] {
+    use litebox::platform::{ThreadProvider as _};
+    }
+}
 
 use crate::loader::elf::ElfLoadInfo;
 
@@ -250,7 +256,15 @@ pub fn optee_command_loop_entry(session_id: u32) -> ! {
     if let Some(cmd) = optee_command_submission_queue().pop(session_id) {
         let elf_load_info = session_id_elf_load_info_map().get(session_id);
         let Some(elf_load_info) = elf_load_info else {
-            litebox_platform_multiplex::platform().terminate_thread(0);
+            cfg_if::cfg_if! {
+                    if #[cfg(feature = "platform_linux_userland")] {
+                        litebox_platform_multiplex::platform().terminate_thread(0);
+                    } else if #[cfg(feature = "platform_lvbs")] {
+                        todo!("switch to VTL0");
+                    } else {
+                        compile_error!(r##"No platform specified."##);
+                    }
+            }
         };
 
         // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
@@ -281,7 +295,15 @@ pub fn optee_command_loop_entry(session_id: u32) -> ! {
         session_id_elf_load_info_map().remove(session_id);
         optee_command_submission_queue().remove(session_id);
         optee_command_completion_queue().remove(session_id);
-        litebox_platform_multiplex::platform().terminate_thread(0);
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "platform_linux_userland")] {
+                litebox_platform_multiplex::platform().terminate_thread(0);
+            } else if #[cfg(feature = "platform_lvbs")] {
+                todo!("switch to VTL0");
+            } else {
+                compile_error!(r##"No platform specified."##);
+            }
+        }
     }
 }
 
