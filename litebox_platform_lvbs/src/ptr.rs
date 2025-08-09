@@ -6,7 +6,7 @@ use litebox::platform::{RawConstPointer, RawMutPointer};
 #[repr(C)]
 #[derive(Clone)]
 pub struct UserConstPtr<T> {
-    pub(crate) inner: *const T,
+    pub inner: *const T,
 }
 
 impl<T: Clone> Copy for UserConstPtr<T> {}
@@ -45,7 +45,7 @@ impl<T: Clone> UserConstPtr<T> {
 #[repr(C)]
 #[derive(Clone)]
 pub struct UserMutPtr<T> {
-    pub(crate) inner: *mut T,
+    pub inner: *mut T,
 }
 
 impl<T: Clone> Copy for UserMutPtr<T> {}
