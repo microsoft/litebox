@@ -88,7 +88,9 @@ const TRAMPOLINE_SECTION_SIZE: usize = 0x18;
 #[allow(clippy::too_many_lines)]
 pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> Result<Vec<u8>> {
     let mut input_workaround: Vec<u64>;
-    let input_binary: &[u8] = if (&raw const input_binary[0] as usize) % 8 != 0 {
+    let input_binary: &[u8] = if (&raw const input_binary[0] as usize).is_multiple_of(8) {
+        input_binary
+    } else {
         // JB: This is an ugly workaround to `object` requiring that its input binary being parsed
         // is always aligned to 8-bytes (otherwise it throws an error); this is very surprising and
         // probably should be corrected upstream in `object`, but for now, we just make a copy and
@@ -104,8 +106,6 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
         let input_workaround_bytes = &mut input_workaround_bytes[..input_binary.len()];
         input_workaround_bytes.copy_from_slice(input_binary);
         &*input_workaround_bytes
-    } else {
-        input_binary
     };
     assert_eq!((&raw const input_binary[0] as usize) % 8, 0);
     let mut builder = match object::FileKind::parse(input_binary)

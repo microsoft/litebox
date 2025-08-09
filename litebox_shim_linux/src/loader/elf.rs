@@ -288,11 +288,11 @@ fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize
         trampoline
     );
     assert!(
-        trampoline.vaddr % PAGE_SIZE == 0,
+        trampoline.vaddr.is_multiple_of(PAGE_SIZE),
         "trampoline address must be page-aligned"
     );
     assert!(
-        trampoline.file_offset % PAGE_SIZE == 0,
+        trampoline.file_offset.is_multiple_of(PAGE_SIZE),
         "trampoline file offset must be page-aligned"
     );
     let start_addr = relo_off + trampoline.vaddr;
