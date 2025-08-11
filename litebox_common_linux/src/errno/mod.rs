@@ -341,3 +341,20 @@ impl From<litebox::event::polling::TryOpError<Errno>> for Errno {
         }
     }
 }
+
+impl From<litebox::platform::ImmediatelyWokenUp> for Errno {
+    fn from(_: litebox::platform::ImmediatelyWokenUp) -> Self {
+        Errno::EAGAIN
+    }
+}
+
+impl From<litebox::platform::RawMutexBlockError> for Errno {
+    fn from(value: litebox::platform::RawMutexBlockError) -> Self {
+        match value {
+            litebox::platform::RawMutexBlockError::ImmediatelyWokenUp => Errno::EAGAIN,
+            litebox::platform::RawMutexBlockError::Interrupted => Errno::EINTR,
+            litebox::platform::RawMutexBlockError::InvalidAddress => Errno::EFAULT,
+            _ => unimplemented!(),
+        }
+    }
+}

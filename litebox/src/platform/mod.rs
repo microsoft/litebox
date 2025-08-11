@@ -218,29 +218,55 @@ where
 }
 
 /// A provider of raw mutexes
-pub trait RawMutexProvider {
+pub trait RawMutexProvider: RawPointerProvider {
     type RawMutex: RawMutex;
+    type UserRawMutex: UserRawMutex;
     /// Allocate a new [`RawMutex`].
     fn new_raw_mutex(&self) -> Self::RawMutex;
+    /// Convert a raw pointer to a [`UserRawMutex`].
+    fn from_raw_ptr(ptr: Self::RawConstPointer<u32>) -> Option<Self::UserRawMutex>;
 }
 
 /// A raw mutex/lock API; expected to roughly match (or even be implemented using) a Linux futex.
-pub trait RawMutex: Send + Sync {
+pub trait RawMutex: UserRawMutex + Send + Sync {
     /// Returns a reference to the underlying atomic value
     fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32;
 
+    /// If the underlying value is `val`, block until a wake operation wakes us up.
+    fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
+        <Self as UserRawMutex>::block(self, val).map_err(|e| match e {
+            RawMutexBlockError::ImmediatelyWokenUp => ImmediatelyWokenUp,
+            RawMutexBlockError::InvalidAddress | RawMutexBlockError::Interrupted => unreachable!(),
+        })
+    }
+
+    /// If the underlying value is `val`, block until a wake operation wakes us up, or some `time`
+    /// has passed without a wake operation having occured.
+    fn block_or_timeout(
+        &self,
+        val: u32,
+        time: core::time::Duration,
+    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
+        <Self as UserRawMutex>::block_or_timeout(self, val, time).map_err(|e| match e {
+            RawMutexBlockError::ImmediatelyWokenUp => ImmediatelyWokenUp,
+            RawMutexBlockError::InvalidAddress | RawMutexBlockError::Interrupted => unreachable!(),
+        })
+    }
+}
+
+/// Similar to [`RawMutex`] but intended for user-space usage, where the underlying
+/// pointer might be inaccessible.
+pub trait UserRawMutex {
     /// Wake up `n` threads blocked on on this raw mutex.
     ///
     /// Returns the number of waiters that were woken up.
     fn wake_many(&self, n: usize) -> usize;
-
     /// Wake up one thread blocked on this raw mutex.
     ///
     /// Returns true if this actually woke up such a thread, or false if no thread was waiting on this raw mutex.
     fn wake_one(&self) -> bool {
         self.wake_many(1) > 0
     }
-
     /// Wake up all threads that are blocked on this raw mutex.
     ///
     /// Returns the number of waiters that were woken up.
@@ -249,7 +275,7 @@ pub trait RawMutex: Send + Sync {
     }
 
     /// If the underlying value is `val`, block until a wake operation wakes us up.
-    fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp>;
+    fn block(&self, val: u32) -> Result<(), RawMutexBlockError>;
 
     /// If the underlying value is `val`, block until a wake operation wakes us up, or some `time`
     /// has passed without a wake operation having occured.
@@ -257,7 +283,7 @@ pub trait RawMutex: Send + Sync {
         &self,
         val: u32,
         time: core::time::Duration,
-    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp>;
+    ) -> Result<UnblockedOrTimedOut, RawMutexBlockError>;
 }
 
 /// A zero-sized struct indicating that the block was immediately unblocked (due to non-matching
@@ -271,6 +297,17 @@ pub enum UnblockedOrTimedOut {
     Unblocked,
     /// Sufficient time elapsed without a wake call
     TimedOut,
+}
+
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum RawMutexBlockError {
+    #[error("immediately woken up")]
+    ImmediatelyWokenUp,
+    #[error("invalid address")]
+    InvalidAddress,
+    #[error("interrupted by a signal")]
+    Interrupted,
 }
 
 /// An IP packet interface to the outside world.

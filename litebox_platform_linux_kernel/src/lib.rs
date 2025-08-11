@@ -7,12 +7,12 @@ use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};
 
 use litebox::mm::linux::PageRange;
+use litebox::platform::RawPointerProvider;
 use litebox::platform::{
-    DebugLogProvider, ExitProvider, IPInterfaceProvider, ImmediatelyWokenUp,
-    PageManagementProvider, Provider, Punchthrough, PunchthroughProvider, PunchthroughToken,
-    RawMutPointer, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
+    DebugLogProvider, ExitProvider, IPInterfaceProvider, PageManagementProvider, Provider,
+    Punchthrough, PunchthroughProvider, PunchthroughToken, RawConstPointer, RawMutPointer,
+    RawMutexBlockError, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
 };
-use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::PunchthroughSyscall;
 use litebox_common_linux::errno::Errno;
 use ptr::{UserConstPtr, UserMutPtr};
@@ -67,7 +67,6 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
                     .map(|()| 0)
                     .ok_or(Errno::EFAULT)
             }
-            PunchthroughSyscall::WakeByAddress { .. } => todo!(),
         };
         match r {
             Ok(v) => Ok(v),
@@ -133,6 +132,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 
 impl<Host: HostInterface> RawMutexProvider for LinuxKernel<Host> {
     type RawMutex = RawMutex<Host>;
+    type UserRawMutex = UserRawMutex<Host>;
 
     fn new_raw_mutex(&self) -> Self::RawMutex {
         Self::RawMutex {
@@ -140,6 +140,21 @@ impl<Host: HostInterface> RawMutexProvider for LinuxKernel<Host> {
             host: core::marker::PhantomData,
         }
     }
+
+    fn from_raw_ptr<'a>(ptr: Self::RawConstPointer<u32>) -> Option<Self::UserRawMutex> {
+        if ptr.as_usize() % core::mem::align_of::<AtomicU32>() != 0 {
+            return None;
+        }
+        Some(UserRawMutex {
+            inner: ptr,
+            host: core::marker::PhantomData,
+        })
+    }
+}
+
+pub struct UserRawMutex<Host: HostInterface> {
+    inner: UserConstPtr<u32>,
+    host: core::marker::PhantomData<Host>,
 }
 
 /// An implementation of [`litebox::platform::RawMutex`]
@@ -156,71 +171,90 @@ impl<Host: HostInterface> litebox::platform::RawMutex for RawMutex<Host> {
     fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32 {
         &self.inner
     }
+}
 
+impl<Host: HostInterface> litebox::platform::UserRawMutex for RawMutex<Host> {
     fn wake_many(&self, n: usize) -> usize {
         Host::wake_many(&self.inner, n).unwrap()
     }
 
-    fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
-        match self.block_or_maybe_timeout(val, None) {
-            Ok(UnblockedOrTimedOut::Unblocked) => Ok(()),
-            Ok(UnblockedOrTimedOut::TimedOut) => unreachable!(),
-            Err(ImmediatelyWokenUp) => Err(ImmediatelyWokenUp),
-        }
+    fn block(&self, val: u32) -> Result<(), litebox::platform::RawMutexBlockError> {
+        block_or_maybe_timeout::<Host>(&self.inner, val, None, || {
+            Some(self.inner.load(core::sync::atomic::Ordering::Relaxed))
+        })
+        .map(|res| match res {
+            UnblockedOrTimedOut::Unblocked => (),
+            UnblockedOrTimedOut::TimedOut => unreachable!(),
+        })
     }
 
     fn block_or_timeout(
         &self,
         val: u32,
         time: core::time::Duration,
-    ) -> Result<litebox::platform::UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        self.block_or_maybe_timeout(val, Some(time))
+    ) -> Result<UnblockedOrTimedOut, RawMutexBlockError> {
+        block_or_maybe_timeout::<Host>(&self.inner, val, Some(time), || {
+            Some(self.inner.load(core::sync::atomic::Ordering::Relaxed))
+        })
     }
 }
 
-impl<Host: HostInterface> RawMutex<Host> {
-    fn block_or_maybe_timeout(
+impl<Host: HostInterface> litebox::platform::UserRawMutex for UserRawMutex<Host> {
+    fn wake_many(&self, n: usize) -> usize {
+        let mutex = unsafe { &*(self.inner.as_usize() as *const AtomicU32) };
+        Host::wake_many(mutex, n).unwrap()
+    }
+
+    fn block(&self, val: u32) -> Result<(), RawMutexBlockError> {
+        let mutex = unsafe { &*(self.inner.as_usize() as *const AtomicU32) };
+        block_or_maybe_timeout::<Host>(mutex, val, None, || {
+            unsafe { self.inner.read_at_offset(0) }.map(alloc::borrow::Cow::into_owned)
+        })
+        .map(|res| match res {
+            UnblockedOrTimedOut::Unblocked => (),
+            UnblockedOrTimedOut::TimedOut => unreachable!(),
+        })
+    }
+
+    fn block_or_timeout(
         &self,
         val: u32,
-        timeout: Option<core::time::Duration>,
-    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        loop {
-            // No need to wait if the value already changed.
-            if self
-                .underlying_atomic()
-                .load(core::sync::atomic::Ordering::Relaxed)
-                != val
-            {
-                return Err(ImmediatelyWokenUp);
+        time: core::time::Duration,
+    ) -> Result<UnblockedOrTimedOut, RawMutexBlockError> {
+        let mutex = unsafe { &*(self.inner.as_usize() as *const AtomicU32) };
+        block_or_maybe_timeout::<Host>(mutex, val, Some(time), || {
+            unsafe { self.inner.read_at_offset(0) }.map(alloc::borrow::Cow::into_owned)
+        })
+    }
+}
+
+fn block_or_maybe_timeout<Host: HostInterface>(
+    mutex: &AtomicU32,
+    val: u32,
+    timeout: Option<core::time::Duration>,
+    load: impl Fn() -> Option<u32>,
+) -> Result<UnblockedOrTimedOut, RawMutexBlockError> {
+    loop {
+        // No need to wait if the value already changed.
+        if load().ok_or(RawMutexBlockError::InvalidAddress)? != val {
+            return Err(RawMutexBlockError::ImmediatelyWokenUp);
+        }
+
+        match Host::block_or_maybe_timeout(mutex, val, timeout) {
+            Ok(()) => {
+                if load().ok_or(RawMutexBlockError::InvalidAddress)? != val {
+                    return Ok(UnblockedOrTimedOut::Unblocked);
+                }
             }
-
-            let ret = Host::block_or_maybe_timeout(&self.inner, val, timeout);
-
-            match ret {
-                Ok(()) => {
-                    if self
-                        .underlying_atomic()
-                        .load(core::sync::atomic::Ordering::Relaxed)
-                        != val
-                    {
-                        return Ok(UnblockedOrTimedOut::Unblocked);
+            Err(e) => {
+                return match e {
+                    Errno::EAGAIN => Err(RawMutexBlockError::ImmediatelyWokenUp),
+                    Errno::EINTR => Err(RawMutexBlockError::Interrupted),
+                    Errno::ETIMEDOUT => Ok(UnblockedOrTimedOut::TimedOut),
+                    _ => {
+                        panic!("Unexpected error: {:?}", e);
                     }
-                }
-                Err(Errno::EAGAIN) => {
-                    // If the futex value does not match val, then the call fails
-                    // immediately with the error EAGAIN.
-                    return Err(ImmediatelyWokenUp);
-                }
-                Err(Errno::EINTR) => {
-                    // return Err(ImmediatelyWokenUp);
-                    todo!("EINTR");
-                }
-                Err(Errno::ETIMEDOUT) => {
-                    return Ok(UnblockedOrTimedOut::TimedOut);
-                }
-                Err(e) => {
-                    panic!("Error: {:?}", e);
-                }
+                };
             }
         }
     }

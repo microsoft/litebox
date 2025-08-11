@@ -76,11 +76,11 @@ impl MockRawMutex {
         &self,
         val: u32,
         timeout: Option<core::time::Duration>,
-    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
+    ) -> Result<UnblockedOrTimedOut, RawMutexBlockError> {
         // We immediately wake up (without even hitting syscalls) if we can clearly see that the
         // value is different.
         if self.inner.load(core::sync::atomic::Ordering::SeqCst) != val {
-            return Err(ImmediatelyWokenUp);
+            return Err(RawMutexBlockError::ImmediatelyWokenUp);
         }
 
         // Track some initial information.
@@ -133,7 +133,9 @@ impl RawMutex for MockRawMutex {
     fn underlying_atomic(&self) -> &AtomicU32 {
         &self.inner
     }
+}
 
+impl UserRawMutex for MockRawMutex {
     fn wake_many(&self, n: usize) -> usize {
         let mut internal_state = loop {
             let internal_state = self.internal_state.write().unwrap();
@@ -152,11 +154,10 @@ impl RawMutex for MockRawMutex {
         num_to_wake_up
     }
 
-    fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
-        match self.block_or_maybe_timeout(val, None) {
-            Ok(UnblockedOrTimedOut::Unblocked) => Ok(()),
-            Ok(UnblockedOrTimedOut::TimedOut) => unreachable!(),
-            Err(ImmediatelyWokenUp) => Err(ImmediatelyWokenUp),
+    fn block(&self, val: u32) -> Result<(), RawMutexBlockError> {
+        match self.block_or_maybe_timeout(val, None)? {
+            UnblockedOrTimedOut::Unblocked => Ok(()),
+            UnblockedOrTimedOut::TimedOut => unreachable!(),
         }
     }
 
@@ -164,13 +165,14 @@ impl RawMutex for MockRawMutex {
         &self,
         val: u32,
         timeout: core::time::Duration,
-    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
+    ) -> Result<UnblockedOrTimedOut, RawMutexBlockError> {
         self.block_or_maybe_timeout(val, Some(timeout))
     }
 }
 
 impl RawMutexProvider for MockPlatform {
     type RawMutex = MockRawMutex;
+    type UserRawMutex = MockRawMutex;
 
     fn new_raw_mutex(&self) -> Self::RawMutex {
         MockRawMutex {
@@ -180,6 +182,10 @@ impl RawMutexProvider for MockPlatform {
                 number_blocked: 0,
             }),
         }
+    }
+
+    fn from_raw_ptr(ptr: Self::RawConstPointer<u32>) -> Option<Self::UserRawMutex> {
+        unimplemented!("raw mutex for MockPlatform")
     }
 }
 

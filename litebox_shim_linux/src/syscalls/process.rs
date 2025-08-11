@@ -3,16 +3,14 @@
 use core::mem::offset_of;
 
 use alloc::boxed::Box;
-use litebox::platform::{ExitProvider as _, RawMutPointer, ThreadProvider};
 use litebox::platform::{
-    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _,
-    ThreadLocalStorageProvider as _,
+    ExitProvider as _, Instant as _, PunchthroughProvider as _, PunchthroughToken as _,
+    RawConstPointer as _, RawMutPointer as _, ThreadLocalStorageProvider as _, ThreadProvider as _,
+    TimeProvider as _, UserRawMutex as _,
 };
 use litebox::utils::TruncateExt;
 use litebox_common_linux::CloneFlags;
 use litebox_common_linux::{ArchPrctlArg, errno::Errno};
-
-use crate::MutPtr;
 
 /// A global counter for the number of threads in the system.
 pub(super) static NR_THREADS: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(1);
@@ -107,19 +105,6 @@ pub(crate) fn sys_rt_sigaction(
     })
 }
 
-fn futex_wake(addr: MutPtr<i32>) {
-    let punchthrough = litebox_common_linux::PunchthroughSyscall::WakeByAddress { addr };
-    let token = litebox_platform_multiplex::platform()
-        .get_punchthrough_token_for(punchthrough)
-        .expect("Failed to get punchthrough token for FUTEX_WAKE");
-    token.execute().unwrap_or_else(|e| match e {
-        litebox::platform::PunchthroughError::Failure(errno) => {
-            panic!("FUTEX_WAKE failed with error: {:?}", errno)
-        }
-        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-    });
-}
-
 const ROBUST_LIST_LIMIT: isize = 2048;
 
 /*
@@ -198,7 +183,12 @@ pub(crate) fn sys_exit(status: i32) -> ! {
         // Clear the child TID if requested
         // TODO: if we are the last thread, we don't need to clear it
         let _ = unsafe { clear_child_tid.write_at_offset(0, 0) };
-        futex_wake(clear_child_tid);
+        let clear_child_tid = crate::ConstPtr::from_usize(clear_child_tid.as_usize());
+        let _ = sys_futex(litebox_common_linux::FutexArgs::WAKE {
+            addr: clear_child_tid,
+            flags: litebox_common_linux::FutexFlags::PRIVATE,
+            count: 1,
+        });
     }
     if let Some(robust_list) = tls.current_task.robust_list.take() {
         let _ = wake_robust_list(robust_list);
@@ -476,6 +466,115 @@ pub(crate) fn sys_getgid() -> usize {
 pub(crate) fn sys_getegid() -> usize {
     litebox_platform_multiplex::platform()
         .with_thread_local_storage_mut(|tls| tls.current_task.credentials.egid)
+}
+
+fn get_timeout(
+    timeout: crate::ConstPtr<litebox_common_linux::Timespec>,
+) -> Result<litebox_common_linux::Timespec, Errno> {
+    let timeout = unsafe { timeout.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+    if timeout.tv_sec < 0 || timeout.tv_nsec > 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(timeout.into_owned())
+}
+
+const FUTEX_BITSET_MATCH_ANY: u32 = 0xFFFFFFFF;
+
+/// Handle syscall `futex`.
+pub(crate) fn sys_futex(
+    arg: litebox_common_linux::FutexArgs<litebox_platform_multiplex::Platform>,
+) -> Result<usize, Errno> {
+    match arg {
+        litebox_common_linux::FutexArgs::WAKE { addr, flags, count } => {
+            if !flags.contains(litebox_common_linux::FutexFlags::PRIVATE) {
+                // Note our mutex implementation assumes futexes are private as we don't support shared memory yet.
+                // It should be fine to ignore this for now.
+                #[cfg(debug_assertions)]
+                litebox::log_println!(
+                    litebox_platform_multiplex::platform(),
+                    "warning: shared futexes"
+                );
+            }
+            let futex = <litebox_platform_multiplex::Platform as litebox::platform::RawMutexProvider>::from_raw_ptr(
+                addr,
+            ).ok_or(Errno::EINVAL)?;
+            Ok(futex.wake_many(count as usize))
+        }
+        litebox_common_linux::FutexArgs::WAIT {
+            addr,
+            flags,
+            val,
+            timeout,
+        } => {
+            if !flags.contains(litebox_common_linux::FutexFlags::PRIVATE) {
+                // Note our mutex implementation assumes futexes are private as we don't support shared memory yet.
+                // It should be fine to ignore this for now.
+                #[cfg(debug_assertions)]
+                litebox::log_println!(
+                    litebox_platform_multiplex::platform(),
+                    "warning: shared futexes"
+                );
+            }
+            let futex = <litebox_platform_multiplex::Platform as litebox::platform::RawMutexProvider>::from_raw_ptr(
+                addr,
+            ).ok_or(Errno::EINVAL)?;
+            match timeout {
+                Some(t) => futex
+                    .block_or_timeout(val, get_timeout(t)?.into())
+                    .map_err(Errno::from)
+                    .and_then(|res| match res {
+                        litebox::platform::UnblockedOrTimedOut::Unblocked => Ok(0),
+                        litebox::platform::UnblockedOrTimedOut::TimedOut => Err(Errno::ETIMEDOUT),
+                    }),
+                None => futex.block(val).map(|()| 0).map_err(Errno::from),
+            }
+        }
+        litebox_common_linux::FutexArgs::WAIT_BITSET {
+            addr,
+            flags,
+            val,
+            timeout,
+            bitmask,
+        } => {
+            if !flags.contains(litebox_common_linux::FutexFlags::PRIVATE) {
+                // Note our mutex implementation assumes futexes are private as we don't support shared memory yet.
+                // It should be fine to ignore this for now.
+                #[cfg(debug_assertions)]
+                litebox::log_println!(
+                    litebox_platform_multiplex::platform(),
+                    "warning: shared futexes"
+                );
+            }
+            if bitmask != FUTEX_BITSET_MATCH_ANY {
+                unimplemented!("FUTEX_BITSET_MATCH_ANY is the only supported bitmask");
+            }
+            if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) && timeout.is_some()
+            {
+                unimplemented!("FUTEX_CLOCK_REALTIME is not supported yet");
+            }
+            let futex = <litebox_platform_multiplex::Platform as litebox::platform::RawMutexProvider>::from_raw_ptr(
+                addr,
+            ).ok_or(Errno::EINVAL)?;
+            match timeout {
+                Some(t) => {
+                    let abs_time: <litebox_platform_multiplex::Platform as litebox::platform::TimeProvider>::Instant = get_timeout(t)?.into();
+                    let now = litebox_platform_multiplex::platform().now();
+                    let rel_time = abs_time.duration_since(&now);
+                    futex
+                        .block_or_timeout(val, rel_time)
+                        .map_err(Errno::from)
+                        .and_then(|res| match res {
+                            litebox::platform::UnblockedOrTimedOut::Unblocked => Ok(0),
+                            litebox::platform::UnblockedOrTimedOut::TimedOut => {
+                                Err(Errno::ETIMEDOUT)
+                            }
+                        })
+                }
+                None => futex.block(val).map(|()| 0).map_err(Errno::from),
+            }
+        }
+        _ => todo!(),
+    }
 }
 
 #[cfg(test)]

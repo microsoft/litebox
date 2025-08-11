@@ -10,7 +10,8 @@ use super::{
 use crate::{
     LiteBox,
     platform::{
-        ImmediatelyWokenUp, Instant as _, RawMutex as _, TimeProvider, UnblockedOrTimedOut,
+        ImmediatelyWokenUp, Instant as _, RawMutex, TimeProvider, UnblockedOrTimedOut,
+        UserRawMutex as _,
     },
     sync::RawSyncPrimitivesProvider,
 };
@@ -144,12 +145,12 @@ impl<Platform: RawSyncPrimitivesProvider> Poller<Platform> {
         let futex = self.condvar.underlying_atomic();
         if futex.swap(0, core::sync::atomic::Ordering::Relaxed) == 0 {
             if let Some(timeout) = timeout {
-                match self.condvar.block_or_timeout(0, timeout) {
+                match RawMutex::block_or_timeout(&self.condvar, 0, timeout) {
                     Ok(UnblockedOrTimedOut::TimedOut) => Err(TimedOut),
                     Ok(UnblockedOrTimedOut::Unblocked) | Err(ImmediatelyWokenUp) => Ok(()),
                 }
             } else {
-                let _ = self.condvar.block(0);
+                let _ = RawMutex::block(&self.condvar, 0);
                 Ok(())
             }
         } else {

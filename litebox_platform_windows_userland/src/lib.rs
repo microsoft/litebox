@@ -11,12 +11,12 @@ use std::cell::Cell;
 use std::os::raw::c_void;
 use std::sync::atomic::Ordering::SeqCst;
 
-use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::RawConstPointer;
 use litebox::platform::ThreadLocalStorageProvider;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
+use litebox::platform::{RawConstPointer, RawMutexBlockError};
 use litebox_common_linux::PunchthroughSyscall;
 
 use windows_sys::Win32::Foundation as Win32_Foundation;
@@ -426,12 +426,61 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
 
 impl litebox::platform::RawMutexProvider for WindowsUserland {
     type RawMutex = RawMutex;
+    type UserRawMutex = UserRawMutex;
 
     fn new_raw_mutex(&self) -> Self::RawMutex {
         RawMutex {
             inner: AtomicU32::new(0),
             waiter_count: AtomicUsize::new(0),
         }
+    }
+
+    fn from_raw_ptr(ptr: Self::RawConstPointer<u32>) -> Option<Self::UserRawMutex> {
+        if ptr.as_usize() % core::mem::align_of::<AtomicU32>() != 0 {
+            return None;
+        }
+        Some(UserRawMutex(ptr))
+    }
+}
+
+pub struct UserRawMutex(litebox::platform::trivial_providers::TransparentConstPtr<u32>);
+
+impl litebox::platform::UserRawMutex for UserRawMutex {
+    fn wake_many(&self, n: usize) -> usize {
+        assert!(n > 0, "wake_many should be called with n > 0");
+        let n: u32 = n.try_into().unwrap();
+
+        let mutex = unsafe { &*(self.0.as_usize() as *const AtomicU32) };
+        unsafe {
+            if n == 1 {
+                Win32_Threading::WakeByAddressSingle(mutex as *const _ as *const c_void);
+            } else if n >= i32::MAX as u32 {
+                Win32_Threading::WakeByAddressAll(mutex as *const _ as *const c_void);
+            } else {
+                // Wake up `n` threads iteratively
+                for _ in 0..n {
+                    Win32_Threading::WakeByAddressSingle(mutex as *const _ as *const c_void);
+                }
+            }
+        }
+        n as usize
+    }
+
+    fn block(&self, val: u32) -> Result<(), RawMutexBlockError> {
+        let mutex = unsafe { &*(self.0.as_usize() as *const AtomicU32) };
+        match block_or_maybe_timeout(mutex, val, None)? {
+            UnblockedOrTimedOut::Unblocked => Ok(()),
+            UnblockedOrTimedOut::TimedOut => unreachable!(),
+        }
+    }
+
+    fn block_or_timeout(
+        &self,
+        val: u32,
+        time: core::time::Duration,
+    ) -> Result<UnblockedOrTimedOut, RawMutexBlockError> {
+        let mutex = unsafe { &*(self.0.as_usize() as *const AtomicU32) };
+        block_or_maybe_timeout(mutex, val, Some(time))
     }
 }
 
@@ -442,78 +491,69 @@ pub struct RawMutex {
     waiter_count: AtomicUsize,
 }
 
-impl RawMutex {
-    fn block_or_maybe_timeout(
-        &self,
-        val: u32,
-        timeout: Option<Duration>,
-    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        // We immediately wake up (without even hitting syscalls) if we can clearly see that the
-        // value is different.
-        if self.inner.load(SeqCst) != val {
-            return Err(ImmediatelyWokenUp);
+fn block_or_maybe_timeout(
+    mutex: &AtomicU32,
+    val: u32,
+    timeout: Option<Duration>,
+) -> Result<UnblockedOrTimedOut, RawMutexBlockError> {
+    // We immediately wake up (without even hitting syscalls) if we can clearly see that the
+    // value is different.
+    if mutex.load(SeqCst) != val {
+        return Err(RawMutexBlockError::ImmediatelyWokenUp);
+    }
+
+    // Track some initial information.
+    let start = std::time::Instant::now();
+
+    loop {
+        // Check if value changed before waiting
+        if mutex.load(SeqCst) != val {
+            break Err(RawMutexBlockError::ImmediatelyWokenUp);
         }
 
-        // Track some initial information.
-        let start = std::time::Instant::now();
-
-        // Indicate we are about to wait.
-        self.waiter_count.fetch_add(1, SeqCst);
-
-        let result = loop {
-            // Check if value changed before waiting
-            if self.inner.load(SeqCst) != val {
-                break Err(ImmediatelyWokenUp);
-            }
-
-            // Compute timeout in ms
-            let timeout_ms = match timeout {
-                None => Win32_Threading::INFINITE, // no timeout
-                Some(timeout) => match timeout.checked_sub(start.elapsed()) {
-                    None => {
-                        // Already timed out
-                        break Ok(UnblockedOrTimedOut::TimedOut);
-                    }
-                    Some(remaining_time) => {
-                        let ms = remaining_time.as_millis();
-                        ms.min((u32::MAX - 1) as u128) as u32
-                    }
-                },
-            };
-
-            let ok = unsafe {
-                Win32_Threading::WaitOnAddress(
-                    &self.inner as *const AtomicU32 as *const c_void,
-                    &val as *const u32 as *const c_void,
-                    std::mem::size_of::<u32>(),
-                    timeout_ms,
-                ) != 0
-            };
-
-            if ok {
-                if self.inner.load(SeqCst) != val {
-                    break Ok(UnblockedOrTimedOut::Unblocked);
+        // Compute timeout in ms
+        let timeout_ms = match timeout {
+            None => Win32_Threading::INFINITE, // no timeout
+            Some(timeout) => match timeout.checked_sub(start.elapsed()) {
+                None => {
+                    // Already timed out
+                    break Ok(UnblockedOrTimedOut::TimedOut);
                 }
-            } else {
-                // Check why WaitOnAddress failed
-                let err = unsafe { GetLastError() };
-                match err {
-                    Win32_Foundation::WAIT_TIMEOUT => {
-                        // Timed out
-                        break Ok(UnblockedOrTimedOut::TimedOut);
-                    }
-                    e => {
-                        // Other error, possibly spurious wakeup or value changed
-                        // Continue the loop to check the value again
-                        panic!("Unexpected error={e} for WaitOnAddress");
-                    }
+                Some(remaining_time) => {
+                    let ms = remaining_time.as_millis();
+                    ms.min((u32::MAX - 1) as u128) as u32
                 }
-            }
+            },
         };
 
-        // Decrement waiter count before returning
-        self.waiter_count.fetch_sub(1, SeqCst);
-        result
+        let ok = unsafe {
+            Win32_Threading::WaitOnAddress(
+                mutex as *const AtomicU32 as *const c_void,
+                &val as *const u32 as *const c_void,
+                std::mem::size_of::<u32>(),
+                timeout_ms,
+            ) != 0
+        };
+
+        if ok {
+            if mutex.load(SeqCst) != val {
+                break Ok(UnblockedOrTimedOut::Unblocked);
+            }
+        } else {
+            // Check why WaitOnAddress failed
+            let err = unsafe { GetLastError() };
+            match err {
+                Win32_Foundation::WAIT_TIMEOUT => {
+                    // Timed out
+                    break Ok(UnblockedOrTimedOut::TimedOut);
+                }
+                e => {
+                    // Other error, possibly spurious wakeup or value changed
+                    // Continue the loop to check the value again
+                    panic!("Unexpected error={} for WaitOnAddress", e);
+                }
+            }
+        }
     }
 }
 
@@ -521,7 +561,9 @@ impl litebox::platform::RawMutex for RawMutex {
     fn underlying_atomic(&self) -> &AtomicU32 {
         &self.inner
     }
+}
 
+impl litebox::platform::UserRawMutex for RawMutex {
     fn wake_many(&self, n: usize) -> usize {
         assert!(n > 0, "wake_many should be called with n > 0");
         let n: u32 = n.try_into().unwrap();
@@ -529,19 +571,13 @@ impl litebox::platform::RawMutex for RawMutex {
 
         unsafe {
             if n == 1 {
-                Win32_Threading::WakeByAddressSingle(
-                    self.underlying_atomic().as_ptr() as *const c_void
-                );
+                Win32_Threading::WakeByAddressSingle(self.inner.as_ptr() as *const c_void);
             } else if (n as usize) >= waiting {
-                Win32_Threading::WakeByAddressAll(
-                    self.underlying_atomic().as_ptr() as *const c_void
-                );
+                Win32_Threading::WakeByAddressAll(self.inner.as_ptr() as *const c_void);
             } else {
                 // Wake up `n` threads iteratively
                 for _ in 0..n {
-                    Win32_Threading::WakeByAddressSingle(
-                        self.underlying_atomic().as_ptr() as *const c_void
-                    );
+                    Win32_Threading::WakeByAddressSingle(self.inner.as_ptr() as *const c_void);
                 }
             }
         }
@@ -551,11 +587,15 @@ impl litebox::platform::RawMutex for RawMutex {
         waiting.min(n as usize)
     }
 
-    fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
-        match self.block_or_maybe_timeout(val, None) {
-            Ok(UnblockedOrTimedOut::Unblocked) => Ok(()),
-            Ok(UnblockedOrTimedOut::TimedOut) => unreachable!(),
-            Err(ImmediatelyWokenUp) => Err(ImmediatelyWokenUp),
+    fn block(&self, val: u32) -> Result<(), RawMutexBlockError> {
+        // Indicate we are about to wait.
+        self.waiter_count.fetch_add(1, SeqCst);
+        let result = block_or_maybe_timeout(&self.inner, val, None);
+        // Decrement waiter count before returning
+        self.waiter_count.fetch_sub(1, SeqCst);
+        match result? {
+            UnblockedOrTimedOut::Unblocked => Ok(()),
+            UnblockedOrTimedOut::TimedOut => unreachable!(),
         }
     }
 
@@ -563,8 +603,13 @@ impl litebox::platform::RawMutex for RawMutex {
         &self,
         val: u32,
         timeout: Duration,
-    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        self.block_or_maybe_timeout(val, Some(timeout))
+    ) -> Result<UnblockedOrTimedOut, RawMutexBlockError> {
+        // Indicate we are about to wait.
+        self.waiter_count.fetch_add(1, SeqCst);
+        let result = block_or_maybe_timeout(&self.inner, val, Some(timeout));
+        // Decrement waiter count before returning
+        self.waiter_count.fetch_sub(1, SeqCst);
+        result
     }
 }
 
