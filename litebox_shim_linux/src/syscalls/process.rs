@@ -475,6 +475,23 @@ pub(crate) fn sys_gettimeofday(
     Ok(())
 }
 
+/// Handle syscall `time`.
+pub(crate) fn sys_time(
+    tloc: crate::MutPtr<litebox_common_linux::time_t>,
+) -> Result<litebox_common_linux::time_t, Errno> {
+    // Get current realtime (wall clock time)
+    let timespec =
+        litebox_platform_multiplex::platform().get_timespec(litebox::platform::ClockType::Realtime);
+
+    // Extract seconds as time_t
+    let seconds = timespec.tv_sec as litebox_common_linux::time_t;
+
+    // Write to tloc
+    unsafe { tloc.write_at_offset(0, seconds) };
+
+    Ok(seconds)
+}
+
 /// Handle syscall `getpid`.
 pub(crate) fn sys_getpid() -> i32 {
     litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| tls.current_task.pid)

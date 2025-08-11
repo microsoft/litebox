@@ -515,6 +515,9 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
         SyscallRequest::ClockGettime { clockid, tp } => {
             syscalls::process::sys_clock_gettime(clockid, tp).map(|()| 0)
         }
+        SyscallRequest::Time { tloc } => {
+            syscalls::process::sys_time(tloc).map(|seconds| seconds as usize)
+        }
         SyscallRequest::Openat {
             dirfd,
             pathname,
