@@ -221,7 +221,7 @@ fn new_thread_callback(
         set_child_tid,
         callback: _,
     } = args;
-    let child_tid = task.tid;
+    let child_tid: i32 = task.tid.truncate();
 
     // Set the TLS for the platform itself
     let litebox_tls = litebox_common_linux::ThreadLocalStorage::new(task);
@@ -343,7 +343,7 @@ pub(crate) fn sys_set_tid_address(tidptr: crate::MutPtr<i32>) -> i32 {
     unsafe {
         litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| {
             tls.current_task.clear_child_tid = Some(tidptr);
-            tls.current_task.tid
+            tls.current_task.tid.truncate()
         })
     }
 }
@@ -352,7 +352,7 @@ pub(crate) fn sys_set_tid_address(tidptr: crate::MutPtr<i32>) -> i32 {
 pub(crate) fn sys_gettid() -> i32 {
     unsafe {
         litebox_platform_multiplex::platform()
-            .with_thread_local_storage_mut(|tls| tls.current_task.tid)
+            .with_thread_local_storage_mut(|tls| tls.current_task.tid.truncate())
     }
 }
 

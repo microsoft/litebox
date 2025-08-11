@@ -190,11 +190,11 @@ impl FreeBSDUserland {
 
         let tid = i32::try_from(tid).expect("tid should fit in i32");
         let ppid =
-            unsafe { syscalls::syscall!(syscalls::Sysno::Getppid) }.expect("Failed to get PPID");
+            unsafe { syscalls::syscall0(syscalls::Sysno::Getppid) }.expect("Failed to get PPID");
         let ppid: i32 = i32::try_from(ppid).expect("ppid should fit in i32");
         let task = alloc::boxed::Box::new(litebox_common_linux::Task {
             pid: tid,
-            tid,
+            tid: i64::from(tid),
             ppid,
             clear_child_tid: None,
             robust_list: None,

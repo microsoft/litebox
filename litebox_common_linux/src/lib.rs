@@ -1073,10 +1073,13 @@ impl<Platform: litebox::platform::RawPointerProvider> ThreadLocalStorage<Platfor
 pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     /// Process ID
     pub pid: i32,
-    /// Thread ID
-    pub tid: i32,
     /// Parent Process ID
     pub ppid: i32,
+    /// Thread ID
+    ///
+    /// Note tid is i32 on Linux but long on freebsd (though it always fits into i32).
+    /// Use i64 for consistency
+    pub tid: i64,
     /// When a thread whose `clear_child_tid` is not `None` terminates, and it shares memory with other threads,
     /// the kernel writes 0 to the address specified by `clear_child_tid` and then executes:
     ///
