@@ -445,13 +445,35 @@ pub(crate) fn sys_clock_gettime(
     tp: crate::MutPtr<litebox_common_linux::Timespec>,
 ) -> Result<(), Errno> {
     let clocktype = match clockid {
-        0 => litebox::platform::ClockType::Realtime,
-        1 => litebox::platform::ClockType::Monotonic,
+        0 | 5 => litebox::platform::ClockType::Realtime,
+        1 | 6 => litebox::platform::ClockType::Monotonic,
         _ => panic!("Unsupported clock ID: {}", clockid),
     };
 
     let timespec = litebox_platform_multiplex::platform().get_timespec(clocktype);
     unsafe { tp.write_at_offset(0, timespec) }.ok_or(Errno::EFAULT)
+}
+
+/// Handle syscall `clock_getres`.
+pub(crate) fn sys_clock_getres(
+    clockid: i32,
+    res: crate::MutPtr<litebox_common_linux::Timespec>,
+) -> Result<(), Errno> {
+    // Validate the clock ID (same validation as clock_gettime)
+    let _clocktype = clockid;
+
+    // Return the resolution of the clock
+    // For most modern systems, the resolution is typically 1 nanosecond
+    // This is a reasonable default for high-resolution timers
+    let resolution = litebox_common_linux::Timespec {
+        tv_sec: 0,
+        tv_nsec: 1, // 1 nanosecond resolution
+    };
+
+    unsafe {
+        res.write_at_offset(0, resolution);
+    }
+    Ok(())
 }
 
 /// Handle syscall `gettimeofday`.

@@ -1656,6 +1656,10 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         clockid: i32,
         tp: Platform::RawMutPointer<Timespec>,
     },
+    ClockGetres {
+        clockid: i32,
+        res: Platform::RawMutPointer<Timespec>,
+    },
     Gettimeofday {
         tv: Platform::RawMutPointer<TimeVal>,
         tz: Platform::RawMutPointer<TimeZone>,
@@ -2074,6 +2078,10 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::clock_gettime => SyscallRequest::ClockGettime {
                 clockid: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
                 tp: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+            },
+            Sysno::clock_getres => SyscallRequest::ClockGetres {
+                clockid: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                res: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
             },
             Sysno::time => SyscallRequest::Time {
                 tloc: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
