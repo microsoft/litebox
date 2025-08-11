@@ -288,6 +288,8 @@ impl WindowsUserland {
         let task = alloc::boxed::Box::new(litebox_common_linux::Task::<WindowsUserland> {
             pid: 1000,
             tid: 1000,
+            // TODO: placeholder for actual PPID
+            ppid: 0,
             clear_child_tid: None,
             robust_list: None,
             credentials: alloc::sync::Arc::new(creds),
