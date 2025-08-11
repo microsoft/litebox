@@ -49,13 +49,20 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         dst: Platform::RawMutPointer<u8>,
         dst_len: Platform::RawMutPointer<u64>,
     },
+    CipherFinal {
+        state: TeeCrypStateHandle,
+        src: Platform::RawConstPointer<u8>,
+        src_len: usize,
+        dst: Platform::RawMutPointer<u8>,
+        dst_len: Platform::RawMutPointer<u64>,
+    },
     CrypObjGetInfo {
         obj: TeeObjHandle,
         info: Platform::RawMutPointer<TeeObjectInfo>,
     },
     CrypObjAlloc {
         typ: TeeObjectType,
-        max_size: usize,
+        max_size: u32,
         obj: Platform::RawMutPointer<TeeObjHandle>,
     },
     CrypObjClose {
@@ -66,7 +73,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     CrypObjPopulate {
         obj: TeeObjHandle,
-        attrs: Platform::RawMutPointer<UteeAttribute>,
+        attrs: Platform::RawConstPointer<UteeAttribute>,
         attr_count: usize,
     },
     CrypObjCopy {
@@ -120,13 +127,20 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 dst: Platform::RawMutPointer::from_usize(ctx.syscall_arg(3)),
                 dst_len: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
             },
+            TeeSyscallNr::CipherFinal => SyscallRequest::CipherFinal {
+                state: TeeCrypStateHandle::try_from_usize(ctx.syscall_arg(0))?,
+                src: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
+                src_len: ctx.syscall_arg(2),
+                dst: Platform::RawMutPointer::from_usize(ctx.syscall_arg(3)),
+                dst_len: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
+            },
             TeeSyscallNr::CrypObjGetInfo => SyscallRequest::CrypObjGetInfo {
                 obj: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
                 info: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
             },
             TeeSyscallNr::CrypObjAlloc => SyscallRequest::CrypObjAlloc {
                 typ: TeeObjectType::try_from_usize(ctx.syscall_arg(0))?,
-                max_size: ctx.syscall_arg(1),
+                max_size: u32::try_from(ctx.syscall_arg(1)).map_err(|_| Errno::EINVAL)?,
                 obj: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
             },
             TeeSyscallNr::CrypObjClose => SyscallRequest::CrypObjClose {
@@ -137,7 +151,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             },
             TeeSyscallNr::CrypObjPopulate => SyscallRequest::CrypObjPopulate {
                 obj: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
-                attrs: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+                attrs: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
                 attr_count: ctx.syscall_arg(2),
             },
             TeeSyscallNr::CrypObjCopy => SyscallRequest::CrypObjCopy {
@@ -200,11 +214,13 @@ impl SyscallContext {
 /// A handle for `TeeObj`. OP-TEE kernel creates secret objects (e.g., via `CrypObjAlloc`)
 /// and provides handles for them to TAs in the user space. This lets them refer to
 /// the objects in subsequent syscalls.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(C)]
 pub struct TeeObjHandle(pub u32);
 
 impl TeeObjHandle {
+    pub const NULL: Self = TeeObjHandle(0);
+
     pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
         u32::try_from(value)
             .map_err(|_| Errno::EINVAL)
@@ -215,7 +231,7 @@ impl TeeObjHandle {
 /// A handle for `TeeCrypState`. Like `TeeObjHandle`, this is a handle for
 /// the cryptographic state (e.g., created through `CrypStateAlloc`) to be provided to
 /// a TA in the user space.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(C)]
 pub struct TeeCrypStateHandle(pub u32);
 
@@ -354,7 +370,34 @@ impl UteeParams {
 pub struct UteeAttribute {
     pub a: u64,
     pub b: u64,
-    pub attribute_id: u32,
+    pub attribute_id: TeeAttributeType,
+}
+
+const TEE_ATTR_SECRET_VALUE: u32 = 0xc000_0000;
+const TEE_ATTR_RSA_MODULUS: u32 = 0xd000_0130;
+const TEE_ATTR_RSA_PUBLIC_EXPONENT: u32 = 0xd000_0230;
+const TEE_ATTR_RSA_PRIVATE_EXPONENT: u32 = 0xc000_0330;
+const TEE_ATTR_RSA_PRIME1: u32 = 0xc000_0430;
+const TEE_ATTR_RSA_PRIME2: u32 = 0xc000_0530;
+const TEE_ATTR_RSA_EXPONENT1: u32 = 0xc000_0630;
+const TEE_ATTR_RSA_EXPONENT2: u32 = 0xc000_0730;
+const TEE_ATTR_RSA_COEFFICIENT: u32 = 0xc000_0830;
+
+/// `TEE_OperationMode` from `optee_os/lib/libutee/include/tee_api_defines.h`
+#[non_exhaustive]
+#[derive(Clone, Copy, TryFromPrimitive)]
+#[repr(u32)]
+pub enum TeeAttributeType {
+    SecretValue = TEE_ATTR_SECRET_VALUE,
+    RsaModulus = TEE_ATTR_RSA_MODULUS,
+    RsaPublicExponent = TEE_ATTR_RSA_PUBLIC_EXPONENT,
+    RsaPrivateExponent = TEE_ATTR_RSA_PRIVATE_EXPONENT,
+    RsaPrime1 = TEE_ATTR_RSA_PRIME1,
+    RsaPrime2 = TEE_ATTR_RSA_PRIME2,
+    RsaExponent1 = TEE_ATTR_RSA_EXPONENT1,
+    RsaExponent2 = TEE_ATTR_RSA_EXPONENT2,
+    RsaCoefficient = TEE_ATTR_RSA_COEFFICIENT,
+    Unknown = 0xffff_ffff,
 }
 
 /// `TEE_UUID` from `optee_os/lib/libutee/include/tee_api_types.h`. It uniquely identifies
@@ -372,13 +415,62 @@ pub struct TeeUuid {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct TeeObjectInfo {
-    pub object_type: u32,
+    pub object_type: TeeObjectType,
     pub object_size: u32,
     pub max_object_size: u32,
-    pub object_usage: u32,
+    pub object_usage: TeeUsage,
     pub data_size: u32,
     pub data_position: u32,
-    pub handle_flags: u32,
+    pub handle_flags: TeeHandleFlag,
+}
+
+bitflags::bitflags! {
+    /// `TEE_USAGE_*` from `optee_os/lib/libutee/include/tee_api_defines.h`
+    #[derive(Clone, Copy)]
+    pub struct TeeUsage: u32 {
+        const TEE_USAGE_EXTRACTABLE = 0x0000_0001;
+        const TEE_USAGE_ENCRYPT = 0x0000_0002;
+        const TEE_USAGE_DECRYPT = 0x0000_0004;
+        const TEE_USAGE_MAC = 0x0000_0008;
+        const TEE_USAGE_SIGN = 0x0000_0010;
+        const TEE_USAGE_VERIFY = 0x0000_0020;
+        const TEE_USAGE_DERIVE = 0x0000_0040;
+    }
+}
+
+bitflags::bitflags! {
+    /// Memory access rights constants from `optee_os/lib/libutee/include/tee_api_defines.h`
+    #[derive(Clone, Copy)]
+    pub struct TeeHandleFlag: u32 {
+        const TEE_HANDLE_FLAG_PERSISTENT = 0x0001_0000;
+        const TEE_HANDLE_FLAG_INITIALIZED = 0x0002_0000;
+        const TEE_HANDLE_FLAG_KEY_SET = 0x0004_0000;
+        const TEE_HANDLE_FLAG_EXPECT_TWO_KEYS = 0x0008_0000;
+    }
+}
+
+impl Default for TeeObjectInfo {
+    fn default() -> Self {
+        TeeObjectInfo {
+            object_type: TeeObjectType::Unknown,
+            object_size: 0,
+            max_object_size: 0,
+            object_usage: TeeUsage::all(),
+            data_size: 0,
+            data_position: 0,
+            handle_flags: TeeHandleFlag::empty(),
+        }
+    }
+}
+
+impl TeeObjectInfo {
+    pub fn new(object_type: TeeObjectType, max_object_size: u32) -> Self {
+        TeeObjectInfo {
+            object_type,
+            max_object_size,
+            ..Default::default()
+        }
+    }
 }
 
 const TEE_MODE_ENCRYPT: u32 = 0;
@@ -474,6 +566,40 @@ impl TeeAlgorithm {
         u32::try_from(value)
             .map_err(|_| Errno::EINVAL)
             .and_then(|v| Self::try_from(v).map_err(|_| Errno::EINVAL))
+    }
+}
+
+const TEE_OPERATION_CIPHER: u32 = 1;
+const TEE_OPERATION_MAC: u32 = 3;
+const TEE_OPERATION_AE: u32 = 4;
+const TEE_OPERATION_DIGEST: u32 = 5;
+const TEE_OPERATION_ASYMMETRIC_CIPHER: u32 = 6;
+const TEE_OPERATION_ASYMMETRIC_SIGNATURE: u32 = 7;
+const TEE_OPERATION_KEY_DERIVATION: u32 = 8;
+
+#[derive(Clone, Copy, TryFromPrimitive, PartialEq)]
+#[repr(u32)]
+pub enum TeeAlgorithmClass {
+    Cipher = TEE_OPERATION_CIPHER,
+    Mac = TEE_OPERATION_MAC,
+    Aead = TEE_OPERATION_AE,
+    Digest = TEE_OPERATION_DIGEST,
+    AsymmetricCipher = TEE_OPERATION_ASYMMETRIC_CIPHER,
+    AsymmetricSignature = TEE_OPERATION_ASYMMETRIC_SIGNATURE,
+    KeyDerivation = TEE_OPERATION_KEY_DERIVATION,
+    Unknown = 0xffff_ffff,
+}
+
+impl From<TeeAlgorithm> for TeeAlgorithmClass {
+    fn from(algo: TeeAlgorithm) -> Self {
+        match algo {
+            TeeAlgorithm::AesCtr | TeeAlgorithm::AesGcm => TeeAlgorithmClass::Cipher,
+            TeeAlgorithm::HmacSha256 | TeeAlgorithm::HmacSha512 => TeeAlgorithmClass::Mac,
+            TeeAlgorithm::RsaPkcs1Sha256 | TeeAlgorithm::RsaPkcs1Sha512 => {
+                TeeAlgorithmClass::AsymmetricSignature
+            }
+            _ => TeeAlgorithmClass::Unknown,
+        }
     }
 }
 

@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aes = { version = "0.7", default-features = false, features =  ["force-soft" ] }
 arrayvec = { version = "0.7.6", default-features = false }
 bitflags = "2.9.0"
 cfg-if = "1.0.0"
+ctr = { version = "0.8", default-features = false }
 elf = { version = "0.7.4", default-features = false }
 elf_loader = { version = "0.12.0", default-features = false }
 hashbrown = "0.15.2"

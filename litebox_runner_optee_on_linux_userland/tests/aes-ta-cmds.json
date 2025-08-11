@@ -1,0 +1,64 @@
+[
+  {
+    "func_id": "open_session"
+  },
+  {
+    "func_id": "invoke_command",
+    "cmd_id": 0,
+    "args": [
+      {
+        "param_type": "value_input",
+        "value_a": 2,
+        "value_b": 0
+      },
+      {
+        "param_type": "value_input",
+        "value_a": 16,
+        "value_b": 0
+      },
+      {
+        "param_type": "value_input",
+        "value_a": 0,
+        "value_b": 0
+      }
+    ]
+  },
+  {
+    "func_id": "invoke_command",
+    "cmd_id": 1,
+    "args": [
+      {
+        "param_type": "memref_input",
+        "data_base64": "n0/1ocTqjWYkBweNuW47KA=="
+      }
+    ]
+  },
+  {
+    "func_id": "invoke_command",
+    "cmd_id": 2,
+    "args": [
+      {
+        "param_type": "memref_input",
+        "data_base64": "EwBd8pG55XWwqyp6Cga19A=="
+      }
+    ]
+  },
+  {
+    "func_id": "invoke_command",
+    "cmd_id": 3,
+    "args": [
+      {
+        "param_type": "memref_input",
+        "data_base64": "QoIkMD89gLLMUrzuF+nLCTJaikXshCws/IV5cTP1GFo="
+      },
+      {
+        "param_type": "memref_output",
+        "buffer_size": 32
+      }
+    ]
+  },
+  {
+    "func_id": "close_session"
+  }
+]
+
