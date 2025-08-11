@@ -18,6 +18,7 @@ pub(crate) enum SyscallTable {
     Setuid = 23,
     Getuid = 24,
     Geteuid = 25,
+    Getppid = 39,
     Getegid = 43,
     Getgid = 47,
     Munmap = 73,
