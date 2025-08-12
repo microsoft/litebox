@@ -37,6 +37,7 @@ pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE>
 }
 
 // Convenience type aliases
+type ConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
 /// Handle OP-TEE syscalls
@@ -52,6 +53,9 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> u32 {
             None => Err(TeeResult::BadParameters),
         },
         SyscallRequest::Panic { code } => syscalls::tee::sys_panic(code),
+        SyscallRequest::CheckAccessRights { flags, buf, len } => {
+            syscalls::tee::sys_check_access_rights(flags, buf, len)
+        }
         SyscallRequest::CrypRandomNumberGenerate { buf, blen } => {
             let mut kernel_buf = vec![0u8; blen.min(MAX_KERNEL_BUF_SIZE)];
             syscalls::cryp::sys_cryp_random_number_generate(&mut kernel_buf).and_then(|()| {
