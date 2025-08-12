@@ -285,7 +285,7 @@ impl LinuxUserland {
         let ppid: i32 = i32::try_from(ppid).expect("ppid should fit in i32");
         let task = alloc::boxed::Box::new(litebox_common_linux::Task {
             pid: tid,
-            tid: i64::from(tid),
+            tid,
             ppid,
             clear_child_tid: None,
             robust_list: None,

@@ -194,7 +194,7 @@ impl FreeBSDUserland {
         let ppid: i32 = i32::try_from(ppid).expect("ppid should fit in i32");
         let task = alloc::boxed::Box::new(litebox_common_linux::Task {
             pid: tid,
-            tid: i64::from(tid),
+            tid,
             ppid,
             clear_child_tid: None,
             robust_list: None,
@@ -228,6 +228,10 @@ struct ThreadStartArgs {
     pt_regs: Box<litebox_common_linux::PtRegs>,
     thread_args: Box<litebox_common_linux::NewThreadArgs<FreeBSDUserland>>,
     entry_point: usize,
+    /// Note `child_tid` is i32 on Linux but `long` on FreeBSD (though it always fits into i32).
+    /// Have a separate field here instead of using the `tid` in [`litebox_common_linux::Task`]
+    /// which is i32.
+    child_tid: isize,
 }
 
 /// Thread start trampoline function for FreeBSD.
@@ -244,6 +248,8 @@ extern "C" fn thread_start(arg: *mut ThreadStartArgs) {
     unsafe {
         litebox_common_linux::wrgsbase(0);
     }
+
+    thread_start_args.thread_args.task.tid = thread_start_args.child_tid.truncate();
 
     // Set up thread-local storage for the new thread. This is done by
     // calling the actual thread callback with the unpacked arguments
@@ -290,9 +296,6 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
         entry_point: usize,
         mut thread_args: Box<Self::ThreadArgs>,
     ) -> Result<usize, Self::ThreadSpawnError> {
-        let child_tid_ptr = core::ptr::from_mut(thread_args.task.as_mut()) as u64
-            + core::mem::offset_of!(litebox_common_linux::Task<FreeBSDUserland>, tid) as u64;
-
         let mut copied_pt_regs = Box::new(*ctx);
 
         // Reset the child stack pointer to the top of the allocated thread stack.
@@ -304,6 +307,7 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
             pt_regs: copied_pt_regs,
             thread_args: thread_args,
             entry_point: entry_point,
+            child_tid: 0,
         };
 
         // We should always use heap to pass the parameter to `thr_new`. This is to avoid using the parents'
@@ -317,7 +321,8 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
             stack_size: stack_size as u64,
             tls_base: 0, // set by our callback
             tls_size: 0, // no need to specify it
-            child_tid: child_tid_ptr,
+            child_tid: thread_start_arg_ptr
+                + core::mem::offset_of!(ThreadStartArgs, child_tid) as u64,
             parent_tid: 0,
             flags: 0,
             _pad: 0,
