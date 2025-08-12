@@ -396,7 +396,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 owner: owner_from_posix_header(p.posix_header()),
                 node_info: NodeInfo {
                     dev: DEVICE_ID,
-                    ino: idx,
+                    // ino starts at 1 (zero represents deleted file)
+                    ino: idx + 1,
                     rdev: None,
                 },
                 blksize: BLOCK_SIZE,
@@ -418,7 +419,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     owner: owner_from_posix_header(entry.posix_header()),
                     node_info: NodeInfo {
                         dev: DEVICE_ID,
-                        ino: *idx,
+                        // ino starts at 1 (zero represents deleted file)
+                        ino: *idx + 1,
                         rdev: None,
                     },
                     blksize: BLOCK_SIZE,

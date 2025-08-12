@@ -326,7 +326,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     fn get_layered_nodeinfo(&self, node_info: NodeInfo) -> NodeInfo {
         let mut node_info_lookup = self.node_info_lookup.write();
         let rdev = node_info.rdev;
-        let new_id = node_info_lookup.len();
+        // ino starts at 1 (zero represents deleted file)
+        let new_id = node_info_lookup.len() + 1;
         let ino = *node_info_lookup.entry(node_info).or_insert(new_id);
         NodeInfo {
             dev: DEVICE_ID,

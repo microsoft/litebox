@@ -52,7 +52,7 @@ fn test_runner_with_dynamic_lib(
     target: &Path,
     cmd_args: &[&str],
     install_files: fn(PathBuf),
-) {
+) -> Vec<u8> {
     let backend_str = match backend {
         Backend::Rewriter => "rewriter",
         Backend::Seccomp => "seccomp",
@@ -233,6 +233,7 @@ fn test_runner_with_dynamic_lib(
         "failed to run litebox_runner_linux_userland {:?}",
         std::str::from_utf8(output.stderr.as_slice()).unwrap()
     );
+    output.stdout
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -268,6 +269,20 @@ fn test_runner_with_dynamic_lib_seccomp() {
     );
 }
 
+/// Get the path of a program using `which`
+#[cfg(target_arch = "x86_64")]
+fn run_which(prog: &str) -> std::path::PathBuf {
+    let prog_path_str = std::process::Command::new("which")
+        .arg(prog)
+        .output()
+        .expect("Failed to find program binary")
+        .stdout;
+    let prog_path_str = String::from_utf8(prog_path_str).unwrap().trim().to_string();
+    let prog_path = std::path::PathBuf::from(prog_path_str);
+    assert!(prog_path.exists(), "Program binary not found",);
+    prog_path
+}
+
 #[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "unknown issue triggers it to fail on CI"]
@@ -288,26 +303,36 @@ console.log(content);
         "/lib64/ld-linux-x86-64.so.2",
         "/lib/x86_64-linux-gnu/libc.so.6",
     ];
-    // get node path via `which node`
-    let node_path_str = std::process::Command::new("which")
-        .arg("node")
-        .output()
-        .expect("Failed to find node binary")
-        .stdout;
-    let node_path_str = String::from_utf8(node_path_str).unwrap().trim().to_string();
-    let node_path = std::path::Path::new(&node_path_str);
-    assert!(
-        node_path.exists(),
-        "Node binary not found at {node_path_str}",
-    );
+    let node_path = run_which("node");
     test_runner_with_dynamic_lib(
         Backend::Seccomp,
         &initial_files,
-        node_path,
+        &node_path,
         &["/out/hello_world.js"],
         |out_dir| {
             // write the test js file to the output directory
             std::fs::write(out_dir.join("hello_world.js"), HELLO_WORLD_JS).unwrap();
         },
     );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_runner_with_ls() {
+    let ls_path = run_which("ls");
+    let output = test_runner_with_dynamic_lib(
+        Backend::Seccomp,
+        &[
+            "/lib/x86_64-linux-gnu/libc.so.6",
+            "/lib64/ld-linux-x86-64.so.2",
+            "/lib/x86_64-linux-gnu/libselinux.so.1",
+            "/lib/x86_64-linux-gnu/libpcre2-8.so.0",
+        ],
+        &ls_path,
+        &[],
+        |_| {},
+    );
+
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(output_str.contains("lib  lib64  usr"));
 }

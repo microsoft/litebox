@@ -184,6 +184,18 @@ impl<T: Clone> RawMutPointer<T> for TransparentMutPtr<T> {
         }
         Some(())
     }
+    unsafe fn write_slice_at_offset(self, count: isize, value: &[T]) -> Option<()> {
+        if self.inner.is_null() || !self.inner.is_aligned() {
+            return None;
+        }
+        if value.is_empty() {
+            return Some(());
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(value.as_ptr(), self.inner.offset(count), value.len());
+        }
+        Some(())
+    }
     fn mutate_subslice_with<R>(
         self,
         range: impl core::ops::RangeBounds<isize>,

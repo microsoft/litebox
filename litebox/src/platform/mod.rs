@@ -496,6 +496,17 @@ where
     #[must_use]
     unsafe fn write_at_offset(self, count: isize, value: T) -> Option<()>;
 
+    /// Write a slice of values at the offset.
+    ///
+    /// Returns `None` if the provided pointer is invalid, or such an offset is known (in advance)
+    /// to be invalid.
+    ///
+    /// # Safety
+    ///
+    /// The offset must be valid location for the pointer.
+    #[must_use]
+    unsafe fn write_slice_at_offset(self, count: isize, value: &[T]) -> Option<()>;
+
     /// Obtain a mutable (sub)slice of memory at the pointer, and run `f` upon it.
     ///
     /// Returns `None` (and does not invoke `f`) if the provided pointer is invalid, or such a slice
