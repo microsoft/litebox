@@ -12,7 +12,7 @@ use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer};
 use litebox::platform::{ThreadLocalStorageProvider, UnblockedOrTimedOut};
-use litebox::utils::ReinterpretUnsignedExt as _;
+use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{ProtFlags, PunchthroughSyscall};
 
 mod syscall_raw;
@@ -239,7 +239,7 @@ struct ThreadStartArgs {
 extern "C" fn thread_start(arg: *mut ThreadStartArgs) {
     // SAFETY: The arg pointer is guaranteed to be valid and point to a ThreadStartArgs
     // that was created via Box::into_raw in spawn_thread.
-    let thread_start_args = unsafe { Box::from_raw(arg) };
+    let mut thread_start_args = unsafe { Box::from_raw(arg) };
 
     // Store the pt_regs onto the stack (for restoration later)
     let pt_regs_stack = *(thread_start_args.pt_regs);
@@ -294,7 +294,7 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
         stack: TransparentMutPtr<u8>,
         stack_size: usize,
         entry_point: usize,
-        mut thread_args: Box<Self::ThreadArgs>,
+        thread_args: Box<Self::ThreadArgs>,
     ) -> Result<usize, Self::ThreadSpawnError> {
         let mut copied_pt_regs = Box::new(*ctx);
 
@@ -314,6 +314,8 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
         // stack, which may be freed (race-condition) before the child thread starts.
         let thread_start_arg_ptr = Box::into_raw(Box::new(thread_start_args));
 
+        let parent_tid = core::mem::MaybeUninit::<isize>::uninit();
+
         let thr_param = freebsd_types::ThrParam {
             start_func: thread_start as usize as u64, // the child will enter `thread_start`
             arg: thread_start_arg_ptr as u64,         // thread start arguments
@@ -321,9 +323,9 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
             stack_size: stack_size as u64,
             tls_base: 0, // set by our callback
             tls_size: 0, // no need to specify it
-            child_tid: thread_start_arg_ptr
+            child_tid: thread_start_arg_ptr as u64
                 + core::mem::offset_of!(ThreadStartArgs, child_tid) as u64,
-            parent_tid: 0,
+            parent_tid: parent_tid.as_ptr() as u64,
             flags: 0,
             _pad: 0,
             rtp: 0, // we do not use real-time priority for now
@@ -341,8 +343,8 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
         match result {
             Ok(_) => {
                 // FreeBSD `thr_new` returns 0 (to the parent) on success. The actual thread ID will
-                // be written to child_tid_ptr by the kernel. We need to read it from the structure.
-                Ok(unsafe { *(child_tid_ptr as *const i32) as usize })
+                // be written to `parent_tid` by the kernel. We need to read it from the structure.
+                Ok(unsafe { parent_tid.assume_init() }.reinterpret_as_unsigned())
             }
             Err(errno) => Err(match errno {
                 crate::errno::Errno::EACCES => litebox_common_linux::errno::Errno::EACCES,
