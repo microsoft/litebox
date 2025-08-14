@@ -1073,6 +1073,8 @@ impl<Platform: litebox::platform::RawPointerProvider> ThreadLocalStorage<Platfor
 pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     /// Process ID
     pub pid: i32,
+    /// Parent Process ID
+    pub ppid: i32,
     /// Thread ID
     pub tid: i32,
     /// When a thread whose `clear_child_tid` is not `None` terminates, and it shares memory with other threads,
@@ -1614,6 +1616,7 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         flags: RngFlags,
     },
     Getpid,
+    Getppid,
     Getuid,
     Geteuid,
     Getgid,
@@ -2038,6 +2041,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 }
             }
             Sysno::getpid => SyscallRequest::Getpid,
+            Sysno::getppid => SyscallRequest::Getppid,
             Sysno::getuid => SyscallRequest::Getuid,
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
