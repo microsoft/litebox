@@ -498,6 +498,6 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
-        todo!()
+        None
     }
 }
