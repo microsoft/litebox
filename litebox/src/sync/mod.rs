@@ -1,14 +1,16 @@
 //! Higher-level synchronization primitives
 //!
-//! The implementation in this module is derived from related source files in Rust's `std`, taken
-//! from `6fd7e9010db6be7605241c39eab7c5078ee2d5bd`/`98815742cf2e914ee0d7142a02322cf939c47834`. The
-//! files have been modified significantly to support invoking through the [`platform`], rather than
+//! The implementation for some of the submodules in this module (namely, [`mutex`] and [`rwlock`])
+//! is derived from related source files in Rust's `std`, taken from
+//! `6fd7e9010db6be7605241c39eab7c5078ee2d5bd`/`98815742cf2e914ee0d7142a02322cf939c47834`. The files
+//! have been modified significantly to support invoking through the [`platform`], rather than
 //! through regular system interfaces. Additionally, support is added tracing locks through the
 //! `lock_tracing` conditional-compilation feature that can aid in debugging.
 
 use crate::platform;
 
 mod condvar;
+pub mod futex;
 mod mutex;
 mod rwlock;
 
