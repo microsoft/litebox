@@ -150,7 +150,9 @@ impl HostSnpInterface {
             } else {
                 Err(Errno::ENOMEM)
             }
-        } else if addr % (PAGE_SIZE << order) != 0 || addr > PHYS_ADDR_MAX - (PAGE_SIZE << order) {
+        } else if !addr.is_multiple_of(PAGE_SIZE << order)
+            || addr > PHYS_ADDR_MAX - (PAGE_SIZE << order)
+        {
             // Address is not aligned or out of bounds
             Err(Errno::EINVAL)
         } else {

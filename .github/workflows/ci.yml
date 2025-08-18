@@ -41,11 +41,19 @@ jobs:
           sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh
       - uses: Swatinem/rust-cache@v2
       - run: ./.github/tools/github_actions_run_cargo fmt
-      - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_platform_lvbs --exclude litebox_runner_lvbs
+      - run: |
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_platform_lvbs --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox_runner_optee_on_linux_userland
           # We exclude `litebox_platform_lvbs` and `litebox_runner_lvbs` because we cannot build them with a stable toolchain.
           # They depend on the unstable `abi_x86_interrupt` feature. `build_and_test_nightly` cover them.
-      - run: ./.github/tools/github_actions_run_cargo build
-      - run: ./.github/tools/github_actions_run_cargo nextest
+          # `litebox_runner_optee_on_linux_userland` conflicts with `litebox_runner_linux_userland` due to
+          # feature unification (`optee_syscall` versus `linux_syscall`). Build it separately for now.
+      - run: |
+          ./.github/tools/github_actions_run_cargo build
+          ./.github/tools/github_actions_run_cargo build -p litebox_runner_optee_on_linux_userland
+      - run: |
+          ./.github/tools/github_actions_run_cargo nextest
+          ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_optee_on_linux_userland
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc
           # We need to run `cargo test --doc` separately because doc tests
@@ -180,6 +188,10 @@ jobs:
           # - `litebox_runner_lvbs` has a custom target (`no_std`), so it does
           #   not work with the current no_std checker.
           #
+          # - `litebox_runner_optee_on_linux_userland` is allowed to have `std`
+          #   access since it needs to actually access the file-system, pull in
+          #   relevant files, and then actually trigger LiteBox itself.
+          #
           # - `litebox_shim_linux` (in its default feature set) depends on
           #   `litebox_platform_multiplex`; similarly, ideally we'd do a more
           #   precise check.
@@ -201,6 +213,7 @@ jobs:
             -not -path './litebox_platform_multiplex/Cargo.toml' \
             -not -path './litebox_runner_linux_userland/Cargo.toml' \
             -not -path './litebox_runner_lvbs/Cargo.toml' \
+            -not -path './litebox_runner_optee_on_linux_userland/Cargo.toml' \
             -not -path './litebox_shim_linux/Cargo.toml' \
             -not -path './litebox_shim_optee/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \

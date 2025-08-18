@@ -21,8 +21,19 @@ mod syscall_intercept;
 
 extern crate alloc;
 
+cfg_if::cfg_if! {
+    if #[cfg(feature = "linux_syscall")] {
+        use litebox_common_linux::SyscallRequest;
+        pub type SyscallReturnType = isize;
+    } else if #[cfg(feature = "optee_syscall")] {
+        use litebox_common_optee::SyscallRequest;
+        pub type SyscallReturnType = u32;
+    } else {
+        compile_error!(r##"No syscall handler specified."##);
+    }
+}
 /// Connector to a shim-exposed syscall-handling interface.
-pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<LinuxUserland>) -> isize;
+pub type SyscallHandler = fn(SyscallRequest<LinuxUserland>) -> SyscallReturnType;
 
 /// The syscall handler passed down from the shim.
 static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
@@ -244,10 +255,10 @@ impl LinuxUserland {
 
             // Check if the line corresponds to the vdso
             // Alternatively, we could read it from `/proc/self/auxv`
-            if let Some(last) = parts.last() {
-                if *last == "[vdso]" {
-                    vdso_address = Some(start);
-                }
+            if let Some(last) = parts.last()
+                && *last == "[vdso]"
+            {
+                vdso_address = Some(start);
             }
         }
         (reserved_pages, vdso_address)
@@ -269,9 +280,13 @@ impl LinuxUserland {
         let tid =
             unsafe { syscalls::syscall!(syscalls::Sysno::gettid) }.expect("Failed to get TID");
         let tid: i32 = i32::try_from(tid).expect("tid should fit in i32");
+        let ppid =
+            unsafe { syscalls::syscall!(syscalls::Sysno::getppid) }.expect("Failed to get PPID");
+        let ppid: i32 = i32::try_from(ppid).expect("ppid should fit in i32");
         let task = alloc::boxed::Box::new(litebox_common_linux::Task {
             pid: tid,
             tid,
+            ppid,
             clear_child_tid: None,
             robust_list: None,
             credentials: alloc::sync::Arc::new(Self::get_user_info()),
@@ -1401,14 +1416,15 @@ unsafe extern "C" {
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
+#[allow(clippy::cast_sign_loss)]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_handler(
     syscall_number: usize,
     ctx: *mut litebox_common_linux::PtRegs,
-) -> isize {
+) -> SyscallReturnType {
     // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
     let ctx = unsafe { &mut *ctx };
-    match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
+    match SyscallRequest::try_from_raw(syscall_number, ctx) {
         Ok(d) => {
             let syscall_handler: SyscallHandler = SYSCALL_HANDLER
                 .read()
@@ -1416,7 +1432,7 @@ unsafe extern "C" fn syscall_handler(
                 .expect("Should have run `register_syscall_handler` by now");
             syscall_handler(d)
         }
-        Err(err) => err.as_neg() as isize,
+        Err(err) => err.as_neg() as SyscallReturnType,
     }
 }
 

@@ -122,7 +122,7 @@ impl<const ALIGN: usize> PageRange<ALIGN> {
     ///
     /// Returns `None` if the range is not `ALIGN`-aligned or empty.
     pub fn new(start: usize, end: usize) -> Option<Self> {
-        if start % ALIGN != 0 || end % ALIGN != 0 {
+        if !start.is_multiple_of(ALIGN) || !end.is_multiple_of(ALIGN) {
             return None;
         }
         if start >= end {
@@ -167,7 +167,7 @@ impl<const ALIGN: usize> NonZeroPageSize<ALIGN> {
     ///
     /// Returns `None` if the size is zero or not `ALIGN`-aligned.
     pub fn new(size: usize) -> Option<Self> {
-        if size == 0 || size % ALIGN != 0 {
+        if size == 0 || !size.is_multiple_of(ALIGN) {
             return None;
         }
         Some(Self { size })
@@ -194,7 +194,7 @@ pub struct NonZeroAddress<const ALIGN: usize>(usize);
 impl<const ALIGN: usize> NonZeroAddress<ALIGN> {
     /// Create a new `NonZeroAddress`, if the address is non-zero and aligned.
     pub fn new(address: usize) -> Option<Self> {
-        if address == 0 || address % ALIGN != 0 {
+        if address == 0 || !address.is_multiple_of(ALIGN) {
             return None;
         }
         Some(Self(address))

@@ -68,6 +68,7 @@ pub struct UserContext {
 
 impl UserContext {
     /// Create a new user context with the given user page table
+    #[allow(dead_code)]
     pub fn new(user_pt: crate::mm::PageTable<PAGE_SIZE>) -> Self {
         UserContext {
             page_table: user_pt,

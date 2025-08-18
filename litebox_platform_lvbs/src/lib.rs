@@ -334,6 +334,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// proper operations (e.g., syscall handling). We should consider implementing
     /// partial mapping to mitigate side-channel attacks and shallow copying to get rid of redudant
     /// page table data structures for kernel space.
+    #[allow(dead_code)]
     pub(crate) fn new_user_page_table(&self) -> mm::PageTable<PAGE_SIZE> {
         let pt = unsafe { mm::PageTable::new_top_level() };
         if pt
