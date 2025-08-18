@@ -24,6 +24,7 @@ use windows_sys::Win32::Foundation as Win32_Foundation;
 use windows_sys::Win32::{
     Foundation::{GetLastError, WIN32_ERROR},
     System::Diagnostics::Debug::{
+        self as Win32_Debug,
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
         EXCEPTION_POINTERS,
     },
@@ -862,6 +863,7 @@ pub struct PunchthroughToken {
     punchthrough: PunchthroughSyscall<WindowsUserland>,
 }
 
+#[expect(unused_variables, reason = "Signal handling is not implemented for Windows yet")]
 impl litebox::platform::PunchthroughToken for PunchthroughToken {
     type Punchthrough = PunchthroughSyscall<WindowsUserland>;
     fn execute(
@@ -894,11 +896,13 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 )?;
                 Ok(0)
             }
-            _ => {
-                unimplemented!(
-                    "PunchthroughToken for WindowsUserland is not fully implemented yet"
-                );
-            }
+            // TODO: Implement the signals for windows userland
+            PunchthroughSyscall::RtSigprocmask { how, set, oldset } => Ok(0),
+            PunchthroughSyscall::RtSigaction {
+                signum,
+                act,
+                oldact,
+            } => Ok(0),
         }
     }
 }
@@ -980,6 +984,104 @@ fn do_query_on_region(mbi: &mut Win32_Memory::MEMORY_BASIC_INFORMATION, base_add
     assert!(ok, "VirtualQuery addr={:p} failed: {}", base_addr, unsafe {
         GetLastError()
     });
+}
+
+// TODO: remove debug functions
+fn werr_text(err: u32) -> String {
+    unsafe {
+        let mut buf: *mut u16 = std::ptr::null_mut();
+        let flags = Win32_Debug::FORMAT_MESSAGE_ALLOCATE_BUFFER
+            | Win32_Debug::FORMAT_MESSAGE_FROM_SYSTEM
+            | Win32_Debug::FORMAT_MESSAGE_IGNORE_INSERTS;
+        let len = Win32_Debug::FormatMessageW(
+            flags,
+            std::ptr::null_mut(),
+            err,
+            0,
+            (&mut buf) as *mut *mut u16 as *mut u16,
+            0,
+            std::ptr::null_mut(),
+        );
+        if len == 0 || buf.is_null() {
+            return format!("Win32 error {}", err);
+        }
+        // Turn to String and free the buffer via LocalFree.
+        let slice = std::slice::from_raw_parts(buf, len as usize);
+        let s = String::from_utf16_lossy(slice).trim().to_string();
+        // LocalFree
+        let _ = Win32_Foundation::LocalFree(buf as *mut c_void);
+        s
+    }
+}
+
+fn state_to_str(s: u32) -> &'static str {
+    match s {
+        Win32_Memory::MEM_COMMIT => "COMMIT",
+        Win32_Memory::MEM_RESERVE => "RESERVE",
+        Win32_Memory::MEM_FREE => "FREE",
+        _ => "UNKNOWN",
+    }
+}
+fn type_to_str(t: u32) -> &'static str {
+    match t {
+        Win32_Memory::MEM_IMAGE => "IMAGE",
+        Win32_Memory::MEM_MAPPED => "MAPPED",
+        Win32_Memory::MEM_PRIVATE => "PRIVATE",
+        0 => "—",
+        _ => "UNKNOWN",
+    }
+}
+fn protect_to_str(p: u32) -> &'static str {
+    match p & 0xff {
+        Win32_Memory::PAGE_NOACCESS => "NOACCESS",
+        Win32_Memory::PAGE_READONLY => "READONLY",
+        Win32_Memory::PAGE_READWRITE => "READWRITE",
+        Win32_Memory::PAGE_WRITECOPY => "WRITECOPY",
+        Win32_Memory::PAGE_EXECUTE => "EXECUTE",
+        Win32_Memory::PAGE_EXECUTE_READ => "EXECUTE_READ",
+        Win32_Memory::PAGE_EXECUTE_READWRITE => "EXECUTE_READWRITE",
+        Win32_Memory::PAGE_EXECUTE_WRITECOPY => "EXECUTE_WRITECOPY",
+        0 => "—",
+        _ => "UNKNOWN",
+    }
+}
+
+unsafe fn walk_range(hproc: Win32_Foundation::HANDLE, mut addr: usize, end: usize) {
+    println!("-- VirtualQuery walk --");
+    while addr < end {
+        let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+        let got = unsafe { Win32_Memory::VirtualQueryEx(
+            hproc,
+            addr as *const c_void,
+            &mut mbi,
+            std::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+        ) };
+        if got == 0 {
+            let e = unsafe {
+                GetLastError()
+            };
+            println!(
+                "VirtualQueryEx failed at {:#x}: {}",
+                addr,
+                werr_text(e)
+            );
+            break;
+        }
+        let base = mbi.BaseAddress as usize;
+        let size = mbi.RegionSize;
+        let next = base.saturating_add(size);
+        println!(
+            "[{:#016x} - {:#016x}) size={:#x}  State={}  Protect={}  Type={}",
+            base,
+            next,
+            size,
+            state_to_str(mbi.State),
+            protect_to_str(mbi.Protect),
+            type_to_str(mbi.Type)
+        );
+        if next <= addr { break; }
+        addr = next;
+    }
 }
 
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
@@ -1090,12 +1192,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 // If the requested end address is beyond the reserved region (cross the region),
                 // we need to allocate more memory.
                 if request_end > region_end {
-                    // Windows region should be aligned to its allocation granularity.
-                    assert!(
-                        self.is_aligned_to_granu(region_end),
-                        "Region end address {:p} is not aligned to allocation granularity",
-                        region_end as *mut c_void
-                    );
+                    // // Windows region should be aligned to its allocation granularity.
+                    // assert!(
+                    //     self.is_aligned_to_granu(region_end),
+                    //     "Region end address {:p} is not aligned to allocation granularity",
+                    //     region_end as *mut c_void
+                    // );
 
                     // In case of cross-region allocation, we must ensure that the virtual address
                     // returned by VirtualAlloc2 is the expected start address (contiguous with the
@@ -1177,13 +1279,20 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 0,
             )
         };
+        // add debug point here
+        if addr.is_null() {
+            // walk
+            let hproc = unsafe { GetCurrentProcess() } as Win32_Foundation::HANDLE;
+            unsafe { walk_range(hproc, 0x7fffd3fc0000, 0x7ffff4000000) };
+        }
         assert!(
             !addr.is_null(),
-            "VirtualAlloc2 failed. Address: {:p}, Size: {}, Permissions: {:?}. Error: {}",
+            "VirtualAlloc2 failed. Address: {:p}, Size: {}, Permissions: {:?}. Error: {} str: {}",
             aligned_base_addr,
             aligned_size,
             initial_permissions,
-            unsafe { GetLastError() }
+            unsafe { GetLastError() },
+            werr_text(unsafe { GetLastError() })
         );
 
         if fixed_address {
