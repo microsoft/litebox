@@ -106,7 +106,12 @@ pub extern "C" fn sandbox_process_init(
     litebox_platform_multiplex::set_platform(platform);
 
     let aux = litebox_shim_linux::loader::auxv::init_auxv();
-    let loaded_program = match litebox_shim_linux::loader::load_program("/test", alloc::vec![], alloc::vec![], aux) {
+    let loaded_program = match litebox_shim_linux::loader::load_program(
+        "/test",
+        alloc::vec![alloc::ffi::CString::new("/test").unwrap()],
+        alloc::vec![],
+        aux,
+    ) {
         Ok(program) => program,
         Err(err) => {
             litebox::log_println!(platform, "failed to load program: {}", err);
