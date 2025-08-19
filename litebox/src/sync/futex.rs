@@ -34,6 +34,18 @@ struct Lockable<Platform: RawSyncPrimitivesProvider> {
     latest_wake_bitset: Option<NonZeroU32>,
 }
 
+impl<Platform: RawSyncPrimitivesProvider> Lockable<Platform> {
+    fn new(litebox: &LiteBox<Platform>) -> Self {
+        let raw_mutex = Arc::new(litebox.x.platform.new_raw_mutex());
+        raw_mutex.underlying_atomic().store(0, Ordering::SeqCst);
+        Self {
+            num_waiters: 0,
+            raw_mutex,
+            latest_wake_bitset: None,
+        }
+    }
+}
+
 impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
     FutexManager<Platform>
 {
@@ -109,23 +121,15 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
             return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);
         }
         // Now we actually can get into the waiting behavior.
-        let lockable: &mut Lockable<Platform> = lockables.entry(addr).or_insert(Lockable {
-            num_waiters: 0,
-            raw_mutex: Arc::new(self.litebox.x.platform.new_raw_mutex()),
-            latest_wake_bitset: None,
-        });
+        let lockable: &mut Lockable<Platform> = lockables
+            .entry(addr)
+            .or_insert_with(|| Lockable::new(&self.litebox));
         lockable.num_waiters += 1;
         let start = self.litebox.x.platform.now();
         // We grab the ability to get to the raw mutex, and then unlock the lockables, so that other
         // threads can then get access to the underlying raw-mutex too, to be able to wake us up.
         let raw_mutex = Arc::clone(&lockable.raw_mutex);
         drop(lockables);
-
-        // We just hard-set the underlying raw-mutex to 0 for now.
-        //
-        // TODO(jayb): we might be able to clean up stuff at the platform layer to make this mildly
-        // cleaner, basically getting rid of the `val` from it.
-        raw_mutex.underlying_atomic().store(0, Ordering::SeqCst);
 
         // Zzz, till we have a reason to wake up.
         loop {
