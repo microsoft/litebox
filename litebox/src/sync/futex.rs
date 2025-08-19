@@ -50,9 +50,8 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
     FutexManager<Platform>
 {
     /// A new futex manager.
-    ///
-    /// TODO(jayb): Integrate this into the `litebox` object itself, to prevent the possibility of
-    /// double-creation.
+    // TODO(jayb): Integrate this into the `litebox` object itself, to prevent the possibility of
+    // double-creation.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
         let lockables = litebox.sync().new_rwlock(HashMap::new());
         Self {
@@ -92,7 +91,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
     /// with a [`FutexError::ImmediatelyWokenBecauseValueMismatch`]. If it does, wait till a `Wake`
     /// operation.
     ///
-    /// If `timeout` is `None`, the this blocks indefinitely.
+    /// If `timeout` is `None`, then this blocks indefinitely.
     ///
     /// If `bitset` is `Some`, then it specifies a mask that can be used by a `Wake` with a `bitset`,
     /// in which case, it provides the ability to select a subset of waiters to be awoken
@@ -285,7 +284,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
     }
 }
 
-/// Potential errors that can be returned by [`FutexManager::futex_op`]
+/// Potential errors that can be returned by [`FutexManager`]'s operations.
 #[derive(Debug, Error)]
 pub enum FutexError {
     #[error("address not correctly aligned to 4-bytes")]

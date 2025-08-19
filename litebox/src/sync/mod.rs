@@ -1,6 +1,6 @@
 //! Higher-level synchronization primitives
 //!
-//! The implementation for some of the submodules in this module (namely, [`mutex`] and [`rwlock`])
+//! The implementation for some of the components in this module (namely, [`Mutex`] and [`RwLock`])
 //! is derived from related source files in Rust's `std`, taken from
 //! `6fd7e9010db6be7605241c39eab7c5078ee2d5bd`/`98815742cf2e914ee0d7142a02322cf939c47834`. The files
 //! have been modified significantly to support invoking through the [`platform`], rather than
