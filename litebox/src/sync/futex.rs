@@ -215,12 +215,13 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
     ) -> Result<u32, FutexError> {
         let addr = futex_addr.as_usize();
         // We will loop until there is no other waker in active play.
-        loop {
-            if let Some(lockable) = self.lockables.write().get_mut(&addr) {
+        let mut lockables = loop {
+            let mut lockables = self.lockables.write();
+            if let Some(lockable) = lockables.get_mut(&addr) {
                 if lockable.latest_wake_bitset.is_none() {
                     // There is no other waiter in play, we take it by setting it up.
                     lockable.latest_wake_bitset = Some(bitset.unwrap_or(NonZeroU32::MAX));
-                    break;
+                    break lockables;
                 } else {
                     // There is another waker in play, we yield to them, and will come back later.
                     core::hint::spin_loop();
@@ -229,9 +230,8 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
                 // There are no waiters, so we can quit early. No one was woken up.
                 return Ok(0);
             }
-        }
+        };
         // Now, we are the sole waker in play.
-        let mut lockables = self.lockables.write();
         let Some(lockable): Option<&mut Lockable<Platform>> = lockables.get_mut(&addr) else {
             // There are no remaining waiters, so we can quit early. No one was woken up.
             return Ok(0);
