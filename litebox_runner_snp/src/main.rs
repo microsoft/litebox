@@ -7,6 +7,7 @@ mod globals;
 
 extern crate alloc;
 
+use litebox::utils::TruncateExt as _;
 use litebox_platform_linux_kernel::{HostInterface, host::snp::ghcb::ghcb_prints};
 
 #[unsafe(no_mangle)]
@@ -19,11 +20,8 @@ pub extern "C" fn page_fault_handler(pt_regs: &mut litebox_common_linux::PtRegs)
     let addr = litebox_platform_linux_kernel::arch::instructions::cr2();
     let code = pt_regs.orig_rax;
 
-    litebox_platform_linux_kernel::print_str_and_int!("page fault at ", addr, 16);
-    litebox_platform_linux_kernel::print_str_and_int!("with code ", code as u64, 16);
-
     match unsafe {
-        litebox_shim_linux::litebox_page_manager().handle_page_fault(addr as usize, code as u64)
+        litebox_shim_linux::litebox_page_manager().handle_page_fault(addr.truncate(), code as u64)
     } {
         Ok(()) => (),
         Err(e) => {
@@ -108,9 +106,16 @@ pub extern "C" fn sandbox_process_init(
     litebox_platform_multiplex::set_platform(platform);
 
     let aux = litebox_shim_linux::loader::auxv::init_auxv();
-    let loaded_program =
-        litebox_shim_linux::loader::load_program("/test", alloc::vec![], alloc::vec![], aux)
-            .unwrap();
+    let loaded_program = match litebox_shim_linux::loader::load_program("/test", alloc::vec![], alloc::vec![], aux) {
+        Ok(program) => program,
+        Err(err) => {
+            litebox::log_println!(platform, "failed to load program: {}", err);
+            litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
+                globals::SM_SEV_TERM_SET,
+                globals::SM_TERM_GENERAL,
+            );
+        }
+    };
 
     pt_regs.rip = loaded_program.entry_point;
     pt_regs.rsp = loaded_program.user_stack_top;
@@ -141,7 +146,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     if let Some(location) = info.location() {
         ghcb_prints("panic occurred at ");
         ghcb_prints(location.file());
-        litebox_platform_linux_kernel::print_str_and_int!(":", location.line() as u64, 10);
+        litebox_platform_linux_kernel::print_str_and_int!(":", u64::from(location.line()), 10);
     } else {
         ghcb_prints("panic occurred but can't get location information...");
     }
