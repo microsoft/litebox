@@ -5,9 +5,8 @@ use core::mem::offset_of;
 use alloc::boxed::Box;
 use litebox::platform::{ExitProvider as _, RawMutPointer as _, ThreadProvider as _};
 use litebox::platform::{
-    Instant as _, PunchthroughProvider as _, PunchthroughToken as _,
-    RawConstPointer as _, ThreadLocalStorageProvider as _,
-    TimeProvider as _, UserRawMutex as _,
+    Instant as _, PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _,
+    ThreadLocalStorageProvider as _, TimeProvider as _, UserRawMutex as _,
 };
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::CloneFlags;
