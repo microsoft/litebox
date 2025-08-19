@@ -64,13 +64,7 @@ fn test_runner_random_ta() {
 #[test]
 fn test_runner_aes_ta() {
     let output = std::process::Command::new("cargo")
-        .args([
-            "build",
-            "-p",
-            "litebox_runner_optee_on_linux_userland",
-            "--features",
-            "litebox_common_optee/shift_syscall_number",
-        ])
+        .args(["build", "-p", "litebox_runner_optee_on_linux_userland"])
         .output()
         .expect("Failed to build litebox_runner_optee_on_linux_userland");
     assert!(
@@ -84,10 +78,8 @@ fn test_runner_aes_ta() {
             "run",
             "-p",
             "litebox_runner_optee_on_linux_userland",
-            "--features",
-            "litebox_common_optee/shift_syscall_number",
             "--",
-            "tests/aes-ta.elf",
+            "tests/aes-ta.elf.hooked",
             "tests/aes-ta-cmds.json",
         ])
         .output()

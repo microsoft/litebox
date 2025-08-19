@@ -4,16 +4,20 @@ use alloc::{ffi::CString, string::ToString};
 use core::ptr::NonNull;
 use elf_loader::{
     Loader,
-    mmap::{MapFlags, ProtFlags},
+    mmap::{MapFlags, Mmap, ProtFlags},
     object::ElfObject,
 };
 use hashbrown::HashMap;
-use litebox::{mm::linux::MappingError, platform::RawConstPointer as _};
+use litebox::{
+    mm::linux::{MappingError, PAGE_SIZE},
+    platform::{RawConstPointer as _, SystemInfoProvider},
+    utils::TruncateExt,
+};
 use litebox_common_linux::errno::Errno;
 use once_cell::race::OnceBox;
 use thiserror::Error;
 
-use crate::MutPtr;
+use crate::{MutPtr, litebox_page_manager};
 
 /// Data structure to maintain a mapping of fd to in-memory TA ELF files.
 /// This is needed because [`elf_loader`] uses file- or fd-backed `mmap` to load ELF files
@@ -85,6 +89,10 @@ impl ElfFileInMemory {
             fd,
         })
     }
+
+    fn size(&self) -> usize {
+        self.buffer.len()
+    }
 }
 
 impl ElfObject for ElfFileInMemory {
@@ -100,7 +108,9 @@ impl ElfObject for ElfFileInMemory {
             buf.len(),
             offset
         );
-        buf.copy_from_slice(&self.buffer[offset..offset + buf.len()]);
+        let src_slice = &self.buffer[offset..];
+        let copy_len = src_slice.len().min(buf.len());
+        buf[..copy_len].copy_from_slice(&src_slice[..copy_len]);
         Ok(())
     }
 
@@ -163,8 +173,11 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
             let mut temp_prot = elf_loader::mmap::ProtFlags::empty();
             temp_prot.set(elf_loader::mmap::ProtFlags::PROT_READ, true);
             temp_prot.set(elf_loader::mmap::ProtFlags::PROT_WRITE, true);
-
-            let mapped_addr = Self::do_mmap_anonymous(addr, len, temp_prot, flags)?;
+            let mapped_addr = if addr.is_some() {
+                Self::do_mmap_anonymous(addr, len, temp_prot, flags)?
+            } else {
+                Self::do_mmap_anonymous(Some(DEFAULT_ELF_LOAD_BASE), len, temp_prot, flags)?
+            };
             let mapped_slice: &mut [u8] =
                 unsafe { core::slice::from_raw_parts_mut(mapped_addr as *mut u8, len) };
             let fd_elf_map = fd_elf_map();
@@ -224,6 +237,137 @@ pub struct ElfLoadInfo {
     pub stack_base: usize,
 }
 
+#[cfg(target_arch = "x86_64")]
+type Ehdr = elf::file::Elf64_Ehdr;
+#[cfg(target_arch = "x86")]
+type Ehdr = elf::file::Elf32_Ehdr;
+#[cfg(target_arch = "x86_64")]
+type Shdr = elf::section::Elf64_Shdr;
+#[cfg(target_arch = "x86")]
+type Shdr = elf::section::Elf32_Shdr;
+
+#[repr(C, packed)]
+struct TrampolineSection {
+    magic_number: u64,
+    trampoline_addr: u64,
+    trampoline_size: u64,
+}
+
+#[derive(Debug)]
+struct TrampolineHdr {
+    /// The virtual memory of the trampoline code.
+    vaddr: usize,
+    /// The file offset of the trampoline code in the ELF file.
+    file_offset: usize,
+    /// Size of the trampoline code in the ELF file.
+    size: usize,
+}
+
+/// Get the trampoline header from the ELF file.
+fn get_trampoline_hdr(object: &mut ElfFileInMemory) -> Option<TrampolineHdr> {
+    let mut buf: [u8; size_of::<Ehdr>()] = [0; size_of::<Ehdr>()];
+    object.read(&mut buf, 0).unwrap();
+    let elfhdr: &Ehdr = unsafe { &*(buf.as_ptr().cast()) };
+
+    // read section headers
+    let shdrs_size = usize::from(elfhdr.e_shentsize) * usize::from(elfhdr.e_shnum.checked_sub(1)?);
+    let mut buf: [u8; size_of::<Shdr>()] = [0; size_of::<Shdr>()];
+    // Read the last section header because our syscall rewriter adds a trampoline section at the end.
+    object
+        .read(
+            &mut buf,
+            usize::try_from(elfhdr.e_shoff).unwrap() + shdrs_size,
+        )
+        .unwrap();
+    let trampoline_shdr: &Shdr = unsafe { &*(buf.as_ptr().cast()) };
+    let trampoline_shdr_flags: u32 = trampoline_shdr.sh_flags.truncate();
+    if trampoline_shdr.sh_type != elf::abi::SHT_PROGBITS
+        || trampoline_shdr_flags != elf::abi::SHF_ALLOC
+    {
+        return None;
+    }
+
+    if trampoline_shdr.sh_size < size_of::<TrampolineSection>().try_into().unwrap() {
+        return None;
+    }
+    let mut buf: [u8; size_of::<TrampolineSection>()] = [0; size_of::<TrampolineSection>()];
+    object
+        .read(
+            &mut buf,
+            usize::try_from(trampoline_shdr.sh_offset).unwrap(),
+        )
+        .ok()?;
+    let trampoline: TrampolineSection = unsafe { core::mem::transmute(buf) };
+    // TODO: check section name instead of magic number
+    if trampoline.magic_number != super::REWRITER_MAGIC_NUMBER {
+        return None;
+    }
+    // The trampoline code is placed at the end of the file.
+    let file_size = object.size();
+    Some(TrampolineHdr {
+        vaddr: usize::try_from(trampoline.trampoline_addr).ok()?,
+        file_offset: file_size - usize::try_from(trampoline.trampoline_size).unwrap(),
+        size: usize::try_from(trampoline.trampoline_size).unwrap(),
+    })
+}
+
+fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize {
+    // Our rewriter ensures that both `trampoline.vaddr` and `trampoline.file_offset` are page-aligned.
+    // Otherwise, `ElfLoaderMmap::mmap` will fail and panic.
+    #[cfg(debug_assertions)]
+    litebox::log_println!(
+        litebox_platform_multiplex::platform(),
+        "Loading trampoline {:?}",
+        trampoline
+    );
+    assert!(
+        trampoline.vaddr.is_multiple_of(PAGE_SIZE),
+        "trampoline address must be page-aligned"
+    );
+    assert!(
+        trampoline.file_offset.is_multiple_of(PAGE_SIZE),
+        "trampoline file offset must be page-aligned"
+    );
+    let start_addr = relo_off + trampoline.vaddr;
+    let end_addr = (start_addr + trampoline.size).next_multiple_of(PAGE_SIZE);
+    let mut need_copy = false;
+    let ret = unsafe {
+        ElfLoaderMmap::mmap(
+            Some(start_addr),
+            end_addr - start_addr,
+            elf_loader::mmap::ProtFlags::PROT_READ | elf_loader::mmap::ProtFlags::PROT_WRITE,
+            elf_loader::mmap::MapFlags::MAP_PRIVATE,
+            trampoline.file_offset,
+            Some(fd),
+            &mut need_copy,
+        )
+    }
+    .expect("failed to mmap trampoline section");
+    assert_eq!(
+        start_addr,
+        ret.as_ptr() as usize,
+        "trampoline mapping address is taken"
+    );
+    // The first 8 bytes of the data is the magic number,
+    let version_number = start_addr as *const u64;
+    assert_eq!(
+        unsafe { version_number.read() },
+        super::REWRITER_VERSION_NUMBER,
+        "trampoline section version number mismatch"
+    );
+    let placeholder = (start_addr + 8) as *mut usize;
+    unsafe {
+        placeholder.write(litebox_platform_multiplex::platform().get_syscall_entry_point());
+    }
+    let ptr = crate::MutPtr::from_usize(start_addr);
+    let pm = litebox_page_manager();
+    unsafe { pm.make_pages_executable(ptr, end_addr - start_addr) }
+        .expect("failed to make pages executable");
+    end_addr
+}
+
+const DEFAULT_ELF_LOAD_BASE: usize = (1 << 46) - PAGE_SIZE;
+
 /// Loader for ELF files
 pub(super) struct ElfLoader;
 
@@ -236,9 +380,11 @@ impl ElfLoader {
         let fd = fd_elf_map
             .register_elf(elf_buf)
             .map_err(ElfLoaderError::OpenError)?;
-        let object = fd_elf_map
+        let mut object = fd_elf_map
             .get(fd)
             .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
+
+        let trampoline = get_trampoline_hdr(&mut object);
 
         let elf = loader
             .easy_load(object)
@@ -246,6 +392,10 @@ impl ElfLoader {
 
         let entry = elf.entry();
         let base = elf.base();
+
+        if let Some(trampoline) = trampoline {
+            load_trampoline(trampoline, base, fd);
+        }
 
         // Since it does not have `ld` or `ldelf`, it should relocate symbols by its own.
         elf.easy_relocate([].into_iter(), &|_| None)
