@@ -28,7 +28,8 @@ pub struct FutexManager<Platform: RawSyncPrimitivesProvider + RawPointerProvider
 
 /// (Private-only) storage for a specific futex.
 struct Lockable<Platform: RawSyncPrimitivesProvider> {
-    // TODO(jayb): Move the `num_waiters` to be part of the raw mutex underlying atomic itself.
+    // TODO(jayb): Move the `num_waiters` to be part of the raw mutex underlying atomic itself. This
+    // is purely a minor optimization opportunity, and should not hurt the actual implementation itself.
     num_waiters: u32,
     raw_mutex: Arc<Platform::RawMutex>,
     latest_wake_bitset: Option<NonZeroU32>,
@@ -213,6 +214,16 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         num_to_wake_up: NonZeroU32,
         bitset: Option<NonZeroU32>,
     ) -> Result<u32, FutexError> {
+        if let Some(bitset) = bitset
+            && bitset != NonZeroU32::MAX
+        {
+            // TODO(jayb): We likely need to track non-trivial bitset waiters in a `Lockable` to
+            // check if it is even feasible to wake anyone up, and then make sure at least one of
+            // them wake up. For now, we simply say that we don't yet support this. The
+            // implementation for this is quite doable within the current system, just takes more
+            // effort, so we postpone it until we actually see it as being needed.
+            unimplemented!()
+        }
         let addr = futex_addr.as_usize();
         // We will loop until there is no other waker in active play.
         let mut lockables = loop {
