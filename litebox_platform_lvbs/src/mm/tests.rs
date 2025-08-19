@@ -235,7 +235,7 @@ fn test_vmm_page_fault() {
         x86_64::PhysAddr::new(0),
     );
     let litebox = LiteBox::new(platform);
-    let mut vmm = PageManager::<_, PAGE_SIZE>::new(&litebox);
+    let vmm = PageManager::<_, PAGE_SIZE>::new(&litebox);
     unsafe {
         assert_eq!(
             vmm.create_writable_pages(

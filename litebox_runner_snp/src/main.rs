@@ -36,7 +36,7 @@ pub extern "C" fn page_fault_handler(pt_regs: &mut litebox_common_linux::PtRegs)
                 e
             );
             litebox_platform_multiplex::platform()
-                .terminate(globals::SM_SEV_TERM_SET, globals::SM_TERM_GENERAL);
+                .terminate(globals::SM_SEV_TERM_SET, globals::SM_TERM_EXCEPTION);
         }
     }
 }
@@ -58,9 +58,13 @@ pub extern "C" fn sandbox_kernel_init(
         ghcb_page,
         ghcb_page_va,
     )
-    .is_err()
+    .is_none()
     {
         ghcb_prints("GHCB page setup failed\n");
+        litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
+            globals::SM_SEV_TERM_SET,
+            globals::SM_TERM_NO_GHCB,
+        );
     } else {
         ghcb_prints("GHCB page setup done\n");
     }
@@ -79,7 +83,8 @@ pub extern "C" fn sandbox_process_init(
     // boot_params: &'static litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params,
 ) {
     let pgd = litebox_platform_linux_kernel::arch::PhysAddr::new_truncate(
-        litebox_platform_linux_kernel::arch::instructions::cr3() & !(litebox::mm::linux::PAGE_SIZE as u64 - 1),
+        litebox_platform_linux_kernel::arch::instructions::cr3()
+            & !(litebox::mm::linux::PAGE_SIZE as u64 - 1),
     );
     let platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel::new(pgd);
     litebox::log_println!(platform, "sandbox_process_init called");

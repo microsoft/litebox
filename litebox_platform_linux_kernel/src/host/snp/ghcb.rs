@@ -1,3 +1,5 @@
+use litebox::utils::TruncateExt as _;
+
 use crate::arch::{
     PhysAddr, VirtAddr,
     instructions::{rdmsr, vc_vmgexit, wrmsr},
@@ -61,11 +63,11 @@ fn num_to_char(n: u8) -> u8 {
 pub fn num_to_buf(buf: &mut [u8; 40], mut n: u64, base: u64) -> usize {
     let mut i = 0;
     if n == 0 {
-        buf[i] = num_to_char(n as u8);
+        buf[i] = num_to_char(0);
         i += 1;
     }
     while n > 0 {
-        buf[i] = num_to_char((n % base) as u8);
+        buf[i] = num_to_char((n % base).truncate());
         n /= base;
         i += 1;
     }
@@ -155,14 +157,14 @@ impl GhcbPage {
 
     /// GHCB page-based communication must set bitmap correctly.
     fn set_offset_valid(&mut self, offset: u64) {
-        let idx: usize = ((offset / 8) / 8) as u8 as usize;
-        let bit: u8 = ((offset / 8) % 8) as u8;
-        let oldv: u8 = self.valid_bitmap[idx];
+        let idx: u8 = ((offset / 8) / 8).truncate();
+        let bit: u8 = ((offset / 8) % 8).truncate();
+        let oldv: u8 = self.valid_bitmap[idx as usize];
         let newv = oldv | (1u8 << (bit));
-        self.valid_bitmap[idx] = newv;
+        self.valid_bitmap[idx as usize] = newv;
     }
 
-    fn page_vc_proto(&mut self, exit: u64, exit1: u64, exit2: u64) -> Result<(), ()> {
+    fn page_vc_proto(&mut self, exit: u64, exit1: u64, exit2: u64) -> Option<()> {
         self.version = GHCB_VERSION_1;
         self.usage = 0; // GHCB_DEFAULT_USAGE
 
@@ -176,9 +178,9 @@ impl GhcbPage {
             unsafe { core::ptr::read_volatile(core::ptr::addr_of!(self.vmsa.sw_exit_info_1)) };
         if sw_exit_info_1 & 0xffffffff == 1 {
             ghcb_prints("page_vc_proto: failed to handle request");
-            return Err(());
+            return None;
         }
-        Ok(())
+        Some(())
     }
 }
 
@@ -188,28 +190,31 @@ const GHCB_MSR_INFO_MASK: u64 = 0xfff;
 pub struct GhcbProtocol;
 
 impl GhcbProtocol {
-    fn ghcb_write_msr(va: VirtAddr, reg: u32, val: u64) -> Result<(), ()> {
+    fn ghcb_write_msr(va: VirtAddr, reg: u32, val: u64) -> Option<()> {
         let ghcb_page = GhcbPage::get_ghcb_page(va);
         ghcb_page.reset();
 
-        ghcb_page.set_rcx(reg as u64);
-        ghcb_page.set_rax(val as u32 as u64);
-        ghcb_page.set_rdx((val >> 32) as u32 as u64);
+        ghcb_page.set_rcx(u64::from(reg));
+
+        let low_val: u32 = val.truncate();
+        let high_val: u32 = (val >> 32).truncate();
+        ghcb_page.set_rax(u64::from(low_val));
+        ghcb_page.set_rdx(u64::from(high_val));
 
         ghcb_page.page_vc_proto(SVM_EXIT_MSR, 1, 0)
     }
 
-    fn sev_es_negotiate_protocol() -> Result<(), ()> {
+    fn sev_es_negotiate_protocol() -> Option<()> {
         let val = ghcb_msr_protocol(GHCB_SEV_INFO_REQ);
         let code = val & GHCB_MSR_INFO_MASK;
         if code != GHCB_SEV_INFO {
             print_str_and_int!("Failed to negotiate GHCB protocol: ", val, 16);
-            return Err(());
+            return None;
         }
-        Ok(())
+        Some(())
     }
 
-    pub fn setup_ghcb_page(pa: PhysAddr, va: VirtAddr) -> Result<(), ()> {
+    pub fn setup_ghcb_page(pa: PhysAddr, va: VirtAddr) -> Option<()> {
         Self::sev_es_negotiate_protocol()?;
 
         // let pfn = pa.frame_number() as u64;
@@ -219,7 +224,7 @@ impl GhcbProtocol {
         if code != GHCB_REGISTER_GPA_RESP || ret_pa != pa.as_u64() {
             print_str_and_int!("code: ", code, 16);
             print_str_and_int!("ret_pa: ", ret_pa, 16);
-            return Err(());
+            return None;
         }
 
         /* specify the guest physical address of the GHCB page

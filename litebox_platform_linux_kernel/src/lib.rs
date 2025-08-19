@@ -297,19 +297,19 @@ impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
 }
 
 impl<Host: HostInterface> litebox::platform::StdioProvider for LinuxKernel<Host> {
-    fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
+    fn read_from_stdin(&self, _buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
         todo!()
     }
 
     fn write_to(
         &self,
-        stream: litebox::platform::StdioOutStream,
-        buf: &[u8],
+        _stream: litebox::platform::StdioOutStream,
+        _buf: &[u8],
     ) -> Result<usize, litebox::platform::StdioWriteError> {
         todo!()
     }
 
-    fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {
+    fn is_a_tty(&self, _stream: litebox::platform::StdioStream) -> bool {
         true
     }
 }
@@ -454,11 +454,11 @@ impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKern
 impl<Host: HostInterface> litebox::platform::ThreadLocalStorageProvider for LinuxKernel<Host> {
     type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<LinuxKernel<Host>>;
 
-    fn set_thread_local_storage(&self, value: Self::ThreadLocalStorage) {
+    fn set_thread_local_storage(&self, _value: Self::ThreadLocalStorage) {
         todo!()
     }
 
-    fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
+    fn with_thread_local_storage_mut<F, R>(&self, _f: F) -> R
     where
         F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
     {
@@ -478,16 +478,16 @@ impl<Host: HostInterface> litebox::platform::ThreadProvider for LinuxKernel<Host
 
     unsafe fn spawn_thread(
         &self,
-        ctx: &Self::ExecutionContext,
-        stack: <Self as RawPointerProvider>::RawMutPointer<u8>,
-        stack_size: usize,
-        entry_point: usize,
-        thread_args: alloc::boxed::Box<Self::ThreadArgs>,
+        _ctx: &Self::ExecutionContext,
+        _stack: <Self as RawPointerProvider>::RawMutPointer<u8>,
+        _stack_size: usize,
+        _entry_point: usize,
+        _thread_args: alloc::boxed::Box<Self::ThreadArgs>,
     ) -> Result<Self::ThreadId, Self::ThreadSpawnError> {
         todo!()
     }
 
-    fn terminate_thread(&self, code: Self::ExitCode) -> ! {
+    fn terminate_thread(&self, _code: Self::ExitCode) -> ! {
         todo!()
     }
 }
