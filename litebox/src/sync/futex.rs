@@ -31,7 +31,7 @@ struct Lockable<Platform: RawSyncPrimitivesProvider> {
     // TODO(jayb): Move the `num_waiters` to be part of the raw mutex underlying atomic itself.
     num_waiters: u32,
     raw_mutex: Arc<Platform::RawMutex>,
-    latest_wake_bitset: u32,
+    latest_wake_bitset: Option<NonZeroU32>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
@@ -112,7 +112,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         let lockable: &mut Lockable<Platform> = lockables.entry(addr).or_insert(Lockable {
             num_waiters: 0,
             raw_mutex: Arc::new(self.litebox.x.platform.new_raw_mutex()),
-            latest_wake_bitset: 0,
+            latest_wake_bitset: None,
         });
         lockable.num_waiters += 1;
         let start = self.litebox.x.platform.now();
@@ -177,7 +177,12 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
             let latest_wake_bitset = {
                 #[expect(clippy::missing_panics_doc, reason = "the lockable must still exist")]
                 {
-                    self.lockables.read().get(&addr).unwrap().latest_wake_bitset
+                    self.lockables
+                        .read()
+                        .get(&addr)
+                        .unwrap()
+                        .latest_wake_bitset
+                        .map_or(0, NonZeroU32::get)
                 }
             };
             if (latest_wake_bitset & bitset.get()) != 0 {
@@ -209,10 +214,9 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // We will loop until there is no other waker in active play.
         loop {
             if let Some(lockable) = self.lockables.write().get_mut(&addr) {
-                if lockable.latest_wake_bitset == 0 {
+                if lockable.latest_wake_bitset.is_none() {
                     // There is no other waiter in play, we take it by setting it up.
-                    lockable.latest_wake_bitset = bitset.map_or(u32::MAX, NonZeroU32::get);
-                    debug_assert_ne!(lockable.latest_wake_bitset, 0);
+                    lockable.latest_wake_bitset = Some(bitset.unwrap_or(NonZeroU32::MAX));
                     break;
                 } else {
                     // There is another waker in play, we yield to them, and will come back later.
@@ -267,7 +271,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         }
         // We can now reset the mask out, and return the number that actually woke up.
         if let Some(lockable) = self.lockables.write().get_mut(&addr) {
-            lockable.latest_wake_bitset = 0;
+            lockable.latest_wake_bitset = None;
             debug_assert!(num_to_wake_up > lockable.num_waiters);
             Ok(num_to_wake_up - lockable.num_waiters)
         } else {
