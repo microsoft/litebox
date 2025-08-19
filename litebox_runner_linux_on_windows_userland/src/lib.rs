@@ -8,7 +8,7 @@ use litebox::LiteBox;
 use litebox::fs::FileSystem as _;
 use litebox_platform_multiplex::Platform;
 use std::os::windows::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
 /// Get file permissions and owner ID in a cross-platform way
 fn get_file_mode_and_uid(metadata: &std::fs::Metadata) -> (litebox::fs::Mode, u32) {
@@ -71,14 +71,25 @@ pub struct CliArgs {
     pub rewrite_syscalls: bool,
 }
 
-/// Backends supported for intercepting syscalls
-#[non_exhaustive]
-#[derive(Debug, Clone, clap::ValueEnum)]
-pub enum InterceptionBackend {
-    /// Use seccomp-based syscall interception
-    Seccomp,
-    /// Depend purely on rewriten syscalls to intercept them
-    Rewriter,
+fn windows_path_to_unix(path: &std::path::Path) -> String {
+    let components: Vec<_> = path
+        .components()
+        .filter_map(|comp| match comp {
+            Component::Prefix(_) => None, // Remove drive letter (C:, D:, etc.)
+            Component::RootDir => Some("/".to_string()),
+            Component::Normal(name) => Some(name.to_string_lossy().to_string()),
+            Component::CurDir => Some(".".to_string()),
+            Component::ParentDir => Some("..".to_string()),
+        })
+        .collect();
+
+    if components.is_empty() || components == ["/"] {
+        "/".to_string()
+    } else if components[0] == "/" {
+        format!("/{}", components[1..].join("/"))
+    } else {
+        components.join("/")
+    }
 }
 
 /// Run Linux programs with LiteBox on unmodified Linux
@@ -137,9 +148,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new();
     let litebox = LiteBox::new(platform);
+    let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
+    let prog_unix_path = windows_path_to_unix(&prog);
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
-        let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
         let ancestors: Vec<_> = prog.ancestors().collect();
         let mut prev_user = 0;
         for (path, &mode_and_user) in ancestors
@@ -149,27 +161,21 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .skip(1)
             .zip(&ancestor_modes_and_users)
         {
-            // TODO(chuqi): Currently the litebox in_mem fs's chown/mkdir behavior is weird:
-            // Whenever creating a directory by `in_mem.with_root_privileges`, the last
-            // `fs.chown(..., 1000, 1000)` somehow didn't change the ownership of the directory
-            // properly: the later retrieval of the directory's uid still shows 0.
-            //
-            // For now, we always use root privilege to create directories and then `chown`.
-            // Created another branch to reproduce the issue for me and Weiteng to debug:
-            // https://github.com/microsoft/litebox/tree/chuqiz/windows-debug-chown-mkdir.
-            println!(
-                "Creating dir: {:?} with permissions: {:?}, user: {:?}. prev_user: {:?}",
-                path, mode_and_user.0, mode_and_user.1, prev_user
-            );
-            // Always use root privileges for directory creation to avoid permission issues
-            in_mem.with_root_privileges(|fs| {
-                fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
-                if mode_and_user.1 != 0 {
-                    // This file is owned by a non-root user, so we need to set the ownership to our default user
-                    fs.chown(path.to_str().unwrap(), Some(1000), Some(1000))
-                        .unwrap();
-                }
-            });
+            // convert windows's path to unix-style and strip its root
+            let unix_path = windows_path_to_unix(path);
+            if prev_user == 0 {
+                // require root user
+                in_mem.with_root_privileges(|fs| {
+                    fs.mkdir(unix_path.as_str(), mode_and_user.0).unwrap();
+                    if mode_and_user.1 != 0 {
+                        // This file is owned by a non-root user, so we need to set the ownership to our default user
+                        fs.chown(unix_path.as_str(), Some(1000), Some(1000))
+                            .unwrap();
+                    }
+                });
+            } else {
+                in_mem.mkdir(unix_path, mode_and_user.0).unwrap();
+            }
             prev_user = mode_and_user.1;
         }
 
@@ -194,15 +200,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let last = ancestor_modes_and_users.last().unwrap();
         if prev_user == 0 {
             in_mem.with_root_privileges(|fs| {
-                open_file(fs, prog.to_str().unwrap(), last.0);
+                open_file(fs, prog_unix_path.as_str(), last.0);
                 if last.1 != 0 {
                     // This file is owned by a non-root user, so we need to set the ownership to our default user
-                    fs.chown(prog.to_str().unwrap(), Some(1000), Some(1000))
+                    fs.chown(prog_unix_path.as_str(), Some(1000), Some(1000))
                         .unwrap();
                 }
             });
         } else {
-            open_file(&mut in_mem, prog.to_str().unwrap(), last.0);
+            open_file(&mut in_mem, prog_unix_path.as_str(), last.0);
         }
 
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(&litebox, tar_data);
@@ -222,15 +228,18 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     litebox_shim_linux::set_fs(initial_file_system);
     litebox_platform_multiplex::set_platform(platform);
     platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
-    // match cli_args.interception_backend {
-    //     InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
-    //     InterceptionBackend::Rewriter => {}
-    // }
 
     let argv = cli_args
         .program_and_arguments
         .iter()
-        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+        .enumerate()
+        .map(|(i, x)| {
+            if i == 0 {
+                std::ffi::CString::new(prog_unix_path.as_bytes()).unwrap()
+            } else {
+                std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap()
+            }
+        })
         .collect();
     let envp: Vec<_> = cli_args
         .environment_variables
@@ -254,7 +263,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     let loaded_program = litebox_shim_linux::loader::load_program(
-        &cli_args.program_and_arguments[0],
+        &prog_unix_path,
         argv,
         envp,
         litebox_shim_linux::loader::auxv::init_auxv(),
