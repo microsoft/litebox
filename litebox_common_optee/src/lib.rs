@@ -1,11 +1,12 @@
 //! Common elements to enable OP-TEE-like functionalities
 
+#![cfg(target_arch = "x86_64")]
 #![no_std]
 
 extern crate alloc;
 
 use litebox::platform::RawConstPointer as _;
-use litebox_common_linux::errno::Errno;
+use litebox_common_linux::{PtRegs, errno::Errno};
 use num_enum::TryFromPrimitive;
 use syscall_nr::TeeSyscallNr;
 
@@ -81,7 +82,8 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
 // to the LVBS platform or runner.
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
-    pub fn try_from_raw(syscall_number: usize, ctx: &SyscallContext) -> Result<Self, Errno> {
+    pub fn try_from_raw(syscall_number: usize, ctx: &PtRegs) -> Result<Self, Errno> {
+        let ctx = SyscallContext::from_pt_regs(ctx);
         let sysnr = u32::try_from(syscall_number).map_err(|_| Errno::ENOSYS)?;
         let dispatcher = match TeeSyscallNr::try_from(sysnr).unwrap_or(TeeSyscallNr::Unknown) {
             TeeSyscallNr::Return => SyscallRequest::Return {
@@ -175,6 +177,22 @@ impl SyscallContext {
     pub fn new(args: &[usize; MAX_SYSCALL_ARGS]) -> Self {
         SyscallContext { args: *args }
     }
+
+    /// Create OP-TEE TA's `SyscallContext` from `PtRegs`.
+    pub fn from_pt_regs(pt_regs: &PtRegs) -> Self {
+        SyscallContext {
+            args: [
+                pt_regs.rdi,
+                pt_regs.rsi,
+                pt_regs.rdx,
+                pt_regs.r10,
+                pt_regs.r8,
+                pt_regs.r9,
+                pt_regs.r12,
+                pt_regs.r13,
+            ],
+        }
+    }
 }
 
 /// A handle for `TeeObj`. OP-TEE kernel creates secret objects (e.g., via `CrypObjAlloc`)
@@ -239,7 +257,7 @@ impl CommandId {
 /// `utee_params` from `optee_os/lib/libutee/include/utee_types.h`
 /// It contains up to 4 parameters where each of them is a collection of
 /// type (1 byte) and two 8-byte data (values or addresses).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct UteeParams {
     pub types: u64,
@@ -287,6 +305,30 @@ impl UteeParams {
             let base_index = index * 2;
             Ok(Some((self.vals[base_index], self.vals[base_index + 1])))
         }
+    }
+
+    pub fn set_type(&mut self, index: usize, param_type: TeeParamType) -> Result<(), Errno> {
+        if index >= TEE_NUM_PARAMS {
+            return Err(Errno::EINVAL);
+        }
+        let mut types_bytes = self.types.to_le_bytes();
+        types_bytes[index] = param_type as u8;
+        self.types = u64::from_le_bytes(types_bytes);
+        Ok(())
+    }
+
+    pub fn set_values(&mut self, index: usize, value1: u64, value2: u64) -> Result<(), Errno> {
+        if index >= TEE_NUM_PARAMS {
+            return Err(Errno::EINVAL);
+        }
+        let base_index = index * 2;
+        self.vals[base_index] = value1;
+        self.vals[base_index + 1] = value2;
+        Ok(())
+    }
+
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -459,31 +501,31 @@ const TEE_ERROR_CORRUPT_OBJECT_2: u32 = 0xf010_0002;
 const TEE_ERROR_STORAGE_NOT_AVAILABLE: u32 = 0xf010_0003;
 const TEE_ERROR_STORAGE_NOT_AVAILABLE_2: u32 = 0xf010_0004;
 const TEE_ERROR_CIPHERTEXT_INVALID: u32 = 0xf010_0006;
-const TEE_ERROR_GENERIC: u32 = 0xfff_0000;
-const TEE_ERROR_ACCESS_DENIED: u32 = 0xfff_0001;
-const TEE_ERROR_CANCEL: u32 = 0xfff_0002;
-const TEE_ERROR_ACCESS_CONFLICT: u32 = 0xfff_0003;
-const TEE_ERROR_EXCESS_DATA: u32 = 0xfff_0004;
-const TEE_ERROR_BAD_FORMAT: u32 = 0xfff_0005;
-const TEE_ERROR_BAD_PARAMETERS: u32 = 0xfff_0006;
-const TEE_ERROR_BAD_STATE: u32 = 0xfff_0007;
-const TEE_ERROR_ITEM_NOT_FOUND: u32 = 0xfff_0008;
-const TEE_ERROR_NOT_IMPLEMENTED: u32 = 0xfff_0009;
-const TEE_ERROR_NOT_SUPPORTED: u32 = 0xfff_000a;
-const TEE_ERROR_NO_DATA: u32 = 0xfff_000b;
-const TEE_ERROR_OUT_OF_MEMORY: u32 = 0xfff_000c;
-const TEE_ERROR_BUSY: u32 = 0xfff_000d;
-const TEE_ERROR_COMMUNICATION: u32 = 0xfff_000e;
-const TEE_ERROR_SECURITY: u32 = 0xfff_000f;
-const TEE_ERROR_SHORT_BUFFER: u32 = 0xfff_0010;
-const TEE_ERROR_EXTERNAL_CANCEL: u32 = 0xfff_0011;
-const TEE_ERROR_OVERFLOW: u32 = 0xfff_300f;
-const TEE_ERROR_TARGET_DEAD: u32 = 0xfff_3024;
-const TEE_ERROR_STORAGE_NO_SPACE: u32 = 0xfff_3041;
-const TEE_ERROR_MAC_INVALID: u32 = 0xfff_3071;
-const TEE_ERROR_SIGNATURE_INVALID: u32 = 0xfff_3072;
-const TEE_ERROR_TIME_NOT_SET: u32 = 0xfff_5000;
-const TEE_ERROR_TIME_NEEDS_RESET: u32 = 0xfff_5001;
+const TEE_ERROR_GENERIC: u32 = 0xffff_0000;
+const TEE_ERROR_ACCESS_DENIED: u32 = 0xffff_0001;
+const TEE_ERROR_CANCEL: u32 = 0xffff_0002;
+const TEE_ERROR_ACCESS_CONFLICT: u32 = 0xffff_0003;
+const TEE_ERROR_EXCESS_DATA: u32 = 0xffff_0004;
+const TEE_ERROR_BAD_FORMAT: u32 = 0xffff_0005;
+const TEE_ERROR_BAD_PARAMETERS: u32 = 0xffff_0006;
+const TEE_ERROR_BAD_STATE: u32 = 0xffff_0007;
+const TEE_ERROR_ITEM_NOT_FOUND: u32 = 0xffff_0008;
+const TEE_ERROR_NOT_IMPLEMENTED: u32 = 0xffff_0009;
+const TEE_ERROR_NOT_SUPPORTED: u32 = 0xffff_000a;
+const TEE_ERROR_NO_DATA: u32 = 0xffff_000b;
+const TEE_ERROR_OUT_OF_MEMORY: u32 = 0xffff_000c;
+const TEE_ERROR_BUSY: u32 = 0xffff_000d;
+const TEE_ERROR_COMMUNICATION: u32 = 0xffff_000e;
+const TEE_ERROR_SECURITY: u32 = 0xffff_000f;
+const TEE_ERROR_SHORT_BUFFER: u32 = 0xffff_0010;
+const TEE_ERROR_EXTERNAL_CANCEL: u32 = 0xffff_0011;
+const TEE_ERROR_OVERFLOW: u32 = 0xffff_300f;
+const TEE_ERROR_TARGET_DEAD: u32 = 0xffff_3024;
+const TEE_ERROR_STORAGE_NO_SPACE: u32 = 0xffff_3041;
+const TEE_ERROR_MAC_INVALID: u32 = 0xffff_3071;
+const TEE_ERROR_SIGNATURE_INVALID: u32 = 0xffff_3072;
+const TEE_ERROR_TIME_NOT_SET: u32 = 0xffff_5000;
+const TEE_ERROR_TIME_NEEDS_RESET: u32 = 0xffff_5001;
 
 /// `TEE_Result` (API error codes) from `optee_os/lib/libutee/include/tee_api_defines.h`
 #[derive(Clone, Copy, TryFromPrimitive)]
@@ -520,10 +562,24 @@ pub enum TeeResult {
     SignatureInvalid = TEE_ERROR_SIGNATURE_INVALID,
     TimeNotSet = TEE_ERROR_TIME_NOT_SET,
     TimeNeedsReset = TEE_ERROR_TIME_NEEDS_RESET,
+    Unknown = 0xffff_ffff,
 }
 
 impl From<TeeResult> for u32 {
     fn from(res: TeeResult) -> Self {
         res as u32
     }
+}
+
+const UTEE_ENTRY_FUNC_OPEN_SESSION: u32 = 0;
+const UTEE_ENTRY_FUNC_CLOSE_SESSION: u32 = 1;
+const UTEE_ENTRY_FUNC_INVOKE_COMMEND: u32 = 2;
+
+#[derive(Clone, Copy, TryFromPrimitive)]
+#[repr(u32)]
+pub enum UteeEntryFunc {
+    OpenSession = UTEE_ENTRY_FUNC_OPEN_SESSION,
+    CloseSession = UTEE_ENTRY_FUNC_CLOSE_SESSION,
+    InvokeCommand = UTEE_ENTRY_FUNC_INVOKE_COMMEND,
+    Unknown = 0xffff_ffff,
 }

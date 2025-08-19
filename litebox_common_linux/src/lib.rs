@@ -13,6 +13,7 @@ use litebox::{
 use syscalls::Sysno;
 
 pub mod errno;
+pub mod mm;
 
 extern crate alloc;
 
@@ -381,7 +382,9 @@ impl From<litebox::fs::FileStatus> for FileStat {
             st_ino: <_>::try_from(ino).unwrap(),
             st_nlink: 1,
             st_mode: (mode.bits() | InodeType::from(file_type) as u32).truncate(),
+            #[cfg_attr(target_arch = "x86", expect(clippy::useless_conversion))]
             st_uid: <_>::from(user),
+            #[cfg_attr(target_arch = "x86", expect(clippy::useless_conversion))]
             st_gid: <_>::from(group),
             st_rdev: rdev
                 .map(|r| <_>::try_from(r.get()).unwrap())
@@ -623,16 +626,54 @@ cfg_if::cfg_if! {
     }
 }
 
-// From libc crate's `timespec` definition.
-//
-// linux x32 compatibility
-// See https://sourceware.org/bugzilla/show_bug.cgi?id=16437
-pub struct timespec {
-    pub tv_sec: time_t,
-    #[cfg(all(target_arch = "x86_64", target_pointer_width = "32"))]
-    pub tv_nsec: i64,
-    #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "32")))]
-    pub tv_nsec: isize,
+/// timespec from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/include/uapi/linux/time_types.h#L7)
+#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq)]
+#[repr(C)]
+pub struct Timespec {
+    /// Seconds.
+    pub tv_sec: i64,
+
+    /// Nanoseconds. Must be less than 1_000_000_000.
+    pub tv_nsec: u64,
+}
+
+impl Timespec {
+    /// Subtract another `Timespec` from self
+    pub fn sub_timespec(&self, other: &Timespec) -> Result<core::time::Duration, errno::Errno> {
+        if self >= other {
+            let (secs, nsec) = if self.tv_nsec >= other.tv_nsec {
+                (
+                    self.tv_sec
+                        .checked_sub(other.tv_sec)
+                        .ok_or(errno::Errno::EDOM)?,
+                    self.tv_nsec - other.tv_nsec,
+                )
+            } else {
+                (
+                    self.tv_sec
+                        .checked_sub(other.tv_sec + 1)
+                        .ok_or(errno::Errno::EDOM)?,
+                    self.tv_nsec + 1_000_000_000 - other.tv_nsec,
+                )
+            };
+
+            Ok(core::time::Duration::new(
+                u64::try_from(secs).map_err(|_| errno::Errno::EDOM)?,
+                nsec.truncate(),
+            ))
+        } else {
+            Err(errno::Errno::EINVAL)
+        }
+    }
+}
+
+impl From<Timespec> for core::time::Duration {
+    fn from(timespec: Timespec) -> Self {
+        core::time::Duration::new(
+            u64::try_from(timespec.tv_sec).unwrap(),
+            timespec.tv_nsec.truncate(),
+        )
+    }
 }
 
 #[repr(C)]
@@ -1032,6 +1073,8 @@ impl<Platform: litebox::platform::RawPointerProvider> ThreadLocalStorage<Platfor
 pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     /// Process ID
     pub pid: i32,
+    /// Parent Process ID
+    pub ppid: i32,
     /// Thread ID
     pub tid: i32,
     /// When a thread whose `clear_child_tid` is not `None` terminates, and it shares memory with other threads,
@@ -1573,6 +1616,7 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         flags: RngFlags,
     },
     Getpid,
+    Getppid,
     Getuid,
     Geteuid,
     Getgid,
@@ -1997,6 +2041,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 }
             }
             Sysno::getpid => SyscallRequest::Getpid,
+            Sysno::getppid => SyscallRequest::Getppid,
             Sysno::getuid => SyscallRequest::Getuid,
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,

@@ -13,12 +13,13 @@ once_cell = { version = "1.20.2", default-features = false, features = ["alloc",
 cfg-if = "1.0.0"
 
 [features]
-default = ["platform_linux_userland"]
+default = ["platform_linux_userland", "litebox_platform_linux_userland/linux_syscall"]
 platform_linux_userland = ["dep:litebox_platform_linux_userland"]
 platform_freebsd_userland = ["dep:litebox_platform_freebsd_userland"]
 platform_windows_userland = ["dep:litebox_platform_windows_userland"]
 platform_lvbs = ["dep:litebox_platform_lvbs"]
 systrap_backend = ["platform_linux_userland", "litebox_platform_linux_userland/systrap_backend"]
+platform_linux_userland_with_optee_syscall = ["platform_linux_userland", "litebox_platform_linux_userland/optee_syscall"]
 
 [lints]
 workspace = true

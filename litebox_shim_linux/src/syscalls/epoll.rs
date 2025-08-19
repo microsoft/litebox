@@ -166,13 +166,14 @@ impl EpollFile {
     fn add_interest(&self, fd: u32, file: &Descriptor, event: EpollEvent) -> Result<(), Errno> {
         let mut interests = self.interests.lock();
         let key = EpollEntryKey::new(fd, file);
-        if let Some(entry) = interests.get(&key) {
-            if entry.desc.upgrade().is_some() {
-                return Err(Errno::EEXIST);
-            }
-            // find stale entry because we don't remove it immediately after the file is closed;
-            // `insert` below will replace it with a new entry.
+        if let Some(entry) = interests.get(&key)
+            && entry.desc.upgrade().is_some()
+        {
+            return Err(Errno::EEXIST);
         }
+        // we may have stale entry because we don't remove it immediately after the file is closed;
+        // `insert` below will replace it with a new entry.
+
         let mask = Events::from_bits_truncate(event.events);
         let entry = EpollEntry::new(
             DescriptorRef::from(file),

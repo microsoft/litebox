@@ -11,9 +11,10 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError,
-    PathError, ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError, WriteError,
+    PathError, ReadDirError, ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError,
+    WriteError,
 };
-use super::{FileStatus, Mode, NodeInfo, SeekWhence, UserInfo};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, UserInfo};
 use crate::utilities::anymap::AnyMap;
 
 /// Just a random constant that is distinct from other file systems. In this case, it is
@@ -169,7 +170,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 // file specified by pathname does not exist, open() will create a
                 // regular file (i.e., O_DIRECTORY is ignored).
                 flags.remove(OFlags::DIRECTORY);
-                parent.children_count = parent.children_count.checked_add(1).unwrap();
+                let old = parent.children.insert(
+                    path.components().unwrap().last().unwrap().into(),
+                    FileType::RegularFile,
+                );
+                assert!(old.is_none());
                 let entry = Entry::File(Arc::new(self.litebox.sync().new_rwlock(FileX {
                     perms: Permissions {
                         mode,
@@ -430,7 +435,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         if !self.current_user.can_write(&parent.perms) {
             return Err(UnlinkError::NoWritePerms);
         }
-        parent.children_count = parent.children_count.checked_sub(1).unwrap();
+        let removed = parent
+            .children
+            .remove(path.components().unwrap().last().unwrap());
+        // Just a sanity check
+        assert!(matches!(removed, Some(FileType::RegularFile)));
         let removed = root.entries.remove(&path).unwrap();
         // Just a sanity check
         assert!(matches!(removed, Entry::File(File { .. })));
@@ -452,7 +461,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         if !self.current_user.can_write(&parent.perms) {
             return Err(MkdirError::NoWritePerms);
         }
-        parent.children_count = parent.children_count.checked_add(1).unwrap();
+        let old = parent.children.insert(
+            path.components().unwrap().last().unwrap().into(),
+            FileType::Directory,
+        );
+        assert!(old.is_none());
         let old = root.entries.insert(
             path,
             Entry::Dir(Arc::new(self.litebox.sync().new_rwlock(DirX {
@@ -460,7 +473,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     mode,
                     userinfo: self.current_user,
                 },
-                children_count: 0,
+                children: HashMap::default(),
                 metadata: AnyMap::new(),
                 unique_id: self.fresh_id(),
             }))),
@@ -483,18 +496,38 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let Entry::Dir(dir) = entry else {
             return Err(RmdirError::NotADirectory);
         };
-        if dir.read().children_count > 0 {
+        if !dir.read().children.is_empty() {
             return Err(RmdirError::NotEmpty);
         }
         let mut parent = parent.write();
         if !self.current_user.can_write(&parent.perms) {
             return Err(RmdirError::NoWritePerms);
         }
-        parent.children_count = parent.children_count.checked_sub(1).unwrap();
+        let removed = parent
+            .children
+            .remove(path.components().unwrap().last().unwrap());
+        // Just a sanity check
+        assert!(matches!(removed, Some(FileType::Directory)));
         let removed = root.entries.remove(&path).unwrap();
         // Just a sanity check
         assert!(matches!(removed, Entry::Dir(_)));
         Ok(())
+    }
+
+    fn read_dir(&self, fd: &FileFd<Platform>) -> Result<Vec<DirEntry>, ReadDirError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let Descriptor::Dir { dir, metadata: _ } = &descriptor_table.get_entry(fd).entry else {
+            return Err(ReadDirError::NotADirectory);
+        };
+        Ok(dir
+            .read()
+            .children
+            .iter()
+            .map(|(name, file_type)| DirEntry {
+                name: name.into(),
+                file_type: file_type.clone(),
+            })
+            .collect())
     }
 
     fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {
@@ -673,7 +706,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
                         mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                         userinfo: UserInfo { user: 0, group: 0 },
                     },
-                    children_count: 0,
+                    children: HashMap::default(),
                     metadata: AnyMap::new(),
                     unique_id: 0,
                 }))),
@@ -687,7 +720,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
         &self,
         path: &str,
         current_user: UserInfo,
-    ) -> ParentAndEntry<Dir<Platform>, Entry<Platform>> {
+    ) -> ParentAndEntry<'_, Dir<Platform>, Entry<Platform>> {
         let mut real_components_seen = false;
         let mut collected = String::new();
         let mut parent_dir = None;
@@ -752,7 +785,7 @@ type Dir<Platform> = Arc<sync::RwLock<Platform, DirX>>;
 
 pub(crate) struct DirX {
     perms: Permissions,
-    children_count: u32,
+    children: HashMap<String, FileType>,
     metadata: AnyMap,
     unique_id: usize,
 }

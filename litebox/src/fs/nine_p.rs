@@ -101,6 +101,13 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
         todo!()
     }
 
+    fn read_dir(
+        &self,
+        fd: &FileFd<Platform>,
+    ) -> Result<alloc::vec::Vec<crate::fs::DirEntry>, super::errors::ReadDirError> {
+        todo!()
+    }
+
     fn file_status(
         &self,
         path: impl crate::path::Arg,

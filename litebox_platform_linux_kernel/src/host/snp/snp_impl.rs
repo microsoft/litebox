@@ -152,7 +152,9 @@ impl HostSnpInterface {
             } else {
                 Err(Errno::ENOMEM)
             }
-        } else if addr % (PAGE_SIZE << order) != 0 || addr > PHYS_ADDR_MAX - (PAGE_SIZE << order) {
+        } else if !addr.is_multiple_of(PAGE_SIZE << order)
+            || addr > PHYS_ADDR_MAX - (PAGE_SIZE << order)
+        {
             // Address is not aligned or out of bounds
             Err(Errno::EINVAL)
         } else {
@@ -291,9 +293,9 @@ impl HostInterface for HostSnpInterface {
         val: u32,
         timeout: Option<core::time::Duration>,
     ) -> Result<(), Errno> {
-        let timeout = timeout.map(|t| crate::host::linux::Timespec {
+        let timeout = timeout.map(|t| litebox_common_linux::Timespec {
             tv_sec: i64::try_from(t.as_secs()).unwrap(),
-            tv_nsec: i64::from(t.subsec_nanos()),
+            tv_nsec: u64::from(t.subsec_nanos()),
         });
         // TODO: sandbox driver needs to be updated to accept a kernel pointer from the guest
         Self::syscalls(SyscallN::<6, NR_SYSCALL_FUTEX> {

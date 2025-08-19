@@ -132,12 +132,12 @@ pub fn get_num_possible_cpus() -> Result<u32, VtlMemoryError> {
 
     if let Some(cmdline_str) = unsafe { CStr::from_ptr(cmdline).to_str().ok() } {
         for token in cmdline_str.split_whitespace() {
-            if token.starts_with("possible_cpus=") {
-                if let Some((_, v)) = token.split_once('=') {
-                    let num = v.parse::<u32>().unwrap_or(0);
-                    if num > 0 {
-                        return Ok(num);
-                    }
+            if token.starts_with("possible_cpus=")
+                && let Some((_, v)) = token.split_once('=')
+            {
+                let num = v.parse::<u32>().unwrap_or(0);
+                if num > 0 {
+                    return Ok(num);
                 }
             }
         }

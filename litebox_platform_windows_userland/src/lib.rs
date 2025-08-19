@@ -36,6 +36,8 @@ use windows_sys::Win32::{
     },
 };
 
+mod perf_counter;
+
 extern crate alloc;
 
 /// Per-thread FS base storage structure
@@ -300,6 +302,8 @@ impl WindowsUserland {
         let task = alloc::boxed::Box::new(litebox_common_linux::Task::<WindowsUserland> {
             pid: 1000,
             tid: 1000,
+            // TODO: placeholder for actual PPID
+            ppid: 0,
             clear_child_tid: None,
             robust_list: None,
             credentials: alloc::sync::Arc::new(creds),
@@ -603,19 +607,33 @@ impl litebox::platform::TimeProvider for WindowsUserland {
     type Instant = Instant;
 
     fn now(&self) -> Self::Instant {
-        Instant {
-            inner: std::time::Instant::now(),
-        }
+        perf_counter::PerformanceCounterInstant::now().into()
     }
 }
 
 pub struct Instant {
-    inner: std::time::Instant,
+    inner: core::time::Duration,
 }
 
 impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
-        self.inner.checked_duration_since(earlier.inner)
+        // On windows there's a threshold below which we consider two timestamps
+        // equivalent due to measurement error. For more details + doc link,
+        // check the docs on [epsilon](perf_counter::PerformanceCounterInstant::epsilon).
+        let epsilon = perf_counter::PerformanceCounterInstant::epsilon();
+        if earlier.inner > self.inner && earlier.inner - self.inner <= epsilon {
+            Some(Duration::new(0, 0))
+        } else {
+            self.inner.checked_sub(earlier.inner)
+        }
+    }
+}
+
+impl From<litebox_common_linux::Timespec> for Instant {
+    fn from(value: litebox_common_linux::Timespec) -> Self {
+        Instant {
+            inner: value.into(),
+        }
     }
 }
 

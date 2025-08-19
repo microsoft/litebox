@@ -270,10 +270,9 @@ fn identify_indirect_relocations(
             if let Ok(sym_name) = elf_params
                 .sym_strtab
                 .get(usize::try_from(sym.st_name).map_err(|_| KernelElfError::ElfParseFailed)?)
+                && !sym_name.is_empty()
             {
-                if !sym_name.is_empty() {
-                    continue;
-                }
+                continue;
             }
 
             // checks whether an unnamed symbol belongs to the target section
@@ -357,12 +356,11 @@ pub fn parse_modinfo(original_elf_data: &[u8]) -> Result<(), KernelElfError> {
         let modinfo_data = &original_elf_data[start..end];
 
         for entry in modinfo_data.split(|&b| b == 0) {
-            if let Ok(s) = str::from_utf8(entry) {
-                if let Some((k, v)) = s.split_once('=') {
-                    if k == "name" {
-                        debug_serial_println!("Modinfo: {} = {}", k, v);
-                    }
-                }
+            if let Ok(s) = str::from_utf8(entry)
+                && let Some((k, v)) = s.split_once('=')
+                && k == "name"
+            {
+                debug_serial_println!("Modinfo: {} = {}", k, v);
             }
         }
     }

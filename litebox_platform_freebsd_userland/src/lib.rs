@@ -12,7 +12,7 @@ use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer};
 use litebox::platform::{ThreadLocalStorageProvider, UnblockedOrTimedOut};
-use litebox::utils::ReinterpretUnsignedExt as _;
+use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{ProtFlags, PunchthroughSyscall};
 
 mod syscall_raw;
@@ -189,9 +189,13 @@ impl FreeBSDUserland {
         }
 
         let tid = i32::try_from(tid).expect("tid should fit in i32");
+        let ppid =
+            unsafe { syscalls::syscall0(syscalls::Sysno::Getppid) }.expect("Failed to get PPID");
+        let ppid: i32 = i32::try_from(ppid).expect("ppid should fit in i32");
         let task = alloc::boxed::Box::new(litebox_common_linux::Task {
             pid: tid,
             tid,
+            ppid,
             clear_child_tid: None,
             robust_list: None,
             credentials: alloc::sync::Arc::new(Self::get_user_info()),
@@ -224,6 +228,10 @@ struct ThreadStartArgs {
     pt_regs: Box<litebox_common_linux::PtRegs>,
     thread_args: Box<litebox_common_linux::NewThreadArgs<FreeBSDUserland>>,
     entry_point: usize,
+    /// Note `child_tid` is i32 on Linux but `long` on FreeBSD (though it always fits into i32).
+    /// Have a separate field here instead of using the `tid` in [`litebox_common_linux::Task`]
+    /// which is i32.
+    child_tid: isize,
 }
 
 /// Thread start trampoline function for FreeBSD.
@@ -231,7 +239,7 @@ struct ThreadStartArgs {
 extern "C" fn thread_start(arg: *mut ThreadStartArgs) {
     // SAFETY: The arg pointer is guaranteed to be valid and point to a ThreadStartArgs
     // that was created via Box::into_raw in spawn_thread.
-    let thread_start_args = unsafe { Box::from_raw(arg) };
+    let mut thread_start_args = unsafe { Box::from_raw(arg) };
 
     // Store the pt_regs onto the stack (for restoration later)
     let pt_regs_stack = *(thread_start_args.pt_regs);
@@ -240,6 +248,8 @@ extern "C" fn thread_start(arg: *mut ThreadStartArgs) {
     unsafe {
         litebox_common_linux::wrgsbase(0);
     }
+
+    thread_start_args.thread_args.task.tid = thread_start_args.child_tid.truncate();
 
     // Set up thread-local storage for the new thread. This is done by
     // calling the actual thread callback with the unpacked arguments
@@ -284,11 +294,8 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
         stack: TransparentMutPtr<u8>,
         stack_size: usize,
         entry_point: usize,
-        mut thread_args: Box<Self::ThreadArgs>,
+        thread_args: Box<Self::ThreadArgs>,
     ) -> Result<usize, Self::ThreadSpawnError> {
-        let child_tid_ptr = core::ptr::from_mut(thread_args.task.as_mut()) as u64
-            + core::mem::offset_of!(litebox_common_linux::Task<FreeBSDUserland>, tid) as u64;
-
         let mut copied_pt_regs = Box::new(*ctx);
 
         // Reset the child stack pointer to the top of the allocated thread stack.
@@ -300,11 +307,14 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
             pt_regs: copied_pt_regs,
             thread_args: thread_args,
             entry_point: entry_point,
+            child_tid: 0,
         };
 
         // We should always use heap to pass the parameter to `thr_new`. This is to avoid using the parents'
         // stack, which may be freed (race-condition) before the child thread starts.
         let thread_start_arg_ptr = Box::into_raw(Box::new(thread_start_args));
+
+        let parent_tid = core::mem::MaybeUninit::<isize>::uninit();
 
         let thr_param = freebsd_types::ThrParam {
             start_func: thread_start as usize as u64, // the child will enter `thread_start`
@@ -313,8 +323,9 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
             stack_size: stack_size as u64,
             tls_base: 0, // set by our callback
             tls_size: 0, // no need to specify it
-            child_tid: child_tid_ptr,
-            parent_tid: 0,
+            child_tid: thread_start_arg_ptr as u64
+                + core::mem::offset_of!(ThreadStartArgs, child_tid) as u64,
+            parent_tid: parent_tid.as_ptr() as u64,
             flags: 0,
             _pad: 0,
             rtp: 0, // we do not use real-time priority for now
@@ -332,8 +343,8 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
         match result {
             Ok(_) => {
                 // FreeBSD `thr_new` returns 0 (to the parent) on success. The actual thread ID will
-                // be written to child_tid_ptr by the kernel. We need to read it from the structure.
-                Ok(unsafe { *(child_tid_ptr as *const i32) as usize })
+                // be written to `parent_tid` by the kernel. We need to read it from the structure.
+                Ok(unsafe { parent_tid.assume_init() }.reinterpret_as_unsigned())
             }
             Err(errno) => Err(match errno {
                 crate::errno::Errno::EACCES => litebox_common_linux::errno::Errno::EACCES,
@@ -536,19 +547,32 @@ impl litebox::platform::TimeProvider for FreeBSDUserland {
     type Instant = Instant;
 
     fn now(&self) -> Self::Instant {
+        let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, t.as_mut_ptr()) };
+        let t = unsafe { t.assume_init() };
         Instant {
-            inner: std::time::Instant::now(),
+            #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
+            inner: litebox_common_linux::Timespec {
+                tv_sec: i64::from(t.tv_sec),
+                tv_nsec: u64::from(t.tv_nsec.reinterpret_as_unsigned()),
+            },
         }
     }
 }
 
 pub struct Instant {
-    inner: std::time::Instant,
+    inner: litebox_common_linux::Timespec,
 }
 
 impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
-        self.inner.checked_duration_since(earlier.inner)
+        self.inner.sub_timespec(&earlier.inner).ok()
+    }
+}
+
+impl From<litebox_common_linux::Timespec> for Instant {
+    fn from(inner: litebox_common_linux::Timespec) -> Self {
+        Instant { inner }
     }
 }
 
