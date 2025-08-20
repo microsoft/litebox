@@ -9,6 +9,8 @@ extern crate std;
 // Ensure we only init the platform once
 static INIT_FUNC: spin::Once = spin::Once::new();
 
+const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
+
 pub(crate) fn init_platform(tun_device_name: Option<&str>) {
     INIT_FUNC.call_once(|| {
         #[cfg(target_os = "linux")]
@@ -24,8 +26,7 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) {
                 .expect("Failed to set permissions on root");
         });
         let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(litebox);
-        let tar_ro_fs =
-            litebox::fs::tar_ro::FileSystem::new(litebox, litebox::fs::tar_ro::empty_tar_file());
+        let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(litebox, TEST_TAR_FILE.into());
         crate::set_fs(litebox::fs::layered::FileSystem::new(
             litebox,
             in_mem_fs,

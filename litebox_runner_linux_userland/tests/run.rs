@@ -233,7 +233,14 @@ fn test_runner_with_dynamic_lib(
         "failed to run litebox_runner_linux_userland {:?}",
         std::str::from_utf8(output.stderr.as_slice()).unwrap()
     );
-    output.stdout
+
+    // combine stdout and stderr
+    let combined = format!(
+        "{}\n{}",
+        std::str::from_utf8(output.stdout.as_slice()).unwrap(),
+        std::str::from_utf8(output.stderr.as_slice()).unwrap()
+    );
+    combined.into()
 }
 
 #[cfg(target_arch = "x86_64")]
