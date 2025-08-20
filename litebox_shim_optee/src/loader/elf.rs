@@ -297,7 +297,7 @@ fn get_trampoline_hdr(object: &mut ElfFileInMemory) -> Option<TrampolineHdr> {
             usize::try_from(trampoline_shdr.sh_offset).unwrap(),
         )
         .ok()?;
-    let trampoline: TrampolineSection = unsafe { core::mem::transmute(buf) };
+    let trampoline = unsafe { &*buf.as_ptr().cast::<TrampolineSection>() };
     // TODO: check section name instead of magic number
     if trampoline.magic_number != super::REWRITER_MAGIC_NUMBER {
         return None;
