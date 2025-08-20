@@ -52,6 +52,7 @@ fn test_runner_with_dynamic_lib(
     target: &Path,
     cmd_args: &[&str],
     install_files: fn(PathBuf),
+    unique_name: &str,
 ) -> Vec<u8> {
     let backend_str = match backend {
         Backend::Rewriter => "rewriter",
@@ -88,7 +89,7 @@ fn test_runner_with_dynamic_lib(
     };
 
     // create tar file containing all dependencies
-    let tar_dir = std::path::Path::new(dir_path.as_str()).join(format!("tar_files_{backend_str}"));
+    let tar_dir = std::path::Path::new(dir_path.as_str()).join(format!("tar_files_{unique_name}"));
     let dirs_to_create = ["lib64", "lib/x86_64-linux-gnu", "lib32"];
     for dir in dirs_to_create {
         std::fs::create_dir_all(tar_dir.join(dir)).unwrap();
@@ -174,11 +175,11 @@ fn test_runner_with_dynamic_lib(
 
     // create tar file using `tar` command
     let tar_file =
-        std::path::Path::new(dir_path.as_str()).join(format!("rootfs_{backend_str}.tar"));
+        std::path::Path::new(dir_path.as_str()).join(format!("rootfs_{unique_name}.tar"));
     let tar_data = std::process::Command::new("tar")
         .args([
             "-cvf",
-            format!("../rootfs_{backend_str}.tar").as_str(),
+            format!("../rootfs_{unique_name}.tar").as_str(),
             "lib",
             "lib32",
             "lib64",
@@ -233,14 +234,7 @@ fn test_runner_with_dynamic_lib(
         "failed to run litebox_runner_linux_userland {:?}",
         std::str::from_utf8(output.stderr.as_slice()).unwrap()
     );
-
-    // combine stdout and stderr
-    let combined = format!(
-        "{}\n{}",
-        std::str::from_utf8(output.stdout.as_slice()).unwrap(),
-        std::str::from_utf8(output.stderr.as_slice()).unwrap()
-    );
-    combined.into()
+    output.stdout
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -254,25 +248,29 @@ const HELLO_WORLD_INIT_FILES: [&str; 2] = ["/lib/ld-linux.so.2", "/lib32/libc.so
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_runner_with_dynamic_lib_rewriter() {
-    let target = compile(HELLO_WORLD_C, "hello_lib_rewriter", false);
+    let unique_name = "hello_lib_rewriter";
+    let target = compile(HELLO_WORLD_C, unique_name, false);
     test_runner_with_dynamic_lib(
         Backend::Rewriter,
         &HELLO_WORLD_INIT_FILES,
         &target,
         &[],
         |_| {},
+        unique_name,
     );
 }
 
 #[test]
 fn test_runner_with_dynamic_lib_seccomp() {
-    let target = compile(HELLO_WORLD_C, "hello_lib_seccomp", false);
+    let unique_name = "hello_lib_seccomp";
+    let target = compile(HELLO_WORLD_C, unique_name, false);
     test_runner_with_dynamic_lib(
         Backend::Seccomp,
         &HELLO_WORLD_INIT_FILES,
         &target,
         &[],
         |_| {},
+        unique_name,
     );
 }
 
@@ -320,6 +318,7 @@ console.log(content);
             // write the test js file to the output directory
             std::fs::write(out_dir.join("hello_world.js"), HELLO_WORLD_JS).unwrap();
         },
+        "hello_node_seccomp",
     );
 }
 
@@ -338,11 +337,12 @@ fn test_runner_with_ls() {
         &ls_path,
         &["-a"],
         |_| {},
+        "ls_seccomp",
     );
 
     let output_str = String::from_utf8_lossy(&output);
     let normalized = output_str.split_whitespace().collect::<Vec<_>>();
-    for each in [".", "..", "lib", "out", "lib64", "usr"] {
+    for each in [".", "..", "lib", "lib64", "usr"] {
         assert!(
             normalized.contains(&each),
             "unexpected ls output:\n{output_str}",

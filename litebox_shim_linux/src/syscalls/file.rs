@@ -974,12 +974,6 @@ pub(crate) fn sys_getdirent64(fd: i32, dirp: MutPtr<u8>, count: usize) -> Result
     let off = 0;
 
     let mut entries = litebox_fs().read_dir(file)?;
-    litebox::log_println!(
-        litebox_platform_multiplex::platform(),
-        "gedirent: {:?}. {}",
-        entries,
-        dir_off,
-    );
     entries.sort_by(|a, b| a.name.cmp(&b.name));
 
     for entry in entries.iter().skip(dir_off) {
