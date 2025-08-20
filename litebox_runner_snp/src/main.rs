@@ -73,63 +73,13 @@ pub extern "C" fn sandbox_kernel_init(
     litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::exit();
 }
 
-const ROOTFS: &[u8] = include_bytes!("./test.tar");
-
 /// Initializes the sandbox process.
-///
-/// # Panics
-///
-/// Panics if the CString creation fails (which should not happen with valid UTF-8 strings).
 #[unsafe(no_mangle)]
 pub extern "C" fn sandbox_process_init(
-    pt_regs: &mut litebox_common_linux::PtRegs,
+    _pt_regs: &mut litebox_common_linux::PtRegs,
     // boot_params: &'static litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params,
 ) {
-    let pgd = litebox_platform_linux_kernel::arch::PhysAddr::new_truncate(
-        litebox_platform_linux_kernel::arch::instructions::cr3()
-            & !(litebox::mm::linux::PAGE_SIZE as u64 - 1),
-    );
-    let platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel::new(pgd);
-    litebox::log_println!(platform, "sandbox_process_init called");
-
-    let litebox = litebox::LiteBox::new(platform);
-    let in_mem_fs = litebox::fs::in_mem::FileSystem::new(&litebox);
-    let tar_ro = litebox::fs::tar_ro::FileSystem::new(&litebox, ROOTFS.into());
-    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&litebox);
-    let fs = litebox::fs::layered::FileSystem::new(
-        &litebox,
-        in_mem_fs,
-        litebox::fs::layered::FileSystem::new(
-            &litebox,
-            dev_stdio,
-            tar_ro,
-            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
-        ),
-        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
-    );
-    litebox_shim_linux::set_fs(fs);
-    litebox_platform_multiplex::set_platform(platform);
-
-    let aux = litebox_shim_linux::loader::auxv::init_auxv();
-    let loaded_program = match litebox_shim_linux::loader::load_program(
-        "/test",
-        alloc::vec![alloc::ffi::CString::new("/test").unwrap()],
-        alloc::vec![],
-        aux,
-    ) {
-        Ok(program) => program,
-        Err(err) => {
-            litebox::log_println!(platform, "failed to load program: {}", err);
-            litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
-                globals::SM_SEV_TERM_SET,
-                globals::SM_TERM_GENERAL,
-            );
-        }
-    };
-
-    pt_regs.rip = loaded_program.entry_point;
-    pt_regs.rsp = loaded_program.user_stack_top;
-    pt_regs.rdx = 0;
+    todo!()
 }
 
 #[unsafe(no_mangle)]
@@ -160,6 +110,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     } else {
         ghcb_prints("panic occurred but can't get location information...");
     }
-    litebox_platform_multiplex::platform()
-        .terminate(globals::SM_SEV_TERM_SET, globals::SM_TERM_GENERAL);
+    litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
+        globals::SM_SEV_TERM_SET,
+        globals::SM_TERM_GENERAL,
+    );
 }
