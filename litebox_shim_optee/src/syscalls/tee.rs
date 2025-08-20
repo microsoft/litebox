@@ -86,9 +86,14 @@ pub fn sys_check_access_rights(
 
     let start = NonZeroAddress::<PAGE_SIZE>::new(align_down(buf.as_usize(), PAGE_SIZE))
         .ok_or(TeeResult::AccessConflict)?;
-    let len = NonZeroPageSize::<PAGE_SIZE>::new(align_up(len, PAGE_SIZE))
-        .ok_or(TeeResult::AccessConflict)?;
-    if let Some(perms) = litebox_page_manager().get_memory_permissions(start, len) {
+    let aligned_len = {
+        let len = len
+            .checked_add(buf.as_usize() - align_down(buf.as_usize(), PAGE_SIZE))
+            .ok_or(TeeResult::AccessConflict)?;
+        NonZeroPageSize::<PAGE_SIZE>::new(align_up(len, PAGE_SIZE))
+            .ok_or(TeeResult::AccessConflict)?
+    };
+    if let Some(perms) = litebox_page_manager().get_memory_permissions(start, aligned_len) {
         if (flags.contains(TeeMemoryAccessRights::TEE_MEMORY_ACCESS_READ)
             && !perms.contains(MemoryRegionPermissions::READ))
             || (flags.contains(TeeMemoryAccessRights::TEE_MEMORY_ACCESS_WRITE)
