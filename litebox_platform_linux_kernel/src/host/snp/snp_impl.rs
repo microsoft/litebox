@@ -2,7 +2,7 @@
 
 use core::arch::asm;
 
-use litebox::platform::{RawConstPointer, RawMutPointer};
+use litebox::platform::{RawConstPointer, RawMutPointer, ThreadLocalStorageProvider};
 use litebox_common_linux::{SigSet, SigmaskHow};
 
 use super::ghcb::ghcb_prints;
@@ -69,6 +69,75 @@ mod alloc {
         unsafe fn mem_free_pages(ptr: *mut u8, order: u32) {
             unsafe { SNP_ALLOCATOR.free_pages(ptr, order) }
         }
+    }
+}
+
+fn current() -> Option<&'static mut bindings::vsbox_task> {
+    let task: u64;
+    unsafe {
+        asm!("rdgsbase {}", out(reg) task, options(nostack, preserves_flags));
+
+        let addr = crate::arch::VirtAddr::new(task);
+        if addr.is_null() {
+            return None;
+        }
+
+        Some(&mut *addr.as_mut_ptr())
+    }
+}
+
+impl SnpLinuxKernel {
+    pub fn set_init_tls(&self, boot_params: &bindings::vmpl2_boot_params) {
+        let task = ::alloc::boxed::Box::new(litebox_common_linux::Task {
+            pid: boot_params.pid,
+            tid: boot_params.pid,
+            ppid: boot_params.ppid,
+            clear_child_tid: None,
+            robust_list: None,
+            credentials: ::alloc::sync::Arc::new(litebox_common_linux::Credentials {
+                uid: boot_params.uid as usize,
+                gid: boot_params.gid as usize,
+                euid: boot_params.euid as usize,
+                egid: boot_params.egid as usize,
+            }),
+        });
+        let tls = litebox_common_linux::ThreadLocalStorage::new(task);
+        self.set_thread_local_storage(tls);
+    }
+}
+
+impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
+    type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<SnpLinuxKernel>;
+
+    fn set_thread_local_storage(&self, value: Self::ThreadLocalStorage) {
+        let current_task = current().expect("Current task must be available");
+        assert!(current_task.tls.is_null(), "TLS should not be set yet");
+        let tls = ::alloc::boxed::Box::new(value);
+        current_task.tls = ::alloc::boxed::Box::into_raw(tls).cast();
+    }
+
+    fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
+    {
+        let current_task = current().expect("Current task must be available");
+        assert!(!current_task.tls.is_null(), "TLS should be set");
+        let tls = unsafe { &mut *current_task.tls.cast::<Self::ThreadLocalStorage>() };
+        assert!(!tls.borrowed, "TLS should not be borrowed");
+        tls.borrowed = true; // mark as borrowed
+        let ret = f(tls);
+        tls.borrowed = false; // mark as not borrowed
+        ret
+    }
+
+    fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
+        let current_task = current().expect("Current task must be available");
+        assert!(!current_task.tls.is_null(), "TLS should be set");
+        let tls = unsafe {
+            ::alloc::boxed::Box::from_raw(current_task.tls.cast::<Self::ThreadLocalStorage>())
+        };
+        current_task.tls = ::core::ptr::null_mut();
+        *tls
     }
 }
 
