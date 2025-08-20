@@ -1,15 +1,24 @@
 use anyhow::Result;
 use clap::Parser;
-use litebox_common_optee::{TeeParamType, UteeEntryFunc, UteeParams};
+use litebox::platform::ThreadLocalStorageProvider;
+use litebox_common_optee::UteeEntryFunc;
 use litebox_platform_multiplex::Platform;
+use litebox_shim_optee::{
+    UteeParamsTyped, optee_command_dispatcher, register_session_id_elf_load_info,
+    submit_optee_command,
+};
+use serde::Deserialize;
 use std::path::PathBuf;
 
 /// Test OP-TEE TAs with LiteBox on unmodified Linux
 #[derive(Parser, Debug)]
 pub struct CliArgs {
-    /// The TA and arguments passed to it
-    #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
-    pub program_and_arguments: Vec<String>,
+    /// Trusted Application (TA)
+    #[arg(required = true, value_hint = clap::ValueHint::ExecutablePath)]
+    pub program: String,
+    /// JSON-formatted command sequence to pass to the TA
+    #[arg(required = true, value_hint = clap::ValueHint::FilePath)]
+    pub command_sequence: String,
     /// Allow using unstable options
     #[arg(short = 'Z', long = "unstable")]
     pub unstable: bool,
@@ -53,7 +62,7 @@ pub enum InterceptionBackend {
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<()> {
     let prog_data: Vec<u8> = {
-        let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
+        let prog = PathBuf::from(&cli_args.program);
         let data = std::fs::read(prog).unwrap();
         #[allow(clippy::let_and_return)]
         let data = if cli_args.rewrite_syscalls {
@@ -66,6 +75,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             data
         };
         data
+    };
+
+    // This runner supports JSON-formatted OP-TEE TA command sequence for ease of development and testing.
+    let ta_commands: Vec<TaCommandBase64> = {
+        let json_path = PathBuf::from(&cli_args.command_sequence);
+        let json_str = std::fs::read_to_string(json_path)?;
+        serde_json::from_str(&json_str)?
     };
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
@@ -81,47 +97,140 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         InterceptionBackend::Rewriter => {}
     }
 
-    // TODO: obtain these parameters, function ID, and command ID from the command line arguments or
-    // some other means (e.g., config file).
-    let mut params = UteeParams::new();
-    params.set_type(0, TeeParamType::None).unwrap();
-    params.set_type(1, TeeParamType::None).unwrap();
-    params.set_type(2, TeeParamType::None).unwrap();
-    params.set_type(3, TeeParamType::None).unwrap();
-    let params = params;
+    let loaded_program = litebox_shim_optee::loader::load_elf_buffer(prog_data.as_slice()).unwrap();
 
-    let loaded_program =
-        litebox_shim_optee::loader::load_elf_buffer(prog_data.as_slice(), &params).unwrap();
+    // Currently, this runner supports a single TA session. Also, for simplicity,
+    // it uses `tid` stored in LiteBox's TLS as a session ID.
+    let tid = litebox_platform_multiplex::platform()
+        .with_thread_local_storage_mut(|tls| tls.current_task.tid);
+    #[allow(clippy::cast_sign_loss)]
+    let session_id = tid as u32;
 
-    // TODO: we need an event loop here, because TAs expect repetitive entrances with
-    // different arguments (i.e., different function ID, different command ID, and different `UteeParams`).
-    // session ID is determined by the kernel (this runner in this case).
-    unsafe {
-        jump_to_entry_point(
-            usize::try_from(UteeEntryFunc::OpenSession as u32)
-                .expect("UteeEntryFunc should fit in usize"),
-            1,
-            loaded_program.params_address,
-            0,
-            loaded_program.entry_point,
-            loaded_program.user_stack_top,
-        );
+    assert!(
+        register_session_id_elf_load_info(session_id, loaded_program),
+        "session ID {session_id} already exists"
+    );
+
+    populate_optee_command_queue(session_id, &ta_commands);
+    optee_command_dispatcher(session_id, false);
+}
+
+/// OP-TEE/TA message command (base64 encoded). It consists of a function ID,
+/// command ID, and up to four arguments. This is base64 encoded to enable
+/// JSON-formatted input files.
+/// TODO: use JSON Schema if we need to validate JSON or we could use Protobuf instead
+#[derive(Debug, Deserialize)]
+struct TaCommandBase64 {
+    func_id: TaEntryFunc,
+    #[serde(default)]
+    cmd_id: u32,
+    #[serde(default)]
+    args: Vec<TaCommandParamsBase64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaEntryFunc {
+    OpenSession,
+    CloseSession,
+    InvokeCommand,
+}
+
+/// An argument of OP-TEE/TA message command (base64 encoded). It consists of
+/// a type and two 64-bit values/references. This is base64 encoded to enable
+/// JSON-formatted input files.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "param_type", rename_all = "snake_case")]
+enum TaCommandParamsBase64 {
+    ValueInput {
+        value_a: u64,
+        value_b: u64,
+    },
+    ValueOutput {},
+    ValueInout {
+        value_a: u64,
+        value_b: u64,
+    },
+    MemrefInput {
+        data_base64: String,
+    },
+    MemrefOutput {
+        buffer_size: u64,
+    },
+    MemrefInout {
+        data_base64: String,
+        buffer_size: u64,
+    },
+}
+
+impl TaCommandParamsBase64 {
+    pub fn as_utee_params_typed(&self) -> UteeParamsTyped {
+        match self {
+            TaCommandParamsBase64::ValueInput { value_a, value_b } => UteeParamsTyped::ValueInput {
+                value_a: *value_a,
+                value_b: *value_b,
+            },
+            TaCommandParamsBase64::ValueOutput {} => UteeParamsTyped::ValueOutput {},
+            TaCommandParamsBase64::ValueInout { value_a, value_b } => UteeParamsTyped::ValueInout {
+                value_a: *value_a,
+                value_b: *value_b,
+            },
+            TaCommandParamsBase64::MemrefInput { data_base64 } => UteeParamsTyped::MemrefInput {
+                data: Self::decode_base64(data_base64).into_boxed_slice(),
+            },
+            TaCommandParamsBase64::MemrefOutput { buffer_size } => UteeParamsTyped::MemrefOutput {
+                buffer_size: usize::try_from(*buffer_size).unwrap(),
+            },
+            TaCommandParamsBase64::MemrefInout {
+                data_base64,
+                buffer_size,
+            } => {
+                let decoded_data = Self::decode_base64(data_base64);
+                let buffer_size = usize::try_from(*buffer_size).unwrap();
+                assert!(
+                    buffer_size >= decoded_data.len(),
+                    "Buffer size is smaller than input data size"
+                );
+                UteeParamsTyped::MemrefInout {
+                    data: decoded_data.into_boxed_slice(),
+                    buffer_size,
+                }
+            }
+        }
+    }
+
+    fn decode_base64(data_base64: &str) -> Vec<u8> {
+        let buf_size = base64::decoded_len_estimate(data_base64.len());
+        let mut buffer = vec![0u8; buf_size];
+        let length = base64::engine::Engine::decode_slice(
+            &base64::engine::general_purpose::STANDARD,
+            data_base64.as_bytes(),
+            buffer.as_mut_slice(),
+        )
+        .expect("Failed to decode base64 data");
+        buffer.truncate(length);
+        buffer
     }
 }
 
-/// TAs obtain four arguments through CPU registers:
-/// - rdi: function ID
-/// - rsi: session ID
-/// - rdx: the address of parameters
-/// - rcx: command ID
-#[unsafe(naked)]
-unsafe extern "C" fn jump_to_entry_point(
-    func: usize,
-    session_id: usize,
-    params: usize,
-    cmd_id: usize,
-    entry_point: usize,
-    user_stack_top: usize,
-) -> ! {
-    core::arch::naked_asm!("mov rsp, r9", "jmp r8", "hlt");
+fn populate_optee_command_queue(session_id: u32, ta_commands: &[TaCommandBase64]) {
+    for ta_command in ta_commands {
+        assert!(
+            (ta_command.args.len() <= UteeParamsTyped::TEE_NUM_PARAMS),
+            "ta_command has more than four arguments."
+        );
+
+        let mut params = [const { UteeParamsTyped::None }; UteeParamsTyped::TEE_NUM_PARAMS];
+        for (param, arg) in params.iter_mut().zip(&ta_command.args) {
+            *param = arg.as_utee_params_typed();
+        }
+
+        let func_id = match ta_command.func_id {
+            TaEntryFunc::OpenSession => UteeEntryFunc::OpenSession,
+            TaEntryFunc::CloseSession => UteeEntryFunc::CloseSession,
+            TaEntryFunc::InvokeCommand => UteeEntryFunc::InvokeCommand,
+        };
+
+        submit_optee_command(session_id, func_id, params, ta_command.cmd_id);
+    }
 }

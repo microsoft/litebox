@@ -73,6 +73,29 @@ impl From<MemoryRegionPermissions> for VmFlags {
     }
 }
 
+impl From<VmFlags> for MemoryRegionPermissions {
+    fn from(value: VmFlags) -> Self {
+        let mut flags = MemoryRegionPermissions::empty();
+        flags.set(
+            MemoryRegionPermissions::READ,
+            value.contains(VmFlags::VM_READ),
+        );
+        flags.set(
+            MemoryRegionPermissions::WRITE,
+            value.contains(VmFlags::VM_WRITE),
+        );
+        flags.set(
+            MemoryRegionPermissions::EXEC,
+            value.contains(VmFlags::VM_EXEC),
+        );
+        flags.set(
+            MemoryRegionPermissions::SHARED,
+            value.contains(VmFlags::VM_SHARED),
+        );
+        flags
+    }
+}
+
 const DEFAULT_RESERVED_SPACE_SIZE: usize = 0x100_0000; // 16 MiB
 
 bitflags::bitflags! {
@@ -673,33 +696,28 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ///
     /// `op` is a callback for caller to initialize the created pages.
     ///
-    /// `before_perms` and `after_perms` are the permissions to set before and after the call to `op`.
+    /// `perm` is the permissions to set for the created pages.
     ///
     /// # Safety
     ///
-    /// Note that if the suggested address is given and `fixed_addr` is set to `true`,
+    /// Note that if the suggested address is given and [`CreatePagesFlags::FIXED_ADDR`] is set,
     /// the kernel uses it directly without checking if it is available, causing overlapping
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     ///
     /// Also, caller must ensure flags are set correctly.
-    pub(super) unsafe fn create_pages<F>(
+    pub(super) unsafe fn create_pages(
         &mut self,
         suggested_new_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
         flags: CreatePagesFlags,
-        before_perms: MemoryRegionPermissions,
-        after_perms: MemoryRegionPermissions,
-        op: F,
-    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
-    where
-        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
-    {
-        let addr = unsafe {
+        perms: MemoryRegionPermissions,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        unsafe {
             self.create_mapping(
                 suggested_new_address,
                 length,
                 VmArea::new(
-                    VmFlags::from(before_perms)
+                    VmFlags::from(perms)
                         | VmFlags::VM_MAY_ACCESS_FLAGS
                         | if flags.contains(CreatePagesFlags::IS_STACK) {
                             VmFlags::VM_GROWSDOWN
@@ -711,25 +729,30 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 flags,
             )
         }
-        .ok_or(MappingError::OutOfMemory)?;
-        // call the user function with the pages
-        if let Err(e) = op(addr) {
-            // remove the mapping if the user function fails
-            unsafe {
-                self.remove_mapping(
-                    PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap(),
-                )
+        .ok_or(MappingError::OutOfMemory)
+    }
+
+    /// Get the memory permissions of a given address range.
+    ///
+    /// `page_range` specifies the range of pages to check the memory permissions.
+    /// This function returns `MemoryRegionPermissions` only if the range is valid.
+    pub(super) fn get_memory_permissions(
+        &self,
+        page_range: PageRange<ALIGN>,
+    ) -> Option<MemoryRegionPermissions> {
+        let (range_start, range_end) = (page_range.start, page_range.end);
+        let range: core::ops::Range<usize> = page_range.into();
+        if let Some(iter) = self.overlapping(range).next() {
+            if iter.0.start > range_start || iter.0.end < range_end {
+                // partial overlap implies that the given range contains unmapped pages or
+                // consists of memory pages with different permissions.
+                return None;
             }
-            .unwrap();
-            return Err(e);
+            let vmflags = iter.1.flags();
+            Some(vmflags.into())
+        } else {
+            None
         }
-        if before_perms != after_perms {
-            let range =
-                PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap();
-            // `protect` should succeed, as we just created the mapping.
-            unsafe { self.protect_mapping(range, after_perms) }.expect("failed to protect mapping");
-        }
-        Ok(addr)
     }
 
     /*================================Internal Functions================================ */
