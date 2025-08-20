@@ -233,7 +233,7 @@ pub struct Instant(u64);
 
 impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
     type Instant = Instant;
-    type Timespec = ();
+    type Timespec = litebox_common_linux::Timespec;
 
     fn now(&self) -> Self::Instant {
         Instant::now()
