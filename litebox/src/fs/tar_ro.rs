@@ -483,18 +483,26 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn with_metadata<T: core::any::Any, R>(
         &self,
-        _fd: &FileFd<Platform>,
-        _f: impl FnOnce(&T) -> R,
+        fd: &FileFd<Platform>,
+        f: impl FnOnce(&T) -> R,
     ) -> Result<R, super::errors::MetadataError> {
-        Err(super::errors::MetadataError::NoSuchMetadata)
+        match &self.litebox.descriptor_table().get_entry(fd).entry {
+            Descriptor::File { metadata, .. } | Descriptor::Dir { metadata, .. } => Ok(f(metadata
+                .get::<T>()
+                .ok_or(super::errors::MetadataError::NoSuchMetadata)?)),
+        }
     }
 
     fn with_metadata_mut<T: core::any::Any, R>(
         &self,
-        _fd: &FileFd<Platform>,
-        _f: impl FnOnce(&mut T) -> R,
+        fd: &FileFd<Platform>,
+        f: impl FnOnce(&mut T) -> R,
     ) -> Result<R, super::errors::MetadataError> {
-        Err(super::errors::MetadataError::NoSuchMetadata)
+        match &mut self.litebox.descriptor_table().get_entry_mut(fd).entry {
+            Descriptor::File { metadata, .. } | Descriptor::Dir { metadata, .. } => Ok(f(metadata
+                .get_mut::<T>()
+                .ok_or(super::errors::MetadataError::NoSuchMetadata)?)),
+        }
     }
 
     fn set_file_metadata<T: core::any::Any>(
