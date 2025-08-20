@@ -72,6 +72,7 @@ mod alloc {
     }
 }
 
+/// Get the current task
 fn current() -> Option<&'static mut bindings::vsbox_task> {
     let task: u64;
     unsafe {
