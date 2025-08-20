@@ -4,20 +4,28 @@ use alloc::{ffi::CString, string::ToString};
 use core::ptr::NonNull;
 use elf_loader::{
     Loader,
-    mmap::{MapFlags, Mmap, ProtFlags},
+    mmap::{MapFlags, ProtFlags},
     object::ElfObject,
 };
 use hashbrown::HashMap;
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE},
-    platform::{RawConstPointer as _, SystemInfoProvider},
-    utils::TruncateExt,
+    platform::RawConstPointer as _,
 };
 use litebox_common_linux::errno::Errno;
 use once_cell::race::OnceBox;
 use thiserror::Error;
 
-use crate::{MutPtr, litebox_page_manager};
+use crate::MutPtr;
+
+#[cfg(feature = "platform_linux_userland")]
+use crate::litebox_page_manager;
+#[cfg(feature = "platform_linux_userland")]
+use elf_loader::mmap::Mmap;
+#[cfg(feature = "platform_linux_userland")]
+use litebox::platform::SystemInfoProvider;
+#[cfg(feature = "platform_linux_userland")]
+use litebox::utils::TruncateExt;
 
 /// Data structure to maintain a mapping of fd to in-memory TA ELF files.
 /// This is needed because [`elf_loader`] uses file- or fd-backed `mmap` to load ELF files
@@ -90,6 +98,7 @@ impl ElfFileInMemory {
         })
     }
 
+    #[allow(dead_code)]
     fn size(&self) -> usize {
         self.buffer.len()
     }
@@ -237,15 +246,20 @@ pub struct ElfLoadInfo {
     pub stack_base: usize,
 }
 
+#[cfg(feature = "platform_linux_userland")]
 #[cfg(target_arch = "x86_64")]
 type Ehdr = elf::file::Elf64_Ehdr;
+#[cfg(feature = "platform_linux_userland")]
 #[cfg(target_arch = "x86")]
 type Ehdr = elf::file::Elf32_Ehdr;
+#[cfg(feature = "platform_linux_userland")]
 #[cfg(target_arch = "x86_64")]
 type Shdr = elf::section::Elf64_Shdr;
+#[cfg(feature = "platform_linux_userland")]
 #[cfg(target_arch = "x86")]
 type Shdr = elf::section::Elf32_Shdr;
 
+#[cfg(feature = "platform_linux_userland")]
 #[repr(C, packed)]
 struct TrampolineSection {
     magic_number: u64,
@@ -253,6 +267,7 @@ struct TrampolineSection {
     trampoline_size: u64,
 }
 
+#[cfg(feature = "platform_linux_userland")]
 #[derive(Debug)]
 struct TrampolineHdr {
     /// The virtual memory of the trampoline code.
@@ -264,6 +279,7 @@ struct TrampolineHdr {
 }
 
 /// Get the trampoline header from the ELF file.
+#[cfg(feature = "platform_linux_userland")]
 fn get_trampoline_hdr(object: &mut ElfFileInMemory) -> Option<TrampolineHdr> {
     let mut buf: [u8; size_of::<Ehdr>()] = [0; size_of::<Ehdr>()];
     object.read(&mut buf, 0).unwrap();
@@ -311,6 +327,7 @@ fn get_trampoline_hdr(object: &mut ElfFileInMemory) -> Option<TrampolineHdr> {
     })
 }
 
+#[cfg(feature = "platform_linux_userland")]
 fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize {
     // Our rewriter ensures that both `trampoline.vaddr` and `trampoline.file_offset` are page-aligned.
     // Otherwise, `ElfLoaderMmap::mmap` will fail and panic.
@@ -380,10 +397,12 @@ impl ElfLoader {
         let fd = fd_elf_map
             .register_elf(elf_buf)
             .map_err(ElfLoaderError::OpenError)?;
+        #[allow(unused_mut)]
         let mut object = fd_elf_map
             .get(fd)
             .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
 
+        #[cfg(feature = "platform_linux_userland")]
         let trampoline = get_trampoline_hdr(&mut object);
 
         let elf = loader
@@ -393,6 +412,7 @@ impl ElfLoader {
         let entry = elf.entry();
         let base = elf.base();
 
+        #[cfg(feature = "platform_linux_userland")]
         if let Some(trampoline) = trampoline {
             load_trampoline(trampoline, base, fd);
         }

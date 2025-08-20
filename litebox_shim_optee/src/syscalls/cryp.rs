@@ -25,7 +25,7 @@ pub(crate) fn sys_cryp_state_alloc(
         if tee_obj_map().is_busy(key1) {
             return Err(TeeResult::BadParameters);
         }
-        // TODO: check key type
+        // TODO: validate key type
     }
     if key2 != TeeObjHandle::NULL {
         if !tee_obj_map().exists(key2) {
@@ -34,10 +34,10 @@ pub(crate) fn sys_cryp_state_alloc(
         if tee_obj_map().is_busy(key2) {
             return Err(TeeResult::BadParameters);
         }
-        // TODO: check key type
+        // TODO: validate key type
     }
 
-    // TODO: check whether the number of keys is valid for the algorithm
+    // TODO: validate whether the number of keys is valid
 
     let cryp_state = TeeCrypState::new(
         algo,
@@ -162,7 +162,7 @@ fn do_cipher_update(
     src_slice: &[u8],
     dst_slice: &mut [u8],
     dst_len: &mut usize,
-    _last_block: bool,
+    last_block: bool,
 ) -> Result<(), TeeResult> {
     if dst_slice.len() < src_slice.len() {
         return Err(TeeResult::ShortBuffer);
@@ -183,7 +183,9 @@ fn do_cipher_update(
             }
             *dst_len = src_slice.len();
         }
-        // TODO: support algorithms which have a certain finalization logic
+        if last_block {
+            todo!("support algorithms which have a certain finalization logic");
+        }
         Ok(())
     } else {
         Err(TeeResult::BadParameters)
