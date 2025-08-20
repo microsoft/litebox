@@ -150,8 +150,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
                         // fallthrough
                     }
                     Ok(UnblockedOrTimedOut::TimedOut) => {
-                        self.decrement_num_waiters_at(addr);
-                        return Err(FutexError::TimedOut);
+                        continue;
                     }
                     Err(ImmediatelyWokenUp) => unreachable!(),
                 }
