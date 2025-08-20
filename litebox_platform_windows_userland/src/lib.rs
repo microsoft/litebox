@@ -187,6 +187,20 @@ impl WindowsUserland {
         let mut sys_info = Win32_SysInfo::SYSTEM_INFO::default();
         Self::get_system_information(&mut sys_info);
 
+        // TODO(chuqi): Currently we just print system information for
+        // `TASK_ADDR_MIN` and `TASK_ADDR_MAX`.
+        // Will remove these prints once we have a better way to replace
+        // the current `const` values in PageManagementProvider.
+        println!("System information.");
+        println!(
+            "=> Max user address: {:#x}",
+            sys_info.lpMaximumApplicationAddress as usize
+        );
+        println!(
+            "=> Min user address: {:#x}",
+            sys_info.lpMinimumApplicationAddress as usize
+        );
+
         let reserved_pages = Self::read_memory_maps();
 
         let platform = Self {
@@ -752,6 +766,12 @@ fn do_query_on_region(mbi: &mut Win32_Memory::MEMORY_BASIC_INFORMATION, base_add
 }
 
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
+    // TODO(chuqi): These are currently "magic numbers" grabbed from my Windows 11 SystemInformation.
+    // The actual values should be determined by `GetSystemInfo()`.
+    //
+    // NOTE: make sure the values are PAGE_ALIGNED.
+    const TASK_ADDR_MIN: usize = 0x1_0000;
+    const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
@@ -767,6 +787,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // 1) In case we have a suggested VA range, we first check and deal with the case
         // that the address (range) is already reserved.
         if suggested_range.start != 0 {
+            assert!(suggested_range.start as usize >= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
+                                                            TASK_ADDR_MIN);
+            assert!(suggested_range.end as usize <= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
+                                                            TASK_ADDR_MAX);
+
             let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
             do_query_on_region(&mut mbi, base_addr);
 

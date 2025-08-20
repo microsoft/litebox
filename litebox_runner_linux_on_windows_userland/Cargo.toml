@@ -11,6 +11,6 @@ litebox_platform_windows_userland = { version = "0.1.0", path = "../litebox_plat
 litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_multiplex", default-features = false, features = ["platform_windows_userland"] }
 litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux", default-features = false, features = ["platform_windows_userland"] }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }
-
+windows-sys = { version = "0.60.2", features = [ "Win32_Storage_FileSystem" ] }
 [lints]
 workspace = true
