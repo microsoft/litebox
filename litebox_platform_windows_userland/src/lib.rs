@@ -18,13 +18,14 @@ use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox_common_linux::PunchthroughSyscall;
+use rangemap::RangeSet;
 
 use windows_sys::Win32::Foundation as Win32_Foundation;
 use windows_sys::Win32::{
     Foundation::{GetLastError, WIN32_ERROR},
     System::Diagnostics::Debug::{
-        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
-        EXCEPTION_POINTERS,
+        self as Win32_Debug, AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION,
+        EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
     },
     System::Memory::{
         self as Win32_Memory, PrefetchVirtualMemory, VirtualAlloc2, VirtualFree, VirtualProtect,
@@ -108,6 +109,17 @@ impl Drop for TlsSlot {
     }
 }
 
+/// Information about a system reservation-granularity (64KB)-aligned allocation region
+#[derive(Debug, Clone)]
+struct AllocationInfo {
+    /// The reservation granularity (64KB)-aligned range that this AllocationInfo represents
+    current_granularity_range: core::ops::Range<usize>,
+    /// The actual full range reserved by VirtualAlloc2 that contains this granularity range
+    full_reserved_range: core::ops::Range<usize>,
+    /// Set of subranges currently in use within this granularity range
+    used_subranges: RangeSet<usize>,
+}
+
 /// The userland Windows platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
@@ -116,6 +128,8 @@ pub struct WindowsUserland {
     tls_slot: TlsSlot,
     reserved_pages: alloc::vec::Vec<core::ops::Range<usize>>,
     sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
+    /// Track reservation granularity (64KB)-aligned allocations for bookkeeping
+    allocation_tracker: std::sync::RwLock<std::collections::BTreeMap<usize, AllocationInfo>>,
 }
 
 // Safety: Given that SYSTEM_INFO is not Send/Sync (it contains *mut c_void), we use RwLock to
@@ -207,6 +221,7 @@ impl WindowsUserland {
             tls_slot: TlsSlot::new().expect("Failed to create TLS slot!"),
             reserved_pages: reserved_pages,
             sys_info: std::sync::RwLock::new(sys_info),
+            allocation_tracker: std::sync::RwLock::new(std::collections::BTreeMap::new()),
         };
         platform.set_init_tls();
 
@@ -285,11 +300,6 @@ impl WindowsUserland {
         x & !(gran - 1)
     }
 
-    fn is_aligned_to_granu(&self, x: usize) -> bool {
-        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
-        x % gran == 0
-    }
-
     fn set_init_tls(&self) {
         // TODO: Currently we are using a static thread ID and credentials (faked).
         // This is a placeholder for future implementation to use passthrough.
@@ -325,6 +335,7 @@ impl litebox::platform::ExitProvider for WindowsUserland {
             tls_slot: _,
             sys_info: _,
             reserved_pages: _,
+            allocation_tracker: _,
         } = self;
         // TODO: Implement Windows process exit
         // For now, use standard process exit
