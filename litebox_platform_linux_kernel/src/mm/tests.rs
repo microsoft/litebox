@@ -216,7 +216,7 @@ fn test_vmm_page_fault() {
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
     let platform = MockKernel::new(p4.start_address());
     let litebox = LiteBox::new(platform);
-    let mut vmm = PageManager::<_, PAGE_SIZE>::new(&litebox);
+    let vmm = PageManager::<_, PAGE_SIZE>::new(&litebox);
     unsafe {
         assert_eq!(
             vmm.create_writable_pages(

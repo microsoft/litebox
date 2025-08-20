@@ -515,7 +515,7 @@ where
     ///
     /// This should only be called from the kernel page fault handler.
     pub unsafe fn handle_page_fault(
-        &mut self,
+        &self,
         fault_addr: usize,
         error_code: u64,
     ) -> Result<(), PageFaultError> {

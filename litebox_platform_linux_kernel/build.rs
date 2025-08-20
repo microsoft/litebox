@@ -9,6 +9,7 @@ fn build_binding_from_sandbox_driver() {
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .allowlist_type("SnpVmplRequestArgs")
         .allowlist_type("vsbox_task")
+        .allowlist_type("vmpl2_boot_params")
         .allowlist_var("SNP_VMPL_.+")
         .use_core()
         .formatter(bindgen::Formatter::Rustfmt)

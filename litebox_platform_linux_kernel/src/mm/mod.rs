@@ -46,8 +46,11 @@ pub trait MemoryProvider {
 }
 
 #[cfg(all(target_arch = "x86_64", not(test)))]
-pub type PageTable<const ALIGN: usize> =
-    crate::arch::mm::paging::X64PageTable<'static, crate::host::snp::SnpLinuxKenrel, ALIGN>;
+pub type PageTable<const ALIGN: usize> = crate::arch::mm::paging::X64PageTable<
+    'static,
+    crate::host::snp::snp_impl::SnpLinuxKernel,
+    ALIGN,
+>;
 #[cfg(all(target_arch = "x86_64", test))]
 pub type PageTable<const ALIGN: usize> =
     crate::arch::mm::paging::X64PageTable<'static, crate::host::mock::MockKernel, ALIGN>;
