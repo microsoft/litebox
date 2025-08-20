@@ -696,33 +696,28 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ///
     /// `op` is a callback for caller to initialize the created pages.
     ///
-    /// `before_perms` and `after_perms` are the permissions to set before and after the call to `op`.
+    /// `perm` is the permissions to set for the created pages.
     ///
     /// # Safety
     ///
-    /// Note that if the suggested address is given and `fixed_addr` is set to `true`,
+    /// Note that if the suggested address is given and [`CreatePagesFlags::FIXED_ADDR`] is set,
     /// the kernel uses it directly without checking if it is available, causing overlapping
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     ///
     /// Also, caller must ensure flags are set correctly.
-    pub(super) unsafe fn create_pages<F>(
+    pub(super) unsafe fn create_pages(
         &mut self,
         suggested_new_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
         flags: CreatePagesFlags,
-        before_perms: MemoryRegionPermissions,
-        after_perms: MemoryRegionPermissions,
-        op: F,
-    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
-    where
-        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
-    {
-        let addr = unsafe {
+        perms: MemoryRegionPermissions,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        unsafe {
             self.create_mapping(
                 suggested_new_address,
                 length,
                 VmArea::new(
-                    VmFlags::from(before_perms)
+                    VmFlags::from(perms)
                         | VmFlags::VM_MAY_ACCESS_FLAGS
                         | if flags.contains(CreatePagesFlags::IS_STACK) {
                             VmFlags::VM_GROWSDOWN
@@ -734,25 +729,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 flags,
             )
         }
-        .ok_or(MappingError::OutOfMemory)?;
-        // call the user function with the pages
-        if let Err(e) = op(addr) {
-            // remove the mapping if the user function fails
-            unsafe {
-                self.remove_mapping(
-                    PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap(),
-                )
-            }
-            .unwrap();
-            return Err(e);
-        }
-        if before_perms != after_perms {
-            let range =
-                PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap();
-            // `protect` should succeed, as we just created the mapping.
-            unsafe { self.protect_mapping(range, after_perms) }.expect("failed to protect mapping");
-        }
-        Ok(addr)
+        .ok_or(MappingError::OutOfMemory)
     }
 
     /// Get the memory permissions of a given address range.
