@@ -73,6 +73,29 @@ impl From<MemoryRegionPermissions> for VmFlags {
     }
 }
 
+impl From<VmFlags> for MemoryRegionPermissions {
+    fn from(value: VmFlags) -> Self {
+        let mut flags = MemoryRegionPermissions::empty();
+        flags.set(
+            MemoryRegionPermissions::READ,
+            value.contains(VmFlags::VM_READ),
+        );
+        flags.set(
+            MemoryRegionPermissions::WRITE,
+            value.contains(VmFlags::VM_WRITE),
+        );
+        flags.set(
+            MemoryRegionPermissions::EXEC,
+            value.contains(VmFlags::VM_EXEC),
+        );
+        flags.set(
+            MemoryRegionPermissions::SHARED,
+            value.contains(VmFlags::VM_SHARED),
+        );
+        flags
+    }
+}
+
 const DEFAULT_RESERVED_SPACE_SIZE: usize = 0x100_0000; // 16 MiB
 
 bitflags::bitflags! {
@@ -730,6 +753,29 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             unsafe { self.protect_mapping(range, after_perms) }.expect("failed to protect mapping");
         }
         Ok(addr)
+    }
+
+    /// Get the memory permissions of a given address range.
+    ///
+    /// `page_range` specifies the range of pages to check the memory permissions.
+    /// This function returns `MemoryRegionPermissions` only if the range is valid.
+    pub(super) fn get_memory_permissions(
+        &self,
+        page_range: PageRange<ALIGN>,
+    ) -> Option<MemoryRegionPermissions> {
+        let (range_start, range_end) = (page_range.start, page_range.end);
+        let range: core::ops::Range<usize> = page_range.into();
+        if let Some(iter) = self.overlapping(range).next() {
+            if iter.0.start > range_start || iter.0.end < range_end {
+                // partial overlap implies that the given range contains unmapped pages or
+                // consists of memory pages with different permissions.
+                return None;
+            }
+            let vmflags = iter.1.flags();
+            Some(vmflags.into())
+        } else {
+            None
+        }
     }
 
     /*================================Internal Functions================================ */
