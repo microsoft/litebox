@@ -454,6 +454,85 @@ pub(crate) fn sys_get_robust_list(
     unsafe { head_ptr.write_at_offset(0, head) }.ok_or(Errno::EFAULT)
 }
 
+/// Handle syscall `clock_gettime`.
+pub(crate) fn sys_clock_gettime(
+    clockid: i32,
+    tp: crate::MutPtr<litebox_common_linux::Timespec>,
+) -> Result<(), Errno> {
+    let clocktype = match clockid {
+        litebox_common_linux::CLOCK_REALTIME | litebox_common_linux::CLOCK_REALTIME_COARSE => {
+            litebox::platform::ClockType::Realtime
+        }
+        litebox_common_linux::CLOCK_MONOTONIC | litebox_common_linux::CLOCK_MONOZTONIC_COARSE => {
+            litebox::platform::ClockType::Monotonic
+        }
+        _ => panic!("Unsupported clock ID: {}", clockid),
+    };
+
+    let timespec = litebox_platform_multiplex::platform().get_timespec(clocktype);
+    unsafe { tp.write_at_offset(0, timespec) }.ok_or(Errno::EFAULT)
+}
+
+/// Handle syscall `clock_getres`.
+pub(crate) fn sys_clock_getres(
+    clockid: i32,
+    res: crate::MutPtr<litebox_common_linux::Timespec>,
+) -> Result<(), Errno> {
+    // Validate the clock ID (same validation as clock_gettime)
+    let _clocktype = clockid;
+
+    // Return the resolution of the clock
+    // For most modern systems, the resolution is typically 1 nanosecond
+    // This is a reasonable default for high-resolution timers
+    let resolution = litebox_common_linux::Timespec {
+        tv_sec: 0,
+        tv_nsec: 1, // 1 nanosecond resolution
+    };
+
+    unsafe {
+        res.write_at_offset(0, resolution);
+    }
+    Ok(())
+}
+
+/// Handle syscall `gettimeofday`.
+pub(crate) fn sys_gettimeofday(
+    tv: crate::MutPtr<litebox_common_linux::TimeVal>,
+    tz: crate::MutPtr<litebox_common_linux::TimeZone>,
+) -> Result<(), Errno> {
+    // Get current realtime (wall clock time)
+    let timespec =
+        litebox_platform_multiplex::platform().get_timespec(litebox::platform::ClockType::Realtime);
+
+    // Convert to TimeVal if requested.
+    let timeval = litebox_common_linux::TimeVal::from(timespec);
+    unsafe { tv.write_at_offset(0, timeval) };
+
+    // Handle timezone parameter (usually NULL and deprecated)
+    // Return timezone as UTC (0 minutes west, no DST)
+    let timezone = litebox_common_linux::TimeZone::new(0, 0);
+    unsafe { tz.write_at_offset(0, timezone) };
+
+    Ok(())
+}
+
+/// Handle syscall `time`.
+pub(crate) fn sys_time(
+    tloc: crate::MutPtr<litebox_common_linux::time_t>,
+) -> Result<litebox_common_linux::time_t, Errno> {
+    // Get current realtime (wall clock time)
+    let timespec =
+        litebox_platform_multiplex::platform().get_timespec(litebox::platform::ClockType::Realtime);
+
+    // Extract seconds as time_t
+    let seconds = timespec.tv_sec as litebox_common_linux::time_t;
+
+    // Write to tloc
+    unsafe { tloc.write_at_offset(0, seconds) };
+
+    Ok(seconds)
+}
+
 /// Handle syscall `getpid`.
 pub(crate) fn sys_getpid() -> i32 {
     litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| tls.current_task.pid)
