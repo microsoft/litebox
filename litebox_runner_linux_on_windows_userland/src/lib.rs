@@ -89,7 +89,7 @@ fn windows_path_to_unix(path: &std::path::Path) -> String {
     }
 }
 
-/// Run Linux programs with LiteBox on unmodified Linux
+/// Run Linux programs with LiteBox on unmodified Windows
 ///
 /// # Panics
 ///
