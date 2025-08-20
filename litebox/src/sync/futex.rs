@@ -134,12 +134,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // Zzz, till we have a reason to wake up.
         loop {
             let remaining = timeout.map(|timeout| {
-                self.litebox
-                    .x
-                    .platform
-                    .now()
-                    .duration_since(&start)
-                    .saturating_sub(timeout)
+                timeout.saturating_sub(self.litebox.x.platform.now().duration_since(&start))
             });
 
             // Check if we have timed out
