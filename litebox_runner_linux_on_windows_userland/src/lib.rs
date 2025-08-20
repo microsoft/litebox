@@ -2,6 +2,8 @@
 // Windows, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
+use windows_sys::Win32::Storage::FileSystem;
+
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use litebox::LiteBox;
@@ -10,14 +12,19 @@ use litebox_platform_multiplex::Platform;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Component, PathBuf};
 
-/// Get file permissions and owner ID in a cross-platform way
+/// Convert Windows file permissions and owner ID to LiteBox internal
 fn get_file_mode_and_uid(metadata: &std::fs::Metadata) -> (litebox::fs::Mode, u32) {
     // On Windows, determine permissions based on file attributes
     let mut mode = litebox::fs::Mode::empty();
 
     // Check if file is read-only
-    let is_readonly = metadata.file_attributes() & 0x1 != 0; // FILE_ATTRIBUTE_READONLY
+    let is_readonly = metadata.file_attributes() & FileSystem::FILE_ATTRIBUTE_READONLY != 0;
 
+    // TODO(chuqi): Windows does not use Unix-like permissions to distinguish r-w-x. Windows uses NTFS ACLs
+    // and the notion of “execute permission” is tied to file type (.exe, .bat, .cmd) and access-control
+    // entries—not a filesystem bit.
+    // Rust's (std::fs) Permissions only exposes the `readonly`` attribute on Windows. For now, we do not
+    // identify "executable". We may either rely on other crates (is_executable) or use file types.
     if metadata.is_dir() {
         // Directories need full permissions to allow creating subdirectories and files
         // Even if marked read-only, we need write access for directory operations
@@ -59,16 +66,6 @@ pub struct CliArgs {
     #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath,
           requires = "unstable", help_heading = "Unstable Options")]
     pub initial_files: Option<PathBuf>,
-    /// Apply syscall-rewriter to the ELF file before running it
-    ///
-    /// This is meant as a convenience feature; real deployments would likely prefer ahead-of-time
-    /// rewrite things to amortize costs.
-    #[arg(
-        long = "rewrite-syscalls",
-        requires = "unstable",
-        help_heading = "Unstable Options"
-    )]
-    pub rewrite_syscalls: bool,
 }
 
 fn windows_path_to_unix(path: &std::path::Path) -> String {
@@ -120,15 +117,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             })
             .collect();
         let data = std::fs::read(prog).unwrap();
-        let data = if cli_args.rewrite_syscalls {
-            // capstone declares a global allocator in conflict with our own.
-            // https://github.com/capstone-rust/capstone-rs/blob/14e855ca58400f454cb7ceb87d2c5e7b635ce498/capstone-rs/src/lib.rs#L16
-            // litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
-            // Might be a bug in `capstone-rs`: https://github.com/capstone-rust/capstone-rs/pull/171
-            todo!()
-        } else {
-            data
-        };
         (modes, data)
     };
     let tar_data = if let Some(tar_file) = cli_args.initial_files.as_ref() {
@@ -141,11 +129,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox::fs::tar_ro::empty_tar_file()
     };
 
-    // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
-    //
-    // TODO: We also need to pick the type of syscall interception based on whether we want
-    // systrap/sigsys interception, or binary rewriting interception. Currently
-    // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new();
     let litebox = LiteBox::new(platform);
     let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
