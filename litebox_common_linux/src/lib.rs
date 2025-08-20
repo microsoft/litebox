@@ -703,9 +703,14 @@ impl TryFrom<TimeVal> for core::time::Duration {
 impl From<Timespec> for TimeVal {
     fn from(timespec: Timespec) -> Self {
         // Convert seconds to microseconds
-        let tv_sec = timespec.tv_sec as time_t;
-        let tv_usec = (timespec.tv_nsec / 1_000) as suseconds_t; // Convert nanoseconds to microseconds
-        TimeVal { tv_sec, tv_usec }
+        let timeval_tv_sec = timespec.tv_sec as time_t;
+        // Convert nanoseconds to microseconds, clamped to avoid overflow
+        let timeval_tv_usec =
+            (timespec.tv_nsec / 1_000).min(suseconds_t::MAX as u64) as suseconds_t;
+        TimeVal {
+            tv_sec: timeval_tv_sec,
+            tv_usec: timeval_tv_usec,
+        }
     }
 }
 
