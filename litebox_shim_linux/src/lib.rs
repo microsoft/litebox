@@ -524,6 +524,7 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
         }
         SyscallRequest::Time { tloc } => {
             let second = syscalls::process::sys_time(tloc);
+            #[allow(clippy::cast_sign_loss)]
             Ok(second as u64 as usize)
         }
         SyscallRequest::Openat {

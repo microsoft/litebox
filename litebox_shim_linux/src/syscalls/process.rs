@@ -473,7 +473,7 @@ pub(crate) fn sys_clock_gettime(clockid: i32, tp: crate::MutPtr<litebox_common_l
 /// Handle syscall `clock_getres`.
 pub(crate) fn sys_clock_getres(clockid: i32, res: crate::MutPtr<litebox_common_linux::Timespec>) {
     // Validate the clock ID (same validation as clock_gettime)
-    #[allow(clippy::let_underscore_drop)]
+    #[allow(clippy::no-effect-underscore-binding)]
     let _clocktype = clockid;
 
     // Return the resolution of the clock
