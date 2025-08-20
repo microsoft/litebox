@@ -217,6 +217,7 @@ mod in_mem {
                     }
                     _ => panic!("Unexpected entry: {}", entry.name),
                 }
+                assert!(entry.ino_info.is_some(), "Inode info should be present");
             }
 
             // Read the subdirectory (should be empty)
@@ -510,6 +511,7 @@ mod tar_ro {
                 "bar" => assert_eq!(entry.file_type, crate::fs::FileType::Directory),
                 _ => panic!("Unexpected entry: {}", entry.name),
             }
+            assert!(entry.ino_info.is_some(), "Inode info should be present");
         }
 
         // Read `bar` directory
@@ -891,6 +893,10 @@ mod layered {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "baz");
         assert_eq!(entries[0].file_type, crate::fs::FileType::RegularFile);
+        assert!(
+            entries[0].ino_info.is_some(),
+            "Inode info should be present"
+        );
     }
 
     #[test]
@@ -942,6 +948,7 @@ mod layered {
                 "bar" | "upperdir" => assert_eq!(entry.file_type, crate::fs::FileType::Directory),
                 _ => panic!("Unexpected entry: {}", entry.name),
             }
+            assert!(entry.ino_info.is_some(), "Inode info should be present");
         }
 
         // Read upperdir directory (should be from upper layer)

@@ -334,5 +334,9 @@ fn test_runner_with_ls() {
     );
 
     let output_str = String::from_utf8_lossy(&output);
-    assert!(output_str.contains("lib  lib64  usr"));
+    let normalized = output_str.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        normalized.contains("lib out lib64 usr"),
+        "unexpected ls output:\n{output_str}",
+    );
 }

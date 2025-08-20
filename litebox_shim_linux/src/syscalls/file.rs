@@ -980,11 +980,8 @@ pub(crate) fn sys_getdirent64(fd: i32, dirp: MutPtr<u8>, count: usize) -> Result
             // not enough space
             break;
         }
-        let stat = litebox_fs()
-            .file_status(entry.name.as_str())
-            .expect("failed to get file status");
         let dirent64 = litebox_common_linux::LinuxDirent64 {
-            ino: stat.node_info.ino as u64,
+            ino: entry.ino_info.as_ref().map_or(0, |node_info| node_info.ino) as u64,
             off: dir_off as u64,
             len: len.truncate(),
             typ: litebox_common_linux::DirentType::from(entry.file_type.clone()) as u8,

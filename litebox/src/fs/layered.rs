@@ -954,7 +954,7 @@ impl<
                 )
             });
 
-        match entry.as_ref() {
+        let mut entries = match entry.as_ref() {
             EntryX::Upper { fd } => {
                 // Get entries from upper layer
                 let mut upper_entries = self.upper.read_dir(fd)?;
@@ -978,14 +978,21 @@ impl<
                     let _ = self.lower.close(lower_fd);
                 }
 
-                Ok(upper_entries)
+                upper_entries
             }
             EntryX::Lower { fd } => {
                 // This is the easy case, nothing to deal with upper entries.
-                self.lower.read_dir(fd)
+                self.lower.read_dir(fd)?
             }
             EntryX::Tombstone => unreachable!(),
+        };
+
+        for e in &mut entries {
+            if let Some(ni) = e.ino_info.take() {
+                e.ino_info = Some(self.get_layered_nodeinfo(ni));
+            }
         }
+        Ok(entries)
     }
 
     fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {

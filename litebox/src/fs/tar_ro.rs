@@ -339,11 +339,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         };
         // Store into a hashmap to collapse together the entries we end up with for multiple files
         // within a sub-dir.
-        let entries: HashMap<String, FileType> = self
+        let entries: HashMap<String, (FileType, usize)> = self
             .tar_data
             .entries()
-            .map(|entry| entry.filename())
-            .filter_map(|p| {
+            .enumerate()
+            .map(|(idx, entry)| (idx, entry.filename()))
+            .filter_map(|(idx, p)| {
                 let p = p.as_str().ok()?;
                 contains_dir(p, path).then(|| {
                     // Drop the directory path from `p`
@@ -351,15 +352,26 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     // Then drop everything after the first `/`; if there is any then it was a dir,
                     // otherwise it was a file.
                     match suffix.split_once('/') {
-                        Some((dir, _)) => (String::from(dir), FileType::Directory),
-                        None => (String::from(suffix), FileType::RegularFile),
+                        Some((dir, _)) => (
+                            String::from(dir),
+                            (FileType::Directory, TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER),
+                        ),
+                        None => (String::from(suffix), (FileType::RegularFile, idx + 1)), // ino starts at 1 (zero represents deleted file)
                     }
                 })
             })
             .collect();
         Ok(entries
             .into_iter()
-            .map(|(name, file_type)| DirEntry { name, file_type })
+            .map(|(name, (file_type, ino))| DirEntry {
+                name,
+                file_type,
+                ino_info: Some(NodeInfo {
+                    dev: DEVICE_ID,
+                    ino,
+                    rdev: None,
+                }),
+            })
             .collect())
     }
 

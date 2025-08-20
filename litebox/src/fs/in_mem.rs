@@ -519,13 +519,46 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let Descriptor::Dir { dir, metadata: _ } = &descriptor_table.get_entry(fd).entry else {
             return Err(ReadDirError::NotADirectory);
         };
+
+        // find the directory path in the root entries by pointer-equality of the Arc
+        let parent_path = {
+            let root = self.root.read();
+            let mut path = root
+                .entries
+                .iter()
+                .find_map(|(path, entry)| match entry {
+                    Entry::Dir(d) if alloc::sync::Arc::ptr_eq(d, dir) => Some(path.clone()),
+                    _ => None,
+                })
+                .unwrap_or(String::new());
+            path.push('/');
+            path
+        };
+
         Ok(dir
             .read()
             .children
             .iter()
-            .map(|(name, file_type)| DirEntry {
-                name: name.into(),
-                file_type: file_type.clone(),
+            .map(|(name, file_type)| {
+                let mut full_path = parent_path.clone();
+                full_path.push_str(name);
+                let ino_info = self.root.read().entries.get(&full_path).map(|entry| {
+                    let ino = match entry {
+                        Entry::File(file) => file.read().unique_id,
+                        Entry::Dir(dir) => dir.read().unique_id,
+                    };
+                    NodeInfo {
+                        dev: DEVICE_ID,
+                        ino,
+                        rdev: None,
+                    }
+                });
+
+                DirEntry {
+                    name: name.into(),
+                    file_type: file_type.clone(),
+                    ino_info,
+                }
             })
             .collect())
     }
