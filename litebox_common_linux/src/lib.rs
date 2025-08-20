@@ -700,16 +700,25 @@ impl TryFrom<TimeVal> for core::time::Duration {
     }
 }
 
+#[allow(clippy::cast_possible_wrap)]
 impl From<Timespec> for TimeVal {
     fn from(timespec: Timespec) -> Self {
-        // Convert seconds to microseconds
-        let timeval_tv_sec = timespec.tv_sec as time_t;
-        // Convert nanoseconds to microseconds, clamped to avoid overflow
-        let timeval_tv_usec =
-            (timespec.tv_nsec / 1_000).min(suseconds_t::MAX as u64) as suseconds_t;
+        // Convert seconds to time_t
+        let timeval_sec = timespec.tv_sec as time_t;
+
+        // Convert nanoseconds to microseconds, ensuring we don't overflow suseconds_t
+        let microseconds = timespec.tv_nsec / 1_000;
+        let timeval_u_sec = if microseconds > suseconds_t::MAX as u64 {
+            suseconds_t::MAX
+        } else {
+            // Safe cast: we've already checked that microseconds <= suseconds_t::MAX
+
+            microseconds as suseconds_t
+        };
+
         TimeVal {
-            tv_sec: timeval_tv_sec,
-            tv_usec: timeval_tv_usec,
+            tv_sec: timeval_sec,
+            tv_usec: timeval_u_sec,
         }
     }
 }
@@ -1610,6 +1619,21 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     SetThreadArea {
         user_desc: Platform::RawMutPointer<UserDesc>,
     },
+    ClockGettime {
+        clockid: i32,
+        tp: Platform::RawMutPointer<Timespec>,
+    },
+    ClockGetres {
+        clockid: i32,
+        res: Platform::RawMutPointer<Timespec>,
+    },
+    Gettimeofday {
+        tv: Platform::RawMutPointer<TimeVal>,
+        tz: Platform::RawMutPointer<TimeZone>,
+    },
+    Time {
+        tloc: Platform::RawMutPointer<time_t>,
+    },
     Getrlimit {
         resource: RlimitResource,
         rlim: Platform::RawMutPointer<Rlimit>,
@@ -2011,6 +2035,21 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 pathname: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
                 bufsiz: ctx.syscall_arg(3),
+            },
+            Sysno::gettimeofday => SyscallRequest::Gettimeofday {
+                tv: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
+                tz: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+            },
+            Sysno::clock_gettime => SyscallRequest::ClockGettime {
+                clockid: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                tp: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+            },
+            Sysno::clock_getres => SyscallRequest::ClockGetres {
+                clockid: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                res: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+            },
+            Sysno::time => SyscallRequest::Time {
+                tloc: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
             },
             #[cfg(target_arch = "x86_64")]
             Sysno::getrlimit => {
