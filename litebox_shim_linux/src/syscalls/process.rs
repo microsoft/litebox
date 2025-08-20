@@ -6,7 +6,7 @@ use alloc::boxed::Box;
 use litebox::platform::{ExitProvider as _, RawMutPointer as _, ThreadProvider as _};
 use litebox::platform::{
     PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _,
-    ThreadLocalStorageProvider as _,
+    ThreadLocalStorageProvider as _, TimeProvider as _,
 };
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::CloneFlags;
