@@ -75,6 +75,11 @@ pub extern "C" fn sandbox_kernel_init(
 
 const ROOTFS: &[u8] = include_bytes!("./test.tar");
 
+/// Initializes the sandbox process.
+///
+/// # Panics
+///
+/// Panics if the CString creation fails (which should not happen with valid UTF-8 strings).
 #[unsafe(no_mangle)]
 pub extern "C" fn sandbox_process_init(
     pt_regs: &mut litebox_common_linux::PtRegs,
