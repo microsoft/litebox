@@ -1,45 +1,13 @@
-use core::arch::asm;
+use litebox::utils::TruncateExt as _;
 
+use crate::arch::instructions::{rdmsr, vc_vmgexit, wrmsr};
+
+// GHCB MSR
 const GHCB_MSR: u32 = 0xc0010130;
+// GHCB Protocols
 const GHCB_HV_DEBUG: u64 = 0xf03;
 
-/// Read MSR
-#[inline]
-pub fn rdmsr(msr: u32) -> u64 {
-    let lo: u32;
-    let hi: u32;
-
-    unsafe {
-        asm!("rdmsr",
-             in("rcx") msr, out("rax") lo, out("rdx") hi,
-             options(nostack));
-    }
-
-    (u64::from(hi) << 32) | u64::from(lo)
-}
-
-/// Write to MSR a given value
-#[inline]
-pub fn wrmsr(msr: u32, value: u64) {
-    #[expect(clippy::cast_possible_truncation)]
-    let lo: u32 = value as u32;
-    let hi: u32 = (value >> 32) as u32;
-
-    unsafe {
-        asm!("wrmsr",
-             in("rcx") msr, in("rax") lo, in("rdx") hi,
-             options(nostack));
-    }
-}
-
-#[inline]
-pub fn vc_vmgexit() {
-    unsafe {
-        asm!("rep vmmcall", options(nomem, nostack, preserves_flags));
-    }
-}
-
-pub fn str2u64(s: &str, start: usize, size: usize) -> u64 {
+fn str2u64(s: &str, start: usize, size: usize) -> u64 {
     let mut buf = [0u8; 8];
     buf[0..size].copy_from_slice(&s.as_bytes()[start..(start + size)]);
     u64::from_le_bytes(buf)
@@ -59,4 +27,43 @@ pub fn ghcb_prints(s: &str) {
     }
     // restore ghcb msr val
     wrmsr(GHCB_MSR, orig_val);
+}
+
+fn num_to_char(n: u8) -> u8 {
+    if n < 10 { n + b'0' } else { n - 10 + b'a' }
+}
+
+pub fn num_to_buf(buf: &mut [u8; 40], mut n: u64, base: u64) -> usize {
+    let mut i = 0;
+    if n == 0 {
+        buf[i] = num_to_char(0);
+        i += 1;
+    }
+    while n > 0 {
+        buf[i] = num_to_char((n % base).truncate());
+        n /= base;
+        i += 1;
+    }
+    i
+}
+
+#[macro_export]
+macro_rules! print_int {
+    ($num: expr, $base: expr) => {{
+        let mut _buf = [0u8; 40];
+        let i = $crate::host::snp::ghcb::num_to_buf(&mut _buf, $num, $base);
+        let slice = &mut _buf[..i];
+        slice.reverse();
+        let s = core::str::from_utf8(&*slice).unwrap();
+        $crate::host::snp::ghcb::ghcb_prints(s);
+    }};
+}
+
+#[macro_export]
+macro_rules! print_str_and_int {
+    ($str: expr, $num: expr, $base: expr) => {{
+        $crate::host::snp::ghcb::ghcb_prints($str);
+        $crate::print_int!($num, $base);
+        $crate::host::snp::ghcb::ghcb_prints("\n");
+    }};
 }

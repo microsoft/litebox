@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_platform_linux_userland = { path = "../litebox_platform_linux_userland/", version = "0.1.0", default-features = false, optional = true }
+litebox_platform_linux_kernel = { path = "../litebox_platform_linux_kernel/", version = "0.1.0", default-features = false, optional = true }
 litebox_platform_freebsd_userland = { path = "../litebox_platform_freebsd_userland/", version = "0.1.0", default-features = false, optional = true }
 litebox_platform_windows_userland = { path = "../litebox_platform_windows_userland/", version = "0.1.0", default-features = false, optional = true }
 litebox_platform_lvbs = { path = "../litebox_platform_lvbs/", version = "0.1.0", default-features = false, optional = true }
@@ -18,6 +19,7 @@ platform_linux_userland = ["dep:litebox_platform_linux_userland"]
 platform_freebsd_userland = ["dep:litebox_platform_freebsd_userland"]
 platform_windows_userland = ["dep:litebox_platform_windows_userland"]
 platform_lvbs = ["dep:litebox_platform_lvbs"]
+platform_linux_snp = ["dep:litebox_platform_linux_kernel"]
 systrap_backend = ["platform_linux_userland", "litebox_platform_linux_userland/systrap_backend"]
 platform_linux_userland_with_optee_syscall = ["platform_linux_userland", "litebox_platform_linux_userland/optee_syscall"]
 

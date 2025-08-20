@@ -501,6 +501,26 @@ where
             .map(|(r, vma)| (r.start..r.end, vma.flags()))
             .collect()
     }
+
+    /// Get the memory permissions of a given address range.
+    ///
+    /// `ptr` specifies the start address of the memory range.
+    /// `len` specifies the length of the memory range.
+    /// This function returns `MemoryRegionPermissions` only if the range is valid.
+    /// A memory range is invalid if it contains:
+    /// - Unmapped pages
+    /// - Memory pages with different permissions
+    pub fn get_memory_permissions(
+        &self,
+        ptr: NonZeroAddress<ALIGN>,
+        len: NonZeroPageSize<ALIGN>,
+    ) -> Option<MemoryRegionPermissions> {
+        let vmem = self.vmem.read();
+        let start = ptr.as_usize();
+        let end = start + len.as_usize();
+        let page_range = PageRange::<ALIGN>::new(start, end)?;
+        vmem.get_memory_permissions(page_range)
+    }
 }
 
 /// If Backend also implements [`VmemPageFaultHandler`], it can handle page faults.
@@ -515,7 +535,7 @@ where
     ///
     /// This should only be called from the kernel page fault handler.
     pub unsafe fn handle_page_fault(
-        &mut self,
+        &self,
         fault_addr: usize,
         error_code: u64,
     ) -> Result<(), PageFaultError> {

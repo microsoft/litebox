@@ -96,7 +96,8 @@ pub fn litebox_fs<'a>() -> &'a LinuxFS {
     FS.get().expect("fs has not yet been set")
 }
 
-pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE> {
+/// Get the global page manager
+pub fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE> {
     static VMEM: OnceBox<PageManager<Platform, PAGE_SIZE>> = OnceBox::new();
     VMEM.get_or_init(|| alloc::boxed::Box::new(PageManager::new(litebox())))
 }

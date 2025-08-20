@@ -25,6 +25,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Panic {
         code: usize,
     },
+    CheckAccessRights {
+        flags: TeeMemoryAccessRights,
+        buf: Platform::RawConstPointer<u8>,
+        len: usize,
+    },
     CrypStateAlloc {
         algo: TeeAlgorithm,
         op_mode: TeeOperationMode,
@@ -95,6 +100,11 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             },
             TeeSyscallNr::Panic => SyscallRequest::Panic {
                 code: ctx.syscall_arg(0),
+            },
+            TeeSyscallNr::CheckAccessRights => SyscallRequest::CheckAccessRights {
+                flags: TeeMemoryAccessRights::try_from_usize(ctx.syscall_arg(0))?,
+                buf: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
+                len: ctx.syscall_arg(2),
             },
             TeeSyscallNr::CrypStateAlloc => SyscallRequest::CrypStateAlloc {
                 algo: TeeAlgorithm::try_from_usize(ctx.syscall_arg(0))?,
@@ -424,8 +434,18 @@ bitflags::bitflags! {
         const TEE_MEMORY_ACCESS_READ = 0x1;
         const TEE_MEMORY_ACCESS_WRITE = 0x2;
         const TEE_MEMORY_ACCESS_ANY_OWNER = 0x4;
+        const TEE_MEMORY_ACCESS_NONSECURE = 0x1000_0000;
+        const TEE_MEMORY_ACCESS_SECURE = 0x2000_0000;
 
         const _ = !0;
+    }
+}
+
+impl TeeMemoryAccessRights {
+    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+        u32::try_from(value)
+            .map_err(|_| Errno::EINVAL)
+            .and_then(|v| Self::from_bits(v).ok_or(Errno::EINVAL))
     }
 }
 
