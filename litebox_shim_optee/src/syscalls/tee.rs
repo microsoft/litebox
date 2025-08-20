@@ -36,7 +36,7 @@ pub fn sys_return(ret: usize) -> ! {
                 .with_thread_local_storage_mut(|tls| tls.current_task.tid);
             #[allow(clippy::cast_sign_loss)]
             let session_id = tid as u32;
-            crate::optee_command_loop_return(session_id);
+            crate::optee_command_dispatcher(session_id, true);
         } else if #[cfg(feature = "platform_lvbs")] {
             todo!("switch to VTL0");
         } else {

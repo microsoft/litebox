@@ -4,7 +4,7 @@ use litebox::platform::ThreadLocalStorageProvider;
 use litebox_common_optee::UteeEntryFunc;
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::{
-    UteeParamsTyped, optee_command_loop_entry, register_session_id_elf_load_info,
+    UteeParamsTyped, optee_command_dispatcher, register_session_id_elf_load_info,
     submit_optee_command,
 };
 use serde::Deserialize;
@@ -106,10 +106,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     #[allow(clippy::cast_sign_loss)]
     let session_id = tid as u32;
 
-    register_session_id_elf_load_info(session_id, loaded_program);
+    assert!(
+        register_session_id_elf_load_info(session_id, loaded_program),
+        "session ID {session_id} already exists"
+    );
 
     populate_optee_command_queue(session_id, &ta_commands);
-    optee_command_loop_entry(session_id);
+    optee_command_dispatcher(session_id, false);
 }
 
 /// OP-TEE/TA message command (base64 encoded). It consists of a function ID,

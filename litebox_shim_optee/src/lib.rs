@@ -93,8 +93,14 @@ impl SessionIdElfLoadInfoMap {
         }
     }
 
-    pub fn insert(&self, session_id: u32, elf_load_info: ElfLoadInfo) {
-        self.inner.lock().insert(session_id, elf_load_info);
+    pub fn insert(&self, session_id: u32, elf_load_info: ElfLoadInfo) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.contains_key(&session_id) {
+            false
+        } else {
+            inner.insert(session_id, elf_load_info);
+            true
+        }
     }
 
     pub fn get(&self, session_id: u32) -> Option<ElfLoadInfo> {
@@ -112,8 +118,8 @@ fn session_id_elf_load_info_map() -> &'static SessionIdElfLoadInfoMap {
 }
 
 /// Register ELF load information for a session ID
-pub fn register_session_id_elf_load_info(session_id: u32, elf_load_info: ElfLoadInfo) {
-    session_id_elf_load_info_map().insert(session_id, elf_load_info);
+pub fn register_session_id_elf_load_info(session_id: u32, elf_load_info: ElfLoadInfo) -> bool {
+    session_id_elf_load_info_map().insert(session_id, elf_load_info)
 }
 
 /// OP-TEE TA command structure for the command submission queue
@@ -229,7 +235,7 @@ pub(crate) fn optee_command_completion_queue() -> &'static OpteeResultQueue {
 }
 
 /// Push or enqueue an OP-TEE command to the command queue which will be
-/// consumed by `optee_command_loop`.
+/// consumed by `optee_command_dispatcher`.
 pub fn submit_optee_command(
     session_id: u32,
     func: UteeEntryFunc,
@@ -244,15 +250,21 @@ pub fn submit_optee_command(
     optee_command_submission_queue().push(session_id, cmd);
 }
 
-/// OP-TEE command loop that dequeues commands from the command queue and handles each of them
+/// OP-TEE command dispatcher that dequeues commands from the command queue and handles each of them
 /// by interacting with loaded TAs.
-/// For now, it terminates the thread if there is no commands left in the queue.
+/// `is_sys_return` indicates whether this function is invoked by `sys_return` which is a system call
+/// that a TA calls when it's done. This implies there can be command outputs to retrieve.
+/// For now, it terminates the current thread if there is no commands left in the queue.
 /// Instead, it can be an infinite loop with sleep to continously handle commands
 /// (i.e., `UteeEntryFunc::InvokeCommand`) until it gets `UteeEntryFunc::CloseSession`
 /// from the queue.
 /// # Panics
 /// This function panics if it cannot allocate a stack
-pub fn optee_command_loop_entry(session_id: u32) -> ! {
+pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
+    if is_sys_return {
+        handle_optee_command_output(session_id);
+    }
+
     if let Some(cmd) = optee_command_submission_queue().pop(session_id) {
         let elf_load_info = session_id_elf_load_info_map().get(session_id);
         let Some(elf_load_info) = elf_load_info else {
@@ -324,12 +336,10 @@ unsafe extern "C" fn jump_to_entry_point(
     core::arch::naked_asm!("mov rsp, r9", "jmp r8", "hlt");
 }
 
-/// A function to retrieve the results of the OP-TEE TA command execution and
-/// re-enter the command loop to handle the next command if exists.
-/// This function is expected to be called by `sys_return` once the TA has
+/// A function to retrieve the results of the OP-TEE TA command execution.
+/// This function is expected to be called through `sys_return` once the TA has
 /// processed a command.
-#[allow(dead_code)]
-pub(crate) fn optee_command_loop_return(session_id: u32) -> ! {
+fn handle_optee_command_output(session_id: u32) {
     // TA stores results in the `UteeParams` structure and/or buffers it refers to.
     while let Some(param_addr) = optee_command_completion_queue().pop(session_id) {
         let params = unsafe { &*(param_addr as *const UteeParams) };
@@ -372,6 +382,4 @@ pub(crate) fn optee_command_loop_return(session_id: u32) -> ! {
             }
         }
     }
-
-    optee_command_loop_entry(session_id)
 }
