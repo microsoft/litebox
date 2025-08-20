@@ -471,11 +471,7 @@ pub(crate) fn sys_clock_gettime(clockid: i32, tp: crate::MutPtr<litebox_common_l
 }
 
 /// Handle syscall `clock_getres`.
-pub(crate) fn sys_clock_getres(clockid: i32, res: crate::MutPtr<litebox_common_linux::Timespec>) {
-    // Validate the clock ID (same validation as clock_gettime)
-    #[allow(clippy::no-effect-underscore-binding)]
-    let _clocktype = clockid;
-
+pub(crate) fn sys_clock_getres(_clockid: i32, res: crate::MutPtr<litebox_common_linux::Timespec>) {
     // Return the resolution of the clock
     // For most modern systems, the resolution is typically 1 nanosecond
     // This is a reasonable default for high-resolution timers
