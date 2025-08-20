@@ -305,3 +305,162 @@ pub enum FutexError {
     #[error("timeout expired before operation completed")]
     TimedOut,
 }
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use crate::LiteBox;
+    use crate::platform::mock::MockPlatform;
+    use alloc::sync::Arc;
+    use core::num::NonZeroU32;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Barrier;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn test_futex_wait_wake_single_thread() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let futex_manager = Arc::new(FutexManager::new(&litebox));
+
+        let futex_word = Arc::new(AtomicU32::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let futex_manager_clone = Arc::clone(&futex_manager);
+        let futex_word_clone = Arc::clone(&futex_word);
+        let barrier_clone = Arc::clone(&barrier);
+
+        // Spawn waiter thread
+        let waiter = thread::spawn(move || {
+            let futex_addr =
+                <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                    futex_word_clone.as_ptr() as usize,
+                );
+
+            barrier_clone.wait(); // Sync with main thread
+
+            // Wait for value 0
+            futex_manager_clone.wait(futex_addr, 0, None, None)
+        });
+
+        barrier.wait(); // Wait for waiter to be ready
+        thread::sleep(Duration::from_millis(10)); // Give waiter time to block
+
+        // Change the value and wake
+        futex_word.store(1, Ordering::SeqCst);
+        let futex_addr =
+            <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                futex_word.as_ptr() as usize,
+            );
+        let woken = futex_manager
+            .wake(futex_addr, NonZeroU32::new(1).unwrap(), None)
+            .unwrap();
+
+        // Wait for waiter thread to complete
+        let result = waiter.join().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(woken, 1);
+    }
+
+    #[test]
+    fn test_futex_wait_wake_single_thread_with_timeout() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let futex_manager = Arc::new(FutexManager::new(&litebox));
+
+        let futex_word = Arc::new(AtomicU32::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let futex_manager_clone = Arc::clone(&futex_manager);
+        let futex_word_clone = Arc::clone(&futex_word);
+        let barrier_clone = Arc::clone(&barrier);
+
+        // Spawn waiter thread with timeout
+        let waiter = thread::spawn(move || {
+            let futex_addr =
+                <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                    futex_word_clone.as_ptr() as usize,
+                );
+
+            barrier_clone.wait(); // Sync with main thread
+
+            // Wait for value 0 with some timeout
+            futex_manager_clone.wait(futex_addr, 0, Some(Duration::from_millis(300)), None)
+        });
+
+        barrier.wait(); // Wait for waiter to be ready
+        thread::sleep(Duration::from_millis(30)); // Give waiter time to block
+
+        // Change the value and wake
+        futex_word.store(1, Ordering::SeqCst);
+        let futex_addr =
+            <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                futex_word.as_ptr() as usize,
+            );
+        let woken = futex_manager
+            .wake(futex_addr, NonZeroU32::new(1).unwrap(), None)
+            .unwrap();
+
+        // Wait for waiter thread to complete
+        let result = waiter.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(woken, 1);
+    }
+
+    #[test]
+    fn test_futex_multiple_waiters_with_timeout() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let futex_manager = Arc::new(FutexManager::new(&litebox));
+
+        let futex_word = Arc::new(AtomicU32::new(0));
+        let barrier = Arc::new(Barrier::new(4)); // 3 waiters + 1 waker
+
+        let mut waiters = std::vec::Vec::new();
+
+        // Spawn 3 waiter threads with timeout
+        for _ in 0..3 {
+            let futex_manager_clone = Arc::clone(&futex_manager);
+            let futex_word_clone = Arc::clone(&futex_word);
+            let barrier_clone = Arc::clone(&barrier);
+
+            let waiter = thread::spawn(move || {
+                let futex_addr = <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                    futex_word_clone.as_ptr() as usize
+                );
+
+                barrier_clone.wait(); // Sync with other threads
+
+                // Wait for value 0 with some timeout
+                futex_manager_clone.wait(futex_addr, 0, Some(Duration::from_millis(300)), None)
+            });
+            waiters.push(waiter);
+        }
+
+        barrier.wait(); // Wait for all waiters to be ready
+        thread::sleep(Duration::from_millis(10)); // Give waiters time to block
+
+        // Change the value and wake all
+        futex_word.store(1, Ordering::SeqCst);
+        let futex_addr =
+            <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                futex_word.as_ptr() as usize,
+            );
+        let woken = futex_manager
+            .wake(futex_addr, NonZeroU32::new(u32::MAX).unwrap(), None)
+            .unwrap();
+
+        // Wait for all waiter threads to complete
+        for waiter in waiters {
+            let result = waiter.join().unwrap();
+            match result {
+                Ok(()) | Err(FutexError::TimedOut) => {}
+                Err(FutexError::ImmediatelyWokenBecauseValueMismatch | FutexError::NotAligned) => {
+                    unreachable!()
+                }
+            }
+        }
+
+        assert!((1..=3).contains(&woken));
+    }
+}
