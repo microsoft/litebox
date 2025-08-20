@@ -240,7 +240,10 @@ impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
     }
 
     fn get_timespec(&self, clock_type: litebox::platform::ClockType) -> Self::Timespec {
-        unimplemented!("get_timespec not implemented for LinuxKernel. clock_type: {:?}", clock_type);
+        unimplemented!(
+            "get_timespec not implemented for LinuxKernel. clock_type: {:?}",
+            clock_type
+        );
     }
 }
 

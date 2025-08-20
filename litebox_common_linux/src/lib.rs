@@ -705,10 +705,7 @@ impl From<Timespec> for TimeVal {
         // Convert seconds to microseconds
         let tv_sec = timespec.tv_sec as time_t;
         let tv_usec = (timespec.tv_nsec / 1_000) as suseconds_t; // Convert nanoseconds to microseconds
-        TimeVal {
-            tv_sec,
-            tv_usec,
-        }
+        TimeVal { tv_sec, tv_usec }
     }
 }
 
