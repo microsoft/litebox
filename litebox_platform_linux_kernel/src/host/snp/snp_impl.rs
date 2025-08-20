@@ -2,7 +2,10 @@
 
 use core::arch::asm;
 
-use litebox::platform::{RawConstPointer, RawMutPointer, ThreadLocalStorageProvider};
+use litebox::{
+    platform::{RawConstPointer, RawMutPointer, ThreadLocalStorageProvider},
+    utils::ReinterpretUnsignedExt as _,
+};
 use litebox_common_linux::{SigSet, SigmaskHow};
 
 use super::ghcb::ghcb_prints;
@@ -179,6 +182,8 @@ const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 
 const NR_SYSCALL_FUTEX: u32 = 202;
 const NR_SYSCALL_RT_SIGPROCMASK: u32 = 14;
+const NR_SYSCALL_READ: u32 = 0;
+const NR_SYSCALL_WRITE: u32 = 1;
 
 const FUTEX_WAIT: i32 = 0;
 const FUTEX_WAKE: i32 = 1;
@@ -392,5 +397,35 @@ impl HostInterface for HostSnpInterface {
             ],
         })
         .map(|_| ())
+    }
+
+    fn read_from_stdin(buf: &mut [u8]) -> Result<usize, Errno> {
+        Self::syscalls(SyscallN::<3, NR_SYSCALL_READ> {
+            args: [
+                litebox_common_linux::STDIN_FILENO as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            ],
+        })
+    }
+
+    fn write_to(stream: litebox::platform::StdioOutStream, buf: &[u8]) -> Result<usize, Errno> {
+        Self::syscalls(SyscallN::<3, NR_SYSCALL_WRITE> {
+            args: [
+                u64::from(
+                    match stream {
+                        litebox::platform::StdioOutStream::Stdout => {
+                            litebox_common_linux::STDOUT_FILENO
+                        }
+                        litebox::platform::StdioOutStream::Stderr => {
+                            litebox_common_linux::STDERR_FILENO
+                        }
+                    }
+                    .reinterpret_as_unsigned(),
+                ),
+                buf.as_ptr() as u64,
+                buf.len() as u64,
+            ],
+        })
     }
 }

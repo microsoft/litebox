@@ -96,4 +96,15 @@ impl HostInterface for MockHostInterface {
     ) -> Result<usize, crate::Errno> {
         todo!()
     }
+
+    fn read_from_stdin(_buf: &mut [u8]) -> Result<usize, litebox_common_linux::errno::Errno> {
+        todo!()
+    }
+
+    fn write_to(
+        _stream: litebox::platform::StdioOutStream,
+        _buf: &[u8],
+    ) -> Result<usize, litebox_common_linux::errno::Errno> {
+        todo!()
+    }
 }
