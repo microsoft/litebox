@@ -182,11 +182,12 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
             let mut temp_prot = elf_loader::mmap::ProtFlags::empty();
             temp_prot.set(elf_loader::mmap::ProtFlags::PROT_READ, true);
             temp_prot.set(elf_loader::mmap::ProtFlags::PROT_WRITE, true);
-            let mapped_addr = if addr.is_some() {
-                Self::do_mmap_anonymous(addr, len, temp_prot, flags)?
-            } else {
-                Self::do_mmap_anonymous(Some(DEFAULT_ELF_LOAD_BASE), len, temp_prot, flags)?
-            };
+            let mapped_addr = Self::do_mmap_anonymous(
+                addr.or(Some(DEFAULT_ELF_LOAD_BASE)),
+                len,
+                temp_prot,
+                flags,
+            )?;
             let mapped_slice: &mut [u8] =
                 unsafe { core::slice::from_raw_parts_mut(mapped_addr as *mut u8, len) };
             let fd_elf_map = fd_elf_map();

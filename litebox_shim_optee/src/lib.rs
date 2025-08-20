@@ -471,7 +471,7 @@ pub(crate) fn optee_command_loop_return(session_id: u32) -> ! {
     optee_command_loop_entry(session_id)
 }
 
-/// A data structure to represent a TEE object refered by `TeeObjHandle`.
+/// A data structure to represent a TEE object referenced by `TeeObjHandle`.
 /// This is an in-kernel data structure such that we can have our own
 /// representation (i.e., doesn't have to match the original OP-TEE data structure).
 ///
@@ -623,7 +623,7 @@ pub(crate) fn tee_obj_map() -> &'static TeeObjMap {
     TEE_OBJ_MAP.get_or_init(|| alloc::boxed::Box::new(TeeObjMap::new()))
 }
 
-/// A data structure to represent a TEE cryptography state refered by `TeeCrypStateHandle`.
+/// A data structure to represent a TEE cryptography state referenced by `TeeCrypStateHandle`.
 /// This is an in-kernel data structure such that we can have our own
 /// representation (i.e., doesn't have to match the original OP-TEE data structure).
 /// It has primary and secondary cryptography object and a cipher.
