@@ -303,11 +303,24 @@ pub enum ReceiveError {
     WouldBlock,
 }
 
+/// A non-exhaustive of clock types that can be used with [`TimeProvider`].
+/// These types correspond to the various clocks available in the system.
+#[derive(Debug, Clone)]
+pub enum ClockType {
+    /// The real-time clock
+    Realtime,
+    /// The monotonic clock
+    Monotonic,
+}
+
 /// An interface to understanding time.
 pub trait TimeProvider {
     type Instant: Instant;
+    type Timespec;
     /// Returns an instant coresponding to "now".
     fn now(&self) -> Self::Instant;
+    /// Returns a Timespec for the given clock type.
+    fn get_timespec(&self, clock_type: ClockType) -> Self::Timespec;
 }
 
 /// An opaque measurement of a monotonically nondecreasing clock.

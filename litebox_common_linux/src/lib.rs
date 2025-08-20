@@ -700,6 +700,35 @@ impl TryFrom<TimeVal> for core::time::Duration {
     }
 }
 
+impl From<Timespec> for TimeVal {
+    fn from(timespec: Timespec) -> Self {
+        // Convert seconds to microseconds
+        let tv_sec = timespec.tv_sec as time_t;
+        let tv_usec = (timespec.tv_nsec / 1_000) as suseconds_t; // Convert nanoseconds to microseconds
+        TimeVal {
+            tv_sec,
+            tv_usec,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TimeZone {
+    tz_minuteswest: i32,
+    tz_dsttime: i32,
+}
+
+impl TimeZone {
+    /// Create a new TimeZone with the given minutes west of UTC and DST time flag
+    pub fn new(tz_minuteswest: i32, tz_dsttime: i32) -> Self {
+        Self {
+            tz_minuteswest,
+            tz_dsttime,
+        }
+    }
+}
+
 #[repr(i32)]
 #[derive(Debug, IntEnum, PartialEq)]
 /// Signal numbers used in Linux.
