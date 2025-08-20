@@ -973,13 +973,16 @@ pub(crate) fn sys_getdirent64(fd: i32, dirp: MutPtr<u8>, count: usize) -> Result
     let mut nbytes = 0;
     let off = 0;
 
+    let mut entries = litebox_fs().read_dir(file)?;
     litebox::log_println!(
         litebox_platform_multiplex::platform(),
-        "gedirent: {:?}",
-        litebox_fs().read_dir(file)?
+        "gedirent: {:?}. {}",
+        entries,
+        dir_off,
     );
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-    for entry in litebox_fs().read_dir(file)?.iter().skip(dir_off) {
+    for entry in entries.iter().skip(dir_off) {
         // include null terminator and make it aligned
         let len = (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len() + 1)
             .next_multiple_of(align_of::<litebox_common_linux::LinuxDirent64>());
