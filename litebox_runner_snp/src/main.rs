@@ -70,7 +70,7 @@ pub extern "C" fn sandbox_kernel_init(
     litebox_platform_linux_kernel::update_cpu_mhz(boot_params.cpu_khz / 1000);
 
     ghcb_prints("sandbox_kernel_init done\n");
-    litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::exit();
+    litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::return_to_host();
 }
 
 const ROOTFS: &[u8] = include_bytes!("./test.tar");
