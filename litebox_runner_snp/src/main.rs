@@ -47,37 +47,17 @@ pub extern "C" fn int_handler(_pt_regs: &mut litebox_common_linux::PtRegs, _vect
 #[unsafe(no_mangle)]
 pub extern "C" fn sandbox_kernel_init(
     _pt_regs: &mut litebox_common_linux::PtRegs,
-    boot_params: &'static litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params,
+    _boot_params: &'static litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params,
 ) {
     ghcb_prints("sandbox_kernel_init called\n");
-    let ghcb_page = litebox_platform_linux_kernel::arch::PhysAddr::new(boot_params.ghcb_page);
-    let ghcb_page_va = litebox_platform_linux_kernel::arch::VirtAddr::new(boot_params.ghcb_page_va);
-    if litebox_platform_linux_kernel::host::snp::ghcb::GhcbProtocol::setup_ghcb_page(
-        ghcb_page,
-        ghcb_page_va,
-    )
-    .is_none()
-    {
-        ghcb_prints("GHCB page setup failed\n");
-        litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
-            globals::SM_SEV_TERM_SET,
-            globals::SM_TERM_NO_GHCB,
-        );
-    } else {
-        ghcb_prints("GHCB page setup done\n");
-    }
-
-    litebox_platform_linux_kernel::update_cpu_mhz(boot_params.cpu_khz / 1000);
-
-    ghcb_prints("sandbox_kernel_init done\n");
-    litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::exit();
+    todo!()
 }
 
 /// Initializes the sandbox process.
 #[unsafe(no_mangle)]
 pub extern "C" fn sandbox_process_init(
     _pt_regs: &mut litebox_common_linux::PtRegs,
-    // boot_params: &'static litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params,
+    _boot_params: &'static litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params,
 ) {
     todo!()
 }
