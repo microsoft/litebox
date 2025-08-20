@@ -273,10 +273,16 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // XXX(jayb): This check may not be ideal if there are no waiters that have any overlap in
         // terms of bitset masks, in which case this might spin forever until at least someone with
         // that mask goes to sleep.
-        while let Some(lockable) = self.lockables.write().get_mut(&addr)
-            && lockable.num_waiters >= num_to_wake_up
-        {
-            core::hint::spin_loop();
+        loop {
+            let lockables = self.lockables.read();
+            if let Some(lockable) = lockables.get(&addr)
+                && lockable.num_waiters >= num_to_wake_up
+            {
+                drop(lockables);
+                core::hint::spin_loop();
+            } else {
+                break;
+            }
         }
         // We can now reset the mask out, and return the number that actually woke up.
         if let Some(lockable) = self.lockables.write().get_mut(&addr) {
