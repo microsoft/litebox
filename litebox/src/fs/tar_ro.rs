@@ -361,18 +361,46 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 })
             })
             .collect();
-        Ok(entries
-            .into_iter()
-            .map(|(name, (file_type, ino))| DirEntry {
-                name,
-                file_type,
-                ino_info: Some(NodeInfo {
-                    dev: DEVICE_ID,
-                    ino,
-                    rdev: None,
+
+        // Add "." and ".." entries first.
+        // In this read-only tar FS we don't maintain distinct inode numbers per-dir,
+        // so use the same directory inode constant for directories (including root).
+        let mut out: Vec<DirEntry> = Vec::new();
+
+        out.push(DirEntry {
+            name: ".".into(),
+            file_type: FileType::Directory,
+            ino_info: Some(NodeInfo {
+                dev: DEVICE_ID,
+                ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                rdev: None,
+            }),
+        });
+
+        out.push(DirEntry {
+            name: "..".into(),
+            file_type: FileType::Directory,
+            ino_info: Some(NodeInfo {
+                dev: DEVICE_ID,
+                ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                rdev: None,
+            }),
+        });
+
+        out.extend(
+            entries
+                .into_iter()
+                .map(|(name, (file_type, ino))| DirEntry {
+                    name,
+                    file_type,
+                    ino_info: Some(NodeInfo {
+                        dev: DEVICE_ID,
+                        ino,
+                        rdev: None,
+                    }),
                 }),
-            })
-            .collect())
+        );
+        Ok(out)
     }
 
     fn file_status(

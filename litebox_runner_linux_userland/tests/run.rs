@@ -329,14 +329,16 @@ fn test_runner_with_ls() {
             "/lib/x86_64-linux-gnu/libpcre2-8.so.0",
         ],
         &ls_path,
-        &[],
+        &["-a"],
         |_| {},
     );
 
     let output_str = String::from_utf8_lossy(&output);
-    let normalized = output_str.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        normalized.contains("lib out lib64 usr"),
-        "unexpected ls output:\n{output_str}",
-    );
+    let normalized = output_str.split_whitespace().collect::<Vec<_>>();
+    for each in [".", "..", "lib", "out", "lib64", "usr"] {
+        assert!(
+            normalized.contains(&each),
+            "unexpected ls output:\n{output_str}",
+        );
+    }
 }

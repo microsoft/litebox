@@ -535,32 +535,53 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             path
         };
 
-        Ok(dir
-            .read()
-            .children
-            .iter()
-            .map(|(name, file_type)| {
-                let mut full_path = parent_path.clone();
-                full_path.push_str(name);
-                let ino_info = self.root.read().entries.get(&full_path).map(|entry| {
-                    let ino = match entry {
-                        Entry::File(file) => file.read().unique_id,
-                        Entry::Dir(dir) => dir.read().unique_id,
-                    };
-                    NodeInfo {
-                        dev: DEVICE_ID,
-                        ino,
-                        rdev: None,
-                    }
-                });
-
-                DirEntry {
-                    name: name.into(),
-                    file_type: file_type.clone(),
-                    ino_info,
+        // helper to get NodeInfo by an entries-key (entries keys have no trailing '/')
+        let get_node_info = |key: &str| -> Option<NodeInfo> {
+            self.root.read().entries.get(key).map(|entry| {
+                let ino = match entry {
+                    Entry::File(file) => file.read().unique_id,
+                    Entry::Dir(dir) => dir.read().unique_id,
+                };
+                NodeInfo {
+                    dev: DEVICE_ID,
+                    ino,
+                    rdev: None,
                 }
             })
-            .collect())
+        };
+
+        let mut entries: Vec<DirEntry> = Vec::new();
+
+        // Add "."
+        entries.push(DirEntry {
+            name: ".".into(),
+            file_type: FileType::Directory,
+            ino_info: Some(NodeInfo {
+                dev: DEVICE_ID,
+                ino: dir.read().unique_id,
+                rdev: None,
+            }),
+        });
+
+        // Add ".."
+        entries.push(DirEntry {
+            name: "..".into(),
+            file_type: FileType::Directory,
+            // entries keys don't have trailing '/'; "" for root
+            ino_info: get_node_info(parent_path.trim_end_matches('/')),
+        });
+
+        // add normal children
+        entries.extend(dir.read().children.iter().map(|(name, file_type)| {
+            let mut full_path = parent_path.clone();
+            full_path.push_str(name);
+            DirEntry {
+                name: name.into(),
+                file_type: file_type.clone(),
+                ino_info: get_node_info(&full_path),
+            }
+        }));
+        Ok(entries)
     }
 
     fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {

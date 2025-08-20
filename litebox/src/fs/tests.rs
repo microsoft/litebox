@@ -171,8 +171,17 @@ mod in_mem {
             let fd = fs
                 .open("/", OFlags::RDONLY, Mode::empty())
                 .expect("Failed to open root directory");
-            let entries = fs.read_dir(&fd).expect("Failed to read directory");
-            assert!(entries.is_empty(), "Root directory should be empty");
+            let entries = fs
+                .read_dir(&fd)
+                .expect("Failed to read directory")
+                .iter()
+                .map(|e| e.name.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                entries,
+                vec![".", ".."],
+                "Root directory should contain . and .."
+            );
             fs.close(fd).expect("Failed to close directory");
         });
     }
@@ -201,17 +210,19 @@ mod in_mem {
             let entries = fs.read_dir(&fd).expect("Failed to read directory");
             fs.close(fd).expect("Failed to close directory");
 
-            // Should have 3 entries: testdir, testfile1, testfile2
-            assert_eq!(entries.len(), 3);
+            // Should have 5 entries: ., .., testdir, testfile1, testfile2
+            assert_eq!(entries.len(), 5);
 
             let mut names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
             names.sort_unstable();
-            assert_eq!(names, vec!["testdir", "testfile1", "testfile2"]);
+            assert_eq!(names, vec![".", "..", "testdir", "testfile1", "testfile2"]);
 
             // Check file types
             for entry in &entries {
                 match entry.name.as_str() {
-                    "testdir" => assert_eq!(entry.file_type, crate::fs::FileType::Directory),
+                    "testdir" | "." | ".." => {
+                        assert_eq!(entry.file_type, crate::fs::FileType::Directory);
+                    }
                     "testfile1" | "testfile2" => {
                         assert_eq!(entry.file_type, crate::fs::FileType::RegularFile);
                     }
@@ -224,8 +235,13 @@ mod in_mem {
             let fd = fs
                 .open("/testdir", OFlags::RDONLY, Mode::empty())
                 .expect("Failed to open subdirectory");
-            let entries = fs.read_dir(&fd).expect("Failed to read subdirectory");
-            assert!(entries.is_empty(), "Subdirectory should be empty");
+            let entries = fs
+                .read_dir(&fd)
+                .expect("Failed to read subdirectory")
+                .iter()
+                .map(|e| e.name.clone())
+                .collect::<Vec<_>>();
+            assert!(entries.len() == 2, "Subdirectory should contain . and ..");
             fs.close(fd).expect("Failed to close subdirectory");
         });
     }
@@ -495,12 +511,12 @@ mod tar_ro {
         let entries = fs.read_dir(&fd).expect("Failed to read root directory");
         fs.close(fd).expect("Failed to close root directory");
 
-        // Should have 2 entries: bar, foo
-        assert_eq!(entries.len(), 2);
+        // Should have 4 entries: ., .., bar, foo
+        assert_eq!(entries.len(), 4);
 
         let mut names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
         names.sort_unstable();
-        assert_eq!(names, vec!["bar", "foo"]);
+        assert_eq!(names, vec![".", "..", "bar", "foo"]);
 
         // Check file types
         for entry in &entries {
@@ -508,7 +524,7 @@ mod tar_ro {
                 "foo" => {
                     assert_eq!(entry.file_type, crate::fs::FileType::RegularFile);
                 }
-                "bar" => assert_eq!(entry.file_type, crate::fs::FileType::Directory),
+                "bar" | "." | ".." => assert_eq!(entry.file_type, crate::fs::FileType::Directory),
                 _ => panic!("Unexpected entry: {}", entry.name),
             }
             assert!(entry.ino_info.is_some(), "Inode info should be present");
@@ -521,10 +537,10 @@ mod tar_ro {
         let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
         fs.close(fd).expect("Failed to close bar directory");
 
-        // Should have 1 entry: baz (file)
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "baz");
-        assert_eq!(entries[0].file_type, crate::fs::FileType::RegularFile);
+        // Should have 3 entry: ., .., baz (file)
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2].name, "baz");
+        assert_eq!(entries[2].file_type, crate::fs::FileType::RegularFile);
     }
 
     #[test]
@@ -889,12 +905,12 @@ mod layered {
         let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
         fs.close(fd).expect("Failed to close bar directory");
 
-        // Should have 1 entry: baz (file)
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "baz");
-        assert_eq!(entries[0].file_type, crate::fs::FileType::RegularFile);
+        // Should have 3 entries: ., .., baz (file)
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2].name, "baz");
+        assert_eq!(entries[2].file_type, crate::fs::FileType::RegularFile);
         assert!(
-            entries[0].ino_info.is_some(),
+            entries[2].ino_info.is_some(),
             "Inode info should be present"
         );
     }
@@ -932,12 +948,15 @@ mod layered {
         let entries = fs.read_dir(&fd).expect("Failed to read root directory");
         fs.close(fd).expect("Failed to close root directory");
 
-        // Should have 4 entries: bar, foo (from lower), upperdir, upperfile (from upper)
-        assert_eq!(entries.len(), 4);
+        // Should have 6 entries: ., .., bar, foo (from lower), upperdir, upperfile (from upper)
+        assert_eq!(entries.len(), 6);
 
         let mut names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
         names.sort_unstable();
-        assert_eq!(names, vec!["bar", "foo", "upperdir", "upperfile"]);
+        assert_eq!(
+            names,
+            vec![".", "..", "bar", "foo", "upperdir", "upperfile"]
+        );
 
         // Check file types
         for entry in &entries {
@@ -945,7 +964,9 @@ mod layered {
                 "foo" | "upperfile" => {
                     assert_eq!(entry.file_type, crate::fs::FileType::RegularFile);
                 }
-                "bar" | "upperdir" => assert_eq!(entry.file_type, crate::fs::FileType::Directory),
+                "bar" | "upperdir" | "." | ".." => {
+                    assert_eq!(entry.file_type, crate::fs::FileType::Directory);
+                }
                 _ => panic!("Unexpected entry: {}", entry.name),
             }
             assert!(entry.ino_info.is_some(), "Inode info should be present");
@@ -958,8 +979,8 @@ mod layered {
         let entries = fs.read_dir(&fd).expect("Failed to read upperdir");
         fs.close(fd).expect("Failed to close upperdir");
 
-        // Should be empty
-        assert!(entries.is_empty());
+        // only . and ..
+        assert!(entries.len() == 2);
     }
 }
 
