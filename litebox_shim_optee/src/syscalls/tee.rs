@@ -3,6 +3,8 @@ use litebox::platform::{RawConstPointer, page_mgmt::MemoryRegionPermissions};
 use litebox_common_optee::{TeeMemoryAccessRights, TeeResult};
 
 #[cfg(feature = "platform_linux_userland")]
+use litebox::platform::ThreadLocalStorageProvider;
+#[cfg(feature = "platform_linux_userland")]
 use litebox::platform::ThreadProvider;
 
 use crate::litebox_page_manager;
@@ -28,11 +30,13 @@ pub fn sys_return(ret: usize) -> ! {
         ret
     );
 
-    // TODO: terminate thread for now. This should be replaced with a proper mechanism to switch to
-    // the main event loop inside the runner.
     cfg_if::cfg_if! {
         if #[cfg(feature = "platform_linux_userland")] {
-            litebox_platform_multiplex::platform().terminate_thread(i32::try_from(ret).unwrap_or(0));
+            let tid = litebox_platform_multiplex::platform()
+                .with_thread_local_storage_mut(|tls| tls.current_task.tid);
+            #[allow(clippy::cast_sign_loss)]
+            let session_id = tid as u32;
+            crate::optee_command_dispatcher(session_id, true);
         } else if #[cfg(feature = "platform_lvbs")] {
             todo!("switch to VTL0");
         } else {
