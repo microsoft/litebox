@@ -16,7 +16,9 @@ mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
-pub type SnpLinuxKenrel = crate::LinuxKernel<HostSnpInterface>;
+pub use bindings::vmpl2_boot_params;
+
+pub type SnpLinuxKernel = crate::LinuxKernel<HostSnpInterface>;
 
 const MAX_ARGS_SIZE: usize = 6;
 type ArgsArray = [u64; MAX_ARGS_SIZE];
@@ -24,6 +26,8 @@ type ArgsArray = [u64; MAX_ARGS_SIZE];
 #[cfg(not(test))]
 mod alloc {
     use crate::HostInterface;
+    use crate::mm::MemoryProvider;
+    use litebox::utils::TruncateExt as _;
 
     const HEAP_ORDER: usize = super::bindings::SNP_VMPL_ALLOC_MAX_ORDER as usize + 12 + 1;
     const PGDIR_SHIFT: u64 = 39;
@@ -34,12 +38,19 @@ mod alloc {
     static SNP_ALLOCATOR: litebox::mm::allocator::SafeZoneAllocator<
         'static,
         HEAP_ORDER,
-        super::SnpLinuxKenrel,
+        super::SnpLinuxKernel,
     > = litebox::mm::allocator::SafeZoneAllocator::new();
 
-    impl litebox::mm::allocator::MemoryProvider for super::SnpLinuxKenrel {
+    impl litebox::mm::allocator::MemoryProvider for super::SnpLinuxKernel {
         fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
-            super::HostSnpInterface::alloc(layout)
+            super::HostSnpInterface::alloc(layout).map(|(addr, size)| {
+                (
+                    Self::pa_to_va(crate::arch::PhysAddr::new_truncate(addr as u64))
+                        .as_u64()
+                        .truncate(),
+                    size,
+                )
+            })
         }
 
         unsafe fn free(addr: usize) {
@@ -47,7 +58,7 @@ mod alloc {
         }
     }
 
-    impl crate::mm::MemoryProvider for super::SnpLinuxKenrel {
+    impl crate::mm::MemoryProvider for super::SnpLinuxKernel {
         const GVA_OFFSET: crate::arch::VirtAddr = crate::arch::VirtAddr::new(LITEBOX_PAGE_OFFSET);
         const PRIVATE_PTE_MASK: u64 = 1 << 51; // SNP encryption bit
 
@@ -195,7 +206,7 @@ impl HostInterface for HostSnpInterface {
             layout.size().next_power_of_two(),
             usize::try_from(PAGE_SIZE).unwrap(),
         );
-        assert!(size > usize::try_from(PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER).unwrap());
+        assert!(size <= usize::try_from(PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER).unwrap());
 
         let mut req = bindings::SnpVmplRequestArgs::new_request(
             bindings::SNP_VMPL_ALLOC_REQ,

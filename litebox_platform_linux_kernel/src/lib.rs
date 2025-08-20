@@ -26,6 +26,10 @@ pub mod ptr;
 
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 
+pub fn update_cpu_mhz(freq: u64) {
+    CPU_MHZ.store(freq, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// This is the platform for running LiteBox in kernel mode.
 /// It requires a host that implements the [`HostInterface`] trait.
 pub struct LinuxKernel<Host: HostInterface> {
@@ -116,14 +120,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             // TODO: Update the init physaddr
             page_table: unsafe { mm::PageTable::new(init_page_table_addr) },
         }))
-    }
-
-    pub fn init(&self, cpu_mhz: u64) {
-        CPU_MHZ.store(cpu_mhz, core::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn exit(&self) -> ! {
-        Host::exit();
     }
 
     pub fn terminate(&self, reason_set: u64, reason_code: u64) -> ! {
@@ -300,6 +296,24 @@ impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
     }
 }
 
+impl<Host: HostInterface> litebox::platform::StdioProvider for LinuxKernel<Host> {
+    fn read_from_stdin(&self, _buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
+        todo!()
+    }
+
+    fn write_to(
+        &self,
+        _stream: litebox::platform::StdioOutStream,
+        _buf: &[u8],
+    ) -> Result<usize, litebox::platform::StdioWriteError> {
+        todo!()
+    }
+
+    fn is_a_tty(&self, _stream: litebox::platform::StdioStream) -> bool {
+        true
+    }
+}
+
 /// Platform-Host Interface
 pub trait HostInterface {
     /// Page allocation from host.
@@ -434,5 +448,56 @@ impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKern
 
     fn access_error(error_code: u64, flags: litebox::mm::linux::VmFlags) -> bool {
         mm::PageTable::<4096>::access_error(error_code, flags)
+    }
+}
+
+impl<Host: HostInterface> litebox::platform::ThreadLocalStorageProvider for LinuxKernel<Host> {
+    type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<LinuxKernel<Host>>;
+
+    fn set_thread_local_storage(&self, _value: Self::ThreadLocalStorage) {
+        todo!()
+    }
+
+    fn with_thread_local_storage_mut<F, R>(&self, _f: F) -> R
+    where
+        F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
+    {
+        todo!()
+    }
+
+    fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
+        todo!()
+    }
+}
+
+impl<Host: HostInterface> litebox::platform::ThreadProvider for LinuxKernel<Host> {
+    type ExecutionContext = litebox_common_linux::PtRegs;
+    type ThreadArgs = litebox_common_linux::NewThreadArgs<LinuxKernel<Host>>;
+    type ThreadSpawnError = litebox_common_linux::errno::Errno;
+    type ThreadId = usize;
+
+    unsafe fn spawn_thread(
+        &self,
+        _ctx: &Self::ExecutionContext,
+        _stack: <Self as RawPointerProvider>::RawMutPointer<u8>,
+        _stack_size: usize,
+        _entry_point: usize,
+        _thread_args: alloc::boxed::Box<Self::ThreadArgs>,
+    ) -> Result<Self::ThreadId, Self::ThreadSpawnError> {
+        todo!()
+    }
+
+    fn terminate_thread(&self, _code: Self::ExitCode) -> ! {
+        todo!()
+    }
+}
+
+impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<Host> {
+    fn get_syscall_entry_point(&self) -> usize {
+        todo!()
+    }
+
+    fn get_vdso_address(&self) -> Option<usize> {
+        None
     }
 }
