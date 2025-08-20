@@ -605,9 +605,18 @@ impl litebox::platform::IPInterfaceProvider for WindowsUserland {
 
 impl litebox::platform::TimeProvider for WindowsUserland {
     type Instant = Instant;
+    type Timespec = litebox_common_linux::Timespec;
 
     fn now(&self) -> Self::Instant {
         perf_counter::PerformanceCounterInstant::now().into()
+    }
+
+    fn get_timespec(&self, clock_type: litebox::platform::ClockType) -> Self::Timespec {
+        let (sec, nsec) = perf_counter::get_timespec(clock_type);
+        litebox_common_linux::Timespec {
+            tv_sec: sec,
+            tv_nsec: nsec as u64,
+        }
     }
 }
 

@@ -545,6 +545,7 @@ impl litebox::platform::IPInterfaceProvider for FreeBSDUserland {
 
 impl litebox::platform::TimeProvider for FreeBSDUserland {
     type Instant = Instant;
+    type Timespec = litebox_common_linux::Timespec;
 
     fn now(&self) -> Self::Instant {
         let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
@@ -557,6 +558,13 @@ impl litebox::platform::TimeProvider for FreeBSDUserland {
                 tv_nsec: u64::from(t.tv_nsec.reinterpret_as_unsigned()),
             },
         }
+    }
+
+    fn get_timespec(&self, clock_type: litebox::platform::ClockType) -> Self::Timespec {
+        unimplemented!(
+            "get_timespec is not implemented for FreeBSD yet. clock type: {:?}",
+            clock_type
+        );
     }
 }
 
