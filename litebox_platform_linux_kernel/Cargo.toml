@@ -12,7 +12,6 @@ bindgen = "0.71.0"
 bitflags = "2.9.0"
 litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
-paste = "1.0.15"
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 arrayvec = { version = "0.7.6", default-features = false }
 rangemap = { version = "1.5.1", features = ["const_fn"] }
