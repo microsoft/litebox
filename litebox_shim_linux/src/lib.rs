@@ -511,16 +511,20 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
             })
         }),
         SyscallRequest::Gettimeofday { tv, tz } => {
-            syscalls::process::sys_gettimeofday(tv, tz).map(|()| 0)
+            syscalls::process::sys_gettimeofday(tv, tz);
+            Ok(0)
         }
         SyscallRequest::ClockGettime { clockid, tp } => {
-            syscalls::process::sys_clock_gettime(clockid, tp).map(|()| 0)
+            syscalls::process::sys_clock_gettime(clockid, tp);
+            Ok(0)
         }
         SyscallRequest::ClockGetres { clockid, res } => {
-            syscalls::process::sys_clock_getres(clockid, res).map(|()| 0)
+            syscalls::process::sys_clock_getres(clockid, res);
+            Ok(0)
         }
         SyscallRequest::Time { tloc } => {
-            syscalls::process::sys_time(tloc).map(|seconds| seconds as usize)
+            let second = syscalls::process::sys_time(tloc);
+            Ok(second as u64 as usize)
         }
         SyscallRequest::Openat {
             dirfd,

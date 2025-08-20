@@ -455,10 +455,7 @@ pub(crate) fn sys_get_robust_list(
 }
 
 /// Handle syscall `clock_gettime`.
-pub(crate) fn sys_clock_gettime(
-    clockid: i32,
-    tp: crate::MutPtr<litebox_common_linux::Timespec>,
-) -> Result<(), Errno> {
+pub(crate) fn sys_clock_gettime(clockid: i32, tp: crate::MutPtr<litebox_common_linux::Timespec>) {
     let clocktype = match clockid {
         litebox_common_linux::CLOCK_REALTIME | litebox_common_linux::CLOCK_REALTIME_COARSE => {
             litebox::platform::ClockType::Realtime
@@ -470,15 +467,13 @@ pub(crate) fn sys_clock_gettime(
     };
 
     let timespec = litebox_platform_multiplex::platform().get_timespec(clocktype);
-    unsafe { tp.write_at_offset(0, timespec) }.ok_or(Errno::EFAULT)
+    unsafe { tp.write_at_offset(0, timespec) };
 }
 
 /// Handle syscall `clock_getres`.
-pub(crate) fn sys_clock_getres(
-    clockid: i32,
-    res: crate::MutPtr<litebox_common_linux::Timespec>,
-) -> Result<(), Errno> {
+pub(crate) fn sys_clock_getres(clockid: i32, res: crate::MutPtr<litebox_common_linux::Timespec>) {
     // Validate the clock ID (same validation as clock_gettime)
+    #[allow(clippy::let_underscore_drop)]
     let _clocktype = clockid;
 
     // Return the resolution of the clock
@@ -492,14 +487,13 @@ pub(crate) fn sys_clock_getres(
     unsafe {
         res.write_at_offset(0, resolution);
     }
-    Ok(())
 }
 
 /// Handle syscall `gettimeofday`.
 pub(crate) fn sys_gettimeofday(
     tv: crate::MutPtr<litebox_common_linux::TimeVal>,
     tz: crate::MutPtr<litebox_common_linux::TimeZone>,
-) -> Result<(), Errno> {
+) {
     // Get current realtime (wall clock time)
     let timespec =
         litebox_platform_multiplex::platform().get_timespec(litebox::platform::ClockType::Realtime);
@@ -512,14 +506,12 @@ pub(crate) fn sys_gettimeofday(
     // Return timezone as UTC (0 minutes west, no DST)
     let timezone = litebox_common_linux::TimeZone::new(0, 0);
     unsafe { tz.write_at_offset(0, timezone) };
-
-    Ok(())
 }
 
 /// Handle syscall `time`.
 pub(crate) fn sys_time(
     tloc: crate::MutPtr<litebox_common_linux::time_t>,
-) -> Result<litebox_common_linux::time_t, Errno> {
+) -> litebox_common_linux::time_t {
     // Get current realtime (wall clock time)
     let timespec =
         litebox_platform_multiplex::platform().get_timespec(litebox::platform::ClockType::Realtime);
@@ -530,7 +522,7 @@ pub(crate) fn sys_time(
     // Write to tloc
     unsafe { tloc.write_at_offset(0, seconds) };
 
-    Ok(seconds)
+    seconds
 }
 
 /// Handle syscall `getpid`.
