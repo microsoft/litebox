@@ -348,4 +348,28 @@ fn test_runner_with_ls() {
             "unexpected ls output:\n{output_str}",
         );
     }
+
+    // test `ls` subdir
+    let output = test_runner_with_dynamic_lib(
+        Backend::Seccomp,
+        &[
+            "/lib/x86_64-linux-gnu/libc.so.6",
+            "/lib64/ld-linux-x86-64.so.2",
+            "/lib/x86_64-linux-gnu/libselinux.so.1",
+            "/lib/x86_64-linux-gnu/libpcre2-8.so.0",
+        ],
+        &ls_path,
+        &["-a", "/lib/x86_64-linux-gnu"],
+        |_| {},
+        "ls_lib_seccomp",
+    );
+
+    let output_str = String::from_utf8_lossy(&output);
+    let normalized = output_str.split_whitespace().collect::<Vec<_>>();
+    for each in [".", "..", "libc.so.6", "libpcre2-8.so.0", "libselinux.so.1"] {
+        assert!(
+            normalized.contains(&each),
+            "unexpected ls output:\n{output_str}",
+        );
+    }
 }
