@@ -914,6 +914,9 @@ fn werr_text(err: u32) -> String {
         let flags = Win32_Debug::FORMAT_MESSAGE_ALLOCATE_BUFFER
             | Win32_Debug::FORMAT_MESSAGE_FROM_SYSTEM
             | Win32_Debug::FORMAT_MESSAGE_IGNORE_INSERTS;
+        // If dwFlags includes FORMAT_MESSAGE_ALLOCATE_BUFFER, the function 
+        // allocates a buffer using the LocalAlloc function, and places the 
+        // pointer to the buffer at the address specified in lpBuffer.
         let len = Win32_Debug::FormatMessageW(
             flags,
             std::ptr::null_mut(),
