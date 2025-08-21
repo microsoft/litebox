@@ -77,16 +77,25 @@ impl MockRawMutex {
         val: u32,
         timeout: Option<core::time::Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        // We immediately wake up (without even hitting syscalls) if we can clearly see that the
-        // value is different.
+        // Before we can lose any wake-ups, we go and set the number blocked incremented by one.
+        self.internal_state.write().unwrap().number_blocked += 1;
+
+        // We then immediately wake up (without triggering anything else) if we can clearly see that
+        // the value is different.
         if self.inner.load(core::sync::atomic::Ordering::SeqCst) != val {
+            // We do need to make sure we reset the state, importantly, making sure that if a waker
+            // showed up along the way, we actually reset that waker count by one, so we are not
+            // leaving it impossible for wakers to handle things later.
+            let mut internal_state = self.internal_state.write().unwrap();
+            internal_state.number_blocked -= 1;
+            if internal_state.number_to_wake_up > 0 {
+                internal_state.number_to_wake_up -= 1;
+            }
             return Err(ImmediatelyWokenUp);
         }
 
         // Track some initial information.
         let start = std::time::Instant::now();
-
-        self.internal_state.write().unwrap().number_blocked += 1;
 
         // We'll be looping unless we find a good reason to exit out of the loop, either due to a
         // wake-up or a time-out. We do a singular (only as a one-off) check for the
@@ -120,11 +129,8 @@ impl MockRawMutex {
             }
 
             internal_state.number_to_wake_up -= 1;
-
-            if self.inner.load(Ordering::SeqCst) != val {
-                internal_state.number_blocked -= 1;
-                return Ok(UnblockedOrTimedOut::Unblocked);
-            }
+            internal_state.number_blocked -= 1;
+            return Ok(UnblockedOrTimedOut::Unblocked);
         }
     }
 }

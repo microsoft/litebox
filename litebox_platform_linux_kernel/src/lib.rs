@@ -194,13 +194,7 @@ impl<Host: HostInterface> RawMutex<Host> {
 
             match ret {
                 Ok(()) => {
-                    if self
-                        .underlying_atomic()
-                        .load(core::sync::atomic::Ordering::Relaxed)
-                        != val
-                    {
-                        return Ok(UnblockedOrTimedOut::Unblocked);
-                    }
+                    return Ok(UnblockedOrTimedOut::Unblocked);
                 }
                 Err(Errno::EAGAIN) => {
                     // If the futex value does not match val, then the call fails

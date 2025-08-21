@@ -249,10 +249,16 @@ pub trait RawMutex: Send + Sync {
     }
 
     /// If the underlying value is `val`, block until a wake operation wakes us up.
+    ///
+    /// Importantly, a wake operation does NOT guarantee that the underlying value has changed; it
+    /// only means that a wake operation has occured. However, an [`ImmediatelyWokenUp`] means that
+    /// the value had changed _before_ it went to sleep.
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp>;
 
     /// If the underlying value is `val`, block until a wake operation wakes us up, or some `time`
     /// has passed without a wake operation having occured.
+    ///
+    /// See comment on [`Self::block`] for more details on underlying value.
     fn block_or_timeout(
         &self,
         val: u32,

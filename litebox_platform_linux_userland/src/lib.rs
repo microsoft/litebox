@@ -540,9 +540,6 @@ impl litebox::platform::RawMutexProvider for LinuxUserland {
     }
 }
 
-// This raw-mutex design takes up more space than absolutely ideal and may possibly be optimized if
-// we can allow for spurious wake-ups. However, the current design makes sure that spurious wake-ups
-// do not actually occur, and that something that is `block`ed can only be woken up by a `wake`.
 pub struct RawMutex {
     // The `inner` is the value shown to the outside world as an underlying atomic.
     inner: AtomicU32,
@@ -589,9 +586,7 @@ impl RawMutex {
                 /* ignored */ 0,
             ) {
                 Ok(0) => {
-                    if self.inner.load(SeqCst) != val {
-                        return Ok(UnblockedOrTimedOut::Unblocked);
-                    }
+                    return Ok(UnblockedOrTimedOut::Unblocked);
                 }
                 Err(syscalls::Errno::EAGAIN) => {
                     if self.inner.load(SeqCst) != val {
