@@ -27,6 +27,38 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Panic {
         code: usize,
     },
+    GetProperty {
+        prop_set: TeePropSet,
+        index: usize,
+        name: Platform::RawMutPointer<u8>,
+        name_len: Platform::RawMutPointer<u32>,
+        buf: Platform::RawMutPointer<u8>,
+        blen: Platform::RawMutPointer<u32>,
+        prop_type: Platform::RawMutPointer<u32>,
+    },
+    GetPropertyNameToIndex {
+        prop_set: TeePropSet,
+        name: Platform::RawConstPointer<u8>,
+        name_len: usize,
+        index: Platform::RawMutPointer<u32>,
+    },
+    OpenTaSession {
+        ta_uuid: Platform::RawConstPointer<TeeUuid>,
+        cancel_req_to: u32,
+        usr_params: Platform::RawConstPointer<UteeParams>,
+        ta_sess_id: Platform::RawMutPointer<u32>,
+        ret_orig: Platform::RawMutPointer<TeeOrigin>,
+    },
+    CloseTaSession {
+        ta_sess_id: u32,
+    },
+    InvokeTaCommand {
+        ta_sess_id: u32,
+        cancel_req_to: u32,
+        cmd_id: u32,
+        params: Platform::RawConstPointer<UteeParams>,
+        ret_orig: Platform::RawMutPointer<TeeOrigin>,
+    },
     CheckAccessRights {
         flags: TeeMemoryAccessRights,
         buf: Platform::RawConstPointer<u8>,
@@ -94,8 +126,8 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
 // `litebox_common_optee` does use error codes for OP-TEE-like world (TAs) and Linux-like world (the LVBS platform).
 // for the below syscall handling, we use Linux error codes (i.e., `Errno`) because any errors will be returned
 // to the LVBS platform or runner.
-
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
+    #[allow(clippy::too_many_lines)]
     pub fn try_from_raw(syscall_number: usize, ctx: &PtRegs) -> Result<Self, Errno> {
         let ctx = SyscallContext::from_pt_regs(ctx);
         let sysnr = u32::try_from(syscall_number).map_err(|_| Errno::ENOSYS)?;
@@ -109,6 +141,38 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             },
             TeeSyscallNr::Panic => SyscallRequest::Panic {
                 code: ctx.syscall_arg(0),
+            },
+            TeeSyscallNr::GetProperty => SyscallRequest::GetProperty {
+                prop_set: TeePropSet::try_from_usize(ctx.syscall_arg(0))?,
+                index: ctx.syscall_arg(1),
+                name: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
+                name_len: Platform::RawMutPointer::from_usize(ctx.syscall_arg(3)),
+                buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
+                blen: Platform::RawMutPointer::from_usize(ctx.syscall_arg(5)),
+                prop_type: Platform::RawMutPointer::from_usize(ctx.syscall_arg(6)),
+            },
+            TeeSyscallNr::GetPropertyNameToIndex => SyscallRequest::GetPropertyNameToIndex {
+                prop_set: TeePropSet::try_from_usize(ctx.syscall_arg(0))?,
+                name: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
+                name_len: ctx.syscall_arg(2),
+                index: Platform::RawMutPointer::from_usize(ctx.syscall_arg(3)),
+            },
+            TeeSyscallNr::OpenTaSession => SyscallRequest::OpenTaSession {
+                ta_uuid: Platform::RawConstPointer::from_usize(ctx.syscall_arg(0)),
+                cancel_req_to: u32::try_from(ctx.syscall_arg(1)).map_err(|_| Errno::EINVAL)?,
+                usr_params: Platform::RawConstPointer::from_usize(ctx.syscall_arg(2)),
+                ta_sess_id: Platform::RawMutPointer::from_usize(ctx.syscall_arg(3)),
+                ret_orig: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
+            },
+            TeeSyscallNr::CloseTaSession => SyscallRequest::CloseTaSession {
+                ta_sess_id: u32::try_from(ctx.syscall_arg(0)).map_err(|_| Errno::EINVAL)?,
+            },
+            TeeSyscallNr::InvokeTaCommand => SyscallRequest::InvokeTaCommand {
+                ta_sess_id: u32::try_from(ctx.syscall_arg(0)).map_err(|_| Errno::EINVAL)?,
+                cancel_req_to: u32::try_from(ctx.syscall_arg(1)).map_err(|_| Errno::EINVAL)?,
+                cmd_id: u32::try_from(ctx.syscall_arg(2)).map_err(|_| Errno::EINVAL)?,
+                params: Platform::RawConstPointer::from_usize(ctx.syscall_arg(3)),
+                ret_orig: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
             },
             TeeSyscallNr::CheckAccessRights => SyscallRequest::CheckAccessRights {
                 flags: TeeMemoryAccessRights::try_from_usize(ctx.syscall_arg(0))?,
@@ -412,13 +476,21 @@ pub enum TeeAttributeType {
 
 /// `TEE_UUID` from `optee_os/lib/libutee/include/tee_api_types.h`. It uniquely identifies
 /// TAs, cryptographic keys, and more.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Default, Debug)]
 #[repr(C)]
 pub struct TeeUuid {
-    time_low: u32,
-    time_mid: u16,
-    time_hi_and_version: u16,
-    clock_seq_and_node: [u8; 8],
+    pub time_low: u32,
+    pub time_mid: u16,
+    pub time_hi_and_version: u16,
+    pub clock_seq_and_node: [u8; 8],
+}
+
+/// `TEE_Identity` from `optee_os/lib/libutee/include/tee_api_types.h`.
+#[derive(Clone, Copy, PartialEq)]
+#[repr(C)]
+pub struct TeeIdentity {
+    pub login: TeeLogin,
+    pub uuid: TeeUuid,
 }
 
 /// `TEE_ObjectInfo` from `optee_os/lib/libutee/include/tee_api_types.h`
@@ -483,6 +555,27 @@ impl TeeObjectInfo {
     }
 }
 
+const TEE_LOGIN_PUBLIC: u32 = 0x0;
+const TEE_LOGIN_USER: u32 = 0x1;
+const TEE_LOGIN_GROUP: u32 = 0x2;
+const TEE_LOGIN_APPLICATION: u32 = 0x4;
+const TEE_LOGIN_APPLICATION_USER: u32 = 0x5;
+const TEE_LOGIN_APPLICATION_GROUP: u32 = 0x6;
+const TEE_LOGIN_TRUSTED_APP: u32 = 0xf000_0000;
+
+/// `TEE Login type` from `optee_os/lib/libutee/include/tee_api_defines.h`
+#[derive(Clone, Copy, PartialEq)]
+#[repr(u32)]
+pub enum TeeLogin {
+    Public = TEE_LOGIN_PUBLIC,
+    User = TEE_LOGIN_USER,
+    Group = TEE_LOGIN_GROUP,
+    Application = TEE_LOGIN_APPLICATION,
+    ApplicationUser = TEE_LOGIN_APPLICATION_USER,
+    ApplicationGroup = TEE_LOGIN_APPLICATION_GROUP,
+    TrustedApp = TEE_LOGIN_TRUSTED_APP,
+}
+
 const TEE_MODE_ENCRYPT: u32 = 0;
 const TEE_MODE_DECRYPT: u32 = 1;
 const TEE_MODE_SIGN: u32 = 2;
@@ -528,6 +621,27 @@ pub enum TeeOrigin {
 }
 
 impl TeeOrigin {
+    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+        u32::try_from(value)
+            .map_err(|_| Errno::EINVAL)
+            .and_then(|v| Self::try_from(v).map_err(|_| Errno::EINVAL))
+    }
+}
+
+const TEE_PROPSET_TEE_IMPLEMENTATION: u32 = 0xffff_fffd;
+const TEE_PROPSET_CURRENT_CLIENT: u32 = 0xffff_fffe;
+const TEE_PROPSET_CURRENT_TA: u32 = 0xffff_ffff;
+
+/// Property sets pseudo handles from `optee_os/lib/libutee/include/tee_api_defines.h`
+#[derive(Clone, Copy, TryFromPrimitive, PartialEq)]
+#[repr(u32)]
+pub enum TeePropSet {
+    TeeImplementation = TEE_PROPSET_TEE_IMPLEMENTATION,
+    CurrentClient = TEE_PROPSET_CURRENT_CLIENT,
+    CurrentTa = TEE_PROPSET_CURRENT_TA,
+}
+
+impl TeePropSet {
     pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
         u32::try_from(value)
             .map_err(|_| Errno::EINVAL)
@@ -744,4 +858,22 @@ pub enum UteeEntryFunc {
     CloseSession = UTEE_ENTRY_FUNC_CLOSE_SESSION,
     InvokeCommand = UTEE_ENTRY_FUNC_INVOKE_COMMEND,
     Unknown = 0xffff_ffff,
+}
+
+const USER_TA_PROP_TYPE_BOOL: u32 = 0;
+const USER_TA_PROP_TYPE_U32: u32 = 1;
+const USER_TA_PROP_TYPE_UUID: u32 = 2;
+const USER_TA_PROP_TYPE_IDENTITY: u32 = 3;
+const USER_TA_PROP_TYPE_STRING: u32 = 4;
+const USER_TA_PROP_TYPE_BINARY_BLOCK: u32 = 5;
+
+#[derive(Clone, Copy)]
+#[repr(u32)]
+pub enum UserTaPropType {
+    Bool = USER_TA_PROP_TYPE_BOOL,
+    U32 = USER_TA_PROP_TYPE_U32,
+    Uuid = USER_TA_PROP_TYPE_UUID,
+    Identity = USER_TA_PROP_TYPE_IDENTITY,
+    String = USER_TA_PROP_TYPE_STRING,
+    BinaryBlock = USER_TA_PROP_TYPE_BINARY_BLOCK,
 }

@@ -1,0 +1,32 @@
+[
+  {
+    "func_id": "open_session",
+    "args": [
+      {
+        "param_type": "value_input",
+        "value_a": 0,
+        "value_b": 0
+      },
+      {
+        "param_type": "value_output"
+      }
+    ]
+  },
+  {
+    "func_id": "invoke_command",
+    "cmd_id": 4,
+    "args": [
+      {
+        "param_type": "memref_input",
+        "data_base64": "AwAAAAQAAABKiCTN5GFOs6a+FgXARp22AAgAAAIAAAA="
+      },
+      {
+        "param_type": "memref_output",
+        "buffer_size": 1024
+      }
+    ]
+  },
+  {
+    "func_id": "close_session"
+  }
+]
