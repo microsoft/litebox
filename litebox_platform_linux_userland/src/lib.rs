@@ -761,6 +761,7 @@ pub struct PunchthroughToken {
 
 impl litebox::platform::PunchthroughToken for PunchthroughToken {
     type Punchthrough = PunchthroughSyscall<LinuxUserland>;
+    #[expect(clippy::too_many_lines)]
     fn execute(
         self,
     ) -> Result<
