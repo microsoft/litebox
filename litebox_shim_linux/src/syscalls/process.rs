@@ -510,8 +510,9 @@ pub(crate) fn sys_time(
     token
         .execute()
         .map(|seconds_usize| {
-            // Convert usize back to time_t
-            seconds_usize as litebox_common_linux::time_t
+            // Safe conversion from usize to time_t (i64)
+            litebox_common_linux::time_t::try_from(seconds_usize)
+                .unwrap_or(litebox_common_linux::time_t::MAX)
         })
         .unwrap_or(0)
 }
