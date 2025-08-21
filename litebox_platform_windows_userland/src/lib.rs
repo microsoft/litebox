@@ -507,9 +507,7 @@ impl RawMutex {
             };
 
             if ok {
-                if self.inner.load(SeqCst) != val {
-                    break Ok(UnblockedOrTimedOut::Unblocked);
-                }
+                break Ok(UnblockedOrTimedOut::Unblocked);
             } else {
                 // Check why WaitOnAddress failed
                 let err = unsafe { GetLastError() };

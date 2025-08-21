@@ -120,11 +120,8 @@ impl MockRawMutex {
             }
 
             internal_state.number_to_wake_up -= 1;
-
-            if self.inner.load(Ordering::SeqCst) != val {
-                internal_state.number_blocked -= 1;
-                return Ok(UnblockedOrTimedOut::Unblocked);
-            }
+            internal_state.number_blocked -= 1;
+            return Ok(UnblockedOrTimedOut::Unblocked);
         }
     }
 }
