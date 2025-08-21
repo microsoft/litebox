@@ -880,6 +880,11 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 _ => panic!("unexpected error {err}"),
             })
             .map_err(litebox::platform::PunchthroughError::Failure),
+            _ => {
+                unimplemented!(
+                    "PunchthroughToken for LinuxUserland is not fully implemented yet"
+                );
+            }
         }
     }
 }

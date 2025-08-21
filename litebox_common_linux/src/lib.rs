@@ -2338,6 +2338,21 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
     WakeByAddress {
         addr: Platform::RawMutPointer<i32>,
     },
+    ClockGettime {
+        clockid: i32,
+        tp: Platform::RawMutPointer<Timespec>,
+    },
+    ClockGetres {
+        clockid: i32,
+        res: Platform::RawMutPointer<Timespec>,
+    },
+    Gettimeofday {
+        tv: Platform::RawMutPointer<TimeVal>,
+        tz: Platform::RawMutPointer<TimeZone>,
+    },
+    Time {
+        tloc: Platform::RawMutPointer<time_t>,
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> litebox::platform::Punchthrough
