@@ -110,6 +110,7 @@ pub extern "C" fn sandbox_process_init(
     litebox_shim_linux::set_fs(fs);
     litebox_platform_multiplex::set_platform(platform);
 
+    // TODO: get path, argv, and envp from `boot_params`.
     let aux = litebox_shim_linux::loader::auxv::init_auxv();
     let loaded_program = match litebox_shim_linux::loader::load_program(
         "/test",

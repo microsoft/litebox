@@ -19,6 +19,9 @@ const HV_X64_MSR_GUEST_OS_ID: u32 = 0x40000000;
 
 const SVM_EXIT_MSR: u64 = 0x07c;
 
+// LiteBox OS ID: use some random number for now
+const LITEBOX_OS_ID: u64 = 0x123;
+
 fn str2u64(s: &str, start: usize, size: usize) -> u64 {
     let mut buf = [0u8; 8];
     buf[0..size].copy_from_slice(&s.as_bytes()[start..(start + size)]);
@@ -41,7 +44,7 @@ pub fn ghcb_prints(s: &str) {
     wrmsr(GHCB_MSR, orig_val);
 }
 
-fn ghcb_msr_protocol(request: u64) -> u64 {
+fn ghcb_msr_call(request: u64) -> u64 {
     // Save the current GHCB MSR value
     let value: u64 = rdmsr(GHCB_MSR);
 
@@ -205,7 +208,7 @@ impl GhcbProtocol {
     }
 
     fn sev_es_negotiate_protocol() -> Option<()> {
-        let val = ghcb_msr_protocol(GHCB_SEV_INFO_REQ);
+        let val = ghcb_msr_call(GHCB_SEV_INFO_REQ);
         let code = val & GHCB_MSR_INFO_MASK;
         if code != GHCB_SEV_INFO {
             print_str_and_int!("Failed to negotiate GHCB protocol: ", val, 16);
@@ -217,8 +220,7 @@ impl GhcbProtocol {
     pub fn setup_ghcb_page(pa: PhysAddr, va: VirtAddr) -> Option<()> {
         Self::sev_es_negotiate_protocol()?;
 
-        // let pfn = pa.frame_number() as u64;
-        let val = ghcb_msr_protocol(GHCB_REGISTER_GPA_REQ | pa.as_u64());
+        let val = ghcb_msr_call(GHCB_REGISTER_GPA_REQ | pa.as_u64());
         let code = val & GHCB_MSR_INFO_MASK;
         let ret_pa = val & !GHCB_MSR_INFO_MASK;
         if code != GHCB_REGISTER_GPA_RESP || ret_pa != pa.as_u64() {
@@ -227,10 +229,10 @@ impl GhcbProtocol {
             return None;
         }
 
-        /* specify the guest physical address of the GHCB page
-         * so that the hypervisor can identify it */
+        // specify the guest physical address of the GHCB page
+        // so that the hypervisor can identify it
         crate::arch::instructions::wrmsr(GHCB_MSR, pa.as_u64());
 
-        Self::ghcb_write_msr(va, HV_X64_MSR_GUEST_OS_ID, 0x123)
+        Self::ghcb_write_msr(va, HV_X64_MSR_GUEST_OS_ID, LITEBOX_OS_ID)
     }
 }
