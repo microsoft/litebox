@@ -1366,7 +1366,7 @@ pub struct CapData {
     pub inheritable: u32,
 }
 
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone)]
 pub struct LinuxDirent64 {
     /// Inode number
@@ -1382,7 +1382,8 @@ pub struct LinuxDirent64 {
     ///
     /// This is a flexible array member (FAM) with variable length. The actual name data
     /// follows immediately after this struct in memory.
-    pub name: [u8; 0],
+    #[allow(clippy::pub_underscore_fields)]
+    pub __name: [u8; 0],
 }
 
 /// Request to syscall handler

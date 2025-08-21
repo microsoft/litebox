@@ -955,7 +955,7 @@ pub fn sys_dup(oldfd: i32, newfd: Option<i32>, flags: Option<OFlags>) -> Result<
 struct Diroff(usize);
 
 const DIRENT_STRUCT_BYTES_WITHOUT_NAME: usize =
-    core::mem::offset_of!(litebox_common_linux::LinuxDirent64, name);
+    core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name);
 
 /// Handle syscall `getdents64`
 pub(crate) fn sys_getdirent64(fd: i32, dirp: MutPtr<u8>, count: usize) -> Result<usize, Errno> {
@@ -989,7 +989,7 @@ pub(crate) fn sys_getdirent64(fd: i32, dirp: MutPtr<u8>, count: usize) -> Result
             off: dir_off as u64,
             len: len.truncate(),
             typ: litebox_common_linux::DirentType::from(entry.file_type.clone()) as u8,
-            name: [0; 0],
+            __name: [0; 0],
         };
         let hdr_ptr = crate::MutPtr::from_usize(dirp.as_usize() + nbytes);
         unsafe { hdr_ptr.write_at_offset(0, dirent64) }.ok_or(Errno::EFAULT)?;

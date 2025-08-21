@@ -180,13 +180,22 @@ fn test_getdent64() {
     let mut found_entries = alloc::vec::Vec::new();
 
     while offset < bytes_read {
-        let dirent_ptr = unsafe {
-            buffer
-                .as_ptr()
-                .add(offset)
-                .cast::<litebox_common_linux::LinuxDirent64>()
+        assert!(
+            unsafe { buffer.as_ptr().add(offset) }.addr()
+                & (core::mem::align_of::<litebox_common_linux::LinuxDirent64>() - 1)
+                == 0,
+            "Pointer at offset {} is not aligned for LinuxDirent64 (requires {}-byte alignment)",
+            offset,
+            core::mem::align_of::<litebox_common_linux::LinuxDirent64>()
+        );
+        let dirent = unsafe {
+            core::ptr::read_unaligned(
+                buffer
+                    .as_ptr()
+                    .add(offset)
+                    .cast::<litebox_common_linux::LinuxDirent64>(),
+            )
         };
-        let dirent = unsafe { &*dirent_ptr };
 
         // Validate the entry length
         assert!(dirent.len > 0, "Directory entry length must be positive");
@@ -198,10 +207,10 @@ fn test_getdent64() {
         let name_ptr = unsafe {
             buffer
                 .as_ptr()
-                .add(offset + core::mem::offset_of!(litebox_common_linux::LinuxDirent64, name))
+                .add(offset + core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name))
         };
-        let name_len =
-            dirent.len as usize - core::mem::offset_of!(litebox_common_linux::LinuxDirent64, name);
+        let name_len = dirent.len as usize
+            - core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name);
         let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
 
         // Find the null terminator
@@ -271,10 +280,13 @@ fn test_getdent64() {
     assert!(bytes <= small_buffer.len(), "Should not exceed buffer size");
     // If bytes > 0, verify the structure is valid
     if bytes > 0 {
-        let dirent_ptr = small_buffer
-            .as_ptr()
-            .cast::<litebox_common_linux::LinuxDirent64>();
-        let dirent = unsafe { &*dirent_ptr };
+        let dirent = unsafe {
+            core::ptr::read_unaligned(
+                small_buffer
+                    .as_ptr()
+                    .cast::<litebox_common_linux::LinuxDirent64>(),
+            )
+        };
         assert!(
             dirent.len as usize <= bytes,
             "First entry length should fit in returned bytes"
@@ -342,13 +354,14 @@ fn test_getdent64() {
         // Parse entries from this chunk
         let mut offset = 0;
         while offset < bytes_read {
-            let dirent_ptr = unsafe {
-                chunk_buffer
-                    .as_ptr()
-                    .add(offset)
-                    .cast::<litebox_common_linux::LinuxDirent64>()
+            let dirent = unsafe {
+                core::ptr::read_unaligned(
+                    chunk_buffer
+                        .as_ptr()
+                        .add(offset)
+                        .cast::<litebox_common_linux::LinuxDirent64>(),
+                )
             };
-            let dirent = unsafe { &*dirent_ptr };
 
             assert!(dirent.len > 0, "Entry length must be positive");
             assert!(
@@ -357,12 +370,12 @@ fn test_getdent64() {
             );
 
             let name_ptr = unsafe {
-                chunk_buffer
-                    .as_ptr()
-                    .add(offset + core::mem::offset_of!(litebox_common_linux::LinuxDirent64, name))
+                chunk_buffer.as_ptr().add(
+                    offset + core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name),
+                )
             };
             let name_len = dirent.len as usize
-                - core::mem::offset_of!(litebox_common_linux::LinuxDirent64, name);
+                - core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name);
             let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
 
             let null_pos = name_bytes
