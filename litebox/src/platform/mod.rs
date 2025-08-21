@@ -306,7 +306,6 @@ pub enum ReceiveError {
 /// An interface to understanding time.
 pub trait TimeProvider {
     type Instant: Instant;
-
     /// Returns an instant coresponding to "now".
     fn now(&self) -> Self::Instant;
 }
