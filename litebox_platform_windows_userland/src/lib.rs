@@ -914,8 +914,8 @@ fn werr_text(err: u32) -> String {
         let flags = Win32_Debug::FORMAT_MESSAGE_ALLOCATE_BUFFER
             | Win32_Debug::FORMAT_MESSAGE_FROM_SYSTEM
             | Win32_Debug::FORMAT_MESSAGE_IGNORE_INSERTS;
-        // If dwFlags includes FORMAT_MESSAGE_ALLOCATE_BUFFER, the function 
-        // allocates a buffer using the LocalAlloc function, and places the 
+        // If dwFlags includes FORMAT_MESSAGE_ALLOCATE_BUFFER, the function
+        // allocates a buffer using the LocalAlloc function, and places the
         // pointer to the buffer at the address specified in lpBuffer.
         let len = Win32_Debug::FormatMessageW(
             flags,
@@ -1173,15 +1173,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 0,
             )
         };
-        assert!(
-            !addr.is_null(),
-            "VirtualAlloc2 failed. Address: {:p}, Size: {}, Permissions: {:?}. Error: {} str: {}",
-            aligned_base_addr,
-            region_free_size,
-            initial_permissions,
-            unsafe { GetLastError() },
-            werr_text(unsafe { GetLastError() })
-        );
+        assert!(!addr.is_null(), "{}", {
+            let last_error = unsafe { GetLastError() };
+            format!(
+                "VirtualAlloc2 failed. Address: {:p}, Size: {}, Permissions: {:?}. Error: {} str: {}",
+                aligned_base_addr,
+                region_free_size,
+                initial_permissions,
+                last_error,
+                werr_text(last_error)
+            )
+        });
 
         if fixed_address {
             assert!(
@@ -1259,14 +1261,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                         Win32_Memory::MEM_RELEASE,
                     ) != 0
                 };
-                assert!(
-                    ok,
-                    "VirtualFree(MEM_RELEASE) on range ({:p} - {:p}) failed: {}. str: {}",
-                    region_to_free.start as *mut c_void,
-                    region_to_free.end as *mut c_void,
-                    unsafe { GetLastError() },
-                    werr_text(unsafe { GetLastError() })
-                );
+                assert!(ok, "{}", {
+                    let last_error = unsafe { GetLastError() };
+                    format!(
+                        "VirtualFree(MEM_RELEASE) on range ({:p} - {:p}) failed: {}. str: {}",
+                        region_to_free.start as *mut c_void,
+                        region_to_free.end as *mut c_void,
+                        last_error,
+                        werr_text(last_error)
+                    )
+                });
             }
         } else {
             let mut decommit_base = range.start;
@@ -1288,14 +1292,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                         Win32_Memory::MEM_DECOMMIT,
                     ) != 0
                 };
-                assert!(
-                    ok,
-                    "VirtualFree(MEM_DECOMMIT) on range ({:p} - {:p}) failed: {}. str: {}",
-                    decommit_base as *mut c_void,
-                    (decommit_base + free_size) as *mut c_void,
-                    unsafe { GetLastError() },
-                    werr_text(unsafe { GetLastError() })
-                );
+                assert!(ok, "{}", {
+                    let last_error = unsafe { GetLastError() };
+                    format!(
+                        "VirtualFree(MEM_DECOMMIT) on range ({:p} - {:p}) failed: {}. str: {}",
+                        decommit_base as *mut c_void,
+                        (decommit_base + free_size) as *mut c_void,
+                        last_error,
+                        werr_text(last_error)
+                    )
+                });
 
                 decommit_base = next;
             }
