@@ -455,9 +455,11 @@ pub(crate) fn sys_get_robust_list(
 }
 
 /// Handle syscall `clock_gettime`.
-pub(crate) fn sys_clock_gettime(clockid: i32, tp: crate::MutPtr<litebox_common_linux::Timespec>) -> Result<(), Errno> {
-    let punchthrough =
-        litebox_common_linux::PunchthroughSyscall::ClockGettime { clockid, tp };
+pub(crate) fn sys_clock_gettime(
+    clockid: i32,
+    tp: crate::MutPtr<litebox_common_linux::Timespec>,
+) -> Result<(), Errno> {
+    let punchthrough = litebox_common_linux::PunchthroughSyscall::ClockGettime { clockid, tp };
     let token = litebox_platform_multiplex::platform()
         .get_punchthrough_token_for(punchthrough)
         .expect("Failed to get punchthrough token for CLOCK_GETTIME");
@@ -487,8 +489,7 @@ pub(crate) fn sys_gettimeofday(
     tv: crate::MutPtr<litebox_common_linux::TimeVal>,
     tz: crate::MutPtr<litebox_common_linux::TimeZone>,
 ) -> Result<(), Errno> {
-    let punchthrough =
-        litebox_common_linux::PunchthroughSyscall::Gettimeofday { tv, tz };
+    let punchthrough = litebox_common_linux::PunchthroughSyscall::Gettimeofday { tv, tz };
     let token = litebox_platform_multiplex::platform()
         .get_punchthrough_token_for(punchthrough)
         .expect("Failed to get punchthrough token for GETTIMEOFDAY");
@@ -502,15 +503,17 @@ pub(crate) fn sys_gettimeofday(
 pub(crate) fn sys_time(
     tloc: crate::MutPtr<litebox_common_linux::time_t>,
 ) -> litebox_common_linux::time_t {
-    let punchthrough =
-        litebox_common_linux::PunchthroughSyscall::Time { tloc };
+    let punchthrough = litebox_common_linux::PunchthroughSyscall::Time { tloc };
     let token = litebox_platform_multiplex::platform()
         .get_punchthrough_token_for(punchthrough)
         .expect("Failed to get punchthrough token for TIME");
-    token.execute().map(|seconds_usize| {
-        // Convert usize back to time_t
-        seconds_usize as litebox_common_linux::time_t
-    }).unwrap_or(0)
+    token
+        .execute()
+        .map(|seconds_usize| {
+            // Convert usize back to time_t
+            seconds_usize as litebox_common_linux::time_t
+        })
+        .unwrap_or(0)
 }
 
 /// Handle syscall `getpid`.

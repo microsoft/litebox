@@ -873,9 +873,7 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
             })
             .map_err(litebox::platform::PunchthroughError::Failure),
             _ => {
-                unimplemented!(
-                    "PunchthroughToken for LinuxUserland is not fully implemented yet"
-                );
+                unimplemented!("PunchthroughToken for LinuxUserland is not fully implemented yet");
             }
         }
     }

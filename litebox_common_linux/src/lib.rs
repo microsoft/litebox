@@ -706,7 +706,7 @@ impl TryFrom<TimeVal> for core::time::Duration {
     }
 }
 
-#[allow(clippy::cast_possible_wrap)]
+#[expect(clippy::cast_possible_wrap)]
 impl From<Timespec> for TimeVal {
     fn from(timespec: Timespec) -> Self {
         // Convert seconds to time_t
@@ -718,7 +718,6 @@ impl From<Timespec> for TimeVal {
             suseconds_t::MAX
         } else {
             // Safe cast: we've already checked that microseconds <= suseconds_t::MAX
-
             microseconds as suseconds_t
         };
 

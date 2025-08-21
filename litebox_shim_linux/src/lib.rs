@@ -510,11 +510,9 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
                     .ok_or(Errno::EFAULT)
             })
         }),
-        SyscallRequest::Gettimeofday { tv, tz } => {
-            syscalls::process::sys_gettimeofday(tv, tz)
-                                .map(|()| 0)
-                                .ok_or(Errno::EFAULT)
-        }
+        SyscallRequest::Gettimeofday { tv, tz } => syscalls::process::sys_gettimeofday(tv, tz)
+            .map(|()| 0)
+            .ok_or(Errno::EFAULT),
         SyscallRequest::ClockGettime { clockid, tp } => {
             syscalls::process::sys_clock_gettime(clockid, tp)
                 .map(|()| 0)

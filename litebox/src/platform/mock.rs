@@ -218,19 +218,11 @@ impl Instant for MockInstant {
 
 impl TimeProvider for MockPlatform {
     type Instant = MockInstant;
-    type Timespec = ();
 
     fn now(&self) -> Self::Instant {
         MockInstant {
             time: self.current_time.fetch_add(1, Ordering::SeqCst),
         }
-    }
-
-    fn get_timespec(&self, clock_type: ClockType) -> Self::Timespec {
-        unimplemented!(
-            "get_timespec is not implemented for MockPlatform. clock_type: {:?}",
-            clock_type
-        );
     }
 }
 

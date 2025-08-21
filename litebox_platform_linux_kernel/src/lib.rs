@@ -73,9 +73,7 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
             }
             PunchthroughSyscall::WakeByAddress { .. } => todo!(),
             _ => {
-                unimplemented!(
-                    "PunchthroughToken for LinuxKernel is not fully implemented yet"
-                );
+                unimplemented!("PunchthroughToken for LinuxKernel is not fully implemented yet");
             }
         };
         match r {
