@@ -103,9 +103,9 @@ const FILETIME_TO_UNIX_EPOCH: u64 = 116_444_736_000_000_000; // 100ns units
 
 // Get current time as timespec for specified clock type
 // Returns (seconds, nanoseconds)
-pub fn get_timespec(clock_id: litebox::platform::ClockType) -> (i64, i64) {
+pub fn get_timespec(clock_id: i32) -> (i64, i64) {
     match clock_id {
-        litebox::platform::ClockType::Realtime => {
+        litebox_common_linux::CLOCK_REALTIME | litebox_common_linux::CLOCK_REALTIME_COARSE => {
             // CLOCK_REALTIME
             unsafe {
                 let mut ft: u64 = 0;
@@ -117,10 +117,13 @@ pub fn get_timespec(clock_id: litebox::platform::ClockType) -> (i64, i64) {
                 (seconds as i64, nanoseconds as i64)
             }
         }
-        litebox::platform::ClockType::Monotonic => {
+        litebox_common_linux::CLOCK_MONOTONIC | litebox_common_linux::CLOCK_MONOTONIC_COARSE => {
             // CLOCK_MONOTONIC
             let instant: PerformanceCounterInstant = PerformanceCounterInstant::now();
             instant.to_timespec_monotonic()
+        }
+        _ => {
+            unimplemented!("get_timespec for clock_id {} is not implemented", clock_id);
         }
     }
 }

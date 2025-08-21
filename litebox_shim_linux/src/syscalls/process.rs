@@ -455,19 +455,16 @@ pub(crate) fn sys_get_robust_list(
 }
 
 /// Handle syscall `clock_gettime`.
-pub(crate) fn sys_clock_gettime(clockid: i32, tp: crate::MutPtr<litebox_common_linux::Timespec>) {
-    let clocktype = match clockid {
-        litebox_common_linux::CLOCK_REALTIME | litebox_common_linux::CLOCK_REALTIME_COARSE => {
-            litebox::platform::ClockType::Realtime
-        }
-        litebox_common_linux::CLOCK_MONOTONIC | litebox_common_linux::CLOCK_MONOZTONIC_COARSE => {
-            litebox::platform::ClockType::Monotonic
-        }
-        _ => panic!("Unsupported clock ID: {}", clockid),
-    };
-
-    let timespec = litebox_platform_multiplex::platform().get_timespec(clocktype);
-    unsafe { tp.write_at_offset(0, timespec) };
+pub(crate) fn sys_clock_gettime(clockid: i32, tp: crate::MutPtr<litebox_common_linux::Timespec>) -> Result<(), Errno> {
+    let punchthrough =
+        litebox_common_linux::PunchthroughSyscall::ClockGettime { clockid, tp };
+    let token = litebox_platform_multiplex::platform()
+        .get_punchthrough_token_for(punchthrough)
+        .expect("Failed to get punchthrough token for CLOCK_GETTIME");
+    token.execute().map(|_| ()).map_err(|e| match e {
+        litebox::platform::PunchthroughError::Failure(errno) => errno,
+        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+    })
 }
 
 /// Handle syscall `clock_getres`.
@@ -489,36 +486,31 @@ pub(crate) fn sys_clock_getres(_clockid: i32, res: crate::MutPtr<litebox_common_
 pub(crate) fn sys_gettimeofday(
     tv: crate::MutPtr<litebox_common_linux::TimeVal>,
     tz: crate::MutPtr<litebox_common_linux::TimeZone>,
-) {
-    // Get current realtime (wall clock time)
-    let timespec =
-        litebox_platform_multiplex::platform().get_timespec(litebox::platform::ClockType::Realtime);
-
-    // Convert to TimeVal if requested.
-    let timeval = litebox_common_linux::TimeVal::from(timespec);
-    unsafe { tv.write_at_offset(0, timeval) };
-
-    // Handle timezone parameter (usually NULL and deprecated)
-    // Return timezone as UTC (0 minutes west, no DST)
-    let timezone = litebox_common_linux::TimeZone::new(0, 0);
-    unsafe { tz.write_at_offset(0, timezone) };
+) -> Result<(), Errno> {
+    let punchthrough =
+        litebox_common_linux::PunchthroughSyscall::Gettimeofday { tv, tz };
+    let token = litebox_platform_multiplex::platform()
+        .get_punchthrough_token_for(punchthrough)
+        .expect("Failed to get punchthrough token for GETTIMEOFDAY");
+    token.execute().map(|_| ()).map_err(|e| match e {
+        litebox::platform::PunchthroughError::Failure(errno) => errno,
+        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+    })
 }
 
 /// Handle syscall `time`.
 pub(crate) fn sys_time(
     tloc: crate::MutPtr<litebox_common_linux::time_t>,
 ) -> litebox_common_linux::time_t {
-    // Get current realtime (wall clock time)
-    let timespec =
-        litebox_platform_multiplex::platform().get_timespec(litebox::platform::ClockType::Realtime);
-
-    // Extract seconds as time_t
-    let seconds = timespec.tv_sec as litebox_common_linux::time_t;
-
-    // Write to tloc
-    unsafe { tloc.write_at_offset(0, seconds) };
-
-    seconds
+    let punchthrough =
+        litebox_common_linux::PunchthroughSyscall::Time { tloc };
+    let token = litebox_platform_multiplex::platform()
+        .get_punchthrough_token_for(punchthrough)
+        .expect("Failed to get punchthrough token for TIME");
+    token.execute().map(|seconds_usize| {
+        // Convert usize back to time_t
+        seconds_usize as litebox_common_linux::time_t
+    }).unwrap_or(0)
 }
 
 /// Handle syscall `getpid`.

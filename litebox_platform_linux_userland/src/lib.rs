@@ -707,7 +707,6 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
 
 impl litebox::platform::TimeProvider for LinuxUserland {
     type Instant = Instant;
-    type Timespec = litebox_common_linux::Timespec;
 
     fn now(&self) -> Self::Instant {
         let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
@@ -720,13 +719,6 @@ impl litebox::platform::TimeProvider for LinuxUserland {
                 tv_nsec: u64::from(t.tv_nsec.reinterpret_as_unsigned()),
             },
         }
-    }
-
-    fn get_timespec(&self, clock_type: litebox::platform::ClockType) -> Self::Timespec {
-        unimplemented!(
-            "get_timespec is not implemented for LinuxUserland (vdso is assumed as available). clock type: {:?}",
-            clock_type
-        );
     }
 }
 

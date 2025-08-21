@@ -11,12 +11,12 @@ use std::cell::Cell;
 use std::os::raw::c_void;
 use std::sync::atomic::Ordering::SeqCst;
 
-use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::RawConstPointer;
 use litebox::platform::ThreadLocalStorageProvider;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
+use litebox::platform::{ImmediatelyWokenUp, RawMutPointer};
 use litebox_common_linux::PunchthroughSyscall;
 
 use windows_sys::Win32::Foundation as Win32_Foundation;
@@ -605,18 +605,9 @@ impl litebox::platform::IPInterfaceProvider for WindowsUserland {
 
 impl litebox::platform::TimeProvider for WindowsUserland {
     type Instant = Instant;
-    type Timespec = litebox_common_linux::Timespec;
 
     fn now(&self) -> Self::Instant {
         perf_counter::PerformanceCounterInstant::now().into()
-    }
-
-    fn get_timespec(&self, clock_type: litebox::platform::ClockType) -> Self::Timespec {
-        let (sec, nsec) = perf_counter::get_timespec(clock_type);
-        litebox_common_linux::Timespec {
-            tv_sec: sec,
-            tv_nsec: nsec as u64,
-        }
     }
 }
 
@@ -667,8 +658,6 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 Ok(0)
             }
             PunchthroughSyscall::GetFsBase { addr } => {
-                use litebox::platform::RawMutPointer as _;
-
                 // Read from the per-thread FS base storage to get the current value
                 let thread_state = WindowsUserland::get_thread_fs_base_state();
 
@@ -686,6 +675,34 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 Win32_Threading::WakeByAddressAll(addr.as_usize() as *const c_void);
                 Ok(0)
             },
+            PunchthroughSyscall::ClockGettime { clockid, tp } => {
+                let ts = perf_counter::get_timespec(clockid);
+                let clock_timespec = litebox_common_linux::Timespec {
+                    tv_sec: ts.0,
+                    tv_nsec: ts.1 as u64,
+                };
+                let _ = unsafe { tp.write_at_offset(0, clock_timespec) };
+                Ok(0)
+            }
+            PunchthroughSyscall::Gettimeofday { tv, tz } => {
+                let ts = perf_counter::get_timespec(litebox_common_linux::CLOCK_REALTIME);
+                let timeval = litebox_common_linux::TimeVal::from(litebox_common_linux::Timespec {
+                    tv_sec: ts.0,
+                    tv_nsec: ts.1 as u64,
+                });
+                let _ = unsafe { tv.write_at_offset(0, timeval) };
+                // Handle timezone parameter (usually NULL and deprecated)
+                // Return timezone as UTC (0 minutes west, no DST)
+                let timezone = litebox_common_linux::TimeZone::new(0, 0);
+                let _ = unsafe { tz.write_at_offset(0, timezone) };
+                Ok(0)
+            }
+            PunchthroughSyscall::Time { tloc } => {
+                let ts = perf_counter::get_timespec(litebox_common_linux::CLOCK_REALTIME);
+                let seconds = ts.0 as litebox_common_linux::time_t;
+                let _ = unsafe { tloc.write_at_offset(0, seconds) };
+                Ok(usize::try_from(seconds).unwrap_or(0))
+            }
             _ => {
                 unimplemented!(
                     "PunchthroughToken for WindowsUserland is not fully implemented yet"

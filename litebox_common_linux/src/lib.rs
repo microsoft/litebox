@@ -32,7 +32,7 @@ pub const FUTEX_REQUEUE: i32 = 3;
 pub const CLOCK_REALTIME: i32 = 0;
 pub const CLOCK_MONOTONIC: i32 = 1;
 pub const CLOCK_REALTIME_COARSE: i32 = 5;
-pub const CLOCK_MONOZTONIC_COARSE: i32 = 6;
+pub const CLOCK_MONOTONIC_COARSE: i32 = 6;
 
 /// Encoding for ioctl commands.
 pub mod ioctl {
@@ -2341,10 +2341,6 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
     ClockGettime {
         clockid: i32,
         tp: Platform::RawMutPointer<Timespec>,
-    },
-    ClockGetres {
-        clockid: i32,
-        res: Platform::RawMutPointer<Timespec>,
     },
     Gettimeofday {
         tv: Platform::RawMutPointer<TimeVal>,
