@@ -521,18 +521,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         };
 
         // find the directory path in the root entries by pointer-equality of the Arc
-        let parent_path = {
+        let mut parent_path = {
             let root = self.root.read();
-            let mut path = root
-                .entries
+            root.entries
                 .iter()
                 .find_map(|(path, entry)| match entry {
                     Entry::Dir(d) if alloc::sync::Arc::ptr_eq(d, dir) => Some(path.clone()),
                     _ => None,
                 })
-                .unwrap_or(String::new());
-            path.push('/');
-            path
+                .unwrap_or(String::new())
         };
 
         // helper to get NodeInfo by an entries-key (entries keys have no trailing '/')
@@ -567,11 +564,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         entries.push(DirEntry {
             name: "..".into(),
             file_type: FileType::Directory,
-            // entries keys don't have trailing '/'; "" for root
-            ino_info: get_node_info(parent_path.trim_end_matches('/')),
+            ino_info: get_node_info(&parent_path),
         });
 
-        // add normal children
+        // Append a trailing '/' to `parent_path`.
+        // An empty string (`""`) represents the root.
+        parent_path.push('/');
+
+        // Add normal children
         entries.extend(dir.read().children.iter().map(|(name, file_type)| {
             let mut full_path = parent_path.clone();
             full_path.push_str(name);

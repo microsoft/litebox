@@ -73,10 +73,6 @@ impl<T: Clone> RawMutPointer<T> for UserMutPtr<T> {
         todo!()
     }
 
-    unsafe fn write_slice_at_offset(self, _count: isize, _value: &[T]) -> Option<()> {
-        todo!()
-    }
-
     fn mutate_subslice_with<R>(
         self,
         _range: impl core::ops::RangeBounds<isize>,

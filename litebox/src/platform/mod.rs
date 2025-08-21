@@ -496,16 +496,24 @@ where
     #[must_use]
     unsafe fn write_at_offset(self, count: isize, value: T) -> Option<()>;
 
-    /// Write a slice of values at the offset.
+    /// Write a slice of values at the given offset.
     ///
-    /// Returns `None` if the provided pointer is invalid, or such an offset is known (in advance)
-    /// to be invalid.
+    /// Returns `None` if the provided pointer is invalid, or if the specified offset is known (in
+    /// advance) to be invalid; in that case there are no guarantees about how many values — if any —
+    /// have been written.
     ///
     /// # Safety
     ///
-    /// The offset must be valid location for the pointer.
+    /// All `values.len()` positions starting from the specified offset must be valid memory
+    /// locations for the pointer.
     #[must_use]
-    unsafe fn write_slice_at_offset(self, count: isize, value: &[T]) -> Option<()>;
+    unsafe fn write_slice_at_offset(self, count: isize, values: &[T]) -> Option<()> {
+        for (offset, v) in (count..).zip(values) {
+            // SAFETY: from the requirements of this function.
+            unsafe { self.write_at_offset(offset, v.clone()) }?;
+        }
+        Some(())
+    }
 
     /// Obtain a mutable (sub)slice of memory at the pointer, and run `f` upon it.
     ///
