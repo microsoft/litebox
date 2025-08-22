@@ -73,10 +73,6 @@ impl HostInterface for MockHostInterface {
         };
     }
 
-    fn exit() -> ! {
-        todo!()
-    }
-
     fn wake_many(_mutex: &AtomicU32, _n: usize) -> Result<usize, crate::Errno> {
         todo!()
     }
@@ -105,6 +101,14 @@ impl HostInterface for MockHostInterface {
         _stream: litebox::platform::StdioOutStream,
         _buf: &[u8],
     ) -> Result<usize, litebox_common_linux::errno::Errno> {
+        todo!()
+    }
+
+    fn return_to_host() -> ! {
+        todo!()
+    }
+
+    fn terminate_process(_code: i32) -> ! {
         todo!()
     }
 }

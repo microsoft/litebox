@@ -86,9 +86,8 @@ impl<Host: HostInterface> ExitProvider for LinuxKernel<Host> {
     type ExitCode = i32;
     const EXIT_SUCCESS: Self::ExitCode = 0;
     const EXIT_FAILURE: Self::ExitCode = 1;
-    fn exit(&self, _code: Self::ExitCode) -> ! {
-        // TODO: We should probably expand the host to handle an error code?
-        Host::exit()
+    fn exit(&self, code: Self::ExitCode) -> ! {
+        Host::terminate_process(code)
     }
 }
 
@@ -332,11 +331,8 @@ pub trait HostInterface {
     /// The caller must ensure that the `addr` is valid and was allocated by this [`Self::alloc`].
     unsafe fn free(addr: usize);
 
-    /// Exit
-    ///
-    /// Exit allows to come back to handle some requests from host,
-    /// but it should not return back to the caller.
-    fn exit() -> !;
+    /// Switch back to host
+    fn return_to_host() -> !;
 
     /// Terminate LiteBox
     fn terminate(reason_set: u64, reason_code: u64) -> !;
@@ -355,6 +351,9 @@ pub trait HostInterface {
         val: u32,
         timeout: Option<core::time::Duration>,
     ) -> Result<(), Errno>;
+
+    /// Terminate the current process.
+    fn terminate_process(code: i32) -> !;
 
     /// For Network
     fn send_ip_packet(packet: &[u8]) -> Result<usize, Errno>;
