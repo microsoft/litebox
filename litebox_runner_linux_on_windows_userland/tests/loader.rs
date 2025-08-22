@@ -185,7 +185,6 @@ fn test_static_linked_prog_with_rewriter() {
     common::test_load_exec_common(&executable_path);
 }
 
-// #[test]
 fn run_dynamic_linked_prog_with_rewriter(
     libs_to_rewrite: &[(&str, &str)],
     libs_no_rewrite: &[(&str, &str)],
@@ -352,5 +351,37 @@ fn test_testcase_dynamic_with_rewriter() {
         exec_name,
         &[],
         |_| {},
+    );
+}
+
+#[test]
+fn test_nodejs_with_rewriter() {
+    let exec_name = "node";
+    let libs_to_rewrite = [
+        ("libc.so.6", "/lib/x86_64-linux-gnu"),
+        ("libdl.so.2", "/lib/x86_64-linux-gnu"),
+        ("libstdc++.so.6", "/lib/x86_64-linux-gnu"),
+        ("libpthread.so.0", "/lib/x86_64-linux-gnu"),
+        ("libm.so.6", "/lib/x86_64-linux-gnu"),
+        ("libgcc_s.so.1", "/lib/x86_64-linux-gnu"),
+        ("ld-linux-x86-64.so.2", "/lib64"),
+    ];
+    let libs_no_rewrite = [("litebox_rtld_audit.so", "/lib64")];
+
+    const HELLO_WORLD_JS: &str = r"
+        const fs = require('node:fs');
+
+        const content = 'Hello World!';
+        console.log(content);
+        ";
+
+    run_dynamic_linked_prog_with_rewriter(
+        &libs_to_rewrite,
+        &libs_no_rewrite,
+        &exec_name,
+        &["/out/hello_world.js"],
+        |out_dir| {
+            std::fs::write(out_dir.join("hello_world.js"), HELLO_WORLD_JS).unwrap();
+        },
     );
 }
