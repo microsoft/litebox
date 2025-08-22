@@ -510,6 +510,22 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
                     .ok_or(Errno::EFAULT)
             })
         }),
+        SyscallRequest::Gettimeofday { tv, tz } => syscalls::process::sys_gettimeofday(tv, tz)
+            .map(|()| 0)
+            .map_err(|_| Errno::EFAULT),
+        SyscallRequest::ClockGettime { clockid, tp } => {
+            syscalls::process::sys_clock_gettime(clockid, tp)
+                .map(|()| 0)
+                .map_err(|_| Errno::EFAULT)
+        }
+        SyscallRequest::ClockGetres { clockid, res } => {
+            syscalls::process::sys_clock_getres(clockid, res);
+            Ok(0)
+        }
+        SyscallRequest::Time { tloc } => {
+            let second = syscalls::process::sys_time(tloc);
+            Ok(usize::try_from(second).unwrap_or(0))
+        }
         SyscallRequest::Openat {
             dirfd,
             pathname,

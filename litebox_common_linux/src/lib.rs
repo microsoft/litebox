@@ -28,6 +28,12 @@ pub const FUTEX_WAIT: i32 = 0;
 pub const FUTEX_WAKE: i32 = 1;
 pub const FUTEX_REQUEUE: i32 = 3;
 
+// linux/time.h
+pub const CLOCK_REALTIME: i32 = 0;
+pub const CLOCK_MONOTONIC: i32 = 1;
+pub const CLOCK_REALTIME_COARSE: i32 = 5;
+pub const CLOCK_MONOTONIC_COARSE: i32 = 6;
+
 /// Encoding for ioctl commands.
 pub mod ioctl {
     /// The number of bits allocated for the ioctl command number field.
@@ -727,6 +733,38 @@ impl TryFrom<TimeVal> for core::time::Duration {
                 u64::try_from(value.tv_sec).map_err(|_| errno::Errno::EDOM)?,
                 u32::try_from(value.tv_usec * 1000).map_err(|_| errno::Errno::EDOM)?,
             ))
+        }
+    }
+}
+
+impl From<Timespec> for TimeVal {
+    fn from(timespec: Timespec) -> Self {
+        // Convert seconds to time_t
+        let timeval_sec = timespec.tv_sec as time_t;
+
+        // Convert nanoseconds to microseconds, ensuring we don't overflow suseconds_t
+        let microseconds = timespec.tv_nsec / 1_000;
+        let timeval_u_sec = suseconds_t::try_from(microseconds).unwrap_or(suseconds_t::MAX);
+        TimeVal {
+            tv_sec: timeval_sec,
+            tv_usec: timeval_u_sec,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TimeZone {
+    tz_minuteswest: i32,
+    tz_dsttime: i32,
+}
+
+impl TimeZone {
+    /// Create a new TimeZone with the given minutes west of UTC and DST time flag
+    pub fn new(tz_minuteswest: i32, tz_dsttime: i32) -> Self {
+        Self {
+            tz_minuteswest,
+            tz_dsttime,
         }
     }
 }
@@ -1630,6 +1668,21 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     SetThreadArea {
         user_desc: Platform::RawMutPointer<UserDesc>,
     },
+    ClockGettime {
+        clockid: i32,
+        tp: Platform::RawMutPointer<Timespec>,
+    },
+    ClockGetres {
+        clockid: i32,
+        res: Platform::RawMutPointer<Timespec>,
+    },
+    Gettimeofday {
+        tv: Platform::RawMutPointer<TimeVal>,
+        tz: Platform::RawMutPointer<TimeZone>,
+    },
+    Time {
+        tloc: Platform::RawMutPointer<time_t>,
+    },
     Getrlimit {
         resource: RlimitResource,
         rlim: Platform::RawMutPointer<Rlimit>,
@@ -2042,6 +2095,21 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
                 bufsiz: ctx.syscall_arg(3),
             },
+            Sysno::gettimeofday => SyscallRequest::Gettimeofday {
+                tv: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
+                tz: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+            },
+            Sysno::clock_gettime => SyscallRequest::ClockGettime {
+                clockid: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                tp: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+            },
+            Sysno::clock_getres => SyscallRequest::ClockGetres {
+                clockid: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                res: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+            },
+            Sysno::time => SyscallRequest::Time {
+                tloc: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
+            },
             #[cfg(target_arch = "x86_64")]
             Sysno::getrlimit => {
                 let resource: i32 = ctx.syscall_arg(0).reinterpret_as_signed().truncate();
@@ -2336,6 +2404,17 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
     },
     WakeByAddress {
         addr: Platform::RawMutPointer<i32>,
+    },
+    ClockGettime {
+        clockid: i32,
+        tp: Platform::RawMutPointer<Timespec>,
+    },
+    Gettimeofday {
+        tv: Platform::RawMutPointer<TimeVal>,
+        tz: Platform::RawMutPointer<TimeZone>,
+    },
+    Time {
+        tloc: Platform::RawMutPointer<time_t>,
     },
 }
 
