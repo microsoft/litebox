@@ -873,12 +873,24 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 _ => panic!("unexpected error {err}"),
             })
             .map_err(litebox::platform::PunchthroughError::Failure),
+            #[expect(
+                unused_variables,
+                reason = "due to vdso, this would not be triggered on LinuxUserland"
+            )]
             PunchthroughSyscall::ClockGettime { clockid, tp } => {
                 unreachable!("Due to vdso, this would not be triggered on LinuxUserland.");
             }
+            #[expect(
+                unused_variables,
+                reason = "due to vdso, this would not be triggered on LinuxUserland"
+            )]
             PunchthroughSyscall::Gettimeofday { tv, tz } => {
                 unreachable!("Due to vdso, this would not be triggered on LinuxUserland.");
             }
+            #[expect(
+                unused_variables,
+                reason = "due to vdso, this would not be triggered on LinuxUserland"
+            )]
             PunchthroughSyscall::Time { tloc } => {
                 unreachable!("Due to vdso, this would not be triggered on LinuxUserland.");
             }
