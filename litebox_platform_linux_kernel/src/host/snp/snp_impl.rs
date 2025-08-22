@@ -2,7 +2,10 @@
 
 use core::arch::asm;
 
-use litebox::platform::{RawConstPointer, RawMutPointer};
+use litebox::{
+    platform::{RawConstPointer, RawMutPointer, ThreadLocalStorageProvider},
+    utils::ReinterpretUnsignedExt as _,
+};
 use litebox_common_linux::{SigSet, SigmaskHow};
 
 use super::ghcb::ghcb_prints;
@@ -72,6 +75,76 @@ mod alloc {
     }
 }
 
+/// Get the current task
+fn current() -> Option<&'static mut bindings::vsbox_task> {
+    let task: u64;
+    unsafe {
+        asm!("rdgsbase {}", out(reg) task, options(nostack, preserves_flags));
+
+        let addr = crate::arch::VirtAddr::new(task);
+        if addr.is_null() {
+            return None;
+        }
+
+        Some(&mut *addr.as_mut_ptr())
+    }
+}
+
+impl SnpLinuxKernel {
+    pub fn set_init_tls(&self, boot_params: &bindings::vmpl2_boot_params) {
+        let task = ::alloc::boxed::Box::new(litebox_common_linux::Task {
+            pid: boot_params.pid,
+            tid: boot_params.pid,
+            ppid: boot_params.ppid,
+            clear_child_tid: None,
+            robust_list: None,
+            credentials: ::alloc::sync::Arc::new(litebox_common_linux::Credentials {
+                uid: boot_params.uid as usize,
+                gid: boot_params.gid as usize,
+                euid: boot_params.euid as usize,
+                egid: boot_params.egid as usize,
+            }),
+        });
+        let tls = litebox_common_linux::ThreadLocalStorage::new(task);
+        self.set_thread_local_storage(tls);
+    }
+}
+
+impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
+    type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<SnpLinuxKernel>;
+
+    fn set_thread_local_storage(&self, value: Self::ThreadLocalStorage) {
+        let current_task = current().expect("Current task must be available");
+        assert!(current_task.tls.is_null(), "TLS should not be set yet");
+        let tls = ::alloc::boxed::Box::new(value);
+        current_task.tls = ::alloc::boxed::Box::into_raw(tls).cast();
+    }
+
+    fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
+    {
+        let current_task = current().expect("Current task must be available");
+        assert!(!current_task.tls.is_null(), "TLS should be set");
+        let tls = unsafe { &mut *current_task.tls.cast::<Self::ThreadLocalStorage>() };
+        assert!(!tls.borrowed, "TLS should not be borrowed");
+        tls.borrowed = true; // mark as borrowed
+        let ret = f(tls);
+        tls.borrowed = false; // mark as not borrowed
+        ret
+    }
+
+    fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
+        let current_task = current().expect("Current task must be available");
+        assert!(!current_task.tls.is_null(), "TLS should be set");
+        let tls = unsafe {
+            ::alloc::boxed::Box::from_raw(current_task.tls.cast::<Self::ThreadLocalStorage>())
+        };
+        current_task.tls = ::core::ptr::null_mut();
+        *tls
+    }
+}
+
 impl bindings::SnpVmplRequestArgs {
     #[inline]
     fn new_request(code: u32, size: u32, args: ArgsArray) -> Self {
@@ -109,6 +182,8 @@ const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 
 const NR_SYSCALL_FUTEX: u32 = 202;
 const NR_SYSCALL_RT_SIGPROCMASK: u32 = 14;
+const NR_SYSCALL_READ: u32 = 0;
+const NR_SYSCALL_WRITE: u32 = 1;
 
 const FUTEX_WAIT: i32 = 0;
 const FUTEX_WAKE: i32 = 1;
@@ -322,5 +397,35 @@ impl HostInterface for HostSnpInterface {
             ],
         })
         .map(|_| ())
+    }
+
+    fn read_from_stdin(buf: &mut [u8]) -> Result<usize, Errno> {
+        Self::syscalls(SyscallN::<3, NR_SYSCALL_READ> {
+            args: [
+                litebox_common_linux::STDIN_FILENO as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            ],
+        })
+    }
+
+    fn write_to(stream: litebox::platform::StdioOutStream, buf: &[u8]) -> Result<usize, Errno> {
+        Self::syscalls(SyscallN::<3, NR_SYSCALL_WRITE> {
+            args: [
+                u64::from(
+                    match stream {
+                        litebox::platform::StdioOutStream::Stdout => {
+                            litebox_common_linux::STDOUT_FILENO
+                        }
+                        litebox::platform::StdioOutStream::Stderr => {
+                            litebox_common_linux::STDERR_FILENO
+                        }
+                    }
+                    .reinterpret_as_unsigned(),
+                ),
+                buf.as_ptr() as u64,
+                buf.len() as u64,
+            ],
+        })
     }
 }
