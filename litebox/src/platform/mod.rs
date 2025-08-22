@@ -249,10 +249,16 @@ pub trait RawMutex: Send + Sync {
     }
 
     /// If the underlying value is `val`, block until a wake operation wakes us up.
+    ///
+    /// Importantly, a wake operation does NOT guarantee that the underlying value has changed; it
+    /// only means that a wake operation has occured. However, an [`ImmediatelyWokenUp`] means that
+    /// the value had changed _before_ it went to sleep.
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp>;
 
     /// If the underlying value is `val`, block until a wake operation wakes us up, or some `time`
     /// has passed without a wake operation having occured.
+    ///
+    /// See comment on [`Self::block`] for more details on underlying value.
     fn block_or_timeout(
         &self,
         val: u32,
@@ -489,6 +495,25 @@ where
     /// The offset must be valid location for the pointer.
     #[must_use]
     unsafe fn write_at_offset(self, count: isize, value: T) -> Option<()>;
+
+    /// Write a slice of values at the given offset.
+    ///
+    /// Returns `None` if the provided pointer is invalid, or if the specified offset is known (in
+    /// advance) to be invalid; in that case there are no guarantees about how many values — if any —
+    /// have been written.
+    ///
+    /// # Safety
+    ///
+    /// All `values.len()` positions starting from the specified offset must be valid memory
+    /// locations for the pointer.
+    #[must_use]
+    unsafe fn write_slice_at_offset(self, count: isize, values: &[T]) -> Option<()> {
+        for (offset, v) in (count..).zip(values) {
+            // SAFETY: from the requirements of this function.
+            unsafe { self.write_at_offset(offset, v.clone()) }?;
+        }
+        Some(())
+    }
 
     /// Obtain a mutable (sub)slice of memory at the pointer, and run `f` upon it.
     ///

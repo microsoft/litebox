@@ -540,9 +540,6 @@ impl litebox::platform::RawMutexProvider for LinuxUserland {
     }
 }
 
-// This raw-mutex design takes up more space than absolutely ideal and may possibly be optimized if
-// we can allow for spurious wake-ups. However, the current design makes sure that spurious wake-ups
-// do not actually occur, and that something that is `block`ed can only be woken up by a `wake`.
 pub struct RawMutex {
     // The `inner` is the value shown to the outside world as an underlying atomic.
     inner: AtomicU32,
@@ -589,9 +586,7 @@ impl RawMutex {
                 /* ignored */ 0,
             ) {
                 Ok(0) => {
-                    if self.inner.load(SeqCst) != val {
-                        return Ok(UnblockedOrTimedOut::Unblocked);
-                    }
+                    return Ok(UnblockedOrTimedOut::Unblocked);
                 }
                 Err(syscalls::Errno::EAGAIN) => {
                     if self.inner.load(SeqCst) != val {
@@ -1136,13 +1131,19 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 
 impl litebox::platform::StdioProvider for LinuxUserland {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
-        use std::io::Read as _;
-        std::io::stdin().read(buf).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::BrokenPipe {
-                litebox::platform::StdioReadError::Closed
-            } else {
-                panic!("unhandled error {err}")
-            }
+        unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::read,
+                usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap(),
+                buf.as_ptr() as usize,
+                buf.len(),
+                // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                syscall_intercept::SYSCALL_ARG_MAGIC,
+            )
+        }
+        .map_err(|err| match err {
+            syscalls::Errno::EPIPE => litebox::platform::StdioReadError::Closed,
+            _ => panic!("unhandled error {err}"),
         })
     }
 
@@ -1151,7 +1152,7 @@ impl litebox::platform::StdioProvider for LinuxUserland {
         stream: litebox::platform::StdioOutStream,
         buf: &[u8],
     ) -> Result<usize, litebox::platform::StdioWriteError> {
-        match unsafe {
+        unsafe {
             syscalls::syscall4(
                 syscalls::Sysno::write,
                 usize::try_from(match stream {
@@ -1168,11 +1169,11 @@ impl litebox::platform::StdioProvider for LinuxUserland {
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
                 syscall_intercept::SYSCALL_ARG_MAGIC,
             )
-        } {
-            Ok(n) => Ok(n),
-            Err(syscalls::Errno::EPIPE) => Err(litebox::platform::StdioWriteError::Closed),
-            Err(err) => panic!("unhandled error {err}"),
         }
+        .map_err(|err| match err {
+            syscalls::Errno::EPIPE => litebox::platform::StdioWriteError::Closed,
+            _ => panic!("unhandled error {err}"),
+        })
     }
 
     fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {
