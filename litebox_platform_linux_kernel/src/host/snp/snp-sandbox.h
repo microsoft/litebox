@@ -73,6 +73,19 @@ struct vmpl2_boot_params {
 	uint64_t ghcb_page_va;
 
 	uint64_t cpu_khz;
+
+	/// Thread ID - the internal kernel "pid"
+	int32_t pid;
+	/// Parent Process ID
+	int32_t ppid;
+	/// real UID of the task
+	uint32_t uid;
+	/// real GID of the task
+	uint32_t gid;
+	/// effective UID of the task
+	uint32_t euid;
+	/// effective GID of the task
+	uint32_t egid;
 } __attribute__((__packed__));
 
 #define MAX_ROOTPATH_SIZE 256
@@ -111,6 +124,9 @@ struct vsbox_task {
 	uint64_t rootpath_len;
 	uint8_t rootpath[MAX_ROOTPATH_SIZE];
 	uint64_t snp_vmpl0_mem_base;
+
+	// Thread-local storage used by VMPL2
+	void *tls;
 
 	// accessible but not directly used by the sandbox kernel
 	// must be kept at the bottom of this struct because

@@ -445,25 +445,6 @@ impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKern
     }
 }
 
-impl<Host: HostInterface> litebox::platform::ThreadLocalStorageProvider for LinuxKernel<Host> {
-    type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<LinuxKernel<Host>>;
-
-    fn set_thread_local_storage(&self, _value: Self::ThreadLocalStorage) {
-        todo!()
-    }
-
-    fn with_thread_local_storage_mut<F, R>(&self, _f: F) -> R
-    where
-        F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
-    {
-        todo!()
-    }
-
-    fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
-        todo!()
-    }
-}
-
 impl<Host: HostInterface> litebox::platform::ThreadProvider for LinuxKernel<Host> {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadArgs = litebox_common_linux::NewThreadArgs<LinuxKernel<Host>>;
