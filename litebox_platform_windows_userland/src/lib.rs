@@ -701,10 +701,11 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 let _ = unsafe { tloc.write_at_offset(0, seconds) };
                 Ok(usize::try_from(seconds).unwrap_or(0))
             }
-            _ => {
-                unimplemented!(
-                    "PunchthroughToken for WindowsUserland is not fully implemented yet"
-                );
+            // TODO(chuqi): Currently, we just add a placeholder (dummy) implementation for signals. This is to
+            // allow temporal testing on target binaries like Node and Python. Will add actual implementation.
+            // See this issue: https://github.com/microsoft/litebox/issues/285
+            PunchthroughSyscall::RtSigaction { .. } | PunchthroughSyscall::RtSigprocmask { .. } => {
+                Ok(0)
             }
         }
     }
