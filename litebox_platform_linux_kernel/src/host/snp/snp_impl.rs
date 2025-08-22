@@ -184,6 +184,7 @@ const NR_SYSCALL_FUTEX: u32 = 202;
 const NR_SYSCALL_RT_SIGPROCMASK: u32 = 14;
 const NR_SYSCALL_READ: u32 = 0;
 const NR_SYSCALL_WRITE: u32 = 1;
+const NR_SYSCALL_EXIT_GROUP: u32 = 231;
 
 const FUTEX_WAIT: i32 = 0;
 const FUTEX_WAKE: i32 = 1;
@@ -303,12 +304,10 @@ impl HostInterface for HostSnpInterface {
         unimplemented!()
     }
 
-    fn exit() -> ! {
+    fn return_to_host() -> ! {
         let mut req = bindings::SnpVmplRequestArgs::new_exit_request();
         Self::request(&mut req);
-        loop {
-            unsafe { asm!("hlt") }
-        }
+        unreachable!("Should not return to the caller after returning to host");
     }
 
     fn terminate(reason_set: u64, reason_code: u64) -> ! {
@@ -321,9 +320,7 @@ impl HostInterface for HostSnpInterface {
 
         // In case hypervisor fails to terminate it or intentionally reschedules it,
         // halt the CPU to prevent further execution
-        loop {
-            unsafe { asm!("hlt") }
-        }
+        unreachable!("Should not return to the caller after terminating the vm");
     }
 
     fn rt_sigprocmask(
@@ -427,5 +424,12 @@ impl HostInterface for HostSnpInterface {
                 buf.len() as u64,
             ],
         })
+    }
+
+    fn terminate_process(code: i32) -> ! {
+        let _ = Self::syscalls(SyscallN::<1, NR_SYSCALL_EXIT_GROUP> {
+            args: [u64::from(code.reinterpret_as_unsigned())],
+        });
+        unreachable!("Should not return to the caller after terminating the process");
     }
 }
