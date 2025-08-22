@@ -1060,6 +1060,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         }
 
         // Do the real VirtualAlloc to reserve and commit the memory.
+        // TODO(chuqi): here we may also break down the RESERVE and COMMIT.
         let addr: *mut c_void = unsafe {
             VirtualAlloc2(
                 GetCurrentProcess(),
