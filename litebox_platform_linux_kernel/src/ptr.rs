@@ -139,7 +139,7 @@ impl<T: Clone> RawMutPointer<T> for UserMutPtr<T> {
         _range: impl core::ops::RangeBounds<isize>,
         _f: impl FnOnce(&mut [T]) -> R,
     ) -> Option<R> {
-        todo!()
+        unimplemented!("use write_slice_at_offset instead")
     }
 
     fn copy_from_slice(self, start_offset: usize, buf: &[T]) -> Option<()>
