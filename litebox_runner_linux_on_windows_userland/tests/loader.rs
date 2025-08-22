@@ -355,7 +355,9 @@ fn test_testcase_dynamic_with_rewriter() {
 }
 
 #[test]
-fn test_nodejs_with_rewriter() {
+// Note(chuqi): due to the binary size of `node` (larger than 100MB), I did not upload it to `test-bins/`.
+// To run this test locally, please make sure you manually copy `node` (as a Linux ELF) to `test-bins/`.
+fn test_nodejs_dynamic_with_rewriter() {
     let exec_name = "node";
     let libs_to_rewrite = [
         ("libc.so.6", "/lib/x86_64-linux-gnu"),
