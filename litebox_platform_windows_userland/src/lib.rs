@@ -1121,13 +1121,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                 core::ptr::null_mut(),
                                 0,
                             );
-                            assert!(
-                                !ptr.is_null(),
-                                "VirtualAlloc2(COMMIT addr={:p}, size=0x{:x}) failed: err={}",
-                                base_addr,
-                                size_within_region,
-                                GetLastError()
-                            );
+                            assert!(!ptr.is_null(), "{}", {
+                                let last_error = GetLastError();
+                                format!(
+                                    "VirtualAlloc2(COMMIT addr={:p}, size=0x{:x}) failed. Error: {}. Str: {}",
+                                    base_addr,
+                                    size_within_region,
+                                    last_error,
+                                    werr_text(last_error)
+                                )
+                            });
                         }
                         // In case the region is already committed, we just need to change its permissions.
                         Win32_Memory::MEM_COMMIT => {
@@ -1139,10 +1142,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     prot_flags(initial_permissions),
                                     &mut old_protect,
                                 ) != 0,
-                                "VirtualProtect(addr={:p}, size=0x{:x}) failed: {}",
-                                base_addr,
-                                size_within_region,
-                                GetLastError()
+                                "{}",
+                                {
+                                    let last_error = GetLastError();
+                                    format!(
+                                        "VirtualProtect(addr={:p}, size=0x{:x}) failed. Error: {}. Str: {}",
+                                        base_addr,
+                                        size_within_region,
+                                        last_error,
+                                        werr_text(last_error)
+                                    )
+                                }
                             );
                         }
                         _ => {
@@ -1272,12 +1282,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
         // Prefetch the memory range if requested
         if populate_pages_immediately {
-            do_prefetch_on_range(addr as usize, aligned_size);
+            do_prefetch_on_range(addr as usize, region_free_size);
         }
 
-        // Do another allocate_pages if region_free_size < aligned_size
-        if region_free_size < aligned_size {
-            let supposed_request_end = addr as usize + aligned_size as usize;
+        // Do another allocate_pages(). Here we should use the actual requested size, but not the
+        // aligned_size. The reason is "aligned_size" should be only used for VirtualAlloc(RESERVE)
+        // for memory region reservation. Since the available size is smaller (for reservation), we
+        // have to handle its next chunk (which is already reserved) and use the exact requested
+        // size for allocation.
+        if region_free_size < size {
+            let supposed_request_end = addr as usize + size as usize;
             <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
                 self,
                 range_allocated.end..supposed_request_end,
@@ -1322,6 +1336,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             }
         } else {
             let mut decommit_base = range.start;
+            let mut remain_size = range.len();
+
             // Decommit the region at mbi boundary
             while decommit_base < range.end {
                 let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
@@ -1331,7 +1347,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 let base = mbi.BaseAddress as usize;
                 let size = mbi.RegionSize as usize;
                 let next = base + size;
-                let free_size = core::cmp::min(range.len(), size);
+                let free_size = core::cmp::min(remain_size, size);
+                remain_size -= free_size;
 
                 let ok = unsafe {
                     VirtualFree(
@@ -1375,15 +1392,42 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
         let mut old_protect: u32 = 0;
-        let ok = unsafe {
-            VirtualProtect(
-                range.start as *mut c_void,
-                range.len(),
-                prot_flags(new_permissions),
-                &raw mut old_protect,
-            ) != 0
-        };
-        assert!(ok, "VirtualProtect failed: {}", unsafe { GetLastError() });
+
+        let mut perm_update_base = range.start;
+        let mut remain_size = range.len();
+        let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+
+        while perm_update_base < range.end {
+            do_query_on_region(&mut mbi, perm_update_base as *mut c_void);
+            assert!(mbi.BaseAddress as usize == perm_update_base);
+
+            let base = mbi.BaseAddress as usize;
+            let size = mbi.RegionSize as usize;
+            let next = base + size;
+            let perm_update_size = core::cmp::min(remain_size, size);
+            remain_size -= perm_update_size;
+
+            let ok = unsafe {
+                VirtualProtect(
+                    perm_update_base as *mut c_void,
+                    perm_update_size,
+                    prot_flags(new_permissions),
+                    &raw mut old_protect,
+                ) != 0
+            };
+            assert!(ok, "{}", {
+                let last_error = unsafe { GetLastError() };
+                format!(
+                    "VirtualProtect on range ({:p} - {:p}) failed: {}. str: {}",
+                    perm_update_base as *mut c_void,
+                    (perm_update_base + perm_update_size) as *mut c_void,
+                    last_error,
+                    werr_text(last_error)
+                )
+            });
+
+            perm_update_base = next;
+        }
         Ok(())
     }
 
