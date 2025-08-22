@@ -1,7 +1,10 @@
 //! This module manages the stack layout for the user process.
 
 use alloc::{collections::btree_map::BTreeMap, ffi::CString, vec::Vec};
-use litebox::platform::{RawConstPointer, RawMutPointer};
+use litebox::{
+    platform::{RawConstPointer, RawMutPointer},
+    utils::ReinterpretSignedExt as _,
+};
 
 use crate::{
     MutPtr,
@@ -128,18 +131,12 @@ impl UserStack {
         // write end marker
         self.push_usize(0)?;
         let size = offsets.len().checked_mul(size_of::<usize>())?;
-        let end = isize::try_from(self.pos).ok()?;
         self.pos = self.pos.checked_sub(size)?;
-        let begin = isize::try_from(self.pos).ok()?;
-        self.stack_top
-            .mutate_subslice_with(begin..end, |s| -> Option<()> {
-                for (i, p) in offsets.iter().enumerate() {
-                    let addr: usize = self.stack_top.as_usize() + *p;
-                    s[i * core::mem::size_of::<usize>()..(i + 1) * core::mem::size_of::<usize>()]
-                        .copy_from_slice(&addr.to_le_bytes());
-                }
-                Some(())
-            })?;
+        let ptr: MutPtr<usize> = MutPtr::from_usize(self.stack_top.as_usize() + self.pos);
+        for (i, p) in offsets.iter().enumerate() {
+            let addr: usize = self.stack_top.as_usize() + *p;
+            unsafe { ptr.write_at_offset(i.reinterpret_as_signed(), addr) }?;
+        }
         Some(())
     }
 
