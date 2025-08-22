@@ -519,15 +519,69 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let Descriptor::Dir { dir, metadata: _ } = &descriptor_table.get_entry(fd).entry else {
             return Err(ReadDirError::NotADirectory);
         };
-        Ok(dir
-            .read()
-            .children
-            .iter()
-            .map(|(name, file_type)| DirEntry {
+
+        // find the directory path in the root entries by pointer-equality of the Arc
+        let mut parent_path = {
+            let root = self.root.read();
+            root.entries
+                .iter()
+                .find_map(|(path, entry)| match entry {
+                    Entry::Dir(d) if alloc::sync::Arc::ptr_eq(d, dir) => Some(path.clone()),
+                    _ => None,
+                })
+                .unwrap_or(String::new())
+        };
+
+        // helper to get NodeInfo by an entries-key (entries keys have no trailing '/')
+        let get_node_info = |key: &str| -> Option<NodeInfo> {
+            self.root.read().entries.get(key).map(|entry| {
+                let ino = match entry {
+                    Entry::File(file) => file.read().unique_id,
+                    Entry::Dir(dir) => dir.read().unique_id,
+                };
+                NodeInfo {
+                    dev: DEVICE_ID,
+                    ino,
+                    rdev: None,
+                }
+            })
+        };
+
+        let mut entries: Vec<DirEntry> = Vec::new();
+
+        // Add "."
+        entries.push(DirEntry {
+            name: ".".into(),
+            file_type: FileType::Directory,
+            ino_info: Some(NodeInfo {
+                dev: DEVICE_ID,
+                ino: dir.read().unique_id,
+                rdev: None,
+            }),
+        });
+
+        // Add ".."
+        entries.push(DirEntry {
+            name: "..".into(),
+            file_type: FileType::Directory,
+            ino_info: get_node_info(&parent_path),
+        });
+
+        // Append a trailing '/' to `parent_path`.
+        // An empty string (`""`) represents the root.
+        parent_path.push('/');
+
+        // Add normal children
+        entries.extend(dir.read().children.iter().map(|(name, file_type)| {
+            let mut full_path = parent_path.clone();
+            full_path.push_str(name);
+            DirEntry {
                 name: name.into(),
                 file_type: file_type.clone(),
-            })
-            .collect())
+                ino_info: get_node_info(&full_path),
+            }
+        }));
+        Ok(entries)
     }
 
     fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {

@@ -343,6 +343,7 @@ pub struct NodeInfo {
 pub struct DirEntry {
     pub name: alloc::string::String,
     pub file_type: FileType,
+    pub ino_info: Option<NodeInfo>,
 }
 
 impl UserInfo {

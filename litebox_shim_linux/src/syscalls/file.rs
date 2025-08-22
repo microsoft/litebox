@@ -950,3 +950,66 @@ pub fn sys_dup(oldfd: i32, newfd: Option<i32>, flags: Option<OFlags>) -> Result<
         Ok(file_descriptors().write().insert(new_file))
     }
 }
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Diroff(usize);
+
+const DIRENT_STRUCT_BYTES_WITHOUT_NAME: usize =
+    core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name);
+
+/// Handle syscall `getdents64`
+pub(crate) fn sys_getdirent64(fd: i32, dirp: MutPtr<u8>, count: usize) -> Result<usize, Errno> {
+    let Ok(fd) = u32::try_from(fd) else {
+        return Err(Errno::EBADF);
+    };
+    let locked_file_descriptors = file_descriptors().read();
+    let Descriptor::File(file) = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)? else {
+        return Err(Errno::EBADF);
+    };
+    let dir_off: Diroff = litebox_fs()
+        .with_metadata(file, |off: &Diroff| *off)
+        .unwrap_or_default();
+    let mut dir_off = dir_off.0;
+    let mut nbytes = 0;
+    let off = 0;
+
+    let mut entries = litebox_fs().read_dir(file)?;
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    for entry in entries.iter().skip(dir_off) {
+        // include null terminator and make it aligned
+        let len = (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len() + 1)
+            .next_multiple_of(align_of::<litebox_common_linux::LinuxDirent64>());
+        if nbytes + len > count {
+            // not enough space
+            break;
+        }
+        let dirent64 = litebox_common_linux::LinuxDirent64 {
+            ino: entry.ino_info.as_ref().map_or(0, |node_info| node_info.ino) as u64,
+            off: dir_off as u64,
+            len: len.truncate(),
+            typ: litebox_common_linux::DirentType::from(entry.file_type.clone()) as u8,
+            __name: [0; 0],
+        };
+        let hdr_ptr = crate::MutPtr::from_usize(dirp.as_usize() + nbytes);
+        unsafe { hdr_ptr.write_at_offset(0, dirent64) }.ok_or(Errno::EFAULT)?;
+        let name_ptr =
+            crate::MutPtr::from_usize(hdr_ptr.as_usize() + DIRENT_STRUCT_BYTES_WITHOUT_NAME);
+        unsafe { name_ptr.write_slice_at_offset(0, entry.name.as_bytes()) }.ok_or(Errno::EFAULT)?;
+        // set the null terminator and padding
+        let zeros_len = len - (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len());
+        unsafe {
+            name_ptr.write_slice_at_offset(
+                isize::try_from(entry.name.len()).unwrap(),
+                &vec![0; zeros_len],
+            )
+        }
+        .ok_or(Errno::EFAULT)?;
+        nbytes += len;
+        dir_off += 1;
+    }
+    let _ = litebox_fs()
+        .set_fd_metadata(file, Diroff(dir_off))
+        .expect("failed to set dir offset");
+    Ok(nbytes)
+}

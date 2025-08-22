@@ -225,6 +225,37 @@ impl From<litebox::fs::FileType> for InodeType {
     }
 }
 
+#[repr(u8)]
+pub enum DirentType {
+    /// Unknown
+    Unknown = 0,
+    /// FIFO (named pipe)
+    NamedPipe = 1,
+    /// Character device
+    CharDevice = 2,
+    /// Directory
+    Directory = 4,
+    /// Block device
+    BlockDevice = 6,
+    /// Regular file
+    Regular = 8,
+    /// Symbolic link
+    SymLink = 10,
+    /// Socket
+    Socket = 12,
+}
+
+impl From<litebox::fs::FileType> for DirentType {
+    fn from(value: litebox::fs::FileType) -> Self {
+        match value {
+            litebox::fs::FileType::RegularFile => DirentType::Regular,
+            litebox::fs::FileType::Directory => DirentType::Directory,
+            litebox::fs::FileType::CharacterDevice => DirentType::CharDevice,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 /// Linux's `stat` struct
 #[cfg(target_arch = "x86_64")]
 #[repr(C, packed)]
@@ -1335,6 +1366,26 @@ pub struct CapData {
     pub inheritable: u32,
 }
 
+#[repr(C)]
+#[derive(Clone)]
+pub struct LinuxDirent64 {
+    /// Inode number
+    pub ino: u64,
+    /// Filesystem-specific value with no specific meaning to user space.
+    /// We use it to locate a directory entry
+    pub off: u64,
+    /// Length of this dirent (including the following name and padding)
+    pub len: u16,
+    /// File type
+    pub typ: u8,
+    /// File name (null-terminated)
+    ///
+    /// This is a flexible array member (FAM) with variable length. The actual name data
+    /// follows immediately after this struct in memory.
+    #[allow(clippy::pub_underscore_fields)]
+    pub __name: [u8; 0],
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
@@ -1627,6 +1678,11 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     CapGet {
         header: Platform::RawMutPointer<CapHeader>,
         data: Option<Platform::RawMutPointer<CapData>>,
+    },
+    GetDirent64 {
+        fd: i32,
+        dirp: Platform::RawMutPointer<u8>,
+        count: usize,
     },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
@@ -2204,7 +2260,13 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     },
                 }
             }
-            Sysno::statx | Sysno::io_uring_setup | Sysno::rseq => {
+            Sysno::getdents64 => SyscallRequest::GetDirent64 {
+                fd: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                dirp: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+                count: ctx.syscall_arg(2),
+            },
+            // TODO: support syscall `statfs`
+            Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 SyscallRequest::Ret(errno::Errno::ENOSYS)
             }
             _ => unimplemented!("Translation for {sysno} is not (yet) currently supported"),

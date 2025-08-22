@@ -341,3 +341,12 @@ impl From<litebox::event::polling::TryOpError<Errno>> for Errno {
         }
     }
 }
+
+impl From<litebox::fs::errors::ReadDirError> for Errno {
+    fn from(value: litebox::fs::errors::ReadDirError) -> Self {
+        match value {
+            litebox::fs::errors::ReadDirError::NotADirectory => Errno::ENOTDIR,
+            _ => unimplemented!(),
+        }
+    }
+}
