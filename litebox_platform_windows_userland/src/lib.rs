@@ -18,7 +18,6 @@ use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox_common_linux::PunchthroughSyscall;
-use rangemap::RangeSet;
 
 use windows_sys::Win32::Foundation as Win32_Foundation;
 use windows_sys::Win32::{
@@ -109,17 +108,6 @@ impl Drop for TlsSlot {
     }
 }
 
-/// Information about a system allocation-granularity (64KB)-aligned allocation region
-#[derive(Debug, Clone)]
-struct AllocationInfo {
-    /// The 64KB granularity-aligned range that this AllocationInfo represents
-    current_granularity_range: core::ops::Range<usize>,
-    /// The actual full range reserved by VirtualAlloc2 that contains this granularity range
-    full_reserved_range: core::ops::Range<usize>,
-    /// Set of subranges currently in use within this granularity range (automatically merges adjacent ranges)
-    used_subranges: RangeSet<usize>,
-}
-
 /// The userland Windows platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
@@ -128,8 +116,6 @@ pub struct WindowsUserland {
     tls_slot: TlsSlot,
     reserved_pages: alloc::vec::Vec<core::ops::Range<usize>>,
     sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
-    /// Track 64KB-aligned allocations to handle Windows allocation granularity
-    allocation_tracker: std::sync::RwLock<std::collections::BTreeMap<usize, AllocationInfo>>,
 }
 
 // Safety: Given that SYSTEM_INFO is not Send/Sync (it contains *mut c_void), we use RwLock to
@@ -187,6 +173,7 @@ unsafe extern "system" fn exception_handler(exception_info: *mut EXCEPTION_POINT
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
+        // debug
         EXCEPTION_CONTINUE_SEARCH
     }
 }
@@ -221,7 +208,6 @@ impl WindowsUserland {
             tls_slot: TlsSlot::new().expect("Failed to create TLS slot!"),
             reserved_pages: reserved_pages,
             sys_info: std::sync::RwLock::new(sys_info),
-            allocation_tracker: std::sync::RwLock::new(std::collections::BTreeMap::new()),
         };
         platform.set_init_tls();
 
@@ -321,138 +307,6 @@ impl WindowsUserland {
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         self.set_thread_local_storage(tls);
     }
-
-    /// Track a new platform allocation granularity (64KB)-aligned allocation (with MEM_RESERVE)
-    fn track_allocation(
-        &self,
-        current_granularity_range: core::ops::Range<usize>,
-        full_reserved_range: core::ops::Range<usize>,
-        used_subrange: core::ops::Range<usize>,
-    ) {
-        let mut tracker = self.allocation_tracker.write().unwrap();
-        let mut used_subranges = RangeSet::new();
-        used_subranges.insert(used_subrange.clone());
-
-        let info = AllocationInfo {
-            current_granularity_range: current_granularity_range.clone(),
-            full_reserved_range: full_reserved_range.clone(),
-            used_subranges,
-        };
-
-        tracker.insert(current_granularity_range.start, info);
-    }
-
-    /// Add a subrange to existing allocations (may span multiple platform_allocation_granularity-aligned regions)
-    fn add_subrange_to_allocations(&self, subrange: core::ops::Range<usize>) {
-        let mut tracker = self.allocation_tracker.write().unwrap();
-
-        // Start from the aligned address of the subrange start
-        let mut current_addr = self.round_down_to_granu(subrange.start);
-        let subrange_end = subrange.end;
-
-        // Process all potential allocation regions that the subrange might span
-        while current_addr < subrange_end {
-            if let Some(info) = tracker.get_mut(&current_addr) {
-                // Calculate the portion of the subrange that overlaps with this granularity range
-                let overlap_start = subrange.start.max(info.current_granularity_range.start);
-                let overlap_end = subrange_end.min(info.current_granularity_range.end);
-
-                if overlap_start < overlap_end {
-                    let overlap_range = overlap_start..overlap_end;
-                    info.used_subranges.insert(overlap_range.clone());
-                }
-
-                // Move to the next potential allocation region
-                current_addr = info.current_granularity_range.end;
-            } else {
-                // No allocation at this address, move to the next granularity-aligned address
-                panic!("No allocation found for address: {:#x}", current_addr);
-            }
-        }
-    }
-
-    /// Remove a subrange from allocation(s) and return reserved ranges that should be freed
-    fn remove_subrange_from_allocations(
-        &self,
-        range: core::ops::Range<usize>,
-    ) -> Vec<core::ops::Range<usize>> {
-        let granularity = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
-        let mut tracker = self.allocation_tracker.write().unwrap();
-        let mut reserved_ranges_to_check = std::collections::HashSet::new();
-        let mut reserved_ranges_to_free = Vec::new();
-
-        // Start from the aligned address of the range start
-        let mut current_addr = self.round_down_to_granu(range.start);
-        let range_end = range.end;
-
-        // Process all potential allocation regions that the range might span
-        while current_addr < range_end {
-            if let Some(info) = tracker.get_mut(&current_addr) {
-                // Calculate the portion of the range that overlaps with this granularity range
-                let overlap_start = range.start.max(info.current_granularity_range.start);
-                let overlap_end = range_end.min(info.current_granularity_range.end);
-
-                if overlap_start < overlap_end {
-                    let overlap_range = overlap_start..overlap_end;
-
-                    // Record the reserved range for later checking
-                    reserved_ranges_to_check.insert(info.full_reserved_range.clone());
-
-                    // Directly remove the overlap range from RangeSet (it handles all the complexity)
-                    info.used_subranges.remove(overlap_range.clone());
-                }
-
-                // Move to the next potential allocation region
-                current_addr = info.current_granularity_range.end;
-            } else {
-                // No allocation at this address, move to the next granularity-aligned address
-                current_addr += self.sys_info.read().unwrap().dwAllocationGranularity as usize;
-            }
-        }
-
-        // Check each reserved range to see if it's completely empty
-        for reserved_range in reserved_ranges_to_check {
-            let mut is_reserved_range_empty = true;
-
-            // Check all granularity chunks within this reserved range
-            let mut check_addr = reserved_range.start;
-
-            while check_addr < reserved_range.end {
-                if let Some(info) = tracker.get(&check_addr) {
-                    assert!(info.full_reserved_range == reserved_range);
-                    if !info.used_subranges.is_empty() {
-                        is_reserved_range_empty = false;
-                        break;
-                    }
-                }
-                check_addr += granularity;
-            }
-
-            // If the entire reserved range is empty, mark it for freeing and remove all its allocations
-            if is_reserved_range_empty {
-                // Remove all allocation entries for this reserved range
-                let mut addrs_to_remove = Vec::new();
-                check_addr = reserved_range.start;
-                while check_addr < reserved_range.end {
-                    if let Some(info) = tracker.get(&check_addr) {
-                        if info.full_reserved_range == reserved_range {
-                            addrs_to_remove.push(check_addr);
-                        }
-                    }
-                    check_addr += granularity;
-                }
-
-                for addr in addrs_to_remove {
-                    tracker.remove(&addr);
-                }
-
-                // Add to the list of reserved ranges to be freed
-                reserved_ranges_to_free.push(reserved_range);
-            }
-        }
-
-        reserved_ranges_to_free
-    }
 }
 
 impl litebox::platform::Provider for WindowsUserland {}
@@ -467,7 +321,6 @@ impl litebox::platform::ExitProvider for WindowsUserland {
             tls_slot: _,
             sys_info: _,
             reserved_pages: _,
-            allocation_tracker: _,
         } = self;
         // TODO: Implement Windows process exit
         // For now, use standard process exit
@@ -1084,6 +937,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
         // 1) In case we have a suggested VA range, we first check and deal with the case
         // that the address (range) is already reserved.
+
         if suggested_range.start != 0 {
             assert!(suggested_range.start as usize >= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
                                                             TASK_ADDR_MIN);
@@ -1151,11 +1005,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     }
                 }
 
-                // Update tracker for existing reserved region
-                let current_request_end = core::cmp::min(suggested_range.end, region_end);
-                let current_subrange = suggested_range.start..current_request_end;
-                self.add_subrange_to_allocations(current_subrange);
-
                 // If the requested end address is beyond the reserved region (cross the region),
                 // we need to allocate more memory.
                 if request_end > region_end {
@@ -1190,22 +1039,23 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // just have to reserve & commit a VA range.
 
         // Align the size and base address to the allocation granularity.
-        let aligned_size = self.round_up_to_granu(size);
         let aligned_base_addr = self.round_down_to_granu(base_addr as usize) as *mut c_void;
-        let mut region_free_end_addr = aligned_base_addr as usize + aligned_size;
-        let mut region_free_size = aligned_size;
+        let aligned_size = self.round_up_to_granu(size);
 
+        // Check the current (unreserved) memory chunk's available size for reservation
+        let mut available_end_addr = aligned_base_addr as usize + aligned_size;
+        let mut available_size = aligned_size;
         if !aligned_base_addr.is_null() {
             let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
             do_query_on_region(&mut mbi, aligned_base_addr);
 
-            region_free_end_addr = core::cmp::min(
-                region_free_end_addr,
+            available_end_addr = core::cmp::min(
+                available_end_addr,
                 mbi.BaseAddress as usize + mbi.RegionSize as usize,
             );
-            region_free_size = core::cmp::min(
-                region_free_size,
-                region_free_end_addr - aligned_base_addr as usize,
+            available_size = core::cmp::min(
+                available_size,
+                available_end_addr - aligned_base_addr as usize,
             );
         }
 
@@ -1214,7 +1064,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             VirtualAlloc2(
                 GetCurrentProcess(),
                 aligned_base_addr,
-                region_free_size,
+                available_size,
                 Win32_Memory::MEM_COMMIT | Win32_Memory::MEM_RESERVE,
                 prot_flags(initial_permissions),
                 core::ptr::null_mut(),
@@ -1226,7 +1076,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             format!(
                 "VirtualAlloc2 failed. Address: {:p}, Size: {}, Permissions: {:?}. Error: {} str: {}",
                 aligned_base_addr,
-                region_free_size,
+                available_size,
                 initial_permissions,
                 last_error,
                 werr_text(last_error)
@@ -1242,42 +1092,20 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             );
         }
 
-        let granularity = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
-        let range_allocated = (addr as usize)..(addr as usize + region_free_size);
-
-        // Track the new allocation - break down to allocation_granularity-sized chunk. This is to avoid the
-        // gap when tracking `AllocationInformation` in huge memory chunks such as 4 * 64KB sizes.
-        let suggested_size = size; // The requested size
-        let mut current_actual = range_allocated.start;
-        let mut remaining_size = core::cmp::min(suggested_size, region_free_size);
-
-        while current_actual < range_allocated.end && remaining_size > 0 {
-            assert!(current_actual + granularity <= range_allocated.end);
-            let chunk_end = current_actual + granularity;
-            let current_chunk = current_actual..chunk_end;
-
-            // Calculate how much of this chunk is actually used
-            let used_size_in_chunk = core::cmp::min(remaining_size, granularity);
-            let used_subrange = current_actual..(current_actual + used_size_in_chunk);
-
-            self.track_allocation(
-                current_chunk.clone(),
-                range_allocated.clone(),
-                used_subrange,
-            );
-
-            remaining_size -= used_size_in_chunk;
-            current_actual = chunk_end;
-        }
+        let range_allocated = (addr as usize)..(addr as usize + available_size);
 
         // Prefetch the memory range if requested
         if populate_pages_immediately {
             do_prefetch_on_range(addr as usize, aligned_size);
         }
 
-        // Do another allocate_pages if region_free_size < aligned_size
-        if region_free_size < aligned_size {
-            let supposed_request_end = addr as usize + aligned_size as usize;
+        // Do another allocate_pages(). Here we should use the actual requested size, but not the
+        // aligned_size. The reason is "aligned_size" should be only used for VirtualAlloc(RESERVE)
+        // for memory region reservation. Since the available size is smaller (for reservation), we
+        // have to handle its next chunk (which is already reserved) and use the exact requested
+        // size for allocation.
+        if available_size < size {
+            let supposed_request_end = addr as usize + size as usize;
             <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
                 self,
                 range_allocated.end..supposed_request_end,
@@ -1297,62 +1125,40 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
-        // Use our tracking mechanism to handle proper deallocation
-        let reserved_regions_to_free = self.remove_subrange_from_allocations(range.clone());
-        if !reserved_regions_to_free.is_empty() {
-            // Release all reserved regions that are now completely unused
-            for region_to_free in reserved_regions_to_free {
-                let ok = unsafe {
-                    VirtualFree(
-                        region_to_free.start as *mut c_void,
-                        0,
-                        Win32_Memory::MEM_RELEASE,
-                    ) != 0
-                };
-                assert!(ok, "{}", {
-                    let last_error = unsafe { GetLastError() };
-                    format!(
-                        "VirtualFree(MEM_RELEASE) on range ({:p} - {:p}) failed: {}. str: {}",
-                        region_to_free.start as *mut c_void,
-                        region_to_free.end as *mut c_void,
-                        last_error,
-                        werr_text(last_error)
-                    )
-                });
-            }
-        } else {
-            let mut decommit_base = range.start;
-            // Decommit the region at mbi boundary
-            while decommit_base < range.end {
-                let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
-                do_query_on_region(&mut mbi, decommit_base as *mut c_void);
-                assert!(mbi.BaseAddress as usize == decommit_base);
+        let mut decommit_base = range.start;
+        let mut remain_size: usize = range.len();
 
-                let base = mbi.BaseAddress as usize;
-                let size = mbi.RegionSize as usize;
-                let next = base + size;
-                let free_size = core::cmp::min(range.len(), size);
+        // Decommit the region at mbi boundary
+        while decommit_base < range.end {
+            let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+            do_query_on_region(&mut mbi, decommit_base as *mut c_void);
+            assert!(mbi.BaseAddress as usize == decommit_base);
 
-                let ok = unsafe {
-                    VirtualFree(
-                        decommit_base as *mut c_void,
-                        free_size,
-                        Win32_Memory::MEM_DECOMMIT,
-                    ) != 0
-                };
-                assert!(ok, "{}", {
-                    let last_error = unsafe { GetLastError() };
-                    format!(
-                        "VirtualFree(MEM_DECOMMIT) on range ({:p} - {:p}) failed: {}. str: {}",
-                        decommit_base as *mut c_void,
-                        (decommit_base + free_size) as *mut c_void,
-                        last_error,
-                        werr_text(last_error)
-                    )
-                });
+            let base = mbi.BaseAddress as usize;
+            let size = mbi.RegionSize as usize;
+            let next = base + size;
+            let free_size = core::cmp::min(remain_size, size);
+            remain_size -= free_size;
 
-                decommit_base = next;
-            }
+            let ok = unsafe {
+                VirtualFree(
+                    decommit_base as *mut c_void,
+                    free_size,
+                    Win32_Memory::MEM_DECOMMIT,
+                ) != 0
+            };
+            assert!(ok, "{}", {
+                let last_error = unsafe { GetLastError() };
+                format!(
+                    "VirtualFree(MEM_DECOMMIT) on range ({:p} - {:p}) failed: {}. str: {}",
+                    decommit_base as *mut c_void,
+                    (decommit_base + free_size) as *mut c_void,
+                    last_error,
+                    werr_text(last_error)
+                )
+            });
+
+            decommit_base = next;
         }
         Ok(())
     }
@@ -1375,15 +1181,43 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
         let mut old_protect: u32 = 0;
-        let ok = unsafe {
-            VirtualProtect(
-                range.start as *mut c_void,
-                range.len(),
-                prot_flags(new_permissions),
-                &raw mut old_protect,
-            ) != 0
-        };
-        assert!(ok, "VirtualProtect failed: {}", unsafe { GetLastError() });
+
+        let mut perm_update_base = range.start;
+        let mut remain_size = range.len();
+        let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+
+        // Decommit the region at mbi boundary
+        while perm_update_base < range.end {
+            do_query_on_region(&mut mbi, perm_update_base as *mut c_void);
+            assert!(mbi.BaseAddress as usize == perm_update_base);
+
+            let base = mbi.BaseAddress as usize;
+            let size = mbi.RegionSize as usize;
+            let next = base + size;
+            let perm_update_size = core::cmp::min(remain_size, size);
+            remain_size -= perm_update_size;
+
+            let ok = unsafe {
+                VirtualProtect(
+                    perm_update_base as *mut c_void,
+                    perm_update_size,
+                    prot_flags(new_permissions),
+                    &raw mut old_protect,
+                ) != 0
+            };
+            assert!(ok, "{}", {
+                let last_error = unsafe { GetLastError() };
+                format!(
+                    "VirtualProtect on range ({:p} - {:p}) failed: {}. str: {}",
+                    perm_update_base as *mut c_void,
+                    (perm_update_base + perm_update_size) as *mut c_void,
+                    last_error,
+                    werr_text(last_error)
+                )
+            });
+
+            perm_update_base = next;
+        }
         Ok(())
     }
 
