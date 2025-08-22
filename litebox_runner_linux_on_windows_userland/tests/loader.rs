@@ -353,37 +353,3 @@ fn test_testcase_dynamic_with_rewriter() {
         |_| {},
     );
 }
-
-#[test]
-// Note(chuqi): due to the binary size of `node` (larger than 100MB), I did not upload it to `test-bins/`.
-// To run this test locally, please make sure you manually copy `node` (as a Linux ELF) to `test-bins/`.
-fn test_nodejs_dynamic_with_rewriter() {
-    let exec_name = "node";
-    let libs_to_rewrite = [
-        ("libc.so.6", "/lib/x86_64-linux-gnu"),
-        ("libdl.so.2", "/lib/x86_64-linux-gnu"),
-        ("libstdc++.so.6", "/lib/x86_64-linux-gnu"),
-        ("libpthread.so.0", "/lib/x86_64-linux-gnu"),
-        ("libm.so.6", "/lib/x86_64-linux-gnu"),
-        ("libgcc_s.so.1", "/lib/x86_64-linux-gnu"),
-        ("ld-linux-x86-64.so.2", "/lib64"),
-    ];
-    let libs_no_rewrite = [("litebox_rtld_audit.so", "/lib64")];
-
-    const HELLO_WORLD_JS: &str = r"
-        const fs = require('node:fs');
-
-        const content = 'Hello World!';
-        console.log(content);
-        ";
-
-    run_dynamic_linked_prog_with_rewriter(
-        &libs_to_rewrite,
-        &libs_no_rewrite,
-        &exec_name,
-        &["/out/hello_world.js"],
-        |out_dir| {
-            std::fs::write(out_dir.join("hello_world.js"), HELLO_WORLD_JS).unwrap();
-        },
-    );
-}
