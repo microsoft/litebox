@@ -716,6 +716,19 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
         SyscallRequest::GetDirent64 { fd, dirp, count } => {
             syscalls::file::sys_getdirent64(fd, dirp, count)
         }
+        SyscallRequest::SchedGetAffinity { pid, len, mask } => {
+            const BITS_PER_BYTE: usize = 8;
+            let cpuset = syscalls::process::sys_sched_getaffinity(pid);
+            if len * BITS_PER_BYTE < cpuset.len() || len & (core::mem::size_of::<usize>() - 1) != 0
+            {
+                Err(Errno::EINVAL)
+            } else {
+                let raw_bytes = cpuset.as_bytes();
+                unsafe { mask.copy_from_slice(0, raw_bytes) }
+                    .map(|()| raw_bytes.len())
+                    .ok_or(Errno::EFAULT)
+            }
+        }
         _ => {
             todo!()
         }

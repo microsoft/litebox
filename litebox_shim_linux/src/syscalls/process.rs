@@ -551,6 +551,34 @@ pub(crate) fn sys_getegid() -> usize {
         .with_thread_local_storage_mut(|tls| tls.current_task.credentials.egid)
 }
 
+/// Number of CPUs
+const NR_CPUS: usize = 2;
+
+pub(crate) struct CpuSet {
+    bits: bitvec::vec::BitVec<u8>,
+}
+
+impl CpuSet {
+    pub(crate) fn len(&self) -> usize {
+        self.bits.len()
+    }
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.bits.as_raw_slice()
+    }
+}
+
+/// Handle syscall `sched_getaffinity`.
+///
+/// Note this is a dummy implementation that always returns the same CPU set
+pub(crate) fn sys_sched_getaffinity(pid: Option<i32>) -> CpuSet {
+    if pid.is_some() {
+        unimplemented!("Getting CPU affinity for a specific PID is not supported yet");
+    }
+    let mut cpuset = bitvec::bitvec![u8, bitvec::order::Lsb0; 0; NR_CPUS];
+    cpuset.iter_mut().for_each(|mut b| *b = true);
+    CpuSet { bits: cpuset }
+}
+
 #[cfg(test)]
 mod tests {
     use core::mem::MaybeUninit;
@@ -790,5 +818,20 @@ mod tests {
             result,
             "Parent TID mismatch"
         );
+    }
+
+    #[test]
+    fn test_sched_getaffinity() {
+        crate::syscalls::tests::init_platform(None);
+
+        let cpuset = super::sys_sched_getaffinity(None);
+        assert_eq!(cpuset.bits.len(), super::NR_CPUS);
+        cpuset.bits.iter().for_each(|b| assert!(*b));
+        let ones: usize = cpuset
+            .as_bytes()
+            .iter()
+            .map(|b| b.count_ones() as usize)
+            .sum();
+        assert_eq!(ones, super::NR_CPUS);
     }
 }
