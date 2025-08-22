@@ -210,6 +210,8 @@ fn test_runner_with_dynamic_lib(
         // Alternatively, we could add a `/etc/ld.so.cache` file to the rootfs.
         "--env",
         "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
+        "--env",
+        "HOME=/",
         "--initial-files",
         tar_file.to_str().unwrap(),
     ];

@@ -144,7 +144,10 @@ pub fn test_load_exec_common(executable_path: &str) {
         CString::new(executable_path).unwrap(),
         CString::new("hello").unwrap(),
     ];
-    let envp = vec![CString::new("PATH=/bin").unwrap()];
+    let envp = vec![
+        CString::new("PATH=/bin").unwrap(),
+        CString::new("HOME=/").unwrap(),
+    ];
     let mut aux = litebox_shim_linux::loader::auxv::init_auxv();
     if litebox_platform_multiplex::platform()
         .get_vdso_address()
