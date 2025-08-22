@@ -962,7 +962,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 );
 
                 let size_within_region = core::cmp::min(size, region_end - suggested_range.start);
-                unsafe {
+                let ptr = unsafe {
                     match mbi.State {
                         // In case the region is already reserved, we just need to commit it.
                         Win32_Memory::MEM_RESERVE => {
@@ -975,13 +975,25 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                 core::ptr::null_mut(),
                                 0,
                             );
-                            assert!(
-                                !ptr.is_null(),
-                                "VirtualAlloc2(COMMIT addr={:p}, size=0x{:x}) failed: err={}",
-                                base_addr,
-                                size_within_region,
-                                GetLastError()
-                            );
+                            assert!(!ptr.is_null(), "{}", {
+                                let last_error = GetLastError();
+                                format!(
+                                    "VirtualAlloc2(COMMIT) failed. Range (0x{:x} - 0x{:x}). Error: {}. Str: {}",
+                                    base_addr as usize,
+                                    (base_addr as usize + size_within_region),
+                                    last_error,
+                                    werr_text(last_error)
+                                )
+                            });
+                            if fixed_address {
+                                assert!(
+                                    ptr == base_addr,
+                                    "VirtualAlloc2(COMMIT) returned address {:p} which is not the expected fixed address {:p}",
+                                    ptr,
+                                    base_addr
+                                );
+                            }
+                            ptr
                         }
                         // In case the region is already committed, we just need to change its permissions.
                         Win32_Memory::MEM_COMMIT => {
@@ -993,16 +1005,29 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     prot_flags(initial_permissions),
                                     &mut old_protect,
                                 ) != 0,
-                                "VirtualProtect(addr={:p}, size=0x{:x}) failed: {}",
-                                base_addr,
-                                size_within_region,
-                                GetLastError()
+                                "{}",
+                                {
+                                    let last_error = GetLastError();
+                                    format!(
+                                        "VirtualProtect failed. Range (0x{:x} - 0x{:x}). Error: {}. Str: {}",
+                                        base_addr as usize,
+                                        (base_addr as usize + size_within_region),
+                                        last_error,
+                                        werr_text(last_error)
+                                    )
+                                }
                             );
+                            base_addr
                         }
                         _ => {
                             panic!("Unexpected memory state: {:?}", mbi.State);
                         }
                     }
+                };
+
+                // Prefetch the memory range if requested
+                if populate_pages_immediately {
+                    do_prefetch_on_range(ptr as usize, size_within_region);
                 }
 
                 // If the requested end address is beyond the reserved region (cross the region),
@@ -1012,17 +1037,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     // returned by VirtualAlloc2 is the expected start address (contiguous with the
                     // already reserved region).
                     <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
-                            self,
-                            region_end..request_end,
-                            initial_permissions,
-                            can_grow_down,
-                            populate_pages_immediately,
-                            true,
-                        )?;
-                }
-                // Prefetch the memory range if requested
-                if populate_pages_immediately {
-                    do_prefetch_on_range(suggested_range.start, suggested_range.len());
+                        self,
+                        region_end..request_end,
+                        initial_permissions,
+                        can_grow_down,
+                        populate_pages_immediately,
+                        true,
+                    )?;
                 }
 
                 return Ok(litebox::platform::trivial_providers::TransparentMutPtr {
@@ -1075,9 +1096,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         assert!(!addr.is_null(), "{}", {
             let last_error = unsafe { GetLastError() };
             format!(
-                "VirtualAlloc2 failed. Address: {:p}, Size: {}, Permissions: {:?}. Error: {} str: {}",
-                aligned_base_addr,
-                available_size,
+                "VirtualAlloc2 failed. Range: (0x{:x} - 0x{:x}), Permissions: {:?}. Error: {} str: {}.",
+                aligned_base_addr as usize,
+                (aligned_base_addr as usize + available_size),
                 initial_permissions,
                 last_error,
                 werr_text(last_error)
@@ -1097,7 +1118,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
         // Prefetch the memory range if requested
         if populate_pages_immediately {
-            do_prefetch_on_range(addr as usize, aligned_size);
+            do_prefetch_on_range(addr as usize, available_size);
         }
 
         // Do another allocate_pages(). Here we should use the actual requested size, but not the
