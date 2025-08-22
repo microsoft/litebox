@@ -76,10 +76,6 @@ pub extern "C" fn sandbox_kernel_init(
 const ROOTFS: &[u8] = include_bytes!("./test.tar");
 
 /// Initializes the sandbox process.
-///
-/// # Panics
-///
-/// Panics if the CString creation fails (which should not happen with valid UTF-8 strings).
 #[unsafe(no_mangle)]
 pub extern "C" fn sandbox_process_init(
     pt_regs: &mut litebox_common_linux::PtRegs,
@@ -112,6 +108,7 @@ pub extern "C" fn sandbox_process_init(
 
     // TODO: get path, argv, and envp from `boot_params`.
     let aux = litebox_shim_linux::loader::auxv::init_auxv();
+    #[allow(clippy::missing_panics_doc, reason = "valid string")]
     let loaded_program = match litebox_shim_linux::loader::load_program(
         "/test",
         alloc::vec![alloc::ffi::CString::new("/test").unwrap()],
