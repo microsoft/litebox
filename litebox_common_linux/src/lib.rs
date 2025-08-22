@@ -1684,6 +1684,11 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         dirp: Platform::RawMutPointer<u8>,
         count: usize,
     },
+    SchedGetAffinity {
+        pid: Option<i32>,
+        len: usize,
+        mask: Platform::RawMutPointer<u8>,
+    },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
 }
@@ -2265,6 +2270,14 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 dirp: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
                 count: ctx.syscall_arg(2),
             },
+            Sysno::sched_getaffinity => {
+                let pid = ctx.syscall_arg(0).reinterpret_as_signed().truncate();
+                SyscallRequest::SchedGetAffinity {
+                    pid: if pid == 0 { None } else { Some(pid) },
+                    len: ctx.syscall_arg(1),
+                    mask: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
+                }
+            }
             // TODO: support syscall `statfs`
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 SyscallRequest::Ret(errno::Errno::ENOSYS)
