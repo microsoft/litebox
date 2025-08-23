@@ -1700,70 +1700,66 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
     /// to handle.
     #[expect(clippy::too_many_lines)]
     pub fn try_from_raw(syscall_number: usize, ctx: &'a PtRegs) -> Result<Self, errno::Errno> {
+        // sys_req! is a convenience macro that automatically takes the correct numbered arguments
+        // (in the order of field specification); due to some Rust restrictions, we need to manually
+        // specify pointers by adding the `:*` to that field, but otherwise everything else about
+        // conversion to the type is automatically inferred.
+        //
+        // See below for example usage, but generally speaking, you just need to specify the fields
+        // in order; if something needs to be a pointer and you forget (or accidentally mark
+        // something as a pointer) the type checker will complain and remind you (due to the nice
+        // attributes on the relevant traits), so you shouldn't need to worry about that.
+        macro_rules! sys_req {
+            ($id:ident { $( $field:ident $(:$star:tt)?),* $(,)? }) => {
+                sys_req!(
+                    @[$id] [ $( $field $(:$star)? ),* ] [ 0, 1, 2, 3, 4, 5 ] [ ]
+                )
+            };
+            (@[$id:ident] [ $f:ident $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+                sys_req!(
+                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: ctx.sys_req_arg($n), ]
+                )
+            };
+            (@[$id:ident] [ $f:ident : * $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+                sys_req!(
+                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: ctx.sys_req_ptr($n), ]
+                )
+            };
+            (@[$id:ident] [ ] [ $($ns:literal),* ] [ $($tail:tt)* ]) => {
+                SyscallRequest::$id { $($tail)* }
+            };
+        }
+
         let sysno = Sysno::from(u32::try_from(syscall_number).map_err(|_| errno::Errno::ENOSYS)?);
         let dispatcher = match sysno {
-            Sysno::read => SyscallRequest::Read {
-                fd: ctx.sys_req_arg(0),
-                buf: ctx.sys_req_ptr(1),
-                count: ctx.sys_req_arg(2),
-            },
-            Sysno::write => SyscallRequest::Write {
-                fd: ctx.sys_req_arg(0),
-                buf: ctx.sys_req_ptr(1),
-                count: ctx.sys_req_arg(2),
-            },
-            Sysno::close => SyscallRequest::Close {
-                fd: ctx.sys_req_arg(0),
-            },
-            Sysno::stat => SyscallRequest::Stat {
-                pathname: ctx.sys_req_ptr(0),
-                buf: ctx.sys_req_ptr(1),
-            },
-            Sysno::fstat => SyscallRequest::Fstat {
-                fd: ctx.sys_req_arg(0),
-                buf: ctx.sys_req_ptr(1),
-            },
-            Sysno::lstat => SyscallRequest::Lstat {
-                pathname: ctx.sys_req_ptr(0),
-                buf: ctx.sys_req_ptr(1),
-            },
+            Sysno::read => sys_req!(Read { fd, buf:*, count }),
+            Sysno::write => sys_req!(Write { fd, buf:*, count }),
+            Sysno::close => sys_req!(Close { fd }),
+            Sysno::stat => sys_req!(Stat { pathname:*, buf:* }),
+            Sysno::fstat => sys_req!(Fstat { fd, buf:* }),
+            Sysno::lstat => sys_req!(Lstat { pathname:*, buf:* }),
             #[cfg(target_arch = "x86_64")]
-            Sysno::mmap => SyscallRequest::Mmap {
-                addr: ctx.sys_req_arg(0),
-                length: ctx.sys_req_arg(1),
-                prot: ctx.sys_req_arg(2),
-                flags: ctx.sys_req_arg(3),
-                fd: ctx.sys_req_arg(4),
-                offset: ctx.sys_req_arg(5),
-            },
+            Sysno::mmap => sys_req!(Mmap {
+                addr,
+                length,
+                prot,
+                flags,
+                fd,
+                offset,
+            }),
             #[cfg(target_arch = "x86")]
-            Sysno::mmap2 => SyscallRequest::Mmap {
-                addr: ctx.sys_req_arg(0),
-                length: ctx.sys_req_arg(1),
-                prot: ctx.sys_req_arg(2),
-                flags: ctx.sys_req_arg(3),
-                fd: ctx.sys_req_arg(4),
-                offset: ctx.sys_req_arg(5),
-            },
-            Sysno::mprotect => SyscallRequest::Mprotect {
-                addr: ctx.sys_req_ptr(0),
-                length: ctx.sys_req_arg(1),
-                prot: ctx.sys_req_arg(2),
-            },
-            Sysno::munmap => SyscallRequest::Munmap {
-                addr: ctx.sys_req_ptr(0),
-                length: ctx.sys_req_arg(1),
-            },
-            Sysno::brk => SyscallRequest::Brk {
-                addr: ctx.sys_req_ptr(0),
-            },
-            Sysno::mremap => SyscallRequest::Mremap {
-                old_addr: ctx.sys_req_ptr(0),
-                old_size: ctx.sys_req_arg(1),
-                new_size: ctx.sys_req_arg(2),
-                flags: ctx.sys_req_arg(3),
-                new_addr: ctx.sys_req_arg(4),
-            },
+            Sysno::mmap2 => sys_req!(Mmap {
+                addr,
+                length,
+                prot,
+                flags,
+                fd,
+                offset,
+            }),
+            Sysno::mprotect => sys_req!(Mprotect { addr:*, length, prot }),
+            Sysno::munmap => sys_req!(Munmap { addr:*, length }),
+            Sysno::brk => sys_req!(Brk { addr:* }),
+            Sysno::mremap => sys_req!(Mremap { old_addr:*, old_size, new_size, flags, new_addr }),
             Sysno::rt_sigprocmask => {
                 let how: i32 = ctx.sys_req_arg(0);
                 if let Ok(how) = SigmaskHow::try_from(how) {
@@ -1808,12 +1804,12 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 },
             },
             #[cfg(target_arch = "x86_64")]
-            Sysno::pread64 => SyscallRequest::Pread64 {
-                fd: ctx.sys_req_arg(0),
-                buf: ctx.sys_req_ptr(1),
-                count: ctx.sys_req_arg(2),
-                offset: ctx.sys_req_arg(3),
-            },
+            Sysno::pread64 => sys_req!(Pread64 {
+                fd,
+                buf:*,
+                count,
+                offset
+            }),
             #[cfg(target_arch = "x86")]
             Sysno::pread64 => SyscallRequest::Pread64 {
                 fd: ctx.sys_req_arg(0),
@@ -1821,28 +1817,14 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 count: ctx.sys_req_arg(2),
                 offset: ctx.sys_req_arg::<i64>(3) | ((ctx.sys_req_arg::<i64>(4)) << 32),
             },
-            Sysno::readv => SyscallRequest::Readv {
-                fd: ctx.sys_req_arg(0),
-                iovec: ctx.sys_req_ptr(1),
-                iovcnt: ctx.sys_req_arg(2),
-            },
-            Sysno::writev => SyscallRequest::Writev {
-                fd: ctx.sys_req_arg(0),
-                iovec: ctx.sys_req_ptr(1),
-                iovcnt: ctx.sys_req_arg(2),
-            },
-            Sysno::access => SyscallRequest::Access {
-                pathname: ctx.sys_req_ptr(0),
-                mode: ctx.sys_req_arg(1),
-            },
+            Sysno::readv => sys_req!(Readv { fd, iovec:*, iovcnt }),
+            Sysno::writev => sys_req!(Writev { fd, iovec:*, iovcnt }),
+            Sysno::access => sys_req!(Access { pathname:*, mode }),
             Sysno::pipe => SyscallRequest::Pipe2 {
                 pipefd: ctx.sys_req_ptr(0),
                 flags: litebox::fs::OFlags::empty(),
             },
-            Sysno::pipe2 => SyscallRequest::Pipe2 {
-                pipefd: ctx.sys_req_ptr(0),
-                flags: ctx.sys_req_arg(1),
-            },
+            Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
             Sysno::madvise => {
                 let behavior: i32 = ctx.sys_req_arg(2);
                 let behavior =
@@ -1883,11 +1865,11 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     },
                 }
             }
-            Sysno::connect => SyscallRequest::Connect {
-                sockfd: ctx.sys_req_arg(0),
-                sockaddr: ctx.sys_req_ptr(1),
-                addrlen: ctx.sys_req_arg(2),
-            },
+            Sysno::connect => sys_req!(Connect {
+                sockfd,
+                sockaddr:*,
+                addrlen
+            }),
             #[cfg(target_arch = "x86_64")]
             Sysno::accept => SyscallRequest::Accept {
                 sockfd: ctx.sys_req_arg(0),
@@ -1895,37 +1877,34 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 addrlen: ctx.sys_req_ptr(2),
                 flags: SockFlags::empty(),
             },
-            Sysno::accept4 => SyscallRequest::Accept {
-                sockfd: ctx.sys_req_arg(0),
-                addr: ctx.sys_req_ptr(1),
-                addrlen: ctx.sys_req_ptr(2),
-                flags: ctx.sys_req_arg(3),
-            },
-            Sysno::sendto => SyscallRequest::Sendto {
-                sockfd: ctx.sys_req_arg(0),
-                buf: ctx.sys_req_ptr(1),
-                len: ctx.sys_req_arg(2),
-                flags: ctx.sys_req_arg(3),
-                addr: ctx.sys_req_ptr(4),
-                addrlen: ctx.sys_req_arg(5),
-            },
-            Sysno::recvfrom => SyscallRequest::Recvfrom {
-                sockfd: ctx.sys_req_arg(0),
-                buf: ctx.sys_req_ptr(1),
-                len: ctx.sys_req_arg(2),
-                flags: ctx.sys_req_arg(3),
-                addr: ctx.sys_req_ptr(4),
-                addrlen: ctx.sys_req_ptr(5),
-            },
-            Sysno::bind => SyscallRequest::Bind {
-                sockfd: ctx.sys_req_arg(0),
-                sockaddr: ctx.sys_req_ptr(1),
-                addrlen: ctx.sys_req_arg(2),
-            },
-            Sysno::listen => SyscallRequest::Listen {
-                sockfd: ctx.sys_req_arg(0),
-                backlog: ctx.sys_req_arg(1),
-            },
+            Sysno::accept4 => sys_req!(Accept {
+                sockfd,
+                addr:*,
+                addrlen:*,
+                flags
+            }),
+            Sysno::sendto => sys_req!(Sendto {
+                sockfd,
+                buf:*,
+                len,
+                flags,
+                addr:*,
+                addrlen
+            }),
+            Sysno::recvfrom => sys_req!(Recvfrom {
+                sockfd,
+                buf:*,
+                len,
+                flags,
+                addr:*,
+                addrlen:*,
+            }),
+            Sysno::bind => sys_req!(Bind {
+                sockfd,
+                sockaddr:*,
+                addrlen
+            }),
+            Sysno::listen => sys_req!(Listen { sockfd, backlog }),
             Sysno::setsockopt => {
                 let optname = SocketOptionName::from(ctx.sys_req_arg(1), ctx.sys_req_arg(2));
                 if let Some(optname) = optname {
@@ -1939,34 +1918,16 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     SyscallRequest::Ret(errno::Errno::EINVAL)
                 }
             }
-            Sysno::exit => SyscallRequest::Exit {
-                status: ctx.sys_req_arg(0),
-            },
-            Sysno::exit_group => SyscallRequest::ExitGroup {
-                status: ctx.sys_req_arg(0),
-            },
-            ::syscalls::Sysno::uname => SyscallRequest::Uname {
-                buf: ctx.sys_req_ptr(0),
-            },
+            Sysno::exit => sys_req!(Exit { status }),
+            Sysno::exit_group => sys_req!(ExitGroup { status }),
+            ::syscalls::Sysno::uname => sys_req!(Uname { buf:* }),
             Sysno::fcntl => SyscallRequest::Fcntl {
                 fd: ctx.sys_req_arg(0),
                 arg: FcntlArg::from(ctx.sys_req_arg(1), ctx.sys_req_arg(2)),
             },
-            Sysno::getcwd => SyscallRequest::Getcwd {
-                buf: ctx.sys_req_ptr(0),
-                size: ctx.sys_req_arg(1),
-            },
-            Sysno::readlink => SyscallRequest::Readlink {
-                pathname: ctx.sys_req_ptr(0),
-                buf: ctx.sys_req_ptr(1),
-                bufsiz: ctx.sys_req_arg(2),
-            },
-            Sysno::readlinkat => SyscallRequest::Readlinkat {
-                dirfd: ctx.sys_req_arg(0),
-                pathname: ctx.sys_req_ptr(1),
-                buf: ctx.sys_req_ptr(2),
-                bufsiz: ctx.sys_req_arg(3),
-            },
+            Sysno::getcwd => sys_req!(Getcwd { buf:*, size }),
+            Sysno::readlink => sys_req!(Readlink { pathname:*, buf:* ,bufsiz }),
+            Sysno::readlinkat => sys_req!(Readlinkat { dirfd, pathname:*, buf:*, bufsiz }),
             #[cfg(target_arch = "x86_64")]
             Sysno::getrlimit => {
                 let resource: i32 = ctx.sys_req_arg(0);
@@ -2043,14 +2004,14 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 sigmask: None,
                 sigsetsize: 0,
             },
-            Sysno::epoll_pwait => SyscallRequest::EpollPwait {
-                epfd: ctx.sys_req_arg(0),
-                events: ctx.sys_req_ptr(1),
-                maxevents: ctx.sys_req_arg(2),
-                timeout: ctx.sys_req_arg(3),
-                sigmask: ctx.sys_req_ptr(4),
-                sigsetsize: ctx.sys_req_arg(5),
-            },
+            Sysno::epoll_pwait => sys_req!(EpollPwait {
+                epfd,
+                events:*,
+                maxevents,
+                timeout,
+                sigmask:*,
+                sigsetsize
+            }),
             Sysno::epoll_create => {
                 // the `size` argument is ignored, but must be greater than zero;
                 let size: i32 = ctx.sys_req_arg(0);
@@ -2062,9 +2023,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     SyscallRequest::Ret(errno::Errno::EINVAL)
                 }
             }
-            Sysno::epoll_create1 => SyscallRequest::EpollCreate {
-                flags: ctx.sys_req_arg(0),
-            },
+            Sysno::epoll_create1 => sys_req!(EpollCreate { flags }),
             Sysno::arch_prctl => {
                 let code: u32 = ctx.sys_req_arg(0);
                 if let Ok(code) = ArchPrctlCode::try_from(code) {
@@ -2083,45 +2042,19 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 }
             }
             Sysno::gettid => SyscallRequest::Gettid,
-            Sysno::set_thread_area => SyscallRequest::SetThreadArea {
-                user_desc: ctx.sys_req_ptr(0),
-            },
-            Sysno::set_tid_address => SyscallRequest::SetTidAddress {
-                tidptr: ctx.sys_req_ptr(0),
-            },
-            Sysno::openat => SyscallRequest::Openat {
-                dirfd: ctx.sys_req_arg(0),
-                pathname: ctx.sys_req_ptr(1),
-                flags: ctx.sys_req_arg(2),
-                mode: ctx.sys_req_arg(3),
-            },
+            Sysno::set_thread_area => sys_req!(SetThreadArea { user_desc:* }),
+            Sysno::set_tid_address => sys_req!(SetTidAddress { tidptr:* }),
+            Sysno::openat => sys_req!(Openat { dirfd,pathname:*,flags,mode }),
             #[cfg(target_arch = "x86_64")]
-            Sysno::newfstatat => SyscallRequest::Newfstatat {
-                dirfd: ctx.sys_req_arg(0),
-                pathname: ctx.sys_req_ptr(1),
-                buf: ctx.sys_req_ptr(2),
-                flags: ctx.sys_req_arg(3),
-            },
+            Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
             #[cfg(target_arch = "x86")]
-            Sysno::fstatat64 => SyscallRequest::Fstatat64 {
-                dirfd: ctx.sys_req_arg(0),
-                pathname: ctx.sys_req_ptr(1),
-                buf: ctx.sys_req_ptr(2),
-                flags: ctx.sys_req_arg(3),
-            },
+            Sysno::fstatat64 => sys_req!(Fstatat64 { dirfd,pathname:*,buf:*,flags }),
             Sysno::eventfd => SyscallRequest::Eventfd2 {
                 initval: ctx.sys_req_arg(0),
                 flags: EfdFlags::empty(),
             },
-            Sysno::eventfd2 => SyscallRequest::Eventfd2 {
-                initval: ctx.sys_req_arg(0),
-                flags: ctx.sys_req_arg(1),
-            },
-            Sysno::getrandom => SyscallRequest::GetRandom {
-                buf: ctx.sys_req_ptr(0),
-                count: ctx.sys_req_arg(1),
-                flags: ctx.sys_req_arg(2),
-            },
+            Sysno::eventfd2 => sys_req!(Eventfd2 { initval, flags }),
+            Sysno::getrandom => sys_req!(GetRandom { buf:*,count,flags }),
             Sysno::clone3 => {
                 debug_assert_eq!(
                     ctx.sys_req_arg::<usize>(1),
@@ -2135,9 +2068,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             }
             Sysno::set_robust_list => {
                 if ctx.sys_req_arg::<usize>(1) == size_of::<RobustListHead<Platform>>() {
-                    SyscallRequest::SetRobustList {
-                        head: ctx.sys_req_arg(0),
-                    }
+                    sys_req!(SetRobustList { head })
                 } else {
                     SyscallRequest::Ret(errno::Errno::EINVAL)
                 }
@@ -2150,18 +2081,9 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     len: ctx.sys_req_ptr(2),
                 }
             }
-            Sysno::sysinfo => SyscallRequest::Sysinfo {
-                buf: ctx.sys_req_ptr(0),
-            },
-            Sysno::capget => SyscallRequest::CapGet {
-                header: ctx.sys_req_ptr(0),
-                data: ctx.sys_req_ptr(1),
-            },
-            Sysno::getdents64 => SyscallRequest::GetDirent64 {
-                fd: ctx.sys_req_arg(0),
-                dirp: ctx.sys_req_ptr(1),
-                count: ctx.sys_req_arg(2),
-            },
+            Sysno::sysinfo => sys_req!(Sysinfo { buf:* }),
+            Sysno::capget => sys_req!(CapGet { header:*,data:* }),
+            Sysno::getdents64 => sys_req!(GetDirent64 { fd,dirp:*,count }),
             // TODO: support syscall `statfs`
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 SyscallRequest::Ret(errno::Errno::ENOSYS)
@@ -2365,6 +2287,9 @@ impl PtRegs {
 //
 // IMPORTANT: this always silently performs truncation. This is why it should not be used for
 // anything other than for `SyscallReuqest::try_from_raw`.
+#[diagnostic::on_unimplemented(
+    message = "If you are trying to use a pointer for the sys_req macro, you might want to `:*` it. Alternatively, you might be looking for `sys_req_ptr` rather than `sys_req_arg`."
+)]
 trait ReinterpretTruncatedFromUsize: Sized {
     fn reinterpret_truncated_from_usize(v: usize) -> Self;
 }
@@ -2435,6 +2360,9 @@ reinterpret_truncated_from_usize_for! {
 //
 // Also, note how it is only implemented on `RawConstPointer` but will also work with
 // `RawMutPointer` because `RawMutPointer` declares `RawConstPointer` as a super-trait.
+#[diagnostic::on_unimplemented(
+    message = "If you are trying to use a non-pointer for the sys_req macro, you might want remove the `:*` for it. Alternatively, you might be looking for `sys_req_arg` rather than `sys_req_ptr`."
+)]
 trait ReinterpretUsizeAsPtr<T>: Sized {
     fn reinterpret_usize_as_ptr(v: usize) -> Self;
 }
