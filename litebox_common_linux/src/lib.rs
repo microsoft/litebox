@@ -1891,7 +1891,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             }
             Sysno::exit => sys_req!(Exit { status }),
             Sysno::exit_group => sys_req!(ExitGroup { status }),
-            ::syscalls::Sysno::uname => sys_req!(Uname { buf:* }),
+            Sysno::uname => sys_req!(Uname { buf:* }),
             Sysno::fcntl => SyscallRequest::Fcntl {
                 fd: ctx.sys_req_arg(0),
                 arg: FcntlArg::from(ctx.sys_req_arg(1), ctx.sys_req_arg(2)),
@@ -1923,7 +1923,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     SyscallRequest::Ret(errno::Errno::EINVAL)
                 }
             }
-            ::syscalls::Sysno::setrlimit => {
+            Sysno::setrlimit => {
                 let resource: i32 = ctx.sys_req_arg(0);
                 if let Ok(resource) = RlimitResource::try_from(resource) {
                     SyscallRequest::Setrlimit {
