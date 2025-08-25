@@ -789,7 +789,6 @@ pub struct PunchthroughToken {
 
 impl litebox::platform::PunchthroughToken for PunchthroughToken {
     type Punchthrough = PunchthroughSyscall<LinuxUserland>;
-    #[expect(clippy::too_many_lines)]
     fn execute(
         self,
     ) -> Result<
@@ -901,11 +900,6 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 _ => panic!("unexpected error {err}"),
             })
             .map_err(litebox::platform::PunchthroughError::Failure),
-            PunchthroughSyscall::ClockGettime { .. }
-            | PunchthroughSyscall::Gettimeofday { .. }
-            | PunchthroughSyscall::Time { .. } => {
-                unreachable!("Due to the vDSO, this would not be triggered on LinuxUserland.");
-            }
         }
     }
 }

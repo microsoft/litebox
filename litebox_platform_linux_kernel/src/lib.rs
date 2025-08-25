@@ -72,9 +72,6 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
                     .ok_or(Errno::EFAULT)
             }
             PunchthroughSyscall::WakeByAddress { .. } => todo!(),
-            _ => {
-                unimplemented!("PunchthroughToken for LinuxKernel is not fully implemented yet");
-            }
         };
         match r {
             Ok(v) => Ok(v),
