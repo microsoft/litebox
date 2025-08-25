@@ -285,11 +285,6 @@ impl WindowsUserland {
         x & !(gran - 1)
     }
 
-    fn is_aligned_to_granu(&self, x: usize) -> bool {
-        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
-        x % gran == 0
-    }
-
     fn set_init_tls(&self) {
         // TODO: Currently we are using a static thread ID and credentials (faked).
         // This is a placeholder for future implementation to use passthrough.
@@ -848,6 +843,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
         // 1) In case we have a suggested VA range, we first check and deal with the case
         // that the address (range) is already reserved.
+
         if suggested_range.start != 0 {
             assert!(suggested_range.start as usize >= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
                                                             TASK_ADDR_MIN);
@@ -872,7 +868,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 );
 
                 let size_within_region = core::cmp::min(size, region_end - suggested_range.start);
-                unsafe {
+                let ptr = unsafe {
                     match mbi.State {
                         // In case the region is already reserved, we just need to commit it.
                         Win32_Memory::MEM_RESERVE => {
@@ -885,13 +881,25 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                 core::ptr::null_mut(),
                                 0,
                             );
-                            assert!(
-                                !ptr.is_null(),
-                                "VirtualAlloc2(COMMIT addr={:p}, size=0x{:x}) failed: err={}",
-                                base_addr,
-                                size_within_region,
-                                GetLastError()
-                            );
+                            assert!(!ptr.is_null(), "{}", {
+                                let last_error = GetLastError();
+                                format!(
+                                    "VirtualAlloc2(COMMIT) failed. Range (0x{:x} - 0x{:x}). Error: {}. Str: {}",
+                                    base_addr as usize,
+                                    (base_addr as usize + size_within_region),
+                                    last_error,
+                                    werr_text(last_error)
+                                )
+                            });
+                            if fixed_address {
+                                assert!(
+                                    ptr == base_addr,
+                                    "VirtualAlloc2(COMMIT) returned address {:p} which is not the expected fixed address {:p}",
+                                    ptr,
+                                    base_addr
+                                );
+                            }
+                            ptr
                         }
                         // In case the region is already committed, we just need to change its permissions.
                         Win32_Memory::MEM_COMMIT => {
@@ -903,43 +911,45 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     prot_flags(initial_permissions),
                                     &mut old_protect,
                                 ) != 0,
-                                "VirtualProtect(addr={:p}, size=0x{:x}) failed: {}",
-                                base_addr,
-                                size_within_region,
-                                GetLastError()
+                                "{}",
+                                {
+                                    let last_error = GetLastError();
+                                    format!(
+                                        "VirtualProtect failed. Range (0x{:x} - 0x{:x}). Error: {}. Str: {}",
+                                        base_addr as usize,
+                                        (base_addr as usize + size_within_region),
+                                        last_error,
+                                        werr_text(last_error)
+                                    )
+                                }
                             );
+                            base_addr
                         }
                         _ => {
                             panic!("Unexpected memory state: {:?}", mbi.State);
                         }
                     }
+                };
+
+                // Prefetch the memory range if requested
+                if populate_pages_immediately {
+                    do_prefetch_on_range(ptr as usize, size_within_region);
                 }
 
                 // If the requested end address is beyond the reserved region (cross the region),
                 // we need to allocate more memory.
                 if request_end > region_end {
-                    // Windows region should be aligned to its allocation granularity.
-                    assert!(
-                        self.is_aligned_to_granu(region_end),
-                        "Region end address {:p} is not aligned to allocation granularity",
-                        region_end as *mut c_void
-                    );
-
                     // In case of cross-region allocation, we must ensure that the virtual address
                     // returned by VirtualAlloc2 is the expected start address (contiguous with the
                     // already reserved region).
                     <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
-                            self,
-                            region_end..request_end,
-                            initial_permissions,
-                            can_grow_down,
-                            populate_pages_immediately,
-                            true,
-                        )?;
-                }
-                // Prefetch the memory range if requested
-                if populate_pages_immediately {
-                    do_prefetch_on_range(suggested_range.start, suggested_range.len());
+                        self,
+                        region_end..request_end,
+                        initial_permissions,
+                        can_grow_down,
+                        populate_pages_immediately,
+                        true,
+                    )?;
                 }
 
                 return Ok(litebox::platform::trivial_providers::TransparentMutPtr {
@@ -956,29 +966,50 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // just have to reserve & commit a VA range.
 
         // Align the size and base address to the allocation granularity.
-        let aligned_size = self.round_up_to_granu(size);
         let aligned_base_addr = self.round_down_to_granu(base_addr as usize) as *mut c_void;
+        let aligned_size = self.round_up_to_granu(size);
 
-        // Reserve and commit the memory.
+        // Check the current (unreserved) memory chunk's available size for reservation
+        let mut available_end_addr = aligned_base_addr as usize + aligned_size;
+        let mut available_size = aligned_size;
+        if !aligned_base_addr.is_null() {
+            let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+            do_query_on_region(&mut mbi, aligned_base_addr);
+
+            available_end_addr = core::cmp::min(
+                available_end_addr,
+                mbi.BaseAddress as usize + mbi.RegionSize as usize,
+            );
+            available_size = core::cmp::min(
+                available_size,
+                available_end_addr - aligned_base_addr as usize,
+            );
+        }
+
+        // Do the real VirtualAlloc to reserve and commit the memory.
+        // TODO(chuqi): here we may also break down the RESERVE and COMMIT.
         let addr: *mut c_void = unsafe {
             VirtualAlloc2(
                 GetCurrentProcess(),
                 aligned_base_addr,
-                aligned_size,
+                available_size,
                 Win32_Memory::MEM_COMMIT | Win32_Memory::MEM_RESERVE,
                 prot_flags(initial_permissions),
                 core::ptr::null_mut(),
                 0,
             )
         };
-        assert!(
-            !addr.is_null(),
-            "VirtualAlloc2 failed. Address: {:p}, Size: {}, Permissions: {:?}. Error: {}",
-            aligned_base_addr,
-            aligned_size,
-            initial_permissions,
-            unsafe { GetLastError() }
-        );
+        assert!(!addr.is_null(), "{}", {
+            let last_error = unsafe { GetLastError() };
+            format!(
+                "VirtualAlloc2 failed. Range: (0x{:x} - 0x{:x}), Permissions: {:?}. Error: {} str: {}.",
+                aligned_base_addr as usize,
+                (aligned_base_addr as usize + available_size),
+                initial_permissions,
+                last_error,
+                werr_text(last_error)
+            )
+        });
 
         if fixed_address {
             assert!(
@@ -989,10 +1020,30 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             );
         }
 
+        let range_allocated = (addr as usize)..(addr as usize + available_size);
+
         // Prefetch the memory range if requested
         if populate_pages_immediately {
-            do_prefetch_on_range(addr as usize, aligned_size);
+            do_prefetch_on_range(addr as usize, available_size);
         }
+
+        // Do another allocate_pages(). Here we should use the actual requested size, but not the
+        // aligned_size. The reason is "aligned_size" should be only used for VirtualAlloc(RESERVE)
+        // for memory region reservation. Since the available size is smaller (for reservation), we
+        // have to handle its next chunk (which is already reserved) and use the exact requested
+        // size for allocation.
+        if available_size < size {
+            let supposed_request_end = addr as usize + size as usize;
+            <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
+                self,
+                range_allocated.end..supposed_request_end,
+                initial_permissions,
+                can_grow_down,
+                populate_pages_immediately,
+                true,
+            )?;
+        }
+
         Ok(litebox::platform::trivial_providers::TransparentMutPtr {
             inner: addr.cast::<u8>(),
         })
@@ -1002,14 +1053,41 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
-        let ok = unsafe {
-            VirtualFree(
-                range.start as *mut c_void,
-                range.len(),
-                Win32_Memory::MEM_DECOMMIT,
-            ) != 0
-        };
-        assert!(ok, "VirtualFree failed: {}", unsafe { GetLastError() });
+        let mut decommit_base = range.start;
+        let mut remain_size: usize = range.len();
+
+        // Decommit the region at mbi boundary
+        while decommit_base < range.end {
+            let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+            do_query_on_region(&mut mbi, decommit_base as *mut c_void);
+            assert!(mbi.BaseAddress as usize == decommit_base);
+
+            let base = mbi.BaseAddress as usize;
+            let size = mbi.RegionSize as usize;
+            let next = base + size;
+            let free_size = core::cmp::min(remain_size, size);
+            remain_size -= free_size;
+
+            let ok = unsafe {
+                VirtualFree(
+                    decommit_base as *mut c_void,
+                    free_size,
+                    Win32_Memory::MEM_DECOMMIT,
+                ) != 0
+            };
+            assert!(ok, "{}", {
+                let last_error = unsafe { GetLastError() };
+                format!(
+                    "VirtualFree(MEM_DECOMMIT) on range ({:p} - {:p}) failed: {}. str: {}",
+                    decommit_base as *mut c_void,
+                    (decommit_base + free_size) as *mut c_void,
+                    last_error,
+                    werr_text(last_error)
+                )
+            });
+
+            decommit_base = next;
+        }
         Ok(())
     }
 
@@ -1031,15 +1109,43 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
         let mut old_protect: u32 = 0;
-        let ok = unsafe {
-            VirtualProtect(
-                range.start as *mut c_void,
-                range.len(),
-                prot_flags(new_permissions),
-                &raw mut old_protect,
-            ) != 0
-        };
-        assert!(ok, "VirtualProtect failed: {}", unsafe { GetLastError() });
+
+        let mut perm_update_base = range.start;
+        let mut remain_size = range.len();
+        let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+
+        // Decommit the region at mbi boundary
+        while perm_update_base < range.end {
+            do_query_on_region(&mut mbi, perm_update_base as *mut c_void);
+            assert!(mbi.BaseAddress as usize == perm_update_base);
+
+            let base = mbi.BaseAddress as usize;
+            let size = mbi.RegionSize as usize;
+            let next = base + size;
+            let perm_update_size = core::cmp::min(remain_size, size);
+            remain_size -= perm_update_size;
+
+            let ok = unsafe {
+                VirtualProtect(
+                    perm_update_base as *mut c_void,
+                    perm_update_size,
+                    prot_flags(new_permissions),
+                    &raw mut old_protect,
+                ) != 0
+            };
+            assert!(ok, "{}", {
+                let last_error = unsafe { GetLastError() };
+                format!(
+                    "VirtualProtect on range ({:p} - {:p}) failed: {}. str: {}",
+                    perm_update_base as *mut c_void,
+                    (perm_update_base + perm_update_size) as *mut c_void,
+                    last_error,
+                    werr_text(last_error)
+                )
+            });
+
+            perm_update_base = next;
+        }
         Ok(())
     }
 
