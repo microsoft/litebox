@@ -23,8 +23,8 @@ use windows_sys::Win32::Foundation as Win32_Foundation;
 use windows_sys::Win32::{
     Foundation::{GetLastError, WIN32_ERROR},
     System::Diagnostics::Debug::{
-        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
-        EXCEPTION_POINTERS,
+        self as Win32_Debug, AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION,
+        EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
     },
     System::Memory::{
         self as Win32_Memory, PrefetchVirtualMemory, VirtualAlloc2, VirtualFree, VirtualProtect,
@@ -771,8 +771,13 @@ fn do_prefetch_on_range(start: usize, size: usize) {
         };
         PrefetchVirtualMemory(GetCurrentProcess(), 1, &raw const prefetch_entry, 0) != 0
     };
-    assert!(ok, "PrefetchVirtualMemory failed with error: {}", unsafe {
-        GetLastError()
+    assert!(ok, "{}", {
+        let last_error = unsafe { GetLastError() };
+        format!(
+            "PrefetchVirtualMemory failed with error: {}. Str: {}",
+            last_error,
+            werr_text(last_error)
+        )
     });
 }
 
@@ -784,8 +789,14 @@ fn do_query_on_region(mbi: &mut Win32_Memory::MEMORY_BASIC_INFORMATION, base_add
             core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
         ) != 0
     };
-    assert!(ok, "VirtualQuery addr={:p} failed: {}", base_addr, unsafe {
-        GetLastError()
+    assert!(ok, "{}", {
+        let last_error = unsafe { GetLastError() };
+        format!(
+            "VirtualQuery addr={:p} failed. error: {}. Str: {}",
+            base_addr,
+            last_error,
+            werr_text(last_error)
+        )
     });
 }
 
