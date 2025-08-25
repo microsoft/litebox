@@ -227,11 +227,19 @@ impl<Host: HostInterface> DebugLogProvider for LinuxKernel<Host> {
 /// An implementation of [`litebox::platform::Instant`]
 pub struct Instant(u64);
 
+/// An implementation of [`litebox::platform::SystemTime`]
+pub struct SystemTime();
+
 impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
     type Instant = Instant;
+    type SystemTime = SystemTime;
 
     fn now(&self) -> Self::Instant {
         Instant::now()
+    }
+
+    fn current_time(&self) -> Self::SystemTime {
+        unimplemented!()
     }
 }
 
@@ -261,6 +269,17 @@ impl Instant {
 
     fn now() -> Self {
         Instant(Self::rdtsc())
+    }
+}
+
+impl litebox::platform::SystemTime for SystemTime {
+    const UNIX_EPOCH: Self = SystemTime();
+
+    fn duration_since(
+        &self,
+        _earlier: &Self,
+    ) -> Result<core::time::Duration, core::time::Duration> {
+        unimplemented!()
     }
 }
 

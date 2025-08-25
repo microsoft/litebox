@@ -702,12 +702,26 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
 
 impl litebox::platform::TimeProvider for LinuxUserland {
     type Instant = Instant;
+    type SystemTime = SystemTime;
 
     fn now(&self) -> Self::Instant {
         let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, t.as_mut_ptr()) };
         let t = unsafe { t.assume_init() };
         Instant {
+            #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
+            inner: litebox_common_linux::Timespec {
+                tv_sec: i64::from(t.tv_sec),
+                tv_nsec: u64::from(t.tv_nsec.reinterpret_as_unsigned()),
+            },
+        }
+    }
+
+    fn current_time(&self) -> Self::SystemTime {
+        let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
+        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, t.as_mut_ptr()) };
+        let t = unsafe { t.assume_init() };
+        SystemTime {
             #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
             inner: litebox_common_linux::Timespec {
                 tv_sec: i64::from(t.tv_sec),
@@ -730,6 +744,25 @@ impl litebox::platform::Instant for Instant {
 impl From<litebox_common_linux::Timespec> for Instant {
     fn from(inner: litebox_common_linux::Timespec) -> Self {
         Instant { inner }
+    }
+}
+
+pub struct SystemTime {
+    inner: litebox_common_linux::Timespec,
+}
+
+impl litebox::platform::SystemTime for SystemTime {
+    const UNIX_EPOCH: Self = SystemTime {
+        inner: litebox_common_linux::Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+    };
+
+    fn duration_since(&self, earlier: &Self) -> Result<core::time::Duration, core::time::Duration> {
+        self.inner
+            .sub_timespec(&earlier.inner)
+            .map_err(|_errno| earlier.inner.sub_timespec(&self.inner).unwrap())
     }
 }
 
