@@ -789,6 +789,33 @@ fn do_query_on_region(mbi: &mut Win32_Memory::MEMORY_BASIC_INFORMATION, base_add
     });
 }
 
+fn werr_text(err: u32) -> String {
+    unsafe {
+        let mut buf: *mut u16 = std::ptr::null_mut();
+        let flags = Win32_Debug::FORMAT_MESSAGE_ALLOCATE_BUFFER
+            | Win32_Debug::FORMAT_MESSAGE_FROM_SYSTEM
+            | Win32_Debug::FORMAT_MESSAGE_IGNORE_INSERTS;
+        let len = Win32_Debug::FormatMessageW(
+            flags,
+            std::ptr::null_mut(),
+            err,
+            0,
+            (&mut buf) as *mut *mut u16 as *mut u16,
+            0,
+            std::ptr::null_mut(),
+        );
+        if len == 0 || buf.is_null() {
+            return format!("Win32 error {}", err);
+        }
+        // Turn to String and free the buffer via LocalFree.
+        let slice = std::slice::from_raw_parts(buf, len as usize);
+        let s = String::from_utf16_lossy(slice).trim().to_string();
+        // LocalFree
+        let _ = Win32_Foundation::LocalFree(buf as *mut c_void);
+        s
+    }
+}
+
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
     // TODO(chuqi): These are currently "magic numbers" grabbed from my Windows 11 SystemInformation.
     // The actual values should be determined by `GetSystemInfo()`.
