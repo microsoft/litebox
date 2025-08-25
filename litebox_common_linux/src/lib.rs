@@ -740,7 +740,7 @@ impl TryFrom<TimeVal> for core::time::Duration {
 impl From<Timespec> for TimeVal {
     fn from(timespec: Timespec) -> Self {
         // Convert seconds to time_t
-        let timeval_sec = timespec.tv_sec as time_t;
+        let timeval_sec: time_t = timespec.tv_sec.truncate();
 
         // Convert nanoseconds to microseconds, ensuring we don't overflow suseconds_t
         let microseconds = timespec.tv_nsec / 1_000;
