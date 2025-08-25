@@ -31,6 +31,9 @@ struct Lockable<Platform: RawSyncPrimitivesProvider> {
     // TODO(jayb): Move the `num_waiters` to be part of the raw mutex underlying atomic itself. This
     // is purely a minor optimization opportunity, and should not hurt the actual implementation itself.
     num_waiters: u32,
+    // Note: we currently use only a single bit from the raw-mutex underlying-atomic, to denote
+    // "there is a waiter active". A mildly more optimized implementation would also move the
+    // `num_waiters` into the same atomic.
     raw_mutex: Arc<Platform::RawMutex>,
     latest_wake_bitset: Option<NonZeroU32>,
 }
@@ -145,6 +148,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
 
             // We should block till we are woken up.
             if let Some(remaining) = remaining {
+                #[expect(clippy::match_same_arms, reason = "different comment explanations")]
                 match raw_mutex.block_or_timeout(0, remaining) {
                     Ok(UnblockedOrTimedOut::Unblocked) => {
                         // fallthrough
@@ -152,14 +156,22 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
                     Ok(UnblockedOrTimedOut::TimedOut) => {
                         continue;
                     }
-                    Err(ImmediatelyWokenUp) => unreachable!(),
+                    Err(ImmediatelyWokenUp) => {
+                        // There is a waker that has already begun trying to wake things up, we
+                        // should not go to sleep at this point, but must instead fallthrough.
+                    }
                 }
             } else {
+                #[expect(clippy::match_same_arms, reason = "different comment explanations")]
+                #[expect(clippy::single_match_else, reason = "explicit Err case")]
                 match raw_mutex.block(0) {
                     Ok(()) => {
                         // fallthrough
                     }
-                    Err(ImmediatelyWokenUp) => unreachable!(),
+                    Err(ImmediatelyWokenUp) => {
+                        // There is a waker that has already begun trying to wake things up, we
+                        // should not go to sleep at this point, but must instead fallthrough.
+                    }
                 }
             }
 
@@ -245,6 +257,12 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
             lockable.num_waiters > 0,
             "The `lockable` for the address should have been GC'd if there were no more waiters."
         );
+        // We now must indicate to possible new waiters that we have begun the wake-up process
+        let old_underlying_atomic = lockable
+            .raw_mutex
+            .underlying_atomic()
+            .fetch_add(1, Ordering::SeqCst);
+        debug_assert_eq!(old_underlying_atomic, 0);
         // We can only wake up the number of sleepers that actually exist. The number of sleepers
         // does not change while we are calculating these things because we are holding on to this
         // lock, thus no more waiters can actually enter sleep while we finish this up.
@@ -287,6 +305,12 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         if let Some(lockable) = self.lockables.write().get_mut(&addr) {
             lockable.latest_wake_bitset = None;
             debug_assert!(num_to_wake_up > lockable.num_waiters);
+            // Allow waiters to start waiting again
+            let old_underlying_atomic = lockable
+                .raw_mutex
+                .underlying_atomic()
+                .fetch_sub(1, Ordering::SeqCst);
+            debug_assert_eq!(old_underlying_atomic, 1);
             Ok(num_to_wake_up - lockable.num_waiters)
         } else {
             // The addr has been GC'd from the addressables. All waiters have been woken up.
