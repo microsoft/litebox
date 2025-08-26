@@ -62,6 +62,7 @@ impl_truncate! { i16, i8 }
 impl_truncate! { usize, usize }
 impl_truncate! { u64, u64 }
 impl_truncate! { u32, u32 }
+impl_truncate! { i64, i64 }
 impl_truncate! { i32, i32 }
 
 /// An extension trait that adds `reinterpret_as_signed` to unsigned integers.
