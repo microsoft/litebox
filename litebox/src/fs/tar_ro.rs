@@ -25,7 +25,6 @@ use alloc::borrow::ToOwned as _;
 use alloc::string::String;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
-use tar_no_std::TarArchive;
 
 use crate::{
     LiteBox,
@@ -61,6 +60,15 @@ enum TarData {
     Borrowed(tar_no_std::TarArchiveRef<'static>),
 }
 
+impl TarData {
+    fn entries(&self) -> tar_no_std::ArchiveEntryIterator<'_> {
+        match self {
+            TarData::Owned(ar) => ar.entries(),
+            TarData::Borrowed(ar_ref) => ar_ref.entries(),
+        }
+    }
+}
+
 /// A backing implementation for [`FileSystem`](super::FileSystem), storing all files in-memory, via
 /// a read-only `.tar` file.
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
@@ -78,11 +86,10 @@ pub fn empty_tar_file() -> Vec<u8> {
 impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// Construct a new `FileSystem` instance from provided `tar_data`.
     ///
-    /// Note: this function takes `tar_data` as a `Vec` rather than a `&[u8]` to eliminate a memcpy
-    /// and ensure that full ownership is taken; if the fact that it is a `Vec` is sub-optimal due
-    /// to an _external_ forced-memcpy for any particular use case, then this could be updated to a
-    /// more flexible type, at the cost of adding an additional lifetime throughout this file
-    /// system.
+    /// Note: this function accepts `tar_data` as a `Cow<'static, [u8]>`. When a borrowed slice is
+    /// provided the filesystem will use a `TarArchiveRef` without taking ownership; when an owned
+    /// buffer is provided it will be consumed to construct a `TarArchive`. Using `Cow` avoids an
+    /// unnecessary copy while allowing either borrowed or owned input.
     ///
     /// Use [`empty_tar_file`] if you need an empty file system.
     ///
@@ -90,36 +97,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     ///
     /// Panics if the provided `tar_data` is found to be an invalid `.tar` file.
     #[must_use]
-    pub fn new(litebox: &LiteBox<Platform>, tar_data: Vec<u8>) -> Self {
+    pub fn new(litebox: &LiteBox<Platform>, tar_data: alloc::borrow::Cow<'static, [u8]>) -> Self {
         Self {
             litebox: litebox.clone(),
-            tar_data: TarData::Owned(TarArchive::new(tar_data.into_boxed_slice()).unwrap()),
+            tar_data: match tar_data {
+                alloc::borrow::Cow::Borrowed(slice) => TarData::Borrowed(
+                    tar_no_std::TarArchiveRef::new(slice).expect("invalid tar data"),
+                ),
+                alloc::borrow::Cow::Owned(vec) => TarData::Owned(
+                    tar_no_std::TarArchive::new(vec.into_boxed_slice()).expect("invalid tar data"),
+                ),
+            },
             current_working_dir: "/".into(),
-        }
-    }
-
-    /// Construct a new `FileSystem` instance from a borrowed/static tar data slice.
-    ///
-    /// This is suitable for use with `include_bytes!()` (which yields a `'static` slice).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the provided `tar_data` is found to be an invalid `.tar` file.
-    #[must_use]
-    pub fn new_borrowed(litebox: &LiteBox<Platform>, tar_data: &'static [u8]) -> Self {
-        Self {
-            litebox: litebox.clone(),
-            tar_data: TarData::Borrowed(
-                tar_no_std::TarArchiveRef::new(tar_data).expect("invalid tar data"),
-            ),
-            current_working_dir: "/".into(),
-        }
-    }
-
-    fn entries(&self) -> tar_no_std::ArchiveEntryIterator<'_> {
-        match &self.tar_data {
-            TarData::Owned(ar) => ar.entries(),
-            TarData::Borrowed(ar_ref) => ar_ref.entries(),
         }
     }
 
@@ -181,7 +170,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             // TODO: this might be slow for large tar files, due to a linear scan. If better perf is
             // needed, we can add a hashmap layer after doing one scan (in `new()`) that allows a
             // direct hashmap lookup of relevant information and data.
-            self.entries().enumerate().find(|(_, entry)| {
+            self.tar_data.entries().enumerate().find(|(_, entry)| {
                 match entry.filename().as_str() {
                     Ok(p) => p == path || contains_dir(p, path),
                     Err(_) => false,
@@ -237,7 +226,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             return Err(ReadError::NotAFile);
         };
         let position = offset.as_mut().unwrap_or(position);
-        let file = self.entries().nth(*idx).unwrap().data();
+        let file = self.tar_data.entries().nth(*idx).unwrap().data();
         let start = (*position).min(file.len());
         let end = position.checked_add(buf.len()).unwrap().min(file.len());
         debug_assert!(start <= end);
@@ -274,7 +263,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         else {
             return Err(SeekError::NotAFile);
         };
-        let file_len = self.entries().nth(*idx).unwrap().data().len();
+        let file_len = self.tar_data.entries().nth(*idx).unwrap().data().len();
         let base = match whence {
             SeekWhence::RelativeToBeginning => 0,
             SeekWhence::RelativeToCurrentOffset => *position,
@@ -295,10 +284,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let path = self.absolute_path(path)?;
         assert!(path.starts_with('/'));
         let path = &path[1..];
-        if self.entries().any(|entry| match entry.filename().as_str() {
-            Ok(p) => p == path || contains_dir(p, path),
-            Err(_) => false,
-        }) {
+        if self
+            .tar_data
+            .entries()
+            .any(|entry| match entry.filename().as_str() {
+                Ok(p) => p == path || contains_dir(p, path),
+                Err(_) => false,
+            })
+        {
             Err(ChmodError::ReadOnlyFileSystem)
         } else {
             Err(PathError::NoSuchFileOrDirectory)?
@@ -314,10 +307,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let path = self.absolute_path(path)?;
         assert!(path.starts_with('/'));
         let path = &path[1..];
-        if self.entries().any(|entry| match entry.filename().as_str() {
-            Ok(p) => p == path || contains_dir(p, path),
-            Err(_) => false,
-        }) {
+        if self
+            .tar_data
+            .entries()
+            .any(|entry| match entry.filename().as_str() {
+                Ok(p) => p == path || contains_dir(p, path),
+                Err(_) => false,
+            })
+        {
             Err(ChownError::ReadOnlyFileSystem)
         } else {
             Err(PathError::NoSuchFileOrDirectory)?
@@ -329,6 +326,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         assert!(path.starts_with('/'));
         let path = &path[1..];
         let entry = self
+            .tar_data
             .entries()
             .find(|entry| match entry.filename().as_str() {
                 Ok(p) => p == path || contains_dir(p, path),
@@ -361,6 +359,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         // Store into a hashmap to collapse together the entries we end up with for multiple files
         // within a sub-dir.
         let entries: HashMap<String, (FileType, usize)> = self
+            .tar_data
             .entries()
             .enumerate()
             .map(|(idx, entry)| (idx, entry.filename()))
@@ -429,13 +428,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         let path = self.absolute_path(path)?;
         let path = &path[1..];
-        let entry = self
-            .entries()
-            .enumerate()
-            .find(|(_, entry)| match entry.filename().as_str() {
+        let entry = self.tar_data.entries().enumerate().find(|(_, entry)| {
+            match entry.filename().as_str() {
                 Ok(p) => p == path || contains_dir(p, path),
                 Err(_) => false,
-            });
+            }
+        });
         match entry {
             None => Err(PathError::NoSuchFileOrDirectory)?,
             Some((_, p)) if p.filename().as_str().unwrap() != path => Ok(super::FileStatus {
@@ -472,7 +470,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         match &self.litebox.descriptor_table().get_entry(fd).entry {
             Descriptor::File { idx, .. } => {
-                let entry = self.entries().nth(*idx).unwrap();
+                let entry = self.tar_data.entries().nth(*idx).unwrap();
                 Ok(super::FileStatus {
                     file_type: super::FileType::RegularFile,
                     mode: mode_of_modeflags(entry.posix_header().mode.to_flags().unwrap()),
