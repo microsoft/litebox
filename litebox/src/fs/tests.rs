@@ -425,7 +425,7 @@ mod in_mem {
                 Mode::RWXU,
             )
             .expect("Failed to create new file with O_CREAT | O_EXCL");
-        
+
         // Write some data to verify file was created
         fs.write(&fd, b"test data", None)
             .expect("Failed to write to new file");
@@ -445,7 +445,7 @@ mod in_mem {
         let fd = fs
             .open("/newfile", OFlags::EXCL | OFlags::RDONLY, Mode::empty())
             .expect("Failed to open existing file with O_EXCL (without O_CREAT)");
-        
+
         // Verify we can read the data
         let mut buffer = vec![0; 9];
         let bytes_read = fs
@@ -465,7 +465,7 @@ mod in_mem {
             .expect("Failed to create directory");
         assert!(matches!(
             fs.open(
-                "/testdir", 
+                "/testdir",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
             ),
@@ -473,8 +473,6 @@ mod in_mem {
         ));
     }
 }
-
-
 
 mod tar_ro {
     use crate::LiteBox;
@@ -1087,7 +1085,7 @@ mod layered {
                 Mode::RWXU,
             )
             .expect("Failed to create new file with O_CREAT | O_EXCL");
-        
+
         fs.write(&fd, b"layered test", None)
             .expect("Failed to write to new file");
         fs.close(fd).expect("Failed to close new file");
@@ -1116,7 +1114,7 @@ mod layered {
         // Test O_CREAT | O_EXCL on file that was deleted (tombstoned) should succeed
         // First delete a file from lower layer
         fs.unlink("foo").expect("Failed to unlink lower layer file");
-        
+
         // Now try to create it with O_EXCL (should succeed since it's tombstoned)
         let fd = fs
             .open(
@@ -1125,7 +1123,7 @@ mod layered {
                 Mode::RWXU,
             )
             .expect("Failed to create file over tombstone with O_CREAT | O_EXCL");
-        
+
         fs.write(&fd, b"new foo content", None)
             .expect("Failed to write to recreated file");
         fs.close(fd).expect("Failed to close recreated file");
