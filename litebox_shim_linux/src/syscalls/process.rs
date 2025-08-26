@@ -508,6 +508,9 @@ pub(crate) fn sys_gettimeofday(
         // should normally be specified as NULL.
         unimplemented!()
     }
+    if tv.as_usize() == 0 {
+        return Ok(());
+    }
     let timeval = litebox_common_linux::Timespec::try_from(real_time_as_duration_since_epoch())
         .or(Err(Errno::EOVERFLOW))?
         .into();
@@ -521,7 +524,9 @@ pub(crate) fn sys_time(
     let time = real_time_as_duration_since_epoch();
     let seconds: u64 = time.as_secs();
     let seconds: litebox_common_linux::time_t = seconds.try_into().or(Err(Errno::EOVERFLOW))?;
-    unsafe { tloc.write_at_offset(0, seconds) }.ok_or(Errno::EFAULT)?;
+    if tloc.as_usize() != 0 {
+        unsafe { tloc.write_at_offset(0, seconds) }.ok_or(Errno::EFAULT)?;
+    }
     Ok(seconds)
 }
 
