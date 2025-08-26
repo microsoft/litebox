@@ -2341,6 +2341,11 @@ impl ReinterpretTruncatedFromUsize for i64 {
         v.reinterpret_as_signed() as i64
     }
 }
+impl ReinterpretTruncatedFromUsize for isize {
+    fn reinterpret_truncated_from_usize(v: usize) -> Self {
+        v.reinterpret_as_signed()
+    }
+}
 macro_rules! reinterpret_truncated_from_usize_for {
     (
         unsigned [$($uty:ty),* $(,)?],
