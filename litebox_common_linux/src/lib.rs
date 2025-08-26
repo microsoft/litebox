@@ -713,6 +713,18 @@ impl From<Timespec> for core::time::Duration {
     }
 }
 
+impl TryFrom<core::time::Duration> for Timespec {
+    // Overflow error, indicated just as a unit
+    type Error = ();
+
+    fn try_from(duration: core::time::Duration) -> Result<Self, Self::Error> {
+        Ok(Timespec {
+            tv_sec: i64::try_from(duration.as_secs()).or(Err(()))?,
+            tv_nsec: u64::from(duration.subsec_nanos()),
+        })
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TimeVal {
@@ -2174,17 +2186,6 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
     },
     WakeByAddress {
         addr: Platform::RawMutPointer<i32>,
-    },
-    ClockGettime {
-        clockid: i32,
-        tp: Platform::RawMutPointer<Timespec>,
-    },
-    Gettimeofday {
-        tv: Platform::RawMutPointer<TimeVal>,
-        tz: Platform::RawMutPointer<TimeZone>,
-    },
-    Time {
-        tloc: Platform::RawMutPointer<time_t>,
     },
 }
 

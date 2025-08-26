@@ -312,11 +312,18 @@ pub enum ReceiveError {
 /// An interface to understanding time.
 pub trait TimeProvider {
     type Instant: Instant;
+    type SystemTime: SystemTime;
     /// Returns an instant coresponding to "now".
     fn now(&self) -> Self::Instant;
+    /// Returns the the current system time.
+    fn current_time(&self) -> Self::SystemTime;
 }
 
 /// An opaque measurement of a monotonically nondecreasing clock.
+///
+/// Notable, the `Instant` is distinct from [`SystemTime`], in that the `Instant` is monotonic, and
+/// need not have any relation with "real" time. It does not matter if the world takes a step
+/// backwards in time, the `Instant` continues marching forward.
 pub trait Instant {
     /// Returns the amount of time elapsed from another instant to this one, or `None` if that
     /// instant is later than this one.
@@ -327,6 +334,20 @@ pub trait Instant {
         self.checked_duration_since(earlier)
             .unwrap_or(core::time::Duration::from_secs(0))
     }
+}
+
+/// A measurement of the system clock.
+///
+/// Notably, the `SystemTime` is distinct from [`Instant`], in that the `SystemTime` need not be
+/// monotonic, but instead is the best guess of "real" or "wall clock" time.
+pub trait SystemTime {
+    /// An anchor in time corresponding to "1970-01-01 00:00:00 UTC".
+    const UNIX_EPOCH: Self;
+    /// Returns the amount of time elapsed from an `earlier` point in time to this one. This is
+    /// fallible since the clock might have been adjusted backwards in time to before the earlier
+    /// point in time was measured; in such a case, it returns an `Err(_)` with the absolute
+    /// duration.
+    fn duration_since(&self, earlier: &Self) -> Result<core::time::Duration, core::time::Duration>;
 }
 
 /// An interface to dumping debug output for tracing purposes.

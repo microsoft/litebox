@@ -222,12 +222,39 @@ impl Instant for MockInstant {
     }
 }
 
+pub(crate) struct MockSystemTime {
+    time: u64,
+}
+
+impl SystemTime for MockSystemTime {
+    const UNIX_EPOCH: Self = MockSystemTime { time: 0 };
+
+    fn duration_since(&self, earlier: &Self) -> Result<core::time::Duration, core::time::Duration> {
+        match self.time.cmp(&earlier.time) {
+            core::cmp::Ordering::Less => {
+                Err(core::time::Duration::from_millis(earlier.time - self.time))
+            }
+            core::cmp::Ordering::Equal => Ok(core::time::Duration::from_millis(0)),
+            core::cmp::Ordering::Greater => {
+                Ok(core::time::Duration::from_millis(self.time - earlier.time))
+            }
+        }
+    }
+}
+
 impl TimeProvider for MockPlatform {
     type Instant = MockInstant;
+    type SystemTime = MockSystemTime;
 
     fn now(&self) -> Self::Instant {
         MockInstant {
             time: self.current_time.fetch_add(1, Ordering::SeqCst),
+        }
+    }
+
+    fn current_time(&self) -> Self::SystemTime {
+        MockSystemTime {
+            time: self.current_time.load(Ordering::SeqCst),
         }
     }
 }
