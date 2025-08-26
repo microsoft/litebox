@@ -132,7 +132,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             Ok(fd) => fd,
             Err(e) => match e {
                 OpenError::AccessNotAllowed => return Err(MigrationError::NoReadPerms),
-                OpenError::NoWritePerms | OpenError::ReadOnlyFileSystem => unreachable!(),
+                OpenError::NoWritePerms
+                | OpenError::ReadOnlyFileSystem
+                | OpenError::AlreadyExists => unreachable!(),
                 OpenError::PathError(path_error) => return Err(path_error)?,
             },
         };
@@ -359,6 +361,7 @@ impl<
     Lower: super::FileSystem + 'static,
 > super::FileSystem for FileSystem<Platform, Upper, Lower>
 {
+    #[expect(clippy::too_many_lines)]
     fn open(
         &self,
         path: impl crate::path::Arg,
@@ -369,6 +372,7 @@ impl<
             | OFlags::RDONLY
             | OFlags::WRONLY
             | OFlags::RDWR
+            | OFlags::EXCL
             | OFlags::NOCTTY
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK;
@@ -377,10 +381,38 @@ impl<
         }
         let path = self.absolute_path(path)?;
         if flags.contains(OFlags::CREAT) {
-            // We must first attempt to open the file _without_ creating it, and only if that fails,
-            // do we fall-through and end up creating it (which will happen on the upper layer).
-            if let Ok(fd) = self.open(path.as_str(), flags - OFlags::CREAT, mode) {
-                return Ok(fd);
+            if flags.contains(OFlags::EXCL) {
+                // O_EXCL with O_CREAT: fail if file already exists anywhere (upper or lower layer)
+                // First check if file exists in upper layer
+                if self.upper.file_status(path.as_str()).is_ok() {
+                    return Err(OpenError::AlreadyExists);
+                }
+                // Then check if file exists in lower layer or as a tombstone
+                if let Some(entry) = self.root.read().entries.get(&path) {
+                    match entry.as_ref() {
+                        EntryX::Tombstone => {
+                            // Tombstone means file was deleted, so we can create it
+                        }
+                        EntryX::Lower { .. } => {
+                            // File exists in lower layer, fail with EXCL
+                            return Err(OpenError::AlreadyExists);
+                        }
+                        EntryX::Upper { .. } => unreachable!(),
+                    }
+                } else if self.ensure_lower_contains(&path).is_ok() {
+                    // File exists in lower layer but not tracked, fail with EXCL
+                    return Err(OpenError::AlreadyExists);
+                }
+                // File doesn't exist anywhere, proceed with creation at upper layer only (fall through)
+                else {
+                }
+            } else {
+                // Normal O_CREAT behavior: try to open existing file first
+                // We must first attempt to open the file _without_ creating it, and only if that fails,
+                // do we fall-through and end up creating it (which will happen on the upper layer).
+                if let Ok(fd) = self.open(path.as_str(), flags - OFlags::CREAT, mode) {
+                    return Ok(fd);
+                }
             }
         }
         let mut tombstone_removal = false;
@@ -440,6 +472,7 @@ impl<
                 OpenError::AccessNotAllowed
                 | OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
+                | OpenError::AlreadyExists
                 | OpenError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
