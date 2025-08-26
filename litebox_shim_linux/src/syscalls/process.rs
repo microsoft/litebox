@@ -454,6 +454,69 @@ pub(crate) fn sys_get_robust_list(
     unsafe { head_ptr.write_at_offset(0, head) }.ok_or(Errno::EFAULT)
 }
 
+/// Handle syscall `clock_gettime`.
+pub(crate) fn sys_clock_gettime(
+    clockid: i32,
+    tp: crate::MutPtr<litebox_common_linux::Timespec>,
+) -> Result<(), Errno> {
+    let punchthrough = litebox_common_linux::PunchthroughSyscall::ClockGettime { clockid, tp };
+    let token = litebox_platform_multiplex::platform()
+        .get_punchthrough_token_for(punchthrough)
+        .expect("Failed to get punchthrough token for CLOCK_GETTIME");
+    token.execute().map(|_| ()).map_err(|e| match e {
+        litebox::platform::PunchthroughError::Failure(errno) => errno,
+        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+    })
+}
+
+/// Handle syscall `clock_getres`.
+pub(crate) fn sys_clock_getres(_clockid: i32, res: crate::MutPtr<litebox_common_linux::Timespec>) {
+    // Return the resolution of the clock
+    // For most modern systems, the resolution is typically 1 nanosecond
+    // This is a reasonable default for high-resolution timers
+    let resolution = litebox_common_linux::Timespec {
+        tv_sec: 0,
+        tv_nsec: 1, // 1 nanosecond resolution
+    };
+
+    unsafe {
+        res.write_at_offset(0, resolution);
+    }
+}
+
+/// Handle syscall `gettimeofday`.
+pub(crate) fn sys_gettimeofday(
+    tv: crate::MutPtr<litebox_common_linux::TimeVal>,
+    tz: crate::MutPtr<litebox_common_linux::TimeZone>,
+) -> Result<(), Errno> {
+    let punchthrough = litebox_common_linux::PunchthroughSyscall::Gettimeofday { tv, tz };
+    let token = litebox_platform_multiplex::platform()
+        .get_punchthrough_token_for(punchthrough)
+        .expect("Failed to get punchthrough token for GETTIMEOFDAY");
+    token.execute().map(|_| ()).map_err(|e| match e {
+        litebox::platform::PunchthroughError::Failure(errno) => errno,
+        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+    })
+}
+
+/// Handle syscall `time`.
+pub(crate) fn sys_time(
+    tloc: crate::MutPtr<litebox_common_linux::time_t>,
+) -> litebox_common_linux::time_t {
+    let punchthrough = litebox_common_linux::PunchthroughSyscall::Time { tloc };
+    let token = litebox_platform_multiplex::platform()
+        .get_punchthrough_token_for(punchthrough)
+        .expect("Failed to get punchthrough token for TIME");
+    token
+        .execute()
+        .map(|seconds_usize| {
+            // Safe conversion from usize to time_t (i64)
+            litebox_common_linux::time_t::try_from(seconds_usize)
+                .unwrap_or(litebox_common_linux::time_t::MAX)
+        })
+        .unwrap_or(0)
+}
+
 /// Handle syscall `getpid`.
 pub(crate) fn sys_getpid() -> i32 {
     litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| tls.current_task.pid)
@@ -486,6 +549,34 @@ pub(crate) fn sys_getgid() -> usize {
 pub(crate) fn sys_getegid() -> usize {
     litebox_platform_multiplex::platform()
         .with_thread_local_storage_mut(|tls| tls.current_task.credentials.egid)
+}
+
+/// Number of CPUs
+const NR_CPUS: usize = 2;
+
+pub(crate) struct CpuSet {
+    bits: bitvec::vec::BitVec<u8>,
+}
+
+impl CpuSet {
+    pub(crate) fn len(&self) -> usize {
+        self.bits.len()
+    }
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.bits.as_raw_slice()
+    }
+}
+
+/// Handle syscall `sched_getaffinity`.
+///
+/// Note this is a dummy implementation that always returns the same CPU set
+pub(crate) fn sys_sched_getaffinity(pid: Option<i32>) -> CpuSet {
+    if pid.is_some() {
+        unimplemented!("Getting CPU affinity for a specific PID is not supported yet");
+    }
+    let mut cpuset = bitvec::bitvec![u8, bitvec::order::Lsb0; 0; NR_CPUS];
+    cpuset.iter_mut().for_each(|mut b| *b = true);
+    CpuSet { bits: cpuset }
 }
 
 #[cfg(test)]
@@ -727,5 +818,20 @@ mod tests {
             result,
             "Parent TID mismatch"
         );
+    }
+
+    #[test]
+    fn test_sched_getaffinity() {
+        crate::syscalls::tests::init_platform(None);
+
+        let cpuset = super::sys_sched_getaffinity(None);
+        assert_eq!(cpuset.bits.len(), super::NR_CPUS);
+        cpuset.bits.iter().for_each(|b| assert!(*b));
+        let ones: usize = cpuset
+            .as_bytes()
+            .iter()
+            .map(|b| b.count_ones() as usize)
+            .sum();
+        assert_eq!(ones, super::NR_CPUS);
     }
 }

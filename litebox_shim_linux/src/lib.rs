@@ -510,6 +510,22 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
                     .ok_or(Errno::EFAULT)
             })
         }),
+        SyscallRequest::Gettimeofday { tv, tz } => syscalls::process::sys_gettimeofday(tv, tz)
+            .map(|()| 0)
+            .map_err(|_| Errno::EFAULT),
+        SyscallRequest::ClockGettime { clockid, tp } => {
+            syscalls::process::sys_clock_gettime(clockid, tp)
+                .map(|()| 0)
+                .map_err(|_| Errno::EFAULT)
+        }
+        SyscallRequest::ClockGetres { clockid, res } => {
+            syscalls::process::sys_clock_getres(clockid, res);
+            Ok(0)
+        }
+        SyscallRequest::Time { tloc } => {
+            let second = syscalls::process::sys_time(tloc);
+            Ok(usize::try_from(second).unwrap_or(0))
+        }
         SyscallRequest::Openat {
             dirfd,
             pathname,
@@ -696,6 +712,22 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
         }
         SyscallRequest::CapGet { header, data } => {
             syscalls::misc::sys_capget(header, data).map(|()| 0)
+        }
+        SyscallRequest::GetDirent64 { fd, dirp, count } => {
+            syscalls::file::sys_getdirent64(fd, dirp, count)
+        }
+        SyscallRequest::SchedGetAffinity { pid, len, mask } => {
+            const BITS_PER_BYTE: usize = 8;
+            let cpuset = syscalls::process::sys_sched_getaffinity(pid);
+            if len * BITS_PER_BYTE < cpuset.len() || len & (core::mem::size_of::<usize>() - 1) != 0
+            {
+                Err(Errno::EINVAL)
+            } else {
+                let raw_bytes = cpuset.as_bytes();
+                unsafe { mask.copy_from_slice(0, raw_bytes) }
+                    .map(|()| raw_bytes.len())
+                    .ok_or(Errno::EFAULT)
+            }
         }
         _ => {
             todo!()

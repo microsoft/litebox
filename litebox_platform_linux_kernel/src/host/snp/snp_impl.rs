@@ -1,9 +1,12 @@
 //! An implementation of [`HostInterface`] for SNP VMM
-
+use ::alloc::boxed::Box;
 use core::arch::asm;
 
-use litebox::platform::{RawConstPointer, RawMutPointer};
-use litebox_common_linux::{SigSet, SigmaskHow};
+use litebox::{
+    platform::{RawConstPointer, RawMutPointer, RawPointerProvider, ThreadLocalStorageProvider},
+    utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt as _},
+};
+use litebox_common_linux::{CloneFlags, SigSet, SigmaskHow};
 
 use super::ghcb::ghcb_prints;
 use crate::{
@@ -72,6 +75,190 @@ mod alloc {
     }
 }
 
+/// Get the current task
+fn current() -> Option<&'static mut bindings::vsbox_task> {
+    let task: u64;
+    unsafe {
+        asm!("rdgsbase {}", out(reg) task, options(nostack, preserves_flags));
+
+        let addr = crate::arch::VirtAddr::new(task);
+        if addr.is_null() {
+            return None;
+        }
+
+        Some(&mut *addr.as_mut_ptr())
+    }
+}
+
+impl SnpLinuxKernel {
+    pub fn set_init_tls(&self, boot_params: &bindings::vmpl2_boot_params) {
+        let task = ::alloc::boxed::Box::new(litebox_common_linux::Task {
+            pid: boot_params.pid,
+            tid: boot_params.pid,
+            ppid: boot_params.ppid,
+            clear_child_tid: None,
+            robust_list: None,
+            credentials: ::alloc::sync::Arc::new(litebox_common_linux::Credentials {
+                uid: boot_params.uid as usize,
+                gid: boot_params.gid as usize,
+                euid: boot_params.euid as usize,
+                egid: boot_params.egid as usize,
+            }),
+        });
+        let tls = litebox_common_linux::ThreadLocalStorage::new(task);
+        self.set_thread_local_storage(tls);
+    }
+}
+
+impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
+    type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<SnpLinuxKernel>;
+
+    fn set_thread_local_storage(&self, value: Self::ThreadLocalStorage) {
+        let current_task = current().expect("Current task must be available");
+        assert!(current_task.tls.is_null(), "TLS should not be set yet");
+        let tls = ::alloc::boxed::Box::new(value);
+        current_task.tls = ::alloc::boxed::Box::into_raw(tls).cast();
+    }
+
+    fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
+    {
+        let current_task = current().expect("Current task must be available");
+        assert!(!current_task.tls.is_null(), "TLS should be set");
+        let tls = unsafe { &mut *current_task.tls.cast::<Self::ThreadLocalStorage>() };
+        assert!(!tls.borrowed, "TLS should not be borrowed");
+        tls.borrowed = true; // mark as borrowed
+        let ret = f(tls);
+        tls.borrowed = false; // mark as not borrowed
+        ret
+    }
+
+    fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
+        let current_task = current().expect("Current task must be available");
+        assert!(!current_task.tls.is_null(), "TLS should be set");
+        let tls = unsafe { Box::from_raw(current_task.tls.cast::<Self::ThreadLocalStorage>()) };
+        current_task.tls = ::core::ptr::null_mut();
+        *tls
+    }
+}
+
+core::arch::global_asm!(include_str!("entry.S"));
+
+struct ThreadStartArgs {
+    entry_point: usize,
+    stack_top: usize,
+    parent_ctx: litebox_common_linux::PtRegs,
+    thread_args: Box<litebox_common_linux::NewThreadArgs<SnpLinuxKernel>>,
+}
+
+const RIP_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs, rip);
+const EFLAGS_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs, eflags);
+
+/// Callback function for a new thread
+///
+/// This is called by `sandbox_process_ret_from_fork` from `entry.S`.
+/// Arguments should be set up by host.
+#[unsafe(no_mangle)]
+extern "C" fn thread_start(
+    pt_regs: *mut litebox_common_linux::PtRegs,
+    args: *mut ThreadStartArgs,
+) -> ! {
+    // SAFETY: The arg pointer is guaranteed to be valid and point to a ThreadStartArgs
+    // that was created via Box::into_raw in spawn_thread.
+    let mut thread_start_args = unsafe { Box::from_raw(args) };
+
+    // SAFETY: The pt_regs pointer is guaranteed to be valid and point to a PtRegs
+    // on the stack (by host).
+    let regs = unsafe { &mut *pt_regs };
+    // Host should set `rax` to child's TID
+    thread_start_args.thread_args.task.tid = regs.rax.reinterpret_as_signed().truncate();
+    // Child's pt_regs should have the same registers as parent's except rax, rip, and rsp.
+    *regs = thread_start_args.parent_ctx;
+    regs.rax = 0;
+    regs.rip = thread_start_args.entry_point;
+    regs.rsp = thread_start_args.stack_top;
+
+    // Set up thread-local storage for the new thread. This is done by
+    // calling the actual thread callback with the unpacked arguments
+    (thread_start_args.thread_args.callback)(*(thread_start_args.thread_args));
+
+    // Restore the context
+    unsafe {
+        core::arch::asm!(
+            "mov     rsp, {0}",
+            "mov     rcx, [rsp + {rip_off}]",
+            "mov     r11, [rsp + {eflags_off}]",
+            "pop     r15",
+            "pop     r14",
+            "pop     r13",
+            "pop     r12",
+            "pop     rbp",
+            "pop     rbx",
+            "pop     rsi",        /* skip r11 */
+            "pop     r10",
+            "pop     r9",
+            "pop     r8",
+            "pop     rax",
+            "pop     rsi",        /* skip rcx */
+            "pop     rdx",
+            "pop     rsi",
+            "pop     rdi",
+            "mov     rsp, [rsp + 0x20]",   /* original rsp */
+            "swapgs",
+            "sysretq",
+            in(reg) pt_regs,
+            rip_off = const RIP_OFFSET,
+            eflags_off = const EFLAGS_OFFSET,
+        );
+    }
+    unreachable!("Thread should not return");
+}
+
+impl litebox::platform::ThreadProvider for SnpLinuxKernel {
+    type ExecutionContext = litebox_common_linux::PtRegs;
+    type ThreadArgs = litebox_common_linux::NewThreadArgs<SnpLinuxKernel>;
+    type ThreadSpawnError = litebox_common_linux::errno::Errno;
+    type ThreadId = usize;
+
+    unsafe fn spawn_thread(
+        &self,
+        ctx: &Self::ExecutionContext,
+        stack: <Self as RawPointerProvider>::RawMutPointer<u8>,
+        stack_size: usize,
+        entry_point: usize,
+        thread_args: Box<Self::ThreadArgs>,
+    ) -> Result<Self::ThreadId, Self::ThreadSpawnError> {
+        let flags = CloneFlags::THREAD
+            | CloneFlags::VM
+            | CloneFlags::FS
+            | CloneFlags::FILES
+            | CloneFlags::SIGHAND
+            | CloneFlags::SYSVSEM
+            | CloneFlags::CHILD_SETTID;
+        let thread_start_args = Box::new(ThreadStartArgs {
+            entry_point,
+            stack_top: stack.as_usize() + stack_size,
+            parent_ctx: *ctx,
+            thread_args,
+        });
+        let thread_start_arg_ptr = Box::into_raw(thread_start_args);
+        // Note this is different from the usual clone3 syscall as we have a driver running
+        // in VMPL0's kernel and handling the syscall differently.
+        // The first argument will be placed into the new thread's RSI register (i.e. the second argument).
+        HostSnpInterface::syscalls(SyscallN::<2, NR_SYSCALL_CLONE3> {
+            args: [thread_start_arg_ptr as u64, flags.bits()],
+        })
+    }
+
+    fn terminate_thread(&self, code: Self::ExitCode) -> ! {
+        let _ = HostSnpInterface::syscalls(SyscallN::<1, NR_SYSCALL_EXIT> {
+            args: [u64::from(code.reinterpret_as_unsigned())],
+        });
+        unreachable!("Should not return to the caller after terminating the thread");
+    }
+}
+
 impl bindings::SnpVmplRequestArgs {
     #[inline]
     fn new_request(code: u32, size: u32, args: ArgsArray) -> Self {
@@ -109,6 +296,11 @@ const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 
 const NR_SYSCALL_FUTEX: u32 = 202;
 const NR_SYSCALL_RT_SIGPROCMASK: u32 = 14;
+const NR_SYSCALL_READ: u32 = 0;
+const NR_SYSCALL_WRITE: u32 = 1;
+const NR_SYSCALL_EXIT: u32 = 60;
+const NR_SYSCALL_EXIT_GROUP: u32 = 231;
+const NR_SYSCALL_CLONE3: u32 = 435;
 
 const FUTEX_WAIT: i32 = 0;
 const FUTEX_WAKE: i32 = 1;
@@ -137,7 +329,6 @@ impl HostSnpInterface {
         let mut args = [0; MAX_ARGS_SIZE];
         args[..N].copy_from_slice(&arg.args);
         let mut req = bindings::SnpVmplRequestArgs::new_request(
-            // FIXME: need to update sandbox driver for the change of this interface
             bindings::SNP_VMPL_SYSCALL_REQ,
             ID, // repurpose size field to syscall id
             args,
@@ -228,12 +419,10 @@ impl HostInterface for HostSnpInterface {
         unimplemented!()
     }
 
-    fn exit() -> ! {
+    fn return_to_host() -> ! {
         let mut req = bindings::SnpVmplRequestArgs::new_exit_request();
         Self::request(&mut req);
-        loop {
-            unsafe { asm!("hlt") }
-        }
+        unreachable!("Should not return to the caller after returning to host");
     }
 
     fn terminate(reason_set: u64, reason_code: u64) -> ! {
@@ -246,9 +435,7 @@ impl HostInterface for HostSnpInterface {
 
         // In case hypervisor fails to terminate it or intentionally reschedules it,
         // halt the CPU to prevent further execution
-        loop {
-            unsafe { asm!("hlt") }
-        }
+        unreachable!("Should not return to the caller after terminating the vm");
     }
 
     fn rt_sigprocmask(
@@ -277,7 +464,6 @@ impl HostInterface for HostSnpInterface {
         let args = SyscallN::<4, NR_SYSCALL_RT_SIGPROCMASK> {
             args: [
                 u64::try_from(how as i32).unwrap(),
-                // TODO: sandbox driver needs to be updated to accept a kernel pointer from the guest
                 kset.as_ref().map_or(0, |v| core::ptr::from_ref(v) as u64),
                 koldset
                     .as_mut()
@@ -322,5 +508,42 @@ impl HostInterface for HostSnpInterface {
             ],
         })
         .map(|_| ())
+    }
+
+    fn read_from_stdin(buf: &mut [u8]) -> Result<usize, Errno> {
+        Self::syscalls(SyscallN::<3, NR_SYSCALL_READ> {
+            args: [
+                litebox_common_linux::STDIN_FILENO as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            ],
+        })
+    }
+
+    fn write_to(stream: litebox::platform::StdioOutStream, buf: &[u8]) -> Result<usize, Errno> {
+        Self::syscalls(SyscallN::<3, NR_SYSCALL_WRITE> {
+            args: [
+                u64::from(
+                    match stream {
+                        litebox::platform::StdioOutStream::Stdout => {
+                            litebox_common_linux::STDOUT_FILENO
+                        }
+                        litebox::platform::StdioOutStream::Stderr => {
+                            litebox_common_linux::STDERR_FILENO
+                        }
+                    }
+                    .reinterpret_as_unsigned(),
+                ),
+                buf.as_ptr() as u64,
+                buf.len() as u64,
+            ],
+        })
+    }
+
+    fn terminate_process(code: i32) -> ! {
+        let _ = Self::syscalls(SyscallN::<1, NR_SYSCALL_EXIT_GROUP> {
+            args: [u64::from(code.reinterpret_as_unsigned())],
+        });
+        unreachable!("Should not return to the caller after terminating the process");
     }
 }

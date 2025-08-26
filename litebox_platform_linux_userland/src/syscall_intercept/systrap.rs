@@ -73,41 +73,24 @@ fn register_seccomp_filter() {
         SeccompRule,
     };
 
+    fn backdoor_on_arg(arg_number: u8) -> SeccompRule {
+        SeccompRule::new(vec![
+            SeccompCondition::new(
+                arg_number,
+                SeccompCmpArgLen::Qword,
+                SeccompCmpOp::Eq,
+                super::SYSCALL_ARG_MAGIC as u64,
+            )
+            .unwrap(),
+        ])
+        .unwrap()
+    }
+
     // allow list
     // TODO: remove syscalls once they are implemented in the shim
     let rules = vec![
-        (
-            libc::SYS_read,
-            vec![
-                // A backdoor to allow invoking read for devices.
-                SeccompRule::new(vec![
-                    SeccompCondition::new(
-                        3,
-                        SeccompCmpArgLen::Qword,
-                        SeccompCmpOp::Eq,
-                        super::SYSCALL_ARG_MAGIC as u64,
-                    )
-                    .unwrap(),
-                ])
-                .unwrap(),
-            ],
-        ),
-        (
-            libc::SYS_write,
-            vec![
-                SeccompRule::new(vec![
-                    // A backdoor to allow invoking write for devices.
-                    SeccompCondition::new(
-                        3,
-                        SeccompCmpArgLen::Qword,
-                        SeccompCmpOp::Eq,
-                        super::SYSCALL_ARG_MAGIC as u64,
-                    )
-                    .unwrap(),
-                ])
-                .unwrap(),
-            ],
-        ),
+        (libc::SYS_read, vec![backdoor_on_arg(3)]),
+        (libc::SYS_write, vec![backdoor_on_arg(3)]),
         (
             libc::SYS_mmap,
             vec![
@@ -124,38 +107,8 @@ fn register_seccomp_filter() {
                 .unwrap(),
             ],
         ),
-        (
-            libc::SYS_mprotect,
-            vec![
-                // A backdoor to allow invoking mprotect.
-                SeccompRule::new(vec![
-                    SeccompCondition::new(
-                        3,
-                        SeccompCmpArgLen::Qword,
-                        SeccompCmpOp::Eq,
-                        super::SYSCALL_ARG_MAGIC as u64,
-                    )
-                    .unwrap(),
-                ])
-                .unwrap(),
-            ],
-        ),
-        (
-            libc::SYS_munmap,
-            vec![
-                // A backdoor to allow invoking munmap.
-                SeccompRule::new(vec![
-                    SeccompCondition::new(
-                        2,
-                        SeccompCmpArgLen::Qword,
-                        SeccompCmpOp::Eq,
-                        super::SYSCALL_ARG_MAGIC as u64,
-                    )
-                    .unwrap(),
-                ])
-                .unwrap(),
-            ],
-        ),
+        (libc::SYS_mprotect, vec![backdoor_on_arg(3)]),
+        (libc::SYS_munmap, vec![backdoor_on_arg(2)]),
         (
             libc::SYS_rt_sigaction,
             vec![
@@ -181,19 +134,10 @@ fn register_seccomp_filter() {
             // allow rt_sigprocmask that does not block SIGSYS
             libc::SYS_rt_sigprocmask,
             vec![
-                SeccompRule::new(vec![
-                    // A backdoor to allow invoking rt_sigprocmask.
-                    // A malicious program can use this to block SIGSYS. However, it only
-                    // causes the program to crash when any syscall is invoked.
-                    SeccompCondition::new(
-                        4,
-                        SeccompCmpArgLen::Qword,
-                        SeccompCmpOp::Eq,
-                        super::SYSCALL_ARG_MAGIC as u64,
-                    )
-                    .unwrap(),
-                ])
-                .unwrap(),
+                // A backdoor to allow invoking rt_sigprocmask.
+                // A malicious program can use this to block SIGSYS. However, it only
+                // causes the program to crash when any syscall is invoked.
+                backdoor_on_arg(4),
                 SeccompRule::new(vec![
                     // The second argument `set` is null, so it does not change the block set.
                     // Unfortunately, seccomp does not allow to inspect memory so we cannot set
@@ -205,89 +149,14 @@ fn register_seccomp_filter() {
         ),
         (libc::SYS_rt_sigreturn, vec![]),
         (libc::SYS_sched_yield, vec![]),
-        (
-            libc::SYS_mremap,
-            vec![
-                // A backdoor to allow invoking mremap.
-                SeccompRule::new(vec![
-                    SeccompCondition::new(
-                        5,
-                        SeccompCmpArgLen::Qword,
-                        SeccompCmpOp::Eq,
-                        super::SYSCALL_ARG_MAGIC as u64,
-                    )
-                    .unwrap(),
-                ])
-                .unwrap(),
-            ],
-        ),
+        (libc::SYS_mremap, vec![backdoor_on_arg(5)]),
         (libc::SYS_sigaltstack, vec![]),
-        (
-            libc::SYS_arch_prctl,
-            vec![
-                // A backdoor to allow invoking arch_prctl.
-                SeccompRule::new(vec![
-                    SeccompCondition::new(
-                        2,
-                        SeccompCmpArgLen::Qword,
-                        SeccompCmpOp::Eq,
-                        super::SYSCALL_ARG_MAGIC as u64,
-                    )
-                    .unwrap(),
-                ])
-                .unwrap(),
-            ],
-        ),
+        (libc::SYS_arch_prctl, vec![backdoor_on_arg(2)]),
         (libc::SYS_futex, vec![]),
-        (
-            libc::SYS_exit,
-            vec![
-                // A backdoor to allow invoking exit.
-                SeccompRule::new(vec![
-                    SeccompCondition::new(
-                        1,
-                        SeccompCmpArgLen::Qword,
-                        SeccompCmpOp::Eq,
-                        super::SYSCALL_ARG_MAGIC as u64,
-                    )
-                    .unwrap(),
-                ])
-                .unwrap(),
-            ],
-        ),
-        (
-            libc::SYS_exit_group,
-            vec![
-                // A backdoor to allow invoking exit_group.
-                SeccompRule::new(vec![
-                    SeccompCondition::new(
-                        1,
-                        SeccompCmpArgLen::Qword,
-                        SeccompCmpOp::Eq,
-                        super::SYSCALL_ARG_MAGIC as u64,
-                    )
-                    .unwrap(),
-                ])
-                .unwrap(),
-            ],
-        ),
+        (libc::SYS_exit, vec![backdoor_on_arg(1)]),
+        (libc::SYS_exit_group, vec![backdoor_on_arg(1)]),
         (libc::SYS_tgkill, vec![]),
-        (
-            libc::SYS_clone3,
-            vec![
-                // A backdoor to allow invoking clone3.
-                SeccompRule::new(vec![
-                    SeccompCondition::new(
-                        2,
-                        SeccompCmpArgLen::Qword,
-                        SeccompCmpOp::Eq,
-                        super::SYSCALL_ARG_MAGIC as u64,
-                    )
-                    .unwrap(),
-                ])
-                .unwrap(),
-            ],
-        ),
+        (libc::SYS_clone3, vec![backdoor_on_arg(2)]),
     ];
     let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> = rules.into_iter().collect();
 

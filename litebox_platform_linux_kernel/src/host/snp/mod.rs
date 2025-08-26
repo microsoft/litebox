@@ -2,3 +2,4 @@
 
 pub mod ghcb;
 pub mod snp_impl;
+pub(crate) mod vmsa;
