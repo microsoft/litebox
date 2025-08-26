@@ -458,28 +458,6 @@ impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKern
     }
 }
 
-impl<Host: HostInterface> litebox::platform::ThreadProvider for LinuxKernel<Host> {
-    type ExecutionContext = litebox_common_linux::PtRegs;
-    type ThreadArgs = litebox_common_linux::NewThreadArgs<LinuxKernel<Host>>;
-    type ThreadSpawnError = litebox_common_linux::errno::Errno;
-    type ThreadId = usize;
-
-    unsafe fn spawn_thread(
-        &self,
-        _ctx: &Self::ExecutionContext,
-        _stack: <Self as RawPointerProvider>::RawMutPointer<u8>,
-        _stack_size: usize,
-        _entry_point: usize,
-        _thread_args: alloc::boxed::Box<Self::ThreadArgs>,
-    ) -> Result<Self::ThreadId, Self::ThreadSpawnError> {
-        todo!()
-    }
-
-    fn terminate_thread(&self, _code: Self::ExitCode) -> ! {
-        todo!()
-    }
-}
-
 impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<Host> {
     fn get_syscall_entry_point(&self) -> usize {
         todo!()

@@ -7,6 +7,7 @@ mod globals;
 
 extern crate alloc;
 
+use alloc::borrow::ToOwned;
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_platform_linux_kernel::{HostInterface, host::snp::ghcb::ghcb_prints};
 
@@ -40,8 +41,13 @@ pub extern "C" fn page_fault_handler(pt_regs: &mut litebox_common_linux::PtRegs)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn int_handler(_pt_regs: &mut litebox_common_linux::PtRegs, _vector: u64) {
-    todo!()
+pub extern "C" fn int_handler(pt_regs: &mut litebox_common_linux::PtRegs, vector: u64) {
+    litebox_platform_linux_kernel::print_str_and_int!("Unhandled interrupt: ", vector, 10);
+    litebox_platform_linux_kernel::print_str_and_int!("RIP: ", pt_regs.rip as u64, 16);
+    litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
+        globals::SM_SEV_TERM_SET,
+        globals::SM_TERM_EXCEPTION,
+    );
 }
 
 #[unsafe(no_mangle)]
@@ -79,13 +85,14 @@ const ROOTFS: &[u8] = include_bytes!("./test.tar");
 #[unsafe(no_mangle)]
 pub extern "C" fn sandbox_process_init(
     pt_regs: &mut litebox_common_linux::PtRegs,
-    _boot_params: &'static litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params,
+    boot_params: &'static litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params,
 ) {
     let pgd = litebox_platform_linux_kernel::arch::PhysAddr::new_truncate(
         litebox_platform_linux_kernel::arch::instructions::cr3()
             & !(litebox::mm::linux::PAGE_SIZE as u64 - 1),
     );
     let platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel::new(pgd);
+    platform.set_init_tls(boot_params);
     litebox::log_println!(platform, "sandbox_process_init called");
 
     let litebox = litebox::LiteBox::new(platform);
@@ -106,15 +113,44 @@ pub extern "C" fn sandbox_process_init(
     litebox_shim_linux::set_fs(fs);
     litebox_platform_multiplex::set_platform(platform);
 
-    // TODO: get path, argv, and envp from `boot_params`.
+    let parse_args =
+        |params: &litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params| -> Option<(
+            alloc::string::String,
+            alloc::vec::Vec<alloc::ffi::CString>,
+            alloc::vec::Vec<alloc::ffi::CString>,
+        )> {
+            let mut argv = alloc::vec::Vec::new();
+            let mut envp = alloc::vec::Vec::new();
+
+            let argv_len = params.argv_len.reinterpret_as_unsigned() as usize;
+            let env_len = params.env_len.reinterpret_as_unsigned() as usize;
+            let total = argv_len + env_len;
+
+            let mut idx = 0;
+            while idx < total {
+                let arg = core::ffi::CStr::from_bytes_until_nul(&params.argv_and_env[idx..])
+                    .ok()?
+                    .to_owned();
+                let this_len = arg.count_bytes() + 1;
+
+                if idx < argv_len {
+                    argv.push(arg);
+                } else {
+                    envp.push(arg);
+                }
+                idx += this_len;
+            }
+            let program = argv.first().cloned()?;
+            Some((program.to_str().ok()?.to_owned(), argv, envp))
+        };
+    let Some((program, argv, envp)) = parse_args(boot_params) else {
+        litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
+            globals::SM_SEV_TERM_SET,
+            globals::SM_TERM_INVALID_PARAM,
+        );
+    };
     let aux = litebox_shim_linux::loader::auxv::init_auxv();
-    #[allow(clippy::missing_panics_doc, reason = "valid string")]
-    let loaded_program = match litebox_shim_linux::loader::load_program(
-        "/test",
-        alloc::vec![alloc::ffi::CString::new("/test").unwrap()],
-        alloc::vec![],
-        aux,
-    ) {
+    let loaded_program = match litebox_shim_linux::loader::load_program(&program, argv, envp, aux) {
         Ok(program) => program,
         Err(err) => {
             litebox::log_println!(platform, "failed to load program: {}", err);

@@ -66,9 +66,6 @@ struct vmpl2_boot_params {
 	/// NOT used if enabling separate page tables
 	uint64_t snp_vmpl2_mem_base;
 
-	uint64_t entry_size;
-	struct vm_area vmas[MAX_VM_AREA_ENTRY];
-
 	uint64_t ghcb_page;
 	uint64_t ghcb_page_va;
 
@@ -86,7 +83,21 @@ struct vmpl2_boot_params {
 	uint32_t euid;
 	/// effective GID of the task
 	uint32_t egid;
+
+	/// length of command line arguments
+	int argv_len;
+	/// length of environment variables
+	int env_len;
+	/// command line arguments and environment variables
+	///
+	/// make the whole struct 4096 bytes so this array fills the remaining space.
+	uint8_t argv_and_env[4024];
 } __attribute__((__packed__));
+
+/* Sanity check: ensure the boot params struct occupies exactly 4KB. */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(struct vmpl2_boot_params) == 4096, "vmpl2_boot_params must be 4096 bytes");
+#endif
 
 #define MAX_ROOTPATH_SIZE 256
 
