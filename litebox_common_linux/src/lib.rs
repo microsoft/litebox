@@ -1443,6 +1443,11 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         buf: Platform::RawConstPointer<u8>,
         count: usize,
     },
+    Lseek {
+        fd: i32,
+        offset: isize,
+        whence: i32,
+    },
     Close {
         fd: i32,
     },
