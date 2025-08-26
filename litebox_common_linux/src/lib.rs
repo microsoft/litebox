@@ -1475,6 +1475,11 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         buf: Platform::RawConstPointer<u8>,
         count: usize,
     },
+    Lseek {
+        fd: i32,
+        offset: isize,
+        whence: i32,
+    },
     Close {
         fd: i32,
     },
@@ -1804,6 +1809,11 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             },
             Sysno::close => SyscallRequest::Close {
                 fd: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+            },
+            Sysno::lseek => SyscallRequest::Lseek {
+                fd: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                offset: ctx.syscall_arg(1) as isize,
+                whence: ctx.syscall_arg(2).reinterpret_as_signed().truncate(),
             },
             Sysno::stat => SyscallRequest::Stat {
                 pathname: Platform::RawConstPointer::from_usize(ctx.syscall_arg(0)),
@@ -3114,6 +3124,7 @@ impl<Platform: litebox::platform::RawPointerProvider> alloc::fmt::Debug
                 .field("header", &header.as_usize())
                 .field("data", &data.map_or(0, |d| d.as_usize()))
                 .finish(),
+            _ => core::fmt::Result::Ok(()),
         }
     }
 }
