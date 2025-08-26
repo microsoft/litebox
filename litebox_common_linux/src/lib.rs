@@ -2211,6 +2211,12 @@ impl<Platform: litebox::platform::RawPointerProvider> alloc::fmt::Debug
                 .field("buf", &buf.as_usize())
                 .field("count", count)
                 .finish(),
+            Self::Lseek { fd, offset, whence } => f
+                .debug_struct("Lseek")
+                .field("fd", fd)
+                .field("offset", offset)
+                .field("whence", whence)
+                .finish(),
             Self::Close { fd } => f.debug_struct("Close").field("fd", fd).finish(),
             Self::Stat { pathname, buf } => f
                 .debug_struct("Stat")
@@ -2707,10 +2713,42 @@ impl<Platform: litebox::platform::RawPointerProvider> alloc::fmt::Debug
                 .field("header", &header.as_usize())
                 .field("data", &data.map_or(0, |d| d.as_usize()))
                 .finish(),
-            Self::Futex { args } => f
-                .debug_struct("Futex")
-                .field("args", &format_args!("{args:?}"))
+            Self::ClockGettime { clockid, tp } => f
+                .debug_struct("ClockGettime")
+                .field("clockid", clockid)
+                .field("tp", &tp.as_usize())
                 .finish(),
+            Self::ClockGetres { clockid, res } => f
+                .debug_struct("ClockGetres")
+                .field("clockid", clockid)
+                .field("res", &res.as_usize())
+                .finish(),
+            Self::Gettimeofday { tv, tz } => f
+                .debug_struct("Gettimeofday")
+                .field("tv", &tv.as_usize())
+                .field("tz", &tz.as_usize())
+                .finish(),
+            Self::Time { tloc } => f
+                .debug_struct("Time")
+                .field("tloc", &tloc.as_usize())
+                .finish(),
+            Self::Getppid => f.debug_struct("Getppid").finish(),
+            Self::GetDirent64 { fd, dirp, count } => f
+                .debug_struct("GetDirent64")
+                .field("fd", fd)
+                .field("dirp", &dirp.as_usize())
+                .field("count", count)
+                .finish(),
+            Self::SchedGetAffinity { pid, len, mask } => f
+                .debug_struct("SchedGetAffinity")
+                .field("pid", &pid.map(|p| p))
+                .field("len", len)
+                .field("mask", &mask.as_usize())
+                .finish(),
+            // Self::Futex { args } => f
+            //     .debug_struct("Futex")
+            //     .field("args", &format_args!("{args:?}"))
+            //     .finish(),
         }
     }
 }

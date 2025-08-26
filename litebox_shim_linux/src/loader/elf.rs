@@ -37,8 +37,14 @@ struct ElfFile {
 impl ElfFile {
     fn new(path: &str) -> Result<Self, Errno> {
         let name = CString::new(path).unwrap();
-        let fd = crate::syscalls::file::sys_open(path, OFlags::RDONLY, Mode::empty())?;
-        let Ok(fd) = i32::try_from(fd) else {
+        let fd = crate::syscalls::file::sys_open(path, OFlags::RDONLY, Mode::empty());
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "Opening ELF file '{}' with fd {:?}",
+            path,
+            fd
+        );
+        let Ok(fd) = i32::try_from(fd?) else {
             unreachable!("fd should be a valid i32");
         };
 
@@ -407,6 +413,8 @@ impl ElfLoader {
             unsafe { litebox_page_manager().brk(init_brk) }.expect("failed to set brk");
             elf
         };
+        #[cfg(debug_assertions)]
+        litebox::log_println!(litebox_platform_multiplex::platform(), "Loading.......");
         let interp: Option<Elf> = if let Some(interp_name) = elf.interp() {
             // e.g., /lib64/ld-linux-x86-64.so.2
             let mut loader = Loader::<ElfLoaderMmap>::new();
@@ -424,7 +432,8 @@ impl ElfLoader {
         } else {
             None
         };
-
+        #[cfg(debug_assertions)]
+        litebox::log_println!(litebox_platform_multiplex::platform(), "Loading.......222");
         Self::init_auxvec_with_elf(&mut aux, &elf);
         let entry = if let Some(ld) = interp {
             aux.insert(AuxKey::AT_BASE, ld.base());

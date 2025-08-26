@@ -257,6 +257,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             );
         }
     }
+    // println!("Loading program: {}", cli_args.program_and_arguments[0]);
     let loaded_program = litebox_shim_linux::loader::load_program(
         &cli_args.program_and_arguments[0],
         argv,
