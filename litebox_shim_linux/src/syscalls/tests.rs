@@ -29,7 +29,7 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) {
                 .expect("Failed to set permissions on root");
         });
         let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(litebox);
-        let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(litebox, TEST_TAR_FILE.into());
+        let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new_borrowed(litebox, TEST_TAR_FILE);
         crate::set_fs(litebox::fs::layered::FileSystem::new(
             litebox,
             in_mem_fs,
