@@ -6,7 +6,7 @@ use alloc::{
     vec,
 };
 use litebox::{
-    fs::{FileSystem as _, Mode, OFlags},
+    fs::{FileSystem as _, Mode, OFlags, SeekWhence},
     path,
     platform::{RawConstPointer, RawMutPointer},
     utils::TruncateExt as _,
