@@ -1103,9 +1103,15 @@ pub type ThreadLocalDescriptor = u8;
 pub type ThreadLocalDescriptor = UserDesc;
 
 pub struct NewThreadArgs<Platform: litebox::platform::RawPointerProvider> {
+    /// Pointer to thread-local storage (TLS) given by the guest program
     pub tls: Option<Platform::RawMutPointer<ThreadLocalDescriptor>>,
+    /// Where to store child TID in child's memory
     pub set_child_tid: Option<Platform::RawMutPointer<i32>>,
+    /// Task struct that maintains all per-thread data
     pub task: alloc::boxed::Box<Task<Platform>>,
+    /// A callback function that *MUST* be called when the thread is created.
+    ///
+    /// Note that `task.tid` must be set correctly before this function is called.
     pub callback: fn(Self),
 }
 

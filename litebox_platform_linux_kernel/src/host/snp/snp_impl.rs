@@ -157,7 +157,8 @@ const EFLAGS_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs,
 
 /// Callback function for a new thread
 ///
-/// This is called by `sandbox_process_ret_from_fork` from `entry.S`
+/// This is called by `sandbox_process_ret_from_fork` from `entry.S`.
+/// Arguments should be set up by host.
 #[unsafe(no_mangle)]
 extern "C" fn thread_start(
     pt_regs: *mut litebox_common_linux::PtRegs,
@@ -242,25 +243,12 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
             thread_args,
         });
         let thread_start_arg_ptr = Box::into_raw(thread_start_args);
-
-        // The following code is identical to `HostSnpInterface::syscalls` except that
-        // it sets `r15` to the thread start argument pointer right before vmexit.
-        // Host should ensure new thread's r15 is the same as the parent thread's.
-        // In `sandbox_process_ret_from_fork` from `entry.S` (called by host in the new thread's
-        // context), it moves `r15` to `rsi` (the second argument).
-        let mut req = bindings::SnpVmplRequestArgs::new_request(
-            bindings::SNP_VMPL_SYSCALL_REQ,
-            NR_SYSCALL_CLONE3, // repurpose size field to syscall id
-            [flags.bits(), 0, 0, 0, 0, 0],
-        );
-        unsafe {
-            asm!("vmmcall",
-                in("rcx") HVCALL_VTL_CALL,
-                in("r14") core::ptr::from_mut(&mut req) as u64,
-                in("r15") thread_start_arg_ptr,
-            );
-        }
-        HostSnpInterface::parse_result(req.ret)
+        // Note this is different from the usual clone3 syscall as we have a driver running
+        // in VMPL0's kernel and handling the syscall differently.
+        // The first argument will be placed into the new thread's RSI register (i.e. the second argument).
+        HostSnpInterface::syscalls(SyscallN::<2, NR_SYSCALL_CLONE3> {
+            args: [thread_start_arg_ptr as u64, flags.bits()],
+        })
     }
 
     fn terminate_thread(&self, code: Self::ExitCode) -> ! {
