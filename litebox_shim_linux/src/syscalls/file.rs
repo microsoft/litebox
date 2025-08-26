@@ -763,11 +763,9 @@ pub fn sys_ioctl(
             .ok_or(Errno::EFAULT)?
             .into_owned();
         match desc {
-            Descriptor::File(file) => {
-                match arg {
-                    IoctlArg::TCGETS(_) => Err(Errno::ENOTTY),
-                    _ => todo!(),
-                }
+            Descriptor::File(file) => match arg {
+                IoctlArg::TCGETS(_) => Err(Errno::ENOTTY),
+                _ => todo!(),
             },
             Descriptor::Stdio(file) => {
                 file.inner.set_status(OFlags::NONBLOCK, val != 0);
