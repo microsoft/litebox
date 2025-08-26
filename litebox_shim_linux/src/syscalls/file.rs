@@ -222,9 +222,7 @@ pub fn sys_lseek(fd: i32, offset: isize, whence: i32) -> Result<usize, Errno> {
         | Descriptor::PipeReader { .. }
         | Descriptor::Epoll { .. }
         | Descriptor::PipeWriter { .. }
-        | Descriptor::Eventfd { .. } => {
-            Err(Errno::ESPIPE)
-        }
+        | Descriptor::Eventfd { .. } => Err(Errno::ESPIPE),
     }
 }
 
