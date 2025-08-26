@@ -763,10 +763,7 @@ pub fn sys_ioctl(
             .ok_or(Errno::EFAULT)?
             .into_owned();
         match desc {
-            Descriptor::File(file) => match arg {
-                IoctlArg::TCGETS(..) => Err(Errno::ENOTTY),
-                _ => todo!(),
-            },
+            Descriptor::File(file) => todo!(),
             Descriptor::Stdio(file) => {
                 file.inner.set_status(OFlags::NONBLOCK, val != 0);
             }
@@ -787,7 +784,10 @@ pub fn sys_ioctl(
 
     match desc {
         Descriptor::Stdio(file) => stdio_ioctl(file, arg),
-        Descriptor::File(file) => todo!(),
+        Descriptor::File(file) => match arg {
+            IoctlArg::TCGETS(..) => Err(Errno::ENOTTY),
+            _ => todo!(),
+        },
         Descriptor::Socket(socket) => todo!(),
         Descriptor::PipeReader {
             consumer,
