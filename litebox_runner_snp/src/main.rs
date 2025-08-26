@@ -97,7 +97,7 @@ pub extern "C" fn sandbox_process_init(
 
     let litebox = litebox::LiteBox::new(platform);
     let in_mem_fs = litebox::fs::in_mem::FileSystem::new(&litebox);
-    let tar_ro = litebox::fs::tar_ro::FileSystem::new(&litebox, ROOTFS.into());
+    let tar_ro = litebox::fs::tar_ro::FileSystem::new_borrowed(&litebox, ROOTFS);
     let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&litebox);
     let fs = litebox::fs::layered::FileSystem::new(
         &litebox,
