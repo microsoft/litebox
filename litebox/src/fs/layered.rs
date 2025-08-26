@@ -371,7 +371,6 @@ impl<
             | OFlags::RDONLY
             | OFlags::WRONLY
             | OFlags::RDWR
-            | OFlags::CLOEXEC
             | OFlags::EXCL
             | OFlags::NOCTTY
             | OFlags::DIRECTORY
