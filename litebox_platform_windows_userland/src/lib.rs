@@ -4,31 +4,77 @@
 // Windows, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
+use core::panic;
 use core::sync::atomic::{AtomicU32, AtomicUsize};
 use core::time::Duration;
+use std::cell::Cell;
 use std::os::raw::c_void;
 use std::sync::atomic::Ordering::SeqCst;
 
-use litebox::platform::ImmediatelyWokenUp;
+use litebox::platform::RawConstPointer;
 use litebox::platform::ThreadLocalStorageProvider;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
+use litebox::platform::{ImmediatelyWokenUp, RawMutPointer};
 use litebox_common_linux::PunchthroughSyscall;
 
 use windows_sys::Win32::Foundation as Win32_Foundation;
 use windows_sys::Win32::{
     Foundation::{GetLastError, WIN32_ERROR},
+    System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+        EXCEPTION_POINTERS,
+    },
     System::Memory::{
         self as Win32_Memory, PrefetchVirtualMemory, VirtualAlloc2, VirtualFree, VirtualProtect,
     },
     System::SystemInformation::{self as Win32_SysInfo},
     System::Threading::{
-        self as Win32_Threading, GetCurrentProcess, TlsAlloc, TlsFree, TlsGetValue, TlsSetValue,
+        self as Win32_Threading, CreateThread, GetCurrentProcess, TlsAlloc, TlsFree, TlsGetValue,
+        TlsSetValue,
     },
 };
 
+mod perf_counter;
+
 extern crate alloc;
+
+/// Per-thread FS base storage structure
+/// Clone and Copy are required to use std::cell::Cell.
+#[derive(Debug, Clone, Copy)]
+struct ThreadFsBaseState {
+    /// The current FS base value for this thread
+    fs_base: usize,
+}
+
+impl ThreadFsBaseState {
+    fn new() -> Self {
+        let current_fs_base = unsafe { litebox_common_linux::rdfsbase() };
+
+        Self {
+            fs_base: current_fs_base,
+        }
+    }
+
+    fn set_fs_base(&mut self, new_base: usize) {
+        self.fs_base = new_base;
+        unsafe {
+            litebox_common_linux::wrfsbase(new_base);
+        }
+    }
+
+    fn restore_fs_base(&self) {
+        unsafe {
+            litebox_common_linux::wrfsbase(self.fs_base);
+        }
+    }
+}
+
+// Thread-local storage for FS base state
+thread_local! {
+    static THREAD_FS_BASE: Cell<ThreadFsBaseState> = Cell::new(ThreadFsBaseState::new());
+}
 
 /// Connector to a shim-exposed syscall-handling interface.
 pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<WindowsUserland>) -> isize;
@@ -79,6 +125,58 @@ pub struct WindowsUserland {
 unsafe impl Send for WindowsUserland {}
 unsafe impl Sync for WindowsUserland {}
 
+/// Helper functions for managing per-thread FS base
+impl WindowsUserland {
+    /// Get the current thread's FS base state
+    fn get_thread_fs_base_state() -> ThreadFsBaseState {
+        THREAD_FS_BASE.with(|state| state.get())
+    }
+
+    /// Set the current thread's FS base
+    fn set_thread_fs_base(new_base: usize) {
+        THREAD_FS_BASE.with(|state| {
+            let mut current_state = state.get();
+            current_state.set_fs_base(new_base);
+            state.set(current_state);
+        });
+    }
+
+    /// Restore the current thread's FS base from saved state
+    fn restore_thread_fs_base() {
+        THREAD_FS_BASE.with(|state| {
+            state.get().restore_fs_base();
+        });
+    }
+
+    /// Initialize FS base state for a new thread
+    fn init_thread_fs_base() {
+        THREAD_FS_BASE.with(|state| {
+            state.set(ThreadFsBaseState::new());
+        });
+    }
+}
+
+unsafe extern "system" fn exception_handler(exception_info: *mut EXCEPTION_POINTERS) -> i32 {
+    unsafe {
+        let info = *exception_info;
+        let exception_record = *info.ExceptionRecord;
+        if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION {
+            let current_fsbase = litebox_common_linux::rdfsbase();
+
+            // Get the saved FS base from the per-thread FS state
+            let thread_state = WindowsUserland::get_thread_fs_base_state();
+
+            if current_fsbase == 0 && current_fsbase != thread_state.fs_base {
+                // Restore the FS base from the saved state
+                WindowsUserland::restore_thread_fs_base();
+
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+        EXCEPTION_CONTINUE_SEARCH
+    }
+}
+
 impl WindowsUserland {
     /// Create a new userland-Windows platform for use in `LiteBox`.
     ///
@@ -89,6 +187,20 @@ impl WindowsUserland {
         let mut sys_info = Win32_SysInfo::SYSTEM_INFO::default();
         Self::get_system_information(&mut sys_info);
 
+        // TODO(chuqi): Currently we just print system information for
+        // `TASK_ADDR_MIN` and `TASK_ADDR_MAX`.
+        // Will remove these prints once we have a better way to replace
+        // the current `const` values in PageManagementProvider.
+        println!("System information.");
+        println!(
+            "=> Max user address: {:#x}",
+            sys_info.lpMaximumApplicationAddress as usize
+        );
+        println!(
+            "=> Min user address: {:#x}",
+            sys_info.lpMinimumApplicationAddress as usize
+        );
+
         let reserved_pages = Self::read_memory_maps();
 
         let platform = Self {
@@ -97,6 +209,15 @@ impl WindowsUserland {
             sys_info: std::sync::RwLock::new(sys_info),
         };
         platform.set_init_tls();
+
+        // Initialize it's own fs-base (for the main thread)
+        WindowsUserland::init_thread_fs_base();
+
+        // Windows sets FS_BASE to 0 regularly upon scheduling; we register an exception handler
+        // to set FS_BASE back to a "stored" value whenever we notice that it has become 0.
+        unsafe {
+            let _ = AddVectoredExceptionHandler(0, Some(exception_handler));
+        }
 
         Box::leak(Box::new(platform))
     }
@@ -164,6 +285,11 @@ impl WindowsUserland {
         x & !(gran - 1)
     }
 
+    fn is_aligned_to_granu(&self, x: usize) -> bool {
+        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
+        x % gran == 0
+    }
+
     fn set_init_tls(&self) {
         // TODO: Currently we are using a static thread ID and credentials (faked).
         // This is a placeholder for future implementation to use passthrough.
@@ -176,6 +302,8 @@ impl WindowsUserland {
         let task = alloc::boxed::Box::new(litebox_common_linux::Task::<WindowsUserland> {
             pid: 1000,
             tid: 1000,
+            // TODO: placeholder for actual PPID
+            ppid: 0,
             clear_child_tid: None,
             robust_list: None,
             credentials: alloc::sync::Arc::new(creds),
@@ -204,14 +332,60 @@ impl litebox::platform::ExitProvider for WindowsUserland {
     }
 }
 
+/// Thread start wrapper function for Windows userland.
+unsafe extern "system" fn thread_start(param: *mut c_void) -> u32 {
+    // Initialize FS base state for this new thread
+    WindowsUserland::init_thread_fs_base();
+
+    let thread_start_args = unsafe { Box::from_raw(param as *mut ThreadStartArgs) };
+
+    // store the guest pt_regs onto the stack (for restoration later on)
+    let pt_regs_stack = *thread_start_args.pt_regs;
+
+    // Set up thread-local storage for the new thread. This is done by
+    // calling the actual thread callback with the unpacked arguments
+    (thread_start_args.thread_args.callback)(*(thread_start_args.thread_args));
+
+    // Restore the context
+    unsafe {
+        core::arch::asm!(
+            "mov rbx, {0}",
+            "xor rax, rax",
+            "mov rsp, {1}",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rcx",      // skip pt_regs.rax
+            "pop rcx",
+            "pop rdx",
+            "pop rsi",
+            "pop rdi",
+            "add rsp, 24",  // skip orig_rax, rip, cs, eflags
+            "popfq",
+            "pop rsp",      // restore the stack pointer (which points to the entry point of the thread)
+            "jmp rbx",
+            in(reg) thread_start_args.entry_point,
+            in(reg) &raw const pt_regs_stack.r11, // restore registers, starting from r11
+            out("rax") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    0
+}
+
+struct ThreadStartArgs {
+    pt_regs: Box<litebox_common_linux::PtRegs>,
+    thread_args: Box<litebox_common_linux::NewThreadArgs<WindowsUserland>>,
+    entry_point: usize,
+}
+
 impl litebox::platform::ThreadProvider for WindowsUserland {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadArgs = litebox_common_linux::NewThreadArgs<WindowsUserland>;
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
     type ThreadId = usize;
 
-    #[expect(unused_variables)]
-    #[expect(unused_mut)]
     unsafe fn spawn_thread(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -220,14 +394,49 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         entry_point: usize,
         mut thread_args: Box<Self::ThreadArgs>,
     ) -> Result<usize, Self::ThreadSpawnError> {
-        unimplemented!("spawn_thread is not implemented for Windows yet.");
+        let child_tid_ptr = core::ptr::from_mut(thread_args.task.as_mut()) as u64
+            + core::mem::offset_of!(litebox_common_linux::Task<WindowsUserland>, tid) as u64;
+
+        let mut copied_pt_regs = Box::new(*ctx);
+
+        // Reset the child stack pointer to the top of the allocated thread stack.
+        copied_pt_regs.rsp = stack.as_usize() + stack_size - 0x8;
+
+        let thread_args = thread_args;
+
+        let thread_start_args = ThreadStartArgs {
+            pt_regs: copied_pt_regs,
+            thread_args: thread_args,
+            entry_point: entry_point,
+        };
+
+        // We should always use heap to pass the parameter to `CreateThread`. This is to avoid using the parents'
+        // stack, which may be freed (race-condition) before the child thread starts.
+        let thread_start_arg_ptr = Box::into_raw(Box::new(thread_start_args));
+
+        let handle: Win32_Foundation::HANDLE = unsafe {
+            CreateThread(
+                core::ptr::null_mut(),
+                // just let the OS to allocate a dummy stack
+                0,
+                Some(thread_start),
+                thread_start_arg_ptr as *mut c_void,
+                // This flag indicates that the stack size is a reservation, not a commit.
+                Win32_Threading::STACK_SIZE_PARAM_IS_A_RESERVATION,
+                child_tid_ptr as *mut u32,
+            )
+        };
+        assert!(!handle.is_null(), "Failed to create thread");
+        Ok(unsafe { *(child_tid_ptr as *const i32) as usize })
     }
 
+    #[allow(unreachable_code)]
     fn terminate_thread(&self, code: Self::ExitCode) -> ! {
-        unimplemented!(
-            "terminate_thread is not implemented for Windows yet. code: {}",
-            code
-        );
+        unsafe {
+            Win32_Threading::ExitThread(code as u32);
+        };
+
+        unreachable!("exit should not return");
     }
 }
 
@@ -298,9 +507,7 @@ impl RawMutex {
             };
 
             if ok {
-                if self.inner.load(SeqCst) != val {
-                    break Ok(UnblockedOrTimedOut::Unblocked);
-                }
+                break Ok(UnblockedOrTimedOut::Unblocked);
             } else {
                 // Check why WaitOnAddress failed
                 let err = unsafe { GetLastError() };
@@ -312,7 +519,7 @@ impl RawMutex {
                     e => {
                         // Other error, possibly spurious wakeup or value changed
                         // Continue the loop to check the value again
-                        panic!("Unexpected error={} for WaitOnAddress", e);
+                        panic!("Unexpected error={e} for WaitOnAddress");
                     }
                 }
             }
@@ -398,23 +605,36 @@ impl litebox::platform::TimeProvider for WindowsUserland {
     type Instant = Instant;
 
     fn now(&self) -> Self::Instant {
-        Instant {
-            inner: std::time::Instant::now(),
-        }
+        perf_counter::PerformanceCounterInstant::now().into()
     }
 }
 
 pub struct Instant {
-    inner: std::time::Instant,
+    inner: core::time::Duration,
 }
 
 impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
-        self.inner.checked_duration_since(earlier.inner)
+        // On windows there's a threshold below which we consider two timestamps
+        // equivalent due to measurement error. For more details + doc link,
+        // check the docs on [epsilon](perf_counter::PerformanceCounterInstant::epsilon).
+        let epsilon = perf_counter::PerformanceCounterInstant::epsilon();
+        if earlier.inner > self.inner && earlier.inner - self.inner <= epsilon {
+            Some(Duration::new(0, 0))
+        } else {
+            self.inner.checked_sub(earlier.inner)
+        }
     }
 }
 
-#[expect(dead_code)]
+impl From<litebox_common_linux::Timespec> for Instant {
+    fn from(value: litebox_common_linux::Timespec) -> Self {
+        Instant {
+            inner: value.into(),
+        }
+    }
+}
+
 pub struct PunchthroughToken {
     punchthrough: PunchthroughSyscall<WindowsUserland>,
 }
@@ -429,7 +649,64 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
             <Self::Punchthrough as litebox::platform::Punchthrough>::ReturnFailure,
         >,
     > {
-        unimplemented!("punchthrough is not implemented for Windows yet");
+        match self.punchthrough {
+            PunchthroughSyscall::SetFsBase { addr } => {
+                // Use WindowsUserland's per-thread FS base management system
+                WindowsUserland::set_thread_fs_base(addr);
+                Ok(0)
+            }
+            PunchthroughSyscall::GetFsBase { addr } => {
+                // Read from the per-thread FS base storage to get the current value
+                let thread_state = WindowsUserland::get_thread_fs_base_state();
+
+                // Use the stored FS base value from our per-thread storage
+                let fs_base = thread_state.fs_base;
+
+                unsafe { addr.write_at_offset(0, fs_base) }.ok_or(
+                    litebox::platform::PunchthroughError::Failure(
+                        litebox_common_linux::errno::Errno::EFAULT,
+                    ),
+                )?;
+                Ok(0)
+            }
+            PunchthroughSyscall::WakeByAddress { addr } => unsafe {
+                Win32_Threading::WakeByAddressAll(addr.as_usize() as *const c_void);
+                Ok(0)
+            },
+            PunchthroughSyscall::ClockGettime { clockid, tp } => {
+                let ts = perf_counter::get_timespec(clockid);
+                let clock_timespec = litebox_common_linux::Timespec {
+                    tv_sec: ts.0,
+                    tv_nsec: ts.1 as u64,
+                };
+                let _ = unsafe { tp.write_at_offset(0, clock_timespec) };
+                Ok(0)
+            }
+            PunchthroughSyscall::Gettimeofday { tv, tz } => {
+                let ts = perf_counter::get_timespec(litebox_common_linux::CLOCK_REALTIME);
+                let timeval = litebox_common_linux::TimeVal::from(litebox_common_linux::Timespec {
+                    tv_sec: ts.0,
+                    tv_nsec: ts.1 as u64,
+                });
+                let _ = unsafe { tv.write_at_offset(0, timeval) };
+                // Handle timezone parameter (usually NULL and deprecated)
+                // Return timezone as UTC (0 minutes west, no DST)
+                let timezone = litebox_common_linux::TimeZone::new(0, 0);
+                let _ = unsafe { tz.write_at_offset(0, timezone) };
+                Ok(0)
+            }
+            PunchthroughSyscall::Time { tloc } => {
+                let ts = perf_counter::get_timespec(litebox_common_linux::CLOCK_REALTIME);
+                let seconds = ts.0 as litebox_common_linux::time_t;
+                let _ = unsafe { tloc.write_at_offset(0, seconds) };
+                Ok(usize::try_from(seconds).unwrap_or(0))
+            }
+            _ => {
+                unimplemented!(
+                    "PunchthroughToken for WindowsUserland is not fully implemented yet"
+                );
+            }
+        }
     }
 }
 
@@ -499,72 +776,129 @@ fn do_prefetch_on_range(start: usize, size: usize) {
     });
 }
 
+fn do_query_on_region(mbi: &mut Win32_Memory::MEMORY_BASIC_INFORMATION, base_addr: *mut c_void) {
+    let ok = unsafe {
+        Win32_Memory::VirtualQuery(
+            base_addr,
+            mbi,
+            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+        ) != 0
+    };
+    assert!(ok, "VirtualQuery addr={:p} failed: {}", base_addr, unsafe {
+        GetLastError()
+    });
+}
+
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
+    // TODO(chuqi): These are currently "magic numbers" grabbed from my Windows 11 SystemInformation.
+    // The actual values should be determined by `GetSystemInfo()`.
+    //
+    // NOTE: make sure the values are PAGE_ALIGNED.
+    const TASK_ADDR_MIN: usize = 0x1_0000;
+    const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
-        _can_grow_down: bool,
+        can_grow_down: bool,
         populate_pages_immediately: bool,
-        _fixed_address: bool,
+        fixed_address: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let base_addr = suggested_range.start as *mut c_void;
         let size = suggested_range.len();
         // TODO: For Windows, there is no MAP_GROWDOWN features so far.
 
         // 1) In case we have a suggested VA range, we first check and deal with the case
-        // that the address is already reserved.
+        // that the address (range) is already reserved.
         if suggested_range.start != 0 {
+            assert!(suggested_range.start as usize >= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
+                                                            TASK_ADDR_MIN);
+            assert!(suggested_range.end as usize <= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
+                                                            TASK_ADDR_MAX);
+
             let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
-            let ok = unsafe {
-                Win32_Memory::VirtualQuery(
+            do_query_on_region(&mut mbi, base_addr);
+
+            // The region is already either reserved or committed, and we need to handle both cases.
+            if mbi.State == Win32_Memory::MEM_RESERVE || mbi.State == Win32_Memory::MEM_COMMIT {
+                let region_base = mbi.BaseAddress as usize;
+                let region_size = mbi.RegionSize as usize;
+                let region_end = region_base + region_size;
+                let request_end = suggested_range.start + size;
+
+                assert!(
+                    suggested_range.start <= region_end,
+                    "Requested start address ({:p}) is beyond the reserved region end ({:p})",
                     base_addr,
-                    &raw mut mbi,
-                    core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
-                ) != 0
-            };
-            assert!(ok, "VirtualQuery failed: {}", unsafe { GetLastError() });
+                    region_end as *mut c_void
+                );
 
-            // For already-reserved memory, we just need to commit it.
-            if mbi.State == Win32_Memory::MEM_RESERVE {
-                let addr = unsafe {
-                    VirtualAlloc2(
-                        GetCurrentProcess(),
-                        base_addr.cast::<c_void>(),
-                        size,
-                        Win32_Memory::MEM_COMMIT,
-                        prot_flags(initial_permissions),
-                        core::ptr::null_mut(),
-                        0,
-                    )
-                };
-                assert!(!addr.is_null(), "VirtualAlloc2 failed: {}", unsafe {
-                    GetLastError()
-                });
-
-                // Prefetch the memory range if requested
-                if populate_pages_immediately {
-                    do_prefetch_on_range(suggested_range.start, suggested_range.len());
+                let size_within_region = core::cmp::min(size, region_end - suggested_range.start);
+                unsafe {
+                    match mbi.State {
+                        // In case the region is already reserved, we just need to commit it.
+                        Win32_Memory::MEM_RESERVE => {
+                            let ptr = VirtualAlloc2(
+                                GetCurrentProcess(),
+                                base_addr.cast::<c_void>(),
+                                size_within_region,
+                                Win32_Memory::MEM_COMMIT,
+                                prot_flags(initial_permissions),
+                                core::ptr::null_mut(),
+                                0,
+                            );
+                            assert!(
+                                !ptr.is_null(),
+                                "VirtualAlloc2(COMMIT addr={:p}, size=0x{:x}) failed: err={}",
+                                base_addr,
+                                size_within_region,
+                                GetLastError()
+                            );
+                        }
+                        // In case the region is already committed, we just need to change its permissions.
+                        Win32_Memory::MEM_COMMIT => {
+                            let mut old_protect: u32 = 0;
+                            assert!(
+                                Win32_Memory::VirtualProtect(
+                                    base_addr,
+                                    size_within_region,
+                                    prot_flags(initial_permissions),
+                                    &mut old_protect,
+                                ) != 0,
+                                "VirtualProtect(addr={:p}, size=0x{:x}) failed: {}",
+                                base_addr,
+                                size_within_region,
+                                GetLastError()
+                            );
+                        }
+                        _ => {
+                            panic!("Unexpected memory state: {:?}", mbi.State);
+                        }
+                    }
                 }
 
-                return Ok(litebox::platform::trivial_providers::TransparentMutPtr {
-                    inner: addr.cast::<u8>(),
-                });
-            }
+                // If the requested end address is beyond the reserved region (cross the region),
+                // we need to allocate more memory.
+                if request_end > region_end {
+                    // Windows region should be aligned to its allocation granularity.
+                    assert!(
+                        self.is_aligned_to_granu(region_end),
+                        "Region end address {:p} is not aligned to allocation granularity",
+                        region_end as *mut c_void
+                    );
 
-            // For already-committed memory, we just need to overlay its permissions.
-            if mbi.State == Win32_Memory::MEM_COMMIT {
-                let mut old_protect: u32 = 0;
-                let ok = unsafe {
-                    VirtualProtect(
-                        base_addr,
-                        size,
-                        prot_flags(initial_permissions),
-                        &raw mut old_protect,
-                    ) != 0
-                };
-                assert!(ok, "VirtualProtect failed: {}", unsafe { GetLastError() });
-
+                    // In case of cross-region allocation, we must ensure that the virtual address
+                    // returned by VirtualAlloc2 is the expected start address (contiguous with the
+                    // already reserved region).
+                    <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
+                            self,
+                            region_end..request_end,
+                            initial_permissions,
+                            can_grow_down,
+                            populate_pages_immediately,
+                            true,
+                        )?;
+                }
                 // Prefetch the memory range if requested
                 if populate_pages_immediately {
                     do_prefetch_on_range(suggested_range.start, suggested_range.len());
@@ -574,9 +908,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     inner: base_addr.cast::<u8>(),
                 });
             }
+            // If the region is not reserved or committed, we just need to reserve and commit it.
+            // Fallthrough to the next step.
+            else {
+            }
         }
 
-        // 2) In case that the (indicated) VA is not reserved, we have to reserve & commit it.
+        // 2) In case that the (indicated) VA is not reserved, or there is no suggested VA, we
+        // just have to reserve & commit a VA range.
 
         // Align the size and base address to the allocation granularity.
         let aligned_size = self.round_up_to_granu(size);
@@ -602,6 +941,15 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             initial_permissions,
             unsafe { GetLastError() }
         );
+
+        if fixed_address {
+            assert!(
+                addr == aligned_base_addr,
+                "VirtualAlloc2 returned address {:p} which is not the expected fixed address {:p}",
+                addr,
+                aligned_base_addr
+            );
+        }
 
         // Prefetch the memory range if requested
         if populate_pages_immediately {
@@ -840,7 +1188,7 @@ unsafe extern "C" fn syscall_handler(
 ) -> isize {
     // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
     let ctx = unsafe { &mut *ctx };
-    match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
+    let res = match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
         Ok(d) => {
             let syscall_handler: SyscallHandler = SYSCALL_HANDLER
                 .read()
@@ -849,7 +1197,9 @@ unsafe extern "C" fn syscall_handler(
             syscall_handler(d)
         }
         Err(err) => err.as_neg() as isize,
-    }
+    };
+
+    res
 }
 
 impl litebox::platform::SystemInfoProvider for WindowsUserland {
@@ -875,8 +1225,7 @@ impl WindowsUserland {
     }
 }
 
-/// Windows thread-local storage implementation (placeholder)
-/// Windows uses different TLS mechanisms than Unix systems
+/// WindowsUserland platform's thread-local storage implementation.
 impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
     type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<WindowsUserland>;
 

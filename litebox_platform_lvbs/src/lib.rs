@@ -333,6 +333,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// proper operations (e.g., syscall handling). We should consider implementing
     /// partial mapping to mitigate side-channel attacks and shallow copying to get rid of redudant
     /// page table data structures for kernel space.
+    #[allow(dead_code)]
     pub(crate) fn new_user_page_table(&self) -> mm::PageTable<PAGE_SIZE> {
         let pt = unsafe { mm::PageTable::new_top_level() };
         if pt
@@ -422,13 +423,7 @@ impl<Host: HostInterface> RawMutex<Host> {
 
             match ret {
                 Ok(()) => {
-                    if self
-                        .underlying_atomic()
-                        .load(core::sync::atomic::Ordering::Relaxed)
-                        != val
-                    {
-                        return Ok(UnblockedOrTimedOut::Unblocked);
-                    }
+                    return Ok(UnblockedOrTimedOut::Unblocked);
                 }
                 Err(Errno::EAGAIN) => {
                     // If the futex value does not match val, then the call fails
@@ -593,6 +588,9 @@ pub trait HostInterface {
 }
 
 impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
+    const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
+    const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,

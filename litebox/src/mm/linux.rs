@@ -73,6 +73,29 @@ impl From<MemoryRegionPermissions> for VmFlags {
     }
 }
 
+impl From<VmFlags> for MemoryRegionPermissions {
+    fn from(value: VmFlags) -> Self {
+        let mut flags = MemoryRegionPermissions::empty();
+        flags.set(
+            MemoryRegionPermissions::READ,
+            value.contains(VmFlags::VM_READ),
+        );
+        flags.set(
+            MemoryRegionPermissions::WRITE,
+            value.contains(VmFlags::VM_WRITE),
+        );
+        flags.set(
+            MemoryRegionPermissions::EXEC,
+            value.contains(VmFlags::VM_EXEC),
+        );
+        flags.set(
+            MemoryRegionPermissions::SHARED,
+            value.contains(VmFlags::VM_SHARED),
+        );
+        flags
+    }
+}
+
 const DEFAULT_RESERVED_SPACE_SIZE: usize = 0x100_0000; // 16 MiB
 
 bitflags::bitflags! {
@@ -122,7 +145,7 @@ impl<const ALIGN: usize> PageRange<ALIGN> {
     ///
     /// Returns `None` if the range is not `ALIGN`-aligned or empty.
     pub fn new(start: usize, end: usize) -> Option<Self> {
-        if start % ALIGN != 0 || end % ALIGN != 0 {
+        if !start.is_multiple_of(ALIGN) || !end.is_multiple_of(ALIGN) {
             return None;
         }
         if start >= end {
@@ -167,7 +190,7 @@ impl<const ALIGN: usize> NonZeroPageSize<ALIGN> {
     ///
     /// Returns `None` if the size is zero or not `ALIGN`-aligned.
     pub fn new(size: usize) -> Option<Self> {
-        if size == 0 || size % ALIGN != 0 {
+        if size == 0 || !size.is_multiple_of(ALIGN) {
             return None;
         }
         Some(Self { size })
@@ -194,7 +217,7 @@ pub struct NonZeroAddress<const ALIGN: usize>(usize);
 impl<const ALIGN: usize> NonZeroAddress<ALIGN> {
     /// Create a new `NonZeroAddress`, if the address is non-zero and aligned.
     pub fn new(address: usize) -> Option<Self> {
-        if address == 0 || address % ALIGN != 0 {
+        if address == 0 || !address.is_multiple_of(ALIGN) {
             return None;
         }
         Some(Self(address))
@@ -253,11 +276,6 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
 }
 
 impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem<Platform, ALIGN> {
-    pub(super) const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
-    #[cfg(target_arch = "x86_64")]
-    pub(super) const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
-    #[cfg(target_arch = "x86")]
-    pub(super) const TASK_ADDR_MAX: usize = 0xC000_0000; // 3 GiB (see arch/x86/include/asm/page_32_types.h)
     pub(super) const STACK_GUARD_GAP: usize = 256 << 12;
 
     /// Create a new [`Vmem`] instance with the given memory [backend](PageManagementProvider).
@@ -386,7 +404,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         fixed_address: bool,
     ) -> Option<Platform::RawMutPointer<u8>> {
         let (start, end) = (suggested_range.start, suggested_range.end);
-        if start < Self::TASK_ADDR_MIN || end > Self::TASK_ADDR_MAX {
+        if start < Platform::TASK_ADDR_MIN || end > Platform::TASK_ADDR_MAX {
             return None;
         }
         if fixed_address {
@@ -427,6 +445,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let new_start = ret.as_usize();
         let new_end = new_start + suggested_range.len();
         self.vmas.insert(new_start..new_end, vma);
+        debug_assert!(new_start >= Platform::TASK_ADDR_MIN);
+        debug_assert!(new_end <= Platform::TASK_ADDR_MAX);
         Some(ret)
     }
 
@@ -676,33 +696,28 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ///
     /// `op` is a callback for caller to initialize the created pages.
     ///
-    /// `before_perms` and `after_perms` are the permissions to set before and after the call to `op`.
+    /// `perm` is the permissions to set for the created pages.
     ///
     /// # Safety
     ///
-    /// Note that if the suggested address is given and `fixed_addr` is set to `true`,
+    /// Note that if the suggested address is given and [`CreatePagesFlags::FIXED_ADDR`] is set,
     /// the kernel uses it directly without checking if it is available, causing overlapping
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     ///
     /// Also, caller must ensure flags are set correctly.
-    pub(super) unsafe fn create_pages<F>(
+    pub(super) unsafe fn create_pages(
         &mut self,
         suggested_new_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
         flags: CreatePagesFlags,
-        before_perms: MemoryRegionPermissions,
-        after_perms: MemoryRegionPermissions,
-        op: F,
-    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
-    where
-        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
-    {
-        let addr = unsafe {
+        perms: MemoryRegionPermissions,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        unsafe {
             self.create_mapping(
                 suggested_new_address,
                 length,
                 VmArea::new(
-                    VmFlags::from(before_perms)
+                    VmFlags::from(perms)
                         | VmFlags::VM_MAY_ACCESS_FLAGS
                         | if flags.contains(CreatePagesFlags::IS_STACK) {
                             VmFlags::VM_GROWSDOWN
@@ -714,25 +729,30 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 flags,
             )
         }
-        .ok_or(MappingError::OutOfMemory)?;
-        // call the user function with the pages
-        if let Err(e) = op(addr) {
-            // remove the mapping if the user function fails
-            unsafe {
-                self.remove_mapping(
-                    PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap(),
-                )
+        .ok_or(MappingError::OutOfMemory)
+    }
+
+    /// Get the memory permissions of a given address range.
+    ///
+    /// `page_range` specifies the range of pages to check the memory permissions.
+    /// This function returns `MemoryRegionPermissions` only if the range is valid.
+    pub(super) fn get_memory_permissions(
+        &self,
+        page_range: PageRange<ALIGN>,
+    ) -> Option<MemoryRegionPermissions> {
+        let (range_start, range_end) = (page_range.start, page_range.end);
+        let range: core::ops::Range<usize> = page_range.into();
+        if let Some(iter) = self.overlapping(range).next() {
+            if iter.0.start > range_start || iter.0.end < range_end {
+                // partial overlap implies that the given range contains unmapped pages or
+                // consists of memory pages with different permissions.
+                return None;
             }
-            .unwrap();
-            return Err(e);
+            let vmflags = iter.1.flags();
+            Some(vmflags.into())
+        } else {
+            None
         }
-        if before_perms != after_perms {
-            let range =
-                PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap();
-            // `protect` should succeed, as we just created the mapping.
-            unsafe { self.protect_mapping(range, after_perms) }.expect("failed to protect mapping");
-        }
-        Ok(addr)
     }
 
     /*================================Internal Functions================================ */
@@ -749,11 +769,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         fixed_addr: bool,
     ) -> Option<usize> {
         let size = length.as_usize();
-        if size > Self::TASK_ADDR_MAX {
+        if size > Platform::TASK_ADDR_MAX {
             return None;
         }
         if let Some(suggested_address) = suggested_address {
-            if (Self::TASK_ADDR_MAX - size) < suggested_address.0 {
+            if (Platform::TASK_ADDR_MAX - size) < suggested_address.0 {
                 return None;
             }
             if fixed_addr
@@ -767,8 +787,12 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
 
         // top down
         // 1. check [last_end, TASK_SIZE_MAX)
-        let (low_limit, high_limit) =
-            (Self::TASK_ADDR_MIN, Self::TASK_ADDR_MAX - length.as_usize());
+        let (low_limit, high_limit) = (
+            Platform::TASK_ADDR_MIN,
+            Platform::TASK_ADDR_MAX - length.as_usize(),
+        );
+        debug_assert!(Platform::TASK_ADDR_MIN % ALIGN == 0);
+        debug_assert!(Platform::TASK_ADDR_MAX % ALIGN == 0);
         let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
         if last_end <= high_limit {
             return Some(high_limit);

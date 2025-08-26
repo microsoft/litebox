@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 arrayvec = { version = "0.7.6", default-features = false }
+bitvec = { version = "1.0.1", default-features = false, features = ["alloc"] }
 bitflags = "2.9.0"
 litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
@@ -29,6 +30,7 @@ default = ["platform_linux_userland"]
 platform_freebsd_userland = ["litebox_platform_multiplex/platform_freebsd_userland"]
 platform_linux_userland = ["litebox_platform_multiplex/platform_linux_userland"]
 platform_windows_userland = ["litebox_platform_multiplex/platform_windows_userland"]
+platform_linux_snp = ["litebox_platform_multiplex/platform_linux_snp"]
 
 [dev-dependencies]
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }

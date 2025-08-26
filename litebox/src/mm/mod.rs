@@ -44,6 +44,65 @@ where
         Self { vmem }
     }
 
+    /// Create a mapping with the given flags.
+    ///
+    /// `suggested_new_address` is the hint address for where to create the pages if it is not `None`.
+    /// Otherwise, let the kernel choose an available memory region.
+    ///
+    /// `length` is the size of the pages to be created.
+    ///
+    /// Set `flags` to control options such as fixed address, stack, and populate pages.
+    ///
+    /// `op` is a callback for caller to initialize the created pages.
+    ///
+    /// `before_perms` and `after_perms` are the permissions to set before and after the call to `op`.
+    ///
+    /// # Safety
+    ///
+    /// Note that if the suggested address is given and [`CreatePagesFlags::FIXED_ADDR`] is set,
+    /// the kernel uses it directly without checking if it is available, causing overlapping
+    /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
+    ///
+    /// Also, caller must ensure flags are set correctly.
+    unsafe fn create_pages<F>(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        before_perms: MemoryRegionPermissions,
+        after_perms: MemoryRegionPermissions,
+        op: F,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
+    where
+        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
+    {
+        let addr = {
+            let mut vmem = self.vmem.write();
+            unsafe { vmem.create_pages(suggested_address, length, flags, before_perms) }?
+        };
+        // call the user function with the pages
+        // Note `op` may trigger page fault handler which requires write lock to `vmem`.
+        if let Err(e) = op(addr) {
+            // remove the mapping if the user function fails
+            let mut vmem = self.vmem.write();
+            unsafe {
+                vmem.remove_mapping(
+                    PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap(),
+                )
+            }
+            .unwrap();
+            return Err(e);
+        }
+        if before_perms != after_perms {
+            let range =
+                PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap();
+            // `protect` should succeed, as we just created the mapping.
+            let mut vmem = self.vmem.write();
+            unsafe { vmem.protect_mapping(range, after_perms) }.expect("failed to protect mapping");
+        }
+        Ok(addr)
+    }
+
     /// Create readable and executable pages.
     ///
     /// `suggested_address` is the hint address for where to create the pages if it is not `None`.
@@ -70,9 +129,8 @@ where
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
-        let mut vmem = self.vmem.write();
         unsafe {
-            vmem.create_pages(
+            self.create_pages(
                 suggested_address,
                 length,
                 flags,
@@ -112,8 +170,7 @@ where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-        let mut vmem = self.vmem.write();
-        unsafe { vmem.create_pages(suggested_address, length, flags, perms, perms, op) }
+        unsafe { self.create_pages(suggested_address, length, flags, perms, perms, op) }
     }
 
     /// Create read-only pages.
@@ -142,9 +199,8 @@ where
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
-        let mut vmem = self.vmem.write();
         unsafe {
-            vmem.create_pages(
+            self.create_pages(
                 suggested_address,
                 length,
                 flags,
@@ -183,9 +239,8 @@ where
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
-        let mut vmem = self.vmem.write();
         unsafe {
-            vmem.create_pages(
+            self.create_pages(
                 suggested_address,
                 length,
                 flags,
@@ -217,9 +272,8 @@ where
         flags: CreatePagesFlags,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-        let mut vmem = self.vmem.write();
         let flags = CreatePagesFlags::IS_STACK | flags;
-        unsafe { vmem.create_pages(suggested_address, length, flags, perms, perms, |_| Ok(0)) }
+        unsafe { self.create_pages(suggested_address, length, flags, perms, perms, |_| Ok(0)) }
     }
 
     /// Set the program break to the given address.
@@ -284,8 +338,6 @@ where
                     length,
                     CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
                     perms,
-                    perms,
-                    |_| Ok(0),
                 )
             }?;
         }
@@ -501,6 +553,26 @@ where
             .map(|(r, vma)| (r.start..r.end, vma.flags()))
             .collect()
     }
+
+    /// Get the memory permissions of a given address range.
+    ///
+    /// `ptr` specifies the start address of the memory range.
+    /// `len` specifies the length of the memory range.
+    /// This function returns `MemoryRegionPermissions` only if the range is valid.
+    /// A memory range is invalid if it contains:
+    /// - Unmapped pages
+    /// - Memory pages with different permissions
+    pub fn get_memory_permissions(
+        &self,
+        ptr: NonZeroAddress<ALIGN>,
+        len: NonZeroPageSize<ALIGN>,
+    ) -> Option<MemoryRegionPermissions> {
+        let vmem = self.vmem.read();
+        let start = ptr.as_usize();
+        let end = start + len.as_usize();
+        let page_range = PageRange::<ALIGN>::new(start, end)?;
+        vmem.get_memory_permissions(page_range)
+    }
 }
 
 /// If Backend also implements [`VmemPageFaultHandler`], it can handle page faults.
@@ -515,14 +587,12 @@ where
     ///
     /// This should only be called from the kernel page fault handler.
     pub unsafe fn handle_page_fault(
-        &mut self,
+        &self,
         fault_addr: usize,
         error_code: u64,
     ) -> Result<(), PageFaultError> {
         let fault_addr = fault_addr & !(ALIGN - 1);
-        if !(Vmem::<Platform, ALIGN>::TASK_ADDR_MIN..Vmem::<Platform, ALIGN>::TASK_ADDR_MAX)
-            .contains(&fault_addr)
-        {
+        if !(Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX).contains(&fault_addr) {
             return Err(PageFaultError::AccessError("Invalid address"));
         }
 
@@ -530,7 +600,7 @@ where
         // Find the range closest to the fault address
         let (start, vma) = {
             let (r, vma) = vmem
-                .overlapping(fault_addr..Vmem::<Platform, ALIGN>::TASK_ADDR_MAX)
+                .overlapping(fault_addr..Platform::TASK_ADDR_MAX)
                 .next()
                 .ok_or(PageFaultError::AccessError("no mapping"))?;
             (r.start, *vma)
@@ -542,7 +612,7 @@ where
             }
 
             if !vmem
-                .overlapping(Vmem::<Platform, ALIGN>::TASK_ADDR_MIN..fault_addr)
+                .overlapping(Platform::TASK_ADDR_MIN..fault_addr)
                 .next_back()
                 .is_none_or(|(prev_range, prev_vma)| {
                     // Enforce gap between stack and other preceding non-stack mappings.

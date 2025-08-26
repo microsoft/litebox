@@ -96,7 +96,8 @@ pub fn litebox_fs<'a>() -> &'a LinuxFS {
     FS.get().expect("fs has not yet been set")
 }
 
-pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE> {
+/// Get the global page manager
+pub fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE> {
     static VMEM: OnceBox<PageManager<Platform, PAGE_SIZE>> = OnceBox::new();
     VMEM.get_or_init(|| alloc::boxed::Box::new(PageManager::new(litebox())))
 }
@@ -512,6 +513,22 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
                     .ok_or(Errno::EFAULT)
             })
         }),
+        SyscallRequest::Gettimeofday { tv, tz } => syscalls::process::sys_gettimeofday(tv, tz)
+            .map(|()| 0)
+            .map_err(|_| Errno::EFAULT),
+        SyscallRequest::ClockGettime { clockid, tp } => {
+            syscalls::process::sys_clock_gettime(clockid, tp)
+                .map(|()| 0)
+                .map_err(|_| Errno::EFAULT)
+        }
+        SyscallRequest::ClockGetres { clockid, res } => {
+            syscalls::process::sys_clock_getres(clockid, res);
+            Ok(0)
+        }
+        SyscallRequest::Time { tloc } => {
+            let second = syscalls::process::sys_time(tloc);
+            Ok(usize::try_from(second).unwrap_or(0))
+        }
         SyscallRequest::Openat {
             dirfd,
             pathname,
@@ -683,6 +700,9 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
         SyscallRequest::Getpid => {
             Ok(syscalls::process::sys_getpid().reinterpret_as_unsigned() as usize)
         }
+        SyscallRequest::Getppid => {
+            Ok(syscalls::process::sys_getppid().reinterpret_as_unsigned() as usize)
+        }
         SyscallRequest::Getuid => Ok(syscalls::process::sys_getuid()),
         SyscallRequest::Getgid => Ok(syscalls::process::sys_getgid()),
         SyscallRequest::Geteuid => Ok(syscalls::process::sys_geteuid()),
@@ -695,6 +715,22 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
         }
         SyscallRequest::CapGet { header, data } => {
             syscalls::misc::sys_capget(header, data).map(|()| 0)
+        }
+        SyscallRequest::GetDirent64 { fd, dirp, count } => {
+            syscalls::file::sys_getdirent64(fd, dirp, count)
+        }
+        SyscallRequest::SchedGetAffinity { pid, len, mask } => {
+            const BITS_PER_BYTE: usize = 8;
+            let cpuset = syscalls::process::sys_sched_getaffinity(pid);
+            if len * BITS_PER_BYTE < cpuset.len() || len & (core::mem::size_of::<usize>() - 1) != 0
+            {
+                Err(Errno::EINVAL)
+            } else {
+                let raw_bytes = cpuset.as_bytes();
+                unsafe { mask.copy_from_slice(0, raw_bytes) }
+                    .map(|()| raw_bytes.len())
+                    .ok_or(Errno::EFAULT)
+            }
         }
         _ => {
             todo!()

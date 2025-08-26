@@ -374,6 +374,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// Also, the caller must ensure no page table frame is shared with other page tables.
     /// This function expects that `Drop` will deallocate the top-level page table frame. It does not
     /// deallocate the top-level page table frame because this can result in an undefined behavior.
+    #[allow(dead_code)]
     pub(crate) unsafe fn clean_up(&self) {
         let mut allocator = PageTableAllocator::<M>::new();
         unsafe {

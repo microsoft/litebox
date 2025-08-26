@@ -1,17 +1,13 @@
 //! Implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
+//! Most of these syscalls which are not backed by files are implemented in [`litebox_common_linux::mm`].
 
 use litebox::{
-    mm::linux::{
-        CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmemUnmapError,
-    },
-    platform::{RawConstPointer, RawMutPointer, page_mgmt::DeallocationError},
+    mm::linux::{MappingError, PAGE_SIZE},
+    platform::RawMutPointer,
 };
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
 use crate::{MutPtr, litebox_page_manager};
-
-const PAGE_MASK: usize = !(PAGE_SIZE - 1);
-const PAGE_SHIFT: usize = PAGE_SIZE.trailing_zeros() as usize;
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
@@ -25,6 +21,7 @@ fn align_down(addr: usize, align: usize) -> usize {
     addr & !(align - 1)
 }
 
+#[inline]
 fn do_mmap(
     suggested_addr: Option<usize>,
     len: usize,
@@ -33,46 +30,18 @@ fn do_mmap(
     ensure_space_after: bool,
     op: impl FnOnce(MutPtr<u8>) -> Result<usize, MappingError>,
 ) -> Result<MutPtr<u8>, MappingError> {
-    let flags = {
-        let mut create_flags = CreatePagesFlags::empty();
-        create_flags.set(
-            CreatePagesFlags::FIXED_ADDR,
-            flags.contains(MapFlags::MAP_FIXED),
-        );
-        create_flags.set(
-            CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-            flags.contains(MapFlags::MAP_POPULATE),
-        );
-        create_flags.set(CreatePagesFlags::ENSURE_SPACE_AFTER, ensure_space_after);
-        create_flags.set(
-            CreatePagesFlags::MAP_FILE,
-            !flags.contains(MapFlags::MAP_ANONYMOUS),
-        );
-        create_flags
-    };
-    let suggested_addr = match suggested_addr {
-        Some(addr) => Some(NonZeroAddress::new(addr).ok_or(MappingError::UnAligned)?),
-        None => None,
-    };
-    let length = NonZeroPageSize::new(len).ok_or(MappingError::UnAligned)?;
-    let pm = litebox_page_manager();
-    match prot {
-        ProtFlags::PROT_READ_EXEC => unsafe {
-            pm.create_executable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_READ_WRITE => unsafe {
-            pm.create_writable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_READ => unsafe {
-            pm.create_readable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_NONE => unsafe {
-            pm.create_inaccessible_pages(suggested_addr, length, flags, op)
-        },
-        _ => todo!("Unsupported prot flags {:?}", prot),
-    }
+    litebox_common_linux::mm::do_mmap(
+        litebox_page_manager(),
+        suggested_addr,
+        len,
+        prot,
+        flags,
+        ensure_space_after,
+        op,
+    )
 }
 
+#[inline]
 fn do_mmap_anonymous(
     suggested_addr: Option<usize>,
     len: usize,
@@ -141,13 +110,7 @@ pub(crate) fn sys_mmap(
     offset: usize,
 ) -> Result<MutPtr<u8>, Errno> {
     // check alignment
-    if offset & !PAGE_MASK != 0 {
-        return Err(Errno::EINVAL);
-    }
-    if addr & !PAGE_MASK != 0 {
-        return Err(Errno::EINVAL);
-    }
-    if len == 0 {
+    if !offset.is_multiple_of(PAGE_SIZE) || !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
         return Err(Errno::EINVAL);
     }
     if flags.intersects(
@@ -183,56 +146,22 @@ pub(crate) fn sys_mmap(
 }
 
 /// Handle syscall `munmap`
+#[inline]
 pub(crate) fn sys_munmap(addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
-    if addr.as_usize() & !PAGE_MASK != 0 {
-        return Err(Errno::EINVAL);
-    }
-    if len == 0 {
-        return Err(Errno::EINVAL);
-    }
-    let aligned_len = align_up(len, PAGE_SIZE);
-    if addr.as_usize().checked_add(aligned_len).is_none() {
-        return Err(Errno::EINVAL);
-    }
-
-    let pm = litebox_page_manager();
-    match unsafe { pm.remove_pages(addr, aligned_len) } {
-        Err(VmemUnmapError::UnAligned) => Err(Errno::EINVAL),
-        Err(VmemUnmapError::UnmapError(e)) => match e {
-            DeallocationError::Unaligned => Err(Errno::EINVAL),
-            // It is not an error if the indicated range does not contain any mapped pages.
-            DeallocationError::AlreadyUnallocated => Ok(()),
-            _ => unimplemented!(),
-        },
-        Ok(()) => Ok(()),
-    }
+    litebox_common_linux::mm::sys_munmap(litebox_page_manager(), addr, len)
 }
 
 /// Handle syscall `mprotect`
+#[inline]
 pub(crate) fn sys_mprotect(
     addr: crate::MutPtr<u8>,
     len: usize,
     prot: ProtFlags,
 ) -> Result<(), Errno> {
-    if addr.as_usize() & !PAGE_MASK != 0 {
-        return Err(Errno::EINVAL);
-    }
-    if len == 0 {
-        return Ok(());
-    }
-
-    let pm = litebox_page_manager();
-    match prot {
-        ProtFlags::PROT_READ_EXEC => unsafe { pm.make_pages_executable(addr, len) },
-        ProtFlags::PROT_READ_WRITE => unsafe { pm.make_pages_writable(addr, len) },
-        ProtFlags::PROT_READ => unsafe { pm.make_pages_readable(addr, len) },
-        ProtFlags::PROT_NONE => unsafe { pm.make_pages_inaccessible(addr, len) },
-        ProtFlags::PROT_READ_WRITE_EXEC => unsafe { pm.make_pages_rwx(addr, len) },
-        _ => todo!("Unsupported prot flags {:?}", prot),
-    }
-    .map_err(Errno::from)
+    litebox_common_linux::mm::sys_mprotect(litebox_page_manager(), addr, len, prot)
 }
 
+#[inline]
 pub(crate) fn sys_mremap(
     old_addr: crate::MutPtr<u8>,
     old_size: usize,
@@ -240,95 +169,30 @@ pub(crate) fn sys_mremap(
     flags: MRemapFlags,
     new_addr: usize,
 ) -> Result<crate::MutPtr<u8>, Errno> {
-    if flags.intersects(
-        (MRemapFlags::MREMAP_FIXED | MRemapFlags::MREMAP_MAYMOVE | MRemapFlags::MREMAP_DONTUNMAP)
-            .complement(),
-    ) {
-        return Err(Errno::EINVAL);
-    }
-    if flags.contains(MRemapFlags::MREMAP_FIXED) && !flags.contains(MRemapFlags::MREMAP_MAYMOVE) {
-        return Err(Errno::EINVAL);
-    }
-    /*
-     * MREMAP_DONTUNMAP is always a move and it does not allow resizing
-     * in the process.
-     */
-    if flags.contains(MRemapFlags::MREMAP_DONTUNMAP)
-        && (!flags.contains(MRemapFlags::MREMAP_MAYMOVE) || old_size != new_size)
-    {
-        return Err(Errno::EINVAL);
-    }
-    if old_addr.as_usize() & !PAGE_MASK != 0 {
-        return Err(Errno::EINVAL);
-    }
-
-    let old_size = align_down(old_size, PAGE_SIZE);
-    let new_size = align_down(new_size, PAGE_SIZE);
-    if new_size == 0 {
-        return Err(Errno::EINVAL);
-    }
-
-    if flags.intersects(MRemapFlags::MREMAP_FIXED | MRemapFlags::MREMAP_DONTUNMAP) {
-        todo!("Unsupported flags {:?}", flags);
-    }
-
-    let pm = litebox_page_manager();
-    unsafe {
-        pm.remap_pages(
-            old_addr,
-            old_size,
-            new_size,
-            flags.contains(MRemapFlags::MREMAP_MAYMOVE),
-        )
-    }
-    .map_err(Errno::from)
+    litebox_common_linux::mm::sys_mremap(
+        litebox_page_manager(),
+        old_addr,
+        old_size,
+        new_size,
+        flags,
+        new_addr,
+    )
 }
 
 /// Handle syscall `brk`
+#[inline]
 pub(crate) fn sys_brk(addr: MutPtr<u8>) -> Result<usize, Errno> {
-    let pm = litebox_page_manager();
-    unsafe { pm.brk(addr.as_usize()) }.map_err(Errno::from)
+    litebox_common_linux::mm::sys_brk(litebox_page_manager(), addr)
 }
 
 /// Handle syscall `madvise`
+#[inline]
 pub(crate) fn sys_madvise(
     addr: MutPtr<u8>,
     len: usize,
     advice: litebox_common_linux::MadviseBehavior,
 ) -> Result<(), Errno> {
-    if addr.as_usize() & !PAGE_MASK != 0 {
-        return Err(Errno::EINVAL);
-    }
-    if len == 0 {
-        return Ok(());
-    }
-    let aligned_len = len.next_multiple_of(PAGE_SIZE);
-    if aligned_len == 0 {
-        // overflow
-        return Err(Errno::EINVAL);
-    }
-    let Some(end) = addr.as_usize().checked_add(aligned_len) else {
-        return Err(Errno::EINVAL);
-    };
-
-    match advice {
-        litebox_common_linux::MadviseBehavior::Normal
-        | litebox_common_linux::MadviseBehavior::DontFork
-        | litebox_common_linux::MadviseBehavior::DoFork => {
-            // No-op for now, as we don't support fork yet.
-            Ok(())
-        }
-        litebox_common_linux::MadviseBehavior::DontNeed => {
-            // After a successful MADV_DONTNEED operation, the semantics of memory access in the specified region are changed:
-            // subsequent accesses of pages in the range will succeed, but will result in either repopulating the memory contents
-            // from the up-to-date contents of the underlying mapped file (for shared file mappings, shared anonymous mappings,
-            // and shmem-based techniques such as System V shared memory segments) or zero-fill-on-demand pages for anonymous private mappings.
-            //
-            // Note we do not support shared memory yet, so this is just to discard the pages without removing the mapping.
-            unsafe { litebox_page_manager().reset_pages(addr, len) }.map_err(Errno::from)
-        }
-        _ => unimplemented!("unsupported madvise behavior"),
-    }
+    litebox_common_linux::mm::sys_madvise(litebox_page_manager(), addr, len, advice)
 }
 
 #[cfg(test)]
@@ -337,7 +201,7 @@ mod tests {
         fs::{Mode, OFlags},
         platform::{RawConstPointer, RawMutPointer},
     };
-    use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+    use litebox_common_linux::{MapFlags, ProtFlags};
 
     use crate::syscalls::{
         file::{sys_close, sys_open, sys_write},
@@ -345,7 +209,7 @@ mod tests {
         tests::init_platform,
     };
 
-    use super::{sys_madvise, sys_mmap, sys_mremap};
+    use super::{sys_madvise, sys_mmap};
 
     #[test]
     fn test_anonymous_mmap() {
@@ -398,6 +262,8 @@ mod tests {
         sys_close(fd).unwrap();
     }
 
+    // `mremap` is not implemented for freebsd yet.
+    #[cfg(not(feature = "platform_freebsd_userland"))]
     #[test]
     fn test_mremap() {
         init_platform(None);
@@ -413,10 +279,23 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            sys_mremap(addr, 0x1000, 0x2000, MRemapFlags::empty(), 0),
-            Err(Errno::ENOMEM)
+            super::sys_mremap(
+                addr,
+                0x1000,
+                0x2000,
+                litebox_common_linux::MRemapFlags::empty(),
+                0
+            ),
+            Err(litebox_common_linux::errno::Errno::ENOMEM)
         ),);
-        let new_addr = sys_mremap(addr, 0x1000, 0x2000, MRemapFlags::MREMAP_MAYMOVE, 0).unwrap();
+        let new_addr = super::sys_mremap(
+            addr,
+            0x1000,
+            0x2000,
+            litebox_common_linux::MRemapFlags::MREMAP_MAYMOVE,
+            0,
+        )
+        .unwrap();
         sys_munmap(addr, 0x2000).unwrap();
         sys_munmap(new_addr, 0x2000).unwrap();
     }

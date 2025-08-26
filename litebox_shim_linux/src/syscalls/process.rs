@@ -3,12 +3,12 @@
 use core::mem::offset_of;
 
 use alloc::boxed::Box;
-use litebox::platform::{ExitProvider as _, RawMutPointer, ThreadProvider};
+use litebox::platform::{ExitProvider as _, RawMutPointer as _, ThreadProvider as _};
 use litebox::platform::{
     PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _,
     ThreadLocalStorageProvider as _,
 };
-use litebox::utils::TruncateExt;
+use litebox::utils::TruncateExt as _;
 use litebox_common_linux::CloneFlags;
 use litebox_common_linux::{ArchPrctlArg, errno::Errno};
 
@@ -216,7 +216,7 @@ fn new_thread_callback(
     args: litebox_common_linux::NewThreadArgs<litebox_platform_multiplex::Platform>,
 ) {
     let litebox_common_linux::NewThreadArgs {
-        mut task,
+        task,
         tls,
         set_child_tid,
         callback: _,
@@ -293,8 +293,12 @@ pub(crate) fn sys_clone(
     }
 
     let platform = litebox_platform_multiplex::platform();
-    let (credentials, pid) = platform.with_thread_local_storage_mut(|tls| {
-        (tls.current_task.credentials.clone(), tls.current_task.pid)
+    let (credentials, pid, parent_proc_id) = platform.with_thread_local_storage_mut(|tls| {
+        (
+            tls.current_task.credentials.clone(),
+            tls.current_task.pid,
+            tls.current_task.ppid,
+        )
     });
     let child_tid = unsafe {
         platform.spawn_thread(
@@ -312,6 +316,7 @@ pub(crate) fn sys_clone(
                 task: Box::new(litebox_common_linux::Task {
                     pid,
                     tid: 0, // The actual TID will be set by the platform
+                    ppid: parent_proc_id,
                     clear_child_tid: if flags.contains(CloneFlags::CHILD_CLEARTID) {
                         child_tid
                     } else {
@@ -324,10 +329,10 @@ pub(crate) fn sys_clone(
             }),
         )
     }?;
-    if flags.contains(CloneFlags::PARENT_SETTID) {
-        if let Some(parent_tid_ptr) = parent_tid {
-            let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid.truncate()) };
-        }
+    if flags.contains(CloneFlags::PARENT_SETTID)
+        && let Some(parent_tid_ptr) = parent_tid
+    {
+        let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid.truncate()) };
     }
     NR_THREADS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Ok(child_tid)
@@ -449,9 +454,77 @@ pub(crate) fn sys_get_robust_list(
     unsafe { head_ptr.write_at_offset(0, head) }.ok_or(Errno::EFAULT)
 }
 
+/// Handle syscall `clock_gettime`.
+pub(crate) fn sys_clock_gettime(
+    clockid: i32,
+    tp: crate::MutPtr<litebox_common_linux::Timespec>,
+) -> Result<(), Errno> {
+    let punchthrough = litebox_common_linux::PunchthroughSyscall::ClockGettime { clockid, tp };
+    let token = litebox_platform_multiplex::platform()
+        .get_punchthrough_token_for(punchthrough)
+        .expect("Failed to get punchthrough token for CLOCK_GETTIME");
+    token.execute().map(|_| ()).map_err(|e| match e {
+        litebox::platform::PunchthroughError::Failure(errno) => errno,
+        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+    })
+}
+
+/// Handle syscall `clock_getres`.
+pub(crate) fn sys_clock_getres(_clockid: i32, res: crate::MutPtr<litebox_common_linux::Timespec>) {
+    // Return the resolution of the clock
+    // For most modern systems, the resolution is typically 1 nanosecond
+    // This is a reasonable default for high-resolution timers
+    let resolution = litebox_common_linux::Timespec {
+        tv_sec: 0,
+        tv_nsec: 1, // 1 nanosecond resolution
+    };
+
+    unsafe {
+        res.write_at_offset(0, resolution);
+    }
+}
+
+/// Handle syscall `gettimeofday`.
+pub(crate) fn sys_gettimeofday(
+    tv: crate::MutPtr<litebox_common_linux::TimeVal>,
+    tz: crate::MutPtr<litebox_common_linux::TimeZone>,
+) -> Result<(), Errno> {
+    let punchthrough = litebox_common_linux::PunchthroughSyscall::Gettimeofday { tv, tz };
+    let token = litebox_platform_multiplex::platform()
+        .get_punchthrough_token_for(punchthrough)
+        .expect("Failed to get punchthrough token for GETTIMEOFDAY");
+    token.execute().map(|_| ()).map_err(|e| match e {
+        litebox::platform::PunchthroughError::Failure(errno) => errno,
+        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+    })
+}
+
+/// Handle syscall `time`.
+pub(crate) fn sys_time(
+    tloc: crate::MutPtr<litebox_common_linux::time_t>,
+) -> litebox_common_linux::time_t {
+    let punchthrough = litebox_common_linux::PunchthroughSyscall::Time { tloc };
+    let token = litebox_platform_multiplex::platform()
+        .get_punchthrough_token_for(punchthrough)
+        .expect("Failed to get punchthrough token for TIME");
+    token
+        .execute()
+        .map(|seconds_usize| {
+            // Safe conversion from usize to time_t (i64)
+            litebox_common_linux::time_t::try_from(seconds_usize)
+                .unwrap_or(litebox_common_linux::time_t::MAX)
+        })
+        .unwrap_or(0)
+}
+
 /// Handle syscall `getpid`.
 pub(crate) fn sys_getpid() -> i32 {
     litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| tls.current_task.pid)
+}
+
+pub(crate) fn sys_getppid() -> i32 {
+    litebox_platform_multiplex::platform()
+        .with_thread_local_storage_mut(|tls| tls.current_task.ppid)
 }
 
 /// Handle syscall `getuid`.
@@ -476,6 +549,34 @@ pub(crate) fn sys_getgid() -> usize {
 pub(crate) fn sys_getegid() -> usize {
     litebox_platform_multiplex::platform()
         .with_thread_local_storage_mut(|tls| tls.current_task.credentials.egid)
+}
+
+/// Number of CPUs
+const NR_CPUS: usize = 2;
+
+pub(crate) struct CpuSet {
+    bits: bitvec::vec::BitVec<u8>,
+}
+
+impl CpuSet {
+    pub(crate) fn len(&self) -> usize {
+        self.bits.len()
+    }
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.bits.as_raw_slice()
+    }
+}
+
+/// Handle syscall `sched_getaffinity`.
+///
+/// Note this is a dummy implementation that always returns the same CPU set
+pub(crate) fn sys_sched_getaffinity(pid: Option<i32>) -> CpuSet {
+    if pid.is_some() {
+        unimplemented!("Getting CPU affinity for a specific PID is not supported yet");
+    }
+    let mut cpuset = bitvec::bitvec![u8, bitvec::order::Lsb0; 0; NR_CPUS];
+    cpuset.iter_mut().for_each(|mut b| *b = true);
+    CpuSet { bits: cpuset }
 }
 
 #[cfg(test)]
@@ -524,8 +625,11 @@ mod tests {
         sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize())).expect("Failed to restore FS base");
     }
 
-    static mut TLS: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+    // Initialize a static TLS area with value `1`. This value is later on used to verify that
+    // the TLS is set up correctly.
+    static mut TLS: [u8; PAGE_SIZE] = [1; PAGE_SIZE];
     static mut CHILD_TID: i32 = 0;
+    static mut PARENT_PID: i32 = 0;
 
     #[test]
     #[expect(clippy::too_many_lines)]
@@ -613,11 +717,18 @@ mod tests {
             "stack allocated at: {:#x}",
             stack.as_usize()
         );
+        unsafe { PARENT_PID = super::sys_getppid() };
         let main: fn() = || {
             let tid = super::sys_gettid();
             litebox::log_println!(
                 litebox_platform_multiplex::platform(),
                 "Child started {tid}"
+            );
+
+            assert_eq!(
+                unsafe { PARENT_PID },
+                super::sys_getppid(),
+                "Parent PID should match"
             );
 
             #[cfg(target_arch = "x86_64")]
@@ -633,6 +744,17 @@ mod tests {
                     addr,
                     unsafe { current_fs_base.assume_init() },
                     "FS base should match TLS pointer"
+                );
+
+                // Check the TLS value from FS base
+                let mut fs_0: u8;
+                unsafe {
+                    core::arch::asm!("mov {0}, fs:0", out(reg_byte) fs_0);
+                }
+                // Verify that the TLS value is initialized to its correct value (`1`).
+                assert_eq!(
+                    fs_0, 0x1,
+                    "TLS value from FS base should match the initialized value"
                 );
             }
 
@@ -696,5 +818,20 @@ mod tests {
             result,
             "Parent TID mismatch"
         );
+    }
+
+    #[test]
+    fn test_sched_getaffinity() {
+        crate::syscalls::tests::init_platform(None);
+
+        let cpuset = super::sys_sched_getaffinity(None);
+        assert_eq!(cpuset.bits.len(), super::NR_CPUS);
+        cpuset.bits.iter().for_each(|b| assert!(*b));
+        let ones: usize = cpuset
+            .as_bytes()
+            .iter()
+            .map(|b| b.count_ones() as usize)
+            .sum();
+        assert_eq!(ones, super::NR_CPUS);
     }
 }

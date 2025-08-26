@@ -3,6 +3,7 @@
 use crate::fd::{FdEnabledSubsystem, TypedFd};
 use crate::path;
 
+use alloc::vec::Vec;
 use bitflags::bitflags;
 
 use core::ffi::c_uint;
@@ -20,7 +21,7 @@ mod tests;
 
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError,
-    ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError, WriteError,
+    ReadDirError, ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -106,6 +107,11 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
 
     /// Remove a directory
     fn rmdir(&self, path: impl path::Arg) -> Result<(), RmdirError>;
+
+    /// Read directory entries from a directory file descriptor.
+    ///
+    /// Returns a list of file/directory names (explicitly _not_ including `.` or `..`).
+    fn read_dir(&self, fd: &TypedFd<Self>) -> Result<Vec<DirEntry>, ReadDirError>;
 
     /// Obtain the status of a file/directory/... on the file-system.
     fn file_status(&self, path: impl path::Arg) -> Result<FileStatus, FileStatusError>;
@@ -200,7 +206,7 @@ bitflags! {
 /// Types of files on a file-system.
 ///
 /// See [`FileSystem::file_status`].
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 #[non_exhaustive]
 pub enum FileType {
     RegularFile,
@@ -329,6 +335,15 @@ pub struct NodeInfo {
     pub ino: usize,
     /// Device that is being referred to (will be `Some(...)` only if special file)
     pub rdev: Option<NonZeroUsize>,
+}
+
+/// Directory entries returned by [`FileSystem::read_dir`]
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct DirEntry {
+    pub name: alloc::string::String,
+    pub file_type: FileType,
+    pub ino_info: Option<NodeInfo>,
 }
 
 impl UserInfo {

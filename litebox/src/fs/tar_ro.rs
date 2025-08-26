@@ -24,15 +24,22 @@
 use alloc::borrow::ToOwned as _;
 use alloc::string::String;
 use alloc::vec::Vec;
+use hashbrown::HashMap;
 use tar_no_std::TarArchive;
 
-use crate::{LiteBox, path::Arg as _, sync, utilities::anymap::AnyMap};
+use crate::{
+    LiteBox,
+    fs::{DirEntry, FileType},
+    path::Arg as _,
+    sync,
+    utilities::anymap::AnyMap,
+};
 
 use super::{
     Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     errors::{
-        ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadError,
-        RmdirError, SeekError, UnlinkError, WriteError,
+        ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadDirError,
+        ReadError, RmdirError, SeekError, UnlinkError, WriteError,
     },
 };
 
@@ -106,6 +113,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
 impl<Platform: sync::RawSyncPrimitivesProvider> super::private::Sealed for FileSystem<Platform> {}
 
 fn contains_dir(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
     assert!(!needle.ends_with('/'));
     haystack.starts_with(needle) && haystack.as_bytes().get(needle.len()) == Some(&b'/')
 }
@@ -118,11 +128,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         _mode: Mode,
     ) -> Result<FileFd<Platform>, OpenError> {
         use super::OFlags;
-        let currently_supported_oflags: OFlags = OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR;
-        if flags.contains(currently_supported_oflags.complement()) {
+        let currently_supported_oflags: OFlags = OFlags::RDONLY
+            | OFlags::WRONLY
+            | OFlags::RDWR
+            | OFlags::NOCTTY
+            | OFlags::DIRECTORY
+            | OFlags::NONBLOCK;
+        if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!()
         }
         let path = self.absolute_path(path)?;
+        if path.is_empty() {
+            // We are at the root directory, we should just return early.
+            return Ok(self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
+                path: path.clone(),
+                metadata: AnyMap::new(),
+            }));
+        }
         assert!(path.starts_with('/'));
         let path = &path[1..];
         let Some((idx, entry)) =
@@ -144,6 +166,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         assert!(flags.contains(OFlags::RDONLY));
         if entry.filename().as_str().unwrap() == path {
             // it is a file
+            if flags.contains(OFlags::DIRECTORY) {
+                return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+            }
             Ok(self
                 .litebox
                 .descriptor_table_mut()
@@ -307,6 +332,77 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Err(RmdirError::ReadOnlyFileSystem)
     }
 
+    fn read_dir(&self, fd: &FileFd<Platform>) -> Result<Vec<DirEntry>, ReadDirError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let Descriptor::Dir { path, metadata: _ } = &descriptor_table.get_entry(fd).entry else {
+            return Err(ReadDirError::NotADirectory);
+        };
+        // Store into a hashmap to collapse together the entries we end up with for multiple files
+        // within a sub-dir.
+        let entries: HashMap<String, (FileType, usize)> = self
+            .tar_data
+            .entries()
+            .enumerate()
+            .map(|(idx, entry)| (idx, entry.filename()))
+            .filter_map(|(idx, p)| {
+                let p = p.as_str().ok()?;
+                contains_dir(p, path).then(|| {
+                    // Drop the directory path from `p`
+                    let suffix = p.trim_start_matches(path).trim_start_matches('/');
+                    // Then drop everything after the first `/`; if there is any then it was a dir,
+                    // otherwise it was a file.
+                    match suffix.split_once('/') {
+                        Some((dir, _)) => (
+                            String::from(dir),
+                            (FileType::Directory, TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER),
+                        ),
+                        None => (String::from(suffix), (FileType::RegularFile, idx + 1)), // ino starts at 1 (zero represents deleted file)
+                    }
+                })
+            })
+            .collect();
+
+        // Add "." and ".." entries first.
+        // In this read-only tar FS we don't maintain distinct inode numbers per-dir,
+        // so use the same directory inode constant for directories (including root).
+        let mut out: Vec<DirEntry> = Vec::new();
+
+        out.push(DirEntry {
+            name: ".".into(),
+            file_type: FileType::Directory,
+            ino_info: Some(NodeInfo {
+                dev: DEVICE_ID,
+                ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                rdev: None,
+            }),
+        });
+
+        out.push(DirEntry {
+            name: "..".into(),
+            file_type: FileType::Directory,
+            ino_info: Some(NodeInfo {
+                dev: DEVICE_ID,
+                ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                rdev: None,
+            }),
+        });
+
+        out.extend(
+            entries
+                .into_iter()
+                .map(|(name, (file_type, ino))| DirEntry {
+                    name,
+                    file_type,
+                    ino_info: Some(NodeInfo {
+                        dev: DEVICE_ID,
+                        ino,
+                        rdev: None,
+                    }),
+                }),
+        );
+        Ok(out)
+    }
+
     fn file_status(
         &self,
         path: impl crate::path::Arg,
@@ -340,7 +436,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 owner: owner_from_posix_header(p.posix_header()),
                 node_info: NodeInfo {
                     dev: DEVICE_ID,
-                    ino: idx,
+                    // ino starts at 1 (zero represents deleted file)
+                    ino: idx + 1,
                     rdev: None,
                 },
                 blksize: BLOCK_SIZE,
@@ -362,7 +459,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     owner: owner_from_posix_header(entry.posix_header()),
                     node_info: NodeInfo {
                         dev: DEVICE_ID,
-                        ino: *idx,
+                        // ino starts at 1 (zero represents deleted file)
+                        ino: *idx + 1,
                         rdev: None,
                     },
                     blksize: BLOCK_SIZE,
@@ -385,18 +483,26 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn with_metadata<T: core::any::Any, R>(
         &self,
-        _fd: &FileFd<Platform>,
-        _f: impl FnOnce(&T) -> R,
+        fd: &FileFd<Platform>,
+        f: impl FnOnce(&T) -> R,
     ) -> Result<R, super::errors::MetadataError> {
-        Err(super::errors::MetadataError::NoSuchMetadata)
+        match &self.litebox.descriptor_table().get_entry(fd).entry {
+            Descriptor::File { metadata, .. } | Descriptor::Dir { metadata, .. } => Ok(f(metadata
+                .get::<T>()
+                .ok_or(super::errors::MetadataError::NoSuchMetadata)?)),
+        }
     }
 
     fn with_metadata_mut<T: core::any::Any, R>(
         &self,
-        _fd: &FileFd<Platform>,
-        _f: impl FnOnce(&mut T) -> R,
+        fd: &FileFd<Platform>,
+        f: impl FnOnce(&mut T) -> R,
     ) -> Result<R, super::errors::MetadataError> {
-        Err(super::errors::MetadataError::NoSuchMetadata)
+        match &mut self.litebox.descriptor_table().get_entry_mut(fd).entry {
+            Descriptor::File { metadata, .. } | Descriptor::Dir { metadata, .. } => Ok(f(metadata
+                .get_mut::<T>()
+                .ok_or(super::errors::MetadataError::NoSuchMetadata)?)),
+        }
     }
 
     fn set_file_metadata<T: core::any::Any>(
@@ -459,10 +565,6 @@ enum Descriptor {
         metadata: AnyMap,
     },
     Dir {
-        #[expect(
-            dead_code,
-            reason = "mostly used for debugging; we might consider removing this in the future"
-        )]
         path: String,
         metadata: AnyMap,
     },

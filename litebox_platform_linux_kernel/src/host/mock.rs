@@ -1,5 +1,7 @@
 use core::sync::atomic::AtomicU32;
 
+use litebox::utils::ReinterpretUnsignedExt as _;
+
 use crate::HostInterface;
 
 pub struct MockHostInterface {}
@@ -25,22 +27,23 @@ impl HostInterface for MockHostInterface {
             core::cmp::max(layout.align(), 0x1000) << 1,
         );
         let addr = unsafe {
-            libc::mmap(
-                core::ptr::null_mut(),
+            syscalls::syscall6(
+                syscalls::Sysno::mmap,
+                0,
                 size << 1,
-                litebox_common_linux::ProtFlags::PROT_READ_WRITE.bits(),
+                litebox_common_linux::ProtFlags::PROT_READ_WRITE
+                    .bits()
+                    .reinterpret_as_unsigned() as usize,
                 (litebox_common_linux::MapFlags::MAP_PRIVATE
                     | litebox_common_linux::MapFlags::MAP_ANON)
-                    .bits(),
-                -1,
+                    .bits()
+                    .reinterpret_as_unsigned() as usize,
+                usize::MAX,
                 0,
             )
-        };
-        if addr == libc::MAP_FAILED {
-            None
-        } else {
-            Some((addr as usize, size << 1))
         }
+        .ok()?;
+        Some((addr, size << 1))
     }
 
     unsafe fn free(_addr: usize) {
@@ -60,11 +63,14 @@ impl HostInterface for MockHostInterface {
     }
 
     fn log(msg: &str) {
-        unsafe { libc::write(libc::STDOUT_FILENO, msg.as_ptr().cast(), msg.len()) };
-    }
-
-    fn exit() -> ! {
-        todo!()
+        let _ = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::write,
+                litebox_common_linux::STDERR_FILENO as usize,
+                msg.as_ptr() as usize,
+                msg.len(),
+            )
+        };
     }
 
     fn wake_many(_mutex: &AtomicU32, _n: usize) -> Result<usize, crate::Errno> {
@@ -84,6 +90,25 @@ impl HostInterface for MockHostInterface {
         _set: Option<crate::ptr::UserConstPtr<litebox_common_linux::SigSet>>,
         _old_set: Option<crate::ptr::UserMutPtr<litebox_common_linux::SigSet>>,
     ) -> Result<usize, crate::Errno> {
+        todo!()
+    }
+
+    fn read_from_stdin(_buf: &mut [u8]) -> Result<usize, litebox_common_linux::errno::Errno> {
+        todo!()
+    }
+
+    fn write_to(
+        _stream: litebox::platform::StdioOutStream,
+        _buf: &[u8],
+    ) -> Result<usize, litebox_common_linux::errno::Errno> {
+        todo!()
+    }
+
+    fn return_to_host() -> ! {
+        todo!()
+    }
+
+    fn terminate_process(_code: i32) -> ! {
         todo!()
     }
 }

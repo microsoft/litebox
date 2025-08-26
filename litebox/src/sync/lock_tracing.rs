@@ -306,15 +306,15 @@ impl<Platform: RawSyncPrimitivesProvider> LockTrackerX<Platform> {
                     width = tracker.as_ref().unwrap().active(),
                 );
             }
-        } else if let Some(t) = contended {
-            if CONFIG_PRINT_CONTENDED_LOCKS {
-                debug_log_println!(
-                    tracker.as_ref().unwrap().platform,
-                    "[LOCKTRACER{blank:.<width$}] Attempt on {locked} is CONTENDED at {t}",
-                    blank = "",
-                    width = tracker.as_ref().unwrap().active(),
-                );
-            }
+        } else if let Some(t) = contended
+            && CONFIG_PRINT_CONTENDED_LOCKS
+        {
+            debug_log_println!(
+                tracker.as_ref().unwrap().platform,
+                "[LOCKTRACER{blank:.<width$}] Attempt on {locked} is CONTENDED at {t}",
+                blank = "",
+                width = tracker.as_ref().unwrap().active(),
+            );
         }
         LockAttemptWitness {
             locked,

@@ -13,6 +13,7 @@ use litebox::{
 use syscalls::Sysno;
 
 pub mod errno;
+pub mod mm;
 
 extern crate alloc;
 
@@ -26,6 +27,12 @@ pub const STDERR_FILENO: i32 = 2;
 pub const FUTEX_WAIT: i32 = 0;
 pub const FUTEX_WAKE: i32 = 1;
 pub const FUTEX_REQUEUE: i32 = 3;
+
+// linux/time.h
+pub const CLOCK_REALTIME: i32 = 0;
+pub const CLOCK_MONOTONIC: i32 = 1;
+pub const CLOCK_REALTIME_COARSE: i32 = 5;
+pub const CLOCK_MONOTONIC_COARSE: i32 = 6;
 
 /// Encoding for ioctl commands.
 pub mod ioctl {
@@ -224,6 +231,37 @@ impl From<litebox::fs::FileType> for InodeType {
     }
 }
 
+#[repr(u8)]
+pub enum DirentType {
+    /// Unknown
+    Unknown = 0,
+    /// FIFO (named pipe)
+    NamedPipe = 1,
+    /// Character device
+    CharDevice = 2,
+    /// Directory
+    Directory = 4,
+    /// Block device
+    BlockDevice = 6,
+    /// Regular file
+    Regular = 8,
+    /// Symbolic link
+    SymLink = 10,
+    /// Socket
+    Socket = 12,
+}
+
+impl From<litebox::fs::FileType> for DirentType {
+    fn from(value: litebox::fs::FileType) -> Self {
+        match value {
+            litebox::fs::FileType::RegularFile => DirentType::Regular,
+            litebox::fs::FileType::Directory => DirentType::Directory,
+            litebox::fs::FileType::CharacterDevice => DirentType::CharDevice,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 /// Linux's `stat` struct
 #[cfg(target_arch = "x86_64")]
 #[repr(C, packed)]
@@ -381,7 +419,9 @@ impl From<litebox::fs::FileStatus> for FileStat {
             st_ino: <_>::try_from(ino).unwrap(),
             st_nlink: 1,
             st_mode: (mode.bits() | InodeType::from(file_type) as u32).truncate(),
+            #[cfg_attr(target_arch = "x86", expect(clippy::useless_conversion))]
             st_uid: <_>::from(user),
+            #[cfg_attr(target_arch = "x86", expect(clippy::useless_conversion))]
             st_gid: <_>::from(group),
             st_rdev: rdev
                 .map(|r| <_>::try_from(r.get()).unwrap())
@@ -640,16 +680,54 @@ cfg_if::cfg_if! {
     }
 }
 
-// From libc crate's `timespec` definition.
-//
-// linux x32 compatibility
-// See https://sourceware.org/bugzilla/show_bug.cgi?id=16437
-pub struct timespec {
-    pub tv_sec: time_t,
-    #[cfg(all(target_arch = "x86_64", target_pointer_width = "32"))]
-    pub tv_nsec: i64,
-    #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "32")))]
-    pub tv_nsec: isize,
+/// timespec from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/include/uapi/linux/time_types.h#L7)
+#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq)]
+#[repr(C)]
+pub struct Timespec {
+    /// Seconds.
+    pub tv_sec: i64,
+
+    /// Nanoseconds. Must be less than 1_000_000_000.
+    pub tv_nsec: u64,
+}
+
+impl Timespec {
+    /// Subtract another `Timespec` from self
+    pub fn sub_timespec(&self, other: &Timespec) -> Result<core::time::Duration, errno::Errno> {
+        if self >= other {
+            let (secs, nsec) = if self.tv_nsec >= other.tv_nsec {
+                (
+                    self.tv_sec
+                        .checked_sub(other.tv_sec)
+                        .ok_or(errno::Errno::EDOM)?,
+                    self.tv_nsec - other.tv_nsec,
+                )
+            } else {
+                (
+                    self.tv_sec
+                        .checked_sub(other.tv_sec + 1)
+                        .ok_or(errno::Errno::EDOM)?,
+                    self.tv_nsec + 1_000_000_000 - other.tv_nsec,
+                )
+            };
+
+            Ok(core::time::Duration::new(
+                u64::try_from(secs).map_err(|_| errno::Errno::EDOM)?,
+                nsec.truncate(),
+            ))
+        } else {
+            Err(errno::Errno::EINVAL)
+        }
+    }
+}
+
+impl From<Timespec> for core::time::Duration {
+    fn from(timespec: Timespec) -> Self {
+        core::time::Duration::new(
+            u64::try_from(timespec.tv_sec).unwrap(),
+            timespec.tv_nsec.truncate(),
+        )
+    }
 }
 
 #[repr(C)]
@@ -672,6 +750,38 @@ impl TryFrom<TimeVal> for core::time::Duration {
                 u64::try_from(value.tv_sec).map_err(|_| errno::Errno::EDOM)?,
                 u32::try_from(value.tv_usec * 1000).map_err(|_| errno::Errno::EDOM)?,
             ))
+        }
+    }
+}
+
+impl From<Timespec> for TimeVal {
+    fn from(timespec: Timespec) -> Self {
+        // Convert seconds to time_t
+        let timeval_sec = timespec.tv_sec as time_t;
+
+        // Convert nanoseconds to microseconds, ensuring we don't overflow suseconds_t
+        let microseconds = timespec.tv_nsec / 1_000;
+        let timeval_u_sec = suseconds_t::try_from(microseconds).unwrap_or(suseconds_t::MAX);
+        TimeVal {
+            tv_sec: timeval_sec,
+            tv_usec: timeval_u_sec,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TimeZone {
+    tz_minuteswest: i32,
+    tz_dsttime: i32,
+}
+
+impl TimeZone {
+    /// Create a new TimeZone with the given minutes west of UTC and DST time flag
+    pub fn new(tz_minuteswest: i32, tz_dsttime: i32) -> Self {
+        Self {
+            tz_minuteswest,
+            tz_dsttime,
         }
     }
 }
@@ -1064,6 +1174,8 @@ impl<Platform: litebox::platform::RawPointerProvider> ThreadLocalStorage<Platfor
 pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     /// Process ID
     pub pid: i32,
+    /// Parent Process ID
+    pub ppid: i32,
     /// Thread ID
     pub tid: i32,
     /// When a thread whose `clear_child_tid` is not `None` terminates, and it shares memory with other threads,
@@ -1324,6 +1436,26 @@ pub struct CapData {
     pub inheritable: u32,
 }
 
+#[repr(C)]
+#[derive(Clone)]
+pub struct LinuxDirent64 {
+    /// Inode number
+    pub ino: u64,
+    /// Filesystem-specific value with no specific meaning to user space.
+    /// We use it to locate a directory entry
+    pub off: u64,
+    /// Length of this dirent (including the following name and padding)
+    pub len: u16,
+    /// File type
+    pub typ: u8,
+    /// File name (null-terminated)
+    ///
+    /// This is a flexible array member (FAM) with variable length. The actual name data
+    /// follows immediately after this struct in memory.
+    #[allow(clippy::pub_underscore_fields)]
+    pub __name: [u8; 0],
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
@@ -1568,6 +1700,21 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     SetThreadArea {
         user_desc: Platform::RawMutPointer<UserDesc>,
     },
+    ClockGettime {
+        clockid: i32,
+        tp: Platform::RawMutPointer<Timespec>,
+    },
+    ClockGetres {
+        clockid: i32,
+        res: Platform::RawMutPointer<Timespec>,
+    },
+    Gettimeofday {
+        tv: Platform::RawMutPointer<TimeVal>,
+        tz: Platform::RawMutPointer<TimeZone>,
+    },
+    Time {
+        tloc: Platform::RawMutPointer<time_t>,
+    },
     Getrlimit {
         resource: RlimitResource,
         rlim: Platform::RawMutPointer<Rlimit>,
@@ -1605,6 +1752,7 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         flags: RngFlags,
     },
     Getpid,
+    Getppid,
     Getuid,
     Geteuid,
     Getgid,
@@ -1615,6 +1763,16 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     CapGet {
         header: Platform::RawMutPointer<CapHeader>,
         data: Option<Platform::RawMutPointer<CapData>>,
+    },
+    GetDirent64 {
+        fd: i32,
+        dirp: Platform::RawMutPointer<u8>,
+        count: usize,
+    },
+    SchedGetAffinity {
+        pid: Option<i32>,
+        len: usize,
+        mask: Platform::RawMutPointer<u8>,
     },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
@@ -1969,6 +2127,21 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
                 bufsiz: ctx.syscall_arg(3),
             },
+            Sysno::gettimeofday => SyscallRequest::Gettimeofday {
+                tv: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
+                tz: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+            },
+            Sysno::clock_gettime => SyscallRequest::ClockGettime {
+                clockid: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                tp: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+            },
+            Sysno::clock_getres => SyscallRequest::ClockGetres {
+                clockid: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                res: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+            },
+            Sysno::time => SyscallRequest::Time {
+                tloc: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
+            },
             #[cfg(target_arch = "x86_64")]
             Sysno::getrlimit => {
                 let resource: i32 = ctx.syscall_arg(0).reinterpret_as_signed().truncate();
@@ -2029,6 +2202,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 }
             }
             Sysno::getpid => SyscallRequest::Getpid,
+            Sysno::getppid => SyscallRequest::Getppid,
             Sysno::getuid => SyscallRequest::Getuid,
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
@@ -2191,7 +2365,21 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     },
                 }
             }
-            Sysno::statx | Sysno::io_uring_setup | Sysno::rseq => {
+            Sysno::getdents64 => SyscallRequest::GetDirent64 {
+                fd: ctx.syscall_arg(0).reinterpret_as_signed().truncate(),
+                dirp: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
+                count: ctx.syscall_arg(2),
+            },
+            Sysno::sched_getaffinity => {
+                let pid = ctx.syscall_arg(0).reinterpret_as_signed().truncate();
+                SyscallRequest::SchedGetAffinity {
+                    pid: if pid == 0 { None } else { Some(pid) },
+                    len: ctx.syscall_arg(1),
+                    mask: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
+                }
+            }
+            // TODO: support syscall `statfs`
+            Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 SyscallRequest::Ret(errno::Errno::ENOSYS)
             }
             _ => unimplemented!("Translation for {sysno} is not (yet) currently supported"),
@@ -2248,6 +2436,17 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
     },
     WakeByAddress {
         addr: Platform::RawMutPointer<i32>,
+    },
+    ClockGettime {
+        clockid: i32,
+        tp: Platform::RawMutPointer<Timespec>,
+    },
+    Gettimeofday {
+        tv: Platform::RawMutPointer<TimeVal>,
+        tz: Platform::RawMutPointer<TimeZone>,
+    },
+    Time {
+        tloc: Platform::RawMutPointer<time_t>,
     },
 }
 

@@ -218,6 +218,7 @@ struct TrampolineSection {
     trampoline_size: u64,
 }
 
+#[derive(Debug)]
 struct TrampolineHdr {
     /// The virtual memory of the trampoline code.
     vaddr: usize,
@@ -246,7 +247,7 @@ fn get_trampoline_hdr(object: &mut ElfFile) -> Option<TrampolineHdr> {
     let trampoline_shdr: &Shdr = unsafe { &*(buf.as_ptr().cast()) };
     let trampoline_shdr_flags: u32 = trampoline_shdr.sh_flags.truncate();
     if trampoline_shdr.sh_type != elf::abi::SHT_PROGBITS
-        || trampoline_shdr_flags != elf::abi::SHF_ALLOC | elf::abi::SHF_EXECINSTR
+        || trampoline_shdr_flags != elf::abi::SHF_ALLOC
     {
         return None;
     }
@@ -280,12 +281,18 @@ fn get_trampoline_hdr(object: &mut ElfFile) -> Option<TrampolineHdr> {
 fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize {
     // Our rewriter ensures that both `trampoline.vaddr` and `trampoline.file_offset` are page-aligned.
     // Otherwise, `ElfLoaderMmap::mmap` will fail and panic.
+    #[cfg(debug_assertions)]
+    litebox::log_println!(
+        litebox_platform_multiplex::platform(),
+        "Loading trampoline {:?}",
+        trampoline
+    );
     assert!(
-        trampoline.vaddr % PAGE_SIZE == 0,
+        trampoline.vaddr.is_multiple_of(PAGE_SIZE),
         "trampoline address must be page-aligned"
     );
     assert!(
-        trampoline.file_offset % PAGE_SIZE == 0,
+        trampoline.file_offset.is_multiple_of(PAGE_SIZE),
         "trampoline file offset must be page-aligned"
     );
     let start_addr = relo_off + trampoline.vaddr;

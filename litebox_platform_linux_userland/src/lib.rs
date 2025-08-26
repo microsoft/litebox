@@ -21,8 +21,19 @@ mod syscall_intercept;
 
 extern crate alloc;
 
+cfg_if::cfg_if! {
+    if #[cfg(feature = "linux_syscall")] {
+        use litebox_common_linux::SyscallRequest;
+        pub type SyscallReturnType = isize;
+    } else if #[cfg(feature = "optee_syscall")] {
+        use litebox_common_optee::SyscallRequest;
+        pub type SyscallReturnType = u32;
+    } else {
+        compile_error!(r##"No syscall handler specified."##);
+    }
+}
 /// Connector to a shim-exposed syscall-handling interface.
-pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<LinuxUserland>) -> isize;
+pub type SyscallHandler = fn(SyscallRequest<LinuxUserland>) -> SyscallReturnType;
 
 /// The syscall handler passed down from the shim.
 static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
@@ -244,10 +255,10 @@ impl LinuxUserland {
 
             // Check if the line corresponds to the vdso
             // Alternatively, we could read it from `/proc/self/auxv`
-            if let Some(last) = parts.last() {
-                if *last == "[vdso]" {
-                    vdso_address = Some(start);
-                }
+            if let Some(last) = parts.last()
+                && *last == "[vdso]"
+            {
+                vdso_address = Some(start);
             }
         }
         (reserved_pages, vdso_address)
@@ -269,9 +280,13 @@ impl LinuxUserland {
         let tid =
             unsafe { syscalls::syscall!(syscalls::Sysno::gettid) }.expect("Failed to get TID");
         let tid: i32 = i32::try_from(tid).expect("tid should fit in i32");
+        let ppid =
+            unsafe { syscalls::syscall!(syscalls::Sysno::getppid) }.expect("Failed to get PPID");
+        let ppid: i32 = i32::try_from(ppid).expect("ppid should fit in i32");
         let task = alloc::boxed::Box::new(litebox_common_linux::Task {
             pid: tid,
             tid,
+            ppid,
             clear_child_tid: None,
             robust_list: None,
             credentials: alloc::sync::Arc::new(Self::get_user_info()),
@@ -525,9 +540,6 @@ impl litebox::platform::RawMutexProvider for LinuxUserland {
     }
 }
 
-// This raw-mutex design takes up more space than absolutely ideal and may possibly be optimized if
-// we can allow for spurious wake-ups. However, the current design makes sure that spurious wake-ups
-// do not actually occur, and that something that is `block`ed can only be woken up by a `wake`.
 pub struct RawMutex {
     // The `inner` is the value shown to the outside world as an underlying atomic.
     inner: AtomicU32,
@@ -574,9 +586,7 @@ impl RawMutex {
                 /* ignored */ 0,
             ) {
                 Ok(0) => {
-                    if self.inner.load(SeqCst) != val {
-                        return Ok(UnblockedOrTimedOut::Unblocked);
-                    }
+                    return Ok(UnblockedOrTimedOut::Unblocked);
                 }
                 Err(syscalls::Errno::EAGAIN) => {
                     if self.inner.load(SeqCst) != val {
@@ -694,19 +704,32 @@ impl litebox::platform::TimeProvider for LinuxUserland {
     type Instant = Instant;
 
     fn now(&self) -> Self::Instant {
+        let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, t.as_mut_ptr()) };
+        let t = unsafe { t.assume_init() };
         Instant {
-            inner: std::time::Instant::now(),
+            #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
+            inner: litebox_common_linux::Timespec {
+                tv_sec: i64::from(t.tv_sec),
+                tv_nsec: u64::from(t.tv_nsec.reinterpret_as_unsigned()),
+            },
         }
     }
 }
 
 pub struct Instant {
-    inner: std::time::Instant,
+    inner: litebox_common_linux::Timespec,
 }
 
 impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
-        self.inner.checked_duration_since(earlier.inner)
+        self.inner.sub_timespec(&earlier.inner).ok()
+    }
+}
+
+impl From<litebox_common_linux::Timespec> for Instant {
+    fn from(inner: litebox_common_linux::Timespec) -> Self {
+        Instant { inner }
     }
 }
 
@@ -733,6 +756,7 @@ pub struct PunchthroughToken {
 
 impl litebox::platform::PunchthroughToken for PunchthroughToken {
     type Punchthrough = PunchthroughSyscall<LinuxUserland>;
+    #[expect(clippy::too_many_lines)]
     fn execute(
         self,
     ) -> Result<
@@ -844,6 +868,11 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 _ => panic!("unexpected error {err}"),
             })
             .map_err(litebox::platform::PunchthroughError::Failure),
+            PunchthroughSyscall::ClockGettime { .. }
+            | PunchthroughSyscall::Gettimeofday { .. }
+            | PunchthroughSyscall::Time { .. } => {
+                unreachable!("Due to the vDSO, this would not be triggered on LinuxUserland.");
+            }
         }
     }
 }
@@ -911,7 +940,7 @@ fn futex_timeout(
             .unwrap()
             .try_into()
             .unwrap();
-        litebox_common_linux::timespec { tv_sec, tv_nsec }
+        litebox_common_linux::Timespec { tv_sec, tv_nsec }
     });
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
     unsafe {
@@ -977,6 +1006,12 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
 }
 
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for LinuxUserland {
+    const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
+    #[cfg(target_arch = "x86_64")]
+    const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+    #[cfg(target_arch = "x86")]
+    const TASK_ADDR_MAX: usize = 0xC000_0000; // 3 GiB (see arch/x86/include/asm/page_32_types.h)
+
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
@@ -1096,13 +1131,19 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 
 impl litebox::platform::StdioProvider for LinuxUserland {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
-        use std::io::Read as _;
-        std::io::stdin().read(buf).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::BrokenPipe {
-                litebox::platform::StdioReadError::Closed
-            } else {
-                panic!("unhandled error {err}")
-            }
+        unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::read,
+                usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap(),
+                buf.as_ptr() as usize,
+                buf.len(),
+                // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                syscall_intercept::SYSCALL_ARG_MAGIC,
+            )
+        }
+        .map_err(|err| match err {
+            syscalls::Errno::EPIPE => litebox::platform::StdioReadError::Closed,
+            _ => panic!("unhandled error {err}"),
         })
     }
 
@@ -1111,7 +1152,7 @@ impl litebox::platform::StdioProvider for LinuxUserland {
         stream: litebox::platform::StdioOutStream,
         buf: &[u8],
     ) -> Result<usize, litebox::platform::StdioWriteError> {
-        match unsafe {
+        unsafe {
             syscalls::syscall4(
                 syscalls::Sysno::write,
                 usize::try_from(match stream {
@@ -1128,11 +1169,11 @@ impl litebox::platform::StdioProvider for LinuxUserland {
                 // Unused by the syscall but would be checked by Seccomp filter if enabled.
                 syscall_intercept::SYSCALL_ARG_MAGIC,
             )
-        } {
-            Ok(n) => Ok(n),
-            Err(syscalls::Errno::EPIPE) => Err(litebox::platform::StdioWriteError::Closed),
-            Err(err) => panic!("unhandled error {err}"),
         }
+        .map_err(|err| match err {
+            syscalls::Errno::EPIPE => litebox::platform::StdioWriteError::Closed,
+            _ => panic!("unhandled error {err}"),
+        })
     }
 
     fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {
@@ -1351,14 +1392,15 @@ unsafe extern "C" {
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
+#[allow(clippy::cast_sign_loss)]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_handler(
     syscall_number: usize,
     ctx: *mut litebox_common_linux::PtRegs,
-) -> isize {
+) -> SyscallReturnType {
     // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
     let ctx = unsafe { &mut *ctx };
-    match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
+    match SyscallRequest::try_from_raw(syscall_number, ctx) {
         Ok(d) => {
             let syscall_handler: SyscallHandler = SYSCALL_HANDLER
                 .read()
@@ -1366,7 +1408,7 @@ unsafe extern "C" fn syscall_handler(
                 .expect("Should have run `register_syscall_handler` by now");
             syscall_handler(d)
         }
-        Err(err) => err.as_neg() as isize,
+        Err(err) => err.as_neg() as SyscallReturnType,
     }
 }
 

@@ -11,9 +11,10 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError,
-    PathError, ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError, WriteError,
+    PathError, ReadDirError, ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError,
+    WriteError,
 };
-use super::{FileStatus, Mode, NodeInfo, SeekWhence, UserInfo};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, UserInfo};
 use crate::utilities::anymap::AnyMap;
 
 /// Just a random constant that is distinct from other file systems. In this case, it is
@@ -134,13 +135,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn open(
         &self,
         path: impl crate::path::Arg,
-        flags: super::OFlags,
+        mut flags: super::OFlags,
         mode: super::Mode,
     ) -> Result<FileFd<Platform>, OpenError> {
         use super::OFlags;
-        let currently_supported_oflags: OFlags =
-            OFlags::CREAT | OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR;
-        if flags.contains(currently_supported_oflags.complement()) {
+        let currently_supported_oflags: OFlags = OFlags::CREAT
+            | OFlags::RDONLY
+            | OFlags::WRONLY
+            | OFlags::RDWR
+            | OFlags::NOCTTY
+            | OFlags::DIRECTORY
+            | OFlags::NONBLOCK;
+        if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!()
         }
         let path = self.absolute_path(path)?;
@@ -160,7 +166,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 if !self.current_user.can_write(&parent.perms) {
                     return Err(OpenError::NoWritePerms);
                 }
-                parent.children_count = parent.children_count.checked_add(1).unwrap();
+                // When both O_CREAT and O_DIRECTORY are specified in flags and the
+                // file specified by pathname does not exist, open() will create a
+                // regular file (i.e., O_DIRECTORY is ignored).
+                flags.remove(OFlags::DIRECTORY);
+                let old = parent.children.insert(
+                    path.components().unwrap().last().unwrap().into(),
+                    FileType::RegularFile,
+                );
+                assert!(old.is_none());
                 let entry = Entry::File(Arc::new(self.litebox.sync().new_rwlock(FileX {
                     perms: Permissions {
                         mode,
@@ -199,16 +213,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             false
         };
         match entry {
-            Entry::File(file) => Ok(self
-                .litebox
-                .descriptor_table_mut()
-                .insert(Descriptor::File {
-                    file: file.clone(),
-                    read_allowed,
-                    write_allowed,
-                    position: 0,
-                    metadata: AnyMap::new(),
-                })),
+            Entry::File(file) => {
+                if flags.contains(OFlags::DIRECTORY) {
+                    return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+                }
+                Ok(self
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert(Descriptor::File {
+                        file: file.clone(),
+                        read_allowed,
+                        write_allowed,
+                        position: 0,
+                        metadata: AnyMap::new(),
+                    }))
+            }
             Entry::Dir(dir) => Ok(self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
                 dir: dir.clone(),
                 metadata: AnyMap::new(),
@@ -416,7 +435,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         if !self.current_user.can_write(&parent.perms) {
             return Err(UnlinkError::NoWritePerms);
         }
-        parent.children_count = parent.children_count.checked_sub(1).unwrap();
+        let removed = parent
+            .children
+            .remove(path.components().unwrap().last().unwrap());
+        // Just a sanity check
+        assert!(matches!(removed, Some(FileType::RegularFile)));
         let removed = root.entries.remove(&path).unwrap();
         // Just a sanity check
         assert!(matches!(removed, Entry::File(File { .. })));
@@ -438,7 +461,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         if !self.current_user.can_write(&parent.perms) {
             return Err(MkdirError::NoWritePerms);
         }
-        parent.children_count = parent.children_count.checked_add(1).unwrap();
+        let old = parent.children.insert(
+            path.components().unwrap().last().unwrap().into(),
+            FileType::Directory,
+        );
+        assert!(old.is_none());
         let old = root.entries.insert(
             path,
             Entry::Dir(Arc::new(self.litebox.sync().new_rwlock(DirX {
@@ -446,7 +473,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     mode,
                     userinfo: self.current_user,
                 },
-                children_count: 0,
+                children: HashMap::default(),
                 metadata: AnyMap::new(),
                 unique_id: self.fresh_id(),
             }))),
@@ -469,18 +496,92 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let Entry::Dir(dir) = entry else {
             return Err(RmdirError::NotADirectory);
         };
-        if dir.read().children_count > 0 {
+        if !dir.read().children.is_empty() {
             return Err(RmdirError::NotEmpty);
         }
         let mut parent = parent.write();
         if !self.current_user.can_write(&parent.perms) {
             return Err(RmdirError::NoWritePerms);
         }
-        parent.children_count = parent.children_count.checked_sub(1).unwrap();
+        let removed = parent
+            .children
+            .remove(path.components().unwrap().last().unwrap());
+        // Just a sanity check
+        assert!(matches!(removed, Some(FileType::Directory)));
         let removed = root.entries.remove(&path).unwrap();
         // Just a sanity check
         assert!(matches!(removed, Entry::Dir(_)));
         Ok(())
+    }
+
+    fn read_dir(&self, fd: &FileFd<Platform>) -> Result<Vec<DirEntry>, ReadDirError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let Descriptor::Dir { dir, metadata: _ } = &descriptor_table.get_entry(fd).entry else {
+            return Err(ReadDirError::NotADirectory);
+        };
+
+        // find the directory path in the root entries by pointer-equality of the Arc
+        let mut parent_path = {
+            let root = self.root.read();
+            root.entries
+                .iter()
+                .find_map(|(path, entry)| match entry {
+                    Entry::Dir(d) if alloc::sync::Arc::ptr_eq(d, dir) => Some(path.clone()),
+                    _ => None,
+                })
+                .unwrap_or(String::new())
+        };
+
+        // helper to get NodeInfo by an entries-key (entries keys have no trailing '/')
+        let get_node_info = |key: &str| -> Option<NodeInfo> {
+            self.root.read().entries.get(key).map(|entry| {
+                let ino = match entry {
+                    Entry::File(file) => file.read().unique_id,
+                    Entry::Dir(dir) => dir.read().unique_id,
+                };
+                NodeInfo {
+                    dev: DEVICE_ID,
+                    ino,
+                    rdev: None,
+                }
+            })
+        };
+
+        let mut entries: Vec<DirEntry> = Vec::new();
+
+        // Add "."
+        entries.push(DirEntry {
+            name: ".".into(),
+            file_type: FileType::Directory,
+            ino_info: Some(NodeInfo {
+                dev: DEVICE_ID,
+                ino: dir.read().unique_id,
+                rdev: None,
+            }),
+        });
+
+        // Add ".."
+        entries.push(DirEntry {
+            name: "..".into(),
+            file_type: FileType::Directory,
+            ino_info: get_node_info(&parent_path),
+        });
+
+        // Append a trailing '/' to `parent_path`.
+        // An empty string (`""`) represents the root.
+        parent_path.push('/');
+
+        // Add normal children
+        entries.extend(dir.read().children.iter().map(|(name, file_type)| {
+            let mut full_path = parent_path.clone();
+            full_path.push_str(name);
+            DirEntry {
+                name: name.into(),
+                file_type: file_type.clone(),
+                ino_info: get_node_info(&full_path),
+            }
+        }));
+        Ok(entries)
     }
 
     fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {
@@ -659,7 +760,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
                         mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                         userinfo: UserInfo { user: 0, group: 0 },
                     },
-                    children_count: 0,
+                    children: HashMap::default(),
                     metadata: AnyMap::new(),
                     unique_id: 0,
                 }))),
@@ -673,7 +774,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
         &self,
         path: &str,
         current_user: UserInfo,
-    ) -> ParentAndEntry<Dir<Platform>, Entry<Platform>> {
+    ) -> ParentAndEntry<'_, Dir<Platform>, Entry<Platform>> {
         let mut real_components_seen = false;
         let mut collected = String::new();
         let mut parent_dir = None;
@@ -738,7 +839,7 @@ type Dir<Platform> = Arc<sync::RwLock<Platform, DirX>>;
 
 pub(crate) struct DirX {
     perms: Permissions,
-    children_count: u32,
+    children: HashMap<String, FileType>,
     metadata: AnyMap,
     unique_id: usize,
 }

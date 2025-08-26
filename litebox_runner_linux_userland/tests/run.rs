@@ -63,9 +63,11 @@ fn test_static_linked_prog_with_rewriter() {
 
     // rewrite the binary
     let _ = std::fs::remove_file(hooked_path.clone());
-    println!("Running `cargo run -p litebox_syscall_rewriter -- -o {} {}`",
-                hooked_path.to_str().unwrap(),
-                path.to_str().unwrap());
+    println!(
+        "Running `cargo run -p litebox_syscall_rewriter -- -o {} {}`",
+        hooked_path.to_str().unwrap(),
+        path.to_str().unwrap()
+    );
     let output = std::process::Command::new("cargo")
         .args([
             "run",
@@ -99,7 +101,8 @@ fn test_runner_with_dynamic_lib(
     target: &Path,
     cmd_args: &[&str],
     install_files: fn(PathBuf),
-) {
+    unique_name: &str,
+) -> Vec<u8> {
     let backend_str = match backend {
         Backend::Rewriter => "rewriter",
         Backend::Seccomp => "seccomp",
@@ -135,8 +138,13 @@ fn test_runner_with_dynamic_lib(
     };
 
     // create tar file containing all dependencies
-    let tar_dir = std::path::Path::new(dir_path.as_str()).join(format!("tar_files_{backend_str}"));
-    let dirs_to_create = ["lib64", "lib/x86_64-linux-gnu", "lib32", "usr/lib/python3.10"];
+    let tar_dir = std::path::Path::new(dir_path.as_str()).join(format!("tar_files_{unique_name}"));
+    let dirs_to_create = [
+        "lib64",
+        "lib/x86_64-linux-gnu",
+        "lib32",
+        "usr/lib/python3.10",
+    ];
     for dir in dirs_to_create {
         std::fs::create_dir_all(tar_dir.join(dir)).unwrap();
     }
@@ -182,9 +190,9 @@ fn test_runner_with_dynamic_lib(
     install_files(tar_dir.join("out"));
 
     #[cfg(target_arch = "x86_64")]
-    let target = "--target=x86_64-unknown-linux-musl";
+    let target = "--target=x86_64-unknown-linux-gnu";
     #[cfg(target_arch = "x86")]
-    let target = "--target=i686-unknown-linux-musl";
+    let target = "--target=i686-unknown-linux-gnu";
 
     // build litebox_runner_linux_userland to get the latest `litebox_rtld_audit.so`
     let output = std::process::Command::new("cargo")
@@ -221,11 +229,11 @@ fn test_runner_with_dynamic_lib(
 
     // create tar file using `tar` command
     let tar_file =
-        std::path::Path::new(dir_path.as_str()).join(format!("rootfs_{backend_str}.tar"));
+        std::path::Path::new(dir_path.as_str()).join(format!("rootfs_{unique_name}.tar"));
     let tar_data = std::process::Command::new("tar")
         .args([
             "-cvf",
-            format!("../rootfs_{backend_str}.tar").as_str(),
+            format!("../rootfs_{unique_name}.tar").as_str(),
             "lib",
             "lib32",
             "lib64",
@@ -257,6 +265,8 @@ fn test_runner_with_dynamic_lib(
         // Alternatively, we could add a `/etc/ld.so.cache` file to the rootfs.
         "--env",
         "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
+        "--env",
+        "HOME=/",
         "--initial-files",
         tar_file.to_str().unwrap(),
     ];
@@ -281,6 +291,7 @@ fn test_runner_with_dynamic_lib(
         "failed to run litebox_runner_linux_userland {:?}",
         std::str::from_utf8(output.stderr.as_slice()).unwrap()
     );
+    output.stdout
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -294,26 +305,44 @@ const HELLO_WORLD_INIT_FILES: [&str; 2] = ["/lib/ld-linux.so.2", "/lib32/libc.so
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_runner_with_dynamic_lib_rewriter() {
-    let target = compile(HELLO_WORLD_C, "hello_lib_rewriter", false);
+    let unique_name = "hello_lib_rewriter";
+    let target = compile(HELLO_WORLD_C, unique_name, false);
     test_runner_with_dynamic_lib(
         Backend::Rewriter,
         &HELLO_WORLD_INIT_FILES,
         &target,
         &[],
         |_| {},
+        unique_name,
     );
 }
 
 #[test]
 fn test_runner_with_dynamic_lib_seccomp() {
-    let target = compile(HELLO_WORLD_C, "hello_lib_seccomp", false);
+    let unique_name = "hello_lib_seccomp";
+    let target = compile(HELLO_WORLD_C, unique_name, false);
     test_runner_with_dynamic_lib(
         Backend::Seccomp,
         &HELLO_WORLD_INIT_FILES,
         &target,
         &[],
         |_| {},
+        unique_name,
     );
+}
+
+/// Get the path of a program using `which`
+#[cfg(target_arch = "x86_64")]
+fn run_which(prog: &str) -> std::path::PathBuf {
+    let prog_path_str = std::process::Command::new("which")
+        .arg(prog)
+        .output()
+        .expect("Failed to find program binary")
+        .stdout;
+    let prog_path_str = String::from_utf8(prog_path_str).unwrap().trim().to_string();
+    let prog_path = std::path::PathBuf::from(prog_path_str);
+    assert!(prog_path.exists(), "Program binary not found",);
+    prog_path
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -336,27 +365,163 @@ console.log(content);
         "/lib64/ld-linux-x86-64.so.2",
         "/lib/x86_64-linux-gnu/libc.so.6",
     ];
-    // get node path via `which node`
-    let node_path_str = std::process::Command::new("which")
-        .arg("node")
-        .output()
-        .expect("Failed to find node binary")
-        .stdout;
-    let node_path_str = String::from_utf8(node_path_str).unwrap().trim().to_string();
-    let node_path = std::path::Path::new(&node_path_str);
-    assert!(
-        node_path.exists(),
-        "Node binary not found at {node_path_str}",
-    );
+    let node_path = run_which("node");
     test_runner_with_dynamic_lib(
         Backend::Seccomp,
         &initial_files,
-        node_path,
+        &node_path,
         &["/out/hello_world.js"],
         |out_dir| {
             // write the test js file to the output directory
             std::fs::write(out_dir.join("hello_world.js"), HELLO_WORLD_JS).unwrap();
         },
+        "hello_node_seccomp",
+    );
+}
+
+#[allow(clippy::too_many_lines)]
+// Assume we have every needed files (including audit_rtld.so, and all libs) in a tar_source directory A/
+fn test_runner_with_tar_source_dir(
+    backend: Backend,
+    libs: &[&str],
+    target: &Path,
+    cmd_args: &[&str],
+    tar_source_dir: PathBuf,
+) -> Vec<u8> {
+    let backend_str = match backend {
+        Backend::Rewriter => "rewriter",
+        Backend::Seccomp => "seccomp",
+    };
+
+    // Use the already compiled executable from the tests folder (same dir as this file)
+    let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // let dir_path = std::env::var("OUT_DIR").unwrap();
+
+    let path = match backend {
+        Backend::Seccomp => target.to_path_buf(),
+        Backend::Rewriter => {
+            // new path in out_dir with .hooked suffix
+            let out_path = std::path::Path::new(test_dir.to_str().unwrap()).join(format!(
+                "{}.hooked",
+                target.file_name().unwrap().to_str().unwrap()
+            ));
+            let output = std::process::Command::new("cargo")
+                .args([
+                    "run",
+                    "-p",
+                    "litebox_syscall_rewriter",
+                    "--",
+                    target.to_str().unwrap(),
+                    "-o",
+                    out_path.to_str().unwrap(),
+                ])
+                .output()
+                .expect("Failed to run litebox_syscall_rewriter");
+            assert!(
+                output.status.success(),
+                "failed to run litebox_syscall_rewriter {:?}",
+                std::str::from_utf8(output.stderr.as_slice()).unwrap()
+            );
+            out_path
+        }
+    };
+
+    // TODO(chuqi): Support rewriter (libs inside the tar_source_dir)
+    #[cfg(target_arch = "x86_64")]
+    let target = "--target=x86_64-unknown-linux-gnu";
+    #[cfg(target_arch = "x86")]
+    let target = "--target=i686-unknown-linux-gnu";
+
+    match backend {
+        Backend::Rewriter => {}
+        Backend::Seccomp => {}
+    }
+
+    // create tar file using `tar` command
+    let tar_file =
+        std::path::Path::new(&test_dir.to_str().unwrap()).join(format!("rootfs_python.tar"));
+    let tar_data = std::process::Command::new("tar")
+        .args([
+            "--format=ustar",
+            "-cvf",
+            tar_file.to_str().unwrap(),
+            "lib",
+            "lib64",
+            "usr",
+            "out",
+        ])
+        .current_dir(&tar_source_dir)
+        .output()
+        .expect("Failed to create tar file");
+    assert!(
+        tar_data.status.success(),
+        "failed to create tar file {:?}",
+        std::str::from_utf8(tar_data.stderr.as_slice()).unwrap()
+    );
+    println!("Tar file created at: {}", tar_file.to_str().unwrap());
+
+    // run litebox_runner_linux_userland with the tar file and the compiled executable
+    let mut args = vec![
+        "run",
+        "-p",
+        "litebox_runner_linux_userland",
+        target,
+        "--",
+        "--unstable",
+        "--interception-backend",
+        backend_str,
+        // Tell ld where to find the libraries.
+        // See https://man7.org/linux/man-pages/man8/ld.so.8.html for how ld works.
+        // Alternatively, we could add a `/etc/ld.so.cache` file to the rootfs.
+        "--env",
+        "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
+        "--env",
+        "HOME=/",
+        "--initial-files",
+        tar_file.to_str().unwrap(),
+    ];
+    match backend {
+        Backend::Rewriter => {
+            args.push("--env");
+            args.push("LD_AUDIT=/lib64/litebox_rtld_audit.so");
+        }
+        Backend::Seccomp => {
+            // No need to set LD_AUDIT for seccomp backend
+        }
+    }
+    args.push(path.to_str().unwrap());
+    args.extend_from_slice(cmd_args);
+    println!("XXXX Running `cargo {}`", args.join(" "));
+    let output = std::process::Command::new("cargo")
+        .args(args)
+        .output()
+        .expect("Failed to run litebox_runner_linux_userland");
+    assert!(
+        output.status.success(),
+        "failed to run litebox_runner_linux_userland {:?}",
+        std::str::from_utf8(output.stderr.as_slice()).unwrap()
+    );
+    output.stdout
+}
+
+#[test]
+fn test_tar() {
+    let tar_source_dir = "/home/chuqi/GitHub/tar-python3.10";
+    let python3_path = run_which("python3");
+    assert!(
+        python3_path.exists(),
+        "Python binary not found at {}",
+        python3_path.to_str().unwrap()
+    );
+
+    println!("Using python3 at: {}", python3_path.to_str().unwrap());
+
+    test_runner_with_tar_source_dir(
+        Backend::Seccomp,
+        &[],
+        &python3_path,
+        &["/out/hello.py"],
+        PathBuf::from(tar_source_dir),
     );
 }
 
@@ -382,7 +547,10 @@ print('Hello World!')
         .output()
         .expect("Failed to find python3 binary")
         .stdout;
-    let python_path_str = String::from_utf8(python_path_str).unwrap().trim().to_string();
+    let python_path_str = String::from_utf8(python_path_str)
+        .unwrap()
+        .trim()
+        .to_string();
     let python_path = std::path::Path::new(&python_path_str);
     assert!(
         python_path.exists(),
@@ -397,5 +565,58 @@ print('Hello World!')
             // write the test python file to the output directory
             std::fs::write(out_dir.join("hello_world.py"), HELLO_WORLD_PY).unwrap();
         },
+        "test-python",
     );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_runner_with_ls() {
+    let ls_path = run_which("ls");
+    let output = test_runner_with_dynamic_lib(
+        Backend::Seccomp,
+        &[
+            "/lib/x86_64-linux-gnu/libc.so.6",
+            "/lib64/ld-linux-x86-64.so.2",
+            "/lib/x86_64-linux-gnu/libselinux.so.1",
+            "/lib/x86_64-linux-gnu/libpcre2-8.so.0",
+        ],
+        &ls_path,
+        &["-a"],
+        |_| {},
+        "ls_seccomp",
+    );
+
+    let output_str = String::from_utf8_lossy(&output);
+    let normalized = output_str.split_whitespace().collect::<Vec<_>>();
+    for each in [".", "..", "lib", "lib64", "usr"] {
+        assert!(
+            normalized.contains(&each),
+            "unexpected ls output:\n{output_str}",
+        );
+    }
+
+    // test `ls` subdir
+    let output = test_runner_with_dynamic_lib(
+        Backend::Seccomp,
+        &[
+            "/lib/x86_64-linux-gnu/libc.so.6",
+            "/lib64/ld-linux-x86-64.so.2",
+            "/lib/x86_64-linux-gnu/libselinux.so.1",
+            "/lib/x86_64-linux-gnu/libpcre2-8.so.0",
+        ],
+        &ls_path,
+        &["-a", "/lib/x86_64-linux-gnu"],
+        |_| {},
+        "ls_lib_seccomp",
+    );
+
+    let output_str = String::from_utf8_lossy(&output);
+    let normalized = output_str.split_whitespace().collect::<Vec<_>>();
+    for each in [".", "..", "libc.so.6", "libpcre2-8.so.0", "libselinux.so.1"] {
+        assert!(
+            normalized.contains(&each),
+            "unexpected ls output:\n{output_str}",
+        );
+    }
 }

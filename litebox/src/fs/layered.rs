@@ -2,8 +2,9 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 use crate::LiteBox;
 use crate::fd::{InternalFd, TypedFd};
@@ -12,9 +13,9 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadError, RmdirError, SeekError, UnlinkError, WriteError,
+    ReadDirError, ReadError, RmdirError, SeekError, UnlinkError, WriteError,
 };
-use super::{FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
 
 /// Just a random constant that is distinct from other file systems. In this case, it is
 /// `b'Lyrs'.hex()`.
@@ -325,7 +326,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     fn get_layered_nodeinfo(&self, node_info: NodeInfo) -> NodeInfo {
         let mut node_info_lookup = self.node_info_lookup.write();
         let rdev = node_info.rdev;
-        let new_id = node_info_lookup.len();
+        // ino starts at 1 (zero represents deleted file)
+        let new_id = node_info_lookup.len() + 1;
         let ino = *node_info_lookup.entry(node_info).or_insert(new_id);
         NodeInfo {
             dev: DEVICE_ID,
@@ -363,12 +365,24 @@ impl<
         flags: OFlags,
         mode: Mode,
     ) -> Result<FileFd<Platform, Upper, Lower>, OpenError> {
-        let currently_supported_oflags: OFlags =
-            OFlags::CREAT | OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR;
-        if flags.contains(currently_supported_oflags.complement()) {
+        let currently_supported_oflags: OFlags = OFlags::CREAT
+            | OFlags::RDONLY
+            | OFlags::WRONLY
+            | OFlags::RDWR
+            | OFlags::NOCTTY
+            | OFlags::DIRECTORY
+            | OFlags::NONBLOCK;
+        if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!()
         }
         let path = self.absolute_path(path)?;
+        if flags.contains(OFlags::CREAT) {
+            // We must first attempt to open the file _without_ creating it, and only if that fails,
+            // do we fall-through and end up creating it (which will happen on the upper layer).
+            if let Ok(fd) = self.open(path.as_str(), flags - OFlags::CREAT, mode) {
+                return Ok(fd);
+            }
+        }
         let mut tombstone_removal = false;
         // If we already have an entry saying it is a tombstone, then we need to quit out early;
         // otherwise, we'll check the levels.
@@ -927,6 +941,58 @@ impl<
         // do at least a "number of entries" check on both upper and lower level at all times.
         // However, in terms of functionality, we will be placing tombstone entries.
         todo!()
+    }
+
+    fn read_dir(&self, fd: &FileFd<Platform, Upper, Lower>) -> Result<Vec<DirEntry>, ReadDirError> {
+        let (entry, path) = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| {
+                (
+                    Arc::clone(&descriptor.entry.entry),
+                    descriptor.entry.path.clone(),
+                )
+            });
+
+        let mut entries = match entry.as_ref() {
+            EntryX::Upper { fd } => {
+                // Get entries from upper layer
+                let mut upper_entries = self.upper.read_dir(fd)?;
+
+                // Try to get entries from lower layer for the same path
+                if let Ok(lower_fd) = self
+                    .lower
+                    .open(path.as_str(), OFlags::RDONLY, Mode::empty())
+                {
+                    if let Ok(lower_entries) = self.lower.read_dir(&lower_fd) {
+                        // Merge entries, avoiding duplicates (upper layer takes precedence)
+                        let upper_names: HashSet<String> =
+                            upper_entries.iter().map(|e| e.name.clone()).collect();
+
+                        for lower_entry in lower_entries {
+                            if !upper_names.contains(&lower_entry.name) {
+                                upper_entries.push(lower_entry);
+                            }
+                        }
+                    }
+                    let _ = self.lower.close(lower_fd);
+                }
+
+                upper_entries
+            }
+            EntryX::Lower { fd } => {
+                // This is the easy case, nothing to deal with upper entries.
+                self.lower.read_dir(fd)?
+            }
+            EntryX::Tombstone => unreachable!(),
+        };
+
+        for e in &mut entries {
+            if let Some(ni) = e.ino_info.take() {
+                e.ino_info = Some(self.get_layered_nodeinfo(ni));
+            }
+        }
+        Ok(entries)
     }
 
     fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {

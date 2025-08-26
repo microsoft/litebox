@@ -26,6 +26,10 @@ pub mod ptr;
 
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 
+pub fn update_cpu_mhz(freq: u64) {
+    CPU_MHZ.store(freq, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// This is the platform for running LiteBox in kernel mode.
 /// It requires a host that implements the [`HostInterface`] trait.
 pub struct LinuxKernel<Host: HostInterface> {
@@ -68,6 +72,9 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
                     .ok_or(Errno::EFAULT)
             }
             PunchthroughSyscall::WakeByAddress { .. } => todo!(),
+            _ => {
+                unimplemented!("PunchthroughToken for LinuxKernel is not fully implemented yet");
+            }
         };
         match r {
             Ok(v) => Ok(v),
@@ -82,9 +89,8 @@ impl<Host: HostInterface> ExitProvider for LinuxKernel<Host> {
     type ExitCode = i32;
     const EXIT_SUCCESS: Self::ExitCode = 0;
     const EXIT_FAILURE: Self::ExitCode = 1;
-    fn exit(&self, _code: Self::ExitCode) -> ! {
-        // TODO: We should probably expand the host to handle an error code?
-        Host::exit()
+    fn exit(&self, code: Self::ExitCode) -> ! {
+        Host::terminate_process(code)
     }
 }
 
@@ -116,14 +122,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             // TODO: Update the init physaddr
             page_table: unsafe { mm::PageTable::new(init_page_table_addr) },
         }))
-    }
-
-    pub fn init(&self, cpu_mhz: u64) {
-        CPU_MHZ.store(cpu_mhz, core::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn exit(&self) -> ! {
-        Host::exit();
     }
 
     pub fn terminate(&self, reason_set: u64, reason_code: u64) -> ! {
@@ -198,13 +196,7 @@ impl<Host: HostInterface> RawMutex<Host> {
 
             match ret {
                 Ok(()) => {
-                    if self
-                        .underlying_atomic()
-                        .load(core::sync::atomic::Ordering::Relaxed)
-                        != val
-                    {
-                        return Ok(UnblockedOrTimedOut::Unblocked);
-                    }
+                    return Ok(UnblockedOrTimedOut::Unblocked);
                 }
                 Err(Errno::EAGAIN) => {
                     // If the futex value does not match val, then the call fails
@@ -300,6 +292,30 @@ impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
     }
 }
 
+impl<Host: HostInterface> litebox::platform::StdioProvider for LinuxKernel<Host> {
+    fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
+        Host::read_from_stdin(buf).map_err(|err| match err {
+            Errno::EPIPE => litebox::platform::StdioReadError::Closed,
+            _ => panic!("unhandled error {err}"),
+        })
+    }
+
+    fn write_to(
+        &self,
+        stream: litebox::platform::StdioOutStream,
+        buf: &[u8],
+    ) -> Result<usize, litebox::platform::StdioWriteError> {
+        Host::write_to(stream, buf).map_err(|err| match err {
+            Errno::EPIPE => litebox::platform::StdioWriteError::Closed,
+            _ => panic!("unhandled error {err}"),
+        })
+    }
+
+    fn is_a_tty(&self, _stream: litebox::platform::StdioStream) -> bool {
+        false
+    }
+}
+
 /// Platform-Host Interface
 pub trait HostInterface {
     /// Page allocation from host.
@@ -318,11 +334,8 @@ pub trait HostInterface {
     /// The caller must ensure that the `addr` is valid and was allocated by this [`Self::alloc`].
     unsafe fn free(addr: usize);
 
-    /// Exit
-    ///
-    /// Exit allows to come back to handle some requests from host,
-    /// but it should not return back to the caller.
-    fn exit() -> !;
+    /// Switch back to host
+    fn return_to_host() -> !;
 
     /// Terminate LiteBox
     fn terminate(reason_set: u64, reason_code: u64) -> !;
@@ -342,16 +355,27 @@ pub trait HostInterface {
         timeout: Option<core::time::Duration>,
     ) -> Result<(), Errno>;
 
+    /// Terminate the current process.
+    fn terminate_process(code: i32) -> !;
+
     /// For Network
     fn send_ip_packet(packet: &[u8]) -> Result<usize, Errno>;
 
     fn receive_ip_packet(packet: &mut [u8]) -> Result<usize, Errno>;
+
+    // For Stdio
+    fn read_from_stdin(buf: &mut [u8]) -> Result<usize, Errno>;
+
+    fn write_to(stream: litebox::platform::StdioOutStream, buf: &[u8]) -> Result<usize, Errno>;
 
     /// For Debugging
     fn log(msg: &str);
 }
 
 impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
+    const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
+    const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
@@ -431,5 +455,37 @@ impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKern
 
     fn access_error(error_code: u64, flags: litebox::mm::linux::VmFlags) -> bool {
         mm::PageTable::<4096>::access_error(error_code, flags)
+    }
+}
+
+impl<Host: HostInterface> litebox::platform::ThreadProvider for LinuxKernel<Host> {
+    type ExecutionContext = litebox_common_linux::PtRegs;
+    type ThreadArgs = litebox_common_linux::NewThreadArgs<LinuxKernel<Host>>;
+    type ThreadSpawnError = litebox_common_linux::errno::Errno;
+    type ThreadId = usize;
+
+    unsafe fn spawn_thread(
+        &self,
+        _ctx: &Self::ExecutionContext,
+        _stack: <Self as RawPointerProvider>::RawMutPointer<u8>,
+        _stack_size: usize,
+        _entry_point: usize,
+        _thread_args: alloc::boxed::Box<Self::ThreadArgs>,
+    ) -> Result<Self::ThreadId, Self::ThreadSpawnError> {
+        todo!()
+    }
+
+    fn terminate_thread(&self, _code: Self::ExitCode) -> ! {
+        todo!()
+    }
+}
+
+impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<Host> {
+    fn get_syscall_entry_point(&self) -> usize {
+        todo!()
+    }
+
+    fn get_vdso_address(&self) -> Option<usize> {
+        None
     }
 }

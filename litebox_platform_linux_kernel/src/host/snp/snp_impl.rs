@@ -2,7 +2,10 @@
 
 use core::arch::asm;
 
-use litebox::platform::{RawConstPointer, RawMutPointer};
+use litebox::{
+    platform::{RawConstPointer, RawMutPointer, ThreadLocalStorageProvider},
+    utils::ReinterpretUnsignedExt as _,
+};
 use litebox_common_linux::{SigSet, SigmaskHow};
 
 use super::ghcb::ghcb_prints;
@@ -16,7 +19,9 @@ mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
-pub type SnpLinuxKenrel = crate::LinuxKernel<HostSnpInterface>;
+pub use bindings::vmpl2_boot_params;
+
+pub type SnpLinuxKernel = crate::LinuxKernel<HostSnpInterface>;
 
 const MAX_ARGS_SIZE: usize = 6;
 type ArgsArray = [u64; MAX_ARGS_SIZE];
@@ -24,6 +29,8 @@ type ArgsArray = [u64; MAX_ARGS_SIZE];
 #[cfg(not(test))]
 mod alloc {
     use crate::HostInterface;
+    use crate::mm::MemoryProvider;
+    use litebox::utils::TruncateExt as _;
 
     const HEAP_ORDER: usize = super::bindings::SNP_VMPL_ALLOC_MAX_ORDER as usize + 12 + 1;
     const PGDIR_SHIFT: u64 = 39;
@@ -34,12 +41,19 @@ mod alloc {
     static SNP_ALLOCATOR: litebox::mm::allocator::SafeZoneAllocator<
         'static,
         HEAP_ORDER,
-        super::SnpLinuxKenrel,
+        super::SnpLinuxKernel,
     > = litebox::mm::allocator::SafeZoneAllocator::new();
 
-    impl litebox::mm::allocator::MemoryProvider for super::SnpLinuxKenrel {
+    impl litebox::mm::allocator::MemoryProvider for super::SnpLinuxKernel {
         fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
-            super::HostSnpInterface::alloc(layout)
+            super::HostSnpInterface::alloc(layout).map(|(addr, size)| {
+                (
+                    Self::pa_to_va(crate::arch::PhysAddr::new_truncate(addr as u64))
+                        .as_u64()
+                        .truncate(),
+                    size,
+                )
+            })
         }
 
         unsafe fn free(addr: usize) {
@@ -47,7 +61,7 @@ mod alloc {
         }
     }
 
-    impl crate::mm::MemoryProvider for super::SnpLinuxKenrel {
+    impl crate::mm::MemoryProvider for super::SnpLinuxKernel {
         const GVA_OFFSET: crate::arch::VirtAddr = crate::arch::VirtAddr::new(LITEBOX_PAGE_OFFSET);
         const PRIVATE_PTE_MASK: u64 = 1 << 51; // SNP encryption bit
 
@@ -58,6 +72,76 @@ mod alloc {
         unsafe fn mem_free_pages(ptr: *mut u8, order: u32) {
             unsafe { SNP_ALLOCATOR.free_pages(ptr, order) }
         }
+    }
+}
+
+/// Get the current task
+fn current() -> Option<&'static mut bindings::vsbox_task> {
+    let task: u64;
+    unsafe {
+        asm!("rdgsbase {}", out(reg) task, options(nostack, preserves_flags));
+
+        let addr = crate::arch::VirtAddr::new(task);
+        if addr.is_null() {
+            return None;
+        }
+
+        Some(&mut *addr.as_mut_ptr())
+    }
+}
+
+impl SnpLinuxKernel {
+    pub fn set_init_tls(&self, boot_params: &bindings::vmpl2_boot_params) {
+        let task = ::alloc::boxed::Box::new(litebox_common_linux::Task {
+            pid: boot_params.pid,
+            tid: boot_params.pid,
+            ppid: boot_params.ppid,
+            clear_child_tid: None,
+            robust_list: None,
+            credentials: ::alloc::sync::Arc::new(litebox_common_linux::Credentials {
+                uid: boot_params.uid as usize,
+                gid: boot_params.gid as usize,
+                euid: boot_params.euid as usize,
+                egid: boot_params.egid as usize,
+            }),
+        });
+        let tls = litebox_common_linux::ThreadLocalStorage::new(task);
+        self.set_thread_local_storage(tls);
+    }
+}
+
+impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
+    type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<SnpLinuxKernel>;
+
+    fn set_thread_local_storage(&self, value: Self::ThreadLocalStorage) {
+        let current_task = current().expect("Current task must be available");
+        assert!(current_task.tls.is_null(), "TLS should not be set yet");
+        let tls = ::alloc::boxed::Box::new(value);
+        current_task.tls = ::alloc::boxed::Box::into_raw(tls).cast();
+    }
+
+    fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
+    {
+        let current_task = current().expect("Current task must be available");
+        assert!(!current_task.tls.is_null(), "TLS should be set");
+        let tls = unsafe { &mut *current_task.tls.cast::<Self::ThreadLocalStorage>() };
+        assert!(!tls.borrowed, "TLS should not be borrowed");
+        tls.borrowed = true; // mark as borrowed
+        let ret = f(tls);
+        tls.borrowed = false; // mark as not borrowed
+        ret
+    }
+
+    fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
+        let current_task = current().expect("Current task must be available");
+        assert!(!current_task.tls.is_null(), "TLS should be set");
+        let tls = unsafe {
+            ::alloc::boxed::Box::from_raw(current_task.tls.cast::<Self::ThreadLocalStorage>())
+        };
+        current_task.tls = ::core::ptr::null_mut();
+        *tls
     }
 }
 
@@ -98,6 +182,9 @@ const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 
 const NR_SYSCALL_FUTEX: u32 = 202;
 const NR_SYSCALL_RT_SIGPROCMASK: u32 = 14;
+const NR_SYSCALL_READ: u32 = 0;
+const NR_SYSCALL_WRITE: u32 = 1;
+const NR_SYSCALL_EXIT_GROUP: u32 = 231;
 
 const FUTEX_WAIT: i32 = 0;
 const FUTEX_WAKE: i32 = 1;
@@ -152,7 +239,9 @@ impl HostSnpInterface {
             } else {
                 Err(Errno::ENOMEM)
             }
-        } else if addr % (PAGE_SIZE << order) != 0 || addr > PHYS_ADDR_MAX - (PAGE_SIZE << order) {
+        } else if !addr.is_multiple_of(PAGE_SIZE << order)
+            || addr > PHYS_ADDR_MAX - (PAGE_SIZE << order)
+        {
             // Address is not aligned or out of bounds
             Err(Errno::EINVAL)
         } else {
@@ -193,7 +282,7 @@ impl HostInterface for HostSnpInterface {
             layout.size().next_power_of_two(),
             usize::try_from(PAGE_SIZE).unwrap(),
         );
-        assert!(size > usize::try_from(PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER).unwrap());
+        assert!(size <= usize::try_from(PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER).unwrap());
 
         let mut req = bindings::SnpVmplRequestArgs::new_request(
             bindings::SNP_VMPL_ALLOC_REQ,
@@ -215,12 +304,10 @@ impl HostInterface for HostSnpInterface {
         unimplemented!()
     }
 
-    fn exit() -> ! {
+    fn return_to_host() -> ! {
         let mut req = bindings::SnpVmplRequestArgs::new_exit_request();
         Self::request(&mut req);
-        loop {
-            unsafe { asm!("hlt") }
-        }
+        unreachable!("Should not return to the caller after returning to host");
     }
 
     fn terminate(reason_set: u64, reason_code: u64) -> ! {
@@ -233,9 +320,7 @@ impl HostInterface for HostSnpInterface {
 
         // In case hypervisor fails to terminate it or intentionally reschedules it,
         // halt the CPU to prevent further execution
-        loop {
-            unsafe { asm!("hlt") }
-        }
+        unreachable!("Should not return to the caller after terminating the vm");
     }
 
     fn rt_sigprocmask(
@@ -291,9 +376,9 @@ impl HostInterface for HostSnpInterface {
         val: u32,
         timeout: Option<core::time::Duration>,
     ) -> Result<(), Errno> {
-        let timeout = timeout.map(|t| crate::host::linux::Timespec {
+        let timeout = timeout.map(|t| litebox_common_linux::Timespec {
             tv_sec: i64::try_from(t.as_secs()).unwrap(),
-            tv_nsec: i64::from(t.subsec_nanos()),
+            tv_nsec: u64::from(t.subsec_nanos()),
         });
         // TODO: sandbox driver needs to be updated to accept a kernel pointer from the guest
         Self::syscalls(SyscallN::<6, NR_SYSCALL_FUTEX> {
@@ -309,5 +394,42 @@ impl HostInterface for HostSnpInterface {
             ],
         })
         .map(|_| ())
+    }
+
+    fn read_from_stdin(buf: &mut [u8]) -> Result<usize, Errno> {
+        Self::syscalls(SyscallN::<3, NR_SYSCALL_READ> {
+            args: [
+                litebox_common_linux::STDIN_FILENO as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            ],
+        })
+    }
+
+    fn write_to(stream: litebox::platform::StdioOutStream, buf: &[u8]) -> Result<usize, Errno> {
+        Self::syscalls(SyscallN::<3, NR_SYSCALL_WRITE> {
+            args: [
+                u64::from(
+                    match stream {
+                        litebox::platform::StdioOutStream::Stdout => {
+                            litebox_common_linux::STDOUT_FILENO
+                        }
+                        litebox::platform::StdioOutStream::Stderr => {
+                            litebox_common_linux::STDERR_FILENO
+                        }
+                    }
+                    .reinterpret_as_unsigned(),
+                ),
+                buf.as_ptr() as u64,
+                buf.len() as u64,
+            ],
+        })
+    }
+
+    fn terminate_process(code: i32) -> ! {
+        let _ = Self::syscalls(SyscallN::<1, NR_SYSCALL_EXIT_GROUP> {
+            args: [u64::from(code.reinterpret_as_unsigned())],
+        });
+        unreachable!("Should not return to the caller after terminating the process");
     }
 }

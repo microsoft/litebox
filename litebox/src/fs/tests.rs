@@ -4,6 +4,7 @@ mod in_mem {
     use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
+    use alloc::vec::Vec;
     extern crate std;
 
     #[test]
@@ -163,6 +164,114 @@ mod in_mem {
     }
 
     #[test]
+    fn read_dir_empty() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
+            let fd = fs
+                .open("/", OFlags::RDONLY, Mode::empty())
+                .expect("Failed to open root directory");
+            let entries = fs
+                .read_dir(&fd)
+                .expect("Failed to read directory")
+                .iter()
+                .map(|e| e.name.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                entries,
+                vec![".", ".."],
+                "Root directory should contain . and .."
+            );
+            fs.close(fd).expect("Failed to close directory");
+        });
+    }
+
+    #[test]
+    fn read_dir_with_files_and_dirs() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
+            // Create a directory structure
+            fs.mkdir("/testdir", Mode::RWXU)
+                .expect("Failed to create directory");
+            let fd1 = fs
+                .open("/testfile1", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .expect("Failed to create file1");
+            fs.close(fd1).expect("Failed to close file1");
+            let fd2 = fs
+                .open("/testfile2", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .expect("Failed to create file2");
+            fs.close(fd2).expect("Failed to close file2");
+
+            // Read root directory
+            let fd = fs
+                .open("/", OFlags::RDONLY, Mode::empty())
+                .expect("Failed to open root directory");
+            let entries = fs.read_dir(&fd).expect("Failed to read directory");
+            fs.close(fd).expect("Failed to close directory");
+
+            // Should have 5 entries: ., .., testdir, testfile1, testfile2
+            assert_eq!(entries.len(), 5);
+
+            let mut names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(names, vec![".", "..", "testdir", "testfile1", "testfile2"]);
+
+            // Check file types
+            for entry in &entries {
+                match entry.name.as_str() {
+                    "testdir" | "." | ".." => {
+                        assert_eq!(entry.file_type, crate::fs::FileType::Directory);
+                    }
+                    "testfile1" | "testfile2" => {
+                        assert_eq!(entry.file_type, crate::fs::FileType::RegularFile);
+                    }
+                    _ => panic!("Unexpected entry: {}", entry.name),
+                }
+                assert!(entry.ino_info.is_some(), "Inode info should be present");
+            }
+
+            // Read the subdirectory (should be empty)
+            let fd = fs
+                .open("/testdir", OFlags::RDONLY, Mode::empty())
+                .expect("Failed to open subdirectory");
+            let entries = fs
+                .read_dir(&fd)
+                .expect("Failed to read subdirectory")
+                .iter()
+                .map(|e| e.name.clone())
+                .collect::<Vec<_>>();
+            assert!(entries.len() == 2, "Subdirectory should contain . and ..");
+            fs.close(fd).expect("Failed to close subdirectory");
+        });
+    }
+
+    #[test]
+    fn read_dir_file_not_directory() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
+            // Create a file
+            let fd = fs
+                .open("/testfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .expect("Failed to create file");
+            fs.close(fd).expect("Failed to close file");
+
+            // Try to read_dir on the file (should fail)
+            let fd = fs
+                .open("/testfile", OFlags::RDONLY, Mode::empty())
+                .expect("Failed to open file");
+            let result = fs.read_dir(&fd);
+            fs.close(fd).expect("Failed to close file");
+
+            assert!(matches!(
+                result,
+                Err(crate::fs::errors::ReadDirError::NotADirectory)
+            ));
+        });
+    }
+
+    #[test]
     fn chown_test() {
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);
@@ -221,6 +330,82 @@ mod in_mem {
                 .expect("Failed to chown group only");
         });
     }
+
+    #[test]
+    fn o_directory_flag_tests() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+        // Create test directory and file
+        fs.mkdir("/testdir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .expect("Failed to create directory");
+
+        let fd = fs
+            .open("/testfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        fs.close(fd).expect("Failed to close file");
+
+        // Test O_DIRECTORY on a directory (should succeed)
+        let fd = fs
+            .open(
+                "/testdir",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .expect("Failed to open directory with O_DIRECTORY");
+        fs.close(fd).expect("Failed to close directory");
+
+        // Test O_DIRECTORY on a regular file (should fail)
+        assert!(matches!(
+            fs.open(
+                "/testfile",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty()
+            ),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::ComponentNotADirectory
+            ))
+        ));
+
+        // Test O_DIRECTORY on non-existent path (should fail)
+        assert!(matches!(
+            fs.open(
+                "/nonexistent",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty()
+            ),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::NoSuchFileOrDirectory
+            ))
+        ));
+
+        // Test O_DIRECTORY with O_CREAT on non-existent path
+        // According to the implementation, O_DIRECTORY should be ignored when O_CREAT is specified
+        let fd = fs
+            .open(
+                "/newfile",
+                OFlags::CREAT | OFlags::WRONLY | OFlags::DIRECTORY,
+                Mode::RWXU,
+            )
+            .expect("Failed to create file with O_CREAT | O_DIRECTORY");
+        fs.close(fd).expect("Failed to close file");
+
+        // Verify it created a regular file, not a directory
+        let stat = fs
+            .file_status("/newfile")
+            .expect("Failed to get file status");
+        assert_eq!(stat.file_type, crate::fs::FileType::RegularFile);
+
+        // Test O_DIRECTORY with various access modes
+        let fd = fs
+            .open("/testdir", OFlags::RDWR | OFlags::DIRECTORY, Mode::empty())
+            .expect("Failed to open directory with O_RDWR | O_DIRECTORY");
+        fs.close(fd).expect("Failed to close directory");
+    }
 }
 
 mod tar_ro {
@@ -229,6 +414,7 @@ mod tar_ro {
     use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
+    use alloc::vec::Vec;
     extern crate std;
 
     const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");
@@ -272,6 +458,107 @@ mod tar_ro {
             .expect("Failed to open dir");
         fs.close(fd).expect("Failed to close dir");
     }
+
+    #[test]
+    fn o_directory_flag_tests() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+
+        // Test O_DIRECTORY on a directory (should succeed)
+        let fd = fs
+            .open("bar", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+            .expect("Failed to open directory with O_DIRECTORY");
+        fs.close(fd).expect("Failed to close directory");
+
+        // Test O_DIRECTORY on a regular file (should fail)
+        assert!(matches!(
+            fs.open("foo", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::ComponentNotADirectory
+            ))
+        ));
+
+        // Test O_DIRECTORY on non-existent path (should fail)
+        assert!(matches!(
+            fs.open(
+                "nonexistent",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty()
+            ),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::NoSuchFileOrDirectory
+            ))
+        ));
+
+        // Test O_DIRECTORY on nested file (should fail)
+        assert!(matches!(
+            fs.open("bar/baz", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::ComponentNotADirectory
+            ))
+        ));
+    }
+
+    #[test]
+    fn read_dir_subdirectory() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+
+        // Read root directory
+        let fd = fs
+            .open("/", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open root directory");
+        let entries = fs.read_dir(&fd).expect("Failed to read root directory");
+        fs.close(fd).expect("Failed to close root directory");
+
+        // Should have 4 entries: ., .., bar, foo
+        assert_eq!(entries.len(), 4);
+
+        let mut names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec![".", "..", "bar", "foo"]);
+
+        // Check file types
+        for entry in &entries {
+            match entry.name.as_str() {
+                "foo" => {
+                    assert_eq!(entry.file_type, crate::fs::FileType::RegularFile);
+                }
+                "bar" | "." | ".." => assert_eq!(entry.file_type, crate::fs::FileType::Directory),
+                _ => panic!("Unexpected entry: {}", entry.name),
+            }
+            assert!(entry.ino_info.is_some(), "Inode info should be present");
+        }
+
+        // Read `bar` directory
+        let fd = fs
+            .open("bar", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open bar directory");
+        let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
+        fs.close(fd).expect("Failed to close bar directory");
+
+        // Should have 3 entry: ., .., baz (file)
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2].name, "baz");
+        assert_eq!(entries[2].file_type, crate::fs::FileType::RegularFile);
+    }
+
+    #[test]
+    fn read_dir_file_not_directory() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+
+        let fd = fs
+            .open("foo", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open foo file");
+        let result = fs.read_dir(&fd);
+        fs.close(fd).expect("Failed to close foo file");
+
+        assert!(matches!(
+            result,
+            Err(crate::fs::errors::ReadDirError::NotADirectory)
+        ));
+    }
 }
 
 mod layered {
@@ -280,6 +567,7 @@ mod layered {
     use crate::fs::{in_mem, layered, tar_ro};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
+    use alloc::vec::Vec;
     extern crate std;
 
     const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");
@@ -485,6 +773,214 @@ mod layered {
                 crate::fs::errors::PathError::NoSuchFileOrDirectory
             )),
         ));
+    }
+
+    #[test]
+    fn o_directory_flag_tests() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
+
+        in_mem_fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+        // Create a test directory in the upper layer
+        in_mem_fs
+            .mkdir("/upperdir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .expect("Failed to create directory");
+
+        // Create a test file in the upper layer
+        let fd = in_mem_fs
+            .open("/upperfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        in_mem_fs.close(fd).expect("Failed to close file");
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem_fs,
+            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Test O_DIRECTORY on directory from lower layer (tar)
+        let fd = fs
+            .open("bar", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+            .expect("Failed to open lower layer directory with O_DIRECTORY");
+        fs.close(fd).expect("Failed to close directory");
+
+        // Test O_DIRECTORY on directory from upper layer (in_mem)
+        let fd = fs
+            .open(
+                "/upperdir",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .expect("Failed to open upper layer directory with O_DIRECTORY");
+        fs.close(fd).expect("Failed to close directory");
+
+        // Test O_DIRECTORY on file from lower layer (should fail)
+        assert!(matches!(
+            fs.open("foo", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::ComponentNotADirectory
+            ))
+        ));
+
+        // Test O_DIRECTORY on file from upper layer (should fail)
+        assert!(matches!(
+            fs.open(
+                "/upperfile",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty()
+            ),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::ComponentNotADirectory
+            ))
+        ));
+
+        // Test O_DIRECTORY on nested file from lower layer (should fail)
+        assert!(matches!(
+            fs.open("bar/baz", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::ComponentNotADirectory
+            ))
+        ));
+
+        // Test O_DIRECTORY on non-existent path (should fail)
+        assert!(matches!(
+            fs.open(
+                "nonexistent",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty()
+            ),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::NoSuchFileOrDirectory
+            ))
+        ));
+    }
+
+    #[test]
+    // Regression test for #250: a file that already exists in the lower layer should not be
+    // shadowed by an attempt to create a file.
+    fn file_create_exist_in_lower() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
+        in_mem_fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem_fs,
+            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+        let fd = fs
+            .open("foo", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+            .expect("Failed to open file");
+        let mut buffer = vec![0; 4];
+
+        // The file exists, and is readable
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
+        assert_eq!(&buffer[..bytes_read], b"test");
+    }
+
+    #[test]
+    fn read_dir_from_lower_layer() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Read bar subdirectory
+        let fd = fs
+            .open("bar", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open bar directory");
+        let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
+        fs.close(fd).expect("Failed to close bar directory");
+
+        // Should have 3 entries: ., .., baz (file)
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2].name, "baz");
+        assert_eq!(entries[2].file_type, crate::fs::FileType::RegularFile);
+        assert!(
+            entries[2].ino_info.is_some(),
+            "Inode info should be present"
+        );
+    }
+
+    #[test]
+    fn read_dir_from_upper_layer() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
+        in_mem_fs.with_root_privileges(|fs| {
+            // Set up root directory permissions to allow access
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+
+            // Create some files in the upper layer
+            fs.mkdir("/upperdir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to create upperdir");
+            let fd = fs
+                .open("/upperfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .expect("Failed to create upperfile");
+            fs.close(fd).expect("Failed to close upperfile");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem_fs,
+            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Read root directory (should contain entries from both layers)
+        let fd = fs
+            .open("/", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open root directory");
+        let entries = fs.read_dir(&fd).expect("Failed to read root directory");
+        fs.close(fd).expect("Failed to close root directory");
+
+        // Should have 6 entries: ., .., bar, foo (from lower), upperdir, upperfile (from upper)
+        assert_eq!(entries.len(), 6);
+
+        let mut names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![".", "..", "bar", "foo", "upperdir", "upperfile"]
+        );
+
+        // Check file types
+        for entry in &entries {
+            match entry.name.as_str() {
+                "foo" | "upperfile" => {
+                    assert_eq!(entry.file_type, crate::fs::FileType::RegularFile);
+                }
+                "bar" | "upperdir" | "." | ".." => {
+                    assert_eq!(entry.file_type, crate::fs::FileType::Directory);
+                }
+                _ => panic!("Unexpected entry: {}", entry.name),
+            }
+            assert!(entry.ino_info.is_some(), "Inode info should be present");
+        }
+
+        // Read upperdir directory (should be from upper layer)
+        let fd = fs
+            .open("/upperdir", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open upperdir");
+        let entries = fs.read_dir(&fd).expect("Failed to read upperdir");
+        fs.close(fd).expect("Failed to close upperdir");
+
+        // only . and ..
+        assert!(entries.len() == 2);
     }
 }
 
