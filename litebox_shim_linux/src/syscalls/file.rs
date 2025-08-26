@@ -764,7 +764,7 @@ pub fn sys_ioctl(
             .into_owned();
         match desc {
             Descriptor::File(file) => match arg {
-                IoctlArg::TCGETS(_) => Err(Errno::ENOTTY),
+                IoctlArg::TCGETS(..) => Err(Errno::ENOTTY),
                 _ => todo!(),
             },
             Descriptor::Stdio(file) => {
