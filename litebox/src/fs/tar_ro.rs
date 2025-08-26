@@ -25,7 +25,6 @@ use alloc::borrow::ToOwned as _;
 use alloc::string::String;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
-use tar_no_std::TarArchive;
 
 use crate::{
     LiteBox,
@@ -56,11 +55,25 @@ const TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER: usize = 0xFACE;
 // TODO(jayb): Determine appropriate block size
 const BLOCK_SIZE: usize = 0;
 
+enum TarData {
+    Owned(tar_no_std::TarArchive),
+    Borrowed(tar_no_std::TarArchiveRef<'static>),
+}
+
+impl TarData {
+    fn entries(&self) -> tar_no_std::ArchiveEntryIterator<'_> {
+        match self {
+            TarData::Owned(ar) => ar.entries(),
+            TarData::Borrowed(ar_ref) => ar_ref.entries(),
+        }
+    }
+}
+
 /// A backing implementation for [`FileSystem`](super::FileSystem), storing all files in-memory, via
 /// a read-only `.tar` file.
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
     litebox: LiteBox<Platform>,
-    tar_data: TarArchive,
+    tar_data: TarData,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
 }
@@ -73,11 +86,10 @@ pub fn empty_tar_file() -> Vec<u8> {
 impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// Construct a new `FileSystem` instance from provided `tar_data`.
     ///
-    /// Note: this function takes `tar_data` as a `Vec` rather than a `&[u8]` to eliminate a memcpy
-    /// and ensure that full ownership is taken; if the fact that it is a `Vec` is sub-optimal due
-    /// to an _external_ forced-memcpy for any particular use case, then this could be updated to a
-    /// more flexible type, at the cost of adding an additional lifetime throughout this file
-    /// system.
+    /// Note: this function accepts `tar_data` as a `Cow<'static, [u8]>`. When a borrowed slice is
+    /// provided the filesystem will use a `TarArchiveRef` without taking ownership; when an owned
+    /// buffer is provided it will be consumed to construct a `TarArchive`. Using `Cow` avoids an
+    /// unnecessary copy while allowing either borrowed or owned input.
     ///
     /// Use [`empty_tar_file`] if you need an empty file system.
     ///
@@ -85,10 +97,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     ///
     /// Panics if the provided `tar_data` is found to be an invalid `.tar` file.
     #[must_use]
-    pub fn new(litebox: &LiteBox<Platform>, tar_data: Vec<u8>) -> Self {
+    pub fn new(litebox: &LiteBox<Platform>, tar_data: alloc::borrow::Cow<'static, [u8]>) -> Self {
         Self {
             litebox: litebox.clone(),
-            tar_data: TarArchive::new(tar_data.into_boxed_slice()).unwrap(),
+            tar_data: match tar_data {
+                alloc::borrow::Cow::Borrowed(slice) => TarData::Borrowed(
+                    tar_no_std::TarArchiveRef::new(slice).expect("invalid tar data"),
+                ),
+                alloc::borrow::Cow::Owned(vec) => TarData::Owned(
+                    tar_no_std::TarArchive::new(vec.into_boxed_slice()).expect("invalid tar data"),
+                ),
+            },
             current_working_dir: "/".into(),
         }
     }
