@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use litebox::path::Arg;
+use litebox_runner_linux_userland::CliArgs;
+use clap::Parser;
 mod common;
 
 const HELLO_WORLD_C: &str = r#"
@@ -523,6 +525,35 @@ fn test_tar() {
         &["/out/hello.py"],
         PathBuf::from(tar_source_dir),
     );
+}
+
+#[test]
+fn debug_tar() {
+    let python3_path = run_which("python3");
+    
+    let rootfs_tar = std::path::PathBuf::from("/home/chuqi/GitHub/litebox/litebox_runner_linux_userland/rootfs_python.tar");
+    // Call litebox_runner_linux_userland directly
+    
+    // Craft CliArgs manually
+    let cli_args = litebox_runner_linux_userland::CliArgs {
+        unstable: true,
+        forward_environment_variables: false,
+        rewrite_syscalls: false,
+        interception_backend: litebox_runner_linux_userland::InterceptionBackend::Seccomp,
+        environment_variables: vec![
+            "LD_LIBRARY_PATH=/lib64:/lib32:/lib".to_string(),
+            "HOME=/".to_string(),
+        ],
+        program_and_arguments: vec![
+            python3_path.to_str().unwrap().to_string(),
+            "/out/hello.py".to_string(),
+        ],
+        insert_files: vec![],
+        initial_files: Some(rootfs_tar),
+    };
+    
+    let result = litebox_runner_linux_userland::run(cli_args);
+    println!("Result: {:?}", result);
 }
 
 #[cfg(target_arch = "x86_64")]
