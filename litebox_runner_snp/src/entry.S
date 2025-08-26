@@ -50,7 +50,6 @@ _exit:
 
 sandbox_tun_read_write_start:
 sandbox_mount_start:
-sandbox_process_ret_from_fork:
 sandbox_signal_ret:
 rust_begin_unwind:
 snp_panic:
