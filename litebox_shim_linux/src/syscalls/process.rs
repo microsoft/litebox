@@ -10,10 +10,8 @@ use litebox::platform::{
     ThreadLocalStorageProvider as _,
 };
 use litebox::utils::TruncateExt as _;
-use litebox_common_linux::CloneFlags;
 use litebox_common_linux::{ArchPrctlArg, errno::Errno};
-
-use crate::MutPtr;
+use litebox_common_linux::{CloneFlags, FutexArgs};
 
 /// A global counter for the number of threads in the system.
 pub(super) static NR_THREADS: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(1);
@@ -108,19 +106,6 @@ pub(crate) fn sys_rt_sigaction(
     })
 }
 
-fn futex_wake(addr: MutPtr<i32>) {
-    let punchthrough = litebox_common_linux::PunchthroughSyscall::WakeByAddress { addr };
-    let token = litebox_platform_multiplex::platform()
-        .get_punchthrough_token_for(punchthrough)
-        .expect("Failed to get punchthrough token for FUTEX_WAKE");
-    token.execute().unwrap_or_else(|e| match e {
-        litebox::platform::PunchthroughError::Failure(errno) => {
-            panic!("FUTEX_WAKE failed with error: {:?}", errno)
-        }
-        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-    });
-}
-
 const ROBUST_LIST_LIMIT: isize = 2048;
 
 /*
@@ -212,7 +197,13 @@ pub(crate) fn sys_exit(status: i32) -> ! {
         // Clear the child TID if requested
         // TODO: if we are the last thread, we don't need to clear it
         let _ = unsafe { clear_child_tid.write_at_offset(0, 0) };
-        futex_wake(clear_child_tid);
+        // Cast from *i32 to *u32
+        let clear_child_tid = crate::MutPtr::from_usize(clear_child_tid.as_usize());
+        let _ = sys_futex(litebox_common_linux::FutexArgs::WAKE {
+            addr: clear_child_tid,
+            flags: litebox_common_linux::FutexFlags::PRIVATE,
+            count: 1,
+        });
     }
     if let Some(robust_list) = tls.current_task.robust_list.take() {
         let _ = wake_robust_list(robust_list);
@@ -604,6 +595,81 @@ pub(crate) fn sys_sched_getaffinity(pid: Option<i32>) -> CpuSet {
     let mut cpuset = bitvec::bitvec![u8, bitvec::order::Lsb0; 0; NR_CPUS];
     cpuset.iter_mut().for_each(|mut b| *b = true);
     CpuSet { bits: cpuset }
+}
+
+fn get_timeout(
+    timeout: crate::ConstPtr<litebox_common_linux::Timespec>,
+) -> Result<litebox_common_linux::Timespec, Errno> {
+    let timeout = unsafe { timeout.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+    if timeout.tv_sec < 0 || timeout.tv_nsec > 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(timeout.into_owned())
+}
+
+pub(crate) fn sys_futex(
+    arg: litebox_common_linux::FutexArgs<litebox_platform_multiplex::Platform>,
+) -> Result<usize, Errno> {
+    macro_rules! warn_shared_futex {
+        ($flag:ident) => {
+            if !$flag.contains(litebox_common_linux::FutexFlags::PRIVATE) {
+                #[cfg(debug_assertions)]
+                litebox::log_println!(
+                    litebox_platform_multiplex::platform(),
+                    "warning: shared futexes"
+                );
+            }
+        };
+    }
+
+    let res = match arg {
+        FutexArgs::WAKE { addr, flags, count } => {
+            warn_shared_futex!(flags);
+            let Some(count) = core::num::NonZeroU32::new(count) else {
+                return Ok(0);
+            };
+            let futex_manager = crate::litebox_futex_manager();
+            futex_manager.wake(addr, count, Some(core::num::NonZeroU32::MAX))? as usize
+        }
+        FutexArgs::WAIT {
+            addr,
+            flags,
+            val,
+            timeout,
+        } => {
+            warn_shared_futex!(flags);
+            let futex_manager = crate::litebox_futex_manager();
+            let timeout = timeout.map(get_timeout).transpose()?.map(Into::into);
+            futex_manager.wait(addr, val, timeout, Some(core::num::NonZeroU32::MAX))?;
+            0
+        }
+        litebox_common_linux::FutexArgs::WAIT_BITSET {
+            addr,
+            flags,
+            val,
+            timeout,
+            bitmask,
+        } => {
+            warn_shared_futex!(flags);
+            if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) && timeout.is_some()
+            {
+                unimplemented!("FUTEX_CLOCK_REALTIME is not supported yet");
+            }
+            let timeout = timeout
+                .map(get_timeout)
+                .transpose()?
+                .map(|ts| {
+                    let abs_time: <litebox_platform_multiplex::Platform as litebox::platform::TimeProvider>::Instant = ts.into();
+                    let now = litebox_platform_multiplex::platform().now();
+                    abs_time.duration_since(&now)
+                });
+            let futex_manager = crate::litebox_futex_manager();
+            futex_manager.wait(addr, val, timeout, core::num::NonZeroU32::new(bitmask))?;
+            0
+        }
+        _ => unimplemented!("Unsupported futex operation"),
+    };
+    Ok(res)
 }
 
 #[cfg(test)]

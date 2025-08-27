@@ -23,7 +23,7 @@ use litebox::{
     fs::FileSystem,
     mm::{PageManager, linux::PAGE_SIZE},
     platform::{RawConstPointer as _, RawMutPointer as _},
-    sync::RwLock,
+    sync::{RwLock, futex::FutexManager},
     utils::ReinterpretUnsignedExt,
 };
 use litebox_common_linux::{SyscallRequest, errno::Errno};
@@ -109,6 +109,14 @@ pub(crate) fn litebox_net<'a>()
     NET.get_or_init(|| {
         let net = litebox::net::Network::new(litebox());
         alloc::boxed::Box::new(litebox().sync().new_mutex(net))
+    })
+}
+
+pub(crate) fn litebox_futex_manager<'a>() -> &'a FutexManager<Platform> {
+    static FUTEX_MANAGER: OnceBox<FutexManager<Platform>> = OnceBox::new();
+    FUTEX_MANAGER.get_or_init(|| {
+        let futex_manager = FutexManager::new(litebox());
+        alloc::boxed::Box::new(futex_manager)
     })
 }
 
@@ -728,6 +736,7 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
                     .ok_or(Errno::EFAULT)
             }
         }
+        SyscallRequest::Futex { args } => syscalls::process::sys_futex(args),
         _ => {
             todo!()
         }
