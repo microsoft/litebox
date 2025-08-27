@@ -268,6 +268,23 @@ impl Instant {
     }
 }
 
+impl From<litebox_common_linux::Timespec> for Instant {
+    fn from(inner: litebox_common_linux::Timespec) -> Self {
+        if inner.tv_sec < 0 {
+            return Instant(0);
+        }
+        let Some(micros) = (inner.tv_nsec / 1_000).checked_add_signed(inner.tv_sec * 1_000_000)
+        else {
+            return Instant(u64::MAX);
+        };
+        let Some(counter) = micros.checked_mul(CPU_MHZ.load(core::sync::atomic::Ordering::Relaxed))
+        else {
+            return Instant(u64::MAX);
+        };
+        Instant(counter)
+    }
+}
+
 impl litebox::platform::SystemTime for SystemTime {
     const UNIX_EPOCH: Self = SystemTime();
 
