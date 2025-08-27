@@ -679,7 +679,7 @@ pub(crate) fn sys_futex(
 mod tests {
     use core::mem::MaybeUninit;
 
-    use litebox::{mm::linux::PAGE_SIZE, platform::RawConstPointer as _};
+    use litebox::{mm::linux::PAGE_SIZE, platform::RawConstPointer as _, utils::TruncateExt as _};
     use litebox_common_linux::{CloneFlags, MapFlags, ProtFlags};
 
     #[cfg(target_arch = "x86_64")]
@@ -924,7 +924,7 @@ mod tests {
         };
 
         make_aligned_entry!(main_wrapper, new_thread_main_test);
-        let result = super::sys_clone(
+        let child_tid = super::sys_clone(
             flags,
             Some(parent_tid_ptr),
             Some(stack),
@@ -944,14 +944,22 @@ mod tests {
         litebox::log_println!(
             litebox_platform_multiplex::platform(),
             "sys_clone returned: {}",
-            result
+            child_tid
         );
-        assert!(result > 0, "sys_clone should return a positive PID");
         assert_eq!(
             unsafe { parent_tid.assume_init() } as usize,
-            result,
-            "Parent TID mismatch"
+            child_tid,
+            "Child's TID mismatch"
         );
+        // Test if CloneFlags::CHILD_CLEARTID works: child thread should clear it and wake up one thread
+        // that is waiting on it.
+        let futex_ptr = crate::MutPtr::from_usize(child_tid_ptr.as_usize());
+        let _ = super::sys_futex(litebox_common_linux::FutexArgs::WAIT {
+            addr: futex_ptr,
+            flags: litebox_common_linux::FutexFlags::PRIVATE,
+            val: child_tid.truncate(),
+            timeout: None,
+        });
     }
 
     #[test]
