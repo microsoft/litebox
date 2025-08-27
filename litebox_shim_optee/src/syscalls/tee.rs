@@ -33,7 +33,8 @@ fn align_down(addr: usize, align: usize) -> usize {
     addr & !(align - 1)
 }
 
-/// A system call to return to the kernel.
+/// A system call to return to the kernel. A TA calls this function when
+/// it finishes its job delivered through a TA command invocation.
 pub fn sys_return(ret: usize) -> ! {
     #[cfg(debug_assertions)]
     litebox::log_println!(
@@ -90,12 +91,12 @@ pub fn sys_panic(code: usize) -> ! {
 }
 
 // TODO: replace this with a proper implementation
-const GPD_CLIENT_IDENTITY: usize = 0xffff_0000;
+const GPD_CLIENT_IDENTITY: u32 = 0xffff_0000;
 
-/// A system call to get system property information.
+/// A system call to get system, client, or TA property information.
 pub fn sys_get_property(
     prop_set: TeePropSet,
-    index: usize,
+    index: u32,
     name_buf: Option<&mut [u8]>,
     name_len: Option<crate::MutPtr<u32>>,
     prop_buf: &mut [u8],
@@ -141,7 +142,7 @@ pub fn sys_get_property(
     }
 }
 
-/// A system call to get the index of system property.
+/// A system call to get the index of property information by its name.
 pub fn sys_get_property_name_to_index(
     prop_set: TeePropSet,
     name: &[u8],
@@ -157,7 +158,7 @@ pub fn sys_get_property_name_to_index(
             if prop_set == TeePropSet::CurrentClient {
                 unsafe {
                     index
-                        .write_at_offset(0, u32::try_from(GPD_CLIENT_IDENTITY).unwrap())
+                        .write_at_offset(0, GPD_CLIENT_IDENTITY)
                         .ok_or(TeeResult::AccessDenied)?;
                 }
                 Ok(())
@@ -165,7 +166,7 @@ pub fn sys_get_property_name_to_index(
                 Err(TeeResult::BadParameters)
             }
         }
-        _ => todo!("implement sys_get_property for {:?}", name_str),
+        _ => todo!(),
     }
 }
 
@@ -184,7 +185,7 @@ pub fn sys_open_ta_session(
             .ok_or(TeeResult::AccessDenied)?;
     }
     if is_pta(&ta_uuid, &usr_params) {
-        // `open_ta_session` syscall lets a user TA open a session with a PTA which provides
+        // `open_ta_session` syscall lets a user-mode TA open a session with a PTA which provides
         // several import services (it works as a proxy for extra system calls).
         unsafe {
             ta_sess_id
@@ -193,7 +194,7 @@ pub fn sys_open_ta_session(
         }
         Ok(())
     } else {
-        // `open_ta_session` syscall lets a user TA open a session another user TA
+        // `open_ta_session` syscall lets a user-mode TA open a session another user-mode TA
         // (using its UUID) to leverage its functions.
         // TODO: if this TA hasn't been loaded, we need to load its ELF and prepare its stack (hopefully
         // in a separate page table). We can do this here or at `sys_invoke_ta_command` (in a lazy manner).

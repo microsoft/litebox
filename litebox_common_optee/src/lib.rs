@@ -29,7 +29,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     GetProperty {
         prop_set: TeePropSet,
-        index: usize,
+        index: u32,
         name: Platform::RawMutPointer<u8>,
         name_len: Platform::RawMutPointer<u32>,
         buf: Platform::RawMutPointer<u8>,
@@ -144,7 +144,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             },
             TeeSyscallNr::GetProperty => SyscallRequest::GetProperty {
                 prop_set: TeePropSet::try_from_usize(ctx.syscall_arg(0))?,
-                index: ctx.syscall_arg(1),
+                index: u32::try_from(ctx.syscall_arg(1)).map_err(|_| Errno::EINVAL)?,
                 name: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
                 name_len: Platform::RawMutPointer::from_usize(ctx.syscall_arg(3)),
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
@@ -867,6 +867,7 @@ const USER_TA_PROP_TYPE_IDENTITY: u32 = 3;
 const USER_TA_PROP_TYPE_STRING: u32 = 4;
 const USER_TA_PROP_TYPE_BINARY_BLOCK: u32 = 5;
 
+/// USER_TA_PROP_TYPE_* from lib/libutee/include/user_ta_header.h
 #[derive(Clone, Copy)]
 #[repr(u32)]
 pub enum UserTaPropType {
