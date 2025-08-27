@@ -583,7 +583,6 @@ impl RawMutex {
                 /* expected value */ val,
                 remaining_time,
                 /* ignored */ None,
-                /* ignored */ 0,
             ) {
                 Ok(0) => {
                     return Ok(UnblockedOrTimedOut::Unblocked);
@@ -622,7 +621,6 @@ impl litebox::platform::RawMutex for RawMutex {
             /* number to wake up */ n,
             /* val2: ignored */ 0,
             /* uaddr2: ignored */ None,
-            /* val3: ignored */ 0,
         )
         .expect("failed to wake up waiters")
     }
@@ -934,7 +932,6 @@ fn futex_timeout(
     val: u32,
     timeout: Option<Duration>,
     uaddr2: Option<&AtomicU32>,
-    val3: u32,
 ) -> Result<usize, syscalls::Errno> {
     let uaddr: *const AtomicU32 = uaddr as _;
     let futex_op: i32 = futex_op as _;
@@ -966,7 +963,9 @@ fn futex_timeout(
                 0 // No timeout
             },
             uaddr2 as usize,
-            val3 as usize,
+            // argument `val3` is ignored for this futex operation;
+            // we reinterpret it as the magic value to pass through the Seccomp filter.
+            syscall_intercept::SYSCALL_ARG_MAGIC,
         )
     }
 }
@@ -978,7 +977,6 @@ fn futex_val2(
     val: u32,
     val2: u32,
     uaddr2: Option<&AtomicU32>,
-    val3: u32,
 ) -> Result<usize, syscalls::Errno> {
     let uaddr: *const AtomicU32 = uaddr as _;
     let futex_op: i32 = futex_op as _;
@@ -991,7 +989,9 @@ fn futex_val2(
             val as usize,
             val2 as usize,
             uaddr2 as usize,
-            val3 as usize,
+            // argument `val3` is ignored for this futex operation;
+            // we reinterpret it as the magic value to pass through the Seccomp filter.
+            syscall_intercept::SYSCALL_ARG_MAGIC,
         )
     }
 }
