@@ -327,6 +327,9 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
             None => Err(Errno::EFAULT),
         },
         SyscallRequest::Close { fd } => syscalls::file::sys_close(fd).map(|()| 0),
+        SyscallRequest::Lseek { fd, offset, whence } => {
+            syscalls::file::sys_lseek(fd, offset, whence)
+        }
         SyscallRequest::RtSigprocmask {
             how,
             set,
