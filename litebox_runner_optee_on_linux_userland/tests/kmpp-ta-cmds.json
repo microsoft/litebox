@@ -27,6 +27,20 @@
     ]
   },
   {
+    "func_id": "invoke_command",
+    "cmd_id": 8,
+    "args": [
+      {
+        "param_type": "memref_input",
+        "data_base64": "AxAAAAgAAABKiCTN5GFOs6a+FgXARp22AAAAAEqIJM3kYU6zpr4WBcBGnbZKiCTN5GFOs6a+FgXARp22IAAAAEqIJM3kYU6zpr4WBcBGnbZKiCTN5GFOs6a+FgXARp22"
+      },
+      {
+        "param_type": "memref_output",
+        "buffer_size": 1024
+      }
+    ]
+  },
+  {
     "func_id": "close_session"
   }
 ]
