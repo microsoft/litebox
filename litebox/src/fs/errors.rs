@@ -18,7 +18,7 @@ pub enum OpenError {
     NoWritePerms,
     #[error("write access requested for a file on a read-only filesystem")]
     ReadOnlyFileSystem,
-    #[error("file already exists and O_EXCL was specified")]
+    #[error("file already exists")]
     AlreadyExists,
     #[error(transparent)]
     PathError(#[from] PathError),
