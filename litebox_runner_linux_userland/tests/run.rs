@@ -375,3 +375,146 @@ fn test_runner_with_ls() {
         );
     }
 }
+
+#[allow(clippy::too_many_lines)]
+// Assume we have every needed files (including audit_rtld.so, and all libs) in a tar_source directory A/
+fn test_runner_with_tar_source_dir(
+    backend: Backend,
+    target: &str,
+    cmd_args: &[&str],
+    tar_source_dir: PathBuf,
+) -> Vec<u8> {
+    let backend_str = match backend {
+        Backend::Rewriter => "rewriter",
+        Backend::Seccomp => "seccomp",
+    };
+
+    // Use the already compiled executable from the tests folder (same dir as this file)
+    let test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    let path = test_dir.join(target);
+    assert!(path.exists(), "Target binary not found at {}", path.to_str().unwrap());
+    println!("Using target executable binary at: {}", path.to_str().unwrap());
+
+    #[cfg(target_arch = "x86_64")]
+    let target = "--target=x86_64-unknown-linux-gnu";
+    #[cfg(target_arch = "x86")]
+    let target = "--target=i686-unknown-linux-gnu";
+
+    // create tar file using `tar` command
+    let tar_file =
+        std::path::Path::new(&test_dir.to_str().unwrap()).join(format!("rootfs_python_{}.tar", backend_str));
+    let tar_data = std::process::Command::new("tar")
+        .args([
+            "--format=ustar",
+            "-cvf",
+            tar_file.to_str().unwrap(),
+            "lib",
+            "lib64",
+            "usr",
+            "out",
+        ])
+        .current_dir(&tar_source_dir)
+        .output()
+        .expect("Failed to create tar file");
+    assert!(
+        tar_data.status.success(),
+        "failed to create tar file {:?}",
+        std::str::from_utf8(tar_data.stderr.as_slice()).unwrap()
+    );
+    println!("Tar file created at: {}", tar_file.to_str().unwrap());
+
+    // run litebox_runner_linux_userland with the tar file and the compiled executable
+    let mut args = vec![
+        "run",
+        "-p",
+        "litebox_runner_linux_userland",
+        target,
+        "--",
+        "--unstable",
+        "--interception-backend",
+        backend_str,
+        // Tell ld where to find the libraries.
+        // See https://man7.org/linux/man-pages/man8/ld.so.8.html for how ld works.
+        // Alternatively, we could add a `/etc/ld.so.cache` file to the rootfs.
+        "--env",
+        "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
+        "--env",
+        "HOME=/",
+        "--initial-files",
+        tar_file.to_str().unwrap(),
+    ];
+    match backend {
+        Backend::Rewriter => {
+            args.push("--env");
+            args.push("LD_AUDIT=/lib64/litebox_rtld_audit.so");
+        }
+        Backend::Seccomp => {
+            // No need to set LD_AUDIT for seccomp backend
+        }
+    }
+    args.push(path.to_str().unwrap());
+    args.extend_from_slice(cmd_args);
+    println!("XXXX Running `cargo {}`", args.join(" "));
+    let output = std::process::Command::new("cargo")
+        .args(args)
+        .output()
+        .expect("Failed to run litebox_runner_linux_userland");
+    assert!(
+        output.status.success(),
+        "failed to run litebox_runner_linux_userland {:?}",
+        std::str::from_utf8(output.stderr.as_slice()).unwrap()
+    );
+    output.stdout
+}
+
+#[test]
+fn test_tar_seccomp() {
+    let tar_source_dir = "/home/chuqi/GitHub/tar-python3.10";
+    test_runner_with_tar_source_dir(
+        Backend::Seccomp,
+        "python3",
+        &["/out/hello.py"],
+        PathBuf::from(tar_source_dir),
+    );
+}
+
+#[test]
+fn test_tar_rewriter() {
+    let tar_source_dir = "/home/chuqi/GitHub/tar-python3.10-rewriter";
+    test_runner_with_tar_source_dir(
+        Backend::Rewriter,
+        "python3.hooked",
+        &["/out/hello.py"],
+        PathBuf::from(tar_source_dir),
+    );
+}
+
+#[test]
+fn debug_tar() {
+    let python3_path = run_which("python3");
+    
+    let rootfs_tar = std::path::PathBuf::from("/home/chuqi/GitHub/litebox/litebox_runner_linux_userland/rootfs_python.tar");
+    // Call litebox_runner_linux_userland directly
+    
+    // Craft CliArgs manually
+    let cli_args = litebox_runner_linux_userland::CliArgs {
+        unstable: true,
+        forward_environment_variables: false,
+        rewrite_syscalls: false,
+        interception_backend: litebox_runner_linux_userland::InterceptionBackend::Seccomp,
+        environment_variables: vec![
+            "LD_LIBRARY_PATH=/lib64:/lib32:/lib".to_string(),
+            "HOME=/".to_string(),
+        ],
+        program_and_arguments: vec![
+            python3_path.to_str().unwrap().to_string(),
+            "/out/hello.py".to_string(),
+        ],
+        insert_files: vec![],
+        initial_files: Some(rootfs_tar),
+    };
+    
+    let result = litebox_runner_linux_userland::run(cli_args);
+    println!("Result: {:?}", result);
+}
