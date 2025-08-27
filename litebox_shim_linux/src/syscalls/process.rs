@@ -593,13 +593,16 @@ fn get_timeout(
     Ok(timeout.into_owned())
 }
 
+/// Handle syscall `futex`
 pub(crate) fn sys_futex(
     arg: litebox_common_linux::FutexArgs<litebox_platform_multiplex::Platform>,
 ) -> Result<usize, Errno> {
+    /// Note our mutex implementation assumes futexes are private as we don't support shared memory yet.
+    /// It should be fine to treat shared futexes as private for now.
     macro_rules! warn_shared_futex {
         ($flag:ident) => {
+            #[cfg(debug_assertions)]
             if !$flag.contains(litebox_common_linux::FutexFlags::PRIVATE) {
-                #[cfg(debug_assertions)]
                 litebox::log_println!(
                     litebox_platform_multiplex::platform(),
                     "warning: shared futexes"
