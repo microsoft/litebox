@@ -132,7 +132,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             Ok(fd) => fd,
             Err(e) => match e {
                 OpenError::AccessNotAllowed => return Err(MigrationError::NoReadPerms),
-                OpenError::NoWritePerms | OpenError::ReadOnlyFileSystem => unreachable!(),
+                OpenError::NoWritePerms
+                | OpenError::ReadOnlyFileSystem
+                | OpenError::AlreadyExists => unreachable!(),
                 OpenError::PathError(path_error) => return Err(path_error)?,
             },
         };
@@ -359,6 +361,7 @@ impl<
     Lower: super::FileSystem + 'static,
 > super::FileSystem for FileSystem<Platform, Upper, Lower>
 {
+    #[expect(clippy::too_many_lines)]
     fn open(
         &self,
         path: impl crate::path::Arg,
@@ -369,6 +372,7 @@ impl<
             | OFlags::RDONLY
             | OFlags::WRONLY
             | OFlags::RDWR
+            | OFlags::EXCL
             | OFlags::NOCTTY
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK;
@@ -377,10 +381,18 @@ impl<
         }
         let path = self.absolute_path(path)?;
         if flags.contains(OFlags::CREAT) {
-            // We must first attempt to open the file _without_ creating it, and only if that fails,
-            // do we fall-through and end up creating it (which will happen on the upper layer).
-            if let Ok(fd) = self.open(path.as_str(), flags - OFlags::CREAT, mode) {
-                return Ok(fd);
+            if flags.contains(OFlags::EXCL) {
+                // O_EXCL with O_CREAT: fail if file already exists anywhere (upper or lower layer)
+                if self.file_status(path.as_str()).is_ok() {
+                    return Err(OpenError::AlreadyExists);
+                }
+            } else {
+                // Normal O_CREAT behavior: try to open existing file first
+                // We must first attempt to open the file _without_ creating it, and only if that fails,
+                // do we fall-through and end up creating it (which will happen on the upper layer).
+                if let Ok(fd) = self.open(path.as_str(), flags - OFlags::CREAT, mode) {
+                    return Ok(fd);
+                }
             }
         }
         let mut tombstone_removal = false;
@@ -440,6 +452,7 @@ impl<
                 OpenError::AccessNotAllowed
                 | OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
+                | OpenError::AlreadyExists
                 | OpenError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname

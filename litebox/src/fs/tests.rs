@@ -406,6 +406,72 @@ mod in_mem {
             .expect("Failed to open directory with O_RDWR | O_DIRECTORY");
         fs.close(fd).expect("Failed to close directory");
     }
+
+    #[test]
+    fn o_excl_flag_tests() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+
+        // Test O_CREAT | O_EXCL on non-existent file (should succeed)
+        let fd = fs
+            .open(
+                "/newfile",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            )
+            .expect("Failed to create new file with O_CREAT | O_EXCL");
+
+        // Write some data to verify file was created
+        fs.write(&fd, b"test data", None)
+            .expect("Failed to write to new file");
+        fs.close(fd).expect("Failed to close new file");
+
+        // Test O_CREAT | O_EXCL on existing file (should fail)
+        assert!(matches!(
+            fs.open(
+                "/newfile",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            ),
+            Err(crate::fs::errors::OpenError::AlreadyExists)
+        ));
+
+        // Test O_EXCL without O_CREAT (should be ignored and succeed)
+        let fd = fs
+            .open("/newfile", OFlags::EXCL | OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open existing file with O_EXCL (without O_CREAT)");
+
+        // Verify we can read the data
+        let mut buffer = vec![0; 9];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
+        assert_eq!(&buffer[..bytes_read], b"test data");
+        fs.close(fd).expect("Failed to close file");
+
+        // Test O_CREAT without O_EXCL on existing file (should succeed)
+        let fd = fs
+            .open("/newfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to open existing file with O_CREAT (without O_EXCL)");
+        fs.close(fd).expect("Failed to close file");
+
+        // Test O_CREAT | O_EXCL on directory (should fail)
+        fs.mkdir("/testdir", Mode::RWXU)
+            .expect("Failed to create directory");
+        assert!(matches!(
+            fs.open(
+                "/testdir",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            ),
+            Err(crate::fs::errors::OpenError::AlreadyExists)
+        ));
+    }
 }
 
 mod tar_ro {
@@ -981,6 +1047,120 @@ mod layered {
 
         // only . and ..
         assert!(entries.len() == 2);
+    }
+
+    #[test]
+    fn o_excl_layered_tests() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
+        in_mem_fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem_fs,
+            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Test O_CREAT | O_EXCL on file that exists in lower layer (should fail)
+        // "foo" exists in the tar file
+        assert!(matches!(
+            fs.open(
+                "foo",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            ),
+            Err(crate::fs::errors::OpenError::AlreadyExists)
+        ));
+
+        // Test O_CREAT | O_EXCL on file that doesn't exist anywhere (should succeed)
+        let fd = fs
+            .open(
+                "/newfile",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            )
+            .expect("Failed to create new file with O_CREAT | O_EXCL");
+
+        fs.write(&fd, b"layered test", None)
+            .expect("Failed to write to new file");
+        fs.close(fd).expect("Failed to close new file");
+
+        // Test O_CREAT | O_EXCL on file that now exists in upper layer (should fail)
+        assert!(matches!(
+            fs.open(
+                "/newfile",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            ),
+            Err(crate::fs::errors::OpenError::AlreadyExists)
+        ));
+
+        // Test O_CREAT | O_EXCL on directory that exists in lower layer (should fail)
+        // "bar" is a directory in the tar file
+        assert!(matches!(
+            fs.open(
+                "bar",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            ),
+            Err(crate::fs::errors::OpenError::AlreadyExists)
+        ));
+
+        // Test O_CREAT | O_EXCL on file that was deleted (tombstoned) should succeed
+        // First delete a file from lower layer
+        fs.unlink("foo").expect("Failed to unlink lower layer file");
+
+        // Now try to create it with O_EXCL (should succeed since it's tombstoned)
+        let fd = fs
+            .open(
+                "foo",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            )
+            .expect("Failed to create file over tombstone with O_CREAT | O_EXCL");
+
+        fs.write(&fd, b"new foo content", None)
+            .expect("Failed to write to recreated file");
+        fs.close(fd).expect("Failed to close recreated file");
+
+        // Verify the new content
+        let fd = fs
+            .open("foo", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open recreated file");
+        let mut buffer = vec![0; 15];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from recreated file");
+        assert_eq!(&buffer[..bytes_read], b"new foo content");
+        fs.close(fd).expect("Failed to close recreated file");
+
+        // Test O_CREAT | O_EXCL behavior with existing upper layer file
+        // Create a file in upper layer first
+        let fd = fs
+            .open(
+                "/upper_only_file",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXU,
+            )
+            .expect("Failed to create upper layer file");
+        fs.write(&fd, b"upper content", None)
+            .expect("Failed to write to upper layer file");
+        fs.close(fd).expect("Failed to close upper layer file");
+
+        // Now try O_CREAT | O_EXCL on the same file (should fail)
+        assert!(matches!(
+            fs.open(
+                "/upper_only_file",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            ),
+            Err(crate::fs::errors::OpenError::AlreadyExists)
+        ));
     }
 }
 
