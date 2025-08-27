@@ -810,7 +810,10 @@ pub fn sys_ioctl(
 
     match desc {
         Descriptor::Stdio(file) => stdio_ioctl(file, arg),
-        Descriptor::File(file) => todo!(),
+        Descriptor::File(file) => match arg {
+            IoctlArg::TCGETS(..) => Err(Errno::ENOTTY),
+            _ => todo!(),
+        },
         Descriptor::Socket(socket) => todo!(),
         Descriptor::PipeReader {
             consumer,
