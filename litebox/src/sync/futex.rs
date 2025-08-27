@@ -299,8 +299,13 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // that mask goes to sleep.
         loop {
             let lockables = self.lockables.read();
+            // A waiter that starts after `wake` has begun may increment `lockable.num_waiters`.
+            // Such a late-arriving waiter will detect that a wake is already in progress and
+            // therefore will not actually block (it will be immediately woken). Because it never
+            // sleeps, it will proceed to decrement `lockable.num_waiters`. The following check
+            // only needs to account for waiters that were already present before `wake` began.
             if let Some(lockable) = lockables.get(&addr)
-                && num_to_wake_up > old_num_waiters - lockable.num_waiters
+                && lockable.num_waiters + num_to_wake_up > old_num_waiters
             {
                 drop(lockables);
                 core::hint::spin_loop();
