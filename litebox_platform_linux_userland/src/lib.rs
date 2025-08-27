@@ -884,22 +884,6 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
             PunchthroughSyscall::SetThreadArea { user_desc } => {
                 set_thread_area(user_desc).map_err(litebox::platform::PunchthroughError::Failure)
             }
-            PunchthroughSyscall::WakeByAddress { addr } => unsafe {
-                syscalls::syscall6(
-                    syscalls::Sysno::futex,
-                    addr.as_usize(),
-                    usize::try_from(FutexOperation::Wake as i32).unwrap(),
-                    1,
-                    0,
-                    0,
-                    0,
-                )
-            }
-            .map_err(|err| match err {
-                syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
-                _ => panic!("unexpected error {err}"),
-            })
-            .map_err(litebox::platform::PunchthroughError::Failure),
         }
     }
 }
