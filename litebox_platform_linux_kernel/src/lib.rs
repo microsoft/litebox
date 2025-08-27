@@ -72,9 +72,6 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
                     .ok_or(Errno::EFAULT)
             }
             PunchthroughSyscall::WakeByAddress { .. } => todo!(),
-            _ => {
-                unimplemented!("PunchthroughToken for LinuxKernel is not fully implemented yet");
-            }
         };
         match r {
             Ok(v) => Ok(v),
@@ -227,11 +224,19 @@ impl<Host: HostInterface> DebugLogProvider for LinuxKernel<Host> {
 /// An implementation of [`litebox::platform::Instant`]
 pub struct Instant(u64);
 
+/// An implementation of [`litebox::platform::SystemTime`]
+pub struct SystemTime();
+
 impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
     type Instant = Instant;
+    type SystemTime = SystemTime;
 
     fn now(&self) -> Self::Instant {
         Instant::now()
+    }
+
+    fn current_time(&self) -> Self::SystemTime {
+        unimplemented!()
     }
 }
 
@@ -261,6 +266,17 @@ impl Instant {
 
     fn now() -> Self {
         Instant(Self::rdtsc())
+    }
+}
+
+impl litebox::platform::SystemTime for SystemTime {
+    const UNIX_EPOCH: Self = SystemTime();
+
+    fn duration_since(
+        &self,
+        _earlier: &Self,
+    ) -> Result<core::time::Duration, core::time::Duration> {
+        unimplemented!()
     }
 }
 
@@ -455,28 +471,6 @@ impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKern
 
     fn access_error(error_code: u64, flags: litebox::mm::linux::VmFlags) -> bool {
         mm::PageTable::<4096>::access_error(error_code, flags)
-    }
-}
-
-impl<Host: HostInterface> litebox::platform::ThreadProvider for LinuxKernel<Host> {
-    type ExecutionContext = litebox_common_linux::PtRegs;
-    type ThreadArgs = litebox_common_linux::NewThreadArgs<LinuxKernel<Host>>;
-    type ThreadSpawnError = litebox_common_linux::errno::Errno;
-    type ThreadId = usize;
-
-    unsafe fn spawn_thread(
-        &self,
-        _ctx: &Self::ExecutionContext,
-        _stack: <Self as RawPointerProvider>::RawMutPointer<u8>,
-        _stack_size: usize,
-        _entry_point: usize,
-        _thread_args: alloc::boxed::Box<Self::ThreadArgs>,
-    ) -> Result<Self::ThreadId, Self::ThreadSpawnError> {
-        todo!()
-    }
-
-    fn terminate_thread(&self, _code: Self::ExitCode) -> ! {
-        todo!()
     }
 }
 

@@ -713,6 +713,18 @@ impl From<Timespec> for core::time::Duration {
     }
 }
 
+impl TryFrom<core::time::Duration> for Timespec {
+    // Overflow error, indicated just as a unit
+    type Error = ();
+
+    fn try_from(duration: core::time::Duration) -> Result<Self, Self::Error> {
+        Ok(Timespec {
+            tv_sec: i64::try_from(duration.as_secs()).or(Err(()))?,
+            tv_nsec: u64::from(duration.subsec_nanos()),
+        })
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TimeVal {
@@ -740,7 +752,7 @@ impl TryFrom<TimeVal> for core::time::Duration {
 impl From<Timespec> for TimeVal {
     fn from(timespec: Timespec) -> Self {
         // Convert seconds to time_t
-        let timeval_sec = timespec.tv_sec as time_t;
+        let timeval_sec: time_t = timespec.tv_sec.truncate();
 
         // Convert nanoseconds to microseconds, ensuring we don't overflow suseconds_t
         let microseconds = timespec.tv_nsec / 1_000;
@@ -1103,9 +1115,15 @@ pub type ThreadLocalDescriptor = u8;
 pub type ThreadLocalDescriptor = UserDesc;
 
 pub struct NewThreadArgs<Platform: litebox::platform::RawPointerProvider> {
+    /// Pointer to thread-local storage (TLS) given by the guest program
     pub tls: Option<Platform::RawMutPointer<ThreadLocalDescriptor>>,
+    /// Where to store child TID in child's memory
     pub set_child_tid: Option<Platform::RawMutPointer<i32>>,
+    /// Task struct that maintains all per-thread data
     pub task: alloc::boxed::Box<Task<Platform>>,
+    /// A callback function that *MUST* be called when the thread is created.
+    ///
+    /// Note that `task.tid` must be set correctly before this function is called.
     pub callback: fn(Self),
 }
 
@@ -2168,17 +2186,6 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
     },
     WakeByAddress {
         addr: Platform::RawMutPointer<i32>,
-    },
-    ClockGettime {
-        clockid: i32,
-        tp: Platform::RawMutPointer<Timespec>,
-    },
-    Gettimeofday {
-        tv: Platform::RawMutPointer<TimeVal>,
-        tz: Platform::RawMutPointer<TimeZone>,
-    },
-    Time {
-        tloc: Platform::RawMutPointer<time_t>,
     },
 }
 
