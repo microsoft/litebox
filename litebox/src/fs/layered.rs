@@ -383,28 +383,8 @@ impl<
         if flags.contains(OFlags::CREAT) {
             if flags.contains(OFlags::EXCL) {
                 // O_EXCL with O_CREAT: fail if file already exists anywhere (upper or lower layer)
-                // First check if file exists in upper layer
-                if self.upper.file_status(path.as_str()).is_ok() {
+                if self.file_status(path.as_str()).is_ok() {
                     return Err(OpenError::AlreadyExists);
-                }
-                // Then check if file exists in lower layer or as a tombstone
-                if let Some(entry) = self.root.read().entries.get(&path) {
-                    match entry.as_ref() {
-                        EntryX::Tombstone => {
-                            // Tombstone means file was deleted, so we can create it
-                        }
-                        EntryX::Lower { .. } => {
-                            // File exists in lower layer, fail with EXCL
-                            return Err(OpenError::AlreadyExists);
-                        }
-                        EntryX::Upper { .. } => unreachable!(),
-                    }
-                } else if self.ensure_lower_contains(&path).is_ok() {
-                    // File exists in lower layer but not tracked, fail with EXCL
-                    return Err(OpenError::AlreadyExists);
-                }
-                // File doesn't exist anywhere, proceed with creation at upper layer only (fall through)
-                else {
                 }
             } else {
                 // Normal O_CREAT behavior: try to open existing file first
