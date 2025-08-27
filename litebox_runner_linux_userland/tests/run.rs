@@ -9,7 +9,7 @@ enum Backend {
 }
 
 #[allow(clippy::too_many_lines)]
-fn test_runner_with_dynamic_lib(
+fn run_with_dynamic_lib(
     backend: Backend,
     target: &Path,
     cmd_args: &[&str],
@@ -226,7 +226,7 @@ fn test_runner_with_dynamic_lib_rewriter() {
             .expect("failed to get file stem");
         let unique_name = format!("{stem}_rewriter");
         let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
-        test_runner_with_dynamic_lib(Backend::Rewriter, &target, &[], |_| {}, &unique_name);
+        run_with_dynamic_lib(Backend::Rewriter, &target, &[], |_| {}, &unique_name);
     }
 }
 
@@ -239,7 +239,7 @@ fn test_runner_with_dynamic_lib_seccomp() {
             .expect("failed to get file stem");
         let unique_name = format!("{stem}_seccomp");
         let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
-        test_runner_with_dynamic_lib(Backend::Seccomp, &target, &[], |_| {}, &unique_name);
+        run_with_dynamic_lib(Backend::Seccomp, &target, &[], |_| {}, &unique_name);
     }
 }
 
@@ -269,7 +269,7 @@ console.log(content);
 ";
 
     let node_path = run_which("node");
-    test_runner_with_dynamic_lib(
+    run_with_dynamic_lib(
         Backend::Seccomp,
         &node_path,
         &["/out/hello_world.js"],
@@ -285,8 +285,7 @@ console.log(content);
 #[test]
 fn test_runner_with_ls() {
     let ls_path = run_which("ls");
-    let output =
-        test_runner_with_dynamic_lib(Backend::Seccomp, &ls_path, &["-a"], |_| {}, "ls_seccomp");
+    let output = run_with_dynamic_lib(Backend::Seccomp, &ls_path, &["-a"], |_| {}, "ls_seccomp");
 
     let output_str = String::from_utf8_lossy(&output);
     let normalized = output_str.split_whitespace().collect::<Vec<_>>();
@@ -298,7 +297,7 @@ fn test_runner_with_ls() {
     }
 
     // test `ls` subdir
-    let output = test_runner_with_dynamic_lib(
+    let output = run_with_dynamic_lib(
         Backend::Seccomp,
         &ls_path,
         &["-a", "/lib/x86_64-linux-gnu"],
