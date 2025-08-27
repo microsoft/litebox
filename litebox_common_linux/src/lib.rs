@@ -1464,6 +1464,11 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         buf: Platform::RawConstPointer<u8>,
         count: usize,
     },
+    Lseek {
+        fd: i32,
+        offset: isize,
+        whence: i32,
+    },
     Close {
         fd: i32,
     },
@@ -1819,6 +1824,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::read => sys_req!(Read { fd, buf:*, count }),
             Sysno::write => sys_req!(Write { fd, buf:*, count }),
             Sysno::close => sys_req!(Close { fd }),
+            Sysno::lseek => sys_req!(Lseek { fd, offset, whence }),
             Sysno::stat => sys_req!(Stat { pathname:*, buf:* }),
             Sysno::fstat => sys_req!(Fstat { fd, buf:* }),
             Sysno::lstat => sys_req!(Lstat { pathname:*, buf:* }),
@@ -2344,6 +2350,11 @@ trait ReinterpretTruncatedFromUsize: Sized {
 impl ReinterpretTruncatedFromUsize for i64 {
     fn reinterpret_truncated_from_usize(v: usize) -> Self {
         v.reinterpret_as_signed() as i64
+    }
+}
+impl ReinterpretTruncatedFromUsize for isize {
+    fn reinterpret_truncated_from_usize(v: usize) -> Self {
+        v.reinterpret_as_signed()
     }
 }
 macro_rules! reinterpret_truncated_from_usize_for {
