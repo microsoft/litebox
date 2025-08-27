@@ -242,6 +242,36 @@ impl SystemTime for MockSystemTime {
     }
 }
 
+impl NetworkInterfaceConfigProvider for MockPlatform {
+    fn network_interface_support(&self) -> NetworkInterfaceSupport {
+        // MockPlatform supports both interfaces, with IP preferred for compatibility
+        NetworkInterfaceSupport::BothWithIpPreferred
+    }
+}
+
+impl EthernetInterfaceProvider for MockPlatform {
+    fn send_ethernet_frame(&self, frame: &[u8]) -> Result<(), SendError> {
+        // For MockPlatform, we'll use the same packet storage for both IP and Ethernet
+        // In a real implementation, these might be separate
+        self.ip_packets.write().unwrap().push_back(frame.into());
+        Ok(())
+    }
+
+    fn receive_ethernet_frame(&self, frame: &mut [u8]) -> Result<usize, ReceiveError> {
+        // For MockPlatform, we'll use the same packet storage for both IP and Ethernet
+        // In a real implementation, these might be separate
+        if self.ip_packets.read().unwrap().is_empty() {
+            Err(ReceiveError::WouldBlock)
+        } else {
+            let mut ipp = self.ip_packets.write().unwrap();
+            let v = ipp.pop_front().unwrap();
+            assert!(v.len() <= frame.len());
+            frame[..v.len()].copy_from_slice(&v);
+            Ok(v.len())
+        }
+    }
+}
+
 impl TimeProvider for MockPlatform {
     type Instant = MockInstant;
     type SystemTime = MockSystemTime;
@@ -309,5 +339,22 @@ impl StdioProvider for MockPlatform {
 
     fn is_a_tty(&self, _stream: StdioStream) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mock_platform_network_interface_configuration() {
+        let platform = MockPlatform::new();
+        let config = platform.network_interface_support();
+
+        // MockPlatform should support both interfaces with IP preferred (for compatibility)
+        assert_eq!(config, NetworkInterfaceSupport::BothWithIpPreferred);
+        assert!(config.supports_ip());
+        assert!(config.supports_ethernet());
+        assert_eq!(config.preferred_interface(), NetworkInterfaceType::Ip);
     }
 }

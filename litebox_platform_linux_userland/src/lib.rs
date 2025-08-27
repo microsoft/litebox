@@ -1721,4 +1721,20 @@ mod tests {
         let tls = LinuxUserland::get_thread_local_storage();
         assert!(tls.is_null(), "TLS should be null after releasing it");
     }
+
+    #[test]
+    fn test_network_interface_configuration() {
+        use litebox::platform::{
+            NetworkInterfaceConfigProvider, NetworkInterfaceSupport, NetworkInterfaceType,
+        };
+
+        let platform = LinuxUserland::new(None);
+        let config = platform.network_interface_support();
+
+        // LinuxUserland should support both interfaces with Ethernet preferred
+        assert_eq!(config, NetworkInterfaceSupport::BothWithEthernetPreferred);
+        assert!(config.supports_ip());
+        assert!(config.supports_ethernet());
+        assert_eq!(config.preferred_interface(), NetworkInterfaceType::Ethernet);
+    }
 }
