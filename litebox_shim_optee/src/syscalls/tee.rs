@@ -185,7 +185,7 @@ pub fn sys_open_ta_session(
             .ok_or(TeeResult::AccessDenied)?;
     }
     if is_pta(&ta_uuid, &usr_params) {
-        // `open_ta_session` syscall lets a user-mode TA open a session with a PTA which provides
+        // `open_ta_session` syscall lets a user-mode TA open a session to a PTA which provides
         // several import services (it works as a proxy for extra system calls).
         unsafe {
             ta_sess_id
@@ -194,7 +194,7 @@ pub fn sys_open_ta_session(
         }
         Ok(())
     } else {
-        // `open_ta_session` syscall lets a user-mode TA open a session another user-mode TA
+        // `open_ta_session` syscall lets a user-mode TA open a session to another user-mode TA
         // (using its UUID) to leverage its functions.
         // TODO: if this TA hasn't been loaded, we need to load its ELF and prepare its stack (hopefully
         // in a separate page table). We can do this here or at `sys_invoke_ta_command` (in a lazy manner).
