@@ -513,6 +513,7 @@ pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const FIONBIO: u32 = 0x5421;
+pub const FIOCLEX: u32 = 0x5451;
 pub const TIOCGPTN: u32 = 0x80045430;
 
 /// Commands for use with `ioctl`.
@@ -529,6 +530,8 @@ pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     TIOCGPTN(Platform::RawMutPointer<u32>),
     /// Enables or disables non-blocking mode
     FIONBIO(Platform::RawConstPointer<i32>),
+    /// Set close on exec
+    FIOCLEX,
     Raw {
         cmd: u32,
         arg: Platform::RawMutPointer<u8>,
@@ -543,6 +546,7 @@ impl<Platform: litebox::platform::RawPointerProvider> alloc::fmt::Debug for Ioct
             Self::TIOCGWINSZ(arg0) => f.debug_tuple("TIOCGWINSZ").field(&arg0.as_usize()).finish(),
             Self::TIOCGPTN(arg0) => f.debug_tuple("TIOCGPTN").field(&arg0.as_usize()).finish(),
             Self::FIONBIO(arg0) => f.debug_tuple("FIONBIO").field(&arg0.as_usize()).finish(),
+            Self::FIOCLEX => f.debug_tuple("FIOCLEX").finish(),
             Self::Raw { cmd, arg } => f
                 .debug_struct("Raw")
                 .field("cmd", cmd)
@@ -727,6 +731,18 @@ impl From<Timespec> for core::time::Duration {
             u64::try_from(timespec.tv_sec).unwrap(),
             timespec.tv_nsec.truncate(),
         )
+    }
+}
+
+impl TryFrom<core::time::Duration> for Timespec {
+    // Overflow error, indicated just as a unit
+    type Error = ();
+
+    fn try_from(duration: core::time::Duration) -> Result<Self, Self::Error> {
+        Ok(Timespec {
+            tv_sec: i64::try_from(duration.as_secs()).or(Err(()))?,
+            tv_nsec: u64::from(duration.subsec_nanos()),
+        })
     }
 }
 
@@ -1907,6 +1923,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
+                        FIOCLEX => IoctlArg::FIOCLEX,
                         _ => IoctlArg::Raw {
                             cmd,
                             arg: ctx.sys_req_ptr(2),
@@ -2801,17 +2818,6 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
     },
     WakeByAddress {
         addr: Platform::RawMutPointer<i32>,
-    },
-    ClockGettime {
-        clockid: i32,
-        tp: Platform::RawMutPointer<Timespec>,
-    },
-    Gettimeofday {
-        tv: Platform::RawMutPointer<TimeVal>,
-        tz: Platform::RawMutPointer<TimeZone>,
-    },
-    Time {
-        tloc: Platform::RawMutPointer<time_t>,
     },
 }
 

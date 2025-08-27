@@ -4,6 +4,7 @@ use core::mem::offset_of;
 
 use alloc::boxed::Box;
 use litebox::platform::{ExitProvider as _, RawMutPointer as _, ThreadProvider as _};
+use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{
     PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _,
     ThreadLocalStorageProvider as _,
@@ -454,19 +455,32 @@ pub(crate) fn sys_get_robust_list(
     unsafe { head_ptr.write_at_offset(0, head) }.ok_or(Errno::EFAULT)
 }
 
+fn real_time_as_duration_since_epoch() -> core::time::Duration {
+    let now = litebox_platform_multiplex::platform().current_time();
+    let unix_epoch = <litebox_platform_multiplex::Platform as TimeProvider>::SystemTime::UNIX_EPOCH;
+    now.duration_since(&unix_epoch)
+        .expect("must be after unix epoch")
+}
+
 /// Handle syscall `clock_gettime`.
 pub(crate) fn sys_clock_gettime(
     clockid: i32,
     tp: crate::MutPtr<litebox_common_linux::Timespec>,
 ) -> Result<(), Errno> {
-    let punchthrough = litebox_common_linux::PunchthroughSyscall::ClockGettime { clockid, tp };
-    let token = litebox_platform_multiplex::platform()
-        .get_punchthrough_token_for(punchthrough)
-        .expect("Failed to get punchthrough token for CLOCK_GETTIME");
-    token.execute().map(|_| ()).map_err(|e| match e {
-        litebox::platform::PunchthroughError::Failure(errno) => errno,
-        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-    })
+    let duration: core::time::Duration = match clockid {
+        0 => {
+            // CLOCK_REALTIME
+            real_time_as_duration_since_epoch()
+        }
+        1 => {
+            // CLOCK_MONOTONIC
+            let now = litebox_platform_multiplex::platform().now();
+            now.duration_since(crate::boot_time())
+        }
+        _ => unimplemented!(),
+    };
+    let timespec = litebox_common_linux::Timespec::try_from(duration).or(Err(Errno::EOVERFLOW))?;
+    unsafe { tp.write_at_offset(0, timespec) }.ok_or(Errno::EFAULT)
 }
 
 /// Handle syscall `clock_getres`.
@@ -489,32 +503,31 @@ pub(crate) fn sys_gettimeofday(
     tv: crate::MutPtr<litebox_common_linux::TimeVal>,
     tz: crate::MutPtr<litebox_common_linux::TimeZone>,
 ) -> Result<(), Errno> {
-    let punchthrough = litebox_common_linux::PunchthroughSyscall::Gettimeofday { tv, tz };
-    let token = litebox_platform_multiplex::platform()
-        .get_punchthrough_token_for(punchthrough)
-        .expect("Failed to get punchthrough token for GETTIMEOFDAY");
-    token.execute().map(|_| ()).map_err(|e| match e {
-        litebox::platform::PunchthroughError::Failure(errno) => errno,
-        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-    })
+    if tz.as_usize() != 0 {
+        // `man 2 gettimeofday`: The use of the timezone structure is obsolete; the tz argument
+        // should normally be specified as NULL.
+        unimplemented!()
+    }
+    if tv.as_usize() == 0 {
+        return Ok(());
+    }
+    let timeval = litebox_common_linux::Timespec::try_from(real_time_as_duration_since_epoch())
+        .or(Err(Errno::EOVERFLOW))?
+        .into();
+    unsafe { tv.write_at_offset(0, timeval) }.ok_or(Errno::EFAULT)
 }
 
 /// Handle syscall `time`.
 pub(crate) fn sys_time(
     tloc: crate::MutPtr<litebox_common_linux::time_t>,
-) -> litebox_common_linux::time_t {
-    let punchthrough = litebox_common_linux::PunchthroughSyscall::Time { tloc };
-    let token = litebox_platform_multiplex::platform()
-        .get_punchthrough_token_for(punchthrough)
-        .expect("Failed to get punchthrough token for TIME");
-    token
-        .execute()
-        .map(|seconds_usize| {
-            // Safe conversion from usize to time_t (i64)
-            litebox_common_linux::time_t::try_from(seconds_usize)
-                .unwrap_or(litebox_common_linux::time_t::MAX)
-        })
-        .unwrap_or(0)
+) -> Result<litebox_common_linux::time_t, Errno> {
+    let time = real_time_as_duration_since_epoch();
+    let seconds: u64 = time.as_secs();
+    let seconds: litebox_common_linux::time_t = seconds.try_into().or(Err(Errno::EOVERFLOW))?;
+    if tloc.as_usize() != 0 {
+        unsafe { tloc.write_at_offset(0, seconds) }.ok_or(Errno::EFAULT)?;
+    }
+    Ok(seconds)
 }
 
 /// Handle syscall `getpid`.
