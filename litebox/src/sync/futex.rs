@@ -266,26 +266,33 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // We can only wake up the number of sleepers that actually exist. The number of sleepers
         // does not change while we are calculating these things because we are holding on to this
         // lock, thus no more waiters can actually enter sleep while we finish this up.
-        let num_to_wake_up: u32 = lockable.num_waiters.min(num_to_wake_up.get());
-        // Now we can actually trigger things to start waking up. We don't actually trust the
-        // underlying primitive to tell us accurately how many woke up, although we do a quick
-        // sanity check that it claims that at least one woke up.
-        let num_claimed_woken_up: usize = lockable.raw_mutex.wake_many(
-            #[expect(
-                clippy::missing_panics_doc,
-                reason = "this conversion should never fail"
-            )]
-            {
-                num_to_wake_up.try_into().unwrap()
-            },
-        );
-        debug_assert!(num_claimed_woken_up > 0);
+        let old_num_waiters = lockable.num_waiters;
+        let num_to_wake_up = num_to_wake_up.get();
+        // Now we can actually trigger things to start waking up.
+        // Note that the number of waiters that actually woke up may be less than `old_num_waiters`,
+        // because some waiter might immediately wake up so kernel doesn't count it.
+        let num_to_wake_up = if old_num_waiters >= num_to_wake_up {
+            let _ = lockable.raw_mutex.wake_many(
+                #[expect(
+                    clippy::missing_panics_doc,
+                    reason = "this conversion should never fail"
+                )]
+                {
+                    num_to_wake_up.try_into().unwrap()
+                },
+            );
+            num_to_wake_up
+        } else {
+            // Wake up all
+            let _ = lockable.raw_mutex.wake_all();
+            old_num_waiters
+        };
+
         // Releasing the lock allows those woken threads to proceed with their wake-up sequence.
         drop(lockables);
-        // Now, we spin until at least one of the waiters has woken up and finished letting us know
-        // it has woken up. We know there must have been at least one before, so as long as the
-        // value does not drop, we know that nothing has been woken up yet. If the `lockable` for it
-        // has been GC'd out, that means all wakers got woken up, which is fine too to quit out.
+        // Now, we spin until all `num_to_wake_up` waiters have woken up and finished letting us know
+        // it has woken up. If the `lockable` for it has been GC'd out, that means all wakers got woken up,
+        // which is fine too to quit out.
         //
         // XXX(jayb): This check may not be ideal if there are no waiters that have any overlap in
         // terms of bitset masks, in which case this might spin forever until at least someone with
@@ -293,7 +300,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         loop {
             let lockables = self.lockables.read();
             if let Some(lockable) = lockables.get(&addr)
-                && lockable.num_waiters >= num_to_wake_up
+                && num_to_wake_up > old_num_waiters - lockable.num_waiters
             {
                 drop(lockables);
                 core::hint::spin_loop();
@@ -304,18 +311,14 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // We can now reset the mask out, and return the number that actually woke up.
         if let Some(lockable) = self.lockables.write().get_mut(&addr) {
             lockable.latest_wake_bitset = None;
-            debug_assert!(num_to_wake_up > lockable.num_waiters);
             // Allow waiters to start waiting again
             let old_underlying_atomic = lockable
                 .raw_mutex
                 .underlying_atomic()
                 .fetch_sub(1, Ordering::SeqCst);
             debug_assert_eq!(old_underlying_atomic, 1);
-            Ok(num_to_wake_up - lockable.num_waiters)
-        } else {
-            // The addr has been GC'd from the addressables. All waiters have been woken up.
-            Ok(num_to_wake_up)
         }
+        Ok(num_to_wake_up)
     }
 }
 
