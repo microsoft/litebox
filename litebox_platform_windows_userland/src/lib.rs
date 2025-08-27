@@ -601,6 +601,26 @@ impl litebox::platform::IPInterfaceProvider for WindowsUserland {
     }
 }
 
+impl litebox::platform::NetworkInterfaceConfigProvider for WindowsUserland {
+    fn network_interface_support(&self) -> litebox::platform::NetworkInterfaceSupport {
+        // WindowsUserland currently only supports IP interface
+        litebox::platform::NetworkInterfaceSupport::IpOnly
+    }
+}
+
+impl litebox::platform::EthernetInterfaceProvider for WindowsUserland {
+    fn send_ethernet_frame(&self, _frame: &[u8]) -> Result<(), litebox::platform::SendError> {
+        unimplemented!("WindowsUserland platform does not support Ethernet interface")
+    }
+
+    fn receive_ethernet_frame(
+        &self,
+        _frame: &mut [u8],
+    ) -> Result<usize, litebox::platform::ReceiveError> {
+        unimplemented!("WindowsUserland platform does not support Ethernet interface")
+    }
+}
+
 impl litebox::platform::TimeProvider for WindowsUserland {
     type Instant = Instant;
     type SystemTime = SystemTime;

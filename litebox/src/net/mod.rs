@@ -51,8 +51,11 @@ const MAX_PACKET_COUNT: usize = 32;
 /// `underlying_atomic`.
 pub struct Network<Platform>
 where
-    Platform:
-        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
+    Platform: platform::IPInterfaceProvider
+        + platform::EthernetInterfaceProvider
+        + platform::NetworkInterfaceConfigProvider
+        + platform::TimeProvider
+        + sync::RawSyncPrimitivesProvider,
 {
     litebox: LiteBox<Platform>,
     /// The set of sockets
@@ -72,8 +75,11 @@ where
 
 impl<Platform> Network<Platform>
 where
-    Platform:
-        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
+    Platform: platform::IPInterfaceProvider
+        + platform::EthernetInterfaceProvider
+        + platform::NetworkInterfaceConfigProvider
+        + platform::TimeProvider
+        + sync::RawSyncPrimitivesProvider,
 {
     /// Construct a new `Network` instance
     ///
@@ -82,7 +88,26 @@ where
     /// system.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
         let mut device = phy::Device::new(litebox.x.platform);
-        let config = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
+
+        // Configure hardware address based on the platform's preferred interface type
+        let hardware_address = match litebox
+            .x
+            .platform
+            .network_interface_support()
+            .preferred_interface()
+        {
+            platform::NetworkInterfaceType::Ip => smoltcp::wire::HardwareAddress::Ip,
+            platform::NetworkInterfaceType::Ethernet => {
+                // Use a default MAC address for Ethernet - in a real implementation this might be configurable
+                smoltcp::wire::HardwareAddress::Ethernet(
+                    smoltcp::wire::EthernetAddress::from_bytes(&[
+                        0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+                    ]),
+                )
+            }
+        };
+
+        let config = smoltcp::iface::Config::new(hardware_address);
         let mut interface =
             smoltcp::iface::Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
         interface.update_ip_addrs(|ip_addrs| {
@@ -337,8 +362,11 @@ impl PlatformInteractionReinvocationAdvice {
 
 impl<Platform> Network<Platform>
 where
-    Platform:
-        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
+    Platform: platform::IPInterfaceProvider
+        + platform::EthernetInterfaceProvider
+        + platform::NetworkInterfaceConfigProvider
+        + platform::TimeProvider
+        + sync::RawSyncPrimitivesProvider,
 {
     /// Sets the interaction with the outside world to `platform_interaction`.
     ///
@@ -467,8 +495,11 @@ where
 
 impl<Platform> Network<Platform>
 where
-    Platform:
-        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
+    Platform: platform::IPInterfaceProvider
+        + platform::EthernetInterfaceProvider
+        + platform::NetworkInterfaceConfigProvider
+        + platform::TimeProvider
+        + sync::RawSyncPrimitivesProvider,
 {
     /// Explicitly private-only function that returns the current (smoltcp) Instant, relative to the
     /// initialized arbitrary 0-point in time.
@@ -1110,7 +1141,7 @@ pub enum TcpOptionData {
 }
 
 crate::fd::enable_fds_for_subsystem! {
-    @Platform: { platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider };
+    @Platform: { platform::IPInterfaceProvider + platform::EthernetInterfaceProvider + platform::NetworkInterfaceConfigProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider };
     Network<Platform>;
     SocketHandle;
     -> SocketFd<Platform>;

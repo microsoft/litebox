@@ -543,6 +543,26 @@ impl litebox::platform::IPInterfaceProvider for FreeBSDUserland {
     }
 }
 
+impl litebox::platform::NetworkInterfaceConfigProvider for FreeBSDUserland {
+    fn network_interface_support(&self) -> litebox::platform::NetworkInterfaceSupport {
+        // FreeBSDUserland currently only supports IP interface
+        litebox::platform::NetworkInterfaceSupport::IpOnly
+    }
+}
+
+impl litebox::platform::EthernetInterfaceProvider for FreeBSDUserland {
+    fn send_ethernet_frame(&self, _frame: &[u8]) -> Result<(), litebox::platform::SendError> {
+        unimplemented!("FreeBSDUserland platform does not support Ethernet interface")
+    }
+
+    fn receive_ethernet_frame(
+        &self,
+        _frame: &mut [u8],
+    ) -> Result<usize, litebox::platform::ReceiveError> {
+        unimplemented!("FreeBSDUserland platform does not support Ethernet interface")
+    }
+}
+
 impl litebox::platform::TimeProvider for FreeBSDUserland {
     type Instant = Instant;
     type SystemTime = SystemTime;

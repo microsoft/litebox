@@ -1583,6 +1583,76 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     }
 }
 
+impl litebox::platform::NetworkInterfaceConfigProvider for LinuxUserland {
+    fn network_interface_support(&self) -> litebox::platform::NetworkInterfaceSupport {
+        // LinuxUserland supports both IP and Ethernet interfaces, with Ethernet preferred
+        // as requested in the problem statement
+        litebox::platform::NetworkInterfaceSupport::BothWithEthernetPreferred
+    }
+}
+
+impl litebox::platform::EthernetInterfaceProvider for LinuxUserland {
+    fn send_ethernet_frame(&self, frame: &[u8]) -> Result<(), litebox::platform::SendError> {
+        // For now, implement this similarly to IP packets - LinuxUserland will use
+        // the same TUN/TAP device. In a full implementation, this might use a TAP
+        // device specifically for Ethernet frames.
+        let tun_fd = self.tun_socket_fd.read().unwrap();
+        let Some(tun_socket_fd) = tun_fd.as_ref() else {
+            unimplemented!("networking without tun is unimplemented")
+        };
+        match unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::write,
+                usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
+                frame.as_ptr() as usize,
+                frame.len(),
+                // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                syscall_intercept::SYSCALL_ARG_MAGIC,
+            )
+        } {
+            Ok(n) => {
+                if n != frame.len() {
+                    unimplemented!("unexpected size {n}")
+                }
+                Ok(())
+            }
+            Err(errno) => {
+                unimplemented!("unexpected error {errno}")
+            }
+        }
+    }
+
+    fn receive_ethernet_frame(
+        &self,
+        frame: &mut [u8],
+    ) -> Result<usize, litebox::platform::ReceiveError> {
+        // For now, implement this similarly to IP packets - LinuxUserland will use
+        // the same TUN/TAP device. In a full implementation, this might use a TAP
+        // device specifically for Ethernet frames.
+        let tun_fd = self.tun_socket_fd.read().unwrap();
+        let Some(tun_socket_fd) = tun_fd.as_ref() else {
+            unimplemented!("networking without tun is unimplemented")
+        };
+        unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::read,
+                usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
+                frame.as_mut_ptr() as usize,
+                frame.len(),
+                // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                syscall_intercept::SYSCALL_ARG_MAGIC,
+            )
+        }
+        .map_err(|errno| match errno {
+            #[allow(unreachable_patterns, reason = "EAGAIN == EWOULDBLOCK")]
+            syscalls::Errno::EWOULDBLOCK | syscalls::Errno::EAGAIN => {
+                litebox::platform::ReceiveError::WouldBlock
+            }
+            _ => unimplemented!("unexpected error {errno}"),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::AtomicU32;

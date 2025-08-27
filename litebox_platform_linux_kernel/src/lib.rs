@@ -308,6 +308,26 @@ impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
     }
 }
 
+impl<Host: HostInterface> litebox::platform::NetworkInterfaceConfigProvider for LinuxKernel<Host> {
+    fn network_interface_support(&self) -> litebox::platform::NetworkInterfaceSupport {
+        // LinuxKernel currently only supports IP interface
+        litebox::platform::NetworkInterfaceSupport::IpOnly
+    }
+}
+
+impl<Host: HostInterface> litebox::platform::EthernetInterfaceProvider for LinuxKernel<Host> {
+    fn send_ethernet_frame(&self, _frame: &[u8]) -> Result<(), litebox::platform::SendError> {
+        unimplemented!("LinuxKernel platform does not support Ethernet interface")
+    }
+
+    fn receive_ethernet_frame(
+        &self,
+        _frame: &mut [u8],
+    ) -> Result<usize, litebox::platform::ReceiveError> {
+        unimplemented!("LinuxKernel platform does not support Ethernet interface")
+    }
+}
+
 impl<Host: HostInterface> litebox::platform::StdioProvider for LinuxKernel<Host> {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
         Host::read_from_stdin(buf).map_err(|err| match err {

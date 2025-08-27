@@ -8,13 +8,24 @@ use crate::platform;
 /// The maximum transmission unit for a device
 pub(crate) const DEVICE_MTU: usize = 1600;
 
-pub(crate) struct Device<Platform: platform::IPInterfaceProvider + 'static> {
+pub(crate) struct Device<
+    Platform: platform::IPInterfaceProvider
+        + platform::EthernetInterfaceProvider
+        + platform::NetworkInterfaceConfigProvider
+        + 'static,
+> {
     pub(crate) platform: &'static Platform,
     receive_buffer: [u8; DEVICE_MTU],
     send_buffer: [u8; DEVICE_MTU],
 }
 
-impl<Platform: platform::IPInterfaceProvider> Device<Platform> {
+impl<Platform> Device<Platform>
+where
+    Platform: platform::IPInterfaceProvider
+        + platform::EthernetInterfaceProvider
+        + platform::NetworkInterfaceConfigProvider
+        + 'static,
+{
     pub(crate) fn new(platform: &'static Platform) -> Self {
         Self {
             platform,
@@ -24,7 +35,13 @@ impl<Platform: platform::IPInterfaceProvider> Device<Platform> {
     }
 }
 
-impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Platform> {
+impl<Platform> smoltcp::phy::Device for Device<Platform>
+where
+    Platform: platform::IPInterfaceProvider
+        + platform::EthernetInterfaceProvider
+        + platform::NetworkInterfaceConfigProvider
+        + 'static,
+{
     type RxToken<'a>
         = RxToken<'a>
     where
@@ -38,7 +55,21 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        match self.platform.receive_ip_packet(&mut self.receive_buffer) {
+        // Choose interface based on platform's preferred interface type
+        let result = match self
+            .platform
+            .network_interface_support()
+            .preferred_interface()
+        {
+            platform::NetworkInterfaceType::Ip => {
+                self.platform.receive_ip_packet(&mut self.receive_buffer)
+            }
+            platform::NetworkInterfaceType::Ethernet => self
+                .platform
+                .receive_ethernet_frame(&mut self.receive_buffer),
+        };
+
+        match result {
             Ok(size) => Some((
                 RxToken {
                     buffer: &self.receive_buffer[..size],
@@ -61,7 +92,15 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
 
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
         let mut caps = smoltcp::phy::DeviceCapabilities::default();
-        caps.medium = smoltcp::phy::Medium::Ip;
+        // Set the medium based on the platform's preferred interface
+        caps.medium = match self
+            .platform
+            .network_interface_support()
+            .preferred_interface()
+        {
+            platform::NetworkInterfaceType::Ip => smoltcp::phy::Medium::Ip,
+            platform::NetworkInterfaceType::Ethernet => smoltcp::phy::Medium::Ethernet,
+        };
         caps.max_transmission_unit = DEVICE_MTU;
         caps
     }
@@ -80,21 +119,40 @@ impl smoltcp::phy::RxToken for RxToken<'_> {
     }
 }
 
-pub(crate) struct TxToken<'a, Platform: platform::IPInterfaceProvider> {
+pub(crate) struct TxToken<
+    'a,
+    Platform: platform::IPInterfaceProvider
+        + platform::EthernetInterfaceProvider
+        + platform::NetworkInterfaceConfigProvider,
+> {
     platform: &'a Platform,
     buffer: &'a mut [u8],
 }
 
-impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::TxToken for TxToken<'_, Platform> {
+impl<Platform> smoltcp::phy::TxToken for TxToken<'_, Platform>
+where
+    Platform: platform::IPInterfaceProvider
+        + platform::EthernetInterfaceProvider
+        + platform::NetworkInterfaceConfigProvider,
+{
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
         let packet = &mut self.buffer[..len];
         let res = f(packet);
-        self.platform
-            .send_ip_packet(packet)
-            .expect("Sending IP packet failed");
+
+        // Choose interface based on platform's preferred interface type
+        let send_result = match self
+            .platform
+            .network_interface_support()
+            .preferred_interface()
+        {
+            platform::NetworkInterfaceType::Ip => self.platform.send_ip_packet(packet),
+            platform::NetworkInterfaceType::Ethernet => self.platform.send_ethernet_frame(packet),
+        };
+
+        send_result.expect("Sending packet/frame failed");
         res
     }
 }

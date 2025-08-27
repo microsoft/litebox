@@ -34,6 +34,8 @@ macro_rules! log_println {
 pub trait Provider:
     RawMutexProvider
     + IPInterfaceProvider
+    + EthernetInterfaceProvider
+    + NetworkInterfaceConfigProvider
     + TimeProvider
     + PunchthroughProvider
     + DebugLogProvider
@@ -296,6 +298,23 @@ pub trait IPInterfaceProvider {
     fn receive_ip_packet(&self, packet: &mut [u8]) -> Result<usize, ReceiveError>;
 }
 
+/// An Ethernet frame interface to the outside world.
+///
+/// This could be implemented via a `read`/`write` to a TAP device.
+pub trait EthernetInterfaceProvider {
+    /// Send the Ethernet frame.
+    ///
+    /// Returns `Ok(())` when entire frame is sent, or a [`SendError`] if it is unable to send the
+    /// entire frame.
+    fn send_ethernet_frame(&self, frame: &[u8]) -> Result<(), SendError>;
+
+    /// Receive an Ethernet frame into `frame`.
+    ///
+    /// Returns size of frame received, or a [`ReceiveError`] if unable to receive an entire
+    /// frame.
+    fn receive_ethernet_frame(&self, frame: &mut [u8]) -> Result<usize, ReceiveError>;
+}
+
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -307,6 +326,63 @@ pub enum SendError {}
 pub enum ReceiveError {
     #[error("Receive operation would block")]
     WouldBlock,
+}
+
+/// Network interface type that a platform supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkInterfaceType {
+    /// IP-level interface (TUN-like)
+    Ip,
+    /// Ethernet-level interface (TAP-like)
+    Ethernet,
+}
+
+/// Network interface configuration for a platform.
+///
+/// Platforms can support either IP-level interface, Ethernet-level interface, or both.
+/// When both are supported, the platform should specify which one is preferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkInterfaceSupport {
+    /// Only IP-level interface is supported
+    IpOnly,
+    /// Only Ethernet-level interface is supported
+    EthernetOnly,
+    /// Both are supported, with IP preferred
+    BothWithIpPreferred,
+    /// Both are supported, with Ethernet preferred
+    BothWithEthernetPreferred,
+}
+
+impl NetworkInterfaceSupport {
+    /// Returns true if this configuration supports IP-level interface.
+    pub fn supports_ip(&self) -> bool {
+        matches!(
+            self,
+            Self::IpOnly | Self::BothWithIpPreferred | Self::BothWithEthernetPreferred
+        )
+    }
+
+    /// Returns true if this configuration supports Ethernet-level interface.
+    pub fn supports_ethernet(&self) -> bool {
+        matches!(
+            self,
+            Self::EthernetOnly | Self::BothWithIpPreferred | Self::BothWithEthernetPreferred
+        )
+    }
+
+    /// Returns the preferred interface type.
+    pub fn preferred_interface(&self) -> NetworkInterfaceType {
+        match self {
+            Self::IpOnly | Self::BothWithIpPreferred => NetworkInterfaceType::Ip,
+            Self::EthernetOnly | Self::BothWithEthernetPreferred => NetworkInterfaceType::Ethernet,
+        }
+    }
+}
+
+/// A provider that can declare its network interface support.
+pub trait NetworkInterfaceConfigProvider {
+    /// Returns the network interface support configuration for this platform.
+    fn network_interface_support(&self) -> NetworkInterfaceSupport;
 }
 
 /// An interface to understanding time.
