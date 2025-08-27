@@ -812,6 +812,15 @@ pub fn sys_ioctl(
         Descriptor::Stdio(file) => stdio_ioctl(file, arg),
         Descriptor::File(file) => match arg {
             IoctlArg::TCGETS(..) => Err(Errno::ENOTTY),
+            IoctlArg::FIOCLEX => {
+                if litebox_fs()
+                    .set_fd_metadata(file, FileDescriptorFlags::FD_CLOEXEC)
+                    .is_err()
+                {
+                    unreachable!()
+                }
+                Ok(0)
+            }
             _ => todo!(),
         },
         Descriptor::Socket(socket) => todo!(),
