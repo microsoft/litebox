@@ -636,21 +636,6 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 )?;
                 Ok(0)
             }
-            PunchthroughSyscall::WakeByAddress { addr } => unsafe {
-                syscalls::syscall5(
-                    syscalls::Sysno::UmtxOp,
-                    addr.as_usize(),
-                    freebsd_types::UmtxOpOperation::UMTX_OP_WAKE as usize,
-                    1,
-                    addr.as_usize(),
-                    0,
-                )
-            }
-            .map_err(|err| match err {
-                errno::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
-                _ => panic!("unexpected error {err}"),
-            })
-            .map_err(litebox::platform::PunchthroughError::Failure),
             _ => {
                 unimplemented!(
                     "PunchthroughToken for FreeBSDUserland is not fully implemented yet"
