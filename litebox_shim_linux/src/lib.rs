@@ -327,6 +327,9 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
             None => Err(Errno::EFAULT),
         },
         SyscallRequest::Close { fd } => syscalls::file::sys_close(fd).map(|()| 0),
+        SyscallRequest::Lseek { fd, offset, whence } => {
+            syscalls::file::sys_lseek(fd, offset, whence)
+        }
         SyscallRequest::RtSigprocmask {
             how,
             set,
@@ -510,22 +513,18 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
                     .ok_or(Errno::EFAULT)
             })
         }),
-        SyscallRequest::Gettimeofday { tv, tz } => syscalls::process::sys_gettimeofday(tv, tz)
-            .map(|()| 0)
-            .map_err(|_| Errno::EFAULT),
+        SyscallRequest::Gettimeofday { tv, tz } => {
+            syscalls::process::sys_gettimeofday(tv, tz).map(|()| 0)
+        }
         SyscallRequest::ClockGettime { clockid, tp } => {
-            syscalls::process::sys_clock_gettime(clockid, tp)
-                .map(|()| 0)
-                .map_err(|_| Errno::EFAULT)
+            syscalls::process::sys_clock_gettime(clockid, tp).map(|()| 0)
         }
         SyscallRequest::ClockGetres { clockid, res } => {
             syscalls::process::sys_clock_getres(clockid, res);
             Ok(0)
         }
-        SyscallRequest::Time { tloc } => {
-            let second = syscalls::process::sys_time(tloc);
-            Ok(usize::try_from(second).unwrap_or(0))
-        }
+        SyscallRequest::Time { tloc } => syscalls::process::sys_time(tloc)
+            .and_then(|second| usize::try_from(second).or(Err(Errno::EOVERFLOW))),
         SyscallRequest::Openat {
             dirfd,
             pathname,

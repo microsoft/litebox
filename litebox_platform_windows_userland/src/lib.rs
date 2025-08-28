@@ -19,7 +19,7 @@ use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox::platform::{ImmediatelyWokenUp, RawMutPointer};
 use litebox_common_linux::PunchthroughSyscall;
 
-use windows_sys::Win32::Foundation as Win32_Foundation;
+use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
 use windows_sys::Win32::{
     Foundation::{GetLastError, WIN32_ERROR},
     System::Diagnostics::Debug::{
@@ -29,7 +29,7 @@ use windows_sys::Win32::{
     System::Memory::{
         self as Win32_Memory, PrefetchVirtualMemory, VirtualAlloc2, VirtualFree, VirtualProtect,
     },
-    System::SystemInformation::{self as Win32_SysInfo},
+    System::SystemInformation::{self as Win32_SysInfo, GetSystemTimeAsFileTime},
     System::Threading::{
         self as Win32_Threading, CreateThread, GetCurrentProcess, TlsAlloc, TlsFree, TlsGetValue,
         TlsSetValue,
@@ -598,9 +598,26 @@ impl litebox::platform::IPInterfaceProvider for WindowsUserland {
 
 impl litebox::platform::TimeProvider for WindowsUserland {
     type Instant = Instant;
+    type SystemTime = SystemTime;
 
     fn now(&self) -> Self::Instant {
         perf_counter::PerformanceCounterInstant::now().into()
+    }
+
+    fn current_time(&self) -> Self::SystemTime {
+        let mut filetime = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        unsafe {
+            GetSystemTimeAsFileTime(&mut filetime as *mut FILETIME);
+        }
+        let FILETIME {
+            dwLowDateTime: low,
+            dwHighDateTime: high,
+        } = filetime;
+        let filetime = (u64::from(high) << 32) | u64::from(low);
+        SystemTime { filetime }
     }
 }
 
@@ -626,6 +643,38 @@ impl From<litebox_common_linux::Timespec> for Instant {
     fn from(value: litebox_common_linux::Timespec) -> Self {
         Instant {
             inner: value.into(),
+        }
+    }
+}
+
+pub struct SystemTime {
+    // 100ns intervals since Windows epoch
+    filetime: u64,
+}
+
+impl litebox::platform::SystemTime for SystemTime {
+    // Windows epoch: Jan 1, 1601
+    // Unix epoch: Jan 1, 1970
+    // Difference: 11644473600 seconds
+    // Intervals: 100ns intervals
+    // Seconds per interval: 10^-7
+    const UNIX_EPOCH: Self = SystemTime {
+        filetime: 11_644_473_600 * 10_000_000,
+    };
+
+    fn duration_since(&self, earlier: &Self) -> Result<core::time::Duration, core::time::Duration> {
+        if self.filetime >= earlier.filetime {
+            let diff_100ns = self.filetime - earlier.filetime;
+            let nanos = diff_100ns * 100;
+            let secs = nanos / 1_000_000_000;
+            let remaining_nanos = nanos % 1_000_000_000;
+            Ok(core::time::Duration::new(secs, remaining_nanos as u32))
+        } else {
+            let diff_100ns = earlier.filetime - self.filetime;
+            let nanos = diff_100ns * 100;
+            let secs = nanos / 1_000_000_000;
+            let remaining_nanos = nanos % 1_000_000_000;
+            Err(core::time::Duration::new(secs, remaining_nanos as u32))
         }
     }
 }
@@ -668,34 +717,6 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 Win32_Threading::WakeByAddressAll(addr.as_usize() as *const c_void);
                 Ok(0)
             },
-            PunchthroughSyscall::ClockGettime { clockid, tp } => {
-                let ts = perf_counter::get_timespec(clockid);
-                let clock_timespec = litebox_common_linux::Timespec {
-                    tv_sec: ts.0,
-                    tv_nsec: ts.1 as u64,
-                };
-                let _ = unsafe { tp.write_at_offset(0, clock_timespec) };
-                Ok(0)
-            }
-            PunchthroughSyscall::Gettimeofday { tv, tz } => {
-                let ts = perf_counter::get_timespec(litebox_common_linux::CLOCK_REALTIME);
-                let timeval = litebox_common_linux::TimeVal::from(litebox_common_linux::Timespec {
-                    tv_sec: ts.0,
-                    tv_nsec: ts.1 as u64,
-                });
-                let _ = unsafe { tv.write_at_offset(0, timeval) };
-                // Handle timezone parameter (usually NULL and deprecated)
-                // Return timezone as UTC (0 minutes west, no DST)
-                let timezone = litebox_common_linux::TimeZone::new(0, 0);
-                let _ = unsafe { tz.write_at_offset(0, timezone) };
-                Ok(0)
-            }
-            PunchthroughSyscall::Time { tloc } => {
-                let ts = perf_counter::get_timespec(litebox_common_linux::CLOCK_REALTIME);
-                let seconds = ts.0 as litebox_common_linux::time_t;
-                let _ = unsafe { tloc.write_at_offset(0, seconds) };
-                Ok(usize::try_from(seconds).unwrap_or(0))
-            }
             _ => {
                 unimplemented!(
                     "PunchthroughToken for WindowsUserland is not fully implemented yet"

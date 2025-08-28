@@ -4,6 +4,7 @@ use core::mem::offset_of;
 
 use alloc::boxed::Box;
 use litebox::platform::{ExitProvider as _, RawMutPointer as _, ThreadProvider as _};
+use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{
     PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _,
     ThreadLocalStorageProvider as _,
@@ -454,19 +455,32 @@ pub(crate) fn sys_get_robust_list(
     unsafe { head_ptr.write_at_offset(0, head) }.ok_or(Errno::EFAULT)
 }
 
+fn real_time_as_duration_since_epoch() -> core::time::Duration {
+    let now = litebox_platform_multiplex::platform().current_time();
+    let unix_epoch = <litebox_platform_multiplex::Platform as TimeProvider>::SystemTime::UNIX_EPOCH;
+    now.duration_since(&unix_epoch)
+        .expect("must be after unix epoch")
+}
+
 /// Handle syscall `clock_gettime`.
 pub(crate) fn sys_clock_gettime(
     clockid: i32,
     tp: crate::MutPtr<litebox_common_linux::Timespec>,
 ) -> Result<(), Errno> {
-    let punchthrough = litebox_common_linux::PunchthroughSyscall::ClockGettime { clockid, tp };
-    let token = litebox_platform_multiplex::platform()
-        .get_punchthrough_token_for(punchthrough)
-        .expect("Failed to get punchthrough token for CLOCK_GETTIME");
-    token.execute().map(|_| ()).map_err(|e| match e {
-        litebox::platform::PunchthroughError::Failure(errno) => errno,
-        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-    })
+    let duration: core::time::Duration = match clockid {
+        0 => {
+            // CLOCK_REALTIME
+            real_time_as_duration_since_epoch()
+        }
+        1 => {
+            // CLOCK_MONOTONIC
+            let now = litebox_platform_multiplex::platform().now();
+            now.duration_since(crate::boot_time())
+        }
+        _ => unimplemented!(),
+    };
+    let timespec = litebox_common_linux::Timespec::try_from(duration).or(Err(Errno::EOVERFLOW))?;
+    unsafe { tp.write_at_offset(0, timespec) }.ok_or(Errno::EFAULT)
 }
 
 /// Handle syscall `clock_getres`.
@@ -489,32 +503,31 @@ pub(crate) fn sys_gettimeofday(
     tv: crate::MutPtr<litebox_common_linux::TimeVal>,
     tz: crate::MutPtr<litebox_common_linux::TimeZone>,
 ) -> Result<(), Errno> {
-    let punchthrough = litebox_common_linux::PunchthroughSyscall::Gettimeofday { tv, tz };
-    let token = litebox_platform_multiplex::platform()
-        .get_punchthrough_token_for(punchthrough)
-        .expect("Failed to get punchthrough token for GETTIMEOFDAY");
-    token.execute().map(|_| ()).map_err(|e| match e {
-        litebox::platform::PunchthroughError::Failure(errno) => errno,
-        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-    })
+    if tz.as_usize() != 0 {
+        // `man 2 gettimeofday`: The use of the timezone structure is obsolete; the tz argument
+        // should normally be specified as NULL.
+        unimplemented!()
+    }
+    if tv.as_usize() == 0 {
+        return Ok(());
+    }
+    let timeval = litebox_common_linux::Timespec::try_from(real_time_as_duration_since_epoch())
+        .or(Err(Errno::EOVERFLOW))?
+        .into();
+    unsafe { tv.write_at_offset(0, timeval) }.ok_or(Errno::EFAULT)
 }
 
 /// Handle syscall `time`.
 pub(crate) fn sys_time(
     tloc: crate::MutPtr<litebox_common_linux::time_t>,
-) -> litebox_common_linux::time_t {
-    let punchthrough = litebox_common_linux::PunchthroughSyscall::Time { tloc };
-    let token = litebox_platform_multiplex::platform()
-        .get_punchthrough_token_for(punchthrough)
-        .expect("Failed to get punchthrough token for TIME");
-    token
-        .execute()
-        .map(|seconds_usize| {
-            // Safe conversion from usize to time_t (i64)
-            litebox_common_linux::time_t::try_from(seconds_usize)
-                .unwrap_or(litebox_common_linux::time_t::MAX)
-        })
-        .unwrap_or(0)
+) -> Result<litebox_common_linux::time_t, Errno> {
+    let time = real_time_as_duration_since_epoch();
+    let seconds: u64 = time.as_secs();
+    let seconds: litebox_common_linux::time_t = seconds.try_into().or(Err(Errno::EOVERFLOW))?;
+    if tloc.as_usize() != 0 {
+        unsafe { tloc.write_at_offset(0, seconds) }.ok_or(Errno::EFAULT)?;
+    }
+    Ok(seconds)
 }
 
 /// Handle syscall `getpid`.
@@ -631,6 +644,102 @@ mod tests {
     static mut CHILD_TID: i32 = 0;
     static mut PARENT_PID: i32 = 0;
 
+    /// Create an aligned entry point for the new thread.
+    ///
+    /// The stack pointer at the entry of the new thread is 16-byte aligned, but regular
+    /// functions assume a 16-byte aligned stack pointer right before the call instruction,
+    /// which means the stack pointer at the entry of a regular function is actually 8-byte aligned.
+    /// We only need to do this if we want to pass a Rust function to `sys_clone`.
+    macro_rules! make_aligned_entry {
+        ($wrapper:ident, $target:path) => {
+            #[cfg(target_arch = "x86_64")]
+            #[unsafe(no_mangle)]
+            #[unsafe(naked)]
+            pub extern "C" fn $wrapper() -> ! {
+                unsafe {
+                    core::arch::naked_asm!(
+                        "test rsp, 15",  // check stack alignment
+                        "jz 2f",         // if aligned already, skip
+                        "sub rsp, 8",    // else adjust by 8
+                        "2:",
+                        "call {func}",
+                        func = sym $target,
+                    )
+                }
+            }
+            #[cfg(target_arch = "x86")]
+            #[unsafe(no_mangle)]
+            #[unsafe(naked)]
+            pub extern "C" fn $wrapper() -> ! {
+                unsafe {
+                    core::arch::naked_asm!(
+                        "test esp, 15",  // check stack alignment
+                        "jz 2f",         // if aligned already, skip
+                        "sub esp, 8",    // else adjust by 8
+                        "2:",
+                        "call {func}",
+                        func = sym $target,
+                    )
+                }
+            }
+        };
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn new_thread_main_test() -> ! {
+        let tid = super::sys_gettid();
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "Child started {tid}"
+        );
+
+        assert_eq!(
+            unsafe { PARENT_PID },
+            super::sys_getppid(),
+            "Parent PID should match"
+        );
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut current_fs_base = MaybeUninit::<usize>::uninit();
+            super::sys_arch_prctl(litebox_common_linux::ArchPrctlArg::GetFs(crate::MutPtr {
+                inner: current_fs_base.as_mut_ptr(),
+            }))
+            .expect("Failed to get FS base");
+            #[allow(static_mut_refs)]
+            let addr = unsafe { TLS.as_ptr() } as usize;
+            assert_eq!(
+                addr,
+                unsafe { current_fs_base.assume_init() },
+                "FS base should match TLS pointer"
+            );
+
+            // Check the TLS value from FS base
+            let mut fs_0: u8;
+            unsafe {
+                core::arch::asm!("mov {0}, fs:0", out(reg_byte) fs_0);
+            }
+            // Verify that the TLS value is initialized to its correct value (`1`).
+            assert_eq!(
+                fs_0, 0x1,
+                "TLS value from FS base should match the initialized value"
+            );
+        }
+
+        assert!(unsafe { CHILD_TID } > 0, "Child TID should be set");
+        assert_eq!(
+            unsafe { CHILD_TID },
+            tid,
+            "Child TID should match sys_gettid result"
+        );
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "Child TID: {}",
+            unsafe { CHILD_TID }
+        );
+        super::sys_exit(0);
+    }
+
     #[test]
     #[expect(clippy::too_many_lines)]
     fn test_thread_spawn() {
@@ -718,59 +827,6 @@ mod tests {
             stack.as_usize()
         );
         unsafe { PARENT_PID = super::sys_getppid() };
-        let main: fn() = || {
-            let tid = super::sys_gettid();
-            litebox::log_println!(
-                litebox_platform_multiplex::platform(),
-                "Child started {tid}"
-            );
-
-            assert_eq!(
-                unsafe { PARENT_PID },
-                super::sys_getppid(),
-                "Parent PID should match"
-            );
-
-            #[cfg(target_arch = "x86_64")]
-            {
-                let mut current_fs_base = MaybeUninit::<usize>::uninit();
-                super::sys_arch_prctl(litebox_common_linux::ArchPrctlArg::GetFs(crate::MutPtr {
-                    inner: current_fs_base.as_mut_ptr(),
-                }))
-                .expect("Failed to get FS base");
-                #[allow(static_mut_refs)]
-                let addr = unsafe { TLS.as_ptr() } as usize;
-                assert_eq!(
-                    addr,
-                    unsafe { current_fs_base.assume_init() },
-                    "FS base should match TLS pointer"
-                );
-
-                // Check the TLS value from FS base
-                let mut fs_0: u8;
-                unsafe {
-                    core::arch::asm!("mov {0}, fs:0", out(reg_byte) fs_0);
-                }
-                // Verify that the TLS value is initialized to its correct value (`1`).
-                assert_eq!(
-                    fs_0, 0x1,
-                    "TLS value from FS base should match the initialized value"
-                );
-            }
-
-            assert!(unsafe { CHILD_TID } > 0, "Child TID should be set");
-            assert_eq!(
-                unsafe { CHILD_TID },
-                tid,
-                "Child TID should match sys_gettid result"
-            );
-            litebox::log_println!(
-                litebox_platform_multiplex::platform(),
-                "Child TID: {}",
-                unsafe { CHILD_TID }
-            );
-            super::sys_exit(0);
-        };
 
         #[cfg(target_arch = "x86")]
         let mut user_desc = {
@@ -790,6 +846,7 @@ mod tests {
             }
         };
 
+        make_aligned_entry!(main_wrapper, new_thread_main_test);
         let result = super::sys_clone(
             flags,
             Some(parent_tid_ptr),
@@ -804,7 +861,7 @@ mod tests {
                 inner: &raw mut user_desc,
             }),
             &pt_regs,
-            main as usize,
+            main_wrapper as usize,
         )
         .expect("sys_clone failed");
         litebox::log_println!(
