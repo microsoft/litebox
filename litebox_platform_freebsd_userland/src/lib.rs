@@ -406,9 +406,7 @@ impl RawMutex {
             /* expected value */ val as usize,
             timeout,
         ) {
-            Ok(0) => {
-                Ok(UnblockedOrTimedOut::Unblocked)
-            }
+            Ok(0) => Ok(UnblockedOrTimedOut::Unblocked),
             Err(e) if e == i32::from(crate::errno::Errno::EAGAIN) as isize => {
                 Err(ImmediatelyWokenUp)
             }
@@ -446,9 +444,7 @@ impl litebox::platform::RawMutex for RawMutex {
                 // Wake failed.
                 0
             }
-            Ok(_) => {
-                n as usize
-            }
+            Ok(_) => n as usize,
         }
     }
 
