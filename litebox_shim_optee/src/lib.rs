@@ -69,6 +69,92 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> u32 {
             None => Err(TeeResult::BadParameters),
         },
         SyscallRequest::Panic { code } => syscalls::tee::sys_panic(code),
+        SyscallRequest::GetProperty {
+            prop_set,
+            index,
+            name,
+            name_len,
+            buf,
+            blen,
+            prop_type,
+        } => {
+            if let Some(buf_length) = unsafe { blen.read_at_offset(0) }
+                && usize::try_from(*buf_length).unwrap() <= MAX_KERNEL_BUF_SIZE
+            {
+                let mut prop_buf = vec![0u8; usize::try_from(*buf_length).unwrap()];
+                if name.as_usize() != 0 || name_len.as_usize() != 0 {
+                    todo!("return the name of a given property index")
+                }
+                syscalls::tee::sys_get_property(
+                    prop_set,
+                    index,
+                    None,
+                    None,
+                    &mut prop_buf,
+                    blen,
+                    prop_type,
+                )
+                .and_then(|()| {
+                    buf.copy_from_slice(0, &prop_buf)
+                        .ok_or(TeeResult::ShortBuffer)?;
+                    Ok(())
+                })
+            } else {
+                Err(TeeResult::BadParameters)
+            }
+        }
+        SyscallRequest::GetPropertyNameToIndex {
+            prop_set,
+            name,
+            name_len,
+            index,
+        } => match unsafe { name.to_cow_slice(name_len) } {
+            Some(name) => syscalls::tee::sys_get_property_name_to_index(prop_set, &name, index),
+            None => Err(TeeResult::BadParameters),
+        },
+        SyscallRequest::OpenTaSession {
+            ta_uuid,
+            cancel_req_to,
+            usr_params,
+            ta_sess_id,
+            ret_orig,
+        } => {
+            if let Some(ta_uuid) = unsafe { ta_uuid.read_at_offset(0) }
+                && let Some(usr_params) = unsafe { usr_params.read_at_offset(0) }
+            {
+                syscalls::tee::sys_open_ta_session(
+                    *ta_uuid,
+                    cancel_req_to,
+                    *usr_params,
+                    ta_sess_id,
+                    ret_orig,
+                )
+            } else {
+                Err(TeeResult::BadParameters)
+            }
+        }
+        SyscallRequest::CloseTaSession { ta_sess_id } => {
+            syscalls::tee::sys_close_ta_session(ta_sess_id)
+        }
+        SyscallRequest::InvokeTaCommand {
+            ta_sess_id,
+            cancel_req_to,
+            cmd_id,
+            params,
+            ret_orig,
+        } => {
+            if let Some(params) = unsafe { params.read_at_offset(0) } {
+                syscalls::tee::sys_invoke_ta_command(
+                    ta_sess_id,
+                    cancel_req_to,
+                    cmd_id,
+                    *params,
+                    ret_orig,
+                )
+            } else {
+                Err(TeeResult::BadParameters)
+            }
+        }
         SyscallRequest::CheckAccessRights { flags, buf, len } => {
             syscalls::tee::sys_check_access_rights(flags, buf, len)
         }
@@ -471,7 +557,7 @@ fn handle_optee_command_output(session_id: u32) {
                             "output (index: {}): {:#x} {:?}",
                             idx,
                             addr,
-                            slice,
+                            slice
                         );
                         // TODO: return the outcome
                     }

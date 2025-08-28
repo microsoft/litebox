@@ -1289,8 +1289,11 @@ syscall_callback:
     push    r11         /* pt_regs->r11 */
     push    rbx         /* pt_regs->bx */
     push    rbp         /* pt_regs->bp */
+    /* Save OP-TEE syscall's 6th and 7th arguments */
+    push    r12         /* pt_regs->r12 */
+    push    r13         /* pt_regs->r13 */
 
-    sub rsp, 32         /* skip r12-r15 */
+    sub rsp, 16         /* skip r14-r15 */
 
     /* Save the original stack pointer */
     mov  rbp, rsp
