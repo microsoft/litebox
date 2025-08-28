@@ -5,7 +5,7 @@
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
 use core::panic;
-use core::sync::atomic::{AtomicU32, AtomicUsize};
+use core::sync::atomic::AtomicU32;
 use core::time::Duration;
 use std::cell::Cell;
 use std::os::raw::c_void;
@@ -17,7 +17,7 @@ use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox::platform::{ImmediatelyWokenUp, RawMutPointer};
-use litebox::utils::ReinterpretUnsignedExt as _;
+use litebox::utils::{TruncateExt as _, ReinterpretUnsignedExt as _};
 use litebox_common_linux::PunchthroughSyscall;
 
 use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
@@ -440,7 +440,6 @@ impl litebox::platform::RawMutexProvider for WindowsUserland {
     fn new_raw_mutex(&self) -> Self::RawMutex {
         RawMutex {
             inner: AtomicU32::new(0),
-            waiter_count: AtomicUsize::new(0),
         }
     }
 }
@@ -449,7 +448,6 @@ impl litebox::platform::RawMutexProvider for WindowsUserland {
 pub struct RawMutex {
     // The `inner` is the value shown to the outside world as an underlying atomic.
     inner: AtomicU32,
-    waiter_count: AtomicUsize,
 }
 
 impl RawMutex {
@@ -464,64 +462,41 @@ impl RawMutex {
             return Err(ImmediatelyWokenUp);
         }
 
-        // Track some initial information.
-        let start = std::time::Instant::now();
-
-        // Indicate we are about to wait.
-        self.waiter_count.fetch_add(1, SeqCst);
-
-        let result = 'res: {
-            // Check if value changed before waiting
-            if self.inner.load(SeqCst) != val {
-                break 'res Err(ImmediatelyWokenUp);
-            }
-
-            // Compute timeout in ms
-            let timeout_ms = match timeout {
-                None => Win32_Threading::INFINITE, // no timeout
-                Some(timeout) => match timeout.checked_sub(start.elapsed()) {
-                    None => {
-                        // Already timed out
-                        break 'res Ok(UnblockedOrTimedOut::TimedOut);
-                    }
-                    Some(remaining_time) => {
-                        let ms = remaining_time.as_millis();
-                        u32::try_from(ms.min(u128::from(u32::MAX - 1))).unwrap()
-                    }
-                },
-            };
-
-            let ok = unsafe {
-                Win32_Threading::WaitOnAddress(
-                    (&raw const self.inner).cast::<c_void>(),
-                    (&raw const val).cast::<c_void>(),
-                    std::mem::size_of::<u32>(),
-                    timeout_ms,
-                ) != 0
-            };
-
-            if ok {
-                Ok(UnblockedOrTimedOut::Unblocked)
-            } else {
-                // Check why WaitOnAddress failed
-                let err = unsafe { GetLastError() };
-                match err {
-                    Win32_Foundation::WAIT_TIMEOUT => {
-                        // Timed out
-                        Ok(UnblockedOrTimedOut::TimedOut)
-                    }
-                    e => {
-                        // Other error, possibly spurious wakeup or value changed
-                        // Continue the loop to check the value again
-                        panic!("Unexpected error={e} for WaitOnAddress");
-                    }
-                }
+        // Compute timeout in ms
+        let timeout_ms = match timeout {
+            None => Win32_Threading::INFINITE, // no timeout
+            Some(timeout) => {
+                let ms = timeout.as_millis();
+                ms.min(u128::from(u32::MAX - 1)).truncate()
             }
         };
 
-        // Decrement waiter count before returning
-        self.waiter_count.fetch_sub(1, SeqCst);
-        result
+        let ok = unsafe {
+            Win32_Threading::WaitOnAddress(
+                (&raw const self.inner).cast::<c_void>(),
+                (&raw const val).cast::<c_void>(),
+                std::mem::size_of::<u32>(),
+                timeout_ms,
+            ) != 0
+        };
+
+        if ok {
+            Ok(UnblockedOrTimedOut::Unblocked)
+        } else {
+            // Check why WaitOnAddress failed
+            let err = unsafe { GetLastError() };
+            match err {
+                Win32_Foundation::WAIT_TIMEOUT => {
+                    // Timed out
+                    Ok(UnblockedOrTimedOut::TimedOut)
+                }
+                e => {
+                    // Other error, possibly spurious wakeup or value changed
+                    // Continue the loop to check the value again
+                    panic!("Unexpected error={e} for WaitOnAddress");
+                }
+            }
+        }
     }
 }
 
@@ -533,30 +508,24 @@ impl litebox::platform::RawMutex for RawMutex {
     fn wake_many(&self, n: usize) -> usize {
         assert!(n > 0, "wake_many should be called with n > 0");
         let n: u32 = n.try_into().unwrap();
-        let waiting = self.waiter_count.load(SeqCst);
 
+        let mutex = core::ptr::from_ref(self.underlying_atomic()).cast::<c_void>();
         unsafe {
             if n == 1 {
-                Win32_Threading::WakeByAddressSingle(
-                    self.underlying_atomic().as_ptr() as *const c_void
-                );
-            } else if (n as usize) >= waiting {
-                Win32_Threading::WakeByAddressAll(
-                    self.underlying_atomic().as_ptr() as *const c_void
-                );
+                Win32_Threading::WakeByAddressSingle(mutex);
+            } else if n >= i32::MAX as u32 {
+                Win32_Threading::WakeByAddressAll(mutex);
             } else {
                 // Wake up `n` threads iteratively
                 for _ in 0..n {
-                    Win32_Threading::WakeByAddressSingle(
-                        self.underlying_atomic().as_ptr() as *const c_void
-                    );
+                    Win32_Threading::WakeByAddressSingle(mutex);
                 }
             }
         }
 
         // For windows, the OS kernel does not tell us how many threads were actually woken up,
-        // so we just return the minimum of `n` and the current number of waiters
-        waiting.min(n as usize)
+        // so we just return `n`
+        n as usize
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
@@ -1276,7 +1245,7 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::{AtomicU32, AtomicUsize};
+    use core::sync::atomic::AtomicU32;
     use std::thread::sleep;
 
     use crate::WindowsUserland;
@@ -1287,7 +1256,6 @@ mod tests {
     fn test_raw_mutex() {
         let mutex = std::sync::Arc::new(super::RawMutex {
             inner: AtomicU32::new(0),
-            waiter_count: AtomicUsize::new(0),
         });
 
         let copied_mutex = mutex.clone();
