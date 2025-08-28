@@ -557,51 +557,21 @@ impl RawMutex {
             return Err(ImmediatelyWokenUp);
         }
 
-        // Track some initial information.
-        let start = std::time::Instant::now();
-
-        // We'll be looping unless we find a good reason to exit out of the loop, either due to a
-        // wake-up or a time-out. We do a singular (only as a one-off) check for the
-        // immediate-wake-up purely as an optimization, but otherwise, the only way to exit this
-        // loop is to actually hit an `Ok` state out for this function.
-        loop {
-            let remaining_time = match timeout {
-                None => None,
-                Some(timeout) => match timeout.checked_sub(start.elapsed()) {
-                    None => {
-                        break Ok(UnblockedOrTimedOut::TimedOut);
-                    }
-                    Some(remaining_time) => Some(remaining_time),
-                },
-            };
-
-            // We wait on the futex, with a timeout if needed; the timeout is based on how much time
-            // remains to be elapsed.
-            match futex_timeout(
-                &self.inner,
-                FutexOperation::Wait,
-                /* expected value */ val,
-                remaining_time,
-                /* ignored */ None,
-            ) {
-                Ok(0) => {
-                    return Ok(UnblockedOrTimedOut::Unblocked);
-                }
-                Err(syscalls::Errno::EAGAIN) => {
-                    if self.inner.load(SeqCst) != val {
-                        // Ah, we seem to have actually been immediately woken up! Let us not
-                        // miss this.
-                        return Err(ImmediatelyWokenUp);
-                    }
-                }
-                Err(syscalls::Errno::ETIMEDOUT) => {
-                    return Ok(UnblockedOrTimedOut::TimedOut);
-                }
-                Err(e) => {
-                    panic!("Unexpected errno={e} for FUTEX_WAIT")
-                }
-                _ => unreachable!(),
+        // We wait on the futex, with a timeout if needed
+        match futex_timeout(
+            &self.inner,
+            FutexOperation::Wait,
+            /* expected value */ val,
+            timeout,
+            /* ignored */ None,
+        ) {
+            Ok(0) => Ok(UnblockedOrTimedOut::Unblocked),
+            Err(syscalls::Errno::EAGAIN) => Err(ImmediatelyWokenUp),
+            Err(syscalls::Errno::ETIMEDOUT) => Ok(UnblockedOrTimedOut::TimedOut),
+            Err(e) => {
+                panic!("Unexpected errno={e} for FUTEX_WAIT")
             }
+            _ => unreachable!(),
         }
     }
 }
