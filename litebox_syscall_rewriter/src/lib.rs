@@ -631,7 +631,7 @@ fn hook_syscall_and_after(
 #[allow(clippy::too_many_arguments)]
 fn hook_syscall_before_and_after(
     arch: Arch,
-    _control_transfer_targets: &HashSet<u64>,
+    control_transfer_targets: &HashSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
@@ -657,10 +657,19 @@ fn hook_syscall_before_and_after(
     let prev_inst = &instructions[inst_index - 1];
     let next_inst = &instructions[inst_index + 1];
 
+    // Make sure we have enough space
     if prev_inst.len() + syscall_inst.len() + next_inst.len() < 5 {
         return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
     }
 
+    // Both the syscall and its following instructions cannot be a control transfer target
+    if control_transfer_targets.contains(&syscall_inst_addr)
+        || control_transfer_targets.contains(&next_inst.address())
+    {
+        return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
+    }
+
+    // We don't support the case when the previous instruction is a control transfer instruction
     let prev_inst_detail = cs.insn_detail(prev_inst).unwrap();
     if prev_inst_detail.groups().iter().any(|&grp| {
         grp.0 == u8::try_from(X86_GRP_JUMP).unwrap()
@@ -680,6 +689,9 @@ fn hook_syscall_before_and_after(
     {
         return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
     }
+
+    let mut need_jump_back = true;
+
     if next_inst_detail
         .groups()
         .iter()
@@ -699,6 +711,15 @@ fn hook_syscall_before_and_after(
         {
             return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
         }
+        need_jump_back = false;
+    }
+
+    if next_inst_detail
+        .groups()
+        .iter()
+        .any(|&grp| grp.0 == u8::try_from(X86_GRP_RET).unwrap())
+    {
+        need_jump_back = false;
     }
 
     let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
@@ -728,12 +749,14 @@ fn hook_syscall_before_and_after(
     // Copy the next inst
     trampoline_data.extend_from_slice(next_inst.bytes());
 
-    // Add jmp back to original after syscall
-    let return_addr = next_inst.address() + next_inst.bytes().len() as u64;
-    let jmp_back_offset = i64::try_from(return_addr).unwrap()
-        - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 5).unwrap();
-    trampoline_data.push(0xE9);
-    trampoline_data.extend_from_slice(&(i32::try_from(jmp_back_offset).unwrap().to_le_bytes()));
+    // Add jmp back to original after syscall if needed
+    if need_jump_back {
+        let return_addr = next_inst.address() + next_inst.bytes().len() as u64;
+        let jmp_back_offset = i64::try_from(return_addr).unwrap()
+            - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 5).unwrap();
+        trampoline_data.push(0xE9);
+        trampoline_data.extend_from_slice(&(i32::try_from(jmp_back_offset).unwrap().to_le_bytes()));
+    }
 
     // Replace original instructions with jump to trampoline
     let replace_offset = usize::try_from(replace_start - section_base_addr).unwrap();
