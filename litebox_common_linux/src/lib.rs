@@ -513,6 +513,7 @@ pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const FIONBIO: u32 = 0x5421;
+pub const FIOCLEX: u32 = 0x5451;
 pub const TIOCGPTN: u32 = 0x80045430;
 
 /// Commands for use with `ioctl`.
@@ -529,6 +530,8 @@ pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     TIOCGPTN(Platform::RawMutPointer<u32>),
     /// Enables or disables non-blocking mode
     FIONBIO(Platform::RawConstPointer<i32>),
+    /// Set close on exec
+    FIOCLEX,
     Raw {
         cmd: u32,
         arg: Platform::RawMutPointer<u8>,
@@ -1883,6 +1886,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
+                        FIOCLEX => IoctlArg::FIOCLEX,
                         _ => IoctlArg::Raw {
                             cmd,
                             arg: ctx.sys_req_ptr(2),
