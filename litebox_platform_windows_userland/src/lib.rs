@@ -712,10 +712,6 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 )?;
                 Ok(0)
             }
-            PunchthroughSyscall::WakeByAddress { addr } => unsafe {
-                Win32_Threading::WakeByAddressAll(addr.as_usize() as *const c_void);
-                Ok(0)
-            },
             _ => {
                 unimplemented!(
                     "PunchthroughToken for WindowsUserland is not fully implemented yet"
