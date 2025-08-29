@@ -159,14 +159,11 @@ fn test_runner_with_dynamic_lib(
                     .join("litebox_rtld_audit.so")
                     .to_str()
                     .unwrap(),
-                tar_dir
-                    .join("lib64/litebox_rtld_audit.so")
-                    .to_str()
-                    .unwrap()
+                tar_dir.join("lib/litebox_rtld_audit.so").to_str().unwrap()
             );
             std::fs::copy(
                 std::path::Path::new(dir_path.as_str()).join("litebox_rtld_audit.so"),
-                tar_dir.join("lib64/litebox_rtld_audit.so"),
+                tar_dir.join("lib/litebox_rtld_audit.so"),
             )
             .unwrap();
         }
@@ -218,7 +215,7 @@ fn test_runner_with_dynamic_lib(
     match backend {
         Backend::Rewriter => {
             args.push("--env");
-            args.push("LD_AUDIT=/lib64/litebox_rtld_audit.so");
+            args.push("LD_AUDIT=/lib/litebox_rtld_audit.so");
         }
         Backend::Seccomp => {
             // No need to set LD_AUDIT for seccomp backend
@@ -247,6 +244,7 @@ const HELLO_WORLD_INIT_FILES: [&str; 2] = [
 #[cfg(target_arch = "x86")]
 const HELLO_WORLD_INIT_FILES: [&str; 2] = ["/lib/ld-linux.so.2", "/lib32/libc.so.6"];
 
+// our rtld_audit does not support x86 yet
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_runner_with_dynamic_lib_rewriter() {
