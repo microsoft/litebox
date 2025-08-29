@@ -9,7 +9,7 @@ enum Backend {
 }
 
 #[allow(clippy::too_many_lines)]
-fn run_with_dynamic_lib(
+fn run_target_program(
     backend: Backend,
     target: &Path,
     cmd_args: &[&str],
@@ -58,7 +58,7 @@ fn run_with_dynamic_lib(
     }
     std::fs::create_dir_all(tar_dir.join("out")).unwrap();
     let libs = common::find_dependencies(target.to_str().unwrap());
-    for file in libs {
+    for file in &libs {
         let file_path = std::path::Path::new(file.as_str());
         let dest_path = tar_dir.join(&file[1..]);
         match backend {
@@ -114,23 +114,22 @@ fn run_with_dynamic_lib(
         std::str::from_utf8(output.stderr.as_slice()).unwrap()
     );
 
-    match backend {
-        Backend::Rewriter => {
-            println!(
-                "Copying {} to {}",
-                std::path::Path::new(dir_path.as_str())
-                    .join("litebox_rtld_audit.so")
-                    .to_str()
-                    .unwrap(),
-                tar_dir.join("lib/litebox_rtld_audit.so").to_str().unwrap()
-            );
-            std::fs::copy(
-                std::path::Path::new(dir_path.as_str()).join("litebox_rtld_audit.so"),
-                tar_dir.join("lib/litebox_rtld_audit.so"),
-            )
-            .unwrap();
-        }
-        Backend::Seccomp => {}
+    if let Backend::Rewriter = backend
+        && !libs.is_empty()
+    {
+        println!(
+            "Copying {} to {}",
+            std::path::Path::new(dir_path.as_str())
+                .join("litebox_rtld_audit.so")
+                .to_str()
+                .unwrap(),
+            tar_dir.join("lib/litebox_rtld_audit.so").to_str().unwrap()
+        );
+        std::fs::copy(
+            std::path::Path::new(dir_path.as_str()).join("litebox_rtld_audit.so"),
+            tar_dir.join("lib/litebox_rtld_audit.so"),
+        )
+        .unwrap();
     }
 
     // create tar file using `tar` command
@@ -226,7 +225,20 @@ fn test_runner_with_dynamic_lib_rewriter() {
             .expect("failed to get file stem");
         let unique_name = format!("{stem}_rewriter");
         let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
-        run_with_dynamic_lib(Backend::Rewriter, &target, &[], |_| {}, &unique_name);
+        run_target_program(Backend::Rewriter, &target, &[], |_| {}, &unique_name);
+    }
+}
+
+#[test]
+fn test_runner_with_static_exec_rewriter() {
+    for path in find_c_test_files("./tests") {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("failed to get file stem");
+        let unique_name = format!("{stem}_exec_rewriter");
+        let target = common::compile(path.to_str().unwrap(), &unique_name, true, false);
+        run_target_program(Backend::Rewriter, &target, &[], |_| {}, &unique_name);
     }
 }
 
@@ -239,7 +251,7 @@ fn test_runner_with_dynamic_lib_seccomp() {
             .expect("failed to get file stem");
         let unique_name = format!("{stem}_seccomp");
         let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
-        run_with_dynamic_lib(Backend::Seccomp, &target, &[], |_| {}, &unique_name);
+        run_target_program(Backend::Seccomp, &target, &[], |_| {}, &unique_name);
     }
 }
 
@@ -269,7 +281,7 @@ console.log(content);
 ";
 
     let node_path = run_which("node");
-    run_with_dynamic_lib(
+    run_target_program(
         Backend::Seccomp,
         &node_path,
         &["/out/hello_world.js"],
@@ -285,7 +297,7 @@ console.log(content);
 #[test]
 fn test_runner_with_ls() {
     let ls_path = run_which("ls");
-    let output = run_with_dynamic_lib(Backend::Seccomp, &ls_path, &["-a"], |_| {}, "ls_seccomp");
+    let output = run_target_program(Backend::Seccomp, &ls_path, &["-a"], |_| {}, "ls_seccomp");
 
     let output_str = String::from_utf8_lossy(&output);
     let normalized = output_str.split_whitespace().collect::<Vec<_>>();
@@ -297,7 +309,7 @@ fn test_runner_with_ls() {
     }
 
     // test `ls` subdir
-    let output = run_with_dynamic_lib(
+    let output = run_target_program(
         Backend::Seccomp,
         &ls_path,
         &["-a", "/lib/x86_64-linux-gnu"],
