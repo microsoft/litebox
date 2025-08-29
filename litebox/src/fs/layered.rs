@@ -335,6 +335,88 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             rdev,
         }
     }
+
+    /// Helper method to truncate an existing file to zero length
+    fn truncate_existing_file(
+        &self,
+        path: &str,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<FileFd<Platform, Upper, Lower>, OpenError> {
+        use alloc::string::ToString;
+
+        // Check where the file exists and handle each case appropriately
+        match (self.upper.file_status(path), self.lower.file_status(path)) {
+            // File exists in upper layer (may also exist in lower, but upper takes precedence)
+            (Ok(_), _) => {
+                // Here we delegate the actual upper layer's fs to truncate the file, by passing `open(flags)`
+                let upper_fd = self.upper.open(path, flags, mode)?;
+                let entry = Arc::new(EntryX::Upper { fd: upper_fd });
+                Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+                    path: path.to_string(),
+                    flags,
+                    entry,
+                    position: 0.into(),
+                }))
+            }
+            // File exists only in lower layer
+            (Err(_), Ok(lower_status)) => {
+                match self.layering_semantics {
+                    LayeringSemantics::LowerLayerReadOnly => {
+                        // Create empty file in upper layer to shadow lower layer (migration).
+                        // We add the flage `O_CREAT` here to ensure an empty file will be created.
+                        let upper_fd =
+                            self.upper
+                                .open(path, flags | OFlags::CREAT, lower_status.mode)?;
+                        let entry = Arc::new(EntryX::Upper { fd: upper_fd });
+                        Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+                            path: path.to_string(),
+                            flags,
+                            entry,
+                            position: 0.into(),
+                        }))
+                    }
+                    LayeringSemantics::LowerLayerWritableFiles => {
+                        // Truncate directly in lower layer.
+                        // Here we delegate the actual lower layer's fs to truncate the file, by passing `open(flags)`
+                        let lower_fd = self.lower.open(path, flags, mode)?;
+                        let entry = Arc::new(EntryX::Lower { fd: lower_fd });
+
+                        // Update the entry in root tracking
+                        let _old = self
+                            .root
+                            .write()
+                            .entries
+                            .insert(path.to_string(), Arc::clone(&entry));
+
+                        Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+                            path: path.to_string(),
+                            flags,
+                            entry,
+                            position: 0.into(),
+                        }))
+                    }
+                }
+            }
+            // File doesn't exist in either layer
+            (Err(_), Err(_)) => {
+                if flags.contains(OFlags::CREAT) {
+                    // Create new empty file in upper layer
+                    let upper_fd = self.upper.open(path, flags, mode)?;
+                    let entry = Arc::new(EntryX::Upper { fd: upper_fd });
+                    Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+                        path: path.to_string(),
+                        flags,
+                        entry,
+                        position: 0.into(),
+                    }))
+                } else {
+                    // File doesn't exist and O_CREAT not specified
+                    Err(PathError::NoSuchFileOrDirectory.into())
+                }
+            }
+        }
+    }
 }
 
 /// Possible errors when migrating a file up from lower to upper layer
@@ -371,11 +453,29 @@ impl<
             | OFlags::RDWR
             | OFlags::NOCTTY
             | OFlags::DIRECTORY
-            | OFlags::NONBLOCK;
+            | OFlags::NONBLOCK
+            | OFlags::TRUNC;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!()
         }
         let path = self.absolute_path(path)?;
+
+        // Handle O_TRUNC: truncate file to zero length if opened for writing
+        if flags.contains(OFlags::TRUNC)
+            && (flags.contains(OFlags::WRONLY) || flags.contains(OFlags::RDWR))
+        {
+            // Check if the file exists before attempting truncation
+            if self.file_status(path.as_str()).is_ok() {
+                // File exists, we need to truncate it
+                return self.truncate_existing_file(path.as_str(), flags, mode);
+            }
+            // If file doesn't exist and O_CREAT is not specified, this should fail
+            if !flags.contains(OFlags::CREAT) {
+                return Err(PathError::NoSuchFileOrDirectory.into());
+            }
+            // If O_CREAT is also specified, continue with normal creation (which creates an empty file)
+        }
+
         if flags.contains(OFlags::CREAT) {
             // We must first attempt to open the file _without_ creating it, and only if that fails,
             // do we fall-through and end up creating it (which will happen on the upper layer).

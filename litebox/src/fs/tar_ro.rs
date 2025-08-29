@@ -152,7 +152,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::RDWR
             | OFlags::NOCTTY
             | OFlags::DIRECTORY
-            | OFlags::NONBLOCK;
+            | OFlags::NONBLOCK
+            | OFlags::TRUNC;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!()
         }
@@ -180,6 +181,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
         if flags.contains(OFlags::RDWR) || flags.contains(OFlags::WRONLY) {
+            return Err(OpenError::ReadOnlyFileSystem);
+        }
+        // Handle O_TRUNC on read-only filesystem - this should also fail
+        if flags.contains(OFlags::TRUNC)
+            && (flags.contains(OFlags::WRONLY) || flags.contains(OFlags::RDWR))
+        {
             return Err(OpenError::ReadOnlyFileSystem);
         }
         assert!(flags.contains(OFlags::RDONLY));

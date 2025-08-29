@@ -145,7 +145,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::RDWR
             | OFlags::NOCTTY
             | OFlags::DIRECTORY
-            | OFlags::NONBLOCK;
+            | OFlags::NONBLOCK
+            | OFlags::TRUNC;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!()
         }
@@ -217,6 +218,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 if flags.contains(OFlags::DIRECTORY) {
                     return Err(OpenError::PathError(PathError::ComponentNotADirectory));
                 }
+
+                // Handle O_TRUNC: truncate file to zero length if opened for writing
+                if flags.contains(OFlags::TRUNC)
+                    && (flags.contains(OFlags::WRONLY) || flags.contains(OFlags::RDWR))
+                {
+                    if write_allowed {
+                        file.write().data.clear();
+                    } else {
+                        // Un-specified behavior (https://www.man7.org/linux/man-pages/man2/open.2.html)
+                    }
+                }
+
                 Ok(self
                     .litebox
                     .descriptor_table_mut()

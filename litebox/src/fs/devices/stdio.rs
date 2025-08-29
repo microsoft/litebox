@@ -95,7 +95,7 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
     ) -> Result<FileFd<Platform>, OpenError> {
         let open_directory = flags.contains(OFlags::DIRECTORY);
         let nonblocking = flags.contains(OFlags::NONBLOCK);
-        let flags = flags - OFlags::DIRECTORY - OFlags::NONBLOCK - OFlags::NOCTTY; // ignore NOCTTY
+        let flags = flags - OFlags::DIRECTORY - OFlags::NONBLOCK - OFlags::NOCTTY - OFlags::TRUNC; // ignore NOCTTY and TRUNC
         let path = self.absolute_path(path)?;
         let stream = match path.as_str() {
             "/dev/stdin" => {
