@@ -713,6 +713,102 @@ mod tests {
     static mut CHILD_TID: i32 = 0;
     static mut PARENT_PID: i32 = 0;
 
+    /// Create an aligned entry point for the new thread.
+    ///
+    /// The stack pointer at the entry of the new thread is 16-byte aligned, but regular
+    /// functions assume a 16-byte aligned stack pointer right before the call instruction,
+    /// which means the stack pointer at the entry of a regular function is actually 8-byte aligned.
+    /// We only need to do this if we want to pass a Rust function to `sys_clone`.
+    macro_rules! make_aligned_entry {
+        ($wrapper:ident, $target:path) => {
+            #[cfg(target_arch = "x86_64")]
+            #[unsafe(no_mangle)]
+            #[unsafe(naked)]
+            pub extern "C" fn $wrapper() -> ! {
+                unsafe {
+                    core::arch::naked_asm!(
+                        "test rsp, 15",  // check stack alignment
+                        "jz 2f",         // if aligned already, skip
+                        "sub rsp, 8",    // else adjust by 8
+                        "2:",
+                        "call {func}",
+                        func = sym $target,
+                    )
+                }
+            }
+            #[cfg(target_arch = "x86")]
+            #[unsafe(no_mangle)]
+            #[unsafe(naked)]
+            pub extern "C" fn $wrapper() -> ! {
+                unsafe {
+                    core::arch::naked_asm!(
+                        "test esp, 15",  // check stack alignment
+                        "jz 2f",         // if aligned already, skip
+                        "sub esp, 8",    // else adjust by 8
+                        "2:",
+                        "call {func}",
+                        func = sym $target,
+                    )
+                }
+            }
+        };
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn new_thread_main_test() -> ! {
+        let tid = super::sys_gettid();
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "Child started {tid}"
+        );
+
+        assert_eq!(
+            unsafe { PARENT_PID },
+            super::sys_getppid(),
+            "Parent PID should match"
+        );
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut current_fs_base = MaybeUninit::<usize>::uninit();
+            super::sys_arch_prctl(litebox_common_linux::ArchPrctlArg::GetFs(crate::MutPtr {
+                inner: current_fs_base.as_mut_ptr(),
+            }))
+            .expect("Failed to get FS base");
+            #[allow(static_mut_refs)]
+            let addr = unsafe { TLS.as_ptr() } as usize;
+            assert_eq!(
+                addr,
+                unsafe { current_fs_base.assume_init() },
+                "FS base should match TLS pointer"
+            );
+
+            // Check the TLS value from FS base
+            let mut fs_0: u8;
+            unsafe {
+                core::arch::asm!("mov {0}, fs:0", out(reg_byte) fs_0);
+            }
+            // Verify that the TLS value is initialized to its correct value (`1`).
+            assert_eq!(
+                fs_0, 0x1,
+                "TLS value from FS base should match the initialized value"
+            );
+        }
+
+        assert!(unsafe { CHILD_TID } > 0, "Child TID should be set");
+        assert_eq!(
+            unsafe { CHILD_TID },
+            tid,
+            "Child TID should match sys_gettid result"
+        );
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "Child TID: {}",
+            unsafe { CHILD_TID }
+        );
+        super::sys_exit(0);
+    }
+
     #[test]
     #[expect(clippy::too_many_lines)]
     fn test_thread_spawn() {
@@ -800,59 +896,6 @@ mod tests {
             stack.as_usize()
         );
         unsafe { PARENT_PID = super::sys_getppid() };
-        let main: fn() = || {
-            let tid = super::sys_gettid();
-            litebox::log_println!(
-                litebox_platform_multiplex::platform(),
-                "Child started {tid}"
-            );
-
-            assert_eq!(
-                unsafe { PARENT_PID },
-                super::sys_getppid(),
-                "Parent PID should match"
-            );
-
-            #[cfg(target_arch = "x86_64")]
-            {
-                let mut current_fs_base = MaybeUninit::<usize>::uninit();
-                super::sys_arch_prctl(litebox_common_linux::ArchPrctlArg::GetFs(crate::MutPtr {
-                    inner: current_fs_base.as_mut_ptr(),
-                }))
-                .expect("Failed to get FS base");
-                #[allow(static_mut_refs)]
-                let addr = unsafe { TLS.as_ptr() } as usize;
-                assert_eq!(
-                    addr,
-                    unsafe { current_fs_base.assume_init() },
-                    "FS base should match TLS pointer"
-                );
-
-                // Check the TLS value from FS base
-                let mut fs_0: u8;
-                unsafe {
-                    core::arch::asm!("mov {0}, fs:0", out(reg_byte) fs_0);
-                }
-                // Verify that the TLS value is initialized to its correct value (`1`).
-                assert_eq!(
-                    fs_0, 0x1,
-                    "TLS value from FS base should match the initialized value"
-                );
-            }
-
-            assert!(unsafe { CHILD_TID } > 0, "Child TID should be set");
-            assert_eq!(
-                unsafe { CHILD_TID },
-                tid,
-                "Child TID should match sys_gettid result"
-            );
-            litebox::log_println!(
-                litebox_platform_multiplex::platform(),
-                "Child TID: {}",
-                unsafe { CHILD_TID }
-            );
-            super::sys_exit(0);
-        };
 
         #[cfg(target_arch = "x86")]
         let mut user_desc = {
@@ -872,7 +915,8 @@ mod tests {
             }
         };
 
-        let child_tid = super::sys_clone(
+        make_aligned_entry!(main_wrapper, new_thread_main_test);
+        let result = super::sys_clone(
             flags,
             Some(parent_tid_ptr),
             Some(stack),
@@ -886,7 +930,7 @@ mod tests {
                 inner: &raw mut user_desc,
             }),
             &pt_regs,
-            main as usize,
+            main_wrapper as usize,
         )
         .expect("sys_clone failed");
         litebox::log_println!(
