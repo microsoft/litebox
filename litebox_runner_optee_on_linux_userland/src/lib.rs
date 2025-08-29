@@ -38,7 +38,7 @@ pub struct CliArgs {
         long = "interception-backend",
         requires = "unstable",
         help_heading = "Unstable Options",
-        default_value = "seccomp"
+        default_value = "rewriter"
     )]
     pub interception_backend: InterceptionBackend,
 }

@@ -162,6 +162,16 @@ impl From<litebox::fs::errors::WriteError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::SeekError> for Errno {
+    fn from(value: litebox::fs::errors::SeekError) -> Self {
+        match value {
+            litebox::fs::errors::SeekError::NotAFile => Errno::EBADF,
+            litebox::fs::errors::SeekError::InvalidOffset => Errno::EINVAL,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::platform::page_mgmt::AllocationError> for Errno {
     fn from(value: litebox::platform::page_mgmt::AllocationError) -> Self {
         match value {
