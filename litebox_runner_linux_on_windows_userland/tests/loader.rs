@@ -353,3 +353,69 @@ fn test_testcase_dynamic_with_rewriter() {
         |_| {},
     );
 }
+
+#[allow(clippy::too_many_lines)]
+// Assume we have every needed files (including audit_rtld.so, and all libs) in a tar_source directory A/
+fn test_runner_with_tar_source_dir(
+    target: &str,
+    cmd_args: &[&str],
+    tar_name: &str,
+) -> Vec<u8> {
+    let backend_str = "rewriter";
+
+    // Use the already compiled executable from the tests folder (same dir as this file)
+    let test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    let path = test_dir.join(target);
+    assert!(path.exists(), "Target binary not found at {}", path.to_str().unwrap());
+    println!("Using target executable binary at: {}", path.to_str().unwrap());
+
+    // create tar file using `tar` command
+    let tar_file = test_dir.join(tar_name);
+    assert!(tar_file.exists(), "Tar source directory not found at {}", tar_file.to_str().unwrap());
+    println!("Tar file at: {}", tar_file.to_str().unwrap());
+
+    // run litebox_runner_linux_userland with the tar file and the compiled executable
+    let mut args = vec![
+        "run",
+        "-p",
+        "litebox_runner_linux_on_windows_userland",
+        "--",
+        "--unstable",
+        // Tell ld where to find the libraries.
+        // See https://man7.org/linux/man-pages/man8/ld.so.8.html for how ld works.
+        // Alternatively, we could add a `/etc/ld.so.cache` file to the rootfs.
+        "--env",
+        "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
+        "--env",
+        "HOME=/",
+        "--initial-files",
+        tar_file.to_str().unwrap(),
+        "--env",
+        "LD_AUDIT=/lib64/litebox_rtld_audit.so"
+    ];
+
+    args.push(path.to_str().unwrap());
+    args.extend_from_slice(cmd_args);
+
+    println!("WINDOWS Running `cargo {}`", args.join(" "));
+    let output = std::process::Command::new("cargo")
+        .args(args)
+        .output()
+        .expect("Failed to run litebox_runner_linux_on_windows_userland");
+    assert!(
+        output.status.success(),
+        "failed to run litebox_runner_linux_on_windows_userland {:?}",
+        std::str::from_utf8(output.stderr.as_slice()).unwrap()
+    );
+    output.stdout
+}
+
+#[test]
+fn test_tar_rewriter() {
+    test_runner_with_tar_source_dir(
+        "python3.hooked",
+        &["/out/hello.py"],
+        "rootfs_python_rewriter.tar",
+    );
+}

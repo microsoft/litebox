@@ -713,38 +713,6 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 )?;
                 Ok(0)
             }
-            PunchthroughSyscall::WakeByAddress { addr } => unsafe {
-                Win32_Threading::WakeByAddressAll(addr.as_usize() as *const c_void);
-                Ok(0)
-            },
-            PunchthroughSyscall::ClockGettime { clockid, tp } => {
-                let ts = perf_counter::get_timespec(clockid);
-                let clock_timespec = litebox_common_linux::Timespec {
-                    tv_sec: ts.0,
-                    tv_nsec: ts.1 as u64,
-                };
-                let _ = unsafe { tp.write_at_offset(0, clock_timespec) };
-                Ok(0)
-            }
-            PunchthroughSyscall::Gettimeofday { tv, tz } => {
-                let ts = perf_counter::get_timespec(litebox_common_linux::CLOCK_REALTIME);
-                let timeval = litebox_common_linux::TimeVal::from(litebox_common_linux::Timespec {
-                    tv_sec: ts.0,
-                    tv_nsec: ts.1 as u64,
-                });
-                let _ = unsafe { tv.write_at_offset(0, timeval) };
-                // Handle timezone parameter (usually NULL and deprecated)
-                // Return timezone as UTC (0 minutes west, no DST)
-                let timezone = litebox_common_linux::TimeZone::new(0, 0);
-                let _ = unsafe { tz.write_at_offset(0, timezone) };
-                Ok(0)
-            }
-            PunchthroughSyscall::Time { tloc } => {
-                let ts = perf_counter::get_timespec(litebox_common_linux::CLOCK_REALTIME);
-                let seconds = ts.0 as litebox_common_linux::time_t;
-                let _ = unsafe { tloc.write_at_offset(0, seconds) };
-                Ok(usize::try_from(seconds).unwrap_or(0))
-            }
             // TODO(chuqi): Currently, we just add a placeholder (dummy) implementation for signals. This is to
             // allow temporal testing on target binaries like Node and Python. Will add actual implementation.
             // See this issue: https://github.com/microsoft/litebox/issues/285
