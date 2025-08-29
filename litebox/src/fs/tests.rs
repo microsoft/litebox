@@ -1171,6 +1171,7 @@ mod layered {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines)]
     fn o_trunc_flag_tests() {
         let litebox = LiteBox::new(MockPlatform::new());
 
