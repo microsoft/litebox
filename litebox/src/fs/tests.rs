@@ -408,6 +408,7 @@ mod in_mem {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines)]
     fn o_trunc_flag_tests() {
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);
