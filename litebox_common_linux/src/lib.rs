@@ -1983,8 +1983,14 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 arg: FcntlArg::from(ctx.sys_req_arg(1), ctx.sys_req_arg(2)),
             },
             Sysno::gettimeofday => sys_req!(Gettimeofday { tv:*, tz:* }),
+            #[cfg(target_arch = "x86_64")]
             Sysno::clock_gettime => sys_req!(ClockGettime { clockid, tp:* }),
+            #[cfg(target_arch = "x86")]
+            Sysno::clock_gettime64 => sys_req!(ClockGettime { clockid, tp:* }),
+            #[cfg(target_arch = "x86_64")]
             Sysno::clock_getres => sys_req!(ClockGetres { clockid, res:* }),
+            #[cfg(target_arch = "x86")]
+            Sysno::clock_getres_time64 => sys_req!(ClockGetres { clockid, res:* }),
             Sysno::time => sys_req!(Time { tloc:* }),
             Sysno::getcwd => sys_req!(Getcwd { buf:*, size }),
             Sysno::readlink => sys_req!(Readlink { pathname:*, buf:* ,bufsiz }),
