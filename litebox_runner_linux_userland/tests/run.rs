@@ -492,7 +492,7 @@ fn test_tar_rewriter() {
 }
 
 #[test]
-fn debug_tar() {
+fn debug_python_tar() {
     let python3_path = std::path::PathBuf::from("/home/chuqi/GitHub/litebox/litebox_runner_linux_userland/python3.hooked");
     
     let rootfs_tar = std::path::PathBuf::from("/home/chuqi/GitHub/litebox/litebox_runner_linux_userland/rootfs_python_rewriter.tar");
@@ -512,6 +512,7 @@ fn debug_tar() {
         program_and_arguments: vec![
             python3_path.to_str().unwrap().to_string(),
             "/Lib/test/test_bool.py".to_string(),
+            // "/out/hello.py".to_string()
         ],
         insert_files: vec![],
         initial_files: Some(rootfs_tar),

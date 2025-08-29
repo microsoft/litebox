@@ -315,6 +315,9 @@ const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
 #[allow(clippy::too_many_lines)]
 pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
+    #[cfg(debug_assertions)]
+    litebox::log_println!(litebox_platform_multiplex::platform(), "{request:?}");
+    
     let res: Result<usize, Errno> = match request {
         SyscallRequest::Ret(errno) => Err(errno),
         SyscallRequest::Exit { status } => syscalls::process::sys_exit(status),
@@ -749,6 +752,9 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
             todo!()
         }
     };
+
+    #[cfg(debug_assertions)]
+    litebox::log_println!(litebox_platform_multiplex::platform(), "result: {res:?}");
 
     res.map_or_else(
         |e| {
