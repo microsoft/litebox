@@ -413,6 +413,7 @@ fn test_runner_with_tar_source_dir(
             "lib64",
             "usr",
             "out",
+            "Lib"
         ])
         .current_dir(&tar_source_dir)
         .output()
@@ -485,16 +486,16 @@ fn test_tar_rewriter() {
     test_runner_with_tar_source_dir(
         Backend::Rewriter,
         "python3.hooked",
-        &["/out/hello.py"],
+        &["/Lib/test/test_bool.py"], // /out/hello.py
         PathBuf::from(tar_source_dir),
     );
 }
 
 #[test]
 fn debug_tar() {
-    let python3_path = run_which("python3");
+    let python3_path = std::path::PathBuf::from("/home/chuqi/GitHub/litebox/litebox_runner_linux_userland/python3.hooked");
     
-    let rootfs_tar = std::path::PathBuf::from("/home/chuqi/GitHub/litebox/litebox_runner_linux_userland/rootfs_python.tar");
+    let rootfs_tar = std::path::PathBuf::from("/home/chuqi/GitHub/litebox/litebox_runner_linux_userland/rootfs_python_rewriter.tar");
     // Call litebox_runner_linux_userland directly
     
     // Craft CliArgs manually
@@ -502,14 +503,15 @@ fn debug_tar() {
         unstable: true,
         forward_environment_variables: false,
         rewrite_syscalls: false,
-        interception_backend: litebox_runner_linux_userland::InterceptionBackend::Seccomp,
+        interception_backend: litebox_runner_linux_userland::InterceptionBackend::Rewriter,
         environment_variables: vec![
             "LD_LIBRARY_PATH=/lib64:/lib32:/lib".to_string(),
             "HOME=/".to_string(),
+            "LD_AUDIT=/lib64/litebox_rtld_audit.so".to_string()
         ],
         program_and_arguments: vec![
             python3_path.to_str().unwrap().to_string(),
-            "/out/hello.py".to_string(),
+            "/Lib/test/test_bool.py".to_string(),
         ],
         insert_files: vec![],
         initial_files: Some(rootfs_tar),
