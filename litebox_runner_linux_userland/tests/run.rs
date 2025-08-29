@@ -217,7 +217,7 @@ fn find_c_test_files(dir: &str) -> Vec<PathBuf> {
 // our rtld_audit does not support x86 yet
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn test_runner_with_dynamic_lib_rewriter() {
+fn test_dynamic_lib_with_rewriter() {
     for path in find_c_test_files("./tests") {
         let stem = path
             .file_stem()
@@ -230,7 +230,7 @@ fn test_runner_with_dynamic_lib_rewriter() {
 }
 
 #[test]
-fn test_runner_with_static_exec_rewriter() {
+fn test_static_exec_with_rewriter() {
     for path in find_c_test_files("./tests") {
         let stem = path
             .file_stem()
@@ -243,7 +243,7 @@ fn test_runner_with_static_exec_rewriter() {
 }
 
 #[test]
-fn test_runner_with_dynamic_lib_seccomp() {
+fn test_dynamic_lib_with_seccomp() {
     for path in find_c_test_files("./tests") {
         let stem = path
             .file_stem()
