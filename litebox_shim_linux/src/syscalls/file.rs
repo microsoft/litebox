@@ -6,7 +6,7 @@ use alloc::{
     vec,
 };
 use litebox::{
-    fs::{FileSystem as _, Mode, OFlags},
+    fs::{FileSystem as _, Mode, OFlags, SeekWhence},
     path,
     platform::{RawConstPointer, RawMutPointer},
     utils::TruncateExt as _,
@@ -198,6 +198,32 @@ pub fn sys_pwrite64(fd: i32, buf: &[u8], offset: usize) -> Result<usize, Errno> 
         return Err(Errno::EINVAL);
     }
     sys_write(fd, buf, Some(offset))
+}
+
+/// Handle syscall `lseek`
+pub fn sys_lseek(fd: i32, offset: isize, whence: i32) -> Result<usize, Errno> {
+    let seekwhence: SeekWhence = match whence {
+        0 => SeekWhence::RelativeToBeginning,
+        1 => SeekWhence::RelativeToCurrentOffset,
+        2 => SeekWhence::RelativeToEnd,
+        _ => todo!("unsupported whence"),
+    };
+    let Ok(fd) = u32::try_from(fd) else {
+        return Err(Errno::EBADF);
+    };
+    let file_table = file_descriptors().read();
+    let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
+    match desc {
+        Descriptor::File(file) => litebox_fs()
+            .seek(file, offset, seekwhence)
+            .map_err(Errno::from),
+        Descriptor::Stdio(..)
+        | Descriptor::Socket(..)
+        | Descriptor::PipeReader { .. }
+        | Descriptor::Epoll { .. }
+        | Descriptor::PipeWriter { .. }
+        | Descriptor::Eventfd { .. } => Err(Errno::ESPIPE),
+    }
 }
 
 fn do_close(desc: Descriptor) -> Result<(), Errno> {
@@ -786,6 +812,15 @@ pub fn sys_ioctl(
         Descriptor::Stdio(file) => stdio_ioctl(file, arg),
         Descriptor::File(file) => match arg {
             IoctlArg::TCGETS(..) => Err(Errno::ENOTTY),
+            IoctlArg::FIOCLEX => {
+                if litebox_fs()
+                    .set_fd_metadata(file, FileDescriptorFlags::FD_CLOEXEC)
+                    .is_err()
+                {
+                    unreachable!()
+                }
+                Ok(0)
+            }
             _ => todo!(),
         },
         Descriptor::Socket(socket) => todo!(),

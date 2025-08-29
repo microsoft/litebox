@@ -1,3 +1,5 @@
+//! Implementation of cryptography related syscalls
+
 use aes::{
     Aes128, Aes192, Aes256,
     cipher::{NewCipher, StreamCipher, generic_array::GenericArray},
