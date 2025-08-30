@@ -485,7 +485,7 @@ impl RawMutex {
                     }
                     Some(remaining_time) => {
                         let ms = remaining_time.as_millis();
-                        ms.min(u128::from(u32::MAX - 1)) as u32
+                        u32::try_from(ms.min(u128::from(u32::MAX - 1))).unwrap()
                     }
                 },
             };
@@ -810,6 +810,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     // NOTE: make sure the values are PAGE_ALIGNED.
     const TASK_ADDR_MIN: usize = 0x1_0000;
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
+    #[expect(clippy::too_many_lines)]
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
@@ -821,6 +822,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         let base_addr = suggested_range.start as *mut c_void;
         let size = suggested_range.len();
         // TODO: For Windows, there is no MAP_GROWDOWN features so far.
+        let _ = can_grow_down;
 
         // 1) In case we have a suggested VA range, we first check and deal with the case
         // that the address (range) is already reserved.
