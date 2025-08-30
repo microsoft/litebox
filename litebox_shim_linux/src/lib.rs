@@ -525,10 +525,18 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
             syscalls::process::sys_gettimeofday(tv, tz).map(|()| 0)
         }
         SyscallRequest::ClockGettime { clockid, tp } => {
-            syscalls::process::sys_clock_gettime(clockid, tp).map(|()| 0)
+            let clock_id =
+                litebox_common_linux::ClockId::try_from(clockid).expect("invalid clockid");
+            syscalls::process::sys_clock_gettime(clock_id).and_then(|t| {
+                unsafe { tp.write_at_offset(0, t) }
+                    .map(|()| 0)
+                    .ok_or(Errno::EFAULT)
+            })
         }
         SyscallRequest::ClockGetres { clockid, res } => {
-            syscalls::process::sys_clock_getres(clockid, res);
+            let clock_id =
+                litebox_common_linux::ClockId::try_from(clockid).expect("invalid clockid");
+            syscalls::process::sys_clock_getres(clock_id, res);
             Ok(0)
         }
         SyscallRequest::Time { tloc } => syscalls::process::sys_time(tloc)

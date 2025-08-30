@@ -74,16 +74,7 @@ fn register_seccomp_filter() {
     };
 
     fn backdoor_on_arg(arg_number: u8) -> SeccompRule {
-        SeccompRule::new(vec![
-            SeccompCondition::new(
-                arg_number,
-                SeccompCmpArgLen::Qword,
-                SeccompCmpOp::Eq,
-                super::SYSCALL_ARG_MAGIC as u64,
-            )
-            .unwrap(),
-        ])
-        .unwrap()
+        SeccompRule::new(vec![backdoor_cond_on_arg(arg_number)]).unwrap()
     }
 
     fn backdoor_cond_on_arg(arg_number: u8) -> SeccompCondition {

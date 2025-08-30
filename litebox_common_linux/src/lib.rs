@@ -1449,11 +1449,19 @@ pub struct LinuxDirent64 {
 
 #[non_exhaustive]
 #[repr(i32)]
+#[derive(Debug, IntEnum)]
+pub enum ClockId {
+    RealTime = 0,
+    Monotonic = 1,
+}
+
+#[non_exhaustive]
+#[repr(i32)]
 #[derive(Debug, IntEnum, PartialEq)]
 pub enum FutexOperation {
-    WAIT = 0,
-    WAKE = 1,
-    WAIT_BITSET = 9,
+    Wait = 0,
+    Wake = 1,
+    WaitBitset = 9,
 }
 
 bitflags::bitflags! {
@@ -1470,7 +1478,7 @@ bitflags::bitflags! {
 
 #[non_exhaustive]
 pub enum FutexArgs<Platform: litebox::platform::RawPointerProvider> {
-    WAIT {
+    Wait {
         addr: Platform::RawMutPointer<u32>,
         flags: FutexFlags,
         val: u32,
@@ -1479,14 +1487,14 @@ pub enum FutexArgs<Platform: litebox::platform::RawPointerProvider> {
         /// timeout is interpreted as an absolute value.
         timeout: Option<Platform::RawConstPointer<Timespec>>,
     },
-    WAIT_BITSET {
+    WaitBitset {
         addr: Platform::RawMutPointer<u32>,
         flags: FutexFlags,
         val: u32,
         timeout: Option<Platform::RawConstPointer<Timespec>>,
         bitmask: u32,
     },
-    WAKE {
+    Wake {
         addr: Platform::RawMutPointer<u32>,
         flags: FutexFlags,
         count: u32,
@@ -2205,20 +2213,20 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 let val = ctx.sys_req_arg(2);
                 let timeout = ctx.sys_req_ptr(3);
                 let args = match cmd {
-                    FutexOperation::WAIT => FutexArgs::WAIT {
+                    FutexOperation::Wait => FutexArgs::Wait {
                         addr,
                         flags,
                         val,
                         timeout,
                     },
-                    FutexOperation::WAIT_BITSET => FutexArgs::WAIT_BITSET {
+                    FutexOperation::WaitBitset => FutexArgs::WaitBitset {
                         addr,
                         flags,
                         val,
                         timeout,
                         bitmask: ctx.sys_req_arg(5),
                     },
-                    FutexOperation::WAKE => FutexArgs::WAKE {
+                    FutexOperation::Wake => FutexArgs::Wake {
                         addr,
                         flags,
                         count: val,

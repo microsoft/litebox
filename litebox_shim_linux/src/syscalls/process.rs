@@ -199,7 +199,7 @@ pub(crate) fn sys_exit(status: i32) -> ! {
         let _ = unsafe { clear_child_tid.write_at_offset(0, 0) };
         // Cast from *i32 to *u32
         let clear_child_tid = crate::MutPtr::from_usize(clear_child_tid.as_usize());
-        let _ = sys_futex(litebox_common_linux::FutexArgs::WAKE {
+        let _ = sys_futex(litebox_common_linux::FutexArgs::Wake {
             addr: clear_child_tid,
             flags: litebox_common_linux::FutexFlags::PRIVATE,
             count: 1,
@@ -469,27 +469,28 @@ fn real_time_as_duration_since_epoch() -> core::time::Duration {
 
 /// Handle syscall `clock_gettime`.
 pub(crate) fn sys_clock_gettime(
-    clockid: i32,
-    tp: crate::MutPtr<litebox_common_linux::Timespec>,
-) -> Result<(), Errno> {
+    clockid: litebox_common_linux::ClockId,
+) -> Result<litebox_common_linux::Timespec, Errno> {
     let duration: core::time::Duration = match clockid {
-        0 => {
+        litebox_common_linux::ClockId::RealTime => {
             // CLOCK_REALTIME
             real_time_as_duration_since_epoch()
         }
-        1 => {
+        litebox_common_linux::ClockId::Monotonic => {
             // CLOCK_MONOTONIC
             let now = litebox_platform_multiplex::platform().now();
             now.duration_since(crate::boot_time())
         }
         _ => unimplemented!(),
     };
-    let timespec = litebox_common_linux::Timespec::try_from(duration).or(Err(Errno::EOVERFLOW))?;
-    unsafe { tp.write_at_offset(0, timespec) }.ok_or(Errno::EFAULT)
+    litebox_common_linux::Timespec::try_from(duration).or(Err(Errno::EOVERFLOW))
 }
 
 /// Handle syscall `clock_getres`.
-pub(crate) fn sys_clock_getres(_clockid: i32, res: crate::MutPtr<litebox_common_linux::Timespec>) {
+pub(crate) fn sys_clock_getres(
+    _clockid: litebox_common_linux::ClockId,
+    res: crate::MutPtr<litebox_common_linux::Timespec>,
+) {
     // Return the resolution of the clock
     // For most modern systems, the resolution is typically 1 nanosecond
     // This is a reasonable default for high-resolution timers
@@ -619,22 +620,22 @@ pub(crate) fn sys_futex(
             if !$flag.contains(litebox_common_linux::FutexFlags::PRIVATE) {
                 litebox::log_println!(
                     litebox_platform_multiplex::platform(),
-                    "warning: shared futexes"
+                    "warning: shared futexes\n"
                 );
             }
         };
     }
 
     let res = match arg {
-        FutexArgs::WAKE { addr, flags, count } => {
+        FutexArgs::Wake { addr, flags, count } => {
             warn_shared_futex!(flags);
             let Some(count) = core::num::NonZeroU32::new(count) else {
                 return Ok(0);
             };
             let futex_manager = crate::litebox_futex_manager();
-            futex_manager.wake(addr, count, Some(core::num::NonZeroU32::MAX))? as usize
+            futex_manager.wake(addr, count, None)? as usize
         }
-        FutexArgs::WAIT {
+        FutexArgs::Wait {
             addr,
             flags,
             val,
@@ -643,10 +644,10 @@ pub(crate) fn sys_futex(
             warn_shared_futex!(flags);
             let futex_manager = crate::litebox_futex_manager();
             let timeout = timeout.map(get_timeout).transpose()?.map(Into::into);
-            futex_manager.wait(addr, val, timeout, Some(core::num::NonZeroU32::MAX))?;
+            futex_manager.wait(addr, val, timeout, None)?;
             0
         }
-        litebox_common_linux::FutexArgs::WAIT_BITSET {
+        litebox_common_linux::FutexArgs::WaitBitset {
             addr,
             flags,
             val,
@@ -654,18 +655,17 @@ pub(crate) fn sys_futex(
             bitmask,
         } => {
             warn_shared_futex!(flags);
-            if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) && timeout.is_some()
-            {
-                unimplemented!("FUTEX_CLOCK_REALTIME is not supported yet");
-            }
-            let timeout = timeout
-                .map(get_timeout)
-                .transpose()?
-                .map(|ts| {
-                    let abs_time: <litebox_platform_multiplex::Platform as litebox::platform::TimeProvider>::Instant = ts.into();
-                    let now = litebox_platform_multiplex::platform().now();
-                    abs_time.duration_since(&now)
-                });
+            let timeout = timeout.map(get_timeout).transpose()?.map(|ts| {
+                let now = sys_clock_gettime(
+                    if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
+                        litebox_common_linux::ClockId::RealTime
+                    } else {
+                        litebox_common_linux::ClockId::Monotonic
+                    },
+                )
+                .expect("failed to get current time");
+                ts.sub_timespec(&now).unwrap_or(core::time::Duration::ZERO)
+            });
             let futex_manager = crate::litebox_futex_manager();
             futex_manager.wait(addr, val, timeout, core::num::NonZeroU32::new(bitmask))?;
             0
@@ -954,7 +954,7 @@ mod tests {
         // Test if CloneFlags::CHILD_CLEARTID works: child thread should clear it and wake up one thread
         // that is waiting on it.
         let futex_ptr = crate::MutPtr::from_usize(child_tid_ptr.as_usize());
-        let _ = super::sys_futex(litebox_common_linux::FutexArgs::WAIT {
+        let _ = super::sys_futex(litebox_common_linux::FutexArgs::Wait {
             addr: futex_ptr,
             flags: litebox_common_linux::FutexFlags::PRIVATE,
             val: child_tid.truncate(),

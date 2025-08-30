@@ -467,7 +467,7 @@ impl RawMutex {
             None => Win32_Threading::INFINITE, // no timeout
             Some(timeout) => {
                 let ms = timeout.as_millis();
-                ms.min(u128::from(u32::MAX - 1)).truncate()
+                ms.min(u128::from(Win32_Threading::INFINITE - 1)).truncate()
             }
         };
 
