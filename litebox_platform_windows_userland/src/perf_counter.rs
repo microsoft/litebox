@@ -23,13 +23,13 @@ impl PerformanceCounterInstant {
     // Reference: https://docs.microsoft.com/en-us/windows/desktop/SysInfo
     //                   /acquiring-high-resolution-time-stamps
     pub fn epsilon() -> Duration {
-        let epsilon = NANOS_PER_SEC / (frequency() as u64);
+        let epsilon = NANOS_PER_SEC / frequency();
         Duration::from_nanos(epsilon)
     }
 }
 impl From<PerformanceCounterInstant> for super::Instant {
     fn from(other: PerformanceCounterInstant) -> Self {
-        let freq = frequency() as u64;
+        let freq = frequency();
         let instant_nsec = mul_div_u64(other.ts as u64, NANOS_PER_SEC, freq);
         Self {
             inner: Duration::from_nanos(instant_nsec),
@@ -37,7 +37,7 @@ impl From<PerformanceCounterInstant> for super::Instant {
     }
 }
 
-fn frequency() -> i64 {
+fn frequency() -> u64 {
     // Either the cached result of `QueryPerformanceFrequency` or `0` for
     // uninitialized. Storing this as a single `AtomicU64` allows us to use
     // `Relaxed` operations, as we are only interested in the effects on a
@@ -47,10 +47,10 @@ fn frequency() -> i64 {
     let cached = FREQUENCY.load(Ordering::Relaxed);
     // If a previous thread has filled in this global state, use that.
     if cached != 0 {
-        return cached as i64;
+        return cached;
     }
     // ... otherwise learn for ourselves ...
-    let mut frequency = 0;
+    let mut frequency: i64 = 0;
     assert!(
         unsafe {
             windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&raw mut frequency)
@@ -58,8 +58,8 @@ fn frequency() -> i64 {
         "QueryPerformanceFrequency failed {}",
         unsafe { GetLastError() }
     );
-
-    FREQUENCY.store(frequency as u64, Ordering::Relaxed);
+    let frequency = u64::try_from(frequency).unwrap();
+    FREQUENCY.store(frequency, Ordering::Relaxed);
     frequency
 }
 
