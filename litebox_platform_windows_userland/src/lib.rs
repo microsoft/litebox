@@ -469,10 +469,10 @@ impl RawMutex {
         // Indicate we are about to wait.
         self.waiter_count.fetch_add(1, SeqCst);
 
-        let result = loop {
+        let result = 'res: {
             // Check if value changed before waiting
             if self.inner.load(SeqCst) != val {
-                break Err(ImmediatelyWokenUp);
+                break 'res Err(ImmediatelyWokenUp);
             }
 
             // Compute timeout in ms
@@ -481,7 +481,7 @@ impl RawMutex {
                 Some(timeout) => match timeout.checked_sub(start.elapsed()) {
                     None => {
                         // Already timed out
-                        break Ok(UnblockedOrTimedOut::TimedOut);
+                        break 'res Ok(UnblockedOrTimedOut::TimedOut);
                     }
                     Some(remaining_time) => {
                         let ms = remaining_time.as_millis();
@@ -500,14 +500,14 @@ impl RawMutex {
             };
 
             if ok {
-                break Ok(UnblockedOrTimedOut::Unblocked);
+                Ok(UnblockedOrTimedOut::Unblocked)
             } else {
                 // Check why WaitOnAddress failed
                 let err = unsafe { GetLastError() };
                 match err {
                     Win32_Foundation::WAIT_TIMEOUT => {
                         // Timed out
-                        break Ok(UnblockedOrTimedOut::TimedOut);
+                        Ok(UnblockedOrTimedOut::TimedOut)
                     }
                     e => {
                         // Other error, possibly spurious wakeup or value changed
