@@ -11,7 +11,7 @@ use windows_sys::Win32::Foundation::GetLastError;
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 
 pub struct PerformanceCounterInstant {
-    ts: i64,
+    ts: u64,
 }
 impl PerformanceCounterInstant {
     pub fn now() -> Self {
@@ -30,7 +30,7 @@ impl PerformanceCounterInstant {
 impl From<PerformanceCounterInstant> for super::Instant {
     fn from(other: PerformanceCounterInstant) -> Self {
         let freq = frequency();
-        let instant_nsec = mul_div_u64(other.ts as u64, NANOS_PER_SEC, freq);
+        let instant_nsec = mul_div_u64(other.ts, NANOS_PER_SEC, freq);
         Self {
             inner: Duration::from_nanos(instant_nsec),
         }
@@ -63,7 +63,7 @@ fn frequency() -> u64 {
     frequency
 }
 
-fn query() -> i64 {
+fn query() -> u64 {
     let mut qpc_value: i64 = 0;
     assert!(
         unsafe {
@@ -72,7 +72,7 @@ fn query() -> i64 {
         "QueryPerformanceCounter failed {}",
         unsafe { GetLastError() }
     );
-    qpc_value
+    u64::try_from(qpc_value).unwrap()
 }
 
 // Computes (value*numer)/denom without overflow, as long as both
