@@ -316,7 +316,7 @@ impl WindowsUserland {
 impl litebox::platform::Provider for WindowsUserland {}
 
 impl litebox::platform::ExitProvider for WindowsUserland {
-    type ExitCode = i32;
+    type ExitCode = u32;
     const EXIT_SUCCESS: Self::ExitCode = 0;
     const EXIT_FAILURE: Self::ExitCode = 1;
 
@@ -326,9 +326,7 @@ impl litebox::platform::ExitProvider for WindowsUserland {
             sys_info: _,
             reserved_pages: _,
         } = self;
-        // TODO: Implement Windows process exit
-        // For now, use standard process exit
-        std::process::exit(code);
+        unsafe { windows_sys::Win32::System::Threading::ExitProcess(code) }
     }
 }
 
@@ -430,13 +428,8 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         Ok(unsafe { *(child_tid_ptr as *const u32) as usize })
     }
 
-    #[allow(unreachable_code)]
     fn terminate_thread(&self, code: Self::ExitCode) -> ! {
-        unsafe {
-            Win32_Threading::ExitThread(code as u32);
-        };
-
-        unreachable!("exit should not return");
+        unsafe { Win32_Threading::ExitThread(code) }
     }
 }
 
