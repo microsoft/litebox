@@ -53,7 +53,7 @@ fn frequency() -> i64 {
     let mut frequency = 0;
     assert!(
         unsafe {
-            windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut frequency)
+            windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&raw mut frequency)
         } != 0,
         "QueryPerformanceFrequency failed {}",
         unsafe { GetLastError() }
@@ -66,8 +66,9 @@ fn frequency() -> i64 {
 fn query() -> i64 {
     let mut qpc_value: i64 = 0;
     assert!(
-        unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut qpc_value) }
-            != 0,
+        unsafe {
+            windows_sys::Win32::System::Performance::QueryPerformanceCounter(&raw mut qpc_value)
+        } != 0,
         "QueryPerformanceCounter failed {}",
         unsafe { GetLastError() }
     );
