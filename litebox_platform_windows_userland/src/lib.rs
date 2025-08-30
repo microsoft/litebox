@@ -64,7 +64,7 @@ impl ThreadFsBaseState {
         }
     }
 
-    fn restore_fs_base(&self) {
+    fn restore_fs_base(self) {
         unsafe {
             litebox_common_linux::wrfsbase(self.fs_base);
         }
@@ -427,7 +427,7 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
             )
         };
         assert!(!handle.is_null(), "Failed to create thread");
-        Ok(unsafe { *(child_tid_ptr as *const i32) as usize })
+        Ok(unsafe { *(child_tid_ptr as *const u32) as usize })
     }
 
     #[allow(unreachable_code)]
