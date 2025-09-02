@@ -753,28 +753,12 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> isize {
         }
     };
 
-    #[cfg(debug_assertions)]
-    litebox::log_println!(litebox_platform_multiplex::platform(), "result: {res:?}");
-
-    res.map_or_else(
-        |e| {
-            let e: i32 = e.as_neg();
-            let Ok(e) = isize::try_from(e) else {
-                // On both 32-bit and 64-bit, this should never be triggered
-                unreachable!()
-            };
-            e
-        },
-        |val: usize| {
-            let Ok(v) = isize::try_from(val) else {
-                // Note in case where val is an address (e.g., returned from `mmap`), we currently
-                // assume user space address does not exceed isize::MAX. On 64-bit, the max user
-                // address is 0x7FFF_FFFF_F000, which is below this; for 32-bit, this may not hold,
-                // and we might need to de-restrict this if ever seen in practice. For now, we are
-                // keeping the stricter version.
-                unreachable!("invalid user pointer");
-            };
-            v
-        },
-    )
+    res.unwrap_or_else(|e| {
+        let e: i32 = e.as_neg();
+        let Ok(e) = isize::try_from(e) else {
+            // On both 32-bit and 64-bit, this should never be triggered
+            unreachable!()
+        };
+        e.reinterpret_as_unsigned()
+    })
 }

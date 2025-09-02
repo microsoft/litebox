@@ -269,10 +269,8 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         let old_num_waiters = lockable.num_waiters;
         let num_to_wake_up = num_to_wake_up.get();
         // Now we can actually trigger things to start waking up.
-        // Note that the number of waiters that actually woke up may be less than `old_num_waiters`,
-        // because some waiter might immediately wake up so kernel doesn't count it.
         let num_to_wake_up = if old_num_waiters >= num_to_wake_up {
-            let _ = lockable.raw_mutex.wake_many(
+            let num_claimed_woken_up = lockable.raw_mutex.wake_many(
                 #[expect(
                     clippy::missing_panics_doc,
                     reason = "this conversion should never fail"
@@ -281,10 +279,15 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
                     num_to_wake_up.try_into().unwrap()
                 },
             );
+            // Note that `num_claimed_woken_up` may be less than what we requested even if there are enough waiters present.
+            // This is because some waiter might immediately wake up due to a value mismatch so the kernel doesn't count it.
+            debug_assert!(num_claimed_woken_up <= num_to_wake_up as usize);
             num_to_wake_up
         } else {
             // Wake up all
-            let _ = lockable.raw_mutex.wake_all();
+            let num_claimed_woken_up = lockable.raw_mutex.wake_all();
+            // The number of woken threads cannot exceed the number of waiters that were present before waking up.
+            debug_assert!(num_claimed_woken_up <= old_num_waiters as usize);
             old_num_waiters
         };
 
@@ -293,6 +296,10 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // Now, we spin until all `num_to_wake_up` waiters have woken up and finished letting us know
         // it has woken up. If the `lockable` for it has been GC'd out, that means all wakers got woken up,
         // which is fine too to quit out.
+        //
+        // While our documentation of this function says "at most", we attempt to wake up "as many as", since
+        // this is closer to what some applications seem to expect; this is similar to how Linux also says
+        // "at most" but then attempts "as many as".
         //
         // XXX(jayb): This check may not be ideal if there are no waiters that have any overlap in
         // terms of bitset masks, in which case this might spin forever until at least someone with

@@ -8,6 +8,10 @@
 #define HEADER_MAGIC ((uint64_t)0x584f42204554494c) // "LITE BOX"
 #define TRAMP_MAGIC ((uint64_t)0x30584f424554494c)  // "LITEBOX0"
 
+#if !defined(__x86_64__)
+# error "rtld_audit.c: build target must be x86_64"
+#endif
+
 // Linux syscall numbers (x86_64)
 #define SYS_openat 257
 #define SYS_read 0

@@ -53,7 +53,7 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
         Ok(())
     }
 
-    unsafe fn remap_pages(
+    unsafe fn move_and_expand_pages(
         &self,
         old_range: Range<usize>,
         new_range: Range<usize>,

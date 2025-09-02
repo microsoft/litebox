@@ -715,9 +715,9 @@ mod tests {
 
     /// Create an aligned entry point for the new thread.
     ///
-    /// The stack pointer at the entry of the new thread is 16-byte aligned, but regular
-    /// functions assume a 16-byte aligned stack pointer right before the call instruction,
-    /// which means the stack pointer at the entry of a regular function is actually 8-byte aligned.
+    /// The stack pointer at the entry of the new thread is 16-byte aligned, but x86_64 ABI expects
+    /// RSP % 16 == 8 at normal function entry (because the CALL pushed a return address). Similarly,
+    /// x86 ABI expects ESP % 16 == 12 on function entry.
     /// We only need to do this if we want to pass a Rust function to `sys_clone`.
     macro_rules! make_aligned_entry {
         ($wrapper:ident, $target:path) => {
@@ -727,10 +727,7 @@ mod tests {
             pub extern "C" fn $wrapper() -> ! {
                 unsafe {
                     core::arch::naked_asm!(
-                        "test rsp, 15",  // check stack alignment
-                        "jz 2f",         // if aligned already, skip
-                        "sub rsp, 8",    // else adjust by 8
-                        "2:",
+                        "and rsp, -16",  // make it 16-byte aligned
                         "call {func}",
                         func = sym $target,
                     )
@@ -742,10 +739,7 @@ mod tests {
             pub extern "C" fn $wrapper() -> ! {
                 unsafe {
                     core::arch::naked_asm!(
-                        "test esp, 15",  // check stack alignment
-                        "jz 2f",         // if aligned already, skip
-                        "sub esp, 8",    // else adjust by 8
-                        "2:",
+                        "and esp, -16",  // make it 16-byte aligned
                         "call {func}",
                         func = sym $target,
                     )

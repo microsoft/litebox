@@ -24,7 +24,7 @@ extern crate alloc;
 cfg_if::cfg_if! {
     if #[cfg(feature = "linux_syscall")] {
         use litebox_common_linux::SyscallRequest;
-        pub type SyscallReturnType = isize;
+        pub type SyscallReturnType = usize;
     } else if #[cfg(feature = "optee_syscall")] {
         use litebox_common_optee::SyscallRequest;
         pub type SyscallReturnType = u32;
@@ -1093,7 +1093,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         Ok(())
     }
 
-    unsafe fn remap_pages(
+    unsafe fn move_and_expand_pages(
         &self,
         old_range: core::ops::Range<usize>,
         new_range: core::ops::Range<usize>,
@@ -1368,6 +1368,9 @@ syscall_callback:
     /* Align the stack to 16 bytes */
     and esp, -16
 
+    /* esp is now 16-byte aligned, adjust by 8 so that it is still
+    16-byte aligned before the call instruction */
+    sub esp, 8
     /* Pass the sysno and pointer to pt_regs to syscall_handler */
     push ebp
     push eax
