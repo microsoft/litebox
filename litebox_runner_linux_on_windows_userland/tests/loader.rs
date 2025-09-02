@@ -147,7 +147,7 @@ fn test_static_linked_prog_with_rewriter() {
     test_dir.push("tests/test-bins");
 
     let prog_name = "hello_world_static";
-    let prog_name_hooked = format!("{}.hooked", prog_name);
+    let prog_name_hooked = format!("{prog_name}.hooked");
 
     let path = test_dir.join(prog_name);
     let hooked_path = test_dir.join(&prog_name_hooked);
@@ -177,7 +177,7 @@ fn test_static_linked_prog_with_rewriter() {
         std::str::from_utf8(output.stderr.as_slice()).unwrap()
     );
 
-    let executable_path = format!("/{}", prog_name_hooked);
+    let executable_path = format!("/{prog_name_hooked}");
     let executable_data = std::fs::read(hooked_path).unwrap();
 
     common::init_platform(&[], &[], &[]);
@@ -186,9 +186,10 @@ fn test_static_linked_prog_with_rewriter() {
 }
 
 // #[test]
+#[expect(clippy::too_many_lines)]
 fn run_dynamic_linked_prog_with_rewriter(
     libs_to_rewrite: &[(&str, &str)],
-    libs_no_rewrite: &[(&str, &str)],
+    libs_without_rewrite: &[(&str, &str)],
     exec_name: &str,
     cmd_args: &[&str],
     install_files: fn(std::path::PathBuf),
@@ -198,7 +199,7 @@ fn run_dynamic_linked_prog_with_rewriter(
     test_dir.push("tests/test-bins");
 
     let prog_name = exec_name;
-    let prog_name_hooked = format!("{}.hooked", prog_name);
+    let prog_name_hooked = format!("{prog_name}.hooked");
 
     let path = test_dir.join(prog_name);
     let hooked_path = test_dir.join(&prog_name_hooked);
@@ -252,9 +253,9 @@ fn run_dynamic_linked_prog_with_rewriter(
                 "-p",
                 "litebox_syscall_rewriter",
                 "--",
-                &src.to_str().unwrap(),
+                src.to_str().unwrap(),
                 "-o",
-                &dst.to_str().unwrap(),
+                dst.to_str().unwrap(),
             ])
             .output()
             .expect("Failed to run syscall rewriter");
@@ -267,7 +268,7 @@ fn run_dynamic_linked_prog_with_rewriter(
 
     // Copy libraries that are not needed to be rewritten (`litebox_rtld_audit.so`)
     // to the tar directory
-    for (file, prefix) in libs_no_rewrite {
+    for (file, prefix) in libs_without_rewrite {
         let src = test_dir.join(file);
         let dst_dir = tar_src_path.join(prefix.trim_start_matches('/'));
         let dst = dst_dir.join(file);
@@ -343,12 +344,12 @@ fn test_testcase_dynamic_with_rewriter() {
         ("libc.so.6", "/lib/x86_64-linux-gnu"),
         ("ld-linux-x86-64.so.2", "/lib64"),
     ];
-    let libs_no_rewrite = [("litebox_rtld_audit.so", "/lib64")];
+    let libs_without_rewrite = [("litebox_rtld_audit.so", "/lib64")];
 
     // Run
     run_dynamic_linked_prog_with_rewriter(
         &libs_to_rewrite,
-        &libs_no_rewrite,
+        &libs_without_rewrite,
         exec_name,
         &[],
         |_| {},

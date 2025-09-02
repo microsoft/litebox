@@ -193,6 +193,19 @@ fn wake_robust_list(
     Ok(())
 }
 
+fn exit_code(
+    status: i32,
+) -> <litebox_platform_multiplex::Platform as litebox::platform::ExitProvider>::ExitCode {
+    if status == 0 {
+        litebox_platform_multiplex::Platform::EXIT_SUCCESS
+    } else {
+        // TODO(jayb): We are currently folding away all non-zero exit codes as just failure. We
+        // might wish to think of a better design for the ExitProvider to support a better handling
+        // of this.
+        litebox_platform_multiplex::Platform::EXIT_FAILURE
+    }
+}
+
 pub(crate) fn sys_exit(status: i32) -> ! {
     let mut tls = litebox_platform_multiplex::platform().release_thread_local_storage();
     if let Some(clear_child_tid) = tls.current_task.clear_child_tid.take() {
@@ -206,11 +219,12 @@ pub(crate) fn sys_exit(status: i32) -> ! {
     }
 
     NR_THREADS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-    litebox_platform_multiplex::platform().terminate_thread(status)
+
+    litebox_platform_multiplex::platform().terminate_thread(exit_code(status))
 }
 
 pub(crate) fn sys_exit_group(status: i32) -> ! {
-    litebox_platform_multiplex::platform().exit(status)
+    litebox_platform_multiplex::platform().exit(exit_code(status))
 }
 
 fn new_thread_callback(
