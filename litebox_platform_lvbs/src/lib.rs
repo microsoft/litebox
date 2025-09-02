@@ -39,7 +39,7 @@ pub mod mshv;
 pub mod ptr;
 
 pub mod syscall_entry;
-pub(crate) mod user_context;
+pub mod user_context;
 
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 

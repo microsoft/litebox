@@ -257,7 +257,7 @@ pub(crate) fn allocate_stack(stack_base: Option<usize>) -> Option<TaStack> {
             .expect("DEFAULT_STACK_SIZE is not page-aligned");
         unsafe {
             litebox_page_manager()
-                .create_stack_pages(None, length, CreatePagesFlags::empty())
+                .create_stack_pages(None, length, CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY)
                 .ok()?
         }
     };

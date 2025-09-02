@@ -15,8 +15,14 @@ impl<T: Clone> RawConstPointer<T> for UserConstPtr<T> {
         todo!()
     }
 
-    unsafe fn to_cow_slice<'a>(self, _len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
-        todo!()
+    unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
+        // todo!()
+        if self.inner.is_null() || !self.inner.is_aligned() {
+            return None;
+        }
+        Some(alloc::borrow::Cow::Borrowed(unsafe {
+            core::slice::from_raw_parts(self.inner, len)
+        }))
     }
 
     fn as_usize(&self) -> usize {
@@ -54,8 +60,14 @@ impl<T: Clone> RawConstPointer<T> for UserMutPtr<T> {
         todo!()
     }
 
-    unsafe fn to_cow_slice<'a>(self, _len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
-        todo!()
+    unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
+        // todo!()
+        if self.inner.is_null() || !self.inner.is_aligned() {
+            return None;
+        }
+        Some(alloc::borrow::Cow::Borrowed(unsafe {
+            core::slice::from_raw_parts(self.inner, len)
+        }))
     }
 
     fn as_usize(&self) -> usize {
@@ -69,16 +81,48 @@ impl<T: Clone> RawConstPointer<T> for UserMutPtr<T> {
 }
 
 impl<T: Clone> RawMutPointer<T> for UserMutPtr<T> {
-    unsafe fn write_at_offset(self, _count: isize, _value: T) -> Option<()> {
-        todo!()
+    unsafe fn write_at_offset(self, count: isize, value: T) -> Option<()> {
+        // todo!()
+        if self.inner.is_null() || !self.inner.is_aligned() {
+            return None;
+        }
+        unsafe {
+            *self.inner.offset(count) = value;
+        }
+        Some(())
     }
 
     fn mutate_subslice_with<R>(
         self,
-        _range: impl core::ops::RangeBounds<isize>,
-        _f: impl FnOnce(&mut [T]) -> R,
+        range: impl core::ops::RangeBounds<isize>,
+        f: impl FnOnce(&mut [T]) -> R,
     ) -> Option<R> {
-        todo!()
+        // todo!()
+        if self.inner.is_null() || !self.inner.is_aligned() {
+            return None;
+        }
+        let start = match range.start_bound() {
+            core::ops::Bound::Included(&x) => x,
+            core::ops::Bound::Excluded(_) => unreachable!(),
+            core::ops::Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            core::ops::Bound::Included(&x) => x.checked_add(1)?,
+            core::ops::Bound::Excluded(&x) => x,
+            core::ops::Bound::Unbounded => {
+                return None;
+            }
+        };
+        let len = if start <= end {
+            start.abs_diff(end)
+        } else {
+            return None;
+        };
+        let _ = start.checked_mul(size_of::<T>().try_into().ok()?)?;
+        let data = unsafe { self.inner.offset(start) };
+        let _ = isize::try_from(len.checked_mul(size_of::<T>())?).ok()?;
+        let slice = unsafe { core::slice::from_raw_parts_mut(data, len) };
+        Some(f(slice))
     }
 }
 

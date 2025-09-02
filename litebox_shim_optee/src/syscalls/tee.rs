@@ -51,7 +51,8 @@ pub fn sys_return(ret: usize) -> ! {
             let session_id = tid as u32;
             crate::optee_command_dispatcher(session_id, true);
         } else if #[cfg(feature = "platform_lvbs")] {
-            todo!("switch to VTL0");
+            // todo!("switch to VTL0");
+            crate::optee_command_dispatcher(1, true);
         } else {
             compile_error!(r##"No platform specified."##);
         }

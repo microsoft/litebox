@@ -19,6 +19,14 @@ use litebox_platform_lvbs::{
 };
 use litebox_platform_multiplex::Platform;
 
+use litebox_platform_lvbs::user_context::UserSpaceManagement;
+
+use litebox_common_optee::UteeEntryFunc;
+use litebox_shim_optee::{
+    UteeParamsTyped, handle_syscall_request, optee_command_dispatcher,
+    register_session_id_elf_load_info, submit_optee_command,
+};
+
 /// # Panics
 ///
 /// Panics if it failed to enable Hyper-V hypercall
@@ -98,8 +106,68 @@ pub fn init() -> Option<&'static Platform> {
 }
 
 pub fn run(platform: Option<&'static Platform>) -> ! {
+    if get_core_id() == 0 {
+        if let Some(platform) = platform {
+            litebox_platform_multiplex::set_platform(platform);
+            litebox_platform_lvbs::set_platform_low(platform);
+            if let Ok(session_id) = platform.create_userspace() {
+                let session_id: u32 = session_id.try_into().unwrap();
+
+                let loaded_program =
+                    litebox_shim_optee::loader::load_elf_buffer(TA_BINARY).unwrap();
+                register_session_id_elf_load_info(session_id, loaded_program);
+
+                let params = [
+                    UteeParamsTyped::None,
+                    UteeParamsTyped::None,
+                    UteeParamsTyped::None,
+                    UteeParamsTyped::None,
+                ];
+                submit_optee_command(session_id, UteeEntryFunc::OpenSession, params, 0);
+
+                let params = [
+                    UteeParamsTyped::ValueInout {
+                        value_a: 100,
+                        value_b: 0,
+                    },
+                    UteeParamsTyped::None,
+                    UteeParamsTyped::None,
+                    UteeParamsTyped::None,
+                ];
+                submit_optee_command(session_id, UteeEntryFunc::InvokeCommand, params, 0);
+
+                let params = [
+                    UteeParamsTyped::ValueInout {
+                        value_a: 200,
+                        value_b: 0,
+                    },
+                    UteeParamsTyped::None,
+                    UteeParamsTyped::None,
+                    UteeParamsTyped::None,
+                ];
+                submit_optee_command(session_id, UteeEntryFunc::InvokeCommand, params, 1);
+
+                let params = [
+                    UteeParamsTyped::None,
+                    UteeParamsTyped::None,
+                    UteeParamsTyped::None,
+                    UteeParamsTyped::None,
+                ];
+                submit_optee_command(session_id, UteeEntryFunc::CloseSession, params, 0);
+
+                optee_command_dispatcher(session_id, false);
+            } else {
+                panic!("Failed to create userspace");
+            }
+        } else {
+            panic!("Failed to get platform");
+        };
+    }
     vtl_switch_loop_entry(platform)
 }
+
+const TA_BINARY: &[u8] =
+    include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/hello-ta.elf");
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

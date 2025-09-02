@@ -144,13 +144,13 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> u32 {
     );
 
     // save user context
-    crate::platform_low()
-        .save_user_context(
-            ctx_raw.user_rip().unwrap(),
-            ctx_raw.user_rsp().unwrap(),
-            ctx_raw.user_rflags(),
-        )
-        .expect("Failed to save user context");
+    // crate::platform_low()
+    //     .save_user_context(
+    //         ctx_raw.user_rip().unwrap(),
+    //         ctx_raw.user_rsp().unwrap(),
+    //         ctx_raw.user_rflags(),
+    //     )
+    //     .expect("Failed to save user context");
 
     let ctx = ctx_raw.to_pt_regs();
 
@@ -159,6 +159,7 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> u32 {
         SyscallRequest::try_from_raw(usize::try_from(sysnr).unwrap(), &ctx)
             .expect("Failed to convert syscall request"),
     );
+    return sysret;
 
     // TODO: We should decide whether we place this function here, OP-TEE shim, or separate it into
     // multiple functions and place them in the appropriate places.
