@@ -513,6 +513,7 @@ pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const FIONBIO: u32 = 0x5421;
+pub const FIOCLEX: u32 = 0x5451;
 pub const TIOCGPTN: u32 = 0x80045430;
 
 /// Commands for use with `ioctl`.
@@ -530,6 +531,8 @@ pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     TIOCGPTN(Platform::RawMutPointer<u32>),
     /// Enables or disables non-blocking mode
     FIONBIO(Platform::RawConstPointer<i32>),
+    /// Set close on exec
+    FIOCLEX,
     Raw {
         cmd: u32,
         arg: Platform::RawMutPointer<u8>,
@@ -1464,6 +1467,11 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         buf: Platform::RawConstPointer<u8>,
         count: usize,
     },
+    Lseek {
+        fd: i32,
+        offset: isize,
+        whence: i32,
+    },
     Close {
         fd: i32,
     },
@@ -1819,6 +1827,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::read => sys_req!(Read { fd, buf:*, count }),
             Sysno::write => sys_req!(Write { fd, buf:*, count }),
             Sysno::close => sys_req!(Close { fd }),
+            Sysno::lseek => sys_req!(Lseek { fd, offset, whence }),
             Sysno::stat => sys_req!(Stat { pathname:*, buf:* }),
             Sysno::fstat => sys_req!(Fstat { fd, buf:* }),
             Sysno::lstat => sys_req!(Lstat { pathname:*, buf:* }),
@@ -1880,6 +1889,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
+                        FIOCLEX => IoctlArg::FIOCLEX,
                         _ => IoctlArg::Raw {
                             cmd,
                             arg: ctx.sys_req_ptr(2),
@@ -1976,8 +1986,14 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 arg: FcntlArg::from(ctx.sys_req_arg(1), ctx.sys_req_arg(2)),
             },
             Sysno::gettimeofday => sys_req!(Gettimeofday { tv:*, tz:* }),
+            #[cfg(target_arch = "x86_64")]
             Sysno::clock_gettime => sys_req!(ClockGettime { clockid, tp:* }),
+            #[cfg(target_arch = "x86")]
+            Sysno::clock_gettime64 => sys_req!(ClockGettime { clockid, tp:* }),
+            #[cfg(target_arch = "x86_64")]
             Sysno::clock_getres => sys_req!(ClockGetres { clockid, res:* }),
+            #[cfg(target_arch = "x86")]
+            Sysno::clock_getres_time64 => sys_req!(ClockGetres { clockid, res:* }),
             Sysno::time => sys_req!(Time { tloc:* }),
             Sysno::getcwd => sys_req!(Getcwd { buf:*, size }),
             Sysno::readlink => sys_req!(Readlink { pathname:*, buf:* ,bufsiz }),
@@ -2343,6 +2359,11 @@ trait ReinterpretTruncatedFromUsize: Sized {
 impl ReinterpretTruncatedFromUsize for i64 {
     fn reinterpret_truncated_from_usize(v: usize) -> Self {
         v.reinterpret_as_signed() as i64
+    }
+}
+impl ReinterpretTruncatedFromUsize for isize {
+    fn reinterpret_truncated_from_usize(v: usize) -> Self {
+        v.reinterpret_as_signed()
     }
 }
 macro_rules! reinterpret_truncated_from_usize_for {
