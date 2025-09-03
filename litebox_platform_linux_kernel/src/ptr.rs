@@ -11,6 +11,12 @@ pub struct UserConstPtr<T> {
     pub(crate) inner: *const T,
 }
 
+impl<T: Clone> core::fmt::Debug for UserConstPtr<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("UserConstPtr").field(&self.inner).finish()
+    }
+}
+
 unsafe fn read_at_offset<'a, T: Clone>(
     ptr: *const T,
     count: isize,
@@ -99,6 +105,12 @@ impl<T: Clone> UserConstPtr<T> {
 #[derive(Clone)]
 pub struct UserMutPtr<T> {
     pub(crate) inner: *mut T,
+}
+
+impl<T: Clone> core::fmt::Debug for UserMutPtr<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("UserMutPtr").field(&self.inner).finish()
+    }
 }
 
 impl<T: Clone> Copy for UserMutPtr<T> {}

@@ -109,6 +109,11 @@ impl core::error::Error for Underspecified {}
 pub struct TransparentConstPtr<T> {
     pub inner: *const T,
 }
+impl<T: Clone> core::fmt::Debug for TransparentConstPtr<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("ConstPtr").field(&self.inner).finish()
+    }
+}
 impl<T: Clone> Copy for TransparentConstPtr<T> {}
 impl<T: Clone> RawConstPointer<T> for TransparentConstPtr<T> {
     unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
@@ -145,6 +150,11 @@ impl<T: Clone> RawConstPointer<T> for TransparentConstPtr<T> {
 #[derive(Clone)]
 pub struct TransparentMutPtr<T> {
     pub inner: *mut T,
+}
+impl<T: Clone> core::fmt::Debug for TransparentMutPtr<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("MutPtr").field(&self.inner).finish()
+    }
 }
 impl<T: Clone> Copy for TransparentMutPtr<T> {}
 impl<T: Clone> RawConstPointer<T> for TransparentMutPtr<T> {
