@@ -26,6 +26,7 @@ use litebox_shim_optee::{
     UteeParamsTyped, handle_syscall_request, optee_command_dispatcher,
     register_session_id_elf_load_info, submit_optee_command,
 };
+use x86_64::VirtAddr;
 
 /// # Panics
 ///
@@ -116,6 +117,13 @@ pub fn run(platform: Option<&'static Platform>) -> ! {
                 let loaded_program =
                     litebox_shim_optee::loader::load_elf_buffer(TA_BINARY).unwrap();
                 register_session_id_elf_load_info(session_id, loaded_program);
+                platform
+                    .save_user_context(
+                        VirtAddr::new(u64::try_from(loaded_program.entry_point).unwrap()),
+                        VirtAddr::new(u64::try_from(loaded_program.stack_base).unwrap()),
+                        x86_64::registers::rflags::RFlags::INTERRUPT_FLAG,
+                    )
+                    .expect("Failed to save user context");
 
                 let params = [
                     UteeParamsTyped::None,

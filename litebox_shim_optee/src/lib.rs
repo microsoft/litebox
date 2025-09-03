@@ -25,6 +25,8 @@ use litebox_common_optee::{
 };
 use litebox_platform_multiplex::Platform;
 
+use litebox_platform_lvbs::user_context::UserSpaceManagement;
+
 cfg_if::cfg_if! {
     if #[cfg(feature = "platform_linux_userland")] {
     use litebox::platform::{ThreadProvider as _};

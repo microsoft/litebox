@@ -127,50 +127,82 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
     }
 
     #[allow(clippy::similar_names)]
-    fn enter_userspace(&self, userspace_id: usize, _arguments: Option<&[usize]>) -> ! {
+    fn enter_userspace(&self, userspace_id: usize, arguments: Option<&[usize]>) -> ! {
         let rsp;
         let rip;
         let rflags;
-        {
-            let inner = self.user_contexts.inner.lock();
-            if let Some(user_ctx) = inner.get(&userspace_id) {
-                debug_serial_println!(
-                    "Entering userspace(ID: {}): RIP: {:#x}, RSP: {:#x}, RFLAGS: {:#x}, CR3: {:#x}",
-                    userspace_id,
-                    user_ctx.rip,
-                    user_ctx.rsp,
-                    user_ctx.rflags,
-                    user_ctx
-                        .page_table
-                        .get_physical_frame()
-                        .start_address()
-                        .as_u64()
-                );
-                rsp = user_ctx.rsp;
-                rip = user_ctx.rip;
-                rflags = user_ctx.rflags;
-                user_ctx.page_table.change_address_space();
-            } else {
-                panic!("Userspace with ID: {} does not exist", userspace_id);
-            }
-        } // release the lock before entering userspace
-        let Some((_, cs_idx, ds_idx)) = get_per_core_kernel_context().get_segment_selectors()
-        else {
-            panic!("GDT is not initialized");
-        };
-        unsafe {
-            asm!(
-                "push r10",
-                "push r11",
-                "push r12",
-                "push r13",
-                "push r14",
-                "iretq",
-                in("r10") ds_idx, in("r11") rsp.as_u64(), in("r12") rflags.bits(),
-                in("r13") cs_idx, in("r14") rip.as_u64(),
+        if let Some(arguments) = arguments {
+            rsp = VirtAddr::new(u64::try_from(arguments[5]).unwrap());
+            rip = VirtAddr::new(u64::try_from(arguments[4]).unwrap());
+            rflags = RFlags::INTERRUPT_FLAG;
+            debug_serial_println!(
+                "Entering OP-TEE TA userspace(ID: {}): RIP: {:#x}, RSP: {:#x}, RFLAGS: {:#x}",
+                userspace_id,
+                rip,
+                rsp,
+                rflags,
             );
+            let Some((_, cs_idx, ds_idx)) = get_per_core_kernel_context().get_segment_selectors()
+            else {
+                panic!("GDT is not initialized");
+            };
+            x86_64::instructions::tlb::flush_all();
+            unsafe {
+                asm!(
+                    "push r10",
+                    "push r11",
+                    "push r12",
+                    "push r13",
+                    "push r14",
+                    "iretq",
+                    in("r10") ds_idx, in("r11") rsp.as_u64(), in("r12") rflags.bits(),
+                    in("r13") cs_idx, in("r14") rip.as_u64(),
+                    in("rdi") arguments[0], in("rsi") arguments[1], in("rdx") arguments[2], in("rcx") arguments[3],
+                );
+            }
+            panic!("IRETQ failed to enter userspace");
+        } else {
+            {
+                let inner = self.user_contexts.inner.lock();
+                if let Some(user_ctx) = inner.get(&userspace_id) {
+                    debug_serial_println!(
+                        "Entering userspace(ID: {}): RIP: {:#x}, RSP: {:#x}, RFLAGS: {:#x}, CR3: {:#x}",
+                        userspace_id,
+                        user_ctx.rip,
+                        user_ctx.rsp,
+                        user_ctx.rflags,
+                        user_ctx
+                            .page_table
+                            .get_physical_frame()
+                            .start_address()
+                            .as_u64()
+                    );
+                    rsp = user_ctx.rsp;
+                    rip = user_ctx.rip;
+                    rflags = user_ctx.rflags;
+                    // user_ctx.page_table.change_address_space();
+                } else {
+                    panic!("Userspace with ID: {} does not exist", userspace_id);
+                }
+            } // release the lock before entering userspace
+            let Some((_, cs_idx, ds_idx)) = get_per_core_kernel_context().get_segment_selectors()
+            else {
+                panic!("GDT is not initialized");
+            };
+            unsafe {
+                asm!(
+                    "push r10",
+                    "push r11",
+                    "push r12",
+                    "push r13",
+                    "push r14",
+                    "iretq",
+                    in("r10") ds_idx, in("r11") rsp.as_u64(), in("r12") rflags.bits(),
+                    in("r13") cs_idx, in("r14") rip.as_u64(),
+                );
+            }
+            panic!("IRETQ failed to enter userspace");
         }
-        panic!("IRETQ failed to enter userspace");
     }
 
     fn save_user_context(
@@ -182,20 +214,21 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
         let (cr3, _) = Cr3::read_raw();
         let mut inner = self.user_contexts.inner.lock();
         // TODO: to avoid the below linear search, we can maintain CR3 to `userspace_id` mapping.
-        for (id, user_ctx) in inner.iter_mut() {
-            if cr3 == user_ctx.page_table.get_physical_frame() {
-                user_ctx.rsp = user_stack_ptr;
-                user_ctx.rip = user_ret_addr;
-                user_ctx.rflags = rflags;
-                debug_serial_println!(
-                    "Updated user context (ID: {}): RIP={:#x}, RSP={:#x}, RFLAGS={:#x}",
-                    id,
-                    user_ctx.rip.as_u64(),
-                    user_ctx.rsp.as_u64(),
-                    user_ctx.rflags.bits(),
-                );
-                return Ok(());
-            }
+        // for (id, user_ctx) in inner.iter_mut() {
+        if let Some((id, user_ctx)) = inner.iter_mut().next() {
+            // if cr3 == user_ctx.page_table.get_physical_frame() {
+            user_ctx.rsp = user_stack_ptr;
+            user_ctx.rip = user_ret_addr;
+            user_ctx.rflags = rflags;
+            debug_serial_println!(
+                "Updated user context (ID: {}): RIP={:#x}, RSP={:#x}, RFLAGS={:#x}",
+                id,
+                user_ctx.rip.as_u64(),
+                user_ctx.rsp.as_u64(),
+                user_ctx.rflags.bits(),
+            );
+            return Ok(());
+            // }
         }
         Err(Errno::EINVAL)
     }
