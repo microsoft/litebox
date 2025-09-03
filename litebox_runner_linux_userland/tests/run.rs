@@ -509,7 +509,8 @@ fn debug_python_tar() {
         ],
         program_and_arguments: vec![
             python3_path.to_str().unwrap().to_string(),
-            "/Lib/test/test_bool.py".to_string(),
+            // "/Lib/test/test_bool.py".to_string(),
+            "/out/numpy.py".to_string()
             // "/out/hello.py".to_string()
         ],
         insert_files: vec![],

@@ -758,6 +758,9 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
         }
     };
 
+
+    litebox::log_println!(litebox_platform_multiplex::platform(), "{res:?}");
+
     res.unwrap_or_else(|e| {
         let e: i32 = e.as_neg();
         let Ok(e) = isize::try_from(e) else {

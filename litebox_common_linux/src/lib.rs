@@ -2363,6 +2363,14 @@ impl<Platform: litebox::platform::RawPointerProvider> alloc::fmt::Debug
                 )
                 .field("buf", &buf.as_usize())
                 .finish(),
+            Self::Mkdir { pathname, mode } => f
+                .debug_struct("Mkdir")
+                .field(
+                    "pathname",
+                    &unsafe { pathname.to_cow_cstr() }.map(alloc::borrow::Cow::into_owned),
+                )
+                .field("mode", mode)
+                .finish(),
             Self::Fstat { fd, buf } => f
                 .debug_struct("Fstat")
                 .field("fd", fd)
