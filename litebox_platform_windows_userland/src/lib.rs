@@ -608,7 +608,7 @@ impl litebox::platform::TimeProvider for WindowsUserland {
             dwHighDateTime: 0,
         };
         unsafe {
-            GetSystemTimeAsFileTime(&mut filetime as *mut FILETIME);
+            GetSystemTimeAsFileTime(&raw mut filetime);
         }
         let FILETIME {
             dwLowDateTime: low,
