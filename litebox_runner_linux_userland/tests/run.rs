@@ -391,8 +391,15 @@ fn test_runner_with_tar_source_dir(
     let test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
     let path = test_dir.join(target);
-    assert!(path.exists(), "Target binary not found at {}", path.to_str().unwrap());
-    println!("Using target executable binary at: {}", path.to_str().unwrap());
+    assert!(
+        path.exists(),
+        "Target binary not found at {}",
+        path.to_str().unwrap()
+    );
+    println!(
+        "Using target executable binary at: {}",
+        path.to_str().unwrap()
+    );
 
     #[cfg(target_arch = "x86_64")]
     let target = "--target=x86_64-unknown-linux-gnu";
@@ -400,8 +407,8 @@ fn test_runner_with_tar_source_dir(
     let target = "--target=i686-unknown-linux-gnu";
 
     // create tar file using `tar` command
-    let tar_file =
-        std::path::Path::new(&test_dir.to_str().unwrap()).join(format!("rootfs_python_{}.tar", backend_str));
+    let tar_file = std::path::Path::new(&test_dir.to_str().unwrap())
+        .join(format!("rootfs_python_{}.tar", backend_str));
     let tar_data = std::process::Command::new("tar")
         .args([
             "--format=ustar",
@@ -411,7 +418,7 @@ fn test_runner_with_tar_source_dir(
             "lib64",
             "usr",
             "out",
-            "Lib"
+            "Lib",
         ])
         .current_dir(&tar_source_dir)
         .output()
@@ -491,11 +498,15 @@ fn test_tar_rewriter() {
 
 #[test]
 fn debug_python_tar() {
-    let python3_path = std::path::PathBuf::from("/home/chuqi/GitHub/litebox/litebox_runner_linux_userland/python3.hooked");
-    
-    let rootfs_tar = std::path::PathBuf::from("/home/chuqi/GitHub/litebox/litebox_runner_linux_userland/rootfs_python_rewriter.tar");
+    let python3_path = std::path::PathBuf::from(
+        "/home/chuqi/GitHub/litebox/litebox_runner_linux_userland/python3.hooked",
+    );
+
+    let rootfs_tar = std::path::PathBuf::from(
+        "/home/chuqi/GitHub/litebox/litebox_runner_linux_userland/rootfs_python_rewriter.tar",
+    );
     // Call litebox_runner_linux_userland directly
-    
+
     // Craft CliArgs manually
     let cli_args = litebox_runner_linux_userland::CliArgs {
         unstable: true,
@@ -505,18 +516,17 @@ fn debug_python_tar() {
         environment_variables: vec![
             "LD_LIBRARY_PATH=/lib64:/lib32:/lib".to_string(),
             "HOME=/".to_string(),
-            "LD_AUDIT=/lib64/litebox_rtld_audit.so".to_string()
+            "LD_AUDIT=/lib64/litebox_rtld_audit.so".to_string(),
         ],
         program_and_arguments: vec![
             python3_path.to_str().unwrap().to_string(),
             // "/Lib/test/test_bool.py".to_string(),
-            "/out/numpy.py".to_string()
-            // "/out/hello.py".to_string()
+            "/out/numpy.py".to_string(), // "/out/hello.py".to_string()
         ],
         insert_files: vec![],
         initial_files: Some(rootfs_tar),
     };
-    
+
     let result = litebox_runner_linux_userland::run(cli_args);
     println!("Result: {:?}", result);
 }

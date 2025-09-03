@@ -358,23 +358,30 @@ fn test_testcase_dynamic_with_rewriter() {
 
 #[allow(clippy::too_many_lines)]
 // Assume we have every needed files (including audit_rtld.so, and all libs) in a tar_source directory A/
-fn test_runner_with_tar_source_dir(
-    target: &str,
-    cmd_args: &[&str],
-    tar_name: &str,
-) -> Vec<u8> {
+fn test_runner_with_tar_source_dir(target: &str, cmd_args: &[&str], tar_name: &str) -> Vec<u8> {
     let backend_str = "rewriter";
 
     // Use the already compiled executable from the tests folder (same dir as this file)
     let test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
     let path = test_dir.join(target);
-    assert!(path.exists(), "Target binary not found at {}", path.to_str().unwrap());
-    println!("Using target executable binary at: {}", path.to_str().unwrap());
+    assert!(
+        path.exists(),
+        "Target binary not found at {}",
+        path.to_str().unwrap()
+    );
+    println!(
+        "Using target executable binary at: {}",
+        path.to_str().unwrap()
+    );
 
     // create tar file using `tar` command
     let tar_file = test_dir.join(tar_name);
-    assert!(tar_file.exists(), "Tar source directory not found at {}", tar_file.to_str().unwrap());
+    assert!(
+        tar_file.exists(),
+        "Tar source directory not found at {}",
+        tar_file.to_str().unwrap()
+    );
     println!("Tar file at: {}", tar_file.to_str().unwrap());
 
     // run litebox_runner_linux_userland with the tar file and the compiled executable
@@ -394,7 +401,7 @@ fn test_runner_with_tar_source_dir(
         "--initial-files",
         tar_file.to_str().unwrap(),
         "--env",
-        "LD_AUDIT=/lib64/litebox_rtld_audit.so"
+        "LD_AUDIT=/lib64/litebox_rtld_audit.so",
     ];
 
     args.push(path.to_str().unwrap());
