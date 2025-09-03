@@ -984,15 +984,15 @@ mod layered {
     }
 
     #[test]
-    fn mkdir_path_test() {
+    fn dir_creation_inside_lower_existing_dir() {
         let litebox = LiteBox::new(MockPlatform::new());
-        
+
         let mut upper = in_mem::FileSystem::new(&litebox);
         upper.with_root_privileges(|fs| {
             fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod / in upper layer");
         });
-        
+
         let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
         let fs = layered::FileSystem::new(
             &litebox,
@@ -1001,26 +1001,29 @@ mod layered {
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
 
-        // Create the directory /out/__pycache__
-        fs.mkdir("/out/__pycache__", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-            .expect("Failed to create /out/__pycache__ directory");
+        // Create the directory /bar/test (where /bar already exists inside the tar file)
+        fs.mkdir("/bar/test", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .expect("Failed to create /bar/test directory");
 
         // Verify the directory was created
-        let stat = fs.file_status("/out/__pycache__")
-            .expect("Failed to get status of /out/__pycache__");
+        let stat = fs
+            .file_status("/bar/test")
+            .expect("Failed to get status of /bar/test");
         assert_eq!(stat.file_type, FileType::Directory);
 
         // Verify we can open the directory
-        let fd = fs.open("/out/__pycache__", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open /out/__pycache__ directory");
-        let entries = fs.read_dir(&fd)
-            .expect("Failed to read /out/__pycache__ directory");
+        let fd = fs
+            .open("/bar/test", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open /bar/test directory");
+        let entries = fs
+            .read_dir(&fd)
+            .expect("Failed to read /bar/test directory");
         fs.close(fd).expect("Failed to close directory");
-        
+
         // Should contain only . and .. entries
         assert_eq!(entries.len(), 2);
         let mut names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        names.sort();
+        names.sort_unstable();
         assert_eq!(names, vec![".", ".."]);
     }
 }
