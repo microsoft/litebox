@@ -959,7 +959,7 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Descriptor {
             if file_status.node_info.dev == 1283027571 && file_status.node_info.ino == 364 {
                 let path = "/out/numpy.py";
                 let file = litebox_fs()
-                    .open(path, OFlags::CLOEXEC, Mode::empty())
+                    .open(path, OFlags::RDWR, Mode::empty())
                     .unwrap();
                 return Descriptor::File(file);
             }
