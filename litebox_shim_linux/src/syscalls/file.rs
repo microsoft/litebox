@@ -953,6 +953,18 @@ pub fn sys_epoll_pwait(
 fn do_dup(file: &Descriptor, flags: OFlags) -> Descriptor {
     match file {
         Descriptor::Stdio(file) => Descriptor::Stdio(file.dup(flags.contains(OFlags::CLOEXEC))),
+        Descriptor::File(file_fd) => {
+            let file_status = litebox_fs().fd_file_status(file_fd).unwrap();
+            // hardcode
+            if file_status.node_info.dev == 1283027571 && file_status.node_info.ino == 364 {
+                let path = "/out/numpy.py";
+                let file = litebox_fs()
+                    .open(path, OFlags::CLOEXEC, Mode::empty())
+                    .unwrap();
+                return Descriptor::File(file);
+            }
+            panic!("Need to implement fd duplication via descriptor table");
+        }
         _ => todo!(),
     }
 }
