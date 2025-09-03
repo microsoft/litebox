@@ -439,7 +439,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         path: impl crate::path::Arg,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         let path = self.absolute_path(path)?;
-        let path = &path[1..];
+        let path = if path.is_empty() {
+            ""
+        } else {
+            assert!(path.starts_with('/'));
+            &path[1..]
+        };
         let entry = self.tar_data.entries().enumerate().find(|(_, entry)| {
             match entry.filename().as_str() {
                 Ok(p) => p == path || contains_dir(p, path),

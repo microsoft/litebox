@@ -518,6 +518,7 @@ pub const TIOCGPTN: u32 = 0x80045430;
 
 /// Commands for use with `ioctl`.
 #[non_exhaustive]
+#[derive(Debug)]
 pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     /// Get the current serial port settings.
     TCGETS(Platform::RawMutPointer<Termios>),
@@ -602,7 +603,7 @@ bitflags::bitflags! {
 
 #[repr(u8)]
 #[non_exhaustive]
-#[derive(IntEnum, Debug, PartialEq)]
+#[derive(IntEnum, PartialEq, Debug)]
 pub enum Protocol {
     ICMP = 1,
     TCP = 6,
@@ -920,6 +921,7 @@ pub enum ArchPrctlCode {
 
 /// Argument for the `arch_prctl` syscall, corresponding to the [`ArchPrctlCode`] enum.
 #[non_exhaustive]
+#[derive(Debug)]
 pub enum ArchPrctlArg<Platform: litebox::platform::RawPointerProvider> {
     #[cfg(target_arch = "x86_64")]
     SetFs(usize),
@@ -1566,6 +1568,7 @@ impl<Platform: litebox::platform::RawPointerProvider> core::fmt::Debug for Futex
 
 /// Request to syscall handler
 #[non_exhaustive]
+#[derive(Debug)]
 pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     Exit {
         status: i32,

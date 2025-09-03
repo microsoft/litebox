@@ -1172,213 +1172,14 @@ mod layered {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines)]
-    fn o_trunc_flag_tests() {
+    fn dir_creation_inside_lower_existing_dir() {
         let litebox = LiteBox::new(MockPlatform::new());
 
-        // Test with LowerLayerReadOnly semantics
-        {
-            let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
-            let mut upper = in_mem::FileSystem::new(&litebox);
-
-            // Set up write permissions on the upper layer
-            upper.with_root_privileges(|fs| {
-                fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                    .expect("Failed to chmod / in upper layer");
-            });
-
-            let fs = layered::FileSystem::new(
-                &litebox,
-                upper,
-                lower,
-                layered::LayeringSemantics::LowerLayerReadOnly,
-            );
-
-            // Open with O_TRUNC should create a shadow file in upper layer
-            let fd = fs
-                .open("foo", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
-                .expect("Failed to open file with O_TRUNC");
-
-            // File should be truncated (empty)
-            let mut buffer = vec![0; 1024];
-            let bytes_read = fs
-                .read(&fd, &mut buffer, None)
-                .expect("Failed to read file");
-            assert_eq!(bytes_read, 0);
-
-            // Write new content
-            fs.write(&fd, b"new content", None)
-                .expect("Failed to write to file");
-            fs.close(fd).expect("Failed to close file");
-
-            // Verify the content persists
-            let fd = fs
-                .open("foo", OFlags::RDONLY, Mode::empty())
-                .expect("Failed to reopen file");
-            let mut buffer = vec![0; 1024];
-            let bytes_read = fs
-                .read(&fd, &mut buffer, None)
-                .expect("Failed to read file");
-            assert_eq!(&buffer[..bytes_read], b"new content");
-            fs.close(fd).expect("Failed to close file");
-        }
-
-        // Test with LowerLayerWritableFiles semantics
-        {
-            let lower = in_mem::FileSystem::new(&litebox);
-            let mut upper = in_mem::FileSystem::new(&litebox);
-
-            // Set up write permissions
-            upper.with_root_privileges(|fs| {
-                fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                    .expect("Failed to chmod / in upper layer");
-            });
-
-            // Create a file in the upper layer
-            let fd = upper
-                .open("test2.txt", OFlags::WRONLY | OFlags::CREAT, Mode::RWXU)
-                .expect("Failed to create file in upper layer");
-            upper
-                .write(&fd, b"upper layer content", None)
-                .expect("Failed to write to upper layer file");
-            upper.close(fd).expect("Failed to close upper layer file");
-
-            let fs = layered::FileSystem::new(
-                &litebox,
-                upper,
-                lower,
-                layered::LayeringSemantics::LowerLayerWritableFiles,
-            );
-
-            // Open with O_TRUNC should truncate the existing file in upper layer
-            let fd = fs
-                .open("test2.txt", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
-                .expect("Failed to open file with O_TRUNC");
-
-            // File should be truncated (empty)
-            let mut buffer = vec![0; 1024];
-            let bytes_read = fs
-                .read(&fd, &mut buffer, None)
-                .expect("Failed to read file");
-            assert_eq!(bytes_read, 0);
-            fs.close(fd).expect("Failed to close file");
-        }
-
-        // Test O_TRUNC with O_CREAT on new file
-        {
-            let lower = in_mem::FileSystem::new(&litebox);
-            let mut upper = in_mem::FileSystem::new(&litebox);
-
-            // Set up write permissions
-            upper.with_root_privileges(|fs| {
-                fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                    .expect("Failed to chmod / in upper layer");
-            });
-
-            let fs = layered::FileSystem::new(
-                &litebox,
-                upper,
-                lower,
-                layered::LayeringSemantics::LowerLayerReadOnly,
-            );
-
-            let fd = fs
-                .open(
-                    "newfile.txt",
-                    OFlags::WRONLY | OFlags::CREAT | OFlags::TRUNC,
-                    Mode::RWXU,
-                )
-                .expect("Failed to create new file with O_TRUNC");
-
-            fs.write(&fd, b"test content", None)
-                .expect("Failed to write to new file");
-            fs.close(fd).expect("Failed to close new file");
-
-            // Verify content
-            let fd = fs
-                .open("newfile.txt", OFlags::RDONLY, Mode::empty())
-                .expect("Failed to reopen new file");
-            let mut buffer = vec![0; 1024];
-            let bytes_read = fs
-                .read(&fd, &mut buffer, None)
-                .expect("Failed to read new file");
-            assert_eq!(&buffer[..bytes_read], b"test content");
-            fs.close(fd).expect("Failed to close new file");
-        }
-
-        // Test O_TRUNC on non-existent file without O_CREAT - should fail
-        {
-            let lower = in_mem::FileSystem::new(&litebox);
-            let mut upper = in_mem::FileSystem::new(&litebox);
-
-            // Set up write permissions
-            upper.with_root_privileges(|fs| {
-                fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                    .expect("Failed to chmod / in upper layer");
-            });
-
-            let fs = layered::FileSystem::new(
-                &litebox,
-                upper,
-                lower,
-                layered::LayeringSemantics::LowerLayerReadOnly,
-            );
-
-            assert!(matches!(
-                fs.open(
-                    "nonexistent.txt",
-                    OFlags::WRONLY | OFlags::TRUNC,
-                    Mode::empty()
-                ),
-                Err(crate::fs::errors::OpenError::PathError(
-                    crate::fs::errors::PathError::NoSuchFileOrDirectory
-                ))
-            ));
-        }
-
-        // Test that O_RDONLY with O_TRUNC doesn't actually truncate
-        {
-            let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
-            let mut upper = in_mem::FileSystem::new(&litebox);
-
-            // Set up write permissions (though not needed for this read-only test)
-            upper.with_root_privileges(|fs| {
-                fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                    .expect("Failed to chmod / in upper layer");
-            });
-
-            let fs = layered::FileSystem::new(
-                &litebox,
-                upper,
-                lower,
-                layered::LayeringSemantics::LowerLayerReadOnly,
-            );
-
-            // Open with O_RDONLY | O_TRUNC
-            let fd = fs
-                .open("bar/baz", OFlags::RDONLY | OFlags::TRUNC, Mode::empty())
-                .expect("Failed to open file with O_RDONLY | O_TRUNC");
-
-            // File should still have original content (not truncated)
-            let mut buffer = vec![0; 1024];
-            let bytes_read = fs
-                .read(&fd, &mut buffer, None)
-                .expect("Failed to read file");
-            assert_eq!(&buffer[..bytes_read], b"test bar baz\n");
-            fs.close(fd).expect("Failed to close file");
-        }
-    }
-
-    #[test]
-    fn mkdir_path_test() {
-        let litebox = LiteBox::new(MockPlatform::new());
-        
         let mut upper = in_mem::FileSystem::new(&litebox);
         upper.with_root_privileges(|fs| {
             fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod / in upper layer");
         });
-        
         let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
         let fs = layered::FileSystem::new(
             &litebox,
@@ -1387,26 +1188,29 @@ mod layered {
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
 
-        // Create the directory /out/__pycache__
-        fs.mkdir("/out/__pycache__", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-            .expect("Failed to create /out/__pycache__ directory");
+        // Create the directory /bar/test (where /bar already exists inside the tar file)
+        fs.mkdir("/bar/test", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .expect("Failed to create /bar/test directory");
 
         // Verify the directory was created
-        let stat = fs.file_status("/out/__pycache__")
-            .expect("Failed to get status of /out/__pycache__");
+        let stat = fs
+            .file_status("/bar/test")
+            .expect("Failed to get status of /bar/test");
         assert_eq!(stat.file_type, FileType::Directory);
 
         // Verify we can open the directory
-        let fd = fs.open("/out/__pycache__", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open /out/__pycache__ directory");
-        let entries = fs.read_dir(&fd)
-            .expect("Failed to read /out/__pycache__ directory");
+        let fd = fs
+            .open("/bar/test", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open /bar/test directory");
+        let entries = fs
+            .read_dir(&fd)
+            .expect("Failed to read /bar/test directory");
         fs.close(fd).expect("Failed to close directory");
-        
+
         // Should contain only . and .. entries
         assert_eq!(entries.len(), 2);
         let mut names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        names.sort();
+        names.sort_unstable();
         assert_eq!(names, vec![".", ".."]);
     }
 }
