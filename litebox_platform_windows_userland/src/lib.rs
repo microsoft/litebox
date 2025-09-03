@@ -64,7 +64,7 @@ impl ThreadFsBaseState {
         }
     }
 
-    fn restore_fs_base(&self) {
+    fn restore_fs_base(self) {
         unsafe {
             litebox_common_linux::wrfsbase(self.fs_base);
         }
@@ -129,7 +129,7 @@ unsafe impl Sync for WindowsUserland {}
 impl WindowsUserland {
     /// Get the current thread's FS base state
     fn get_thread_fs_base_state() -> ThreadFsBaseState {
-        THREAD_FS_BASE.with(|state| state.get())
+        THREAD_FS_BASE.with(std::cell::Cell::get)
     }
 
     /// Set the current thread's FS base
@@ -205,7 +205,7 @@ impl WindowsUserland {
 
         let platform = Self {
             tls_slot: TlsSlot::new().expect("Failed to create TLS slot!"),
-            reserved_pages: reserved_pages,
+            reserved_pages,
             sys_info: std::sync::RwLock::new(sys_info),
         };
         platform.set_init_tls();
@@ -244,8 +244,8 @@ impl WindowsUserland {
             let ok = unsafe {
                 Win32_Memory::VirtualQuery(
                     address as *const c_void,
-                    &mut mbi,
-                    core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>() as usize,
+                    &raw mut mbi,
+                    core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
                 ) != 0
             };
             if !ok {
@@ -255,11 +255,11 @@ impl WindowsUserland {
             if mbi.State == Win32_Memory::MEM_RESERVE || mbi.State == Win32_Memory::MEM_COMMIT {
                 reserved_pages.push(core::ops::Range {
                     start: mbi.BaseAddress as usize,
-                    end: (mbi.BaseAddress as usize + mbi.RegionSize) as usize,
+                    end: (mbi.BaseAddress as usize + mbi.RegionSize),
                 });
             }
 
-            address = (mbi.BaseAddress as usize + mbi.RegionSize) as usize;
+            address = mbi.BaseAddress as usize + mbi.RegionSize;
             if address == 0 {
                 break;
             }
@@ -316,7 +316,7 @@ impl WindowsUserland {
 impl litebox::platform::Provider for WindowsUserland {}
 
 impl litebox::platform::ExitProvider for WindowsUserland {
-    type ExitCode = i32;
+    type ExitCode = u32;
     const EXIT_SUCCESS: Self::ExitCode = 0;
     const EXIT_FAILURE: Self::ExitCode = 1;
 
@@ -326,9 +326,7 @@ impl litebox::platform::ExitProvider for WindowsUserland {
             sys_info: _,
             reserved_pages: _,
         } = self;
-        // TODO: Implement Windows process exit
-        // For now, use standard process exit
-        std::process::exit(code);
+        unsafe { windows_sys::Win32::System::Threading::ExitProcess(code) }
     }
 }
 
@@ -337,7 +335,7 @@ unsafe extern "system" fn thread_start(param: *mut c_void) -> u32 {
     // Initialize FS base state for this new thread
     WindowsUserland::init_thread_fs_base();
 
-    let thread_start_args = unsafe { Box::from_raw(param as *mut ThreadStartArgs) };
+    let thread_start_args = unsafe { Box::from_raw(param.cast::<ThreadStartArgs>()) };
 
     // store the guest pt_regs onto the stack (for restoration later on)
     let pt_regs_stack = *thread_start_args.pt_regs;
@@ -406,8 +404,8 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
 
         let thread_start_args = ThreadStartArgs {
             pt_regs: copied_pt_regs,
-            thread_args: thread_args,
-            entry_point: entry_point,
+            thread_args,
+            entry_point,
         };
 
         // We should always use heap to pass the parameter to `CreateThread`. This is to avoid using the parents'
@@ -420,23 +418,18 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
                 // just let the OS to allocate a dummy stack
                 0,
                 Some(thread_start),
-                thread_start_arg_ptr as *mut c_void,
+                thread_start_arg_ptr.cast::<c_void>(),
                 // This flag indicates that the stack size is a reservation, not a commit.
                 Win32_Threading::STACK_SIZE_PARAM_IS_A_RESERVATION,
                 child_tid_ptr as *mut u32,
             )
         };
         assert!(!handle.is_null(), "Failed to create thread");
-        Ok(unsafe { *(child_tid_ptr as *const i32) as usize })
+        Ok(unsafe { *(child_tid_ptr as *const u32) as usize })
     }
 
-    #[allow(unreachable_code)]
     fn terminate_thread(&self, code: Self::ExitCode) -> ! {
-        unsafe {
-            Win32_Threading::ExitThread(code as u32);
-        };
-
-        unreachable!("exit should not return");
+        unsafe { Win32_Threading::ExitThread(code) }
     }
 }
 
@@ -476,10 +469,10 @@ impl RawMutex {
         // Indicate we are about to wait.
         self.waiter_count.fetch_add(1, SeqCst);
 
-        let result = loop {
+        let result = 'res: {
             // Check if value changed before waiting
             if self.inner.load(SeqCst) != val {
-                break Err(ImmediatelyWokenUp);
+                break 'res Err(ImmediatelyWokenUp);
             }
 
             // Compute timeout in ms
@@ -488,33 +481,33 @@ impl RawMutex {
                 Some(timeout) => match timeout.checked_sub(start.elapsed()) {
                     None => {
                         // Already timed out
-                        break Ok(UnblockedOrTimedOut::TimedOut);
+                        break 'res Ok(UnblockedOrTimedOut::TimedOut);
                     }
                     Some(remaining_time) => {
                         let ms = remaining_time.as_millis();
-                        ms.min((u32::MAX - 1) as u128) as u32
+                        u32::try_from(ms.min(u128::from(u32::MAX - 1))).unwrap()
                     }
                 },
             };
 
             let ok = unsafe {
                 Win32_Threading::WaitOnAddress(
-                    &self.inner as *const AtomicU32 as *const c_void,
-                    &val as *const u32 as *const c_void,
+                    (&raw const self.inner).cast::<c_void>(),
+                    (&raw const val).cast::<c_void>(),
                     std::mem::size_of::<u32>(),
                     timeout_ms,
                 ) != 0
             };
 
             if ok {
-                break Ok(UnblockedOrTimedOut::Unblocked);
+                Ok(UnblockedOrTimedOut::Unblocked)
             } else {
                 // Check why WaitOnAddress failed
                 let err = unsafe { GetLastError() };
                 match err {
                     Win32_Foundation::WAIT_TIMEOUT => {
                         // Timed out
-                        break Ok(UnblockedOrTimedOut::TimedOut);
+                        Ok(UnblockedOrTimedOut::TimedOut)
                     }
                     e => {
                         // Other error, possibly spurious wakeup or value changed
@@ -817,6 +810,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     // NOTE: make sure the values are PAGE_ALIGNED.
     const TASK_ADDR_MIN: usize = 0x1_0000;
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
+    #[expect(clippy::too_many_lines)]
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
@@ -828,13 +822,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         let base_addr = suggested_range.start as *mut c_void;
         let size = suggested_range.len();
         // TODO: For Windows, there is no MAP_GROWDOWN features so far.
+        let _ = can_grow_down;
 
         // 1) In case we have a suggested VA range, we first check and deal with the case
         // that the address (range) is already reserved.
         if suggested_range.start != 0 {
-            assert!(suggested_range.start as usize >= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
+            assert!(suggested_range.start >= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
                                                             TASK_ADDR_MIN);
-            assert!(suggested_range.end as usize <= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
+            assert!(suggested_range.end <= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
                                                             TASK_ADDR_MAX);
 
             let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
@@ -843,7 +838,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             // The region is already either reserved or committed, and we need to handle both cases.
             if mbi.State == Win32_Memory::MEM_RESERVE || mbi.State == Win32_Memory::MEM_COMMIT {
                 let region_base = mbi.BaseAddress as usize;
-                let region_size = mbi.RegionSize as usize;
+                let region_size = mbi.RegionSize;
                 let region_end = region_base + region_size;
                 let request_end = suggested_range.start + size;
 
@@ -884,7 +879,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     base_addr,
                                     size_within_region,
                                     prot_flags(initial_permissions),
-                                    &mut old_protect,
+                                    &raw mut old_protect,
                                 ) != 0,
                                 "VirtualProtect(addr={:p}, size=0x{:x}) failed: {}",
                                 base_addr,
@@ -966,9 +961,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         if fixed_address {
             assert!(
                 addr == aligned_base_addr,
-                "VirtualAlloc2 returned address {:p} which is not the expected fixed address {:p}",
-                addr,
-                aligned_base_addr
+                "VirtualAlloc2 returned address {addr:p} which is not the expected fixed address {aligned_base_addr:p}"
             );
         }
 
@@ -1209,7 +1202,8 @@ unsafe extern "C" fn syscall_handler(
 ) -> isize {
     // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
     let ctx = unsafe { &mut *ctx };
-    let res = match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
+
+    match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
         Ok(d) => {
             let syscall_handler: SyscallHandler = SYSCALL_HANDLER
                 .read()
@@ -1218,9 +1212,7 @@ unsafe extern "C" fn syscall_handler(
             syscall_handler(d)
         }
         Err(err) => err.as_neg() as isize,
-    };
-
-    res
+    }
 }
 
 impl litebox::platform::SystemInfoProvider for WindowsUserland {
