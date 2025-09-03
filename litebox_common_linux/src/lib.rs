@@ -448,7 +448,7 @@ pub enum FcntlArg {
     /// Set descriptor status flags
     SETFL(OFlags),
     /// Duplicate file descriptor and set close-on-exec flag
-    DUPFD_CLOEXEC,
+    DUPFD_CLOEXEC(usize),
 }
 
 const F_GETFD: i32 = 1;
@@ -476,7 +476,7 @@ impl FcntlArg {
             F_SETFD => Self::SETFD(FileDescriptorFlags::from_bits_truncate(arg.truncate())),
             F_GETFL => Self::GETFL,
             F_SETFL => Self::SETFL(OFlags::from_bits_truncate(arg.truncate())),
-            F_DUPFD_CLOEXEC => Self::DUPFD_CLOEXEC,
+            F_DUPFD_CLOEXEC => Self::DUPFD_CLOEXEC(arg),
             _ => unimplemented!(),
         }
     }

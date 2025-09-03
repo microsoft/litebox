@@ -177,6 +177,26 @@ impl Descriptors {
             u32::try_from(idx).unwrap()
         }
     }
+    fn insert_since(&mut self, descriptor: Descriptor, since: usize) -> u32 {
+        let idx = self
+            .descriptors
+            .iter()
+            .enumerate()
+            .skip(since)
+            .find(|(_, v)| v.is_none())
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| {
+                self.descriptors.resize_with(since + 1, Default::default);
+                since
+            });
+        let old = self.descriptors[idx].replace(descriptor);
+        assert!(old.is_none());
+        if idx >= (2 << 30) {
+            panic!("Too many FDs");
+        } else {
+            u32::try_from(idx).unwrap()
+        }
+    }
     fn insert_at(&mut self, descriptor: Descriptor, idx: usize) -> Option<Descriptor> {
         if idx >= self.descriptors.len() {
             self.descriptors.resize_with(idx + 1, Default::default);
