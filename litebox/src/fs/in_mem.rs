@@ -11,8 +11,8 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError,
-    PathError, ReadDirError, ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError,
-    WriteError,
+    PathError, ReadDirError, ReadError, RmdirError, SeekError, SetMetadataError, TruncateError,
+    UnlinkError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, UserInfo};
 use crate::utilities::anymap::AnyMap;
@@ -350,6 +350,26 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             *position = new_posn;
             Ok(new_posn)
         }
+    }
+
+    fn truncate(&self, fd: &FileFd<Platform>) -> Result<(), TruncateError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let Descriptor::File {
+            file,
+            read_allowed: _,
+            write_allowed,
+            position,
+            metadata: _,
+        } = &mut descriptor_table.get_entry_mut(fd).entry
+        else {
+            return Err(TruncateError::NotAFile);
+        };
+        if !*write_allowed {
+            return Err(TruncateError::NotForWriting);
+        }
+        file.write().data.clear();
+        *position = 0;
+        Ok(())
     }
 
     fn chmod(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), ChmodError> {

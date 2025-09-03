@@ -38,7 +38,7 @@ use super::{
     Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     errors::{
         ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadDirError,
-        ReadError, RmdirError, SeekError, UnlinkError, WriteError,
+        ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
     },
 };
 
@@ -282,6 +282,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         } else {
             *position = new_posn;
             Ok(new_posn)
+        }
+    }
+
+    fn truncate(&self, fd: &FileFd<Platform>) -> Result<(), TruncateError> {
+        match self.litebox.descriptor_table().get_entry(fd).entry {
+            Descriptor::File { .. } => Err(TruncateError::NotForWriting),
+            Descriptor::Dir { .. } => Err(TruncateError::NotAFile),
         }
     }
 

@@ -8,7 +8,7 @@ use crate::{
         FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
         errors::{
             ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-            ReadDirError, ReadError, RmdirError, SeekError, UnlinkError, WriteError,
+            ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
         },
     },
     path::Arg,
@@ -187,6 +187,13 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
         unimplemented!()
+    }
+
+    fn truncate(&self, fd: &FileFd<Platform>) -> Result<(), TruncateError> {
+        match self.litebox.descriptor_table().get_entry(fd).entry {
+            StdioStream::Stdin => Err(TruncateError::NotForWriting),
+            StdioStream::Stdout | StdioStream::Stderr => Ok(()),
+        }
     }
 
     #[expect(unused_variables, reason = "unimplemented")]

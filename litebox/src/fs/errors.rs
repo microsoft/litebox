@@ -59,6 +59,15 @@ pub enum SeekError {
     InvalidOffset,
 }
 
+/// Possible errors from [`FileSystem::truncate`]
+#[derive(Error, Debug)]
+pub enum TruncateError {
+    #[error("file descriptor does not point to a file")]
+    NotAFile,
+    #[error("file is not opened for writing")]
+    NotForWriting,
+}
+
 /// Possible errors from [`FileSystem::chmod`]
 #[non_exhaustive]
 #[derive(Error, Debug)]

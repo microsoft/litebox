@@ -21,7 +21,8 @@ mod tests;
 
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError,
-    ReadDirError, ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError, WriteError,
+    ReadDirError, ReadError, RmdirError, SeekError, SetMetadataError, TruncateError, UnlinkError,
+    WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -87,6 +88,9 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         offset: isize,
         whence: SeekWhence,
     ) -> Result<usize, SeekError>;
+
+    /// Truncate the file (i.e., reset the offset to zero, and set its contents to empty).
+    fn truncate(&self, fd: &TypedFd<Self>) -> Result<(), TruncateError>;
 
     /// Change the permissions of a file
     fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;

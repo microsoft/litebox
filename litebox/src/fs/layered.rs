@@ -13,7 +13,7 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, UnlinkError, WriteError,
+    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
 
@@ -812,6 +812,58 @@ impl<
             .position
             .store(position, SeqCst);
         Ok(position)
+    }
+
+    fn truncate(&self, fd: &FileFd<Platform, Upper, Lower>) -> Result<(), TruncateError> {
+        let (flags, entry) = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| {
+                (descriptor.entry.flags, Arc::clone(&descriptor.entry.entry))
+            });
+        let layered_fd = fd;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.truncate(fd),
+            EntryX::Lower { fd } => {
+                match self.layering_semantics {
+                    LayeringSemantics::LowerLayerWritableFiles => self.lower.truncate(fd),
+                    LayeringSemantics::LowerLayerReadOnly => {
+                        if flags.contains(OFlags::WRONLY) || flags.contains(OFlags::RDWR) {
+                            // We might need to migrate the file up
+                            match self.lower.truncate(fd) {
+                                Ok(()) => unreachable!(),
+                                Err(TruncateError::NotAFile) => Err(TruncateError::NotAFile),
+                                Err(TruncateError::NotForWriting) => {
+                                    // We must actually migrate this file up, and keep it truncated.
+                                    //
+                                    // TODO(jayb): Optimization opportunity; do not copy the data
+                                    // over before immediately truncating it after that. To do this
+                                    // nicely, we need to refactor `migrate_file_up`, but for now,
+                                    // we do need a chunk of its behavior around arc entry
+                                    // refcounting and such, and we do not want to duplicate that
+                                    // here, so we take a mild perf hit of essentially copying
+                                    // before instantly erasing.
+                                    self.litebox.descriptor_table().with_entry(
+                                        layered_fd,
+                                        |descriptor| {
+                                            self.migrate_file_up(&descriptor.entry.path)
+                                                .expect("this migration should always succeed");
+                                        },
+                                    );
+                                    // Now the recursion should just see an upper-layer file.
+                                    self.truncate(layered_fd)
+                                }
+                            }
+                        } else {
+                            // The lower level truncate will correctly identify dir/file and handle
+                            // the difference in erroring.
+                            self.lower.truncate(fd)
+                        }
+                    }
+                }
+            }
+            EntryX::Tombstone => unreachable!(),
+        }
     }
 
     fn chmod(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), ChmodError> {
