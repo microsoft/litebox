@@ -194,7 +194,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             open_file(&mut in_mem, prog_unix_path.as_str(), last.0);
         }
 
-        let tar_ro = litebox::fs::tar_ro::FileSystem::new(&litebox, tar_data);
+        let tar_ro = litebox::fs::tar_ro::FileSystem::new(&litebox, tar_data.into());
         let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&litebox);
         litebox::fs::layered::FileSystem::new(
             &litebox,

@@ -28,6 +28,12 @@ need_stdout = false
 command = ["cargo", "clippy", "--all-targets", "--all-features"]
 need_stdout = false
 
+# Clippy on Windows target using PowerShell on WSL
+[jobs.clippy-windows]
+command = ["pwsh.exe", "-Command", '$env:CARGO_TARGET_DIR = ".\target\windows"; $env:CARGO_INCREMENTAL = "0"; cargo --color=never clippy -p litebox_runner_linux_on_windows_userland --all-targets --all-features 2>&1 | ForEach-Object { [Console]::WriteLine($PSItem) }']
+need_stdout = true
+extraneous_args = false
+
 # All build checks on LVBS
 [jobs.buildchecks-lvbs]
 command = ["bash", "-c", """
@@ -84,3 +90,4 @@ alt-n = "job:nextest-x86"
 d = "job:doc-open"
 alt-d = "job:doc"
 v = "job:buildchecks-lvbs"
+w = "job:clippy-windows"

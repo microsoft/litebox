@@ -35,7 +35,7 @@ unsafe extern "C" {
     fn trampoline(entry: usize, sp: usize) -> !;
 }
 
-pub fn init_platform(tar_data: &[u8], initial_dirs: &[&str], initial_files: &[&str]) {
+pub fn init_platform(tar_data: &'static [u8], initial_dirs: &[&str], initial_files: &[&str]) {
     let platform = Platform::new();
     set_platform(platform);
     let platform = litebox_platform_multiplex::platform();
@@ -50,7 +50,7 @@ pub fn init_platform(tar_data: &[u8], initial_dirs: &[&str], initial_files: &[&s
     let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(
         &litebox,
         if tar_data.is_empty() {
-            litebox::fs::tar_ro::empty_tar_file()
+            litebox::fs::tar_ro::empty_tar_file().into()
         } else {
             tar_data.into()
         },
