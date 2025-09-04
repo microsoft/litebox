@@ -9,6 +9,12 @@ pub struct UserConstPtr<T> {
     pub inner: *const T,
 }
 
+impl<T: Clone> core::fmt::Debug for UserConstPtr<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("UserConstPtr").field(&self.inner).finish()
+    }
+}
+
 impl<T: Clone> Copy for UserConstPtr<T> {}
 impl<T: Clone> RawConstPointer<T> for UserConstPtr<T> {
     unsafe fn read_at_offset<'a>(self, _count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
@@ -46,6 +52,12 @@ impl<T: Clone> UserConstPtr<T> {
 #[derive(Clone)]
 pub struct UserMutPtr<T> {
     pub inner: *mut T,
+}
+
+impl<T: Clone> core::fmt::Debug for UserMutPtr<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("UserMutPtr").field(&self.inner).finish()
+    }
 }
 
 impl<T: Clone> Copy for UserMutPtr<T> {}
