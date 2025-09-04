@@ -418,6 +418,7 @@ fn test_runner_with_tar_source_dir(
             "lib64",
             "usr",
             "out",
+            "opt",
             "Lib",
         ])
         .current_dir(&tar_source_dir)

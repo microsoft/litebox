@@ -1199,7 +1199,7 @@ impl litebox::platform::StdioProvider for LinuxUserland {
 }
 
 #[global_allocator]
-static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 28, LinuxUserland> =
+static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 30, LinuxUserland> =
     litebox::mm::allocator::SafeZoneAllocator::new();
 
 impl litebox::mm::allocator::MemoryProvider for LinuxUserland {
