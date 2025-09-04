@@ -677,8 +677,6 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
             Ok(0)
         }
         FcntlArg::DUPFD_CLOEXEC(minfd) => {
-            file_descriptors().write().get_fd(fd).ok_or(Errno::EBADF)?;
-
             let new_file = file_descriptors()
                 .read()
                 .get_fd(fd)
