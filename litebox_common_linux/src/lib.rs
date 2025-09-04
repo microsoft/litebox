@@ -1477,6 +1477,7 @@ bitflags::bitflags! {
 }
 
 #[non_exhaustive]
+#[derive(Debug)]
 pub enum FutexArgs<Platform: litebox::platform::RawPointerProvider> {
     Wait {
         addr: Platform::RawMutPointer<u32>,
