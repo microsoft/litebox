@@ -178,19 +178,19 @@ impl Descriptors {
         }
     }
     fn insert_since(&mut self, descriptor: Descriptor, since: usize) -> u32 {
-        let idx = self
-            .descriptors
-            .iter()
-            .enumerate()
-            .skip(since)
-            .find(|(_, v)| v.is_none())
-            .map(|(i, _)| i)
-            .unwrap_or_else(|| {
-                self.descriptors.resize_with(since + 1, Default::default);
-                since
-            });
+        let idx = if since >= self.descriptors.len() {
+            self.descriptors.resize_with(since + 1, || None);
+            since
+        } else if let Some(off) = self.descriptors[since..].iter().position(Option::is_none) {
+            since + off
+        } else {
+            self.descriptors.push(None);
+            self.descriptors.len() - 1
+        };
+
         let old = self.descriptors[idx].replace(descriptor);
-        assert!(old.is_none());
+        assert!(old.is_none(), "logic bug: overwriting a non-empty slot");
+
         if idx >= (2 << 30) {
             panic!("Too many FDs");
         } else {
