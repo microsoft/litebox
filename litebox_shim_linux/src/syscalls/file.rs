@@ -677,11 +677,8 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
             Ok(0)
         }
         FcntlArg::DUPFD_CLOEXEC(minfd) => {
-            let new_file = file_descriptors()
-                .read()
-                .get_fd(fd)
-                .ok_or(Errno::EBADF)
-                .map(|desc| do_dup(desc, OFlags::CLOEXEC))?;
+            let new_file = do_dup(desc, OFlags::CLOEXEC);
+            
             drop(locked_file_descriptors);
             // dup and choose a fd since `minfd`
             Ok(file_descriptors().write().insert_since(new_file, minfd))
