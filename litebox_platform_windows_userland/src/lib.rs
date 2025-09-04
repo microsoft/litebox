@@ -17,6 +17,7 @@ use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox::platform::{ImmediatelyWokenUp, RawMutPointer};
+use litebox::utils::ReinterpretUnsignedExt as _;
 use litebox_common_linux::PunchthroughSyscall;
 
 use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
@@ -77,7 +78,7 @@ thread_local! {
 }
 
 /// Connector to a shim-exposed syscall-handling interface.
-pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<WindowsUserland>) -> isize;
+pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<WindowsUserland>) -> usize;
 
 /// The syscall handler passed down from the shim.
 static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
@@ -1199,7 +1200,7 @@ unsafe extern "C" {
 unsafe extern "C" fn syscall_handler(
     syscall_number: usize,
     ctx: *mut litebox_common_linux::PtRegs,
-) -> isize {
+) -> usize {
     // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
     let ctx = unsafe { &mut *ctx };
 
@@ -1211,7 +1212,7 @@ unsafe extern "C" fn syscall_handler(
                 .expect("Should have run `register_syscall_handler` by now");
             syscall_handler(d)
         }
-        Err(err) => err.as_neg() as isize,
+        Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
     }
 }
 
