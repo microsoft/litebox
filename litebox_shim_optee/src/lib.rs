@@ -446,6 +446,7 @@ pub fn submit_optee_command(
 /// This function panics if it cannot allocate a stack
 pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
     if is_sys_return {
+        // TODO: return this output to VTL0
         handle_optee_command_output(session_id);
     }
 
@@ -456,7 +457,9 @@ pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
                     if #[cfg(feature = "platform_linux_userland")] {
                         litebox_platform_multiplex::platform().terminate_thread(0);
                     } else if #[cfg(feature = "platform_lvbs")] {
-                        todo!("switch to VTL0");
+                        unsafe {
+                            litebox_platform_lvbs::mshv::vtl_switch::jump_to_vtl_switch_loop();
+                        }
                     } else {
                         compile_error!(r##"No platform specified."##);
                     }
@@ -488,14 +491,18 @@ pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
         }
     } else {
         // no command left. terminate the thread for now (or sleep until next command comes)
-        session_id_elf_load_info_map().remove(session_id);
-        optee_command_submission_queue().remove(session_id);
-        optee_command_completion_queue().remove(session_id);
+        // TODO: re-enable these once on-demand TA loading is implemented.
+        // for now, we assume a session/TA is persistent and never removed.
+        // session_id_elf_load_info_map().remove(session_id);
+        // optee_command_submission_queue().remove(session_id);
+        // optee_command_completion_queue().remove(session_id);
         cfg_if::cfg_if! {
             if #[cfg(feature = "platform_linux_userland")] {
                 litebox_platform_multiplex::platform().terminate_thread(0);
             } else if #[cfg(feature = "platform_lvbs")] {
-                todo!("switch to VTL0");
+                unsafe {
+                    litebox_platform_lvbs::mshv::vtl_switch::jump_to_vtl_switch_loop();
+                }
             } else {
                 compile_error!(r##"No platform specified."##);
             }

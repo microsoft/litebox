@@ -677,7 +677,12 @@ pub fn mshv_vsm_copy_secondary_key(_pa: u64, _nranges: u64) -> Result<i64, Errno
 /// This function protects the kexec kernel blob (PE) only if it has a valid signature.
 /// Note: this function does not make kexec kernel pages executable, which should be done by
 /// another VTL1 method that can intercept the kexec/reset signal.
+#[expect(clippy::unnecessary_wraps)]
 pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64, Errno> {
+    // repurpose `mshv_vsm_kexec_validate` for a while for OP-TEE TA calls.
+    // we don't need to do this once we add VSM functions for OP-TEE.
+    // crate::optee_call();
+    // Ok(0)
     debug_serial_println!(
         "VSM: Validate kexec pa {:#x} nranges {} crash {}",
         pa,

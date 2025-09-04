@@ -739,3 +739,20 @@ pub fn platform_low() -> &'static Platform {
         .get()
         .expect("set_platform_low should have already been called before this point")
 }
+
+// TODO: remove this callback
+pub type OpteeCallback = fn();
+static OPTEE_CALLBACK: spin::Once<OpteeCallback> = spin::Once::new();
+
+// TODO: remove this callback
+pub fn set_optee_callback(callback: OpteeCallback) {
+    OPTEE_CALLBACK.call_once(|| callback);
+}
+
+// TODO: remove this callback
+pub fn optee_call() {
+    let optee_callback: OpteeCallback = *OPTEE_CALLBACK
+        .get()
+        .expect("OP-TEE callback should be initialized");
+    optee_callback();
+}

@@ -117,6 +117,8 @@ pub fn run(platform: Option<&'static Platform>) -> ! {
             if let Ok(session_id) = platform.create_userspace() {
                 let session_id: u32 = u32::try_from(session_id).expect("invalid session_id");
 
+                // TODO: load TA ELF binary according to an OP-TEE message command
+                // we do have ELF loading here due to crate dependency
                 let loaded_program =
                     litebox_shim_optee::loader::load_elf_buffer(TA_BINARY).unwrap();
                 register_session_id_elf_load_info(session_id, loaded_program);
@@ -127,54 +129,63 @@ pub fn run(platform: Option<&'static Platform>) -> ! {
                         x86_64::registers::rflags::RFlags::INTERRUPT_FLAG,
                     )
                     .expect("Failed to save user context");
-
-                let params = [
-                    UteeParamsTyped::None,
-                    UteeParamsTyped::None,
-                    UteeParamsTyped::None,
-                    UteeParamsTyped::None,
-                ];
-                submit_optee_command(session_id, UteeEntryFunc::OpenSession, params, 0);
-
-                let params = [
-                    UteeParamsTyped::ValueInout {
-                        value_a: 100,
-                        value_b: 0,
-                    },
-                    UteeParamsTyped::None,
-                    UteeParamsTyped::None,
-                    UteeParamsTyped::None,
-                ];
-                submit_optee_command(session_id, UteeEntryFunc::InvokeCommand, params, 0);
-
-                let params = [
-                    UteeParamsTyped::ValueInout {
-                        value_a: 200,
-                        value_b: 0,
-                    },
-                    UteeParamsTyped::None,
-                    UteeParamsTyped::None,
-                    UteeParamsTyped::None,
-                ];
-                submit_optee_command(session_id, UteeEntryFunc::InvokeCommand, params, 1);
-
-                let params = [
-                    UteeParamsTyped::None,
-                    UteeParamsTyped::None,
-                    UteeParamsTyped::None,
-                    UteeParamsTyped::None,
-                ];
-                submit_optee_command(session_id, UteeEntryFunc::CloseSession, params, 0);
-
-                optee_command_dispatcher(session_id, false);
             } else {
                 panic!("Failed to create userspace");
             }
+
+            // TODO: remove this callback
+            litebox_platform_lvbs::set_optee_callback(optee_call);
         } else {
             panic!("Failed to get platform");
-        };
+        }
     }
     vtl_switch_loop_entry(platform)
+}
+
+// callback to work around crate dependency issues. Should be removed once
+// we finalize our refactoring.
+fn optee_call() {
+    // TODO: create a VSM function and do the below within that function
+    let session_id = 1;
+    let params = [
+        UteeParamsTyped::None,
+        UteeParamsTyped::None,
+        UteeParamsTyped::None,
+        UteeParamsTyped::None,
+    ];
+    submit_optee_command(session_id, UteeEntryFunc::OpenSession, params, 0);
+
+    let params = [
+        UteeParamsTyped::ValueInout {
+            value_a: 100,
+            value_b: 0,
+        },
+        UteeParamsTyped::None,
+        UteeParamsTyped::None,
+        UteeParamsTyped::None,
+    ];
+    submit_optee_command(session_id, UteeEntryFunc::InvokeCommand, params, 0);
+
+    let params = [
+        UteeParamsTyped::ValueInout {
+            value_a: 200,
+            value_b: 0,
+        },
+        UteeParamsTyped::None,
+        UteeParamsTyped::None,
+        UteeParamsTyped::None,
+    ];
+    submit_optee_command(session_id, UteeEntryFunc::InvokeCommand, params, 1);
+
+    let params = [
+        UteeParamsTyped::None,
+        UteeParamsTyped::None,
+        UteeParamsTyped::None,
+        UteeParamsTyped::None,
+    ];
+    submit_optee_command(session_id, UteeEntryFunc::CloseSession, params, 0);
+
+    optee_command_dispatcher(session_id, false);
 }
 
 const TA_BINARY: &[u8] =

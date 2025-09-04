@@ -197,9 +197,10 @@ unsafe extern "C" fn load_vtl_state(vtl: u8) {
 }
 
 pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
-    if let Some(platform) = platform {
-        crate::set_platform_low(platform);
-    }
+    // TODO: renable this once refactoring is done
+    // if let Some(platform) = platform {
+    //     crate::set_platform_low(platform);
+    // }
 
     unsafe {
         save_vtl0_state();
@@ -231,7 +232,9 @@ fn jump_to_vtl_switch_loop_with_stack_cleanup() -> ! {
 
 /// expose `vtl_switch_loop` to the outside (e.g., the syscall handler)
 #[unsafe(naked)]
-pub(crate) unsafe extern "C" fn jump_to_vtl_switch_loop() -> ! {
+// TODO: renable this once refactoring is done
+// pub(crate) unsafe extern "C" fn jump_to_vtl_switch_loop() -> ! {
+pub unsafe extern "C" fn jump_to_vtl_switch_loop() -> ! {
     naked_asm!(
         "jmp {loop}",
         loop = sym vtl_switch_loop,
