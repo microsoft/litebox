@@ -629,7 +629,10 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
             Ok(0)
         }
         FcntlArg::GETFL => match desc {
-            Descriptor::File(file) => todo!(),
+            Descriptor::File(file) => {
+                // TODO(chuqi): hardcode for now
+                Ok(OFlags::RDWR.bits())
+            }
             Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { consumer, .. } => Ok(consumer.get_status().bits()),
             Descriptor::PipeWriter { producer, .. } => Ok(producer.get_status().bits()),
