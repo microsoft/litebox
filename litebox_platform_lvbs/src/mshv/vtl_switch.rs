@@ -197,10 +197,9 @@ unsafe extern "C" fn load_vtl_state(vtl: u8) {
 }
 
 pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
-    // TODO: renable this once refactoring is done
-    // if let Some(platform) = platform {
-    //     crate::set_platform_low(platform);
-    // }
+    if let Some(platform) = platform {
+        crate::set_platform_low(platform);
+    }
 
     unsafe {
         save_vtl0_state();

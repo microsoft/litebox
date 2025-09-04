@@ -75,6 +75,7 @@ pub fn init() -> Option<&'static Platform> {
             let pml4_table_addr = vtl1_start + u64::try_from(PAGE_SIZE * VTL1_PML4E_PAGE).unwrap();
             let platform = Platform::new(pml4_table_addr, vtl1_start, vtl1_end);
             ret = Some(platform);
+            litebox_platform_multiplex::set_platform(platform);
 
             // Add the rest of the VTL1 memory to the global allocator once they are mapped to the kernel page table.
             let mem_fill_start = mem_fill_start + mem_fill_size;
@@ -94,6 +95,8 @@ pub fn init() -> Option<&'static Platform> {
         } else {
             panic!("Failed to get memory info");
         }
+
+        litebox_platform_lvbs::set_optee_callback(optee_call);
     }
 
     if let Err(e) = hvcall::init() {
@@ -106,45 +109,36 @@ pub fn init() -> Option<&'static Platform> {
     ret
 }
 
-/// # Panics
-///
-/// Panics if `session_id` is invalid
 pub fn run(platform: Option<&'static Platform>) -> ! {
-    if get_core_id() == 0 {
-        if let Some(platform) = platform {
-            litebox_platform_multiplex::set_platform(platform);
-            litebox_platform_lvbs::set_platform_low(platform);
-            if let Ok(session_id) = platform.create_userspace() {
-                let session_id: u32 = u32::try_from(session_id).expect("invalid session_id");
-
-                // TODO: load TA ELF binary according to an OP-TEE message command
-                // we do have ELF loading here due to crate dependency
-                let loaded_program =
-                    litebox_shim_optee::loader::load_elf_buffer(TA_BINARY).unwrap();
-                register_session_id_elf_load_info(session_id, loaded_program);
-                platform
-                    .save_user_context(
-                        VirtAddr::new(u64::try_from(loaded_program.entry_point).unwrap()),
-                        VirtAddr::new(u64::try_from(loaded_program.stack_base).unwrap()),
-                        x86_64::registers::rflags::RFlags::INTERRUPT_FLAG,
-                    )
-                    .expect("Failed to save user context");
-            } else {
-                panic!("Failed to create userspace");
-            }
-
-            // TODO: remove this callback
-            litebox_platform_lvbs::set_optee_callback(optee_call);
-        } else {
-            panic!("Failed to get platform");
-        }
-    }
     vtl_switch_loop_entry(platform)
 }
 
 // callback to work around crate dependency issues. Should be removed once
 // we finalize our refactoring.
 fn optee_call() {
+    static CALL_ONCE: spin::Once<bool> = spin::Once::new();
+    CALL_ONCE.call_once(|| {
+        let platform = litebox_platform_lvbs::platform_low();
+        if let Ok(session_id) = platform.create_userspace() {
+            let session_id: u32 = u32::try_from(session_id).expect("invalid session_id");
+
+            // TODO: load TA ELF binary according to an OP-TEE message command
+            // we do have ELF loading here due to crate dependency
+            let loaded_program = litebox_shim_optee::loader::load_elf_buffer(TA_BINARY).unwrap();
+            register_session_id_elf_load_info(session_id, loaded_program);
+            platform
+                .save_user_context(
+                    VirtAddr::new(u64::try_from(loaded_program.entry_point).unwrap()),
+                    VirtAddr::new(u64::try_from(loaded_program.stack_base).unwrap()),
+                    x86_64::registers::rflags::RFlags::INTERRUPT_FLAG,
+                )
+                .expect("Failed to save user context");
+        } else {
+            panic!("Failed to create userspace");
+        }
+        true
+    });
+
     // TODO: create a VSM function and do the below within that function
     let session_id = 1;
     let params = [
