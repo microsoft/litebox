@@ -23,8 +23,8 @@ use litebox_platform_lvbs::user_context::UserSpaceManagement;
 
 use litebox_common_optee::UteeEntryFunc;
 use litebox_shim_optee::{
-    UteeParamsTyped, handle_syscall_request, optee_command_dispatcher,
-    register_session_id_elf_load_info, submit_optee_command,
+    UteeParamsTyped, optee_command_dispatcher, register_session_id_elf_load_info,
+    submit_optee_command,
 };
 use x86_64::VirtAddr;
 
@@ -106,13 +106,16 @@ pub fn init() -> Option<&'static Platform> {
     ret
 }
 
+/// # Panics
+///
+/// Panics if `session_id` is invalid
 pub fn run(platform: Option<&'static Platform>) -> ! {
     if get_core_id() == 0 {
         if let Some(platform) = platform {
             litebox_platform_multiplex::set_platform(platform);
             litebox_platform_lvbs::set_platform_low(platform);
             if let Ok(session_id) = platform.create_userspace() {
-                let session_id: u32 = session_id.try_into().unwrap();
+                let session_id: u32 = u32::try_from(session_id).expect("invalid session_id");
 
                 let loaded_program =
                     litebox_shim_optee::loader::load_elf_buffer(TA_BINARY).unwrap();

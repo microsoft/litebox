@@ -92,6 +92,12 @@ impl UserContextMap {
     }
 }
 
+impl Default for UserContextMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
     fn create_userspace(&self) -> Result<usize, Errno> {
         let mut inner = self.user_contexts.inner.lock();
@@ -211,7 +217,7 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
         user_stack_ptr: VirtAddr,
         rflags: RFlags,
     ) -> Result<(), Errno> {
-        let (cr3, _) = Cr3::read_raw();
+        let (_cr3, _) = Cr3::read_raw();
         let mut inner = self.user_contexts.inner.lock();
         // TODO: to avoid the below linear search, we can maintain CR3 to `userspace_id` mapping.
         // for (id, user_ctx) in inner.iter_mut() {
