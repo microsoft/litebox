@@ -1128,7 +1128,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         let mut remain_size = range.len();
         let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
 
-        // Decommit the region at mbi boundary
+        // Update the region permissions at mbi boundary
         while perm_update_base < range.end {
             do_query_on_region(&mut mbi, perm_update_base as *mut c_void);
             assert!(mbi.BaseAddress as usize == perm_update_base);
