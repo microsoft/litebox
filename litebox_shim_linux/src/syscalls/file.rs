@@ -684,6 +684,7 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
         }
         FcntlArg::DUPFD_CLOEXEC(minfd) => {
             let new_file = do_dup(desc, OFlags::CLOEXEC);
+            
             // dup and choose a fd since `minfd`
             Ok(file_descriptors().write().insert_since(new_file, minfd))
         }
