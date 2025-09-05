@@ -169,8 +169,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     /// necessary.
     ///
     /// Note: this focuses only on files.
+    ///
+    /// If `copy_data` is `true`, it copies over the lower data to the upper one, otherwise, it
+    /// makes the upper file empty (similar to a truncate). Generally speaking, you want to use
+    /// `true` for `copy_data`.
     #[allow(clippy::too_many_lines)]
-    fn migrate_file_up(&self, path: &str) -> Result<(), MigrationError> {
+    fn migrate_file_up(&self, path: &str, copy_data: bool) -> Result<(), MigrationError> {
         match self.layering_semantics {
             LayeringSemantics::LowerLayerReadOnly => {
                 // fallthrough
@@ -231,7 +235,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         );
                     }
                     let upper_fd = upper_fd.as_ref().unwrap();
-                    if size > 0 {
+                    if size > 0 && copy_data {
                         self.upper.write(upper_fd, &temp_buf[..size], None).expect(
                             "writing to upper layer must succeed, or layered file migration is in serious trouble",
                         );
@@ -773,7 +777,7 @@ impl<
         }
         // Change it to an upper-level file, also altering the file descriptor.
         drop(entry);
-        match self.migrate_file_up(&path) {
+        match self.migrate_file_up(&path, true) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => return Err(WriteError::NotAFile),
@@ -835,23 +839,14 @@ impl<
                                 Err(TruncateError::NotAFile) => Err(TruncateError::NotAFile),
                                 Err(TruncateError::NotForWriting) => {
                                     // We must actually migrate this file up, and keep it truncated.
-                                    //
-                                    // TODO(jayb): Optimization opportunity; do not copy the data
-                                    // over before immediately truncating it after that. To do this
-                                    // nicely, we need to refactor `migrate_file_up`, but for now,
-                                    // we do need a chunk of its behavior around arc entry
-                                    // refcounting and such, and we do not want to duplicate that
-                                    // here, so we take a mild perf hit of essentially copying
-                                    // before instantly erasing.
                                     self.litebox.descriptor_table().with_entry(
                                         layered_fd,
                                         |descriptor| {
-                                            self.migrate_file_up(&descriptor.entry.path)
+                                            self.migrate_file_up(&descriptor.entry.path, false)
                                                 .expect("this migration should always succeed");
                                         },
                                     );
-                                    // Now the recursion should just see an upper-layer file.
-                                    self.truncate(layered_fd)
+                                    Ok(())
                                 }
                             }
                         } else {
@@ -888,7 +883,7 @@ impl<
             },
         }
         self.ensure_lower_contains(&path)?;
-        match self.migrate_file_up(&path) {
+        match self.migrate_file_up(&path, true) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => unimplemented!(),
@@ -926,7 +921,7 @@ impl<
             },
         }
         self.ensure_lower_contains(&path)?;
-        match self.migrate_file_up(&path) {
+        match self.migrate_file_up(&path, true) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => unimplemented!(),
