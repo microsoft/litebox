@@ -782,7 +782,7 @@ fn do_prefetch_on_range(start: usize, size: usize) {
     };
     assert!(ok, "{}", {
         let last_error = unsafe { GetLastError() };
-        format_args!(
+        format!(
             "PrefetchVirtualMemory failed with error: {}. Str: {}",
             last_error,
             werr_text(last_error)
@@ -800,7 +800,7 @@ fn do_query_on_region(mbi: &mut Win32_Memory::MEMORY_BASIC_INFORMATION, base_add
     };
     assert!(ok, "{}", {
         let last_error = unsafe { GetLastError() };
-        format_args!(
+        format!(
             "VirtualQuery addr={:p} failed. error: {}. Str: {}",
             base_addr,
             last_error,
@@ -899,7 +899,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                             );
                             assert!(!ptr.is_null(), "{}", {
                                 let last_error = GetLastError();
-                                format_args!(
+                                format!(
                                     "VirtualAlloc2(COMMIT) failed. Range (0x{:x} - 0x{:x}). Error: {}. Str: {}",
                                     base_addr as usize,
                                     (base_addr as usize + size_within_region),
@@ -1001,7 +1001,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         };
         assert!(!addr.is_null(), "{}", {
             let last_error = unsafe { GetLastError() };
-            format_args!(
+            format!(
                 "VirtualAlloc2 failed. Range: (0x{:x} - 0x{:x}), Permissions: {:?}. Error: {} str: {}.",
                 aligned_base_addr as usize,
                 (aligned_base_addr as usize + available_size),
@@ -1076,7 +1076,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 };
                 assert!(ok, "{}", {
                     let last_error = unsafe { GetLastError() };
-                    format_args!(
+                    format!(
                         "VirtualFree(MEM_DECOMMIT) on range ({:p} - {:p}) failed: {}. str: {}",
                         decommit_base as *mut c_void,
                         (decommit_base + free_size) as *mut c_void,
@@ -1134,7 +1134,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             };
             assert!(ok, "{}", {
                 let last_error = unsafe { GetLastError() };
-                format_args!(
+                format!(
                     "VirtualProtect on range ({:p} - {:p}) failed: {}. str: {}",
                     perm_update_base as *mut c_void,
                     (perm_update_base + perm_update_size) as *mut c_void,
