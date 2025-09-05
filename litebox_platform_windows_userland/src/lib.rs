@@ -917,29 +917,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                             }
                             ptr
                         }
-                        // In case the region is already committed, we just need to change its permissions.
+                        // Should not happen: the region is already committed.
                         Win32_Memory::MEM_COMMIT => {
-                            let mut old_protect: u32 = 0;
-                            assert!(
-                                Win32_Memory::VirtualProtect(
-                                    base_addr,
-                                    size_within_region,
-                                    prot_flags(initial_permissions),
-                                    &raw mut old_protect,
-                                ) != 0,
-                                "{}",
-                                {
-                                    let last_error = GetLastError();
-                                    format_args!(
-                                        "VirtualProtect failed. Range (0x{:x} - 0x{:x}). Error: {}. Str: {}",
-                                        base_addr as usize,
-                                        (base_addr as usize + size_within_region),
-                                        last_error,
-                                        werr_text(last_error)
-                                    )
-                                }
+                            panic!(
+                                "The memory range (0x{:x} - 0x{:x}) is already committed.",
+                                base_addr as usize,
+                                (base_addr as usize + size_within_region)
                             );
-                            base_addr
                         }
                         _ => {
                             panic!("Unexpected memory state: {:?}", mbi.State);
@@ -1082,28 +1066,25 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             let free_size = core::cmp::min(remain_size, size);
             remain_size -= free_size;
 
-            // According to Win32 API:
-            // The function does not fail if you attempt to decommit an uncommitted page. 
-            // This means that you can decommit a range of pages without first determining 
-            // the current commitment state.
-            let ok = unsafe {
-                VirtualFree(
-                    decommit_base as *mut c_void,
-                    free_size,
-                    Win32_Memory::MEM_DECOMMIT,
-                ) != 0
-            };
-            assert!(ok, "{}", {
-                let last_error = unsafe { GetLastError() };
-                format_args!(
-                    "VirtualFree(MEM_DECOMMIT) on range ({:p} - {:p}) failed: {}. str: {}",
-                    decommit_base as *mut c_void,
-                    (decommit_base + free_size) as *mut c_void,
-                    last_error,
-                    werr_text(last_error)
-                )
-            });
-
+            if mbi.State == Win32_Memory::MEM_COMMIT {
+                let ok = unsafe {
+                    VirtualFree(
+                        decommit_base as *mut c_void,
+                        free_size,
+                        Win32_Memory::MEM_DECOMMIT,
+                    ) != 0
+                };
+                assert!(ok, "{}", {
+                    let last_error = unsafe { GetLastError() };
+                    format_args!(
+                        "VirtualFree(MEM_DECOMMIT) on range ({:p} - {:p}) failed: {}. str: {}",
+                        decommit_base as *mut c_void,
+                        (decommit_base + free_size) as *mut c_void,
+                        last_error,
+                        werr_text(last_error)
+                    )
+                });
+            }
             decommit_base = next;
         }
         Ok(())
