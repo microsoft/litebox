@@ -642,7 +642,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         unsafe { self.page_table.unmap_pages(range, true) }
     }
 
-    unsafe fn move_and_expand_pages(
+    unsafe fn remap_pages(
         &self,
         old_range: core::ops::Range<usize>,
         new_range: core::ops::Range<usize>,

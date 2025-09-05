@@ -69,7 +69,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// The caller must ensure that these pages are not in active use.
     unsafe fn deallocate_pages(&self, range: Range<usize>) -> Result<(), DeallocationError>;
 
-    /// Move and expand pages from `old_range` to `new_range`.
+    /// Remap pages from `old_range` to `new_range`.
     ///
     /// ## Returns
     ///
@@ -79,9 +79,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// The caller must ensure that it is safe to move the `old_range` (i.e., these pages are not in
     /// active use).
-    /// The caller must ensure that the new_range is larger than the old_range, and two ranges do not
-    /// overlap.
-    unsafe fn move_and_expand_pages(
+    unsafe fn remap_pages(
         &self,
         old_range: Range<usize>,
         new_range: Range<usize>,
@@ -127,7 +125,7 @@ pub enum DeallocationError {
     AlreadyUnallocated,
 }
 
-/// Possible errors for [`PageManagementProvider::move_and_expand_pages`]
+/// Possible errors for [`PageManagementProvider::remap_pages`]
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum RemapError {

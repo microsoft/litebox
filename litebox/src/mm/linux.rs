@@ -600,7 +600,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
         let new_addr = unsafe {
             self.platform
-                .move_and_expand_pages(old_range.into(), new_range.into())
+                .remap_pages(old_range.into(), new_range.into())
         }
         .map_err(VmemMoveError::RemapError)?;
 

@@ -1109,7 +1109,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         Ok(())
     }
 
-    unsafe fn move_and_expand_pages(
+    unsafe fn remap_pages(
         &self,
         old_range: core::ops::Range<usize>,
         new_range: core::ops::Range<usize>,

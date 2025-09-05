@@ -996,13 +996,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         Ok(())
     }
 
-    unsafe fn move_and_expand_pages(
+    unsafe fn remap_pages(
         &self,
         old_range: core::ops::Range<usize>,
         new_range: core::ops::Range<usize>,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
         unimplemented!(
-            "move_and_expand_pages is not implemented for Windows yet. old_range: {:?}, new_range: {:?}",
+            "remap_pages is not implemented for Windows yet. old_range: {:?}, new_range: {:?}",
             old_range,
             new_range
         );
