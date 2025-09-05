@@ -443,6 +443,7 @@ impl<
             | OFlags::WRONLY
             | OFlags::RDWR
             | OFlags::EXCL
+            | OFlags::TRUNC
             | OFlags::NOCTTY
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK;
@@ -459,7 +460,9 @@ impl<
             } else {
                 // We must first attempt to open the file _without_ creating it, and only if that fails,
                 // do we fall-through and end up creating it (which will happen on the upper layer).
-                if let Ok(fd) = self.open(path.as_str(), flags - OFlags::CREAT, mode) {
+                if let Ok(fd) =
+                    self.open(path.as_str(), flags - OFlags::CREAT - OFlags::TRUNC, mode)
+                {
                     return Ok(fd);
                 }
             }
@@ -553,8 +556,9 @@ impl<
         // We must check the lower level, creating an entry if needed
         let original_flags = flags;
         let mut flags = flags;
-        // Prevent creation of files at lower level
+        // Prevent creation or truncation of files at lower level
         flags.remove(OFlags::CREAT);
+        flags.remove(OFlags::TRUNC);
         match self.layering_semantics {
             LayeringSemantics::LowerLayerReadOnly => {
                 // Switch the lower level to read-only; the other calls will take care of
@@ -567,6 +571,7 @@ impl<
                 // Do nothing more to the flags, because we might be writing things to lower level.
                 // We just make sure that there is no creation happening, that's all :)
                 assert!(!flags.contains(OFlags::CREAT));
+                assert!(!flags.contains(OFlags::TRUNC));
             }
         }
         // Any errors from lower level now _must_ propagate up, so we can just invoke
@@ -580,12 +585,30 @@ impl<
             .entries
             .insert(path.clone(), Arc::clone(&entry));
         assert!(old.is_none());
-        Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+        let fd = self.litebox.descriptor_table_mut().insert(Descriptor {
             path,
             flags: original_flags,
             entry,
             position: 0.into(),
-        }))
+        });
+        if original_flags.contains(OFlags::TRUNC) {
+            // The only scenario where we need to manually trigger truncation is when a file does
+            // not exist at the upper level but exists at the lower level; in that case, our
+            // `truncate` functionality (at the layered FS itself) should correctly migrate things
+            // over and handle them.
+            match self.truncate(&fd) {
+                Ok(()) => {}
+                Err(TruncateError::NotAFile | TruncateError::NotForWriting) => {
+                    // TODO: Attempting to truncate a file not open for writing (or is not a file)
+                    // is a weird scenario. Linux defines it to be unspecified behavior, but we may
+                    // wish to push the behavior a step above by a custom OpenError for each of
+                    // these instead? We can postpone this decision until we actually see this in
+                    // action though.
+                    unimplemented!()
+                }
+            }
+        }
+        Ok(fd)
     }
 
     fn close(&self, fd: FileFd<Platform, Upper, Lower>) -> Result<(), CloseError> {

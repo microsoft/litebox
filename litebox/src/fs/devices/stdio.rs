@@ -94,8 +94,13 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         mode: Mode,
     ) -> Result<FileFd<Platform>, OpenError> {
         let open_directory = flags.contains(OFlags::DIRECTORY);
+        let flags = flags - OFlags::DIRECTORY;
         let nonblocking = flags.contains(OFlags::NONBLOCK);
-        let flags = flags - OFlags::DIRECTORY - OFlags::NONBLOCK - OFlags::NOCTTY; // ignore NOCTTY
+        let flags = flags - OFlags::NONBLOCK;
+        // ignore NOCTTY
+        let flags = flags - OFlags::NOCTTY;
+        let truncate = flags.contains(OFlags::TRUNC);
+        let flags = flags - OFlags::TRUNC;
         let path = self.absolute_path(path)?;
         let stream = match path.as_str() {
             "/dev/stdin" => {
@@ -127,7 +132,14 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         if nonblocking {
             unimplemented!("Non-blocking I/O is not supported for stdio streams");
         }
-        Ok(self.litebox.descriptor_table_mut().insert(stream))
+        let fd = self.litebox.descriptor_table_mut().insert(stream);
+        if truncate {
+            match self.truncate(&fd) {
+                Ok(()) => {}
+                Err(_) => unimplemented!(),
+            }
+        }
+        Ok(fd)
     }
 
     fn close(&self, fd: FileFd<Platform>) -> Result<(), CloseError> {

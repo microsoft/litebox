@@ -143,6 +143,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::RDONLY
             | OFlags::WRONLY
             | OFlags::RDWR
+            | OFlags::TRUNC
             | OFlags::NOCTTY
             | OFlags::EXCL
             | OFlags::DIRECTORY
@@ -216,13 +217,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         } else {
             false
         };
-        match entry {
+        let fd = match entry {
             Entry::File(file) => {
                 if flags.contains(OFlags::DIRECTORY) {
                     return Err(OpenError::PathError(PathError::ComponentNotADirectory));
                 }
-                Ok(self
-                    .litebox
+                self.litebox
                     .descriptor_table_mut()
                     .insert(Descriptor::File {
                         file: file.clone(),
@@ -230,13 +230,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                         write_allowed,
                         position: 0,
                         metadata: AnyMap::new(),
-                    }))
+                    })
             }
-            Entry::Dir(dir) => Ok(self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
+            Entry::Dir(dir) => self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
                 dir: dir.clone(),
                 metadata: AnyMap::new(),
-            })),
+            }),
+        };
+        if flags.contains(OFlags::TRUNC) {
+            match self.truncate(&fd) {
+                Ok(()) => {}
+                Err(_) => unimplemented!(),
+            }
         }
+        Ok(fd)
     }
 
     fn close(&self, fd: FileFd<Platform>) -> Result<(), CloseError> {

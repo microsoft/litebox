@@ -152,6 +152,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::RDWR
             | OFlags::CREAT
             | OFlags::EXCL
+            | OFlags::TRUNC
             | OFlags::NOCTTY
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK;
@@ -188,26 +189,32 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             return Err(OpenError::ReadOnlyFileSystem);
         }
         assert!(flags.contains(OFlags::RDONLY));
-        if entry.filename().as_str().unwrap() == path {
+        let fd = if entry.filename().as_str().unwrap() == path {
             // it is a file
             if flags.contains(OFlags::DIRECTORY) {
                 return Err(OpenError::PathError(PathError::ComponentNotADirectory));
             }
-            Ok(self
-                .litebox
+            self.litebox
                 .descriptor_table_mut()
                 .insert(Descriptor::File {
                     idx,
                     position: 0,
                     metadata: AnyMap::new(),
-                }))
+                })
         } else {
             // it is a dir
-            Ok(self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
+            self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
                 path: path.to_owned(),
                 metadata: AnyMap::new(),
-            }))
+            })
+        };
+        if flags.contains(OFlags::TRUNC) {
+            match self.truncate(&fd) {
+                Ok(()) => {}
+                Err(_) => unimplemented!(),
+            }
         }
+        Ok(fd)
     }
 
     fn close(&self, fd: FileFd<Platform>) -> Result<(), CloseError> {
