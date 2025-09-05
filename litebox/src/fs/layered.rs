@@ -461,9 +461,7 @@ impl<
             } else {
                 // We must first attempt to open the file _without_ creating it, and only if that fails,
                 // do we fall-through and end up creating it (which will happen on the upper layer).
-                if let Ok(fd) =
-                    self.open(path.as_str(), flags - OFlags::CREAT - OFlags::TRUNC, mode)
-                {
+                if let Ok(fd) = self.open(path.as_str(), flags - OFlags::CREAT, mode) {
                     return Ok(fd);
                 }
             }
@@ -856,13 +854,19 @@ impl<
                                 Err(TruncateError::NotAFile) => Err(TruncateError::NotAFile),
                                 Err(TruncateError::NotForWriting) => {
                                     // We must actually migrate this file up, and keep it truncated.
-                                    self.litebox.descriptor_table().with_entry(
-                                        layered_fd,
-                                        |descriptor| {
-                                            self.migrate_file_up(&descriptor.entry.path, false)
-                                                .expect("this migration should always succeed");
-                                        },
-                                    );
+                                    //
+                                    // We must first drop the cloned entry to make sure that the ref
+                                    // counting works out correctly during migration.
+                                    drop(entry);
+                                    let path = self
+                                        .litebox
+                                        .descriptor_table()
+                                        .with_entry(layered_fd, |descriptor| {
+                                            descriptor.entry.path.clone()
+                                        });
+                                    self.migrate_file_up(&path, false)
+                                        .expect("this migration should always succeed");
+
                                     Ok(())
                                 }
                             }
