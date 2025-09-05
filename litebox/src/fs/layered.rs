@@ -1318,6 +1318,18 @@ enum EntryX<Upper: super::FileSystem + 'static, Lower: super::FileSystem + 'stat
     Tombstone,
 }
 
+impl<Upper: super::FileSystem + 'static, Lower: super::FileSystem + 'static> core::fmt::Debug
+    for EntryX<Upper, Lower>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Upper { fd: _ } => f.debug_struct("Upper").finish_non_exhaustive(),
+            Self::Lower { fd: _ } => f.debug_struct("Lower").finish_non_exhaustive(),
+            Self::Tombstone => write!(f, "Tombstone"),
+        }
+    }
+}
+
 crate::fd::enable_fds_for_subsystem! {
     @Platform: { sync::RawSyncPrimitivesProvider }, Upper: { super::FileSystem + 'static }, Lower: { super::FileSystem + 'static };
     FileSystem<Platform, Upper, Lower>;
