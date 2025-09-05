@@ -25,7 +25,7 @@ mod freebsd_types;
 extern crate alloc;
 
 /// Connector to a shim-exposed syscall-handling interface.
-pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<FreeBSDUserland>) -> isize;
+pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<FreeBSDUserland>) -> usize;
 
 /// The syscall handler passed down from the shim.
 static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
@@ -301,8 +301,6 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
         // Reset the child stack pointer to the top of the allocated thread stack.
         copied_pt_regs.rsp = stack.as_usize() + stack_size - 0x8;
 
-        let thread_args = thread_args;
-
         let thread_start_args = ThreadStartArgs {
             pt_regs: copied_pt_regs,
             thread_args: thread_args,
@@ -355,7 +353,7 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
                 crate::errno::Errno::ENOMEM => litebox_common_linux::errno::Errno::ENOMEM,
                 crate::errno::Errno::ENOSPC => litebox_common_linux::errno::Errno::ENOSPC,
                 crate::errno::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
-                _ => panic!("Unexpected error from thr_new: {}", errno),
+                _ => panic!("Unexpected error from thr_new: {errno}"),
             }),
         }
     }
@@ -1018,7 +1016,7 @@ unsafe extern "C" {
 unsafe extern "C" fn syscall_handler(
     syscall_number: usize,
     ctx: *mut litebox_common_linux::PtRegs,
-) -> isize {
+) -> usize {
     // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
     let ctx = unsafe { &mut *ctx };
     match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
@@ -1029,7 +1027,7 @@ unsafe extern "C" fn syscall_handler(
                 .expect("Should have run `register_syscall_handler` by now");
             syscall_handler(d)
         }
-        Err(err) => err.as_neg() as isize,
+        Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
     }
 }
 
