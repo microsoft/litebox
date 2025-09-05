@@ -199,7 +199,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 OpenError::AccessNotAllowed => return Err(MigrationError::NoReadPerms),
                 OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
-                | OpenError::AlreadyExists => unreachable!(),
+                | OpenError::AlreadyExists
+                | OpenError::TruncateError(_) => unreachable!(),
                 OpenError::PathError(path_error) => return Err(path_error)?,
             },
         };
@@ -525,6 +526,9 @@ impl<
                 | OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
+                | OpenError::TruncateError(
+                    TruncateError::NotAFile | TruncateError::NotForWriting,
+                )
                 | OpenError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
@@ -596,17 +600,7 @@ impl<
             // not exist at the upper level but exists at the lower level; in that case, our
             // `truncate` functionality (at the layered FS itself) should correctly migrate things
             // over and handle them.
-            match self.truncate(&fd) {
-                Ok(()) => {}
-                Err(TruncateError::NotAFile | TruncateError::NotForWriting) => {
-                    // TODO: Attempting to truncate a file not open for writing (or is not a file)
-                    // is a weird scenario. Linux defines it to be unspecified behavior, but we may
-                    // wish to push the behavior a step above by a custom OpenError for each of
-                    // these instead? We can postpone this decision until we actually see this in
-                    // action though.
-                    unimplemented!()
-                }
-            }
+            self.truncate(&fd)?;
         }
         Ok(fd)
     }

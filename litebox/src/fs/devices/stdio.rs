@@ -134,10 +134,7 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         }
         let fd = self.litebox.descriptor_table_mut().insert(stream);
         if truncate {
-            match self.truncate(&fd) {
-                Ok(()) => {}
-                Err(_) => unimplemented!(),
-            }
+            self.truncate(&fd)?;
         }
         Ok(fd)
     }

@@ -20,6 +20,8 @@ pub enum OpenError {
     ReadOnlyFileSystem,
     #[error("file already exists")]
     AlreadyExists,
+    #[error("error when truncating: {0}")]
+    TruncateError(#[from] TruncateError),
     #[error(transparent)]
     PathError(#[from] PathError),
 }
