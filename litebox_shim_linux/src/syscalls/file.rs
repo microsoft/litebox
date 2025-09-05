@@ -77,7 +77,7 @@ pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, 
         _ => None,
     };
     litebox_fs()
-        .open(path, flags - OFlags::CLOEXEC - OFlags::TRUNC, mode)
+        .open(path, flags - OFlags::CLOEXEC, mode)
         .map(|file| {
             let file = if let Some(typ) = stdio_typ {
                 Descriptor::Stdio(crate::stdio::StdioFile::new(typ, file, flags))
@@ -88,18 +88,6 @@ pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, 
                         .is_err()
                 {
                     unreachable!()
-                }
-                if flags.contains(OFlags::TRUNC) && flags.intersects(OFlags::RDWR | OFlags::WRONLY)
-                {
-                    match litebox_fs().truncate(&file) {
-                        Ok(()) | Err(litebox::fs::errors::TruncateError::NotAFile) => {
-                            // Either truncation succeeds (it was a file) or it fails due to it
-                            // being a directory or otherwise. `man 2 open` explicitly lists the
-                            // second case as having unspecified behavior, in which case, it is
-                            // correct to just ignore the truncation.
-                        }
-                        Err(litebox::fs::errors::TruncateError::NotForWriting) => unreachable!(),
-                    }
                 }
                 Descriptor::File(file)
             };
