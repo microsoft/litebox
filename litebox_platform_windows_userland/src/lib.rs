@@ -912,13 +912,30 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                             }
                             ptr
                         }
-                        // Should not happen: the region is already committed.
+                        // In case the region is already committed, we just need to change its permissions.
+                        // This only happens due to we RESERVE | COMMIT an aligned size (larger than the required).
                         Win32_Memory::MEM_COMMIT => {
-                            panic!(
-                                "The memory range (0x{:x} - 0x{:x}) is already committed.",
-                                base_addr as usize,
-                                (base_addr as usize + size_within_region)
+                            let mut old_protect: u32 = 0;
+                            assert!(
+                                Win32_Memory::VirtualProtect(
+                                    base_addr,
+                                    size_within_region,
+                                    prot_flags(initial_permissions),
+                                    &raw mut old_protect,
+                                ) != 0,
+                                "{}",
+                                {
+                                    let last_error = GetLastError();
+                                    format!(
+                                        "VirtualProtect failed. Range (0x{:x} - 0x{:x}). Error: {}. Str: {}",
+                                        base_addr as usize,
+                                        (base_addr as usize + size_within_region),
+                                        last_error,
+                                        werr_text(last_error)
+                                    )
+                                }
                             );
+                            base_addr
                         }
                         _ => {
                             panic!("Unexpected memory state: {:?}", mbi.State);
