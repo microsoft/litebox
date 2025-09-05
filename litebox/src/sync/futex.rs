@@ -266,53 +266,34 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // We can only wake up the number of sleepers that actually exist. The number of sleepers
         // does not change while we are calculating these things because we are holding on to this
         // lock, thus no more waiters can actually enter sleep while we finish this up.
-        let old_num_waiters = lockable.num_waiters;
-        let num_to_wake_up = num_to_wake_up.get();
-        // Now we can actually trigger things to start waking up.
-        let num_to_wake_up = if old_num_waiters >= num_to_wake_up {
-            let num_claimed_woken_up = lockable.raw_mutex.wake_many(
-                #[expect(
-                    clippy::missing_panics_doc,
-                    reason = "this conversion should never fail"
-                )]
-                {
-                    num_to_wake_up.try_into().unwrap()
-                },
-            );
-            // Note that `num_claimed_woken_up` may be less than what we requested even if there are enough waiters present.
-            // This is because some waiter might immediately wake up due to a value mismatch so the kernel doesn't count it.
-            debug_assert!(num_claimed_woken_up <= num_to_wake_up as usize);
-            num_to_wake_up
-        } else {
-            // Wake up all
-            let num_claimed_woken_up = lockable.raw_mutex.wake_all();
-            // The number of woken threads cannot exceed the number of waiters that were present before waking up.
-            debug_assert!(num_claimed_woken_up <= old_num_waiters as usize);
-            old_num_waiters
-        };
-
+        let num_to_wake_up: u32 = lockable.num_waiters.min(num_to_wake_up.get());
+        // Now we can actually trigger things to start waking up. We don't actually trust the
+        // underlying primitive to tell us accurately how many woke up, although we do a quick
+        // sanity check that it claims that at least one woke up.
+        let num_claimed_woken_up: usize = lockable.raw_mutex.wake_many(
+            #[expect(
+                clippy::missing_panics_doc,
+                reason = "this conversion should never fail"
+            )]
+            {
+                num_to_wake_up.try_into().unwrap()
+            },
+        );
+        debug_assert!(num_claimed_woken_up > 0);
         // Releasing the lock allows those woken threads to proceed with their wake-up sequence.
         drop(lockables);
-        // Now, we spin until all `num_to_wake_up` waiters have woken up and finished letting us know
-        // it has woken up. If the `lockable` for it has been GC'd out, that means all wakers got woken up,
-        // which is fine too to quit out.
-        //
-        // While our documentation of this function says "at most", we attempt to wake up "as many as", since
-        // this is closer to what some applications seem to expect; this is similar to how Linux also says
-        // "at most" but then attempts "as many as".
+        // Now, we spin until at least one of the waiters has woken up and finished letting us know
+        // it has woken up. We know there must have been at least one before, so as long as the
+        // value does not drop, we know that nothing has been woken up yet. If the `lockable` for it
+        // has been GC'd out, that means all wakers got woken up, which is fine too to quit out.
         //
         // XXX(jayb): This check may not be ideal if there are no waiters that have any overlap in
         // terms of bitset masks, in which case this might spin forever until at least someone with
         // that mask goes to sleep.
         loop {
             let lockables = self.lockables.read();
-            // A waiter that starts after `wake` has begun may increment `lockable.num_waiters`.
-            // Such a late-arriving waiter will detect that a wake is already in progress and
-            // therefore will not actually block (it will be immediately woken). Because it never
-            // sleeps, it will proceed to decrement `lockable.num_waiters`. The following check
-            // only needs to account for waiters that were already present before `wake` began.
             if let Some(lockable) = lockables.get(&addr)
-                && lockable.num_waiters + num_to_wake_up > old_num_waiters
+                && lockable.num_waiters >= num_to_wake_up
             {
                 drop(lockables);
                 core::hint::spin_loop();
@@ -323,14 +304,18 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // We can now reset the mask out, and return the number that actually woke up.
         if let Some(lockable) = self.lockables.write().get_mut(&addr) {
             lockable.latest_wake_bitset = None;
+            debug_assert!(num_to_wake_up > lockable.num_waiters);
             // Allow waiters to start waiting again
             let old_underlying_atomic = lockable
                 .raw_mutex
                 .underlying_atomic()
                 .fetch_sub(1, Ordering::SeqCst);
             debug_assert_eq!(old_underlying_atomic, 1);
+            Ok(num_to_wake_up - lockable.num_waiters)
+        } else {
+            // The addr has been GC'd from the addressables. All waiters have been woken up.
+            Ok(num_to_wake_up)
         }
-        Ok(num_to_wake_up)
     }
 }
 
