@@ -185,7 +185,6 @@ fn test_static_linked_prog_with_rewriter() {
     common::test_load_exec_common(&executable_path);
 }
 
-// #[test]
 #[expect(clippy::too_many_lines)]
 fn run_dynamic_linked_prog_with_rewriter(
     libs_to_rewrite: &[(&str, &str)],

@@ -74,15 +74,16 @@ fn register_seccomp_filter() {
     };
 
     fn backdoor_on_arg(arg_number: u8) -> SeccompRule {
-        SeccompRule::new(vec![
-            SeccompCondition::new(
-                arg_number,
-                SeccompCmpArgLen::Qword,
-                SeccompCmpOp::Eq,
-                super::SYSCALL_ARG_MAGIC as u64,
-            )
-            .unwrap(),
-        ])
+        SeccompRule::new(vec![backdoor_cond_on_arg(arg_number)]).unwrap()
+    }
+
+    fn backdoor_cond_on_arg(arg_number: u8) -> SeccompCondition {
+        SeccompCondition::new(
+            arg_number,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::Eq,
+            super::SYSCALL_ARG_MAGIC as u64,
+        )
         .unwrap()
     }
 
@@ -152,7 +153,33 @@ fn register_seccomp_filter() {
         (libc::SYS_mremap, vec![backdoor_on_arg(5)]),
         (libc::SYS_sigaltstack, vec![]),
         (libc::SYS_arch_prctl, vec![backdoor_on_arg(2)]),
-        (libc::SYS_futex, vec![]),
+        (
+            libc::SYS_futex,
+            vec![
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        1,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::MaskedEq(0x7f),
+                        libc::FUTEX_WAIT as u64,
+                    )
+                    .unwrap(),
+                    backdoor_cond_on_arg(5),
+                ])
+                .unwrap(),
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        1,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::MaskedEq(0x7f),
+                        libc::FUTEX_WAKE as u64,
+                    )
+                    .unwrap(),
+                    backdoor_cond_on_arg(5),
+                ])
+                .unwrap(),
+            ],
+        ),
         (libc::SYS_exit, vec![backdoor_on_arg(1)]),
         (libc::SYS_exit_group, vec![backdoor_on_arg(1)]),
         (libc::SYS_tgkill, vec![]),
