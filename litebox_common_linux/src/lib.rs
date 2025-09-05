@@ -1829,6 +1829,12 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     Futex {
         args: FutexArgs<Platform>,
     },
+    Execve {
+        pathname: Platform::RawConstPointer<i8>,
+        argv: Platform::RawConstPointer<Platform::RawConstPointer<i8>>,
+        envp: Platform::RawConstPointer<Platform::RawConstPointer<i8>>,
+        ctx: &'a mut PtRegs,
+    },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
 }
@@ -1844,7 +1850,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
     /// is allowed to panic upon receiving a syscall number (or arguments) that it does not know how
     /// to handle.
     #[expect(clippy::too_many_lines)]
-    pub fn try_from_raw(syscall_number: usize, ctx: &'a PtRegs) -> Result<Self, errno::Errno> {
+    pub fn try_from_raw(syscall_number: usize, ctx: &'a mut PtRegs) -> Result<Self, errno::Errno> {
         // sys_req! is a convenience macro that automatically takes the correct numbered arguments
         // (in the order of field specification); due to some Rust restrictions, we need to manually
         // specify pointers by adding the `:*` to that field, but otherwise everything else about
@@ -2241,6 +2247,18 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     },
                 };
                 SyscallRequest::Futex { args }
+            }
+            Sysno::execve => {
+                // execve(pathname, argv, envp)
+                let pathname = ctx.sys_req_ptr(0);
+                let argv = ctx.sys_req_ptr(1);
+                let envp = ctx.sys_req_ptr(2);
+                SyscallRequest::Execve {
+                    pathname,
+                    argv,
+                    envp,
+                    ctx,
+                }
             }
             // TODO: support syscall `statfs`
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {

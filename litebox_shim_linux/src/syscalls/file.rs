@@ -226,7 +226,7 @@ pub fn sys_lseek(fd: i32, offset: isize, whence: i32) -> Result<usize, Errno> {
     }
 }
 
-fn do_close(desc: Descriptor) -> Result<(), Errno> {
+pub(crate) fn do_close(desc: Descriptor) -> Result<(), Errno> {
     match desc {
         Descriptor::File(file) => litebox_fs().close(file).map_err(Errno::from),
         Descriptor::Stdio(crate::stdio::StdioFile { inner, .. }) => {
@@ -505,6 +505,26 @@ impl Descriptor {
         };
         Ok(fstat)
     }
+
+    pub(crate) fn get_file_descriptor_flags(&self) -> FileDescriptorFlags {
+        match self {
+            Descriptor::File(file) => litebox_fs()
+                .with_metadata(file, |flags: &FileDescriptorFlags| *flags)
+                .unwrap_or(FileDescriptorFlags::empty()),
+            Descriptor::Socket(socket) => todo!(),
+            Descriptor::PipeReader { close_on_exec, .. }
+            | Descriptor::PipeWriter { close_on_exec, .. }
+            | Descriptor::Eventfd { close_on_exec, .. }
+            | Descriptor::Epoll { close_on_exec, .. }
+            | Descriptor::Stdio(crate::stdio::StdioFile { close_on_exec, .. }) => {
+                if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
+                    FileDescriptorFlags::FD_CLOEXEC
+                } else {
+                    FileDescriptorFlags::empty()
+                }
+            }
+        }
+    }
 }
 
 fn do_stat(pathname: impl path::Arg, follow_symlink: bool) -> Result<FileStat, Errno> {
@@ -586,27 +606,12 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
     let locked_file_descriptors = file_descriptors().read();
     let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
     match arg {
-        FcntlArg::GETFD => {
-            let flags: FileDescriptorFlags =
-                match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
-                    Descriptor::File(file) => litebox_fs()
-                        .with_metadata(file, |flags: &FileDescriptorFlags| *flags)
-                        .unwrap_or(FileDescriptorFlags::empty()),
-                    Descriptor::Socket(socket) => todo!(),
-                    Descriptor::PipeReader { close_on_exec, .. }
-                    | Descriptor::PipeWriter { close_on_exec, .. }
-                    | Descriptor::Eventfd { close_on_exec, .. }
-                    | Descriptor::Epoll { close_on_exec, .. }
-                    | Descriptor::Stdio(crate::stdio::StdioFile { close_on_exec, .. }) => {
-                        if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
-                            FileDescriptorFlags::FD_CLOEXEC
-                        } else {
-                            FileDescriptorFlags::empty()
-                        }
-                    }
-                };
-            Ok(flags.bits())
-        }
+        FcntlArg::GETFD => Ok(file_descriptors()
+            .read()
+            .get_fd(fd)
+            .ok_or(Errno::EBADF)?
+            .get_file_descriptor_flags()
+            .bits()),
         FcntlArg::SETFD(flags) => {
             match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
                 Descriptor::File(file) => {

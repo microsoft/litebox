@@ -675,6 +675,102 @@ pub(crate) fn sys_futex(
     Ok(res)
 }
 
+// Handle syscall `execve`.
+//
+// Old address space not unmapped (memory leak across exec). Add a PageManager reset/unmap-all API later.
+// Signal handler reset semantics not implemented.
+// Shebang scripts and PT_INTERP search path edge cases limited (loader already handles interpreter path but not script parsing).
+// Credential changes via setuid bits not handled.
+// Robust list / futex death handling on exec currently skipped.
+pub(crate) fn sys_execve(
+    pathname: crate::ConstPtr<i8>,
+    argv: crate::ConstPtr<crate::ConstPtr<i8>>,
+    envp: crate::ConstPtr<crate::ConstPtr<i8>>,
+    ctx: &mut litebox_common_linux::PtRegs,
+) -> Result<(), Errno> {
+    // 1. Copy pathname
+    let Some(path_cstr) = pathname.to_cstring() else {
+        return Err(Errno::EFAULT);
+    };
+    let path = path_cstr.to_str().map_err(|_| Errno::ENOENT)?; // simplistic
+
+    // 2. Copy argv/envp arrays
+    const MAX_VEC: usize = 4096; // limit count
+    const MAX_TOTAL_BYTES: usize = 256 * 1024; // simplistic size cap
+    fn copy_vector(
+        mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
+        which: &str,
+    ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
+        let mut out = alloc::vec::Vec::new();
+        let mut total = 0usize;
+        for _ in 0..MAX_VEC {
+            let p: crate::ConstPtr<i8> = unsafe {
+                // read pointer-sized entries
+                match base.read_at_offset(0) {
+                    Some(ptr) => ptr.into_owned(),
+                    None => return Err(Errno::EFAULT),
+                }
+            };
+            if p.as_usize() == 0 {
+                break;
+            }
+            let Some(cs) = p.to_cstring() else {
+                return Err(Errno::EFAULT);
+            };
+            total += cs.as_bytes().len() + 1;
+            if total > MAX_TOTAL_BYTES {
+                return Err(Errno::E2BIG);
+            }
+            out.push(cs);
+            // advance to next pointer
+            base = crate::ConstPtr::from_usize(base.as_usize() + core::mem::size_of::<usize>());
+        }
+        Ok(out)
+    }
+
+    let argv_vec = if argv.as_usize() == 0 {
+        alloc::vec::Vec::new()
+    } else {
+        copy_vector(argv, "argv")?
+    };
+    let envp_vec = if envp.as_usize() == 0 {
+        alloc::vec::Vec::new()
+    } else {
+        copy_vector(envp, "envp")?
+    };
+
+    // 3. Close CLOEXEC descriptors
+    crate::file_descriptors().write().close_on_exec();
+
+    // 4. (TODO) Reset signal dispositions, clear robust list, etc.
+
+    // 5. Build auxv
+    let mut aux = crate::loader::auxv::init_auxv();
+
+    // 6. Load new image
+    let info = crate::loader::load_program(path, argv_vec, envp_vec, aux)
+        .map_err::<Errno, _>(Into::into)?;
+
+    // 7. Rewrite register state: new IP/SP, zero rax so caller never resumes old path
+    #[cfg(target_arch = "x86_64")]
+    {
+        ctx.rip = info.entry_point;
+        ctx.rsp = info.user_stack_top;
+        ctx.rdx = 0;
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        ctx.eip = info.entry_point;
+        ctx.esp = info.user_stack_top;
+        ctx.edx = 0;
+    }
+
+    // 8. (Optional) clear general-purpose regs for a cleaner start (GNU ld-linux doesn’t require)
+    // Leave others as-is for now.
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use core::mem::MaybeUninit;
