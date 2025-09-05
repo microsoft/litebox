@@ -767,7 +767,8 @@ mod tests {
         let tid = super::sys_gettid();
         litebox::log_println!(
             litebox_platform_multiplex::platform(),
-            "Child started {tid}"
+            "Child started {}",
+            tid
         );
 
         assert_eq!(

@@ -50,6 +50,9 @@ pub struct LinuxUserland {
     reserved_pages: Vec<core::ops::Range<usize>>,
     /// The base address of the VDSO.
     vdso_address: Option<usize>,
+    #[cfg(target_arch = "x86")]
+    /// The GDT entry number used for TLS by LiteBox
+    tls_entry_number: AtomicU32,
 }
 
 const IF_NAMESIZE: usize = 16;
@@ -165,6 +168,9 @@ impl LinuxUserland {
             seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages,
             vdso_address,
+            #[cfg(target_arch = "x86")]
+            // u32::MAX (i.e., -1) means not allocated yet
+            tls_entry_number: AtomicU32::new(u32::MAX),
         };
         platform.set_init_tls();
         Box::leak(Box::new(platform))
@@ -310,6 +316,8 @@ impl litebox::platform::ExitProvider for LinuxUserland {
                 seccomp_interception_enabled: _,
             reserved_pages: _,
             vdso_address: _,
+            #[cfg(target_arch = "x86")]
+                tls_entry_number: _,
         } = self;
         // We don't need to explicitly drop this, but doing so clarifies our intent that we want to
         // close it out :). The type itself is re-specified here to make sure we look at this
@@ -1490,7 +1498,9 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
         flags.set_seg_32bit(true);
         flags.set_useable(true);
         let mut user_desc = litebox_common_linux::UserDesc {
-            entry_number: u32::MAX,
+            entry_number: self
+                .tls_entry_number
+                .load(core::sync::atomic::Ordering::Relaxed),
             base_addr: Box::into_raw(tls) as u32,
             limit: u32::try_from(core::mem::size_of::<Self::ThreadLocalStorage>()).unwrap() - 1,
             flags,
@@ -1500,6 +1510,10 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
         };
         set_thread_area(user_desc_ptr).expect("Failed to set thread area for TLS");
 
+        self.tls_entry_number.store(
+            user_desc.entry_number & 0xfff,
+            core::sync::atomic::Ordering::Relaxed,
+        );
         let new_fs_selector = ((user_desc.entry_number & 0xfff) << 3) | 0x3; // user mode
         Self::set_fs_selector(new_fs_selector.truncate());
     }
