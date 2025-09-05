@@ -40,7 +40,6 @@ use core::{
 };
 use hashbrown::HashMap;
 use litebox_common_linux::errno::Errno;
-use litebox_common_optee::{TeeParamType, UteeEntryFunc, UteeParams};
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{PageSize, PhysFrame, Size4KiB, frame::PhysFrameRange},
@@ -674,42 +673,11 @@ pub fn mshv_vsm_copy_secondary_key(_pa: u64, _nranges: u64) -> Result<i64, Errno
     Ok(0)
 }
 
-pub fn optee_test(_pa: u64, _nranges: u64) -> Result<i64, Errno> {
-    let mut params = UteeParams::new();
-    crate::optee_call(1, UteeEntryFunc::OpenSession, 0, params);
-
-    params
-        .set_type(0, TeeParamType::ValueInout)
-        .map_err(|_| Errno::EINVAL)?;
-    params.set_values(0, 100, 0).map_err(|_| Errno::EINVAL)?;
-    crate::optee_call(1, UteeEntryFunc::InvokeCommand, 0, params);
-
-    params
-        .set_type(0, TeeParamType::ValueInout)
-        .map_err(|_| Errno::EINVAL)?;
-    params.set_values(0, 200, 0).map_err(|_| Errno::EINVAL)?;
-    crate::optee_call(1, UteeEntryFunc::InvokeCommand, 1, params);
-
-    params
-        .set_type(0, TeeParamType::None)
-        .map_err(|_| Errno::EINVAL)?;
-    crate::optee_call(1, UteeEntryFunc::CloseSession, 0, params);
-
-    // switch back to VTL0
-    crate::optee_call_done(1);
-
-    Ok(0)
-}
-
 /// VSM function for write protecting the memory regions of a verified kernel image for kexec.
 /// This function protects the kexec kernel blob (PE) only if it has a valid signature.
 /// Note: this function does not make kexec kernel pages executable, which should be done by
 /// another VTL1 method that can intercept the kexec/reset signal.
 pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64, Errno> {
-    // repurpose `mshv_vsm_kexec_validate` for a while for OP-TEE TA calls.
-    // we don't need to do this once we add VSM functions for OP-TEE.
-    // return optee_test(pa, nranges);
-
     debug_serial_println!(
         "VSM: Validate kexec pa {:#x} nranges {} crash {}",
         pa,

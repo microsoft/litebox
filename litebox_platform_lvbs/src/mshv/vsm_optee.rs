@@ -8,7 +8,7 @@ use crate::user_context::UserSpaceManagement;
 use litebox_common_linux::errno::Errno;
 use num_enum::TryFromPrimitive;
 
-use litebox_common_optee::{TeeLogin, TeeUuid, UteeParams};
+use litebox_common_optee::{TeeLogin, TeeParamType, TeeUuid, UteeEntryFunc, UteeParams};
 
 const OPTEE_MSG_CMD_OPEN_SESSION: u32 = 0;
 const OPTEE_MSG_CMD_INVOKE_COMMAND: u32 = 1;
@@ -143,10 +143,42 @@ pub fn mshv_vsm_optee_close_session(session_id: usize) -> Result<i64, Errno> {
     }
 }
 
+fn optee_test() -> Result<i64, Errno> {
+    let mut params = UteeParams::new();
+    crate::optee_call(1, UteeEntryFunc::OpenSession, 0, params);
+
+    params
+        .set_type(0, TeeParamType::ValueInout)
+        .map_err(|_| Errno::EINVAL)?;
+    params.set_values(0, 100, 0).map_err(|_| Errno::EINVAL)?;
+    crate::optee_call(1, UteeEntryFunc::InvokeCommand, 0, params);
+
+    params
+        .set_type(0, TeeParamType::ValueInout)
+        .map_err(|_| Errno::EINVAL)?;
+    params.set_values(0, 200, 0).map_err(|_| Errno::EINVAL)?;
+    crate::optee_call(1, UteeEntryFunc::InvokeCommand, 1, params);
+
+    params
+        .set_type(0, TeeParamType::None)
+        .map_err(|_| Errno::EINVAL)?;
+    crate::optee_call(1, UteeEntryFunc::CloseSession, 0, params);
+
+    // switch back to VTL0
+    crate::optee_call_done(1);
+
+    Ok(0)
+}
+
 /// OP-TEE message command dispatcher
 pub fn optee_msg_cmd_dispatch(msg_cmd_id: OpteeMessageCommand, _params: &[u64]) -> i64 {
     // TODO: params[0] will have a VTL0 physical address containing `OpteeMsgArg`. Copy and parse it.
 
+    // for testing only
+    let _ = optee_test();
+    0
+
+    /*
     let result = match msg_cmd_id {
         OpteeMessageCommand::OpenSession => {
             // OpteeMsgArg.params[0].a-b: TA UUID
@@ -172,4 +204,5 @@ pub fn optee_msg_cmd_dispatch(msg_cmd_id: OpteeMessageCommand, _params: &[u64]) 
         Ok(value) => value,
         Err(errno) => errno.as_neg().into(),
     }
+    */
 }
