@@ -21,7 +21,7 @@ use litebox_platform_multiplex::Platform;
 
 use litebox_platform_lvbs::user_context::UserSpaceManagement;
 
-use litebox_common_optee::UteeEntryFunc;
+use litebox_common_optee::{UteeEntryFunc, UteeParams};
 use litebox_shim_optee::{
     UteeParamsTyped, optee_command_dispatcher, register_session_id_elf_load_info,
     submit_optee_command,
@@ -97,6 +97,7 @@ pub fn init() -> Option<&'static Platform> {
         }
 
         litebox_platform_lvbs::set_optee_callback(optee_call);
+        litebox_platform_lvbs::set_optee_callback_done(optee_call_done);
     }
 
     if let Err(e) = hvcall::init() {
@@ -115,7 +116,7 @@ pub fn run(platform: Option<&'static Platform>) -> ! {
 
 // callback to work around crate dependency issues. Should be removed once
 // we finalize our refactoring.
-fn optee_call() {
+fn optee_call(session_id: u32, func: UteeEntryFunc, cmd_id: u32, params: &UteeParams) {
     static CALL_ONCE: spin::Once<bool> = spin::Once::new();
     CALL_ONCE.call_once(|| {
         let platform = litebox_platform_lvbs::platform_low();
@@ -140,45 +141,40 @@ fn optee_call() {
     });
 
     // TODO: create a VSM function and do the below within that function
-    let session_id = 1;
-    let params = [
-        UteeParamsTyped::None,
-        UteeParamsTyped::None,
-        UteeParamsTyped::None,
-        UteeParamsTyped::None,
-    ];
-    submit_optee_command(session_id, UteeEntryFunc::OpenSession, params, 0);
+    let mut params_typed = [const { UteeParamsTyped::None }; UteeParamsTyped::TEE_NUM_PARAMS];
+    for i in 0..UteeParamsTyped::TEE_NUM_PARAMS {
+        params_typed[i] = match params.get_type(i) {
+            Ok(ty) => match ty {
+                litebox_common_optee::TeeParamType::None => UteeParamsTyped::None,
+                litebox_common_optee::TeeParamType::ValueInput => {
+                    let Some((a, b)) = params.get_values(i).expect("invalid value input") else {
+                        panic!("invalid value input");
+                    };
+                    UteeParamsTyped::ValueInput {
+                        value_a: a,
+                        value_b: b,
+                    }
+                }
+                litebox_common_optee::TeeParamType::ValueOutput => UteeParamsTyped::ValueOutput {},
+                litebox_common_optee::TeeParamType::ValueInout => {
+                    let Some((a, b)) = params.get_values(i).expect("invalid value inout") else {
+                        panic!("invalid value inout");
+                    };
+                    UteeParamsTyped::ValueInout {
+                        value_a: a,
+                        value_b: b,
+                    }
+                }
+                _ => UteeParamsTyped::None,
+            },
+            Err(_) => UteeParamsTyped::None,
+        };
+    }
 
-    let params = [
-        UteeParamsTyped::ValueInout {
-            value_a: 100,
-            value_b: 0,
-        },
-        UteeParamsTyped::None,
-        UteeParamsTyped::None,
-        UteeParamsTyped::None,
-    ];
-    submit_optee_command(session_id, UteeEntryFunc::InvokeCommand, params, 0);
+    submit_optee_command(session_id, func, params_typed, cmd_id);
+}
 
-    let params = [
-        UteeParamsTyped::ValueInout {
-            value_a: 200,
-            value_b: 0,
-        },
-        UteeParamsTyped::None,
-        UteeParamsTyped::None,
-        UteeParamsTyped::None,
-    ];
-    submit_optee_command(session_id, UteeEntryFunc::InvokeCommand, params, 1);
-
-    let params = [
-        UteeParamsTyped::None,
-        UteeParamsTyped::None,
-        UteeParamsTyped::None,
-        UteeParamsTyped::None,
-    ];
-    submit_optee_command(session_id, UteeEntryFunc::CloseSession, params, 0);
-
+fn optee_call_done(session_id: u32) {
     optee_command_dispatcher(session_id, false);
 }
 

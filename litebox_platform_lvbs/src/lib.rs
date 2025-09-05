@@ -23,6 +23,7 @@ use litebox::platform::{
 };
 use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::errno::Errno;
+use litebox_common_optee::{UteeEntryFunc, UteeParams};
 use ptr::{UserConstPtr, UserMutPtr};
 use x86_64::structures::paging::{
     PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
@@ -741,18 +742,30 @@ pub fn platform_low() -> &'static Platform {
 }
 
 // TODO: remove this callback
-pub type OpteeCallback = fn();
+pub type OpteeCallback = fn(u32, UteeEntryFunc, u32, &UteeParams);
+pub type OpteeCallbackDone = fn(u32);
 static OPTEE_CALLBACK: spin::Once<OpteeCallback> = spin::Once::new();
+static OPTEE_CALLBACK_DONE: spin::Once<OpteeCallbackDone> = spin::Once::new();
 
 // TODO: remove this callback
 pub fn set_optee_callback(callback: OpteeCallback) {
     OPTEE_CALLBACK.call_once(|| callback);
 }
+pub fn set_optee_callback_done(callback: OpteeCallbackDone) {
+    OPTEE_CALLBACK_DONE.call_once(|| callback);
+}
 
 // TODO: remove this callback
-pub fn optee_call() {
+pub fn optee_call(session_id: u32, func: UteeEntryFunc, cmd_id: u32, params: UteeParams) {
     let optee_callback: OpteeCallback = *OPTEE_CALLBACK
         .get()
         .expect("OP-TEE callback should be initialized");
-    optee_callback();
+    optee_callback(session_id, func, cmd_id, &params);
+}
+
+pub fn optee_call_done(session_id: u32) {
+    let optee_callback_done: OpteeCallbackDone = *OPTEE_CALLBACK_DONE
+        .get()
+        .expect("OP-TEE callback_done should be initialized");
+    optee_callback_done(session_id);
 }
