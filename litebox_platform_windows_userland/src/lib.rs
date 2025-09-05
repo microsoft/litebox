@@ -603,7 +603,7 @@ impl litebox::platform::TimeProvider for WindowsUserland {
             dwHighDateTime: 0,
         };
         unsafe {
-            GetSystemTimeAsFileTime(&mut filetime as *mut FILETIME);
+            GetSystemTimeAsFileTime(&raw mut filetime);
         }
         let FILETIME {
             dwLowDateTime: low,
@@ -783,8 +783,7 @@ fn do_prefetch_on_range(start: usize, size: usize) {
     assert!(ok, "{}", {
         let last_error = unsafe { GetLastError() };
         format!(
-            "PrefetchVirtualMemory failed with error: {}. Str: {}",
-            last_error,
+            "PrefetchVirtualMemory failed with error: {last_error}. Str: {}",
             werr_text(last_error)
         )
     });
@@ -801,9 +800,7 @@ fn do_query_on_region(mbi: &mut Win32_Memory::MEMORY_BASIC_INFORMATION, base_add
     assert!(ok, "{}", {
         let last_error = unsafe { GetLastError() };
         format!(
-            "VirtualQuery addr={:p} failed. error: {}. Str: {}",
-            base_addr,
-            last_error,
+            "VirtualQuery addr={base_addr:p} failed. error: {last_error}. Str: {}",
             werr_text(last_error)
         )
     });
@@ -820,18 +817,18 @@ fn werr_text(err: u32) -> String {
             std::ptr::null_mut(),
             err,
             0,
-            (&mut buf) as *mut *mut u16 as *mut u16,
+            (&raw mut buf).cast::<u16>(),
             0,
             std::ptr::null_mut(),
         );
         if len == 0 || buf.is_null() {
-            return format!("Win32 error {}", err);
+            return format!("Win32 error {err}");
         }
         // Turn to String and free the buffer via LocalFree.
         let slice = std::slice::from_raw_parts(buf, len as usize);
         let s = String::from_utf16_lossy(slice).trim().to_string();
         // LocalFree
-        let _ = Win32_Foundation::LocalFree(buf as *mut c_void);
+        let _ = Win32_Foundation::LocalFree(buf.cast::<c_void>());
         s
     }
 }
@@ -910,9 +907,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                             if fixed_address {
                                 assert!(
                                     ptr == base_addr,
-                                    "VirtualAlloc2(COMMIT) returned address {:p} which is not the expected fixed address {:p}",
-                                    ptr,
-                                    base_addr
+                                    "VirtualAlloc2(COMMIT) returned address {ptr:p} which is not the expected fixed address {base_addr:p}",
                                 );
                             }
                             ptr
@@ -978,7 +973,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
             available_end_addr = core::cmp::min(
                 available_end_addr,
-                mbi.BaseAddress as usize + mbi.RegionSize as usize,
+                mbi.BaseAddress as usize + mbi.RegionSize,
             );
             available_size = core::cmp::min(
                 available_size,
@@ -1031,7 +1026,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // have to handle its next chunk (which is already reserved) and use the exact requested
         // size for allocation.
         if available_size < size {
-            let supposed_request_end = addr as usize + size as usize;
+            let supposed_request_end = addr as usize + size;
             <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
                 self,
                 range_allocated.end..supposed_request_end,
@@ -1061,7 +1056,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             assert!(mbi.BaseAddress as usize == decommit_base);
 
             let base = mbi.BaseAddress as usize;
-            let size = mbi.RegionSize as usize;
+            let size = mbi.RegionSize;
             let next = base + size;
             let free_size = core::cmp::min(remain_size, size);
             remain_size -= free_size;
@@ -1119,7 +1114,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             assert!(mbi.BaseAddress as usize == perm_update_base);
 
             let base = mbi.BaseAddress as usize;
-            let size = mbi.RegionSize as usize;
+            let size = mbi.RegionSize;
             let next = base + size;
             let perm_update_size = core::cmp::min(remain_size, size);
             remain_size -= perm_update_size;
