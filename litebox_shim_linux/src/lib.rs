@@ -339,7 +339,7 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
             syscalls::file::sys_lseek(fd, offset, whence)
         }
         SyscallRequest::Mkdir { pathname, mode } => {
-            pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+            pathname.to_cstring().map_or(Err(Errno::EINVAL), |path| {
                 syscalls::file::sys_mkdir(path, mode).map(|()| 0)
             })
         }
