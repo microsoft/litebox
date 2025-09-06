@@ -23,7 +23,7 @@ use litebox::{
     fs::FileSystem,
     mm::{PageManager, linux::PAGE_SIZE},
     platform::{RawConstPointer as _, RawMutPointer as _},
-    sync::RwLock,
+    sync::{RwLock, futex::FutexManager},
     utils::ReinterpretUnsignedExt,
 };
 use litebox_common_linux::{SyscallRequest, errno::Errno};
@@ -109,6 +109,14 @@ pub(crate) fn litebox_net<'a>()
     NET.get_or_init(|| {
         let net = litebox::net::Network::new(litebox());
         alloc::boxed::Box::new(litebox().sync().new_mutex(net))
+    })
+}
+
+pub(crate) fn litebox_futex_manager<'a>() -> &'a FutexManager<Platform> {
+    static FUTEX_MANAGER: OnceBox<FutexManager<Platform>> = OnceBox::new();
+    FUTEX_MANAGER.get_or_init(|| {
+        let futex_manager = FutexManager::new(litebox());
+        alloc::boxed::Box::new(futex_manager)
     })
 }
 
@@ -522,10 +530,18 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
             syscalls::process::sys_gettimeofday(tv, tz).map(|()| 0)
         }
         SyscallRequest::ClockGettime { clockid, tp } => {
-            syscalls::process::sys_clock_gettime(clockid, tp).map(|()| 0)
+            let clock_id =
+                litebox_common_linux::ClockId::try_from(clockid).expect("invalid clockid");
+            syscalls::process::sys_clock_gettime(clock_id).and_then(|t| {
+                unsafe { tp.write_at_offset(0, t) }
+                    .map(|()| 0)
+                    .ok_or(Errno::EFAULT)
+            })
         }
         SyscallRequest::ClockGetres { clockid, res } => {
-            syscalls::process::sys_clock_getres(clockid, res);
+            let clock_id =
+                litebox_common_linux::ClockId::try_from(clockid).expect("invalid clockid");
+            syscalls::process::sys_clock_getres(clock_id, res);
             Ok(0)
         }
         SyscallRequest::Time { tloc } => syscalls::process::sys_time(tloc)
@@ -733,6 +749,7 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
                     .ok_or(Errno::EFAULT)
             }
         }
+        SyscallRequest::Futex { args } => syscalls::process::sys_futex(args),
         _ => {
             todo!()
         }

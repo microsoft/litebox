@@ -372,3 +372,13 @@ impl From<litebox::fs::errors::ReadDirError> for Errno {
         }
     }
 }
+
+impl From<litebox::sync::futex::FutexError> for Errno {
+    fn from(value: litebox::sync::futex::FutexError) -> Self {
+        match value {
+            litebox::sync::futex::FutexError::NotAligned => Errno::EINVAL,
+            litebox::sync::futex::FutexError::ImmediatelyWokenBecauseValueMismatch => Errno::EAGAIN,
+            litebox::sync::futex::FutexError::TimedOut => Errno::ETIMEDOUT,
+        }
+    }
+}

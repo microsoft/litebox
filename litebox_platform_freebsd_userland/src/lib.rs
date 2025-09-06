@@ -25,7 +25,7 @@ mod freebsd_types;
 extern crate alloc;
 
 /// Connector to a shim-exposed syscall-handling interface.
-pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<FreeBSDUserland>) -> isize;
+pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<FreeBSDUserland>) -> usize;
 
 /// The syscall handler passed down from the shim.
 static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
@@ -301,8 +301,6 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
         // Reset the child stack pointer to the top of the allocated thread stack.
         copied_pt_regs.rsp = stack.as_usize() + stack_size - 0x8;
 
-        let thread_args = thread_args;
-
         let thread_start_args = ThreadStartArgs {
             pt_regs: copied_pt_regs,
             thread_args: thread_args,
@@ -355,7 +353,7 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
                 crate::errno::Errno::ENOMEM => litebox_common_linux::errno::Errno::ENOMEM,
                 crate::errno::Errno::ENOSPC => litebox_common_linux::errno::Errno::ENOSPC,
                 crate::errno::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
-                _ => panic!("Unexpected error from thr_new: {}", errno),
+                _ => panic!("Unexpected error from thr_new: {errno}"),
             }),
         }
     }
@@ -377,7 +375,6 @@ impl litebox::platform::RawMutexProvider for FreeBSDUserland {
     fn new_raw_mutex(&self) -> Self::RawMutex {
         RawMutex {
             inner: AtomicU32::new(0),
-            num_to_wake_up: AtomicU32::new(0),
         }
     }
 }
@@ -386,7 +383,6 @@ impl litebox::platform::RawMutexProvider for FreeBSDUserland {
 pub struct RawMutex {
     // The `inner` is the value shown to the outside world as an underlying atomic.
     inner: AtomicU32,
-    num_to_wake_up: AtomicU32,
 }
 
 impl RawMutex {
@@ -403,55 +399,24 @@ impl RawMutex {
             return Err(ImmediatelyWokenUp);
         }
 
-        // Track some initial information.
-        let mut first_time = true;
-        let start = std::time::Instant::now();
-
-        // We'll be looping unless we find a good reason to exit out of the loop, either due to a
-        // wake-up or a time-out. We do a singular (only as a one-off) check for the
-        // immediate-wake-up purely as an optimization, but otherwise, the only way to exit this
-        // loop is to actually hit an `Ok` state out for this function.
-        loop {
-            let remaining_time = match timeout {
-                None => None,
-                Some(timeout) => match timeout.checked_sub(start.elapsed()) {
-                    None => {
-                        break Ok(UnblockedOrTimedOut::TimedOut);
-                    }
-                    Some(remaining_time) => Some(remaining_time),
-                },
-            };
-
-            // We wait on the umtx_op, with a timeout if needed; the timeout is based on how much time
-            // remains to be elapsed.
-            match umtx_op_operation_timeout(
-                &self.num_to_wake_up,
-                freebsd_types::UmtxOpOperation::UMTX_OP_WAIT_UINT,
-                /* expected value */ 0,
-                remaining_time,
-            ) {
-                Ok(0) => {
-                    // Fallthrough: just let the waker to clean up the value.
-                    return Ok(UnblockedOrTimedOut::Unblocked);
-                }
-                Err(e) if e == i32::from(crate::errno::Errno::EAGAIN) as isize => {
-                    // A wake-up was already in progress when we attempted to wait. Has someone
-                    // already touched inner value? We only check this on the first time around,
-                    // anything else could be a true wake.
-                    if first_time && self.inner.load(SeqCst) != val {
-                        // Ah, we seem to have actually been immediately woken up! Let us not
-                        // miss this.
-                        return Err(ImmediatelyWokenUp);
-                    } else {
-                        // Try again.
-                        first_time = false;
-                    }
-                }
-                Err(e) => {
-                    panic!("Unexpected errno={e} for UMTX_OP_WAIT")
-                }
-                _ => unreachable!(),
+        // We wait on the umtx_op, with a timeout if needed.
+        match umtx_op_operation_timeout(
+            &self.inner,
+            freebsd_types::UmtxOpOperation::UMTX_OP_WAIT_UINT,
+            /* expected value */ val as usize,
+            timeout,
+        ) {
+            Ok(0) => Ok(UnblockedOrTimedOut::Unblocked),
+            Err(e) if e == i32::from(crate::errno::Errno::EAGAIN) as isize => {
+                Err(ImmediatelyWokenUp)
             }
+            Err(e) if e == i32::from(crate::errno::Errno::ETIMEDOUT) as isize => {
+                Ok(UnblockedOrTimedOut::TimedOut)
+            }
+            Err(e) => {
+                panic!("Unexpected errno={e} for UMTX_OP_WAIT")
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -464,47 +429,23 @@ impl litebox::platform::RawMutex for RawMutex {
     /// Wake up multiple waiters.
     /// Always returns `n` on success, and `0` on failure.
     fn wake_many(&self, n: usize) -> usize {
-        use core::sync::atomic::Ordering::SeqCst;
-
         assert!(n > 0);
         let n: u32 = n.try_into().unwrap();
-        // The highest two bits are always reserved as "lock bits".
-        let n = n.min((1 << 30) - 1);
-
-        // For FreeBSD, we can't do the same requeue trick as Linux futex, nor can we infer
-        // the actually woken up count, so we always clear the `num_to_wake_up` value
-        // and let the kernel decide the number of threads to wake up.
-
-        // Set the number of waiters we want allowed to know that they can wake up, while
-        // also grabbing the "lock bit"s.
-        while self
-            .num_to_wake_up
-            .compare_exchange(0, n | (0b11 << 30), SeqCst, SeqCst)
-            .is_err()
-        {
-            // If someone else is _also_ attempting to wake waiters up, then we should just spin
-            // until the other waker is done with their job and brings the value down.
-            core::hint::spin_loop();
-        }
 
         // Now we can actually wake them up using FreeBSD's umtx_op and it always returns 0
         // on success. We cannot ask the kernel how many were woken up.
         match umtx_op_operation_timeout(
-            &self.num_to_wake_up,
+            &self.inner,
             freebsd_types::UmtxOpOperation::UMTX_OP_WAKE,
             n as usize, // Number of threads to wake
             None,       // No timeout for wake operations
         ) {
             Err(_) => {
                 // Wake failed.
-                return 0;
+                0
             }
-            Ok(_) => {
-                // Unlock the lock bits and clean up the value, allowing other wakers to run.
-                self.num_to_wake_up.store(0, SeqCst);
-                return n as usize;
-            }
-        };
+            Ok(_) => n as usize,
+        }
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
@@ -638,21 +579,6 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 )?;
                 Ok(0)
             }
-            PunchthroughSyscall::WakeByAddress { addr } => unsafe {
-                syscalls::syscall5(
-                    syscalls::Sysno::UmtxOp,
-                    addr.as_usize(),
-                    freebsd_types::UmtxOpOperation::UMTX_OP_WAKE as usize,
-                    1,
-                    addr.as_usize(),
-                    0,
-                )
-            }
-            .map_err(|err| match err {
-                errno::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
-                _ => panic!("unexpected error {err}"),
-            })
-            .map_err(litebox::platform::PunchthroughError::Failure),
             _ => {
                 unimplemented!(
                     "PunchthroughToken for FreeBSDUserland is not fully implemented yet"
@@ -712,7 +638,7 @@ fn umtx_op_operation_timeout(
         // and uddr2 must point to the timespec structure.
         (
             core::mem::size_of::<libc::timespec>(),
-            ts as *const libc::timespec as usize,
+            core::ptr::from_ref(ts) as usize,
         )
     } else {
         (obj_ptr, 0)
@@ -1018,7 +944,7 @@ unsafe extern "C" {
 unsafe extern "C" fn syscall_handler(
     syscall_number: usize,
     ctx: *mut litebox_common_linux::PtRegs,
-) -> isize {
+) -> usize {
     // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
     let ctx = unsafe { &mut *ctx };
     match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
@@ -1029,7 +955,7 @@ unsafe extern "C" fn syscall_handler(
                 .expect("Should have run `register_syscall_handler` by now");
             syscall_handler(d)
         }
-        Err(err) => err.as_neg() as isize,
+        Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
     }
 }
 
@@ -1109,7 +1035,6 @@ mod tests {
     fn test_raw_mutex() {
         let mutex = std::sync::Arc::new(super::RawMutex {
             inner: AtomicU32::new(0),
-            num_to_wake_up: AtomicU32::new(0),
         });
 
         let copied_mutex = mutex.clone();
