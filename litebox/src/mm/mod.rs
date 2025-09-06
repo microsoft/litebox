@@ -345,6 +345,11 @@ where
         Ok(brk)
     }
 
+    pub unsafe fn reset_brk(&self) {
+        let mut vmem = self.vmem.write();
+        vmem.brk = 0;
+    }
+
     /// Expands (or shrinks) an existing memory mapping
     ///
     /// `old_addr` is the old address of the virtual memory block that you want to expand (or shrink).

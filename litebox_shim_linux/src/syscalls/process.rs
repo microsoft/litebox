@@ -13,6 +13,8 @@ use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{ArchPrctlArg, errno::Errno};
 use litebox_common_linux::{CloneFlags, FutexArgs};
 
+use crate::litebox_page_manager;
+
 /// A global counter for the number of threads in the system.
 pub(super) static NR_THREADS: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(1);
 
@@ -675,6 +677,9 @@ pub(crate) fn sys_futex(
     Ok(res)
 }
 
+const MAX_VEC: usize = 4096; // limit count
+const MAX_TOTAL_BYTES: usize = 256 * 1024; // size cap
+
 // Handle syscall `execve`.
 //
 // Old address space not unmapped (memory leak across exec). Add a PageManager reset/unmap-all API later.
@@ -695,8 +700,6 @@ pub(crate) fn sys_execve(
     let path = path_cstr.to_str().map_err(|_| Errno::ENOENT)?; // simplistic
 
     // 2. Copy argv/envp arrays
-    const MAX_VEC: usize = 4096; // limit count
-    const MAX_TOTAL_BYTES: usize = 256 * 1024; // simplistic size cap
     fn copy_vector(
         mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
         which: &str,
@@ -743,6 +746,7 @@ pub(crate) fn sys_execve(
     crate::file_descriptors().write().close_on_exec();
 
     // 4. (TODO) Reset signal dispositions, clear robust list, etc.
+    unsafe { litebox_page_manager().reset_brk() };
 
     // 5. Build auxv
     let mut aux = crate::loader::auxv::init_auxv();
@@ -775,8 +779,13 @@ pub(crate) fn sys_execve(
 mod tests {
     use core::mem::MaybeUninit;
 
-    use litebox::{mm::linux::PAGE_SIZE, platform::RawConstPointer as _, utils::TruncateExt as _};
+    use litebox::{
+        fs::FileSystem, mm::linux::PAGE_SIZE, path::Arg, platform::RawConstPointer as _,
+        utils::TruncateExt as _,
+    };
     use litebox_common_linux::{CloneFlags, MapFlags, ProtFlags};
+
+    use crate::syscalls::tests::compile;
 
     #[cfg(target_arch = "x86_64")]
     #[test]
@@ -1072,5 +1081,154 @@ mod tests {
             .map(|b| b.count_ones() as usize)
             .sum();
         assert_eq!(ones, super::NR_CPUS);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    core::arch::global_asm!(
+        "
+        .text
+        .align	4
+        .globl	trampoline
+        .type	trampoline,@function
+    trampoline:
+        xor rdx, rdx
+        mov	rsp, rsi
+        jmp	rdi
+        /* Should not reach. */
+        hlt"
+    );
+    #[cfg(target_arch = "x86")]
+    core::arch::global_asm!(
+        "
+        .text
+        .align  4
+        .globl  trampoline
+        .type   trampoline,@function
+    trampoline:
+        xor     edx, edx
+        mov     ebx, [esp + 4]
+        mov     eax, [esp + 8]
+        mov     esp, eax
+        jmp     ebx
+        /* Should not reach. */
+        hlt"
+    );
+
+    unsafe extern "C" {
+        fn trampoline(entry: usize, sp: usize) -> !;
+    }
+
+    const EXECVE_TARGET_PROGRAM: &str = r#"
+#include <stdio.h>
+
+int main(int argc, char *argv[]) {
+    printf("Hello from execve_test!\n");
+    return 0;
+}
+    "#;
+
+    #[test]
+    fn test_execve() {
+        extern crate std;
+
+        let dir_path = std::env::var("OUT_DIR").unwrap();
+        // let dir_path = "../target/debug".to_string();
+        let src_path = std::path::Path::new(dir_path.as_str()).join("execve_test.c");
+        let bin_path = std::path::Path::new(dir_path.as_str()).join("execve_test");
+        std::fs::write(&src_path, EXECVE_TARGET_PROGRAM).expect("Failed to write test program");
+        compile(
+            src_path.to_str().unwrap(),
+            bin_path.to_str().unwrap(),
+            true,
+            false,
+        );
+        let executable_data = std::fs::read(bin_path.clone()).unwrap();
+
+        crate::syscalls::tests::init_platform(None);
+
+        let target_prog = "/execve_test";
+        let fd = crate::litebox_fs()
+            .open(
+                target_prog,
+                litebox::fs::OFlags::CREAT | litebox::fs::OFlags::WRONLY,
+                litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO | litebox::fs::Mode::RWXU,
+            )
+            .unwrap();
+        crate::litebox_fs()
+            .write(&fd, &executable_data, None)
+            .unwrap();
+        crate::litebox_fs().close(fd).unwrap();
+
+        // Build C-style argument strings (must be NUL-terminated).
+        let prog_c = target_prog.to_c_str().unwrap();
+        let path = crate::ConstPtr {
+            inner: prog_c.as_ptr().cast_mut(),
+        };
+        let argv_data = [prog_c.as_ptr() as *const i8, core::ptr::null()];
+        let argv = crate::ConstPtr {
+            inner: argv_data.as_ptr() as *mut crate::ConstPtr<i8>,
+        };
+        let envp_data = [c"PATH=/bin".as_ptr() as *const i8, core::ptr::null()];
+        let envp = crate::ConstPtr {
+            inner: envp_data.as_ptr() as *mut crate::ConstPtr<i8>,
+        };
+
+        #[cfg(target_arch = "x86_64")]
+        let mut pt_regs = litebox_common_linux::PtRegs {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            rbp: 0,
+            rbx: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            rax: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            orig_rax: syscalls::Sysno::execve as usize,
+            rip: 0,
+            cs: 0x33, // __USER_CS
+            eflags: 0,
+            rsp: 0,
+            ss: 0x2b, // __USER_DS
+        };
+        #[cfg(target_arch = "x86")]
+        let mut pt_regs = litebox_common_linux::PtRegs {
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+            esi: 0,
+            edi: 0,
+            ebp: 0,
+            eax: 0,
+            xds: 0,
+            xes: 0,
+            xfs: 0,
+            xgs: 0,
+            orig_eax: syscalls::Sysno::execve as usize,
+            eip: 0,
+            xcs: 0x23, // __USER_CS
+            eflags: 0,
+            esp: 0,
+            xss: 0x2b, // __USER_DS
+        };
+
+        super::sys_execve(path, argv, envp, &mut pt_regs).expect("sys_execve failed");
+
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            trampoline(pt_regs.rip, pt_regs.rsp)
+        };
+        #[cfg(target_arch = "x86")]
+        unsafe {
+            trampoline(pt_regs.eip, pt_regs.esp)
+        };
+
+        unreachable!();
     }
 }

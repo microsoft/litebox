@@ -55,6 +55,12 @@ pub struct LinuxUserland {
     tls_entry_number: AtomicU32,
 }
 
+impl core::fmt::Debug for LinuxUserland {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LinuxUserland").finish_non_exhaustive()
+    }
+}
+
 const IF_NAMESIZE: usize = 16;
 /// Use TUN device
 const IFF_TUN: i32 = 0x0001;
@@ -1290,7 +1296,8 @@ syscall_callback:
 
     add  rsp, 24         /* skip orig_rax, rip, cs */
     popfq
-    add  rsp, 16         /* skip rsp, ss */
+    pop  rsp
+    add  rsp, 8         /* skip ss */
 
     /* Return to the caller */
     ret
