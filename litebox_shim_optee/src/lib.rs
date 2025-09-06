@@ -479,6 +479,17 @@ pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
 
         optee_command_completion_queue().push(session_id, stack.get_params_address());
 
+        #[cfg(debug_assertions)]
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "func {:#x} session_id {:#x} params {:#x} cmd_id {:#x} entry_point {:#x} stack_top {:#x}",
+            cmd.func as u32,
+            session_id,
+            stack.get_params_address(),
+            cmd.cmd_id as usize,
+            elf_load_info.entry_point,
+            stack.get_cur_stack_top()
+        );
         unsafe {
             jump_to_entry_point(
                 cmd.func as u32 as usize,
@@ -524,7 +535,28 @@ unsafe extern "C" fn jump_to_entry_point(
     entry_point: usize,
     user_stack_top: usize,
 ) -> ! {
+    #[cfg(feature = "platform_linux_userland")]
     core::arch::naked_asm!("mov rsp, r9", "jmp r8", "hlt");
+
+    // switch to user mode
+    #[cfg(feature = "platform_lvbs")]
+    core::arch::naked_asm!(
+        "mov rax, cr3",
+        "mov cr3, rax",
+        "mov rax, {user_ds}",
+        "push rax",
+        "push r9",
+        "mov rax, {rflags}",
+        "push rax",
+        "mov rax, {user_cs}",
+        "push rax",
+        "push r8",
+        "iretq",
+        "hlt",
+        user_ds = const 0x33,
+        rflags = const 1 << 9,
+        user_cs = const 0x2b,
+    );
 }
 
 /// A function to retrieve the results of the OP-TEE TA command execution.
