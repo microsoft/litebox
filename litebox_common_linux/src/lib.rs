@@ -518,6 +518,7 @@ pub const TIOCGPTN: u32 = 0x80045430;
 
 /// Commands for use with `ioctl`.
 #[non_exhaustive]
+#[derive(Debug)]
 pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     /// Get the current serial port settings.
     TCGETS(Platform::RawMutPointer<Termios>),
@@ -584,7 +585,7 @@ bitflags::bitflags! {
 
 #[repr(u8)]
 #[non_exhaustive]
-#[derive(IntEnum, PartialEq)]
+#[derive(IntEnum, PartialEq, Debug)]
 pub enum Protocol {
     ICMP = 1,
     TCP = 6,
@@ -902,6 +903,7 @@ pub enum ArchPrctlCode {
 
 /// Argument for the `arch_prctl` syscall, corresponding to the [`ArchPrctlCode`] enum.
 #[non_exhaustive]
+#[derive(Debug)]
 pub enum ArchPrctlArg<Platform: litebox::platform::RawPointerProvider> {
     #[cfg(target_arch = "x86_64")]
     SetFs(usize),
@@ -1445,8 +1447,64 @@ pub struct LinuxDirent64 {
     pub __name: [u8; 0],
 }
 
+#[non_exhaustive]
+#[repr(i32)]
+#[derive(Debug, IntEnum)]
+pub enum ClockId {
+    RealTime = 0,
+    Monotonic = 1,
+}
+
+#[non_exhaustive]
+#[repr(i32)]
+#[derive(Debug, IntEnum, PartialEq)]
+pub enum FutexOperation {
+    Wait = 0,
+    Wake = 1,
+    WaitBitset = 9,
+}
+
+bitflags::bitflags! {
+    #[derive(Debug)]
+    pub struct FutexFlags: i32 {
+        const PRIVATE = 0x80; // FUTEX_PRIVATE_FLAG
+        const CLOCK_REALTIME = 0x100; // FUTEX_CLOCK_REALTIME
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+
+        const FUTEX_CMD_MASK = !(FutexFlags::PRIVATE.bits() | FutexFlags::CLOCK_REALTIME.bits());
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum FutexArgs<Platform: litebox::platform::RawPointerProvider> {
+    Wait {
+        addr: Platform::RawMutPointer<u32>,
+        flags: FutexFlags,
+        val: u32,
+        /// Note: for FUTEX_WAIT, timeout is interpreted as a relative
+        /// value. This differs from other futex operations, where
+        /// timeout is interpreted as an absolute value.
+        timeout: Option<Platform::RawConstPointer<Timespec>>,
+    },
+    WaitBitset {
+        addr: Platform::RawMutPointer<u32>,
+        flags: FutexFlags,
+        val: u32,
+        timeout: Option<Platform::RawConstPointer<Timespec>>,
+        bitmask: u32,
+    },
+    Wake {
+        addr: Platform::RawMutPointer<u32>,
+        flags: FutexFlags,
+        count: u32,
+    },
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
+#[derive(Debug)]
 pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     Exit {
         status: i32,
@@ -1768,6 +1826,9 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         len: usize,
         mask: Platform::RawMutPointer<u8>,
     },
+    Futex {
+        args: FutexArgs<Platform>,
+    },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
 }
@@ -1983,8 +2044,14 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 arg: FcntlArg::from(ctx.sys_req_arg(1), ctx.sys_req_arg(2)),
             },
             Sysno::gettimeofday => sys_req!(Gettimeofday { tv:*, tz:* }),
+            #[cfg(target_arch = "x86_64")]
             Sysno::clock_gettime => sys_req!(ClockGettime { clockid, tp:* }),
+            #[cfg(target_arch = "x86")]
+            Sysno::clock_gettime64 => sys_req!(ClockGettime { clockid, tp:* }),
+            #[cfg(target_arch = "x86_64")]
             Sysno::clock_getres => sys_req!(ClockGetres { clockid, res:* }),
+            #[cfg(target_arch = "x86")]
+            Sysno::clock_getres_time64 => sys_req!(ClockGetres { clockid, res:* }),
             Sysno::time => sys_req!(Time { tloc:* }),
             Sysno::getcwd => sys_req!(Getcwd { buf:*, size }),
             Sysno::readlink => sys_req!(Readlink { pathname:*, buf:* ,bufsiz }),
@@ -2131,12 +2198,42 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::capget => sys_req!(CapGet { header:*,data:* }),
             Sysno::getdents64 => sys_req!(GetDirent64 { fd,dirp:*,count }),
             Sysno::sched_getaffinity => {
-                let pid = ctx.syscall_arg(0).reinterpret_as_signed().truncate();
+                let pid = ctx.sys_req_arg(0);
                 SyscallRequest::SchedGetAffinity {
                     pid: if pid == 0 { None } else { Some(pid) },
-                    len: ctx.syscall_arg(1),
-                    mask: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
+                    len: ctx.sys_req_arg(1),
+                    mask: ctx.sys_req_ptr(2),
                 }
+            }
+            Sysno::futex => {
+                let addr = ctx.sys_req_ptr(0);
+                let op: i32 = ctx.sys_req_arg(1);
+                let cmd = FutexOperation::try_from(op & FutexFlags::FUTEX_CMD_MASK.bits())
+                    .expect("Invalid futex operation");
+                let flags = FutexFlags::from_bits(op & !FutexFlags::FUTEX_CMD_MASK.bits()).unwrap();
+                let val = ctx.sys_req_arg(2);
+                let timeout = ctx.sys_req_ptr(3);
+                let args = match cmd {
+                    FutexOperation::Wait => FutexArgs::Wait {
+                        addr,
+                        flags,
+                        val,
+                        timeout,
+                    },
+                    FutexOperation::WaitBitset => FutexArgs::WaitBitset {
+                        addr,
+                        flags,
+                        val,
+                        timeout,
+                        bitmask: ctx.sys_req_arg(5),
+                    },
+                    FutexOperation::Wake => FutexArgs::Wake {
+                        addr,
+                        flags,
+                        count: val,
+                    },
+                };
+                SyscallRequest::Futex { args }
             }
             // TODO: support syscall `statfs`
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
@@ -2182,9 +2279,7 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
     },
     /// Set the FS base register to the value in `addr`.
     #[cfg(target_arch = "x86_64")]
-    SetFsBase {
-        addr: usize,
-    },
+    SetFsBase { addr: usize },
     /// Get the current value of the FS base register and store it in `addr`.
     #[cfg(target_arch = "x86_64")]
     GetFsBase {
@@ -2193,9 +2288,6 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
     #[cfg(target_arch = "x86")]
     SetThreadArea {
         user_desc: Platform::RawMutPointer<UserDesc>,
-    },
-    WakeByAddress {
-        addr: Platform::RawMutPointer<i32>,
     },
 }
 

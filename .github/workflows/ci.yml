@@ -125,6 +125,32 @@ jobs:
       - name: Build documentation (fail on warnings)
         run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items
 
+  build_and_test_windows:
+    name: Build and Test Windows
+    runs-on: windows-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+      RUSTDOCFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-pc-windows-msvc
+      - name: Set up Nextest
+        uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --verbose --all-targets --all-features -p litebox_runner_linux_on_windows_userland
+      - run: cargo build --verbose -p litebox_runner_linux_on_windows_userland
+      - run: cargo nextest run --profile ci -p litebox_runner_linux_on_windows_userland
+      - run: |
+          cargo test --verbose --doc -p litebox_runner_linux_on_windows_userland
+          # We need to run `cargo test --doc` separately because doc tests
+          # aren't included in nextest at the moment. See relevant discussion at
+          # https://github.com/nextest-rs/nextest/issues/16
+      - name: Build documentation (fail on warnings)
+        run: cargo doc --verbose --no-deps --all-features --document-private-items -p litebox_runner_linux_on_windows_userland
+
   build_and_test_snp:
     name: Build and Test SNP
     runs-on: ubuntu-latest
