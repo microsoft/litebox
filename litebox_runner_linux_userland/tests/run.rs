@@ -271,7 +271,6 @@ fn run_which(prog: &str) -> std::path::PathBuf {
 
 #[cfg(target_arch = "x86_64")]
 #[test]
-#[ignore = "unknown issue triggers it to fail on CI"]
 fn test_runner_with_nodejs() {
     const HELLO_WORLD_JS: &str = r"
 const fs = require('node:fs');
