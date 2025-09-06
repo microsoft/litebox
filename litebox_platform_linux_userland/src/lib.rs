@@ -1510,6 +1510,7 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
         };
         set_thread_area(user_desc_ptr).expect("Failed to set thread area for TLS");
 
+        assert!(user_desc.entry_number <= 0xfff);
         self.tls_entry_number.store(
             user_desc.entry_number & 0xfff,
             core::sync::atomic::Ordering::Relaxed,
