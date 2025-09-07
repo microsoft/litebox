@@ -213,10 +213,7 @@ impl WindowsUserland {
         // Initialize WinTun if adapter name is provided
         let wintun_session = wintun_adapter_name.map(|adapter_name| {
             // Load the WinTun library from the system
-            let wintun = unsafe {
-                wintun::load()
-                .expect("Failed to load WinTun library")
-            };
+            let wintun = unsafe { wintun::load().expect("Failed to load WinTun library") };
 
             // Try to open an existing adapter, or create a new one
             let adapter = match wintun::Adapter::open(&wintun, adapter_name) {
