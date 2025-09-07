@@ -21,10 +21,9 @@ use litebox_platform_multiplex::Platform;
 
 use litebox_platform_lvbs::user_context::UserSpaceManagement;
 
-use litebox_common_optee::{UteeEntryFunc, UteeParams};
+use litebox_common_optee::{UteeEntryFunc, UteeParamOwned};
 use litebox_shim_optee::{
-    UteeParamsTyped, optee_command_dispatcher, register_session_id_elf_load_info,
-    submit_optee_command,
+    optee_command_dispatcher, register_session_id_elf_load_info, submit_optee_command,
 };
 use x86_64::VirtAddr;
 
@@ -116,7 +115,12 @@ pub fn run(platform: Option<&'static Platform>) -> ! {
 
 // callback to work around crate dependency issues. Should be removed once
 // we finalize our refactoring.
-fn optee_call(session_id: u32, func: UteeEntryFunc, cmd_id: u32, params: &UteeParams) {
+fn optee_call(
+    session_id: u32,
+    func: UteeEntryFunc,
+    cmd_id: u32,
+    params: &[UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS],
+) {
     static CALL_ONCE: spin::Once<bool> = spin::Once::new();
     CALL_ONCE.call_once(|| {
         let platform = litebox_platform_lvbs::platform_low();
@@ -140,38 +144,7 @@ fn optee_call(session_id: u32, func: UteeEntryFunc, cmd_id: u32, params: &UteePa
         true
     });
 
-    // TODO: create a VSM function and do the below within that function
-    let mut params_typed = [const { UteeParamsTyped::None }; UteeParamsTyped::TEE_NUM_PARAMS];
-    for i in 0..UteeParamsTyped::TEE_NUM_PARAMS {
-        params_typed[i] = match params.get_type(i) {
-            Ok(ty) => match ty {
-                litebox_common_optee::TeeParamType::None => UteeParamsTyped::None,
-                litebox_common_optee::TeeParamType::ValueInput => {
-                    let Some((a, b)) = params.get_values(i).expect("invalid value input") else {
-                        panic!("invalid value input");
-                    };
-                    UteeParamsTyped::ValueInput {
-                        value_a: a,
-                        value_b: b,
-                    }
-                }
-                litebox_common_optee::TeeParamType::ValueOutput => UteeParamsTyped::ValueOutput {},
-                litebox_common_optee::TeeParamType::ValueInout => {
-                    let Some((a, b)) = params.get_values(i).expect("invalid value inout") else {
-                        panic!("invalid value inout");
-                    };
-                    UteeParamsTyped::ValueInout {
-                        value_a: a,
-                        value_b: b,
-                    }
-                }
-                _ => UteeParamsTyped::None,
-            },
-            Err(_) => UteeParamsTyped::None,
-        };
-    }
-
-    submit_optee_command(session_id, func, params_typed, cmd_id);
+    submit_optee_command(session_id, func, params, cmd_id);
 }
 
 fn optee_call_done(session_id: u32) {
@@ -180,6 +153,8 @@ fn optee_call_done(session_id: u32) {
 
 const TA_BINARY: &[u8] =
     include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/hello-ta.elf");
+// include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/random-ta.elf");
+// include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/aes-ta.elf");
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

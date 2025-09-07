@@ -21,7 +21,7 @@ use litebox::{
 use litebox_common_optee::{
     SyscallRequest, TeeAlgorithm, TeeAlgorithmClass, TeeAttributeType, TeeCrypStateHandle,
     TeeHandleFlag, TeeObjHandle, TeeObjectInfo, TeeObjectType, TeeOperationMode, TeeParamType,
-    TeeResult, UteeAttribute, UteeEntryFunc, UteeParams,
+    TeeResult, UteeAttribute, UteeEntryFunc, UteeParamOwned, UteeParams,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -291,6 +291,7 @@ impl SessionIdElfLoadInfoMap {
         self.inner.lock().get(&session_id).copied()
     }
 
+    #[allow(dead_code)]
     pub fn remove(&self, session_id: u32) {
         self.inner.lock().remove(&session_id);
     }
@@ -310,37 +311,8 @@ pub fn register_session_id_elf_load_info(session_id: u32, elf_load_info: ElfLoad
 #[derive(Clone)]
 pub(crate) struct OpteeCommand {
     pub func: UteeEntryFunc,
-    pub params: [UteeParamsTyped; UteeParamsTyped::TEE_NUM_PARAMS],
+    pub params: [UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS],
     pub cmd_id: u32,
-}
-
-/// Typed `UteeParams` for OP-TEE commands
-#[derive(Clone)]
-pub enum UteeParamsTyped {
-    None,
-    ValueInput {
-        value_a: u64,
-        value_b: u64,
-    },
-    ValueOutput {},
-    ValueInout {
-        value_a: u64,
-        value_b: u64,
-    },
-    MemrefInput {
-        data: alloc::boxed::Box<[u8]>,
-    },
-    MemrefOutput {
-        buffer_size: usize,
-    },
-    MemrefInout {
-        data: alloc::boxed::Box<[u8]>,
-        buffer_size: usize,
-    },
-}
-
-impl UteeParamsTyped {
-    pub const TEE_NUM_PARAMS: usize = UteeParams::TEE_NUM_PARAMS;
 }
 
 /// OP-TEE command submission queue
@@ -370,14 +342,23 @@ impl OpteeCommandQueue {
             .and_then(alloc::collections::VecDeque::pop_front)
     }
 
+    #[allow(dead_code)]
     pub fn remove(&self, session_id: u32) {
         self.inner.lock().remove(&session_id);
     }
 }
 
+/// OP-TEE TA command result structure for the command completion queue
+#[derive(Clone)]
+pub(crate) struct OpteeCommandResult {
+    pub params_addr: usize, // TA's address containing the results
+    pub out_addrs: [Option<usize>; UteeParamOwned::TEE_NUM_PARAMS],
+    // VTL0 addresses to copy the results back
+}
+
 /// OP-TEE command completion queue which stores the addresses of `UteeParams`
 pub(crate) struct OpteeResultQueue {
-    inner: spin::mutex::SpinMutex<HashMap<u32, VecDeque<usize>>>,
+    inner: spin::mutex::SpinMutex<HashMap<u32, VecDeque<OpteeCommandResult>>>,
 }
 
 impl OpteeResultQueue {
@@ -387,7 +368,7 @@ impl OpteeResultQueue {
         }
     }
 
-    pub fn push(&self, session_id: u32, result: usize) {
+    pub fn push(&self, session_id: u32, result: OpteeCommandResult) {
         self.inner
             .lock()
             .entry(session_id)
@@ -396,13 +377,14 @@ impl OpteeResultQueue {
     }
 
     #[allow(dead_code)]
-    pub fn pop(&self, session_id: u32) -> Option<usize> {
+    pub fn pop(&self, session_id: u32) -> Option<OpteeCommandResult> {
         self.inner
             .lock()
             .get_mut(&session_id)
             .and_then(alloc::collections::VecDeque::pop_front)
     }
 
+    #[allow(dead_code)]
     pub fn remove(&self, session_id: u32) {
         self.inner.lock().remove(&session_id);
     }
@@ -423,12 +405,12 @@ pub(crate) fn optee_command_completion_queue() -> &'static OpteeResultQueue {
 pub fn submit_optee_command(
     session_id: u32,
     func: UteeEntryFunc,
-    params: [UteeParamsTyped; UteeParamsTyped::TEE_NUM_PARAMS],
+    params: &[UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS],
     cmd_id: u32,
 ) {
     let cmd = OpteeCommand {
         func,
-        params,
+        params: params.clone(),
         cmd_id,
     };
     optee_command_submission_queue().push(session_id, cmd);
@@ -477,7 +459,11 @@ pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
             .init(cmd.params.as_slice())
             .expect("Failed to initialize stack with parameters");
 
-        optee_command_completion_queue().push(session_id, stack.get_params_address());
+        let cmd_result = OpteeCommandResult {
+            params_addr: stack.get_params_address(),
+            out_addrs: [None; UteeParamOwned::TEE_NUM_PARAMS],
+        };
+        optee_command_completion_queue().push(session_id, cmd_result);
 
         #[cfg(debug_assertions)]
         litebox::log_println!(
@@ -564,8 +550,8 @@ unsafe extern "C" fn jump_to_entry_point(
 /// processed a command.
 fn handle_optee_command_output(session_id: u32) {
     // TA stores results in the `UteeParams` structure and/or buffers it refers to.
-    while let Some(param_addr) = optee_command_completion_queue().pop(session_id) {
-        let params = unsafe { &*(param_addr as *const UteeParams) };
+    while let Some(cmd_result) = optee_command_completion_queue().pop(session_id) {
+        let params = unsafe { &*(cmd_result.params_addr as *const UteeParams) };
         for idx in 0..UteeParams::TEE_NUM_PARAMS {
             let param_type = params.get_type(idx).expect("Failed to get parameter type");
             match param_type {
@@ -579,7 +565,9 @@ fn handle_optee_command_output(session_id: u32) {
                             value_a,
                             value_b,
                         );
-                        // TODO: return the outcome
+                        if let Some(_out_addr) = cmd_result.out_addrs[idx] {
+                            todo!("copy the result back to VTL0");
+                        }
                     }
                 }
                 TeeParamType::MemrefOutput | TeeParamType::MemrefInout => {
@@ -598,7 +586,9 @@ fn handle_optee_command_output(session_id: u32) {
                             addr,
                             slice
                         );
-                        // TODO: return the outcome
+                        if let Some(_out_addr) = cmd_result.out_addrs[idx] {
+                            todo!("copy the result back to VTL0");
+                        }
                     }
                 }
                 _ => {}

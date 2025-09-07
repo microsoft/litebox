@@ -438,6 +438,42 @@ impl UteeParams {
     }
 }
 
+/// Each parameter for TA invocation with copied content/buffer for safer operations.
+/// This is our representation of `utee_params` and not for directly
+/// interacting with OP-TEE TAs and clients (which expect pointers/references).
+#[derive(Clone)]
+pub enum UteeParamOwned {
+    None,
+    ValueInput {
+        value_a: u64,
+        value_b: u64,
+    },
+    ValueOutput {
+        out_address: usize,
+    },
+    ValueInout {
+        value_a: u64,
+        value_b: u64,
+        out_address: usize,
+    },
+    MemrefInput {
+        data: alloc::boxed::Box<[u8]>,
+    },
+    MemrefOutput {
+        buffer_size: usize,
+        out_address: usize,
+    },
+    MemrefInout {
+        data: alloc::boxed::Box<[u8]>,
+        buffer_size: usize,
+        out_address: usize,
+    },
+}
+
+impl UteeParamOwned {
+    pub const TEE_NUM_PARAMS: usize = UteeParams::TEE_NUM_PARAMS;
+}
+
 /// `utee_attribute` from `optee_os/lib/libutee/include/utee_types.h`
 #[derive(Clone, Copy)]
 #[repr(C)]

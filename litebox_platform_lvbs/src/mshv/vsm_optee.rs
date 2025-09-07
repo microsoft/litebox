@@ -8,7 +8,7 @@ use crate::user_context::UserSpaceManagement;
 use litebox_common_linux::errno::Errno;
 use num_enum::TryFromPrimitive;
 
-use litebox_common_optee::{TeeLogin, TeeParamType, TeeUuid, UteeEntryFunc, UteeParams};
+use litebox_common_optee::{TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams};
 
 const OPTEE_MSG_CMD_OPEN_SESSION: u32 = 0;
 const OPTEE_MSG_CMD_INVOKE_COMMAND: u32 = 1;
@@ -99,6 +99,7 @@ struct OpteeMsgArg {
 }
 
 // A placeholder for testing purposes. This isn't a real function signature.
+#[expect(dead_code)]
 pub fn mshv_vsm_optee_open_session(
     _ta_uuid: TeeUuid,
     _client_uuid: TeeUuid,
@@ -117,7 +118,7 @@ pub fn mshv_vsm_optee_open_session(
 }
 
 // A placeholder for testing purposes. This isn't a real function signature.
-#[allow(unreachable_code)]
+#[expect(dead_code)]
 pub fn mshv_vsm_optee_invoke_command(
     session_id: usize,
     _function_id: u32,
@@ -126,13 +127,13 @@ pub fn mshv_vsm_optee_invoke_command(
 ) -> Result<i64, Errno> {
     if crate::platform_low().check_userspace(session_id) {
         crate::platform_low().enter_userspace(session_id, None);
-        unreachable!("enter_userspace should never return");
     } else {
         Err(Errno::ENOENT)
     }
 }
 
 // A placeholder for testing purposes. This isn't a real function signature.
+#[expect(dead_code)]
 pub fn mshv_vsm_optee_close_session(session_id: usize) -> Result<i64, Errno> {
     if crate::platform_low().check_userspace(session_id) {
         crate::platform_low().delete_userspace(session_id)?;
@@ -143,26 +144,57 @@ pub fn mshv_vsm_optee_close_session(session_id: usize) -> Result<i64, Errno> {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn optee_test() -> Result<i64, Errno> {
-    let mut params = UteeParams::new();
-    crate::optee_call(1, UteeEntryFunc::OpenSession, 0, params);
+    let params = [
+        UteeParamOwned::None,
+        UteeParamOwned::None,
+        UteeParamOwned::None,
+        UteeParamOwned::None,
+    ];
+    crate::optee_call(1, UteeEntryFunc::OpenSession, 0, &params);
 
-    params
-        .set_type(0, TeeParamType::ValueInout)
-        .map_err(|_| Errno::EINVAL)?;
-    params.set_values(0, 100, 0).map_err(|_| Errno::EINVAL)?;
-    crate::optee_call(1, UteeEntryFunc::InvokeCommand, 0, params);
+    // commands for hello world TA
+    let params = [
+        UteeParamOwned::ValueInout {
+            value_a: 100,
+            value_b: 0,
+            out_address: 0,
+        },
+        UteeParamOwned::None,
+        UteeParamOwned::None,
+        UteeParamOwned::None,
+    ];
+    crate::optee_call(1, UteeEntryFunc::InvokeCommand, 0, &params);
 
-    params
-        .set_type(0, TeeParamType::ValueInout)
-        .map_err(|_| Errno::EINVAL)?;
-    params.set_values(0, 200, 0).map_err(|_| Errno::EINVAL)?;
-    crate::optee_call(1, UteeEntryFunc::InvokeCommand, 1, params);
+    let params = [
+        UteeParamOwned::ValueInout {
+            value_a: 200,
+            value_b: 0,
+            out_address: 0,
+        },
+        UteeParamOwned::None,
+        UteeParamOwned::None,
+        UteeParamOwned::None,
+    ];
+    crate::optee_call(1, UteeEntryFunc::InvokeCommand, 1, &params);
 
-    params
-        .set_type(0, TeeParamType::None)
-        .map_err(|_| Errno::EINVAL)?;
-    crate::optee_call(1, UteeEntryFunc::CloseSession, 0, params);
+    // command for random TA
+    // let params = [
+    //     UteeParamOwned::MemrefOutput { buffer_size: 64, out_address: 0 },
+    //     UteeParamOwned::None,
+    //     UteeParamOwned::None,
+    //     UteeParamOwned::None,
+    // ];
+    // crate::optee_call(1, UteeEntryFunc::InvokeCommand, 0, &params);
+
+    let params = [
+        UteeParamOwned::None,
+        UteeParamOwned::None,
+        UteeParamOwned::None,
+        UteeParamOwned::None,
+    ];
+    crate::optee_call(1, UteeEntryFunc::CloseSession, 0, &params);
 
     // switch back to VTL0
     crate::optee_call_done(1);
@@ -171,7 +203,8 @@ fn optee_test() -> Result<i64, Errno> {
 }
 
 /// OP-TEE message command dispatcher
-pub fn optee_msg_cmd_dispatch(msg_cmd_id: OpteeMessageCommand, _params: &[u64]) -> i64 {
+#[allow(clippy::unnecessary_wraps)]
+pub fn optee_msg_cmd_dispatch(_msg_cmd_id: OpteeMessageCommand, _params: &[u64]) -> i64 {
     // TODO: params[0] will have a VTL0 physical address containing `OpteeMsgArg`. Copy and parse it.
 
     // for testing only

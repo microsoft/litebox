@@ -230,9 +230,9 @@ fn jump_to_vtl_switch_loop_with_stack_cleanup() -> ! {
 }
 
 /// expose `vtl_switch_loop` to the outside (e.g., the syscall handler)
+/// # Safety
+/// This function is unsafe because it uses naked assembly.
 #[unsafe(naked)]
-// TODO: renable this once refactoring is done
-// pub(crate) unsafe extern "C" fn jump_to_vtl_switch_loop() -> ! {
 pub unsafe extern "C" fn jump_to_vtl_switch_loop() -> ! {
     naked_asm!(
         "jmp {loop}",
