@@ -2048,6 +2048,13 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 fd: ctx.sys_req_arg(0),
                 arg: FcntlArg::from(ctx.sys_req_arg(1), ctx.sys_req_arg(2)),
             },
+            // TODO: fcntl64 is identical to fcntl except certain commands (e.g., `F_OFD_SETLK`)
+            // that we don't support yet.
+            #[cfg(target_arch = "x86")]
+            Sysno::fcntl64 => SyscallRequest::Fcntl {
+                fd: ctx.sys_req_arg(0),
+                arg: FcntlArg::from(ctx.sys_req_arg(1), ctx.sys_req_arg(2)),
+            },
             Sysno::gettimeofday => sys_req!(Gettimeofday { tv:*, tz:* }),
             #[cfg(target_arch = "x86_64")]
             Sysno::clock_gettime => sys_req!(ClockGettime { clockid, tp:* }),
