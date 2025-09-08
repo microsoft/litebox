@@ -250,7 +250,7 @@ fn load_program_wrapper(
 fn load_program(
     path: &str,
     argv: alloc::vec::Vec<alloc::ffi::CString>,
-    envp: alloc::vec::Vec<alloc::ffi::CString>,
+    mut envp: alloc::vec::Vec<alloc::ffi::CString>,
 ) -> Result<(), litebox_common_linux::errno::Errno> {
     let mut aux = litebox_shim_linux::loader::auxv::init_auxv();
     if litebox_platform_multiplex::platform()
@@ -278,6 +278,8 @@ fn load_program(
             );
         }
     }
+    // Enable the audit library to load trampoline code for rewritten binaries.
+    envp.push(c"LD_AUDIT=/lib/litebox_rtld_audit.so".into());
     let loaded_program = litebox_shim_linux::loader::load_program(path, argv, envp, aux).unwrap();
     unsafe {
         trampoline::jump_to_entry_point(loaded_program.entry_point, loaded_program.user_stack_top)
