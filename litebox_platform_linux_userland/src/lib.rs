@@ -1298,8 +1298,7 @@ syscall_callback:
 
     add  rsp, 24         /* skip orig_rax, rip, cs */
     popfq
-    pop  rsp
-    add  rsp, 8         /* skip ss */
+    add  rsp, 16         /* skip rsp, ss */
 
     /* Return to the caller */
     ret
