@@ -89,8 +89,13 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         whence: SeekWhence,
     ) -> Result<usize, SeekError>;
 
-    /// Truncate the file (i.e., reset the offset to zero, and set its contents to empty).
-    fn truncate(&self, fd: &TypedFd<Self>) -> Result<(), TruncateError>;
+    /// Truncate the file to the specified length.
+    ///
+    /// If shorter than existing size, extra data is lost. If longer than existing size, resize by
+    /// adding `\0`s.
+    ///
+    /// The offset is reset to zero.
+    fn truncate(&self, fd: &TypedFd<Self>, length: usize) -> Result<(), TruncateError>;
 
     /// Change the permissions of a file
     fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;

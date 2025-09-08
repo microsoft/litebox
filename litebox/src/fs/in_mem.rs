@@ -238,7 +238,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }),
         };
         if flags.contains(OFlags::TRUNC) {
-            match self.truncate(&fd) {
+            match self.truncate(&fd, 0) {
                 Ok(()) => {}
                 Err(e) => {
                     self.close(fd).unwrap();
@@ -362,7 +362,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
-    fn truncate(&self, fd: &FileFd<Platform>) -> Result<(), TruncateError> {
+    fn truncate(&self, fd: &FileFd<Platform>, length: usize) -> Result<(), TruncateError> {
         let descriptor_table = self.litebox.descriptor_table();
         let Descriptor::File {
             file,
@@ -377,7 +377,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         if !*write_allowed {
             return Err(TruncateError::NotForWriting);
         }
-        file.write().data.clear();
+        let mut file_data = file.write();
+        if length < file_data.data.len() {
+            file_data.data.truncate(length);
+        } else if length > file_data.data.len() {
+            file_data.data.resize(length, 0);
+        }
         *position = 0;
         Ok(())
     }
