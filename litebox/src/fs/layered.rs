@@ -600,7 +600,17 @@ impl<
             // not exist at the upper level but exists at the lower level; in that case, our
             // `truncate` functionality (at the layered FS itself) should correctly migrate things
             // over and handle them.
-            self.truncate(&fd)?;
+            match self.truncate(&fd) {
+                Ok(()) | Err(TruncateError::IsTerminalDevice) => {
+                    // The terminal device is the one case we need to (due to Linux compatibility)
+                    // explicitly ignore the truncation ability, and instead silently continue as if
+                    // no error was thrown during truncation.
+                }
+                Err(e) => {
+                    self.close(fd).unwrap();
+                    return Err(e.into());
+                }
+            }
         }
         Ok(fd)
     }

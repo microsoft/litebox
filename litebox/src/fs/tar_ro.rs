@@ -209,7 +209,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             })
         };
         if flags.contains(OFlags::TRUNC) {
-            self.truncate(&fd)?;
+            match self.truncate(&fd) {
+                Ok(()) => {}
+                Err(e) => {
+                    self.close(fd).unwrap();
+                    return Err(e.into());
+                }
+            }
         }
         Ok(fd)
     }
