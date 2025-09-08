@@ -8,6 +8,7 @@ anyhow = "1.0.97"
 clap = { version = "4.5.33", features = ["derive"] }
 libc = { version = "0.2.169", default-features = false }
 litebox = { version = "0.1.0", path = "../litebox" }
+litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
 litebox_platform_linux_userland = { version = "0.1.0", path = "../litebox_platform_linux_userland" }
 litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_multiplex", default-features = false, features = ["platform_linux_userland", "systrap_backend"] }
 litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux" }

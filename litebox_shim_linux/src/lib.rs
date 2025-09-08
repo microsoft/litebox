@@ -97,9 +97,10 @@ pub fn litebox_fs<'a>() -> &'a LinuxFS {
 }
 
 /// Get the global page manager
-pub fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE> {
-    static VMEM: OnceBox<PageManager<Platform, PAGE_SIZE>> = OnceBox::new();
-    VMEM.get_or_init(|| alloc::boxed::Box::new(PageManager::new(litebox())))
+pub fn litebox_page_manager() -> alloc::sync::Arc<PageManager<Platform, { PAGE_SIZE }>> {
+    use litebox::platform::ThreadLocalStorageProvider;
+    litebox_platform_multiplex::platform()
+        .with_thread_local_storage_mut(|tls| tls.current_task.page_manager.clone())
 }
 
 pub(crate) fn litebox_net<'a>()
