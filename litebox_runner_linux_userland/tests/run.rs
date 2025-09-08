@@ -294,6 +294,7 @@ console.log(content);
 
 #[cfg(target_arch = "x86_64")]
 #[test]
+#[ignore = "Rewriting node and its dependencies takes > 5 minutes, so ignore by default"]
 fn test_node_with_rewriter() {
     const HELLO_WORLD_JS: &str = r"
 const fs = require('node:fs');
