@@ -1241,6 +1241,8 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
         tls.borrowed = false;
         ret
     }
+
+    fn clear_guest_thread_local_storage(&self) {}
 }
 
 #[cfg(test)]

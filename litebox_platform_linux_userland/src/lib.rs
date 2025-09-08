@@ -1590,6 +1590,9 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
         ret
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn clear_guest_thread_local_storage(&self) {}
+
     #[cfg(target_arch = "x86")]
     fn clear_guest_thread_local_storage(&self) {
         const GDT_ENTRY_TLS_ENTRIES: u32 = 3;

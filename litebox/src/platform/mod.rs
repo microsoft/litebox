@@ -672,6 +672,9 @@ pub trait ThreadLocalStorageProvider {
     /// Panics if TLS is being used by [`Self::with_thread_local_storage_mut`].
     fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage;
 
-    #[cfg(target_arch = "x86")]
+    /// Clear any guest thread-local storage state for the current thread.
+    ///
+    /// This is used to help emulate certain syscalls (e.g., `execve`) that clear TLS,
+    /// which is necessary for some platforms (e.g., x86 Linux).
     fn clear_guest_thread_local_storage(&self);
 }
