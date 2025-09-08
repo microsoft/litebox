@@ -30,6 +30,8 @@ pub fn find_dependencies(prog: &str) -> Vec<String> {
                 && token.starts_with('/')
             {
                 paths.push(token.to_string());
+            } else {
+                println!("Warning: unexpected ldd output line: {line}");
             }
         } else {
             // Format: "/lib64/ld-linux-x86-64.so.2 (0x...)" or "linux-vdso.so.1 (0x...)"
