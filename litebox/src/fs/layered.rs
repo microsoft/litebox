@@ -212,7 +212,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         // We are here the first time around, and did not error out, yay! We can
                         // actually open up the file.
                         //
-                        // TODO: We might need to make all the parent directories?
+                        // First, we make sure we've set up the ancestor directories.
+                        match self.mkdir_migrating_ancestor_dirs(path) {
+                            Ok(()) => {}
+                            Err(e) => unimplemented!("{e} when setting up ancestor dirs"),
+                        }
+                        // Now we can actually open the file.
                         upper_fd = Some(
                             self.upper
                                 .open(
