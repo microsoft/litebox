@@ -387,10 +387,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             return Err(TruncateError::NotForWriting);
         }
         let mut file_data = file.write();
-        if length < file_data.data.len() {
-            file_data.data.truncate(length);
-        } else if length > file_data.data.len() {
-            file_data.data.resize(length, 0);
+        match length.cmp(&file_data.data.len()) {
+            core::cmp::Ordering::Less => file_data.data.truncate(length),
+            core::cmp::Ordering::Equal => file_data.data.resize(length, 0),
+            core::cmp::Ordering::Greater => (),
         }
         if reset_offset {
             *position = 0;
