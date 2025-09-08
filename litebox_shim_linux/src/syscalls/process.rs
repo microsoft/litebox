@@ -809,9 +809,11 @@ pub(crate) fn sys_execve(
             tls.current_task.page_manager.release_memory(release);
         };
     });
+    #[cfg(target_arch = "x86")]
+    litebox_platform_multiplex::platform().clear_guest_thread_local_storage();
 
     if let Some(callback) = EXECVE_CALLBACK.get() {
-        callback(ctx, path, argv_vec, envp_vec);
+        callback(ctx, path, argv_vec, envp_vec).expect("we already released memory above");
     }
 
     Ok(())

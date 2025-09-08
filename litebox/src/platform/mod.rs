@@ -671,4 +671,7 @@ pub trait ThreadLocalStorageProvider {
     /// Panics if TLS is not set yet.
     /// Panics if TLS is being used by [`Self::with_thread_local_storage_mut`].
     fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage;
+
+    #[cfg(target_arch = "x86")]
+    fn clear_guest_thread_local_storage(&self);
 }
