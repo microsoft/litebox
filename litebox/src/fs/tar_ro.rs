@@ -292,7 +292,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn truncate(&self, fd: &FileFd<Platform>) -> Result<(), TruncateError> {
         match self.litebox.descriptor_table().get_entry(fd).entry {
             Descriptor::File { .. } => Err(TruncateError::NotForWriting),
-            Descriptor::Dir { .. } => Err(TruncateError::NotAFile),
+            Descriptor::Dir { .. } => Err(TruncateError::IsDirectory),
         }
     }
 

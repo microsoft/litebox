@@ -198,11 +198,8 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         unimplemented!()
     }
 
-    fn truncate(&self, fd: &FileFd<Platform>) -> Result<(), TruncateError> {
-        match self.litebox.descriptor_table().get_entry(fd).entry {
-            StdioStream::Stdin => Err(TruncateError::NotForWriting),
-            StdioStream::Stdout | StdioStream::Stderr => Ok(()),
-        }
+    fn truncate(&self, _fd: &FileFd<Platform>) -> Result<(), TruncateError> {
+        Err(TruncateError::IsTerminalDevice)
     }
 
     #[expect(unused_variables, reason = "unimplemented")]

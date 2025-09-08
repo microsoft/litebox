@@ -525,7 +525,9 @@ impl<
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
                 | OpenError::TruncateError(
-                    TruncateError::NotAFile | TruncateError::NotForWriting,
+                    TruncateError::IsDirectory
+                    | TruncateError::NotForWriting
+                    | TruncateError::IsTerminalDevice,
                 )
                 | OpenError::PathError(
                     PathError::ComponentNotADirectory
@@ -851,7 +853,10 @@ impl<
                             // We might need to migrate the file up
                             match self.lower.truncate(fd) {
                                 Ok(()) => unreachable!(),
-                                Err(TruncateError::NotAFile) => Err(TruncateError::NotAFile),
+                                Err(TruncateError::IsDirectory) => Err(TruncateError::IsDirectory),
+                                Err(TruncateError::IsTerminalDevice) => {
+                                    Err(TruncateError::IsTerminalDevice)
+                                }
                                 Err(TruncateError::NotForWriting) => {
                                     // We must actually migrate this file up, and keep it truncated.
                                     //

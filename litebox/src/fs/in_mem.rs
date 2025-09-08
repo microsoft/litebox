@@ -366,7 +366,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             metadata: _,
         } = &mut descriptor_table.get_entry_mut(fd).entry
         else {
-            return Err(TruncateError::NotAFile);
+            return Err(TruncateError::IsDirectory);
         };
         if !*write_allowed {
             return Err(TruncateError::NotForWriting);

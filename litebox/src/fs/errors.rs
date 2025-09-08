@@ -64,10 +64,12 @@ pub enum SeekError {
 /// Possible errors from [`FileSystem::truncate`]
 #[derive(Error, Debug)]
 pub enum TruncateError {
-    #[error("file descriptor does not point to a file")]
-    NotAFile,
+    #[error("file descriptor points to a directory")]
+    IsDirectory,
     #[error("file is not opened for writing")]
     NotForWriting,
+    #[error("file descriptor points to a terminal device")]
+    IsTerminalDevice,
 }
 
 /// Possible errors from [`FileSystem::chmod`]
