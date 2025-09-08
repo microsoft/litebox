@@ -345,7 +345,17 @@ where
         Ok(brk)
     }
 
-    pub unsafe fn reset_brk(&self) {
+    pub unsafe fn release_memory(&self, f: fn(Range<usize>, VmFlags) -> bool) {
+        for (r, vma) in self.mappings() {
+            if !f(r.clone(), vma) {
+                continue;
+            }
+            let mut vmem = self.vmem.write();
+            let range = PageRange::new(r.start, r.end).unwrap();
+            unsafe { vmem.remove_mapping(range) }.expect("failed to remove mapping");
+        }
+
+        // reset brk
         let mut vmem = self.vmem.write();
         vmem.brk = 0;
     }
