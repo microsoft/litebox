@@ -137,7 +137,7 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
             // Note: matching Linux behavior, this does not actually perform any truncation, and
             // instead, it is silently ignored if you attempt to truncate upon opening stdio.
             assert!(matches!(
-                self.truncate(&fd, 0),
+                self.truncate(&fd, 0, true),
                 Err(TruncateError::IsTerminalDevice)
             ));
         }
@@ -203,7 +203,12 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         unimplemented!()
     }
 
-    fn truncate(&self, _fd: &FileFd<Platform>, _length: usize) -> Result<(), TruncateError> {
+    fn truncate(
+        &self,
+        _fd: &FileFd<Platform>,
+        _length: usize,
+        _reset_offset: bool,
+    ) -> Result<(), TruncateError> {
         Err(TruncateError::IsTerminalDevice)
     }
 

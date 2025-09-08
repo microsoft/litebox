@@ -600,7 +600,7 @@ impl<
             // not exist at the upper level but exists at the lower level; in that case, our
             // `truncate` functionality (at the layered FS itself) should correctly migrate things
             // over and handle them.
-            match self.truncate(&fd, 0) {
+            match self.truncate(&fd, 0, true) {
                 Ok(()) | Err(TruncateError::IsTerminalDevice) => {
                     // The terminal device is the one case we need to (due to Linux compatibility)
                     // explicitly ignore the truncation ability, and instead silently continue as if
@@ -845,7 +845,12 @@ impl<
         Ok(position)
     }
 
-    fn truncate(&self, fd: &FileFd<Platform, Upper, Lower>, length: usize) -> Result<(), TruncateError> {
+    fn truncate(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+        length: usize,
+        reset_offset: bool,
+    ) -> Result<(), TruncateError> {
         let (flags, entry) = self
             .litebox
             .descriptor_table()
@@ -854,14 +859,16 @@ impl<
             });
         let layered_fd = fd;
         match entry.as_ref() {
-            EntryX::Upper { fd } => self.upper.truncate(fd, length),
+            EntryX::Upper { fd } => self.upper.truncate(fd, length, reset_offset),
             EntryX::Lower { fd } => {
                 match self.layering_semantics {
-                    LayeringSemantics::LowerLayerWritableFiles => self.lower.truncate(fd, length),
+                    LayeringSemantics::LowerLayerWritableFiles => {
+                        self.lower.truncate(fd, length, reset_offset)
+                    }
                     LayeringSemantics::LowerLayerReadOnly => {
                         if flags.contains(OFlags::WRONLY) || flags.contains(OFlags::RDWR) {
                             // We might need to migrate the file up
-                            match self.lower.truncate(fd, length) {
+                            match self.lower.truncate(fd, length, reset_offset) {
                                 Ok(()) => unreachable!(),
                                 Err(TruncateError::IsDirectory) => Err(TruncateError::IsDirectory),
                                 Err(TruncateError::IsTerminalDevice) => {
@@ -888,7 +895,7 @@ impl<
                         } else {
                             // The lower level truncate will correctly identify dir/file and handle
                             // the difference in erroring.
-                            self.lower.truncate(fd, length)
+                            self.lower.truncate(fd, length, reset_offset)
                         }
                     }
                 }

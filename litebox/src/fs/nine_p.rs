@@ -68,7 +68,12 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
         todo!()
     }
 
-    fn truncate(&self, fd: &FileFd<Platform>, length: usize) -> Result<(), super::errors::TruncateError> {
+    fn truncate(
+        &self,
+        fd: &FileFd<Platform>,
+        length: usize,
+        reset_offset: bool,
+    ) -> Result<(), super::errors::TruncateError> {
         todo!()
     }
 

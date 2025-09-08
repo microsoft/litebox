@@ -238,7 +238,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }),
         };
         if flags.contains(OFlags::TRUNC) {
-            match self.truncate(&fd, 0) {
+            match self.truncate(&fd, 0, true) {
                 Ok(()) => {}
                 Err(e) => {
                     self.close(fd).unwrap();
@@ -362,7 +362,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
-    fn truncate(&self, fd: &FileFd<Platform>, length: usize) -> Result<(), TruncateError> {
+    fn truncate(
+        &self,
+        fd: &FileFd<Platform>,
+        length: usize,
+        reset_offset: bool,
+    ) -> Result<(), TruncateError> {
         let descriptor_table = self.litebox.descriptor_table();
         let Descriptor::File {
             file,
@@ -383,7 +388,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         } else if length > file_data.data.len() {
             file_data.data.resize(length, 0);
         }
-        *position = 0;
+        if reset_offset {
+            *position = 0;
+        }
         Ok(())
     }
 

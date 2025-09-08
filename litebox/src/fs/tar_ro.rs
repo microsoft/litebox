@@ -209,7 +209,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             })
         };
         if flags.contains(OFlags::TRUNC) {
-            match self.truncate(&fd, 0) {
+            match self.truncate(&fd, 0, true) {
                 Ok(()) => {}
                 Err(e) => {
                     self.close(fd).unwrap();
@@ -295,7 +295,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
-    fn truncate(&self, fd: &FileFd<Platform>, _length: usize) -> Result<(), TruncateError> {
+    fn truncate(
+        &self,
+        fd: &FileFd<Platform>,
+        _length: usize,
+        _reset_offset: bool,
+    ) -> Result<(), TruncateError> {
         match self.litebox.descriptor_table().get_entry(fd).entry {
             Descriptor::File { .. } => Err(TruncateError::NotForWriting),
             Descriptor::Dir { .. } => Err(TruncateError::IsDirectory),

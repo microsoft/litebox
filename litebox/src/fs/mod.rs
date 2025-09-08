@@ -94,8 +94,13 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// If shorter than existing size, extra data is lost. If longer than existing size, resize by
     /// adding `\0`s.
     ///
-    /// The offset is reset to zero.
-    fn truncate(&self, fd: &TypedFd<Self>, length: usize) -> Result<(), TruncateError>;
+    /// If `reset_offset` is true, the offset is reset to zero; otherwise, it remains unchanged.
+    fn truncate(
+        &self,
+        fd: &TypedFd<Self>,
+        length: usize,
+        reset_offset: bool,
+    ) -> Result<(), TruncateError>;
 
     /// Change the permissions of a file
     fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
