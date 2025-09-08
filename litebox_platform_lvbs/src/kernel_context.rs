@@ -27,6 +27,7 @@ pub struct KernelContext {
     _guard_page_1: [u8; PAGE_SIZE],
     hvcall_input: [u8; PAGE_SIZE],
     hvcall_output: [u8; PAGE_SIZE],
+    xsave_page: [u8; PAGE_SIZE],
     pub tss: gdt::AlignedTss,
     pub vtl0_state: VtlState,
     pub vtl1_state: VtlState,
@@ -80,6 +81,32 @@ impl KernelContext {
     pub(crate) fn get_segment_selectors(&self) -> Option<(u16, u16, u16)> {
         self.gdt.map(gdt::GdtWrapper::get_segment_selectors)
     }
+
+    /// Save the extended states (i.e., XSAVE area) of a kernel thread
+    /// This function is experimental. We assume that we call this function right before
+    /// running some VSM functions or programs which might overwrite the extended state.
+    pub fn save_extended_states(&self) {
+        unsafe {
+            core::arch::asm!(
+                "xsave [{}]",
+                in(reg) &raw const self.xsave_page as u64,
+                in("rax") !0usize,
+                in("rdx") !0usize,
+            );
+        }
+    }
+
+    /// Load the saved extended states (i.e., XSAVE area) of a kernel thread
+    pub fn load_extended_states(&self) {
+        unsafe {
+            core::arch::asm!(
+                "xrstor [{}]",
+                in(reg) &raw const self.xsave_page as u64,
+                in("rax") !0usize,
+                in("rdx") !0usize,
+            );
+        }
+    }
 }
 
 // TODO: use heap
@@ -92,6 +119,7 @@ static mut PER_CORE_KERNEL_CONTEXT: [KernelContext; MAX_CORES] = [KernelContext 
     _guard_page_1: [0u8; PAGE_SIZE],
     hvcall_input: [0u8; PAGE_SIZE],
     hvcall_output: [0u8; PAGE_SIZE],
+    xsave_page: [0u8; PAGE_SIZE],
     tss: gdt::AlignedTss(TaskStateSegment::new()),
     vtl0_state: VtlState {
         rbp: 0,

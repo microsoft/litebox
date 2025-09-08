@@ -483,6 +483,9 @@ pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
             litebox_common_linux::wrfsbase(crate::loader::DEFAULT_FS_BASE);
         }
 
+        #[cfg(feature = "platform_lvbs")]
+        litebox_platform_lvbs::kernel_context::get_per_core_kernel_context().save_extended_states();
+
         unsafe {
             jump_to_entry_point(
                 cmd.func as u32 as usize,
@@ -504,6 +507,7 @@ pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
             if #[cfg(feature = "platform_linux_userland")] {
                 litebox_platform_multiplex::platform().terminate_thread(0);
             } else if #[cfg(feature = "platform_lvbs")] {
+                litebox_platform_lvbs::kernel_context::get_per_core_kernel_context().load_extended_states();
                 unsafe {
                     litebox_platform_lvbs::mshv::vtl_switch::jump_to_vtl_switch_loop();
                 }

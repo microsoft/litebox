@@ -36,8 +36,17 @@ pub fn init() -> Option<&'static Platform> {
     x86_64::instructions::interrupts::enable();
     let mut flags = x86_64::registers::control::Cr4::read();
     flags.insert(x86_64::registers::control::Cr4Flags::FSGSBASE);
+    flags.insert(x86_64::registers::control::Cr4Flags::OSFXSR);
+    flags.insert(x86_64::registers::control::Cr4Flags::OSXMMEXCPT_ENABLE);
+    flags.insert(x86_64::registers::control::Cr4Flags::OSXSAVE);
     unsafe {
         x86_64::registers::control::Cr4::write(flags);
+    }
+    let mut flags = x86_64::registers::xcontrol::XCr0::read();
+    flags.insert(x86_64::registers::xcontrol::XCr0Flags::SSE);
+    flags.insert(x86_64::registers::xcontrol::XCr0Flags::X87);
+    unsafe {
+        x86_64::registers::xcontrol::XCr0::write(flags);
     }
 
     let mut ret: Option<&'static Platform> = None;
