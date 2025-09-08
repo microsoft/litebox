@@ -476,6 +476,13 @@ pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
             elf_load_info.entry_point,
             stack.get_cur_stack_top()
         );
+
+        // load thread local storage (TLS)
+        #[cfg(feature = "platform_lvbs")]
+        unsafe {
+            litebox_common_linux::wrfsbase(crate::loader::DEFAULT_FS_BASE);
+        }
+
         unsafe {
             jump_to_entry_point(
                 cmd.func as u32 as usize,

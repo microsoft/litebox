@@ -1,4 +1,7 @@
 //! Userspace Pointer Abstraction
+//! TODO: All these pointer operations must be aware of the differences between
+//! kernel and user spaces and between VTL0 and VTL1 for
+//! additional sanity checks and extra mode switches (e.g., SMAP/SMEP)
 
 use litebox::platform::{RawConstPointer, RawMutPointer};
 
@@ -11,8 +14,14 @@ pub struct UserConstPtr<T> {
 
 impl<T: Clone> Copy for UserConstPtr<T> {}
 impl<T: Clone> RawConstPointer<T> for UserConstPtr<T> {
-    unsafe fn read_at_offset<'a>(self, _count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
-        todo!()
+    unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
+        // todo!()
+        if self.inner.is_null() || !self.inner.is_aligned() {
+            return None;
+        }
+        Some(alloc::borrow::Cow::Borrowed(unsafe {
+            &*self.inner.offset(count)
+        }))
     }
 
     unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
@@ -56,8 +65,14 @@ pub struct UserMutPtr<T> {
 
 impl<T: Clone> Copy for UserMutPtr<T> {}
 impl<T: Clone> RawConstPointer<T> for UserMutPtr<T> {
-    unsafe fn read_at_offset<'a>(self, _count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
-        todo!()
+    unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
+        // todo!()
+        if self.inner.is_null() || !self.inner.is_aligned() {
+            return None;
+        }
+        Some(alloc::borrow::Cow::Borrowed(unsafe {
+            &*self.inner.offset(count)
+        }))
     }
 
     unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {

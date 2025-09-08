@@ -77,7 +77,7 @@ pub(crate) fn sys_mmap(
     if flags.contains(MapFlags::MAP_ANONYMOUS) {
         do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
     } else {
-        panic!("we don't support file-backed mmap");
+        return Err(Errno::EINVAL);
     }
     .map_err(Errno::from)
 }

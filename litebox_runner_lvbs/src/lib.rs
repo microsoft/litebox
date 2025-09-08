@@ -34,6 +34,11 @@ pub fn init() -> Option<&'static Platform> {
     gdt::init();
     interrupts::init_idt();
     x86_64::instructions::interrupts::enable();
+    let mut flags = x86_64::registers::control::Cr4::read();
+    flags.insert(x86_64::registers::control::Cr4Flags::FSGSBASE);
+    unsafe {
+        x86_64::registers::control::Cr4::write(flags);
+    }
 
     let mut ret: Option<&'static Platform> = None;
 
@@ -155,6 +160,7 @@ const TA_BINARY: &[u8] =
     include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/hello-ta.elf");
 // include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/random-ta.elf");
 // include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/aes-ta.elf");
+// include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/kmpp-ta.elf");
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

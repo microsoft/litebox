@@ -146,6 +146,7 @@ pub fn mshv_vsm_optee_close_session(session_id: usize) -> Result<i64, Errno> {
 
 #[allow(clippy::unnecessary_wraps)]
 fn optee_test() -> Result<i64, Errno> {
+    // open session for other example TAs
     let params = [
         UteeParamOwned::None,
         UteeParamOwned::None,
@@ -154,30 +155,42 @@ fn optee_test() -> Result<i64, Errno> {
     ];
     crate::optee_call(1, UteeEntryFunc::OpenSession, 0, &params);
 
-    // commands for hello world TA
-    let params = [
-        UteeParamOwned::ValueInout {
-            value_a: 100,
-            value_b: 0,
-            out_address: 0,
-        },
-        UteeParamOwned::None,
-        UteeParamOwned::None,
-        UteeParamOwned::None,
-    ];
-    crate::optee_call(1, UteeEntryFunc::InvokeCommand, 0, &params);
+    // open session for the KMPP TA
+    // let params = [
+    //     UteeParamOwned::ValueInput {
+    //         value_a: 1, // session ID
+    //         value_b: 0,
+    //     },
+    //     UteeParamOwned::ValueOutput { out_address: 0 },
+    //     UteeParamOwned::None,
+    //     UteeParamOwned::None,
+    // ];
+    // crate::optee_call(1, UteeEntryFunc::OpenSession, 0, &params);
 
-    let params = [
-        UteeParamOwned::ValueInout {
-            value_a: 200,
-            value_b: 0,
-            out_address: 0,
-        },
-        UteeParamOwned::None,
-        UteeParamOwned::None,
-        UteeParamOwned::None,
-    ];
-    crate::optee_call(1, UteeEntryFunc::InvokeCommand, 1, &params);
+    // commands for hello world TA
+    // let params = [
+    //     UteeParamOwned::ValueInout {
+    //         value_a: 100,
+    //         value_b: 0,
+    //         out_address: 0,
+    //     },
+    //     UteeParamOwned::None,
+    //     UteeParamOwned::None,
+    //     UteeParamOwned::None,
+    // ];
+    // crate::optee_call(1, UteeEntryFunc::InvokeCommand, 0, &params);
+
+    // let params = [
+    //     UteeParamOwned::ValueInout {
+    //         value_a: 200,
+    //         value_b: 0,
+    //         out_address: 0,
+    //     },
+    //     UteeParamOwned::None,
+    //     UteeParamOwned::None,
+    //     UteeParamOwned::None,
+    // ];
+    // crate::optee_call(1, UteeEntryFunc::InvokeCommand, 1, &params);
 
     // command for random TA
     // let params = [
