@@ -64,6 +64,8 @@ pub enum InterceptionBackend {
     Rewriter,
 }
 
+const REQUIRE_RTLD_AUDIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Run Linux programs with LiteBox on unmodified Linux
 ///
 /// # Panics
@@ -205,7 +207,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
-        InterceptionBackend::Rewriter => {}
+        InterceptionBackend::Rewriter => {
+            REQUIRE_RTLD_AUDIT.store(true, core::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     let argv = cli_args
@@ -279,7 +283,9 @@ fn load_program(
         }
     }
     // Enable the audit library to load trampoline code for rewritten binaries.
-    envp.push(c"LD_AUDIT=/lib/litebox_rtld_audit.so".into());
+    if REQUIRE_RTLD_AUDIT.load(core::sync::atomic::Ordering::SeqCst) {
+        envp.push(c"LD_AUDIT=/lib/litebox_rtld_audit.so".into());
+    }
     let loaded_program = litebox_shim_linux::loader::load_program(path, argv, envp, aux).unwrap();
     unsafe {
         trampoline::jump_to_entry_point(loaded_program.entry_point, loaded_program.user_stack_top)
