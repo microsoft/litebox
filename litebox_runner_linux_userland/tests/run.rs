@@ -271,8 +271,7 @@ fn run_which(prog: &str) -> std::path::PathBuf {
 
 #[cfg(target_arch = "x86_64")]
 #[test]
-#[ignore = "unknown issue triggers it to fail on CI and it runs really slowly"]
-fn test_runner_with_nodejs() {
+fn test_node_with_seccomp() {
     const HELLO_WORLD_JS: &str = r"
 const fs = require('node:fs');
 
@@ -291,7 +290,19 @@ console.log(content);
         },
         "hello_node_seccomp",
     );
+}
 
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_node_with_rewriter() {
+    const HELLO_WORLD_JS: &str = r"
+const fs = require('node:fs');
+
+const content = 'Hello World!';
+console.log(content);
+";
+
+    let node_path = run_which("node");
     run_target_program(
         Backend::Rewriter,
         &node_path,
@@ -300,7 +311,7 @@ console.log(content);
             // write the test js file to the output directory
             std::fs::write(out_dir.join("hello_world.js"), HELLO_WORLD_JS).unwrap();
         },
-        "hello_node_seccomp",
+        "hello_node_rewriter",
     );
 }
 
