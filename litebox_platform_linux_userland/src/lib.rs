@@ -50,6 +50,9 @@ pub struct LinuxUserland {
     reserved_pages: Vec<core::ops::Range<usize>>,
     /// The base address of the VDSO.
     vdso_address: Option<usize>,
+    #[cfg(target_arch = "x86")]
+    /// The GDT entry number used for TLS by LiteBox
+    tls_entry_number: AtomicU32,
 }
 
 const IF_NAMESIZE: usize = 16;
@@ -165,6 +168,9 @@ impl LinuxUserland {
             seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages,
             vdso_address,
+            #[cfg(target_arch = "x86")]
+            // u32::MAX (i.e., -1) means not allocated yet
+            tls_entry_number: AtomicU32::new(u32::MAX),
         };
         platform.set_init_tls();
         Box::leak(Box::new(platform))
@@ -310,6 +316,8 @@ impl litebox::platform::ExitProvider for LinuxUserland {
                 seccomp_interception_enabled: _,
             reserved_pages: _,
             vdso_address: _,
+            #[cfg(target_arch = "x86")]
+                tls_entry_number: _,
         } = self;
         // We don't need to explicitly drop this, but doing so clarifies our intent that we want to
         // close it out :). The type itself is re-specified here to make sure we look at this
@@ -557,52 +565,21 @@ impl RawMutex {
             return Err(ImmediatelyWokenUp);
         }
 
-        // Track some initial information.
-        let start = std::time::Instant::now();
-
-        // We'll be looping unless we find a good reason to exit out of the loop, either due to a
-        // wake-up or a time-out. We do a singular (only as a one-off) check for the
-        // immediate-wake-up purely as an optimization, but otherwise, the only way to exit this
-        // loop is to actually hit an `Ok` state out for this function.
-        loop {
-            let remaining_time = match timeout {
-                None => None,
-                Some(timeout) => match timeout.checked_sub(start.elapsed()) {
-                    None => {
-                        break Ok(UnblockedOrTimedOut::TimedOut);
-                    }
-                    Some(remaining_time) => Some(remaining_time),
-                },
-            };
-
-            // We wait on the futex, with a timeout if needed; the timeout is based on how much time
-            // remains to be elapsed.
-            match futex_timeout(
-                &self.inner,
-                FutexOperation::Wait,
-                /* expected value */ val,
-                remaining_time,
-                /* ignored */ None,
-                /* ignored */ 0,
-            ) {
-                Ok(0) => {
-                    return Ok(UnblockedOrTimedOut::Unblocked);
-                }
-                Err(syscalls::Errno::EAGAIN) => {
-                    if self.inner.load(SeqCst) != val {
-                        // Ah, we seem to have actually been immediately woken up! Let us not
-                        // miss this.
-                        return Err(ImmediatelyWokenUp);
-                    }
-                }
-                Err(syscalls::Errno::ETIMEDOUT) => {
-                    return Ok(UnblockedOrTimedOut::TimedOut);
-                }
-                Err(e) => {
-                    panic!("Unexpected errno={e} for FUTEX_WAIT")
-                }
-                _ => unreachable!(),
+        // We wait on the futex, with a timeout if needed
+        match futex_timeout(
+            &self.inner,
+            FutexOperation::Wait,
+            /* expected value */ val,
+            timeout,
+            /* ignored */ None,
+        ) {
+            Ok(0) => Ok(UnblockedOrTimedOut::Unblocked),
+            Err(syscalls::Errno::EAGAIN) => Err(ImmediatelyWokenUp),
+            Err(syscalls::Errno::ETIMEDOUT) => Ok(UnblockedOrTimedOut::TimedOut),
+            Err(e) => {
+                panic!("Unexpected errno={e} for FUTEX_WAIT")
             }
+            _ => unreachable!(),
         }
     }
 }
@@ -622,7 +599,6 @@ impl litebox::platform::RawMutex for RawMutex {
             /* number to wake up */ n,
             /* val2: ignored */ 0,
             /* uaddr2: ignored */ None,
-            /* val3: ignored */ 0,
         )
         .expect("failed to wake up waiters")
     }
@@ -884,22 +860,6 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
             PunchthroughSyscall::SetThreadArea { user_desc } => {
                 set_thread_area(user_desc).map_err(litebox::platform::PunchthroughError::Failure)
             }
-            PunchthroughSyscall::WakeByAddress { addr } => unsafe {
-                syscalls::syscall6(
-                    syscalls::Sysno::futex,
-                    addr.as_usize(),
-                    usize::try_from(FutexOperation::Wake as i32).unwrap(),
-                    1,
-                    0,
-                    0,
-                    0,
-                )
-            }
-            .map_err(|err| match err {
-                syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
-                _ => panic!("unexpected error {err}"),
-            })
-            .map_err(litebox::platform::PunchthroughError::Failure),
         }
     }
 }
@@ -950,7 +910,6 @@ fn futex_timeout(
     val: u32,
     timeout: Option<Duration>,
     uaddr2: Option<&AtomicU32>,
-    val3: u32,
 ) -> Result<usize, syscalls::Errno> {
     let uaddr: *const AtomicU32 = uaddr as _;
     let futex_op: i32 = futex_op as _;
@@ -982,7 +941,9 @@ fn futex_timeout(
                 0 // No timeout
             },
             uaddr2 as usize,
-            val3 as usize,
+            // argument `val3` is ignored for this futex operation;
+            // we reinterpret it as the magic value to pass through the Seccomp filter.
+            syscall_intercept::SYSCALL_ARG_MAGIC,
         )
     }
 }
@@ -994,7 +955,6 @@ fn futex_val2(
     val: u32,
     val2: u32,
     uaddr2: Option<&AtomicU32>,
-    val3: u32,
 ) -> Result<usize, syscalls::Errno> {
     let uaddr: *const AtomicU32 = uaddr as _;
     let futex_op: i32 = futex_op as _;
@@ -1007,7 +967,9 @@ fn futex_val2(
             val as usize,
             val2 as usize,
             uaddr2 as usize,
-            val3 as usize,
+            // argument `val3` is ignored for this futex operation;
+            // we reinterpret it as the magic value to pass through the Seccomp filter.
+            syscall_intercept::SYSCALL_ARG_MAGIC,
         )
     }
 }
@@ -1536,7 +1498,9 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
         flags.set_seg_32bit(true);
         flags.set_useable(true);
         let mut user_desc = litebox_common_linux::UserDesc {
-            entry_number: u32::MAX,
+            entry_number: self
+                .tls_entry_number
+                .load(core::sync::atomic::Ordering::Relaxed),
             base_addr: Box::into_raw(tls) as u32,
             limit: u32::try_from(core::mem::size_of::<Self::ThreadLocalStorage>()).unwrap() - 1,
             flags,
@@ -1546,6 +1510,11 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
         };
         set_thread_area(user_desc_ptr).expect("Failed to set thread area for TLS");
 
+        assert!(user_desc.entry_number <= 0xfff);
+        self.tls_entry_number.store(
+            user_desc.entry_number & 0xfff,
+            core::sync::atomic::Ordering::Relaxed,
+        );
         let new_fs_selector = ((user_desc.entry_number & 0xfff) << 3) | 0x3; // user mode
         Self::set_fs_selector(new_fs_selector.truncate());
     }
