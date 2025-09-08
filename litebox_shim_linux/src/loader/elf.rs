@@ -303,7 +303,7 @@ fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize
             Some(start_addr),
             end_addr - start_addr,
             elf_loader::mmap::ProtFlags::PROT_READ | elf_loader::mmap::ProtFlags::PROT_WRITE,
-            elf_loader::mmap::MapFlags::MAP_PRIVATE | elf_loader::mmap::MapFlags::MAP_FIXED,
+            elf_loader::mmap::MapFlags::MAP_PRIVATE,
             trampoline.file_offset,
             Some(fd),
             &mut need_copy,
