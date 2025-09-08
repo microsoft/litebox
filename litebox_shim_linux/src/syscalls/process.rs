@@ -806,7 +806,7 @@ pub(crate) fn sys_execve(
             true
         };
         unsafe {
-            tls.current_task.page_manager.release_mappings(release);
+            tls.current_task.page_manager.release_memory(release);
         };
     });
 
