@@ -134,7 +134,12 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         }
         let fd = self.litebox.descriptor_table_mut().insert(stream);
         if truncate {
-            self.truncate(&fd)?;
+            // Note: matching Linux behavior, this does not actually perform any truncation, and
+            // instead, it is silently ignored if you attempt to truncate upon opening stdio.
+            assert!(matches!(
+                self.truncate(&fd),
+                Err(TruncateError::IsTerminalDevice)
+            ));
         }
         Ok(fd)
     }
