@@ -419,6 +419,8 @@ fn test_runner_with_tar_source_dir(
             "usr",
             "out",
             "opt",
+            "shared",
+            "etc",
             "Lib",
         ])
         .current_dir(&tar_source_dir)
@@ -492,7 +494,7 @@ fn test_tar_rewriter() {
     test_runner_with_tar_source_dir(
         Backend::Rewriter,
         "python3.hooked",
-        &["/Lib/test/test_bool.py"], // /out/hello.py
+        &["/out/agent.py"], // /out/hello.py
         PathBuf::from(tar_source_dir),
     );
 }
@@ -522,7 +524,7 @@ fn debug_python_tar() {
         program_and_arguments: vec![
             python3_path.to_str().unwrap().to_string(),
             // "/Lib/test/test_bool.py".to_string(),
-            "/out/numpy.py".to_string(), // "/out/hello.py".to_string()
+            "/out/agent.py".to_string(), // "/out/hello.py".to_string()
         ],
         insert_files: vec![],
         initial_files: Some(rootfs_tar),

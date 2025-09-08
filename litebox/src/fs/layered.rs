@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use hashbrown::{HashMap, HashSet};
 
-use crate::LiteBox;
+use crate::{LiteBox};
 use crate::fd::{InternalFd, TypedFd};
 use crate::path::Arg;
 use crate::sync;
