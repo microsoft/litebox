@@ -851,7 +851,7 @@ const UTEE_ENTRY_FUNC_OPEN_SESSION: u32 = 0;
 const UTEE_ENTRY_FUNC_CLOSE_SESSION: u32 = 1;
 const UTEE_ENTRY_FUNC_INVOKE_COMMEND: u32 = 2;
 
-#[derive(Clone, Copy, TryFromPrimitive)]
+#[derive(Clone, Copy, TryFromPrimitive, PartialEq)]
 #[repr(u32)]
 pub enum UteeEntryFunc {
     OpenSession = UTEE_ENTRY_FUNC_OPEN_SESSION,

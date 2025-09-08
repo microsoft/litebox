@@ -231,6 +231,17 @@ fn populate_optee_command_queue(session_id: u32, ta_commands: &[TaCommandBase64]
             TaEntryFunc::InvokeCommand => UteeEntryFunc::InvokeCommand,
         };
 
+        // special handling for the KMPP TA whose `OpenSession` expects the session ID
+        if func_id == UteeEntryFunc::OpenSession
+            && let UteeParamsTyped::ValueInput {
+                ref mut value_a,
+                value_b: _,
+            } = params[0]
+            && *value_a == 0
+        {
+            *value_a = u64::from(session_id);
+        }
+
         submit_optee_command(session_id, func_id, params, ta_command.cmd_id);
     }
 }

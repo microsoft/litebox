@@ -18,7 +18,7 @@
     "args": [
       {
         "param_type": "memref_input",
-        "data_base64": "AwAAAAQAAABKiCTN5GFOs6a+FgXARp22AAgAAAIAAAA="
+        "data_base64": "AwAAAAMAAABKiCTN5GFOs6a+FgXARp22AAgAAAMAAAA="
       },
       {
         "param_type": "memref_output",
@@ -28,11 +28,25 @@
   },
   {
     "func_id": "invoke_command",
-    "cmd_id": 8,
+    "cmd_id": 0,
     "args": [
       {
         "param_type": "memref_input",
-        "data_base64": "AxAAAAgAAABKiCTN5GFOs6a+FgXARp22AAAAAEqIJM3kYU6zpr4WBcBGnbZKiCTN5GFOs6a+FgXARp22IAAAAEqIJM3kYU6zpr4WBcBGnbZKiCTN5GFOs6a+FgXARp22"
+        "data_base64": "AwAAAAAAAABKiCTN5GFOs6a+FgXARp22MC5XVmxXSHpkY2g3OHdzZHhXTUs3V3BpL29VV2s9AAADAAAACAAAABAAAAAgAAAAMAIAAOBmqUlcVsCEWrNU+JMkIeY/Q2sQ797Eu8l116gVkhsxLk2JpoE1ZU5KF9y+SFvipbe0/YPI4EOgK/Y7JhxCIfQq4L2reIxNzkIu434rYw6zzeXGAyM1PXprU3BjLzpWJz68f302oWfiIXxx/uRgC9gKLB9KmuiFG8vI0TW+otyIgDxHAc1cUJZzdoCWWCHHBdqfXivVVx0DxB2+21BwQ6OqCO0wZQZMZ9AT/ZtbHdn5ZFIYZS9lwfPcthh7qyao/kauiwoxI+WKkm08kUnkdf5IsdNvO6zFybNRCZPcrq9w9zVDmk8+Lgq9TR30BmLf0c2NVNkgMRZLphC+7OWYgQpOgEfl7qgn2pl0s6xvaRnoHPyhKPyECSgI8A63gUlFiP1So8Gw0GHsSjm+S8tLo9HGrZsYSlhmK4XybqkDWk97wl4R3JJPjBykEj9+WaWu29I6zrakzn6zCqhNREW/K5lXujD88CUdsyP1kHDkYaFZu9uqgLl9CHLtlkLdC0iflb3TXfwDa/ur09QPuOwiLg3k0D42emYFx9Ags+qGhGESgcDl0oG7zPizgmNOckWFfq8wQFz9JATR+WSx/0AHrkEVAJwaaWtFyhg5i7SBKcsJKqdyiHOkn55sNV+Ci/J8SgfzGqs5bK+h1PdxbLCOl6eNy2j29dVMB2d1anyAJlcVKVfu5LdI4dnNUdvj4bzhbmOhRd1RfJCq18qr1/xyakfgBvNSvo39WsxQhP5Oa8bAVI6WwoiYRm/gSgnRG868KjzddAqO1DJypVJLWLjHiL3xt4ZkjiasKkdCspfCdgzoYBh+kIcFnIA="
+      },
+      {
+        "param_type": "memref_output",
+        "buffer_size": 1024
+      }
+    ]
+  },
+  {
+    "func_id": "invoke_command",
+    "cmd_id": 3,
+    "args": [
+      {
+        "param_type": "memref_input",
+        "data_base64": "AwAAAAMAAABKiCTN5GFOs6a+FgXARp22AAAAAOWEw4MCAAAABgAAAAADAAAoAAAAAAAAAKACAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
       },
       {
         "param_type": "memref_output",
