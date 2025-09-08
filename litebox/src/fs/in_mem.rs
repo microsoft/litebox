@@ -321,6 +321,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             file.data[start..end].copy_from_slice(&buf[..first_half_len]);
             first_half_len
         } else {
+            if *position > file.data.len() {
+                // Need to pad with 0s because position was past the end of the file
+                file.data.resize(*position, 0);
+            }
             0
         };
         file.data.extend(&buf[start..]);
