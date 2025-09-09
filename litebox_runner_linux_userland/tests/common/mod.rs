@@ -23,6 +23,7 @@ pub fn find_dependencies(prog: &str) -> Vec<String> {
             let right = line[idx + 2..].trim();
             // Skip "not found"
             if right.starts_with("not found") {
+                println!("Warning: dependency not found: {line}");
                 continue;
             }
             // Extract token before whitespace or '('
