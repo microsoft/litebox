@@ -747,6 +747,7 @@ impl<
             EntryX::Tombstone => unreachable!(),
         }
         // Change it to an upper-level file, also altering the file descriptor.
+        drop(entry);
         match self.migrate_file_up(&path) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
