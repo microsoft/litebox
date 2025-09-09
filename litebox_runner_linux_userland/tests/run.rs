@@ -242,6 +242,7 @@ fn test_static_exec_with_rewriter() {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn test_dynamic_lib_with_seccomp() {
     for path in find_c_test_files("./tests") {

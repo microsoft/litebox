@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 /// Find all dependencies of a given binary via `ldd`
+#[allow(dead_code, reason = "not used by loader.rs for x86")]
 pub fn find_dependencies(prog: &str) -> Vec<String> {
     let output = std::process::Command::new("ldd")
         .arg(prog)

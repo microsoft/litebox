@@ -156,6 +156,7 @@ fn test_load_exec_common(executable_path: &str) {
     unsafe { trampoline(info.entry_point, info.user_stack_top) };
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn test_load_exec_dynamic() {
     let path = common::compile("./tests/hello.c", "hello_dylib", false, false);
@@ -179,6 +180,7 @@ fn test_load_exec_dynamic() {
     test_load_exec_common(executable_path);
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn test_load_exec_static() {
     let path = common::compile("./tests/hello.c", "hello_exec", true, false);
