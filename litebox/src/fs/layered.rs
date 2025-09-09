@@ -387,7 +387,6 @@ impl<
                     return Err(OpenError::AlreadyExists);
                 }
             } else {
-                // Normal O_CREAT behavior: try to open existing file first
                 // We must first attempt to open the file _without_ creating it, and only if that fails,
                 // do we fall-through and end up creating it (which will happen on the upper layer).
                 if let Ok(fd) = self.open(path.as_str(), flags - OFlags::CREAT, mode) {
