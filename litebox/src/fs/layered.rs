@@ -514,6 +514,19 @@ impl<
                     // None of these can be handled by lower level, just quit out early
                     return Err(e);
                 }
+                OpenError::PathError(PathError::MissingComponent)
+                    if flags.contains(OFlags::CREAT) =>
+                {
+                    // We must check if the lower layer contains all the directories; if it does, we
+                    // can create the same directories and then re-trigger the open.
+                    let dirname = path.rsplit_once('/').unwrap().0;
+                    if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
+                        // We must migrate the directories above, and then re-trigger the open
+                        self.mkdir_migrating_ancestor_dirs(&path).unwrap();
+                        return self.open(path, flags, mode);
+                    }
+                    // Otherwise, handle-able by a lower level, fallthrough
+                }
                 OpenError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                 ) => {
