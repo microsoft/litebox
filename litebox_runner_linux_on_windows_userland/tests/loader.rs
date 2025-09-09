@@ -422,7 +422,7 @@ fn test_runner_with_tar_source_dir(target: &str, cmd_args: &[&str], tar_name: &s
 #[test]
 fn test_tar_rewriter() {
     test_runner_with_tar_source_dir(
-        "python3.hooked",
+        "python3-linux.elf",
         &["/out/agent.py"],
         "rootfs_python_rewriter.tar",
     );
