@@ -226,6 +226,12 @@ pub fn sys_lseek(fd: i32, offset: isize, whence: i32) -> Result<usize, Errno> {
     }
 }
 
+/// Handle syscall `mkdir`
+pub fn sys_mkdir(pathname: impl path::Arg, mode: u32) -> Result<(), Errno> {
+    let mode = Mode::from_bits_retain(mode);
+    litebox_fs().mkdir(pathname, mode).map_err(Errno::from)
+}
+
 fn do_close(desc: Descriptor) -> Result<(), Errno> {
     match desc {
         Descriptor::File(file) => litebox_fs().close(file).map_err(Errno::from),
