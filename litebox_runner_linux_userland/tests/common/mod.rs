@@ -1,104 +1,62 @@
-use std::{arch::global_asm, ffi::CString};
+use std::path::PathBuf;
 
-use litebox::{
-    LiteBox,
-    fs::{FileSystem as _, Mode, OFlags},
-    platform::SystemInfoProvider as _,
-};
-use litebox_platform_multiplex::{Platform, set_platform};
-use litebox_shim_linux::{litebox_fs, loader::load_program, set_fs};
+/// Find all dependencies of a given binary via `ldd`
+#[allow(dead_code, reason = "not used by loader.rs for x86")]
+pub fn find_dependencies(prog: &str) -> Vec<String> {
+    let output = std::process::Command::new("ldd")
+        .arg(prog)
+        .output()
+        .expect("Failed to execute ldd");
 
-#[cfg(target_arch = "x86_64")]
-global_asm!(
-    "
-    .text
-    .align	4
-    .globl	trampoline
-    .type	trampoline,@function
-trampoline:
-    xor rdx, rdx
-    mov	rsp, rsi
-    jmp	rdi
-    /* Should not reach. */
-    hlt"
-);
-#[cfg(target_arch = "x86")]
-global_asm!(
-    "
-    .text
-    .align  4
-    .globl  trampoline
-    .type   trampoline,@function
-trampoline:
-    xor     edx, edx
-    mov     ebx, [esp + 4]
-    mov     eax, [esp + 8]
-    mov     esp, eax
-    jmp     ebx
-    /* Should not reach. */
-    hlt"
-);
+    let dependencies = String::from_utf8_lossy(&output.stdout);
+    println!("Dependencies:\n{dependencies}");
 
-unsafe extern "C" {
-    fn trampoline(entry: usize, sp: usize) -> !;
-}
+    let mut paths = Vec::new();
 
-pub fn init_platform(
-    tar_data: &'static [u8],
-    initial_dirs: &[&str],
-    initial_files: &[&str],
-    tun_device_name: Option<&str>,
-    enable_syscall_interception: bool,
-) {
-    let platform = Platform::new(tun_device_name);
-    set_platform(platform);
-    let platform = litebox_platform_multiplex::platform();
-    let litebox = LiteBox::new(platform);
+    for line in dependencies.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
 
-    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(&litebox);
-    in_mem_fs.with_root_privileges(|fs| {
-        fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-            .expect("Failed to set permissions on root");
-    });
-    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&litebox);
-    let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(
-        &litebox,
-        if tar_data.is_empty() {
-            litebox::fs::tar_ro::empty_tar_file().into()
+        if let Some(idx) = line.find("=>") {
+            // Format: "libc.so.6 => /lib/.../libc.so.6 (0x...)"
+            let right = line[idx + 2..].trim();
+            // Skip "not found"
+            if right.starts_with("not found") {
+                println!("Warning: dependency not found: {line}");
+                continue;
+            }
+            // Extract token before whitespace or '('
+            if let Some(token) = right.split_whitespace().next()
+                && token.starts_with('/')
+            {
+                paths.push(token.to_string());
+            } else {
+                println!("Warning: unexpected ldd output line: {line}");
+            }
         } else {
-            tar_data.into()
-        },
-    );
-    set_fs(litebox::fs::layered::FileSystem::new(
-        &litebox,
-        in_mem_fs,
-        litebox::fs::layered::FileSystem::new(
-            &litebox,
-            dev_stdio,
-            tar_ro_fs,
-            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
-        ),
-        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
-    ));
-
-    for each in initial_dirs {
-        install_dir(each);
-    }
-    for each in initial_files {
-        let data = std::fs::read(each).unwrap();
-        install_file(data, each);
+            // Format: "/lib64/ld-linux-x86-64.so.2 (0x...)" or "linux-vdso.so.1 (0x...)"
+            if let Some(token) = line.split_whitespace().next()
+                && token.starts_with('/')
+            {
+                paths.push(token.to_string());
+            }
+        }
     }
 
-    platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
+    println!("Resolved dependency paths: {paths:?}");
 
-    if enable_syscall_interception {
-        platform.enable_seccomp_based_syscall_interception();
-    }
+    paths
 }
 
 /// Compile C code into an executable
-pub fn compile(input: &str, output: &str, exec_or_lib: bool, nolibc: bool) {
-    let mut args = vec!["-o", output, input];
+pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: bool) -> PathBuf {
+    let dir_path = std::env::var("OUT_DIR").unwrap();
+    let path = std::path::Path::new(dir_path.as_str()).join(unique_name);
+    let output = path.to_str().unwrap();
+
+    let mut args = vec!["-o", output, src_path];
     if exec_or_lib {
         args.push("-static");
     }
@@ -113,68 +71,11 @@ pub fn compile(input: &str, output: &str, exec_or_lib: bool, nolibc: bool) {
     let output = std::process::Command::new("gcc")
         .args(args)
         .output()
-        .expect("Failed to compile hello.c");
+        .expect("Failed to compile");
     assert!(
         output.status.success(),
-        "failed to compile hello.c {:?}",
+        "failed to compile: {:?}",
         std::str::from_utf8(output.stderr.as_slice()).unwrap()
     );
-}
-
-pub fn install_dir(path: &str) {
-    litebox_fs()
-        .mkdir(path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
-        .expect("Failed to create directory");
-}
-
-pub fn install_file(contents: Vec<u8>, out: &str) {
-    let fd = litebox_fs()
-        .open(
-            out,
-            OFlags::CREAT | OFlags::WRONLY,
-            Mode::RWXG | Mode::RWXO | Mode::RWXU,
-        )
-        .unwrap();
-    litebox_fs().write(&fd, &contents, None).unwrap();
-    litebox_fs().close(fd).unwrap();
-}
-
-pub fn test_load_exec_common(executable_path: &str) {
-    let argv = vec![
-        CString::new(executable_path).unwrap(),
-        CString::new("hello").unwrap(),
-    ];
-    let envp = vec![
-        CString::new("PATH=/bin").unwrap(),
-        CString::new("HOME=/").unwrap(),
-    ];
-    let mut aux = litebox_shim_linux::loader::auxv::init_auxv();
-    if litebox_platform_multiplex::platform()
-        .get_vdso_address()
-        .is_none()
-    {
-        // Due to restrict permissions in CI, we cannot read `/proc/self/maps`.
-        // To pass CI, we rely on `getauxval` (which we should avoid #142) to get the VDSO
-        // address when failing to read `/proc/self/maps`.
-        #[cfg(target_arch = "x86_64")]
-        {
-            let vdso_address = unsafe { libc::getauxval(libc::AT_SYSINFO_EHDR) };
-            aux.insert(
-                litebox_shim_linux::loader::auxv::AuxKey::AT_SYSINFO_EHDR,
-                usize::try_from(vdso_address).unwrap(),
-            );
-        }
-        #[cfg(target_arch = "x86")]
-        {
-            // AT_SYSINFO = 32
-            let vdso_address = unsafe { libc::getauxval(32) };
-            aux.insert(
-                litebox_shim_linux::loader::auxv::AuxKey::AT_SYSINFO,
-                usize::try_from(vdso_address).unwrap(),
-            );
-        }
-    }
-    let info = load_program(executable_path, argv, envp, aux).unwrap();
-
-    unsafe { trampoline(info.entry_point, info.user_stack_top) };
+    path
 }
