@@ -144,6 +144,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::WRONLY
             | OFlags::RDWR
             | OFlags::NOCTTY
+            | OFlags::EXCL
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK;
         if flags.intersects(currently_supported_oflags.complement()) {
@@ -154,6 +155,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             let mut root = self.root.write();
             let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
             if let Some(entry) = entry {
+                if flags.contains(OFlags::EXCL) {
+                    return Err(OpenError::AlreadyExists);
+                }
                 entry
             } else {
                 let Some((_, parent)) = parent else {

@@ -150,11 +150,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let currently_supported_oflags: OFlags = OFlags::RDONLY
             | OFlags::WRONLY
             | OFlags::RDWR
+            | OFlags::CREAT
+            | OFlags::EXCL
             | OFlags::NOCTTY
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!()
+        }
+        if flags.contains(OFlags::CREAT) {
+            return Err(OpenError::ReadOnlyFileSystem);
         }
         let path = self.absolute_path(path)?;
         if path.is_empty() {

@@ -127,6 +127,7 @@ impl From<litebox::fs::errors::OpenError> for Errno {
             litebox::fs::errors::OpenError::NoWritePerms => Errno::EACCES,
             litebox::fs::errors::OpenError::PathError(path_error) => path_error.into(),
             litebox::fs::errors::OpenError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::OpenError::AlreadyExists => Errno::EEXIST,
             _ => unimplemented!(),
         }
     }
