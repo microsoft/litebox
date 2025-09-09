@@ -1206,6 +1206,103 @@ mod layered {
         names.sort_unstable();
         assert_eq!(names, vec![".", ".."]);
     }
+
+    #[test]
+    fn file_creation_with_ancestor_dir_migration() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod / in upper layer");
+        });
+
+        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Open bar/test for writing (where bar exists in lower layer but test doesn't exist)
+        // This should create ancestor directories and allow file creation
+        let fd = fs
+            .open("bar/test", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to open bar/test for writing");
+
+        // Write data to the file
+        let data = b"Hello from nested file!";
+        fs.write(&fd, data, None)
+            .expect("Failed to write to bar/test");
+        fs.close(fd).expect("Failed to close file");
+
+        // Read the file back
+        let fd = fs
+            .open("bar/test", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open bar/test for reading");
+        let mut buffer = vec![0; 1024];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from bar/test");
+        assert_eq!(&buffer[..bytes_read], data);
+        fs.close(fd).expect("Failed to close file");
+
+        // Verify the file exists and has correct type
+        let stat = fs
+            .file_status("bar/test")
+            .expect("Failed to get status of bar/test");
+        assert_eq!(stat.file_type, FileType::RegularFile);
+    }
+
+    #[test]
+    fn file_modification_with_ancestor_dir_migration() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod / in upper layer");
+        });
+
+        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Open bar/baz for writing (both bar and baz exist in lower layer)
+        // This should migrate ancestor directories and allow file modification
+        let fd = fs
+            .open("bar/baz", OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to open bar/baz for writing");
+
+        // Write new data to the file (overwriting existing content)
+        let data = b"Modified content!";
+        fs.write(&fd, data, None)
+            .expect("Failed to write to bar/baz");
+        fs.close(fd).expect("Failed to close file");
+
+        // Read the file back to verify it was modified
+        let fd = fs
+            .open("bar/baz", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open bar/baz for reading");
+        let mut buffer = vec![0; 1024];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from bar/baz");
+
+        assert_eq!(&buffer[..bytes_read], data);
+        fs.close(fd).expect("Failed to close file");
+
+        // Verify the file still exists and has correct type
+        let stat = fs
+            .file_status("bar/baz")
+            .expect("Failed to get status of bar/baz");
+        assert_eq!(stat.file_type, FileType::RegularFile);
+    }
 }
 
 mod stdio {

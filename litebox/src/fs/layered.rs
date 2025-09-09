@@ -101,6 +101,67 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         }
     }
 
+    /// (private-only) Create all parent/ancestor directories for a `path`, making sure that each of
+    /// these exist in the lower layer. It does _not_ set up `path` itself on the upper layer
+    /// though; this is left to the callee to handle.
+    ///
+    /// NOTE: This is _not_ equivalent to running `mkdir -p {path}` or `mkdir {path}` or anything
+    /// like that.
+    fn mkdir_migrating_ancestor_dirs(&self, path: &str) -> Result<(), MkdirError> {
+        let path = self.absolute_path(path)?;
+        for dir in path.increasing_ancestors().map_err(PathError::from)? {
+            if dir == path {
+                return Ok(());
+            }
+            match self.ensure_lower_contains(dir) {
+                Ok(FileType::Directory) => {
+                    // The dir does in fact exist; we just need to confirm that the upper layer also
+                    // has it.
+                    match self
+                        .upper
+                        .mkdir(dir, self.lower.file_status(dir).unwrap().mode)
+                    {
+                        Ok(()) => {
+                            // fallthrough to next increasing ancestor
+                        }
+                        Err(e) => match e {
+                            MkdirError::AlreadyExists => {
+                                // perfectly fine, just fallthrough to next place in the loop
+                            }
+                            MkdirError::ReadOnlyFileSystem
+                            | MkdirError::NoWritePerms
+                            | MkdirError::PathError(
+                                PathError::ComponentNotADirectory
+                                | PathError::InvalidPathname
+                                | PathError::NoSearchPerms { .. },
+                            ) => {
+                                return Err(e);
+                            }
+                            MkdirError::PathError(
+                                PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                            ) => {
+                                unreachable!()
+                            }
+                        },
+                    }
+                }
+                Ok(FileType::RegularFile | FileType::CharacterDevice)
+                | Err(PathError::MissingComponent) => unreachable!(),
+                Err(PathError::ComponentNotADirectory) => unimplemented!(),
+                Err(PathError::InvalidPathname) => unreachable!("we just confirmed valid path"),
+                Err(e @ PathError::NoSearchPerms { .. }) => {
+                    return Err(e)?;
+                }
+                Err(PathError::NoSuchFileOrDirectory) => {
+                    assert_ne!(dir, path);
+                    return Err(PathError::MissingComponent)?;
+                }
+            }
+        }
+        // The loop above should return at one of its return points
+        unreachable!()
+    }
+
     /// (private-only) Migrate a file from lower to upper layer
     ///
     /// It performs a check to make sure that the lower level has the file, and if the lower-level
@@ -153,7 +214,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         // We are here the first time around, and did not error out, yay! We can
                         // actually open up the file.
                         //
-                        // TODO: We might need to make all the parent directories?
+                        // First, we make sure we've set up the ancestor directories.
+                        match self.mkdir_migrating_ancestor_dirs(path) {
+                            Ok(()) => {}
+                            Err(e) => unimplemented!("{e} when setting up ancestor dirs"),
+                        }
+                        // Now we can actually open the file.
                         upper_fd = Some(
                             self.upper
                                 .open(
@@ -460,6 +526,19 @@ impl<
                     // None of these can be handled by lower level, just quit out early
                     return Err(e);
                 }
+                OpenError::PathError(PathError::MissingComponent)
+                    if flags.contains(OFlags::CREAT) =>
+                {
+                    // We must check if the lower layer contains all the directories; if it does, we
+                    // can create the same directories and then re-trigger the open.
+                    let dirname = path.rsplit_once('/').unwrap().0;
+                    if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
+                        // We must migrate the directories above, and then re-trigger the open
+                        self.mkdir_migrating_ancestor_dirs(&path).unwrap();
+                        return self.open(path, flags, mode);
+                    }
+                    // Otherwise, handle-able by a lower level, fallthrough
+                }
                 OpenError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                 ) => {
@@ -693,6 +772,7 @@ impl<
             EntryX::Tombstone => unreachable!(),
         }
         // Change it to an upper-level file, also altering the file descriptor.
+        drop(entry);
         match self.migrate_file_up(&path) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
@@ -890,60 +970,9 @@ impl<
         // We know that at least one of the components is missing. We should check each of the
         // components individually, making directories for any components that already exist at the
         // lower layer, and erroring out if no lower layer component exists of that form.
-        for dir in path.increasing_ancestors().map_err(PathError::from)? {
-            match self.ensure_lower_contains(dir) {
-                Ok(FileType::Directory) => {
-                    // The dir does in fact exist; we just need to confirm that the upper layer also
-                    // has it.
-                    match self
-                        .upper
-                        .mkdir(dir, self.lower.file_status(dir).unwrap().mode)
-                    {
-                        Ok(()) => {
-                            // fallthrough to next increasing ancestor
-                        }
-                        Err(e) => match e {
-                            MkdirError::AlreadyExists => {
-                                // perfectly fine, just fallthrough to next place in the loop
-                            }
-                            MkdirError::ReadOnlyFileSystem
-                            | MkdirError::NoWritePerms
-                            | MkdirError::PathError(
-                                PathError::ComponentNotADirectory
-                                | PathError::InvalidPathname
-                                | PathError::NoSearchPerms { .. },
-                            ) => {
-                                return Err(e);
-                            }
-                            MkdirError::PathError(
-                                PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
-                            ) => {
-                                unreachable!()
-                            }
-                        },
-                    }
-                }
-                Ok(FileType::RegularFile | FileType::CharacterDevice)
-                | Err(PathError::MissingComponent) => unreachable!(),
-                Err(PathError::ComponentNotADirectory) => unimplemented!(),
-                Err(PathError::InvalidPathname) => unreachable!("we just confirmed valid path"),
-                Err(e @ PathError::NoSearchPerms { .. }) => {
-                    return Err(e)?;
-                }
-                Err(PathError::NoSuchFileOrDirectory) => {
-                    // This is possibly the missing component; if it is same as the path itself,
-                    // then it just needs its mkdir at the upper level; otherwise it is a true
-                    // missing component.
-                    if dir != path {
-                        return Err(PathError::MissingComponent)?;
-                    }
-                    return self.upper.mkdir(&*path, mode);
-                }
-            }
-        }
-        // The last round of the loop should guarantee upper-directory creation if needed, so it
-        // should be impossible for us to actually reach here.
-        unreachable!()
+        self.mkdir_migrating_ancestor_dirs(&path)?;
+        // And then now we can make the upper directory.
+        self.upper.mkdir(path, mode)
     }
 
     #[expect(unused_variables, reason = "unimplemented")]
