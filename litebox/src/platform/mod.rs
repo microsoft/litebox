@@ -24,7 +24,7 @@ macro_rules! log_println {
     ($platform:expr, $($tt:tt)*) => {{
         use core::fmt::Write as _;
         use $crate::platform::DebugLogProvider as _;
-        let mut t: arrayvec::ArrayString<4096> = arrayvec::ArrayString::new();
+        let mut t: arrayvec::ArrayString<8192> = arrayvec::ArrayString::new();
         writeln!(t, $($tt)*).unwrap();
         $platform.debug_log_print(&t);
     }};
