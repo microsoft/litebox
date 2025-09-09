@@ -359,8 +359,7 @@ fn test_testcase_dynamic_with_rewriter() {
 #[allow(clippy::too_many_lines)]
 // Assume we have every needed files (including audit_rtld.so, and all libs) in a tar_source directory A/
 fn test_runner_with_tar_source_dir(target: &str, cmd_args: &[&str], tar_name: &str) -> Vec<u8> {
-    let backend_str = "rewriter";
-
+    // let backend_str = "rewriter";
     // Use the already compiled executable from the tests folder (same dir as this file)
     let test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
@@ -424,7 +423,7 @@ fn test_runner_with_tar_source_dir(target: &str, cmd_args: &[&str], tar_name: &s
 fn test_tar_rewriter() {
     test_runner_with_tar_source_dir(
         "python3.hooked",
-        &["/out/hello.py"],
+        &["/out/agent.py"],
         "rootfs_python_rewriter.tar",
     );
 }
