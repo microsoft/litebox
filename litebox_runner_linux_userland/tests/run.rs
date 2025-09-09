@@ -174,15 +174,6 @@ fn run_target_program(
         "--initial-files",
         tar_file.to_str().unwrap(),
     ];
-    match backend {
-        Backend::Rewriter => {
-            args.push("--env");
-            args.push("LD_AUDIT=/lib/litebox_rtld_audit.so");
-        }
-        Backend::Seccomp => {
-            // No need to set LD_AUDIT for seccomp backend
-        }
-    }
     args.push(path.to_str().unwrap());
     args.extend_from_slice(cmd_args);
     println!("Running `cargo {}`", args.join(" "));
