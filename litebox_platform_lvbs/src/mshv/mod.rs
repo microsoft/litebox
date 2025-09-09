@@ -118,7 +118,7 @@ pub const VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE: u32 = 0x1_ffea;
 pub const VSM_VTL_CALL_FUNC_ID_PATCH_TEXT: u32 = 0x1_ffeb;
 
 // This VSM function ID for OP-TEE messages is subject to change
-pub const VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE: u32 = 0x1f_ffff;
+pub const VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE: u32 = 0x1_fff0;
 
 /// VSM Functions
 #[derive(Debug, PartialEq, TryFromPrimitive)]

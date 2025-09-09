@@ -30,7 +30,6 @@ pub enum OpteeMessageCommand {
     UnregisterShm = OPTEE_MSG_CMD_UNREGISTER_SHM,
     DoBottomHalf = OPTEE_MSG_CMD_DO_BOTTOM_HALF,
     StopAsyncNotif = OPTEE_MSG_CMD_STOP_ASYNC_NOTIF,
-    Unknown = 0xffff_ffff,
 }
 
 /// Temporary reference memory parameter
@@ -339,4 +338,255 @@ pub fn optee_msg_cmd_dispatch(_msg_cmd_id: OpteeMessageCommand, _params: &[u64])
         Err(errno) => errno.as_neg().into(),
     }
     */
+}
+
+/// OP-TEE SMC call arguments. OP-TEE assumes that the underlying architecture is Arm with TrustZone.
+/// This is why it uses SMC calling convention (SMCCC). We need to translate this into VTL switch convention.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct OpteeSmcArgs {
+    args: [usize; NUM_OPTEE_SMC_ARGS],
+}
+const NUM_OPTEE_SMC_ARGS: usize = 9;
+
+impl OpteeSmcArgs {
+    #[expect(dead_code)]
+    pub fn arg_index(&self, index: usize) -> usize {
+        match index {
+            0..8 => self.args[index],
+            _ => panic!("BUG: Invalid OPTEE SMC argument index: {}", index),
+        }
+    }
+
+    pub fn func_id(&self) -> Result<OpteeSmcFunction, Errno> {
+        OpteeSmcFunction::try_from(self.args[0] & 0xffff).map_err(|_| Errno::EINVAL)
+    }
+
+    pub fn set_result(&mut self, result: &OpteeSmcResult) {
+        match result {
+            OpteeSmcResult::Generic { status } => {
+                self.args[0] = *status as usize;
+            }
+            OpteeSmcResult::ExchangeCapabilities {
+                status,
+                capabilities,
+                max_notif_value,
+                data,
+            } => {
+                self.args[0] = *status as usize;
+                self.args[1] = *capabilities;
+                self.args[2] = *max_notif_value;
+                self.args[3] = *data;
+            }
+            OpteeSmcResult::Uuid { data } => {
+                self.args[0] = usize::try_from(data[0]).unwrap();
+                self.args[1] = usize::try_from(data[1]).unwrap();
+                self.args[2] = usize::try_from(data[2]).unwrap();
+                self.args[3] = usize::try_from(data[3]).unwrap();
+            }
+            OpteeSmcResult::Revision { major, minor } => {
+                self.args[0] = *major;
+                self.args[1] = *minor;
+            }
+            OpteeSmcResult::OsRevision {
+                major,
+                minor,
+                build_id,
+            } => {
+                self.args[0] = *major;
+                self.args[1] = *minor;
+                self.args[2] = *build_id;
+            }
+            OpteeSmcResult::DisableShmCache {
+                status,
+                shm_upper32,
+                shm_lower32,
+            } => {
+                self.args[0] = *status as usize;
+                self.args[1] = *shm_upper32;
+                self.args[2] = *shm_lower32;
+            }
+        }
+    }
+}
+
+const OPTEE_SMC_FUNCID_GET_OS_REVISION: usize = 0x1;
+const OPTEE_SMC_FUNCID_CALL_WITH_ARG: usize = 0x4;
+const OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES: usize = 0x9;
+const OPTEE_SMC_FUNCID_DISABLE_SHM_CACHE: usize = 0xa;
+
+const OPTEE_SMC_FUNCID_CALLS_UID: usize = 0xff01;
+const OPTEE_SMC_FUNCID_CALLS_REVISION: usize = 0xff03;
+
+#[derive(PartialEq, TryFromPrimitive)]
+#[repr(usize)]
+pub enum OpteeSmcFunction {
+    GetOsRevision = OPTEE_SMC_FUNCID_GET_OS_REVISION,
+    CallWithArg = OPTEE_SMC_FUNCID_CALL_WITH_ARG,
+    ExchangeCapabilities = OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES,
+    DisableShmCache = OPTEE_SMC_FUNCID_DISABLE_SHM_CACHE,
+    CallsUid = OPTEE_SMC_FUNCID_CALLS_UID,
+    CallsRevision = OPTEE_SMC_FUNCID_CALLS_REVISION,
+}
+
+pub enum OpteeSmcResult {
+    Generic {
+        status: OpteeSmcReturn,
+    },
+    ExchangeCapabilities {
+        status: OpteeSmcReturn,
+        capabilities: usize,
+        max_notif_value: usize,
+        data: usize,
+    },
+    Uuid {
+        data: [u32; 4],
+    },
+    Revision {
+        major: usize,
+        minor: usize,
+    },
+    OsRevision {
+        major: usize,
+        minor: usize,
+        build_id: usize,
+    },
+    DisableShmCache {
+        status: OpteeSmcReturn,
+        shm_upper32: usize,
+        shm_lower32: usize,
+    },
+}
+
+bitflags::bitflags! {
+    #[derive(PartialEq, Clone, Copy)]
+    pub struct OpteeSecureWorldCapabilities: usize {
+        const HAVE_RESERVED_SHM = 1 << 0;
+        const UNREGISTERED_SHM = 1 << 1;
+        const DYNAMIC_SHM = 1 << 2;
+        const MEMREF_NULL = 1 << 4;
+        const RPC_ARG = 1 << 6;
+    }
+}
+
+const OPTEE_MSG_REVISION_MAJOR: usize = 2;
+const OPTEE_MSG_REVISION_MINOR: usize = 0;
+
+const NUM_RPC_PARAMS: usize = 4;
+
+const OPTEE_MSG_UID_0: u32 = 0x384f_b3e0;
+const OPTEE_MSG_UID_1: u32 = 0xe7f8_11e3;
+const OPTEE_MSG_UID_2: u32 = 0xaf63_0002;
+const OPTEE_MSG_UID_3: u32 = 0xa5d5_c51b;
+
+const OPTEE_SMC_RETURN_OK: usize = 0x0;
+const OPTEE_SMC_RETURN_ETHREAD_LIMIT: usize = 0x1;
+const OPTEE_SMC_RETURN_EBUSY: usize = 0x2;
+const OPTEE_SMC_RETURN_ERESUME: usize = 0x3;
+const OPTEE_SMC_RETURN_EBADADDR: usize = 0x4;
+const OPTEE_SMC_RETURN_EBADCMD: usize = 0x5;
+const OPTEE_SMC_RETURN_ENOMEM: usize = 0x6;
+const OPTEE_SMC_RETURN_ENOTAVAIL: usize = 0x7;
+// OPTEE_SMC_RETURN_IS_RPC()
+
+#[derive(Copy, Clone, PartialEq, TryFromPrimitive)]
+#[repr(usize)]
+pub enum OpteeSmcReturn {
+    Ok = OPTEE_SMC_RETURN_OK,
+    EThreadLimit = OPTEE_SMC_RETURN_ETHREAD_LIMIT,
+    EBusy = OPTEE_SMC_RETURN_EBUSY,
+    EResume = OPTEE_SMC_RETURN_ERESUME,
+    EBadAddr = OPTEE_SMC_RETURN_EBADADDR,
+    EBadCmd = OPTEE_SMC_RETURN_EBADCMD,
+    ENomem = OPTEE_SMC_RETURN_ENOMEM,
+    ENotAvail = OPTEE_SMC_RETURN_ENOTAVAIL,
+}
+
+#[allow(clippy::unnecessary_wraps)]
+pub fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
+    if let Ok(optee_smc_args_page_addr) =
+        x86_64::PhysAddr::try_new(optee_smc_args_pfn << crate::mshv::vtl1_mem_layout::PAGE_SHIFT)
+        && let Some(mut optee_smc_args) = unsafe {
+            crate::platform_low().copy_from_vtl0_phys::<OpteeSmcArgs>(optee_smc_args_page_addr)
+        }
+    {
+        match optee_smc_args.func_id() {
+            Ok(func_id) => match func_id {
+                OpteeSmcFunction::CallWithArg => {
+                    debug_serial_println!(
+                        "OP-TEE SMC SMC function ID: CallWithArg. 2nd argument would contain OpteeMsgArg"
+                    );
+                    optee_smc_args.set_result(&OpteeSmcResult::Generic {
+                        status: OpteeSmcReturn::Ok,
+                    });
+                }
+                OpteeSmcFunction::ExchangeCapabilities => {
+                    debug_serial_println!("OP-TEE SMC function ID: ExchangeCapabilities");
+                    optee_smc_args.set_result(&OpteeSmcResult::ExchangeCapabilities {
+                        status: OpteeSmcReturn::Ok,
+                        capabilities: (OpteeSecureWorldCapabilities::DYNAMIC_SHM
+                            | OpteeSecureWorldCapabilities::MEMREF_NULL
+                            | OpteeSecureWorldCapabilities::RPC_ARG)
+                            .bits(),
+                        max_notif_value: 0,
+                        data: NUM_RPC_PARAMS,
+                    });
+                }
+                OpteeSmcFunction::DisableShmCache => {
+                    debug_serial_println!("OP-TEE SMC function ID: DisableShmCache");
+                    optee_smc_args.set_result(&OpteeSmcResult::DisableShmCache {
+                        status: OpteeSmcReturn::ENotAvail,
+                        shm_upper32: 0,
+                        shm_lower32: 0,
+                    });
+                }
+                OpteeSmcFunction::CallsUid => {
+                    debug_serial_println!("OP-TEE SMC function ID: CallsUid");
+                    optee_smc_args.set_result(&OpteeSmcResult::Uuid {
+                        data: [
+                            OPTEE_MSG_UID_0,
+                            OPTEE_MSG_UID_1,
+                            OPTEE_MSG_UID_2,
+                            OPTEE_MSG_UID_3,
+                        ],
+                    });
+                }
+                OpteeSmcFunction::GetOsRevision => {
+                    debug_serial_println!("OP-TEE SMC function ID: GetOsRevision");
+                    optee_smc_args.set_result(&OpteeSmcResult::OsRevision {
+                        major: OPTEE_MSG_REVISION_MAJOR,
+                        minor: OPTEE_MSG_REVISION_MINOR,
+                        build_id: 0,
+                    });
+                }
+                OpteeSmcFunction::CallsRevision => {
+                    debug_serial_println!("OP-TEE SMC function ID: CallsRevision");
+                    optee_smc_args.set_result(&OpteeSmcResult::Revision {
+                        major: OPTEE_MSG_REVISION_MAJOR,
+                        minor: OPTEE_MSG_REVISION_MINOR,
+                    });
+                }
+            },
+            Err(errno) => {
+                debug_serial_println!(
+                    "OP-TEE SMC Invalid function ID {:#x}, errno={}",
+                    optee_smc_args.args[0],
+                    errno
+                );
+                return Errno::EINVAL.as_neg().into();
+            }
+        }
+
+        if unsafe {
+            crate::platform_low()
+                .copy_to_vtl0_phys::<OpteeSmcArgs>(optee_smc_args_page_addr, &optee_smc_args)
+        } {
+            0
+        } else {
+            debug_serial_println!("Failed to copy OpteeSmcArgs back to VTL0");
+            Errno::EINVAL.as_neg().into()
+        }
+    } else {
+        Errno::EINVAL.as_neg().into()
+    }
 }
