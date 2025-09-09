@@ -338,6 +338,11 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
         SyscallRequest::Lseek { fd, offset, whence } => {
             syscalls::file::sys_lseek(fd, offset, whence)
         }
+        SyscallRequest::Mkdir { pathname, mode } => {
+            pathname.to_cstring().map_or(Err(Errno::EINVAL), |path| {
+                syscalls::file::sys_mkdir(path, mode).map(|()| 0)
+            })
+        }
         SyscallRequest::RtSigprocmask {
             how,
             set,
@@ -398,6 +403,14 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
         SyscallRequest::Mprotect { addr, length, prot } => {
             syscalls::mm::sys_mprotect(addr, length, prot).map(|()| 0)
         }
+        SyscallRequest::Mremap {
+            old_addr,
+            old_size,
+            new_size,
+            flags,
+            new_addr,
+        } => syscalls::mm::sys_mremap(old_addr, old_size, new_size, flags, new_addr)
+            .map(|ptr| ptr.as_usize()),
         SyscallRequest::Munmap { addr, length } => {
             syscalls::mm::sys_munmap(addr, length).map(|()| 0)
         }

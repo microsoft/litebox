@@ -1542,6 +1542,10 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         pathname: Platform::RawConstPointer<i8>,
         buf: Platform::RawMutPointer<FileStat>,
     },
+    Mkdir {
+        pathname: Platform::RawConstPointer<i8>,
+        mode: u32,
+    },
     Mmap {
         addr: usize,
         length: usize,
@@ -1889,6 +1893,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::stat => sys_req!(Stat { pathname:*, buf:* }),
             Sysno::fstat => sys_req!(Fstat { fd, buf:* }),
             Sysno::lstat => sys_req!(Lstat { pathname:*, buf:* }),
+            Sysno::mkdir => sys_req!(Mkdir { pathname:*, mode }),
             #[cfg(target_arch = "x86_64")]
             Sysno::mmap => sys_req!(Mmap {
                 addr,
@@ -2040,6 +2045,13 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::exit_group => sys_req!(ExitGroup { status }),
             Sysno::uname => sys_req!(Uname { buf:* }),
             Sysno::fcntl => SyscallRequest::Fcntl {
+                fd: ctx.sys_req_arg(0),
+                arg: FcntlArg::from(ctx.sys_req_arg(1), ctx.sys_req_arg(2)),
+            },
+            // TODO: fcntl64 is identical to fcntl except certain commands (e.g., `F_OFD_SETLK`)
+            // that we don't support yet.
+            #[cfg(target_arch = "x86")]
+            Sysno::fcntl64 => SyscallRequest::Fcntl {
                 fd: ctx.sys_req_arg(0),
                 arg: FcntlArg::from(ctx.sys_req_arg(1), ctx.sys_req_arg(2)),
             },

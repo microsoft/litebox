@@ -127,6 +127,7 @@ impl From<litebox::fs::errors::OpenError> for Errno {
             litebox::fs::errors::OpenError::NoWritePerms => Errno::EACCES,
             litebox::fs::errors::OpenError::PathError(path_error) => path_error.into(),
             litebox::fs::errors::OpenError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::OpenError::AlreadyExists => Errno::EEXIST,
             _ => unimplemented!(),
         }
     }
@@ -166,6 +167,18 @@ impl From<litebox::fs::errors::SeekError> for Errno {
         match value {
             litebox::fs::errors::SeekError::NotAFile => Errno::EBADF,
             litebox::fs::errors::SeekError::InvalidOffset => Errno::EINVAL,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::fs::errors::MkdirError> for Errno {
+    fn from(value: litebox::fs::errors::MkdirError) -> Self {
+        match value {
+            litebox::fs::errors::MkdirError::PathError(path_error) => path_error.into(),
+            litebox::fs::errors::MkdirError::AlreadyExists => Errno::EEXIST,
+            litebox::fs::errors::MkdirError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::MkdirError::NoWritePerms => Errno::EACCES,
             _ => unimplemented!(),
         }
     }
