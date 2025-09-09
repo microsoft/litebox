@@ -171,6 +171,18 @@ impl From<litebox::fs::errors::SeekError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::MkdirError> for Errno {
+    fn from(value: litebox::fs::errors::MkdirError) -> Self {
+        match value {
+            litebox::fs::errors::MkdirError::PathError(path_error) => path_error.into(),
+            litebox::fs::errors::MkdirError::AlreadyExists => Errno::EEXIST,
+            litebox::fs::errors::MkdirError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::MkdirError::NoWritePerms => Errno::EACCES,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::platform::page_mgmt::AllocationError> for Errno {
     fn from(value: litebox::platform::page_mgmt::AllocationError) -> Self {
         match value {
