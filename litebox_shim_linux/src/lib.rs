@@ -96,9 +96,10 @@ pub fn litebox_fs<'a>() -> &'a LinuxFS {
 }
 
 /// Get the global page manager
-pub fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE> {
-    static VMEM: OnceBox<PageManager<Platform, PAGE_SIZE>> = OnceBox::new();
-    VMEM.get_or_init(|| alloc::boxed::Box::new(PageManager::new(litebox())))
+pub fn litebox_page_manager() -> alloc::sync::Arc<PageManager<Platform, { PAGE_SIZE }>> {
+    use litebox::platform::ThreadLocalStorageProvider;
+    litebox_platform_multiplex::platform()
+        .with_thread_local_storage_mut(|tls| tls.current_task.page_manager.clone())
 }
 
 pub(crate) fn litebox_net<'a>()
@@ -236,6 +237,20 @@ impl Descriptors {
         } else {
             None
         }
+    }
+    fn close_on_exec(&mut self) {
+        self.descriptors.iter_mut().for_each(|slot| {
+            if let Some(desc) = slot.take() {
+                if desc
+                    .get_file_descriptor_flags()
+                    .contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC)
+                {
+                    syscalls::file::do_close(desc);
+                } else {
+                    *slot = Some(desc);
+                }
+            }
+        });
     }
 }
 
@@ -757,6 +772,12 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
             }
         }
         SyscallRequest::Futex { args } => syscalls::process::sys_futex(args),
+        SyscallRequest::Execve {
+            pathname,
+            argv,
+            envp,
+            ctx,
+        } => syscalls::process::sys_execve(pathname, argv, envp, ctx).map(|()| 0),
         _ => {
             todo!()
         }

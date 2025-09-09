@@ -55,6 +55,12 @@ pub struct LinuxUserland {
     tls_entry_number: AtomicU32,
 }
 
+impl core::fmt::Debug for LinuxUserland {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LinuxUserland").finish_non_exhaustive()
+    }
+}
+
 const IF_NAMESIZE: usize = 16;
 /// Use TUN device
 const IFF_TUN: i32 = 0x0001;
@@ -172,8 +178,9 @@ impl LinuxUserland {
             // u32::MAX (i.e., -1) means not allocated yet
             tls_entry_number: AtomicU32::new(u32::MAX),
         };
-        platform.set_init_tls();
-        Box::leak(Box::new(platform))
+        let platform = Box::leak(Box::new(platform));
+        platform.set_init_tls(&litebox::LiteBox::new(platform));
+        platform
     }
 
     /// Register the syscall handler (provided by the Linux shim)
@@ -282,7 +289,7 @@ impl LinuxUserland {
         }
     }
 
-    fn set_init_tls(&self) {
+    fn set_init_tls(&self, litebox: &litebox::LiteBox<LinuxUserland>) {
         let tid =
             unsafe { syscalls::syscall!(syscalls::Sysno::gettid) }.expect("Failed to get TID");
         let tid: i32 = i32::try_from(tid).expect("tid should fit in i32");
@@ -296,6 +303,7 @@ impl LinuxUserland {
             clear_child_tid: None,
             robust_list: None,
             credentials: alloc::sync::Arc::new(Self::get_user_info()),
+            page_manager: alloc::sync::Arc::new(litebox::mm::PageManager::new(litebox)),
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         self.set_thread_local_storage(tls);

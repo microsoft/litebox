@@ -91,7 +91,11 @@ fn current() -> Option<&'static mut bindings::vsbox_task> {
 }
 
 impl SnpLinuxKernel {
-    pub fn set_init_tls(&self, boot_params: &bindings::vmpl2_boot_params) {
+    pub fn set_init_tls(
+        &self,
+        boot_params: &bindings::vmpl2_boot_params,
+        litebox: &litebox::LiteBox<Self>,
+    ) {
         let task = ::alloc::boxed::Box::new(litebox_common_linux::Task {
             pid: boot_params.pid,
             tid: boot_params.pid,
@@ -104,6 +108,7 @@ impl SnpLinuxKernel {
                 euid: boot_params.euid as usize,
                 egid: boot_params.egid as usize,
             }),
+            page_manager: ::alloc::sync::Arc::new(litebox::mm::PageManager::new(litebox)),
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         self.set_thread_local_storage(tls);
@@ -290,7 +295,7 @@ const fn is_err_value(x: u64) -> bool {
     x >= !MAX_ERRNO
 }
 
-const PAGE_SIZE: u64 = 4096;
+const PAGE_SIZE: u64 = litebox::mm::linux::PAGE_SIZE as u64;
 /// Max physical address
 const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 

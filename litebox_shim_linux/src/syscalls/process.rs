@@ -1,8 +1,10 @@
 //! Process/thread related syscalls.
 
 use core::mem::offset_of;
+use core::ops::Range;
 
 use alloc::boxed::Box;
+use litebox::mm::linux::VmFlags;
 use litebox::platform::{ExitProvider as _, RawMutPointer as _, ThreadProvider as _};
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{
@@ -299,13 +301,15 @@ pub(crate) fn sys_clone(
     }
 
     let platform = litebox_platform_multiplex::platform();
-    let (credentials, pid, parent_proc_id) = platform.with_thread_local_storage_mut(|tls| {
-        (
-            tls.current_task.credentials.clone(),
-            tls.current_task.pid,
-            tls.current_task.ppid,
-        )
-    });
+    let (credentials, pid, parent_proc_id, page_manager) =
+        platform.with_thread_local_storage_mut(|tls| {
+            (
+                tls.current_task.credentials.clone(),
+                tls.current_task.pid,
+                tls.current_task.ppid,
+                tls.current_task.page_manager.clone(),
+            )
+        });
     let child_tid = unsafe {
         platform.spawn_thread(
             ctx,
@@ -330,6 +334,7 @@ pub(crate) fn sys_clone(
                     },
                     robust_list: None,
                     credentials,
+                    page_manager,
                 }),
                 callback: new_thread_callback,
             }),
@@ -670,6 +675,137 @@ pub(crate) fn sys_futex(
         _ => unimplemented!("Unsupported futex operation"),
     };
     Ok(res)
+}
+
+pub type ExecveCallback = fn(
+    ctx: &mut litebox_common_linux::PtRegs,
+    path: &str,
+    argv: alloc::vec::Vec<alloc::ffi::CString>,
+    envp: alloc::vec::Vec<alloc::ffi::CString>,
+) -> Result<(), Errno>;
+static EXECVE_CALLBACK: once_cell::race::OnceBox<ExecveCallback> = once_cell::race::OnceBox::new();
+
+pub fn set_execve_callback(callback: ExecveCallback) {
+    EXECVE_CALLBACK
+        .set(Box::new(callback))
+        .expect("execve callback already set");
+}
+
+const MAX_VEC: usize = 4096; // limit count
+const MAX_TOTAL_BYTES: usize = 256 * 1024; // size cap
+
+// Handle syscall `execve`.
+pub(crate) fn sys_execve(
+    pathname: crate::ConstPtr<i8>,
+    argv: crate::ConstPtr<crate::ConstPtr<i8>>,
+    envp: crate::ConstPtr<crate::ConstPtr<i8>>,
+    ctx: &mut litebox_common_linux::PtRegs,
+) -> Result<(), Errno> {
+    // 1. Copy pathname
+    let Some(path_cstr) = pathname.to_cstring() else {
+        return Err(Errno::EFAULT);
+    };
+    let path = path_cstr.to_str().map_err(|_| Errno::ENOENT)?; // simplistic
+
+    // 2. Copy argv/envp arrays
+    fn copy_vector(
+        mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
+        which: &str,
+    ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
+        let mut out = alloc::vec::Vec::new();
+        let mut total = 0usize;
+        for _ in 0..MAX_VEC {
+            let p: crate::ConstPtr<i8> = unsafe {
+                // read pointer-sized entries
+                match base.read_at_offset(0) {
+                    Some(ptr) => ptr.into_owned(),
+                    None => return Err(Errno::EFAULT),
+                }
+            };
+            if p.as_usize() == 0 {
+                break;
+            }
+            let Some(cs) = p.to_cstring() else {
+                return Err(Errno::EFAULT);
+            };
+            total += cs.as_bytes().len() + 1;
+            if total > MAX_TOTAL_BYTES {
+                return Err(Errno::E2BIG);
+            }
+            out.push(cs);
+            // advance to next pointer
+            base = crate::ConstPtr::from_usize(base.as_usize() + core::mem::size_of::<usize>());
+        }
+        Ok(out)
+    }
+
+    let argv_vec = if argv.as_usize() == 0 {
+        alloc::vec::Vec::new()
+    } else {
+        copy_vector(argv, "argv")?
+    };
+    let envp_vec = if envp.as_usize() == 0 {
+        alloc::vec::Vec::new()
+    } else {
+        copy_vector(envp, "envp")?
+    };
+
+    // 3. Close CLOEXEC descriptors
+    crate::file_descriptors().write().close_on_exec();
+
+    // unmmap all memory mappings and reset brk
+    litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| {
+        tls.current_task.robust_list = None;
+
+        if let Some(robust_list) = tls.current_task.robust_list.take() {
+            let _ = wake_robust_list(robust_list);
+        }
+
+        // Check if we are the only thread in the process
+        assert_eq!(
+            alloc::sync::Arc::strong_count(&tls.current_task.page_manager),
+            1,
+            "execve when multiple threads exist is not supported yet"
+        );
+        let release = |r: Range<usize>, vm: VmFlags| {
+            // Reserved mappings
+            if vm.is_empty() {
+                return false;
+            }
+            if vm.contains(VmFlags::VM_GROWSDOWN) {
+                // Stack we are currently running on, don't unmap it.
+                // This happens when litebox runs in user space.
+                let rsp: usize;
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    core::arch::asm!(
+                        "mov {}, rsp",
+                        out(reg) rsp,
+                    );
+                }
+                #[cfg(target_arch = "x86")]
+                unsafe {
+                    core::arch::asm!(
+                        "mov {}, esp",
+                        out(reg) rsp,
+                    );
+                }
+                if r.start <= rsp && rsp < r.end {
+                    return false;
+                }
+            }
+            true
+        };
+        unsafe {
+            tls.current_task.page_manager.release_memory(release);
+        };
+    });
+
+    if let Some(callback) = EXECVE_CALLBACK.get() {
+        callback(ctx, path, argv_vec, envp_vec);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

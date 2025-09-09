@@ -1123,13 +1123,18 @@ pub type ThreadLocalDescriptor = u8;
 #[cfg(target_arch = "x86")]
 pub type ThreadLocalDescriptor = UserDesc;
 
-pub struct NewThreadArgs<Platform: litebox::platform::RawPointerProvider> {
+pub struct NewThreadArgs<Platform, const ALIGN: usize = { litebox::mm::linux::PAGE_SIZE }>
+where
+    Platform: litebox::platform::RawPointerProvider
+        + litebox::sync::RawSyncPrimitivesProvider
+        + litebox::platform::page_mgmt::PageManagementProvider<ALIGN>,
+{
     /// Pointer to thread-local storage (TLS) given by the guest program
     pub tls: Option<Platform::RawMutPointer<ThreadLocalDescriptor>>,
     /// Where to store child TID in child's memory
     pub set_child_tid: Option<Platform::RawMutPointer<i32>>,
     /// Task struct that maintains all per-thread data
-    pub task: alloc::boxed::Box<Task<Platform>>,
+    pub task: alloc::boxed::Box<Task<Platform, ALIGN>>,
     /// A callback function that *MUST* be called when the thread is created.
     ///
     /// Note that `task.tid` must be set correctly before this function is called.
@@ -1137,13 +1142,18 @@ pub struct NewThreadArgs<Platform: litebox::platform::RawPointerProvider> {
 }
 
 /// Struct for thread-local storage.
-pub struct ThreadLocalStorage<Platform: litebox::platform::RawPointerProvider> {
+pub struct ThreadLocalStorage<Platform, const ALIGN: usize = { litebox::mm::linux::PAGE_SIZE }>
+where
+    Platform: litebox::platform::RawPointerProvider
+        + litebox::sync::RawSyncPrimitivesProvider
+        + litebox::platform::page_mgmt::PageManagementProvider<ALIGN>,
+{
     /// Indicates whether the TLS is being borrowed.
     pub borrowed: bool,
 
     #[cfg(target_arch = "x86")]
-    pub self_ptr: *mut ThreadLocalStorage<Platform>,
-    pub current_task: alloc::boxed::Box<Task<Platform>>,
+    pub self_ptr: *mut ThreadLocalStorage<Platform, ALIGN>,
+    pub current_task: alloc::boxed::Box<Task<Platform, ALIGN>>,
 }
 
 /// Credentials of a process
@@ -1155,8 +1165,13 @@ pub struct Credentials {
     pub egid: usize,
 }
 
-impl<Platform: litebox::platform::RawPointerProvider> ThreadLocalStorage<Platform> {
-    pub const fn new(task: alloc::boxed::Box<Task<Platform>>) -> Self {
+impl<Platform, const ALIGN: usize> ThreadLocalStorage<Platform, ALIGN>
+where
+    Platform: litebox::platform::RawPointerProvider
+        + litebox::sync::RawSyncPrimitivesProvider
+        + litebox::platform::page_mgmt::PageManagementProvider<ALIGN>,
+{
+    pub const fn new(task: alloc::boxed::Box<Task<Platform, ALIGN>>) -> Self {
         Self {
             borrowed: false,
             #[cfg(target_arch = "x86")]
@@ -1166,7 +1181,12 @@ impl<Platform: litebox::platform::RawPointerProvider> ThreadLocalStorage<Platfor
     }
 }
 
-pub struct Task<Platform: litebox::platform::RawPointerProvider> {
+pub struct Task<Platform, const ALIGN: usize = { litebox::mm::linux::PAGE_SIZE }>
+where
+    Platform: litebox::platform::RawPointerProvider
+        + litebox::sync::RawSyncPrimitivesProvider
+        + litebox::platform::page_mgmt::PageManagementProvider<ALIGN>,
+{
     /// Process ID
     pub pid: i32,
     /// Parent Process ID
@@ -1188,6 +1208,8 @@ pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     pub robust_list: Option<Platform::RawConstPointer<RobustListHead<Platform>>>,
     /// Shared process credentials.
     pub credentials: alloc::sync::Arc<Credentials>,
+    /// Shared memory manager
+    pub page_manager: alloc::sync::Arc<litebox::mm::PageManager<Platform, ALIGN>>,
 }
 
 #[repr(C)]
@@ -1837,6 +1859,12 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     Futex {
         args: FutexArgs<Platform>,
     },
+    Execve {
+        pathname: Platform::RawConstPointer<i8>,
+        argv: Platform::RawConstPointer<Platform::RawConstPointer<i8>>,
+        envp: Platform::RawConstPointer<Platform::RawConstPointer<i8>>,
+        ctx: &'a mut PtRegs,
+    },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
 }
@@ -1852,7 +1880,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
     /// is allowed to panic upon receiving a syscall number (or arguments) that it does not know how
     /// to handle.
     #[expect(clippy::too_many_lines)]
-    pub fn try_from_raw(syscall_number: usize, ctx: &'a PtRegs) -> Result<Self, errno::Errno> {
+    pub fn try_from_raw(syscall_number: usize, ctx: &'a mut PtRegs) -> Result<Self, errno::Errno> {
         // sys_req! is a convenience macro that automatically takes the correct numbered arguments
         // (in the order of field specification); due to some Rust restrictions, we need to manually
         // specify pointers by adding the `:*` to that field, but otherwise everything else about
@@ -2270,6 +2298,18 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     },
                 };
                 SyscallRequest::Futex { args }
+            }
+            Sysno::execve => {
+                // execve(pathname, argv, envp)
+                let pathname = ctx.sys_req_ptr(0);
+                let argv = ctx.sys_req_ptr(1);
+                let envp = ctx.sys_req_ptr(2);
+                SyscallRequest::Execve {
+                    pathname,
+                    argv,
+                    envp,
+                    ctx,
+                }
             }
             // TODO: support syscall `statfs`
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {

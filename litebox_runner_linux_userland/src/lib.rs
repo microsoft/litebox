@@ -8,6 +8,8 @@ use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::PathBuf;
 
+extern crate alloc;
+
 /// Run Linux programs with LiteBox on unmodified Linux
 #[derive(Parser, Debug)]
 pub struct CliArgs {
@@ -217,6 +219,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
     litebox_shim_linux::set_fs(initial_file_system);
     litebox_platform_multiplex::set_platform(platform);
+    litebox_shim_linux::syscalls::process::set_execve_callback(load_program_wrapper);
     platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
@@ -249,6 +252,24 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
+    load_program(&cli_args.program_and_arguments[0], argv, envp).expect("failed to load program");
+    Ok(())
+}
+
+fn load_program_wrapper(
+    _ctx: &mut litebox_common_linux::PtRegs,
+    path: &str,
+    argv: alloc::vec::Vec<alloc::ffi::CString>,
+    envp: alloc::vec::Vec<alloc::ffi::CString>,
+) -> Result<(), litebox_common_linux::errno::Errno> {
+    load_program(path, argv, envp)
+}
+
+fn load_program(
+    path: &str,
+    argv: alloc::vec::Vec<alloc::ffi::CString>,
+    envp: alloc::vec::Vec<alloc::ffi::CString>,
+) -> Result<(), litebox_common_linux::errno::Errno> {
     let mut aux = litebox_shim_linux::loader::auxv::init_auxv();
     if litebox_platform_multiplex::platform()
         .get_vdso_address()
@@ -275,14 +296,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             );
         }
     }
-    let loaded_program = litebox_shim_linux::loader::load_program(
-        &cli_args.program_and_arguments[0],
-        argv,
-        envp,
-        aux,
-    )
-    .unwrap();
-
+    let loaded_program = litebox_shim_linux::loader::load_program(path, argv, envp, aux).unwrap();
     unsafe {
         trampoline::jump_to_entry_point(loaded_program.entry_point, loaded_program.user_stack_top)
     }

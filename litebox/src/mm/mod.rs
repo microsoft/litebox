@@ -345,6 +345,21 @@ where
         Ok(brk)
     }
 
+    pub unsafe fn release_memory(&self, f: fn(Range<usize>, VmFlags) -> bool) {
+        for (r, vma) in self.mappings() {
+            if !f(r.clone(), vma) {
+                continue;
+            }
+            let mut vmem = self.vmem.write();
+            let range = PageRange::new(r.start, r.end).unwrap();
+            unsafe { vmem.remove_mapping(range) }.expect("failed to remove mapping");
+        }
+
+        // reset brk
+        let mut vmem = self.vmem.write();
+        vmem.brk = 0;
+    }
+
     /// Expands (or shrinks) an existing memory mapping
     ///
     /// `old_addr` is the old address of the virtual memory block that you want to expand (or shrink).

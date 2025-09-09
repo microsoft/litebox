@@ -405,6 +405,7 @@ impl ElfLoader {
             let init_brk =
                 core::cmp::max((base + brk).next_multiple_of(PAGE_SIZE), end_of_trampoline);
             unsafe { litebox_page_manager().brk(init_brk) }.expect("failed to set brk");
+            crate::syscalls::file::sys_close(file_fd).expect("failed to close fd");
             elf
         };
         let interp: Option<Elf> = if let Some(interp_name) = elf.interp() {
@@ -420,6 +421,7 @@ impl ElfLoader {
             if let Some(trampoline) = trampoline {
                 load_trampoline(trampoline, interp.base(), file_fd);
             }
+            crate::syscalls::file::sys_close(file_fd).expect("failed to close fd");
             Some(interp)
         } else {
             None
