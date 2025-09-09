@@ -685,6 +685,11 @@ pub type ExecveCallback = fn(
 ) -> Result<(), Errno>;
 static EXECVE_CALLBACK: once_cell::race::OnceBox<ExecveCallback> = once_cell::race::OnceBox::new();
 
+/// Set the execve callback, which is responsible for loading and jumping to the new program.
+///
+/// # Panics
+///
+/// This function should be called only once during initialization.
 pub fn set_execve_callback(callback: ExecveCallback) {
     EXECVE_CALLBACK
         .set(Box::new(callback))
@@ -701,13 +706,6 @@ pub(crate) fn sys_execve(
     envp: crate::ConstPtr<crate::ConstPtr<i8>>,
     ctx: &mut litebox_common_linux::PtRegs,
 ) -> Result<(), Errno> {
-    // 1. Copy pathname
-    let Some(path_cstr) = pathname.to_cstring() else {
-        return Err(Errno::EFAULT);
-    };
-    let path = path_cstr.to_str().map_err(|_| Errno::ENOENT)?; // simplistic
-
-    // 2. Copy argv/envp arrays
     fn copy_vector(
         mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
         which: &str,
@@ -739,6 +737,13 @@ pub(crate) fn sys_execve(
         Ok(out)
     }
 
+    // Copy pathname
+    let Some(path_cstr) = pathname.to_cstring() else {
+        return Err(Errno::EFAULT);
+    };
+    let path = path_cstr.to_str().map_err(|_| Errno::ENOENT)?; // simplistic
+
+    // Copy argv and envp vectors
     let argv_vec = if argv.as_usize() == 0 {
         alloc::vec::Vec::new()
     } else {
@@ -750,7 +755,7 @@ pub(crate) fn sys_execve(
         copy_vector(envp, "envp")?
     };
 
-    // 3. Close CLOEXEC descriptors
+    // Close CLOEXEC descriptors
     crate::file_descriptors().write().close_on_exec();
 
     // unmmap all memory mappings and reset brk
@@ -774,7 +779,8 @@ pub(crate) fn sys_execve(
             }
             if vm.contains(VmFlags::VM_GROWSDOWN) {
                 // Stack we are currently running on, don't unmap it.
-                // This happens when litebox runs in user space.
+                // This happens when litebox runs in user space so that
+                // it shares the stack with the guest program.
                 let rsp: usize;
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
@@ -796,13 +802,14 @@ pub(crate) fn sys_execve(
             }
             true
         };
-        unsafe {
-            tls.current_task.page_manager.release_memory(release);
-        };
+        unsafe { tls.current_task.page_manager.release_memory(release) }
+            .expect("failed to release memory mappings");
     });
+    #[cfg(target_arch = "x86")]
+    litebox_platform_multiplex::platform().clear_guest_thread_local_storage();
 
     if let Some(callback) = EXECVE_CALLBACK.get() {
-        callback(ctx, path, argv_vec, envp_vec);
+        callback(ctx, path, argv_vec, envp_vec).expect("we already released memory above");
     }
 
     Ok(())

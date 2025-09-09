@@ -72,7 +72,8 @@ pub enum InterceptionBackend {
     Rewriter,
 }
 
-const REQUIRE_RTLD_AUDIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static REQUIRE_RTLD_AUDIT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Run Linux programs with LiteBox on unmodified Linux
 ///

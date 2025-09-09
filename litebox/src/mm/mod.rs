@@ -345,19 +345,31 @@ where
         Ok(brk)
     }
 
-    pub unsafe fn release_memory(&self, f: fn(Range<usize>, VmFlags) -> bool) {
+    /// Release memory mappings that satisfy the given condition and reset the program break.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the released memory regions are no longer used.
+    pub unsafe fn release_memory(
+        &self,
+        f: fn(Range<usize>, VmFlags) -> bool,
+    ) -> Result<(), VmemUnmapError> {
         for (r, vma) in self.mappings() {
             if !f(r.clone(), vma) {
                 continue;
             }
             let mut vmem = self.vmem.write();
-            let range = PageRange::new(r.start, r.end).unwrap();
-            unsafe { vmem.remove_mapping(range) }.expect("failed to remove mapping");
+            let Some(range) = PageRange::new(r.start, r.end) else {
+                unreachable!()
+            };
+            unsafe { vmem.remove_mapping(range) }?;
         }
 
         // reset brk
         let mut vmem = self.vmem.write();
         vmem.brk = 0;
+
+        Ok(())
     }
 
     /// Expands (or shrinks) an existing memory mapping

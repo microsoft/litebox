@@ -209,7 +209,8 @@ impl WindowsUserland {
             reserved_pages,
             sys_info: std::sync::RwLock::new(sys_info),
         };
-        platform.set_init_tls();
+        let platform = Box::leak(Box::new(platform));
+        platform.set_init_tls(&litebox::LiteBox::new(platform));
 
         // Initialize it's own fs-base (for the main thread)
         WindowsUserland::init_thread_fs_base();
@@ -220,7 +221,7 @@ impl WindowsUserland {
             let _ = AddVectoredExceptionHandler(0, Some(exception_handler));
         }
 
-        Box::leak(Box::new(platform))
+        platform
     }
 
     /// Register the syscall handler (provided by the Linux shim)
@@ -291,7 +292,7 @@ impl WindowsUserland {
         x % gran == 0
     }
 
-    fn set_init_tls(&self) {
+    fn set_init_tls(&self, litebox: &litebox::LiteBox<WindowsUserland>) {
         // TODO: Currently we are using a static thread ID and credentials (faked).
         // This is a placeholder for future implementation to use passthrough.
         let creds = litebox_common_linux::Credentials {
@@ -308,6 +309,7 @@ impl WindowsUserland {
             clear_child_tid: None,
             robust_list: None,
             credentials: alloc::sync::Arc::new(creds),
+            page_manager: alloc::sync::Arc::new(litebox::mm::PageManager::new(litebox)),
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         self.set_thread_local_storage(tls);
@@ -1241,6 +1243,8 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
         tls.borrowed = false;
         ret
     }
+
+    fn clear_guest_thread_local_storage(&self) {}
 }
 
 #[cfg(test)]

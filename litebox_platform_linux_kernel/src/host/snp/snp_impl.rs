@@ -146,6 +146,8 @@ impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
         current_task.tls = ::core::ptr::null_mut();
         *tls
     }
+
+    fn clear_guest_thread_local_storage(&self) {}
 }
 
 core::arch::global_asm!(include_str!("entry.S"));
