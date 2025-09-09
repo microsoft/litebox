@@ -17,6 +17,10 @@ pub use page_mgmt::PageManagementProvider;
 
 #[macro_export]
 macro_rules! log_println {
+    ($platform:expr, $s:expr) => {{
+        use $crate::platform::DebugLogProvider as _;
+        $platform.debug_log_print($s);
+    }};
     ($platform:expr, $($tt:tt)*) => {{
         use core::fmt::Write as _;
         use $crate::platform::DebugLogProvider as _;
@@ -379,7 +383,7 @@ pub trait RawPointerProvider {
 /// A read-only raw pointer, morally equivalent to `*const T`.
 ///
 /// See [`RawPointerProvider`] for details.
-pub trait RawConstPointer<T>: Copy
+pub trait RawConstPointer<T>: Copy + core::fmt::Debug
 where
     T: Clone,
 {
