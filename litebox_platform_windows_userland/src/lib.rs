@@ -98,7 +98,6 @@ fn untrack_committed_memory(range: core::ops::Range<usize>) {
     tracker.remove(range);
 }
 
-#[allow(dead_code)]
 fn is_range_within_committed(range: &core::ops::Range<usize>) -> bool {
     let tracker = MEMORY_TRACKER.read().unwrap();
     // No gapped overlapping means the range is fully covered
@@ -913,6 +912,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                         Win32_Memory::MEM_COMMIT => {
                             let committed_range =
                                 (base_addr as usize)..(base_addr as usize + size_within_region);
+                            // We are safe to operate on a PageManagementProvider committed range.
                             if is_range_within_committed(&committed_range) {
                                 let mut old_protect: u32 = 0;
                                 assert!(
@@ -935,11 +935,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     }
                                 );
                                 base_addr
-                            } else if fixed_address {
+                            } 
+                            // Deal with collision with global allocator.
+                            else if fixed_address {
                                 return Err(
                                     litebox::platform::page_mgmt::AllocationError::AlreadyAllocated,
                                 );
-                            } else {
+                            } 
+                            else {
                                 // We simply handle it as a new allocation request (for the whole range).
                                 return <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
                                         self,
