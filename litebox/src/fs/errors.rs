@@ -20,6 +20,8 @@ pub enum OpenError {
     ReadOnlyFileSystem,
     #[error("file already exists")]
     AlreadyExists,
+    #[error("error when truncating: {0}")]
+    TruncateError(#[from] TruncateError),
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -57,6 +59,17 @@ pub enum SeekError {
     NotAFile,
     #[error("would seek to an invalid (negative or past end) of seekable positions")]
     InvalidOffset,
+}
+
+/// Possible errors from [`FileSystem::truncate`]
+#[derive(Error, Debug)]
+pub enum TruncateError {
+    #[error("file descriptor points to a directory")]
+    IsDirectory,
+    #[error("file is not opened for writing")]
+    NotForWriting,
+    #[error("file descriptor points to a terminal device")]
+    IsTerminalDevice,
 }
 
 /// Possible errors from [`FileSystem::chmod`]

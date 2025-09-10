@@ -38,7 +38,7 @@ use super::{
     Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     errors::{
         ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadDirError,
-        ReadError, RmdirError, SeekError, UnlinkError, WriteError,
+        ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
     },
 };
 
@@ -152,6 +152,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::RDWR
             | OFlags::CREAT
             | OFlags::EXCL
+            | OFlags::TRUNC
             | OFlags::NOCTTY
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK;
@@ -188,26 +189,35 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             return Err(OpenError::ReadOnlyFileSystem);
         }
         assert!(flags.contains(OFlags::RDONLY));
-        if entry.filename().as_str().unwrap() == path {
+        let fd = if entry.filename().as_str().unwrap() == path {
             // it is a file
             if flags.contains(OFlags::DIRECTORY) {
                 return Err(OpenError::PathError(PathError::ComponentNotADirectory));
             }
-            Ok(self
-                .litebox
+            self.litebox
                 .descriptor_table_mut()
                 .insert(Descriptor::File {
                     idx,
                     position: 0,
                     metadata: AnyMap::new(),
-                }))
+                })
         } else {
             // it is a dir
-            Ok(self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
+            self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
                 path: path.to_owned(),
                 metadata: AnyMap::new(),
-            }))
+            })
+        };
+        if flags.contains(OFlags::TRUNC) {
+            match self.truncate(&fd, 0, true) {
+                Ok(()) => {}
+                Err(e) => {
+                    self.close(fd).unwrap();
+                    return Err(e.into());
+                }
+            }
         }
+        Ok(fd)
     }
 
     fn close(&self, fd: FileFd<Platform>) -> Result<(), CloseError> {
@@ -282,6 +292,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         } else {
             *position = new_posn;
             Ok(new_posn)
+        }
+    }
+
+    fn truncate(
+        &self,
+        fd: &FileFd<Platform>,
+        _length: usize,
+        _reset_offset: bool,
+    ) -> Result<(), TruncateError> {
+        match self.litebox.descriptor_table().get_entry(fd).entry {
+            Descriptor::File { .. } => Err(TruncateError::NotForWriting),
+            Descriptor::Dir { .. } => Err(TruncateError::IsDirectory),
         }
     }
 

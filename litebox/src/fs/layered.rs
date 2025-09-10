@@ -13,7 +13,7 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, UnlinkError, WriteError,
+    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
 
@@ -101,6 +101,67 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         }
     }
 
+    /// (private-only) Create all parent/ancestor directories for a `path`, making sure that each of
+    /// these exist in the lower layer. It does _not_ set up `path` itself on the upper layer
+    /// though; this is left to the callee to handle.
+    ///
+    /// NOTE: This is _not_ equivalent to running `mkdir -p {path}` or `mkdir {path}` or anything
+    /// like that.
+    fn mkdir_migrating_ancestor_dirs(&self, path: &str) -> Result<(), MkdirError> {
+        let path = self.absolute_path(path)?;
+        for dir in path.increasing_ancestors().map_err(PathError::from)? {
+            if dir == path {
+                return Ok(());
+            }
+            match self.ensure_lower_contains(dir) {
+                Ok(FileType::Directory) => {
+                    // The dir does in fact exist; we just need to confirm that the upper layer also
+                    // has it.
+                    match self
+                        .upper
+                        .mkdir(dir, self.lower.file_status(dir).unwrap().mode)
+                    {
+                        Ok(()) => {
+                            // fallthrough to next increasing ancestor
+                        }
+                        Err(e) => match e {
+                            MkdirError::AlreadyExists => {
+                                // perfectly fine, just fallthrough to next place in the loop
+                            }
+                            MkdirError::ReadOnlyFileSystem
+                            | MkdirError::NoWritePerms
+                            | MkdirError::PathError(
+                                PathError::ComponentNotADirectory
+                                | PathError::InvalidPathname
+                                | PathError::NoSearchPerms { .. },
+                            ) => {
+                                return Err(e);
+                            }
+                            MkdirError::PathError(
+                                PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                            ) => {
+                                unreachable!()
+                            }
+                        },
+                    }
+                }
+                Ok(FileType::RegularFile | FileType::CharacterDevice)
+                | Err(PathError::MissingComponent) => unreachable!(),
+                Err(PathError::ComponentNotADirectory) => unimplemented!(),
+                Err(PathError::InvalidPathname) => unreachable!("we just confirmed valid path"),
+                Err(e @ PathError::NoSearchPerms { .. }) => {
+                    return Err(e)?;
+                }
+                Err(PathError::NoSuchFileOrDirectory) => {
+                    assert_ne!(dir, path);
+                    return Err(PathError::MissingComponent)?;
+                }
+            }
+        }
+        // The loop above should return at one of its return points
+        unreachable!()
+    }
+
     /// (private-only) Migrate a file from lower to upper layer
     ///
     /// It performs a check to make sure that the lower level has the file, and if the lower-level
@@ -108,8 +169,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     /// necessary.
     ///
     /// Note: this focuses only on files.
+    ///
+    /// If `copy_data` is `true`, it copies over the lower data to the upper one, otherwise, it
+    /// makes the upper file empty (similar to a truncate). Generally speaking, you want to use
+    /// `true` for `copy_data`.
     #[allow(clippy::too_many_lines)]
-    fn migrate_file_up(&self, path: &str) -> Result<(), MigrationError> {
+    fn migrate_file_up(&self, path: &str, copy_data: bool) -> Result<(), MigrationError> {
         match self.layering_semantics {
             LayeringSemantics::LowerLayerReadOnly => {
                 // fallthrough
@@ -134,7 +199,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 OpenError::AccessNotAllowed => return Err(MigrationError::NoReadPerms),
                 OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
-                | OpenError::AlreadyExists => unreachable!(),
+                | OpenError::AlreadyExists
+                | OpenError::TruncateError(_) => unreachable!(),
                 OpenError::PathError(path_error) => return Err(path_error)?,
             },
         };
@@ -153,7 +219,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         // We are here the first time around, and did not error out, yay! We can
                         // actually open up the file.
                         //
-                        // TODO: We might need to make all the parent directories?
+                        // First, we make sure we've set up the ancestor directories.
+                        match self.mkdir_migrating_ancestor_dirs(path) {
+                            Ok(()) => {}
+                            Err(e) => unimplemented!("{e} when setting up ancestor dirs"),
+                        }
+                        // Now we can actually open the file.
                         upper_fd = Some(
                             self.upper
                                 .open(
@@ -165,7 +236,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         );
                     }
                     let upper_fd = upper_fd.as_ref().unwrap();
-                    if size > 0 {
+                    if size > 0 && copy_data {
                         self.upper.write(upper_fd, &temp_buf[..size], None).expect(
                             "writing to upper layer must succeed, or layered file migration is in serious trouble",
                         );
@@ -373,6 +444,7 @@ impl<
             | OFlags::WRONLY
             | OFlags::RDWR
             | OFlags::EXCL
+            | OFlags::TRUNC
             | OFlags::NOCTTY
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK;
@@ -452,6 +524,11 @@ impl<
                 | OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
+                | OpenError::TruncateError(
+                    TruncateError::IsDirectory
+                    | TruncateError::NotForWriting
+                    | TruncateError::IsTerminalDevice,
+                )
                 | OpenError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
@@ -459,6 +536,19 @@ impl<
                 ) => {
                     // None of these can be handled by lower level, just quit out early
                     return Err(e);
+                }
+                OpenError::PathError(PathError::MissingComponent)
+                    if flags.contains(OFlags::CREAT) =>
+                {
+                    // We must check if the lower layer contains all the directories; if it does, we
+                    // can create the same directories and then re-trigger the open.
+                    let dirname = path.rsplit_once('/').unwrap().0;
+                    if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
+                        // We must migrate the directories above, and then re-trigger the open
+                        self.mkdir_migrating_ancestor_dirs(&path).unwrap();
+                        return self.open(path, flags, mode);
+                    }
+                    // Otherwise, handle-able by a lower level, fallthrough
                 }
                 OpenError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -470,8 +560,9 @@ impl<
         // We must check the lower level, creating an entry if needed
         let original_flags = flags;
         let mut flags = flags;
-        // Prevent creation of files at lower level
+        // Prevent creation or truncation of files at lower level
         flags.remove(OFlags::CREAT);
+        flags.remove(OFlags::TRUNC);
         match self.layering_semantics {
             LayeringSemantics::LowerLayerReadOnly => {
                 // Switch the lower level to read-only; the other calls will take care of
@@ -484,6 +575,7 @@ impl<
                 // Do nothing more to the flags, because we might be writing things to lower level.
                 // We just make sure that there is no creation happening, that's all :)
                 assert!(!flags.contains(OFlags::CREAT));
+                assert!(!flags.contains(OFlags::TRUNC));
             }
         }
         // Any errors from lower level now _must_ propagate up, so we can just invoke
@@ -497,12 +589,30 @@ impl<
             .entries
             .insert(path.clone(), Arc::clone(&entry));
         assert!(old.is_none());
-        Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+        let fd = self.litebox.descriptor_table_mut().insert(Descriptor {
             path,
             flags: original_flags,
             entry,
             position: 0.into(),
-        }))
+        });
+        if original_flags.contains(OFlags::TRUNC) {
+            // The only scenario where we need to manually trigger truncation is when a file does
+            // not exist at the upper level but exists at the lower level; in that case, our
+            // `truncate` functionality (at the layered FS itself) should correctly migrate things
+            // over and handle them.
+            match self.truncate(&fd, 0, true) {
+                Ok(()) | Err(TruncateError::IsTerminalDevice) => {
+                    // The terminal device is the one case we need to (due to Linux compatibility)
+                    // explicitly ignore the truncation ability, and instead silently continue as if
+                    // no error was thrown during truncation.
+                }
+                Err(e) => {
+                    self.close(fd).unwrap();
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok(fd)
     }
 
     fn close(&self, fd: FileFd<Platform, Upper, Lower>) -> Result<(), CloseError> {
@@ -693,7 +803,8 @@ impl<
             EntryX::Tombstone => unreachable!(),
         }
         // Change it to an upper-level file, also altering the file descriptor.
-        match self.migrate_file_up(&path) {
+        drop(entry);
+        match self.migrate_file_up(&path, true) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => return Err(WriteError::NotAFile),
@@ -734,6 +845,65 @@ impl<
         Ok(position)
     }
 
+    fn truncate(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+        length: usize,
+        reset_offset: bool,
+    ) -> Result<(), TruncateError> {
+        let (flags, entry) = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| {
+                (descriptor.entry.flags, Arc::clone(&descriptor.entry.entry))
+            });
+        let layered_fd = fd;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.truncate(fd, length, reset_offset),
+            EntryX::Lower { fd } => {
+                match self.layering_semantics {
+                    LayeringSemantics::LowerLayerWritableFiles => {
+                        self.lower.truncate(fd, length, reset_offset)
+                    }
+                    LayeringSemantics::LowerLayerReadOnly => {
+                        if flags.contains(OFlags::WRONLY) || flags.contains(OFlags::RDWR) {
+                            // We might need to migrate the file up
+                            match self.lower.truncate(fd, length, reset_offset) {
+                                Ok(()) => unreachable!(),
+                                Err(TruncateError::IsDirectory) => Err(TruncateError::IsDirectory),
+                                Err(TruncateError::IsTerminalDevice) => {
+                                    Err(TruncateError::IsTerminalDevice)
+                                }
+                                Err(TruncateError::NotForWriting) => {
+                                    // We must actually migrate this file up, and keep it truncated.
+                                    //
+                                    // We must first drop the cloned entry to make sure that the ref
+                                    // counting works out correctly during migration.
+                                    drop(entry);
+                                    let path = self
+                                        .litebox
+                                        .descriptor_table()
+                                        .with_entry(layered_fd, |descriptor| {
+                                            descriptor.entry.path.clone()
+                                        });
+                                    self.migrate_file_up(&path, false)
+                                        .expect("this migration should always succeed");
+
+                                    Ok(())
+                                }
+                            }
+                        } else {
+                            // The lower level truncate will correctly identify dir/file and handle
+                            // the difference in erroring.
+                            self.lower.truncate(fd, length, reset_offset)
+                        }
+                    }
+                }
+            }
+            EntryX::Tombstone => unreachable!(),
+        }
+    }
+
     fn chmod(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), ChmodError> {
         let path = self.absolute_path(path)?;
         match self.upper.chmod(path.as_str(), mode) {
@@ -756,7 +926,7 @@ impl<
             },
         }
         self.ensure_lower_contains(&path)?;
-        match self.migrate_file_up(&path) {
+        match self.migrate_file_up(&path, true) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => unimplemented!(),
@@ -794,7 +964,7 @@ impl<
             },
         }
         self.ensure_lower_contains(&path)?;
-        match self.migrate_file_up(&path) {
+        match self.migrate_file_up(&path, true) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => unimplemented!(),
@@ -890,60 +1060,9 @@ impl<
         // We know that at least one of the components is missing. We should check each of the
         // components individually, making directories for any components that already exist at the
         // lower layer, and erroring out if no lower layer component exists of that form.
-        for dir in path.increasing_ancestors().map_err(PathError::from)? {
-            match self.ensure_lower_contains(dir) {
-                Ok(FileType::Directory) => {
-                    // The dir does in fact exist; we just need to confirm that the upper layer also
-                    // has it.
-                    match self
-                        .upper
-                        .mkdir(dir, self.lower.file_status(dir).unwrap().mode)
-                    {
-                        Ok(()) => {
-                            // fallthrough to next increasing ancestor
-                        }
-                        Err(e) => match e {
-                            MkdirError::AlreadyExists => {
-                                // perfectly fine, just fallthrough to next place in the loop
-                            }
-                            MkdirError::ReadOnlyFileSystem
-                            | MkdirError::NoWritePerms
-                            | MkdirError::PathError(
-                                PathError::ComponentNotADirectory
-                                | PathError::InvalidPathname
-                                | PathError::NoSearchPerms { .. },
-                            ) => {
-                                return Err(e);
-                            }
-                            MkdirError::PathError(
-                                PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
-                            ) => {
-                                unreachable!()
-                            }
-                        },
-                    }
-                }
-                Ok(FileType::RegularFile | FileType::CharacterDevice)
-                | Err(PathError::MissingComponent) => unreachable!(),
-                Err(PathError::ComponentNotADirectory) => unimplemented!(),
-                Err(PathError::InvalidPathname) => unreachable!("we just confirmed valid path"),
-                Err(e @ PathError::NoSearchPerms { .. }) => {
-                    return Err(e)?;
-                }
-                Err(PathError::NoSuchFileOrDirectory) => {
-                    // This is possibly the missing component; if it is same as the path itself,
-                    // then it just needs its mkdir at the upper level; otherwise it is a true
-                    // missing component.
-                    if dir != path {
-                        return Err(PathError::MissingComponent)?;
-                    }
-                    return self.upper.mkdir(&*path, mode);
-                }
-            }
-        }
-        // The last round of the loop should guarantee upper-directory creation if needed, so it
-        // should be impossible for us to actually reach here.
-        unreachable!()
+        self.mkdir_migrating_ancestor_dirs(&path)?;
+        // And then now we can make the upper directory.
+        self.upper.mkdir(path, mode)
     }
 
     #[expect(unused_variables, reason = "unimplemented")]
@@ -1219,6 +1338,18 @@ enum EntryX<Upper: super::FileSystem + 'static, Lower: super::FileSystem + 'stat
     // This file exists in the lower level, but as far as the layered architecture is concerned,
     // this is marked as deleted. RIP (x_x)
     Tombstone,
+}
+
+impl<Upper: super::FileSystem + 'static, Lower: super::FileSystem + 'static> core::fmt::Debug
+    for EntryX<Upper, Lower>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Upper { fd: _ } => f.debug_struct("Upper").finish_non_exhaustive(),
+            Self::Lower { fd: _ } => f.debug_struct("Lower").finish_non_exhaustive(),
+            Self::Tombstone => write!(f, "Tombstone"),
+        }
+    }
 }
 
 crate::fd::enable_fds_for_subsystem! {

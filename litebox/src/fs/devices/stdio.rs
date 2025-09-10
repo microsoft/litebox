@@ -8,7 +8,7 @@ use crate::{
         FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
         errors::{
             ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-            ReadDirError, ReadError, RmdirError, SeekError, UnlinkError, WriteError,
+            ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
         },
     },
     path::Arg,
@@ -94,8 +94,13 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         mode: Mode,
     ) -> Result<FileFd<Platform>, OpenError> {
         let open_directory = flags.contains(OFlags::DIRECTORY);
+        let flags = flags - OFlags::DIRECTORY;
         let nonblocking = flags.contains(OFlags::NONBLOCK);
-        let flags = flags - OFlags::DIRECTORY - OFlags::NONBLOCK - OFlags::NOCTTY; // ignore NOCTTY
+        let flags = flags - OFlags::NONBLOCK;
+        // ignore NOCTTY
+        let flags = flags - OFlags::NOCTTY;
+        let truncate = flags.contains(OFlags::TRUNC);
+        let flags = flags - OFlags::TRUNC;
         let path = self.absolute_path(path)?;
         let stream = match path.as_str() {
             "/dev/stdin" => {
@@ -127,7 +132,16 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         if nonblocking {
             unimplemented!("Non-blocking I/O is not supported for stdio streams");
         }
-        Ok(self.litebox.descriptor_table_mut().insert(stream))
+        let fd = self.litebox.descriptor_table_mut().insert(stream);
+        if truncate {
+            // Note: matching Linux behavior, this does not actually perform any truncation, and
+            // instead, it is silently ignored if you attempt to truncate upon opening stdio.
+            assert!(matches!(
+                self.truncate(&fd, 0, true),
+                Err(TruncateError::IsTerminalDevice)
+            ));
+        }
+        Ok(fd)
     }
 
     fn close(&self, fd: FileFd<Platform>) -> Result<(), CloseError> {
@@ -187,6 +201,15 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
         unimplemented!()
+    }
+
+    fn truncate(
+        &self,
+        _fd: &FileFd<Platform>,
+        _length: usize,
+        _reset_offset: bool,
+    ) -> Result<(), TruncateError> {
+        Err(TruncateError::IsTerminalDevice)
     }
 
     #[expect(unused_variables, reason = "unimplemented")]
