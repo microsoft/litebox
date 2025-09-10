@@ -131,7 +131,7 @@ pub struct OpteeMsgArg {
     ret: u32,
     ret_origin: u32,
     num_params: u32,
-    params: [OpteeMsgParam; 4], // UteeParams by default support up to 4 parameters
+    params: [OpteeMsgParam; 6], // OpenSession: the first two params are not delivered to TA
 }
 
 // A placeholder for testing purposes. This isn't a real function signature.
@@ -182,6 +182,7 @@ pub fn mshv_vsm_optee_close_session(session_id: usize) -> Result<i64, Errno> {
 
 #[allow(clippy::unnecessary_wraps)]
 #[allow(clippy::too_many_lines)]
+#[allow(dead_code)]
 fn optee_test() -> Result<i64, Errno> {
     // open session for other example TAs
     let params = [
@@ -612,6 +613,23 @@ pub fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
                 OpteeSmcFunction::CallWithArg | OpteeSmcFunction::CallWithRpcArg => {
                     debug_serial_println!("OP-TEE SMC function ID: CallWithArg or CallWithRpcArg");
                     if let Ok(mut msg_arg) = optee_smc_args.optee_msg_arg() {
+                        // tiny hack to proceed. remove this later once copying results back to VTL0 works.
+                        msg_arg.ret = 0;
+                        msg_arg.session = 1;
+                        optee_smc_args.set_result(
+                            &OpteeSmcResult::Generic {
+                                status: OpteeSmcReturn::Ok,
+                            },
+                            Some(&msg_arg),
+                        );
+                        unsafe {
+                            let _ = crate::platform_low().copy_to_vtl0_phys::<OpteeSmcArgs>(
+                                optee_smc_args_page_addr,
+                                &optee_smc_args,
+                            );
+                        }
+                        // remove above later
+
                         process_optee_msg_arg(&mut msg_arg);
                         optee_smc_args.set_result(
                             &OpteeSmcResult::Generic {
@@ -734,8 +752,12 @@ pub fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
 }
 
 pub fn process_optee_msg_arg(msg_arg: &mut OpteeMsgArg) {
-    debug_serial_println!("optee_msg_arg cmd={:#x}", msg_arg.cmd);
-    for i in 0..usize::try_from(msg_arg.num_params.min(4)).unwrap_or(0) {
+    debug_serial_println!(
+        "optee_msg_arg cmd={:#x} func={:#x}",
+        msg_arg.cmd,
+        msg_arg.func
+    );
+    for i in 0..usize::try_from(msg_arg.num_params).unwrap_or(0) {
         debug_serial_println!(
             "param[{}] attr={:#x} a={:#x} b={:#x} c={:#x}",
             i,
@@ -751,8 +773,15 @@ pub fn process_optee_msg_arg(msg_arg: &mut OpteeMsgArg) {
             OpteeMessageCommand::OpenSession => UteeEntryFunc::OpenSession,
             OpteeMessageCommand::InvokeCommand => UteeEntryFunc::InvokeCommand,
             OpteeMessageCommand::CloseSession => UteeEntryFunc::CloseSession,
-            _ => UteeEntryFunc::Unknown, // either unupported or not for TAs (e.g., RegisterShm)
+            _ => UteeEntryFunc::Unknown,
         };
+    if utee_entry_func == UteeEntryFunc::Unknown {
+        // either unupported or not for TAs (e.g., RegisterShm)
+        msg_arg.ret = 0;
+        msg_arg.session = 1;
+        return;
+    }
+
     let cmd_id = msg_arg.func;
 
     let mut params = [
@@ -762,8 +791,16 @@ pub fn process_optee_msg_arg(msg_arg: &mut OpteeMsgArg) {
         UteeParamOwned::None,
     ];
 
-    for i in 0..usize::try_from(msg_arg.num_params.min(4)).unwrap_or(0) {
-        params[i] = match msg_arg.params[i].attr_type() {
+    let shift: u32 = if utee_entry_func == UteeEntryFunc::OpenSession {
+        2 // OpteeMessageCommand::OpenSession uses params[0] and params[1] for other purposes (i.e., to load TA binary)
+    } else {
+        0
+    };
+
+    for i in usize::try_from(shift).unwrap()
+        ..usize::try_from(msg_arg.num_params.min(shift + 4)).unwrap_or(0)
+    {
+        params[i - usize::try_from(shift).unwrap()] = match msg_arg.params[i].attr_type() {
             Ok(OpteeMsgAttrType::ValueInput) => UteeParamOwned::ValueInput {
                 value_a: msg_arg.params[i].u.a,
                 value_b: msg_arg.params[i].u.b,
@@ -814,8 +851,8 @@ pub fn process_optee_msg_arg(msg_arg: &mut OpteeMsgArg) {
         };
     }
 
-    // enter TA
-    // crate::optee_call(1, utee_entry_func, cmd_id, &params);
+    crate::optee_call(1, utee_entry_func, cmd_id, &params);
+    crate::optee_call_done(1);
 
     msg_arg.ret = 0;
     msg_arg.session = 1;

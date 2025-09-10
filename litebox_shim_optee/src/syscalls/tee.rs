@@ -51,7 +51,6 @@ pub fn sys_return(ret: usize) -> ! {
             let session_id = tid as u32;
             crate::optee_command_dispatcher(session_id, true);
         } else if #[cfg(feature = "platform_lvbs")] {
-            // todo!("switch to VTL0");
             crate::optee_command_dispatcher(1, true);
         } else {
             compile_error!(r##"No platform specified."##);
@@ -84,7 +83,7 @@ pub fn sys_panic(code: usize) -> ! {
         if #[cfg(feature = "platform_linux_userland")] {
             litebox_platform_multiplex::platform().terminate_thread(i32::try_from(code).unwrap_or(0));
         } else if #[cfg(feature = "platform_lvbs")] {
-            todo!("switch to VTL0");
+            crate::optee_command_dispatcher(1, true);
         } else {
             compile_error!(r##"No platform specified."##);
         }

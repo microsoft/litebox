@@ -590,13 +590,22 @@ fn handle_optee_command_output(session_id: u32) {
                             )
                         };
                         #[cfg(debug_assertions)]
-                        litebox::log_println!(
-                            litebox_platform_multiplex::platform(),
-                            "output (index: {}): {:#x} {:?}",
-                            idx,
-                            addr,
-                            slice
-                        );
+                        if slice.is_empty() {
+                            litebox::log_println!(
+                                litebox_platform_multiplex::platform(),
+                                "output (index: {}): {:#x}",
+                                idx,
+                                addr,
+                            );
+                        } else {
+                            litebox::log_println!(
+                                litebox_platform_multiplex::platform(),
+                                "output (index: {}): {:#x} {:?}",
+                                idx,
+                                addr,
+                                slice
+                            );
+                        }
                         if let Some(_out_addr) = cmd_result.out_addrs[idx] {
                             todo!("copy the result back to VTL0");
                         }
