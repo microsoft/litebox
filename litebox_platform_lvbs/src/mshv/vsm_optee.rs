@@ -30,62 +30,63 @@ pub enum OpteeMessageCommand {
     UnregisterShm = OPTEE_MSG_CMD_UNREGISTER_SHM,
     DoBottomHalf = OPTEE_MSG_CMD_DO_BOTTOM_HALF,
     StopAsyncNotif = OPTEE_MSG_CMD_STOP_ASYNC_NOTIF,
+    Unknown = 0xffff_ffff,
 }
 
-/// Temporary reference memory parameter
-/// buf_ptr: Address of the buffer
-/// size: Size of the buffer
-/// shm_ref: Temporary shared memory reference, pointer to a struct tee_shm
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-struct OpteeMsgParamTmem {
-    buf_ptr: u64,
-    size: u64,
-    shm_ref: u64,
-}
+// Temporary reference memory parameter
+// buf_ptr: Address of the buffer
+// size: Size of the buffer
+// shm_ref: Temporary shared memory reference, pointer to a struct tee_shm
+// #[derive(Clone, Copy, Debug)]
+// #[repr(C)]
+// struct OpteeMsgParamTmem {
+//     buf_ptr: u64,
+//     size: u64,
+//     shm_ref: u64,
+// }
 
-/// Registered memory reference parameter
-/// offs: Offset into shared memory reference
-/// size: Size of the buffer
-/// shm_ref: Shared memory reference, pointer to a struct tee_shm
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct OpteeMsgParamRmem {
-    offs: u64,
-    size: u64,
-    shm_ref: u64,
-}
+// Registered memory reference parameter
+// offs: Offset into shared memory reference
+// size: Size of the buffer
+// shm_ref: Shared memory reference, pointer to a struct tee_shm
+// #[derive(Clone, Copy)]
+// #[repr(C)]
+// struct OpteeMsgParamRmem {
+//     offs: u64,
+//     size: u64,
+//     shm_ref: u64,
+// }
 
 /// Opaque value parameter
 /// Value parameters are passed unchecked between normal and secure world.
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct OpteeMsgParamValue {
+pub struct OpteeMsgParamValue {
     a: u64,
     b: u64,
     c: u64,
 }
 
+// #[derive(Clone, Copy)]
+// #[repr(C)]
+// union OpteeMsgParamUnion {
+//     tmem: OpteeMsgParamTmem,
+//     rmem: OpteeMsgParamRmem,
+//     value: OpteeMsgParamValue,
+//     octets: [u8; 24],
+// }
+
 #[derive(Clone, Copy)]
 #[repr(C)]
-union OpteeMsgParamUnion {
-    tmem: OpteeMsgParamTmem,
-    rmem: OpteeMsgParamRmem,
-    value: OpteeMsgParamValue,
-    octets: [u8; 24],
+pub struct OpteeMsgParam {
+    attr: u64, // TODO: extract types (e.g., input, output, inout, ...)
+    // u: OpteeMsgParamUnion,
+    u: OpteeMsgParamValue, // simplify this for now
 }
 
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct OpteeMsgParam {
-    attr: u64, // TODO: modular_bitfield
-    u: OpteeMsgParamUnion,
-}
-
-#[expect(dead_code)]
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct OpteeMsgArg {
+pub struct OpteeMsgArg {
     cmd: u32,
     func: u32,
     session: u32,
@@ -94,7 +95,7 @@ struct OpteeMsgArg {
     ret: u32,
     ret_origin: u32,
     num_params: u32,
-    params: [OpteeMsgParam; 0],
+    params: [OpteeMsgParam; 4], // UteeParams by default support up to 4 parameters
 }
 
 // A placeholder for testing purposes. This isn't a real function signature.
@@ -350,7 +351,6 @@ struct OpteeSmcArgs {
 const NUM_OPTEE_SMC_ARGS: usize = 9;
 
 impl OpteeSmcArgs {
-    #[expect(dead_code)]
     pub fn arg_index(&self, index: usize) -> usize {
         match index {
             0..8 => self.args[index],
@@ -360,6 +360,54 @@ impl OpteeSmcArgs {
 
     pub fn func_id(&self) -> Result<OpteeSmcFunction, Errno> {
         OpteeSmcFunction::try_from(self.args[0] & 0xffff).map_err(|_| Errno::EINVAL)
+    }
+
+    fn optee_msg_arg_phys_addr(&self) -> Result<x86_64::PhysAddr, Errno> {
+        let addr = (self.args[2] as u64) | ((self.args[1] as u64) << 32);
+        x86_64::PhysAddr::try_new(addr).map_err(|_| Errno::EINVAL)
+    }
+
+    fn optee_msg_arg_phys_addr_from_cookie(&self) -> Result<x86_64::PhysAddr, Errno> {
+        let mut addr = (self.args[2] as u64) | ((self.args[1] as u64) << 32);
+        addr.checked_add(u64::try_from(self.args[3]).unwrap())
+            .ok_or(Errno::EINVAL)?;
+        x86_64::PhysAddr::try_new(addr).map_err(|_| Errno::EINVAL)
+    }
+
+    pub fn optee_msg_arg(&self) -> Result<OpteeMsgArg, Errno> {
+        let msg_arg_addr = match self.func_id() {
+            Ok(OpteeSmcFunction::CallWithArg | OpteeSmcFunction::CallWithRpcArg) => {
+                self.optee_msg_arg_phys_addr()
+            }
+            Ok(OpteeSmcFunction::CallWithRegdArg) => self.optee_msg_arg_phys_addr_from_cookie(),
+            _ => Err(Errno::EINVAL),
+        }?;
+
+        if let Some(msg_arg) =
+            unsafe { crate::platform_low().copy_from_vtl0_phys::<OpteeMsgArg>(msg_arg_addr) }
+        {
+            Ok(*msg_arg)
+        } else {
+            Err(Errno::EINVAL)
+        }
+    }
+
+    pub fn set_optee_msg_arg(&self, msg_arg: &OpteeMsgArg) -> Result<(), Errno> {
+        let msg_arg_addr = match self.func_id() {
+            Ok(OpteeSmcFunction::CallWithArg | OpteeSmcFunction::CallWithRpcArg) => {
+                self.optee_msg_arg_phys_addr()
+            }
+            Ok(OpteeSmcFunction::CallWithRegdArg) => self.optee_msg_arg_phys_addr_from_cookie(),
+            _ => Err(Errno::EINVAL),
+        }?;
+
+        if unsafe { crate::platform_low().copy_to_vtl0_phys::<OpteeMsgArg>(msg_arg_addr, msg_arg) }
+        {
+            Ok(())
+        } else {
+            debug_serial_println!("Failed to copy OpteeSmcArgs back to VTL0");
+            Err(Errno::EINVAL)
+        }
     }
 
     pub fn set_result(&mut self, result: &OpteeSmcResult) {
@@ -414,6 +462,8 @@ const OPTEE_SMC_FUNCID_GET_OS_REVISION: usize = 0x1;
 const OPTEE_SMC_FUNCID_CALL_WITH_ARG: usize = 0x4;
 const OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES: usize = 0x9;
 const OPTEE_SMC_FUNCID_DISABLE_SHM_CACHE: usize = 0xa;
+const OPTEE_SMC_FUNCID_CALL_WITH_RPC_ARG: usize = 0x12;
+const OPTEE_SMC_FUNCID_CALL_WITH_REGD_ARG: usize = 0x13;
 
 const OPTEE_SMC_FUNCID_CALLS_UID: usize = 0xff01;
 const OPTEE_SMC_FUNCID_CALLS_REVISION: usize = 0xff03;
@@ -425,6 +475,8 @@ pub enum OpteeSmcFunction {
     CallWithArg = OPTEE_SMC_FUNCID_CALL_WITH_ARG,
     ExchangeCapabilities = OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES,
     DisableShmCache = OPTEE_SMC_FUNCID_DISABLE_SHM_CACHE,
+    CallWithRpcArg = OPTEE_SMC_FUNCID_CALL_WITH_RPC_ARG,
+    CallWithRegdArg = OPTEE_SMC_FUNCID_CALL_WITH_REGD_ARG,
     CallsUid = OPTEE_SMC_FUNCID_CALLS_UID,
     CallsRevision = OPTEE_SMC_FUNCID_CALLS_REVISION,
 }
@@ -503,6 +555,7 @@ pub enum OpteeSmcReturn {
 }
 
 #[allow(clippy::unnecessary_wraps)]
+#[allow(clippy::too_many_lines)]
 pub fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
     if let Ok(optee_smc_args_page_addr) =
         x86_64::PhysAddr::try_new(optee_smc_args_pfn << crate::mshv::vtl1_mem_layout::PAGE_SHIFT)
@@ -512,10 +565,28 @@ pub fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
     {
         match optee_smc_args.func_id() {
             Ok(func_id) => match func_id {
-                OpteeSmcFunction::CallWithArg => {
+                OpteeSmcFunction::CallWithArg | OpteeSmcFunction::CallWithRpcArg => {
                     debug_serial_println!(
-                        "OP-TEE SMC SMC function ID: CallWithArg. 2nd argument would contain OpteeMsgArg"
+                        "OP-TEE SMC SMC function ID: CallWithArg or CallWithRpcArg"
                     );
+                    if let Ok(mut msg_arg) = optee_smc_args.optee_msg_arg() {
+                        process_optee_msg_arg(&mut msg_arg);
+                        if optee_smc_args.set_optee_msg_arg(&msg_arg).is_err() {
+                            return Errno::EINVAL.as_neg().into();
+                        }
+                    }
+                    optee_smc_args.set_result(&OpteeSmcResult::Generic {
+                        status: OpteeSmcReturn::Ok,
+                    });
+                }
+                OpteeSmcFunction::CallWithRegdArg => {
+                    debug_serial_println!("OP-TEE SMC function ID: CallWithRegdArg");
+                    if let Ok(mut msg_arg) = optee_smc_args.optee_msg_arg() {
+                        process_optee_msg_arg(&mut msg_arg);
+                        if optee_smc_args.set_optee_msg_arg(&msg_arg).is_err() {
+                            return Errno::EINVAL.as_neg().into();
+                        }
+                    }
                     optee_smc_args.set_result(&OpteeSmcResult::Generic {
                         status: OpteeSmcReturn::Ok,
                     });
@@ -589,4 +660,50 @@ pub fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
     } else {
         Errno::EINVAL.as_neg().into()
     }
+}
+
+pub fn process_optee_msg_arg(msg_arg: &mut OpteeMsgArg) {
+    match OpteeMessageCommand::try_from(msg_arg.cmd).unwrap_or(OpteeMessageCommand::Unknown) {
+        OpteeMessageCommand::OpenSession => {
+            debug_serial_println!("OP-TEE Message Command: OpenSession");
+            // TODO: convert msg_arg.params to UteeParamOwned and invoke optee_call()
+            // we should include output address into UteeParamOwned.
+        }
+        OpteeMessageCommand::InvokeCommand => {
+            debug_serial_println!("OP-TEE Message Command: InvokeCommand");
+        }
+        OpteeMessageCommand::CloseSession => {
+            debug_serial_println!("OP-TEE Message Command: CloseSession");
+        }
+        OpteeMessageCommand::Cancel => {
+            debug_serial_println!("OP-TEE Message Command: Cancel");
+        }
+        OpteeMessageCommand::RegisterShm => {
+            debug_serial_println!("OP-TEE Message Command: RegisterShm");
+        }
+        OpteeMessageCommand::UnregisterShm => {
+            debug_serial_println!("OP-TEE Message Command: UnregisterShm");
+        }
+        OpteeMessageCommand::DoBottomHalf => {
+            debug_serial_println!("OP-TEE Message Command: DoBottomHalf");
+        }
+        OpteeMessageCommand::StopAsyncNotif => {
+            debug_serial_println!("OP-TEE Message Command: StopAsyncNotif");
+        }
+        OpteeMessageCommand::Unknown => {
+            panic!("Unknown OP-TEE Message Command");
+        }
+    }
+    for i in 0..usize::try_from(msg_arg.num_params.min(4)).unwrap_or(0) {
+        debug_serial_println!(
+            "param[{}] attr={:#x} a={:#x} b={:#x} c={:#x}",
+            i,
+            msg_arg.params[i].attr,
+            msg_arg.params[i].u.a,
+            msg_arg.params[i].u.b,
+            msg_arg.params[i].u.c,
+        );
+    }
+    msg_arg.ret = 0;
+    msg_arg.session = 1;
 }
