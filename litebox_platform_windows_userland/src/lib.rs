@@ -935,14 +935,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     }
                                 );
                                 base_addr
-                            } 
+                            }
                             // Deal with collision with global allocator.
                             else if fixed_address {
                                 return Err(
                                     litebox::platform::page_mgmt::AllocationError::AlreadyAllocated,
                                 );
-                            } 
-                            else {
+                            } else {
                                 // We simply handle it as a new allocation request (for the whole range).
                                 return <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
                                         self,
