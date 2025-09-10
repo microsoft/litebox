@@ -644,11 +644,6 @@ fn handle_optee_command_output(session_id: u32) {
                         if !slice.is_empty()
                             && let Some(out_addr) = cmd_result.out_addrs[idx]
                         {
-                            litebox::log_println!(
-                                litebox_platform_multiplex::platform(),
-                                "out_addr: {:#x}",
-                                out_addr
-                            );
                             unsafe {
                                 litebox_platform_lvbs::platform_low().copy_slice_to_vtl0_phys(
                                     x86_64::PhysAddr::new(u64::try_from(out_addr).unwrap()),

@@ -6,8 +6,10 @@ use crate::debug_serial_println;
 
 use crate::user_context::UserSpaceManagement;
 use alloc::vec;
+use hashbrown::HashMap;
 use litebox_common_linux::errno::Errno;
 use num_enum::TryFromPrimitive;
+use once_cell::race::OnceBox;
 
 use litebox_common_optee::{TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams};
 
@@ -742,6 +744,7 @@ pub fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn decode_optee_msg_arg(
     msg_arg: &OpteeMsgArg,
     msg_arg_phys_addr: usize,
@@ -767,6 +770,24 @@ pub fn decode_optee_msg_arg(
         );
     }
 
+    match OpteeMessageCommand::try_from(msg_arg.cmd).unwrap_or(OpteeMessageCommand::Unknown) {
+        OpteeMessageCommand::RegisterShm => {
+            shm_ref_map().insert(
+                msg_arg.params[0].u.c,
+                ShmRefInfo {
+                    phys_addr: msg_arg.params[0].u.a,
+                    size: usize::try_from(msg_arg.params[0].u.b).unwrap(),
+                },
+            );
+            return None;
+        }
+        OpteeMessageCommand::UnregisterShm => {
+            shm_ref_map().remove(msg_arg.params[0].u.c);
+            return None;
+        }
+        _ => {}
+    }
+
     let utee_entry_func =
         match OpteeMessageCommand::try_from(msg_arg.cmd).unwrap_or(OpteeMessageCommand::Unknown) {
             OpteeMessageCommand::OpenSession => UteeEntryFunc::OpenSession,
@@ -775,7 +796,7 @@ pub fn decode_optee_msg_arg(
             _ => UteeEntryFunc::Unknown,
         };
     if utee_entry_func == UteeEntryFunc::Unknown {
-        // either unupported or not for TAs (e.g., RegisterShm)
+        // either unupported or not for TAs
         return None;
     }
 
@@ -817,39 +838,50 @@ pub fn decode_optee_msg_arg(
                     + core::mem::offset_of!(OpteeMsgParam, u),
             },
             Ok(OpteeMsgAttrType::RmemInput | OpteeMsgAttrType::TmemInput) => {
-                // TODO: `u.c` can contain a virtual address (shared mem cookie?) of data.
-                // it seems that we should maintain the address of shared memory and figure out the actual
-                // physical address based on them.
-                let mut data = vec![0u8; usize::try_from(msg_arg.params[i].u.b).unwrap()];
-                if unsafe {
-                    crate::platform_low().copy_slice_from_vtl0_phys(
-                        x86_64::PhysAddr::new(msg_arg.params[i].u.a),
-                        &mut data,
-                    )
-                } {
-                    UteeParamOwned::MemrefInput { data: data.into() }
+                if let Some(phys_addr) =
+                    get_vtl0_phys_addr_from_optee_msg_param(msg_arg.params[i].u)
+                {
+                    let mut data = vec![0u8; usize::try_from(msg_arg.params[i].u.b).unwrap()];
+                    if unsafe {
+                        crate::platform_low()
+                            .copy_slice_from_vtl0_phys(x86_64::PhysAddr::new(phys_addr), &mut data)
+                    } {
+                        UteeParamOwned::MemrefInput { data: data.into() }
+                    } else {
+                        UteeParamOwned::None
+                    }
                 } else {
                     UteeParamOwned::None
                 }
             }
             Ok(OpteeMsgAttrType::RmemOutput | OpteeMsgAttrType::TmemOutput) => {
-                UteeParamOwned::MemrefOutput {
-                    buffer_size: usize::try_from(msg_arg.params[i].u.b).unwrap(),
-                    out_address: usize::try_from(msg_arg.params[i].u.a).unwrap(),
+                if let Some(phys_addr) =
+                    get_vtl0_phys_addr_from_optee_msg_param(msg_arg.params[i].u)
+                {
+                    UteeParamOwned::MemrefOutput {
+                        buffer_size: usize::try_from(msg_arg.params[i].u.b).unwrap(),
+                        out_address: usize::try_from(phys_addr).unwrap(),
+                    }
+                } else {
+                    UteeParamOwned::None
                 }
             }
             Ok(OpteeMsgAttrType::RmemInout | OpteeMsgAttrType::TmemInout) => {
-                let mut data = vec![0u8; usize::try_from(msg_arg.params[i].u.b).unwrap()];
-                if unsafe {
-                    crate::platform_low().copy_slice_from_vtl0_phys(
-                        x86_64::PhysAddr::new(msg_arg.params[i].u.a),
-                        &mut data,
-                    )
-                } {
-                    UteeParamOwned::MemrefInout {
-                        data: data.into(),
-                        buffer_size: usize::try_from(msg_arg.params[i].u.b).unwrap(),
-                        out_address: usize::try_from(msg_arg.params[i].u.a).unwrap(),
+                if let Some(phys_addr) =
+                    get_vtl0_phys_addr_from_optee_msg_param(msg_arg.params[i].u)
+                {
+                    let mut data = vec![0u8; usize::try_from(msg_arg.params[i].u.b).unwrap()];
+                    if unsafe {
+                        crate::platform_low()
+                            .copy_slice_from_vtl0_phys(x86_64::PhysAddr::new(phys_addr), &mut data)
+                    } {
+                        UteeParamOwned::MemrefInout {
+                            data: data.into(),
+                            buffer_size: usize::try_from(msg_arg.params[i].u.b).unwrap(),
+                            out_address: usize::try_from(phys_addr).unwrap(),
+                        }
+                    } else {
+                        UteeParamOwned::None
                     }
                 } else {
                     UteeParamOwned::None
@@ -860,4 +892,58 @@ pub fn decode_optee_msg_arg(
     }
 
     Some((1, utee_entry_func, cmd_id, params))
+}
+
+fn get_vtl0_phys_addr_from_optee_msg_param(param: OpteeMsgParamValue) -> Option<u64> {
+    if param.c == 0 {
+        // temporary memory
+        if param.a == 0 { None } else { Some(param.a) }
+    } else if let Some(shm_ref_info) = shm_ref_map().get(param.c) {
+        if shm_ref_info.size >= usize::try_from(param.a + param.b).unwrap() {
+            Some(shm_ref_info.phys_addr + param.a)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Maintain the physical address of `shm_ref` in VTL0
+pub(crate) struct ShmRefMap {
+    inner: spin::mutex::SpinMutex<HashMap<u64, ShmRefInfo>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct ShmRefInfo {
+    pub phys_addr: u64,
+    pub size: usize,
+}
+
+impl ShmRefMap {
+    pub fn new() -> Self {
+        Self {
+            inner: spin::mutex::SpinMutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn insert(&self, shm_ref: u64, info: ShmRefInfo) {
+        let mut guard = self.inner.lock();
+        guard.insert(shm_ref, info);
+    }
+
+    pub fn remove(&self, shm_ref: u64) {
+        let mut guard = self.inner.lock();
+        guard.remove(&shm_ref);
+    }
+
+    pub fn get(&self, shm_ref: u64) -> Option<ShmRefInfo> {
+        let guard = self.inner.lock();
+        guard.get(&shm_ref).copied()
+    }
+}
+
+fn shm_ref_map() -> &'static ShmRefMap {
+    static SHM_REF_MAP: OnceBox<ShmRefMap> = OnceBox::new();
+    SHM_REF_MAP.get_or_init(|| alloc::boxed::Box::new(ShmRefMap::new()))
 }
