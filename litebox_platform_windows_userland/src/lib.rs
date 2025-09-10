@@ -848,8 +848,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 );
 
                 let size_within_region = core::cmp::min(size, region_end - suggested_range.start);
-                let mut fallthrough_on_committed = false;
-
                 let ptr = unsafe {
                     match mbi.State {
                         // In case the region is already reserved, we just need to commit it.
@@ -883,34 +881,27 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                         }
                         // In case the region is already committed, we just need to change its permissions.
                         Win32_Memory::MEM_COMMIT => {
-                            if fixed_address {
-                                let mut old_protect: u32 = 0;
-                                assert!(
-                                    Win32_Memory::VirtualProtect(
-                                        base_addr,
-                                        size_within_region,
-                                        prot_flags(initial_permissions),
-                                        &raw mut old_protect,
-                                    ) != 0,
-                                    "{}",
-                                    {
-                                        let last_error = GetLastError();
-                                        format!(
-                                            "VirtualProtect failed. Range (0x{:x} - 0x{:x}). Error: {}. Str: {}",
-                                            base_addr as usize,
-                                            (base_addr as usize + size_within_region),
-                                            last_error,
-                                            werr_text(last_error)
-                                        )
-                                    }
-                                );
-                                base_addr
-                            } else {
-                                // If there is no `fixed_address` requirement, we perform another reservation & commitment
-                                // without specifying the range.
-                                fallthrough_on_committed = true;
-                                null_mut()
-                            }
+                            let mut old_protect: u32 = 0;
+                            assert!(
+                                Win32_Memory::VirtualProtect(
+                                    base_addr,
+                                    size_within_region,
+                                    prot_flags(initial_permissions),
+                                    &raw mut old_protect,
+                                ) != 0,
+                                "{}",
+                                {
+                                    let last_error = GetLastError();
+                                    format!(
+                                        "VirtualProtect failed. Range (0x{:x} - 0x{:x}). Error: {}. Str: {}",
+                                        base_addr as usize,
+                                        (base_addr as usize + size_within_region),
+                                        last_error,
+                                        werr_text(last_error)
+                                    )
+                                }
+                            );
+                            base_addr
                         }
                         _ => {
                             panic!("Unexpected memory state: {:?}", mbi.State);
@@ -918,63 +909,30 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     }
                 };
 
-                if fallthrough_on_committed {
-                    // If the region is already committed, and there is no `fixed_address` requirement,
-                    // we perform another reservation & commitment without specifying the range.
-                    let aligned_size = self.round_up_to_granu(size);
-                    let addr: *mut c_void = unsafe {
-                        VirtualAlloc2(
-                            GetCurrentProcess(),
-                            null_mut(),
-                            aligned_size,
-                            Win32_Memory::MEM_COMMIT | Win32_Memory::MEM_RESERVE,
-                            prot_flags(initial_permissions),
-                            core::ptr::null_mut(),
-                            0,
-                        )
-                    };
-                    assert!(!addr.is_null(), "{}", {
-                        let last_error = unsafe { GetLastError() };
-                        format!(
-                            "VirtualAlloc2 failed (with base_addr 0). Permissions: {:?}. Error: {} str: {}.",
-                            initial_permissions,
-                            last_error,
-                            werr_text(last_error)
-                        )
-                    });
-                    // Prefetch the memory range if requested
-                    if populate_pages_immediately {
-                        do_prefetch_on_range(addr as usize, size);
-                    }
-                    return Ok(litebox::platform::trivial_providers::TransparentMutPtr {
-                        inner: addr.cast::<u8>(),
-                    });
-                } else {
-                    // Prefetch the memory range if requested
-                    if populate_pages_immediately {
-                        do_prefetch_on_range(ptr as usize, size_within_region);
-                    }
-
-                    // If the requested end address is beyond the reserved region (cross the region),
-                    // we need to allocate more memory.
-                    if request_end > region_end {
-                        // In case of cross-region allocation, we must ensure that the virtual address
-                        // returned by VirtualAlloc2 is the expected start address (contiguous with the
-                        // already reserved region).
-                        <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
-                            self,
-                            region_end..request_end,
-                            initial_permissions,
-                            can_grow_down,
-                            populate_pages_immediately,
-                            true,
-                        )?;
-                    }
-
-                    return Ok(litebox::platform::trivial_providers::TransparentMutPtr {
-                        inner: base_addr.cast::<u8>(),
-                    });
+                // Prefetch the memory range if requested
+                if populate_pages_immediately {
+                    do_prefetch_on_range(ptr as usize, size_within_region);
                 }
+
+                // If the requested end address is beyond the reserved region (cross the region),
+                // we need to allocate more memory.
+                if request_end > region_end {
+                    // In case of cross-region allocation, we must ensure that the virtual address
+                    // returned by VirtualAlloc2 is the expected start address (contiguous with the
+                    // already reserved region).
+                    <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
+                        self,
+                        region_end..request_end,
+                        initial_permissions,
+                        can_grow_down,
+                        populate_pages_immediately,
+                        true,
+                    )?;
+                }
+
+                return Ok(litebox::platform::trivial_providers::TransparentMutPtr {
+                    inner: base_addr.cast::<u8>(),
+                });
             }
             // If the region is not reserved or committed, we just need to reserve and commit it.
             // Fallthrough to the next step.
