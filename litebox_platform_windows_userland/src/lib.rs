@@ -7,9 +7,9 @@
 use core::panic;
 use core::sync::atomic::AtomicU32;
 use core::time::Duration;
+use rangemap::RangeSet;
 use std::cell::Cell;
 use std::os::raw::c_void;
-use std::ptr::null_mut;
 use std::sync::atomic::Ordering::SeqCst;
 
 use litebox::platform::RawConstPointer;
@@ -41,6 +41,9 @@ use windows_sys::Win32::{
 mod perf_counter;
 
 extern crate alloc;
+
+/// Global memory tracker to maintain all committed memory ranges from the PageManagementProvider
+static MEMORY_TRACKER: std::sync::RwLock<RangeSet<usize>> = std::sync::RwLock::new(RangeSet::new());
 
 /// Per-thread FS base storage structure
 /// Clone and Copy are required to use std::cell::Cell.
@@ -83,6 +86,24 @@ pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<WindowsUserlan
 
 /// The syscall handler passed down from the shim.
 static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
+
+/// Helper functions for managing the global memory tracker
+fn track_committed_memory(range: core::ops::Range<usize>) {
+    let mut tracker = MEMORY_TRACKER.write().unwrap();
+    tracker.insert(range);
+}
+
+fn untrack_committed_memory(range: core::ops::Range<usize>) {
+    let mut tracker = MEMORY_TRACKER.write().unwrap();
+    tracker.remove(range);
+}
+
+#[allow(dead_code)]
+fn is_range_within_committed(range: &core::ops::Range<usize>) -> bool {
+    let tracker = MEMORY_TRACKER.read().unwrap();
+    // No gapped overlapping means the range is fully covered
+    tracker.gaps(range).count() == 0
+}
 
 struct TlsSlot {
     dwtlsindex: u32,
@@ -877,31 +898,58 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     "VirtualAlloc2(COMMIT) returned address {ptr:p} which is not the expected fixed address {base_addr:p}",
                                 );
                             }
+
+                            // Track the committed memory range
+                            track_committed_memory(
+                                (ptr as usize)..(ptr as usize + size_within_region),
+                            );
+
                             ptr
                         }
-                        // In case the region is already committed, we just need to change its permissions.
+
+                        // In case the region is already committed, we make sure the already committed region is in the tracker.
+                        // We simply change the protection flags of the region (if in the tracker). Otherwise it means we are
+                        // colluding with the global memory allocator and we have to handle new allocation.
                         Win32_Memory::MEM_COMMIT => {
-                            let mut old_protect: u32 = 0;
-                            assert!(
-                                Win32_Memory::VirtualProtect(
-                                    base_addr,
-                                    size_within_region,
-                                    prot_flags(initial_permissions),
-                                    &raw mut old_protect,
-                                ) != 0,
-                                "{}",
-                                {
-                                    let last_error = GetLastError();
-                                    format!(
-                                        "VirtualProtect failed. Range (0x{:x} - 0x{:x}). Error: {}. Str: {}",
-                                        base_addr as usize,
-                                        (base_addr as usize + size_within_region),
-                                        last_error,
-                                        werr_text(last_error)
-                                    )
-                                }
-                            );
-                            base_addr
+                            let committed_range =
+                                (base_addr as usize)..(base_addr as usize + size_within_region);
+                            if is_range_within_committed(&committed_range) {
+                                let mut old_protect: u32 = 0;
+                                assert!(
+                                    Win32_Memory::VirtualProtect(
+                                        base_addr,
+                                        size_within_region,
+                                        prot_flags(initial_permissions),
+                                        &raw mut old_protect,
+                                    ) != 0,
+                                    "{}",
+                                    {
+                                        let last_error = GetLastError();
+                                        format!(
+                                            "VirtualProtect failed. Range (0x{:x} - 0x{:x}). Error: {}. Str: {}",
+                                            base_addr as usize,
+                                            (base_addr as usize + size_within_region),
+                                            last_error,
+                                            werr_text(last_error)
+                                        )
+                                    }
+                                );
+                                base_addr
+                            } else if fixed_address {
+                                return Err(
+                                    litebox::platform::page_mgmt::AllocationError::AlreadyAllocated,
+                                );
+                            } else {
+                                // We simply handle it as a new allocation request (for the whole range).
+                                return <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
+                                        self,
+                                        0..size,
+                                        initial_permissions,
+                                        can_grow_down,
+                                        populate_pages_immediately,
+                                        false,
+                                        );
+                            }
                         }
                         _ => {
                             panic!("Unexpected memory state: {:?}", mbi.State);
@@ -998,6 +1046,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
         let range_allocated = (addr as usize)..(addr as usize + available_size);
 
+        // Track the committed memory range
+        track_committed_memory(range_allocated.clone());
+
         // Prefetch the memory range if requested
         if populate_pages_immediately {
             do_prefetch_on_range(addr as usize, available_size);
@@ -1062,6 +1113,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                         werr_text(last_error)
                     )
                 });
+
+                // Untrack the decommitted memory range
+                untrack_committed_memory(decommit_base..(decommit_base + free_size));
             }
             decommit_base = next;
         }
