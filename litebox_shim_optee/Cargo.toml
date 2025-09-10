@@ -30,6 +30,9 @@ thiserror = { version = "2.0.6", default-features = false }
 # NOTE: We must keep this in sync with the version above.
 elf_loader = { version = "0.12.0", default-features = false, features = ["rel"] }
 
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
+
 [features]
 default = ["platform_lvbs"]
 platform_linux_userland = ["litebox_platform_multiplex/platform_linux_userland_with_optee_syscall"]

@@ -414,7 +414,7 @@ impl OpteeSmcArgs {
     }
 
     /// Get `OpteeMsgArg` from VTL0's memory using OP-TEE SMC call arguments.
-    pub fn optee_msg_arg(&self) -> Result<OpteeMsgArg, Errno> {
+    pub fn optee_msg_arg(&self) -> Result<(OpteeMsgArg, usize), Errno> {
         let msg_arg_addr = match self.func_id() {
             Ok(OpteeSmcFunction::CallWithArg | OpteeSmcFunction::CallWithRpcArg) => {
                 self.optee_msg_arg_phys_addr()
@@ -426,7 +426,7 @@ impl OpteeSmcArgs {
         if let Some(msg_arg) =
             unsafe { crate::platform_low().copy_from_vtl0_phys::<OpteeMsgArg>(msg_arg_addr) }
         {
-            Ok(*msg_arg)
+            Ok((*msg_arg, usize::try_from(msg_arg_addr.as_u64()).unwrap()))
         } else {
             Err(Errno::EINVAL)
         }
@@ -610,10 +610,12 @@ pub fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
     {
         match optee_smc_args.func_id() {
             Ok(func_id) => match func_id {
-                OpteeSmcFunction::CallWithArg | OpteeSmcFunction::CallWithRpcArg => {
-                    debug_serial_println!("OP-TEE SMC function ID: CallWithArg or CallWithRpcArg");
-                    if let Ok(mut msg_arg) = optee_smc_args.optee_msg_arg() {
-                        // tiny hack to proceed. remove this later once copying results back to VTL0 works.
+                OpteeSmcFunction::CallWithArg
+                | OpteeSmcFunction::CallWithRpcArg
+                | OpteeSmcFunction::CallWithRegdArg => {
+                    debug_serial_println!("OP-TEE SMC function ID: CallWith*Arg");
+                    if let Ok((mut msg_arg, msg_arg_phys_addr)) = optee_smc_args.optee_msg_arg() {
+                        // tiny hack to proceed. remove this later once copying results back to VTL0 correctly works.
                         msg_arg.ret = 0;
                         msg_arg.session = 1;
                         optee_smc_args.set_result(
@@ -630,32 +632,21 @@ pub fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
                         }
                         // remove above later
 
-                        process_optee_msg_arg(&mut msg_arg);
-                        optee_smc_args.set_result(
-                            &OpteeSmcResult::Generic {
-                                status: OpteeSmcReturn::Ok,
-                            },
-                            Some(&msg_arg),
-                        );
-                    } else {
-                        optee_smc_args.set_result(
-                            &OpteeSmcResult::Generic {
-                                status: OpteeSmcReturn::EBadAddr,
-                            },
-                            None,
-                        );
-                    }
-                }
-                OpteeSmcFunction::CallWithRegdArg => {
-                    debug_serial_println!("OP-TEE SMC function ID: CallWithRegdArg");
-                    if let Ok(mut msg_arg) = optee_smc_args.optee_msg_arg() {
-                        process_optee_msg_arg(&mut msg_arg);
-                        optee_smc_args.set_result(
-                            &OpteeSmcResult::Generic {
-                                status: OpteeSmcReturn::Ok,
-                            },
-                            Some(&msg_arg),
-                        );
+                        if let Some((session_id, utee_entry_func, cmd_id, params)) =
+                            decode_optee_msg_arg(&msg_arg, msg_arg_phys_addr)
+                        {
+                            crate::optee_call(session_id, utee_entry_func, cmd_id, &params);
+                            crate::optee_call_done(session_id);
+                            msg_arg.ret = 0;
+                            msg_arg.session = session_id;
+                            optee_smc_args.set_result(
+                                &OpteeSmcResult::Generic {
+                                    status: OpteeSmcReturn::Ok,
+                                },
+                                Some(&msg_arg),
+                            );
+                        }
+                        return 0; // tiny hack. remove it later.
                     } else {
                         optee_smc_args.set_result(
                             &OpteeSmcResult::Generic {
@@ -751,7 +742,15 @@ pub fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
     }
 }
 
-pub fn process_optee_msg_arg(msg_arg: &mut OpteeMsgArg) {
+pub fn decode_optee_msg_arg(
+    msg_arg: &OpteeMsgArg,
+    msg_arg_phys_addr: usize,
+) -> Option<(
+    u32,
+    UteeEntryFunc,
+    u32,
+    [UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS],
+)> {
     debug_serial_println!(
         "optee_msg_arg cmd={:#x} func={:#x}",
         msg_arg.cmd,
@@ -777,9 +776,7 @@ pub fn process_optee_msg_arg(msg_arg: &mut OpteeMsgArg) {
         };
     if utee_entry_func == UteeEntryFunc::Unknown {
         // either unupported or not for TAs (e.g., RegisterShm)
-        msg_arg.ret = 0;
-        msg_arg.session = 1;
-        return;
+        return None;
     }
 
     let cmd_id = msg_arg.func;
@@ -805,13 +802,24 @@ pub fn process_optee_msg_arg(msg_arg: &mut OpteeMsgArg) {
                 value_a: msg_arg.params[i].u.a,
                 value_b: msg_arg.params[i].u.b,
             },
-            Ok(OpteeMsgAttrType::ValueOutput) => UteeParamOwned::ValueOutput { out_address: 0 },
+            Ok(OpteeMsgAttrType::ValueOutput) => UteeParamOwned::ValueOutput {
+                out_address: msg_arg_phys_addr
+                    + core::mem::offset_of!(OpteeMsgArg, params)
+                    + core::mem::size_of::<OpteeMsgParam>() * i
+                    + core::mem::offset_of!(OpteeMsgParam, u),
+            },
             Ok(OpteeMsgAttrType::ValueInout) => UteeParamOwned::ValueInout {
                 value_a: msg_arg.params[i].u.a,
                 value_b: msg_arg.params[i].u.b,
-                out_address: 0,
+                out_address: msg_arg_phys_addr
+                    + core::mem::offset_of!(OpteeMsgArg, params)
+                    + core::mem::size_of::<OpteeMsgParam>() * i
+                    + core::mem::offset_of!(OpteeMsgParam, u),
             },
             Ok(OpteeMsgAttrType::RmemInput | OpteeMsgAttrType::TmemInput) => {
+                // TODO: `u.c` can contain a virtual address (shared mem cookie?) of data.
+                // it seems that we should maintain the address of shared memory and figure out the actual
+                // physical address based on them.
                 let mut data = vec![0u8; usize::try_from(msg_arg.params[i].u.b).unwrap()];
                 if unsafe {
                     crate::platform_low().copy_slice_from_vtl0_phys(
@@ -851,9 +859,5 @@ pub fn process_optee_msg_arg(msg_arg: &mut OpteeMsgArg) {
         };
     }
 
-    crate::optee_call(1, utee_entry_func, cmd_id, &params);
-    crate::optee_call_done(1);
-
-    msg_arg.ret = 0;
-    msg_arg.session = 1;
+    Some((1, utee_entry_func, cmd_id, params))
 }

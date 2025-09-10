@@ -461,7 +461,34 @@ pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
 
         let cmd_result = OpteeCommandResult {
             params_addr: stack.get_params_address(),
-            out_addrs: [None; UteeParamOwned::TEE_NUM_PARAMS],
+            out_addrs: {
+                let mut addrs = [None; UteeParamOwned::TEE_NUM_PARAMS];
+                for (i, param) in cmd.params.iter().enumerate() {
+                    match *param {
+                        UteeParamOwned::ValueOutput { out_address }
+                        | UteeParamOwned::ValueInout {
+                            value_a: _,
+                            value_b: _,
+                            out_address,
+                        }
+                        | UteeParamOwned::MemrefOutput {
+                            buffer_size: _,
+                            out_address,
+                        }
+                        | UteeParamOwned::MemrefInout {
+                            data: _,
+                            buffer_size: _,
+                            out_address,
+                        } => {
+                            if out_address != 0 {
+                                addrs[i] = Some(out_address);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                addrs
+            },
         };
         optee_command_completion_queue().push(session_id, cmd_result);
 
@@ -576,8 +603,16 @@ fn handle_optee_command_output(session_id: u32) {
                             value_a,
                             value_b,
                         );
-                        if let Some(_out_addr) = cmd_result.out_addrs[idx] {
-                            todo!("copy the result back to VTL0");
+                        if let Some(out_addr) = cmd_result.out_addrs[idx] {
+                            let mut buffer = [0u8; 16];
+                            buffer[..8].copy_from_slice(&value_a.to_le_bytes());
+                            buffer[8..].copy_from_slice(&value_b.to_le_bytes());
+                            unsafe {
+                                litebox_platform_lvbs::platform_low().copy_slice_to_vtl0_phys(
+                                    x86_64::PhysAddr::new(u64::try_from(out_addr).unwrap()),
+                                    &buffer,
+                                );
+                            }
                         }
                     }
                 }
@@ -606,8 +641,20 @@ fn handle_optee_command_output(session_id: u32) {
                                 slice
                             );
                         }
-                        if let Some(_out_addr) = cmd_result.out_addrs[idx] {
-                            todo!("copy the result back to VTL0");
+                        if !slice.is_empty()
+                            && let Some(out_addr) = cmd_result.out_addrs[idx]
+                        {
+                            litebox::log_println!(
+                                litebox_platform_multiplex::platform(),
+                                "out_addr: {:#x}",
+                                out_addr
+                            );
+                            unsafe {
+                                litebox_platform_lvbs::platform_low().copy_slice_to_vtl0_phys(
+                                    x86_64::PhysAddr::new(u64::try_from(out_addr).unwrap()),
+                                    slice,
+                                );
+                            }
                         }
                     }
                 }
