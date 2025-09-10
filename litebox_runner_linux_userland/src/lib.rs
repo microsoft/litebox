@@ -50,6 +50,9 @@ pub struct CliArgs {
         default_value = "seccomp"
     )]
     pub interception_backend: InterceptionBackend,
+    #[arg(long = "tun-device-name", requires = "unstable", help_heading = "Unstable Options",
+          help = "If provided, connect to a TUN device with this name inside the LiteBox instance")]
+    pub tun_device_name: Option<String>,
 }
 
 /// Backends supported for intercepting syscalls
@@ -119,7 +122,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // TODO: We also need to pick the type of syscall interception based on whether we want
     // systrap/sigsys interception, or binary rewriting interception. Currently
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
-    let platform = Platform::new(None);
+    let platform = Platform::new(cli_args.tun_device_name.as_deref());
     let litebox = LiteBox::new(platform);
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
