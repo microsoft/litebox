@@ -5,6 +5,7 @@
 use crate::debug_serial_println;
 
 use crate::user_context::UserSpaceManagement;
+use alloc::vec;
 use litebox_common_linux::errno::Errno;
 use num_enum::TryFromPrimitive;
 
@@ -76,12 +77,47 @@ pub struct OpteeMsgParamValue {
 //     octets: [u8; 24],
 // }
 
+const OPTEE_MSG_ATTR_TYPE_NONE: u64 = 0x0;
+const OPTEE_MSG_ATTR_TYPE_VALUE_INPUT: u64 = 0x1;
+const OPTEE_MSG_ATTR_TYPE_VALUE_OUTPUT: u64 = 0x2;
+const OPTEE_MSG_ATTR_TYPE_VALUE_INOUT: u64 = 0x3;
+const OPTEE_MSG_ATTR_TYPE_RMEM_INPUT: u64 = 0x5;
+const OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT: u64 = 0x6;
+const OPTEE_MSG_ATTR_TYPE_RMEM_INOUT: u64 = 0x7;
+// const OPTEE_MSG_ATTR_TYPE_FMEM_INPUT: u64 = OPTEE_MSG_ATTR_TYPE_RMEM_INPUT;
+// const OPTEE_MSG_ATTR_TYPE_FMEM_OUTPUT: u64 = OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT;
+// const OPTEE_MSG_ATTR_TYPE_FMEM_INOUT: u64 = OPTEE_MSG_ATTR_TYPE_RMEM_INOUT;
+const OPTEE_MSG_ATTR_TYPE_TMEM_INPUT: u64 = 0x9;
+const OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT: u64 = 0xa;
+const OPTEE_MSG_ATTR_TYPE_TMEM_INOUT: u64 = 0xb;
+
+#[derive(Debug, PartialEq, TryFromPrimitive)]
+#[repr(u64)]
+pub enum OpteeMsgAttrType {
+    None = OPTEE_MSG_ATTR_TYPE_NONE,
+    ValueInput = OPTEE_MSG_ATTR_TYPE_VALUE_INPUT,
+    ValueOutput = OPTEE_MSG_ATTR_TYPE_VALUE_OUTPUT,
+    ValueInout = OPTEE_MSG_ATTR_TYPE_VALUE_INOUT,
+    RmemInput = OPTEE_MSG_ATTR_TYPE_RMEM_INPUT,
+    RmemOutput = OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT,
+    RmemInout = OPTEE_MSG_ATTR_TYPE_RMEM_INOUT,
+    TmemInput = OPTEE_MSG_ATTR_TYPE_TMEM_INPUT,
+    TmemOutput = OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT,
+    TmemInout = OPTEE_MSG_ATTR_TYPE_TMEM_INOUT,
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct OpteeMsgParam {
-    attr: u64, // TODO: extract types (e.g., input, output, inout, ...)
+    attr: u64,
     // u: OpteeMsgParamUnion,
     u: OpteeMsgParamValue, // simplify this for now
+}
+
+impl OpteeMsgParam {
+    pub fn attr_type(&self) -> Result<OpteeMsgAttrType, Errno> {
+        OpteeMsgAttrType::try_from(self.attr & 0xff).map_err(|_| Errno::EINVAL)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -351,6 +387,7 @@ struct OpteeSmcArgs {
 const NUM_OPTEE_SMC_ARGS: usize = 9;
 
 impl OpteeSmcArgs {
+    #[allow(dead_code)]
     pub fn arg_index(&self, index: usize) -> usize {
         match index {
             0..8 => self.args[index],
@@ -358,6 +395,7 @@ impl OpteeSmcArgs {
         }
     }
 
+    /// Get the function ID of an OP-TEE SMC call.
     pub fn func_id(&self) -> Result<OpteeSmcFunction, Errno> {
         OpteeSmcFunction::try_from(self.args[0] & 0xffff).map_err(|_| Errno::EINVAL)
     }
@@ -368,12 +406,13 @@ impl OpteeSmcArgs {
     }
 
     fn optee_msg_arg_phys_addr_from_cookie(&self) -> Result<x86_64::PhysAddr, Errno> {
-        let mut addr = (self.args[2] as u64) | ((self.args[1] as u64) << 32);
+        let addr = (self.args[2] as u64) | ((self.args[1] as u64) << 32);
         addr.checked_add(u64::try_from(self.args[3]).unwrap())
             .ok_or(Errno::EINVAL)?;
         x86_64::PhysAddr::try_new(addr).map_err(|_| Errno::EINVAL)
     }
 
+    /// Get `OpteeMsgArg` from VTL0's memory using OP-TEE SMC call arguments.
     pub fn optee_msg_arg(&self) -> Result<OpteeMsgArg, Errno> {
         let msg_arg_addr = match self.func_id() {
             Ok(OpteeSmcFunction::CallWithArg | OpteeSmcFunction::CallWithRpcArg) => {
@@ -392,7 +431,7 @@ impl OpteeSmcArgs {
         }
     }
 
-    pub fn set_optee_msg_arg(&self, msg_arg: &OpteeMsgArg) -> Result<(), Errno> {
+    fn set_optee_msg_arg(&self, msg_arg: &OpteeMsgArg) -> Result<(), Errno> {
         let msg_arg_addr = match self.func_id() {
             Ok(OpteeSmcFunction::CallWithArg | OpteeSmcFunction::CallWithRpcArg) => {
                 self.optee_msg_arg_phys_addr()
@@ -410,10 +449,15 @@ impl OpteeSmcArgs {
         }
     }
 
-    pub fn set_result(&mut self, result: &OpteeSmcResult) {
+    /// Set the result of an OP-TEE SMC call. This function overwrites VTL0's memory containing
+    /// `OpTeeSmcArgs` and possibly `OpteeMsgArg`.
+    pub fn set_result(&mut self, result: &OpteeSmcResult, msg_arg: Option<&OpteeMsgArg>) {
         match result {
             OpteeSmcResult::Generic { status } => {
                 self.args[0] = *status as usize;
+                if let Some(msg_arg) = msg_arg {
+                    let _ = self.set_optee_msg_arg(msg_arg);
+                }
             }
             OpteeSmcResult::ExchangeCapabilities {
                 status,
@@ -566,76 +610,103 @@ pub fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
         match optee_smc_args.func_id() {
             Ok(func_id) => match func_id {
                 OpteeSmcFunction::CallWithArg | OpteeSmcFunction::CallWithRpcArg => {
-                    debug_serial_println!(
-                        "OP-TEE SMC SMC function ID: CallWithArg or CallWithRpcArg"
-                    );
+                    debug_serial_println!("OP-TEE SMC function ID: CallWithArg or CallWithRpcArg");
                     if let Ok(mut msg_arg) = optee_smc_args.optee_msg_arg() {
                         process_optee_msg_arg(&mut msg_arg);
-                        if optee_smc_args.set_optee_msg_arg(&msg_arg).is_err() {
-                            return Errno::EINVAL.as_neg().into();
-                        }
+                        optee_smc_args.set_result(
+                            &OpteeSmcResult::Generic {
+                                status: OpteeSmcReturn::Ok,
+                            },
+                            Some(&msg_arg),
+                        );
+                    } else {
+                        optee_smc_args.set_result(
+                            &OpteeSmcResult::Generic {
+                                status: OpteeSmcReturn::EBadAddr,
+                            },
+                            None,
+                        );
                     }
-                    optee_smc_args.set_result(&OpteeSmcResult::Generic {
-                        status: OpteeSmcReturn::Ok,
-                    });
                 }
                 OpteeSmcFunction::CallWithRegdArg => {
                     debug_serial_println!("OP-TEE SMC function ID: CallWithRegdArg");
                     if let Ok(mut msg_arg) = optee_smc_args.optee_msg_arg() {
                         process_optee_msg_arg(&mut msg_arg);
-                        if optee_smc_args.set_optee_msg_arg(&msg_arg).is_err() {
-                            return Errno::EINVAL.as_neg().into();
-                        }
+                        optee_smc_args.set_result(
+                            &OpteeSmcResult::Generic {
+                                status: OpteeSmcReturn::Ok,
+                            },
+                            Some(&msg_arg),
+                        );
+                    } else {
+                        optee_smc_args.set_result(
+                            &OpteeSmcResult::Generic {
+                                status: OpteeSmcReturn::EBadAddr,
+                            },
+                            None,
+                        );
                     }
-                    optee_smc_args.set_result(&OpteeSmcResult::Generic {
-                        status: OpteeSmcReturn::Ok,
-                    });
                 }
                 OpteeSmcFunction::ExchangeCapabilities => {
                     debug_serial_println!("OP-TEE SMC function ID: ExchangeCapabilities");
-                    optee_smc_args.set_result(&OpteeSmcResult::ExchangeCapabilities {
-                        status: OpteeSmcReturn::Ok,
-                        capabilities: (OpteeSecureWorldCapabilities::DYNAMIC_SHM
-                            | OpteeSecureWorldCapabilities::MEMREF_NULL
-                            | OpteeSecureWorldCapabilities::RPC_ARG)
-                            .bits(),
-                        max_notif_value: 0,
-                        data: NUM_RPC_PARAMS,
-                    });
+                    optee_smc_args.set_result(
+                        &OpteeSmcResult::ExchangeCapabilities {
+                            status: OpteeSmcReturn::Ok,
+                            capabilities: (OpteeSecureWorldCapabilities::DYNAMIC_SHM
+                                | OpteeSecureWorldCapabilities::MEMREF_NULL
+                                | OpteeSecureWorldCapabilities::RPC_ARG)
+                                .bits(),
+                            max_notif_value: 0,
+                            data: NUM_RPC_PARAMS,
+                        },
+                        None,
+                    );
                 }
                 OpteeSmcFunction::DisableShmCache => {
                     debug_serial_println!("OP-TEE SMC function ID: DisableShmCache");
-                    optee_smc_args.set_result(&OpteeSmcResult::DisableShmCache {
-                        status: OpteeSmcReturn::ENotAvail,
-                        shm_upper32: 0,
-                        shm_lower32: 0,
-                    });
+                    optee_smc_args.set_result(
+                        &OpteeSmcResult::DisableShmCache {
+                            status: OpteeSmcReturn::ENotAvail,
+                            shm_upper32: 0,
+                            shm_lower32: 0,
+                        },
+                        None,
+                    );
                 }
                 OpteeSmcFunction::CallsUid => {
                     debug_serial_println!("OP-TEE SMC function ID: CallsUid");
-                    optee_smc_args.set_result(&OpteeSmcResult::Uuid {
-                        data: [
-                            OPTEE_MSG_UID_0,
-                            OPTEE_MSG_UID_1,
-                            OPTEE_MSG_UID_2,
-                            OPTEE_MSG_UID_3,
-                        ],
-                    });
+                    optee_smc_args.set_result(
+                        &OpteeSmcResult::Uuid {
+                            data: [
+                                OPTEE_MSG_UID_0,
+                                OPTEE_MSG_UID_1,
+                                OPTEE_MSG_UID_2,
+                                OPTEE_MSG_UID_3,
+                            ],
+                        },
+                        None,
+                    );
                 }
                 OpteeSmcFunction::GetOsRevision => {
                     debug_serial_println!("OP-TEE SMC function ID: GetOsRevision");
-                    optee_smc_args.set_result(&OpteeSmcResult::OsRevision {
-                        major: OPTEE_MSG_REVISION_MAJOR,
-                        minor: OPTEE_MSG_REVISION_MINOR,
-                        build_id: 0,
-                    });
+                    optee_smc_args.set_result(
+                        &OpteeSmcResult::OsRevision {
+                            major: OPTEE_MSG_REVISION_MAJOR,
+                            minor: OPTEE_MSG_REVISION_MINOR,
+                            build_id: 0,
+                        },
+                        None,
+                    );
                 }
                 OpteeSmcFunction::CallsRevision => {
                     debug_serial_println!("OP-TEE SMC function ID: CallsRevision");
-                    optee_smc_args.set_result(&OpteeSmcResult::Revision {
-                        major: OPTEE_MSG_REVISION_MAJOR,
-                        minor: OPTEE_MSG_REVISION_MINOR,
-                    });
+                    optee_smc_args.set_result(
+                        &OpteeSmcResult::Revision {
+                            major: OPTEE_MSG_REVISION_MAJOR,
+                            minor: OPTEE_MSG_REVISION_MINOR,
+                        },
+                        None,
+                    );
                 }
             },
             Err(errno) => {
@@ -663,37 +734,7 @@ pub fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
 }
 
 pub fn process_optee_msg_arg(msg_arg: &mut OpteeMsgArg) {
-    match OpteeMessageCommand::try_from(msg_arg.cmd).unwrap_or(OpteeMessageCommand::Unknown) {
-        OpteeMessageCommand::OpenSession => {
-            debug_serial_println!("OP-TEE Message Command: OpenSession");
-            // TODO: convert msg_arg.params to UteeParamOwned and invoke optee_call()
-            // we should include output address into UteeParamOwned.
-        }
-        OpteeMessageCommand::InvokeCommand => {
-            debug_serial_println!("OP-TEE Message Command: InvokeCommand");
-        }
-        OpteeMessageCommand::CloseSession => {
-            debug_serial_println!("OP-TEE Message Command: CloseSession");
-        }
-        OpteeMessageCommand::Cancel => {
-            debug_serial_println!("OP-TEE Message Command: Cancel");
-        }
-        OpteeMessageCommand::RegisterShm => {
-            debug_serial_println!("OP-TEE Message Command: RegisterShm");
-        }
-        OpteeMessageCommand::UnregisterShm => {
-            debug_serial_println!("OP-TEE Message Command: UnregisterShm");
-        }
-        OpteeMessageCommand::DoBottomHalf => {
-            debug_serial_println!("OP-TEE Message Command: DoBottomHalf");
-        }
-        OpteeMessageCommand::StopAsyncNotif => {
-            debug_serial_println!("OP-TEE Message Command: StopAsyncNotif");
-        }
-        OpteeMessageCommand::Unknown => {
-            panic!("Unknown OP-TEE Message Command");
-        }
-    }
+    debug_serial_println!("optee_msg_arg cmd={:#x}", msg_arg.cmd);
     for i in 0..usize::try_from(msg_arg.num_params.min(4)).unwrap_or(0) {
         debug_serial_println!(
             "param[{}] attr={:#x} a={:#x} b={:#x} c={:#x}",
@@ -704,6 +745,78 @@ pub fn process_optee_msg_arg(msg_arg: &mut OpteeMsgArg) {
             msg_arg.params[i].u.c,
         );
     }
+
+    let utee_entry_func =
+        match OpteeMessageCommand::try_from(msg_arg.cmd).unwrap_or(OpteeMessageCommand::Unknown) {
+            OpteeMessageCommand::OpenSession => UteeEntryFunc::OpenSession,
+            OpteeMessageCommand::InvokeCommand => UteeEntryFunc::InvokeCommand,
+            OpteeMessageCommand::CloseSession => UteeEntryFunc::CloseSession,
+            _ => UteeEntryFunc::Unknown, // either unupported or not for TAs (e.g., RegisterShm)
+        };
+    let cmd_id = msg_arg.func;
+
+    let mut params = [
+        UteeParamOwned::None,
+        UteeParamOwned::None,
+        UteeParamOwned::None,
+        UteeParamOwned::None,
+    ];
+
+    for i in 0..usize::try_from(msg_arg.num_params.min(4)).unwrap_or(0) {
+        params[i] = match msg_arg.params[i].attr_type() {
+            Ok(OpteeMsgAttrType::ValueInput) => UteeParamOwned::ValueInput {
+                value_a: msg_arg.params[i].u.a,
+                value_b: msg_arg.params[i].u.b,
+            },
+            Ok(OpteeMsgAttrType::ValueOutput) => UteeParamOwned::ValueOutput { out_address: 0 },
+            Ok(OpteeMsgAttrType::ValueInout) => UteeParamOwned::ValueInout {
+                value_a: msg_arg.params[i].u.a,
+                value_b: msg_arg.params[i].u.b,
+                out_address: 0,
+            },
+            Ok(OpteeMsgAttrType::RmemInput | OpteeMsgAttrType::TmemInput) => {
+                let mut data = vec![0u8; usize::try_from(msg_arg.params[i].u.b).unwrap()];
+                if unsafe {
+                    crate::platform_low().copy_slice_from_vtl0_phys(
+                        x86_64::PhysAddr::new(msg_arg.params[i].u.a),
+                        &mut data,
+                    )
+                } {
+                    UteeParamOwned::MemrefInput { data: data.into() }
+                } else {
+                    UteeParamOwned::None
+                }
+            }
+            Ok(OpteeMsgAttrType::RmemOutput | OpteeMsgAttrType::TmemOutput) => {
+                UteeParamOwned::MemrefOutput {
+                    buffer_size: usize::try_from(msg_arg.params[i].u.b).unwrap(),
+                    out_address: usize::try_from(msg_arg.params[i].u.a).unwrap(),
+                }
+            }
+            Ok(OpteeMsgAttrType::RmemInout | OpteeMsgAttrType::TmemInout) => {
+                let mut data = vec![0u8; usize::try_from(msg_arg.params[i].u.b).unwrap()];
+                if unsafe {
+                    crate::platform_low().copy_slice_from_vtl0_phys(
+                        x86_64::PhysAddr::new(msg_arg.params[i].u.a),
+                        &mut data,
+                    )
+                } {
+                    UteeParamOwned::MemrefInout {
+                        data: data.into(),
+                        buffer_size: usize::try_from(msg_arg.params[i].u.b).unwrap(),
+                        out_address: usize::try_from(msg_arg.params[i].u.a).unwrap(),
+                    }
+                } else {
+                    UteeParamOwned::None
+                }
+            }
+            _ => UteeParamOwned::None,
+        };
+    }
+
+    // enter TA
+    // crate::optee_call(1, utee_entry_func, cmd_id, &params);
+
     msg_arg.ret = 0;
     msg_arg.session = 1;
 }
