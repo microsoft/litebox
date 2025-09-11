@@ -4,6 +4,7 @@
 
 use crate::debug_serial_println;
 
+use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use crate::user_context::UserSpaceManagement;
 use alloc::vec;
 use hashbrown::HashMap;
@@ -12,6 +13,12 @@ use num_enum::TryFromPrimitive;
 use once_cell::race::OnceBox;
 
 use litebox_common_optee::{TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams};
+
+#[inline]
+fn align_up(addr: u64, align: u64) -> u64 {
+    debug_assert!(align.is_power_of_two());
+    (addr + align - 1) & !(align - 1)
+}
 
 #[inline]
 fn align_down(addr: u64, align: u64) -> u64 {
@@ -140,13 +147,6 @@ pub struct OpteeMsgArg {
     ret_origin: u32,
     num_params: u32,
     params: [OpteeMsgParam; 6], // OpenSession: the first two params are not delivered to TA
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct ShmRefPagesData {
-    pub pages_list: [u64; 4096 / 8 - 8],
-    pub next_page_data: u64,
 }
 
 // A placeholder for testing purposes. This isn't a real function signature.
@@ -785,11 +785,42 @@ pub fn decode_optee_msg_arg(
 
     match OpteeMessageCommand::try_from(msg_arg.cmd).unwrap_or(OpteeMessageCommand::Unknown) {
         OpteeMessageCommand::RegisterShm => {
+            let phys_addr = msg_arg.params[0].u.a;
+            let size = msg_arg.params[0].u.b;
+            let shm_ref = msg_arg.params[0].u.c;
+
+            let aligned_phys_addr = align_down(phys_addr, u64::try_from(PAGE_SIZE).unwrap());
+            let page_offset = phys_addr - aligned_phys_addr;
+            let aligned_size = align_up(size, u64::try_from(PAGE_SIZE).unwrap());
+
+            let num_pages = usize::try_from(aligned_size).unwrap() / PAGE_SIZE;
+            let mut pages_list = alloc::vec![0u64; num_pages];
+
+            if let Some(pages_data) = unsafe {
+                crate::platform_low().copy_from_vtl0_phys::<ShmRefPagesData>(x86_64::PhysAddr::new(
+                    aligned_phys_addr,
+                ))
+            } {
+                if pages_data.next_page_data != 0 {
+                    debug_serial_println!("TODO: support multi-paged ShmRefPagesData");
+                    return None;
+                }
+                for (i, page) in pages_list.iter_mut().enumerate().take(num_pages) {
+                    if pages_data.pages_list[i] != 0 {
+                        *page = pages_data.pages_list[i];
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                return None;
+            }
+
             shm_ref_map().insert(
-                msg_arg.params[0].u.c,
+                shm_ref,
                 ShmRefInfo {
-                    phys_addr: msg_arg.params[0].u.a,
-                    size: usize::try_from(msg_arg.params[0].u.b).unwrap(),
+                    pages_list: pages_list.into(),
+                    page_offset,
                 },
             );
             return None;
@@ -912,13 +943,11 @@ fn get_vtl0_phys_addr_from_optee_msg_param(param: OpteeMsgParamValue) -> Option<
         // temporary memory
         if param.a == 0 { None } else { Some(param.a) }
     } else if let Some(shm_ref_info) = shm_ref_map().get(param.c) {
-        let aligned_phys_addr = align_down(shm_ref_info.phys_addr, 4096);
-        let page_offset = shm_ref_info.phys_addr - aligned_phys_addr;
-        unsafe {
-            crate::platform_low()
-                .copy_from_vtl0_phys::<ShmRefPagesData>(x86_64::PhysAddr::new(aligned_phys_addr))
-        }
-        .map(|pages_data| pages_data.pages_list[0] + page_offset + param.a)
+        let offset = shm_ref_info.page_offset + param.a;
+        let page_index = offset / u64::try_from(PAGE_SIZE).unwrap();
+        let page_offset = offset - align_down(offset, u64::try_from(PAGE_SIZE).unwrap());
+        Some(shm_ref_info.pages_list[usize::try_from(page_index).unwrap()] + page_offset)
+        // TODO: support cross-page-boundary accesses. Perhaps we need to return `ShmRefInfo` itself.
     } else {
         None
     }
@@ -930,9 +959,18 @@ pub(crate) struct ShmRefMap {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
+struct ShmRefPagesData {
+    pub pages_list: [u64; PAGELIST_ENTRIES_PER_PAGE],
+    pub next_page_data: u64,
+}
+const PAGELIST_ENTRIES_PER_PAGE: usize =
+    PAGE_SIZE / core::mem::size_of::<u64>() - core::mem::size_of::<u64>();
+
+#[derive(Clone)]
 pub struct ShmRefInfo {
-    pub phys_addr: u64,
-    pub size: usize,
+    pub pages_list: alloc::boxed::Box<[u64]>,
+    pub page_offset: u64,
 }
 
 impl ShmRefMap {
@@ -954,7 +992,7 @@ impl ShmRefMap {
 
     pub fn get(&self, shm_ref: u64) -> Option<ShmRefInfo> {
         let guard = self.inner.lock();
-        guard.get(&shm_ref).copied()
+        guard.get(&shm_ref).cloned()
     }
 }
 
