@@ -1,11 +1,10 @@
 //! Event file for notification
 
-use crate::syscalls::epoll::IOPollable;
 use core::sync::atomic::AtomicU32;
 
 use litebox::{
     event::{
-        Events,
+        Events, IOPollable,
         observer::Observer,
         polling::{Pollee, TryOpError},
     },

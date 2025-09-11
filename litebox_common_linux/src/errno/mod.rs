@@ -383,3 +383,13 @@ impl From<litebox::sync::futex::FutexError> for Errno {
         }
     }
 }
+
+impl From<litebox::pipes::PipeError> for Errno {
+    fn from(value: litebox::pipes::PipeError) -> Self {
+        match value {
+            litebox::pipes::PipeError::Closed => Errno::EPIPE,
+            litebox::pipes::PipeError::WouldBlock => Errno::EAGAIN,
+            _ => unimplemented!(),
+        }
+    }
+}

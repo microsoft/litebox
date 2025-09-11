@@ -343,7 +343,7 @@ impl Socket {
     crate::syscalls::common_functions_for_file_status!();
 }
 
-impl crate::syscalls::epoll::IOPollable for Socket {
+impl litebox::event::IOPollable for Socket {
     fn check_io_events(&self) -> Events {
         litebox_net()
             .lock()

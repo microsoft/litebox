@@ -30,7 +30,6 @@ use litebox_common_linux::{SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
 use syscalls::net::sys_setsockopt;
 
-pub(crate) mod channel;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
@@ -247,11 +246,11 @@ enum Descriptor {
     // TODO: this could be addressed by #120.
     Socket(alloc::sync::Arc<crate::syscalls::net::Socket>),
     PipeReader {
-        consumer: alloc::sync::Arc<crate::channel::Consumer<u8>>,
+        consumer: alloc::sync::Arc<litebox::pipes::ReadEnd<Platform, u8>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
     PipeWriter {
-        producer: alloc::sync::Arc<crate::channel::Producer<u8>>,
+        producer: alloc::sync::Arc<litebox::pipes::WriteEnd<Platform, u8>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
     Eventfd {
