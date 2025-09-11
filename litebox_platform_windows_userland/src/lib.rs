@@ -24,6 +24,7 @@ use litebox_common_linux::PunchthroughSyscall;
 use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
 use windows_sys::Win32::{
     Foundation::{GetLastError, WIN32_ERROR},
+    System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler},
     System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
         EXCEPTION_POINTERS,
@@ -83,6 +84,23 @@ pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<WindowsUserlan
 
 /// The syscall handler passed down from the shim.
 static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
+
+/// Signal handler for SIGINT (Ctrl+C)
+static SIGINT_HANDLER: std::sync::RwLock<Option<fn()>> = std::sync::RwLock::new(None);
+
+/// Windows Console Control Handler for translating Ctrl+C to SIGINT
+pub unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> i32 {
+    match ctrl_type {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT => {
+            // Call the registered SIGINT handler if one exists
+            if let Some(handler) = *SIGINT_HANDLER.read().unwrap() {
+                handler();
+            }
+            1 // TRUE - we handled the event
+        }
+        _ => 0, // FALSE - let the system handle other events
+    }
+}
 
 struct TlsSlot {
     dwtlsindex: u32,
@@ -250,6 +268,11 @@ impl WindowsUserland {
             let _ = AddVectoredExceptionHandler(0, Some(exception_handler));
         }
 
+        // Register console control handler for SIGINT (Ctrl+C) support
+        unsafe {
+            SetConsoleCtrlHandler(Some(console_ctrl_handler), 1);
+        }
+
         Box::leak(Box::new(platform))
     }
 
@@ -264,6 +287,18 @@ impl WindowsUserland {
             old.is_none(),
             "Should not register more than one syscall_handler"
         );
+    }
+
+    /// Register a SIGINT (Ctrl+C) signal handler
+    ///
+    /// This translates Linux rt_sigaction syscall for SIGINT to Windows console control handling
+    pub fn register_sigint_handler(&self, handler: fn()) {
+        *SIGINT_HANDLER.write().unwrap() = Some(handler);
+    }
+
+    /// Unregister the SIGINT handler
+    pub fn unregister_sigint_handler(&self) {
+        *SIGINT_HANDLER.write().unwrap() = None;
     }
 
     fn read_memory_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
@@ -1700,6 +1735,41 @@ mod tests {
         // The test validates that both send and receive operations work
         // Even if no packets are received (common in isolated test environments),
         // the absence of panics indicates the interface is working correctly
+    }
+
+    #[test]
+    fn test_sigint_handler() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        static SIGNAL_RECEIVED: Mutex<bool> = Mutex::new(false);
+
+        fn test_sigint_handler_fn() {
+            *SIGNAL_RECEIVED.lock().unwrap() = true;
+            println!("SIGINT received!");
+        }
+
+        let platform = WindowsUserland::new(None);
+
+        // Register a SIGINT handler
+        platform.register_sigint_handler(test_sigint_handler_fn);
+
+        // Simulate signal handling by directly calling the console control handler
+        unsafe {
+            crate::console_ctrl_handler(windows_sys::Win32::System::Console::CTRL_C_EVENT);
+        }
+
+        // Small delay to ensure the handler runs
+        std::thread::sleep(Duration::from_millis(10000));
+
+        // Check if the signal was received
+        assert!(
+            *SIGNAL_RECEIVED.lock().unwrap(),
+            "SIGINT handler should have been called"
+        );
+
+        // Unregister the handler
+        platform.unregister_sigint_handler();
     }
 
     /// Creates a sample ICMP ping packet
