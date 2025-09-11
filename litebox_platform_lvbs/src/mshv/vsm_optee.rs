@@ -13,6 +13,12 @@ use once_cell::race::OnceBox;
 
 use litebox_common_optee::{TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams};
 
+#[inline]
+fn align_down(addr: u64, align: u64) -> u64 {
+    debug_assert!(align.is_power_of_two());
+    addr & !(align - 1)
+}
+
 const OPTEE_MSG_CMD_OPEN_SESSION: u32 = 0;
 const OPTEE_MSG_CMD_INVOKE_COMMAND: u32 = 1;
 const OPTEE_MSG_CMD_CLOSE_SESSION: u32 = 2;
@@ -134,6 +140,13 @@ pub struct OpteeMsgArg {
     ret_origin: u32,
     num_params: u32,
     params: [OpteeMsgParam; 6], // OpenSession: the first two params are not delivered to TA
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct ShmRefPagesData {
+    pub pages_list: [u64; 4096 / 8 - 8],
+    pub next_page_data: u64,
 }
 
 // A placeholder for testing purposes. This isn't a real function signature.
@@ -899,11 +912,13 @@ fn get_vtl0_phys_addr_from_optee_msg_param(param: OpteeMsgParamValue) -> Option<
         // temporary memory
         if param.a == 0 { None } else { Some(param.a) }
     } else if let Some(shm_ref_info) = shm_ref_map().get(param.c) {
-        if shm_ref_info.size >= usize::try_from(param.a + param.b).unwrap() {
-            Some(shm_ref_info.phys_addr + param.a)
-        } else {
-            None
+        let aligned_phys_addr = align_down(shm_ref_info.phys_addr, 4096);
+        let page_offset = shm_ref_info.phys_addr - aligned_phys_addr;
+        unsafe {
+            crate::platform_low()
+                .copy_from_vtl0_phys::<ShmRefPagesData>(x86_64::PhysAddr::new(aligned_phys_addr))
         }
+        .map(|pages_data| pages_data.pages_list[0] + page_offset + param.a)
     } else {
         None
     }
