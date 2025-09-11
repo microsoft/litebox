@@ -50,7 +50,7 @@ pub fn init_platform(tar_data: &'static [u8], initial_dirs: &[&str], initial_fil
     let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(
         &litebox,
         if tar_data.is_empty() {
-            litebox::fs::tar_ro::empty_tar_file().into()
+            litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
         } else {
             tar_data.into()
         },
