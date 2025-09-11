@@ -2174,6 +2174,15 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::set_thread_area => sys_req!(SetThreadArea { user_desc:* }),
             Sysno::set_tid_address => sys_req!(SetTidAddress { tidptr:* }),
             Sysno::openat => sys_req!(Openat { dirfd,pathname:*,flags,mode }),
+            Sysno::open => {
+                // open is equivalent to openat with dirfd AT_FDCWD
+                SyscallRequest::Openat {
+                    dirfd: AT_FDCWD,
+                    pathname: ctx.sys_req_ptr(0),
+                    flags: ctx.sys_req_arg(1),
+                    mode: ctx.sys_req_arg(2),
+                }
+            }
             Sysno::creat => {
                 // creat is equivalent to open with flags O_CREAT|O_WRONLY|O_TRUNC
                 SyscallRequest::Openat {
