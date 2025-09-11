@@ -79,9 +79,7 @@ pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
 }
 
 /// An empty tar file to support an empty file system.
-pub fn empty_tar_file() -> Vec<u8> {
-    alloc::vec![0u8; 10240]
-}
+pub const EMPTY_TAR_FILE: &[u8] = &[0u8; 10240];
 
 impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// Construct a new `FileSystem` instance from provided `tar_data`.
@@ -91,7 +89,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// buffer is provided it will be consumed to construct a `TarArchive`. Using `Cow` avoids an
     /// unnecessary copy while allowing either borrowed or owned input.
     ///
-    /// Use [`empty_tar_file`] if you need an empty file system.
+    /// Use [`EMPTY_TAR_FILE`] if you need an empty file system.
     ///
     /// # Panics
     ///

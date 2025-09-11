@@ -589,10 +589,7 @@ impl CpuSet {
 /// Handle syscall `sched_getaffinity`.
 ///
 /// Note this is a dummy implementation that always returns the same CPU set
-pub(crate) fn sys_sched_getaffinity(pid: Option<i32>) -> CpuSet {
-    if pid.is_some() {
-        unimplemented!("Getting CPU affinity for a specific PID is not supported yet");
-    }
+pub(crate) fn sys_sched_getaffinity(_pid: Option<i32>) -> CpuSet {
     let mut cpuset = bitvec::bitvec![u8, bitvec::order::Lsb0; 0; NR_CPUS];
     cpuset.iter_mut().for_each(|mut b| *b = true);
     CpuSet { bits: cpuset }
