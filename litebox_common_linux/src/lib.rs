@@ -34,6 +34,10 @@ pub const CLOCK_MONOTONIC: i32 = 1;
 pub const CLOCK_REALTIME_COARSE: i32 = 5;
 pub const CLOCK_MONOTONIC_COARSE: i32 = 6;
 
+/// Special value `libc::AT_FDCWD` used to indicate openat should use
+/// the current working directory.
+pub const AT_FDCWD: i32 = -100;
+
 /// Encoding for ioctl commands.
 pub mod ioctl {
     /// The number of bits allocated for the ioctl command number field.
@@ -2170,6 +2174,17 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::set_thread_area => sys_req!(SetThreadArea { user_desc:* }),
             Sysno::set_tid_address => sys_req!(SetTidAddress { tidptr:* }),
             Sysno::openat => sys_req!(Openat { dirfd,pathname:*,flags,mode }),
+            Sysno::creat => {
+                // creat is equivalent to open with flags O_CREAT|O_WRONLY|O_TRUNC
+                SyscallRequest::Openat {
+                    dirfd: AT_FDCWD,
+                    pathname: ctx.sys_req_ptr(0),
+                    flags: litebox::fs::OFlags::CREAT
+                        | litebox::fs::OFlags::WRONLY
+                        | litebox::fs::OFlags::TRUNC,
+                    mode: ctx.sys_req_arg(1),
+                }
+            }
             #[cfg(target_arch = "x86_64")]
             Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
             #[cfg(target_arch = "x86")]
