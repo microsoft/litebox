@@ -96,10 +96,9 @@ pub fn litebox_fs<'a>() -> &'a LinuxFS {
 }
 
 /// Get the global page manager
-pub fn litebox_page_manager() -> alloc::sync::Arc<PageManager<Platform, { PAGE_SIZE }>> {
-    use litebox::platform::ThreadLocalStorageProvider;
-    litebox_platform_multiplex::platform()
-        .with_thread_local_storage_mut(|tls| tls.current_task.page_manager.clone())
+pub fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE> {
+    static VMEM: OnceBox<PageManager<Platform, PAGE_SIZE>> = OnceBox::new();
+    VMEM.get_or_init(|| alloc::boxed::Box::new(PageManager::new(litebox())))
 }
 
 pub(crate) fn litebox_net<'a>()
@@ -777,7 +776,7 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
             argv,
             envp,
             ctx,
-        } => syscalls::process::sys_execve(pathname, argv, envp, ctx).map(|()| 0),
+        } => syscalls::process::sys_execve(pathname, argv, envp, ctx).map(|()| unreachable!()),
         _ => {
             todo!()
         }

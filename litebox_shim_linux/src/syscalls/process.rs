@@ -301,15 +301,13 @@ pub(crate) fn sys_clone(
     }
 
     let platform = litebox_platform_multiplex::platform();
-    let (credentials, pid, parent_proc_id, page_manager) =
-        platform.with_thread_local_storage_mut(|tls| {
-            (
-                tls.current_task.credentials.clone(),
-                tls.current_task.pid,
-                tls.current_task.ppid,
-                tls.current_task.page_manager.clone(),
-            )
-        });
+    let (credentials, pid, parent_proc_id) = platform.with_thread_local_storage_mut(|tls| {
+        (
+            tls.current_task.credentials.clone(),
+            tls.current_task.pid,
+            tls.current_task.ppid,
+        )
+    });
     let child_tid = unsafe {
         platform.spawn_thread(
             ctx,
@@ -334,7 +332,6 @@ pub(crate) fn sys_clone(
                     },
                     robust_list: None,
                     credentials,
-                    page_manager,
                 }),
                 callback: new_thread_callback,
             }),
@@ -678,7 +675,6 @@ pub(crate) fn sys_futex(
 }
 
 pub type ExecveCallback = fn(
-    ctx: &mut litebox_common_linux::PtRegs,
     path: &str,
     argv: alloc::vec::Vec<alloc::ffi::CString>,
     envp: alloc::vec::Vec<alloc::ffi::CString>,
@@ -700,6 +696,8 @@ const MAX_VEC: usize = 4096; // limit count
 const MAX_TOTAL_BYTES: usize = 256 * 1024; // size cap
 
 // Handle syscall `execve`.
+//
+// Note this function does not return on success.
 pub(crate) fn sys_execve(
     pathname: crate::ConstPtr<i8>,
     argv: crate::ConstPtr<crate::ConstPtr<i8>>,
@@ -767,11 +765,11 @@ pub(crate) fn sys_execve(
         }
 
         // Check if we are the only thread in the process
-        assert_eq!(
-            alloc::sync::Arc::strong_count(&tls.current_task.page_manager),
-            1,
-            "execve when multiple threads exist is not supported yet"
-        );
+        // Note since we don't support multiple processes yet; `NR_THREADS` is effectively the number of threads in
+        // the current process.
+        if NR_THREADS.load(core::sync::atomic::Ordering::Relaxed) != 1 {
+            unimplemented!("execve when multiple threads exist is not supported yet");
+        }
         let release = |r: Range<usize>, vm: VmFlags| {
             // Reserved mappings
             if vm.is_empty() {
@@ -802,17 +800,17 @@ pub(crate) fn sys_execve(
             }
             true
         };
-        unsafe { tls.current_task.page_manager.release_memory(release) }
-            .expect("failed to release memory mappings");
+        let page_manager = crate::litebox_page_manager();
+        unsafe { page_manager.release_memory(release) }.expect("failed to release memory mappings");
     });
     #[cfg(target_arch = "x86")]
     litebox_platform_multiplex::platform().clear_guest_thread_local_storage();
 
-    if let Some(callback) = EXECVE_CALLBACK.get() {
-        callback(ctx, path, argv_vec, envp_vec).expect("we already released memory above");
-    }
-
-    Ok(())
+    let callback = EXECVE_CALLBACK.get().expect("execve callback is not set");
+    // if `execve` fails, it is unrecoverable at this point as we have already unmapped everything.
+    // TODO: add some basic checks before we unmap everything
+    callback(path, argv_vec, envp_vec).expect("we already released memory above");
+    unreachable!("execve callback must not return on success");
 }
 
 #[cfg(test)]

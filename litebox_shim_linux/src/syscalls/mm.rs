@@ -31,7 +31,7 @@ fn do_mmap(
     op: impl FnOnce(MutPtr<u8>) -> Result<usize, MappingError>,
 ) -> Result<MutPtr<u8>, MappingError> {
     litebox_common_linux::mm::do_mmap(
-        &litebox_page_manager(),
+        litebox_page_manager(),
         suggested_addr,
         len,
         prot,
@@ -148,7 +148,7 @@ pub(crate) fn sys_mmap(
 /// Handle syscall `munmap`
 #[inline]
 pub(crate) fn sys_munmap(addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
-    litebox_common_linux::mm::sys_munmap(&litebox_page_manager(), addr, len)
+    litebox_common_linux::mm::sys_munmap(litebox_page_manager(), addr, len)
 }
 
 /// Handle syscall `mprotect`
@@ -158,7 +158,7 @@ pub(crate) fn sys_mprotect(
     len: usize,
     prot: ProtFlags,
 ) -> Result<(), Errno> {
-    litebox_common_linux::mm::sys_mprotect(&litebox_page_manager(), addr, len, prot)
+    litebox_common_linux::mm::sys_mprotect(litebox_page_manager(), addr, len, prot)
 }
 
 #[inline]
@@ -170,7 +170,7 @@ pub(crate) fn sys_mremap(
     new_addr: usize,
 ) -> Result<crate::MutPtr<u8>, Errno> {
     litebox_common_linux::mm::sys_mremap(
-        &litebox_page_manager(),
+        litebox_page_manager(),
         old_addr,
         old_size,
         new_size,
@@ -182,7 +182,7 @@ pub(crate) fn sys_mremap(
 /// Handle syscall `brk`
 #[inline]
 pub(crate) fn sys_brk(addr: MutPtr<u8>) -> Result<usize, Errno> {
-    litebox_common_linux::mm::sys_brk(&litebox_page_manager(), addr)
+    litebox_common_linux::mm::sys_brk(litebox_page_manager(), addr)
 }
 
 /// Handle syscall `madvise`
@@ -192,7 +192,7 @@ pub(crate) fn sys_madvise(
     len: usize,
     advice: litebox_common_linux::MadviseBehavior,
 ) -> Result<(), Errno> {
-    litebox_common_linux::mm::sys_madvise(&litebox_page_manager(), addr, len, advice)
+    litebox_common_linux::mm::sys_madvise(litebox_page_manager(), addr, len, advice)
 }
 
 #[cfg(test)]

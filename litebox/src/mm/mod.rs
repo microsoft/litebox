@@ -352,10 +352,10 @@ where
     /// The caller must ensure that the released memory regions are no longer used.
     pub unsafe fn release_memory(
         &self,
-        f: fn(Range<usize>, VmFlags) -> bool,
+        releasable: fn(Range<usize>, VmFlags) -> bool,
     ) -> Result<(), VmemUnmapError> {
         for (r, vma) in self.mappings() {
-            if !f(r.clone(), vma) {
+            if !releasable(r.clone(), vma) {
                 continue;
             }
             let mut vmem = self.vmem.write();

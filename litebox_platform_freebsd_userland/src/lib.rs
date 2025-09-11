@@ -1019,8 +1019,6 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
         tls.borrowed = false; // Mark as not borrowed anymore
         res
     }
-
-    fn clear_guest_thread_local_storage(&self) {}
 }
 
 #[cfg(test)]

@@ -222,7 +222,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
     litebox_shim_linux::set_fs(initial_file_system);
     litebox_platform_multiplex::set_platform(platform);
-    litebox_shim_linux::syscalls::process::set_execve_callback(load_program_wrapper);
+    litebox_shim_linux::syscalls::process::set_execve_callback(load_program);
     platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
@@ -258,16 +258,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     load_program(&cli_args.program_and_arguments[0], argv, envp).expect("failed to load program");
-    Ok(())
-}
-
-fn load_program_wrapper(
-    _ctx: &mut litebox_common_linux::PtRegs,
-    path: &str,
-    argv: alloc::vec::Vec<alloc::ffi::CString>,
-    envp: alloc::vec::Vec<alloc::ffi::CString>,
-) -> Result<(), litebox_common_linux::errno::Errno> {
-    load_program(path, argv, envp)
+    unreachable!("should have jumped to the program");
 }
 
 fn load_program(

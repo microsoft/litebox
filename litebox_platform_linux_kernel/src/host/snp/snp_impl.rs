@@ -91,11 +91,7 @@ fn current() -> Option<&'static mut bindings::vsbox_task> {
 }
 
 impl SnpLinuxKernel {
-    pub fn set_init_tls(
-        &self,
-        boot_params: &bindings::vmpl2_boot_params,
-        litebox: &litebox::LiteBox<Self>,
-    ) {
+    pub fn set_init_tls(&self, boot_params: &bindings::vmpl2_boot_params) {
         let task = ::alloc::boxed::Box::new(litebox_common_linux::Task {
             pid: boot_params.pid,
             tid: boot_params.pid,
@@ -108,7 +104,6 @@ impl SnpLinuxKernel {
                 euid: boot_params.euid as usize,
                 egid: boot_params.egid as usize,
             }),
-            page_manager: ::alloc::sync::Arc::new(litebox::mm::PageManager::new(litebox)),
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         self.set_thread_local_storage(tls);
@@ -146,8 +141,6 @@ impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
         current_task.tls = ::core::ptr::null_mut();
         *tls
     }
-
-    fn clear_guest_thread_local_storage(&self) {}
 }
 
 core::arch::global_asm!(include_str!("entry.S"));

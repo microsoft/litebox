@@ -178,9 +178,8 @@ impl LinuxUserland {
             // u32::MAX (i.e., -1) means not allocated yet
             tls_entry_number: AtomicU32::new(u32::MAX),
         };
-        let platform = Box::leak(Box::new(platform));
-        platform.set_init_tls(&litebox::LiteBox::new(platform));
-        platform
+        platform.set_init_tls();
+        Box::leak(Box::new(platform))
     }
 
     /// Register the syscall handler (provided by the Linux shim)
@@ -289,7 +288,7 @@ impl LinuxUserland {
         }
     }
 
-    fn set_init_tls(&self, litebox: &litebox::LiteBox<LinuxUserland>) {
+    fn set_init_tls(&self) {
         let tid =
             unsafe { syscalls::syscall!(syscalls::Sysno::gettid) }.expect("Failed to get TID");
         let tid: i32 = i32::try_from(tid).expect("tid should fit in i32");
@@ -303,7 +302,6 @@ impl LinuxUserland {
             clear_child_tid: None,
             robust_list: None,
             credentials: alloc::sync::Arc::new(Self::get_user_info()),
-            page_manager: alloc::sync::Arc::new(litebox::mm::PageManager::new(litebox)),
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         self.set_thread_local_storage(tls);
@@ -1589,9 +1587,6 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
         tls.borrowed = false; // mark as not borrowed anymore
         ret
     }
-
-    #[cfg(target_arch = "x86_64")]
-    fn clear_guest_thread_local_storage(&self) {}
 
     #[cfg(target_arch = "x86")]
     fn clear_guest_thread_local_storage(&self) {

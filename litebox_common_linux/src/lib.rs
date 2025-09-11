@@ -1123,18 +1123,13 @@ pub type ThreadLocalDescriptor = u8;
 #[cfg(target_arch = "x86")]
 pub type ThreadLocalDescriptor = UserDesc;
 
-pub struct NewThreadArgs<Platform, const ALIGN: usize = { litebox::mm::linux::PAGE_SIZE }>
-where
-    Platform: litebox::platform::RawPointerProvider
-        + litebox::sync::RawSyncPrimitivesProvider
-        + litebox::platform::page_mgmt::PageManagementProvider<ALIGN>,
-{
+pub struct NewThreadArgs<Platform: litebox::platform::RawPointerProvider> {
     /// Pointer to thread-local storage (TLS) given by the guest program
     pub tls: Option<Platform::RawMutPointer<ThreadLocalDescriptor>>,
     /// Where to store child TID in child's memory
     pub set_child_tid: Option<Platform::RawMutPointer<i32>>,
     /// Task struct that maintains all per-thread data
-    pub task: alloc::boxed::Box<Task<Platform, ALIGN>>,
+    pub task: alloc::boxed::Box<Task<Platform>>,
     /// A callback function that *MUST* be called when the thread is created.
     ///
     /// Note that `task.tid` must be set correctly before this function is called.
@@ -1142,18 +1137,13 @@ where
 }
 
 /// Struct for thread-local storage.
-pub struct ThreadLocalStorage<Platform, const ALIGN: usize = { litebox::mm::linux::PAGE_SIZE }>
-where
-    Platform: litebox::platform::RawPointerProvider
-        + litebox::sync::RawSyncPrimitivesProvider
-        + litebox::platform::page_mgmt::PageManagementProvider<ALIGN>,
-{
+pub struct ThreadLocalStorage<Platform: litebox::platform::RawPointerProvider> {
     /// Indicates whether the TLS is being borrowed.
     pub borrowed: bool,
 
     #[cfg(target_arch = "x86")]
-    pub self_ptr: *mut ThreadLocalStorage<Platform, ALIGN>,
-    pub current_task: alloc::boxed::Box<Task<Platform, ALIGN>>,
+    pub self_ptr: *mut ThreadLocalStorage<Platform>,
+    pub current_task: alloc::boxed::Box<Task<Platform>>,
 }
 
 /// Credentials of a process
@@ -1165,13 +1155,8 @@ pub struct Credentials {
     pub egid: usize,
 }
 
-impl<Platform, const ALIGN: usize> ThreadLocalStorage<Platform, ALIGN>
-where
-    Platform: litebox::platform::RawPointerProvider
-        + litebox::sync::RawSyncPrimitivesProvider
-        + litebox::platform::page_mgmt::PageManagementProvider<ALIGN>,
-{
-    pub const fn new(task: alloc::boxed::Box<Task<Platform, ALIGN>>) -> Self {
+impl<Platform: litebox::platform::RawPointerProvider> ThreadLocalStorage<Platform> {
+    pub const fn new(task: alloc::boxed::Box<Task<Platform>>) -> Self {
         Self {
             borrowed: false,
             #[cfg(target_arch = "x86")]
@@ -1181,12 +1166,7 @@ where
     }
 }
 
-pub struct Task<Platform, const ALIGN: usize = { litebox::mm::linux::PAGE_SIZE }>
-where
-    Platform: litebox::platform::RawPointerProvider
-        + litebox::sync::RawSyncPrimitivesProvider
-        + litebox::platform::page_mgmt::PageManagementProvider<ALIGN>,
-{
+pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     /// Process ID
     pub pid: i32,
     /// Parent Process ID
@@ -1208,8 +1188,6 @@ where
     pub robust_list: Option<Platform::RawConstPointer<RobustListHead<Platform>>>,
     /// Shared process credentials.
     pub credentials: alloc::sync::Arc<Credentials>,
-    /// Shared memory manager
-    pub page_manager: alloc::sync::Arc<litebox::mm::PageManager<Platform, ALIGN>>,
 }
 
 #[repr(C)]
