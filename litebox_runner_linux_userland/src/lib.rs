@@ -50,11 +50,11 @@ pub struct CliArgs {
         default_value = "seccomp"
     )]
     pub interception_backend: InterceptionBackend,
+    /// Connect to a TUN device with this name
     #[arg(
         long = "tun-device-name",
         requires = "unstable",
-        help_heading = "Unstable Options",
-        help = "If provided, connect to a TUN device with this name inside the LiteBox instance"
+        help_heading = "Unstable Options"
     )]
     pub tun_device_name: Option<String>,
 }
