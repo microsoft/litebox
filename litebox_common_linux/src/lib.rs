@@ -2188,12 +2188,11 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 let args = CloneArgs {
                     // The upper 32 bits are clone3-specific. The low 8 bits are the exit signal.
                     flags: CloneFlags::from_bits_retain(ctx.syscall_arg(0) as u64 & 0xffffff00),
-                    stack: ctx.syscall_arg(1) as u64,
-                    parent_tid: ctx.syscall_arg(2) as u64,
-                    child_tid: ctx.syscall_arg(if cfg!(target_arch = "x86_64") { 3 } else { 4 })
-                        as u64,
-                    tls: ctx.syscall_arg(if cfg!(target_arch = "x86_64") { 4 } else { 3 }) as u64,
-                    pidfd: ctx.syscall_arg(2) as u64, // aliases parent_tid
+                    stack: ctx.sys_req_arg(1),
+                    parent_tid: ctx.sys_req_arg(2),
+                    child_tid: ctx.sys_req_arg(if cfg!(target_arch = "x86_64") { 3 } else { 4 }),
+                    tls: ctx.sys_req_arg(if cfg!(target_arch = "x86_64") { 4 } else { 3 }),
+                    pidfd: ctx.sys_req_arg(2), // aliases parent_tid
                     exit_signal: ctx.syscall_arg(0) as u64 & 0xff,
                     stack_size: 0,
                     set_tid: 0,
@@ -2472,6 +2471,11 @@ impl PtRegs {
 )]
 trait ReinterpretTruncatedFromUsize: Sized {
     fn reinterpret_truncated_from_usize(v: usize) -> Self;
+}
+impl ReinterpretTruncatedFromUsize for u64 {
+    fn reinterpret_truncated_from_usize(v: usize) -> Self {
+        v as u64
+    }
 }
 impl ReinterpretTruncatedFromUsize for i64 {
     fn reinterpret_truncated_from_usize(v: usize) -> Self {
