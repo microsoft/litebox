@@ -331,7 +331,6 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         }
         // We can now reset the mask out, and return the number that actually woke up.
         if let Some(lockable) = self.lockables.write().get_mut(&addr) {
-            lockable.latest_wake_bitset = None;
             // Allow waiters to start waiting again
             // Note it is possible that we get a new `lockable` here if all waiters got
             // woken up (hence removed it) and a new waiter came in after that. This ensure
