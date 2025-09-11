@@ -24,6 +24,7 @@ pub struct FutexManager<Platform: RawSyncPrimitivesProvider + RawPointerProvider
     // A map from user-space addresses to raw mutexes.
     lockables: RwLock<Platform, HashMap<usize, Lockable<Platform>>>,
     litebox: LiteBox<Platform>,
+    tickets: AtomicU32,
 }
 
 /// (Private-only) storage for a specific futex.
@@ -61,6 +62,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         Self {
             lockables,
             litebox: litebox.clone(),
+            tickets: AtomicU32::new(1),
         }
     }
 
@@ -235,7 +237,12 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         let mut lockables = loop {
             let mut lockables = self.lockables.write();
             if let Some(lockable) = lockables.get_mut(&addr) {
-                if lockable.latest_wake_bitset.is_none() {
+                if lockable
+                    .raw_mutex
+                    .underlying_atomic()
+                    .load(Ordering::SeqCst)
+                    == 0
+                {
                     // There is no other waiter in play, we take it by setting it up.
                     lockable.latest_wake_bitset = Some(bitset.unwrap_or(NonZeroU32::MAX));
                     break lockables;
@@ -258,10 +265,12 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
             "The `lockable` for the address should have been GC'd if there were no more waiters."
         );
         // We now must indicate to possible new waiters that we have begun the wake-up process
+        let ticket = self.tickets.fetch_add(1, Ordering::SeqCst);
+        debug_assert_ne!(ticket, 0);
         let old_underlying_atomic = lockable
             .raw_mutex
             .underlying_atomic()
-            .fetch_add(1, Ordering::SeqCst);
+            .swap(ticket, Ordering::SeqCst);
         debug_assert_eq!(old_underlying_atomic, 0);
         // We can only wake up the number of sleepers that actually exist. The number of sleepers
         // does not change while we are calculating these things because we are holding on to this
@@ -324,11 +333,18 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         if let Some(lockable) = self.lockables.write().get_mut(&addr) {
             lockable.latest_wake_bitset = None;
             // Allow waiters to start waiting again
-            let old_underlying_atomic = lockable
+            // Note it is possible that we get a new `lockable` here if all waiters got
+            // woken up (hence removed it) and a new waiter came in after that. This ensure
+            // that we only clear the `latest_wake_bitset` if we are still working with
+            // the same `lockable`.
+            if lockable
                 .raw_mutex
                 .underlying_atomic()
-                .fetch_sub(1, Ordering::SeqCst);
-            debug_assert_eq!(old_underlying_atomic, 1);
+                .compare_exchange(ticket, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                lockable.latest_wake_bitset = None;
+            }
         }
         Ok(num_to_wake_up)
     }
