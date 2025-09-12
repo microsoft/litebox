@@ -129,7 +129,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
     };
 
-    let platform = Platform::new();
+    let platform = Platform::new(None);
     let litebox = LiteBox::new(platform);
     let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
     let prog_unix_path = windows_path_to_unix(&prog);

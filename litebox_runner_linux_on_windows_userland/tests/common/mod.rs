@@ -36,7 +36,7 @@ unsafe extern "C" {
 }
 
 pub fn init_platform(tar_data: &'static [u8], initial_dirs: &[&str], initial_files: &[&str]) {
-    let platform = Platform::new();
+    let platform = Platform::new(None);
     set_platform(platform);
     let platform = litebox_platform_multiplex::platform();
     let litebox = LiteBox::new(platform);
