@@ -47,10 +47,8 @@ impl FreeBSDUserland {
         let platform = Self {
             reserved_pages: Self::read_proc_self_maps(),
         };
-        let platform = Box::leak(Box::new(platform));
-
-        platform.set_init_tls(&litebox::LiteBox::new(platform));
-        platform
+        platform.set_init_tls();
+        Box::leak(Box::new(platform))
     }
 
     /// Register the syscall handler (provided by the Linux shim)
@@ -182,7 +180,7 @@ impl FreeBSDUserland {
         }
     }
 
-    fn set_init_tls(&self, litebox: &litebox::LiteBox<FreeBSDUserland>) {
+    fn set_init_tls(&self) {
         let mut tid: isize = 0;
         unsafe {
             syscalls::syscall1(syscalls::Sysno::ThrSelf, &mut tid as *mut isize as usize)
@@ -200,7 +198,6 @@ impl FreeBSDUserland {
             clear_child_tid: None,
             robust_list: None,
             credentials: alloc::sync::Arc::new(Self::get_user_info()),
-            page_manager: alloc::sync::Arc::new(litebox::mm::PageManager::new(litebox)),
         });
 
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
