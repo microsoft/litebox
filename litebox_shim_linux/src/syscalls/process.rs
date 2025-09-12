@@ -702,7 +702,6 @@ pub(crate) fn sys_execve(
     pathname: crate::ConstPtr<i8>,
     argv: crate::ConstPtr<crate::ConstPtr<i8>>,
     envp: crate::ConstPtr<crate::ConstPtr<i8>>,
-    ctx: &mut litebox_common_linux::PtRegs,
 ) -> Result<(), Errno> {
     fn copy_vector(
         mut base: crate::ConstPtr<crate::ConstPtr<i8>>,

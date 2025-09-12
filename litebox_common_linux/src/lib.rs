@@ -1841,7 +1841,6 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         pathname: Platform::RawConstPointer<i8>,
         argv: Platform::RawConstPointer<Platform::RawConstPointer<i8>>,
         envp: Platform::RawConstPointer<Platform::RawConstPointer<i8>>,
-        ctx: &'a mut PtRegs,
     },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
@@ -2277,18 +2276,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 };
                 SyscallRequest::Futex { args }
             }
-            Sysno::execve => {
-                // execve(pathname, argv, envp)
-                let pathname = ctx.sys_req_ptr(0);
-                let argv = ctx.sys_req_ptr(1);
-                let envp = ctx.sys_req_ptr(2);
-                SyscallRequest::Execve {
-                    pathname,
-                    argv,
-                    envp,
-                    ctx,
-                }
-            }
+            Sysno::execve => sys_req!(Execve { pathname:*, argv:*, envp:* }),
             // TODO: support syscall `statfs`
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 SyscallRequest::Ret(errno::Errno::ENOSYS)

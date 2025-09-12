@@ -775,8 +775,7 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
             pathname,
             argv,
             envp,
-            ctx,
-        } => syscalls::process::sys_execve(pathname, argv, envp, ctx).map(|()| unreachable!()),
+        } => syscalls::process::sys_execve(pathname, argv, envp).map(|()| unreachable!()),
         _ => {
             todo!()
         }
