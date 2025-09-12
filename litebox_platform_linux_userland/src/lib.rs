@@ -436,14 +436,25 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
             | CloneFlags::SYSVSEM
             | CloneFlags::CHILD_SETTID;
 
+        let stack = stack.as_usize();
+        let (stack, stack_size) = if stack_size > 0 || stack == 0 {
+            (stack as u64, stack_size as u64)
+        } else {
+            // clone3 requires a non-zero stack size, but we don't know what it
+            // is. Specify an 8-byte stack--the kernel should only really care
+            // about the stack size on platforms that require it (IA64) or when
+            // shadow stacks are enabled.
+            (stack.wrapping_sub(8) as u64, 8)
+        };
+
         let clone_args = litebox_common_linux::CloneArgs {
             flags,
             pidfd: 0,
             child_tid: child_tid_ptr,
             parent_tid: 0,
             exit_signal: 0,
-            stack: stack.as_usize() as u64,
-            stack_size: stack_size as u64,
+            stack,
+            stack_size,
             tls: 0,
             set_tid: 0,
             set_tid_size: 0,

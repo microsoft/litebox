@@ -1752,6 +1752,10 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         flags: litebox::fs::OFlags,
     },
     Clone {
+        args: CloneArgs,
+        ctx: &'a PtRegs,
+    },
+    Clone3 {
         args: Platform::RawConstPointer<CloneArgs>,
         ctx: &'a PtRegs,
     },
@@ -2204,13 +2208,30 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             },
             Sysno::eventfd2 => sys_req!(Eventfd2 { initval, flags }),
             Sysno::getrandom => sys_req!(GetRandom { buf:*,count,flags }),
+            Sysno::clone => {
+                let args = CloneArgs {
+                    // The upper 32 bits are clone3-specific. The low 8 bits are the exit signal.
+                    flags: CloneFlags::from_bits_retain(ctx.syscall_arg(0) as u64 & 0xffffff00),
+                    stack: ctx.sys_req_arg(1),
+                    parent_tid: ctx.sys_req_arg(2),
+                    child_tid: ctx.sys_req_arg(if cfg!(target_arch = "x86_64") { 3 } else { 4 }),
+                    tls: ctx.sys_req_arg(if cfg!(target_arch = "x86_64") { 4 } else { 3 }),
+                    pidfd: ctx.sys_req_arg(2), // aliases parent_tid
+                    exit_signal: ctx.syscall_arg(0) as u64 & 0xff,
+                    stack_size: 0,
+                    set_tid: 0,
+                    set_tid_size: 0,
+                    cgroup: 0,
+                };
+                SyscallRequest::Clone { args, ctx }
+            }
             Sysno::clone3 => {
                 debug_assert_eq!(
                     ctx.sys_req_arg::<usize>(1),
                     size_of::<CloneArgs>(),
                     "legacy clone3 struct"
                 );
-                SyscallRequest::Clone {
+                SyscallRequest::Clone3 {
                     args: ctx.sys_req_ptr(0),
                     ctx,
                 }
@@ -2474,6 +2495,11 @@ impl PtRegs {
 )]
 trait ReinterpretTruncatedFromUsize: Sized {
     fn reinterpret_truncated_from_usize(v: usize) -> Self;
+}
+impl ReinterpretTruncatedFromUsize for u64 {
+    fn reinterpret_truncated_from_usize(v: usize) -> Self {
+        v as u64
+    }
 }
 impl ReinterpretTruncatedFromUsize for i64 {
     fn reinterpret_truncated_from_usize(v: usize) -> Self {
