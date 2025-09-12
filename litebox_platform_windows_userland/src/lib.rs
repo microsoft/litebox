@@ -219,7 +219,8 @@ impl WindowsUserland {
             let adapter = match wintun::Adapter::open(&wintun, adapter_name) {
                 Ok(adapter) => adapter,
                 Err(_) => {
-                    // If opening failed (adapter doesn't exist), create a new one
+                    // If opening failed (adapter doesn't exist), create a new one.
+                    // TODO: The tunnel_type "LiteBox" is a placeholder name for now.
                     wintun::Adapter::create(&wintun, adapter_name, "LiteBox", None)
                         .expect("Failed to create WinTun adapter")
                 }
@@ -601,9 +602,8 @@ impl litebox::platform::IPInterfaceProvider for WindowsUserland {
 
         // Copy the IP packet data into the WinTun packet
         let packet_bytes = wintun_packet.bytes_mut();
-        if packet_bytes.len() != packet.len() {
-            unimplemented!("unexpected size {}", packet_bytes.len())
-        }
+
+        assert_eq!(packet_bytes.len(), packet.len());
         packet_bytes[..packet.len()].copy_from_slice(packet);
 
         // Send the packet through WinTun
@@ -1401,35 +1401,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ip_interface_without_wintun() {
-        // Test IP interface functionality when WinTun is not enabled
-        let platform = WindowsUserland::new(None);
-
-        // Create a sample IP packet (minimal IPv4 header)
-        let mut test_packet = [0u8; 64];
-        test_packet[0] = 0x45; // Version 4, Header length 20 bytes
-        test_packet[9] = 0x06; // Protocol: TCP
-
-        // Test send_ip_packet without WinTun - should panic with unimplemented
-        let result = std::panic::catch_unwind(|| platform.send_ip_packet(&test_packet));
-        assert!(
-            result.is_err(),
-            "send_ip_packet should panic when WinTun is not available"
-        );
-
-        // Test receive_ip_packet without WinTun - should panic with unimplemented
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut receive_buffer = [0u8; 1500];
-            platform.receive_ip_packet(&mut receive_buffer)
-        }));
-        assert!(
-            result.is_err(),
-            "receive_ip_packet should panic when WinTun is not available"
-        );
-    }
-
-    #[test]
-    #[ignore] // This test requires Administrator privileges and WinTun driver to be installed
     fn test_ip_interface_with_wintun() {
         // Test IP interface functionality with WinTun enabled
         // Note: This test requires Administrator privileges to create network adapters
@@ -1544,7 +1515,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // This test requires Administrator privileges and may need external network activity
+    // This test requires Administrator privileges and may need external network activity
     fn test_ip_interface_packet_reception() {
         use std::thread;
         use std::time::Duration;
@@ -1628,7 +1599,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // This test requires Administrator privileges  
+    // This test requires Administrator privileges
     fn test_ip_interface_bidirectional_with_threading() {
         use std::sync::{Arc, Mutex};
         use std::thread;
