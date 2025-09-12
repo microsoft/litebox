@@ -11,6 +11,7 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, TruncateExt},
 };
 use syscalls::Sysno;
+use thiserror::Error;
 
 pub mod errno;
 pub mod mm;
@@ -1845,6 +1846,14 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     Ret(errno::Errno),
 }
 
+#[derive(Error, Debug)]
+pub enum SysnoError {
+    #[error("unknown syscall number: {0}")]
+    UnknownSyscall(usize),
+    #[error("unsupported syscall: {0:?}")]
+    UnsupportedSyscall(Sysno),
+}
+
 impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Platform> {
     /// Take the raw syscall number and arguments, and provide a stronger-typed `SyscallRequest`.
     ///
@@ -1856,7 +1865,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
     /// is allowed to panic upon receiving a syscall number (or arguments) that it does not know how
     /// to handle.
     #[expect(clippy::too_many_lines)]
-    pub fn try_from_raw(syscall_number: usize, ctx: &'a PtRegs) -> Result<Self, errno::Errno> {
+    pub fn try_from_raw(syscall_number: usize, ctx: &'a PtRegs) -> Result<Self, SysnoError> {
         // sys_req! is a convenience macro that automatically takes the correct numbered arguments
         // (in the order of field specification); due to some Rust restrictions, we need to manually
         // specify pointers by adding the `:*` to that field, but otherwise everything else about
@@ -1892,7 +1901,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             };
         }
 
-        let sysno = Sysno::from(u32::try_from(syscall_number).map_err(|_| errno::Errno::ENOSYS)?);
+        let sysno = Sysno::new(syscall_number).ok_or(SysnoError::UnknownSyscall(syscall_number))?;
         let dispatcher = match sysno {
             Sysno::read => sys_req!(Read { fd, buf:*, count }),
             Sysno::write => sys_req!(Write { fd, buf:*, count }),
@@ -2296,7 +2305,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 SyscallRequest::Ret(errno::Errno::ENOSYS)
             }
-            _ => unimplemented!("Translation for {sysno} is not (yet) currently supported"),
+            _ => return Err(SysnoError::UnsupportedSyscall(sysno)),
         };
         Ok(dispatcher)
     }

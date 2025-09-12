@@ -180,7 +180,7 @@ pub extern "C" fn sandbox_task_exit() {
 pub extern "C" fn do_syscall_64(nr: u64, pt_regs: &mut litebox_common_linux::PtRegs) {
     pt_regs.rax = match litebox_common_linux::SyscallRequest::try_from_raw(nr.truncate(), pt_regs) {
         Ok(req) => litebox_shim_linux::handle_syscall_request(req),
-        Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
+        Err(err) => unimplemented!("{err}"),
     };
 }
 

@@ -4,10 +4,10 @@
 // Linux, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
 
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering::SeqCst;
+use core::time::Duration;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::Ordering::SeqCst;
-use std::time::Duration;
 
 use litebox::fs::OFlags;
 use litebox::platform::UnblockedOrTimedOut;
@@ -37,6 +37,44 @@ pub type SyscallHandler = fn(SyscallRequest<LinuxUserland>) -> SyscallReturnType
 
 /// The syscall handler passed down from the shim.
 static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
+
+macro_rules! debug_print {
+    ($s:expr) => {
+        let _ = unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::write,
+                litebox_common_linux::STDERR_FILENO as usize,
+                $s.as_ptr() as usize,
+                $s.len(),
+                // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                syscall_intercept::SYSCALL_ARG_MAGIC,
+            )
+        };
+    };
+}
+
+/// The standard `panic!` macro may not work as expected because it uses TLS, which may have
+/// been overwritten by the guest. Instead, we define our own panic macro that could at print
+/// out the panic message to stderr before panicking.
+macro_rules! litebox_panic {
+    () => {{
+        debug_print!("panic");
+        panic!();
+    }};
+    ($($arg:tt)+) => {{
+        let arg = format_args!($($arg)+).to_string();
+        debug_print!(arg);
+        panic!();
+    }};
+}
+
+macro_rules! litebox_unimplemented {
+    () => {{
+        debug_print!("not implemented");
+        panic!();
+    }};
+    ($($arg:tt)+) => { litebox_panic!($($arg)+) };
+}
 
 /// The userland Linux platform.
 ///
@@ -528,7 +566,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
                 syscalls::Errno::ENOMEM => litebox_common_linux::errno::Errno::ENOMEM,
                 syscalls::Errno::ENOSPC => litebox_common_linux::errno::Errno::ENOSPC,
                 syscalls::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
-                _ => panic!("unexpected error {err}"),
+                _ => litebox_panic!("unexpected error {err}"),
             });
         }
         Ok(ret)
@@ -588,7 +626,7 @@ impl RawMutex {
             Err(syscalls::Errno::EAGAIN) => Err(ImmediatelyWokenUp),
             Err(syscalls::Errno::ETIMEDOUT) => Ok(UnblockedOrTimedOut::TimedOut),
             Err(e) => {
-                panic!("Unexpected errno={e} for FUTEX_WAIT")
+                litebox_panic!("Unexpected errno={e} for FUTEX_WAIT")
             }
             _ => unreachable!(),
         }
@@ -635,7 +673,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
         let tun_fd = self.tun_socket_fd.read().unwrap();
         let Some(tun_socket_fd) = tun_fd.as_ref() else {
-            unimplemented!("networking without tun is unimplemented")
+            litebox_unimplemented!("networking without tun is unimplemented")
         };
         match unsafe {
             syscalls::syscall4(
@@ -649,12 +687,12 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
         } {
             Ok(n) => {
                 if n != packet.len() {
-                    unimplemented!("unexpected size {n}")
+                    litebox_unimplemented!("unexpected size {n}")
                 }
                 Ok(())
             }
             Err(errno) => {
-                unimplemented!("unexpected error {errno}")
+                litebox_unimplemented!("unexpected error {errno}")
             }
         }
     }
@@ -665,7 +703,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
     ) -> Result<usize, litebox::platform::ReceiveError> {
         let tun_fd = self.tun_socket_fd.read().unwrap();
         let Some(tun_socket_fd) = tun_fd.as_ref() else {
-            unimplemented!("networking without tun is unimplemented")
+            litebox_unimplemented!("networking without tun is unimplemented")
         };
         unsafe {
             syscalls::syscall4(
@@ -682,7 +720,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
             syscalls::Errno::EWOULDBLOCK | syscalls::Errno::EAGAIN => {
                 litebox::platform::ReceiveError::WouldBlock
             }
-            _ => unimplemented!("unexpected error {errno}"),
+            _ => litebox_unimplemented!("unexpected error {errno}"),
         })
     }
 }
@@ -765,7 +803,7 @@ fn set_thread_area(
             syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
             syscalls::Errno::ENOSYS => litebox_common_linux::errno::Errno::ENOSYS,
             syscalls::Errno::ESRCH => litebox_common_linux::errno::Errno::ESRCH,
-            _ => panic!("unexpected error {err}"),
+            _ => litebox_panic!("unexpected error {err}"),
         },
     )
 }
@@ -817,7 +855,7 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 .map_err(|err| match err {
                     syscalls::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
                     syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
-                    _ => panic!("unexpected error {err}"),
+                    _ => litebox_panic!("unexpected error {err}"),
                 })
                 .map_err(litebox::platform::PunchthroughError::Failure)
             }
@@ -847,7 +885,7 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 .map_err(|err| match err {
                     syscalls::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
                     syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
-                    _ => panic!("unexpected error {err}"),
+                    _ => litebox_panic!("unexpected error {err}"),
                 })
                 .map_err(litebox::platform::PunchthroughError::Failure)
             }
@@ -1000,7 +1038,7 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
         flags.contains(MemoryRegionPermissions::EXEC),
     );
     if flags.contains(MemoryRegionPermissions::SHARED) {
-        unimplemented!()
+        litebox_unimplemented!()
     }
     res
 }
@@ -1141,9 +1179,12 @@ impl litebox::platform::StdioProvider for LinuxUserland {
                 syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         }
-        .map_err(|err| match err {
-            syscalls::Errno::EPIPE => litebox::platform::StdioReadError::Closed,
-            _ => panic!("unhandled error {err}"),
+        .map_err(|err| {
+            if err == syscalls::Errno::EPIPE {
+                litebox::platform::StdioReadError::Closed
+            } else {
+                litebox_panic!("unhandled error {err}")
+            }
         })
     }
 
@@ -1170,9 +1211,12 @@ impl litebox::platform::StdioProvider for LinuxUserland {
                 syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         }
-        .map_err(|err| match err {
-            syscalls::Errno::EPIPE => litebox::platform::StdioWriteError::Closed,
-            _ => panic!("unhandled error {err}"),
+        .map_err(|err| {
+            if err == syscalls::Errno::EPIPE {
+                litebox::platform::StdioWriteError::Closed
+            } else {
+                litebox_panic!("unhandled error {err}")
+            }
         })
     }
 
@@ -1414,7 +1458,7 @@ unsafe extern "C" fn syscall_handler(
                 .expect("Should have run `register_syscall_handler` by now");
             syscall_handler(d)
         }
-        Err(err) => err.as_neg() as SyscallReturnType,
+        Err(e) => litebox_unimplemented!("{e}"),
     }
 }
 
@@ -1440,14 +1484,7 @@ impl LinuxUserland {
 
     #[cfg(target_arch = "x86")]
     fn get_thread_local_storage() -> *mut litebox_common_linux::ThreadLocalStorage<LinuxUserland> {
-        let mut fs_selector: u16;
-        unsafe {
-            core::arch::asm!(
-                "mov {0:x}, fs",
-                out(reg) fs_selector,
-                options(nostack, preserves_flags)
-            );
-        }
+        let fs_selector = Self::get_fs_selector();
         if fs_selector == 0 {
             return core::ptr::null_mut();
         }
@@ -1465,6 +1502,21 @@ impl LinuxUserland {
     }
 
     #[cfg(target_arch = "x86")]
+    #[inline]
+    fn get_fs_selector() -> u16 {
+        let mut fs_selector: u16;
+        unsafe {
+            core::arch::asm!(
+                "mov {0:x}, fs",
+                out(reg) fs_selector,
+                options(nostack, preserves_flags)
+            );
+        }
+        fs_selector
+    }
+
+    #[cfg(target_arch = "x86")]
+    #[inline]
     fn set_fs_selector(fss: u16) {
         unsafe {
             core::arch::asm!(
