@@ -857,9 +857,15 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             let mut query_addr = base_addr as usize;
             while query_addr < suggested_range.end {
                 let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                do_query_on_region(&mut mbi, query_addr as *mut c_void);
+
                 let mut query_region_end = query_addr + mbi.RegionSize;
                 query_region_end = core::cmp::min(query_region_end, suggested_range.end);
-                do_query_on_region(&mut mbi, query_addr as *mut c_void);
+
+                println!(
+                    "Querying addr: 0x{query_addr:x}, end: 0x{query_region_end:x}, suggested end: {:p} state: {:?}",
+                    suggested_range.end as *mut c_void, mbi.State
+                );
                 // Deal with collision with already committed memory outside of the tracker.
                 if mbi.State == Win32_Memory::MEM_COMMIT
                     && !is_range_within_committed(&(query_addr..query_region_end))
@@ -902,7 +908,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     region_end as *mut c_void
                 );
 
-                let size_within_region = core::cmp::min(size, region_end - suggested_range.start);
+                let size_within_region: usize =
+                    core::cmp::min(size, region_end - suggested_range.start);
                 let ptr = unsafe {
                     match mbi.State {
                         // In case the region is already reserved, we just need to commit it.
