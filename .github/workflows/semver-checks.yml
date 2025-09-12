@@ -1,7 +1,7 @@
 name: SemverChecks
 
-# Run only on pull requests (or if triggered manually)
-on: [pull_request, workflow_dispatch]
+# Run on pull requests, merge groups, or if triggered manually
+on: [pull_request, merge_group, workflow_dispatch]
 
 permissions:
   contents: read
@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Fail if PR base is not main
-        if: github.event.pull_request.base.ref != 'main'
+        if: github.event.pull_request.base.ref != 'main' && github.event_name == 'pull_request'
         run: |
           echo "This PR does not target the 'main' branch. Exiting."
           exit 1
@@ -59,6 +59,7 @@ jobs:
       #     https://api.github.com/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/issues/${{ github.event.number }}/reactions \
       #     -d '{"content":"${{ steps.semver_check.outputs.reaction }}"}'
       - name: Delete old semver checks comments, if any
+        if: github.event_name == 'pull_request'
         run: |
           # Get the old comments
           COMMENT_IDS=$(curl -L \
@@ -77,6 +78,7 @@ jobs:
             https://api.github.com/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/issues/comments/$ID
           done
       - name: Add a new issue comment if needed
+        if: github.event_name == 'pull_request'
         run: |
           curl -L \
           -X POST \
