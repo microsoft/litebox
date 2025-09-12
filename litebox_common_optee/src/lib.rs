@@ -461,12 +461,12 @@ pub enum UteeParamOwned {
     },
     MemrefOutput {
         buffer_size: usize,
-        out_address: usize,
+        out_addresses: alloc::boxed::Box<[usize]>,
     },
     MemrefInout {
         data: alloc::boxed::Box<[u8]>,
         buffer_size: usize,
-        out_address: usize,
+        out_addresses: alloc::boxed::Box<[usize]>,
     },
 }
 

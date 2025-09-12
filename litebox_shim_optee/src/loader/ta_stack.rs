@@ -224,13 +224,13 @@ impl TaStack {
                 UteeParamOwned::MemrefInout {
                     data,
                     buffer_size,
-                    out_address: _,
+                    out_addresses: _,
                 } => {
                     self.push_param_memref(TeeParamType::MemrefInout, Some(data), *buffer_size)?;
                 }
                 UteeParamOwned::MemrefOutput {
                     buffer_size,
-                    out_address: _,
+                    out_addresses: _,
                 } => {
                     self.push_param_memref(TeeParamType::MemrefOutput, None, *buffer_size)?;
                 }

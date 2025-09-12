@@ -38,6 +38,12 @@ pub(crate) mod syscalls;
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 
+#[inline]
+fn align_down(addr: u64, align: u64) -> u64 {
+    debug_assert!(align.is_power_of_two());
+    addr & !(align - 1)
+}
+
 /// Get the global litebox object
 pub fn litebox<'a>() -> &'a LiteBox<Platform> {
     static LITEBOX: OnceBox<LiteBox<Platform>> = OnceBox::new();
@@ -352,7 +358,7 @@ impl OpteeCommandQueue {
 #[derive(Clone)]
 pub(crate) struct OpteeCommandResult {
     pub params_addr: usize, // TA's address containing the results
-    pub out_addrs: [Option<usize>; UteeParamOwned::TEE_NUM_PARAMS],
+    pub out_addrs: [Option<alloc::boxed::Box<[usize]>>; UteeParamOwned::TEE_NUM_PARAMS],
     // VTL0 addresses to copy the results back
 }
 
@@ -426,6 +432,7 @@ pub fn submit_optee_command(
 /// from the queue.
 /// # Panics
 /// This function panics if it cannot allocate a stack
+#[allow(clippy::too_many_lines)]
 pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
     if is_sys_return {
         // TODO: return this output to VTL0
@@ -462,27 +469,31 @@ pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
         let cmd_result = OpteeCommandResult {
             params_addr: stack.get_params_address(),
             out_addrs: {
-                let mut addrs = [None; UteeParamOwned::TEE_NUM_PARAMS];
+                let mut addrs: [Option<alloc::boxed::Box<[usize]>>;
+                    UteeParamOwned::TEE_NUM_PARAMS] =
+                    [const { None }; UteeParamOwned::TEE_NUM_PARAMS];
                 for (i, param) in cmd.params.iter().enumerate() {
-                    match *param {
+                    match param {
                         UteeParamOwned::ValueOutput { out_address }
                         | UteeParamOwned::ValueInout {
                             value_a: _,
                             value_b: _,
                             out_address,
+                        } => {
+                            if *out_address != 0 {
+                                addrs[i] = Some(alloc::boxed::Box::new([*out_address]));
+                            }
                         }
-                        | UteeParamOwned::MemrefOutput {
+                        UteeParamOwned::MemrefOutput {
                             buffer_size: _,
-                            out_address,
+                            out_addresses,
                         }
                         | UteeParamOwned::MemrefInout {
                             data: _,
                             buffer_size: _,
-                            out_address,
+                            out_addresses,
                         } => {
-                            if out_address != 0 {
-                                addrs[i] = Some(out_address);
-                            }
+                            addrs[i] = Some(out_addresses.clone());
                         }
                         _ => {}
                     }
@@ -603,13 +614,13 @@ fn handle_optee_command_output(session_id: u32) {
                             value_a,
                             value_b,
                         );
-                        if let Some(out_addr) = cmd_result.out_addrs[idx] {
+                        if let Some(out_addr) = &cmd_result.out_addrs[idx] {
                             let mut buffer = [0u8; 16];
                             buffer[..8].copy_from_slice(&value_a.to_le_bytes());
                             buffer[8..].copy_from_slice(&value_b.to_le_bytes());
                             unsafe {
                                 litebox_platform_lvbs::platform_low().copy_slice_to_vtl0_phys(
-                                    x86_64::PhysAddr::new(u64::try_from(out_addr).unwrap()),
+                                    x86_64::PhysAddr::new(u64::try_from(out_addr[0]).unwrap()),
                                     &buffer,
                                 );
                             }
@@ -635,21 +646,16 @@ fn handle_optee_command_output(session_id: u32) {
                         } else {
                             litebox::log_println!(
                                 litebox_platform_multiplex::platform(),
-                                "output (index: {}): {:#x} {:?}",
+                                "output (index: {}): {:#x} {:?} (up to 16 bytes)",
                                 idx,
                                 addr,
-                                slice
+                                &slice[..slice.len().min(16)]
                             );
                         }
                         if !slice.is_empty()
-                            && let Some(out_addr) = cmd_result.out_addrs[idx]
+                            && let Some(out_addr) = &cmd_result.out_addrs[idx]
                         {
-                            unsafe {
-                                litebox_platform_lvbs::platform_low().copy_slice_to_vtl0_phys(
-                                    x86_64::PhysAddr::new(u64::try_from(out_addr).unwrap()),
-                                    slice,
-                                );
-                            }
+                            let _ = copy_to_shm_phys_addrs(out_addr, slice);
                         }
                     }
                 }
@@ -939,4 +945,59 @@ impl TeeCrypStateMap {
 pub(crate) fn tee_cryp_state_map() -> &'static TeeCrypStateMap {
     static TEE_CRYPT_STATE_MAP: OnceBox<TeeCrypStateMap> = OnceBox::new();
     TEE_CRYPT_STATE_MAP.get_or_init(|| alloc::boxed::Box::new(TeeCrypStateMap::new()))
+}
+
+/// Copy data to a list of physical addresses of OP-TEE shared memory in VTL0 from a buffer in VTL1.
+///
+/// # Security
+/// This function must check the validity of the output physical addresses and the input buffer like:
+/// - The output addresses must belong to OP-TEE shared memory to do not corrupt arbitrary memory location.
+/// - The input buffer must be within VTL1's memory and not contain any sensitive information without encryption.
+fn copy_to_shm_phys_addrs(out_addrs: &[usize], buffer: &[u8]) -> bool {
+    let aligned_addr = align_down(
+        u64::try_from(out_addrs[0]).unwrap(),
+        u64::try_from(PAGE_SIZE).unwrap(),
+    );
+    let page_offset = out_addrs[0] - usize::try_from(aligned_addr).unwrap();
+    let to_copy = buffer.len().min(PAGE_SIZE - page_offset);
+    if !unsafe {
+        litebox_platform_lvbs::platform_low().copy_slice_to_vtl0_phys(
+            x86_64::PhysAddr::new(u64::try_from(out_addrs[0]).unwrap()),
+            &buffer[..to_copy],
+        )
+    } {
+        return false;
+    }
+    #[cfg(debug_assertions)]
+    litebox::log_println!(
+        litebox_platform_multiplex::platform(),
+        "copied {} bytes to {:#x}",
+        to_copy,
+        out_addrs[0]
+    );
+    let mut copied = to_copy;
+    for out_addr in out_addrs.iter().skip(1) {
+        if copied >= buffer.len() {
+            break;
+        }
+        let to_copy = (buffer.len() - copied).min(PAGE_SIZE);
+        if !unsafe {
+            litebox_platform_lvbs::platform_low().copy_slice_to_vtl0_phys(
+                x86_64::PhysAddr::new(u64::try_from(*out_addr).unwrap()),
+                &buffer[copied..copied + to_copy],
+            )
+        } {
+            return false;
+        }
+        #[cfg(debug_assertions)]
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "copied {} bytes to {:#x}",
+            to_copy,
+            *out_addr
+        );
+        copied += to_copy;
+    }
+
+    true
 }

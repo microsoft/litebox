@@ -4,27 +4,16 @@
 
 use crate::debug_serial_println;
 
-use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
-use crate::user_context::UserSpaceManagement;
-use alloc::vec;
+use alloc::{vec, vec::Vec};
 use hashbrown::HashMap;
-use litebox_common_linux::errno::Errno;
 use num_enum::TryFromPrimitive;
 use once_cell::race::OnceBox;
+use x86_64::{align_down, align_up};
 
+use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
+use crate::user_context::UserSpaceManagement;
+use litebox_common_linux::errno::Errno;
 use litebox_common_optee::{TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams};
-
-#[inline]
-fn align_up(addr: u64, align: u64) -> u64 {
-    debug_assert!(align.is_power_of_two());
-    (addr + align - 1) & !(align - 1)
-}
-
-#[inline]
-fn align_down(addr: u64, align: u64) -> u64 {
-    debug_assert!(align.is_power_of_two());
-    addr & !(align - 1)
-}
 
 const OPTEE_MSG_CMD_OPEN_SESSION: u32 = 0;
 const OPTEE_MSG_CMD_INVOKE_COMMAND: u32 = 1;
@@ -195,6 +184,7 @@ pub fn mshv_vsm_optee_close_session(session_id: usize) -> Result<i64, Errno> {
     }
 }
 
+/*
 #[allow(clippy::unnecessary_wraps)]
 #[allow(clippy::too_many_lines)]
 #[allow(dead_code)]
@@ -354,17 +344,16 @@ fn optee_test() -> Result<i64, Errno> {
 
     Ok(0)
 }
+*/
 
+/*
 /// OP-TEE message command dispatcher
 #[allow(clippy::unnecessary_wraps)]
 pub fn optee_msg_cmd_dispatch(_msg_cmd_id: OpteeMessageCommand, _params: &[u64]) -> i64 {
     // TODO: params[0] will have a VTL0 physical address containing `OpteeMsgArg`. Copy and parse it.
 
-    // for testing only
     let _ = optee_test();
     0
-
-    /*
     let result = match msg_cmd_id {
         OpteeMessageCommand::OpenSession => {
             // OpteeMsgArg.params[0].a-b: TA UUID
@@ -390,8 +379,8 @@ pub fn optee_msg_cmd_dispatch(_msg_cmd_id: OpteeMessageCommand, _params: &[u64])
         Ok(value) => value,
         Err(errno) => errno.as_neg().into(),
     }
-    */
 }
+*/
 
 /// OP-TEE SMC call arguments. OP-TEE assumes that the underlying architecture is Arm with TrustZone.
 /// This is why it uses SMC calling convention (SMCCC). We need to translate this into VTL switch convention.
@@ -785,43 +774,10 @@ pub fn decode_optee_msg_arg(
 
     match OpteeMessageCommand::try_from(msg_arg.cmd).unwrap_or(OpteeMessageCommand::Unknown) {
         OpteeMessageCommand::RegisterShm => {
-            let phys_addr = msg_arg.params[0].u.a;
-            let size = msg_arg.params[0].u.b;
-            let shm_ref = msg_arg.params[0].u.c;
-
-            let aligned_phys_addr = align_down(phys_addr, u64::try_from(PAGE_SIZE).unwrap());
-            let page_offset = phys_addr - aligned_phys_addr;
-            let aligned_size = align_up(size, u64::try_from(PAGE_SIZE).unwrap());
-
-            let num_pages = usize::try_from(aligned_size).unwrap() / PAGE_SIZE;
-            let mut pages_list = alloc::vec![0u64; num_pages];
-
-            if let Some(pages_data) = unsafe {
-                crate::platform_low().copy_from_vtl0_phys::<ShmRefPagesData>(x86_64::PhysAddr::new(
-                    aligned_phys_addr,
-                ))
-            } {
-                if pages_data.next_page_data != 0 {
-                    debug_serial_println!("TODO: support multi-paged ShmRefPagesData");
-                    return None;
-                }
-                for (i, page) in pages_list.iter_mut().enumerate().take(num_pages) {
-                    if pages_data.pages_list[i] != 0 {
-                        *page = pages_data.pages_list[i];
-                    } else {
-                        break;
-                    }
-                }
-            } else {
-                return None;
-            }
-
-            shm_ref_map().insert(
-                shm_ref,
-                ShmRefInfo {
-                    pages_list: pages_list.into(),
-                    page_offset,
-                },
+            shm_ref_map().register_shm(
+                msg_arg.params[0].u.a,
+                msg_arg.params[0].u.b,
+                msg_arg.params[0].u.c,
             );
             return None;
         }
@@ -882,14 +838,13 @@ pub fn decode_optee_msg_arg(
                     + core::mem::offset_of!(OpteeMsgParam, u),
             },
             Ok(OpteeMsgAttrType::RmemInput | OpteeMsgAttrType::TmemInput) => {
-                if let Some(phys_addr) =
-                    get_vtl0_phys_addr_from_optee_msg_param(msg_arg.params[i].u)
+                if let Some(phys_addrs) =
+                    get_shm_phys_addrs_from_optee_msg_param(msg_arg.params[i].u)
                 {
-                    let mut data = vec![0u8; usize::try_from(msg_arg.params[i].u.b).unwrap()];
-                    if unsafe {
-                        crate::platform_low()
-                            .copy_slice_from_vtl0_phys(x86_64::PhysAddr::new(phys_addr), &mut data)
-                    } {
+                    let data_size = usize::try_from(msg_arg.params[i].u.b).unwrap();
+                    let mut data = vec![0u8; data_size];
+
+                    if copy_from_shm_phys_addrs(&phys_addrs, &mut data) {
                         UteeParamOwned::MemrefInput { data: data.into() }
                     } else {
                         UteeParamOwned::None
@@ -899,30 +854,30 @@ pub fn decode_optee_msg_arg(
                 }
             }
             Ok(OpteeMsgAttrType::RmemOutput | OpteeMsgAttrType::TmemOutput) => {
-                if let Some(phys_addr) =
-                    get_vtl0_phys_addr_from_optee_msg_param(msg_arg.params[i].u)
+                if let Some(phys_addrs) =
+                    get_shm_phys_addrs_from_optee_msg_param(msg_arg.params[i].u)
                 {
+                    let buffer_size = usize::try_from(msg_arg.params[i].u.b).unwrap();
                     UteeParamOwned::MemrefOutput {
-                        buffer_size: usize::try_from(msg_arg.params[i].u.b).unwrap(),
-                        out_address: usize::try_from(phys_addr).unwrap(),
+                        buffer_size,
+                        out_addresses: phys_addrs.into(),
                     }
                 } else {
                     UteeParamOwned::None
                 }
             }
             Ok(OpteeMsgAttrType::RmemInout | OpteeMsgAttrType::TmemInout) => {
-                if let Some(phys_addr) =
-                    get_vtl0_phys_addr_from_optee_msg_param(msg_arg.params[i].u)
+                if let Some(phys_addrs) =
+                    get_shm_phys_addrs_from_optee_msg_param(msg_arg.params[i].u)
                 {
-                    let mut data = vec![0u8; usize::try_from(msg_arg.params[i].u.b).unwrap()];
-                    if unsafe {
-                        crate::platform_low()
-                            .copy_slice_from_vtl0_phys(x86_64::PhysAddr::new(phys_addr), &mut data)
-                    } {
+                    let buffer_size = usize::try_from(msg_arg.params[i].u.b).unwrap();
+                    let mut data = vec![0u8; buffer_size];
+
+                    if copy_from_shm_phys_addrs(&phys_addrs, &mut data) {
                         UteeParamOwned::MemrefInout {
                             data: data.into(),
-                            buffer_size: usize::try_from(msg_arg.params[i].u.b).unwrap(),
-                            out_address: usize::try_from(phys_addr).unwrap(),
+                            buffer_size,
+                            out_addresses: phys_addrs.into(),
                         }
                     } else {
                         UteeParamOwned::None
@@ -938,22 +893,99 @@ pub fn decode_optee_msg_arg(
     Some((1, utee_entry_func, cmd_id, params))
 }
 
-fn get_vtl0_phys_addr_from_optee_msg_param(param: OpteeMsgParamValue) -> Option<u64> {
+/// Get a list of the physical addresses of OP-TEE shared memory from an `OpteeMsgParamValue`.
+/// All addresses must be page-aligned except possibly the first one.
+/// These addresses are virtually contiguous within VTL0, but not necessarily physically contiguous.
+fn get_shm_phys_addrs_from_optee_msg_param(param: OpteeMsgParamValue) -> Option<Vec<usize>> {
     if param.c == 0 {
         // temporary memory
-        if param.a == 0 { None } else { Some(param.a) }
+        if param.a == 0 {
+            None
+        } else {
+            Some(vec![usize::try_from(param.a).unwrap()])
+        }
     } else if let Some(shm_ref_info) = shm_ref_map().get(param.c) {
         let offset = shm_ref_info.page_offset + param.a;
         let page_index = offset / u64::try_from(PAGE_SIZE).unwrap();
         let page_offset = offset - align_down(offset, u64::try_from(PAGE_SIZE).unwrap());
-        Some(shm_ref_info.pages_list[usize::try_from(page_index).unwrap()] + page_offset)
-        // TODO: support cross-page-boundary accesses. Perhaps we need to return `ShmRefInfo` itself.
+        let mem_size = param.b;
+        let num_pages = usize::try_from(align_up(
+            page_offset + mem_size,
+            u64::try_from(PAGE_SIZE).unwrap(),
+        ))
+        .unwrap()
+            / PAGE_SIZE;
+        let mut pages = Vec::with_capacity(num_pages);
+        pages.push(
+            usize::try_from(shm_ref_info.pages[usize::try_from(page_index).unwrap()] + page_offset)
+                .unwrap(),
+        );
+
+        debug_serial_println!(
+            "offset={} page_index={} page_offset={} mem_size={} num_pages={}",
+            offset,
+            page_index,
+            page_offset,
+            mem_size,
+            num_pages,
+        );
+
+        for i in 1..num_pages {
+            pages.push(
+                usize::try_from(shm_ref_info.pages[usize::try_from(page_index).unwrap() + i])
+                    .unwrap(),
+            );
+        }
+        Some(pages)
     } else {
         None
     }
 }
 
-/// Maintain the physical address of `shm_ref` in VTL0
+/// Copy data from a list of physical addresses of OP-TEE shared memory in VTL0 to a buffer in VTL1.
+///
+/// # Security
+/// This function must check the validity of the input physical addresses and the out buffer like:
+/// - The input addresses must belong to OP-TEE shared memory to do not access arbitrary data which might be malicious.
+/// - The output buffer must be within VTL1's memory to avoid information leakage and arbitrary memory corruption.
+fn copy_from_shm_phys_addrs(in_addrs: &[usize], buffer: &mut [u8]) -> bool {
+    let aligned_addr = align_down(
+        u64::try_from(in_addrs[0]).unwrap(),
+        u64::try_from(PAGE_SIZE).unwrap(),
+    );
+    let page_offset = in_addrs[0] - usize::try_from(aligned_addr).unwrap();
+    let to_copy = buffer.len().min(PAGE_SIZE - page_offset);
+    if !unsafe {
+        crate::platform_low().copy_slice_from_vtl0_phys(
+            x86_64::PhysAddr::new(u64::try_from(in_addrs[0]).unwrap()),
+            &mut buffer[..to_copy],
+        )
+    } {
+        return false;
+    }
+    debug_serial_println!("copied {} bytes from {:#x}", to_copy, in_addrs[0]);
+    let mut copied = to_copy;
+    for in_addr in in_addrs.iter().skip(1) {
+        if copied >= buffer.len() {
+            break;
+        }
+        let to_copy = (buffer.len() - copied).min(PAGE_SIZE);
+        if !unsafe {
+            crate::platform_low().copy_slice_from_vtl0_phys(
+                x86_64::PhysAddr::new(u64::try_from(*in_addr).unwrap()),
+                &mut buffer[copied..copied + to_copy],
+            )
+        } {
+            return false;
+        }
+        debug_serial_println!("copied {} bytes from {:#x}", to_copy, *in_addr);
+        copied += to_copy;
+    }
+
+    true
+}
+
+/// Maintain the information of OP-TEE shared memory in VTL0 referenced by `shm_ref`.
 pub(crate) struct ShmRefMap {
     inner: spin::mutex::SpinMutex<HashMap<u64, ShmRefInfo>>,
 }
@@ -969,7 +1001,7 @@ const PAGELIST_ENTRIES_PER_PAGE: usize =
 
 #[derive(Clone)]
 pub struct ShmRefInfo {
-    pub pages_list: alloc::boxed::Box<[u64]>,
+    pub pages: alloc::boxed::Box<[u64]>,
     pub page_offset: u64,
 }
 
@@ -993,6 +1025,54 @@ impl ShmRefMap {
     pub fn get(&self, shm_ref: u64) -> Option<ShmRefInfo> {
         let guard = self.inner.lock();
         guard.get(&shm_ref).cloned()
+    }
+
+    pub fn register_shm(&self, phys_addr: u64, size: u64, shm_ref: u64) {
+        let aligned_phys_addr = align_down(phys_addr, u64::try_from(PAGE_SIZE).unwrap());
+        let page_offset = phys_addr - aligned_phys_addr;
+        let aligned_size = align_up(page_offset + size, u64::try_from(PAGE_SIZE).unwrap());
+
+        let num_pages = usize::try_from(aligned_size).unwrap() / PAGE_SIZE;
+        let mut pages = Vec::with_capacity(num_pages);
+
+        let mut pages_data_addr = aligned_phys_addr;
+        loop {
+            if let Some(pages_data) = unsafe {
+                crate::platform_low()
+                    .copy_from_vtl0_phys::<ShmRefPagesData>(x86_64::PhysAddr::new(pages_data_addr))
+            } {
+                for i in 0..PAGELIST_ENTRIES_PER_PAGE {
+                    if pages_data.pages_list[i] == 0 || pages.len() == num_pages {
+                        break;
+                    } else if pages_data.pages_list[i]
+                        != align_down(pages_data.pages_list[i], u64::try_from(PAGE_SIZE).unwrap())
+                    {
+                        debug_serial_println!(
+                            "shm_ref address is not page-aligned {:#x}",
+                            pages_data.pages_list[i]
+                        );
+                        return;
+                    } else {
+                        pages.push(pages_data.pages_list[i]);
+                    }
+                }
+                if pages_data.next_page_data == 0 || pages.len() == num_pages {
+                    break;
+                } else {
+                    pages_data_addr = pages_data.next_page_data;
+                }
+            } else {
+                return;
+            }
+        }
+
+        self.insert(
+            shm_ref,
+            ShmRefInfo {
+                pages: pages.into(),
+                page_offset,
+            },
+        );
     }
 }
 
