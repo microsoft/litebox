@@ -908,7 +908,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
                         // In case the region is already committed, we make sure the already committed region is in the tracker.
                         // We simply change the protection flags of the region (if in the tracker). Otherwise it means we are
-                        // colluding with the global memory allocator and we have to handle new allocation.
+                        // colliding with the global memory allocator and we have to handle new allocation.
                         Win32_Memory::MEM_COMMIT => {
                             let committed_range =
                                 (base_addr as usize)..(base_addr as usize + size_within_region);
