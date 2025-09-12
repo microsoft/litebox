@@ -24,7 +24,7 @@ use litebox::{
     mm::{PageManager, linux::PAGE_SIZE},
     platform::{RawConstPointer as _, RawMutPointer as _},
     sync::{RwLock, futex::FutexManager},
-    utils::ReinterpretUnsignedExt,
+    utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
 use litebox_common_linux::{SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
@@ -307,6 +307,34 @@ pub extern "C" fn close(fd: i32) -> i32 {
 // hopefully-reasonable middle ground.
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 
+/// A wrapper function around `sys_pread64` that copies data in chunks to avoid OOMing.
+fn pread_with_user_buf(
+    fd: i32,
+    buf: MutPtr<u8>,
+    count: usize,
+    offset: i64,
+) -> Result<usize, Errno> {
+    let mut kernel_buf = vec![0u8; 0x1000];
+    let mut read_total = 0;
+    while read_total < count {
+        let to_read = (count - read_total).min(kernel_buf.len());
+        match syscalls::file::sys_pread64(
+            fd,
+            &mut kernel_buf[..to_read],
+            offset + (read_total.reinterpret_as_signed() as i64),
+        ) {
+            Ok(0) => break, // EOF
+            Ok(size) => {
+                buf.copy_from_slice(read_total, &kernel_buf[..size])
+                    .ok_or(Errno::EFAULT)?;
+                read_total += size;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(read_total)
+}
+
 /// Handle Linux syscalls and dispatch them to LiteBox implementations.
 ///
 /// # Panics
@@ -321,13 +349,34 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
         SyscallRequest::Read { fd, buf, count } => {
             // Note some applications (e.g., `node`) seem to assume that getting fewer bytes than
             // requested indicates EOF.
-            debug_assert!(count <= MAX_KERNEL_BUF_SIZE);
-            let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
-            syscalls::file::sys_read(fd, &mut kernel_buf, None).and_then(|size| {
-                buf.copy_from_slice(0, &kernel_buf[..size])
-                    .map(|()| size)
-                    .ok_or(Errno::EFAULT)
-            })
+            if count <= MAX_KERNEL_BUF_SIZE {
+                let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
+                syscalls::file::sys_read(fd, &mut kernel_buf, None).and_then(|size| {
+                    buf.copy_from_slice(0, &kernel_buf[..size])
+                        .map(|()| size)
+                        .ok_or(Errno::EFAULT)
+                })
+            } else {
+                // If the read size is too large, we need to do some extra work to avoid OOMing.
+                // We read data in chunks and update the file offset ourselves only if the read succeeds.
+                syscalls::file::sys_lseek(fd, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset)
+                    .inspect_err(|e| {
+                        if *e == Errno::ESPIPE {
+                            unimplemented!("read on non-seekable fds with large buffers");
+                        }
+                    })
+                    .and_then(|cur_loc| {
+                        pread_with_user_buf(fd, buf, count, i64::try_from(cur_loc).unwrap())
+                            .inspect(|read_total| {
+                                syscalls::file::sys_lseek(
+                                    fd,
+                                    (cur_loc + read_total).reinterpret_as_signed(),
+                                    litebox::fs::SeekWhence::RelativeToBeginning,
+                                )
+                                .expect("lseek failed");
+                            })
+                    })
+            }
         }
         SyscallRequest::Write { fd, buf, count } => match unsafe { buf.to_cow_slice(count) } {
             Some(buf) => syscalls::file::sys_write(fd, &buf, None),
@@ -335,7 +384,13 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
         },
         SyscallRequest::Close { fd } => syscalls::file::sys_close(fd).map(|()| 0),
         SyscallRequest::Lseek { fd, offset, whence } => {
-            syscalls::file::sys_lseek(fd, offset, whence)
+            let seekwhence = match whence {
+                0 => litebox::fs::SeekWhence::RelativeToBeginning,
+                1 => litebox::fs::SeekWhence::RelativeToCurrentOffset,
+                2 => litebox::fs::SeekWhence::RelativeToEnd,
+                _ => todo!("unsupported whence"),
+            };
+            syscalls::file::sys_lseek(fd, offset, seekwhence)
         }
         SyscallRequest::Mkdir { pathname, mode } => {
             pathname.to_cstring().map_or(Err(Errno::EINVAL), |path| {
@@ -372,14 +427,7 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
             buf,
             count,
             offset,
-        } => {
-            let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
-            syscalls::file::sys_pread64(fd, &mut kernel_buf, offset).and_then(|size| {
-                buf.copy_from_slice(0, &kernel_buf[..size])
-                    .map(|()| size)
-                    .ok_or(Errno::EFAULT)
-            })
-        }
+        } => pread_with_user_buf(fd, buf, count, offset),
         SyscallRequest::Pwrite64 {
             fd,
             buf,

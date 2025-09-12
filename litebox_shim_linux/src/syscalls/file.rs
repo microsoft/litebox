@@ -198,22 +198,14 @@ pub fn sys_pwrite64(fd: i32, buf: &[u8], offset: usize) -> Result<usize, Errno> 
 }
 
 /// Handle syscall `lseek`
-pub fn sys_lseek(fd: i32, offset: isize, whence: i32) -> Result<usize, Errno> {
-    let seekwhence: SeekWhence = match whence {
-        0 => SeekWhence::RelativeToBeginning,
-        1 => SeekWhence::RelativeToCurrentOffset,
-        2 => SeekWhence::RelativeToEnd,
-        _ => todo!("unsupported whence"),
-    };
+pub fn sys_lseek(fd: i32, offset: isize, whence: SeekWhence) -> Result<usize, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
     let file_table = file_descriptors().read();
     let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
     match desc {
-        Descriptor::File(file) => litebox_fs()
-            .seek(file, offset, seekwhence)
-            .map_err(Errno::from),
+        Descriptor::File(file) => litebox_fs().seek(file, offset, whence).map_err(Errno::from),
         Descriptor::Stdio(..)
         | Descriptor::Socket(..)
         | Descriptor::PipeReader { .. }
