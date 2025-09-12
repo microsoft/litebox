@@ -852,6 +852,39 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             assert!(suggested_range.end <= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
                                                             TASK_ADDR_MAX);
 
+            // Query the memory state of the suggested address in a loop. This ensures that all of the
+            // suggested address range is not colliding with the global memory allocator.
+            let mut query_addr = base_addr as usize;
+            while query_addr < suggested_range.end {
+                let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                let mut query_region_end = query_addr + mbi.RegionSize;
+                query_region_end = core::cmp::min(query_region_end, suggested_range.end);
+                do_query_on_region(&mut mbi, query_addr as *mut c_void);
+                // Deal with collision with already committed memory outside of the tracker.
+                if mbi.State == Win32_Memory::MEM_COMMIT
+                    && !is_range_within_committed(&(query_addr..query_region_end))
+                {
+                    if fixed_address {
+                        return Err(
+                            litebox::platform::page_mgmt::AllocationError::AlreadyAllocated,
+                        );
+                    } else {
+                        // We simply handle it as a new allocation request (for the whole range).
+                        return <WindowsUserland as litebox::platform::PageManagementProvider<
+                            ALIGN,
+                        >>::allocate_pages(
+                            self,
+                            0..size,
+                            initial_permissions,
+                            can_grow_down,
+                            populate_pages_immediately,
+                            false,
+                        );
+                    }
+                }
+                query_addr = query_region_end;
+            }
+
             let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
             do_query_on_region(&mut mbi, base_addr);
 
@@ -908,52 +941,32 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                             ptr
                         }
 
-                        // In case the region is already committed, we make sure the already committed region is in the tracker.
-                        // We simply change the protection flags of the region (if in the tracker). Otherwise it means we are
-                        // colliding with the global memory allocator and we have to handle new allocation.
+                        // In case the region is already committed, we simply need to update the permission.
+                        // We already ensured that the committed region does not collide with the global
+                        // allocator above.
                         Win32_Memory::MEM_COMMIT => {
-                            let committed_range =
-                                (base_addr as usize)..(base_addr as usize + size_within_region);
                             // We are safe to operate on a PageManagementProvider committed range.
-                            if is_range_within_committed(&committed_range) {
-                                let mut old_protect: u32 = 0;
-                                assert!(
-                                    Win32_Memory::VirtualProtect(
-                                        base_addr,
-                                        size_within_region,
-                                        prot_flags(initial_permissions),
-                                        &raw mut old_protect,
-                                    ) != 0,
-                                    "{}",
-                                    {
-                                        let last_error = GetLastError();
-                                        format!(
-                                            "VirtualProtect failed. Range (0x{:x} - 0x{:x}). Error: {}. Str: {}",
-                                            base_addr as usize,
-                                            (base_addr as usize + size_within_region),
-                                            last_error,
-                                            werr_text(last_error)
-                                        )
-                                    }
-                                );
-                                base_addr
-                            }
-                            // Deal with collision with global allocator.
-                            else if fixed_address {
-                                return Err(
-                                    litebox::platform::page_mgmt::AllocationError::AlreadyAllocated,
-                                );
-                            } else {
-                                // We simply handle it as a new allocation request (for the whole range).
-                                return <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
-                                        self,
-                                        0..size,
-                                        initial_permissions,
-                                        can_grow_down,
-                                        populate_pages_immediately,
-                                        false,
-                                        );
-                            }
+                            let mut old_protect: u32 = 0;
+                            assert!(
+                                Win32_Memory::VirtualProtect(
+                                    base_addr,
+                                    size_within_region,
+                                    prot_flags(initial_permissions),
+                                    &raw mut old_protect,
+                                ) != 0,
+                                "{}",
+                                {
+                                    let last_error = GetLastError();
+                                    format!(
+                                        "VirtualProtect failed. Range (0x{:x} - 0x{:x}). Error: {}. Str: {}",
+                                        base_addr as usize,
+                                        (base_addr as usize + size_within_region),
+                                        last_error,
+                                        werr_text(last_error)
+                                    )
+                                }
+                            );
+                            base_addr
                         }
                         _ => {
                             panic!("Unexpected memory state: {:?}", mbi.State);
