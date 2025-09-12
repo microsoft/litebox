@@ -30,7 +30,6 @@ use litebox_common_linux::{SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
 use syscalls::net::sys_setsockopt;
 
-pub(crate) mod channel;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
@@ -247,11 +246,11 @@ enum Descriptor {
     // TODO: this could be addressed by #120.
     Socket(alloc::sync::Arc<crate::syscalls::net::Socket>),
     PipeReader {
-        consumer: alloc::sync::Arc<crate::channel::Consumer<u8>>,
+        consumer: alloc::sync::Arc<litebox::pipes::ReadEnd<Platform, u8>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
     PipeWriter {
-        producer: alloc::sync::Arc<crate::channel::Producer<u8>>,
+        producer: alloc::sync::Arc<litebox::pipes::WriteEnd<Platform, u8>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
     Eventfd {
@@ -621,58 +620,10 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
                 Ok(0)
             })
         }
-        SyscallRequest::Clone { args, ctx } => {
+        SyscallRequest::Clone { args, ctx } => handle_clone_request(&args, ctx),
+        SyscallRequest::Clone3 { args, ctx } => {
             if let Some(clone_args) = unsafe { args.read_at_offset(0) } {
-                let clone_args = clone_args.into_owned();
-                if clone_args.cgroup != 0 {
-                    unimplemented!("Clone with cgroup is not supported");
-                }
-                if clone_args.set_tid != 0 {
-                    unimplemented!("Clone with set_tid is not supported");
-                }
-                if clone_args.exit_signal != 0 {
-                    unimplemented!("Clone with exit_signal is not supported");
-                }
-                let parent_tid = if clone_args.parent_tid == 0 {
-                    None
-                } else {
-                    Some(MutPtr::from_usize(
-                        usize::try_from(clone_args.parent_tid).unwrap(),
-                    ))
-                };
-                let stack = if clone_args.stack == 0 {
-                    None
-                } else {
-                    Some(MutPtr::from_usize(
-                        usize::try_from(clone_args.stack).unwrap(),
-                    ))
-                };
-                let child_tid = if clone_args.child_tid == 0 {
-                    None
-                } else {
-                    Some(MutPtr::from_usize(
-                        usize::try_from(clone_args.child_tid).unwrap(),
-                    ))
-                };
-                let tls = if clone_args.tls != 0 {
-                    Some(MutPtr::from_usize(usize::try_from(clone_args.tls).unwrap()))
-                } else {
-                    None
-                };
-                usize::try_from(clone_args.stack_size)
-                    .map_err(|_| Errno::EINVAL)
-                    .and_then(|stack_size| {
-                        syscalls::process::sys_clone(
-                            clone_args.flags,
-                            parent_tid,
-                            stack,
-                            stack_size,
-                            child_tid,
-                            tls,
-                            ctx,
-                            ctx.get_ip(),
-                        )
-                    })
+                handle_clone_request(&clone_args, ctx)
             } else {
                 Err(Errno::EFAULT)
             }
@@ -771,4 +722,59 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
         };
         e.reinterpret_as_unsigned()
     })
+}
+
+fn handle_clone_request(
+    clone_args: &litebox_common_linux::CloneArgs,
+    ctx: &litebox_common_linux::PtRegs,
+) -> Result<usize, Errno> {
+    if clone_args.cgroup != 0 {
+        unimplemented!("Clone with cgroup is not supported");
+    }
+    if clone_args.set_tid != 0 {
+        unimplemented!("Clone with set_tid is not supported");
+    }
+    if clone_args.exit_signal != 0 {
+        unimplemented!("Clone with exit_signal is not supported");
+    }
+    let parent_tid = if clone_args.parent_tid == 0 {
+        None
+    } else {
+        Some(MutPtr::from_usize(
+            usize::try_from(clone_args.parent_tid).unwrap(),
+        ))
+    };
+    let stack = if clone_args.stack == 0 {
+        None
+    } else {
+        Some(MutPtr::from_usize(
+            usize::try_from(clone_args.stack).unwrap(),
+        ))
+    };
+    let child_tid = if clone_args.child_tid == 0 {
+        None
+    } else {
+        Some(MutPtr::from_usize(
+            usize::try_from(clone_args.child_tid).unwrap(),
+        ))
+    };
+    let tls = if clone_args.tls != 0 {
+        Some(MutPtr::from_usize(usize::try_from(clone_args.tls).unwrap()))
+    } else {
+        None
+    };
+    usize::try_from(clone_args.stack_size)
+        .map_err(|_| Errno::EINVAL)
+        .and_then(|stack_size| {
+            syscalls::process::sys_clone(
+                clone_args.flags,
+                parent_tid,
+                stack,
+                stack_size,
+                child_tid,
+                tls,
+                ctx,
+                ctx.get_ip(),
+            )
+        })
 }
