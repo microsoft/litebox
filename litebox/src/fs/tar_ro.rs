@@ -38,7 +38,7 @@ use super::{
     Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     errors::{
         ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadDirError,
-        ReadError, RmdirError, SeekError, UnlinkError, WriteError,
+        ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
     },
 };
 
@@ -79,9 +79,7 @@ pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
 }
 
 /// An empty tar file to support an empty file system.
-pub fn empty_tar_file() -> Vec<u8> {
-    alloc::vec![0u8; 10240]
-}
+pub const EMPTY_TAR_FILE: &[u8] = &[0u8; 10240];
 
 impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// Construct a new `FileSystem` instance from provided `tar_data`.
@@ -91,7 +89,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// buffer is provided it will be consumed to construct a `TarArchive`. Using `Cow` avoids an
     /// unnecessary copy while allowing either borrowed or owned input.
     ///
-    /// Use [`empty_tar_file`] if you need an empty file system.
+    /// Use [`EMPTY_TAR_FILE`] if you need an empty file system.
     ///
     /// # Panics
     ///
@@ -150,11 +148,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let currently_supported_oflags: OFlags = OFlags::RDONLY
             | OFlags::WRONLY
             | OFlags::RDWR
+            | OFlags::CREAT
+            | OFlags::EXCL
+            | OFlags::TRUNC
             | OFlags::NOCTTY
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!()
+        }
+        if flags.contains(OFlags::CREAT) {
+            return Err(OpenError::ReadOnlyFileSystem);
         }
         let path = self.absolute_path(path)?;
         if path.is_empty() {
@@ -183,26 +187,35 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             return Err(OpenError::ReadOnlyFileSystem);
         }
         assert!(flags.contains(OFlags::RDONLY));
-        if entry.filename().as_str().unwrap() == path {
+        let fd = if entry.filename().as_str().unwrap() == path {
             // it is a file
             if flags.contains(OFlags::DIRECTORY) {
                 return Err(OpenError::PathError(PathError::ComponentNotADirectory));
             }
-            Ok(self
-                .litebox
+            self.litebox
                 .descriptor_table_mut()
                 .insert(Descriptor::File {
                     idx,
                     position: 0,
                     metadata: AnyMap::new(),
-                }))
+                })
         } else {
             // it is a dir
-            Ok(self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
+            self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
                 path: path.to_owned(),
                 metadata: AnyMap::new(),
-            }))
+            })
+        };
+        if flags.contains(OFlags::TRUNC) {
+            match self.truncate(&fd, 0, true) {
+                Ok(()) => {}
+                Err(e) => {
+                    self.close(fd).unwrap();
+                    return Err(e.into());
+                }
+            }
         }
+        Ok(fd)
     }
 
     fn close(&self, fd: FileFd<Platform>) -> Result<(), CloseError> {
@@ -277,6 +290,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         } else {
             *position = new_posn;
             Ok(new_posn)
+        }
+    }
+
+    fn truncate(
+        &self,
+        fd: &FileFd<Platform>,
+        _length: usize,
+        _reset_offset: bool,
+    ) -> Result<(), TruncateError> {
+        match self.litebox.descriptor_table().get_entry(fd).entry {
+            Descriptor::File { .. } => Err(TruncateError::NotForWriting),
+            Descriptor::Dir { .. } => Err(TruncateError::IsDirectory),
         }
     }
 

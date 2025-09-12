@@ -406,6 +406,163 @@ mod in_mem {
             .expect("Failed to open directory with O_RDWR | O_DIRECTORY");
         fs.close(fd).expect("Failed to close directory");
     }
+
+    #[test]
+    fn o_excl_flag_tests() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+
+        // Test O_CREAT | O_EXCL on non-existent file (should succeed)
+        let fd = fs
+            .open(
+                "/newfile",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            )
+            .expect("Failed to create new file with O_CREAT | O_EXCL");
+
+        // Write some data to verify file was created
+        fs.write(&fd, b"test data", None)
+            .expect("Failed to write to new file");
+        fs.close(fd).expect("Failed to close new file");
+
+        // Test O_CREAT | O_EXCL on existing file (should fail)
+        assert!(matches!(
+            fs.open(
+                "/newfile",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            ),
+            Err(crate::fs::errors::OpenError::AlreadyExists)
+        ));
+
+        // Test O_EXCL without O_CREAT (should be ignored and succeed)
+        let fd = fs
+            .open("/newfile", OFlags::EXCL | OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open existing file with O_EXCL (without O_CREAT)");
+
+        // Verify we can read the data
+        let mut buffer = vec![0; 9];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
+        assert_eq!(&buffer[..bytes_read], b"test data");
+        fs.close(fd).expect("Failed to close file");
+
+        // Test O_CREAT without O_EXCL on existing file (should succeed)
+        let fd = fs
+            .open("/newfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to open existing file with O_CREAT (without O_EXCL)");
+        fs.close(fd).expect("Failed to close file");
+
+        // Test O_CREAT | O_EXCL on directory (should fail)
+        fs.mkdir("/testdir", Mode::RWXU)
+            .expect("Failed to create directory");
+        assert!(matches!(
+            fs.open(
+                "/testdir",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            ),
+            Err(crate::fs::errors::OpenError::AlreadyExists)
+        ));
+    }
+
+    #[test]
+    fn open_with_trunc() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+
+        // Create a file and write some initial content
+        let path = "/testfile";
+        let fd = fs
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        let initial_data = b"Hello, world! This is initial content.";
+        fs.write(&fd, initial_data, None)
+            .expect("Failed to write initial content");
+        fs.close(fd).expect("Failed to close file");
+
+        // Verify initial content was written
+        let fd = fs
+            .open(path, OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open file for reading");
+        let mut buffer = vec![0; initial_data.len()];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read initial content");
+        assert_eq!(bytes_read, initial_data.len());
+        assert_eq!(&buffer, initial_data);
+        fs.close(fd).expect("Failed to close file");
+
+        // Test O_TRUNC with O_WRONLY - should truncate file
+        let fd = fs
+            .open(path, OFlags::WRONLY | OFlags::TRUNC, Mode::empty())
+            .expect("Failed to open file with O_TRUNC | O_WRONLY");
+
+        // Write new content to the truncated file
+        let new_data = b"New content";
+        fs.write(&fd, new_data, None)
+            .expect("Failed to write new content");
+        fs.close(fd).expect("Failed to close file");
+
+        // Verify the file was truncated and contains only new content
+        let fd = fs
+            .open(path, OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open file for verification");
+        let mut buffer = vec![0; initial_data.len()];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read after truncation");
+        assert_eq!(bytes_read, new_data.len());
+        assert_eq!(&buffer[..bytes_read], new_data);
+        fs.close(fd).expect("Failed to close file");
+
+        // Test O_TRUNC with O_RDWR - should also truncate
+        fs.write(
+            &fs.open(path, OFlags::WRONLY, Mode::empty()).unwrap(),
+            b"More content to truncate",
+            None,
+        )
+        .unwrap();
+        fs.close(fs.open(path, OFlags::WRONLY, Mode::empty()).unwrap())
+            .unwrap();
+
+        let fd = fs
+            .open(path, OFlags::RDWR | OFlags::TRUNC, Mode::empty())
+            .expect("Failed to open file with O_TRUNC | O_RDWR");
+
+        // File should be empty after truncation
+        let mut buffer = vec![0; 100];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from truncated file");
+        assert_eq!(bytes_read, 0);
+
+        // Write and read back to verify it works
+        let test_data = b"After RDWR truncation";
+        fs.write(&fd, test_data, None)
+            .expect("Failed to write after RDWR truncation");
+
+        fs.seek(&fd, 0, crate::fs::SeekWhence::RelativeToBeginning)
+            .expect("Failed to seek to beginning");
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read after write");
+        assert_eq!(bytes_read, test_data.len());
+        assert_eq!(&buffer[..bytes_read], test_data);
+        fs.close(fd).expect("Failed to close file");
+    }
 }
 
 mod tar_ro {
@@ -984,6 +1141,120 @@ mod layered {
     }
 
     #[test]
+    fn o_excl_layered_tests() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
+        in_mem_fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem_fs,
+            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Test O_CREAT | O_EXCL on file that exists in lower layer (should fail)
+        // "foo" exists in the tar file
+        assert!(matches!(
+            fs.open(
+                "foo",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            ),
+            Err(crate::fs::errors::OpenError::AlreadyExists)
+        ));
+
+        // Test O_CREAT | O_EXCL on file that doesn't exist anywhere (should succeed)
+        let fd = fs
+            .open(
+                "/newfile",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            )
+            .expect("Failed to create new file with O_CREAT | O_EXCL");
+
+        fs.write(&fd, b"layered test", None)
+            .expect("Failed to write to new file");
+        fs.close(fd).expect("Failed to close new file");
+
+        // Test O_CREAT | O_EXCL on file that now exists in upper layer (should fail)
+        assert!(matches!(
+            fs.open(
+                "/newfile",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            ),
+            Err(crate::fs::errors::OpenError::AlreadyExists)
+        ));
+
+        // Test O_CREAT | O_EXCL on directory that exists in lower layer (should fail)
+        // "bar" is a directory in the tar file
+        assert!(matches!(
+            fs.open(
+                "bar",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            ),
+            Err(crate::fs::errors::OpenError::AlreadyExists)
+        ));
+
+        // Test O_CREAT | O_EXCL on file that was deleted (tombstoned) should succeed
+        // First delete a file from lower layer
+        fs.unlink("foo").expect("Failed to unlink lower layer file");
+
+        // Now try to create it with O_EXCL (should succeed since it's tombstoned)
+        let fd = fs
+            .open(
+                "foo",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            )
+            .expect("Failed to create file over tombstone with O_CREAT | O_EXCL");
+
+        fs.write(&fd, b"new foo content", None)
+            .expect("Failed to write to recreated file");
+        fs.close(fd).expect("Failed to close recreated file");
+
+        // Verify the new content
+        let fd = fs
+            .open("foo", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open recreated file");
+        let mut buffer = vec![0; 15];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from recreated file");
+        assert_eq!(&buffer[..bytes_read], b"new foo content");
+        fs.close(fd).expect("Failed to close recreated file");
+
+        // Test O_CREAT | O_EXCL behavior with existing upper layer file
+        // Create a file in upper layer first
+        let fd = fs
+            .open(
+                "/upper_only_file",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXU,
+            )
+            .expect("Failed to create upper layer file");
+        fs.write(&fd, b"upper content", None)
+            .expect("Failed to write to upper layer file");
+        fs.close(fd).expect("Failed to close upper layer file");
+
+        // Now try O_CREAT | O_EXCL on the same file (should fail)
+        assert!(matches!(
+            fs.open(
+                "/upper_only_file",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RWXU,
+            ),
+            Err(crate::fs::errors::OpenError::AlreadyExists)
+        ));
+    }
+
+    #[test]
     fn dir_creation_inside_lower_existing_dir() {
         let litebox = LiteBox::new(MockPlatform::new());
 
@@ -1025,6 +1296,151 @@ mod layered {
         let mut names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(names, vec![".", ".."]);
+    }
+
+    #[test]
+    fn file_creation_with_ancestor_dir_migration() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod / in upper layer");
+        });
+
+        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Open bar/test for writing (where bar exists in lower layer but test doesn't exist)
+        // This should create ancestor directories and allow file creation
+        let fd = fs
+            .open("bar/test", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to open bar/test for writing");
+
+        // Write data to the file
+        let data = b"Hello from nested file!";
+        fs.write(&fd, data, None)
+            .expect("Failed to write to bar/test");
+        fs.close(fd).expect("Failed to close file");
+
+        // Read the file back
+        let fd = fs
+            .open("bar/test", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open bar/test for reading");
+        let mut buffer = vec![0; 1024];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from bar/test");
+        assert_eq!(&buffer[..bytes_read], data);
+        fs.close(fd).expect("Failed to close file");
+
+        // Verify the file exists and has correct type
+        let stat = fs
+            .file_status("bar/test")
+            .expect("Failed to get status of bar/test");
+        assert_eq!(stat.file_type, FileType::RegularFile);
+    }
+
+    #[test]
+    fn file_modification_with_ancestor_dir_migration() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod / in upper layer");
+        });
+
+        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Open bar/baz for writing (both bar and baz exist in lower layer)
+        // This should migrate ancestor directories and allow file modification
+        let fd = fs
+            .open("bar/baz", OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to open bar/baz for writing");
+
+        // Write new data to the file (overwriting existing content)
+        let data = b"Modified content!";
+        fs.write(&fd, data, None)
+            .expect("Failed to write to bar/baz");
+        fs.close(fd).expect("Failed to close file");
+
+        // Read the file back to verify it was modified
+        let fd = fs
+            .open("bar/baz", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open bar/baz for reading");
+        let mut buffer = vec![0; 1024];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from bar/baz");
+
+        assert_eq!(&buffer[..bytes_read], data);
+        fs.close(fd).expect("Failed to close file");
+
+        // Verify the file still exists and has correct type
+        let stat = fs
+            .file_status("bar/baz")
+            .expect("Failed to get status of bar/baz");
+        assert_eq!(stat.file_type, FileType::RegularFile);
+    }
+
+    #[test]
+    fn open_with_trunc() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        // Set up write permissions on the upper layer
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod / in upper layer");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Open with O_TRUNC should create a shadow file in upper layer
+        let fd = fs
+            .open("foo", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
+            .expect("Failed to open file with O_TRUNC");
+
+        // File should be truncated (empty)
+        let mut buffer = vec![0; 1024];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read file");
+        assert_eq!(bytes_read, 0);
+
+        // Write new content
+        fs.write(&fd, b"new content", None)
+            .expect("Failed to write to file");
+        fs.close(fd).expect("Failed to close file");
+
+        // Verify the content persists
+        let fd = fs
+            .open("foo", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to reopen file");
+        let mut buffer = vec![0; 1024];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read file");
+        assert_eq!(&buffer[..bytes_read], b"new content");
+        fs.close(fd).expect("Failed to close file");
     }
 }
 

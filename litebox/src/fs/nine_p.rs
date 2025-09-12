@@ -68,6 +68,15 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
         todo!()
     }
 
+    fn truncate(
+        &self,
+        fd: &FileFd<Platform>,
+        length: usize,
+        reset_offset: bool,
+    ) -> Result<(), super::errors::TruncateError> {
+        todo!()
+    }
+
     fn chmod(
         &self,
         path: impl crate::path::Arg,

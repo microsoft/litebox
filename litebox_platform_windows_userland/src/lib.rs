@@ -437,7 +437,7 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         let mut copied_pt_regs = Box::new(*ctx);
 
         // Reset the child stack pointer to the top of the allocated thread stack.
-        copied_pt_regs.rsp = stack.as_usize() + stack_size - 0x8;
+        copied_pt_regs.rsp = stack.as_usize() + stack_size;
 
         let thread_args = thread_args;
 

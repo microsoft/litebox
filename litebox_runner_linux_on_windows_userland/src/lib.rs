@@ -126,7 +126,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         std::fs::read(tar_file)
             .map_err(|e| anyhow!("Could not read tar file at {}: {}", tar_file.display(), e))?
     } else {
-        litebox::fs::tar_ro::empty_tar_file()
+        litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
     };
 
     let platform = Platform::new(None);

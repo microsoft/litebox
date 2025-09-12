@@ -14,7 +14,6 @@ once_cell = { version = "1.20.2", default-features = false, features = ["alloc",
 elf = { version = "0.7.4", default-features = false }
 elf_loader = { version = "0.12.0", default-features = false, features = [] }
 thiserror = { version = "2.0.6", default-features = false }
-ringbuf = { version = "0.4.8", default-features = false, features = ["alloc"] }
 syscalls = { version = "0.6", default-features = false }
 
 [target.'cfg(target_arch = "x86")'.dependencies]
