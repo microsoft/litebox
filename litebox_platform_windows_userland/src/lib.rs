@@ -87,17 +87,19 @@ pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<WindowsUserlan
 /// The syscall handler passed down from the shim.
 static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
 
-/// Helper functions for managing the global memory tracker
+/// Helper function to track committed memory ranges by the PageManagementProvider
 fn track_committed_memory(range: core::ops::Range<usize>) {
     let mut tracker = MEMORY_TRACKER.write().unwrap();
     tracker.insert(range);
 }
 
+/// Helper function to untrack freed memory ranges by the PageManagementProvider
 fn untrack_committed_memory(range: core::ops::Range<usize>) {
     let mut tracker = MEMORY_TRACKER.write().unwrap();
     tracker.remove(range);
 }
 
+/// Helper function to check if a memory range is fully within committed ranges of the PageManagementProvider
 fn is_range_within_committed(range: &core::ops::Range<usize>) -> bool {
     let tracker = MEMORY_TRACKER.read().unwrap();
     // No gapped overlapping means the range is fully covered
