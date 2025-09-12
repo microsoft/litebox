@@ -11,8 +11,8 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError,
-    PathError, ReadDirError, ReadError, RmdirError, SeekError, SetMetadataError, UnlinkError,
-    WriteError,
+    PathError, ReadDirError, ReadError, RmdirError, SeekError, SetMetadataError, TruncateError,
+    UnlinkError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, UserInfo};
 use crate::utilities::anymap::AnyMap;
@@ -132,6 +132,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem<Platform> {
+    #[expect(clippy::too_many_lines)]
     fn open(
         &self,
         path: impl crate::path::Arg,
@@ -143,7 +144,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::RDONLY
             | OFlags::WRONLY
             | OFlags::RDWR
+            | OFlags::TRUNC
             | OFlags::NOCTTY
+            | OFlags::EXCL
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK;
         if flags.intersects(currently_supported_oflags.complement()) {
@@ -154,6 +157,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             let mut root = self.root.write();
             let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
             if let Some(entry) = entry {
+                if flags.contains(OFlags::EXCL) {
+                    return Err(OpenError::AlreadyExists);
+                }
                 entry
             } else {
                 let Some((_, parent)) = parent else {
@@ -212,13 +218,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         } else {
             false
         };
-        match entry {
+        let fd = match entry {
             Entry::File(file) => {
                 if flags.contains(OFlags::DIRECTORY) {
                     return Err(OpenError::PathError(PathError::ComponentNotADirectory));
                 }
-                Ok(self
-                    .litebox
+                self.litebox
                     .descriptor_table_mut()
                     .insert(Descriptor::File {
                         file: file.clone(),
@@ -226,13 +231,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                         write_allowed,
                         position: 0,
                         metadata: AnyMap::new(),
-                    }))
+                    })
             }
-            Entry::Dir(dir) => Ok(self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
+            Entry::Dir(dir) => self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
                 dir: dir.clone(),
                 metadata: AnyMap::new(),
-            })),
+            }),
+        };
+        if flags.contains(OFlags::TRUNC) {
+            match self.truncate(&fd, 0, true) {
+                Ok(()) => {}
+                Err(e) => {
+                    self.close(fd).unwrap();
+                    return Err(e.into());
+                }
+            }
         }
+        Ok(fd)
     }
 
     fn close(&self, fd: FileFd<Platform>) -> Result<(), CloseError> {
@@ -307,6 +322,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             file.data[start..end].copy_from_slice(&buf[..first_half_len]);
             first_half_len
         } else {
+            if *position > file.data.len() {
+                // Need to pad with 0s because position was past the end of the file
+                file.data.resize(*position, 0);
+            }
             0
         };
         file.data.extend(&buf[start..]);
@@ -346,6 +365,38 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             *position = new_posn;
             Ok(new_posn)
         }
+    }
+
+    fn truncate(
+        &self,
+        fd: &FileFd<Platform>,
+        length: usize,
+        reset_offset: bool,
+    ) -> Result<(), TruncateError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let Descriptor::File {
+            file,
+            read_allowed: _,
+            write_allowed,
+            position,
+            metadata: _,
+        } = &mut descriptor_table.get_entry_mut(fd).entry
+        else {
+            return Err(TruncateError::IsDirectory);
+        };
+        if !*write_allowed {
+            return Err(TruncateError::NotForWriting);
+        }
+        let mut file_data = file.write();
+        match length.cmp(&file_data.data.len()) {
+            core::cmp::Ordering::Less => file_data.data.truncate(length),
+            core::cmp::Ordering::Equal => file_data.data.resize(length, 0),
+            core::cmp::Ordering::Greater => (),
+        }
+        if reset_offset {
+            *position = 0;
+        }
+        Ok(())
     }
 
     fn chmod(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), ChmodError> {

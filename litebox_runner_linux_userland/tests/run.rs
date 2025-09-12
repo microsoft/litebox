@@ -1,43 +1,6 @@
+mod common;
+
 use std::path::{Path, PathBuf};
-
-const HELLO_WORLD_C: &str = r#"
-#include <stdio.h>
-
-int main() {
-    printf("Hello, World!\n");
-    return 0;
-}
-"#;
-
-/// Compile C code into an executable
-fn compile(source: &str, unique_name: &str, exec_or_lib: bool) -> PathBuf {
-    let dir_path = std::env::var("OUT_DIR").unwrap();
-    let src_path = std::path::Path::new(dir_path.as_str()).join(format!("{unique_name}.c"));
-    std::fs::write(src_path.clone(), source).unwrap();
-    let path = std::path::Path::new(dir_path.as_str()).join(unique_name);
-    let input = src_path.to_str().unwrap();
-    let output = path.to_str().unwrap();
-
-    let mut args = vec!["-o", output, input];
-    if exec_or_lib {
-        args.push("-static");
-    }
-    args.push(match std::env::consts::ARCH {
-        "x86_64" => "-m64",
-        "x86" => "-m32",
-        _ => unimplemented!(),
-    });
-    let output = std::process::Command::new("gcc")
-        .args(args)
-        .output()
-        .expect("Failed to compile hello.c");
-    assert!(
-        output.status.success(),
-        "failed to compile hello.c {:?}",
-        std::str::from_utf8(output.stderr.as_slice()).unwrap()
-    );
-    path
-}
 
 #[allow(dead_code)]
 enum Backend {
@@ -46,9 +9,8 @@ enum Backend {
 }
 
 #[allow(clippy::too_many_lines)]
-fn test_runner_with_dynamic_lib(
+fn run_target_program(
     backend: Backend,
-    libs: &[&str],
     target: &Path,
     cmd_args: &[&str],
     install_files: fn(PathBuf),
@@ -95,8 +57,9 @@ fn test_runner_with_dynamic_lib(
         std::fs::create_dir_all(tar_dir.join(dir)).unwrap();
     }
     std::fs::create_dir_all(tar_dir.join("out")).unwrap();
-    for file in libs {
-        let file_path = std::path::Path::new(file);
+    let libs = common::find_dependencies(target.to_str().unwrap());
+    for file in &libs {
+        let file_path = std::path::Path::new(file.as_str());
         let dest_path = tar_dir.join(&file[1..]);
         match backend {
             Backend::Seccomp => {
@@ -151,23 +114,22 @@ fn test_runner_with_dynamic_lib(
         std::str::from_utf8(output.stderr.as_slice()).unwrap()
     );
 
-    match backend {
-        Backend::Rewriter => {
-            println!(
-                "Copying {} to {}",
-                std::path::Path::new(dir_path.as_str())
-                    .join("litebox_rtld_audit.so")
-                    .to_str()
-                    .unwrap(),
-                tar_dir.join("lib/litebox_rtld_audit.so").to_str().unwrap()
-            );
-            std::fs::copy(
-                std::path::Path::new(dir_path.as_str()).join("litebox_rtld_audit.so"),
-                tar_dir.join("lib/litebox_rtld_audit.so"),
-            )
-            .unwrap();
-        }
-        Backend::Seccomp => {}
+    if let Backend::Rewriter = backend
+        && !libs.is_empty()
+    {
+        println!(
+            "Copying {} to {}",
+            std::path::Path::new(dir_path.as_str())
+                .join("litebox_rtld_audit.so")
+                .to_str()
+                .unwrap(),
+            tar_dir.join("lib/litebox_rtld_audit.so").to_str().unwrap()
+        );
+        std::fs::copy(
+            std::path::Path::new(dir_path.as_str()).join("litebox_rtld_audit.so"),
+            tar_dir.join("lib/litebox_rtld_audit.so"),
+        )
+        .unwrap();
     }
 
     // create tar file using `tar` command
@@ -236,42 +198,62 @@ fn test_runner_with_dynamic_lib(
     output.stdout
 }
 
-#[cfg(target_arch = "x86_64")]
-const HELLO_WORLD_INIT_FILES: [&str; 2] = [
-    "/lib64/ld-linux-x86-64.so.2",
-    "/lib/x86_64-linux-gnu/libc.so.6",
-];
-#[cfg(target_arch = "x86")]
-const HELLO_WORLD_INIT_FILES: [&str; 2] = ["/lib/ld-linux.so.2", "/lib32/libc.so.6"];
+/// Find all C test files in a directory
+fn find_c_test_files(dir: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if let Some("c") = path.extension().and_then(|e| e.to_str()) {
+            files.push(path);
+        }
+    }
+    files
+}
 
 // our rtld_audit does not support x86 yet
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn test_runner_with_dynamic_lib_rewriter() {
-    let unique_name = "hello_lib_rewriter";
-    let target = compile(HELLO_WORLD_C, unique_name, false);
-    test_runner_with_dynamic_lib(
-        Backend::Rewriter,
-        &HELLO_WORLD_INIT_FILES,
-        &target,
-        &[],
-        |_| {},
-        unique_name,
-    );
+fn test_dynamic_lib_with_rewriter() {
+    for path in find_c_test_files("./tests") {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("failed to get file stem");
+        let unique_name = format!("{stem}_rewriter");
+        let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
+        run_target_program(Backend::Rewriter, &target, &[], |_| {}, &unique_name);
+    }
 }
 
 #[test]
-fn test_runner_with_dynamic_lib_seccomp() {
-    let unique_name = "hello_lib_seccomp";
-    let target = compile(HELLO_WORLD_C, unique_name, false);
-    test_runner_with_dynamic_lib(
-        Backend::Seccomp,
-        &HELLO_WORLD_INIT_FILES,
-        &target,
-        &[],
-        |_| {},
-        unique_name,
-    );
+fn test_static_exec_with_rewriter() {
+    for path in find_c_test_files("./tests") {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("failed to get file stem");
+        let unique_name = format!("{stem}_exec_rewriter");
+        let target = common::compile(path.to_str().unwrap(), &unique_name, true, false);
+        run_target_program(Backend::Rewriter, &target, &[], |_| {}, &unique_name);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_dynamic_lib_with_seccomp() {
+    for path in find_c_test_files("./tests") {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("failed to get file stem");
+        let unique_name = format!("{stem}_seccomp");
+        let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
+        run_target_program(Backend::Seccomp, &target, &[], |_| {}, &unique_name);
+    }
 }
 
 /// Get the path of a program using `which`
@@ -290,8 +272,7 @@ fn run_which(prog: &str) -> std::path::PathBuf {
 
 #[cfg(target_arch = "x86_64")]
 #[test]
-#[ignore = "unknown issue triggers it to fail on CI"]
-fn test_runner_with_nodejs() {
+fn test_node_with_seccomp() {
     const HELLO_WORLD_JS: &str = r"
 const fs = require('node:fs');
 
@@ -299,19 +280,9 @@ const content = 'Hello World!';
 console.log(content);
 ";
 
-    let initial_files = [
-        "/lib/x86_64-linux-gnu/libdl.so.2",
-        "/lib/x86_64-linux-gnu/libstdc++.so.6",
-        "/lib/x86_64-linux-gnu/libm.so.6",
-        "/lib/x86_64-linux-gnu/libgcc_s.so.1",
-        "/lib/x86_64-linux-gnu/libpthread.so.0",
-        "/lib64/ld-linux-x86-64.so.2",
-        "/lib/x86_64-linux-gnu/libc.so.6",
-    ];
     let node_path = run_which("node");
-    test_runner_with_dynamic_lib(
+    run_target_program(
         Backend::Seccomp,
-        &initial_files,
         &node_path,
         &["/out/hello_world.js"],
         |out_dir| {
@@ -324,21 +295,33 @@ console.log(content);
 
 #[cfg(target_arch = "x86_64")]
 #[test]
+#[ignore = "Rewriting node and its dependencies takes > 5 minutes, so ignore by default"]
+fn test_node_with_rewriter() {
+    const HELLO_WORLD_JS: &str = r"
+const fs = require('node:fs');
+
+const content = 'Hello World!';
+console.log(content);
+";
+
+    let node_path = run_which("node");
+    run_target_program(
+        Backend::Rewriter,
+        &node_path,
+        &["/out/hello_world.js"],
+        |out_dir| {
+            // write the test js file to the output directory
+            std::fs::write(out_dir.join("hello_world.js"), HELLO_WORLD_JS).unwrap();
+        },
+        "hello_node_rewriter",
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
 fn test_runner_with_ls() {
     let ls_path = run_which("ls");
-    let output = test_runner_with_dynamic_lib(
-        Backend::Seccomp,
-        &[
-            "/lib/x86_64-linux-gnu/libc.so.6",
-            "/lib64/ld-linux-x86-64.so.2",
-            "/lib/x86_64-linux-gnu/libselinux.so.1",
-            "/lib/x86_64-linux-gnu/libpcre2-8.so.0",
-        ],
-        &ls_path,
-        &["-a"],
-        |_| {},
-        "ls_seccomp",
-    );
+    let output = run_target_program(Backend::Seccomp, &ls_path, &["-a"], |_| {}, "ls_seccomp");
 
     let output_str = String::from_utf8_lossy(&output);
     let normalized = output_str.split_whitespace().collect::<Vec<_>>();
@@ -350,14 +333,8 @@ fn test_runner_with_ls() {
     }
 
     // test `ls` subdir
-    let output = test_runner_with_dynamic_lib(
+    let output = run_target_program(
         Backend::Seccomp,
-        &[
-            "/lib/x86_64-linux-gnu/libc.so.6",
-            "/lib64/ld-linux-x86-64.so.2",
-            "/lib/x86_64-linux-gnu/libselinux.so.1",
-            "/lib/x86_64-linux-gnu/libpcre2-8.so.0",
-        ],
         &ls_path,
         &["-a", "/lib/x86_64-linux-gnu"],
         |_| {},

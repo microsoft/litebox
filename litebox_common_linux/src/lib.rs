@@ -34,6 +34,10 @@ pub const CLOCK_MONOTONIC: i32 = 1;
 pub const CLOCK_REALTIME_COARSE: i32 = 5;
 pub const CLOCK_MONOTONIC_COARSE: i32 = 6;
 
+/// Special value `libc::AT_FDCWD` used to indicate openat should use
+/// the current working directory.
+pub const AT_FDCWD: i32 = -100;
+
 /// Encoding for ioctl commands.
 pub mod ioctl {
     /// The number of bits allocated for the ioctl command number field.
@@ -1542,6 +1546,10 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         pathname: Platform::RawConstPointer<i8>,
         buf: Platform::RawMutPointer<FileStat>,
     },
+    Mkdir {
+        pathname: Platform::RawConstPointer<i8>,
+        mode: u32,
+    },
     Mmap {
         addr: usize,
         length: usize,
@@ -1744,6 +1752,10 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         flags: litebox::fs::OFlags,
     },
     Clone {
+        args: CloneArgs,
+        ctx: &'a PtRegs,
+    },
+    Clone3 {
         args: Platform::RawConstPointer<CloneArgs>,
         ctx: &'a PtRegs,
     },
@@ -1889,6 +1901,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::stat => sys_req!(Stat { pathname:*, buf:* }),
             Sysno::fstat => sys_req!(Fstat { fd, buf:* }),
             Sysno::lstat => sys_req!(Lstat { pathname:*, buf:* }),
+            Sysno::mkdir => sys_req!(Mkdir { pathname:*, mode }),
             #[cfg(target_arch = "x86_64")]
             Sysno::mmap => sys_req!(Mmap {
                 addr,
@@ -2043,6 +2056,13 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 fd: ctx.sys_req_arg(0),
                 arg: FcntlArg::from(ctx.sys_req_arg(1), ctx.sys_req_arg(2)),
             },
+            // TODO: fcntl64 is identical to fcntl except certain commands (e.g., `F_OFD_SETLK`)
+            // that we don't support yet.
+            #[cfg(target_arch = "x86")]
+            Sysno::fcntl64 => SyscallRequest::Fcntl {
+                fd: ctx.sys_req_arg(0),
+                arg: FcntlArg::from(ctx.sys_req_arg(1), ctx.sys_req_arg(2)),
+            },
             Sysno::gettimeofday => sys_req!(Gettimeofday { tv:*, tz:* }),
             #[cfg(target_arch = "x86_64")]
             Sysno::clock_gettime => sys_req!(ClockGettime { clockid, tp:* }),
@@ -2158,6 +2178,26 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::set_thread_area => sys_req!(SetThreadArea { user_desc:* }),
             Sysno::set_tid_address => sys_req!(SetTidAddress { tidptr:* }),
             Sysno::openat => sys_req!(Openat { dirfd,pathname:*,flags,mode }),
+            Sysno::open => {
+                // open is equivalent to openat with dirfd AT_FDCWD
+                SyscallRequest::Openat {
+                    dirfd: AT_FDCWD,
+                    pathname: ctx.sys_req_ptr(0),
+                    flags: ctx.sys_req_arg(1),
+                    mode: ctx.sys_req_arg(2),
+                }
+            }
+            Sysno::creat => {
+                // creat is equivalent to open with flags O_CREAT|O_WRONLY|O_TRUNC
+                SyscallRequest::Openat {
+                    dirfd: AT_FDCWD,
+                    pathname: ctx.sys_req_ptr(0),
+                    flags: litebox::fs::OFlags::CREAT
+                        | litebox::fs::OFlags::WRONLY
+                        | litebox::fs::OFlags::TRUNC,
+                    mode: ctx.sys_req_arg(1),
+                }
+            }
             #[cfg(target_arch = "x86_64")]
             Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
             #[cfg(target_arch = "x86")]
@@ -2168,13 +2208,30 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             },
             Sysno::eventfd2 => sys_req!(Eventfd2 { initval, flags }),
             Sysno::getrandom => sys_req!(GetRandom { buf:*,count,flags }),
+            Sysno::clone => {
+                let args = CloneArgs {
+                    // The upper 32 bits are clone3-specific. The low 8 bits are the exit signal.
+                    flags: CloneFlags::from_bits_retain(ctx.syscall_arg(0) as u64 & 0xffffff00),
+                    stack: ctx.sys_req_arg(1),
+                    parent_tid: ctx.sys_req_arg(2),
+                    child_tid: ctx.sys_req_arg(if cfg!(target_arch = "x86_64") { 3 } else { 4 }),
+                    tls: ctx.sys_req_arg(if cfg!(target_arch = "x86_64") { 4 } else { 3 }),
+                    pidfd: ctx.sys_req_arg(2), // aliases parent_tid
+                    exit_signal: ctx.syscall_arg(0) as u64 & 0xff,
+                    stack_size: 0,
+                    set_tid: 0,
+                    set_tid_size: 0,
+                    cgroup: 0,
+                };
+                SyscallRequest::Clone { args, ctx }
+            }
             Sysno::clone3 => {
                 debug_assert_eq!(
                     ctx.sys_req_arg::<usize>(1),
                     size_of::<CloneArgs>(),
                     "legacy clone3 struct"
                 );
-                SyscallRequest::Clone {
+                SyscallRequest::Clone3 {
                     args: ctx.sys_req_ptr(0),
                     ctx,
                 }
@@ -2438,6 +2495,11 @@ impl PtRegs {
 )]
 trait ReinterpretTruncatedFromUsize: Sized {
     fn reinterpret_truncated_from_usize(v: usize) -> Self;
+}
+impl ReinterpretTruncatedFromUsize for u64 {
+    fn reinterpret_truncated_from_usize(v: usize) -> Self {
+        v as u64
+    }
 }
 impl ReinterpretTruncatedFromUsize for i64 {
     fn reinterpret_truncated_from_usize(v: usize) -> Self {
