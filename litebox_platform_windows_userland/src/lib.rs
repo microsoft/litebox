@@ -862,10 +862,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 let mut query_region_end = query_addr + mbi.RegionSize;
                 query_region_end = core::cmp::min(query_region_end, suggested_range.end);
 
-                println!(
-                    "Querying addr: 0x{query_addr:x}, end: 0x{query_region_end:x}, suggested end: {:p} state: {:?}",
-                    suggested_range.end as *mut c_void, mbi.State
-                );
                 // Deal with collision with already committed memory outside of the tracker.
                 if mbi.State == Win32_Memory::MEM_COMMIT
                     && !is_range_within_committed(&(query_addr..query_region_end))
