@@ -153,9 +153,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::TRUNC
             | OFlags::NOCTTY
             | OFlags::DIRECTORY
-            | OFlags::NONBLOCK;
+            | OFlags::NONBLOCK
+            | OFlags::LARGEFILE;
         if flags.intersects(currently_supported_oflags.complement()) {
-            unimplemented!()
+            unimplemented!("{flags:?}")
         }
         if flags.contains(OFlags::CREAT) {
             return Err(OpenError::ReadOnlyFileSystem);
