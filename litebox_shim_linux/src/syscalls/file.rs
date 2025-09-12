@@ -1115,6 +1115,92 @@ pub fn sys_epoll_pwait(
     Ok(epoll_events.len())
 }
 
+/// Handle syscall `ppoll`.
+pub fn sys_ppoll(
+    fds: MutPtr<litebox_common_linux::Pollfd>,
+    nfds: usize,
+    timeout: Option<ConstPtr<litebox_common_linux::Timespec>>,
+    sigmask: Option<ConstPtr<litebox_common_linux::SigSet>>,
+    sigsetsize: usize,
+) -> Result<usize, Errno> {
+    if sigmask.is_some() {
+        unimplemented!("no sigmask support yet");
+    }
+    if (nfds as isize) < 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    let timeout = timeout
+        .map(super::process::get_timeout)
+        .transpose()?
+        .map(Into::into);
+
+    do_ppoll(fds, nfds, timeout)
+}
+
+/// Handle syscall `poll`.
+pub fn sys_poll(
+    fds: MutPtr<litebox_common_linux::Pollfd>,
+    nfds: usize,
+    timeout: i32,
+) -> Result<usize, Errno> {
+    if (nfds as isize) < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let timeout = if timeout < 0 {
+        None
+    } else {
+        Some(core::time::Duration::from_millis(timeout as u64))
+    };
+    do_ppoll(fds, nfds, timeout)
+}
+
+fn do_ppoll(
+    fds: MutPtr<litebox_common_linux::Pollfd>,
+    nfds: usize,
+    timeout: Option<core::time::Duration>,
+) -> Result<usize, Errno> {
+    let mut set = super::epoll::PollSet::with_capacity(nfds);
+    {
+        let locked_file_descriptors = file_descriptors().read();
+        for i in 0..nfds {
+            let fd = unsafe { fds.read_at_offset(i as isize) }
+                .ok_or(Errno::EFAULT)?
+                .into_owned();
+
+            let events = litebox::event::Events::from_bits_truncate(fd.events as u16 as u32);
+            if fd.fd < 0 {
+                set.add_empty_interest();
+            } else if let Some(desc) = locked_file_descriptors.get_fd(fd.fd as u32) {
+                set.add_interest(desc, events);
+            } else {
+                set.add_ready_interest(litebox::event::Events::NVAL);
+            };
+        }
+    }
+
+    set.wait_or_timeout(timeout);
+
+    // Write just the revents back.
+    let fds_addr = fds.as_usize();
+    let mut ready_count = 0;
+    for (i, revents) in set.check_revents().enumerate() {
+        // TODO: This is not great from a provenance perspective. Consider
+        // adding cast+add methods to ConstPtr/MutPtr.
+        let fd_addr = fds_addr + i * core::mem::size_of::<litebox_common_linux::Pollfd>();
+        let revents_ptr = crate::MutPtr::<i16>::from_usize(
+            fd_addr + core::mem::offset_of!(litebox_common_linux::Pollfd, revents),
+        );
+        unsafe {
+            revents_ptr
+                .write_at_offset(0, revents.bits() as i16)
+                .ok_or(Errno::EFAULT)
+        }?;
+        ready_count += !revents.is_empty() as usize;
+    }
+    Ok(ready_count)
+}
+
 fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
     match file {
         Descriptor::LiteBoxRawFd(raw_fd) => {

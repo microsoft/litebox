@@ -626,6 +626,14 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
                     .ok_or(Errno::EFAULT)
             })
         }),
+        SyscallRequest::Ppoll {
+            fds,
+            nfds,
+            timeout,
+            sigmask,
+            sigsetsize,
+        } => syscalls::file::sys_ppoll(fds, nfds, timeout, sigmask, sigsetsize),
+        SyscallRequest::Poll { fds, nfds, timeout } => syscalls::file::sys_poll(fds, nfds, timeout),
         SyscallRequest::Readlinkat {
             dirfd,
             pathname,

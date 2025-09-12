@@ -72,16 +72,20 @@ impl DescriptorRef {
 }
 
 impl Descriptor {
-    /// Returns the interesting events now and monitors their occurrence in the future if the
-    /// observer is provided.
-    fn poll(&self, mask: Events, observer: Option<Weak<dyn Observer<Events>>>) -> Events {
-        let io_pollable: &dyn IOPollable = match self {
+    fn io_pollable(&self) -> Option<&dyn IOPollable> {
+        Some(match self {
             Descriptor::PipeReader { consumer, .. } => consumer,
             Descriptor::PipeWriter { producer, .. } => producer,
             Descriptor::Eventfd { file, .. } => file,
             Descriptor::Socket(socket) => socket,
-            _ => todo!(),
-        };
+            _ => return None,
+        })
+    }
+
+    /// Returns the interesting events now and monitors their occurrence in the future if the
+    /// observer is provided.
+    fn poll(&self, mask: Events, observer: Option<Weak<dyn Observer<Events>>>) -> Events {
+        let io_pollable: &dyn IOPollable = self.io_pollable().unwrap();
         if let Some(observer) = observer {
             io_pollable.register_observer(observer, mask);
         }
@@ -398,6 +402,140 @@ impl ReadySet {
     }
 }
 
+/// A poll set used for transient polling of a set of files. Designed for use
+/// with the `poll` and `ppoll` syscalls.
+pub struct PollSet {
+    entries: Vec<PollEntry>,
+    is_ready: bool,
+    pollee: Option<Arc<Pollee<Platform>>>,
+}
+
+enum PollEntry {
+    Observing(Arc<PollEntryObserver>),
+    Ready(Events),
+}
+
+struct PollEntryObserver {
+    mask: Events,
+    revents: core::sync::atomic::AtomicU32,
+    pollee: Arc<Pollee<Platform>>,
+}
+
+impl PollSet {
+    /// Returns a new empty `PollSet` with the given interest capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+            is_ready: false,
+            pollee: None,
+        }
+    }
+
+    /// Adds interest in the given file with the given event mask.
+    pub fn add_interest(&mut self, file: &Descriptor, mask: Events) {
+        let mask = mask | Events::ALWAYS_POLLED;
+        let Some(pollable) = file.io_pollable() else {
+            self.add_empty_interest();
+            return;
+        };
+        // Check first before allocating an observer.
+        let revents = pollable.check_io_events() & mask;
+        // Skip monitoring if this or any previous interest is already ready.
+        if !revents.is_empty() || self.is_ready {
+            self.is_ready = true;
+            self.entries.push(PollEntry::Ready(revents));
+        } else {
+            let observer = Arc::new(PollEntryObserver {
+                mask,
+                revents: 0.into(),
+                pollee: self.pollee().clone(),
+            });
+            // TODO: unregister interest when the PollSet is dropped to avoid a
+            // leak for long-lived files that never wake up. Or update the
+            // Observer infra to garbage collect dead observers periodically.
+            let revents = file.poll(mask, Some(Arc::downgrade(&observer) as _));
+            if !revents.is_empty() {
+                // Race. Accumulate the events.
+                self.is_ready = true;
+                observer.on_events(&revents);
+            }
+            self.entries.push(PollEntry::Observing(observer));
+        }
+    }
+
+    /// Adds an empty interest slot that is never ready.
+    pub fn add_empty_interest(&mut self) {
+        self.entries.push(PollEntry::Ready(Events::empty()));
+    }
+
+    /// Adds an interest that is immediately ready.
+    pub fn add_ready_interest(&mut self, events: Events) {
+        self.entries.push(PollEntry::Ready(events));
+        self.is_ready = true;
+    }
+
+    /// Waits until at least one entry is ready or the timeout expires.
+    pub fn wait_or_timeout(&mut self, timeout: Option<Duration>) {
+        if self.is_ready {
+            return;
+        }
+        self.pollee();
+        let pollee = self.pollee.as_ref().unwrap();
+        match pollee.wait_or_timeout(
+            timeout,
+            || {
+                if self.entries.iter().any(|e| e.is_ready()) {
+                    Ok::<_, litebox::event::polling::TryOpError<core::convert::Infallible>>(())
+                } else {
+                    Err(litebox::event::polling::TryOpError::TryAgain)
+                }
+            },
+            || false,
+        ) {
+            Ok(()) | Err(litebox::event::polling::TryOpError::TimedOut) => {}
+            Err(litebox::event::polling::TryOpError::TryAgain) => unreachable!(),
+        }
+    }
+
+    pub fn check_revents(&self) -> impl Iterator<Item = Events> + '_ {
+        self.entries.iter().map(|e| e.check_revents())
+    }
+
+    fn pollee(&mut self) -> &Arc<Pollee<Platform>> {
+        self.pollee
+            .get_or_insert_with(|| Arc::new(litebox::event::polling::Pollee::new(crate::litebox())))
+    }
+}
+
+impl PollEntry {
+    fn is_ready(&self) -> bool {
+        match *self {
+            PollEntry::Ready(events) => !events.is_empty(),
+            PollEntry::Observing(ref observer) => {
+                observer.revents.load(core::sync::atomic::Ordering::Relaxed) != 0
+            }
+        }
+    }
+
+    fn check_revents(&self) -> Events {
+        match *self {
+            PollEntry::Ready(events) => events,
+            PollEntry::Observing(ref observer) => Events::from_bits_retain(
+                observer.revents.load(core::sync::atomic::Ordering::Acquire) as u32,
+            ),
+        }
+    }
+}
+
+impl Observer<Events> for PollEntryObserver {
+    fn on_events(&self, events: &Events) {
+        let revents = *events & self.mask;
+        self.revents
+            .fetch_or(revents.bits(), core::sync::atomic::Ordering::Release);
+        self.pollee.notify_observers(Events::IN);
+    }
+}
+
 #[cfg(test)]
 mod test {
     use alloc::sync::Arc;
@@ -405,6 +543,7 @@ mod test {
     use litebox_common_linux::{EfdFlags, EpollEvent};
 
     use super::EpollFile;
+    use core::time::Duration;
 
     extern crate std;
 
@@ -476,5 +615,41 @@ mod test {
         };
         consumer.read(&mut buf).unwrap();
         assert_eq!(buf, [1, 2]);
+    }
+
+    #[test]
+    fn test_poll() {
+        crate::syscalls::tests::init_platform(None);
+
+        let mut set = super::PollSet::with_capacity(0);
+        let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
+            0,
+            EfdFlags::empty(),
+            crate::litebox(),
+        ));
+        set.add_interest(
+            &crate::Descriptor::Eventfd {
+                file: eventfd.clone(),
+                close_on_exec: core::sync::atomic::AtomicBool::new(false),
+            },
+            Events::IN,
+        );
+
+        set.wait_or_timeout(Some(Duration::from_millis(100)));
+        let revents: std::vec::Vec<_> = set.check_revents().collect();
+        assert_eq!(revents.len(), 1);
+        assert!(revents[0].is_empty());
+
+        // spawn a thread to write to the eventfd
+        let copied_eventfd = eventfd.clone();
+        std::thread::spawn(move || {
+            copied_eventfd.write(1).unwrap();
+        });
+
+        set.wait_or_timeout(None);
+
+        let revents: std::vec::Vec<_> = set.check_revents().collect();
+        assert_eq!(revents.len(), 1);
+        assert_eq!(revents[0], Events::IN);
     }
 }
