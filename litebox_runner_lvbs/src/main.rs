@@ -9,7 +9,7 @@ use litebox_platform_lvbs::{
 };
 
 #[cfg(debug_assertions)]
-use litebox_platform_lvbs::host::bootparam::{dump_boot_params, dump_cmdline};
+use litebox_platform_lvbs::host::bootparam::parse_boot_info;
 
 #[expect(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
@@ -37,11 +37,7 @@ pub fn kernel_main() -> ! {
         serial_println!(" Hello from LiteBox for LVBS! ");
         serial_println!("==============================");
 
-        #[cfg(debug_assertions)]
-        dump_boot_params();
-
-        #[cfg(debug_assertions)]
-        dump_cmdline();
+        parse_boot_info();
     }
 
     let platform = litebox_runner_lvbs::init();
