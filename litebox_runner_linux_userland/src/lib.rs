@@ -4,6 +4,7 @@ use litebox::LiteBox;
 use litebox::fs::FileSystem as _;
 use litebox::platform::SystemInfoProvider as _;
 use litebox_platform_multiplex::Platform;
+use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::PathBuf;
 
@@ -111,14 +112,24 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         };
         (modes, data)
     };
-    let tar_data = if let Some(tar_file) = cli_args.initial_files.as_ref() {
+    let tar_data: &'static [u8] = if let Some(tar_file) = cli_args.initial_files.as_ref() {
         if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
             anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
         }
-        std::fs::read(tar_file)
-            .map_err(|e| anyhow!("Could not read tar file at {}: {}", tar_file.display(), e))?
+        let file = std::fs::File::open(tar_file)?;
+        // SAFETY: We assume that the tar file given to us is not going to change _externally_
+        // while in the middle of execution. Since we are mapping it as read-only and mapping it
+        // only once, we are not going to change it either. With both these in mind, this call
+        // is safe.
+        //
+        // We need to leak the `Mmap` object, so that it stays alive until the end of the
+        // program, rather than being unmapped at function finish (i.e., to get the `'static`
+        // lifetime).
+        Box::leak(Box::new(unsafe { Mmap::map(&file) }.map_err(|e| {
+            anyhow!("Could not read tar file at {}: {}", tar_file.display(), e)
+        })?))
     } else {
-        litebox::fs::tar_ro::empty_tar_file()
+        litebox::fs::tar_ro::EMPTY_TAR_FILE
     };
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24

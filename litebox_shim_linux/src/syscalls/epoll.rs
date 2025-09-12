@@ -7,7 +7,7 @@ use alloc::{
 };
 use litebox::{
     LiteBox,
-    event::{Events, observer::Observer, polling::Pollee},
+    event::{Events, IOPollable, observer::Observer, polling::Pollee},
 };
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
 use litebox_platform_multiplex::Platform;
@@ -26,8 +26,8 @@ bitflags::bitflags! {
 }
 
 enum DescriptorRef {
-    PipeReader(Weak<crate::channel::Consumer<u8>>),
-    PipeWriter(Weak<crate::channel::Producer<u8>>),
+    PipeReader(Weak<litebox::pipes::ReadEnd<Platform, u8>>),
+    PipeWriter(Weak<litebox::pipes::WriteEnd<Platform, u8>>),
     Eventfd(Weak<crate::syscalls::eventfd::EventFile<litebox_platform_multiplex::Platform>>),
     Socket(Weak<crate::syscalls::net::Socket>),
 }
@@ -86,19 +86,6 @@ impl Descriptor {
             io_pollable.register_observer(observer, mask);
         }
         io_pollable.check_io_events() & (mask | Events::ALWAYS_POLLED)
-    }
-}
-
-pub(crate) trait IOPollable {
-    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events);
-    fn check_io_events(&self) -> Events;
-}
-impl<T: IOPollable> IOPollable for Arc<T> {
-    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
-        self.as_ref().register_observer(observer, mask);
-    }
-    fn check_io_events(&self) -> Events {
-        self.as_ref().check_io_events()
     }
 }
 
@@ -461,7 +448,7 @@ mod test {
     fn test_epoll_with_pipe() {
         let epoll = setup_epoll();
         let (producer, consumer) =
-            crate::channel::Channel::<u8>::new(2, OFlags::empty(), crate::litebox()).split();
+            litebox::pipes::new_pipe::<_, u8>(crate::litebox(), 2, OFlags::empty(), None);
         let reader = crate::Descriptor::PipeReader {
             consumer,
             close_on_exec: core::sync::atomic::AtomicBool::new(false),

@@ -34,9 +34,6 @@ enum FsPath<P: path::Arg> {
 
 /// Maximum size of a file path
 pub const PATH_MAX: usize = 4096;
-/// Special value `libc::AT_FDCWD` used to indicate openat should use
-/// the current working directory.
-pub const AT_FDCWD: i32 = -100;
 
 impl<P: path::Arg> FsPath<P> {
     fn new(dirfd: i32, path: P) -> Result<Self, Errno> {
@@ -53,7 +50,7 @@ impl<P: path::Arg> FsPath<P> {
             } else {
                 FsPath::FdRelative { fd: dirfd, path }
             }
-        } else if dirfd == AT_FDCWD {
+        } else if dirfd == litebox_common_linux::AT_FDCWD {
             if path_str.is_empty() {
                 FsPath::Cwd
             } else {
@@ -133,7 +130,7 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
         Descriptor::PipeReader { consumer, .. } => {
             let consumer = consumer.clone();
             drop(file_table);
-            consumer.read(buf)
+            Ok(consumer.read(buf)?)
         }
         Descriptor::PipeWriter { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
         Descriptor::Eventfd { file, .. } => {
@@ -171,7 +168,7 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
         Descriptor::PipeWriter { producer, .. } => {
             let producer = producer.clone();
             drop(file_table);
-            producer.write(buf)
+            Ok(producer.write(buf)?)
         }
         Descriptor::Eventfd { file, .. } => {
             let file = file.clone();
@@ -422,7 +419,7 @@ fn do_readlink(fullpath: &str) -> Result<String, Errno> {
 
 /// Handle syscall `readlink`
 pub fn sys_readlink(pathname: impl path::Arg, buf: &mut [u8]) -> Result<usize, Errno> {
-    sys_readlinkat(AT_FDCWD, pathname, buf)
+    sys_readlinkat(litebox_common_linux::AT_FDCWD, pathname, buf)
 }
 
 /// Handle syscall `readlinkat`
@@ -711,8 +708,13 @@ pub fn sys_pipe2(flags: OFlags) -> Result<(u32, u32), Errno> {
         todo!("O_DIRECT not supported");
     }
 
-    let (writer, reader) =
-        crate::channel::Channel::new(DEFAULT_PIPE_BUF_SIZE, flags, crate::litebox()).split();
+    let (writer, reader) = litebox::pipes::new_pipe(
+        crate::litebox(),
+        DEFAULT_PIPE_BUF_SIZE,
+        flags,
+        // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
+        4096.try_into().ok(),
+    );
     let close_on_exec = flags.contains(OFlags::CLOEXEC);
     let read_fd = file_descriptors().write().insert(Descriptor::PipeReader {
         consumer: reader,
