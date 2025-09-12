@@ -925,16 +925,7 @@ impl litebox::platform::PunchthroughProvider for LinuxUserland {
 
 impl litebox::platform::DebugLogProvider for LinuxUserland {
     fn debug_log_print(&self, msg: &str) {
-        let _ = unsafe {
-            syscalls::syscall4(
-                syscalls::Sysno::write,
-                litebox_common_linux::STDERR_FILENO as usize,
-                msg.as_ptr() as usize,
-                msg.len(),
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
-            )
-        };
+        debug_print!(msg);
     }
 }
 
