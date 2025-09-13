@@ -9,7 +9,7 @@ use litebox::{
     fs::{FileSystem as _, Mode, OFlags, SeekWhence},
     path,
     platform::{RawConstPointer, RawMutPointer},
-    utils::TruncateExt as _,
+    utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
     AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
@@ -1126,10 +1126,6 @@ pub fn sys_ppoll(
     if sigmask.is_some() {
         unimplemented!("no sigmask support yet");
     }
-    if (nfds as isize) < 0 {
-        return Err(Errno::EINVAL);
-    }
-
     let timeout = timeout
         .map(super::process::get_timeout)
         .transpose()?
@@ -1144,13 +1140,11 @@ pub fn sys_poll(
     nfds: usize,
     timeout: i32,
 ) -> Result<usize, Errno> {
-    if (nfds as isize) < 0 {
-        return Err(Errno::EINVAL);
-    }
-    let timeout = if timeout < 0 {
-        None
-    } else {
+    let timeout = if timeout >= 0 {
+        #[allow(clippy::cast_sign_loss, reason = "timeout is a positive integer")]
         Some(core::time::Duration::from_millis(timeout as u64))
+    } else {
+        None
     };
     do_ppoll(fds, nfds, timeout)
 }
@@ -1160,43 +1154,51 @@ fn do_ppoll(
     nfds: usize,
     timeout: Option<core::time::Duration>,
 ) -> Result<usize, Errno> {
+    let nfds_signed = isize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
     let mut set = super::epoll::PollSet::with_capacity(nfds);
     {
         let locked_file_descriptors = file_descriptors().read();
-        for i in 0..nfds {
-            let fd = unsafe { fds.read_at_offset(i as isize) }
+        for i in 0..nfds_signed {
+            let fd = unsafe { fds.read_at_offset(i) }
                 .ok_or(Errno::EFAULT)?
                 .into_owned();
 
-            let events = litebox::event::Events::from_bits_truncate(fd.events as u16 as u32);
+            let events = litebox::event::Events::from_bits_truncate(
+                fd.events.reinterpret_as_unsigned().into(),
+            );
             if fd.fd < 0 {
                 set.add_empty_interest();
-            } else if let Some(desc) = locked_file_descriptors.get_fd(fd.fd as u32) {
+            } else if let Some(desc) =
+                locked_file_descriptors.get_fd(fd.fd.reinterpret_as_unsigned())
+            {
                 set.add_interest(desc, events);
             } else {
                 set.add_ready_interest(litebox::event::Events::NVAL);
-            };
+            }
         }
     }
 
     set.wait_or_timeout(timeout);
 
     // Write just the revents back.
-    let fds_addr = fds.as_usize();
+    let fds_base_addr = fds.as_usize();
     let mut ready_count = 0;
     for (i, revents) in set.check_revents().enumerate() {
         // TODO: This is not great from a provenance perspective. Consider
         // adding cast+add methods to ConstPtr/MutPtr.
-        let fd_addr = fds_addr + i * core::mem::size_of::<litebox_common_linux::Pollfd>();
+        let fd_addr = fds_base_addr + i * core::mem::size_of::<litebox_common_linux::Pollfd>();
         let revents_ptr = crate::MutPtr::<i16>::from_usize(
             fd_addr + core::mem::offset_of!(litebox_common_linux::Pollfd, revents),
         );
+        let revents: u16 = revents.bits().truncate();
         unsafe {
             revents_ptr
-                .write_at_offset(0, revents.bits() as i16)
+                .write_at_offset(0, revents.reinterpret_as_signed())
                 .ok_or(Errno::EFAULT)
         }?;
-        ready_count += !revents.is_empty() as usize;
+        if revents != 0 {
+            ready_count += 1;
+        }
     }
     Ok(ready_count)
 }

@@ -484,7 +484,7 @@ impl PollSet {
         match pollee.wait_or_timeout(
             timeout,
             || {
-                if self.entries.iter().any(|e| e.is_ready()) {
+                if self.entries.iter().any(PollEntry::is_ready) {
                     Ok::<_, litebox::event::polling::TryOpError<core::convert::Infallible>>(())
                 } else {
                     Err(litebox::event::polling::TryOpError::TryAgain)
@@ -498,7 +498,7 @@ impl PollSet {
     }
 
     pub fn check_revents(&self) -> impl Iterator<Item = Events> + '_ {
-        self.entries.iter().map(|e| e.check_revents())
+        self.entries.iter().map(PollEntry::check_revents)
     }
 
     fn pollee(&mut self) -> &Arc<Pollee<Platform>> {
@@ -521,7 +521,7 @@ impl PollEntry {
         match *self {
             PollEntry::Ready(events) => events,
             PollEntry::Observing(ref observer) => Events::from_bits_retain(
-                observer.revents.load(core::sync::atomic::Ordering::Acquire) as u32,
+                observer.revents.load(core::sync::atomic::Ordering::Acquire),
             ),
         }
     }
