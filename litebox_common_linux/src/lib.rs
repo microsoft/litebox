@@ -1459,6 +1459,15 @@ pub enum ClockId {
     Monotonic = 1,
 }
 
+bitflags::bitflags! {
+    #[derive(Debug)]
+    pub struct TimerFlags: i32 {
+        const ABSTIME = 0x1; // TIMER_ABSTIME
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
 #[non_exhaustive]
 #[repr(i32)]
 #[derive(Debug, IntEnum, PartialEq)]
@@ -1772,6 +1781,12 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         clockid: i32,
         res: Platform::RawMutPointer<Timespec>,
     },
+    ClockNanosleep {
+        clockid: i32,
+        flags: TimerFlags,
+        request: Platform::RawConstPointer<Timespec>,
+        remain: Option<Platform::RawMutPointer<Timespec>>,
+    },
     Gettimeofday {
         tv: Platform::RawMutPointer<TimeVal>,
         tz: Platform::RawMutPointer<TimeZone>,
@@ -2072,6 +2087,15 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::clock_getres => sys_req!(ClockGetres { clockid, res:* }),
             #[cfg(target_arch = "x86")]
             Sysno::clock_getres_time64 => sys_req!(ClockGetres { clockid, res:* }),
+            Sysno::clock_nanosleep => {
+                sys_req!(ClockNanosleep { clockid, flags, request:*, remain:* })
+            }
+            Sysno::nanosleep => SyscallRequest::ClockNanosleep {
+                clockid: ClockId::Monotonic.into(),
+                flags: TimerFlags::empty(),
+                request: ctx.sys_req_ptr(0),
+                remain: ctx.sys_req_ptr(1),
+            },
             Sysno::time => sys_req!(Time { tloc:* }),
             Sysno::getcwd => sys_req!(Getcwd { buf:*, size }),
             Sysno::readlink => sys_req!(Readlink { pathname:*, buf:* ,bufsiz }),
@@ -2559,6 +2583,7 @@ reinterpret_truncated_from_usize_for! {
         EpollCreateFlags,
         EfdFlags,
         RngFlags,
+        TimerFlags,
     ],
 }
 
