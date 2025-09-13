@@ -148,9 +148,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::NOCTTY
             | OFlags::EXCL
             | OFlags::DIRECTORY
-            | OFlags::NONBLOCK;
+            | OFlags::NONBLOCK
+            | OFlags::LARGEFILE;
         if flags.intersects(currently_supported_oflags.complement()) {
-            unimplemented!()
+            unimplemented!("{flags:?}")
         }
         let path = self.absolute_path(path)?;
         let entry = if flags.contains(OFlags::CREAT) {

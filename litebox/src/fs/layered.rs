@@ -447,9 +447,10 @@ impl<
             | OFlags::TRUNC
             | OFlags::NOCTTY
             | OFlags::DIRECTORY
-            | OFlags::NONBLOCK;
+            | OFlags::NONBLOCK
+            | OFlags::LARGEFILE;
         if flags.intersects(currently_supported_oflags.complement()) {
-            unimplemented!()
+            unimplemented!("{flags:?}")
         }
         let path = self.absolute_path(path)?;
         if flags.contains(OFlags::CREAT) {
