@@ -510,6 +510,8 @@ impl Descriptor {
     }
 
     pub(crate) fn get_file_descriptor_flags(&self) -> FileDescriptorFlags {
+        // Currently, only one such flag is defined: FD_CLOEXEC, the close-on-exec flag.
+        // See https://www.man7.org/linux/man-pages/man2/F_GETFD.2const.html
         match self {
             Descriptor::File(file) => litebox_fs()
                 .with_metadata(file, |flags: &FileDescriptorFlags| *flags)

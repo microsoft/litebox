@@ -47,6 +47,7 @@ impl FreeBSDUserland {
         let platform = Self {
             reserved_pages: Self::read_proc_self_maps(),
         };
+
         platform.set_init_tls();
         Box::leak(Box::new(platform))
     }
