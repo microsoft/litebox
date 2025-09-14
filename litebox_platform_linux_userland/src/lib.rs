@@ -4,6 +4,7 @@
 // Linux, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
 
+use std::cell::RefCell;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::SeqCst;
@@ -1454,18 +1455,32 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
     }
 }
 
+#[repr(C)]
+struct TlsData<T> {
+    #[cfg(target_arch = "x86")]
+    self_ptr: *const Self,
+    data: RefCell<T>,
+}
+
 impl LinuxUserland {
     #[cfg(target_arch = "x86_64")]
-    fn get_thread_local_storage() -> *mut litebox_common_linux::ThreadLocalStorage<LinuxUserland> {
+    fn get_thread_local_storage()
+    -> *const TlsData<litebox_common_linux::ThreadLocalStorage<LinuxUserland>> {
         let tls = unsafe { litebox_common_linux::rdgsbase() };
         if tls == 0 {
             return core::ptr::null_mut();
         }
-        tls as *mut litebox_common_linux::ThreadLocalStorage<LinuxUserland>
+        tls as *const TlsData<litebox_common_linux::ThreadLocalStorage<LinuxUserland>>
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn clear_thread_local_storage(&self) {
+        unsafe { litebox_common_linux::wrgsbase(0) };
     }
 
     #[cfg(target_arch = "x86")]
-    fn get_thread_local_storage() -> *mut litebox_common_linux::ThreadLocalStorage<LinuxUserland> {
+    fn get_thread_local_storage()
+    -> *const TlsData<litebox_common_linux::ThreadLocalStorage<LinuxUserland>> {
         let mut fs_selector: u16;
         unsafe {
             core::arch::asm!(
@@ -1478,16 +1493,24 @@ impl LinuxUserland {
             return core::ptr::null_mut();
         }
 
-        let mut addr: usize;
+        let mut addr: *const TlsData<litebox_common_linux::ThreadLocalStorage<LinuxUserland>>;
         unsafe {
             core::arch::asm!(
-                "mov {0}, fs:{offset}",
+                "mov {0}, fs:0", // The first field of TlsData is a self-pointer
                 out(reg) addr,
-                offset = const core::mem::offset_of!(litebox_common_linux::ThreadLocalStorage<LinuxUserland>, self_ptr),
                 options(nostack, preserves_flags)
             );
         }
-        addr as *mut litebox_common_linux::ThreadLocalStorage<LinuxUserland>
+        addr
+    }
+
+    #[cfg(target_arch = "x86")]
+    fn clear_thread_local_storage(&self) {
+        Self::set_fs_selector(0);
+        clear_thread_area(
+            self.tls_entry_number
+                .swap(u32::MAX, core::sync::atomic::Ordering::SeqCst),
+        );
     }
 
     #[cfg(target_arch = "x86")]
@@ -1512,7 +1535,9 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
         let old_gs_base = unsafe { litebox_common_linux::rdgsbase() };
         assert!(old_gs_base == 0, "TLS already set for this thread");
-        let tls = Box::new(tls);
+        let tls = Box::new(TlsData {
+            data: RefCell::new(tls),
+        });
         unsafe { litebox_common_linux::wrgsbase(Box::into_raw(tls) as usize) };
     }
 
@@ -1528,8 +1553,11 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
         }
         assert!(old_fs_selector == 0, "TLS already set for this thread");
 
-        let mut tls = Box::new(tls);
-        tls.self_ptr = tls.as_mut();
+        let mut tls = Box::new(TlsData {
+            self_ptr: core::ptr::null_mut(),
+            data: RefCell::new(tls),
+        });
+        tls.self_ptr = &mut *tls;
 
         let mut flags = litebox_common_linux::UserDescFlags(0);
         flags.set_seg_32bit(true);
@@ -1556,33 +1584,16 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
         Self::set_fs_selector(new_fs_selector.truncate());
     }
 
-    #[cfg(target_arch = "x86_64")]
     fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
         let tls = Self::get_thread_local_storage();
         assert!(!tls.is_null(), "TLS must be set before releasing it");
-        unsafe {
-            litebox_common_linux::wrgsbase(0);
-        }
+        self.clear_thread_local_storage();
 
-        let tls = unsafe { Box::from_raw(tls) };
-        assert!(!tls.borrowed, "TLS must not be borrowed when releasing it");
-        *tls
-    }
+        // Ensure TLS is not borrowed.
+        let _ = unsafe { (*tls).data.borrow_mut() };
 
-    #[cfg(target_arch = "x86")]
-    fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
-        let tls = Self::get_thread_local_storage();
-        assert!(!tls.is_null(), "TLS must be set before releasing it");
-        Self::set_fs_selector(0); // reset fs selector
-
-        clear_thread_area(
-            self.tls_entry_number
-                .swap(u32::MAX, core::sync::atomic::Ordering::SeqCst),
-        );
-
-        let tls = unsafe { Box::from_raw(tls) };
-        assert!(!tls.borrowed, "TLS must not be borrowed when releasing it");
-        *tls
+        let tls = unsafe { Box::from_raw(tls.cast_mut()) };
+        tls.data.into_inner()
     }
 
     fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
@@ -1591,12 +1602,8 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     {
         let tls = Self::get_thread_local_storage();
         assert!(!tls.is_null(), "TLS must be set before accessing it");
-        let tls = unsafe { &mut *tls };
-        assert!(!tls.borrowed, "TLS is already borrowed");
-        tls.borrowed = true; // mark as borrowed
-        let ret = f(tls);
-        tls.borrowed = false; // mark as not borrowed anymore
-        ret
+        let tls = unsafe { &*tls };
+        f(&mut tls.data.borrow_mut())
     }
 
     #[cfg(target_arch = "x86")]
@@ -1667,7 +1674,7 @@ mod tests {
         let platform = LinuxUserland::new(None);
         let tls = LinuxUserland::get_thread_local_storage();
         assert!(!tls.is_null(), "TLS should not be null");
-        let tid = unsafe { (*tls).current_task.tid };
+        let tid = unsafe { (*tls).data.borrow().current_task.tid };
 
         platform.with_thread_local_storage_mut(|tls| {
             assert_eq!(

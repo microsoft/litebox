@@ -4,12 +4,14 @@
 // Windows, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
+use core::cell::Cell;
+use core::cell::RefCell;
+use core::mem::ManuallyDrop;
 use core::panic;
 use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering::SeqCst;
 use core::time::Duration;
-use std::cell::Cell;
 use std::os::raw::c_void;
-use std::sync::atomic::Ordering::SeqCst;
 
 use litebox::platform::RawConstPointer;
 use litebox::platform::ThreadLocalStorageProvider;
@@ -22,7 +24,7 @@ use litebox_common_linux::PunchthroughSyscall;
 
 use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
 use windows_sys::Win32::{
-    Foundation::{GetLastError, WIN32_ERROR},
+    Foundation::GetLastError,
     System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
         EXCEPTION_POINTERS,
@@ -31,10 +33,7 @@ use windows_sys::Win32::{
         self as Win32_Memory, PrefetchVirtualMemory, VirtualAlloc2, VirtualFree, VirtualProtect,
     },
     System::SystemInformation::{self as Win32_SysInfo, GetSystemTimeAsFileTime},
-    System::Threading::{
-        self as Win32_Threading, CreateThread, GetCurrentProcess, TlsAlloc, TlsFree, TlsGetValue,
-        TlsSetValue,
-    },
+    System::Threading::{self as Win32_Threading, CreateThread, GetCurrentProcess},
 };
 
 mod perf_counter;
@@ -50,12 +49,10 @@ struct ThreadFsBaseState {
 }
 
 impl ThreadFsBaseState {
-    fn new() -> Self {
-        let current_fs_base = unsafe { litebox_common_linux::rdfsbase() };
-
-        Self {
-            fs_base: current_fs_base,
-        }
+    const fn new() -> Self {
+        // There's no point in trying to read the current FS base since it will
+        // likely be 0 (as set by Windows scheduler). We just initialize it to 0.
+        Self { fs_base: 0 }
     }
 
     fn set_fs_base(&mut self, new_base: usize) {
@@ -74,7 +71,7 @@ impl ThreadFsBaseState {
 
 // Thread-local storage for FS base state
 thread_local! {
-    static THREAD_FS_BASE: Cell<ThreadFsBaseState> = Cell::new(ThreadFsBaseState::new());
+    static THREAD_FS_BASE: Cell<ThreadFsBaseState> = const { Cell::new(ThreadFsBaseState::new()) };
 }
 
 /// Connector to a shim-exposed syscall-handling interface.
@@ -83,38 +80,11 @@ pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<WindowsUserlan
 /// The syscall handler passed down from the shim.
 static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
 
-struct TlsSlot {
-    dwtlsindex: u32,
-}
-
-impl TlsSlot {
-    fn new() -> Result<Self, WIN32_ERROR> {
-        let tls_index = unsafe { TlsAlloc() };
-        if tls_index == Win32_Threading::TLS_OUT_OF_INDEXES {
-            Err(unsafe { GetLastError() })
-        } else {
-            Ok(Self {
-                dwtlsindex: tls_index,
-            })
-        }
-    }
-}
-
-impl Drop for TlsSlot {
-    fn drop(&mut self) {
-        // Free the TLS index when the slot is dropped
-        unsafe {
-            TlsFree(self.dwtlsindex);
-        }
-    }
-}
-
 /// The userland Windows platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
 /// traits.
 pub struct WindowsUserland {
-    tls_slot: TlsSlot,
     reserved_pages: alloc::vec::Vec<core::ops::Range<usize>>,
     sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
 }
@@ -205,7 +175,6 @@ impl WindowsUserland {
         let reserved_pages = Self::read_memory_maps();
 
         let platform = Self {
-            tls_slot: TlsSlot::new().expect("Failed to create TLS slot!"),
             reserved_pages,
             sys_info: std::sync::RwLock::new(sys_info),
         };
@@ -323,7 +292,6 @@ impl litebox::platform::ExitProvider for WindowsUserland {
 
     fn exit(&self, code: Self::ExitCode) -> ! {
         let Self {
-            tls_slot: _,
             sys_info: _,
             reserved_pages: _,
         } = self;
@@ -1192,16 +1160,10 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
     }
 }
 
-impl WindowsUserland {
-    fn get_thread_local_storage(
-        &self,
-    ) -> *mut litebox_common_linux::ThreadLocalStorage<WindowsUserland> {
-        let tls_ptr = unsafe { TlsGetValue(self.tls_slot.dwtlsindex) };
-        if tls_ptr.is_null() {
-            return core::ptr::null_mut();
-        }
-        tls_ptr.cast::<litebox_common_linux::ThreadLocalStorage<WindowsUserland>>()
-    }
+thread_local! {
+    // Use `ManuallyDrop` for more efficient TLS accesses, since this is always
+    // dropped manually before the thread exits.
+    static PLATFORM_TLS: RefCell<Option<ManuallyDrop<litebox_common_linux::ThreadLocalStorage<WindowsUserland>>>> = const { RefCell::new(None) };
 }
 
 /// WindowsUserland platform's thread-local storage implementation.
@@ -1209,37 +1171,28 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
     type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<WindowsUserland>;
 
     fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
-        let tls_ptr = Box::into_raw(Box::new(tls)) as *const core::ffi::c_void;
-        let succ = unsafe { TlsSetValue(self.tls_slot.dwtlsindex, tls_ptr) };
-        assert!(succ != 0, "Failed to set TLS value. Error={}.", unsafe {
-            GetLastError()
+        PLATFORM_TLS.with_borrow_mut(|cell| {
+            assert!(cell.is_none(), "TLS is already set for this thread");
+            *cell = Some(ManuallyDrop::new(tls));
         });
     }
 
     fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
-        let tls = self.get_thread_local_storage();
-        assert!(!tls.is_null(), "TLS must be set before releasing it");
-        // reset the TLS slot
-        unsafe {
-            TlsSetValue(self.tls_slot.dwtlsindex, core::ptr::null_mut());
-        }
-        let tls = unsafe { Box::from_raw(tls) };
-        assert!(!tls.borrowed, "TLS must not be borrowed when releasing it");
-        *tls
+        ManuallyDrop::into_inner(
+            PLATFORM_TLS
+                .take()
+                .expect("TLS must be set before releasing it"),
+        )
     }
 
     fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
     {
-        let tls = self.get_thread_local_storage();
-        assert!(!tls.is_null(), "TLS must be set before accessing it");
-        let tls = unsafe { &mut *tls };
-        assert!(!tls.borrowed, "TLS must not be borrowed when accessing it");
-        tls.borrowed = true;
-        let ret = f(tls);
-        tls.borrowed = false;
-        ret
+        PLATFORM_TLS.with_borrow_mut(|cell| {
+            let tls = cell.as_mut().expect("TLS must be set before accessing it");
+            f(tls)
+        })
     }
 }
 
@@ -1291,9 +1244,8 @@ mod tests {
     #[test]
     fn test_tls() {
         let platform = WindowsUserland::new();
-        let tls = platform.get_thread_local_storage();
-        assert!(!tls.is_null(), "TLS should not be null");
-        let tid = unsafe { (*tls).current_task.tid };
+        let tid = super::PLATFORM_TLS
+            .with_borrow(|cell| cell.as_ref().expect("TLS should be set").current_task.tid);
 
         platform.with_thread_local_storage_mut(|tls| {
             assert_eq!(
@@ -1308,7 +1260,7 @@ mod tests {
             "TLS should have the correct task ID"
         );
 
-        let tls = platform.get_thread_local_storage();
-        assert!(tls.is_null(), "TLS should be null after releasing it");
+        super::PLATFORM_TLS
+            .with_borrow(|cell| assert!(cell.is_none(), "TLS should be null after releasing it"));
     }
 }

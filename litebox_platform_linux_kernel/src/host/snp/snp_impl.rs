@@ -1,6 +1,7 @@
 //! An implementation of [`HostInterface`] for SNP VMM
 use ::alloc::boxed::Box;
 use core::arch::asm;
+use core::cell::RefCell;
 
 use litebox::{
     platform::{RawConstPointer, RawMutPointer, RawPointerProvider, ThreadLocalStorageProvider},
@@ -116,7 +117,7 @@ impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
     fn set_thread_local_storage(&self, value: Self::ThreadLocalStorage) {
         let current_task = current().expect("Current task must be available");
         assert!(current_task.tls.is_null(), "TLS should not be set yet");
-        let tls = ::alloc::boxed::Box::new(value);
+        let tls = ::alloc::boxed::Box::new(RefCell::new(value));
         current_task.tls = ::alloc::boxed::Box::into_raw(tls).cast();
     }
 
@@ -126,20 +127,19 @@ impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
     {
         let current_task = current().expect("Current task must be available");
         assert!(!current_task.tls.is_null(), "TLS should be set");
-        let tls = unsafe { &mut *current_task.tls.cast::<Self::ThreadLocalStorage>() };
-        assert!(!tls.borrowed, "TLS should not be borrowed");
-        tls.borrowed = true; // mark as borrowed
-        let ret = f(tls);
-        tls.borrowed = false; // mark as not borrowed
-        ret
+        let tls = unsafe { &*current_task.tls.cast::<RefCell<Self::ThreadLocalStorage>>() };
+        f(&mut tls.borrow_mut())
     }
 
     fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
         let current_task = current().expect("Current task must be available");
         assert!(!current_task.tls.is_null(), "TLS should be set");
-        let tls = unsafe { Box::from_raw(current_task.tls.cast::<Self::ThreadLocalStorage>()) };
-        current_task.tls = ::core::ptr::null_mut();
-        *tls
+
+        let tls =
+            core::mem::take(&mut current_task.tls).cast::<RefCell<Self::ThreadLocalStorage>>();
+        let _ = unsafe { (*tls).borrow_mut() }; // ensure no one is borrowing it
+
+        unsafe { Box::from_raw(tls.cast_mut()) }.into_inner()
     }
 }
 
