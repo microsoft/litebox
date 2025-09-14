@@ -4,7 +4,7 @@
 // Linux, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
 
-use std::cell::RefCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::SeqCst;
@@ -1265,18 +1265,37 @@ core::arch::global_asm!(
     "
     .text
     .align  4
+    .global syscall_callback2
+    .type   syscall_callback2,@function
+syscall_callback2:
+    /* rcx contains the return address, r11 is scratch */
+    mov     r11, rsp    /* save the user rsp */
+    mov     rsp, gs:[0] /* get the platform stack */
+    push    0x2b        /* pt_regs->ss = __USER_DS */
+    push    r11         /* pt_regs->sp */
+    pushfq              /* pt_regs->eflags */
+    push    0x33        /* pt_regs->cs = __USER_CS */
+    push    rcx         /* pt_regs->ip */
+    jmp     syscall_iret_frame_pushed
+
+    .text
+    .align  4
     .globl  syscall_callback
     .type   syscall_callback,@function
 syscall_callback:
+    /* rcx and r11 are scratch */
+    mov     rcx, [rsp] /* get the return address from the stack */
+    lea     r11, [rsp + 8] /* get the rsp at the point of the syscall */
+
     /* TODO: save float and vector registers (xsave or fxsave) */
     /* Save caller-saved registers */
     push    0x2b       /* pt_regs->ss = __USER_DS */
-    push    rsp        /* pt_regs->sp */
+    push    r11        /* pt_regs->sp */
     pushfq             /* pt_regs->eflags */
     push    0x33       /* pt_regs->cs = __USER_CS */
-    push    rcx
-    mov     rcx, [rsp + 0x28] /* get the return address from the stack */
-    xchg    rcx, [rsp] /* pt_regs->ip */
+    push    rcx        /* pt_regs->ip */
+
+syscall_iret_frame_pushed:
     push    rax        /* pt_regs->orig_ax */
 
     push    rdi         /* pt_regs->di */
@@ -1327,12 +1346,14 @@ syscall_callback:
     pop  rsi
     pop  rdi
 
-    add  rsp, 24         /* skip orig_rax, rip, cs */
+    pop  rcx             /* skip pt_regs->orig_rax */
+    pop  rcx             /* get pt_regs->rip */
+    add  rsp, 8          /* skip cs */
     popfq
-    add  rsp, 16         /* skip rsp, ss */
+    pop  rsp
 
     /* Return to the caller */
-    ret
+    jmp  rcx
 "
 );
 
@@ -1414,6 +1435,7 @@ syscall_callback:
 unsafe extern "C" {
     // Defined in asm blocks above
     fn syscall_callback() -> isize;
+    fn syscall_callback2() -> isize;
 }
 
 /// Handles Linux syscalls and dispatches them to LiteBox implementations.
@@ -1459,7 +1481,22 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
 struct TlsData<T> {
     #[cfg(target_arch = "x86")]
     self_ptr: *const Self,
+    #[cfg(target_arch = "x86_64")]
+    x64: X64TlsData,
     data: RefCell<T>,
+}
+
+#[repr(C)]
+struct X64TlsData {
+    platform_top_of_stack: usize,
+    platform_stack: Box<[UnsafeCell<Page>]>,
+    sig_stack: Box<[UnsafeCell<Page>]>,
+}
+
+#[derive(Copy, Clone)]
+#[repr(align(4096))]
+struct Page {
+    _data: [u8; 4096],
 }
 
 impl LinuxUserland {
@@ -1537,7 +1574,35 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
         let old_gs_base = unsafe { litebox_common_linux::rdgsbase() };
         assert!(old_gs_base == 0, "TLS already set for this thread");
+        let platform_stack = (0..4)
+            .map(|_| UnsafeCell::new(Page { _data: [0; 4096] }))
+            .collect::<Box<[_]>>();
+        let sig_stack = (0..4)
+            .map(|_| UnsafeCell::new(Page { _data: [0; 4096] }))
+            .collect::<Box<[_]>>();
+
+        // Set up an alternate signal stack.
+        unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::sigaltstack,
+                core::ptr::from_ref(&libc::stack_t {
+                    ss_sp: sig_stack.as_ptr().cast_mut().cast(),
+                    ss_flags: 0,
+                    ss_size: sig_stack.len() * core::mem::size_of::<Page>(),
+                }) as usize,
+                0,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
+            )
+            .expect("sigaltstack failed")
+        };
+
         let tls = Box::new(TlsData {
+            x64: X64TlsData {
+                platform_top_of_stack: platform_stack.as_ptr().wrapping_add(platform_stack.len())
+                    as usize,
+                platform_stack,
+                sig_stack,
+            },
             data: RefCell::new(tls),
         });
         unsafe { litebox_common_linux::wrgsbase(Box::into_raw(tls) as usize) };
@@ -1595,6 +1660,23 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
         let _ = unsafe { (*tls).data.borrow_mut() };
 
         let tls = unsafe { Box::from_raw(tls.cast_mut()) };
+
+        // Clear the alternate signal stack.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::sigaltstack,
+                core::ptr::from_ref(&libc::stack_t {
+                    ss_sp: core::ptr::null_mut(),
+                    ss_flags: libc::SS_DISABLE,
+                    ss_size: 0,
+                }) as usize,
+                0,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
+            )
+            .expect("sigaltstack failed")
+        };
+
         tls.data.into_inner()
     }
 

@@ -32,16 +32,13 @@ extern "C" fn sigsys_handler(sig: c_int, info: *mut libc::siginfo_t, context: *m
 
         // Get the stack pointer (RSP) from the context
         let ucontext = &mut *(context.cast::<libc::ucontext_t>());
-        let stack_pointer = &mut ucontext.uc_mcontext.gregs[libc::REG_RSP as usize];
-        // push the return address onto the stack
-        *stack_pointer -= 8;
-        *(*stack_pointer as *mut usize) = addr as usize;
+        ucontext.uc_mcontext.gregs[libc::REG_RCX as usize] = addr as i64;
 
         // TODO: hotpatch the syscall instruction to jump to the `sigsys_callback`
         // to avoid traps again.
         let rip = &mut ucontext.uc_mcontext.gregs[libc::REG_RIP as usize];
         // Set the instruction pointer to the syscall dispatcher
-        *rip = i64::try_from(crate::syscall_callback as usize).unwrap();
+        *rip = i64::try_from(crate::syscall_callback2 as usize).unwrap();
     }
 }
 
@@ -53,7 +50,7 @@ fn register_sigsys_handler() {
     unsafe { libc::sigemptyset(sig_mask.as_mut_ptr()) };
     let sig_action = libc::sigaction {
         sa_sigaction: sigsys_handler as usize,
-        sa_flags: litebox_common_linux::SaFlags::SIGINFO
+        sa_flags: (litebox_common_linux::SaFlags::SIGINFO | litebox_common_linux::SaFlags::ONSTACK)
             .bits()
             .reinterpret_as_signed(),
         // SAFETY: Initialized by `libc::sigemptyset`
@@ -151,7 +148,7 @@ fn register_seccomp_filter() {
         (libc::SYS_rt_sigreturn, vec![]),
         (libc::SYS_sched_yield, vec![]),
         (libc::SYS_mremap, vec![backdoor_on_arg(5)]),
-        (libc::SYS_sigaltstack, vec![]),
+        (libc::SYS_sigaltstack, vec![backdoor_on_arg(2)]),
         (libc::SYS_arch_prctl, vec![backdoor_on_arg(2)]),
         (
             libc::SYS_futex,
