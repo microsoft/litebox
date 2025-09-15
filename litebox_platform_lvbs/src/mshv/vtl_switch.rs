@@ -217,12 +217,26 @@ fn jump_to_vtl_switch_loop_with_stack_cleanup() -> ! {
     let stack_top = kernel_context.kernel_stack_top();
     unsafe {
         asm!(
-            "mov rsp, rax",
+            "mov rsp, {0}",
             "and rsp, {stack_alignment}",
             "jmp {loop}",
-            in("rax") stack_top, loop = sym vtl_switch_loop,
+            in(reg) stack_top, loop = sym vtl_switch_loop,
             stack_alignment = const STACK_ALIGNMENT,
             options(noreturn)
+        );
+    }
+}
+
+#[allow(clippy::inline_always)]
+#[inline(always)]
+pub fn reload_kernel_stack() {
+    let kernel_context = get_per_core_kernel_context();
+    let stack_top = kernel_context.kernel_stack_top();
+    unsafe {
+        asm!(
+            "mov rsp, {0}",
+            "and rsp, {stack_alignment}",
+            in(reg) stack_top, stack_alignment = const STACK_ALIGNMENT
         );
     }
 }

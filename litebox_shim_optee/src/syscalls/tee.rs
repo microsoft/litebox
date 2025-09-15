@@ -43,6 +43,8 @@ pub fn sys_return(ret: usize) -> ! {
         ret
     );
 
+    litebox_platform_lvbs::mshv::vtl_switch::reload_kernel_stack();
+
     cfg_if::cfg_if! {
         if #[cfg(feature = "platform_linux_userland")] {
             let tid = litebox_platform_multiplex::platform()
@@ -78,6 +80,8 @@ pub fn sys_panic(code: usize) -> ! {
         "panic with code {}",
         code,
     );
+
+    litebox_platform_lvbs::mshv::vtl_switch::reload_kernel_stack();
 
     cfg_if::cfg_if! {
         if #[cfg(feature = "platform_linux_userland")] {

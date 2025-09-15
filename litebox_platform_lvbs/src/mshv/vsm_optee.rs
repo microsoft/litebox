@@ -81,22 +81,19 @@ pub struct OpteeMsgParamValue {
 //     octets: [u8; 24],
 // }
 
-const OPTEE_MSG_ATTR_TYPE_NONE: u64 = 0x0;
-const OPTEE_MSG_ATTR_TYPE_VALUE_INPUT: u64 = 0x1;
-const OPTEE_MSG_ATTR_TYPE_VALUE_OUTPUT: u64 = 0x2;
-const OPTEE_MSG_ATTR_TYPE_VALUE_INOUT: u64 = 0x3;
-const OPTEE_MSG_ATTR_TYPE_RMEM_INPUT: u64 = 0x5;
-const OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT: u64 = 0x6;
-const OPTEE_MSG_ATTR_TYPE_RMEM_INOUT: u64 = 0x7;
-// const OPTEE_MSG_ATTR_TYPE_FMEM_INPUT: u64 = OPTEE_MSG_ATTR_TYPE_RMEM_INPUT;
-// const OPTEE_MSG_ATTR_TYPE_FMEM_OUTPUT: u64 = OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT;
-// const OPTEE_MSG_ATTR_TYPE_FMEM_INOUT: u64 = OPTEE_MSG_ATTR_TYPE_RMEM_INOUT;
-const OPTEE_MSG_ATTR_TYPE_TMEM_INPUT: u64 = 0x9;
-const OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT: u64 = 0xa;
-const OPTEE_MSG_ATTR_TYPE_TMEM_INOUT: u64 = 0xb;
+const OPTEE_MSG_ATTR_TYPE_NONE: u8 = 0x0;
+const OPTEE_MSG_ATTR_TYPE_VALUE_INPUT: u8 = 0x1;
+const OPTEE_MSG_ATTR_TYPE_VALUE_OUTPUT: u8 = 0x2;
+const OPTEE_MSG_ATTR_TYPE_VALUE_INOUT: u8 = 0x3;
+const OPTEE_MSG_ATTR_TYPE_RMEM_INPUT: u8 = 0x5;
+const OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT: u8 = 0x6;
+const OPTEE_MSG_ATTR_TYPE_RMEM_INOUT: u8 = 0x7;
+const OPTEE_MSG_ATTR_TYPE_TMEM_INPUT: u8 = 0x9;
+const OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT: u8 = 0xa;
+const OPTEE_MSG_ATTR_TYPE_TMEM_INOUT: u8 = 0xb;
 
 #[derive(Debug, PartialEq, TryFromPrimitive)]
-#[repr(u64)]
+#[repr(u8)]
 pub enum OpteeMsgAttrType {
     None = OPTEE_MSG_ATTR_TYPE_NONE,
     ValueInput = OPTEE_MSG_ATTR_TYPE_VALUE_INPUT,
@@ -115,12 +112,13 @@ pub enum OpteeMsgAttrType {
 pub struct OpteeMsgParam {
     attr: u64,
     // u: OpteeMsgParamUnion,
-    u: OpteeMsgParamValue, // simplify this for now
+    value: OpteeMsgParamValue,
 }
 
 impl OpteeMsgParam {
-    pub fn attr_type(&self) -> Result<OpteeMsgAttrType, Errno> {
-        OpteeMsgAttrType::try_from(self.attr & 0xff).map_err(|_| Errno::EINVAL)
+    pub fn attr_type(&self) -> OpteeMsgAttrType {
+        OpteeMsgAttrType::try_from(u8::try_from(self.attr & 0xff).unwrap())
+            .unwrap_or(OpteeMsgAttrType::None)
     }
 }
 
@@ -766,23 +764,23 @@ pub fn decode_optee_msg_arg(
             "param[{}] attr={:#x} a={:#x} b={:#x} c={:#x}",
             i,
             msg_arg.params[i].attr,
-            msg_arg.params[i].u.a,
-            msg_arg.params[i].u.b,
-            msg_arg.params[i].u.c,
+            msg_arg.params[i].value.a,
+            msg_arg.params[i].value.b,
+            msg_arg.params[i].value.c,
         );
     }
 
     match OpteeMessageCommand::try_from(msg_arg.cmd).unwrap_or(OpteeMessageCommand::Unknown) {
         OpteeMessageCommand::RegisterShm => {
             shm_ref_map().register_shm(
-                msg_arg.params[0].u.a,
-                msg_arg.params[0].u.b,
-                msg_arg.params[0].u.c,
+                msg_arg.params[0].value.a,
+                msg_arg.params[0].value.b,
+                msg_arg.params[0].value.c,
             );
             return None;
         }
         OpteeMessageCommand::UnregisterShm => {
-            shm_ref_map().remove(msg_arg.params[0].u.c);
+            shm_ref_map().remove(msg_arg.params[0].value.c);
             return None;
         }
         _ => {}
@@ -819,29 +817,30 @@ pub fn decode_optee_msg_arg(
         ..usize::try_from(msg_arg.num_params.min(shift + 4)).unwrap_or(0)
     {
         params[i - usize::try_from(shift).unwrap()] = match msg_arg.params[i].attr_type() {
-            Ok(OpteeMsgAttrType::ValueInput) => UteeParamOwned::ValueInput {
-                value_a: msg_arg.params[i].u.a,
-                value_b: msg_arg.params[i].u.b,
+            OpteeMsgAttrType::ValueInput => UteeParamOwned::ValueInput {
+                value_a: msg_arg.params[i].value.a,
+                value_b: msg_arg.params[i].value.b,
             },
-            Ok(OpteeMsgAttrType::ValueOutput) => UteeParamOwned::ValueOutput {
+            OpteeMsgAttrType::ValueOutput => UteeParamOwned::ValueOutput {
                 out_address: msg_arg_phys_addr
                     + core::mem::offset_of!(OpteeMsgArg, params)
                     + core::mem::size_of::<OpteeMsgParam>() * i
-                    + core::mem::offset_of!(OpteeMsgParam, u),
+                    + core::mem::offset_of!(OpteeMsgParam, value),
             },
-            Ok(OpteeMsgAttrType::ValueInout) => UteeParamOwned::ValueInout {
-                value_a: msg_arg.params[i].u.a,
-                value_b: msg_arg.params[i].u.b,
+            OpteeMsgAttrType::ValueInout => UteeParamOwned::ValueInout {
+                value_a: msg_arg.params[i].value.a,
+                value_b: msg_arg.params[i].value.b,
                 out_address: msg_arg_phys_addr
                     + core::mem::offset_of!(OpteeMsgArg, params)
                     + core::mem::size_of::<OpteeMsgParam>() * i
-                    + core::mem::offset_of!(OpteeMsgParam, u),
+                    + core::mem::offset_of!(OpteeMsgParam, value),
             },
-            Ok(OpteeMsgAttrType::RmemInput | OpteeMsgAttrType::TmemInput) => {
-                if let Some(phys_addrs) =
-                    get_shm_phys_addrs_from_optee_msg_param(msg_arg.params[i].u)
-                {
-                    let data_size = usize::try_from(msg_arg.params[i].u.b).unwrap();
+            OpteeMsgAttrType::RmemInput | OpteeMsgAttrType::TmemInput => {
+                if let Some(phys_addrs) = get_shm_phys_addrs_from_optee_msg_param(
+                    msg_arg.params[i].attr_type(),
+                    msg_arg.params[i].value,
+                ) {
+                    let data_size = usize::try_from(msg_arg.params[i].value.b).unwrap();
                     let mut data = vec![0u8; data_size];
 
                     if copy_from_shm_phys_addrs(&phys_addrs, &mut data) {
@@ -853,11 +852,12 @@ pub fn decode_optee_msg_arg(
                     UteeParamOwned::None
                 }
             }
-            Ok(OpteeMsgAttrType::RmemOutput | OpteeMsgAttrType::TmemOutput) => {
-                if let Some(phys_addrs) =
-                    get_shm_phys_addrs_from_optee_msg_param(msg_arg.params[i].u)
-                {
-                    let buffer_size = usize::try_from(msg_arg.params[i].u.b).unwrap();
+            OpteeMsgAttrType::RmemOutput | OpteeMsgAttrType::TmemOutput => {
+                if let Some(phys_addrs) = get_shm_phys_addrs_from_optee_msg_param(
+                    msg_arg.params[i].attr_type(),
+                    msg_arg.params[i].value,
+                ) {
+                    let buffer_size = usize::try_from(msg_arg.params[i].value.b).unwrap();
                     UteeParamOwned::MemrefOutput {
                         buffer_size,
                         out_addresses: phys_addrs.into(),
@@ -866,11 +866,12 @@ pub fn decode_optee_msg_arg(
                     UteeParamOwned::None
                 }
             }
-            Ok(OpteeMsgAttrType::RmemInout | OpteeMsgAttrType::TmemInout) => {
-                if let Some(phys_addrs) =
-                    get_shm_phys_addrs_from_optee_msg_param(msg_arg.params[i].u)
-                {
-                    let buffer_size = usize::try_from(msg_arg.params[i].u.b).unwrap();
+            OpteeMsgAttrType::RmemInout | OpteeMsgAttrType::TmemInout => {
+                if let Some(phys_addrs) = get_shm_phys_addrs_from_optee_msg_param(
+                    msg_arg.params[i].attr_type(),
+                    msg_arg.params[i].value,
+                ) {
+                    let buffer_size = usize::try_from(msg_arg.params[i].value.b).unwrap();
                     let mut data = vec![0u8; buffer_size];
 
                     if copy_from_shm_phys_addrs(&phys_addrs, &mut data) {
@@ -886,7 +887,7 @@ pub fn decode_optee_msg_arg(
                     UteeParamOwned::None
                 }
             }
-            _ => UteeParamOwned::None,
+            OpteeMsgAttrType::None => UteeParamOwned::None,
         };
     }
 
@@ -896,49 +897,56 @@ pub fn decode_optee_msg_arg(
 /// Get a list of the physical addresses of OP-TEE shared memory from an `OpteeMsgParamValue`.
 /// All addresses must be page-aligned except possibly the first one.
 /// These addresses are virtually contiguous within VTL0, but not necessarily physically contiguous.
-fn get_shm_phys_addrs_from_optee_msg_param(param: OpteeMsgParamValue) -> Option<Vec<usize>> {
-    if param.c == 0 {
-        // temporary memory
-        if param.a == 0 {
-            None
-        } else {
-            Some(vec![usize::try_from(param.a).unwrap()])
+fn get_shm_phys_addrs_from_optee_msg_param(
+    attr_type: OpteeMsgAttrType,
+    param: OpteeMsgParamValue,
+) -> Option<Vec<usize>> {
+    match attr_type {
+        OpteeMsgAttrType::TmemInput
+        | OpteeMsgAttrType::TmemOutput
+        | OpteeMsgAttrType::TmemInout => {
+            if param.a == 0 {
+                None
+            } else {
+                Some(vec![usize::try_from(param.a).unwrap()])
+            }
         }
-    } else if let Some(shm_ref_info) = shm_ref_map().get(param.c) {
-        let offset = shm_ref_info.page_offset + param.a;
-        let page_index = offset / u64::try_from(PAGE_SIZE).unwrap();
-        let page_offset = offset - align_down(offset, u64::try_from(PAGE_SIZE).unwrap());
-        let mem_size = param.b;
-        let num_pages = usize::try_from(align_up(
-            page_offset + mem_size,
-            u64::try_from(PAGE_SIZE).unwrap(),
-        ))
-        .unwrap()
-            / PAGE_SIZE;
-        let mut pages = Vec::with_capacity(num_pages);
-        pages.push(
-            usize::try_from(shm_ref_info.pages[usize::try_from(page_index).unwrap()] + page_offset)
-                .unwrap(),
-        );
-
-        debug_serial_println!(
-            "offset={} page_index={} page_offset={} mem_size={} num_pages={}",
-            offset,
-            page_index,
-            page_offset,
-            mem_size,
-            num_pages,
-        );
-
-        for i in 1..num_pages {
-            pages.push(
-                usize::try_from(shm_ref_info.pages[usize::try_from(page_index).unwrap() + i])
+        OpteeMsgAttrType::RmemInput
+        | OpteeMsgAttrType::RmemOutput
+        | OpteeMsgAttrType::RmemInout => {
+            if let Some(shm_ref_info) = shm_ref_map().get(param.c) {
+                let offset = shm_ref_info.page_offset + param.a;
+                let page_index = offset / u64::try_from(PAGE_SIZE).unwrap();
+                let page_offset = offset - align_down(offset, u64::try_from(PAGE_SIZE).unwrap());
+                let mem_size = param.b;
+                let num_pages = usize::try_from(align_up(
+                    page_offset + mem_size,
+                    u64::try_from(PAGE_SIZE).unwrap(),
+                ))
+                .unwrap()
+                    / PAGE_SIZE;
+                let mut pages = Vec::with_capacity(num_pages);
+                pages.push(
+                    usize::try_from(
+                        shm_ref_info.pages[usize::try_from(page_index).unwrap()] + page_offset,
+                    )
                     .unwrap(),
-            );
+                );
+
+                for i in 1..num_pages {
+                    pages.push(
+                        usize::try_from(
+                            shm_ref_info.pages[usize::try_from(page_index).unwrap() + i],
+                        )
+                        .unwrap(),
+                    );
+                }
+                Some(pages)
+            } else {
+                None
+            }
         }
-        Some(pages)
-    } else {
-        None
+        _ => None,
     }
 }
 
@@ -963,7 +971,6 @@ fn copy_from_shm_phys_addrs(in_addrs: &[usize], buffer: &mut [u8]) -> bool {
     } {
         return false;
     }
-    debug_serial_println!("copied {} bytes from {:#x}", to_copy, in_addrs[0]);
     let mut copied = to_copy;
     for in_addr in in_addrs.iter().skip(1) {
         if copied >= buffer.len() {
@@ -978,7 +985,6 @@ fn copy_from_shm_phys_addrs(in_addrs: &[usize], buffer: &mut [u8]) -> bool {
         } {
             return false;
         }
-        debug_serial_println!("copied {} bytes from {:#x}", to_copy, *in_addr);
         copied += to_copy;
     }
 
@@ -1044,11 +1050,11 @@ impl ShmRefMap {
                 for i in 0..PAGELIST_ENTRIES_PER_PAGE {
                     if pages_data.pages_list[i] == 0 || pages.len() == num_pages {
                         break;
-                    } else if pages_data.pages_list[i]
-                        != align_down(pages_data.pages_list[i], u64::try_from(PAGE_SIZE).unwrap())
+                    } else if !pages_data.pages_list[i]
+                        .is_multiple_of(u64::try_from(PAGE_SIZE).unwrap())
                     {
                         debug_serial_println!(
-                            "shm_ref address is not page-aligned {:#x}",
+                            "shared memory's physical address is not page-aligned {:#x}",
                             pages_data.pages_list[i]
                         );
                         return;

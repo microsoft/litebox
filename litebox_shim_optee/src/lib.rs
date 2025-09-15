@@ -968,13 +968,6 @@ fn copy_to_shm_phys_addrs(out_addrs: &[usize], buffer: &[u8]) -> bool {
     } {
         return false;
     }
-    #[cfg(debug_assertions)]
-    litebox::log_println!(
-        litebox_platform_multiplex::platform(),
-        "copied {} bytes to {:#x}",
-        to_copy,
-        out_addrs[0]
-    );
     let mut copied = to_copy;
     for out_addr in out_addrs.iter().skip(1) {
         if copied >= buffer.len() {
@@ -989,13 +982,6 @@ fn copy_to_shm_phys_addrs(out_addrs: &[usize], buffer: &[u8]) -> bool {
         } {
             return false;
         }
-        #[cfg(debug_assertions)]
-        litebox::log_println!(
-            litebox_platform_multiplex::platform(),
-            "copied {} bytes to {:#x}",
-            to_copy,
-            *out_addr
-        );
         copied += to_copy;
     }
 
