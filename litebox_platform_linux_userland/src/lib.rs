@@ -1455,7 +1455,6 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
     }
 }
 
-#[repr(C)]
 struct TlsData<T> {
     #[cfg(target_arch = "x86")]
     self_ptr: *const Self,
@@ -1474,6 +1473,7 @@ impl LinuxUserland {
     }
 
     #[cfg(target_arch = "x86_64")]
+    #[expect(clippy::unused_self, reason = "self is needed on x86")]
     fn clear_thread_local_storage(&self) {
         unsafe { litebox_common_linux::wrgsbase(0) };
     }
@@ -1496,8 +1496,9 @@ impl LinuxUserland {
         let mut addr: *const TlsData<litebox_common_linux::ThreadLocalStorage<LinuxUserland>>;
         unsafe {
             core::arch::asm!(
-                "mov {0}, fs:0", // The first field of TlsData is a self-pointer
+                "mov {0}, fs:{offset}",
                 out(reg) addr,
+                offset = const core::mem::offset_of!(TlsData<litebox_common_linux::ThreadLocalStorage<LinuxUserland>>, self_ptr),
                 options(nostack, preserves_flags)
             );
         }
