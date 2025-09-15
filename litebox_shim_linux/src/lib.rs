@@ -237,6 +237,20 @@ impl Descriptors {
             None
         }
     }
+    fn close_on_exec(&mut self) {
+        self.descriptors.iter_mut().for_each(|slot| {
+            if let Some(desc) = slot.take() {
+                if desc
+                    .get_file_descriptor_flags()
+                    .contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC)
+                {
+                    syscalls::file::do_close(desc);
+                } else {
+                    *slot = Some(desc);
+                }
+            }
+        });
+    }
 }
 
 enum Descriptor {
@@ -709,6 +723,11 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
             }
         }
         SyscallRequest::Futex { args } => syscalls::process::sys_futex(args),
+        SyscallRequest::Execve {
+            pathname,
+            argv,
+            envp,
+        } => syscalls::process::sys_execve(pathname, argv, envp).map(|()| unreachable!()),
         _ => {
             todo!()
         }

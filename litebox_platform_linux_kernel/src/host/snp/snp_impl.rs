@@ -290,7 +290,7 @@ const fn is_err_value(x: u64) -> bool {
     x >= !MAX_ERRNO
 }
 
-const PAGE_SIZE: u64 = 4096;
+const PAGE_SIZE: u64 = litebox::mm::linux::PAGE_SIZE as u64;
 /// Max physical address
 const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 

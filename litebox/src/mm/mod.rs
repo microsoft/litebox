@@ -345,6 +345,33 @@ where
         Ok(brk)
     }
 
+    /// Release memory mappings that satisfy the given condition and reset the program break.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the released memory regions are no longer used.
+    pub unsafe fn release_memory(
+        &self,
+        releasable: fn(Range<usize>, VmFlags) -> bool,
+    ) -> Result<(), VmemUnmapError> {
+        for (r, vma) in self.mappings() {
+            if !releasable(r.clone(), vma) {
+                continue;
+            }
+            let mut vmem = self.vmem.write();
+            let Some(range) = PageRange::new(r.start, r.end) else {
+                unreachable!()
+            };
+            unsafe { vmem.remove_mapping(range) }?;
+        }
+
+        // reset brk
+        let mut vmem = self.vmem.write();
+        vmem.brk = 0;
+
+        Ok(())
+    }
+
     /// Expands (or shrinks) an existing memory mapping
     ///
     /// `old_addr` is the old address of the virtual memory block that you want to expand (or shrink).

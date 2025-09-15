@@ -55,6 +55,12 @@ pub struct LinuxUserland {
     tls_entry_number: AtomicU32,
 }
 
+impl core::fmt::Debug for LinuxUserland {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LinuxUserland").finish_non_exhaustive()
+    }
+}
+
 const IF_NAMESIZE: usize = 16;
 /// Use TUN device
 const IFF_TUN: i32 = 0x0001;
@@ -768,6 +774,26 @@ fn set_thread_area(
             _ => panic!("unexpected error {err}"),
         },
     )
+}
+
+#[cfg(target_arch = "x86")]
+fn clear_thread_area(entry_number: u32) {
+    if entry_number == u32::MAX {
+        return;
+    }
+
+    let flags = litebox_common_linux::UserDescFlags(0);
+    let mut user_desc = litebox_common_linux::UserDesc {
+        entry_number,
+        base_addr: 0,
+        limit: 0,
+        flags,
+    };
+    let user_desc_ptr = litebox::platform::trivial_providers::TransparentMutPtr {
+        inner: &raw mut user_desc,
+    };
+
+    set_thread_area(user_desc_ptr).expect("failed to clear TLS entry");
 }
 
 pub struct PunchthroughToken {
@@ -1549,6 +1575,11 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
         assert!(!tls.is_null(), "TLS must be set before releasing it");
         Self::set_fs_selector(0); // reset fs selector
 
+        clear_thread_area(
+            self.tls_entry_number
+                .swap(u32::MAX, core::sync::atomic::Ordering::SeqCst),
+        );
+
         let tls = unsafe { Box::from_raw(tls) };
         assert!(!tls.borrowed, "TLS must not be borrowed when releasing it");
         *tls
@@ -1566,6 +1597,23 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
         let ret = f(tls);
         tls.borrowed = false; // mark as not borrowed anymore
         ret
+    }
+
+    #[cfg(target_arch = "x86")]
+    fn clear_guest_thread_local_storage(&self) {
+        const GDT_ENTRY_TLS_ENTRIES: u32 = 3;
+        const GDT_ENTRY_TLS_MIN: u32 = 12;
+        const GDT_ENTRY_TLS_MAX: u32 = GDT_ENTRY_TLS_MIN + GDT_ENTRY_TLS_ENTRIES - 1;
+
+        // Each thread has GDT_ENTRY_TLS_ENTRIES (3) entries in the GDT for TLS.
+        // LiteBox itself uses the first one or two slots, depending on whether it is `no_std` or not.
+        // Only the last one is available for guest use. Hence, we only clear the last one here.
+        debug_assert_ne!(
+            self.tls_entry_number
+                .load(core::sync::atomic::Ordering::Relaxed),
+            GDT_ENTRY_TLS_MAX
+        );
+        clear_thread_area(GDT_ENTRY_TLS_MAX);
     }
 }
 

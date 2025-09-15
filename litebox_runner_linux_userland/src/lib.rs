@@ -8,6 +8,8 @@ use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::PathBuf;
 
+extern crate alloc;
+
 /// Run Linux programs with LiteBox on unmodified Linux
 #[derive(Parser, Debug)]
 pub struct CliArgs {
@@ -69,6 +71,9 @@ pub enum InterceptionBackend {
     /// Depend purely on rewriten syscalls to intercept them
     Rewriter,
 }
+
+static REQUIRE_RTLD_AUDIT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Run Linux programs with LiteBox on unmodified Linux
 ///
@@ -217,10 +222,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
     litebox_shim_linux::set_fs(initial_file_system);
     litebox_platform_multiplex::set_platform(platform);
+    litebox_shim_linux::syscalls::process::set_execve_callback(load_program);
     platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
-        InterceptionBackend::Rewriter => {}
+        InterceptionBackend::Rewriter => {
+            REQUIRE_RTLD_AUDIT.store(true, core::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     let argv = cli_args
@@ -249,6 +257,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
+    load_program(&cli_args.program_and_arguments[0], argv, envp).expect("failed to load program");
+    unreachable!("should have jumped to the program");
+}
+
+fn load_program(
+    path: &str,
+    argv: alloc::vec::Vec<alloc::ffi::CString>,
+    mut envp: alloc::vec::Vec<alloc::ffi::CString>,
+) -> Result<(), litebox_common_linux::errno::Errno> {
     let mut aux = litebox_shim_linux::loader::auxv::init_auxv();
     if litebox_platform_multiplex::platform()
         .get_vdso_address()
@@ -275,14 +292,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             );
         }
     }
-    let loaded_program = litebox_shim_linux::loader::load_program(
-        &cli_args.program_and_arguments[0],
-        argv,
-        envp,
-        aux,
-    )
-    .unwrap();
-
+    // Enable the audit library to load trampoline code for rewritten binaries.
+    if REQUIRE_RTLD_AUDIT.load(core::sync::atomic::Ordering::SeqCst) {
+        envp.push(c"LD_AUDIT=/lib/litebox_rtld_audit.so".into());
+    }
+    let loaded_program = litebox_shim_linux::loader::load_program(path, argv, envp, aux).unwrap();
     unsafe {
         trampoline::jump_to_entry_point(loaded_program.entry_point, loaded_program.user_stack_top)
     }
