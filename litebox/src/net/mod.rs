@@ -6,7 +6,6 @@ use core::net::{Ipv4Addr, SocketAddr};
 
 use crate::event::Events;
 use crate::platform::Instant;
-use crate::utilities::anymap::AnyMap;
 use crate::{LiteBox, platform, sync};
 
 use bitflags::bitflags;
@@ -20,8 +19,8 @@ mod phy;
 mod tests;
 
 use errors::{
-    AcceptError, BindError, CloseError, ConnectError, ListenError, MetadataError, ReceiveError,
-    SendError, SetMetadataError, SocketError,
+    AcceptError, BindError, CloseError, ConnectError, ListenError, ReceiveError, SendError,
+    SocketError,
 };
 use local_ports::{LocalPort, LocalPortAllocator};
 
@@ -120,11 +119,6 @@ pub(crate) struct SocketHandle {
     handle: smoltcp::iface::SocketHandle,
     // Protocol-specific data
     specific: ProtocolSpecific,
-    /// Socket-level metadata
-    /// TODO: FD-specific metadata (similar to fs) will be added in the future.
-    /// This needs to be handled when switching to the Arc-based implementation
-    /// (possibly connected to #31) and is tracked in #120.
-    socket_metadata: AnyMap,
 }
 
 impl core::ops::Deref for SocketHandle {
@@ -549,7 +543,6 @@ where
                 Protocol::Icmp => unimplemented!(),
                 Protocol::Raw { protocol: _ } => unimplemented!(),
             },
-            socket_metadata: AnyMap::new(),
         }))
     }
 
@@ -834,7 +827,6 @@ where
                         local_port,
                         server_socket: None,
                     }),
-                    socket_metadata: AnyMap::new(),
                 }))
             }
             ProtocolSpecific::Udp(_) => unimplemented!(),
@@ -942,55 +934,6 @@ where
                 Err(errors::SetTcpOptionError::NotTcpSocket)
             }
         }
-    }
-
-    /// Apply `f` on metadata at a socket fd, if it exists.
-    pub fn with_metadata<T: core::any::Any, R>(
-        &self,
-        fd: &SocketFd<Platform>,
-        f: impl FnOnce(&T) -> R,
-    ) -> Result<R, MetadataError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let table_entry = descriptor_table.get_entry(fd);
-        let socket_handle = &table_entry.entry;
-
-        if let Some(m) = socket_handle.socket_metadata.get::<T>() {
-            Ok(f(m))
-        } else {
-            Err(MetadataError::NoSuchMetadata)
-        }
-    }
-
-    /// Similar to [`Self::with_metadata`] but mutable.
-    pub fn with_metadata_mut<T: core::any::Any, R>(
-        &mut self,
-        fd: &SocketFd<Platform>,
-        f: impl FnOnce(&mut T) -> R,
-    ) -> Result<R, MetadataError> {
-        let descriptor_table = self.litebox.descriptor_table_mut();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
-        let socket_handle = &mut table_entry.entry;
-
-        if let Some(m) = socket_handle.socket_metadata.get_mut::<T>() {
-            Ok(f(m))
-        } else {
-            Err(MetadataError::NoSuchMetadata)
-        }
-    }
-
-    /// Store arbitrary metadata into a socket.
-    ///
-    /// Returns the old metadata if any such metadata exists.
-    pub fn set_socket_metadata<T: core::any::Any>(
-        &mut self,
-        fd: &SocketFd<Platform>,
-        metadata: T,
-    ) -> Result<Option<T>, SetMetadataError<T>> {
-        let descriptor_table = self.litebox.descriptor_table_mut();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
-        let socket_handle = &mut table_entry.entry;
-
-        Ok(socket_handle.socket_metadata.insert(metadata))
     }
 
     /// Get the [`Events`] for a socket.
