@@ -2087,9 +2087,15 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::clock_getres => sys_req!(ClockGetres { clockid, res:* }),
             #[cfg(target_arch = "x86")]
             Sysno::clock_getres_time64 => sys_req!(ClockGetres { clockid, res:* }),
+            #[cfg(target_arch = "x86_64")]
             Sysno::clock_nanosleep => {
                 sys_req!(ClockNanosleep { clockid, flags, request:*, remain:* })
             }
+            #[cfg(target_arch = "x86")]
+            Sysno::clock_nanosleep_time64 => {
+                sys_req!(ClockNanosleep { clockid, flags, request:*, remain:* })
+            }
+            #[cfg(target_arch = "x86_64")]
             Sysno::nanosleep => SyscallRequest::ClockNanosleep {
                 clockid: ClockId::Monotonic.into(),
                 flags: TimerFlags::empty(),
