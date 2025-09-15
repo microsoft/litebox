@@ -1567,8 +1567,8 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
             entry_number: self
                 .tls_entry_number
                 .load(core::sync::atomic::Ordering::Relaxed),
+            limit: u32::try_from(core::mem::size_of_val(tls.as_ref())).unwrap() - 1,
             base_addr: Box::into_raw(tls) as u32,
-            limit: u32::try_from(core::mem::size_of::<Self::ThreadLocalStorage>()).unwrap() - 1,
             flags,
         };
         let user_desc_ptr = litebox::platform::trivial_providers::TransparentMutPtr {
