@@ -1138,11 +1138,6 @@ pub struct NewThreadArgs<Platform: litebox::platform::RawPointerProvider> {
 
 /// Struct for thread-local storage.
 pub struct ThreadLocalStorage<Platform: litebox::platform::RawPointerProvider> {
-    /// Indicates whether the TLS is being borrowed.
-    pub borrowed: bool,
-
-    #[cfg(target_arch = "x86")]
-    pub self_ptr: *mut ThreadLocalStorage<Platform>,
     pub current_task: alloc::boxed::Box<Task<Platform>>,
 }
 
@@ -1157,12 +1152,7 @@ pub struct Credentials {
 
 impl<Platform: litebox::platform::RawPointerProvider> ThreadLocalStorage<Platform> {
     pub const fn new(task: alloc::boxed::Box<Task<Platform>>) -> Self {
-        Self {
-            borrowed: false,
-            #[cfg(target_arch = "x86")]
-            self_ptr: core::ptr::null_mut(),
-            current_task: task,
-        }
+        Self { current_task: task }
     }
 }
 

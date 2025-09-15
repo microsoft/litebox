@@ -4,6 +4,7 @@
 // FreeBSD, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
 
+use core::cell::RefCell;
 use core::sync::atomic::AtomicU32;
 use core::time::Duration;
 
@@ -970,13 +971,13 @@ impl litebox::platform::SystemInfoProvider for FreeBSDUserland {
 }
 
 impl FreeBSDUserland {
-    fn get_thread_local_storage() -> *mut litebox_common_linux::ThreadLocalStorage<FreeBSDUserland>
-    {
+    fn get_thread_local_storage()
+    -> *const RefCell<litebox_common_linux::ThreadLocalStorage<FreeBSDUserland>> {
         let tls = unsafe { litebox_common_linux::rdgsbase() };
         if tls == 0 {
             return core::ptr::null_mut();
         }
-        tls as *mut litebox_common_linux::ThreadLocalStorage<FreeBSDUserland>
+        tls as *const RefCell<litebox_common_linux::ThreadLocalStorage<FreeBSDUserland>>
     }
 }
 
@@ -989,7 +990,7 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
     fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
         let old_gs_base = unsafe { litebox_common_linux::rdgsbase() };
         assert!(old_gs_base == 0, "TLS already set for this thread");
-        let tls = Box::new(tls);
+        let tls = Box::new(RefCell::new(tls));
         unsafe { litebox_common_linux::wrgsbase(Box::into_raw(tls) as usize) };
     }
 
@@ -999,9 +1000,10 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
         unsafe {
             litebox_common_linux::wrgsbase(0);
         }
-        let tls = unsafe { Box::from_raw(tls) };
-        assert!(!tls.borrowed, "TLS must not be borrowed when releasing it");
-        *tls
+
+        let _ = unsafe { (*tls).borrow_mut() }; // Ensure no one is borrowing it
+
+        unsafe { Box::from_raw(tls.cast_mut()) }.into_inner()
     }
 
     fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
@@ -1010,12 +1012,8 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
     {
         let tls = Self::get_thread_local_storage();
         assert!(!tls.is_null(), "TLS must be set before accessing it");
-        let tls = unsafe { &mut *tls };
-        assert!(!tls.borrowed, "TLS is already borrowed");
-        tls.borrowed = true; // Mark as borrowed
-        let res = f(tls);
-        tls.borrowed = false; // Mark as not borrowed anymore
-        res
+        let tls = unsafe { &*tls };
+        f(&mut tls.borrow_mut())
     }
 }
 
@@ -1069,7 +1067,7 @@ mod tests {
         let platform = FreeBSDUserland::new();
         let tls = FreeBSDUserland::get_thread_local_storage();
         assert!(!tls.is_null(), "TLS should not be null");
-        let tid = unsafe { (*tls).current_task.tid };
+        let tid = unsafe { (*tls).borrow().current_task.tid };
 
         platform.with_thread_local_storage_mut(|tls| {
             assert_eq!(

@@ -659,7 +659,6 @@ pub trait ThreadLocalStorageProvider {
     /// # Panics
     ///
     /// Panics if TLS is not set yet.
-    /// Panics if TLS is borrowed already (e.g., recursive call).
     fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut Self::ThreadLocalStorage) -> R;
