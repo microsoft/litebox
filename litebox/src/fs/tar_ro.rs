@@ -31,7 +31,6 @@ use crate::{
     fs::{DirEntry, FileType},
     path::Arg as _,
     sync,
-    utilities::anymap::AnyMap,
 };
 
 use super::{
@@ -164,10 +163,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let path = self.absolute_path(path)?;
         if path.is_empty() {
             // We are at the root directory, we should just return early.
-            return Ok(self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
-                path: path.clone(),
-                metadata: AnyMap::new(),
-            }));
+            return Ok(self
+                .litebox
+                .descriptor_table_mut()
+                .insert(Descriptor::Dir { path: path.clone() }));
         }
         assert!(path.starts_with('/'));
         let path = &path[1..];
@@ -195,16 +194,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
             self.litebox
                 .descriptor_table_mut()
-                .insert(Descriptor::File {
-                    idx,
-                    position: 0,
-                    metadata: AnyMap::new(),
-                })
+                .insert(Descriptor::File { idx, position: 0 })
         } else {
             // it is a dir
             self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
                 path: path.to_owned(),
-                metadata: AnyMap::new(),
             })
         };
         if flags.contains(OFlags::TRUNC) {
@@ -231,11 +225,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         mut offset: Option<usize>,
     ) -> Result<usize, ReadError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let Descriptor::File {
-            idx,
-            position,
-            metadata: _,
-        } = &mut descriptor_table.get_entry_mut(fd).entry
+        let Descriptor::File { idx, position } = &mut descriptor_table.get_entry_mut(fd).entry
         else {
             return Err(ReadError::NotAFile);
         };
@@ -269,11 +259,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let Descriptor::File {
-            idx,
-            position,
-            metadata: _,
-        } = &mut descriptor_table.get_entry_mut(fd).entry
+        let Descriptor::File { idx, position } = &mut descriptor_table.get_entry_mut(fd).entry
         else {
             return Err(SeekError::NotAFile);
         };
@@ -379,7 +365,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn read_dir(&self, fd: &FileFd<Platform>) -> Result<Vec<DirEntry>, ReadDirError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let Descriptor::Dir { path, metadata: _ } = &descriptor_table.get_entry(fd).entry else {
+        let Descriptor::Dir { path } = &descriptor_table.get_entry(fd).entry else {
             return Err(ReadDirError::NotADirectory);
         };
         // Store into a hashmap to collapse together the entries we end up with for multiple files
@@ -530,52 +516,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }),
         }
     }
-
-    fn with_metadata<T: core::any::Any, R>(
-        &self,
-        fd: &FileFd<Platform>,
-        f: impl FnOnce(&T) -> R,
-    ) -> Result<R, super::errors::MetadataError> {
-        match &self.litebox.descriptor_table().get_entry(fd).entry {
-            Descriptor::File { metadata, .. } | Descriptor::Dir { metadata, .. } => Ok(f(metadata
-                .get::<T>()
-                .ok_or(super::errors::MetadataError::NoSuchMetadata)?)),
-        }
-    }
-
-    fn with_metadata_mut<T: core::any::Any, R>(
-        &self,
-        fd: &FileFd<Platform>,
-        f: impl FnOnce(&mut T) -> R,
-    ) -> Result<R, super::errors::MetadataError> {
-        match &mut self.litebox.descriptor_table().get_entry_mut(fd).entry {
-            Descriptor::File { metadata, .. } | Descriptor::Dir { metadata, .. } => Ok(f(metadata
-                .get_mut::<T>()
-                .ok_or(super::errors::MetadataError::NoSuchMetadata)?)),
-        }
-    }
-
-    fn set_file_metadata<T: core::any::Any>(
-        &self,
-        _fd: &FileFd<Platform>,
-        metadata: T,
-    ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
-        Err(super::errors::SetMetadataError::ReadOnlyFileSystem(
-            metadata,
-        ))
-    }
-
-    fn set_fd_metadata<T: core::any::Any>(
-        &self,
-        fd: &FileFd<Platform>,
-        m: T,
-    ) -> Result<Option<T>, super::errors::SetMetadataError<T>> {
-        match &mut self.litebox.descriptor_table().get_entry_mut(fd).entry {
-            Descriptor::File { metadata, .. } | Descriptor::Dir { metadata, .. } => {
-                Ok(metadata.insert(m))
-            }
-        }
-    }
 }
 
 const DEFAULT_DIR_MODE: Mode =
@@ -609,15 +549,8 @@ fn owner_from_posix_header(posix_header: &tar_no_std::PosixHeader) -> UserInfo {
 }
 
 enum Descriptor {
-    File {
-        idx: usize,
-        position: usize,
-        metadata: AnyMap,
-    },
-    Dir {
-        path: String,
-        metadata: AnyMap,
-    },
+    File { idx: usize, position: usize },
+    Dir { path: String },
 }
 
 crate::fd::enable_fds_for_subsystem! {

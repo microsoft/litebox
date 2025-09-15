@@ -20,9 +20,8 @@ pub mod tar_ro;
 mod tests;
 
 use errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError,
-    ReadDirError, ReadError, RmdirError, SeekError, SetMetadataError, TruncateError, UnlinkError,
-    WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
+    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -132,49 +131,6 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
 
     /// Equivalent to [`Self::file_status`], but open an open `fd` instead.
     fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<FileStatus, FileStatusError>;
-
-    /// Apply `f` on metadata at an fd, if it exists.
-    ///
-    /// This returns the most-specific metadata available for the file descriptor---specifically, if
-    /// both [`Self::set_fd_metadata`] and [`Self::set_file_metadata`]) are run on the same fd, this
-    /// will only return the value from the fd one, which will shadow the file one. If no
-    /// fd-specific one is set, this returns the file-specific one.
-    fn with_metadata<T: core::any::Any, R>(
-        &self,
-        fd: &TypedFd<Self>,
-        f: impl FnOnce(&T) -> R,
-    ) -> Result<R, MetadataError>;
-
-    /// Similar to [`Self::with_metadata`] but mutable.
-    fn with_metadata_mut<T: core::any::Any, R>(
-        &self,
-        fd: &TypedFd<Self>,
-        f: impl FnOnce(&mut T) -> R,
-    ) -> Result<R, MetadataError>;
-
-    /// Store arbitrary metadata into a file.
-    ///
-    /// Such metadata is visible to any open file descriptor on the file associated with the file
-    /// descriptor. See similar [`Self::set_fd_metadata`] which is specific to file descriptors, and
-    /// does not alias the metadata.
-    ///
-    /// Returns the old metadata if any such metadata exists.
-    fn set_file_metadata<T: core::any::Any>(
-        &self,
-        fd: &TypedFd<Self>,
-        metadata: T,
-    ) -> Result<Option<T>, SetMetadataError<T>>;
-
-    /// Store arbitrary metdata into a file descriptor.
-    ///
-    /// Such metadata is specific to the current file descriptor and is NOT shared with other open
-    /// descriptors to the same file. See the similar [`Self::set_file_metadata`] which aliases
-    /// metadata over all file descriptors opened for the same file.
-    fn set_fd_metadata<T: core::any::Any>(
-        &self,
-        fd: &TypedFd<Self>,
-        metadata: T,
-    ) -> Result<Option<T>, SetMetadataError<T>>;
 }
 
 bitflags! {
