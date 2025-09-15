@@ -8,6 +8,7 @@ use crate::{
 };
 use core::ffi::{CStr, c_char};
 use num_enum::TryFromPrimitive;
+use spin::Once;
 
 // This module defines a simplified Linux boot params structure
 // (based on arch/x86/include/uapi/asm/bootparam.h and
@@ -24,6 +25,9 @@ const E820_UNUSABLE: u32 = 5;
 const E820_PMEM: u32 = 7;
 const E820_PRAM: u32 = 12;
 const E820_RESERVED_KERN: u32 = 128;
+
+static POSSIBLE_CPUS: Once<u32> = Once::new();
+static VTL1_MEMORY_INFO: Once<(u64, u64)> = Once::new();
 
 #[derive(Default, Clone, Copy)]
 #[repr(C, packed)]
@@ -98,7 +102,7 @@ impl Default for BootParams {
 }
 
 #[cfg(debug_assertions)]
-pub fn dump_boot_params() {
+fn dump_boot_params() {
     let boot_params = get_address_of_special_page(VTL1_BOOT_PARAMS_PAGE) as *const BootParams;
     unsafe {
         (*boot_params).dump();
@@ -106,7 +110,7 @@ pub fn dump_boot_params() {
 }
 
 #[cfg(debug_assertions)]
-pub fn dump_cmdline() {
+fn dump_cmdline() {
     let cmdline = get_address_of_special_page(VTL1_CMDLINE_PAGE) as *const c_char;
     if cmdline.is_null() {
         return;
@@ -119,12 +123,32 @@ pub fn dump_cmdline() {
 
 /// Funtion to get the guest physical start address and size of VTL1 memory
 pub fn get_vtl1_memory_info() -> Result<(u64, u64), VtlMemoryError> {
-    let boot_params = get_address_of_special_page(VTL1_BOOT_PARAMS_PAGE) as *const BootParams;
-    unsafe { (*boot_params).memory_info() }
+    if let Some(pair) = VTL1_MEMORY_INFO.get().copied() {
+        Ok(pair)
+    } else {
+        Err(VtlMemoryError::InvalidBootParams)
+    }
 }
 
 /// Funtion to get the number of possible cpus from the command line (Linux kernel's num_possible_cpus())
 pub fn get_num_possible_cpus() -> Result<u32, VtlMemoryError> {
+    if let Some(cpus) = POSSIBLE_CPUS.get() {
+        Ok(*cpus)
+    } else {
+        Err(VtlMemoryError::InvalidCmdLine)
+    }
+}
+
+fn save_vtl1_memory_info() -> Result<(), VtlMemoryError> {
+    let boot_params = get_address_of_special_page(VTL1_BOOT_PARAMS_PAGE) as *const BootParams;
+    if let Some((start, size)) = unsafe { (*boot_params).memory_info().ok() } {
+        VTL1_MEMORY_INFO.call_once(|| (start, size));
+        return Ok(());
+    }
+    Err(VtlMemoryError::InvalidBootParams)
+}
+
+fn save_possible_cpus() -> Result<(), VtlMemoryError> {
     let cmdline = get_address_of_special_page(VTL1_CMDLINE_PAGE) as *const c_char;
     if cmdline.is_null() {
         return Err(VtlMemoryError::InvalidCmdLine);
@@ -137,13 +161,24 @@ pub fn get_num_possible_cpus() -> Result<u32, VtlMemoryError> {
             {
                 let num = v.parse::<u32>().unwrap_or(0);
                 if num > 0 {
-                    return Ok(num);
+                    POSSIBLE_CPUS.call_once(|| num);
+                    return Ok(());
                 }
             }
         }
     }
-
     Err(VtlMemoryError::InvalidCmdLine)
+}
+/// # Panics
+///
+/// Panics if possible cpus or vtl1 memory extraction fails
+pub fn parse_boot_info() {
+    #[cfg(debug_assertions)]
+    dump_cmdline();
+    #[cfg(debug_assertions)]
+    dump_boot_params();
+    save_possible_cpus().unwrap(); // Panic if CPU extraction fails
+    save_vtl1_memory_info().unwrap(); // Panic if memory extraction fails
 }
 
 /// E820 entry type
