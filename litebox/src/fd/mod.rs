@@ -13,6 +13,7 @@ use thiserror::Error;
 
 use crate::LiteBox;
 use crate::sync::{RawSyncPrimitivesProvider, RwLock};
+use crate::utilities::anymap::AnyMap;
 
 #[cfg(test)]
 mod tests;
@@ -25,7 +26,7 @@ mod tests;
 /// conversion.
 pub struct Descriptors<Platform: RawSyncPrimitivesProvider> {
     litebox: LiteBox<Platform>,
-    entries: Vec<Option<Arc<RwLock<Platform, DescriptorEntry>>>>,
+    entries: Vec<Option<IndividualEntry<Platform>>>,
     /// Stored FDs are used to provide raw integer values in a safer way.
     stored_fds: Vec<Option<OwnedFd>>,
 }
@@ -51,6 +52,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ) -> TypedFd<Subsystem> {
         let entry = DescriptorEntry {
             entry: alloc::boxed::Box::new(entry.into()),
+            metadata: AnyMap::new(),
         };
         let idx = self
             .entries
@@ -60,7 +62,8 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 self.entries.push(None);
                 self.entries.len() - 1
             });
-        let old = self.entries[idx].replace(Arc::new(self.litebox.sync().new_rwlock(entry)));
+        let old =
+            self.entries[idx].replace(IndividualEntry::new(self.litebox.sync().new_rwlock(entry)));
         assert!(old.is_none());
         TypedFd {
             _phantom: PhantomData,
@@ -80,7 +83,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             unreachable!();
         };
         fd.x.mark_as_closed();
-        Arc::into_inner(old)
+        Arc::into_inner(old.x)
             .map(RwLock::into_inner)
             .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
     }
@@ -312,6 +315,100 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             x: owned_fd,
         })
     }
+
+    /// Apply `f` on metadata at an fd, if it exists.
+    ///
+    /// This returns the most-specific metadata available for the file descriptor---specifically, if
+    /// both [`Self::set_fd_metadata`] and [`Self::set_entry_metadata`]) are run on the same
+    /// fd, this will only return the value from the fd one, which will shadow the file one. If no
+    /// fd-specific one is set, this returns the entry-specific one.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the invariants guarantee that the unwrap panics cannot occur"
+    )]
+    pub fn with_metadata<Subsystem: FdEnabledSubsystem, T: core::any::Any, R>(
+        &self,
+        fd: &TypedFd<Subsystem>,
+        f: impl FnOnce(&T) -> R,
+    ) -> Result<R, MetadataError> {
+        let ind_entry = self.entries[fd.x.as_usize()].as_ref().unwrap();
+        match ind_entry.metadata.get::<T>() {
+            Some(m) => Ok(f(m)),
+            None => ind_entry
+                .read()
+                .metadata
+                .get::<T>()
+                .map(f)
+                .ok_or(MetadataError::NoSuchMetadata),
+        }
+    }
+
+    /// Similar to [`Self::with_metadata`] but mutable.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the invariants guarantee that the unwrap panics cannot occur"
+    )]
+    pub fn with_metadata_mut<Subsystem: FdEnabledSubsystem, T: core::any::Any, R>(
+        &mut self,
+        fd: &TypedFd<Subsystem>,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> Result<R, MetadataError> {
+        let ind_entry = self.entries[fd.x.as_usize()].as_mut().unwrap();
+        match ind_entry.metadata.get_mut::<T>() {
+            Some(m) => Ok(f(m)),
+            None => ind_entry
+                .write()
+                .metadata
+                .get_mut::<T>()
+                .map(f)
+                .ok_or(MetadataError::NoSuchMetadata),
+        }
+    }
+
+    /// Store arbitrary metadata into a file.
+    ///
+    /// Such metadata is visible to any open fd on the entry associated with the fd. See similar
+    /// [`Self::set_fd_metadata`] which is specific to fds, and does not alias the metadata.
+    ///
+    /// Returns the old metadata if any such metadata exists.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the invariants guarantee that the unwrap panics cannot occur"
+    )]
+    pub fn set_entry_metadata<Subsystem: FdEnabledSubsystem, T: core::any::Any>(
+        &mut self,
+        fd: &TypedFd<Subsystem>,
+        metadata: T,
+    ) -> Option<T> {
+        self.entries[fd.x.as_usize()]
+            .as_ref()
+            .unwrap()
+            .x
+            .write()
+            .metadata
+            .insert(metadata)
+    }
+
+    /// Store arbitrary metdata into a file descriptor.
+    ///
+    /// Such metadata is specific to the current fd and is NOT shared with other open fds to the
+    /// same entry. See the similar [`Self::set_entry_metadata`] which aliases metadata over all fds
+    /// opened for the same entry.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the invariants guarantee that the unwrap panics cannot occur"
+    )]
+    pub fn set_fd_metadata<Subsystem: FdEnabledSubsystem, T: core::any::Any>(
+        &mut self,
+        fd: &TypedFd<Subsystem>,
+        metadata: T,
+    ) -> Option<T> {
+        self.entries[fd.x.as_usize()]
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert(metadata)
+    }
 }
 
 /// LiteBox subsystems that support having file descriptors.
@@ -334,9 +431,37 @@ pub enum ErrRawIntFd {
     InvalidSubsystem,
 }
 
+/// Possible errors from getting metadata
+#[derive(Error, Debug)]
+pub enum MetadataError {
+    #[error("no such metadata available")]
+    NoSuchMetadata,
+}
+
+/// A module-internal fd-specific individual entry
+struct IndividualEntry<Platform: RawSyncPrimitivesProvider> {
+    x: Arc<RwLock<Platform, DescriptorEntry>>,
+    metadata: AnyMap,
+}
+impl<Platform: RawSyncPrimitivesProvider> core::ops::Deref for IndividualEntry<Platform> {
+    type Target = Arc<RwLock<Platform, DescriptorEntry>>;
+    fn deref(&self) -> &Self::Target {
+        &self.x
+    }
+}
+impl<Platform: RawSyncPrimitivesProvider> IndividualEntry<Platform> {
+    fn new(x: RwLock<Platform, DescriptorEntry>) -> Self {
+        Self {
+            x: Arc::new(x),
+            metadata: AnyMap::new(),
+        }
+    }
+}
+
 /// A crate-internal entry for a descriptor.
 pub(crate) struct DescriptorEntry {
     entry: alloc::boxed::Box<dyn FdEnabledSubsystemEntry>,
+    metadata: AnyMap,
 }
 
 impl DescriptorEntry {
