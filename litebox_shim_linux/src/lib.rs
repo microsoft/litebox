@@ -20,7 +20,7 @@ use once_cell::race::OnceBox;
 
 use litebox::{
     LiteBox,
-    fs::FileSystem,
+    fd::{ErrRawIntFd, TypedFd},
     mm::{PageManager, linux::PAGE_SIZE},
     platform::{RawConstPointer as _, RawMutPointer as _},
     sync::{RwLock, futex::FutexManager},
@@ -119,6 +119,31 @@ pub(crate) fn litebox_futex_manager<'a>() -> &'a FutexManager<Platform> {
     })
 }
 
+// Special override so that `GETFL` can return stdio-specific flags
+pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
+
+fn initialize_stdio_in_shared_descriptors_table() {
+    use litebox::fs::{FileSystem as _, Mode, OFlags};
+    let stdin = litebox_fs()
+        .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+        .unwrap();
+    let stdout = litebox_fs()
+        .open("/dev/stdout", OFlags::WRONLY, Mode::empty())
+        .unwrap();
+    let stderr = litebox_fs()
+        .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
+        .unwrap();
+    let mut dt = litebox().descriptor_table_mut();
+    for (raw_fd, fd) in [(0, stdin), (1, stdout), (2, stderr)] {
+        let status_flags = OFlags::APPEND | OFlags::RDWR;
+        debug_assert_eq!(OFlags::STATUS_FLAGS_MASK & status_flags, status_flags);
+        let old = dt.set_entry_metadata(&fd, StdioStatusFlags(status_flags));
+        assert!(old.is_none());
+        let success = dt.fd_into_specific_raw_integer(fd, raw_fd);
+        assert!(success);
+    }
+}
+
 // Convenience type aliases
 type ConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
@@ -129,41 +154,16 @@ struct Descriptors {
 
 impl Descriptors {
     fn new() -> Self {
+        // TODO(jayb): We are initializing the stdio files into the shared descriptor table here
+        // mostly because the old `StdioFile` and Descriptor interface was here. It will be moved
+        // out when this `Descriptors` struct is removed from this crate (one of the last few bits
+        // of the shared PR series).
+        initialize_stdio_in_shared_descriptors_table();
         Self {
             descriptors: vec![
-                Some(Descriptor::Stdio(stdio::StdioFile::new(
-                    litebox::platform::StdioStream::Stdin,
-                    litebox_fs()
-                        .open(
-                            "/dev/stdin",
-                            litebox::fs::OFlags::RDONLY,
-                            litebox::fs::Mode::empty(),
-                        )
-                        .unwrap(),
-                    litebox::fs::OFlags::APPEND | litebox::fs::OFlags::RDWR,
-                ))),
-                Some(Descriptor::Stdio(stdio::StdioFile::new(
-                    litebox::platform::StdioStream::Stdout,
-                    litebox_fs()
-                        .open(
-                            "/dev/stdout",
-                            litebox::fs::OFlags::WRONLY,
-                            litebox::fs::Mode::empty(),
-                        )
-                        .unwrap(),
-                    litebox::fs::OFlags::APPEND | litebox::fs::OFlags::RDWR,
-                ))),
-                Some(Descriptor::Stdio(stdio::StdioFile::new(
-                    litebox::platform::StdioStream::Stderr,
-                    litebox_fs()
-                        .open(
-                            "/dev/stderr",
-                            litebox::fs::OFlags::WRONLY,
-                            litebox::fs::Mode::empty(),
-                        )
-                        .unwrap(),
-                    litebox::fs::OFlags::APPEND | litebox::fs::OFlags::RDWR,
-                ))),
+                Some(Descriptor::LiteBoxRawFd(0)),
+                Some(Descriptor::LiteBoxRawFd(1)),
+                Some(Descriptor::LiteBoxRawFd(2)),
             ],
         }
     }
@@ -254,6 +254,7 @@ impl Descriptors {
 }
 
 enum Descriptor {
+    LiteBoxRawFd(usize),
     File(FileFd),
     // Note we are using `Arc` here so that we can hold a reference to the socket
     // without holding a lock on the file descriptor (see `sys_accept` for an example).
@@ -271,8 +272,6 @@ enum Descriptor {
         file: alloc::sync::Arc<syscalls::eventfd::EventFile<Platform>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
-    // TODO: we may not need this once #31 and #68 are done.
-    Stdio(stdio::StdioFile),
     Epoll {
         file: alloc::sync::Arc<syscalls::epoll::EpollFile>,
         close_on_exec: core::sync::atomic::AtomicBool,
@@ -284,6 +283,37 @@ pub(crate) fn file_descriptors<'a>() -> &'a RwLock<Platform, Descriptors> {
         once_cell::race::OnceBox::new();
     FILE_DESCRIPTORS
         .get_or_init(|| alloc::boxed::Box::new(litebox().sync().new_rwlock(Descriptors::new())))
+}
+
+pub(crate) fn run_on_raw_fd<R>(
+    fd: usize,
+    fs: impl FnOnce(&TypedFd<LinuxFS>) -> R,
+    net: impl FnOnce(&TypedFd<litebox::net::Network<Platform>>) -> R,
+) -> Result<R, Errno> {
+    let dt = litebox().descriptor_table();
+    match dt.fd_from_raw_integer(fd) {
+        Ok(fd) => {
+            drop(dt);
+            Ok(fs(&*fd.upgrade().ok_or(Errno::EBADF)?))
+        }
+        Err(ErrRawIntFd::CurrentlyUnconsumable) => unreachable!(),
+        Err(ErrRawIntFd::NotFound) => Err(Errno::EBADF),
+        Err(ErrRawIntFd::InvalidSubsystem) => {
+            match dt.fd_from_raw_integer(fd) {
+                Ok(fd) => {
+                    drop(dt);
+                    Ok(net(&*fd.upgrade().ok_or(Errno::EBADF)?))
+                }
+                Err(ErrRawIntFd::CurrentlyUnconsumable) => unreachable!(),
+                Err(ErrRawIntFd::NotFound) => unreachable!("fd shown to exist before"),
+                Err(ErrRawIntFd::InvalidSubsystem) => {
+                    // We currently only have net and fs FDs at the moment, when we add more, we
+                    // need to expand out this function signature too
+                    unreachable!()
+                }
+            }
+        }
+    }
 }
 
 /// Open a file

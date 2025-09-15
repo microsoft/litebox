@@ -231,8 +231,8 @@ impl EpollEntryKey {
             Descriptor::PipeReader { consumer, .. } => Arc::as_ptr(consumer).cast(),
             Descriptor::PipeWriter { producer, .. } => Arc::as_ptr(producer).cast(),
             Descriptor::Eventfd { file, .. } => Arc::as_ptr(file).cast(),
-            Descriptor::Stdio(crate::stdio::StdioFile { inner, .. }) => Arc::as_ptr(inner).cast(),
             Descriptor::Socket(socket) => Arc::as_ptr(socket).cast(),
+            Descriptor::File(file) => core::ptr::from_ref(file).cast(),
             _ => todo!(),
         };
         Self(fd, ptr)
