@@ -314,7 +314,7 @@ fn pread_with_user_buf(
     count: usize,
     offset: i64,
 ) -> Result<usize, Errno> {
-    let mut kernel_buf = vec![0u8; 0x1000];
+    let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
     let mut read_total = 0;
     while read_total < count {
         let to_read = (count - read_total).min(kernel_buf.len());
@@ -332,6 +332,7 @@ fn pread_with_user_buf(
             Err(e) => return Err(e),
         }
     }
+    assert!(read_total <= count);
     Ok(read_total)
 }
 
@@ -361,18 +362,29 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
                 // We read data in chunks and update the file offset ourselves only if the read succeeds.
                 syscalls::file::sys_lseek(fd, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset)
                     .inspect_err(|e| {
-                        if *e == Errno::ESPIPE {
-                            unimplemented!("read on non-seekable fds with large buffers");
+                        match *e {
+                            Errno::EBADF => (), // safe errors to return
+                            Errno::ESPIPE => {
+                                unimplemented!("read on non-seekable fds with large buffers");
+                            }
+                            Errno::EINVAL => {
+                                unreachable!("seekable file should not return EINVAL when getting current offset");
+                            }
+                            _ => {
+                                unimplemented!("unexpected error from lseek: {}", e);
+                            }
                         }
                     })
                     .and_then(|cur_loc| {
                         pread_with_user_buf(fd, buf, count, i64::try_from(cur_loc).unwrap())
                             .inspect(|read_total| {
+                                // Update the file offset to reflect the read we just did.
                                 syscalls::file::sys_lseek(
                                     fd,
                                     (cur_loc + read_total).reinterpret_as_signed(),
                                     litebox::fs::SeekWhence::RelativeToBeginning,
                                 )
+                                // Given that previous lseek and pread succeeded, this lseek should also succeed.
                                 .expect("lseek failed");
                             })
                     })
