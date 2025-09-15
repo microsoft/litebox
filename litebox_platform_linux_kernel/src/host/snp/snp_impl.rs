@@ -139,7 +139,7 @@ impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
             core::mem::take(&mut current_task.tls).cast::<RefCell<Self::ThreadLocalStorage>>();
         let _ = unsafe { (*tls).borrow_mut() }; // ensure no one is borrowing it
 
-        unsafe { Box::from_raw(tls.cast_mut()) }.into_inner()
+        unsafe { Box::from_raw(tls) }.into_inner()
     }
 }
 
