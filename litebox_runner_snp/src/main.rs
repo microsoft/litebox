@@ -95,15 +95,16 @@ pub extern "C" fn sandbox_process_init(
     platform.set_init_tls(boot_params);
     litebox::log_println!(platform, "sandbox_process_init called");
 
-    let litebox = litebox::LiteBox::new(platform);
-    let in_mem_fs = litebox::fs::in_mem::FileSystem::new(&litebox);
-    let tar_ro = litebox::fs::tar_ro::FileSystem::new(&litebox, ROOTFS.into());
-    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&litebox);
+    litebox_platform_multiplex::set_platform(platform);
+    let litebox = litebox_shim_linux::litebox();
+    let in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+    let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, ROOTFS.into());
+    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(litebox);
     let fs = litebox::fs::layered::FileSystem::new(
-        &litebox,
+        litebox,
         in_mem_fs,
         litebox::fs::layered::FileSystem::new(
-            &litebox,
+            litebox,
             dev_stdio,
             tar_ro,
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
@@ -111,7 +112,6 @@ pub extern "C" fn sandbox_process_init(
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     );
     litebox_shim_linux::set_fs(fs);
-    litebox_platform_multiplex::set_platform(platform);
 
     let parse_args =
         |params: &litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params| -> Option<(
