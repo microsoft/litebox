@@ -1510,7 +1510,6 @@ pub enum FutexArgs<Platform: litebox::platform::RawPointerProvider> {
     },
 }
 
-#[non_exhaustive]
 #[repr(u32)]
 #[derive(Debug, IntEnum)]
 pub enum PrctlOption {
@@ -1518,8 +1517,8 @@ pub enum PrctlOption {
     GetPDeathSig = 2,
     GetDumpable = 3,
     SetDumpable = 4,
-    GetUnaligned = 5,
-    SetUnaligned = 6,
+    GetUnalign = 5,
+    SetUnalign = 6,
     GetKeepCaps = 7,
     SetKeepCaps = 8,
     GetFpEmu = 9,
@@ -1528,9 +1527,9 @@ pub enum PrctlOption {
     SetFpExc = 12,
     GetTiming = 13,
     SetTiming = 14,
-    /// Set process name
+    /// PR_SET_NAME: set process name
     SetName = 15,
-    /// Get process name
+    /// PR_GET_NAME: Get process name
     GetName = 16,
     GetEndian = 19,
     SetEndian = 20,
@@ -1544,18 +1543,18 @@ pub enum PrctlOption {
     SetSecureBits = 28,
     SetTimerSlack = 29,
     GetTimerSlack = 30,
-    TaskPerfEventDisable = 31,
-    TaskPerfEventEnable = 32,
-    MceKill = 33,
-    GetMceKill = 34,
-    SetMMap = 35,
+    TaskPerfEventsDisable = 31,
+    TaskPerfEventsEnable = 32,
+    MCEKill = 33,
+    MCEKillGet = 34,
+    SetMM = 35,
     SetChildSubreaper = 36,
     GetChildSubreaper = 37,
     SetNoNewPrivs = 38,
     GetNoNewPrivs = 39,
     GetTidAddress = 40,
-    SetThpDisable = 41,
-    GetThpDisable = 42,
+    SetTHPDisable = 41,
+    GetTHPDisable = 42,
     // No longer implemented, but left here to ensure the numbers stay reserved:
     // MpxEnableManagement = 43,
     // MpxDisableManagement = 44,
