@@ -880,6 +880,18 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 .map_err(litebox::platform::PunchthroughError::Failure)
             }
             PunchthroughSyscall::RtSigreturn { stack } => {
+                // The stack pointer should point to a `ucontext` structure. Due to our syscall
+                // interception mechanism (see syscall_callback), the actual stack pointer is
+                // 2 `usize`s below the provided pointer.
+                //
+                // The stack layout looks like this:
+                // |-----------------|
+                // | __USER_DS       | <- current stack
+                // |-----------------|
+                // | return address  |
+                // |-----------------|
+                // | ucontext        | <- original stack when syscall was invoked
+                // |-----------------|
                 let stack = stack + size_of::<usize>() * 2;
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
