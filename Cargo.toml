@@ -17,6 +17,9 @@ members = [
     "litebox_shim_linux",
     "litebox_syscall_rewriter",
     "litebox_runner_snp",
+    # The CI tests are not meant to be released (thus are not prefixed with
+    # `litebox_`), but exist purely to better manage development on LiteBox.
+    "dev_tests",
 ]
 default-members = [
     "litebox",
@@ -32,7 +35,8 @@ default-members = [
     "litebox_runner_linux_on_windows_userland",
     "litebox_shim_linux",
     "litebox_shim_optee",
-    "litebox_syscall_rewriter"
+    "litebox_syscall_rewriter",
+    "dev_tests",
 ]
 # We exclude `litebox_runner_lvbs` from `default-members` because its interrupt handling
 # depends on the unstable `abi_x86_interrupt` feature, which requires a nightly toolchain.
