@@ -625,6 +625,16 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
             syscalls::process::sys_clock_getres(clock_id, res);
             Ok(0)
         }
+        SyscallRequest::ClockNanosleep {
+            clockid,
+            flags,
+            request,
+            remain,
+        } => {
+            let clock_id =
+                litebox_common_linux::ClockId::try_from(clockid).expect("invalid clockid");
+            syscalls::process::sys_clock_nanosleep(clock_id, flags, request, remain).map(|()| 0)
+        }
         SyscallRequest::Time { tloc } => syscalls::process::sys_time(tloc)
             .and_then(|second| usize::try_from(second).or(Err(Errno::EOVERFLOW))),
         SyscallRequest::Openat {

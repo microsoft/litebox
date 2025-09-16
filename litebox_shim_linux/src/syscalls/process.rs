@@ -8,8 +8,8 @@ use litebox::mm::linux::VmFlags;
 use litebox::platform::{ExitProvider as _, RawMutPointer as _, ThreadProvider as _};
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{
-    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _,
-    ThreadLocalStorageProvider as _,
+    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutex as _,
+    RawMutexProvider as _, ThreadLocalStorageProvider as _,
 };
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{ArchPrctlArg, errno::Errno};
@@ -473,19 +473,30 @@ fn real_time_as_duration_since_epoch() -> core::time::Duration {
 pub(crate) fn sys_clock_gettime(
     clockid: litebox_common_linux::ClockId,
 ) -> Result<litebox_common_linux::Timespec, Errno> {
-    let duration: core::time::Duration = match clockid {
+    let duration = gettime_as_duration(litebox_platform_multiplex::platform(), clockid)?;
+    litebox_common_linux::Timespec::try_from(duration).or(Err(Errno::EOVERFLOW))
+}
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "will fail for unknown clock IDs in the future"
+)]
+fn gettime_as_duration(
+    platform: &litebox_platform_multiplex::Platform,
+    clockid: litebox_common_linux::ClockId,
+) -> Result<core::time::Duration, Errno> {
+    let duration = match clockid {
         litebox_common_linux::ClockId::RealTime => {
             // CLOCK_REALTIME
             real_time_as_duration_since_epoch()
         }
         litebox_common_linux::ClockId::Monotonic => {
             // CLOCK_MONOTONIC
-            let now = litebox_platform_multiplex::platform().now();
-            now.duration_since(crate::boot_time())
+            platform.now().duration_since(crate::boot_time())
         }
         _ => unimplemented!(),
     };
-    litebox_common_linux::Timespec::try_from(duration).or(Err(Errno::EOVERFLOW))
+    Ok(duration)
 }
 
 /// Handle syscall `clock_getres`.
@@ -504,6 +515,46 @@ pub(crate) fn sys_clock_getres(
     unsafe {
         res.write_at_offset(0, resolution);
     }
+}
+
+/// Handle syscall `clock_nanosleep`.
+pub(crate) fn sys_clock_nanosleep(
+    clockid: litebox_common_linux::ClockId,
+    flags: litebox_common_linux::TimerFlags,
+    request: crate::ConstPtr<litebox_common_linux::Timespec>,
+    remain: Option<crate::MutPtr<litebox_common_linux::Timespec>>,
+) -> Result<(), Errno> {
+    let request = core::time::Duration::from(get_timeout(request)?);
+    if flags.intersects(litebox_common_linux::TimerFlags::ABSTIME.complement()) {
+        return Err(Errno::EINVAL);
+    }
+    let is_abs = flags.contains(litebox_common_linux::TimerFlags::ABSTIME);
+
+    let platform = litebox_platform_multiplex::platform();
+    let duration = if is_abs {
+        let now = gettime_as_duration(platform, clockid)?;
+        if request <= now {
+            return Ok(());
+        }
+        request - now
+    } else {
+        request
+    };
+
+    // Reuse the raw mutex provider to implement sleep.
+    //
+    // TODO: consider a new litebox API to directly sleep, with integration with
+    // interruptions.
+    let r = platform.new_raw_mutex().block_or_timeout(0, duration);
+    assert!(matches!(
+        r,
+        Ok(litebox::platform::UnblockedOrTimedOut::TimedOut)
+    ),);
+
+    // TODO: update the remainder for non-absolute sleeps interrupted by signals.
+    let _ = remain;
+
+    Ok(())
 }
 
 /// Handle syscall `gettimeofday`.
