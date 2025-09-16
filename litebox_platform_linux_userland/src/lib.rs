@@ -907,7 +907,7 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 unsafe {
                     core::arch::asm!(
                         "mov esp, {0}",
-                        "syscall", // invokes rt_sigreturn
+                        "int 0x80", // invokes rt_sigreturn
                         in(reg) stack,
                         in("rax") syscalls::Sysno::rt_sigreturn as usize,
                         options(noreturn)
