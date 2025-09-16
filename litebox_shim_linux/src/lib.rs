@@ -447,6 +447,7 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
                 Err(Errno::EINVAL)
             }
         }
+        SyscallRequest::RtSigreturn { stack } => syscalls::process::sys_rt_sigreturn(stack),
         SyscallRequest::Ioctl { fd, arg } => syscalls::file::sys_ioctl(fd, arg).map(|v| v as usize),
         SyscallRequest::Pread64 {
             fd,

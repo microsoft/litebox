@@ -803,6 +803,7 @@ pub struct PunchthroughToken {
 
 impl litebox::platform::PunchthroughToken for PunchthroughToken {
     type Punchthrough = PunchthroughSyscall<LinuxUserland>;
+    #[expect(clippy::too_many_lines)]
     fn execute(
         self,
     ) -> Result<
@@ -877,6 +878,29 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                     _ => panic!("unexpected error {err}"),
                 })
                 .map_err(litebox::platform::PunchthroughError::Failure)
+            }
+            PunchthroughSyscall::RtSigreturn { stack } => {
+                let stack = stack + size_of::<usize>() * 2;
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    core::arch::asm!(
+                        "mov rsp, {0}",
+                        "syscall", // invokes rt_sigreturn
+                        in(reg) stack,
+                        in("rax") syscalls::Sysno::rt_sigreturn as usize,
+                        options(noreturn)
+                    );
+                }
+                #[cfg(target_arch = "x86")]
+                unsafe {
+                    core::arch::asm!(
+                        "mov esp, {0}",
+                        "syscall", // invokes rt_sigreturn
+                        in(reg) stack,
+                        in("rax") syscalls::Sysno::rt_sigreturn as usize,
+                        options(noreturn)
+                    );
+                }
             }
             #[cfg(target_arch = "x86_64")]
             PunchthroughSyscall::SetFsBase { addr } => {
