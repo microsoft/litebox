@@ -6,7 +6,6 @@ use windows_sys::Win32::Storage::FileSystem;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use litebox::LiteBox;
 use litebox::fs::FileSystem as _;
 use litebox_platform_multiplex::Platform;
 use std::os::windows::fs::MetadataExt;
@@ -130,11 +129,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     let platform = Platform::new();
-    let litebox = LiteBox::new(platform);
+    litebox_platform_multiplex::set_platform(platform);
+    let litebox = litebox_shim_linux::litebox();
     let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
     let prog_unix_path = windows_path_to_unix(&prog);
     let initial_file_system = {
-        let mut in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
+        let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
         let ancestors: Vec<_> = prog.ancestors().collect();
         let mut prev_user = 0;
         for (path, &mode_and_user) in ancestors
@@ -194,13 +194,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             open_file(&mut in_mem, prog_unix_path.as_str(), last.0);
         }
 
-        let tar_ro = litebox::fs::tar_ro::FileSystem::new(&litebox, tar_data.into());
-        let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&litebox);
+        let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
+        let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(litebox);
         litebox::fs::layered::FileSystem::new(
-            &litebox,
+            litebox,
             in_mem,
             litebox::fs::layered::FileSystem::new(
-                &litebox,
+                litebox,
                 dev_stdio,
                 tar_ro,
                 litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
@@ -209,7 +209,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     };
     litebox_shim_linux::set_fs(initial_file_system);
-    litebox_platform_multiplex::set_platform(platform);
     platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
 
     let argv = cli_args
