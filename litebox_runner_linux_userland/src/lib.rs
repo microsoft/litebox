@@ -1,6 +1,5 @@
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use litebox::LiteBox;
 use litebox::fs::FileSystem as _;
 use litebox::platform::SystemInfoProvider as _;
 use litebox_platform_multiplex::Platform;
@@ -143,9 +142,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // systrap/sigsys interception, or binary rewriting interception. Currently
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new(cli_args.tun_device_name.as_deref());
-    let litebox = LiteBox::new(platform);
+    litebox_platform_multiplex::set_platform(platform);
+    let litebox = litebox_shim_linux::litebox();
     let initial_file_system = {
-        let mut in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
+        let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
         let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
         let ancestors: Vec<_> = prog.ancestors().collect();
         let mut prev_user = 0;
@@ -206,13 +206,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             open_file(&mut in_mem, prog.to_str().unwrap(), last.0);
         }
 
-        let tar_ro = litebox::fs::tar_ro::FileSystem::new(&litebox, tar_data.into());
-        let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&litebox);
+        let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
+        let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(litebox);
         litebox::fs::layered::FileSystem::new(
-            &litebox,
+            litebox,
             in_mem,
             litebox::fs::layered::FileSystem::new(
-                &litebox,
+                litebox,
                 dev_stdio,
                 tar_ro,
                 litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
@@ -221,7 +221,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     };
     litebox_shim_linux::set_fs(initial_file_system);
-    litebox_platform_multiplex::set_platform(platform);
     litebox_shim_linux::syscalls::process::set_execve_callback(load_program);
     platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
     match cli_args.interception_backend {

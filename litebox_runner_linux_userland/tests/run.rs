@@ -181,11 +181,19 @@ fn run_target_program(
         .args(args)
         .output()
         .expect("Failed to run litebox_runner_linux_userland");
-    assert!(
-        output.status.success(),
-        "failed to run litebox_runner_linux_userland {:?}",
-        std::str::from_utf8(output.stderr.as_slice()).unwrap()
-    );
+    if !output.status.success() {
+        eprintln!("stdout:");
+        eprintln!(
+            "{}",
+            std::string::String::from_utf8_lossy(output.stdout.as_slice())
+        );
+        eprintln!("stderr:");
+        eprintln!(
+            "{}",
+            std::string::String::from_utf8_lossy(output.stderr.as_slice())
+        );
+        panic!("failed to run litebox_runner_linux_userland")
+    }
     output.stdout
 }
 

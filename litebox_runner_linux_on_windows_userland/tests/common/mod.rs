@@ -3,7 +3,6 @@
 use std::{arch::global_asm, ffi::CString};
 
 use litebox::{
-    LiteBox,
     fs::{FileSystem as _, Mode, OFlags},
     platform::SystemInfoProvider as _,
 };
@@ -39,16 +38,16 @@ pub fn init_platform(tar_data: &'static [u8], initial_dirs: &[&str], initial_fil
     let platform = Platform::new();
     set_platform(platform);
     let platform = litebox_platform_multiplex::platform();
-    let litebox = LiteBox::new(platform);
+    let litebox = litebox_shim_linux::litebox();
 
-    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(&litebox);
+    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     in_mem_fs.with_root_privileges(|fs| {
         fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to set permissions on root");
     });
-    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(&litebox);
+    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(litebox);
     let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(
-        &litebox,
+        litebox,
         if tar_data.is_empty() {
             litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
         } else {
@@ -56,10 +55,10 @@ pub fn init_platform(tar_data: &'static [u8], initial_dirs: &[&str], initial_fil
         },
     );
     set_fs(litebox::fs::layered::FileSystem::new(
-        &litebox,
+        litebox,
         in_mem_fs,
         litebox::fs::layered::FileSystem::new(
-            &litebox,
+            litebox,
             dev_stdio,
             tar_ro_fs,
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
