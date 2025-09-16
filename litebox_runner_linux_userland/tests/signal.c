@@ -1,18 +1,44 @@
 #define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <string.h>
 #include <unistd.h>
+#include <ucontext.h>
+#include <stdint.h>
+
+/*
+ * We capture the address of a label placed just after the deliberate fault
+ * and, in the SIGSEGV handler, we rewrite the saved instruction pointer
+ * (RIP/EIP/PC) to that label so execution resumes as if the faulting line
+ * had completed. This is inherently non-portable and relies on:
+ *  - GNU C "labels as values" extension (&&label)
+ *  - Knowledge of ucontext_t layout per architecture
+ * Use ONLY for testing / experimentation.
+ */
+static volatile void *recover_ip = NULL;
 
 static void segv_handler(int sig, siginfo_t *info, void *ucontext) {
-    (void)ucontext; // unused
+    ucontext_t *ctx = (ucontext_t *)ucontext;
     printf("Caught signal %d (%s)\n", sig, strsignal(sig));
     if (info) {
         printf("  Fault address: %p\n", info->si_addr);
-        if (info->si_addr == 0xdeadbeef)
-            _exit(0); // Exit immediately (async-signal-safe)
+        if (info->si_addr == (void *)0xdeadbeef) {
+#if defined(__x86_64__)
+            ctx->uc_mcontext.gregs[REG_RIP] = (greg_t)recover_ip;
+#elif defined(__i386__)
+            ctx->uc_mcontext.gregs[REG_EIP] = (greg_t)recover_ip;
+#elif defined(__aarch64__)
+            ctx->uc_mcontext.pc = (uintptr_t)recover_ip;
+#else
+            /* Unsupported arch: fail fast */
+            _exit(3);
+#endif
+            return; // Resume execution at recover_ip
+        }
     }
+    // Not our deliberate fault; exit
     _exit(1); // Exit immediately (async-signal-safe)
 }
 
@@ -28,13 +54,21 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
+    /* Capture label address for recovery */
+    void *after_fault_label = &&after_fault;
+    recover_ip = after_fault_label;
+
     printf("About to trigger SIGSEGV...\n");
 
     // Deliberately cause a segmentation fault
-    int *p = 0xdeadbeef;
+    int *p = (int *)0xdeadbeef;
     *p = 42;
 
-    // We never reach here
-    printf("This line will not be executed.\n");
+    /* We never execute the next statement directly (recovered instead) */
+    printf("This line should never be printed directly.\n");
+
+after_fault:
+    printf("Resumed after skipping faulting instruction.\n");
+    printf("Test succeeded; continuing normal execution.\n");
     return 0;
 }
