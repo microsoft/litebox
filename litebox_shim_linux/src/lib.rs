@@ -682,6 +682,13 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
         SyscallRequest::Ftruncate { fd, length } => {
             syscalls::file::sys_ftruncate(fd, length).map(|()| 0)
         }
+        SyscallRequest::Unlinkat {
+            dirfd,
+            pathname,
+            flags,
+        } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+            syscalls::file::sys_unlinkat(dirfd, path, flags).map(|()| 0)
+        }),
         SyscallRequest::Stat { pathname, buf } => {
             pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                 syscalls::file::sys_stat(path).and_then(|stat| {

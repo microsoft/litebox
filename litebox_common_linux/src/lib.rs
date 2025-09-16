@@ -201,6 +201,9 @@ bitflags::bitflags! {
         /// Don't sync attributes with the server
         const AT_STATX_DONT_SYNC = 0x4000;
 
+        /// Used with `unlinkat`, remove directory instead of unlinking a file.
+        const AT_REMOVEDIR = 0x200;
+
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
     }
@@ -1978,6 +1981,11 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         fd: i32,
         length: usize,
     },
+    Unlinkat {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        flags: AtFlags,
+    },
     #[cfg(target_arch = "x86_64")]
     Newfstatat {
         dirfd: i32,
@@ -2515,6 +2523,15 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     pathname: ctx.sys_req_ptr(0),
                     flags: ctx.sys_req_arg(1),
                     mode: ctx.sys_req_arg(2),
+                }
+            }
+            Sysno::unlinkat => sys_req!(Unlinkat { dirfd,pathname:*,flags }),
+            Sysno::unlink => {
+                // unlink is equivalent to unlinkat with dirfd AT_FDCWD and flags 0
+                SyscallRequest::Unlinkat {
+                    dirfd: AT_FDCWD,
+                    pathname: ctx.sys_req_ptr(0),
+                    flags: AtFlags::empty(),
                 }
             }
             Sysno::creat => {
