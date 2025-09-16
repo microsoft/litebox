@@ -836,7 +836,7 @@ impl Signal {
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
-pub struct SigSet(usize);
+pub struct SigSet(u64);
 
 impl SigSet {
     pub fn empty() -> Self {
@@ -844,15 +844,15 @@ impl SigSet {
     }
 
     pub fn add(&mut self, signum: Signal) {
-        self.0 |= 1 << (signum as usize - 1);
+        self.0 |= 1 << (signum as u64 - 1);
     }
 
     pub fn remove(&mut self, signum: Signal) {
-        self.0 &= !(1 << (signum as usize - 1));
+        self.0 &= !(1 << (signum as u64 - 1));
     }
 
     pub fn contains(&self, signum: Signal) -> bool {
-        (self.0 & (1 << (signum as usize - 1))) != 0
+        (self.0 & (1 << (signum as u64 - 1))) != 0
     }
 }
 
