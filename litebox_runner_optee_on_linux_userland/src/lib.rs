@@ -108,7 +108,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     assert!(
         register_session_id_elf_load_info(session_id, loaded_program),
-        "session ID {session_id} already exists"
+        "redundant session ID is not allowed"
     );
 
     populate_optee_command_queue(session_id, &ta_commands);
