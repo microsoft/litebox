@@ -788,6 +788,10 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
             argv,
             envp,
         } => syscalls::process::sys_execve(pathname, argv, envp).map(|()| unreachable!()),
+        SyscallRequest::Umask { mask } => {
+            let old_mask = syscalls::file::sys_umask(mask);
+            Ok(old_mask.bits() as usize)
+        }
         _ => {
             todo!()
         }

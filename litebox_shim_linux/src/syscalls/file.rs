@@ -63,6 +63,21 @@ impl<P: path::Arg> FsPath<P> {
     }
 }
 
+/// Global umask
+///
+/// Note we don't support fork (or `Clone` without `CloneFlags::FS`) yet, so one mask suffices.
+static UMASK: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(Mode::WGRP.bits() | Mode::WOTH.bits());
+fn get_umask() -> Mode {
+    Mode::from_bits_truncate(UMASK.load(core::sync::atomic::Ordering::SeqCst))
+}
+
+/// Handle syscall `umask`
+pub(crate) fn sys_umask(new_mask: u32) -> Mode {
+    let new_mask = Mode::from_bits_truncate(new_mask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
+    Mode::from_bits_truncate(UMASK.swap(new_mask.bits(), core::sync::atomic::Ordering::SeqCst))
+}
+
 /// Handle syscall `open`
 pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
     // TODO: check file stat instead of hardcoding the path to distinguish between stdio
@@ -73,6 +88,7 @@ pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, 
         "/dev/stderr" => Some(litebox::platform::StdioStream::Stderr),
         _ => None,
     };
+    let mode = mode & !get_umask();
     litebox_fs()
         .open(path, flags - OFlags::CLOEXEC, mode)
         .map(|file| {
@@ -217,7 +233,7 @@ pub fn sys_lseek(fd: i32, offset: isize, whence: SeekWhence) -> Result<usize, Er
 
 /// Handle syscall `mkdir`
 pub fn sys_mkdir(pathname: impl path::Arg, mode: u32) -> Result<(), Errno> {
-    let mode = Mode::from_bits_retain(mode);
+    let mode = Mode::from_bits_retain(mode) & !get_umask();
     litebox_fs().mkdir(pathname, mode).map_err(Errno::from)
 }
 

@@ -3,9 +3,11 @@ use litebox::platform::RawConstPointer as _;
 use litebox_common_linux::{EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
 use litebox_platform_multiplex::{Platform, set_platform};
 
-use super::file::{sys_dup, sys_eventfd2, sys_fcntl, sys_getdirent64, sys_open, sys_pipe2};
+use super::file::{
+    sys_close, sys_dup, sys_eventfd2, sys_fcntl, sys_getdirent64, sys_mkdir, sys_open, sys_pipe2,
+    sys_stat, sys_umask,
+};
 use crate::MutPtr;
-use crate::syscalls::file::sys_close;
 
 extern crate std;
 
@@ -396,4 +398,59 @@ fn test_getdent64() {
         all_entries,
         alloc::vec![".", "..", "bar", "foo", "test_file1.txt", "test_file2.txt"]
     );
+}
+
+#[test]
+fn test_umask_behavior() {
+    init_platform(None);
+
+    // 1. Capture original mask without changing final state.
+    let orig = sys_umask(0).bits(); // sets mask to 0, returns previous
+    let _ = sys_umask(orig); // restore original
+
+    // We expect the default (from implementation) to be 0o022.
+    assert_eq!(orig, 0o022, "Default umask should be 022 (got {orig:03o})",);
+
+    // 2. Set a new umask (e.g., 0o077) and verify file creation honors it.
+    let prev = sys_umask(0o077).bits();
+    assert_eq!(prev, orig, "Setting umask should return previous value");
+
+    // Create a file with mode 0o666; with umask 0o077 it should become 0o600.
+    let file_mode = Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH; // 0o666
+    let test_file = "/umask_rs_test_file_perm.txt";
+    let fd = sys_open(test_file, OFlags::CREAT | OFlags::WRONLY, file_mode)
+        .expect("Failed to create test file with O_CREAT");
+    // Close it (ignore errors)
+    let _ = sys_close(i32::try_from(fd).unwrap());
+
+    let stat_file = sys_stat(test_file).expect("stat failed on test file");
+    let actual_file_perm = stat_file.st_mode & 0o777;
+    assert_eq!(
+        actual_file_perm, 0o600,
+        "File permission should respect umask (expected 600 got {actual_file_perm:03o})",
+    );
+
+    // 3. Create a directory with mode 0o777; with umask 0o077 should become 0o700.
+    let dir_mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits();
+    let test_dir = "/umask_rs_test_dir";
+    sys_mkdir(test_dir, dir_mode).expect("Failed to create test directory");
+
+    let stat_dir = sys_stat(test_dir).expect("stat failed on test directory");
+    let actual_dir_perm = stat_dir.st_mode & 0o777;
+    assert_eq!(
+        actual_dir_perm, 0o700,
+        "Directory permission should respect umask (expected 700 got {actual_dir_perm:03o})",
+    );
+
+    // 4. High bits are ignored: set mask with bits beyond 0o777.
+    // Current mask is 0o077; now set 0o1777 -> stored low 9 bits = 0o777.
+    let prev2 = sys_umask(0o1777).bits();
+    assert_eq!(prev2, 0o077, "Returned previous mask should be 077");
+    let prev3 = sys_umask(0).bits(); // fetch current (0o777) and set to 0
+    assert_eq!(
+        prev3, 0o777,
+        "Only low 9 bits should be retained (expected 777)"
+    );
+    // Restore to original
+    let _ = sys_umask(orig);
 }
