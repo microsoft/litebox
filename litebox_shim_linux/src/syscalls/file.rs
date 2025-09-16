@@ -1155,35 +1155,24 @@ fn do_ppoll(
     timeout: Option<core::time::Duration>,
 ) -> Result<usize, Errno> {
     let nfds_signed = isize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
-    let mut set = super::epoll::PollSet::with_capacity(nfds);
-    {
-        let locked_file_descriptors = file_descriptors().read();
-        for i in 0..nfds_signed {
-            let fd = unsafe { fds.read_at_offset(i) }
-                .ok_or(Errno::EFAULT)?
-                .into_owned();
 
-            let events = litebox::event::Events::from_bits_truncate(
-                fd.events.reinterpret_as_unsigned().into(),
-            );
-            if fd.fd < 0 {
-                set.add_empty_interest();
-            } else if let Some(desc) =
-                locked_file_descriptors.get_fd(fd.fd.reinterpret_as_unsigned())
-            {
-                set.add_interest(desc, events);
-            } else {
-                set.add_ready_interest(litebox::event::Events::NVAL);
-            }
-        }
+    let mut set = super::epoll::PollSet::with_capacity(nfds);
+    for i in 0..nfds_signed {
+        let fd = unsafe { fds.read_at_offset(i) }
+            .ok_or(Errno::EFAULT)?
+            .into_owned();
+
+        let events =
+            litebox::event::Events::from_bits_truncate(fd.events.reinterpret_as_unsigned().into());
+        set.add_fd(fd.fd, events);
     }
 
-    set.wait_or_timeout(timeout);
+    set.wait_or_timeout(|| file_descriptors().read(), timeout);
 
     // Write just the revents back.
     let fds_base_addr = fds.as_usize();
     let mut ready_count = 0;
-    for (i, revents) in set.check_revents().enumerate() {
+    for (i, revents) in set.revents().enumerate() {
         // TODO: This is not great from a provenance perspective. Consider
         // adding cast+add methods to ConstPtr/MutPtr.
         let fd_addr = fds_base_addr + i * core::mem::size_of::<litebox_common_linux::Pollfd>();

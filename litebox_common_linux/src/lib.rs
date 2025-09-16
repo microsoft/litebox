@@ -2483,7 +2483,12 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 }
             }
             Sysno::epoll_create1 => sys_req!(EpollCreate { flags }),
+            #[cfg(target_arch = "x86_64")]
             Sysno::ppoll => {
+                sys_req!(Ppoll { fds:*, nfds, timeout:*, sigmask:*, sigsetsize })
+            }
+            #[cfg(target_arch = "x86")]
+            Sysno::ppoll_time64 => {
                 sys_req!(Ppoll { fds:*, nfds, timeout:*, sigmask:*, sigsetsize })
             }
             Sysno::poll => {
