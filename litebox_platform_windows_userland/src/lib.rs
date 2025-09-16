@@ -277,6 +277,7 @@ impl WindowsUserland {
             clear_child_tid: None,
             robust_list: None,
             credentials: alloc::sync::Arc::new(creds),
+            comm: [0; litebox_common_linux::TASK_COMM_LEN],
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         self.set_thread_local_storage(tls);
