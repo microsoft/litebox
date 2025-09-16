@@ -5,7 +5,7 @@ use litebox::platform::SystemInfoProvider as _;
 use litebox_platform_multiplex::Platform;
 use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 extern crate alloc;
 
@@ -90,7 +90,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     let (ancestor_modes_and_users, prog_data): (Vec<(litebox::fs::Mode, u32)>, Vec<u8>) = {
-        let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
+        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
         let ancestors: Vec<_> = prog.ancestors().collect();
         let modes: Vec<_> = ancestors
             .into_iter()
@@ -146,7 +146,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let litebox = litebox_shim_linux::litebox();
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
-        let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
+        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
         let ancestors: Vec<_> = prog.ancestors().collect();
         let mut prev_user = 0;
         for (path, &mode_and_user) in ancestors
@@ -220,6 +220,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
         )
     };
+
+    // We need to get the file path before enabling seccomp
+    let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+    let prog_path = prog.to_str().ok_or_else(|| {
+        anyhow!(
+            "Could not convert program path {:?} to a string",
+            cli_args.program_and_arguments[0]
+        )
+    })?;
+
     litebox_shim_linux::set_fs(initial_file_system);
     litebox_shim_linux::syscalls::process::set_execve_callback(load_program);
     platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
@@ -256,7 +266,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    load_program(&cli_args.program_and_arguments[0], argv, envp).expect("failed to load program");
+    load_program(prog_path, argv, envp).expect("failed to load program");
     unreachable!("should have jumped to the program");
 }
 
