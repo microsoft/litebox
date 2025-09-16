@@ -447,7 +447,7 @@ impl OpteeSmcArgs {
         {
             Ok(())
         } else {
-            debug_serial_println!("Failed to copy OpteeSmcArgs back to VTL0");
+            // debug_serial_println!("Failed to copy OpteeSmcArgs back to VTL0");
             Err(Errno::EINVAL)
         }
     }
@@ -615,7 +615,7 @@ pub fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
                 OpteeSmcFunction::CallWithArg
                 | OpteeSmcFunction::CallWithRpcArg
                 | OpteeSmcFunction::CallWithRegdArg => {
-                    debug_serial_println!("OP-TEE SMC function ID: CallWith*Arg");
+                    // debug_serial_println!("OP-TEE SMC function ID: CallWith*Arg");
                     if let Ok((mut msg_arg, msg_arg_phys_addr)) = optee_smc_args.optee_msg_arg() {
                         // tiny hack to proceed. remove this later once copying results back to VTL0 correctly works.
                         msg_arg.ret = 0;
@@ -736,7 +736,7 @@ pub fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
         } {
             0
         } else {
-            debug_serial_println!("Failed to copy OpteeSmcArgs back to VTL0");
+            // debug_serial_println!("Failed to copy OpteeSmcArgs back to VTL0");
             Errno::EINVAL.as_neg().into()
         }
     } else {
@@ -754,21 +754,21 @@ pub fn decode_optee_msg_arg(
     u32,
     [UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS],
 )> {
-    debug_serial_println!(
-        "optee_msg_arg cmd={:#x} func={:#x}",
-        msg_arg.cmd,
-        msg_arg.func
-    );
-    for i in 0..usize::try_from(msg_arg.num_params).unwrap_or(0) {
-        debug_serial_println!(
-            "param[{}] attr={:#x} a={:#x} b={:#x} c={:#x}",
-            i,
-            msg_arg.params[i].attr,
-            msg_arg.params[i].value.a,
-            msg_arg.params[i].value.b,
-            msg_arg.params[i].value.c,
-        );
-    }
+    // debug_serial_println!(
+    //     "optee_msg_arg cmd={:#x} func={:#x}",
+    //     msg_arg.cmd,
+    //     msg_arg.func
+    // );
+    // for i in 0..usize::try_from(msg_arg.num_params).unwrap_or(0) {
+    //     debug_serial_println!(
+    //         "param[{}] attr={:#x} a={:#x} b={:#x} c={:#x}",
+    //         i,
+    //         msg_arg.params[i].attr,
+    //         msg_arg.params[i].value.a,
+    //         msg_arg.params[i].value.b,
+    //         msg_arg.params[i].value.c,
+    //     );
+    // }
 
     match OpteeMessageCommand::try_from(msg_arg.cmd).unwrap_or(OpteeMessageCommand::Unknown) {
         OpteeMessageCommand::RegisterShm => {

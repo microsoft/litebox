@@ -36,12 +36,12 @@ fn align_down(addr: usize, align: usize) -> usize {
 /// A system call to return to the kernel. A TA calls this function when
 /// it finishes its job delivered through a TA command invocation.
 pub fn sys_return(ret: usize) -> ! {
-    #[cfg(debug_assertions)]
-    litebox::log_println!(
-        litebox_platform_multiplex::platform(),
-        "sys_return: ret {}",
-        ret
-    );
+    // #[cfg(debug_assertions)]
+    // litebox::log_println!(
+    //     litebox_platform_multiplex::platform(),
+    //     "sys_return: ret {}",
+    //     ret
+    // );
 
     litebox_platform_lvbs::mshv::vtl_switch::reload_kernel_stack();
 
@@ -62,12 +62,12 @@ pub fn sys_return(ret: usize) -> ! {
 
 /// A system call to print out a message.
 pub fn sys_log(buf: &[u8]) -> Result<(), TeeResult> {
-    #[cfg(debug_assertions)]
-    litebox::log_println!(
-        litebox_platform_multiplex::platform(),
-        "sys_log: buf {:#x}",
-        buf.as_ptr() as usize
-    );
+    // #[cfg(debug_assertions)]
+    // litebox::log_println!(
+    //     litebox_platform_multiplex::platform(),
+    //     "sys_log: buf {:#x}",
+    //     buf.as_ptr() as usize
+    // );
     let msg = core::str::from_utf8(buf).map_err(|_| TeeResult::BadFormat)?;
     litebox::log_println!(litebox_platform_multiplex::platform(), "{}", msg);
     Ok(())

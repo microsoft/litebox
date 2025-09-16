@@ -503,17 +503,17 @@ pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
         };
         optee_command_completion_queue().push(session_id, cmd_result);
 
-        #[cfg(debug_assertions)]
-        litebox::log_println!(
-            litebox_platform_multiplex::platform(),
-            "func {:#x} session_id {:#x} params {:#x} cmd_id {:#x} entry_point {:#x} stack_top {:#x}",
-            cmd.func as u32,
-            session_id,
-            stack.get_params_address(),
-            cmd.cmd_id as usize,
-            elf_load_info.entry_point,
-            stack.get_cur_stack_top()
-        );
+        // #[cfg(debug_assertions)]
+        // litebox::log_println!(
+        //     litebox_platform_multiplex::platform(),
+        //     "func {:#x} session_id {:#x} params {:#x} cmd_id {:#x} entry_point {:#x} stack_top {:#x}",
+        //     cmd.func as u32,
+        //     session_id,
+        //     stack.get_params_address(),
+        //     cmd.cmd_id as usize,
+        //     elf_load_info.entry_point,
+        //     stack.get_cur_stack_top()
+        // );
 
         // load thread local storage (TLS)
         #[cfg(feature = "platform_lvbs")]
@@ -606,14 +606,14 @@ fn handle_optee_command_output(session_id: u32) {
             match param_type {
                 TeeParamType::ValueOutput | TeeParamType::ValueInout => {
                     if let Ok(Some((value_a, value_b))) = params.get_values(idx) {
-                        #[cfg(debug_assertions)]
-                        litebox::log_println!(
-                            litebox_platform_multiplex::platform(),
-                            "output (index: {}): {:#x} {:#x}",
-                            idx,
-                            value_a,
-                            value_b,
-                        );
+                        // #[cfg(debug_assertions)]
+                        // litebox::log_println!(
+                        //     litebox_platform_multiplex::platform(),
+                        //     "output (index: {}): {:#x} {:#x}",
+                        //     idx,
+                        //     value_a,
+                        //     value_b,
+                        // );
                         if let Some(out_addr) = &cmd_result.out_addrs[idx] {
                             let mut buffer = [0u8; 16];
                             buffer[..8].copy_from_slice(&value_a.to_le_bytes());
@@ -635,23 +635,23 @@ fn handle_optee_command_output(session_id: u32) {
                                 usize::try_from(len).unwrap_or(0),
                             )
                         };
-                        #[cfg(debug_assertions)]
-                        if slice.is_empty() {
-                            litebox::log_println!(
-                                litebox_platform_multiplex::platform(),
-                                "output (index: {}): {:#x}",
-                                idx,
-                                addr,
-                            );
-                        } else {
-                            litebox::log_println!(
-                                litebox_platform_multiplex::platform(),
-                                "output (index: {}): {:#x} {:?} (up to 16 bytes)",
-                                idx,
-                                addr,
-                                &slice[..slice.len().min(16)]
-                            );
-                        }
+                        // #[cfg(debug_assertions)]
+                        // if slice.is_empty() {
+                        //     litebox::log_println!(
+                        //         litebox_platform_multiplex::platform(),
+                        //         "output (index: {}): {:#x}",
+                        //         idx,
+                        //         addr,
+                        //     );
+                        // } else {
+                        //     litebox::log_println!(
+                        //         litebox_platform_multiplex::platform(),
+                        //         "output (index: {}): {:#x} {:?} (up to 16 bytes)",
+                        //         idx,
+                        //         addr,
+                        //         &slice[..slice.len().min(16)]
+                        //     );
+                        // }
                         if !slice.is_empty()
                             && let Some(out_addr) = &cmd_result.out_addrs[idx]
                         {

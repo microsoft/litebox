@@ -135,7 +135,7 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> u32 {
         .get()
         .expect("Syscall handler should be initialized");
 
-    debug_serial_println!("sysnr = {:#x}, ctx_raw = {:#x}", sysnr, ctx_raw as usize);
+    // debug_serial_println!("sysnr = {:#x}, ctx_raw = {:#x}", sysnr, ctx_raw as usize);
     let ctx_raw = unsafe { &*ctx_raw };
 
     assert!(

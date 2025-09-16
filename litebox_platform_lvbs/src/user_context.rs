@@ -226,13 +226,13 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
             user_ctx.rsp = user_stack_ptr;
             user_ctx.rip = user_ret_addr;
             user_ctx.rflags = rflags;
-            debug_serial_println!(
-                "Updated user context (ID: {}): RIP={:#x}, RSP={:#x}, RFLAGS={:#x}",
-                id,
-                user_ctx.rip.as_u64(),
-                user_ctx.rsp.as_u64(),
-                user_ctx.rflags.bits(),
-            );
+            // debug_serial_println!(
+            //     "Updated user context (ID: {}): RIP={:#x}, RSP={:#x}, RFLAGS={:#x}",
+            //     id,
+            //     user_ctx.rip.as_u64(),
+            //     user_ctx.rsp.as_u64(),
+            //     user_ctx.rflags.bits(),
+            // );
             return Ok(());
             // }
         }
