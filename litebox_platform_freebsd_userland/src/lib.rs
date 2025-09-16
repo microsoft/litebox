@@ -200,6 +200,7 @@ impl FreeBSDUserland {
             clear_child_tid: None,
             robust_list: None,
             credentials: alloc::sync::Arc::new(Self::get_user_info()),
+            comm: [0; litebox_common_linux::TASK_COMM_LEN],
         });
 
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);

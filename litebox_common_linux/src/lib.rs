@@ -1156,6 +1156,9 @@ impl<Platform: litebox::platform::RawPointerProvider> ThreadLocalStorage<Platfor
     }
 }
 
+/// Task command name length
+pub const TASK_COMM_LEN: usize = 16;
+
 pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     /// Process ID
     pub pid: i32,
@@ -1178,6 +1181,8 @@ pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     pub robust_list: Option<Platform::RawConstPointer<RobustListHead<Platform>>>,
     /// Shared process credentials.
     pub credentials: alloc::sync::Arc<Credentials>,
+    /// Command name (usually the executable name, excluding the path)
+    pub comm: [u8; TASK_COMM_LEN],
 }
 
 #[repr(C)]
@@ -1503,6 +1508,67 @@ pub enum FutexArgs<Platform: litebox::platform::RawPointerProvider> {
         flags: FutexFlags,
         count: u32,
     },
+}
+
+#[non_exhaustive]
+#[repr(u32)]
+#[derive(Debug, IntEnum)]
+pub enum PrctlOption {
+    SetPDeathSig = 1,
+    GetPDeathSig = 2,
+    GetDumpable = 3,
+    SetDumpable = 4,
+    GetUnaligned = 5,
+    SetUnaligned = 6,
+    GetKeepCaps = 7,
+    SetKeepCaps = 8,
+    GetFpEmu = 9,
+    SetFpEmu = 10,
+    GetFpExc = 11,
+    SetFpExc = 12,
+    GetTiming = 13,
+    SetTiming = 14,
+    /// Set process name
+    SetName = 15,
+    /// Get process name
+    GetName = 16,
+    GetEndian = 19,
+    SetEndian = 20,
+    GetSeccomp = 21,
+    SetSeccomp = 22,
+    CapBSetRead = 23,
+    CapBSetDrop = 24,
+    GetTSC = 25,
+    SetTSC = 26,
+    GetSecureBits = 27,
+    SetSecureBits = 28,
+    SetTimerSlack = 29,
+    GetTimerSlack = 30,
+    TaskPerfEventDisable = 31,
+    TaskPerfEventEnable = 32,
+    MceKill = 33,
+    GetMceKill = 34,
+    SetMMap = 35,
+    SetChildSubreaper = 36,
+    GetChildSubreaper = 37,
+    SetNoNewPrivs = 38,
+    GetNoNewPrivs = 39,
+    GetTidAddress = 40,
+    SetThpDisable = 41,
+    GetThpDisable = 42,
+    // No longer implemented, but left here to ensure the numbers stay reserved:
+    // MpxEnableManagement = 43,
+    // MpxDisableManagement = 44,
+    SetFpMode = 45,
+    GetFpMode = 46,
+    CapAmbient = 47,
+}
+
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum PrctlArg<Platform: litebox::platform::RawPointerProvider> {
+    SetName(Platform::RawConstPointer<u8>),
+    GetName(Platform::RawMutPointer<u8>),
 }
 
 /// Request to syscall handler
@@ -1854,6 +1920,9 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     Umask {
         mask: u32,
     },
+    Prctl {
+        args: PrctlArg<Platform>,
+    },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
 }
@@ -2185,6 +2254,25 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 }
             }
             Sysno::epoll_create1 => sys_req!(EpollCreate { flags }),
+            Sysno::prctl => {
+                let op: u32 = ctx.sys_req_arg(0);
+                if let Ok(op) = PrctlOption::try_from(op) {
+                    match op {
+                        PrctlOption::SetName => SyscallRequest::Prctl {
+                            args: PrctlArg::SetName(ctx.sys_req_ptr(1)),
+                        },
+                        PrctlOption::GetName => SyscallRequest::Prctl {
+                            args: PrctlArg::GetName(ctx.sys_req_ptr(1)),
+                        },
+                        _ => {
+                            // We don't yet support any other prctl operations.
+                            unimplemented!("Unsupported prctl operation: {op:?}")
+                        }
+                    }
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
+            }
             Sysno::arch_prctl => {
                 let code: u32 = ctx.sys_req_arg(0);
                 if let Ok(code) = ArchPrctlCode::try_from(code) {

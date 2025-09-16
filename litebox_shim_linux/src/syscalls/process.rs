@@ -13,11 +13,49 @@ use litebox::platform::{
 };
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{ArchPrctlArg, errno::Errno};
-use litebox_common_linux::{CloneFlags, FutexArgs};
+use litebox_common_linux::{CloneFlags, FutexArgs, PrctlArg};
 
 /// A global counter for the number of threads in the system.
 pub(super) static NR_THREADS: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(1);
 
+/// Set the current task's command name.
+pub fn set_task_comm(comm: &[u8]) {
+    litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| {
+        let comm = &comm[..comm.len().min(litebox_common_linux::TASK_COMM_LEN - 1)];
+        tls.current_task.comm[..comm.len()].copy_from_slice(comm);
+    });
+}
+
+/// Handle syscall `prctl`.
+pub(crate) fn sys_prctl(
+    arg: PrctlArg<litebox_platform_multiplex::Platform>,
+) -> Result<usize, Errno> {
+    match arg {
+        PrctlArg::GetName(name) => litebox_platform_multiplex::platform()
+            .with_thread_local_storage_mut(|tls| {
+                unsafe { name.write_slice_at_offset(0, &tls.current_task.comm) }
+                    .ok_or(Errno::EFAULT)
+            })
+            .map(|()| 0),
+        PrctlArg::SetName(name) => {
+            let mut name_buf = [0u8; litebox_common_linux::TASK_COMM_LEN - 1];
+            // strncpy
+            for (i, byte) in name_buf.iter_mut().enumerate() {
+                let b = *unsafe { name.read_at_offset(isize::try_from(i).unwrap()) }
+                    .ok_or(Errno::EFAULT)?;
+                if b == 0 {
+                    break;
+                }
+                *byte = b;
+            }
+            set_task_comm(&name_buf);
+            Ok(0)
+        }
+        _ => unimplemented!(),
+    }
+}
+
+/// Handle syscall `arch_prctl`.
 pub(crate) fn sys_arch_prctl(
     arg: ArchPrctlArg<litebox_platform_multiplex::Platform>,
 ) -> Result<(), Errno> {
@@ -301,11 +339,12 @@ pub(crate) fn sys_clone(
     }
 
     let platform = litebox_platform_multiplex::platform();
-    let (credentials, pid, parent_proc_id) = platform.with_thread_local_storage_mut(|tls| {
+    let (credentials, pid, parent_proc_id, comm) = platform.with_thread_local_storage_mut(|tls| {
         (
             tls.current_task.credentials.clone(),
             tls.current_task.pid,
             tls.current_task.ppid,
+            tls.current_task.comm,
         )
     });
     let child_tid = unsafe {
@@ -332,6 +371,7 @@ pub(crate) fn sys_clone(
                     },
                     robust_list: None,
                     credentials,
+                    comm,
                 }),
                 callback: new_thread_callback,
             }),
@@ -789,7 +829,7 @@ pub(crate) fn sys_execve(
     let Some(path_cstr) = pathname.to_cstring() else {
         return Err(Errno::EFAULT);
     };
-    let path = path_cstr.to_str().map_err(|_| Errno::ENOENT)?; // simplistic
+    let path = path_cstr.to_str().map_err(|_| Errno::ENOENT)?;
 
     // Copy argv and envp vectors
     let argv_vec = if argv.as_usize() == 0 {
@@ -1164,5 +1204,60 @@ mod tests {
             .map(|b| b.count_ones() as usize)
             .sum();
         assert_eq!(ones, super::NR_CPUS);
+    }
+
+    #[test]
+    fn test_prctl_set_get_name() {
+        crate::syscalls::tests::init_platform(None);
+
+        // Prepare a null-terminated name to set
+        let name: &[u8] = b"litebox-test\0";
+
+        // Call prctl(PR_SET_NAME, set_buf)
+        let set_ptr = crate::ConstPtr {
+            inner: name.as_ptr(),
+        };
+        super::sys_prctl(litebox_common_linux::PrctlArg::SetName(set_ptr))
+            .expect("sys_prctl SetName failed");
+
+        // Prepare buffer for prctl(PR_GET_NAME, get_buf)
+        let mut get_buf = [0u8; litebox_common_linux::TASK_COMM_LEN];
+        let get_ptr = crate::MutPtr {
+            inner: get_buf.as_mut_ptr(),
+        };
+
+        super::sys_prctl(litebox_common_linux::PrctlArg::GetName(get_ptr))
+            .expect("sys_prctl GetName failed");
+        assert_eq!(
+            &get_buf[..name.len()],
+            name,
+            "prctl get_name returned unexpected comm"
+        );
+
+        // Test too long name
+        let long_name = [b'a'; litebox_common_linux::TASK_COMM_LEN + 10];
+        let long_name_ptr = crate::ConstPtr {
+            inner: long_name.as_ptr(),
+        };
+        super::sys_prctl(litebox_common_linux::PrctlArg::SetName(long_name_ptr))
+            .expect("sys_prctl SetName failed");
+
+        // Get the name again
+        let mut get_buf = [0u8; litebox_common_linux::TASK_COMM_LEN];
+        let get_ptr = crate::MutPtr {
+            inner: get_buf.as_mut_ptr(),
+        };
+        super::sys_prctl(litebox_common_linux::PrctlArg::GetName(get_ptr))
+            .expect("sys_prctl GetName failed");
+        assert_eq!(
+            get_buf[litebox_common_linux::TASK_COMM_LEN - 1],
+            0,
+            "prctl get_name did not null-terminate the comm"
+        );
+        assert_eq!(
+            &get_buf[..litebox_common_linux::TASK_COMM_LEN - 1],
+            &long_name[..litebox_common_linux::TASK_COMM_LEN - 1],
+            "prctl get_name returned unexpected comm for too long name"
+        );
     }
 }

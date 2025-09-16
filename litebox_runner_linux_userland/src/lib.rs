@@ -297,6 +297,8 @@ fn load_program(
         envp.push(c"LD_AUDIT=/lib/litebox_rtld_audit.so".into());
     }
     let loaded_program = litebox_shim_linux::loader::load_program(path, argv, envp, aux).unwrap();
+    let comm = path.rsplit('/').next().unwrap_or("unknown");
+    litebox_shim_linux::syscalls::process::set_task_comm(comm.as_bytes());
     unsafe {
         trampoline::jump_to_entry_point(loaded_program.entry_point, loaded_program.user_stack_top)
     }

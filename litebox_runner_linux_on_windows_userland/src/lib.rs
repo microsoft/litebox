@@ -253,6 +253,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     )
     .unwrap();
 
+    let comm = prog_unix_path.rsplit('/').next().unwrap_or("unknown");
+    litebox_shim_linux::syscalls::process::set_task_comm(comm.as_bytes());
+
     unsafe {
         trampoline::jump_to_entry_point(loaded_program.entry_point, loaded_program.user_stack_top)
     }
