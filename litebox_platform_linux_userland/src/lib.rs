@@ -62,6 +62,35 @@ impl core::fmt::Debug for LinuxUserland {
     }
 }
 
+#[cfg(target_arch = "x86")]
+macro_rules! debug_print {
+    ($s:expr) => {
+        let _ = unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::write,
+                litebox_common_linux::STDERR_FILENO as usize,
+                $s.as_ptr() as usize,
+                $s.len(),
+                // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                syscall_intercept::SYSCALL_ARG_MAGIC,
+            )
+        };
+    };
+}
+
+#[cfg(target_arch = "x86")]
+macro_rules! litebox_panic {
+    () => {{
+        debug_print!("panic");
+        panic!();
+    }};
+    ($($arg:tt)+) => {{
+        let arg = format_args!($($arg)+).to_string();
+        debug_print!(arg);
+        panic!();
+    }};
+}
+
 const IF_NAMESIZE: usize = 16;
 /// Use TUN device
 const IFF_TUN: i32 = 0x0001;
@@ -1610,7 +1639,9 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
         let user_desc_ptr = litebox::platform::trivial_providers::TransparentMutPtr {
             inner: &raw mut user_desc,
         };
-        set_thread_area(user_desc_ptr).expect("Failed to set thread area for TLS");
+        if let Err(e) = set_thread_area(user_desc_ptr) {
+            litebox_panic!("set_thread_area failed: {e}");
+        }
 
         assert!(user_desc.entry_number <= 0xfff);
         self.tls_entry_number.store(
