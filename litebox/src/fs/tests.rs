@@ -1499,6 +1499,153 @@ mod layered {
         assert_eq!(&buffer[..bytes_read], b"new content");
         fs.close(fd).expect("Failed to close file");
     }
+
+    #[test]
+    fn rmdir_upper_only_directory() {
+        use crate::fs::errors::{PathError, RmdirError};
+
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        // Prepare upper with permissive root
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("chmod / failed");
+        });
+
+        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Create an empty directory only in upper layer
+        fs.mkdir("/upper_empty", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .expect("mkdir upper_empty failed");
+
+        // Remove it
+        fs.rmdir("/upper_empty")
+            .expect("rmdir upper_empty should succeed");
+
+        // Verify it no longer exists
+        assert!(matches!(
+            fs.file_status("/upper_empty"),
+            Err(crate::fs::errors::FileStatusError::PathError(
+                PathError::NoSuchFileOrDirectory
+            ))
+        ));
+
+        // Second removal should yield NoSuchFileOrDirectory (path error)
+        assert!(matches!(
+            fs.rmdir("/upper_empty"),
+            Err(RmdirError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+    }
+
+    #[test]
+    fn rmdir_upper_directory_not_empty_then_empty() {
+        use crate::fs::errors::{PathError, RmdirError};
+
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO).unwrap();
+        });
+        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        fs.mkdir("/upper_dir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .expect("mkdir upper_dir failed");
+
+        // Create a file inside making directory non-empty
+        let fd = fs
+            .open(
+                "/upper_dir/file",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXU | Mode::RWXG,
+            )
+            .expect("create file in upper_dir failed");
+        fs.close(fd).unwrap();
+
+        // Attempt to remove while non-empty
+        assert!(matches!(fs.rmdir("/upper_dir"), Err(RmdirError::NotEmpty)));
+
+        // Remove inner file
+        fs.unlink("/upper_dir/file").expect("unlink inner failed");
+
+        // Now should succeed
+        fs.rmdir("/upper_dir")
+            .expect("rmdir upper_dir should succeed");
+
+        // Confirm gone
+        assert!(matches!(
+            fs.file_status("/upper_dir"),
+            Err(crate::fs::errors::FileStatusError::PathError(
+                PathError::NoSuchFileOrDirectory
+            ))
+        ));
+    }
+
+    #[test]
+    fn rmdir_lower_directory_non_empty() {
+        use crate::fs::errors::RmdirError;
+
+        let litebox = LiteBox::new(MockPlatform::new());
+        let upper = in_mem::FileSystem::new(&litebox); // empty
+        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // "bar" exists in lower layer and contains "baz" (non-empty)
+        assert!(matches!(fs.rmdir("bar"), Err(RmdirError::NotEmpty)));
+    }
+
+    #[test]
+    fn rmdir_not_a_directory() {
+        use crate::fs::errors::RmdirError;
+
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO).unwrap();
+        });
+        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Create a regular file (upper only)
+        let fd = fs
+            .open(
+                "/regular_file",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXU | Mode::RWXG,
+            )
+            .expect("create file failed");
+        fs.close(fd).unwrap();
+
+        // rmdir should fail with NotADirectory
+        assert!(matches!(
+            fs.rmdir("/regular_file"),
+            Err(RmdirError::NotADirectory)
+        ));
+    }
 }
 
 mod stdio {
