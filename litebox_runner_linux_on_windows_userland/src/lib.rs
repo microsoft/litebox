@@ -9,7 +9,7 @@ use clap::Parser;
 use litebox::fs::FileSystem as _;
 use litebox_platform_multiplex::Platform;
 use std::os::windows::fs::MetadataExt;
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Convert Windows file permissions and owner ID to LiteBox internal
 fn get_file_mode_and_uid(metadata: &std::fs::Metadata) -> (litebox::fs::Mode, u32) {
@@ -104,7 +104,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     let (ancestor_modes_and_users, prog_data): (Vec<(litebox::fs::Mode, u32)>, Vec<u8>) = {
-        let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
+        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0]))?;
         let ancestors: Vec<_> = prog.ancestors().collect();
         let modes: Vec<_> = ancestors
             .into_iter()
@@ -131,7 +131,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let platform = Platform::new();
     litebox_platform_multiplex::set_platform(platform);
     let litebox = litebox_shim_linux::litebox();
-    let prog = PathBuf::from(&cli_args.program_and_arguments[0]);
+    let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0]))?;
     let prog_unix_path = windows_path_to_unix(&prog);
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
