@@ -250,6 +250,9 @@ jobs:
           #   it is a helper binary that runs in userland to AOT "compile" ELFs.
           #
           # - `litebox_runner_snp` is `no_std` but requires custom target to build
+          #
+          # - `dev_tests` is meant to only be used for tests, and thus can
+          #   safely use std.
           find . -type f -name 'Cargo.toml' \
             -not -path './Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
@@ -265,5 +268,6 @@ jobs:
             -not -path './litebox_shim_optee/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
             -not -path './litebox_runner_snp/Cargo.toml' \
+            -not -path './dev_tests/Cargo.toml' \
             -print0 | \
               xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --target x86_64-unknown-none || exit 1; echo; echo'
