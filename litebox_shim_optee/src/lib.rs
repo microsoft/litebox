@@ -468,7 +468,7 @@ pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
         // for each command freely.
         let mut stack = crate::loader::ta_stack::allocate_stack(Some(elf_load_info.stack_base))
             .unwrap_or_else(|| {
-                panic!("Failed to allocate stack for session ID: {}", session_id);
+                panic!("Failed to allocate stack");
             });
         stack
             .init(cmd.params.as_slice())
