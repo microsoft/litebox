@@ -20,7 +20,6 @@ buddy_system_allocator = { version = "0.11.0", default-features = false, feature
 slabmalloc = { git = "https://github.com/gz/rust-slabmalloc.git", rev = "19480b2e82704210abafe575fb9699184c1be110" }
 
 [features]
-default = ["enforce_singleton_litebox_instance"]
 lock_tracing = ["dep:arrayvec", "spin/mutex"]
 panic_on_unclosed_fd_drop = []
 enforce_singleton_litebox_instance = []
