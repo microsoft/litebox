@@ -161,6 +161,9 @@ pub extern "C" fn sandbox_process_init(
         }
     };
 
+    let comm = program.rsplit('/').next().unwrap_or("unknown");
+    litebox_shim_linux::syscalls::process::set_task_comm(comm.as_bytes());
+
     pt_regs.rip = loaded_program.entry_point;
     pt_regs.rsp = loaded_program.user_stack_top;
     pt_regs.rdx = 0;

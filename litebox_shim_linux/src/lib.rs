@@ -581,6 +581,7 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
             sigmask,
             sigsetsize,
         } => syscalls::file::sys_epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize),
+        SyscallRequest::Prctl { args } => syscalls::process::sys_prctl(args),
         SyscallRequest::ArchPrctl { arg } => syscalls::process::sys_arch_prctl(arg).map(|()| 0),
         SyscallRequest::Readlink {
             pathname,

@@ -105,6 +105,7 @@ impl SnpLinuxKernel {
                 euid: boot_params.euid as usize,
                 egid: boot_params.egid as usize,
             }),
+            comm: [0; litebox_common_linux::TASK_COMM_LEN],
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         self.set_thread_local_storage(tls);
