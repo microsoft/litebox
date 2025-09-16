@@ -36,3 +36,23 @@ fn ratchet_transmutes() -> Result<()> {
             .count())
     })
 }
+
+#[test]
+fn ratchet_globals() -> Result<()> {
+    ratchet(57, |file| {
+        Ok(file
+            .lines()
+            .filter(|line| {
+                // Heuristic: detect "static" at the start of a line, excluding whitespace. This should
+                // prevent us from accidentally including code that contains the word in a comment, or
+                // is referring to the `'static` lifetime.
+                let trimmed = line.as_ref().unwrap().trim_start();
+                trimmed.starts_with("static ")
+                    || trimmed.split_once(' ').is_some_and(|(a, b)| {
+                        // Account for `pub`, `pub(crate)`, ...
+                        a.starts_with("pub") && b.starts_with("static ")
+                    })
+            })
+            .count())
+    })
+}
