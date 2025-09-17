@@ -1,7 +1,10 @@
 mod cache;
 mod common;
 
-use std::{os::unix::process::ExitStatusExt as _, path::{Path, PathBuf}};
+use std::{
+    os::unix::process::ExitStatusExt as _,
+    path::{Path, PathBuf},
+};
 
 #[allow(dead_code)]
 enum Backend {
