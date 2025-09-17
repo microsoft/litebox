@@ -487,6 +487,7 @@ impl PollSet {
                         entry.observer = Some(observer);
                         Some(weak as _)
                     };
+                    // TODO: add machinery to unregister the observer to avoid leaks.
                     file.poll(entry.mask, observer)
                 } else {
                     Events::NVAL
