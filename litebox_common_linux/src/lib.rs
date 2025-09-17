@@ -1123,7 +1123,9 @@ pub type ThreadLocalDescriptor = u8;
 #[cfg(target_arch = "x86")]
 pub type ThreadLocalDescriptor = UserDesc;
 
-pub struct NewThreadArgs<Platform: litebox::platform::RawPointerProvider> {
+pub struct NewThreadArgs<
+    Platform: litebox::platform::RawPointerProvider + litebox::sync::RawSyncPrimitivesProvider,
+> {
     /// Pointer to thread-local storage (TLS) given by the guest program
     pub tls: Option<Platform::RawMutPointer<ThreadLocalDescriptor>>,
     /// Where to store child TID in child's memory
@@ -1132,7 +1134,7 @@ pub struct NewThreadArgs<Platform: litebox::platform::RawPointerProvider> {
     /// will wait until the parent signals the gate before proceeding with running
     /// the guest thread entry. This avoids races when the parent wants to write
     /// its child-tid (parent_tid) into parent memory after spawn.
-    pub start_gate: Option<alloc::sync::Arc<core::sync::atomic::AtomicU32>>,
+    pub start_gate: Option<alloc::sync::Arc<litebox::sync::Mutex<Platform, ()>>>,
     /// Task struct that maintains all per-thread data
     pub task: alloc::boxed::Box<Task<Platform>>,
     /// A callback function that *MUST* be called when the thread is created.

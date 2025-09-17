@@ -272,10 +272,7 @@ fn new_thread_callback(
 
     // Wait for parent to write parent_tid if a start gate is present.
     if let Some(gate) = start_gate {
-        // gate value 0 = locked, non-zero = go.
-        while gate.load(core::sync::atomic::Ordering::Acquire) == 0 {
-            core::hint::spin_loop();
-        }
+        let _ = gate.lock();
     }
 
     // Set the TLS for the platform itself
@@ -373,14 +370,18 @@ pub(crate) fn sys_clone(
         None
     };
 
-    // Create an optional start gate when parent_tid and child_tid point to the same address.
+    // Create an optional `guard` when parent_tid and child_tid point to the same address.
     // Clearing child_tid is always done after setting parent_tid, so this ensures these two
     // operations occur in order if they are on the same address.
-    let start_gate = if let Some(parent_tid_ptr) = set_parent_tid
+    let start_gate = alloc::sync::Arc::new(crate::litebox().sync().new_mutex(()));
+    let start_gate_clone = start_gate.clone();
+    let guard = if let Some(parent_tid_ptr) = set_parent_tid
         && let Some(child_tid_ptr) = clear_child_tid
         && parent_tid_ptr.as_usize() == child_tid_ptr.as_usize()
     {
-        Some(alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(0)))
+        // Lock the mutex before creating the thread, so that the new thread will block on it
+        // until this function returns (i.e., guard is dropped).
+        Some(start_gate.lock())
     } else {
         None
     };
@@ -394,7 +395,11 @@ pub(crate) fn sys_clone(
             Box::new(litebox_common_linux::NewThreadArgs {
                 tls,
                 set_child_tid,
-                start_gate: start_gate.clone(),
+                start_gate: if guard.is_some() {
+                    Some(start_gate_clone)
+                } else {
+                    None
+                },
                 task: Box::new(litebox_common_linux::Task {
                     pid,
                     tid: 0, // The actual TID will be set by the platform
@@ -410,11 +415,6 @@ pub(crate) fn sys_clone(
     }?;
     if let Some(parent_tid_ptr) = set_parent_tid {
         let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid.truncate()) };
-    }
-
-    // Signal the child to start now that parent tid was written (if we created a gate).
-    if let Some(gate) = start_gate {
-        gate.store(1, core::sync::atomic::Ordering::SeqCst);
     }
 
     NR_THREADS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
