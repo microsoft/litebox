@@ -8,6 +8,7 @@ use alloc::{
 use litebox::{
     LiteBox,
     event::{Events, IOPollable, observer::Observer, polling::Pollee},
+    platform::{Instant as _, RawMutex as _, RawMutexProvider as _, TimeProvider as _},
     utils::ReinterpretUnsignedExt,
 };
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
@@ -416,7 +417,7 @@ struct PollEntry {
     observer: Option<Arc<PollEntryObserver>>,
 }
 
-struct PollEntryObserver(Arc<Pollee<Platform>>);
+struct PollEntryObserver(Arc<<Platform as litebox::platform::RawMutexProvider>::RawMutex>);
 
 /// Trait for testing `PollSet`.
 pub(crate) trait GetFd {
@@ -449,78 +450,80 @@ impl PollSet {
         });
     }
 
+    /// Waits for any of the fds in the poll set to become ready, or until the
+    /// timeout expires.
     pub fn wait_or_timeout<T: GetFd>(
         &mut self,
         mut lock_fds: impl FnMut() -> T,
         timeout: Option<Duration>,
     ) {
-        // Fast path when timeout is zero: just poll all fds once and return.
-        if timeout.is_some_and(|t| t.is_zero()) {
-            let fds = lock_fds();
+        extern crate std;
+        let platform = litebox_platform_multiplex::platform();
+        let condvar = Arc::new(platform.new_raw_mutex());
+
+        let start_time = platform.now();
+        let mut register = true;
+        let mut is_ready = timeout.is_some_and(|t| t.is_zero());
+        loop {
+            let mut fds = lock_fds();
             for entry in &mut self.entries {
                 entry.revents = if entry.fd < 0 {
                     continue;
                 } else if let Some(file) = fds.get_fd(entry.fd) {
-                    file.poll(entry.mask, None)
+                    let observer = if is_ready || !register {
+                        // The poll set is already ready, or we have already
+                        // registered the observer for this entry.
+                        None
+                    } else {
+                        // TODO: a separate allocation is necessary here
+                        // because registering an observer twice with two
+                        // different event masks results in the last one
+                        // replacing the first. If this is changed to
+                        // instead OR the new registration into the existing
+                        // one, then we can use a single observer for all
+                        // entries.
+                        let observer = Arc::new(PollEntryObserver(condvar.clone()));
+                        let weak = Arc::downgrade(&observer);
+                        entry.observer = Some(observer);
+                        Some(weak as _)
+                    };
+                    file.poll(entry.mask, observer)
                 } else {
                     Events::NVAL
                 };
-            }
-            return;
-        }
-
-        let pollee = Arc::new(litebox::event::polling::Pollee::new(crate::litebox()));
-        let r = pollee.wait_or_timeout(
-            timeout,
-            || {
-                let mut is_ready = false;
-                let mut register = true;
-                let fds = lock_fds();
-                for entry in &mut self.entries {
-                    entry.revents = if entry.fd < 0 {
-                        continue;
-                    } else if let Some(file) = fds.get_fd(entry.fd) {
-                        let observer = if is_ready || !register {
-                            // The poll set is already ready, or we have already
-                            // registered the observer for this entry.
-                            None
-                        } else {
-                            // TODO: a separate allocation is necessary here
-                            // because registering an observer twice with two
-                            // different event masks results in the last one
-                            // replacing the first. If this is changed to
-                            // instead OR the new registration into the existing
-                            // one, then we can use a single observer for all
-                            // entries.
-                            let observer = Arc::new(PollEntryObserver(pollee.clone()));
-                            let weak = Arc::downgrade(&observer);
-                            entry.observer = Some(observer);
-                            Some(weak as _)
-                        };
-                        file.poll(entry.mask, observer)
-                    } else {
-                        Events::NVAL
-                    };
-                    if !entry.revents.is_empty() {
-                        is_ready = true;
-                        register = false;
-                    }
-                }
-                if is_ready {
-                    Ok::<_, litebox::event::polling::TryOpError<core::convert::Infallible>>(())
-                } else {
+                if !entry.revents.is_empty() {
+                    is_ready = true;
                     register = false;
-                    Err(litebox::event::polling::TryOpError::TryAgain)
                 }
-            },
-            || false,
-        );
-        match r {
-            Ok(()) | Err(litebox::event::polling::TryOpError::TimedOut) => {}
-            Err(litebox::event::polling::TryOpError::TryAgain) => unreachable!(),
+            }
+
+            if is_ready {
+                break;
+            }
+
+            let remaining_time =
+                timeout.map(|t| t.saturating_sub(platform.now().duration_since(&start_time)));
+            if let Some(remaining_time) = remaining_time {
+                if matches!(
+                    condvar.block_or_timeout(0, remaining_time),
+                    Ok(litebox::platform::UnblockedOrTimedOut::TimedOut),
+                ) {
+                    // Timed out. Loop around once more to check if any fds are
+                    // ready, to match Linux behavior.
+                    is_ready = true;
+                }
+            } else {
+                condvar.block(0);
+            }
+            condvar
+                .underlying_atomic()
+                .store(0, core::sync::atomic::Ordering::Relaxed);
         }
     }
 
+    /// Returns the accumulated `revents` for each entry in the poll set.
+    ///
+    /// These are only valid after a call to `wait_or_timeout`.
     pub fn revents(&self) -> impl Iterator<Item = Events> + '_ {
         self.entries.iter().map(|entry| entry.revents)
     }
@@ -528,7 +531,10 @@ impl PollSet {
 
 impl Observer<Events> for PollEntryObserver {
     fn on_events(&self, events: &Events) {
-        self.0.notify_observers(Events::IN);
+        self.0
+            .underlying_atomic()
+            .store(1, core::sync::atomic::Ordering::Release);
+        self.0.wake_one();
     }
 }
 
@@ -615,6 +621,28 @@ mod test {
 
     #[test]
     fn test_poll() {
+        #[derive(Copy, Clone)]
+        struct Fds<'a>(i32, Option<&'a crate::Descriptor>);
+
+        impl super::GetFd for Fds<'_> {
+            fn get_fd(&self, n: i32) -> Option<&crate::Descriptor> {
+                if n == self.0 { self.1 } else { None }
+            }
+        }
+
+        struct FdsOnce<'a>(core::cell::Cell<Option<i32>>, Option<&'a crate::Descriptor>);
+
+        impl super::GetFd for &FdsOnce<'_> {
+            fn get_fd(&self, n: i32) -> Option<&crate::Descriptor> {
+                if Some(n) == self.0.get() {
+                    self.0.set(None);
+                    self.1
+                } else {
+                    None
+                }
+            }
+        }
+
         crate::syscalls::tests::init_platform(None);
 
         let mut set = super::PollSet::with_capacity(0);
@@ -624,24 +652,15 @@ mod test {
             crate::litebox(),
         ));
 
-        struct Fds(i32, Option<crate::Descriptor>);
+        let fd = 10;
+        let descriptor = crate::Descriptor::Eventfd {
+            file: eventfd.clone(),
+            close_on_exec: core::sync::atomic::AtomicBool::new(false),
+        };
 
-        impl super::GetFd for &Fds {
-            fn get_fd(&self, n: i32) -> Option<&crate::Descriptor> {
-                if n == self.0 { self.1.as_ref() } else { None }
-            }
-        }
-
-        const FD: i32 = 10;
-        let fds = Fds(
-            FD,
-            Some(crate::Descriptor::Eventfd {
-                file: eventfd.clone(),
-                close_on_exec: core::sync::atomic::AtomicBool::new(false),
-            }),
-        );
-
-        set.add_fd(FD, Events::IN);
+        let no_fds = Fds(-1, None);
+        let fds = Fds(fd, Some(&descriptor));
+        set.add_fd(fd, Events::IN);
 
         let revents = |set: &super::PollSet| {
             let revents: std::vec::Vec<_> = set.revents().collect();
@@ -649,16 +668,20 @@ mod test {
             revents[0]
         };
 
-        set.wait_or_timeout(|| &Fds(0, None), None);
+        set.wait_or_timeout(|| no_fds, None);
         assert_eq!(revents(&set), Events::NVAL);
 
         eventfd.write(1).unwrap();
-        set.wait_or_timeout(|| &fds, None);
+        set.wait_or_timeout(|| fds, None);
         assert_eq!(revents(&set), Events::IN);
 
         eventfd.read().unwrap();
-        set.wait_or_timeout(|| &fds, Some(Duration::from_millis(100)));
+        set.wait_or_timeout(|| fds, Some(Duration::from_millis(100)));
         assert!(revents(&set).is_empty());
+
+        let once = FdsOnce(Some(fd).into(), Some(&descriptor));
+        set.wait_or_timeout(|| &once, Some(Duration::from_millis(100)));
+        assert_eq!(revents(&set), Events::NVAL);
 
         // spawn a thread to write to the eventfd
         let copied_eventfd = eventfd.clone();
@@ -666,7 +689,7 @@ mod test {
             copied_eventfd.write(1).unwrap();
         });
 
-        set.wait_or_timeout(|| &fds, None);
+        set.wait_or_timeout(|| fds, None);
         assert_eq!(revents(&set), Events::IN);
     }
 }
