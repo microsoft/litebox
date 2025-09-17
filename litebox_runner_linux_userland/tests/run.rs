@@ -137,7 +137,7 @@ fn run_target_program(
         .output()
         .expect("Failed to run litebox_runner_linux_userland");
     if !output.status.success() {
-        eprintln!("stdout:");
+        eprintln!("stdout: {}", output.status.code().unwrap_or(-1));
         eprintln!(
             "{}",
             std::string::String::from_utf8_lossy(output.stdout.as_slice())
