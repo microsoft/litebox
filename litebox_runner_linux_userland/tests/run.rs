@@ -1,7 +1,7 @@
 mod cache;
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::{os::unix::process::ExitStatusExt as _, path::{Path, PathBuf}};
 
 #[allow(dead_code)]
 enum Backend {
@@ -138,6 +138,9 @@ fn run_target_program(
         .expect("Failed to run litebox_runner_linux_userland");
     if !output.status.success() {
         eprintln!("stdout: {}", output.status.code().unwrap_or(-1));
+        if let Some(sig) = output.status.signal() {
+            eprintln!("terminated by signal: {sig}");
+        }
         eprintln!(
             "{}",
             std::string::String::from_utf8_lossy(output.stdout.as_slice())
