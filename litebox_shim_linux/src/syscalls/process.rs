@@ -380,7 +380,7 @@ pub(crate) fn sys_clone(
         && parent_tid_ptr.as_usize() == child_tid_ptr.as_usize()
     {
         // Lock the mutex before creating the thread, so that the new thread will block on it
-        // until this function returns (i.e., guard is dropped).
+        // until `guard` is dropped.
         Some(start_gate.lock())
     } else {
         None
@@ -416,6 +416,8 @@ pub(crate) fn sys_clone(
     if let Some(parent_tid_ptr) = set_parent_tid {
         let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid.truncate()) };
     }
+    // After parent_tid is set, we can drop the guard to let the new thread proceed.
+    drop(guard);
 
     NR_THREADS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Ok(child_tid)
