@@ -1,3 +1,4 @@
+mod cache;
 mod common;
 
 use std::ffi::CString;
@@ -294,27 +295,17 @@ fn test_syscall_rewriter() {
     // rewrite the hello_exec_nolibc
     let hooked_path = std::path::Path::new(dir_path.as_str()).join("hello_exec_nolibc.hooked");
     let _ = std::fs::remove_file(hooked_path.clone());
-    let output = std::process::Command::new("cargo")
-        .args([
-            "run",
-            "-p",
-            "litebox_syscall_rewriter",
-            "--",
+    let rewrite_success = common::rewrite_with_cache(
+        &path,
+        &hooked_path,
+        &[
             "--trampoline-addr",
             litebox_shim_linux::loader::REWRITER_MAGIC_NUMBER
                 .to_string()
                 .as_str(),
-            "-o",
-            hooked_path.to_str().unwrap(),
-            path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to run syscall rewriter");
-    assert!(
-        output.status.success(),
-        "failed to run syscall rewriter {:?}",
-        std::str::from_utf8(output.stderr.as_slice()).unwrap()
+        ],
     );
+    assert!(rewrite_success, "failed to run syscall rewriter");
 
     let executable_path = "/hello_exec_nolibc.hooked";
     let executable_data = std::fs::read(hooked_path).unwrap();
