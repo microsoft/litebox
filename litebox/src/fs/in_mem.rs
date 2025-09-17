@@ -311,13 +311,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             return Err(WriteError::NotForWriting);
         }
         let position = offset.as_mut().unwrap_or(position);
+        let end_position = position.checked_add(buf.len()).unwrap();
         let mut file = file.write();
         let start = if *position < file.data.len() {
             let start = *position;
-            let end = position
-                .checked_add(buf.len())
-                .unwrap()
-                .min(file.data.len());
+            let end = end_position.min(file.data.len());
             debug_assert!(start <= end);
             let first_half_len = end - start;
             file.data[start..end].copy_from_slice(&buf[..first_half_len]);
@@ -330,7 +328,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             0
         };
         file.data.extend(&buf[start..]);
-        *position = file.data.len();
+        *position = end_position;
         Ok(buf.len())
     }
 
