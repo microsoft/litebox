@@ -475,9 +475,11 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
                 "syscall",
                 "cmp rax, 0",
                 "jne 2f",
-                "push {0}", // push the return address
+                "push {0}",     // push the return address
+                "mov [{1} + {rsp_offset}], rsp", // save the current stack pointer to pt_regs.rsp
+                "and rsp, -16", // align stack to 16 bytes
+                "sub rsp, 8",   // offset by 8...
                 "mov rdi, {1}",
-                "mov [rdi + {rsp_offset}], rsp",    // save the current stack pointer to pt_regs.rsp
                 "mov rsi, {2}",
                 "jmp thread_start",
                 // should never return
