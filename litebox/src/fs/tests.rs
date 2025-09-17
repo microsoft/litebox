@@ -563,6 +563,63 @@ mod in_mem {
         assert_eq!(&buffer[..bytes_read], test_data);
         fs.close(fd).expect("Failed to close file");
     }
+
+    #[test]
+    fn write_position_after_seek() {
+        use crate::fs::SeekWhence;
+
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
+            // Allow regular user to create in root for this focused test
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("chmod / failed");
+        });
+
+        let fd = fs
+            .open(
+                "/posfile",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RWXU | Mode::RWXG | Mode::RWXO,
+            )
+            .expect("open failed");
+
+        // 1. First positional write; position should advance by 6.
+        fs.write(&fd, b"abcdef", None).expect("first write failed");
+
+        // 2. Rewind to beginning.
+        fs.seek(&fd, 0, SeekWhence::RelativeToBeginning)
+            .expect("seek failed");
+
+        // 3. Another positional write should write from start
+        fs.write(&fd, b"X", None).expect("overwrite failed");
+
+        // The file offset should now be at 2.
+        assert_eq!(
+            fs.seek(&fd, 0, SeekWhence::RelativeToCurrentOffset)
+                .expect("seek failed"),
+            1
+        );
+
+        // Read back whole file to verify content and length.
+        fs.seek(&fd, 0, SeekWhence::RelativeToBeginning)
+            .expect("seek failed");
+        let mut buf = [0u8; 16];
+        let n = fs.read(&fd, &mut buf, None).expect("read failed");
+        assert_eq!(n, 6, "file length should be 6 after writes");
+        assert_eq!(&buf[..n], b"Xbcdef", "file content mismatch");
+
+        // Extra: another append to verify continued correct advancement.
+        fs.write(&fd, b"12", None).expect("second append failed");
+        fs.seek(&fd, 0, SeekWhence::RelativeToBeginning)
+            .expect("seek 2 failed");
+        let mut buf2 = [0u8; 16];
+        let n2 = fs.read(&fd, &mut buf2, None).expect("read 2 failed");
+        assert_eq!(n2, 8);
+        assert_eq!(&buf2[..n2], b"Xbcdef12");
+
+        fs.close(fd).expect("close failed");
+    }
 }
 
 mod tar_ro {
