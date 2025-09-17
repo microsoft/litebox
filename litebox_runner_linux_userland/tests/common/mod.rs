@@ -51,6 +51,30 @@ pub fn find_dependencies(prog: &str) -> Vec<String> {
     paths
 }
 
+/// Find all Rust source files in the litebox_syscall_rewriter crate
+fn find_rewriter_source_files() -> Vec<PathBuf> {
+    let mut source_files = Vec::new();
+
+    // Get the absolute path to the workspace root, then to the rewriter crate
+    if let Ok(cargo_manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let workspace_root = std::path::Path::new(&cargo_manifest_dir).parent().unwrap();
+        let rewriter_dir = workspace_root.join("litebox_syscall_rewriter");
+        let pattern = format!("{}/**/*.rs", rewriter_dir.display());
+
+        if let Ok(paths) = glob(&pattern) {
+            for path in paths.flatten() {
+                if path.is_file() {
+                    source_files.push(path);
+                }
+            }
+        }
+    }
+
+    // Sort for consistent ordering
+    source_files.sort();
+    source_files
+}
+
 /// Compile C code into an executable with caching
 pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: bool) -> PathBuf {
     let dir_path = std::env::var("OUT_DIR").unwrap();
@@ -106,7 +130,14 @@ pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: boo
 
 /// Run syscall rewriter with caching
 pub fn rewrite_with_cache(input_path: &Path, output_path: &Path, extra_args: &[&str]) -> bool {
-    let input_paths = vec![input_path];
+    // Include both the input file and all rewriter source files in the cache key
+    let mut input_paths = vec![input_path];
+    let rewriter_sources = find_rewriter_source_files();
+    let rewriter_paths: Vec<&Path> = rewriter_sources
+        .iter()
+        .map(std::path::PathBuf::as_path)
+        .collect();
+    input_paths.extend(rewriter_paths);
 
     let mut args = vec!["run", "-p", "litebox_syscall_rewriter", "--"];
     args.extend_from_slice(extra_args);
@@ -121,8 +152,9 @@ pub fn rewrite_with_cache(input_path: &Path, output_path: &Path, extra_args: &[&
 
     if let Ok(true) = crate::cache::is_cached_and_valid(&input_paths, output_path, &command) {
         println!(
-            "Using cached rewriter result for: {}",
-            output_path.display()
+            "Using cached rewriter result for: {} (tracking {} rewriter source files)",
+            output_path.display(),
+            rewriter_sources.len()
         );
         return true;
     }
