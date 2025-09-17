@@ -265,9 +265,15 @@ fn new_thread_callback(
         task,
         tls,
         set_child_tid,
+        start_gate,
         callback: _,
     } = args;
     let child_tid = task.tid;
+
+    // Wait for parent to write parent_tid if a start gate is present.
+    if let Some(gate) = start_gate {
+        let _ = gate.lock();
+    }
 
     // Set the TLS for the platform itself
     let litebox_tls = litebox_common_linux::ThreadLocalStorage::new(task);
@@ -347,6 +353,39 @@ pub(crate) fn sys_clone(
             tls.current_task.comm,
         )
     });
+
+    let set_child_tid = if flags.contains(CloneFlags::CHILD_SETTID) {
+        child_tid
+    } else {
+        None
+    };
+    let clear_child_tid = if flags.contains(CloneFlags::CHILD_CLEARTID) {
+        child_tid
+    } else {
+        None
+    };
+    let set_parent_tid = if flags.contains(CloneFlags::PARENT_SETTID) {
+        parent_tid
+    } else {
+        None
+    };
+
+    // Create an optional `guard` when parent_tid and child_tid point to the same address.
+    // Clearing child_tid is always done after setting parent_tid, so this ensures these two
+    // operations occur in order if they are on the same address.
+    let start_gate = alloc::sync::Arc::new(crate::litebox().sync().new_mutex(()));
+    let start_gate_clone = start_gate.clone();
+    let guard = if let Some(parent_tid_ptr) = set_parent_tid
+        && let Some(child_tid_ptr) = clear_child_tid
+        && parent_tid_ptr.as_usize() == child_tid_ptr.as_usize()
+    {
+        // Lock the mutex before creating the thread, so that the new thread will block on it
+        // until `guard` is dropped.
+        Some(start_gate.lock())
+    } else {
+        None
+    };
+
     let child_tid = unsafe {
         platform.spawn_thread(
             ctx,
@@ -355,8 +394,9 @@ pub(crate) fn sys_clone(
             main,
             Box::new(litebox_common_linux::NewThreadArgs {
                 tls,
-                set_child_tid: if flags.contains(CloneFlags::CHILD_SETTID) {
-                    child_tid
+                set_child_tid,
+                start_gate: if guard.is_some() {
+                    Some(start_gate_clone)
                 } else {
                     None
                 },
@@ -364,11 +404,7 @@ pub(crate) fn sys_clone(
                     pid,
                     tid: 0, // The actual TID will be set by the platform
                     ppid: parent_proc_id,
-                    clear_child_tid: if flags.contains(CloneFlags::CHILD_CLEARTID) {
-                        child_tid
-                    } else {
-                        None
-                    },
+                    clear_child_tid,
                     robust_list: None,
                     credentials,
                     comm,
@@ -377,11 +413,12 @@ pub(crate) fn sys_clone(
             }),
         )
     }?;
-    if flags.contains(CloneFlags::PARENT_SETTID)
-        && let Some(parent_tid_ptr) = parent_tid
-    {
+    if let Some(parent_tid_ptr) = set_parent_tid {
         let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid.truncate()) };
     }
+    // After parent_tid is set, we can drop the guard to let the new thread proceed.
+    drop(guard);
+
     NR_THREADS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Ok(child_tid)
 }
