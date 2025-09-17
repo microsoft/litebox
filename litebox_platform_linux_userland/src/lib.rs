@@ -1474,8 +1474,7 @@ impl LinuxUserland {
     }
 
     #[cfg(target_arch = "x86_64")]
-    #[expect(clippy::unused_self, reason = "self is needed on x86")]
-    fn clear_thread_local_storage(&self) {
+    fn clear_thread_local_storage() {
         unsafe { litebox_common_linux::wrgsbase(0) };
     }
 
@@ -1507,7 +1506,7 @@ impl LinuxUserland {
     }
 
     #[cfg(target_arch = "x86")]
-    fn clear_thread_local_storage(&self) {
+    fn clear_thread_local_storage() {
         Self::set_fs_selector(0);
     }
 
@@ -1585,7 +1584,7 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
         let tls = Self::get_thread_local_storage();
         assert!(!tls.is_null(), "TLS must be set before releasing it");
-        self.clear_thread_local_storage();
+        Self::clear_thread_local_storage();
 
         // Ensure TLS is not borrowed.
         let _ = unsafe { (*tls).data.borrow_mut() };
