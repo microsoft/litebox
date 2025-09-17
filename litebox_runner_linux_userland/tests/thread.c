@@ -3,7 +3,7 @@
 #include <pthread.h>
 #include <unistd.h>
 
-#define NUM_THREADS 2
+#define NUM_THREADS 20
 
 // Thread function
 void* thread_func(void* arg) {

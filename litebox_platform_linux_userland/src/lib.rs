@@ -1509,10 +1509,6 @@ impl LinuxUserland {
     #[cfg(target_arch = "x86")]
     fn clear_thread_local_storage(&self) {
         Self::set_fs_selector(0);
-        clear_thread_area(
-            self.tls_entry_number
-                .swap(u32::MAX, core::sync::atomic::Ordering::SeqCst),
-        );
     }
 
     #[cfg(target_arch = "x86")]
