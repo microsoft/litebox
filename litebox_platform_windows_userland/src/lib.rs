@@ -751,7 +751,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     // NOTE: make sure the values are PAGE_ALIGNED.
     const TASK_ADDR_MIN: usize = 0x1_0000;
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
-    #[expect(clippy::too_many_lines)]
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,

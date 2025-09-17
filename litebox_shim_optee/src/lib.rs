@@ -60,7 +60,6 @@ type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPoin
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-#[allow(clippy::too_many_lines)]
 pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> u32 {
     let res: Result<(), TeeResult> = match request {
         SyscallRequest::Return { ret } => syscalls::tee::sys_return(ret),

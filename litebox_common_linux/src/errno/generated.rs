@@ -16,10 +16,6 @@ impl super::Errno {
     /// ```
     /// and very minor manual cleanup (combining same value numbers with `/`, as well as adding the
     /// fallthrough-unreachable case).
-    #[expect(
-        clippy::too_many_lines,
-        reason = "auto-generated code that needs to reference a large number of values"
-    )]
     pub const fn as_str(self) -> &'static str {
         match self.value.get() {
             1 => "EPERM: Operation not permitted",

@@ -356,7 +356,6 @@ impl ElfLoader {
     }
 
     /// Load an ELF file and prepare the stack for the new process.
-    #[allow(clippy::too_many_lines)]
     pub(super) fn load(
         path: &str,
         argv: Vec<CString>,

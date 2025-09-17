@@ -409,7 +409,6 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
     type ThreadId = usize;
 
-    #[expect(clippy::too_many_lines)]
     unsafe fn spawn_thread(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -794,7 +793,6 @@ pub struct PunchthroughToken {
 
 impl litebox::platform::PunchthroughToken for PunchthroughToken {
     type Punchthrough = PunchthroughSyscall<LinuxUserland>;
-    #[expect(clippy::too_many_lines)]
     fn execute(
         self,
     ) -> Result<

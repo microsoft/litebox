@@ -85,7 +85,6 @@ const TRAMPOLINE_SECTION_SIZE: usize = 0x18;
     clippy::missing_panics_doc,
     reason = "any panics in here are not part of the public contract and should be fixed within this module"
 )]
-#[allow(clippy::too_many_lines)]
 pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> Result<Vec<u8>> {
     let mut input_workaround: Vec<u64>;
     let input_binary: &[u8] = if (&raw const input_binary[0] as usize).is_multiple_of(8) {
@@ -284,7 +283,7 @@ enum Arch {
 }
 
 /// (private) Hook all syscalls in `section`, possibly extending `trampoline_data` to do so.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn hook_syscalls_in_section(
     arch: Arch,
     control_transfer_targets: &HashSet<u64>,
