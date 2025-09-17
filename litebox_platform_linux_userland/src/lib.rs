@@ -1555,7 +1555,7 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
             self_ptr: core::ptr::null_mut(),
             data: RefCell::new(tls),
         });
-        tls.self_ptr = &mut *tls;
+        tls.self_ptr = &raw const *tls;
 
         let mut flags = litebox_common_linux::UserDescFlags(0);
         flags.set_seg_32bit(true);
