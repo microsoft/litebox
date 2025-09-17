@@ -265,9 +265,18 @@ fn new_thread_callback(
         task,
         tls,
         set_child_tid,
+        start_gate,
         callback: _,
     } = args;
     let child_tid = task.tid;
+
+    // Wait for parent to write parent_tid if a start gate is present.
+    if let Some(gate) = start_gate {
+        // gate value 0 = locked, non-zero = go.
+        while gate.load(core::sync::atomic::Ordering::Acquire) == 0 {
+            core::hint::spin_loop();
+        }
+    }
 
     // Set the TLS for the platform itself
     let litebox_tls = litebox_common_linux::ThreadLocalStorage::new(task);
@@ -347,6 +356,35 @@ pub(crate) fn sys_clone(
             tls.current_task.comm,
         )
     });
+
+    let set_child_tid = if flags.contains(CloneFlags::CHILD_SETTID) {
+        child_tid
+    } else {
+        None
+    };
+    let clear_child_tid = if flags.contains(CloneFlags::CHILD_CLEARTID) {
+        child_tid
+    } else {
+        None
+    };
+    let set_parent_tid = if flags.contains(CloneFlags::PARENT_SETTID) {
+        parent_tid
+    } else {
+        None
+    };
+
+    // Create an optional start gate when parent_tid and child_tid point to the same address.
+    // Clearing child_tid is always done after setting parent_tid, so this ensures these two
+    // operations occur in order if they are on the same address.
+    let start_gate = if let Some(parent_tid_ptr) = set_parent_tid
+        && let Some(child_tid_ptr) = clear_child_tid
+        && parent_tid_ptr.as_usize() == child_tid_ptr.as_usize()
+    {
+        Some(alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(0)))
+    } else {
+        None
+    };
+
     let child_tid = unsafe {
         platform.spawn_thread(
             ctx,
@@ -355,20 +393,13 @@ pub(crate) fn sys_clone(
             main,
             Box::new(litebox_common_linux::NewThreadArgs {
                 tls,
-                set_child_tid: if flags.contains(CloneFlags::CHILD_SETTID) {
-                    child_tid
-                } else {
-                    None
-                },
+                set_child_tid,
+                start_gate: start_gate.clone(),
                 task: Box::new(litebox_common_linux::Task {
                     pid,
                     tid: 0, // The actual TID will be set by the platform
                     ppid: parent_proc_id,
-                    clear_child_tid: if flags.contains(CloneFlags::CHILD_CLEARTID) {
-                        child_tid
-                    } else {
-                        None
-                    },
+                    clear_child_tid,
                     robust_list: None,
                     credentials,
                     comm,
@@ -377,11 +408,15 @@ pub(crate) fn sys_clone(
             }),
         )
     }?;
-    if flags.contains(CloneFlags::PARENT_SETTID)
-        && let Some(parent_tid_ptr) = parent_tid
-    {
+    if let Some(parent_tid_ptr) = set_parent_tid {
         let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid.truncate()) };
     }
+
+    // Signal the child to start now that parent tid was written (if we created a gate).
+    if let Some(gate) = start_gate {
+        gate.store(1, core::sync::atomic::Ordering::SeqCst);
+    }
+
     NR_THREADS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Ok(child_tid)
 }
