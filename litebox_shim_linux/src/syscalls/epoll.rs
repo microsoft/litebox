@@ -455,7 +455,6 @@ impl PollSet {
         mut lock_fds: impl FnMut() -> T,
         timeout: Option<Duration>,
     ) {
-        extern crate std;
         let platform = litebox_platform_multiplex::platform();
         let condvar = Arc::new(platform.new_raw_mutex());
 
