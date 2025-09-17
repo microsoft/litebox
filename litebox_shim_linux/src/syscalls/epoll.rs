@@ -74,20 +74,18 @@ impl DescriptorRef {
 }
 
 impl Descriptor {
-    fn io_pollable(&self) -> Option<&dyn IOPollable> {
-        Some(match self {
+    /// Returns the interesting events now and monitors their occurrence in the future if the
+    /// observer is provided.
+    fn poll(&self, mask: Events, observer: Option<Weak<dyn Observer<Events>>>) -> Events {
+        let io_pollable: &dyn IOPollable = match self {
             Descriptor::PipeReader { consumer, .. } => consumer,
             Descriptor::PipeWriter { producer, .. } => producer,
             Descriptor::Eventfd { file, .. } => file,
             Descriptor::Socket(socket) => socket,
-            _ => return None,
-        })
-    }
-
-    /// Returns the interesting events now and monitors their occurrence in the future if the
-    /// observer is provided.
-    fn poll(&self, mask: Events, observer: Option<Weak<dyn Observer<Events>>>) -> Events {
-        let io_pollable = self.io_pollable().unwrap();
+            Descriptor::File(typed_fd) => todo!(),
+            Descriptor::Stdio(stdio_file) => return Events::OUT & mask, // TODO
+            Descriptor::Epoll { file, .. } => todo!(),
+        };
         if let Some(observer) = observer {
             io_pollable.register_observer(observer, mask);
         }
