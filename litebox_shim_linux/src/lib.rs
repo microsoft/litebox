@@ -804,6 +804,7 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
             let old_mask = syscalls::file::sys_umask(mask);
             Ok(old_mask.bits() as usize)
         }
+        SyscallRequest::Alarm { seconds } => syscalls::process::sys_alarm(seconds),
         _ => {
             todo!()
         }

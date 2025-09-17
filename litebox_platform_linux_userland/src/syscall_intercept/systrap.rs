@@ -184,6 +184,7 @@ fn register_seccomp_filter() {
         (libc::SYS_exit_group, vec![backdoor_on_arg(1)]),
         (libc::SYS_tgkill, vec![]),
         (libc::SYS_clone3, vec![backdoor_on_arg(2)]),
+        (libc::SYS_alarm, vec![backdoor_on_arg(1)]),
     ];
     let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> = rules.into_iter().collect();
 

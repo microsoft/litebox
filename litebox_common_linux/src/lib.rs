@@ -1932,6 +1932,9 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     Prctl {
         args: PrctlArg<Platform>,
     },
+    Alarm {
+        seconds: u32,
+    },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
 }
@@ -2423,6 +2426,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             }
             Sysno::execve => sys_req!(Execve { pathname:*, argv:*, envp:* }),
             Sysno::umask => sys_req!(Umask { mask }),
+            Sysno::alarm => sys_req!(Alarm { seconds }),
             // TODO: support syscall `statfs`
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 SyscallRequest::Ret(errno::Errno::ENOSYS)
@@ -2470,6 +2474,10 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
         /// The user stack pointer at the time of the signal.
         stack: usize,
     },
+    /// Arrange for a SIGALRM signal to be delivered to the calling process in `seconds` seconds.
+    /// If `seconds` is zero, any pending alarm is canceled.
+    /// In any event, any previously set alarm() is canceled.
+    Alarm { seconds: u32 },
     /// Set the FS base register to the value in `addr`.
     #[cfg(target_arch = "x86_64")]
     SetFsBase { addr: usize },
