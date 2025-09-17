@@ -1,3 +1,4 @@
+mod cache;
 mod common;
 
 use std::path::{Path, PathBuf};
@@ -29,23 +30,8 @@ fn run_target_program(
                 "{}.hooked",
                 target.file_name().unwrap().to_str().unwrap()
             ));
-            let output = std::process::Command::new("cargo")
-                .args([
-                    "run",
-                    "-p",
-                    "litebox_syscall_rewriter",
-                    "--",
-                    target.to_str().unwrap(),
-                    "-o",
-                    out_path.to_str().unwrap(),
-                ])
-                .output()
-                .expect("Failed to run litebox_syscall_rewriter");
-            assert!(
-                output.status.success(),
-                "failed to run litebox_syscall_rewriter {:?}",
-                std::str::from_utf8(output.stderr.as_slice()).unwrap()
-            );
+            let success = common::rewrite_with_cache(target, &out_path, &[]);
+            assert!(success, "failed to run litebox_syscall_rewriter");
             out_path
         }
     };
@@ -71,27 +57,11 @@ fn run_target_program(
                 std::fs::copy(file_path, dest_path).unwrap();
             }
             Backend::Rewriter => {
-                println!(
-                    "Running `cargo run -p litebox_syscall_rewriter -- -o {} {}`",
-                    dest_path.to_str().unwrap(),
-                    file_path.to_str().unwrap(),
-                );
-                let output = std::process::Command::new("cargo")
-                    .args([
-                        "run",
-                        "-p",
-                        "litebox_syscall_rewriter",
-                        "--",
-                        "-o",
-                        dest_path.to_str().unwrap(),
-                        file_path.to_str().unwrap(),
-                    ])
-                    .output()
-                    .expect("Failed to run litebox_syscall_rewriter");
+                let success = common::rewrite_with_cache(file_path, &dest_path, &[]);
                 assert!(
-                    output.status.success(),
-                    "failed to run litebox_syscall_rewriter {:?}",
-                    std::str::from_utf8(output.stderr.as_slice()).unwrap()
+                    success,
+                    "failed to run litebox_syscall_rewriter for {}",
+                    file_path.to_str().unwrap()
                 );
             }
         }
@@ -132,27 +102,12 @@ fn run_target_program(
         .unwrap();
     }
 
-    // create tar file using `tar` command
+    // create tar file using `tar` command with caching
     let tar_file =
         std::path::Path::new(dir_path.as_str()).join(format!("rootfs_{unique_name}.tar"));
-    let tar_data = std::process::Command::new("tar")
-        .args([
-            "-cvf",
-            format!("../rootfs_{unique_name}.tar").as_str(),
-            "lib",
-            "lib32",
-            "lib64",
-            "out",
-        ])
-        .current_dir(&tar_dir)
-        .output()
-        .expect("Failed to create tar file");
-    assert!(
-        tar_data.status.success(),
-        "failed to create tar file {:?}",
-        std::str::from_utf8(tar_data.stderr.as_slice()).unwrap()
-    );
-    println!("Tar file created at: {}", tar_file.to_str().unwrap());
+    let tar_success = common::create_tar_with_cache(&tar_dir, &tar_file, unique_name);
+    assert!(tar_success, "failed to create tar file");
+    println!("Tar file ready at: {}", tar_file.to_str().unwrap());
 
     // run litebox_runner_linux_userland with the tar file and the compiled executable
     let mut args = vec![

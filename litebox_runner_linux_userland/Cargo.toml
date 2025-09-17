@@ -16,6 +16,9 @@ litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewri
 memmap2 = "0.9.8"
 
 [dev-dependencies]
+sha2 = "0.10"
+walkdir = "2.0"
+glob = "0.3"
 
 [lints]
 workspace = true
