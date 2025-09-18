@@ -17,3 +17,29 @@ pub(crate) use x86_64::{
 
 #[cfg(test)]
 pub(crate) use x86_64::structures::paging::mapper::{MappedFrame, TranslateResult};
+
+/// Get the APIC ID of the current core.
+#[inline]
+pub fn get_core_id() -> usize {
+    use core::arch::x86_64::__cpuid_count as cpuid_count;
+    const CPU_VERSION_INFO: u32 = 1;
+
+    let result = unsafe { cpuid_count(CPU_VERSION_INFO, 0x0) };
+    let apic_id = (result.ebx >> 24) & 0xff;
+
+    apic_id as usize
+}
+
+/// Enable FSGSBASE instructions
+#[inline]
+pub fn enable_fsgsbase() {
+    let mut flags = x86_64::registers::control::Cr4::read();
+    flags.insert(x86_64::registers::control::Cr4Flags::FSGSBASE);
+    unsafe {
+        x86_64::registers::control::Cr4::write(flags);
+    }
+}
+
+/// The maximum number of supported CPU cores. It depends on the number of VCPUs that
+/// Hyper-V supports. We set it to 128 for now.
+pub const MAX_CORES: usize = 128;

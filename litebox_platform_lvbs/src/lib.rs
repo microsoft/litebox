@@ -33,7 +33,6 @@ extern crate alloc;
 
 pub mod arch;
 pub mod host;
-pub mod kernel_context;
 pub mod mm;
 pub mod mshv;
 pub mod ptr;

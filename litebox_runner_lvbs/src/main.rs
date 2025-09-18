@@ -3,19 +3,17 @@
 
 use core::arch::asm;
 use litebox_platform_lvbs::{
-    arch::instrs::hlt_loop,
-    kernel_context::{get_core_id, get_per_core_kernel_context},
+    arch::{enable_fsgsbase, get_core_id, instrs::hlt_loop},
+    host::{bootparam::parse_boot_info, per_cpu_variables::get_per_cpu_variables},
     serial_println,
 };
-
-#[cfg(debug_assertions)]
-use litebox_platform_lvbs::host::bootparam::parse_boot_info;
 
 #[expect(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
-    let kernel_context = get_per_core_kernel_context();
-    let stack_top = kernel_context.kernel_stack_top();
+    enable_fsgsbase();
+    let per_cpu_variables = get_per_cpu_variables();
+    let stack_top = per_cpu_variables.kernel_stack_top();
 
     unsafe {
         asm!(

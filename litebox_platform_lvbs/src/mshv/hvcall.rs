@@ -1,9 +1,12 @@
 //! Hyper-V Hypercall functions
 
 use crate::{
-    arch::instrs::{rdmsr, wrmsr},
+    arch::{
+        get_core_id,
+        instrs::{rdmsr, wrmsr},
+    },
     debug_serial_println,
-    kernel_context::{get_core_id, get_per_core_kernel_context},
+    host::per_cpu_variables::get_per_cpu_variables,
     mshv::{
         HV_HYPERCALL_REP_COMP_MASK, HV_HYPERCALL_REP_COMP_OFFSET, HV_HYPERCALL_REP_START_MASK,
         HV_HYPERCALL_REP_START_OFFSET, HV_HYPERCALL_RESULT_MASK, HV_HYPERCALL_VARHEAD_OFFSET,
@@ -75,14 +78,14 @@ pub fn init() -> Result<(), HypervError> {
 
     debug_serial_println!("HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
 
-    let kernel_context = get_per_core_kernel_context();
+    let per_cpu_variables = get_per_cpu_variables();
 
     wrmsr(
         HV_X64_MSR_VP_ASSIST_PAGE,
-        kernel_context.hv_vp_assist_page_as_u64() | HV_X64_MSR_VP_ASSIST_PAGE_ENABLE,
+        per_cpu_variables.hv_vp_assist_page_as_u64() | HV_X64_MSR_VP_ASSIST_PAGE_ENABLE,
     );
     if rdmsr(HV_X64_MSR_VP_ASSIST_PAGE)
-        != kernel_context.hv_vp_assist_page_as_u64() | HV_X64_MSR_VP_ASSIST_PAGE_ENABLE
+        != per_cpu_variables.hv_vp_assist_page_as_u64() | HV_X64_MSR_VP_ASSIST_PAGE_ENABLE
     {
         return Err(HypervError::InvalidAssistPage);
     }
@@ -109,20 +112,20 @@ pub fn init() -> Result<(), HypervError> {
 
     wrmsr(
         HV_X64_MSR_HYPERCALL,
-        kernel_context.hv_hypercall_page_as_u64() | u64::from(HV_X64_MSR_HYPERCALL_ENABLE),
+        per_cpu_variables.hv_hypercall_page_as_u64() | u64::from(HV_X64_MSR_HYPERCALL_ENABLE),
     );
     if rdmsr(HV_X64_MSR_HYPERCALL)
-        != kernel_context.hv_hypercall_page_as_u64() | u64::from(HV_X64_MSR_HYPERCALL_ENABLE)
+        != per_cpu_variables.hv_hypercall_page_as_u64() | u64::from(HV_X64_MSR_HYPERCALL_ENABLE)
     {
         return Err(HypervError::InvalidHypercallPage);
     }
 
     wrmsr(
         HV_X64_MSR_SIMP,
-        kernel_context.hv_simp_page_as_u64() | u64::from(HV_X64_MSR_SIMP_ENABLE),
+        per_cpu_variables.hv_simp_page_as_u64() | u64::from(HV_X64_MSR_SIMP_ENABLE),
     );
     if rdmsr(HV_X64_MSR_SIMP)
-        != kernel_context.hv_simp_page_as_u64() | u64::from(HV_X64_MSR_SIMP_ENABLE)
+        != per_cpu_variables.hv_simp_page_as_u64() | u64::from(HV_X64_MSR_SIMP_ENABLE)
     {
         return Err(HypervError::InvalidSimpPage);
     }
@@ -161,8 +164,8 @@ pub fn hv_do_hypercall(
     output: *mut core::ffi::c_void,
 ) -> Result<u64, HypervCallError> {
     let mut status: u64;
-    let kernel_context = get_per_core_kernel_context();
-    let hypercall_pg_addr: u64 = kernel_context.hv_hypercall_page_as_u64();
+    let per_cpu_variables = get_per_cpu_variables();
+    let hypercall_pg_addr: u64 = per_cpu_variables.hv_hypercall_page_as_u64();
 
     unsafe {
         asm!(

@@ -2,10 +2,11 @@
 
 use crate::{
     arch::{
+        MAX_CORES,
         instrs::rdmsr,
         msr::{MSR_EFER, MSR_IA32_CR_PAT},
     },
-    kernel_context::{MAX_CORES, get_per_core_kernel_context},
+    host::per_cpu_variables::get_per_cpu_variables,
     mshv::{
         HV_PARTITION_ID_SELF, HV_VP_INDEX_SELF, HV_VTL_NORMAL, HV_VTL_SECURE, HVCALL_ENABLE_VP_VTL,
         HVCALL_GET_VP_REGISTERS, HVCALL_SET_VP_REGISTERS, HvEnableVpVtl, HvGetVpRegistersInput,
@@ -27,9 +28,9 @@ fn hvcall_set_vp_registers_internal(
     value: u64,
     target_vtl: HvInputVtl,
 ) -> Result<u64, HypervCallError> {
-    let kernel_context = get_per_core_kernel_context();
+    let per_cpu_variables = get_per_cpu_variables();
     let hvin = unsafe {
-        &mut *kernel_context
+        &mut *per_cpu_variables
             .hv_hypercall_input_page_as_mut_ptr()
             .cast::<HvSetVpRegistersInput>()
     };
@@ -67,15 +68,15 @@ fn hvcall_get_vp_registers_internal(
     reg_name: u32,
     target_vtl: HvInputVtl,
 ) -> Result<u64, HypervCallError> {
-    let kernel_context = get_per_core_kernel_context();
+    let per_cpu_variables = get_per_cpu_variables();
     let hvin = unsafe {
-        &mut *kernel_context
+        &mut *per_cpu_variables
             .hv_hypercall_input_page_as_mut_ptr()
             .cast::<HvGetVpRegistersInput>()
     };
     *hvin = HvGetVpRegistersInput::new();
     let hvout = unsafe {
-        &mut *kernel_context
+        &mut *per_cpu_variables
             .hv_hypercall_output_page_as_mut_ptr()
             .cast::<HvGetVpRegistersOutput>()
     };

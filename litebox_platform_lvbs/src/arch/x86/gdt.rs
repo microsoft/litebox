@@ -1,6 +1,7 @@
 //! Global Descriptor Table (GDT) and Task State Segment (TSS)
 
-use crate::kernel_context::{MAX_CORES, get_core_id, get_per_core_kernel_context};
+use crate::arch::{MAX_CORES, get_core_id};
+use crate::host::per_cpu_variables::get_per_cpu_variables;
 use core::mem::MaybeUninit;
 use x86_64::{
     PrivilegeLevel, VirtAddr,
@@ -82,10 +83,10 @@ static mut GDT_STORAGE: [MaybeUninit<GdtWrapper>; MAX_CORES] =
 
 fn setup_gdt_tss() {
     let core_id = get_core_id();
-    let kernel_context = get_per_core_kernel_context();
+    let per_cpu_variables = get_per_cpu_variables();
 
     let stack_top = kernel_context.interrupt_stack_top() & !15;
-    let tss = &mut kernel_context.tss;
+    let tss = &mut per_cpu_variables.tss;
     tss.0.interrupt_stack_table[0] = VirtAddr::new(stack_top);
 
     let gdt = unsafe { &mut *GDT_STORAGE[core_id].as_mut_ptr() };
@@ -105,7 +106,7 @@ fn setup_gdt_tss() {
         load_tss(gdt.selectors.tss);
     }
 
-    kernel_context.gdt = Some(gdt);
+    per_cpu_variables.gdt = Some(gdt);
 }
 
 /// Set up GDT and TSS (for a core)
