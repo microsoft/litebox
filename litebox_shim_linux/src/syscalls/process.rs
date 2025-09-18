@@ -957,6 +957,17 @@ pub(crate) fn sys_execve(
     unreachable!("execve callback must not return on success");
 }
 
+/// Handle syscall `alarm`.
+pub(crate) fn sys_alarm(seconds: u32) -> Result<usize, Errno> {
+    let token = litebox_platform_multiplex::platform()
+        .get_punchthrough_token_for(litebox_common_linux::PunchthroughSyscall::Alarm { seconds })
+        .expect("Failed to get punchthrough token for SET_ALARM");
+    token.execute().map_err(|e| match e {
+        litebox::platform::PunchthroughError::Failure(errno) => errno,
+        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use core::mem::MaybeUninit;

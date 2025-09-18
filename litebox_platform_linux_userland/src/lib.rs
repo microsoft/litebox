@@ -935,6 +935,16 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
             PunchthroughSyscall::SetThreadArea { user_desc } => {
                 set_thread_area(user_desc).map_err(litebox::platform::PunchthroughError::Failure)
             }
+            PunchthroughSyscall::Alarm { seconds } => unsafe {
+                let remain = syscalls::syscall2(
+                    syscalls::Sysno::alarm,
+                    seconds as usize,
+                    // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                    syscall_intercept::SYSCALL_ARG_MAGIC,
+                )
+                .expect("failed to set alarm");
+                Ok(remain)
+            },
         }
     }
 }

@@ -72,6 +72,7 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
                     .map(|()| 0)
                     .ok_or(Errno::EFAULT)
             }
+            PunchthroughSyscall::Alarm { seconds: _ } => todo!(),
         };
         match r {
             Ok(v) => Ok(v),
