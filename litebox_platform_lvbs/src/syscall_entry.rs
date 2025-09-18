@@ -1,6 +1,6 @@
 use crate::debug_serial_println;
 use crate::{
-    kernel_context::get_per_core_kernel_context, mshv::vtl_switch::jump_to_vtl_switch_loop,
+    host::per_cpu_variables::get_per_cpu_variables, mshv::vtl_switch::jump_to_vtl_switch_loop,
     user_context::UserSpaceManagement,
 };
 use core::arch::{asm, naked_asm};
@@ -175,9 +175,9 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> u32 {
         return sysret;
     }
 
-    let kernel_context = get_per_core_kernel_context();
-    kernel_context.set_vtl_return_value(0);
-    let stack_top = kernel_context.kernel_stack_top();
+    let per_cpu_variables = get_per_cpu_variables();
+    per_cpu_variables.set_vtl_return_value(0);
+    let stack_top = per_cpu_variables.kernel_stack_top();
     unsafe {
         asm!(
             "mov rsp, rax",
@@ -194,6 +194,7 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> u32 {
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry_wrapper() {
     naked_asm!(
+        "swapgs",
         "push rsp",
         "push r11",
         "push rcx",
@@ -213,6 +214,7 @@ unsafe extern "C" fn syscall_entry_wrapper() {
         "pop rcx",
         "pop r11",
         "pop rbp",
+        "swapgs",
         "sysretq",
         stack_alignment = const STACK_ALIGNMENT,
         syscall_entry = sym syscall_entry,
@@ -242,8 +244,8 @@ pub(crate) fn init(syscall_handler: SyscallHandler) {
     SFMask::write(rflags);
 
     // configure STAR MSR for CS/SS selectors
-    let kernel_context = get_per_core_kernel_context();
-    let (kernel_cs, user_cs, _) = kernel_context
+    let per_cpu_variables = get_per_cpu_variables();
+    let (kernel_cs, user_cs, _) = per_cpu_variables
         .get_segment_selectors()
         .expect("GDT not initialized for the current core");
     unsafe { Star::write_raw(user_cs, kernel_cs) };

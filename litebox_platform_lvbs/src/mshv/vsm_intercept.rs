@@ -1,5 +1,5 @@
 use crate::{
-    kernel_context::get_per_core_kernel_context,
+    host::per_cpu_variables::get_per_cpu_variables,
     mshv::{
         DEFAULT_REG_PIN_MASK, HV_REGISTER_PENDING_EVENT0, HV_X64_REGISTER_APIC_BASE,
         HV_X64_REGISTER_CR0, HV_X64_REGISTER_CR4, HV_X64_REGISTER_CSTAR, HV_X64_REGISTER_EFER,
@@ -46,8 +46,8 @@ pub enum InterceptedRegisterName {
 }
 
 pub fn vsm_handle_intercept() {
-    let kernel_context = get_per_core_kernel_context();
-    let simp_page = kernel_context.hv_simp_page_as_mut_ptr();
+    let per_cpu_variables = get_per_cpu_variables();
+    let simp_page = per_cpu_variables.hv_simp_page_as_mut_ptr();
 
     let msg_type = unsafe { (*simp_page).sint_message[0].header.message_type };
     unsafe {
@@ -165,8 +165,8 @@ fn validate_and_continue_vtl0_register_write(
     mask: u64,
     int_msg_hdr: &HvInterceptMessageHeader,
 ) {
-    let kernel_context = get_per_core_kernel_context();
-    if let Some(allowed_value) = kernel_context.vtl0_locked_regs.get(reg_name) {
+    let per_cpu_variables = get_per_cpu_variables();
+    if let Some(allowed_value) = per_cpu_variables.vtl0_locked_regs.get(reg_name) {
         if value & mask == allowed_value {
             hvcall_set_vp_vtl0_registers(reg_name, value).expect("Failed to write VTL0 register");
             advance_vtl0_rip(int_msg_hdr).expect("Failed to advance VTL0 RIP");

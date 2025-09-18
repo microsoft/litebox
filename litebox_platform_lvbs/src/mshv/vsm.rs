@@ -3,12 +3,13 @@
 #[cfg(debug_assertions)]
 use crate::mshv::mem_integrity::parse_modinfo;
 use crate::{
+    arch::get_core_id,
     debug_serial_print, debug_serial_println,
+    host::per_cpu_variables::get_per_cpu_variables,
     host::{
         bootparam::{get_num_possible_cpus, get_vtl1_memory_info},
         linux::{CpuMask, KEXEC_SEGMENT_MAX, Kimage},
     },
-    kernel_context::{get_core_id, get_per_core_kernel_context},
     mshv::{
         HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
         HV_REGISTER_CR_INTERCEPT_CR4_MASK, HV_REGISTER_VSM_PARTITION_CONFIG,
@@ -1092,13 +1093,13 @@ impl ControlRegMap {
 }
 
 fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
-    let kernel_context = get_per_core_kernel_context();
+    let per_cpu_variables = get_per_cpu_variables();
 
-    kernel_context.vtl0_locked_regs.init();
+    per_cpu_variables.vtl0_locked_regs.init();
 
-    for reg_name in kernel_context.vtl0_locked_regs.reg_names() {
+    for reg_name in per_cpu_variables.vtl0_locked_regs.reg_names() {
         let value = hvcall_get_vp_vtl0_registers(reg_name)?;
-        kernel_context.vtl0_locked_regs.set(reg_name, value);
+        per_cpu_variables.vtl0_locked_regs.set(reg_name, value);
     }
 
     Ok(0)

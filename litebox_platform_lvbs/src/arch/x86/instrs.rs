@@ -43,3 +43,19 @@ pub fn wrmsr(msr: u32, value: u64) {
         );
     }
 }
+
+#[expect(clippy::inline_always)]
+#[inline(always)]
+pub fn rdgsbase() -> u64 {
+    let gsbase: u64;
+    unsafe {
+        asm!("rdgsbase {}", out(reg) gsbase, options(nostack, preserves_flags));
+    }
+    gsbase
+}
+
+#[expect(clippy::inline_always)]
+#[inline(always)]
+pub fn wrgsbase(gsbase: u64) {
+    unsafe { asm!("wrgsbase {}", in(reg) gsbase, options(nostack, preserves_flags)) }
+}

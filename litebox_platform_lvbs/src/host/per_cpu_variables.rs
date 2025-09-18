@@ -1,7 +1,11 @@
-//! VTL1 kernel context
+//! Per-CPU VTL1 kernel variables
 
 use crate::{
-    arch::gdt,
+    arch::{
+        MAX_CORES, gdt, get_core_id,
+        instrs::{rdgsbase, wrgsbase},
+    },
+    host::bootparam::get_num_possible_cpus,
     mshv::{
         HvMessagePage, HvVpAssistPage,
         vsm::{ControlRegMap, NUM_CONTROL_REGS},
@@ -9,16 +13,16 @@ use crate::{
         vtl1_mem_layout::PAGE_SIZE,
     },
 };
+use alloc::boxed::Box;
 use x86_64::structures::tss::TaskStateSegment;
 
-pub const MAX_CORES: usize = 8; // TODO: use cpumask
 pub const INTERRUPT_STACK_SIZE: usize = 2 * PAGE_SIZE;
 pub const KERNEL_STACK_SIZE: usize = 10 * PAGE_SIZE;
 
-/// Per-core VTL1 kernel context
+/// Per-CPU VTL1 kernel variables
 #[repr(align(4096))]
 #[derive(Clone, Copy)]
-pub struct KernelContext {
+pub struct PerCpuVariables {
     hv_vp_assist_page: [u8; PAGE_SIZE],
     hv_simp_page: [u8; PAGE_SIZE],
     interrupt_stack: [u8; INTERRUPT_STACK_SIZE],
@@ -34,7 +38,7 @@ pub struct KernelContext {
     pub gdt: Option<&'static gdt::GdtWrapper>,
 }
 
-impl KernelContext {
+impl PerCpuVariables {
     pub fn kernel_stack_top(&self) -> u64 {
         &raw const self.kernel_stack as u64 + (self.kernel_stack.len() - 1) as u64
     }
@@ -82,8 +86,8 @@ impl KernelContext {
     }
 }
 
-// TODO: use heap
-static mut PER_CORE_KERNEL_CONTEXT: [KernelContext; MAX_CORES] = [KernelContext {
+/// per-CPU variables for core 0 (or BSP). This must use static memory because kernel heap is not ready.
+static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
     hv_vp_assist_page: [0u8; PAGE_SIZE],
     hv_simp_page: [0u8; PAGE_SIZE],
     interrupt_stack: [0u8; INTERRUPT_STACK_SIZE],
@@ -133,24 +137,73 @@ static mut PER_CORE_KERNEL_CONTEXT: [KernelContext; MAX_CORES] = [KernelContext 
         entries: [(0, 0); NUM_CONTROL_REGS],
     },
     gdt: const { None },
-}; MAX_CORES];
+};
 
-/// Get the APIC ID of the current core.
-#[inline]
-pub fn get_core_id() -> usize {
-    use core::arch::x86_64::__cpuid_count as cpuid_count;
-    const CPU_VERSION_INFO: u32 = 1;
+/// Store the addresses of per-CPU variables. The kernel threads are expected to access
+/// the corresponding per-CPU variables via the GS registers which will store the addresses later.
+/// Instead of maintaining this map, we might be able to use a hypercall to directly program each core's GS register.
+static mut PER_CPU_VARIABLE_ADDRESSES: [Option<u64>; MAX_CORES] = [None; MAX_CORES];
 
-    let result = unsafe { cpuid_count(CPU_VERSION_INFO, 0x0) };
-    let apic_id = (result.ebx >> 24) & 0xff;
-
-    apic_id as usize
+/// Get the per-CPU variables for the current core.
+/// # Panics
+/// Panics if GSBASE is not set
+pub fn get_per_cpu_variables() -> &'static mut PerCpuVariables {
+    let gsbase = rdgsbase();
+    if gsbase == 0 {
+        let core_id = get_core_id();
+        if let Some(addr) = if core_id == 0 {
+            Some(&raw mut BSP_VARIABLES as u64)
+        } else {
+            unsafe { PER_CPU_VARIABLE_ADDRESSES[core_id] }
+        } {
+            let addr = x86_64::VirtAddr::new(addr);
+            wrgsbase(addr.as_u64());
+            unsafe { &mut *addr.as_mut_ptr() }
+        } else {
+            panic!(
+                "GSBASE is not set, and no per-CPU variables are allocated for core {}",
+                core_id
+            );
+        }
+    } else {
+        let addr = x86_64::VirtAddr::new(gsbase);
+        unsafe { &mut *addr.as_mut_ptr() }
+    }
 }
 
-/// Get the per-core kernel context
-pub fn get_per_core_kernel_context() -> &'static mut KernelContext {
-    let core_id = get_core_id();
-    unsafe { &mut PER_CORE_KERNEL_CONTEXT[core_id] }
+/// Allocate per-CPU variables in heap for all possible cores. We expect that the BSP will call
+/// this function to allocate per-CPU variables for other APs because our per-CPU variables are
+/// huge such that each AP without a proper stack cannot allocate its own per-CPU variables.
+/// # Panics
+/// Panics if the number of possible CPUs exceeds `MAX_CORES`
+pub fn allocate_per_cpu_variables() {
+    let num_cores =
+        usize::try_from(get_num_possible_cpus().expect("Failed to get number of possible CPUs"))
+            .unwrap();
+    assert!(
+        num_cores <= MAX_CORES,
+        "# of possible CPUs ({num_cores}) exceeds MAX_CORES",
+    );
+
+    #[allow(clippy::needless_range_loop)]
+    for i in 1..num_cores {
+        let per_cpu_variables =
+            Box::leak(Box::new(core::mem::MaybeUninit::<PerCpuVariables>::uninit()));
+        unsafe {
+            // PerCpuVariables is larger than the stack size, so we can't use the stack to initialize it.
+            core::slice::from_raw_parts_mut(
+                per_cpu_variables.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of::<PerCpuVariables>(),
+            )
+            .fill(0);
+        }
+        let per_cpu_variables = unsafe { per_cpu_variables.assume_init_mut() };
+
+        unsafe {
+            PER_CPU_VARIABLE_ADDRESSES[i] =
+                Some(core::ptr::from_mut::<PerCpuVariables>(per_cpu_variables) as u64);
+        }
+    }
 }
 
 // A hypercall page is a shared read-only code page, so it's better not to use heap.

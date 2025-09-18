@@ -2,10 +2,9 @@
 
 use core::panic::PanicInfo;
 use litebox_platform_lvbs::{
-    arch::{gdt, instrs::hlt_loop, interrupts},
+    arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
     debug_serial_println,
-    host::bootparam::get_vtl1_memory_info,
-    kernel_context::get_core_id,
+    host::{bootparam::get_vtl1_memory_info, per_cpu_variables::allocate_per_cpu_variables},
     mm::MemoryProvider,
     mshv::{
         hvcall,
@@ -93,6 +92,8 @@ pub fn init() -> Option<&'static Platform> {
     interrupts::init_idt();
     x86_64::instructions::interrupts::enable();
     Platform::register_syscall_handler(litebox_shim_optee::handle_syscall_request);
+
+    allocate_per_cpu_variables();
 
     ret
 }
