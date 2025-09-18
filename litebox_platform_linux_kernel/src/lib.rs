@@ -60,6 +60,7 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
                 act: _,
                 oldact: _,
             } => todo!(),
+            PunchthroughSyscall::RtSigreturn { stack: _ } => todo!(),
             PunchthroughSyscall::SetFsBase { addr } => {
                 unsafe { litebox_common_linux::wrfsbase(addr) };
                 Ok(0)

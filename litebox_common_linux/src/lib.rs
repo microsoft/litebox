@@ -836,7 +836,7 @@ impl Signal {
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
-pub struct SigSet(usize);
+pub struct SigSet(u64);
 
 impl SigSet {
     pub fn empty() -> Self {
@@ -844,15 +844,15 @@ impl SigSet {
     }
 
     pub fn add(&mut self, signum: Signal) {
-        self.0 |= 1 << (signum as usize - 1);
+        self.0 |= 1 << (signum as u64 - 1);
     }
 
     pub fn remove(&mut self, signum: Signal) {
-        self.0 &= !(1 << (signum as usize - 1));
+        self.0 &= !(1 << (signum as u64 - 1));
     }
 
     pub fn contains(&self, signum: Signal) -> bool {
-        (self.0 & (1 << (signum as usize - 1))) != 0
+        (self.0 & (1 << (signum as u64 - 1))) != 0
     }
 }
 
@@ -1660,6 +1660,9 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         oldact: Option<Platform::RawMutPointer<SigAction>>,
         sigsetsize: usize,
     },
+    RtSigreturn {
+        stack: usize,
+    },
     Ioctl {
         fd: i32,
         arg: IoctlArg<Platform>,
@@ -2038,6 +2041,10 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     SyscallRequest::Ret(errno::Errno::EINVAL)
                 }
             }
+            #[cfg(target_arch = "x86_64")]
+            Sysno::rt_sigreturn => SyscallRequest::RtSigreturn { stack: ctx.rsp },
+            #[cfg(target_arch = "x86")]
+            Sysno::rt_sigreturn => SyscallRequest::RtSigreturn { stack: ctx.esp },
             Sysno::ioctl => SyscallRequest::Ioctl {
                 fd: ctx.sys_req_arg(0),
                 arg: {
@@ -2457,6 +2464,11 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
         act: Option<Platform::RawConstPointer<SigAction>>,
         /// If `oldact` is not None, the previous action for the signal is stored in `oldact`.
         oldact: Option<Platform::RawMutPointer<SigAction>>,
+    },
+    /// Return from signal handler and cleanup stack
+    RtSigreturn {
+        /// The user stack pointer at the time of the signal.
+        stack: usize,
     },
     /// Set the FS base register to the value in `addr`.
     #[cfg(target_arch = "x86_64")]
