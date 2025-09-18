@@ -257,7 +257,7 @@ impl WindowsUserland {
 
     fn is_aligned_to_granu(&self, x: usize) -> bool {
         let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
-        x % gran == 0
+        x.is_multiple_of(gran)
     }
 
     fn set_init_tls(&self) {
