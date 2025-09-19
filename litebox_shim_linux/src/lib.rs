@@ -4,10 +4,14 @@
 //! chosen by the [platform multiplex](../litebox_platform_multiplex/index.html).
 
 #![no_std]
-// NOTE(jayb): Allowing this only until the API design is fleshed out, once that is complete, this
-// suppressed warning should be removed.
-#![allow(dead_code, unused)]
-#![warn(unused_imports)]
+#![allow(
+    dead_code,
+    unreachable_patterns,
+    unused_must_use,
+    unused_mut,
+    unused_unsafe,
+    unused_variables
+)]
 
 extern crate alloc;
 
