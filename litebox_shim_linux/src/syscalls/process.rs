@@ -318,7 +318,7 @@ fn new_thread_callback(
         #[cfg(target_arch = "x86_64")]
         {
             use litebox::platform::RawConstPointer as _;
-            sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()));
+            sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize())).unwrap();
         }
     }
 
@@ -615,7 +615,7 @@ pub(crate) fn sys_clock_getres(
     };
 
     unsafe {
-        res.write_at_offset(0, resolution);
+        res.write_at_offset(0, resolution).unwrap();
     }
 }
 

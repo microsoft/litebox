@@ -5,7 +5,6 @@
 
 #![no_std]
 #![allow(dead_code)]
-#![allow(unused_must_use)]
 
 extern crate alloc;
 
@@ -242,7 +241,7 @@ impl Descriptors {
                     .get_file_descriptor_flags()
                     .contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC)
                 {
-                    syscalls::file::do_close(desc);
+                    syscalls::file::do_close(desc).unwrap();
                 } else {
                     *slot = Some(desc);
                 }

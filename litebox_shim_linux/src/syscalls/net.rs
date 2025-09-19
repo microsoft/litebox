@@ -79,7 +79,7 @@ pub(crate) struct Socket {
 impl Drop for Socket {
     fn drop(&mut self) {
         if let Some(sockfd) = self.fd.take() {
-            litebox_net().lock().close(sockfd);
+            litebox_net().lock().close(sockfd).unwrap();
         }
     }
 }
@@ -571,7 +571,7 @@ pub(crate) fn sys_recvfrom(
             drop(file_table);
             let mut buffer: [u8; 4096] = [0; 4096];
             let size = socket.receive(&mut buffer, flags)?;
-            buf.copy_from_slice(0, &buffer).ok_or(Errno::EFAULT);
+            buf.copy_from_slice(0, &buffer).ok_or(Errno::EFAULT)?;
             Ok(size)
         }
         _ => Err(Errno::ENOTSOCK),
