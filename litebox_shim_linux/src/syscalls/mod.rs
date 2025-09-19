@@ -19,6 +19,7 @@ macro_rules! common_functions_for_file_status {
                 & litebox::fs::OFlags::STATUS_FLAGS_MASK
         }
 
+        #[allow(dead_code)]
         pub(crate) fn set_status(&self, flag: litebox::fs::OFlags, on: bool) {
             if on {
                 self.status

@@ -177,6 +177,7 @@ impl EpollFile {
         Ok(())
     }
 
+    #[expect(dead_code)]
     fn mod_interest(&self, fd: u32, file: &Descriptor, event: EpollEvent) -> Result<(), Errno> {
         // EPOLLEXCLUSIVE is not allowed for a EPOLL_CTL_MOD operation
         let flags = EpollFlags::from_bits_truncate(event.events);

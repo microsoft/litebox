@@ -4,7 +4,6 @@
 //! chosen by the [platform multiplex](../litebox_platform_multiplex/index.html).
 
 #![no_std]
-#![allow(dead_code)]
 
 extern crate alloc;
 
@@ -193,46 +192,8 @@ impl Descriptors {
         let fd = fd as usize;
         self.descriptors.get_mut(fd)?.take()
     }
-    fn remove_file(&mut self, fd: u32) -> Option<FileFd> {
-        let fd = fd as usize;
-        if let Some(Descriptor::File(file_fd)) = self
-            .descriptors
-            .get_mut(fd)?
-            .take_if(|v| matches!(v, Descriptor::File(_)))
-        {
-            Some(file_fd)
-        } else {
-            None
-        }
-    }
-    fn remove_socket(&mut self, fd: u32) -> Option<alloc::sync::Arc<crate::syscalls::net::Socket>> {
-        let fd = fd as usize;
-        if let Some(Descriptor::Socket(socket_fd)) = self
-            .descriptors
-            .get_mut(fd)?
-            .take_if(|v| matches!(v, Descriptor::Socket(_)))
-        {
-            Some(socket_fd)
-        } else {
-            None
-        }
-    }
     fn get_fd(&self, fd: u32) -> Option<&Descriptor> {
         self.descriptors.get(fd as usize)?.as_ref()
-    }
-    fn get_file_fd(&self, fd: u32) -> Option<&FileFd> {
-        if let Descriptor::File(file_fd) = self.descriptors.get(fd as usize)?.as_ref()? {
-            Some(file_fd)
-        } else {
-            None
-        }
-    }
-    fn get_socket_fd(&self, fd: u32) -> Option<&crate::syscalls::net::Socket> {
-        if let Descriptor::Socket(socket_fd) = self.descriptors.get(fd as usize)?.as_ref()? {
-            Some(socket_fd)
-        } else {
-            None
-        }
     }
     fn close_on_exec(&mut self) {
         self.descriptors.iter_mut().for_each(|slot| {

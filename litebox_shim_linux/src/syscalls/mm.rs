@@ -16,6 +16,10 @@ fn align_up(addr: usize, align: usize) -> usize {
 }
 
 #[inline]
+#[expect(
+    dead_code,
+    reason = "currently unused, but maintained just to stay near the above"
+)]
 fn align_down(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
     addr & !(align - 1)

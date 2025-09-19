@@ -20,10 +20,11 @@ use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox_net};
 
 const ADDR_MAX_LEN: usize = 128;
 
+#[cfg_attr(not(test), expect(dead_code))]
 #[repr(C)]
 struct CSockStorage {
-    pub sa_family: u16,
-    pub bytes: [u8; ADDR_MAX_LEN - 2],
+    sa_family: u16,
+    bytes: [u8; ADDR_MAX_LEN - 2],
 }
 
 impl Default for CSockStorage {
@@ -71,6 +72,7 @@ pub(crate) struct Socket {
     pub(crate) fd: Option<SocketFd<Platform>>,
     /// File status flags (see [`litebox::fs::OFlags::STATUS_FLAGS_MASK`])
     pub(crate) status: AtomicU32,
+    #[expect(dead_code)]
     pub(crate) close_on_exec: AtomicBool,
     options: litebox::sync::Mutex<Platform, SocketOptions>,
     pollee: Pollee<Platform>,
