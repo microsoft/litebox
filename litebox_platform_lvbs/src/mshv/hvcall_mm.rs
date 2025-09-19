@@ -1,7 +1,7 @@
 //! Hyper-V Hypercall functions for memory management
 
 use crate::{
-    host::per_cpu_variables::get_per_cpu_variables,
+    host::per_cpu_variables::with_per_cpu_variables,
     mshv::{
         HV_PARTITION_ID_SELF, HVCALL_MODIFY_VTL_PROTECTION_MASK, HvInputModifyVtlProtectionMask,
         HvInputVtl, HvPageProtFlags,
@@ -18,12 +18,11 @@ pub fn hv_modify_vtl_protection_mask(
     num_pages: u64,
     page_access: HvPageProtFlags,
 ) -> Result<u64, HypervCallError> {
-    let per_cpu_variables = get_per_cpu_variables();
-    let hvin = unsafe {
+    let hvin = with_per_cpu_variables(|per_cpu_variables| unsafe {
         &mut *per_cpu_variables
             .hv_hypercall_input_page_as_mut_ptr()
             .cast::<HvInputModifyVtlProtectionMask>()
-    };
+    });
     *hvin = HvInputModifyVtlProtectionMask::new();
 
     hvin.partition_id = HV_PARTITION_ID_SELF;

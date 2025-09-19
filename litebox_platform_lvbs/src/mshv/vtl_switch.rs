@@ -1,7 +1,7 @@
 //! VTL switch related functions
 
 use crate::{
-    host::per_cpu_variables::get_per_cpu_variables,
+    host::per_cpu_variables::with_per_cpu_variables,
     mshv::{
         HV_VTL_NORMAL, HV_VTL_SECURE, NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT,
         VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction, vsm::vsm_dispatch,
@@ -70,8 +70,7 @@ impl VtlState {
 }
 
 fn save_vtl_state_to_per_cpu_variables(vtl: u8, vtl_state: *const VtlState) {
-    let per_cpu_variables = get_per_cpu_variables();
-    match vtl {
+    with_per_cpu_variables(|per_cpu_variables| match vtl {
         HV_VTL_NORMAL => per_cpu_variables
             .vtl0_state
             .clone_from(unsafe { &*vtl_state }),
@@ -79,7 +78,7 @@ fn save_vtl_state_to_per_cpu_variables(vtl: u8, vtl_state: *const VtlState) {
             .vtl1_state
             .clone_from(unsafe { &*vtl_state }),
         _ => panic!("Invalid VTL number: {}", vtl),
-    }
+    });
 }
 
 // Save CPU registers to a global data structure through using a stack
@@ -155,12 +154,11 @@ unsafe extern "C" fn save_vtl1_state() {
 }
 
 fn load_vtl_state_from_per_cpu_variables(vtl: u8, vtl_state: *mut VtlState) {
-    let per_cpu_variables = get_per_cpu_variables();
-    match vtl {
+    with_per_cpu_variables(|per_cpu_variables| match vtl {
         HV_VTL_NORMAL => unsafe { vtl_state.copy_from(&raw const per_cpu_variables.vtl0_state, 1) },
         HV_VTL_SECURE => unsafe { vtl_state.copy_from(&raw const per_cpu_variables.vtl1_state, 1) },
         _ => panic!("Invalid VTL number: {}", vtl),
-    }
+    });
 }
 
 // Restore CPU registers from the global data structure through using a stack.
@@ -217,8 +215,8 @@ pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
 #[allow(clippy::inline_always)]
 #[inline(always)]
 fn jump_to_vtl_switch_loop_with_stack_cleanup() -> ! {
-    let per_cpu_variables = get_per_cpu_variables();
-    let stack_top = per_cpu_variables.kernel_stack_top();
+    let stack_top =
+        with_per_cpu_variables(|per_cpu_variables| per_cpu_variables.kernel_stack_top());
     unsafe {
         asm!(
             "mov rsp, rax",
@@ -259,12 +257,15 @@ fn vtl_switch_loop() -> ! {
             load_vtl_state(HV_VTL_SECURE);
         }
 
-        let per_cpu_variables = get_per_cpu_variables();
-        let reason = unsafe { (*per_cpu_variables.hv_vp_assist_page_as_ptr()).vtl_entry_reason };
+        let reason = with_per_cpu_variables(|per_cpu_variables| unsafe {
+            (*per_cpu_variables.hv_vp_assist_page_as_ptr()).vtl_entry_reason
+        });
         match VtlEntryReason::try_from(reason).unwrap_or(VtlEntryReason::Unknown) {
             #[allow(clippy::cast_sign_loss)]
             VtlEntryReason::VtlCall => {
-                let params = per_cpu_variables.vtl0_state.get_vtlcall_params();
+                let params = with_per_cpu_variables(|per_cpu_variables| {
+                    per_cpu_variables.vtl0_state.get_vtlcall_params()
+                });
                 if VsmFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
                     .unwrap_or(VsmFunction::Unknown)
                     == VsmFunction::Unknown
@@ -272,7 +273,9 @@ fn vtl_switch_loop() -> ! {
                     todo!("unknown function ID = {:#x}", params[0]);
                 } else {
                     let result = vtlcall_dispatch(&params);
-                    per_cpu_variables.set_vtl_return_value(result as u64);
+                    with_per_cpu_variables(|per_cpu_variables| {
+                        per_cpu_variables.set_vtl_return_value(result as u64);
+                    });
                     jump_to_vtl_switch_loop_with_stack_cleanup();
                 }
             }

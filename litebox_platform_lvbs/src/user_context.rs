@@ -3,7 +3,7 @@
 
 use crate::debug_serial_println;
 use crate::{
-    HostInterface, LinuxKernel, host::per_cpu_variables::get_per_cpu_variables,
+    HostInterface, LinuxKernel, host::per_cpu_variables::with_per_cpu_variables,
     mshv::vtl1_mem_layout::PAGE_SIZE,
 };
 use core::arch::asm;
@@ -154,7 +154,9 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
                 panic!("Userspace with ID: {} does not exist", userspace_id);
             }
         } // release the lock before entering userspace
-        let Some((_, cs_idx, ds_idx)) = get_per_cpu_variables().get_segment_selectors() else {
+        let Some((_, cs_idx, ds_idx)) =
+            with_per_cpu_variables(|per_cpu_variables| per_cpu_variables.get_segment_selectors())
+        else {
             panic!("GDT is not initialized");
         };
         unsafe {
