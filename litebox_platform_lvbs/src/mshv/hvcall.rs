@@ -6,7 +6,7 @@ use crate::{
         instrs::{rdmsr, wrmsr},
     },
     debug_serial_println,
-    host::per_cpu_variables::get_per_cpu_variables,
+    host::per_cpu_variables::with_per_cpu_variables,
     mshv::{
         HV_HYPERCALL_REP_COMP_MASK, HV_HYPERCALL_REP_COMP_OFFSET, HV_HYPERCALL_REP_START_MASK,
         HV_HYPERCALL_REP_START_OFFSET, HV_HYPERCALL_RESULT_MASK, HV_HYPERCALL_VARHEAD_OFFSET,
@@ -78,17 +78,20 @@ pub fn init() -> Result<(), HypervError> {
 
     debug_serial_println!("HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
 
-    let per_cpu_variables = get_per_cpu_variables();
+    with_per_cpu_variables(|per_cpu_variables| {
+        wrmsr(
+            HV_X64_MSR_VP_ASSIST_PAGE,
+            per_cpu_variables.hv_vp_assist_page_as_u64() | HV_X64_MSR_VP_ASSIST_PAGE_ENABLE,
+        );
+        if rdmsr(HV_X64_MSR_VP_ASSIST_PAGE)
+            == per_cpu_variables.hv_vp_assist_page_as_u64() | HV_X64_MSR_VP_ASSIST_PAGE_ENABLE
+        {
+            Ok(())
+        } else {
+            Err(HypervError::InvalidAssistPage)
+        }
+    })?;
 
-    wrmsr(
-        HV_X64_MSR_VP_ASSIST_PAGE,
-        per_cpu_variables.hv_vp_assist_page_as_u64() | HV_X64_MSR_VP_ASSIST_PAGE_ENABLE,
-    );
-    if rdmsr(HV_X64_MSR_VP_ASSIST_PAGE)
-        != per_cpu_variables.hv_vp_assist_page_as_u64() | HV_X64_MSR_VP_ASSIST_PAGE_ENABLE
-    {
-        return Err(HypervError::InvalidAssistPage);
-    }
     debug_serial_println!(
         "HV_X64_MSR_VP_ASSIST_PAGE: {:#x}",
         rdmsr(HV_X64_MSR_VP_ASSIST_PAGE)
@@ -110,25 +113,30 @@ pub fn init() -> Result<(), HypervError> {
         );
     }
 
-    wrmsr(
-        HV_X64_MSR_HYPERCALL,
-        per_cpu_variables.hv_hypercall_page_as_u64() | u64::from(HV_X64_MSR_HYPERCALL_ENABLE),
-    );
-    if rdmsr(HV_X64_MSR_HYPERCALL)
-        != per_cpu_variables.hv_hypercall_page_as_u64() | u64::from(HV_X64_MSR_HYPERCALL_ENABLE)
-    {
-        return Err(HypervError::InvalidHypercallPage);
-    }
+    with_per_cpu_variables(|per_cpu_variables| {
+        wrmsr(
+            HV_X64_MSR_HYPERCALL,
+            per_cpu_variables.hv_hypercall_page_as_u64() | u64::from(HV_X64_MSR_HYPERCALL_ENABLE),
+        );
+        if rdmsr(HV_X64_MSR_HYPERCALL)
+            != per_cpu_variables.hv_hypercall_page_as_u64() | u64::from(HV_X64_MSR_HYPERCALL_ENABLE)
+        {
+            return Err(HypervError::InvalidHypercallPage);
+        }
 
-    wrmsr(
-        HV_X64_MSR_SIMP,
-        per_cpu_variables.hv_simp_page_as_u64() | u64::from(HV_X64_MSR_SIMP_ENABLE),
-    );
-    if rdmsr(HV_X64_MSR_SIMP)
-        != per_cpu_variables.hv_simp_page_as_u64() | u64::from(HV_X64_MSR_SIMP_ENABLE)
-    {
-        return Err(HypervError::InvalidSimpPage);
-    }
+        wrmsr(
+            HV_X64_MSR_SIMP,
+            per_cpu_variables.hv_simp_page_as_u64() | u64::from(HV_X64_MSR_SIMP_ENABLE),
+        );
+        if rdmsr(HV_X64_MSR_SIMP)
+            == per_cpu_variables.hv_simp_page_as_u64() | u64::from(HV_X64_MSR_SIMP_ENABLE)
+        {
+            Ok(())
+        } else {
+            Err(HypervError::InvalidSimpPage)
+        }
+    })?;
+
     debug_serial_println!("HV_X64_MSR_SIMP: {:#x}", rdmsr(HV_X64_MSR_SIMP));
 
     let mut sint = HvSynicSint::new();
@@ -164,8 +172,8 @@ pub fn hv_do_hypercall(
     output: *mut core::ffi::c_void,
 ) -> Result<u64, HypervCallError> {
     let mut status: u64;
-    let per_cpu_variables = get_per_cpu_variables();
-    let hypercall_pg_addr: u64 = per_cpu_variables.hv_hypercall_page_as_u64();
+    let hypercall_pg_addr =
+        with_per_cpu_variables(|per_cpu_variables| per_cpu_variables.hv_hypercall_page_as_u64());
 
     unsafe {
         asm!(

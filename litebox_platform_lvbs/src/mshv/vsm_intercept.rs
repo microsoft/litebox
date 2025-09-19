@@ -1,5 +1,5 @@
 use crate::{
-    host::per_cpu_variables::get_per_cpu_variables,
+    host::per_cpu_variables::with_per_cpu_variables,
     mshv::{
         DEFAULT_REG_PIN_MASK, HV_REGISTER_PENDING_EVENT0, HV_X64_REGISTER_APIC_BASE,
         HV_X64_REGISTER_CR0, HV_X64_REGISTER_CR4, HV_X64_REGISTER_CSTAR, HV_X64_REGISTER_EFER,
@@ -46,14 +46,13 @@ pub enum InterceptedRegisterName {
 }
 
 pub fn vsm_handle_intercept() {
-    let per_cpu_variables = get_per_cpu_variables();
-    let simp_page = per_cpu_variables.hv_simp_page_as_mut_ptr();
+    let simp_page = with_per_cpu_variables(|per_cpu_variables| unsafe {
+        &mut *per_cpu_variables.hv_simp_page_as_mut_ptr()
+    });
 
-    let msg_type = unsafe { (*simp_page).sint_message[0].header.message_type };
-    unsafe {
-        (*simp_page).sint_message[0].header.message_type = HvMessageType::None.into();
-    }
-    let payload = unsafe { (*simp_page).sint_message[0].payload };
+    let msg_type = simp_page.sint_message[0].header.message_type;
+    simp_page.sint_message[0].header.message_type = HvMessageType::None.into();
+    let payload = simp_page.sint_message[0].payload;
 
     match HvMessageType::try_from(msg_type).unwrap() {
         HvMessageType::GpaIntercept => {
@@ -165,8 +164,9 @@ fn validate_and_continue_vtl0_register_write(
     mask: u64,
     int_msg_hdr: &HvInterceptMessageHeader,
 ) {
-    let per_cpu_variables = get_per_cpu_variables();
-    if let Some(allowed_value) = per_cpu_variables.vtl0_locked_regs.get(reg_name) {
+    if let Some(allowed_value) =
+        with_per_cpu_variables(|per_cpu_variables| per_cpu_variables.vtl0_locked_regs.get(reg_name))
+    {
         if value & mask == allowed_value {
             hvcall_set_vp_vtl0_registers(reg_name, value).expect("Failed to write VTL0 register");
             advance_vtl0_rip(int_msg_hdr).expect("Failed to advance VTL0 RIP");

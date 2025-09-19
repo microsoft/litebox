@@ -4,7 +4,7 @@
 use core::arch::asm;
 use litebox_platform_lvbs::{
     arch::{enable_fsgsbase, get_core_id, instrs::hlt_loop},
-    host::{bootparam::parse_boot_info, per_cpu_variables::get_per_cpu_variables},
+    host::{bootparam::parse_boot_info, per_cpu_variables::with_per_cpu_variables},
     serial_println,
 };
 
@@ -12,8 +12,8 @@ use litebox_platform_lvbs::{
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
     enable_fsgsbase();
-    let per_cpu_variables = get_per_cpu_variables();
-    let stack_top = per_cpu_variables.kernel_stack_top();
+    let stack_top =
+        with_per_cpu_variables(|per_cpu_variables| per_cpu_variables.kernel_stack_top());
 
     unsafe {
         asm!(

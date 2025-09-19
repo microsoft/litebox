@@ -1,7 +1,7 @@
 //! Global Descriptor Table (GDT) and Task State Segment (TSS)
 
 use crate::arch::{MAX_CORES, get_core_id};
-use crate::host::per_cpu_variables::get_per_cpu_variables;
+use crate::host::per_cpu_variables::with_per_cpu_variables;
 use core::mem::MaybeUninit;
 use x86_64::{
     PrivilegeLevel, VirtAddr,
@@ -83,30 +83,34 @@ static mut GDT_STORAGE: [MaybeUninit<GdtWrapper>; MAX_CORES] =
 
 fn setup_gdt_tss() {
     let core_id = get_core_id();
-    let per_cpu_variables = get_per_cpu_variables();
 
-    let stack_top = kernel_context.interrupt_stack_top() & !15;
-    let tss = &mut per_cpu_variables.tss;
-    tss.0.interrupt_stack_table[0] = VirtAddr::new(stack_top);
+    with_per_cpu_variables(|per_cpu_variables| {
+        let stack_top = kernel_context.interrupt_stack_top() & !15;
+        per_cpu_variables.tss.0.interrupt_stack_table[0] = VirtAddr::new(stack_top);
 
-    let gdt = unsafe { &mut *GDT_STORAGE[core_id].as_mut_ptr() };
-    *gdt = GdtWrapper::new();
+        let gdt = unsafe { &mut *GDT_STORAGE[core_id].as_mut_ptr() };
+        *gdt = GdtWrapper::new();
 
-    gdt.selectors.kernel_code = gdt.gdt.append(Descriptor::kernel_code_segment());
-    gdt.selectors.kernel_data = gdt.gdt.append(Descriptor::kernel_data_segment());
-    gdt.selectors.tss = gdt.gdt.append(Descriptor::tss_segment(&tss.0));
-    gdt.selectors.user_code = gdt.gdt.append(Descriptor::user_code_segment());
-    gdt.selectors.user_data = gdt.gdt.append(Descriptor::user_data_segment());
+        // Safety: this is an unsafe hack to get a 'static reference to the TSS due to
+        // `Descriptor::tss_segment()`'s requirement.
+        // TODO: have a separate per-CPU variables with static lifetime for TSS and others?
+        let tss_ref = &raw const (per_cpu_variables.tss.0) as u64;
+        let tss_ref = unsafe { &*(tss_ref as *const TaskStateSegment) };
+        gdt.selectors.tss = gdt.gdt.append(Descriptor::tss_segment(tss_ref));
 
-    gdt.gdt.load();
+        gdt.selectors.kernel_code = gdt.gdt.append(Descriptor::kernel_code_segment());
+        gdt.selectors.kernel_data = gdt.gdt.append(Descriptor::kernel_data_segment());
+        gdt.selectors.user_code = gdt.gdt.append(Descriptor::user_code_segment());
+        gdt.selectors.user_data = gdt.gdt.append(Descriptor::user_data_segment());
+        gdt.gdt.load();
+        unsafe {
+            CS::set_reg(gdt.selectors.kernel_code);
+            DS::set_reg(gdt.selectors.kernel_data);
+            load_tss(gdt.selectors.tss);
+        }
 
-    unsafe {
-        CS::set_reg(gdt.selectors.kernel_code);
-        DS::set_reg(gdt.selectors.kernel_data);
-        load_tss(gdt.selectors.tss);
-    }
-
-    per_cpu_variables.gdt = Some(gdt);
+        per_cpu_variables.gdt = Some(gdt);
+    });
 }
 
 /// Set up GDT and TSS (for a core)

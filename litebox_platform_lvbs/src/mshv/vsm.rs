@@ -5,7 +5,7 @@ use crate::mshv::mem_integrity::parse_modinfo;
 use crate::{
     arch::get_core_id,
     debug_serial_print, debug_serial_println,
-    host::per_cpu_variables::get_per_cpu_variables,
+    host::per_cpu_variables::with_per_cpu_variables,
     host::{
         bootparam::{get_num_possible_cpus, get_vtl1_memory_info},
         linux::{CpuMask, KEXEC_SEGMENT_MAX, Kimage},
@@ -1092,15 +1092,17 @@ impl ControlRegMap {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
-    let per_cpu_variables = get_per_cpu_variables();
+    with_per_cpu_variables(|per_cpu_variables| {
+        per_cpu_variables.vtl0_locked_regs.init();
 
-    per_cpu_variables.vtl0_locked_regs.init();
-
-    for reg_name in per_cpu_variables.vtl0_locked_regs.reg_names() {
-        let value = hvcall_get_vp_vtl0_registers(reg_name)?;
-        per_cpu_variables.vtl0_locked_regs.set(reg_name, value);
-    }
+        for reg_name in per_cpu_variables.vtl0_locked_regs.reg_names() {
+            if let Ok(value) = hvcall_get_vp_vtl0_registers(reg_name) {
+                per_cpu_variables.vtl0_locked_regs.set(reg_name, value);
+            }
+        }
+    });
 
     Ok(0)
 }

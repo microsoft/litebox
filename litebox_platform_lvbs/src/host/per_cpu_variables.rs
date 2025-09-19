@@ -142,23 +142,36 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
 /// Store the addresses of per-CPU variables. The kernel threads are expected to access
 /// the corresponding per-CPU variables via the GS registers which will store the addresses later.
 /// Instead of maintaining this map, we might be able to use a hypercall to directly program each core's GS register.
-static mut PER_CPU_VARIABLE_ADDRESSES: [Option<u64>; MAX_CORES] = [None; MAX_CORES];
+static mut PER_CPU_VARIABLE_ADDRESSES: [Option<*mut PerCpuVariables>; MAX_CORES] =
+    [const { None }; MAX_CORES];
 
-/// Get the per-CPU variables for the current core.
+/// Execute a closure with a mutable reference to the current core's per-CPU variables.
+///
+/// # Safety
+/// This function assumes the following:
+/// - The GSBASE register values of individual cores must be properly set (i.e., they must be different).
+/// - `get_core_id()` must return distinct APIC IDs for different cores.
+///
+/// If we cannot guarantee these assumptions, this function may cause undefined behavior.
+///
 /// # Panics
-/// Panics if GSBASE is not set
-pub fn get_per_cpu_variables() -> &'static mut PerCpuVariables {
+/// Panics if GSBASE is not set, it contains a non-canonical address, or no per-CPU variables are allocated
+pub fn with_per_cpu_variables<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut PerCpuVariables) -> R,
+{
     let gsbase = rdgsbase();
-    if gsbase == 0 {
+    let per_cpu_variables = if gsbase == 0 {
         let core_id = get_core_id();
         if let Some(addr) = if core_id == 0 {
-            Some(&raw mut BSP_VARIABLES as u64)
+            Some(&raw mut BSP_VARIABLES)
         } else {
             unsafe { PER_CPU_VARIABLE_ADDRESSES[core_id] }
         } {
-            let addr = x86_64::VirtAddr::new(addr);
+            let addr = x86_64::VirtAddr::try_new(addr.addr() as u64)
+                .expect("Non-canonical per-CPU variable address");
             wrgsbase(addr.as_u64());
-            unsafe { &mut *addr.as_mut_ptr() }
+            unsafe { &mut *addr.as_mut_ptr::<PerCpuVariables>() }
         } else {
             panic!(
                 "GSBASE is not set, and no per-CPU variables are allocated for core {}",
@@ -166,9 +179,10 @@ pub fn get_per_cpu_variables() -> &'static mut PerCpuVariables {
             );
         }
     } else {
-        let addr = x86_64::VirtAddr::new(gsbase);
-        unsafe { &mut *addr.as_mut_ptr() }
-    }
+        let addr = x86_64::VirtAddr::try_new(gsbase).expect("Non-canonical GSBASE value");
+        unsafe { &mut *addr.as_mut_ptr::<PerCpuVariables>() }
+    };
+    f(per_cpu_variables)
 }
 
 /// Allocate per-CPU variables in heap for all possible cores. We expect that the BSP will call
@@ -198,10 +212,9 @@ pub fn allocate_per_cpu_variables() {
             .fill(0);
         }
         let per_cpu_variables = unsafe { per_cpu_variables.assume_init_mut() };
-
         unsafe {
             PER_CPU_VARIABLE_ADDRESSES[i] =
-                Some(core::ptr::from_mut::<PerCpuVariables>(per_cpu_variables) as u64);
+                Some(core::ptr::from_mut::<PerCpuVariables>(per_cpu_variables));
         }
     }
 }
