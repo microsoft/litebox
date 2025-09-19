@@ -7,9 +7,9 @@
 //! Whenever we want/need to make a new decision or add an interface, we are going to try our best
 //! to keep things largely consistent with the anymap crate.
 //!
-//! Due to how we're using it within LiteBox, we are doing something similar to `anymap::Map<dyn Any
-//! + Send + Sync>` rather than a direct `anymap::AnyMap` (which would just be equivalent to
-//! `anymap::Map<dyn Any>`.
+//! Due to how we're using it within LiteBox, what we are doing is something similar to
+//! `anymap::Map<dyn Any + Send + Sync>` rather than a direct `anymap::AnyMap` (which would just be
+//! equivalent to `anymap::Map<dyn Any>`).
 
 use alloc::boxed::Box;
 use core::any::{Any, TypeId};
