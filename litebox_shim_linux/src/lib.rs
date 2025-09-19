@@ -6,7 +6,6 @@
 #![no_std]
 #![allow(dead_code)]
 #![allow(unused_must_use)]
-#![allow(unused_unsafe)]
 #![allow(unused_variables)]
 
 extern crate alloc;
@@ -822,7 +821,7 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
                 Err(Errno::EINVAL)
             } else {
                 let raw_bytes = cpuset.as_bytes();
-                unsafe { mask.copy_from_slice(0, raw_bytes) }
+                mask.copy_from_slice(0, raw_bytes)
                     .map(|()| raw_bytes.len())
                     .ok_or(Errno::EFAULT)
             }

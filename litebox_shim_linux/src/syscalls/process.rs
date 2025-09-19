@@ -455,20 +455,15 @@ pub(crate) fn sys_clone(
 
 /// Handle syscall `set_tid_address`.
 pub(crate) fn sys_set_tid_address(tidptr: crate::MutPtr<i32>) -> i32 {
-    unsafe {
-        litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| {
-            tls.current_task.clear_child_tid = Some(tidptr);
-            tls.current_task.tid
-        })
-    }
+    litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| {
+        tls.current_task.clear_child_tid = Some(tidptr);
+        tls.current_task.tid
+    })
 }
 
 /// Handle syscall `gettid`.
 pub(crate) fn sys_gettid() -> i32 {
-    unsafe {
-        litebox_platform_multiplex::platform()
-            .with_thread_local_storage_mut(|tls| tls.current_task.tid)
-    }
+    litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| tls.current_task.tid)
 }
 
 // TODO: enforce the following limits:
@@ -1070,25 +1065,21 @@ mod tests {
             #[unsafe(no_mangle)]
             #[unsafe(naked)]
             pub extern "C" fn $wrapper() -> ! {
-                unsafe {
-                    core::arch::naked_asm!(
-                        "and rsp, -16",  // make it 16-byte aligned
-                        "call {func}",
-                        func = sym $target,
-                    )
-                }
+                core::arch::naked_asm!(
+                    "and rsp, -16",  // make it 16-byte aligned
+                    "call {func}",
+                    func = sym $target,
+                )
             }
             #[cfg(target_arch = "x86")]
             #[unsafe(no_mangle)]
             #[unsafe(naked)]
             pub extern "C" fn $wrapper() -> ! {
-                unsafe {
-                    core::arch::naked_asm!(
-                        "and esp, -16",  // make it 16-byte aligned
-                        "call {func}",
-                        func = sym $target,
-                    )
-                }
+                core::arch::naked_asm!(
+                    "and esp, -16",  // make it 16-byte aligned
+                    "call {func}",
+                    func = sym $target,
+                )
             }
         };
     }
