@@ -85,7 +85,7 @@ fn setup_gdt_tss() {
     let core_id = get_core_id();
 
     with_per_cpu_variables(|per_cpu_variables| {
-        let stack_top = kernel_context.interrupt_stack_top() & !15;
+        let stack_top = per_cpu_variables.interrupt_stack_top() & !15;
         per_cpu_variables.tss.0.interrupt_stack_table[0] = VirtAddr::new(stack_top);
 
         let gdt = unsafe { &mut *GDT_STORAGE[core_id].as_mut_ptr() };
