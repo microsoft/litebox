@@ -326,11 +326,15 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         clippy::missing_panics_doc,
         reason = "the invariants guarantee that the unwrap panics cannot occur"
     )]
-    pub fn with_metadata<Subsystem: FdEnabledSubsystem, T: core::any::Any, R>(
+    pub fn with_metadata<Subsystem, T, R>(
         &self,
         fd: &TypedFd<Subsystem>,
         f: impl FnOnce(&T) -> R,
-    ) -> Result<R, MetadataError> {
+    ) -> Result<R, MetadataError>
+    where
+        Subsystem: FdEnabledSubsystem,
+        T: core::any::Any + Send + Sync,
+    {
         let ind_entry = self.entries[fd.x.as_usize()].as_ref().unwrap();
         match ind_entry.metadata.get::<T>() {
             Some(m) => Ok(f(m)),
@@ -348,11 +352,15 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         clippy::missing_panics_doc,
         reason = "the invariants guarantee that the unwrap panics cannot occur"
     )]
-    pub fn with_metadata_mut<Subsystem: FdEnabledSubsystem, T: core::any::Any, R>(
+    pub fn with_metadata_mut<Subsystem, T, R>(
         &mut self,
         fd: &TypedFd<Subsystem>,
         f: impl FnOnce(&mut T) -> R,
-    ) -> Result<R, MetadataError> {
+    ) -> Result<R, MetadataError>
+    where
+        Subsystem: FdEnabledSubsystem,
+        T: core::any::Any + Send + Sync,
+    {
         let ind_entry = self.entries[fd.x.as_usize()].as_mut().unwrap();
         match ind_entry.metadata.get_mut::<T>() {
             Some(m) => Ok(f(m)),
@@ -375,11 +383,15 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         clippy::missing_panics_doc,
         reason = "the invariants guarantee that the unwrap panics cannot occur"
     )]
-    pub fn set_entry_metadata<Subsystem: FdEnabledSubsystem, T: core::any::Any>(
+    pub fn set_entry_metadata<Subsystem, T>(
         &mut self,
         fd: &TypedFd<Subsystem>,
         metadata: T,
-    ) -> Option<T> {
+    ) -> Option<T>
+    where
+        Subsystem: FdEnabledSubsystem,
+        T: core::any::Any + Send + Sync,
+    {
         self.entries[fd.x.as_usize()]
             .as_ref()
             .unwrap()
@@ -398,11 +410,15 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         clippy::missing_panics_doc,
         reason = "the invariants guarantee that the unwrap panics cannot occur"
     )]
-    pub fn set_fd_metadata<Subsystem: FdEnabledSubsystem, T: core::any::Any>(
+    pub fn set_fd_metadata<Subsystem, T>(
         &mut self,
         fd: &TypedFd<Subsystem>,
         metadata: T,
-    ) -> Option<T> {
+    ) -> Option<T>
+    where
+        Subsystem: FdEnabledSubsystem,
+        T: core::any::Any + Send + Sync,
+    {
         self.entries[fd.x.as_usize()]
             .as_mut()
             .unwrap()
