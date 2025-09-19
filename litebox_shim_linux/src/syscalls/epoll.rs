@@ -66,7 +66,6 @@ impl DescriptorRef {
                 close_on_exec: AtomicBool::new(false),
             }),
             DescriptorRef::Socket(socket) => socket.upgrade().map(Descriptor::Socket),
-            _ => todo!(),
         }
     }
 }

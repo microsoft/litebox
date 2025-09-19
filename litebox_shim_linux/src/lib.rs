@@ -6,7 +6,6 @@
 #![no_std]
 #![allow(
     dead_code,
-    unreachable_patterns,
     unused_must_use,
     unused_mut,
     unused_unsafe,
