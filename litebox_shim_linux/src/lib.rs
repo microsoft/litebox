@@ -4,14 +4,15 @@
 //! chosen by the [platform multiplex](../litebox_platform_multiplex/index.html).
 
 #![no_std]
-// NOTE(jayb): Allowing this only until the API design is fleshed out, once that is complete, this
-// suppressed warning should be removed.
-#![allow(dead_code, unused)]
-#![warn(unused_imports)]
 #![expect(
     clippy::unused_self,
     reason = "by convention, syscalls and related methods take &self even if unused"
 )]
+#![expect(dead_code, reason = "transitionary to be removed soon")]
+#![expect(unused_must_use, reason = "transitionary to be removed soon")]
+#![expect(unused_mut, reason = "transitionary to be removed soon")]
+#![expect(unused_unsafe, reason = "transitionary to be removed soon")]
+#![expect(unused_variables, reason = "transitionary to be removed soon")]
 
 extern crate alloc;
 
