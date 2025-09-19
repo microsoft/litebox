@@ -4,13 +4,10 @@
 //! chosen by the [platform multiplex](../litebox_platform_multiplex/index.html).
 
 #![no_std]
-#![allow(
-    dead_code,
-    unused_must_use,
-    unused_mut,
-    unused_unsafe,
-    unused_variables
-)]
+#![allow(dead_code)]
+#![allow(unused_must_use)]
+#![allow(unused_unsafe)]
+#![allow(unused_variables)]
 
 extern crate alloc;
 

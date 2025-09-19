@@ -551,7 +551,7 @@ pub(crate) fn sys_recvfrom(
     fd: i32,
     buf: MutPtr<u8>,
     len: usize,
-    mut flags: ReceiveFlags,
+    flags: ReceiveFlags,
     sockaddr: Option<MutPtr<u8>>,
     addrlen: Option<MutPtr<u32>>,
 ) -> Result<usize, Errno> {
