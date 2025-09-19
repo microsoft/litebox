@@ -277,7 +277,7 @@ impl Socket {
         &self,
         buf: &[u8],
         flags: SendFlags,
-        sockaddr: Option<SocketAddr>,
+        _sockaddr: Option<SocketAddr>,
     ) -> Result<usize, Errno> {
         let n = litebox_net()
             .lock()
@@ -550,7 +550,7 @@ pub(crate) fn sys_sendto(
 pub(crate) fn sys_recvfrom(
     fd: i32,
     buf: MutPtr<u8>,
-    len: usize,
+    _len: usize,
     flags: ReceiveFlags,
     sockaddr: Option<MutPtr<u8>>,
     addrlen: Option<MutPtr<u32>>,

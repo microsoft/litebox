@@ -309,7 +309,7 @@ impl EpollEntry {
 }
 
 impl Observer<Events> for EpollEntry {
-    fn on_events(&self, events: &Events) {
+    fn on_events(&self, _events: &Events) {
         self.ready.push(self);
     }
 }

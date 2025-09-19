@@ -104,7 +104,7 @@ pub(crate) fn sys_arch_prctl(
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn set_thread_area(
-    user_desc: crate::MutPtr<litebox_common_linux::UserDesc>,
+    _user_desc: crate::MutPtr<litebox_common_linux::UserDesc>,
 ) -> Result<(), Errno> {
     Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
 }
@@ -184,8 +184,8 @@ const ROBUST_LIST_LIMIT: isize = 2048;
  */
 fn handle_futex_death(
     futex_addr: crate::ConstPtr<u32>,
-    pi: bool,
-    pending_op: bool,
+    _pi: bool,
+    _pending_op: bool,
 ) -> Result<(), Errno> {
     if futex_addr.as_usize() % 4 != 0 {
         return Err(Errno::EINVAL);
@@ -858,7 +858,7 @@ pub(crate) fn sys_execve(
 ) -> Result<(), Errno> {
     fn copy_vector(
         mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
-        which: &str,
+        _which: &str,
     ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
         let mut out = alloc::vec::Vec::new();
         let mut total = 0usize;

@@ -6,7 +6,6 @@
 #![no_std]
 #![allow(dead_code)]
 #![allow(unused_must_use)]
-#![allow(unused_variables)]
 
 extern crate alloc;
 
