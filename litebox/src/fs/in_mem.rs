@@ -10,12 +10,10 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MetadataError, MkdirError, OpenError,
-    PathError, ReadDirError, ReadError, RmdirError, SeekError, SetMetadataError, TruncateError,
-    UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
+    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, UserInfo};
-use crate::utilities::anymap::AnyMap;
 
 /// Just a random constant that is distinct from other file systems. In this case, it is
 /// `b'IMem'.hex()`.
@@ -188,7 +186,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                         userinfo: self.current_user,
                     },
                     data: Vec::new(),
-                    metadata: AnyMap::new(),
                     unique_id: self.fresh_id(),
                 })));
                 let old = root.entries.insert(path, entry.clone());
@@ -231,13 +228,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                         read_allowed,
                         write_allowed,
                         position: 0,
-                        metadata: AnyMap::new(),
                     })
             }
-            Entry::Dir(dir) => self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
-                dir: dir.clone(),
-                metadata: AnyMap::new(),
-            }),
+            Entry::Dir(dir) => self
+                .litebox
+                .descriptor_table_mut()
+                .insert(Descriptor::Dir { dir: dir.clone() }),
         };
         if flags.contains(OFlags::TRUNC) {
             match self.truncate(&fd, 0, true) {
@@ -268,7 +264,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             read_allowed,
             write_allowed: _,
             position,
-            metadata: _,
         } = &mut descriptor_table.get_entry_mut(fd).entry
         else {
             return Err(ReadError::NotAFile);
@@ -302,7 +297,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             read_allowed: _,
             write_allowed,
             position,
-            metadata: _,
         } = &mut descriptor_table.get_entry_mut(fd).entry
         else {
             return Err(WriteError::NotAFile);
@@ -344,7 +338,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             read_allowed: _,
             write_allowed: _,
             position,
-            metadata: _,
         } = &mut descriptor_table.get_entry_mut(fd).entry
         else {
             return Err(SeekError::NotAFile);
@@ -378,7 +371,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             read_allowed: _,
             write_allowed,
             position,
-            metadata: _,
         } = &mut descriptor_table.get_entry_mut(fd).entry
         else {
             return Err(TruncateError::IsDirectory);
@@ -524,7 +516,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     userinfo: self.current_user,
                 },
                 children: HashMap::default(),
-                metadata: AnyMap::new(),
                 unique_id: self.fresh_id(),
             }))),
         );
@@ -566,7 +557,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn read_dir(&self, fd: &FileFd<Platform>) -> Result<Vec<DirEntry>, ReadDirError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let Descriptor::Dir { dir, metadata: _ } = &descriptor_table.get_entry(fd).entry else {
+        let Descriptor::Dir { dir } = &descriptor_table.get_entry(fd).entry else {
             return Err(ReadDirError::NotADirectory);
         };
 
@@ -710,83 +701,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             blksize: BLOCK_SIZE,
         })
     }
-
-    fn with_metadata<T: core::any::Any, R>(
-        &self,
-        fd: &FileFd<Platform>,
-        f: impl FnOnce(&T) -> R,
-    ) -> Result<R, MetadataError> {
-        match &self.litebox.descriptor_table().get_entry(fd).entry {
-            Descriptor::File { file, metadata, .. } => match metadata.get::<T>() {
-                Some(m) => Ok(f(m)),
-                None => file
-                    .read()
-                    .metadata
-                    .get::<T>()
-                    .map(f)
-                    .ok_or(MetadataError::NoSuchMetadata),
-            },
-            Descriptor::Dir { dir, metadata } => match metadata.get::<T>() {
-                Some(m) => Ok(f(m)),
-                None => dir
-                    .read()
-                    .metadata
-                    .get::<T>()
-                    .map(f)
-                    .ok_or(MetadataError::NoSuchMetadata),
-            },
-        }
-    }
-
-    fn with_metadata_mut<T: core::any::Any, R>(
-        &self,
-        fd: &FileFd<Platform>,
-        f: impl FnOnce(&mut T) -> R,
-    ) -> Result<R, MetadataError> {
-        match &mut self.litebox.descriptor_table().get_entry_mut(fd).entry {
-            Descriptor::File { file, metadata, .. } => match metadata.get_mut::<T>() {
-                Some(m) => Ok(f(m)),
-                None => file
-                    .write()
-                    .metadata
-                    .get_mut::<T>()
-                    .map(f)
-                    .ok_or(MetadataError::NoSuchMetadata),
-            },
-            Descriptor::Dir { dir, metadata } => match metadata.get_mut::<T>() {
-                Some(m) => Ok(f(m)),
-                None => dir
-                    .write()
-                    .metadata
-                    .get_mut::<T>()
-                    .map(f)
-                    .ok_or(MetadataError::NoSuchMetadata),
-            },
-        }
-    }
-
-    fn set_file_metadata<T: core::any::Any>(
-        &self,
-        fd: &FileFd<Platform>,
-        m: T,
-    ) -> Result<Option<T>, SetMetadataError<T>> {
-        match &self.litebox.descriptor_table().get_entry(fd).entry {
-            Descriptor::File { file, .. } => Ok(file.write().metadata.insert(m)),
-            Descriptor::Dir { dir, .. } => Ok(dir.write().metadata.insert(m)),
-        }
-    }
-
-    fn set_fd_metadata<T: core::any::Any>(
-        &self,
-        fd: &FileFd<Platform>,
-        m: T,
-    ) -> Result<Option<T>, SetMetadataError<T>> {
-        match &mut self.litebox.descriptor_table().get_entry_mut(fd).entry {
-            Descriptor::File { metadata, .. } | Descriptor::Dir { metadata, .. } => {
-                Ok(metadata.insert(m))
-            }
-        }
-    }
 }
 
 struct RootDir<Platform: sync::RawSyncPrimitivesProvider> {
@@ -811,7 +725,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
                         userinfo: UserInfo { user: 0, group: 0 },
                     },
                     children: HashMap::default(),
-                    metadata: AnyMap::new(),
                     unique_id: 0,
                 }))),
             )]
@@ -890,7 +803,6 @@ type Dir<Platform> = Arc<sync::RwLock<Platform, DirX>>;
 pub(crate) struct DirX {
     perms: Permissions,
     children: HashMap<String, FileType>,
-    metadata: AnyMap,
     unique_id: usize,
 }
 
@@ -899,7 +811,6 @@ type File<Platform> = Arc<sync::RwLock<Platform, FileX>>;
 pub(crate) struct FileX {
     perms: Permissions,
     data: Vec<u8>,
-    metadata: AnyMap,
     unique_id: usize,
 }
 
@@ -957,11 +868,9 @@ pub(crate) enum Descriptor<Platform: sync::RawSyncPrimitivesProvider> {
         read_allowed: bool,
         write_allowed: bool,
         position: usize,
-        metadata: AnyMap,
     },
     Dir {
         dir: Dir<Platform>,
-        metadata: AnyMap,
     },
 }
 

@@ -16,7 +16,7 @@ use litebox_common_linux::{
     IoWriteVec, IoctlArg, errno::Errno,
 };
 
-use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox_fs};
+use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox, litebox_fs};
 
 /// Path in the file system
 enum FsPath<P: path::Arg> {
@@ -96,9 +96,10 @@ pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, 
                 Descriptor::Stdio(crate::stdio::StdioFile::new(typ, file, flags))
             } else {
                 if flags.contains(OFlags::CLOEXEC)
-                    && litebox_fs()
+                    && litebox()
+                        .descriptor_table_mut()
                         .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
-                        .is_err()
+                        .is_some()
                 {
                     unreachable!()
                 }
@@ -521,7 +522,8 @@ impl Descriptor {
         // Currently, only one such flag is defined: FD_CLOEXEC, the close-on-exec flag.
         // See https://www.man7.org/linux/man-pages/man2/F_GETFD.2const.html
         match self {
-            Descriptor::File(file) => litebox_fs()
+            Descriptor::File(file) => litebox()
+                .descriptor_table()
                 .with_metadata(file, |flags: &FileDescriptorFlags| *flags)
                 .unwrap_or(FileDescriptorFlags::empty()),
             Descriptor::Socket(socket) => todo!(),
@@ -628,9 +630,9 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
         FcntlArg::SETFD(flags) => {
             match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
                 Descriptor::File(file) => {
-                    if litebox_fs().set_fd_metadata(file, flags).is_err() {
-                        unreachable!()
-                    }
+                    let _old = litebox()
+                        .descriptor_table_mut()
+                        .set_fd_metadata(file, flags);
                 }
                 Descriptor::Socket(socket) => todo!(),
                 Descriptor::PipeReader { close_on_exec, .. }
@@ -724,7 +726,7 @@ pub fn sys_pipe2(flags: OFlags) -> Result<(u32, u32), Errno> {
     }
 
     let (writer, reader) = litebox::pipes::new_pipe(
-        crate::litebox(),
+        litebox(),
         DEFAULT_PIPE_BUF_SIZE,
         flags,
         // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
@@ -747,7 +749,7 @@ pub fn sys_eventfd2(initval: u32, flags: EfdFlags) -> Result<u32, Errno> {
         return Err(Errno::EINVAL);
     }
 
-    let eventfd = super::eventfd::EventFile::new(u64::from(initval), flags, crate::litebox());
+    let eventfd = super::eventfd::EventFile::new(u64::from(initval), flags, litebox());
     let fd = file_descriptors().write().insert(Descriptor::Eventfd {
         file: alloc::sync::Arc::new(eventfd),
         close_on_exec: core::sync::atomic::AtomicBool::new(flags.contains(EfdFlags::CLOEXEC)),
@@ -836,12 +838,9 @@ pub fn sys_ioctl(
         Descriptor::File(file) => match arg {
             IoctlArg::TCGETS(..) => Err(Errno::ENOTTY),
             IoctlArg::FIOCLEX => {
-                if litebox_fs()
-                    .set_fd_metadata(file, FileDescriptorFlags::FD_CLOEXEC)
-                    .is_err()
-                {
-                    unreachable!()
-                }
+                let _old = litebox()
+                    .descriptor_table_mut()
+                    .set_fd_metadata(file, FileDescriptorFlags::FD_CLOEXEC);
                 Ok(0)
             }
             _ => todo!(),
@@ -872,7 +871,7 @@ pub fn sys_epoll_create(flags: EpollCreateFlags) -> Result<u32, Errno> {
         return Err(Errno::EINVAL);
     }
 
-    let epoll_file = super::epoll::EpollFile::new(crate::litebox());
+    let epoll_file = super::epoll::EpollFile::new(litebox());
     let fd = file_descriptors().write().insert(Descriptor::Epoll {
         file: alloc::sync::Arc::new(epoll_file),
         close_on_exec: core::sync::atomic::AtomicBool::new(
@@ -1027,7 +1026,8 @@ pub(crate) fn sys_getdirent64(fd: i32, dirp: MutPtr<u8>, count: usize) -> Result
     let Descriptor::File(file) = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)? else {
         return Err(Errno::EBADF);
     };
-    let dir_off: Diroff = litebox_fs()
+    let dir_off: Diroff = litebox()
+        .descriptor_table()
         .with_metadata(file, |off: &Diroff| *off)
         .unwrap_or_default();
     let mut dir_off = dir_off.0;
@@ -1069,8 +1069,8 @@ pub(crate) fn sys_getdirent64(fd: i32, dirp: MutPtr<u8>, count: usize) -> Result
         nbytes += len;
         dir_off += 1;
     }
-    let _ = litebox_fs()
-        .set_fd_metadata(file, Diroff(dir_off))
-        .expect("failed to set dir offset");
+    let _old = litebox()
+        .descriptor_table_mut()
+        .set_fd_metadata(file, Diroff(dir_off));
     Ok(nbytes)
 }

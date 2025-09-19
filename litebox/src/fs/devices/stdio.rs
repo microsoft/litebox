@@ -275,42 +275,6 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
             blksize: STDIO_BLOCK_SIZE,
         })
     }
-
-    #[expect(unused_variables, reason = "unimplemented")]
-    fn with_metadata<T: core::any::Any, R>(
-        &self,
-        fd: &FileFd<Platform>,
-        f: impl FnOnce(&T) -> R,
-    ) -> Result<R, crate::fs::errors::MetadataError> {
-        unimplemented!()
-    }
-
-    #[expect(unused_variables, reason = "unimplemented")]
-    fn with_metadata_mut<T: core::any::Any, R>(
-        &self,
-        fd: &FileFd<Platform>,
-        f: impl FnOnce(&mut T) -> R,
-    ) -> Result<R, crate::fs::errors::MetadataError> {
-        unimplemented!()
-    }
-
-    #[expect(unused_variables, reason = "unimplemented")]
-    fn set_file_metadata<T: core::any::Any>(
-        &self,
-        fd: &FileFd<Platform>,
-        metadata: T,
-    ) -> Result<Option<T>, crate::fs::errors::SetMetadataError<T>> {
-        unimplemented!()
-    }
-
-    #[expect(unused_variables, reason = "unimplemented")]
-    fn set_fd_metadata<T: core::any::Any>(
-        &self,
-        fd: &FileFd<Platform>,
-        metadata: T,
-    ) -> Result<Option<T>, crate::fs::errors::SetMetadataError<T>> {
-        unimplemented!()
-    }
 }
 
 crate::fd::enable_fds_for_subsystem! {
