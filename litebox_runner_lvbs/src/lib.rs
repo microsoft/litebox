@@ -81,6 +81,8 @@ pub fn init() -> Option<&'static Platform> {
                 mem_fill_start,
                 mem_fill_size
             );
+
+            allocate_per_cpu_variables();
         } else {
             panic!("Failed to get memory info");
         }
@@ -92,8 +94,6 @@ pub fn init() -> Option<&'static Platform> {
     interrupts::init_idt();
     x86_64::instructions::interrupts::enable();
     Platform::register_syscall_handler(litebox_shim_optee::handle_syscall_request);
-
-    allocate_per_cpu_variables();
 
     ret
 }

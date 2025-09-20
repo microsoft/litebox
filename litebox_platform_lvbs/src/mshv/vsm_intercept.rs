@@ -164,9 +164,10 @@ fn validate_and_continue_vtl0_register_write(
     mask: u64,
     int_msg_hdr: &HvInterceptMessageHeader,
 ) {
-    if let Some(allowed_value) =
-        with_per_cpu_variables(|per_cpu_variables| per_cpu_variables.vtl0_locked_regs.get(reg_name))
-    {
+    let allowed_value = with_per_cpu_variables(|per_cpu_variables| {
+        per_cpu_variables.vtl0_locked_regs.get(reg_name)
+    });
+    if let Some(allowed_value) = allowed_value {
         if value & mask == allowed_value {
             hvcall_set_vp_vtl0_registers(reg_name, value).expect("Failed to write VTL0 register");
             advance_vtl0_rip(int_msg_hdr).expect("Failed to advance VTL0 RIP");
