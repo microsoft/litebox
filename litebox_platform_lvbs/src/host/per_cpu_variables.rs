@@ -14,6 +14,7 @@ use crate::{
     },
 };
 use alloc::boxed::Box;
+use core::{cell::RefCell, mem::MaybeUninit};
 use x86_64::structures::tss::TaskStateSegment;
 
 pub const INTERRUPT_STACK_SIZE: usize = 2 * PAGE_SIZE;
@@ -142,8 +143,8 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
 /// Store the addresses of per-CPU variables. The kernel threads are expected to access
 /// the corresponding per-CPU variables via the GS registers which will store the addresses later.
 /// Instead of maintaining this map, we might be able to use a hypercall to directly program each core's GS register.
-static mut PER_CPU_VARIABLE_ADDRESSES: [Option<*mut PerCpuVariables>; MAX_CORES] =
-    [const { None }; MAX_CORES];
+static mut PER_CPU_VARIABLE_ADDRESSES: [MaybeUninit<RefCell<*mut PerCpuVariables>>; MAX_CORES] =
+    [const { MaybeUninit::uninit() }; MAX_CORES];
 
 /// Execute a closure with a mutable reference to the current core's per-CPU variables.
 ///
@@ -152,36 +153,41 @@ static mut PER_CPU_VARIABLE_ADDRESSES: [Option<*mut PerCpuVariables>; MAX_CORES]
 /// - The GSBASE register values of individual cores must be properly set (i.e., they must be different).
 /// - `get_core_id()` must return distinct APIC IDs for different cores.
 ///
-/// If we cannot guarantee these assumptions, this function may cause undefined behavior.
+/// If we cannot guarantee these assumptions, this function may result in unsafe or undefined behaviors.
 ///
 /// # Panics
-/// Panics if GSBASE is not set, it contains a non-canonical address, or no per-CPU variables are allocated
+/// Panics if GSBASE is not set, it contains a non-canonical address, or no per-CPU variables are allocated.
+/// Panics if this function is recursively called (`BorrowMutError`).
 pub fn with_per_cpu_variables<F, R>(f: F) -> R
 where
     F: FnOnce(&mut PerCpuVariables) -> R,
+    R: Sized + 'static,
 {
-    let gsbase = rdgsbase();
-    let per_cpu_variables = if gsbase == 0 {
+    if rdgsbase() == 0 {
         let core_id = get_core_id();
-        if let Some(addr) = if core_id == 0 {
-            Some(&raw mut BSP_VARIABLES)
+        let addr = if core_id == 0 {
+            let addr = &raw mut BSP_VARIABLES;
+            unsafe {
+                PER_CPU_VARIABLE_ADDRESSES[0].write(RefCell::new(addr));
+                PER_CPU_VARIABLE_ADDRESSES[0].as_ptr()
+            }
         } else {
-            unsafe { PER_CPU_VARIABLE_ADDRESSES[core_id] }
-        } {
-            let addr = x86_64::VirtAddr::try_new(addr.addr() as u64)
-                .expect("Non-canonical per-CPU variable address");
-            wrgsbase(addr.as_u64());
-            unsafe { &mut *addr.as_mut_ptr::<PerCpuVariables>() }
-        } else {
-            panic!(
-                "GSBASE is not set, and no per-CPU variables are allocated for core {}",
-                core_id
-            );
-        }
-    } else {
-        let addr = x86_64::VirtAddr::try_new(gsbase).expect("Non-canonical GSBASE value");
-        unsafe { &mut *addr.as_mut_ptr::<PerCpuVariables>() }
-    };
+            unsafe { PER_CPU_VARIABLE_ADDRESSES[core_id].as_ptr() }
+        };
+        assert!(
+            !addr.is_null(),
+            "GSBASE is not set, and per-CPU variables are not allocated"
+        );
+        let addr = x86_64::VirtAddr::new(u64::try_from(addr.addr()).unwrap());
+        wrgsbase(addr.as_u64());
+    }
+
+    let gsbase = rdgsbase();
+    let addr = x86_64::VirtAddr::try_new(gsbase).expect("Non-canonical GSBASE value");
+    let refcell = unsafe { &*addr.as_ptr::<RefCell<*mut PerCpuVariables>>() };
+    let mut borrow = refcell.borrow_mut();
+    let per_cpu_variables = unsafe { &mut **borrow };
+
     f(per_cpu_variables)
 }
 
@@ -199,22 +205,24 @@ pub fn allocate_per_cpu_variables() {
         "# of possible CPUs ({num_cores}) exceeds MAX_CORES",
     );
 
+    // TODO: use `cpu_online_mask` to selectively allocate per-CPU variables
     #[allow(clippy::needless_range_loop)]
     for i in 1..num_cores {
-        let per_cpu_variables =
-            Box::leak(Box::new(core::mem::MaybeUninit::<PerCpuVariables>::uninit()));
-        unsafe {
-            // PerCpuVariables is larger than the stack size, so we can't use the stack to initialize it.
+        let mut per_cpu_variables = Box::new(core::mem::MaybeUninit::<PerCpuVariables>::uninit());
+        let per_cpu_variables = unsafe {
+            // `PerCpuVariables` is larger than the stack size, so we cannot use the stack to initialize it.
+            let ptr = per_cpu_variables.as_mut_ptr();
             core::slice::from_raw_parts_mut(
-                per_cpu_variables.as_mut_ptr().cast::<u8>(),
+                ptr.cast::<u8>(),
                 core::mem::size_of::<PerCpuVariables>(),
             )
             .fill(0);
-        }
-        let per_cpu_variables = unsafe { per_cpu_variables.assume_init_mut() };
+            (*ptr).tss = gdt::AlignedTss(TaskStateSegment::new());
+
+            per_cpu_variables.assume_init()
+        };
         unsafe {
-            PER_CPU_VARIABLE_ADDRESSES[i] =
-                Some(core::ptr::from_mut::<PerCpuVariables>(per_cpu_variables));
+            PER_CPU_VARIABLE_ADDRESSES[i].write(RefCell::new(Box::into_raw(per_cpu_variables)));
         }
     }
 }

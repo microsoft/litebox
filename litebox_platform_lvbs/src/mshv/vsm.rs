@@ -63,7 +63,7 @@ impl AlignedPage {
 // For now, we do not validate large kernel modules due to the VTL1's memory size limitation.
 const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
 
-pub fn init() {
+pub(crate) fn init() {
     assert!(
         !(get_core_id() == 0 && mshv_vsm_configure_partition().is_err()),
         "Failed to configure VSM partition"
@@ -1094,15 +1094,17 @@ impl ControlRegMap {
 
 #[allow(clippy::unnecessary_wraps)]
 fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
-    with_per_cpu_variables(|per_cpu_variables| {
+    let reg_names = with_per_cpu_variables(|per_cpu_variables| {
         per_cpu_variables.vtl0_locked_regs.init();
-
-        for reg_name in per_cpu_variables.vtl0_locked_regs.reg_names() {
-            if let Ok(value) = hvcall_get_vp_vtl0_registers(reg_name) {
-                per_cpu_variables.vtl0_locked_regs.set(reg_name, value);
-            }
-        }
+        per_cpu_variables.vtl0_locked_regs.reg_names()
     });
+    for reg_name in reg_names {
+        if let Ok(value) = hvcall_get_vp_vtl0_registers(reg_name) {
+            with_per_cpu_variables(|per_cpu_variables| {
+                per_cpu_variables.vtl0_locked_regs.set(reg_name, value);
+            });
+        }
+    }
 
     Ok(0)
 }
