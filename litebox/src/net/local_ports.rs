@@ -68,6 +68,17 @@ impl LocalPortAllocator {
         }
     }
 
+    /// Allocate a local port, either ephemeral (if `port` is 0) or specific (if `port` is non-zero)
+    pub(crate) fn allocate_local_port(
+        &mut self,
+        port: u16,
+    ) -> Result<LocalPort, LocalPortAllocationError> {
+        let Some(port) = NonZeroU16::new(port) else {
+            return self.ephemeral_port();
+        };
+        self.specific_port(port)
+    }
+
     /// Increments the ref-count for a local port, producing a new [`LocalPort`] token to be used
     #[must_use]
     pub(crate) fn allocate_same_local_port(&mut self, port: &LocalPort) -> LocalPort {

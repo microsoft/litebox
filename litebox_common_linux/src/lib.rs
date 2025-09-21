@@ -1925,7 +1925,7 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         len: usize,
         flags: ReceiveFlags,
         addr: Option<Platform::RawMutPointer<u8>>,
-        addrlen: Option<Platform::RawMutPointer<u32>>,
+        addrlen: Platform::RawMutPointer<u32>,
     },
     Bind {
         sockfd: i32,
@@ -1941,6 +1941,11 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         optname: SocketOptionName,
         optval: Platform::RawConstPointer<u8>,
         optlen: usize,
+    },
+    Getsockname {
+        sockfd: i32,
+        addr: Platform::RawMutPointer<u8>,
+        addrlen: Platform::RawMutPointer<u32>,
     },
     Uname {
         buf: Platform::RawMutPointer<Utsname>,
@@ -2381,6 +2386,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     SyscallRequest::Ret(errno::Errno::EINVAL)
                 }
             }
+            Sysno::getsockname => sys_req!(Getsockname { sockfd, addr:*, addrlen:* }),
             Sysno::exit => sys_req!(Exit { status }),
             Sysno::exit_group => sys_req!(ExitGroup { status }),
             Sysno::uname => sys_req!(Uname { buf:* }),

@@ -2,7 +2,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use core::net::{Ipv4Addr, SocketAddr};
+use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use crate::event::Events;
 use crate::platform::Instant;
@@ -12,7 +12,7 @@ use bitflags::bitflags;
 use smoltcp::socket::{icmp, raw, tcp, udp};
 
 pub mod errors;
-mod local_ports;
+pub mod local_ports;
 mod phy;
 
 #[cfg(test)]
@@ -190,7 +190,12 @@ impl TcpServerSpecific {
 }
 
 /// Socket-specific data for UDP sockets
-pub(crate) struct UdpSpecific {}
+pub(crate) struct UdpSpecific {
+    /// Remote endpoint
+    ///
+    /// If `connect`-ed, this is the remote endpoint to which packets are sent by default.
+    remote_endpoint: Option<smoltcp::wire::IpEndpoint>,
+}
 
 /// Socket-specific data for ICMP sockets
 pub(crate) struct IcmpSpecific {}
@@ -439,7 +444,7 @@ where
             self.litebox.descriptor_table().iter::<Network<Platform>>()
         {
             match socket_handle.entry.protocol() {
-                Protocol::Tcp => {
+                Protocol::Tcp | Protocol::Udp => {
                     // TODO: We need to actually update events here; with the previous event-manager interfaces we had, this could be done with:
                     // ```
                     // let socket: &tcp::Socket = self.socket_set.get(socket_handle.entry.handle);
@@ -451,7 +456,6 @@ where
                     //
                     // We need to migrate this to the newer interfaces that use observers.
                 }
-                Protocol::Udp => unimplemented!(),
                 Protocol::Icmp => unimplemented!(),
                 Protocol::Raw { protocol: _ } => unimplemented!(),
             }
@@ -539,7 +543,9 @@ where
                     local_port: None,
                     server_socket: None,
                 }),
-                Protocol::Udp => unimplemented!(),
+                Protocol::Udp => ProtocolSpecific::Udp(UdpSpecific {
+                    remote_endpoint: None,
+                }),
                 Protocol::Icmp => unimplemented!(),
                 Protocol::Raw { protocol: _ } => unimplemented!(),
             },
@@ -607,7 +613,10 @@ where
                 match socket.connect(self.interface.context(), addr, local_endpoint) {
                     Ok(()) => {}
                     Err(tcp::ConnectError::InvalidState) => unreachable!(),
-                    Err(tcp::ConnectError::Unaddressable) => todo!(),
+                    Err(tcp::ConnectError::Unaddressable) => {
+                        self.local_port_allocator.deallocate(local_port);
+                        return Err(ConnectError::Unaddressable);
+                    }
                 }
                 let old_port = socket_handle.tcp_mut().local_port.replace(local_port);
                 if old_port.is_some() {
@@ -615,7 +624,21 @@ where
                     unimplemented!()
                 }
             }
-            Protocol::Udp => unimplemented!(),
+            Protocol::Udp => {
+                if addr.port() == 0 {
+                    return Err(ConnectError::Unaddressable);
+                }
+                let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                if !socket.is_open() {
+                    let local_port = self.local_port_allocator.ephemeral_port()?;
+                    let local_endpoint: smoltcp::wire::IpListenEndpoint = local_port.port().into();
+                    let Ok(()) = socket.bind(local_endpoint) else {
+                        unreachable!("binding to a free port cannot fail")
+                    };
+                }
+                let addr: smoltcp::wire::IpEndpoint = (*addr).into();
+                socket_handle.udp_mut().remote_endpoint = Some(addr);
+            }
             Protocol::Icmp => unimplemented!(),
             Protocol::Raw { protocol: _ } => unimplemented!(),
         }
@@ -625,6 +648,32 @@ where
 
         self.automated_platform_interaction(PollDirection::Both);
         Ok(())
+    }
+
+    /// Get the local address and port a socket is bound to.
+    pub fn get_local_addr(&self, fd: &SocketFd<Platform>) -> SocketAddr {
+        let descriptor_table = self.litebox.descriptor_table();
+        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let socket_handle = &mut table_entry.entry;
+
+        match socket_handle.protocol() {
+            Protocol::Tcp => unimplemented!(),
+            Protocol::Udp => {
+                let socket: &udp::Socket = self.socket_set.get(socket_handle.handle);
+                let local_endpoint = socket.endpoint();
+                match local_endpoint.addr {
+                    Some(smoltcp::wire::IpAddress::Ipv4(ipv4)) => {
+                        SocketAddr::V4(SocketAddrV4::new(ipv4, local_endpoint.port))
+                    }
+                    None => SocketAddr::V4(SocketAddrV4::new(
+                        Ipv4Addr::UNSPECIFIED,
+                        local_endpoint.port,
+                    )),
+                }
+            }
+            Protocol::Icmp => unimplemented!(),
+            Protocol::Raw { protocol: _ } => unimplemented!(),
+        }
     }
 
     /// Bind a socket to a specific address and port.
@@ -644,46 +693,46 @@ where
         match socket_handle.protocol() {
             Protocol::Tcp => {
                 if socket_handle.tcp().server_socket.is_some() {
-                    // Need to think about how to handle this situation where this has already been
-                    // marked as a server socket.
+                    return Err(BindError::AlreadyBound);
+                }
+                let lp = self
+                    .local_port_allocator
+                    .allocate_local_port(addr.port())
+                    .map_err(|_| BindError::PortAlreadyInUse(addr.port()))?;
+                let new_port = lp.port();
+                let old_lp = socket_handle.tcp_mut().local_port.replace(lp);
+                if let Some(old) = old_lp {
+                    self.local_port_allocator.deallocate(old);
+                    // Currently unsure if the dealloc is sufficient and if we need to do
+                    // anything else here (possibly return an error message due to trying to
+                    // do things to a connected socket, not sure), so just marking as
+                    // unimplemented for now to trigger a panic.
                     unimplemented!()
                 }
-                let port = match self.local_port_allocator.specific_port(
-                    addr.port()
-                        .try_into()
-                        .or(Err(BindError::UnsupportedAddress(*socket_addr)))?,
-                ) {
-                    Ok(lp) => {
-                        let old_lp = socket_handle.tcp_mut().local_port.replace(lp);
-                        if let Some(old) = old_lp {
-                            self.local_port_allocator.deallocate(old);
-                            // Currently unsure if the dealloc is sufficient and if we need to do
-                            // anything else here (possibly return an error message due to trying to
-                            // do things to a connected socket, not sure), so just marking as
-                            // unimplemented for now to trigger a panic.
-                            unimplemented!()
-                        }
-                        addr.port()
-                    }
-                    Err(e) => match e {
-                        local_ports::LocalPortAllocationError::AlreadyInUse(p) => {
-                            return Err(BindError::PortAlreadyInUse(p));
-                        }
-                        local_ports::LocalPortAllocationError::NoAvailableFreePorts => {
-                            unreachable!()
-                        }
-                    },
-                };
                 socket_handle.tcp_mut().server_socket = Some(TcpServerSpecific {
                     ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
                         addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
-                        port,
+                        port: new_port,
                     },
                     backlog: None,
                     socket_set_handles: vec![],
                 });
             }
-            Protocol::Udp => unimplemented!(),
+            Protocol::Udp => {
+                let lp = self
+                    .local_port_allocator
+                    .allocate_local_port(addr.port())
+                    .map_err(|_| BindError::PortAlreadyInUse(addr.port()))?;
+                let local_endpoint = smoltcp::wire::IpListenEndpoint {
+                    addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
+                    port: lp.port(),
+                };
+                let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                let _ = socket.bind(local_endpoint).map_err(|e| match e {
+                    udp::BindError::InvalidState => BindError::AlreadyBound,
+                    udp::BindError::Unaddressable => unreachable!(),
+                });
+            }
             Protocol::Icmp => unimplemented!(),
             Protocol::Raw { protocol: _ } => unimplemented!(),
         }
@@ -842,6 +891,17 @@ where
         buf: &[u8],
         flags: SendFlags,
     ) -> Result<usize, SendError> {
+        self.sendto(fd, buf, flags, None)
+    }
+
+    /// Send data over a socket, possibly specifying the destination address.
+    pub fn sendto(
+        &mut self,
+        fd: &SocketFd<Platform>,
+        buf: &[u8],
+        flags: SendFlags,
+        sockaddr: Option<SocketAddr>,
+    ) -> Result<usize, SendError> {
         let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table.get_entry_mut(fd);
         let socket_handle = &mut table_entry.entry;
@@ -856,7 +916,40 @@ where
                 .get_mut::<tcp::Socket>(socket_handle.handle)
                 .send_slice(buf)
                 .map_err(|tcp::SendError::InvalidState| SendError::SocketInInvalidState),
-            Protocol::Udp => unimplemented!(),
+            Protocol::Udp => {
+                let sockaddr = sockaddr
+                    .map(|s| match s {
+                        SocketAddr::V4(addr) => smoltcp::wire::IpEndpoint {
+                            addr: smoltcp::wire::IpAddress::Ipv4(*addr.ip()),
+                            port: addr.port(),
+                        },
+                        SocketAddr::V6(_) => unimplemented!(),
+                    })
+                    .or_else(|| socket_handle.udp().remote_endpoint);
+                let Some(remote_endpoint) = sockaddr else {
+                    return Err(SendError::Unaddressable);
+                };
+                let udp_socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                if !udp_socket.is_open() {
+                    let Ok(()) = udp_socket.bind(smoltcp::wire::IpListenEndpoint {
+                        addr: None,
+                        port: self
+                            .local_port_allocator
+                            .ephemeral_port()
+                            .map_err(SendError::PortAllocationFailure)?
+                            .port(),
+                    }) else {
+                        unreachable!("binding to a free port cannot fail")
+                    };
+                }
+                udp_socket
+                    .send_slice(buf, remote_endpoint)
+                    .map(|()| buf.len())
+                    .map_err(|e| match e {
+                        udp::SendError::BufferFull => SendError::BufferFull,
+                        udp::SendError::Unaddressable => SendError::Unaddressable,
+                    })
+            }
             Protocol::Icmp => unimplemented!(),
             Protocol::Raw { protocol: _ } => unimplemented!(),
         };
@@ -869,12 +962,14 @@ where
     }
 
     /// Receive data from a connected socket.
+    ///
+    /// On success, returns the number of bytes received and, if applicable, the source address.
     pub fn receive(
         &mut self,
         fd: &SocketFd<Platform>,
         buf: &mut [u8],
         flags: ReceiveFlags,
-    ) -> Result<usize, ReceiveError> {
+    ) -> Result<(usize, Option<SocketAddr>), ReceiveError> {
         // Note that we do an earlier-than-usual automated interaction to ingress packets since it
         // doesn't hurt to do this too often (other than wasting energy), and this allows us to
         // possibly get packets where we might otherwise return with size 0 on the `receive`.
@@ -892,11 +987,28 @@ where
                 .socket_set
                 .get_mut::<tcp::Socket>(socket_handle.handle)
                 .recv_slice(buf)
+                .map(|n| (n, None))
                 .map_err(|e| match e {
                     tcp::RecvError::InvalidState => ReceiveError::SocketInInvalidState,
                     tcp::RecvError::Finished => ReceiveError::OperationFinished,
                 }),
-            Protocol::Udp => unimplemented!(),
+            Protocol::Udp => match self
+                .socket_set
+                .get_mut::<udp::Socket>(socket_handle.handle)
+                .recv_slice(buf)
+            {
+                Ok((n, meta)) => {
+                    let remote_addr = match meta.endpoint.addr {
+                        smoltcp::wire::IpAddress::Ipv4(ipv4_addr) => {
+                            SocketAddr::V4(SocketAddrV4::new(ipv4_addr, meta.endpoint.port))
+                        }
+                    };
+                    Ok((n, Some(remote_addr)))
+                }
+                Err(udp::RecvError::Exhausted) => Ok((0, None)),
+                // TODO: how to read partial data instead of erroring out?
+                Err(udp::RecvError::Truncated) => unimplemented!(),
+            },
             Protocol::Icmp => unimplemented!(),
             Protocol::Raw { protocol: _ } => unimplemented!(),
         };

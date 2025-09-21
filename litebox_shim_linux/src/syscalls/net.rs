@@ -9,7 +9,8 @@ use litebox::{
     event::{Events, observer::Observer, polling::Pollee},
     fs::OFlags,
     net::{ReceiveFlags, SendFlags, SocketFd},
-    platform::{RawConstPointer, RawMutPointer},
+    platform::{RawConstPointer as _, RawMutPointer as _},
+    utils::TruncateExt as _,
 };
 use litebox_common_linux::{
     AddressFamily, SockFlags, SockType, SocketOption, SocketOptionName, TcpOption, errno::Errno,
@@ -47,10 +48,22 @@ impl From<CSockInetAddr> for SocketAddrV4 {
     }
 }
 
+impl From<SocketAddrV4> for CSockInetAddr {
+    fn from(addr: SocketAddrV4) -> Self {
+        CSockInetAddr {
+            family: AddressFamily::INET as i16,
+            port: addr.port().to_be(),
+            addr: addr.ip().octets(),
+            __pad: 0,
+        }
+    }
+}
+
 /// Socket address structure for different address families.
 /// Currently only supports IPv4 (AF_INET).
 #[non_exhaustive]
-pub(super) enum SocketAddress {
+#[derive(Clone)]
+pub(crate) enum SocketAddress {
     Inet(SocketAddr),
 }
 
@@ -280,7 +293,7 @@ impl Socket {
     ) -> Result<usize, Errno> {
         let n = litebox_net()
             .lock()
-            .send(self.fd.as_ref().unwrap(), buf, flags)?;
+            .sendto(self.fd.as_ref().unwrap(), buf, flags, sockaddr)?;
         if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
     }
 
@@ -290,9 +303,6 @@ impl Socket {
         flags: SendFlags,
         sockaddr: Option<SocketAddr>,
     ) -> Result<usize, Errno> {
-        if let Some(addr) = sockaddr {
-            unimplemented!("sendto with addr {addr}");
-        }
         if self.get_status().contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT) {
             self.try_sendto(buf, flags, sockaddr)
         } else {
@@ -312,14 +322,26 @@ impl Socket {
         }
     }
 
-    fn try_receive(&self, buf: &mut [u8], flags: ReceiveFlags) -> Result<usize, Errno> {
-        let n = litebox_net()
+    fn try_receive(
+        &self,
+        buf: &mut [u8],
+        flags: ReceiveFlags,
+    ) -> Result<(usize, Option<SocketAddr>), Errno> {
+        let (n, sockaddr) = litebox_net()
             .lock()
             .receive(self.fd.as_ref().unwrap(), buf, flags)?;
-        if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
+        if n == 0 {
+            Err(Errno::EAGAIN)
+        } else {
+            Ok((n, sockaddr))
+        }
     }
 
-    pub(crate) fn receive(&self, buf: &mut [u8], flags: ReceiveFlags) -> Result<usize, Errno> {
+    pub(crate) fn receive(
+        &self,
+        buf: &mut [u8],
+        flags: ReceiveFlags,
+    ) -> Result<(usize, Option<SocketAddr>), Errno> {
         if self.get_status().contains(OFlags::NONBLOCK) || flags.contains(ReceiveFlags::DONTWAIT) {
             self.try_receive(buf, flags)
         } else {
@@ -398,7 +420,10 @@ pub(crate) fn sys_socket(
     })
 }
 
-fn read_sockaddr_from_user(sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<SocketAddress, Errno> {
+pub(crate) fn read_sockaddr_from_user(
+    sockaddr: ConstPtr<u8>,
+    addrlen: usize,
+) -> Result<SocketAddress, Errno> {
     if addrlen < 2 {
         return Err(Errno::EINVAL);
     }
@@ -425,6 +450,36 @@ fn read_sockaddr_from_user(sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<Soc
         }
         _ => todo!("unsupported family {family:?}"),
     }
+}
+
+pub(crate) fn write_sockaddr_to_user(
+    sock_addr: SocketAddress,
+    addr: crate::MutPtr<u8>,
+    addrlen: crate::MutPtr<u32>,
+) -> Result<(), Errno> {
+    let addrlen_val = unsafe { addrlen.read_at_offset(0) }
+        .ok_or(Errno::EFAULT)?
+        .into_owned();
+    if addrlen_val >= i32::MAX as u32 {
+        return Err(Errno::EINVAL);
+    }
+    let len: u32 = match sock_addr {
+        SocketAddress::Inet(SocketAddr::V4(v4_addr)) => {
+            let addrlen_val = size_of::<CSockInetAddr>().min(addrlen_val as usize);
+            let c_addr: CSockInetAddr = v4_addr.into();
+            let bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(
+                    (&raw const c_addr).cast::<u8>(),
+                    size_of::<CSockInetAddr>(),
+                )
+            };
+            unsafe { addr.write_slice_at_offset(0, &bytes[..addrlen_val]) }.ok_or(Errno::EFAULT)?;
+            size_of::<CSockInetAddr>()
+        }
+        SocketAddress::Inet(SocketAddr::V6(_)) => todo!("copy_sockaddr_to_user for IPv6"),
+    }
+    .truncate();
+    unsafe { addrlen.write_at_offset(0, len) }.ok_or(Errno::EFAULT)
 }
 
 /// Handle syscall `accept`
@@ -466,15 +521,14 @@ pub(crate) fn sys_accept(
 }
 
 /// Handle syscall `connect`
-pub(crate) fn sys_connect(fd: i32, sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<(), Errno> {
+pub(crate) fn sys_connect(fd: i32, sockaddr: SocketAddress) -> Result<(), Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
 
-    let addr = read_sockaddr_from_user(sockaddr, addrlen)?;
     match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
         Descriptor::Socket(socket) => {
-            let SocketAddress::Inet(addr) = addr;
+            let SocketAddress::Inet(addr) = sockaddr;
             socket.connect(addr)
         }
         _ => Err(Errno::ENOTSOCK),
@@ -482,19 +536,18 @@ pub(crate) fn sys_connect(fd: i32, sockaddr: ConstPtr<u8>, addrlen: usize) -> Re
 }
 
 /// Handle syscall `bind`
-pub(crate) fn sys_bind(sockfd: i32, sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<(), Errno> {
+pub(crate) fn sys_bind(sockfd: i32, sockaddr: SocketAddress) -> Result<(), Errno> {
     let Ok(sockfd) = u32::try_from(sockfd) else {
         return Err(Errno::EBADF);
     };
 
-    let addr = read_sockaddr_from_user(sockaddr, addrlen)?;
     match file_descriptors()
         .read()
         .get_fd(sockfd)
         .ok_or(Errno::EBADF)?
     {
         Descriptor::Socket(socket) => {
-            let SocketAddress::Inet(addr) = addr;
+            let SocketAddress::Inet(addr) = sockaddr;
             socket.bind(addr)
         }
         _ => Err(Errno::ENOTSOCK),
@@ -523,29 +576,21 @@ pub(crate) fn sys_sendto(
     buf: ConstPtr<u8>,
     len: usize,
     mut flags: SendFlags,
-    sockaddr: Option<ConstPtr<u8>>,
-    addrlen: u32,
+    sockaddr: Option<SocketAddress>,
 ) -> Result<usize, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
 
-    let sockaddr = sockaddr
-        .map(|addr| read_sockaddr_from_user(addr, addrlen as usize))
-        .transpose()?;
     let buf = unsafe { buf.to_cow_slice(len).ok_or(Errno::EFAULT) }?;
     let file_table = file_descriptors().read();
     let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
     match socket {
         Descriptor::Socket(socket) => {
             let socket = socket.clone();
-            if socket.get_status().contains(OFlags::NONBLOCK) {
-                flags.insert(SendFlags::DONTWAIT);
-            }
-            let sockaddr = sockaddr.map(|SocketAddress::Inet(addr)| addr);
             // drop file table as `sendto` may block
             drop(file_table);
-            socket.sendto(&buf, flags, sockaddr)
+            socket.sendto(&buf, flags, sockaddr.map(|SocketAddress::Inet(addr)| addr))
         }
         _ => Err(Errno::ENOTSOCK),
     }
@@ -557,15 +602,10 @@ pub(crate) fn sys_recvfrom(
     buf: MutPtr<u8>,
     len: usize,
     mut flags: ReceiveFlags,
-    sockaddr: Option<MutPtr<u8>>,
-    addrlen: Option<MutPtr<u32>>,
-) -> Result<usize, Errno> {
+) -> Result<(usize, Option<SocketAddress>), Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
-    if sockaddr.is_some() || addrlen.is_some() {
-        todo!();
-    }
 
     let file_table = file_descriptors().read();
     let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
@@ -575,9 +615,10 @@ pub(crate) fn sys_recvfrom(
             // drop file table as `receive` may block
             drop(file_table);
             let mut buffer: [u8; 4096] = [0; 4096];
-            let size = socket.receive(&mut buffer, flags)?;
-            buf.copy_from_slice(0, &buffer).ok_or(Errno::EFAULT);
-            Ok(size)
+            let (size, remote_addr) = socket.receive(&mut buffer, flags)?;
+            buf.copy_from_slice(0, &buffer[..size])
+                .ok_or(Errno::EFAULT)?;
+            Ok((size, remote_addr.map(SocketAddress::Inet)))
         }
         _ => Err(Errno::ENOTSOCK),
     }
@@ -603,41 +644,47 @@ pub(crate) fn sys_setsockopt(
     }
 }
 
+/// Handle syscall `getsockname`
+pub(crate) fn sys_getsockname(sockfd: i32) -> Result<SocketAddr, Errno> {
+    let Ok(sockfd) = u32::try_from(sockfd) else {
+        return Err(Errno::EBADF);
+    };
+
+    match file_descriptors()
+        .read()
+        .get_fd(sockfd)
+        .ok_or(Errno::EBADF)?
+    {
+        Descriptor::Socket(socket) => {
+            let litebox_net = litebox_net();
+            let net = litebox_net.lock();
+            Ok(net.get_local_addr(socket.fd.as_ref().unwrap()))
+        }
+        _ => Err(Errno::ENOTSOCK),
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
+    use core::net::SocketAddr;
+
     use alloc::string::ToString as _;
-    use litebox::net::SendFlags;
+    use litebox::net::{ReceiveFlags, SendFlags};
     use litebox::platform::RawConstPointer as _;
     use litebox_common_linux::{AddressFamily, SockFlags, SockType, errno::Errno};
 
-    use crate::{ConstPtr, syscalls::file::sys_close};
-
-    use super::{
-        CSockInetAddr, CSockStorage, sys_accept, sys_bind, sys_listen, sys_sendto, sys_socket,
+    use super::{SocketAddress, sys_connect, sys_getsockname};
+    use crate::{
+        ConstPtr,
+        syscalls::{file::sys_close, net::sys_recvfrom},
     };
+
+    use super::{sys_accept, sys_bind, sys_listen, sys_sendto, sys_socket};
 
     extern crate std;
 
     const TUN_IP_ADDR: [u8; 4] = [10, 0, 0, 2];
-
-    fn create_inet_addr(addr: [u8; 4], port: u16) -> CSockStorage {
-        let inetaddr = CSockInetAddr {
-            family: AddressFamily::INET as i16,
-            port: port.to_be(),
-            addr,
-            __pad: 0,
-        };
-        let mut sockaddr = CSockStorage::default();
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (&raw const inetaddr).cast::<u8>(),
-                (&raw mut sockaddr).cast::<u8>(),
-                core::mem::size_of::<CSockInetAddr>(),
-            );
-        };
-        sockaddr
-    }
 
     fn test_tcp_socket(
         ip: [u8; 4],
@@ -657,11 +704,11 @@ mod tests {
         )
         .unwrap();
         let server = i32::try_from(server).unwrap();
-        let sockaddr = create_inet_addr(ip, port);
-        let addr: ConstPtr<u8> =
-            ConstPtr::from_usize(core::ptr::from_ref(&sockaddr).expose_provenance());
-        sys_bind(server, addr, core::mem::size_of::<CSockInetAddr>())
-            .expect("Failed to bind socket");
+        let sockaddr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::from(ip),
+            port,
+        )));
+        sys_bind(server, sockaddr).expect("Failed to bind socket");
         sys_listen(server, 1).expect("Failed to listen on socket");
 
         // Invoke the callback after binding and listening
@@ -685,7 +732,7 @@ mod tests {
         let ptr = ConstPtr::from_usize(buf.as_ptr().expose_provenance());
         let n = if is_nonblocking {
             loop {
-                match sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None, 0) {
+                match sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None) {
                     Ok(0) => {}
                     Err(e) => {
                         assert_eq!(e, Errno::EAGAIN);
@@ -695,7 +742,7 @@ mod tests {
                 core::hint::spin_loop();
             }
         } else {
-            sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None, 0)
+            sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None)
                 .expect("Failed to send data")
         };
         assert_eq!(n, buf.len());
@@ -799,5 +846,78 @@ int main(int argc, char *argv[]) {
     #[test]
     fn test_tun_nonblocking_tcp_socket_with_external_client() {
         test_tcp_socket_with_external_client(8080, true);
+    }
+
+    #[test]
+    fn test_tun_blocking_udp_socket() {
+        crate::syscalls::tests::init_platform(Some("tun99"));
+
+        // Server socket and bind
+        let server_fd = sys_socket(
+            AddressFamily::INET,
+            SockType::Datagram,
+            SockFlags::empty(),
+            Some(litebox_common_linux::Protocol::UDP),
+        )
+        .expect("failed to create server socket");
+        let server_fd = i32::try_from(server_fd).unwrap();
+        let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::from(TUN_IP_ADDR),
+            40030,
+        )));
+        sys_bind(server_fd, server_addr.clone()).expect("failed to bind server");
+
+        // Client socket and explicit bind
+        let client_fd = sys_socket(
+            AddressFamily::INET,
+            SockType::Datagram,
+            SockFlags::empty(),
+            Some(litebox_common_linux::Protocol::UDP),
+        )
+        .expect("failed to create client socket");
+        let client_fd = i32::try_from(client_fd).unwrap();
+
+        // Send from client to server
+        let msg = "udp bound";
+        let msg_ptr = ConstPtr::from_usize(msg.as_ptr().expose_provenance());
+        sys_sendto(
+            client_fd,
+            msg_ptr,
+            msg.len(),
+            SendFlags::empty(),
+            Some(server_addr.clone()),
+        )
+        .expect("failed to sendto");
+
+        // Server receives and inspects sender addr
+        let mut recv_buf = [0u8; 48];
+        let recv_ptr = crate::MutPtr::from_usize(recv_buf.as_mut_ptr() as usize);
+        let (n, sender_addr) =
+            sys_recvfrom(server_fd, recv_ptr, recv_buf.len(), ReceiveFlags::empty())
+                .expect("recvfrom failed");
+        let received = core::str::from_utf8(&recv_buf[..n]).expect("invalid utf8");
+        assert_eq!(received, msg);
+        let SocketAddress::Inet(sender_addr) = sender_addr.unwrap();
+
+        // Client implicitly bound to an ephemeral port via sendto
+        let client_addr = sys_getsockname(client_fd).expect("getsockname failed");
+        assert_eq!(client_addr.port(), sender_addr.port());
+
+        // Client connects to server address
+        sys_connect(client_fd, server_addr.clone()).expect("failed to connect");
+
+        // Now client can send without specifying addr
+        let msg = "udp connected";
+        let msg_ptr = ConstPtr::from_usize(msg.as_ptr().expose_provenance());
+        sys_sendto(client_fd, msg_ptr, msg.len(), SendFlags::empty(), None)
+            .expect("failed to sendto");
+
+        let (n, _) = sys_recvfrom(server_fd, recv_ptr, recv_buf.len(), ReceiveFlags::empty())
+            .expect("recvfrom failed");
+        let received = core::str::from_utf8(&recv_buf[..n]).expect("invalid utf8");
+        assert_eq!(received, msg);
+
+        sys_close(client_fd).expect("failed to close client");
+        sys_close(server_fd).expect("failed to close server");
     }
 }

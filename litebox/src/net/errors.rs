@@ -38,6 +38,8 @@ pub enum ConnectError {
     UnsupportedAddress(SocketAddr),
     #[error("Port allocation failed: {0}")]
     PortAllocationFailure(#[from] LocalPortAllocationError),
+    #[error("Invalid address")]
+    Unaddressable,
 }
 
 /// Possible errors from [`Network::bind`]
@@ -50,6 +52,8 @@ pub enum BindError {
     UnsupportedAddress(SocketAddr),
     #[error("Port {0} already in use")]
     PortAlreadyInUse(u16),
+    #[error("Already bound to an address")]
+    AlreadyBound,
 }
 
 /// Possible errors from [`Network::listen`]
@@ -86,6 +90,12 @@ pub enum SendError {
     InvalidFd,
     #[error("Socket is in an invalid state")]
     SocketInInvalidState,
+    #[error("Destination address is unaddressable")]
+    Unaddressable,
+    #[error("Buffer is full")]
+    BufferFull,
+    #[error("port allocation failed: {0}")]
+    PortAllocationFailure(#[from] LocalPortAllocationError),
 }
 
 /// Possible errors from [`Network::receive`]

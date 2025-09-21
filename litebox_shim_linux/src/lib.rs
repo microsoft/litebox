@@ -28,7 +28,6 @@ use litebox::{
 };
 use litebox_common_linux::{ContinueOperation, SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
-use syscalls::net::sys_setsockopt;
 
 pub mod loader;
 pub(crate) mod stdio;
@@ -568,7 +567,8 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> ContinueOper
             sockfd,
             sockaddr,
             addrlen,
-        } => syscalls::net::sys_connect(sockfd, sockaddr, addrlen).map(|()| 0),
+        } => syscalls::net::read_sockaddr_from_user(sockaddr, addrlen)
+            .and_then(|sockaddr| syscalls::net::sys_connect(sockfd, sockaddr).map(|()| 0)),
         SyscallRequest::Accept {
             sockfd,
             addr,
@@ -582,7 +582,10 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> ContinueOper
             flags,
             addr,
             addrlen,
-        } => syscalls::net::sys_sendto(sockfd, buf, len, flags, addr, addrlen),
+        } => addr
+            .map(|addr| syscalls::net::read_sockaddr_from_user(addr, addrlen as usize))
+            .transpose()
+            .and_then(|sockaddr| syscalls::net::sys_sendto(sockfd, buf, len, flags, sockaddr)),
         SyscallRequest::Recvfrom {
             sockfd,
             buf,
@@ -590,12 +593,20 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> ContinueOper
             flags,
             addr,
             addrlen,
-        } => syscalls::net::sys_recvfrom(sockfd, buf, len, flags, addr, addrlen),
+        } => syscalls::net::sys_recvfrom(sockfd, buf, len, flags).and_then(|(size, src_addr)| {
+            if let Some(src_addr) = src_addr
+                && let Some(sock_ptr) = addr
+            {
+                syscalls::net::write_sockaddr_to_user(src_addr, sock_ptr, addrlen)?;
+            }
+            Ok(size)
+        }),
         SyscallRequest::Bind {
             sockfd,
             sockaddr,
             addrlen,
-        } => syscalls::net::sys_bind(sockfd, sockaddr, addrlen).map(|()| 0),
+        } => syscalls::net::read_sockaddr_from_user(sockaddr, addrlen)
+            .and_then(|sockaddr| syscalls::net::sys_bind(sockfd, sockaddr).map(|()| 0)),
         SyscallRequest::Listen { sockfd, backlog } => {
             syscalls::net::sys_listen(sockfd, backlog).map(|()| 0)
         }
@@ -604,7 +615,19 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> ContinueOper
             optname,
             optval,
             optlen,
-        } => sys_setsockopt(sockfd, optname, optval, optlen).map(|()| 0),
+        } => syscalls::net::sys_setsockopt(sockfd, optname, optval, optlen).map(|()| 0),
+        SyscallRequest::Getsockname {
+            sockfd,
+            addr,
+            addrlen,
+        } => syscalls::net::sys_getsockname(sockfd).and_then(|sockaddr| {
+            syscalls::net::write_sockaddr_to_user(
+                syscalls::net::SocketAddress::Inet(sockaddr),
+                addr,
+                addrlen,
+            )
+            .map(|()| 0)
+        }),
         SyscallRequest::Uname { buf } => syscalls::misc::sys_uname(buf).map(|()| 0usize),
         SyscallRequest::Fcntl { fd, arg } => syscalls::file::sys_fcntl(fd, arg).map(|v| v as usize),
         SyscallRequest::Getcwd { buf, size: count } => {
