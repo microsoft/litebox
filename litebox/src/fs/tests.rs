@@ -1499,6 +1499,30 @@ mod layered {
         assert_eq!(&buffer[..bytes_read], b"new content");
         fs.close(fd).expect("Failed to close file");
     }
+
+    #[test]
+    fn layered_in_mem_stdio_tar() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            layered::FileSystem::new(
+                &litebox,
+                crate::fs::devices::stdio::FileSystem::new(&litebox),
+                tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+                layered::LayeringSemantics::LowerLayerReadOnly,
+            ),
+            layered::LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        // Should be able to write to "foo" even if it exists in the tar layer
+        let fd = fs
+            .open("foo", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+            .expect("Failed to open file");
+        fs.write(&fd, b"layered in-mem stdio tar", None)
+            .expect("Failed to write to file");
+        fs.close(fd).expect("Failed to close file");
+    }
 }
 
 mod stdio {
