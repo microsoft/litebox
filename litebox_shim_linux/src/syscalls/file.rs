@@ -126,6 +126,19 @@ pub fn sys_openat(
     }
 }
 
+/// Handle syscall `ftruncate`
+pub(crate) fn sys_ftruncate(fd: i32, length: usize) -> Result<(), Errno> {
+    let Ok(fd) = u32::try_from(fd) else {
+        return Err(Errno::EBADF);
+    };
+    let file_table = file_descriptors().read();
+    let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
+    let Descriptor::File(file) = desc else {
+        return Err(Errno::EINVAL);
+    };
+    litebox_fs().truncate(file, length, false).map_err(Errno::from)
+}
+
 /// Handle syscall `read`
 ///
 /// `offset` is an optional offset to read from. If `None`, it will read from the current file position.

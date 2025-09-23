@@ -1803,6 +1803,10 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         flags: litebox::fs::OFlags,
         mode: litebox::fs::Mode,
     },
+    Ftruncate {
+        fd: i32,
+        length: usize,
+    },
     #[cfg(target_arch = "x86_64")]
     Newfstatat {
         dirfd: i32,
@@ -2330,6 +2334,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     mode: ctx.sys_req_arg(1),
                 }
             }
+            Sysno::ftruncate => sys_req!(Ftruncate { fd, length }),
             #[cfg(target_arch = "x86_64")]
             Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
             #[cfg(target_arch = "x86")]
