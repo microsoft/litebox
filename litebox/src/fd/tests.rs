@@ -132,7 +132,7 @@ fn test_fd_raw_integer() {
     let fetched_fd = descriptors
         .fd_from_raw_integer::<MockSubsystem>(raw_fd)
         .unwrap();
-    let data = descriptors.with_entry(fetched_fd, |e| e.data.clone());
+    let data = descriptors.with_entry(&fetched_fd.upgrade().unwrap(), |e| e.data.clone());
     assert_eq!(data, "test");
 
     let consumed_fd = descriptors

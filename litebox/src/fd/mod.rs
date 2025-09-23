@@ -5,7 +5,7 @@
     reason = "still under development, remove before merging PR"
 )]
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
@@ -28,7 +28,7 @@ pub struct Descriptors<Platform: RawSyncPrimitivesProvider> {
     litebox: LiteBox<Platform>,
     entries: Vec<Option<IndividualEntry<Platform>>>,
     /// Stored FDs are used to provide raw integer values in a safer way.
-    stored_fds: Vec<Option<OwnedFd>>,
+    stored_fds: Vec<Option<Arc<OwnedFd>>>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
@@ -290,16 +290,19 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 .read()
                 .matches_subsystem::<Subsystem>()
         );
-        let old = self.stored_fds[raw_fd].replace(fd.x);
+        let old = self.stored_fds[raw_fd].replace(Arc::new(fd.x));
         assert!(old.is_none());
         true
     }
 
     /// Borrow the typed FD for the raw integer value of the `fd`.
     ///
-    /// This operation is only reasonable to do if there is only a "short duration" between
-    /// generation of the typed FD and its use; otherwise, there can be no guarantee that the
-    /// particular FD hasn't changed out entirely.
+    /// Importantly, users of this function should **not** store an upgrade of the `Weak`.
+    ///
+    /// This operation is mainly aimed at usage in the scenario where there is only a "short
+    /// duration" between generation of the typed FD and its use. Raw integers have no long-term
+    /// meaning, and can switch subsystems over time. All this is captured in the usage of `Weak` as
+    /// the return. If the underlying FD got consumed away, then it becomes non-upgradable.
     ///
     /// Returns `Ok` iff the `fd` exists and is for the correct subsystem.
     ///
@@ -308,22 +311,39 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     pub fn fd_from_raw_integer<Subsystem: FdEnabledSubsystem>(
         &self,
         fd: usize,
-    ) -> Result<&TypedFd<Subsystem>, ErrRawIntFd> {
+    ) -> Result<Weak<TypedFd<Subsystem>>, ErrRawIntFd> {
         let Some(Some(stored_fd)) = self.stored_fds.get(fd) else {
             return Err(ErrRawIntFd::NotFound);
         };
-        let owned_fd: &OwnedFd = stored_fd;
+        let owned_fd: &Arc<OwnedFd> = stored_fd;
         let Some(Some(entry)) = self.entries.get(stored_fd.as_usize()) else {
             return Err(ErrRawIntFd::NotFound);
         };
         if !entry.read().matches_subsystem::<Subsystem>() {
             return Err(ErrRawIntFd::InvalidSubsystem);
         }
-        // SAFETY: Since `TypedFd` is `#[repr(transparent)]`, we can safety cast the type over (it
-        // is essentially the correct type, we simply want to expose a wrapped-type variant of it).
-        // We've just confirmed that it is the correct subsystem too.
-        let typed_fd: &TypedFd<Subsystem> = unsafe { &*core::ptr::from_ref(owned_fd).cast() };
-        Ok(typed_fd)
+
+        let typed_fd: Arc<TypedFd<Subsystem>> = {
+            let fd: Arc<OwnedFd> = Arc::clone(owned_fd);
+            let fd: *const OwnedFd = Arc::into_raw(fd);
+            // SAFETY: We are effectively converting an `Arc<OwnedFd>` to an
+            // `Arc<TypedFd<Subsystem>>`.
+            //
+            // This is safe because:
+            //
+            //   - `TypedFd` is a `#[repr(transparent)]` wrapper on `OwnedFd`.
+            //
+            //   - We just confirmed that it is of the correct subsystem.
+            //
+            //   - Thus, `OwnedFd` and `TypedFd` are effectively the same type, and thus are safely
+            //     castable.
+            //
+            //   - `Arc::from_raw`'s safety documentation requires the standard safe castability
+            //     constraints between the two.
+            unsafe { Arc::from_raw(fd.cast()) }
+        };
+
+        Ok(Arc::downgrade(&typed_fd))
     }
 
     /// Obtain the typed FD for the raw integer value of the `fd`.
@@ -355,10 +375,21 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         let Some(owned_fd) = stored_fd.take() else {
             return Err(ErrRawIntFd::NotFound);
         };
-        Ok(TypedFd {
-            _phantom: PhantomData,
-            x: owned_fd,
-        })
+        match Arc::try_unwrap(owned_fd) {
+            Ok(owned_fd) => Ok(TypedFd {
+                _phantom: PhantomData,
+                x: owned_fd,
+            }),
+            Err(owned_fd) => {
+                // Seems like it is unconsumable due to ongoing usage (there is some `Weak` from
+                // `fd_from_raw_integer` that has been upgraded). We should let the user know that there
+                // is ongoing usage.
+                let None = stored_fd.replace(owned_fd) else {
+                    unreachable!()
+                };
+                Err(ErrRawIntFd::CurrentlyUnconsumable)
+            }
+        }
     }
 
     /// Apply `f` on metadata at an fd, if it exists.
@@ -490,6 +521,8 @@ pub enum ErrRawIntFd {
     NotFound,
     #[error("fd for invalid subsystem")]
     InvalidSubsystem,
+    #[error("could not consume due to ongoing FD usage")]
+    CurrentlyUnconsumable,
 }
 
 /// Possible errors from getting metadata
