@@ -690,27 +690,7 @@ mod tests {
     const SERVER_PORT: u16 = 8080;
     const CLIENT_PORT: u16 = 8081;
 
-    fn compile(code: &str, unique_name: &str) -> std::path::PathBuf {
-        let dir_path = std::env::var("OUT_DIR").unwrap();
-        let src_path =
-            std::path::Path::new(dir_path.as_str()).join(alloc::format!("{unique_name}.c"));
-        std::fs::write(src_path.as_path(), code).unwrap();
-        let output_path = std::path::Path::new(dir_path.as_str()).join(unique_name);
-        crate::syscalls::tests::compile(
-            src_path.to_str().unwrap(),
-            output_path.to_str().unwrap(),
-            true,
-            false,
-        );
-        output_path
-    }
-
-    fn test_tcp_socket(
-        ip: [u8; 4],
-        port: u16,
-        is_nonblocking: bool,
-        callback: impl FnOnce([u8; 4], u16),
-    ) {
+    fn test_tcp_socket(ip: [u8; 4], port: u16, is_nonblocking: bool) {
         let server = sys_socket(
             AddressFamily::INET,
             SockType::Stream,
@@ -730,8 +710,11 @@ mod tests {
         sys_bind(server, sockaddr).expect("Failed to bind socket");
         sys_listen(server, 1).expect("Failed to listen on socket");
 
-        // Invoke the callback after binding and listening
-        callback(ip, port);
+        let mut child = std::process::Command::new("nc")
+            .args([TUN_IP_ADDR_STR, SERVER_PORT.to_string().as_str()])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn client");
 
         let client_fd = if is_nonblocking {
             loop {
@@ -767,84 +750,13 @@ mod tests {
         assert_eq!(n, buf.len());
         sys_close(client_fd).expect("Failed to close client socket");
         sys_close(server).expect("Failed to close server socket");
+
+        child.wait().expect("Failed to wait for client");
     }
-
-    const EXTERNAL_CLIENT_C_CODE: &str = r#"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-
-int main(int argc, char *argv[]) {
-    // create a tcp client to connect to the server and receive message from it
-    int sockfd;
-    struct sockaddr_in server_addr;
-    char buffer[1024];
-    int port;
-
-    // get port number from command line argument
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <port>\n", argv[0]);
-        return 1;
-    }
-    // convert port number from string to integer
-    port = atoi(argv[1]);
-    printf("Port number: %d\n", port);
-
-    // create socket
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) {
-        perror("socket");
-        return 1;
-    }
-
-    // set server address
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port);
-    server_addr.sin_addr.s_addr = inet_addr("10.0.0.2");
-
-    // sleep for 100ms to allow server to start
-    usleep(100000);
-
-    // connect to server
-    if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("connect");
-        close(sockfd);
-        return 1;
-    }
-
-    // receive message from server
-    int bytes_received = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
-    if (bytes_received < 0) {
-        perror("recv");
-        close(sockfd);
-        return 1;
-    }
-
-    // null-terminate the received message
-    buffer[bytes_received] = '\0';
-
-    // print the received message
-    printf("Received message: %s\n", buffer);
-
-    // close the socket
-    close(sockfd);
-    return 0;
-}
-    "#;
 
     fn test_tcp_socket_with_external_client(port: u16, is_nonblocking: bool) {
-        let output_path = compile(EXTERNAL_CLIENT_C_CODE, "external_client");
-        let mut child = std::process::Command::new(output_path.to_str().unwrap())
-            .args([port.to_string().as_str()])
-            .spawn()
-            .expect("Failed to spawn client");
         crate::syscalls::tests::init_platform(Some("tun99"));
-        test_tcp_socket(TUN_IP_ADDR, port, is_nonblocking, |_, _| {});
-        child.wait().expect("Failed to wait for client");
+        test_tcp_socket(TUN_IP_ADDR, port, is_nonblocking);
     }
 
     #[test]
