@@ -355,12 +355,24 @@ impl From<litebox::net::errors::ReceiveError> for Errno {
     }
 }
 
-impl From<litebox::event::polling::TryOpError<Errno>> for Errno {
-    fn from(value: litebox::event::polling::TryOpError<Errno>) -> Self {
+impl<E> From<litebox::event::polling::TryOpError<E>> for Errno
+where
+    E: Into<Errno>,
+{
+    fn from(value: litebox::event::polling::TryOpError<E>) -> Self {
         match value {
             litebox::event::polling::TryOpError::TryAgain => Errno::EAGAIN,
             litebox::event::polling::TryOpError::TimedOut => Errno::ETIMEDOUT,
-            litebox::event::polling::TryOpError::Other(e) => e,
+            litebox::event::polling::TryOpError::Other(e) => e.into(),
+        }
+    }
+}
+
+impl From<litebox::event::polling::TryOpError<core::convert::Infallible>> for Errno {
+    fn from(value: litebox::event::polling::TryOpError<core::convert::Infallible>) -> Self {
+        match value {
+            litebox::event::polling::TryOpError::TryAgain => Errno::EAGAIN,
+            litebox::event::polling::TryOpError::TimedOut => Errno::ETIMEDOUT,
         }
     }
 }

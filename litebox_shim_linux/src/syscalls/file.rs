@@ -1,11 +1,14 @@
 //! Implementation of file related syscalls, e.g., `open`, `read`, `write`, etc.
 
+use core::{convert::Infallible, ops::Range};
+
 use alloc::{
     ffi::CString,
     string::{String, ToString as _},
     vec,
 };
 use litebox::{
+    event::polling::TryOpError,
     fs::{FileSystem as _, Mode, OFlags, SeekWhence},
     path,
     platform::{RawConstPointer, RawMutPointer},
@@ -212,6 +215,19 @@ pub fn sys_pwrite64(fd: i32, buf: &[u8], offset: usize) -> Result<usize, Errno> 
         return Err(Errno::EINVAL);
     }
     sys_write(fd, buf, Some(offset))
+}
+
+pub(crate) const SEEK_SET: i16 = 0;
+pub(crate) const SEEK_CUR: i16 = 1;
+pub(crate) const SEEK_END: i16 = 2;
+
+pub(crate) fn try_into_whence(value: i16) -> Result<SeekWhence, i16> {
+    match value {
+        SEEK_SET => Ok(SeekWhence::RelativeToBeginning),
+        SEEK_CUR => Ok(SeekWhence::RelativeToCurrentOffset),
+        SEEK_END => Ok(SeekWhence::RelativeToEnd),
+        _ => Err(value),
+    }
 }
 
 /// Handle syscall `lseek`
@@ -613,7 +629,129 @@ pub fn sys_newfstatat(
     Ok(fstat)
 }
 
-pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct RangeLockItem {
+    /// pid of the lock owner
+    owner: i32,
+    /// type of the lock
+    lock_type: litebox_common_linux::FlockType,
+}
+
+impl RangeLockItem {
+    fn conflict_with(self, other: Self) -> bool {
+        if self.owner == other.owner {
+            // The same owner can always change the lock
+            return false;
+        }
+        // Write locks conflict with any other lock
+        self.lock_type == litebox_common_linux::FlockType::WriteLock
+            || other.lock_type == litebox_common_linux::FlockType::WriteLock
+    }
+}
+
+#[derive(Default)]
+struct RangeLock {
+    inner: rangemap::RangeMap<usize, RangeLockItem>,
+}
+
+impl RangeLock {
+    /// Remove all ranges owned by `item.owner` that overlap with `range`
+    fn unlock(&mut self, range: Range<usize>, item: RangeLockItem) {
+        let to_remove: alloc::vec::Vec<Range<usize>> = self
+            .inner
+            .overlapping(range.clone())
+            .filter_map(|(r, existing)| {
+                if existing.owner == item.owner {
+                    // return the overlapping part
+                    Some(r.start.max(range.start)..r.end.min(range.end))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for each in to_remove {
+            self.inner.remove(each);
+        }
+    }
+
+    /// Try to lock/unlock the given range without blocking.
+    fn try_set_lock(
+        &mut self,
+        range: Range<usize>,
+        item: RangeLockItem,
+    ) -> Result<(), TryOpError<Infallible>> {
+        if let litebox_common_linux::FlockType::Unlock = item.lock_type {
+            self.inner.remove(range);
+            return Ok(());
+        }
+
+        if self
+            .inner
+            .overlapping(range.clone())
+            .any(|existing| existing.1.conflict_with(item))
+        {
+            return Err(TryOpError::TryAgain);
+        }
+        self.inner.insert(range, item);
+        Ok(())
+    }
+
+    /// Test if a lock can be set
+    ///
+    /// If a conflicting lock exists, return `Some((range, item))` of the first conflicting lock found.
+    /// Otherwise, return `None`.
+    fn test_lock(
+        &self,
+        range: Range<usize>,
+        item: RangeLockItem,
+    ) -> Option<(Range<usize>, RangeLockItem)> {
+        self.inner
+            .overlapping(range)
+            .find(|existing| existing.1.conflict_with(item))
+            .map(|(range, v)| (range.clone(), *v))
+    }
+
+    fn get_range(
+        file: &crate::FileFd,
+        flock: &litebox_common_linux::Flock,
+    ) -> Result<Range<usize>, Errno> {
+        let item = RangeLockItem {
+            owner: super::process::sys_getpid(),
+            lock_type: litebox_common_linux::FlockType::try_from(flock.type_)
+                .map_err(|_| Errno::EINVAL)?,
+        };
+        let start = {
+            let whence = try_into_whence(flock.whence).map_err(|_| Errno::EINVAL)?;
+            match whence {
+                SeekWhence::RelativeToBeginning => flock.start,
+                SeekWhence::RelativeToCurrentOffset => {
+                    let Ok(start) = litebox_fs().seek(file, 0, SeekWhence::RelativeToCurrentOffset)
+                    else {
+                        unimplemented!()
+                    };
+                    start
+                }
+                SeekWhence::RelativeToEnd => litebox_fs()
+                    .fd_file_status(file)
+                    .map(|status| status.size)?,
+            }
+        };
+        if flock.len == 0 {
+            Ok(start..isize::MAX as usize)
+        } else {
+            let end = start
+                .checked_add_signed(flock.len)
+                .ok_or(Errno::EOVERFLOW)?;
+            Ok(start.min(end)..start.max(end))
+        }
+    }
+}
+
+#[expect(clippy::too_many_lines)]
+pub(crate) fn sys_fcntl(
+    fd: i32,
+    arg: FcntlArg<litebox_platform_multiplex::Platform>,
+) -> Result<u32, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
@@ -692,6 +830,99 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                 Descriptor::Epoll { file, .. } => todo!(),
             }
             Ok(0)
+        }
+        FcntlArg::GETLK(lock) => {
+            let Descriptor::File(file) = desc else {
+                return Err(Errno::EBADF);
+            };
+            let mut flock = unsafe { lock.read_at_offset(0) }
+                .ok_or(Errno::EFAULT)?
+                .into_owned();
+            let lock_type = litebox_common_linux::FlockType::try_from(flock.type_)
+                .map_err(|_| Errno::EINVAL)?;
+            if let litebox_common_linux::FlockType::Unlock = lock_type {
+                return Err(Errno::EINVAL);
+            }
+            let item = RangeLockItem {
+                owner: super::process::sys_getpid(),
+                lock_type,
+            };
+            let range = RangeLock::get_range(file, &flock)?;
+            match litebox()
+                .descriptor_table()
+                .with_metadata(file, |range_lock: &RangeLock| {
+                    range_lock.test_lock(range, item)
+                })
+                .ok()
+                .flatten()
+            {
+                Some((range, lock)) => {
+                    flock.type_ = lock.lock_type as i16;
+                    flock.pid = lock.owner;
+
+                    flock.whence = SEEK_SET;
+                    flock.start = range.start;
+                    flock.len = if range.end == isize::MAX as usize {
+                        0
+                    } else {
+                        isize::try_from(range.len()).unwrap()
+                    };
+                }
+                None => flock.type_ = litebox_common_linux::FlockType::Unlock as i16,
+            }
+            unsafe { lock.write_at_offset(0, flock) }.ok_or(Errno::EFAULT)?;
+            Ok(0)
+        }
+        FcntlArg::SETLK(lock) | FcntlArg::SETLKW(lock) => {
+            let Descriptor::File(file) = desc else {
+                return Err(Errno::EBADF);
+            };
+            let flock = unsafe { lock.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+            let item = RangeLockItem {
+                owner: super::process::sys_getpid(),
+                lock_type: litebox_common_linux::FlockType::try_from(flock.type_)
+                    .map_err(|_| Errno::EINVAL)?,
+            };
+            let range = RangeLock::get_range(file, &flock)?;
+            {
+                // insert metadata if not exists
+                let mut file_table = litebox().descriptor_table_mut();
+                if let Err(litebox::fd::MetadataError::NoSuchMetadata) =
+                    file_table.with_metadata(file, |_: &RangeLock| {})
+                {
+                    // TODO: this suppose to be per-file, but here it is per-entry
+                    file_table.set_entry_metadata(file, RangeLock::default());
+                }
+            }
+
+            if matches!(arg, FcntlArg::SETLK(_)) {
+                let Ok(res) = litebox()
+                    .descriptor_table_mut()
+                    .with_metadata_mut(file, |range_lock: &mut RangeLock| {
+                        range_lock.try_set_lock(range, item)
+                    })
+                else {
+                    unreachable!("metadata must exist");
+                };
+                res.map_err(Errno::from).map(|()| 0)
+            } else {
+                // TODO: use `poll` instead of busy loop
+                loop {
+                    match litebox()
+                        .descriptor_table_mut()
+                        .with_metadata_mut(file, |range_lock: &mut RangeLock| {
+                            range_lock.try_set_lock(range.clone(), item)
+                        })
+                        .expect("metadata must exist")
+                    {
+                        Ok(()) => break,
+                        Err(TryOpError::TryAgain) => {}
+                        Err(TryOpError::TimedOut) => unreachable!(),
+                    }
+                    core::hint::spin_loop();
+                }
+                Ok(0)
+            }
         }
         _ => unimplemented!(),
     }

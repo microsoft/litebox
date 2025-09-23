@@ -410,13 +410,10 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
         },
         SyscallRequest::Close { fd } => syscalls::file::sys_close(fd).map(|()| 0),
         SyscallRequest::Lseek { fd, offset, whence } => {
-            let seekwhence = match whence {
-                0 => litebox::fs::SeekWhence::RelativeToBeginning,
-                1 => litebox::fs::SeekWhence::RelativeToCurrentOffset,
-                2 => litebox::fs::SeekWhence::RelativeToEnd,
-                _ => todo!("unsupported whence"),
-            };
-            syscalls::file::sys_lseek(fd, offset, seekwhence)
+            use litebox::utils::TruncateExt as _;
+            syscalls::file::try_into_whence(whence.truncate())
+                .map_err(|_| Errno::EINVAL)
+                .and_then(|seekwhence| syscalls::file::sys_lseek(fd, offset, seekwhence))
         }
         SyscallRequest::Mkdir { pathname, mode } => {
             pathname.to_cstring().map_or(Err(Errno::EINVAL), |path| {
