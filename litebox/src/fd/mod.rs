@@ -239,11 +239,50 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         &mut self,
         fd: TypedFd<Subsystem>,
     ) -> usize {
-        let ret = self.stored_fds.iter().position(Option::is_none);
-        let ret = ret.unwrap_or_else(|| {
-            self.stored_fds.push(None);
-            self.stored_fds.len() - 1
-        });
+        let ret = self
+            .stored_fds
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(self.stored_fds.len());
+        let success = self.fd_into_specific_raw_integer(fd, ret);
+        assert!(success);
+        ret
+    }
+
+    /// Store the provided `fd` at the provided _specific_ raw integer FD.
+    ///
+    /// This is similar to [`Self::fd_into_raw_integer`] except that it specifies a specific FD to
+    /// be stored into.
+    ///
+    /// Will return with `true` iff it succeeds (i.e., nothing else was using that raw integer FD).
+    /// If you want to replace a used slot, you must first consume that slot via
+    /// [`Self::fd_consume_raw_integer`].
+    #[must_use]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "not guaranteed as an API-level guarantee, but instead as a defensive panic to re-consider implementation if we hit it"
+    )]
+    pub fn fd_into_specific_raw_integer<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        fd: TypedFd<Subsystem>,
+        raw_fd: usize,
+    ) -> bool {
+        // TODO(jayb): Should we be storing things via a HashMap to make sure this operation cannot
+        // be too expensive if someone tries to store into a large raw FD?
+        //
+        // If this assertion failure is hit in practice, we might need to be more defensive via the
+        // HashMap, rather than just silently allow big growth
+        assert!(
+            raw_fd < self.stored_fds.len() + 100,
+            "explicit upper bound restriction for now; see implementation details"
+        );
+        if self.stored_fds.get(raw_fd).is_some_and(Option::is_some) {
+            // There's already something at this slot.
+            return false;
+        }
+        if raw_fd >= self.stored_fds.len() {
+            self.stored_fds.resize_with(raw_fd + 1, || None);
+        }
         debug_assert!(
             self.entries[fd.x.as_usize()]
                 .as_ref()
@@ -251,9 +290,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 .read()
                 .matches_subsystem::<Subsystem>()
         );
-        let old = self.stored_fds[ret].replace(fd.x);
+        let old = self.stored_fds[raw_fd].replace(fd.x);
         assert!(old.is_none());
-        ret
+        true
     }
 
     /// Borrow the typed FD for the raw integer value of the `fd`.
