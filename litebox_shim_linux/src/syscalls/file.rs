@@ -136,7 +136,9 @@ pub(crate) fn sys_ftruncate(fd: i32, length: usize) -> Result<(), Errno> {
     let Descriptor::File(file) = desc else {
         return Err(Errno::EINVAL);
     };
-    litebox_fs().truncate(file, length, false).map_err(Errno::from)
+    litebox_fs()
+        .truncate(file, length, false)
+        .map_err(Errno::from)
 }
 
 /// Handle syscall `read`
