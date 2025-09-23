@@ -1066,21 +1066,7 @@ impl<
         self.upper.mkdir(path, mode)
     }
 
-    #[expect(clippy::too_many_lines)]
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
-        // Semantics:
-        // - If the directory exists only in upper: ensure empty -> remove.
-        // - If it exists only in lower: ensure empty in lower -> place tombstone.
-        // - If it exists in both: ensure BOTH are empty -> remove upper + tombstone lower.
-        // - Union emptiness = (upper empty) AND (lower empty (if it exists and upper empty)).
-        // - Root ("/") may never be removed -> Busy.
-        // - A non-directory in either layer -> NotADirectory.
-        // - Non-empty -> NotEmpty.
-        // - Path errors that lower cannot fix propagate immediately.
-        //
-        // Permissions: we mirror `unlink` semantics—tombstoning lower layer without mutating it.
-        // This keeps consistency with existing layered delete behavior.
-
         let path = self.absolute_path(path)?;
 
         // Prevent removing root explicitly (even if upper is empty).
@@ -1088,130 +1074,84 @@ impl<
             return Err(RmdirError::Busy);
         }
 
-        // Track existence and (later) emptiness.
-        let mut upper_exists = false;
-        let mut lower_exists = false;
-
-        // First, probe upper.
-        match self.upper.file_status(path.as_str()) {
-            Ok(st) => match st.file_type {
-                FileType::Directory => {
-                    upper_exists = true;
-                }
-                _ => {
+        let dir_fd = match self.open(
+            path.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(e) => match e {
+                OpenError::PathError(PathError::ComponentNotADirectory) => {
                     return Err(RmdirError::NotADirectory);
                 }
+                OpenError::PathError(pe) => return Err(pe.into()),
+                OpenError::AccessNotAllowed => todo!(),
+                OpenError::ReadOnlyFileSystem => {
+                    return Err(RmdirError::ReadOnlyFileSystem);
+                }
+                OpenError::NoWritePerms
+                | OpenError::AlreadyExists
+                | OpenError::TruncateError(_) => {
+                    unreachable!()
+                }
             },
-            Err(FileStatusError::PathError(e)) => {
+        };
+        let entries = match self.read_dir(&dir_fd) {
+            Ok(entries) => entries,
+            Err(ReadDirError::NotADirectory) => unreachable!(),
+        };
+        self.close(dir_fd).expect("close dir fd failed");
+        // "." and ".." are always present; anything more => not empty.
+        if entries.len() > 2 {
+            return Err(RmdirError::NotEmpty);
+        }
+
+        // blindly rmdir at upper layer, suppressing non-existence errors.
+        if let Err(e) = self.upper.rmdir(path.as_str()) {
+            match e {
+                RmdirError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                ) => {
+                    // fallthrough
+                }
+                RmdirError::NotEmpty
+                | RmdirError::NotADirectory
+                | RmdirError::ReadOnlyFileSystem
+                | RmdirError::PathError(
+                    PathError::ComponentNotADirectory | PathError::InvalidPathname,
+                ) => unreachable!(),
+                RmdirError::Busy
+                | RmdirError::NoWritePerms
+                | RmdirError::PathError(PathError::NoSearchPerms { .. }) => return Err(e),
+            }
+        }
+
+        if let LayeringSemantics::LowerLayerReadOnly = self.layering_semantics {
+            self.root
+                .write()
+                .entries
+                .insert(path, Arc::new(EntryX::Tombstone));
+        } else {
+            // If lower layer is writable, we can just rmdir there too, suppressing non-existence errors.
+            if let Err(e) = self.lower.rmdir(path.as_str()) {
                 match e {
-                    // These cannot be salvaged by consulting lower; propagate.
-                    PathError::ComponentNotADirectory
-                    | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. } => return Err(e.into()),
-                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent => {
-                        // Not present in upper—fall through to check lower.
+                    RmdirError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    ) => {
+                        // fallthrough
                     }
+                    RmdirError::NotEmpty
+                    | RmdirError::NotADirectory
+                    | RmdirError::ReadOnlyFileSystem
+                    | RmdirError::PathError(
+                        PathError::ComponentNotADirectory | PathError::InvalidPathname,
+                    ) => unreachable!(),
+                    RmdirError::Busy
+                    | RmdirError::NoWritePerms
+                    | RmdirError::PathError(PathError::NoSearchPerms { .. }) => return Err(e),
                 }
             }
         }
-
-        // Probe lower (using existing helper which maps to FileType).
-        match self.ensure_lower_contains(&path) {
-            Ok(ft) => {
-                match ft {
-                    FileType::Directory => {
-                        lower_exists = true;
-                    }
-                    FileType::RegularFile | FileType::CharacterDevice => {
-                        // A file/device at lower contradicts a directory removal.
-                        return Err(RmdirError::NotADirectory);
-                    }
-                }
-            }
-            Err(e) => match e {
-                PathError::NoSuchFileOrDirectory | PathError::MissingComponent => {
-                    // Absent at lower -> fine.
-                }
-                PathError::ComponentNotADirectory
-                | PathError::InvalidPathname
-                | PathError::NoSearchPerms { .. } => return Err(e.into()),
-            },
-        }
-
-        // If neither layer has it -> ENOENT via PathError
-        if !upper_exists && !lower_exists {
-            return Err(PathError::NoSuchFileOrDirectory.into());
-        }
-
-        // Determine emptiness BEFORE mutating anything.
-        // We only need to inspect a layer if it claims existence.
-        if upper_exists {
-            // Open the directory on upper and read entries.
-            let upper_fd = self
-                .upper
-                .open(
-                    path.as_str(),
-                    OFlags::RDONLY | OFlags::DIRECTORY,
-                    Mode::empty(),
-                )
-                .expect("upper.file_status succeeded but open failed");
-            let entries = self
-                .upper
-                .read_dir(&upper_fd)
-                .expect("read_dir upper failed");
-            self.upper
-                .close(upper_fd)
-                .expect("close upper dir fd failed");
-            // Convention: "." and ".." are always present; anything more => not empty.
-            if entries.len() > 2 {
-                return Err(RmdirError::NotEmpty);
-            }
-        }
-
-        if lower_exists {
-            // If upper exists AND is empty we still must ensure lower empty (union emptiness).
-            // If upper does not exist, we also must ensure lower empty before tombstoning.
-            let lower_fd = self
-                .lower
-                .open(
-                    path.as_str(),
-                    OFlags::RDONLY | OFlags::DIRECTORY,
-                    Mode::empty(),
-                )
-                .expect("lower.contains said directory but open failed");
-            let entries = self
-                .lower
-                .read_dir(&lower_fd)
-                .expect("read_dir lower failed");
-            self.lower
-                .close(lower_fd)
-                .expect("close lower dir fd failed");
-            // Convention: "." and ".." are always present; anything more => not empty.
-            if entries.len() > 2 {
-                return Err(RmdirError::NotEmpty);
-            }
-        }
-
-        // Mutation phase.
-        if upper_exists {
-            // Remove from upper layer.
-            self.upper.rmdir(path.as_str())?;
-            if lower_exists {
-                // Need to hide surviving lower directory.
-                self.root
-                    .write()
-                    .entries
-                    .insert(path, Arc::new(EntryX::Tombstone));
-            }
-            return Ok(());
-        }
-
-        // Only lower exists: place tombstone (leaving lower untouched).
-        debug_assert!(lower_exists);
-        self.root
-            .write()
-            .entries
-            .insert(path, Arc::new(EntryX::Tombstone));
         Ok(())
     }
 
