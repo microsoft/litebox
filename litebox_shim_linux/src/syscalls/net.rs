@@ -1022,7 +1022,7 @@ int main(int argc, char *argv[]) {
         let server_fd = i32::try_from(server_fd).unwrap();
         let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
             core::net::Ipv4Addr::from(TUN_IP_ADDR),
-            port,
+            SERVER_PORT,
         )));
         sys_bind(server_fd, server_addr.clone()).expect("failed to bind server");
 
@@ -1071,7 +1071,7 @@ int main(int argc, char *argv[]) {
 
         let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
             core::net::Ipv4Addr::from(TUN_IP_ADDR),
-            port,
+            SERVER_PORT,
         )));
 
         // Send from client to server
