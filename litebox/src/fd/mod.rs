@@ -239,20 +239,21 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         &mut self,
         fd: TypedFd<Subsystem>,
     ) -> usize {
-        let raw = fd.x.as_usize();
+        let ret = self.stored_fds.iter().position(Option::is_none);
+        let ret = ret.unwrap_or_else(|| {
+            self.stored_fds.push(None);
+            self.stored_fds.len() - 1
+        });
         debug_assert!(
-            self.entries[raw]
+            self.entries[fd.x.as_usize()]
                 .as_ref()
                 .unwrap()
                 .read()
                 .matches_subsystem::<Subsystem>()
         );
-        if self.stored_fds.len() <= raw {
-            self.stored_fds.resize_with(raw + 1, || None);
-        }
-        let old = self.stored_fds[raw].replace(fd.x);
+        let old = self.stored_fds[ret].replace(fd.x);
         assert!(old.is_none());
-        raw
+        ret
     }
 
     /// Borrow the typed FD for the raw integer value of the `fd`.
@@ -269,16 +270,16 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         &self,
         fd: usize,
     ) -> Result<&TypedFd<Subsystem>, ErrRawIntFd> {
-        let Some(Some(entry)) = self.entries.get(fd) else {
+        let Some(Some(stored_fd)) = self.stored_fds.get(fd) else {
+            return Err(ErrRawIntFd::NotFound);
+        };
+        let owned_fd: &OwnedFd = stored_fd;
+        let Some(Some(entry)) = self.entries.get(stored_fd.as_usize()) else {
             return Err(ErrRawIntFd::NotFound);
         };
         if !entry.read().matches_subsystem::<Subsystem>() {
             return Err(ErrRawIntFd::InvalidSubsystem);
         }
-        let Some(Some(stored_fd)) = self.stored_fds.get(fd) else {
-            return Err(ErrRawIntFd::NotFound);
-        };
-        let owned_fd: &OwnedFd = stored_fd;
         // SAFETY: Since `TypedFd` is `#[repr(transparent)]`, we can safety cast the type over (it
         // is essentially the correct type, we simply want to expose a wrapped-type variant of it).
         // We've just confirmed that it is the correct subsystem too.
@@ -298,15 +299,20 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         &mut self,
         fd: usize,
     ) -> Result<TypedFd<Subsystem>, ErrRawIntFd> {
-        let Some(Some(entry)) = self.entries.get(fd) else {
-            return Err(ErrRawIntFd::NotFound);
-        };
-        if !entry.read().matches_subsystem::<Subsystem>() {
-            return Err(ErrRawIntFd::InvalidSubsystem);
-        }
         let Some(stored_fd) = self.stored_fds.get_mut(fd) else {
             return Err(ErrRawIntFd::NotFound);
         };
+        match stored_fd {
+            None => return Err(ErrRawIntFd::NotFound),
+            Some(x) => {
+                let Some(Some(entry)) = self.entries.get(x.as_usize()) else {
+                    return Err(ErrRawIntFd::NotFound);
+                };
+                if !entry.read().matches_subsystem::<Subsystem>() {
+                    return Err(ErrRawIntFd::InvalidSubsystem);
+                }
+            }
+        }
         let Some(owned_fd) = stored_fd.take() else {
             return Err(ErrRawIntFd::NotFound);
         };
