@@ -682,9 +682,26 @@ mod tests {
 
     use super::{sys_accept, sys_bind, sys_listen, sys_sendto, sys_socket};
 
+    extern crate alloc;
     extern crate std;
 
     const TUN_IP_ADDR: [u8; 4] = [10, 0, 0, 2];
+    const SERVER_PORT: u16 = 8080;
+
+    fn compile(code: &str, unique_name: &str) -> std::path::PathBuf {
+        let dir_path = std::env::var("OUT_DIR").unwrap();
+        let src_path =
+            std::path::Path::new(dir_path.as_str()).join(alloc::format!("{unique_name}.c"));
+        std::fs::write(src_path.as_path(), code).unwrap();
+        let output_path = std::path::Path::new(dir_path.as_str()).join(unique_name);
+        crate::syscalls::tests::compile(
+            src_path.to_str().unwrap(),
+            output_path.to_str().unwrap(),
+            true,
+            false,
+        );
+        output_path
+    }
 
     fn test_tcp_socket(
         ip: [u8; 4],
@@ -818,17 +835,7 @@ int main(int argc, char *argv[]) {
     "#;
 
     fn test_tcp_socket_with_external_client(port: u16, is_nonblocking: bool) {
-        let dir_path = std::env::var("OUT_DIR").unwrap();
-        let src_path = std::path::Path::new(dir_path.as_str()).join("external_client.c");
-        std::fs::write(src_path.as_path(), EXTERNAL_CLIENT_C_CODE).unwrap();
-        let output_path = std::path::Path::new(dir_path.as_str()).join("external_client");
-        crate::syscalls::tests::compile(
-            src_path.to_str().unwrap(),
-            output_path.to_str().unwrap(),
-            true,
-            false,
-        );
-
+        let output_path = compile(EXTERNAL_CLIENT_C_CODE, "external_client");
         let mut child = std::process::Command::new(output_path.to_str().unwrap())
             .args([port.to_string().as_str()])
             .spawn()
@@ -840,16 +847,168 @@ int main(int argc, char *argv[]) {
 
     #[test]
     fn test_tun_blocking_tcp_socket_with_external_client() {
-        test_tcp_socket_with_external_client(8080, false);
+        test_tcp_socket_with_external_client(SERVER_PORT, false);
     }
 
     #[test]
     fn test_tun_nonblocking_tcp_socket_with_external_client() {
-        test_tcp_socket_with_external_client(8080, true);
+        test_tcp_socket_with_external_client(SERVER_PORT, true);
     }
 
+    const EXTERNAL_UDP_CLIENT_C_CODE: &str = r#"
+// udp_connect_client_test.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+
+#define BUF_SIZE 1024
+
+int main(int argc, char *argv[]) {
+    int client_fd;
+    struct sockaddr_in server_addr;
+    char buf[BUF_SIZE];
+    int port;
+
+    // get port number from command line argument
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <port>\n", argv[0]);
+        return 1;
+    }
+    // convert port number from string to integer
+    port = atoi(argv[1]);
+    printf("Port number: %d\n", port);
+
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family      = AF_INET;
+    server_addr.sin_port        = htons(port);
+    inet_pton(AF_INET, "10.0.0.2", &server_addr.sin_addr);
+
+    // Create client socket
+    client_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (client_fd < 0) {
+        perror("socket(client)");
+        exit(1);
+    }
+
+    // ---- Unconnected send ----
+    const char *msg1 = "Hello without connect()";
+    if (sendto(client_fd, msg1, strlen(msg1), 0,
+               (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("sendto");
+        exit(1);
+    } else {
+        printf("[client] sent: %s\n", msg1);
+    }
+
+    // ---- Connect the UDP socket ----
+    if (connect(client_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("connect");
+        exit(1);
+    }
+    printf("[client] connected to 10.0.0.2:%d\n", port);
+
+    // Now we can use send() instead of sendto()
+    const char *msg2 = "Hello with connect()";
+    if (send(client_fd, msg2, strlen(msg2), 0) < 0) {
+        perror("send");
+    } else {
+        printf("[client] sent: %s\n", msg2);
+    }
+
+    // ---- Now test getsocketname() on the client ----
+    struct sockaddr_in local_addr;
+    socklen_t addr_len = sizeof(local_addr);
+    if (getsockname(client_fd, (struct sockaddr *)&local_addr, &addr_len) < 0) {
+        perror("getsockname");
+    } else {
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &local_addr.sin_addr, ip_str, sizeof(ip_str));
+        printf("[client] local address: %s:%d\n", ip_str, ntohs(local_addr.sin_port));
+    }
+
+    close(client_fd);
+    return 0;
+}
+    "#;
+
+    const EXTERNAL_UDP_SERVER_C_CODE: &str = r#"
+// udp_connect_server_test.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+
+#define BUF_SIZE 1024
+
+int main(int argc, char *argv[]) {
+    int server_fd;
+    struct sockaddr_in server_addr, client_addr;
+    char buf[BUF_SIZE];
+    int port;
+
+    // get port number from command line argument
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <port>\n", argv[0]);
+        return 1;
+    }
+    // convert port number from string to integer
+    port = atoi(argv[1]);
+    printf("Port number: %d\n", port);
+
+    // Create server socket
+    server_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (server_fd < 0) {
+        perror("socket(server)");
+        exit(1);
+    }
+
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family      = AF_INET;
+    server_addr.sin_port        = htons(port);
+    inet_pton(AF_INET, "10.0.0.2", &server_addr.sin_addr);
+
+    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("bind");
+        exit(1);
+    }
+
+    // Server receives with recvfrom
+    socklen_t slen = sizeof(server_addr);
+    ssize_t n = recvfrom(server_fd, buf, sizeof(buf) - 1, 0,
+                         (struct sockaddr *)&server_addr, &slen);
+    if (n >= 0) {
+        buf[n] = '\0';
+        printf("[server] received: %s\n", buf);
+    }
+
+    // Server receives again
+    n = recvfrom(server_fd, buf, sizeof(buf) - 1, 0,
+                 (struct sockaddr *)&server_addr, &slen);
+    if (n >= 0) {
+        buf[n] = '\0';
+        printf("[server] received: %s\n", buf);
+    }
+
+    close(server_fd);
+    return 0;
+}
+    "#;
+
     #[test]
-    fn test_tun_blocking_udp_socket() {
+    fn test_tun_blocking_udp_server_socket() {
+        let output_path = compile(EXTERNAL_UDP_CLIENT_C_CODE, "external_udp_client");
+        let mut child = std::process::Command::new(output_path.to_str().unwrap())
+            .args([SERVER_PORT.to_string().as_str()])
+            .spawn()
+            .expect("Failed to spawn client");
+
         crate::syscalls::tests::init_platform(Some("tun99"));
 
         // Server socket and bind
@@ -863,9 +1022,42 @@ int main(int argc, char *argv[]) {
         let server_fd = i32::try_from(server_fd).unwrap();
         let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
             core::net::Ipv4Addr::from(TUN_IP_ADDR),
-            40030,
+            port,
         )));
         sys_bind(server_fd, server_addr.clone()).expect("failed to bind server");
+
+        // Server receives and inspects sender addr
+        let mut recv_buf = [0u8; 48];
+        let recv_ptr = crate::MutPtr::from_usize(recv_buf.as_mut_ptr() as usize);
+        let (n, sender_addr) =
+            sys_recvfrom(server_fd, recv_ptr, recv_buf.len(), ReceiveFlags::empty())
+                .expect("recvfrom failed");
+        let received = core::str::from_utf8(&recv_buf[..n]).expect("invalid utf8");
+        assert_eq!(received, "Hello without connect()");
+        let SocketAddress::Inet(sender_addr) = sender_addr.unwrap();
+        assert_ne!(sender_addr.port(), 0);
+
+        // Now client can send without specifying addr
+        let msg = "Hello with connect()";
+        let (n, _) = sys_recvfrom(server_fd, recv_ptr, recv_buf.len(), ReceiveFlags::empty())
+            .expect("recvfrom failed");
+        let received = core::str::from_utf8(&recv_buf[..n]).expect("invalid utf8");
+        assert_eq!(received, msg);
+
+        sys_close(server_fd).expect("failed to close server");
+
+        child.wait().expect("Failed to wait for client");
+    }
+
+    #[test]
+    fn test_tun_blocking_udp_client_socket() {
+        let output_path = compile(EXTERNAL_UDP_SERVER_C_CODE, "external_udp_server");
+        let mut child = std::process::Command::new(output_path.to_str().unwrap())
+            .args([SERVER_PORT.to_string().as_str()])
+            .spawn()
+            .expect("Failed to spawn client");
+
+        crate::syscalls::tests::init_platform(Some("tun99"));
 
         // Client socket and explicit bind
         let client_fd = sys_socket(
@@ -877,8 +1069,13 @@ int main(int argc, char *argv[]) {
         .expect("failed to create client socket");
         let client_fd = i32::try_from(client_fd).unwrap();
 
+        let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::from(TUN_IP_ADDR),
+            port,
+        )));
+
         // Send from client to server
-        let msg = "udp bound";
+        let msg = "Hello without connect()";
         let msg_ptr = ConstPtr::from_usize(msg.as_ptr().expose_provenance());
         sys_sendto(
             client_fd,
@@ -889,35 +1086,21 @@ int main(int argc, char *argv[]) {
         )
         .expect("failed to sendto");
 
-        // Server receives and inspects sender addr
-        let mut recv_buf = [0u8; 48];
-        let recv_ptr = crate::MutPtr::from_usize(recv_buf.as_mut_ptr() as usize);
-        let (n, sender_addr) =
-            sys_recvfrom(server_fd, recv_ptr, recv_buf.len(), ReceiveFlags::empty())
-                .expect("recvfrom failed");
-        let received = core::str::from_utf8(&recv_buf[..n]).expect("invalid utf8");
-        assert_eq!(received, msg);
-        let SocketAddress::Inet(sender_addr) = sender_addr.unwrap();
-
         // Client implicitly bound to an ephemeral port via sendto
         let client_addr = sys_getsockname(client_fd).expect("getsockname failed");
-        assert_eq!(client_addr.port(), sender_addr.port());
+        assert_ne!(client_addr.port(), 0);
 
         // Client connects to server address
         sys_connect(client_fd, server_addr.clone()).expect("failed to connect");
 
         // Now client can send without specifying addr
-        let msg = "udp connected";
+        let msg = "Hello with connect()";
         let msg_ptr = ConstPtr::from_usize(msg.as_ptr().expose_provenance());
         sys_sendto(client_fd, msg_ptr, msg.len(), SendFlags::empty(), None)
             .expect("failed to sendto");
 
-        let (n, _) = sys_recvfrom(server_fd, recv_ptr, recv_buf.len(), ReceiveFlags::empty())
-            .expect("recvfrom failed");
-        let received = core::str::from_utf8(&recv_buf[..n]).expect("invalid utf8");
-        assert_eq!(received, msg);
-
         sys_close(client_fd).expect("failed to close client");
-        sys_close(server_fd).expect("failed to close server");
+
+        child.wait().expect("Failed to wait for client");
     }
 }
