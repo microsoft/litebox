@@ -372,19 +372,27 @@ impl From<litebox::net::errors::ListenError> for Errno {
     }
 }
 
+impl From<litebox::net::local_ports::LocalPortAllocationError> for Errno {
+    fn from(value: litebox::net::local_ports::LocalPortAllocationError) -> Self {
+        match value {
+            litebox::net::local_ports::LocalPortAllocationError::AlreadyInUse(_) => {
+                Errno::EADDRINUSE
+            }
+            litebox::net::local_ports::LocalPortAllocationError::NoAvailableFreePorts => {
+                Errno::EAGAIN
+            }
+        }
+    }
+}
+
 impl From<litebox::net::errors::SendError> for Errno {
     fn from(value: litebox::net::errors::SendError) -> Self {
         match value {
             litebox::net::errors::SendError::InvalidFd => Errno::EBADF,
             litebox::net::errors::SendError::SocketInInvalidState => Errno::ENOTCONN,
             litebox::net::errors::SendError::Unaddressable => Errno::EDESTADDRREQ,
-            litebox::net::errors::SendError::BufferFull
-            | litebox::net::errors::SendError::PortAllocationFailure(
-                litebox::net::local_ports::LocalPortAllocationError::NoAvailableFreePorts,
-            ) => Errno::EAGAIN,
-            litebox::net::errors::SendError::PortAllocationFailure(
-                litebox::net::local_ports::LocalPortAllocationError::AlreadyInUse(_),
-            ) => Errno::EADDRINUSE,
+            litebox::net::errors::SendError::BufferFull => Errno::EAGAIN,
+            litebox::net::errors::SendError::PortAllocationFailure(e) => e.into(),
             _ => unimplemented!(),
         }
     }
