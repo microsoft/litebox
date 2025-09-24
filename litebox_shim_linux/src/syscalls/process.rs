@@ -51,6 +51,19 @@ pub(crate) fn sys_prctl(
             set_task_comm(&name_buf);
             Ok(0)
         }
+        PrctlArg::CapBSetRead(cap) => {
+            // Return 1 if the capability specified in cap is in the calling
+            // thread's capability bounding set, or 0 if it is not.
+            if cap
+                > litebox_common_linux::CapSet::LAST_CAP
+                    .bits()
+                    .trailing_zeros() as usize
+            {
+                return Err(Errno::EINVAL);
+            }
+            // Note we don't support capabilities in LiteBox, so we always return 0.
+            Ok(0)
+        }
         _ => unimplemented!(),
     }
 }
