@@ -5,7 +5,8 @@ use alloc::vec::Vec;
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use crate::event::Events;
-use crate::platform::Instant;
+use crate::platform::{Instant, TimeProvider};
+use crate::sync::RawSyncPrimitivesProvider;
 use crate::{LiteBox, platform, sync};
 
 use bitflags::bitflags;
@@ -117,22 +118,27 @@ where
 
 /// [`SocketHandle`] stores all relevant information for a specific [`SocketFd`], for easy access
 /// from [`SocketFd`], _except_ the `Socket` itself which is stored in the [`Network::socket_set`].
-pub(crate) struct SocketHandle {
+pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// Whether this socket handle is going away soon (i.e., `close` has been invoked upon it).
     consider_closed: bool,
     /// The handle into the `socket_set`
     handle: smoltcp::iface::SocketHandle,
     // Protocol-specific data
     specific: ProtocolSpecific,
+    pollee: crate::event::polling::Pollee<Platform>,
 }
 
-impl core::ops::Deref for SocketHandle {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> core::ops::Deref
+    for SocketHandle<Platform>
+{
     type Target = ProtocolSpecific;
     fn deref(&self) -> &Self::Target {
         &self.specific
     }
 }
-impl core::ops::DerefMut for SocketHandle {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> core::ops::DerefMut
+    for SocketHandle<Platform>
+{
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.specific
     }
@@ -451,21 +457,19 @@ where
         for (internal_fd, socket_handle) in
             self.litebox.descriptor_table().iter::<Network<Platform>>()
         {
-            match socket_handle.entry.protocol() {
-                Protocol::Tcp | Protocol::Udp => {
-                    // TODO: We need to actually update events here; with the previous event-manager interfaces we had, this could be done with:
-                    // ```
-                    // let socket: &tcp::Socket = self.socket_set.get(socket_handle.entry.handle);
-                    // self.event_manager
-                    //     .set_events(internal_fd, Events::IN, socket.can_recv());
-                    // self.event_manager
-                    //     .set_events(internal_fd, Events::OUT, socket.can_send());
-                    // ```
-                    //
-                    // We need to migrate this to the newer interfaces that use observers.
-                }
-                Protocol::Icmp => unimplemented!(),
-                Protocol::Raw { protocol: _ } => unimplemented!(),
+            let socket_handle = &socket_handle.entry;
+            let events = self.check_socket_events(socket_handle);
+            if !events.is_empty() {
+                // Notify observers if there are any events
+                //
+                // Note we should only send new events, e.g., notify `Events::IN` only if this
+                // socket received new data since last time we notified `Events::IN`, but `check_socket_events`
+                // only provides the current state of events. We could potentially track socket's buffer
+                // lengths to determine if new data has arrived since last time, but that would be
+                // more complex. Alternatively, we could implement our own packet processing so that we can
+                // track new data arrivals more precisely. For now, we simply notify whenever there are events.
+                // This means we might send duplicate events, which is not correct in some corner cases (e.g., see epoll's EPOLLET).
+                socket_handle.pollee.notify_observers(events);
             }
         }
     }
@@ -558,11 +562,12 @@ where
                 Protocol::Icmp => unimplemented!(),
                 Protocol::Raw { protocol: _ } => unimplemented!(),
             },
+            pollee: crate::event::polling::Pollee::new(&self.litebox),
         }))
     }
 
     /// Creates a new [`SocketFd`] for a newly-created [`SocketHandle`].
-    fn new_socket_fd_for(&mut self, socket_handle: SocketHandle) -> SocketFd<Platform> {
+    fn new_socket_fd_for(&mut self, socket_handle: SocketHandle<Platform>) -> SocketFd<Platform> {
         self.litebox.descriptor_table_mut().insert(socket_handle)
     }
 
@@ -944,6 +949,7 @@ where
                         local_port,
                         server_socket: None,
                     }),
+                    pollee: crate::event::polling::Pollee::new(&self.litebox),
                 }))
             }
             ProtocolSpecific::Udp(_) => unimplemented!(),
@@ -1196,11 +1202,28 @@ where
         }
     }
 
-    /// Get the [`Events`] for a socket.
+    /// Register an observer for events on a socket.
+    pub fn register_observer(
+        &self,
+        fd: &SocketFd<Platform>,
+        observer: alloc::sync::Weak<dyn crate::event::observer::Observer<Events>>,
+        mask: Events,
+    ) {
+        let descriptor_table = self.litebox.descriptor_table();
+        let table_entry = descriptor_table.get_entry(fd);
+        table_entry.entry.pollee.register_observer(observer, mask);
+    }
+
+    /// Get the [`Events`] for a socket [`SocketFd`].
     pub fn check_events(&self, fd: &SocketFd<Platform>) -> Option<Events> {
-        let descriptor_table = self.litebox.descriptor_table_mut();
-        let mut table_entry = descriptor_table.get_entry_mut(fd)?;
-        let socket_handle = &mut table_entry.entry;
+        let descriptor_table = self.litebox.descriptor_table();
+        let table_entry = descriptor_table.get_entry(fd)?;
+        let socket_handle = &table_entry.entry;
+        self.check_socket_events(socket_handle)
+    }
+
+    /// Get the [`Events`] for a socket handle [`SocketHandle`].
+    fn check_socket_events(&self, socket_handle: &SocketHandle<Platform>) -> Option<Events> {
         if socket_handle.consider_closed {
             return None;
         }
@@ -1214,7 +1237,7 @@ where
                 if tcp_socket.can_send() {
                     events |= Events::OUT;
                 }
-                if !tcp_socket.is_open() {
+                if tcp_socket.state() == tcp::State::CloseWait {
                     events |= Events::HUP;
                 } else if !events.contains(Events::IN) {
                     // A server socket should have `Events::IN` if any of its listening sockets is connected.
@@ -1232,7 +1255,17 @@ where
                 }
                 Some(events)
             }
-            Protocol::Udp => unimplemented!(),
+            Protocol::Udp => {
+                let udp_socket = self.socket_set.get::<udp::Socket>(socket_handle.handle);
+                let mut events = Events::empty();
+                if udp_socket.can_recv() {
+                    events |= Events::IN;
+                }
+                if udp_socket.can_send() {
+                    events |= Events::OUT;
+                }
+                Some(events)
+            }
             Protocol::Icmp => unimplemented!(),
             Protocol::Raw { protocol: _ } => unimplemented!(),
         }
@@ -1316,6 +1349,7 @@ pub enum TcpOptionData {
 crate::fd::enable_fds_for_subsystem! {
     @Platform: { platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider };
     Network<Platform>;
-    SocketHandle;
+    @Platform: { platform::TimeProvider + sync::RawSyncPrimitivesProvider };
+    SocketHandle<Platform>;
     -> SocketFd<Platform>;
 }

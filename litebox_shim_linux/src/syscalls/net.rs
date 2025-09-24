@@ -3,6 +3,7 @@
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use litebox::{
+    event::{Events, observer::Observer},
     fs::OFlags,
     net::TcpOptionData,
     platform::{RawConstPointer as _, RawMutPointer as _},
@@ -936,6 +937,7 @@ mod tests {
 
     use alloc::string::ToString as _;
     use litebox::platform::RawConstPointer as _;
+    use litebox::utils::TruncateExt as _;
     use litebox_common_linux::{
         AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType, errno::Errno,
     };
@@ -981,6 +983,25 @@ mod tests {
         task.sys_listen(server, 1)
             .expect("Failed to listen on socket");
 
+        // Create an epoll instance and register the server fd for EPOLLIN
+        let epfd = task
+            .sys_epoll_create(litebox_common_linux::EpollCreateFlags::empty())
+            .expect("failed to create epoll");
+        let epfd = i32::try_from(epfd).unwrap();
+        let ev = litebox_common_linux::EpollEvent {
+            events: litebox::event::Events::IN.bits(),
+            data: 0,
+        };
+        let ev_ptr = (&raw const ev).cast::<litebox_common_linux::EpollEvent>();
+        let ev_const = crate::ConstPtr::from_usize(ev_ptr as usize);
+        task.sys_epoll_ctl(
+            epfd,
+            litebox_common_linux::EpollOp::EpollCtlAdd,
+            server,
+            ev_const,
+        )
+        .expect("epoll_ctl add server failed");
+
         let buf = "Hello, world!";
         let mut child = match option {
             "sendto" => std::process::Command::new("nc")
@@ -1002,20 +1023,26 @@ mod tests {
         }
         .expect("failed to run nc");
 
-        let client_fd = if is_nonblocking {
+        if is_nonblocking {
             loop {
-                match task.sys_accept(server, None, None, SockFlags::empty()) {
-                    Ok(fd) => break fd,
-                    Err(e) => {
-                        assert_eq!(e, Errno::EAGAIN);
-                        core::hint::spin_loop();
+                // wait on epoll for server to be readable (incoming connection)
+                let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
+                let events_ptr = crate::MutPtr::from_usize(events.as_mut_ptr() as usize);
+                let n = task
+                    .sys_epoll_pwait(epfd, events_ptr, events.len().truncate(), -1, None, 0)
+                    .expect("epoll_wait failed");
+                if n > 0 {
+                    for ev in &events[..n] {
+                        assert!(ev.events & litebox::event::Events::IN.bits() != 0);
                     }
+                    break;
                 }
             }
-        } else {
-            task.sys_accept(server, None, None, SockFlags::empty())
-                .expect("Failed to accept connection")
-        };
+        }
+
+        let client_fd = task
+            .sys_accept(server, None, None, SockFlags::empty())
+            .expect("Failed to accept connection");
         let client_fd = i32::try_from(client_fd).unwrap();
         match option {
             "sendto" => {

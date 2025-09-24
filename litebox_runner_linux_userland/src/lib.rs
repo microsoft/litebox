@@ -216,6 +216,22 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     })?;
 
     shim.set_fs(initial_file_system);
+
+    litebox_shim_linux::litebox_net()
+        .lock()
+        .set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+    if cli_args.tun_device_name.is_some() {
+        std::thread::spawn(|| {
+            // TODO: use `poll` rather than busy-looping
+            loop {
+                litebox_shim_linux::litebox_net()
+                    .lock()
+                    .perform_platform_interaction();
+                core::hint::spin_loop();
+            }
+        });
+    }
+
     shim.set_load_filter(fixup_env_aux);
     platform.register_shim(shim.entrypoints());
     match cli_args.interception_backend {
