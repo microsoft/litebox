@@ -97,8 +97,8 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         let flags = flags - OFlags::DIRECTORY;
         let nonblocking = flags.contains(OFlags::NONBLOCK);
         let flags = flags - OFlags::NONBLOCK;
-        // ignore NOCTTY
-        let flags = flags - OFlags::NOCTTY;
+        // ignore NOCTTY and NOFOLLOW
+        let flags = flags - OFlags::NOCTTY - OFlags::NOFOLLOW;
         let truncate = flags.contains(OFlags::TRUNC);
         let flags = flags - OFlags::TRUNC;
         let path = self.absolute_path(path)?;

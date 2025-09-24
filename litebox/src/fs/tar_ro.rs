@@ -153,7 +153,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::NOCTTY
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK
-            | OFlags::LARGEFILE;
+            | OFlags::LARGEFILE
+            | OFlags::NOFOLLOW;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!("{flags:?}")
         }
