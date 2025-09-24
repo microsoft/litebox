@@ -948,6 +948,26 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 .expect("failed to set alarm");
                 Ok(remain)
             },
+            PunchthroughSyscall::ThreadKill {
+                thread_group_id,
+                thread_id,
+                sig,
+            } => unsafe {
+                syscalls::syscall3(
+                    syscalls::Sysno::tgkill,
+                    thread_group_id.reinterpret_as_unsigned() as usize,
+                    thread_id.reinterpret_as_unsigned() as usize,
+                    (sig as i32 as isize).reinterpret_as_unsigned(),
+                )
+            }
+            .map_err(|err| match err {
+                syscalls::Errno::EAGAIN => litebox_common_linux::errno::Errno::EAGAIN,
+                syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
+                syscalls::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
+                syscalls::Errno::ESRCH => litebox_common_linux::errno::Errno::ESRCH,
+                _ => panic!("unexpected error {err}"),
+            })
+            .map_err(litebox::platform::PunchthroughError::Failure),
         }
     }
 }

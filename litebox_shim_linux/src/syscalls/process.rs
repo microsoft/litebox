@@ -968,6 +968,32 @@ pub(crate) fn sys_alarm(seconds: u32) -> Result<usize, Errno> {
     })
 }
 
+/// Handle syscall `tgkill`.
+pub(crate) fn sys_tgkill(
+    thread_group_id: i32,
+    thread_id: i32,
+    sig: litebox_common_linux::Signal,
+) -> Result<(), Errno> {
+    if thread_id <= 0 || thread_group_id <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    if thread_group_id != sys_getpid() {
+        unimplemented!("Sending signal to other processes is not supported yet");
+    }
+    let punchthrough = litebox_common_linux::PunchthroughSyscall::ThreadKill {
+        thread_group_id,
+        thread_id,
+        sig,
+    };
+    let token = litebox_platform_multiplex::platform()
+        .get_punchthrough_token_for(punchthrough)
+        .expect("Failed to get punchthrough token for TGKILL");
+    token.execute().map(|_| ()).map_err(|e| match e {
+        litebox::platform::PunchthroughError::Failure(errno) => errno,
+        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use core::mem::MaybeUninit;
