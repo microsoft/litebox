@@ -393,3 +393,13 @@ impl From<litebox::pipes::PipeError> for Errno {
         }
     }
 }
+
+impl From<litebox::fs::errors::TruncateError> for Errno {
+    fn from(value: litebox::fs::errors::TruncateError) -> Self {
+        match value {
+            litebox::fs::errors::TruncateError::IsDirectory => Errno::EISDIR,
+            litebox::fs::errors::TruncateError::NotForWriting => Errno::EACCES,
+            litebox::fs::errors::TruncateError::IsTerminalDevice => Errno::EINVAL,
+        }
+    }
+}
