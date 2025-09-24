@@ -780,6 +780,14 @@ pub struct TimeVal {
     tv_sec: time_t,
     tv_usec: suseconds_t,
 }
+#[repr(C)]
+#[derive(Clone)]
+pub struct ItimerVal {
+    /// Timer interval
+    interval: TimeVal,
+    /// Current value
+    value: TimeVal,
+}
 
 const MICROS_PER_SEC: i32 = 1_000_000;
 impl TryFrom<TimeVal> for core::time::Duration {
@@ -2181,6 +2189,11 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         tid: i32,
         sig: i32,
     },
+    SetITimer {
+        which: i32,
+        new_value: Platform::RawConstPointer<ItimerVal>,
+        old_value: Option<Platform::RawMutPointer<ItimerVal>>,
+    },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
 }
@@ -2713,6 +2726,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::tgkill => sys_req!(ThreadKill { tgid, tid, sig }),
+            Sysno::setitimer => sys_req!(SetITimer { which, new_value:*, old_value:* }),
             // TODO: support syscall `statfs`
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 SyscallRequest::Ret(errno::Errno::ENOSYS)
@@ -2769,6 +2783,11 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
         thread_group_id: i32,
         thread_id: i32,
         sig: Signal,
+    },
+    SetItimer {
+        which: i32,
+        new_value: Platform::RawConstPointer<ItimerVal>,
+        old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },
     /// Set the FS base register to the value in `addr`.
     #[cfg(target_arch = "x86_64")]

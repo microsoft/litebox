@@ -877,6 +877,11 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
                 .map_err(|_| Errno::EINVAL)
                 .and_then(|sig| syscalls::process::sys_tgkill(tgid, tid, sig).map(|()| 0))
         }
+        SyscallRequest::SetITimer {
+            which,
+            new_value,
+            old_value,
+        } => syscalls::process::sys_setitimer(which, new_value, old_value).map(|()| 0),
         _ => {
             todo!()
         }

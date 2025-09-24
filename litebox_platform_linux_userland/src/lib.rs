@@ -959,6 +959,28 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 _ => panic!("unexpected error {err}"),
             })
             .map_err(litebox::platform::PunchthroughError::Failure),
+            PunchthroughSyscall::SetItimer {
+                which,
+                new_value,
+                old_value,
+            } => unsafe {
+                syscalls::syscall3(
+                    syscalls::Sysno::setitimer,
+                    which as usize,
+                    new_value.as_usize(),
+                    if let Some(old_value) = old_value {
+                        old_value.as_usize()
+                    } else {
+                        0
+                    },
+                )
+            }
+            .map_err(|err| match err {
+                syscalls::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
+                syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
+                _ => panic!("unexpected error {err}"),
+            })
+            .map_err(litebox::platform::PunchthroughError::Failure),
         }
     }
 }
