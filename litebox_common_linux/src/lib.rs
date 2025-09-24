@@ -1436,18 +1436,66 @@ pub struct EpollEvent {
     pub data: u64,
 }
 
-#[non_exhaustive]
 #[repr(i32)]
 #[derive(Debug, IntEnum)]
 pub enum MadviseBehavior {
     /// Normal behavior, no special treatment
     Normal = 0,
+    /// Expect random page references
+    Random = 1,
+    /// Expect sequential page references
+    Sequential = 2,
+    /// Will need these pages
+    WillNeed = 3,
     /// Do not expect access in the near future
     DontNeed = 4,
+
+    /* common parameters: try to keep these consistent across architectures */
+    /// Free pages only if memory pressure
+    Free = 8,
+    /// Remove these pages & resources
+    Remove = 9,
     /// Don't inherit across fork
     DontFork = 10,
     /// Do inherit across fork
     DoFork = 11,
+    /// Poison a page for testing
+    HWPoison = 100,
+    /// Soft offline page for testing
+    SoftOffline = 101,
+
+    /// KSM may merge identical pages
+    Mergeable = 12,
+    /// KSM may not merge identical pages
+    Unmergeable = 13,
+    /// Worth backing with hugepages
+    HugePage = 14,
+    /// Not worth backing with hugepages
+    NoHugePage = 15,
+
+    /// Explicitly exclude from core dumps,
+    /// overrides the coredump filter bits
+    DontDump = 16,
+    /// Clear the MADV_DONTDUMP flag
+    DoDump = 17,
+
+    /// Zero memory on fork, child only
+    WipeOnFork = 18,
+    /// Undo MADV_WIPEONFORK
+    KeepOnFork = 19,
+
+    // Deactivate these pages
+    Cold = 20,
+    /// reclaim these pages
+    Pageout = 21,
+
+    /// populate (prefault) page tables readable
+    PopulateRead = 22,
+    /// populate (prefault) page tables writable
+    PopulateWrite = 23,
+
+    /// like DONTNEED, but drop locked pages too
+    DontNeedLocked = 24,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1763,7 +1811,7 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     Madvise {
         addr: Platform::RawMutPointer<u8>,
         length: usize,
-        behavior: MadviseBehavior,
+        behavior: i32,
     },
     Dup {
         oldfd: i32,
@@ -2176,10 +2224,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
             Sysno::madvise => {
-                let behavior: i32 = ctx.sys_req_arg(2);
-                let behavior =
-                    MadviseBehavior::try_from(behavior).expect("unsupported madvise behavior");
-                sys_req!(Madvise { addr:*, length, behavior:{behavior} })
+                sys_req!(Madvise { addr:*, length, behavior })
             }
             Sysno::dup => SyscallRequest::Dup {
                 oldfd: ctx.sys_req_arg(0),

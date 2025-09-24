@@ -10,7 +10,6 @@ use thiserror::Error;
 
 use crate::platform::PageManagementProvider;
 use crate::platform::RawConstPointer;
-use crate::platform::page_mgmt::DeallocationError;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
 
 /// Page size in bytes
@@ -337,7 +336,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         Ok(())
     }
 
-    /// Reset pages without removing its mapping (i.e., `madvise` with `DontNeed`).
+    /// Reset pages without removing its mapping (e.g., `madvise` with `DontNeed` or `Free`).
+    ///
+    /// `lazy_free` indicates whether to lazily free the pages (if `true`) or
+    /// immediately free them (if `false`). For simplicity, we always free the pages
+    /// immediately for now. Also, `lazy_free` should only work for anonymous mappings.
     ///
     /// The current implementation effectively re-inserts the mapping with the same
     /// `VmArea` properties, which will cause the pages to be unmapped and mapped again.
@@ -353,7 +356,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) unsafe fn reset_pages(
         &mut self,
         range: PageRange<ALIGN>,
-    ) -> Result<(), VmemUnmapError> {
+        lazy_free: bool,
+    ) -> Result<(), VmemResetError> {
         let range: Range<usize> = range.into();
         // Any unmapped regions in the original range will result in this function returning `DeallocationError::AlreadyUnallocated`
         // while still resetting all of the existing vmas in the range.
@@ -363,10 +367,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .map(|(r, vma)| (r.clone(), *vma))
             .collect();
         for (r, vma) in overlapping_ranges {
-            assert!(
-                !vma.is_file_backed(),
-                "resetting file-backed mappings is not supported yet"
-            );
+            if vma.is_file_backed() {
+                if lazy_free {
+                    // Only works for anonymous mappings now.
+                    return Err(VmemResetError::FileBacked);
+                }
+                unimplemented!("resetting file-backed mappings is not supported yet");
+            }
             let start = r.start.max(range.start);
             let end = r.end.min(range.end);
             let new_range = PageRange::new(start, end).unwrap();
@@ -374,9 +381,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 .expect("failed to reset pages");
         }
         if unmapped_error {
-            Err(VmemUnmapError::UnmapError(
-                DeallocationError::AlreadyUnallocated,
-            ))
+            Err(VmemResetError::AlreadyUnallocated)
         } else {
             Ok(())
         }
@@ -832,6 +837,17 @@ pub enum VmemUnmapError {
     UnAligned,
     #[error("failed to unmap pages: {0}")]
     UnmapError(#[from] crate::platform::page_mgmt::DeallocationError),
+}
+
+/// Error for resetting pages
+#[derive(Error, Debug)]
+pub enum VmemResetError {
+    #[error("arg is not aligned")]
+    UnAligned,
+    #[error("provided range contains unallocated pages")]
+    AlreadyUnallocated,
+    #[error("reset file-backed mapping")]
+    FileBacked,
 }
 
 /// Error for [`Vmem::resize_mapping`]

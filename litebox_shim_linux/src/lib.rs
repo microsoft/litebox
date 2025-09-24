@@ -502,7 +502,9 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
             addr,
             length,
             behavior,
-        } => syscalls::mm::sys_madvise(addr, length, behavior).map(|()| 0),
+        } => litebox_common_linux::MadviseBehavior::try_from(behavior)
+            .map_err(|_| Errno::EINVAL)
+            .and_then(|behavior| syscalls::mm::sys_madvise(addr, length, behavior).map(|()| 0)),
         SyscallRequest::Dup {
             oldfd,
             newfd,
