@@ -264,13 +264,17 @@ impl HekiPatch {
         else {
             return false;
         };
-        let bytes_in_first_page = usize::try_from(pa_0.align_up(Size4KiB::SIZE) - pa_0).unwrap();
+        let bytes_in_first_page = if pa_0.is_aligned(Size4KiB::SIZE) {
+            core::cmp::min(PAGE_SIZE, usize::from(self.size))
+        } else {
+            usize::try_from(pa_0.align_up(Size4KiB::SIZE) - pa_0).unwrap()
+        };
 
         !(self.size == 0
             || usize::from(self.size) > POKE_MAX_OPCODE_SIZE
             || (pa_0 == pa_1)
-            || (pa_1.is_null() && bytes_in_first_page < usize::from(self.size))
-            || (!pa_1.is_null() && bytes_in_first_page > usize::from(self.size)))
+            || (bytes_in_first_page < usize::from(self.size) && pa_1.is_null())
+            || (bytes_in_first_page >= usize::from(self.size) && !pa_1.is_null()))
     }
 }
 

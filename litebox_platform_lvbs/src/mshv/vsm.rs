@@ -858,12 +858,17 @@ pub fn mshv_vsm_patch_text(patch_pa_0: u64, patch_pa_1: u64) -> Result<i64, Errn
 fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPatch, Errno> {
     let patch_pa_0 = PhysAddr::try_new(patch_pa_0).map_err(|_| Errno::EINVAL)?;
     let patch_pa_1 = PhysAddr::try_new(patch_pa_1).map_err(|_| Errno::EINVAL)?;
-    let bytes_in_first_page =
-        usize::try_from(patch_pa_0.align_up(Size4KiB::SIZE) - patch_pa_0).unwrap();
+    if patch_pa_0.is_null() || patch_pa_0 == patch_pa_1 || !patch_pa_1.is_aligned(Size4KiB::SIZE) {
+        return Err(Errno::EINVAL);
+    }
+    let bytes_in_first_page = if patch_pa_0.is_aligned(Size4KiB::SIZE) {
+        core::cmp::min(PAGE_SIZE, core::mem::size_of::<HekiPatch>())
+    } else {
+        usize::try_from(patch_pa_0.align_up(Size4KiB::SIZE) - patch_pa_0).unwrap()
+    };
 
-    if (!patch_pa_0.is_null() && patch_pa_0 == patch_pa_1)
-        || (patch_pa_1.is_null() && bytes_in_first_page < core::mem::size_of::<HekiPatch>())
-        || (!patch_pa_1.is_null() && bytes_in_first_page >= core::mem::size_of::<HekiPatch>())
+    if (bytes_in_first_page < core::mem::size_of::<HekiPatch>() && patch_pa_1.is_null())
+        || (bytes_in_first_page >= core::mem::size_of::<HekiPatch>() && !patch_pa_1.is_null())
     {
         return Err(Errno::EINVAL);
     }
