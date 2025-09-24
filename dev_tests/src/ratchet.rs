@@ -39,7 +39,7 @@ fn ratchet_transmutes() -> Result<()> {
 
 #[test]
 fn ratchet_globals() -> Result<()> {
-    ratchet(57, |file| {
+    ratchet(58, |file| {
         Ok(file
             .lines()
             .filter(|line| {

@@ -308,6 +308,19 @@ fn load_program(
     let loaded_program = litebox_shim_linux::loader::load_program(path, argv, envp, aux).unwrap();
     let comm = path.rsplit('/').next().unwrap_or("unknown");
     litebox_shim_linux::syscalls::process::set_task_comm(comm.as_bytes());
+
+    // Save LiteBox's TLS before returning to the guest
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        litebox_common_linux::wrgsbase(litebox_common_linux::rdfsbase());
+        litebox_common_linux::wrfsbase(0);
+    }
+    #[cfg(target_arch = "x86")]
+    unsafe {
+        litebox_common_linux::wrfss(litebox_common_linux::rdgss());
+        litebox_common_linux::wrgss(0);
+    };
+
     unsafe {
         trampoline::jump_to_entry_point(loaded_program.entry_point, loaded_program.user_stack_top)
     }

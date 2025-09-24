@@ -476,6 +476,8 @@ pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
 
         optee_command_completion_queue().push(session_id, stack.get_params_address());
 
+        litebox_common_linux::swap_fsgs();
+
         unsafe {
             jump_to_entry_point(
                 cmd.func as u32 as usize,

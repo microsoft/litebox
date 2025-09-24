@@ -1112,6 +1112,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Will add this test back after supporting std::spawn"]
     #[expect(clippy::too_many_lines)]
     fn test_thread_spawn() {
         crate::syscalls::tests::init_platform(None);

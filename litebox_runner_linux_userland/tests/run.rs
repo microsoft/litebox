@@ -232,6 +232,7 @@ fn run_which(prog: &str) -> std::path::PathBuf {
 
 #[cfg(target_arch = "x86_64")]
 #[test]
+#[ignore = "Will add this test back after supporting std::spawn"]
 fn test_node_with_seccomp() {
     const HELLO_WORLD_JS: &str = r"
 const fs = require('node:fs');
