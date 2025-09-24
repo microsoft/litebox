@@ -1016,6 +1016,10 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
         let tls = unsafe { &*tls };
         f(&mut tls.borrow_mut())
     }
+
+    fn clear_guest_thread_local_storage(&self) {
+        todo!()
+    }
 }
 
 #[cfg(test)]

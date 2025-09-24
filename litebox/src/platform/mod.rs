@@ -675,6 +675,5 @@ pub trait ThreadLocalStorageProvider {
     ///
     /// This is used to help emulate certain syscalls (e.g., `execve`) that clear TLS,
     /// which is necessary for some platforms (e.g., x86 Linux).
-    #[cfg(target_arch = "x86")]
     fn clear_guest_thread_local_storage(&self);
 }

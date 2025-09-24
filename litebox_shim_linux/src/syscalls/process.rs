@@ -947,7 +947,6 @@ pub(crate) fn sys_execve(
         let page_manager = crate::litebox_page_manager();
         unsafe { page_manager.release_memory(release) }.expect("failed to release memory mappings");
     });
-    #[cfg(target_arch = "x86")]
     litebox_platform_multiplex::platform().clear_guest_thread_local_storage();
 
     let callback = EXECVE_CALLBACK.get().expect("execve callback is not set");

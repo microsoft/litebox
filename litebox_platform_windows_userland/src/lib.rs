@@ -1195,6 +1195,10 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
             f(tls)
         })
     }
+
+    fn clear_guest_thread_local_storage(&self) {
+        todo!()
+    }
 }
 
 #[cfg(test)]

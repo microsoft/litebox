@@ -52,9 +52,6 @@ pub struct LinuxUserland {
     reserved_pages: Vec<core::ops::Range<usize>>,
     /// The base address of the VDSO.
     vdso_address: Option<usize>,
-    #[cfg(target_arch = "x86")]
-    /// The GDT entry number used for TLS by LiteBox
-    tls_entry_number: AtomicU32,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -176,9 +173,6 @@ impl LinuxUserland {
             seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages,
             vdso_address,
-            #[cfg(target_arch = "x86")]
-            // u32::MAX (i.e., -1) means not allocated yet
-            tls_entry_number: AtomicU32::new(u32::MAX),
         };
         platform.set_init_tls();
         Box::leak(Box::new(platform))
@@ -325,8 +319,6 @@ impl litebox::platform::ExitProvider for LinuxUserland {
                 seccomp_interception_enabled: _,
             reserved_pages: _,
             vdso_address: _,
-            #[cfg(target_arch = "x86")]
-                tls_entry_number: _,
         } = self;
         // We don't need to explicitly drop this, but doing so clarifies our intent that we want to
         // close it out :). The type itself is re-specified here to make sure we look at this
@@ -1521,7 +1513,7 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
 
     fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
         PLATFORM_TLS.with_borrow_mut(|cell| {
-            //assert!(cell.is_none(), "TLS is already set for this thread");
+            assert!(cell.is_none(), "TLS is already set for this thread");
             *cell = Some(ManuallyDrop::new(tls));
         });
     }
@@ -1544,21 +1536,18 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
         })
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn clear_guest_thread_local_storage(&self) {
+        unsafe { litebox_common_linux::wrgsbase(0) };
+    }
+
     #[cfg(target_arch = "x86")]
     fn clear_guest_thread_local_storage(&self) {
-        const GDT_ENTRY_TLS_ENTRIES: u32 = 3;
-        const GDT_ENTRY_TLS_MIN: u32 = 12;
-        const GDT_ENTRY_TLS_MAX: u32 = GDT_ENTRY_TLS_MIN + GDT_ENTRY_TLS_ENTRIES - 1;
-
-        // Each thread has GDT_ENTRY_TLS_ENTRIES (3) entries in the GDT for TLS.
-        // LiteBox itself uses the first one or two slots, depending on whether it is `no_std` or not.
-        // Only the last one is available for guest use. Hence, we only clear the last one here.
-        debug_assert_ne!(
-            self.tls_entry_number
-                .load(core::sync::atomic::Ordering::Relaxed),
-            GDT_ENTRY_TLS_MAX
-        );
-        clear_thread_area(GDT_ENTRY_TLS_MAX);
+        let fs_selector = litebox_common_linux::rdfss();
+        if fs_selector != 0 {
+            clear_thread_area(u32::from(fs_selector) >> 3);
+            litebox_common_linux::wrfss(0);
+        }
     }
 }
 

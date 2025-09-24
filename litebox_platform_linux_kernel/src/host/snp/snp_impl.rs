@@ -142,6 +142,10 @@ impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
 
         unsafe { Box::from_raw(tls) }.into_inner()
     }
+
+    fn clear_guest_thread_local_storage(&self) {
+        todo!()
+    }
 }
 
 core::arch::global_asm!(include_str!("entry.S"));
