@@ -864,11 +864,14 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
     let bytes_in_first_page = if patch_pa_0.is_aligned(Size4KiB::SIZE) {
         core::cmp::min(PAGE_SIZE, core::mem::size_of::<HekiPatch>())
     } else {
-        usize::try_from(patch_pa_0.align_up(Size4KiB::SIZE) - patch_pa_0).unwrap()
+        core::cmp::min(
+            usize::try_from(patch_pa_0.align_up(Size4KiB::SIZE) - patch_pa_0).unwrap(),
+            core::mem::size_of::<HekiPatch>(),
+        )
     };
 
     if (bytes_in_first_page < core::mem::size_of::<HekiPatch>() && patch_pa_1.is_null())
-        || (bytes_in_first_page >= core::mem::size_of::<HekiPatch>() && !patch_pa_1.is_null())
+        || (bytes_in_first_page == core::mem::size_of::<HekiPatch>() && !patch_pa_1.is_null())
     {
         return Err(Errno::EINVAL);
     }
