@@ -1677,7 +1677,7 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         fd: i32,
         buf: Platform::RawConstPointer<u8>,
         count: usize,
-        offset: usize,
+        offset: i64,
     },
     Readv {
         fd: i32,
@@ -2075,6 +2075,20 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             }),
             #[cfg(target_arch = "x86")]
             Sysno::pread64 => sys_req!(Pread64 {
+                fd,
+                buf:*,
+                count,
+                offset: { ctx.sys_req_arg::<i64>(3) | ((ctx.sys_req_arg::<i64>(4)) << 32) },
+            }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::pwrite64 => sys_req!(Pwrite64 {
+                fd,
+                buf:*,
+                count,
+                offset
+            }),
+            #[cfg(target_arch = "x86")]
+            Sysno::pwrite64 => sys_req!(Pwrite64 {
                 fd,
                 buf:*,
                 count,
