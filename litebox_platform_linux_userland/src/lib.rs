@@ -966,7 +966,7 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
             } => unsafe {
                 syscalls::syscall3(
                     syscalls::Sysno::setitimer,
-                    which as usize,
+                    which.reinterpret_as_unsigned() as usize,
                     new_value.as_usize(),
                     if let Some(old_value) = old_value {
                         old_value.as_usize()
