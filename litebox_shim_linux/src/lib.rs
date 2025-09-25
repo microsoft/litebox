@@ -808,6 +808,11 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
             Ok(old_mask.bits() as usize)
         }
         SyscallRequest::Alarm { seconds } => syscalls::process::sys_alarm(seconds),
+        SyscallRequest::ThreadKill { tgid, tid, sig } => {
+            litebox_common_linux::Signal::try_from(sig)
+                .map_err(|_| Errno::EINVAL)
+                .and_then(|sig| syscalls::process::sys_tgkill(tgid, tid, sig).map(|()| 0))
+        }
         _ => {
             todo!()
         }
