@@ -172,8 +172,9 @@ pub fn hv_do_hypercall(
     output: *mut core::ffi::c_void,
 ) -> Result<u64, HypervCallError> {
     let mut status: u64;
-    let hypercall_pg_addr =
-        with_per_cpu_variables(|per_cpu_variables| per_cpu_variables.hv_hypercall_page_as_u64());
+    let hypercall_pg_addr = with_per_cpu_variables(
+        crate::host::per_cpu_variables::PerCpuVariables::hv_hypercall_page_as_u64,
+    );
 
     unsafe {
         asm!(

@@ -1,5 +1,5 @@
 use crate::{
-    host::per_cpu_variables::with_per_cpu_variables,
+    host::per_cpu_variables::{with_per_cpu_variables, with_per_cpu_variables_mut},
     mshv::{
         DEFAULT_REG_PIN_MASK, HV_REGISTER_PENDING_EVENT0, HV_X64_REGISTER_APIC_BASE,
         HV_X64_REGISTER_CR0, HV_X64_REGISTER_CR4, HV_X64_REGISTER_CSTAR, HV_X64_REGISTER_EFER,
@@ -46,7 +46,7 @@ pub enum InterceptedRegisterName {
 }
 
 pub fn vsm_handle_intercept() {
-    let simp_page = with_per_cpu_variables(|per_cpu_variables| unsafe {
+    let simp_page = with_per_cpu_variables_mut(|per_cpu_variables| unsafe {
         &mut *per_cpu_variables.hv_simp_page_as_mut_ptr()
     });
 
