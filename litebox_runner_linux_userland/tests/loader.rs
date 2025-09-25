@@ -153,19 +153,7 @@ fn test_load_exec_common(executable_path: &str) {
     }
     let info = load_program(executable_path, argv, envp, aux).unwrap();
 
-    // Save LiteBox's TLS before returning to the guest
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        assert!(litebox_common_linux::rdgsbase() == 0);
-        litebox_common_linux::wrgsbase(litebox_common_linux::rdfsbase());
-        litebox_common_linux::wrfsbase(0);
-    }
-    #[cfg(target_arch = "x86")]
-    {
-        assert!(litebox_common_linux::rdfss() == 0);
-        litebox_common_linux::wrfss(litebox_common_linux::rdgss());
-        litebox_common_linux::wrgss(0);
-    };
+    litebox_common_linux::swap_fsgs();
 
     unsafe { trampoline(info.entry_point, info.user_stack_top) };
 }

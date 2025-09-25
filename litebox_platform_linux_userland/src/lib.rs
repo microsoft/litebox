@@ -905,7 +905,7 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                     );
                 }
             }
-            // Since we use gs to store the TLS base for the guest, we read/write gsbase instead.
+            // We swap gs and fs before and after a syscall so at this point guest's fs base is stored in gs
             #[cfg(target_arch = "x86_64")]
             PunchthroughSyscall::SetFsBase { addr } => {
                 unsafe { litebox_common_linux::wrgsbase(addr) };
@@ -1599,13 +1599,9 @@ mod tests {
     #[test]
     fn test_tls() {
         let platform = LinuxUserland::new(None);
-        platform.with_thread_local_storage_mut(|tls| {
-            tls.current_task.tid = 0x1234; // Change the task ID
-        });
         let tid = platform.with_thread_local_storage_mut(|tls| {
-            let tid = tls.current_task.tid; //= 0x1234; // Change the task ID
-            assert!(tid == 0x1234, "TLS should have the modified task ID");
-            tid
+            tls.current_task.tid = 0x1234; // Change the task ID
+            tls.current_task.tid
         });
         let tls = platform.release_thread_local_storage();
         assert_eq!(
