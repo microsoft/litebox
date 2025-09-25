@@ -20,6 +20,8 @@ pub enum OpenError {
     ReadOnlyFileSystem,
     #[error("file already exists")]
     AlreadyExists,
+    #[error("found a symbolic link when O_NOFOLLOW was specified")]
+    FoundSymlink,
     #[error("error when truncating: {0}")]
     TruncateError(#[from] TruncateError),
     #[error(transparent)]
@@ -166,6 +168,30 @@ pub enum FileStatusError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`FileSystem::symlink`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum SymlinkError {
+    #[error("the parent directory does not allow write permission")]
+    NoWritePerms,
+    #[error("pathname already exists")]
+    AlreadyExists,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from [`FileSystem::read_link`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum ReadLinkError {
+    #[error("path is not a symbolic link")]
+    NotASymlink,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors in any file-system function due to path errors.
 #[derive(Error, Debug)]
 pub enum PathError {
@@ -184,6 +210,15 @@ pub enum PathError {
     MissingComponent,
     #[error("a component used as a directory in pathname is not, in fact, a directory")]
     ComponentNotADirectory,
+    #[error("too many levels of symbolic links")]
+    TooManySymlinks,
+    #[error("symbolic link loop detected")]
+    SymlinkLoop,
+    #[error("found dangling symlink for '{prefix}' that expanded to '{suffix}'")]
+    DanglingSymlinkExpansion {
+        prefix: alloc::string::String,
+        suffix: alloc::string::String,
+    },
 }
 
 impl From<crate::path::ConversionError> for PathError {

@@ -21,7 +21,8 @@ mod tests;
 
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadError, ReadLinkError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
+    WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -127,10 +128,31 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     fn read_dir(&self, fd: &TypedFd<Self>) -> Result<Vec<DirEntry>, ReadDirError>;
 
     /// Obtain the status of a file/directory/... on the file-system.
-    fn file_status(&self, path: impl path::Arg) -> Result<FileStatus, FileStatusError>;
+    ///
+    /// If `follow_last_symlink` is true, symlinks are followed (like `stat()`).
+    /// If false, symlinks are not followed (like `lstat()`).
+    fn file_status(
+        &self,
+        path: impl path::Arg,
+        follow_last_symlink: bool,
+    ) -> Result<FileStatus, FileStatusError>;
 
     /// Equivalent to [`Self::file_status`], but open an open `fd` instead.
     fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<FileStatus, FileStatusError>;
+
+    /// Create a symbolic link pointing from `link_path` to `target`.
+    ///
+    /// The `target` does not need to exist at the time the symlink is created.
+    fn symlink(
+        &self,
+        target: impl path::Arg,
+        link_path: impl path::Arg,
+    ) -> Result<(), SymlinkError>;
+
+    /// Read the target of a symbolic link.
+    ///
+    /// This operation does not follow the symlink, but reads the stored target path.
+    fn read_link(&self, path: impl path::Arg) -> Result<alloc::string::String, ReadLinkError>;
 }
 
 bitflags! {
@@ -182,6 +204,7 @@ pub enum FileType {
     RegularFile,
     Directory,
     CharacterDevice,
+    SymbolicLink,
 }
 
 bitflags! {
