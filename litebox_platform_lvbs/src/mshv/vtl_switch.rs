@@ -1,7 +1,7 @@
 //! VTL switch related functions
 
 use crate::{
-    host::per_cpu_variables::with_per_cpu_variables,
+    host::per_cpu_variables::{with_per_cpu_variables, with_per_cpu_variables_mut},
     mshv::{
         HV_VTL_NORMAL, HV_VTL_SECURE, NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT,
         VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction, vsm::vsm_dispatch,
@@ -70,7 +70,7 @@ impl VtlState {
 }
 
 fn save_vtl_state_to_per_cpu_variables(vtl: u8, vtl_state: *const VtlState) {
-    with_per_cpu_variables(|per_cpu_variables| match vtl {
+    with_per_cpu_variables_mut(|per_cpu_variables| match vtl {
         HV_VTL_NORMAL => per_cpu_variables
             .vtl0_state
             .clone_from(unsafe { &*vtl_state }),
@@ -154,7 +154,7 @@ unsafe extern "C" fn save_vtl1_state() {
 }
 
 fn load_vtl_state_from_per_cpu_variables(vtl: u8, vtl_state: *mut VtlState) {
-    with_per_cpu_variables(|per_cpu_variables| match vtl {
+    with_per_cpu_variables_mut(|per_cpu_variables| match vtl {
         HV_VTL_NORMAL => unsafe { vtl_state.copy_from(&raw const per_cpu_variables.vtl0_state, 1) },
         HV_VTL_SECURE => unsafe { vtl_state.copy_from(&raw const per_cpu_variables.vtl1_state, 1) },
         _ => panic!("Invalid VTL number: {}", vtl),
@@ -216,7 +216,7 @@ pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
 #[inline(always)]
 fn jump_to_vtl_switch_loop_with_stack_cleanup() -> ! {
     let stack_top =
-        with_per_cpu_variables(|per_cpu_variables| per_cpu_variables.kernel_stack_top());
+        with_per_cpu_variables(crate::host::per_cpu_variables::PerCpuVariables::kernel_stack_top);
     unsafe {
         asm!(
             "mov rsp, rax",
@@ -273,7 +273,7 @@ fn vtl_switch_loop() -> ! {
                     todo!("unknown function ID = {:#x}", params[0]);
                 } else {
                     let result = vtlcall_dispatch(&params);
-                    with_per_cpu_variables(|per_cpu_variables| {
+                    with_per_cpu_variables_mut(|per_cpu_variables| {
                         per_cpu_variables.set_vtl_return_value(result as u64);
                     });
                     jump_to_vtl_switch_loop_with_stack_cleanup();

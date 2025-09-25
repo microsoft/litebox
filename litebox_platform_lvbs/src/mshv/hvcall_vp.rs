@@ -6,7 +6,7 @@ use crate::{
         instrs::rdmsr,
         msr::{MSR_EFER, MSR_IA32_CR_PAT},
     },
-    host::per_cpu_variables::with_per_cpu_variables,
+    host::per_cpu_variables::with_per_cpu_variables_mut,
     mshv::{
         HV_PARTITION_ID_SELF, HV_VP_INDEX_SELF, HV_VTL_NORMAL, HV_VTL_SECURE, HVCALL_ENABLE_VP_VTL,
         HVCALL_GET_VP_REGISTERS, HVCALL_SET_VP_REGISTERS, HvEnableVpVtl, HvGetVpRegistersInput,
@@ -28,7 +28,7 @@ fn hvcall_set_vp_registers_internal(
     value: u64,
     target_vtl: HvInputVtl,
 ) -> Result<u64, HypervCallError> {
-    let hvin = with_per_cpu_variables(|per_cpu_variables| unsafe {
+    let hvin = with_per_cpu_variables_mut(|per_cpu_variables| unsafe {
         &mut *per_cpu_variables
             .hv_hypercall_input_page_as_mut_ptr()
             .cast::<HvSetVpRegistersInput>()
@@ -67,13 +67,13 @@ fn hvcall_get_vp_registers_internal(
     reg_name: u32,
     target_vtl: HvInputVtl,
 ) -> Result<u64, HypervCallError> {
-    let hvin = with_per_cpu_variables(|per_cpu_variables| unsafe {
+    let hvin = with_per_cpu_variables_mut(|per_cpu_variables| unsafe {
         &mut *per_cpu_variables
             .hv_hypercall_input_page_as_mut_ptr()
             .cast::<HvGetVpRegistersInput>()
     });
     *hvin = HvGetVpRegistersInput::new();
-    let hvout = with_per_cpu_variables(|per_cpu_variables| unsafe {
+    let hvout = with_per_cpu_variables_mut(|per_cpu_variables| unsafe {
         &mut *per_cpu_variables
             .hv_hypercall_output_page_as_mut_ptr()
             .cast::<HvGetVpRegistersOutput>()

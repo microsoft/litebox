@@ -146,7 +146,7 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
 static mut PER_CPU_VARIABLE_ADDRESSES: [MaybeUninit<RefCell<*mut PerCpuVariables>>; MAX_CORES] =
     [const { MaybeUninit::uninit() }; MAX_CORES];
 
-/// Execute a closure with a mutable reference to the current core's per-CPU variables.
+/// Execute a closure with a reference to the current core's per-CPU variables.
 ///
 /// # Safety
 /// This function assumes the following:
@@ -160,10 +160,48 @@ static mut PER_CPU_VARIABLE_ADDRESSES: [MaybeUninit<RefCell<*mut PerCpuVariables
 /// Panics if this function is recursively called (`BorrowMutError`).
 pub fn with_per_cpu_variables<F, R>(f: F) -> R
 where
+    F: FnOnce(&PerCpuVariables) -> R,
+    R: Sized + 'static,
+{
+    let gsbase = read_or_populate_gsbase();
+    let addr = x86_64::VirtAddr::try_new(gsbase).expect("Non-canonical GSBASE value");
+    let refcell = unsafe { &*addr.as_ptr::<RefCell<*mut PerCpuVariables>>() };
+    let borrow = refcell.borrow();
+    let per_cpu_variables = unsafe { &**borrow };
+
+    f(per_cpu_variables)
+}
+
+/// Execute a closure with a mutable reference to the current core's per-CPU variables.
+///
+/// # Safety
+/// This function assumes the following:
+/// - The GSBASE register values of individual cores must be properly set (i.e., they must be different).
+/// - `get_core_id()` must return distinct APIC IDs for different cores.
+///
+/// If we cannot guarantee these assumptions, this function may result in unsafe or undefined behaviors.
+///
+/// # Panics
+/// Panics if GSBASE is not set, it contains a non-canonical address, or no per-CPU variables are allocated.
+/// Panics if this function is recursively called (`BorrowMutError`).
+pub fn with_per_cpu_variables_mut<F, R>(f: F) -> R
+where
     F: FnOnce(&mut PerCpuVariables) -> R,
     R: Sized + 'static,
 {
-    if rdgsbase() == 0 {
+    let gsbase = read_or_populate_gsbase();
+    let addr = x86_64::VirtAddr::try_new(gsbase).expect("Non-canonical GSBASE value");
+    let refcell = unsafe { &*addr.as_ptr::<RefCell<*mut PerCpuVariables>>() };
+    let mut borrow = refcell.borrow_mut();
+    let per_cpu_variables = unsafe { &mut **borrow };
+
+    f(per_cpu_variables)
+}
+
+#[inline]
+fn read_or_populate_gsbase() -> u64 {
+    let gsbase = rdgsbase();
+    if gsbase == 0 {
         let core_id = get_core_id();
         let addr = if core_id == 0 {
             let addr = &raw mut BSP_VARIABLES;
@@ -180,15 +218,10 @@ where
         );
         let addr = x86_64::VirtAddr::new(u64::try_from(addr.addr()).unwrap());
         wrgsbase(addr.as_u64());
+        addr.as_u64()
+    } else {
+        gsbase
     }
-
-    let gsbase = rdgsbase();
-    let addr = x86_64::VirtAddr::try_new(gsbase).expect("Non-canonical GSBASE value");
-    let refcell = unsafe { &*addr.as_ptr::<RefCell<*mut PerCpuVariables>>() };
-    let mut borrow = refcell.borrow_mut();
-    let per_cpu_variables = unsafe { &mut **borrow };
-
-    f(per_cpu_variables)
 }
 
 /// Allocate per-CPU variables in heap for all possible cores. We expect that the BSP will call

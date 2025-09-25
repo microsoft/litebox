@@ -154,9 +154,9 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
                 panic!("Userspace with ID: {} does not exist", userspace_id);
             }
         } // release the lock before entering userspace
-        let Some((_, cs_idx, ds_idx)) =
-            with_per_cpu_variables(|per_cpu_variables| per_cpu_variables.get_segment_selectors())
-        else {
+        let Some((_, cs_idx, ds_idx)) = with_per_cpu_variables(
+            crate::host::per_cpu_variables::PerCpuVariables::get_segment_selectors,
+        ) else {
             panic!("GDT is not initialized");
         };
         unsafe {
