@@ -418,6 +418,9 @@ impl ElfLoader {
             load_trampoline(trampoline, base, fd);
         }
 
+        // TODO: the following memory page allocated for TLS in the TA
+        // will be freed when the TA is unloaded.
+
         // Since we don't use `ld` or `ldelf` for loading a TA, we should manually set up
         // the userspace thread local storage (TLS)
         let _ = crate::syscalls::mm::sys_mmap(
