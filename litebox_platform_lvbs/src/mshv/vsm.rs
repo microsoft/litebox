@@ -19,8 +19,9 @@ use crate::{
         HvCrInterceptControlFlags, HvPageProtFlags, HvRegisterVsmPartitionConfig,
         HvRegisterVsmVpSecureVtlConfig, VsmFunction, X86Cr0Flags, X86Cr4Flags,
         heki::{
-            HekiKdataType, HekiKexecType, HekiPage, HekiPatch, HekiPatchInfo, HekiRange, MemAttr,
-            ModMemType, mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr,
+            HekiKdataType, HekiKernelInfo, HekiKernelSymbol, HekiKexecType, HekiPage, HekiPatch,
+            HekiPatchInfo, HekiRange, MemAttr, ModMemType, mem_attr_to_hv_page_prot_flags,
+            mod_mem_type_to_mem_attr,
         },
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
@@ -33,8 +34,9 @@ use crate::{
     },
     serial_println,
 };
-use alloc::{boxed::Box, collections::BTreeMap, vec, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, ffi::CString, string::String, vec, vec::Vec};
 use core::{
+    mem,
     ops::Range,
     sync::atomic::{AtomicBool, AtomicI64, Ordering},
 };
@@ -311,6 +313,7 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, Errno> {
 
 /// VSM function for loading kernel data (e.g., certificates, blocklist, kernel symbols) into VTL1.
 /// `pa` and `nranges` specify memory areas containing the information about the memory ranges to load.
+#[allow(clippy::too_many_lines)]
 pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
     if PhysAddr::try_new(pa)
         .ok()
@@ -329,9 +332,13 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
         return Err(Errno::EINVAL);
     }
 
+    let vtl0_info = &crate::platform_low().vtl0_kernel_info;
+
     let mut system_certs_mem = MemoryContainer::new();
     let mut kexec_trampoline_metadata = KexecMemoryMetadata::new();
     let mut patch_info_mem = MemoryContainer::new();
+    let mut kinfo_mem = MemoryContainer::new();
+    let mut kdata_mem = MemoryContainer::new();
 
     if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
         for heki_page in heki_pages {
@@ -364,6 +371,16 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
                             .write_bytes_from_heki_range(heki_range)
                             .map_err(|_| Errno::EINVAL)?;
                     }
+                    HekiKdataType::KernelInfo => {
+                        kinfo_mem
+                            .write_bytes_from_heki_range(heki_range)
+                            .map_err(|_| Errno::EINVAL)?;
+                    }
+                    HekiKdataType::KernelData => {
+                        kdata_mem
+                            .write_bytes_from_heki_range(heki_range)
+                            .map_err(|_| Errno::EINVAL)?;
+                    }
                     HekiKdataType::Unknown => {
                         serial_println!("VSM: Invalid kernel data type");
                         return Err(Errno::EINVAL);
@@ -389,9 +406,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
         // Its integrity depends on UEFI Secure Boot which ensures only trusted software is loaded during
         // the boot process.
         if let Ok(cert) = Certificate::from_der(&cert_buf) {
-            crate::platform_low()
-                .vtl0_kernel_info
-                .set_system_certificate(cert);
+            vtl0_info.set_system_certificate(cert);
         } else {
             serial_println!("VSM: Failed to parse system certificate");
             return Err(Errno::EINVAL);
@@ -411,17 +426,46 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
         patch_info_mem
             .read_bytes(patch_info_mem.start().unwrap(), &mut patch_info_buf)
             .map_err(|_| Errno::EINVAL)?;
-        crate::platform_low()
-            .vtl0_kernel_info
+        vtl0_info
             .precomputed_patches
             .insert_patch_data_from_bytes(&patch_info_buf, None)
             .map_err(|_| Errno::EINVAL)?;
     }
 
+    if kinfo_mem.is_empty() || kdata_mem.is_empty() {
+        serial_println!("VSM: No kernel symbol table found");
+        return Err(Errno::EINVAL);
+    }
+
+    let mut kinfo_buf = vec![0u8; kinfo_mem.len()];
+    let mut kdata_buf = vec![0u8; kdata_mem.len()];
+
+    kinfo_mem
+        .read_bytes(kinfo_mem.start().unwrap(), &mut kinfo_buf)
+        .map_err(|_| Errno::EINVAL)?;
+    let kinfo = HekiKernelInfo::from_bytes(&kinfo_buf)?;
+
+    kdata_mem
+        .read_bytes(kdata_mem.start().unwrap(), &mut kdata_buf)
+        .map_err(|_| Errno::EINVAL)?;
+
+    vtl0_info.gpl_symbols.build_from_container(
+        VirtAddr::from_ptr(kinfo.gpl_start),
+        VirtAddr::from_ptr(kinfo.gpl_end),
+        &kdata_mem,
+        &kdata_buf,
+    )?;
+
+    vtl0_info.symbols.build_from_container(
+        VirtAddr::from_ptr(kinfo.start),
+        VirtAddr::from_ptr(kinfo.end),
+        &kdata_mem,
+        &kdata_buf,
+    )?;
+
     Ok(0)
     // TODO: create blocklist keys
     // TODO: save blocklist hashes
-    // TODO: get kernel info (i.e., kernel symbols)
 }
 
 /// VSM function for validating a guest kernel module and applying specified protection to its memory ranges after validation.
@@ -1059,6 +1103,8 @@ pub struct Vtl0KernelInfo {
     kexec_metadata: KexecMemoryMetadataWrapper,
     crash_kexec_metadata: KexecMemoryMetadataWrapper,
     precomputed_patches: PatchDataMap,
+    symbols: SymbolTable,
+    gpl_symbols: SymbolTable,
     // TODO: revocation cert, blocklist, etc.
 }
 
@@ -1071,6 +1117,8 @@ impl Vtl0KernelInfo {
             kexec_metadata: KexecMemoryMetadataWrapper::new(),
             crash_kexec_metadata: KexecMemoryMetadataWrapper::new(),
             precomputed_patches: PatchDataMap::new(),
+            symbols: SymbolTable::new(),
+            gpl_symbols: SymbolTable::new(),
         }
     }
 
@@ -1838,4 +1886,92 @@ impl PatchDataMap {
 pub enum PatchDataMapError {
     InvalidHekiPatchInfo,
     InvalidHekiPatch,
+}
+
+pub struct Symbol {
+    _value: u64,
+    _name: String,
+}
+
+impl Symbol {
+    pub fn from_bytes(kinfo_start: usize, start: VirtAddr, bytes: &[u8]) -> Result<Self, Errno> {
+        let kinfo_bytes = &bytes[kinfo_start..];
+        let ksym = HekiKernelSymbol::from_bytes(kinfo_bytes)?;
+
+        let value_addr = start + mem::offset_of!(HekiKernelSymbol, value_offset) as u64;
+        let value = value_addr
+            .as_u64()
+            .wrapping_add_signed(i64::from(ksym.value_offset));
+
+        let name_offset = kinfo_start
+            + mem::offset_of!(HekiKernelSymbol, name_offset)
+            + usize::try_from(ksym.name_offset).map_err(|_| Errno::EINVAL)?;
+
+        if name_offset >= bytes.len() {
+            return Err(Errno::EINVAL);
+        }
+        bytes[name_offset..]
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(Errno::EBADR)?;
+
+        // SAFETY:
+        // - offset is within bytes (checked above)
+        // - there is a NUL terminator within bytes[offset..] (checked above)
+        // - bytes is still valid for the duration of this function
+        let name_str = unsafe {
+            let name_ptr = bytes.as_ptr().add(name_offset).cast::<c_char>();
+            CStr::from_ptr(name_ptr)
+        };
+        let name = CString::new(name_str.to_str().unwrap()).unwrap();
+        let name = name.into_string().unwrap();
+        Ok(Symbol {
+            _value: value,
+            _name: name,
+        })
+    }
+}
+pub struct SymbolTable {
+    inner: spin::rwlock::RwLock<Vec<Symbol>>,
+}
+use core::ffi::{CStr, c_char};
+
+impl SymbolTable {
+    pub fn new() -> Self {
+        Self {
+            inner: spin::rwlock::RwLock::new(Vec::new()),
+        }
+    }
+    pub fn build_from_container(
+        &self,
+        start: VirtAddr,
+        end: VirtAddr,
+        mem: &MemoryContainer,
+        buf: &[u8],
+    ) -> Result<u64, Errno> {
+        if start < mem.range.start || end > mem.range.end {
+            serial_println!("VSM: Symbol table data not found");
+            return Err(Errno::EINVAL);
+        }
+
+        let kinfo_len = usize::try_from(end - start).unwrap();
+        if kinfo_len % HekiKernelSymbol::KSYM_LEN != 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        let mut kinfo_offset = usize::try_from(start - mem.range.start).unwrap();
+        let mut kinfo_addr = start;
+        let ksym_count = kinfo_len / HekiKernelSymbol::KSYM_LEN;
+        let mut inner = self.inner.write();
+        inner.reserve(ksym_count);
+
+        for _ in 0..ksym_count {
+            let sym = Symbol::from_bytes(kinfo_offset, kinfo_addr, buf).unwrap();
+            //serial_println!("{} {:#x}", sym.name, sym.value);
+            inner.push(sym);
+            kinfo_offset += HekiKernelSymbol::KSYM_LEN;
+            kinfo_addr += HekiKernelSymbol::KSYM_LEN as u64;
+        }
+        Ok(0)
+    }
 }

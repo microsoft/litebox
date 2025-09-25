@@ -2,6 +2,8 @@ use crate::{
     host::linux::ListHead,
     mshv::{HvPageProtFlags, vtl1_mem_layout::PAGE_SIZE},
 };
+use core::mem;
+use litebox_common_linux::errno::Errno;
 use num_enum::TryFromPrimitive;
 use x86_64::{
     PhysAddr, VirtAddr,
@@ -322,5 +324,61 @@ impl HekiPatchInfo {
         !(self.typ_ != HekiPatchType::JumpLabel
             || self.patch_index == 0
             || self.patch_index > self.max_patch_count)
+    }
+}
+
+#[repr(C)]
+#[allow(clippy::struct_field_names)]
+/* TODO: Account for kernel config changes the size and meaning of the field members */
+pub struct HekiKernelSymbol {
+    pub value_offset: core::ffi::c_int,
+    pub name_offset: core::ffi::c_int,
+    pub namespace_offset: core::ffi::c_int,
+}
+
+impl HekiKernelSymbol {
+    pub const KSYM_LEN: usize = mem::size_of::<HekiKernelSymbol>();
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Errno> {
+        if bytes.len() < Self::KSYM_LEN {
+            return Err(Errno::EINVAL);
+        }
+        let ksym_bytes: [u8; Self::KSYM_LEN] = (&bytes[..Self::KSYM_LEN])
+            .try_into()
+            .map_err(|_| Errno::EINVAL)?;
+
+        // SAFETY: Casting from vtl0 buffer that contained the struct
+        unsafe {
+            let ksym: HekiKernelSymbol = core::mem::transmute(ksym_bytes);
+            Ok(ksym)
+        }
+    }
+}
+
+#[repr(C)]
+pub struct HekiKernelInfo {
+    pub start: *const HekiKernelSymbol,
+    pub end: *const HekiKernelSymbol,
+    pub gpl_start: *const HekiKernelSymbol,
+    pub gpl_end: *const HekiKernelSymbol,
+    // Skip unused arch info
+}
+
+impl HekiKernelInfo {
+    const KINFO_LEN: usize = mem::size_of::<HekiKernelInfo>();
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Errno> {
+        if bytes.len() < Self::KINFO_LEN {
+            return Err(Errno::EINVAL);
+        }
+        let kinfo_bytes: [u8; Self::KINFO_LEN] = (&bytes[..Self::KINFO_LEN])
+            .try_into()
+            .map_err(|_| Errno::EINVAL)?;
+
+        // SAFETY: Casting from vtl0 buffer that contained the struct
+        unsafe {
+            let kinfo: HekiKernelInfo = core::mem::transmute(kinfo_bytes);
+            Ok(kinfo)
+        }
     }
 }
