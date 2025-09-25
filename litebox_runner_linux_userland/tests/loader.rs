@@ -153,6 +153,8 @@ fn test_load_exec_common(executable_path: &str) {
     }
     let info = load_program(executable_path, argv, envp, aux).unwrap();
 
+    litebox_common_linux::swap_fsgs();
+
     unsafe { trampoline(info.entry_point, info.user_stack_top) };
 }
 

@@ -418,6 +418,29 @@ impl ElfLoader {
             load_trampoline(trampoline, base, fd);
         }
 
+        // TODO: the following memory page allocated for TLS in the TA
+        // will be freed when the TA is unloaded.
+
+        // Since we don't use `ld` or `ldelf` for loading a TA, we should manually set up
+        // the userspace thread local storage (TLS)
+        let _ = crate::syscalls::mm::sys_mmap(
+            super::DEFAULT_FS_BASE,
+            PAGE_SIZE,
+            litebox_common_linux::ProtFlags::PROT_READ
+                | litebox_common_linux::ProtFlags::PROT_WRITE,
+            litebox_common_linux::MapFlags::MAP_PRIVATE
+                | litebox_common_linux::MapFlags::MAP_ANONYMOUS
+                | litebox_common_linux::MapFlags::MAP_FIXED
+                | litebox_common_linux::MapFlags::MAP_POPULATE,
+            -1,
+            0,
+        );
+        unsafe {
+            litebox_common_linux::wrgsbase(super::DEFAULT_FS_BASE);
+        }
+        // TODO: store and load this FS base value through a global data structure instead of
+        // using a fixed address
+
         // Since it does not have `ld` or `ldelf`, it should relocate symbols by its own.
         elf.easy_relocate([].into_iter(), &|_| None)
             .map_err(ElfLoaderError::LoaderError)?;

@@ -673,8 +673,6 @@ pub trait ThreadLocalStorageProvider {
 
     /// Clear any guest thread-local storage state for the current thread.
     ///
-    /// This is used to help emulate certain syscalls (e.g., `execve`) that clear TLS,
-    /// which is necessary for some platforms (e.g., x86 Linux).
-    #[cfg(target_arch = "x86")]
+    /// This is used to help emulate certain syscalls (e.g., `execve`) that clear TLS.
     fn clear_guest_thread_local_storage(&self);
 }

@@ -5,6 +5,7 @@
 #![cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
 
 use std::cell::RefCell;
+use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::SeqCst;
@@ -51,9 +52,6 @@ pub struct LinuxUserland {
     reserved_pages: Vec<core::ops::Range<usize>>,
     /// The base address of the VDSO.
     vdso_address: Option<usize>,
-    #[cfg(target_arch = "x86")]
-    /// The GDT entry number used for TLS by LiteBox
-    tls_entry_number: AtomicU32,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -175,9 +173,6 @@ impl LinuxUserland {
             seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages,
             vdso_address,
-            #[cfg(target_arch = "x86")]
-            // u32::MAX (i.e., -1) means not allocated yet
-            tls_entry_number: AtomicU32::new(u32::MAX),
         };
         platform.set_init_tls();
         Box::leak(Box::new(platform))
@@ -324,8 +319,6 @@ impl litebox::platform::ExitProvider for LinuxUserland {
                 seccomp_interception_enabled: _,
             reserved_pages: _,
             vdso_address: _,
-            #[cfg(target_arch = "x86")]
-                tls_entry_number: _,
         } = self;
         // We don't need to explicitly drop this, but doing so clarifies our intent that we want to
         // close it out :). The type itself is re-specified here to make sure we look at this
@@ -356,17 +349,11 @@ extern "C" fn thread_start(
     let copied = *pt_regs;
     drop(pt_regs);
 
-    // Reset TLS for the new thread
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        litebox_common_linux::wrgsbase(0);
-    }
-    #[cfg(target_arch = "x86")]
-    LinuxUserland::set_fs_selector(0);
-
     // Allow caller to run some code before we return to the new thread.
     let thread_args = unsafe { alloc::boxed::Box::from_raw(thread_args) };
     (thread_args.callback)(*thread_args);
+
+    litebox_common_linux::swap_fsgs();
 
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -918,25 +905,31 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                     );
                 }
             }
+            // We swap gs and fs before and after a syscall so at this point guest's fs base is stored in gs
             #[cfg(target_arch = "x86_64")]
             PunchthroughSyscall::SetFsBase { addr } => {
-                unsafe { litebox_common_linux::wrfsbase(addr) };
+                unsafe { litebox_common_linux::wrgsbase(addr) };
                 Ok(0)
             }
             #[cfg(target_arch = "x86_64")]
             PunchthroughSyscall::GetFsBase { addr } => {
                 use litebox::platform::RawMutPointer as _;
-                let fs_base = unsafe { litebox_common_linux::rdfsbase() };
-                unsafe { addr.write_at_offset(0, fs_base) }.ok_or(
+                let gs_base = unsafe { litebox_common_linux::rdgsbase() };
+                unsafe { addr.write_at_offset(0, gs_base) }.ok_or(
                     litebox::platform::PunchthroughError::Failure(
                         litebox_common_linux::errno::Errno::EFAULT,
                     ),
                 )?;
                 Ok(0)
             }
+            // Since the kernel will update gs, we swap fs and gs before/after calling set_thread_area.
             #[cfg(target_arch = "x86")]
             PunchthroughSyscall::SetThreadArea { user_desc } => {
-                set_thread_area(user_desc).map_err(litebox::platform::PunchthroughError::Failure)
+                litebox_common_linux::swap_fsgs();
+                let ret = set_thread_area(user_desc)
+                    .map_err(litebox::platform::PunchthroughError::Failure);
+                litebox_common_linux::swap_fsgs();
+                ret
             }
             PunchthroughSyscall::Alarm { seconds } => unsafe {
                 let remain = syscalls::syscall2(
@@ -1501,9 +1494,10 @@ unsafe extern "C" fn syscall_handler(
     syscall_number: usize,
     ctx: *mut litebox_common_linux::PtRegs,
 ) -> SyscallReturnType {
+    litebox_common_linux::swap_fsgs();
     // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
     let ctx = unsafe { &mut *ctx };
-    match SyscallRequest::try_from_raw(syscall_number, ctx) {
+    let ret = match SyscallRequest::try_from_raw(syscall_number, ctx) {
         Ok(d) => {
             let syscall_handler: SyscallHandler = SYSCALL_HANDLER
                 .read()
@@ -1512,7 +1506,9 @@ unsafe extern "C" fn syscall_handler(
             syscall_handler(d)
         }
         Err(err) => err.as_neg() as SyscallReturnType,
-    }
+    };
+    litebox_common_linux::swap_fsgs();
+    ret
 }
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
@@ -1525,168 +1521,53 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
     }
 }
 
-struct TlsData<T> {
-    #[cfg(target_arch = "x86")]
-    self_ptr: *const Self,
-    data: RefCell<T>,
+thread_local! {
+    // Use `ManuallyDrop` for more efficient TLS accesses, since this is always
+    // dropped manually before the thread exits.
+    static PLATFORM_TLS: RefCell<Option<ManuallyDrop<litebox_common_linux::ThreadLocalStorage<LinuxUserland>>>> = const { RefCell::new(None) };
 }
 
-impl LinuxUserland {
-    #[cfg(target_arch = "x86_64")]
-    fn get_thread_local_storage()
-    -> *const TlsData<litebox_common_linux::ThreadLocalStorage<LinuxUserland>> {
-        let tls = unsafe { litebox_common_linux::rdgsbase() };
-        if tls == 0 {
-            return core::ptr::null_mut();
-        }
-        tls as *const TlsData<litebox_common_linux::ThreadLocalStorage<LinuxUserland>>
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn clear_thread_local_storage() {
-        unsafe { litebox_common_linux::wrgsbase(0) };
-    }
-
-    #[cfg(target_arch = "x86")]
-    fn get_thread_local_storage()
-    -> *const TlsData<litebox_common_linux::ThreadLocalStorage<LinuxUserland>> {
-        let mut fs_selector: u16;
-        unsafe {
-            core::arch::asm!(
-                "mov {0:x}, fs",
-                out(reg) fs_selector,
-                options(nostack, preserves_flags)
-            );
-        }
-        if fs_selector == 0 {
-            return core::ptr::null_mut();
-        }
-
-        let mut addr: *const TlsData<litebox_common_linux::ThreadLocalStorage<LinuxUserland>>;
-        unsafe {
-            core::arch::asm!(
-                "mov {0}, fs:{offset}",
-                out(reg) addr,
-                offset = const core::mem::offset_of!(TlsData<litebox_common_linux::ThreadLocalStorage<LinuxUserland>>, self_ptr),
-                options(nostack, preserves_flags)
-            );
-        }
-        addr
-    }
-
-    #[cfg(target_arch = "x86")]
-    fn clear_thread_local_storage() {
-        Self::set_fs_selector(0);
-    }
-
-    #[cfg(target_arch = "x86")]
-    fn set_fs_selector(fss: u16) {
-        unsafe {
-            core::arch::asm!(
-                "mov fs, {0:x}",
-                in(reg) fss,
-                options(nostack, preserves_flags)
-            );
-        }
-    }
-}
-
-/// Similar to libc, we use fs/gs registers to store thread-local storage (TLS).
-/// To avoid conflicts with libc's TLS, we choose to use gs on x86_64 and fs on x86
-/// as libc uses fs on x86_64 and gs on x86.
+/// LinuxUserland platform's thread-local storage implementation.
 impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<LinuxUserland>;
 
-    #[cfg(target_arch = "x86_64")]
     fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
-        let old_gs_base = unsafe { litebox_common_linux::rdgsbase() };
-        assert!(old_gs_base == 0, "TLS already set for this thread");
-        let tls = Box::new(TlsData {
-            data: RefCell::new(tls),
+        PLATFORM_TLS.with_borrow_mut(|cell| {
+            assert!(cell.is_none(), "TLS is already set for this thread");
+            *cell = Some(ManuallyDrop::new(tls));
         });
-        unsafe { litebox_common_linux::wrgsbase(Box::into_raw(tls) as usize) };
-    }
-
-    #[cfg(target_arch = "x86")]
-    fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
-        let mut old_fs_selector: u16;
-        unsafe {
-            core::arch::asm!(
-                "mov {0:x}, fs",
-                out(reg) old_fs_selector,
-                options(nostack, preserves_flags)
-            );
-        }
-        assert!(old_fs_selector == 0, "TLS already set for this thread");
-
-        let mut tls = Box::new(TlsData {
-            self_ptr: core::ptr::null_mut(),
-            data: RefCell::new(tls),
-        });
-        tls.self_ptr = &raw const *tls;
-
-        let mut flags = litebox_common_linux::UserDescFlags(0);
-        flags.set_seg_32bit(true);
-        flags.set_useable(true);
-        let mut user_desc = litebox_common_linux::UserDesc {
-            entry_number: self
-                .tls_entry_number
-                .load(core::sync::atomic::Ordering::Relaxed),
-            limit: u32::try_from(core::mem::size_of_val(tls.as_ref())).unwrap() - 1,
-            base_addr: Box::into_raw(tls) as u32,
-            flags,
-        };
-        let user_desc_ptr = litebox::platform::trivial_providers::TransparentMutPtr {
-            inner: &raw mut user_desc,
-        };
-        set_thread_area(user_desc_ptr).expect("Failed to set thread area for TLS");
-
-        assert!(user_desc.entry_number <= 0xfff);
-        self.tls_entry_number.store(
-            user_desc.entry_number & 0xfff,
-            core::sync::atomic::Ordering::Relaxed,
-        );
-        let new_fs_selector = ((user_desc.entry_number & 0xfff) << 3) | 0x3; // user mode
-        Self::set_fs_selector(new_fs_selector.truncate());
     }
 
     fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
-        let tls = Self::get_thread_local_storage();
-        assert!(!tls.is_null(), "TLS must be set before releasing it");
-        Self::clear_thread_local_storage();
-
-        // Ensure TLS is not borrowed.
-        let _ = unsafe { (*tls).data.borrow_mut() };
-
-        let tls = unsafe { Box::from_raw(tls.cast_mut()) };
-        tls.data.into_inner()
+        ManuallyDrop::into_inner(
+            PLATFORM_TLS
+                .take()
+                .expect("TLS must be set before releasing it"),
+        )
     }
 
     fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
     {
-        let tls = Self::get_thread_local_storage();
-        assert!(!tls.is_null(), "TLS must be set before accessing it");
-        let tls = unsafe { &*tls };
-        f(&mut tls.data.borrow_mut())
+        PLATFORM_TLS.with_borrow_mut(|cell| {
+            let tls = cell.as_mut().expect("TLS must be set before accessing it");
+            f(tls)
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn clear_guest_thread_local_storage(&self) {
+        unsafe { litebox_common_linux::wrgsbase(0) };
     }
 
     #[cfg(target_arch = "x86")]
     fn clear_guest_thread_local_storage(&self) {
-        const GDT_ENTRY_TLS_ENTRIES: u32 = 3;
-        const GDT_ENTRY_TLS_MIN: u32 = 12;
-        const GDT_ENTRY_TLS_MAX: u32 = GDT_ENTRY_TLS_MIN + GDT_ENTRY_TLS_ENTRIES - 1;
-
-        // Each thread has GDT_ENTRY_TLS_ENTRIES (3) entries in the GDT for TLS.
-        // LiteBox itself uses the first one or two slots, depending on whether it is `no_std` or not.
-        // Only the last one is available for guest use. Hence, we only clear the last one here.
-        debug_assert_ne!(
-            self.tls_entry_number
-                .load(core::sync::atomic::Ordering::Relaxed),
-            GDT_ENTRY_TLS_MAX
-        );
-        clear_thread_area(GDT_ENTRY_TLS_MAX);
+        let fs_selector = litebox_common_linux::rdfss();
+        if fs_selector != 0 {
+            clear_thread_area(u32::from(fs_selector) >> 3);
+            litebox_common_linux::wrfss(0);
+        }
     }
 }
 
@@ -1738,24 +1619,14 @@ mod tests {
     #[test]
     fn test_tls() {
         let platform = LinuxUserland::new(None);
-        let tls = LinuxUserland::get_thread_local_storage();
-        assert!(!tls.is_null(), "TLS should not be null");
-        let tid = unsafe { (*tls).data.borrow().current_task.tid };
-
-        platform.with_thread_local_storage_mut(|tls| {
-            assert_eq!(
-                tls.current_task.tid, tid,
-                "TLS should have the correct task ID"
-            );
+        let tid = platform.with_thread_local_storage_mut(|tls| {
             tls.current_task.tid = 0x1234; // Change the task ID
+            tls.current_task.tid
         });
         let tls = platform.release_thread_local_storage();
         assert_eq!(
-            tls.current_task.tid, 0x1234,
+            tls.current_task.tid, tid,
             "TLS should have the correct task ID"
         );
-
-        let tls = LinuxUserland::get_thread_local_storage();
-        assert!(tls.is_null(), "TLS should be null after releasing it");
     }
 }

@@ -998,6 +998,73 @@ pub unsafe fn wrgsbase(gs_base: usize) {
     }
 }
 
+/// Reads the current FS segment selector
+#[cfg(target_arch = "x86")]
+pub fn rdfss() -> u16 {
+    let mut fs_selector: u16;
+    unsafe {
+        core::arch::asm!(
+            "mov {0:x}, fs",
+            out(reg) fs_selector,
+            options(nostack, preserves_flags)
+        );
+    }
+    fs_selector
+}
+
+/// Writes the FS segment selector
+#[cfg(target_arch = "x86")]
+pub fn wrfss(fs_selector: u16) {
+    unsafe {
+        core::arch::asm!(
+            "mov fs, {0:x}",
+            in(reg) fs_selector,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Reads the current GS segment selector
+#[cfg(target_arch = "x86")]
+pub fn rdgss() -> u16 {
+    let mut gs_selector: u16;
+    unsafe {
+        core::arch::asm!(
+            "mov {0:x}, gs",
+            out(reg) gs_selector,
+            options(nostack, preserves_flags)
+        );
+    }
+    gs_selector
+}
+
+/// Writes the GS segment selector
+#[cfg(target_arch = "x86")]
+pub fn wrgss(gs_selector: u16) {
+    unsafe {
+        core::arch::asm!(
+            "mov gs, {0:x}",
+            in(reg) gs_selector,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn swap_fsgs() {
+    let fs_base = unsafe { rdfsbase() };
+    let gs_base = unsafe { rdgsbase() };
+    unsafe { wrgsbase(fs_base) };
+    unsafe { wrfsbase(gs_base) };
+}
+#[cfg(target_arch = "x86")]
+pub fn swap_fsgs() {
+    let fs_selector = rdfss();
+    let gs_selector = rdgss();
+    wrgss(fs_selector);
+    wrfss(gs_selector);
+}
+
 /// Linux's `user_desc` struct used by the `set_thread_area` syscall.
 #[repr(C, packed)]
 #[derive(Debug, Clone)]

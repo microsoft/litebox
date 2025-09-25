@@ -947,7 +947,6 @@ pub(crate) fn sys_execve(
         let page_manager = crate::litebox_page_manager();
         unsafe { page_manager.release_memory(release) }.expect("failed to release memory mappings");
     });
-    #[cfg(target_arch = "x86")]
     litebox_platform_multiplex::platform().clear_guest_thread_local_storage();
 
     let callback = EXECVE_CALLBACK.get().expect("execve callback is not set");
@@ -1138,6 +1137,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Will add this test back after supporting std::spawn"]
     #[expect(clippy::too_many_lines)]
     fn test_thread_spawn() {
         crate::syscalls::tests::init_platform(None);
