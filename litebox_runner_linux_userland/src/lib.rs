@@ -224,9 +224,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         std::thread::spawn(|| {
             // TODO: use `poll` rather than busy-looping
             loop {
-                litebox_shim_linux::litebox_net()
+                if litebox_shim_linux::litebox_net()
                     .lock()
-                    .perform_platform_interaction();
+                    .perform_platform_interaction()
+                    .call_again_immediately()
+                {
+                    continue;
+                }
                 core::hint::spin_loop();
             }
         });
