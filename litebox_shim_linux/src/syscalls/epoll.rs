@@ -385,15 +385,17 @@ impl ReadySet {
     }
 
     fn pop_multiple(&self, maxevents: usize, events: &mut Vec<EpollEvent>) {
-        let mut entries = self.entries.lock();
-        let mut nums = entries.len();
+        let mut nums = self.entries.lock().len();
         while nums > 0 {
             nums -= 1;
             if events.len() >= maxevents {
                 break;
             }
 
-            let Some(weak_entry) = entries.pop_front() else {
+            // Note the lock operation was moved into the loop to avoid holding the lock while calling `poll()`.
+            // e.g., `poll` on a socket requires lock on network, and a deadlock may happen if another thread
+            // holds the network lock and tries to add an entry to the same epoll instance upon new events.
+            let Some(weak_entry) = self.entries.lock().pop_front() else {
                 // no more entries
                 break;
             };
@@ -419,7 +421,7 @@ impl ReadySet {
                 entry
                     .is_ready
                     .store(true, core::sync::atomic::Ordering::Relaxed);
-                entries.push_back(weak_entry);
+                self.entries.lock().push_back(weak_entry);
             }
         }
     }
