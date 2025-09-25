@@ -1993,6 +1993,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         addr: Platform::RawMutPointer<u8>,
         addrlen: Platform::RawMutPointer<u32>,
     },
+    Getpeername {
+        sockfd: i32,
+        addr: Platform::RawMutPointer<u8>,
+        addrlen: Platform::RawMutPointer<u32>,
+    },
     Uname {
         buf: Platform::RawMutPointer<Utsname>,
     },
@@ -2463,6 +2468,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 }
             }
             Sysno::getsockname => sys_req!(Getsockname { sockfd, addr:*, addrlen:* }),
+            Sysno::getpeername => sys_req!(Getpeername { sockfd, addr:*, addrlen:* }),
             Sysno::exit => sys_req!(Exit { status }),
             Sysno::exit_group => sys_req!(ExitGroup { status }),
             Sysno::uname => sys_req!(Uname { buf:* }),

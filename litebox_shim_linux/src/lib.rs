@@ -847,12 +847,14 @@ impl Task {
                 addr,
                 addrlen,
             } => self.sys_getsockname(sockfd).and_then(|sockaddr| {
-                syscalls::net::write_sockaddr_to_user(
-                    syscalls::net::SocketAddress::Inet(sockaddr),
-                    addr,
-                    addrlen,
-                )
-                .map(|()| 0)
+                syscalls::net::write_sockaddr_to_user(sockaddr, addr, addrlen).map(|()| 0)
+            }),
+            SyscallRequest::Getpeername {
+                sockfd,
+                addr,
+                addrlen,
+            } => self.sys_getpeername(sockfd).and_then(|sockaddr| {
+                syscalls::net::write_sockaddr_to_user(sockaddr, addr, addrlen).map(|()| 0)
             }),
             SyscallRequest::Uname { buf } => self.sys_uname(buf).map(|()| 0usize),
             SyscallRequest::Fcntl { fd, arg } => self.sys_fcntl(fd, arg).map(|v| v as usize),

@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use crate::event::{Events, IOPollable};
+use crate::net::errors::RemoteAddrError;
 use crate::platform::{Instant, TimeProvider};
 use crate::sync::RawSyncPrimitivesProvider;
 use crate::{LiteBox, platform, sync};
@@ -849,7 +850,17 @@ where
         let socket_handle = &mut table_entry.entry;
 
         match socket_handle.protocol() {
-            Protocol::Tcp => unimplemented!(),
+            Protocol::Tcp => {
+                let socket: &tcp::Socket = self.socket_set.get(socket_handle.handle);
+                match socket.local_endpoint() {
+                    Some(endpoint) => match endpoint.addr {
+                        smoltcp::wire::IpAddress::Ipv4(ipv4) => {
+                            Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, endpoint.port)))
+                        }
+                    },
+                    None => Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))),
+                }
+            }
             Protocol::Udp => {
                 let socket: &udp::Socket = self.socket_set.get(socket_handle.handle);
                 let local_endpoint = socket.endpoint();
@@ -865,6 +876,34 @@ where
             }
             Protocol::Icmp => unimplemented!(),
             Protocol::Raw { protocol: _ } => unimplemented!(),
+        }
+    }
+
+    /// Get the remote address and port a socket is connected to, if any.
+    pub fn get_remote_addr(&self, fd: &SocketFd<Platform>) -> Result<SocketAddr, RemoteAddrError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(RemoteAddrError::InvalidFd)?;
+        let socket_handle = &mut table_entry.entry;
+
+        let endpoint = match socket_handle.protocol() {
+            Protocol::Tcp => self
+                .socket_set
+                .get::<tcp::Socket>(socket_handle.handle)
+                .remote_endpoint()
+                .ok_or(RemoteAddrError::NotConnected)?,
+            Protocol::Udp => socket_handle
+                .udp()
+                .remote_endpoint
+                .ok_or(RemoteAddrError::NotConnected)?,
+            Protocol::Icmp => unimplemented!(),
+            Protocol::Raw { protocol: _ } => unimplemented!(),
+        };
+        match endpoint.addr {
+            smoltcp::wire::IpAddress::Ipv4(ipv4) => {
+                Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, endpoint.port)))
+            }
         }
     }
 

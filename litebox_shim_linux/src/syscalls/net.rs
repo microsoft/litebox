@@ -708,6 +708,23 @@ impl Task {
                     drop(file_table); // Drop before possibly-blocking `accept`
                     let sock_type = get_socket_type(fd)?;
                     let fd = accept(fd)?;
+                    if let Some(addr) = addr {
+                        let remote_addr = litebox_net()
+                            .lock()
+                            .get_remote_addr(&fd)
+                            .expect("accepted socket should have remote addr");
+                        if let Err(e) = match addrlen {
+                            Some(addrlen) => write_sockaddr_to_user(
+                                SocketAddress::Inet(remote_addr),
+                                addr,
+                                addrlen,
+                            ),
+                            None => return Err(Errno::EFAULT),
+                        } {
+                            return Err(e);
+                        }
+                    }
+
                     initialize_socket(&fd, sock_type, flags);
                     Ok(Descriptor::LiteBoxRawFd(
                         files.raw_descriptor_store.write().fd_into_raw_integer(fd),
@@ -909,7 +926,7 @@ impl Task {
     }
 
     /// Handle syscall `getsockname`
-    pub(crate) fn sys_getsockname(&self, sockfd: i32) -> Result<SocketAddr, Errno> {
+    pub(crate) fn sys_getsockname(&self, sockfd: i32) -> Result<SocketAddress, Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
@@ -922,7 +939,35 @@ impl Task {
             .ok_or(Errno::EBADF)?
         {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-                litebox_net().lock().get_local_addr(fd).map_err(Errno::from)
+                litebox_net()
+                    .lock()
+                    .get_local_addr(fd)
+                    .map(SocketAddress::Inet)
+                    .map_err(Errno::from)
+            }),
+            _ => Err(Errno::ENOTSOCK),
+        }
+    }
+
+    /// Handle syscall `getpeername`
+    pub(crate) fn sys_getpeername(&self, sockfd: i32) -> Result<SocketAddress, Errno> {
+        let Ok(sockfd) = u32::try_from(sockfd) else {
+            return Err(Errno::EBADF);
+        };
+
+        let files = self.files.borrow();
+        match files
+            .file_descriptors
+            .read()
+            .get_fd(sockfd)
+            .ok_or(Errno::EBADF)?
+        {
+            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
+                litebox_net()
+                    .lock()
+                    .get_remote_addr(fd)
+                    .map(SocketAddress::Inet)
+                    .map_err(Errno::from)
             }),
             _ => Err(Errno::ENOTSOCK),
         }
