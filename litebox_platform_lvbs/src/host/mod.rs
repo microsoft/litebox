@@ -17,7 +17,7 @@ struct HypercallPage([u8; PAGE_SIZE]);
 
 /// Get the address of a Hyper-V hypercall page. A `call` instruction to this address
 /// results in a trap-based Hyper-V hypercall. We must ensure that each
-/// Virtual Partition (VP)'s hypercall page is neither overlapped with nor reused
+/// Virtual Processor (VP)'s hypercall page is neither overlapped with nor reused
 /// for other code and data. Different VPs can share the same address for
 /// their hypercall pages because Hyper-V will figure out which VP makes this hypercall.
 /// To this end, we reserve a static memory page for the hypercall page which will
