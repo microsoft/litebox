@@ -828,6 +828,9 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
     })
 }
 
+/// Signal mask to be sent at exit
+const CLONE_SIGNAL_MASK: u64 = 0x000000ff;
+
 fn handle_clone_request(
     clone_args: &litebox_common_linux::CloneArgs,
     ctx: &litebox_common_linux::PtRegs,
@@ -838,8 +841,9 @@ fn handle_clone_request(
     if clone_args.set_tid != 0 {
         unimplemented!("Clone with set_tid is not supported");
     }
-    if clone_args.exit_signal != 0 {
-        unimplemented!("Clone with exit_signal is not supported");
+    // Note `exit_signal` is ignored because we don't support `fork` yet; we just validate it.
+    if clone_args.exit_signal & !CLONE_SIGNAL_MASK != 0 || clone_args.exit_signal > 64 {
+        return Err(Errno::EINVAL);
     }
     let parent_tid = if clone_args.parent_tid == 0 {
         None

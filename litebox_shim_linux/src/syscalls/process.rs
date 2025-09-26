@@ -354,10 +354,12 @@ pub(crate) fn sys_clone(
     if !flags.contains(CloneFlags::SYSVSEM) {
         unimplemented!("Clone without SYSVSEM flag is not supported");
     }
+    if !flags.contains(CloneFlags::THREAD | CloneFlags::SIGHAND) {
+        unimplemented!("Clone without THREAD or SIGHAND flag is not supported");
+    }
     let unsupported_clone_flags = CloneFlags::PIDFD
         | CloneFlags::PTRACE
         | CloneFlags::VFORK
-        | CloneFlags::PARENT
         | CloneFlags::NEWNS
         | CloneFlags::UNTRACED
         | CloneFlags::NEWCGROUP
