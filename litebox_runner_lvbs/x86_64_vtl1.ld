@@ -17,12 +17,6 @@ SECTIONS
         KEEP(*(.text._start))
         *(.text .text.*)
         *(.got)
-
-        . = ALIGN(0x1000);
-        _hypercall_page_start = .;
-        KEEP(*(.hypercall_page))
-        _hypercall_page_end = .;
-
         _text_end = .;
     }
     .data : ALIGN(0x200000) { 

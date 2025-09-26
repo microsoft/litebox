@@ -6,7 +6,7 @@ use crate::{
         instrs::{rdmsr, wrmsr},
     },
     debug_serial_println,
-    host::per_cpu_variables::with_per_cpu_variables,
+    host::{hv_hypercall_page_address, per_cpu_variables::with_per_cpu_variables},
     mshv::{
         HV_HYPERCALL_REP_COMP_MASK, HV_HYPERCALL_REP_COMP_OFFSET, HV_HYPERCALL_REP_START_MASK,
         HV_HYPERCALL_REP_START_OFFSET, HV_HYPERCALL_RESULT_MASK, HV_HYPERCALL_VARHEAD_OFFSET,
@@ -113,17 +113,17 @@ pub fn init() -> Result<(), HypervError> {
         );
     }
 
-    with_per_cpu_variables(|per_cpu_variables| {
-        wrmsr(
-            HV_X64_MSR_HYPERCALL,
-            per_cpu_variables.hv_hypercall_page_as_u64() | u64::from(HV_X64_MSR_HYPERCALL_ENABLE),
-        );
-        if rdmsr(HV_X64_MSR_HYPERCALL)
-            != per_cpu_variables.hv_hypercall_page_as_u64() | u64::from(HV_X64_MSR_HYPERCALL_ENABLE)
-        {
-            return Err(HypervError::InvalidHypercallPage);
-        }
+    wrmsr(
+        HV_X64_MSR_HYPERCALL,
+        hv_hypercall_page_address() | u64::from(HV_X64_MSR_HYPERCALL_ENABLE),
+    );
+    if rdmsr(HV_X64_MSR_HYPERCALL)
+        != hv_hypercall_page_address() | u64::from(HV_X64_MSR_HYPERCALL_ENABLE)
+    {
+        return Err(HypervError::InvalidHypercallPage);
+    }
 
+    with_per_cpu_variables(|per_cpu_variables| {
         wrmsr(
             HV_X64_MSR_SIMP,
             per_cpu_variables.hv_simp_page_as_u64() | u64::from(HV_X64_MSR_SIMP_ENABLE),
@@ -172,14 +172,10 @@ pub fn hv_do_hypercall(
     output: *mut core::ffi::c_void,
 ) -> Result<u64, HypervCallError> {
     let mut status: u64;
-    let hypercall_pg_addr = with_per_cpu_variables(
-        crate::host::per_cpu_variables::PerCpuVariables::hv_hypercall_page_as_u64,
-    );
-
     unsafe {
         asm!(
             "call rax",
-            in("rax") hypercall_pg_addr, in("rcx") control, in("rdx") input,
+            in("rax") hv_hypercall_page_address(), in("rcx") control, in("rdx") input,
             in("r8") output, lateout("rax") status, options(nostack)
         );
     }
