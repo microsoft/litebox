@@ -9,11 +9,6 @@ use litebox_common_optee::{
     UserTaPropType, UteeParams,
 };
 
-#[cfg(feature = "platform_linux_userland")]
-use litebox::platform::ThreadLocalStorageProvider;
-#[cfg(feature = "platform_linux_userland")]
-use litebox::platform::ThreadProvider;
-
 use crate::{
     litebox_page_manager,
     syscalls::pta::{
@@ -43,19 +38,7 @@ pub fn sys_return(ret: usize) -> ! {
         ret
     );
 
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "platform_linux_userland")] {
-            let tid = litebox_platform_multiplex::platform()
-                .with_thread_local_storage_mut(|tls| tls.current_task.tid);
-            #[allow(clippy::cast_sign_loss)]
-            let session_id = tid as u32;
-            crate::optee_command_dispatcher(session_id, true);
-        } else if #[cfg(feature = "platform_lvbs")] {
-            todo!("switch to VTL0");
-        } else {
-            compile_error!(r##"No platform specified."##);
-        }
-    }
+    litebox_runner_command_dispatcher::command_dispatcher().return_to_command_dispatcher()
 }
 
 /// A system call to print out a message.
@@ -79,15 +62,7 @@ pub fn sys_panic(code: usize) -> ! {
         code,
     );
 
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "platform_linux_userland")] {
-            litebox_platform_multiplex::platform().terminate_thread(i32::try_from(code).unwrap_or(0));
-        } else if #[cfg(feature = "platform_lvbs")] {
-            todo!("switch to VTL0");
-        } else {
-            compile_error!(r##"No platform specified."##);
-        }
-    }
+    litebox_runner_command_dispatcher::command_dispatcher().return_to_command_dispatcher()
 }
 
 // TODO: replace this with a proper implementation
