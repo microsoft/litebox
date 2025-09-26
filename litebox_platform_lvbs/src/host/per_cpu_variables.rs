@@ -1,10 +1,7 @@
 //! Per-CPU VTL1 kernel variables
 
 use crate::{
-    arch::{
-        MAX_CORES, gdt, get_core_id,
-        instrs::{rdgsbase, wrgsbase},
-    },
+    arch::{MAX_CORES, gdt, get_core_id},
     host::bootparam::get_num_possible_cpus,
     mshv::{
         HvMessagePage, HvVpAssistPage,
@@ -15,6 +12,7 @@ use crate::{
 };
 use alloc::boxed::Box;
 use core::{cell::RefCell, mem::MaybeUninit};
+use litebox_common_linux::{rdgsbase, wrgsbase};
 use x86_64::structures::tss::TaskStateSegment;
 
 pub const INTERRUPT_STACK_SIZE: usize = 2 * PAGE_SIZE;
@@ -163,7 +161,7 @@ where
     F: FnOnce(&PerCpuVariables) -> R,
     R: Sized + 'static,
 {
-    let gsbase = read_or_populate_gsbase();
+    let gsbase = u64::try_from(read_or_populate_gsbase()).unwrap();
     let addr = x86_64::VirtAddr::try_new(gsbase).expect("Non-canonical GSBASE value");
     let refcell = unsafe { &*addr.as_ptr::<RefCell<*mut PerCpuVariables>>() };
     let borrow = refcell.borrow();
@@ -189,7 +187,7 @@ where
     F: FnOnce(&mut PerCpuVariables) -> R,
     R: Sized + 'static,
 {
-    let gsbase = read_or_populate_gsbase();
+    let gsbase = u64::try_from(read_or_populate_gsbase()).unwrap();
     let addr = x86_64::VirtAddr::try_new(gsbase).expect("Non-canonical GSBASE value");
     let refcell = unsafe { &*addr.as_ptr::<RefCell<*mut PerCpuVariables>>() };
     let mut borrow = refcell.borrow_mut();
@@ -199,8 +197,8 @@ where
 }
 
 #[inline]
-fn read_or_populate_gsbase() -> u64 {
-    let gsbase = rdgsbase();
+fn read_or_populate_gsbase() -> usize {
+    let gsbase = unsafe { rdgsbase() };
     if gsbase == 0 {
         let core_id = get_core_id();
         let addr = if core_id == 0 {
@@ -217,8 +215,8 @@ fn read_or_populate_gsbase() -> u64 {
             "GSBASE is not set, and per-CPU variables are not allocated"
         );
         let addr = x86_64::VirtAddr::new(u64::try_from(addr.addr()).unwrap());
-        wrgsbase(addr.as_u64());
-        addr.as_u64()
+        unsafe { wrgsbase(usize::try_from(addr.as_u64()).unwrap()) };
+        usize::try_from(addr.as_u64()).unwrap()
     } else {
         gsbase
     }
