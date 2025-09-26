@@ -1811,7 +1811,7 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     Madvise {
         addr: Platform::RawMutPointer<u8>,
         length: usize,
-        behavior: i32,
+        behavior: MadviseBehavior,
     },
     Dup {
         oldfd: i32,
@@ -2224,7 +2224,12 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
             Sysno::madvise => {
-                sys_req!(Madvise { addr:*, length, behavior })
+                let behavior: i32 = ctx.sys_req_arg(2);
+                if let Ok(behavior) = MadviseBehavior::try_from(behavior) {
+                    sys_req!(Madvise { addr:*, length, behavior: { behavior } })
+                } else {
+                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                }
             }
             Sysno::dup => SyscallRequest::Dup {
                 oldfd: ctx.sys_req_arg(0),
