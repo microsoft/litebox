@@ -62,11 +62,6 @@ impl PerCpuVariables {
         &raw const self.hv_simp_page as u64
     }
 
-    #[allow(clippy::unused_self)]
-    pub(crate) fn hv_hypercall_page_as_u64(&self) -> u64 {
-        get_hypercall_page_address()
-    }
-
     pub(crate) fn hv_hypercall_input_page_as_mut_ptr(&mut self) -> *mut [u8; PAGE_SIZE] {
         &raw mut self.hvcall_input
     }
@@ -256,18 +251,4 @@ pub fn allocate_per_cpu_variables() {
             PER_CPU_VARIABLE_ADDRESSES[i].write(RefCell::new(Box::into_raw(per_cpu_variables)));
         }
     }
-}
-
-// A hypercall page is a shared read-only code page, so it's better not to use heap.
-unsafe extern "C" {
-    static _hypercall_page_start: u8;
-}
-
-#[unsafe(link_section = ".hypercall_page")]
-pub static HYPERCALL_PAGE: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
-
-/// Get the hypercall page address
-#[inline]
-pub fn get_hypercall_page_address() -> u64 {
-    &raw const _hypercall_page_start as u64
 }
