@@ -140,6 +140,18 @@ impl Socket {
                         self.options.lock().send_timeout = read_timeval_as_duration(optval)?;
                         return Ok(());
                     }
+                    SocketOption::LINGER => {
+                        if optlen < size_of::<litebox_common_linux::Linger>() {
+                            return Err(Errno::EINVAL);
+                        }
+                        let linger: crate::ConstPtr<litebox_common_linux::Linger> =
+                            crate::ConstPtr::from_usize(optval.as_usize());
+                        let linger = unsafe { linger.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+                        if linger.onoff != 0 && linger.linger != 0 {
+                            unimplemented!("SO_LINGER with non-zero timeout is not supported yet");
+                        }
+                        return Ok(());
+                    }
                     _ => {}
                 }
 
@@ -185,7 +197,7 @@ impl Socket {
                     // We use fixed buffer size for now
                     SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
                     // Already handled at the beginning
-                    SocketOption::RCVTIMEO | SocketOption::SNDTIMEO => {}
+                    SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER => {}
                     // Socket does not support these options
                     SocketOption::TYPE | SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
                 }

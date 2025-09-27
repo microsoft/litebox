@@ -587,6 +587,14 @@ bitflags::bitflags! {
     }
 }
 
+/// struct for SO_LINGER option
+#[repr(C)]
+#[derive(Clone)]
+pub struct Linger {
+    pub onoff: i32,  /* Linger active		*/
+    pub linger: i32, /* How long to linger for	*/
+}
+
 #[repr(u8)]
 #[non_exhaustive]
 #[derive(IntEnum, PartialEq, Debug)]
@@ -612,6 +620,11 @@ pub enum SocketOption {
     SNDBUF = 7,
     RCVBUF = 8,
     KEEPALIVE = 9,
+    /// This option controls the action taken when unsent messages queue on
+    /// a socket and close() is performed. If SO_LINGER is set, the system
+    /// shall block the process during close() until it can transmit the data
+    /// or until the time expires.
+    LINGER = 13,
     PEERCRED = 17,
     RCVTIMEO = 20,
     SNDTIMEO = 21,
@@ -2277,8 +2290,9 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::bind => sys_req!(Bind { sockfd, sockaddr:*, addrlen }),
             Sysno::listen => sys_req!(Listen { sockfd, backlog }),
             Sysno::setsockopt => {
-                let optname = SocketOptionName::from(ctx.sys_req_arg(1), ctx.sys_req_arg(2));
-                if let Some(optname) = optname {
+                let level: u32 = ctx.sys_req_arg(1);
+                let name: u32 = ctx.sys_req_arg(2);
+                if let Some(optname) = SocketOptionName::from(level, name) {
                     SyscallRequest::Setsockopt {
                         sockfd: ctx.sys_req_arg(0),
                         optname,
@@ -2286,7 +2300,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                         optlen: ctx.sys_req_arg(4),
                     }
                 } else {
-                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                    unimplemented!("level: {}, optname: {}", level, name);
                 }
             }
             Sysno::exit => sys_req!(Exit { status }),
