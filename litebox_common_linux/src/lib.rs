@@ -635,10 +635,10 @@ pub enum SocketOption {
 pub enum TcpOption {
     NODELAY = 1,
     CORK = 3,
-    /// The time (in seconds) the connection needs to remain idle
-    /// before TCP starts sending keepalive probes, if the socket
-    /// option SO_KEEPALIVE has been set on this socket.
+    /// Start keeplives after this period
     KEEPIDLE = 4,
+    /// Interval between keepalives
+    KEEPINTVL = 5,
     INFO = 11,
     CONGESTION = 13,
 }

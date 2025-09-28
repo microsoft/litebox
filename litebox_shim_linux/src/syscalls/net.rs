@@ -241,8 +241,25 @@ impl Socket {
                         if val < 1 || val > MAX_TCP_KEEPIDLE {
                             return Err(Errno::EINVAL);
                         }
+                        // Note smoltcp does not distinguish between idle and interval time.
                         if !self.options.lock().keep_alive {
                             return Ok(());
+                        }
+                        litebox_net()
+                            .lock()
+                            .set_tcp_option(
+                                self.fd.as_ref().unwrap(),
+                                litebox::net::TcpOptionData::KEEPALIVE(Some(
+                                    core::time::Duration::from_secs(val as u64),
+                                )),
+                            )
+                            .expect("set TCP_KEEPALIVE should succeed");
+                        Ok(())
+                    }
+                    TcpOption::KEEPINTVL => {
+                        const MAX_TCP_KEEPINTVL: u32 = 32767;
+                        if val < 1 || val > MAX_TCP_KEEPINTVL {
+                            return Err(Errno::EINVAL);
                         }
                         litebox_net()
                             .lock()
