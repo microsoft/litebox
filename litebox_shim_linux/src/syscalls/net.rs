@@ -272,6 +272,14 @@ impl Socket {
                             .expect("set TCP_KEEPALIVE should succeed");
                         Ok(())
                     }
+                    TcpOption::KEEPCNT => {
+                        const MAX_TCP_KEEPCNT: u32 = 127;
+                        if val < 1 || val > MAX_TCP_KEEPCNT {
+                            return Err(Errno::EINVAL);
+                        }
+                        // TODO: smoltcp does not seem to support this, no-op for now
+                        Ok(())
+                    }
                     _ => unimplemented!("TCP option {to:?}"),
                 }
             }

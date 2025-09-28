@@ -639,6 +639,8 @@ pub enum TcpOption {
     KEEPIDLE = 4,
     /// Interval between keepalives
     KEEPINTVL = 5,
+    /// Number of keepalives before death
+    KEEPCNT = 6,
     INFO = 11,
     CONGESTION = 13,
 }
