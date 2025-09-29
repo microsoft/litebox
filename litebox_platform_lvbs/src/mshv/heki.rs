@@ -347,10 +347,19 @@ impl HekiKernelSymbol {
             .try_into()
             .map_err(|_| Errno::EINVAL)?;
 
+        /* TODO: memory container's copy appears to be copying data into unaligned
+         * address. Fix copy, then we can verify alignment or use trans____
+         */
+        #[allow(clippy::cast_ptr_alignment)]
+        let ksym_ptr = ksym_bytes.as_ptr().cast::<HekiKernelSymbol>();
+
         // SAFETY: Casting from vtl0 buffer that contained the struct
         unsafe {
-            let ksym: HekiKernelSymbol = core::mem::transmute(ksym_bytes);
-            Ok(ksym)
+            Ok(HekiKernelSymbol {
+                value_offset: (*ksym_ptr).value_offset,
+                name_offset: (*ksym_ptr).name_offset,
+                namespace_offset: (*ksym_ptr).namespace_offset,
+            })
         }
     }
 }
@@ -375,10 +384,20 @@ impl HekiKernelInfo {
             .try_into()
             .map_err(|_| Errno::EINVAL)?;
 
+        /* TODO: memory container's copy appears to be copying data into unaligned
+         * address. Fix copy, then we can verify alignment or use trans____
+         */
+        #[allow(clippy::cast_ptr_alignment)]
+        let kinfo_ptr = kinfo_bytes.as_ptr().cast::<HekiKernelInfo>();
+
         // SAFETY: Casting from vtl0 buffer that contained the struct
         unsafe {
-            let kinfo: HekiKernelInfo = core::mem::transmute(kinfo_bytes);
-            Ok(kinfo)
+            Ok(HekiKernelInfo {
+                start: (*kinfo_ptr).start,
+                end: (*kinfo_ptr).end,
+                gpl_start: (*kinfo_ptr).gpl_start,
+                gpl_end: (*kinfo_ptr).gpl_end,
+            })
         }
     }
 }

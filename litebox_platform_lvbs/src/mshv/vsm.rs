@@ -1967,7 +1967,7 @@ impl SymbolTable {
 
         for _ in 0..ksym_count {
             let sym = Symbol::from_bytes(kinfo_offset, kinfo_addr, buf).unwrap();
-            //serial_println!("{} {:#x}", sym.name, sym.value);
+            //serial_println!("{} {:#x}", sym._name, sym._value);
             inner.push(sym);
             kinfo_offset += HekiKernelSymbol::KSYM_LEN;
             kinfo_addr += HekiKernelSymbol::KSYM_LEN as u64;
