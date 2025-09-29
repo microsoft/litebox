@@ -238,7 +238,7 @@ impl Socket {
                     }
                     TcpOption::KEEPIDLE => {
                         const MAX_TCP_KEEPIDLE: u32 = 32767;
-                        if val < 1 || val > MAX_TCP_KEEPIDLE {
+                        if !(1..=MAX_TCP_KEEPIDLE).contains(&val) {
                             return Err(Errno::EINVAL);
                         }
                         // Note smoltcp does not distinguish between idle and interval time.
@@ -250,7 +250,7 @@ impl Socket {
                             .set_tcp_option(
                                 self.fd.as_ref().unwrap(),
                                 litebox::net::TcpOptionData::KEEPALIVE(Some(
-                                    core::time::Duration::from_secs(val as u64),
+                                    core::time::Duration::from_secs(u64::from(val)),
                                 )),
                             )
                             .expect("set TCP_KEEPALIVE should succeed");
@@ -258,7 +258,7 @@ impl Socket {
                     }
                     TcpOption::KEEPINTVL => {
                         const MAX_TCP_KEEPINTVL: u32 = 32767;
-                        if val < 1 || val > MAX_TCP_KEEPINTVL {
+                        if !(1..=MAX_TCP_KEEPINTVL).contains(&val) {
                             return Err(Errno::EINVAL);
                         }
                         litebox_net()
@@ -266,7 +266,7 @@ impl Socket {
                             .set_tcp_option(
                                 self.fd.as_ref().unwrap(),
                                 litebox::net::TcpOptionData::KEEPALIVE(Some(
-                                    core::time::Duration::from_secs(val as u64),
+                                    core::time::Duration::from_secs(u64::from(val)),
                                 )),
                             )
                             .expect("set TCP_KEEPALIVE should succeed");
@@ -274,7 +274,7 @@ impl Socket {
                     }
                     TcpOption::KEEPCNT => {
                         const MAX_TCP_KEEPCNT: u32 = 127;
-                        if val < 1 || val > MAX_TCP_KEEPCNT {
+                        if !(1..=MAX_TCP_KEEPCNT).contains(&val) {
                             return Err(Errno::EINVAL);
                         }
                         // TODO: smoltcp does not seem to support this, no-op for now
