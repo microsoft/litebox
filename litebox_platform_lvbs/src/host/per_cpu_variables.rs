@@ -136,6 +136,7 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
 /// Store the addresses of per-CPU variables. The kernel threads are expected to access
 /// the corresponding per-CPU variables via the GS registers which will store the addresses later.
 /// Instead of maintaining this map, we might be able to use a hypercall to directly program each core's GS register.
+/// TODO: consider whether we can avoid using `MaybeUninit` here (which is dangerous in a global context).
 static mut PER_CPU_VARIABLE_ADDRESSES: [MaybeUninit<RefCell<*mut PerCpuVariables>>; MAX_CORES] =
     [const { MaybeUninit::uninit() }; MAX_CORES];
 
