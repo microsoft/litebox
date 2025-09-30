@@ -29,7 +29,7 @@ fn ratchet(expected: usize, f: impl Fn(BufReader<File>) -> Result<usize>) -> Res
 
 #[test]
 fn ratchet_transmutes() -> Result<()> {
-    ratchet(7, |file| {
+    ratchet(4, |file| {
         Ok(file
             .lines()
             .filter(|line| line.as_ref().unwrap().contains("transmute"))

@@ -2,7 +2,6 @@
 
 use core::{
     alloc::{GlobalAlloc, Layout},
-    mem::transmute,
     ptr::NonNull,
 };
 
@@ -90,14 +89,24 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
 
     /// Allocates a new [`ObjectPage`] from the System.
     fn alloc_page(&self) -> Option<&'static mut ObjectPage<'static>> {
-        self.allocate_pages(Self::BASE_PAGE_SIZE_ORDER)
-            .map(|r| unsafe { transmute(r as usize) })
+        self.allocate_pages(Self::BASE_PAGE_SIZE_ORDER).map(|r| {
+            if (r as usize).is_multiple_of(core::mem::align_of::<ObjectPage<'static>>()) {
+                unsafe { &mut *r.cast() }
+            } else {
+                unreachable!()
+            }
+        })
     }
 
     /// Allocates a new [`LargeObjectPage`] from the system.
     fn alloc_large_page(&self) -> Option<&'static mut LargeObjectPage<'static>> {
-        self.allocate_pages(Self::LARGE_PAGE_SIZE_ORDER)
-            .map(|r| unsafe { transmute(r as usize) })
+        self.allocate_pages(Self::LARGE_PAGE_SIZE_ORDER).map(|r| {
+            if (r as usize).is_multiple_of(core::mem::align_of::<LargeObjectPage<'static>>()) {
+                unsafe { &mut *r.cast() }
+            } else {
+                unreachable!()
+            }
+        })
     }
 
     /// Allocate (1 << `order`) virtually contiguous pages using buddy allocator.

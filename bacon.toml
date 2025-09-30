@@ -48,6 +48,18 @@ cargo +$TOOLCHAIN build -Z build-std-features=compiler-builtins-mem -Z build-std
 """]
 need_stdout = false
 
+# All build checks on SNP
+[jobs.buildchecks-snp]
+command = ["bash", "-c", """
+#!/bin/bash
+set -eo pipefail
+set -x
+TOOLCHAIN=$(awk -F'"' '/channel/{print $2}' litebox_runner_snp/rust-toolchain.toml)
+cargo +$TOOLCHAIN clippy --bins --examples --all-features -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem --manifest-path=litebox_runner_snp/Cargo.toml --target litebox_runner_snp/target.json
+cargo +$TOOLCHAIN build -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem --manifest-path=litebox_runner_snp/Cargo.toml --target litebox_runner_snp/target.json
+"""]
+need_stdout = false
+
 # Run nextest on default target
 [jobs.nextest]
 command = [
@@ -90,4 +102,5 @@ alt-n = "job:nextest-x86"
 d = "job:doc-open"
 alt-d = "job:doc"
 v = "job:buildchecks-lvbs"
+alt-s = "job:buildchecks-snp"
 w = "job:clippy-windows"

@@ -112,7 +112,10 @@ pub fn hvcall_get_vp_vtl0_registers(reg_name: u32) -> Result<u64, HypervCallErro
 }
 
 /// Populate the VP context for VTL1
-#[expect(clippy::similar_names)]
+#[allow(
+    clippy::similar_names,
+    reason = "some versions of clippy trigger this warning due to rip/rsp"
+)]
 fn hv_vtl_populate_vp_context(input: &mut HvEnableVpVtl, tss: u64, rip: u64, rsp: u64) {
     use x86_64::instructions::tables::{sgdt, sidt};
     use x86_64::registers::{
@@ -173,7 +176,10 @@ fn hv_vtl_populate_vp_context(input: &mut HvEnableVpVtl, tss: u64, rip: u64, rsp
 }
 
 /// Hyper-V Hypercall to enable a certain VTL for a specific virtual processor (VP)
-#[expect(clippy::similar_names)]
+#[allow(
+    clippy::similar_names,
+    reason = "some versions of clippy trigger this warning due to rip/rsp"
+)]
 fn hvcall_enable_vp_vtl(
     core_id: u32,
     new_vtl: u8,
@@ -213,7 +219,10 @@ fn get_entry() -> u64 {
 ///
 /// # Panics
 /// Panics if the number of online cores is greater than `MAX_CORES`.
-#[expect(clippy::similar_names)]
+#[allow(
+    clippy::similar_names,
+    reason = "some versions of clippy trigger this warning due to rip/rsp"
+)]
 pub fn init_vtl_aps(online_cores: u32) -> Result<u64, HypervCallError> {
     assert!(online_cores <= u32::try_from(MAX_CORES).expect("MAX_CORES"));
 
