@@ -450,15 +450,15 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
         .map_err(|_| Errno::EINVAL)?;
 
     vtl0_info.gpl_symbols.build_from_container(
-        VirtAddr::from_ptr(kinfo.gpl_start),
-        VirtAddr::from_ptr(kinfo.gpl_end),
+        VirtAddr::from_ptr(kinfo.ksymtab_gpl_start),
+        VirtAddr::from_ptr(kinfo.ksymtab_gpl_end),
         &kdata_mem,
         &kdata_buf,
     )?;
 
     vtl0_info.symbols.build_from_container(
-        VirtAddr::from_ptr(kinfo.start),
-        VirtAddr::from_ptr(kinfo.end),
+        VirtAddr::from_ptr(kinfo.ksymtab_start),
+        VirtAddr::from_ptr(kinfo.ksymtab_end),
         &kdata_mem,
         &kdata_buf,
     )?;
@@ -1888,13 +1888,17 @@ pub enum PatchDataMapError {
     InvalidHekiPatch,
 }
 
+// TODO: Use this to resolve symbols in modules
 pub struct Symbol {
     _value: u64,
-    _name: String,
 }
 
 impl Symbol {
-    pub fn from_bytes(kinfo_start: usize, start: VirtAddr, bytes: &[u8]) -> Result<Self, Errno> {
+    pub fn from_bytes(
+        kinfo_start: usize,
+        start: VirtAddr,
+        bytes: &[u8],
+    ) -> Result<(String, Self), Errno> {
         let kinfo_bytes = &bytes[kinfo_start..];
         let ksym = HekiKernelSymbol::from_bytes(kinfo_bytes)?;
 
@@ -1910,14 +1914,18 @@ impl Symbol {
         if name_offset >= bytes.len() {
             return Err(Errno::EINVAL);
         }
-        bytes[name_offset..]
+        let name_len = bytes[name_offset..]
             .iter()
             .position(|&b| b == 0)
             .ok_or(Errno::EBADR)?;
+        if name_len >= HekiKernelSymbol::KSY_NAME_LEN {
+            return Err(Errno::EINVAL);
+        }
 
         // SAFETY:
         // - offset is within bytes (checked above)
         // - there is a NUL terminator within bytes[offset..] (checked above)
+        // - Length of name string is within spec range (checked above)
         // - bytes is still valid for the duration of this function
         let name_str = unsafe {
             let name_ptr = bytes.as_ptr().add(name_offset).cast::<c_char>();
@@ -1925,21 +1933,18 @@ impl Symbol {
         };
         let name = CString::new(name_str.to_str().unwrap()).unwrap();
         let name = name.into_string().unwrap();
-        Ok(Symbol {
-            _value: value,
-            _name: name,
-        })
+        Ok((name, Symbol { _value: value }))
     }
 }
 pub struct SymbolTable {
-    inner: spin::rwlock::RwLock<Vec<Symbol>>,
+    inner: spin::rwlock::RwLock<HashMap<String, Symbol>>,
 }
 use core::ffi::{CStr, c_char};
 
 impl SymbolTable {
     pub fn new() -> Self {
         Self {
-            inner: spin::rwlock::RwLock::new(Vec::new()),
+            inner: spin::rwlock::RwLock::new(HashMap::new()),
         }
     }
     pub fn build_from_container(
@@ -1966,9 +1971,8 @@ impl SymbolTable {
         inner.reserve(ksym_count);
 
         for _ in 0..ksym_count {
-            let sym = Symbol::from_bytes(kinfo_offset, kinfo_addr, buf).unwrap();
-            //serial_println!("{} {:#x}", sym._name, sym._value);
-            inner.push(sym);
+            let (name, sym) = Symbol::from_bytes(kinfo_offset, kinfo_addr, buf).unwrap();
+            inner.insert(name, sym);
             kinfo_offset += HekiKernelSymbol::KSYM_LEN;
             kinfo_addr += HekiKernelSymbol::KSYM_LEN as u64;
         }

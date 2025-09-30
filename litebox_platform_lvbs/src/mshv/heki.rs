@@ -329,7 +329,7 @@ impl HekiPatchInfo {
 
 #[repr(C)]
 #[allow(clippy::struct_field_names)]
-/* TODO: Account for kernel config changes the size and meaning of the field members */
+// TODO: Account for kernel config changing the size and meaning of the field members
 pub struct HekiKernelSymbol {
     pub value_offset: core::ffi::c_int,
     pub name_offset: core::ffi::c_int,
@@ -338,6 +338,7 @@ pub struct HekiKernelSymbol {
 
 impl HekiKernelSymbol {
     pub const KSYM_LEN: usize = mem::size_of::<HekiKernelSymbol>();
+    pub const KSY_NAME_LEN: usize = 512;
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Errno> {
         if bytes.len() < Self::KSYM_LEN {
@@ -347,9 +348,8 @@ impl HekiKernelSymbol {
             .try_into()
             .map_err(|_| Errno::EINVAL)?;
 
-        /* TODO: memory container's copy appears to be copying data into unaligned
-         * address. Fix copy, then we can verify alignment or use trans____
-         */
+        // TODO: memory container's copy appears to be copying data into unaligned
+        // address. Fix copy, then we can verify alignment or use trans____
         #[allow(clippy::cast_ptr_alignment)]
         let ksym_ptr = ksym_bytes.as_ptr().cast::<HekiKernelSymbol>();
 
@@ -365,11 +365,12 @@ impl HekiKernelSymbol {
 }
 
 #[repr(C)]
+#[allow(clippy::struct_field_names)]
 pub struct HekiKernelInfo {
-    pub start: *const HekiKernelSymbol,
-    pub end: *const HekiKernelSymbol,
-    pub gpl_start: *const HekiKernelSymbol,
-    pub gpl_end: *const HekiKernelSymbol,
+    pub ksymtab_start: *const HekiKernelSymbol,
+    pub ksymtab_end: *const HekiKernelSymbol,
+    pub ksymtab_gpl_start: *const HekiKernelSymbol,
+    pub ksymtab_gpl_end: *const HekiKernelSymbol,
     // Skip unused arch info
 }
 
@@ -384,19 +385,18 @@ impl HekiKernelInfo {
             .try_into()
             .map_err(|_| Errno::EINVAL)?;
 
-        /* TODO: memory container's copy appears to be copying data into unaligned
-         * address. Fix copy, then we can verify alignment or use trans____
-         */
+        // TODO: memory container's copy appears to be copying data into unaligned
+        // address. Fix copy, then we can verify alignment or use trans____
         #[allow(clippy::cast_ptr_alignment)]
         let kinfo_ptr = kinfo_bytes.as_ptr().cast::<HekiKernelInfo>();
 
         // SAFETY: Casting from vtl0 buffer that contained the struct
         unsafe {
             Ok(HekiKernelInfo {
-                start: (*kinfo_ptr).start,
-                end: (*kinfo_ptr).end,
-                gpl_start: (*kinfo_ptr).gpl_start,
-                gpl_end: (*kinfo_ptr).gpl_end,
+                ksymtab_start: (*kinfo_ptr).ksymtab_start,
+                ksymtab_end: (*kinfo_ptr).ksymtab_end,
+                ksymtab_gpl_start: (*kinfo_ptr).ksymtab_gpl_start,
+                ksymtab_gpl_end: (*kinfo_ptr).ksymtab_gpl_end,
             })
         }
     }
