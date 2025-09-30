@@ -1237,9 +1237,15 @@ where
                 if tcp_socket.can_send() {
                     events |= Events::OUT;
                 }
-                if tcp_socket.state() == tcp::State::CloseWait {
+                // A socket is closing if and only if it has sent its FIN packet but
+                // is still waiting for an ACK packet from the peer to acknowledge the FIN it sent.
+                if matches!(
+                    tcp_socket.state(),
+                    tcp::State::FinWait1 | tcp::State::Closing | tcp::State::LastAck
+                ) {
                     events |= Events::HUP;
-                } else if !events.contains(Events::IN) {
+                }
+                if !events.contains(Events::IN) {
                     // A server socket should have `Events::IN` if any of its listening sockets is connected.
                     if let Some(server_socket) = socket_handle.specific.tcp().server_socket.as_ref()
                     {
