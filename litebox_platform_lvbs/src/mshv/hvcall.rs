@@ -73,7 +73,7 @@ fn check_hyperv() -> Result<(), HypervError> {
 pub fn init() -> Result<(), HypervError> {
     check_hyperv()?;
 
-    debug_serial_println!("HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
+//    debug_serial_println!("HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
 
     let kernel_context = get_per_core_kernel_context();
 
@@ -86,10 +86,10 @@ pub fn init() -> Result<(), HypervError> {
     {
         return Err(HypervError::InvalidAssistPage);
     }
-    debug_serial_println!(
+ /*    debug_serial_println!(
         "HV_X64_MSR_VP_ASSIST_PAGE: {:#x}",
         rdmsr(HV_X64_MSR_VP_ASSIST_PAGE)
-    );
+    ); */
 
     let guest_id = generate_guest_id(
         HV_CANONICAL_VENDOR_ID.into(),

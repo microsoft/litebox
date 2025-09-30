@@ -169,7 +169,7 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
 
 /// VSM function for enforcing certain security features of VTL0
 pub fn mshv_vsm_secure_config_vtl0() -> Result<i64, Errno> {
-    debug_serial_println!("VSM: Secure VTL0 configuration");
+  //  debug_serial_println!("VSM: Secure VTL0 configuration");
 
     let mut config = HvRegisterVsmVpSecureVtlConfig::new();
     config.set_mbec_enabled(true);
@@ -341,14 +341,14 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
                 let epa = heki_range.epa;
                 // TODO: load kernel data (e.g., into `BTreeMap` or other data structures) once we implement data consumers like `mshv_vsm_validate_guest_module`.
                 // for now, this function is a no-op and just prints the memory range we should load.
-                debug_serial_println!(
+             /*    debug_serial_println!(
                     "VSM: Load kernel data: va {:#x} pa {:#x} epa {:#x} {:?} (size: {})",
                     va,
                     pa,
                     epa,
                     heki_range.heki_kdata_type(),
                     epa - pa
-                );
+                );*/
 
                 match heki_range.heki_kdata_type() {
                     HekiKdataType::SystemCerts => {
@@ -439,11 +439,11 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         return Err(Errno::EINVAL);
     }
 
-    debug_serial_println!(
+   /*  debug_serial_println!(
         "VSM: Validate kernel module: pa {:#x} nranges {}",
         pa,
         nranges,
-    );
+    );*/
 
     // collect and maintain the memory ranges of a module locally until the module is validated and its metadata is registered in the global map
     // we don't maintain this content in the global map due to memory overhead. Instead, we could add its hash value to the global map to check the integrity.
@@ -579,7 +579,7 @@ fn prepare_data_for_module_validation(
 /// write-protecting the memory ranges that should be read-only after initialization.
 /// `token` is the unique identifier for the module.
 pub fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, Errno> {
-    debug_serial_println!("VSM: Free kernel module's init (token: {})", token);
+   // debug_serial_println!("VSM: Free kernel module's init (token: {})", token);
 
     if !crate::platform_low()
         .vtl0_kernel_info
@@ -622,7 +622,7 @@ pub fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, Errno> {
 /// VSM function for supporting the unloading of a guest kernel module.
 /// `token` is the unique identifier for the module.
 pub fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, Errno> {
-    debug_serial_println!("VSM: Unload kernel module (token: {})", token);
+    //debug_serial_println!("VSM: Unload kernel module (token: {})", token);
 
     if !crate::platform_low()
         .vtl0_kernel_info
@@ -830,7 +830,7 @@ fn prepare_data_for_kexec_validation(
 /// within one or across two likely non-contiguous physical pages.
 pub fn mshv_vsm_patch_text(patch_pa_0: u64, patch_pa_1: u64) -> Result<i64, Errno> {
     let heki_patch = copy_heki_patch_from_vtl0(patch_pa_0, patch_pa_1)?;
-    debug_serial_println!("VSM: {:?}", heki_patch);
+  //  debug_serial_println!("VSM: {:?}", heki_patch);
 
     let Some(precomputed_patch) = crate::platform_low()
         .vtl0_kernel_info

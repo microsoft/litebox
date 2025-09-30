@@ -166,10 +166,11 @@ fn optee_call_done(session_id: u32) {
 }
 
 const TA_BINARY: &[u8] =
-    include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/hello-ta.elf");
-// include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/random-ta.elf");
-// include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/aes-ta.elf");
-// include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/kmpp-ta.elf");
+   // include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/hello-ta.elf");
+   // include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/random-ta.elf");
+   // include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/aes-ta.elf");
+   // include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/kmpp-ta.elf");
+   include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/kmpp-ta-2.elf");
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
