@@ -561,7 +561,8 @@ impl ResourceLimits {
     }
 }
 
-fn do_prlimit(
+/// Get resource limits, and optionally set new limits.
+pub(crate) fn do_prlimit(
     resource: litebox_common_linux::RlimitResource,
     new_limit: Option<litebox_common_linux::Rlimit>,
 ) -> Result<litebox_common_linux::Rlimit, Errno> {

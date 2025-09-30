@@ -1290,7 +1290,7 @@ pub type rlim_t = usize;
 
 /// Used by getrlimit and setrlimit syscalls
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Rlimit {
     pub rlim_cur: rlim_t,
     pub rlim_max: rlim_t,
