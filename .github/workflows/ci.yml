@@ -157,7 +157,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Set up Rust
         run: |
-          RUST_CHANNEL=$(awk -F'"' '/channel/{print $2}' litebox_runner_lvbs/rust-toolchain.toml)
+          RUST_CHANNEL=$(awk -F'"' '/channel/{print $2}' litebox_runner_snp/rust-toolchain.toml)
           rustup toolchain install ${RUST_CHANNEL} --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-unknown-none
           rustup component add rust-src --toolchain ${RUST_CHANNEL}-x86_64-unknown-linux-gnu
           rustup default ${RUST_CHANNEL}
