@@ -75,6 +75,11 @@ pub(super) struct SocketOptions {
     pub(super) recv_timeout: Option<core::time::Duration>,
     /// Sending timeout, None (default value) means no timeout
     pub(super) send_timeout: Option<core::time::Duration>,
+    /// Linger timeout, None (default value) means closing in the background.
+    /// If it is `Some`, a close or shutdown will not return
+    /// until all queued messages for the socket have been
+    /// successfully sent or the timeout has been reached.
+    pub(super) linger_timeout: Option<core::time::Duration>,
 }
 
 // TODO: move `status` and `close_on_exec` to litebox once #119 is completed
