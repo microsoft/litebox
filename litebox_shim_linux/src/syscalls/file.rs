@@ -96,10 +96,10 @@ pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, 
                 Descriptor::File(file)
             }
         })?;
-    file_descriptors().write().insert(file).map_err(|desc| {
-        do_close(desc).expect("closing descriptor should succeed");
-        Errno::EMFILE
-    })
+    file_descriptors()
+        .write()
+        .insert(file)
+        .map_err(|desc| do_close(desc).err().unwrap_or(Errno::EMFILE))
 }
 
 /// Handle syscall `openat`
@@ -866,20 +866,14 @@ pub fn sys_pipe2(flags: OFlags) -> Result<(u32, u32), Errno> {
             consumer: reader,
             close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
         })
-        .map_err(|desc| {
-            do_close(desc).expect("closing descriptor should succeed");
-            Errno::EMFILE
-        })?;
+        .map_err(|desc| do_close(desc).err().unwrap_or(Errno::EMFILE))?;
     let write_fd = file_descriptors()
         .write()
         .insert(Descriptor::PipeWriter {
             producer: writer,
             close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
         })
-        .map_err(|desc| {
-            do_close(desc).expect("closing descriptor should succeed");
-            Errno::EMFILE
-        })?;
+        .map_err(|desc| do_close(desc).err().unwrap_or(Errno::EMFILE))?;
     Ok((read_fd, write_fd))
 }
 
@@ -895,10 +889,7 @@ pub fn sys_eventfd2(initval: u32, flags: EfdFlags) -> Result<u32, Errno> {
             file: alloc::sync::Arc::new(eventfd),
             close_on_exec: core::sync::atomic::AtomicBool::new(flags.contains(EfdFlags::CLOEXEC)),
         })
-        .map_err(|desc| {
-            do_close(desc).expect("closing descriptor should succeed");
-            Errno::EMFILE
-        })
+        .map_err(|desc| do_close(desc).err().unwrap_or(Errno::EMFILE))
 }
 
 fn stdio_ioctl(arg: IoctlArg<litebox_platform_multiplex::Platform>) -> Result<u32, Errno> {
@@ -1054,10 +1045,7 @@ pub fn sys_epoll_create(flags: EpollCreateFlags) -> Result<u32, Errno> {
                 flags.contains(EpollCreateFlags::EPOLL_CLOEXEC),
             ),
         })
-        .map_err(|desc| {
-            do_close(desc).expect("closing descriptor should succeed");
-            Errno::EMFILE
-        })
+        .map_err(|desc| do_close(desc).err().unwrap_or(Errno::EMFILE))
 }
 
 /// Handle syscall `epoll_ctl`
@@ -1239,10 +1227,10 @@ pub fn sys_dup(oldfd: i32, newfd: Option<i32>, flags: Option<OFlags>) -> Result<
         Ok(newfd)
     } else {
         // dup
-        file_descriptors().write().insert(new_file).map_err(|desc| {
-            do_close(desc).expect("closing descriptor should succeed");
-            Errno::EMFILE
-        })
+        file_descriptors()
+            .write()
+            .insert(new_file)
+            .map_err(|desc| do_close(desc).err().unwrap_or(Errno::EMFILE))
     }
 }
 
