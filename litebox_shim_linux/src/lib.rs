@@ -167,7 +167,7 @@ impl Descriptors {
             ],
         }
     }
-    fn insert(&mut self, descriptor: Descriptor) -> u32 {
+    fn insert(&mut self, descriptor: Descriptor) -> Result<u32, Descriptor> {
         let idx = self
             .descriptors
             .iter()
@@ -176,13 +176,16 @@ impl Descriptors {
                 self.descriptors.push(None);
                 self.descriptors.len() - 1
             });
+        if idx
+            >= crate::syscalls::process::LITEBOX_PROCESS
+                .limits
+                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
+        {
+            return Err(descriptor);
+        }
         let old = self.descriptors[idx].replace(descriptor);
         assert!(old.is_none());
-        if idx >= (2 << 30) {
-            panic!("Too many FDs");
-        } else {
-            u32::try_from(idx).unwrap()
-        }
+        Ok(u32::try_from(idx).unwrap())
     }
     fn insert_at(&mut self, descriptor: Descriptor, idx: usize) -> Option<Descriptor> {
         if idx >= self.descriptors.len() {

@@ -1335,7 +1335,7 @@ pub fn rlimit64_to_rlimit(rlim: Rlimit64) -> Rlimit {
 }
 
 #[repr(i32)]
-#[derive(Debug, IntEnum)]
+#[derive(Clone, Copy, Debug, IntEnum)]
 pub enum RlimitResource {
     /// CPU time in sec
     CPU = 0,

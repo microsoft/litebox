@@ -15,6 +15,7 @@ elf = { version = "0.7.4", default-features = false }
 elf_loader = { version = "0.12.0", default-features = false, features = [] }
 thiserror = { version = "2.0.6", default-features = false }
 syscalls = { version = "0.6", default-features = false }
+seq-macro = "0.3"
 
 [target.'cfg(target_arch = "x86")'.dependencies]
 # ELF loader requires us to enable the `rel` dependency on 32-bit to work.

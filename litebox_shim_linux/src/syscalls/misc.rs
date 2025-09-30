@@ -96,7 +96,9 @@ pub(crate) fn sys_sysinfo() -> litebox_common_linux::Sysinfo {
         bufferram: 0,
         totalswap: 0,
         freeswap: 0,
-        procs: super::process::NR_THREADS.load(core::sync::atomic::Ordering::Relaxed),
+        procs: super::process::LITEBOX_PROCESS
+            .nr_threads
+            .load(core::sync::atomic::Ordering::Relaxed),
         totalhigh: 0,
         freehigh: 0,
         mem_unit: 1,
