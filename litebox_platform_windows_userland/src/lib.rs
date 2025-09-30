@@ -89,6 +89,12 @@ pub struct WindowsUserland {
     sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
 }
 
+impl core::fmt::Debug for WindowsUserland {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WindowsUserland").finish_non_exhaustive()
+    }
+}
+
 // Safety: Given that SYSTEM_INFO is not Send/Sync (it contains *mut c_void), we use RwLock to
 // ensure that the sys_info is only accessed in a thread-safe manner.
 // Moreover, SYSTEM_INFO is only initialized once during platform creation, and it is read-only
