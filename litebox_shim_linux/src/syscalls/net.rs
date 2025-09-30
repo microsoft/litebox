@@ -147,6 +147,7 @@ impl Socket {
                         let linger: crate::ConstPtr<litebox_common_linux::Linger> =
                             crate::ConstPtr::from_usize(optval.as_usize());
                         let linger = unsafe { linger.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+                        // TODO: our current implementation of `close` does not support graceful close yet.
                         if linger.onoff != 0 && linger.linger != 0 {
                             unimplemented!("SO_LINGER with non-zero timeout is not supported yet");
                         }
@@ -236,26 +237,6 @@ impl Socket {
                         }
                         Ok(())
                     }
-                    TcpOption::KEEPIDLE => {
-                        const MAX_TCP_KEEPIDLE: u32 = 32767;
-                        if !(1..=MAX_TCP_KEEPIDLE).contains(&val) {
-                            return Err(Errno::EINVAL);
-                        }
-                        // Note smoltcp does not distinguish between idle and interval time.
-                        if !self.options.lock().keep_alive {
-                            return Ok(());
-                        }
-                        litebox_net()
-                            .lock()
-                            .set_tcp_option(
-                                self.fd.as_ref().unwrap(),
-                                litebox::net::TcpOptionData::KEEPALIVE(Some(
-                                    core::time::Duration::from_secs(u64::from(val)),
-                                )),
-                            )
-                            .expect("set TCP_KEEPALIVE should succeed");
-                        Ok(())
-                    }
                     TcpOption::KEEPINTVL => {
                         const MAX_TCP_KEEPINTVL: u32 = 32767;
                         if !(1..=MAX_TCP_KEEPINTVL).contains(&val) {
@@ -272,14 +253,7 @@ impl Socket {
                             .expect("set TCP_KEEPALIVE should succeed");
                         Ok(())
                     }
-                    TcpOption::KEEPCNT => {
-                        const MAX_TCP_KEEPCNT: u32 = 127;
-                        if !(1..=MAX_TCP_KEEPCNT).contains(&val) {
-                            return Err(Errno::EINVAL);
-                        }
-                        // TODO: smoltcp does not seem to support this, no-op for now
-                        Ok(())
-                    }
+                    TcpOption::KEEPCNT | TcpOption::KEEPIDLE => Err(Errno::EOPNOTSUPP),
                     _ => unimplemented!("TCP option {to:?}"),
                 }
             }
