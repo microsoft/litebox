@@ -3,8 +3,9 @@ extern crate alloc;
 
 use hashbrown::HashMap;
 use litebox::platform::ThreadProvider;
-use litebox_common_optee::{TeeParamType, UteeEntryFunc, UteeParamOwned, UteeParams};
-use litebox_runner_command_dispatcher::OpteeTaCommand;
+use litebox_common_optee::{
+    OpteeTaCommand, TeeParamType, UteeEntryFunc, UteeParamOwned, UteeParams,
+};
 use litebox_shim_optee::loader::ElfLoadInfo;
 use once_cell::race::OnceBox;
 
