@@ -62,8 +62,43 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 self.entries.push(None);
                 self.entries.len() - 1
             });
-        let old =
-            self.entries[idx].replace(IndividualEntry::new(self.litebox.sync().new_rwlock(entry)));
+        let old = self.entries[idx].replace(IndividualEntry::new(Arc::new(
+            self.litebox.sync().new_rwlock(entry),
+        )));
+        assert!(old.is_none());
+        TypedFd {
+            _phantom: PhantomData,
+            x: OwnedFd::new(idx),
+        }
+    }
+
+    /// Create a duplicate of the provided `fd`.
+    ///
+    /// This newly-created FD shares all behavior with the existing FD, including (for example)
+    /// offsets. Any metadata stored via [`Self::set_entry_metadata`] is (as expected) maintained as
+    /// aliased metadata at the new FD. However, any metadata that was stored via
+    /// [`Self::set_fd_metadata`] is **not** duplicated; if you want that data to be copied over to
+    /// the new entry, you must copy it over yourself.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panic is impossible due to type invariants"
+    )]
+    pub fn duplicate<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        fd: &TypedFd<Subsystem>,
+    ) -> TypedFd<Subsystem> {
+        let idx = self
+            .entries
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                self.entries.push(None);
+                self.entries.len() - 1
+            });
+        let new_ind_entry = IndividualEntry::new(Arc::clone(
+            &self.entries[fd.x.as_usize()].as_ref().unwrap().x,
+        ));
+        let old = self.entries[idx].replace(new_ind_entry);
         assert!(old.is_none());
         TypedFd {
             _phantom: PhantomData,
@@ -544,9 +579,9 @@ impl<Platform: RawSyncPrimitivesProvider> core::ops::Deref for IndividualEntry<P
     }
 }
 impl<Platform: RawSyncPrimitivesProvider> IndividualEntry<Platform> {
-    fn new(x: RwLock<Platform, DescriptorEntry>) -> Self {
+    fn new(x: Arc<RwLock<Platform, DescriptorEntry>>) -> Self {
         Self {
-            x: Arc::new(x),
+            x,
             metadata: AnyMap::new(),
         }
     }
