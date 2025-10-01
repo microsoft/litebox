@@ -1123,13 +1123,8 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
                 Ok(fd) => {
                     let fd: Arc<litebox::fd::TypedFd<crate::LinuxFS>> =
                         fd.upgrade().ok_or(Errno::EBADF)?;
-                    let cloexec = dt
-                        .with_metadata(&fd, |flags: &FileDescriptorFlags| {
-                            flags.contains(FileDescriptorFlags::FD_CLOEXEC)
-                        })
-                        .unwrap_or(false);
                     let fd = dt.duplicate(&fd);
-                    if cloexec {
+                    if flags.contains(OFlags::CLOEXEC) {
                         let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
                         assert!(old.is_none());
                     }
@@ -1160,13 +1155,8 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
         }
         Descriptor::File(file) => {
             let mut dt = litebox().descriptor_table_mut();
-            let cloexec = dt
-                .with_metadata(file, |flags: &FileDescriptorFlags| {
-                    flags.contains(FileDescriptorFlags::FD_CLOEXEC)
-                })
-                .unwrap_or(false);
             let file = dt.duplicate(file);
-            if cloexec {
+            if flags.contains(OFlags::CLOEXEC) {
                 let old = dt.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC);
                 assert!(old.is_none());
             }
