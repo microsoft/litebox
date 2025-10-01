@@ -3,6 +3,9 @@
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 
+extern crate alloc;
+
+use alloc::boxed::Box;
 use num_enum::TryFromPrimitive;
 
 const VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL: u32 = 0x1_ffe0;
@@ -45,4 +48,14 @@ pub enum VsmFunction {
 impl VsmFunction {
     /// VTL call parameters (`param[0]`: function ID, `param[1..4]`: parameters)
     pub const NUM_VTLCALL_PARAMS: usize = 4;
+}
+
+/// VSM-VTL call command representation. This command is delivered from
+/// the VTL0 kernel to the VTL1 kernel. Except for the OP-TEE message
+/// command (which will be converted into `OpteeSmcCommand`), all other
+/// commands are handled by the VSM-VTL call command handler.
+/// TODO: use enum to strongly type the commands
+pub struct VsmVtlCommand {
+    pub func: VsmFunction,
+    pub params: Box<[u64; VsmFunction::NUM_VTLCALL_PARAMS - 1]>,
 }

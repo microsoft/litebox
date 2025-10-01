@@ -8,45 +8,17 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use litebox_common_linux::errno::Errno;
-use litebox_common_lvbs::VsmFunction;
-use litebox_common_optee::{OpteeSmcFunction, UteeParamOwned};
+use litebox_common_lvbs::VsmVtlCommand;
+use litebox_common_optee::{OpteeMessageCommand, OpteeSmcCommand, OpteeTaCommand};
 use once_cell::race::OnceBox;
 
-/// OP-TEE TA command representation. This command is delivered to a TA
-/// through its entry point function and `libutee`.
-pub enum OpteeTaCommand {
-    /// Open a new session with a loaded TA. This lets the TA know
-    /// its session ID and provides the parameters for the initialization.
-    OpenSession {
-        session_id: u32,
-        params: Box<[UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS]>,
-    },
-    /// Close an existing session with a loaded TA.
-    CloseSession { session_id: u32 },
-    /// Invoke a command within an existing session with a loaded TA.
-    InvokeCommand {
-        session_id: u32,
-        params: Box<[UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS]>,
-        cmd_id: u32,
-    },
-}
-
-// TODO: use enum to strongly type the commands
-pub struct OpteeSmcCommand {
-    pub func: OpteeSmcFunction,
-    pub params: Box<[u64; OpteeSmcFunction::NUM_OPTEE_SMC_ARGS - 1]>,
-}
-
-// TODO: use enum to strongly type the commands
-pub struct VsmVtlCommand {
-    pub func: VsmFunction,
-    pub params: Box<[u64; VsmFunction::NUM_VTLCALL_PARAMS - 1]>,
-}
-
 pub type OpteeTaCommandHandler = fn(&OpteeTaCommand) -> !;
-pub type OpteeSmcCommandHandler = fn(&OpteeSmcCommand) -> Result<i64, Errno>;
-pub type VsmVtlCommandHandler = fn(&VsmVtlCommand) -> Result<i64, Errno>;
 pub type ReturnFunction = fn() -> !;
+
+pub type OpteeMessageCommandHandler = fn(&OpteeMessageCommand) -> Result<i64, Errno>;
+pub type OpteeSmcCommandHandler = fn(&OpteeSmcCommand) -> Result<i64, Errno>;
+
+pub type VsmVtlCommandHandler = fn(&VsmVtlCommand) -> Result<i64, Errno>;
 
 /// A command dispatcher to dispatch commands to appropriate handlers.
 /// This runner currently only supports OP-TEE TA commands but other runners
@@ -55,9 +27,11 @@ pub type ReturnFunction = fn() -> !;
 pub struct CommandDispatcher {
     /// OP-TEE TA command handler function
     optee_ta_command_handler_fn: OnceBox<OpteeTaCommandHandler>,
+    /// OP-TEE Message command handler function
+    optee_message_command_handler_fn: OnceBox<OpteeMessageCommandHandler>,
     /// OP-TEE SMC command handler function
     optee_smc_command_handler_fn: OnceBox<OpteeSmcCommandHandler>,
-    /// VSM VTL call command handler function
+    /// VSM-VTL call command handler function
     vsm_vtl_command_handler_fn: OnceBox<VsmVtlCommandHandler>,
     /// Function to return from the handler
     return_function: OnceBox<ReturnFunction>,
@@ -67,6 +41,7 @@ impl CommandDispatcher {
     pub fn new() -> Self {
         Self {
             optee_ta_command_handler_fn: OnceBox::new(),
+            optee_message_command_handler_fn: OnceBox::new(),
             optee_smc_command_handler_fn: OnceBox::new(),
             vsm_vtl_command_handler_fn: OnceBox::new(),
             return_function: OnceBox::new(),
@@ -76,6 +51,10 @@ impl CommandDispatcher {
     /// Register a command handler function for OP-TEE TA commands.
     pub fn register_optee_ta_command_handler(&self, handler: OpteeTaCommandHandler) {
         let _ = self.optee_ta_command_handler_fn.set(Box::new(handler));
+    }
+
+    pub fn register_optee_message_command_handler(&self, handler: OpteeMessageCommandHandler) {
+        let _ = self.optee_message_command_handler_fn.set(Box::new(handler));
     }
 
     /// Register a command handler function for OP-TEE SMC commands.
@@ -125,6 +104,20 @@ impl CommandDispatcher {
             (handler)(command)
         } else {
             panic!("OP-TEE SMC command dispatcher not registered");
+        }
+    }
+
+    /// Call the registered OP-TEE message command handler function.
+    /// # Panics
+    /// Panics if the command dispatcher function is not registered.
+    pub fn handle_optee_message_command(
+        &self,
+        command: &OpteeMessageCommand,
+    ) -> Result<i64, Errno> {
+        if let Some(handler) = self.optee_message_command_handler_fn.get() {
+            (handler)(command)
+        } else {
+            panic!("OP-TEE Message command dispatcher not registered");
         }
     }
 

@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use litebox::platform::RawConstPointer as _;
 use litebox_common_linux::{PtRegs, errno::Errno};
 use modular_bitfield::prelude::*;
@@ -459,16 +460,16 @@ pub enum UteeParamOwned {
         out_address: usize,
     },
     MemrefInput {
-        data: alloc::boxed::Box<[u8]>,
+        data: Box<[u8]>,
     },
     MemrefOutput {
         buffer_size: usize,
-        out_addresses: alloc::boxed::Box<[usize]>,
+        out_addresses: Box<[usize]>,
     },
     MemrefInout {
-        data: alloc::boxed::Box<[u8]>,
+        data: Box<[u8]>,
         buffer_size: usize,
-        out_addresses: alloc::boxed::Box<[usize]>,
+        out_addresses: Box<[usize]>,
     },
 }
 
@@ -887,14 +888,14 @@ impl From<TeeResult> for u32 {
 
 const UTEE_ENTRY_FUNC_OPEN_SESSION: u32 = 0;
 const UTEE_ENTRY_FUNC_CLOSE_SESSION: u32 = 1;
-const UTEE_ENTRY_FUNC_INVOKE_COMMEND: u32 = 2;
+const UTEE_ENTRY_FUNC_INVOKE_COMMAND: u32 = 2;
 
 #[derive(Clone, Copy, TryFromPrimitive, PartialEq)]
 #[repr(u32)]
 pub enum UteeEntryFunc {
     OpenSession = UTEE_ENTRY_FUNC_OPEN_SESSION,
     CloseSession = UTEE_ENTRY_FUNC_CLOSE_SESSION,
-    InvokeCommand = UTEE_ENTRY_FUNC_INVOKE_COMMEND,
+    InvokeCommand = UTEE_ENTRY_FUNC_INVOKE_COMMAND,
     Unknown = 0xffff_ffff,
 }
 
@@ -917,6 +918,25 @@ pub enum UserTaPropType {
     BinaryBlock = USER_TA_PROP_TYPE_BINARY_BLOCK,
 }
 
+/// OP-TEE TA command representation. This command is delivered to a TA
+/// through its entry point function and `libutee`.
+pub enum OpteeTaCommand {
+    /// Open a new session with a loaded TA. This lets the TA know
+    /// its session ID and provides the parameters for the initialization.
+    OpenSession {
+        session_id: u32,
+        params: Box<[UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS]>,
+    },
+    /// Close an existing session with a loaded TA.
+    CloseSession { session_id: u32 },
+    /// Invoke a command within an existing session with a loaded TA.
+    InvokeCommand {
+        session_id: u32,
+        params: Box<[UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS]>,
+        cmd_id: u32,
+    },
+}
+
 const OPTEE_SMC_FUNCID_GET_OS_REVISION: u64 = 0x1;
 const OPTEE_SMC_FUNCID_CALL_WITH_ARG: u64 = 0x4;
 const OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES: u64 = 0x9;
@@ -927,8 +947,9 @@ const OPTEE_SMC_FUNCID_CALL_WITH_REGD_ARG: u64 = 0x13;
 const OPTEE_SMC_FUNCID_CALLS_UID: u64 = 0xff01;
 const OPTEE_SMC_FUNCID_CALLS_REVISION: u64 = 0xff03;
 
-#[derive(PartialEq, TryFromPrimitive)]
+#[derive(Debug, PartialEq, TryFromPrimitive)]
 #[repr(u64)]
+#[non_exhaustive]
 pub enum OpteeSmcFunction {
     GetOsRevision = OPTEE_SMC_FUNCID_GET_OS_REVISION,
     CallWithArg = OPTEE_SMC_FUNCID_CALL_WITH_ARG,
@@ -942,4 +963,121 @@ pub enum OpteeSmcFunction {
 
 impl OpteeSmcFunction {
     pub const NUM_OPTEE_SMC_ARGS: usize = 9;
+}
+
+/// OP-TEE Secure Monitor Call (SMC) command representation. This is based on
+/// Arm's SMC Calling Convention (SMCCC). The OP-TEE driver only supports SMCCC
+/// because it does not consider other architectures (e.g., x86).
+/// This command is delivered is as one of `VsmVtlCommand`.
+/// TODO: use enum to strongly type the commands
+pub struct OpteeSmcCommand {
+    pub func: OpteeSmcFunction,
+    pub params: Box<[u64; OpteeSmcFunction::NUM_OPTEE_SMC_ARGS - 1]>,
+}
+
+// Note.
+// `UTEE_ENTRY_FUNC_CLOSE_SESSION` and `UTEE_ENTRY_FUNC_INVOKE_COMMAND` are 1 and 2 whereas
+// `OPTEE_MSG_CMD_CLOSE_SESSION` and `OPTEE_MSG_CMD_INVOKE_COMMAND` are 2 and 1 (swapped).
+// We might need to accept this inconsistency for compatibility with OP-TEE.
+const OPTEE_MSG_CMD_OPEN_SESSION: u32 = 0;
+const OPTEE_MSG_CMD_INVOKE_COMMAND: u32 = 1;
+const OPTEE_MSG_CMD_CLOSE_SESSION: u32 = 2;
+const OPTEE_MSG_CMD_CANCEL: u32 = 3;
+const OPTEE_MSG_CMD_REGISTER_SHM: u32 = 4;
+const OPTEE_MSG_CMD_UNREGISTER_SHM: u32 = 5;
+const OPTEE_MSG_CMD_DO_BOTTOM_HALF: u32 = 6;
+const OPTEE_MSG_CMD_STOP_ASYNC_NOTIF: u32 = 7;
+
+#[derive(Debug, PartialEq, TryFromPrimitive, Clone)]
+#[repr(u32)]
+pub enum OpteeMessageCommandFunction {
+    // The below three functions are expected to be handled together with user-space TAs
+    OpenSession = OPTEE_MSG_CMD_OPEN_SESSION,
+    InvokeCommand = OPTEE_MSG_CMD_INVOKE_COMMAND,
+    CloseSession = OPTEE_MSG_CMD_CLOSE_SESSION,
+    // The below functions are expected to be solely handled by the VTL1 kernel
+    Cancel = OPTEE_MSG_CMD_CANCEL,
+    RegisterShm = OPTEE_MSG_CMD_REGISTER_SHM,
+    UnregisterShm = OPTEE_MSG_CMD_UNREGISTER_SHM,
+    DoBottomHalf = OPTEE_MSG_CMD_DO_BOTTOM_HALF,
+    StopAsyncNotif = OPTEE_MSG_CMD_STOP_ASYNC_NOTIF,
+}
+
+impl OpteeMessageCommandFunction {
+    /// Two extra parameters to deliver a TA UUID (its two halves) to
+    /// load the corresponding TA.
+    pub const NUM_OPTEE_MSG_ARGS: usize = UteeParams::TEE_NUM_PARAMS + 2;
+}
+
+/// OP-TEE message command representation. This command is delivered from
+/// the VTL0 (normal world) OP-TEE driver to the VTL1 (secure world) kernel.
+/// Some commands (e.g., shared memory registration) are handled by the VTL1 kernel
+/// whereas some other commands are delivered to user-space TAs as `OpteeTaCommand`.
+#[derive(Debug, Clone)]
+#[repr(C)]
+pub struct OpteeMessageCommand {
+    pub msg_cmd: OpteeMessageCommandFunction,
+    pub cmd_id: u32,
+    pub session_id: u32,
+    pub cancel_id: u32,
+    pub pad: u32,
+    pub ret: u32,
+    pub ret_origin: u32,
+    pub num_params: u32,
+    pub params: Box<[OpteeMsgParam; OpteeMessageCommandFunction::NUM_OPTEE_MSG_ARGS]>,
+}
+
+const OPTEE_MSG_ATTR_TYPE_NONE: u8 = 0x0;
+const OPTEE_MSG_ATTR_TYPE_VALUE_INPUT: u8 = 0x1;
+const OPTEE_MSG_ATTR_TYPE_VALUE_OUTPUT: u8 = 0x2;
+const OPTEE_MSG_ATTR_TYPE_VALUE_INOUT: u8 = 0x3;
+const OPTEE_MSG_ATTR_TYPE_RMEM_INPUT: u8 = 0x5;
+const OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT: u8 = 0x6;
+const OPTEE_MSG_ATTR_TYPE_RMEM_INOUT: u8 = 0x7;
+const OPTEE_MSG_ATTR_TYPE_TMEM_INPUT: u8 = 0x9;
+const OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT: u8 = 0xa;
+const OPTEE_MSG_ATTR_TYPE_TMEM_INOUT: u8 = 0xb;
+
+#[derive(Debug, PartialEq, TryFromPrimitive)]
+#[repr(u8)]
+pub enum OpteeMsgAttrType {
+    None = OPTEE_MSG_ATTR_TYPE_NONE,
+    // Exchange data as values
+    ValueInput = OPTEE_MSG_ATTR_TYPE_VALUE_INPUT,
+    ValueOutput = OPTEE_MSG_ATTR_TYPE_VALUE_OUTPUT,
+    ValueInout = OPTEE_MSG_ATTR_TYPE_VALUE_INOUT,
+    // Use registered shared memory to exchange data
+    RmemInput = OPTEE_MSG_ATTR_TYPE_RMEM_INPUT,
+    RmemOutput = OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT,
+    RmemInout = OPTEE_MSG_ATTR_TYPE_RMEM_INOUT,
+    // Create temporary shared memory to exchange data
+    TmemInput = OPTEE_MSG_ATTR_TYPE_TMEM_INPUT,
+    TmemOutput = OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT,
+    TmemInout = OPTEE_MSG_ATTR_TYPE_TMEM_INOUT,
+}
+
+// TODO: improve attribute handling and support the union of value and reference
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct OpteeMsgParam {
+    attr: u64,
+    value: OpteeMsgParamValue,
+}
+
+impl OpteeMsgParam {
+    pub fn attr_type(&self) -> OpteeMsgAttrType {
+        #[allow(clippy::missing_panics_doc)]
+        OpteeMsgAttrType::try_from(u8::try_from(self.attr & 0xff).unwrap())
+            .unwrap_or(OpteeMsgAttrType::None)
+    }
+}
+
+/// Opaque value parameter
+/// Value parameters are passed unchecked between normal and secure world.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct OpteeMsgParamValue {
+    a: u64,
+    b: u64,
+    c: u64, // this third parameter is for secure-world kernel not for user-space TAs
 }
