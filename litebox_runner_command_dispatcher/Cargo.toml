@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
+litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
+litebox_common_lvbs = { path = "../litebox_common_lvbs/", version = "0.1.0" }
 litebox_common_optee = { path = "../litebox_common_optee/", version = "0.1.0" }
 
 [lints]

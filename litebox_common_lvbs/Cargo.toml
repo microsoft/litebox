@@ -1,0 +1,10 @@
+[package]
+name = "litebox_common_lvbs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+num_enum = { version = "0.7.3", default-features = false }
+
+[lints]
+workspace = true

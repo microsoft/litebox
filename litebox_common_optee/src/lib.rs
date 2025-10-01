@@ -916,3 +916,30 @@ pub enum UserTaPropType {
     String = USER_TA_PROP_TYPE_STRING,
     BinaryBlock = USER_TA_PROP_TYPE_BINARY_BLOCK,
 }
+
+const OPTEE_SMC_FUNCID_GET_OS_REVISION: u64 = 0x1;
+const OPTEE_SMC_FUNCID_CALL_WITH_ARG: u64 = 0x4;
+const OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES: u64 = 0x9;
+const OPTEE_SMC_FUNCID_DISABLE_SHM_CACHE: u64 = 0xa;
+const OPTEE_SMC_FUNCID_CALL_WITH_RPC_ARG: u64 = 0x12;
+const OPTEE_SMC_FUNCID_CALL_WITH_REGD_ARG: u64 = 0x13;
+
+const OPTEE_SMC_FUNCID_CALLS_UID: u64 = 0xff01;
+const OPTEE_SMC_FUNCID_CALLS_REVISION: u64 = 0xff03;
+
+#[derive(PartialEq, TryFromPrimitive)]
+#[repr(u64)]
+pub enum OpteeSmcFunction {
+    GetOsRevision = OPTEE_SMC_FUNCID_GET_OS_REVISION,
+    CallWithArg = OPTEE_SMC_FUNCID_CALL_WITH_ARG,
+    ExchangeCapabilities = OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES,
+    DisableShmCache = OPTEE_SMC_FUNCID_DISABLE_SHM_CACHE,
+    CallWithRpcArg = OPTEE_SMC_FUNCID_CALL_WITH_RPC_ARG,
+    CallWithRegdArg = OPTEE_SMC_FUNCID_CALL_WITH_REGD_ARG,
+    CallsUid = OPTEE_SMC_FUNCID_CALLS_UID,
+    CallsRevision = OPTEE_SMC_FUNCID_CALLS_REVISION,
+}
+
+impl OpteeSmcFunction {
+    pub const NUM_OPTEE_SMC_ARGS: usize = 9;
+}
