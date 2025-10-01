@@ -3,7 +3,8 @@ extern crate alloc;
 
 use hashbrown::HashMap;
 use litebox::platform::ThreadProvider;
-use litebox_common_optee::{TeeParamType, UteeParams};
+use litebox_common_optee::{TeeParamType, UteeEntryFunc, UteeParamOwned, UteeParams};
+use litebox_runner_command_dispatcher::OpteeTaCommand;
 use litebox_shim_optee::loader::ElfLoadInfo;
 use once_cell::race::OnceBox;
 
@@ -54,8 +55,25 @@ pub fn register_session_id_elf_load_info(session_id: u32, elf_load_info: ElfLoad
 
 /// A function to handle an OP-TEE TA command. This function sets up the stack and input `UteeParams`, and
 /// jumps to the entry point of the TA.
-pub fn optee_ta_command_handler(command: &litebox_runner_command_dispatcher::OpteeTaCommand) -> ! {
-    let elf_load_info = session_id_elf_load_info_map().get(command.session_id);
+pub fn optee_ta_command_handler(command: &OpteeTaCommand) -> ! {
+    let (func, session_id, params, cmd_id) = match command {
+        OpteeTaCommand::OpenSession { session_id, params } => {
+            (UteeEntryFunc::OpenSession, *session_id, params, 0)
+        }
+        OpteeTaCommand::CloseSession { session_id } => (
+            UteeEntryFunc::CloseSession,
+            *session_id,
+            &Box::new([const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS]),
+            0,
+        ),
+        OpteeTaCommand::InvokeCommand {
+            session_id,
+            params,
+            cmd_id,
+        } => (UteeEntryFunc::InvokeCommand, *session_id, params, *cmd_id),
+    };
+
+    let elf_load_info = session_id_elf_load_info_map().get(session_id);
     let Some(elf_load_info) = elf_load_info else {
         litebox_platform_multiplex::platform().terminate_thread(0);
     };
@@ -63,19 +81,17 @@ pub fn optee_ta_command_handler(command: &litebox_runner_command_dispatcher::Opt
     // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
     // loaded binary and heap. In that sense, we can create (and destroy) a stack
     // for each command freely.
-    let stack = litebox_shim_optee::loader::init_stack(
-        Some(elf_load_info.stack_base),
-        command.params.as_slice(),
-    )
-    .expect("Failed to initialize stack with parameters");
+    let stack =
+        litebox_shim_optee::loader::init_stack(Some(elf_load_info.stack_base), params.as_slice())
+            .expect("Failed to initialize stack with parameters");
 
     unsafe {
         litebox_common_linux::swap_fsgs();
         jump_to_entry_point(
-            command.func as u32 as usize,
-            command.session_id as usize,
+            func as u32 as usize,
+            session_id as usize,
             stack.get_params_address(),
-            command.cmd_id as usize,
+            cmd_id as usize,
             elf_load_info.entry_point,
             stack.get_cur_stack_top(),
         );

@@ -284,7 +284,7 @@ fn populate_ta_command_replay_queue(session_id: u32, ta_commands: &[TaCommandBas
             *value_a = u64::from(session_id);
         }
 
-        submit_ta_command(session_id, func_id, params, ta_command.cmd_id);
+        submit_ta_command(session_id, func_id, &params, ta_command.cmd_id);
     }
 }
 
@@ -301,9 +301,14 @@ impl TaCommandQueue {
     }
 
     pub fn push(&self, cmd: OpteeTaCommand) {
+        let session_id = match &cmd {
+            OpteeTaCommand::OpenSession { session_id, .. }
+            | OpteeTaCommand::CloseSession { session_id }
+            | OpteeTaCommand::InvokeCommand { session_id, .. } => *session_id,
+        };
         self.inner
             .lock()
-            .entry(cmd.session_id)
+            .entry(session_id)
             .or_default()
             .push_back(cmd);
     }
@@ -330,14 +335,21 @@ pub(crate) fn optee_command_replay_queue() -> &'static TaCommandQueue {
 pub fn submit_ta_command(
     session_id: u32,
     func: UteeEntryFunc,
-    params: [UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS],
+    params: &[UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS],
     cmd_id: u32,
 ) {
-    let cmd = OpteeTaCommand {
-        session_id,
-        func,
-        params: Box::new(params),
-        cmd_id,
+    let cmd = match func {
+        UteeEntryFunc::OpenSession => OpteeTaCommand::OpenSession {
+            session_id,
+            params: Box::new(params.clone()),
+        },
+        UteeEntryFunc::CloseSession => OpteeTaCommand::CloseSession { session_id },
+        UteeEntryFunc::InvokeCommand => OpteeTaCommand::InvokeCommand {
+            session_id,
+            params: Box::new(params.clone()),
+            cmd_id,
+        },
+        UteeEntryFunc::Unknown => return,
     };
     optee_command_replay_queue().push(cmd);
 }
