@@ -448,9 +448,8 @@ where
 
     /// Reset pages without removing its mapping.
     ///
-    /// `lazy_free` indicates whether to lazily free the pages (if `true`) or
-    /// immediately free them (if `false`). For simplicity, we always free the pages
-    /// immediately for now. Also, `lazy_free` should only work for anonymous mappings.
+    /// If `anonymous_only` is true and any part of the range is non‑anonymous (i.e., file‑backed),
+    /// returns `Err(VmemResetError::FileBacked)`.
     ///
     /// After calling this function, the memory region remains mapped, but its contents are invalidated.
     /// Subsequent accesses to the region will result in repopulating the memory contents, either from
@@ -465,12 +464,12 @@ where
         &self,
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
-        lazy_free: bool,
+        anonymous_only: bool,
     ) -> Result<(), VmemResetError> {
         let mut vmem = self.vmem.write();
         let start = ptr.as_usize();
         let range = PageRange::new(start, start + len).ok_or(VmemResetError::UnAligned)?;
-        unsafe { vmem.reset_pages(range, lazy_free) }
+        unsafe { vmem.reset_pages(range, anonymous_only) }
     }
 
     /// Internal common function used by `make_pages_*` to change page permissions.

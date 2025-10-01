@@ -336,11 +336,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         Ok(())
     }
 
-    /// Reset pages without removing its mapping (e.g., `madvise` with `DontNeed` or `Free`).
+    /// Reset pages without removing its mapping (similar to Linux `madvise` with
+    /// `MADV_DONTNEED` or `MADV_FREE`).
     ///
-    /// `lazy_free` indicates whether to lazily free the pages (if `true`) or
-    /// immediately free them (if `false`). For simplicity, we always free the pages
-    /// immediately for now. Also, `lazy_free` should only work for anonymous mappings.
+    /// If `anonymous_only` is true and any part of the range is non‑anonymous (i.e., file‑backed),
+    /// returns `Err(VmemResetError::FileBacked)`.
     ///
     /// The current implementation effectively re-inserts the mapping with the same
     /// `VmArea` properties, which will cause the pages to be unmapped and mapped again.
@@ -356,7 +356,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) unsafe fn reset_pages(
         &mut self,
         range: PageRange<ALIGN>,
-        lazy_free: bool,
+        anonymous_only: bool,
     ) -> Result<(), VmemResetError> {
         let range: Range<usize> = range.into();
         // Any unmapped regions in the original range will result in this function returning `DeallocationError::AlreadyUnallocated`
@@ -368,8 +368,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .collect();
         for (r, vma) in overlapping_ranges {
             if vma.is_file_backed() {
-                if lazy_free {
-                    // Only works for anonymous mappings now.
+                if anonymous_only {
                     return Err(VmemResetError::FileBacked);
                 }
                 unimplemented!("resetting file-backed mappings is not supported yet");
