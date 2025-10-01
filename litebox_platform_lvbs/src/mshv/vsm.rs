@@ -17,7 +17,7 @@ use crate::{
         HV_X64_REGISTER_LSTAR, HV_X64_REGISTER_SFMASK, HV_X64_REGISTER_STAR,
         HV_X64_REGISTER_SYSENTER_CS, HV_X64_REGISTER_SYSENTER_EIP, HV_X64_REGISTER_SYSENTER_ESP,
         HvCrInterceptControlFlags, HvPageProtFlags, HvRegisterVsmPartitionConfig,
-        HvRegisterVsmVpSecureVtlConfig, VsmFunction, X86Cr0Flags, X86Cr4Flags,
+        HvRegisterVsmVpSecureVtlConfig, X86Cr0Flags, X86Cr4Flags,
         heki::{
             HekiKdataType, HekiKernelInfo, HekiKernelSymbol, HekiKexecType, HekiPage, HekiPatch,
             HekiPatchInfo, HekiRange, MemAttr, ModMemType, mem_attr_to_hv_page_prot_flags,
@@ -42,6 +42,7 @@ use core::{
 };
 use hashbrown::HashMap;
 use litebox_common_linux::errno::Errno;
+use litebox_common_lvbs::VsmFunction;
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{PageSize, PhysFrame, Size4KiB, frame::PhysFrameRange},

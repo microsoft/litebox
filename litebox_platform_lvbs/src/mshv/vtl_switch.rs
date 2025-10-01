@@ -3,13 +3,13 @@
 use crate::{
     kernel_context::get_per_core_kernel_context,
     mshv::{
-        HV_VTL_NORMAL, HV_VTL_SECURE, NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT,
-        VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction, vsm::vsm_dispatch,
-        vsm_intercept::vsm_handle_intercept,
+        HV_VTL_NORMAL, HV_VTL_SECURE, VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL,
+        vsm::vsm_dispatch, vsm_intercept::vsm_handle_intercept,
     },
 };
 use core::arch::{asm, naked_asm};
 use litebox_common_linux::errno::Errno;
+use litebox_common_lvbs::VsmFunction;
 use num_enum::TryFromPrimitive;
 
 /// Return to VTL0
@@ -64,7 +64,7 @@ impl VtlState {
         (self.rax, self.rcx)
     }
 
-    pub fn get_vtlcall_params(&self) -> [u64; NUM_VTLCALL_PARAMS] {
+    pub fn get_vtlcall_params(&self) -> [u64; VsmFunction::NUM_VTLCALL_PARAMS] {
         [self.rdi, self.rsi, self.rdx, self.r8]
     }
 }
@@ -284,7 +284,7 @@ fn vtl_switch_loop() -> ! {
     }
 }
 
-fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
+fn vtlcall_dispatch(params: &[u64; VsmFunction::NUM_VTLCALL_PARAMS]) -> i64 {
     let func_id = VsmFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
         .unwrap_or(VsmFunction::Unknown);
     match func_id {

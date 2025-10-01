@@ -100,46 +100,6 @@ pub const HV_REGISTER_PENDING_EVENT0: u32 = 0x0001_0004;
 
 pub const HV_SECURE_VTL_BOOT_TOKEN: u8 = 0xdc;
 
-/// VTL call parameters (`param[0]`: function ID, `param[1..4]`: parameters)
-pub const NUM_VTLCALL_PARAMS: usize = 4;
-
-pub const VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL: u32 = 0x1_ffe0;
-pub const VSM_VTL_CALL_FUNC_ID_BOOT_APS: u32 = 0x1_ffe1;
-pub const VSM_VTL_CALL_FUNC_ID_LOCK_REGS: u32 = 0x1_ffe2;
-pub const VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT: u32 = 0x1_ffe3;
-pub const VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY: u32 = 0x1_ffe4;
-pub const VSM_VTL_CALL_FUNC_ID_LOAD_KDATA: u32 = 0x1_ffe5;
-pub const VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE: u32 = 0x1_ffe6;
-pub const VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT: u32 = 0x1_ffe7;
-pub const VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE: u32 = 0x1_ffe8;
-pub const VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY: u32 = 0x1_ffe9;
-pub const VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE: u32 = 0x1_ffea;
-pub const VSM_VTL_CALL_FUNC_ID_PATCH_TEXT: u32 = 0x1_ffeb;
-
-// This VSM function ID for OP-TEE messages is subject to change
-pub const VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE: u32 = 0x1f_ffff;
-
-/// VSM Functions
-#[derive(Debug, PartialEq, TryFromPrimitive)]
-#[repr(u32)]
-pub enum VsmFunction {
-    // VSM/Heki functions
-    EnableAPsVtl = VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL,
-    BootAPs = VSM_VTL_CALL_FUNC_ID_BOOT_APS,
-    LockRegs = VSM_VTL_CALL_FUNC_ID_LOCK_REGS,
-    SignalEndOfBoot = VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT,
-    ProtectMemory = VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY,
-    LoadKData = VSM_VTL_CALL_FUNC_ID_LOAD_KDATA,
-    ValidateModule = VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE,
-    FreeModuleInit = VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT,
-    UnloadModule = VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE,
-    CopySecondaryKey = VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY,
-    KexecValidate = VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE,
-    PatchText = VSM_VTL_CALL_FUNC_ID_PATCH_TEXT,
-    OpteeMessage = VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE,
-    Unknown = 0xffff_ffff,
-}
-
 pub const MSR_EFER: u32 = 0xc000_0080;
 pub const MSR_STAR: u32 = 0xc000_0081;
 pub const MSR_LSTAR: u32 = 0xc000_0082;
