@@ -9,22 +9,35 @@ extern crate alloc;
 use alloc::boxed::Box;
 use litebox_common_linux::errno::Errno;
 use litebox_common_lvbs::VsmFunction;
-use litebox_common_optee::{OpteeSmcFunction, UteeEntryFunc, UteeParamOwned};
+use litebox_common_optee::{OpteeSmcFunction, UteeParamOwned};
 use once_cell::race::OnceBox;
 
-// TODO: use enum to strongly type the commands
-pub struct OpteeTaCommand {
-    pub session_id: u32,
-    pub func: UteeEntryFunc,
-    pub params: Box<[UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS]>,
-    pub cmd_id: u32,
+/// OP-TEE TA command representation. This command is delivered to a TA
+/// through its entry point function and `libutee`.
+pub enum OpteeTaCommand {
+    /// Open a new session with a loaded TA. This lets the TA know
+    /// its session ID and provides the parameters for the initialization.
+    OpenSession {
+        session_id: u32,
+        params: Box<[UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS]>,
+    },
+    /// Close an existing session with a loaded TA.
+    CloseSession { session_id: u32 },
+    /// Invoke a command within an existing session with a loaded TA.
+    InvokeCommand {
+        session_id: u32,
+        params: Box<[UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS]>,
+        cmd_id: u32,
+    },
 }
 
+// TODO: use enum to strongly type the commands
 pub struct OpteeSmcCommand {
     pub func: OpteeSmcFunction,
     pub params: Box<[u64; OpteeSmcFunction::NUM_OPTEE_SMC_ARGS - 1]>,
 }
 
+// TODO: use enum to strongly type the commands
 pub struct VsmVtlCommand {
     pub func: VsmFunction,
     pub params: Box<[u64; VsmFunction::NUM_VTLCALL_PARAMS - 1]>,
