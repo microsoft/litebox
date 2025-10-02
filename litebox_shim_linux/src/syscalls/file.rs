@@ -259,14 +259,16 @@ pub fn sys_mkdir(pathname: impl path::Arg, mode: u32) -> Result<(), Errno> {
 pub(crate) fn do_close(desc: Descriptor) -> Result<(), Errno> {
     match desc {
         Descriptor::LiteBoxRawFd(raw_fd) => {
-            // XXX(jayb): This is not ideal, but we should NEVER hit the `unreachable!` below in
-            // practice if all the places that use `fd_from_raw_integer` actually follow the
-            // constraints declared in its documentation. We need to run this for more than just
-            // once because it _can_ accidentally happen that the internals of `fd_from_raw_integer`
-            // itself, or in the short durations that something else is attempting to read/write to
-            // the FD at the same time that another thread is attempting to close that exact same
-            // FD. This should be incredibly rare in practice. To make this better, we probably need
-            // to update `fd_consume_raw_integer` interface on the LiteBox side itself.
+            // XXX(jayb): This is not ideal, but we should hopefully practically not hit the
+            // `unreachable!` below in practice if all the places that use `fd_from_raw_integer`
+            // actually follow the constraints declared in its documentation. We need to run this
+            // for more than just once because it _can_ accidentally happen that the internals of
+            // `fd_from_raw_integer` itself, or in the short durations that something else is
+            // attempting to read/write to the FD at the same time that another thread is attempting
+            // to close that exact same FD. This should be incredibly rare in practice. Care
+            // obviously must be taken for blocking operations to release things between attempted
+            // reads/writes. To make this better, we probably need to update
+            // `fd_consume_raw_integer` interface on the LiteBox side itself.
             for _fuel in 0..1000 {
                 let mut dt = crate::litebox().descriptor_table_mut();
                 return match dt.fd_consume_raw_integer(raw_fd) {
