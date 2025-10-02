@@ -37,6 +37,16 @@ pub struct LinuxKernel<Host: HostInterface> {
     page_table: mm::PageTable<4096>,
 }
 
+impl<Host: HostInterface> core::fmt::Debug for LinuxKernel<Host> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct(&alloc::format!(
+            "LinuxKernel<{}>",
+            core::any::type_name::<Host>()
+        ))
+        .finish_non_exhaustive()
+    }
+}
+
 pub struct LinuxPunchthroughToken<Host: HostInterface> {
     punchthrough: PunchthroughSyscall<LinuxKernel<Host>>,
     host: core::marker::PhantomData<Host>,
