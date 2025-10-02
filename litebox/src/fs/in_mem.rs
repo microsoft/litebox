@@ -189,7 +189,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     data: Vec::new(),
                     unique_id: self.fresh_id(),
                 })));
-                let old = root.entries.insert(path, entry.clone());
+                let old = root.entries.insert(path.clone(), entry.clone());
                 assert!(old.is_none());
                 entry
             }
@@ -235,6 +235,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 .litebox
                 .descriptor_table_mut()
                 .insert(Descriptor::Dir { dir: dir.clone() }),
+            Entry::Symlink(symlink) => {
+                if flags.contains(OFlags::NOFOLLOW) {
+                    return Err(OpenError::FoundSymlinkTo {
+                        target: symlink.read().raw_target.clone(),
+                    });
+                } else {
+                    // DO NOT COMMIT: Make sure no infinite loops
+                    return self.open(symlink.read().target(&path)?, flags, mode);
+                }
+            }
         };
         if flags.contains(OFlags::TRUNC) {
             match self.truncate(&fd, 0, true) {
@@ -415,6 +425,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 perms.mode = mode;
                 Ok(())
             }
+            Entry::Symlink(symlink) => {
+                let target = symlink.read().target(&path)?;
+                // DO NOT COMMIT Loop detection
+                self.chmod(target, mode)
+            }
         }
     }
 
@@ -456,6 +471,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     perms.userinfo.group = new_group;
                 }
                 Ok(())
+            }
+            Entry::Symlink(symlink) => {
+                let target = symlink.read().target(&path)?;
+                // DO NOT COMMIT Loop detection
+                self.chown(target, user, group)
             }
         }
     }
@@ -580,6 +600,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 let ino = match entry {
                     Entry::File(file) => file.read().unique_id,
                     Entry::Dir(dir) => dir.read().unique_id,
+                    Entry::Symlink(symlink) => symlink.read().unique_id,
                 };
                 NodeInfo {
                     dev: DEVICE_ID,
@@ -656,6 +677,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     dir.unique_id,
                 )
             }
+            Entry::Symlink(symlink) => {
+                if follow_last_symlink {
+                    let target = symlink.read().target(&path)?;
+                    // DO NOT COMMIT Loop detection
+                    return self.file_status(target, true);
+                } else {
+                    // DO NOT COMMIT
+                    todo!()
+                }
+            }
         };
         Ok(FileStatus {
             file_type,
@@ -692,6 +723,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                         dir.unique_id,
                     )
                 }
+                Descriptor::Symlink { .. } => unreachable!(),
             };
         Ok(FileStatus {
             file_type,
@@ -712,7 +744,38 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         target: impl crate::path::Arg,
         link_path: impl crate::path::Arg,
     ) -> Result<(), super::errors::SymlinkError> {
-        todo!()
+        let link_path = self.absolute_path(link_path)?;
+        let mut root = self.root.write();
+        let (parent, entry) = root.parent_and_entry(&link_path, self.current_user)?;
+        let Some((_, parent)) = parent else {
+            // Attempted to make `/`
+            return Err(super::errors::SymlinkError::AlreadyExists);
+        };
+        if entry.is_some() {
+            return Err(super::errors::SymlinkError::AlreadyExists);
+        }
+        let mut parent = parent.write();
+        if !self.current_user.can_write(&parent.perms) {
+            return Err(super::errors::SymlinkError::NoWritePerms);
+        }
+        let old = parent.children.insert(
+            link_path.components().unwrap().last().unwrap().into(),
+            FileType::SymbolicLink,
+        );
+        assert!(old.is_none());
+        let old = root.entries.insert(
+            link_path,
+            Entry::Symlink(Arc::new(self.litebox.sync().new_rwlock(SymlinkX {
+                perms: Permissions {
+                    mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+                    userinfo: self.current_user,
+                },
+                raw_target: target.as_rust_str().map_err(PathError::from)?.into(),
+                unique_id: self.fresh_id(),
+            }))),
+        );
+        assert!(old.is_none());
+        Ok(())
     }
 }
 
@@ -781,6 +844,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
                     }
                     parent_dir = Some((parent_path.as_str(), dir.clone()));
                 }
+                (_, Entry::Symlink(symlink)) => {
+                    // DO NOT COMMIT
+                    todo!()
+                }
             }
             collected += "/";
             collected += p;
@@ -792,6 +859,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
 enum Entry<Platform: sync::RawSyncPrimitivesProvider> {
     File(File<Platform>),
     Dir(Dir<Platform>),
+    Symlink(Symlink<Platform>),
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> Entry<Platform> {
@@ -799,6 +867,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Entry<Platform> {
         match self {
             Self::File(file) => file.read().perms.clone(),
             Self::Dir(dir) => dir.read().perms.clone(),
+            Self::Symlink(symlink) => symlink.read().perms.clone(),
         }
     }
 }
@@ -808,6 +877,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Clone for Entry<Platform> {
         match self {
             Self::File(file) => Self::File(file.clone()),
             Self::Dir(dir) => Self::Dir(dir.clone()),
+            Self::Symlink(symlink) => Self::Symlink(symlink.clone()),
         }
     }
 }
@@ -826,6 +896,30 @@ pub(crate) struct FileX {
     perms: Permissions,
     data: Vec<u8>,
     unique_id: usize,
+}
+
+type Symlink<Platform> = Arc<sync::RwLock<Platform, SymlinkX>>;
+
+pub(crate) struct SymlinkX {
+    perms: Permissions,
+    raw_target: String,
+    unique_id: usize,
+}
+
+impl SymlinkX {
+    /// Get the absolute symlink target, given the path of the symlink itself.
+    ///
+    /// Does NOT perform any loop detection. The caller must ensure that they are not looping.
+    fn target(&self, symlink_path: &str) -> Result<String, PathError> {
+        assert!(!symlink_path.ends_with('/'));
+        if self.raw_target.starts_with('/') {
+            // Target itself is absolute; can return directly
+            Ok(self.raw_target.clone())
+        } else {
+            // Strictly relative symlink target that we must make absolute
+            Ok(alloc::format!("{}/../{}", symlink_path, self.raw_target).normalized()?)
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -885,6 +979,9 @@ pub(crate) enum Descriptor<Platform: sync::RawSyncPrimitivesProvider> {
     },
     Dir {
         dir: Dir<Platform>,
+    },
+    Symlink {
+        symlink: Symlink<Platform>,
     },
 }
 
