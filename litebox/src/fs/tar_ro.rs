@@ -21,9 +21,8 @@
 //! Taro Milk Tea, Tapioca Bubbles, 50% Sugar, No Ice.
 //! ```
 
-use alloc::borrow::ToOwned as _;
-use alloc::string::String;
 use alloc::vec::Vec;
+use alloc::{borrow::ToOwned as _, string::String};
 use hashbrown::HashMap;
 
 use crate::{
@@ -37,7 +36,8 @@ use super::{
     Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     errors::{
         ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadDirError,
-        ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+        ReadError, ReadLinkError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
+        WriteError,
     },
 };
 
@@ -438,6 +438,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn file_status(
         &self,
         path: impl crate::path::Arg,
+        follow_last_symlink: bool,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         let path = self.absolute_path(path)?;
         let path = if path.is_empty() {
@@ -516,6 +517,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 blksize: BLOCK_SIZE,
             }),
         }
+    }
+
+    fn symlink(
+        &self,
+        _target: impl crate::path::Arg,
+        _link_path: impl crate::path::Arg,
+    ) -> Result<(), SymlinkError> {
+        Err(SymlinkError::ReadOnlyFileSystem)
+    }
+
+    fn read_link(&self, _path: impl crate::path::Arg) -> Result<String, ReadLinkError> {
+        Err(ReadLinkError::NotASymlink)
     }
 }
 

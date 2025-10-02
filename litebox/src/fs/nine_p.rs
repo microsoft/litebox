@@ -120,6 +120,7 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
     fn file_status(
         &self,
         path: impl crate::path::Arg,
+        follow_last_symlink: bool,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         todo!()
     }
@@ -128,6 +129,21 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
         &self,
         fd: &FileFd<Platform>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
+        todo!()
+    }
+
+    fn symlink(
+        &self,
+        target: impl crate::path::Arg,
+        link_path: impl crate::path::Arg,
+    ) -> Result<(), super::errors::SymlinkError> {
+        todo!()
+    }
+
+    fn read_link(
+        &self,
+        path: impl crate::path::Arg,
+    ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
         todo!()
     }
 }

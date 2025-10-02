@@ -626,7 +626,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Ok(entries)
     }
 
-    fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {
+    fn file_status(
+        &self,
+        path: impl crate::path::Arg,
+        follow_last_symlink: bool,
+    ) -> Result<FileStatus, FileStatusError> {
         let path = self.absolute_path(path)?;
         let root = self.root.read();
         let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
@@ -702,6 +706,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             blksize: BLOCK_SIZE,
         })
     }
+
+    fn symlink(
+        &self,
+        target: impl crate::path::Arg,
+        link_path: impl crate::path::Arg,
+    ) -> Result<(), super::errors::SymlinkError> {
+        todo!()
+    }
+
+    fn read_link(
+        &self,
+        path: impl crate::path::Arg,
+    ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
+        todo!()
+    }
 }
 
 struct RootDir<Platform: sync::RawSyncPrimitivesProvider> {
@@ -739,6 +758,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
         path: &str,
         current_user: UserInfo,
     ) -> ParentAndEntry<'_, Dir<Platform>, Entry<Platform>> {
+        // DO NOT COMMIT: We need to handle possibly throwing a a dangling symlink error here
         let mut real_components_seen = false;
         let mut collected = String::new();
         let mut parent_dir = None;

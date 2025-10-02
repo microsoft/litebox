@@ -396,7 +396,7 @@ mod in_mem {
 
         // Verify it created a regular file, not a directory
         let stat = fs
-            .file_status("/newfile")
+            .file_status("/newfile", true)
             .expect("Failed to get file status");
         assert_eq!(stat.file_type, crate::fs::FileType::RegularFile);
 
@@ -808,7 +808,7 @@ mod layered {
         assert_eq!(stat.mode, Mode::from_bits(0o644).unwrap());
         fs.close(fd).expect("Failed to close file");
 
-        let stat = fs.file_status("bar").expect("Failed to file stat");
+        let stat = fs.file_status("bar", true).expect("Failed to file stat");
         assert_eq!(stat.file_type, FileType::Directory);
         assert_eq!(stat.mode, Mode::from_bits(0o777).unwrap());
 
@@ -1335,7 +1335,7 @@ mod layered {
 
         // Verify the directory was created
         let stat = fs
-            .file_status("/bar/test")
+            .file_status("/bar/test", true)
             .expect("Failed to get status of /bar/test");
         assert_eq!(stat.file_type, FileType::Directory);
 
@@ -1398,7 +1398,7 @@ mod layered {
 
         // Verify the file exists and has correct type
         let stat = fs
-            .file_status("bar/test")
+            .file_status("bar/test", true)
             .expect("Failed to get status of bar/test");
         assert_eq!(stat.file_type, FileType::RegularFile);
     }
@@ -1447,7 +1447,7 @@ mod layered {
 
         // Verify the file still exists and has correct type
         let stat = fs
-            .file_status("bar/baz")
+            .file_status("bar/baz", true)
             .expect("Failed to get status of bar/baz");
         assert_eq!(stat.file_type, FileType::RegularFile);
     }

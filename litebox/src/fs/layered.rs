@@ -94,8 +94,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
 
     /// (private-only) check if the lower level has the path; if there is a path failure, just fail
     /// out with the relevant path error.
-    fn ensure_lower_contains(&self, path: &str) -> Result<FileType, PathError> {
-        match self.lower.file_status(path) {
+    fn ensure_lower_contains(
+        &self,
+        path: &str,
+        follow_last_symlink: bool,
+    ) -> Result<FileType, PathError> {
+        match self.lower.file_status(path, follow_last_symlink) {
             Ok(stat) => Ok(stat.file_type),
             Err(FileStatusError::PathError(e)) => Err(e),
         }
@@ -113,13 +117,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             if dir == path {
                 return Ok(());
             }
-            match self.ensure_lower_contains(dir) {
+            match self.ensure_lower_contains(dir, true) {
                 Ok(FileType::Directory) => {
                     // The dir does in fact exist; we just need to confirm that the upper layer also
                     // has it.
                     match self
                         .upper
-                        .mkdir(dir, self.lower.file_status(dir).unwrap().mode)
+                        .mkdir(dir, self.lower.file_status(dir, true).unwrap().mode)
                     {
                         Ok(()) => {
                             // fallthrough to next increasing ancestor
@@ -138,6 +142,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                                 return Err(e);
                             }
                             MkdirError::PathError(
+                                PathError::TooManySymlinks
+                                | PathError::SymlinkLoop
+                                | PathError::DanglingSymlinkExpansion { .. },
+                            ) => unimplemented!(),
+                            MkdirError::PathError(
                                 PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                             ) => {
                                 unreachable!()
@@ -145,9 +154,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         },
                     }
                 }
-                Ok(FileType::RegularFile | FileType::CharacterDevice)
+                Ok(FileType::RegularFile | FileType::CharacterDevice | FileType::SymbolicLink)
                 | Err(PathError::MissingComponent) => unreachable!(),
-                Err(PathError::ComponentNotADirectory) => unimplemented!(),
+                Err(
+                    PathError::ComponentNotADirectory
+                    | PathError::TooManySymlinks
+                    | PathError::SymlinkLoop
+                    | PathError::DanglingSymlinkExpansion { .. },
+                ) => unimplemented!(),
                 Err(PathError::InvalidPathname) => unreachable!("we just confirmed valid path"),
                 Err(e @ PathError::NoSearchPerms { .. }) => {
                     return Err(e)?;
@@ -200,6 +214,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
+                | OpenError::FoundSymlink
                 | OpenError::TruncateError(_) => unreachable!(),
                 OpenError::PathError(path_error) => return Err(path_error)?,
             },
@@ -457,7 +472,7 @@ impl<
         if flags.contains(OFlags::CREAT) {
             if flags.contains(OFlags::EXCL) {
                 // O_EXCL with O_CREAT: fail if file already exists anywhere (upper or lower layer)
-                if self.file_status(path.as_str()).is_ok() {
+                if self.file_status(path.as_str(), false).is_ok() {
                     return Err(OpenError::AlreadyExists);
                 }
             } else {
@@ -531,10 +546,13 @@ impl<
                     | TruncateError::NotForWriting
                     | TruncateError::IsTerminalDevice,
                 )
+                | OpenError::FoundSymlink
                 | OpenError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. },
+                    | PathError::NoSearchPerms { .. }
+                    | PathError::SymlinkLoop
+                    | PathError::TooManySymlinks,
                 ) => {
                     // None of these can be handled by lower level, just quit out early
                     return Err(e);
@@ -545,7 +563,7 @@ impl<
                     // We must check if the lower layer contains all the directories; if it does, we
                     // can create the same directories and then re-trigger the open.
                     let dirname = path.rsplit_once('/').unwrap().0;
-                    if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
+                    if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname, true) {
                         // We must migrate the directories above, and then re-trigger the open
                         self.mkdir_migrating_ancestor_dirs(&path).unwrap();
                         return self.open(path, flags, mode);
@@ -556,6 +574,10 @@ impl<
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                 ) => {
                     // Handle-able by a lower level, fallthrough
+                }
+                OpenError::PathError(PathError::DanglingSymlinkExpansion { prefix, suffix }) => {
+                    // DO NOT COMMIT
+                    todo!()
                 }
             },
         }
@@ -916,7 +938,9 @@ impl<
                 | ChmodError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. },
+                    | PathError::NoSearchPerms { .. }
+                    | PathError::SymlinkLoop
+                    | PathError::TooManySymlinks,
                 ) => {
                     return Err(e);
                 }
@@ -925,9 +949,13 @@ impl<
                 ) => {
                     // fallthrough
                 }
+                ChmodError::PathError(PathError::DanglingSymlinkExpansion { prefix, suffix }) => {
+                    // DO NOT COMMIT
+                    todo!()
+                }
             },
         }
-        self.ensure_lower_contains(&path)?;
+        self.ensure_lower_contains(&path, true)?;
         match self.migrate_file_up(&path, true) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
@@ -954,7 +982,9 @@ impl<
                 | ChownError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. },
+                    | PathError::NoSearchPerms { .. }
+                    | PathError::SymlinkLoop
+                    | PathError::TooManySymlinks,
                 ) => {
                     return Err(e);
                 }
@@ -963,9 +993,13 @@ impl<
                 ) => {
                     // fallthrough
                 }
+                ChownError::PathError(PathError::DanglingSymlinkExpansion { prefix, suffix }) => {
+                    // DO NOT COMMIT
+                    todo!()
+                }
             },
         }
-        self.ensure_lower_contains(&path)?;
+        self.ensure_lower_contains(&path, true)?;
         match self.migrate_file_up(&path, true) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
@@ -983,7 +1017,7 @@ impl<
             Ok(()) => {
                 // If the lower level contains the file, then we need to place a tombstone in its
                 // path, to prevent the lower level from showing up above.
-                if self.ensure_lower_contains(&path).is_ok() {
+                if self.ensure_lower_contains(&path, false).is_ok() {
                     // fallthrough to place the tombstone
                 } else {
                     // Lower level doesn't contain it, we are done (with success, since we actually
@@ -998,7 +1032,9 @@ impl<
                 | UnlinkError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. },
+                    | PathError::NoSearchPerms { .. }
+                    | PathError::TooManySymlinks
+                    | PathError::SymlinkLoop,
                 ) => {
                     return Err(e);
                 }
@@ -1007,8 +1043,8 @@ impl<
                 ) => {
                     // We must now check if the lower level contains the file; if it does not, we
                     // must exit with failure. Otherwise, we fallthrough to place the tombstone.
-                    match self.ensure_lower_contains(&path)? {
-                        FileType::RegularFile => {
+                    match self.ensure_lower_contains(&path, false)? {
+                        FileType::RegularFile | FileType::SymbolicLink => {
                             // fallthrough
                         }
                         FileType::Directory => {
@@ -1016,6 +1052,10 @@ impl<
                         }
                         FileType::CharacterDevice => unimplemented!(),
                     }
+                }
+                UnlinkError::PathError(PathError::DanglingSymlinkExpansion { prefix, suffix }) => {
+                    // DO NOT COMMIT
+                    todo!()
                 }
             },
         }
@@ -1035,7 +1075,11 @@ impl<
                 // If we could successfully make the directory, we know that things are "sane" at
                 // the upper level, but we must also check the lower level to make sure that this
                 // directory didn't already exist.
-                if self.ensure_lower_contains(&path).is_ok() {
+                if self.ensure_lower_contains(&path, false).is_ok() {
+                    match self.upper.rmdir(path.as_str()) {
+                        Ok(()) => {}
+                        Err(_) => unreachable!(),
+                    }
                     return Err(MkdirError::AlreadyExists);
                 }
                 return Ok(());
@@ -1047,7 +1091,9 @@ impl<
                 | MkdirError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. },
+                    | PathError::NoSearchPerms { .. }
+                    | PathError::TooManySymlinks
+                    | PathError::SymlinkLoop,
                 ) => {
                     return Err(e);
                 }
@@ -1056,6 +1102,10 @@ impl<
                 }
                 MkdirError::PathError(PathError::MissingComponent) => {
                     // fallthrough
+                }
+                MkdirError::PathError(PathError::DanglingSymlinkExpansion { prefix, suffix }) => {
+                    // DO NOT COMMIT
+                    todo!()
                 }
             },
         }
@@ -1128,7 +1178,11 @@ impl<
         Ok(entries)
     }
 
-    fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {
+    fn file_status(
+        &self,
+        path: impl crate::path::Arg,
+        follow_last_symlink: bool,
+    ) -> Result<FileStatus, FileStatusError> {
         // Note: we grab the info from the relevant level and then immediately spit back the same,
         // essentially to ask the compiler to remind us we need to update this when we support
         // inodes and such.
@@ -1158,7 +1212,7 @@ impl<
             });
         }
         // The file is not open, we must look at the levels themselves.
-        match self.upper.file_status(&*path) {
+        match self.upper.file_status(&*path, follow_last_symlink) {
             Ok(FileStatus {
                 file_type,
                 mode,
@@ -1180,7 +1234,9 @@ impl<
                 FileStatusError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. },
+                    | PathError::NoSearchPerms { .. }
+                    | PathError::SymlinkLoop
+                    | PathError::TooManySymlinks,
                 ) => {
                     // None of these can be handled by lower level, just quit out early
                     return Err(e);
@@ -1189,6 +1245,13 @@ impl<
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                 ) => {
                     // Handle-able by a lower level, fallthrough
+                }
+                FileStatusError::PathError(PathError::DanglingSymlinkExpansion {
+                    prefix,
+                    suffix,
+                }) => {
+                    // DO NOT COMMIT
+                    todo!()
                 }
             },
         }
@@ -1199,7 +1262,7 @@ impl<
             owner,
             node_info,
             blksize,
-        } = self.lower.file_status(path)?;
+        } = self.lower.file_status(path, follow_last_symlink)?;
         Ok(FileStatus {
             file_type,
             mode,
@@ -1240,6 +1303,21 @@ impl<
             node_info: self.get_layered_nodeinfo(node_info),
             blksize,
         })
+    }
+
+    fn symlink(
+        &self,
+        target: impl crate::path::Arg,
+        link_path: impl crate::path::Arg,
+    ) -> Result<(), super::errors::SymlinkError> {
+        todo!()
+    }
+
+    fn read_link(
+        &self,
+        path: impl crate::path::Arg,
+    ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
+        todo!()
     }
 }
 

@@ -8,7 +8,8 @@ use crate::{
         FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
         errors::{
             ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-            ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+            ReadDirError, ReadError, ReadLinkError, RmdirError, SeekError, SymlinkError,
+            TruncateError, UnlinkError, WriteError,
         },
     },
     path::Arg,
@@ -249,7 +250,11 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         Err(ReadDirError::NotADirectory)
     }
 
-    fn file_status(&self, path: impl Arg) -> Result<FileStatus, FileStatusError> {
+    fn file_status(
+        &self,
+        path: impl Arg,
+        _follow_last_symlink: bool,
+    ) -> Result<FileStatus, FileStatusError> {
         let path = self.absolute_path(path)?;
         if matches!(path.as_str(), "/dev/stdin" | "/dev/stdout" | "/dev/stderr") {
             Ok(FileStatus {
@@ -274,6 +279,18 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
             node_info: STDIO_NODE_INFO,
             blksize: STDIO_BLOCK_SIZE,
         })
+    }
+
+    fn symlink(
+        &self,
+        _target: impl crate::path::Arg,
+        _link_path: impl crate::path::Arg,
+    ) -> Result<(), SymlinkError> {
+        Err(SymlinkError::ReadOnlyFileSystem)
+    }
+
+    fn read_link(&self, _path: impl crate::path::Arg) -> Result<String, ReadLinkError> {
+        Err(ReadLinkError::NotASymlink)
     }
 }
 
