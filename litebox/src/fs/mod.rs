@@ -148,11 +148,6 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         target: impl path::Arg,
         link_path: impl path::Arg,
     ) -> Result<(), SymlinkError>;
-
-    /// Read the target of a symbolic link.
-    ///
-    /// This operation does not follow the symlink, but reads the stored target path.
-    fn read_link(&self, path: impl path::Arg) -> Result<alloc::string::String, ReadLinkError>;
 }
 
 bitflags! {

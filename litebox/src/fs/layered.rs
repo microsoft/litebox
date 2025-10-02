@@ -214,7 +214,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
-                | OpenError::FoundSymlink
+                | OpenError::FoundSymlinkTo { .. }
                 | OpenError::TruncateError(_) => unreachable!(),
                 OpenError::PathError(path_error) => return Err(path_error)?,
             },
@@ -546,7 +546,6 @@ impl<
                     | TruncateError::NotForWriting
                     | TruncateError::IsTerminalDevice,
                 )
-                | OpenError::FoundSymlink
                 | OpenError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
@@ -574,6 +573,10 @@ impl<
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                 ) => {
                     // Handle-able by a lower level, fallthrough
+                }
+                OpenError::FoundSymlinkTo { target } => {
+                    // DO NOT COMMIT
+                    todo!()
                 }
                 OpenError::PathError(PathError::DanglingSymlinkExpansion { prefix, suffix }) => {
                     // DO NOT COMMIT
@@ -1310,13 +1313,6 @@ impl<
         target: impl crate::path::Arg,
         link_path: impl crate::path::Arg,
     ) -> Result<(), super::errors::SymlinkError> {
-        todo!()
-    }
-
-    fn read_link(
-        &self,
-        path: impl crate::path::Arg,
-    ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
         todo!()
     }
 }

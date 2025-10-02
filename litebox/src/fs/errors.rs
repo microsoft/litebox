@@ -20,8 +20,8 @@ pub enum OpenError {
     ReadOnlyFileSystem,
     #[error("file already exists")]
     AlreadyExists,
-    #[error("found a symbolic link when O_NOFOLLOW was specified")]
-    FoundSymlink,
+    #[error("found a symbolic link (pointing to {target:?}) when O_NOFOLLOW was specified")]
+    FoundSymlinkTo { target: alloc::string::String },
     #[error("error when truncating: {0}")]
     TruncateError(#[from] TruncateError),
     #[error(transparent)]
@@ -215,6 +215,7 @@ pub enum PathError {
     #[error("symbolic link loop detected")]
     SymlinkLoop,
     #[error("found dangling symlink for '{prefix}' that expanded to '{suffix}'")]
+    /// NOTE: This particular error will never be returned by any [layered FS](crate::fs::layered).
     DanglingSymlinkExpansion {
         prefix: alloc::string::String,
         suffix: alloc::string::String,

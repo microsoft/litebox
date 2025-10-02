@@ -288,10 +288,6 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
     ) -> Result<(), SymlinkError> {
         Err(SymlinkError::ReadOnlyFileSystem)
     }
-
-    fn read_link(&self, _path: impl crate::path::Arg) -> Result<String, ReadLinkError> {
-        Err(ReadLinkError::NotASymlink)
-    }
 }
 
 crate::fd::enable_fds_for_subsystem! {

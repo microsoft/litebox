@@ -714,13 +714,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     ) -> Result<(), super::errors::SymlinkError> {
         todo!()
     }
-
-    fn read_link(
-        &self,
-        path: impl crate::path::Arg,
-    ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
-        todo!()
-    }
 }
 
 struct RootDir<Platform: sync::RawSyncPrimitivesProvider> {

@@ -526,10 +526,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     ) -> Result<(), SymlinkError> {
         Err(SymlinkError::ReadOnlyFileSystem)
     }
-
-    fn read_link(&self, _path: impl crate::path::Arg) -> Result<String, ReadLinkError> {
-        Err(ReadLinkError::NotASymlink)
-    }
 }
 
 const DEFAULT_DIR_MODE: Mode =

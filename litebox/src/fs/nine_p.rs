@@ -139,13 +139,6 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
     ) -> Result<(), super::errors::SymlinkError> {
         todo!()
     }
-
-    fn read_link(
-        &self,
-        path: impl crate::path::Arg,
-    ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
-        todo!()
-    }
 }
 
 crate::fd::enable_fds_for_subsystem! {
