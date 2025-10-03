@@ -184,16 +184,6 @@ pub enum SymlinkError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`FileSystem::read_link`]
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum ReadLinkError {
-    #[error("path is not a symbolic link")]
-    NotASymlink,
-    #[error(transparent)]
-    PathError(#[from] PathError),
-}
-
 /// Possible errors in any file-system function due to path errors.
 #[derive(Error, Debug)]
 pub enum PathError {
@@ -212,10 +202,8 @@ pub enum PathError {
     MissingComponent,
     #[error("a component used as a directory in pathname is not, in fact, a directory")]
     ComponentNotADirectory,
-    #[error("too many levels of symbolic links")]
+    #[error("too many levels of symbolic links; could be a symlink loop")]
     TooManySymlinks,
-    #[error("symbolic link loop detected")]
-    SymlinkLoop,
     #[error(
         "found dangling symlink for {prefix_pre_expansion:?} that expanded to {prefix_post_expansion:?}, with remaining suffix {suffix:?}"
     )]

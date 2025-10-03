@@ -143,7 +143,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                             }
                             MkdirError::PathError(
                                 PathError::TooManySymlinks
-                                | PathError::SymlinkLoop
                                 | PathError::DanglingSymlinkExpansion { .. },
                             ) => unimplemented!(),
                             MkdirError::PathError(
@@ -159,7 +158,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 Err(
                     PathError::ComponentNotADirectory
                     | PathError::TooManySymlinks
-                    | PathError::SymlinkLoop
                     | PathError::DanglingSymlinkExpansion { .. },
                 ) => unimplemented!(),
                 Err(PathError::InvalidPathname) => unreachable!("we just confirmed valid path"),
@@ -550,7 +548,6 @@ impl<
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
                     | PathError::NoSearchPerms { .. }
-                    | PathError::SymlinkLoop
                     | PathError::TooManySymlinks,
                 ) => {
                     // None of these can be handled by lower level, just quit out early
@@ -578,7 +575,11 @@ impl<
                     // DO NOT COMMIT
                     todo!()
                 }
-                OpenError::PathError(PathError::DanglingSymlinkExpansion { prefix, suffix }) => {
+                OpenError::PathError(PathError::DanglingSymlinkExpansion {
+                    prefix_pre_expansion,
+                    prefix_post_expansion,
+                    suffix,
+                }) => {
                     // DO NOT COMMIT
                     todo!()
                 }
@@ -942,7 +943,6 @@ impl<
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
                     | PathError::NoSearchPerms { .. }
-                    | PathError::SymlinkLoop
                     | PathError::TooManySymlinks,
                 ) => {
                     return Err(e);
@@ -952,7 +952,11 @@ impl<
                 ) => {
                     // fallthrough
                 }
-                ChmodError::PathError(PathError::DanglingSymlinkExpansion { prefix, suffix }) => {
+                ChmodError::PathError(PathError::DanglingSymlinkExpansion {
+                    prefix_pre_expansion,
+                    prefix_post_expansion,
+                    suffix,
+                }) => {
                     // DO NOT COMMIT
                     todo!()
                 }
@@ -986,7 +990,6 @@ impl<
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
                     | PathError::NoSearchPerms { .. }
-                    | PathError::SymlinkLoop
                     | PathError::TooManySymlinks,
                 ) => {
                     return Err(e);
@@ -996,7 +999,11 @@ impl<
                 ) => {
                     // fallthrough
                 }
-                ChownError::PathError(PathError::DanglingSymlinkExpansion { prefix, suffix }) => {
+                ChownError::PathError(PathError::DanglingSymlinkExpansion {
+                    prefix_pre_expansion,
+                    prefix_post_expansion,
+                    suffix,
+                }) => {
                     // DO NOT COMMIT
                     todo!()
                 }
@@ -1036,8 +1043,7 @@ impl<
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
                     | PathError::NoSearchPerms { .. }
-                    | PathError::TooManySymlinks
-                    | PathError::SymlinkLoop,
+                    | PathError::TooManySymlinks,
                 ) => {
                     return Err(e);
                 }
@@ -1056,7 +1062,11 @@ impl<
                         FileType::CharacterDevice => unimplemented!(),
                     }
                 }
-                UnlinkError::PathError(PathError::DanglingSymlinkExpansion { prefix, suffix }) => {
+                UnlinkError::PathError(PathError::DanglingSymlinkExpansion {
+                    prefix_pre_expansion,
+                    prefix_post_expansion,
+                    suffix,
+                }) => {
                     // DO NOT COMMIT
                     todo!()
                 }
@@ -1095,8 +1105,7 @@ impl<
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
                     | PathError::NoSearchPerms { .. }
-                    | PathError::TooManySymlinks
-                    | PathError::SymlinkLoop,
+                    | PathError::TooManySymlinks,
                 ) => {
                     return Err(e);
                 }
@@ -1106,7 +1115,11 @@ impl<
                 MkdirError::PathError(PathError::MissingComponent) => {
                     // fallthrough
                 }
-                MkdirError::PathError(PathError::DanglingSymlinkExpansion { prefix, suffix }) => {
+                MkdirError::PathError(PathError::DanglingSymlinkExpansion {
+                    prefix_pre_expansion,
+                    prefix_post_expansion,
+                    suffix,
+                }) => {
                     // DO NOT COMMIT
                     todo!()
                 }
@@ -1238,7 +1251,6 @@ impl<
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
                     | PathError::NoSearchPerms { .. }
-                    | PathError::SymlinkLoop
                     | PathError::TooManySymlinks,
                 ) => {
                     // None of these can be handled by lower level, just quit out early
@@ -1250,7 +1262,8 @@ impl<
                     // Handle-able by a lower level, fallthrough
                 }
                 FileStatusError::PathError(PathError::DanglingSymlinkExpansion {
-                    prefix,
+                    prefix_pre_expansion,
+                    prefix_post_expansion,
                     suffix,
                 }) => {
                     // DO NOT COMMIT

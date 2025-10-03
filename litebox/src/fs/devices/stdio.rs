@@ -8,8 +8,8 @@ use crate::{
         FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
         errors::{
             ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-            ReadDirError, ReadError, ReadLinkError, RmdirError, SeekError, SymlinkError,
-            TruncateError, UnlinkError, WriteError,
+            ReadDirError, ReadError, RmdirError, SeekError, SymlinkError, TruncateError,
+            UnlinkError, WriteError,
         },
     },
     path::Arg,

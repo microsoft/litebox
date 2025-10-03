@@ -36,8 +36,7 @@ use super::{
     Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     errors::{
         ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadDirError,
-        ReadError, ReadLinkError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
-        WriteError,
+        ReadError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError, WriteError,
     },
 };
 
