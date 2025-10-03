@@ -676,7 +676,7 @@ where
         }
     }
 
-    /// Bind a socket to a specific address and port.
+    /// Bind a socket to a specific address and port. If the port is 0, an ephemeral port is allocated.
     pub fn bind(
         &mut self,
         fd: &SocketFd<Platform>,
@@ -884,23 +884,15 @@ where
         }
     }
 
-    /// Send data over a connected socket.
+    /// Send data over a socket, optionally specifying the destination address.
+    ///
+    /// If the socket is connection-mode, destination address shall be ignored.
     pub fn send(
         &mut self,
         fd: &SocketFd<Platform>,
         buf: &[u8],
         flags: SendFlags,
-    ) -> Result<usize, SendError> {
-        self.sendto(fd, buf, flags, None)
-    }
-
-    /// Send data over a socket, possibly specifying the destination address.
-    pub fn sendto(
-        &mut self,
-        fd: &SocketFd<Platform>,
-        buf: &[u8],
-        flags: SendFlags,
-        sockaddr: Option<SocketAddr>,
+        destination: Option<SocketAddr>,
     ) -> Result<usize, SendError> {
         let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table.get_entry_mut(fd);
@@ -917,16 +909,13 @@ where
                 .send_slice(buf)
                 .map_err(|tcp::SendError::InvalidState| SendError::SocketInInvalidState),
             Protocol::Udp => {
-                let sockaddr = sockaddr
+                let destination = destination
                     .map(|s| match s {
-                        SocketAddr::V4(addr) => smoltcp::wire::IpEndpoint {
-                            addr: smoltcp::wire::IpAddress::Ipv4(*addr.ip()),
-                            port: addr.port(),
-                        },
+                        SocketAddr::V4(addr) => smoltcp::wire::IpEndpoint::from(addr),
                         SocketAddr::V6(_) => unimplemented!(),
                     })
                     .or_else(|| socket_handle.udp().remote_endpoint);
-                let Some(remote_endpoint) = sockaddr else {
+                let Some(remote_endpoint) = destination else {
                     return Err(SendError::Unaddressable);
                 };
                 let udp_socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
@@ -963,13 +952,18 @@ where
 
     /// Receive data from a connected socket.
     ///
-    /// On success, returns the number of bytes received and, if applicable, the source address.
+    /// If the `source_addr` is `Some` and the underlying protocol provides a source address, it will be updated.
+    /// e.g., UDP does provide the source address, while TCP does not (because it is connection-oriented,
+    /// once it is established, both ends should already know each other's addresses).
+    ///
+    /// On success, returns the number of bytes received.
     pub fn receive(
         &mut self,
         fd: &SocketFd<Platform>,
         buf: &mut [u8],
         flags: ReceiveFlags,
-    ) -> Result<(usize, Option<SocketAddr>), ReceiveError> {
+        source_addr: Option<&mut Option<SocketAddr>>,
+    ) -> Result<usize, ReceiveError> {
         // Note that we do an earlier-than-usual automated interaction to ingress packets since it
         // doesn't hurt to do this too often (other than wasting energy), and this allows us to
         // possibly get packets where we might otherwise return with size 0 on the `receive`.
@@ -983,29 +977,36 @@ where
         }
 
         let ret = match socket_handle.protocol() {
-            Protocol::Tcp => self
-                .socket_set
-                .get_mut::<tcp::Socket>(socket_handle.handle)
-                .recv_slice(buf)
-                .map(|n| (n, None))
-                .map_err(|e| match e {
-                    tcp::RecvError::InvalidState => ReceiveError::SocketInInvalidState,
-                    tcp::RecvError::Finished => ReceiveError::OperationFinished,
-                }),
+            Protocol::Tcp => {
+                if let Some(source_addr) = source_addr {
+                    // TCP is connection-oriented, so no need to provide a source address
+                    *source_addr = None;
+                }
+                self.socket_set
+                    .get_mut::<tcp::Socket>(socket_handle.handle)
+                    .recv_slice(buf)
+                    .map_err(|e| match e {
+                        tcp::RecvError::InvalidState => ReceiveError::SocketInInvalidState,
+                        tcp::RecvError::Finished => ReceiveError::OperationFinished,
+                    })
+            }
             Protocol::Udp => match self
                 .socket_set
                 .get_mut::<udp::Socket>(socket_handle.handle)
                 .recv_slice(buf)
             {
                 Ok((n, meta)) => {
-                    let remote_addr = match meta.endpoint.addr {
-                        smoltcp::wire::IpAddress::Ipv4(ipv4_addr) => {
-                            SocketAddr::V4(SocketAddrV4::new(ipv4_addr, meta.endpoint.port))
-                        }
-                    };
-                    Ok((n, Some(remote_addr)))
+                    if let Some(source_addr) = source_addr {
+                        let remote_addr = match meta.endpoint.addr {
+                            smoltcp::wire::IpAddress::Ipv4(ipv4_addr) => {
+                                SocketAddr::V4(SocketAddrV4::new(ipv4_addr, meta.endpoint.port))
+                            }
+                        };
+                        *source_addr = Some(remote_addr);
+                    }
+                    Ok(n)
                 }
-                Err(udp::RecvError::Exhausted) => Ok((0, None)),
+                Err(udp::RecvError::Exhausted) => Ok(0),
                 // TODO: how to read partial data instead of erroring out?
                 Err(udp::RecvError::Truncated) => unimplemented!(),
             },

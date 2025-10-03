@@ -593,14 +593,28 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> ContinueOper
             flags,
             addr,
             addrlen,
-        } => syscalls::net::sys_recvfrom(sockfd, buf, len, flags).and_then(|(size, src_addr)| {
-            if let Some(src_addr) = src_addr
-                && let Some(sock_ptr) = addr
-            {
-                syscalls::net::write_sockaddr_to_user(src_addr, sock_ptr, addrlen)?;
-            }
-            Ok(size)
-        }),
+        } => {
+            let mut source_addr = None;
+            syscalls::net::sys_recvfrom(
+                sockfd,
+                buf,
+                len,
+                flags,
+                if addr.is_some() {
+                    Some(&mut source_addr)
+                } else {
+                    None
+                },
+            )
+            .and_then(|size| {
+                if let Some(src_addr) = source_addr
+                    && let Some(sock_ptr) = addr
+                {
+                    syscalls::net::write_sockaddr_to_user(src_addr, sock_ptr, addrlen)?;
+                }
+                Ok(size)
+            })
+        }
         SyscallRequest::Bind {
             sockfd,
             sockaddr,

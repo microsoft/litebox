@@ -179,9 +179,7 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
         Descriptor::Socket(socket) => {
             let socket = socket.clone();
             drop(file_table);
-            socket
-                .receive(buf, litebox::net::ReceiveFlags::empty())
-                .map(|(size, _)| size)
+            socket.receive(buf, litebox::net::ReceiveFlags::empty(), None)
         }
         Descriptor::PipeReader { consumer, .. } => {
             let consumer = consumer.clone();

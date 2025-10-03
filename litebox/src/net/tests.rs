@@ -39,7 +39,7 @@ fn bidi_tcp_comms(mut network: Network<MockPlatform>, comms: fn(&mut Network<Moc
     // Send data from client to server
     let client_to_server_data = b"Hello from client!";
     let bytes_sent = network
-        .send(&client_fd, client_to_server_data, SendFlags::empty())
+        .send(&client_fd, client_to_server_data, SendFlags::empty(), None)
         .expect("Failed to send data");
     assert_eq!(bytes_sent, client_to_server_data.len());
 
@@ -47,15 +47,15 @@ fn bidi_tcp_comms(mut network: Network<MockPlatform>, comms: fn(&mut Network<Moc
 
     // Receive data on the server
     let mut server_buffer = [0u8; 1024];
-    let (bytes_received, _) = network
-        .receive(&server_fd, &mut server_buffer, ReceiveFlags::empty())
+    let bytes_received = network
+        .receive(&server_fd, &mut server_buffer, ReceiveFlags::empty(), None)
         .expect("Failed to receive data");
     assert_eq!(&server_buffer[..bytes_received], client_to_server_data);
 
     // Send data from server to client
     let server_to_client_data = b"Hello from server!";
     let bytes_sent = network
-        .send(&server_fd, server_to_client_data, SendFlags::empty())
+        .send(&server_fd, server_to_client_data, SendFlags::empty(), None)
         .expect("Failed to send data");
     assert_eq!(bytes_sent, server_to_client_data.len());
 
@@ -63,8 +63,8 @@ fn bidi_tcp_comms(mut network: Network<MockPlatform>, comms: fn(&mut Network<Moc
 
     // Receive data on the client
     let mut client_buffer = [0u8; 1024];
-    let (bytes_received, _) = network
-        .receive(&client_fd, &mut client_buffer, ReceiveFlags::empty())
+    let bytes_received = network
+        .receive(&client_fd, &mut client_buffer, ReceiveFlags::empty(), None)
         .expect("Failed to receive data");
     assert_eq!(&client_buffer[..bytes_received], server_to_client_data);
 

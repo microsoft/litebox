@@ -293,7 +293,7 @@ impl Socket {
     ) -> Result<usize, Errno> {
         let n = litebox_net()
             .lock()
-            .sendto(self.fd.as_ref().unwrap(), buf, flags, sockaddr)?;
+            .send(self.fd.as_ref().unwrap(), buf, flags, sockaddr)?;
         if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
     }
 
@@ -326,33 +326,30 @@ impl Socket {
         &self,
         buf: &mut [u8],
         flags: ReceiveFlags,
-    ) -> Result<(usize, Option<SocketAddr>), Errno> {
-        let (n, sockaddr) = litebox_net()
+        source_addr: Option<&mut Option<SocketAddr>>,
+    ) -> Result<usize, Errno> {
+        let n = litebox_net()
             .lock()
-            .receive(self.fd.as_ref().unwrap(), buf, flags)?;
-        if n == 0 {
-            Err(Errno::EAGAIN)
-        } else {
-            Ok((n, sockaddr))
-        }
+            .receive(self.fd.as_ref().unwrap(), buf, flags, source_addr)?;
+        if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
     }
 
     pub(crate) fn receive(
         &self,
         buf: &mut [u8],
         flags: ReceiveFlags,
-    ) -> Result<(usize, Option<SocketAddr>), Errno> {
+        mut source_addr: Option<&mut Option<SocketAddr>>,
+    ) -> Result<usize, Errno> {
         if self.get_status().contains(OFlags::NONBLOCK) || flags.contains(ReceiveFlags::DONTWAIT) {
-            self.try_receive(buf, flags)
+            self.try_receive(buf, flags, source_addr)
         } else {
             let timeout = self.options.lock().recv_timeout;
             if timeout.is_some() {
                 todo!("recv timeout");
             }
 
-            // TODO: use `poll` instead of busy wait
             loop {
-                match self.try_receive(buf, flags) {
+                match self.try_receive(buf, flags, source_addr.as_deref_mut()) {
                     Err(Errno::EAGAIN) => {}
                     ret => return ret,
                 }
@@ -602,7 +599,8 @@ pub(crate) fn sys_recvfrom(
     buf: MutPtr<u8>,
     len: usize,
     mut flags: ReceiveFlags,
-) -> Result<(usize, Option<SocketAddress>), Errno> {
+    source_addr: Option<&mut Option<SocketAddress>>,
+) -> Result<usize, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
@@ -615,10 +613,22 @@ pub(crate) fn sys_recvfrom(
             // drop file table as `receive` may block
             drop(file_table);
             let mut buffer: [u8; 4096] = [0; 4096];
-            let (size, remote_addr) = socket.receive(&mut buffer, flags)?;
+            let mut addr = None;
+            let size = socket.receive(
+                &mut buffer,
+                flags,
+                if source_addr.is_some() {
+                    Some(&mut addr)
+                } else {
+                    None
+                },
+            )?;
+            if let Some(source_addr) = source_addr {
+                *source_addr = addr.map(SocketAddress::Inet);
+            }
             buf.copy_from_slice(0, &buffer[..size])
                 .ok_or(Errno::EFAULT)?;
-            Ok((size, remote_addr.map(SocketAddress::Inet)))
+            Ok(size)
         }
         _ => Err(Errno::ENOTSOCK),
     }
@@ -816,9 +826,15 @@ mod tests {
         // Server receives and inspects sender addr
         let mut recv_buf = [0u8; 48];
         let recv_ptr = crate::MutPtr::from_usize(recv_buf.as_mut_ptr() as usize);
-        let (n, sender_addr) =
-            sys_recvfrom(server_fd, recv_ptr, recv_buf.len(), ReceiveFlags::empty())
-                .expect("recvfrom failed");
+        let mut sender_addr = None;
+        let n = sys_recvfrom(
+            server_fd,
+            recv_ptr,
+            recv_buf.len(),
+            ReceiveFlags::empty(),
+            Some(&mut sender_addr),
+        )
+        .expect("recvfrom failed");
         let received = core::str::from_utf8(&recv_buf[..n]).expect("invalid utf8");
         assert_eq!(received, msg);
         let SocketAddress::Inet(sender_addr) = sender_addr.unwrap();
