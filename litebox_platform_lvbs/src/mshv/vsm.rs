@@ -34,6 +34,7 @@ use crate::{
     },
     serial_println,
 };
+use aligned_vec::avec;
 use alloc::{boxed::Box, collections::BTreeMap, ffi::CString, string::String, vec, vec::Vec};
 use core::{
     mem,
@@ -47,6 +48,16 @@ use x86_64::{
     structures::paging::{PageSize, PhysFrame, Size4KiB, frame::PhysFrameRange},
 };
 use x509_cert::{Certificate, der::Decode};
+
+#[derive(Copy, Clone)]
+#[repr(align(4096))]
+struct AlignedPage([u8; PAGE_SIZE]);
+
+impl AlignedPage {
+    pub fn new() -> Self {
+        AlignedPage([0; PAGE_SIZE])
+    }
+}
 
 // For now, we do not validate large kernel modules due to the VTL1's memory size limitation.
 const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
@@ -143,20 +154,20 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
     }
 
     // boot_signal is an array of bytes whose length is the number of possible cores. Copy the entire page for now.
-    if let Some(mut boot_signal_page_buf) = unsafe {
-        crate::platform_low().copy_from_vtl0_phys::<[u8; PAGE_SIZE]>(boot_signal_page_addr)
-    } {
+    if let Some(mut boot_signal_page_buf) =
+        unsafe { crate::platform_low().copy_from_vtl0_phys::<AlignedPage>(boot_signal_page_addr) }
+    {
         // TODO: execute `init_vtl_ap` for each online core and update the corresponding boot signal byte.
         // Currently, we use `init_vtl_aps` to initialize all present cores which
         // takes a long time if we have a lot of cores.
         debug_serial_println!("updating boot signal page");
         for i in 0..get_num_possible_cpus().unwrap_or(0) {
-            boot_signal_page_buf[i as usize] = HV_SECURE_VTL_BOOT_TOKEN;
+            boot_signal_page_buf.0[i as usize] = HV_SECURE_VTL_BOOT_TOKEN;
         }
 
         if unsafe {
             crate::platform_low()
-                .copy_to_vtl0_phys::<[u8; PAGE_SIZE]>(boot_signal_page_addr, &boot_signal_page_buf)
+                .copy_to_vtl0_phys::<AlignedPage>(boot_signal_page_addr, &boot_signal_page_buf)
         } {
             Ok(0)
         } else {
@@ -436,8 +447,8 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
         return Err(Errno::EINVAL);
     }
 
-    let mut kinfo_buf = vec![0u8; kinfo_mem.len()];
-    let mut kdata_buf = vec![0u8; kdata_mem.len()];
+    let mut kinfo_buf = avec![0u8; kinfo_mem.len()];
+    let mut kdata_buf = avec![0u8; kdata_mem.len()];
 
     kinfo_mem
         .read_bytes(kinfo_mem.start().unwrap(), &mut kinfo_buf)
@@ -516,7 +527,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         "Module ELF size exceeds the maximum allowed size"
     );
 
-    let mut original_elf_data = vec![0u8; elf_size];
+    let mut original_elf_data = avec![0u8; elf_size];
     module_as_elf
         .read_bytes(module_as_elf.start().unwrap(), &mut original_elf_data)
         .map_err(|_| Errno::EINVAL)?;
@@ -1452,7 +1463,7 @@ impl ModuleMemory {
 /// explicit page mappings at VTL1.
 /// This structure is expected to be used locally and temporarily, so we do not protect it with a lock.
 pub struct MemoryContainer {
-    pages: BTreeMap<VirtAddr, Box<[u8; PAGE_SIZE]>>,
+    pages: BTreeMap<VirtAddr, Box<AlignedPage>>,
     range: Range<VirtAddr>,
 }
 
@@ -1501,11 +1512,11 @@ impl MemoryContainer {
         }
     }
 
-    fn get_or_alloc_page(&mut self, addr: VirtAddr) -> &mut Box<[u8; PAGE_SIZE]> {
+    fn get_or_alloc_page(&mut self, addr: VirtAddr) -> &mut Box<AlignedPage> {
         let page_base = addr.align_down(Size4KiB::SIZE);
         self.pages
             .entry(page_base)
-            .or_insert_with(|| Box::new([0; PAGE_SIZE]))
+            .or_insert_with(|| Box::new(AlignedPage::new()))
     }
 
     /// Write physical memory bytes from VTL0 specified in `HekiRange` at the specified virtual address
@@ -1531,18 +1542,18 @@ impl MemoryContainer {
         if !phys_cur.is_aligned(Size4KiB::SIZE) {
             let Some(page) = (unsafe {
                 crate::platform_low()
-                    .copy_from_vtl0_phys::<[u8; PAGE_SIZE]>(phys_cur.align_down(Size4KiB::SIZE))
+                    .copy_from_vtl0_phys::<AlignedPage>(phys_cur.align_down(Size4KiB::SIZE))
             }) else {
                 return Err(MemoryContainerError::CopyFromVtl0Failed);
             };
             let page_offset =
                 usize::try_from(phys_cur - phys_cur.align_down(Size4KiB::SIZE)).unwrap();
-            self.write_bytes(addr, &page[page_offset..])?;
+            self.write_bytes(addr, &page.0[page_offset..])?;
             phys_cur += Size4KiB::SIZE - u64::try_from(page_offset).unwrap();
         }
         while phys_cur < phys_end {
             let Some(page) =
-                (unsafe { crate::platform_low().copy_from_vtl0_phys::<[u8; PAGE_SIZE]>(phys_cur) })
+                (unsafe { crate::platform_low().copy_from_vtl0_phys::<AlignedPage>(phys_cur) })
             else {
                 return Err(MemoryContainerError::CopyFromVtl0Failed);
             };
@@ -1551,7 +1562,7 @@ impl MemoryContainer {
             } else {
                 usize::try_from(phys_end - phys_cur).unwrap()
             };
-            self.write_bytes(addr + (phys_cur - phys_start), &page[..to_write])?;
+            self.write_bytes(addr + (phys_cur - phys_start), &page.0[..to_write])?;
             phys_cur += u64::try_from(to_write).unwrap();
         }
 
@@ -1596,7 +1607,7 @@ impl MemoryContainer {
             let page_offset = copy_start.page_offset().into();
             let data_offset = usize::try_from(copy_start - start).expect("data offset error");
 
-            page[page_offset..page_offset + len]
+            page.0[page_offset..page_offset + len]
                 .copy_from_slice(&data[data_offset..data_offset + len]);
             num_bytes += len;
         }
@@ -1634,7 +1645,7 @@ impl MemoryContainer {
             let buf_offset = usize::try_from(copy_start - start).expect("buffer offset error");
 
             buf[buf_offset..buf_offset + len]
-                .copy_from_slice(&page[page_offset..page_offset + len]);
+                .copy_from_slice(&page.0[page_offset..page_offset + len]);
             num_bytes += len;
         }
 

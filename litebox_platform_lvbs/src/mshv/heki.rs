@@ -175,6 +175,7 @@ pub const HEKI_MAX_RANGES: usize =
     ((PAGE_SIZE as u32 - u64::BITS * 3 / 8) / core::mem::size_of::<HekiRange>() as u32) as usize;
 
 #[derive(Clone, Copy)]
+#[repr(align(4096))]
 #[repr(C)]
 pub struct HekiPage {
     pub next: *mut HekiPage,
@@ -344,14 +345,10 @@ impl HekiKernelSymbol {
         if bytes.len() < Self::KSYM_LEN {
             return Err(Errno::EINVAL);
         }
-        let ksym_bytes: [u8; Self::KSYM_LEN] = (&bytes[..Self::KSYM_LEN])
-            .try_into()
-            .map_err(|_| Errno::EINVAL)?;
 
-        // TODO: memory container's copy appears to be copying data into unaligned
-        // address. Fix copy, then we can verify alignment or use trans____
         #[allow(clippy::cast_ptr_alignment)]
-        let ksym_ptr = ksym_bytes.as_ptr().cast::<HekiKernelSymbol>();
+        let ksym_ptr = bytes.as_ptr().cast::<HekiKernelSymbol>();
+        assert!(ksym_ptr.is_aligned(), "ksym_ptr is not aligned");
 
         // SAFETY: Casting from vtl0 buffer that contained the struct
         unsafe {
@@ -381,14 +378,10 @@ impl HekiKernelInfo {
         if bytes.len() < Self::KINFO_LEN {
             return Err(Errno::EINVAL);
         }
-        let kinfo_bytes: [u8; Self::KINFO_LEN] = (&bytes[..Self::KINFO_LEN])
-            .try_into()
-            .map_err(|_| Errno::EINVAL)?;
 
-        // TODO: memory container's copy appears to be copying data into unaligned
-        // address. Fix copy, then we can verify alignment or use trans____
         #[allow(clippy::cast_ptr_alignment)]
-        let kinfo_ptr = kinfo_bytes.as_ptr().cast::<HekiKernelInfo>();
+        let kinfo_ptr = bytes.as_ptr().cast::<HekiKernelInfo>();
+        assert!(kinfo_ptr.is_aligned(), "kinfo_ptr is not aligned");
 
         // SAFETY: Casting from vtl0 buffer that contained the struct
         unsafe {

@@ -177,7 +177,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address
     /// # Panics
     ///
-    /// Panics if `phys_addr` is invalid
+    /// Panics if `phys_addr` is invalid or not properly aligned for `T`
     pub unsafe fn copy_from_vtl0_phys<T: Copy>(
         &self,
         phys_addr: x86_64::PhysAddr,
@@ -191,25 +191,26 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         ) {
             let page_offset =
                 usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
-            let raw = Box::into_raw(Box::new(core::mem::MaybeUninit::<T>::uninit()));
+            let src_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
+            assert!(src_ptr.is_aligned(), "src_ptr is not properly aligned");
 
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    page_addr.wrapping_add(page_offset).cast::<u8>(),
-                    (*raw).as_mut_ptr().cast::<u8>(),
-                    core::mem::size_of::<T>(),
-                );
-            }
+            let mut boxed = Box::<T>::new_uninit();
+            let dst_ptr = boxed.as_mut_ptr();
+
+            let boxed = unsafe {
+                core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, 1);
+                boxed.assume_init()
+            };
 
             assert!(
                 self.unmap_vtl0_pages(page_addr, length).is_ok(),
                 "Failed to unmap VTL0 pages"
             );
 
-            return Some(unsafe { Box::from_raw((*raw).as_mut_ptr()) });
+            Some(boxed)
+        } else {
+            None
         }
-
-        None
     }
 
     /// This function copies data from the VTL1 kernel to VTL0 physical memory.
@@ -219,7 +220,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address
     /// # Panics
     ///
-    /// Panics if phys_addr is invalid
+    /// Panics if phys_addr is invalid or not properly aligned for `T`
     pub unsafe fn copy_to_vtl0_phys<T: Copy>(
         &self,
         phys_addr: x86_64::PhysAddr,
@@ -232,12 +233,13 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         ) {
             let page_offset =
                 usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
+            let dst_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
+            assert!(dst_ptr.is_aligned(), "dst_ptr is not properly aligned");
+
+            let src_ptr = core::ptr::from_ref::<T>(value);
+
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    core::ptr::from_ref::<T>(value).cast::<u8>(),
-                    page_addr.wrapping_add(page_offset).cast::<u8>(),
-                    core::mem::size_of::<T>(),
-                );
+                core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, 1);
             }
             assert!(
                 self.unmap_vtl0_pages(page_addr, length).is_ok(),
@@ -258,7 +260,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ///
     /// # Panics
     ///
-    /// Panics if phys_addr is invalid
+    /// Panics if phys_addr is invalid or not properly aligned for `T`
     pub unsafe fn copy_slice_to_vtl0_phys<T: Copy>(
         &self,
         phys_addr: x86_64::PhysAddr,
@@ -271,12 +273,13 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         ) {
             let page_offset =
                 usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
+            let dst_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
+            assert!(dst_ptr.is_aligned(), "dst_ptr is not properly aligned");
+
+            let src_ptr = value.as_ptr();
+
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    value.as_ptr().cast::<u8>(),
-                    page_addr.wrapping_add(page_offset).cast::<u8>(),
-                    core::mem::size_of_val(value),
-                );
+                core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, value.len());
             }
             assert!(
                 self.unmap_vtl0_pages(page_addr, length).is_ok(),
@@ -297,7 +300,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ///
     /// # Panics
     ///
-    /// Panics if phys_addr is invalid
+    /// Panics if phys_addr is invalid or not properly aligned for `T`
     pub unsafe fn copy_slice_from_vtl0_phys<T: Copy>(
         &self,
         phys_addr: x86_64::PhysAddr,
@@ -310,12 +313,13 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         ) {
             let page_offset =
                 usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
+            let src_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
+            assert!(src_ptr.is_aligned(), "src_ptr is not properly aligned");
+
+            let dst_ptr = buf.as_mut_ptr();
+
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    page_addr.wrapping_add(page_offset).cast::<u8>(),
-                    buf.as_mut_ptr().cast::<u8>(),
-                    core::mem::size_of_val(buf),
-                );
+                core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, buf.len());
             }
 
             assert!(
