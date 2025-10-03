@@ -24,6 +24,12 @@ use errors::{
     ReadError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError, WriteError,
 };
 
+/// Maximum number of symlinks to traverse before it is considered "too many". This number exists
+/// mostly as a safety measure; it should be sufficiently high that no real symlink chains are
+/// impacted, while at the same time, not be so high that someone just gets stuck for a long time
+/// waiting.
+const MAX_SYMLINK_TRAVERSAL_FUEL: u8 = 10;
+
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
 /// made public.
 mod private {

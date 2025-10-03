@@ -1,5 +1,6 @@
 //! An in-memory file system, not backed by any physical device.
 
+use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -814,13 +815,54 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
         path: &str,
         current_user: UserInfo,
     ) -> ParentAndEntry<'_, Dir<Platform>, Entry<Platform>> {
-        // DO NOT COMMIT Handle as many `DanglingSymlinkExpansion` here as possible before bumping up.
-        //
-        // DO NOT COMMIT take an extra argument that allows/handles last-level symlinking
-        self.parent_and_entry_internal(path, current_user)
+        let mut previous_dangling = None;
+        let mut path: String = path.into();
+        for _fuel in 0..super::MAX_SYMLINK_TRAVERSAL_FUEL {
+            match self.parent_and_entry_with_no_symlink_traversal_anywhere(&path, current_user) {
+                Ok((parent, entry)) => {
+                    // DO NOT COMMIT take an extra argument that allows/handles last-level
+                    // symlinking; i.e., what if the entry here is a symlink.
+                    return Ok((parent, entry));
+                }
+                e @ Err(
+                    PathError::ComponentNotADirectory
+                    | PathError::NoSearchPerms { .. }
+                    | PathError::InvalidPathname,
+                ) => {
+                    // Cannot be handled, just bump it up
+                    return e;
+                }
+                Err(PathError::TooManySymlinks) => unreachable!(),
+                Err(PathError::DanglingSymlinkExpansion {
+                    prefix_pre_expansion,
+                    prefix_post_expansion,
+                    suffix,
+                }) => {
+                    path = format!("{prefix_post_expansion}/{suffix}");
+                    previous_dangling = Some(PathError::DanglingSymlinkExpansion {
+                        prefix_pre_expansion,
+                        prefix_post_expansion,
+                        suffix,
+                    });
+                }
+                e @ Err(PathError::NoSuchFileOrDirectory | PathError::MissingComponent) => {
+                    if let Some(dangling) = previous_dangling {
+                        // There is a real dangling symlink, we should return it.
+                        return Err(dangling);
+                    } else {
+                        // There are no symlinks involved, just bump it up
+                        return e;
+                    }
+                }
+            }
+        }
+        Err(PathError::TooManySymlinks)
     }
 
-    fn parent_and_entry_internal(
+    /// An internal function to be called only by `parent_and_entry`; does not traverse symlinks
+    /// anywhere. You almost definitely want to use `parent_and_entry` which handles the correct
+    /// symlink traversals and returns that you'd want.
+    fn parent_and_entry_with_no_symlink_traversal_anywhere(
         &self,
         path: &str,
         current_user: UserInfo,
