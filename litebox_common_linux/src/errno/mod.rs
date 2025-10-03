@@ -214,6 +214,16 @@ impl From<litebox::mm::linux::VmemUnmapError> for Errno {
     }
 }
 
+impl From<litebox::mm::linux::VmemResetError> for Errno {
+    fn from(value: litebox::mm::linux::VmemResetError) -> Self {
+        match value {
+            litebox::mm::linux::VmemResetError::UnAligned => Errno::EINVAL,
+            litebox::mm::linux::VmemResetError::AlreadyUnallocated => Errno::ENOMEM,
+            litebox::mm::linux::VmemResetError::FileBacked => Errno::EINVAL,
+        }
+    }
+}
+
 impl From<litebox::mm::linux::MappingError> for Errno {
     fn from(value: litebox::mm::linux::MappingError) -> Self {
         match value {

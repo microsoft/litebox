@@ -243,7 +243,11 @@ pub fn sys_madvise<
             // and shmem-based techniques such as System V shared memory segments) or zero-fill-on-demand pages for anonymous private mappings.
             //
             // Note we do not support shared memory yet, so this is just to discard the pages without removing the mapping.
-            unsafe { pm.reset_pages(addr, len) }.map_err(Errno::from)
+            unsafe { pm.reset_pages(addr, aligned_len, false) }.map_err(Errno::from)
         }
+        crate::MadviseBehavior::Free => {
+            unsafe { pm.reset_pages(addr, aligned_len, true) }.map_err(Errno::from)
+        }
+        _ => unimplemented!("Unsupported madvise behavior {:?}", advice),
     }
 }

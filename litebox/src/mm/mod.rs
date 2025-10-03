@@ -16,7 +16,7 @@ use linux::{
 
 use crate::{
     LiteBox,
-    mm::linux::{NonZeroAddress, NonZeroPageSize},
+    mm::linux::{NonZeroAddress, NonZeroPageSize, VmemResetError},
     platform::{
         PageManagementProvider, RawConstPointer,
         page_mgmt::{MemoryRegionPermissions, RemapError},
@@ -448,6 +448,9 @@ where
 
     /// Reset pages without removing its mapping.
     ///
+    /// If `anonymous_only` is true and any part of the range is non‑anonymous (i.e., file‑backed),
+    /// returns `Err(VmemResetError::FileBacked)`.
+    ///
     /// After calling this function, the memory region remains mapped, but its contents are invalidated.
     /// Subsequent accesses to the region will result in repopulating the memory contents, either from
     /// the underlying mapped file (for file-backed mappings, which is supported) or as zero-filled pages
@@ -461,11 +464,12 @@ where
         &self,
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
-    ) -> Result<(), VmemUnmapError> {
+        anonymous_only: bool,
+    ) -> Result<(), VmemResetError> {
         let mut vmem = self.vmem.write();
         let start = ptr.as_usize();
-        let range = PageRange::new(start, start + len).ok_or(VmemUnmapError::UnAligned)?;
-        unsafe { vmem.reset_pages(range) }
+        let range = PageRange::new(start, start + len).ok_or(VmemResetError::UnAligned)?;
+        unsafe { vmem.reset_pages(range, anonymous_only) }
     }
 
     /// Internal common function used by `make_pages_*` to change page permissions.
