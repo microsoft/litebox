@@ -814,11 +814,30 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
         path: &str,
         current_user: UserInfo,
     ) -> ParentAndEntry<'_, Dir<Platform>, Entry<Platform>> {
-        // DO NOT COMMIT: We need to handle possibly throwing a a dangling symlink error here
+        // DO NOT COMMIT Handle as many `DanglingSymlinkExpansion` here as possible before bumping up.
+        //
+        // DO NOT COMMIT take an extra argument that allows/handles last-level symlinking
+        self.parent_and_entry_internal(path, current_user)
+    }
+
+    fn parent_and_entry_internal(
+        &self,
+        path: &str,
+        current_user: UserInfo,
+    ) -> ParentAndEntry<'_, Dir<Platform>, Entry<Platform>> {
         let mut real_components_seen = false;
         let mut collected = String::new();
         let mut parent_dir = None;
-        for p in path.normalized_components()? {
+        let path = path.normalized()?;
+        for (num_ancestors, p) in path.components()?.enumerate() {
+            debug_assert_eq!(
+                path.components()?
+                    .take(num_ancestors)
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                collected,
+                "Sanity check `num_ancestors` counting"
+            );
             if p.is_empty() || p == ".." {
                 // After normalization, these can only be at the start of the path, so can all be
                 // ignored. We do an `assert` here mostly as a sanity check.
@@ -845,8 +864,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
                     parent_dir = Some((parent_path.as_str(), dir.clone()));
                 }
                 (_, Entry::Symlink(symlink)) => {
-                    // DO NOT COMMIT
-                    todo!()
+                    let prefix_post_expansion = symlink.read().target(&collected)?;
+                    return Err(PathError::DanglingSymlinkExpansion {
+                        prefix_pre_expansion: collected,
+                        prefix_post_expansion,
+                        suffix: path
+                            .components()?
+                            .skip(num_ancestors)
+                            .collect::<Vec<_>>()
+                            .join("/"),
+                    });
                 }
             }
             collected += "/";
