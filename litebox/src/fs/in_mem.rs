@@ -156,7 +156,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let path = self.absolute_path(path)?;
         let entry = if flags.contains(OFlags::CREAT) {
             let mut root = self.root.write();
-            let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
+            let (parent, entry) = root.parent_and_entry(&path, self.current_user, true)?;
             if let Some(entry) = entry {
                 if flags.contains(OFlags::EXCL) {
                     return Err(OpenError::AlreadyExists);
@@ -196,7 +196,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
         } else {
             let root = self.root.read();
-            let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+            let (_, entry) =
+                root.parent_and_entry(&path, self.current_user, !flags.contains(OFlags::NOFOLLOW))?;
             let Some(entry) = entry else {
                 return Err(PathError::NoSuchFileOrDirectory)?;
             };
@@ -237,14 +238,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 .descriptor_table_mut()
                 .insert(Descriptor::Dir { dir: dir.clone() }),
             Entry::Symlink(symlink) => {
-                if flags.contains(OFlags::NOFOLLOW) {
-                    return Err(OpenError::FoundSymlinkTo {
-                        target: symlink.read().raw_target.clone(),
-                    });
-                } else {
-                    // DO NOT COMMIT: Make sure no infinite loops
-                    return self.open(symlink.read().target(&path)?, flags, mode);
-                }
+                // Should not be reachable unless `NOFOLLOW` is passed
+                assert!(flags.contains(OFlags::NOFOLLOW));
+                return Err(OpenError::FoundSymlinkTo {
+                    target: symlink.read().raw_target.clone(),
+                });
             }
         };
         if flags.contains(OFlags::TRUNC) {
@@ -405,7 +403,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn chmod(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), ChmodError> {
         let path = self.absolute_path(path)?;
         let root = self.root.read();
-        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (_, entry) = root.parent_and_entry(&path, self.current_user, false)?;
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
@@ -426,11 +424,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 perms.mode = mode;
                 Ok(())
             }
-            Entry::Symlink(symlink) => {
-                let target = symlink.read().target(&path)?;
-                // DO NOT COMMIT Loop detection
-                self.chmod(target, mode)
-            }
+            Entry::Symlink(_) => unreachable!(),
         }
     }
 
@@ -442,7 +436,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     ) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
         let root = self.root.read();
-        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (_, entry) = root.parent_and_entry(&path, self.current_user, false)?;
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
@@ -473,18 +467,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 }
                 Ok(())
             }
-            Entry::Symlink(symlink) => {
-                let target = symlink.read().target(&path)?;
-                // DO NOT COMMIT Loop detection
-                self.chown(target, user, group)
-            }
+            Entry::Symlink(_) => unreachable!(),
         }
     }
 
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
-        let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (parent, entry) = root.parent_and_entry(&path, self.current_user, true)?;
         let Some((_, parent)) = parent else {
             // Attempted to remove `/`
             return Err(UnlinkError::IsADirectory);
@@ -503,17 +493,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             .children
             .remove(path.components().unwrap().last().unwrap());
         // Just a sanity check
-        assert!(matches!(removed, Some(FileType::RegularFile)));
+        assert!(matches!(
+            removed,
+            Some(FileType::RegularFile | FileType::SymbolicLink)
+        ));
         let removed = root.entries.remove(&path).unwrap();
         // Just a sanity check
-        assert!(matches!(removed, Entry::File(File { .. })));
+        assert!(matches!(
+            removed,
+            Entry::File(File { .. }) | Entry::Symlink(Symlink { .. })
+        ));
         Ok(())
     }
 
     fn mkdir(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
-        let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (parent, entry) = root.parent_and_entry(&path, self.current_user, false)?;
         let Some((_parent_path, parent)) = parent else {
             // Attempted to make `/`
             return Err(MkdirError::AlreadyExists);
@@ -548,7 +544,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
-        let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (parent, entry) = root.parent_and_entry(&path, self.current_user, true)?;
         let Some((_, parent)) = parent else {
             // Attempted to remove `/`
             return Err(RmdirError::Busy);
@@ -655,7 +651,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     ) -> Result<FileStatus, FileStatusError> {
         let path = self.absolute_path(path)?;
         let root = self.root.read();
-        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (_, entry) = root.parent_and_entry(&path, self.current_user, !follow_last_symlink)?;
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
@@ -679,14 +675,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 )
             }
             Entry::Symlink(symlink) => {
-                if follow_last_symlink {
-                    let target = symlink.read().target(&path)?;
-                    // DO NOT COMMIT Loop detection
-                    return self.file_status(target, true);
-                } else {
-                    // DO NOT COMMIT
-                    todo!()
-                }
+                // Only reachable if it was asked not to follow last symlink
+                assert!(!follow_last_symlink);
+                let symlink = symlink.read();
+                (
+                    super::FileType::SymbolicLink,
+                    symlink.perms.clone(),
+                    symlink.raw_target.len(),
+                    symlink.unique_id,
+                )
             }
         };
         Ok(FileStatus {
@@ -747,7 +744,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     ) -> Result<(), super::errors::SymlinkError> {
         let link_path = self.absolute_path(link_path)?;
         let mut root = self.root.write();
-        let (parent, entry) = root.parent_and_entry(&link_path, self.current_user)?;
+        let (parent, entry) = root.parent_and_entry(&link_path, self.current_user, true)?;
         let Some((_, parent)) = parent else {
             // Attempted to make `/`
             return Err(super::errors::SymlinkError::AlreadyExists);
@@ -814,6 +811,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
         &self,
         path: &str,
         current_user: UserInfo,
+        allow_returning_symlink_entry: bool,
     ) -> ParentAndEntry<'_, Dir<Platform>, Entry<Platform>> {
         let mut previous_dangling = None;
         let mut path: String = path.into();
