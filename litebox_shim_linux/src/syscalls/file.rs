@@ -84,17 +84,15 @@ pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, 
     let file = litebox_fs()
         .open(path, flags - OFlags::CLOEXEC, mode)
         .map(|file| {
-            let file = {
-                if flags.contains(OFlags::CLOEXEC)
-                    && litebox()
-                        .descriptor_table_mut()
-                        .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
-                        .is_some()
-                {
-                    unreachable!()
-                }
-                Descriptor::File(file)
+            if flags.contains(OFlags::CLOEXEC)
+                && litebox()
+                    .descriptor_table_mut()
+                    .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
+                    .is_some()
+            {
+                unreachable!()
             }
+            Descriptor::File(file)
         })?;
     file_descriptors()
         .write()

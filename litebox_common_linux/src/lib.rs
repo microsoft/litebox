@@ -1370,6 +1370,10 @@ pub enum RlimitResource {
     /// timeout for RT tasks in us
     RTTIME = 15,
 }
+impl RlimitResource {
+    /// Maximum value for RlimitResource
+    pub const RLIM_NLIMITS: usize = RlimitResource::RTTIME as usize + 1;
+}
 
 #[repr(C)]
 pub struct RobustList<Platform: litebox::platform::RawPointerProvider> {

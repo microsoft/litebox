@@ -491,8 +491,6 @@ pub(crate) fn sys_gettid() -> i32 {
 // TODO: enforce the following limits:
 const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
 const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
-/// Number of resource limits
-pub const RLIMIT_COUNT: usize = 16;
 
 struct AtomicRlimit {
     cur: core::sync::atomic::AtomicUsize,
@@ -509,7 +507,7 @@ impl AtomicRlimit {
 }
 
 pub(crate) struct ResourceLimits {
-    limits: [AtomicRlimit; RLIMIT_COUNT],
+    limits: [AtomicRlimit; litebox_common_linux::RlimitResource::RLIM_NLIMITS],
 }
 
 impl ResourceLimits {
