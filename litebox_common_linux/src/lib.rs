@@ -1070,64 +1070,6 @@ pub unsafe fn wrfss(fs_selector: u16) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    "
-    .text
-    .align  4
-    .globl  swap_fsgs
-    .type   swap_fsgs,@function
-swap_fsgs:
-    # Read FS base into RDX
-    rdfsbase rdx
-    # Read GS base into RCX
-    rdgsbase rcx
-    # Write FS base value to GS base
-    wrgsbase rdx
-    # Write GS base value to FS base
-    wrfsbase rcx
-    ret
-"
-);
-
-#[cfg(target_arch = "x86")]
-core::arch::global_asm!(
-    "
-    .text
-    .align  4
-    .globl  swap_fsgs
-    .type   swap_fsgs,@function
-swap_fsgs:
-    # Read FS selector into AX (zero-extended to EAX)
-    mov ax, fs
-
-    # Read GS selector into CX (zero-extended to ECX)
-    mov cx, gs
-
-    # Write old FS selector value (in EAX) to GS
-    mov gs, ax
- 
-    # Write old GS selector value (in ECX) to FS
-    mov fs, cx
-
-    ret
-"
-);
-
-unsafe extern "C" {
-    /// Swaps the FS and GS segment base addresses (x86-64) or selectors (x86).
-    ///
-    /// This function exchanges the values of the FS and GS segments, which is useful
-    /// for managing thread-local storage between host and guest contexts.
-    ///
-    /// # Safety
-    ///
-    /// If wrong values are written to FS or GS, it may lead to
-    /// undefined behavior or crashes. The caller must ensure that
-    /// swapping these segments is safe in the current context.
-    pub fn swap_fsgs();
-}
-
 /// Linux's `user_desc` struct used by the `set_thread_area` syscall.
 #[repr(C, packed)]
 #[derive(Debug, Clone)]
