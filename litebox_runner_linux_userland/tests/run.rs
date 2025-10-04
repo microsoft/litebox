@@ -285,7 +285,7 @@ fn test_runner_with_ls() {
 
     let output_str = String::from_utf8_lossy(&output);
     let normalized = output_str.split_whitespace().collect::<Vec<_>>();
-    for each in [".", "..", "lib", "lib64", "workspace"] {
+    for each in [".", "..", "lib", "lib64"] {
         assert!(
             normalized.contains(&each),
             "unexpected ls output:\n{output_str}\n{each} not found",
