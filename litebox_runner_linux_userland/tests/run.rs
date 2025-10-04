@@ -233,7 +233,7 @@ fn run_which(prog: &str) -> std::path::PathBuf {
 
 #[cfg(target_arch = "x86_64")]
 #[test]
-#[ignore = "Will add this test back after supporting std::spawn"]
+#[ignore = "We need to modify seccomp backend to support std in the platform"]
 fn test_node_with_seccomp() {
     const HELLO_WORLD_JS: &str = r"
 const fs = require('node:fs');
@@ -257,7 +257,6 @@ console.log(content);
 
 #[cfg(target_arch = "x86_64")]
 #[test]
-#[ignore = "Rewriting node and its dependencies takes > 5 minutes, so ignore by default"]
 fn test_node_with_rewriter() {
     const HELLO_WORLD_JS: &str = r"
 const fs = require('node:fs');
@@ -280,28 +279,27 @@ console.log(content);
 }
 
 #[cfg(target_arch = "x86_64")]
-#[ignore = "This test uses seccomp"]
 #[test]
 fn test_runner_with_ls() {
     let ls_path = run_which("ls");
-    let output = run_target_program(Backend::Rewriter, &ls_path, &["-a"], |_| {}, "ls_seccomp");
+    let output = run_target_program(Backend::Rewriter, &ls_path, &["-a"], |_| {}, "ls_rewriter");
 
     let output_str = String::from_utf8_lossy(&output);
     let normalized = output_str.split_whitespace().collect::<Vec<_>>();
-    for each in [".", "..", "lib", "lib64", "usr"] {
+    for each in [".", "..", "lib", "lib64", "workspace"] {
         assert!(
             normalized.contains(&each),
-            "unexpected ls output:\n{output_str}",
+            "unexpected ls output:\n{output_str}\n{each} not found",
         );
     }
 
     // test `ls` subdir
     let output = run_target_program(
-        Backend::Seccomp,
+        Backend::Rewriter,
         &ls_path,
         &["-a", "/lib/x86_64-linux-gnu"],
         |_| {},
-        "ls_lib_seccomp",
+        "ls_lib_rewriter",
     );
 
     let output_str = String::from_utf8_lossy(&output);
@@ -309,7 +307,7 @@ fn test_runner_with_ls() {
     for each in [".", "..", "libc.so.6", "libpcre2-8.so.0", "libselinux.so.1"] {
         assert!(
             normalized.contains(&each),
-            "unexpected ls output:\n{output_str}",
+            "unexpected ls output:\n{output_str}\n{each} not found",
         );
     }
 }
