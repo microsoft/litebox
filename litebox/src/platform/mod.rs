@@ -99,6 +99,9 @@ pub trait ThreadProvider: RawPointerProvider + ExitProvider {
 
     /// Terminate the current thread with the given exit code.
     fn terminate_thread(&self, code: Self::ExitCode) -> !;
+
+    /// Get the next available thread ID.
+    fn next_thread_id(&self) -> i32;
 }
 
 /// Punch through any functionality for a particular platform that is not explicitly part of the
@@ -652,14 +655,14 @@ pub trait ThreadLocalStorageProvider {
     /// # Panics
     ///
     /// Panics if TLS is set already.
-    fn set_thread_local_storage(&self, value: Self::ThreadLocalStorage);
+    fn set_thread_local_storage(value: Self::ThreadLocalStorage);
 
     /// Invokes the provided callback function with the thread-local storage value for the current thread.
     ///
     /// # Panics
     ///
     /// Panics if TLS is not set yet.
-    fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
+    fn with_thread_local_storage_mut<F, R>(f: F) -> R
     where
         F: FnOnce(&mut Self::ThreadLocalStorage) -> R;
 
@@ -669,10 +672,10 @@ pub trait ThreadLocalStorageProvider {
     ///
     /// Panics if TLS is not set yet.
     /// Panics if TLS is being used by [`Self::with_thread_local_storage_mut`].
-    fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage;
+    fn release_thread_local_storage() -> Self::ThreadLocalStorage;
 
     /// Clear any guest thread-local storage state for the current thread.
     ///
     /// This is used to help emulate certain syscalls (e.g., `execve`) that clear TLS.
-    fn clear_guest_thread_local_storage(&self);
+    fn clear_guest_thread_local_storage();
 }

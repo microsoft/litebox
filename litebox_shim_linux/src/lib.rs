@@ -411,8 +411,14 @@ fn pread_with_user_buf(
 pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
     let res: Result<usize, Errno> = match request {
         SyscallRequest::Ret(errno) => Err(errno),
-        SyscallRequest::Exit { status } => syscalls::process::sys_exit(status),
-        SyscallRequest::ExitGroup { status } => syscalls::process::sys_exit_group(status),
+        SyscallRequest::Exit { status } => {
+            syscalls::process::sys_exit(status);
+            Ok(0)
+        }
+        SyscallRequest::ExitGroup { status } => {
+            syscalls::process::sys_exit_group(status);
+            Ok(0)
+        }
         SyscallRequest::Read { fd, buf, count } => {
             // Note some applications (e.g., `node`) seem to assume that getting fewer bytes than
             // requested indicates EOF.
@@ -866,7 +872,7 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
             pathname,
             argv,
             envp,
-        } => syscalls::process::sys_execve(pathname, argv, envp).map(|()| unreachable!()),
+        } => syscalls::process::sys_execve(pathname, argv, envp),
         SyscallRequest::Umask { mask } => {
             let old_mask = syscalls::file::sys_umask(mask);
             Ok(old_mask.bits() as usize)

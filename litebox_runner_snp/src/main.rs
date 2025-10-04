@@ -92,7 +92,7 @@ pub extern "C" fn sandbox_process_init(
             & !(litebox::mm::linux::PAGE_SIZE as u64 - 1),
     );
     let platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel::new(pgd);
-    platform.set_init_tls(boot_params);
+    litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel::set_init_tls(boot_params);
     litebox::log_println!(platform, "sandbox_process_init called");
 
     litebox_platform_multiplex::set_platform(platform);

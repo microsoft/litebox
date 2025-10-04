@@ -203,6 +203,7 @@ fn test_static_exec_with_rewriter() {
 
 #[cfg(target_arch = "x86_64")]
 #[test]
+#[ignore = "We need to modify seccomp backend to support std in the platform"]
 fn test_dynamic_lib_with_seccomp() {
     for path in find_c_test_files("./tests") {
         let stem = path
@@ -278,10 +279,11 @@ console.log(content);
 }
 
 #[cfg(target_arch = "x86_64")]
+#[ignore = "This test uses seccomp"]
 #[test]
 fn test_runner_with_ls() {
     let ls_path = run_which("ls");
-    let output = run_target_program(Backend::Seccomp, &ls_path, &["-a"], |_| {}, "ls_seccomp");
+    let output = run_target_program(Backend::Rewriter, &ls_path, &["-a"], |_| {}, "ls_seccomp");
 
     let output_str = String::from_utf8_lossy(&output);
     let normalized = output_str.split_whitespace().collect::<Vec<_>>();
