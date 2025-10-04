@@ -206,18 +206,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
 
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
-        let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(litebox);
-        litebox::fs::layered::FileSystem::new(
-            litebox,
-            in_mem,
-            litebox::fs::layered::FileSystem::new(
-                litebox,
-                dev_stdio,
-                tar_ro,
-                litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
-            ),
-            litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
-        )
+        litebox_shim_linux::default_fs(in_mem, tar_ro)
     };
 
     // We need to get the file path before enabling seccomp

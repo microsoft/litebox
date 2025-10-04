@@ -39,7 +39,11 @@ type LinuxFS = litebox::fs::layered::FileSystem<
     litebox::fs::in_mem::FileSystem<Platform>,
     litebox::fs::layered::FileSystem<
         Platform,
-        litebox::fs::devices::stdio::FileSystem<Platform>,
+        litebox::fs::layered::FileSystem<
+            Platform,
+            litebox::fs::devices::stdio::FileSystem<Platform>,
+            litebox::fs::devices::null::FileSystem<Platform>,
+        >,
         litebox::fs::tar_ro::FileSystem<Platform>,
     >,
 >;
@@ -84,6 +88,32 @@ pub fn set_fs(fs: LinuxFS) {
     FS.set(alloc::boxed::Box::new(fs))
         .map_err(|_| {})
         .expect("fs is already set");
+}
+
+/// Create a default layered file system with the given in-memory and tar read-only layers.
+pub fn default_fs(
+    in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+    tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
+) -> LinuxFS {
+    let litebox = crate::litebox();
+    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(litebox);
+    let dev_null = litebox::fs::devices::null::FileSystem::new(litebox);
+    litebox::fs::layered::FileSystem::new(
+        litebox,
+        in_mem_fs,
+        litebox::fs::layered::FileSystem::new(
+            litebox,
+            litebox::fs::layered::FileSystem::new(
+                litebox,
+                dev_stdio,
+                dev_null,
+                litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+            ),
+            tar_ro_fs,
+            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+        ),
+        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+    )
 }
 
 /// Get the global file system

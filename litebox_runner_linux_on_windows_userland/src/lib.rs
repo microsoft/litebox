@@ -194,18 +194,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
 
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
-        let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(litebox);
-        litebox::fs::layered::FileSystem::new(
-            litebox,
-            in_mem,
-            litebox::fs::layered::FileSystem::new(
-                litebox,
-                dev_stdio,
-                tar_ro,
-                litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
-            ),
-            litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
-        )
+        litebox_shim_linux::default_fs(in_mem, tar_ro)
     };
     litebox_shim_linux::set_fs(initial_file_system);
     platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
