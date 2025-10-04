@@ -8,7 +8,7 @@ use core::cell::Cell;
 use core::cell::RefCell;
 use core::mem::ManuallyDrop;
 use core::panic;
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicI32, AtomicU32};
 use core::sync::atomic::Ordering::SeqCst;
 use core::time::Duration;
 use std::os::raw::c_void;
@@ -33,7 +33,7 @@ use windows_sys::Win32::{
         self as Win32_Memory, PrefetchVirtualMemory, VirtualAlloc2, VirtualFree, VirtualProtect,
     },
     System::SystemInformation::{self as Win32_SysInfo, GetSystemTimeAsFileTime},
-    System::Threading::{self as Win32_Threading, CreateThread, GetCurrentProcess},
+    System::Threading::{self as Win32_Threading, GetCurrentProcess},
 };
 
 mod perf_counter;
@@ -303,7 +303,7 @@ impl litebox::platform::ExitProvider for WindowsUserland {
     const EXIT_SUCCESS: Self::ExitCode = 0;
     const EXIT_FAILURE: Self::ExitCode = 1;
 
-    fn exit(&self, code: Self::ExitCode) -> ! {
+    fn exit(&self, _code: Self::ExitCode) -> ! {
         todo!("this function is not needed")
     }
 }
@@ -314,7 +314,6 @@ core::arch::global_asm!(
     .text
     .align  4
     .globl  thread_start_asm
-    .type   thread_start_asm,@function
 thread_start_asm:
     /* The following layout should match PtRegs */
     sub rsp, 16
@@ -441,7 +440,7 @@ pub unsafe extern "C" fn thread_start_internal(
     stack_pointer: usize,
     frame_pointer: usize,
 ) {
-    LinuxUserland::with_thread_local_storage_mut(|tls| {
+    WindowsUserland::with_thread_local_storage_mut(|tls| {
         tls.current_task.stored_sp = stack_pointer;
         tls.current_task.stored_bp = frame_pointer;
     });
@@ -514,7 +513,7 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         Ok(0)
     }
 
-    fn terminate_thread(&self, code: Self::ExitCode) -> ! {
+    fn terminate_thread(&self, _code: Self::ExitCode) -> ! {
         todo!("this function is not needed")
     }
 
@@ -1236,7 +1235,7 @@ syscall_callback:
 
     mov rcx, rsp
     call swap_sp
-    mov rsp, rdx
+    mov rsp, rax
 
     /* Pass the syscall number to the syscall dispatcher */
     mov rcx, r15
