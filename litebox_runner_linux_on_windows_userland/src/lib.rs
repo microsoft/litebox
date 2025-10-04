@@ -255,9 +255,32 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let comm = prog_unix_path.rsplit('/').next().unwrap_or("unknown");
     litebox_shim_linux::syscalls::process::set_task_comm(comm.as_bytes());
 
-    unsafe {
-        trampoline::jump_to_entry_point(loaded_program.entry_point, loaded_program.user_stack_top)
-    }
+    #[cfg(target_arch = "x86_64")]
+    let pt_regs = litebox_common_linux::PtRegs {
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        rbp: 0,
+        rbx: 0,
+        r11: loaded_program.user_stack_top,
+        r10: loaded_program.entry_point,
+        r9: 0,
+        r8: 0,
+        rax: 0,
+        rcx: 0,
+        rdx: 0,
+        rsi: 0,
+        rdi: 0,
+        orig_rax: 0,
+        rip: 0,
+        cs: 0x33, // __USER_CS
+        eflags: 0,
+        rsp: 0,
+        ss: 0x2b, // __USER_DS
+    };
+
+    unsafe { litebox_platform_windows_userland::thread_start_asm(&pt_regs) };
 }
 
 mod trampoline {
