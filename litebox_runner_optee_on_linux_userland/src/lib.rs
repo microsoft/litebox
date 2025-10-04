@@ -101,8 +101,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     // Currently, this runner supports a single TA session. Also, for simplicity,
     // it uses `tid` stored in LiteBox's TLS as a session ID.
-    let tid = litebox_platform_multiplex::platform()
-        .with_thread_local_storage_mut(|tls| tls.current_task.tid);
+    let tid = litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
+        tls.current_task.tid
+    });
     #[allow(clippy::cast_sign_loss)]
     let session_id = tid as u32;
 

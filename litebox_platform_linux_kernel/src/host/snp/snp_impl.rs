@@ -92,7 +92,7 @@ fn current() -> Option<&'static mut bindings::vsbox_task> {
 }
 
 impl SnpLinuxKernel {
-    pub fn set_init_tls(&self, boot_params: &bindings::vmpl2_boot_params) {
+    pub fn set_init_tls(boot_params: &bindings::vmpl2_boot_params) {
         let task = ::alloc::boxed::Box::new(litebox_common_linux::Task {
             pid: boot_params.pid,
             tid: boot_params.pid,
@@ -106,23 +106,26 @@ impl SnpLinuxKernel {
                 egid: boot_params.egid as usize,
             }),
             comm: [0; litebox_common_linux::TASK_COMM_LEN],
+            stored_sp: 0,
+            stored_bp: 0,
+            to_terminate: 0,
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
-        self.set_thread_local_storage(tls);
+        Self::set_thread_local_storage(tls);
     }
 }
 
 impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
     type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<SnpLinuxKernel>;
 
-    fn set_thread_local_storage(&self, value: Self::ThreadLocalStorage) {
+    fn set_thread_local_storage(value: Self::ThreadLocalStorage) {
         let current_task = current().expect("Current task must be available");
         assert!(current_task.tls.is_null(), "TLS should not be set yet");
         let tls = ::alloc::boxed::Box::new(RefCell::new(value));
         current_task.tls = ::alloc::boxed::Box::into_raw(tls).cast();
     }
 
-    fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
+    fn with_thread_local_storage_mut<F, R>(f: F) -> R
     where
         F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
     {
@@ -132,7 +135,7 @@ impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
         f(&mut tls.borrow_mut())
     }
 
-    fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
+    fn release_thread_local_storage() -> Self::ThreadLocalStorage {
         let current_task = current().expect("Current task must be available");
         assert!(!current_task.tls.is_null(), "TLS should be set");
 
@@ -143,7 +146,7 @@ impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
         unsafe { Box::from_raw(tls) }.into_inner()
     }
 
-    fn clear_guest_thread_local_storage(&self) {
+    fn clear_guest_thread_local_storage() {
         todo!()
     }
 }
@@ -186,7 +189,7 @@ extern "C" fn thread_start(
 
     // Set up thread-local storage for the new thread. This is done by
     // calling the actual thread callback with the unpacked arguments
-    (thread_start_args.thread_args.callback)(*(thread_start_args.thread_args));
+    (thread_start_args.thread_args.callback)(&thread_start_args.thread_args);
 
     // Restore the context
     unsafe {
@@ -261,6 +264,10 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
             args: [u64::from(code.reinterpret_as_unsigned())],
         });
         unreachable!("Should not return to the caller after terminating the thread");
+    }
+
+    fn next_thread_id(&self) -> i32 {
+        todo!()
     }
 }
 

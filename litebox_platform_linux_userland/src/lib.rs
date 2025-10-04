@@ -7,8 +7,8 @@
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
-use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::{AtomicI32, AtomicU32};
 use std::time::Duration;
 
 use litebox::fs::OFlags;
@@ -17,7 +17,7 @@ use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer, ThreadLocalStorageProvider};
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
-use litebox_common_linux::{CloneFlags, MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
+use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall, swap_fsgs};
 
 mod syscall_intercept;
 
@@ -52,6 +52,8 @@ pub struct LinuxUserland {
     reserved_pages: Vec<core::ops::Range<usize>>,
     /// The base address of the VDSO.
     vdso_address: Option<usize>,
+    /// Thread Id counter
+    thread_id_counter: std::sync::atomic::AtomicI32,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -173,8 +175,9 @@ impl LinuxUserland {
             seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages,
             vdso_address,
+            thread_id_counter: AtomicI32::new(2), // next thread id
         };
-        platform.set_init_tls();
+        Self::set_init_tls();
         Box::leak(Box::new(platform))
     }
 
@@ -284,7 +287,7 @@ impl LinuxUserland {
         }
     }
 
-    fn set_init_tls(&self) {
+    fn set_init_tls() {
         let tid =
             unsafe { syscalls::syscall!(syscalls::Sysno::gettid) }.expect("Failed to get TID");
         let tid: i32 = i32::try_from(tid).expect("tid should fit in i32");
@@ -299,9 +302,12 @@ impl LinuxUserland {
             robust_list: None,
             credentials: alloc::sync::Arc::new(Self::get_user_info()),
             comm: [0; litebox_common_linux::TASK_COMM_LEN],
+            stored_sp: 0,
+            stored_bp: 0,
+            to_terminate: 0,
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
-        self.set_thread_local_storage(tls);
+        Self::set_thread_local_storage(tls);
     }
 }
 
@@ -312,54 +318,196 @@ impl litebox::platform::ExitProvider for LinuxUserland {
     const EXIT_SUCCESS: Self::ExitCode = 0;
     const EXIT_FAILURE: Self::ExitCode = 1;
 
-    fn exit(&self, code: Self::ExitCode) -> ! {
-        let Self {
-            tun_socket_fd,
-            #[cfg(feature = "systrap_backend")]
-                seccomp_interception_enabled: _,
-            reserved_pages: _,
-            vdso_address: _,
-        } = self;
-        // We don't need to explicitly drop this, but doing so clarifies our intent that we want to
-        // close it out :). The type itself is re-specified here to make sure we look at this
-        // particular function in case we decide to change up the types within `LinuxUserland`.
-        drop::<Option<std::os::fd::OwnedFd>>(tun_socket_fd.write().unwrap().take());
-        // And then we actually exit
-        unsafe {
-            syscalls::syscall2(
-                syscalls::Sysno::exit_group,
-                (code as isize).reinterpret_as_unsigned(),
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
-            )
-        }
-        .expect("Failed to exit group");
-
-        unreachable!("exit_group should not return");
+    fn exit(&self, _code: Self::ExitCode) -> ! {
+        todo!("this function is not needed")
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    "
+    .text
+    .align  4
+    .globl  thread_start_asm
+    .type   thread_start_asm,@function
+thread_start_asm:
+    /* The following layout should match PtRegs */
+    sub rsp, 16
+    pushfq
+    sub rsp, 24
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push rax
+    push r8
+    push r9
+    push r10
+    push r11
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov rbp, rsp
+    and rsp, -16
+
+    lea rsi, [rsp] /* include the ret address */
+    mov rdx, rbp
+    call thread_start_internal
+
+    /* The following code should never be executed,
+       because the second half of this function
+       is actually executed in syscall_callback
+       when a thread terminates. If we reach here,
+       it indicates an unexpected return from thread_start_internal.
+       Trigger an interrupt to generate a signal (SIGTRAP). */
+    int3
+"
+);
+
+#[cfg(target_arch = "x86")]
+core::arch::global_asm!(
+    "
+    .text
+    .align  4
+    .globl  thread_start_asm
+    .type   thread_start_asm,@function
+thread_start_asm:
+    mov  eax, [esp + 4] /* retrieve the ctx argument */
+    /* Standard function prologue - establish frame pointer first */
+    sub esp, 8
+    pushfd
+    sub esp, 32
+    push    ebp
+    push    edi
+    push    esi
+    push    edx
+    push    ecx
+    push    ebx
+
+    mov ebp, esp
+    and esp, -16
+    sub esp, 4
+
+    push ebp      /* frame_pointer */
+    push esp      /* stack_pointer */
+    push eax      /* ctx */
+    call thread_start_internal
+
+    /* Should never reach here - trigger interrupt if we do */
+    int3
+"
+);
+
+unsafe extern "C" {
+    /// Assembly function that captures execution context and initiates guest thread startup.
+    ///
+    /// This function is the entry point for starting a guest thread. It performs the following:
+    ///
+    /// 1. Saves all general-purpose registers, flags, and other CPU state onto the stack
+    ///    in a layout that matches the `PtRegs` structure.
+    /// 2. Captures the current stack pointer (RSP/ESP) and frame pointer (RBP/EBP).
+    /// 3. Calls `thread_start_internal` with:
+    ///    - `ctx`: A reference to the provided `PtRegs` structure (passed in RDI/stack)
+    ///    - `stack_pointer`: The captured stack pointer value
+    ///    - `frame_pointer`: The captured frame pointer value
+    /// 4. After `thread_start_internal` returns, restores all saved registers and returns
+    ///    to the caller.
+    ///
+    /// ## Stack Layout Coordination with `syscall_callback`
+    ///
+    /// This function's stack layout is carefully designed to match the stack layout used by
+    /// `syscall_callback`. This coordination enables a critical optimization for thread termination:
+    ///
+    /// * When `syscall_callback` handles a syscall, it switches from the guest's stack to the
+    ///   platform's stack (RSP/RBP), which are the values captured and stored by this function.
+    /// * When a thread terminates (via exit syscall), instead of switching back to the guest's
+    ///   stack and frame pointer, the termination path simply pops the registers from the stack
+    ///   that was set up by `thread_start_asm`.
+    /// * This creates a "stitched" stack layout where the `syscall_callback` register restoration
+    ///   directly unwinds to the frame created by `thread_start_asm`, allowing a clean return
+    ///   to the caller of `thread_start_asm` without explicitly managing the guest stack.
+    ///
+    /// In essence, the platform stack frame created here serves as both the initial context
+    /// for the guest thread and the final unwinding point when the thread terminates.
+    ///
+    /// # Parameters
+    ///
+    /// * `ctx` - A reference to a `PtRegs` structure containing the initial register state
+    ///   for the guest thread. On x86-64, this is passed in RDI. On x86, it's passed on the stack.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because:
+    /// * It must be called with a valid `PtRegs` reference.
+    /// * It modifies the stack extensively to save/restore register state.
+    /// * It assumes the stack has sufficient space for the register save area.
+    /// * Thread-local storage must be properly initialized before calling this function.
+    /// * The stack layout must remain compatible with `syscall_callback` for proper thread termination.
+    pub fn thread_start_asm(ctx: &litebox_common_linux::PtRegs);
+}
+
+/// Internal function called from assembly to initialize a new guest thread.
+///
+/// This function is called from the `thread_start_asm` assembly routine after it has
+/// captured the current execution context (registers) and stack/frame pointers. It stores
+/// the captured stack and frame pointers into thread-local storage and then starts the
+/// guest thread execution.
+///
+/// # Parameters
+///
+/// * `ctx` - A reference to the captured processor register state (`PtRegs`) containing
+///   all general-purpose registers, flags, and other CPU state at the point of entry.
+/// * `stack_pointer` - The stack pointer (RSP/ESP) value at the time of entry, which
+///   represents the current position in the native stack.
+/// * `frame_pointer` - The frame pointer (RBP/EBP) value at the time of entry, used
+///   for stack frame traversal and debugging.
+///
+/// # Safety
+///
+/// This function is marked `unsafe` because:
+///
+/// * It must be called from assembly code with a valid C calling convention.
+/// * The `ctx` reference must point to a valid `PtRegs` structure that has been properly
+///   initialized by the assembly caller (`thread_start_asm`).
+/// * The `stack_pointer` and `frame_pointer` must be valid addresses within the current
+///   thread's stack space.
+/// * It accesses thread-local storage which must have been properly initialized for the
+///   calling thread.
+/// * It may modify thread-local state that affects subsequent execution.
+/// * The function must only be called in the context where the thread is ready to start
+///   guest execution.
+///
+/// # Panics
+///
+/// May panic if thread-local storage has not been properly initialized for the calling thread.
 #[unsafe(no_mangle)]
-extern "C" fn thread_start(
-    pt_regs: *mut litebox_common_linux::PtRegs,
-    thread_args: *mut litebox_common_linux::NewThreadArgs<LinuxUserland>,
-) -> ! {
-    let pt_regs = unsafe { alloc::boxed::Box::from_raw(pt_regs) };
-    // copy pt_regs from heap to stack
-    let copied = *pt_regs;
-    drop(pt_regs);
+pub unsafe extern "C" fn thread_start_internal(
+    ctx: &litebox_common_linux::PtRegs,
+    stack_pointer: usize,
+    frame_pointer: usize,
+) {
+    LinuxUserland::with_thread_local_storage_mut(|tls| {
+        tls.current_task.stored_sp = stack_pointer;
+        tls.current_task.stored_bp = frame_pointer;
+    });
 
-    // Allow caller to run some code before we return to the new thread.
-    let thread_args = unsafe { alloc::boxed::Box::from_raw(thread_args) };
-    (thread_args.callback)(*thread_args);
-
-    litebox_common_linux::swap_fsgs();
+    unsafe { swap_fsgs() };
 
     #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::asm!(
+            "mov rsp, rax",
             "xor rax, rax",
-            "mov rsp, {0}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop rbp",
+            "pop rbx",
             "pop r11",
             "pop r10",
             "pop r9",
@@ -369,21 +517,20 @@ extern "C" fn thread_start(
             "pop rdx",
             "pop rsi",
             "pop rdi",
-            "add rsp, 24",  // skip orig_rax, rip, cs, eflags
+            "add rsp, 24",  // orig_rax, rip, cs
             "popfq",
-            "pop rsp",      // restore the stack pointer (which points to the entry point of the thread)
-            "ret",
-            in(reg) &raw const copied.r11, // restore registers, starting from r11
-            out("rax") _,
-            options(nostack, preserves_flags)
+            "mov rsp, r11", // set rsp to the stack_top of the guest
+            "jmp rcx", // jump to the entry point of the thread
+            in("rax") ctx,
+            options(noreturn)
         );
     }
 
     #[cfg(target_arch = "x86")]
     unsafe {
         core::arch::asm!(
+            "mov esp, eax",
             "xor eax, eax",
-            "mov esp, {0}",
             "pop ebx",
             "pop ecx",
             "pop edx",
@@ -392,15 +539,22 @@ extern "C" fn thread_start(
             "pop ebp",
             "add esp, 32", // skip eax, xds, xes, xfs, xgs, orig_eax, eip, xcs,
             "popfd",
-            "pop esp", // restore the stack pointer (which points to the entry point of the thread
-            "ret",
-            in(reg) &raw const copied,
-            out("eax") _,
-            options(nostack, preserves_flags)
+            "mov esp, ecx", // set esp to the stack_top of the guest
+            "jmp ebx", // jump to the entry point of the thread
+            in("eax") ctx,
+            options(noreturn)
         );
     }
+}
 
-    unreachable!();
+fn thread_start(
+    thread_args: &litebox_common_linux::NewThreadArgs<LinuxUserland>,
+    ctx: litebox_common_linux::PtRegs,
+) {
+    // Allow caller to run some code before we return to the new thread.
+    (thread_args.callback)(thread_args);
+
+    unsafe { thread_start_asm(&ctx) };
 }
 
 impl litebox::platform::ThreadProvider for LinuxUserland {
@@ -409,141 +563,41 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
     type ThreadId = usize;
 
-    #[expect(clippy::too_many_lines)]
     unsafe fn spawn_thread(
         &self,
         ctx: &litebox_common_linux::PtRegs,
         stack: TransparentMutPtr<u8>,
         stack_size: usize,
         entry_point: usize,
-        mut thread_args: Box<Self::ThreadArgs>,
+        thread_args: Box<Self::ThreadArgs>,
     ) -> Result<usize, Self::ThreadSpawnError> {
-        let child_tid_ptr = core::ptr::from_mut(thread_args.task.as_mut()) as u64
-            + core::mem::offset_of!(litebox_common_linux::Task<LinuxUserland>, tid) as u64;
-        // new process/thread may have a different stack and thus does not have access to
-        // the pt_regs (on the original stack), so we need to copy it to heap.
-        let new_pt_regs = Box::into_raw(Box::new(*ctx));
-        let thread_args = Box::into_raw(thread_args);
-        let flags = CloneFlags::THREAD
-            | CloneFlags::VM
-            | CloneFlags::FS
-            | CloneFlags::FILES
-            | CloneFlags::SIGHAND
-            | CloneFlags::SYSVSEM
-            | CloneFlags::CHILD_SETTID;
+        let mut ctx_copy = *ctx;
 
-        let stack = stack.as_usize();
-        let (stack, stack_size) = if stack_size > 0 || stack == 0 {
-            (stack as u64, stack_size as u64)
-        } else {
-            // clone3 requires a non-zero stack size, but we don't know what it
-            // is. Specify an 8-byte stack--the kernel should only really care
-            // about the stack size on platforms that require it (IA64) or when
-            // shadow stacks are enabled.
-            (stack.wrapping_sub(8) as u64, 8)
-        };
-
-        let clone_args = litebox_common_linux::CloneArgs {
-            flags,
-            pidfd: 0,
-            child_tid: child_tid_ptr,
-            parent_tid: 0,
-            exit_signal: 0,
-            stack,
-            stack_size,
-            tls: 0,
-            set_tid: 0,
-            set_tid_size: 0,
-            cgroup: 0,
-        };
-        let mut ret: usize;
         #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                "cmp rax, 0",
-                "jne 2f",
-                "push {0}",     // push the return address
-                "mov [{1} + {rsp_offset}], rsp", // save the current stack pointer to pt_regs.rsp
-                "and rsp, -16", // align stack to 16 bytes
-                "sub rsp, 8",   // offset by 8...
-                "mov rdi, {1}",
-                "mov rsi, {2}",
-                "jmp thread_start",
-                // should never return
-                "hlt",
-                "2:",
-                in(reg) entry_point,
-                in(reg) new_pt_regs,
-                in(reg) thread_args,
-                rsp_offset = const core::mem::offset_of!(litebox_common_linux::PtRegs, rsp),
-                inlateout("rax") syscalls::Sysno::clone3 as usize => ret,
-                in("rdi") &raw const clone_args,
-                in("rsi") size_of::<litebox_common_linux::CloneArgs>(),
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                in("rdx") syscall_intercept::SYSCALL_ARG_MAGIC,
-                out("rcx") _, // rcx is used to store old rip
-                out("r11") _, // r11 is used to store old rflags
-                options(nostack, preserves_flags)
-            );
+        {
+            ctx_copy.rcx = entry_point;
+            ctx_copy.r11 = stack.as_usize() + stack_size;
         }
+
         #[cfg(target_arch = "x86")]
-        unsafe {
-            core::arch::asm!(
-                "int 0x80",
-                "cmp eax, 0",
-                "jne 2f",
-                "push {0}", // save the return address
-                "mov ebx, {1}",
-                "mov [ebx + {esp_offset}], esp", // save the current stack pointer to pt_regs.esp
-                "push {2}",
-                "push ebx",
-                "call thread_start",
-                // should never return
-                "hlt",
-                "2:",
-                in(reg) entry_point,
-                in(reg) new_pt_regs,
-                in(reg) thread_args,
-                esp_offset = const core::mem::offset_of!(litebox_common_linux::PtRegs, esp),
-                inlateout("eax") syscalls::Sysno::clone3 as usize => ret,
-                in("ebx") &raw const clone_args,
-                in("ecx") size_of::<litebox_common_linux::CloneArgs>(),
-                options(nostack, preserves_flags)
-            );
+        {
+            ctx_copy.ebx = entry_point;
+            ctx_copy.ecx = stack.as_usize() + stack_size;
         }
-        if ret > (-4096isize).reinterpret_as_unsigned() {
-            drop(unsafe { alloc::boxed::Box::from_raw(new_pt_regs) });
-            drop(unsafe { alloc::boxed::Box::from_raw(thread_args) });
-            let errno: i32 = ret.reinterpret_as_signed().truncate();
-            let err = syscalls::Errno::new(-errno);
-            return Err(match err {
-                syscalls::Errno::EACCES => litebox_common_linux::errno::Errno::EACCES,
-                syscalls::Errno::EAGAIN => litebox_common_linux::errno::Errno::EAGAIN,
-                syscalls::Errno::EBUSY => litebox_common_linux::errno::Errno::EBUSY,
-                syscalls::Errno::EEXIST => litebox_common_linux::errno::Errno::EEXIST,
-                syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
-                syscalls::Errno::ENOMEM => litebox_common_linux::errno::Errno::ENOMEM,
-                syscalls::Errno::ENOSPC => litebox_common_linux::errno::Errno::ENOSPC,
-                syscalls::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
-                _ => panic!("unexpected error {err}"),
-            });
-        }
-        Ok(ret)
+
+        // TODO: do we need to wait for the handle in the main thread?
+        let _handle = std::thread::spawn(move || thread_start(&thread_args, ctx_copy));
+
+        Ok(0)
     }
 
-    fn terminate_thread(&self, code: Self::ExitCode) -> ! {
-        unsafe {
-            syscalls::syscall2(
-                syscalls::Sysno::exit,
-                (code as isize).reinterpret_as_unsigned(),
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
-            )
-        }
-        .expect("Failed to exit");
+    fn terminate_thread(&self, _code: Self::ExitCode) -> ! {
+        todo!("this function is not needed")
+    }
 
-        unreachable!("exit should not return");
+    fn next_thread_id(&self) -> i32 {
+        self.thread_id_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -925,10 +979,10 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
             // Since the kernel will update gs, we swap fs and gs before/after calling set_thread_area.
             #[cfg(target_arch = "x86")]
             PunchthroughSyscall::SetThreadArea { user_desc } => {
-                litebox_common_linux::swap_fsgs();
+                unsafe { swap_fsgs() };
                 let ret = set_thread_area(user_desc)
                     .map_err(litebox::platform::PunchthroughError::Failure);
-                litebox_common_linux::swap_fsgs();
+                unsafe { swap_fsgs() };
                 ret
             }
             PunchthroughSyscall::Alarm { seconds } => unsafe {
@@ -1322,6 +1376,29 @@ impl litebox::mm::allocator::MemoryProvider for LinuxUserland {
     }
 }
 
+#[unsafe(no_mangle)]
+unsafe extern "C" fn swap_sp(sp_to_swap: usize) -> usize {
+    LinuxUserland::with_thread_local_storage_mut(|tls| {
+        let sp = tls.current_task.stored_sp;
+        tls.current_task.stored_sp = sp_to_swap;
+        sp
+    })
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn swap_bp(bp_to_swap: usize) -> usize {
+    LinuxUserland::with_thread_local_storage_mut(|tls| {
+        let bp = tls.current_task.stored_bp;
+        tls.current_task.stored_bp = bp_to_swap;
+        bp
+    })
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn to_terminate_thread() -> usize {
+    LinuxUserland::with_thread_local_storage_mut(|tls| tls.current_task.to_terminate)
+}
+
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     "
@@ -1356,7 +1433,8 @@ syscall_callback:
     push    r12         /* pt_regs->r12 */
     push    r13         /* pt_regs->r13 */
 
-    sub rsp, 16         /* skip r14-r15 */
+    push    r14         /* pt_regs->r14 */
+    push    r15         /* pt_regs->r15 */
 
     /* Save the original stack pointer */
     mov  rbp, rsp
@@ -1364,19 +1442,55 @@ syscall_callback:
     /* Align the stack to 16 bytes */
     and rsp, -16
 
-    /* Pass the syscall number to the syscall dispatcher */
-    mov rdi, rax
-    /* Pass pt_regs saved on stack to syscall_dispatcher */
-    mov rsi, rbp
+    /* Save the syscall number */
+    mov r14, rbp
+    mov r15, rax
+
+    /* Swap fs and gs */
+    call swap_fsgs
+
+    /* Retrieve platform rsp and rbp switch to them */
+    mov rdi, rbp
+    call swap_bp
+    mov rbp, rax
+
+    mov rdi, rsp
+    call swap_sp
+    mov rsp, rdx
+
+    /* Pass syscall number and pt_regs (saved on the guest stack) */
+    mov rdi, r15
+    mov rsi, r14
 
     /* Call syscall_handler */
     call syscall_handler
+    mov rbx, rax
 
-    /* Restore the original stack pointer */
-    mov  rsp, rbp
-    add  rsp, 32         /* skip r12-r15 */
+    /* Check if to terminate the thread */
+    call to_terminate_thread
+    test rax, rax
+    jnz .Lcontinue_execution
+
+    mov rdi, rsp
+    call swap_sp
+    mov rsp, rax
+
+    mov rdi, rbp
+    call swap_bp
+    mov rbp, rax
+
+    /* Swap fs and gs */
+    call swap_fsgs
+
+.Lcontinue_execution:
+    mov rsp, rbp
+    mov rax, rbx
 
     /* Restore caller-saved registers */
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
     pop  rbp
     pop  rbx
     pop  r11
@@ -1450,13 +1564,52 @@ syscall_callback:
     /* esp is now 16-byte aligned, adjust by 8 so that it is still
     16-byte aligned before the call instruction */
     sub esp, 8
-    /* Pass the sysno and pointer to pt_regs to syscall_handler */
+
+    /* Save sysno and pt_regs address */
+    mov esi, ebp
+    mov edi, eax
+
+    /* Swap fs/gs/bp/sp */
+    call swap_fsgs
+
     push ebp
-    push eax
+    call swap_bp
+    add esp, 4
+    mov ebp, eax
+
+    push esp
+    call swap_sp
+    add esp, 4
+    mov esp, eax
+
+    /* Pass the sysno and pointer to pt_regs to syscall_handler */
+    push esi
+    push edi
 
     call syscall_handler
+    mov ebx, eax
+    add esp, 8
 
+    call to_terminate_thread
+    test eax, eax
+    jnz .Lcontinue_execution
+
+    push esp
+    call swap_sp
+    add esp, 4
+    mov esp, eax
+
+    push ebp
+    call swap_bp
+    add esp, 4
+    mov ebp, eax
+
+    call swap_fsgs
+
+.Lcontinue_execution:
     mov esp, ebp
+    mov eax, ebx
+
     pop ebx
     pop ecx
     pop edx
@@ -1494,10 +1647,9 @@ unsafe extern "C" fn syscall_handler(
     syscall_number: usize,
     ctx: *mut litebox_common_linux::PtRegs,
 ) -> SyscallReturnType {
-    litebox_common_linux::swap_fsgs();
     // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
     let ctx = unsafe { &mut *ctx };
-    let ret = match SyscallRequest::try_from_raw(syscall_number, ctx) {
+    match SyscallRequest::try_from_raw(syscall_number, ctx) {
         Ok(d) => {
             let syscall_handler: SyscallHandler = SYSCALL_HANDLER
                 .read()
@@ -1506,9 +1658,7 @@ unsafe extern "C" fn syscall_handler(
             syscall_handler(d)
         }
         Err(err) => err.as_neg() as SyscallReturnType,
-    };
-    litebox_common_linux::swap_fsgs();
-    ret
+    }
 }
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
@@ -1531,14 +1681,14 @@ thread_local! {
 impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<LinuxUserland>;
 
-    fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
+    fn set_thread_local_storage(tls: Self::ThreadLocalStorage) {
         PLATFORM_TLS.with_borrow_mut(|cell| {
             assert!(cell.is_none(), "TLS is already set for this thread");
             *cell = Some(ManuallyDrop::new(tls));
         });
     }
 
-    fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
+    fn release_thread_local_storage() -> Self::ThreadLocalStorage {
         ManuallyDrop::into_inner(
             PLATFORM_TLS
                 .take()
@@ -1546,7 +1696,7 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
         )
     }
 
-    fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
+    fn with_thread_local_storage_mut<F, R>(f: F) -> R
     where
         F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
     {
@@ -1557,16 +1707,16 @@ impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn clear_guest_thread_local_storage(&self) {
+    fn clear_guest_thread_local_storage() {
         unsafe { litebox_common_linux::wrgsbase(0) };
     }
 
     #[cfg(target_arch = "x86")]
-    fn clear_guest_thread_local_storage(&self) {
+    fn clear_guest_thread_local_storage() {
         let fs_selector = litebox_common_linux::rdfss();
         if fs_selector != 0 {
             clear_thread_area(u32::from(fs_selector) >> 3);
-            litebox_common_linux::wrfss(0);
+            unsafe { litebox_common_linux::wrfss(0) };
         }
     }
 }
@@ -1618,12 +1768,12 @@ mod tests {
 
     #[test]
     fn test_tls() {
-        let platform = LinuxUserland::new(None);
-        let tid = platform.with_thread_local_storage_mut(|tls| {
+        let _platform = LinuxUserland::new(None);
+        let tid = LinuxUserland::with_thread_local_storage_mut(|tls| {
             tls.current_task.tid = 0x1234; // Change the task ID
             tls.current_task.tid
         });
-        let tls = platform.release_thread_local_storage();
+        let tls = LinuxUserland::release_thread_local_storage();
         assert_eq!(
             tls.current_task.tid, tid,
             "TLS should have the correct task ID"

@@ -49,7 +49,7 @@ impl FreeBSDUserland {
             reserved_pages: Self::read_proc_self_maps(),
         };
 
-        platform.set_init_tls();
+        Self::set_init_tls();
         Box::leak(Box::new(platform))
     }
 
@@ -182,7 +182,7 @@ impl FreeBSDUserland {
         }
     }
 
-    fn set_init_tls(&self) {
+    fn set_init_tls() {
         let mut tid: isize = 0;
         unsafe {
             syscalls::syscall1(syscalls::Sysno::ThrSelf, &mut tid as *mut isize as usize)
@@ -204,7 +204,7 @@ impl FreeBSDUserland {
         });
 
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
-        self.set_thread_local_storage(tls);
+        Self::set_thread_local_storage(tls);
     }
 }
 
@@ -368,6 +368,10 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
         }
         // This should never be reached as thr_exit does not return
         unreachable!("thr_exit should not return")
+    }
+
+    fn next_available_thread_id(&self) -> i32 {
+        todo!()
     }
 }
 
@@ -988,14 +992,14 @@ impl FreeBSDUserland {
 impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
     type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<FreeBSDUserland>;
 
-    fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
+    fn set_thread_local_storage(tls: Self::ThreadLocalStorage) {
         let old_gs_base = unsafe { litebox_common_linux::rdgsbase() };
         assert!(old_gs_base == 0, "TLS already set for this thread");
         let tls = Box::new(RefCell::new(tls));
         unsafe { litebox_common_linux::wrgsbase(Box::into_raw(tls) as usize) };
     }
 
-    fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
+    fn release_thread_local_storage() -> Self::ThreadLocalStorage {
         let tls = Self::get_thread_local_storage();
         assert!(!tls.is_null(), "TLS must be set before releasing it");
         unsafe {
@@ -1007,7 +1011,7 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
         unsafe { Box::from_raw(tls.cast_mut()) }.into_inner()
     }
 
-    fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
+    fn with_thread_local_storage_mut<F, R>(f: F) -> R
     where
         F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
     {
@@ -1017,7 +1021,7 @@ impl litebox::platform::ThreadLocalStorageProvider for FreeBSDUserland {
         f(&mut tls.borrow_mut())
     }
 
-    fn clear_guest_thread_local_storage(&self) {
+    fn clear_guest_thread_local_storage() {
         todo!()
     }
 }
@@ -1074,14 +1078,14 @@ mod tests {
         assert!(!tls.is_null(), "TLS should not be null");
         let tid = unsafe { (*tls).borrow().current_task.tid };
 
-        platform.with_thread_local_storage_mut(|tls| {
+        FreeBSDUserland::with_thread_local_storage_mut(|tls| {
             assert_eq!(
                 tls.current_task.tid, tid,
                 "TLS should have the correct task ID"
             );
             tls.current_task.tid = 0x1234; // Change the task ID
         });
-        let tls = platform.release_thread_local_storage();
+        let tls = FreeBSDUserland::release_thread_local_storage();
         assert_eq!(
             tls.current_task.tid, 0x1234,
             "TLS should have the correct task ID"

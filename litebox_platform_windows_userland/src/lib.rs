@@ -184,7 +184,7 @@ impl WindowsUserland {
             reserved_pages,
             sys_info: std::sync::RwLock::new(sys_info),
         };
-        platform.set_init_tls();
+        Self::set_init_tls();
 
         // Initialize it's own fs-base (for the main thread)
         WindowsUserland::init_thread_fs_base();
@@ -266,7 +266,7 @@ impl WindowsUserland {
         x.is_multiple_of(gran)
     }
 
-    fn set_init_tls(&self) {
+    fn set_init_tls() {
         // TODO: Currently we are using a static thread ID and credentials (faked).
         // This is a placeholder for future implementation to use passthrough.
         let creds = litebox_common_linux::Credentials {
@@ -284,9 +284,12 @@ impl WindowsUserland {
             robust_list: None,
             credentials: alloc::sync::Arc::new(creds),
             comm: [0; litebox_common_linux::TASK_COMM_LEN],
+            stored_sp: 0,
+            stored_bp: 0,
+            to_terminate: 0,
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
-        self.set_thread_local_storage(tls);
+        Self::set_thread_local_storage(tls);
     }
 }
 
@@ -318,7 +321,7 @@ unsafe extern "system" fn thread_start(param: *mut c_void) -> u32 {
 
     // Set up thread-local storage for the new thread. This is done by
     // calling the actual thread callback with the unpacked arguments
-    (thread_start_args.thread_args.callback)(*(thread_start_args.thread_args));
+    (thread_start_args.thread_args.callback)(&thread_start_args.thread_args);
 
     // Restore the context
     unsafe {
@@ -406,6 +409,10 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
 
     fn terminate_thread(&self, code: Self::ExitCode) -> ! {
         unsafe { Win32_Threading::ExitThread(code) }
+    }
+
+    fn next_thread_id(&self) -> i32 {
+        todo!()
     }
 }
 
@@ -1177,14 +1184,14 @@ thread_local! {
 impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
     type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<WindowsUserland>;
 
-    fn set_thread_local_storage(&self, tls: Self::ThreadLocalStorage) {
+    fn set_thread_local_storage(tls: Self::ThreadLocalStorage) {
         PLATFORM_TLS.with_borrow_mut(|cell| {
             assert!(cell.is_none(), "TLS is already set for this thread");
             *cell = Some(ManuallyDrop::new(tls));
         });
     }
 
-    fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage {
+    fn release_thread_local_storage() -> Self::ThreadLocalStorage {
         ManuallyDrop::into_inner(
             PLATFORM_TLS
                 .take()
@@ -1192,7 +1199,7 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
         )
     }
 
-    fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
+    fn with_thread_local_storage_mut<F, R>(f: F) -> R
     where
         F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
     {
@@ -1202,7 +1209,7 @@ impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
         })
     }
 
-    fn clear_guest_thread_local_storage(&self) {
+    fn clear_guest_thread_local_storage() {
         todo!()
     }
 }
@@ -1258,14 +1265,14 @@ mod tests {
         let tid = super::PLATFORM_TLS
             .with_borrow(|cell| cell.as_ref().expect("TLS should be set").current_task.tid);
 
-        platform.with_thread_local_storage_mut(|tls| {
+        WindowsUserland::with_thread_local_storage_mut(|tls| {
             assert_eq!(
                 tls.current_task.tid, tid,
                 "TLS should have the correct task ID"
             );
             tls.current_task.tid = 0x1234; // Change the task ID
         });
-        let tls = platform.release_thread_local_storage();
+        let tls = WindowsUserland::release_thread_local_storage();
         assert_eq!(
             tls.current_task.tid, 0x1234,
             "TLS should have the correct task ID"
