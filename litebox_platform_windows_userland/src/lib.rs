@@ -1215,7 +1215,10 @@ syscall_callback:
     push    rbx         /* pt_regs->bx */
     push    rbp         /* pt_regs->bp */
 
-    sub rsp, 32         /* skip r12-r15 */
+    push    r12
+    push    r13
+    push    r14
+    push    r15
 
     /* Save the original stack pointer */
     mov  rbp, rsp
@@ -1263,7 +1266,11 @@ syscall_callback:
     /* Restore the original stack pointer */
     mov  rsp, rbp
     mov  rax, rbx     /* syscall return value in rax */
-    add  rsp, 32         /* skip r12-r15 */
+
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
 
     /* Restore caller-saved registers */
     pop  rbp
