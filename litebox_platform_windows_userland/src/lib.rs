@@ -8,8 +8,8 @@ use core::cell::Cell;
 use core::cell::RefCell;
 use core::mem::ManuallyDrop;
 use core::panic;
-use core::sync::atomic::{AtomicI32, AtomicU32};
 use core::sync::atomic::Ordering::SeqCst;
+use core::sync::atomic::{AtomicI32, AtomicU32};
 use core::time::Duration;
 use std::os::raw::c_void;
 
