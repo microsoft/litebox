@@ -329,6 +329,7 @@ core::arch::global_asm!(
     .text
     .align  4
     .globl  swap_fsgs
+    .type   swap_fsgs,@function
 swap_fsgs:
     # Read FS base into RDX
     rdfsbase rdx
@@ -348,6 +349,7 @@ core::arch::global_asm!(
     .text
     .align  4
     .globl  swap_fsgs
+    .type   swap_fsgs,@function
 swap_fsgs:
     # Read FS selector into AX (zero-extended to EAX)
     mov ax, fs
@@ -576,7 +578,7 @@ pub unsafe extern "C" fn thread_start_internal(
             "add rsp, 24",  // orig_rax, rip, cs
             "popfq",
             "mov rsp, r11", // set rsp to the stack_top of the guest
-            "jmp rcx", // jump to the entry point of the thread
+            "jmp r10", // jump to the entry point of the thread
             in("rax") ctx,
             options(noreturn)
         );
@@ -631,7 +633,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
 
         #[cfg(target_arch = "x86_64")]
         {
-            ctx_copy.rcx = entry_point;
+            ctx_copy.r10 = entry_point;
             ctx_copy.r11 = stack.as_usize() + stack_size;
         }
 
