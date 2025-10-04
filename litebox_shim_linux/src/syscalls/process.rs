@@ -1004,7 +1004,7 @@ pub(crate) fn sys_tgkill(
 
 #[cfg(test)]
 mod tests {
-    use litebox::{mm::linux::PAGE_SIZE};
+    use litebox::mm::linux::PAGE_SIZE;
 
     #[cfg(target_arch = "x86_64")]
     #[test]
@@ -1012,8 +1012,8 @@ mod tests {
         use super::sys_arch_prctl;
         use crate::{MutPtr, syscalls::tests::init_platform};
         use core::mem::MaybeUninit;
-        use litebox_common_linux::ArchPrctlArg;
         use litebox::platform::RawConstPointer;
+        use litebox_common_linux::ArchPrctlArg;
 
         init_platform(None);
 
