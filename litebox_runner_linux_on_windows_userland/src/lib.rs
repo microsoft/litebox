@@ -269,26 +269,5 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     unsafe { litebox_platform_windows_userland::thread_start_asm(&pt_regs) };
-}
-
-mod trampoline {
-    core::arch::global_asm!(
-        "
-    .text
-    .align  4
-    .globl  jump_to_entry_point
-jump_to_entry_point:
-    xor r8, r8
-    mov	rsp, rdx
-    /* Clear rdx (will move to r9 according to glibc's ABI) */
-    xor rdx, rdx
-    /* Jump to glibc's _start */
-    jmp	rcx
-    /* Should not reach. */
-    ud2
-    hlt"
-    );
-    unsafe extern "C" {
-        pub(crate) fn jump_to_entry_point(entry_point: usize, stack_pointer: usize) -> !;
-    }
+    Ok(())
 }

@@ -1,6 +1,6 @@
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
-use std::{arch::global_asm, ffi::CString};
+use std::ffi::CString;
 
 use litebox::{
     fs::{FileSystem as _, Mode, OFlags},
@@ -8,31 +8,6 @@ use litebox::{
 };
 use litebox_platform_multiplex::{Platform, set_platform};
 use litebox_shim_linux::{litebox_fs, loader::load_program, set_fs};
-
-// According to glibc's ABI (https://github.com/lattera/glibc/blob/master/sysdeps/x86_64/start.S#L79),
-// when entering the _start function, %rdx will move to %r9, which is the 6th argument of the function
-// __libc_start_main. This argument `rtld_fini` is used to register a cleanup function (`atexit`).
-// However, today's Linux kernel by default does not set it. So we will need to clear %rdx before jumping
-// to the _start function.
-global_asm!(
-    "
-    .text
-    .align	4
-    .globl	trampoline
-trampoline:
-    xor r8, r8
-    mov	rsp, rdx
-    /* Clear rdx (will move to r9 according to glibc's ABI) */
-    xor rdx, rdx
-    /* Jump to glibc's _start */
-    jmp	rcx
-    /* Should not reach. */
-    hlt"
-);
-
-unsafe extern "C" {
-    fn trampoline(entry: usize, sp: usize) -> !;
-}
 
 pub fn init_platform(tar_data: &'static [u8], initial_dirs: &[&str], initial_files: &[&str]) {
     let platform = Platform::new();
@@ -98,6 +73,29 @@ pub fn test_load_exec_common(executable_path: &str) {
         // do nothing about aux for now
     }
     let info = load_program(executable_path, argv, envp, aux).unwrap();
-
-    unsafe { trampoline(info.entry_point, info.user_stack_top) };
+    #[cfg(target_arch = "x86_64")]
+    let pt_regs = litebox_common_linux::PtRegs {
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        rbp: 0,
+        rbx: 0,
+        r11: info.user_stack_top,
+        r10: info.entry_point,
+        r9: 0,
+        r8: 0,
+        rax: 0,
+        rcx: 0,
+        rdx: 0,
+        rsi: 0,
+        rdi: 0,
+        orig_rax: 0,
+        rip: 0,
+        cs: 0x33, // __USER_CS
+        eflags: 0,
+        rsp: 0,
+        ss: 0x2b, // __USER_DS
+    };
+    unsafe { litebox_platform_windows_userland::thread_start_asm(&pt_regs) };
 }
