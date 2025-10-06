@@ -1444,7 +1444,6 @@ pub struct Pollfd {
     pub revents: i16,
 }
 
-#[non_exhaustive]
 #[repr(i32)]
 #[derive(Debug, IntEnum)]
 pub enum MadviseBehavior {
