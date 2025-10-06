@@ -499,6 +499,9 @@ impl PollSet {
                 break;
             }
 
+            // Don't register observers again in the next iteration.
+            register = false;
+
             let remaining_time =
                 timeout.map(|t| t.saturating_sub(platform.now().duration_since(&start_time)));
             if let Some(remaining_time) = remaining_time {
