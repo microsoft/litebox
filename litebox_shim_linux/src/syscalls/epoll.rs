@@ -83,7 +83,7 @@ impl Descriptor {
             Descriptor::Eventfd { file, .. } => file,
             Descriptor::Socket(socket) => socket,
             Descriptor::File(typed_fd) => todo!(),
-            Descriptor::Stdio(stdio_file) => return Events::OUT & mask, // TODO
+            Descriptor::LiteBoxRawFd(fd) => return Events::OUT & mask, // TODO: handle properly
             Descriptor::Epoll { file, .. } => todo!(),
         };
         if let Some(observer) = observer {
