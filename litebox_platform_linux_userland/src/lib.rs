@@ -1513,7 +1513,7 @@ syscall_callback:
 
     mov rdi, rsp
     call swap_sp
-    mov rsp, rdx
+    mov rsp, rax
 
     /* Pass syscall number and pt_regs (saved on the guest stack) */
     mov rdi, r15
