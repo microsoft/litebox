@@ -629,12 +629,7 @@ where
                 }
                 // TODO: Should we `.close()` or should we `.abort()`?
                 socket.abort();
-                // TODO: We need to actually update events here; with the previous event-manager interfaces we had, this could be done with:
-                // ```
-                // self.event_manager.mark_events(internal_fd, Events::HUP);
-                // ```
-                //
-                // We need to migrate this to the newer interfaces that use observers.
+                socket_handle.entry.pollee.notify_observers(Events::HUP);
             }
         }
         self.automated_platform_interaction(PollDirection::Both);
@@ -1236,14 +1231,6 @@ where
                 }
                 if tcp_socket.can_send() {
                     events |= Events::OUT;
-                }
-                // A socket is closing if and only if it has sent its FIN packet but
-                // is still waiting for an ACK packet from the peer to acknowledge the FIN it sent.
-                if matches!(
-                    tcp_socket.state(),
-                    tcp::State::FinWait1 | tcp::State::Closing | tcp::State::LastAck
-                ) {
-                    events |= Events::HUP;
                 }
                 if !events.contains(Events::IN) {
                     // A server socket should have `Events::IN` if any of its listening sockets is connected.
