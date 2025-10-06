@@ -410,6 +410,26 @@ impl From<litebox::net::errors::ReceiveError> for Errno {
     }
 }
 
+impl From<litebox::net::errors::SetTcpOptionError> for Errno {
+    fn from(value: litebox::net::errors::SetTcpOptionError) -> Self {
+        match value {
+            litebox::net::errors::SetTcpOptionError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::SetTcpOptionError::NotTcpSocket => Errno::ENOPROTOOPT,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::net::errors::GetTcpOptionError> for Errno {
+    fn from(value: litebox::net::errors::GetTcpOptionError) -> Self {
+        match value {
+            litebox::net::errors::GetTcpOptionError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::GetTcpOptionError::NotTcpSocket => Errno::ENOPROTOOPT,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl<E> From<litebox::event::polling::TryOpError<E>> for Errno
 where
     E: Into<Errno>,

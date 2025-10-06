@@ -33,7 +33,7 @@ const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
 /// Maximum size of rx/tx buffers for sockets
-const SOCKET_BUFFER_SIZE: usize = 65536;
+pub const SOCKET_BUFFER_SIZE: usize = 65536;
 
 /// Limits maximum number of packets in a buffer
 const MAX_PACKET_COUNT: usize = 32;
@@ -1051,6 +1051,32 @@ where
             }
             Protocol::Udp | Protocol::Icmp | Protocol::Raw { .. } => {
                 Err(errors::SetTcpOptionError::NotTcpSocket)
+            }
+        }
+    }
+    /// Get TCP options
+    pub fn get_tcp_option(
+        &self,
+        fd: &SocketFd<Platform>,
+        name: TcpOptionName,
+    ) -> Result<TcpOptionData, errors::GetTcpOptionError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let socket_handle = &mut table_entry.entry;
+        match socket_handle.protocol() {
+            Protocol::Tcp => {
+                let tcp_socket = self.socket_set.get::<tcp::Socket>(socket_handle.handle);
+                match name {
+                    TcpOptionName::NODELAY => {
+                        Ok(TcpOptionData::NODELAY(!tcp_socket.nagle_enabled()))
+                    }
+                    TcpOptionName::KEEPALIVE => Ok(TcpOptionData::KEEPALIVE(
+                        tcp_socket.keep_alive().map(|d| d.into()),
+                    )),
+                }
+            }
+            Protocol::Udp | Protocol::Icmp | Protocol::Raw { .. } => {
+                Err(errors::GetTcpOptionError::NotTcpSocket)
             }
         }
     }

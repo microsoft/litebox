@@ -642,6 +642,12 @@ pub fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> Continu
             optval,
             optlen,
         } => syscalls::net::sys_setsockopt(sockfd, optname, optval, optlen).map(|()| 0),
+        SyscallRequest::Getsockopt {
+            sockfd,
+            optname,
+            optval,
+            optlen,
+        } => syscalls::net::sys_getsockopt(sockfd, optname, optval, optlen).map(|()| 0),
         SyscallRequest::Getsockname {
             sockfd,
             addr,
