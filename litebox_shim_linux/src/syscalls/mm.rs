@@ -114,8 +114,7 @@ pub(crate) fn sys_mmap(
         return Err(Errno::EINVAL);
     }
     if flags.intersects(
-        MapFlags::MAP_SHARED
-            | MapFlags::MAP_32BIT
+        MapFlags::MAP_32BIT
             | MapFlags::MAP_GROWSDOWN
             | MapFlags::MAP_LOCKED
             | MapFlags::MAP_NONBLOCK
@@ -127,6 +126,15 @@ pub(crate) fn sys_mmap(
     ) {
         todo!("Unsupported flags {:?}", flags);
     }
+
+    if flags.contains(MapFlags::MAP_SHARED) {
+        #[cfg(debug_assertions)]
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "Warning: MAP_SHARED is not fully supported yet, changes are not reflected to the underlying file.",
+        );
+    }
+    let flags = flags - MapFlags::MAP_SHARED;
 
     let aligned_len = align_up(len, PAGE_SIZE);
     if aligned_len == 0 {
