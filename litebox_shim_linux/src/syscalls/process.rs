@@ -15,8 +15,21 @@ use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{ArchPrctlArg, errno::Errno};
 use litebox_common_linux::{CloneFlags, FutexArgs, PrctlArg};
 
-/// A global counter for the number of threads in the system.
-pub(super) static NR_THREADS: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(1);
+/// A structure representing a process
+pub(crate) struct Process {
+    /// number of threads in this process
+    pub(crate) nr_threads: core::sync::atomic::AtomicU16,
+    /// resource limits for this process
+    pub(crate) limits: ResourceLimits,
+}
+
+/// A global singleton process structure.
+///
+/// Note we currently only support a single process in LiteBox.
+pub(crate) static LITEBOX_PROCESS: Process = Process {
+    nr_threads: core::sync::atomic::AtomicU16::new(1),
+    limits: ResourceLimits::default(),
+};
 
 /// Set the current task's command name.
 pub fn set_task_comm(comm: &[u8]) {
@@ -279,7 +292,9 @@ pub(crate) fn sys_exit(status: i32) -> ! {
         let _ = wake_robust_list(robust_list);
     }
 
-    NR_THREADS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    LITEBOX_PROCESS
+        .nr_threads
+        .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
 
     litebox_platform_multiplex::platform().terminate_thread(exit_code(status))
 }
@@ -449,7 +464,9 @@ pub(crate) fn sys_clone(
     // After parent_tid is set, we can drop the guard to let the new thread proceed.
     drop(guard);
 
-    NR_THREADS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    LITEBOX_PROCESS
+        .nr_threads
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Ok(child_tid)
 }
 
@@ -475,29 +492,107 @@ pub(crate) fn sys_gettid() -> i32 {
 const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
 const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
 
-fn do_prlimit(
-    pid: Option<i32>,
-    resource: litebox_common_linux::RlimitResource,
-    new_limit: Option<litebox_common_linux::Rlimit>,
-) -> litebox_common_linux::Rlimit {
-    if new_limit.is_some() {
-        unimplemented!("Setting new limits is not supported yet");
+struct AtomicRlimit {
+    cur: core::sync::atomic::AtomicUsize,
+    max: core::sync::atomic::AtomicUsize,
+}
+
+impl AtomicRlimit {
+    const fn new(cur: usize, max: usize) -> Self {
+        Self {
+            cur: core::sync::atomic::AtomicUsize::new(cur),
+            max: core::sync::atomic::AtomicUsize::new(max),
+        }
     }
-    if pid.is_some() {
-        unimplemented!("prlimit for a specific PID is not supported yet");
+}
+
+pub(crate) struct ResourceLimits {
+    limits: [AtomicRlimit; litebox_common_linux::RlimitResource::RLIM_NLIMITS],
+}
+
+impl ResourceLimits {
+    const fn default() -> Self {
+        seq_macro::seq!(N in 0..16 {
+            let mut limits = [
+                #(
+                    AtomicRlimit::new(0, 0),
+                )*
+            ];
+        });
+        limits[litebox_common_linux::RlimitResource::NOFILE as usize] = AtomicRlimit {
+            cur: core::sync::atomic::AtomicUsize::new(RLIMIT_NOFILE_CUR),
+            max: core::sync::atomic::AtomicUsize::new(RLIMIT_NOFILE_MAX),
+        };
+        limits[litebox_common_linux::RlimitResource::STACK as usize] = AtomicRlimit {
+            cur: core::sync::atomic::AtomicUsize::new(crate::loader::DEFAULT_STACK_SIZE),
+            max: core::sync::atomic::AtomicUsize::new(litebox_common_linux::rlim_t::MAX),
+        };
+        Self { limits }
     }
 
-    match resource {
-        litebox_common_linux::RlimitResource::STACK => litebox_common_linux::Rlimit {
-            rlim_cur: crate::loader::DEFAULT_STACK_SIZE,
-            rlim_max: litebox_common_linux::rlim_t::MAX,
-        },
-        litebox_common_linux::RlimitResource::NOFILE => litebox_common_linux::Rlimit {
-            rlim_cur: RLIMIT_NOFILE_CUR,
-            rlim_max: RLIMIT_NOFILE_MAX,
-        },
-        _ => unimplemented!("Unsupported resource for prlimit: {:?}", resource),
+    pub(crate) fn get_rlimit(
+        &self,
+        resource: litebox_common_linux::RlimitResource,
+    ) -> litebox_common_linux::Rlimit {
+        let r = &self.limits[resource as usize];
+        litebox_common_linux::Rlimit {
+            rlim_cur: r.cur.load(core::sync::atomic::Ordering::Relaxed),
+            rlim_max: r.max.load(core::sync::atomic::Ordering::Relaxed),
+        }
     }
+
+    pub(crate) fn get_rlimit_cur(&self, resource: litebox_common_linux::RlimitResource) -> usize {
+        let r = &self.limits[resource as usize];
+        r.cur.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set_rlimit(
+        &self,
+        resource: litebox_common_linux::RlimitResource,
+        new_limit: litebox_common_linux::Rlimit,
+    ) {
+        let r = &self.limits[resource as usize];
+        r.cur
+            .store(new_limit.rlim_cur, core::sync::atomic::Ordering::Relaxed);
+        r.max
+            .store(new_limit.rlim_max, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Get resource limits, and optionally set new limits.
+pub(crate) fn do_prlimit(
+    resource: litebox_common_linux::RlimitResource,
+    new_limit: Option<litebox_common_linux::Rlimit>,
+) -> Result<litebox_common_linux::Rlimit, Errno> {
+    let old_rlimit = match resource {
+        litebox_common_linux::RlimitResource::NOFILE
+        | litebox_common_linux::RlimitResource::STACK => {
+            LITEBOX_PROCESS.limits.get_rlimit(resource)
+        }
+        _ => unimplemented!("Unsupported resource for get_rlimit: {:?}", resource),
+    };
+    if let Some(new_limit) = new_limit {
+        if new_limit.rlim_cur > new_limit.rlim_max {
+            return Err(Errno::EINVAL);
+        }
+        if let litebox_common_linux::RlimitResource::NOFILE = resource
+            && new_limit.rlim_max > RLIMIT_NOFILE_MAX
+        {
+            return Err(Errno::EPERM);
+        }
+        // Note process with `CAP_SYS_RESOURCE` can increase the hard limit, but we don't
+        // support capabilities in LiteBox, so we don't check for that here.
+        if new_limit.rlim_max > old_rlimit.rlim_max {
+            return Err(Errno::EPERM);
+        }
+        match resource {
+            litebox_common_linux::RlimitResource::NOFILE => {
+                LITEBOX_PROCESS.limits.set_rlimit(resource, new_limit);
+            }
+            _ => unimplemented!("Unsupported resource for set_rlimit: {:?}", resource),
+        }
+    }
+    Ok(old_rlimit)
 }
 
 /// Handle syscall `prlimit64`.
@@ -510,6 +605,9 @@ pub(crate) fn sys_prlimit(
     new_rlim: Option<crate::ConstPtr<litebox_common_linux::Rlimit64>>,
     old_rlim: Option<crate::MutPtr<litebox_common_linux::Rlimit64>>,
 ) -> Result<(), Errno> {
+    if pid.is_some() {
+        unimplemented!("prlimit for a specific PID is not supported yet");
+    }
     let new_limit = match new_rlim {
         Some(rlim) => {
             let rlim = unsafe { rlim.read_at_offset(0) }
@@ -519,7 +617,7 @@ pub(crate) fn sys_prlimit(
         }
         None => None,
     };
-    let old_limit = litebox_common_linux::rlimit_to_rlimit64(do_prlimit(pid, resource, new_limit));
+    let old_limit = litebox_common_linux::rlimit_to_rlimit64(do_prlimit(resource, new_limit)?);
     if let Some(old_rlim) = old_rlim {
         unsafe { old_rlim.write_at_offset(0, old_limit) }.ok_or(Errno::EINVAL)?;
     }
@@ -531,7 +629,7 @@ pub(crate) fn sys_getrlimit(
     resource: litebox_common_linux::RlimitResource,
     rlim: crate::MutPtr<litebox_common_linux::Rlimit>,
 ) -> Result<(), Errno> {
-    let old_limit = do_prlimit(None, resource, None);
+    let old_limit = do_prlimit(resource, None)?;
     unsafe { rlim.write_at_offset(0, old_limit) }.ok_or(Errno::EINVAL)
 }
 
@@ -543,7 +641,7 @@ pub(crate) fn sys_setrlimit(
     let new_limit = unsafe { rlim.read_at_offset(0) }
         .ok_or(Errno::EFAULT)?
         .into_owned();
-    let _ = do_prlimit(None, resource, Some(new_limit));
+    let _ = do_prlimit(resource, Some(new_limit))?;
     Ok(())
 }
 
@@ -922,9 +1020,11 @@ pub(crate) fn sys_execve(
         }
 
         // Check if we are the only thread in the process
-        // Note since we don't support multiple processes yet; `NR_THREADS` is effectively the number of threads in
-        // the current process.
-        if NR_THREADS.load(core::sync::atomic::Ordering::Relaxed) != 1 {
+        if LITEBOX_PROCESS
+            .nr_threads
+            .load(core::sync::atomic::Ordering::Relaxed)
+            != 1
+        {
             unimplemented!("execve when multiple threads exist is not supported yet");
         }
         let release = |r: Range<usize>, vm: VmFlags| {

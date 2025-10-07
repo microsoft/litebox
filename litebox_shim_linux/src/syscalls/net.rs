@@ -392,7 +392,10 @@ pub(crate) fn sys_socket(
         AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
         _ => unimplemented!(),
     };
-    Ok(file_descriptors().write().insert(file))
+    file_descriptors().write().insert(file).map_err(|desc| {
+        crate::syscalls::file::do_close(desc).expect("closing descriptor should succeed");
+        Errno::EMFILE
+    })
 }
 
 fn read_sockaddr_from_user(sockaddr: ConstPtr<u8>, addrlen: usize) -> Result<SocketAddress, Errno> {
@@ -456,7 +459,10 @@ pub(crate) fn sys_accept(
         }
         _ => return Err(Errno::ENOTSOCK),
     };
-    Ok(file_descriptors().write().insert(file))
+    file_descriptors().write().insert(file).map_err(|desc| {
+        crate::syscalls::file::do_close(desc).expect("closing descriptor should succeed");
+        Errno::EMFILE
+    })
 }
 
 /// Handle syscall `connect`

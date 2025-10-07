@@ -453,3 +453,51 @@ fn test_umask_behavior() {
     // Restore to original
     let _ = sys_umask(orig);
 }
+
+#[test]
+fn test_rlimit_nofile() {
+    use litebox_common_linux::{Rlimit, RlimitResource, errno::Errno};
+
+    crate::syscalls::tests::init_platform(None);
+
+    // 1. Get the current NOFILE limit.
+    let cur_lim = super::process::do_prlimit(RlimitResource::NOFILE, None)
+        .expect("sys_getrlimit(NOFILE) failed");
+    assert!(cur_lim.rlim_max >= cur_lim.rlim_cur, "expected max >= cur");
+
+    // 2. Try to raise hard limit by 1 (should be EPERM and not change state).
+    let raise = Rlimit {
+        rlim_cur: cur_lim.rlim_cur,
+        rlim_max: cur_lim.rlim_max.saturating_add(1),
+    };
+    let err = super::process::do_prlimit(RlimitResource::NOFILE, Some(raise))
+        .expect_err("raising NOFILE hard limit should fail");
+    assert_eq!(err, Errno::EPERM);
+
+    // 3. Try cur > max (EINVAL).
+    let bad_order = Rlimit {
+        rlim_cur: cur_lim.rlim_max + 1,
+        rlim_max: cur_lim.rlim_max,
+    };
+    let err = super::process::do_prlimit(RlimitResource::NOFILE, Some(bad_order))
+        .expect_err("cur > max should be invalid");
+    assert_eq!(err, Errno::EINVAL);
+
+    // 4. Lower soft limit
+    let probe_fd = super::file::sys_dup(0, None, None).expect("probe dup failed");
+    let new_lim = Rlimit {
+        rlim_cur: probe_fd as usize + 1,
+        rlim_max: cur_lim.rlim_max,
+    };
+    super::process::do_prlimit(RlimitResource::NOFILE, Some(new_lim))
+        .expect("lowering NOFILE cur limit should succeed");
+    assert_eq!(
+        super::file::sys_dup(0, None, None).expect_err("dup should fail due to new cur limit"),
+        Errno::EMFILE,
+    );
+    assert_eq!(
+        super::file::sys_open("/prlimit_file", OFlags::CREAT | OFlags::RDONLY, Mode::RWXU)
+            .expect_err("open should fail due to new cur limit"),
+        Errno::EMFILE,
+    );
+}

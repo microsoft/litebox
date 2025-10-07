@@ -81,23 +81,23 @@ pub(crate) fn sys_umask(new_mask: u32) -> Mode {
 /// Handle syscall `open`
 pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
     let mode = mode & !get_umask();
-    litebox_fs()
+    let file = litebox_fs()
         .open(path, flags - OFlags::CLOEXEC, mode)
         .map(|file| {
-            let file = {
-                if flags.contains(OFlags::CLOEXEC)
-                    && litebox()
-                        .descriptor_table_mut()
-                        .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
-                        .is_some()
-                {
-                    unreachable!()
-                }
-                Descriptor::File(file)
-            };
-            file_descriptors().write().insert(file)
-        })
-        .map_err(Errno::from)
+            if flags.contains(OFlags::CLOEXEC)
+                && litebox()
+                    .descriptor_table_mut()
+                    .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
+                    .is_some()
+            {
+                unreachable!()
+            }
+            Descriptor::File(file)
+        })?;
+    file_descriptors()
+        .write()
+        .insert(file)
+        .map_err(|desc| do_close(desc).err().unwrap_or(Errno::EMFILE))
 }
 
 /// Handle syscall `openat`
@@ -857,14 +857,20 @@ pub fn sys_pipe2(flags: OFlags) -> Result<(u32, u32), Errno> {
         4096.try_into().ok(),
     );
     let close_on_exec = flags.contains(OFlags::CLOEXEC);
-    let read_fd = file_descriptors().write().insert(Descriptor::PipeReader {
-        consumer: reader,
-        close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
-    });
-    let write_fd = file_descriptors().write().insert(Descriptor::PipeWriter {
-        producer: writer,
-        close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
-    });
+    let read_fd = file_descriptors()
+        .write()
+        .insert(Descriptor::PipeReader {
+            consumer: reader,
+            close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
+        })
+        .map_err(|desc| do_close(desc).err().unwrap_or(Errno::EMFILE))?;
+    let write_fd = file_descriptors()
+        .write()
+        .insert(Descriptor::PipeWriter {
+            producer: writer,
+            close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
+        })
+        .map_err(|desc| do_close(desc).err().unwrap_or(Errno::EMFILE))?;
     Ok((read_fd, write_fd))
 }
 
@@ -874,11 +880,13 @@ pub fn sys_eventfd2(initval: u32, flags: EfdFlags) -> Result<u32, Errno> {
     }
 
     let eventfd = super::eventfd::EventFile::new(u64::from(initval), flags, litebox());
-    let fd = file_descriptors().write().insert(Descriptor::Eventfd {
-        file: alloc::sync::Arc::new(eventfd),
-        close_on_exec: core::sync::atomic::AtomicBool::new(flags.contains(EfdFlags::CLOEXEC)),
-    });
-    Ok(fd)
+    file_descriptors()
+        .write()
+        .insert(Descriptor::Eventfd {
+            file: alloc::sync::Arc::new(eventfd),
+            close_on_exec: core::sync::atomic::AtomicBool::new(flags.contains(EfdFlags::CLOEXEC)),
+        })
+        .map_err(|desc| do_close(desc).err().unwrap_or(Errno::EMFILE))
 }
 
 fn stdio_ioctl(arg: IoctlArg<litebox_platform_multiplex::Platform>) -> Result<u32, Errno> {
@@ -1026,13 +1034,15 @@ pub fn sys_epoll_create(flags: EpollCreateFlags) -> Result<u32, Errno> {
     }
 
     let epoll_file = super::epoll::EpollFile::new(litebox());
-    let fd = file_descriptors().write().insert(Descriptor::Epoll {
-        file: alloc::sync::Arc::new(epoll_file),
-        close_on_exec: core::sync::atomic::AtomicBool::new(
-            flags.contains(EpollCreateFlags::EPOLL_CLOEXEC),
-        ),
-    });
-    Ok(fd)
+    file_descriptors()
+        .write()
+        .insert(Descriptor::Epoll {
+            file: alloc::sync::Arc::new(epoll_file),
+            close_on_exec: core::sync::atomic::AtomicBool::new(
+                flags.contains(EpollCreateFlags::EPOLL_CLOEXEC),
+            ),
+        })
+        .map_err(|desc| do_close(desc).err().unwrap_or(Errno::EMFILE))
 }
 
 /// Handle syscall `epoll_ctl`
@@ -1197,6 +1207,13 @@ pub fn sys_dup(oldfd: i32, newfd: Option<i32>, flags: Option<OFlags>) -> Result<
                 Ok(oldfd)
             };
         }
+        if newfd as usize
+            > super::process::LITEBOX_PROCESS
+                .limits
+                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
+        {
+            return Err(Errno::EBADF);
+        }
 
         if let Some(old_file) = file_descriptors()
             .write()
@@ -1207,7 +1224,10 @@ pub fn sys_dup(oldfd: i32, newfd: Option<i32>, flags: Option<OFlags>) -> Result<
         Ok(newfd)
     } else {
         // dup
-        Ok(file_descriptors().write().insert(new_file))
+        file_descriptors()
+            .write()
+            .insert(new_file)
+            .map_err(|desc| do_close(desc).err().unwrap_or(Errno::EMFILE))
     }
 }
 

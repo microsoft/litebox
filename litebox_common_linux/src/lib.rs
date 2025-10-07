@@ -1290,7 +1290,7 @@ pub type rlim_t = usize;
 
 /// Used by getrlimit and setrlimit syscalls
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Rlimit {
     pub rlim_cur: rlim_t,
     pub rlim_max: rlim_t,
@@ -1335,7 +1335,7 @@ pub fn rlimit64_to_rlimit(rlim: Rlimit64) -> Rlimit {
 }
 
 #[repr(i32)]
-#[derive(Debug, IntEnum)]
+#[derive(Clone, Copy, Debug, IntEnum)]
 pub enum RlimitResource {
     /// CPU time in sec
     CPU = 0,
@@ -1369,6 +1369,10 @@ pub enum RlimitResource {
     RTPRIO = 14,
     /// timeout for RT tasks in us
     RTTIME = 15,
+}
+impl RlimitResource {
+    /// Maximum value for RlimitResource
+    pub const RLIM_NLIMITS: usize = RlimitResource::RTTIME as usize + 1;
 }
 
 #[repr(C)]
