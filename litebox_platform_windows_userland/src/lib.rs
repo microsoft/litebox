@@ -361,7 +361,6 @@ unsafe extern "C" {
     /// 2. Captures the current stack pointer (RSP/ESP) and frame pointer (RBP/EBP).
     /// 3. Calls `thread_start_internal` with:
     ///    - `ctx`: A reference to the provided `PtRegs` structure (passed in RDI/stack)
-    ///    - `stack_pointer`: The captured stack pointer value
     ///    - `frame_pointer`: The captured frame pointer value
     /// 4. After `thread_start_internal` returns, restores all saved registers and returns
     ///    to the caller.
@@ -410,8 +409,6 @@ unsafe extern "C" {
 ///
 /// * `ctx` - A reference to the captured processor register state (`PtRegs`) containing
 ///   all general-purpose registers, flags, and other CPU state at the point of entry.
-/// * `stack_pointer` - The stack pointer (RSP/ESP) value at the time of entry, which
-///   represents the current position in the native stack.
 /// * `frame_pointer` - The frame pointer (RBP/EBP) value at the time of entry, used
 ///   for stack frame traversal and debugging.
 ///
@@ -422,7 +419,7 @@ unsafe extern "C" {
 /// * It must be called from assembly code with a valid C calling convention.
 /// * The `ctx` reference must point to a valid `PtRegs` structure that has been properly
 ///   initialized by the assembly caller (`thread_start_asm`).
-/// * The `stack_pointer` and `frame_pointer` must be valid addresses within the current
+/// * The `frame_pointer` must be valid addresses within the current
 ///   thread's stack space.
 /// * It accesses thread-local storage which must have been properly initialized for the
 ///   calling thread.
@@ -436,7 +433,6 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thread_start_internal(
     ctx: &litebox_common_linux::PtRegs,
-    stack_pointer: usize,
     frame_pointer: usize,
 ) {
     WindowsUserland::with_thread_local_storage_mut(|tls| {
