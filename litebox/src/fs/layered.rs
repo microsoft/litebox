@@ -173,7 +173,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     /// If `copy_data` is `true`, it copies over the lower data to the upper one, otherwise, it
     /// makes the upper file empty (similar to a truncate). Generally speaking, you want to use
     /// `true` for `copy_data`.
-    #[allow(clippy::too_many_lines)]
     fn migrate_file_up(&self, path: &str, copy_data: bool) -> Result<(), MigrationError> {
         match self.layering_semantics {
             LayeringSemantics::LowerLayerReadOnly => {
@@ -432,7 +431,6 @@ impl<
     Lower: super::FileSystem + 'static,
 > super::FileSystem for FileSystem<Platform, Upper, Lower>
 {
-    #[expect(clippy::too_many_lines)]
     fn open(
         &self,
         path: impl crate::path::Arg,

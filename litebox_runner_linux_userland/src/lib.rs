@@ -81,7 +81,6 @@ static REQUIRE_RTLD_AUDIT: core::sync::atomic::AtomicBool =
 /// Can panic if any particulars of the environment are not set up as expected. Ideally, would not
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
-#[expect(clippy::too_many_lines)]
 pub fn run(cli_args: CliArgs) -> Result<()> {
     if !cli_args.insert_files.is_empty() {
         unimplemented!(

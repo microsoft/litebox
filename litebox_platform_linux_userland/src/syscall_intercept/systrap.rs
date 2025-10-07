@@ -65,7 +65,6 @@ fn register_sigsys_handler() {
     assert_eq!(ret, 0, "Failed to register SIGSYS handler: {ret}");
 }
 
-#[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
 fn register_seccomp_filter() {
     use seccompiler::{

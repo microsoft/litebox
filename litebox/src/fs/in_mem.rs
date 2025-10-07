@@ -130,7 +130,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem<Platform> {
-    #[expect(clippy::too_many_lines)]
     fn open(
         &self,
         path: impl crate::path::Arg,

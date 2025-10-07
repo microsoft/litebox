@@ -12,7 +12,6 @@ enum Backend {
     Seccomp,
 }
 
-#[allow(clippy::too_many_lines)]
 fn run_target_program(
     backend: Backend,
     target: &Path,

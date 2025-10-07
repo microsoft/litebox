@@ -2125,7 +2125,6 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
     /// Ideally, this function would not panic. However, since it is currently under development, it
     /// is allowed to panic upon receiving a syscall number (or arguments) that it does not know how
     /// to handle.
-    #[expect(clippy::too_many_lines)]
     pub fn try_from_raw(syscall_number: usize, ctx: &'a PtRegs) -> Result<Self, errno::Errno> {
         // sys_req! is a convenience macro that automatically takes the correct numbered arguments
         // (in the order of field specification); due to some Rust restrictions, we need to manually
