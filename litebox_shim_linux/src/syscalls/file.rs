@@ -131,6 +131,30 @@ pub(crate) fn sys_ftruncate(fd: i32, length: usize) -> Result<(), Errno> {
         .map_err(Errno::from)
 }
 
+/// Handle syscall `unlinkat`
+pub(crate) fn sys_unlinkat(
+    dirfd: i32,
+    pathname: impl path::Arg,
+    flags: AtFlags,
+) -> Result<(), Errno> {
+    if flags.intersects(AtFlags::AT_REMOVEDIR.complement()) {
+        return Err(Errno::EINVAL);
+    }
+
+    let fs_path = FsPath::new(dirfd, pathname)?;
+    match fs_path {
+        FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
+            if flags.contains(AtFlags::AT_REMOVEDIR) {
+                litebox_fs().rmdir(path).map_err(Errno::from)
+            } else {
+                litebox_fs().unlink(path).map_err(Errno::from)
+            }
+        }
+        FsPath::Cwd => Err(Errno::EINVAL),
+        FsPath::Fd(_) | FsPath::FdRelative { .. } => unimplemented!(),
+    }
+}
+
 /// Handle syscall `read`
 ///
 /// `offset` is an optional offset to read from. If `None`, it will read from the current file position.

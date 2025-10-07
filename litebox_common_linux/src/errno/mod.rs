@@ -133,6 +133,32 @@ impl From<litebox::fs::errors::OpenError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::UnlinkError> for Errno {
+    fn from(value: litebox::fs::errors::UnlinkError) -> Self {
+        match value {
+            litebox::fs::errors::UnlinkError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::UnlinkError::IsADirectory => Errno::EISDIR,
+            litebox::fs::errors::UnlinkError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::UnlinkError::PathError(path_error) => path_error.into(),
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::fs::errors::RmdirError> for Errno {
+    fn from(value: litebox::fs::errors::RmdirError) -> Self {
+        match value {
+            litebox::fs::errors::RmdirError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::RmdirError::Busy => Errno::EBUSY,
+            litebox::fs::errors::RmdirError::NotEmpty => Errno::ENOTEMPTY,
+            litebox::fs::errors::RmdirError::NotADirectory => Errno::ENOTDIR,
+            litebox::fs::errors::RmdirError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::RmdirError::PathError(path_error) => path_error.into(),
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::fs::errors::CloseError> for Errno {
     fn from(value: litebox::fs::errors::CloseError) -> Self {
         #[expect(clippy::match_single_binding)]

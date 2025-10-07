@@ -1,6 +1,6 @@
 use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
-use litebox_common_linux::{EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
+use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
 use litebox_platform_multiplex::{Platform, set_platform};
 
 use super::file::{
@@ -499,5 +499,84 @@ fn test_rlimit_nofile() {
         super::file::sys_open("/prlimit_file", OFlags::CREAT | OFlags::RDONLY, Mode::RWXU)
             .expect_err("open should fail due to new cur limit"),
         Errno::EMFILE,
+    );
+}
+
+#[test]
+fn test_unlinkat() {
+    init_platform(None);
+
+    // 1. Create a regular file and unlink it.
+    let file_path = "/unlink_test_file.txt";
+    let fd = sys_open(
+        file_path,
+        OFlags::CREAT | OFlags::WRONLY,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .expect("Failed to create test file for unlink");
+    sys_close(i32::try_from(fd).unwrap()).expect("Failed to close test file");
+    super::file::sys_unlinkat(0, file_path, AtFlags::empty())
+        .expect("unlinkat should succeed on regular file");
+    assert_eq!(
+        super::file::sys_stat(file_path),
+        Err(Errno::ENOENT),
+        "File should no longer exist after unlink"
+    );
+
+    // 2. Create a directory and attempt to unlink without AT_REMOVEDIR -> EISDIR.
+    let dir_path = "/unlink_dir";
+    let dir_mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits();
+    sys_mkdir(dir_path, dir_mode).expect("Failed to create directory");
+    assert_eq!(
+        super::file::sys_unlinkat(0, dir_path, AtFlags::empty()),
+        Err(Errno::EISDIR),
+        "Unlinking a directory without AT_REMOVEDIR should return EISDIR"
+    );
+
+    // 3. Create a non-empty directory and remove with AT_REMOVEDIR -> ENOTEMPTY.
+    let nonempty_dir = "/unlink_dir_nonempty";
+    sys_mkdir(nonempty_dir, dir_mode).expect("Failed to create non-empty directory");
+    let inner_file_fd = sys_open(
+        "/unlink_dir_nonempty/inner.txt",
+        OFlags::CREAT | OFlags::WRONLY,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .expect("Failed to create inner file");
+    sys_close(i32::try_from(inner_file_fd).unwrap()).expect("Failed to close inner file");
+    assert_eq!(
+        super::file::sys_unlinkat(0, nonempty_dir, AtFlags::AT_REMOVEDIR),
+        Err(Errno::ENOTEMPTY),
+        "Removing a non-empty directory with AT_REMOVEDIR should return ENOTEMPTY"
+    );
+
+    // 4. Invalid flag combination: AT_REMOVEDIR | (any other flag) -> EINVAL.
+    assert_eq!(
+        super::file::sys_unlinkat(
+            0,
+            dir_path,
+            AtFlags::AT_REMOVEDIR | AtFlags::AT_SYMLINK_NOFOLLOW
+        ),
+        Err(Errno::EINVAL),
+        "Invalid extra flags with AT_REMOVEDIR should return EINVAL"
+    );
+
+    // 5. Successfully remove previously created empty directory with AT_REMOVEDIR.
+    super::file::sys_unlinkat(0, dir_path, AtFlags::AT_REMOVEDIR)
+        .expect("Should remove empty directory with AT_REMOVEDIR");
+    assert_eq!(
+        super::file::sys_stat(dir_path),
+        Err(Errno::ENOENT),
+        "Directory should no longer exist after removal"
+    );
+
+    // 6. Create and remove another empty directory to ensure repeatability.
+    let empty_dir2 = "/unlink_empty_dir";
+    sys_mkdir(empty_dir2, dir_mode).expect("Failed to create second empty directory");
+    super::file::sys_unlinkat(0, empty_dir2, AtFlags::AT_REMOVEDIR)
+        .expect("Should remove second empty directory");
+    assert_eq!(
+        super::file::sys_stat(empty_dir2),
+        Err(Errno::ENOENT),
+        "Second directory should no longer exist after removal"
     );
 }
