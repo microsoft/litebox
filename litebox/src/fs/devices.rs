@@ -49,7 +49,7 @@ enum Device {
     Null,
 }
 
-/// A backing implementation for [`FileSystem`](super::super::FileSystem).
+/// A backing implementation for [`FileSystem`](super::FileSystem).
 ///
 /// This provider provides only `/dev/stdin`, `/dev/stdout`, and `/dev/stderr`.
 pub struct FileSystem<
