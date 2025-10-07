@@ -302,7 +302,6 @@ impl LinuxUserland {
             robust_list: None,
             credentials: alloc::sync::Arc::new(Self::get_user_info()),
             comm: [0; litebox_common_linux::TASK_COMM_LEN],
-            stored_sp: 0,
             stored_bp: 0,
             to_terminate: 0,
         });
@@ -448,10 +447,9 @@ thread_start_asm:
 
     mov ebp, esp
     and esp, -16
-    sub esp, 4
+    sub esp, 8
 
     push ebp      /* frame_pointer */
-    push esp      /* stack_pointer */
     push eax      /* ctx */
     call thread_start_internal
 
@@ -470,7 +468,6 @@ unsafe extern "C" {
     /// 2. Captures the current stack pointer (RSP/ESP) and frame pointer (RBP/EBP).
     /// 3. Calls `thread_start_internal` with:
     ///    - `ctx`: A reference to the provided `PtRegs` structure (passed in RDI/stack)
-    ///    - `stack_pointer`: The captured stack pointer value
     ///    - `frame_pointer`: The captured frame pointer value
     /// 4. After `thread_start_internal` returns, restores all saved registers and returns
     ///    to the caller.
@@ -519,8 +516,6 @@ unsafe extern "C" {
 ///
 /// * `ctx` - A reference to the captured processor register state (`PtRegs`) containing
 ///   all general-purpose registers, flags, and other CPU state at the point of entry.
-/// * `stack_pointer` - The stack pointer (RSP/ESP) value at the time of entry, which
-///   represents the current position in the native stack.
 /// * `frame_pointer` - The frame pointer (RBP/EBP) value at the time of entry, used
 ///   for stack frame traversal and debugging.
 ///
@@ -531,7 +526,7 @@ unsafe extern "C" {
 /// * It must be called from assembly code with a valid C calling convention.
 /// * The `ctx` reference must point to a valid `PtRegs` structure that has been properly
 ///   initialized by the assembly caller (`thread_start_asm`).
-/// * The `stack_pointer` and `frame_pointer` must be valid addresses within the current
+/// * The `frame_pointer` must be valid addresses within the current
 ///   thread's stack space.
 /// * It accesses thread-local storage which must have been properly initialized for the
 ///   calling thread.
@@ -545,11 +540,9 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thread_start_internal(
     ctx: &litebox_common_linux::PtRegs,
-    stack_pointer: usize,
     frame_pointer: usize,
 ) {
     LinuxUserland::with_thread_local_storage_mut(|tls| {
-        tls.current_task.stored_sp = stack_pointer;
         tls.current_task.stored_bp = frame_pointer;
     });
 
@@ -1434,15 +1427,6 @@ impl litebox::mm::allocator::MemoryProvider for LinuxUserland {
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn swap_sp(sp_to_swap: usize) -> usize {
-    LinuxUserland::with_thread_local_storage_mut(|tls| {
-        let sp = tls.current_task.stored_sp;
-        tls.current_task.stored_sp = sp_to_swap;
-        sp
-    })
-}
-
-#[unsafe(no_mangle)]
 unsafe extern "C" fn swap_bp(bp_to_swap: usize) -> usize {
     LinuxUserland::with_thread_local_storage_mut(|tls| {
         let bp = tls.current_task.stored_bp;
@@ -1506,14 +1490,14 @@ syscall_callback:
     /* Swap fs and gs */
     call swap_fsgs
 
-    /* Retrieve platform rsp and rbp switch to them */
+    /* Switch to platform rbp */
     mov rdi, rbp
     call swap_bp
     mov rbp, rax
 
-    mov rdi, rsp
-    call swap_sp
-    mov rsp, rax
+    /* Recover the aligned stack pointer */
+    mov rsp, rbp
+    and rsp, -16
 
     /* Pass syscall number and pt_regs (saved on the guest stack) */
     mov rdi, r15
@@ -1527,10 +1511,6 @@ syscall_callback:
     call to_terminate_thread
     test rax, rax
     jnz .Lcontinue_execution
-
-    mov rdi, rsp
-    call swap_sp
-    mov rsp, rax
 
     mov rdi, rbp
     call swap_bp
@@ -1629,15 +1609,16 @@ syscall_callback:
     /* Swap fs/gs/bp/sp */
     call swap_fsgs
 
+    /* Switch to platform rbp */
     push ebp
     call swap_bp
     add esp, 4
     mov ebp, eax
 
-    push esp
-    call swap_sp
-    add esp, 4
-    mov esp, eax
+    /* Recover the aligned stack pointer */
+    mov esp, ebp
+    and esp, -16
+    sub esp, 8
 
     /* Pass the sysno and pointer to pt_regs to syscall_handler */
     push esi
@@ -1650,11 +1631,6 @@ syscall_callback:
     call to_terminate_thread
     test eax, eax
     jnz .Lcontinue_execution
-
-    push esp
-    call swap_sp
-    add esp, 4
-    mov esp, eax
 
     push ebp
     call swap_bp

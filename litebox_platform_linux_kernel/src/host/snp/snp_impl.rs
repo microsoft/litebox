@@ -106,7 +106,6 @@ impl SnpLinuxKernel {
                 egid: boot_params.egid as usize,
             }),
             comm: [0; litebox_common_linux::TASK_COMM_LEN],
-            stored_sp: 0,
             stored_bp: 0,
             to_terminate: 0,
         });

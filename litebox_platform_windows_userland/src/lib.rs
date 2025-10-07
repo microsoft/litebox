@@ -287,7 +287,6 @@ impl WindowsUserland {
             robust_list: None,
             credentials: alloc::sync::Arc::new(creds),
             comm: [0; litebox_common_linux::TASK_COMM_LEN],
-            stored_sp: 0,
             stored_bp: 0,
             to_terminate: 0,
         });
@@ -441,7 +440,6 @@ pub unsafe extern "C" fn thread_start_internal(
     frame_pointer: usize,
 ) {
     WindowsUserland::with_thread_local_storage_mut(|tls| {
-        tls.current_task.stored_sp = stack_pointer;
         tls.current_task.stored_bp = frame_pointer;
     });
 
@@ -1164,15 +1162,6 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn swap_sp(sp_to_swap: usize) -> usize {
-    WindowsUserland::with_thread_local_storage_mut(|tls| {
-        let sp = tls.current_task.stored_sp;
-        tls.current_task.stored_sp = sp_to_swap;
-        sp
-    })
-}
-
-#[unsafe(no_mangle)]
 unsafe extern "C" fn swap_bp(bp_to_swap: usize) -> usize {
     WindowsUserland::with_thread_local_storage_mut(|tls| {
         let bp = tls.current_task.stored_bp;
@@ -1230,14 +1219,14 @@ syscall_callback:
     mov r14, rbp
     mov r15, rax
 
-    /* Retrieve platform rsp and rbp switch to them */
+    /* Switch to platform rbp */
     mov rcx, rbp
     call swap_bp
     mov rbp, rax
 
-    mov rcx, rsp
-    call swap_sp
-    mov rsp, rax
+    /* Recover the aligned stack pointer */
+    mov rsp, rbp
+    and rsp, -16
 
     /* Pass the syscall number to the syscall dispatcher */
     mov rcx, r15
@@ -1252,10 +1241,6 @@ syscall_callback:
     call to_terminate_thread
     test rax, rax
     jnz .Lcontinue_execution
-
-    mov rcx, rsp
-    call swap_sp
-    mov rsp, rax
 
     mov rcx, rbp
     call swap_bp

@@ -1263,9 +1263,7 @@ pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     pub credentials: alloc::sync::Arc<Credentials>,
     /// Command name (usually the executable name, excluding the path)
     pub comm: [u8; TASK_COMM_LEN],
-    /// Stored stack pointer for the thread. Used for switching stacks between the guest and the platform.
-    pub stored_sp: usize,
-    /// Stored instruction pointer for the thread. Used for a platform to terminate a thread gracefully.
+    /// Stored frame pointer for the thread
     pub stored_bp: usize,
     /// Indicate if it's about to terminate the current thread
     pub to_terminate: usize,

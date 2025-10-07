@@ -323,7 +323,6 @@ fn new_thread_callback(
         robust_list: task.robust_list,
         credentials: task.credentials.clone(),
         comm: task.comm,
-        stored_sp: 0,
         stored_bp: 0,
         to_terminate: 0,
     });
@@ -443,7 +442,6 @@ pub(crate) fn sys_clone(
                     robust_list: None,
                     credentials,
                     comm,
-                    stored_sp: 0,
                     stored_bp: 0,
                     to_terminate: 0,
                 }),
