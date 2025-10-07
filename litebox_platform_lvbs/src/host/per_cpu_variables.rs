@@ -11,7 +11,7 @@ use crate::{
     },
 };
 use alloc::boxed::Box;
-use core::{cell::RefCell, mem::MaybeUninit};
+use core::cell::RefCell;
 use litebox_common_linux::{rdgsbase, wrgsbase};
 use x86_64::structures::tss::TaskStateSegment;
 
@@ -136,9 +136,8 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
 /// Store the addresses of per-CPU variables. The kernel threads are expected to access
 /// the corresponding per-CPU variables via the GS registers which will store the addresses later.
 /// Instead of maintaining this map, we might be able to use a hypercall to directly program each core's GS register.
-/// TODO: consider whether we can avoid using `MaybeUninit` here (which is dangerous in a global context).
-static mut PER_CPU_VARIABLE_ADDRESSES: [MaybeUninit<RefCell<*mut PerCpuVariables>>; MAX_CORES] =
-    [const { MaybeUninit::uninit() }; MAX_CORES];
+static mut PER_CPU_VARIABLE_ADDRESSES: [RefCell<*mut PerCpuVariables>; MAX_CORES] =
+    [const { RefCell::new(core::ptr::null_mut()) }; MAX_CORES];
 
 /// Execute a closure with a reference to the current core's per-CPU variables.
 ///
@@ -157,9 +156,9 @@ where
     F: FnOnce(&PerCpuVariables) -> R,
     R: Sized + 'static,
 {
-    let gsbase = u64::try_from(read_or_populate_gsbase()).unwrap();
-    let addr = x86_64::VirtAddr::try_new(gsbase).expect("Non-canonical GSBASE value");
-    let refcell = unsafe { &*addr.as_ptr::<RefCell<*mut PerCpuVariables>>() };
+    let Some(refcell) = get_or_init_refcell_of_per_cpu_variables() else {
+        panic!("No per-CPU variables are allocated");
+    };
     let borrow = refcell.borrow();
     let per_cpu_variables = unsafe { &**borrow };
 
@@ -183,38 +182,46 @@ where
     F: FnOnce(&mut PerCpuVariables) -> R,
     R: Sized + 'static,
 {
-    let gsbase = u64::try_from(read_or_populate_gsbase()).unwrap();
-    let addr = x86_64::VirtAddr::try_new(gsbase).expect("Non-canonical GSBASE value");
-    let refcell = unsafe { &*addr.as_ptr::<RefCell<*mut PerCpuVariables>>() };
+    let Some(refcell) = get_or_init_refcell_of_per_cpu_variables() else {
+        panic!("No per-CPU variables are allocated");
+    };
     let mut borrow = refcell.borrow_mut();
     let per_cpu_variables = unsafe { &mut **borrow };
 
     f(per_cpu_variables)
 }
 
-#[inline]
-fn read_or_populate_gsbase() -> usize {
+/// Get or initialize a `RefCell` that contains a pointer to the current core's per-CPU variables.
+/// This `RefCell` is expected to be stored in the GS register.
+fn get_or_init_refcell_of_per_cpu_variables() -> Option<&'static RefCell<*mut PerCpuVariables>> {
     let gsbase = unsafe { rdgsbase() };
     if gsbase == 0 {
         let core_id = get_core_id();
-        let addr = if core_id == 0 {
+        let refcell = if core_id == 0 {
             let addr = &raw mut BSP_VARIABLES;
             unsafe {
-                PER_CPU_VARIABLE_ADDRESSES[0].write(RefCell::new(addr));
-                PER_CPU_VARIABLE_ADDRESSES[0].as_ptr()
+                PER_CPU_VARIABLE_ADDRESSES[0] = RefCell::new(addr);
+                &PER_CPU_VARIABLE_ADDRESSES[0]
             }
         } else {
-            unsafe { PER_CPU_VARIABLE_ADDRESSES[core_id].as_ptr() }
+            unsafe { &PER_CPU_VARIABLE_ADDRESSES[core_id] }
         };
-        assert!(
-            !addr.is_null(),
-            "GSBASE is not set, and per-CPU variables are not allocated"
-        );
-        let addr = x86_64::VirtAddr::new(u64::try_from(addr.addr()).unwrap());
-        unsafe { wrgsbase(usize::try_from(addr.as_u64()).unwrap()) };
-        usize::try_from(addr.as_u64()).unwrap()
+        if refcell.borrow().is_null() {
+            None
+        } else {
+            let addr = x86_64::VirtAddr::new(&raw const *refcell as u64);
+            unsafe { wrgsbase(usize::try_from(addr.as_u64()).unwrap()) }
+            Some(refcell)
+        }
     } else {
-        gsbase
+        let addr = x86_64::VirtAddr::try_new(u64::try_from(gsbase).unwrap())
+            .expect("GS contains a non-canonical address");
+        let refcell = unsafe { &*addr.as_ptr::<RefCell<*mut PerCpuVariables>>() };
+        if refcell.borrow().is_null() {
+            None
+        } else {
+            Some(refcell)
+        }
     }
 }
 
@@ -244,7 +251,7 @@ pub fn allocate_per_cpu_variables() {
             per_cpu_variables.assume_init()
         };
         unsafe {
-            PER_CPU_VARIABLE_ADDRESSES[i].write(RefCell::new(Box::into_raw(per_cpu_variables)));
+            PER_CPU_VARIABLE_ADDRESSES[i] = RefCell::new(Box::into_raw(per_cpu_variables));
         }
     }
 }
