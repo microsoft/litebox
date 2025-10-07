@@ -1692,7 +1692,7 @@ unsafe extern "C" fn syscall_handler(
 
     #[cfg(target_arch = "x86_64")]
     {
-        ctx.rax = ret;
+        ctx.rax = ret as usize;
     }
     #[cfg(target_arch = "x86")]
     {
