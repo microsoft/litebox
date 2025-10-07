@@ -4,7 +4,7 @@ pub mod observer;
 pub mod polling;
 
 bitflags::bitflags! {
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct Events: u32 {
         /// `POLLIN`: There is data to be read.
         const IN    = 0x0001;

@@ -1440,6 +1440,14 @@ pub struct EpollEvent {
     pub data: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct Pollfd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
 #[repr(i32)]
 #[derive(Debug, IntEnum)]
 pub enum MadviseBehavior {
@@ -1954,6 +1962,18 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     EpollCreate {
         flags: EpollCreateFlags,
     },
+    Poll {
+        fds: Platform::RawMutPointer<Pollfd>,
+        nfds: usize,
+        timeout: i32,
+    },
+    Ppoll {
+        fds: Platform::RawMutPointer<Pollfd>,
+        nfds: usize,
+        timeout: Option<Platform::RawConstPointer<Timespec>>,
+        sigmask: Option<Platform::RawConstPointer<SigSet>>,
+        sigsetsize: usize,
+    },
     ArchPrctl {
         arg: ArchPrctlArg<Platform>,
     },
@@ -2465,6 +2485,17 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 }
             }
             Sysno::epoll_create1 => sys_req!(EpollCreate { flags }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::ppoll => {
+                sys_req!(Ppoll { fds:*, nfds, timeout:*, sigmask:*, sigsetsize })
+            }
+            #[cfg(target_arch = "x86")]
+            Sysno::ppoll_time64 => {
+                sys_req!(Ppoll { fds:*, nfds, timeout:*, sigmask:*, sigsetsize })
+            }
+            Sysno::poll => {
+                sys_req!(Poll { fds:*, nfds, timeout })
+            }
             Sysno::prctl => {
                 let op: u32 = ctx.sys_req_arg(0);
                 if let Ok(op) = PrctlOption::try_from(op) {

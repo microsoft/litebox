@@ -8,6 +8,8 @@ use alloc::{
 use litebox::{
     LiteBox,
     event::{Events, IOPollable, observer::Observer, polling::Pollee},
+    platform::{Instant as _, RawMutex as _, RawMutexProvider as _, TimeProvider as _},
+    utils::ReinterpretUnsignedExt,
 };
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
 use litebox_platform_multiplex::Platform;
@@ -80,7 +82,9 @@ impl Descriptor {
             Descriptor::PipeWriter { producer, .. } => producer,
             Descriptor::Eventfd { file, .. } => file,
             Descriptor::Socket(socket) => socket,
-            _ => todo!(),
+            Descriptor::File(typed_fd) => todo!(),
+            Descriptor::LiteBoxRawFd(fd) => return Events::OUT & mask, // TODO: handle properly
+            Descriptor::Epoll { file, .. } => todo!(),
         };
         if let Some(observer) = observer {
             io_pollable.register_observer(observer, mask);
@@ -398,6 +402,143 @@ impl ReadySet {
     }
 }
 
+/// A poll set used for transient polling of a set of files. Designed for use
+/// with the `poll` and `ppoll` syscalls.
+pub(crate) struct PollSet {
+    entries: Vec<PollEntry>,
+}
+
+struct PollEntry {
+    fd: i32,
+    mask: Events,
+    revents: Events,
+    observer: Option<Arc<PollEntryObserver>>,
+}
+
+struct PollEntryObserver(Arc<<Platform as litebox::platform::RawMutexProvider>::RawMutex>);
+
+/// Trait for testing `PollSet`.
+pub(crate) trait GetFd {
+    fn get_fd(&self, n: i32) -> Option<&Descriptor>;
+}
+
+impl GetFd for litebox::sync::RwLockReadGuard<'_, Platform, crate::Descriptors> {
+    fn get_fd(&self, n: i32) -> Option<&Descriptor> {
+        (**self).get_fd(n.reinterpret_as_unsigned())
+    }
+}
+
+impl PollSet {
+    /// Returns a new empty `PollSet` with the given interest capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Adds an fd to the poll set with the given event mask.
+    ///
+    /// If fd is negative, it is ignored during polling.
+    pub fn add_fd(&mut self, fd: i32, mask: Events) {
+        self.entries.push(PollEntry {
+            fd,
+            mask: mask | Events::ALWAYS_POLLED,
+            revents: Events::empty(),
+            observer: None,
+        });
+    }
+
+    /// Waits for any of the fds in the poll set to become ready, or until the
+    /// timeout expires.
+    pub fn wait_or_timeout<T: GetFd>(
+        &mut self,
+        mut lock_fds: impl FnMut() -> T,
+        timeout: Option<Duration>,
+    ) {
+        let platform = litebox_platform_multiplex::platform();
+        let condvar = Arc::new(platform.new_raw_mutex());
+
+        let start_time = platform.now();
+        let mut register = true;
+        let mut is_ready = timeout.is_some_and(|t| t.is_zero());
+        loop {
+            let mut fds = lock_fds();
+            for entry in &mut self.entries {
+                entry.revents = if entry.fd < 0 {
+                    continue;
+                } else if let Some(file) = fds.get_fd(entry.fd) {
+                    let observer = if is_ready || !register {
+                        // The poll set is already ready, or we have already
+                        // registered the observer for this entry.
+                        None
+                    } else {
+                        // TODO: a separate allocation is necessary here
+                        // because registering an observer twice with two
+                        // different event masks results in the last one
+                        // replacing the first. If this is changed to
+                        // instead OR the new registration into the existing
+                        // one, then we can use a single observer for all
+                        // entries.
+                        let observer = Arc::new(PollEntryObserver(condvar.clone()));
+                        let weak = Arc::downgrade(&observer);
+                        entry.observer = Some(observer);
+                        Some(weak as _)
+                    };
+                    // TODO: add machinery to unregister the observer to avoid leaks.
+                    file.poll(entry.mask, observer)
+                } else {
+                    Events::NVAL
+                };
+                if !entry.revents.is_empty() {
+                    is_ready = true;
+                    register = false;
+                }
+            }
+
+            if is_ready {
+                break;
+            }
+
+            // Don't register observers again in the next iteration.
+            register = false;
+
+            let remaining_time =
+                timeout.map(|t| t.saturating_sub(platform.now().duration_since(&start_time)));
+            if let Some(remaining_time) = remaining_time {
+                if matches!(
+                    condvar.block_or_timeout(0, remaining_time),
+                    Ok(litebox::platform::UnblockedOrTimedOut::TimedOut),
+                ) {
+                    // Timed out. Loop around once more to check if any fds are
+                    // ready, to match Linux behavior.
+                    is_ready = true;
+                }
+            } else {
+                condvar.block(0);
+            }
+            condvar
+                .underlying_atomic()
+                .store(0, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Returns the accumulated `revents` for each entry in the poll set.
+    ///
+    /// These are only valid after a call to `wait_or_timeout`.
+    pub fn revents(&self) -> impl Iterator<Item = Events> + '_ {
+        self.entries.iter().map(|entry| entry.revents)
+    }
+}
+
+impl Observer<Events> for PollEntryObserver {
+    fn on_events(&self, events: &Events) {
+        self.0
+            .underlying_atomic()
+            .store(1, core::sync::atomic::Ordering::Release);
+        self.0.wake_one();
+    }
+}
+
 #[cfg(test)]
 mod test {
     use alloc::sync::Arc;
@@ -405,6 +546,7 @@ mod test {
     use litebox_common_linux::{EfdFlags, EpollEvent};
 
     use super::EpollFile;
+    use core::time::Duration;
 
     extern crate std;
 
@@ -476,5 +618,79 @@ mod test {
         };
         consumer.read(&mut buf).unwrap();
         assert_eq!(buf, [1, 2]);
+    }
+
+    #[test]
+    fn test_poll() {
+        #[derive(Copy, Clone)]
+        struct Fds<'a>(i32, Option<&'a crate::Descriptor>);
+
+        impl super::GetFd for Fds<'_> {
+            fn get_fd(&self, n: i32) -> Option<&crate::Descriptor> {
+                if n == self.0 { self.1 } else { None }
+            }
+        }
+
+        struct FdsOnce<'a>(core::cell::Cell<Option<i32>>, Option<&'a crate::Descriptor>);
+
+        impl super::GetFd for &FdsOnce<'_> {
+            fn get_fd(&self, n: i32) -> Option<&crate::Descriptor> {
+                if Some(n) == self.0.get() {
+                    self.0.set(None);
+                    self.1
+                } else {
+                    None
+                }
+            }
+        }
+
+        crate::syscalls::tests::init_platform(None);
+
+        let mut set = super::PollSet::with_capacity(0);
+        let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
+            0,
+            EfdFlags::empty(),
+            crate::litebox(),
+        ));
+
+        let fd = 10;
+        let descriptor = crate::Descriptor::Eventfd {
+            file: eventfd.clone(),
+            close_on_exec: core::sync::atomic::AtomicBool::new(false),
+        };
+
+        let no_fds = Fds(-1, None);
+        let fds = Fds(fd, Some(&descriptor));
+        set.add_fd(fd, Events::IN);
+
+        let revents = |set: &super::PollSet| {
+            let revents: std::vec::Vec<_> = set.revents().collect();
+            assert_eq!(revents.len(), 1);
+            revents[0]
+        };
+
+        set.wait_or_timeout(|| no_fds, None);
+        assert_eq!(revents(&set), Events::NVAL);
+
+        eventfd.write(1).unwrap();
+        set.wait_or_timeout(|| fds, None);
+        assert_eq!(revents(&set), Events::IN);
+
+        eventfd.read().unwrap();
+        set.wait_or_timeout(|| fds, Some(Duration::from_millis(100)));
+        assert!(revents(&set).is_empty());
+
+        let once = FdsOnce(Some(fd).into(), Some(&descriptor));
+        set.wait_or_timeout(|| &once, Some(Duration::from_millis(100)));
+        assert_eq!(revents(&set), Events::NVAL);
+
+        // spawn a thread to write to the eventfd
+        let copied_eventfd = eventfd.clone();
+        std::thread::spawn(move || {
+            copied_eventfd.write(1).unwrap();
+        });
+
+        set.wait_or_timeout(|| fds, None);
+        assert_eq!(revents(&set), Events::IN);
     }
 }
