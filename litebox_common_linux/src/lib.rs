@@ -460,7 +460,7 @@ pub enum FcntlArg<Platform: litebox::platform::RawPointerProvider> {
 }
 
 #[repr(i16)]
-#[derive(Clone, Copy, Debug, IntEnum, PartialEq, Eq)]
+#[derive(Debug, IntEnum)]
 pub enum FlockType {
     /// Shared or read lock
     ReadLock = 0,
@@ -471,11 +471,11 @@ pub enum FlockType {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Debug)]
 pub struct Flock {
     /// Type of lock: F_RDLCK, F_WRLCK, or F_UNLCK
     pub type_: i16,
-    /// Where `l_start' is relative to
+    /// Where `start' is relative to
     pub whence: i16,
     /// Offset where the lock begins
     pub start: usize,
