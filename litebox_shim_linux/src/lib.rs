@@ -385,7 +385,6 @@ fn pread_with_user_buf(
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-#[allow(clippy::too_many_lines)]
 pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
     let res: Result<usize, Errno> = match request {
         SyscallRequest::Ret(errno) => Err(errno),

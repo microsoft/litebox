@@ -81,7 +81,6 @@ fn collect_mappings(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<Range<usize>
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn test_vmm_mapping() {
     let start_addr: usize = 0x1_0000;
     let range = PageRange::new(start_addr, start_addr + 12 * PAGE_SIZE).unwrap();

@@ -127,7 +127,6 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
 // for the below syscall handling, we use Linux error codes (i.e., `Errno`) because any errors will be returned
 // to the LVBS platform or runner.
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
-    #[allow(clippy::too_many_lines)]
     pub fn try_from_raw(syscall_number: usize, ctx: &PtRegs) -> Result<Self, Errno> {
         let ctx = SyscallContext::from_pt_regs(ctx);
         let sysnr = u32::try_from(syscall_number).map_err(|_| Errno::ENOSYS)?;

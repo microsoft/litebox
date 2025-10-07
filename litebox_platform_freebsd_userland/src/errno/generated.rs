@@ -10,10 +10,6 @@ impl super::Errno {
     ///
     /// Generated from FreeBSD 14.3 errno manual page
     /// https://man.freebsd.org/cgi/man.cgi?errno
-    #[expect(
-        clippy::too_many_lines,
-        reason = "auto-generated code that needs to reference a large number of values"
-    )]
     pub(crate) const fn as_str(self) -> &'static str {
         match self.value.get() {
             1 => "EPERM: Operation not permitted",

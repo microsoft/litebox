@@ -699,7 +699,6 @@ pub fn sys_newfstatat(
     Ok(fstat)
 }
 
-#[expect(clippy::too_many_lines)]
 pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);

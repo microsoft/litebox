@@ -106,7 +106,6 @@ impl Socket {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn setsockopt(
         &self,
         optname: SocketOptionName,
