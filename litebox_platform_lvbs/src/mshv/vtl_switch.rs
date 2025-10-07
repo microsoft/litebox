@@ -219,7 +219,7 @@ fn jump_to_vtl_switch_loop_with_stack_cleanup() -> ! {
         asm!(
             "mov rsp, rax",
             "and rsp, {stack_alignment}",
-            "jmp {loop}",
+            "call {loop}",
             in("rax") stack_top, loop = sym vtl_switch_loop,
             stack_alignment = const STACK_ALIGNMENT,
             options(noreturn)
@@ -231,7 +231,7 @@ fn jump_to_vtl_switch_loop_with_stack_cleanup() -> ! {
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn jump_to_vtl_switch_loop() -> ! {
     naked_asm!(
-        "jmp {loop}",
+        "call {loop}",
         loop = sym vtl_switch_loop,
     );
 }
