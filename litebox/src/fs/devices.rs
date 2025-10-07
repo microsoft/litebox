@@ -1,4 +1,4 @@
-//! Device provider for LiteBox inclduding:
+//! Device provider for LiteBox including:
 //! 1. Standard input/output devices.
 //! 2. /dev/null device.
 
