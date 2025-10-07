@@ -55,6 +55,26 @@ fn ratchet_globals() -> Result<()> {
     )
 }
 
+#[test]
+fn ratchet_maybe_uninit() -> Result<()> {
+    ratchet(
+        &[
+            ("dev_tests/", 1),
+            ("litebox_platform_freebsd_userland/", 3),
+            ("litebox_platform_linux_kernel/", 1),
+            ("litebox_platform_linux_userland/", 3),
+            ("litebox_platform_lvbs/", 8),
+            ("litebox_shim_linux/", 8),
+        ],
+        |file| {
+            Ok(file
+                .lines()
+                .filter(|line| line.as_ref().unwrap().contains("MaybeUninit"))
+                .count())
+        },
+    )
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Convenience function to set up a ratchet test, see below for examples.
@@ -123,7 +143,7 @@ fn ratchet(expected: &[(&str, usize)], f: impl Fn(BufReader<File>) -> Result<usi
             }
             std::cmp::Ordering::Greater => {
                 bail!(
-                    "Ratcheted count for paths starting with '{prefix}' increased by {} :(\n\nYou might be using a feature that is ratcheted.\nTips:\n\tTry if you can work without using this feature.\n\tIf you think the heuristic detection is incorrect, you might need to update the ratchet's heuristic.\n\tIf the heuristic is correct, you might need to update the count.",
+                    "Ratcheted count for paths starting with '{prefix}' increased by {} :(\n\nYou might be using a feature that is ratcheted (i.e., we are aiming to reduce usage of in the codebase).\nTips:\n\tTry if you can work without using this feature.\n\tIf you think the heuristic detection is incorrect, you might need to update the ratchet's heuristic.\n\tIf the heuristic is correct, you might need to update the count.",
                     count - expected_count
                 )
             }
