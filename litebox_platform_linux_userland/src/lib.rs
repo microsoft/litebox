@@ -1505,7 +1505,6 @@ syscall_callback:
 
     /* Call syscall_handler */
     call syscall_handler
-    mov rbx, rax
 
     /* Check if to terminate the thread */
     call to_terminate_thread
@@ -1521,7 +1520,6 @@ syscall_callback:
 
 .Lcontinue_execution:
     mov rsp, rbp
-    mov rax, rbx
 
     /* Restore caller-saved registers */
     pop  r15
@@ -1534,7 +1532,7 @@ syscall_callback:
     pop  r10
     pop  r9
     pop  r8
-    pop  rcx             /* skip pt_regs->ax */
+    pop  rax
     pop  rcx
     pop  rdx
     pop  rsi
@@ -1625,7 +1623,6 @@ syscall_callback:
     push edi
 
     call syscall_handler
-    mov ebx, eax
     add esp, 8
 
     call to_terminate_thread
@@ -1641,7 +1638,6 @@ syscall_callback:
 
 .Lcontinue_execution:
     mov esp, ebp
-    mov eax, ebx
 
     pop ebx
     pop ecx
@@ -1649,8 +1645,9 @@ syscall_callback:
     pop esi
     pop edi
     pop ebp
+    pop eax
 
-    add esp, 32         /* skip eax, xds, xes, xfs, xgs, orig_eax, eip, xcs */
+    add esp, 28         /* skip xds, xes, xfs, xgs, orig_eax, eip, xcs */
     popfd
     add  esp, 8         /* skip esp, ss */
 
@@ -1682,7 +1679,7 @@ unsafe extern "C" fn syscall_handler(
 ) -> SyscallReturnType {
     // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
     let ctx = unsafe { &mut *ctx };
-    match SyscallRequest::try_from_raw(syscall_number, ctx) {
+    let ret = match SyscallRequest::try_from_raw(syscall_number, ctx) {
         Ok(d) => {
             let syscall_handler: SyscallHandler = SYSCALL_HANDLER
                 .read()
@@ -1691,7 +1688,18 @@ unsafe extern "C" fn syscall_handler(
             syscall_handler(d)
         }
         Err(err) => err.as_neg() as SyscallReturnType,
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        ctx.rax = ret;
     }
+    #[cfg(target_arch = "x86")]
+    {
+        ctx.eax = ret;
+    }
+
+    ret
 }
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {

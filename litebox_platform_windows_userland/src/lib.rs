@@ -1231,7 +1231,6 @@ syscall_callback:
 
     /* Call syscall_handler */
     call syscall_handler
-    mov rbx, rax
 
     /* Check if to terminate the thread */
     call to_terminate_thread
@@ -1246,7 +1245,6 @@ syscall_callback:
 
     /* Restore the original stack pointer */
     mov  rsp, rbp
-    mov  rax, rbx     /* syscall return value in rax */
 
     pop  r15
     pop  r14
@@ -1260,7 +1258,7 @@ syscall_callback:
     pop  r10
     pop  r9
     pop  r8
-    pop  rcx             /* skip pt_regs->ax */
+    pop  rax
     pop  rcx
     pop  rdx
     pop  rsi
@@ -1298,7 +1296,7 @@ unsafe extern "C" fn syscall_handler(
     // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
     let ctx = unsafe { &mut *ctx };
 
-    match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
+    let ret = match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
         Ok(d) => {
             let syscall_handler: SyscallHandler = SYSCALL_HANDLER
                 .read()
@@ -1307,7 +1305,18 @@ unsafe extern "C" fn syscall_handler(
             syscall_handler(d)
         }
         Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        ctx.rax = ret;
     }
+    #[cfg(target_arch = "x86")]
+    {
+        ctx.eax = ret;
+    }
+
+    ret
 }
 
 impl litebox::platform::SystemInfoProvider for WindowsUserland {
