@@ -194,13 +194,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             let src_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
             assert!(src_ptr.is_aligned(), "src_ptr is not properly aligned");
 
-            let mut boxed = Box::<T>::new_uninit();
-            let dst_ptr = boxed.as_mut_ptr();
-
-            let boxed = unsafe {
-                core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, 1);
-                boxed.assume_init()
-            };
+            let boxed = Box::<T>::new(unsafe { core::ptr::read_volatile(src_ptr) });
 
             assert!(
                 self.unmap_vtl0_pages(page_addr, length).is_ok(),
@@ -236,11 +230,8 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             let dst_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
             assert!(dst_ptr.is_aligned(), "dst_ptr is not properly aligned");
 
-            let src_ptr = core::ptr::from_ref::<T>(value);
+            unsafe { core::ptr::write_volatile(dst_ptr, *value) };
 
-            unsafe {
-                core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, 1);
-            }
             assert!(
                 self.unmap_vtl0_pages(page_addr, length).is_ok(),
                 "Failed to unmap VTL0 pages"
@@ -276,11 +267,9 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             let dst_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
             assert!(dst_ptr.is_aligned(), "dst_ptr is not properly aligned");
 
-            let src_ptr = value.as_ptr();
+            let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, value.len()) };
+            dst.copy_from_slice(value);
 
-            unsafe {
-                core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, value.len());
-            }
             assert!(
                 self.unmap_vtl0_pages(page_addr, length).is_ok(),
                 "Failed to unmap VTL0 pages"
@@ -316,11 +305,8 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             let src_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
             assert!(src_ptr.is_aligned(), "src_ptr is not properly aligned");
 
-            let dst_ptr = buf.as_mut_ptr();
-
-            unsafe {
-                core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, buf.len());
-            }
+            let src = unsafe { core::slice::from_raw_parts(src_ptr, buf.len()) };
+            buf.copy_from_slice(src);
 
             assert!(
                 self.unmap_vtl0_pages(page_addr, length).is_ok(),

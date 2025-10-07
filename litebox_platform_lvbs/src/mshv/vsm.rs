@@ -447,8 +447,9 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
         return Err(Errno::EINVAL);
     }
 
-    let mut kinfo_buf = avec![0u8; kinfo_mem.len()];
-    let mut kdata_buf = avec![0u8; kdata_mem.len()];
+    let mut kinfo_buf = avec![[{ core::mem::align_of::<HekiKernelInfo>() }] | 0u8; kinfo_mem.len()];
+    let mut kdata_buf =
+        avec![[{ core::mem::align_of::<HekiKernelSymbol>() }] | 0u8; kdata_mem.len()];
 
     kinfo_mem
         .read_bytes(kinfo_mem.start().unwrap(), &mut kinfo_buf)
@@ -527,7 +528,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         "Module ELF size exceeds the maximum allowed size"
     );
 
-    let mut original_elf_data = avec![0u8; elf_size];
+    let mut original_elf_data = vec![0u8; elf_size];
     module_as_elf
         .read_bytes(module_as_elf.start().unwrap(), &mut original_elf_data)
         .map_err(|_| Errno::EINVAL)?;
