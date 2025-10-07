@@ -1,4 +1,6 @@
-//! Standard input/output devices.
+//! Device provider for LiteBox inclduding:
+//! 1. Standard input/output devices.
+//! 2. /dev/null device.
 
 use alloc::string::String;
 
@@ -12,11 +14,13 @@ use crate::{
         },
     },
     path::Arg,
-    platform::{StdioOutStream, StdioReadError, StdioStream, StdioWriteError},
+    platform::{StdioOutStream, StdioReadError, StdioWriteError},
 };
 
 /// Block size for stdio devices
 const STDIO_BLOCK_SIZE: usize = 1024;
+/// Block size for null device
+const NULL_BLKSIZE: usize = 0x1000;
 
 /// Constant node information for all 3 stdio devices:
 /// ```console
@@ -30,6 +34,20 @@ const STDIO_NODE_INFO: NodeInfo = NodeInfo {
     ino: 9,
     rdev: core::num::NonZeroUsize::new(34822),
 };
+/// Node info for /dev/null
+const NULL_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 4,
+    // major=1, minor=3
+    rdev: core::num::NonZeroUsize::new(0x103),
+};
+
+enum Device {
+    Stdin,
+    Stdout,
+    Stderr,
+    Null,
+}
 
 /// A backing implementation for [`FileSystem`](super::super::FileSystem).
 ///
@@ -60,7 +78,7 @@ impl<Platform: crate::platform::StdioProvider + crate::sync::RawSyncPrimitivesPr
 }
 
 impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider>
-    super::super::private::Sealed for FileSystem<Platform>
+    super::private::Sealed for FileSystem<Platform>
 {
 }
 
@@ -85,7 +103,7 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
 }
 
 impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider>
-    super::super::FileSystem for FileSystem<Platform>
+    super::FileSystem for FileSystem<Platform>
 {
     fn open(
         &self,
@@ -102,37 +120,38 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         let truncate = flags.contains(OFlags::TRUNC);
         let flags = flags - OFlags::TRUNC;
         let path = self.absolute_path(path)?;
-        let stream = match path.as_str() {
+        let device = match path.as_str() {
             "/dev/stdin" => {
                 if flags == OFlags::RDONLY && mode.is_empty() {
-                    StdioStream::Stdin
+                    Device::Stdin
                 } else {
                     unimplemented!()
                 }
             }
             "/dev/stdout" => {
                 if flags == OFlags::WRONLY && mode.is_empty() {
-                    StdioStream::Stdout
+                    Device::Stdout
                 } else {
                     unimplemented!()
                 }
             }
             "/dev/stderr" => {
                 if flags == OFlags::WRONLY && mode.is_empty() {
-                    StdioStream::Stderr
+                    Device::Stderr
                 } else {
                     unimplemented!()
                 }
             }
+            "/dev/null" => Device::Null,
             _ => return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
         };
         if open_directory {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        if nonblocking {
+        if nonblocking && matches!(device, Device::Stdin | Device::Stderr | Device::Stdout) {
             unimplemented!("Non-blocking I/O is not supported for stdio streams");
         }
-        let fd = self.litebox.descriptor_table_mut().insert(stream);
+        let fd = self.litebox.descriptor_table_mut().insert(device);
         if truncate {
             // Note: matching Linux behavior, this does not actually perform any truncation, and
             // instead, it is silently ignored if you attempt to truncate upon opening stdio.
@@ -155,8 +174,15 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        if self.litebox.descriptor_table().get_entry(fd).entry != StdioStream::Stdin {
-            return Err(ReadError::NotForReading);
+        match &self.litebox.descriptor_table().get_entry(fd).entry {
+            Device::Stdin => {}
+            Device::Stdout | Device::Stderr => {
+                return Err(ReadError::NotForReading);
+            }
+            Device::Null => {
+                // /dev/null read returns EOF
+                return Ok(0);
+            }
         }
         if offset.is_some() {
             unimplemented!()
@@ -177,9 +203,13 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
         let stream = match &self.litebox.descriptor_table().get_entry(fd).entry {
-            StdioStream::Stdin => return Err(WriteError::NotForWriting),
-            StdioStream::Stdout => StdioOutStream::Stdout,
-            StdioStream::Stderr => StdioOutStream::Stderr,
+            Device::Stdin => return Err(WriteError::NotForWriting),
+            Device::Stdout => StdioOutStream::Stdout,
+            Device::Stderr => StdioOutStream::Stderr,
+            Device::Null => {
+                // /dev/null discards data: report as if written fully
+                return Ok(buf.len());
+            }
         };
         if offset.is_some() {
             unimplemented!()
@@ -193,14 +223,19 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
             })
     }
 
-    #[expect(unused_variables, reason = "unimplemented")]
     fn seek(
         &self,
         fd: &FileFd<Platform>,
-        offset: isize,
-        whence: SeekWhence,
+        _offset: isize,
+        _whence: SeekWhence,
     ) -> Result<usize, SeekError> {
-        unimplemented!()
+        match &self.litebox.descriptor_table().get_entry(fd).entry {
+            Device::Stdin | Device::Stdout | Device::Stderr => unimplemented!(),
+            Device::Null => {
+                // Linux allows lseek on /dev/null and returns position 0 (or sets to length 0).
+                Ok(0)
+            }
+        }
     }
 
     fn truncate(
@@ -251,35 +286,52 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
 
     fn file_status(&self, path: impl Arg) -> Result<FileStatus, FileStatusError> {
         let path = self.absolute_path(path)?;
-        if matches!(path.as_str(), "/dev/stdin" | "/dev/stdout" | "/dev/stderr") {
-            Ok(FileStatus {
+        match path.as_str() {
+            "/dev/stdin" | "/dev/stdout" | "/dev/stderr" => Ok(FileStatus {
                 file_type: FileType::CharacterDevice,
                 mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
                 size: 0,
                 owner: UserInfo::ROOT,
                 node_info: STDIO_NODE_INFO,
                 blksize: STDIO_BLOCK_SIZE,
-            })
-        } else {
-            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
+            }),
+            "/dev/null" => Ok(FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: NULL_NODE_INFO,
+                blksize: NULL_BLKSIZE,
+            }),
+            _ => Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)),
         }
     }
 
-    fn fd_file_status(&self, _fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
-        Ok(FileStatus {
-            file_type: FileType::CharacterDevice,
-            mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
-            size: 0,
-            owner: UserInfo::ROOT,
-            node_info: STDIO_NODE_INFO,
-            blksize: STDIO_BLOCK_SIZE,
-        })
+    fn fd_file_status(&self, fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
+        match &self.litebox.descriptor_table().get_entry(fd).entry {
+            Device::Stdin | Device::Stdout | Device::Stderr => Ok(FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: STDIO_NODE_INFO,
+                blksize: STDIO_BLOCK_SIZE,
+            }),
+            Device::Null => Ok(FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: NULL_NODE_INFO,
+                blksize: NULL_BLKSIZE,
+            }),
+        }
     }
 }
 
 crate::fd::enable_fds_for_subsystem! {
     @ Platform: { crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider };
     FileSystem<Platform>;
-    StdioStream;
+    Device;
     -> FileFd<Platform>;
 }

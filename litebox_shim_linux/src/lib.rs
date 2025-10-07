@@ -39,11 +39,7 @@ type LinuxFS = litebox::fs::layered::FileSystem<
     litebox::fs::in_mem::FileSystem<Platform>,
     litebox::fs::layered::FileSystem<
         Platform,
-        litebox::fs::layered::FileSystem<
-            Platform,
-            litebox::fs::devices::stdio::FileSystem<Platform>,
-            litebox::fs::devices::null::FileSystem<Platform>,
-        >,
+        litebox::fs::devices::FileSystem<Platform>,
         litebox::fs::tar_ro::FileSystem<Platform>,
     >,
 >;
@@ -96,19 +92,13 @@ pub fn default_fs(
     tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
 ) -> LinuxFS {
     let litebox = crate::litebox();
-    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(litebox);
-    let dev_null = litebox::fs::devices::null::FileSystem::new(litebox);
+    let dev_stdio = litebox::fs::devices::FileSystem::new(litebox);
     litebox::fs::layered::FileSystem::new(
         litebox,
         in_mem_fs,
         litebox::fs::layered::FileSystem::new(
             litebox,
-            litebox::fs::layered::FileSystem::new(
-                litebox,
-                dev_stdio,
-                dev_null,
-                litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
-            ),
+            dev_stdio,
             tar_ro_fs,
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
         ),

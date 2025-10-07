@@ -1659,7 +1659,7 @@ mod stdio {
     fn stdio_open_read_write() {
         let platform = MockPlatform::new();
         let litebox = LiteBox::new(platform);
-        let fs = crate::fs::devices::stdio::FileSystem::new(&litebox);
+        let fs = crate::fs::devices::FileSystem::new(&litebox);
 
         // Test opening and writing to /dev/stdout
         let fd_stdout = fs
@@ -1704,7 +1704,7 @@ mod stdio {
     #[test]
     fn non_dev_path_fails() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = crate::fs::devices::stdio::FileSystem::new(&litebox);
+        let fs = crate::fs::devices::FileSystem::new(&litebox);
 
         // Attempt to open a non-/dev/* path
         let result = fs.open("foo", OFlags::RDONLY, Mode::empty());
@@ -1733,7 +1733,7 @@ mod layered_stdio {
         let layered_fs = layered::FileSystem::new(
             &litebox,
             in_mem::FileSystem::new(&litebox),
-            devices::stdio::FileSystem::new(&litebox),
+            devices::FileSystem::new(&litebox),
             LayeringSemantics::LowerLayerWritableFiles,
         );
 
@@ -1797,7 +1797,7 @@ mod layered_stdio {
         let fs = layered::FileSystem::new(
             &litebox,
             in_mem,
-            devices::stdio::FileSystem::new(&litebox),
+            devices::FileSystem::new(&litebox),
             LayeringSemantics::LowerLayerWritableFiles,
         );
 
