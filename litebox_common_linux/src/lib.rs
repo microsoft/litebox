@@ -445,7 +445,7 @@ impl From<litebox::fs::FileStatus> for FileStat {
 /// Commands for use with `fcntl`.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum FcntlArg {
+pub enum FcntlArg<Platform: litebox::platform::RawPointerProvider> {
     /// Get the file descriptor flags
     GETFD,
     /// Set the file descriptor flags
@@ -454,12 +454,47 @@ pub enum FcntlArg {
     GETFL,
     /// Set descriptor status flags
     SETFL(OFlags),
+    /// Get a file lock
+    GETLK(Platform::RawMutPointer<Flock>),
+    /// Set a file lock
+    SETLK(Platform::RawConstPointer<Flock>),
+    /// Set a file lock and wait if blocked
+    SETLKW(Platform::RawConstPointer<Flock>),
+}
+
+#[repr(i16)]
+#[derive(Debug, IntEnum)]
+pub enum FlockType {
+    /// Shared or read lock
+    ReadLock = 0,
+    /// Exclusive or write lock
+    WriteLock = 1,
+    /// Remove lock
+    Unlock = 2,
+}
+
+#[repr(C)]
+#[derive(Clone, Debug)]
+pub struct Flock {
+    /// Type of lock: F_RDLCK, F_WRLCK, or F_UNLCK
+    pub type_: i16,
+    /// Where `start' is relative to
+    pub whence: i16,
+    /// Offset where the lock begins
+    pub start: usize,
+    /// Size of the locked area, 0 means until EOF
+    pub len: isize,
+    /// Process holding the lock
+    pub pid: i32,
 }
 
 const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
+const F_GETLK: i32 = 5;
+const F_SETLK: i32 = 6;
+const F_SETLKW: i32 = 7;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
@@ -471,14 +506,17 @@ bitflags::bitflags! {
     }
 }
 
-impl FcntlArg {
+impl<Platform: litebox::platform::RawPointerProvider> FcntlArg<Platform> {
     pub fn from(cmd: i32, arg: usize) -> Self {
         match cmd {
             F_GETFD => Self::GETFD,
             F_SETFD => Self::SETFD(FileDescriptorFlags::from_bits_truncate(arg.truncate())),
             F_GETFL => Self::GETFL,
             F_SETFL => Self::SETFL(OFlags::from_bits_truncate(arg.truncate())),
-            _ => unimplemented!(),
+            F_GETLK => Self::GETLK(Platform::RawMutPointer::from_usize(arg)),
+            F_SETLK => Self::SETLK(Platform::RawConstPointer::from_usize(arg)),
+            F_SETLKW => Self::SETLKW(Platform::RawConstPointer::from_usize(arg)),
+            _ => unimplemented!("{cmd}"),
         }
     }
 }
@@ -1942,7 +1980,7 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     },
     Fcntl {
         fd: i32,
-        arg: FcntlArg,
+        arg: FcntlArg<Platform>,
     },
     Getcwd {
         buf: Platform::RawMutPointer<u8>,

@@ -251,6 +251,19 @@ pub fn sys_pwrite64(fd: i32, buf: &[u8], offset: i64) -> Result<usize, Errno> {
     sys_write(fd, buf, Some(pos))
 }
 
+const SEEK_SET: i16 = 0;
+const SEEK_CUR: i16 = 1;
+const SEEK_END: i16 = 2;
+
+pub(crate) fn try_into_whence(value: i16) -> Result<SeekWhence, i16> {
+    match value {
+        SEEK_SET => Ok(SeekWhence::RelativeToBeginning),
+        SEEK_CUR => Ok(SeekWhence::RelativeToCurrentOffset),
+        SEEK_END => Ok(SeekWhence::RelativeToEnd),
+        _ => Err(value),
+    }
+}
+
 /// Handle syscall `lseek`
 pub fn sys_lseek(fd: i32, offset: isize, whence: SeekWhence) -> Result<usize, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
@@ -723,7 +736,10 @@ pub fn sys_newfstatat(
     Ok(fstat)
 }
 
-pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
+pub(crate) fn sys_fcntl(
+    fd: i32,
+    arg: FcntlArg<litebox_platform_multiplex::Platform>,
+) -> Result<u32, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
@@ -839,6 +855,37 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                 }
                 Descriptor::Epoll { file, .. } => todo!(),
             }
+            Ok(0)
+        }
+        FcntlArg::GETLK(lock) => {
+            let Descriptor::File(file) = desc else {
+                return Err(Errno::EBADF);
+            };
+            let mut flock = unsafe { lock.read_at_offset(0) }
+                .ok_or(Errno::EFAULT)?
+                .into_owned();
+            let lock_type = litebox_common_linux::FlockType::try_from(flock.type_)
+                .map_err(|_| Errno::EINVAL)?;
+            if let litebox_common_linux::FlockType::Unlock = lock_type {
+                return Err(Errno::EINVAL);
+            }
+
+            // Note LiteBox does not support multiple processes yet, and one process
+            // can always acquire the lock it owns, so return `Unlock` unconditionally.
+            flock.type_ = litebox_common_linux::FlockType::Unlock as i16;
+            unsafe { lock.write_at_offset(0, flock) }.ok_or(Errno::EFAULT)?;
+            Ok(0)
+        }
+        FcntlArg::SETLK(lock) | FcntlArg::SETLKW(lock) => {
+            let Descriptor::File(file) = desc else {
+                return Err(Errno::EBADF);
+            };
+            let flock = unsafe { lock.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+            let _ = litebox_common_linux::FlockType::try_from(flock.type_)
+                .map_err(|_| Errno::EINVAL)?;
+
+            // Note LiteBox does not support multiple processes yet, and one process
+            // can always acquire the lock it owns, so we don't need to maintain anything.
             Ok(0)
         }
         _ => unimplemented!(),
