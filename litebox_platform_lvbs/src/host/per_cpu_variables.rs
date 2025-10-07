@@ -235,17 +235,12 @@ pub fn allocate_per_cpu_variables() {
     // TODO: use `cpu_online_mask` to selectively allocate per-CPU variables
     #[allow(clippy::needless_range_loop)]
     for i in 1..num_cores {
-        let mut per_cpu_variables = Box::new(core::mem::MaybeUninit::<PerCpuVariables>::uninit());
+        let mut per_cpu_variables = Box::<PerCpuVariables>::new_uninit();
+        // Safety: `PerCpuVariables` is larger than the stack size, so we manually `memset` it to zero.
         let per_cpu_variables = unsafe {
-            // `PerCpuVariables` is larger than the stack size, so we cannot use the stack to initialize it.
             let ptr = per_cpu_variables.as_mut_ptr();
-            core::slice::from_raw_parts_mut(
-                ptr.cast::<u8>(),
-                core::mem::size_of::<PerCpuVariables>(),
-            )
-            .fill(0);
+            ptr.write_bytes(0, 1);
             (*ptr).tss = gdt::AlignedTss(TaskStateSegment::new());
-
             per_cpu_variables.assume_init()
         };
         unsafe {
