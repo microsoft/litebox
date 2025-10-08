@@ -721,7 +721,7 @@ pub(crate) fn sys_clock_nanosleep(
         if request <= now {
             return Ok(());
         }
-        request - now
+        request.checked_sub(now).unwrap()
     } else {
         request
     };
