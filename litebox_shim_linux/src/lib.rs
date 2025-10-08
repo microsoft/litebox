@@ -902,7 +902,7 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> ContinueOper
         }
     };
 
-    let ret = res.unwrap_or_else(|e| {
+    let return_value = res.unwrap_or_else(|e| {
         let e: i32 = e.as_neg();
         let Ok(e) = isize::try_from(e) else {
             // On both 32-bit and 64-bit, this should never be triggered
@@ -910,7 +910,7 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> ContinueOper
         };
         e.reinterpret_as_unsigned()
     });
-    ContinueOperation::ResumeGuest { return_value: ret }
+    ContinueOperation::ResumeGuest { return_value }
 }
 
 fn handle_clone_request(
