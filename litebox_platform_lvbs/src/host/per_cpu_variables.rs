@@ -13,7 +13,6 @@ use crate::{
 use alloc::boxed::Box;
 use core::cell::RefCell;
 use litebox_common_linux::{rdgsbase, wrgsbase};
-use x86_64::structures::tss::TaskStateSegment;
 
 pub const INTERRUPT_STACK_SIZE: usize = 2 * PAGE_SIZE;
 pub const KERNEL_STACK_SIZE: usize = 10 * PAGE_SIZE;
@@ -30,7 +29,6 @@ pub struct PerCpuVariables {
     _guard_page_1: [u8; PAGE_SIZE],
     hvcall_input: [u8; PAGE_SIZE],
     hvcall_output: [u8; PAGE_SIZE],
-    pub tss: gdt::AlignedTss,
     pub vtl0_state: VtlState,
     pub vtl1_state: VtlState,
     pub vtl0_locked_regs: ControlRegMap,
@@ -90,7 +88,6 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
     _guard_page_1: [0u8; PAGE_SIZE],
     hvcall_input: [0u8; PAGE_SIZE],
     hvcall_output: [0u8; PAGE_SIZE],
-    tss: gdt::AlignedTss(TaskStateSegment::new()),
     vtl0_state: VtlState {
         rbp: 0,
         cr2: 0,
@@ -247,7 +244,6 @@ pub fn allocate_per_cpu_variables() {
         let per_cpu_variables = unsafe {
             let ptr = per_cpu_variables.as_mut_ptr();
             ptr.write_bytes(0, 1);
-            (*ptr).tss = gdt::AlignedTss(TaskStateSegment::new());
             per_cpu_variables.assume_init()
         };
         unsafe {

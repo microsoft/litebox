@@ -22,10 +22,6 @@ use litebox_platform_multiplex::Platform;
 ///
 /// Panics if it failed to enable Hyper-V hypercall
 pub fn init() -> Option<&'static Platform> {
-    gdt::init();
-    interrupts::init_idt();
-    x86_64::instructions::interrupts::enable();
-
     let mut ret: Option<&'static Platform> = None;
 
     if get_core_id() == 0 {
@@ -91,8 +87,8 @@ pub fn init() -> Option<&'static Platform> {
     if let Err(e) = hvcall::init() {
         panic!("Err: {:?}", e);
     }
+    gdt::init();
     interrupts::init_idt();
-    x86_64::instructions::interrupts::enable();
     Platform::register_syscall_handler(litebox_shim_optee::handle_syscall_request);
 
     ret
