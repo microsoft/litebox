@@ -6,7 +6,7 @@ use crate::{
 };
 use core::arch::{asm, naked_asm};
 use litebox_common_linux::PtRegs;
-use litebox_common_optee::{SyscallContext, SyscallRequest};
+use litebox_common_optee::SyscallContext;
 use x86_64::{
     VirtAddr,
     registers::{
@@ -38,7 +38,18 @@ use x86_64::{
 // r11: userspace rflags
 // Note. rsp should point to the userspace stack before calling `sysretq`
 
-pub type SyscallHandler = fn(SyscallRequest<crate::host::LvbsLinuxKernel>) -> u32;
+cfg_if::cfg_if! {
+    if #[cfg(feature = "linux_syscall")] {
+        use litebox_common_linux::{ContinueOperation, SyscallRequest};
+    } else if #[cfg(feature = "optee_syscall")] {
+        use litebox_common_optee::{ContinueOperation, SyscallRequest};
+    } else {
+        compile_error!(r##"No syscall handler specified."##);
+    }
+}
+pub type SyscallReturnType = ContinueOperation;
+
+pub type SyscallHandler = fn(SyscallRequest<crate::host::LvbsLinuxKernel>) -> SyscallReturnType;
 static SYSCALL_HANDLER: spin::Once<SyscallHandler> = spin::Once::new();
 
 #[cfg(target_arch = "x86_64")]
@@ -156,10 +167,15 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> u32 {
     let ctx = ctx_raw.to_pt_regs();
 
     // call the syscall handler passed down from the shim
-    let sysret = syscall_handler(
+    let sysret = match syscall_handler(
         SyscallRequest::try_from_raw(usize::try_from(sysnr).unwrap(), &ctx)
             .expect("Failed to convert syscall request"),
-    );
+    ) {
+        ContinueOperation::ResumeGuest { return_value } => return_value,
+        ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
+            u32::try_from(status).unwrap()
+        }
+    };
 
     // TODO: We should decide whether we place this function here, OP-TEE shim, or separate it into
     // multiple functions and place them in the appropriate places.

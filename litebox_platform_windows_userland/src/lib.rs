@@ -75,7 +75,9 @@ thread_local! {
 }
 
 /// Connector to a shim-exposed syscall-handling interface.
-pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<WindowsUserland>) -> usize;
+pub type SyscallHandler = fn(
+    litebox_common_linux::SyscallRequest<WindowsUserland>,
+) -> litebox_common_linux::ContinueOperation;
 
 /// The syscall handler passed down from the shim.
 static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
@@ -288,7 +290,6 @@ impl WindowsUserland {
             credentials: alloc::sync::Arc::new(creds),
             comm: [0; litebox_common_linux::TASK_COMM_LEN],
             stored_bp: 0,
-            to_terminate: 0,
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         Self::set_thread_local_storage(tls);
@@ -1166,11 +1167,6 @@ unsafe extern "C" fn swap_bp(bp_to_swap: usize) -> usize {
     })
 }
 
-#[unsafe(no_mangle)]
-unsafe extern "C" fn to_terminate_thread() -> usize {
-    WindowsUserland::with_thread_local_storage_mut(|tls| tls.current_task.to_terminate)
-}
-
 core::arch::global_asm!(
     "
     .text
@@ -1231,12 +1227,10 @@ syscall_callback:
 
     /* Call syscall_handler */
     call syscall_handler
+    test al, al
+    jz .Lcontinue_execution
 
-    /* Check if to terminate the thread */
-    call to_terminate_thread
-    test rax, rax
-    jnz .Lcontinue_execution
-
+    /* Switch back to guest rbp */
     mov rcx, rbp
     call swap_bp
     mov rbp, rax
@@ -1296,27 +1290,49 @@ unsafe extern "C" fn syscall_handler(
     // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
     let ctx = unsafe { &mut *ctx };
 
-    let ret = match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
+    match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
         Ok(d) => {
             let syscall_handler: SyscallHandler = SYSCALL_HANDLER
                 .read()
                 .unwrap()
                 .expect("Should have run `register_syscall_handler` by now");
-            syscall_handler(d)
+            match syscall_handler(d) {
+                ContinueOperation::ResumeGuest { return_value } => {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        ctx.rax = return_value as usize;
+                    }
+                    #[cfg(target_arch = "x86")]
+                    {
+                        ctx.eax = return_value;
+                    }
+                    true
+                }
+                ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        ctx.rax = status.reinterpret_as_unsigned() as usize;
+                    }
+                    #[cfg(target_arch = "x86")]
+                    {
+                        ctx.eax = status.reinterpret_as_unsigned();
+                    }
+                    false
+                }
+            }
         }
-        Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
-    };
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        ctx.rax = ret;
+        Err(err) => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                ctx.rax = err.as_neg() as usize;
+            }
+            #[cfg(target_arch = "x86")]
+            {
+                ctx.eax = err.as_neg() as usize;
+            }
+            true
+        }
     }
-    #[cfg(target_arch = "x86")]
-    {
-        ctx.eax = ret;
-    }
-
-    ret
 }
 
 impl litebox::platform::SystemInfoProvider for WindowsUserland {

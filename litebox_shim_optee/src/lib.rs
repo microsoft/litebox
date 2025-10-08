@@ -19,9 +19,9 @@ use litebox::{
     platform::{RawConstPointer as _, RawMutPointer as _},
 };
 use litebox_common_optee::{
-    SyscallRequest, TeeAlgorithm, TeeAlgorithmClass, TeeAttributeType, TeeCrypStateHandle,
-    TeeHandleFlag, TeeObjHandle, TeeObjectInfo, TeeObjectType, TeeOperationMode, TeeParamType,
-    TeeResult, UteeAttribute, UteeEntryFunc, UteeParams,
+    ContinueOperation, SyscallRequest, TeeAlgorithm, TeeAlgorithmClass, TeeAttributeType,
+    TeeCrypStateHandle, TeeHandleFlag, TeeObjHandle, TeeObjectInfo, TeeObjectType,
+    TeeOperationMode, TeeParamType, TeeResult, UteeAttribute, UteeEntryFunc, UteeParams,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -60,9 +60,11 @@ type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPoin
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> u32 {
+pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> ContinueOperation {
+    if let SyscallRequest::Return { ret } = request {
+        return ContinueOperation::ExitThread(syscalls::tee::sys_return(ret));
+    }
     let res: Result<(), TeeResult> = match request {
-        SyscallRequest::Return { ret } => syscalls::tee::sys_return(ret),
         SyscallRequest::Log { buf, len } => match unsafe { buf.to_cow_slice(len) } {
             Some(buf) => syscalls::tee::sys_log(&buf),
             None => Err(TeeResult::BadParameters),
@@ -228,9 +230,11 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> u32 {
         _ => todo!(),
     };
 
-    match res {
-        Ok(()) => TeeResult::Success.into(),
-        Err(e) => e.into(),
+    ContinueOperation::ResumeGuest {
+        return_value: match res {
+            Ok(()) => TeeResult::Success.into(),
+            Err(e) => e.into(),
+        },
     }
 }
 

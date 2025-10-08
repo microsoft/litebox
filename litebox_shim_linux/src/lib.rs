@@ -26,7 +26,7 @@ use litebox::{
     sync::{RwLock, futex::FutexManager},
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
-use litebox_common_linux::{SyscallRequest, errno::Errno};
+use litebox_common_linux::{ContinueOperation, SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
 use syscalls::net::sys_setsockopt;
 
@@ -408,17 +408,36 @@ fn pread_with_user_buf(
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
+pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> ContinueOperation {
+    if let SyscallRequest::Exit { status } = request {
+        syscalls::process::sys_exit(status);
+        return ContinueOperation::ExitThread(status);
+    } else if let SyscallRequest::ExitGroup { status } = request {
+        syscalls::process::sys_exit_group(status);
+        return ContinueOperation::ExitProcess(status);
+    } else if let SyscallRequest::Execve {
+        pathname,
+        argv,
+        envp,
+    } = request
+    {
+        match syscalls::process::sys_execve(pathname, argv, envp) {
+            Ok(()) => return ContinueOperation::ExitProcess(0),
+            Err(err) => {
+                let e: i32 = err.as_neg();
+                let Ok(e) = isize::try_from(e) else {
+                    // On both 32-bit and 64-bit, this should never be triggered
+                    unreachable!()
+                };
+                return ContinueOperation::ResumeGuest {
+                    return_value: e.reinterpret_as_unsigned(),
+                };
+            }
+        }
+    }
+
     let res: Result<usize, Errno> = match request {
         SyscallRequest::Ret(errno) => Err(errno),
-        SyscallRequest::Exit { status } => {
-            syscalls::process::sys_exit(status);
-            Ok(0)
-        }
-        SyscallRequest::ExitGroup { status } => {
-            syscalls::process::sys_exit_group(status);
-            Ok(0)
-        }
         SyscallRequest::Read { fd, buf, count } => {
             // Note some applications (e.g., `node`) seem to assume that getting fewer bytes than
             // requested indicates EOF.
@@ -868,11 +887,6 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
             }
         }
         SyscallRequest::Futex { args } => syscalls::process::sys_futex(args),
-        SyscallRequest::Execve {
-            pathname,
-            argv,
-            envp,
-        } => syscalls::process::sys_execve(pathname, argv, envp),
         SyscallRequest::Umask { mask } => {
             let old_mask = syscalls::file::sys_umask(mask);
             Ok(old_mask.bits() as usize)
@@ -888,14 +902,15 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> usize {
         }
     };
 
-    res.unwrap_or_else(|e| {
+    let ret = res.unwrap_or_else(|e| {
         let e: i32 = e.as_neg();
         let Ok(e) = isize::try_from(e) else {
             // On both 32-bit and 64-bit, this should never be triggered
             unreachable!()
         };
         e.reinterpret_as_unsigned()
-    })
+    });
+    ContinueOperation::ResumeGuest { return_value: ret }
 }
 
 fn handle_clone_request(

@@ -1265,8 +1265,6 @@ pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     pub comm: [u8; TASK_COMM_LEN],
     /// Stored frame pointer for the thread
     pub stored_bp: usize,
-    /// Indicate if it's about to terminate the current thread
-    pub to_terminate: usize,
 }
 
 #[repr(C)]
@@ -2152,6 +2150,12 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
+}
+
+pub enum ContinueOperation {
+    ResumeGuest { return_value: usize },
+    ExitThread(i32),
+    ExitProcess(i32),
 }
 
 impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Platform> {

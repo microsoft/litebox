@@ -14,7 +14,7 @@ use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer};
 use litebox::platform::{ThreadLocalStorageProvider, UnblockedOrTimedOut};
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
-use litebox_common_linux::{ProtFlags, PunchthroughSyscall};
+use litebox_common_linux::{ContinueOperation, ProtFlags, PunchthroughSyscall};
 
 mod syscall_raw;
 use syscall_raw::syscalls;
@@ -26,7 +26,8 @@ mod freebsd_types;
 extern crate alloc;
 
 /// Connector to a shim-exposed syscall-handling interface.
-pub type SyscallHandler = fn(litebox_common_linux::SyscallRequest<FreeBSDUserland>) -> usize;
+pub type SyscallHandler =
+    fn(litebox_common_linux::SyscallRequest<FreeBSDUserland>) -> ContinueOperation;
 
 /// The syscall handler passed down from the shim.
 static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
@@ -959,7 +960,12 @@ unsafe extern "C" fn syscall_handler(
                 .read()
                 .unwrap()
                 .expect("Should have run `register_syscall_handler` by now");
-            syscall_handler(d)
+            match syscall_handler(d) {
+                ContinueOperation::ResumeGuest { return_value } => return_value,
+                ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
+                    status.reinterpret_as_unsigned() as usize
+                }
+            }
         }
         Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
     }

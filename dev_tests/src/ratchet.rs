@@ -64,7 +64,7 @@ fn ratchet_maybe_uninit() -> Result<()> {
             ("litebox_platform_linux_kernel/", 1),
             ("litebox_platform_linux_userland/", 3),
             ("litebox_platform_lvbs/", 5),
-            ("litebox_shim_linux/", 8),
+            ("litebox_shim_linux/", 7),
         ],
         |file| {
             Ok(file

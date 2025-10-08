@@ -107,7 +107,6 @@ impl SnpLinuxKernel {
             }),
             comm: [0; litebox_common_linux::TASK_COMM_LEN],
             stored_bp: 0,
-            to_terminate: 0,
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         Self::set_thread_local_storage(tls);

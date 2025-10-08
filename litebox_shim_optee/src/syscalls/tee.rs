@@ -35,7 +35,7 @@ fn align_down(addr: usize, align: usize) -> usize {
 
 /// A system call to return to the kernel. A TA calls this function when
 /// it finishes its job delivered through a TA command invocation.
-pub fn sys_return(ret: usize) -> ! {
+pub fn sys_return(ret: usize) -> usize {
     #[cfg(debug_assertions)]
     litebox::log_println!(
         litebox_platform_multiplex::platform(),
@@ -50,6 +50,7 @@ pub fn sys_return(ret: usize) -> ! {
             #[allow(clippy::cast_sign_loss)]
             let session_id = tid as u32;
             crate::optee_command_dispatcher(session_id, true);
+            ret
         } else if #[cfg(feature = "platform_lvbs")] {
             todo!("switch to VTL0");
         } else {

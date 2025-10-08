@@ -291,7 +291,6 @@ pub(crate) fn sys_exit(_status: i32) {
         if let Some(robust_list) = tls.current_task.robust_list.take() {
             let _ = wake_robust_list(robust_list);
         }
-        tls.current_task.to_terminate = 1;
     });
 
     LITEBOX_PROCESS
@@ -299,11 +298,7 @@ pub(crate) fn sys_exit(_status: i32) {
         .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
 }
 
-pub(crate) fn sys_exit_group(status: i32) {
-    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
-        tls.current_task.to_terminate = 1;
-    });
-}
+pub(crate) fn sys_exit_group(_status: i32) {}
 
 fn new_thread_callback(
     args: &litebox_common_linux::NewThreadArgs<litebox_platform_multiplex::Platform>,
@@ -324,7 +319,6 @@ fn new_thread_callback(
         credentials: task.credentials.clone(),
         comm: task.comm,
         stored_bp: 0,
-        to_terminate: 0,
     });
     // Set the TLS for the platform itself
     let litebox_tls = litebox_common_linux::ThreadLocalStorage::new(new_task);
@@ -443,7 +437,6 @@ pub(crate) fn sys_clone(
                     credentials,
                     comm,
                     stored_bp: 0,
-                    to_terminate: 0,
                 }),
                 callback: new_thread_callback,
             }),
@@ -949,7 +942,7 @@ pub(crate) fn sys_execve(
     pathname: crate::ConstPtr<i8>,
     argv: crate::ConstPtr<crate::ConstPtr<i8>>,
     envp: crate::ConstPtr<crate::ConstPtr<i8>>,
-) -> Result<usize, Errno> {
+) -> Result<(), Errno> {
     fn copy_vector(
         mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
         which: &str,
@@ -1057,11 +1050,7 @@ pub(crate) fn sys_execve(
     // if `execve` fails, it is unrecoverable at this point as we have already unmapped everything.
     // TODO: add some basic checks before we unmap everything
     callback(path, argv_vec, envp_vec);
-
-    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
-        tls.current_task.to_terminate = 1;
-    });
-    Ok(0)
+    Ok(())
 }
 
 /// Handle syscall `alarm`.
