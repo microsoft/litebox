@@ -9,7 +9,7 @@ use litebox::{
     fs::{FileSystem as _, Mode, OFlags, SeekWhence},
     path,
     platform::{RawConstPointer, RawMutPointer},
-    utils::TruncateExt as _,
+    utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
     AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
@@ -131,6 +131,30 @@ pub(crate) fn sys_ftruncate(fd: i32, length: usize) -> Result<(), Errno> {
         .map_err(Errno::from)
 }
 
+/// Handle syscall `unlinkat`
+pub(crate) fn sys_unlinkat(
+    dirfd: i32,
+    pathname: impl path::Arg,
+    flags: AtFlags,
+) -> Result<(), Errno> {
+    if flags.intersects(AtFlags::AT_REMOVEDIR.complement()) {
+        return Err(Errno::EINVAL);
+    }
+
+    let fs_path = FsPath::new(dirfd, pathname)?;
+    match fs_path {
+        FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
+            if flags.contains(AtFlags::AT_REMOVEDIR) {
+                litebox_fs().rmdir(path).map_err(Errno::from)
+            } else {
+                litebox_fs().unlink(path).map_err(Errno::from)
+            }
+        }
+        FsPath::Cwd => Err(Errno::EINVAL),
+        FsPath::Fd(_) | FsPath::FdRelative { .. } => unimplemented!(),
+    }
+}
+
 /// Handle syscall `read`
 ///
 /// `offset` is an optional offset to read from. If `None`, it will read from the current file position.
@@ -225,6 +249,19 @@ pub fn sys_pread64(fd: i32, buf: &mut [u8], offset: i64) -> Result<usize, Errno>
 pub fn sys_pwrite64(fd: i32, buf: &[u8], offset: i64) -> Result<usize, Errno> {
     let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
     sys_write(fd, buf, Some(pos))
+}
+
+const SEEK_SET: i16 = 0;
+const SEEK_CUR: i16 = 1;
+const SEEK_END: i16 = 2;
+
+pub(crate) fn try_into_whence(value: i16) -> Result<SeekWhence, i16> {
+    match value {
+        SEEK_SET => Ok(SeekWhence::RelativeToBeginning),
+        SEEK_CUR => Ok(SeekWhence::RelativeToCurrentOffset),
+        SEEK_END => Ok(SeekWhence::RelativeToEnd),
+        _ => Err(value),
+    }
 }
 
 /// Handle syscall `lseek`
@@ -699,7 +736,10 @@ pub fn sys_newfstatat(
     Ok(fstat)
 }
 
-pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
+pub(crate) fn sys_fcntl(
+    fd: i32,
+    arg: FcntlArg<litebox_platform_multiplex::Platform>,
+) -> Result<u32, Errno> {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
@@ -815,6 +855,37 @@ pub fn sys_fcntl(fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
                 }
                 Descriptor::Epoll { file, .. } => todo!(),
             }
+            Ok(0)
+        }
+        FcntlArg::GETLK(lock) => {
+            let Descriptor::File(file) = desc else {
+                return Err(Errno::EBADF);
+            };
+            let mut flock = unsafe { lock.read_at_offset(0) }
+                .ok_or(Errno::EFAULT)?
+                .into_owned();
+            let lock_type = litebox_common_linux::FlockType::try_from(flock.type_)
+                .map_err(|_| Errno::EINVAL)?;
+            if let litebox_common_linux::FlockType::Unlock = lock_type {
+                return Err(Errno::EINVAL);
+            }
+
+            // Note LiteBox does not support multiple processes yet, and one process
+            // can always acquire the lock it owns, so return `Unlock` unconditionally.
+            flock.type_ = litebox_common_linux::FlockType::Unlock as i16;
+            unsafe { lock.write_at_offset(0, flock) }.ok_or(Errno::EFAULT)?;
+            Ok(0)
+        }
+        FcntlArg::SETLK(lock) | FcntlArg::SETLKW(lock) => {
+            let Descriptor::File(file) = desc else {
+                return Err(Errno::EBADF);
+            };
+            let flock = unsafe { lock.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+            let _ = litebox_common_linux::FlockType::try_from(flock.type_)
+                .map_err(|_| Errno::EINVAL)?;
+
+            // Note LiteBox does not support multiple processes yet, and one process
+            // can always acquire the lock it owns, so we don't need to maintain anything.
             Ok(0)
         }
         _ => unimplemented!(),
@@ -1122,6 +1193,83 @@ pub fn sys_epoll_pwait(
             .ok_or(Errno::EFAULT)?;
     }
     Ok(epoll_events.len())
+}
+
+/// Handle syscall `ppoll`.
+pub fn sys_ppoll(
+    fds: MutPtr<litebox_common_linux::Pollfd>,
+    nfds: usize,
+    timeout: Option<ConstPtr<litebox_common_linux::Timespec>>,
+    sigmask: Option<ConstPtr<litebox_common_linux::SigSet>>,
+    sigsetsize: usize,
+) -> Result<usize, Errno> {
+    if sigmask.is_some() {
+        unimplemented!("no sigmask support yet");
+    }
+    let timeout = timeout
+        .map(super::process::get_timeout)
+        .transpose()?
+        .map(Into::into);
+
+    do_ppoll(fds, nfds, timeout)
+}
+
+/// Handle syscall `poll`.
+pub fn sys_poll(
+    fds: MutPtr<litebox_common_linux::Pollfd>,
+    nfds: usize,
+    timeout: i32,
+) -> Result<usize, Errno> {
+    let timeout = if timeout >= 0 {
+        #[allow(clippy::cast_sign_loss, reason = "timeout is a positive integer")]
+        Some(core::time::Duration::from_millis(timeout as u64))
+    } else {
+        None
+    };
+    do_ppoll(fds, nfds, timeout)
+}
+
+fn do_ppoll(
+    fds: MutPtr<litebox_common_linux::Pollfd>,
+    nfds: usize,
+    timeout: Option<core::time::Duration>,
+) -> Result<usize, Errno> {
+    let nfds_signed = isize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
+
+    let mut set = super::epoll::PollSet::with_capacity(nfds);
+    for i in 0..nfds_signed {
+        let fd = unsafe { fds.read_at_offset(i) }
+            .ok_or(Errno::EFAULT)?
+            .into_owned();
+
+        let events =
+            litebox::event::Events::from_bits_truncate(fd.events.reinterpret_as_unsigned().into());
+        set.add_fd(fd.fd, events);
+    }
+
+    set.wait_or_timeout(|| file_descriptors().read(), timeout);
+
+    // Write just the revents back.
+    let fds_base_addr = fds.as_usize();
+    let mut ready_count = 0;
+    for (i, revents) in set.revents().enumerate() {
+        // TODO: This is not great from a provenance perspective. Consider
+        // adding cast+add methods to ConstPtr/MutPtr.
+        let fd_addr = fds_base_addr + i * core::mem::size_of::<litebox_common_linux::Pollfd>();
+        let revents_ptr = crate::MutPtr::<i16>::from_usize(
+            fd_addr + core::mem::offset_of!(litebox_common_linux::Pollfd, revents),
+        );
+        let revents: u16 = revents.bits().truncate();
+        unsafe {
+            revents_ptr
+                .write_at_offset(0, revents.reinterpret_as_signed())
+                .ok_or(Errno::EFAULT)
+        }?;
+        if revents != 0 {
+            ready_count += 1;
+        }
+    }
+    Ok(ready_count)
 }
 
 fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {

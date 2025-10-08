@@ -1065,13 +1065,93 @@ impl<
         self.upper.mkdir(path, mode)
     }
 
-    #[expect(unused_variables, reason = "unimplemented")]
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
-        // Roughly identical to `unlink` except we need to worry about directories, thus need to
-        // check for whether there are any sub-entries in the directories. This does require us to
-        // do at least a "number of entries" check on both upper and lower level at all times.
-        // However, in terms of functionality, we will be placing tombstone entries.
-        todo!()
+        let path = self.absolute_path(path)?;
+
+        // Prevent removing root explicitly (even if upper is empty).
+        if path == "/" {
+            return Err(RmdirError::Busy);
+        }
+
+        let dir_fd = match self.open(
+            path.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(e) => match e {
+                OpenError::PathError(PathError::ComponentNotADirectory) => {
+                    return Err(RmdirError::NotADirectory);
+                }
+                OpenError::PathError(pe) => return Err(pe.into()),
+                OpenError::AccessNotAllowed => todo!(),
+                OpenError::ReadOnlyFileSystem => {
+                    return Err(RmdirError::ReadOnlyFileSystem);
+                }
+                OpenError::NoWritePerms
+                | OpenError::AlreadyExists
+                | OpenError::TruncateError(_) => {
+                    unreachable!()
+                }
+            },
+        };
+        let entries = match self.read_dir(&dir_fd) {
+            Ok(entries) => entries,
+            Err(ReadDirError::NotADirectory) => unreachable!(),
+        };
+        self.close(dir_fd).expect("close dir fd failed");
+        // "." and ".." are always present; anything more => not empty.
+        if entries.len() > 2 {
+            return Err(RmdirError::NotEmpty);
+        }
+
+        // blindly rmdir at upper layer, suppressing non-existence errors.
+        if let Err(e) = self.upper.rmdir(path.as_str()) {
+            match e {
+                RmdirError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                ) => {
+                    // fallthrough
+                }
+                RmdirError::NotEmpty
+                | RmdirError::NotADirectory
+                | RmdirError::ReadOnlyFileSystem
+                | RmdirError::PathError(
+                    PathError::ComponentNotADirectory | PathError::InvalidPathname,
+                ) => unreachable!(),
+                RmdirError::Busy
+                | RmdirError::NoWritePerms
+                | RmdirError::PathError(PathError::NoSearchPerms { .. }) => return Err(e),
+            }
+        }
+
+        if let LayeringSemantics::LowerLayerReadOnly = self.layering_semantics {
+            self.root
+                .write()
+                .entries
+                .insert(path, Arc::new(EntryX::Tombstone));
+        } else {
+            // If lower layer is writable, we can just rmdir there too, suppressing non-existence errors.
+            if let Err(e) = self.lower.rmdir(path.as_str()) {
+                match e {
+                    RmdirError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    ) => {
+                        // fallthrough
+                    }
+                    RmdirError::NotEmpty
+                    | RmdirError::NotADirectory
+                    | RmdirError::ReadOnlyFileSystem
+                    | RmdirError::PathError(
+                        PathError::ComponentNotADirectory | PathError::InvalidPathname,
+                    ) => unreachable!(),
+                    RmdirError::Busy
+                    | RmdirError::NoWritePerms
+                    | RmdirError::PathError(PathError::NoSearchPerms { .. }) => return Err(e),
+                }
+            }
+        }
+        Ok(())
     }
 
     fn read_dir(&self, fd: &FileFd<Platform, Upper, Lower>) -> Result<Vec<DirEntry>, ReadDirError> {

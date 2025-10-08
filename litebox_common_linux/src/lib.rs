@@ -201,6 +201,9 @@ bitflags::bitflags! {
         /// Don't sync attributes with the server
         const AT_STATX_DONT_SYNC = 0x4000;
 
+        /// Used with `unlinkat`, remove directory instead of unlinking a file.
+        const AT_REMOVEDIR = 0x200;
+
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
     }
@@ -442,7 +445,7 @@ impl From<litebox::fs::FileStatus> for FileStat {
 /// Commands for use with `fcntl`.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum FcntlArg {
+pub enum FcntlArg<Platform: litebox::platform::RawPointerProvider> {
     /// Get the file descriptor flags
     GETFD,
     /// Set the file descriptor flags
@@ -451,12 +454,47 @@ pub enum FcntlArg {
     GETFL,
     /// Set descriptor status flags
     SETFL(OFlags),
+    /// Get a file lock
+    GETLK(Platform::RawMutPointer<Flock>),
+    /// Set a file lock
+    SETLK(Platform::RawConstPointer<Flock>),
+    /// Set a file lock and wait if blocked
+    SETLKW(Platform::RawConstPointer<Flock>),
+}
+
+#[repr(i16)]
+#[derive(Debug, IntEnum)]
+pub enum FlockType {
+    /// Shared or read lock
+    ReadLock = 0,
+    /// Exclusive or write lock
+    WriteLock = 1,
+    /// Remove lock
+    Unlock = 2,
+}
+
+#[repr(C)]
+#[derive(Clone, Debug)]
+pub struct Flock {
+    /// Type of lock: F_RDLCK, F_WRLCK, or F_UNLCK
+    pub type_: i16,
+    /// Where `start' is relative to
+    pub whence: i16,
+    /// Offset where the lock begins
+    pub start: usize,
+    /// Size of the locked area, 0 means until EOF
+    pub len: isize,
+    /// Process holding the lock
+    pub pid: i32,
 }
 
 const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
+const F_GETLK: i32 = 5;
+const F_SETLK: i32 = 6;
+const F_SETLKW: i32 = 7;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
@@ -468,14 +506,17 @@ bitflags::bitflags! {
     }
 }
 
-impl FcntlArg {
+impl<Platform: litebox::platform::RawPointerProvider> FcntlArg<Platform> {
     pub fn from(cmd: i32, arg: usize) -> Self {
         match cmd {
             F_GETFD => Self::GETFD,
             F_SETFD => Self::SETFD(FileDescriptorFlags::from_bits_truncate(arg.truncate())),
             F_GETFL => Self::GETFL,
             F_SETFL => Self::SETFL(OFlags::from_bits_truncate(arg.truncate())),
-            _ => unimplemented!(),
+            F_GETLK => Self::GETLK(Platform::RawMutPointer::from_usize(arg)),
+            F_SETLK => Self::SETLK(Platform::RawConstPointer::from_usize(arg)),
+            F_SETLKW => Self::SETLKW(Platform::RawConstPointer::from_usize(arg)),
+            _ => unimplemented!("{cmd}"),
         }
     }
 }
@@ -1440,6 +1481,14 @@ pub struct EpollEvent {
     pub data: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct Pollfd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
 #[repr(i32)]
 #[derive(Debug, IntEnum)]
 pub enum MadviseBehavior {
@@ -1931,7 +1980,7 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     },
     Fcntl {
         fd: i32,
-        arg: FcntlArg,
+        arg: FcntlArg<Platform>,
     },
     Getcwd {
         buf: Platform::RawMutPointer<u8>,
@@ -1953,6 +2002,18 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     },
     EpollCreate {
         flags: EpollCreateFlags,
+    },
+    Poll {
+        fds: Platform::RawMutPointer<Pollfd>,
+        nfds: usize,
+        timeout: i32,
+    },
+    Ppoll {
+        fds: Platform::RawMutPointer<Pollfd>,
+        nfds: usize,
+        timeout: Option<Platform::RawConstPointer<Timespec>>,
+        sigmask: Option<Platform::RawConstPointer<SigSet>>,
+        sigsetsize: usize,
     },
     ArchPrctl {
         arg: ArchPrctlArg<Platform>,
@@ -1977,6 +2038,11 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     Ftruncate {
         fd: i32,
         length: usize,
+    },
+    Unlinkat {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        flags: AtFlags,
     },
     #[cfg(target_arch = "x86_64")]
     Newfstatat {
@@ -2465,6 +2531,17 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 }
             }
             Sysno::epoll_create1 => sys_req!(EpollCreate { flags }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::ppoll => {
+                sys_req!(Ppoll { fds:*, nfds, timeout:*, sigmask:*, sigsetsize })
+            }
+            #[cfg(target_arch = "x86")]
+            Sysno::ppoll_time64 => {
+                sys_req!(Ppoll { fds:*, nfds, timeout:*, sigmask:*, sigsetsize })
+            }
+            Sysno::poll => {
+                sys_req!(Poll { fds:*, nfds, timeout })
+            }
             Sysno::prctl => {
                 let op: u32 = ctx.sys_req_arg(0);
                 if let Ok(op) = PrctlOption::try_from(op) {
@@ -2515,6 +2592,15 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     pathname: ctx.sys_req_ptr(0),
                     flags: ctx.sys_req_arg(1),
                     mode: ctx.sys_req_arg(2),
+                }
+            }
+            Sysno::unlinkat => sys_req!(Unlinkat { dirfd,pathname:*,flags }),
+            Sysno::unlink => {
+                // unlink is equivalent to unlinkat with dirfd AT_FDCWD and flags 0
+                SyscallRequest::Unlinkat {
+                    dirfd: AT_FDCWD,
+                    pathname: ctx.sys_req_ptr(0),
+                    flags: AtFlags::empty(),
                 }
             }
             Sysno::creat => {

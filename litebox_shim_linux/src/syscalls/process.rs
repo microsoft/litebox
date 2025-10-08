@@ -853,11 +853,12 @@ pub(crate) fn sys_sched_getaffinity(_pid: Option<i32>) -> CpuSet {
     CpuSet { bits: cpuset }
 }
 
-fn get_timeout(
+// TODO: move elsewhere?
+pub(crate) fn get_timeout(
     timeout: crate::ConstPtr<litebox_common_linux::Timespec>,
 ) -> Result<litebox_common_linux::Timespec, Errno> {
     let timeout = unsafe { timeout.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
-    if timeout.tv_sec < 0 || timeout.tv_nsec > 1_000_000_000 {
+    if timeout.tv_sec < 0 || timeout.tv_nsec >= 1_000_000_000 {
         return Err(Errno::EINVAL);
     }
     Ok(timeout.into_owned())
