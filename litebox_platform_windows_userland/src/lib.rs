@@ -20,7 +20,7 @@ use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox::platform::{ImmediatelyWokenUp, RawMutPointer};
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
-use litebox_common_linux::PunchthroughSyscall;
+use litebox_common_linux::{ContinueOperation, PunchthroughSyscall};
 
 use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
 use windows_sys::Win32::{
@@ -1286,7 +1286,7 @@ unsafe extern "C" {
 unsafe extern "C" fn syscall_handler(
     syscall_number: usize,
     ctx: *mut litebox_common_linux::PtRegs,
-) -> usize {
+) -> bool {
     // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
     let ctx = unsafe { &mut *ctx };
 
@@ -1300,7 +1300,7 @@ unsafe extern "C" fn syscall_handler(
                 ContinueOperation::ResumeGuest { return_value } => {
                     #[cfg(target_arch = "x86_64")]
                     {
-                        ctx.rax = return_value as usize;
+                        ctx.rax = return_value;
                     }
                     #[cfg(target_arch = "x86")]
                     {
@@ -1309,27 +1309,13 @@ unsafe extern "C" fn syscall_handler(
                     true
                 }
                 ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        ctx.rax = status.reinterpret_as_unsigned() as usize;
-                    }
-                    #[cfg(target_arch = "x86")]
-                    {
-                        ctx.eax = status.reinterpret_as_unsigned();
-                    }
+                    ctx.rax = status.reinterpret_as_unsigned() as usize;
                     false
                 }
             }
         }
         Err(err) => {
-            #[cfg(target_arch = "x86_64")]
-            {
-                ctx.rax = err.as_neg() as usize;
-            }
-            #[cfg(target_arch = "x86")]
-            {
-                ctx.eax = err.as_neg() as usize;
-            }
+            ctx.rax = (err.as_neg() as isize).reinterpret_as_unsigned();
             true
         }
     }
