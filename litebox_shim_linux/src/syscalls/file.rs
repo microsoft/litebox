@@ -339,7 +339,10 @@ pub(crate) fn do_close(desc: Descriptor) -> Result<(), Errno> {
                     match rds
                             .fd_consume_raw_integer::<litebox::net::Network<litebox_platform_multiplex::Platform>>(raw_fd)
                         {
-                            Ok(fd) => todo!("net"),
+                            Ok(fd) => {
+                                drop(rds);
+                                crate::litebox_net().lock().close(&fd).map_err(Errno::from)
+                            },
                             Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
                             Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
                                 // We currently only have net and fs FDs at the moment, if/when we add

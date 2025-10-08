@@ -168,6 +168,15 @@ impl From<litebox::fs::errors::CloseError> for Errno {
     }
 }
 
+impl From<litebox::net::errors::CloseError> for Errno {
+    fn from(value: litebox::net::errors::CloseError) -> Self {
+        match value {
+            litebox::net::errors::CloseError::InvalidFd => Errno::EBADF,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::fs::errors::ReadError> for Errno {
     fn from(value: litebox::fs::errors::ReadError) -> Self {
         match value {
