@@ -1691,7 +1691,13 @@ unsafe extern "C" fn syscall_handler(
                 ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
                     #[cfg(target_arch = "x86_64")]
                     {
-                        ctx.rax = status.reinterpret_as_unsigned() as usize;
+                        cfg_if::cfg_if! {
+                            if #[cfg(feature = "linux_syscall")] {
+                                ctx.rax = status.reinterpret_as_unsigned() as usize;
+                            } else if #[cfg(feature = "optee_syscall")] {
+                                ctx.rax = status;
+                            }
+                        }
                     }
                     #[cfg(target_arch = "x86")]
                     {

@@ -50,7 +50,6 @@ pub fn sys_return(ret: usize) -> usize {
             #[allow(clippy::cast_sign_loss)]
             let session_id = tid as u32;
             crate::optee_command_dispatcher(session_id, true);
-            ret
         } else if #[cfg(feature = "platform_lvbs")] {
             todo!("switch to VTL0");
         } else {
