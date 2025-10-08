@@ -17,9 +17,7 @@ use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer, ThreadLocalStorageProvider};
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
-use litebox_common_linux::{
-    ContinueOperation, MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall,
-};
+use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
 
 mod syscall_intercept;
 
@@ -27,10 +25,10 @@ extern crate alloc;
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "linux_syscall")] {
-        use litebox_common_linux::SyscallRequest;
+        use litebox_common_linux::{ContinueOperation, SyscallRequest};
         pub type SyscallReturnType = litebox_common_linux::ContinueOperation;
     } else if #[cfg(feature = "optee_syscall")] {
-        use litebox_common_optee::SyscallRequest;
+        use litebox_common_optee::{ContinueOperation, SyscallRequest};
         pub type SyscallReturnType = litebox_common_optee::ContinueOperation;
     } else {
         compile_error!(r##"No syscall handler specified."##);

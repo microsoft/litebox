@@ -41,13 +41,14 @@ use x86_64::{
 cfg_if::cfg_if! {
     if #[cfg(feature = "linux_syscall")] {
         use litebox_common_linux::{ContinueOperation, SyscallRequest};
+        pub type SyscallReturnType = ContinueOperation;
     } else if #[cfg(feature = "optee_syscall")] {
         use litebox_common_optee::{ContinueOperation, SyscallRequest};
+        pub type SyscallReturnType = ContinueOperation;
     } else {
         compile_error!(r##"No syscall handler specified."##);
     }
 }
-pub type SyscallReturnType = ContinueOperation;
 
 pub type SyscallHandler = fn(SyscallRequest<crate::host::LvbsLinuxKernel>) -> SyscallReturnType;
 static SYSCALL_HANDLER: spin::Once<SyscallHandler> = spin::Once::new();
