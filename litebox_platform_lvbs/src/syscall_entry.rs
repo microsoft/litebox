@@ -143,7 +143,7 @@ impl SyscallContextRaw {
 
 #[allow(clippy::similar_names)]
 #[allow(unreachable_code)]
-fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> u32 {
+fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> usize {
     let syscall_handler: SyscallHandler = *SYSCALL_HANDLER
         .get()
         .expect("Syscall handler should be initialized");
@@ -172,9 +172,27 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> u32 {
         SyscallRequest::try_from_raw(usize::try_from(sysnr).unwrap(), &ctx)
             .expect("Failed to convert syscall request"),
     ) {
-        ContinueOperation::ResumeGuest { return_value } => return_value,
+        ContinueOperation::ResumeGuest { return_value } => {
+            cfg_if::cfg_if! {
+                if #[cfg(feature = "linux_syscall")] {
+                    return_value
+                } else if #[cfg(feature = "optee_syscall")] {
+                    return_value as usize
+                } else {
+                    compile_error!(r##"No syscall handler specified."##);
+                }
+            }
+        }
         ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
-            u32::try_from(status).unwrap()
+            cfg_if::cfg_if! {
+                if #[cfg(feature = "linux_syscall")] {
+                    status.cast_unsigned() as usize
+                } else if #[cfg(feature = "optee_syscall")] {
+                    status
+                } else {
+                    compile_error!(r##"No syscall handler specified."##);
+                }
+            }
         }
     };
 
