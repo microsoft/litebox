@@ -99,19 +99,7 @@ pub extern "C" fn sandbox_process_init(
     let litebox = litebox_shim_linux::litebox();
     let in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, ROOTFS.into());
-    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(litebox);
-    let fs = litebox::fs::layered::FileSystem::new(
-        litebox,
-        in_mem_fs,
-        litebox::fs::layered::FileSystem::new(
-            litebox,
-            dev_stdio,
-            tar_ro,
-            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
-        ),
-        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
-    );
-    litebox_shim_linux::set_fs(fs);
+    litebox_shim_linux::set_fs(litebox_shim_linux::default_fs(in_mem_fs, tar_ro));
 
     let parse_args =
         |params: &litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params| -> Option<(
