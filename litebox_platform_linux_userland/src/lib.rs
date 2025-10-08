@@ -1680,7 +1680,13 @@ unsafe extern "C" fn syscall_handler(
                 ContinueOperation::ResumeGuest { return_value } => {
                     #[cfg(target_arch = "x86_64")]
                     {
-                        ctx.rax = return_value as usize;
+                        cfg_if::cfg_if! {
+                            if #[cfg(feature = "linux_syscall")] {
+                                ctx.rax = return_value;
+                            } else if #[cfg(feature = "optee_syscall")] {
+                                ctx.rax = return_value as usize;
+                            }
+                        }
                     }
                     #[cfg(target_arch = "x86")]
                     {
