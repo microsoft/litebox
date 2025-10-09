@@ -2,7 +2,7 @@
 
 use core::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::atomic::{AtomicBool, AtomicU32},
+    sync::atomic::AtomicU32,
 };
 
 use litebox::{
@@ -104,7 +104,6 @@ pub(crate) struct Socket {
     pub(crate) raw_fd: Option<usize>,
     /// File status flags (see [`litebox::fs::OFlags::STATUS_FLAGS_MASK`])
     pub(crate) status: AtomicU32,
-    pub(crate) close_on_exec: AtomicBool,
     sock_type: SockType,
     options: litebox::sync::Mutex<Platform, SocketOptions>,
     pollee: Pollee<Platform>,
@@ -150,11 +149,20 @@ impl Socket {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
 
+        if flags.contains(SockFlags::CLOEXEC) {
+            short_borrow_socket_fd(raw_fd, |fd| {
+                let old = crate::litebox()
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC);
+                assert!(old.is_none());
+            })
+            .unwrap();
+        }
+
         Self {
             raw_fd: Some(raw_fd),
             // `SockFlags` is a subset of `OFlags`
             status: AtomicU32::new(flags.bits()),
-            close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
             sock_type,
             options: litebox.sync().new_mutex(SocketOptions::default()),
             pollee: Pollee::new(litebox),
