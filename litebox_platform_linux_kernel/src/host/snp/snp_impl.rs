@@ -263,10 +263,6 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
         });
         unreachable!("Should not return to the caller after terminating the thread");
     }
-
-    fn next_thread_id(&self) -> i32 {
-        todo!()
-    }
 }
 
 impl bindings::SnpVmplRequestArgs {

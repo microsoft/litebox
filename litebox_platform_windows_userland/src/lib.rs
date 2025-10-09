@@ -8,8 +8,8 @@ use core::cell::Cell;
 use core::cell::RefCell;
 use core::mem::ManuallyDrop;
 use core::panic;
+use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering::SeqCst;
-use core::sync::atomic::{AtomicI32, AtomicU32};
 use core::time::Duration;
 use std::os::raw::c_void;
 
@@ -89,8 +89,6 @@ static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::R
 pub struct WindowsUserland {
     reserved_pages: alloc::vec::Vec<core::ops::Range<usize>>,
     sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
-    /// Thread Id counter
-    thread_id_counter: std::sync::atomic::AtomicI32,
 }
 
 impl core::fmt::Debug for WindowsUserland {
@@ -187,7 +185,6 @@ impl WindowsUserland {
         let platform = Self {
             reserved_pages,
             sys_info: std::sync::RwLock::new(sys_info),
-            thread_id_counter: AtomicI32::new(2), // next thread id
         };
         Self::set_init_tls();
 
@@ -513,11 +510,6 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
 
     fn terminate_thread(&self, _code: Self::ExitCode) -> ! {
         todo!("this function is not needed")
-    }
-
-    fn next_thread_id(&self) -> i32 {
-        self.thread_id_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 }
 

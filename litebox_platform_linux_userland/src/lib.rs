@@ -7,8 +7,8 @@
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::atomic::{AtomicI32, AtomicU32};
 use std::time::Duration;
 
 use litebox::fs::OFlags;
@@ -52,8 +52,6 @@ pub struct LinuxUserland {
     reserved_pages: Vec<core::ops::Range<usize>>,
     /// The base address of the VDSO.
     vdso_address: Option<usize>,
-    /// Thread Id counter
-    thread_id_counter: std::sync::atomic::AtomicI32,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -175,7 +173,6 @@ impl LinuxUserland {
             seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages,
             vdso_address,
-            thread_id_counter: AtomicI32::new(2), // next thread id
         };
         Self::set_init_tls();
         Box::leak(Box::new(platform))
@@ -649,11 +646,6 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
 
     fn terminate_thread(&self, _code: Self::ExitCode) -> ! {
         todo!("this function is not needed")
-    }
-
-    fn next_thread_id(&self) -> i32 {
-        self.thread_id_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 }
 

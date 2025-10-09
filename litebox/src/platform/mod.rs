@@ -99,9 +99,6 @@ pub trait ThreadProvider: RawPointerProvider + ExitProvider {
 
     /// Terminate the current thread with the given exit code.
     fn terminate_thread(&self, code: Self::ExitCode) -> !;
-
-    /// Get the next available thread ID.
-    fn next_thread_id(&self) -> i32;
 }
 
 /// Punch through any functionality for a particular platform that is not explicitly part of the

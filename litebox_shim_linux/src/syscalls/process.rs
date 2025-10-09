@@ -1,9 +1,9 @@
 //! Process/thread related syscalls.
 
+use alloc::boxed::Box;
 use core::mem::offset_of;
 use core::ops::Range;
-
-use alloc::boxed::Box;
+use core::sync::atomic::AtomicI32;
 use litebox::mm::linux::VmFlags;
 use litebox::platform::{ExitProvider as _, RawMutPointer as _, ThreadProvider as _};
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
@@ -20,6 +20,8 @@ pub(crate) struct Process {
     pub(crate) nr_threads: core::sync::atomic::AtomicU16,
     /// resource limits for this process
     pub(crate) limits: ResourceLimits,
+    /// Thread Id counter
+    pub(crate) thread_id_counter: AtomicI32,
 }
 
 /// A global singleton process structure.
@@ -28,6 +30,7 @@ pub(crate) struct Process {
 pub(crate) static LITEBOX_PROCESS: Process = Process {
     nr_threads: core::sync::atomic::AtomicU16::new(1),
     limits: ResourceLimits::default(),
+    thread_id_counter: AtomicI32::new(2), // start from 2, as 1 is used by the main thread
 };
 
 /// Set the current task's command name.
@@ -411,7 +414,9 @@ pub(crate) fn sys_clone(
     };
 
     let platform = litebox_platform_multiplex::platform();
-    let child_tid = platform.next_thread_id();
+    let child_tid = LITEBOX_PROCESS
+        .thread_id_counter
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if let Some(parent_tid_ptr) = set_parent_tid {
         let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid) };
     }
