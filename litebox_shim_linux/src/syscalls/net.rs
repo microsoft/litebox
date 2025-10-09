@@ -17,8 +17,8 @@ use litebox_common_linux::{
     TcpOption, errno::Errno,
 };
 
-use crate::Platform;
 use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox_net};
+use crate::{Platform, litebox};
 
 const ADDR_MAX_LEN: usize = 128;
 
@@ -104,7 +104,6 @@ pub(crate) struct Socket {
     pub(crate) raw_fd: Option<usize>,
     /// File status flags (see [`litebox::fs::OFlags::STATUS_FLAGS_MASK`])
     pub(crate) status: AtomicU32,
-    options: litebox::sync::Mutex<Platform, SocketOptions>,
     pollee: Pollee<Platform>,
 }
 
@@ -153,7 +152,6 @@ impl Socket {
         raw_fd: usize,
         sock_type: SockType,
         flags: SockFlags,
-        litebox: &litebox::LiteBox<Platform>,
         init_events: Events,
     ) -> Self {
         let _ = init_events; // TODO: `init_events` were being ignored before this PR, what to do?
@@ -161,15 +159,17 @@ impl Socket {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
 
-        if flags.contains(SockFlags::CLOEXEC) {
-            short_borrow_socket_fd(raw_fd, |fd| {
-                let old = crate::litebox()
-                    .descriptor_table_mut()
-                    .set_fd_metadata(fd, litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC);
+        short_borrow_socket_fd(raw_fd, |fd| {
+            let mut dt = litebox().descriptor_table_mut();
+            let old = dt.set_entry_metadata(fd, SocketOptions::default());
+            assert!(old.is_none());
+            if flags.contains(SockFlags::CLOEXEC) {
+                let old =
+                    dt.set_fd_metadata(fd, litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC);
                 assert!(old.is_none());
-            })
-            .unwrap();
-        }
+            }
+        })
+        .unwrap();
         short_borrow_socket_fd(raw_fd, |fd| {
             let old = crate::litebox()
                 .descriptor_table_mut()
@@ -182,9 +182,28 @@ impl Socket {
             raw_fd: Some(raw_fd),
             // `SockFlags` is a subset of `OFlags`
             status: AtomicU32::new(flags.bits()),
-            options: litebox.sync().new_mutex(SocketOptions::default()),
-            pollee: Pollee::new(litebox),
+            pollee: Pollee::new(litebox()),
         }
+    }
+
+    fn with_socket_options<R>(&self, f: impl FnOnce(&SocketOptions) -> R) -> Result<R, Errno> {
+        short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+            litebox()
+                .descriptor_table()
+                .with_metadata(fd, |opt| f(opt))
+                .unwrap()
+        })
+    }
+    fn with_socket_options_mut<R>(
+        &self,
+        f: impl FnOnce(&mut SocketOptions) -> R,
+    ) -> Result<R, Errno> {
+        short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+            litebox()
+                .descriptor_table_mut()
+                .with_metadata_mut(fd, |opt| f(opt))
+                .unwrap()
+        })
     }
 
     fn setsockopt(
@@ -213,11 +232,13 @@ impl Socket {
                     };
                 match so {
                     SocketOption::RCVTIMEO => {
-                        self.options.lock().recv_timeout = read_timeval_as_duration(optval)?;
+                        let duration = read_timeval_as_duration(optval)?;
+                        self.with_socket_options_mut(|opt| opt.recv_timeout = duration)?;
                         return Ok(());
                     }
                     SocketOption::SNDTIMEO => {
-                        self.options.lock().send_timeout = read_timeval_as_duration(optval)?;
+                        let duration = read_timeval_as_duration(optval)?;
+                        self.with_socket_options_mut(|opt| opt.send_timeout = duration)?;
                         return Ok(());
                     }
                     SocketOption::LINGER => {
@@ -245,7 +266,7 @@ impl Socket {
                     .into_owned();
                 match so {
                     SocketOption::REUSEADDR => {
-                        self.options.lock().reuse_address = val != 0;
+                        self.with_socket_options_mut(|opt| opt.reuse_address = val != 0)?;
                     }
                     SocketOption::BROADCAST => {
                         if val == 0 {
@@ -275,7 +296,7 @@ impl Socket {
                                 _ => unimplemented!(),
                             }
                         }
-                        self.options.lock().keep_alive = keep_alive;
+                        self.with_socket_options_mut(|opt| opt.keep_alive = keep_alive)?;
                     }
                     // We use fixed buffer size for now
                     SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
@@ -353,16 +374,17 @@ impl Socket {
             SocketOptionName::Socket(sopt) => {
                 match sopt {
                     SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER => {
-                        let tv = match sopt {
-                            SocketOption::RCVTIMEO => self.options.lock().recv_timeout,
-                            SocketOption::SNDTIMEO => self.options.lock().send_timeout,
-                            SocketOption::LINGER => self.options.lock().linger_timeout,
-                            _ => unreachable!(),
-                        }
-                        .map_or_else(
-                            litebox_common_linux::TimeVal::default,
-                            litebox_common_linux::TimeVal::from,
-                        );
+                        let tv = self
+                            .with_socket_options(|options| match sopt {
+                                SocketOption::RCVTIMEO => options.recv_timeout,
+                                SocketOption::SNDTIMEO => options.send_timeout,
+                                SocketOption::LINGER => options.linger_timeout,
+                                _ => unreachable!(),
+                            })?
+                            .map_or_else(
+                                litebox_common_linux::TimeVal::default,
+                                litebox_common_linux::TimeVal::from,
+                            );
                         // If the provided buffer is too small, we just write as much as we can.
                         let length = size_of::<litebox_common_linux::TimeVal>().min(len as usize);
                         let data = unsafe {
@@ -374,9 +396,13 @@ impl Socket {
                     _ => {
                         let val = match sopt {
                             SocketOption::TYPE => get_socket_type(self.raw_fd.unwrap())? as u32,
-                            SocketOption::REUSEADDR => u32::from(self.options.lock().reuse_address),
+                            SocketOption::REUSEADDR => {
+                                u32::from(self.with_socket_options(|o| o.reuse_address)?)
+                            }
                             SocketOption::BROADCAST => 1, // TODO: We don't support disabling SO_BROADCAST
-                            SocketOption::KEEPALIVE => u32::from(self.options.lock().keep_alive),
+                            SocketOption::KEEPALIVE => {
+                                u32::from(self.with_socket_options(|o| o.keep_alive)?)
+                            }
                             SocketOption::RCVBUF | SocketOption::SNDBUF => {
                                 litebox::net::SOCKET_BUFFER_SIZE.truncate()
                             }
@@ -534,7 +560,7 @@ impl Socket {
         if self.get_status().contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT) {
             self.try_sendto(buf, new_flags, sockaddr)
         } else {
-            let timeout = self.options.lock().send_timeout;
+            let timeout = self.with_socket_options(|opt| opt.send_timeout)?;
             if timeout.is_some() {
                 todo!("send timeout");
             }
@@ -601,7 +627,7 @@ impl Socket {
         if self.get_status().contains(OFlags::NONBLOCK) || flags.contains(ReceiveFlags::DONTWAIT) {
             self.try_receive(buf, new_flags, source_addr)
         } else {
-            let timeout = self.options.lock().recv_timeout;
+            let timeout = self.with_socket_options(|opt| opt.recv_timeout)?;
             if timeout.is_some() {
                 todo!("recv timeout");
             }
@@ -668,7 +694,6 @@ pub(crate) fn sys_socket(
                 raw_fd,
                 ty,
                 flags,
-                crate::litebox(),
                 Events::empty(),
             )))
         }
@@ -775,7 +800,6 @@ pub(crate) fn sys_accept(
                 raw_fd,
                 sock_type,
                 flags,
-                crate::litebox(),
                 Events::empty(),
             )))
         }
