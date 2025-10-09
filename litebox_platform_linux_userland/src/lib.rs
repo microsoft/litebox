@@ -567,8 +567,11 @@ pub unsafe extern "C" fn thread_start_internal(
             "pop rdx",
             "pop rsi",
             "pop rdi",
-            "add rsp, 24",  // orig_rax, rip, cs
+            "pop r10", // skip orig_rax
+            "pop r10", // read rip into r10
+            "pop r11", // skip cs
             "popfq",
+            "pop r11", // read rsp into rax
             "mov rsp, r11", // set rsp to the stack_top of the guest
             "jmp r10", // jump to the entry point of the thread
             in("rax") ctx,
@@ -587,8 +590,11 @@ pub unsafe extern "C" fn thread_start_internal(
             "pop esi",
             "pop edi",
             "pop ebp",
-            "add esp, 32", // skip eax, xds, xes, xfs, xgs, orig_eax, eip, xcs,
+            "add esp, 24", // skip eax, xds, xes, xfs, xgs, orig_eax, eip, xcs,
+            "pop ebx", // read eip into ebx
+            "pop ecx", // skip xcs
             "popfd",
+            "pop ecx", // read esp into ecx
             "mov esp, ecx", // set esp to the stack_top of the guest
             "jmp ebx", // jump to the entry point of the thread
             in("eax") ctx,
@@ -625,14 +631,14 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
 
         #[cfg(target_arch = "x86_64")]
         {
-            ctx_copy.r10 = entry_point;
-            ctx_copy.r11 = stack.as_usize() + stack_size;
+            ctx_copy.rip = entry_point;
+            ctx_copy.rsp = stack.as_usize() + stack_size;
         }
 
         #[cfg(target_arch = "x86")]
         {
-            ctx_copy.ebx = entry_point;
-            ctx_copy.ecx = stack.as_usize() + stack_size;
+            ctx_copy.eip = entry_point;
+            ctx_copy.esp = stack.as_usize() + stack_size;
         }
 
         // TODO: do we need to wait for the handle in the main thread?

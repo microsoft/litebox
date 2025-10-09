@@ -81,8 +81,8 @@ pub fn test_load_exec_common(executable_path: &str) {
         r12: 0,
         rbp: 0,
         rbx: 0,
-        r11: info.user_stack_top,
-        r10: info.entry_point,
+        r11: 0,
+        r10: 0,
         r9: 0,
         r8: 0,
         rax: 0,
@@ -91,10 +91,10 @@ pub fn test_load_exec_common(executable_path: &str) {
         rsi: 0,
         rdi: 0,
         orig_rax: 0,
-        rip: 0,
+        rip: info.entry_point,
         cs: 0x33, // __USER_CS
         eflags: 0,
-        rsp: 0,
+        rsp: info.user_stack_top,
         ss: 0x2b, // __USER_DS
     };
     unsafe { litebox_platform_windows_userland::thread_start_asm(&pt_regs) };

@@ -251,8 +251,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         r12: 0,
         rbp: 0,
         rbx: 0,
-        r11: loaded_program.user_stack_top,
-        r10: loaded_program.entry_point,
+        r11: 0,
+        r10: 0,
         r9: 0,
         r8: 0,
         rax: 0,
@@ -261,10 +261,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         rsi: 0,
         rdi: 0,
         orig_rax: 0,
-        rip: 0,
+        rip: loaded_program.entry_point,
         cs: 0x33, // __USER_CS
         eflags: 0,
-        rsp: 0,
+        rsp: loaded_program.user_stack_top,
         ss: 0x2b, // __USER_DS
     };
 

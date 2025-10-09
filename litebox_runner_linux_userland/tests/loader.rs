@@ -114,8 +114,8 @@ fn test_load_exec_common(executable_path: &str) {
         r12: 0,
         rbp: 0,
         rbx: 0,
-        r11: info.user_stack_top,
-        r10: info.entry_point,
+        r11: 0,
+        r10: 0,
         r9: 0,
         r8: 0,
         rax: 0,
@@ -124,16 +124,16 @@ fn test_load_exec_common(executable_path: &str) {
         rsi: 0,
         rdi: 0,
         orig_rax: 0,
-        rip: 0,
+        rip: info.entry_point,
         cs: 0x33, // __USER_CS
         eflags: 0,
-        rsp: 0,
+        rsp: info.user_stack_top,
         ss: 0x2b, // __USER_DS
     };
     #[cfg(target_arch = "x86")]
     let pt_regs = litebox_common_linux::PtRegs {
-        ebx: info.entry_point,
-        ecx: info.user_stack_top,
+        ebx: 0,
+        ecx: 0,
         edx: 0,
         esi: 0,
         edi: 0,
@@ -144,10 +144,10 @@ fn test_load_exec_common(executable_path: &str) {
         xfs: 0,
         xgs: 0,
         orig_eax: 0,
-        eip: 0,
+        eip: info.entry_point,
         xcs: 0x23, // __USER_CS
         eflags: 0,
-        esp: 0,
+        esp: info.user_stack_top,
         xss: 0x2b, // __USER_DS
     };
     unsafe { litebox_platform_linux_userland::thread_start_asm(&pt_regs) };

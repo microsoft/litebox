@@ -460,8 +460,11 @@ pub unsafe extern "C" fn thread_start_internal(
             "pop rdx",
             "pop rsi",
             "pop rdi",
-            "add rsp, 24",  // orig_rax, rip, cs
+            "pop r10", // skip orig_rax
+            "pop r10", // read rip into r10
+            "pop r11", // skip cs
             "popfq",
+            "pop r11", // read rsp into rax
             "mov rsp, r11", // set rsp to the stack_top of the guest
             "jmp r10", // jump to the entry point of the thread
             in("rax") ctx,
@@ -498,8 +501,8 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
 
         #[cfg(target_arch = "x86_64")]
         {
-            ctx_copy.r10 = entry_point;
-            ctx_copy.r11 = stack.as_usize() + stack_size;
+            ctx_copy.rip = entry_point;
+            ctx_copy.rsp = stack.as_usize() + stack_size;
         }
 
         // TODO: do we need to wait for the handle in the main thread?

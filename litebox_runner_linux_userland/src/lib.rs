@@ -305,8 +305,8 @@ fn load_program(
         r12: 0,
         rbp: 0,
         rbx: 0,
-        r11: loaded_program.user_stack_top,
-        r10: loaded_program.entry_point,
+        r11: 0,
+        r10: 0,
         r9: 0,
         r8: 0,
         rax: 0,
@@ -315,16 +315,16 @@ fn load_program(
         rsi: 0,
         rdi: 0,
         orig_rax: 0,
-        rip: 0,
+        rip: loaded_program.entry_point,
         cs: 0x33, // __USER_CS
         eflags: 0,
-        rsp: 0,
+        rsp: loaded_program.user_stack_top,
         ss: 0x2b, // __USER_DS
     };
     #[cfg(target_arch = "x86")]
     let pt_regs = litebox_common_linux::PtRegs {
-        ebx: loaded_program.entry_point,
-        ecx: loaded_program.user_stack_top,
+        ebx: 0,
+        ecx: 0,
         edx: 0,
         esi: 0,
         edi: 0,
@@ -335,10 +335,10 @@ fn load_program(
         xfs: 0,
         xgs: 0,
         orig_eax: 0,
-        eip: 0,
+        eip: loaded_program.entry_point,
         xcs: 0x23, // __USER_CS
         eflags: 0,
-        esp: 0,
+        esp: loaded_program.user_stack_top,
         xss: 0x2b, // __USER_DS
     };
     unsafe { litebox_platform_linux_userland::thread_start_asm(&pt_regs) };
