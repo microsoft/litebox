@@ -31,7 +31,7 @@ enum DescriptorRef {
     PipeReader(Weak<litebox::pipes::ReadEnd<Platform, u8>>),
     PipeWriter(Weak<litebox::pipes::WriteEnd<Platform, u8>>),
     Eventfd(Weak<crate::syscalls::eventfd::EventFile<litebox_platform_multiplex::Platform>>),
-    Socket(Weak<crate::syscalls::net::Socket>),
+    // Socket(Weak<crate::syscalls::net::Socket>),
 }
 
 impl DescriptorRef {
@@ -44,7 +44,7 @@ impl DescriptorRef {
                 DescriptorRef::PipeWriter(Arc::downgrade(producer))
             }
             Descriptor::Eventfd { file, .. } => DescriptorRef::Eventfd(Arc::downgrade(file)),
-            Descriptor::Socket(socket) => DescriptorRef::Socket(Arc::downgrade(socket)),
+            // Descriptor::Socket(socket) => DescriptorRef::Socket(Arc::downgrade(socket)),
             _ => todo!(),
         }
     }
@@ -67,7 +67,7 @@ impl DescriptorRef {
                 file,
                 close_on_exec: AtomicBool::new(false),
             }),
-            DescriptorRef::Socket(socket) => socket.upgrade().map(Descriptor::Socket),
+            // DescriptorRef::Socket(socket) => socket.upgrade().map(Descriptor::Socket),
             _ => todo!(),
         }
     }
@@ -235,7 +235,7 @@ impl EpollEntryKey {
             Descriptor::PipeReader { consumer, .. } => Arc::as_ptr(consumer).cast(),
             Descriptor::PipeWriter { producer, .. } => Arc::as_ptr(producer).cast(),
             Descriptor::Eventfd { file, .. } => Arc::as_ptr(file).cast(),
-            Descriptor::Socket(socket) => Arc::as_ptr(socket).cast(),
+            Descriptor::Socket(socket) => todo!(),
             Descriptor::Epoll { .. } => todo!(),
         };
         Self(fd, ptr)

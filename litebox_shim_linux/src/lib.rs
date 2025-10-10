@@ -265,27 +265,8 @@ impl Descriptors {
         let fd = fd as usize;
         self.descriptors.get_mut(fd)?.take()
     }
-    fn remove_socket(&mut self, fd: u32) -> Option<alloc::sync::Arc<crate::syscalls::net::Socket>> {
-        let fd = fd as usize;
-        if let Some(Descriptor::Socket(socket_fd)) = self
-            .descriptors
-            .get_mut(fd)?
-            .take_if(|v| matches!(v, Descriptor::Socket(_)))
-        {
-            Some(socket_fd)
-        } else {
-            None
-        }
-    }
     fn get_fd(&self, fd: u32) -> Option<&Descriptor> {
         self.descriptors.get(fd as usize)?.as_ref()
-    }
-    fn get_socket_fd(&self, fd: u32) -> Option<&crate::syscalls::net::Socket> {
-        if let Descriptor::Socket(socket_fd) = self.descriptors.get(fd as usize)?.as_ref()? {
-            Some(socket_fd)
-        } else {
-            None
-        }
     }
     fn close_on_exec(&mut self) {
         self.descriptors.iter_mut().for_each(|slot| {
@@ -305,10 +286,7 @@ impl Descriptors {
 
 enum Descriptor {
     LiteBoxRawFd(usize),
-    // Note we are using `Arc` here so that we can hold a reference to the socket
-    // without holding a lock on the file descriptor (see `sys_accept` for an example).
-    // TODO: this could be addressed by #120.
-    Socket(alloc::sync::Arc<crate::syscalls::net::Socket>),
+    Socket(usize),
     PipeReader {
         consumer: alloc::sync::Arc<litebox::pipes::ReadEnd<Platform, u8>>,
         close_on_exec: core::sync::atomic::AtomicBool,
