@@ -11,12 +11,12 @@
 	"linker": "rust-lld",
 	"pre-link-args": {
 		"ld": [
-			"-Tlitebox_runner_lvbs/x86_64_vtl1.ld",
+			"-Tlitebox_runner_lvbs/x86_64-vtl1-none.ld",
 			"--gc-sections",
 			"-no-pie"
 		],
 		"ld.lld": [
-			"--script=litebox_runner_lvbs/x86_64_vtl1.ld",
+			"--script=litebox_runner_lvbs/x86_64-vtl1-none.ld",
 			"--gc-sections",
 			"-no-pie"
 		]

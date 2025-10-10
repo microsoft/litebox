@@ -28,7 +28,7 @@ elf = { version = "0.7.4", default-features = false }
 cms = { version = "0.2.3", default-features = false, features = ["alloc"] }
 rsa = { version = "0.9.8", default-features = false }
 sha1 = { version = "0.10.6", default-features = false }
-sha2 = { version = "0.10.9", default-features = false, features = ["oid"] }
+sha2 = { version = "0.10.9", default-features = false, features = ["asm", "oid"] }
 x509-cert = { version = "0.2.5", default-features = false }
 const-oid = { version = "0.9.6", default-features = false, features = ["db"] }
 authenticode = { version = "0.4.3", default-features = false, features = ["object"] }
