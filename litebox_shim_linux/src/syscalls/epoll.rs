@@ -81,7 +81,7 @@ impl Descriptor {
             Descriptor::PipeReader { consumer, .. } => consumer,
             Descriptor::PipeWriter { producer, .. } => producer,
             Descriptor::Eventfd { file, .. } => file,
-            Descriptor::Socket(socket) => socket,
+            Descriptor::Socket(socket) => todo!("see #383"),
             Descriptor::LiteBoxRawFd(fd) => return Events::OUT & mask, // TODO: handle properly
             Descriptor::Epoll { file, .. } => todo!(),
         };

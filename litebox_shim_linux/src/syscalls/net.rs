@@ -6,7 +6,7 @@ use core::{
 };
 
 use litebox::{
-    event::{Events, observer::Observer, polling::Pollee},
+    event::Events,
     fs::OFlags,
     net::{SocketFd, TcpOptionData},
     platform::{RawConstPointer as _, RawMutPointer as _},
@@ -104,7 +104,6 @@ pub(crate) struct Socket {
     pub(crate) raw_fd: Option<usize>,
     /// File status flags (see [`litebox::fs::OFlags::STATUS_FLAGS_MASK`])
     pub(crate) status: AtomicU32,
-    pollee: Pollee<Platform>,
 }
 
 impl Drop for Socket {
@@ -182,7 +181,6 @@ impl Socket {
             raw_fd: Some(raw_fd),
             // `SockFlags` is a subset of `OFlags`
             status: AtomicU32::new(flags.bits()),
-            pollee: Pollee::new(litebox()),
         }
     }
 
@@ -643,22 +641,6 @@ impl Socket {
     }
 
     crate::syscalls::common_functions_for_file_status!();
-}
-
-impl litebox::event::IOPollable for Socket {
-    fn check_io_events(&self) -> Events {
-        short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
-            litebox_net()
-                .lock()
-                .check_events(fd)
-                .expect("Invalid socket fd")
-        })
-        .unwrap()
-    }
-
-    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
-        self.pollee.register_observer(observer, mask);
-    }
 }
 
 /// Handle syscall `socket`
