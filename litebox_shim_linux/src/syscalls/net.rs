@@ -41,7 +41,10 @@ struct CSockStorage {
 
 impl Default for CSockStorage {
     fn default() -> Self {
-        unsafe { core::mem::zeroed() }
+        Self {
+            sa_family: 0,
+            bytes: [0u8; _],
+        }
     }
 }
 
