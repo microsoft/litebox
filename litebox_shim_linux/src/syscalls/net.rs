@@ -1,9 +1,6 @@
 //! Socket-related syscalls, e.g., socket, bind, listen, etc.
 
-use core::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::atomic::AtomicU32,
-};
+use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use litebox::{
     event::Events,
@@ -102,8 +99,6 @@ pub(super) struct SocketOptions {
 // TODO: remove this once the full dup-supported descriptors in litebox are set up.
 pub(crate) struct Socket {
     pub(crate) raw_fd: Option<usize>,
-    /// File status flags (see [`litebox::fs::OFlags::STATUS_FLAGS_MASK`])
-    pub(crate) status: AtomicU32,
 }
 
 impl Drop for Socket {
@@ -146,6 +141,8 @@ fn get_socket_type(raw_fd: usize) -> Result<SockType, Errno> {
     .flatten()
 }
 
+struct SocketOFlags(OFlags);
+
 impl Socket {
     pub(crate) fn new(
         raw_fd: usize,
@@ -167,20 +164,14 @@ impl Socket {
                     dt.set_fd_metadata(fd, litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC);
                 assert!(old.is_none());
             }
-        })
-        .unwrap();
-        short_borrow_socket_fd(raw_fd, |fd| {
-            let old = crate::litebox()
-                .descriptor_table_mut()
-                .set_fd_metadata(fd, sock_type);
+            let old = dt.set_fd_metadata(fd, sock_type);
             assert!(old.is_none());
-        })
-        .unwrap();
+            let old = dt.set_entry_metadata(fd, SocketOFlags(status));
+            assert!(old.is_none());
+        });
 
         Self {
             raw_fd: Some(raw_fd),
-            // `SockFlags` is a subset of `OFlags`
-            status: AtomicU32::new(flags.bits()),
         }
     }
 
@@ -640,7 +631,26 @@ impl Socket {
         }
     }
 
-    crate::syscalls::common_functions_for_file_status!();
+    pub(crate) fn get_status(&self) -> litebox::fs::OFlags {
+        short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+            litebox()
+                .descriptor_table()
+                .with_metadata(fd, |SocketOFlags(flags)| *flags)
+                .unwrap()
+        })
+        .unwrap()
+            & litebox::fs::OFlags::STATUS_FLAGS_MASK
+    }
+
+    pub(crate) fn set_status(&self, flag: litebox::fs::OFlags, on: bool) {
+        short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+            litebox()
+                .descriptor_table_mut()
+                .with_metadata_mut(fd, |SocketOFlags(flags)| flags.set(flag, on))
+                .unwrap();
+        })
+        .unwrap();
+    }
 }
 
 /// Handle syscall `socket`
