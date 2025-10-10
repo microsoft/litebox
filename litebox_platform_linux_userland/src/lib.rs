@@ -299,7 +299,7 @@ impl LinuxUserland {
             robust_list: None,
             credentials: alloc::sync::Arc::new(Self::get_user_info()),
             comm: [0; litebox_common_linux::TASK_COMM_LEN],
-            stored_bp: 0,
+            stored_bp: None,
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         Self::set_thread_local_storage(tls);
@@ -539,7 +539,7 @@ pub unsafe extern "C" fn thread_start_internal(
     frame_pointer: usize,
 ) {
     LinuxUserland::with_thread_local_storage_mut(|tls| {
-        tls.current_task.stored_bp = frame_pointer;
+        tls.current_task.stored_bp = Some(frame_pointer);
     });
 
     unsafe { swap_fsgs() };
@@ -612,6 +612,8 @@ fn thread_start(
 
     unsafe { thread_start_asm(&ctx) };
     // TODO: have syscall_callback return if we need to terminate the process.
+    // We should return this value to the caller so load_program can return it
+    // to the user.
 }
 
 impl litebox::platform::ThreadProvider for LinuxUserland {
@@ -646,10 +648,6 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         let _handle = std::thread::spawn(move || thread_start(*thread_args, ctx_copy));
 
         Ok(0)
-    }
-
-    fn terminate_thread(&self, _code: Self::ExitCode) -> ! {
-        todo!("this function is not needed")
     }
 }
 
@@ -1430,8 +1428,8 @@ impl litebox::mm::allocator::MemoryProvider for LinuxUserland {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn swap_bp(bp_to_swap: usize) -> usize {
     LinuxUserland::with_thread_local_storage_mut(|tls| {
-        let bp = tls.current_task.stored_bp;
-        tls.current_task.stored_bp = bp_to_swap;
+        let bp = tls.current_task.stored_bp.unwrap();
+        tls.current_task.stored_bp = Some(bp_to_swap);
         bp
     })
 }

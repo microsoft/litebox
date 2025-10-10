@@ -106,7 +106,7 @@ impl SnpLinuxKernel {
                 egid: boot_params.egid as usize,
             }),
             comm: [0; litebox_common_linux::TASK_COMM_LEN],
-            stored_bp: 0,
+            stored_bp: None,
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         Self::set_thread_local_storage(tls);
@@ -256,13 +256,6 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
             args: [thread_start_arg_ptr as u64, flags.bits()],
         })
     }
-
-    fn terminate_thread(&self, code: Self::ExitCode) -> ! {
-        let _ = HostSnpInterface::syscalls(SyscallN::<1, NR_SYSCALL_EXIT> {
-            args: [u64::from(code.reinterpret_as_unsigned())],
-        });
-        unreachable!("Should not return to the caller after terminating the thread");
-    }
 }
 
 impl bindings::SnpVmplRequestArgs {
@@ -304,6 +297,7 @@ const NR_SYSCALL_FUTEX: u32 = 202;
 const NR_SYSCALL_RT_SIGPROCMASK: u32 = 14;
 const NR_SYSCALL_READ: u32 = 0;
 const NR_SYSCALL_WRITE: u32 = 1;
+#[allow(dead_code)]
 const NR_SYSCALL_EXIT: u32 = 60;
 const NR_SYSCALL_EXIT_GROUP: u32 = 231;
 const NR_SYSCALL_CLONE3: u32 = 435;

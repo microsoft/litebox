@@ -286,7 +286,7 @@ impl WindowsUserland {
             robust_list: None,
             credentials: alloc::sync::Arc::new(creds),
             comm: [0; litebox_common_linux::TASK_COMM_LEN],
-            stored_bp: 0,
+            stored_bp: None,
         });
         let tls = litebox_common_linux::ThreadLocalStorage::new(task);
         Self::set_thread_local_storage(tls);
@@ -434,7 +434,7 @@ pub unsafe extern "C" fn thread_start_internal(
     frame_pointer: usize,
 ) {
     WindowsUserland::with_thread_local_storage_mut(|tls| {
-        tls.current_task.stored_bp = frame_pointer;
+        tls.current_task.stored_bp = Some(frame_pointer);
     });
 
     #[cfg(target_arch = "x86_64")]
@@ -506,10 +506,6 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         let _handle = std::thread::spawn(move || thread_start(*thread_args, ctx_copy));
 
         Ok(0)
-    }
-
-    fn terminate_thread(&self, _code: Self::ExitCode) -> ! {
-        todo!("this function is not needed")
     }
 }
 
@@ -1156,8 +1152,8 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn swap_bp(bp_to_swap: usize) -> usize {
     WindowsUserland::with_thread_local_storage_mut(|tls| {
-        let bp = tls.current_task.stored_bp;
-        tls.current_task.stored_bp = bp_to_swap;
+        let bp = tls.current_task.stored_bp.unwrap();
+        tls.current_task.stored_bp = Some(bp_to_swap);
         bp
     })
 }

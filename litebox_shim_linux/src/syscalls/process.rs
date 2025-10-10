@@ -320,7 +320,7 @@ fn new_thread_callback(
         robust_list: task.robust_list,
         credentials: task.credentials.clone(),
         comm: task.comm,
-        stored_bp: 0,
+        stored_bp: None,
     });
     let child_tid = task.tid;
 
@@ -444,7 +444,7 @@ pub(crate) fn sys_clone(
                     robust_list: None,
                     credentials,
                     comm,
-                    stored_bp: 0,
+                    stored_bp: None,
                 }),
                 callback: new_thread_callback,
             }),

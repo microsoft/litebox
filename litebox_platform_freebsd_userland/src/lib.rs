@@ -360,20 +360,6 @@ impl litebox::platform::ThreadProvider for FreeBSDUserland {
             }),
         }
     }
-
-    fn terminate_thread(&self, _code: Self::ExitCode) -> ! {
-        // Use thr_exit to terminate the current thread
-        unsafe {
-            syscalls::syscall1(syscalls::Sysno::ThrExit, core::ptr::null::<()>() as usize)
-                .expect("thr_exit should not fail");
-        }
-        // This should never be reached as thr_exit does not return
-        unreachable!("thr_exit should not return")
-    }
-
-    fn next_available_thread_id(&self) -> i32 {
-        todo!()
-    }
 }
 
 impl litebox::platform::RawMutexProvider for FreeBSDUserland {

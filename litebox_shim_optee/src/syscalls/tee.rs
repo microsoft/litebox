@@ -11,8 +11,6 @@ use litebox_common_optee::{
 
 #[cfg(feature = "platform_linux_userland")]
 use litebox::platform::ThreadLocalStorageProvider;
-#[cfg(feature = "platform_linux_userland")]
-use litebox::platform::ThreadProvider;
 
 use crate::{
     litebox_page_manager,
@@ -80,9 +78,7 @@ pub fn sys_panic(code: usize) -> ! {
     );
 
     cfg_if::cfg_if! {
-        if #[cfg(feature = "platform_linux_userland")] {
-            litebox_platform_multiplex::platform().terminate_thread(i32::try_from(code).unwrap_or(0));
-        } else if #[cfg(feature = "platform_lvbs")] {
+        if #[cfg(feature = "platform_lvbs")] {
             todo!("switch to VTL0");
         } else {
             compile_error!(r##"No platform specified."##);

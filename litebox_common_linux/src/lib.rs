@@ -1264,7 +1264,7 @@ pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     /// Command name (usually the executable name, excluding the path)
     pub comm: [u8; TASK_COMM_LEN],
     /// Stored frame pointer for the thread
-    pub stored_bp: usize,
+    pub stored_bp: Option<usize>,
 }
 
 #[repr(C)]
