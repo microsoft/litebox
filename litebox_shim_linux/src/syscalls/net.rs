@@ -94,18 +94,14 @@ pub(super) struct SocketOptions {
     pub(super) linger_timeout: Option<core::time::Duration>,
 }
 
-// TODO: move `status` and `close_on_exec` to litebox once #119 is completed
-//
-// TODO: remove this once the full dup-supported descriptors in litebox are set up.
 pub(crate) struct Socket {
-    pub(crate) raw_fd: Option<usize>,
+    pub(crate) raw_fd: usize,
 }
 
 impl Drop for Socket {
     fn drop(&mut self) {
-        if let Some(raw_fd) = self.raw_fd.take() {
-            crate::syscalls::file::do_close(crate::Descriptor::LiteBoxRawFd(raw_fd)).unwrap();
-        }
+        let raw_fd = self.raw_fd;
+        crate::syscalls::file::do_close(crate::Descriptor::LiteBoxRawFd(raw_fd)).unwrap();
     }
 }
 
@@ -170,13 +166,11 @@ impl Socket {
             assert!(old.is_none());
         });
 
-        Self {
-            raw_fd: Some(raw_fd),
-        }
+        Self { raw_fd }
     }
 
     fn with_socket_options<R>(&self, f: impl FnOnce(&SocketOptions) -> R) -> Result<R, Errno> {
-        short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+        short_borrow_socket_fd(self.raw_fd, |fd| {
             litebox()
                 .descriptor_table()
                 .with_metadata(fd, |opt| f(opt))
@@ -187,7 +181,7 @@ impl Socket {
         &self,
         f: impl FnOnce(&mut SocketOptions) -> R,
     ) -> Result<R, Errno> {
-        short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+        short_borrow_socket_fd(self.raw_fd, |fd| {
             litebox()
                 .descriptor_table_mut()
                 .with_metadata_mut(fd, |opt| f(opt))
@@ -264,7 +258,7 @@ impl Socket {
                     }
                     SocketOption::KEEPALIVE => {
                         let keep_alive = val != 0;
-                        if let Err(err) = short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+                        if let Err(err) = short_borrow_socket_fd(self.raw_fd, |fd| {
                             litebox_net().lock().set_tcp_option(
                                 fd,
                                 // default time interval is 2 hours
@@ -313,7 +307,7 @@ impl Socket {
                             // CORK is the opposite of NODELAY
                             val == 0
                         };
-                        short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+                        short_borrow_socket_fd(self.raw_fd, |fd| {
                             litebox_net()
                                 .lock()
                                 .set_tcp_option(fd, litebox::net::TcpOptionData::NODELAY(on))
@@ -327,7 +321,7 @@ impl Socket {
                         if !(1..=MAX_TCP_KEEPINTVL).contains(&val) {
                             return Err(Errno::EINVAL);
                         }
-                        if let Err(err) = short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+                        if let Err(err) = short_borrow_socket_fd(self.raw_fd, |fd| {
                             litebox_net().lock().set_tcp_option(
                                 fd,
                                 litebox::net::TcpOptionData::KEEPALIVE(Some(
@@ -384,7 +378,7 @@ impl Socket {
                     }
                     _ => {
                         let val = match sopt {
-                            SocketOption::TYPE => get_socket_type(self.raw_fd.unwrap())? as u32,
+                            SocketOption::TYPE => get_socket_type(self.raw_fd)? as u32,
                             SocketOption::REUSEADDR => {
                                 u32::from(self.with_socket_options(|o| o.reuse_address)?)
                             }
@@ -412,7 +406,7 @@ impl Socket {
                 let val: u32 = match tcpopt {
                     TcpOption::KEEPINTVL => {
                         let TcpOptionData::KEEPALIVE(interval) =
-                            short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+                            short_borrow_socket_fd(self.raw_fd, |fd| {
                                 litebox_net()
                                     .lock()
                                     .get_tcp_option(fd, litebox::net::TcpOptionName::KEEPALIVE)
@@ -426,7 +420,7 @@ impl Socket {
                     }
                     TcpOption::NODELAY | TcpOption::CORK => {
                         let TcpOptionData::NODELAY(nodelay) =
-                            short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+                            short_borrow_socket_fd(self.raw_fd, |fd| {
                                 litebox_net()
                                     .lock()
                                     .get_tcp_option(fd, litebox::net::TcpOptionName::NODELAY)
@@ -458,7 +452,7 @@ impl Socket {
     }
 
     fn try_accept(&self) -> Result<SocketFd<Platform>, Errno> {
-        short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+        short_borrow_socket_fd(self.raw_fd, |fd| {
             litebox_net().lock().accept(fd).map_err(Errno::from)
         })
         .flatten()
@@ -480,7 +474,7 @@ impl Socket {
     }
 
     fn bind(&self, sockaddr: SocketAddr) -> Result<(), Errno> {
-        short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+        short_borrow_socket_fd(self.raw_fd, |fd| {
             litebox_net()
                 .lock()
                 .bind(fd, &sockaddr)
@@ -490,7 +484,7 @@ impl Socket {
     }
 
     fn connect(&self, sockaddr: SocketAddr) -> Result<(), Errno> {
-        short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+        short_borrow_socket_fd(self.raw_fd, |fd| {
             litebox_net()
                 .lock()
                 .connect(fd, &sockaddr)
@@ -500,7 +494,7 @@ impl Socket {
     }
 
     fn listen(&self, backlog: u16) -> Result<(), Errno> {
-        short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+        short_borrow_socket_fd(self.raw_fd, |fd| {
             litebox_net()
                 .lock()
                 .listen(fd, backlog)
@@ -515,7 +509,7 @@ impl Socket {
         flags: litebox::net::SendFlags,
         sockaddr: Option<SocketAddr>,
     ) -> Result<usize, Errno> {
-        let n = short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+        let n = short_borrow_socket_fd(self.raw_fd, |fd| {
             litebox_net()
                 .lock()
                 .send(fd, buf, flags, sockaddr)
@@ -571,7 +565,7 @@ impl Socket {
         flags: litebox::net::ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, Errno> {
-        let n = short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+        let n = short_borrow_socket_fd(self.raw_fd, |fd| {
             litebox_net()
                 .lock()
                 .receive(fd, buf, flags, source_addr)
@@ -602,7 +596,7 @@ impl Socket {
         );
         // `MSG_TRUNC` behavior depends on the socket type
         if flags.contains(ReceiveFlags::TRUNC) {
-            match get_socket_type(self.raw_fd.unwrap())? {
+            match get_socket_type(self.raw_fd)? {
                 SockType::Datagram | SockType::Raw => {
                     new_flags.insert(litebox::net::ReceiveFlags::TRUNC);
                 }
@@ -632,7 +626,7 @@ impl Socket {
     }
 
     pub(crate) fn get_status(&self) -> litebox::fs::OFlags {
-        short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+        short_borrow_socket_fd(self.raw_fd, |fd| {
             litebox()
                 .descriptor_table()
                 .with_metadata(fd, |SocketOFlags(flags)| *flags)
@@ -643,7 +637,7 @@ impl Socket {
     }
 
     pub(crate) fn set_status(&self, flag: litebox::fs::OFlags, on: bool) {
-        short_borrow_socket_fd(self.raw_fd.unwrap(), |fd| {
+        short_borrow_socket_fd(self.raw_fd, |fd| {
             litebox()
                 .descriptor_table_mut()
                 .with_metadata_mut(fd, |SocketOFlags(flags)| flags.set(flag, on))
@@ -787,7 +781,7 @@ pub(crate) fn sys_accept(
             let mut rds = crate::raw_descriptor_store().write();
             let raw_fd = rds.fd_into_raw_integer(fd);
             drop(rds);
-            let sock_type = get_socket_type(socket.raw_fd.unwrap())?;
+            let sock_type = get_socket_type(socket.raw_fd)?;
             Descriptor::Socket(alloc::sync::Arc::new(Socket::new(
                 raw_fd,
                 sock_type,
@@ -972,7 +966,7 @@ pub(crate) fn sys_getsockname(sockfd: i32) -> Result<SocketAddr, Errno> {
         .get_fd(sockfd)
         .ok_or(Errno::EBADF)?
     {
-        Descriptor::Socket(socket) => short_borrow_socket_fd(socket.raw_fd.unwrap(), |fd| {
+        Descriptor::Socket(socket) => short_borrow_socket_fd(socket.raw_fd, |fd| {
             litebox_net().lock().get_local_addr(fd).map_err(Errno::from)
         })
         .flatten(),
