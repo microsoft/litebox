@@ -98,7 +98,7 @@ pub(super) struct SocketOptions {
 }
 
 pub(crate) struct Socket {
-    pub(crate) raw_fd: usize,
+    raw_fd: usize,
 }
 
 // XXX(jayb): Transitionary function that should likely be removed before we merge this PR.
@@ -164,7 +164,9 @@ impl Socket {
 
         Self { raw_fd }
     }
+}
 
+impl Socket {
     fn with_socket_options<R>(&self, f: impl FnOnce(&SocketOptions) -> R) -> Result<R, Errno> {
         short_borrow_socket_fd(self.raw_fd, |fd| {
             litebox()
@@ -184,7 +186,9 @@ impl Socket {
                 .unwrap()
         })
     }
+}
 
+impl Socket {
     fn setsockopt(
         &self,
         optname: SocketOptionName,
@@ -335,7 +339,9 @@ impl Socket {
             }
         }
     }
+}
 
+impl Socket {
     fn getsockopt(
         &self,
         optname: SocketOptionName,
@@ -446,14 +452,18 @@ impl Socket {
         unsafe { optlen.write_at_offset(0, new_len.truncate()) }.ok_or(Errno::EFAULT)?;
         Ok(())
     }
+}
 
+impl Socket {
     fn try_accept(&self) -> Result<SocketFd<Platform>, Errno> {
         short_borrow_socket_fd(self.raw_fd, |fd| {
             litebox_net().lock().accept(fd).map_err(Errno::from)
         })
         .flatten()
     }
+}
 
+impl Socket {
     fn accept(&self) -> Result<SocketFd<Platform>, Errno> {
         if self.get_status().contains(OFlags::NONBLOCK) {
             self.try_accept()
@@ -468,7 +478,9 @@ impl Socket {
             }
         }
     }
+}
 
+impl Socket {
     fn bind(&self, sockaddr: SocketAddr) -> Result<(), Errno> {
         short_borrow_socket_fd(self.raw_fd, |fd| {
             litebox_net()
@@ -478,7 +490,9 @@ impl Socket {
         })
         .flatten()
     }
+}
 
+impl Socket {
     fn connect(&self, sockaddr: SocketAddr) -> Result<(), Errno> {
         short_borrow_socket_fd(self.raw_fd, |fd| {
             litebox_net()
@@ -488,7 +502,9 @@ impl Socket {
         })
         .flatten()
     }
+}
 
+impl Socket {
     fn listen(&self, backlog: u16) -> Result<(), Errno> {
         short_borrow_socket_fd(self.raw_fd, |fd| {
             litebox_net()
@@ -498,7 +514,9 @@ impl Socket {
         })
         .flatten()
     }
+}
 
+impl Socket {
     fn try_sendto(
         &self,
         buf: &[u8],
@@ -514,7 +532,9 @@ impl Socket {
         .flatten()?;
         if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
     }
+}
 
+impl Socket {
     pub(crate) fn sendto(
         &self,
         buf: &[u8],
@@ -554,7 +574,9 @@ impl Socket {
             }
         }
     }
+}
 
+impl Socket {
     fn try_receive(
         &self,
         buf: &mut [u8],
@@ -570,7 +592,9 @@ impl Socket {
         .flatten()?;
         if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
     }
+}
 
+impl Socket {
     pub(crate) fn receive(
         &self,
         buf: &mut [u8],
@@ -620,7 +644,9 @@ impl Socket {
             }
         }
     }
+}
 
+impl Socket {
     pub(crate) fn get_status(&self) -> litebox::fs::OFlags {
         short_borrow_socket_fd(self.raw_fd, |fd| {
             litebox()
@@ -631,7 +657,9 @@ impl Socket {
         .unwrap()
             & litebox::fs::OFlags::STATUS_FLAGS_MASK
     }
+}
 
+impl Socket {
     pub(crate) fn set_status(&self, flag: litebox::fs::OFlags, on: bool) {
         short_borrow_socket_fd(self.raw_fd, |fd| {
             litebox()
