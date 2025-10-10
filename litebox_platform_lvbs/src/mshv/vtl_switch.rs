@@ -272,9 +272,13 @@ fn vtl_switch_loop() -> ! {
                 {
                     todo!("unknown function ID = {:#x}", params[0]);
                 } else {
+                    with_per_cpu_variables_mut(|per_cpu_variables| {
+                        per_cpu_variables.save_extended_states();
+                    });
                     let result = vtlcall_dispatch(&params);
                     with_per_cpu_variables_mut(|per_cpu_variables| {
                         per_cpu_variables.set_vtl_return_value(result as u64);
+                        per_cpu_variables.restore_extended_states();
                     });
                     jump_to_vtl_switch_loop_with_stack_cleanup();
                 }
