@@ -34,8 +34,8 @@ macro_rules! convert_flags {
 
 #[repr(C)]
 struct CSockStorage {
-    pub sa_family: u16,
-    pub bytes: [u8; ADDR_MAX_LEN - 2],
+    sa_family: u16,
+    bytes: [u8; ADDR_MAX_LEN - 2],
 }
 
 impl Default for CSockStorage {
@@ -82,18 +82,18 @@ pub(crate) enum SocketAddress {
 }
 
 #[derive(Default)]
-pub(super) struct SocketOptions {
-    pub(super) reuse_address: bool,
-    pub(super) keep_alive: bool,
+struct SocketOptions {
+    reuse_address: bool,
+    keep_alive: bool,
     /// Receiving timeout, None (default value) means no timeout
-    pub(super) recv_timeout: Option<core::time::Duration>,
+    recv_timeout: Option<core::time::Duration>,
     /// Sending timeout, None (default value) means no timeout
-    pub(super) send_timeout: Option<core::time::Duration>,
+    send_timeout: Option<core::time::Duration>,
     /// Linger timeout, None (default value) means closing in the background.
     /// If it is `Some`, a close or shutdown will not return
     /// until all queued messages for the socket have been
     /// successfully sent or the timeout has been reached.
-    pub(super) linger_timeout: Option<core::time::Duration>,
+    linger_timeout: Option<core::time::Duration>,
 }
 
 pub(crate) struct Socket {
@@ -595,7 +595,7 @@ pub(crate) fn receive(
     }
 }
 
-pub(crate) fn get_status(raw_fd: usize) -> litebox::fs::OFlags {
+fn get_status(raw_fd: usize) -> litebox::fs::OFlags {
     short_borrow_socket_fd(raw_fd, |fd| {
         litebox()
             .descriptor_table()
@@ -606,7 +606,7 @@ pub(crate) fn get_status(raw_fd: usize) -> litebox::fs::OFlags {
         & litebox::fs::OFlags::STATUS_FLAGS_MASK
 }
 
-pub(crate) fn set_status(raw_fd: usize, flag: litebox::fs::OFlags, on: bool) {
+fn set_status(raw_fd: usize, flag: litebox::fs::OFlags, on: bool) {
     short_borrow_socket_fd(raw_fd, |fd| {
         litebox()
             .descriptor_table_mut()
