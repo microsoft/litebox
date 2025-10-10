@@ -441,7 +441,7 @@ pub fn submit_optee_command(
 /// from the queue.
 /// # Panics
 /// This function panics if it cannot allocate a stack
-pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
+pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) {
     if is_sys_return {
         handle_optee_command_output(session_id);
     }
@@ -449,13 +449,7 @@ pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
     if let Some(cmd) = optee_command_submission_queue().pop(session_id) {
         let elf_load_info = session_id_elf_load_info_map().get(session_id);
         let Some(elf_load_info) = elf_load_info else {
-            cfg_if::cfg_if! {
-                    if #[cfg(feature = "platform_lvbs")] {
-                        todo!("switch to VTL0");
-                    } else {
-                        compile_error!(r##"No platform specified."##);
-                    }
-            }
+            panic!("No ELF load info found");
         };
 
         // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
@@ -486,13 +480,6 @@ pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
         session_id_elf_load_info_map().remove(session_id);
         optee_command_submission_queue().remove(session_id);
         optee_command_completion_queue().remove(session_id);
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "platform_lvbs")] {
-                todo!("switch to VTL0");
-            } else {
-                compile_error!(r##"No platform specified."##);
-            }
-        }
     }
 }
 

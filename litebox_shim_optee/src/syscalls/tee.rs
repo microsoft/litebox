@@ -48,12 +48,10 @@ pub fn sys_return(ret: usize) -> usize {
             #[allow(clippy::cast_sign_loss)]
             let session_id = tid as u32;
             crate::optee_command_dispatcher(session_id, true);
-        } else if #[cfg(feature = "platform_lvbs")] {
-            todo!("switch to VTL0");
-        } else {
-            compile_error!(r##"No platform specified."##);
         }
     }
+
+    ret
 }
 
 /// A system call to print out a message.
@@ -70,20 +68,14 @@ pub fn sys_log(buf: &[u8]) -> Result<(), TeeResult> {
 }
 
 /// A system call that a TA calls when it panics.
-pub fn sys_panic(code: usize) -> ! {
+#[allow(clippy::unnecessary_wraps)]
+pub fn sys_panic(code: usize) -> Result<(), TeeResult> {
     litebox::log_println!(
         litebox_platform_multiplex::platform(),
         "panic with code {}",
         code,
     );
-
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "platform_lvbs")] {
-            todo!("switch to VTL0");
-        } else {
-            compile_error!(r##"No platform specified."##);
-        }
-    }
+    Ok(())
 }
 
 // TODO: replace this with a proper implementation

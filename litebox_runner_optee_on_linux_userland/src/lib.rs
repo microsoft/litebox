@@ -114,6 +114,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     populate_optee_command_queue(session_id, &ta_commands);
     optee_command_dispatcher(session_id, false);
+    Ok(())
 }
 
 /// OP-TEE/TA message command (base64 encoded). It consists of a function ID,
