@@ -98,13 +98,6 @@ pub(crate) struct Socket {
     pub(crate) raw_fd: usize,
 }
 
-impl Drop for Socket {
-    fn drop(&mut self) {
-        let raw_fd = self.raw_fd;
-        crate::syscalls::file::do_close(crate::Descriptor::LiteBoxRawFd(raw_fd)).unwrap();
-    }
-}
-
 // XXX(jayb): Transitionary function that should likely be removed before we merge this PR.
 //
 // Explicitly intended as a short socket borrow.
