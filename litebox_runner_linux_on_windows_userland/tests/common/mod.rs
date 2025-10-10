@@ -45,7 +45,6 @@ pub fn init_platform(tar_data: &'static [u8], initial_dirs: &[&str], initial_fil
         fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to set permissions on root");
     });
-    let dev_stdio = litebox::fs::devices::stdio::FileSystem::new(litebox);
     let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(
         litebox,
         if tar_data.is_empty() {
@@ -54,17 +53,7 @@ pub fn init_platform(tar_data: &'static [u8], initial_dirs: &[&str], initial_fil
             tar_data.into()
         },
     );
-    set_fs(litebox::fs::layered::FileSystem::new(
-        litebox,
-        in_mem_fs,
-        litebox::fs::layered::FileSystem::new(
-            litebox,
-            dev_stdio,
-            tar_ro_fs,
-            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
-        ),
-        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
-    ));
+    set_fs(litebox_shim_linux::default_fs(in_mem_fs, tar_ro_fs));
 
     for each in initial_dirs {
         install_dir(each);
