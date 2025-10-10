@@ -278,23 +278,22 @@ fn exit_code(
 }
 
 pub(crate) fn sys_exit(_status: i32) {
-    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
-        if let Some(clear_child_tid) = tls.current_task.clear_child_tid.take() {
-            // Clear the child TID if requested
-            // TODO: if we are the last thread, we don't need to clear it
-            let _ = unsafe { clear_child_tid.write_at_offset(0, 0) };
-            // Cast from *i32 to *u32
-            let clear_child_tid = crate::MutPtr::from_usize(clear_child_tid.as_usize());
-            let _ = sys_futex(litebox_common_linux::FutexArgs::Wake {
-                addr: clear_child_tid,
-                flags: litebox_common_linux::FutexFlags::PRIVATE,
-                count: 1,
-            });
-        }
-        if let Some(robust_list) = tls.current_task.robust_list.take() {
-            let _ = wake_robust_list(robust_list);
-        }
-    });
+    let mut tls = litebox_platform_multiplex::Platform::release_thread_local_storage();
+    if let Some(clear_child_tid) = tls.current_task.clear_child_tid.take() {
+        // Clear the child TID if requested
+        // TODO: if we are the last thread, we don't need to clear it
+        let _ = unsafe { clear_child_tid.write_at_offset(0, 0) };
+        // Cast from *i32 to *u32
+        let clear_child_tid = crate::MutPtr::from_usize(clear_child_tid.as_usize());
+        let _ = sys_futex(litebox_common_linux::FutexArgs::Wake {
+            addr: clear_child_tid,
+            flags: litebox_common_linux::FutexFlags::PRIVATE,
+            count: 1,
+        });
+    }
+    if let Some(robust_list) = tls.current_task.robust_list.take() {
+        let _ = wake_robust_list(robust_list);
+    }
 
     LITEBOX_PROCESS
         .nr_threads
@@ -304,7 +303,7 @@ pub(crate) fn sys_exit(_status: i32) {
 pub(crate) fn sys_exit_group(_status: i32) {}
 
 fn new_thread_callback(
-    args: &litebox_common_linux::NewThreadArgs<litebox_platform_multiplex::Platform>,
+    args: litebox_common_linux::NewThreadArgs<litebox_platform_multiplex::Platform>,
 ) {
     let litebox_common_linux::NewThreadArgs {
         task,
@@ -323,6 +322,8 @@ fn new_thread_callback(
         comm: task.comm,
         stored_bp: 0,
     });
+    let child_tid = task.tid;
+
     // Set the TLS for the platform itself
     let litebox_tls = litebox_common_linux::ThreadLocalStorage::new(new_task);
     litebox_platform_multiplex::Platform::set_thread_local_storage(litebox_tls);
@@ -331,13 +332,18 @@ fn new_thread_callback(
     if let Some(tls) = tls {
         // Set the TLS base pointer for the new thread
         #[cfg(target_arch = "x86")]
-        set_thread_area(*tls);
+        set_thread_area(tls);
 
         #[cfg(target_arch = "x86_64")]
         {
             use litebox::platform::RawConstPointer as _;
             sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()));
         }
+    }
+
+    if let Some(child_tid_ptr) = set_child_tid {
+        // Set the child TID if requested
+        let _ = unsafe { child_tid_ptr.write_at_offset(0, child_tid) };
     }
 }
 
@@ -419,9 +425,6 @@ pub(crate) fn sys_clone(
         .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if let Some(parent_tid_ptr) = set_parent_tid {
         let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid) };
-    }
-    if let Some(child_tid_ptr) = set_child_tid {
-        let _ = unsafe { child_tid_ptr.write_at_offset(0, child_tid) };
     }
 
     unsafe {

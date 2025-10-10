@@ -544,6 +544,9 @@ pub unsafe extern "C" fn thread_start_internal(
 
     unsafe { swap_fsgs() };
 
+    // TODO: The following code can be optimized to avoid overwriting r10 and r11
+    // by reading out rsp and rip first, and putting rip onto the new stack,
+    // then we restore all the resigers, and use rax to swtich the stack, then call ret.
     #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::asm!(
@@ -559,7 +562,7 @@ pub unsafe extern "C" fn thread_start_internal(
             "pop r10",
             "pop r9",
             "pop r8",
-            "pop rcx",      // skip pt_regs.rax
+            "pop rcx", // skip rax
             "pop rcx",
             "pop rdx",
             "pop rsi",
@@ -601,13 +604,14 @@ pub unsafe extern "C" fn thread_start_internal(
 }
 
 fn thread_start(
-    thread_args: &litebox_common_linux::NewThreadArgs<LinuxUserland>,
+    thread_args: litebox_common_linux::NewThreadArgs<LinuxUserland>,
     ctx: litebox_common_linux::PtRegs,
 ) {
     // Allow caller to run some code before we return to the new thread.
     (thread_args.callback)(thread_args);
 
     unsafe { thread_start_asm(&ctx) };
+    // TODO: have syscall_callback return if we need to terminate the process.
 }
 
 impl litebox::platform::ThreadProvider for LinuxUserland {
@@ -639,7 +643,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         }
 
         // TODO: do we need to wait for the handle in the main thread?
-        let _handle = std::thread::spawn(move || thread_start(&thread_args, ctx_copy));
+        let _handle = std::thread::spawn(move || thread_start(*thread_args, ctx_copy));
 
         Ok(0)
     }

@@ -187,7 +187,7 @@ extern "C" fn thread_start(
 
     // Set up thread-local storage for the new thread. This is done by
     // calling the actual thread callback with the unpacked arguments
-    (thread_start_args.thread_args.callback)(&thread_start_args.thread_args);
+    (thread_start_args.thread_args.callback)(*thread_start_args.thread_args);
 
     // Restore the context
     unsafe {

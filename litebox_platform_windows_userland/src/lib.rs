@@ -471,7 +471,7 @@ pub unsafe extern "C" fn thread_start_internal(
 }
 
 fn thread_start(
-    thread_args: &litebox_common_linux::NewThreadArgs<WindowsUserland>,
+    thread_args: litebox_common_linux::NewThreadArgs<WindowsUserland>,
     ctx: litebox_common_linux::PtRegs,
 ) {
     // Allow caller to run some code before we return to the new thread.
@@ -503,7 +503,7 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         }
 
         // TODO: do we need to wait for the handle in the main thread?
-        let _handle = std::thread::spawn(move || thread_start(&thread_args, ctx_copy));
+        let _handle = std::thread::spawn(move || thread_start(*thread_args, ctx_copy));
 
         Ok(0)
     }

@@ -1207,12 +1207,12 @@ pub struct NewThreadArgs<
     /// A callback function that *MUST* be called when the thread is created.
     ///
     /// Note that `task.tid` must be set correctly before this function is called.
-    pub callback: fn(&Self),
+    pub callback: fn(Self),
 }
 
 unsafe impl<Platform> Send for NewThreadArgs<Platform> where
     Platform:
-        litebox::platform::RawPointerProvider + litebox::sync::RawSyncPrimitivesProvider + Send // if your platform object must be movable across threads
+        litebox::platform::RawPointerProvider + litebox::sync::RawSyncPrimitivesProvider + Send
 {
 }
 
