@@ -208,9 +208,9 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
         )
         .flatten(),
         Descriptor::Socket(socket) => {
-            let socket = socket.clone();
+            let raw_fd = socket.raw_fd;
             drop(file_table);
-            socket.receive(buf, litebox_common_linux::ReceiveFlags::empty(), None)
+            super::net::receive(raw_fd, buf, litebox_common_linux::ReceiveFlags::empty(), None)
         }
         Descriptor::PipeReader { consumer, .. } => {
             let consumer = consumer.clone();
@@ -249,9 +249,9 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
         )
         .flatten(),
         Descriptor::Socket(socket) => {
-            let socket = socket.clone();
+            let raw_fd = socket.raw_fd;
             drop(file_table);
-            socket.sendto(buf, litebox_common_linux::SendFlags::empty(), None)
+            super::net::sendto(raw_fd, buf, litebox_common_linux::SendFlags::empty(), None)
         }
         Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
         Descriptor::PipeWriter { producer, .. } => {
@@ -480,10 +480,10 @@ pub fn sys_writev(
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
         Descriptor::Socket(socket) => {
-            let socket = socket.clone();
+            let raw_fd = socket.raw_fd;
             drop(locked_file_descriptors);
             write_to_iovec(iovs, |buf: &[u8]| {
-                socket.sendto(buf, litebox_common_linux::SendFlags::empty(), None)
+                super::net::sendto(raw_fd, buf, litebox_common_linux::SendFlags::empty(), None)
             })
         }
         Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
