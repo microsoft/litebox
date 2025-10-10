@@ -211,21 +211,6 @@ impl FreeBSDUserland {
 
 impl litebox::platform::Provider for FreeBSDUserland {}
 
-impl litebox::platform::ExitProvider for FreeBSDUserland {
-    type ExitCode = i32;
-    const EXIT_SUCCESS: Self::ExitCode = 0;
-    const EXIT_FAILURE: Self::ExitCode = 1;
-
-    fn exit(&self, code: Self::ExitCode) -> ! {
-        let Self { reserved_pages: _ } = self;
-
-        unsafe { syscalls::syscall1(syscalls::Sysno::Exit, code as usize) }
-            .expect("Failed to exit group");
-
-        unreachable!("exit_group should not return");
-    }
-}
-
 /// The arguments passed to the thread start function.
 struct ThreadStartArgs {
     pt_regs: Box<litebox_common_linux::PtRegs>,

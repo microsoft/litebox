@@ -295,16 +295,6 @@ impl WindowsUserland {
 
 impl litebox::platform::Provider for WindowsUserland {}
 
-impl litebox::platform::ExitProvider for WindowsUserland {
-    type ExitCode = u32;
-    const EXIT_SUCCESS: Self::ExitCode = 0;
-    const EXIT_FAILURE: Self::ExitCode = 1;
-
-    fn exit(&self, _code: Self::ExitCode) -> ! {
-        todo!("this function is not needed")
-    }
-}
-
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     "

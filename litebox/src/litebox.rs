@@ -4,7 +4,6 @@ use alloc::sync::Arc;
 
 use crate::{
     fd::Descriptors,
-    platform::ExitProvider,
     sync::{RawSyncPrimitivesProvider, RwLock, Synchronization},
 };
 
@@ -20,7 +19,7 @@ pub struct LiteBox<Platform: RawSyncPrimitivesProvider> {
     pub(crate) x: Arc<LiteBoxX<Platform>>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider + ExitProvider> LiteBox<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Create a new (empty) [`LiteBox`] instance for the given `platform`.
     ///
     /// # Panics
@@ -74,14 +73,6 @@ impl<Platform: RawSyncPrimitivesProvider + ExitProvider> LiteBox<Platform> {
         let old = ret.x.descriptors.write().replace(descriptors);
         debug_assert!(old.is_none());
         ret
-    }
-
-    /// Clean up and exit the current process running within the [`LiteBox`] instance.
-    pub fn clean_exit(&self, exit_code: Platform::ExitCode) -> ! {
-        // TODO(jayb): After #24, #31, we will be able to pass along clean-up operations to
-        // subcomponents, to request a clean-up. For now, there is no clean-up necessary, we can
-        // just exit.
-        self.x.platform.exit(exit_code)
     }
 }
 

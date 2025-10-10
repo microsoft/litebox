@@ -42,31 +42,11 @@ pub trait Provider:
     + PunchthroughProvider
     + DebugLogProvider
     + RawPointerProvider
-    + ExitProvider
 {
 }
 
-/// Exiting cleanly.
-///
-/// Each platform can pick its own exit code type, which the shim can use to provide possibly
-/// greater detail in its exit scenarios.
-///
-/// The only requirement for `ExitCode` is that there must be a canonical success, and a canonical
-/// failure code.
-///
-/// NOTE: This is not guaranteed to be the only way to exit from a LiteBox process---the other
-/// approach is via a panic. However, a panic should be considered to be an issue in the
-/// implementation. Valid exits must always pass through cleanly into the [`ExitProvider`].
-pub trait ExitProvider: Sized {
-    type ExitCode;
-    const EXIT_SUCCESS: Self::ExitCode;
-    const EXIT_FAILURE: Self::ExitCode;
-    /// Exits the program with the given exit code.
-    fn exit(&self, code: Self::ExitCode) -> !;
-}
-
 /// Thread management provider.
-pub trait ThreadProvider: RawPointerProvider + ExitProvider {
+pub trait ThreadProvider: RawPointerProvider {
     /// Execution context for the current thread of the guest program.
     type ExecutionContext;
     /// Platform-specific argument needed for the new thread to start

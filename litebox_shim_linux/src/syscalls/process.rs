@@ -5,12 +5,12 @@ use core::mem::offset_of;
 use core::ops::Range;
 use core::sync::atomic::AtomicI32;
 use litebox::mm::linux::VmFlags;
-use litebox::platform::{ExitProvider as _, RawMutPointer as _, ThreadProvider as _};
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{
     PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutex as _,
     RawMutexProvider as _, ThreadLocalStorageProvider as _,
 };
+use litebox::platform::{RawMutPointer as _, ThreadProvider as _};
 use litebox_common_linux::{ArchPrctlArg, errno::Errno};
 use litebox_common_linux::{CloneFlags, FutexArgs, PrctlArg};
 
@@ -262,19 +262,6 @@ fn wake_robust_list(
         );
     }
     Ok(())
-}
-
-fn exit_code(
-    status: i32,
-) -> <litebox_platform_multiplex::Platform as litebox::platform::ExitProvider>::ExitCode {
-    if status == 0 {
-        litebox_platform_multiplex::Platform::EXIT_SUCCESS
-    } else {
-        // TODO(jayb): We are currently folding away all non-zero exit codes as just failure. We
-        // might wish to think of a better design for the ExitProvider to support a better handling
-        // of this.
-        litebox_platform_multiplex::Platform::EXIT_FAILURE
-    }
 }
 
 pub(crate) fn sys_exit(_status: i32) {

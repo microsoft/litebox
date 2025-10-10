@@ -18,8 +18,8 @@ use host::linux::sigset_t;
 use litebox::mm::linux::PageRange;
 use litebox::platform::page_mgmt::DeallocationError;
 use litebox::platform::{
-    DebugLogProvider, ExitProvider, IPInterfaceProvider, ImmediatelyWokenUp,
-    PageManagementProvider, RawMutexProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
+    DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
+    RawMutexProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
 };
 use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::errno::Errno;
@@ -50,16 +50,6 @@ pub struct LinuxKernel<Host: HostInterface> {
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
     vtl0_kernel_info: Vtl0KernelInfo,
     user_contexts: UserContextMap,
-}
-
-impl<Host: HostInterface> ExitProvider for LinuxKernel<Host> {
-    type ExitCode = i32;
-    const EXIT_SUCCESS: Self::ExitCode = 0;
-    const EXIT_FAILURE: Self::ExitCode = 1;
-    fn exit(&self, _code: Self::ExitCode) -> ! {
-        // TODO: We should probably expand the host to handle an error code?
-        Host::exit()
-    }
 }
 
 impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
