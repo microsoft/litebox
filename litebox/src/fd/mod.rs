@@ -9,6 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
+use core::sync::atomic::AtomicBool;
 use thiserror::Error;
 
 use crate::LiteBox;
@@ -104,7 +105,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// have been cleared out).
     pub(crate) fn remove<Subsystem: FdEnabledSubsystem>(
         &mut self,
-        mut fd: TypedFd<Subsystem>,
+        fd: TypedFd<Subsystem>,
     ) -> Option<Subsystem::Entry> {
         let Some(old) = self.entries[fd.x.as_usize()].take() else {
             unreachable!();
@@ -667,7 +668,7 @@ pub(crate) struct InternalFd {
 /// token of ownership over a file descriptor.
 struct OwnedFd {
     raw: u32,
-    closed: bool,
+    closed: AtomicBool,
 }
 
 impl OwnedFd {
@@ -677,19 +678,21 @@ impl OwnedFd {
     pub(crate) fn new(raw: usize) -> Self {
         Self {
             raw: raw.try_into().unwrap(),
-            closed: false,
+            closed: AtomicBool::new(false),
         }
     }
 
     /// Check if it is closed
     pub(crate) fn is_closed(&self) -> bool {
-        self.closed
+        self.closed.load(core::sync::atomic::Ordering::SeqCst)
     }
 
     /// Mark it as closed
-    pub(crate) fn mark_as_closed(&mut self) {
-        assert!(!self.is_closed());
-        self.closed = true;
+    pub(crate) fn mark_as_closed(&self) {
+        let was_closed = self
+            .closed
+            .fetch_or(true, core::sync::atomic::Ordering::SeqCst);
+        assert!(!was_closed);
     }
 
     /// Obtain the raw index it was created with
@@ -701,7 +704,7 @@ impl OwnedFd {
 
 impl Drop for OwnedFd {
     fn drop(&mut self) {
-        if self.closed {
+        if self.is_closed() {
             // This has been closed out by a valid close operation
         } else {
             // The owned fd is dropped without being consumed by a `close` operation that has
