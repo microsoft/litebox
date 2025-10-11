@@ -1,8 +1,12 @@
 use crate::{
     host::linux::ListHead,
     mshv::{HvPageProtFlags, vtl1_mem_layout::PAGE_SIZE},
+    serial_println,
 };
-use core::mem;
+
+use core::{mem};
+
+use alloc::vec::Vec;
 use litebox_common_linux::errno::Errno;
 use num_enum::TryFromPrimitive;
 use x86_64::{
@@ -62,9 +66,8 @@ pub enum HekiKexecType {
     #[default]
     Unknown = 0xffff_ffff_ffff_ffff,
 }
-
-#[derive(Clone, Copy, Default, Debug, TryFromPrimitive, PartialEq)]
-#[repr(u64)]
+#[derive(Clone, Copy, Default, Debug, TryFromPrimitive, PartialEq, Hash, Eq)]
+#[repr(u64)] //TODO: Make this u8? Its repru64 because of args from vtl0
 pub enum ModMemType {
     Text = 0,
     Data = 1,
@@ -75,9 +78,58 @@ pub enum ModMemType {
     InitRoData = 6,
     ElfBuffer = 7,
     Patch = 8,
+    Syms = 9,
+    GplSyms = 10,
     #[default]
     Unknown = 0xffff_ffff_ffff_ffff,
 }
+
+impl From<usize> for ModMemType {
+    fn from(i: usize) -> Self {
+        match i {
+            0 => ModMemType::Text,
+            1 => ModMemType::Data,
+            2 => ModMemType::RoData,
+            3 => ModMemType::RoAfterInit,
+            4 => ModMemType::InitText,
+            5 => ModMemType::InitData,
+            6 => ModMemType::InitRoData,
+            _ => ModMemType::Unknown,
+        }
+    }
+}
+
+impl From<ModMemType> for usize {
+    fn from(m: ModMemType) -> Self {
+        match m {
+            ModMemType::Text => 0,
+            ModMemType::Data => 1,
+            ModMemType::RoData => 2,
+            ModMemType::RoAfterInit => 3,
+            ModMemType::InitText => 4,
+            ModMemType::InitData => 5,
+            ModMemType::InitRoData => 6,
+            _ => 0xffff_ffff_ffff_ffff,
+        }
+    }
+}
+/*
+impl Into<ModMemType> for usize {
+
+    fn into(self) -> ModMemType {
+        match self {
+            ModMemType::Text => 0,
+            ModMemType::Data => 1,
+            ModMemType::RoData => 2,
+            ModMemType::RoAfterInit=>3,
+            ModMemType::InitText=>4,
+            ModMemType::InitData=>5,
+            ModMemType::InitRoData=>6,
+            _=>0xffff_ffff_ffff_ffff
+        }
+    }
+}
+    */
 
 pub(crate) fn mod_mem_type_to_mem_attr(mod_mem_type: ModMemType) -> MemAttr {
     let mut mem_attr = MemAttr::empty();
@@ -364,33 +416,109 @@ impl HekiKernelSymbol {
 #[repr(C)]
 #[allow(clippy::struct_field_names)]
 pub struct HekiKernelInfo {
-    pub ksymtab_start: *const HekiKernelSymbol,
-    pub ksymtab_end: *const HekiKernelSymbol,
-    pub ksymtab_gpl_start: *const HekiKernelSymbol,
-    pub ksymtab_gpl_end: *const HekiKernelSymbol,
-    // Skip unused arch info
+    pub ksymtab_start: VirtAddr,
+    pub ksymtab_end: VirtAddr,
+    pub ksymtab_gpl_start: VirtAddr,
+    pub ksymtab_gpl_end: VirtAddr,
+    pv_ops: Vec<u64>,
 }
 
 impl HekiKernelInfo {
-    const KINFO_LEN: usize = mem::size_of::<HekiKernelInfo>();
+    pub const ARCH_INDEX_PV_BUG: usize = 0;
+    pub const ARCH_INDEX_PV_NOP: usize = 1;
+    pub const ARCH_INDEX_INDIRECT_THUNK: usize = 2;
+    pub const ARCH_INDEX_RETURN_THUNK_INIT: usize = 3;
+    pub const ARCH_INDEX_RETURN_THUNK: usize = 4;
+    pub const ARCH_INDEX_PV_OPS: usize = 5;
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Errno> {
-        if bytes.len() < Self::KINFO_LEN {
+        #[allow(clippy::struct_field_names)]
+        #[repr(C)]
+        struct _KernelSymbolInfo {
+            pub ksymtab_start: *const HekiKernelSymbol,
+            pub ksymtab_end: *const HekiKernelSymbol,
+            pub ksymtab_gpl_start: *const HekiKernelSymbol,
+            pub ksymtab_gpl_end: *const HekiKernelSymbol,
+        }
+        
+        let ksym_info_len = mem::size_of::<_KernelSymbolInfo>();
+        if bytes.len() < ksym_info_len {
+            return Err(Errno::EINVAL);
+        }
+        serial_println!("syminfo_len:{ksym_info_len}");
+        
+        let ksym_info_bytes = &bytes[..ksym_info_len];
+        #[allow(clippy::cast_ptr_alignment)]
+        let ksym_info_ptr = ksym_info_bytes.as_ptr().cast::<_KernelSymbolInfo>();
+        if !ksym_info_ptr.is_aligned() {
+            serial_println!("ksym_info_ptr:{ksym_info_ptr:p} is not aligned");
+            return Err(Errno::EINVAL);
+        }
+
+        let pvops_bytes = &bytes[ksym_info_len..];
+        if pvops_bytes.len() < Self::ARCH_INDEX_PV_OPS { //TODO: This hshould be a multiple
+            return Err(Errno::EINVAL);
+        }
+        if !pvops_bytes.len().is_multiple_of(mem::size_of::<u64>()) {
             return Err(Errno::EINVAL);
         }
 
         #[allow(clippy::cast_ptr_alignment)]
-        let kinfo_ptr = bytes.as_ptr().cast::<HekiKernelInfo>();
-        assert!(kinfo_ptr.is_aligned(), "kinfo_ptr is not aligned");
+        let pvops_ptr = pvops_bytes.as_ptr().cast::<u64>();
+        if !pvops_ptr.is_aligned() {
+            return Err(Errno::EINVAL);
+        }
+        let pvops_count = pvops_bytes.len() / mem::size_of::<u64>();
+        if pvops_count < Self::ARCH_INDEX_PV_OPS {
+            return Err(Errno::EINVAL);
+        }
 
-        // SAFETY: Casting from vtl0 buffer that contained the struct
+        // SAFETY: Checked that bytes is large enough to contain the smallest
+        // valid amount of information, and that it is aligned correctly
         unsafe {
             Ok(HekiKernelInfo {
-                ksymtab_start: (*kinfo_ptr).ksymtab_start,
-                ksymtab_end: (*kinfo_ptr).ksymtab_end,
-                ksymtab_gpl_start: (*kinfo_ptr).ksymtab_gpl_start,
-                ksymtab_gpl_end: (*kinfo_ptr).ksymtab_gpl_end,
+                ksymtab_start: VirtAddr::from_ptr((*ksym_info_ptr).ksymtab_start),
+                ksymtab_end: VirtAddr::from_ptr((*ksym_info_ptr).ksymtab_end),
+                ksymtab_gpl_start: VirtAddr::from_ptr((*ksym_info_ptr).ksymtab_gpl_start),
+                ksymtab_gpl_end: VirtAddr::from_ptr((*ksym_info_ptr).ksymtab_gpl_end),
+                pv_ops: (0..pvops_count)
+                    .map(|i| {
+                        serial_println!("    {}:pv_ops:{:x}", i, *pvops_ptr.add(i));
+                        *pvops_ptr.add(i)
+                    })
+                    .collect(),
             })
         }
+    }
+
+    pub fn get_sym_info(
+        &self,
+    ) -> (
+        VirtAddr,
+        VirtAddr,
+        VirtAddr,
+        VirtAddr,
+    ) {
+        (self.ksymtab_start, self.ksymtab_end, self.ksymtab_gpl_start, self.ksymtab_gpl_end)
+    }
+
+    pub fn get_arch_kinfo(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.pv_ops[Self::ARCH_INDEX_PV_BUG],
+            self.pv_ops[Self::ARCH_INDEX_PV_NOP],
+            self.pv_ops[Self::ARCH_INDEX_INDIRECT_THUNK],
+            self.pv_ops[Self::ARCH_INDEX_RETURN_THUNK_INIT],
+            self.pv_ops[Self::ARCH_INDEX_RETURN_THUNK],
+        )
+    }
+
+    pub fn get_arch_pv_op(&self, index: usize) -> Option<u64> {
+        let op_index = index + Self::ARCH_INDEX_PV_OPS;
+        //if let Some(op) = self.pv_ops.get(op_index) {
+        //    Some(op.clone())
+        //} else {
+        //    None
+       // }
+        self.pv_ops.get(op_index).copied()
     }
 }
