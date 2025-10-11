@@ -1,7 +1,7 @@
 //! Global Descriptor Table (GDT) and Task State Segment (TSS)
 
-use crate::kernel_context::{MAX_CORES, get_core_id, get_per_core_kernel_context};
-use core::mem::MaybeUninit;
+use crate::host::per_cpu_variables::{with_per_cpu_variables, with_per_cpu_variables_mut};
+use alloc::boxed::Box;
 use x86_64::{
     PrivilegeLevel, VirtAddr,
     instructions::{
@@ -76,27 +76,31 @@ impl Default for GdtWrapper {
     }
 }
 
-// TODO: use heap
-static mut GDT_STORAGE: [MaybeUninit<GdtWrapper>; MAX_CORES] =
-    [const { MaybeUninit::uninit() }; MAX_CORES];
-
 fn setup_gdt_tss() {
-    let core_id = get_core_id();
-    let kernel_context = get_per_core_kernel_context();
+    const STACK_ALIGNMENT: u64 = 16;
 
-    let stack_top = kernel_context.interrupt_stack_top() & !15;
-    let tss = &mut kernel_context.tss;
+    let stack_top = with_per_cpu_variables(|per_cpu_variables| {
+        per_cpu_variables.interrupt_stack_top() & !(STACK_ALIGNMENT - 1)
+    });
+
+    let mut tss = Box::new(AlignedTss(TaskStateSegment::new()));
     tss.0.interrupt_stack_table[0] = VirtAddr::new(stack_top);
 
-    let gdt = unsafe { &mut *GDT_STORAGE[core_id].as_mut_ptr() };
-    *gdt = GdtWrapper::new();
+    let mut gdt = Box::new(GdtWrapper::new());
+
+    // `tss_segment()` requires `&'static TaskStateSegment`. Leaking `tss` is fine because
+    // it will be used until the LVBS kernel resets.
+    let tss = Box::leak(tss);
+    gdt.selectors.tss = gdt.gdt.append(Descriptor::tss_segment(&tss.0));
 
     gdt.selectors.kernel_code = gdt.gdt.append(Descriptor::kernel_code_segment());
     gdt.selectors.kernel_data = gdt.gdt.append(Descriptor::kernel_data_segment());
-    gdt.selectors.tss = gdt.gdt.append(Descriptor::tss_segment(&tss.0));
     gdt.selectors.user_code = gdt.gdt.append(Descriptor::user_code_segment());
     gdt.selectors.user_data = gdt.gdt.append(Descriptor::user_data_segment());
 
+    // `gdt.load()` requires `&'static self`. Leaking `gdt` is fine because
+    // it will be used until the LVBS kernel resets.
+    let gdt = Box::leak(gdt);
     gdt.gdt.load();
 
     unsafe {
@@ -105,7 +109,9 @@ fn setup_gdt_tss() {
         load_tss(gdt.selectors.tss);
     }
 
-    kernel_context.gdt = Some(gdt);
+    with_per_cpu_variables_mut(|per_cpu_variables| {
+        per_cpu_variables.gdt = Some(gdt);
+    });
 }
 
 /// Set up GDT and TSS (for a core)

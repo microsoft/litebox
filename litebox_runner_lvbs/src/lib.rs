@@ -2,10 +2,9 @@
 
 use core::panic::PanicInfo;
 use litebox_platform_lvbs::{
-    arch::{gdt, instrs::hlt_loop, interrupts},
+    arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
     debug_serial_println,
-    host::bootparam::get_vtl1_memory_info,
-    kernel_context::get_core_id,
+    host::{bootparam::get_vtl1_memory_info, per_cpu_variables::allocate_per_cpu_variables},
     mm::MemoryProvider,
     mshv::{
         hvcall,
@@ -23,10 +22,6 @@ use litebox_platform_multiplex::Platform;
 ///
 /// Panics if it failed to enable Hyper-V hypercall
 pub fn init() -> Option<&'static Platform> {
-    gdt::init();
-    interrupts::init_idt();
-    x86_64::instructions::interrupts::enable();
-
     let mut ret: Option<&'static Platform> = None;
 
     if get_core_id() == 0 {
@@ -82,6 +77,8 @@ pub fn init() -> Option<&'static Platform> {
                 mem_fill_start,
                 mem_fill_size
             );
+
+            allocate_per_cpu_variables();
         } else {
             panic!("Failed to get memory info");
         }
@@ -90,6 +87,7 @@ pub fn init() -> Option<&'static Platform> {
     if let Err(e) = hvcall::init() {
         panic!("Err: {:?}", e);
     }
+    gdt::init();
     interrupts::init_idt();
     x86_64::instructions::interrupts::enable();
     Platform::register_syscall_handler(litebox_shim_optee::handle_syscall_request);

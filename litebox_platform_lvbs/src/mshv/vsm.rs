@@ -3,12 +3,13 @@
 #[cfg(debug_assertions)]
 use crate::mshv::mem_integrity::parse_modinfo;
 use crate::{
+    arch::get_core_id,
     debug_serial_print, debug_serial_println,
+    host::per_cpu_variables::with_per_cpu_variables_mut,
     host::{
         bootparam::{get_num_possible_cpus, get_vtl1_memory_info},
         linux::{CpuMask, KEXEC_SEGMENT_MAX, Kimage},
     },
-    kernel_context::{get_core_id, get_per_core_kernel_context},
     mshv::{
         HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
         HV_REGISTER_CR_INTERCEPT_CR4_MASK, HV_REGISTER_VSM_PARTITION_CONFIG,
@@ -62,7 +63,7 @@ impl AlignedPage {
 // For now, we do not validate large kernel modules due to the VTL1's memory size limitation.
 const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
 
-pub fn init() {
+pub(crate) fn init() {
     assert!(
         !(get_core_id() == 0 && mshv_vsm_configure_partition().is_err()),
         "Failed to configure VSM partition"
@@ -1091,14 +1092,18 @@ impl ControlRegMap {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
-    let kernel_context = get_per_core_kernel_context();
-
-    kernel_context.vtl0_locked_regs.init();
-
-    for reg_name in kernel_context.vtl0_locked_regs.reg_names() {
-        let value = hvcall_get_vp_vtl0_registers(reg_name)?;
-        kernel_context.vtl0_locked_regs.set(reg_name, value);
+    let reg_names = with_per_cpu_variables_mut(|per_cpu_variables| {
+        per_cpu_variables.vtl0_locked_regs.init();
+        per_cpu_variables.vtl0_locked_regs.reg_names()
+    });
+    for reg_name in reg_names {
+        if let Ok(value) = hvcall_get_vp_vtl0_registers(reg_name) {
+            with_per_cpu_variables_mut(|per_cpu_variables| {
+                per_cpu_variables.vtl0_locked_regs.set(reg_name, value);
+            });
+        }
     }
 
     Ok(0)

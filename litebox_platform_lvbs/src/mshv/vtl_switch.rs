@@ -1,7 +1,7 @@
 //! VTL switch related functions
 
 use crate::{
-    kernel_context::get_per_core_kernel_context,
+    host::per_cpu_variables::{with_per_cpu_variables, with_per_cpu_variables_mut},
     mshv::{
         HV_VTL_NORMAL, HV_VTL_SECURE, NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT,
         VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction, vsm::vsm_dispatch,
@@ -69,13 +69,16 @@ impl VtlState {
     }
 }
 
-fn save_vtl_state_to_kernel_context(vtl: u8, vtl_state: *const VtlState) {
-    let kernel_context = get_per_core_kernel_context();
-    match vtl {
-        HV_VTL_NORMAL => kernel_context.vtl0_state.clone_from(unsafe { &*vtl_state }),
-        HV_VTL_SECURE => kernel_context.vtl1_state.clone_from(unsafe { &*vtl_state }),
+fn save_vtl_state_to_per_cpu_variables(vtl: u8, vtl_state: *const VtlState) {
+    with_per_cpu_variables_mut(|per_cpu_variables| match vtl {
+        HV_VTL_NORMAL => per_cpu_variables
+            .vtl0_state
+            .clone_from(unsafe { &*vtl_state }),
+        HV_VTL_SECURE => per_cpu_variables
+            .vtl1_state
+            .clone_from(unsafe { &*vtl_state }),
         _ => panic!("Invalid VTL number: {}", vtl),
-    }
+    });
 }
 
 // Save CPU registers to a global data structure through using a stack
@@ -103,13 +106,13 @@ unsafe extern "C" fn save_vtl0_state() {
         "mov edi, {vtl}",
         "mov rsi, rsp",
         "and rsp, {stack_alignment}",
-        "call {save_vtl_state_to_kernel_context}",
+        "call {save_vtl_state_to_per_cpu_variables}",
         "mov rsp, rbp",
         "add rsp, {register_space}",
         "ret",
         vtl = const HV_VTL_NORMAL,
         stack_alignment = const STACK_ALIGNMENT,
-        save_vtl_state_to_kernel_context = sym save_vtl_state_to_kernel_context,
+        save_vtl_state_to_per_cpu_variables = sym save_vtl_state_to_per_cpu_variables,
         register_space = const core::mem::size_of::<VtlState>(),
     );
 }
@@ -139,24 +142,23 @@ unsafe extern "C" fn save_vtl1_state() {
         "mov edi, {vtl}",
         "mov rsi, rsp",
         "and rsp, {stack_alignment}",
-        "call {save_vtl_state_to_kernel_context}",
+        "call {save_vtl_state_to_per_cpu_variables}",
         "mov rsp, rbp",
         "add rsp, {register_space}",
         "ret",
         vtl = const HV_VTL_SECURE,
         stack_alignment = const STACK_ALIGNMENT,
-        save_vtl_state_to_kernel_context = sym save_vtl_state_to_kernel_context,
+        save_vtl_state_to_per_cpu_variables = sym save_vtl_state_to_per_cpu_variables,
         register_space = const core::mem::size_of::<VtlState>(),
     );
 }
 
-fn load_vtl_state_from_kernel_context(vtl: u8, vtl_state: *mut VtlState) {
-    let kernel_context = get_per_core_kernel_context();
-    match vtl {
-        HV_VTL_NORMAL => unsafe { vtl_state.copy_from(&raw const kernel_context.vtl0_state, 1) },
-        HV_VTL_SECURE => unsafe { vtl_state.copy_from(&raw const kernel_context.vtl1_state, 1) },
+fn load_vtl_state_from_per_cpu_variables(vtl: u8, vtl_state: *mut VtlState) {
+    with_per_cpu_variables_mut(|per_cpu_variables| match vtl {
+        HV_VTL_NORMAL => unsafe { vtl_state.copy_from(&raw const per_cpu_variables.vtl0_state, 1) },
+        HV_VTL_SECURE => unsafe { vtl_state.copy_from(&raw const per_cpu_variables.vtl1_state, 1) },
         _ => panic!("Invalid VTL number: {}", vtl),
-    }
+    });
 }
 
 // Restore CPU registers from the global data structure through using a stack.
@@ -168,7 +170,7 @@ unsafe extern "C" fn load_vtl_state(vtl: u8) {
         // rdi holds the VTL number
         "mov rsi, rsp",
         "and rsp, {stack_alignment}",
-        "call {load_vtl_state_from_kernel_context}",
+        "call {load_vtl_state_from_per_cpu_variables}",
         "mov rsp, rbp",
         "pop rbp",
         "pop rax",
@@ -190,7 +192,7 @@ unsafe extern "C" fn load_vtl_state(vtl: u8) {
         "ret",
         register_space = const core::mem::size_of::<VtlState>(),
         stack_alignment = const STACK_ALIGNMENT,
-        load_vtl_state_from_kernel_context = sym load_vtl_state_from_kernel_context,
+        load_vtl_state_from_per_cpu_variables = sym load_vtl_state_from_per_cpu_variables,
     );
 }
 
@@ -213,8 +215,8 @@ pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
 #[allow(clippy::inline_always)]
 #[inline(always)]
 fn jump_to_vtl_switch_loop_with_stack_cleanup() -> ! {
-    let kernel_context = get_per_core_kernel_context();
-    let stack_top = kernel_context.kernel_stack_top();
+    let stack_top =
+        with_per_cpu_variables(crate::host::per_cpu_variables::PerCpuVariables::kernel_stack_top);
     unsafe {
         asm!(
             "mov rsp, rax",
@@ -255,12 +257,15 @@ fn vtl_switch_loop() -> ! {
             load_vtl_state(HV_VTL_SECURE);
         }
 
-        let kernel_context = get_per_core_kernel_context();
-        let reason = unsafe { (*kernel_context.hv_vp_assist_page_as_ptr()).vtl_entry_reason };
+        let reason = with_per_cpu_variables(|per_cpu_variables| unsafe {
+            (*per_cpu_variables.hv_vp_assist_page_as_ptr()).vtl_entry_reason
+        });
         match VtlEntryReason::try_from(reason).unwrap_or(VtlEntryReason::Unknown) {
             #[allow(clippy::cast_sign_loss)]
             VtlEntryReason::VtlCall => {
-                let params = kernel_context.vtl0_state.get_vtlcall_params();
+                let params = with_per_cpu_variables(|per_cpu_variables| {
+                    per_cpu_variables.vtl0_state.get_vtlcall_params()
+                });
                 if VsmFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
                     .unwrap_or(VsmFunction::Unknown)
                     == VsmFunction::Unknown
@@ -268,7 +273,9 @@ fn vtl_switch_loop() -> ! {
                     todo!("unknown function ID = {:#x}", params[0]);
                 } else {
                     let result = vtlcall_dispatch(&params);
-                    kernel_context.set_vtl_return_value(result as u64);
+                    with_per_cpu_variables_mut(|per_cpu_variables| {
+                        per_cpu_variables.set_vtl_return_value(result as u64);
+                    });
                     jump_to_vtl_switch_loop_with_stack_cleanup();
                 }
             }
