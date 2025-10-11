@@ -18,7 +18,7 @@ mod in_mem {
                 .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to create file");
 
-            fs.close(fd).expect("Failed to close file");
+            fs.close(&fd).expect("Failed to close file");
 
             // Test file deletion
             fs.unlink(path).expect("Failed to unlink file");
@@ -41,7 +41,7 @@ mod in_mem {
                 .expect("Failed to create file");
             let data = b"Hello, world!";
             fs.write(&fd, data, None).expect("Failed to write to file");
-            fs.close(fd).expect("Failed to close file");
+            fs.close(&fd).expect("Failed to close file");
 
             // Read from the file
             let fd = fs
@@ -53,7 +53,7 @@ mod in_mem {
                 .expect("Failed to read from file");
             assert_eq!(bytes_read, data.len());
             assert_eq!(&buffer, data);
-            fs.close(fd).expect("Failed to close file");
+            fs.close(&fd).expect("Failed to close file");
         });
     }
 
@@ -92,7 +92,7 @@ mod in_mem {
             .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
 
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
 
         // Test file deletion
         fs.unlink(path).expect("Failed to unlink file");
@@ -121,7 +121,7 @@ mod in_mem {
         fs.write(&fd, data, None).expect("Failed to write to file");
         fs.write(&fd, &data[2..], Some(2))
             .expect("Failed to write to file with offset");
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
 
         // Read from the file
         let fd = fs
@@ -137,7 +137,7 @@ mod in_mem {
         assert_eq!(bytes_read, data.len());
         assert_eq!(bytes_read2, data.len() - 2);
         assert_eq!(&buffer, data);
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
     }
 
     #[test]
@@ -182,7 +182,7 @@ mod in_mem {
                 vec![".", ".."],
                 "Root directory should contain . and .."
             );
-            fs.close(fd).expect("Failed to close directory");
+            fs.close(&fd).expect("Failed to close directory");
         });
     }
 
@@ -197,18 +197,18 @@ mod in_mem {
             let fd1 = fs
                 .open("/testfile1", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to create file1");
-            fs.close(fd1).expect("Failed to close file1");
+            fs.close(&fd1).expect("Failed to close file1");
             let fd2 = fs
                 .open("/testfile2", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to create file2");
-            fs.close(fd2).expect("Failed to close file2");
+            fs.close(&fd2).expect("Failed to close file2");
 
             // Read root directory
             let fd = fs
                 .open("/", OFlags::RDONLY, Mode::empty())
                 .expect("Failed to open root directory");
             let entries = fs.read_dir(&fd).expect("Failed to read directory");
-            fs.close(fd).expect("Failed to close directory");
+            fs.close(&fd).expect("Failed to close directory");
 
             // Should have 5 entries: ., .., testdir, testfile1, testfile2
             assert_eq!(entries.len(), 5);
@@ -242,7 +242,7 @@ mod in_mem {
                 .map(|e| e.name.clone())
                 .collect::<Vec<_>>();
             assert!(entries.len() == 2, "Subdirectory should contain . and ..");
-            fs.close(fd).expect("Failed to close subdirectory");
+            fs.close(&fd).expect("Failed to close subdirectory");
         });
     }
 
@@ -255,14 +255,14 @@ mod in_mem {
             let fd = fs
                 .open("/testfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to create file");
-            fs.close(fd).expect("Failed to close file");
+            fs.close(&fd).expect("Failed to close file");
 
             // Try to read_dir on the file (should fail)
             let fd = fs
                 .open("/testfile", OFlags::RDONLY, Mode::empty())
                 .expect("Failed to open file");
             let result = fs.read_dir(&fd);
-            fs.close(fd).expect("Failed to close file");
+            fs.close(&fd).expect("Failed to close file");
 
             assert!(matches!(
                 result,
@@ -282,7 +282,7 @@ mod in_mem {
             let fd = fs
                 .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to create file");
-            fs.close(fd).expect("Failed to close file");
+            fs.close(&fd).expect("Failed to close file");
 
             // First chown to 1000:1000 as root (should succeed)
             fs.chown(path, Some(1000), Some(1000))
@@ -347,7 +347,7 @@ mod in_mem {
         let fd = fs
             .open("/testfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
 
         // Test O_DIRECTORY on a directory (should succeed)
         let fd = fs
@@ -357,7 +357,7 @@ mod in_mem {
                 Mode::empty(),
             )
             .expect("Failed to open directory with O_DIRECTORY");
-        fs.close(fd).expect("Failed to close directory");
+        fs.close(&fd).expect("Failed to close directory");
 
         // Test O_DIRECTORY on a regular file (should fail)
         assert!(matches!(
@@ -392,7 +392,7 @@ mod in_mem {
                 Mode::RWXU,
             )
             .expect("Failed to create file with O_CREAT | O_DIRECTORY");
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
 
         // Verify it created a regular file, not a directory
         let stat = fs
@@ -404,7 +404,7 @@ mod in_mem {
         let fd = fs
             .open("/testdir", OFlags::RDWR | OFlags::DIRECTORY, Mode::empty())
             .expect("Failed to open directory with O_RDWR | O_DIRECTORY");
-        fs.close(fd).expect("Failed to close directory");
+        fs.close(&fd).expect("Failed to close directory");
     }
 
     #[test]
@@ -429,7 +429,7 @@ mod in_mem {
         // Write some data to verify file was created
         fs.write(&fd, b"test data", None)
             .expect("Failed to write to new file");
-        fs.close(fd).expect("Failed to close new file");
+        fs.close(&fd).expect("Failed to close new file");
 
         // Test O_CREAT | O_EXCL on existing file (should fail)
         assert!(matches!(
@@ -452,13 +452,13 @@ mod in_mem {
             .read(&fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"test data");
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
 
         // Test O_CREAT without O_EXCL on existing file (should succeed)
         let fd = fs
             .open("/newfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to open existing file with O_CREAT (without O_EXCL)");
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
 
         // Test O_CREAT | O_EXCL on directory (should fail)
         fs.mkdir("/testdir", Mode::RWXU)
@@ -491,7 +491,7 @@ mod in_mem {
         let initial_data = b"Hello, world! This is initial content.";
         fs.write(&fd, initial_data, None)
             .expect("Failed to write initial content");
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
 
         // Verify initial content was written
         let fd = fs
@@ -503,7 +503,7 @@ mod in_mem {
             .expect("Failed to read initial content");
         assert_eq!(bytes_read, initial_data.len());
         assert_eq!(&buffer, initial_data);
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
 
         // Test O_TRUNC with O_WRONLY - should truncate file
         let fd = fs
@@ -514,7 +514,7 @@ mod in_mem {
         let new_data = b"New content";
         fs.write(&fd, new_data, None)
             .expect("Failed to write new content");
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
 
         // Verify the file was truncated and contains only new content
         let fd = fs
@@ -526,7 +526,7 @@ mod in_mem {
             .expect("Failed to read after truncation");
         assert_eq!(bytes_read, new_data.len());
         assert_eq!(&buffer[..bytes_read], new_data);
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
 
         // Test O_TRUNC with O_RDWR - should also truncate
         fs.write(
@@ -535,7 +535,7 @@ mod in_mem {
             None,
         )
         .unwrap();
-        fs.close(fs.open(path, OFlags::WRONLY, Mode::empty()).unwrap())
+        fs.close(&fs.open(path, OFlags::WRONLY, Mode::empty()).unwrap())
             .unwrap();
 
         let fd = fs
@@ -561,7 +561,7 @@ mod in_mem {
             .expect("Failed to read after write");
         assert_eq!(bytes_read, test_data.len());
         assert_eq!(&buffer[..bytes_read], test_data);
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
     }
 
     #[test]
@@ -618,7 +618,7 @@ mod in_mem {
         assert_eq!(n2, 8);
         assert_eq!(&buf2[..n2], b"Xbcdef12");
 
-        fs.close(fd).expect("close failed");
+        fs.close(&fd).expect("close failed");
     }
 }
 
@@ -645,7 +645,7 @@ mod tar_ro {
             .read(&fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"testfoo\n");
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
         let fd = fs
             .open("bar/baz", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file");
@@ -654,7 +654,7 @@ mod tar_ro {
             .read(&fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"test bar baz\n");
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
     }
 
     #[test]
@@ -670,7 +670,7 @@ mod tar_ro {
         let fd = fs
             .open("bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open dir");
-        fs.close(fd).expect("Failed to close dir");
+        fs.close(&fd).expect("Failed to close dir");
     }
 
     #[test]
@@ -682,7 +682,7 @@ mod tar_ro {
         let fd = fs
             .open("bar", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
             .expect("Failed to open directory with O_DIRECTORY");
-        fs.close(fd).expect("Failed to close directory");
+        fs.close(&fd).expect("Failed to close directory");
 
         // Test O_DIRECTORY on a regular file (should fail)
         assert!(matches!(
@@ -723,7 +723,7 @@ mod tar_ro {
             .open("/", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open root directory");
         let entries = fs.read_dir(&fd).expect("Failed to read root directory");
-        fs.close(fd).expect("Failed to close root directory");
+        fs.close(&fd).expect("Failed to close root directory");
 
         // Should have 4 entries: ., .., bar, foo
         assert_eq!(entries.len(), 4);
@@ -749,7 +749,7 @@ mod tar_ro {
             .open("bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open bar directory");
         let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
-        fs.close(fd).expect("Failed to close bar directory");
+        fs.close(&fd).expect("Failed to close bar directory");
 
         // Should have 3 entry: ., .., baz (file)
         assert_eq!(entries.len(), 3);
@@ -766,7 +766,7 @@ mod tar_ro {
             .open("foo", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open foo file");
         let result = fs.read_dir(&fd);
-        fs.close(fd).expect("Failed to close foo file");
+        fs.close(&fd).expect("Failed to close foo file");
 
         assert!(matches!(
             result,
@@ -806,7 +806,7 @@ mod layered {
         let stat = fs.fd_file_status(&fd).expect("Failed to fd file stat");
         assert_eq!(stat.file_type, FileType::RegularFile);
         assert_eq!(stat.mode, Mode::from_bits(0o644).unwrap());
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
 
         let stat = fs.file_status("bar").expect("Failed to file stat");
         assert_eq!(stat.file_type, FileType::Directory);
@@ -823,7 +823,7 @@ mod layered {
         let stat = fs.fd_file_status(&fd).expect("Failed to fd file stat");
         assert_eq!(stat.file_type, FileType::RegularFile);
         assert_eq!(stat.mode, Mode::from_bits(0o644).unwrap());
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
     }
 
     #[test]
@@ -844,7 +844,7 @@ mod layered {
         let fd = fs
             .open("bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open dir");
-        fs.close(fd).expect("Failed to close dir");
+        fs.close(&fd).expect("Failed to close dir");
     }
 
     /// Check that for the same file, even though it started as a lower-level file, writing to it
@@ -895,8 +895,8 @@ mod layered {
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"shareoo\n");
 
-        fs.close(fd1).expect("Failed to close file");
-        fs.close(fd2).expect("Failed to close file");
+        fs.close(&fd1).expect("Failed to close file");
+        fs.close(&fd2).expect("Failed to close file");
     }
 
     /// Similar to [`file_read_write_sync_up`] but also confirm that file positions have been
@@ -944,8 +944,8 @@ mod layered {
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"eoo\n");
 
-        fs.close(fd1).expect("Failed to close file");
-        fs.close(fd2).expect("Failed to close file");
+        fs.close(&fd1).expect("Failed to close file");
+        fs.close(&fd2).expect("Failed to close file");
     }
 
     #[test]
@@ -980,7 +980,7 @@ mod layered {
         assert_eq!(&buffer[..bytes_read], b"foo\n");
 
         // But if we close and attempt to re-open, it should not exist
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
         assert!(matches!(
             fs.open("foo", OFlags::RDONLY, Mode::empty()),
             Err(crate::fs::errors::OpenError::PathError(
@@ -1007,7 +1007,7 @@ mod layered {
         let fd = in_mem_fs
             .open("/upperfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
-        in_mem_fs.close(fd).expect("Failed to close file");
+        in_mem_fs.close(&fd).expect("Failed to close file");
 
         let fs = layered::FileSystem::new(
             &litebox,
@@ -1020,7 +1020,7 @@ mod layered {
         let fd = fs
             .open("bar", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
             .expect("Failed to open lower layer directory with O_DIRECTORY");
-        fs.close(fd).expect("Failed to close directory");
+        fs.close(&fd).expect("Failed to close directory");
 
         // Test O_DIRECTORY on directory from upper layer (in_mem)
         let fd = fs
@@ -1030,7 +1030,7 @@ mod layered {
                 Mode::empty(),
             )
             .expect("Failed to open upper layer directory with O_DIRECTORY");
-        fs.close(fd).expect("Failed to close directory");
+        fs.close(&fd).expect("Failed to close directory");
 
         // Test O_DIRECTORY on file from lower layer (should fail)
         assert!(matches!(
@@ -1117,7 +1117,7 @@ mod layered {
             .open("bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open bar directory");
         let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
-        fs.close(fd).expect("Failed to close bar directory");
+        fs.close(&fd).expect("Failed to close bar directory");
 
         // Should have 3 entries: ., .., baz (file)
         assert_eq!(entries.len(), 3);
@@ -1145,7 +1145,7 @@ mod layered {
             let fd = fs
                 .open("/upperfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to create upperfile");
-            fs.close(fd).expect("Failed to close upperfile");
+            fs.close(&fd).expect("Failed to close upperfile");
         });
 
         let fs = layered::FileSystem::new(
@@ -1160,7 +1160,7 @@ mod layered {
             .open("/", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open root directory");
         let entries = fs.read_dir(&fd).expect("Failed to read root directory");
-        fs.close(fd).expect("Failed to close root directory");
+        fs.close(&fd).expect("Failed to close root directory");
 
         // Should have 6 entries: ., .., bar, foo (from lower), upperdir, upperfile (from upper)
         assert_eq!(entries.len(), 6);
@@ -1191,7 +1191,7 @@ mod layered {
             .open("/upperdir", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open upperdir");
         let entries = fs.read_dir(&fd).expect("Failed to read upperdir");
-        fs.close(fd).expect("Failed to close upperdir");
+        fs.close(&fd).expect("Failed to close upperdir");
 
         // only . and ..
         assert!(entries.len() == 2);
@@ -1236,7 +1236,7 @@ mod layered {
 
         fs.write(&fd, b"layered test", None)
             .expect("Failed to write to new file");
-        fs.close(fd).expect("Failed to close new file");
+        fs.close(&fd).expect("Failed to close new file");
 
         // Test O_CREAT | O_EXCL on file that now exists in upper layer (should fail)
         assert!(matches!(
@@ -1274,7 +1274,7 @@ mod layered {
 
         fs.write(&fd, b"new foo content", None)
             .expect("Failed to write to recreated file");
-        fs.close(fd).expect("Failed to close recreated file");
+        fs.close(&fd).expect("Failed to close recreated file");
 
         // Verify the new content
         let fd = fs
@@ -1285,7 +1285,7 @@ mod layered {
             .read(&fd, &mut buffer, None)
             .expect("Failed to read from recreated file");
         assert_eq!(&buffer[..bytes_read], b"new foo content");
-        fs.close(fd).expect("Failed to close recreated file");
+        fs.close(&fd).expect("Failed to close recreated file");
 
         // Test O_CREAT | O_EXCL behavior with existing upper layer file
         // Create a file in upper layer first
@@ -1298,7 +1298,7 @@ mod layered {
             .expect("Failed to create upper layer file");
         fs.write(&fd, b"upper content", None)
             .expect("Failed to write to upper layer file");
-        fs.close(fd).expect("Failed to close upper layer file");
+        fs.close(&fd).expect("Failed to close upper layer file");
 
         // Now try O_CREAT | O_EXCL on the same file (should fail)
         assert!(matches!(
@@ -1346,7 +1346,7 @@ mod layered {
         let entries = fs
             .read_dir(&fd)
             .expect("Failed to read /bar/test directory");
-        fs.close(fd).expect("Failed to close directory");
+        fs.close(&fd).expect("Failed to close directory");
 
         // Should contain only . and .. entries
         assert_eq!(entries.len(), 2);
@@ -1383,7 +1383,7 @@ mod layered {
         let data = b"Hello from nested file!";
         fs.write(&fd, data, None)
             .expect("Failed to write to bar/test");
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
 
         // Read the file back
         let fd = fs
@@ -1394,7 +1394,7 @@ mod layered {
             .read(&fd, &mut buffer, None)
             .expect("Failed to read from bar/test");
         assert_eq!(&buffer[..bytes_read], data);
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
 
         // Verify the file exists and has correct type
         let stat = fs
@@ -1431,7 +1431,7 @@ mod layered {
         let data = b"Modified content!";
         fs.write(&fd, data, None)
             .expect("Failed to write to bar/baz");
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
 
         // Read the file back to verify it was modified
         let fd = fs
@@ -1443,7 +1443,7 @@ mod layered {
             .expect("Failed to read from bar/baz");
 
         assert_eq!(&buffer[..bytes_read], data);
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
 
         // Verify the file still exists and has correct type
         let stat = fs
@@ -1486,7 +1486,7 @@ mod layered {
         // Write new content
         fs.write(&fd, b"new content", None)
             .expect("Failed to write to file");
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
 
         // Verify the content persists
         let fd = fs
@@ -1497,7 +1497,7 @@ mod layered {
             .read(&fd, &mut buffer, None)
             .expect("Failed to read file");
         assert_eq!(&buffer[..bytes_read], b"new content");
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
     }
 
     #[test]
@@ -1573,7 +1573,7 @@ mod layered {
                 Mode::RWXU | Mode::RWXG,
             )
             .expect("create file in upper_dir failed");
-        fs.close(fd).unwrap();
+        fs.close(&fd).unwrap();
 
         // Attempt to remove while non-empty
         assert!(matches!(fs.rmdir("/upper_dir"), Err(RmdirError::NotEmpty)));
@@ -1638,7 +1638,7 @@ mod layered {
                 Mode::RWXU | Mode::RWXG,
             )
             .expect("create file failed");
-        fs.close(fd).unwrap();
+        fs.close(&fd).unwrap();
 
         // rmdir should fail with NotADirectory
         assert!(matches!(
@@ -1668,7 +1668,7 @@ mod stdio {
         let data = b"Hello, stdout!";
         fs.write(&fd_stdout, data, None)
             .expect("Failed to write to /dev/stdout");
-        fs.close(fd_stdout).expect("Failed to close /dev/stdout");
+        fs.close(&fd_stdout).expect("Failed to close /dev/stdout");
         assert_eq!(platform.stdout_queue.read().unwrap().len(), 1);
         assert_eq!(platform.stdout_queue.read().unwrap()[0], data);
 
@@ -1679,7 +1679,7 @@ mod stdio {
         let data = b"Hello, stderr!";
         fs.write(&fd_stderr, data, None)
             .expect("Failed to write to /dev/stderr");
-        fs.close(fd_stderr).expect("Failed to close /dev/stderr");
+        fs.close(&fd_stderr).expect("Failed to close /dev/stderr");
         assert_eq!(platform.stderr_queue.read().unwrap().len(), 1);
         assert_eq!(platform.stderr_queue.read().unwrap()[0], data);
 
@@ -1698,7 +1698,7 @@ mod stdio {
             .expect("Failed to read from /dev/stdin");
         assert_eq!(bytes_read, 13);
         assert_eq!(&buffer, b"Hello, stdin!");
-        fs.close(fd_stdin).expect("Failed to close /dev/stdin");
+        fs.close(&fd_stdin).expect("Failed to close /dev/stdin");
     }
 
     #[test]
@@ -1746,7 +1746,7 @@ mod layered_stdio {
             .write(&fd_stdout, data, None)
             .expect("Failed to write to /dev/stdout");
         layered_fs
-            .close(fd_stdout)
+            .close(&fd_stdout)
             .expect("Failed to close /dev/stdout");
         assert_eq!(platform.stdout_queue.read().unwrap().len(), 1);
         assert_eq!(platform.stdout_queue.read().unwrap()[0], data);
@@ -1760,7 +1760,7 @@ mod layered_stdio {
             .write(&fd_stderr, data, None)
             .expect("Failed to write to /dev/stderr");
         layered_fs
-            .close(fd_stderr)
+            .close(&fd_stderr)
             .expect("Failed to close /dev/stderr");
         assert_eq!(platform.stderr_queue.read().unwrap().len(), 1);
         assert_eq!(platform.stderr_queue.read().unwrap()[0], data);
@@ -1780,7 +1780,7 @@ mod layered_stdio {
             .expect("Failed to read from /dev/stdin");
         assert_eq!(&buffer[..bytes_read], b"Hello, layered stdin!");
         layered_fs
-            .close(fd_stdin)
+            .close(&fd_stdin)
             .expect("Failed to close /dev/stdin");
     }
 
@@ -1807,7 +1807,7 @@ mod layered_stdio {
             .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
 
-        fs.close(fd).expect("Failed to close file");
+        fs.close(&fd).expect("Failed to close file");
 
         // Test file deletion
         fs.unlink(path).expect("Failed to unlink file");

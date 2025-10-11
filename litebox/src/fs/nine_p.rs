@@ -37,7 +37,7 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
         todo!()
     }
 
-    fn close(&self, fd: FileFd<Platform>) -> Result<(), super::errors::CloseError> {
+    fn close(&self, fd: &FileFd<Platform>) -> Result<(), super::errors::CloseError> {
         todo!()
     }
 

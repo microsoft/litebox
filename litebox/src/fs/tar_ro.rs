@@ -206,7 +206,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             match self.truncate(&fd, 0, true) {
                 Ok(()) => {}
                 Err(e) => {
-                    self.close(fd).unwrap();
+                    self.close(&fd).unwrap();
                     return Err(e.into());
                 }
             }
@@ -214,7 +214,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Ok(fd)
     }
 
-    fn close(&self, fd: FileFd<Platform>) -> Result<(), CloseError> {
+    fn close(&self, fd: &FileFd<Platform>) -> Result<(), CloseError> {
         self.litebox.descriptor_table_mut().remove(fd);
         Ok(())
     }

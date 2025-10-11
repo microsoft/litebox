@@ -558,10 +558,13 @@ where
     }
 
     /// Close the socket at `fd`
-    pub fn close(&mut self, fd: SocketFd<Platform>) -> Result<(), CloseError> {
+    pub fn close(&mut self, fd: &SocketFd<Platform>) -> Result<(), CloseError> {
         let Some(mut socket_handle) = self.litebox.descriptor_table_mut().remove(fd) else {
             // There might be other duplicates around (e.g., due to `dup`), so we don't want to do
             // any deallocations and such. We just return.
+            //
+            // XXX(jayb): if there is an ongoing operation, we may possibly be in a scenario where
+            // we never clear things out. We need to set up some sort of a `Drop` system here.
             return Ok(());
         };
         let socket = self.socket_set.remove(socket_handle.entry.handle);

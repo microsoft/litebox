@@ -110,7 +110,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// If the `fd` was already closed out, then (obviously) it does not return an entry.
     pub(crate) fn remove<Subsystem: FdEnabledSubsystem>(
         &mut self,
-        fd: TypedFd<Subsystem>,
+        fd: &TypedFd<Subsystem>,
     ) -> Option<Subsystem::Entry> {
         let Some(old) = self.entries[fd.x.as_usize()?].take() else {
             unreachable!();
@@ -687,6 +687,9 @@ pub(crate) struct InternalFd {
 
 /// An explicitly-private shared-common element of [`TypedFd`], denoting an owned (non-clonable)
 /// token of ownership over a file descriptor.
+///
+/// Note: this indicates ownership over the descriptor itself, but not necessarily the underlying
+/// entry, since there might be duplicates to the underlying entry.
 struct OwnedFd {
     raw: u32,
     closed: AtomicBool,

@@ -274,8 +274,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         }
         // Now that we've migrated the data (and node-info) over, we can close out both of the file
         // descriptors.
-        self.upper.close(upper_fd.unwrap()).unwrap();
-        self.lower.close(lower_fd).unwrap();
+        self.upper.close(&upper_fd.unwrap()).unwrap();
+        self.lower.close(&lower_fd).unwrap();
 
         // Now we need to migrate all the descriptor entries over.
         //
@@ -357,7 +357,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     match entry {
                         EntryX::Upper { .. } | EntryX::Tombstone => unreachable!(),
                         EntryX::Lower { fd } => {
-                            self.lower.close(fd).unwrap();
+                            self.lower.close(&fd).unwrap();
                         }
                     }
                 }
@@ -609,7 +609,7 @@ impl<
                     // no error was thrown during truncation.
                 }
                 Err(e) => {
-                    self.close(fd).unwrap();
+                    self.close(&fd).unwrap();
                     return Err(e.into());
                 }
             }
@@ -617,7 +617,7 @@ impl<
         Ok(fd)
     }
 
-    fn close(&self, fd: FileFd<Platform, Upper, Lower>) -> Result<(), CloseError> {
+    fn close(&self, fd: &FileFd<Platform, Upper, Lower>) -> Result<(), CloseError> {
         let Some(removed_entry) = self.litebox.descriptor_table_mut().remove(fd) else {
             // Was duplicated, don't need to do anything.
             return Ok(());
@@ -657,7 +657,7 @@ impl<
                 let EntryX::Upper { fd } = Arc::into_inner(entry).unwrap() else {
                     unreachable!()
                 };
-                self.upper.close(fd)
+                self.upper.close(&fd)
             }
             EntryX::Lower { .. } => {
                 // Lower level FDs almost always have a corresponding entry in the root. Thus, we
@@ -686,7 +686,7 @@ impl<
                             Some(EntryX::Lower { fd }) => {
                                 // We are the sole remaining holder of the FD. Let us clean things
                                 // up at the lower level.
-                                return self.lower.close(fd);
+                                return self.lower.close(&fd);
                             }
                             None => {
                                 // Someone else's job. We can quit successfully.
@@ -707,7 +707,7 @@ impl<
                 let EntryX::Lower { fd, .. } = Arc::into_inner(entry).unwrap() else {
                     unreachable!()
                 };
-                self.lower.close(fd)
+                self.lower.close(&fd)
             }
         }
     }
@@ -1110,7 +1110,7 @@ impl<
             Ok(entries) => entries,
             Err(ReadDirError::ClosedFd | ReadDirError::NotADirectory) => unreachable!(),
         };
-        self.close(dir_fd).expect("close dir fd failed");
+        self.close(&dir_fd).expect("close dir fd failed");
         // "." and ".." are always present; anything more => not empty.
         if entries.len() > 2 {
             return Err(RmdirError::NotEmpty);
@@ -1198,7 +1198,7 @@ impl<
                             }
                         }
                     }
-                    let _ = self.lower.close(lower_fd);
+                    let _ = self.lower.close(&lower_fd);
                 }
 
                 upper_entries

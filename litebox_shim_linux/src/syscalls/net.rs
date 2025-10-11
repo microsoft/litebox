@@ -92,7 +92,7 @@ pub(crate) struct Socket {
 impl Drop for Socket {
     fn drop(&mut self) {
         if let Some(sockfd) = self.fd.take() {
-            litebox_net().lock().close(sockfd);
+            litebox_net().lock().close(&sockfd);
         }
     }
 }

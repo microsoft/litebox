@@ -315,7 +315,7 @@ pub(crate) fn do_close(desc: Descriptor) -> Result<(), Errno> {
                 return match rds.fd_consume_raw_integer(raw_fd) {
                     Ok(fd) => {
                         drop(rds);
-                        litebox_fs().close(fd).map_err(Errno::from)
+                        litebox_fs().close(&fd).map_err(Errno::from)
                     }
                     Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
                     Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {

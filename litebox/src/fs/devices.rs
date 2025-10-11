@@ -163,7 +163,7 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         Ok(fd)
     }
 
-    fn close(&self, fd: FileFd<Platform>) -> Result<(), CloseError> {
+    fn close(&self, fd: &FileFd<Platform>) -> Result<(), CloseError> {
         self.litebox.descriptor_table_mut().remove(fd);
         Ok(())
     }

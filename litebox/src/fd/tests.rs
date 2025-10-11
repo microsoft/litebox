@@ -42,7 +42,7 @@ fn test_insert_and_remove_entry() {
 
     assert_eq!(descriptors.entries.len(), 1);
 
-    let removed_entry = descriptors.remove(typed_fd);
+    let removed_entry = descriptors.remove(&typed_fd);
     assert!(removed_entry.is_some());
     assert_eq!(removed_entry.unwrap().data, "test");
 }
@@ -75,7 +75,7 @@ fn test_iter_entries() {
     assert_eq!(entries, vec!["entry1", "entry2"]); // Notice that "x" does not show up
 
     // Remove one entry and check again
-    descriptors.remove(fd1);
+    descriptors.remove(&fd1);
     let entries_after_removal: Vec<String> = descriptors
         .iter::<MockSubsystem>()
         .map(|(_, e)| e.data.clone())
