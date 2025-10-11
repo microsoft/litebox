@@ -309,7 +309,6 @@ pub(crate) fn run_on_raw_fd<R>(
             drop(rds);
             Ok(fs(&fd))
         }
-        Err(ErrRawIntFd::CurrentlyUnconsumable) => unreachable!(),
         Err(ErrRawIntFd::NotFound) => Err(Errno::EBADF),
         Err(ErrRawIntFd::InvalidSubsystem) => {
             match rds.fd_from_raw_integer(fd) {
@@ -317,7 +316,6 @@ pub(crate) fn run_on_raw_fd<R>(
                     drop(rds);
                     Ok(net(&fd))
                 }
-                Err(ErrRawIntFd::CurrentlyUnconsumable) => unreachable!(),
                 Err(ErrRawIntFd::NotFound) => unreachable!("fd shown to exist before"),
                 Err(ErrRawIntFd::InvalidSubsystem) => {
                     // We currently only have net and fs FDs at the moment, when we add more, we

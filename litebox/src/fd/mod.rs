@@ -518,50 +518,22 @@ impl RawDescriptorStorage {
         Ok(typed_fd)
     }
 
-    /// Obtain the typed FD for the raw integer value of the `fd`.
+    /// Obtain the typed FD for the raw integer value of the `fd`, "consuming" the raw integer.
     ///
-    /// This operation will "consume" the raw integer (thus future [`Self::fd_from_raw_integer`]
-    /// might not refer to this file descriptor unless it is returned back via
-    /// [`Self::fd_into_raw_integer`]).
+    /// Since this operation "consumes" the raw integer, future [`Self::fd_from_raw_integer`] might
+    /// not refer to this file descriptor.
     ///
     /// You almost definitely want [`Self::fd_from_raw_integer`] instead, and should only use this
     /// if you really know you want to consume the descriptor.
     pub fn fd_consume_raw_integer<Subsystem: FdEnabledSubsystem>(
         &mut self,
         fd: usize,
-    ) -> Result<TypedFd<Subsystem>, ErrRawIntFd> {
-        let Some(stored_fd) = self.stored_fds.get_mut(fd) else {
-            return Err(ErrRawIntFd::NotFound);
-        };
-        match stored_fd {
-            None => return Err(ErrRawIntFd::NotFound),
-            Some(stored_fd) => {
-                if !stored_fd.matches_subsystem::<Subsystem>() {
-                    return Err(ErrRawIntFd::InvalidSubsystem);
-                }
-            }
-        }
-        let Some(sfd) = stored_fd.take() else {
-            return Err(ErrRawIntFd::NotFound);
-        };
-        match Arc::try_unwrap(sfd.x) {
-            Ok(owned_fd) => Ok(TypedFd {
-                _phantom: PhantomData,
-                x: owned_fd,
-            }),
-            Err(owned_fd) => {
-                // Seems like it is unconsumable due to ongoing usage (there is some `Weak` from
-                // `fd_from_raw_integer` that has been upgraded). We should let the user know that there
-                // is ongoing usage.
-                let None = stored_fd.replace(StoredFd {
-                    x: owned_fd,
-                    subsystem_entry_type_id: sfd.subsystem_entry_type_id,
-                }) else {
-                    unreachable!()
-                };
-                Err(ErrRawIntFd::CurrentlyUnconsumable)
-            }
-        }
+    ) -> Result<Arc<TypedFd<Subsystem>>, ErrRawIntFd> {
+        let ret = self.fd_from_raw_integer(fd)?;
+        let underlying = self.stored_fds[fd].take();
+        debug_assert!(underlying.is_some());
+        drop(underlying);
+        Ok(ret)
     }
 }
 
@@ -583,8 +555,6 @@ pub enum ErrRawIntFd {
     NotFound,
     #[error("fd for invalid subsystem")]
     InvalidSubsystem,
-    #[error("could not consume due to ongoing FD usage")]
-    CurrentlyUnconsumable,
 }
 
 /// Possible errors from getting metadata

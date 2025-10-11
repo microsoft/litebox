@@ -300,26 +300,15 @@ pub fn sys_mkdir(pathname: impl path::Arg, mode: u32) -> Result<(), Errno> {
 pub(crate) fn do_close(desc: Descriptor) -> Result<(), Errno> {
     match desc {
         Descriptor::LiteBoxRawFd(raw_fd) => {
-            // XXX(jayb): This is not ideal, but we should hopefully practically not hit the
-            // `unreachable!` below in practice if all the places that use `fd_from_raw_integer`
-            // actually follow the constraints declared in its documentation. We need to run this
-            // for more than just once because it _can_ accidentally happen that the internals of
-            // `fd_from_raw_integer` itself, or in the short durations that something else is
-            // attempting to read/write to the FD at the same time that another thread is attempting
-            // to close that exact same FD. This should be incredibly rare in practice. Care
-            // obviously must be taken for blocking operations to release things between attempted
-            // reads/writes. To make this better, we probably need to update
-            // `fd_consume_raw_integer` interface on the LiteBox side itself.
-            for _fuel in 0..1000 {
-                let mut rds = raw_descriptor_store().write();
-                return match rds.fd_consume_raw_integer(raw_fd) {
-                    Ok(fd) => {
-                        drop(rds);
-                        litebox_fs().close(&fd).map_err(Errno::from)
-                    }
-                    Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
-                    Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
-                        match rds
+            let mut rds = raw_descriptor_store().write();
+            match rds.fd_consume_raw_integer(raw_fd) {
+                Ok(fd) => {
+                    drop(rds);
+                    litebox_fs().close(&fd).map_err(Errno::from)
+                }
+                Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
+                Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
+                    match rds
                             .fd_consume_raw_integer::<litebox::net::Network<litebox_platform_multiplex::Platform>>(raw_fd)
                         {
                             Ok(fd) => todo!("net"),
@@ -329,21 +318,9 @@ pub(crate) fn do_close(desc: Descriptor) -> Result<(), Errno> {
                                 // more, we need to expand this out too.
                                 unreachable!()
                             }
-                            Err(litebox::fd::ErrRawIntFd::CurrentlyUnconsumable) => {
-                                // Try again
-                                continue;
-                            },
                         }
-                    }
-                    Err(litebox::fd::ErrRawIntFd::CurrentlyUnconsumable) => {
-                        // Try again
-                        continue;
-                    }
-                };
+                }
             }
-            unreachable!(
-                "cannot close {raw_fd}. something might be holding onto the results of `fd_from_raw_integer` for too long"
-            )
         }
         Descriptor::Socket(socket) => Ok(()), // The actual close happens when the socket is dropped
         Descriptor::PipeReader { .. }
@@ -1292,7 +1269,6 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
                     }
                     Ok(Descriptor::LiteBoxRawFd(rds.fd_into_raw_integer(fd)))
                 }
-                Err(ErrRawIntFd::CurrentlyUnconsumable) => unreachable!(),
                 Err(ErrRawIntFd::NotFound) => Err(Errno::EBADF),
                 Err(ErrRawIntFd::InvalidSubsystem) => {
                     match rds.fd_from_raw_integer(*raw_fd) {
@@ -1305,7 +1281,6 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
                             let fd = dt.duplicate(&fd).ok_or(Errno::EBADF)?;
                             Ok(Descriptor::LiteBoxRawFd(rds.fd_into_raw_integer(fd)))
                         }
-                        Err(ErrRawIntFd::CurrentlyUnconsumable) => unreachable!(),
                         Err(ErrRawIntFd::NotFound) => unreachable!("fd shown to exist before"),
                         Err(ErrRawIntFd::InvalidSubsystem) => {
                             // fs+net are the only subsystems at the moment
