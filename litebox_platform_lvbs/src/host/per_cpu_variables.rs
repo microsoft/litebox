@@ -236,7 +236,7 @@ pub fn allocate_per_cpu_variables() {
         "# of possible CPUs ({num_cores}) exceeds MAX_CORES",
     );
 
-    // TODO: use `cpu_online_mask` to selectively allocate per-CPU variables
+    // TODO: use `cpu_online_mask` to selectively allocate per-CPU variables only for online CPUs.
     // Note. `PER_CPU_VARIABLE_ADDRESSES[0]` is expected to be already initialized to point to
     // `BSP_VARIABLES` before calling this function by `get_or_init_refcell_of_per_cpu_variables()`.
     #[allow(clippy::needless_range_loop)]
