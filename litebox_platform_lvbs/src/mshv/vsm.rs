@@ -27,6 +27,7 @@ use crate::{
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
+        kmod::valid_elf,
         mem_integrity::{
             validate_kernel_module_against_elf, validate_text_patch,
             verify_kernel_module_signature, verify_kernel_pe_signature,
@@ -556,6 +557,12 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         return Err(Errno::EINVAL);
     }
 
+    if let Err(e) = valid_elf(&original_elf_data, &module_in_memory, &module_memory_metadata) {
+        serial_println!("VSM: kmod: Elf was not valid: {e}");
+    } else {
+        serial_println!("VSM: kmod: Elf was valid");
+    };
+
     // pre-computed patch data for a module
     if !patch_info_for_module.is_empty() {
         let mut patch_info_buf = vec![0u8; patch_info_for_module.len()];
@@ -567,6 +574,44 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
             .precomputed_patches
             .insert_patch_data_from_bytes(&patch_info_buf, Some(&mut module_memory_metadata))
             .map_err(|_| Errno::EINVAL)?;
+    }
+
+    // symbol data for module
+    if !module_in_memory.symbols.is_empty() {
+        serial_println!("Found symbols: size:{}", module_in_memory.symbols.len());
+        let mut rodata_buf = avec![[{ core::mem::align_of::<HekiKernelSymbol>() }] | 0u8; module_in_memory.rodata.len()];
+        module_in_memory
+            .rodata
+            .read_bytes(module_in_memory.rodata.start().unwrap(), &mut rodata_buf)
+            .map_err(|_| Errno::EINVAL)?;
+
+        module_memory_metadata.symbols.build_from_container(
+            module_in_memory.symbols.range.start,
+            module_in_memory.symbols.range.end,
+            &module_in_memory.rodata,
+            &rodata_buf,
+        )?;
+    }
+
+    if !module_in_memory.gpl_symbols.is_empty() {
+        serial_println!("Found symbols: size:{}", module_in_memory.gpl_symbols.len());
+        let mut rodata_buf = avec![[{ core::mem::align_of::<HekiKernelSymbol>() }] | 0u8; module_in_memory.rodata.len()];
+        module_in_memory
+            .rodata
+            .read_bytes(module_in_memory.rodata.start().unwrap(), &mut rodata_buf)
+            .map_err(|_| Errno::EINVAL)?;
+
+        module_memory_metadata.symbols.build_from_container(
+            module_in_memory.gpl_symbols.range.start,
+            module_in_memory.gpl_symbols.range.end,
+            &module_in_memory.rodata,
+            &rodata_buf,
+        )?;
+    }
+
+    //read one symbol, one gpl symbol as sample
+    if let Some(s) = module_memory_metadata.symbols.list_one() {
+        serial_println!("Module symbol test: {}", s);
     }
 
     // once a module is verified and validated, change the permission of its memory ranges based on their types
@@ -597,6 +642,16 @@ fn prepare_data_for_module_validation(
 ) -> Result<(), Errno> {
     for heki_page in heki_pages {
         for heki_range in heki_page {
+            let va = heki_range.va;
+            let pa = heki_range.pa;
+            let epa = heki_range.epa;
+            serial_println!(
+                "mod:range:  type:{:?} va:{:#x} pa:{:#x} epa:{:#x}",
+                heki_range.mod_mem_type(),
+                va,
+                pa,
+                epa
+            );
             match heki_range.mod_mem_type() {
                 ModMemType::Unknown => {
                     serial_println!("VSM: Invalid module memory type");
@@ -614,10 +669,10 @@ fn prepare_data_for_module_validation(
                 }
                 _ => {
                     // if input memory range's type is neither `Unknown` nor `ElfBuffer`, its addresses must be page-aligned
-                    if !heki_range.is_aligned(Size4KiB::SIZE) {
-                        serial_println!("VSM: input address must be page-aligned");
-                        return Err(Errno::EINVAL);
-                    }
+                    //if !heki_range.is_aligned(Size4KiB::SIZE) {
+                    //    serial_println!("VSM: input address must be page-aligned");
+                    //    return Err(Errno::EINVAL);
+                    //}
 
                     module_in_memory
                         .write_bytes_from_heki_range(heki_range)
@@ -1174,6 +1229,18 @@ impl Vtl0KernelInfo {
             })
             .or(None)
     }
+
+    pub fn find_symbol(&self, sym_name: &str) -> Option<u64> {
+        match self.gpl_symbols.find(sym_name) {
+            None => match self.symbols.find(sym_name) {
+                None => {
+                    self.module_memory_metadata.find_symbol(sym_name)
+                }
+                Some(value) => Some(value),
+            },
+            Some(value) => Some(value),
+        }
+    }
 }
 
 /// Data structure for maintaining the memory ranges of each VTL0 kernel module and their types
@@ -1183,8 +1250,10 @@ pub struct ModuleMemoryMetadataMap {
 }
 
 pub struct ModuleMemoryMetadata {
-    ranges: Vec<ModuleMemoryRange>,
+    pub ranges: Vec<ModuleMemoryRange>, // TODO: FEMI: Make this priv again and put in heki_mod or make this struct HekiMod
     patch_targets: Vec<PhysAddr>,
+    symbols: SymbolTable,
+    gpl_symbols: SymbolTable,
 }
 
 impl ModuleMemoryMetadata {
@@ -1192,6 +1261,8 @@ impl ModuleMemoryMetadata {
         Self {
             ranges: Vec::new(),
             patch_targets: Vec::new(),
+            symbols: SymbolTable::new(),
+            gpl_symbols: SymbolTable::new(),
         }
     }
 
@@ -1213,6 +1284,17 @@ impl ModuleMemoryMetadata {
         self.ranges.push(mem_range);
     }
 
+    pub(crate) fn get_mem_type_va(&self, mem_type: ModMemType) -> Option<VirtAddr> {
+        self.ranges.iter().find_map(|range| {
+            if mem_type == range.mod_mem_type {
+                //TODO: FEMI: We take the first range as truth. Fix with new heki_walk/etc
+                Some(range.virt_addr)
+            } else {
+                None
+            }
+        })
+    }
+
     #[inline]
     pub(crate) fn insert_patch_target(&mut self, patch_target: PhysAddr) {
         self.patch_targets.push(patch_target);
@@ -1223,6 +1305,18 @@ impl ModuleMemoryMetadata {
     #[inline]
     pub(crate) fn get_patch_targets(&self) -> &Vec<PhysAddr> {
         &self.patch_targets
+    }
+
+    pub(crate) fn find_symbol(&self, sym_name: &str) -> Option<u64> {
+        match self.gpl_symbols.find(sym_name) {
+            None => match self.symbols.find(sym_name) {
+                None => {
+                    None
+                }
+                Some(value) => Some(value),
+            },
+            Some(value) => Some(value),
+        }
     }
 }
 
@@ -1327,6 +1421,17 @@ impl ModuleMemoryMetadataMap {
             None
         }
     }
+
+    pub fn find_symbol(&self, sym_name: &str) -> Option<u64> {
+        let map = self.inner.lock();
+        for (_, data) in map.iter() {
+            if let Some(value) = data.find_symbol(sym_name) {
+                serial_println!("Found symbol {} in module", sym_name);
+                return Some(value);
+            }
+        }
+        None
+    }
 }
 
 impl Default for ModuleMemoryMetadataMap {
@@ -1393,17 +1498,25 @@ fn protect_physical_memory_range(
 /// Data structure for maintaining the memory content of a kernel module by its sections. Currently, it only maintains
 /// certain sections like `.text` and `.init.text` which are needed for module validation.
 pub struct ModuleMemory {
-    text: MemoryContainer,
+    pub text: MemoryContainer,
+    data: MemoryContainer,
+    rodata: MemoryContainer,
     init_text: MemoryContainer,
     init_rodata: MemoryContainer,
+    symbols: MemoryContainer,
+    gpl_symbols: MemoryContainer,
 }
 
 impl ModuleMemory {
     pub fn new() -> Self {
         Self {
             text: MemoryContainer::new(),
+            data: MemoryContainer::new(),
+            rodata: MemoryContainer::new(),
             init_text: MemoryContainer::new(),
             init_rodata: MemoryContainer::new(),
+            symbols: MemoryContainer::new(),
+            gpl_symbols: MemoryContainer::new(),
         }
     }
 
@@ -1446,6 +1559,8 @@ impl ModuleMemory {
     ) -> Result<(), MemoryContainerError> {
         match mod_mem_type {
             ModMemType::Text => self.text.write_vtl0_phys_bytes(addr, phys_start, phys_end),
+            ModMemType::Data => self.data.write_vtl0_phys_bytes(addr, phys_start, phys_end),
+            ModMemType::RoData => self.rodata.write_vtl0_phys_bytes(addr, phys_start, phys_end),
             ModMemType::InitText => self
                 .init_text
                 .write_vtl0_phys_bytes(addr, phys_start, phys_end),
@@ -1454,10 +1569,14 @@ impl ModuleMemory {
                 .write_vtl0_phys_bytes(addr, phys_start, phys_end),
             ModMemType::ElfBuffer
             | ModMemType::Patch
-            | ModMemType::Data
-            | ModMemType::RoData
             | ModMemType::RoAfterInit
             | ModMemType::InitData => Ok(()), // we don't validate other memory types for now
+            ModMemType::Syms => self
+                .symbols
+                .write_vtl0_phys_bytes(addr, phys_start, phys_end),
+            ModMemType::GplSyms => self
+                .gpl_symbols
+                .write_vtl0_phys_bytes(addr, phys_start, phys_end),
             ModMemType::Unknown => Err(MemoryContainerError::InvalidType),
         }
     }
@@ -1915,19 +2034,23 @@ impl Symbol {
         start: VirtAddr,
         bytes: &[u8],
     ) -> Result<(String, Self), Errno> {
+        //serial_println!("from_bytes: start:{:#x} size:{}", start, kinfo_start);
         let kinfo_bytes = &bytes[kinfo_start..];
         let ksym = HekiKernelSymbol::from_bytes(kinfo_bytes)?;
+        //serial_println!("from_bytes: ksym {:#x} {:#x} ", ksym.name_offset, ksym.value_offset);
 
         let value_addr = start + mem::offset_of!(HekiKernelSymbol, value_offset) as u64;
         let value = value_addr
             .as_u64()
             .wrapping_add_signed(i64::from(ksym.value_offset));
+        //serial_println!("from_bytes: value:{:#}", value);
 
         let name_offset = kinfo_start
             + mem::offset_of!(HekiKernelSymbol, name_offset)
             + usize::try_from(ksym.name_offset).map_err(|_| Errno::EINVAL)?;
 
         if name_offset >= bytes.len() {
+            serial_println!("name_offset:{} bytes length {}", name_offset, bytes.len());
             return Err(Errno::EINVAL);
         }
         let name_len = bytes[name_offset..]
@@ -1970,6 +2093,13 @@ impl SymbolTable {
         mem: &MemoryContainer,
         buf: &[u8],
     ) -> Result<u64, Errno> {
+        serial_println!(
+            "build_from_container: start:{:#x} end:{:#x} range:{:#x}..{:#x}",
+            start,
+            end,
+            mem.range.start,
+            mem.range.end
+        );
         if start < mem.range.start || end > mem.range.end {
             serial_println!("VSM: Symbol table data not found");
             return Err(Errno::EINVAL);
@@ -1986,12 +2116,33 @@ impl SymbolTable {
         let mut inner = self.inner.write();
         inner.reserve(ksym_count);
 
+        let mut rate_limit = 0;
         for _ in 0..ksym_count {
             let (name, sym) = Symbol::from_bytes(kinfo_offset, kinfo_addr, buf).unwrap();
+            if rate_limit < 20 {
+                crate::serial_println!("    sym:{} value:{}", name, sym._value);
+                rate_limit += 1;
+            }
             inner.insert(name, sym);
             kinfo_offset += HekiKernelSymbol::KSYM_LEN;
             kinfo_addr += HekiKernelSymbol::KSYM_LEN as u64;
         }
         Ok(0)
+    }
+
+    pub fn find(&self, sym_name: &str) -> Option<u64> {
+        let inner = self.inner.write();
+        let Some(sym) = inner.get(sym_name) else {
+            return None;
+        };
+        Some(sym._value)
+    }
+
+    pub fn list_one(&self) -> Option<String> {
+        let inner = self.inner.write();
+        for (s, _v) in inner.iter() {
+            return Some(s.clone());
+        }
+        None
     }
 }
