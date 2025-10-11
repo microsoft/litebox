@@ -17,7 +17,9 @@ use litebox_common_linux::{
     IoWriteVec, IoctlArg, errno::Errno,
 };
 
-use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox, litebox_fs};
+use crate::{
+    ConstPtr, Descriptor, MutPtr, file_descriptors, litebox, litebox_fs, raw_descriptor_store,
+};
 
 /// Path in the file system
 enum FsPath<P: path::Arg> {
@@ -83,14 +85,15 @@ pub(crate) fn sys_umask(new_mask: u32) -> Mode {
 pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
     let mode = mode & !get_umask();
     let file = litebox_fs().open(path, flags - OFlags::CLOEXEC, mode)?;
-    let mut dt = litebox().descriptor_table_mut();
     if flags.contains(OFlags::CLOEXEC) {
-        let None = dt.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC) else {
+        let None = litebox()
+            .descriptor_table_mut()
+            .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
+        else {
             unreachable!()
         };
     }
-    let raw_fd = dt.fd_into_raw_integer(file);
-    drop(dt);
+    let raw_fd = raw_descriptor_store().write().fd_into_raw_integer(file);
     file_descriptors()
         .write()
         .insert(Descriptor::LiteBoxRawFd(raw_fd))
@@ -308,15 +311,15 @@ pub(crate) fn do_close(desc: Descriptor) -> Result<(), Errno> {
             // reads/writes. To make this better, we probably need to update
             // `fd_consume_raw_integer` interface on the LiteBox side itself.
             for _fuel in 0..1000 {
-                let mut dt = crate::litebox().descriptor_table_mut();
-                return match dt.fd_consume_raw_integer(raw_fd) {
+                let mut rds = raw_descriptor_store().write();
+                return match rds.fd_consume_raw_integer(raw_fd) {
                     Ok(fd) => {
-                        drop(dt);
+                        drop(rds);
                         litebox_fs().close(fd).map_err(Errno::from)
                     }
                     Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
                     Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
-                        match dt
+                        match rds
                             .fd_consume_raw_integer::<litebox::net::Network<litebox_platform_multiplex::Platform>>(raw_fd)
                         {
                             Ok(fd) => todo!("net"),
@@ -1272,7 +1275,8 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
             use alloc::sync::Arc;
             use litebox::fd::ErrRawIntFd;
             let mut dt = litebox().descriptor_table_mut();
-            match dt.fd_from_raw_integer(*raw_fd) {
+            let mut rds = raw_descriptor_store().write();
+            match rds.fd_from_raw_integer(*raw_fd) {
                 Ok(fd) => {
                     let fd: Arc<litebox::fd::TypedFd<crate::LinuxFS>> =
                         fd.upgrade().ok_or(Errno::EBADF)?;
@@ -1281,12 +1285,12 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
                         let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
                         assert!(old.is_none());
                     }
-                    Ok(Descriptor::LiteBoxRawFd(dt.fd_into_raw_integer(fd)))
+                    Ok(Descriptor::LiteBoxRawFd(rds.fd_into_raw_integer(fd)))
                 }
                 Err(ErrRawIntFd::CurrentlyUnconsumable) => unreachable!(),
                 Err(ErrRawIntFd::NotFound) => Err(Errno::EBADF),
                 Err(ErrRawIntFd::InvalidSubsystem) => {
-                    match dt.fd_from_raw_integer(*raw_fd) {
+                    match rds.fd_from_raw_integer(*raw_fd) {
                         Ok(fd) => {
                             let fd: Arc<
                                 litebox::fd::TypedFd<
@@ -1294,7 +1298,7 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
                                 >,
                             > = fd.upgrade().ok_or(Errno::EBADF)?;
                             let fd = dt.duplicate(&fd);
-                            Ok(Descriptor::LiteBoxRawFd(dt.fd_into_raw_integer(fd)))
+                            Ok(Descriptor::LiteBoxRawFd(rds.fd_into_raw_integer(fd)))
                         }
                         Err(ErrRawIntFd::CurrentlyUnconsumable) => unreachable!(),
                         Err(ErrRawIntFd::NotFound) => unreachable!("fd shown to exist before"),

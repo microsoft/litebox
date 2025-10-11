@@ -19,16 +19,9 @@ use crate::utilities::anymap::AnyMap;
 mod tests;
 
 /// Storage of file descriptors and their entries.
-///
-/// This particular object is also able to turn safely-typed file descriptors to/from unsafely-typed
-/// integers, with a reasonable amount of safety---this will not be able to check for "ABA" style
-/// issues, but will at least prevent using a descriptor for an unintended subsystem at the point of
-/// conversion.
 pub struct Descriptors<Platform: RawSyncPrimitivesProvider> {
     litebox: LiteBox<Platform>,
     entries: Vec<Option<IndividualEntry<Platform>>>,
-    /// Stored FDs are used to provide raw integer values in a safer way.
-    stored_fds: Vec<Option<Arc<OwnedFd>>>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
@@ -41,7 +34,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Self {
             litebox,
             entries: vec![],
-            stored_fds: vec![],
         }
     }
 
@@ -263,170 +255,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         )
     }
 
-    /// Get the corresponding integer value of the provided `fd`.
-    ///
-    /// This explicitly consumes the `fd`.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "panics are only within assertions"
-    )]
-    pub fn fd_into_raw_integer<Subsystem: FdEnabledSubsystem>(
-        &mut self,
-        fd: TypedFd<Subsystem>,
-    ) -> usize {
-        let ret = self
-            .stored_fds
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or(self.stored_fds.len());
-        let success = self.fd_into_specific_raw_integer(fd, ret);
-        assert!(success);
-        ret
-    }
-
-    /// Store the provided `fd` at the provided _specific_ raw integer FD.
-    ///
-    /// This is similar to [`Self::fd_into_raw_integer`] except that it specifies a specific FD to
-    /// be stored into.
-    ///
-    /// Will return with `true` iff it succeeds (i.e., nothing else was using that raw integer FD).
-    /// If you want to replace a used slot, you must first consume that slot via
-    /// [`Self::fd_consume_raw_integer`].
-    #[must_use]
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "not guaranteed as an API-level guarantee, but instead as a defensive panic to re-consider implementation if we hit it"
-    )]
-    pub fn fd_into_specific_raw_integer<Subsystem: FdEnabledSubsystem>(
-        &mut self,
-        fd: TypedFd<Subsystem>,
-        raw_fd: usize,
-    ) -> bool {
-        // TODO(jayb): Should we be storing things via a HashMap to make sure this operation cannot
-        // be too expensive if someone tries to store into a large raw FD?
-        //
-        // If this assertion failure is hit in practice, we might need to be more defensive via the
-        // HashMap, rather than just silently allow big growth
-        assert!(
-            raw_fd < self.stored_fds.len() + 100,
-            "explicit upper bound restriction for now; see implementation details"
-        );
-        if self.stored_fds.get(raw_fd).is_some_and(Option::is_some) {
-            // There's already something at this slot.
-            return false;
-        }
-        if raw_fd >= self.stored_fds.len() {
-            self.stored_fds.resize_with(raw_fd + 1, || None);
-        }
-        debug_assert!(
-            self.entries[fd.x.as_usize()]
-                .as_ref()
-                .unwrap()
-                .read()
-                .matches_subsystem::<Subsystem>()
-        );
-        let old = self.stored_fds[raw_fd].replace(Arc::new(fd.x));
-        assert!(old.is_none());
-        true
-    }
-
-    /// Borrow the typed FD for the raw integer value of the `fd`.
-    ///
-    /// Importantly, users of this function should **not** store an upgrade of the `Weak`.
-    ///
-    /// This operation is mainly aimed at usage in the scenario where there is only a "short
-    /// duration" between generation of the typed FD and its use. Raw integers have no long-term
-    /// meaning, and can switch subsystems over time. All this is captured in the usage of `Weak` as
-    /// the return. If the underlying FD got consumed away, then it becomes non-upgradable.
-    ///
-    /// Returns `Ok` iff the `fd` exists and is for the correct subsystem.
-    ///
-    /// To fully remove this FD from the system to make it available to consume, see
-    /// [`Self::fd_consume_raw_integer`].
-    pub fn fd_from_raw_integer<Subsystem: FdEnabledSubsystem>(
-        &self,
-        fd: usize,
-    ) -> Result<Weak<TypedFd<Subsystem>>, ErrRawIntFd> {
-        let Some(Some(stored_fd)) = self.stored_fds.get(fd) else {
-            return Err(ErrRawIntFd::NotFound);
-        };
-        let owned_fd: &Arc<OwnedFd> = stored_fd;
-        let Some(Some(entry)) = self.entries.get(stored_fd.as_usize()) else {
-            return Err(ErrRawIntFd::NotFound);
-        };
-        if !entry.read().matches_subsystem::<Subsystem>() {
-            return Err(ErrRawIntFd::InvalidSubsystem);
-        }
-
-        let typed_fd: Arc<TypedFd<Subsystem>> = {
-            let fd: Arc<OwnedFd> = Arc::clone(owned_fd);
-            let fd: *const OwnedFd = Arc::into_raw(fd);
-            // SAFETY: We are effectively converting an `Arc<OwnedFd>` to an
-            // `Arc<TypedFd<Subsystem>>`.
-            //
-            // This is safe because:
-            //
-            //   - `TypedFd` is a `#[repr(transparent)]` wrapper on `OwnedFd`.
-            //
-            //   - We just confirmed that it is of the correct subsystem.
-            //
-            //   - Thus, `OwnedFd` and `TypedFd` are effectively the same type, and thus are safely
-            //     castable.
-            //
-            //   - `Arc::from_raw`'s safety documentation requires the standard safe castability
-            //     constraints between the two.
-            unsafe { Arc::from_raw(fd.cast()) }
-        };
-
-        Ok(Arc::downgrade(&typed_fd))
-    }
-
-    /// Obtain the typed FD for the raw integer value of the `fd`.
-    ///
-    /// This operation will "consume" the raw integer (thus future [`Self::fd_from_raw_integer`]
-    /// might not refer to this file descriptor unless it is returned back via
-    /// [`Self::fd_into_raw_integer`]).
-    ///
-    /// You almost definitely want [`Self::fd_from_raw_integer`] instead, and should only use this
-    /// if you really know you want to consume the descriptor.
-    pub fn fd_consume_raw_integer<Subsystem: FdEnabledSubsystem>(
-        &mut self,
-        fd: usize,
-    ) -> Result<TypedFd<Subsystem>, ErrRawIntFd> {
-        let Some(stored_fd) = self.stored_fds.get_mut(fd) else {
-            return Err(ErrRawIntFd::NotFound);
-        };
-        match stored_fd {
-            None => return Err(ErrRawIntFd::NotFound),
-            Some(x) => {
-                let Some(Some(entry)) = self.entries.get(x.as_usize()) else {
-                    return Err(ErrRawIntFd::NotFound);
-                };
-                if !entry.read().matches_subsystem::<Subsystem>() {
-                    return Err(ErrRawIntFd::InvalidSubsystem);
-                }
-            }
-        }
-        let Some(owned_fd) = stored_fd.take() else {
-            return Err(ErrRawIntFd::NotFound);
-        };
-        match Arc::try_unwrap(owned_fd) {
-            Ok(owned_fd) => Ok(TypedFd {
-                _phantom: PhantomData,
-                x: owned_fd,
-            }),
-            Err(owned_fd) => {
-                // Seems like it is unconsumable due to ongoing usage (there is some `Weak` from
-                // `fd_from_raw_integer` that has been upgraded). We should let the user know that there
-                // is ongoing usage.
-                let None = stored_fd.replace(owned_fd) else {
-                    unreachable!()
-                };
-                Err(ErrRawIntFd::CurrentlyUnconsumable)
-            }
-        }
-    }
-
     /// Apply `f` on metadata at an fd, if it exists.
     ///
     /// This returns the most-specific metadata available for the file descriptor---specifically, if
@@ -538,6 +366,195 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     }
 }
 
+/// Safe(r) conversions between safely-typed file descriptors and unsafely-typed integers.
+///
+/// This particular object is also able to turn safely-typed file descriptors to/from unsafely-typed
+/// integers, with a reasonable amount of safety---this will not be able to check for "ABA" style
+/// issues, but will at least prevent using a descriptor for an unintended subsystem at the point of
+/// conversion.
+pub struct RawDescriptorStorage {
+    /// Stored FDs are used to provide raw integer values in a safer way.
+    stored_fds: Vec<Option<StoredFd>>,
+}
+
+struct StoredFd {
+    x: Arc<OwnedFd>,
+    subsystem_entry_type_id: core::any::TypeId,
+}
+impl StoredFd {
+    fn new<Subsystem: FdEnabledSubsystem>(fd: TypedFd<Subsystem>) -> Self {
+        Self {
+            x: Arc::new(fd.x),
+            subsystem_entry_type_id: core::any::TypeId::of::<Subsystem::Entry>(),
+        }
+    }
+    #[must_use]
+    fn matches_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> bool {
+        self.subsystem_entry_type_id == core::any::TypeId::of::<Subsystem::Entry>()
+    }
+}
+
+impl RawDescriptorStorage {
+    #[expect(clippy::new_without_default)]
+    /// Create a new raw descriptor store.
+    pub fn new() -> Self {
+        Self { stored_fds: vec![] }
+    }
+
+    /// Get the corresponding integer value of the provided `fd`.
+    ///
+    /// This explicitly consumes the `fd`.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panics are only within assertions"
+    )]
+    pub fn fd_into_raw_integer<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        fd: TypedFd<Subsystem>,
+    ) -> usize {
+        let ret = self
+            .stored_fds
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(self.stored_fds.len());
+        let success = self.fd_into_specific_raw_integer(fd, ret);
+        assert!(success);
+        ret
+    }
+
+    /// Store the provided `fd` at the provided _specific_ raw integer FD.
+    ///
+    /// This is similar to [`Self::fd_into_raw_integer`] except that it specifies a specific FD to
+    /// be stored into.
+    ///
+    /// Will return with `true` iff it succeeds (i.e., nothing else was using that raw integer FD).
+    /// If you want to replace a used slot, you must first consume that slot via
+    /// [`Self::fd_consume_raw_integer`].
+    #[must_use]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "not guaranteed as an API-level guarantee, but instead as a defensive panic to re-consider implementation if we hit it"
+    )]
+    pub fn fd_into_specific_raw_integer<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        fd: TypedFd<Subsystem>,
+        raw_fd: usize,
+    ) -> bool {
+        // TODO(jayb): Should we be storing things via a HashMap to make sure this operation cannot
+        // be too expensive if someone tries to store into a large raw FD?
+        //
+        // If this assertion failure is hit in practice, we might need to be more defensive via the
+        // HashMap, rather than just silently allow big growth
+        assert!(
+            raw_fd < self.stored_fds.len() + 100,
+            "explicit upper bound restriction for now; see implementation details"
+        );
+        if self.stored_fds.get(raw_fd).is_some_and(Option::is_some) {
+            // There's already something at this slot.
+            return false;
+        }
+        if raw_fd >= self.stored_fds.len() {
+            self.stored_fds.resize_with(raw_fd + 1, || None);
+        }
+        let old = self.stored_fds[raw_fd].replace(StoredFd::new(fd));
+        assert!(old.is_none());
+        true
+    }
+
+    /// Borrow the typed FD for the raw integer value of the `fd`.
+    ///
+    /// Importantly, users of this function should **not** store an upgrade of the `Weak`.
+    ///
+    /// This operation is mainly aimed at usage in the scenario where there is only a "short
+    /// duration" between generation of the typed FD and its use. Raw integers have no long-term
+    /// meaning, and can switch subsystems over time. All this is captured in the usage of `Weak` as
+    /// the return. If the underlying FD got consumed away, then it becomes non-upgradable.
+    ///
+    /// Returns `Ok` iff the `fd` exists and is for the correct subsystem.
+    ///
+    /// To fully remove this FD from the system to make it available to consume, see
+    /// [`Self::fd_consume_raw_integer`].
+    pub fn fd_from_raw_integer<Subsystem: FdEnabledSubsystem>(
+        &self,
+        fd: usize,
+    ) -> Result<Weak<TypedFd<Subsystem>>, ErrRawIntFd> {
+        let Some(Some(stored_fd)) = self.stored_fds.get(fd) else {
+            return Err(ErrRawIntFd::NotFound);
+        };
+        if !stored_fd.matches_subsystem::<Subsystem>() {
+            return Err(ErrRawIntFd::InvalidSubsystem);
+        }
+
+        let typed_fd: Arc<TypedFd<Subsystem>> = {
+            let fd: Arc<OwnedFd> = Arc::clone(&stored_fd.x);
+            let fd: *const OwnedFd = Arc::into_raw(fd);
+            // SAFETY: We are effectively converting an `Arc<OwnedFd>` to an
+            // `Arc<TypedFd<Subsystem>>`.
+            //
+            // This is safe because:
+            //
+            //   - `TypedFd` is a `#[repr(transparent)]` wrapper on `OwnedFd`.
+            //
+            //   - We just confirmed that it is of the correct subsystem.
+            //
+            //   - Thus, `OwnedFd` and `TypedFd` are effectively the same type, and thus are safely
+            //     castable.
+            //
+            //   - `Arc::from_raw`'s safety documentation requires the standard safe castability
+            //     constraints between the two.
+            unsafe { Arc::from_raw(fd.cast()) }
+        };
+
+        Ok(Arc::downgrade(&typed_fd))
+    }
+
+    /// Obtain the typed FD for the raw integer value of the `fd`.
+    ///
+    /// This operation will "consume" the raw integer (thus future [`Self::fd_from_raw_integer`]
+    /// might not refer to this file descriptor unless it is returned back via
+    /// [`Self::fd_into_raw_integer`]).
+    ///
+    /// You almost definitely want [`Self::fd_from_raw_integer`] instead, and should only use this
+    /// if you really know you want to consume the descriptor.
+    pub fn fd_consume_raw_integer<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        fd: usize,
+    ) -> Result<TypedFd<Subsystem>, ErrRawIntFd> {
+        let Some(stored_fd) = self.stored_fds.get_mut(fd) else {
+            return Err(ErrRawIntFd::NotFound);
+        };
+        match stored_fd {
+            None => return Err(ErrRawIntFd::NotFound),
+            Some(stored_fd) => {
+                if !stored_fd.matches_subsystem::<Subsystem>() {
+                    return Err(ErrRawIntFd::InvalidSubsystem);
+                }
+            }
+        }
+        let Some(sfd) = stored_fd.take() else {
+            return Err(ErrRawIntFd::NotFound);
+        };
+        match Arc::try_unwrap(sfd.x) {
+            Ok(owned_fd) => Ok(TypedFd {
+                _phantom: PhantomData,
+                x: owned_fd,
+            }),
+            Err(owned_fd) => {
+                // Seems like it is unconsumable due to ongoing usage (there is some `Weak` from
+                // `fd_from_raw_integer` that has been upgraded). We should let the user know that there
+                // is ongoing usage.
+                let None = stored_fd.replace(StoredFd {
+                    x: owned_fd,
+                    subsystem_entry_type_id: sfd.subsystem_entry_type_id,
+                }) else {
+                    unreachable!()
+                };
+                Err(ErrRawIntFd::CurrentlyUnconsumable)
+            }
+        }
+    }
+}
+
 /// LiteBox subsystems that support having file descriptors.
 pub trait FdEnabledSubsystem: Sized {
     #[doc(hidden)]
@@ -548,8 +565,8 @@ pub trait FdEnabledSubsystem: Sized {
 #[doc(hidden)]
 pub trait FdEnabledSubsystemEntry: core::any::Any {}
 
-/// Possible errors from [`Descriptors::fd_from_raw_integer`] and
-/// [`Descriptors::fd_consume_raw_integer`].
+/// Possible errors from [`RawDescriptorStorage::fd_from_raw_integer`] and
+/// [`RawDescriptorStorage::fd_consume_raw_integer`].
 #[derive(Error, Debug)]
 pub enum ErrRawIntFd {
     #[error("no such file descriptor found")]

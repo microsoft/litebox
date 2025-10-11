@@ -118,26 +118,24 @@ fn test_fd_raw_integer() {
     let litebox = litebox();
     let mut descriptors = litebox.descriptor_table_mut();
 
-    let result = descriptors.fd_from_raw_integer::<MockSubsystem>(999);
+    let mut rds = super::RawDescriptorStorage::new();
+
+    let result = rds.fd_from_raw_integer::<MockSubsystem>(999);
     assert!(matches!(result, Err(ErrRawIntFd::NotFound)));
 
     let entry = MockEntry {
         data: "test".to_string(),
     };
     let typed_fd: TypedFd<MockSubsystem> = descriptors.insert(entry);
-    let raw_fd = descriptors.fd_into_raw_integer(typed_fd);
-    let result = descriptors.fd_from_raw_integer::<MockSubsystem2>(raw_fd);
+    let raw_fd = rds.fd_into_raw_integer(typed_fd);
+    let result = rds.fd_from_raw_integer::<MockSubsystem2>(raw_fd);
     assert!(matches!(result, Err(ErrRawIntFd::InvalidSubsystem)));
 
-    let fetched_fd = descriptors
-        .fd_from_raw_integer::<MockSubsystem>(raw_fd)
-        .unwrap();
+    let fetched_fd = rds.fd_from_raw_integer::<MockSubsystem>(raw_fd).unwrap();
     let data = descriptors.with_entry(&fetched_fd.upgrade().unwrap(), |e| e.data.clone());
     assert_eq!(data, "test");
 
-    let consumed_fd = descriptors
-        .fd_consume_raw_integer::<MockSubsystem>(raw_fd)
-        .unwrap();
+    let consumed_fd = rds.fd_consume_raw_integer::<MockSubsystem>(raw_fd).unwrap();
     let data = descriptors.with_entry(&consumed_fd, |e| e.data.clone());
     assert_eq!(data, "test");
 }

@@ -154,12 +154,13 @@ fn initialize_stdio_in_shared_descriptors_table() {
         .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
         .unwrap();
     let mut dt = litebox().descriptor_table_mut();
+    let mut rds = raw_descriptor_store().write();
     for (raw_fd, fd) in [(0, stdin), (1, stdout), (2, stderr)] {
         let status_flags = OFlags::APPEND | OFlags::RDWR;
         debug_assert_eq!(OFlags::STATUS_FLAGS_MASK & status_flags, status_flags);
         let old = dt.set_entry_metadata(&fd, StdioStatusFlags(status_flags));
         assert!(old.is_none());
-        let success = dt.fd_into_specific_raw_integer(fd, raw_fd);
+        let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
         assert!(success);
     }
 }
@@ -276,6 +277,20 @@ enum Descriptor {
     },
 }
 
+// XXX: This should likely be made task-specific, since each task has its own list of FDs
+pub(crate) fn raw_descriptor_store<'a>() -> &'a RwLock<Platform, litebox::fd::RawDescriptorStorage>
+{
+    static RDS: once_cell::race::OnceBox<RwLock<Platform, litebox::fd::RawDescriptorStorage>> =
+        once_cell::race::OnceBox::new();
+    RDS.get_or_init(|| {
+        alloc::boxed::Box::new(
+            litebox()
+                .sync()
+                .new_rwlock(litebox::fd::RawDescriptorStorage::new()),
+        )
+    })
+}
+
 pub(crate) fn file_descriptors<'a>() -> &'a RwLock<Platform, Descriptors> {
     static FILE_DESCRIPTORS: once_cell::race::OnceBox<RwLock<Platform, Descriptors>> =
         once_cell::race::OnceBox::new();
@@ -288,18 +303,18 @@ pub(crate) fn run_on_raw_fd<R>(
     fs: impl FnOnce(&TypedFd<LinuxFS>) -> R,
     net: impl FnOnce(&TypedFd<litebox::net::Network<Platform>>) -> R,
 ) -> Result<R, Errno> {
-    let dt = litebox().descriptor_table();
-    match dt.fd_from_raw_integer(fd) {
+    let rds = raw_descriptor_store().read();
+    match rds.fd_from_raw_integer(fd) {
         Ok(fd) => {
-            drop(dt);
+            drop(rds);
             Ok(fs(&*fd.upgrade().ok_or(Errno::EBADF)?))
         }
         Err(ErrRawIntFd::CurrentlyUnconsumable) => unreachable!(),
         Err(ErrRawIntFd::NotFound) => Err(Errno::EBADF),
         Err(ErrRawIntFd::InvalidSubsystem) => {
-            match dt.fd_from_raw_integer(fd) {
+            match rds.fd_from_raw_integer(fd) {
                 Ok(fd) => {
-                    drop(dt);
+                    drop(rds);
                     Ok(net(&*fd.upgrade().ok_or(Errno::EBADF)?))
                 }
                 Err(ErrRawIntFd::CurrentlyUnconsumable) => unreachable!(),
