@@ -397,8 +397,7 @@ thread_start_asm:
     mov rbp, rsp
     and rsp, -16
 
-    lea rsi, [rsp] /* include the ret address */
-    mov rdx, rbp
+    mov rsi, rbp /* frame pointer */
     call thread_start_internal
 
     /* The following code should never be executed,
