@@ -237,6 +237,8 @@ pub fn allocate_per_cpu_variables() {
     );
 
     // TODO: use `cpu_online_mask` to selectively allocate per-CPU variables
+    // Note. `PER_CPU_VARIABLE_ADDRESSES[0]` is expected to be already initialized to point to
+    // `BSP_VARIABLES` before calling this function by `get_or_init_refcell_of_per_cpu_variables()`.
     #[allow(clippy::needless_range_loop)]
     for i in 1..num_cores {
         let mut per_cpu_variables = Box::<PerCpuVariables>::new_uninit();
