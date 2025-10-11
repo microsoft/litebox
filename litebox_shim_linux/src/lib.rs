@@ -307,7 +307,7 @@ pub(crate) fn run_on_raw_fd<R>(
     match rds.fd_from_raw_integer(fd) {
         Ok(fd) => {
             drop(rds);
-            Ok(fs(&*fd.upgrade().ok_or(Errno::EBADF)?))
+            Ok(fs(&fd))
         }
         Err(ErrRawIntFd::CurrentlyUnconsumable) => unreachable!(),
         Err(ErrRawIntFd::NotFound) => Err(Errno::EBADF),
@@ -315,7 +315,7 @@ pub(crate) fn run_on_raw_fd<R>(
             match rds.fd_from_raw_integer(fd) {
                 Ok(fd) => {
                     drop(rds);
-                    Ok(net(&*fd.upgrade().ok_or(Errno::EBADF)?))
+                    Ok(net(&fd))
                 }
                 Err(ErrRawIntFd::CurrentlyUnconsumable) => unreachable!(),
                 Err(ErrRawIntFd::NotFound) => unreachable!("fd shown to exist before"),

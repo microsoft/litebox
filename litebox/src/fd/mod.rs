@@ -5,7 +5,7 @@
     reason = "still under development, remove before merging PR"
 )]
 
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
@@ -461,23 +461,13 @@ impl RawDescriptorStorage {
         true
     }
 
-    /// Borrow the typed FD for the raw integer value of the `fd`.
+    /// Get the typed FD for the raw integer value of the `fd`.
     ///
-    /// Importantly, users of this function should **not** store an upgrade of the `Weak`.
-    ///
-    /// This operation is mainly aimed at usage in the scenario where there is only a "short
-    /// duration" between generation of the typed FD and its use. Raw integers have no long-term
-    /// meaning, and can switch subsystems over time. All this is captured in the usage of `Weak` as
-    /// the return. If the underlying FD got consumed away, then it becomes non-upgradable.
-    ///
-    /// Returns `Ok` iff the `fd` exists and is for the correct subsystem.
-    ///
-    /// To fully remove this FD from the system to make it available to consume, see
-    /// [`Self::fd_consume_raw_integer`].
+    /// To fully remove this FD from see [`Self::fd_consume_raw_integer`].
     pub fn fd_from_raw_integer<Subsystem: FdEnabledSubsystem>(
         &self,
         fd: usize,
-    ) -> Result<Weak<TypedFd<Subsystem>>, ErrRawIntFd> {
+    ) -> Result<Arc<TypedFd<Subsystem>>, ErrRawIntFd> {
         let Some(Some(stored_fd)) = self.stored_fds.get(fd) else {
             return Err(ErrRawIntFd::NotFound);
         };
@@ -505,7 +495,7 @@ impl RawDescriptorStorage {
             unsafe { Arc::from_raw(fd.cast()) }
         };
 
-        Ok(Arc::downgrade(&typed_fd))
+        Ok(typed_fd)
     }
 
     /// Obtain the typed FD for the raw integer value of the `fd`.

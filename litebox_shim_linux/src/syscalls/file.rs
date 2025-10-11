@@ -1278,8 +1278,7 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
             let mut rds = raw_descriptor_store().write();
             match rds.fd_from_raw_integer(*raw_fd) {
                 Ok(fd) => {
-                    let fd: Arc<litebox::fd::TypedFd<crate::LinuxFS>> =
-                        fd.upgrade().ok_or(Errno::EBADF)?;
+                    let fd: Arc<litebox::fd::TypedFd<crate::LinuxFS>> = fd;
                     let fd = dt.duplicate(&fd);
                     if flags.contains(OFlags::CLOEXEC) {
                         let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
@@ -1296,7 +1295,7 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
                                 litebox::fd::TypedFd<
                                     litebox::net::Network<litebox_platform_multiplex::Platform>,
                                 >,
-                            > = fd.upgrade().ok_or(Errno::EBADF)?;
+                            > = fd;
                             let fd = dt.duplicate(&fd);
                             Ok(Descriptor::LiteBoxRawFd(rds.fd_into_raw_integer(fd)))
                         }
