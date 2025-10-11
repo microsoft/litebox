@@ -35,6 +35,8 @@ pub enum CloseError {}
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadError {
+    #[error("fd has been closed already")]
+    ClosedFd,
     #[error("file descriptor does not point to a file")]
     NotAFile,
     #[error("file not open for reading")]
@@ -45,6 +47,8 @@ pub enum ReadError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum WriteError {
+    #[error("fd has been closed already")]
+    ClosedFd,
     #[error("file descriptor does not point to a file")]
     NotAFile,
     #[error("file not open for writing")]
@@ -55,6 +59,8 @@ pub enum WriteError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum SeekError {
+    #[error("fd has been closed already")]
+    ClosedFd,
     #[error("file descriptor does not point to a file")]
     NotAFile,
     #[error("would seek to an invalid (negative or past end) of seekable positions")]
@@ -64,6 +70,8 @@ pub enum SeekError {
 /// Possible errors from [`FileSystem::truncate`]
 #[derive(Error, Debug)]
 pub enum TruncateError {
+    #[error("fd has been closed already")]
+    ClosedFd,
     #[error("file descriptor points to a directory")]
     IsDirectory,
     #[error("file is not opened for writing")]
@@ -154,6 +162,8 @@ pub enum RmdirError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadDirError {
+    #[error("fd has been closed already")]
+    ClosedFd,
     #[error("fd does not point to a directory")]
     NotADirectory,
 }
@@ -162,6 +172,8 @@ pub enum ReadDirError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum FileStatusError {
+    #[error("fd has been closed already")]
+    ClosedFd,
     #[error(transparent)]
     PathError(#[from] PathError),
 }

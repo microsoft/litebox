@@ -601,7 +601,9 @@ where
         };
 
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(ConnectError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
 
         match socket_handle.protocol() {
@@ -653,7 +655,9 @@ where
     /// Get the local address and port a socket is bound to.
     pub fn get_local_addr(&self, fd: &SocketFd<Platform>) -> Result<SocketAddr, LocalAddrError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(LocalAddrError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
 
         match socket_handle.protocol() {
@@ -687,7 +691,9 @@ where
         };
 
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(BindError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
 
         match socket_handle.protocol() {
@@ -752,7 +758,9 @@ where
     /// bound.
     pub fn listen(&mut self, fd: &SocketFd<Platform>, backlog: u16) -> Result<(), ListenError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(ListenError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
 
         if backlog == 0 {
@@ -830,7 +838,9 @@ where
     pub fn accept(&mut self, fd: &SocketFd<Platform>) -> Result<SocketFd<Platform>, AcceptError> {
         self.automated_platform_interaction(PollDirection::Both);
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(AcceptError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
 
         match &mut socket_handle.specific {
@@ -896,7 +906,9 @@ where
         destination: Option<SocketAddr>,
     ) -> Result<usize, SendError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(SendError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
 
         if !flags.is_empty() {
@@ -975,7 +987,9 @@ where
         // possibly get packets where we might otherwise return with size 0 on the `receive`.
         self.automated_platform_interaction(PollDirection::Ingress);
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(ReceiveError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
 
         if flags.intersects(ReceiveFlags::DONTWAIT.complement()) {
@@ -1034,7 +1048,9 @@ where
         data: TcpOptionData,
     ) -> Result<(), errors::SetTcpOptionError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(errors::SetTcpOptionError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
         match socket_handle.protocol() {
             Protocol::Tcp => {
@@ -1058,7 +1074,7 @@ where
     /// Get the [`Events`] for a socket.
     pub fn check_events(&self, fd: &SocketFd<Platform>) -> Option<Events> {
         let descriptor_table = self.litebox.descriptor_table_mut();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table.get_entry_mut(fd)?;
         let socket_handle = &mut table_entry.entry;
         match socket_handle.protocol() {
             Protocol::Tcp => {

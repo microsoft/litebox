@@ -226,7 +226,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         mut offset: Option<usize>,
     ) -> Result<usize, ReadError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let Descriptor::File { idx, position } = &mut descriptor_table.get_entry_mut(fd).entry
+        let Descriptor::File { idx, position } = &mut descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(ReadError::ClosedFd)?
+            .entry
         else {
             return Err(ReadError::NotAFile);
         };
@@ -247,7 +250,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         _buf: &[u8],
         _offset: Option<usize>,
     ) -> Result<usize, WriteError> {
-        match self.litebox.descriptor_table().get_entry(fd).entry {
+        match self
+            .litebox
+            .descriptor_table()
+            .get_entry(fd)
+            .ok_or(WriteError::ClosedFd)?
+            .entry
+        {
             Descriptor::File { .. } => Err(WriteError::NotForWriting),
             Descriptor::Dir { .. } => Err(WriteError::NotAFile),
         }
@@ -260,7 +269,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let Descriptor::File { idx, position } = &mut descriptor_table.get_entry_mut(fd).entry
+        let Descriptor::File { idx, position } = &mut descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(SeekError::ClosedFd)?
+            .entry
         else {
             return Err(SeekError::NotAFile);
         };
@@ -287,7 +299,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         _length: usize,
         _reset_offset: bool,
     ) -> Result<(), TruncateError> {
-        match self.litebox.descriptor_table().get_entry(fd).entry {
+        match self
+            .litebox
+            .descriptor_table()
+            .get_entry(fd)
+            .ok_or(TruncateError::ClosedFd)?
+            .entry
+        {
             Descriptor::File { .. } => Err(TruncateError::NotForWriting),
             Descriptor::Dir { .. } => Err(TruncateError::IsDirectory),
         }
@@ -366,7 +384,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn read_dir(&self, fd: &FileFd<Platform>) -> Result<Vec<DirEntry>, ReadDirError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let Descriptor::Dir { path } = &descriptor_table.get_entry(fd).entry else {
+        let Descriptor::Dir { path } = &descriptor_table
+            .get_entry(fd)
+            .ok_or(ReadDirError::ClosedFd)?
+            .entry
+        else {
             return Err(ReadDirError::NotADirectory);
         };
         // Store into a hashmap to collapse together the entries we end up with for multiple files
@@ -486,7 +508,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         &self,
         fd: &FileFd<Platform>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        match &self.litebox.descriptor_table().get_entry(fd).entry {
+        match &self
+            .litebox
+            .descriptor_table()
+            .get_entry(fd)
+            .ok_or(super::errors::FileStatusError::ClosedFd)?
+            .entry
+        {
             Descriptor::File { idx, .. } => {
                 let entry = self.tar_data.entries().nth(*idx).unwrap();
                 Ok(super::FileStatus {

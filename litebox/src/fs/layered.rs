@@ -97,6 +97,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     fn ensure_lower_contains(&self, path: &str) -> Result<FileType, PathError> {
         match self.lower.file_status(path) {
             Ok(stat) => Ok(stat.file_type),
+            Err(FileStatusError::ClosedFd) => unreachable!(),
             Err(FileStatusError::PathError(e)) => Err(e),
         }
     }
@@ -251,7 +252,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         // In which case we quit early
                         return Err(MigrationError::NotAFile);
                     }
-                    ReadError::NotForReading => unreachable!(),
+                    ReadError::ClosedFd | ReadError::NotForReading => unreachable!(),
                 },
             }
         }
@@ -527,7 +528,8 @@ impl<
                 | OpenError::TruncateError(
                     TruncateError::IsDirectory
                     | TruncateError::NotForWriting
-                    | TruncateError::IsTerminalDevice,
+                    | TruncateError::IsTerminalDevice
+                    | TruncateError::ClosedFd,
                 )
                 | OpenError::PathError(
                     PathError::ComponentNotADirectory
@@ -731,7 +733,9 @@ impl<
                 } else {
                     Ok(Arc::clone(&descriptor.entry.entry))
                 }
-            })?;
+            })
+            .ok_or(ReadError::ClosedFd)
+            .flatten()?;
         // Perform the actual operation
         let num_bytes = match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.read(fd, buf, offset)?,
@@ -741,6 +745,7 @@ impl<
         self.litebox
             .descriptor_table()
             .get_entry(fd)
+            .ok_or(ReadError::ClosedFd)?
             .entry
             .position
             .fetch_add(num_bytes, SeqCst);
@@ -770,13 +775,16 @@ impl<
                         descriptor.entry.path.clone(),
                     ))
                 }
-            })?;
+            })
+            .ok_or(WriteError::ClosedFd)
+            .flatten()?;
         match entry.as_ref() {
             EntryX::Upper { fd: upper_fd } => {
                 let num_bytes = self.upper.write(upper_fd, buf, offset)?;
                 self.litebox
                     .descriptor_table()
                     .get_entry(fd)
+                    .unwrap()
                     .entry
                     .position
                     .fetch_add(num_bytes, SeqCst);
@@ -790,12 +798,9 @@ impl<
                     LayeringSemantics::LowerLayerWritableFiles => {
                         // Allow direct write to lower layer
                         let num_bytes = self.lower.write(lower_fd, buf, offset)?;
-                        self.litebox
-                            .descriptor_table()
-                            .get_entry(fd)
-                            .entry
-                            .position
-                            .fetch_add(num_bytes, SeqCst);
+                        if let Some(e) = self.litebox.descriptor_table().get_entry(fd) {
+                            e.entry.position.fetch_add(num_bytes, SeqCst);
+                        }
                         return Ok(num_bytes);
                     }
                 }
@@ -812,7 +817,13 @@ impl<
         }
         // As a sanity check, in debug mode, confirm that it is now an upper file
         debug_assert!(matches!(
-            *self.litebox.descriptor_table().get_entry(fd).entry.entry,
+            *self
+                .litebox
+                .descriptor_table()
+                .get_entry(fd)
+                .unwrap()
+                .entry
+                .entry,
             EntryX::Upper { .. }
         ));
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
@@ -829,19 +840,17 @@ impl<
         let entry = self
             .litebox
             .descriptor_table()
-            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry));
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))
+            .ok_or(SeekError::ClosedFd)?;
         // Perform the seek, and update the position info
         let position = match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.seek(fd, offset, whence)?,
             EntryX::Lower { fd } => self.lower.seek(fd, offset, whence)?,
             EntryX::Tombstone => unreachable!(),
         };
-        self.litebox
-            .descriptor_table()
-            .get_entry(fd)
-            .entry
-            .position
-            .store(position, SeqCst);
+        if let Some(e) = self.litebox.descriptor_table().get_entry(fd) {
+            e.entry.position.store(position, SeqCst);
+        }
         Ok(position)
     }
 
@@ -856,7 +865,8 @@ impl<
             .descriptor_table()
             .with_entry(fd, |descriptor| {
                 (descriptor.entry.flags, Arc::clone(&descriptor.entry.entry))
-            });
+            })
+            .ok_or(TruncateError::ClosedFd)?;
         let layered_fd = fd;
         match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.truncate(fd, length, reset_offset),
@@ -869,7 +879,7 @@ impl<
                         if flags.contains(OFlags::WRONLY) || flags.contains(OFlags::RDWR) {
                             // We might need to migrate the file up
                             match self.lower.truncate(fd, length, reset_offset) {
-                                Ok(()) => unreachable!(),
+                                Ok(()) | Err(TruncateError::ClosedFd) => unreachable!(),
                                 Err(TruncateError::IsDirectory) => Err(TruncateError::IsDirectory),
                                 Err(TruncateError::IsTerminalDevice) => {
                                     Err(TruncateError::IsTerminalDevice)
@@ -885,7 +895,8 @@ impl<
                                         .descriptor_table()
                                         .with_entry(layered_fd, |descriptor| {
                                             descriptor.entry.path.clone()
-                                        });
+                                        })
+                                        .ok_or(TruncateError::ClosedFd)?;
                                     self.migrate_file_up(&path, false)
                                         .expect("this migration should always succeed");
 
@@ -1097,7 +1108,7 @@ impl<
         };
         let entries = match self.read_dir(&dir_fd) {
             Ok(entries) => entries,
-            Err(ReadDirError::NotADirectory) => unreachable!(),
+            Err(ReadDirError::ClosedFd | ReadDirError::NotADirectory) => unreachable!(),
         };
         self.close(dir_fd).expect("close dir fd failed");
         // "." and ".." are always present; anything more => not empty.
@@ -1163,7 +1174,8 @@ impl<
                     Arc::clone(&descriptor.entry.entry),
                     descriptor.entry.path.clone(),
                 )
-            });
+            })
+            .ok_or(ReadDirError::ClosedFd)?;
 
         let mut entries = match entry.as_ref() {
             EntryX::Upper { fd } => {
@@ -1268,6 +1280,7 @@ impl<
                 ) => {
                     // Handle-able by a lower level, fallthrough
                 }
+                FileStatusError::ClosedFd => unreachable!(),
             },
         }
         let FileStatus {
@@ -1295,7 +1308,8 @@ impl<
         let entry = self
             .litebox
             .descriptor_table()
-            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry));
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))
+            .ok_or(FileStatusError::ClosedFd)?;
         let FileStatus {
             file_type,
             mode,

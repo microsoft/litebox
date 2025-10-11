@@ -174,7 +174,13 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        match &self.litebox.descriptor_table().get_entry(fd).entry {
+        match &self
+            .litebox
+            .descriptor_table()
+            .get_entry(fd)
+            .ok_or(ReadError::ClosedFd)?
+            .entry
+        {
             Device::Stdin => {}
             Device::Stdout | Device::Stderr => {
                 return Err(ReadError::NotForReading);
@@ -202,7 +208,13 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
-        let stream = match &self.litebox.descriptor_table().get_entry(fd).entry {
+        let stream = match &self
+            .litebox
+            .descriptor_table()
+            .get_entry(fd)
+            .ok_or(WriteError::ClosedFd)?
+            .entry
+        {
             Device::Stdin => return Err(WriteError::NotForWriting),
             Device::Stdout => StdioOutStream::Stdout,
             Device::Stderr => StdioOutStream::Stderr,
@@ -229,7 +241,13 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
         _offset: isize,
         _whence: SeekWhence,
     ) -> Result<usize, SeekError> {
-        match &self.litebox.descriptor_table().get_entry(fd).entry {
+        match &self
+            .litebox
+            .descriptor_table()
+            .get_entry(fd)
+            .ok_or(SeekError::ClosedFd)?
+            .entry
+        {
             Device::Stdin | Device::Stdout | Device::Stderr => unimplemented!(),
             Device::Null => {
                 // Linux allows lseek on /dev/null and returns position 0 (or sets to length 0).
@@ -308,7 +326,13 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
     }
 
     fn fd_file_status(&self, fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
-        match &self.litebox.descriptor_table().get_entry(fd).entry {
+        match &self
+            .litebox
+            .descriptor_table()
+            .get_entry(fd)
+            .ok_or(FileStatusError::ClosedFd)?
+            .entry
+        {
             Device::Stdin | Device::Stdout | Device::Stderr => Ok(FileStatus {
                 file_type: FileType::CharacterDevice,
                 mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,

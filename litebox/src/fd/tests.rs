@@ -132,11 +132,15 @@ fn test_fd_raw_integer() {
     assert!(matches!(result, Err(ErrRawIntFd::InvalidSubsystem)));
 
     let fetched_fd = rds.fd_from_raw_integer::<MockSubsystem>(raw_fd).unwrap();
-    let data = descriptors.with_entry(&fetched_fd, |e| e.data.clone());
+    let data = descriptors
+        .with_entry(&fetched_fd, |e| e.data.clone())
+        .unwrap();
     assert_eq!(data, "test");
     drop(fetched_fd);
 
     let consumed_fd = rds.fd_consume_raw_integer::<MockSubsystem>(raw_fd).unwrap();
-    let data = descriptors.with_entry(&consumed_fd, |e| e.data.clone());
+    let data = descriptors
+        .with_entry(&consumed_fd, |e| e.data.clone())
+        .unwrap();
     assert_eq!(data, "test");
 }

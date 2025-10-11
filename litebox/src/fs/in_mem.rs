@@ -264,7 +264,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             read_allowed,
             write_allowed: _,
             position,
-        } = &mut descriptor_table.get_entry_mut(fd).entry
+        } = &mut descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(ReadError::ClosedFd)?
+            .entry
         else {
             return Err(ReadError::NotAFile);
         };
@@ -297,7 +300,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             read_allowed: _,
             write_allowed,
             position,
-        } = &mut descriptor_table.get_entry_mut(fd).entry
+        } = &mut descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(WriteError::ClosedFd)?
+            .entry
         else {
             return Err(WriteError::NotAFile);
         };
@@ -338,7 +344,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             read_allowed: _,
             write_allowed: _,
             position,
-        } = &mut descriptor_table.get_entry_mut(fd).entry
+        } = &mut descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(SeekError::ClosedFd)?
+            .entry
         else {
             return Err(SeekError::NotAFile);
         };
@@ -371,7 +380,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             read_allowed: _,
             write_allowed,
             position,
-        } = &mut descriptor_table.get_entry_mut(fd).entry
+        } = &mut descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(TruncateError::ClosedFd)?
+            .entry
         else {
             return Err(TruncateError::IsDirectory);
         };
@@ -557,7 +569,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn read_dir(&self, fd: &FileFd<Platform>) -> Result<Vec<DirEntry>, ReadDirError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let Descriptor::Dir { dir } = &descriptor_table.get_entry(fd).entry else {
+        let Descriptor::Dir { dir } = &descriptor_table
+            .get_entry(fd)
+            .ok_or(ReadDirError::ClosedFd)?
+            .entry
+        else {
             return Err(ReadDirError::NotADirectory);
         };
 
@@ -667,27 +683,32 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     }
 
     fn fd_file_status(&self, fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
-        let (file_type, perms, size, unique_id) =
-            match &self.litebox.descriptor_table().get_entry(fd).entry {
-                Descriptor::File { file, .. } => {
-                    let file = file.read();
-                    (
-                        super::FileType::RegularFile,
-                        file.perms.clone(),
-                        file.data.len(),
-                        file.unique_id,
-                    )
-                }
-                Descriptor::Dir { dir, .. } => {
-                    let dir = dir.read();
-                    (
-                        super::FileType::Directory,
-                        dir.perms.clone(),
-                        super::DEFAULT_DIRECTORY_SIZE,
-                        dir.unique_id,
-                    )
-                }
-            };
+        let (file_type, perms, size, unique_id) = match &self
+            .litebox
+            .descriptor_table()
+            .get_entry(fd)
+            .ok_or(FileStatusError::ClosedFd)?
+            .entry
+        {
+            Descriptor::File { file, .. } => {
+                let file = file.read();
+                (
+                    super::FileType::RegularFile,
+                    file.perms.clone(),
+                    file.data.len(),
+                    file.unique_id,
+                )
+            }
+            Descriptor::Dir { dir, .. } => {
+                let dir = dir.read();
+                (
+                    super::FileType::Directory,
+                    dir.perms.clone(),
+                    super::DEFAULT_DIRECTORY_SIZE,
+                    dir.unique_id,
+                )
+            }
+        };
         Ok(FileStatus {
             file_type,
             mode: perms.mode,

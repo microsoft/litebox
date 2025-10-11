@@ -72,6 +72,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// aliased metadata at the new FD. However, any metadata that was stored via
     /// [`Self::set_fd_metadata`] is **not** duplicated; if you want that data to be copied over to
     /// the new entry, you must copy it over yourself.
+    ///
+    /// If the fd has already been closed (potentially on a different thread), this duplication will
+    /// fail and will return `None`.
     #[expect(
         clippy::missing_panics_doc,
         reason = "panic is impossible due to type invariants"
@@ -79,7 +82,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     pub fn duplicate<Subsystem: FdEnabledSubsystem>(
         &mut self,
         fd: &TypedFd<Subsystem>,
-    ) -> TypedFd<Subsystem> {
+    ) -> Option<TypedFd<Subsystem>> {
         let idx = self
             .entries
             .iter()
@@ -89,25 +92,27 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 self.entries.len() - 1
             });
         let new_ind_entry = IndividualEntry::new(Arc::clone(
-            &self.entries[fd.x.as_usize()].as_ref().unwrap().x,
+            &self.entries[fd.x.as_usize()?].as_ref().unwrap().x,
         ));
         let old = self.entries[idx].replace(new_ind_entry);
         assert!(old.is_none());
-        TypedFd {
+        Some(TypedFd {
             _phantom: PhantomData,
             x: OwnedFd::new(idx),
-        }
+        })
     }
 
     /// Removes the entry at `fd`, closing out the file descriptor.
     ///
     /// Returns the descriptor entry if it is unique (i.e., it was not duplicated, or all duplicates
     /// have been cleared out).
+    ///
+    /// If the `fd` was already closed out, then (obviously) it does not return an entry.
     pub(crate) fn remove<Subsystem: FdEnabledSubsystem>(
         &mut self,
         fd: TypedFd<Subsystem>,
     ) -> Option<Subsystem::Entry> {
-        let Some(old) = self.entries[fd.x.as_usize()].take() else {
+        let Some(old) = self.entries[fd.x.as_usize()?].take() else {
             unreachable!();
         };
         fd.x.mark_as_closed();
@@ -175,7 +180,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     }
 
     /// Use the entry at `fd` as read-only.
-    pub(crate) fn with_entry<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> R
+    ///
+    /// If the `fd` has been closed, then skips applying `f` and returns `None`.
+    pub(crate) fn with_entry<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
     where
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&Subsystem::Entry) -> R,
@@ -183,12 +190,14 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         // Since the typed FD should not have been created unless we had the correct subsystem in
         // the first place, none of this should panic---if it does, someone has done a bad cast
         // somewhere.
-        let entry = self.entries[fd.x.as_usize()].as_ref().unwrap().read();
-        f(entry.as_subsystem::<Subsystem>())
+        let entry = self.entries[fd.x.as_usize()?].as_ref().unwrap().read();
+        Some(f(entry.as_subsystem::<Subsystem>()))
     }
 
     /// Use the entry at `fd` as mutably.
-    pub(crate) fn with_entry_mut<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> R
+    ///
+    /// If the `fd` has been closed, then skips applying `f` and returns `None`.
+    pub(crate) fn with_entry_mut<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
     where
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&mut Subsystem::Entry) -> R,
@@ -196,8 +205,8 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         // Since the typed FD should not have been created unless we had the correct subsystem in
         // the first place, none of this should panic---if it does, someone has done a bad cast
         // somewhere.
-        let mut entry = self.entries[fd.x.as_usize()].as_ref().unwrap().write();
-        f(entry.as_subsystem_mut::<Subsystem>())
+        let mut entry = self.entries[fd.x.as_usize()?].as_ref().unwrap().write();
+        Some(f(entry.as_subsystem_mut::<Subsystem>()))
     }
 
     /// Use the entry at `internal_fd` as mutably.
@@ -235,11 +244,12 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     pub(crate) fn get_entry<Subsystem: FdEnabledSubsystem>(
         &self,
         fd: &TypedFd<Subsystem>,
-    ) -> impl core::ops::Deref<Target = Subsystem::Entry> + use<'_, Platform, Subsystem> {
-        crate::sync::RwLockReadGuard::map(
-            self.entries[fd.x.as_usize()].as_ref().unwrap().read(),
+    ) -> Option<impl core::ops::Deref<Target = Subsystem::Entry> + use<'_, Platform, Subsystem>>
+    {
+        Some(crate::sync::RwLockReadGuard::map(
+            self.entries[fd.x.as_usize()?].as_ref().unwrap().read(),
             |e| e.as_subsystem::<Subsystem>(),
-        )
+        ))
     }
 
     /// Get the entry at `fd`, mutably.
@@ -249,11 +259,12 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     pub(crate) fn get_entry_mut<Subsystem: FdEnabledSubsystem>(
         &self,
         fd: &TypedFd<Subsystem>,
-    ) -> impl core::ops::DerefMut<Target = Subsystem::Entry> + use<'_, Platform, Subsystem> {
-        crate::sync::RwLockWriteGuard::map(
-            self.entries[fd.x.as_usize()].as_ref().unwrap().write(),
+    ) -> Option<impl core::ops::DerefMut<Target = Subsystem::Entry> + use<'_, Platform, Subsystem>>
+    {
+        Some(crate::sync::RwLockWriteGuard::map(
+            self.entries[fd.x.as_usize()?].as_ref().unwrap().write(),
             |e| e.as_subsystem_mut::<Subsystem>(),
-        )
+        ))
     }
 
     /// Apply `f` on metadata at an fd, if it exists.
@@ -275,7 +286,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Subsystem: FdEnabledSubsystem,
         T: core::any::Any + Send + Sync,
     {
-        let ind_entry = self.entries[fd.x.as_usize()].as_ref().unwrap();
+        let ind_entry = self.entries[fd.x.as_usize().ok_or(MetadataError::ClosedFd)?]
+            .as_ref()
+            .unwrap();
         match ind_entry.metadata.get::<T>() {
             Some(m) => Ok(f(m)),
             None => ind_entry
@@ -301,7 +314,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Subsystem: FdEnabledSubsystem,
         T: core::any::Any + Send + Sync,
     {
-        let ind_entry = self.entries[fd.x.as_usize()].as_mut().unwrap();
+        let ind_entry = self.entries[fd.x.as_usize().ok_or(MetadataError::ClosedFd)?]
+            .as_mut()
+            .unwrap();
         match ind_entry.metadata.get_mut::<T>() {
             Some(m) => Ok(f(m)),
             None => ind_entry
@@ -319,6 +334,8 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// [`Self::set_fd_metadata`] which is specific to fds, and does not alias the metadata.
     ///
     /// Returns the old metadata if any such metadata exists.
+    ///
+    /// Silently drops the store if the FD has been closed out.
     #[expect(
         clippy::missing_panics_doc,
         reason = "the invariants guarantee that the unwrap panics cannot occur"
@@ -332,7 +349,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Subsystem: FdEnabledSubsystem,
         T: core::any::Any + Send + Sync,
     {
-        self.entries[fd.x.as_usize()]
+        self.entries[fd.x.as_usize()?]
             .as_ref()
             .unwrap()
             .x
@@ -346,6 +363,8 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// Such metadata is specific to the current fd and is NOT shared with other open fds to the
     /// same entry. See the similar [`Self::set_entry_metadata`] which aliases metadata over all fds
     /// opened for the same entry.
+    ///
+    /// Silently drops the store if the FD has been closed out.
     #[expect(
         clippy::missing_panics_doc,
         reason = "the invariants guarantee that the unwrap panics cannot occur"
@@ -359,7 +378,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Subsystem: FdEnabledSubsystem,
         T: core::any::Any + Send + Sync,
     {
-        self.entries[fd.x.as_usize()]
+        self.entries[fd.x.as_usize()?]
             .as_mut()
             .unwrap()
             .metadata
@@ -573,6 +592,8 @@ pub enum ErrRawIntFd {
 pub enum MetadataError {
     #[error("no such metadata available")]
     NoSuchMetadata,
+    #[error("fd has been closed")]
+    ClosedFd,
 }
 
 /// A module-internal fd-specific individual entry
@@ -695,10 +716,15 @@ impl OwnedFd {
         assert!(!was_closed);
     }
 
-    /// Obtain the raw index it was created with
-    pub(crate) fn as_usize(&self) -> usize {
-        assert!(!self.is_closed());
-        self.raw.try_into().unwrap()
+    /// Obtain the raw index it was created with if it has not been closed.
+    ///
+    /// Returns `None` if it has already been closed.
+    pub(crate) fn as_usize(&self) -> Option<usize> {
+        if self.is_closed() {
+            return None;
+        }
+        let v: usize = self.raw.try_into().unwrap();
+        Some(v)
     }
 }
 

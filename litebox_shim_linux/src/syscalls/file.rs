@@ -1037,7 +1037,13 @@ pub fn sys_ioctl(
                 litebox()
                     .descriptor_table()
                     .with_metadata(fd, |crate::StdioStatusFlags(_)| stdio_ioctl(&arg))
-                    .unwrap_or_else(|MetadataError::NoSuchMetadata| {
+                    .unwrap_or_else(|err| {
+                        match err {
+                            MetadataError::NoSuchMetadata => {},
+                            MetadataError::ClosedFd => {
+                                todo!()
+                            }
+                        }
                         match arg {
                             IoctlArg::TCGETS(..) => Err(Errno::ENOTTY),
                             IoctlArg::FIOCLEX => {
@@ -1279,7 +1285,7 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
             match rds.fd_from_raw_integer(*raw_fd) {
                 Ok(fd) => {
                     let fd: Arc<litebox::fd::TypedFd<crate::LinuxFS>> = fd;
-                    let fd = dt.duplicate(&fd);
+                    let fd = dt.duplicate(&fd).ok_or(Errno::EBADF)?;
                     if flags.contains(OFlags::CLOEXEC) {
                         let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
                         assert!(old.is_none());
@@ -1296,7 +1302,7 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
                                     litebox::net::Network<litebox_platform_multiplex::Platform>,
                                 >,
                             > = fd;
-                            let fd = dt.duplicate(&fd);
+                            let fd = dt.duplicate(&fd).ok_or(Errno::EBADF)?;
                             Ok(Descriptor::LiteBoxRawFd(rds.fd_into_raw_integer(fd)))
                         }
                         Err(ErrRawIntFd::CurrentlyUnconsumable) => unreachable!(),
