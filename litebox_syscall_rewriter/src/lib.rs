@@ -386,12 +386,21 @@ fn hook_syscalls_in_section(
             );
         }
 
-        // Add call [rip + offset_to_shared_target]
+        let return_addr = inst.address() + inst.bytes().len() as u64;
         if arch == Arch::X86_64 {
-            trampoline_data.extend_from_slice(&[0xFF, 0x15]);
+            // Put jump back location into rcx.
+            let jmp_back_offset = i64::try_from(return_addr).unwrap()
+                - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 7).unwrap();
+            trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
+            trampoline_data
+                .extend_from_slice(&(i32::try_from(jmp_back_offset).unwrap().to_le_bytes()));
+
+            // Add jmp [rip + offset_to_shared_target]
+            trampoline_data.extend_from_slice(&[0xFF, 0x25]);
             let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 4);
             trampoline_data.extend_from_slice(&disp32.to_le_bytes());
         } else {
+            // Add call [rip + offset_to_shared_target]
             // For 32-bit, use a different approach to simulate `call [rip + disp32]`
             trampoline_data.push(0x50); // PUSH EAX
             trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
@@ -401,14 +410,14 @@ fn hook_syscalls_in_section(
             trampoline_data.extend_from_slice(&disp32.to_le_bytes());
             // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
             // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
-        }
 
-        // Add jmp back to original after syscall
-        let return_addr = inst.address() + inst.bytes().len() as u64;
-        let jmp_back_offset = i64::try_from(return_addr).unwrap()
-            - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 5).unwrap();
-        trampoline_data.push(0xE9);
-        trampoline_data.extend_from_slice(&(i32::try_from(jmp_back_offset).unwrap().to_le_bytes()));
+            // Add jmp back to original after syscall
+            let jmp_back_offset = i64::try_from(return_addr).unwrap()
+                - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 5).unwrap();
+            trampoline_data.push(0xE9);
+            trampoline_data
+                .extend_from_slice(&(i32::try_from(jmp_back_offset).unwrap().to_le_bytes()));
+        }
 
         // Replace original instructions with jump to trampoline
         let replace_offset = usize::try_from(replace_start - section_base_addr).unwrap();
@@ -575,12 +584,16 @@ fn hook_syscall_and_after(
 
     let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
 
-    // Add call [rip + offset_to_shared_target]
     if arch == Arch::X86_64 {
-        trampoline_data.extend_from_slice(&[0xFF, 0x15]);
+        // Put jump back location into rcx, via lea rcx, [next instruction]
+        trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
+        trampoline_data.extend_from_slice(&6u32.to_le_bytes());
+        // Add jmp [rip + offset_to_shared_target]
+        trampoline_data.extend_from_slice(&[0xFF, 0x25]);
         let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 4);
         trampoline_data.extend_from_slice(&disp32.to_le_bytes());
     } else {
+        // Add call [rip + offset_to_shared_target]
         // For 32-bit, use a different approach to simulate `call [rip + disp32]`
         trampoline_data.push(0x50); // PUSH EAX
         trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
