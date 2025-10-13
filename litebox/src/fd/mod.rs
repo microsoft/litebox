@@ -10,6 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::sync::atomic::AtomicBool;
+use hashbrown::HashMap;
 use thiserror::Error;
 
 use crate::LiteBox;
@@ -119,6 +120,71 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Arc::into_inner(old.x)
             .map(RwLock::into_inner)
             .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
+    }
+
+    /// Drain all entries that are fully accounted for by the `fds`, removing those FDs from `fd`s,
+    /// and returning their corresponding entries.
+    ///
+    /// This is similar to [`Self::remove`] except it allows draining a whole collection of FDs,
+    /// which is helpful if there are duplicated FDs in the mix. This is particularly useful if one
+    /// is unsure if there are ongoing operations on some entries in the FD, and thus wants to delay
+    /// some sort of `close` operation.
+    ///
+    /// No ordering guarantees are provided by this function; the resulting entries can be
+    /// arbitrarily ordered.
+    ///
+    /// If an FD remains in `fds` after this function finishes running, then it is guaranteed to
+    /// have at least one other duplicate floating around and still accessing an entry somewhere
+    /// outside of `fds`; if an entry is returned, then all possible FDs to it have been removed
+    /// removed from `fds` (and no other operation was concurrently accessing an entry).
+    pub(crate) fn drain_entries_full_covered_by<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        fds: &mut Vec<TypedFd<Subsystem>>,
+    ) -> Vec<Subsystem::Entry> {
+        // Each FD corresponds to an `IndividualEntry`, which has an Arc to a `DescriptorEntry`. If
+        // we have the same number of FDs as matching to the strong-count of a descriptor entry,
+        // then it must be the case that we have everything needed to close the entries out.
+        let removable_entries: Vec<*const RwLock<_, _>> = {
+            let mut strong_count_and_count = HashMap::<*const _, (usize, usize)>::new();
+            for fd in fds.iter() {
+                let entry = &self.entries[fd.x.as_usize().unwrap()];
+                // It would not be "incorrect" to see a closed out entry, but as it currently stands, I
+                // believe that we'll only see alive entries, so this `unwrap` is confirming that; if we
+                // need to expand it out, we'd simply have a `continue` here.
+                let entry = entry.as_ref().unwrap();
+                strong_count_and_count
+                    .entry(Arc::as_ptr(&entry.x))
+                    .or_insert((Arc::strong_count(&entry.x), 0))
+                    .1 += 1;
+            }
+            strong_count_and_count
+                .into_iter()
+                .filter(|(_ptr, (sc, c))| sc == c)
+                .map(|(ptr, _)| ptr)
+                .collect()
+        };
+        // Now we can actually go and remove every single such FD.
+        let entries: Vec<Subsystem::Entry> = {
+            let mut entries = vec![];
+            fds.retain(|fd: &TypedFd<Subsystem>| {
+                let entry = &self.entries[fd.x.as_usize().unwrap()];
+                let entry = entry.as_ref().unwrap();
+                let entry_ptr = Arc::as_ptr(&entry.x);
+                if !removable_entries.contains(&entry_ptr) {
+                    return true;
+                }
+                // This FD is removable
+                let entry = self.remove(fd);
+                if let Some(entry) = entry {
+                    // This is the last of the individual entries that were holding a ref to this.
+                    entries.push(entry);
+                }
+                false
+            });
+            entries
+        };
+        debug_assert_eq!(entries.len(), removable_entries.len());
+        entries
     }
 
     /// An iterator of descriptors and entries for a subsystem
