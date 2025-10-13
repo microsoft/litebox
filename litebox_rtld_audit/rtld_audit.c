@@ -56,7 +56,9 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
   register long r8 __asm__("r8") = a5;
   register long r9 __asm__("r9") = a6;
 
-  __asm__ volatile("call *%[entry]"
+  __asm__ volatile("leaq 1f(%%rip), %%rcx\n"
+                   "jmp *%[entry]\n"
+                   "1:\n"
                    : "+r"(rax)
                    : [entry] "r"(syscall_entry), "r"(rdi), "r"(rsi), "r"(rdx),
                      "r"(r10), "r"(r8), "r"(r9)
