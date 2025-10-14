@@ -1767,7 +1767,7 @@ pub enum PrctlArg<Platform: litebox::platform::RawPointerProvider> {
 /// Request to syscall handler
 #[non_exhaustive]
 #[derive(Debug)]
-pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
+pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Exit {
         status: i32,
     },
@@ -2035,11 +2035,9 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     },
     Clone {
         args: CloneArgs,
-        ctx: &'a PtRegs,
     },
     Clone3 {
         args: Platform::RawConstPointer<CloneArgs>,
-        ctx: &'a PtRegs,
     },
     /// Manipulate thread-local storage information.
     /// Returns `ENOSYS` on 64-bit.
@@ -2153,12 +2151,12 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
 }
 
 pub enum ContinueOperation {
-    ResumeGuest { return_value: usize },
+    ResumeGuest,
     ExitThread(i32),
     ExitProcess(i32),
 }
 
-impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Platform> {
+impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
     /// Take the raw syscall number and arguments, and provide a stronger-typed `SyscallRequest`.
     ///
     /// Returns `Ok` if a valid translation exists, if no such translation exists, returns the [`Errno`](errno::Errno) for it.
@@ -2168,7 +2166,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
     /// Ideally, this function would not panic. However, since it is currently under development, it
     /// is allowed to panic upon receiving a syscall number (or arguments) that it does not know how
     /// to handle.
-    pub fn try_from_raw(syscall_number: usize, ctx: &'a PtRegs) -> Result<Self, errno::Errno> {
+    pub fn try_from_raw(syscall_number: usize, ctx: &PtRegs) -> Result<Self, errno::Errno> {
         // sys_req! is a convenience macro that automatically takes the correct numbered arguments
         // (in the order of field specification); due to some Rust restrictions, we need to manually
         // specify pointers by adding the `:*` to that field, but otherwise everything else about
@@ -2613,7 +2611,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     set_tid_size: 0,
                     cgroup: 0,
                 };
-                SyscallRequest::Clone { args, ctx }
+                SyscallRequest::Clone { args }
             }
             Sysno::clone3 => {
                 debug_assert_eq!(
@@ -2623,7 +2621,6 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                 );
                 SyscallRequest::Clone3 {
                     args: ctx.sys_req_ptr(0),
-                    ctx,
                 }
             }
             Sysno::set_robust_list => {

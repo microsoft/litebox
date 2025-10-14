@@ -25,17 +25,17 @@ extern crate alloc;
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "linux_syscall")] {
-        use litebox_common_linux::{ContinueOperation, SyscallRequest};
+        use litebox_common_linux::ContinueOperation;
         pub type SyscallReturnType = litebox_common_linux::ContinueOperation;
     } else if #[cfg(feature = "optee_syscall")] {
-        use litebox_common_optee::{ContinueOperation, SyscallRequest};
+        use litebox_common_optee::ContinueOperation;
         pub type SyscallReturnType = litebox_common_optee::ContinueOperation;
     } else {
         compile_error!(r##"No syscall handler specified."##);
     }
 }
 /// Connector to a shim-exposed syscall-handling interface.
-pub type SyscallHandler = fn(SyscallRequest<LinuxUserland>) -> SyscallReturnType;
+pub type SyscallHandler = fn(&mut litebox_common_linux::PtRegs) -> SyscallReturnType;
 
 /// The syscall handler passed down from the shim.
 static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
@@ -1652,64 +1652,31 @@ unsafe extern "C" {
 #[allow(clippy::cast_sign_loss)]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_handler(
-    syscall_number: usize,
-    ctx: *mut litebox_common_linux::PtRegs,
+    _syscall_number: usize,
+    ctx: &mut litebox_common_linux::PtRegs,
 ) -> bool {
-    // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
-    let ctx = unsafe { &mut *ctx };
-    match SyscallRequest::try_from_raw(syscall_number, ctx) {
-        Ok(d) => {
-            let syscall_handler: SyscallHandler = SYSCALL_HANDLER
-                .read()
-                .unwrap()
-                .expect("Should have run `register_syscall_handler` by now");
-            match syscall_handler(d) {
-                ContinueOperation::ResumeGuest { return_value } => {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        cfg_if::cfg_if! {
-                            if #[cfg(feature = "linux_syscall")] {
-                                ctx.rax = return_value;
-                            } else if #[cfg(feature = "optee_syscall")] {
-                                ctx.rax = return_value as usize;
-                            }
-                        }
-                    }
-                    #[cfg(target_arch = "x86")]
-                    {
-                        ctx.eax = return_value;
-                    }
-                    true
-                }
-                ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        cfg_if::cfg_if! {
-                            if #[cfg(feature = "linux_syscall")] {
-                                ctx.rax = status.reinterpret_as_unsigned() as usize;
-                            } else if #[cfg(feature = "optee_syscall")] {
-                                ctx.rax = status;
-                            }
-                        }
-                    }
-                    #[cfg(target_arch = "x86")]
-                    {
-                        ctx.eax = status.reinterpret_as_unsigned() as usize;
-                    }
-                    false
-                }
-            }
-        }
-        Err(err) => {
+    let syscall_handler: SyscallHandler = SYSCALL_HANDLER
+        .read()
+        .unwrap()
+        .expect("Should have run `register_syscall_handler` by now");
+    match syscall_handler(ctx) {
+        ContinueOperation::ResumeGuest => true,
+        ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
             #[cfg(target_arch = "x86_64")]
             {
-                ctx.rax = err.as_neg() as usize;
+                cfg_if::cfg_if! {
+                    if #[cfg(feature = "linux_syscall")] {
+                        ctx.rax = status.reinterpret_as_unsigned() as usize;
+                    } else if #[cfg(feature = "optee_syscall")] {
+                        ctx.rax = status;
+                    }
+                }
             }
             #[cfg(target_arch = "x86")]
             {
-                ctx.eax = err.as_neg() as usize;
+                ctx.eax = status.reinterpret_as_unsigned() as usize;
             }
-            true
+            false
         }
     }
 }

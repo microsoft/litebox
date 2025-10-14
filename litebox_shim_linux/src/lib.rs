@@ -384,35 +384,47 @@ fn pread_with_user_buf(
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> ContinueOperation {
-    if let SyscallRequest::Exit { status } = request {
-        syscalls::process::sys_exit(status);
-        return ContinueOperation::ExitThread(status);
-    } else if let SyscallRequest::ExitGroup { status } = request {
-        syscalls::process::sys_exit_group(status);
-        return ContinueOperation::ExitProcess(status);
-    } else if let SyscallRequest::Execve {
-        pathname,
-        argv,
-        envp,
-    } = request
-    {
-        match syscalls::process::sys_execve(pathname, argv, envp) {
-            Ok(()) => return ContinueOperation::ExitProcess(0),
-            Err(err) => {
-                let e: i32 = err.as_neg();
-                let Ok(e) = isize::try_from(e) else {
-                    // On both 32-bit and 64-bit, this should never be triggered
-                    unreachable!()
-                };
-                return ContinueOperation::ResumeGuest {
-                    return_value: e.reinterpret_as_unsigned(),
-                };
-            }
+pub fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
+    fn set_return(ctx: &mut litebox_common_linux::PtRegs, value: usize) {
+        #[cfg(target_arch = "x86")]
+        {
+            ctx.eax = value;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            ctx.rax = value;
         }
     }
 
+    #[cfg(target_arch = "x86")]
+    let syscall_number = ctx.orig_eax;
+    #[cfg(target_arch = "x86_64")]
+    let syscall_number = ctx.orig_rax;
+    let request = match SyscallRequest::<Platform>::try_from_raw(syscall_number, ctx) {
+        Ok(request) => request,
+        Err(err) => {
+            set_return(ctx, (err.as_neg() as isize).reinterpret_as_unsigned());
+            return ContinueOperation::ResumeGuest;
+        }
+    };
+
     let res: Result<usize, Errno> = match request {
+        SyscallRequest::Exit { status } => {
+            syscalls::process::sys_exit(status);
+            return ContinueOperation::ExitThread(status);
+        }
+        SyscallRequest::ExitGroup { status } => {
+            syscalls::process::sys_exit_group(status);
+            return ContinueOperation::ExitProcess(status);
+        }
+        SyscallRequest::Execve {
+            pathname,
+            argv,
+            envp,
+        } => match syscalls::process::sys_execve(pathname, argv, envp) {
+            Ok(()) => return ContinueOperation::ExitProcess(0),
+            Err(err) => Err(err),
+        },
         SyscallRequest::Ret(errno) => Err(errno),
         SyscallRequest::Read { fd, buf, count } => {
             // Note some applications (e.g., `node`) seem to assume that getting fewer bytes than
@@ -774,8 +786,8 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> ContinueOper
                 Ok(0)
             })
         }
-        SyscallRequest::Clone { args, ctx } => handle_clone_request(&args, ctx),
-        SyscallRequest::Clone3 { args, ctx } => {
+        SyscallRequest::Clone { args } => handle_clone_request(&args, ctx),
+        SyscallRequest::Clone3 { args } => {
             if let Some(clone_args) = unsafe { args.read_at_offset(0) } {
                 handle_clone_request(&clone_args, ctx)
             } else {
@@ -878,15 +890,11 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> ContinueOper
         }
     };
 
-    let return_value = res.unwrap_or_else(|e| {
-        let e: i32 = e.as_neg();
-        let Ok(e) = isize::try_from(e) else {
-            // On both 32-bit and 64-bit, this should never be triggered
-            unreachable!()
-        };
-        e.reinterpret_as_unsigned()
-    });
-    ContinueOperation::ResumeGuest { return_value }
+    set_return(
+        ctx,
+        res.unwrap_or_else(|e| (e.as_neg() as isize).reinterpret_as_unsigned()),
+    );
+    ContinueOperation::ResumeGuest
 }
 
 fn handle_clone_request(

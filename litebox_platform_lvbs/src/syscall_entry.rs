@@ -40,17 +40,17 @@ use x86_64::{
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "linux_syscall")] {
-        use litebox_common_linux::{ContinueOperation, SyscallRequest};
+        use litebox_common_linux::ContinueOperation;
         pub type SyscallReturnType = ContinueOperation;
     } else if #[cfg(feature = "optee_syscall")] {
-        use litebox_common_optee::{ContinueOperation, SyscallRequest};
+        use litebox_common_optee::ContinueOperation;
         pub type SyscallReturnType = ContinueOperation;
     } else {
         compile_error!(r##"No syscall handler specified."##);
     }
 }
 
-pub type SyscallHandler = fn(SyscallRequest<crate::host::LvbsLinuxKernel>) -> SyscallReturnType;
+pub type SyscallHandler = fn(&mut litebox_common_linux::PtRegs) -> SyscallReturnType;
 static SYSCALL_HANDLER: spin::Once<SyscallHandler> = spin::Once::new();
 
 #[cfg(target_arch = "x86_64")]
@@ -114,7 +114,7 @@ impl SyscallContextRaw {
     }
 
     #[expect(clippy::cast_possible_truncation)]
-    pub fn to_pt_regs(&self) -> PtRegs {
+    pub fn to_pt_regs(&self, rax: u64) -> PtRegs {
         PtRegs {
             r15: 0,
             r14: 0,
@@ -131,7 +131,7 @@ impl SyscallContextRaw {
             rdx: self.rdx as usize,
             rsi: self.rsi as usize,
             rdi: self.rdi as usize,
-            orig_rax: 0,
+            orig_rax: rax as usize,
             rip: 0,
             cs: 0,
             eflags: 0,
@@ -165,24 +165,11 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> usize {
         )
         .expect("Failed to save user context");
 
-    let ctx = ctx_raw.to_pt_regs();
+    let mut ctx = ctx_raw.to_pt_regs(sysnr);
 
     // call the syscall handler passed down from the shim
-    let sysret = match syscall_handler(
-        SyscallRequest::try_from_raw(usize::try_from(sysnr).unwrap(), &ctx)
-            .expect("Failed to convert syscall request"),
-    ) {
-        ContinueOperation::ResumeGuest { return_value } => {
-            cfg_if::cfg_if! {
-                if #[cfg(feature = "linux_syscall")] {
-                    return_value
-                } else if #[cfg(feature = "optee_syscall")] {
-                    return_value as usize
-                } else {
-                    compile_error!(r##"No syscall handler specified."##);
-                }
-            }
-        }
+    let sysret = match syscall_handler(&mut ctx) {
+        ContinueOperation::ResumeGuest => ctx.rax,
         ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
             cfg_if::cfg_if! {
                 if #[cfg(feature = "linux_syscall")] {
