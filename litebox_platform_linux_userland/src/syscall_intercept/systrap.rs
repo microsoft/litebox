@@ -30,12 +30,9 @@ extern "C" fn sigsys_handler(sig: c_int, info: *mut libc::siginfo_t, context: *m
             std::process::abort();
         }
 
-        // Get the stack pointer (RSP) from the context
+        // Store the return address in RCX, as expected by `syscall_callback`.
         let ucontext = &mut *(context.cast::<libc::ucontext_t>());
-        let stack_pointer = &mut ucontext.uc_mcontext.gregs[libc::REG_RSP as usize];
-        // push the return address onto the stack
-        *stack_pointer -= 8;
-        *(*stack_pointer as *mut usize) = addr as usize;
+        ucontext.uc_mcontext.gregs[libc::REG_RCX as usize] = addr as i64;
 
         // TODO: hotpatch the syscall instruction to jump to the `sigsys_callback`
         // to avoid traps again.

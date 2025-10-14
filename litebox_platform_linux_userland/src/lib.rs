@@ -1328,15 +1328,15 @@ core::arch::global_asm!(
     .globl  syscall_callback
     .type   syscall_callback,@function
 syscall_callback:
+    /* Push the return address onto the stack */
+    push    rcx
     /* TODO: save float and vector registers (xsave or fxsave) */
     /* Save caller-saved registers */
     push    0x2b       /* pt_regs->ss = __USER_DS */
     push    rsp        /* pt_regs->sp */
     pushfq             /* pt_regs->eflags */
     push    0x33       /* pt_regs->cs = __USER_CS */
-    push    rcx
-    mov     rcx, [rsp + 0x28] /* get the return address from the stack */
-    xchg    rcx, [rsp] /* pt_regs->ip */
+    push    rcx        /* pt_regs->ip */
     push    rax        /* pt_regs->orig_ax */
 
     push    rdi         /* pt_regs->di */
