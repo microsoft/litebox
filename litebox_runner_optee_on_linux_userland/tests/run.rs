@@ -62,7 +62,7 @@ fn test_runner_random_ta() {
 
 #[cfg(target_arch = "x86_64")]
 #[test]
-#[ignore] // aes-ta.elf.hooked needs to be regenerated but the original file is missing
+#[ignore = "aes-ta.elf.hooked needs to be regenerated but the original file is missing"]
 fn test_runner_aes_ta() {
     let output = std::process::Command::new("cargo")
         .args(["build", "-p", "litebox_runner_optee_on_linux_userland"])
