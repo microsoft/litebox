@@ -116,21 +116,20 @@ pub(crate) fn get_socket_fd(raw_fd: usize) -> Result<Arc<SocketFd>, Errno> {
 
 struct SocketOFlags(OFlags);
 
-fn initialize_socket(raw_fd: usize, sock_type: SockType, flags: SockFlags) {
+fn initialize_socket(fd: &SocketFd, sock_type: SockType, flags: SockFlags) {
     let mut status = OFlags::RDWR;
     status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
 
-    let fd = get_socket_fd(raw_fd).unwrap();
     let mut dt = litebox().descriptor_table_mut();
-    let old = dt.set_entry_metadata(&fd, SocketOptions::default());
+    let old = dt.set_entry_metadata(fd, SocketOptions::default());
     assert!(old.is_none());
     if flags.contains(SockFlags::CLOEXEC) {
-        let old = dt.set_fd_metadata(&fd, litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC);
+        let old = dt.set_fd_metadata(fd, litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC);
         assert!(old.is_none());
     }
-    let old = dt.set_fd_metadata(&fd, sock_type);
+    let old = dt.set_fd_metadata(fd, sock_type);
     assert!(old.is_none());
-    let old = dt.set_entry_metadata(&fd, SocketOFlags(status));
+    let old = dt.set_entry_metadata(fd, SocketOFlags(status));
     assert!(old.is_none());
 }
 
@@ -148,7 +147,7 @@ fn with_socket_options_mut<R>(fd: &SocketFd, f: impl FnOnce(&mut SocketOptions) 
 }
 
 fn setsockopt(
-    raw_fd: usize,
+    fd: &SocketFd,
     optname: SocketOptionName,
     optval: ConstPtr<u8>,
     optlen: usize,
@@ -174,14 +173,14 @@ fn setsockopt(
             match so {
                 SocketOption::RCVTIMEO => {
                     let duration = read_timeval_as_duration(optval)?;
-                    with_socket_options_mut(&*get_socket_fd(raw_fd)?, |opt| {
+                    with_socket_options_mut(fd, |opt| {
                         opt.recv_timeout = duration;
                     });
                     return Ok(());
                 }
                 SocketOption::SNDTIMEO => {
                     let duration = read_timeval_as_duration(optval)?;
-                    with_socket_options_mut(&*get_socket_fd(raw_fd)?, |opt| {
+                    with_socket_options_mut(fd, |opt| {
                         opt.send_timeout = duration;
                     });
                     return Ok(());
@@ -211,7 +210,7 @@ fn setsockopt(
                 .into_owned();
             match so {
                 SocketOption::REUSEADDR => {
-                    with_socket_options_mut(&*get_socket_fd(raw_fd)?, |opt| {
+                    with_socket_options_mut(fd, |opt| {
                         opt.reuse_address = val != 0;
                     });
                 }
@@ -222,9 +221,8 @@ fn setsockopt(
                 }
                 SocketOption::KEEPALIVE => {
                     let keep_alive = val != 0;
-                    let fd = get_socket_fd(raw_fd)?;
                     if let Err(err) = litebox_net().lock().set_tcp_option(
-                        &fd,
+                        fd,
                         // default time interval is 2 hours
                         litebox::net::TcpOptionData::KEEPALIVE(Some(
                             core::time::Duration::from_secs(2 * 60 * 60),
@@ -240,7 +238,7 @@ fn setsockopt(
                             _ => unimplemented!(),
                         }
                     }
-                    with_socket_options_mut(&*get_socket_fd(raw_fd)?, |opt| {
+                    with_socket_options_mut(fd, |opt| {
                         opt.keep_alive = keep_alive;
                     });
                 }
@@ -270,10 +268,9 @@ fn setsockopt(
                         // CORK is the opposite of NODELAY
                         val == 0
                     };
-                    let fd = get_socket_fd(raw_fd)?;
                     if let Err(err) = litebox_net()
                         .lock()
-                        .set_tcp_option(&fd, litebox::net::TcpOptionData::NODELAY(on))
+                        .set_tcp_option(fd, litebox::net::TcpOptionData::NODELAY(on))
                     {
                         match err {
                             litebox::net::errors::SetTcpOptionError::InvalidFd => {
@@ -393,18 +390,17 @@ fn getsockopt(
     Ok(())
 }
 
-fn try_accept(raw_fd: usize) -> Result<SocketFd, Errno> {
-    let fd = get_socket_fd(raw_fd)?;
-    litebox_net().lock().accept(&fd).map_err(Errno::from)
+fn try_accept(fd: &SocketFd) -> Result<SocketFd, Errno> {
+    litebox_net().lock().accept(fd).map_err(Errno::from)
 }
 
-fn accept(raw_fd: usize) -> Result<SocketFd, Errno> {
-    if get_status(&*get_socket_fd(raw_fd)?).contains(OFlags::NONBLOCK) {
-        try_accept(raw_fd)
+fn accept(fd: &SocketFd) -> Result<SocketFd, Errno> {
+    if get_status(fd).contains(OFlags::NONBLOCK) {
+        try_accept(fd)
     } else {
         // TODO: use `poll` instead of busy wait
         loop {
-            match try_accept(raw_fd) {
+            match try_accept(fd) {
                 Err(Errno::EAGAIN) => {}
                 ret => return ret,
             }
@@ -413,43 +409,39 @@ fn accept(raw_fd: usize) -> Result<SocketFd, Errno> {
     }
 }
 
-fn bind(raw_fd: usize, sockaddr: SocketAddr) -> Result<(), Errno> {
-    let fd = get_socket_fd(raw_fd)?;
+fn bind(fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
     litebox_net()
         .lock()
-        .bind(&fd, &sockaddr)
+        .bind(fd, &sockaddr)
         .map_err(Errno::from)
 }
 
-fn connect(raw_fd: usize, sockaddr: SocketAddr) -> Result<(), Errno> {
-    let fd = get_socket_fd(raw_fd)?;
+fn connect(fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
     litebox_net()
         .lock()
-        .connect(&fd, &sockaddr)
+        .connect(fd, &sockaddr)
         .map_err(Errno::from)
 }
 
-fn listen(raw_fd: usize, backlog: u16) -> Result<(), Errno> {
-    let fd = get_socket_fd(raw_fd)?;
+fn listen(fd: &SocketFd, backlog: u16) -> Result<(), Errno> {
     litebox_net()
         .lock()
-        .listen(&fd, backlog)
+        .listen(fd, backlog)
         .map_err(Errno::from)
 }
 
 fn try_sendto(
-    raw_fd: usize,
+    fd: &SocketFd,
     buf: &[u8],
     flags: litebox::net::SendFlags,
     sockaddr: Option<SocketAddr>,
 ) -> Result<usize, Errno> {
-    let fd = get_socket_fd(raw_fd)?;
-    let n = litebox_net().lock().send(&fd, buf, flags, sockaddr)?;
+    let n = litebox_net().lock().send(fd, buf, flags, sockaddr)?;
     if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
 }
 
 pub(crate) fn sendto(
-    raw_fd: usize,
+    fd: &SocketFd,
     buf: &[u8],
     flags: SendFlags,
     sockaddr: Option<SocketAddr>,
@@ -469,19 +461,17 @@ pub(crate) fn sendto(
         OOB,
     );
 
-    if get_status(&*get_socket_fd(raw_fd)?).contains(OFlags::NONBLOCK)
-        || flags.contains(SendFlags::DONTWAIT)
-    {
-        try_sendto(raw_fd, buf, new_flags, sockaddr)
+    if get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT) {
+        try_sendto(fd, buf, new_flags, sockaddr)
     } else {
-        let timeout = with_socket_options(&*get_socket_fd(raw_fd)?, |opt| opt.send_timeout);
+        let timeout = with_socket_options(fd, |opt| opt.send_timeout);
         if timeout.is_some() {
             todo!("send timeout");
         }
 
         // TODO: use `poll` instead of busy wait
         loop {
-            match try_sendto(raw_fd, buf, new_flags, sockaddr) {
+            match try_sendto(fd, buf, new_flags, sockaddr) {
                 Err(Errno::EAGAIN) => {}
                 ret => return ret,
             }
@@ -595,10 +585,10 @@ pub(crate) fn sys_socket(
                 _ => unimplemented!(),
             };
             let socket = litebox_net().lock().socket(protocol)?;
+            initialize_socket(&socket, ty, flags);
             let mut rds = crate::raw_descriptor_store().write();
             let raw_fd = rds.fd_into_raw_integer(socket);
             drop(rds);
-            initialize_socket(raw_fd, ty, flags);
             Descriptor::Socket(raw_fd)
         }
         AddressFamily::UNIX => todo!(),
@@ -695,12 +685,12 @@ pub(crate) fn sys_accept(
             let socket = *socket;
             // drop file table as `accept` may block
             drop(file_table);
-            let fd = accept(socket)?;
+            let fd = accept(&*get_socket_fd(socket)?)?;
+            let sock_type = get_socket_type(&*get_socket_fd(socket)?)?;
+            initialize_socket(&fd, sock_type, flags);
             let mut rds = crate::raw_descriptor_store().write();
             let raw_fd = rds.fd_into_raw_integer(fd);
             drop(rds);
-            let sock_type = get_socket_type(&*get_socket_fd(socket)?)?;
-            initialize_socket(raw_fd, sock_type, flags);
             Descriptor::Socket(raw_fd)
         }
         _ => return Err(Errno::ENOTSOCK),
@@ -720,7 +710,7 @@ pub(crate) fn sys_connect(fd: i32, sockaddr: SocketAddress) -> Result<(), Errno>
     match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
         Descriptor::Socket(socket) => {
             let SocketAddress::Inet(addr) = sockaddr;
-            connect(*socket, addr)
+            connect(&*get_socket_fd(*socket)?, addr)
         }
         _ => Err(Errno::ENOTSOCK),
     }
@@ -739,7 +729,7 @@ pub(crate) fn sys_bind(sockfd: i32, sockaddr: SocketAddress) -> Result<(), Errno
     {
         Descriptor::Socket(socket) => {
             let SocketAddress::Inet(addr) = sockaddr;
-            bind(*socket, addr)
+            bind(&*get_socket_fd(*socket)?, addr)
         }
         _ => Err(Errno::ENOTSOCK),
     }
@@ -756,7 +746,7 @@ pub(crate) fn sys_listen(sockfd: i32, backlog: u16) -> Result<(), Errno> {
         .get_fd(sockfd)
         .ok_or(Errno::EBADF)?
     {
-        Descriptor::Socket(socket) => listen(*socket, backlog),
+        Descriptor::Socket(socket) => listen(&*get_socket_fd(*socket)?, backlog),
         _ => Err(Errno::ENOTSOCK),
     }
 }
@@ -782,7 +772,7 @@ pub(crate) fn sys_sendto(
             // drop file table as `sendto` may block
             drop(file_table);
             sendto(
-                socket,
+                &*get_socket_fd(socket)?,
                 &buf,
                 flags,
                 sockaddr.map(|SocketAddress::Inet(addr)| addr),
@@ -849,7 +839,9 @@ pub(crate) fn sys_setsockopt(
         .get_fd(sockfd)
         .ok_or(Errno::EBADF)?
     {
-        Descriptor::Socket(socket) => setsockopt(*socket, optname, optval, optlen),
+        Descriptor::Socket(socket) => {
+            setsockopt(&*get_socket_fd(*socket)?, optname, optval, optlen)
+        }
         _ => Err(Errno::ENOTSOCK),
     }
 }

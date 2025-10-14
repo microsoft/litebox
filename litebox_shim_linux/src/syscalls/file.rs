@@ -256,7 +256,12 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
         Descriptor::Socket(socket) => {
             let raw_fd = *socket;
             drop(file_table);
-            super::net::sendto(raw_fd, buf, litebox_common_linux::SendFlags::empty(), None)
+            super::net::sendto(
+                &*super::net::get_socket_fd(raw_fd)?,
+                buf,
+                litebox_common_linux::SendFlags::empty(),
+                None,
+            )
         }
         Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
         Descriptor::PipeWriter { producer, .. } => {
@@ -488,7 +493,12 @@ pub fn sys_writev(
             let raw_fd = *socket;
             drop(locked_file_descriptors);
             write_to_iovec(iovs, |buf: &[u8]| {
-                super::net::sendto(raw_fd, buf, litebox_common_linux::SendFlags::empty(), None)
+                super::net::sendto(
+                    &*super::net::get_socket_fd(raw_fd)?,
+                    buf,
+                    litebox_common_linux::SendFlags::empty(),
+                    None,
+                )
             })
         }
         Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
