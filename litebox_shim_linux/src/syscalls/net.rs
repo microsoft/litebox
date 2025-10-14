@@ -7,7 +7,7 @@ use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use alloc::sync::Arc;
 use litebox::{
     fs::OFlags,
-    net::{SocketFd, TcpOptionData},
+    net::TcpOptionData,
     platform::{RawConstPointer as _, RawMutPointer as _},
     utils::TruncateExt as _,
 };
@@ -34,6 +34,8 @@ macro_rules! convert_flags {
         }
     };
 }
+
+type SocketFd = litebox::net::SocketFd<Platform>;
 
 #[repr(C)]
 struct CSockStorage {
@@ -99,7 +101,7 @@ struct SocketOptions {
     linger_timeout: Option<core::time::Duration>,
 }
 
-fn get_socket_fd(raw_fd: usize) -> Result<Arc<SocketFd<Platform>>, Errno> {
+fn get_socket_fd(raw_fd: usize) -> Result<Arc<SocketFd>, Errno> {
     match crate::raw_descriptor_store()
         .read()
         .fd_from_raw_integer(raw_fd)
@@ -400,12 +402,12 @@ fn getsockopt(
     Ok(())
 }
 
-fn try_accept(raw_fd: usize) -> Result<SocketFd<Platform>, Errno> {
+fn try_accept(raw_fd: usize) -> Result<SocketFd, Errno> {
     let fd = get_socket_fd(raw_fd)?;
     litebox_net().lock().accept(&fd).map_err(Errno::from)
 }
 
-fn accept(raw_fd: usize) -> Result<SocketFd<Platform>, Errno> {
+fn accept(raw_fd: usize) -> Result<SocketFd, Errno> {
     if get_status(raw_fd).contains(OFlags::NONBLOCK) {
         try_accept(raw_fd)
     } else {
