@@ -1087,8 +1087,6 @@ pub(crate) fn sys_tgkill(
 
 #[cfg(test)]
 mod tests {
-    use litebox::mm::linux::PAGE_SIZE;
-
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_arch_prctl() {
