@@ -1805,6 +1805,19 @@ pub enum PrctlArg<Platform: litebox::platform::RawPointerProvider> {
     CapBSetRead(usize),
 }
 
+#[repr(u32)]
+#[derive(Debug, IntEnum)]
+pub enum IntervalTimer {
+    /// This timer counts down in real (i.e., wall clock) time.  At each expiration, a SIGALRM signal is generated.
+    Real = 0,
+    /// This timer counts down against the user-mode CPU time consumed by the process. The measurement includes CPU time
+    /// consumed by all threads in the process. At each expiration, a SIGVTALRM signal is generated.
+    Virtual = 1,
+    /// This timer counts down against the total (i.e., both user and system) CPU time consumed by the process.
+    /// The measurement includes CPU time consumed by all threads in the process. At each expiration, a SIGPROF signal is generated.
+    Prof = 2,
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 #[derive(Debug)]
@@ -2190,7 +2203,7 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         sig: i32,
     },
     SetITimer {
-        which: i32,
+        which: IntervalTimer,
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },
@@ -2726,7 +2739,14 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::tgkill => sys_req!(ThreadKill { tgid, tid, sig }),
-            Sysno::setitimer => sys_req!(SetITimer { which, new_value:*, old_value:* }),
+            Sysno::setitimer => {
+                let which: u32 = ctx.sys_req_arg(0);
+                if let Ok(which) = IntervalTimer::try_from(which) {
+                    sys_req!(SetITimer { which: {which}, new_value:*, old_value:* })
+                } else {
+                    return Ok(SyscallRequest::Ret(errno::Errno::EINVAL));
+                }
+            }
             // TODO: support syscall `statfs`
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 SyscallRequest::Ret(errno::Errno::ENOSYS)
@@ -2784,8 +2804,8 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
         thread_id: i32,
         sig: Signal,
     },
-    SetItimer {
-        which: i32,
+    SetITimer {
+        which: IntervalTimer,
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },

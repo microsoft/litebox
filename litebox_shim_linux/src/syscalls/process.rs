@@ -1109,11 +1109,11 @@ pub(crate) fn sys_tgkill(
 
 /// Handle syscall `setitimer`
 pub(crate) fn sys_setitimer(
-    which: i32,
+    which: litebox_common_linux::IntervalTimer,
     new_value: crate::ConstPtr<litebox_common_linux::ItimerVal>,
     old_value: Option<crate::MutPtr<litebox_common_linux::ItimerVal>>,
 ) -> Result<(), Errno> {
-    let punchthrough = litebox_common_linux::PunchthroughSyscall::SetItimer {
+    let punchthrough = litebox_common_linux::PunchthroughSyscall::SetITimer {
         which,
         new_value,
         old_value,

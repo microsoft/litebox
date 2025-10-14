@@ -959,14 +959,14 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 _ => panic!("unexpected error {err}"),
             })
             .map_err(litebox::platform::PunchthroughError::Failure),
-            PunchthroughSyscall::SetItimer {
+            PunchthroughSyscall::SetITimer {
                 which,
                 new_value,
                 old_value,
             } => unsafe {
                 syscalls::syscall3(
                     syscalls::Sysno::setitimer,
-                    which.reinterpret_as_unsigned() as usize,
+                    which as usize,
                     new_value.as_usize(),
                     if let Some(old_value) = old_value {
                         old_value.as_usize()
