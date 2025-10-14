@@ -27,7 +27,6 @@ elf_loader = { version = "0.12.0", default-features = false, features = ["rel"] 
 
 [features]
 default = ["platform_linux_userland"]
-platform_freebsd_userland = ["litebox_platform_multiplex/platform_freebsd_userland"]
 platform_linux_userland = ["litebox_platform_multiplex/platform_linux_userland_with_linux_syscall"]
 platform_windows_userland = ["litebox_platform_multiplex/platform_windows_userland"]
 platform_linux_snp = ["litebox_platform_multiplex/platform_linux_snp"]

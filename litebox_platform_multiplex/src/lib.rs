@@ -26,8 +26,6 @@ extern crate alloc;
 cfg_if::cfg_if! {
     if #[cfg(all(feature = "platform_linux_userland", target_os = "linux"))] {
         pub type Platform = litebox_platform_linux_userland::LinuxUserland;
-    } else if #[cfg(all(feature = "platform_freebsd_userland", target_os = "freebsd"))] {
-        pub type Platform = litebox_platform_freebsd_userland::FreeBSDUserland;
     } else if #[cfg(all(feature = "platform_windows_userland", target_os = "windows"))] {
         pub type Platform = litebox_platform_windows_userland::WindowsUserland;
     } else if #[cfg(feature = "platform_lvbs")] {
