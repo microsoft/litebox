@@ -65,6 +65,16 @@ pub struct CliArgs {
     #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath,
           requires = "unstable", help_heading = "Unstable Options")]
     pub initial_files: Option<PathBuf>,
+    /// Apply syscall-rewriter to the ELF file before running it
+    ///
+    /// This is meant as a convenience feature; real deployments would likely prefer ahead-of-time
+    /// rewrite things to amortize costs.
+    #[arg(
+        long = "rewrite-syscalls",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub rewrite_syscalls: bool,
 }
 
 fn windows_path_to_unix(path: &std::path::Path) -> String {
@@ -115,6 +125,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             })
             .collect();
         let data = std::fs::read(prog).unwrap();
+        let data = if cli_args.rewrite_syscalls {
+            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
+        } else {
+            data
+        };
         (modes, data)
     };
     let tar_data = if let Some(tar_file) = cli_args.initial_files.as_ref() {
