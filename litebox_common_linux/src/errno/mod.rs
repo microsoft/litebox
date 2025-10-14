@@ -393,6 +393,7 @@ impl From<litebox::net::errors::SendError> for Errno {
             litebox::net::errors::SendError::Unaddressable => Errno::EDESTADDRREQ,
             litebox::net::errors::SendError::BufferFull => Errno::EAGAIN,
             litebox::net::errors::SendError::PortAllocationFailure(e) => e.into(),
+            litebox::net::errors::SendError::UnnecessaryDestinationAddress => Errno::EISCONN,
             _ => unimplemented!(),
         }
     }

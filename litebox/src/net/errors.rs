@@ -96,6 +96,8 @@ pub enum SendError {
     BufferFull,
     #[error("port allocation failed: {0}")]
     PortAllocationFailure(#[from] LocalPortAllocationError),
+    #[error("unnecessary destination address provided")]
+    UnnecessaryDestinationAddress,
 }
 
 /// Possible errors from [`Network::receive`]

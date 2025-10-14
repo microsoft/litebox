@@ -886,7 +886,8 @@ where
 
     /// Send data over a socket, optionally specifying the destination address.
     ///
-    /// If the socket is connection-mode, destination address shall be ignored.
+    /// If the socket is connection-mode and the destination address is provided,
+    /// `Err(SendError::UnnecessaryDestinationAddress)` is returned.
     pub fn send(
         &mut self,
         fd: &SocketFd<Platform>,
@@ -903,11 +904,16 @@ where
         }
 
         let ret = match socket_handle.protocol() {
-            Protocol::Tcp => self
-                .socket_set
-                .get_mut::<tcp::Socket>(socket_handle.handle)
-                .send_slice(buf)
-                .map_err(|tcp::SendError::InvalidState| SendError::SocketInInvalidState),
+            Protocol::Tcp => {
+                if destination.is_some() {
+                    // TCP is connection-oriented, so no destination address should be provided
+                    return Err(SendError::UnnecessaryDestinationAddress);
+                }
+                self.socket_set
+                    .get_mut::<tcp::Socket>(socket_handle.handle)
+                    .send_slice(buf)
+                    .map_err(|tcp::SendError::InvalidState| SendError::SocketInInvalidState)
+            }
             Protocol::Udp => {
                 let destination = destination
                     .map(|s| match s {
