@@ -41,6 +41,12 @@ jobs:
         run: |
           sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh
       - uses: Swatinem/rust-cache@v2
+      - name: Cache custom out directories
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/*/build/litebox_runner_linux_userland-*/out
+          key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_platform_lvbs --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp
@@ -82,6 +88,12 @@ jobs:
         run: |
           sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh
       - uses: Swatinem/rust-cache@v2
+      - name: Cache custom out directories
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/*/build/litebox_runner_linux_userland-*/out
+          key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
       - run: ./.github/tools/github_actions_run_cargo build --target=i686-unknown-linux-gnu
       - run: ./.github/tools/github_actions_run_cargo nextest --target=i686-unknown-linux-gnu
       - run: |
@@ -113,6 +125,12 @@ jobs:
         run: |
           sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh
       - uses: Swatinem/rust-cache@v2
+      - name: Cache custom out directories
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/*/build/litebox_runner_linux_userland-*/out
+          key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
       - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features
       - run: |
           ./.github/tools/github_actions_run_cargo build
