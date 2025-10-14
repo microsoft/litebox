@@ -408,7 +408,7 @@ fn try_accept(raw_fd: usize) -> Result<SocketFd, Errno> {
 }
 
 fn accept(raw_fd: usize) -> Result<SocketFd, Errno> {
-    if get_status(raw_fd).contains(OFlags::NONBLOCK) {
+    if get_status(&*get_socket_fd(raw_fd)?).contains(OFlags::NONBLOCK) {
         try_accept(raw_fd)
     } else {
         // TODO: use `poll` instead of busy wait
@@ -478,7 +478,9 @@ pub(crate) fn sendto(
         OOB,
     );
 
-    if get_status(raw_fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT) {
+    if get_status(&*get_socket_fd(raw_fd)?).contains(OFlags::NONBLOCK)
+        || flags.contains(SendFlags::DONTWAIT)
+    {
         try_sendto(raw_fd, buf, new_flags, sockaddr)
     } else {
         let timeout = with_socket_options(raw_fd, |opt| opt.send_timeout)?;
@@ -540,7 +542,9 @@ pub(crate) fn receive(
         }
     }
 
-    if get_status(raw_fd).contains(OFlags::NONBLOCK) || flags.contains(ReceiveFlags::DONTWAIT) {
+    if get_status(&*get_socket_fd(raw_fd)?).contains(OFlags::NONBLOCK)
+        || flags.contains(ReceiveFlags::DONTWAIT)
+    {
         try_receive(raw_fd, buf, new_flags, source_addr)
     } else {
         let timeout = with_socket_options(raw_fd, |opt| opt.recv_timeout)?;
@@ -559,21 +563,12 @@ pub(crate) fn receive(
     }
 }
 
-fn get_status(raw_fd: usize) -> litebox::fs::OFlags {
-    let fd = get_socket_fd(raw_fd).unwrap();
+fn get_status(fd: &SocketFd) -> litebox::fs::OFlags {
     litebox()
         .descriptor_table()
-        .with_metadata(&fd, |SocketOFlags(flags)| *flags)
+        .with_metadata(fd, |SocketOFlags(flags)| *flags)
         .unwrap()
         & litebox::fs::OFlags::STATUS_FLAGS_MASK
-}
-
-fn set_status(raw_fd: usize, flag: litebox::fs::OFlags, on: bool) {
-    let fd = get_socket_fd(raw_fd).unwrap();
-    litebox()
-        .descriptor_table_mut()
-        .with_metadata_mut(&fd, |SocketOFlags(flags)| flags.set(flag, on))
-        .unwrap();
 }
 
 /// Handle syscall `socket`
