@@ -82,7 +82,6 @@ impl Descriptor {
             Descriptor::PipeWriter { producer, .. } => producer,
             Descriptor::Eventfd { file, .. } => file,
             Descriptor::Socket(socket) => socket,
-            Descriptor::File(typed_fd) => todo!(),
             Descriptor::LiteBoxRawFd(fd) => return Events::OUT & mask, // TODO: handle properly
             Descriptor::Epoll { file, .. } => todo!(),
         };
@@ -232,12 +231,12 @@ struct EpollEntryKey(u32, *const ());
 impl EpollEntryKey {
     fn new(fd: u32, desc: &Descriptor) -> Self {
         let ptr = match desc {
+            Descriptor::LiteBoxRawFd(raw_fd) => *raw_fd as _,
             Descriptor::PipeReader { consumer, .. } => Arc::as_ptr(consumer).cast(),
             Descriptor::PipeWriter { producer, .. } => Arc::as_ptr(producer).cast(),
             Descriptor::Eventfd { file, .. } => Arc::as_ptr(file).cast(),
             Descriptor::Socket(socket) => Arc::as_ptr(socket).cast(),
-            Descriptor::File(file) => core::ptr::from_ref(file).cast(),
-            _ => todo!(),
+            Descriptor::Epoll { .. } => todo!(),
         };
         Self(fd, ptr)
     }

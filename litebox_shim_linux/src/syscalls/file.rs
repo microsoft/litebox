@@ -6,6 +6,7 @@ use alloc::{
     vec,
 };
 use litebox::{
+    fd::MetadataError,
     fs::{FileSystem as _, Mode, OFlags, SeekWhence},
     path,
     platform::{RawConstPointer, RawMutPointer},
@@ -81,22 +82,18 @@ pub(crate) fn sys_umask(new_mask: u32) -> Mode {
 /// Handle syscall `open`
 pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
     let mode = mode & !get_umask();
-    let file = litebox_fs()
-        .open(path, flags - OFlags::CLOEXEC, mode)
-        .map(|file| {
-            if flags.contains(OFlags::CLOEXEC)
-                && litebox()
-                    .descriptor_table_mut()
-                    .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
-                    .is_some()
-            {
-                unreachable!()
-            }
-            Descriptor::File(file)
-        })?;
+    let file = litebox_fs().open(path, flags - OFlags::CLOEXEC, mode)?;
+    let mut dt = litebox().descriptor_table_mut();
+    if flags.contains(OFlags::CLOEXEC) {
+        let None = dt.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC) else {
+            unreachable!()
+        };
+    }
+    let raw_fd = dt.fd_into_raw_integer(file);
+    drop(dt);
     file_descriptors()
         .write()
-        .insert(file)
+        .insert(Descriptor::LiteBoxRawFd(raw_fd))
         .map_err(|desc| do_close(desc).err().unwrap_or(Errno::EMFILE))
 }
 
@@ -123,12 +120,19 @@ pub(crate) fn sys_ftruncate(fd: i32, length: usize) -> Result<(), Errno> {
     };
     let file_table = file_descriptors().read();
     let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
-    let Descriptor::File(file) = desc else {
-        return Err(Errno::EINVAL);
-    };
-    litebox_fs()
-        .truncate(file, length, false)
-        .map_err(Errno::from)
+    match desc {
+        Descriptor::LiteBoxRawFd(raw_fd) => crate::run_on_raw_fd(
+            *raw_fd,
+            |fd| {
+                litebox_fs()
+                    .truncate(fd, length, false)
+                    .map_err(Errno::from)
+            },
+            |_fd| todo!("net"),
+        ),
+        _ => Err(Errno::EINVAL),
+    }
+    .flatten()
 }
 
 /// Handle syscall `unlinkat`
@@ -172,7 +176,6 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
             |fd| todo!("net"),
         )
         .flatten(),
-        Descriptor::File(file) => litebox_fs().read(file, buf, offset).map_err(Errno::from),
         Descriptor::Socket(socket) => {
             let socket = socket.clone();
             drop(file_table);
@@ -214,7 +217,6 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
             |fd| todo!("net"),
         )
         .flatten(),
-        Descriptor::File(file) => litebox_fs().write(file, buf, offset).map_err(Errno::from),
         Descriptor::Socket(socket) => {
             let socket = socket.clone();
             drop(file_table);
@@ -278,7 +280,6 @@ pub fn sys_lseek(fd: i32, offset: isize, whence: SeekWhence) -> Result<usize, Er
             |_| Err(Errno::ESPIPE),
         )
         .flatten(),
-        Descriptor::File(file) => litebox_fs().seek(file, offset, whence).map_err(Errno::from),
         Descriptor::Socket(..)
         | Descriptor::PipeReader { .. }
         | Descriptor::Epoll { .. }
@@ -341,7 +342,6 @@ pub(crate) fn do_close(desc: Descriptor) -> Result<(), Errno> {
                 "cannot close {raw_fd}. something might be holding onto the results of `fd_from_raw_integer` for too long"
             )
         }
-        Descriptor::File(file) => litebox_fs().close(file).map_err(Errno::from),
         Descriptor::Socket(socket) => Ok(()), // The actual close happens when the socket is dropped
         Descriptor::PipeReader { .. }
         | Descriptor::PipeWriter { .. }
@@ -404,9 +404,6 @@ pub fn sys_readv(
                 |fd| todo!("net"),
             )
             .flatten()?,
-            Descriptor::File(file) => litebox_fs()
-                .read(file, &mut kernel_buffer, None)
-                .map_err(Errno::from)?,
             Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { consumer, .. } => todo!(),
             Descriptor::PipeWriter { .. } | Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
@@ -471,9 +468,6 @@ pub fn sys_writev(
         // TODO: The data transfers performed by readv() and writev() are atomic: the data
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
-        Descriptor::File(file) => write_to_iovec(iovs, |buf: &[u8]| {
-            litebox_fs().write(file, buf, None).map_err(Errno::from)
-        }),
         Descriptor::Socket(socket) => {
             let socket = socket.clone();
             drop(locked_file_descriptors);
@@ -572,7 +566,6 @@ impl Descriptor {
                 |fd| todo!("net"),
             )
             .flatten()?,
-            Descriptor::File(file) => FileStat::from(litebox_fs().fd_file_status(file)?),
             Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { .. } => FileStat {
                 // TODO: give correct values
@@ -652,10 +645,6 @@ impl Descriptor {
             )
             // TODO: We need to expose an errno up here somewhere
             .unwrap(),
-            Descriptor::File(file) => litebox()
-                .descriptor_table()
-                .with_metadata(file, |flags: &FileDescriptorFlags| *flags)
-                .unwrap_or(FileDescriptorFlags::empty()),
             Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { close_on_exec, .. }
             | Descriptor::PipeWriter { close_on_exec, .. }
@@ -762,11 +751,6 @@ pub(crate) fn sys_fcntl(
                     },
                     |fd| todo!("net"),
                 )?,
-                Descriptor::File(file) => {
-                    let _old = litebox()
-                        .descriptor_table_mut()
-                        .set_fd_metadata(file, flags);
-                }
                 Descriptor::Socket(socket) => todo!(),
                 Descriptor::PipeReader { close_on_exec, .. }
                 | Descriptor::PipeWriter { close_on_exec, .. }
@@ -794,13 +778,6 @@ pub(crate) fn sys_fcntl(
                 },
                 |fd| todo!("net"),
             ),
-            Descriptor::File(file) => Ok(litebox()
-                .descriptor_table()
-                .with_metadata(file, |crate::StdioStatusFlags(flags)| {
-                    *flags & OFlags::STATUS_FLAGS_MASK
-                })
-                .unwrap_or(OFlags::empty())
-                .bits()),
             Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { consumer, .. } => Ok(consumer.get_status().bits()),
             Descriptor::PipeWriter { producer, .. } => Ok(producer.get_status().bits()),
@@ -842,7 +819,6 @@ pub(crate) fn sys_fcntl(
                     },
                     |fd| todo!("net"),
                 )?,
-                Descriptor::File(file) => todo!(),
                 Descriptor::Socket(socket) => todo!(),
                 Descriptor::PipeReader { consumer, .. } => {
                     toggle_flags!(consumer);
@@ -858,35 +834,49 @@ pub(crate) fn sys_fcntl(
             Ok(0)
         }
         FcntlArg::GETLK(lock) => {
-            let Descriptor::File(file) = desc else {
+            let Descriptor::LiteBoxRawFd(raw_fd) = desc else {
                 return Err(Errno::EBADF);
             };
-            let mut flock = unsafe { lock.read_at_offset(0) }
-                .ok_or(Errno::EFAULT)?
-                .into_owned();
-            let lock_type = litebox_common_linux::FlockType::try_from(flock.type_)
-                .map_err(|_| Errno::EINVAL)?;
-            if let litebox_common_linux::FlockType::Unlock = lock_type {
-                return Err(Errno::EINVAL);
-            }
+            crate::run_on_raw_fd(
+                *raw_fd,
+                |fd| {
+                    let mut flock = unsafe { lock.read_at_offset(0) }
+                        .ok_or(Errno::EFAULT)?
+                        .into_owned();
+                    let lock_type = litebox_common_linux::FlockType::try_from(flock.type_)
+                        .map_err(|_| Errno::EINVAL)?;
+                    if let litebox_common_linux::FlockType::Unlock = lock_type {
+                        return Err(Errno::EINVAL);
+                    }
 
-            // Note LiteBox does not support multiple processes yet, and one process
-            // can always acquire the lock it owns, so return `Unlock` unconditionally.
-            flock.type_ = litebox_common_linux::FlockType::Unlock as i16;
-            unsafe { lock.write_at_offset(0, flock) }.ok_or(Errno::EFAULT)?;
-            Ok(0)
+                    // Note LiteBox does not support multiple processes yet, and one process
+                    // can always acquire the lock it owns, so return `Unlock` unconditionally.
+                    flock.type_ = litebox_common_linux::FlockType::Unlock as i16;
+                    unsafe { lock.write_at_offset(0, flock) }.ok_or(Errno::EFAULT)?;
+                    Ok(0)
+                },
+                |fd| todo!("net"),
+            )
+            .flatten()
         }
         FcntlArg::SETLK(lock) | FcntlArg::SETLKW(lock) => {
-            let Descriptor::File(file) = desc else {
+            let Descriptor::LiteBoxRawFd(raw_fd) = desc else {
                 return Err(Errno::EBADF);
             };
-            let flock = unsafe { lock.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
-            let _ = litebox_common_linux::FlockType::try_from(flock.type_)
-                .map_err(|_| Errno::EINVAL)?;
+            crate::run_on_raw_fd(
+                *raw_fd,
+                |fd| {
+                    let flock = unsafe { lock.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+                    let _ = litebox_common_linux::FlockType::try_from(flock.type_)
+                        .map_err(|_| Errno::EINVAL)?;
 
-            // Note LiteBox does not support multiple processes yet, and one process
-            // can always acquire the lock it owns, so we don't need to maintain anything.
-            Ok(0)
+                    // Note LiteBox does not support multiple processes yet, and one process
+                    // can always acquire the lock it owns, so we don't need to maintain anything.
+                    Ok(0)
+                },
+                |fd| todo!("net"),
+            )
+            .flatten()
         }
         _ => unimplemented!(),
     }
@@ -960,7 +950,7 @@ pub fn sys_eventfd2(initval: u32, flags: EfdFlags) -> Result<u32, Errno> {
         .map_err(|desc| do_close(desc).err().unwrap_or(Errno::EMFILE))
 }
 
-fn stdio_ioctl(arg: IoctlArg<litebox_platform_multiplex::Platform>) -> Result<u32, Errno> {
+fn stdio_ioctl(arg: &IoctlArg<litebox_platform_multiplex::Platform>) -> Result<u32, Errno> {
     match arg {
         IoctlArg::TCGETS(termios) => {
             unsafe {
@@ -1016,13 +1006,10 @@ pub fn sys_ioctl(
         match desc {
             Descriptor::LiteBoxRawFd(raw_fd) => {
                 // TODO: stdio NONBLOCK?
-                todo!()
-            }
-            Descriptor::File(file) => {
                 #[cfg(debug_assertions)]
                 litebox::log_println!(
                     litebox_platform_multiplex::platform(),
-                    "Attempted to set non-blocking on file; currently unimplemented"
+                    "Attempted to set non-blocking on raw fd; currently unimplemented"
                 );
             }
             Descriptor::Socket(socket) => todo!(),
@@ -1046,38 +1033,45 @@ pub fn sys_ioctl(
             |fd| {
                 litebox()
                     .descriptor_table()
-                    .with_metadata(fd, |crate::StdioStatusFlags(_)| stdio_ioctl(arg))
-                    .unwrap_or_else(|_| unimplemented!())
+                    .with_metadata(fd, |crate::StdioStatusFlags(_)| stdio_ioctl(&arg))
+                    .unwrap_or_else(|MetadataError::NoSuchMetadata| {
+                        match arg {
+                            IoctlArg::TCGETS(..) => Err(Errno::ENOTTY),
+                            IoctlArg::FIOCLEX => {
+                                crate::run_on_raw_fd(
+                                    *raw_fd,
+                                    |fd| {
+                                        let _old = litebox()
+                                            .descriptor_table_mut()
+                                            .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                                    },
+                                    |fd| todo!("net")
+                                )?;
+                                Ok(0)
+                            }
+                            IoctlArg::TIOCGWINSZ(_) | IoctlArg::TCSETS(_) => {
+                                #[cfg(debug_assertions)]
+                                litebox::log_println!(
+                                    litebox_platform_multiplex::platform(),
+                                    "Got {:?} for non-stdio file; this is likely temporary during the migration away from stdio and should get cleaned up at some point",
+                                    arg
+                                );
+                                Err(Errno::EPERM)
+                            }
+                            _ => {
+                                #[cfg(debug_assertions)]
+                                litebox::log_println!(
+                                    litebox_platform_multiplex::platform(),
+                                    "\n\n\n{:?}\n\n\n",
+                                    arg
+                                );
+                                todo!()
+                            }
+                        }
+                    })
             },
             |fd| todo!("net"),
         )?,
-        Descriptor::File(file) => match arg {
-            IoctlArg::TCGETS(..) => Err(Errno::ENOTTY),
-            IoctlArg::FIOCLEX => {
-                let _old = litebox()
-                    .descriptor_table_mut()
-                    .set_fd_metadata(file, FileDescriptorFlags::FD_CLOEXEC);
-                Ok(0)
-            }
-            IoctlArg::TIOCGWINSZ(_) | IoctlArg::TCSETS(_) => {
-                #[cfg(debug_assertions)]
-                litebox::log_println!(
-                    litebox_platform_multiplex::platform(),
-                    "Got {:?} for non-stdio file; this is likely temporary during the migration away from stdio and should get cleaned up at some point",
-                    arg
-                );
-                Err(Errno::EPERM)
-            }
-            _ => {
-                #[cfg(debug_assertions)]
-                litebox::log_println!(
-                    litebox_platform_multiplex::platform(),
-                    "\n\n\n{:?}\n\n\n",
-                    arg
-                );
-                todo!()
-            }
-        },
         Descriptor::Socket(socket) => todo!(),
         Descriptor::PipeReader {
             consumer,
@@ -1312,15 +1306,6 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
                 }
             }
         }
-        Descriptor::File(file) => {
-            let mut dt = litebox().descriptor_table_mut();
-            let file = dt.duplicate(file);
-            if flags.contains(OFlags::CLOEXEC) {
-                let old = dt.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC);
-                assert!(old.is_none());
-            }
-            Ok(Descriptor::File(file))
-        }
         _ => todo!(),
     }
 }
@@ -1391,54 +1376,64 @@ pub(crate) fn sys_getdirent64(fd: i32, dirp: MutPtr<u8>, count: usize) -> Result
         return Err(Errno::EBADF);
     };
     let locked_file_descriptors = file_descriptors().read();
-    let Descriptor::File(file) = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)? else {
+    let Descriptor::LiteBoxRawFd(raw_fd) =
+        locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?
+    else {
         return Err(Errno::EBADF);
     };
-    let dir_off: Diroff = litebox()
-        .descriptor_table()
-        .with_metadata(file, |off: &Diroff| *off)
-        .unwrap_or_default();
-    let mut dir_off = dir_off.0;
-    let mut nbytes = 0;
-    let off = 0;
+    crate::run_on_raw_fd(
+        *raw_fd,
+        |file| {
+            let dir_off: Diroff = litebox()
+                .descriptor_table()
+                .with_metadata(file, |off: &Diroff| *off)
+                .unwrap_or_default();
+            let mut dir_off = dir_off.0;
+            let mut nbytes = 0;
+            let off = 0;
 
-    let mut entries = litebox_fs().read_dir(file)?;
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
+            let mut entries = litebox_fs().read_dir(file)?;
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-    for entry in entries.iter().skip(dir_off) {
-        // include null terminator and make it aligned
-        let len = (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len() + 1)
-            .next_multiple_of(align_of::<litebox_common_linux::LinuxDirent64>());
-        if nbytes + len > count {
-            // not enough space
-            break;
-        }
-        let dirent64 = litebox_common_linux::LinuxDirent64 {
-            ino: entry.ino_info.as_ref().map_or(0, |node_info| node_info.ino) as u64,
-            off: dir_off as u64,
-            len: len.truncate(),
-            typ: litebox_common_linux::DirentType::from(entry.file_type.clone()) as u8,
-            __name: [0; 0],
-        };
-        let hdr_ptr = crate::MutPtr::from_usize(dirp.as_usize() + nbytes);
-        unsafe { hdr_ptr.write_at_offset(0, dirent64) }.ok_or(Errno::EFAULT)?;
-        let name_ptr =
-            crate::MutPtr::from_usize(hdr_ptr.as_usize() + DIRENT_STRUCT_BYTES_WITHOUT_NAME);
-        unsafe { name_ptr.write_slice_at_offset(0, entry.name.as_bytes()) }.ok_or(Errno::EFAULT)?;
-        // set the null terminator and padding
-        let zeros_len = len - (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len());
-        unsafe {
-            name_ptr.write_slice_at_offset(
-                isize::try_from(entry.name.len()).unwrap(),
-                &vec![0; zeros_len],
-            )
-        }
-        .ok_or(Errno::EFAULT)?;
-        nbytes += len;
-        dir_off += 1;
-    }
-    let _old = litebox()
-        .descriptor_table_mut()
-        .set_fd_metadata(file, Diroff(dir_off));
-    Ok(nbytes)
+            for entry in entries.iter().skip(dir_off) {
+                // include null terminator and make it aligned
+                let len = (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len() + 1)
+                    .next_multiple_of(align_of::<litebox_common_linux::LinuxDirent64>());
+                if nbytes + len > count {
+                    // not enough space
+                    break;
+                }
+                let dirent64 = litebox_common_linux::LinuxDirent64 {
+                    ino: entry.ino_info.as_ref().map_or(0, |node_info| node_info.ino) as u64,
+                    off: dir_off as u64,
+                    len: len.truncate(),
+                    typ: litebox_common_linux::DirentType::from(entry.file_type.clone()) as u8,
+                    __name: [0; 0],
+                };
+                let hdr_ptr = crate::MutPtr::from_usize(dirp.as_usize() + nbytes);
+                unsafe { hdr_ptr.write_at_offset(0, dirent64) }.ok_or(Errno::EFAULT)?;
+                let name_ptr = crate::MutPtr::from_usize(
+                    hdr_ptr.as_usize() + DIRENT_STRUCT_BYTES_WITHOUT_NAME,
+                );
+                unsafe { name_ptr.write_slice_at_offset(0, entry.name.as_bytes()) }
+                    .ok_or(Errno::EFAULT)?;
+                // set the null terminator and padding
+                let zeros_len = len - (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len());
+                unsafe {
+                    name_ptr.write_slice_at_offset(
+                        isize::try_from(entry.name.len()).unwrap(),
+                        &vec![0; zeros_len],
+                    )
+                }
+                .ok_or(Errno::EFAULT)?;
+                nbytes += len;
+                dir_off += 1;
+            }
+            let _old = litebox()
+                .descriptor_table_mut()
+                .set_fd_metadata(file, Diroff(dir_off));
+            Ok(nbytes)
+        },
+        |fd| todo!("net"),
+    )?
 }
