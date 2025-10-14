@@ -9,6 +9,7 @@ extern crate alloc;
 
 use alloc::borrow::ToOwned;
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
+use litebox_common_linux::ContinueOperation;
 use litebox_platform_linux_kernel::{HostInterface, host::snp::ghcb::ghcb_prints};
 
 #[unsafe(no_mangle)]
@@ -92,7 +93,7 @@ pub extern "C" fn sandbox_process_init(
             & !(litebox::mm::linux::PAGE_SIZE as u64 - 1),
     );
     let platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel::new(pgd);
-    platform.set_init_tls(boot_params);
+    litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel::set_init_tls(boot_params);
     litebox::log_println!(platform, "sandbox_process_init called");
 
     litebox_platform_multiplex::set_platform(platform);
@@ -170,7 +171,12 @@ pub extern "C" fn sandbox_task_exit() {
 #[unsafe(no_mangle)]
 pub extern "C" fn do_syscall_64(nr: u64, pt_regs: &mut litebox_common_linux::PtRegs) {
     pt_regs.rax = match litebox_common_linux::SyscallRequest::try_from_raw(nr.truncate(), pt_regs) {
-        Ok(req) => litebox_shim_linux::handle_syscall_request(req),
+        Ok(req) => match litebox_shim_linux::handle_syscall_request(req) {
+            ContinueOperation::ResumeGuest { return_value } => return_value,
+            ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
+                status.cast_unsigned() as usize
+            }
+        },
         Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
     };
 }

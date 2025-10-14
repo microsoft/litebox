@@ -8,9 +8,9 @@ use core::{arch::asm, sync::atomic::AtomicU32};
 
 use litebox::mm::linux::PageRange;
 use litebox::platform::{
-    DebugLogProvider, ExitProvider, IPInterfaceProvider, ImmediatelyWokenUp,
-    PageManagementProvider, Provider, Punchthrough, PunchthroughProvider, PunchthroughToken,
-    RawMutPointer, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
+    DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider, Provider,
+    Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutPointer, RawMutexProvider,
+    TimeProvider, UnblockedOrTimedOut,
 };
 use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::PunchthroughSyscall;
@@ -93,15 +93,6 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
 }
 
 impl<Host: HostInterface> Provider for LinuxKernel<Host> {}
-
-impl<Host: HostInterface> ExitProvider for LinuxKernel<Host> {
-    type ExitCode = i32;
-    const EXIT_SUCCESS: Self::ExitCode = 0;
-    const EXIT_FAILURE: Self::ExitCode = 1;
-    fn exit(&self, code: Self::ExitCode) -> ! {
-        Host::terminate_process(code)
-    }
-}
 
 impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
     type RawConstPointer<T: Clone> = ptr::UserConstPtr<T>;

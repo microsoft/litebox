@@ -250,15 +250,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    load_program(prog_path, argv, envp).expect("failed to load program");
-    unreachable!("should have jumped to the program");
+    load_program(prog_path, argv, envp);
+    Ok(())
 }
 
 fn load_program(
     path: &str,
     argv: alloc::vec::Vec<alloc::ffi::CString>,
     mut envp: alloc::vec::Vec<alloc::ffi::CString>,
-) -> Result<(), litebox_common_linux::errno::Errno> {
+) {
     let mut aux = litebox_shim_linux::loader::auxv::init_auxv();
     if litebox_platform_multiplex::platform()
         .get_vdso_address()
@@ -293,46 +293,49 @@ fn load_program(
     let comm = path.rsplit('/').next().unwrap_or("unknown");
     litebox_shim_linux::syscalls::process::set_task_comm(comm.as_bytes());
 
-    // Save LiteBox's TLS before returning to the guest
-    litebox_common_linux::swap_fsgs();
-
-    unsafe {
-        trampoline::jump_to_entry_point(loaded_program.entry_point, loaded_program.user_stack_top)
-    }
-}
-
-mod trampoline {
     #[cfg(target_arch = "x86_64")]
-    core::arch::global_asm!(
-        "
-    .text
-    .align  4
-    .globl  jump_to_entry_point
-    .type   jump_to_entry_point,@function
-jump_to_entry_point:
-    xor rdx, rdx
-    mov     rsp, rsi
-    jmp     rdi
-    /* Should not reach. */
-    hlt"
-    );
+    let pt_regs = litebox_common_linux::PtRegs {
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        rbp: 0,
+        rbx: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rax: 0,
+        rcx: 0,
+        rdx: 0,
+        rsi: 0,
+        rdi: 0,
+        orig_rax: 0,
+        rip: loaded_program.entry_point,
+        cs: 0x33, // __USER_CS
+        eflags: 0,
+        rsp: loaded_program.user_stack_top,
+        ss: 0x2b, // __USER_DS
+    };
     #[cfg(target_arch = "x86")]
-    core::arch::global_asm!(
-        "
-    .text
-    .align  4
-    .globl  jump_to_entry_point
-    .type   jump_to_entry_point,@function
-jump_to_entry_point:
-    xor     edx, edx
-    mov     ebx, [esp + 4]
-    mov     eax, [esp + 8]
-    mov     esp, eax
-    jmp     ebx
-    /* Should not reach. */
-    hlt"
-    );
-    unsafe extern "C" {
-        pub(crate) fn jump_to_entry_point(entry_point: usize, stack_pointer: usize) -> !;
-    }
+    let pt_regs = litebox_common_linux::PtRegs {
+        ebx: 0,
+        ecx: 0,
+        edx: 0,
+        esi: 0,
+        edi: 0,
+        ebp: 0,
+        eax: 0,
+        xds: 0,
+        xes: 0,
+        xfs: 0,
+        xgs: 0,
+        orig_eax: 0,
+        eip: loaded_program.entry_point,
+        xcs: 0x23, // __USER_CS
+        eflags: 0,
+        esp: loaded_program.user_stack_top,
+        xss: 0x2b, // __USER_DS
+    };
+    unsafe { litebox_platform_linux_userland::thread_start_asm(&pt_regs) };
 }

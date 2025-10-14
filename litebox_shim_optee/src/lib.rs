@@ -19,17 +19,11 @@ use litebox::{
     platform::{RawConstPointer as _, RawMutPointer as _},
 };
 use litebox_common_optee::{
-    SyscallRequest, TeeAlgorithm, TeeAlgorithmClass, TeeAttributeType, TeeCrypStateHandle,
-    TeeHandleFlag, TeeObjHandle, TeeObjectInfo, TeeObjectType, TeeOperationMode, TeeParamType,
-    TeeResult, UteeAttribute, UteeEntryFunc, UteeParams,
+    ContinueOperation, SyscallRequest, TeeAlgorithm, TeeAlgorithmClass, TeeAttributeType,
+    TeeCrypStateHandle, TeeHandleFlag, TeeObjHandle, TeeObjectInfo, TeeObjectType,
+    TeeOperationMode, TeeParamType, TeeResult, UteeAttribute, UteeEntryFunc, UteeParams,
 };
 use litebox_platform_multiplex::Platform;
-
-cfg_if::cfg_if! {
-    if #[cfg(feature = "platform_linux_userland")] {
-    use litebox::platform::{ThreadProvider as _};
-    }
-}
 
 use crate::loader::elf::ElfLoadInfo;
 
@@ -60,9 +54,11 @@ type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPoin
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> u32 {
+pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> ContinueOperation {
+    if let SyscallRequest::Return { ret } = request {
+        return ContinueOperation::ExitThread(syscalls::tee::sys_return(ret));
+    }
     let res: Result<(), TeeResult> = match request {
-        SyscallRequest::Return { ret } => syscalls::tee::sys_return(ret),
         SyscallRequest::Log { buf, len } => match unsafe { buf.to_cow_slice(len) } {
             Some(buf) => syscalls::tee::sys_log(&buf),
             None => Err(TeeResult::BadParameters),
@@ -228,9 +224,11 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> u32 {
         _ => todo!(),
     };
 
-    match res {
-        Ok(()) => TeeResult::Success.into(),
-        Err(e) => e.into(),
+    ContinueOperation::ResumeGuest {
+        return_value: match res {
+            Ok(()) => TeeResult::Success.into(),
+            Err(e) => e.into(),
+        },
     }
 }
 
@@ -443,7 +441,7 @@ pub fn submit_optee_command(
 /// from the queue.
 /// # Panics
 /// This function panics if it cannot allocate a stack
-pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
+pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) {
     if is_sys_return {
         handle_optee_command_output(session_id);
     }
@@ -451,15 +449,7 @@ pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
     if let Some(cmd) = optee_command_submission_queue().pop(session_id) {
         let elf_load_info = session_id_elf_load_info_map().get(session_id);
         let Some(elf_load_info) = elf_load_info else {
-            cfg_if::cfg_if! {
-                    if #[cfg(feature = "platform_linux_userland")] {
-                        litebox_platform_multiplex::platform().terminate_thread(0);
-                    } else if #[cfg(feature = "platform_lvbs")] {
-                        todo!("switch to VTL0");
-                    } else {
-                        compile_error!(r##"No platform specified."##);
-                    }
-            }
+            panic!("No ELF load info found");
         };
 
         // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
@@ -474,9 +464,6 @@ pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
             .expect("Failed to initialize stack with parameters");
 
         optee_command_completion_queue().push(session_id, stack.get_params_address());
-
-        // TODO: We will move the following line into the platform or the runner after the OPTEE shim is refactored.
-        litebox_common_linux::swap_fsgs();
 
         unsafe {
             jump_to_entry_point(
@@ -493,15 +480,6 @@ pub fn optee_command_dispatcher(session_id: u32, is_sys_return: bool) -> ! {
         session_id_elf_load_info_map().remove(session_id);
         optee_command_submission_queue().remove(session_id);
         optee_command_completion_queue().remove(session_id);
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "platform_linux_userland")] {
-                litebox_platform_multiplex::platform().terminate_thread(0);
-            } else if #[cfg(feature = "platform_lvbs")] {
-                todo!("switch to VTL0");
-            } else {
-                compile_error!(r##"No platform specified."##);
-            }
-        }
     }
 }
 

@@ -42,31 +42,11 @@ pub trait Provider:
     + PunchthroughProvider
     + DebugLogProvider
     + RawPointerProvider
-    + ExitProvider
 {
 }
 
-/// Exiting cleanly.
-///
-/// Each platform can pick its own exit code type, which the shim can use to provide possibly
-/// greater detail in its exit scenarios.
-///
-/// The only requirement for `ExitCode` is that there must be a canonical success, and a canonical
-/// failure code.
-///
-/// NOTE: This is not guaranteed to be the only way to exit from a LiteBox process---the other
-/// approach is via a panic. However, a panic should be considered to be an issue in the
-/// implementation. Valid exits must always pass through cleanly into the [`ExitProvider`].
-pub trait ExitProvider: Sized {
-    type ExitCode;
-    const EXIT_SUCCESS: Self::ExitCode;
-    const EXIT_FAILURE: Self::ExitCode;
-    /// Exits the program with the given exit code.
-    fn exit(&self, code: Self::ExitCode) -> !;
-}
-
 /// Thread management provider.
-pub trait ThreadProvider: RawPointerProvider + ExitProvider {
+pub trait ThreadProvider: RawPointerProvider {
     /// Execution context for the current thread of the guest program.
     type ExecutionContext;
     /// Platform-specific argument needed for the new thread to start
@@ -96,9 +76,6 @@ pub trait ThreadProvider: RawPointerProvider + ExitProvider {
         entry_point: usize,
         thread_args: alloc::boxed::Box<Self::ThreadArgs>,
     ) -> Result<Self::ThreadId, Self::ThreadSpawnError>;
-
-    /// Terminate the current thread with the given exit code.
-    fn terminate_thread(&self, code: Self::ExitCode) -> !;
 }
 
 /// Punch through any functionality for a particular platform that is not explicitly part of the
@@ -652,14 +629,14 @@ pub trait ThreadLocalStorageProvider {
     /// # Panics
     ///
     /// Panics if TLS is set already.
-    fn set_thread_local_storage(&self, value: Self::ThreadLocalStorage);
+    fn set_thread_local_storage(value: Self::ThreadLocalStorage);
 
     /// Invokes the provided callback function with the thread-local storage value for the current thread.
     ///
     /// # Panics
     ///
     /// Panics if TLS is not set yet.
-    fn with_thread_local_storage_mut<F, R>(&self, f: F) -> R
+    fn with_thread_local_storage_mut<F, R>(f: F) -> R
     where
         F: FnOnce(&mut Self::ThreadLocalStorage) -> R;
 
@@ -669,10 +646,10 @@ pub trait ThreadLocalStorageProvider {
     ///
     /// Panics if TLS is not set yet.
     /// Panics if TLS is being used by [`Self::with_thread_local_storage_mut`].
-    fn release_thread_local_storage(&self) -> Self::ThreadLocalStorage;
+    fn release_thread_local_storage() -> Self::ThreadLocalStorage;
 
     /// Clear any guest thread-local storage state for the current thread.
     ///
     /// This is used to help emulate certain syscalls (e.g., `execve`) that clear TLS.
-    fn clear_guest_thread_local_storage(&self);
+    fn clear_guest_thread_local_storage();
 }

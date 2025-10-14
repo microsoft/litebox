@@ -976,7 +976,7 @@ pub unsafe fn rdfsbase() -> usize {
         core::arch::asm!(
             "rdfsbase {}",
             out(reg) ret,
-            options(nostack, nomem)
+            options(nostack, nomem, preserves_flags)
         );
     }
     ret
@@ -997,7 +997,7 @@ pub unsafe fn wrfsbase(fs_base: usize) {
         core::arch::asm!(
             "wrfsbase {}",
             in(reg) fs_base,
-            options(nostack, nomem)
+            options(nostack, nomem, preserves_flags)
         );
     }
 }
@@ -1014,7 +1014,7 @@ pub unsafe fn rdgsbase() -> usize {
         core::arch::asm!(
             "rdgsbase {}",
             out(reg) ret,
-            options(nostack, nomem)
+            options(nostack, nomem, preserves_flags)
         );
     }
     ret
@@ -1034,7 +1034,7 @@ pub unsafe fn wrgsbase(gs_base: usize) {
         core::arch::asm!(
             "wrgsbase {}",
             in(reg) gs_base,
-            options(nostack, nomem)
+            options(nostack, nomem, preserves_flags)
         );
     }
 }
@@ -1047,63 +1047,27 @@ pub fn rdfss() -> u16 {
         core::arch::asm!(
             "mov {0:x}, fs",
             out(reg) fs_selector,
-            options(nostack, preserves_flags)
+            options(nostack, nomem, preserves_flags)
         );
     }
     fs_selector
 }
 
 /// Writes the FS segment selector
+///
+/// ## Safety
+///
+/// If a wrong value is written to the FS segment selector, it may lead to
+/// undefined behavior or crashes.
 #[cfg(target_arch = "x86")]
-pub fn wrfss(fs_selector: u16) {
+pub unsafe fn wrfss(fs_selector: u16) {
     unsafe {
         core::arch::asm!(
             "mov fs, {0:x}",
             in(reg) fs_selector,
-            options(nostack, preserves_flags)
+            options(nostack, nomem, preserves_flags)
         );
     }
-}
-
-/// Reads the current GS segment selector
-#[cfg(target_arch = "x86")]
-pub fn rdgss() -> u16 {
-    let mut gs_selector: u16;
-    unsafe {
-        core::arch::asm!(
-            "mov {0:x}, gs",
-            out(reg) gs_selector,
-            options(nostack, preserves_flags)
-        );
-    }
-    gs_selector
-}
-
-/// Writes the GS segment selector
-#[cfg(target_arch = "x86")]
-pub fn wrgss(gs_selector: u16) {
-    unsafe {
-        core::arch::asm!(
-            "mov gs, {0:x}",
-            in(reg) gs_selector,
-            options(nostack, preserves_flags)
-        );
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-pub fn swap_fsgs() {
-    let fs_base = unsafe { rdfsbase() };
-    let gs_base = unsafe { rdgsbase() };
-    unsafe { wrgsbase(fs_base) };
-    unsafe { wrfsbase(gs_base) };
-}
-#[cfg(target_arch = "x86")]
-pub fn swap_fsgs() {
-    let fs_selector = rdfss();
-    let gs_selector = rdgss();
-    wrgss(fs_selector);
-    wrfss(gs_selector);
 }
 
 /// Linux's `user_desc` struct used by the `set_thread_area` syscall.
@@ -1238,17 +1202,18 @@ pub struct NewThreadArgs<
     pub tls: Option<Platform::RawMutPointer<ThreadLocalDescriptor>>,
     /// Where to store child TID in child's memory
     pub set_child_tid: Option<Platform::RawMutPointer<i32>>,
-    /// Optional start gate shared between parent and child. When present the child
-    /// will wait until the parent signals the gate before proceeding with running
-    /// the guest thread entry. This avoids races when the parent wants to write
-    /// its child-tid (parent_tid) into parent memory after spawn.
-    pub start_gate: Option<alloc::sync::Arc<litebox::sync::Mutex<Platform, ()>>>,
     /// Task struct that maintains all per-thread data
     pub task: alloc::boxed::Box<Task<Platform>>,
     /// A callback function that *MUST* be called when the thread is created.
     ///
     /// Note that `task.tid` must be set correctly before this function is called.
     pub callback: fn(Self),
+}
+
+unsafe impl<Platform> Send for NewThreadArgs<Platform> where
+    Platform:
+        litebox::platform::RawPointerProvider + litebox::sync::RawSyncPrimitivesProvider + Send
+{
 }
 
 /// Struct for thread-local storage.
@@ -1298,6 +1263,8 @@ pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     pub credentials: alloc::sync::Arc<Credentials>,
     /// Command name (usually the executable name, excluding the path)
     pub comm: [u8; TASK_COMM_LEN],
+    /// Stored frame pointer for the thread
+    pub stored_bp: Option<usize>,
 }
 
 #[repr(C)]
@@ -2183,6 +2150,12 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
     },
     /// A sentinel that is expected to be "handled" by trivially returning its value.
     Ret(errno::Errno),
+}
+
+pub enum ContinueOperation {
+    ResumeGuest { return_value: usize },
+    ExitThread(i32),
+    ExitProcess(i32),
 }
 
 impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Platform> {

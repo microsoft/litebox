@@ -1,17 +1,16 @@
 //! Process/thread related syscalls.
 
+use alloc::boxed::Box;
 use core::mem::offset_of;
 use core::ops::Range;
-
-use alloc::boxed::Box;
+use core::sync::atomic::AtomicI32;
 use litebox::mm::linux::VmFlags;
-use litebox::platform::{ExitProvider as _, RawMutPointer as _, ThreadProvider as _};
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{
     PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutex as _,
     RawMutexProvider as _, ThreadLocalStorageProvider as _,
 };
-use litebox::utils::TruncateExt as _;
+use litebox::platform::{RawMutPointer as _, ThreadProvider as _};
 use litebox_common_linux::{ArchPrctlArg, errno::Errno};
 use litebox_common_linux::{CloneFlags, FutexArgs, PrctlArg};
 
@@ -21,6 +20,8 @@ pub(crate) struct Process {
     pub(crate) nr_threads: core::sync::atomic::AtomicU16,
     /// resource limits for this process
     pub(crate) limits: ResourceLimits,
+    /// Thread Id counter
+    pub(crate) thread_id_counter: AtomicI32,
 }
 
 /// A global singleton process structure.
@@ -29,11 +30,12 @@ pub(crate) struct Process {
 pub(crate) static LITEBOX_PROCESS: Process = Process {
     nr_threads: core::sync::atomic::AtomicU16::new(1),
     limits: ResourceLimits::default(),
+    thread_id_counter: AtomicI32::new(2), // start from 2, as 1 is used by the main thread
 };
 
 /// Set the current task's command name.
 pub fn set_task_comm(comm: &[u8]) {
-    litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| {
+    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
         let comm = &comm[..comm.len().min(litebox_common_linux::TASK_COMM_LEN - 1)];
         tls.current_task.comm[..comm.len()].copy_from_slice(comm);
     });
@@ -44,12 +46,13 @@ pub(crate) fn sys_prctl(
     arg: PrctlArg<litebox_platform_multiplex::Platform>,
 ) -> Result<usize, Errno> {
     match arg {
-        PrctlArg::GetName(name) => litebox_platform_multiplex::platform()
-            .with_thread_local_storage_mut(|tls| {
+        PrctlArg::GetName(name) => {
+            litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
                 unsafe { name.write_slice_at_offset(0, &tls.current_task.comm) }
                     .ok_or(Errno::EFAULT)
             })
-            .map(|()| 0),
+            .map(|()| 0)
+        }
         PrctlArg::SetName(name) => {
             let mut name_buf = [0u8; litebox_common_linux::TASK_COMM_LEN - 1];
             // strncpy
@@ -261,21 +264,8 @@ fn wake_robust_list(
     Ok(())
 }
 
-fn exit_code(
-    status: i32,
-) -> <litebox_platform_multiplex::Platform as litebox::platform::ExitProvider>::ExitCode {
-    if status == 0 {
-        litebox_platform_multiplex::Platform::EXIT_SUCCESS
-    } else {
-        // TODO(jayb): We are currently folding away all non-zero exit codes as just failure. We
-        // might wish to think of a better design for the ExitProvider to support a better handling
-        // of this.
-        litebox_platform_multiplex::Platform::EXIT_FAILURE
-    }
-}
-
-pub(crate) fn sys_exit(status: i32) -> ! {
-    let mut tls = litebox_platform_multiplex::platform().release_thread_local_storage();
+pub(crate) fn sys_exit(_status: i32) {
+    let mut tls = litebox_platform_multiplex::Platform::release_thread_local_storage();
     if let Some(clear_child_tid) = tls.current_task.clear_child_tid.take() {
         // Clear the child TID if requested
         // TODO: if we are the last thread, we don't need to clear it
@@ -295,13 +285,9 @@ pub(crate) fn sys_exit(status: i32) -> ! {
     LITEBOX_PROCESS
         .nr_threads
         .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-
-    litebox_platform_multiplex::platform().terminate_thread(exit_code(status))
 }
 
-pub(crate) fn sys_exit_group(status: i32) -> ! {
-    litebox_platform_multiplex::platform().exit(exit_code(status))
-}
+pub(crate) fn sys_exit_group(_status: i32) {}
 
 fn new_thread_callback(
     args: litebox_common_linux::NewThreadArgs<litebox_platform_multiplex::Platform>,
@@ -310,19 +296,24 @@ fn new_thread_callback(
         task,
         tls,
         set_child_tid,
-        start_gate,
         callback: _,
     } = args;
+
+    let new_task = Box::new(litebox_common_linux::Task {
+        pid: task.pid,
+        tid: task.tid, // The actual TID will be set by the platform
+        ppid: task.ppid,
+        clear_child_tid: task.clear_child_tid,
+        robust_list: task.robust_list,
+        credentials: task.credentials.clone(),
+        comm: task.comm,
+        stored_bp: None,
+    });
     let child_tid = task.tid;
 
-    // Wait for parent to write parent_tid if a start gate is present.
-    if let Some(gate) = start_gate {
-        let _ = gate.lock();
-    }
-
     // Set the TLS for the platform itself
-    let litebox_tls = litebox_common_linux::ThreadLocalStorage::new(task);
-    litebox_platform_multiplex::platform().set_thread_local_storage(litebox_tls);
+    let litebox_tls = litebox_common_linux::ThreadLocalStorage::new(new_task);
+    litebox_platform_multiplex::Platform::set_thread_local_storage(litebox_tls);
 
     // Set the TLS for the guest program
     if let Some(tls) = tls {
@@ -337,9 +328,9 @@ fn new_thread_callback(
         }
     }
 
-    if let Some(set_child_tid) = set_child_tid {
+    if let Some(child_tid_ptr) = set_child_tid {
         // Set the child TID if requested
-        let _ = unsafe { set_child_tid.write_at_offset(0, child_tid) };
+        let _ = unsafe { child_tid_ptr.write_at_offset(0, child_tid) };
     }
 }
 
@@ -349,7 +340,7 @@ fn new_thread_callback(
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn sys_clone(
     flags: litebox_common_linux::CloneFlags,
-    parent_tid: Option<crate::MutPtr<u32>>,
+    parent_tid: Option<crate::MutPtr<i32>>,
     stack: Option<crate::MutPtr<u8>>,
     stack_size: usize,
     child_tid: Option<crate::MutPtr<i32>>,
@@ -389,15 +380,15 @@ pub(crate) fn sys_clone(
         unimplemented!("Clone with unsupported flags: {:?}", flags);
     }
 
-    let platform = litebox_platform_multiplex::platform();
-    let (credentials, pid, parent_proc_id, comm) = platform.with_thread_local_storage_mut(|tls| {
-        (
-            tls.current_task.credentials.clone(),
-            tls.current_task.pid,
-            tls.current_task.ppid,
-            tls.current_task.comm,
-        )
-    });
+    let (credentials, pid, parent_proc_id, comm) =
+        litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
+            (
+                tls.current_task.credentials.clone(),
+                tls.current_task.pid,
+                tls.current_task.ppid,
+                tls.current_task.comm,
+            )
+        });
 
     let set_child_tid = if flags.contains(CloneFlags::CHILD_SETTID) {
         child_tid
@@ -415,23 +406,15 @@ pub(crate) fn sys_clone(
         None
     };
 
-    // Create an optional `guard` when parent_tid and child_tid point to the same address.
-    // Clearing child_tid is always done after setting parent_tid, so this ensures these two
-    // operations occur in order if they are on the same address.
-    let start_gate = alloc::sync::Arc::new(crate::litebox().sync().new_mutex(()));
-    let start_gate_clone = start_gate.clone();
-    let guard = if let Some(parent_tid_ptr) = set_parent_tid
-        && let Some(child_tid_ptr) = clear_child_tid
-        && parent_tid_ptr.as_usize() == child_tid_ptr.as_usize()
-    {
-        // Lock the mutex before creating the thread, so that the new thread will block on it
-        // until `guard` is dropped.
-        Some(start_gate.lock())
-    } else {
-        None
-    };
+    let platform = litebox_platform_multiplex::platform();
+    let child_tid = LITEBOX_PROCESS
+        .thread_id_counter
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if let Some(parent_tid_ptr) = set_parent_tid {
+        let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid) };
+    }
 
-    let child_tid = unsafe {
+    unsafe {
         platform.spawn_thread(
             ctx,
             stack.expect("Stack pointer is required for thread creation"),
@@ -440,40 +423,31 @@ pub(crate) fn sys_clone(
             Box::new(litebox_common_linux::NewThreadArgs {
                 tls,
                 set_child_tid,
-                start_gate: if guard.is_some() {
-                    Some(start_gate_clone)
-                } else {
-                    None
-                },
                 task: Box::new(litebox_common_linux::Task {
                     pid,
-                    tid: 0, // The actual TID will be set by the platform
+                    tid: child_tid,
                     ppid: parent_proc_id,
                     clear_child_tid,
                     robust_list: None,
                     credentials,
                     comm,
+                    stored_bp: None,
                 }),
                 callback: new_thread_callback,
             }),
         )
     }?;
-    if let Some(parent_tid_ptr) = set_parent_tid {
-        let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid.truncate()) };
-    }
-    // After parent_tid is set, we can drop the guard to let the new thread proceed.
-    drop(guard);
 
     LITEBOX_PROCESS
         .nr_threads
         .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    Ok(child_tid)
+    Ok(usize::try_from(child_tid).unwrap())
 }
 
 /// Handle syscall `set_tid_address`.
 pub(crate) fn sys_set_tid_address(tidptr: crate::MutPtr<i32>) -> i32 {
     unsafe {
-        litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| {
+        litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
             tls.current_task.clear_child_tid = Some(tidptr);
             tls.current_task.tid
         })
@@ -483,8 +457,9 @@ pub(crate) fn sys_set_tid_address(tidptr: crate::MutPtr<i32>) -> i32 {
 /// Handle syscall `gettid`.
 pub(crate) fn sys_gettid() -> i32 {
     unsafe {
-        litebox_platform_multiplex::platform()
-            .with_thread_local_storage_mut(|tls| tls.current_task.tid)
+        litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
+            tls.current_task.tid
+        })
     }
 }
 
@@ -648,7 +623,7 @@ pub(crate) fn sys_setrlimit(
 /// Handle syscall `set_robust_list`.
 pub(crate) fn sys_set_robust_list(head: usize) {
     let head = crate::ConstPtr::from_usize(head);
-    litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| {
+    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
         tls.current_task.robust_list = Some(head);
     });
 }
@@ -661,7 +636,7 @@ pub(crate) fn sys_get_robust_list(
     if pid.is_some() {
         unimplemented!("Getting robust list for a specific PID is not supported yet");
     }
-    let head = litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| {
+    let head = litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
         tls.current_task.robust_list.map_or(0, |ptr| ptr.as_usize())
     });
     unsafe { head_ptr.write_at_offset(0, head) }.ok_or(Errno::EFAULT)
@@ -741,7 +716,7 @@ pub(crate) fn sys_clock_nanosleep(
         if request <= now {
             return Ok(());
         }
-        request - now
+        request.checked_sub(now).unwrap()
     } else {
         request
     };
@@ -796,36 +771,39 @@ pub(crate) fn sys_time(
 
 /// Handle syscall `getpid`.
 pub(crate) fn sys_getpid() -> i32 {
-    litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| tls.current_task.pid)
+    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| tls.current_task.pid)
 }
 
 pub(crate) fn sys_getppid() -> i32 {
-    litebox_platform_multiplex::platform()
-        .with_thread_local_storage_mut(|tls| tls.current_task.ppid)
+    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| tls.current_task.ppid)
 }
 
 /// Handle syscall `getuid`.
 pub(crate) fn sys_getuid() -> usize {
-    litebox_platform_multiplex::platform()
-        .with_thread_local_storage_mut(|tls| tls.current_task.credentials.uid)
+    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
+        tls.current_task.credentials.uid
+    })
 }
 
 /// Handle syscall `geteuid`.
 pub(crate) fn sys_geteuid() -> usize {
-    litebox_platform_multiplex::platform()
-        .with_thread_local_storage_mut(|tls| tls.current_task.credentials.euid)
+    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
+        tls.current_task.credentials.euid
+    })
 }
 
 /// Handle syscall `getgid`.
 pub(crate) fn sys_getgid() -> usize {
-    litebox_platform_multiplex::platform()
-        .with_thread_local_storage_mut(|tls| tls.current_task.credentials.gid)
+    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
+        tls.current_task.credentials.gid
+    })
 }
 
 /// Handle syscall `getegid`.
 pub(crate) fn sys_getegid() -> usize {
-    litebox_platform_multiplex::platform()
-        .with_thread_local_storage_mut(|tls| tls.current_task.credentials.egid)
+    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
+        tls.current_task.credentials.egid
+    })
 }
 
 /// Number of CPUs
@@ -935,7 +913,7 @@ pub type ExecveCallback = fn(
     path: &str,
     argv: alloc::vec::Vec<alloc::ffi::CString>,
     envp: alloc::vec::Vec<alloc::ffi::CString>,
-) -> Result<(), Errno>;
+);
 static EXECVE_CALLBACK: once_cell::race::OnceBox<ExecveCallback> = once_cell::race::OnceBox::new();
 
 /// Set the execve callback, which is responsible for loading and jumping to the new program.
@@ -1013,7 +991,7 @@ pub(crate) fn sys_execve(
     crate::file_descriptors().write().close_on_exec();
 
     // unmmap all memory mappings and reset brk
-    litebox_platform_multiplex::platform().with_thread_local_storage_mut(|tls| {
+    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
         tls.current_task.robust_list = None;
 
         if let Some(robust_list) = tls.current_task.robust_list.take() {
@@ -1061,13 +1039,13 @@ pub(crate) fn sys_execve(
         let page_manager = crate::litebox_page_manager();
         unsafe { page_manager.release_memory(release) }.expect("failed to release memory mappings");
     });
-    litebox_platform_multiplex::platform().clear_guest_thread_local_storage();
+    litebox_platform_multiplex::Platform::clear_guest_thread_local_storage();
 
     let callback = EXECVE_CALLBACK.get().expect("execve callback is not set");
     // if `execve` fails, it is unrecoverable at this point as we have already unmapped everything.
     // TODO: add some basic checks before we unmap everything
-    callback(path, argv_vec, envp_vec).expect("we already released memory above");
-    unreachable!("execve callback must not return on success");
+    callback(path, argv_vec, envp_vec);
+    Ok(())
 }
 
 /// Handle syscall `alarm`.
@@ -1109,17 +1087,13 @@ pub(crate) fn sys_tgkill(
 
 #[cfg(test)]
 mod tests {
-    use core::mem::MaybeUninit;
-
-    use litebox::{mm::linux::PAGE_SIZE, platform::RawConstPointer as _, utils::TruncateExt as _};
-    use litebox_common_linux::{CloneFlags, MapFlags, ProtFlags};
-
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_arch_prctl() {
         use super::sys_arch_prctl;
         use crate::{MutPtr, syscalls::tests::init_platform};
         use core::mem::MaybeUninit;
+        use litebox::platform::RawConstPointer;
         use litebox_common_linux::ArchPrctlArg;
 
         init_platform(None);
@@ -1151,248 +1125,6 @@ mod tests {
         // Restore old FS base
         let ptr: crate::MutPtr<u8> = crate::MutPtr::from_usize(old_fs_base);
         sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize())).expect("Failed to restore FS base");
-    }
-
-    // Initialize a static TLS area with value `1`. This value is later on used to verify that
-    // the TLS is set up correctly.
-    static mut TLS: [u8; PAGE_SIZE] = [1; PAGE_SIZE];
-    static mut CHILD_TID: i32 = 0;
-    static mut PARENT_PID: i32 = 0;
-
-    /// Create an aligned entry point for the new thread.
-    ///
-    /// The stack pointer at the entry of the new thread is 16-byte aligned, but x86_64 ABI expects
-    /// RSP % 16 == 8 at normal function entry (because the CALL pushed a return address). Similarly,
-    /// x86 ABI expects ESP % 16 == 12 on function entry.
-    /// We only need to do this if we want to pass a Rust function to `sys_clone`.
-    macro_rules! make_aligned_entry {
-        ($wrapper:ident, $target:path) => {
-            #[cfg(target_arch = "x86_64")]
-            #[unsafe(no_mangle)]
-            #[unsafe(naked)]
-            pub extern "C" fn $wrapper() -> ! {
-                unsafe {
-                    core::arch::naked_asm!(
-                        "and rsp, -16",  // make it 16-byte aligned
-                        "call {func}",
-                        func = sym $target,
-                    )
-                }
-            }
-            #[cfg(target_arch = "x86")]
-            #[unsafe(no_mangle)]
-            #[unsafe(naked)]
-            pub extern "C" fn $wrapper() -> ! {
-                unsafe {
-                    core::arch::naked_asm!(
-                        "and esp, -16",  // make it 16-byte aligned
-                        "call {func}",
-                        func = sym $target,
-                    )
-                }
-            }
-        };
-    }
-
-    #[unsafe(no_mangle)]
-    extern "C" fn new_thread_main_test() -> ! {
-        let tid = super::sys_gettid();
-        litebox::log_println!(
-            litebox_platform_multiplex::platform(),
-            "Child started {}",
-            tid
-        );
-
-        assert_eq!(
-            unsafe { PARENT_PID },
-            super::sys_getppid(),
-            "Parent PID should match"
-        );
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            let mut current_fs_base = MaybeUninit::<usize>::uninit();
-            super::sys_arch_prctl(litebox_common_linux::ArchPrctlArg::GetFs(crate::MutPtr {
-                inner: current_fs_base.as_mut_ptr(),
-            }))
-            .expect("Failed to get FS base");
-            #[allow(static_mut_refs)]
-            let addr = unsafe { TLS.as_ptr() } as usize;
-            assert_eq!(
-                addr,
-                unsafe { current_fs_base.assume_init() },
-                "FS base should match TLS pointer"
-            );
-
-            // Check the TLS value from FS base
-            let mut fs_0: u8;
-            unsafe {
-                core::arch::asm!("mov {0}, fs:0", out(reg_byte) fs_0);
-            }
-            // Verify that the TLS value is initialized to its correct value (`1`).
-            assert_eq!(
-                fs_0, 0x1,
-                "TLS value from FS base should match the initialized value"
-            );
-        }
-
-        assert!(unsafe { CHILD_TID } > 0, "Child TID should be set");
-        assert_eq!(
-            unsafe { CHILD_TID },
-            tid,
-            "Child TID should match sys_gettid result"
-        );
-        litebox::log_println!(
-            litebox_platform_multiplex::platform(),
-            "Child TID: {}",
-            unsafe { CHILD_TID }
-        );
-        super::sys_exit(0);
-    }
-
-    #[test]
-    #[ignore = "Will add this test back after supporting std::spawn"]
-    fn test_thread_spawn() {
-        crate::syscalls::tests::init_platform(None);
-
-        let stack_size = 8 * 1024 * 1024; // 8 MiB
-        let stack = crate::syscalls::mm::sys_mmap(
-            0,
-            stack_size,
-            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-        .expect("Failed to allocate stack");
-
-        let mut parent_tid = MaybeUninit::<u32>::uninit();
-        let parent_tid_ptr = crate::MutPtr {
-            inner: parent_tid.as_mut_ptr(),
-        };
-
-        #[allow(static_mut_refs)]
-        let child_tid_ptr = crate::MutPtr {
-            inner: &raw mut CHILD_TID,
-        };
-
-        let flags = CloneFlags::THREAD
-            | CloneFlags::VM
-            | CloneFlags::FS
-            | CloneFlags::FILES
-            | CloneFlags::SIGHAND
-            | CloneFlags::PARENT_SETTID
-            | CloneFlags::CHILD_SETTID
-            | CloneFlags::CHILD_CLEARTID
-            | CloneFlags::SYSVSEM;
-
-        // Call sys_clone
-        #[cfg(target_arch = "x86_64")]
-        let pt_regs = litebox_common_linux::PtRegs {
-            r15: 0,
-            r14: 0,
-            r13: 0,
-            r12: 0,
-            rbp: 0,
-            rbx: 0,
-            r11: 0,
-            r10: 0,
-            r9: 0,
-            r8: 0,
-            rax: 0,
-            rcx: 0,
-            rdx: 0,
-            rsi: 0,
-            rdi: 0,
-            orig_rax: syscalls::Sysno::clone3 as usize,
-            rip: 0,
-            cs: 0x33, // __USER_CS
-            eflags: 0,
-            rsp: 0,
-            ss: 0x2b, // __USER_DS
-        };
-        #[cfg(target_arch = "x86")]
-        let pt_regs = litebox_common_linux::PtRegs {
-            ebx: 0,
-            ecx: 0,
-            edx: 0,
-            esi: 0,
-            edi: 0,
-            ebp: 0,
-            eax: 0,
-            xds: 0,
-            xes: 0,
-            xfs: 0,
-            xgs: 0,
-            orig_eax: syscalls::Sysno::clone3 as usize,
-            eip: 0,
-            xcs: 0x23, // __USER_CS
-            eflags: 0,
-            esp: 0,
-            xss: 0x2b, // __USER_DS
-        };
-        litebox::log_println!(
-            litebox_platform_multiplex::platform(),
-            "stack allocated at: {:#x}",
-            stack.as_usize()
-        );
-        unsafe { PARENT_PID = super::sys_getppid() };
-
-        #[cfg(target_arch = "x86")]
-        let mut user_desc = {
-            let mut flags = litebox_common_linux::UserDescFlags(0);
-            flags.set_seg_32bit(true);
-            flags.set_useable(true);
-            litebox_common_linux::UserDesc {
-                entry_number: u32::MAX,
-                #[allow(static_mut_refs)]
-                base_addr: unsafe { TLS.as_mut_ptr() } as u32,
-                limit: u32::try_from(core::mem::size_of::<
-                    litebox_common_linux::ThreadLocalStorage<litebox_platform_multiplex::Platform>,
-                >())
-                .unwrap()
-                    - 1,
-                flags,
-            }
-        };
-
-        make_aligned_entry!(main_wrapper, new_thread_main_test);
-        let child_tid = super::sys_clone(
-            flags,
-            Some(parent_tid_ptr),
-            Some(stack),
-            stack_size,
-            Some(child_tid_ptr),
-            Some(crate::MutPtr {
-                #[cfg(target_arch = "x86_64")]
-                #[allow(static_mut_refs)]
-                inner: unsafe { TLS.as_mut_ptr() },
-                #[cfg(target_arch = "x86")]
-                inner: &raw mut user_desc,
-            }),
-            &pt_regs,
-            main_wrapper as usize,
-        )
-        .expect("sys_clone failed");
-        litebox::log_println!(
-            litebox_platform_multiplex::platform(),
-            "sys_clone returned: {}",
-            child_tid
-        );
-        assert_eq!(
-            unsafe { parent_tid.assume_init() } as usize,
-            child_tid,
-            "Child's TID mismatch"
-        );
-        // Test if CloneFlags::CHILD_CLEARTID works: child thread should clear it and wake up one thread
-        // that is waiting on it.
-        let futex_ptr = crate::MutPtr::from_usize(child_tid_ptr.as_usize());
-        let _ = super::sys_futex(litebox_common_linux::FutexArgs::Wait {
-            addr: futex_ptr,
-            flags: litebox_common_linux::FutexFlags::PRIVATE,
-            val: child_tid.truncate(),
-            timeout: None,
-        });
     }
 
     #[test]

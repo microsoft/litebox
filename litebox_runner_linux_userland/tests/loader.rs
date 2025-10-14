@@ -10,41 +10,6 @@ use litebox::{
 use litebox_platform_multiplex::{Platform, set_platform};
 use litebox_shim_linux::{litebox_fs, loader::load_program, set_fs};
 
-#[cfg(target_arch = "x86_64")]
-std::arch::global_asm!(
-    "
-    .text
-    .align	4
-    .globl	trampoline
-    .type	trampoline,@function
-trampoline:
-    xor rdx, rdx
-    mov	rsp, rsi
-    jmp	rdi
-    /* Should not reach. */
-    hlt"
-);
-#[cfg(target_arch = "x86")]
-std::arch::global_asm!(
-    "
-    .text
-    .align  4
-    .globl  trampoline
-    .type   trampoline,@function
-trampoline:
-    xor     edx, edx
-    mov     ebx, [esp + 4]
-    mov     eax, [esp + 8]
-    mov     esp, eax
-    jmp     ebx
-    /* Should not reach. */
-    hlt"
-);
-
-unsafe extern "C" {
-    fn trampoline(entry: usize, sp: usize) -> !;
-}
-
 fn init_platform(
     tar_data: &'static [u8],
     initial_dirs: &[&str],
@@ -141,10 +106,51 @@ fn test_load_exec_common(executable_path: &str) {
         }
     }
     let info = load_program(executable_path, argv, envp, aux).unwrap();
-
-    litebox_common_linux::swap_fsgs();
-
-    unsafe { trampoline(info.entry_point, info.user_stack_top) };
+    #[cfg(target_arch = "x86_64")]
+    let pt_regs = litebox_common_linux::PtRegs {
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        rbp: 0,
+        rbx: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rax: 0,
+        rcx: 0,
+        rdx: 0,
+        rsi: 0,
+        rdi: 0,
+        orig_rax: 0,
+        rip: info.entry_point,
+        cs: 0x33, // __USER_CS
+        eflags: 0,
+        rsp: info.user_stack_top,
+        ss: 0x2b, // __USER_DS
+    };
+    #[cfg(target_arch = "x86")]
+    let pt_regs = litebox_common_linux::PtRegs {
+        ebx: 0,
+        ecx: 0,
+        edx: 0,
+        esi: 0,
+        edi: 0,
+        ebp: 0,
+        eax: 0,
+        xds: 0,
+        xes: 0,
+        xfs: 0,
+        xgs: 0,
+        orig_eax: 0,
+        eip: info.entry_point,
+        xcs: 0x23, // __USER_CS
+        eflags: 0,
+        esp: info.user_stack_top,
+        xss: 0x2b, // __USER_DS
+    };
+    unsafe { litebox_platform_linux_userland::thread_start_asm(&pt_regs) };
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -165,7 +171,7 @@ fn test_load_exec_dynamic() {
             .map(std::string::String::as_str)
             .collect::<Vec<_>>(),
         None,
-        true,
+        false,
     );
     install_file(executable_data, executable_path);
     test_load_exec_common(executable_path);
@@ -179,7 +185,7 @@ fn test_load_exec_static() {
     let executable_path = "/hello_exec";
     let executable_data = std::fs::read(path).unwrap();
 
-    init_platform(&[], &[], &[], None, true);
+    init_platform(&[], &[], &[], None, false);
 
     install_file(executable_data, executable_path);
 

@@ -5,6 +5,7 @@ edition = "2024"
 
 
 [dependencies]
+cfg-if = "1.0.0"
 bitflags = "2.9.0"
 buddy_system_allocator = { version = "0.11.0", default-features = false, features = ["use_spin"] }
 slabmalloc = { git = "https://github.com/gz/rust-slabmalloc.git", rev = "19480b2e82704210abafe575fb9699184c1be110" }
@@ -40,7 +41,9 @@ aligned-vec = { version = "0.6.4", default-features = false }
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
 
 [features]
-default = []
+default = ["optee_syscall"]
+optee_syscall = []
+linux_syscall = []
 interrupt = ["x86_64/abi_x86_interrupt"]
 
 [lints]
