@@ -586,10 +586,11 @@ pub(crate) fn sys_socket(
             };
             let socket = litebox_net().lock().socket(protocol)?;
             initialize_socket(&socket, ty, flags);
-            let mut rds = crate::raw_descriptor_store().write();
-            let raw_fd = rds.fd_into_raw_integer(socket);
-            drop(rds);
-            Descriptor::Socket(raw_fd)
+            Descriptor::LiteBoxRawFd(
+                crate::raw_descriptor_store()
+                    .write()
+                    .fd_into_raw_integer(socket),
+            )
         }
         AddressFamily::UNIX => todo!(),
         AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
@@ -681,20 +682,24 @@ pub(crate) fn sys_accept(
     let file_table = file_descriptors().read();
     let socket = file_table.get_fd(sockfd).ok_or(Errno::EBADF)?;
     let file = match socket {
-        Descriptor::Socket(socket) => {
-            let socket = *socket;
-            // drop file table as `accept` may block
-            drop(file_table);
-            let fd = accept(&*get_socket_fd(socket)?)?;
-            let sock_type = get_socket_type(&*get_socket_fd(socket)?)?;
-            initialize_socket(&fd, sock_type, flags);
-            let mut rds = crate::raw_descriptor_store().write();
-            let raw_fd = rds.fd_into_raw_integer(fd);
-            drop(rds);
-            Descriptor::Socket(raw_fd)
-        }
+        Descriptor::LiteBoxRawFd(raw_fd) => crate::run_on_raw_fd(
+            *raw_fd,
+            |fd| Err(Errno::ENOTSOCK),
+            |fd| {
+                let sock_type = get_socket_type(fd)?;
+                let fd = accept(fd)?;
+                initialize_socket(&fd, sock_type, flags);
+                Ok(Descriptor::LiteBoxRawFd(
+                    crate::raw_descriptor_store()
+                        .write()
+                        .fd_into_raw_integer(fd),
+                ))
+            },
+        )
+        .flatten()?,
         _ => return Err(Errno::ENOTSOCK),
     };
+    drop(file_table);
     file_descriptors().write().insert(file).map_err(|desc| {
         crate::syscalls::file::do_close(desc).expect("closing descriptor should succeed");
         Errno::EMFILE
@@ -708,10 +713,15 @@ pub(crate) fn sys_connect(fd: i32, sockaddr: SocketAddress) -> Result<(), Errno>
     };
 
     match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
-        Descriptor::Socket(socket) => {
-            let SocketAddress::Inet(addr) = sockaddr;
-            connect(&*get_socket_fd(*socket)?, addr)
-        }
+        Descriptor::LiteBoxRawFd(raw_fd) => crate::run_on_raw_fd(
+            *raw_fd,
+            |fd| Err(Errno::ENOTSOCK),
+            |fd| {
+                let SocketAddress::Inet(addr) = sockaddr;
+                connect(fd, addr)
+            },
+        )
+        .flatten(),
         _ => Err(Errno::ENOTSOCK),
     }
 }
@@ -727,10 +737,15 @@ pub(crate) fn sys_bind(sockfd: i32, sockaddr: SocketAddress) -> Result<(), Errno
         .get_fd(sockfd)
         .ok_or(Errno::EBADF)?
     {
-        Descriptor::Socket(socket) => {
-            let SocketAddress::Inet(addr) = sockaddr;
-            bind(&*get_socket_fd(*socket)?, addr)
-        }
+        Descriptor::LiteBoxRawFd(raw_fd) => crate::run_on_raw_fd(
+            *raw_fd,
+            |fd| Err(Errno::ENOTSOCK),
+            |fd| {
+                let SocketAddress::Inet(addr) = sockaddr;
+                bind(fd, addr)
+            },
+        )
+        .flatten(),
         _ => Err(Errno::ENOTSOCK),
     }
 }
@@ -746,7 +761,10 @@ pub(crate) fn sys_listen(sockfd: i32, backlog: u16) -> Result<(), Errno> {
         .get_fd(sockfd)
         .ok_or(Errno::EBADF)?
     {
-        Descriptor::Socket(socket) => listen(&*get_socket_fd(*socket)?, backlog),
+        Descriptor::LiteBoxRawFd(raw_fd) => {
+            crate::run_on_raw_fd(*raw_fd, |fd| Err(Errno::ENOTSOCK), |fd| listen(fd, backlog))
+                .flatten()
+        }
         _ => Err(Errno::ENOTSOCK),
     }
 }
@@ -767,17 +785,18 @@ pub(crate) fn sys_sendto(
     let file_table = file_descriptors().read();
     let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
     match socket {
-        Descriptor::Socket(socket) => {
-            let socket = *socket;
-            // drop file table as `sendto` may block
-            drop(file_table);
-            sendto(
-                &*get_socket_fd(socket)?,
-                &buf,
-                flags,
-                sockaddr.map(|SocketAddress::Inet(addr)| addr),
-            )
-        }
+        Descriptor::LiteBoxRawFd(raw_fd) => crate::run_on_raw_fd(
+            *raw_fd,
+            |fd| Err(Errno::ENOTSOCK),
+            |fd| {
+                if get_status(fd).contains(OFlags::NONBLOCK) {
+                    flags.insert(SendFlags::DONTWAIT);
+                }
+                let sockaddr = sockaddr.map(|SocketAddress::Inet(addr)| addr);
+                sendto(fd, &buf, flags, sockaddr)
+            },
+        )
+        .flatten(),
         _ => Err(Errno::ENOTSOCK),
     }
 }
@@ -795,31 +814,32 @@ pub(crate) fn sys_recvfrom(
     };
 
     let file_table = file_descriptors().read();
-    let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
-    match socket {
-        Descriptor::Socket(socket) => {
-            let socket = *socket;
-            // drop file table as `receive` may block
-            drop(file_table);
-            let mut buffer: [u8; 4096] = [0; 4096];
-            let mut addr = None;
-            let size = receive(
-                &*get_socket_fd(socket)?,
-                &mut buffer,
-                flags,
-                if source_addr.is_some() {
-                    Some(&mut addr)
-                } else {
-                    None
-                },
-            )?;
-            if let Some(source_addr) = source_addr {
-                *source_addr = addr.map(SocketAddress::Inet);
-            }
-            buf.copy_from_slice(0, &buffer[..size])
-                .ok_or(Errno::EFAULT)?;
-            Ok(size)
-        }
+    match file_table.get_fd(fd).ok_or(Errno::EBADF)? {
+        Descriptor::LiteBoxRawFd(raw_fd) => crate::run_on_raw_fd(
+            *raw_fd,
+            |fd| Err(Errno::ENOTSOCK),
+            |fd| {
+                let mut buffer: [u8; 4096] = [0; 4096];
+                let mut addr = None;
+                let size = receive(
+                    fd,
+                    &mut buffer,
+                    flags,
+                    if source_addr.is_some() {
+                        Some(&mut addr)
+                    } else {
+                        None
+                    },
+                )?;
+                if let Some(source_addr) = source_addr {
+                    *source_addr = addr.map(SocketAddress::Inet);
+                }
+                buf.copy_from_slice(0, &buffer[..size])
+                    .ok_or(Errno::EFAULT)?;
+                Ok(size)
+            },
+        )
+        .flatten(),
         _ => Err(Errno::ENOTSOCK),
     }
 }
@@ -839,9 +859,12 @@ pub(crate) fn sys_setsockopt(
         .get_fd(sockfd)
         .ok_or(Errno::EBADF)?
     {
-        Descriptor::Socket(socket) => {
-            setsockopt(&*get_socket_fd(*socket)?, optname, optval, optlen)
-        }
+        Descriptor::LiteBoxRawFd(raw_fd) => crate::run_on_raw_fd(
+            *raw_fd,
+            |fd| Err(Errno::ENOTSOCK),
+            |fd| setsockopt(fd, optname, optval, optlen),
+        )
+        .flatten(),
         _ => Err(Errno::ENOTSOCK),
     }
 }
@@ -862,9 +885,12 @@ pub(crate) fn sys_getsockopt(
         .get_fd(sockfd)
         .ok_or(Errno::EBADF)?
     {
-        Descriptor::Socket(socket) => {
-            getsockopt(&*get_socket_fd(*socket)?, optname, optval, optlen)
-        }
+        Descriptor::LiteBoxRawFd(raw_fd) => crate::run_on_raw_fd(
+            *raw_fd,
+            |fd| Err(Errno::ENOTSOCK),
+            |fd| getsockopt(fd, optname, optval, optlen),
+        )
+        .flatten(),
         _ => Err(Errno::ENOTSOCK),
     }
 }
@@ -880,10 +906,12 @@ pub(crate) fn sys_getsockname(sockfd: i32) -> Result<SocketAddr, Errno> {
         .get_fd(sockfd)
         .ok_or(Errno::EBADF)?
     {
-        Descriptor::Socket(socket) => litebox_net()
-            .lock()
-            .get_local_addr(&*get_socket_fd(*socket)?)
-            .map_err(Errno::from),
+        Descriptor::LiteBoxRawFd(raw_fd) => crate::run_on_raw_fd(
+            *raw_fd,
+            |fd| Err(Errno::ENOTSOCK),
+            |fd| litebox_net().lock().get_local_addr(fd).map_err(Errno::from),
+        )
+        .flatten(),
         _ => Err(Errno::ENOTSOCK),
     }
 }

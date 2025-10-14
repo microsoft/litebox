@@ -201,21 +201,27 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
     let file_table = file_descriptors().read();
     let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
     match desc {
-        Descriptor::LiteBoxRawFd(raw_fd) => crate::run_on_raw_fd(
-            *raw_fd,
-            |fd| litebox_fs().read(fd, buf, offset).map_err(Errno::from),
-            |fd| todo!("net"),
-        )
-        .flatten(),
-        Descriptor::Socket(socket) => {
-            let raw_fd = *socket;
-            drop(file_table);
-            super::net::receive(
-                &*super::net::get_socket_fd(raw_fd)?,
-                buf,
-                litebox_common_linux::ReceiveFlags::empty(),
-                None,
+        Descriptor::LiteBoxRawFd(raw_fd) => {
+            // We need to do this cell dance because otherwise Rust can't recognize that the two
+            // closures are mutually exclusive.
+            let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
+            crate::run_on_raw_fd(
+                *raw_fd,
+                |fd| {
+                    litebox_fs()
+                        .read(fd, &mut buf.borrow_mut(), offset)
+                        .map_err(Errno::from)
+                },
+                |fd| {
+                    super::net::receive(
+                        fd,
+                        &mut buf.borrow_mut(),
+                        litebox_common_linux::ReceiveFlags::empty(),
+                        None,
+                    )
+                },
             )
+            .flatten()
         }
         Descriptor::PipeReader { consumer, .. } => {
             let consumer = consumer.clone();
@@ -250,19 +256,9 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
         Descriptor::LiteBoxRawFd(raw_fd) => crate::run_on_raw_fd(
             *raw_fd,
             |fd| litebox_fs().write(fd, buf, offset).map_err(Errno::from),
-            |fd| todo!("net"),
+            |fd| super::net::sendto(fd, buf, litebox_common_linux::SendFlags::empty(), None),
         )
         .flatten(),
-        Descriptor::Socket(socket) => {
-            let raw_fd = *socket;
-            drop(file_table);
-            super::net::sendto(
-                &*super::net::get_socket_fd(raw_fd)?,
-                buf,
-                litebox_common_linux::SendFlags::empty(),
-                None,
-            )
-        }
         Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
         Descriptor::PipeWriter { producer, .. } => {
             let producer = producer.clone();
@@ -321,8 +317,7 @@ pub fn sys_lseek(fd: i32, offset: isize, whence: SeekWhence) -> Result<usize, Er
             |_| Err(Errno::ESPIPE),
         )
         .flatten(),
-        Descriptor::Socket(..)
-        | Descriptor::PipeReader { .. }
+        Descriptor::PipeReader { .. }
         | Descriptor::Epoll { .. }
         | Descriptor::PipeWriter { .. }
         | Descriptor::Eventfd { .. } => Err(Errno::ESPIPE),
@@ -363,7 +358,6 @@ pub(crate) fn do_close(desc: Descriptor) -> Result<(), Errno> {
                 }
             }
         }
-        Descriptor::Socket(socket) => Ok(()), // The actual close happens when the socket is dropped
         Descriptor::PipeReader { .. }
         | Descriptor::PipeWriter { .. }
         | Descriptor::Eventfd { .. }
@@ -425,7 +419,6 @@ pub fn sys_readv(
                 |fd| todo!("net"),
             )
             .flatten()?,
-            Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { consumer, .. } => todo!(),
             Descriptor::PipeWriter { .. } | Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
             Descriptor::Eventfd { file, .. } => todo!(),
@@ -475,6 +468,9 @@ pub fn sys_writev(
         unsafe { &iovec.to_cow_slice(iovcnt).ok_or(Errno::EFAULT)? };
     let locked_file_descriptors = file_descriptors().read();
     let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
+    // TODO: The data transfers performed by readv() and writev() are atomic: the data
+    // written by writev() is written as a single block that is not intermingled with
+    // output from writes in other processes
     match desc {
         Descriptor::LiteBoxRawFd(raw_fd) => crate::run_on_raw_fd(
             *raw_fd,
@@ -483,24 +479,13 @@ pub fn sys_writev(
                     litebox_fs().write(fd, buf, None).map_err(Errno::from)
                 })
             },
-            |fd| todo!("net"),
+            |fd| {
+                write_to_iovec(iovs, |buf: &[u8]| {
+                    super::net::sendto(fd, buf, litebox_common_linux::SendFlags::empty(), None)
+                })
+            },
         )
         .flatten(),
-        // TODO: The data transfers performed by readv() and writev() are atomic: the data
-        // written by writev() is written as a single block that is not intermingled with
-        // output from writes in other processes
-        Descriptor::Socket(socket) => {
-            let raw_fd = *socket;
-            drop(locked_file_descriptors);
-            write_to_iovec(iovs, |buf: &[u8]| {
-                super::net::sendto(
-                    &*super::net::get_socket_fd(raw_fd)?,
-                    buf,
-                    litebox_common_linux::SendFlags::empty(),
-                    None,
-                )
-            })
-        }
         Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
         Descriptor::PipeWriter { producer, .. } => todo!(),
         Descriptor::Eventfd { file, .. } => todo!(),
@@ -592,7 +577,6 @@ impl Descriptor {
                 |fd| todo!("net"),
             )
             .flatten()?,
-            Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { .. } => FileStat {
                 // TODO: give correct values
                 st_dev: 0,
@@ -671,7 +655,6 @@ impl Descriptor {
             )
             // TODO: We need to expose an errno up here somewhere
             .unwrap(),
-            Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { close_on_exec, .. }
             | Descriptor::PipeWriter { close_on_exec, .. }
             | Descriptor::Eventfd { close_on_exec, .. }
@@ -777,7 +760,6 @@ pub(crate) fn sys_fcntl(
                     },
                     |fd| todo!("net"),
                 )?,
-                Descriptor::Socket(socket) => todo!(),
                 Descriptor::PipeReader { close_on_exec, .. }
                 | Descriptor::PipeWriter { close_on_exec, .. }
                 | Descriptor::Eventfd { close_on_exec, .. }
@@ -804,7 +786,6 @@ pub(crate) fn sys_fcntl(
                 },
                 |fd| todo!("net"),
             ),
-            Descriptor::Socket(socket) => todo!(),
             Descriptor::PipeReader { consumer, .. } => Ok(consumer.get_status().bits()),
             Descriptor::PipeWriter { producer, .. } => Ok(producer.get_status().bits()),
             Descriptor::Eventfd { file, .. } => Ok(file.get_status().bits()),
@@ -845,7 +826,7 @@ pub(crate) fn sys_fcntl(
                     },
                     |fd| todo!("net"),
                 )?,
-                Descriptor::Socket(socket) => todo!(),
+
                 Descriptor::PipeReader { consumer, .. } => {
                     toggle_flags!(consumer);
                 }
@@ -1038,7 +1019,7 @@ pub fn sys_ioctl(
                     "Attempted to set non-blocking on raw fd; currently unimplemented"
                 );
             }
-            Descriptor::Socket(socket) => todo!(),
+
             Descriptor::PipeReader { consumer, .. } => {
                 consumer.set_status(OFlags::NONBLOCK, val != 0);
             }
@@ -1104,7 +1085,6 @@ pub fn sys_ioctl(
             },
             |fd| todo!("net"),
         )?,
-        Descriptor::Socket(socket) => todo!(),
         Descriptor::PipeReader {
             consumer,
             close_on_exec,

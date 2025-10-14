@@ -286,7 +286,6 @@ impl Descriptors {
 
 enum Descriptor {
     LiteBoxRawFd(usize),
-    Socket(usize),
     PipeReader {
         consumer: alloc::sync::Arc<litebox::pipes::ReadEnd<Platform, u8>>,
         close_on_exec: core::sync::atomic::AtomicBool,
