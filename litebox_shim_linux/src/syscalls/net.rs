@@ -4,7 +4,6 @@
 /// descriptor.  See #120.
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
-use alloc::sync::Arc;
 use litebox::{
     fs::OFlags,
     net::TcpOptionData,
@@ -99,19 +98,6 @@ struct SocketOptions {
     /// until all queued messages for the socket have been
     /// successfully sent or the timeout has been reached.
     linger_timeout: Option<core::time::Duration>,
-}
-
-// XXX(jayb) Temporarily `pub(crate)`, should move away from this before the PR is merged.
-pub(crate) fn get_socket_fd(raw_fd: usize) -> Result<Arc<SocketFd>, Errno> {
-    match crate::raw_descriptor_store()
-        .read()
-        .fd_from_raw_integer(raw_fd)
-    {
-        Ok(fd) => Ok(fd),
-        Err(litebox::fd::ErrRawIntFd::NotFound | litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
-            Err(Errno::EBADF)
-        }
-    }
 }
 
 struct SocketOFlags(OFlags);
