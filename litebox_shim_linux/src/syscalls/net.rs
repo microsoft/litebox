@@ -134,20 +134,17 @@ fn initialize_socket(raw_fd: usize, sock_type: SockType, flags: SockFlags) {
     assert!(old.is_none());
 }
 
-fn with_socket_options<R>(fd: &SocketFd, f: impl FnOnce(&SocketOptions) -> R) -> Result<R, Errno> {
-    Ok(litebox()
+fn with_socket_options<R>(fd: &SocketFd, f: impl FnOnce(&SocketOptions) -> R) -> R {
+    litebox()
         .descriptor_table()
         .with_metadata(fd, |opt| f(opt))
-        .unwrap())
+        .unwrap()
 }
-fn with_socket_options_mut<R>(
-    fd: &SocketFd,
-    f: impl FnOnce(&mut SocketOptions) -> R,
-) -> Result<R, Errno> {
-    Ok(litebox()
+fn with_socket_options_mut<R>(fd: &SocketFd, f: impl FnOnce(&mut SocketOptions) -> R) -> R {
+    litebox()
         .descriptor_table_mut()
         .with_metadata_mut(fd, |opt| f(opt))
-        .unwrap())
+        .unwrap()
 }
 
 fn setsockopt(
@@ -178,15 +175,15 @@ fn setsockopt(
                 SocketOption::RCVTIMEO => {
                     let duration = read_timeval_as_duration(optval)?;
                     with_socket_options_mut(&*get_socket_fd(raw_fd)?, |opt| {
-                        opt.recv_timeout = duration
-                    })?;
+                        opt.recv_timeout = duration;
+                    });
                     return Ok(());
                 }
                 SocketOption::SNDTIMEO => {
                     let duration = read_timeval_as_duration(optval)?;
                     with_socket_options_mut(&*get_socket_fd(raw_fd)?, |opt| {
-                        opt.send_timeout = duration
-                    })?;
+                        opt.send_timeout = duration;
+                    });
                     return Ok(());
                 }
                 SocketOption::LINGER => {
@@ -215,8 +212,8 @@ fn setsockopt(
             match so {
                 SocketOption::REUSEADDR => {
                     with_socket_options_mut(&*get_socket_fd(raw_fd)?, |opt| {
-                        opt.reuse_address = val != 0
-                    })?;
+                        opt.reuse_address = val != 0;
+                    });
                 }
                 SocketOption::BROADCAST => {
                     if val == 0 {
@@ -244,8 +241,8 @@ fn setsockopt(
                         }
                     }
                     with_socket_options_mut(&*get_socket_fd(raw_fd)?, |opt| {
-                        opt.keep_alive = keep_alive
-                    })?;
+                        opt.keep_alive = keep_alive;
+                    });
                 }
                 // We use fixed buffer size for now
                 SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
@@ -318,7 +315,7 @@ fn getsockopt(
                         SocketOption::SNDTIMEO => options.send_timeout,
                         SocketOption::LINGER => options.linger_timeout,
                         _ => unreachable!(),
-                    })?
+                    })
                     .map_or_else(
                         litebox_common_linux::TimeVal::default,
                         litebox_common_linux::TimeVal::from,
@@ -335,11 +332,11 @@ fn getsockopt(
                     let val = match sopt {
                         SocketOption::TYPE => get_socket_type(fd)? as u32,
                         SocketOption::REUSEADDR => {
-                            u32::from(with_socket_options(fd, |o| o.reuse_address)?)
+                            u32::from(with_socket_options(fd, |o| o.reuse_address))
                         }
                         SocketOption::BROADCAST => 1, // TODO: We don't support disabling SO_BROADCAST
                         SocketOption::KEEPALIVE => {
-                            u32::from(with_socket_options(fd, |o| o.keep_alive)?)
+                            u32::from(with_socket_options(fd, |o| o.keep_alive))
                         }
                         SocketOption::RCVBUF | SocketOption::SNDBUF => {
                             litebox::net::SOCKET_BUFFER_SIZE.truncate()
@@ -362,7 +359,7 @@ fn getsockopt(
                 TcpOption::KEEPINTVL => {
                     let TcpOptionData::KEEPALIVE(interval) = litebox_net()
                         .lock()
-                        .get_tcp_option(&fd, litebox::net::TcpOptionName::KEEPALIVE)?
+                        .get_tcp_option(fd, litebox::net::TcpOptionName::KEEPALIVE)?
                     else {
                         unreachable!()
                     };
@@ -371,7 +368,7 @@ fn getsockopt(
                 TcpOption::NODELAY | TcpOption::CORK => {
                     let TcpOptionData::NODELAY(nodelay) = litebox_net()
                         .lock()
-                        .get_tcp_option(&fd, litebox::net::TcpOptionName::NODELAY)?
+                        .get_tcp_option(fd, litebox::net::TcpOptionName::NODELAY)?
                     else {
                         unreachable!()
                     };
@@ -477,7 +474,7 @@ pub(crate) fn sendto(
     {
         try_sendto(raw_fd, buf, new_flags, sockaddr)
     } else {
-        let timeout = with_socket_options(&*get_socket_fd(raw_fd)?, |opt| opt.send_timeout)?;
+        let timeout = with_socket_options(&*get_socket_fd(raw_fd)?, |opt| opt.send_timeout);
         if timeout.is_some() {
             todo!("send timeout");
         }
@@ -499,7 +496,7 @@ fn try_receive(
     flags: litebox::net::ReceiveFlags,
     source_addr: Option<&mut Option<SocketAddr>>,
 ) -> Result<usize, Errno> {
-    let n = litebox_net().lock().receive(&fd, buf, flags, source_addr)?;
+    let n = litebox_net().lock().receive(fd, buf, flags, source_addr)?;
     if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
 }
 
@@ -538,7 +535,7 @@ pub(crate) fn receive(
     if get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(ReceiveFlags::DONTWAIT) {
         try_receive(fd, buf, new_flags, source_addr)
     } else {
-        let timeout = with_socket_options(fd, |opt| opt.recv_timeout)?;
+        let timeout = with_socket_options(fd, |opt| opt.recv_timeout);
         if timeout.is_some() {
             todo!("recv timeout");
         }
