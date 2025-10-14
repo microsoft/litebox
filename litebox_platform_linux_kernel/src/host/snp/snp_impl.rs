@@ -3,8 +3,8 @@ use ::alloc::boxed::Box;
 use core::arch::asm;
 
 use litebox::{
-    platform::{RawConstPointer, RawMutPointer, RawPointerProvider},
-    utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt as _},
+    platform::{RawConstPointer, RawMutPointer},
+    utils::ReinterpretUnsignedExt as _,
 };
 use litebox_common_linux::{CloneFlags, SigSet, SigmaskHow};
 
@@ -133,10 +133,8 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
 core::arch::global_asm!(include_str!("entry.S"));
 
 struct ThreadStartArgs {
-    entry_point: usize,
-    stack_top: usize,
-    parent_ctx: litebox_common_linux::PtRegs,
-    thread_args: Box<litebox_common_linux::NewThreadArgs<SnpLinuxKernel>>,
+    ctx: litebox_common_linux::PtRegs,
+    init_thread: Box<dyn litebox::platform::InitThread>,
 }
 
 const RIP_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs, rip);
@@ -148,27 +146,14 @@ const EFLAGS_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs,
 /// Arguments should be set up by host.
 #[unsafe(no_mangle)]
 extern "C" fn thread_start(
-    pt_regs: *mut litebox_common_linux::PtRegs,
-    args: *mut ThreadStartArgs,
+    regs: &mut litebox_common_linux::PtRegs,
+    thread_start_args: Box<ThreadStartArgs>,
 ) -> ! {
-    // SAFETY: The arg pointer is guaranteed to be valid and point to a ThreadStartArgs
-    // that was created via Box::into_raw in spawn_thread.
-    let mut thread_start_args = unsafe { Box::from_raw(args) };
-
-    // SAFETY: The pt_regs pointer is guaranteed to be valid and point to a PtRegs
-    // on the stack (by host).
-    let regs = unsafe { &mut *pt_regs };
-    // Host should set `rax` to child's TID
-    thread_start_args.thread_args.task.tid = regs.rax.reinterpret_as_signed().truncate();
-    // Child's pt_regs should have the same registers as parent's except rax, rip, and rsp.
-    *regs = thread_start_args.parent_ctx;
-    regs.rax = 0;
-    regs.rip = thread_start_args.entry_point;
-    regs.rsp = thread_start_args.stack_top;
+    *regs = thread_start_args.ctx;
 
     // Set up thread-local storage for the new thread. This is done by
     // calling the actual thread callback with the unpacked arguments
-    (thread_start_args.thread_args.callback)(*thread_start_args.thread_args);
+    thread_start_args.init_thread.init();
 
     // Restore the context
     unsafe {
@@ -194,7 +179,7 @@ extern "C" fn thread_start(
             "mov     rsp, [rsp + 0x20]",   /* original rsp */
             "swapgs",
             "sysretq",
-            in(reg) pt_regs,
+            in(reg) regs,
             rip_off = const RIP_OFFSET,
             eflags_off = const EFLAGS_OFFSET,
         );
@@ -204,18 +189,13 @@ extern "C" fn thread_start(
 
 impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     type ExecutionContext = litebox_common_linux::PtRegs;
-    type ThreadArgs = litebox_common_linux::NewThreadArgs<SnpLinuxKernel>;
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
-    type ThreadId = usize;
 
     unsafe fn spawn_thread(
         &self,
         ctx: &Self::ExecutionContext,
-        stack: <Self as RawPointerProvider>::RawMutPointer<u8>,
-        stack_size: usize,
-        entry_point: usize,
-        thread_args: Box<Self::ThreadArgs>,
-    ) -> Result<Self::ThreadId, Self::ThreadSpawnError> {
+        init_thread: Box<dyn litebox::platform::InitThread>,
+    ) -> Result<(), Self::ThreadSpawnError> {
         let flags = CloneFlags::THREAD
             | CloneFlags::VM
             | CloneFlags::FS
@@ -224,10 +204,8 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
             | CloneFlags::SYSVSEM
             | CloneFlags::CHILD_SETTID;
         let thread_start_args = Box::new(ThreadStartArgs {
-            entry_point,
-            stack_top: stack.as_usize() + stack_size,
-            parent_ctx: *ctx,
-            thread_args,
+            ctx: *ctx,
+            init_thread,
         });
         let thread_start_arg_ptr = Box::into_raw(thread_start_args);
         // Note this is different from the usual clone3 syscall as we have a driver running
@@ -235,7 +213,8 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
         // The first argument will be placed into the new thread's RSI register (i.e. the second argument).
         HostSnpInterface::syscalls(SyscallN::<2, NR_SYSCALL_CLONE3> {
             args: [thread_start_arg_ptr as u64, flags.bits()],
-        })
+        })?;
+        Ok(())
     }
 }
 
