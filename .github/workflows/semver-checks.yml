@@ -3,6 +3,11 @@ name: SemverChecks
 # Run on pull requests, merge groups, or if triggered manually
 on: [pull_request, merge_group, workflow_dispatch]
 
+# If a new commit is pushed to the branch before ongoing runs finish, cancel the ongoing runs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: write
