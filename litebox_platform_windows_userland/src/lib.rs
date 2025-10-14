@@ -345,12 +345,10 @@ unsafe extern "C" {
     ///
     /// 1. Saves all general-purpose registers, flags, and other CPU state onto the stack
     ///    in a layout that matches the `PtRegs` structure.
-    /// 2. Captures the current stack pointer (RSP/ESP) and frame pointer (RBP/EBP).
+    /// 2. Captures the current frame pointer (RBP/EBP).
     /// 3. Calls `thread_start_internal` with:
     ///    - `ctx`: A reference to the provided `PtRegs` structure (passed in RDI/stack)
     ///    - `frame_pointer`: The captured frame pointer value
-    /// 4. After `thread_start_internal` returns, restores all saved registers and returns
-    ///    to the caller.
     ///
     /// ## Stack Layout Coordination with `syscall_callback`
     ///
