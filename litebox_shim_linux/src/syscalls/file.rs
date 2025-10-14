@@ -210,7 +210,12 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
         Descriptor::Socket(socket) => {
             let raw_fd = *socket;
             drop(file_table);
-            super::net::receive(raw_fd, buf, litebox_common_linux::ReceiveFlags::empty(), None)
+            super::net::receive(
+                &*super::net::get_socket_fd(raw_fd)?,
+                buf,
+                litebox_common_linux::ReceiveFlags::empty(),
+                None,
+            )
         }
         Descriptor::PipeReader { consumer, .. } => {
             let consumer = consumer.clone();

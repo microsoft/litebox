@@ -101,7 +101,8 @@ struct SocketOptions {
     linger_timeout: Option<core::time::Duration>,
 }
 
-fn get_socket_fd(raw_fd: usize) -> Result<Arc<SocketFd>, Errno> {
+// XXX(jayb) Temporarily `pub(crate)`, should move away from this before the PR is merged.
+pub(crate) fn get_socket_fd(raw_fd: usize) -> Result<Arc<SocketFd>, Errno> {
     match crate::raw_descriptor_store()
         .read()
         .fd_from_raw_integer(raw_fd)
@@ -111,17 +112,6 @@ fn get_socket_fd(raw_fd: usize) -> Result<Arc<SocketFd>, Errno> {
             Err(Errno::EBADF)
         }
     }
-}
-
-fn get_socket_type(raw_fd: usize) -> Result<SockType, Errno> {
-    let fd = get_socket_fd(raw_fd)?;
-    crate::litebox()
-        .descriptor_table()
-        .with_metadata(&fd, |sock_type: &SockType| *sock_type)
-        .map_err(|e| match e {
-            litebox::fd::MetadataError::NoSuchMetadata => Errno::ENOTSOCK,
-            litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
-        })
 }
 
 struct SocketOFlags(OFlags);
@@ -144,21 +134,19 @@ fn initialize_socket(raw_fd: usize, sock_type: SockType, flags: SockFlags) {
     assert!(old.is_none());
 }
 
-fn with_socket_options<R>(raw_fd: usize, f: impl FnOnce(&SocketOptions) -> R) -> Result<R, Errno> {
-    let fd = get_socket_fd(raw_fd)?;
+fn with_socket_options<R>(fd: &SocketFd, f: impl FnOnce(&SocketOptions) -> R) -> Result<R, Errno> {
     Ok(litebox()
         .descriptor_table()
-        .with_metadata(&fd, |opt| f(opt))
+        .with_metadata(fd, |opt| f(opt))
         .unwrap())
 }
 fn with_socket_options_mut<R>(
-    raw_fd: usize,
+    fd: &SocketFd,
     f: impl FnOnce(&mut SocketOptions) -> R,
 ) -> Result<R, Errno> {
-    let fd = get_socket_fd(raw_fd)?;
     Ok(litebox()
         .descriptor_table_mut()
-        .with_metadata_mut(&fd, |opt| f(opt))
+        .with_metadata_mut(fd, |opt| f(opt))
         .unwrap())
 }
 
@@ -189,12 +177,16 @@ fn setsockopt(
             match so {
                 SocketOption::RCVTIMEO => {
                     let duration = read_timeval_as_duration(optval)?;
-                    with_socket_options_mut(raw_fd, |opt| opt.recv_timeout = duration)?;
+                    with_socket_options_mut(&*get_socket_fd(raw_fd)?, |opt| {
+                        opt.recv_timeout = duration
+                    })?;
                     return Ok(());
                 }
                 SocketOption::SNDTIMEO => {
                     let duration = read_timeval_as_duration(optval)?;
-                    with_socket_options_mut(raw_fd, |opt| opt.send_timeout = duration)?;
+                    with_socket_options_mut(&*get_socket_fd(raw_fd)?, |opt| {
+                        opt.send_timeout = duration
+                    })?;
                     return Ok(());
                 }
                 SocketOption::LINGER => {
@@ -222,7 +214,9 @@ fn setsockopt(
                 .into_owned();
             match so {
                 SocketOption::REUSEADDR => {
-                    with_socket_options_mut(raw_fd, |opt| opt.reuse_address = val != 0)?;
+                    with_socket_options_mut(&*get_socket_fd(raw_fd)?, |opt| {
+                        opt.reuse_address = val != 0
+                    })?;
                 }
                 SocketOption::BROADCAST => {
                     if val == 0 {
@@ -249,7 +243,9 @@ fn setsockopt(
                             _ => unimplemented!(),
                         }
                     }
-                    with_socket_options_mut(raw_fd, |opt| opt.keep_alive = keep_alive)?;
+                    with_socket_options_mut(&*get_socket_fd(raw_fd)?, |opt| {
+                        opt.keep_alive = keep_alive
+                    })?;
                 }
                 // We use fixed buffer size for now
                 SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
@@ -301,7 +297,7 @@ fn setsockopt(
 }
 
 fn getsockopt(
-    raw_fd: usize,
+    fd: &SocketFd,
     optname: SocketOptionName,
     optval: MutPtr<u8>,
     optlen: MutPtr<u32>,
@@ -317,7 +313,7 @@ fn getsockopt(
         SocketOptionName::Socket(sopt) => {
             match sopt {
                 SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER => {
-                    let tv = with_socket_options(raw_fd, |options| match sopt {
+                    let tv = with_socket_options(fd, |options| match sopt {
                         SocketOption::RCVTIMEO => options.recv_timeout,
                         SocketOption::SNDTIMEO => options.send_timeout,
                         SocketOption::LINGER => options.linger_timeout,
@@ -337,13 +333,13 @@ fn getsockopt(
                 }
                 _ => {
                     let val = match sopt {
-                        SocketOption::TYPE => get_socket_type(raw_fd)? as u32,
+                        SocketOption::TYPE => get_socket_type(fd)? as u32,
                         SocketOption::REUSEADDR => {
-                            u32::from(with_socket_options(raw_fd, |o| o.reuse_address)?)
+                            u32::from(with_socket_options(fd, |o| o.reuse_address)?)
                         }
                         SocketOption::BROADCAST => 1, // TODO: We don't support disabling SO_BROADCAST
                         SocketOption::KEEPALIVE => {
-                            u32::from(with_socket_options(raw_fd, |o| o.keep_alive)?)
+                            u32::from(with_socket_options(fd, |o| o.keep_alive)?)
                         }
                         SocketOption::RCVBUF | SocketOption::SNDBUF => {
                             litebox::net::SOCKET_BUFFER_SIZE.truncate()
@@ -364,7 +360,6 @@ fn getsockopt(
         SocketOptionName::TCP(tcpopt) => {
             let val: u32 = match tcpopt {
                 TcpOption::KEEPINTVL => {
-                    let fd = get_socket_fd(raw_fd)?;
                     let TcpOptionData::KEEPALIVE(interval) = litebox_net()
                         .lock()
                         .get_tcp_option(&fd, litebox::net::TcpOptionName::KEEPALIVE)?
@@ -374,7 +369,6 @@ fn getsockopt(
                     interval.map_or(0, |d| d.as_secs().try_into().unwrap())
                 }
                 TcpOption::NODELAY | TcpOption::CORK => {
-                    let fd = get_socket_fd(raw_fd)?;
                     let TcpOptionData::NODELAY(nodelay) = litebox_net()
                         .lock()
                         .get_tcp_option(&fd, litebox::net::TcpOptionName::NODELAY)?
@@ -483,7 +477,7 @@ pub(crate) fn sendto(
     {
         try_sendto(raw_fd, buf, new_flags, sockaddr)
     } else {
-        let timeout = with_socket_options(raw_fd, |opt| opt.send_timeout)?;
+        let timeout = with_socket_options(&*get_socket_fd(raw_fd)?, |opt| opt.send_timeout)?;
         if timeout.is_some() {
             todo!("send timeout");
         }
@@ -500,18 +494,17 @@ pub(crate) fn sendto(
 }
 
 fn try_receive(
-    raw_fd: usize,
+    fd: &SocketFd,
     buf: &mut [u8],
     flags: litebox::net::ReceiveFlags,
     source_addr: Option<&mut Option<SocketAddr>>,
 ) -> Result<usize, Errno> {
-    let fd = get_socket_fd(raw_fd)?;
     let n = litebox_net().lock().receive(&fd, buf, flags, source_addr)?;
     if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
 }
 
 pub(crate) fn receive(
-    raw_fd: usize,
+    fd: &SocketFd,
     buf: &mut [u8],
     flags: ReceiveFlags,
     mut source_addr: Option<&mut Option<SocketAddr>>,
@@ -531,7 +524,7 @@ pub(crate) fn receive(
     );
     // `MSG_TRUNC` behavior depends on the socket type
     if flags.contains(ReceiveFlags::TRUNC) {
-        match get_socket_type(raw_fd)? {
+        match get_socket_type(fd)? {
             SockType::Datagram | SockType::Raw => {
                 new_flags.insert(litebox::net::ReceiveFlags::TRUNC);
             }
@@ -542,25 +535,33 @@ pub(crate) fn receive(
         }
     }
 
-    if get_status(&*get_socket_fd(raw_fd)?).contains(OFlags::NONBLOCK)
-        || flags.contains(ReceiveFlags::DONTWAIT)
-    {
-        try_receive(raw_fd, buf, new_flags, source_addr)
+    if get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(ReceiveFlags::DONTWAIT) {
+        try_receive(fd, buf, new_flags, source_addr)
     } else {
-        let timeout = with_socket_options(raw_fd, |opt| opt.recv_timeout)?;
+        let timeout = with_socket_options(fd, |opt| opt.recv_timeout)?;
         if timeout.is_some() {
             todo!("recv timeout");
         }
 
         // TODO: use `poll` instead of busy wait
         loop {
-            match try_receive(raw_fd, buf, new_flags, source_addr.as_deref_mut()) {
+            match try_receive(fd, buf, new_flags, source_addr.as_deref_mut()) {
                 Err(Errno::EAGAIN) => {}
                 ret => return ret,
             }
             core::hint::spin_loop();
         }
     }
+}
+
+fn get_socket_type(fd: &SocketFd) -> Result<SockType, Errno> {
+    crate::litebox()
+        .descriptor_table()
+        .with_metadata(fd, |sock_type: &SockType| *sock_type)
+        .map_err(|e| match e {
+            litebox::fd::MetadataError::NoSuchMetadata => Errno::ENOTSOCK,
+            litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
+        })
 }
 
 fn get_status(fd: &SocketFd) -> litebox::fs::OFlags {
@@ -701,7 +702,7 @@ pub(crate) fn sys_accept(
             let mut rds = crate::raw_descriptor_store().write();
             let raw_fd = rds.fd_into_raw_integer(fd);
             drop(rds);
-            let sock_type = get_socket_type(socket)?;
+            let sock_type = get_socket_type(&*get_socket_fd(socket)?)?;
             initialize_socket(raw_fd, sock_type, flags);
             Descriptor::Socket(raw_fd)
         }
@@ -816,7 +817,7 @@ pub(crate) fn sys_recvfrom(
             let mut buffer: [u8; 4096] = [0; 4096];
             let mut addr = None;
             let size = receive(
-                socket,
+                &*get_socket_fd(socket)?,
                 &mut buffer,
                 flags,
                 if source_addr.is_some() {
@@ -872,7 +873,9 @@ pub(crate) fn sys_getsockopt(
         .get_fd(sockfd)
         .ok_or(Errno::EBADF)?
     {
-        Descriptor::Socket(socket) => getsockopt(*socket, optname, optval, optlen),
+        Descriptor::Socket(socket) => {
+            getsockopt(&*get_socket_fd(*socket)?, optname, optval, optlen)
+        }
         _ => Err(Errno::ENOTSOCK),
     }
 }
