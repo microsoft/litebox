@@ -262,11 +262,8 @@ mod tests {
         sys_close(fd).unwrap();
     }
 
-    // `mremap` is not implemented for freebsd/windows yet.
-    #[cfg(not(any(
-        feature = "platform_freebsd_userland",
-        feature = "platform_windows_userland"
-    )))]
+    // `mremap` is not implemented for windows yet.
+    #[cfg(not(any(feature = "platform_windows_userland")))]
     #[test]
     fn test_mremap() {
         init_platform(None);
