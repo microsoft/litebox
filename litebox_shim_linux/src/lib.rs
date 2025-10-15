@@ -899,6 +899,11 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> ContinueOper
                     .ok_or(Errno::EFAULT)
             }
         }
+        SyscallRequest::SchedYield => {
+            // Do nothing until we have more scheduler integration with the
+            // platform.
+            Ok(0)
+        }
         SyscallRequest::Futex { args } => syscalls::process::sys_futex(args),
         SyscallRequest::Umask { mask } => {
             let old_mask = syscalls::file::sys_umask(mask);

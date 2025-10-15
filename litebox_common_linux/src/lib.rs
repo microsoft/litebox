@@ -2171,6 +2171,7 @@ pub enum SyscallRequest<'a, Platform: litebox::platform::RawPointerProvider> {
         len: usize,
         mask: Platform::RawMutPointer<u8>,
     },
+    SchedYield,
     Futex {
         args: FutexArgs<Platform>,
     },
@@ -2704,6 +2705,7 @@ impl<'a, Platform: litebox::platform::RawPointerProvider> SyscallRequest<'a, Pla
                     mask: ctx.sys_req_ptr(2),
                 }
             }
+            Sysno::sched_yield => SyscallRequest::SchedYield,
             Sysno::futex => {
                 let addr = ctx.sys_req_ptr(0);
                 let op: i32 = ctx.sys_req_arg(1);
