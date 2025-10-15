@@ -1,6 +1,5 @@
 use anyhow::Result;
 use clap::Parser;
-use litebox::platform::ThreadLocalStorageProvider;
 use litebox::utils::ReinterpretUnsignedExt;
 use litebox_common_optee::UteeEntryFunc;
 use litebox_platform_multiplex::Platform;
@@ -101,8 +100,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let loaded_program = litebox_shim_optee::loader::load_elf_buffer(prog_data.as_slice()).unwrap();
 
     // Currently, this runner supports a single TA session. Also, for simplicity,
-    // it uses `tid` stored in LiteBox's TLS as a session ID.
+    // it uses `tid` as a session ID.
     let session_id = platform.init_task().tid.reinterpret_as_unsigned();
+    litebox_shim_optee::set_session_id(session_id);
 
     assert!(
         register_session_id_elf_load_info(session_id, loaded_program),

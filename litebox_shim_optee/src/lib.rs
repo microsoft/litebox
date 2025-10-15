@@ -829,3 +829,11 @@ pub(crate) fn tee_cryp_state_map() -> &'static TeeCrypStateMap {
     static TEE_CRYPT_STATE_MAP: OnceBox<TeeCrypStateMap> = OnceBox::new();
     TEE_CRYPT_STATE_MAP.get_or_init(|| alloc::boxed::Box::new(TeeCrypStateMap::new()))
 }
+
+#[cfg(feature = "platform_linux_userland")]
+pub fn set_session_id(session_id: u32) {
+    SESSION_ID.store(session_id, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "platform_linux_userland")]
+static SESSION_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
