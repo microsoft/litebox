@@ -698,7 +698,7 @@ pub(crate) fn sys_getsockname(sockfd: i32) -> Result<SocketAddr, Errno> {
         Descriptor::Socket(socket) => {
             let litebox_net = litebox_net();
             let net = litebox_net.lock();
-            Ok(net.get_local_addr(socket.fd.as_ref().unwrap()))
+            Ok(net.get_local_addr(socket.fd.as_ref().unwrap())?)
         }
         _ => Err(Errno::ENOTSOCK),
     }
