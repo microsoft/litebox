@@ -144,7 +144,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let platform = Platform::new();
     litebox_platform_multiplex::set_platform(platform);
-    let litebox = litebox_shim_linux::litebox();
+    let litebox = litebox_shim_linux::init_process(platform.init_task());
     let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0]))?;
     let prog_unix_path = windows_path_to_unix(&prog);
     let initial_file_system = {

@@ -1,6 +1,7 @@
 //! Auxiliary vector support.
 
-use litebox::platform::{SystemInfoProvider as _, ThreadLocalStorageProvider as _};
+use crate::with_current_task_mut;
+use litebox::platform::SystemInfoProvider as _;
 
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -67,9 +68,7 @@ pub type AuxVec = alloc::collections::btree_map::BTreeMap<AuxKey, usize>;
 pub fn init_auxv() -> AuxVec {
     let mut aux = AuxVec::new();
 
-    let user_info = litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
-        (*tls.current_task.credentials).clone()
-    });
+    let user_info = with_current_task_mut(|task| (*task.credentials).clone());
     aux.insert(AuxKey::AT_UID, user_info.uid);
     aux.insert(AuxKey::AT_EUID, user_info.euid);
     aux.insert(AuxKey::AT_GID, user_info.gid);

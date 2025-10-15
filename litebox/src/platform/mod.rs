@@ -5,6 +5,7 @@
 //! other crates that implement them upon various types.
 
 pub mod page_mgmt;
+pub mod tls;
 pub mod trivial_providers;
 
 #[cfg(test)]
@@ -621,35 +622,34 @@ pub trait SystemInfoProvider {
 }
 
 /// A provider for thread-local storage.
+///
+/// Currently, this provides just a single thread-local storage pointer. Shims
+/// should use [`shim_thread_local!`](crate::shim_thread_local) macro for a safe
+/// and ergonomic interface to TLS.
 pub trait ThreadLocalStorageProvider {
-    type ThreadLocalStorage;
+    /// Gets the current thread-local storage pointer.
+    //
+    // DEVNOTE: note that this does not take `&self`. So far, this has not been
+    // a problem for platform implementations, and allowing this does improve
+    // performance by avoiding a platform lookup on every TLS access. But we
+    // could consider changing this in the future if needed.
+    fn get_thread_local_storage() -> *mut ();
 
-    /// Set a thread-local storage value for the current thread.
+    /// Replaces the current thread-local storage pointer with `value`,
+    /// returning the previous value.
     ///
-    /// # Panics
+    /// # Safety
+    /// The caller must cooperate with other users of this function to ensure
+    /// that the TLS pointer is not replaced with an invalid pointer.
     ///
-    /// Panics if TLS is set already.
-    fn set_thread_local_storage(value: Self::ThreadLocalStorage);
-
-    /// Invokes the provided callback function with the thread-local storage value for the current thread.
-    ///
-    /// # Panics
-    ///
-    /// Panics if TLS is not set yet.
-    fn with_thread_local_storage_mut<F, R>(f: F) -> R
-    where
-        F: FnOnce(&mut Self::ThreadLocalStorage) -> R;
-
-    /// Release the thread-local storage value for the current thread
-    ///
-    /// # Panics
-    ///
-    /// Panics if TLS is not set yet.
-    /// Panics if TLS is being used by [`Self::with_thread_local_storage_mut`].
-    fn release_thread_local_storage() -> Self::ThreadLocalStorage;
+    /// This can be achieved by using
+    /// [`shim_thread_local!`](crate::shim_thread_local).
+    unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut ();
 
     /// Clear any guest thread-local storage state for the current thread.
     ///
     /// This is used to help emulate certain syscalls (e.g., `execve`) that clear TLS.
+    ///
+    /// TODO: move this to a separate trait or eliminate.
     fn clear_guest_thread_local_storage();
 }

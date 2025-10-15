@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 // platform-specific things within it.
 use once_cell::race::OnceBox;
 
+use core::cell::RefCell;
 use litebox::{
     LiteBox,
     fd::{ErrRawIntFd, TypedFd},
@@ -60,8 +61,25 @@ pub(crate) fn boot_time() -> &'static <Platform as litebox::platform::TimeProvid
         .expect("litebox() should have already been called before this point")
 }
 
+/// Initialize the shim to run a task with the given parameters.
+///
+/// Returns the global litebox object.
+pub fn init_process<'a>(task: litebox_common_linux::Task<Platform>) -> &'a LiteBox<Platform> {
+    // TODO: ensure this gets torn down even if the thread never runs. Consider
+    // a scoped execution model, e.g.
+    // ```
+    // litebox_shim_linux::run_process(task, |litebox| {
+    //     ...
+    // })
+    // ```
+    SHIM_TLS.init(LinuxShimTls {
+        current_task: RefCell::new(task),
+    });
+    litebox()
+}
+
 /// Get the global litebox object
-pub fn litebox<'a>() -> &'a LiteBox<Platform> {
+pub(crate) fn litebox<'a>() -> &'a LiteBox<Platform> {
     static LITEBOX: OnceBox<LiteBox<Platform>> = OnceBox::new();
     LITEBOX.get_or_init(|| {
         use litebox::platform::TimeProvider as _;
@@ -942,4 +960,16 @@ fn handle_clone_request(
                 ctx.get_ip(),
             )
         })
+}
+
+struct LinuxShimTls {
+    current_task: RefCell<litebox_common_linux::Task<Platform>>,
+}
+
+litebox::shim_thread_local! {
+    static SHIM_TLS: LinuxShimTls: Platform;
+}
+
+fn with_current_task_mut<R>(f: impl FnOnce(&mut litebox_common_linux::Task<Platform>) -> R) -> R {
+    SHIM_TLS.with(|tls| f(&mut tls.current_task.borrow_mut()))
 }

@@ -4,8 +4,6 @@
 // Linux, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
 
-use std::cell::RefCell;
-use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::SeqCst;
@@ -15,9 +13,10 @@ use litebox::fs::OFlags;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::trivial_providers::TransparentMutPtr;
-use litebox::platform::{ImmediatelyWokenUp, RawConstPointer, ThreadLocalStorageProvider};
+use litebox::platform::{ImmediatelyWokenUp, RawConstPointer};
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
+use std::cell::Cell;
 
 mod syscall_intercept;
 
@@ -174,7 +173,6 @@ impl LinuxUserland {
             reserved_pages,
             vdso_address,
         };
-        Self::set_init_tls();
         Box::leak(Box::new(platform))
     }
 
@@ -284,14 +282,16 @@ impl LinuxUserland {
         }
     }
 
-    fn set_init_tls() {
-        let tid =
-            unsafe { syscalls::syscall!(syscalls::Sysno::gettid) }.expect("Failed to get TID");
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panicking only on failures of documented linux contracts"
+    )]
+    pub fn init_task(&self) -> litebox_common_linux::Task<Self> {
+        let tid = unsafe { syscalls::raw_syscall!(syscalls::Sysno::gettid) };
         let tid: i32 = i32::try_from(tid).expect("tid should fit in i32");
-        let ppid =
-            unsafe { syscalls::syscall!(syscalls::Sysno::getppid) }.expect("Failed to get PPID");
+        let ppid = unsafe { syscalls::raw_syscall!(syscalls::Sysno::getppid) };
         let ppid: i32 = i32::try_from(ppid).expect("ppid should fit in i32");
-        let task = alloc::boxed::Box::new(litebox_common_linux::Task {
+        litebox_common_linux::Task {
             pid: tid,
             tid,
             ppid,
@@ -299,10 +299,7 @@ impl LinuxUserland {
             robust_list: None,
             credentials: alloc::sync::Arc::new(Self::get_user_info()),
             comm: [0; litebox_common_linux::TASK_COMM_LEN],
-            stored_bp: None,
-        });
-        let tls = litebox_common_linux::ThreadLocalStorage::new(task);
-        Self::set_thread_local_storage(tls);
+        }
     }
 }
 
@@ -525,9 +522,7 @@ pub unsafe extern "C" fn thread_start_internal(
     ctx: &litebox_common_linux::PtRegs,
     frame_pointer: usize,
 ) {
-    LinuxUserland::with_thread_local_storage_mut(|tls| {
-        tls.current_task.stored_bp = Some(frame_pointer);
-    });
+    STORED_BP.set(Some(frame_pointer));
 
     unsafe { swap_fsgs() };
 
@@ -1412,13 +1407,13 @@ impl litebox::mm::allocator::MemoryProvider for LinuxUserland {
     }
 }
 
+thread_local! {
+    static STORED_BP: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
+}
+
 #[unsafe(no_mangle)]
 unsafe extern "C" fn swap_bp(bp_to_swap: usize) -> usize {
-    LinuxUserland::with_thread_local_storage_mut(|tls| {
-        let bp = tls.current_task.stored_bp.unwrap();
-        tls.current_task.stored_bp = Some(bp_to_swap);
-        bp
-    })
+    STORED_BP.replace(Some(bp_to_swap)).unwrap()
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1727,36 +1722,17 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
 thread_local! {
     // Use `ManuallyDrop` for more efficient TLS accesses, since this is always
     // dropped manually before the thread exits.
-    static PLATFORM_TLS: RefCell<Option<ManuallyDrop<litebox_common_linux::ThreadLocalStorage<LinuxUserland>>>> = const { RefCell::new(None) };
+    static PLATFORM_TLS: Cell<*mut ()> = const { Cell::new(core::ptr::null_mut()) };
 }
 
 /// LinuxUserland platform's thread-local storage implementation.
 impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
-    type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<LinuxUserland>;
-
-    fn set_thread_local_storage(tls: Self::ThreadLocalStorage) {
-        PLATFORM_TLS.with_borrow_mut(|cell| {
-            assert!(cell.is_none(), "TLS is already set for this thread");
-            *cell = Some(ManuallyDrop::new(tls));
-        });
+    fn get_thread_local_storage() -> *mut () {
+        PLATFORM_TLS.get()
     }
 
-    fn release_thread_local_storage() -> Self::ThreadLocalStorage {
-        ManuallyDrop::into_inner(
-            PLATFORM_TLS
-                .take()
-                .expect("TLS must be set before releasing it"),
-        )
-    }
-
-    fn with_thread_local_storage_mut<F, R>(f: F) -> R
-    where
-        F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
-    {
-        PLATFORM_TLS.with_borrow_mut(|cell| {
-            let tls = cell.as_mut().expect("TLS must be set before accessing it");
-            f(tls)
-        })
+    unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
+        PLATFORM_TLS.replace(value)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1779,7 +1755,7 @@ mod tests {
     use core::sync::atomic::AtomicU32;
     use std::thread::sleep;
 
-    use litebox::platform::{RawMutex, ThreadLocalStorageProvider as _};
+    use litebox::platform::RawMutex;
 
     use crate::LinuxUserland;
     use litebox::platform::PageManagementProvider;
@@ -1817,19 +1793,5 @@ mod tests {
             assert!(page.end > page.start);
             prev = page.end;
         }
-    }
-
-    #[test]
-    fn test_tls() {
-        let _platform = LinuxUserland::new(None);
-        let tid = LinuxUserland::with_thread_local_storage_mut(|tls| {
-            tls.current_task.tid = 0x1234; // Change the task ID
-            tls.current_task.tid
-        });
-        let tls = LinuxUserland::release_thread_local_storage();
-        assert_eq!(
-            tls.current_task.tid, tid,
-            "TLS should have the correct task ID"
-        );
     }
 }

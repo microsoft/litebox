@@ -1216,11 +1216,6 @@ unsafe impl<Platform> Send for NewThreadArgs<Platform> where
 {
 }
 
-/// Struct for thread-local storage.
-pub struct ThreadLocalStorage<Platform: litebox::platform::RawPointerProvider> {
-    pub current_task: alloc::boxed::Box<Task<Platform>>,
-}
-
 /// Credentials of a process
 #[derive(Clone)]
 pub struct Credentials {
@@ -1228,12 +1223,6 @@ pub struct Credentials {
     pub euid: usize,
     pub gid: usize,
     pub egid: usize,
-}
-
-impl<Platform: litebox::platform::RawPointerProvider> ThreadLocalStorage<Platform> {
-    pub const fn new(task: alloc::boxed::Box<Task<Platform>>) -> Self {
-        Self { current_task: task }
-    }
 }
 
 /// Task command name length
@@ -1263,8 +1252,6 @@ pub struct Task<Platform: litebox::platform::RawPointerProvider> {
     pub credentials: alloc::sync::Arc<Credentials>,
     /// Command name (usually the executable name, excluding the path)
     pub comm: [u8; TASK_COMM_LEN],
-    /// Stored frame pointer for the thread
-    pub stored_bp: Option<usize>,
 }
 
 #[repr(C)]

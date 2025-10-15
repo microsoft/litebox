@@ -13,7 +13,7 @@ pub fn init_platform(tar_data: &'static [u8], initial_dirs: &[&str], initial_fil
     let platform = Platform::new();
     set_platform(platform);
     let platform = litebox_platform_multiplex::platform();
-    let litebox = litebox_shim_linux::litebox();
+    let litebox = litebox_shim_linux::init_process(platform.init_task());
 
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     in_mem_fs.with_root_privileges(|fs| {

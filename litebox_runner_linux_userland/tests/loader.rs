@@ -20,7 +20,7 @@ fn init_platform(
     let platform = Platform::new(tun_device_name);
     set_platform(platform);
     let platform = litebox_platform_multiplex::platform();
-    let litebox = litebox_shim_linux::litebox();
+    let litebox = litebox_shim_linux::init_process(platform.init_task());
 
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     in_mem_fs.with_root_privileges(|fs| {

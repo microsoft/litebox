@@ -1,10 +1,9 @@
 //! An implementation of [`HostInterface`] for SNP VMM
 use ::alloc::boxed::Box;
 use core::arch::asm;
-use core::cell::RefCell;
 
 use litebox::{
-    platform::{RawConstPointer, RawMutPointer, RawPointerProvider, ThreadLocalStorageProvider},
+    platform::{RawConstPointer, RawMutPointer, RawPointerProvider},
     utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{CloneFlags, SigSet, SigmaskHow};
@@ -92,8 +91,11 @@ fn current() -> Option<&'static mut bindings::vsbox_task> {
 }
 
 impl SnpLinuxKernel {
-    pub fn set_init_tls(boot_params: &bindings::vmpl2_boot_params) {
-        let task = ::alloc::boxed::Box::new(litebox_common_linux::Task {
+    pub fn init_task(
+        &self,
+        boot_params: &bindings::vmpl2_boot_params,
+    ) -> litebox_common_linux::Task<Self> {
+        litebox_common_linux::Task {
             pid: boot_params.pid,
             tid: boot_params.pid,
             ppid: boot_params.ppid,
@@ -106,42 +108,21 @@ impl SnpLinuxKernel {
                 egid: boot_params.egid as usize,
             }),
             comm: [0; litebox_common_linux::TASK_COMM_LEN],
-            stored_bp: None,
-        });
-        let tls = litebox_common_linux::ThreadLocalStorage::new(task);
-        Self::set_thread_local_storage(tls);
+        }
     }
 }
 
 impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
-    type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<SnpLinuxKernel>;
-
-    fn set_thread_local_storage(value: Self::ThreadLocalStorage) {
-        let current_task = current().expect("Current task must be available");
-        assert!(current_task.tls.is_null(), "TLS should not be set yet");
-        let tls = ::alloc::boxed::Box::new(RefCell::new(value));
-        current_task.tls = ::alloc::boxed::Box::into_raw(tls).cast();
+    fn get_thread_local_storage() -> *mut () {
+        current()
+            .expect("Current task must be available")
+            .tls
+            .cast()
     }
 
-    fn with_thread_local_storage_mut<F, R>(f: F) -> R
-    where
-        F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
-    {
+    unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
         let current_task = current().expect("Current task must be available");
-        assert!(!current_task.tls.is_null(), "TLS should be set");
-        let tls = unsafe { &*current_task.tls.cast::<RefCell<Self::ThreadLocalStorage>>() };
-        f(&mut tls.borrow_mut())
-    }
-
-    fn release_thread_local_storage() -> Self::ThreadLocalStorage {
-        let current_task = current().expect("Current task must be available");
-        assert!(!current_task.tls.is_null(), "TLS should be set");
-
-        let tls =
-            core::mem::take(&mut current_task.tls).cast::<RefCell<Self::ThreadLocalStorage>>();
-        let _ = unsafe { (*tls).borrow_mut() }; // ensure no one is borrowing it
-
-        unsafe { Box::from_raw(tls) }.into_inner()
+        core::mem::replace(&mut current_task.tls, value.cast()).cast()
     }
 
     fn clear_guest_thread_local_storage() {

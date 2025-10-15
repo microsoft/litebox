@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use litebox::platform::ThreadLocalStorageProvider;
+use litebox::utils::ReinterpretUnsignedExt;
 use litebox_common_optee::UteeEntryFunc;
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::{
@@ -101,11 +102,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     // Currently, this runner supports a single TA session. Also, for simplicity,
     // it uses `tid` stored in LiteBox's TLS as a session ID.
-    let tid = litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
-        tls.current_task.tid
-    });
-    #[allow(clippy::cast_sign_loss)]
-    let session_id = tid as u32;
+    let session_id = platform.init_task().tid.reinterpret_as_unsigned();
 
     assert!(
         register_session_id_elf_load_info(session_id, loaded_program),
