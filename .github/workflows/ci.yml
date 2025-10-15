@@ -159,16 +159,16 @@ jobs:
       - name: Set up Nextest
         uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --verbose --all-targets --all-features -p litebox_runner_linux_on_windows_userland
-      - run: cargo build --verbose -p litebox_runner_linux_on_windows_userland
-      - run: cargo nextest run --profile ci -p litebox_runner_linux_on_windows_userland
+      - run: cargo clippy --locked --verbose --all-targets --all-features -p litebox_runner_linux_on_windows_userland
+      - run: cargo build --locked --verbose -p litebox_runner_linux_on_windows_userland
+      - run: cargo nextest run --locked --profile ci -p litebox_runner_linux_on_windows_userland
       - run: |
-          cargo test --verbose --doc -p litebox_runner_linux_on_windows_userland
+          cargo test --locked --verbose --doc -p litebox_runner_linux_on_windows_userland
           # We need to run `cargo test --doc` separately because doc tests
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
-        run: cargo doc --verbose --no-deps --all-features --document-private-items -p litebox_runner_linux_on_windows_userland
+        run: cargo doc --locked --verbose --no-deps --all-features --document-private-items -p litebox_runner_linux_on_windows_userland
 
   build_and_test_snp:
     name: Build and Test SNP
@@ -289,4 +289,4 @@ jobs:
             -not -path './litebox_runner_snp/Cargo.toml' \
             -not -path './dev_tests/Cargo.toml' \
             -print0 | \
-              xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --target x86_64-unknown-none || exit 1; echo; echo'
+              xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --locked --target x86_64-unknown-none || exit 1; echo; echo'
