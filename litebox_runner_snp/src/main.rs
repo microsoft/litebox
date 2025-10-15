@@ -169,16 +169,13 @@ pub extern "C" fn sandbox_task_exit() {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn do_syscall_64(nr: u64, pt_regs: &mut litebox_common_linux::PtRegs) {
-    pt_regs.rax = match litebox_common_linux::SyscallRequest::try_from_raw(nr.truncate(), pt_regs) {
-        Ok(req) => match litebox_shim_linux::handle_syscall_request(req) {
-            ContinueOperation::ResumeGuest { return_value } => return_value,
-            ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
-                status.cast_unsigned() as usize
-            }
-        },
-        Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
-    };
+pub extern "C" fn do_syscall_64(pt_regs: &mut litebox_common_linux::PtRegs) {
+    match litebox_shim_linux::handle_syscall_request(pt_regs) {
+        ContinueOperation::ResumeGuest => {}
+        ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
+            pt_regs.rax = status.cast_unsigned() as usize;
+        }
+    }
 }
 
 /// This function is called on panic.

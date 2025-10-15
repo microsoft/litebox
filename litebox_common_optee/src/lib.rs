@@ -124,7 +124,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
 }
 
 pub enum ContinueOperation {
-    ResumeGuest { return_value: u32 },
+    ResumeGuest,
     ExitThread(usize),
     ExitProcess(usize),
 }

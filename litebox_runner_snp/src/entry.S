@@ -89,8 +89,7 @@ entry_SYSCALL_64:
     push    r14         /* pt_regs->r14 */
     push    r15         /* pt_regs->r15 */
 
-    mov     rdi, rax
-    mov     rsi, rsp
+    mov     rdi, rsp
     call    do_syscall_64
 
 swapgs_restore_regs_and_return_to_usermode:

@@ -75,9 +75,8 @@ thread_local! {
 }
 
 /// Connector to a shim-exposed syscall-handling interface.
-pub type SyscallHandler = fn(
-    litebox_common_linux::SyscallRequest<WindowsUserland>,
-) -> litebox_common_linux::ContinueOperation;
+pub type SyscallHandler =
+    fn(&mut litebox_common_linux::PtRegs) -> litebox_common_linux::ContinueOperation;
 
 /// The syscall handler passed down from the shim.
 static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
@@ -1262,39 +1261,18 @@ unsafe extern "C" {
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_handler(
-    syscall_number: usize,
-    ctx: *mut litebox_common_linux::PtRegs,
+    _syscall_number: usize,
+    ctx: &mut litebox_common_linux::PtRegs,
 ) -> bool {
-    // SAFETY: By the requirements of this function, it's safe to dereference a valid pointer to `PtRegs`.
-    let ctx = unsafe { &mut *ctx };
-
-    match litebox_common_linux::SyscallRequest::try_from_raw(syscall_number, ctx) {
-        Ok(d) => {
-            let syscall_handler: SyscallHandler = SYSCALL_HANDLER
-                .read()
-                .unwrap()
-                .expect("Should have run `register_syscall_handler` by now");
-            match syscall_handler(d) {
-                ContinueOperation::ResumeGuest { return_value } => {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        ctx.rax = return_value;
-                    }
-                    #[cfg(target_arch = "x86")]
-                    {
-                        ctx.eax = return_value;
-                    }
-                    true
-                }
-                ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
-                    ctx.rax = status.reinterpret_as_unsigned() as usize;
-                    false
-                }
-            }
-        }
-        Err(err) => {
-            ctx.rax = (err.as_neg() as isize).reinterpret_as_unsigned();
-            true
+    let syscall_handler: SyscallHandler = SYSCALL_HANDLER
+        .read()
+        .unwrap()
+        .expect("Should have run `register_syscall_handler` by now");
+    match syscall_handler(ctx) {
+        ContinueOperation::ResumeGuest => true,
+        ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
+            ctx.rax = status.reinterpret_as_unsigned() as usize;
+            false
         }
     }
 }

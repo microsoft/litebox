@@ -17,6 +17,7 @@ use litebox::{
     LiteBox,
     mm::{PageManager, linux::PAGE_SIZE},
     platform::{RawConstPointer as _, RawMutPointer as _},
+    utils::ReinterpretUnsignedExt,
 };
 use litebox_common_optee::{
     ContinueOperation, SyscallRequest, TeeAlgorithm, TeeAlgorithmClass, TeeAttributeType,
@@ -54,7 +55,16 @@ type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPoin
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> ContinueOperation {
+pub fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
+    let request = match SyscallRequest::<Platform>::try_from_raw(ctx.orig_rax, ctx) {
+        Ok(request) => request,
+        Err(err) => {
+            // TODO: this seems like the wrong kind of error for OPTEE.
+            ctx.rax = (err.as_neg() as isize).reinterpret_as_unsigned();
+            return ContinueOperation::ResumeGuest;
+        }
+    };
+
     if let SyscallRequest::Return { ret } = request {
         return ContinueOperation::ExitThread(syscalls::tee::sys_return(ret));
     }
@@ -224,12 +234,11 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> ContinueOper
         _ => todo!(),
     };
 
-    ContinueOperation::ResumeGuest {
-        return_value: match res {
-            Ok(()) => TeeResult::Success.into(),
-            Err(e) => e.into(),
-        },
-    }
+    ctx.rax = match res {
+        Ok(()) => u32::from(TeeResult::Success),
+        Err(e) => e.into(),
+    } as usize;
+    ContinueOperation::ResumeGuest
 }
 
 #[inline]
