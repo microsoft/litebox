@@ -84,6 +84,7 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
                     .ok_or(Errno::EFAULT)
             }
             PunchthroughSyscall::Alarm { seconds: _ } => todo!(),
+            PunchthroughSyscall::SetITimer { .. } => todo!(),
         };
         match r {
             Ok(v) => Ok(v),

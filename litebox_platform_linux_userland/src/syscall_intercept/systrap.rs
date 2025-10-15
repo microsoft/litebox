@@ -179,6 +179,7 @@ fn register_seccomp_filter() {
         (libc::SYS_exit, vec![backdoor_on_arg(1)]),
         (libc::SYS_exit_group, vec![backdoor_on_arg(1)]),
         (libc::SYS_tgkill, vec![]),
+        (libc::SYS_setitimer, vec![]),
         (libc::SYS_clone3, vec![backdoor_on_arg(2)]),
         (libc::SYS_alarm, vec![backdoor_on_arg(1)]),
     ];
