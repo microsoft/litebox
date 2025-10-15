@@ -18,3 +18,14 @@ test-group = "tun-access"
 [[profile.default.overrides]]
 filter = 'package(litebox_shim_linux) and test(test_tun)'
 test-group = "tun-access"
+
+# For flaky tests on the CI, we attempt to re-run a couple of times before
+# failing. We explicitly don't do this on the default non-CI profile, so that
+# flakiness shows up on dev machines accurately, but it is annoying on the CI
+# side, so we instead allow a few retry attempts.
+[[profile.ci.overrides]]
+filter = 'package(litebox_runner_linux_userland) and test(test_dynamic_lib_with_rewriter)'
+retries = 2
+[[profile.ci.overrides]]
+filter = 'package(litebox_runner_linux_userland) and test(test_static_exec_with_rewriter)'
+retries = 2
