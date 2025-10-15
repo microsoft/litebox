@@ -842,9 +842,13 @@ impl From<Timespec> for TimeVal {
 
 impl From<core::time::Duration> for TimeVal {
     fn from(duration: core::time::Duration) -> Self {
-        let tv_sec: time_t = duration.as_secs().reinterpret_as_signed();
-        let tv_usec: suseconds_t = duration.subsec_micros().reinterpret_as_signed() as _;
-        TimeVal { tv_sec, tv_usec }
+        let timeval_sec: time_t = duration.as_secs().reinterpret_as_signed().truncate();
+        let timeval_u_sec: suseconds_t =
+            suseconds_t::from(duration.subsec_micros().reinterpret_as_signed());
+        TimeVal {
+            tv_sec: timeval_sec,
+            tv_usec: timeval_u_sec,
+        }
     }
 }
 

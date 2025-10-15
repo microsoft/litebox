@@ -1071,7 +1071,7 @@ where
                         Ok(TcpOptionData::NODELAY(!tcp_socket.nagle_enabled()))
                     }
                     TcpOptionName::KEEPALIVE => Ok(TcpOptionData::KEEPALIVE(
-                        tcp_socket.keep_alive().map(|d| d.into()),
+                        tcp_socket.keep_alive().map(core::time::Duration::from),
                     )),
                 }
             }

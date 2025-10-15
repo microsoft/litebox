@@ -290,24 +290,22 @@ impl Socket {
                             SocketOption::LINGER => self.options.lock().linger_timeout,
                             _ => unreachable!(),
                         }
-                        .map_or_else(litebox_common_linux::TimeVal::default, |d| d.into());
-                        let data = unsafe {
-                            core::slice::from_raw_parts(
-                                (&raw const tv).cast::<u8>(),
-                                size_of::<litebox_common_linux::TimeVal>().min(len as usize),
-                            )
-                        };
-                        unsafe { optval.write_slice_at_offset(0, data) }.ok_or(Errno::EFAULT)?;
+                        .map_or_else(
+                            litebox_common_linux::TimeVal::default,
+                            litebox_common_linux::TimeVal::from,
+                        );
+                        let optval = MutPtr::from_usize(optval.as_usize());
+                        unsafe { optval.write_at_offset(0, tv) }.ok_or(Errno::EFAULT)?;
                         size_of::<litebox_common_linux::TimeVal>()
                     }
                     _ => {
                         let val = match sopt {
                             SocketOption::TYPE => todo!(),
-                            SocketOption::REUSEADDR => self.options.lock().reuse_address as u32,
+                            SocketOption::REUSEADDR => u32::from(self.options.lock().reuse_address),
                             SocketOption::BROADCAST => 1, // TODO: We don't support disabling SO_BROADCAST
-                            SocketOption::KEEPALIVE => self.options.lock().keep_alive as u32,
+                            SocketOption::KEEPALIVE => u32::from(self.options.lock().keep_alive),
                             SocketOption::RCVBUF | SocketOption::SNDBUF => {
-                                litebox::net::SOCKET_BUFFER_SIZE as u32
+                                litebox::net::SOCKET_BUFFER_SIZE.truncate()
                             }
                             SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
                             SocketOption::RCVTIMEO
@@ -341,12 +339,12 @@ impl Socket {
                         else {
                             unreachable!()
                         };
-                        if let TcpOption::NODELAY = tcpopt {
-                            nodelay as u32
+                        u32::from(if let TcpOption::NODELAY = tcpopt {
+                            nodelay
                         } else {
                             // CORK is the opposite of NODELAY
-                            (!nodelay) as u32
-                        }
+                            !nodelay
+                        })
                     }
                     TcpOption::KEEPCNT | TcpOption::KEEPIDLE => return Err(Errno::EOPNOTSUPP),
                     TcpOption::CONGESTION | TcpOption::INFO => {
