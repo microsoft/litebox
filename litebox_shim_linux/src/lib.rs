@@ -931,6 +931,7 @@ pub fn handle_syscall_request(request: SyscallRequest<Platform>) -> ContinueOper
     ContinueOperation::ResumeGuest { return_value }
 }
 
+const MAX_SIGNAL_NUMBER: u64 = 64;
 fn handle_clone_request(
     clone_args: &litebox_common_linux::CloneArgs,
     ctx: &litebox_common_linux::PtRegs,
@@ -941,8 +942,9 @@ fn handle_clone_request(
     if clone_args.set_tid != 0 {
         unimplemented!("Clone with set_tid is not supported");
     }
-    if clone_args.exit_signal != 0 {
-        unimplemented!("Clone with exit_signal is not supported");
+    // Note `exit_signal` is ignored because we don't support `fork` yet; we just validate it.
+    if clone_args.exit_signal > MAX_SIGNAL_NUMBER {
+        return Err(Errno::EINVAL);
     }
     let parent_tid = if clone_args.parent_tid == 0 {
         None
