@@ -42,6 +42,14 @@ pub enum ConnectError {
     Unaddressable,
 }
 
+/// Possible errors from [`Network::get_local_addr`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum LocalAddrError {
+    #[error("Not a valid open file descriptor")]
+    InvalidFd,
+}
+
 /// Possible errors from [`Network::bind`]
 #[non_exhaustive]
 #[derive(Error, Debug)]

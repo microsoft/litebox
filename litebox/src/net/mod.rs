@@ -19,8 +19,8 @@ mod phy;
 mod tests;
 
 use errors::{
-    AcceptError, BindError, CloseError, ConnectError, ListenError, ReceiveError, SendError,
-    SocketError,
+    AcceptError, BindError, CloseError, ConnectError, ListenError, LocalAddrError, ReceiveError,
+    SendError, SocketError,
 };
 use local_ports::{LocalPort, LocalPortAllocator};
 
@@ -651,7 +651,7 @@ where
     }
 
     /// Get the local address and port a socket is bound to.
-    pub fn get_local_addr(&self, fd: &SocketFd<Platform>) -> SocketAddr {
+    pub fn get_local_addr(&self, fd: &SocketFd<Platform>) -> Result<SocketAddr, LocalAddrError> {
         let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table.get_entry_mut(fd);
         let socket_handle = &mut table_entry.entry;
@@ -663,12 +663,12 @@ where
                 let local_endpoint = socket.endpoint();
                 match local_endpoint.addr {
                     Some(smoltcp::wire::IpAddress::Ipv4(ipv4)) => {
-                        SocketAddr::V4(SocketAddrV4::new(ipv4, local_endpoint.port))
+                        Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, local_endpoint.port)))
                     }
-                    None => SocketAddr::V4(SocketAddrV4::new(
+                    None => Ok(SocketAddr::V4(SocketAddrV4::new(
                         Ipv4Addr::UNSPECIFIED,
                         local_endpoint.port,
-                    )),
+                    ))),
                 }
             }
             Protocol::Icmp => unimplemented!(),
