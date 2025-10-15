@@ -850,7 +850,13 @@ mod tests {
     const SERVER_PORT: u16 = 8080;
     const CLIENT_PORT: u16 = 8081;
 
-    fn test_tcp_socket(ip: [u8; 4], port: u16, is_nonblocking: bool) {
+    fn test_tcp_socket(
+        ip: [u8; 4],
+        port: u16,
+        is_nonblocking: bool,
+        test_trunc: bool,
+        option: &str,
+    ) {
         let server = sys_socket(
             AddressFamily::INET,
             SockType::Stream,
@@ -870,11 +876,26 @@ mod tests {
         sys_bind(server, sockaddr).expect("Failed to bind socket");
         sys_listen(server, 1).expect("Failed to listen on socket");
 
-        let mut child = std::process::Command::new("nc")
-            .args([TUN_IP_ADDR_STR, SERVER_PORT.to_string().as_str()])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .expect("Failed to spawn client");
+        let buf = "Hello, world!";
+        let mut child = match option {
+            "sendto" => std::process::Command::new("nc")
+                .args([
+                    "-w", // timeout for connects and final net reads
+                    "1",
+                    TUN_IP_ADDR_STR,
+                    SERVER_PORT.to_string().as_str(),
+                ])
+                .stdout(std::process::Stdio::piped())
+                .spawn(),
+            "recvfrom" => std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &alloc::format!("echo -n '{buf}' | nc -w 1 {TUN_IP_ADDR_STR} {SERVER_PORT}",),
+                ])
+                .spawn(),
+            _ => panic!("Unknown option"),
+        }
+        .expect("failed to run nc");
 
         let client_fd = if is_nonblocking {
             loop {
@@ -890,47 +911,80 @@ mod tests {
             sys_accept(server, None, None, SockFlags::empty()).expect("Failed to accept connection")
         };
         let client_fd = i32::try_from(client_fd).unwrap();
-        let buf = "Hello, world!";
-        let ptr = ConstPtr::from_usize(buf.as_ptr().expose_provenance());
-        let n = if is_nonblocking {
-            loop {
-                match sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None) {
-                    Ok(0) => {}
-                    Err(e) => {
-                        assert_eq!(e, Errno::EAGAIN);
-                    }
-                    Ok(n) => break n,
-                }
-                core::hint::spin_loop();
+        match option {
+            "sendto" => {
+                let ptr = ConstPtr::from_usize(buf.as_ptr().expose_provenance());
+                let n = sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None)
+                    .expect("Failed to send data");
+                assert_eq!(n, buf.len());
+                let output = child.wait_with_output().expect("Failed to wait for client");
+                let stdout = alloc::string::String::from_utf8_lossy(&output.stdout);
+                assert_eq!(stdout, buf);
             }
-        } else {
-            sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None)
-                .expect("Failed to send data")
-        };
-        assert_eq!(n, buf.len());
+            "recvfrom" => {
+                if is_nonblocking {
+                    unimplemented!("non-blocking recvfrom")
+                }
+                let mut recv_buf = [0u8; 48];
+                let recv_ptr = crate::MutPtr::from_usize(recv_buf.as_mut_ptr() as usize);
+                let n = sys_recvfrom(
+                    client_fd,
+                    recv_ptr,
+                    recv_buf.len(),
+                    if test_trunc {
+                        ReceiveFlags::TRUNC
+                    } else {
+                        ReceiveFlags::empty()
+                    },
+                    None,
+                )
+                .expect("Failed to receive data");
+                if test_trunc {
+                    assert!(recv_buf.iter().all(|&b| b == 0)); // buf remains unchanged
+                } else {
+                    assert_eq!(recv_buf[..n], buf.as_bytes()[..n]);
+                }
+                assert_eq!(n, buf.len()); // even with truncation, it returns the actual length
+                let _ = child.wait().expect("Failed to wait for client");
+            }
+            _ => panic!("Unknown option"),
+        }
+
         sys_close(client_fd).expect("Failed to close client socket");
         sys_close(server).expect("Failed to close server socket");
-
-        child.wait().expect("Failed to wait for client");
     }
 
-    fn test_tcp_socket_with_external_client(port: u16, is_nonblocking: bool) {
+    fn test_tcp_socket_with_external_client(
+        port: u16,
+        is_nonblocking: bool,
+        test_trunc: bool,
+        option: &str,
+    ) {
         crate::syscalls::tests::init_platform(Some("tun99"));
-        test_tcp_socket(TUN_IP_ADDR, port, is_nonblocking);
+        test_tcp_socket(TUN_IP_ADDR, port, is_nonblocking, test_trunc, option);
     }
 
     #[test]
-    fn test_tun_blocking_tcp_socket_with_external_client() {
-        test_tcp_socket_with_external_client(SERVER_PORT, false);
+    fn test_tun_blocking_sendto_tcp_socket() {
+        test_tcp_socket_with_external_client(SERVER_PORT, false, false, "sendto");
     }
 
     #[test]
-    fn test_tun_nonblocking_tcp_socket_with_external_client() {
-        test_tcp_socket_with_external_client(SERVER_PORT, true);
+    fn test_tun_nonblocking_sendto_tcp_socket() {
+        test_tcp_socket_with_external_client(SERVER_PORT, true, false, "sendto");
     }
 
     #[test]
-    fn test_tun_blocking_udp_server_socket() {
+    fn test_tun_blocking_recvfrom_tcp_socket() {
+        test_tcp_socket_with_external_client(SERVER_PORT, false, false, "recvfrom");
+    }
+
+    #[test]
+    fn test_tun_blocking_recvfrom_tcp_socket_with_truncation() {
+        test_tcp_socket_with_external_client(SERVER_PORT, false, true, "recvfrom");
+    }
+
+    fn blocking_udp_server_socket(test_trunc: bool) {
         crate::syscalls::tests::init_platform(Some("tun99"));
 
         // Server socket and bind
@@ -977,22 +1031,45 @@ mod tests {
         let mut recv_buf = [0u8; 48];
         let recv_ptr = crate::MutPtr::from_usize(recv_buf.as_mut_ptr() as usize);
         let mut sender_addr = None;
+        let mut recv_flags = ReceiveFlags::empty();
+        if test_trunc {
+            recv_flags.insert(ReceiveFlags::TRUNC);
+        }
         let n = sys_recvfrom(
             server_fd,
             recv_ptr,
-            recv_buf.len(),
-            ReceiveFlags::empty(),
+            if test_trunc {
+                8 // intentionally small size to test truncation
+            } else {
+                recv_buf.len()
+            },
+            recv_flags,
             Some(&mut sender_addr),
         )
         .expect("recvfrom failed");
-        let received = core::str::from_utf8(&recv_buf[..n]).expect("invalid utf8");
-        assert_eq!(received, msg);
+        if test_trunc {
+            assert_eq!(n, msg.len()); // return the actual length of the datagram rather than the received length
+            assert_eq!(recv_buf[..8], msg.as_bytes()[..8]); // only part of the message is received
+        } else {
+            assert_eq!(n, msg.len());
+            assert_eq!(recv_buf[..n], msg.as_bytes()[..n]);
+        }
         let SocketAddress::Inet(sender_addr) = sender_addr.unwrap();
         assert_eq!(sender_addr.port(), CLIENT_PORT);
 
         sys_close(server_fd).expect("failed to close server");
 
         child.wait().expect("Failed to wait for client");
+    }
+
+    #[test]
+    fn test_tun_blocking_udp_server_socket() {
+        blocking_udp_server_socket(false);
+    }
+
+    #[test]
+    fn test_tun_blocking_udp_server_socket_with_truncation() {
+        blocking_udp_server_socket(true);
     }
 
     #[test]

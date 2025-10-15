@@ -978,8 +978,9 @@ where
         let mut table_entry = descriptor_table.get_entry_mut(fd);
         let socket_handle = &mut table_entry.entry;
 
-        if flags.intersects(ReceiveFlags::DONTWAIT.complement()) {
-            unimplemented!()
+        let flags = flags & ReceiveFlags::ALL; // ignore irrelevant flags (e.g., NOSIGNAL)
+        if flags.intersects((ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC).complement()) {
+            unimplemented!("flags: {:?}", flags);
         }
 
         let ret = match socket_handle.protocol() {
@@ -988,34 +989,56 @@ where
                     // TCP is connection-oriented, so no need to provide a source address
                     *source_addr = None;
                 }
-                self.socket_set
-                    .get_mut::<tcp::Socket>(socket_handle.handle)
-                    .recv_slice(buf)
-                    .map_err(|e| match e {
-                        tcp::RecvError::InvalidState => ReceiveError::SocketInInvalidState,
-                        tcp::RecvError::Finished => ReceiveError::OperationFinished,
-                    })
-            }
-            Protocol::Udp => match self
-                .socket_set
-                .get_mut::<udp::Socket>(socket_handle.handle)
-                .recv_slice(buf)
-            {
-                Ok((n, meta)) => {
-                    if let Some(source_addr) = source_addr {
-                        let remote_addr = match meta.endpoint.addr {
-                            smoltcp::wire::IpAddress::Ipv4(ipv4_addr) => {
-                                SocketAddr::V4(SocketAddrV4::new(ipv4_addr, meta.endpoint.port))
-                            }
+                let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
+                if flags.contains(ReceiveFlags::TRUNC) {
+                    // This flag causes the received bytes of data to be discarded
+                    let discard_slice =
+                        |tcp_socket: &mut tcp::Socket<'_>| -> Result<usize, tcp::RecvError> {
+                            // See [`tcp::Socket::recv_slice`] and [`tcp::Socket::recv`] for why we do two `recv` calls.
+                            // Basically, the socket buffer is implemented as a ring buffer, and if the data to be read
+                            // wraps around, a single `recv` call will not be able to read all the data.
+                            let size1 = tcp_socket.recv(|data| (data.len(), data.len()))?;
+                            let size2 = tcp_socket.recv(|data| (data.len(), data.len()))?;
+                            Ok(size1 + size2)
                         };
-                        *source_addr = Some(remote_addr);
-                    }
-                    Ok(n)
+                    discard_slice(tcp_socket)
+                } else {
+                    tcp_socket.recv_slice(buf)
                 }
-                Err(udp::RecvError::Exhausted) => Ok(0),
-                // TODO: how to read partial data instead of erroring out?
-                Err(udp::RecvError::Truncated) => unimplemented!(),
-            },
+                .map_err(|e| match e {
+                    tcp::RecvError::InvalidState => ReceiveError::SocketInInvalidState,
+                    tcp::RecvError::Finished => ReceiveError::OperationFinished,
+                })
+            }
+            Protocol::Udp => {
+                match self
+                    .socket_set
+                    .get_mut::<udp::Socket>(socket_handle.handle)
+                    .recv()
+                {
+                    Ok((data, meta)) => {
+                        if let Some(source_addr) = source_addr {
+                            let remote_addr = match meta.endpoint.addr {
+                                smoltcp::wire::IpAddress::Ipv4(ipv4_addr) => {
+                                    SocketAddr::V4(SocketAddrV4::new(ipv4_addr, meta.endpoint.port))
+                                }
+                            };
+                            *source_addr = Some(remote_addr);
+                        }
+                        let length = data.len().min(buf.len());
+                        buf[..length].copy_from_slice(&data[..length]);
+                        if flags.contains(ReceiveFlags::TRUNC) {
+                            // return the real size of the packet or datagram,
+                            // even when it was longer than the passed buffer.
+                            Ok(data.len())
+                        } else {
+                            Ok(length)
+                        }
+                    }
+                    Err(udp::RecvError::Exhausted) => Ok(0),
+                    Err(udp::RecvError::Truncated) => unreachable!(),
+                }
+            }
             Protocol::Icmp => unimplemented!(),
             Protocol::Raw { protocol: _ } => unimplemented!(),
         };
@@ -1150,6 +1173,14 @@ bitflags! {
         const WAITALL = 0x100;
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
+
+        const ALL = Self::CMSG_CLOEXEC.bits()
+            | Self::DONTWAIT.bits()
+            | Self::ERRQUEUE.bits()
+            | Self::OOB.bits()
+            | Self::PEEK.bits()
+            | Self::TRUNC.bits()
+            | Self::WAITALL.bits();
     }
 }
 
