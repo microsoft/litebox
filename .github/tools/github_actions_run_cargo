@@ -5,7 +5,7 @@
 # locally.
 #
 # Author: Jay Bosamiya
-# Version: 0.0.1
+# Version: 0.0.2
 #
 # Usage:
 #   ./github_actions_run_cargo build
@@ -34,8 +34,8 @@ COMMAND=$1
 shift
 
 case "$COMMAND" in
-    build|check|clippy)
-        if ! cargo "$COMMAND" --message-format json --verbose "$@" | to_gha; then
+    build | check | clippy)
+        if ! cargo "$COMMAND" --locked --message-format json --verbose "$@" | to_gha; then
             echo '::error title='"$COMMAND"' issue::"cargo '"$COMMAND"'" failed'
             exit 1
         fi
@@ -47,20 +47,20 @@ case "$COMMAND" in
         fi
         ;;
     test)
-        if ! cargo test --verbose "$@"; then
+        if ! cargo test --locked --verbose "$@"; then
             echo '::error title=Tests failed::"cargo test" failed'
             exit 1
         fi
         ;;
     nextest)
         # Reads the config from .config/nextest.toml
-        if ! cargo nextest run --profile ci "$@"; then
+        if ! cargo nextest run --locked --profile ci "$@"; then
             echo '::error title=Tests failed::"cargo nextest run" failed'
             exit 1
         fi
         ;;
     doc)
-        if ! cargo doc --message-format json --verbose "$@" | to_gha; then
+        if ! cargo doc --locked --message-format json --verbose "$@" | to_gha; then
             echo '::error title=Documentation issue::"cargo doc" failed'
             exit 1
         fi
