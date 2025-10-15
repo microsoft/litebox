@@ -152,6 +152,19 @@ impl Socket {
                         self.options.lock().send_timeout = read_timeval_as_duration(optval)?;
                         return Ok(());
                     }
+                    SocketOption::LINGER => {
+                        if optlen < size_of::<litebox_common_linux::Linger>() {
+                            return Err(Errno::EINVAL);
+                        }
+                        let linger: crate::ConstPtr<litebox_common_linux::Linger> =
+                            crate::ConstPtr::from_usize(optval.as_usize());
+                        let linger = unsafe { linger.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+                        // TODO: our current implementation of `close` does not support graceful close yet.
+                        if linger.onoff != 0 && linger.linger != 0 {
+                            unimplemented!("SO_LINGER with non-zero timeout is not supported yet");
+                        }
+                        return Ok(());
+                    }
                     _ => {}
                 }
 
@@ -197,7 +210,7 @@ impl Socket {
                     // We use fixed buffer size for now
                     SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
                     // Already handled at the beginning
-                    SocketOption::RCVTIMEO | SocketOption::SNDTIMEO => {}
+                    SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER => {}
                     // Socket does not support these options
                     SocketOption::TYPE | SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
                 }
@@ -236,6 +249,23 @@ impl Socket {
                         }
                         Ok(())
                     }
+                    TcpOption::KEEPINTVL => {
+                        const MAX_TCP_KEEPINTVL: u32 = 32767;
+                        if !(1..=MAX_TCP_KEEPINTVL).contains(&val) {
+                            return Err(Errno::EINVAL);
+                        }
+                        litebox_net()
+                            .lock()
+                            .set_tcp_option(
+                                self.fd.as_ref().unwrap(),
+                                litebox::net::TcpOptionData::KEEPALIVE(Some(
+                                    core::time::Duration::from_secs(u64::from(val)),
+                                )),
+                            )
+                            .expect("set TCP_KEEPALIVE should succeed");
+                        Ok(())
+                    }
+                    TcpOption::KEEPCNT | TcpOption::KEEPIDLE => Err(Errno::EOPNOTSUPP),
                     _ => unimplemented!("TCP option {to:?}"),
                 }
             }
