@@ -341,6 +341,7 @@ impl From<litebox::net::errors::BindError> for Errno {
             litebox::net::errors::BindError::InvalidFd => Errno::EBADF,
             litebox::net::errors::BindError::UnsupportedAddress(_) => Errno::EAFNOSUPPORT,
             litebox::net::errors::BindError::PortAlreadyInUse(_) => Errno::EADDRINUSE,
+            litebox::net::errors::BindError::AlreadyBound => Errno::EINVAL,
             _ => unimplemented!(),
         }
     }
@@ -352,6 +353,7 @@ impl From<litebox::net::errors::ConnectError> for Errno {
             litebox::net::errors::ConnectError::InvalidFd => Errno::EBADF,
             litebox::net::errors::ConnectError::UnsupportedAddress(_) => Errno::EAFNOSUPPORT,
             litebox::net::errors::ConnectError::PortAllocationFailure(_) => Errno::EADDRINUSE,
+            litebox::net::errors::ConnectError::Unaddressable => Errno::EADDRNOTAVAIL,
             _ => unimplemented!(),
         }
     }
@@ -370,11 +372,28 @@ impl From<litebox::net::errors::ListenError> for Errno {
     }
 }
 
+impl From<litebox::net::local_ports::LocalPortAllocationError> for Errno {
+    fn from(value: litebox::net::local_ports::LocalPortAllocationError) -> Self {
+        match value {
+            litebox::net::local_ports::LocalPortAllocationError::AlreadyInUse(_) => {
+                Errno::EADDRINUSE
+            }
+            litebox::net::local_ports::LocalPortAllocationError::NoAvailableFreePorts => {
+                Errno::EAGAIN
+            }
+        }
+    }
+}
+
 impl From<litebox::net::errors::SendError> for Errno {
     fn from(value: litebox::net::errors::SendError) -> Self {
         match value {
             litebox::net::errors::SendError::InvalidFd => Errno::EBADF,
             litebox::net::errors::SendError::SocketInInvalidState => Errno::ENOTCONN,
+            litebox::net::errors::SendError::Unaddressable => Errno::EDESTADDRREQ,
+            litebox::net::errors::SendError::BufferFull => Errno::EAGAIN,
+            litebox::net::errors::SendError::PortAllocationFailure(e) => e.into(),
+            litebox::net::errors::SendError::UnnecessaryDestinationAddress => Errno::EISCONN,
             _ => unimplemented!(),
         }
     }
@@ -391,12 +410,15 @@ impl From<litebox::net::errors::ReceiveError> for Errno {
     }
 }
 
-impl From<litebox::event::polling::TryOpError<Errno>> for Errno {
-    fn from(value: litebox::event::polling::TryOpError<Errno>) -> Self {
+impl<E> From<litebox::event::polling::TryOpError<E>> for Errno
+where
+    E: Into<Errno>,
+{
+    fn from(value: litebox::event::polling::TryOpError<E>) -> Self {
         match value {
             litebox::event::polling::TryOpError::TryAgain => Errno::EAGAIN,
             litebox::event::polling::TryOpError::TimedOut => Errno::ETIMEDOUT,
-            litebox::event::polling::TryOpError::Other(e) => e,
+            litebox::event::polling::TryOpError::Other(e) => e.into(),
         }
     }
 }

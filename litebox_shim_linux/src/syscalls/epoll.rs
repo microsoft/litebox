@@ -121,7 +121,7 @@ impl EpollFile {
             || {
                 self.ready.pop_multiple(maxevents, &mut events);
                 if events.is_empty() {
-                    return Err(litebox::event::polling::TryOpError::TryAgain);
+                    return Err(litebox::event::polling::TryOpError::<Errno>::TryAgain);
                 }
                 Ok(())
             },
