@@ -166,7 +166,7 @@ mod tests {
         static TLS: Cell<*mut ()> = const { Cell::new(core::ptr::null_mut()) };
     }
 
-    impl ThreadLocalStorageProvider for Platform {
+    unsafe impl ThreadLocalStorageProvider for Platform {
         fn get_thread_local_storage() -> *mut () {
             TLS.get()
         }
