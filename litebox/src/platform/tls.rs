@@ -1,7 +1,7 @@
 //! Thread-local storage support for shims.
 //!
-//! Shims can use [`shim_thread_local!`] to define thread-local static
-//! variables.
+//! Shims can use [`shim_thread_local!`](crate::shim_thread_local) to define
+//! thread-local static variables.
 
 use crate::platform::ThreadLocalStorageProvider;
 use alloc::boxed::Box;
