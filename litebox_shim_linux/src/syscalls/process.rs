@@ -299,7 +299,7 @@ type ThreadLocalDescriptor = u8;
 /// On `x86`, this is represented as a `UserDesc`, which provides a more
 /// structured descriptor (e.g., base address, limit, flags).
 #[cfg(target_arch = "x86")]
-type ThreadLocalDescriptor = UserDesc;
+type ThreadLocalDescriptor = litebox_common_linux::UserDesc;
 
 struct NewThreadArgs<
     Platform: litebox::platform::RawPointerProvider + litebox::sync::RawSyncPrimitivesProvider,
