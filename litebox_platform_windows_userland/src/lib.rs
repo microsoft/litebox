@@ -1308,7 +1308,7 @@ thread_local! {
 }
 
 /// WindowsUserland platform's thread-local storage implementation.
-impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
+unsafe impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
     fn get_thread_local_storage() -> *mut () {
         PLATFORM_TLS.get()
     }

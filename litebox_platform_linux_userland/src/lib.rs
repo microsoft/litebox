@@ -4,6 +4,7 @@
 // Linux, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
 
+use std::cell::Cell;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::SeqCst;
@@ -16,7 +17,6 @@ use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer};
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
-use std::cell::Cell;
 
 mod syscall_intercept;
 
@@ -1726,7 +1726,7 @@ thread_local! {
 }
 
 /// LinuxUserland platform's thread-local storage implementation.
-impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
+unsafe impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     fn get_thread_local_storage() -> *mut () {
         PLATFORM_TLS.get()
     }

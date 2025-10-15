@@ -112,7 +112,7 @@ impl SnpLinuxKernel {
     }
 }
 
-impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
+unsafe impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
     fn get_thread_local_storage() -> *mut () {
         current()
             .expect("Current task must be available")

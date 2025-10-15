@@ -5,7 +5,10 @@
 
 use crate::platform::ThreadLocalStorageProvider;
 use alloc::boxed::Box;
-use core::{cell::Cell, marker::PhantomData, ptr, sync::atomic::AtomicU8};
+use core::cell::Cell;
+use core::marker::PhantomData;
+use core::ptr;
+use core::sync::atomic::AtomicU8;
 
 /// Defines a thread-local static variable for shim use, with the given
 /// platform.
@@ -20,7 +23,7 @@ use core::{cell::Cell, marker::PhantomData, ptr, sync::atomic::AtomicU8};
 ///
 /// ```no_run
 /// # struct MyPlatform;
-/// # impl litebox::platform::ThreadLocalStorageProvider for MyPlatform {
+/// # unsafe impl litebox::platform::ThreadLocalStorageProvider for MyPlatform {
 /// #     fn get_thread_local_storage() -> *mut () { todo!() }
 /// #     unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () { todo!() }
 /// #     fn clear_guest_thread_local_storage() { todo!() }

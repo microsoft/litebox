@@ -13,12 +13,12 @@ extern crate alloc;
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 
 // TODO(jayb) Replace out all uses of once_cell and such with our own implementation that uses
 // platform-specific things within it.
 use once_cell::race::OnceBox;
 
-use core::cell::RefCell;
 use litebox::{
     LiteBox,
     fd::{ErrRawIntFd, TypedFd},

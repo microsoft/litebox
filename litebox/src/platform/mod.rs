@@ -626,7 +626,11 @@ pub trait SystemInfoProvider {
 /// Currently, this provides just a single thread-local storage pointer. Shims
 /// should use [`shim_thread_local!`](crate::shim_thread_local) macro for a safe
 /// and ergonomic interface to TLS.
-pub trait ThreadLocalStorageProvider {
+///
+/// # Safety
+/// The implementation must ensure that the TLS pointer that is set for the
+/// thread is the one that is returned.
+pub unsafe trait ThreadLocalStorageProvider {
     /// Gets the current thread-local storage pointer.
     //
     // DEVNOTE: note that this does not take `&self`. So far, this has not been
