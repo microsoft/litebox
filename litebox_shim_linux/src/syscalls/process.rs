@@ -1085,6 +1085,26 @@ pub(crate) fn sys_tgkill(
     })
 }
 
+/// Handle syscall `setitimer`
+pub(crate) fn sys_setitimer(
+    which: litebox_common_linux::IntervalTimer,
+    new_value: crate::ConstPtr<litebox_common_linux::ItimerVal>,
+    old_value: Option<crate::MutPtr<litebox_common_linux::ItimerVal>>,
+) -> Result<(), Errno> {
+    let punchthrough = litebox_common_linux::PunchthroughSyscall::SetITimer {
+        which,
+        new_value,
+        old_value,
+    };
+    let token = litebox_platform_multiplex::platform()
+        .get_punchthrough_token_for(punchthrough)
+        .expect("Failed to get punchthrough token for SETITIMER");
+    token.execute().map(|_| ()).map_err(|e| match e {
+        litebox::platform::PunchthroughError::Failure(errno) => errno,
+        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_arch = "x86_64")]
