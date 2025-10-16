@@ -13,7 +13,6 @@ use std::time::Duration;
 use litebox::fs::OFlags;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
-use litebox::platform::trivial_providers::TransparentMutPtr;
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer};
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
@@ -533,7 +532,6 @@ pub unsafe extern "C" fn thread_start_internal(
     unsafe {
         core::arch::asm!(
             "mov rsp, rax",
-            "xor rax, rax",
             "pop r15",
             "pop r14",
             "pop r13",
@@ -544,7 +542,7 @@ pub unsafe extern "C" fn thread_start_internal(
             "pop r10",
             "pop r9",
             "pop r8",
-            "pop rcx", // skip rax
+            "pop rax",
             "pop rcx",
             "pop rdx",
             "pop rsi",
@@ -586,11 +584,11 @@ pub unsafe extern "C" fn thread_start_internal(
 }
 
 fn thread_start(
-    thread_args: litebox_common_linux::NewThreadArgs<LinuxUserland>,
+    init_thread: Box<dyn litebox::platform::InitThread>,
     ctx: litebox_common_linux::PtRegs,
 ) {
     // Allow caller to run some code before we return to the new thread.
-    (thread_args.callback)(thread_args);
+    init_thread.init();
 
     unsafe { thread_start_asm(&ctx) };
     // TODO: have syscall_callback return if we need to terminate the process.
@@ -600,36 +598,18 @@ fn thread_start(
 
 impl litebox::platform::ThreadProvider for LinuxUserland {
     type ExecutionContext = litebox_common_linux::PtRegs;
-    type ThreadArgs = litebox_common_linux::NewThreadArgs<LinuxUserland>;
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
-    type ThreadId = usize;
 
     unsafe fn spawn_thread(
         &self,
         ctx: &litebox_common_linux::PtRegs,
-        stack: TransparentMutPtr<u8>,
-        stack_size: usize,
-        entry_point: usize,
-        thread_args: Box<Self::ThreadArgs>,
-    ) -> Result<usize, Self::ThreadSpawnError> {
-        let mut ctx_copy = *ctx;
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            ctx_copy.rip = entry_point;
-            ctx_copy.rsp = stack.as_usize() + stack_size;
-        }
-
-        #[cfg(target_arch = "x86")]
-        {
-            ctx_copy.eip = entry_point;
-            ctx_copy.esp = stack.as_usize() + stack_size;
-        }
-
+        init_thread: Box<dyn litebox::platform::InitThread>,
+    ) -> Result<(), Self::ThreadSpawnError> {
+        let ctx = *ctx;
         // TODO: do we need to wait for the handle in the main thread?
-        let _handle = std::thread::spawn(move || thread_start(*thread_args, ctx_copy));
+        let _handle = std::thread::spawn(move || thread_start(init_thread, ctx));
 
-        Ok(0)
+        Ok(())
     }
 }
 

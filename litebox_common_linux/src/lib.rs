@@ -1209,40 +1209,6 @@ pub struct CloneArgs {
     pub cgroup: u64,
 }
 
-/// A descriptor for thread-local storage (TLS).
-///
-/// On `x86_64`, this is represented as a `u8`. The TLS pointer can point to
-/// an arbitrary-sized memory region.
-#[cfg(target_arch = "x86_64")]
-pub type ThreadLocalDescriptor = u8;
-/// A descriptor for thread-local storage (TLS).
-///
-/// On `x86`, this is represented as a `UserDesc`, which provides a more
-/// structured descriptor (e.g., base address, limit, flags).
-#[cfg(target_arch = "x86")]
-pub type ThreadLocalDescriptor = UserDesc;
-
-pub struct NewThreadArgs<
-    Platform: litebox::platform::RawPointerProvider + litebox::sync::RawSyncPrimitivesProvider,
-> {
-    /// Pointer to thread-local storage (TLS) given by the guest program
-    pub tls: Option<Platform::RawMutPointer<ThreadLocalDescriptor>>,
-    /// Where to store child TID in child's memory
-    pub set_child_tid: Option<Platform::RawMutPointer<i32>>,
-    /// Task struct that maintains all per-thread data
-    pub task: alloc::boxed::Box<Task<Platform>>,
-    /// A callback function that *MUST* be called when the thread is created.
-    ///
-    /// Note that `task.tid` must be set correctly before this function is called.
-    pub callback: fn(Self),
-}
-
-unsafe impl<Platform> Send for NewThreadArgs<Platform> where
-    Platform:
-        litebox::platform::RawPointerProvider + litebox::sync::RawSyncPrimitivesProvider + Send
-{
-}
-
 /// Credentials of a process
 #[derive(Clone)]
 pub struct Credentials {
