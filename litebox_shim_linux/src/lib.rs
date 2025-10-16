@@ -65,8 +65,8 @@ pub(crate) fn boot_time() -> &'static <Platform as litebox::platform::TimeProvid
 ///
 /// Returns the global litebox object.
 pub fn init_process<'a>(task: litebox_common_linux::Task<Platform>) -> &'a LiteBox<Platform> {
-    // TODO: ensure this gets torn down even if the thread never runs. Consider
-    // a scoped execution model, e.g.
+    // TODO: ensure this gets torn down even if the thread never runs sys_exit.
+    // Consider a scoped execution model, e.g.
     // ```
     // litebox_shim_linux::run_process(task, |litebox| {
     //     ...
@@ -967,7 +967,8 @@ struct LinuxShimTls {
 }
 
 litebox::shim_thread_local! {
-    static SHIM_TLS: LinuxShimTls: Platform;
+    #[platform = Platform]
+    static SHIM_TLS: LinuxShimTls;
 }
 
 fn with_current_task_mut<R>(f: impl FnOnce(&mut litebox_common_linux::Task<Platform>) -> R) -> R {

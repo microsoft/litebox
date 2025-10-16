@@ -5,7 +5,6 @@
 //! other crates that implement them upon various types.
 
 pub mod page_mgmt;
-pub mod tls;
 pub mod trivial_providers;
 
 #[cfg(test)]
@@ -629,10 +628,15 @@ pub trait SystemInfoProvider {
 ///
 /// # Safety
 /// The implementation must ensure that the TLS pointer that is set for the
-/// thread is the one that is returned.
+/// thread (via `replace_thread_local_storage`) is the one that is returned, and
+/// that [`null_mut()`](core::ptr::null_mut) is returned if no TLS pointer has
+/// been set.
 pub unsafe trait ThreadLocalStorageProvider {
-    /// Gets the current thread-local storage pointer.
-    //
+    /// Gets the current thread-local storage pointer that was set with the most
+    /// recent call to `replace_thread_local_storage`. If
+    /// `replace_thread_local_storage` was never called, this function must
+    /// return [`null_mut()`](core::ptr::null_mut).
+    ///
     // DEVNOTE: note that this does not take `&self`. So far, this has not been
     // a problem for platform implementations, and allowing this does improve
     // performance by avoiding a platform lookup on every TLS access. But we
@@ -641,6 +645,8 @@ pub unsafe trait ThreadLocalStorageProvider {
 
     /// Replaces the current thread-local storage pointer with `value`,
     /// returning the previous value.
+    ///
+    /// The initial value for a thread is [`null_mut()`](core::ptr::null_mut).
     ///
     /// # Safety
     /// The caller must cooperate with other users of this function to ensure

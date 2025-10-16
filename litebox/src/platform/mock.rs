@@ -302,3 +302,21 @@ impl StdioProvider for MockPlatform {
         false
     }
 }
+
+std::thread_local! {
+    static MOCK_TLS: core::cell::Cell<*mut()>  = const { core::cell::Cell::new(core::ptr::null_mut()) };
+}
+
+unsafe impl ThreadLocalStorageProvider for MockPlatform {
+    fn get_thread_local_storage() -> *mut () {
+        MOCK_TLS.get()
+    }
+
+    unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
+        MOCK_TLS.replace(value)
+    }
+
+    fn clear_guest_thread_local_storage() {
+        unimplemented!()
+    }
+}

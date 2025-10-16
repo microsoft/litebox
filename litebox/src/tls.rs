@@ -22,14 +22,9 @@ use core::sync::atomic::AtomicU8;
 /// # Example
 ///
 /// ```no_run
-/// # struct MyPlatform;
-/// # unsafe impl litebox::platform::ThreadLocalStorageProvider for MyPlatform {
-/// #     fn get_thread_local_storage() -> *mut () { todo!() }
-/// #     unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () { todo!() }
-/// #     fn clear_guest_thread_local_storage() { todo!() }
-/// # }
 /// litebox::shim_thread_local! {
-///     static MY_TLS: core::cell::Cell<u32>: MyPlatform;
+///     #[platform = litebox::platform::mock::MockPlatform]
+///     static MY_TLS: core::cell::Cell<u32>;
 /// }
 ///
 /// MY_TLS.init(42.into());
@@ -40,21 +35,21 @@ use core::sync::atomic::AtomicU8;
 /// ```
 #[macro_export]
 macro_rules! shim_thread_local {
-    (static $name:ident: $ty:ty: $platform:ty;) => {
-        static $name: $crate::platform::tls::TlsKey<$ty, $platform> =
-            unsafe { $crate::platform::tls::TlsKey::new_unchecked() };
+    (#[platform = $platform:ty] static $name:ident: $ty:ty;) => {
+        static $name: $crate::tls::TlsKey<$ty, $platform> =
+            unsafe { $crate::tls::TlsKey::new_unchecked() };
     };
 }
 
-/// A key used to access thread local storage of type `T` for platform `P`.
-pub struct TlsKey<T, P> {
+/// A key used to access thread local storage of type `T` for `Platform`.
+pub struct TlsKey<T, Platform> {
     // Used to ensure there's a unique address for this.
     _dummy: AtomicU8,
-    _phantom: PhantomData<fn(T, &P) -> T>,
+    _phantom: PhantomData<fn(T, &Platform) -> T>,
 }
 
-#[repr(C)] // needed so that the offset of `key` is predictable across different `T` and `P`.
-struct Tls<T: 'static, P: 'static> {
+#[repr(C)] // needed so that the offset of `key` is predictable across different `T` and `Platform`.
+struct Tls<T: 'static, Platform: 'static> {
     /// Tracks which TLS key this value is for.
     ///
     /// FUTURE: consider allowing multiple TLS keys to be active at once. This
@@ -64,7 +59,7 @@ struct Tls<T: 'static, P: 'static> {
     ///
     /// This could be useful to give shims more flexibility or to improve
     /// performance of getting the TLS value (removing a branch).
-    key: &'static TlsKey<T, P>,
+    key: &'static TlsKey<T, Platform>,
     /// Tracks the number of active `with` calls.
     ///
     /// FUTURE: consider a scoped initialization model that will statically
@@ -75,7 +70,7 @@ struct Tls<T: 'static, P: 'static> {
     data: T,
 }
 
-impl<T: 'static, P: ThreadLocalStorageProvider> TlsKey<T, P> {
+impl<T: 'static, Platform: ThreadLocalStorageProvider> TlsKey<T, Platform> {
     /// Don't use. Use [`shim_thread_local!`] instead.
     #[doc(hidden)]
     pub const unsafe fn new_unchecked() -> Self {
@@ -96,12 +91,13 @@ impl<T: 'static, P: ThreadLocalStorageProvider> TlsKey<T, P> {
             data: value,
         });
         unsafe {
-            let old_tls = P::replace_thread_local_storage(Box::into_raw(tls).cast());
+            let old_tls = Platform::replace_thread_local_storage(Box::into_raw(tls).cast());
             if !old_tls.is_null() {
                 // Put it back in case panic unwinds and something is
                 // referencing it.
-                let _value =
-                    Box::from_raw(P::replace_thread_local_storage(old_tls).cast::<Tls<T, P>>());
+                let _value = Box::from_raw(
+                    Platform::replace_thread_local_storage(old_tls).cast::<Tls<T, Platform>>(),
+                );
                 panic!("tls is already in use on this thread");
             }
         }
@@ -116,25 +112,26 @@ impl<T: 'static, P: ThreadLocalStorageProvider> TlsKey<T, P> {
         // Validate the TLS is set and of the right type before taking it out.
         let _ = self.get_ptr();
         let tls = unsafe {
-            let ptr = P::replace_thread_local_storage(ptr::null_mut()).cast::<Tls<T, P>>();
+            let ptr =
+                Platform::replace_thread_local_storage(ptr::null_mut()).cast::<Tls<T, Platform>>();
             Box::from_raw(ptr)
         };
         let users = tls.users.get();
         if users != 0 {
             // Put it back in case panic unwinds and something is
             // referencing it.
-            unsafe { P::replace_thread_local_storage(Box::into_raw(tls).cast()) };
+            unsafe { Platform::replace_thread_local_storage(Box::into_raw(tls).cast()) };
             panic!("tls is still in use on this thread");
         }
         tls.data
     }
 
-    fn get_ptr(&'static self) -> *const Tls<T, P> {
-        let ptr = P::get_thread_local_storage();
+    fn get_ptr(&'static self) -> *const Tls<T, Platform> {
+        let ptr = Platform::get_thread_local_storage();
         assert!(!ptr.is_null(), "tls is not set");
         let key = unsafe {
-            *ptr.wrapping_byte_add(core::mem::offset_of!(Tls<T, P>, key))
-                .cast::<*const TlsKey<T, P>>()
+            *ptr.wrapping_byte_add(core::mem::offset_of!(Tls<T, Platform>, key))
+                .cast::<*const TlsKey<T, Platform>>()
         };
         assert!(ptr::addr_eq(key, self), "tls type mismatch");
         ptr.cast()
@@ -157,35 +154,17 @@ impl<T: 'static, P: ThreadLocalStorageProvider> TlsKey<T, P> {
 mod tests {
     extern crate std;
 
-    use crate::platform::ThreadLocalStorageProvider;
+    use crate::platform::mock::MockPlatform;
     use core::cell::Cell;
 
-    struct Platform;
-
-    std::thread_local! {
-        static TLS: Cell<*mut ()> = const { Cell::new(core::ptr::null_mut()) };
-    }
-
-    unsafe impl ThreadLocalStorageProvider for Platform {
-        fn get_thread_local_storage() -> *mut () {
-            TLS.get()
-        }
-
-        unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
-            TLS.replace(value)
-        }
-
-        fn clear_guest_thread_local_storage() {
-            unimplemented!()
-        }
+    shim_thread_local! {
+        #[platform = MockPlatform]
+        static SHIM_TLS: Cell<u32>;
     }
 
     shim_thread_local! {
-        static SHIM_TLS: Cell<u32>: Platform;
-    }
-
-    shim_thread_local! {
-        static OTHER_TLS: Cell<u32>: Platform;
+        #[platform = MockPlatform]
+        static OTHER_TLS: Cell<u32>;
     }
 
     #[test]
