@@ -221,18 +221,26 @@ fn get_entry() -> u64 {
     clippy::similar_names,
     reason = "some versions of clippy trigger this warning due to rip/rsp"
 )]
-pub fn init_vtl_aps(online_cores: u32) -> Result<u64, HypervCallError> {
-    assert!(online_cores <= u32::try_from(MAX_CORES).expect("MAX_CORES"));
+pub fn init_vtl_aps(online_cores: &[u32]) -> Result<u64, HypervCallError> {
+    assert!(online_cores.len() as u32 <= u32::try_from(MAX_CORES).expect("MAX_CORES"));
 
     let rip: u64 = get_entry() as *const () as u64;
     let rsp = get_address_of_special_page(VTL1_KERNEL_STACK_PAGE) + PAGE_SIZE as u64 - 1;
     let tss = get_address_of_special_page(VTL1_TSS_PAGE);
 
-    for core in 1..online_cores {
+    for &core in online_cores {
+		// Skip boot processor since VTL is already enabled for it by VTL0
+        if core == 0 {
+            serial_println!("Skipping boot processor (core 0)");
+            continue;
+        }
         let result = hvcall_enable_vp_vtl(core, HV_VTL_SECURE, tss, rip, rsp);
-        if result.is_err() {
-            serial_println!("Failed to enable VTL for core {}: {:?}", core, result);
-            return result;
+        match result {
+            Ok(_) => serial_println!("Enabled VTL for core {}", core),
+            Err(e) => {
+                serial_println!("Failed to enable VTL for core {}: {:?}", core, e);
+                return Err(e);
+            }
         }
     }
 

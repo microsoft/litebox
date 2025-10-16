@@ -7,7 +7,7 @@ use crate::{
     debug_serial_print, debug_serial_println,
     host::per_cpu_variables::with_per_cpu_variables_mut,
     host::{
-        bootparam::{get_num_possible_cpus, get_vtl1_memory_info},
+        bootparam::get_vtl1_memory_info,
         linux::{CpuMask, KEXEC_SEGMENT_MAX, Kimage},
     },
     mshv::{
@@ -113,25 +113,33 @@ pub fn mshv_vsm_enable_aps(cpu_present_mask_pfn: u64) -> Result<i64, Errno> {
     if let Some(cpu_mask) =
         unsafe { crate::platform_low().copy_from_vtl0_phys::<CpuMask>(cpu_present_mask_page_addr) }
     {
+        let decoded_mask = cpu_mask.decode_cpu_mask();
         debug_serial_print!("cpu_present_mask: ");
-        for (i, elem) in cpu_mask.decode_cpu_mask().iter().enumerate() {
+        for (i, elem) in decoded_mask.iter().enumerate() {
             if *elem {
                 debug_serial_print!("{}, ", i);
             }
         }
         debug_serial_println!("");
+
+        let present_cpus: Vec<u32> = decoded_mask
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &present)| if present { Some(i as u32) } else { None })
+            .collect();
+
+        if present_cpus.is_empty() {
+            serial_println!("No CPUs found in cpu_present_mask");
+            return Err(Errno::EINVAL);
+        }
+
+        // Initialize APs for present CPUs
+        init_vtl_aps(&present_cpus).map_err(|_| Errno::EINVAL)?;
+
+        Ok(0)
     } else {
         serial_println!("Failed to get cpu_present_mask");
         return Err(Errno::EINVAL);
-    }
-
-    // TODO: cpu_present_mask vs num_possible_cpus in kernel command line. which one should we use?
-    if let Ok(num_cores) = get_num_possible_cpus() {
-        debug_serial_println!("the number of possible cores: {num_cores}");
-        init_vtl_aps(num_cores).map_err(|_| Errno::EINVAL)?;
-        Ok(0)
-    } else {
-        Err(Errno::EINVAL)
     }
 }
 
@@ -155,21 +163,22 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
             }
         }
         debug_serial_println!("");
-    } else {
-        serial_println!("Failed to get cpu_online_mask");
-        return Err(Errno::EINVAL);
-    }
 
-    // boot_signal is an array of bytes whose length is the number of possible cores. Copy the entire page for now.
-    if let Some(mut boot_signal_page_buf) =
-        unsafe { crate::platform_low().copy_from_vtl0_phys::<AlignedPage>(boot_signal_page_addr) }
-    {
+        // boot_signal is an array of bytes whose length is the number of possible cores. Copy the entire page for now.
+        let Some(mut boot_signal_page_buf) = (unsafe {
+            crate::platform_low().copy_from_vtl0_phys::<AlignedPage>(boot_signal_page_addr)
+        }) else {
+            serial_println!("Failed to get boot signal page");
+            return Err(Errno::EINVAL);
+
+        };
         // TODO: execute `init_vtl_ap` for each online core and update the corresponding boot signal byte.
         // Currently, we use `init_vtl_aps` to initialize all present cores which
         // takes a long time if we have a lot of cores.
-        debug_serial_println!("updating boot signal page");
-        for i in 0..get_num_possible_cpus().unwrap_or(0) {
-            boot_signal_page_buf.0[i as usize] = HV_SECURE_VTL_BOOT_TOKEN;
+        for (i, elem) in cpu_mask.decode_cpu_mask().iter().enumerate() {
+            if *elem {
+                boot_signal_page_buf.0[i as usize] = HV_SECURE_VTL_BOOT_TOKEN;
+            }
         }
 
         if unsafe {
@@ -182,7 +191,7 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
             Err(Errno::EINVAL)
         }
     } else {
-        serial_println!("Failed to get boot signal page");
+        serial_println!("Failed to get cpu_online_mask");
         Err(Errno::EINVAL)
     }
 }
