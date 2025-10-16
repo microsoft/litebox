@@ -138,7 +138,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new(cli_args.tun_device_name.as_deref());
     litebox_platform_multiplex::set_platform(platform);
-    let litebox = litebox_shim_linux::litebox();
+    let litebox = litebox_shim_linux::init_process(platform.init_task());
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
         let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();

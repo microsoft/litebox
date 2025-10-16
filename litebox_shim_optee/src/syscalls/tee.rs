@@ -9,9 +9,6 @@ use litebox_common_optee::{
     UserTaPropType, UteeParams,
 };
 
-#[cfg(feature = "platform_linux_userland")]
-use litebox::platform::ThreadLocalStorageProvider;
-
 use crate::{
     litebox_page_manager,
     syscalls::pta::{
@@ -43,10 +40,7 @@ pub fn sys_return(ret: usize) -> usize {
 
     cfg_if::cfg_if! {
         if #[cfg(feature = "platform_linux_userland")] {
-            let tid = litebox_platform_multiplex::Platform::
-                with_thread_local_storage_mut(|tls| tls.current_task.tid);
-            #[allow(clippy::cast_sign_loss)]
-            let session_id = tid as u32;
+            let session_id = crate::SESSION_ID.load(core::sync::atomic::Ordering::Relaxed);
             crate::optee_command_dispatcher(session_id, true);
         }
     }

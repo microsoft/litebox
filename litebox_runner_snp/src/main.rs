@@ -93,11 +93,10 @@ pub extern "C" fn sandbox_process_init(
             & !(litebox::mm::linux::PAGE_SIZE as u64 - 1),
     );
     let platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel::new(pgd);
-    litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel::set_init_tls(boot_params);
     litebox::log_println!(platform, "sandbox_process_init called");
 
     litebox_platform_multiplex::set_platform(platform);
-    let litebox = litebox_shim_linux::litebox();
+    let litebox = litebox_shim_linux::init_process(platform.init_task(boot_params));
     let in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, ROOTFS.into());
     litebox_shim_linux::set_fs(litebox_shim_linux::default_fs(in_mem_fs, tar_ro));

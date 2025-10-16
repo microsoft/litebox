@@ -25,15 +25,15 @@ fn ratchet_transmutes() -> Result<()> {
 fn ratchet_globals() -> Result<()> {
     ratchet(
         &[
-            ("litebox/", 1),
+            ("litebox/", 5),
             ("litebox_platform_linux_kernel/", 4),
-            ("litebox_platform_linux_userland/", 3),
+            ("litebox_platform_linux_userland/", 4),
             ("litebox_platform_lvbs/", 17),
             ("litebox_platform_multiplex/", 1),
-            ("litebox_platform_windows_userland/", 5),
+            ("litebox_platform_windows_userland/", 6),
             ("litebox_runner_linux_userland/", 1),
-            ("litebox_shim_linux/", 12),
-            ("litebox_shim_optee/", 9),
+            ("litebox_shim_linux/", 13),
+            ("litebox_shim_optee/", 10),
         ],
         |file| {
             Ok(file
@@ -80,18 +80,19 @@ fn ratchet_maybe_uninit() -> Result<()> {
 /// `expected` is a list of (file name prefix, expected count) pairs.
 fn ratchet(expected: &[(&str, usize)], f: impl Fn(BufReader<File>) -> Result<usize>) -> Result<()> {
     let all_rs_files = crate::all_rs_files()?.collect::<Vec<std::path::PathBuf>>();
+    let mut errors = Vec::new();
 
     for (i, (prefix_i, _)) in expected.iter().enumerate() {
         if !prefix_i.ends_with('/') {
-            bail!(
+            errors.push(format!(
                 "The prefix '{prefix_i}' should end with a '/'. Please make sure all prefixes end with a '/' to avoid accidental overlaps."
-            );
+            ));
         }
         for (j, (prefix_j, _)) in expected.iter().enumerate() {
             if i != j && prefix_i.starts_with(prefix_j) {
-                bail!(
+                errors.push(format!(
                     "The prefix '{prefix_j}' is a prefix of '{prefix_i}'. Please make sure the prefixes are unique and non-overlapping."
-                );
+                ));
             }
         }
         for (prefix, _) in expected {
@@ -99,9 +100,9 @@ fn ratchet(expected: &[(&str, usize)], f: impl Fn(BufReader<File>) -> Result<usi
                 .iter()
                 .any(|p| p.to_string_lossy().starts_with(prefix))
             {
-                bail!(
+                errors.push(format!(
                     "The prefix '{prefix}' does not match any file. Please make sure all prefixes match at least one file."
-                );
+                ));
             }
         }
     }
@@ -112,9 +113,9 @@ fn ratchet(expected: &[(&str, usize)], f: impl Fn(BufReader<File>) -> Result<usi
             .any(|(prefix, _)| file_name.starts_with(prefix))
             && f(BufReader::new(File::open(p).unwrap()))? > 0
         {
-            bail!(
+            errors.push(format!(
                 "The file '{file_name}'  that with a non-zero ratchet value is not covered by any prefix.\nPlease make sure all files are covered by some prefix."
-            );
+            ));
         }
     }
 
@@ -128,24 +129,28 @@ fn ratchet(expected: &[(&str, usize)], f: impl Fn(BufReader<File>) -> Result<usi
 
         match count.cmp(expected_count) {
             std::cmp::Ordering::Less => {
-                bail!(
+                errors.push(format!(
                     "Good news!! Ratched count for paths starting with '{prefix}' decreased! :)\n\nPlease reduce the expected count in the ratchet to {count}"
-                )
+                ));
             }
             std::cmp::Ordering::Equal => {
                 if count == 0 {
-                    bail!(
+                    errors.push(format!(
                         "The prefix {prefix} should be removed from the list since the ratchet has succesfully worked! :)"
-                    )
+                    ));
                 }
             }
             std::cmp::Ordering::Greater => {
-                bail!(
+                errors.push(format!(
                     "Ratcheted count for paths starting with '{prefix}' increased by {} :(\n\nYou might be using a feature that is ratcheted (i.e., we are aiming to reduce usage of in the codebase).\nTips:\n\tTry if you can work without using this feature.\n\tIf you think the heuristic detection is incorrect, you might need to update the ratchet's heuristic.\n\tIf the heuristic is correct, you might need to update the count.",
                     count - expected_count
-                )
+                ));
             }
         }
+    }
+
+    if !errors.is_empty() {
+        bail!("Ratchet test failed:\n{}", errors.join("\n\n"));
     }
 
     Ok(())

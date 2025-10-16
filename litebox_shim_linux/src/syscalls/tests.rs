@@ -19,12 +19,13 @@ const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
 pub(crate) fn init_platform(tun_device_name: Option<&str>) {
     INIT_FUNC.call_once(|| {
         #[cfg(target_os = "linux")]
-        set_platform(Platform::new(tun_device_name));
+        let platform = Platform::new(tun_device_name);
 
         #[cfg(not(target_os = "linux"))]
-        set_platform(Platform::new());
+        let platform = Platform::new();
 
-        let litebox = crate::litebox();
+        set_platform(platform);
+        let litebox = crate::init_process(platform.init_task());
         let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
         in_mem_fs.with_root_privileges(|fs| {
             fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
