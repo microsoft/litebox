@@ -294,9 +294,13 @@ impl Socket {
                             litebox_common_linux::TimeVal::default,
                             litebox_common_linux::TimeVal::from,
                         );
-                        let optval = MutPtr::from_usize(optval.as_usize());
-                        unsafe { optval.write_at_offset(0, tv) }.ok_or(Errno::EFAULT)?;
-                        size_of::<litebox_common_linux::TimeVal>()
+                        // If the provided buffer is too small, we just write as much as we can.
+                        let length = size_of::<litebox_common_linux::TimeVal>().min(len as usize);
+                        let data = unsafe {
+                            core::slice::from_raw_parts((&raw const tv).cast::<u8>(), length)
+                        };
+                        unsafe { optval.write_slice_at_offset(0, data) }.ok_or(Errno::EFAULT)?;
+                        length
                     }
                     _ => {
                         let val = match sopt {
@@ -312,9 +316,11 @@ impl Socket {
                             | SocketOption::SNDTIMEO
                             | SocketOption::LINGER => unreachable!(),
                         };
-                        let data = &val.to_ne_bytes()[..size_of::<u32>().min(len as usize)];
+                        // If the provided buffer is too small, we just write as much as we can.
+                        let length = size_of::<u32>().min(len as usize);
+                        let data = &val.to_ne_bytes()[..length];
                         unsafe { optval.write_slice_at_offset(0, data) }.ok_or(Errno::EFAULT)?;
-                        size_of::<u32>()
+                        length
                     }
                 }
             }
