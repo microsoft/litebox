@@ -476,9 +476,55 @@ syscall_callback:
 /// destructors.
 ///
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
+    // The fast path for switching to the guest relies on rcx == rip. This is
+    // the common case, because the syscall instruction sets rcx to rip at entry
+    // to the kernel. When this is not the case, we use NtContinue to jump to
+    // the guest with the full register state.
+    //
+    // This is much slower, but it is only used for things like signal handlers,
+    // so it should not be on the critical path.
     if ctx.rcx != ctx.rip {
-        // TODO: use SetThreadContext in this case.
-        eprintln!("WARNING: ctx.rcx != ctx.rip, resumed context may be invalid");
+        unsafe {
+            use litebox::utils::ReinterpretSignedExt;
+            use windows_sys::Win32::System::Diagnostics::Debug::*;
+            #[link(name = "ntdll")]
+            unsafe extern "system" {
+                fn NtContinue(
+                    ctx: *const CONTEXT,
+                    raise_alert: u8,
+                ) -> windows_sys::Win32::Foundation::NTSTATUS;
+            }
+            let win_ctx = CONTEXT {
+                ContextFlags: CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64,
+                EFlags: ctx.eflags.truncate(),
+                Rax: ctx.rax as u64,
+                Rcx: ctx.rcx as u64,
+                Rdx: ctx.rdx as u64,
+                Rbx: ctx.rbx as u64,
+                Rsp: ctx.rsp as u64,
+                Rbp: ctx.rbp as u64,
+                Rsi: ctx.rsi as u64,
+                Rdi: ctx.rdi as u64,
+                R8: ctx.r8 as u64,
+                R9: ctx.r9 as u64,
+                R10: ctx.r10 as u64,
+                R11: ctx.r11 as u64,
+                R12: ctx.r12 as u64,
+                R13: ctx.r13 as u64,
+                R14: ctx.r14 as u64,
+                R15: ctx.r15 as u64,
+                Rip: ctx.rip as u64,
+                ..core::mem::zeroed()
+            };
+            let status = NtContinue(&win_ctx, 0);
+            panic!(
+                "NtContinue failed: {}",
+                std::io::Error::from_raw_os_error(
+                    windows_sys::Win32::Foundation::RtlNtStatusToDosError(status)
+                        .reinterpret_as_signed(),
+                ),
+            );
+        }
     }
     unsafe {
         core::arch::asm!(
@@ -1023,7 +1069,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             aligned_base_addr,
             aligned_size,
             initial_permissions,
-            unsafe { GetLastError() }
+            std::io::Error::last_os_error()
         );
 
         if fixed_address {
@@ -1053,7 +1099,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 Win32_Memory::MEM_DECOMMIT,
             ) != 0
         };
-        assert!(ok, "VirtualFree failed: {}", unsafe { GetLastError() });
+        assert!(
+            ok,
+            "VirtualFree failed: {}",
+            std::io::Error::last_os_error()
+        );
         Ok(())
     }
 
@@ -1083,7 +1133,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 &raw mut old_protect,
             ) != 0
         };
-        assert!(ok, "VirtualProtect failed: {}", unsafe { GetLastError() });
+        assert!(
+            ok,
+            "VirtualProtect failed: {}",
+            std::io::Error::last_os_error()
+        );
         Ok(())
     }
 
