@@ -611,7 +611,7 @@ pub enum AddressFamily {
 
 #[repr(u32)]
 #[non_exhaustive]
-#[derive(Debug, IntEnum)]
+#[derive(Clone, Copy, Debug, IntEnum)]
 pub enum SockType {
     Stream = 1,
     Datagram = 2,

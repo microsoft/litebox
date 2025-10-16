@@ -90,6 +90,7 @@ pub(crate) struct Socket {
     /// File status flags (see [`litebox::fs::OFlags::STATUS_FLAGS_MASK`])
     pub(crate) status: AtomicU32,
     pub(crate) close_on_exec: AtomicBool,
+    sock_type: SockType,
     options: litebox::sync::Mutex<Platform, SocketOptions>,
     pollee: Pollee<Platform>,
 }
@@ -105,6 +106,7 @@ impl Drop for Socket {
 impl Socket {
     pub(crate) fn new(
         fd: SocketFd<Platform>,
+        sock_type: SockType,
         flags: SockFlags,
         litebox: &litebox::LiteBox<Platform>,
         init_events: Events,
@@ -119,6 +121,7 @@ impl Socket {
             // `SockFlags` is a subset of `OFlags`
             status: AtomicU32::new(flags.bits()),
             close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
+            sock_type,
             options: litebox.sync().new_mutex(SocketOptions::default()),
             pollee: Pollee::new(litebox),
         }
@@ -304,7 +307,7 @@ impl Socket {
                     }
                     _ => {
                         let val = match sopt {
-                            SocketOption::TYPE => todo!(),
+                            SocketOption::TYPE => self.sock_type as u32,
                             SocketOption::REUSEADDR => u32::from(self.options.lock().reuse_address),
                             SocketOption::BROADCAST => 1, // TODO: We don't support disabling SO_BROADCAST
                             SocketOption::KEEPALIVE => u32::from(self.options.lock().keep_alive),
@@ -526,6 +529,7 @@ pub(crate) fn sys_socket(
             let socket = litebox_net().lock().socket(protocol)?;
             Descriptor::Socket(alloc::sync::Arc::new(Socket::new(
                 socket,
+                ty,
                 flags,
                 crate::litebox(),
                 Events::empty(),
@@ -628,6 +632,7 @@ pub(crate) fn sys_accept(
             let fd = socket.accept()?;
             Descriptor::Socket(alloc::sync::Arc::new(Socket::new(
                 fd,
+                socket.sock_type,
                 flags,
                 crate::litebox(),
                 Events::empty(),
