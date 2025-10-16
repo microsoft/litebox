@@ -287,48 +287,79 @@ pub(crate) fn sys_exit(_status: i32) {
 
 pub(crate) fn sys_exit_group(_status: i32) {}
 
-fn new_thread_callback(
-    args: litebox_common_linux::NewThreadArgs<litebox_platform_multiplex::Platform>,
-) {
-    let litebox_common_linux::NewThreadArgs {
-        task,
-        tls,
-        set_child_tid,
-        callback: _,
-    } = args;
+/// A descriptor for thread-local storage (TLS).
+///
+/// On `x86_64`, this is represented as a `u8`. The TLS pointer can point to
+/// an arbitrary-sized memory region.
+#[cfg(target_arch = "x86_64")]
+type ThreadLocalDescriptor = u8;
 
-    let new_task = litebox_common_linux::Task {
-        pid: task.pid,
-        tid: task.tid, // The actual TID will be set by the platform
-        ppid: task.ppid,
-        clear_child_tid: task.clear_child_tid,
-        robust_list: task.robust_list,
-        credentials: task.credentials.clone(),
-        comm: task.comm,
-    };
-    let child_tid = task.tid;
+/// A descriptor for thread-local storage (TLS).
+///
+/// On `x86`, this is represented as a `UserDesc`, which provides a more
+/// structured descriptor (e.g., base address, limit, flags).
+#[cfg(target_arch = "x86")]
+type ThreadLocalDescriptor = litebox_common_linux::UserDesc;
 
-    // Set the TLS for the platform itself
-    crate::SHIM_TLS.init(crate::LinuxShimTls {
-        current_task: new_task.into(),
-    });
+struct NewThreadArgs<
+    Platform: litebox::platform::RawPointerProvider + litebox::sync::RawSyncPrimitivesProvider,
+> {
+    /// Pointer to thread-local storage (TLS) given by the guest program
+    tls: Option<Platform::RawMutPointer<ThreadLocalDescriptor>>,
+    /// Where to store child TID in child's memory
+    set_child_tid: Option<Platform::RawMutPointer<i32>>,
+    /// Task struct that maintains all per-thread data
+    task: alloc::boxed::Box<litebox_common_linux::Task<Platform>>,
+}
 
-    // Set the TLS for the guest program
-    if let Some(tls) = tls {
-        // Set the TLS base pointer for the new thread
-        #[cfg(target_arch = "x86")]
-        set_thread_area(tls);
+// FUTURE: Consider revisiting this impl, see <https://github.com/microsoft/litebox/issues/431>.
+unsafe impl<Platform> Send for NewThreadArgs<Platform> where
+    Platform:
+        litebox::platform::RawPointerProvider + litebox::sync::RawSyncPrimitivesProvider + Send
+{
+}
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            use litebox::platform::RawConstPointer as _;
-            sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()));
+impl litebox::platform::InitThread for NewThreadArgs<litebox_platform_multiplex::Platform> {
+    fn init(self: alloc::boxed::Box<Self>) {
+        let Self {
+            task,
+            tls,
+            set_child_tid,
+        } = *self;
+
+        let new_task = litebox_common_linux::Task {
+            pid: task.pid,
+            tid: task.tid,
+            ppid: task.ppid,
+            clear_child_tid: task.clear_child_tid,
+            robust_list: task.robust_list,
+            credentials: task.credentials.clone(),
+            comm: task.comm,
+        };
+        let child_tid = task.tid;
+
+        // Set the TLS for the platform itself
+        crate::SHIM_TLS.init(crate::LinuxShimTls {
+            current_task: new_task.into(),
+        });
+
+        // Set the TLS for the guest program
+        if let Some(tls) = tls {
+            // Set the TLS base pointer for the new thread
+            #[cfg(target_arch = "x86")]
+            set_thread_area(tls);
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                use litebox::platform::RawConstPointer as _;
+                sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()));
+            }
         }
-    }
 
-    if let Some(child_tid_ptr) = set_child_tid {
-        // Set the child TID if requested
-        let _ = unsafe { child_tid_ptr.write_at_offset(0, child_tid) };
+        if let Some(child_tid_ptr) = set_child_tid {
+            // Set the child TID if requested
+            let _ = unsafe { child_tid_ptr.write_at_offset(0, child_tid) };
+        }
     }
 }
 
@@ -342,7 +373,7 @@ pub(crate) fn sys_clone(
     stack: Option<crate::MutPtr<u8>>,
     stack_size: usize,
     child_tid: Option<crate::MutPtr<i32>>,
-    tls: Option<crate::MutPtr<litebox_common_linux::ThreadLocalDescriptor>>,
+    tls: Option<crate::MutPtr<ThreadLocalDescriptor>>,
     ctx: &litebox_common_linux::PtRegs,
     main: usize,
 ) -> Result<usize, Errno> {
@@ -407,13 +438,29 @@ pub(crate) fn sys_clone(
         let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid) };
     }
 
+    let stack = stack.expect("Stack must be provided when creating a new thread");
+
+    let mut ctx_copy = *ctx;
+
+    // Update the context for the new thread. Note that the new thread gets a
+    // return value of 0.
+    #[cfg(target_arch = "x86_64")]
+    {
+        ctx_copy.rip = main;
+        ctx_copy.rsp = stack.as_usize() + stack_size;
+        ctx_copy.rax = 0;
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        ctx_copy.eip = main;
+        ctx_copy.esp = stack.as_usize() + stack_size;
+        ctx_copy.eax = 0;
+    }
+
     unsafe {
         platform.spawn_thread(
-            ctx,
-            stack.expect("Stack pointer is required for thread creation"),
-            stack_size,
-            main,
-            Box::new(litebox_common_linux::NewThreadArgs {
+            &ctx_copy,
+            Box::new(NewThreadArgs {
                 tls,
                 set_child_tid,
                 task: Box::new(litebox_common_linux::Task {
@@ -425,7 +472,6 @@ pub(crate) fn sys_clone(
                     credentials,
                     comm,
                 }),
-                callback: new_thread_callback,
             }),
         )
     }?;

@@ -49,33 +49,35 @@ pub trait Provider:
 pub trait ThreadProvider: RawPointerProvider {
     /// Execution context for the current thread of the guest program.
     type ExecutionContext;
-    /// Platform-specific argument needed for the new thread to start
-    type ThreadArgs;
     /// Error type for [`ThreadProvider::spawn_thread`].
     type ThreadSpawnError: core::error::Error;
-    /// Thread identifier type for the spawned thread.
-    type ThreadId: Clone + Send + Sync + 'static;
 
     /// Spawn a new thread with the given entry point.
     ///
-    /// `stack` is a pointer to the stack for the new thread, and `stack_size` is the size of the stack.
+    /// `ctx` contains the initial register state, including the entry point and stack pointer.
     ///
-    /// `entry_point` is the address of the first instruction in the guest program that will be executed
-    /// in the new thread.
-    ///
-    /// `thread_args` is the additional platform-specific argument needed for the new thread to start
+    /// `init_thread` provides an object used to initialize the shim on the new thread.
     ///
     /// # Safety
     ///
-    /// The `entry_point` must be a valid entry point for the new thread.
+    /// The context must be valid.
     unsafe fn spawn_thread(
         &self,
         ctx: &Self::ExecutionContext,
-        stack: <Self as RawPointerProvider>::RawMutPointer<u8>,
-        stack_size: usize,
-        entry_point: usize,
-        thread_args: alloc::boxed::Box<Self::ThreadArgs>,
-    ) -> Result<Self::ThreadId, Self::ThreadSpawnError>;
+        init_thread: alloc::boxed::Box<dyn InitThread>,
+    ) -> Result<(), Self::ThreadSpawnError>;
+}
+
+/// An object to initialize a newly spawned platform thread for use with the
+/// shim that spawned it.
+///
+/// This is implemented by the shim for passing to [`ThreadProvider::spawn_thread`].
+pub trait InitThread: Send {
+    /// Initializes the thread.
+    ///
+    /// After calling this, the caller must run the thread in the shim until it
+    /// exits, or there may be hangs or leaks.
+    fn init(self: alloc::boxed::Box<Self>);
 }
 
 /// Punch through any functionality for a particular platform that is not explicitly part of the
