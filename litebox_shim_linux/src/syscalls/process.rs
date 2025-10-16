@@ -49,7 +49,7 @@ pub(crate) struct Credentials {
 pub(crate) static NEXT_THREAD_ID: AtomicI32 = AtomicI32::new(2); // start from 2, as 1 is used by the main thread
 
 /// Set the current task's command name.
-pub fn set_task_comm(comm: &[u8]) {
+pub(crate) fn set_task_comm(comm: &[u8]) {
     with_current_task(|task| {
         let mut new_comm = [0u8; litebox_common_linux::TASK_COMM_LEN];
         let comm = &comm[..comm.len().min(litebox_common_linux::TASK_COMM_LEN - 1)];
@@ -941,24 +941,6 @@ pub(crate) fn sys_futex(
     Ok(res)
 }
 
-pub type ExecveCallback = fn(
-    path: &str,
-    argv: alloc::vec::Vec<alloc::ffi::CString>,
-    envp: alloc::vec::Vec<alloc::ffi::CString>,
-);
-static EXECVE_CALLBACK: once_cell::race::OnceBox<ExecveCallback> = once_cell::race::OnceBox::new();
-
-/// Set the execve callback, which is responsible for loading and jumping to the new program.
-///
-/// # Panics
-///
-/// This function should be called only once during initialization.
-pub fn set_execve_callback(callback: ExecveCallback) {
-    EXECVE_CALLBACK
-        .set(Box::new(callback))
-        .expect("execve callback already set");
-}
-
 const MAX_VEC: usize = 4096; // limit count
 const MAX_TOTAL_BYTES: usize = 256 * 1024; // size cap
 
@@ -969,7 +951,7 @@ pub(crate) fn sys_execve(
     pathname: crate::ConstPtr<i8>,
     argv: crate::ConstPtr<crate::ConstPtr<i8>>,
     envp: crate::ConstPtr<crate::ConstPtr<i8>>,
-    ctx: &litebox_common_linux::PtRegs,
+    ctx: &mut litebox_common_linux::PtRegs,
 ) -> Result<(), Errno> {
     fn copy_vector(
         mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
@@ -1014,7 +996,7 @@ pub(crate) fn sys_execve(
     } else {
         copy_vector(argv, "argv")?
     };
-    let envp_vec = if envp.as_usize() == 0 {
+    let mut envp_vec = if envp.as_usize() == 0 {
         alloc::vec::Vec::new()
     } else {
         copy_vector(envp, "envp")?
@@ -1022,6 +1004,9 @@ pub(crate) fn sys_execve(
 
     // Close CLOEXEC descriptors
     crate::file_descriptors().write().close_on_exec();
+
+    // Clear TLS for the new program.
+    clear_tls(ctx);
 
     // unmmap all memory mappings and reset brk
     with_current_task(|task| {
@@ -1049,11 +1034,34 @@ pub(crate) fn sys_execve(
         ctx.xgs.truncate(),
     );
 
-    let callback = EXECVE_CALLBACK.get().expect("execve callback is not set");
-    // if `execve` fails, it is unrecoverable at this point as we have already unmapped everything.
-    // TODO: add some basic checks before we unmap everything
-    callback(path, argv_vec, envp_vec);
+    // TODO: split this operation into pre-unmap and post-unmap parts, and handle failure properly for both cases.
+    *ctx = crate::load_program(path, argv_vec, envp_vec).unwrap();
+
     Ok(())
+}
+
+fn clear_tls(ctx: &mut litebox_common_linux::PtRegs) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        sys_arch_prctl(ArchPrctlArg::SetFs(0));
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        let gs_selector = u32::try_from(ctx.xgs).unwrap();
+        if gs_selector != 0 {
+            let flags = litebox_common_linux::UserDescFlags(0);
+            let mut user_desc = litebox_common_linux::UserDesc {
+                entry_number: gs_selector >> 3,
+                base_addr: 0,
+                limit: 0,
+                flags,
+            };
+            let user_desc_ptr = litebox::platform::trivial_providers::TransparentMutPtr {
+                inner: &raw mut user_desc,
+            };
+            set_thread_area(user_desc_ptr).expect("failed to clear TLS entry");
+        }
+    }
 }
 
 /// Handle syscall `alarm`.

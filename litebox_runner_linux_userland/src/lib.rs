@@ -215,7 +215,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     })?;
 
     litebox_shim_linux::set_fs(initial_file_system);
-    litebox_shim_linux::syscalls::process::set_execve_callback(load_program);
+    litebox_shim_linux::set_load_filter(fixup_env_aux);
     platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
@@ -250,16 +250,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    load_program(prog_path, argv, envp);
+    let mut pt_regs = litebox_shim_linux::load_program(prog_path, argv, envp)?;
+    unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };
     Ok(())
 }
 
-fn load_program(
-    path: &str,
-    argv: alloc::vec::Vec<alloc::ffi::CString>,
-    mut envp: alloc::vec::Vec<alloc::ffi::CString>,
+fn fixup_env_aux(
+    envp: &mut Vec<alloc::ffi::CString>,
+    aux: &mut litebox_shim_linux::loader::auxv::AuxVec,
 ) {
-    let mut aux = litebox_shim_linux::loader::auxv::init_auxv();
     if litebox_platform_multiplex::platform()
         .get_vdso_address()
         .is_none()
@@ -289,53 +288,4 @@ fn load_program(
     if REQUIRE_RTLD_AUDIT.load(core::sync::atomic::Ordering::SeqCst) {
         envp.push(c"LD_AUDIT=/lib/litebox_rtld_audit.so".into());
     }
-    let loaded_program = litebox_shim_linux::loader::load_program(path, argv, envp, aux).unwrap();
-    let comm = path.rsplit('/').next().unwrap_or("unknown");
-    litebox_shim_linux::syscalls::process::set_task_comm(comm.as_bytes());
-
-    #[cfg(target_arch = "x86_64")]
-    let mut pt_regs = litebox_common_linux::PtRegs {
-        r15: 0,
-        r14: 0,
-        r13: 0,
-        r12: 0,
-        rbp: 0,
-        rbx: 0,
-        r11: 0,
-        r10: 0,
-        r9: 0,
-        r8: 0,
-        rax: 0,
-        rcx: 0,
-        rdx: 0,
-        rsi: 0,
-        rdi: 0,
-        orig_rax: 0,
-        rip: loaded_program.entry_point,
-        cs: 0x33, // __USER_CS
-        eflags: 0,
-        rsp: loaded_program.user_stack_top,
-        ss: 0x2b, // __USER_DS
-    };
-    #[cfg(target_arch = "x86")]
-    let mut pt_regs = litebox_common_linux::PtRegs {
-        ebx: 0,
-        ecx: 0,
-        edx: 0,
-        esi: 0,
-        edi: 0,
-        ebp: 0,
-        eax: 0,
-        xds: 0,
-        xes: 0,
-        xfs: 0,
-        xgs: 0,
-        orig_eax: 0,
-        eip: loaded_program.entry_point,
-        xcs: 0x23, // __USER_CS
-        eflags: 0,
-        esp: loaded_program.user_stack_top,
-        xss: 0x2b, // __USER_DS
-    };
-    unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };
 }
