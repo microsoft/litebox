@@ -327,7 +327,7 @@ impl litebox::platform::InitThread for NewThreadArgs<litebox_platform_multiplex:
             set_child_tid,
         } = *self;
 
-        let new_task = Box::new(litebox_common_linux::Task {
+        let new_task = litebox_common_linux::Task {
             pid: task.pid,
             tid: task.tid,
             ppid: task.ppid,
@@ -335,7 +335,7 @@ impl litebox::platform::InitThread for NewThreadArgs<litebox_platform_multiplex:
             robust_list: task.robust_list,
             credentials: task.credentials.clone(),
             comm: task.comm,
-        });
+        };
         let child_tid = task.tid;
 
         // Set the TLS for the platform itself
