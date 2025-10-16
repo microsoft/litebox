@@ -22,8 +22,14 @@ use core::sync::atomic::AtomicU8;
 /// # Example
 ///
 /// ```no_run
+/// # struct MyPlatform;
+/// # unsafe impl litebox::platform::ThreadLocalStorageProvider for MyPlatform {
+/// #     fn get_thread_local_storage() -> *mut () { todo!() }
+/// #     unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () { todo!() }
+/// #     fn clear_guest_thread_local_storage() { todo!() }
+/// # }
 /// litebox::shim_thread_local! {
-///     #[platform = litebox::platform::mock::MockPlatform]
+///     #[platform = MyPlatform]
 ///     static MY_TLS: core::cell::Cell<u32>;
 /// }
 ///
