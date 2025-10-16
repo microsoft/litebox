@@ -312,7 +312,7 @@ struct NewThreadArgs<
     task: alloc::boxed::Box<litebox_common_linux::Task<Platform>>,
 }
 
-// TODO: impl Send for RawMutPointer and family so that this manual impl is not needed.
+// FUTURE: Consider revisiting this impl, see <https://github.com/microsoft/litebox/issues/431>.
 unsafe impl<Platform> Send for NewThreadArgs<Platform> where
     Platform:
         litebox::platform::RawPointerProvider + litebox::sync::RawSyncPrimitivesProvider + Send
