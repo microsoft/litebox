@@ -259,7 +259,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     litebox_shim_linux::syscalls::process::set_task_comm(comm.as_bytes());
 
     #[cfg(target_arch = "x86_64")]
-    let pt_regs = litebox_common_linux::PtRegs {
+    let mut pt_regs = litebox_common_linux::PtRegs {
         r15: 0,
         r14: 0,
         r13: 0,
@@ -283,6 +283,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         ss: 0x2b, // __USER_DS
     };
 
-    unsafe { litebox_platform_windows_userland::thread_start_asm(&pt_regs) };
+    unsafe { litebox_platform_windows_userland::run_thread(&mut pt_regs) };
     Ok(())
 }

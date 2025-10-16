@@ -285,137 +285,204 @@ impl WindowsUserland {
 
 impl litebox::platform::Provider for WindowsUserland {}
 
-#[cfg(target_arch = "x86_64")]
+/// Runs a guest thread with the given initial context.
+///
+/// This will run until the thread terminates.
+///
+/// # Safety
+/// The context must be valid guest context.
+pub unsafe fn run_thread(ctx: &mut litebox_common_linux::PtRegs) {
+    unsafe { run_thread_inner(ctx) }
+}
+
+// Define TLS for the asm code to use.
 core::arch::global_asm!(
     "
-    .text
-    .align  4
-    .globl  thread_start_asm
-thread_start_asm:
-    /* The following layout should match PtRegs */
-    sub rsp, 16
-    pushfq
-    sub rsp, 24
-    push rdi
-    push rsi
-    push rdx
-    push rcx
-    push rax
-    push r8
-    push r9
-    push r10
-    push r11
-    push rbx
-    push rbp
-    push r12
-    push r13
-    push r14
-    push r15
-
-    mov rbp, rsp
-    and rsp, -16
-
-    mov rdx, rbp /* frame pointer */
-    call thread_start_internal
-
-    /* The following code should never be executed,
-       because the second half of this function
-       is actually executed in syscall_callback
-       when a thread terminates. If we reach here,
-       it indicates an unexpected return from thread_start_internal.
-       Trigger an interrupt to generate a signal (SIGTRAP). */
-    int3
+    .section .tls$,\"dw\"
+    .p2align 3, 0
+host_sp:
+    .quad 0
+host_bp:
+    .quad 0
+scratch:
+    .quad 0
+guest_context_top:
+    .quad 0
 "
 );
 
-unsafe extern "C" {
-    /// Assembly function that captures execution context and initiates guest thread startup.
-    ///
-    /// This function is the entry point for starting a guest thread. It performs the following:
-    ///
-    /// 1. Saves all general-purpose registers, flags, and other CPU state onto the stack
-    ///    in a layout that matches the `PtRegs` structure.
-    /// 2. Captures the current frame pointer (RBP/EBP).
-    /// 3. Calls `thread_start_internal` with:
-    ///    - `ctx`: A reference to the provided `PtRegs` structure (passed in RDI/stack)
-    ///    - `frame_pointer`: The captured frame pointer value
-    ///
-    /// ## Stack Layout Coordination with `syscall_callback`
-    ///
-    /// This function's stack layout is carefully designed to match the stack layout used by
-    /// `syscall_callback`. This coordination enables a critical optimization for thread termination:
-    ///
-    /// * When `syscall_callback` handles a syscall, it switches from the guest's stack to the
-    ///   platform's stack (RSP/RBP), which are the values captured and stored by this function.
-    /// * When a thread terminates (via exit syscall), instead of switching back to the guest's
-    ///   stack and frame pointer, the termination path simply pops the registers from the stack
-    ///   that was set up by `thread_start_asm`.
-    /// * This creates a "stitched" stack layout where the `syscall_callback` register restoration
-    ///   directly unwinds to the frame created by `thread_start_asm`, allowing a clean return
-    ///   to the caller of `thread_start_asm` without explicitly managing the guest stack.
-    ///
-    /// In essence, the platform stack frame created here serves as both the initial context
-    /// for the guest thread and the final unwinding point when the thread terminates.
-    ///
-    /// # Parameters
-    ///
-    /// * `ctx` - A reference to a `PtRegs` structure containing the initial register state
-    ///   for the guest thread. On x86-64, this is passed in RDI. On x86, it's passed on the stack.
-    ///
-    /// # Safety
-    ///
-    /// This function is unsafe because:
-    /// * It must be called with a valid `PtRegs` reference.
-    /// * It modifies the stack extensively to save/restore register state.
-    /// * It assumes the stack has sufficient space for the register save area.
-    /// * Thread-local storage must be properly initialized before calling this function.
-    /// * The stack layout must remain compatible with `syscall_callback` for proper thread termination.
-    pub fn thread_start_asm(ctx: &litebox_common_linux::PtRegs);
+/// Runs the guest thread until it terminates.
+///
+/// This saves all non-volatile register state then switches to the guest
+/// context. When the guest makes a syscall, it jumps back into the middle of
+/// this routine, at `syscall_callback`. This code then updates the guest
+/// context structure, switches back to the host stack, and calls the syscall
+/// handler.
+///
+/// When the guest thread terminates, this function returns after restoring
+/// non-volatile register state.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+unsafe extern "C-unwind" fn run_thread_inner(ctx: &mut litebox_common_linux::PtRegs) {
+    core::arch::naked_asm!(
+    "
+    .seh_proc run_thread
+    // Push all non-volatiles
+    push rbp
+    .seh_pushreg rbp
+    mov rbp, rsp
+    .seh_setframe rbp, 0
+    push rbx
+    .seh_pushreg rbx
+    push rdi
+    .seh_pushreg rdi
+    push rsi
+    .seh_pushreg rsi
+    push r12
+    .seh_pushreg r12
+    push r13
+    .seh_pushreg r13
+    push r14
+    .seh_pushreg r14
+    push r15
+    .seh_pushreg r15
+    sub rsp, 168 // align + space for xmm6-xmm15
+    .seh_stackalloc 168
+    movdqa [rsp + 0*16], xmm6
+    .seh_savexmm xmm6, 0*16
+    movdqa [rsp + 1*16], xmm7
+    .seh_savexmm xmm7, 1*16
+    movdqa [rsp + 2*16], xmm8
+    .seh_savexmm xmm8, 2*16
+    movdqa [rsp + 3*16], xmm9
+    .seh_savexmm xmm9, 3*16
+    movdqa [rsp + 4*16], xmm10
+    .seh_savexmm xmm10, 4*16
+    movdqa [rsp + 5*16], xmm11
+    .seh_savexmm xmm11, 5*16
+    movdqa [rsp + 6*16], xmm12
+    .seh_savexmm xmm12, 6*16
+    movdqa [rsp + 7*16], xmm13
+    .seh_savexmm xmm13, 7*16
+    movdqa [rsp + 8*16], xmm14
+    .seh_savexmm xmm14, 8*16
+    movdqa [rsp + 9*16], xmm15
+    .seh_savexmm xmm15, 9*16
+    .seh_endprologue
+
+    // Save the host rsp and rbp and guest context
+    mov     r11d, DWORD PTR [rip + _tls_index]
+    mov     r8, QWORD PTR gs:[88]
+    mov     r11, QWORD PTR [r8 + r11 * 8]
+    mov     QWORD PTR [r11 + host_sp@SECREL32], rsp
+    mov     QWORD PTR [r11 + host_bp@SECREL32], rbp
+    lea     rax, [rcx + {GUEST_CONTEXT_SIZE}]
+    mov     QWORD PTR [r11 + guest_context_top@SECREL32], rax
+
+    // Switch to the guest context. When the guest issues a syscall, it will
+    // jump back into the middle of this function, at `syscall_callback`.
+    call {switch_to_guest}
+    ud2
+
+    // This entry point is called from the guest when it issues a syscall
+    // instruction.
+    //
+    // At entry, the register context is the guest context with the
+    // return address in rcx. r11 is an available scratch register (it would
+    // contain rflags if the syscall instruction had actually been issued).
+syscall_callback:
+    // Set rsp to the top of the guest context.
+    mov     r11d, DWORD PTR [rip + _tls_index]
+    shl     r11d, 3
+    add     r11, QWORD PTR gs:[88]
+    mov     r11, QWORD PTR [r11]
+    mov     QWORD PTR [r11 + scratch@SECREL32], rsp
+    mov     rsp, QWORD PTR [r11 + guest_context_top@SECREL32]
+
+    // TODO: save float and vector registers (xsave or fxsave)
+    // Save caller-saved registers
+    push    0x2b       // pt_regs->ss = __USER_DS
+    push    QWORD PTR [r11 + scratch@SECREL32] // pt_regs->sp
+    pushfq             // pt_regs->eflags
+    push    0x33       // pt_regs->cs = __USER_CS
+    push    rcx        // pt_regs->ip
+    push    rax        // pt_regs->orig_ax
+
+    push    rdi         // pt_regs->di
+    push    rsi         // pt_regs->si
+    push    rdx         // pt_regs->dx
+    push    rcx         // pt_regs->cx
+    push    -38         // pt_regs->ax = ENOSYS
+    push    r8          // pt_regs->r8
+    push    r9          // pt_regs->r9
+    push    r10         // pt_regs->r10
+    push    [rsp + 88]  // pt_regs->r11 = rflags
+    push    rbx         // pt_regs->bx
+    push    rbp         // pt_regs->bp
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+
+    /// Pass the syscall number and the pt_regs to syscall_handler.
+    mov rcx, rax
+    mov     rdx, rsp
+
+    /// Reestablish the stack and frame pointers.
+    mov     rsp, [r11 + host_sp@SECREL32]
+    mov     rbp, [r11 + host_bp@SECREL32]
+
+    // Call syscall_handler
+    call {syscall_handler}
+
+    // The thread is exiting. Restore non-volatile registers and return.
+    lea  rsp, [rbp - (168 + 56)]
+    movdqa xmm6, [rsp + 0*16]
+    movdqa xmm7, [rsp + 1*16]
+    movdqa xmm8, [rsp + 2*16]
+    movdqa xmm9, [rsp + 3*16]
+    movdqa xmm10, [rsp + 4*16]
+    movdqa xmm11, [rsp + 5*16]
+    movdqa xmm12, [rsp + 6*16]
+    movdqa xmm13, [rsp + 7*16]
+    movdqa xmm14, [rsp + 8*16]
+    movdqa xmm15, [rsp + 9*16]
+    add rsp, 168 // 10 * 16 + 8 (for stack alignment)
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rsi
+    pop  rdi
+    pop  rbx
+    pop  rbp
+    ret
+    .seh_endproc
+    ",
+    syscall_handler = sym syscall_handler,
+    switch_to_guest = sym switch_to_guest,
+    GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
+    );
 }
 
-/// Internal function called from assembly to initialize a new guest thread.
-///
-/// This function is called from the `thread_start_asm` assembly routine after it has
-/// captured the current execution context (registers) and stack/frame pointers. It stores
-/// the captured stack and frame pointers into thread-local storage and then starts the
-/// guest thread execution.
-///
-/// # Parameters
-///
-/// * `ctx` - A reference to the captured processor register state (`PtRegs`) containing
-///   all general-purpose registers, flags, and other CPU state at the point of entry.
-/// * `frame_pointer` - The frame pointer (RBP/EBP) value at the time of entry, used
-///   for stack frame traversal and debugging.
+/// Switches to the provided guest context.
 ///
 /// # Safety
+/// The context must be valid guest context. This can only be called if
+/// `run_thread_inner` is on the stack; after the guest exits, it will return to
+/// the interior of `run_thread_inner`.
 ///
-/// This function is marked `unsafe` because:
+/// Do not call this at a point where the stack needs to be unwound to run
+/// destructors.
 ///
-/// * It must be called from assembly code with a valid C calling convention.
-/// * The `ctx` reference must point to a valid `PtRegs` structure that has been properly
-///   initialized by the assembly caller (`thread_start_asm`).
-/// * The `frame_pointer` must be valid addresses within the current
-///   thread's stack space.
-/// * It accesses thread-local storage which must have been properly initialized for the
-///   calling thread.
-/// * It may modify thread-local state that affects subsequent execution.
-/// * The function must only be called in the context where the thread is ready to start
-///   guest execution.
-///
-/// # Panics
-///
-/// May panic if thread-local storage has not been properly initialized for the calling thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn thread_start_internal(
-    ctx: &litebox_common_linux::PtRegs,
-    frame_pointer: usize,
-) {
-    STORED_BP.set(Some(frame_pointer));
-
-    #[cfg(target_arch = "x86_64")]
+unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
+    if ctx.rcx != ctx.rip {
+        // TODO: use SetThreadContext in this case.
+        eprintln!("WARNING: ctx.rcx != ctx.rip, resumed context may be invalid");
+    }
     unsafe {
         core::arch::asm!(
-            "mov rsp, rax",
+            "mov rsp, {ctx}",
             "pop r15",
             "pop r14",
             "pop r13",
@@ -431,27 +498,26 @@ pub unsafe extern "C" fn thread_start_internal(
             "pop rdx",
             "pop rsi",
             "pop rdi",
-            "pop r10", // skip orig_rax
-            "pop r10", // read rip into r10
-            "pop r11", // skip cs
+            "pop rcx", // skip orig_rax
+            "pop rcx", // read rip into rcx
+            "add rsp, 8", // skip cs
             "popfq",
-            "pop r11", // read rsp into rax
-            "mov rsp, r11", // set rsp to the stack_top of the guest
-            "jmp r10", // jump to the entry point of the thread
-            in("rax") ctx,
-            options(noreturn)
+            "pop rsp",
+            "jmp rcx", // jump to the entry point of the thread
+            ctx = in(reg) ctx,
+            options(noreturn, nostack)
         );
     }
 }
 
 fn thread_start(
     init_thread: Box<dyn litebox::platform::InitThread>,
-    ctx: litebox_common_linux::PtRegs,
+    mut ctx: litebox_common_linux::PtRegs,
 ) {
     // Allow caller to run some code before we return to the new thread.
     init_thread.init();
 
-    unsafe { thread_start_asm(&ctx) };
+    unsafe { run_thread(&mut ctx) };
 }
 
 impl litebox::platform::ThreadProvider for WindowsUserland {
@@ -1111,115 +1177,6 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
     }
 }
 
-thread_local! {
-    static STORED_BP: Cell<Option<usize>> = const { Cell::new(None) };
-}
-
-#[unsafe(no_mangle)]
-unsafe extern "C" fn swap_bp(bp_to_swap: usize) -> usize {
-    STORED_BP.replace(Some(bp_to_swap)).unwrap()
-}
-
-core::arch::global_asm!(
-    "
-    .text
-    .align  4
-    .globl  syscall_callback
-syscall_callback:
-    /* Push the return address onto the stack */
-    push    rcx
-    /* TODO: save float and vector registers (xsave or fxsave) */
-    /* Save caller-saved registers */
-    push    0x2b       /* pt_regs->ss = __USER_DS */
-    push    rsp        /* pt_regs->sp */
-    pushfq             /* pt_regs->eflags */
-    push    0x33       /* pt_regs->cs = __USER_CS */
-    push    rcx        /* pt_regs->ip */
-    push    rax        /* pt_regs->orig_ax */
-
-    push    rdi         /* pt_regs->di */
-    push    rsi         /* pt_regs->si */
-    push    rdx         /* pt_regs->dx */
-    push    rcx         /* pt_regs->cx */
-    push    -38         /* pt_regs->ax = ENOSYS */
-    push    r8          /* pt_regs->r8 */
-    push    r9          /* pt_regs->r9 */
-    push    r10         /* pt_regs->r10 */
-    push    r11         /* pt_regs->r11 */
-    push    rbx         /* pt_regs->bx */
-    push    rbp         /* pt_regs->bp */
-
-    push    r12
-    push    r13
-    push    r14
-    push    r15
-
-    /* Save the original stack pointer */
-    mov  rbp, rsp
-
-    /* Align the stack to 16 bytes */
-    and rsp, -16
-
-    /* Save the syscall number */
-    mov r14, rbp
-    mov r15, rax
-
-    /* Switch to platform rbp */
-    mov rcx, rbp
-    call swap_bp
-    mov rbp, rax
-
-    /* Recover the aligned stack pointer */
-    mov rsp, rbp
-    and rsp, -16
-
-    /* Pass the syscall number to the syscall dispatcher */
-    mov rcx, r15
-    /* Pass pt_regs saved on stack to syscall dispatcher */
-    mov rdx, r14
-
-    /* Call syscall_handler */
-    call syscall_handler
-    test al, al
-    jz .Lcontinue_execution
-
-    /* Switch back to guest rbp */
-    mov rcx, rbp
-    call swap_bp
-    mov rbp, rax
-
-.Lcontinue_execution:
-
-    /* Restore the original stack pointer */
-    mov  rsp, rbp
-
-    pop  r15
-    pop  r14
-    pop  r13
-    pop  r12
-
-    /* Restore caller-saved registers */
-    pop  rbp
-    pop  rbx
-    pop  r11
-    pop  r10
-    pop  r9
-    pop  r8
-    pop  rax
-    pop  rcx
-    pop  rdx
-    pop  rsi
-    pop  rdi
-
-    add  rsp, 24         /* skip orig_rax, rip, cs */
-    popfq
-    add  rsp, 16         /* skip rsp, ss */
-
-    /* Return to the caller */
-    ret
-"
-);
-
 unsafe extern "C" {
     // Defined in asm blocks above
     fn syscall_callback() -> isize;
@@ -1235,21 +1192,23 @@ unsafe extern "C" {
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-#[unsafe(no_mangle)]
-unsafe extern "C" fn syscall_handler(
+unsafe extern "C-unwind" fn syscall_handler(
     _syscall_number: usize,
     ctx: &mut litebox_common_linux::PtRegs,
-) -> bool {
+) {
     let syscall_handler: SyscallHandler = SYSCALL_HANDLER
         .read()
         .unwrap()
         .expect("Should have run `register_syscall_handler` by now");
-    match syscall_handler(ctx) {
+    let resume = match syscall_handler(ctx) {
         ContinueOperation::ResumeGuest => true,
         ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
             ctx.rax = status.reinterpret_as_unsigned() as usize;
             false
         }
+    };
+    if resume {
+        unsafe { switch_to_guest(ctx) };
     }
 }
 
@@ -1278,10 +1237,6 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
 
     unsafe fn replace_thread_local_storage(new_tls: *mut ()) -> *mut () {
         PLATFORM_TLS.replace(new_tls)
-    }
-
-    fn clear_guest_thread_local_storage() {
-        todo!()
     }
 }
 
