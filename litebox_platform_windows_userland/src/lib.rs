@@ -718,10 +718,13 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 )?;
                 Ok(0)
             }
-            _ => {
-                unimplemented!(
-                    "PunchthroughToken for WindowsUserland is not fully implemented yet"
-                );
+            PunchthroughSyscall::RtSigprocmask { .. } => {
+                // Ignored for now.
+                eprintln!("WARNING: ignoring RtSigprocmask punchthrough");
+                Ok(0)
+            }
+            p => {
+                unimplemented!("unimplemented PunchthroughToken for WindowsUserland: {p:?}");
             }
         }
     }

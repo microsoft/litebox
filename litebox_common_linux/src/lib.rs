@@ -2712,6 +2712,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
 /// shim.
 ///
 /// NOTE: It is assumed that all punchthroughs here are non-blocking.
+#[derive(Debug)]
 pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
     /// Examine and change blocked signals
     RtSigprocmask {
