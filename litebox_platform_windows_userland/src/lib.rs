@@ -291,6 +291,10 @@ impl litebox::platform::Provider for WindowsUserland {}
 ///
 /// # Safety
 /// The context must be valid guest context.
+#[expect(
+    clippy::missing_panics_doc,
+    reason = "the caller cannot control whether this will panic"
+)]
 pub unsafe fn run_thread(ctx: &mut litebox_common_linux::PtRegs) {
     // Allocate a TLS slot for this module if not already done. This is used as
     // a place to store data across calls to the guest, since all the registers
@@ -504,9 +508,12 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     // This is much slower, but it is only used for things like signal handlers,
     // so it should not be on the critical path.
     if ctx.rcx != ctx.rip {
+        #[cfg(true)]
         unsafe {
             use litebox::utils::ReinterpretSignedExt;
-            use windows_sys::Win32::System::Diagnostics::Debug::*;
+            use windows_sys::Win32::System::Diagnostics::Debug::{
+                CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64,
+            };
             #[link(name = "ntdll")]
             unsafe extern "system" {
                 fn NtContinue(
@@ -536,7 +543,7 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
                 Rip: ctx.rip as u64,
                 ..core::mem::zeroed()
             };
-            let status = NtContinue(&win_ctx, 0);
+            let status = NtContinue(&raw const win_ctx, 0);
             panic!(
                 "NtContinue failed: {}",
                 std::io::Error::from_raw_os_error(
