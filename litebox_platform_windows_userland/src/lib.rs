@@ -370,9 +370,13 @@ unsafe extern "C-unwind" fn run_thread_inner(ctx: &mut litebox_common_linux::PtR
     .seh_savexmm xmm15, 9*16
     .seh_endprologue
 
+    // Offset of the TLS array in the TEB; our module's TLS data is pointed to
+    // by the pointer at _tls_index offset from this pointer.
+    .equ TEB_TLS_OFFSET, 0x5c
+
     // Save the host rsp and rbp and guest context
     mov     r11d, DWORD PTR [rip + _tls_index]
-    mov     r8, QWORD PTR gs:[88]
+    mov     r8, QWORD PTR gs:[TEB_TLS_OFFSET]
     mov     r11, QWORD PTR [r8 + r11 * 8]
     mov     QWORD PTR [r11 + host_sp@SECREL32], rsp
     mov     QWORD PTR [r11 + host_bp@SECREL32], rbp
@@ -394,7 +398,7 @@ syscall_callback:
     // Set rsp to the top of the guest context.
     mov     r11d, DWORD PTR [rip + _tls_index]
     shl     r11d, 3
-    add     r11, QWORD PTR gs:[88]
+    add     r11, QWORD PTR gs:[TEB_TLS_OFFSET]
     mov     r11, QWORD PTR [r11]
     mov     QWORD PTR [r11 + scratch@SECREL32], rsp
     mov     rsp, QWORD PTR [r11 + guest_context_top@SECREL32]
