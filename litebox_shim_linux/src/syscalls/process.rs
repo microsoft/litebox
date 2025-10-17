@@ -12,6 +12,8 @@ use litebox::platform::{
     RawMutexProvider as _, ThreadLocalStorageProvider as _,
 };
 use litebox::platform::{RawMutPointer as _, ThreadProvider as _};
+#[cfg(target_arch = "x86")]
+use litebox::utils::TruncateExt;
 use litebox_common_linux::{ArchPrctlArg, errno::Errno};
 use litebox_common_linux::{CloneFlags, FutexArgs, PrctlArg};
 
@@ -959,6 +961,7 @@ pub(crate) fn sys_execve(
     pathname: crate::ConstPtr<i8>,
     argv: crate::ConstPtr<crate::ConstPtr<i8>>,
     envp: crate::ConstPtr<crate::ConstPtr<i8>>,
+    ctx: &litebox_common_linux::PtRegs,
 ) -> Result<(), Errno> {
     fn copy_vector(
         mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
@@ -1028,40 +1031,16 @@ pub(crate) fn sys_execve(
         {
             unimplemented!("execve when multiple threads exist is not supported yet");
         }
-        let release = |r: Range<usize>, vm: VmFlags| {
-            // Reserved mappings
-            if vm.is_empty() {
-                return false;
-            }
-            if vm.contains(VmFlags::VM_GROWSDOWN) {
-                // Stack we are currently running on, don't unmap it.
-                // This happens when litebox runs in user space so that
-                // it shares the stack with the guest program.
-                let rsp: usize;
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    core::arch::asm!(
-                        "mov {}, rsp",
-                        out(reg) rsp,
-                    );
-                }
-                #[cfg(target_arch = "x86")]
-                unsafe {
-                    core::arch::asm!(
-                        "mov {}, esp",
-                        out(reg) rsp,
-                    );
-                }
-                if r.start <= rsp && rsp < r.end {
-                    return false;
-                }
-            }
-            true
-        };
+        // Don't release reserved mappings.
+        let release = |r: Range<usize>, vm: VmFlags| !vm.is_empty();
         let page_manager = crate::litebox_page_manager();
         unsafe { page_manager.release_memory(release) }.expect("failed to release memory mappings");
     });
-    litebox_platform_multiplex::Platform::clear_guest_thread_local_storage();
+
+    litebox_platform_multiplex::Platform::clear_guest_thread_local_storage(
+        #[cfg(target_arch = "x86")]
+        ctx.xgs.truncate(),
+    );
 
     let callback = EXECVE_CALLBACK.get().expect("execve callback is not set");
     // if `execve` fails, it is unrecoverable at this point as we have already unmapped everything.
