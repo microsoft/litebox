@@ -389,7 +389,8 @@ unsafe extern "C-unwind" fn run_thread_inner(ctx: &mut litebox_common_linux::PtR
     lea r8, [rdi + {GUEST_CONTEXT_SIZE}]
     mov fs:guest_context_top@tpoff, r8
 
-    // Save host fs base in gs base.
+    // Save host fs base in gs base. This will stay set for the lifetime
+    // of this call stack.
     rdfsbase r8
     wrgsbase r8
 
@@ -436,21 +437,21 @@ syscall_callback:
     push    r14         // pt_regs->r14
     push    r15         // pt_regs->r15
 
-    // Pass syscall number and pt_regs
-    mov     rdi, rax
-    mov     rsi, rsp
+    // Pass pt_regs to syscall_handler.
+    mov     rdi, rsp
 
-    // Restore the stack and frame pointer
+    // Restore the stack and frame pointer.
     mov     rsp, gs:host_sp@tpoff
     mov     rbp, gs:host_bp@tpoff
 
-    // Restore host fs base
+    // Restore host fs base.
     rdfsbase rdx
     mov gs:guest_fsbase@tpoff, rdx
     rdgsbase rdx
     wrfsbase rdx
 
-    // Handle the syscall and resume the guest.
+    // Handle the syscall. This will jump back to the guest but
+    // will return if the thread is exiting.
     call {syscall_handler}
 
     // This thread is done. Return.
@@ -551,9 +552,8 @@ syscall_callback:
     push    ecx         // pt_regs->ecx
     push    ebx         // pt_regs->ebx
 
-    // Pass the sysno and pointer to pt_regs to syscall_handler
-    mov ecx, eax
-    mov edx, esp
+    // Pass the pointer to pt_regs to syscall_handler.
+    mov ecx, esp
 
     // Restore esp and ebp
     mov esp, fs:host_sp@ntpoff
@@ -566,6 +566,8 @@ syscall_callback:
     mov ax, fs
     mov gs, ax
 
+    // Handle the syscall. This will jump back to the guest but
+    // will return if the thread is exiting.
     call {syscall_handler_fast}
 
     lea  esp, [ebp - 3*4]
@@ -585,11 +587,8 @@ syscall_callback:
 
 /// Wrapper around `syscall_handler` to use the fastcall convention.
 #[cfg(target_arch = "x86")]
-unsafe extern "fastcall" fn syscall_handler_fast(
-    syscall_number: usize,
-    ctx: &mut litebox_common_linux::PtRegs,
-) {
-    unsafe { syscall_handler(syscall_number, ctx) }
+unsafe extern "fastcall-unwind" fn syscall_handler_fast(ctx: &mut litebox_common_linux::PtRegs) {
+    unsafe { syscall_handler(ctx) }
 }
 
 /// Switches to the provided guest context.
@@ -1501,18 +1500,15 @@ unsafe extern "C" {
 ///
 /// # Safety
 ///
-/// - The `ctx` pointer must be valid pointer to a
-///   `litebox_common_linux::PtRegs` structure.
+/// - The `ctx` pointer must be valid pointer to a `litebox_common_linux::PtRegs` structure.
+/// - If any syscall argument is a pointer, it must be valid.
 ///
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development
 /// purposes.
 #[allow(clippy::cast_sign_loss)]
-unsafe extern "C-unwind" fn syscall_handler(
-    _syscall_number: usize,
-    ctx: &mut litebox_common_linux::PtRegs,
-) {
+unsafe extern "C-unwind" fn syscall_handler(ctx: &mut litebox_common_linux::PtRegs) {
     let syscall_handler: SyscallHandler = SYSCALL_HANDLER
         .read()
         .unwrap()

@@ -383,7 +383,8 @@ unsafe extern "C-unwind" fn run_thread_inner(ctx: &mut litebox_common_linux::PtR
     .equ SCRATCH, 24
     .equ TLS_SIZE, 32
 
-    // Save space on the stack for the TLS data and store it in the TLS slot.
+    // Save space on the stack for the TLS data and store the pointer to it in
+    // the TLS slot.
     sub     rsp, TLS_SIZE
     mov     r9d, DWORD PTR [rip + {TLS_INDEX}]
     mov     QWORD PTR gs:[r9 * 8 + TEB_TLS_SLOTS_OFFSET], rsp
@@ -438,15 +439,15 @@ syscall_callback:
     push    r14
     push    r15
 
-    /// Pass the syscall number and the pt_regs to syscall_handler.
-    mov rcx, rax
-    mov     rdx, rsp
+    /// Pass the pt_regs to syscall_handler.
+    mov     rcx, rsp
 
     /// Reestablish the stack and frame pointers.
     mov     rsp, [r11 + HOST_SP]
     mov     rbp, [r11 + HOST_BP]
 
-    // Call syscall_handler
+    // Handle the syscall. This will jump back to the guest but
+    // will return if the thread is exiting.
     call {syscall_handler}
 
     // The thread is exiting. Zero the TLS slot to avoid dangling pointers.
@@ -1265,10 +1266,7 @@ unsafe extern "C" {
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-unsafe extern "C-unwind" fn syscall_handler(
-    _syscall_number: usize,
-    ctx: &mut litebox_common_linux::PtRegs,
-) {
+unsafe extern "C-unwind" fn syscall_handler(ctx: &mut litebox_common_linux::PtRegs) {
     let syscall_handler: SyscallHandler = SYSCALL_HANDLER
         .read()
         .unwrap()
