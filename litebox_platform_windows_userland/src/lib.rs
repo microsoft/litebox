@@ -35,38 +35,9 @@ mod perf_counter;
 
 extern crate alloc;
 
-/// Per-thread FS base storage structure
-/// Clone and Copy are required to use std::cell::Cell.
-#[derive(Debug, Clone, Copy)]
-struct ThreadFsBaseState {
-    /// The current FS base value for this thread
-    fs_base: usize,
-}
-
-impl ThreadFsBaseState {
-    const fn new() -> Self {
-        // There's no point in trying to read the current FS base since it will
-        // likely be 0 (as set by Windows scheduler). We just initialize it to 0.
-        Self { fs_base: 0 }
-    }
-
-    fn set_fs_base(&mut self, new_base: usize) {
-        self.fs_base = new_base;
-        unsafe {
-            litebox_common_linux::wrfsbase(new_base);
-        }
-    }
-
-    fn restore_fs_base(self) {
-        unsafe {
-            litebox_common_linux::wrfsbase(self.fs_base);
-        }
-    }
-}
-
 // Thread-local storage for FS base state
 thread_local! {
-    static THREAD_FS_BASE: Cell<ThreadFsBaseState> = const { Cell::new(ThreadFsBaseState::new()) };
+    static THREAD_FS_BASE: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Connector to a shim-exposed syscall-handling interface.
@@ -101,31 +72,26 @@ unsafe impl Sync for WindowsUserland {}
 /// Helper functions for managing per-thread FS base
 impl WindowsUserland {
     /// Get the current thread's FS base state
-    fn get_thread_fs_base_state() -> ThreadFsBaseState {
-        THREAD_FS_BASE.with(std::cell::Cell::get)
+    fn get_thread_fs_base() -> usize {
+        THREAD_FS_BASE.get()
     }
 
     /// Set the current thread's FS base
     fn set_thread_fs_base(new_base: usize) {
-        THREAD_FS_BASE.with(|state| {
-            let mut current_state = state.get();
-            current_state.set_fs_base(new_base);
-            state.set(current_state);
-        });
+        THREAD_FS_BASE.set(new_base);
+        Self::restore_thread_fs_base();
     }
 
     /// Restore the current thread's FS base from saved state
     fn restore_thread_fs_base() {
-        THREAD_FS_BASE.with(|state| {
-            state.get().restore_fs_base();
-        });
+        unsafe {
+            litebox_common_linux::wrfsbase(THREAD_FS_BASE.get());
+        }
     }
 
     /// Initialize FS base state for a new thread
     fn init_thread_fs_base() {
-        THREAD_FS_BASE.with(|state| {
-            state.set(ThreadFsBaseState::new());
-        });
+        Self::set_thread_fs_base(0);
     }
 }
 
@@ -137,9 +103,9 @@ unsafe extern "system" fn exception_handler(exception_info: *mut EXCEPTION_POINT
             let current_fsbase = litebox_common_linux::rdfsbase();
 
             // Get the saved FS base from the per-thread FS state
-            let thread_state = WindowsUserland::get_thread_fs_base_state();
+            let target_fsbase = WindowsUserland::get_thread_fs_base();
 
-            if current_fsbase == 0 && current_fsbase != thread_state.fs_base {
+            if current_fsbase == 0 && current_fsbase != target_fsbase {
                 // Restore the FS base from the saved state
                 WindowsUserland::restore_thread_fs_base();
 
@@ -844,12 +810,8 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 Ok(0)
             }
             PunchthroughSyscall::GetFsBase { addr } => {
-                // Read from the per-thread FS base storage to get the current value
-                let thread_state = WindowsUserland::get_thread_fs_base_state();
-
                 // Use the stored FS base value from our per-thread storage
-                let fs_base = thread_state.fs_base;
-
+                let fs_base = WindowsUserland::get_thread_fs_base();
                 unsafe { addr.write_at_offset(0, fs_base) }.ok_or(
                     litebox::platform::PunchthroughError::Failure(
                         litebox_common_linux::errno::Errno::EFAULT,
@@ -1120,20 +1082,24 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
     unsafe fn deallocate_pages(
         &self,
-        range: core::ops::Range<usize>,
+        mut range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
-        let ok = unsafe {
-            VirtualFree(
-                range.start as *mut c_void,
-                range.len(),
-                Win32_Memory::MEM_DECOMMIT,
-            ) != 0
-        };
-        assert!(
-            ok,
-            "VirtualFree failed: {}",
-            std::io::Error::last_os_error()
-        );
+        // This could be multiple VADs at the NT level. Query and loop.
+        // TODO: this problem probably exists elsewhere; consider refactoring.
+        while !range.is_empty() {
+            let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+            do_query_on_region(&mut mbi, range.start as *mut c_void);
+            let len = mbi.RegionSize.min(range.len());
+            let ok = unsafe {
+                VirtualFree(range.start as *mut c_void, len, Win32_Memory::MEM_DECOMMIT) != 0
+            };
+            assert!(
+                ok,
+                "VirtualFree failed: {}",
+                std::io::Error::last_os_error()
+            );
+            range = (range.start + len)..range.end;
+        }
         Ok(())
     }
 
@@ -1318,6 +1284,10 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
 
     unsafe fn replace_thread_local_storage(new_tls: *mut ()) -> *mut () {
         PLATFORM_TLS.replace(new_tls)
+    }
+
+    fn clear_guest_thread_local_storage() {
+        Self::init_thread_fs_base();
     }
 }
 
