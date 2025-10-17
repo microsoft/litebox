@@ -99,7 +99,7 @@ pub fn init_process<'a>(task: litebox_common_linux::TaskParams) -> &'a LiteBox<P
                 egid,
             }
             .into(),
-            comm: Default::default(), // set at load time
+            comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
             fs: Arc::new(syscalls::file::FsState::new()).into(),
             process: syscalls::process::Process::new().into(),
         },
