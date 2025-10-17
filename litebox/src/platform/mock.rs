@@ -315,8 +315,4 @@ unsafe impl ThreadLocalStorageProvider for MockPlatform {
     unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
         MOCK_TLS.replace(value)
     }
-
-    fn clear_guest_thread_local_storage() {
-        unimplemented!()
-    }
 }

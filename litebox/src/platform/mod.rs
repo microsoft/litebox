@@ -663,5 +663,7 @@ pub unsafe trait ThreadLocalStorageProvider {
     /// This is used to help emulate certain syscalls (e.g., `execve`) that clear TLS.
     ///
     /// TODO: move this to a separate trait or eliminate.
-    fn clear_guest_thread_local_storage();
+    fn clear_guest_thread_local_storage(#[cfg(target_arch = "x86")] _selector: u16) {
+        unimplemented!()
+    }
 }

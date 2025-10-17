@@ -124,10 +124,6 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
         let current_task = current().expect("Current task must be available");
         core::mem::replace(&mut current_task.tls, value.cast()).cast()
     }
-
-    fn clear_guest_thread_local_storage() {
-        todo!()
-    }
 }
 
 core::arch::global_asm!(include_str!("entry.S"));

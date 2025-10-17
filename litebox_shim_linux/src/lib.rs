@@ -438,7 +438,7 @@ pub fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> Continu
             pathname,
             argv,
             envp,
-        } => match syscalls::process::sys_execve(pathname, argv, envp) {
+        } => match syscalls::process::sys_execve(pathname, argv, envp, ctx) {
             Ok(()) => return ContinueOperation::ExitProcess(0),
             Err(err) => Err(err),
         },

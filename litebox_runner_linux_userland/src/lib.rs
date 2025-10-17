@@ -294,7 +294,7 @@ fn load_program(
     litebox_shim_linux::syscalls::process::set_task_comm(comm.as_bytes());
 
     #[cfg(target_arch = "x86_64")]
-    let pt_regs = litebox_common_linux::PtRegs {
+    let mut pt_regs = litebox_common_linux::PtRegs {
         r15: 0,
         r14: 0,
         r13: 0,
@@ -318,7 +318,7 @@ fn load_program(
         ss: 0x2b, // __USER_DS
     };
     #[cfg(target_arch = "x86")]
-    let pt_regs = litebox_common_linux::PtRegs {
+    let mut pt_regs = litebox_common_linux::PtRegs {
         ebx: 0,
         ecx: 0,
         edx: 0,
@@ -337,5 +337,5 @@ fn load_program(
         esp: loaded_program.user_stack_top,
         xss: 0x2b, // __USER_DS
     };
-    unsafe { litebox_platform_linux_userland::thread_start_asm(&pt_regs) };
+    unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };
 }
