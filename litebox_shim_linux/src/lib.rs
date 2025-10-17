@@ -300,6 +300,9 @@ impl Descriptors {
             }
         });
     }
+    fn len(&self) -> usize {
+        self.descriptors.len()
+    }
 }
 
 enum Descriptor {
@@ -759,6 +762,14 @@ pub fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> Continu
             sigsetsize,
         } => syscalls::file::sys_ppoll(fds, nfds, timeout, sigmask, sigsetsize),
         SyscallRequest::Poll { fds, nfds, timeout } => syscalls::file::sys_poll(fds, nfds, timeout),
+        SyscallRequest::Pselect {
+            nfds,
+            readfds,
+            writefds,
+            exceptfds,
+            timeout,
+            sigmask,
+        } => syscalls::file::sys_pselect(nfds, readfds, writefds, exceptfds, timeout, sigmask),
         SyscallRequest::Readlinkat {
             dirfd,
             pathname,

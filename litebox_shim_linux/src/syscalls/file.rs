@@ -6,6 +6,7 @@ use alloc::{
     vec,
 };
 use litebox::{
+    event::Events,
     fd::MetadataError,
     fs::{FileSystem as _, Mode, OFlags, SeekWhence},
     path,
@@ -1292,6 +1293,120 @@ fn do_ppoll(
         }
     }
     Ok(ready_count)
+}
+
+pub(crate) fn do_pselect(
+    nfds: u32,
+    readfds: Option<&mut litebox_common_linux::FdSet>,
+    writefds: Option<&mut litebox_common_linux::FdSet>,
+    exceptfds: Option<&mut litebox_common_linux::FdSet>,
+    timeout: Option<core::time::Duration>,
+) -> Result<usize, Errno> {
+    if nfds as usize >= litebox_common_linux::FD_SETSIZE {
+        return Err(Errno::EINVAL);
+    }
+    let max_fd: u32 = file_descriptors().read().len().truncate();
+    let nfds = nfds.min(max_fd);
+
+    let mut set = super::epoll::PollSet::with_capacity(nfds as usize);
+    for i in 0..nfds {
+        let mut events = litebox::event::Events::empty();
+        if readfds.as_ref().is_some_and(|set| set.is_set(i)) {
+            events |= litebox::event::Events::IN;
+        }
+        if writefds.as_ref().is_some_and(|set| set.is_set(i)) {
+            events |= litebox::event::Events::OUT;
+        }
+        if exceptfds.as_ref().is_some_and(|set| set.is_set(i)) {
+            events |= litebox::event::Events::PRI;
+        }
+        if !events.is_empty() {
+            set.add_fd(i.reinterpret_as_signed(), events);
+        }
+    }
+
+    set.wait_or_timeout(|| file_descriptors().read(), timeout);
+
+    let mut ready_count = 0;
+    if let Some(fds) = readfds {
+        fds.clear();
+        for (i, revents) in set.revents_with_fds() {
+            if revents.intersects(Events::IN | Events::ALWAYS_POLLED) {
+                // no negative fds added to the set
+                fds.set(i.reinterpret_as_unsigned());
+                ready_count += 1;
+            }
+        }
+    }
+    if let Some(fds) = writefds {
+        fds.clear();
+        for (i, revents) in set.revents_with_fds() {
+            if revents.intersects(Events::OUT | Events::ALWAYS_POLLED) {
+                fds.set(i.reinterpret_as_unsigned());
+                ready_count += 1;
+            }
+        }
+    }
+    if let Some(fds) = exceptfds {
+        fds.clear();
+        for (i, revents) in set.revents_with_fds() {
+            if revents.contains(Events::PRI) {
+                fds.set(i.reinterpret_as_unsigned());
+                ready_count += 1;
+            }
+        }
+    }
+    Ok(ready_count)
+}
+
+pub(crate) fn sys_pselect(
+    nfds: u32,
+    readfds: Option<MutPtr<litebox_common_linux::FdSet>>,
+    writefds: Option<MutPtr<litebox_common_linux::FdSet>>,
+    exceptfds: Option<MutPtr<litebox_common_linux::FdSet>>,
+    timeout: Option<ConstPtr<litebox_common_linux::Timespec>>,
+    sigmask: Option<ConstPtr<litebox_common_linux::SigSet>>,
+) -> Result<usize, Errno> {
+    if sigmask.is_some() {
+        unimplemented!("no sigmask support yet");
+    }
+    let timeout = timeout
+        .map(super::process::get_timeout)
+        .transpose()?
+        .map(Into::into);
+
+    let mut kreadfds = readfds
+        .map(|fds| unsafe { fds.read_at_offset(0) }.ok_or(Errno::EFAULT))
+        .transpose()?
+        .map(alloc::borrow::Cow::into_owned);
+    let mut kwritefds = writefds
+        .map(|fds| unsafe { fds.read_at_offset(0) }.ok_or(Errno::EFAULT))
+        .transpose()?
+        .map(alloc::borrow::Cow::into_owned);
+    let mut kexceptfds = exceptfds
+        .map(|fds| unsafe { fds.read_at_offset(0) }.ok_or(Errno::EFAULT))
+        .transpose()?
+        .map(alloc::borrow::Cow::into_owned);
+
+    let count = do_pselect(
+        nfds,
+        kreadfds.as_mut(),
+        kwritefds.as_mut(),
+        kexceptfds.as_mut(),
+        timeout,
+    )?;
+
+    if let Some(fds) = kreadfds {
+        unsafe { readfds.unwrap().write_at_offset(0, fds) }.ok_or(Errno::EFAULT)?;
+    }
+    if let Some(fds) = kwritefds {
+        unsafe { writefds.unwrap().write_at_offset(0, fds) }.ok_or(Errno::EFAULT)?;
+    }
+    if let Some(fds) = kexceptfds {
+        unsafe { exceptfds.unwrap().write_at_offset(0, fds) }.ok_or(Errno::EFAULT)?;
+    }
+
+    Ok(count)
 }
 
 fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {

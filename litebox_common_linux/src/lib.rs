@@ -1796,6 +1796,59 @@ bitflags::bitflags! {
     }
 }
 
+pub const FD_SETSIZE: usize = 1024;
+#[derive(Debug, Default, Clone, Copy)]
+#[repr(C)]
+pub struct FdSet {
+    fds_bits: [usize; FD_SETSIZE / Self::USIZE_BITS],
+}
+
+impl FdSet {
+    const USIZE_BITS: usize = core::mem::size_of::<usize>() * 8;
+    /// Check if a file descriptor is set in the set
+    ///
+    /// # Panics
+    ///
+    /// Panics if `fd` is out of range ( `fd` >= [`FD_SETSIZE`]).
+    pub fn is_set(&self, fd: u32) -> bool {
+        let idx = fd as usize / Self::USIZE_BITS;
+        let bit = fd as usize % Self::USIZE_BITS;
+        (self.fds_bits[idx] & (1 << bit)) != 0
+    }
+
+    /// Clear all file descriptors in the set
+    pub fn clear(&mut self) {
+        self.fds_bits.fill(0);
+    }
+
+    /// Set a file descriptor in the set
+    ///
+    /// # Panics
+    ///
+    /// Panics if `fd` is out of range ( `fd` >= [`FD_SETSIZE`]).
+    pub fn set(&mut self, fd: u32) {
+        let idx = fd as usize / Self::USIZE_BITS;
+        let bit = fd as usize % Self::USIZE_BITS;
+        self.fds_bits[idx] |= 1 << bit;
+    }
+
+    /// Iterate over all set file descriptors in the set
+    pub fn iter(&self) -> impl Iterator<Item = u32> {
+        self.fds_bits.iter().enumerate().flat_map(|(idx, bits)| {
+            let mut bits = *bits;
+            core::iter::from_fn(move || {
+                if bits == 0 {
+                    None
+                } else {
+                    let bit = bits.trailing_zeros();
+                    bits &= !(1 << bit);
+                    Some((idx * Self::USIZE_BITS + bit as usize).truncate())
+                }
+            })
+        })
+    }
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 #[derive(Debug)]
@@ -2024,6 +2077,14 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         timeout: Option<Platform::RawConstPointer<Timespec>>,
         sigmask: Option<Platform::RawConstPointer<SigSet>>,
         sigsetsize: usize,
+    },
+    Pselect {
+        nfds: u32,
+        readfds: Option<Platform::RawMutPointer<FdSet>>,
+        writefds: Option<Platform::RawMutPointer<FdSet>>,
+        exceptfds: Option<Platform::RawMutPointer<FdSet>>,
+        timeout: Option<Platform::RawConstPointer<Timespec>>,
+        sigmask: Option<Platform::RawConstPointer<SigSet>>,
     },
     ArchPrctl {
         arg: ArchPrctlArg<Platform>,
@@ -2572,6 +2633,28 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }
             Sysno::poll => {
                 sys_req!(Poll { fds:*, nfds, timeout })
+            }
+            #[cfg(target_arch = "x86_64")]
+            Sysno::pselect6 => {
+                sys_req!(Pselect {
+                    nfds,
+                    readfds:*,
+                    writefds:*,
+                    exceptfds:*,
+                    timeout:*,
+                    sigmask:*,
+                })
+            }
+            #[cfg(target_arch = "x86")]
+            Sysno::pselect6_time64 => {
+                sys_req!(Pselect {
+                    nfds,
+                    readfds:*,
+                    writefds:*,
+                    exceptfds:*,
+                    timeout:*,
+                    sigmask:*,
+                })
             }
             Sysno::prctl => {
                 let op: u32 = ctx.sys_req_arg(0);
