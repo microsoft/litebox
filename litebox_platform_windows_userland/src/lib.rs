@@ -292,24 +292,27 @@ impl litebox::platform::Provider for WindowsUserland {}
 /// # Safety
 /// The context must be valid guest context.
 pub unsafe fn run_thread(ctx: &mut litebox_common_linux::PtRegs) {
+    // Allocate a TLS slot for this module if not already done. This is used as
+    // a place to store data across calls to the guest, since all the registers
+    // are used by the guest and will be clobbered.
+    //
+    // We use this instead of native TLS because accesses are easier from
+    // assembly. In particular, finding the module's TLS base requires extra
+    // registers and/or clobbering flags, whereas we can get the value of a
+    // TLS slot with only one register and no changes to flags.
+    static REGISTER_KEY: std::sync::Once = const { std::sync::Once::new() };
+    REGISTER_KEY.call_once(|| {
+        let index = unsafe { windows_sys::Win32::System::Threading::TlsAlloc() };
+        assert!(
+            index < 64,
+            "no non-extended TLS slots available: {index:#x}"
+        );
+        TLS_INDEX.store(index, std::sync::atomic::Ordering::Relaxed);
+    });
     unsafe { run_thread_inner(ctx) }
 }
 
-// Define TLS for the asm code to use.
-core::arch::global_asm!(
-    "
-    .section .tls$,\"dw\"
-    .p2align 3, 0
-host_sp:
-    .quad 0
-host_bp:
-    .quad 0
-scratch:
-    .quad 0
-guest_context_top:
-    .quad 0
-"
-);
+static TLS_INDEX: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// Runs the guest thread until it terminates.
 ///
@@ -370,18 +373,26 @@ unsafe extern "C-unwind" fn run_thread_inner(ctx: &mut litebox_common_linux::PtR
     .seh_savexmm xmm15, 9*16
     .seh_endprologue
 
-    // Offset of the TLS array in the TEB; our module's TLS data is pointed to
-    // by the pointer at _tls_index offset from this pointer.
-    .equ TEB_TLS_OFFSET, 0x5c
+    // Offset into the TEB (gs segment) where TLS slots are stored.
+    .equ TEB_TLS_SLOTS_OFFSET, 5248
 
-    // Save the host rsp and rbp and guest context
-    mov     r11d, DWORD PTR [rip + _tls_index]
-    mov     r8, QWORD PTR gs:[TEB_TLS_OFFSET]
-    mov     r11, QWORD PTR [r8 + r11 * 8]
-    mov     QWORD PTR [r11 + host_sp@SECREL32], rsp
-    mov     QWORD PTR [r11 + host_bp@SECREL32], rbp
+    // Offsets within our TLS space on the stack.
+    .equ HOST_SP, 0
+    .equ HOST_BP, 8
+    .equ GUEST_CONTEXT_TOP, 16
+    .equ SCRATCH, 24
+    .equ TLS_SIZE, 32
+
+    // Save space on the stack for the TLS data and store it in the TLS slot.
+    sub     rsp, TLS_SIZE
+    mov     r9d, DWORD PTR [rip + {TLS_INDEX}]
+    mov     QWORD PTR gs:[r9 * 8 + TEB_TLS_SLOTS_OFFSET], rsp
+
+    // Save the host rsp and rbp and guest context top.
+    mov     QWORD PTR [rsp + HOST_SP], rsp
+    mov     QWORD PTR [rsp + HOST_BP], rbp
     lea     rax, [rcx + {GUEST_CONTEXT_SIZE}]
-    mov     QWORD PTR [r11 + guest_context_top@SECREL32], rax
+    mov     QWORD PTR [rsp + GUEST_CONTEXT_TOP], rax
 
     // Switch to the guest context. When the guest issues a syscall, it will
     // jump back into the middle of this function, at `syscall_callback`.
@@ -395,18 +406,17 @@ unsafe extern "C-unwind" fn run_thread_inner(ctx: &mut litebox_common_linux::PtR
     // return address in rcx. r11 is an available scratch register (it would
     // contain rflags if the syscall instruction had actually been issued).
 syscall_callback:
+    // Get the TLS base from the TLS slot.
+    mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
+    mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
     // Set rsp to the top of the guest context.
-    mov     r11d, DWORD PTR [rip + _tls_index]
-    shl     r11d, 3
-    add     r11, QWORD PTR gs:[TEB_TLS_OFFSET]
-    mov     r11, QWORD PTR [r11]
-    mov     QWORD PTR [r11 + scratch@SECREL32], rsp
-    mov     rsp, QWORD PTR [r11 + guest_context_top@SECREL32]
+    mov     QWORD PTR [r11 + SCRATCH], rsp
+    mov     rsp, QWORD PTR [r11 + GUEST_CONTEXT_TOP]
 
     // TODO: save float and vector registers (xsave or fxsave)
     // Save caller-saved registers
     push    0x2b       // pt_regs->ss = __USER_DS
-    push    QWORD PTR [r11 + scratch@SECREL32] // pt_regs->sp
+    push    QWORD PTR [r11 + SCRATCH] // pt_regs->sp
     pushfq             // pt_regs->eflags
     push    0x33       // pt_regs->cs = __USER_CS
     push    rcx        // pt_regs->ip
@@ -433,13 +443,17 @@ syscall_callback:
     mov     rdx, rsp
 
     /// Reestablish the stack and frame pointers.
-    mov     rsp, [r11 + host_sp@SECREL32]
-    mov     rbp, [r11 + host_bp@SECREL32]
+    mov     rsp, [r11 + HOST_SP]
+    mov     rbp, [r11 + HOST_BP]
 
     // Call syscall_handler
     call {syscall_handler}
 
-    // The thread is exiting. Restore non-volatile registers and return.
+    // The thread is exiting. Zero the TLS slot to avoid dangling pointers.
+    mov     r9d, DWORD PTR [rip + {TLS_INDEX}]
+    mov     QWORD PTR gs:[r9 * 8 + TEB_TLS_SLOTS_OFFSET], 0
+
+    // Restore non-volatile registers and return.
     lea  rsp, [rbp - (168 + 56)]
     movdqa xmm6, [rsp + 0*16]
     movdqa xmm7, [rsp + 1*16]
@@ -465,6 +479,7 @@ syscall_callback:
     ",
     syscall_handler = sym syscall_handler,
     switch_to_guest = sym switch_to_guest,
+    TLS_INDEX = sym TLS_INDEX,
     GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
     );
 }
