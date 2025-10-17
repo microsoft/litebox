@@ -745,6 +745,7 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
             }
             PunchthroughSyscall::RtSigprocmask { .. } => {
                 // Ignored for now.
+                eprintln!("WARNING: ignoring RtSigprocmask punchthrough");
                 Ok(0)
             }
             p => {
