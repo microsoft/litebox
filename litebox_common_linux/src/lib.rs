@@ -1209,42 +1209,24 @@ pub struct CloneArgs {
     pub cgroup: u64,
 }
 
-/// Credentials of a process
-#[derive(Clone)]
-pub struct Credentials {
-    pub uid: usize,
-    pub euid: usize,
-    pub gid: usize,
-    pub egid: usize,
-}
-
 /// Task command name length
 pub const TASK_COMM_LEN: usize = 16;
 
-pub struct Task<Platform: litebox::platform::RawPointerProvider> {
+pub struct TaskParams {
     /// Process ID
     pub pid: i32,
     /// Parent Process ID
     pub ppid: i32,
     /// Thread ID
     pub tid: i32,
-    /// When a thread whose `clear_child_tid` is not `None` terminates, and it shares memory with other threads,
-    /// the kernel writes 0 to the address specified by `clear_child_tid` and then executes:
-    ///
-    /// futex(clear_child_tid, FUTEX_WAKE, 1, NULL, NULL, 0);
-    ///
-    /// This operation wakes a single thread waiting on the specified memory location via futex.
-    /// Any errors from the futex wake operation are ignored.
-    pub clear_child_tid: Option<Platform::RawMutPointer<i32>>,
-    /// The purpose of the robust futex list is to ensure that if a thread accidentally fails to unlock a futex before
-    /// terminating or calling execve(2), another thread that is waiting on that futex is notified that the former owner
-    /// of the futex has died. This notification consists of two pieces: the FUTEX_OWNER_DIED bit is set in the futex word,
-    /// and the kernel performs a futex(2) FUTEX_WAKE operation on one of the threads waiting on the futex.
-    pub robust_list: Option<Platform::RawConstPointer<RobustListHead<Platform>>>,
-    /// Shared process credentials.
-    pub credentials: alloc::sync::Arc<Credentials>,
-    /// Command name (usually the executable name, excluding the path)
-    pub comm: [u8; TASK_COMM_LEN],
+    /// The initial uid.
+    pub uid: u32,
+    /// The initial effective uid.
+    pub euid: u32,
+    /// The initial gid.
+    pub gid: u32,
+    /// The initial effective gid.
+    pub egid: u32,
 }
 
 #[repr(C)]

@@ -261,24 +261,18 @@ impl WindowsUserland {
         x.is_multiple_of(gran)
     }
 
-    pub fn init_task(&self) -> litebox_common_linux::Task<Self> {
+    pub fn init_task(&self) -> litebox_common_linux::TaskParams {
         // TODO: Currently we are using a static thread ID and credentials (faked).
         // This is a placeholder for future implementation to use passthrough.
-        let creds = litebox_common_linux::Credentials {
-            uid: 1000,
-            gid: 1000,
-            euid: 1000,
-            egid: 1000,
-        };
-        litebox_common_linux::Task::<WindowsUserland> {
+        litebox_common_linux::TaskParams {
             pid: 1000,
             tid: 1000,
             // TODO: placeholder for actual PPID
             ppid: 0,
-            clear_child_tid: None,
-            robust_list: None,
-            credentials: alloc::sync::Arc::new(creds),
-            comm: [0; litebox_common_linux::TASK_COMM_LEN],
+            uid: 1000,
+            gid: 1000,
+            euid: 1000,
+            egid: 1000,
         }
     }
 }
