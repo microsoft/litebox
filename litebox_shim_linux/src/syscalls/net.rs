@@ -1,7 +1,5 @@
 //! Socket-related syscalls, e.g., socket, bind, listen, etc.
 
-/// XXX(jayb): How do we handle things like `sys_accept` without holding a lock on the file
-/// descriptor.  See #120.
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use litebox::{
