@@ -762,6 +762,13 @@ pub fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> Continu
             sigsetsize,
         } => syscalls::file::sys_ppoll(fds, nfds, timeout, sigmask, sigsetsize),
         SyscallRequest::Poll { fds, nfds, timeout } => syscalls::file::sys_poll(fds, nfds, timeout),
+        SyscallRequest::Select {
+            nfds,
+            readfds,
+            writefds,
+            exceptfds,
+            timeout,
+        } => syscalls::file::sys_select(nfds, readfds, writefds, exceptfds, timeout),
         SyscallRequest::Pselect {
             nfds,
             readfds,

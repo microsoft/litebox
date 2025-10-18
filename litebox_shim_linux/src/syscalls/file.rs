@@ -1354,22 +1354,13 @@ pub(crate) fn do_pselect(
     Ok(ready_count)
 }
 
-pub(crate) fn sys_pselect(
+fn select_common(
     nfds: u32,
     readfds: Option<MutPtr<litebox_common_linux::FdSet>>,
     writefds: Option<MutPtr<litebox_common_linux::FdSet>>,
     exceptfds: Option<MutPtr<litebox_common_linux::FdSet>>,
-    timeout: Option<ConstPtr<litebox_common_linux::Timespec>>,
-    sigsetpack: Option<ConstPtr<litebox_common_linux::SigSetPack>>,
+    timeout: Option<core::time::Duration>,
 ) -> Result<usize, Errno> {
-    if sigsetpack.is_some() {
-        unimplemented!("no sigsetpack support yet");
-    }
-    let timeout = timeout
-        .map(super::process::get_timeout)
-        .transpose()?
-        .map(Into::into);
-
     let mut kreadfds = readfds
         .map(|fds| unsafe { fds.read_at_offset(0) }.ok_or(Errno::EFAULT))
         .transpose()?
@@ -1402,6 +1393,46 @@ pub(crate) fn sys_pselect(
     }
 
     Ok(count)
+}
+
+/// Handle syscall `select`.
+pub(crate) fn sys_select(
+    nfds: u32,
+    readfds: Option<MutPtr<litebox_common_linux::FdSet>>,
+    writefds: Option<MutPtr<litebox_common_linux::FdSet>>,
+    exceptfds: Option<MutPtr<litebox_common_linux::FdSet>>,
+    timeout: Option<MutPtr<litebox_common_linux::TimeVal>>,
+) -> Result<usize, Errno> {
+    let timeout = timeout
+        .map(|tv_ptr| {
+            let tv = unsafe { tv_ptr.read_at_offset(0) }
+                .ok_or(Errno::EFAULT)?
+                .into_owned();
+            core::time::Duration::try_from(tv).map_err(|_| Errno::EINVAL)
+        })
+        .transpose()?;
+
+    select_common(nfds, readfds, writefds, exceptfds, timeout)
+}
+
+/// Handle syscall `pselect`.
+pub(crate) fn sys_pselect(
+    nfds: u32,
+    readfds: Option<MutPtr<litebox_common_linux::FdSet>>,
+    writefds: Option<MutPtr<litebox_common_linux::FdSet>>,
+    exceptfds: Option<MutPtr<litebox_common_linux::FdSet>>,
+    timeout: Option<ConstPtr<litebox_common_linux::Timespec>>,
+    sigsetpack: Option<ConstPtr<litebox_common_linux::SigSetPack>>,
+) -> Result<usize, Errno> {
+    if sigsetpack.is_some() {
+        unimplemented!("no sigsetpack support yet");
+    }
+    let timeout = timeout
+        .map(super::process::get_timeout)
+        .transpose()?
+        .map(Into::into);
+
+    select_common(nfds, readfds, writefds, exceptfds, timeout)
 }
 
 fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {

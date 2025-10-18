@@ -2085,6 +2085,13 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         sigmask: Option<Platform::RawConstPointer<SigSet>>,
         sigsetsize: usize,
     },
+    Select {
+        nfds: u32,
+        readfds: Option<Platform::RawMutPointer<FdSet>>,
+        writefds: Option<Platform::RawMutPointer<FdSet>>,
+        exceptfds: Option<Platform::RawMutPointer<FdSet>>,
+        timeout: Option<Platform::RawMutPointer<TimeVal>>,
+    },
     Pselect {
         nfds: u32,
         readfds: Option<Platform::RawMutPointer<FdSet>>,
@@ -2640,6 +2647,26 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }
             Sysno::poll => {
                 sys_req!(Poll { fds:*, nfds, timeout })
+            }
+            #[cfg(target_arch = "x86_64")]
+            Sysno::select => {
+                sys_req!(Select {
+                    nfds,
+                    readfds:*,
+                    writefds:*,
+                    exceptfds:*,
+                    timeout:*,
+                })
+            }
+            #[cfg(target_arch = "x86")]
+            Sysno::_newselect => {
+                sys_req!(Select {
+                    nfds,
+                    readfds:*,
+                    writefds:*,
+                    exceptfds:*,
+                    timeout:*,
+                })
             }
             #[cfg(target_arch = "x86_64")]
             Sysno::pselect6 => {
