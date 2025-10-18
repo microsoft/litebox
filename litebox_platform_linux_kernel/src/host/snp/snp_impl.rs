@@ -94,20 +94,15 @@ impl SnpLinuxKernel {
     pub fn init_task(
         &self,
         boot_params: &bindings::vmpl2_boot_params,
-    ) -> litebox_common_linux::Task<Self> {
-        litebox_common_linux::Task {
+    ) -> litebox_common_linux::TaskParams {
+        litebox_common_linux::TaskParams {
             pid: boot_params.pid,
             tid: boot_params.pid,
             ppid: boot_params.ppid,
-            clear_child_tid: None,
-            robust_list: None,
-            credentials: ::alloc::sync::Arc::new(litebox_common_linux::Credentials {
-                uid: boot_params.uid as usize,
-                gid: boot_params.gid as usize,
-                euid: boot_params.euid as usize,
-                egid: boot_params.egid as usize,
-            }),
-            comm: [0; litebox_common_linux::TASK_COMM_LEN],
+            uid: boot_params.uid,
+            gid: boot_params.gid,
+            euid: boot_params.euid,
+            egid: boot_params.egid,
         }
     }
 }

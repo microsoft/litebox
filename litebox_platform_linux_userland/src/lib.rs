@@ -269,35 +269,33 @@ impl LinuxUserland {
         (reserved_pages, vdso_address)
     }
 
-    fn get_user_info() -> litebox_common_linux::Credentials {
-        litebox_common_linux::Credentials {
-            // Alternatively, we could read those from `/proc/self/aux`
-            uid: unsafe { syscalls::syscall0(syscalls::Sysno::getuid) }.expect("failed to get UID"),
-            euid: unsafe { syscalls::syscall0(syscalls::Sysno::geteuid) }
-                .expect("failed to get EUID"),
-            gid: unsafe { syscalls::syscall0(syscalls::Sysno::getgid) }.expect("failed to get GID"),
-            egid: unsafe { syscalls::syscall0(syscalls::Sysno::getegid) }
-                .expect("failed to get EGID"),
-        }
-    }
-
     #[expect(
         clippy::missing_panics_doc,
         reason = "panicking only on failures of documented linux contracts"
     )]
-    pub fn init_task(&self) -> litebox_common_linux::Task<Self> {
-        let tid = unsafe { syscalls::raw_syscall!(syscalls::Sysno::gettid) };
-        let tid: i32 = i32::try_from(tid).expect("tid should fit in i32");
-        let ppid = unsafe { syscalls::raw_syscall!(syscalls::Sysno::getppid) };
-        let ppid: i32 = i32::try_from(ppid).expect("ppid should fit in i32");
-        litebox_common_linux::Task {
+    pub fn init_task(&self) -> litebox_common_linux::TaskParams {
+        let tid = unsafe { syscalls::raw::syscall0(syscalls::Sysno::gettid) }
+            .try_into()
+            .unwrap();
+        let ppid = unsafe { syscalls::raw::syscall0(syscalls::Sysno::getppid) }
+            .try_into()
+            .unwrap();
+        litebox_common_linux::TaskParams {
             pid: tid,
             tid,
             ppid,
-            clear_child_tid: None,
-            robust_list: None,
-            credentials: alloc::sync::Arc::new(Self::get_user_info()),
-            comm: [0; litebox_common_linux::TASK_COMM_LEN],
+            uid: unsafe { syscalls::raw::syscall0(syscalls::Sysno::getuid) }
+                .try_into()
+                .unwrap(),
+            euid: unsafe { syscalls::raw::syscall0(syscalls::Sysno::geteuid) }
+                .try_into()
+                .unwrap(),
+            gid: unsafe { syscalls::raw::syscall0(syscalls::Sysno::getgid) }
+                .try_into()
+                .unwrap(),
+            egid: unsafe { syscalls::raw::syscall0(syscalls::Sysno::getegid) }
+                .try_into()
+                .unwrap(),
         }
     }
 }

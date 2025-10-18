@@ -1,6 +1,6 @@
 //! Auxiliary vector support.
 
-use crate::with_current_task_mut;
+use crate::with_current_task;
 use litebox::platform::SystemInfoProvider as _;
 
 #[allow(non_camel_case_types)]
@@ -68,11 +68,11 @@ pub type AuxVec = alloc::collections::btree_map::BTreeMap<AuxKey, usize>;
 pub fn init_auxv() -> AuxVec {
     let mut aux = AuxVec::new();
 
-    let user_info = with_current_task_mut(|task| (*task.credentials).clone());
-    aux.insert(AuxKey::AT_UID, user_info.uid);
-    aux.insert(AuxKey::AT_EUID, user_info.euid);
-    aux.insert(AuxKey::AT_GID, user_info.gid);
-    aux.insert(AuxKey::AT_EGID, user_info.egid);
+    let user_info = with_current_task(|task| (*task.credentials).clone());
+    aux.insert(AuxKey::AT_UID, user_info.uid as usize);
+    aux.insert(AuxKey::AT_EUID, user_info.euid as usize);
+    aux.insert(AuxKey::AT_GID, user_info.gid as usize);
+    aux.insert(AuxKey::AT_EGID, user_info.egid as usize);
 
     if let Some(vdso_base) = litebox_platform_multiplex::platform().get_vdso_address() {
         aux.insert(AuxKey::AT_SYSINFO_EHDR, vdso_base);
