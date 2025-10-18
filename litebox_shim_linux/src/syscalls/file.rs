@@ -1365,10 +1365,10 @@ pub(crate) fn sys_pselect(
     writefds: Option<MutPtr<litebox_common_linux::FdSet>>,
     exceptfds: Option<MutPtr<litebox_common_linux::FdSet>>,
     timeout: Option<ConstPtr<litebox_common_linux::Timespec>>,
-    sigmask: Option<ConstPtr<litebox_common_linux::SigSet>>,
+    sigsetpack: Option<ConstPtr<litebox_common_linux::SigSetPack>>,
 ) -> Result<usize, Errno> {
-    if sigmask.is_some() {
-        unimplemented!("no sigmask support yet");
+    if sigsetpack.is_some() {
+        unimplemented!("no sigsetpack support yet");
     }
     let timeout = timeout
         .map(super::process::get_timeout)

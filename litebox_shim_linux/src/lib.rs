@@ -768,8 +768,8 @@ pub fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> Continu
             writefds,
             exceptfds,
             timeout,
-            sigmask,
-        } => syscalls::file::sys_pselect(nfds, readfds, writefds, exceptfds, timeout, sigmask),
+            sigsetpack,
+        } => syscalls::file::sys_pselect(nfds, readfds, writefds, exceptfds, timeout, sigsetpack),
         SyscallRequest::Readlinkat {
             dirfd,
             pathname,

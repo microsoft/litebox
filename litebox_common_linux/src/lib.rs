@@ -1849,6 +1849,13 @@ impl FdSet {
     }
 }
 
+/// Packaged sigset with its size, used by `pselect` syscall
+#[derive(Clone, Copy)]
+pub struct SigSetPack {
+    pub sigset: SigSet,
+    pub size: usize,
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 #[derive(Debug)]
@@ -2084,7 +2091,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         writefds: Option<Platform::RawMutPointer<FdSet>>,
         exceptfds: Option<Platform::RawMutPointer<FdSet>>,
         timeout: Option<Platform::RawConstPointer<Timespec>>,
-        sigmask: Option<Platform::RawConstPointer<SigSet>>,
+        sigsetpack: Option<Platform::RawConstPointer<SigSetPack>>,
     },
     ArchPrctl {
         arg: ArchPrctlArg<Platform>,
@@ -2642,7 +2649,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     writefds:*,
                     exceptfds:*,
                     timeout:*,
-                    sigmask:*,
+                    sigsetpack:*,
                 })
             }
             #[cfg(target_arch = "x86")]
@@ -2653,7 +2660,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     writefds:*,
                     exceptfds:*,
                     timeout:*,
-                    sigmask:*,
+                    sigsetpack:*,
                 })
             }
             Sysno::prctl => {
