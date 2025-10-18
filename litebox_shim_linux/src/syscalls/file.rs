@@ -1305,8 +1305,10 @@ pub(crate) fn do_pselect(
     if nfds as usize >= litebox_common_linux::FD_SETSIZE {
         return Err(Errno::EINVAL);
     }
-    let max_fd: u32 = file_descriptors().read().len().truncate();
-    let nfds = nfds.min(max_fd);
+    let max_fd = file_descriptors().read().len();
+    if nfds as usize > max_fd {
+        return Err(Errno::EBADF);
+    }
 
     let mut set = super::epoll::PollSet::with_capacity(nfds as usize);
     for i in 0..nfds {
@@ -1328,34 +1330,27 @@ pub(crate) fn do_pselect(
     set.wait_or_timeout(|| file_descriptors().read(), timeout);
 
     let mut ready_count = 0;
-    if let Some(fds) = readfds {
-        fds.clear();
-        for (i, revents) in set.revents_with_fds() {
-            if revents.intersects(Events::IN | Events::ALWAYS_POLLED) {
-                // no negative fds added to the set
-                fds.set(i.reinterpret_as_unsigned());
-                ready_count += 1;
+    let mut process_fdset = |fds: Option<&mut litebox_common_linux::FdSet>,
+                             target_events: Events|
+     -> Result<(), Errno> {
+        if let Some(fds) = fds {
+            fds.clear();
+            for (i, revents) in set.revents_with_fds() {
+                if revents.contains(Events::NVAL) {
+                    return Err(Errno::EBADF);
+                }
+                if revents.intersects(target_events) {
+                    // no negative fds added to the set
+                    fds.set(i.reinterpret_as_unsigned());
+                    ready_count += 1;
+                }
             }
         }
-    }
-    if let Some(fds) = writefds {
-        fds.clear();
-        for (i, revents) in set.revents_with_fds() {
-            if revents.intersects(Events::OUT | Events::ALWAYS_POLLED) {
-                fds.set(i.reinterpret_as_unsigned());
-                ready_count += 1;
-            }
-        }
-    }
-    if let Some(fds) = exceptfds {
-        fds.clear();
-        for (i, revents) in set.revents_with_fds() {
-            if revents.contains(Events::PRI) {
-                fds.set(i.reinterpret_as_unsigned());
-                ready_count += 1;
-            }
-        }
-    }
+        Ok(())
+    };
+    process_fdset(readfds, Events::IN | Events::ALWAYS_POLLED)?;
+    process_fdset(writefds, Events::OUT | Events::ALWAYS_POLLED)?;
+    process_fdset(exceptfds, Events::PRI)?;
     Ok(ready_count)
 }
 

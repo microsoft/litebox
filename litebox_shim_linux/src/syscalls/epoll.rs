@@ -777,4 +777,31 @@ mod test {
 
         let _ = sys_close(rfd);
     }
+
+    #[test]
+    fn test_pselect_invalid_fd() {
+        crate::syscalls::tests::init_platform(None);
+
+        let invalid_fd_u = 100u32;
+
+        // prepare fd_set for read
+        let mut rfds = litebox_common_linux::FdSet::default();
+        rfds.clear();
+        rfds.set(invalid_fd_u);
+
+        let ret = do_pselect(
+            invalid_fd_u + 1,
+            Some(&mut rfds),
+            None,
+            None,
+            Some(core::time::Duration::from_secs(1)),
+        );
+
+        // Expect pselect to return EBADF
+        assert!(ret.is_err(), "pselect should fail for invalid fd");
+        assert_eq!(
+            ret.err().unwrap(),
+            litebox_common_linux::errno::Errno::EBADF
+        );
+    }
 }
