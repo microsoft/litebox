@@ -611,7 +611,7 @@ pub enum AddressFamily {
 
 #[repr(u32)]
 #[non_exhaustive]
-#[derive(Debug, IntEnum)]
+#[derive(Clone, Copy, Debug, IntEnum)]
 pub enum SockType {
     Stream = 1,
     Datagram = 2,
@@ -794,7 +794,7 @@ impl TryFrom<core::time::Duration> for Timespec {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 pub struct TimeVal {
     tv_sec: time_t,
     tv_usec: suseconds_t,
@@ -833,6 +833,18 @@ impl From<Timespec> for TimeVal {
         // Convert nanoseconds to microseconds, ensuring we don't overflow suseconds_t
         let microseconds = timespec.tv_nsec / 1_000;
         let timeval_u_sec = suseconds_t::try_from(microseconds).unwrap_or(suseconds_t::MAX);
+        TimeVal {
+            tv_sec: timeval_sec,
+            tv_usec: timeval_u_sec,
+        }
+    }
+}
+
+impl From<core::time::Duration> for TimeVal {
+    fn from(duration: core::time::Duration) -> Self {
+        let timeval_sec: time_t = duration.as_secs().reinterpret_as_signed().truncate();
+        let timeval_u_sec: suseconds_t =
+            suseconds_t::from(duration.subsec_micros().reinterpret_as_signed());
         TimeVal {
             tv_sec: timeval_sec,
             tv_usec: timeval_u_sec,
@@ -1935,6 +1947,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         optval: Platform::RawConstPointer<u8>,
         optlen: usize,
     },
+    Getsockopt {
+        sockfd: i32,
+        optname: SocketOptionName,
+        optval: Platform::RawMutPointer<u8>,
+        optlen: Platform::RawMutPointer<u32>,
+    },
     Getsockname {
         sockfd: i32,
         addr: Platform::RawMutPointer<u8>,
@@ -2370,18 +2388,27 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::recvfrom => sys_req!(Recvfrom { sockfd, buf:*, len, flags, addr:*, addrlen:*, }),
             Sysno::bind => sys_req!(Bind { sockfd, sockaddr:*, addrlen }),
             Sysno::listen => sys_req!(Listen { sockfd, backlog }),
-            Sysno::setsockopt => {
+            Sysno::setsockopt | Sysno::getsockopt => {
                 let level: u32 = ctx.sys_req_arg(1);
                 let name: u32 = ctx.sys_req_arg(2);
-                if let Some(optname) = SocketOptionName::from(level, name) {
-                    SyscallRequest::Setsockopt {
-                        sockfd: ctx.sys_req_arg(0),
-                        optname,
-                        optval: ctx.sys_req_ptr(3),
-                        optlen: ctx.sys_req_arg(4),
-                    }
-                } else {
+                let Some(optname) = SocketOptionName::from(level, name) else {
                     unimplemented!("level: {}, optname: {}", level, name);
+                };
+                let sockfd = ctx.sys_req_arg(0);
+                match sysno {
+                    Sysno::setsockopt => sys_req!(Setsockopt {
+                        sockfd: { sockfd },
+                        optname: { optname },
+                        optval:*,
+                        optlen,
+                    }),
+                    Sysno::getsockopt => sys_req!(Getsockopt {
+                        sockfd: { sockfd },
+                        optname: { optname },
+                        optval:*,
+                        optlen:*,
+                    }),
+                    _ => unreachable!(),
                 }
             }
             Sysno::getsockname => sys_req!(Getsockname { sockfd, addr:*, addrlen:* }),
