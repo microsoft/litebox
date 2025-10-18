@@ -579,7 +579,6 @@ where
             // It seems like there might be other duplicates around (e.g., due to `dup`), so we
             // can't immediately close it out (or this FD has already been closed out). We
             // attempt to queue it for future closure and then just return.
-            let mut dt = self.litebox.descriptor_table_mut();
             let fd = dt.duplicate(fd).ok_or(CloseError::InvalidFd)?;
             let Some(()) = dt.with_entry_mut(&fd, |entry| entry.entry.consider_closed = true)
             else {
