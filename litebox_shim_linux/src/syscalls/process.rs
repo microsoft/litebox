@@ -1,5 +1,8 @@
 //! Process/thread related syscalls.
 
+use crate::Task;
+use crate::UserMutPointer;
+use crate::with_current_task;
 use alloc::boxed::Box;
 use core::mem::offset_of;
 use core::ops::Range;
@@ -11,6 +14,8 @@ use litebox::platform::{
     RawMutexProvider as _, ThreadLocalStorageProvider as _,
 };
 use litebox::platform::{RawMutPointer as _, ThreadProvider as _};
+#[cfg(target_arch = "x86")]
+use litebox::utils::TruncateExt;
 use litebox_common_linux::{ArchPrctlArg, errno::Errno};
 use litebox_common_linux::{CloneFlags, FutexArgs, PrctlArg};
 
@@ -20,24 +25,36 @@ pub(crate) struct Process {
     pub(crate) nr_threads: core::sync::atomic::AtomicU16,
     /// resource limits for this process
     pub(crate) limits: ResourceLimits,
-    /// Thread Id counter
-    pub(crate) thread_id_counter: AtomicI32,
 }
 
-/// A global singleton process structure.
-///
-/// Note we currently only support a single process in LiteBox.
-pub(crate) static LITEBOX_PROCESS: Process = Process {
-    nr_threads: core::sync::atomic::AtomicU16::new(1),
-    limits: ResourceLimits::default(),
-    thread_id_counter: AtomicI32::new(2), // start from 2, as 1 is used by the main thread
-};
+impl Process {
+    pub fn new() -> Self {
+        Self {
+            nr_threads: 1.into(),
+            limits: ResourceLimits::default(),
+        }
+    }
+}
+
+/// Credentials of a process
+#[derive(Clone)]
+pub(crate) struct Credentials {
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+}
+
+// TODO: better management of thread IDs
+pub(crate) static NEXT_THREAD_ID: AtomicI32 = AtomicI32::new(2); // start from 2, as 1 is used by the main thread
 
 /// Set the current task's command name.
 pub fn set_task_comm(comm: &[u8]) {
-    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
+    with_current_task(|task| {
+        let mut new_comm = [0u8; litebox_common_linux::TASK_COMM_LEN];
         let comm = &comm[..comm.len().min(litebox_common_linux::TASK_COMM_LEN - 1)];
-        tls.current_task.comm[..comm.len()].copy_from_slice(comm);
+        new_comm[..comm.len()].copy_from_slice(comm);
+        task.comm.set(new_comm);
     });
 }
 
@@ -46,13 +63,10 @@ pub(crate) fn sys_prctl(
     arg: PrctlArg<litebox_platform_multiplex::Platform>,
 ) -> Result<usize, Errno> {
     match arg {
-        PrctlArg::GetName(name) => {
-            litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
-                unsafe { name.write_slice_at_offset(0, &tls.current_task.comm) }
-                    .ok_or(Errno::EFAULT)
-            })
-            .map(|()| 0)
-        }
+        PrctlArg::GetName(name) => with_current_task(|task| {
+            unsafe { name.write_slice_at_offset(0, &task.comm.get()) }.ok_or(Errno::EFAULT)
+        })
+        .map(|()| 0),
         PrctlArg::SetName(name) => {
             let mut name_buf = [0u8; litebox_common_linux::TASK_COMM_LEN - 1];
             // strncpy
@@ -265,8 +279,9 @@ fn wake_robust_list(
 }
 
 pub(crate) fn sys_exit(_status: i32) {
-    let mut tls = litebox_platform_multiplex::Platform::release_thread_local_storage();
-    if let Some(clear_child_tid) = tls.current_task.clear_child_tid.take() {
+    let mut tls = crate::SHIM_TLS.deinit();
+    let task = tls.current_task;
+    if let Some(clear_child_tid) = task.clear_child_tid.into_inner() {
         // Clear the child TID if requested
         // TODO: if we are the last thread, we don't need to clear it
         let _ = unsafe { clear_child_tid.write_at_offset(0, 0) };
@@ -278,59 +293,73 @@ pub(crate) fn sys_exit(_status: i32) {
             count: 1,
         });
     }
-    if let Some(robust_list) = tls.current_task.robust_list.take() {
+    if let Some(robust_list) = task.robust_list.into_inner() {
         let _ = wake_robust_list(robust_list);
     }
 
-    LITEBOX_PROCESS
+    task.process
         .nr_threads
         .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 pub(crate) fn sys_exit_group(_status: i32) {}
 
-fn new_thread_callback(
-    args: litebox_common_linux::NewThreadArgs<litebox_platform_multiplex::Platform>,
-) {
-    let litebox_common_linux::NewThreadArgs {
-        task,
-        tls,
-        set_child_tid,
-        callback: _,
-    } = args;
+/// A descriptor for thread-local storage (TLS).
+///
+/// On `x86_64`, this is represented as a `u8`. The TLS pointer can point to
+/// an arbitrary-sized memory region.
+#[cfg(target_arch = "x86_64")]
+type ThreadLocalDescriptor = u8;
 
-    let new_task = Box::new(litebox_common_linux::Task {
-        pid: task.pid,
-        tid: task.tid, // The actual TID will be set by the platform
-        ppid: task.ppid,
-        clear_child_tid: task.clear_child_tid,
-        robust_list: task.robust_list,
-        credentials: task.credentials.clone(),
-        comm: task.comm,
-        stored_bp: None,
-    });
-    let child_tid = task.tid;
+/// A descriptor for thread-local storage (TLS).
+///
+/// On `x86`, this is represented as a `UserDesc`, which provides a more
+/// structured descriptor (e.g., base address, limit, flags).
+#[cfg(target_arch = "x86")]
+type ThreadLocalDescriptor = litebox_common_linux::UserDesc;
 
-    // Set the TLS for the platform itself
-    let litebox_tls = litebox_common_linux::ThreadLocalStorage::new(new_task);
-    litebox_platform_multiplex::Platform::set_thread_local_storage(litebox_tls);
+struct NewThreadArgs {
+    /// Pointer to thread-local storage (TLS) given by the guest program
+    tls: Option<UserMutPointer<ThreadLocalDescriptor>>,
+    /// Where to store child TID in child's memory
+    set_child_tid: Option<UserMutPointer<i32>>,
+    /// Task struct that maintains all per-thread data
+    task: Task,
+}
 
-    // Set the TLS for the guest program
-    if let Some(tls) = tls {
-        // Set the TLS base pointer for the new thread
-        #[cfg(target_arch = "x86")]
-        set_thread_area(tls);
+// FUTURE: Consider revisiting this impl, see <https://github.com/microsoft/litebox/issues/431>.
+unsafe impl Send for NewThreadArgs {}
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            use litebox::platform::RawConstPointer as _;
-            sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()));
+impl litebox::platform::InitThread for NewThreadArgs {
+    fn init(self: alloc::boxed::Box<Self>) {
+        let Self {
+            task,
+            tls,
+            set_child_tid,
+        } = *self;
+
+        let child_tid = task.tid;
+
+        // Set the TLS for the platform itself
+        crate::SHIM_TLS.init(crate::LinuxShimTls { current_task: task });
+
+        // Set the TLS for the guest program
+        if let Some(tls) = tls {
+            // Set the TLS base pointer for the new thread
+            #[cfg(target_arch = "x86")]
+            set_thread_area(tls);
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                use litebox::platform::RawConstPointer as _;
+                sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()));
+            }
         }
-    }
 
-    if let Some(child_tid_ptr) = set_child_tid {
-        // Set the child TID if requested
-        let _ = unsafe { child_tid_ptr.write_at_offset(0, child_tid) };
+        if let Some(child_tid_ptr) = set_child_tid {
+            // Set the child TID if requested
+            let _ = unsafe { child_tid_ptr.write_at_offset(0, child_tid) };
+        }
     }
 }
 
@@ -344,15 +373,12 @@ pub(crate) fn sys_clone(
     stack: Option<crate::MutPtr<u8>>,
     stack_size: usize,
     child_tid: Option<crate::MutPtr<i32>>,
-    tls: Option<crate::MutPtr<litebox_common_linux::ThreadLocalDescriptor>>,
+    tls: Option<crate::MutPtr<ThreadLocalDescriptor>>,
     ctx: &litebox_common_linux::PtRegs,
     main: usize,
 ) -> Result<usize, Errno> {
     if !flags.contains(CloneFlags::VM) {
         unimplemented!("Clone without VM flag is not supported");
-    }
-    if !flags.contains(CloneFlags::FS) {
-        unimplemented!("Clone without FS flag is not supported");
     }
     if !flags.contains(CloneFlags::FILES) {
         unimplemented!("Clone without FILES flag is not supported");
@@ -382,87 +408,99 @@ pub(crate) fn sys_clone(
         unimplemented!("Clone with unsupported flags: {:?}", flags);
     }
 
-    let (credentials, pid, parent_proc_id, comm) =
-        litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
-            (
-                tls.current_task.credentials.clone(),
-                tls.current_task.pid,
-                tls.current_task.ppid,
-                tls.current_task.comm,
-            )
-        });
+    with_current_task(|task| {
+        let set_child_tid = if flags.contains(CloneFlags::CHILD_SETTID) {
+            child_tid
+        } else {
+            None
+        };
+        let clear_child_tid = if flags.contains(CloneFlags::CHILD_CLEARTID) {
+            child_tid
+        } else {
+            None
+        };
+        let set_parent_tid = if flags.contains(CloneFlags::PARENT_SETTID) {
+            parent_tid
+        } else {
+            None
+        };
+        let fs = if flags.contains(CloneFlags::FS) {
+            task.fs.borrow().clone()
+        } else {
+            alloc::sync::Arc::new((**task.fs.borrow()).clone())
+        };
 
-    let set_child_tid = if flags.contains(CloneFlags::CHILD_SETTID) {
-        child_tid
-    } else {
-        None
-    };
-    let clear_child_tid = if flags.contains(CloneFlags::CHILD_CLEARTID) {
-        child_tid
-    } else {
-        None
-    };
-    let set_parent_tid = if flags.contains(CloneFlags::PARENT_SETTID) {
-        parent_tid
-    } else {
-        None
-    };
+        let child_tid = NEXT_THREAD_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if let Some(parent_tid_ptr) = set_parent_tid {
+            let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid) };
+        }
 
-    let platform = litebox_platform_multiplex::platform();
-    let child_tid = LITEBOX_PROCESS
-        .thread_id_counter
-        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if let Some(parent_tid_ptr) = set_parent_tid {
-        let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid) };
-    }
+        let stack = stack.expect("Stack must be provided when creating a new thread");
 
-    unsafe {
-        platform.spawn_thread(
-            ctx,
-            stack.expect("Stack pointer is required for thread creation"),
-            stack_size,
-            main,
-            Box::new(litebox_common_linux::NewThreadArgs {
-                tls,
-                set_child_tid,
-                task: Box::new(litebox_common_linux::Task {
-                    pid,
-                    tid: child_tid,
-                    ppid: parent_proc_id,
-                    clear_child_tid,
-                    robust_list: None,
-                    credentials,
-                    comm,
-                    stored_bp: None,
+        let mut ctx_copy = *ctx;
+
+        // Update the context for the new thread. Note that the new thread gets a
+        // return value of 0.
+        #[cfg(target_arch = "x86_64")]
+        {
+            ctx_copy.rip = main;
+            ctx_copy.rsp = stack.as_usize() + stack_size;
+            ctx_copy.rax = 0;
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            ctx_copy.eip = main;
+            ctx_copy.esp = stack.as_usize() + stack_size;
+            ctx_copy.eax = 0;
+        }
+
+        task.process
+            .nr_threads
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+        let r = unsafe {
+            litebox_platform_multiplex::platform().spawn_thread(
+                &ctx_copy,
+                Box::new(NewThreadArgs {
+                    tls,
+                    set_child_tid,
+                    task: Task {
+                        pid: task.pid,
+                        tid: child_tid,
+                        ppid: task.ppid,
+                        clear_child_tid: clear_child_tid.into(),
+                        robust_list: None.into(),
+                        credentials: task.credentials.clone(),
+                        comm: task.comm.clone(),
+                        fs: fs.into(),
+                        process: task.process.clone(),
+                    },
                 }),
-                callback: new_thread_callback,
-            }),
-        )
-    }?;
+            )
+        };
 
-    LITEBOX_PROCESS
-        .nr_threads
-        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    Ok(usize::try_from(child_tid).unwrap())
+        if let Err(err) = r {
+            task.process
+                .nr_threads
+                .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+            return Err(err);
+        }
+
+        Ok(usize::try_from(child_tid).unwrap())
+    })
 }
 
 /// Handle syscall `set_tid_address`.
 pub(crate) fn sys_set_tid_address(tidptr: crate::MutPtr<i32>) -> i32 {
-    unsafe {
-        litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
-            tls.current_task.clear_child_tid = Some(tidptr);
-            tls.current_task.tid
-        })
-    }
+    with_current_task(|task| {
+        task.clear_child_tid.set(Some(tidptr));
+        task.tid
+    })
 }
 
 /// Handle syscall `gettid`.
 pub(crate) fn sys_gettid() -> i32 {
-    unsafe {
-        litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
-            tls.current_task.tid
-        })
-    }
+    with_current_task(|task| task.tid)
 }
 
 // TODO: enforce the following limits:
@@ -541,35 +579,37 @@ pub(crate) fn do_prlimit(
     resource: litebox_common_linux::RlimitResource,
     new_limit: Option<litebox_common_linux::Rlimit>,
 ) -> Result<litebox_common_linux::Rlimit, Errno> {
-    let old_rlimit = match resource {
-        litebox_common_linux::RlimitResource::NOFILE
-        | litebox_common_linux::RlimitResource::STACK => {
-            LITEBOX_PROCESS.limits.get_rlimit(resource)
-        }
-        _ => unimplemented!("Unsupported resource for get_rlimit: {:?}", resource),
-    };
-    if let Some(new_limit) = new_limit {
-        if new_limit.rlim_cur > new_limit.rlim_max {
-            return Err(Errno::EINVAL);
-        }
-        if let litebox_common_linux::RlimitResource::NOFILE = resource
-            && new_limit.rlim_max > RLIMIT_NOFILE_MAX
-        {
-            return Err(Errno::EPERM);
-        }
-        // Note process with `CAP_SYS_RESOURCE` can increase the hard limit, but we don't
-        // support capabilities in LiteBox, so we don't check for that here.
-        if new_limit.rlim_max > old_rlimit.rlim_max {
-            return Err(Errno::EPERM);
-        }
-        match resource {
-            litebox_common_linux::RlimitResource::NOFILE => {
-                LITEBOX_PROCESS.limits.set_rlimit(resource, new_limit);
+    with_current_task(|task| {
+        let old_rlimit = match resource {
+            litebox_common_linux::RlimitResource::NOFILE
+            | litebox_common_linux::RlimitResource::STACK => {
+                task.process.limits.get_rlimit(resource)
             }
-            _ => unimplemented!("Unsupported resource for set_rlimit: {:?}", resource),
+            _ => unimplemented!("Unsupported resource for get_rlimit: {:?}", resource),
+        };
+        if let Some(new_limit) = new_limit {
+            if new_limit.rlim_cur > new_limit.rlim_max {
+                return Err(Errno::EINVAL);
+            }
+            if let litebox_common_linux::RlimitResource::NOFILE = resource
+                && new_limit.rlim_max > RLIMIT_NOFILE_MAX
+            {
+                return Err(Errno::EPERM);
+            }
+            // Note process with `CAP_SYS_RESOURCE` can increase the hard limit, but we don't
+            // support capabilities in LiteBox, so we don't check for that here.
+            if new_limit.rlim_max > old_rlimit.rlim_max {
+                return Err(Errno::EPERM);
+            }
+            match resource {
+                litebox_common_linux::RlimitResource::NOFILE => {
+                    task.process.limits.set_rlimit(resource, new_limit);
+                }
+                _ => unimplemented!("Unsupported resource for set_rlimit: {:?}", resource),
+            }
         }
-    }
-    Ok(old_rlimit)
+        Ok(old_rlimit)
+    })
 }
 
 /// Handle syscall `prlimit64`.
@@ -625,8 +665,8 @@ pub(crate) fn sys_setrlimit(
 /// Handle syscall `set_robust_list`.
 pub(crate) fn sys_set_robust_list(head: usize) {
     let head = crate::ConstPtr::from_usize(head);
-    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
-        tls.current_task.robust_list = Some(head);
+    with_current_task(|task| {
+        task.robust_list.set(Some(head));
     });
 }
 
@@ -638,9 +678,7 @@ pub(crate) fn sys_get_robust_list(
     if pid.is_some() {
         unimplemented!("Getting robust list for a specific PID is not supported yet");
     }
-    let head = litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
-        tls.current_task.robust_list.map_or(0, |ptr| ptr.as_usize())
-    });
+    let head = with_current_task(|task| task.robust_list.get().map_or(0, |ptr| ptr.as_usize()));
     unsafe { head_ptr.write_at_offset(0, head) }.ok_or(Errno::EFAULT)
 }
 
@@ -773,39 +811,31 @@ pub(crate) fn sys_time(
 
 /// Handle syscall `getpid`.
 pub(crate) fn sys_getpid() -> i32 {
-    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| tls.current_task.pid)
+    with_current_task(|task| task.pid)
 }
 
 pub(crate) fn sys_getppid() -> i32 {
-    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| tls.current_task.ppid)
+    with_current_task(|task| task.ppid)
 }
 
 /// Handle syscall `getuid`.
-pub(crate) fn sys_getuid() -> usize {
-    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
-        tls.current_task.credentials.uid
-    })
+pub(crate) fn sys_getuid() -> u32 {
+    with_current_task(|task| task.credentials.uid)
 }
 
 /// Handle syscall `geteuid`.
-pub(crate) fn sys_geteuid() -> usize {
-    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
-        tls.current_task.credentials.euid
-    })
+pub(crate) fn sys_geteuid() -> u32 {
+    with_current_task(|task| task.credentials.euid)
 }
 
 /// Handle syscall `getgid`.
-pub(crate) fn sys_getgid() -> usize {
-    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
-        tls.current_task.credentials.gid
-    })
+pub(crate) fn sys_getgid() -> u32 {
+    with_current_task(|task| task.credentials.gid)
 }
 
 /// Handle syscall `getegid`.
-pub(crate) fn sys_getegid() -> usize {
-    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
-        tls.current_task.credentials.egid
-    })
+pub(crate) fn sys_getegid() -> u32 {
+    with_current_task(|task| task.credentials.egid)
 }
 
 /// Number of CPUs
@@ -939,6 +969,7 @@ pub(crate) fn sys_execve(
     pathname: crate::ConstPtr<i8>,
     argv: crate::ConstPtr<crate::ConstPtr<i8>>,
     envp: crate::ConstPtr<crate::ConstPtr<i8>>,
+    ctx: &litebox_common_linux::PtRegs,
 ) -> Result<(), Errno> {
     fn copy_vector(
         mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
@@ -993,55 +1024,30 @@ pub(crate) fn sys_execve(
     crate::file_descriptors().write().close_on_exec();
 
     // unmmap all memory mappings and reset brk
-    litebox_platform_multiplex::Platform::with_thread_local_storage_mut(|tls| {
-        tls.current_task.robust_list = None;
-
-        if let Some(robust_list) = tls.current_task.robust_list.take() {
+    with_current_task(|task| {
+        if let Some(robust_list) = task.robust_list.take() {
             let _ = wake_robust_list(robust_list);
         }
 
         // Check if we are the only thread in the process
-        if LITEBOX_PROCESS
+        if task
+            .process
             .nr_threads
             .load(core::sync::atomic::Ordering::Relaxed)
             != 1
         {
             unimplemented!("execve when multiple threads exist is not supported yet");
         }
-        let release = |r: Range<usize>, vm: VmFlags| {
-            // Reserved mappings
-            if vm.is_empty() {
-                return false;
-            }
-            if vm.contains(VmFlags::VM_GROWSDOWN) {
-                // Stack we are currently running on, don't unmap it.
-                // This happens when litebox runs in user space so that
-                // it shares the stack with the guest program.
-                let rsp: usize;
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    core::arch::asm!(
-                        "mov {}, rsp",
-                        out(reg) rsp,
-                    );
-                }
-                #[cfg(target_arch = "x86")]
-                unsafe {
-                    core::arch::asm!(
-                        "mov {}, esp",
-                        out(reg) rsp,
-                    );
-                }
-                if r.start <= rsp && rsp < r.end {
-                    return false;
-                }
-            }
-            true
-        };
+        // Don't release reserved mappings.
+        let release = |r: Range<usize>, vm: VmFlags| !vm.is_empty();
         let page_manager = crate::litebox_page_manager();
         unsafe { page_manager.release_memory(release) }.expect("failed to release memory mappings");
     });
-    litebox_platform_multiplex::Platform::clear_guest_thread_local_storage();
+
+    litebox_platform_multiplex::Platform::clear_guest_thread_local_storage(
+        #[cfg(target_arch = "x86")]
+        ctx.xgs.truncate(),
+    );
 
     let callback = EXECVE_CALLBACK.get().expect("execve callback is not set");
     // if `execve` fails, it is unrecoverable at this point as we have already unmapped everything.

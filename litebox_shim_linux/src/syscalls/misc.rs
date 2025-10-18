@@ -2,6 +2,7 @@
 //!
 //! Examples of syscalls handled here include `getrandom`, `uname`, and similar operations.
 
+use crate::with_current_task;
 use litebox::{
     platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider as _},
     utils::TruncateExt as _,
@@ -96,9 +97,11 @@ pub(crate) fn sys_sysinfo() -> litebox_common_linux::Sysinfo {
         bufferram: 0,
         totalswap: 0,
         freeswap: 0,
-        procs: super::process::LITEBOX_PROCESS
-            .nr_threads
-            .load(core::sync::atomic::Ordering::Relaxed),
+        procs: with_current_task(|task| {
+            task.process
+                .nr_threads
+                .load(core::sync::atomic::Ordering::Relaxed)
+        }),
         totalhigh: 0,
         freehigh: 0,
         mem_unit: 1,

@@ -1,11 +1,10 @@
 //! An implementation of [`HostInterface`] for SNP VMM
 use ::alloc::boxed::Box;
 use core::arch::asm;
-use core::cell::RefCell;
 
 use litebox::{
-    platform::{RawConstPointer, RawMutPointer, RawPointerProvider, ThreadLocalStorageProvider},
-    utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt as _},
+    platform::{RawConstPointer, RawMutPointer},
+    utils::ReinterpretUnsignedExt as _,
 };
 use litebox_common_linux::{CloneFlags, SigSet, SigmaskHow};
 
@@ -92,70 +91,41 @@ fn current() -> Option<&'static mut bindings::vsbox_task> {
 }
 
 impl SnpLinuxKernel {
-    pub fn set_init_tls(boot_params: &bindings::vmpl2_boot_params) {
-        let task = ::alloc::boxed::Box::new(litebox_common_linux::Task {
+    pub fn init_task(
+        &self,
+        boot_params: &bindings::vmpl2_boot_params,
+    ) -> litebox_common_linux::TaskParams {
+        litebox_common_linux::TaskParams {
             pid: boot_params.pid,
             tid: boot_params.pid,
             ppid: boot_params.ppid,
-            clear_child_tid: None,
-            robust_list: None,
-            credentials: ::alloc::sync::Arc::new(litebox_common_linux::Credentials {
-                uid: boot_params.uid as usize,
-                gid: boot_params.gid as usize,
-                euid: boot_params.euid as usize,
-                egid: boot_params.egid as usize,
-            }),
-            comm: [0; litebox_common_linux::TASK_COMM_LEN],
-            stored_bp: None,
-        });
-        let tls = litebox_common_linux::ThreadLocalStorage::new(task);
-        Self::set_thread_local_storage(tls);
+            uid: boot_params.uid,
+            gid: boot_params.gid,
+            euid: boot_params.euid,
+            egid: boot_params.egid,
+        }
     }
 }
 
-impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
-    type ThreadLocalStorage = litebox_common_linux::ThreadLocalStorage<SnpLinuxKernel>;
-
-    fn set_thread_local_storage(value: Self::ThreadLocalStorage) {
-        let current_task = current().expect("Current task must be available");
-        assert!(current_task.tls.is_null(), "TLS should not be set yet");
-        let tls = ::alloc::boxed::Box::new(RefCell::new(value));
-        current_task.tls = ::alloc::boxed::Box::into_raw(tls).cast();
+unsafe impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
+    fn get_thread_local_storage() -> *mut () {
+        current()
+            .expect("Current task must be available")
+            .tls
+            .cast()
     }
 
-    fn with_thread_local_storage_mut<F, R>(f: F) -> R
-    where
-        F: FnOnce(&mut Self::ThreadLocalStorage) -> R,
-    {
+    unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
         let current_task = current().expect("Current task must be available");
-        assert!(!current_task.tls.is_null(), "TLS should be set");
-        let tls = unsafe { &*current_task.tls.cast::<RefCell<Self::ThreadLocalStorage>>() };
-        f(&mut tls.borrow_mut())
-    }
-
-    fn release_thread_local_storage() -> Self::ThreadLocalStorage {
-        let current_task = current().expect("Current task must be available");
-        assert!(!current_task.tls.is_null(), "TLS should be set");
-
-        let tls =
-            core::mem::take(&mut current_task.tls).cast::<RefCell<Self::ThreadLocalStorage>>();
-        let _ = unsafe { (*tls).borrow_mut() }; // ensure no one is borrowing it
-
-        unsafe { Box::from_raw(tls) }.into_inner()
-    }
-
-    fn clear_guest_thread_local_storage() {
-        todo!()
+        core::mem::replace(&mut current_task.tls, value.cast()).cast()
     }
 }
 
 core::arch::global_asm!(include_str!("entry.S"));
 
 struct ThreadStartArgs {
-    entry_point: usize,
-    stack_top: usize,
-    parent_ctx: litebox_common_linux::PtRegs,
-    thread_args: Box<litebox_common_linux::NewThreadArgs<SnpLinuxKernel>>,
+    ctx: litebox_common_linux::PtRegs,
+    init_thread: Box<dyn litebox::platform::InitThread>,
 }
 
 const RIP_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs, rip);
@@ -167,27 +137,14 @@ const EFLAGS_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs,
 /// Arguments should be set up by host.
 #[unsafe(no_mangle)]
 extern "C" fn thread_start(
-    pt_regs: *mut litebox_common_linux::PtRegs,
-    args: *mut ThreadStartArgs,
+    regs: &mut litebox_common_linux::PtRegs,
+    thread_start_args: Box<ThreadStartArgs>,
 ) -> ! {
-    // SAFETY: The arg pointer is guaranteed to be valid and point to a ThreadStartArgs
-    // that was created via Box::into_raw in spawn_thread.
-    let mut thread_start_args = unsafe { Box::from_raw(args) };
-
-    // SAFETY: The pt_regs pointer is guaranteed to be valid and point to a PtRegs
-    // on the stack (by host).
-    let regs = unsafe { &mut *pt_regs };
-    // Host should set `rax` to child's TID
-    thread_start_args.thread_args.task.tid = regs.rax.reinterpret_as_signed().truncate();
-    // Child's pt_regs should have the same registers as parent's except rax, rip, and rsp.
-    *regs = thread_start_args.parent_ctx;
-    regs.rax = 0;
-    regs.rip = thread_start_args.entry_point;
-    regs.rsp = thread_start_args.stack_top;
+    *regs = thread_start_args.ctx;
 
     // Set up thread-local storage for the new thread. This is done by
     // calling the actual thread callback with the unpacked arguments
-    (thread_start_args.thread_args.callback)(*thread_start_args.thread_args);
+    thread_start_args.init_thread.init();
 
     // Restore the context
     unsafe {
@@ -213,7 +170,7 @@ extern "C" fn thread_start(
             "mov     rsp, [rsp + 0x20]",   /* original rsp */
             "swapgs",
             "sysretq",
-            in(reg) pt_regs,
+            in(reg) regs,
             rip_off = const RIP_OFFSET,
             eflags_off = const EFLAGS_OFFSET,
         );
@@ -223,18 +180,13 @@ extern "C" fn thread_start(
 
 impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     type ExecutionContext = litebox_common_linux::PtRegs;
-    type ThreadArgs = litebox_common_linux::NewThreadArgs<SnpLinuxKernel>;
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
-    type ThreadId = usize;
 
     unsafe fn spawn_thread(
         &self,
         ctx: &Self::ExecutionContext,
-        stack: <Self as RawPointerProvider>::RawMutPointer<u8>,
-        stack_size: usize,
-        entry_point: usize,
-        thread_args: Box<Self::ThreadArgs>,
-    ) -> Result<Self::ThreadId, Self::ThreadSpawnError> {
+        init_thread: Box<dyn litebox::platform::InitThread>,
+    ) -> Result<(), Self::ThreadSpawnError> {
         let flags = CloneFlags::THREAD
             | CloneFlags::VM
             | CloneFlags::FS
@@ -243,10 +195,8 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
             | CloneFlags::SYSVSEM
             | CloneFlags::CHILD_SETTID;
         let thread_start_args = Box::new(ThreadStartArgs {
-            entry_point,
-            stack_top: stack.as_usize() + stack_size,
-            parent_ctx: *ctx,
-            thread_args,
+            ctx: *ctx,
+            init_thread,
         });
         let thread_start_arg_ptr = Box::into_raw(thread_start_args);
         // Note this is different from the usual clone3 syscall as we have a driver running
@@ -254,7 +204,8 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
         // The first argument will be placed into the new thread's RSI register (i.e. the second argument).
         HostSnpInterface::syscalls(SyscallN::<2, NR_SYSCALL_CLONE3> {
             args: [thread_start_arg_ptr as u64, flags.bits()],
-        })
+        })?;
+        Ok(())
     }
 }
 

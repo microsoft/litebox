@@ -13,7 +13,7 @@ pub fn init_platform(tar_data: &'static [u8], initial_dirs: &[&str], initial_fil
     let platform = Platform::new();
     set_platform(platform);
     let platform = litebox_platform_multiplex::platform();
-    let litebox = litebox_shim_linux::litebox();
+    let litebox = litebox_shim_linux::init_process(platform.init_task());
 
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     in_mem_fs.with_root_privileges(|fs| {
@@ -74,7 +74,7 @@ pub fn test_load_exec_common(executable_path: &str) {
     }
     let info = load_program(executable_path, argv, envp, aux).unwrap();
     #[cfg(target_arch = "x86_64")]
-    let pt_regs = litebox_common_linux::PtRegs {
+    let mut pt_regs = litebox_common_linux::PtRegs {
         r15: 0,
         r14: 0,
         r13: 0,
@@ -97,5 +97,5 @@ pub fn test_load_exec_common(executable_path: &str) {
         rsp: info.user_stack_top,
         ss: 0x2b, // __USER_DS
     };
-    unsafe { litebox_platform_windows_userland::thread_start_asm(&pt_regs) };
+    unsafe { litebox_platform_windows_userland::run_thread(&mut pt_regs) };
 }

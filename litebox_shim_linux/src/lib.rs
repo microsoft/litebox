@@ -18,6 +18,8 @@ use alloc::vec::Vec;
 // platform-specific things within it.
 use once_cell::race::OnceBox;
 
+use alloc::sync::Arc;
+use core::cell::{Cell, RefCell};
 use litebox::{
     LiteBox,
     fd::{ErrRawIntFd, TypedFd},
@@ -45,6 +47,9 @@ type LinuxFS = litebox::fs::layered::FileSystem<
 
 type FileFd = litebox::fd::TypedFd<LinuxFS>;
 
+type UserConstPointer<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
+type UserMutPointer<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
+
 static BOOT_TIME: once_cell::race::OnceBox<<Platform as litebox::platform::TimeProvider>::Instant> =
     once_cell::race::OnceBox::new();
 
@@ -59,8 +64,51 @@ pub(crate) fn boot_time() -> &'static <Platform as litebox::platform::TimeProvid
         .expect("litebox() should have already been called before this point")
 }
 
+/// Initialize the shim to run a task with the given parameters.
+///
+/// Returns the global litebox object.
+pub fn init_process<'a>(task: litebox_common_linux::TaskParams) -> &'a LiteBox<Platform> {
+    let litebox_common_linux::TaskParams {
+        pid,
+        ppid,
+        tid,
+        uid,
+        euid,
+        gid,
+        egid,
+    } = task;
+
+    // TODO: ensure this gets torn down even if the thread never runs sys_exit.
+    // Consider a scoped execution model, e.g.
+    // ```
+    // litebox_shim_linux::run_process(task, |litebox| {
+    //     ...
+    // })
+    // ```
+    SHIM_TLS.init(LinuxShimTls {
+        current_task: Task {
+            pid,
+            ppid,
+            tid,
+            clear_child_tid: None.into(),
+            robust_list: None.into(),
+            credentials: syscalls::process::Credentials {
+                uid,
+                euid,
+                gid,
+                egid,
+            }
+            .into(),
+            comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
+            fs: Arc::new(syscalls::file::FsState::new()).into(),
+            process: syscalls::process::Process::new().into(),
+        },
+    });
+    litebox()
+}
+
 /// Get the global litebox object
-pub fn litebox<'a>() -> &'a LiteBox<Platform> {
+pub(crate) fn litebox<'a>() -> &'a LiteBox<Platform> {
     static LITEBOX: OnceBox<LiteBox<Platform>> = OnceBox::new();
     LITEBOX.get_or_init(|| {
         use litebox::platform::TimeProvider as _;
@@ -193,9 +241,11 @@ impl Descriptors {
                 self.descriptors.len() - 1
             });
         if idx
-            >= crate::syscalls::process::LITEBOX_PROCESS
-                .limits
-                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
+            >= with_current_task(|task| {
+                task.process
+                    .limits
+                    .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
+            })
         {
             return Err(descriptor);
         }
@@ -433,7 +483,7 @@ pub fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> Continu
             pathname,
             argv,
             envp,
-        } => match syscalls::process::sys_execve(pathname, argv, envp) {
+        } => match syscalls::process::sys_execve(pathname, argv, envp, ctx) {
             Ok(()) => return ContinueOperation::ExitProcess(0),
             Err(err) => Err(err),
         },
@@ -655,6 +705,12 @@ pub fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> Continu
             optval,
             optlen,
         } => syscalls::net::sys_setsockopt(sockfd, optname, optval, optlen).map(|()| 0),
+        SyscallRequest::Getsockopt {
+            sockfd,
+            optname,
+            optval,
+            optlen,
+        } => syscalls::net::sys_getsockopt(sockfd, optname, optval, optlen).map(|()| 0),
         SyscallRequest::Getsockname {
             sockfd,
             addr,
@@ -895,10 +951,10 @@ pub fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> Continu
         SyscallRequest::Getppid => {
             Ok(syscalls::process::sys_getppid().reinterpret_as_unsigned() as usize)
         }
-        SyscallRequest::Getuid => Ok(syscalls::process::sys_getuid()),
-        SyscallRequest::Getgid => Ok(syscalls::process::sys_getgid()),
-        SyscallRequest::Geteuid => Ok(syscalls::process::sys_geteuid()),
-        SyscallRequest::Getegid => Ok(syscalls::process::sys_getegid()),
+        SyscallRequest::Getuid => Ok(syscalls::process::sys_getuid() as usize),
+        SyscallRequest::Getgid => Ok(syscalls::process::sys_getgid() as usize),
+        SyscallRequest::Geteuid => Ok(syscalls::process::sys_geteuid() as usize),
+        SyscallRequest::Getegid => Ok(syscalls::process::sys_getegid() as usize),
         SyscallRequest::Sysinfo { buf } => {
             let sysinfo = syscalls::misc::sys_sysinfo();
             unsafe { buf.write_at_offset(0, sysinfo) }
@@ -1012,4 +1068,47 @@ fn handle_clone_request(
                 ctx.get_ip(),
             )
         })
+}
+
+struct LinuxShimTls {
+    current_task: Task,
+}
+
+struct Task {
+    process: Arc<syscalls::process::Process>,
+    /// Process ID
+    pid: i32,
+    /// Parent Process ID
+    ppid: i32,
+    /// Thread ID
+    tid: i32,
+    /// When a thread whose `clear_child_tid` is not `None` terminates, and it shares memory with other threads,
+    /// the kernel writes 0 to the address specified by `clear_child_tid` and then executes:
+    ///
+    /// futex(clear_child_tid, FUTEX_WAKE, 1, NULL, NULL, 0);
+    ///
+    /// This operation wakes a single thread waiting on the specified memory location via futex.
+    /// Any errors from the futex wake operation are ignored.
+    clear_child_tid: Cell<Option<UserMutPointer<i32>>>,
+    /// The purpose of the robust futex list is to ensure that if a thread accidentally fails to unlock a futex before
+    /// terminating or calling execve(2), another thread that is waiting on that futex is notified that the former owner
+    /// of the futex has died. This notification consists of two pieces: the FUTEX_OWNER_DIED bit is set in the futex word,
+    /// and the kernel performs a futex(2) FUTEX_WAKE operation on one of the threads waiting on the futex.
+    robust_list: Cell<Option<UserConstPointer<litebox_common_linux::RobustListHead<Platform>>>>,
+    /// Task credentials. These are set per task but are Arc'd to save space
+    /// since most tasks never change their credentials.
+    credentials: Arc<syscalls::process::Credentials>,
+    /// Command name (usually the executable name, excluding the path)
+    comm: Cell<[u8; litebox_common_linux::TASK_COMM_LEN]>,
+    /// Filesystem state.
+    fs: RefCell<Arc<syscalls::file::FsState>>,
+}
+
+litebox::shim_thread_local! {
+    #[platform = Platform]
+    static SHIM_TLS: LinuxShimTls;
+}
+
+fn with_current_task<R>(f: impl FnOnce(&Task) -> R) -> R {
+    SHIM_TLS.with(|tls| f(&tls.current_task))
 }

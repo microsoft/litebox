@@ -611,7 +611,7 @@ pub enum AddressFamily {
 
 #[repr(u32)]
 #[non_exhaustive]
-#[derive(Debug, IntEnum)]
+#[derive(Clone, Copy, Debug, IntEnum)]
 pub enum SockType {
     Stream = 1,
     Datagram = 2,
@@ -794,7 +794,7 @@ impl TryFrom<core::time::Duration> for Timespec {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 pub struct TimeVal {
     tv_sec: time_t,
     tv_usec: suseconds_t,
@@ -833,6 +833,18 @@ impl From<Timespec> for TimeVal {
         // Convert nanoseconds to microseconds, ensuring we don't overflow suseconds_t
         let microseconds = timespec.tv_nsec / 1_000;
         let timeval_u_sec = suseconds_t::try_from(microseconds).unwrap_or(suseconds_t::MAX);
+        TimeVal {
+            tv_sec: timeval_sec,
+            tv_usec: timeval_u_sec,
+        }
+    }
+}
+
+impl From<core::time::Duration> for TimeVal {
+    fn from(duration: core::time::Duration) -> Self {
+        let timeval_sec: time_t = duration.as_secs().reinterpret_as_signed().truncate();
+        let timeval_u_sec: suseconds_t =
+            suseconds_t::from(duration.subsec_micros().reinterpret_as_signed());
         TimeVal {
             tv_sec: timeval_sec,
             tv_usec: timeval_u_sec,
@@ -1209,89 +1221,24 @@ pub struct CloneArgs {
     pub cgroup: u64,
 }
 
-/// A descriptor for thread-local storage (TLS).
-///
-/// On `x86_64`, this is represented as a `u8`. The TLS pointer can point to
-/// an arbitrary-sized memory region.
-#[cfg(target_arch = "x86_64")]
-pub type ThreadLocalDescriptor = u8;
-/// A descriptor for thread-local storage (TLS).
-///
-/// On `x86`, this is represented as a `UserDesc`, which provides a more
-/// structured descriptor (e.g., base address, limit, flags).
-#[cfg(target_arch = "x86")]
-pub type ThreadLocalDescriptor = UserDesc;
-
-pub struct NewThreadArgs<
-    Platform: litebox::platform::RawPointerProvider + litebox::sync::RawSyncPrimitivesProvider,
-> {
-    /// Pointer to thread-local storage (TLS) given by the guest program
-    pub tls: Option<Platform::RawMutPointer<ThreadLocalDescriptor>>,
-    /// Where to store child TID in child's memory
-    pub set_child_tid: Option<Platform::RawMutPointer<i32>>,
-    /// Task struct that maintains all per-thread data
-    pub task: alloc::boxed::Box<Task<Platform>>,
-    /// A callback function that *MUST* be called when the thread is created.
-    ///
-    /// Note that `task.tid` must be set correctly before this function is called.
-    pub callback: fn(Self),
-}
-
-unsafe impl<Platform> Send for NewThreadArgs<Platform> where
-    Platform:
-        litebox::platform::RawPointerProvider + litebox::sync::RawSyncPrimitivesProvider + Send
-{
-}
-
-/// Struct for thread-local storage.
-pub struct ThreadLocalStorage<Platform: litebox::platform::RawPointerProvider> {
-    pub current_task: alloc::boxed::Box<Task<Platform>>,
-}
-
-/// Credentials of a process
-#[derive(Clone)]
-pub struct Credentials {
-    pub uid: usize,
-    pub euid: usize,
-    pub gid: usize,
-    pub egid: usize,
-}
-
-impl<Platform: litebox::platform::RawPointerProvider> ThreadLocalStorage<Platform> {
-    pub const fn new(task: alloc::boxed::Box<Task<Platform>>) -> Self {
-        Self { current_task: task }
-    }
-}
-
 /// Task command name length
 pub const TASK_COMM_LEN: usize = 16;
 
-pub struct Task<Platform: litebox::platform::RawPointerProvider> {
+pub struct TaskParams {
     /// Process ID
     pub pid: i32,
     /// Parent Process ID
     pub ppid: i32,
     /// Thread ID
     pub tid: i32,
-    /// When a thread whose `clear_child_tid` is not `None` terminates, and it shares memory with other threads,
-    /// the kernel writes 0 to the address specified by `clear_child_tid` and then executes:
-    ///
-    /// futex(clear_child_tid, FUTEX_WAKE, 1, NULL, NULL, 0);
-    ///
-    /// This operation wakes a single thread waiting on the specified memory location via futex.
-    /// Any errors from the futex wake operation are ignored.
-    pub clear_child_tid: Option<Platform::RawMutPointer<i32>>,
-    /// The purpose of the robust futex list is to ensure that if a thread accidentally fails to unlock a futex before
-    /// terminating or calling execve(2), another thread that is waiting on that futex is notified that the former owner
-    /// of the futex has died. This notification consists of two pieces: the FUTEX_OWNER_DIED bit is set in the futex word,
-    /// and the kernel performs a futex(2) FUTEX_WAKE operation on one of the threads waiting on the futex.
-    pub robust_list: Option<Platform::RawConstPointer<RobustListHead<Platform>>>,
-    /// Shared process credentials.
-    pub credentials: alloc::sync::Arc<Credentials>,
-    /// Command name (usually the executable name, excluding the path)
-    pub comm: [u8; TASK_COMM_LEN],
-    /// Stored frame pointer for the thread
-    pub stored_bp: Option<usize>,
+    /// The initial uid.
+    pub uid: u32,
+    /// The initial effective uid.
+    pub euid: u32,
+    /// The initial gid.
+    pub gid: u32,
+    /// The initial effective gid.
+    pub egid: u32,
 }
 
 #[repr(C)]
@@ -1982,6 +1929,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         optval: Platform::RawConstPointer<u8>,
         optlen: usize,
     },
+    Getsockopt {
+        sockfd: i32,
+        optname: SocketOptionName,
+        optval: Platform::RawMutPointer<u8>,
+        optlen: Platform::RawMutPointer<u32>,
+    },
     Getsockname {
         sockfd: i32,
         addr: Platform::RawMutPointer<u8>,
@@ -2417,18 +2370,27 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::recvfrom => sys_req!(Recvfrom { sockfd, buf:*, len, flags, addr:*, addrlen:*, }),
             Sysno::bind => sys_req!(Bind { sockfd, sockaddr:*, addrlen }),
             Sysno::listen => sys_req!(Listen { sockfd, backlog }),
-            Sysno::setsockopt => {
+            Sysno::setsockopt | Sysno::getsockopt => {
                 let level: u32 = ctx.sys_req_arg(1);
                 let name: u32 = ctx.sys_req_arg(2);
-                if let Some(optname) = SocketOptionName::from(level, name) {
-                    SyscallRequest::Setsockopt {
-                        sockfd: ctx.sys_req_arg(0),
-                        optname,
-                        optval: ctx.sys_req_ptr(3),
-                        optlen: ctx.sys_req_arg(4),
-                    }
-                } else {
+                let Some(optname) = SocketOptionName::from(level, name) else {
                     unimplemented!("level: {}, optname: {}", level, name);
+                };
+                let sockfd = ctx.sys_req_arg(0);
+                match sysno {
+                    Sysno::setsockopt => sys_req!(Setsockopt {
+                        sockfd: { sockfd },
+                        optname: { optname },
+                        optval:*,
+                        optlen,
+                    }),
+                    Sysno::getsockopt => sys_req!(Getsockopt {
+                        sockfd: { sockfd },
+                        optname: { optname },
+                        optval:*,
+                        optlen:*,
+                    }),
+                    _ => unreachable!(),
                 }
             }
             Sysno::getsockname => sys_req!(Getsockname { sockfd, addr:*, addrlen:* }),
@@ -2759,6 +2721,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
 /// shim.
 ///
 /// NOTE: It is assumed that all punchthroughs here are non-blocking.
+#[derive(Debug)]
 pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
     /// Examine and change blocked signals
     RtSigprocmask {

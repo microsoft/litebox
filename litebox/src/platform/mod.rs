@@ -49,33 +49,35 @@ pub trait Provider:
 pub trait ThreadProvider: RawPointerProvider {
     /// Execution context for the current thread of the guest program.
     type ExecutionContext;
-    /// Platform-specific argument needed for the new thread to start
-    type ThreadArgs;
     /// Error type for [`ThreadProvider::spawn_thread`].
     type ThreadSpawnError: core::error::Error;
-    /// Thread identifier type for the spawned thread.
-    type ThreadId: Clone + Send + Sync + 'static;
 
     /// Spawn a new thread with the given entry point.
     ///
-    /// `stack` is a pointer to the stack for the new thread, and `stack_size` is the size of the stack.
+    /// `ctx` contains the initial register state, including the entry point and stack pointer.
     ///
-    /// `entry_point` is the address of the first instruction in the guest program that will be executed
-    /// in the new thread.
-    ///
-    /// `thread_args` is the additional platform-specific argument needed for the new thread to start
+    /// `init_thread` provides an object used to initialize the shim on the new thread.
     ///
     /// # Safety
     ///
-    /// The `entry_point` must be a valid entry point for the new thread.
+    /// The context must be valid.
     unsafe fn spawn_thread(
         &self,
         ctx: &Self::ExecutionContext,
-        stack: <Self as RawPointerProvider>::RawMutPointer<u8>,
-        stack_size: usize,
-        entry_point: usize,
-        thread_args: alloc::boxed::Box<Self::ThreadArgs>,
-    ) -> Result<Self::ThreadId, Self::ThreadSpawnError>;
+        init_thread: alloc::boxed::Box<dyn InitThread>,
+    ) -> Result<(), Self::ThreadSpawnError>;
+}
+
+/// An object to initialize a newly spawned platform thread for use with the
+/// shim that spawned it.
+///
+/// This is implemented by the shim for passing to [`ThreadProvider::spawn_thread`].
+pub trait InitThread: Send {
+    /// Initializes the thread.
+    ///
+    /// After calling this, the caller must run the thread in the shim until it
+    /// exits, or there may be hangs or leaks.
+    fn init(self: alloc::boxed::Box<Self>);
 }
 
 /// Punch through any functionality for a particular platform that is not explicitly part of the
@@ -621,35 +623,47 @@ pub trait SystemInfoProvider {
 }
 
 /// A provider for thread-local storage.
-pub trait ThreadLocalStorageProvider {
-    type ThreadLocalStorage;
+///
+/// Currently, this provides just a single thread-local storage pointer. Shims
+/// should use [`shim_thread_local!`](crate::shim_thread_local) macro for a safe
+/// and ergonomic interface to TLS.
+///
+/// # Safety
+/// The implementation must ensure that the TLS pointer that is set for the
+/// thread (via `replace_thread_local_storage`) is the one that is returned, and
+/// that [`null_mut()`](core::ptr::null_mut) is returned if no TLS pointer has
+/// been set.
+pub unsafe trait ThreadLocalStorageProvider {
+    /// Gets the current thread-local storage pointer that was set with the most
+    /// recent call to `replace_thread_local_storage`. If
+    /// `replace_thread_local_storage` was never called, this function must
+    /// return [`null_mut()`](core::ptr::null_mut).
+    ///
+    // DEVNOTE: note that this does not take `&self`. So far, this has not been
+    // a problem for platform implementations, and allowing this does improve
+    // performance by avoiding a platform lookup on every TLS access. But we
+    // could consider changing this in the future if needed.
+    fn get_thread_local_storage() -> *mut ();
 
-    /// Set a thread-local storage value for the current thread.
+    /// Replaces the current thread-local storage pointer with `value`,
+    /// returning the previous value.
     ///
-    /// # Panics
+    /// The initial value for a thread is [`null_mut()`](core::ptr::null_mut).
     ///
-    /// Panics if TLS is set already.
-    fn set_thread_local_storage(value: Self::ThreadLocalStorage);
-
-    /// Invokes the provided callback function with the thread-local storage value for the current thread.
+    /// # Safety
+    /// The caller must cooperate with other users of this function to ensure
+    /// that the TLS pointer is not replaced with an invalid pointer.
     ///
-    /// # Panics
-    ///
-    /// Panics if TLS is not set yet.
-    fn with_thread_local_storage_mut<F, R>(f: F) -> R
-    where
-        F: FnOnce(&mut Self::ThreadLocalStorage) -> R;
-
-    /// Release the thread-local storage value for the current thread
-    ///
-    /// # Panics
-    ///
-    /// Panics if TLS is not set yet.
-    /// Panics if TLS is being used by [`Self::with_thread_local_storage_mut`].
-    fn release_thread_local_storage() -> Self::ThreadLocalStorage;
+    /// This can be achieved by using
+    /// [`shim_thread_local!`](crate::shim_thread_local).
+    unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut ();
 
     /// Clear any guest thread-local storage state for the current thread.
     ///
     /// This is used to help emulate certain syscalls (e.g., `execve`) that clear TLS.
-    fn clear_guest_thread_local_storage();
+    ///
+    /// TODO: move this to a separate trait or eliminate.
+    fn clear_guest_thread_local_storage(#[cfg(target_arch = "x86")] _selector: u16) {
+        unimplemented!()
+    }
 }

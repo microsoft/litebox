@@ -129,3 +129,12 @@ pub enum SetTcpOptionError {
     #[error("Not a TCP socket")]
     NotTcpSocket,
 }
+/// Possible errors from [`Network::get_tcp_option`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum GetTcpOptionError {
+    #[error("Not a valid open file descriptor")]
+    InvalidFd,
+    #[error("Not a TCP socket")]
+    NotTcpSocket,
+}

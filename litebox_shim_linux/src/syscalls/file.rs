@@ -17,9 +17,35 @@ use litebox_common_linux::{
     IoWriteVec, IoctlArg, errno::Errno,
 };
 
+use crate::with_current_task;
 use crate::{
     ConstPtr, Descriptor, MutPtr, file_descriptors, litebox, litebox_fs, raw_descriptor_store,
 };
+use core::sync::atomic::Ordering;
+
+pub(crate) struct FsState {
+    umask: core::sync::atomic::AtomicU32,
+}
+
+impl Clone for FsState {
+    fn clone(&self) -> Self {
+        Self {
+            umask: self.umask.load(Ordering::Relaxed).into(),
+        }
+    }
+}
+
+impl FsState {
+    pub fn new() -> Self {
+        Self {
+            umask: (Mode::WGRP | Mode::WOTH).bits().into(),
+        }
+    }
+
+    fn umask(&self) -> Mode {
+        Mode::from_bits_retain(self.umask.load(Ordering::Relaxed))
+    }
+}
 
 /// Path in the file system
 enum FsPath<P: path::Arg> {
@@ -66,19 +92,21 @@ impl<P: path::Arg> FsPath<P> {
     }
 }
 
-/// Global umask
-///
-/// Note we don't support fork (or `Clone` without `CloneFlags::FS`) yet, so one mask suffices.
-static UMASK: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(Mode::WGRP.bits() | Mode::WOTH.bits());
 fn get_umask() -> Mode {
-    Mode::from_bits_truncate(UMASK.load(core::sync::atomic::Ordering::SeqCst))
+    with_current_task(|task| task.fs.borrow().umask())
 }
 
 /// Handle syscall `umask`
 pub(crate) fn sys_umask(new_mask: u32) -> Mode {
     let new_mask = Mode::from_bits_truncate(new_mask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
-    Mode::from_bits_truncate(UMASK.swap(new_mask.bits(), core::sync::atomic::Ordering::SeqCst))
+    with_current_task(|task| {
+        let old_mask = task
+            .fs
+            .borrow()
+            .umask
+            .swap(new_mask.bits(), Ordering::Relaxed);
+        Mode::from_bits_retain(old_mask)
+    })
 }
 
 /// Handle syscall `open`
@@ -1325,9 +1353,11 @@ pub fn sys_dup(oldfd: i32, newfd: Option<i32>, flags: Option<OFlags>) -> Result<
             };
         }
         if newfd as usize
-            > super::process::LITEBOX_PROCESS
-                .limits
-                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
+            > with_current_task(|task| {
+                task.process
+                    .limits
+                    .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
+            })
         {
             return Err(Errno::EBADF);
         }
