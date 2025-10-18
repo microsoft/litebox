@@ -1005,9 +1005,6 @@ pub(crate) fn sys_execve(
     // Close CLOEXEC descriptors
     crate::file_descriptors().write().close_on_exec();
 
-    // Clear TLS for the new program.
-    clear_tls(ctx);
-
     // unmmap all memory mappings and reset brk
     with_current_task(|task| {
         if let Some(robust_list) = task.robust_list.take() {
@@ -1038,30 +1035,6 @@ pub(crate) fn sys_execve(
     *ctx = crate::load_program(path, argv_vec, envp_vec).unwrap();
 
     Ok(())
-}
-
-fn clear_tls(ctx: &mut litebox_common_linux::PtRegs) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        sys_arch_prctl(ArchPrctlArg::SetFs(0));
-    }
-    #[cfg(target_arch = "x86")]
-    {
-        let gs_selector = u32::try_from(ctx.xgs).unwrap();
-        if gs_selector != 0 {
-            let flags = litebox_common_linux::UserDescFlags(0);
-            let mut user_desc = litebox_common_linux::UserDesc {
-                entry_number: gs_selector >> 3,
-                base_addr: 0,
-                limit: 0,
-                flags,
-            };
-            let user_desc_ptr = litebox::platform::trivial_providers::TransparentMutPtr {
-                inner: &raw mut user_desc,
-            };
-            set_thread_area(user_desc_ptr).expect("failed to clear TLS entry");
-        }
-    }
 }
 
 /// Handle syscall `alarm`.
