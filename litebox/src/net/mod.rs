@@ -1144,7 +1144,9 @@ where
         name: TcpOptionName,
     ) -> Result<TcpOptionData, errors::GetTcpOptionError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(errors::GetTcpOptionError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
         match socket_handle.protocol() {
             Protocol::Tcp => {
