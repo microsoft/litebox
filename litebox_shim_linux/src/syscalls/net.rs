@@ -283,6 +283,23 @@ fn setsockopt(
                     }
                     Ok(())
                 }
+                TcpOption::KEEPINTVL => {
+                    const MAX_TCP_KEEPINTVL: u32 = 32767;
+                    if !(1..=MAX_TCP_KEEPINTVL).contains(&val) {
+                        return Err(Errno::EINVAL);
+                    }
+                    litebox_net()
+                        .lock()
+                        .set_tcp_option(
+                            fd,
+                            litebox::net::TcpOptionData::KEEPALIVE(Some(
+                                core::time::Duration::from_secs(u64::from(val)),
+                            )),
+                        )
+                        .expect("set TCP_KEEPALIVE should succeed");
+                    Ok(())
+                }
+                TcpOption::KEEPCNT | TcpOption::KEEPIDLE => Err(Errno::EOPNOTSUPP),
                 _ => unimplemented!("TCP option {to:?}"),
             }
         }
@@ -681,19 +698,21 @@ pub(crate) fn sys_accept(
     let file_table = file_descriptors().read();
     let socket = file_table.get_fd(sockfd).ok_or(Errno::EBADF)?;
     let file = match socket {
-        Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
-            let sock_type = get_socket_type(fd)?;
-            let fd = accept(fd)?;
-            initialize_socket(&fd, sock_type, flags);
-            Ok(Descriptor::LiteBoxRawFd(
-                crate::raw_descriptor_store()
-                    .write()
-                    .fd_into_raw_integer(fd),
-            ))
-        })?,
+        Descriptor::LiteBoxRawFd(raw_fd) => {
+            with_socket_fd(*raw_fd, |fd| {
+                drop(file_table); // Drop before possibly-blocking `accept`
+                let sock_type = get_socket_type(fd)?;
+                let fd = accept(fd)?;
+                initialize_socket(&fd, sock_type, flags);
+                Ok(Descriptor::LiteBoxRawFd(
+                    crate::raw_descriptor_store()
+                        .write()
+                        .fd_into_raw_integer(fd),
+                ))
+            })?
+        }
         _ => return Err(Errno::ENOTSOCK),
     };
-    drop(file_table);
     file_descriptors().write().insert(file).map_err(|desc| {
         crate::syscalls::file::do_close(desc).expect("closing descriptor should succeed");
         Errno::EMFILE
@@ -767,9 +786,6 @@ pub(crate) fn sys_sendto(
     let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
     match socket {
         Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
-            if get_status(fd).contains(OFlags::NONBLOCK) {
-                flags.insert(SendFlags::DONTWAIT);
-            }
             let sockaddr = sockaddr.map(|SocketAddress::Inet(addr)| addr);
             sendto(fd, &buf, flags, sockaddr)
         }),
@@ -794,6 +810,7 @@ pub(crate) fn sys_recvfrom(
         Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
             let mut buffer: [u8; 4096] = [0; 4096];
             let mut addr = None;
+            drop(file_table); // Drop before possibly-blocking `receive`
             let size = receive(
                 fd,
                 &mut buffer,
