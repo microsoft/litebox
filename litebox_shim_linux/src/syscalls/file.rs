@@ -179,7 +179,7 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
         Descriptor::Socket(socket) => {
             let socket = socket.clone();
             drop(file_table);
-            socket.receive(buf, litebox::net::ReceiveFlags::empty(), None)
+            socket.receive(buf, litebox_common_linux::ReceiveFlags::empty(), None)
         }
         Descriptor::PipeReader { consumer, .. } => {
             let consumer = consumer.clone();
@@ -220,7 +220,7 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
         Descriptor::Socket(socket) => {
             let socket = socket.clone();
             drop(file_table);
-            socket.sendto(buf, litebox::net::SendFlags::empty(), None)
+            socket.sendto(buf, litebox_common_linux::SendFlags::empty(), None)
         }
         Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
         Descriptor::PipeWriter { producer, .. } => {
@@ -472,7 +472,7 @@ pub fn sys_writev(
             let socket = socket.clone();
             drop(locked_file_descriptors);
             write_to_iovec(iovs, |buf: &[u8]| {
-                socket.sendto(buf, litebox::net::SendFlags::empty(), None)
+                socket.sendto(buf, litebox_common_linux::SendFlags::empty(), None)
             })
         }
         Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),

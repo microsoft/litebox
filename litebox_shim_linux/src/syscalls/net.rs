@@ -8,18 +8,33 @@ use core::{
 use litebox::{
     event::{Events, observer::Observer, polling::Pollee},
     fs::OFlags,
-    net::{ReceiveFlags, SendFlags, SocketFd, TcpOptionData},
+    net::{SocketFd, TcpOptionData},
     platform::{RawConstPointer as _, RawMutPointer as _},
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
-    AddressFamily, SockFlags, SockType, SocketOption, SocketOptionName, TcpOption, errno::Errno,
+    AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption, SocketOptionName,
+    TcpOption, errno::Errno,
 };
 
 use crate::Platform;
 use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox_net};
 
 const ADDR_MAX_LEN: usize = 128;
+
+macro_rules! convert_flags {
+    ($src:expr, $src_type:ty, $dst_type:ty, $($flag:ident),+ $(,)?) => {
+        {
+            let mut result = <$dst_type>::empty();
+            $(
+                if $src.contains(<$src_type>::$flag) {
+                    result |= <$dst_type>::$flag;
+                }
+            )+
+            result
+        }
+    };
+}
 
 #[repr(C)]
 struct CSockStorage {
@@ -415,7 +430,7 @@ impl Socket {
     fn try_sendto(
         &self,
         buf: &[u8],
-        flags: SendFlags,
+        flags: litebox::net::SendFlags,
         sockaddr: Option<SocketAddr>,
     ) -> Result<usize, Errno> {
         let n = litebox_net()
@@ -430,8 +445,23 @@ impl Socket {
         flags: SendFlags,
         sockaddr: Option<SocketAddr>,
     ) -> Result<usize, Errno> {
+        // Convert `SendFlags` to `litebox::net::SendFlags`
+        // Note [`Network::send`] is non-blocking and `DONTWAIT` is handled below
+        // so we don't convert `DONTWAIT` here.
+        let new_flags = convert_flags!(
+            flags,
+            SendFlags,
+            litebox::net::SendFlags,
+            CONFIRM,
+            DONTROUTE,
+            EOR,
+            MORE,
+            NOSIGNAL,
+            OOB,
+        );
+
         if self.get_status().contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT) {
-            self.try_sendto(buf, flags, sockaddr)
+            self.try_sendto(buf, new_flags, sockaddr)
         } else {
             let timeout = self.options.lock().send_timeout;
             if timeout.is_some() {
@@ -440,7 +470,7 @@ impl Socket {
 
             // TODO: use `poll` instead of busy wait
             loop {
-                match self.try_sendto(buf, flags, sockaddr) {
+                match self.try_sendto(buf, new_flags, sockaddr) {
                     Err(Errno::EAGAIN) => {}
                     ret => return ret,
                 }
@@ -452,7 +482,7 @@ impl Socket {
     fn try_receive(
         &self,
         buf: &mut [u8],
-        flags: ReceiveFlags,
+        flags: litebox::net::ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, Errno> {
         let n = litebox_net()
@@ -467,8 +497,34 @@ impl Socket {
         flags: ReceiveFlags,
         mut source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, Errno> {
+        // Convert `ReceiveFlags` to [`litebox::net::ReceiveFlags`]
+        // Note [`Network::receive`] is non-blocking and `DONTWAIT` is handled below
+        // so we don't convert `DONTWAIT` here.
+        let mut new_flags = convert_flags!(
+            flags,
+            ReceiveFlags,
+            litebox::net::ReceiveFlags,
+            CMSG_CLOEXEC,
+            ERRQUEUE,
+            OOB,
+            PEEK,
+            WAITALL,
+        );
+        // `MSG_TRUNC` behavior depends on the socket type
+        if flags.contains(ReceiveFlags::TRUNC) {
+            match self.sock_type {
+                SockType::Datagram | SockType::Raw => {
+                    new_flags.insert(litebox::net::ReceiveFlags::TRUNC);
+                }
+                SockType::Stream => {
+                    new_flags.insert(litebox::net::ReceiveFlags::DISCARD);
+                }
+                _ => unimplemented!(),
+            }
+        }
+
         if self.get_status().contains(OFlags::NONBLOCK) || flags.contains(ReceiveFlags::DONTWAIT) {
-            self.try_receive(buf, flags, source_addr)
+            self.try_receive(buf, new_flags, source_addr)
         } else {
             let timeout = self.options.lock().recv_timeout;
             if timeout.is_some() {
@@ -476,7 +532,7 @@ impl Socket {
             }
 
             loop {
-                match self.try_receive(buf, flags, source_addr.as_deref_mut()) {
+                match self.try_receive(buf, new_flags, source_addr.as_deref_mut()) {
                     Err(Errno::EAGAIN) => {}
                     ret => return ret,
                 }
@@ -830,9 +886,10 @@ mod tests {
     use core::net::SocketAddr;
 
     use alloc::string::ToString as _;
-    use litebox::net::{ReceiveFlags, SendFlags};
     use litebox::platform::RawConstPointer as _;
-    use litebox_common_linux::{AddressFamily, SockFlags, SockType, errno::Errno};
+    use litebox_common_linux::{
+        AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType, errno::Errno,
+    };
 
     use super::{SocketAddress, sys_connect, sys_getsockname};
     use crate::{

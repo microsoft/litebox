@@ -978,8 +978,9 @@ where
         let mut table_entry = descriptor_table.get_entry_mut(fd);
         let socket_handle = &mut table_entry.entry;
 
-        let flags = flags & ReceiveFlags::ALL; // ignore irrelevant flags (e.g., NOSIGNAL)
-        if flags.intersects((ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC).complement()) {
+        if flags.intersects(
+            (ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC | ReceiveFlags::DISCARD).complement(),
+        ) {
             unimplemented!("flags: {:?}", flags);
         }
 
@@ -991,7 +992,9 @@ where
                 }
                 let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
                 if flags.contains(ReceiveFlags::TRUNC) {
-                    // This flag causes the received bytes of data to be discarded
+                    unimplemented!("TRUNC flag for tcp");
+                }
+                if flags.contains(ReceiveFlags::DISCARD) {
                     let discard_slice =
                         |tcp_socket: &mut tcp::Socket<'_>| -> Result<usize, tcp::RecvError> {
                             // See [`tcp::Socket::recv_slice`] and [`tcp::Socket::recv`] for why we do two `recv` calls.
@@ -1025,14 +1028,18 @@ where
                             };
                             *source_addr = Some(remote_addr);
                         }
-                        let length = data.len().min(buf.len());
-                        buf[..length].copy_from_slice(&data[..length]);
-                        if flags.contains(ReceiveFlags::TRUNC) {
-                            // return the real size of the packet or datagram,
-                            // even when it was longer than the passed buffer.
+                        if flags.contains(ReceiveFlags::DISCARD) {
                             Ok(data.len())
                         } else {
-                            Ok(length)
+                            let length = data.len().min(buf.len());
+                            buf[..length].copy_from_slice(&data[..length]);
+                            if flags.contains(ReceiveFlags::TRUNC) {
+                                // return the real size of the packet or datagram,
+                                // even when it was longer than the passed buffer.
+                                Ok(data.len())
+                            } else {
+                                Ok(length)
+                            }
                         }
                     }
                     Err(udp::RecvError::Exhausted) => Ok(0),
@@ -1171,16 +1178,8 @@ bitflags! {
         const TRUNC = 0x20;
         /// `MSG_WAITALL`: wait for the full amount of data
         const WAITALL = 0x100;
-        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
-        const _ = !0;
-
-        const ALL = Self::CMSG_CLOEXEC.bits()
-            | Self::DONTWAIT.bits()
-            | Self::ERRQUEUE.bits()
-            | Self::OOB.bits()
-            | Self::PEEK.bits()
-            | Self::TRUNC.bits()
-            | Self::WAITALL.bits();
+        /// Discard the received data
+        const DISCARD = 0x8000;
     }
 }
 
@@ -1202,8 +1201,6 @@ bitflags! {
         const NOSIGNAL = 0x4000;
         /// `MSG_OOB`: sends out-of-band data.
         const OOB = 0x1;
-        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
-        const _ = !0;
     }
 }
 

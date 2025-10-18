@@ -6,7 +6,6 @@
 use int_enum::IntEnum;
 use litebox::{
     fs::OFlags,
-    net::{ReceiveFlags, SendFlags},
     platform::{RawConstPointer, RawMutPointer},
     utils::{ReinterpretSignedExt as _, TruncateExt},
 };
@@ -1769,6 +1768,52 @@ pub enum IntervalTimer {
     Prof = 2,
 }
 
+bitflags::bitflags! {
+    /// Flags for the `receive` function.
+    #[derive(Clone, Copy, Debug)]
+    pub struct ReceiveFlags: u32 {
+        /// `MSG_CMSG_CLOEXEC`: close-on-exec for the associated file descriptor
+        const CMSG_CLOEXEC = 0x40000000;
+        /// `MSG_DONTWAIT`: non-blocking operation
+        const DONTWAIT = 0x40;
+        /// `MSG_ERRQUEUE`: destination for error messages
+        const ERRQUEUE = 0x2000;
+        /// `MSG_OOB`: requests receipt of out-of-band data
+        const OOB = 0x1;
+        /// `MSG_PEEK`: requests to peek at incoming messages
+        const PEEK = 0x2;
+        /// `MSG_TRUNC`: truncate the message
+        const TRUNC = 0x20;
+        /// `MSG_WAITALL`: wait for the full amount of data
+        const WAITALL = 0x100;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    /// Flags for the `send` function.
+    #[derive(Clone, Copy, Debug)]
+    pub struct SendFlags: u32 {
+        /// `MSG_CONFIRM`: requests confirmation of the message delivery.
+        const CONFIRM = 0x800;
+        /// `MSG_DONTROUTE`: send the message directly to the interface, bypassing routing.
+        const DONTROUTE = 0x4;
+        /// `MSG_DONTWAIT`: non-blocking operation, do not wait for buffer space to become available.
+        const DONTWAIT = 0x40;
+        /// `MSG_EOR`: indicates the end of a record for message-oriented sockets.
+        const EOR = 0x80;
+        /// `MSG_MORE`: indicates that more data will follow.
+        const MORE = 0x8000;
+        /// `MSG_NOSIGNAL`: prevents the sending of SIGPIPE signals when writing to a socket that is closed.
+        const NOSIGNAL = 0x4000;
+        /// `MSG_OOB`: sends out-of-band data.
+        const OOB = 0x1;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 #[derive(Debug)]
@@ -3008,8 +3053,8 @@ reinterpret_truncated_from_usize_for! {
         litebox::fs::OFlags,
         AtFlags,
         SockFlags,
-        litebox::net::SendFlags,
-        litebox::net::ReceiveFlags,
+        SendFlags,
+        ReceiveFlags,
         EpollCreateFlags,
         EfdFlags,
         RngFlags,
