@@ -1856,6 +1856,13 @@ pub struct SigSetPack {
     pub size: usize,
 }
 
+/// Packaged sigset with its size, used by `pselect` syscall
+#[derive(Clone, Copy)]
+pub struct SigSetPack {
+    pub sigset: SigSet,
+    pub size: usize,
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 #[derive(Debug)]
@@ -2087,16 +2094,16 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     Select {
         nfds: u32,
-        readfds: Option<Platform::RawMutPointer<FdSet>>,
-        writefds: Option<Platform::RawMutPointer<FdSet>>,
-        exceptfds: Option<Platform::RawMutPointer<FdSet>>,
+        readfds: Option<Platform::RawMutPointer<usize>>,
+        writefds: Option<Platform::RawMutPointer<usize>>,
+        exceptfds: Option<Platform::RawMutPointer<usize>>,
         timeout: Option<Platform::RawMutPointer<TimeVal>>,
     },
     Pselect {
         nfds: u32,
-        readfds: Option<Platform::RawMutPointer<FdSet>>,
-        writefds: Option<Platform::RawMutPointer<FdSet>>,
-        exceptfds: Option<Platform::RawMutPointer<FdSet>>,
+        readfds: Option<Platform::RawMutPointer<usize>>,
+        writefds: Option<Platform::RawMutPointer<usize>>,
+        exceptfds: Option<Platform::RawMutPointer<usize>>,
         timeout: Option<Platform::RawConstPointer<Timespec>>,
         sigsetpack: Option<Platform::RawConstPointer<SigSetPack>>,
     },

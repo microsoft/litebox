@@ -720,14 +720,13 @@ mod test {
         });
 
         // prepare fd_set for read
-        let mut rfds = litebox_common_linux::FdSet::default();
-        rfds.clear();
-        rfds.set(rfd_u);
+        let mut rfds = bitvec::bitvec![0; rfd_u.next_multiple_of(64) as usize];
+        rfds.set(rfd_u as usize, true);
 
         // Call pselect
         let ret = do_pselect(rfd_u + 1, Some(&mut rfds), None, None, None).expect("pselect failed");
         assert!(ret > 0, "pselect should report ready");
-        assert!(rfds.iter().all(|fd| fd == rfd_u));
+        assert!(rfds.iter_ones().all(|fd| fd == rfd_u as usize));
 
         // read
         let mut out = [0u8; 8];
@@ -753,9 +752,8 @@ mod test {
         });
 
         // prepare fd_set for read
-        let mut rfds = litebox_common_linux::FdSet::default();
-        rfds.clear();
-        rfds.set(rfd_u);
+        let mut rfds = bitvec::bitvec![0; rfd_u.next_multiple_of(64) as usize];
+        rfds.set(rfd_u as usize, true);
 
         let ret = do_pselect(
             rfd_u + 1,
@@ -768,7 +766,7 @@ mod test {
 
         // Expect pselect to indicate readiness (HUP should cause revents)
         assert!(ret > 0, "pselect should report ready for EOF/HUP");
-        assert!(rfds.iter().all(|fd| fd == rfd_u));
+        assert!(rfds.iter_ones().all(|fd| fd == rfd_u as usize));
 
         // read should return 0 (EOF)
         let mut out = [0u8; 8];
@@ -785,9 +783,8 @@ mod test {
         let invalid_fd_u = 100u32;
 
         // prepare fd_set for read
-        let mut rfds = litebox_common_linux::FdSet::default();
-        rfds.clear();
-        rfds.set(invalid_fd_u);
+        let mut rfds = bitvec::bitvec![0; invalid_fd_u.next_multiple_of(64) as usize];
+        rfds.set(invalid_fd_u as usize, true);
 
         let ret = do_pselect(
             invalid_fd_u + 1,
