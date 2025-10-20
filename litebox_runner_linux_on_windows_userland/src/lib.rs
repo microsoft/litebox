@@ -247,42 +247,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let loaded_program = litebox_shim_linux::loader::load_program(
-        &prog_unix_path,
-        argv,
-        envp,
-        litebox_shim_linux::loader::auxv::init_auxv(),
-    )
-    .unwrap();
-
-    let comm = prog_unix_path.rsplit('/').next().unwrap_or("unknown");
-    litebox_shim_linux::syscalls::process::set_task_comm(comm.as_bytes());
-
-    #[cfg(target_arch = "x86_64")]
-    let mut pt_regs = litebox_common_linux::PtRegs {
-        r15: 0,
-        r14: 0,
-        r13: 0,
-        r12: 0,
-        rbp: 0,
-        rbx: 0,
-        r11: 0,
-        r10: 0,
-        r9: 0,
-        r8: 0,
-        rax: 0,
-        rcx: 0,
-        rdx: 0,
-        rsi: 0,
-        rdi: 0,
-        orig_rax: 0,
-        rip: loaded_program.entry_point,
-        cs: 0x33, // __USER_CS
-        eflags: 0,
-        rsp: loaded_program.user_stack_top,
-        ss: 0x2b, // __USER_DS
-    };
-
+    let mut pt_regs = litebox_shim_linux::load_program(&prog_unix_path, argv, envp).unwrap();
     unsafe { litebox_platform_windows_userland::run_thread(&mut pt_regs) };
     Ok(())
 }

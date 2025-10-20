@@ -137,9 +137,8 @@ pub extern "C" fn sandbox_process_init(
             globals::SM_TERM_INVALID_PARAM,
         );
     };
-    let aux = litebox_shim_linux::loader::auxv::init_auxv();
-    let loaded_program = match litebox_shim_linux::loader::load_program(&program, argv, envp, aux) {
-        Ok(program) => program,
+    *pt_regs = match litebox_shim_linux::load_program(&program, argv, envp) {
+        Ok(regs) => regs,
         Err(err) => {
             litebox::log_println!(platform, "failed to load program: {}", err);
             litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
@@ -148,13 +147,6 @@ pub extern "C" fn sandbox_process_init(
             );
         }
     };
-
-    let comm = program.rsplit('/').next().unwrap_or("unknown");
-    litebox_shim_linux::syscalls::process::set_task_comm(comm.as_bytes());
-
-    pt_regs.rip = loaded_program.entry_point;
-    pt_regs.rsp = loaded_program.user_stack_top;
-    pt_regs.rdx = 0;
 }
 
 #[unsafe(no_mangle)]

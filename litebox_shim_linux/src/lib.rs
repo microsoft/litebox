@@ -484,7 +484,7 @@ pub fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> Continu
             argv,
             envp,
         } => match syscalls::process::sys_execve(pathname, argv, envp, ctx) {
-            Ok(()) => return ContinueOperation::ExitProcess(0),
+            Ok(()) => return ContinueOperation::ResumeGuest,
             Err(err) => Err(err),
         },
         SyscallRequest::Ret(errno) => Err(errno),
@@ -1111,4 +1111,85 @@ litebox::shim_thread_local! {
 
 fn with_current_task<R>(f: impl FnOnce(&Task) -> R) -> R {
     SHIM_TLS.with(|tls| f(&tls.current_task))
+}
+
+pub type LoadFilter =
+    fn(envp: &mut alloc::vec::Vec<alloc::ffi::CString>, auxv: &mut loader::auxv::AuxVec);
+static LOAD_FILTER: once_cell::race::OnceBox<LoadFilter> = once_cell::race::OnceBox::new();
+
+/// Set the load filter, which can augment envp or auxv when starting a new program.
+///
+/// # Panics
+/// Panics if the load filter is already set.
+pub fn set_load_filter(callback: LoadFilter) {
+    LOAD_FILTER
+        .set(alloc::boxed::Box::new(callback))
+        .expect("load filter already set");
+}
+
+/// Loads the specified program into the process's address space and returns the
+/// register state for the initial thread.
+pub fn load_program(
+    path: &str,
+    argv: Vec<alloc::ffi::CString>,
+    mut envp: Vec<alloc::ffi::CString>,
+) -> Result<litebox_common_linux::PtRegs, loader::ElfLoaderError> {
+    let mut aux = crate::loader::auxv::init_auxv();
+    if let Some(&filter) = LOAD_FILTER.get() {
+        filter(&mut envp, &mut aux);
+    }
+
+    // TODO: split parsing from mapping so that we can return an error code to execve that it
+    // can return to the guest.
+    let load_info = loader::load_program(path, argv, envp, aux)?;
+
+    let comm = path.rsplit('/').next().unwrap_or("unknown");
+    syscalls::process::set_task_comm(comm.as_bytes());
+
+    #[cfg(target_arch = "x86_64")]
+    let pt_regs = litebox_common_linux::PtRegs {
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        rbp: 0,
+        rbx: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rax: 0,
+        rcx: 0,
+        rdx: 0,
+        rsi: 0,
+        rdi: 0,
+        orig_rax: 0,
+        rip: load_info.entry_point,
+        cs: 0x33, // __USER_CS
+        eflags: 0,
+        rsp: load_info.user_stack_top,
+        ss: 0x2b, // __USER_DS
+    };
+    #[cfg(target_arch = "x86")]
+    let pt_regs = litebox_common_linux::PtRegs {
+        ebx: 0,
+        ecx: 0,
+        edx: 0,
+        esi: 0,
+        edi: 0,
+        ebp: 0,
+        eax: 0,
+        xds: 0,
+        xes: 0,
+        xfs: 0,
+        xgs: 0,
+        orig_eax: 0,
+        eip: load_info.entry_point,
+        xcs: 0x23, // __USER_CS
+        eflags: 0,
+        esp: load_info.user_stack_top,
+        xss: 0x2b, // __USER_DS
+    };
+
+    Ok(pt_regs)
 }

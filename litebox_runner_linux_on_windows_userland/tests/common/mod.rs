@@ -2,12 +2,9 @@
 
 use std::ffi::CString;
 
-use litebox::{
-    fs::{FileSystem as _, Mode, OFlags},
-    platform::SystemInfoProvider as _,
-};
+use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox_platform_multiplex::{Platform, set_platform};
-use litebox_shim_linux::{litebox_fs, loader::load_program, set_fs};
+use litebox_shim_linux::{litebox_fs, load_program, set_fs};
 
 pub fn init_platform(tar_data: &'static [u8], initial_dirs: &[&str], initial_files: &[&str]) {
     let platform = Platform::new();
@@ -65,37 +62,6 @@ pub fn test_load_exec_common(executable_path: &str) {
         CString::new("hello").unwrap(),
     ];
     let envp = vec![CString::new("PATH=/bin").unwrap()];
-    let aux = litebox_shim_linux::loader::auxv::init_auxv();
-    if litebox_platform_multiplex::platform()
-        .get_vdso_address()
-        .is_none()
-    {
-        // do nothing about aux for now
-    }
-    let info = load_program(executable_path, argv, envp, aux).unwrap();
-    #[cfg(target_arch = "x86_64")]
-    let mut pt_regs = litebox_common_linux::PtRegs {
-        r15: 0,
-        r14: 0,
-        r13: 0,
-        r12: 0,
-        rbp: 0,
-        rbx: 0,
-        r11: 0,
-        r10: 0,
-        r9: 0,
-        r8: 0,
-        rax: 0,
-        rcx: 0,
-        rdx: 0,
-        rsi: 0,
-        rdi: 0,
-        orig_rax: 0,
-        rip: info.entry_point,
-        cs: 0x33, // __USER_CS
-        eflags: 0,
-        rsp: info.user_stack_top,
-        ss: 0x2b, // __USER_DS
-    };
+    let mut pt_regs = load_program(executable_path, argv, envp).unwrap();
     unsafe { litebox_platform_windows_userland::run_thread(&mut pt_regs) };
 }
