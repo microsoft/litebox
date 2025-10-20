@@ -267,20 +267,9 @@ fn setsockopt(
                         // CORK is the opposite of NODELAY
                         val == 0
                     };
-                    if let Err(err) = litebox_net()
+                    litebox_net()
                         .lock()
-                        .set_tcp_option(fd, litebox::net::TcpOptionData::NODELAY(on))
-                    {
-                        match err {
-                            litebox::net::errors::SetTcpOptionError::InvalidFd => {
-                                return Err(Errno::EBADF);
-                            }
-                            litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
-                                return Err(Errno::EOPNOTSUPP);
-                            }
-                            _ => unimplemented!(),
-                        }
-                    }
+                        .set_tcp_option(fd, litebox::net::TcpOptionData::NODELAY(on))?;
                     Ok(())
                 }
                 TcpOption::KEEPINTVL => {
@@ -787,6 +776,7 @@ pub(crate) fn sys_sendto(
     match socket {
         Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
             let sockaddr = sockaddr.map(|SocketAddress::Inet(addr)| addr);
+            drop(file_table); // Drop before possibly-blocking `sendto`
             sendto(fd, &buf, flags, sockaddr)
         }),
         _ => Err(Errno::ENOTSOCK),
@@ -870,12 +860,9 @@ pub(crate) fn sys_getsockopt(
         .get_fd(sockfd)
         .ok_or(Errno::EBADF)?
     {
-        Descriptor::LiteBoxRawFd(raw_fd) => crate::run_on_raw_fd(
-            *raw_fd,
-            |fd| Err(Errno::ENOTSOCK),
-            |fd| getsockopt(fd, optname, optval, optlen),
-        )
-        .flatten(),
+        Descriptor::LiteBoxRawFd(raw_fd) => {
+            with_socket_fd(*raw_fd, |fd| getsockopt(fd, optname, optval, optlen))
+        }
         _ => Err(Errno::ENOTSOCK),
     }
 }
