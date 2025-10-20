@@ -938,9 +938,7 @@ mod tests {
     use alloc::string::ToString as _;
     use litebox::platform::RawConstPointer as _;
     use litebox::utils::TruncateExt as _;
-    use litebox_common_linux::{
-        AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType, errno::Errno,
-    };
+    use litebox_common_linux::{AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType};
 
     use super::SocketAddress;
     use crate::ConstPtr;
@@ -952,6 +950,24 @@ mod tests {
     const TUN_IP_ADDR_STR: &str = "10.0.0.2";
     const SERVER_PORT: u16 = 8080;
     const CLIENT_PORT: u16 = 8081;
+
+    fn init_platform(tun_device_name: Option<&str>) -> crate::Task {
+        let task = crate::syscalls::tests::init_platform(tun_device_name);
+        crate::litebox_net()
+            .lock()
+            .set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+        std::thread::spawn(|| {
+            loop {
+                while crate::litebox_net()
+                    .lock()
+                    .perform_platform_interaction()
+                    .call_again_immediately()
+                {}
+                core::hint::spin_loop();
+            }
+        });
+        task
+    }
 
     fn test_tcp_socket(
         task: &crate::Task,
@@ -1097,7 +1113,7 @@ mod tests {
         test_trunc: bool,
         option: &str,
     ) {
-        let task = crate::syscalls::tests::init_platform(Some("tun99"));
+        let task = init_platform(Some("tun99"));
         test_tcp_socket(&task, TUN_IP_ADDR, port, is_nonblocking, test_trunc, option);
     }
 
@@ -1122,7 +1138,7 @@ mod tests {
     }
 
     fn blocking_udp_server_socket(test_trunc: bool) {
-        let task = crate::syscalls::tests::init_platform(Some("tun99"));
+        let task = init_platform(Some("tun99"));
 
         // Server socket and bind
         let server_fd = task
@@ -1216,7 +1232,7 @@ mod tests {
     fn test_tun_udp_client_socket_without_server() {
         // We do not support loopback yet, so this test only checks that
         // the client can send packets without a server.
-        let task = crate::syscalls::tests::init_platform(Some("tun99"));
+        let task = init_platform(Some("tun99"));
 
         // Client socket and explicit bind
         let client_fd = task

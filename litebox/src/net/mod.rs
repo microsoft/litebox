@@ -126,6 +126,10 @@ pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvide
     // Protocol-specific data
     specific: ProtocolSpecific,
     pollee: crate::event::polling::Pollee<Platform>,
+    /// Whether the socket was last known to be able to send
+    can_send_last: core::sync::atomic::AtomicBool,
+    /// Number of octets in the receive queue
+    recv_queue: core::sync::atomic::AtomicUsize,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> core::ops::Deref
@@ -162,6 +166,8 @@ pub(crate) struct TcpSpecific {
     local_port: Option<LocalPort>,
     /// Server socket specific data
     server_socket: Option<TcpServerSpecific>,
+    /// Whether the socket was last known to be able to accept
+    can_accept_last: core::sync::atomic::AtomicBool,
 }
 
 /// Socket-specific data for TCP server sockets
@@ -458,17 +464,8 @@ where
             self.litebox.descriptor_table().iter::<Network<Platform>>()
         {
             let socket_handle = &socket_handle.entry;
-            let events = self.check_socket_events(socket_handle);
+            let events = self.check_socket_events(socket_handle, true);
             if !events.is_empty() {
-                // Notify observers if there are any events
-                //
-                // Note we should only send new events, e.g., notify `Events::IN` only if this
-                // socket received new data since last time we notified `Events::IN`, but `check_socket_events`
-                // only provides the current state of events. We could potentially track socket's buffer
-                // lengths to determine if new data has arrived since last time, but that would be
-                // more complex. Alternatively, we could implement our own packet processing so that we can
-                // track new data arrivals more precisely. For now, we simply notify whenever there are events.
-                // This means we might send duplicate events, which is not correct in some corner cases (e.g., see epoll's EPOLLET).
                 socket_handle.pollee.notify_observers(events);
             }
         }
@@ -555,6 +552,7 @@ where
                 Protocol::Tcp => ProtocolSpecific::Tcp(TcpSpecific {
                     local_port: None,
                     server_socket: None,
+                    can_accept_last: core::sync::atomic::AtomicBool::new(false),
                 }),
                 Protocol::Udp => ProtocolSpecific::Udp(UdpSpecific {
                     remote_endpoint: None,
@@ -563,6 +561,8 @@ where
                 Protocol::Raw { protocol: _ } => unimplemented!(),
             },
             pollee: crate::event::polling::Pollee::new(&self.litebox),
+            can_send_last: core::sync::atomic::AtomicBool::new(false),
+            recv_queue: core::sync::atomic::AtomicUsize::new(0),
         }))
     }
 
@@ -922,6 +922,10 @@ where
                 }) else {
                     return Err(AcceptError::NoConnectionsReady);
                 };
+                // Reset the accept state tracking so that [`Network::check_socket_events`] can send new events.
+                handle
+                    .can_accept_last
+                    .store(false, core::sync::atomic::Ordering::Relaxed);
                 // Pull that position out of the listening handles
                 let ready_handle = server_socket.socket_set_handles.swap_remove(position);
                 // Refill to the backlog, so that we can have more listening sockets again if needed
@@ -943,8 +947,11 @@ where
                     specific: ProtocolSpecific::Tcp(TcpSpecific {
                         local_port,
                         server_socket: None,
+                        can_accept_last: core::sync::atomic::AtomicBool::new(false),
                     }),
                     pollee: crate::event::polling::Pollee::new(&self.litebox),
+                    can_send_last: core::sync::atomic::AtomicBool::new(true),
+                    recv_queue: core::sync::atomic::AtomicUsize::new(0),
                 }))
             }
             ProtocolSpecific::Udp(_) => unimplemented!(),
@@ -1022,6 +1029,12 @@ where
             Protocol::Icmp => unimplemented!(),
             Protocol::Raw { protocol: _ } => unimplemented!(),
         };
+        if let Ok(0) = ret {
+            // If we sent 0 bytes, then we are not writable anymore
+            socket_handle
+                .can_send_last
+                .store(false, core::sync::atomic::Ordering::Relaxed);
+        }
 
         drop(table_entry);
         drop(descriptor_table);
@@ -1063,7 +1076,7 @@ where
             unimplemented!("flags: {:?}", flags);
         }
 
-        let ret = match socket_handle.protocol() {
+        let (ret, recv_queue_left) = match socket_handle.protocol() {
             Protocol::Tcp => {
                 if let Some(source_addr) = source_addr {
                     // TCP is connection-oriented, so no need to provide a source address
@@ -1073,7 +1086,7 @@ where
                 if flags.contains(ReceiveFlags::TRUNC) {
                     unimplemented!("TRUNC flag for tcp");
                 }
-                if flags.contains(ReceiveFlags::DISCARD) {
+                let ret = if flags.contains(ReceiveFlags::DISCARD) {
                     let discard_slice =
                         |tcp_socket: &mut tcp::Socket<'_>| -> Result<usize, tcp::RecvError> {
                             // See [`tcp::Socket::recv_slice`] and [`tcp::Socket::recv`] for why we do two `recv` calls.
@@ -1090,14 +1103,12 @@ where
                 .map_err(|e| match e {
                     tcp::RecvError::InvalidState => ReceiveError::SocketInInvalidState,
                     tcp::RecvError::Finished => ReceiveError::OperationFinished,
-                })
+                });
+                (ret, tcp_socket.recv_queue())
             }
             Protocol::Udp => {
-                match self
-                    .socket_set
-                    .get_mut::<udp::Socket>(socket_handle.handle)
-                    .recv()
-                {
+                let udp_socket = self.socket_set.get_mut::<udp::Socket>(socket_handle.handle);
+                match udp_socket.recv() {
                     Ok((data, meta)) => {
                         if let Some(source_addr) = source_addr {
                             let remote_addr = match meta.endpoint.addr {
@@ -1107,27 +1118,32 @@ where
                             };
                             *source_addr = Some(remote_addr);
                         }
-                        if flags.contains(ReceiveFlags::DISCARD) {
-                            Ok(data.len())
+                        let n = if flags.contains(ReceiveFlags::DISCARD) {
+                            data.len()
                         } else {
                             let length = data.len().min(buf.len());
                             buf[..length].copy_from_slice(&data[..length]);
                             if flags.contains(ReceiveFlags::TRUNC) {
                                 // return the real size of the packet or datagram,
                                 // even when it was longer than the passed buffer.
-                                Ok(data.len())
+                                data.len()
                             } else {
-                                Ok(length)
+                                length
                             }
-                        }
+                        };
+                        (Ok(n), udp_socket.recv_queue())
                     }
-                    Err(udp::RecvError::Exhausted) => Ok(0),
+                    Err(udp::RecvError::Exhausted) => (Ok(0), 0),
                     Err(udp::RecvError::Truncated) => unreachable!(),
                 }
             }
             Protocol::Icmp => unimplemented!(),
             Protocol::Raw { protocol: _ } => unimplemented!(),
         };
+        // Update the recv_queue size for event tracking
+        socket_handle
+            .recv_queue
+            .store(recv_queue_left, core::sync::atomic::Ordering::Relaxed);
 
         drop(table_entry);
         drop(descriptor_table);
@@ -1214,54 +1230,101 @@ where
         let descriptor_table = self.litebox.descriptor_table();
         let table_entry = descriptor_table.get_entry(fd)?;
         let socket_handle = &table_entry.entry;
-        self.check_socket_events(socket_handle)
+        self.check_socket_events(socket_handle, false)
     }
 
     /// Get the [`Events`] for a socket handle [`SocketHandle`].
-    fn check_socket_events(&self, socket_handle: &SocketHandle<Platform>) -> Option<Events> {
+    ///
+    /// If `new_events_only` is true, only events that are new since the last check are returned.
+    fn check_socket_events(
+        &self,
+        socket_handle: &SocketHandle<Platform>,
+        new_events_only: bool,
+    ) -> Option<Events> {
         if socket_handle.consider_closed {
             return None;
         }
-        match socket_handle.protocol() {
+        let mut events = Events::empty();
+        let recv_queue_last = socket_handle
+            .recv_queue
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let (recv_queue_now, can_send_now, can_recv_now) = match socket_handle.protocol() {
             Protocol::Tcp => {
                 let tcp_socket = self.socket_set.get::<tcp::Socket>(socket_handle.handle);
-                let mut events = Events::empty();
-                if tcp_socket.can_recv() {
-                    events |= Events::IN;
-                }
-                if tcp_socket.can_send() {
-                    events |= Events::OUT;
-                }
-                if !events.contains(Events::IN) {
-                    // A server socket should have `Events::IN` if any of its listening sockets is connected.
-                    if let Some(server_socket) = socket_handle.specific.tcp().server_socket.as_ref()
-                    {
-                        server_socket
-                            .socket_set_handles
-                            .iter()
-                            .any(|&h| {
-                                let socket: &tcp::Socket = self.socket_set.get(h);
-                                socket.state() == tcp::State::Established
-                            })
-                            .then(|| events.insert(Events::IN));
-                    }
-                }
-                Some(events)
+                (
+                    tcp_socket.recv_queue(),
+                    tcp_socket.can_send(),
+                    tcp_socket.can_recv(),
+                )
             }
             Protocol::Udp => {
                 let udp_socket = self.socket_set.get::<udp::Socket>(socket_handle.handle);
-                let mut events = Events::empty();
-                if udp_socket.can_recv() {
-                    events |= Events::IN;
-                }
-                if udp_socket.can_send() {
-                    events |= Events::OUT;
-                }
-                Some(events)
+                (
+                    udp_socket.recv_queue(),
+                    udp_socket.can_send(),
+                    udp_socket.can_recv(),
+                )
             }
             Protocol::Icmp => unimplemented!(),
             Protocol::Raw { protocol: _ } => unimplemented!(),
+        };
+
+        if new_events_only {
+            if recv_queue_now > recv_queue_last && can_recv_now {
+                socket_handle
+                    .recv_queue
+                    .store(recv_queue_now, core::sync::atomic::Ordering::Relaxed);
+                // We have more data to receive than last time, so we should notify
+                events |= Events::IN;
+            }
+
+            let can_send_last = socket_handle
+                .can_send_last
+                .load(core::sync::atomic::Ordering::Relaxed);
+            if !can_send_last && can_send_now {
+                socket_handle
+                    .can_send_last
+                    .store(true, core::sync::atomic::Ordering::Relaxed);
+                // We can now send, so we should notify
+                events |= Events::OUT;
+            }
+        } else {
+            if can_recv_now {
+                events |= Events::IN;
+            }
+            if can_send_now {
+                events |= Events::OUT;
+            }
         }
+
+        // A server socket should have `Events::IN` if any of its listening sockets is connected.
+        if let Protocol::Tcp = socket_handle.protocol()
+            && !events.contains(Events::IN)
+        {
+            let tcp_specific = socket_handle.specific.tcp();
+            if let Some(server_socket) = tcp_specific.server_socket.as_ref() {
+                let can_accept_last = tcp_specific
+                    .can_accept_last
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                if !new_events_only || !can_accept_last {
+                    server_socket
+                        .socket_set_handles
+                        .iter()
+                        .any(|&h| {
+                            let socket: &tcp::Socket = self.socket_set.get(h);
+                            socket.state() == tcp::State::Established
+                        })
+                        .then(|| {
+                            tcp_specific
+                                .can_accept_last
+                                .store(true, core::sync::atomic::Ordering::Relaxed);
+                            events.insert(Events::IN);
+                        });
+                }
+            }
+        }
+
+        Some(events)
     }
 }
 
