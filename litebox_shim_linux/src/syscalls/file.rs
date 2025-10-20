@@ -1358,9 +1358,11 @@ fn select_common(
 ) -> Result<usize, Errno> {
     if nfds >= i32::MAX as u32
         || nfds as usize
-            > super::process::LITEBOX_PROCESS
-                .limits
-                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
+            > with_current_task(|task| {
+                task.process
+                    .limits
+                    .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
+            })
     {
         return Err(Errno::EINVAL);
     }

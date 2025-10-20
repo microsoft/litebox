@@ -1796,66 +1796,6 @@ bitflags::bitflags! {
     }
 }
 
-pub const FD_SETSIZE: usize = 1024;
-#[derive(Debug, Default, Clone, Copy)]
-#[repr(C)]
-pub struct FdSet {
-    fds_bits: [usize; FD_SETSIZE / Self::USIZE_BITS],
-}
-
-impl FdSet {
-    const USIZE_BITS: usize = core::mem::size_of::<usize>() * 8;
-    /// Check if a file descriptor is set in the set
-    ///
-    /// # Panics
-    ///
-    /// Panics if `fd` is out of range ( `fd` >= [`FD_SETSIZE`]).
-    pub fn is_set(&self, fd: u32) -> bool {
-        let idx = fd as usize / Self::USIZE_BITS;
-        let bit = fd as usize % Self::USIZE_BITS;
-        (self.fds_bits[idx] & (1 << bit)) != 0
-    }
-
-    /// Clear all file descriptors in the set
-    pub fn clear(&mut self) {
-        self.fds_bits.fill(0);
-    }
-
-    /// Set a file descriptor in the set
-    ///
-    /// # Panics
-    ///
-    /// Panics if `fd` is out of range ( `fd` >= [`FD_SETSIZE`]).
-    pub fn set(&mut self, fd: u32) {
-        let idx = fd as usize / Self::USIZE_BITS;
-        let bit = fd as usize % Self::USIZE_BITS;
-        self.fds_bits[idx] |= 1 << bit;
-    }
-
-    /// Iterate over all set file descriptors in the set
-    pub fn iter(&self) -> impl Iterator<Item = u32> {
-        self.fds_bits.iter().enumerate().flat_map(|(idx, bits)| {
-            let mut bits = *bits;
-            core::iter::from_fn(move || {
-                if bits == 0 {
-                    None
-                } else {
-                    let bit = bits.trailing_zeros();
-                    bits &= !(1 << bit);
-                    Some((idx * Self::USIZE_BITS + bit as usize).truncate())
-                }
-            })
-        })
-    }
-}
-
-/// Packaged sigset with its size, used by `pselect` syscall
-#[derive(Clone, Copy)]
-pub struct SigSetPack {
-    pub sigset: SigSet,
-    pub size: usize,
-}
-
 /// Packaged sigset with its size, used by `pselect` syscall
 #[derive(Clone, Copy)]
 pub struct SigSetPack {
