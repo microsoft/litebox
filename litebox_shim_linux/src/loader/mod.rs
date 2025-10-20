@@ -5,6 +5,8 @@ pub mod auxv;
 mod elf;
 mod stack;
 
+pub use elf::ElfLoaderError;
+
 /// Load a program into the LiteBox shim.
 pub fn load_program(
     path: &str,
