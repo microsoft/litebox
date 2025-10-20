@@ -2423,18 +2423,18 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 };
                 let sockfd = ctx.sys_req_arg(0);
                 match sysno {
-                    Sysno::setsockopt => sys_req!(Setsockopt {
-                        sockfd: { sockfd },
-                        optname: { optname },
-                        optval:*,
-                        optlen,
-                    }),
-                    Sysno::getsockopt => sys_req!(Getsockopt {
-                        sockfd: { sockfd },
-                        optname: { optname },
-                        optval:*,
-                        optlen:*,
-                    }),
+                    Sysno::setsockopt => SyscallRequest::Setsockopt {
+                        sockfd,
+                        optname,
+                        optval: ctx.sys_req_ptr(3),
+                        optlen: ctx.sys_req_arg(4),
+                    },
+                    Sysno::getsockopt => SyscallRequest::Getsockopt {
+                        sockfd,
+                        optname,
+                        optval: ctx.sys_req_ptr(3),
+                        optlen: ctx.sys_req_ptr(4),
+                    },
                     _ => unreachable!(),
                 }
             }
