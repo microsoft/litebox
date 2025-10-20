@@ -185,7 +185,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     let len = fs.write(&fd, data, None).unwrap();
                     data = &data[len..];
                 }
-                fs.close(fd).unwrap();
+                fs.close(&fd).unwrap();
             };
         let last = ancestor_modes_and_users.last().unwrap();
         if prev_user == 0 {

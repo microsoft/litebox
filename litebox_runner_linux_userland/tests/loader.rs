@@ -67,7 +67,7 @@ fn install_file(contents: Vec<u8>, out: &str) {
         )
         .unwrap();
     litebox_fs().write(&fd, &contents, None).unwrap();
-    litebox_fs().close(fd).unwrap();
+    litebox_fs().close(&fd).unwrap();
 }
 
 fn test_load_exec_common(executable_path: &str) {

@@ -18,7 +18,9 @@ use litebox_common_linux::{
 };
 
 use crate::with_current_task;
-use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox, litebox_fs};
+use crate::{
+    ConstPtr, Descriptor, MutPtr, file_descriptors, litebox, litebox_fs, raw_descriptor_store,
+};
 use core::sync::atomic::Ordering;
 
 pub(crate) struct FsState {
@@ -111,14 +113,15 @@ pub(crate) fn sys_umask(new_mask: u32) -> Mode {
 pub fn sys_open(path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
     let mode = mode & !get_umask();
     let file = litebox_fs().open(path, flags - OFlags::CLOEXEC, mode)?;
-    let mut dt = litebox().descriptor_table_mut();
     if flags.contains(OFlags::CLOEXEC) {
-        let None = dt.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC) else {
+        let None = litebox()
+            .descriptor_table_mut()
+            .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
+        else {
             unreachable!()
         };
     }
-    let raw_fd = dt.fd_into_raw_integer(file);
-    drop(dt);
+    let raw_fd = raw_descriptor_store().write().fd_into_raw_integer(file);
     file_descriptors()
         .write()
         .insert(Descriptor::LiteBoxRawFd(raw_fd))
@@ -325,26 +328,15 @@ pub fn sys_mkdir(pathname: impl path::Arg, mode: u32) -> Result<(), Errno> {
 pub(crate) fn do_close(desc: Descriptor) -> Result<(), Errno> {
     match desc {
         Descriptor::LiteBoxRawFd(raw_fd) => {
-            // XXX(jayb): This is not ideal, but we should hopefully practically not hit the
-            // `unreachable!` below in practice if all the places that use `fd_from_raw_integer`
-            // actually follow the constraints declared in its documentation. We need to run this
-            // for more than just once because it _can_ accidentally happen that the internals of
-            // `fd_from_raw_integer` itself, or in the short durations that something else is
-            // attempting to read/write to the FD at the same time that another thread is attempting
-            // to close that exact same FD. This should be incredibly rare in practice. Care
-            // obviously must be taken for blocking operations to release things between attempted
-            // reads/writes. To make this better, we probably need to update
-            // `fd_consume_raw_integer` interface on the LiteBox side itself.
-            for _fuel in 0..1000 {
-                let mut dt = crate::litebox().descriptor_table_mut();
-                return match dt.fd_consume_raw_integer(raw_fd) {
-                    Ok(fd) => {
-                        drop(dt);
-                        litebox_fs().close(fd).map_err(Errno::from)
-                    }
-                    Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
-                    Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
-                        match dt
+            let mut rds = raw_descriptor_store().write();
+            match rds.fd_consume_raw_integer(raw_fd) {
+                Ok(fd) => {
+                    drop(rds);
+                    litebox_fs().close(&fd).map_err(Errno::from)
+                }
+                Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
+                Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
+                    match rds
                             .fd_consume_raw_integer::<litebox::net::Network<litebox_platform_multiplex::Platform>>(raw_fd)
                         {
                             Ok(fd) => todo!("net"),
@@ -354,21 +346,9 @@ pub(crate) fn do_close(desc: Descriptor) -> Result<(), Errno> {
                                 // more, we need to expand this out too.
                                 unreachable!()
                             }
-                            Err(litebox::fd::ErrRawIntFd::CurrentlyUnconsumable) => {
-                                // Try again
-                                continue;
-                            },
                         }
-                    }
-                    Err(litebox::fd::ErrRawIntFd::CurrentlyUnconsumable) => {
-                        // Try again
-                        continue;
-                    }
-                };
+                }
             }
-            unreachable!(
-                "cannot close {raw_fd}. something might be holding onto the results of `fd_from_raw_integer` for too long"
-            )
         }
         Descriptor::Socket(socket) => Ok(()), // The actual close happens when the socket is dropped
         Descriptor::PipeReader { .. }
@@ -1062,7 +1042,13 @@ pub fn sys_ioctl(
                 litebox()
                     .descriptor_table()
                     .with_metadata(fd, |crate::StdioStatusFlags(_)| stdio_ioctl(&arg))
-                    .unwrap_or_else(|MetadataError::NoSuchMetadata| {
+                    .unwrap_or_else(|err| {
+                        match err {
+                            MetadataError::NoSuchMetadata => {},
+                            MetadataError::ClosedFd => {
+                                todo!()
+                            }
+                        }
                         match arg {
                             IoctlArg::TCGETS(..) => Err(Errno::ENOTTY),
                             IoctlArg::FIOCLEX => {
@@ -1300,31 +1286,29 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
             use alloc::sync::Arc;
             use litebox::fd::ErrRawIntFd;
             let mut dt = litebox().descriptor_table_mut();
-            match dt.fd_from_raw_integer(*raw_fd) {
+            let mut rds = raw_descriptor_store().write();
+            match rds.fd_from_raw_integer(*raw_fd) {
                 Ok(fd) => {
-                    let fd: Arc<litebox::fd::TypedFd<crate::LinuxFS>> =
-                        fd.upgrade().ok_or(Errno::EBADF)?;
-                    let fd = dt.duplicate(&fd);
+                    let fd: Arc<litebox::fd::TypedFd<crate::LinuxFS>> = fd;
+                    let fd = dt.duplicate(&fd).ok_or(Errno::EBADF)?;
                     if flags.contains(OFlags::CLOEXEC) {
                         let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
                         assert!(old.is_none());
                     }
-                    Ok(Descriptor::LiteBoxRawFd(dt.fd_into_raw_integer(fd)))
+                    Ok(Descriptor::LiteBoxRawFd(rds.fd_into_raw_integer(fd)))
                 }
-                Err(ErrRawIntFd::CurrentlyUnconsumable) => unreachable!(),
                 Err(ErrRawIntFd::NotFound) => Err(Errno::EBADF),
                 Err(ErrRawIntFd::InvalidSubsystem) => {
-                    match dt.fd_from_raw_integer(*raw_fd) {
+                    match rds.fd_from_raw_integer(*raw_fd) {
                         Ok(fd) => {
                             let fd: Arc<
                                 litebox::fd::TypedFd<
                                     litebox::net::Network<litebox_platform_multiplex::Platform>,
                                 >,
-                            > = fd.upgrade().ok_or(Errno::EBADF)?;
-                            let fd = dt.duplicate(&fd);
-                            Ok(Descriptor::LiteBoxRawFd(dt.fd_into_raw_integer(fd)))
+                            > = fd;
+                            let fd = dt.duplicate(&fd).ok_or(Errno::EBADF)?;
+                            Ok(Descriptor::LiteBoxRawFd(rds.fd_into_raw_integer(fd)))
                         }
-                        Err(ErrRawIntFd::CurrentlyUnconsumable) => unreachable!(),
                         Err(ErrRawIntFd::NotFound) => unreachable!("fd shown to exist before"),
                         Err(ErrRawIntFd::InvalidSubsystem) => {
                             // fs+net are the only subsystems at the moment

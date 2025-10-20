@@ -5,10 +5,12 @@
     reason = "still under development, remove before merging PR"
 )]
 
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
+use core::sync::atomic::AtomicBool;
+use hashbrown::HashMap;
 use thiserror::Error;
 
 use crate::LiteBox;
@@ -19,16 +21,9 @@ use crate::utilities::anymap::AnyMap;
 mod tests;
 
 /// Storage of file descriptors and their entries.
-///
-/// This particular object is also able to turn safely-typed file descriptors to/from unsafely-typed
-/// integers, with a reasonable amount of safety---this will not be able to check for "ABA" style
-/// issues, but will at least prevent using a descriptor for an unintended subsystem at the point of
-/// conversion.
 pub struct Descriptors<Platform: RawSyncPrimitivesProvider> {
     litebox: LiteBox<Platform>,
     entries: Vec<Option<IndividualEntry<Platform>>>,
-    /// Stored FDs are used to provide raw integer values in a safer way.
-    stored_fds: Vec<Option<Arc<OwnedFd>>>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
@@ -41,7 +36,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Self {
             litebox,
             entries: vec![],
-            stored_fds: vec![],
         }
     }
 
@@ -79,6 +73,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// aliased metadata at the new FD. However, any metadata that was stored via
     /// [`Self::set_fd_metadata`] is **not** duplicated; if you want that data to be copied over to
     /// the new entry, you must copy it over yourself.
+    ///
+    /// If the fd has already been closed (potentially on a different thread), this duplication will
+    /// fail and will return `None`.
     #[expect(
         clippy::missing_panics_doc,
         reason = "panic is impossible due to type invariants"
@@ -86,7 +83,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     pub fn duplicate<Subsystem: FdEnabledSubsystem>(
         &mut self,
         fd: &TypedFd<Subsystem>,
-    ) -> TypedFd<Subsystem> {
+    ) -> Option<TypedFd<Subsystem>> {
         let idx = self
             .entries
             .iter()
@@ -96,31 +93,98 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 self.entries.len() - 1
             });
         let new_ind_entry = IndividualEntry::new(Arc::clone(
-            &self.entries[fd.x.as_usize()].as_ref().unwrap().x,
+            &self.entries[fd.x.as_usize()?].as_ref().unwrap().x,
         ));
         let old = self.entries[idx].replace(new_ind_entry);
         assert!(old.is_none());
-        TypedFd {
+        Some(TypedFd {
             _phantom: PhantomData,
             x: OwnedFd::new(idx),
-        }
+        })
     }
 
     /// Removes the entry at `fd`, closing out the file descriptor.
     ///
     /// Returns the descriptor entry if it is unique (i.e., it was not duplicated, or all duplicates
     /// have been cleared out).
+    ///
+    /// If the `fd` was already closed out, then (obviously) it does not return an entry.
     pub(crate) fn remove<Subsystem: FdEnabledSubsystem>(
         &mut self,
-        mut fd: TypedFd<Subsystem>,
+        fd: &TypedFd<Subsystem>,
     ) -> Option<Subsystem::Entry> {
-        let Some(old) = self.entries[fd.x.as_usize()].take() else {
+        let Some(old) = self.entries[fd.x.as_usize()?].take() else {
             unreachable!();
         };
         fd.x.mark_as_closed();
         Arc::into_inner(old.x)
             .map(RwLock::into_inner)
             .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
+    }
+
+    /// Drain all entries that are fully accounted for by the `fds`, removing those FDs from `fd`s,
+    /// and returning their corresponding entries.
+    ///
+    /// This is similar to [`Self::remove`] except it allows draining a whole collection of FDs,
+    /// which is helpful if there are duplicated FDs in the mix. This is particularly useful if one
+    /// is unsure if there are ongoing operations on some entries in the FD, and thus wants to delay
+    /// some sort of `close` operation.
+    ///
+    /// No ordering guarantees are provided by this function; the resulting entries can be
+    /// arbitrarily ordered.
+    ///
+    /// If an FD remains in `fds` after this function finishes running, then it is guaranteed to
+    /// have at least one other duplicate floating around and still accessing an entry somewhere
+    /// outside of `fds`; if an entry is returned, then all possible FDs to it have been removed
+    /// removed from `fds` (and no other operation was concurrently accessing an entry).
+    pub(crate) fn drain_entries_full_covered_by<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        fds: &mut Vec<TypedFd<Subsystem>>,
+    ) -> Vec<Subsystem::Entry> {
+        // Each FD corresponds to an `IndividualEntry`, which has an Arc to a `DescriptorEntry`. If
+        // we have the same number of FDs as matching to the strong-count of a descriptor entry,
+        // then it must be the case that we have everything needed to close the entries out.
+        let removable_entries: Vec<*const RwLock<_, _>> = {
+            let mut strong_count_and_count = HashMap::<*const _, (usize, usize)>::new();
+            for fd in fds.iter() {
+                let entry = &self.entries[fd.x.as_usize().unwrap()];
+                // It would not be "incorrect" to see a closed out entry, but as it currently stands, I
+                // believe that we'll only see alive entries, so this `unwrap` is confirming that; if we
+                // need to expand it out, we'd simply have a `continue` here.
+                let entry = entry.as_ref().unwrap();
+                strong_count_and_count
+                    .entry(Arc::as_ptr(&entry.x))
+                    .or_insert((Arc::strong_count(&entry.x), 0))
+                    .1 += 1;
+            }
+            strong_count_and_count
+                .into_iter()
+                .filter(|(_ptr, (sc, c))| sc == c)
+                .map(|(ptr, _)| ptr)
+                .collect()
+        };
+        // Now we can actually go and remove every single such FD.
+        let entries: Vec<Subsystem::Entry> = {
+            let mut entries = vec![];
+            fds.retain(|fd: &TypedFd<Subsystem>| {
+                let entry = &self.entries[fd.x.as_usize().unwrap()];
+                let entry = entry.as_ref().unwrap();
+                let entry_ptr = Arc::as_ptr(&entry.x);
+                if !removable_entries.contains(&entry_ptr) {
+                    return true;
+                }
+                // This FD is removable
+                let entry = self.remove(fd);
+                if let Some(entry) = entry {
+                    // This is the last of the individual entries that were holding a ref to this.
+                    entries.push(entry);
+                }
+                false
+            });
+            entries
+        };
+        debug_assert_eq!(entries.len(), removable_entries.len());
+        entries
     }
 
     /// An iterator of descriptors and entries for a subsystem
@@ -182,7 +246,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     }
 
     /// Use the entry at `fd` as read-only.
-    pub(crate) fn with_entry<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> R
+    ///
+    /// If the `fd` has been closed, then skips applying `f` and returns `None`.
+    pub(crate) fn with_entry<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
     where
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&Subsystem::Entry) -> R,
@@ -190,12 +256,14 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         // Since the typed FD should not have been created unless we had the correct subsystem in
         // the first place, none of this should panic---if it does, someone has done a bad cast
         // somewhere.
-        let entry = self.entries[fd.x.as_usize()].as_ref().unwrap().read();
-        f(entry.as_subsystem::<Subsystem>())
+        let entry = self.entries[fd.x.as_usize()?].as_ref().unwrap().read();
+        Some(f(entry.as_subsystem::<Subsystem>()))
     }
 
     /// Use the entry at `fd` as mutably.
-    pub(crate) fn with_entry_mut<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> R
+    ///
+    /// If the `fd` has been closed, then skips applying `f` and returns `None`.
+    pub(crate) fn with_entry_mut<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
     where
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&mut Subsystem::Entry) -> R,
@@ -203,8 +271,8 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         // Since the typed FD should not have been created unless we had the correct subsystem in
         // the first place, none of this should panic---if it does, someone has done a bad cast
         // somewhere.
-        let mut entry = self.entries[fd.x.as_usize()].as_ref().unwrap().write();
-        f(entry.as_subsystem_mut::<Subsystem>())
+        let mut entry = self.entries[fd.x.as_usize()?].as_ref().unwrap().write();
+        Some(f(entry.as_subsystem_mut::<Subsystem>()))
     }
 
     /// Use the entry at `internal_fd` as mutably.
@@ -242,11 +310,12 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     pub(crate) fn get_entry<Subsystem: FdEnabledSubsystem>(
         &self,
         fd: &TypedFd<Subsystem>,
-    ) -> impl core::ops::Deref<Target = Subsystem::Entry> + use<'_, Platform, Subsystem> {
-        crate::sync::RwLockReadGuard::map(
-            self.entries[fd.x.as_usize()].as_ref().unwrap().read(),
+    ) -> Option<impl core::ops::Deref<Target = Subsystem::Entry> + use<'_, Platform, Subsystem>>
+    {
+        Some(crate::sync::RwLockReadGuard::map(
+            self.entries[fd.x.as_usize()?].as_ref().unwrap().read(),
             |e| e.as_subsystem::<Subsystem>(),
-        )
+        ))
     }
 
     /// Get the entry at `fd`, mutably.
@@ -256,11 +325,166 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     pub(crate) fn get_entry_mut<Subsystem: FdEnabledSubsystem>(
         &self,
         fd: &TypedFd<Subsystem>,
-    ) -> impl core::ops::DerefMut<Target = Subsystem::Entry> + use<'_, Platform, Subsystem> {
-        crate::sync::RwLockWriteGuard::map(
-            self.entries[fd.x.as_usize()].as_ref().unwrap().write(),
+    ) -> Option<impl core::ops::DerefMut<Target = Subsystem::Entry> + use<'_, Platform, Subsystem>>
+    {
+        Some(crate::sync::RwLockWriteGuard::map(
+            self.entries[fd.x.as_usize()?].as_ref().unwrap().write(),
             |e| e.as_subsystem_mut::<Subsystem>(),
-        )
+        ))
+    }
+
+    /// Apply `f` on metadata at an fd, if it exists.
+    ///
+    /// This returns the most-specific metadata available for the file descriptor---specifically, if
+    /// both [`Self::set_fd_metadata`] and [`Self::set_entry_metadata`]) are run on the same
+    /// fd, this will only return the value from the fd one, which will shadow the file one. If no
+    /// fd-specific one is set, this returns the entry-specific one.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the invariants guarantee that the unwrap panics cannot occur"
+    )]
+    pub fn with_metadata<Subsystem, T, R>(
+        &self,
+        fd: &TypedFd<Subsystem>,
+        f: impl FnOnce(&T) -> R,
+    ) -> Result<R, MetadataError>
+    where
+        Subsystem: FdEnabledSubsystem,
+        T: core::any::Any + Send + Sync,
+    {
+        let ind_entry = self.entries[fd.x.as_usize().ok_or(MetadataError::ClosedFd)?]
+            .as_ref()
+            .unwrap();
+        match ind_entry.metadata.get::<T>() {
+            Some(m) => Ok(f(m)),
+            None => ind_entry
+                .read()
+                .metadata
+                .get::<T>()
+                .map(f)
+                .ok_or(MetadataError::NoSuchMetadata),
+        }
+    }
+
+    /// Similar to [`Self::with_metadata`] but mutable.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the invariants guarantee that the unwrap panics cannot occur"
+    )]
+    pub fn with_metadata_mut<Subsystem, T, R>(
+        &mut self,
+        fd: &TypedFd<Subsystem>,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> Result<R, MetadataError>
+    where
+        Subsystem: FdEnabledSubsystem,
+        T: core::any::Any + Send + Sync,
+    {
+        let ind_entry = self.entries[fd.x.as_usize().ok_or(MetadataError::ClosedFd)?]
+            .as_mut()
+            .unwrap();
+        match ind_entry.metadata.get_mut::<T>() {
+            Some(m) => Ok(f(m)),
+            None => ind_entry
+                .write()
+                .metadata
+                .get_mut::<T>()
+                .map(f)
+                .ok_or(MetadataError::NoSuchMetadata),
+        }
+    }
+
+    /// Store arbitrary metadata into a file.
+    ///
+    /// Such metadata is visible to any open fd on the entry associated with the fd. See similar
+    /// [`Self::set_fd_metadata`] which is specific to fds, and does not alias the metadata.
+    ///
+    /// Returns the old metadata if any such metadata exists.
+    ///
+    /// Silently drops the store if the FD has been closed out.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the invariants guarantee that the unwrap panics cannot occur"
+    )]
+    pub fn set_entry_metadata<Subsystem, T>(
+        &mut self,
+        fd: &TypedFd<Subsystem>,
+        metadata: T,
+    ) -> Option<T>
+    where
+        Subsystem: FdEnabledSubsystem,
+        T: core::any::Any + Send + Sync,
+    {
+        self.entries[fd.x.as_usize()?]
+            .as_ref()
+            .unwrap()
+            .x
+            .write()
+            .metadata
+            .insert(metadata)
+    }
+
+    /// Store arbitrary metdata into a file descriptor.
+    ///
+    /// Such metadata is specific to the current fd and is NOT shared with other open fds to the
+    /// same entry. See the similar [`Self::set_entry_metadata`] which aliases metadata over all fds
+    /// opened for the same entry.
+    ///
+    /// Silently drops the store if the FD has been closed out.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the invariants guarantee that the unwrap panics cannot occur"
+    )]
+    pub fn set_fd_metadata<Subsystem, T>(
+        &mut self,
+        fd: &TypedFd<Subsystem>,
+        metadata: T,
+    ) -> Option<T>
+    where
+        Subsystem: FdEnabledSubsystem,
+        T: core::any::Any + Send + Sync,
+    {
+        self.entries[fd.x.as_usize()?]
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert(metadata)
+    }
+}
+
+/// Safe(r) conversions between safely-typed file descriptors and unsafely-typed integers.
+///
+/// This particular object is also able to turn safely-typed file descriptors to/from unsafely-typed
+/// integers, with a reasonable amount of safety---this will not be able to check for "ABA" style
+/// issues, but will at least prevent using a descriptor for an unintended subsystem at the point of
+/// conversion.
+pub struct RawDescriptorStorage {
+    /// Stored FDs are used to provide raw integer values in a safer way.
+    stored_fds: Vec<Option<StoredFd>>,
+}
+
+struct StoredFd {
+    x: Arc<OwnedFd>,
+    subsystem_entry_type_id: core::any::TypeId,
+}
+impl StoredFd {
+    fn new<Subsystem: FdEnabledSubsystem>(fd: TypedFd<Subsystem>) -> Self {
+        Self {
+            x: Arc::new(fd.x),
+            subsystem_entry_type_id: core::any::TypeId::of::<Subsystem::Entry>(),
+        }
+    }
+    #[must_use]
+    fn matches_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> bool {
+        self.subsystem_entry_type_id == core::any::TypeId::of::<Subsystem::Entry>()
+    }
+}
+
+impl RawDescriptorStorage {
+    #[expect(clippy::new_without_default)]
+    /// Create a new raw descriptor store.
+    pub fn new() -> Self {
+        Self { stored_fds: vec![] }
     }
 
     /// Get the corresponding integer value of the provided `fd`.
@@ -318,48 +542,27 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         if raw_fd >= self.stored_fds.len() {
             self.stored_fds.resize_with(raw_fd + 1, || None);
         }
-        debug_assert!(
-            self.entries[fd.x.as_usize()]
-                .as_ref()
-                .unwrap()
-                .read()
-                .matches_subsystem::<Subsystem>()
-        );
-        let old = self.stored_fds[raw_fd].replace(Arc::new(fd.x));
+        let old = self.stored_fds[raw_fd].replace(StoredFd::new(fd));
         assert!(old.is_none());
         true
     }
 
-    /// Borrow the typed FD for the raw integer value of the `fd`.
+    /// Get the typed FD for the raw integer value of the `fd`.
     ///
-    /// Importantly, users of this function should **not** store an upgrade of the `Weak`.
-    ///
-    /// This operation is mainly aimed at usage in the scenario where there is only a "short
-    /// duration" between generation of the typed FD and its use. Raw integers have no long-term
-    /// meaning, and can switch subsystems over time. All this is captured in the usage of `Weak` as
-    /// the return. If the underlying FD got consumed away, then it becomes non-upgradable.
-    ///
-    /// Returns `Ok` iff the `fd` exists and is for the correct subsystem.
-    ///
-    /// To fully remove this FD from the system to make it available to consume, see
-    /// [`Self::fd_consume_raw_integer`].
+    /// To fully remove this FD from see [`Self::fd_consume_raw_integer`].
     pub fn fd_from_raw_integer<Subsystem: FdEnabledSubsystem>(
         &self,
         fd: usize,
-    ) -> Result<Weak<TypedFd<Subsystem>>, ErrRawIntFd> {
+    ) -> Result<Arc<TypedFd<Subsystem>>, ErrRawIntFd> {
         let Some(Some(stored_fd)) = self.stored_fds.get(fd) else {
             return Err(ErrRawIntFd::NotFound);
         };
-        let owned_fd: &Arc<OwnedFd> = stored_fd;
-        let Some(Some(entry)) = self.entries.get(stored_fd.as_usize()) else {
-            return Err(ErrRawIntFd::NotFound);
-        };
-        if !entry.read().matches_subsystem::<Subsystem>() {
+        if !stored_fd.matches_subsystem::<Subsystem>() {
             return Err(ErrRawIntFd::InvalidSubsystem);
         }
 
         let typed_fd: Arc<TypedFd<Subsystem>> = {
-            let fd: Arc<OwnedFd> = Arc::clone(owned_fd);
+            let fd: Arc<OwnedFd> = Arc::clone(&stored_fd.x);
             let fd: *const OwnedFd = Arc::into_raw(fd);
             // SAFETY: We are effectively converting an `Arc<OwnedFd>` to an
             // `Arc<TypedFd<Subsystem>>`.
@@ -378,163 +581,25 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             unsafe { Arc::from_raw(fd.cast()) }
         };
 
-        Ok(Arc::downgrade(&typed_fd))
+        Ok(typed_fd)
     }
 
-    /// Obtain the typed FD for the raw integer value of the `fd`.
+    /// Obtain the typed FD for the raw integer value of the `fd`, "consuming" the raw integer.
     ///
-    /// This operation will "consume" the raw integer (thus future [`Self::fd_from_raw_integer`]
-    /// might not refer to this file descriptor unless it is returned back via
-    /// [`Self::fd_into_raw_integer`]).
+    /// Since this operation "consumes" the raw integer, future [`Self::fd_from_raw_integer`] might
+    /// not refer to this file descriptor.
     ///
     /// You almost definitely want [`Self::fd_from_raw_integer`] instead, and should only use this
     /// if you really know you want to consume the descriptor.
     pub fn fd_consume_raw_integer<Subsystem: FdEnabledSubsystem>(
         &mut self,
         fd: usize,
-    ) -> Result<TypedFd<Subsystem>, ErrRawIntFd> {
-        let Some(stored_fd) = self.stored_fds.get_mut(fd) else {
-            return Err(ErrRawIntFd::NotFound);
-        };
-        match stored_fd {
-            None => return Err(ErrRawIntFd::NotFound),
-            Some(x) => {
-                let Some(Some(entry)) = self.entries.get(x.as_usize()) else {
-                    return Err(ErrRawIntFd::NotFound);
-                };
-                if !entry.read().matches_subsystem::<Subsystem>() {
-                    return Err(ErrRawIntFd::InvalidSubsystem);
-                }
-            }
-        }
-        let Some(owned_fd) = stored_fd.take() else {
-            return Err(ErrRawIntFd::NotFound);
-        };
-        match Arc::try_unwrap(owned_fd) {
-            Ok(owned_fd) => Ok(TypedFd {
-                _phantom: PhantomData,
-                x: owned_fd,
-            }),
-            Err(owned_fd) => {
-                // Seems like it is unconsumable due to ongoing usage (there is some `Weak` from
-                // `fd_from_raw_integer` that has been upgraded). We should let the user know that there
-                // is ongoing usage.
-                let None = stored_fd.replace(owned_fd) else {
-                    unreachable!()
-                };
-                Err(ErrRawIntFd::CurrentlyUnconsumable)
-            }
-        }
-    }
-
-    /// Apply `f` on metadata at an fd, if it exists.
-    ///
-    /// This returns the most-specific metadata available for the file descriptor---specifically, if
-    /// both [`Self::set_fd_metadata`] and [`Self::set_entry_metadata`]) are run on the same
-    /// fd, this will only return the value from the fd one, which will shadow the file one. If no
-    /// fd-specific one is set, this returns the entry-specific one.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "the invariants guarantee that the unwrap panics cannot occur"
-    )]
-    pub fn with_metadata<Subsystem, T, R>(
-        &self,
-        fd: &TypedFd<Subsystem>,
-        f: impl FnOnce(&T) -> R,
-    ) -> Result<R, MetadataError>
-    where
-        Subsystem: FdEnabledSubsystem,
-        T: core::any::Any + Send + Sync,
-    {
-        let ind_entry = self.entries[fd.x.as_usize()].as_ref().unwrap();
-        match ind_entry.metadata.get::<T>() {
-            Some(m) => Ok(f(m)),
-            None => ind_entry
-                .read()
-                .metadata
-                .get::<T>()
-                .map(f)
-                .ok_or(MetadataError::NoSuchMetadata),
-        }
-    }
-
-    /// Similar to [`Self::with_metadata`] but mutable.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "the invariants guarantee that the unwrap panics cannot occur"
-    )]
-    pub fn with_metadata_mut<Subsystem, T, R>(
-        &mut self,
-        fd: &TypedFd<Subsystem>,
-        f: impl FnOnce(&mut T) -> R,
-    ) -> Result<R, MetadataError>
-    where
-        Subsystem: FdEnabledSubsystem,
-        T: core::any::Any + Send + Sync,
-    {
-        let ind_entry = self.entries[fd.x.as_usize()].as_mut().unwrap();
-        match ind_entry.metadata.get_mut::<T>() {
-            Some(m) => Ok(f(m)),
-            None => ind_entry
-                .write()
-                .metadata
-                .get_mut::<T>()
-                .map(f)
-                .ok_or(MetadataError::NoSuchMetadata),
-        }
-    }
-
-    /// Store arbitrary metadata into a file.
-    ///
-    /// Such metadata is visible to any open fd on the entry associated with the fd. See similar
-    /// [`Self::set_fd_metadata`] which is specific to fds, and does not alias the metadata.
-    ///
-    /// Returns the old metadata if any such metadata exists.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "the invariants guarantee that the unwrap panics cannot occur"
-    )]
-    pub fn set_entry_metadata<Subsystem, T>(
-        &mut self,
-        fd: &TypedFd<Subsystem>,
-        metadata: T,
-    ) -> Option<T>
-    where
-        Subsystem: FdEnabledSubsystem,
-        T: core::any::Any + Send + Sync,
-    {
-        self.entries[fd.x.as_usize()]
-            .as_ref()
-            .unwrap()
-            .x
-            .write()
-            .metadata
-            .insert(metadata)
-    }
-
-    /// Store arbitrary metdata into a file descriptor.
-    ///
-    /// Such metadata is specific to the current fd and is NOT shared with other open fds to the
-    /// same entry. See the similar [`Self::set_entry_metadata`] which aliases metadata over all fds
-    /// opened for the same entry.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "the invariants guarantee that the unwrap panics cannot occur"
-    )]
-    pub fn set_fd_metadata<Subsystem, T>(
-        &mut self,
-        fd: &TypedFd<Subsystem>,
-        metadata: T,
-    ) -> Option<T>
-    where
-        Subsystem: FdEnabledSubsystem,
-        T: core::any::Any + Send + Sync,
-    {
-        self.entries[fd.x.as_usize()]
-            .as_mut()
-            .unwrap()
-            .metadata
-            .insert(metadata)
+    ) -> Result<Arc<TypedFd<Subsystem>>, ErrRawIntFd> {
+        let ret = self.fd_from_raw_integer(fd)?;
+        let underlying = self.stored_fds[fd].take();
+        debug_assert!(underlying.is_some());
+        drop(underlying);
+        Ok(ret)
     }
 }
 
@@ -548,16 +613,14 @@ pub trait FdEnabledSubsystem: Sized {
 #[doc(hidden)]
 pub trait FdEnabledSubsystemEntry: core::any::Any {}
 
-/// Possible errors from [`Descriptors::fd_from_raw_integer`] and
-/// [`Descriptors::fd_consume_raw_integer`].
+/// Possible errors from [`RawDescriptorStorage::fd_from_raw_integer`] and
+/// [`RawDescriptorStorage::fd_consume_raw_integer`].
 #[derive(Error, Debug)]
 pub enum ErrRawIntFd {
     #[error("no such file descriptor found")]
     NotFound,
     #[error("fd for invalid subsystem")]
     InvalidSubsystem,
-    #[error("could not consume due to ongoing FD usage")]
-    CurrentlyUnconsumable,
 }
 
 /// Possible errors from getting metadata
@@ -565,6 +628,8 @@ pub enum ErrRawIntFd {
 pub enum MetadataError {
     #[error("no such metadata available")]
     NoSuchMetadata,
+    #[error("fd has been closed")]
+    ClosedFd,
 }
 
 /// A module-internal fd-specific individual entry
@@ -658,9 +723,12 @@ pub(crate) struct InternalFd {
 
 /// An explicitly-private shared-common element of [`TypedFd`], denoting an owned (non-clonable)
 /// token of ownership over a file descriptor.
+///
+/// Note: this indicates ownership over the descriptor itself, but not necessarily the underlying
+/// entry, since there might be duplicates to the underlying entry.
 struct OwnedFd {
     raw: u32,
-    closed: bool,
+    closed: AtomicBool,
 }
 
 impl OwnedFd {
@@ -670,31 +738,38 @@ impl OwnedFd {
     pub(crate) fn new(raw: usize) -> Self {
         Self {
             raw: raw.try_into().unwrap(),
-            closed: false,
+            closed: AtomicBool::new(false),
         }
     }
 
     /// Check if it is closed
     pub(crate) fn is_closed(&self) -> bool {
-        self.closed
+        self.closed.load(core::sync::atomic::Ordering::SeqCst)
     }
 
     /// Mark it as closed
-    pub(crate) fn mark_as_closed(&mut self) {
-        assert!(!self.is_closed());
-        self.closed = true;
+    pub(crate) fn mark_as_closed(&self) {
+        let was_closed = self
+            .closed
+            .fetch_or(true, core::sync::atomic::Ordering::SeqCst);
+        assert!(!was_closed);
     }
 
-    /// Obtain the raw index it was created with
-    pub(crate) fn as_usize(&self) -> usize {
-        assert!(!self.is_closed());
-        self.raw.try_into().unwrap()
+    /// Obtain the raw index it was created with if it has not been closed.
+    ///
+    /// Returns `None` if it has already been closed.
+    pub(crate) fn as_usize(&self) -> Option<usize> {
+        if self.is_closed() {
+            return None;
+        }
+        let v: usize = self.raw.try_into().unwrap();
+        Some(v)
     }
 }
 
 impl Drop for OwnedFd {
     fn drop(&mut self) {
-        if self.closed {
+        if self.is_closed() {
             // This has been closed out by a valid close operation
         } else {
             // The owned fd is dropped without being consumed by a `close` operation that has

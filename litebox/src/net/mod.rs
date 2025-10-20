@@ -67,6 +67,8 @@ where
     local_port_allocator: LocalPortAllocator,
     /// Whether outside interaction is automatic or manual
     platform_interaction: PlatformInteraction,
+    /// FDs that are queued for eventual closure
+    queued_for_closure: Vec<SocketFd<Platform>>,
 }
 
 impl<Platform> Network<Platform>
@@ -108,6 +110,7 @@ where
             zero_time: litebox.x.platform.now(),
             local_port_allocator: LocalPortAllocator::new(),
             platform_interaction: PlatformInteraction::Automatic,
+            queued_for_closure: vec![],
         }
     }
 }
@@ -115,6 +118,8 @@ where
 /// [`SocketHandle`] stores all relevant information for a specific [`SocketFd`], for easy access
 /// from [`SocketFd`], _except_ the `Socket` itself which is stored in the [`Network::socket_set`].
 pub(crate) struct SocketHandle {
+    /// Whether this socket handle is going away soon (i.e., `close` has been invoked upon it).
+    consider_closed: bool,
     /// The handle into the `socket_set`
     handle: smoltcp::iface::SocketHandle,
     // Protocol-specific data
@@ -376,6 +381,9 @@ where
         &mut self,
         direction: PollDirection,
     ) -> PlatformInteractionReinvocationAdvice {
+        if self.attempt_to_close_queued() {
+            return PlatformInteractionReinvocationAdvice::CallAgainImmediately;
+        }
         let timestamp = self.now();
         let mut socket_state_changed = false;
         let ingress_advice = if direction.ingress() {
@@ -537,6 +545,7 @@ where
         };
 
         Ok(self.new_socket_fd_for(SocketHandle {
+            consider_closed: false,
             handle,
             specific: match protocol {
                 Protocol::Tcp => ProtocolSpecific::Tcp(TcpSpecific {
@@ -558,13 +567,50 @@ where
     }
 
     /// Close the socket at `fd`
-    pub fn close(&mut self, fd: SocketFd<Platform>) -> Result<(), CloseError> {
-        let Some(mut socket_handle) = self.litebox.descriptor_table_mut().remove(fd) else {
-            // There might be other duplicates around (e.g., due to `dup`), so we don't want to do
-            // any deallocations and such. We just return.
-            return Ok(());
-        };
-        let socket = self.socket_set.remove(socket_handle.entry.handle);
+    pub fn close(&mut self, fd: &SocketFd<Platform>) -> Result<(), CloseError> {
+        // We close immediately if we can
+        let mut dt = self.litebox.descriptor_table_mut();
+        if let Some(socket_handle) = dt.remove(fd) {
+            // Can immediately close it out.
+            drop(dt);
+            self.close_handle(socket_handle.entry);
+            Ok(())
+        } else {
+            // It seems like there might be other duplicates around (e.g., due to `dup`), so we
+            // can't immediately close it out (or this FD has already been closed out). We
+            // attempt to queue it for future closure and then just return.
+            let fd = dt.duplicate(fd).ok_or(CloseError::InvalidFd)?;
+            let Some(()) = dt.with_entry_mut(&fd, |entry| entry.entry.consider_closed = true)
+            else {
+                unreachable!()
+            };
+            self.queued_for_closure.push(fd);
+            Ok(())
+        }
+    }
+
+    /// Attempt to close as many queued-to-close FDs as possible. Returns `true` iff any of them
+    /// were closed.
+    fn attempt_to_close_queued(&mut self) -> bool {
+        if self.queued_for_closure.is_empty() {
+            // fast path
+            return false;
+        }
+        let mut dt = self.litebox.descriptor_table_mut();
+        let entries = dt.drain_entries_full_covered_by(&mut self.queued_for_closure);
+        drop(dt);
+        if entries.is_empty() {
+            return false;
+        }
+        for entry in entries {
+            self.close_handle(entry.entry);
+        }
+        true
+    }
+
+    /// Close the `socket_handle`
+    fn close_handle(&mut self, mut socket_handle: SocketHandle) {
+        let socket = self.socket_set.remove(socket_handle.handle);
         match socket {
             smoltcp::socket::Socket::Raw(_) | smoltcp::socket::Socket::Icmp(_) => {
                 // There is no close/abort for raw and icmp sockets
@@ -573,7 +619,7 @@ where
                 socket.close();
             }
             smoltcp::socket::Socket::Tcp(mut socket) => {
-                if let Some(local_port) = socket_handle.entry.specific.tcp_mut().local_port.take() {
+                if let Some(local_port) = socket_handle.specific.tcp_mut().local_port.take() {
                     self.local_port_allocator.deallocate(local_port);
                 }
                 // TODO: Should we `.close()` or should we `.abort()`?
@@ -587,7 +633,6 @@ where
             }
         }
         self.automated_platform_interaction(PollDirection::Both);
-        Ok(())
     }
 
     /// Initiate a connection to an IP address
@@ -601,8 +646,13 @@ where
         };
 
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(ConnectError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        if socket_handle.consider_closed {
+            return Err(ConnectError::InvalidFd);
+        }
 
         match socket_handle.protocol() {
             Protocol::Tcp => {
@@ -653,7 +703,9 @@ where
     /// Get the local address and port a socket is bound to.
     pub fn get_local_addr(&self, fd: &SocketFd<Platform>) -> Result<SocketAddr, LocalAddrError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(LocalAddrError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
 
         match socket_handle.protocol() {
@@ -687,8 +739,13 @@ where
         };
 
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(BindError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        if socket_handle.consider_closed {
+            return Err(BindError::InvalidFd);
+        }
 
         match socket_handle.protocol() {
             Protocol::Tcp => {
@@ -752,8 +809,13 @@ where
     /// bound.
     pub fn listen(&mut self, fd: &SocketFd<Platform>, backlog: u16) -> Result<(), ListenError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(ListenError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        if socket_handle.consider_closed {
+            return Err(ListenError::InvalidFd);
+        }
 
         if backlog == 0 {
             // What should actually happen here?
@@ -830,8 +892,13 @@ where
     pub fn accept(&mut self, fd: &SocketFd<Platform>) -> Result<SocketFd<Platform>, AcceptError> {
         self.automated_platform_interaction(PollDirection::Both);
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(AcceptError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        if socket_handle.consider_closed {
+            return Err(AcceptError::InvalidFd);
+        }
 
         match &mut socket_handle.specific {
             ProtocolSpecific::Tcp(handle) => {
@@ -871,6 +938,7 @@ where
                 self.automated_platform_interaction(PollDirection::Both);
                 // Create a new FD to hand it back out to the user
                 Ok(self.new_socket_fd_for(SocketHandle {
+                    consider_closed: false,
                     handle: ready_handle,
                     specific: ProtocolSpecific::Tcp(TcpSpecific {
                         local_port,
@@ -896,8 +964,13 @@ where
         destination: Option<SocketAddr>,
     ) -> Result<usize, SendError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(SendError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        if socket_handle.consider_closed {
+            return Err(SendError::InvalidFd);
+        }
 
         if !flags.is_empty() {
             unimplemented!()
@@ -975,8 +1048,13 @@ where
         // possibly get packets where we might otherwise return with size 0 on the `receive`.
         self.automated_platform_interaction(PollDirection::Ingress);
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(ReceiveError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        if socket_handle.consider_closed {
+            return Err(ReceiveError::InvalidFd);
+        }
 
         if flags.intersects(
             (ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC | ReceiveFlags::DISCARD).complement(),
@@ -1064,8 +1142,13 @@ where
         data: TcpOptionData,
     ) -> Result<(), errors::SetTcpOptionError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(errors::SetTcpOptionError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        if socket_handle.consider_closed {
+            return Err(errors::SetTcpOptionError::InvalidFd);
+        }
         match socket_handle.protocol() {
             Protocol::Tcp => {
                 let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
@@ -1091,7 +1174,9 @@ where
         name: TcpOptionName,
     ) -> Result<TcpOptionData, errors::GetTcpOptionError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(errors::GetTcpOptionError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
         match socket_handle.protocol() {
             Protocol::Tcp => {
@@ -1114,8 +1199,11 @@ where
     /// Get the [`Events`] for a socket.
     pub fn check_events(&self, fd: &SocketFd<Platform>) -> Option<Events> {
         let descriptor_table = self.litebox.descriptor_table_mut();
-        let mut table_entry = descriptor_table.get_entry_mut(fd);
+        let mut table_entry = descriptor_table.get_entry_mut(fd)?;
         let socket_handle = &mut table_entry.entry;
+        if socket_handle.consider_closed {
+            return None;
+        }
         match socket_handle.protocol() {
             Protocol::Tcp => {
                 let tcp_socket = self.socket_set.get::<tcp::Socket>(socket_handle.handle);

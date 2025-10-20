@@ -51,8 +51,10 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         mode: Mode,
     ) -> Result<TypedFd<Self>, OpenError>;
 
-    /// Close the file at `fd`
-    fn close(&self, fd: TypedFd<Self>) -> Result<(), CloseError>;
+    /// Close the file at `fd`.
+    ///
+    /// Future operations on the `fd` will start to return `ClosedFd` errors.
+    fn close(&self, fd: &TypedFd<Self>) -> Result<(), CloseError>;
 
     /// Read from a file descriptor at `offset` into a buffer
     ///

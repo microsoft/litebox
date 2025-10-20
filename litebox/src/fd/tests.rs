@@ -42,7 +42,7 @@ fn test_insert_and_remove_entry() {
 
     assert_eq!(descriptors.entries.len(), 1);
 
-    let removed_entry = descriptors.remove(typed_fd);
+    let removed_entry = descriptors.remove(&typed_fd);
     assert!(removed_entry.is_some());
     assert_eq!(removed_entry.unwrap().data, "test");
 }
@@ -75,7 +75,7 @@ fn test_iter_entries() {
     assert_eq!(entries, vec!["entry1", "entry2"]); // Notice that "x" does not show up
 
     // Remove one entry and check again
-    descriptors.remove(fd1);
+    descriptors.remove(&fd1);
     let entries_after_removal: Vec<String> = descriptors
         .iter::<MockSubsystem>()
         .map(|(_, e)| e.data.clone())
@@ -118,26 +118,29 @@ fn test_fd_raw_integer() {
     let litebox = litebox();
     let mut descriptors = litebox.descriptor_table_mut();
 
-    let result = descriptors.fd_from_raw_integer::<MockSubsystem>(999);
+    let mut rds = super::RawDescriptorStorage::new();
+
+    let result = rds.fd_from_raw_integer::<MockSubsystem>(999);
     assert!(matches!(result, Err(ErrRawIntFd::NotFound)));
 
     let entry = MockEntry {
         data: "test".to_string(),
     };
     let typed_fd: TypedFd<MockSubsystem> = descriptors.insert(entry);
-    let raw_fd = descriptors.fd_into_raw_integer(typed_fd);
-    let result = descriptors.fd_from_raw_integer::<MockSubsystem2>(raw_fd);
+    let raw_fd = rds.fd_into_raw_integer(typed_fd);
+    let result = rds.fd_from_raw_integer::<MockSubsystem2>(raw_fd);
     assert!(matches!(result, Err(ErrRawIntFd::InvalidSubsystem)));
 
-    let fetched_fd = descriptors
-        .fd_from_raw_integer::<MockSubsystem>(raw_fd)
+    let fetched_fd = rds.fd_from_raw_integer::<MockSubsystem>(raw_fd).unwrap();
+    let data = descriptors
+        .with_entry(&fetched_fd, |e| e.data.clone())
         .unwrap();
-    let data = descriptors.with_entry(&fetched_fd.upgrade().unwrap(), |e| e.data.clone());
     assert_eq!(data, "test");
+    drop(fetched_fd);
 
-    let consumed_fd = descriptors
-        .fd_consume_raw_integer::<MockSubsystem>(raw_fd)
+    let consumed_fd = rds.fd_consume_raw_integer::<MockSubsystem>(raw_fd).unwrap();
+    let data = descriptors
+        .with_entry(&consumed_fd, |e| e.data.clone())
         .unwrap();
-    let data = descriptors.with_entry(&consumed_fd, |e| e.data.clone());
     assert_eq!(data, "test");
 }
