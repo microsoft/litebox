@@ -104,7 +104,6 @@ pub(crate) struct Socket {
     pub(crate) raw_fd: Option<usize>,
     /// File status flags (see [`litebox::fs::OFlags::STATUS_FLAGS_MASK`])
     pub(crate) status: AtomicU32,
-    sock_type: SockType,
     options: litebox::sync::Mutex<Platform, SocketOptions>,
     pollee: Pollee<Platform>,
 }
@@ -136,6 +135,19 @@ fn short_borrow_socket_fd<R>(
     }
 }
 
+fn get_socket_type(raw_fd: usize) -> Result<SockType, Errno> {
+    short_borrow_socket_fd(raw_fd, |fd| {
+        crate::litebox()
+            .descriptor_table()
+            .with_metadata(fd, |sock_type: &SockType| *sock_type)
+            .map_err(|e| match e {
+                litebox::fd::MetadataError::NoSuchMetadata => Errno::ENOTSOCK,
+                litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
+            })
+    })
+    .flatten()
+}
+
 impl Socket {
     pub(crate) fn new(
         raw_fd: usize,
@@ -158,12 +170,18 @@ impl Socket {
             })
             .unwrap();
         }
+        short_borrow_socket_fd(raw_fd, |fd| {
+            let old = crate::litebox()
+                .descriptor_table_mut()
+                .set_fd_metadata(fd, sock_type);
+            assert!(old.is_none());
+        })
+        .unwrap();
 
         Self {
             raw_fd: Some(raw_fd),
             // `SockFlags` is a subset of `OFlags`
             status: AtomicU32::new(flags.bits()),
-            sock_type,
             options: litebox.sync().new_mutex(SocketOptions::default()),
             pollee: Pollee::new(litebox),
         }
@@ -355,7 +373,7 @@ impl Socket {
                     }
                     _ => {
                         let val = match sopt {
-                            SocketOption::TYPE => self.sock_type as u32,
+                            SocketOption::TYPE => get_socket_type(self.raw_fd.unwrap())? as u32,
                             SocketOption::REUSEADDR => u32::from(self.options.lock().reuse_address),
                             SocketOption::BROADCAST => 1, // TODO: We don't support disabling SO_BROADCAST
                             SocketOption::KEEPALIVE => u32::from(self.options.lock().keep_alive),
@@ -569,7 +587,7 @@ impl Socket {
         );
         // `MSG_TRUNC` behavior depends on the socket type
         if flags.contains(ReceiveFlags::TRUNC) {
-            match self.sock_type {
+            match get_socket_type(self.raw_fd.unwrap())? {
                 SockType::Datagram | SockType::Raw => {
                     new_flags.insert(litebox::net::ReceiveFlags::TRUNC);
                 }
@@ -752,9 +770,10 @@ pub(crate) fn sys_accept(
             let mut rds = crate::raw_descriptor_store().write();
             let raw_fd = rds.fd_into_raw_integer(fd);
             drop(rds);
+            let sock_type = get_socket_type(socket.raw_fd.unwrap())?;
             Descriptor::Socket(alloc::sync::Arc::new(Socket::new(
                 raw_fd,
-                socket.sock_type,
+                sock_type,
                 flags,
                 crate::litebox(),
                 Events::empty(),
