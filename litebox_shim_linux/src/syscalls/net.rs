@@ -1,14 +1,10 @@
 //! Socket-related syscalls, e.g., socket, bind, listen, etc.
 
-use core::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::atomic::{AtomicBool, AtomicU32},
-};
+use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use litebox::{
-    event::{Events, observer::Observer, polling::Pollee},
     fs::OFlags,
-    net::{SocketFd, TcpOptionData},
+    net::TcpOptionData,
     platform::{RawConstPointer as _, RawMutPointer as _},
     utils::TruncateExt as _,
 };
@@ -17,8 +13,8 @@ use litebox_common_linux::{
     TcpOption, errno::Errno,
 };
 
-use crate::Platform;
 use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox_net};
+use crate::{Platform, litebox};
 
 const ADDR_MAX_LEN: usize = 128;
 
@@ -36,15 +32,35 @@ macro_rules! convert_flags {
     };
 }
 
+type SocketFd = litebox::net::SocketFd<Platform>;
+
+fn with_socket_fd<R>(
+    raw_fd: usize,
+    f: impl FnOnce(&SocketFd) -> Result<R, Errno>,
+) -> Result<R, Errno> {
+    let rds = crate::raw_descriptor_store().read();
+    match rds.fd_from_raw_integer(raw_fd) {
+        Ok(fd) => {
+            drop(rds);
+            f(&fd)
+        }
+        Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
+        Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => Err(Errno::ENOTSOCK),
+    }
+}
+
 #[repr(C)]
 struct CSockStorage {
-    pub sa_family: u16,
-    pub bytes: [u8; ADDR_MAX_LEN - 2],
+    sa_family: u16,
+    bytes: [u8; ADDR_MAX_LEN - 2],
 }
 
 impl Default for CSockStorage {
     fn default() -> Self {
-        unsafe { core::mem::zeroed() }
+        Self {
+            sa_family: 0,
+            bytes: [0u8; _],
+        }
     }
 }
 
@@ -83,478 +99,469 @@ pub(crate) enum SocketAddress {
 }
 
 #[derive(Default)]
-pub(super) struct SocketOptions {
-    pub(super) reuse_address: bool,
-    pub(super) keep_alive: bool,
+struct SocketOptions {
+    reuse_address: bool,
+    keep_alive: bool,
     /// Receiving timeout, None (default value) means no timeout
-    pub(super) recv_timeout: Option<core::time::Duration>,
+    recv_timeout: Option<core::time::Duration>,
     /// Sending timeout, None (default value) means no timeout
-    pub(super) send_timeout: Option<core::time::Duration>,
+    send_timeout: Option<core::time::Duration>,
     /// Linger timeout, None (default value) means closing in the background.
     /// If it is `Some`, a close or shutdown will not return
     /// until all queued messages for the socket have been
     /// successfully sent or the timeout has been reached.
-    pub(super) linger_timeout: Option<core::time::Duration>,
+    linger_timeout: Option<core::time::Duration>,
 }
 
-// TODO: move `status` and `close_on_exec` to litebox once #119 is completed
-//
-// TODO: remove this once the full dup-supported descriptors in litebox are set up.
-pub(crate) struct Socket {
-    pub(crate) fd: Option<SocketFd<Platform>>,
-    /// File status flags (see [`litebox::fs::OFlags::STATUS_FLAGS_MASK`])
-    pub(crate) status: AtomicU32,
-    pub(crate) close_on_exec: AtomicBool,
-    sock_type: SockType,
-    options: litebox::sync::Mutex<Platform, SocketOptions>,
-    pollee: Pollee<Platform>,
+struct SocketOFlags(OFlags);
+
+fn initialize_socket(fd: &SocketFd, sock_type: SockType, flags: SockFlags) {
+    let mut status = OFlags::RDWR;
+    status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
+
+    let mut dt = litebox().descriptor_table_mut();
+    let old = dt.set_entry_metadata(fd, SocketOptions::default());
+    assert!(old.is_none());
+    if flags.contains(SockFlags::CLOEXEC) {
+        let old = dt.set_fd_metadata(fd, litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC);
+        assert!(old.is_none());
+    }
+    let old = dt.set_fd_metadata(fd, sock_type);
+    assert!(old.is_none());
+    let old = dt.set_entry_metadata(fd, SocketOFlags(status));
+    assert!(old.is_none());
 }
 
-impl Drop for Socket {
-    fn drop(&mut self) {
-        if let Some(sockfd) = self.fd.take() {
-            litebox_net().lock().close(&sockfd);
-        }
-    }
+fn with_socket_options<R>(fd: &SocketFd, f: impl FnOnce(&SocketOptions) -> R) -> R {
+    litebox()
+        .descriptor_table()
+        .with_metadata(fd, |opt| f(opt))
+        .unwrap()
+}
+fn with_socket_options_mut<R>(fd: &SocketFd, f: impl FnOnce(&mut SocketOptions) -> R) -> R {
+    litebox()
+        .descriptor_table_mut()
+        .with_metadata_mut(fd, |opt| f(opt))
+        .unwrap()
 }
 
-impl Socket {
-    pub(crate) fn new(
-        fd: SocketFd<Platform>,
-        sock_type: SockType,
-        flags: SockFlags,
-        litebox: &litebox::LiteBox<Platform>,
-        init_events: Events,
-    ) -> Self {
-        let _ = init_events; // TODO: `init_events` were being ignored before this PR, what to do?
-
-        let mut status = OFlags::RDWR;
-        status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
-
-        Self {
-            fd: Some(fd),
-            // `SockFlags` is a subset of `OFlags`
-            status: AtomicU32::new(flags.bits()),
-            close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
-            sock_type,
-            options: litebox.sync().new_mutex(SocketOptions::default()),
-            pollee: Pollee::new(litebox),
-        }
-    }
-
-    fn setsockopt(
-        &self,
-        optname: SocketOptionName,
-        optval: ConstPtr<u8>,
-        optlen: usize,
-    ) -> Result<(), Errno> {
-        match optname {
-            SocketOptionName::IP(ip) => match ip {
-                litebox_common_linux::IpOption::TOS => Err(Errno::EOPNOTSUPP),
-            },
-            SocketOptionName::Socket(so) => {
-                let read_timeval_as_duration =
-                    |optval: ConstPtr<_>| -> Result<Option<core::time::Duration>, Errno> {
-                        if optlen < size_of::<litebox_common_linux::TimeVal>() {
-                            return Err(Errno::EINVAL);
-                        }
-                        let optval: ConstPtr<litebox_common_linux::TimeVal> =
-                            ConstPtr::from_usize(optval.as_usize());
-                        let timeval = unsafe { optval.read_at_offset(0) }
-                            .ok_or(Errno::EFAULT)?
-                            .into_owned();
-                        let d = core::time::Duration::try_from(timeval)?;
-                        if d.is_zero() { Ok(None) } else { Ok(Some(d)) }
-                    };
-                match so {
-                    SocketOption::RCVTIMEO => {
-                        self.options.lock().recv_timeout = read_timeval_as_duration(optval)?;
-                        return Ok(());
+fn setsockopt(
+    fd: &SocketFd,
+    optname: SocketOptionName,
+    optval: ConstPtr<u8>,
+    optlen: usize,
+) -> Result<(), Errno> {
+    match optname {
+        SocketOptionName::IP(ip) => match ip {
+            litebox_common_linux::IpOption::TOS => Err(Errno::EOPNOTSUPP),
+        },
+        SocketOptionName::Socket(so) => {
+            let read_timeval_as_duration =
+                |optval: ConstPtr<_>| -> Result<Option<core::time::Duration>, Errno> {
+                    if optlen < size_of::<litebox_common_linux::TimeVal>() {
+                        return Err(Errno::EINVAL);
                     }
-                    SocketOption::SNDTIMEO => {
-                        self.options.lock().send_timeout = read_timeval_as_duration(optval)?;
-                        return Ok(());
-                    }
-                    SocketOption::LINGER => {
-                        if optlen < size_of::<litebox_common_linux::Linger>() {
-                            return Err(Errno::EINVAL);
-                        }
-                        let linger: crate::ConstPtr<litebox_common_linux::Linger> =
-                            crate::ConstPtr::from_usize(optval.as_usize());
-                        let linger = unsafe { linger.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
-                        // TODO: our current implementation of `close` does not support graceful close yet.
-                        if linger.onoff != 0 && linger.linger != 0 {
-                            unimplemented!("SO_LINGER with non-zero timeout is not supported yet");
-                        }
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-
-                if optlen < size_of::<u32>() {
-                    return Err(Errno::EINVAL);
-                }
-                let optval: ConstPtr<u32> = ConstPtr::from_usize(optval.as_usize());
-                let val = unsafe { optval.read_at_offset(0) }
-                    .ok_or(Errno::EFAULT)?
-                    .into_owned();
-                match so {
-                    SocketOption::REUSEADDR => {
-                        self.options.lock().reuse_address = val != 0;
-                    }
-                    SocketOption::BROADCAST => {
-                        if val == 0 {
-                            todo!("disable SO_BROADCAST");
-                        }
-                    }
-                    SocketOption::KEEPALIVE => {
-                        let keep_alive = val != 0;
-                        if let Err(err) = litebox_net().lock().set_tcp_option(
-                            self.fd.as_ref().unwrap(),
-                            // default time interval is 2 hours
-                            litebox::net::TcpOptionData::KEEPALIVE(Some(
-                                core::time::Duration::from_secs(2 * 60 * 60),
-                            )),
-                        ) {
-                            match err {
-                                litebox::net::errors::SetTcpOptionError::InvalidFd => {
-                                    return Err(Errno::EBADF);
-                                }
-                                litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
-                                    unimplemented!(
-                                        "SO_KEEPALIVE is not supported for non-TCP sockets"
-                                    )
-                                }
-                                _ => unimplemented!(),
-                            }
-                        }
-                        self.options.lock().keep_alive = keep_alive;
-                    }
-                    // We use fixed buffer size for now
-                    SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
-                    // Already handled at the beginning
-                    SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER => {}
-                    // Socket does not support these options
-                    SocketOption::TYPE | SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
-                }
-                Ok(())
-            }
-            SocketOptionName::TCP(to) => {
-                let optval: ConstPtr<u32> = ConstPtr::from_usize(optval.as_usize());
-                let val = unsafe { optval.read_at_offset(0) }
-                    .ok_or(Errno::EFAULT)?
-                    .into_owned();
-                match to {
-                    TcpOption::NODELAY | TcpOption::CORK => {
-                        // Some applications use Nagle's Algorithm (via the TCP_NODELAY option) for a similar effect.
-                        // However, TCP_CORK offers more fine-grained control, as it's designed for applications that
-                        // send variable-length chunks of data that don't necessarily fit nicely into a full TCP segment.
-                        // Because smoltcp does not support TCP_CORK, we emulate it by enabling/disabling Nagle's Algorithm.
-                        let on = if let TcpOption::NODELAY = to {
-                            val != 0
-                        } else {
-                            // CORK is the opposite of NODELAY
-                            val == 0
-                        };
-                        litebox_net().lock().set_tcp_option(
-                            self.fd.as_ref().unwrap(),
-                            litebox::net::TcpOptionData::NODELAY(on),
-                        )?;
-                        Ok(())
-                    }
-                    TcpOption::KEEPINTVL => {
-                        const MAX_TCP_KEEPINTVL: u32 = 32767;
-                        if !(1..=MAX_TCP_KEEPINTVL).contains(&val) {
-                            return Err(Errno::EINVAL);
-                        }
-                        litebox_net()
-                            .lock()
-                            .set_tcp_option(
-                                self.fd.as_ref().unwrap(),
-                                litebox::net::TcpOptionData::KEEPALIVE(Some(
-                                    core::time::Duration::from_secs(u64::from(val)),
-                                )),
-                            )
-                            .expect("set TCP_KEEPALIVE should succeed");
-                        Ok(())
-                    }
-                    TcpOption::KEEPCNT | TcpOption::KEEPIDLE => Err(Errno::EOPNOTSUPP),
-                    _ => unimplemented!("TCP option {to:?}"),
-                }
-            }
-        }
-    }
-
-    fn getsockopt(
-        &self,
-        optname: SocketOptionName,
-        optval: MutPtr<u8>,
-        optlen: MutPtr<u32>,
-    ) -> Result<(), Errno> {
-        let len = unsafe { optlen.read_at_offset(0).ok_or(Errno::EFAULT) }?.into_owned();
-        if len > i32::MAX as u32 {
-            return Err(Errno::EINVAL);
-        }
-        let new_len = match optname {
-            SocketOptionName::IP(ipopt) => match ipopt {
-                litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
-            },
-            SocketOptionName::Socket(sopt) => {
-                match sopt {
-                    SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER => {
-                        let tv = match sopt {
-                            SocketOption::RCVTIMEO => self.options.lock().recv_timeout,
-                            SocketOption::SNDTIMEO => self.options.lock().send_timeout,
-                            SocketOption::LINGER => self.options.lock().linger_timeout,
-                            _ => unreachable!(),
-                        }
-                        .map_or_else(
-                            litebox_common_linux::TimeVal::default,
-                            litebox_common_linux::TimeVal::from,
-                        );
-                        // If the provided buffer is too small, we just write as much as we can.
-                        let length = size_of::<litebox_common_linux::TimeVal>().min(len as usize);
-                        let data = unsafe {
-                            core::slice::from_raw_parts((&raw const tv).cast::<u8>(), length)
-                        };
-                        unsafe { optval.write_slice_at_offset(0, data) }.ok_or(Errno::EFAULT)?;
-                        length
-                    }
-                    _ => {
-                        let val = match sopt {
-                            SocketOption::TYPE => self.sock_type as u32,
-                            SocketOption::REUSEADDR => u32::from(self.options.lock().reuse_address),
-                            SocketOption::BROADCAST => 1, // TODO: We don't support disabling SO_BROADCAST
-                            SocketOption::KEEPALIVE => u32::from(self.options.lock().keep_alive),
-                            SocketOption::RCVBUF | SocketOption::SNDBUF => {
-                                litebox::net::SOCKET_BUFFER_SIZE.truncate()
-                            }
-                            SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
-                            SocketOption::RCVTIMEO
-                            | SocketOption::SNDTIMEO
-                            | SocketOption::LINGER => unreachable!(),
-                        };
-                        // If the provided buffer is too small, we just write as much as we can.
-                        let length = size_of::<u32>().min(len as usize);
-                        let data = &val.to_ne_bytes()[..length];
-                        unsafe { optval.write_slice_at_offset(0, data) }.ok_or(Errno::EFAULT)?;
-                        length
-                    }
-                }
-            }
-            SocketOptionName::TCP(tcpopt) => {
-                let val: u32 = match tcpopt {
-                    TcpOption::KEEPINTVL => {
-                        let TcpOptionData::KEEPALIVE(interval) =
-                            litebox_net().lock().get_tcp_option(
-                                self.fd.as_ref().unwrap(),
-                                litebox::net::TcpOptionName::KEEPALIVE,
-                            )?
-                        else {
-                            unreachable!()
-                        };
-                        interval.map_or(0, |d| d.as_secs().try_into().unwrap())
-                    }
-                    TcpOption::NODELAY | TcpOption::CORK => {
-                        let TcpOptionData::NODELAY(nodelay) = litebox_net().lock().get_tcp_option(
-                            self.fd.as_ref().unwrap(),
-                            litebox::net::TcpOptionName::NODELAY,
-                        )?
-                        else {
-                            unreachable!()
-                        };
-                        u32::from(if let TcpOption::NODELAY = tcpopt {
-                            nodelay
-                        } else {
-                            // CORK is the opposite of NODELAY
-                            !nodelay
-                        })
-                    }
-                    TcpOption::KEEPCNT | TcpOption::KEEPIDLE => return Err(Errno::EOPNOTSUPP),
-                    TcpOption::CONGESTION | TcpOption::INFO => {
-                        unimplemented!("TCP option {tcpopt:?}")
-                    }
+                    let optval: ConstPtr<litebox_common_linux::TimeVal> =
+                        ConstPtr::from_usize(optval.as_usize());
+                    let timeval = unsafe { optval.read_at_offset(0) }
+                        .ok_or(Errno::EFAULT)?
+                        .into_owned();
+                    let d = core::time::Duration::try_from(timeval)?;
+                    if d.is_zero() { Ok(None) } else { Ok(Some(d)) }
                 };
-                let data = &val.to_ne_bytes()[..size_of::<u32>().min(len as usize)];
-                unsafe { optval.write_slice_at_offset(0, data) }.ok_or(Errno::EFAULT)?;
-                size_of::<u32>()
-            }
-        };
-        unsafe { optlen.write_at_offset(0, new_len.truncate()) }.ok_or(Errno::EFAULT)?;
-        Ok(())
-    }
-
-    fn try_accept(&self) -> Result<SocketFd<Platform>, Errno> {
-        litebox_net()
-            .lock()
-            .accept(self.fd.as_ref().unwrap())
-            .map_err(Errno::from)
-    }
-
-    fn accept(&self) -> Result<SocketFd<Platform>, Errno> {
-        if self.get_status().contains(OFlags::NONBLOCK) {
-            self.try_accept()
-        } else {
-            // TODO: use `poll` instead of busy wait
-            loop {
-                match self.try_accept() {
-                    Err(Errno::EAGAIN) => {}
-                    ret => return ret,
+            match so {
+                SocketOption::RCVTIMEO => {
+                    let duration = read_timeval_as_duration(optval)?;
+                    with_socket_options_mut(fd, |opt| {
+                        opt.recv_timeout = duration;
+                    });
+                    return Ok(());
                 }
-                core::hint::spin_loop();
+                SocketOption::SNDTIMEO => {
+                    let duration = read_timeval_as_duration(optval)?;
+                    with_socket_options_mut(fd, |opt| {
+                        opt.send_timeout = duration;
+                    });
+                    return Ok(());
+                }
+                SocketOption::LINGER => {
+                    if optlen < size_of::<litebox_common_linux::Linger>() {
+                        return Err(Errno::EINVAL);
+                    }
+                    let linger: crate::ConstPtr<litebox_common_linux::Linger> =
+                        crate::ConstPtr::from_usize(optval.as_usize());
+                    let linger = unsafe { linger.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+                    // TODO: our current implementation of `close` does not support graceful close yet.
+                    if linger.onoff != 0 && linger.linger != 0 {
+                        unimplemented!("SO_LINGER with non-zero timeout is not supported yet");
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+
+            if optlen < size_of::<u32>() {
+                return Err(Errno::EINVAL);
+            }
+            let optval: ConstPtr<u32> = ConstPtr::from_usize(optval.as_usize());
+            let val = unsafe { optval.read_at_offset(0) }
+                .ok_or(Errno::EFAULT)?
+                .into_owned();
+            match so {
+                SocketOption::REUSEADDR => {
+                    with_socket_options_mut(fd, |opt| {
+                        opt.reuse_address = val != 0;
+                    });
+                }
+                SocketOption::BROADCAST => {
+                    if val == 0 {
+                        todo!("disable SO_BROADCAST");
+                    }
+                }
+                SocketOption::KEEPALIVE => {
+                    let keep_alive = val != 0;
+                    if let Err(err) = litebox_net().lock().set_tcp_option(
+                        fd,
+                        // default time interval is 2 hours
+                        litebox::net::TcpOptionData::KEEPALIVE(Some(
+                            core::time::Duration::from_secs(2 * 60 * 60),
+                        )),
+                    ) {
+                        match err {
+                            litebox::net::errors::SetTcpOptionError::InvalidFd => {
+                                return Err(Errno::EBADF);
+                            }
+                            litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
+                                unimplemented!("SO_KEEPALIVE is not supported for non-TCP sockets")
+                            }
+                            _ => unimplemented!(),
+                        }
+                    }
+                    with_socket_options_mut(fd, |opt| {
+                        opt.keep_alive = keep_alive;
+                    });
+                }
+                // We use fixed buffer size for now
+                SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
+                // Already handled at the beginning
+                SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER => {}
+                // Socket does not support these options
+                SocketOption::TYPE | SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
+            }
+            Ok(())
+        }
+        SocketOptionName::TCP(to) => {
+            let optval: ConstPtr<u32> = ConstPtr::from_usize(optval.as_usize());
+            let val = unsafe { optval.read_at_offset(0) }
+                .ok_or(Errno::EFAULT)?
+                .into_owned();
+            match to {
+                TcpOption::NODELAY | TcpOption::CORK => {
+                    // Some applications use Nagle's Algorithm (via the TCP_NODELAY option) for a similar effect.
+                    // However, TCP_CORK offers more fine-grained control, as it's designed for applications that
+                    // send variable-length chunks of data that don't necessarily fit nicely into a full TCP segment.
+                    // Because smoltcp does not support TCP_CORK, we emulate it by enabling/disabling Nagle's Algorithm.
+                    let on = if let TcpOption::NODELAY = to {
+                        val != 0
+                    } else {
+                        // CORK is the opposite of NODELAY
+                        val == 0
+                    };
+                    litebox_net()
+                        .lock()
+                        .set_tcp_option(fd, litebox::net::TcpOptionData::NODELAY(on))?;
+                    Ok(())
+                }
+                TcpOption::KEEPINTVL => {
+                    const MAX_TCP_KEEPINTVL: u32 = 32767;
+                    if !(1..=MAX_TCP_KEEPINTVL).contains(&val) {
+                        return Err(Errno::EINVAL);
+                    }
+                    litebox_net()
+                        .lock()
+                        .set_tcp_option(
+                            fd,
+                            litebox::net::TcpOptionData::KEEPALIVE(Some(
+                                core::time::Duration::from_secs(u64::from(val)),
+                            )),
+                        )
+                        .expect("set TCP_KEEPALIVE should succeed");
+                    Ok(())
+                }
+                TcpOption::KEEPCNT | TcpOption::KEEPIDLE => Err(Errno::EOPNOTSUPP),
+                _ => unimplemented!("TCP option {to:?}"),
             }
         }
     }
-
-    fn bind(&self, sockaddr: SocketAddr) -> Result<(), Errno> {
-        litebox_net()
-            .lock()
-            .bind(self.fd.as_ref().unwrap(), &sockaddr)
-            .map_err(Errno::from)
-    }
-
-    fn connect(&self, sockaddr: SocketAddr) -> Result<(), Errno> {
-        litebox_net()
-            .lock()
-            .connect(self.fd.as_ref().unwrap(), &sockaddr)
-            .map_err(Errno::from)
-    }
-
-    fn listen(&self, backlog: u16) -> Result<(), Errno> {
-        litebox_net()
-            .lock()
-            .listen(self.fd.as_ref().unwrap(), backlog)
-            .map_err(Errno::from)
-    }
-
-    fn try_sendto(
-        &self,
-        buf: &[u8],
-        flags: litebox::net::SendFlags,
-        sockaddr: Option<SocketAddr>,
-    ) -> Result<usize, Errno> {
-        let n = litebox_net()
-            .lock()
-            .send(self.fd.as_ref().unwrap(), buf, flags, sockaddr)?;
-        if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
-    }
-
-    pub(crate) fn sendto(
-        &self,
-        buf: &[u8],
-        flags: SendFlags,
-        sockaddr: Option<SocketAddr>,
-    ) -> Result<usize, Errno> {
-        // Convert `SendFlags` to `litebox::net::SendFlags`
-        // Note [`Network::send`] is non-blocking and `DONTWAIT` is handled below
-        // so we don't convert `DONTWAIT` here.
-        let new_flags = convert_flags!(
-            flags,
-            SendFlags,
-            litebox::net::SendFlags,
-            CONFIRM,
-            DONTROUTE,
-            EOR,
-            MORE,
-            NOSIGNAL,
-            OOB,
-        );
-
-        if self.get_status().contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT) {
-            self.try_sendto(buf, new_flags, sockaddr)
-        } else {
-            let timeout = self.options.lock().send_timeout;
-            if timeout.is_some() {
-                todo!("send timeout");
-            }
-
-            // TODO: use `poll` instead of busy wait
-            loop {
-                match self.try_sendto(buf, new_flags, sockaddr) {
-                    Err(Errno::EAGAIN) => {}
-                    ret => return ret,
-                }
-                core::hint::spin_loop();
-            }
-        }
-    }
-
-    fn try_receive(
-        &self,
-        buf: &mut [u8],
-        flags: litebox::net::ReceiveFlags,
-        source_addr: Option<&mut Option<SocketAddr>>,
-    ) -> Result<usize, Errno> {
-        let n = litebox_net()
-            .lock()
-            .receive(self.fd.as_ref().unwrap(), buf, flags, source_addr)?;
-        if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
-    }
-
-    pub(crate) fn receive(
-        &self,
-        buf: &mut [u8],
-        flags: ReceiveFlags,
-        mut source_addr: Option<&mut Option<SocketAddr>>,
-    ) -> Result<usize, Errno> {
-        // Convert `ReceiveFlags` to [`litebox::net::ReceiveFlags`]
-        // Note [`Network::receive`] is non-blocking and `DONTWAIT` is handled below
-        // so we don't convert `DONTWAIT` here.
-        let mut new_flags = convert_flags!(
-            flags,
-            ReceiveFlags,
-            litebox::net::ReceiveFlags,
-            CMSG_CLOEXEC,
-            ERRQUEUE,
-            OOB,
-            PEEK,
-            WAITALL,
-        );
-        // `MSG_TRUNC` behavior depends on the socket type
-        if flags.contains(ReceiveFlags::TRUNC) {
-            match self.sock_type {
-                SockType::Datagram | SockType::Raw => {
-                    new_flags.insert(litebox::net::ReceiveFlags::TRUNC);
-                }
-                SockType::Stream => {
-                    new_flags.insert(litebox::net::ReceiveFlags::DISCARD);
-                }
-                _ => unimplemented!(),
-            }
-        }
-
-        if self.get_status().contains(OFlags::NONBLOCK) || flags.contains(ReceiveFlags::DONTWAIT) {
-            self.try_receive(buf, new_flags, source_addr)
-        } else {
-            let timeout = self.options.lock().recv_timeout;
-            if timeout.is_some() {
-                todo!("recv timeout");
-            }
-
-            loop {
-                match self.try_receive(buf, new_flags, source_addr.as_deref_mut()) {
-                    Err(Errno::EAGAIN) => {}
-                    ret => return ret,
-                }
-                core::hint::spin_loop();
-            }
-        }
-    }
-
-    crate::syscalls::common_functions_for_file_status!();
 }
 
-impl litebox::event::IOPollable for Socket {
-    fn check_io_events(&self) -> Events {
-        litebox_net()
-            .lock()
-            .check_events(self.fd.as_ref().unwrap())
-            .expect("Invalid socket fd")
+fn getsockopt(
+    fd: &SocketFd,
+    optname: SocketOptionName,
+    optval: MutPtr<u8>,
+    optlen: MutPtr<u32>,
+) -> Result<(), Errno> {
+    let len = unsafe { optlen.read_at_offset(0).ok_or(Errno::EFAULT) }?.into_owned();
+    if len > i32::MAX as u32 {
+        return Err(Errno::EINVAL);
+    }
+    let new_len = match optname {
+        SocketOptionName::IP(ipopt) => match ipopt {
+            litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+        },
+        SocketOptionName::Socket(sopt) => {
+            match sopt {
+                SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER => {
+                    let tv = with_socket_options(fd, |options| match sopt {
+                        SocketOption::RCVTIMEO => options.recv_timeout,
+                        SocketOption::SNDTIMEO => options.send_timeout,
+                        SocketOption::LINGER => options.linger_timeout,
+                        _ => unreachable!(),
+                    })
+                    .map_or_else(
+                        litebox_common_linux::TimeVal::default,
+                        litebox_common_linux::TimeVal::from,
+                    );
+                    // If the provided buffer is too small, we just write as much as we can.
+                    let length = size_of::<litebox_common_linux::TimeVal>().min(len as usize);
+                    let data = unsafe {
+                        core::slice::from_raw_parts((&raw const tv).cast::<u8>(), length)
+                    };
+                    unsafe { optval.write_slice_at_offset(0, data) }.ok_or(Errno::EFAULT)?;
+                    length
+                }
+                _ => {
+                    let val = match sopt {
+                        SocketOption::TYPE => get_socket_type(fd)? as u32,
+                        SocketOption::REUSEADDR => {
+                            u32::from(with_socket_options(fd, |o| o.reuse_address))
+                        }
+                        SocketOption::BROADCAST => 1, // TODO: We don't support disabling SO_BROADCAST
+                        SocketOption::KEEPALIVE => {
+                            u32::from(with_socket_options(fd, |o| o.keep_alive))
+                        }
+                        SocketOption::RCVBUF | SocketOption::SNDBUF => {
+                            litebox::net::SOCKET_BUFFER_SIZE.truncate()
+                        }
+                        SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
+                        SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER => {
+                            unreachable!()
+                        }
+                    };
+                    // If the provided buffer is too small, we just write as much as we can.
+                    let length = size_of::<u32>().min(len as usize);
+                    let data = &val.to_ne_bytes()[..length];
+                    unsafe { optval.write_slice_at_offset(0, data) }.ok_or(Errno::EFAULT)?;
+                    length
+                }
+            }
+        }
+        SocketOptionName::TCP(tcpopt) => {
+            let val: u32 = match tcpopt {
+                TcpOption::KEEPINTVL => {
+                    let TcpOptionData::KEEPALIVE(interval) = litebox_net()
+                        .lock()
+                        .get_tcp_option(fd, litebox::net::TcpOptionName::KEEPALIVE)?
+                    else {
+                        unreachable!()
+                    };
+                    interval.map_or(0, |d| d.as_secs().try_into().unwrap())
+                }
+                TcpOption::NODELAY | TcpOption::CORK => {
+                    let TcpOptionData::NODELAY(nodelay) = litebox_net()
+                        .lock()
+                        .get_tcp_option(fd, litebox::net::TcpOptionName::NODELAY)?
+                    else {
+                        unreachable!()
+                    };
+                    u32::from(if let TcpOption::NODELAY = tcpopt {
+                        nodelay
+                    } else {
+                        // CORK is the opposite of NODELAY
+                        !nodelay
+                    })
+                }
+                TcpOption::KEEPCNT | TcpOption::KEEPIDLE => return Err(Errno::EOPNOTSUPP),
+                TcpOption::CONGESTION | TcpOption::INFO => {
+                    unimplemented!("TCP option {tcpopt:?}")
+                }
+            };
+            let data = &val.to_ne_bytes()[..size_of::<u32>().min(len as usize)];
+            unsafe { optval.write_slice_at_offset(0, data) }.ok_or(Errno::EFAULT)?;
+            size_of::<u32>()
+        }
+    };
+    unsafe { optlen.write_at_offset(0, new_len.truncate()) }.ok_or(Errno::EFAULT)?;
+    Ok(())
+}
+
+fn try_accept(fd: &SocketFd) -> Result<SocketFd, Errno> {
+    litebox_net().lock().accept(fd).map_err(Errno::from)
+}
+
+fn accept(fd: &SocketFd) -> Result<SocketFd, Errno> {
+    if get_status(fd).contains(OFlags::NONBLOCK) {
+        try_accept(fd)
+    } else {
+        // TODO: use `poll` instead of busy wait
+        loop {
+            match try_accept(fd) {
+                Err(Errno::EAGAIN) => {}
+                ret => return ret,
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+fn bind(fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
+    litebox_net()
+        .lock()
+        .bind(fd, &sockaddr)
+        .map_err(Errno::from)
+}
+
+fn connect(fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
+    litebox_net()
+        .lock()
+        .connect(fd, &sockaddr)
+        .map_err(Errno::from)
+}
+
+fn listen(fd: &SocketFd, backlog: u16) -> Result<(), Errno> {
+    litebox_net()
+        .lock()
+        .listen(fd, backlog)
+        .map_err(Errno::from)
+}
+
+fn try_sendto(
+    fd: &SocketFd,
+    buf: &[u8],
+    flags: litebox::net::SendFlags,
+    sockaddr: Option<SocketAddr>,
+) -> Result<usize, Errno> {
+    let n = litebox_net().lock().send(fd, buf, flags, sockaddr)?;
+    if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
+}
+
+pub(crate) fn sendto(
+    fd: &SocketFd,
+    buf: &[u8],
+    flags: SendFlags,
+    sockaddr: Option<SocketAddr>,
+) -> Result<usize, Errno> {
+    // Convert `SendFlags` to `litebox::net::SendFlags`
+    // Note [`Network::send`] is non-blocking and `DONTWAIT` is handled below
+    // so we don't convert `DONTWAIT` here.
+    let new_flags = convert_flags!(
+        flags,
+        SendFlags,
+        litebox::net::SendFlags,
+        CONFIRM,
+        DONTROUTE,
+        EOR,
+        MORE,
+        NOSIGNAL,
+        OOB,
+    );
+
+    if get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT) {
+        try_sendto(fd, buf, new_flags, sockaddr)
+    } else {
+        let timeout = with_socket_options(fd, |opt| opt.send_timeout);
+        if timeout.is_some() {
+            todo!("send timeout");
+        }
+
+        // TODO: use `poll` instead of busy wait
+        loop {
+            match try_sendto(fd, buf, new_flags, sockaddr) {
+                Err(Errno::EAGAIN) => {}
+                ret => return ret,
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+fn try_receive(
+    fd: &SocketFd,
+    buf: &mut [u8],
+    flags: litebox::net::ReceiveFlags,
+    source_addr: Option<&mut Option<SocketAddr>>,
+) -> Result<usize, Errno> {
+    let n = litebox_net().lock().receive(fd, buf, flags, source_addr)?;
+    if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
+}
+
+pub(crate) fn receive(
+    fd: &SocketFd,
+    buf: &mut [u8],
+    flags: ReceiveFlags,
+    mut source_addr: Option<&mut Option<SocketAddr>>,
+) -> Result<usize, Errno> {
+    // Convert `ReceiveFlags` to [`litebox::net::ReceiveFlags`]
+    // Note [`Network::receive`] is non-blocking and `DONTWAIT` is handled below
+    // so we don't convert `DONTWAIT` here.
+    let mut new_flags = convert_flags!(
+        flags,
+        ReceiveFlags,
+        litebox::net::ReceiveFlags,
+        CMSG_CLOEXEC,
+        ERRQUEUE,
+        OOB,
+        PEEK,
+        WAITALL,
+    );
+    // `MSG_TRUNC` behavior depends on the socket type
+    if flags.contains(ReceiveFlags::TRUNC) {
+        match get_socket_type(fd)? {
+            SockType::Datagram | SockType::Raw => {
+                new_flags.insert(litebox::net::ReceiveFlags::TRUNC);
+            }
+            SockType::Stream => {
+                new_flags.insert(litebox::net::ReceiveFlags::DISCARD);
+            }
+            _ => unimplemented!(),
+        }
     }
 
-    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
-        self.pollee.register_observer(observer, mask);
+    if get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(ReceiveFlags::DONTWAIT) {
+        try_receive(fd, buf, new_flags, source_addr)
+    } else {
+        let timeout = with_socket_options(fd, |opt| opt.recv_timeout);
+        if timeout.is_some() {
+            todo!("recv timeout");
+        }
+
+        // TODO: use `poll` instead of busy wait
+        loop {
+            match try_receive(fd, buf, new_flags, source_addr.as_deref_mut()) {
+                Err(Errno::EAGAIN) => {}
+                ret => return ret,
+            }
+            core::hint::spin_loop();
+        }
     }
+}
+
+fn get_socket_type(fd: &SocketFd) -> Result<SockType, Errno> {
+    crate::litebox()
+        .descriptor_table()
+        .with_metadata(fd, |sock_type: &SockType| *sock_type)
+        .map_err(|e| match e {
+            litebox::fd::MetadataError::NoSuchMetadata => Errno::ENOTSOCK,
+            litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
+        })
+}
+
+fn get_status(fd: &SocketFd) -> litebox::fs::OFlags {
+    litebox()
+        .descriptor_table()
+        .with_metadata(fd, |SocketOFlags(flags)| *flags)
+        .unwrap()
+        & litebox::fs::OFlags::STATUS_FLAGS_MASK
 }
 
 /// Handle syscall `socket`
@@ -583,13 +590,12 @@ pub(crate) fn sys_socket(
                 _ => unimplemented!(),
             };
             let socket = litebox_net().lock().socket(protocol)?;
-            Descriptor::Socket(alloc::sync::Arc::new(Socket::new(
-                socket,
-                ty,
-                flags,
-                crate::litebox(),
-                Events::empty(),
-            )))
+            initialize_socket(&socket, ty, flags);
+            Descriptor::LiteBoxRawFd(
+                crate::raw_descriptor_store()
+                    .write()
+                    .fd_into_raw_integer(socket),
+            )
         }
         AddressFamily::UNIX => todo!(),
         AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
@@ -681,18 +687,18 @@ pub(crate) fn sys_accept(
     let file_table = file_descriptors().read();
     let socket = file_table.get_fd(sockfd).ok_or(Errno::EBADF)?;
     let file = match socket {
-        Descriptor::Socket(socket) => {
-            let socket = socket.clone();
-            // drop file table as `accept` may block
-            drop(file_table);
-            let fd = socket.accept()?;
-            Descriptor::Socket(alloc::sync::Arc::new(Socket::new(
-                fd,
-                socket.sock_type,
-                flags,
-                crate::litebox(),
-                Events::empty(),
-            )))
+        Descriptor::LiteBoxRawFd(raw_fd) => {
+            with_socket_fd(*raw_fd, |fd| {
+                drop(file_table); // Drop before possibly-blocking `accept`
+                let sock_type = get_socket_type(fd)?;
+                let fd = accept(fd)?;
+                initialize_socket(&fd, sock_type, flags);
+                Ok(Descriptor::LiteBoxRawFd(
+                    crate::raw_descriptor_store()
+                        .write()
+                        .fd_into_raw_integer(fd),
+                ))
+            })?
         }
         _ => return Err(Errno::ENOTSOCK),
     };
@@ -709,10 +715,10 @@ pub(crate) fn sys_connect(fd: i32, sockaddr: SocketAddress) -> Result<(), Errno>
     };
 
     match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
-        Descriptor::Socket(socket) => {
+        Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
             let SocketAddress::Inet(addr) = sockaddr;
-            socket.connect(addr)
-        }
+            connect(fd, addr)
+        }),
         _ => Err(Errno::ENOTSOCK),
     }
 }
@@ -728,10 +734,10 @@ pub(crate) fn sys_bind(sockfd: i32, sockaddr: SocketAddress) -> Result<(), Errno
         .get_fd(sockfd)
         .ok_or(Errno::EBADF)?
     {
-        Descriptor::Socket(socket) => {
+        Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
             let SocketAddress::Inet(addr) = sockaddr;
-            socket.bind(addr)
-        }
+            bind(fd, addr)
+        }),
         _ => Err(Errno::ENOTSOCK),
     }
 }
@@ -747,7 +753,7 @@ pub(crate) fn sys_listen(sockfd: i32, backlog: u16) -> Result<(), Errno> {
         .get_fd(sockfd)
         .ok_or(Errno::EBADF)?
     {
-        Descriptor::Socket(socket) => socket.listen(backlog),
+        Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| listen(fd, backlog)),
         _ => Err(Errno::ENOTSOCK),
     }
 }
@@ -768,12 +774,11 @@ pub(crate) fn sys_sendto(
     let file_table = file_descriptors().read();
     let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
     match socket {
-        Descriptor::Socket(socket) => {
-            let socket = socket.clone();
-            // drop file table as `sendto` may block
-            drop(file_table);
-            socket.sendto(&buf, flags, sockaddr.map(|SocketAddress::Inet(addr)| addr))
-        }
+        Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
+            let sockaddr = sockaddr.map(|SocketAddress::Inet(addr)| addr);
+            drop(file_table); // Drop before possibly-blocking `sendto`
+            sendto(fd, &buf, flags, sockaddr)
+        }),
         _ => Err(Errno::ENOTSOCK),
     }
 }
@@ -791,15 +796,13 @@ pub(crate) fn sys_recvfrom(
     };
 
     let file_table = file_descriptors().read();
-    let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
-    match socket {
-        Descriptor::Socket(socket) => {
-            let socket = socket.clone();
-            // drop file table as `receive` may block
-            drop(file_table);
+    match file_table.get_fd(fd).ok_or(Errno::EBADF)? {
+        Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
             let mut buffer: [u8; 4096] = [0; 4096];
             let mut addr = None;
-            let size = socket.receive(
+            drop(file_table); // Drop before possibly-blocking `receive`
+            let size = receive(
+                fd,
                 &mut buffer,
                 flags,
                 if source_addr.is_some() {
@@ -814,7 +817,7 @@ pub(crate) fn sys_recvfrom(
             buf.copy_from_slice(0, &buffer[..size])
                 .ok_or(Errno::EFAULT)?;
             Ok(size)
-        }
+        }),
         _ => Err(Errno::ENOTSOCK),
     }
 }
@@ -834,7 +837,9 @@ pub(crate) fn sys_setsockopt(
         .get_fd(sockfd)
         .ok_or(Errno::EBADF)?
     {
-        Descriptor::Socket(socket) => socket.setsockopt(optname, optval, optlen),
+        Descriptor::LiteBoxRawFd(raw_fd) => {
+            with_socket_fd(*raw_fd, |fd| setsockopt(fd, optname, optval, optlen))
+        }
         _ => Err(Errno::ENOTSOCK),
     }
 }
@@ -855,7 +860,9 @@ pub(crate) fn sys_getsockopt(
         .get_fd(sockfd)
         .ok_or(Errno::EBADF)?
     {
-        Descriptor::Socket(socket) => socket.getsockopt(optname, optval, optlen),
+        Descriptor::LiteBoxRawFd(raw_fd) => {
+            with_socket_fd(*raw_fd, |fd| getsockopt(fd, optname, optval, optlen))
+        }
         _ => Err(Errno::ENOTSOCK),
     }
 }
@@ -871,11 +878,9 @@ pub(crate) fn sys_getsockname(sockfd: i32) -> Result<SocketAddr, Errno> {
         .get_fd(sockfd)
         .ok_or(Errno::EBADF)?
     {
-        Descriptor::Socket(socket) => {
-            let litebox_net = litebox_net();
-            let net = litebox_net.lock();
-            Ok(net.get_local_addr(socket.fd.as_ref().unwrap())?)
-        }
+        Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
+            litebox_net().lock().get_local_addr(fd).map_err(Errno::from)
+        }),
         _ => Err(Errno::ENOTSOCK),
     }
 }
