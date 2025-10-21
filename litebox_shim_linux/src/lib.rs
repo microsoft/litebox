@@ -35,7 +35,7 @@ pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
 
-type LinuxFS = litebox::fs::layered::FileSystem<
+pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
     Platform,
     litebox::fs::in_mem::FileSystem<Platform>,
     litebox::fs::layered::FileSystem<
@@ -45,7 +45,7 @@ type LinuxFS = litebox::fs::layered::FileSystem<
     >,
 >;
 
-type FileFd = litebox::fd::TypedFd<LinuxFS>;
+pub(crate) type FileFd = litebox::fd::TypedFd<LinuxFS>;
 
 type UserConstPointer<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 type UserMutPointer<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
@@ -325,23 +325,23 @@ pub(crate) fn file_descriptors<'a>() -> &'a RwLock<Platform, Descriptors> {
         .get_or_init(|| alloc::boxed::Box::new(litebox().sync().new_rwlock(Descriptors::new())))
 }
 
-pub(crate) fn run_on_raw_fd<R>(
+pub(crate) fn run_on_arc_raw_fd<R>(
     fd: usize,
-    fs: impl FnOnce(&TypedFd<LinuxFS>) -> R,
-    net: impl FnOnce(&TypedFd<litebox::net::Network<Platform>>) -> R,
+    fs: impl FnOnce(Arc<TypedFd<LinuxFS>>) -> R,
+    net: impl FnOnce(Arc<TypedFd<litebox::net::Network<Platform>>>) -> R,
 ) -> Result<R, Errno> {
     let rds = raw_descriptor_store().read();
     match rds.fd_from_raw_integer(fd) {
         Ok(fd) => {
             drop(rds);
-            Ok(fs(&fd))
+            Ok(fs(fd))
         }
         Err(ErrRawIntFd::NotFound) => Err(Errno::EBADF),
         Err(ErrRawIntFd::InvalidSubsystem) => {
             match rds.fd_from_raw_integer(fd) {
                 Ok(fd) => {
                     drop(rds);
-                    Ok(net(&fd))
+                    Ok(net(fd))
                 }
                 Err(ErrRawIntFd::NotFound) => unreachable!("fd shown to exist before"),
                 Err(ErrRawIntFd::InvalidSubsystem) => {
@@ -352,6 +352,14 @@ pub(crate) fn run_on_raw_fd<R>(
             }
         }
     }
+}
+
+pub(crate) fn run_on_raw_fd<R>(
+    fd: usize,
+    fs: impl FnOnce(&TypedFd<LinuxFS>) -> R,
+    net: impl FnOnce(&TypedFd<litebox::net::Network<Platform>>) -> R,
+) -> Result<R, Errno> {
+    run_on_arc_raw_fd(fd, |file_fd| fs(&file_fd), |socket_fd| net(&socket_fd))
 }
 
 /// Open a file

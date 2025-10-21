@@ -27,64 +27,91 @@ bitflags::bitflags! {
     }
 }
 
+pub(crate) enum EpollDescriptor {
+    PipeReader(Arc<litebox::pipes::ReadEnd<Platform, u8>>),
+    PipeWriter(Arc<litebox::pipes::WriteEnd<Platform, u8>>),
+    Eventfd(Arc<super::eventfd::EventFile<Platform>>),
+    Epoll(Arc<super::epoll::EpollFile>),
+    File(Arc<crate::FileFd>),
+    Socket(Arc<super::net::SocketFd>),
+}
+
+impl TryFrom<&Descriptor> for EpollDescriptor {
+    type Error = Errno;
+
+    fn try_from(desc: &Descriptor) -> Result<Self, Self::Error> {
+        match desc {
+            Descriptor::LiteBoxRawFd(fd) => {
+                crate::run_on_arc_raw_fd(*fd, EpollDescriptor::File, EpollDescriptor::Socket)
+            }
+            Descriptor::PipeReader { consumer, .. } => {
+                Ok(EpollDescriptor::PipeReader(consumer.clone()))
+            }
+            Descriptor::PipeWriter { producer, .. } => {
+                Ok(EpollDescriptor::PipeWriter(producer.clone()))
+            }
+            Descriptor::Eventfd { file, .. } => Ok(EpollDescriptor::Eventfd(file.clone())),
+            Descriptor::Epoll { file, .. } => Ok(EpollDescriptor::Epoll(file.clone())),
+        }
+    }
+}
+
 enum DescriptorRef {
     PipeReader(Weak<litebox::pipes::ReadEnd<Platform, u8>>),
     PipeWriter(Weak<litebox::pipes::WriteEnd<Platform, u8>>),
     Eventfd(Weak<crate::syscalls::eventfd::EventFile<litebox_platform_multiplex::Platform>>),
+    Epoll(Weak<super::epoll::EpollFile>),
+    File(Weak<crate::FileFd>),
+    Socket(Weak<super::net::SocketFd>),
 }
 
 impl DescriptorRef {
-    fn from(value: &Descriptor) -> Self {
+    fn from(value: &EpollDescriptor) -> Self {
         match value {
-            Descriptor::PipeReader { consumer, .. } => {
-                DescriptorRef::PipeReader(Arc::downgrade(consumer))
-            }
-            Descriptor::PipeWriter { producer, .. } => {
-                DescriptorRef::PipeWriter(Arc::downgrade(producer))
-            }
-            Descriptor::Eventfd { file, .. } => DescriptorRef::Eventfd(Arc::downgrade(file)),
-            _ => todo!(),
+            EpollDescriptor::PipeReader(consumer) => Self::PipeReader(Arc::downgrade(consumer)),
+            EpollDescriptor::PipeWriter(producer) => Self::PipeWriter(Arc::downgrade(producer)),
+            EpollDescriptor::Eventfd(file) => Self::Eventfd(Arc::downgrade(file)),
+            EpollDescriptor::Epoll(file) => Self::Epoll(Arc::downgrade(file)),
+            EpollDescriptor::File(file) => Self::File(Arc::downgrade(file)),
+            EpollDescriptor::Socket(socket) => Self::Socket(Arc::downgrade(socket)),
         }
     }
 
-    fn upgrade(&self) -> Option<Descriptor> {
+    fn upgrade(&self) -> Option<EpollDescriptor> {
         match self {
-            DescriptorRef::PipeReader(pipe) => {
-                pipe.upgrade().map(|consumer| Descriptor::PipeReader {
-                    consumer,
-                    close_on_exec: AtomicBool::new(false),
-                })
-            }
-            DescriptorRef::PipeWriter(pipe) => {
-                pipe.upgrade().map(|producer| Descriptor::PipeWriter {
-                    producer,
-                    close_on_exec: AtomicBool::new(false),
-                })
-            }
-            DescriptorRef::Eventfd(eventfd) => eventfd.upgrade().map(|file| Descriptor::Eventfd {
-                file,
-                close_on_exec: AtomicBool::new(false),
-            }),
-            _ => todo!(),
+            DescriptorRef::PipeReader(pipe) => pipe.upgrade().map(EpollDescriptor::PipeReader),
+            DescriptorRef::PipeWriter(pipe) => pipe.upgrade().map(EpollDescriptor::PipeWriter),
+            DescriptorRef::Eventfd(eventfd) => eventfd.upgrade().map(EpollDescriptor::Eventfd),
+            DescriptorRef::Epoll(epoll) => epoll.upgrade().map(EpollDescriptor::Epoll),
+            DescriptorRef::File(file) => file.upgrade().map(EpollDescriptor::File),
+            DescriptorRef::Socket(socket) => socket.upgrade().map(EpollDescriptor::Socket),
         }
     }
 }
 
-impl Descriptor {
+impl EpollDescriptor {
     /// Returns the interesting events now and monitors their occurrence in the future if the
     /// observer is provided.
-    fn poll(&self, mask: Events, observer: Option<Weak<dyn Observer<Events>>>) -> Events {
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "should be removed once polling on socket is implemented"
+    )]
+    fn poll(&self, mask: Events, observer: Option<Weak<dyn Observer<Events>>>) -> Option<Events> {
         let io_pollable: &dyn IOPollable = match self {
-            Descriptor::PipeReader { consumer, .. } => consumer,
-            Descriptor::PipeWriter { producer, .. } => producer,
-            Descriptor::Eventfd { file, .. } => file,
-            Descriptor::LiteBoxRawFd(fd) => return Events::OUT & mask, // TODO: handle properly
-            Descriptor::Epoll { file, .. } => todo!(),
+            EpollDescriptor::PipeReader(consumer) => consumer,
+            EpollDescriptor::PipeWriter(producer) => producer,
+            EpollDescriptor::Eventfd(file) => file,
+            EpollDescriptor::Epoll(file) => unimplemented!(),
+            EpollDescriptor::File(file) => {
+                // TODO: probably polling on stdio files, return dummy events for now
+                return Some(Events::OUT & mask);
+            }
+            EpollDescriptor::Socket(fd) => todo!(),
         };
         if let Some(observer) = observer {
             io_pollable.register_observer(observer, mask);
         }
-        io_pollable.check_io_events() & (mask | Events::ALWAYS_POLLED)
+        Some(io_pollable.check_io_events() & (mask | Events::ALWAYS_POLLED))
     }
 }
 
@@ -133,7 +160,7 @@ impl EpollFile {
         &self,
         op: EpollOp,
         fd: u32,
-        file: &Descriptor,
+        file: &EpollDescriptor,
         event: Option<EpollEvent>,
     ) -> Result<(), Errno> {
         match op {
@@ -149,7 +176,12 @@ impl EpollFile {
         }
     }
 
-    fn add_interest(&self, fd: u32, file: &Descriptor, event: EpollEvent) -> Result<(), Errno> {
+    fn add_interest(
+        &self,
+        fd: u32,
+        file: &EpollDescriptor,
+        event: EpollEvent,
+    ) -> Result<(), Errno> {
         let mut interests = self.interests.lock();
         let key = EpollEntryKey::new(fd, file);
         if let Some(entry) = interests.get(&key)
@@ -168,7 +200,9 @@ impl EpollFile {
             event.data,
             self.ready.clone(),
         );
-        let events = file.poll(mask, Some(entry.weak_self.clone() as _));
+        let events = file
+            .poll(mask, Some(entry.weak_self.clone() as _))
+            .ok_or(Errno::EBADF)?;
         // Add the new entry to the ready list if the file is ready
         if !events.is_empty() {
             self.ready.push(&entry);
@@ -177,7 +211,12 @@ impl EpollFile {
         Ok(())
     }
 
-    fn mod_interest(&self, fd: u32, file: &Descriptor, event: EpollEvent) -> Result<(), Errno> {
+    fn mod_interest(
+        &self,
+        fd: u32,
+        file: &EpollDescriptor,
+        event: EpollEvent,
+    ) -> Result<(), Errno> {
         // EPOLLEXCLUSIVE is not allowed for a EPOLL_CTL_MOD operation
         let flags = EpollFlags::from_bits_truncate(event.events);
         if flags.contains(EpollFlags::EXCLUSIVE) {
@@ -208,15 +247,22 @@ impl EpollFile {
         entry
             .is_enabled
             .store(true, core::sync::atomic::Ordering::Relaxed);
+        let observer = entry.weak_self.clone();
+        drop(inner);
 
         // re-register the observer with the new mask
-        let events = file.poll(mask, Some(entry.weak_self.clone() as _));
-        if !events.is_empty() {
-            // Add the updated entry to the ready list if the file is ready
-            self.ready.push(entry);
-        }
+        if let Some(events) = file.poll(mask, Some(observer as _)) {
+            if !events.is_empty() {
+                // Add the updated entry to the ready list if the file is ready
+                self.ready.push(entry);
+            }
 
-        Ok(())
+            Ok(())
+        } else {
+            // The file descriptor is closed, remove the entry
+            interests.remove(&key);
+            Err(Errno::ENOENT)
+        }
     }
 
     super::common_functions_for_file_status!();
@@ -225,13 +271,14 @@ impl EpollFile {
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct EpollEntryKey(u32, *const ());
 impl EpollEntryKey {
-    fn new(fd: u32, desc: &Descriptor) -> Self {
+    fn new(fd: u32, desc: &EpollDescriptor) -> Self {
         let ptr = match desc {
-            Descriptor::LiteBoxRawFd(raw_fd) => *raw_fd as _,
-            Descriptor::PipeReader { consumer, .. } => Arc::as_ptr(consumer).cast(),
-            Descriptor::PipeWriter { producer, .. } => Arc::as_ptr(producer).cast(),
-            Descriptor::Eventfd { file, .. } => Arc::as_ptr(file).cast(),
-            Descriptor::Epoll { .. } => todo!(),
+            EpollDescriptor::PipeReader(consumer) => Arc::as_ptr(consumer).cast(),
+            EpollDescriptor::PipeWriter(producer) => Arc::as_ptr(producer).cast(),
+            EpollDescriptor::Eventfd(file) => Arc::as_ptr(file).cast(),
+            EpollDescriptor::Epoll(file) => Arc::as_ptr(file).cast(),
+            EpollDescriptor::File(file) => Arc::as_ptr(file).cast(),
+            EpollDescriptor::Socket(socket_fd) => Arc::as_ptr(socket_fd).cast(),
         };
         Self(fd, ptr)
     }
@@ -281,7 +328,7 @@ impl EpollEntry {
             return None;
         }
 
-        let events = file.poll(inner.mask, None);
+        let events = file.poll(inner.mask, None)?;
         if events.is_empty() {
             Some((None, false))
         } else {
@@ -460,7 +507,9 @@ impl PollSet {
             for entry in &mut self.entries {
                 entry.revents = if entry.fd < 0 {
                     continue;
-                } else if let Some(file) = fds.get_fd(entry.fd) {
+                } else if let Some(file) = fds.get_fd(entry.fd)
+                    && let Ok(poll_descriptor) = EpollDescriptor::try_from(file)
+                {
                     let observer = if is_ready || !register {
                         // The poll set is already ready, or we have already
                         // registered the observer for this entry.
@@ -479,7 +528,9 @@ impl PollSet {
                         Some(weak as _)
                     };
                     // TODO: add machinery to unregister the observer to avoid leaks.
-                    file.poll(entry.mask, observer)
+                    poll_descriptor
+                        .poll(entry.mask, observer)
+                        .unwrap_or(Events::NVAL)
                 } else {
                     Events::NVAL
                 };
@@ -561,10 +612,7 @@ mod test {
         epoll
             .add_interest(
                 10,
-                &crate::Descriptor::Eventfd {
-                    file: eventfd.clone(),
-                    close_on_exec: core::sync::atomic::AtomicBool::new(false),
-                },
+                &super::EpollDescriptor::Eventfd(eventfd.clone()),
                 EpollEvent {
                     events: Events::IN.bits(),
                     data: 0,
@@ -585,10 +633,7 @@ mod test {
         let epoll = setup_epoll();
         let (producer, consumer) =
             litebox::pipes::new_pipe::<_, u8>(crate::litebox(), 2, OFlags::empty(), None);
-        let reader = crate::Descriptor::PipeReader {
-            consumer,
-            close_on_exec: core::sync::atomic::AtomicBool::new(false),
-        };
+        let reader = super::EpollDescriptor::PipeReader(consumer);
         epoll
             .add_interest(
                 10,
@@ -607,7 +652,7 @@ mod test {
         });
         epoll.wait(1024, None).unwrap();
         let mut buf = [0; 2];
-        let crate::Descriptor::PipeReader { consumer, .. } = reader else {
+        let super::EpollDescriptor::PipeReader(consumer) = reader else {
             unreachable!();
         };
         consumer.read(&mut buf).unwrap();
