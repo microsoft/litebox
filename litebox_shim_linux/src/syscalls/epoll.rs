@@ -142,23 +142,23 @@ impl EpollFile {
         timeout: Option<Duration>,
     ) -> Result<Vec<EpollEvent>, Errno> {
         with_current_task(|task| {
-        let mut events = Vec::new();
-        match self.ready.pollee.wait_or_timeout(
+            let mut events = Vec::new();
+            match self.ready.pollee.wait_or_timeout(
                 task,
-            timeout,
-            || {
-                self.ready.pop_multiple(maxevents, &mut events);
-                if events.is_empty() {
-                    return Err(litebox::event::polling::TryOpError::<Errno>::TryAgain);
-                }
-                Ok(())
-            },
-            || self.ready.check_io_events().contains(Events::IN),
-        ) {
-            Ok(()) | Err(litebox::event::polling::TryOpError::TimedOut) => {}
-            Err(e) => return Err(e.into()),
-        }
-        Ok(events)
+                timeout,
+                || {
+                    self.ready.pop_multiple(maxevents, &mut events);
+                    if events.is_empty() {
+                        return Err(litebox::event::polling::TryOpError::<Errno>::TryAgain);
+                    }
+                    Ok(())
+                },
+                || self.ready.check_io_events().contains(Events::IN),
+            ) {
+                Ok(()) | Err(litebox::event::polling::TryOpError::TimedOut) => {}
+                Err(e) => return Err(e.into()),
+            }
+            Ok(events)
         })
     }
 
@@ -508,57 +508,57 @@ impl PollSet {
         with_current_task(|task| {
             let mut woken = Arc::new(AtomicBool::new(false));
             let platform = task.platform;
-        let start_time = platform.now();
-        let mut register = true;
-        let mut is_ready = timeout.is_some_and(|t| t.is_zero());
-        loop {
-            let mut fds = lock_fds();
-            for entry in &mut self.entries {
-                entry.revents = if entry.fd < 0 {
-                    continue;
-                } else if let Some(file) = fds.get_fd(entry.fd)
-                    && let Ok(poll_descriptor) = EpollDescriptor::try_from(file)
-                {
-                    let observer = if is_ready || !register {
-                        // The poll set is already ready, or we have already
-                        // registered the observer for this entry.
-                        None
-                    } else {
-                        // TODO: a separate allocation is necessary here
-                        // because registering an observer twice with two
-                        // different event masks results in the last one
-                        // replacing the first. If this is changed to
-                        // instead OR the new registration into the existing
-                        // one, then we can use a single observer for all
-                        // entries.
+            let start_time = platform.now();
+            let mut register = true;
+            let mut is_ready = timeout.is_some_and(|t| t.is_zero());
+            loop {
+                let mut fds = lock_fds();
+                for entry in &mut self.entries {
+                    entry.revents = if entry.fd < 0 {
+                        continue;
+                    } else if let Some(file) = fds.get_fd(entry.fd)
+                        && let Ok(poll_descriptor) = EpollDescriptor::try_from(file)
+                    {
+                        let observer = if is_ready || !register {
+                            // The poll set is already ready, or we have already
+                            // registered the observer for this entry.
+                            None
+                        } else {
+                            // TODO: a separate allocation is necessary here
+                            // because registering an observer twice with two
+                            // different event masks results in the last one
+                            // replacing the first. If this is changed to
+                            // instead OR the new registration into the existing
+                            // one, then we can use a single observer for all
+                            // entries.
                             let observer = Arc::new(PollEntryObserver {
                                 waker: task.as_waiter().waker(),
                                 woken: woken.clone(),
                             });
-                        let weak = Arc::downgrade(&observer);
-                        entry.observer = Some(observer);
-                        Some(weak as _)
+                            let weak = Arc::downgrade(&observer);
+                            entry.observer = Some(observer);
+                            Some(weak as _)
+                        };
+                        // TODO: add machinery to unregister the observer to avoid leaks.
+                        poll_descriptor
+                            .poll(entry.mask, observer)
+                            .unwrap_or(Events::NVAL)
+                    } else {
+                        Events::NVAL
                     };
-                    // TODO: add machinery to unregister the observer to avoid leaks.
-                    poll_descriptor
-                        .poll(entry.mask, observer)
-                        .unwrap_or(Events::NVAL)
-                } else {
-                    Events::NVAL
-                };
-                if !entry.revents.is_empty() {
-                    is_ready = true;
-                    register = false;
+                    if !entry.revents.is_empty() {
+                        is_ready = true;
+                        register = false;
+                    }
                 }
-            }
-            drop(fds);
+                drop(fds);
 
-            if is_ready {
-                break;
-            }
+                if is_ready {
+                    break;
+                }
 
-            // Don't register observers again in the next iteration.
-            register = false;
+                // Don't register observers again in the next iteration.
+                register = false;
 
                 match task.as_waiter().wait_or_timeout(
                     timeout.map(|t| t - platform.now().duration_since(&start_time)),
@@ -568,15 +568,15 @@ impl PollSet {
                         woken.store(false, Ordering::SeqCst);
                     }
                     Err(WaitError::TimedOut) => {
-                    // Timed out. Loop around once more to check if any fds are
-                    // ready, to match Linux behavior.
-                    is_ready = true;
-                }
+                        // Timed out. Loop around once more to check if any fds are
+                        // ready, to match Linux behavior.
+                        is_ready = true;
+                    }
                     Err(WaitError::Interrupted) => {
                         return Err(Errno::EINTR);
+                    }
+                }
             }
-        }
-    }
             Ok(())
         })
     }
