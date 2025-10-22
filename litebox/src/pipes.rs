@@ -27,6 +27,215 @@ use crate::{
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
 
+/// Support for unidirectional communication channels
+pub struct Pipes<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    litebox: LiteBox<Platform>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
+    /// Construct a new `Pipes` instance.
+    ///
+    /// This function is expected to only be invoked once per platform, as an initialization step,
+    /// and the created `Pipes` handle is expected to be shared across all usage over the system.
+    pub fn new(litebox: &LiteBox<Platform>) -> Self {
+        Self {
+            litebox: litebox.clone(),
+        }
+    }
+
+    /// Create a unidirectional communication channel that sending messages of (slices of) bytes.
+    ///
+    /// This function returns the sender and receiver halves respectively.
+    ///
+    /// `capacity` defines the maximum capacity of the channel, beyond which it will block or refuse to
+    /// write, depending on flags.
+    ///
+    /// `flags` sets up the initial flags for the channel.
+    ///
+    /// `atomic_slice_guarantee_size` (if provided) is the number of elements that are guaranteed to be
+    /// written atomically (i.e., not interleaved with other writes) if a slice of those many (or fewer)
+    /// elements are passed at once. Slices longer than this length have no guarantees on atomicity of
+    /// writes and might be interleaved with other writes.
+    pub fn create_pipe(
+        &self,
+        capacity: usize,
+        flags: Flags,
+        atomic_slice_guarantee_size: Option<NonZeroUsize>,
+    ) -> (PipeFd<Platform>, PipeFd<Platform>) {
+        let (sender, receiver) = new_pipe::<Platform, u8>(
+            &self.litebox,
+            capacity,
+            OFlags::from(flags),
+            atomic_slice_guarantee_size,
+        );
+        let sender = PipeEnd::Sender(sender);
+        let receiver = PipeEnd::Receiver(receiver);
+        let mut dt = self.litebox.descriptor_table_mut();
+        let sender = dt.insert(sender);
+        let receiver = dt.insert(receiver);
+        (sender, receiver)
+    }
+
+    /// Close the pipe at at `fd`.
+    ///
+    /// Future operations on the `fd` will start to return `ClosedFd` errors.
+    pub fn close(&self, fd: &PipeFd<Platform>) -> Result<(), errors::CloseError> {
+        self.litebox.descriptor_table_mut().remove(fd);
+        // Shutdowns are taken care of automatically by the drop implementations
+        Ok(())
+    }
+
+    /// Read values in the pipe into `buf`, returning the number of elements read.
+    ///
+    /// See [`Self::create_pipe`] for details on blocking behavior.
+    pub fn read(&self, fd: &PipeFd<Platform>, buf: &mut [u8]) -> Result<usize, errors::ReadError> {
+        let dt = self.litebox.descriptor_table();
+        let p = match &dt.get_entry(fd).ok_or(errors::ReadError::ClosedFd)?.entry {
+            PipeEnd::Receiver(p) => Arc::clone(p),
+            PipeEnd::Sender(_) => return Err(errors::ReadError::NotForReading),
+        };
+        drop(dt);
+        p.read(buf).map_err(From::from)
+    }
+
+    /// Write the values in `buf` into the pipe, returning the number of elements written.
+    ///
+    /// See [`Self::create_pipe`] for details on blocking and atomicity of writes.
+    pub fn write(&self, fd: &PipeFd<Platform>, buf: &[u8]) -> Result<usize, errors::WriteError> {
+        let dt = self.litebox.descriptor_table();
+        let p = match &dt.get_entry(fd).ok_or(errors::WriteError::ClosedFd)?.entry {
+            PipeEnd::Sender(p) => Arc::clone(p),
+            PipeEnd::Receiver(_) => return Err(errors::WriteError::NotForWriting),
+        };
+        drop(dt);
+        p.write(buf).map_err(From::from)
+    }
+
+    /// Whether the provided FD points to a reader or a writer end.
+    pub fn half_pipe_type(
+        &self,
+        fd: &PipeFd<Platform>,
+    ) -> Result<HalfPipeType, errors::ClosedError> {
+        let dt = self.litebox.descriptor_table();
+        match dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
+            PipeEnd::Sender(_) => Ok(HalfPipeType::SenderHalf),
+            PipeEnd::Receiver(_) => Ok(HalfPipeType::ReceiverHalf),
+        }
+    }
+
+    /// Get the flags set on the pipe at `fd`.
+    pub fn get_flags(&self, fd: &PipeFd<Platform>) -> Result<Flags, errors::ClosedError> {
+        let dt = self.litebox.descriptor_table();
+        let oflags = match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
+            PipeEnd::Receiver(p) => p.get_status(),
+            PipeEnd::Sender(p) => p.get_status(),
+        };
+        Ok(Flags::from_oflags_truncate(oflags))
+    }
+
+    /// Update the flags set on the pipe at `fd`.
+    ///
+    /// Specifically, sets the bits in the `mask` to `on`, leaving the others unchanged.
+    pub fn update_flags(
+        &self,
+        fd: &PipeFd<Platform>,
+        mask: Flags,
+        on: bool,
+    ) -> Result<(), errors::ClosedError> {
+        let dt = self.litebox.descriptor_table();
+        match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
+            PipeEnd::Receiver(p) => p.set_status(OFlags::from(mask), on),
+            PipeEnd::Sender(p) => p.set_status(OFlags::from(mask), on),
+        }
+        Ok(())
+    }
+}
+
+/// Whether a particular pipe end is the sender half or the receiver half
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HalfPipeType {
+    SenderHalf,
+    ReceiverHalf,
+}
+
+enum PipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    Receiver(Arc<ReadEnd<Platform, u8>>),
+    Sender(Arc<WriteEnd<Platform, u8>>),
+}
+
+bitflags::bitflags! {
+    /// Flags for controlling the pipe behaviors.
+    #[repr(transparent)]
+    #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+    pub struct Flags: u32 {
+        /// `NON_BLOCKING` impacts what happens when a full channel is written or, or an empty
+        /// channel is read from. If set, the operations returns immediately with a `WouldBlock`
+        /// error.
+        const NON_BLOCKING = 0x1;
+    }
+}
+
+impl Flags {
+    fn from_oflags_truncate(oflags: OFlags) -> Self {
+        let mut flags = Flags::empty();
+        flags.set(Flags::NON_BLOCKING, oflags.contains(OFlags::NONBLOCK));
+        flags
+    }
+}
+impl From<Flags> for OFlags {
+    fn from(flags: Flags) -> Self {
+        let mut oflags = OFlags::empty();
+        oflags.set(OFlags::NONBLOCK, flags.contains(Flags::NON_BLOCKING));
+        oflags
+    }
+}
+
+pub mod errors {
+    #[expect(
+        unused_imports,
+        reason = "used for doc string links to work out, but not for code"
+    )]
+    use super::Pipes;
+
+    use thiserror::Error;
+
+    /// Possible errors from [`Pipes::close`]
+    #[non_exhaustive]
+    #[derive(Error, Debug)]
+    pub enum CloseError {}
+
+    /// Possible errors from [`Pipes::read`]
+    #[non_exhaustive]
+    #[derive(Error, Debug)]
+    pub enum ReadError {
+        #[error("not an open file descriptor")]
+        ClosedFd,
+        #[error("not open for reading")]
+        NotForReading,
+        #[error("read would block")]
+        WouldBlock,
+    }
+
+    /// Possible errors from [`Pipes::write`]
+    #[non_exhaustive]
+    #[derive(Error, Debug)]
+    pub enum WriteError {
+        #[error("not an open file descriptor")]
+        ClosedFd,
+        #[error("not open for writeing")]
+        NotForWriting,
+        #[error("write would block")]
+        WouldBlock,
+    }
+
+    /// Possible errors from functions that always succeed unless the descriptor is closed.
+    #[derive(Error, Debug)]
+    pub enum ClosedError {
+        #[error("not an open file descriptor")]
+        ClosedFd,
+    }
+}
+
 struct EndPointer<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
     rb: Mutex<Platform, T>,
     pollee: Pollee<Platform>,
@@ -106,6 +315,23 @@ pub enum PipeError {
     Closed,
     #[error("this operation would block")]
     WouldBlock,
+}
+
+impl From<PipeError> for errors::ReadError {
+    fn from(err: PipeError) -> Self {
+        match err {
+            PipeError::Closed => errors::ReadError::ClosedFd,
+            PipeError::WouldBlock => errors::ReadError::WouldBlock,
+        }
+    }
+}
+impl From<PipeError> for errors::WriteError {
+    fn from(err: PipeError) -> Self {
+        match err {
+            PipeError::Closed => errors::WriteError::ClosedFd,
+            PipeError::WouldBlock => errors::WriteError::WouldBlock,
+        }
+    }
 }
 
 impl From<TryOpError<PipeError>> for PipeError {
@@ -369,7 +595,7 @@ pub fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
 
 #[cfg(test)]
 mod tests {
-    use crate::pipes::PipeError;
+    use crate::pipes::errors::{ReadError, WriteError};
 
     extern crate std;
 
@@ -377,78 +603,95 @@ mod tests {
     fn test_blocking_channel() {
         let platform = crate::platform::mock::MockPlatform::new();
         let litebox = crate::LiteBox::new(platform);
+        let pipes = &super::Pipes::new(&litebox);
 
-        let (prod, cons) = super::new_pipe(&litebox, 2, crate::fs::OFlags::empty(), None);
-        std::thread::spawn(move || {
-            let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let (prod, cons) = pipes.create_pipe(2, super::Flags::empty(), None);
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+                let mut i = 0;
+                while i < data.len() {
+                    let ret = pipes.write(&prod, &data[i..]).unwrap();
+                    i += ret;
+                }
+                pipes.close(&prod).unwrap();
+                assert_eq!(i, data.len());
+            });
+
+            let mut buf = [0; 10];
             let mut i = 0;
-            while i < data.len() {
-                let ret = prod.write(&data[i..]).unwrap();
+            loop {
+                let ret = pipes.read(&cons, &mut buf[i..]).unwrap();
+                if ret == 0 {
+                    pipes.close(&cons).unwrap();
+                    break;
+                }
                 i += ret;
             }
-            prod.shutdown();
-            assert_eq!(i, data.len());
+            assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         });
-
-        let mut buf = [0; 10];
-        let mut i = 0;
-        loop {
-            let ret = cons.read(&mut buf[i..]).unwrap();
-            if ret == 0 {
-                cons.shutdown();
-                break;
-            }
-            i += ret;
-        }
-        assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     }
 
     #[test]
     fn test_nonblocking_channel() {
         let platform = crate::platform::mock::MockPlatform::new();
         let litebox = crate::LiteBox::new(platform);
+        let pipes = &super::Pipes::new(&litebox);
 
-        let (prod, cons) = super::new_pipe(&litebox, 2, crate::fs::OFlags::NONBLOCK, None);
-        std::thread::spawn(move || {
-            let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let (prod, cons) = pipes.create_pipe(2, super::Flags::NON_BLOCKING, None);
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+                let mut i = 0;
+                while i < data.len() {
+                    match pipes.write(&prod, &data[i..]) {
+                        Ok(n) => {
+                            i += n;
+                        }
+                        Err(WriteError::WouldBlock) => {
+                            // busy wait
+                            // TODO: use poll rather than busy wait
+                        }
+                        Err(e) => {
+                            panic!("Error writing to channel: {:?}", e);
+                        }
+                    }
+                }
+                pipes.close(&prod).unwrap();
+                assert_eq!(i, data.len());
+            });
+
+            let mut buf = [0; 10];
             let mut i = 0;
-            while i < data.len() {
-                match prod.write(&data[i..]) {
+            loop {
+                match pipes.read(&cons, &mut buf[i..]) {
                     Ok(n) => {
+                        if n == 0 {
+                            break;
+                        }
                         i += n;
                     }
-                    Err(PipeError::WouldBlock) => {
+                    Err(ReadError::WouldBlock) => {
                         // busy wait
                         // TODO: use poll rather than busy wait
                     }
                     Err(e) => {
-                        panic!("Error writing to channel: {:?}", e);
+                        panic!("Error reading from channel: {:?}", e);
                     }
                 }
             }
-            prod.shutdown();
-            assert_eq!(i, data.len());
+            pipes.close(&cons).unwrap();
+            assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         });
-
-        let mut buf = [0; 10];
-        let mut i = 0;
-        loop {
-            match cons.read(&mut buf[i..]) {
-                Ok(n) => {
-                    if n == 0 {
-                        break;
-                    }
-                    i += n;
-                }
-                Err(PipeError::WouldBlock) => {
-                    // busy wait
-                    // TODO: use poll rather than busy wait
-                }
-                Err(e) => {
-                    panic!("Error reading from channel: {:?}", e);
-                }
-            }
-        }
-        assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     }
+}
+
+crate::fd::enable_fds_for_subsystem! {
+    @Platform: { RawSyncPrimitivesProvider + TimeProvider };
+    Pipes<Platform>;
+    @Platform: { RawSyncPrimitivesProvider + TimeProvider };
+    PipeEnd<Platform>;
+    -> PipeFd<Platform>;
 }
