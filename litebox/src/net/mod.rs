@@ -614,7 +614,7 @@ where
     }
 
     /// Close the `socket_handle`
-    fn close_handle(&mut self, mut socket_handle: SocketHandle) {
+    fn close_handle(&mut self, mut socket_handle: SocketHandle<Platform>) {
         let socket = self.socket_set.remove(socket_handle.handle);
         match socket {
             smoltcp::socket::Socket::Raw(_) | smoltcp::socket::Socket::Icmp(_) => {
@@ -629,7 +629,7 @@ where
                 }
                 // TODO: Should we `.close()` or should we `.abort()`?
                 socket.abort();
-                socket_handle.entry.pollee.notify_observers(Events::HUP);
+                socket_handle.pollee.notify_observers(Events::HUP);
             }
         }
         self.automated_platform_interaction(PollDirection::Both);
@@ -1214,15 +1214,19 @@ where
     }
 
     /// Register an observer for events on a socket.
+    ///
+    /// Returns `None` if the `fd` is closed.
     pub fn register_observer(
         &self,
         fd: &SocketFd<Platform>,
         observer: alloc::sync::Weak<dyn crate::event::observer::Observer<Events>>,
         mask: Events,
-    ) {
+    ) -> Option<()> {
         let descriptor_table = self.litebox.descriptor_table();
-        let table_entry = descriptor_table.get_entry(fd);
-        table_entry.entry.pollee.register_observer(observer, mask);
+        let table_entry = descriptor_table.get_entry(fd)?;
+        let entry = &table_entry.entry;
+        entry.pollee.register_observer(observer, mask);
+        Some(())
     }
 
     /// Get the [`Events`] for a socket [`SocketFd`].
@@ -1230,7 +1234,7 @@ where
         let descriptor_table = self.litebox.descriptor_table();
         let table_entry = descriptor_table.get_entry(fd)?;
         let socket_handle = &table_entry.entry;
-        self.check_socket_events(socket_handle, false)
+        Some(self.check_socket_events(socket_handle, false))
     }
 
     /// Get the [`Events`] for a socket handle [`SocketHandle`].
@@ -1240,9 +1244,10 @@ where
         &self,
         socket_handle: &SocketHandle<Platform>,
         new_events_only: bool,
-    ) -> Option<Events> {
+    ) -> Events {
         if socket_handle.consider_closed {
-            return None;
+            // TODO: update this when we support graceful close
+            return Events::empty();
         }
         let mut events = Events::empty();
         let recv_queue_last = socket_handle
@@ -1324,7 +1329,7 @@ where
             }
         }
 
-        Some(events)
+        events
     }
 }
 

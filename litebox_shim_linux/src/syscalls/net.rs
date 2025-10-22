@@ -3,7 +3,6 @@
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use litebox::{
-    event::{Events, observer::Observer},
     fs::OFlags,
     net::TcpOptionData,
     platform::{RawConstPointer as _, RawMutPointer as _},

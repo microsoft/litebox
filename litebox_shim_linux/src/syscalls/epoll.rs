@@ -97,7 +97,14 @@ impl EpollDescriptor {
                 // TODO: probably polling on stdio files, return dummy events for now
                 return Some(Events::OUT & mask);
             }
-            EpollDescriptor::Socket(fd) => todo!(),
+            EpollDescriptor::Socket(fd) => {
+                let net = crate::litebox_net().lock();
+                if let Some(observer) = observer {
+                    net.register_observer(fd, observer, mask)?;
+                }
+                let events = net.check_events(fd)?;
+                return Some(events & (mask | Events::ALWAYS_POLLED));
+            }
             EpollDescriptor::Pipe(fd) => {
                 return crate::litebox_pipes().read().with_iopollable(fd, poll).ok();
             }
