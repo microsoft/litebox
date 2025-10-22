@@ -7,7 +7,7 @@ use alloc::{
 };
 use litebox::{
     event::Events,
-    fd::MetadataError,
+    fd::{FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{FileSystem as _, Mode, OFlags, SeekWhence},
     path,
     platform::{RawConstPointer, RawMutPointer},
@@ -18,10 +18,10 @@ use litebox_common_linux::{
     IoWriteVec, IoctlArg, errno::Errno,
 };
 
-use crate::with_current_task;
 use crate::{
     ConstPtr, Descriptor, MutPtr, file_descriptors, litebox, litebox_fs, raw_descriptor_store,
 };
+use crate::{litebox_pipes, with_current_task};
 use core::sync::atomic::Ordering;
 
 pub(crate) struct FsState {
@@ -161,6 +161,7 @@ pub(crate) fn sys_ftruncate(fd: i32, length: usize) -> Result<(), Errno> {
                     .map_err(Errno::from)
             },
             |_fd| todo!("net"),
+            |fd| todo!("pipes"),
         ),
         _ => Err(Errno::EINVAL),
     }
@@ -203,11 +204,13 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
     let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
     match desc {
         Descriptor::LiteBoxRawFd(raw_fd) => {
+            let raw_fd = *raw_fd;
+            drop(file_table);
             // We need to do this cell dance because otherwise Rust can't recognize that the two
             // closures are mutually exclusive.
             let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
             crate::run_on_raw_fd(
-                *raw_fd,
+                raw_fd,
                 |fd| {
                     litebox_fs()
                         .read(fd, &mut buf.borrow_mut(), offset)
@@ -221,15 +224,16 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
                         None,
                     )
                 },
+                |fd| {
+                    litebox_pipes()
+                        .read()
+                        .read(fd, &mut buf.borrow_mut())
+                        .map_err(Errno::from)
+                },
             )
             .flatten()
         }
-        Descriptor::PipeReader { consumer, .. } => {
-            let consumer = consumer.clone();
-            drop(file_table);
-            Ok(consumer.read(buf)?)
-        }
-        Descriptor::PipeWriter { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
+        Descriptor::Epoll { .. } => Err(Errno::EINVAL),
         Descriptor::Eventfd { file, .. } => {
             let file = file.clone();
             drop(file_table);
@@ -254,18 +258,18 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
     let file_table = file_descriptors().read();
     let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
     match desc {
-        Descriptor::LiteBoxRawFd(raw_fd) => crate::run_on_raw_fd(
-            *raw_fd,
-            |fd| litebox_fs().write(fd, buf, offset).map_err(Errno::from),
-            |fd| super::net::sendto(fd, buf, litebox_common_linux::SendFlags::empty(), None),
-        )
-        .flatten(),
-        Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
-        Descriptor::PipeWriter { producer, .. } => {
-            let producer = producer.clone();
+        Descriptor::LiteBoxRawFd(raw_fd) => {
+            let raw_fd = *raw_fd;
             drop(file_table);
-            Ok(producer.write(buf)?)
+            crate::run_on_raw_fd(
+                raw_fd,
+                |fd| litebox_fs().write(fd, buf, offset).map_err(Errno::from),
+                |fd| super::net::sendto(fd, buf, litebox_common_linux::SendFlags::empty(), None),
+                |fd| litebox_pipes().read().write(fd, buf).map_err(Errno::from),
+            )
+            .flatten()
         }
+        Descriptor::Epoll { .. } => Err(Errno::EINVAL),
         Descriptor::Eventfd { file, .. } => {
             let file = file.clone();
             drop(file_table);
@@ -316,12 +320,10 @@ pub fn sys_lseek(fd: i32, offset: isize, whence: SeekWhence) -> Result<usize, Er
             *raw_fd,
             |fd| litebox_fs().seek(fd, offset, whence).map_err(Errno::from),
             |_| Err(Errno::ESPIPE),
+            |_| Err(Errno::ESPIPE),
         )
         .flatten(),
-        Descriptor::PipeReader { .. }
-        | Descriptor::Epoll { .. }
-        | Descriptor::PipeWriter { .. }
-        | Descriptor::Eventfd { .. } => Err(Errno::ESPIPE),
+        Descriptor::Epoll { .. } | Descriptor::Eventfd { .. } => Err(Errno::ESPIPE),
     }
 }
 
@@ -343,26 +345,32 @@ pub(crate) fn do_close(desc: Descriptor) -> Result<(), Errno> {
                 Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
                 Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
                     match rds
-                            .fd_consume_raw_integer::<litebox::net::Network<litebox_platform_multiplex::Platform>>(raw_fd)
-                        {
-                            Ok(fd) => {
-                                drop(rds);
-                                crate::litebox_net().lock().close(&fd).map_err(Errno::from)
-                            },
-                            Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
-                            Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
-                                // We currently only have net and fs FDs at the moment, if/when we add
-                                // more, we need to expand this out too.
-                                unreachable!()
+                        .fd_consume_raw_integer::<litebox::net::Network<litebox_platform_multiplex::Platform>>(raw_fd)
+                    {
+                        Ok(fd) => {
+                            drop(rds);
+                            crate::litebox_net().lock().close(&fd).map_err(Errno::from)
+                        },
+                        Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
+                        Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
+                            match rds.fd_consume_raw_integer::<litebox::pipes::Pipes<litebox_platform_multiplex::Platform>>(raw_fd) {
+                                Ok(fd) => {
+                                    drop(rds);
+                                    litebox_pipes().read().close(&fd).map_err(Errno::from)
+                                }
+                                Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
+                                Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
+                                    // We currently only have fs, net and pipes FDs at the moment,
+                                    // if/when we add more, we need to expand this out too.
+                                    unreachable!()
+                                }
                             }
                         }
+                    }
                 }
             }
         }
-        Descriptor::PipeReader { .. }
-        | Descriptor::PipeWriter { .. }
-        | Descriptor::Eventfd { .. }
-        | Descriptor::Epoll { .. } => Ok(()),
+        Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } => Ok(()),
     }
 }
 
@@ -418,10 +426,10 @@ pub fn sys_readv(
                         .map_err(Errno::from)
                 },
                 |fd| todo!("net"),
+                |fd| todo!("pipes"),
             )
             .flatten()?,
-            Descriptor::PipeReader { consumer, .. } => todo!(),
-            Descriptor::PipeWriter { .. } | Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
+            Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
             Descriptor::Eventfd { file, .. } => todo!(),
         };
         iov.iov_base
@@ -485,10 +493,10 @@ pub fn sys_writev(
                     super::net::sendto(fd, buf, litebox_common_linux::SendFlags::empty(), None)
                 })
             },
+            |fd| todo!("pipes"),
         )
         .flatten(),
-        Descriptor::PipeReader { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
-        Descriptor::PipeWriter { producer, .. } => todo!(),
+        Descriptor::Epoll { .. } => Err(Errno::EINVAL),
         Descriptor::Eventfd { file, .. } => todo!(),
     }
 }
@@ -576,38 +584,31 @@ impl Descriptor {
                         .map_err(Errno::from)
                 },
                 |fd| todo!("net"),
+                |fd| {
+                    let half_pipe_type = litebox_pipes().read().half_pipe_type(fd)?;
+                    let read_write_mode = match half_pipe_type {
+                        litebox::pipes::HalfPipeType::SenderHalf => Mode::WUSR,
+                        litebox::pipes::HalfPipeType::ReceiverHalf => Mode::RUSR,
+                    };
+                    Ok(FileStat {
+                        // TODO: give correct values
+                        st_dev: 0,
+                        st_ino: 0,
+                        st_nlink: 1,
+                        st_mode: (read_write_mode.bits()
+                            | litebox_common_linux::InodeType::NamedPipe as u32)
+                            .truncate(),
+                        st_uid: 0,
+                        st_gid: 0,
+                        st_rdev: 0,
+                        st_size: 0,
+                        st_blksize: 4096,
+                        st_blocks: 0,
+                        ..Default::default()
+                    })
+                },
             )
             .flatten()?,
-            Descriptor::PipeReader { .. } => FileStat {
-                // TODO: give correct values
-                st_dev: 0,
-                st_ino: 0,
-                st_nlink: 1,
-                st_mode: (Mode::RUSR.bits() | litebox_common_linux::InodeType::NamedPipe as u32)
-                    .truncate(),
-                st_uid: 0,
-                st_gid: 0,
-                st_rdev: 0,
-                st_size: 0,
-                st_blksize: 4096,
-                st_blocks: 0,
-                ..Default::default()
-            },
-            Descriptor::PipeWriter { .. } => FileStat {
-                // TODO: give correct values
-                st_dev: 0,
-                st_ino: 0,
-                st_nlink: 1,
-                st_mode: (Mode::WUSR.bits() | litebox_common_linux::InodeType::NamedPipe as u32)
-                    .truncate(),
-                st_uid: 0,
-                st_gid: 0,
-                st_rdev: 0,
-                st_size: 0,
-                st_blksize: 4096,
-                st_blocks: 0,
-                ..Default::default()
-            },
             Descriptor::Eventfd { .. } => FileStat {
                 // TODO: give correct values
                 st_dev: 0,
@@ -643,32 +644,25 @@ impl Descriptor {
     pub(crate) fn get_file_descriptor_flags(&self) -> Result<FileDescriptorFlags, Errno> {
         // Currently, only one such flag is defined: FD_CLOEXEC, the close-on-exec flag.
         // See https://www.man7.org/linux/man-pages/man2/F_GETFD.2const.html
+        fn get_flags<S: FdEnabledSubsystem>(fd: &TypedFd<S>) -> FileDescriptorFlags {
+            litebox()
+                .descriptor_table()
+                .with_metadata(fd, |flags: &FileDescriptorFlags| *flags)
+                .unwrap_or(FileDescriptorFlags::empty())
+        }
         match self {
-            Descriptor::LiteBoxRawFd(raw_fd) => crate::run_on_raw_fd(
-                *raw_fd,
-                |fd| {
-                    litebox()
-                        .descriptor_table()
-                        .with_metadata(fd, |flags: &FileDescriptorFlags| *flags)
-                        .unwrap_or(FileDescriptorFlags::empty())
-                },
-                |fd| {
-                    litebox()
-                        .descriptor_table()
-                        .with_metadata(fd, |flags: &FileDescriptorFlags| *flags)
-                        .unwrap_or(FileDescriptorFlags::empty())
-                },
-            ),
-            Descriptor::PipeReader { close_on_exec, .. }
-            | Descriptor::PipeWriter { close_on_exec, .. }
-            | Descriptor::Eventfd { close_on_exec, .. }
-            | Descriptor::Epoll { close_on_exec, .. } => Ok(
-                if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
-                    FileDescriptorFlags::FD_CLOEXEC
-                } else {
-                    FileDescriptorFlags::empty()
-                },
-            ),
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                crate::run_on_raw_fd(*raw_fd, get_flags, get_flags, get_flags)
+            }
+            Descriptor::Eventfd { close_on_exec, .. } | Descriptor::Epoll { close_on_exec, .. } => {
+                Ok(
+                    if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
+                        FileDescriptorFlags::FD_CLOEXEC
+                    } else {
+                        FileDescriptorFlags::empty()
+                    },
+                )
+            }
         }
     }
 }
@@ -765,10 +759,11 @@ pub(crate) fn sys_fcntl(
                     |fd| {
                         let _old = litebox().descriptor_table_mut().set_fd_metadata(fd, flags);
                     },
+                    |fd| {
+                        let _old = litebox().descriptor_table_mut().set_fd_metadata(fd, flags);
+                    },
                 )?,
-                Descriptor::PipeReader { close_on_exec, .. }
-                | Descriptor::PipeWriter { close_on_exec, .. }
-                | Descriptor::Eventfd { close_on_exec, .. }
+                Descriptor::Eventfd { close_on_exec, .. }
                 | Descriptor::Epoll { close_on_exec, .. } => {
                     close_on_exec.store(
                         flags.contains(FileDescriptorFlags::FD_CLOEXEC),
@@ -779,29 +774,36 @@ pub(crate) fn sys_fcntl(
             Ok(0)
         }
         FcntlArg::GETFL => match desc {
-            Descriptor::LiteBoxRawFd(raw_fd) => crate::run_on_raw_fd(
+            Descriptor::LiteBoxRawFd(raw_fd) => Ok(crate::run_on_raw_fd(
                 *raw_fd,
                 |fd| {
-                    litebox()
+                    Ok(litebox()
                         .descriptor_table()
                         .with_metadata(fd, |crate::StdioStatusFlags(flags)| {
                             *flags & OFlags::STATUS_FLAGS_MASK
                         })
-                        .unwrap_or(OFlags::empty())
-                        .bits()
+                        .unwrap_or(OFlags::empty()))
                 },
                 |fd| {
-                    litebox()
+                    Ok(litebox()
                         .descriptor_table()
                         .with_metadata(fd, |crate::syscalls::net::SocketOFlags(flags)| {
                             *flags & OFlags::STATUS_FLAGS_MASK
                         })
-                        .unwrap_or(OFlags::empty())
-                        .bits()
+                        .unwrap_or(OFlags::empty()))
                 },
-            ),
-            Descriptor::PipeReader { consumer, .. } => Ok(consumer.get_status().bits()),
-            Descriptor::PipeWriter { producer, .. } => Ok(producer.get_status().bits()),
+                |fd| {
+                    let pipes = litebox_pipes().read();
+                    let flags = OFlags::from(pipes.get_flags(fd).map_err(Errno::from)?);
+                    let dirn = match pipes.half_pipe_type(fd)? {
+                        litebox::pipes::HalfPipeType::SenderHalf => OFlags::WRONLY,
+                        litebox::pipes::HalfPipeType::ReceiverHalf => OFlags::RDONLY,
+                    };
+                    Ok(dirn | flags)
+                },
+            )
+            .flatten()?
+            .bits()),
             Descriptor::Eventfd { file, .. } => Ok(file.get_status().bits()),
             Descriptor::Epoll { file, .. } => Ok(file.get_status().bits()),
         },
@@ -862,13 +864,18 @@ pub(crate) fn sys_fcntl(
                                 }
                             })
                     },
+                    |fd| {
+                        if flags.intersects(OFlags::NONBLOCK.complement()) {
+                            todo!("unsupported flags for pipes")
+                        }
+                        litebox_pipes().read().update_flags(
+                            fd,
+                            litebox::pipes::Flags::NON_BLOCKING,
+                            flags.intersects(OFlags::NONBLOCK),
+                        );
+                        Ok(())
+                    },
                 )??,
-                Descriptor::PipeReader { consumer, .. } => {
-                    toggle_flags!(consumer);
-                }
-                Descriptor::PipeWriter { producer, .. } => {
-                    toggle_flags!(producer);
-                }
                 Descriptor::Eventfd { file, .. } => {
                     toggle_flags!(file);
                 }
@@ -899,6 +906,7 @@ pub(crate) fn sys_fcntl(
                     Ok(0)
                 },
                 |fd| todo!("net"),
+                |fd| todo!("pipes"),
             )
             .flatten()
         }
@@ -918,6 +926,7 @@ pub(crate) fn sys_fcntl(
                     Ok(0)
                 },
                 |fd| todo!("net"),
+                |fd| todo!("pipes"),
             )
             .flatten()
         }
@@ -945,37 +954,47 @@ pub fn sys_getcwd(buf: &mut [u8]) -> Result<usize, Errno> {
 const DEFAULT_PIPE_BUF_SIZE: usize = 1024 * 1024;
 /// Handle syscall `pipe2`
 pub fn sys_pipe2(flags: OFlags) -> Result<(u32, u32), Errno> {
-    if flags.contains((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement()) {
-        return Err(Errno::EINVAL);
-    }
+    let (pipe_flags, cloexec) = {
+        use litebox::pipes::Flags;
+        let mut f = Flags::empty();
+        if flags.contains((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement()) {
+            return Err(Errno::EINVAL);
+        }
+        f.set(Flags::NON_BLOCKING, flags.contains(OFlags::NONBLOCK));
+        if flags.contains(OFlags::DIRECT) {
+            todo!("O_DIRECT not supported");
+        }
+        (f, flags.contains(OFlags::CLOEXEC))
+    };
 
-    if flags.contains(litebox::fs::OFlags::DIRECT) {
-        todo!("O_DIRECT not supported");
-    }
-
-    let (writer, reader) = litebox::pipes::new_pipe(
-        litebox(),
+    let (writer, reader) = crate::litebox_pipes().read().create_pipe(
         DEFAULT_PIPE_BUF_SIZE,
-        flags,
+        pipe_flags,
         // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
-        4096.try_into().ok(),
+        core::num::NonZero::new(4096),
     );
-    let close_on_exec = flags.contains(OFlags::CLOEXEC);
-    let read_fd = file_descriptors()
-        .write()
-        .insert(Descriptor::PipeReader {
-            consumer: reader,
-            close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
-        })
+
+    if cloexec {
+        let mut dt = litebox().descriptor_table_mut();
+        let None = dt.set_fd_metadata(&writer, FileDescriptorFlags::FD_CLOEXEC) else {
+            unreachable!()
+        };
+        let None = dt.set_fd_metadata(&reader, FileDescriptorFlags::FD_CLOEXEC) else {
+            unreachable!()
+        };
+    }
+
+    let mut rds = raw_descriptor_store().write();
+    let wr_raw_fd = rds.fd_into_raw_integer(writer);
+    let rd_raw_fd = rds.fd_into_raw_integer(reader);
+    let mut fds = file_descriptors().write();
+    let w = fds
+        .insert(Descriptor::LiteBoxRawFd(wr_raw_fd))
         .map_err(|desc| do_close(desc).err().unwrap_or(Errno::EMFILE))?;
-    let write_fd = file_descriptors()
-        .write()
-        .insert(Descriptor::PipeWriter {
-            producer: writer,
-            close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
-        })
+    let r = fds
+        .insert(Descriptor::LiteBoxRawFd(rd_raw_fd))
         .map_err(|desc| do_close(desc).err().unwrap_or(Errno::EMFILE))?;
-    Ok((read_fd, write_fd))
+    Ok((r, w))
 }
 
 pub fn sys_eventfd2(initval: u32, flags: EfdFlags) -> Result<u32, Errno> {
@@ -1073,14 +1092,14 @@ pub fn sys_ioctl(
                         }
                         Ok(())
                     },
-                )??;
-            }
-
-            Descriptor::PipeReader { consumer, .. } => {
-                consumer.set_status(OFlags::NONBLOCK, val != 0);
-            }
-            Descriptor::PipeWriter { producer, .. } => {
-                producer.set_status(OFlags::NONBLOCK, val != 0);
+                    |fd| {
+                        litebox_pipes()
+                            .read()
+                            .update_flags(fd, litebox::pipes::Flags::NON_BLOCKING, val != 0)
+                            .map_err(Errno::from)
+                    },
+                )
+                .flatten()?;
             }
             Descriptor::Eventfd { file, .. } => file.set_status(OFlags::NONBLOCK, val != 0),
             Descriptor::Epoll { file, .. } => {
@@ -1114,7 +1133,8 @@ pub fn sys_ioctl(
                                             .descriptor_table_mut()
                                             .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                                     },
-                                    |fd| todo!("net")
+                                    |fd| todo!("net"),
+                                    |fd| todo!("pipes"),
                                 )?;
                                 Ok(0)
                             }
@@ -1140,15 +1160,8 @@ pub fn sys_ioctl(
                     })
             },
             |fd| todo!("net"),
+            |fd| todo!("pipes"),
         )?,
-        Descriptor::PipeReader {
-            consumer,
-            close_on_exec,
-        } => todo!(),
-        Descriptor::PipeWriter {
-            producer,
-            close_on_exec,
-        } => todo!(),
         Descriptor::Eventfd {
             file,
             close_on_exec,
@@ -1500,49 +1513,27 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
     let close_on_exec = flags.contains(OFlags::CLOEXEC);
     match file {
         Descriptor::LiteBoxRawFd(raw_fd) => {
-            use alloc::sync::Arc;
-            use litebox::fd::ErrRawIntFd;
-            let mut dt = litebox().descriptor_table_mut();
-            let mut rds = raw_descriptor_store().write();
-            match rds.fd_from_raw_integer(*raw_fd) {
-                Ok(fd) => {
-                    let fd: Arc<litebox::fd::TypedFd<crate::LinuxFS>> = fd;
-                    let fd = dt.duplicate(&fd).ok_or(Errno::EBADF)?;
-                    if close_on_exec {
-                        let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
-                        assert!(old.is_none());
-                    }
-                    Ok(Descriptor::LiteBoxRawFd(rds.fd_into_raw_integer(fd)))
+            fn dup<S: FdEnabledSubsystem>(
+                fd: &TypedFd<S>,
+                close_on_exec: bool,
+            ) -> Result<Descriptor, Errno> {
+                let mut dt = litebox().descriptor_table_mut();
+                let fd = dt.duplicate(fd).ok_or(Errno::EBADF)?;
+                if close_on_exec {
+                    let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
+                    assert!(old.is_none());
                 }
-                Err(ErrRawIntFd::NotFound) => Err(Errno::EBADF),
-                Err(ErrRawIntFd::InvalidSubsystem) => {
-                    match rds.fd_from_raw_integer(*raw_fd) {
-                        Ok(fd) => {
-                            let fd: Arc<
-                                litebox::fd::TypedFd<
-                                    litebox::net::Network<litebox_platform_multiplex::Platform>,
-                                >,
-                            > = fd;
-                            let fd = dt.duplicate(&fd).ok_or(Errno::EBADF)?;
-                            Ok(Descriptor::LiteBoxRawFd(rds.fd_into_raw_integer(fd)))
-                        }
-                        Err(ErrRawIntFd::NotFound) => unreachable!("fd shown to exist before"),
-                        Err(ErrRawIntFd::InvalidSubsystem) => {
-                            // fs+net are the only subsystems at the moment
-                            unreachable!()
-                        }
-                    }
-                }
+                Ok(Descriptor::LiteBoxRawFd(
+                    raw_descriptor_store().write().fd_into_raw_integer(fd),
+                ))
             }
+            crate::run_on_raw_fd(
+                *raw_fd,
+                |fd| dup(fd, close_on_exec),
+                |fd| dup(fd, close_on_exec),
+                |fd| dup(fd, close_on_exec),
+            )?
         }
-        Descriptor::PipeReader { consumer, .. } => Ok(Descriptor::PipeReader {
-            consumer: consumer.clone(),
-            close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
-        }),
-        Descriptor::PipeWriter { producer, .. } => Ok(Descriptor::PipeWriter {
-            producer: producer.clone(),
-            close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
-        }),
         Descriptor::Eventfd { file, .. } => Ok(Descriptor::Eventfd {
             file: file.clone(),
             close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
@@ -1681,5 +1672,6 @@ pub(crate) fn sys_getdirent64(fd: i32, dirp: MutPtr<u8>, count: usize) -> Result
             Ok(nbytes)
         },
         |fd| todo!("net"),
+        |fd| todo!("pipes"),
     )?
 }

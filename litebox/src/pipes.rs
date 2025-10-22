@@ -149,6 +149,19 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         }
         Ok(())
     }
+
+    /// Perform `f` with the [`IOPollable`] associated with the pipe at `fd`.
+    pub fn with_iopollable<R>(
+        &self,
+        fd: &PipeFd<Platform>,
+        f: impl FnOnce(&dyn IOPollable) -> R,
+    ) -> Result<R, errors::ClosedError> {
+        let dt = self.litebox.descriptor_table();
+        match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
+            PipeEnd::Receiver(p) => Ok(f(p)),
+            PipeEnd::Sender(p) => Ok(f(p)),
+        }
+    }
 }
 
 /// Whether a particular pipe end is the sender half or the receiver half
@@ -262,12 +275,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> EndPointer<Platform,
 macro_rules! common_functions_for_channel {
     () => {
         /// Get the status flags for this channel
-        pub fn get_status(&self) -> OFlags {
+        fn get_status(&self) -> OFlags {
             OFlags::from_bits(self.status.load(Relaxed)).unwrap() & OFlags::STATUS_FLAGS_MASK
         }
 
         /// Update the status flags for `mask` to `on`.
-        pub fn set_status(&self, mask: OFlags, on: bool) {
+        fn set_status(&self, mask: OFlags, on: bool) {
             if on {
                 self.status.fetch_or(mask.bits(), Relaxed);
             } else {
@@ -276,17 +289,17 @@ macro_rules! common_functions_for_channel {
         }
 
         /// Has this been shut down?
-        pub fn is_shutdown(&self) -> bool {
+        fn is_shutdown(&self) -> bool {
             self.endpoint.is_shutdown()
         }
 
         /// Shut this channel down.
-        pub fn shutdown(&self) {
+        fn shutdown(&self) {
             self.endpoint.shutdown();
         }
 
         /// Has the peer (i.e., other end) been shut down?
-        pub fn is_peer_shutdown(&self) -> bool {
+        fn is_peer_shutdown(&self) -> bool {
             if let Some(peer) = self.peer.upgrade() {
                 peer.endpoint.is_shutdown()
             } else {
@@ -297,7 +310,7 @@ macro_rules! common_functions_for_channel {
 }
 
 /// The "writer" (aka producer or transmit) side of a pipe
-pub struct WriteEnd<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
+struct WriteEnd<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
     endpoint: EndPointer<Platform, HeapProd<T>>,
     peer: Weak<ReadEnd<Platform, T>>,
     /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
@@ -309,7 +322,7 @@ pub struct WriteEnd<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
 /// Potential errors when writing or reading from a pipe
 #[derive(Error, Debug)]
 #[non_exhaustive]
-pub enum PipeError {
+enum PipeError {
     #[error("this pipe has been closed down")]
     Closed,
     #[error("this operation would block")]
@@ -392,7 +405,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T
     /// Write the values in `buf` into the pipe, returning the number of elements written.
     ///
     /// See [`new_pipe`] for details on blocking and atomicity of writes.
-    pub fn write(&self, buf: &[T]) -> Result<usize, PipeError>
+    fn write(&self, buf: &[T]) -> Result<usize, PipeError>
     where
         T: Copy,
     {
@@ -444,7 +457,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Drop for WriteEnd<Pl
 }
 
 /// The "reader" (aka consumer or receive) side of a pipe
-pub struct ReadEnd<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
+struct ReadEnd<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
     endpoint: EndPointer<Platform, HeapCons<T>>,
     peer: Weak<WriteEnd<Platform, T>>,
     status: AtomicU32,
@@ -507,7 +520,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> ReadEnd<Platform, T>
     /// Read values in the pipe into `buf`, returning the number of elements read.
     ///
     /// See [`new_pipe`] for details on blocking behavior.
-    pub fn read(&self, buf: &mut [T]) -> Result<usize, PipeError>
+    fn read(&self, buf: &mut [T]) -> Result<usize, PipeError>
     where
         T: Copy,
     {
@@ -558,7 +571,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Drop for ReadEnd<Pla
     clippy::type_complexity,
     reason = "clippy believes this result type to be complex, but factoring it out into a type def would not help readability in any way"
 )]
-pub fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
+fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
     litebox: &LiteBox<Platform>,
     capacity: usize,
     flags: OFlags,
@@ -577,13 +590,7 @@ pub fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
         litebox,
     ));
     let consumer = Arc::new_cyclic(|weak_self| {
-        #[expect(
-            clippy::missing_panics_doc,
-            reason = "Producer has no other references as it is just created. So we can safely get a mutable reference to it."
-        )]
-        {
-            Arc::get_mut(&mut producer).unwrap().peer = weak_self.clone();
-        }
+        Arc::get_mut(&mut producer).unwrap().peer = weak_self.clone();
         let mut consumer = ReadEnd::new(rb_cons, flags, litebox);
         consumer.peer = Arc::downgrade(&producer);
         consumer
