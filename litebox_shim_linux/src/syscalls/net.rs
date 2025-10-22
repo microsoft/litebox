@@ -968,13 +968,65 @@ mod tests {
         task
     }
 
+    fn epoll_add(task: &crate::Task, epfd: i32, target_fd: i32, events: litebox::event::Events) {
+        let ev = litebox_common_linux::EpollEvent {
+            events: events.bits(),
+            data: u64::try_from(target_fd).unwrap(),
+        };
+        let ev_ptr = (&raw const ev).cast::<litebox_common_linux::EpollEvent>();
+        let ev_const = crate::ConstPtr::from_usize(ev_ptr as usize);
+        task.sys_epoll_ctl(
+            epfd,
+            litebox_common_linux::EpollOp::EpollCtlAdd,
+            target_fd,
+            ev_const,
+        )
+        .expect("epoll_ctl add server failed");
+    }
+
+    fn epoll_wait(
+        task: &crate::Task,
+        epfd: i32,
+        events: &mut [litebox_common_linux::EpollEvent],
+    ) -> usize {
+        let events_ptr = crate::MutPtr::from_usize(events.as_mut_ptr() as usize);
+        task.sys_epoll_pwait(epfd, events_ptr, events.len().truncate(), -1, None, 0)
+            .expect("epoll_wait failed")
+    }
+
+    fn epoll_add(task: &crate::Task, epfd: i32, target_fd: i32, events: litebox::event::Events) {
+        let ev = litebox_common_linux::EpollEvent {
+            events: events.bits(),
+            data: u64::try_from(target_fd).unwrap(),
+        };
+        let ev_ptr = (&raw const ev).cast::<litebox_common_linux::EpollEvent>();
+        let ev_const = crate::ConstPtr::from_usize(ev_ptr as usize);
+        task.sys_epoll_ctl(
+            epfd,
+            litebox_common_linux::EpollOp::EpollCtlAdd,
+            target_fd,
+            ev_const,
+        )
+        .expect("epoll_ctl add server failed");
+    }
+
+    fn epoll_wait(
+        task: &crate::Task,
+        epfd: i32,
+        events: &mut [litebox_common_linux::EpollEvent],
+    ) -> usize {
+        let events_ptr = crate::MutPtr::from_usize(events.as_mut_ptr() as usize);
+        task.sys_epoll_pwait(epfd, events_ptr, events.len().truncate(), -1, None, 0)
+            .expect("epoll_wait failed")
+    }
+
     fn test_tcp_socket(
         task: &crate::Task,
         ip: [u8; 4],
         port: u16,
         is_nonblocking: bool,
         test_trunc: bool,
-        option: &str,
+        option: &'static str,
     ) {
         let server = task
             .sys_socket(
@@ -1003,60 +1055,54 @@ mod tests {
             .sys_epoll_create(litebox_common_linux::EpollCreateFlags::empty())
             .expect("failed to create epoll");
         let epfd = i32::try_from(epfd).unwrap();
-        let ev = litebox_common_linux::EpollEvent {
-            events: litebox::event::Events::IN.bits(),
-            data: 0,
-        };
-        let ev_ptr = (&raw const ev).cast::<litebox_common_linux::EpollEvent>();
-        let ev_const = crate::ConstPtr::from_usize(ev_ptr as usize);
-        task.sys_epoll_ctl(
-            epfd,
-            litebox_common_linux::EpollOp::EpollCtlAdd,
-            server,
-            ev_const,
-        )
-        .expect("epoll_ctl add server failed");
+        epoll_add(task, epfd, server, litebox::event::Events::IN);
 
         let buf = "Hello, world!";
-        let mut child = match option {
-            "sendto" => std::process::Command::new("nc")
-                .args([
-                    "-w", // timeout for connects and final net reads
-                    "1",
-                    TUN_IP_ADDR_STR,
-                    SERVER_PORT.to_string().as_str(),
-                ])
-                .stdout(std::process::Stdio::piped())
-                .spawn(),
-            "recvfrom" => std::process::Command::new("sh")
-                .args([
-                    "-c",
-                    &alloc::format!("echo -n '{buf}' | nc -w 1 {TUN_IP_ADDR_STR} {SERVER_PORT}",),
-                ])
-                .spawn(),
-            _ => panic!("Unknown option"),
-        }
-        .expect("failed to run nc");
+        let child_handle = std::thread::spawn(move || {
+            std::thread::sleep(core::time::Duration::from_millis(200)); // Give server time to start
+            match option {
+                "sendto" => std::process::Command::new("nc")
+                    .args([
+                        "-w", // timeout for connects and final net reads
+                        "1",
+                        TUN_IP_ADDR_STR,
+                        SERVER_PORT.to_string().as_str(),
+                    ])
+                    .stdout(std::process::Stdio::piped())
+                    .output(),
+                "recvfrom" => std::process::Command::new("sh")
+                    .args([
+                        "-c",
+                        &alloc::format!(
+                            "echo -n '{buf}' | nc -w 1 {TUN_IP_ADDR_STR} {SERVER_PORT}",
+                        ),
+                    ])
+                    .output(),
+                _ => panic!("Unknown option"),
+            }
+        });
 
         if is_nonblocking {
-            loop {
-                // wait on epoll for server to be readable (incoming connection)
-                let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
-                let events_ptr = crate::MutPtr::from_usize(events.as_mut_ptr() as usize);
-                let n = task
-                    .sys_epoll_pwait(epfd, events_ptr, events.len().truncate(), -1, None, 0)
-                    .expect("epoll_wait failed");
-                if n > 0 {
-                    for ev in &events[..n] {
-                        assert!(ev.events & litebox::event::Events::IN.bits() != 0);
-                    }
-                    break;
-                }
+            // wait on epoll for server to be readable (incoming connection)
+            let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
+            let n = epoll_wait(task, epfd, &mut events);
+            assert_eq!(n, 1);
+            for ev in &events[..n] {
+                assert!(ev.events & litebox::event::Events::IN.bits() != 0);
             }
         }
 
         let client_fd = task
-            .sys_accept(server, None, None, SockFlags::empty())
+            .sys_accept(
+                server,
+                None,
+                None,
+                if is_nonblocking {
+                    SockFlags::NONBLOCK
+                } else {
+                    SockFlags::empty()
+                },
+            )
             .expect("Failed to accept connection");
         let client_fd = i32::try_from(client_fd).unwrap();
         match option {
@@ -1066,13 +1112,24 @@ mod tests {
                     .sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None)
                     .expect("Failed to send data");
                 assert_eq!(n, buf.len());
-                let output = child.wait_with_output().expect("Failed to wait for client");
+                let output = child_handle
+                    .join()
+                    .unwrap()
+                    .expect("Failed to wait for client");
                 let stdout = alloc::string::String::from_utf8_lossy(&output.stdout);
                 assert_eq!(stdout, buf);
             }
             "recvfrom" => {
                 if is_nonblocking {
-                    unimplemented!("non-blocking recvfrom")
+                    epoll_add(task, epfd, client_fd, litebox::event::Events::IN);
+                    let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
+                    let n = epoll_wait(task, epfd, &mut events);
+                    assert_eq!(n, 1);
+                    for ev in &events[..n] {
+                        assert!(ev.events & litebox::event::Events::IN.bits() != 0);
+                        let fd = i32::try_from(ev.data).unwrap();
+                        assert_eq!(fd, client_fd);
+                    }
                 }
                 let mut recv_buf = [0u8; 48];
                 let recv_ptr = crate::MutPtr::from_usize(recv_buf.as_mut_ptr() as usize);
@@ -1095,7 +1152,7 @@ mod tests {
                     assert_eq!(recv_buf[..n], buf.as_bytes()[..n]);
                 }
                 assert_eq!(n, buf.len()); // even with truncation, it returns the actual length
-                let _ = child.wait().expect("Failed to wait for client");
+                let _ = child_handle.join().expect("Failed to wait for client");
             }
             _ => panic!("Unknown option"),
         }
@@ -1110,7 +1167,7 @@ mod tests {
         port: u16,
         is_nonblocking: bool,
         test_trunc: bool,
-        option: &str,
+        option: &'static str,
     ) {
         let task = init_platform(Some("tun99"));
         test_tcp_socket(&task, TUN_IP_ADDR, port, is_nonblocking, test_trunc, option);
@@ -1132,11 +1189,16 @@ mod tests {
     }
 
     #[test]
+    fn test_tun_nonblocking_recvfrom_tcp_socket() {
+        test_tcp_socket_with_external_client(SERVER_PORT, true, false, "recvfrom");
+    }
+
+    #[test]
     fn test_tun_blocking_recvfrom_tcp_socket_with_truncation() {
         test_tcp_socket_with_external_client(SERVER_PORT, false, true, "recvfrom");
     }
 
-    fn blocking_udp_server_socket(test_trunc: bool) {
+    fn blocking_udp_server_socket(test_trunc: bool, is_nonblocking: bool) {
         let task = init_platform(Some("tun99"));
 
         // Server socket and bind
@@ -1144,7 +1206,11 @@ mod tests {
             .sys_socket(
                 AddressFamily::INET,
                 SockType::Datagram,
-                SockFlags::empty(),
+                if is_nonblocking {
+                    SockFlags::NONBLOCK
+                } else {
+                    SockFlags::empty()
+                },
                 Some(litebox_common_linux::Protocol::UDP),
             )
             .expect("failed to create server socket");
@@ -1155,6 +1221,12 @@ mod tests {
         )));
         task.sys_bind(server_fd, server_addr.clone())
             .expect("failed to bind server");
+
+        // Create an epoll instance and register the server fd for EPOLLIN
+        let epfd = sys_epoll_create(litebox_common_linux::EpollCreateFlags::empty())
+            .expect("failed to create epoll");
+        let epfd = i32::try_from(epfd).unwrap();
+        epoll_add(task, epfd, server_fd, litebox::event::Events::IN);
 
         let msg = "Hello from client";
         let mut child = std::process::Command::new("nc")
@@ -1189,6 +1261,16 @@ mod tests {
         if test_trunc {
             recv_flags.insert(ReceiveFlags::TRUNC);
         }
+        if is_nonblocking {
+            let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
+            let n = epoll_wait(task, epfd, &mut events);
+            assert_eq!(n, 1);
+            for ev in &events[..n] {
+                assert!(ev.events & litebox::event::Events::IN.bits() != 0);
+                let fd = i32::try_from(ev.data).unwrap();
+                assert_eq!(fd, server_fd);
+            }
+        }
         let n = task
             .sys_recvfrom(
                 server_fd,
@@ -1219,12 +1301,17 @@ mod tests {
 
     #[test]
     fn test_tun_blocking_udp_server_socket() {
-        blocking_udp_server_socket(false);
+        blocking_udp_server_socket(false, false);
+    }
+
+    #[test]
+    fn test_tun_nonblocking_udp_server_socket() {
+        blocking_udp_server_socket(false, true);
     }
 
     #[test]
     fn test_tun_blocking_udp_server_socket_with_truncation() {
-        blocking_udp_server_socket(true);
+        blocking_udp_server_socket(true, false);
     }
 
     #[test]
