@@ -241,7 +241,7 @@ bitflags! {
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
 
-        /// All file status flags
+        /// All file status flags + access modes
         const STATUS_FLAGS_MASK = Self::APPEND.bits()
             | Self::NONBLOCK.bits()
             | Self::DSYNC.bits()

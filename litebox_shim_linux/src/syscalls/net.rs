@@ -32,7 +32,7 @@ macro_rules! convert_flags {
     };
 }
 
-type SocketFd = litebox::net::SocketFd<Platform>;
+pub(super) type SocketFd = litebox::net::SocketFd<Platform>;
 
 fn with_socket_fd<R>(
     raw_fd: usize,
@@ -113,7 +113,7 @@ struct SocketOptions {
     linger_timeout: Option<core::time::Duration>,
 }
 
-struct SocketOFlags(OFlags);
+pub(crate) struct SocketOFlags(pub OFlags);
 
 fn initialize_socket(fd: &SocketFd, sock_type: SockType, flags: SockFlags) {
     let mut status = OFlags::RDWR;

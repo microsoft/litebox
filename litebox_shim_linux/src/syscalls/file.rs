@@ -785,7 +785,15 @@ pub(crate) fn sys_fcntl(
                         .unwrap_or(OFlags::empty())
                         .bits()
                 },
-                |fd| todo!("net"),
+                |fd| {
+                    litebox()
+                        .descriptor_table()
+                        .with_metadata(fd, |crate::syscalls::net::SocketOFlags(flags)| {
+                            *flags & OFlags::STATUS_FLAGS_MASK
+                        })
+                        .unwrap_or(OFlags::empty())
+                        .bits()
+                },
             ),
             Descriptor::PipeReader { consumer, .. } => Ok(consumer.get_status().bits()),
             Descriptor::PipeWriter { producer, .. } => Ok(producer.get_status().bits()),
@@ -1013,12 +1021,32 @@ pub fn sys_ioctl(
             .into_owned();
         match desc {
             Descriptor::LiteBoxRawFd(raw_fd) => {
-                // TODO: stdio NONBLOCK?
-                #[cfg(debug_assertions)]
-                litebox::log_println!(
-                    litebox_platform_multiplex::platform(),
-                    "Attempted to set non-blocking on raw fd; currently unimplemented"
-                );
+                crate::run_on_raw_fd(
+                    *raw_fd,
+                    |file_fd| {
+                        // TODO: stdio NONBLOCK?
+                        #[cfg(debug_assertions)]
+                        litebox::log_println!(
+                            litebox_platform_multiplex::platform(),
+                            "Attempted to set non-blocking on raw fd; currently unimplemented"
+                        );
+                        Ok(())
+                    },
+                    |socket_fd| {
+                        if let Err(e) = litebox().descriptor_table_mut().with_metadata_mut(
+                            socket_fd,
+                            |crate::syscalls::net::SocketOFlags(flags)| {
+                                flags.set(OFlags::NONBLOCK, val != 0);
+                            },
+                        ) {
+                            match e {
+                                MetadataError::ClosedFd => return Err(Errno::EBADF),
+                                MetadataError::NoSuchMetadata => unreachable!(),
+                            }
+                        }
+                        Ok(())
+                    },
+                )??;
             }
 
             Descriptor::PipeReader { consumer, .. } => {
@@ -1124,7 +1152,7 @@ pub fn sys_epoll_create(flags: EpollCreateFlags) -> Result<u32, Errno> {
 }
 
 /// Handle syscall `epoll_ctl`
-pub fn sys_epoll_ctl(
+pub(crate) fn sys_epoll_ctl(
     epfd: i32,
     op: litebox_common_linux::EpollOp,
     fd: i32,
@@ -1147,6 +1175,7 @@ pub fn sys_epoll_ctl(
     };
 
     let file = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
+    let file_descriptor = super::epoll::EpollDescriptor::try_from(file)?;
     let event = if op == litebox_common_linux::EpollOp::EpollCtlDel {
         None
     } else {
@@ -1156,7 +1185,7 @@ pub fn sys_epoll_ctl(
                 .into_owned(),
         )
     };
-    epoll.epoll_ctl(op, fd, file, event)
+    epoll.epoll_ctl(op, fd, &file_descriptor, event)
 }
 
 /// Handle syscall `epoll_pwait`
