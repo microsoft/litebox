@@ -379,14 +379,13 @@ impl ReadySet {
             return;
         }
 
-        let mut entries = self.entries.lock();
         if !entry
             .is_ready
             .swap(true, core::sync::atomic::Ordering::Relaxed)
         {
+            let mut entries = self.entries.lock();
             entries.push_back(entry.weak_self.clone());
         }
-        drop(entries);
 
         self.pollee.notify_observers(Events::IN);
     }
@@ -425,10 +424,14 @@ impl ReadySet {
             }
 
             if is_still_ready {
-                entry
+                // if another event happened and already pushed the entry (i.e., marked it as ready)
+                // while we were processing, we don't need to push it again.
+                if !entry
                     .is_ready
-                    .store(true, core::sync::atomic::Ordering::Relaxed);
-                self.entries.lock().push_back(weak_entry);
+                    .swap(true, core::sync::atomic::Ordering::Relaxed)
+                {
+                    self.entries.lock().push_back(weak_entry);
+                }
             }
         }
     }
