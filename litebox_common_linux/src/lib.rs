@@ -1796,6 +1796,13 @@ bitflags::bitflags! {
     }
 }
 
+/// Packaged sigset with its size, used by `pselect` syscall
+#[derive(Clone, Copy)]
+pub struct SigSetPack {
+    pub sigset: SigSet,
+    pub size: usize,
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 #[derive(Debug)]
@@ -2024,6 +2031,21 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         timeout: Option<Platform::RawConstPointer<Timespec>>,
         sigmask: Option<Platform::RawConstPointer<SigSet>>,
         sigsetsize: usize,
+    },
+    Select {
+        nfds: u32,
+        readfds: Option<Platform::RawMutPointer<usize>>,
+        writefds: Option<Platform::RawMutPointer<usize>>,
+        exceptfds: Option<Platform::RawMutPointer<usize>>,
+        timeout: Option<Platform::RawMutPointer<TimeVal>>,
+    },
+    Pselect {
+        nfds: u32,
+        readfds: Option<Platform::RawMutPointer<usize>>,
+        writefds: Option<Platform::RawMutPointer<usize>>,
+        exceptfds: Option<Platform::RawMutPointer<usize>>,
+        timeout: Option<Platform::RawConstPointer<Timespec>>,
+        sigsetpack: Option<Platform::RawConstPointer<SigSetPack>>,
     },
     ArchPrctl {
         arg: ArchPrctlArg<Platform>,
@@ -2572,6 +2594,48 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }
             Sysno::poll => {
                 sys_req!(Poll { fds:*, nfds, timeout })
+            }
+            #[cfg(target_arch = "x86_64")]
+            Sysno::select => {
+                sys_req!(Select {
+                    nfds,
+                    readfds:*,
+                    writefds:*,
+                    exceptfds:*,
+                    timeout:*,
+                })
+            }
+            #[cfg(target_arch = "x86")]
+            Sysno::_newselect => {
+                sys_req!(Select {
+                    nfds,
+                    readfds:*,
+                    writefds:*,
+                    exceptfds:*,
+                    timeout:*,
+                })
+            }
+            #[cfg(target_arch = "x86_64")]
+            Sysno::pselect6 => {
+                sys_req!(Pselect {
+                    nfds,
+                    readfds:*,
+                    writefds:*,
+                    exceptfds:*,
+                    timeout:*,
+                    sigsetpack:*,
+                })
+            }
+            #[cfg(target_arch = "x86")]
+            Sysno::pselect6_time64 => {
+                sys_req!(Pselect {
+                    nfds,
+                    readfds:*,
+                    writefds:*,
+                    exceptfds:*,
+                    timeout:*,
+                    sigsetpack:*,
+                })
             }
             Sysno::prctl => {
                 let op: u32 = ctx.sys_req_arg(0);

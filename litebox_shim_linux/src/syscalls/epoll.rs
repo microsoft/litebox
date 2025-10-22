@@ -488,6 +488,7 @@ impl PollSet {
                     register = false;
                 }
             }
+            drop(fds);
 
             if is_ready {
                 break;
@@ -522,6 +523,13 @@ impl PollSet {
     pub fn revents(&self) -> impl Iterator<Item = Events> + '_ {
         self.entries.iter().map(|entry| entry.revents)
     }
+
+    /// Returns the accumulated `revents` and corresponding fds for each entry in the poll set.
+    ///
+    /// These are only valid after a call to `wait_or_timeout`.
+    pub fn revents_with_fds(&self) -> impl Iterator<Item = (i32, Events)> + '_ {
+        self.entries.iter().map(|entry| (entry.fd, entry.revents))
+    }
 }
 
 impl Observer<Events> for PollEntryObserver {
@@ -538,6 +546,8 @@ mod test {
     use alloc::sync::Arc;
     use litebox::{event::Events, fs::OFlags};
     use litebox_common_linux::{EfdFlags, EpollEvent};
+
+    use crate::syscalls::file::{do_pselect, sys_close, sys_pipe2, sys_read};
 
     use super::EpollFile;
     use core::time::Duration;
@@ -686,5 +696,104 @@ mod test {
 
         set.wait_or_timeout(|| fds, None);
         assert_eq!(revents(&set), Events::IN);
+    }
+
+    #[test]
+    fn test_pselect() {
+        crate::syscalls::tests::init_platform(None);
+
+        let (rfd_u, wfd_u) = sys_pipe2(litebox::fs::OFlags::empty()).expect("pipe2 failed");
+        let rfd = i32::try_from(rfd_u).unwrap();
+        let wfd = i32::try_from(wfd_u).unwrap();
+
+        std::thread::spawn(move || {
+            std::thread::sleep(core::time::Duration::from_millis(100));
+            // write a byte
+            let buf = [0x41u8];
+            let written = super::super::file::sys_write(wfd, &buf, None).expect("write failed");
+            assert_eq!(written, 1);
+        });
+
+        // prepare fd_set for read
+        let mut rfds = bitvec::bitvec![0; rfd_u.next_multiple_of(64) as usize];
+        rfds.set(rfd_u as usize, true);
+
+        // Call pselect
+        let ret = do_pselect(rfd_u + 1, Some(&mut rfds), None, None, None).expect("pselect failed");
+        assert!(ret > 0, "pselect should report ready");
+        assert!(rfds.iter_ones().all(|fd| fd == rfd_u as usize));
+
+        // read
+        let mut out = [0u8; 8];
+        let n = sys_read(rfd, &mut out, None).expect("read failed");
+        assert_eq!(n, 1);
+        assert_eq!(out[0], 0x41);
+
+        let _ = sys_close(rfd);
+        let _ = sys_close(wfd);
+    }
+
+    #[test]
+    fn test_pselect_read_hup() {
+        crate::syscalls::tests::init_platform(None);
+
+        let (rfd_u, wfd_u) = sys_pipe2(litebox::fs::OFlags::empty()).expect("pipe2 failed");
+        let rfd = i32::try_from(rfd_u).unwrap();
+        let wfd = i32::try_from(wfd_u).unwrap();
+
+        std::thread::spawn(move || {
+            std::thread::sleep(core::time::Duration::from_millis(100));
+            sys_close(wfd).expect("close writer failed");
+        });
+
+        // prepare fd_set for read
+        let mut rfds = bitvec::bitvec![0; rfd_u.next_multiple_of(64) as usize];
+        rfds.set(rfd_u as usize, true);
+
+        let ret = do_pselect(
+            rfd_u + 1,
+            Some(&mut rfds),
+            None,
+            None,
+            Some(core::time::Duration::from_secs(60)),
+        )
+        .expect("pselect failed");
+
+        // Expect pselect to indicate readiness (HUP should cause revents)
+        assert!(ret > 0, "pselect should report ready for EOF/HUP");
+        assert!(rfds.iter_ones().all(|fd| fd == rfd_u as usize));
+
+        // read should return 0 (EOF)
+        let mut out = [0u8; 8];
+        let n = sys_read(rfd, &mut out, None).expect("read failed");
+        assert_eq!(n, 0, "read should return 0 on EOF");
+
+        let _ = sys_close(rfd);
+    }
+
+    #[test]
+    fn test_pselect_invalid_fd() {
+        crate::syscalls::tests::init_platform(None);
+
+        let invalid_fd_u = 100u32;
+
+        // prepare fd_set for read
+        let mut rfds = bitvec::bitvec![0; invalid_fd_u.next_multiple_of(64) as usize];
+        rfds.set(invalid_fd_u as usize, true);
+
+        let ret = do_pselect(
+            invalid_fd_u + 1,
+            Some(&mut rfds),
+            None,
+            None,
+            Some(core::time::Duration::from_secs(1)),
+        );
+
+        // Expect pselect to return EBADF
+        assert!(ret.is_err(), "pselect should fail for invalid fd");
+        assert_eq!(
+            ret.err().unwrap(),
+            litebox_common_linux::errno::Errno::EBADF
+        );
     }
 }

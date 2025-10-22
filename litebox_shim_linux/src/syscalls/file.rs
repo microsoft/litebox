@@ -6,6 +6,7 @@ use alloc::{
     vec,
 };
 use litebox::{
+    event::Events,
     fd::MetadataError,
     fs::{FileSystem as _, Mode, OFlags, SeekWhence},
     path,
@@ -1276,6 +1277,167 @@ fn do_ppoll(
         }
     }
     Ok(ready_count)
+}
+
+pub(crate) fn do_pselect(
+    nfds: u32,
+    readfds: Option<&mut bitvec::vec::BitVec>,
+    writefds: Option<&mut bitvec::vec::BitVec>,
+    exceptfds: Option<&mut bitvec::vec::BitVec>,
+    timeout: Option<core::time::Duration>,
+) -> Result<usize, Errno> {
+    let file_table_len = file_descriptors().read().len();
+    let mut set = super::epoll::PollSet::with_capacity(nfds as usize);
+    for i in 0..nfds {
+        let mut events = litebox::event::Events::empty();
+        if readfds.as_ref().is_some_and(|set| set[i as usize]) {
+            events |= litebox::event::Events::IN;
+        }
+        if writefds.as_ref().is_some_and(|set| set[i as usize]) {
+            events |= litebox::event::Events::OUT;
+        }
+        if exceptfds.as_ref().is_some_and(|set| set[i as usize]) {
+            events |= litebox::event::Events::PRI;
+        }
+        if !events.is_empty() {
+            if i as usize >= file_table_len {
+                return Err(Errno::EBADF);
+            }
+            set.add_fd(i.reinterpret_as_signed(), events);
+        }
+    }
+
+    set.wait_or_timeout(|| file_descriptors().read(), timeout);
+
+    let mut ready_count = 0;
+    let mut process_fdset =
+        |fds: Option<&mut bitvec::vec::BitVec>, target_events: Events| -> Result<(), Errno> {
+            if let Some(fds) = fds {
+                fds.fill(false);
+                for (i, revents) in set.revents_with_fds() {
+                    if revents.contains(Events::NVAL) {
+                        return Err(Errno::EBADF);
+                    }
+                    if revents.intersects(target_events) {
+                        // no negative fds added to the set
+                        fds.set(i.reinterpret_as_unsigned() as usize, true);
+                        ready_count += 1;
+                    }
+                }
+            }
+            Ok(())
+        };
+    process_fdset(readfds, Events::IN | Events::ALWAYS_POLLED)?;
+    process_fdset(writefds, Events::OUT | Events::ALWAYS_POLLED)?;
+    process_fdset(exceptfds, Events::PRI)?;
+    Ok(ready_count)
+}
+
+fn select_common(
+    nfds: u32,
+    readfds: Option<MutPtr<usize>>,
+    writefds: Option<MutPtr<usize>>,
+    exceptfds: Option<MutPtr<usize>>,
+    timeout: Option<core::time::Duration>,
+) -> Result<usize, Errno> {
+    if nfds >= i32::MAX as u32
+        || nfds as usize
+            > with_current_task(|task| {
+                task.process
+                    .limits
+                    .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
+            })
+    {
+        return Err(Errno::EINVAL);
+    }
+    let len = (nfds as usize).div_ceil(core::mem::size_of::<usize>() * 8);
+    let mut kreadfds = readfds
+        .map(|fds| unsafe { fds.to_cow_slice(len) }.ok_or(Errno::EFAULT))
+        .transpose()?
+        .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_owned()));
+    let mut kwritefds = writefds
+        .map(|fds| unsafe { fds.to_cow_slice(len) }.ok_or(Errno::EFAULT))
+        .transpose()?
+        .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_owned()));
+    let mut kexceptfds = exceptfds
+        .map(|fds| unsafe { fds.to_cow_slice(len) }.ok_or(Errno::EFAULT))
+        .transpose()?
+        .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_owned()));
+
+    let count = do_pselect(
+        nfds,
+        kreadfds.as_mut(),
+        kwritefds.as_mut(),
+        kexceptfds.as_mut(),
+        timeout,
+    )?;
+
+    if let Some(fds) = kreadfds {
+        unsafe {
+            readfds
+                .unwrap()
+                .write_slice_at_offset(0, fds.as_raw_slice())
+        }
+        .ok_or(Errno::EFAULT)?;
+    }
+    if let Some(fds) = kwritefds {
+        unsafe {
+            writefds
+                .unwrap()
+                .write_slice_at_offset(0, fds.as_raw_slice())
+        }
+        .ok_or(Errno::EFAULT)?;
+    }
+    if let Some(fds) = kexceptfds {
+        unsafe {
+            exceptfds
+                .unwrap()
+                .write_slice_at_offset(0, fds.as_raw_slice())
+        }
+        .ok_or(Errno::EFAULT)?;
+    }
+
+    Ok(count)
+}
+
+/// Handle syscall `select`.
+pub(crate) fn sys_select(
+    nfds: u32,
+    readfds: Option<MutPtr<usize>>,
+    writefds: Option<MutPtr<usize>>,
+    exceptfds: Option<MutPtr<usize>>,
+    timeout: Option<MutPtr<litebox_common_linux::TimeVal>>,
+) -> Result<usize, Errno> {
+    let timeout = timeout
+        .map(|tv_ptr| {
+            let tv = unsafe { tv_ptr.read_at_offset(0) }
+                .ok_or(Errno::EFAULT)?
+                .into_owned();
+            core::time::Duration::try_from(tv).map_err(|_| Errno::EINVAL)
+        })
+        .transpose()?;
+
+    select_common(nfds, readfds, writefds, exceptfds, timeout)
+}
+
+/// Handle syscall `pselect`.
+pub(crate) fn sys_pselect(
+    nfds: u32,
+    readfds: Option<MutPtr<usize>>,
+    writefds: Option<MutPtr<usize>>,
+    exceptfds: Option<MutPtr<usize>>,
+    timeout: Option<ConstPtr<litebox_common_linux::Timespec>>,
+    sigsetpack: Option<ConstPtr<litebox_common_linux::SigSetPack>>,
+) -> Result<usize, Errno> {
+    if sigsetpack.is_some() {
+        unimplemented!("no sigsetpack support yet");
+    }
+    let timeout = timeout
+        .map(super::process::get_timeout)
+        .transpose()?
+        .map(Into::into);
+
+    select_common(nfds, readfds, writefds, exceptfds, timeout)
 }
 
 fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
