@@ -375,7 +375,7 @@ pub fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
 #[cfg(test)]
 mod tests {
     use crate::pipes::PipeError;
-    use crate::sync::waiter::WaitState;
+    use crate::sync::waiter::SimpleWaiter;
 
     extern crate std;
 
@@ -389,7 +389,9 @@ mod tests {
             let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
             let mut i = 0;
             while i < data.len() {
-                let ret = prod.write(&WaitState::new(platform), &data[i..]).unwrap();
+                let ret = prod
+                    .write(&SimpleWaiter::new(platform), &data[i..])
+                    .unwrap();
                 i += ret;
             }
             prod.shutdown();
@@ -399,7 +401,9 @@ mod tests {
         let mut buf = [0; 10];
         let mut i = 0;
         loop {
-            let ret = cons.read(&WaitState::new(platform), &mut buf[i..]).unwrap();
+            let ret = cons
+                .read(&SimpleWaiter::new(platform), &mut buf[i..])
+                .unwrap();
             if ret == 0 {
                 cons.shutdown();
                 break;
@@ -419,7 +423,7 @@ mod tests {
             let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
             let mut i = 0;
             while i < data.len() {
-                match prod.write(&WaitState::new(platform), &data[i..]) {
+                match prod.write(&SimpleWaiter::new(platform), &data[i..]) {
                     Ok(n) => {
                         i += n;
                     }
@@ -439,7 +443,7 @@ mod tests {
         let mut buf = [0; 10];
         let mut i = 0;
         loop {
-            match cons.read(&WaitState::new(platform), &mut buf[i..]) {
+            match cons.read(&SimpleWaiter::new(platform), &mut buf[i..]) {
                 Ok(n) => {
                     if n == 0 {
                         break;

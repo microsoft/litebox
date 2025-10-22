@@ -505,10 +505,9 @@ impl PollSet {
         mut lock_fds: impl FnMut() -> T,
         timeout: Option<Duration>,
     ) -> Result<(), Errno> {
-        let platform = litebox_platform_multiplex::platform();
-        let mut woken = Arc::new(AtomicBool::new(false));
-
         with_current_task(|task| {
+            let mut woken = Arc::new(AtomicBool::new(false));
+            let platform = task.platform;
         let start_time = platform.now();
         let mut register = true;
         let mut is_ready = timeout.is_some_and(|t| t.is_zero());
@@ -562,7 +561,6 @@ impl PollSet {
             register = false;
 
                 match task.as_waiter().wait_or_timeout(
-                    platform,
                     timeout.map(|t| t - platform.now().duration_since(&start_time)),
                     || woken.load(Ordering::Relaxed).then_some(()),
                 ) {
@@ -616,7 +614,7 @@ mod test {
 
     use super::EpollFile;
     use core::time::Duration;
-    use litebox::sync::waiter::WaitState;
+    use litebox::sync::waiter::SimpleWaiter;
 
     extern crate std;
 
@@ -649,7 +647,10 @@ mod test {
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
             copied_eventfd
-                .write(&WaitState::new(litebox_platform_multiplex::platform()), 1)
+                .write(
+                    &SimpleWaiter::new(litebox_platform_multiplex::platform()),
+                    1,
+                )
                 .unwrap();
         });
         epoll.wait(1024, None).unwrap();
@@ -678,7 +679,7 @@ mod test {
             assert_eq!(
                 producer
                     .write(
-                        &WaitState::new(litebox_platform_multiplex::platform()),
+                        &SimpleWaiter::new(litebox_platform_multiplex::platform()),
                         &[1, 2]
                     )
                     .unwrap(),
@@ -692,7 +693,7 @@ mod test {
         };
         consumer
             .read(
-                &WaitState::new(litebox_platform_multiplex::platform()),
+                &SimpleWaiter::new(litebox_platform_multiplex::platform()),
                 &mut buf,
             )
             .unwrap();
@@ -752,13 +753,16 @@ mod test {
         assert_eq!(revents(&set), Events::NVAL);
 
         eventfd
-            .write(&WaitState::new(litebox_platform_multiplex::platform()), 1)
+            .write(
+                &SimpleWaiter::new(litebox_platform_multiplex::platform()),
+                1,
+            )
             .unwrap();
         set.wait_or_timeout(|| fds, None);
         assert_eq!(revents(&set), Events::IN);
 
         eventfd
-            .read(&WaitState::new(litebox_platform_multiplex::platform()))
+            .read(&SimpleWaiter::new(litebox_platform_multiplex::platform()))
             .unwrap();
         set.wait_or_timeout(|| fds, Some(Duration::from_millis(100)));
         assert!(revents(&set).is_empty());
@@ -771,7 +775,10 @@ mod test {
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
             copied_eventfd
-                .write(&WaitState::new(litebox_platform_multiplex::platform()), 1)
+                .write(
+                    &SimpleWaiter::new(litebox_platform_multiplex::platform()),
+                    1,
+                )
                 .unwrap();
         });
 

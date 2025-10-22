@@ -21,7 +21,6 @@ use crate::{
 /// This supports polling, waiting (with optional timeouts), and notifications for observers.
 pub struct Pollee<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     subject: Subject<Events, Events, Platform>,
-    platform: &'static Platform,
 }
 
 /// The result of a tried operation.
@@ -44,7 +43,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
         Self {
             subject: Subject::new(litebox.sync()),
-            platform: litebox.x.platform,
         }
     }
 
@@ -80,7 +78,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
         let poller = Arc::new(Poller::new(waiter.waker()));
         self.register_observer(Arc::downgrade(&poller) as _, Events::all());
 
-        let r = waiter.wait_or_timeout(self.platform, timeout, || {
+        let r = waiter.wait_or_timeout(timeout, || {
             if !check() {
                 return None;
             }

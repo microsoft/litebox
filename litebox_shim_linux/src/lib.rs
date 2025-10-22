@@ -87,6 +87,7 @@ pub fn init_process<'a>(task: litebox_common_linux::TaskParams) -> &'a LiteBox<P
     // ```
     SHIM_TLS.init(LinuxShimTls {
         current_task: Task {
+            platform: litebox_platform_multiplex::platform(),
             wait_state: litebox::sync::waiter::WaitState::new(
                 litebox_platform_multiplex::platform(),
             ),
@@ -1081,6 +1082,7 @@ struct LinuxShimTls {
 }
 
 struct Task {
+    platform: &'static Platform,
     wait_state: litebox::sync::waiter::WaitState<Platform>,
     process: Arc<syscalls::process::Process>,
     /// Process ID
@@ -1125,6 +1127,10 @@ impl litebox::sync::waiter::GetWaitState<Platform> for Task {
     fn can_wait(&self) -> bool {
         // TODO: return false if there is a pending signal.
         true
+    }
+
+    fn platform(&self) -> &Platform {
+        self.platform
     }
 }
 

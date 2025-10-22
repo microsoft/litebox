@@ -26,6 +26,7 @@ impl<Platform: RawMutexProvider> WaitState<Platform> {
 pub trait GetWaitState<Platform: RawMutexProvider> {
     fn wait_state(&self) -> &WaitState<Platform>;
     fn can_wait(&self) -> bool;
+    fn platform(&self) -> &Platform;
 }
 
 const NOT_WAITING: u32 = 0;
@@ -44,13 +45,31 @@ pub enum WaitError {
     TimedOut,
 }
 
-impl<Platform: RawMutexProvider> GetWaitState<Platform> for WaitState<Platform> {
+pub struct SimpleWaiter<'a, Platform: RawMutexProvider> {
+    state: WaitState<Platform>,
+    platform: &'a Platform,
+}
+
+impl<'a, Platform: RawMutexProvider> SimpleWaiter<'a, Platform> {
+    pub fn new(platform: &'a Platform) -> Self {
+        Self {
+            state: WaitState::new(platform),
+            platform,
+        }
+    }
+}
+
+impl<Platform: RawMutexProvider> GetWaitState<Platform> for SimpleWaiter<'_, Platform> {
     fn wait_state(&self) -> &WaitState<Platform> {
-        self
+        &self.state
     }
 
     fn can_wait(&self) -> bool {
         true
+    }
+
+    fn platform(&self) -> &Platform {
+        self.platform
     }
 }
 
@@ -63,10 +82,10 @@ impl<Platform: RawMutexProvider + TimeProvider> dyn GetWaitState<Platform> + '_ 
 
     pub fn wait_or_timeout<R>(
         &self,
-        platform: &Platform,
         duration: Option<core::time::Duration>,
         mut f: impl FnMut() -> Option<R>,
     ) -> Result<R, WaitError> {
+        let platform = self.platform();
         let start_time = platform.now();
         let raw_mutex = self.wait_state().state.as_ref();
         let r = loop {

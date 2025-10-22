@@ -466,6 +466,7 @@ pub(crate) fn sys_clone(
                     tls,
                     set_child_tid,
                     task: Task {
+                        platform,
                         wait_state: litebox::sync::waiter::WaitState::new(platform),
                         pid: task.pid,
                         tid: child_tid,
@@ -765,11 +766,7 @@ pub(crate) fn sys_clock_nanosleep(
 
     match with_current_task(|task| {
         task.as_waiter()
-            .wait_or_timeout(
-                platform,
-                Some(duration),
-                || None::<core::convert::Infallible>,
-            )
+            .wait_or_timeout(Some(duration), || None::<core::convert::Infallible>)
     }) {
         Err(litebox::sync::waiter::WaitError::TimedOut) => Ok(()),
         Err(litebox::sync::waiter::WaitError::Interrupted) => {

@@ -119,7 +119,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFil
 
 #[cfg(test)]
 mod tests {
-    use litebox::sync::waiter::WaitState;
+    use litebox::sync::waiter::SimpleWaiter;
     use litebox_common_linux::{EfdFlags, errno::Errno};
 
     extern crate std;
@@ -138,7 +138,7 @@ mod tests {
             let copied_eventfd = eventfd.clone();
             std::thread::spawn(move || {
                 copied_eventfd
-                    .read(&WaitState::new(litebox_platform_multiplex::platform()))
+                    .read(&SimpleWaiter::new(litebox_platform_multiplex::platform()))
                     .unwrap();
             });
         }
@@ -146,7 +146,7 @@ mod tests {
         std::thread::sleep(core::time::Duration::from_millis(500));
         eventfd
             .write(
-                &WaitState::new(litebox_platform_multiplex::platform()),
+                &SimpleWaiter::new(litebox_platform_multiplex::platform()),
                 total,
             )
             .unwrap();
@@ -164,12 +164,15 @@ mod tests {
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
             copied_eventfd
-                .write(&WaitState::new(litebox_platform_multiplex::platform()), 1)
+                .write(
+                    &SimpleWaiter::new(litebox_platform_multiplex::platform()),
+                    1,
+                )
                 .unwrap();
             // block until the first read finishes
             copied_eventfd
                 .write(
-                    &WaitState::new(litebox_platform_multiplex::platform()),
+                    &SimpleWaiter::new(litebox_platform_multiplex::platform()),
                     u64::MAX - 1,
                 )
                 .unwrap();
@@ -177,13 +180,13 @@ mod tests {
 
         // block until the first write
         let ret = eventfd
-            .read(&WaitState::new(litebox_platform_multiplex::platform()))
+            .read(&SimpleWaiter::new(litebox_platform_multiplex::platform()))
             .unwrap();
         assert_eq!(ret, 1);
 
         // block until the second write
         let ret = eventfd
-            .read(&WaitState::new(litebox_platform_multiplex::platform()))
+            .read(&SimpleWaiter::new(litebox_platform_multiplex::platform()))
             .unwrap();
         assert_eq!(ret, u64::MAX - 1);
     }
@@ -202,7 +205,7 @@ mod tests {
             for _ in 0..10000 {
                 copied_eventfd
                     .write(
-                        &WaitState::new(litebox_platform_multiplex::platform()),
+                        &SimpleWaiter::new(litebox_platform_multiplex::platform()),
                         u64::MAX - 1,
                     )
                     .unwrap();
@@ -211,7 +214,7 @@ mod tests {
 
         for _ in 0..10000 {
             let ret = eventfd
-                .read(&WaitState::new(litebox_platform_multiplex::platform()))
+                .read(&SimpleWaiter::new(litebox_platform_multiplex::platform()))
                 .unwrap();
             assert_eq!(ret, u64::MAX - 1);
         }
@@ -229,7 +232,7 @@ mod tests {
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
             // first write should succeed immediately
-            let waiter = WaitState::new(litebox_platform_multiplex::platform());
+            let waiter = SimpleWaiter::new(litebox_platform_multiplex::platform());
             copied_eventfd.write(&waiter, 1).unwrap();
             // block until the first read finishes
             while let Err(e) = copied_eventfd.write(&waiter, u64::MAX - 1) {
@@ -240,7 +243,7 @@ mod tests {
 
         let read = |eventfd: &super::EventFile<litebox_platform_multiplex::Platform>,
                     expected_value: u64| {
-            let waiter = WaitState::new(litebox_platform_multiplex::platform());
+            let waiter = SimpleWaiter::new(litebox_platform_multiplex::platform());
             loop {
                 match eventfd.read(&waiter) {
                     Ok(ret) => {

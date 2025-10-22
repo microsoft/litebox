@@ -24,7 +24,6 @@ use thiserror::Error;
 /// In the future, this may be expanded to support multi-process futexes.
 pub struct FutexManager<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider> {
     table: HashTable<Platform>,
-    litebox: LiteBox<Platform>,
 }
 
 const HASH_TABLE_ENTRIES: usize = 256;
@@ -127,7 +126,6 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
                     })
                 }),
             },
-            litebox: litebox.clone(),
         }
     }
 
@@ -185,7 +183,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
             if futex_addr.load(Ordering::SeqCst) != expected_value {
                 return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);
             }
-            match waiter.wait_or_timeout(self.litebox.x.platform, timeout, || {
+            match waiter.wait_or_timeout(timeout, || {
                 entry.woken.load(Ordering::Acquire).then_some(())
             }) {
                 Ok(()) => Ok(()),
@@ -241,7 +239,7 @@ mod tests {
     use super::*;
     use crate::LiteBox;
     use crate::platform::mock::MockPlatform;
-    use crate::sync::waiter::WaitState;
+    use crate::sync::waiter::SimpleWaiter;
     use alloc::sync::Arc;
     use core::num::NonZeroU32;
     use core::sync::atomic::{AtomicU32, Ordering};
@@ -272,7 +270,7 @@ mod tests {
             barrier_clone.wait(); // Sync with main thread
 
             // Wait for value 0
-            futex_manager_clone.wait(&WaitState::new(platform), futex_addr, 0, None, None)
+            futex_manager_clone.wait(&SimpleWaiter::new(platform), futex_addr, 0, None, None)
         });
 
         barrier.wait(); // Wait for waiter to be ready
@@ -318,7 +316,7 @@ mod tests {
 
             // Wait for value 0 with some timeout
             futex_manager_clone.wait(
-                &WaitState::new(platform),
+                &SimpleWaiter::new(platform),
                 futex_addr,
                 0,
                 Some(Duration::from_millis(300)),
@@ -371,7 +369,7 @@ mod tests {
 
                 // Wait for value 0 with some timeout
                 futex_manager_clone.wait(
-                    &WaitState::new(platform),
+                    &SimpleWaiter::new(platform),
                     futex_addr,
                     0,
                     Some(Duration::from_millis(300)),
