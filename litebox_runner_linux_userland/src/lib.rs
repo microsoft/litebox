@@ -217,20 +217,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     shim.set_fs(initial_file_system);
 
-    litebox_shim_linux::litebox_net()
-        .lock()
-        .set_platform_interaction(litebox::net::PlatformInteraction::Manual);
     if cli_args.tun_device_name.is_some() {
         std::thread::spawn(|| {
             // TODO: use `poll` rather than busy-looping
+            // Also, we need to terminate this thread when the main program exits
             loop {
-                if litebox_shim_linux::litebox_net()
-                    .lock()
-                    .perform_platform_interaction()
-                    .call_again_immediately()
-                {
-                    continue;
-                }
+                while litebox_shim_linux::perform_network_interaction().call_again_immediately() {}
                 core::hint::spin_loop();
             }
         });

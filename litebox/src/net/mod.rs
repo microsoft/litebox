@@ -127,7 +127,7 @@ pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvide
     specific: ProtocolSpecific,
     pollee: crate::event::polling::Pollee<Platform>,
     /// Whether the socket was last known to be able to send
-    can_send_last: core::sync::atomic::AtomicBool,
+    previously_sendable: core::sync::atomic::AtomicBool,
     /// Number of octets in the receive queue
     recv_queue: core::sync::atomic::AtomicUsize,
 }
@@ -167,7 +167,7 @@ pub(crate) struct TcpSpecific {
     /// Server socket specific data
     server_socket: Option<TcpServerSpecific>,
     /// Whether the socket was last known to be able to accept
-    can_accept_last: core::sync::atomic::AtomicBool,
+    previously_acceptable: core::sync::atomic::AtomicBool,
 }
 
 /// Socket-specific data for TCP server sockets
@@ -552,7 +552,7 @@ where
                 Protocol::Tcp => ProtocolSpecific::Tcp(TcpSpecific {
                     local_port: None,
                     server_socket: None,
-                    can_accept_last: core::sync::atomic::AtomicBool::new(false),
+                    previously_acceptable: core::sync::atomic::AtomicBool::new(false),
                 }),
                 Protocol::Udp => ProtocolSpecific::Udp(UdpSpecific {
                     remote_endpoint: None,
@@ -561,7 +561,7 @@ where
                 Protocol::Raw { protocol: _ } => unimplemented!(),
             },
             pollee: crate::event::polling::Pollee::new(&self.litebox),
-            can_send_last: core::sync::atomic::AtomicBool::new(false),
+            previously_sendable: core::sync::atomic::AtomicBool::new(false),
             recv_queue: core::sync::atomic::AtomicUsize::new(0),
         }))
     }
@@ -924,7 +924,7 @@ where
                 };
                 // Reset the accept state tracking so that [`Network::check_socket_events`] can send new events.
                 handle
-                    .can_accept_last
+                    .previously_acceptable
                     .store(false, core::sync::atomic::Ordering::Relaxed);
                 // Pull that position out of the listening handles
                 let ready_handle = server_socket.socket_set_handles.swap_remove(position);
@@ -947,10 +947,10 @@ where
                     specific: ProtocolSpecific::Tcp(TcpSpecific {
                         local_port,
                         server_socket: None,
-                        can_accept_last: core::sync::atomic::AtomicBool::new(false),
+                        previously_acceptable: core::sync::atomic::AtomicBool::new(false),
                     }),
                     pollee: crate::event::polling::Pollee::new(&self.litebox),
-                    can_send_last: core::sync::atomic::AtomicBool::new(true),
+                    previously_sendable: core::sync::atomic::AtomicBool::new(true),
                     recv_queue: core::sync::atomic::AtomicUsize::new(0),
                 }))
             }
@@ -1032,7 +1032,7 @@ where
         if let Ok(0) = ret {
             // If we sent 0 bytes, then we are not writable anymore
             socket_handle
-                .can_send_last
+                .previously_sendable
                 .store(false, core::sync::atomic::Ordering::Relaxed);
         }
 
@@ -1239,7 +1239,9 @@ where
 
     /// Get the [`Events`] for a socket handle [`SocketHandle`].
     ///
-    /// If `new_events_only` is true, only events that are new since the last check are returned.
+    /// If `new_events_only` is true, only events representing meaningful state changes
+    /// since the last check are returned (e.g., new data arrived, socket became writable,
+    /// new connections became acceptable).
     fn check_socket_events(
         &self,
         socket_handle: &SocketHandle<Platform>,
@@ -1253,7 +1255,7 @@ where
         let recv_queue_last = socket_handle
             .recv_queue
             .load(core::sync::atomic::Ordering::Relaxed);
-        let (recv_queue_now, can_send_now, can_recv_now) = match socket_handle.protocol() {
+        let (recv_queue_now, sendable_now, receivable_now) = match socket_handle.protocol() {
             Protocol::Tcp => {
                 let tcp_socket = self.socket_set.get::<tcp::Socket>(socket_handle.handle);
                 (
@@ -1275,7 +1277,7 @@ where
         };
 
         if new_events_only {
-            if recv_queue_now > recv_queue_last && can_recv_now {
+            if recv_queue_now > recv_queue_last && receivable_now {
                 socket_handle
                     .recv_queue
                     .store(recv_queue_now, core::sync::atomic::Ordering::Relaxed);
@@ -1283,21 +1285,21 @@ where
                 events |= Events::IN;
             }
 
-            let can_send_last = socket_handle
-                .can_send_last
+            let previously_sendable = socket_handle
+                .previously_sendable
                 .load(core::sync::atomic::Ordering::Relaxed);
-            if !can_send_last && can_send_now {
+            if !previously_sendable && sendable_now {
                 socket_handle
-                    .can_send_last
+                    .previously_sendable
                     .store(true, core::sync::atomic::Ordering::Relaxed);
                 // We can now send, so we should notify
                 events |= Events::OUT;
             }
         } else {
-            if can_recv_now {
+            if receivable_now {
                 events |= Events::IN;
             }
-            if can_send_now {
+            if sendable_now {
                 events |= Events::OUT;
             }
         }
@@ -1308,10 +1310,10 @@ where
         {
             let tcp_specific = socket_handle.specific.tcp();
             if let Some(server_socket) = tcp_specific.server_socket.as_ref() {
-                let can_accept_last = tcp_specific
-                    .can_accept_last
+                let previously_acceptable = tcp_specific
+                    .previously_acceptable
                     .load(core::sync::atomic::Ordering::Relaxed);
-                if !new_events_only || !can_accept_last {
+                if !new_events_only || !previously_acceptable {
                     server_socket
                         .socket_set_handles
                         .iter()
@@ -1321,7 +1323,7 @@ where
                         })
                         .then(|| {
                             tcp_specific
-                                .can_accept_last
+                                .previously_acceptable
                                 .store(true, core::sync::atomic::Ordering::Relaxed);
                             events.insert(Events::IN);
                         });

@@ -288,9 +288,17 @@ pub fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE> {
 pub(crate) fn litebox_net<'a>() -> &'a litebox::sync::Mutex<Platform, Network<Platform>> {
     static NET: OnceBox<litebox::sync::Mutex<Platform, Network<Platform>>> = OnceBox::new();
     NET.get_or_init(|| {
-        let net = Network::new(litebox());
+        let mut net = Network::new(litebox());
+        net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
         alloc::boxed::Box::new(litebox().sync().new_mutex(net))
     })
+}
+
+/// Perform queued network interactions with the outside world.
+///
+/// This function should be invoked in a loop, based on the returned advice.
+pub fn perform_network_interaction() -> litebox::net::PlatformInteractionReinvocationAdvice {
+    litebox_net().lock().perform_platform_interaction()
 }
 
 pub(crate) fn litebox_pipes<'a>() -> &'a litebox::sync::RwLock<Platform, Pipes<Platform>> {

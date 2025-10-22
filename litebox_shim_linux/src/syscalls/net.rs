@@ -952,16 +952,11 @@ mod tests {
 
     fn init_platform(tun_device_name: Option<&str>) -> crate::Task {
         let task = crate::syscalls::tests::init_platform(tun_device_name);
-        crate::litebox_net()
-            .lock()
-            .set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+        // Start a background thread to perform network interaction
+        // Naive implementation for testing purpose only
         std::thread::spawn(|| {
             loop {
-                while crate::litebox_net()
-                    .lock()
-                    .perform_platform_interaction()
-                    .call_again_immediately()
-                {}
+                while crate::perform_network_interaction().call_again_immediately() {}
                 core::hint::spin_loop();
             }
         });

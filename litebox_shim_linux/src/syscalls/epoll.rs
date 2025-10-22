@@ -398,7 +398,7 @@ impl ReadySet {
                 break;
             }
 
-            // Note the lock operation was moved into the loop to avoid holding the lock while calling `poll()`.
+            // Note the lock operation is performed inside the loop to avoid holding the lock while calling `poll()`.
             // e.g., `poll` on a socket requires lock on network, and a deadlock may happen if another thread
             // holds the network lock and tries to add an entry to the same epoll instance upon new events.
             let Some(weak_entry) = self.entries.lock().pop_front() else {
