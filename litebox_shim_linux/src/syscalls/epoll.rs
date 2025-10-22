@@ -8,13 +8,16 @@ use alloc::{
 use litebox::{
     LiteBox,
     event::{Events, IOPollable, observer::Observer, polling::Pollee},
-    platform::{Instant as _, RawMutex as _, RawMutexProvider as _, TimeProvider as _},
+    platform::{Instant as _, TimeProvider as _},
     utils::ReinterpretUnsignedExt,
 };
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
 use crate::Descriptor;
+use crate::with_current_task;
+use core::sync::atomic::Ordering;
+use litebox::sync::waiter::WaitError;
 
 bitflags::bitflags! {
     /// Linux's epoll flags.
@@ -138,8 +141,10 @@ impl EpollFile {
         maxevents: usize,
         timeout: Option<Duration>,
     ) -> Result<Vec<EpollEvent>, Errno> {
+        with_current_task(|task| {
         let mut events = Vec::new();
         match self.ready.pollee.wait_or_timeout(
+                task,
             timeout,
             || {
                 self.ready.pop_multiple(maxevents, &mut events);
@@ -154,6 +159,7 @@ impl EpollFile {
             Err(e) => return Err(e.into()),
         }
         Ok(events)
+        })
     }
 
     pub(crate) fn epoll_ctl(
@@ -456,7 +462,10 @@ struct PollEntry {
     observer: Option<Arc<PollEntryObserver>>,
 }
 
-struct PollEntryObserver(Arc<<Platform as litebox::platform::RawMutexProvider>::RawMutex>);
+struct PollEntryObserver {
+    waker: litebox::sync::waiter::Waker<Platform>,
+    woken: Arc<AtomicBool>,
+}
 
 /// Trait for testing `PollSet`.
 pub(crate) trait GetFd {
@@ -495,10 +504,11 @@ impl PollSet {
         &mut self,
         mut lock_fds: impl FnMut() -> T,
         timeout: Option<Duration>,
-    ) {
+    ) -> Result<(), Errno> {
         let platform = litebox_platform_multiplex::platform();
-        let condvar = Arc::new(platform.new_raw_mutex());
+        let mut woken = Arc::new(AtomicBool::new(false));
 
+        with_current_task(|task| {
         let start_time = platform.now();
         let mut register = true;
         let mut is_ready = timeout.is_some_and(|t| t.is_zero());
@@ -522,7 +532,10 @@ impl PollSet {
                         // instead OR the new registration into the existing
                         // one, then we can use a single observer for all
                         // entries.
-                        let observer = Arc::new(PollEntryObserver(condvar.clone()));
+                            let observer = Arc::new(PollEntryObserver {
+                                waker: task.as_waiter().waker(),
+                                woken: woken.clone(),
+                            });
                         let weak = Arc::downgrade(&observer);
                         entry.observer = Some(observer);
                         Some(weak as _)
@@ -548,24 +561,26 @@ impl PollSet {
             // Don't register observers again in the next iteration.
             register = false;
 
-            let remaining_time =
-                timeout.map(|t| t.saturating_sub(platform.now().duration_since(&start_time)));
-            if let Some(remaining_time) = remaining_time {
-                if matches!(
-                    condvar.block_or_timeout(0, remaining_time),
-                    Ok(litebox::platform::UnblockedOrTimedOut::TimedOut),
+                match task.as_waiter().wait_or_timeout(
+                    platform,
+                    timeout.map(|t| t - platform.now().duration_since(&start_time)),
+                    || woken.load(Ordering::Relaxed).then_some(()),
                 ) {
+                    Ok(()) => {
+                        woken.store(false, Ordering::SeqCst);
+                    }
+                    Err(WaitError::TimedOut) => {
                     // Timed out. Loop around once more to check if any fds are
                     // ready, to match Linux behavior.
                     is_ready = true;
                 }
-            } else {
-                condvar.block(0);
+                    Err(WaitError::Interrupted) => {
+                        return Err(Errno::EINTR);
             }
-            condvar
-                .underlying_atomic()
-                .store(0, core::sync::atomic::Ordering::Relaxed);
         }
+    }
+            Ok(())
+        })
     }
 
     /// Returns the accumulated `revents` for each entry in the poll set.
@@ -585,10 +600,9 @@ impl PollSet {
 
 impl Observer<Events> for PollEntryObserver {
     fn on_events(&self, events: &Events) {
-        self.0
-            .underlying_atomic()
-            .store(1, core::sync::atomic::Ordering::Release);
-        self.0.wake_one();
+        self.woken
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+        self.waker.wake();
     }
 }
 
@@ -602,6 +616,7 @@ mod test {
 
     use super::EpollFile;
     use core::time::Duration;
+    use litebox::sync::waiter::WaitState;
 
     extern crate std;
 
@@ -633,7 +648,9 @@ mod test {
         // spawn a thread to write to the eventfd
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
-            copied_eventfd.write(1).unwrap();
+            copied_eventfd
+                .write(&WaitState::new(litebox_platform_multiplex::platform()), 1)
+                .unwrap();
         });
         epoll.wait(1024, None).unwrap();
     }
@@ -658,14 +675,27 @@ mod test {
         // spawn a thread to write to the pipe
         std::thread::spawn(move || {
             std::thread::sleep(core::time::Duration::from_millis(100));
-            assert_eq!(producer.write(&[1, 2]).unwrap(), 2);
+            assert_eq!(
+                producer
+                    .write(
+                        &WaitState::new(litebox_platform_multiplex::platform()),
+                        &[1, 2]
+                    )
+                    .unwrap(),
+                2
+            );
         });
         epoll.wait(1024, None).unwrap();
         let mut buf = [0; 2];
         let super::EpollDescriptor::PipeReader(consumer) = reader else {
             unreachable!();
         };
-        consumer.read(&mut buf).unwrap();
+        consumer
+            .read(
+                &WaitState::new(litebox_platform_multiplex::platform()),
+                &mut buf,
+            )
+            .unwrap();
         assert_eq!(buf, [1, 2]);
     }
 
@@ -721,11 +751,15 @@ mod test {
         set.wait_or_timeout(|| no_fds, None);
         assert_eq!(revents(&set), Events::NVAL);
 
-        eventfd.write(1).unwrap();
+        eventfd
+            .write(&WaitState::new(litebox_platform_multiplex::platform()), 1)
+            .unwrap();
         set.wait_or_timeout(|| fds, None);
         assert_eq!(revents(&set), Events::IN);
 
-        eventfd.read().unwrap();
+        eventfd
+            .read(&WaitState::new(litebox_platform_multiplex::platform()))
+            .unwrap();
         set.wait_or_timeout(|| fds, Some(Duration::from_millis(100)));
         assert!(revents(&set).is_empty());
 
@@ -736,7 +770,9 @@ mod test {
         // spawn a thread to write to the eventfd
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
-            copied_eventfd.write(1).unwrap();
+            copied_eventfd
+                .write(&WaitState::new(litebox_platform_multiplex::platform()), 1)
+                .unwrap();
         });
 
         set.wait_or_timeout(|| fds, None);

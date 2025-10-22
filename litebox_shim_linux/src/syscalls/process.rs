@@ -10,8 +10,8 @@ use core::sync::atomic::AtomicI32;
 use litebox::mm::linux::VmFlags;
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{
-    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutex as _,
-    RawMutexProvider as _, ThreadLocalStorageProvider as _,
+    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _,
+    ThreadLocalStorageProvider as _,
 };
 use litebox::platform::{RawMutPointer as _, ThreadProvider as _};
 #[cfg(target_arch = "x86")]
@@ -459,12 +459,14 @@ pub(crate) fn sys_clone(
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
         let r = unsafe {
-            litebox_platform_multiplex::platform().spawn_thread(
+            let platform = litebox_platform_multiplex::platform();
+            platform.spawn_thread(
                 &ctx_copy,
                 Box::new(NewThreadArgs {
                     tls,
                     set_child_tid,
                     task: Task {
+                        wait_state: litebox::sync::waiter::WaitState::new(platform),
                         pid: task.pid,
                         tid: child_tid,
                         ppid: task.ppid,
@@ -761,20 +763,21 @@ pub(crate) fn sys_clock_nanosleep(
         request
     };
 
-    // Reuse the raw mutex provider to implement sleep.
-    //
-    // TODO: consider a new litebox API to directly sleep, with integration with
-    // interruptions.
-    let r = platform.new_raw_mutex().block_or_timeout(0, duration);
-    assert!(matches!(
-        r,
-        Ok(litebox::platform::UnblockedOrTimedOut::TimedOut)
-    ),);
-
-    // TODO: update the remainder for non-absolute sleeps interrupted by signals.
-    let _ = remain;
-
-    Ok(())
+    match with_current_task(|task| {
+        task.as_waiter()
+            .wait_or_timeout(
+                platform,
+                Some(duration),
+                || None::<core::convert::Infallible>,
+            )
+    }) {
+        Err(litebox::sync::waiter::WaitError::TimedOut) => Ok(()),
+        Err(litebox::sync::waiter::WaitError::Interrupted) => {
+            // TODO: update the remainder for non-absolute sleeps interrupted by signals.
+            let _ = remain;
+            Err(Errno::EINTR)
+        }
+    }
 }
 
 /// Handle syscall `gettimeofday`.
@@ -910,7 +913,7 @@ pub(crate) fn sys_futex(
             warn_shared_futex!(flags);
             let futex_manager = crate::litebox_futex_manager();
             let timeout = timeout.map(get_timeout).transpose()?.map(Into::into);
-            futex_manager.wait(addr, val, timeout, None)?;
+            with_current_task(|task| futex_manager.wait(task, addr, val, timeout, None))?;
             0
         }
         litebox_common_linux::FutexArgs::WaitBitset {
@@ -933,7 +936,15 @@ pub(crate) fn sys_futex(
                 ts.sub_timespec(&now).unwrap_or(core::time::Duration::ZERO)
             });
             let futex_manager = crate::litebox_futex_manager();
-            futex_manager.wait(addr, val, timeout, core::num::NonZeroU32::new(bitmask))?;
+            with_current_task(|task| {
+                futex_manager.wait(
+                    task,
+                    addr,
+                    val,
+                    timeout,
+                    core::num::NonZeroU32::new(bitmask),
+                )
+            })?;
             0
         }
         _ => unimplemented!("Unsupported futex operation"),

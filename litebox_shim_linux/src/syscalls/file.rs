@@ -196,6 +196,7 @@ pub(crate) fn sys_unlinkat(
 /// `offset` is an optional offset to read from. If `None`, it will read from the current file position.
 /// If `Some`, it will read from the specified offset without changing the current file position.
 pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize, Errno> {
+    with_current_task(|task| {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
@@ -227,7 +228,7 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
         Descriptor::PipeReader { consumer, .. } => {
             let consumer = consumer.clone();
             drop(file_table);
-            Ok(consumer.read(buf)?)
+                Ok(consumer.read(task, buf)?)
         }
         Descriptor::PipeWriter { .. } | Descriptor::Epoll { .. } => Err(Errno::EINVAL),
         Descriptor::Eventfd { file, .. } => {
@@ -236,11 +237,12 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
             if buf.len() < size_of::<u64>() {
                 return Err(Errno::EINVAL);
             }
-            let value = file.read()?;
+                let value = file.read(task)?;
             buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
             Ok(size_of::<u64>())
         }
     }
+    })
 }
 
 /// Handle syscall `write`
@@ -248,6 +250,7 @@ pub fn sys_read(fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize,
 /// `offset` is an optional offset to write to. If `None`, it will write to the current file position.
 /// If `Some`, it will write to the specified offset without changing the current file position.
 pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Errno> {
+    with_current_task(|task| {
     let Ok(fd) = u32::try_from(fd) else {
         return Err(Errno::EBADF);
     };
@@ -264,7 +267,7 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
         Descriptor::PipeWriter { producer, .. } => {
             let producer = producer.clone();
             drop(file_table);
-            Ok(producer.write(buf)?)
+                Ok(producer.write(task, buf)?)
         }
         Descriptor::Eventfd { file, .. } => {
             let file = file.clone();
@@ -274,9 +277,10 @@ pub fn sys_write(fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Er
                     .try_into()
                     .map_err(|_| Errno::EINVAL)?,
             );
-            file.write(value)
+                file.write(task, value)
         }
     }
+    })
 }
 
 /// Handle syscall `pread64`

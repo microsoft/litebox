@@ -9,22 +9,19 @@ use super::{
 };
 use crate::{
     LiteBox,
-    platform::{
-        ImmediatelyWokenUp, Instant as _, RawMutex as _, TimeProvider, UnblockedOrTimedOut,
+    platform::TimeProvider,
+    sync::{
+        RawSyncPrimitivesProvider,
+        waiter::{WaitError, Waiter, Waker},
     },
-    sync::RawSyncPrimitivesProvider,
 };
 
 /// A pollable entity that can be observed for events.
 ///
 /// This supports polling, waiting (with optional timeouts), and notifications for observers.
 pub struct Pollee<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    inner: Arc<PolleeInner<Platform>>,
-    litebox: LiteBox<Platform>,
-}
-
-struct PolleeInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     subject: Subject<Events, Events, Platform>,
+    platform: &'static Platform,
 }
 
 /// The result of a tried operation.
@@ -34,19 +31,20 @@ pub enum TryOpError<E> {
     TryAgain,
     #[error("operation timed out")]
     TimedOut,
+    #[error("operation interrupted")]
+    Interrupted,
     #[error(transparent)]
     Other(E),
 }
 
+pub struct TryAgain;
+
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     /// Create a new pollee.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
-        let inner = Arc::new(PolleeInner {
-            subject: Subject::new(litebox.sync()),
-        });
         Self {
-            inner,
-            litebox: litebox.clone(),
+            subject: Subject::new(litebox.sync()),
+            platform: litebox.x.platform,
         }
     }
 
@@ -63,6 +61,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     /// to reduce the number of times `try_op` is invoked.
     pub fn wait_or_timeout<R, E>(
         &self,
+        waiter: Waiter<Platform>,
         timeout: Option<core::time::Duration>,
         mut try_op: impl FnMut() -> Result<R, TryOpError<E>>,
         check: impl Fn() -> bool,
@@ -78,91 +77,55 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
             return Err(TryOpError::TimedOut);
         }
 
-        let start_time = self.litebox.x.platform.now();
-        let poller = Arc::new(Poller::new(&self.litebox));
+        let poller = Arc::new(Poller::new(waiter.waker()));
         self.register_observer(Arc::downgrade(&poller) as _, Events::all());
 
-        loop {
+        let r = waiter.wait_or_timeout(self.platform, timeout, || {
             if !check() {
-                let remaining_time = timeout.map(|t| {
-                    t.saturating_sub(self.litebox.x.platform.now().duration_since(&start_time))
-                });
-                poller
-                    .wait_or_timeout(remaining_time)
-                    .map_err(|TimedOut| TryOpError::TimedOut)?;
+                return None;
             }
-            // We always run `try_op` whether `check` returns true or false; we simply delay running
-            // `try_op` for a little while if `check` has returned `false`.
             match try_op() {
-                Err(TryOpError::TryAgain) => {}
-                ret => return ret,
+                Err(TryOpError::TryAgain) => None,
+                r => Some(r),
             }
-        }
+        });
+        r.map_err(|err| match err {
+            WaitError::Interrupted => TryOpError::Interrupted,
+            WaitError::TimedOut => TryOpError::TimedOut,
+        })?
     }
 
     /// Register an observer for events that satisfy the given `filter`.
     pub fn register_observer(&self, observer: Weak<dyn Observer<Events>>, filter: Events) {
-        self.inner
-            .subject
+        self.subject
             .register_observer(observer, filter | Events::ALWAYS_POLLED);
     }
 
     /// Unregister an observer.
     pub fn unregister_observer(&self, observer: Weak<dyn Observer<Events>>) {
-        self.inner.subject.unregister_observer(observer);
+        self.subject.unregister_observer(observer);
     }
 
     /// Notify all registered observers with the given events.
     pub fn notify_observers(&self, events: Events) {
-        self.inner.subject.notify_observers(events);
+        self.subject.notify_observers(events);
     }
 }
 
 /// Private observer, used solely to help implement `Pollee::wait_or_timeout`
 struct Poller<Platform: RawSyncPrimitivesProvider> {
-    condvar: Platform::RawMutex,
+    waker: Waker<Platform>,
 }
-
-/// A trivial zero-sized error returned by `Poller::wait_or_timeout`
-struct TimedOut;
 
 impl<Platform: RawSyncPrimitivesProvider> Poller<Platform> {
     /// Create a new poller.
-    fn new(litebox: &LiteBox<Platform>) -> Self {
-        Self {
-            condvar: litebox.x.platform.new_raw_mutex(),
-        }
-    }
-
-    /// Wait for the poller to be notified.
-    ///
-    /// If the timeout is not `None`, it will be updated to the remaining time after waiting.
-    fn wait_or_timeout(&self, timeout: Option<core::time::Duration>) -> Result<(), TimedOut> {
-        if timeout.is_some_and(|t| t.is_zero()) {
-            return Err(TimedOut);
-        }
-        let futex = self.condvar.underlying_atomic();
-        if futex.swap(0, core::sync::atomic::Ordering::Relaxed) == 0 {
-            if let Some(timeout) = timeout {
-                match self.condvar.block_or_timeout(0, timeout) {
-                    Ok(UnblockedOrTimedOut::TimedOut) => Err(TimedOut),
-                    Ok(UnblockedOrTimedOut::Unblocked) | Err(ImmediatelyWokenUp) => Ok(()),
-                }
-            } else {
-                let _ = self.condvar.block(0);
-                Ok(())
-            }
-        } else {
-            Ok(())
-        }
+    fn new(waker: Waker<Platform>) -> Self {
+        Self { waker }
     }
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Observer<Events> for Poller<Platform> {
     fn on_events(&self, _events: &Events) {
-        self.condvar
-            .underlying_atomic()
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        self.condvar.wake_one();
+        self.waker.wake();
     }
 }

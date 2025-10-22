@@ -24,7 +24,7 @@ use crate::{
     },
     fs::OFlags,
     platform::TimeProvider,
-    sync::{Mutex, RawSyncPrimitivesProvider},
+    sync::{Mutex, RawSyncPrimitivesProvider, waiter::Waiter},
 };
 
 struct EndPointer<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
@@ -106,6 +106,8 @@ pub enum PipeError {
     Closed,
     #[error("this operation would block")]
     WouldBlock,
+    #[error("interrupted while waiting")]
+    Interrupted,
 }
 
 impl From<TryOpError<PipeError>> for PipeError {
@@ -113,6 +115,7 @@ impl From<TryOpError<PipeError>> for PipeError {
         match err {
             TryOpError::TryAgain => PipeError::WouldBlock,
             TryOpError::TimedOut => unreachable!(),
+            TryOpError::Interrupted => PipeError::Interrupted,
             TryOpError::Other(e) => e,
         }
     }
@@ -167,7 +170,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T
     /// Write the values in `buf` into the pipe, returning the number of elements written.
     ///
     /// See [`new_pipe`] for details on blocking and atomicity of writes.
-    pub fn write(&self, buf: &[T]) -> Result<usize, PipeError>
+    pub fn write(&self, waiter: Waiter<Platform>, buf: &[T]) -> Result<usize, PipeError>
     where
         T: Copy,
     {
@@ -175,6 +178,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T
             self.try_write(buf)
         } else {
             self.endpoint.pollee.wait_or_timeout(
+                waiter,
                 None,
                 || self.try_write(buf),
                 || {
@@ -282,7 +286,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> ReadEnd<Platform, T>
     /// Read values in the pipe into `buf`, returning the number of elements read.
     ///
     /// See [`new_pipe`] for details on blocking behavior.
-    pub fn read(&self, buf: &mut [T]) -> Result<usize, PipeError>
+    pub fn read(&self, waiter: Waiter<Platform>, buf: &mut [T]) -> Result<usize, PipeError>
     where
         T: Copy,
     {
@@ -290,6 +294,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> ReadEnd<Platform, T>
             self.try_read(buf)
         } else {
             self.endpoint.pollee.wait_or_timeout(
+                waiter,
                 None,
                 || self.try_read(buf),
                 || {
@@ -370,6 +375,7 @@ pub fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
 #[cfg(test)]
 mod tests {
     use crate::pipes::PipeError;
+    use crate::sync::waiter::WaitState;
 
     extern crate std;
 
@@ -383,7 +389,7 @@ mod tests {
             let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
             let mut i = 0;
             while i < data.len() {
-                let ret = prod.write(&data[i..]).unwrap();
+                let ret = prod.write(&WaitState::new(platform), &data[i..]).unwrap();
                 i += ret;
             }
             prod.shutdown();
@@ -393,7 +399,7 @@ mod tests {
         let mut buf = [0; 10];
         let mut i = 0;
         loop {
-            let ret = cons.read(&mut buf[i..]).unwrap();
+            let ret = cons.read(&WaitState::new(platform), &mut buf[i..]).unwrap();
             if ret == 0 {
                 cons.shutdown();
                 break;
@@ -413,7 +419,7 @@ mod tests {
             let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
             let mut i = 0;
             while i < data.len() {
-                match prod.write(&data[i..]) {
+                match prod.write(&WaitState::new(platform), &data[i..]) {
                     Ok(n) => {
                         i += n;
                     }
@@ -433,7 +439,7 @@ mod tests {
         let mut buf = [0; 10];
         let mut i = 0;
         loop {
-            match cons.read(&mut buf[i..]) {
+            match cons.read(&WaitState::new(platform), &mut buf[i..]) {
                 Ok(n) => {
                     if n == 0 {
                         break;

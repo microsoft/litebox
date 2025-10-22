@@ -16,6 +16,7 @@ mod rwlock;
 
 #[cfg(feature = "lock_tracing")]
 mod lock_tracing;
+pub mod waiter;
 
 pub use condvar::Condvar;
 pub use mutex::{Mutex, MutexGuard};
