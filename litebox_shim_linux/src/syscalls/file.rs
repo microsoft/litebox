@@ -1174,8 +1174,7 @@ pub(crate) fn sys_epoll_ctl(
     };
 
     let file = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
-    let file_descriptor = super::epoll::EpollDescriptor::try_from(file)
-        .expect("file should still be alive under lock");
+    let file_descriptor = super::epoll::EpollDescriptor::try_from(file)?;
     let event = if op == litebox_common_linux::EpollOp::EpollCtlDel {
         None
     } else {
