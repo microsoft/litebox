@@ -218,14 +218,17 @@ pub(crate) fn create_tar_with_cache(tar_dir: &Path, tar_file: &Path, unique_name
 
     // Create command string for caching
     let tar_filename = format!("../rootfs_{unique_name}.tar");
-    let args = [
-        "-cvf",
-        tar_filename.as_str(),
-        "lib",
-        "lib32",
-        "lib64",
-        "out",
-    ];
+    let mut args = vec!["-cvf", tar_filename.as_str()];
+    // collect all entries in the tar_dir
+    let all_entries = tar_dir
+        .read_dir()
+        .expect("Failed to read tar directory")
+        .into_iter()
+        .filter_map(|entry| entry.map(|e| e.file_name()).ok())
+        .collect::<Vec<_>>();
+    for entry in all_entries.iter() {
+        args.push(entry.to_str().unwrap());
+    }
     let mut command_parts = vec!["tar"];
     command_parts.extend_from_slice(&args);
     let command = command_parts.join(" ");

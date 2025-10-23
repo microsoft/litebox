@@ -70,7 +70,7 @@ fn run_target_program(
             }
         }
     }
-    install_files(tar_dir.join("out"));
+    install_files(tar_dir.clone());
 
     // litebox_rtld_audit.so is already built by build.rs and available in OUT_DIR
     if let Backend::Rewriter = backend
@@ -243,7 +243,7 @@ console.log(content);
         &[],
         |out_dir| {
             // write the test js file to the output directory
-            std::fs::write(out_dir.join("hello_world.js"), HELLO_WORLD_JS).unwrap();
+            std::fs::write(out_dir.join("out/hello_world.js"), HELLO_WORLD_JS).unwrap();
         },
         "hello_node_seccomp",
         None,
@@ -268,7 +268,7 @@ console.log(content);
         &[],
         |out_dir| {
             // write the test js file to the output directory
-            std::fs::write(out_dir.join("hello_world.js"), HELLO_WORLD_JS).unwrap();
+            std::fs::write(out_dir.join("out/hello_world.js"), HELLO_WORLD_JS).unwrap();
         },
         "hello_node_rewriter",
         None,
@@ -314,7 +314,7 @@ fn test_runner_with_ls() {
     for each in [".", "..", "libc.so.6", "libpcre2-8.so.0", "libselinux.so.1"] {
         assert!(
             normalized.contains(&each),
-            "unexpected ls output:\n{output_str}\n{each} not found",
+            "unexpected ls output:\n{output_str}",
         );
     }
 }
