@@ -1492,6 +1492,7 @@ pub(crate) fn sys_pselect(
 }
 
 fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
+    let close_on_exec = flags.contains(OFlags::CLOEXEC);
     match file {
         Descriptor::LiteBoxRawFd(raw_fd) => {
             use alloc::sync::Arc;
@@ -1502,7 +1503,7 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
                 Ok(fd) => {
                     let fd: Arc<litebox::fd::TypedFd<crate::LinuxFS>> = fd;
                     let fd = dt.duplicate(&fd).ok_or(Errno::EBADF)?;
-                    if flags.contains(OFlags::CLOEXEC) {
+                    if close_on_exec {
                         let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
                         assert!(old.is_none());
                     }
@@ -1529,7 +1530,22 @@ fn do_dup(file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
                 }
             }
         }
-        _ => todo!(),
+        Descriptor::PipeReader { consumer, .. } => Ok(Descriptor::PipeReader {
+            consumer: consumer.clone(),
+            close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
+        }),
+        Descriptor::PipeWriter { producer, .. } => Ok(Descriptor::PipeWriter {
+            producer: producer.clone(),
+            close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
+        }),
+        Descriptor::Eventfd { file, .. } => Ok(Descriptor::Eventfd {
+            file: file.clone(),
+            close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
+        }),
+        Descriptor::Epoll { file, .. } => Ok(Descriptor::Epoll {
+            file: file.clone(),
+            close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
+        }),
     }
 }
 
