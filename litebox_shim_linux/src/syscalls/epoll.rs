@@ -14,7 +14,7 @@ use litebox::{
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
-use crate::Descriptor;
+use crate::{Descriptor, StrongFd};
 
 bitflags::bitflags! {
     /// Linux's epoll flags.
@@ -41,9 +41,10 @@ impl TryFrom<&Descriptor> for EpollDescriptor {
 
     fn try_from(desc: &Descriptor) -> Result<Self, Self::Error> {
         match desc {
-            Descriptor::LiteBoxRawFd(fd) => {
-                crate::run_on_arc_raw_fd(*fd, EpollDescriptor::File, EpollDescriptor::Socket)
-            }
+            Descriptor::LiteBoxRawFd(raw_fd) => match StrongFd::from_raw(*raw_fd)? {
+                StrongFd::FileSystem(fd) => Ok(EpollDescriptor::File(fd)),
+                StrongFd::Network(fd) => Ok(EpollDescriptor::Socket(fd)),
+            },
             Descriptor::PipeReader { consumer, .. } => {
                 Ok(EpollDescriptor::PipeReader(consumer.clone()))
             }
