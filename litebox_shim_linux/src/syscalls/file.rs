@@ -640,7 +640,7 @@ impl Descriptor {
         Ok(fstat)
     }
 
-    pub(crate) fn get_file_descriptor_flags(&self) -> FileDescriptorFlags {
+    pub(crate) fn get_file_descriptor_flags(&self) -> Result<FileDescriptorFlags, Errno> {
         // Currently, only one such flag is defined: FD_CLOEXEC, the close-on-exec flag.
         // See https://www.man7.org/linux/man-pages/man2/F_GETFD.2const.html
         match self {
@@ -652,20 +652,23 @@ impl Descriptor {
                         .with_metadata(fd, |flags: &FileDescriptorFlags| *flags)
                         .unwrap_or(FileDescriptorFlags::empty())
                 },
-                |fd| todo!("net"),
-            )
-            // TODO: We need to expose an errno up here somewhere
-            .unwrap(),
+                |fd| {
+                    litebox()
+                        .descriptor_table()
+                        .with_metadata(fd, |flags: &FileDescriptorFlags| *flags)
+                        .unwrap_or(FileDescriptorFlags::empty())
+                },
+            ),
             Descriptor::PipeReader { close_on_exec, .. }
             | Descriptor::PipeWriter { close_on_exec, .. }
             | Descriptor::Eventfd { close_on_exec, .. }
-            | Descriptor::Epoll { close_on_exec, .. } => {
+            | Descriptor::Epoll { close_on_exec, .. } => Ok(
                 if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
                     FileDescriptorFlags::FD_CLOEXEC
                 } else {
                     FileDescriptorFlags::empty()
-                }
-            }
+                },
+            ),
         }
     }
 }
@@ -750,7 +753,7 @@ pub(crate) fn sys_fcntl(
             .read()
             .get_fd(fd)
             .ok_or(Errno::EBADF)?
-            .get_file_descriptor_flags()
+            .get_file_descriptor_flags()?
             .bits()),
         FcntlArg::SETFD(flags) => {
             match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
@@ -759,7 +762,9 @@ pub(crate) fn sys_fcntl(
                     |fd| {
                         let _old = litebox().descriptor_table_mut().set_fd_metadata(fd, flags);
                     },
-                    |fd| todo!("net"),
+                    |fd| {
+                        let _old = litebox().descriptor_table_mut().set_fd_metadata(fd, flags);
+                    },
                 )?,
                 Descriptor::PipeReader { close_on_exec, .. }
                 | Descriptor::PipeWriter { close_on_exec, .. }
