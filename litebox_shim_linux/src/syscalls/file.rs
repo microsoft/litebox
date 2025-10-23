@@ -831,11 +831,33 @@ pub(crate) fn sys_fcntl(
                                 }
                                 f.toggle(diff);
                             })
-                            .unwrap_or_else(|_| unimplemented!("SETFL on non-stdio"));
+                            .map_err(|err| match err {
+                                MetadataError::ClosedFd => Errno::EBADF,
+                                MetadataError::NoSuchMetadata => {
+                                    unimplemented!("SETFL on non-stdio")
+                                }
+                            })
                     },
-                    |fd| todo!("net"),
-                )?,
-
+                    |fd| {
+                        litebox()
+                            .descriptor_table_mut()
+                            .with_metadata_mut(fd, |crate::syscalls::net::SocketOFlags(f)| {
+                                let diff = *f ^ flags;
+                                if diff
+                                    .intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME)
+                                {
+                                    todo!("unsupported flags");
+                                }
+                                f.toggle(diff);
+                            })
+                            .map_err(|err| match err {
+                                MetadataError::ClosedFd => Errno::EBADF,
+                                MetadataError::NoSuchMetadata => {
+                                    unreachable!("all sockets have SocketOFlags when created")
+                                }
+                            })
+                    },
+                )??,
                 Descriptor::PipeReader { consumer, .. } => {
                     toggle_flags!(consumer);
                 }
