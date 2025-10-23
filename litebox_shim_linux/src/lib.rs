@@ -270,12 +270,11 @@ impl Descriptors {
     }
     fn close_on_exec(&mut self) {
         self.descriptors.iter_mut().for_each(|slot| {
-            if let Some(desc) = slot.take() {
-                if desc
-                    .get_file_descriptor_flags()
-                    .contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC)
-                {
-                    syscalls::file::do_close(desc);
+            if let Some(desc) = slot.take()
+                && let Ok(flags) = desc.get_file_descriptor_flags()
+            {
+                if flags.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC) {
+                    let _ = syscalls::file::do_close(desc);
                 } else {
                     *slot = Some(desc);
                 }
