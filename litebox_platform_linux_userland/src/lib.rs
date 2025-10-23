@@ -325,6 +325,7 @@ host_bp:
     .quad 0
 guest_context_top:
     .quad 0
+.globl guest_fsbase
 guest_fsbase:
     .quad 0
     "
