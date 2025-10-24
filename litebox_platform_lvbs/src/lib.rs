@@ -22,7 +22,6 @@ use litebox::platform::{
 };
 use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::errno::Errno;
-use litebox_common_optee::ContinueOperation;
 use ptr::{UserConstPtr, UserMutPtr};
 use x86_64::structures::paging::{
     PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
@@ -333,7 +332,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     pub fn register_shim(
         shim: &'static dyn litebox::shim::EnterShim<
             ExecutionContext = litebox_common_linux::PtRegs,
-            ContinueOperation = ContinueOperation,
+            ContinueOperation = syscall_entry::SyscallReturnType,
         >,
     ) {
         syscall_entry::init(shim);

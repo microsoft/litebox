@@ -1977,6 +1977,9 @@ mod tests {
 
     #[test]
     fn test_reserved_pages() {
+        // Reference `run_thread_inner` to ensure the linker sees `exception_callback`.
+        let _x = crate::run_thread_inner as usize;
+
         let platform = LinuxUserland::new(None);
         let reserved_pages: Vec<_> =
             <LinuxUserland as PageManagementProvider<4096>>::reserved_pages(platform).collect();
