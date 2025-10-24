@@ -1810,11 +1810,14 @@ unsafe extern "C" fn exception_signal_handler(
         (rsp, libc::REG_RSP),
         (eflags, libc::REG_EFL),
     ] {
-        *reg = sigctx.gregs[sig_reg as usize]
+        *reg = sigctx.gregs[sig_reg.reinterpret_as_unsigned() as usize]
             .reinterpret_as_unsigned()
             .truncate();
     }
     *orig_rax = *rax;
+
+    // Ensure that `run_thread` is linked in so that `exception_callback` is visible.
+    let _ = run_thread as usize;
 
     // Jump to exception_callback.
     sigctx.gregs[libc::REG_RIP as usize] =
@@ -1893,7 +1896,8 @@ unsafe extern "C" fn exception_signal_handler(
         (xss, libc::REG_SS),
         (xcs, libc::REG_CS),
     ] {
-        *reg = sigctx.gregs[sig_reg as usize].reinterpret_as_unsigned() as usize;
+        *reg = sigctx.gregs[sig_reg.reinterpret_as_unsigned() as usize].reinterpret_as_unsigned()
+            as usize;
     }
     *orig_eax = *eax;
 
@@ -1977,9 +1981,6 @@ mod tests {
 
     #[test]
     fn test_reserved_pages() {
-        // Reference `run_thread_inner` to ensure the linker sees `exception_callback`.
-        let _x = crate::run_thread_inner as usize;
-
         let platform = LinuxUserland::new(None);
         let reserved_pages: Vec<_> =
             <LinuxUserland as PageManagementProvider<4096>>::reserved_pages(platform).collect();

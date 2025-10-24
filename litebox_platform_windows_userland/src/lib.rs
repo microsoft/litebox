@@ -122,16 +122,15 @@ unsafe extern "system" fn vectored_exception_handler(
     }
 
     // Special case for fixing up FS base if it was cleared.
-    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION {
-        if unsafe { litebox_common_linux::rdfsbase() } == 0 {
-            // Get the saved FS base from the per-thread FS state
-            let target_fsbase = WindowsUserland::get_thread_fs_base();
-            if target_fsbase != 0 {
-                // Restore the FS base from the saved state
-                WindowsUserland::restore_thread_fs_base();
-                tls.is_in_guest.set(true);
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+        && unsafe { litebox_common_linux::rdfsbase() } == 0
+    {
+        // Restore the FS base from the saved state and try again.
+        let target_fsbase = WindowsUserland::get_thread_fs_base();
+        if target_fsbase != 0 {
+            WindowsUserland::restore_thread_fs_base();
+            tls.is_in_guest.set(true);
+            return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
     // Save the guest context.
@@ -158,35 +157,39 @@ unsafe extern "system" fn vectored_exception_handler(
         rsp,
         ss: _,
     } = regs;
-    *r15 = context.R15 as usize;
-    *r14 = context.R14 as usize;
-    *r13 = context.R13 as usize;
-    *r12 = context.R12 as usize;
-    *rbp = context.Rbp as usize;
-    *rbx = context.Rbx as usize;
-    *r11 = context.R11 as usize;
-    *r10 = context.R10 as usize;
-    *r9 = context.R9 as usize;
-    *r8 = context.R8 as usize;
-    *rax = context.Rax as usize;
-    *rcx = context.Rcx as usize;
-    *rdx = context.Rdx as usize;
-    *rsi = context.Rsi as usize;
-    *rdi = context.Rdi as usize;
-    *orig_rax = context.Rax as usize;
-    *rip = context.Rip as usize;
+    *r15 = context.R15.truncate();
+    *r14 = context.R14.truncate();
+    *r13 = context.R13.truncate();
+    *r12 = context.R12.truncate();
+    *rbp = context.Rbp.truncate();
+    *rbx = context.Rbx.truncate();
+    *r11 = context.R11.truncate();
+    *r10 = context.R10.truncate();
+    *r9 = context.R9.truncate();
+    *r8 = context.R8.truncate();
+    *rax = context.Rax.truncate();
+    *rcx = context.Rcx.truncate();
+    *rdx = context.Rdx.truncate();
+    *rsi = context.Rsi.truncate();
+    *rdi = context.Rdi.truncate();
+    *orig_rax = context.Rax.truncate();
+    *rip = context.Rip.truncate();
     *eflags = context.EFlags as usize;
-    *rsp = context.Rsp as usize;
+    *rsp = context.Rsp.truncate();
 
     // Push the exception record onto the host stack.
     let exception_record_ptr = tls.host_sp.get().cast::<EXCEPTION_RECORD>().wrapping_sub(1);
+    assert!(exception_record_ptr.is_aligned());
     unsafe { exception_record_ptr.write(*exception_record) };
 
-    // Align the stack pointer.
+    // Re-align the stack pointer.
     let rsp = exception_record_ptr as usize & !15;
 
+    // Ensure that `run_thread` is linked in so that `exception_callback` is visible.
+    let _ = run_thread as usize;
+
     // Update the thread context to jump to the exception handler.
-    context.Rip = exception_callback as u64;
+    context.Rip = exception_callback as usize as u64;
     context.Rsp = rsp as u64;
     context.Rbp = tls.host_bp.get() as u64;
     context.Rcx = core::ptr::from_mut(regs) as u64;
@@ -372,8 +375,8 @@ pub unsafe fn run_thread(ctx: &mut litebox_common_linux::PtRegs) {
 static TLS_INDEX: AtomicU32 = AtomicU32::new(u32::MAX);
 
 struct TlsState {
-    host_sp: Cell<*mut u8>,
-    host_bp: Cell<*mut u8>,
+    host_sp: Cell<*mut u128>,
+    host_bp: Cell<*mut u128>,
     guest_context_top: Cell<*mut litebox_common_linux::PtRegs>,
     scratch: Cell<usize>,
     is_in_guest: Cell<bool>,
@@ -1390,7 +1393,7 @@ unsafe extern "C" {
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
 unsafe extern "C-unwind" fn syscall_handler(ctx: &mut litebox_common_linux::PtRegs) {
     let &shim = SHIM.get().expect("Should have run `register_shim` by now");
-    continue_operation(shim.syscall(ctx), ctx)
+    continue_operation(shim.syscall(ctx), ctx);
 }
 
 unsafe extern "C-unwind" fn exception_handler(
@@ -1407,7 +1410,7 @@ unsafe extern "C-unwind" fn exception_handler(
                 (Exception::GENERAL_PROTECTION_FAULT, 0, 0)
             } else {
                 let error_code = 4 | if read_write_flag == 0 { 0 } else { 1 << 1 }; // PF error code: bit 1 = write
-                (Exception::PAGE_FAULT, error_code, faulting_address as usize)
+                (Exception::PAGE_FAULT, error_code, faulting_address)
             }
         }
         Win32_Foundation::EXCEPTION_ILLEGAL_INSTRUCTION => (Exception::INVALID_OPCODE, 0, 0),
