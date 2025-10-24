@@ -18,6 +18,7 @@ fn run_target_program(
     cmd_args: &[&str],
     install_files: fn(PathBuf),
     unique_name: &str,
+    tun_name: Option<&str>,
 ) -> Vec<u8> {
     let backend_str = match backend {
         Backend::Rewriter => "rewriter",
@@ -115,6 +116,10 @@ fn run_target_program(
         "--initial-files",
         tar_file.to_str().unwrap(),
     ];
+    if let Some(tun_name) = tun_name {
+        args.push("--tun-device-name");
+        args.push(tun_name);
+    }
     args.push(path.to_str().unwrap());
     args.extend_from_slice(cmd_args);
     println!("Running `{} {}`", binary_path, args.join(" "));
@@ -168,7 +173,7 @@ fn test_dynamic_lib_with_rewriter() {
             .expect("failed to get file stem");
         let unique_name = format!("{stem}_rewriter");
         let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
-        run_target_program(Backend::Rewriter, &target, &[], |_| {}, &unique_name);
+        run_target_program(Backend::Rewriter, &target, &[], |_| {}, &unique_name, None);
     }
 }
 
@@ -181,7 +186,7 @@ fn test_static_exec_with_rewriter() {
             .expect("failed to get file stem");
         let unique_name = format!("{stem}_exec_rewriter");
         let target = common::compile(path.to_str().unwrap(), &unique_name, true, false);
-        run_target_program(Backend::Rewriter, &target, &[], |_| {}, &unique_name);
+        run_target_program(Backend::Rewriter, &target, &[], |_| {}, &unique_name, None);
     }
 }
 
@@ -196,7 +201,7 @@ fn test_dynamic_lib_with_seccomp() {
             .expect("failed to get file stem");
         let unique_name = format!("{stem}_seccomp");
         let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
-        run_target_program(Backend::Seccomp, &target, &[], |_| {}, &unique_name);
+        run_target_program(Backend::Seccomp, &target, &[], |_| {}, &unique_name, None);
     }
 }
 
@@ -235,6 +240,7 @@ console.log(content);
             std::fs::write(out_dir.join("hello_world.js"), HELLO_WORLD_JS).unwrap();
         },
         "hello_node_seccomp",
+        None,
     );
 }
 
@@ -258,6 +264,7 @@ console.log(content);
             std::fs::write(out_dir.join("hello_world.js"), HELLO_WORLD_JS).unwrap();
         },
         "hello_node_rewriter",
+        None,
     );
 }
 
@@ -265,7 +272,14 @@ console.log(content);
 #[test]
 fn test_runner_with_ls() {
     let ls_path = run_which("ls");
-    let output = run_target_program(Backend::Rewriter, &ls_path, &["-a"], |_| {}, "ls_rewriter");
+    let output = run_target_program(
+        Backend::Rewriter,
+        &ls_path,
+        &["-a"],
+        |_| {},
+        "ls_rewriter",
+        None,
+    );
 
     let output_str = String::from_utf8_lossy(&output);
     let normalized = output_str.split_whitespace().collect::<Vec<_>>();
@@ -283,6 +297,7 @@ fn test_runner_with_ls() {
         &["-a", "/lib/x86_64-linux-gnu"],
         |_| {},
         "ls_lib_rewriter",
+        None,
     );
 
     let output_str = String::from_utf8_lossy(&output);
