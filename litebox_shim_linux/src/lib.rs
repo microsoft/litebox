@@ -24,6 +24,7 @@ use litebox::{
     LiteBox,
     fd::{ErrRawIntFd, TypedFd},
     mm::{PageManager, linux::PAGE_SIZE},
+    net::Network,
     platform::{RawConstPointer as _, RawMutPointer as _},
     sync::{RwLock, futex::FutexManager},
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
@@ -327,32 +328,38 @@ pub(crate) fn file_descriptors<'a>() -> &'a RwLock<Platform, Descriptors> {
         .get_or_init(|| alloc::boxed::Box::new(litebox().sync().new_rwlock(Descriptors::new())))
 }
 
-pub(crate) fn run_on_arc_raw_fd<R>(
-    fd: usize,
-    fs: impl FnOnce(Arc<TypedFd<LinuxFS>>) -> R,
-    net: impl FnOnce(Arc<TypedFd<litebox::net::Network<Platform>>>) -> R,
-) -> Result<R, Errno> {
-    let rds = raw_descriptor_store().read();
-    match rds.fd_from_raw_integer(fd) {
-        Ok(fd) => {
-            drop(rds);
-            Ok(fs(fd))
-        }
-        Err(ErrRawIntFd::NotFound) => Err(Errno::EBADF),
-        Err(ErrRawIntFd::InvalidSubsystem) => {
-            match rds.fd_from_raw_integer(fd) {
-                Ok(fd) => {
-                    drop(rds);
-                    Ok(net(fd))
-                }
-                Err(ErrRawIntFd::NotFound) => unreachable!("fd shown to exist before"),
-                Err(ErrRawIntFd::InvalidSubsystem) => {
-                    // We currently only have net and fs FDs at the moment, when we add more, we
-                    // need to expand out this function signature too
-                    unreachable!()
-                }
+/// A strongly-typed FD.
+///
+/// This enum only ever stores `Arc<TypedFd<..>>`s, and should not store any additional data
+/// alongside them (i.e., it is a trivial tagged union across the subsystems being used).
+enum StrongFd {
+    FileSystem(Arc<TypedFd<LinuxFS>>),
+    Network(Arc<TypedFd<Network<Platform>>>),
+}
+impl StrongFd {
+    fn from_raw(fd: usize) -> Result<Self, Errno> {
+        match raw_descriptor_store()
+            .read()
+            .typed_fd_at_raw_2::<StrongFd, LinuxFS, Network<Platform>>(fd)
+        {
+            Ok(r) => Ok(r),
+            Err(ErrRawIntFd::InvalidSubsystem) => {
+                // We currently only have net and fs FDs at the moment, when we add more, we need to
+                // expand out `StrongFd` too.
+                unreachable!()
             }
+            Err(ErrRawIntFd::NotFound) => Err(Errno::EBADF),
         }
+    }
+}
+impl From<Arc<TypedFd<LinuxFS>>> for StrongFd {
+    fn from(v: Arc<TypedFd<LinuxFS>>) -> Self {
+        StrongFd::FileSystem(v)
+    }
+}
+impl From<Arc<TypedFd<Network<Platform>>>> for StrongFd {
+    fn from(v: Arc<TypedFd<Network<Platform>>>) -> Self {
+        StrongFd::Network(v)
     }
 }
 
@@ -361,7 +368,10 @@ pub(crate) fn run_on_raw_fd<R>(
     fs: impl FnOnce(&TypedFd<LinuxFS>) -> R,
     net: impl FnOnce(&TypedFd<litebox::net::Network<Platform>>) -> R,
 ) -> Result<R, Errno> {
-    run_on_arc_raw_fd(fd, |file_fd| fs(&file_fd), |socket_fd| net(&socket_fd))
+    match StrongFd::from_raw(fd)? {
+        StrongFd::FileSystem(fd) => Ok(fs(&fd)),
+        StrongFd::Network(fd) => Ok(net(&fd)),
+    }
 }
 
 /// Open a file
