@@ -554,34 +554,7 @@ impl RawDescriptorStorage {
         &self,
         fd: usize,
     ) -> Result<Arc<TypedFd<Subsystem>>, ErrRawIntFd> {
-        let Some(Some(stored_fd)) = self.stored_fds.get(fd) else {
-            return Err(ErrRawIntFd::NotFound);
-        };
-        if !stored_fd.matches_subsystem::<Subsystem>() {
-            return Err(ErrRawIntFd::InvalidSubsystem);
-        }
-
-        let typed_fd: Arc<TypedFd<Subsystem>> = {
-            let fd: Arc<OwnedFd> = Arc::clone(&stored_fd.x);
-            let fd: *const OwnedFd = Arc::into_raw(fd);
-            // SAFETY: We are effectively converting an `Arc<OwnedFd>` to an
-            // `Arc<TypedFd<Subsystem>>`.
-            //
-            // This is safe because:
-            //
-            //   - `TypedFd` is a `#[repr(transparent)]` wrapper on `OwnedFd`.
-            //
-            //   - We just confirmed that it is of the correct subsystem.
-            //
-            //   - Thus, `OwnedFd` and `TypedFd` are effectively the same type, and thus are safely
-            //     castable.
-            //
-            //   - `Arc::from_raw`'s safety documentation requires the standard safe castability
-            //     constraints between the two.
-            unsafe { Arc::from_raw(fd.cast()) }
-        };
-
-        Ok(typed_fd)
+        self.typed_fd_at_raw_1(fd)
     }
 
     /// Obtain the typed FD for the raw integer value of the `fd`, "consuming" the raw integer.
@@ -601,6 +574,76 @@ impl RawDescriptorStorage {
         drop(underlying);
         Ok(ret)
     }
+}
+
+macro_rules! multi_subsystem_generic {
+    ($ident_f:ident, $ident_i:ident, $($f:ident $subsystem:ident),+ $(,)?) => {
+        /// Invoke the corresponding function that matches the subsystem.
+        ///
+        /// Equivalent versions of this function exist at differing number of subsystems.
+        fn $ident_f<R, $($subsystem),+>(
+            &self,
+            fd: usize,
+            $(
+                $f: impl FnOnce(Arc<TypedFd<$subsystem>>) -> R
+            ),+
+        ) -> Result<R, ErrRawIntFd>
+        where
+            $($subsystem: FdEnabledSubsystem),+
+        {
+            let Some(Some(stored_fd)) = self.stored_fds.get(fd) else {
+                return Err(ErrRawIntFd::NotFound);
+            };
+            $(
+                if stored_fd.matches_subsystem::<$subsystem>() {
+                    let typed_fd: Arc<TypedFd<$subsystem>> = {
+                        let fd: Arc<OwnedFd> = Arc::clone(&stored_fd.x);
+                        let fd: *const OwnedFd = Arc::into_raw(fd);
+                        // SAFETY: We are effectively converting an `Arc<OwnedFd>` to an
+                        // `Arc<TypedFd<Subsystem>>`.
+                        //
+                        // This is safe because:
+                        //
+                        //   - `TypedFd` is a `#[repr(transparent)]` wrapper on `OwnedFd`.
+                        //
+                        //   - We just confirmed that it is of the correct subsystem.
+                        //
+                        //   - Thus, `OwnedFd` and `TypedFd` are effectively the same type, and
+                        //     thus are safely castable.
+                        //
+                        //   - `Arc::from_raw`'s safety documentation requires the standard safe
+                        //     castability constraints between the two.
+                        unsafe { Arc::from_raw(fd.cast()) }
+                    };
+                    return Ok($f(typed_fd));
+                }
+            )+
+                Err(ErrRawIntFd::InvalidSubsystem)
+        }
+
+        /// Get a conversion of the typed FD for any of the N subsystems for the raw integer
+        /// value of the `fd`.
+        ///
+        /// Equivalent versions of this function exist at differing number of subsystems.
+        pub fn $ident_i<R, $($subsystem),+>(
+            &self,
+            fd: usize,
+        ) -> Result<R, ErrRawIntFd>
+        where
+            $($subsystem: FdEnabledSubsystem, R: From<Arc<TypedFd<$subsystem>>>),+
+        {
+            self.$ident_f(fd, $(
+                |x: Arc<TypedFd<$subsystem>>| R::from(x)
+            ),+)
+        }
+    };
+}
+
+impl RawDescriptorStorage {
+    multi_subsystem_generic! {invoke_matching_subsystem_1, typed_fd_at_raw_1, f1 S1}
+    multi_subsystem_generic! {invoke_matching_subsystem_2, typed_fd_at_raw_2, f1 S1, f2 S2}
+    multi_subsystem_generic! {invoke_matching_subsystem_3, typed_fd_at_raw_3, f1 S1, f2 S2, f3 S3}
+    multi_subsystem_generic! {invoke_matching_subsystem_4, typed_fd_at_raw_4, f1 S1, f2 S2, f3 S3, f4 S4}
 }
 
 /// LiteBox subsystems that support having file descriptors.
