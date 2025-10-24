@@ -65,6 +65,8 @@ pub enum SeekError {
     NotAFile,
     #[error("would seek to an invalid (negative or past end) of seekable positions")]
     InvalidOffset,
+    #[error("non-seekable file")]
+    NonSeekable,
 }
 
 /// Possible errors from [`FileSystem::truncate`]
