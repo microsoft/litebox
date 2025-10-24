@@ -76,7 +76,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         (sender, receiver)
     }
 
-    /// Close the pipe at at `fd`.
+    /// Close the pipe at `fd`.
     ///
     /// Future operations on the `fd` will start to return `ClosedFd` errors.
     pub fn close(&self, fd: &PipeFd<Platform>) -> Result<(), errors::CloseError> {
@@ -168,9 +168,8 @@ bitflags::bitflags! {
     #[repr(transparent)]
     #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
     pub struct Flags: u32 {
-        /// `NON_BLOCKING` impacts what happens when a full channel is written or, or an empty
-        /// channel is read from. If set, the operations returns immediately with a `WouldBlock`
-        /// error.
+        /// `NON_BLOCKING` impacts what happens when a full channel is written, or an empty channel
+        /// is read from. If set, the operations returns immediately with a `WouldBlock` error.
         const NON_BLOCKING = 0x1;
     }
 }
@@ -222,7 +221,7 @@ pub mod errors {
     pub enum WriteError {
         #[error("not an open file descriptor")]
         ClosedFd,
-        #[error("not open for writeing")]
+        #[error("not open for writing")]
         NotForWriting,
         #[error("write would block")]
         WouldBlock,
