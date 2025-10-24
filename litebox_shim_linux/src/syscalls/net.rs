@@ -13,6 +13,7 @@ use litebox_common_linux::{
     TcpOption, errno::Errno,
 };
 
+use crate::Task;
 use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox_net};
 use crate::{Platform, litebox};
 
@@ -564,49 +565,55 @@ fn get_status(fd: &SocketFd) -> litebox::fs::OFlags {
         & litebox::fs::OFlags::STATUS_FLAGS_MASK
 }
 
-/// Handle syscall `socket`
-pub(crate) fn sys_socket(
-    domain: AddressFamily,
-    ty: SockType,
-    flags: SockFlags,
-    protocol: Option<litebox_common_linux::Protocol>,
-) -> Result<u32, Errno> {
-    let file = match domain {
-        AddressFamily::INET => {
-            let protocol = match ty {
-                SockType::Stream => {
-                    if protocol.is_some_and(|p| p != litebox_common_linux::Protocol::TCP) {
-                        return Err(Errno::EINVAL);
+impl Task {
+    /// Handle syscall `socket`
+    pub(crate) fn sys_socket(
+        &self,
+        domain: AddressFamily,
+        ty: SockType,
+        flags: SockFlags,
+        protocol: Option<litebox_common_linux::Protocol>,
+    ) -> Result<u32, Errno> {
+        let file = match domain {
+            AddressFamily::INET => {
+                let protocol = match ty {
+                    SockType::Stream => {
+                        if protocol.is_some_and(|p| p != litebox_common_linux::Protocol::TCP) {
+                            return Err(Errno::EINVAL);
+                        }
+                        litebox::net::Protocol::Tcp
                     }
-                    litebox::net::Protocol::Tcp
-                }
-                SockType::Datagram => {
-                    if protocol.is_some_and(|p| p != litebox_common_linux::Protocol::UDP) {
-                        return Err(Errno::EINVAL);
+                    SockType::Datagram => {
+                        if protocol.is_some_and(|p| p != litebox_common_linux::Protocol::UDP) {
+                            return Err(Errno::EINVAL);
+                        }
+                        litebox::net::Protocol::Udp
                     }
-                    litebox::net::Protocol::Udp
-                }
-                SockType::Raw => todo!(),
-                _ => unimplemented!(),
-            };
-            let socket = litebox_net().lock().socket(protocol)?;
-            initialize_socket(&socket, ty, flags);
-            Descriptor::LiteBoxRawFd(
-                crate::raw_descriptor_store()
-                    .write()
-                    .fd_into_raw_integer(socket),
-            )
-        }
-        AddressFamily::UNIX => todo!(),
-        AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
-        _ => unimplemented!(),
-    };
-    file_descriptors().write().insert(file).map_err(|desc| {
-        crate::syscalls::file::do_close(desc).expect("closing descriptor should succeed");
-        Errno::EMFILE
-    })
+                    SockType::Raw => todo!(),
+                    _ => unimplemented!(),
+                };
+                let socket = litebox_net().lock().socket(protocol)?;
+                initialize_socket(&socket, ty, flags);
+                Descriptor::LiteBoxRawFd(
+                    crate::raw_descriptor_store()
+                        .write()
+                        .fd_into_raw_integer(socket),
+                )
+            }
+            AddressFamily::UNIX => todo!(),
+            AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
+            _ => unimplemented!(),
+        };
+        file_descriptors()
+            .write()
+            .insert(self, file)
+            .map_err(|desc| {
+                self.do_close(desc)
+                    .expect("closing descriptor should succeed");
+                Errno::EMFILE
+            })
+    }
 }
-
 pub(crate) fn read_sockaddr_from_user(
     sockaddr: ConstPtr<u8>,
     addrlen: usize,
@@ -669,219 +676,230 @@ pub(crate) fn write_sockaddr_to_user(
     unsafe { addrlen.write_at_offset(0, len) }.ok_or(Errno::EFAULT)
 }
 
-/// Handle syscall `accept`
-pub(crate) fn sys_accept(
-    sockfd: i32,
-    addr: Option<MutPtr<u8>>,
-    addrlen: Option<MutPtr<u32>>,
-    flags: SockFlags,
-) -> Result<u32, Errno> {
-    if addr.is_some() || addrlen.is_some() {
-        todo!("accept with addr");
-    }
-
-    let Ok(sockfd) = u32::try_from(sockfd) else {
-        return Err(Errno::EBADF);
-    };
-
-    let file_table = file_descriptors().read();
-    let socket = file_table.get_fd(sockfd).ok_or(Errno::EBADF)?;
-    let file = match socket {
-        Descriptor::LiteBoxRawFd(raw_fd) => {
-            with_socket_fd(*raw_fd, |fd| {
-                drop(file_table); // Drop before possibly-blocking `accept`
-                let sock_type = get_socket_type(fd)?;
-                let fd = accept(fd)?;
-                initialize_socket(&fd, sock_type, flags);
-                Ok(Descriptor::LiteBoxRawFd(
-                    crate::raw_descriptor_store()
-                        .write()
-                        .fd_into_raw_integer(fd),
-                ))
-            })?
+impl Task {
+    /// Handle syscall `accept`
+    pub(crate) fn sys_accept(
+        &self,
+        sockfd: i32,
+        addr: Option<MutPtr<u8>>,
+        addrlen: Option<MutPtr<u32>>,
+        flags: SockFlags,
+    ) -> Result<u32, Errno> {
+        if addr.is_some() || addrlen.is_some() {
+            todo!("accept with addr");
         }
-        _ => return Err(Errno::ENOTSOCK),
-    };
-    file_descriptors().write().insert(file).map_err(|desc| {
-        crate::syscalls::file::do_close(desc).expect("closing descriptor should succeed");
-        Errno::EMFILE
-    })
-}
 
-/// Handle syscall `connect`
-pub(crate) fn sys_connect(fd: i32, sockaddr: SocketAddress) -> Result<(), Errno> {
-    let Ok(fd) = u32::try_from(fd) else {
-        return Err(Errno::EBADF);
-    };
+        let Ok(sockfd) = u32::try_from(sockfd) else {
+            return Err(Errno::EBADF);
+        };
 
-    match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
-        Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
-            let SocketAddress::Inet(addr) = sockaddr;
-            connect(fd, addr)
-        }),
-        _ => Err(Errno::ENOTSOCK),
-    }
-}
-
-/// Handle syscall `bind`
-pub(crate) fn sys_bind(sockfd: i32, sockaddr: SocketAddress) -> Result<(), Errno> {
-    let Ok(sockfd) = u32::try_from(sockfd) else {
-        return Err(Errno::EBADF);
-    };
-
-    match file_descriptors()
-        .read()
-        .get_fd(sockfd)
-        .ok_or(Errno::EBADF)?
-    {
-        Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
-            let SocketAddress::Inet(addr) = sockaddr;
-            bind(fd, addr)
-        }),
-        _ => Err(Errno::ENOTSOCK),
-    }
-}
-
-/// Handle syscall `listen`
-pub(crate) fn sys_listen(sockfd: i32, backlog: u16) -> Result<(), Errno> {
-    let Ok(sockfd) = u32::try_from(sockfd) else {
-        return Err(Errno::EBADF);
-    };
-
-    match file_descriptors()
-        .read()
-        .get_fd(sockfd)
-        .ok_or(Errno::EBADF)?
-    {
-        Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| listen(fd, backlog)),
-        _ => Err(Errno::ENOTSOCK),
-    }
-}
-
-/// Handle syscall `sendto`
-pub(crate) fn sys_sendto(
-    fd: i32,
-    buf: ConstPtr<u8>,
-    len: usize,
-    mut flags: SendFlags,
-    sockaddr: Option<SocketAddress>,
-) -> Result<usize, Errno> {
-    let Ok(fd) = u32::try_from(fd) else {
-        return Err(Errno::EBADF);
-    };
-
-    let buf = unsafe { buf.to_cow_slice(len).ok_or(Errno::EFAULT) }?;
-    let file_table = file_descriptors().read();
-    let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
-    match socket {
-        Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
-            let sockaddr = sockaddr.map(|SocketAddress::Inet(addr)| addr);
-            drop(file_table); // Drop before possibly-blocking `sendto`
-            sendto(fd, &buf, flags, sockaddr)
-        }),
-        _ => Err(Errno::ENOTSOCK),
-    }
-}
-
-/// Handle syscall `recvfrom`
-pub(crate) fn sys_recvfrom(
-    fd: i32,
-    buf: MutPtr<u8>,
-    len: usize,
-    mut flags: ReceiveFlags,
-    source_addr: Option<&mut Option<SocketAddress>>,
-) -> Result<usize, Errno> {
-    let Ok(fd) = u32::try_from(fd) else {
-        return Err(Errno::EBADF);
-    };
-
-    let file_table = file_descriptors().read();
-    match file_table.get_fd(fd).ok_or(Errno::EBADF)? {
-        Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
-            let mut buffer: [u8; 4096] = [0; 4096];
-            let mut addr = None;
-            drop(file_table); // Drop before possibly-blocking `receive`
-            let size = receive(
-                fd,
-                &mut buffer,
-                flags,
-                if source_addr.is_some() {
-                    Some(&mut addr)
-                } else {
-                    None
-                },
-            )?;
-            if let Some(source_addr) = source_addr {
-                *source_addr = addr.map(SocketAddress::Inet);
+        let file_table = file_descriptors().read();
+        let socket = file_table.get_fd(sockfd).ok_or(Errno::EBADF)?;
+        let file = match socket {
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                with_socket_fd(*raw_fd, |fd| {
+                    drop(file_table); // Drop before possibly-blocking `accept`
+                    let sock_type = get_socket_type(fd)?;
+                    let fd = accept(fd)?;
+                    initialize_socket(&fd, sock_type, flags);
+                    Ok(Descriptor::LiteBoxRawFd(
+                        crate::raw_descriptor_store()
+                            .write()
+                            .fd_into_raw_integer(fd),
+                    ))
+                })?
             }
-            buf.copy_from_slice(0, &buffer[..size])
-                .ok_or(Errno::EFAULT)?;
-            Ok(size)
-        }),
-        _ => Err(Errno::ENOTSOCK),
+            _ => return Err(Errno::ENOTSOCK),
+        };
+        file_descriptors()
+            .write()
+            .insert(self, file)
+            .map_err(|desc| {
+                self.do_close(desc)
+                    .expect("closing descriptor should succeed");
+                Errno::EMFILE
+            })
     }
-}
 
-pub(crate) fn sys_setsockopt(
-    sockfd: i32,
-    optname: SocketOptionName,
-    optval: ConstPtr<u8>,
-    optlen: usize,
-) -> Result<(), Errno> {
-    let Ok(sockfd) = u32::try_from(sockfd) else {
-        return Err(Errno::EBADF);
-    };
+    /// Handle syscall `connect`
+    pub(crate) fn sys_connect(&self, fd: i32, sockaddr: SocketAddress) -> Result<(), Errno> {
+        let Ok(fd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
 
-    match file_descriptors()
-        .read()
-        .get_fd(sockfd)
-        .ok_or(Errno::EBADF)?
-    {
-        Descriptor::LiteBoxRawFd(raw_fd) => {
-            with_socket_fd(*raw_fd, |fd| setsockopt(fd, optname, optval, optlen))
+        match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
+            Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
+                let SocketAddress::Inet(addr) = sockaddr;
+                connect(fd, addr)
+            }),
+            _ => Err(Errno::ENOTSOCK),
         }
-        _ => Err(Errno::ENOTSOCK),
     }
-}
 
-/// Handle syscall `getsockopt`
-pub(crate) fn sys_getsockopt(
-    sockfd: i32,
-    optname: SocketOptionName,
-    optval: MutPtr<u8>,
-    optlen: MutPtr<u32>,
-) -> Result<(), Errno> {
-    let Ok(sockfd) = u32::try_from(sockfd) else {
-        return Err(Errno::EBADF);
-    };
+    /// Handle syscall `bind`
+    pub(crate) fn sys_bind(&self, sockfd: i32, sockaddr: SocketAddress) -> Result<(), Errno> {
+        let Ok(sockfd) = u32::try_from(sockfd) else {
+            return Err(Errno::EBADF);
+        };
 
-    match file_descriptors()
-        .read()
-        .get_fd(sockfd)
-        .ok_or(Errno::EBADF)?
-    {
-        Descriptor::LiteBoxRawFd(raw_fd) => {
-            with_socket_fd(*raw_fd, |fd| getsockopt(fd, optname, optval, optlen))
+        match file_descriptors()
+            .read()
+            .get_fd(sockfd)
+            .ok_or(Errno::EBADF)?
+        {
+            Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
+                let SocketAddress::Inet(addr) = sockaddr;
+                bind(fd, addr)
+            }),
+            _ => Err(Errno::ENOTSOCK),
         }
-        _ => Err(Errno::ENOTSOCK),
     }
-}
 
-/// Handle syscall `getsockname`
-pub(crate) fn sys_getsockname(sockfd: i32) -> Result<SocketAddr, Errno> {
-    let Ok(sockfd) = u32::try_from(sockfd) else {
-        return Err(Errno::EBADF);
-    };
+    /// Handle syscall `listen`
+    pub(crate) fn sys_listen(&self, sockfd: i32, backlog: u16) -> Result<(), Errno> {
+        let Ok(sockfd) = u32::try_from(sockfd) else {
+            return Err(Errno::EBADF);
+        };
 
-    match file_descriptors()
-        .read()
-        .get_fd(sockfd)
-        .ok_or(Errno::EBADF)?
-    {
-        Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
-            litebox_net().lock().get_local_addr(fd).map_err(Errno::from)
-        }),
-        _ => Err(Errno::ENOTSOCK),
+        match file_descriptors()
+            .read()
+            .get_fd(sockfd)
+            .ok_or(Errno::EBADF)?
+        {
+            Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| listen(fd, backlog)),
+            _ => Err(Errno::ENOTSOCK),
+        }
+    }
+
+    /// Handle syscall `sendto`
+    pub(crate) fn sys_sendto(
+        &self,
+        fd: i32,
+        buf: ConstPtr<u8>,
+        len: usize,
+        mut flags: SendFlags,
+        sockaddr: Option<SocketAddress>,
+    ) -> Result<usize, Errno> {
+        let Ok(fd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+
+        let buf = unsafe { buf.to_cow_slice(len).ok_or(Errno::EFAULT) }?;
+        let file_table = file_descriptors().read();
+        let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
+        match socket {
+            Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
+                let sockaddr = sockaddr.map(|SocketAddress::Inet(addr)| addr);
+                drop(file_table); // Drop before possibly-blocking `sendto`
+                sendto(fd, &buf, flags, sockaddr)
+            }),
+            _ => Err(Errno::ENOTSOCK),
+        }
+    }
+
+    /// Handle syscall `recvfrom`
+    pub(crate) fn sys_recvfrom(
+        &self,
+        fd: i32,
+        buf: MutPtr<u8>,
+        len: usize,
+        mut flags: ReceiveFlags,
+        source_addr: Option<&mut Option<SocketAddress>>,
+    ) -> Result<usize, Errno> {
+        let Ok(fd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+
+        let file_table = file_descriptors().read();
+        match file_table.get_fd(fd).ok_or(Errno::EBADF)? {
+            Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
+                let mut buffer: [u8; 4096] = [0; 4096];
+                let mut addr = None;
+                drop(file_table); // Drop before possibly-blocking `receive`
+                let size = receive(
+                    fd,
+                    &mut buffer,
+                    flags,
+                    if source_addr.is_some() {
+                        Some(&mut addr)
+                    } else {
+                        None
+                    },
+                )?;
+                if let Some(source_addr) = source_addr {
+                    *source_addr = addr.map(SocketAddress::Inet);
+                }
+                buf.copy_from_slice(0, &buffer[..size])
+                    .ok_or(Errno::EFAULT)?;
+                Ok(size)
+            }),
+            _ => Err(Errno::ENOTSOCK),
+        }
+    }
+
+    pub(crate) fn sys_setsockopt(
+        &self,
+        sockfd: i32,
+        optname: SocketOptionName,
+        optval: ConstPtr<u8>,
+        optlen: usize,
+    ) -> Result<(), Errno> {
+        let Ok(sockfd) = u32::try_from(sockfd) else {
+            return Err(Errno::EBADF);
+        };
+
+        match file_descriptors()
+            .read()
+            .get_fd(sockfd)
+            .ok_or(Errno::EBADF)?
+        {
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                with_socket_fd(*raw_fd, |fd| setsockopt(fd, optname, optval, optlen))
+            }
+            _ => Err(Errno::ENOTSOCK),
+        }
+    }
+
+    /// Handle syscall `getsockopt`
+    pub(crate) fn sys_getsockopt(
+        &self,
+        sockfd: i32,
+        optname: SocketOptionName,
+        optval: MutPtr<u8>,
+        optlen: MutPtr<u32>,
+    ) -> Result<(), Errno> {
+        let Ok(sockfd) = u32::try_from(sockfd) else {
+            return Err(Errno::EBADF);
+        };
+
+        match file_descriptors()
+            .read()
+            .get_fd(sockfd)
+            .ok_or(Errno::EBADF)?
+        {
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                with_socket_fd(*raw_fd, |fd| getsockopt(fd, optname, optval, optlen))
+            }
+            _ => Err(Errno::ENOTSOCK),
+        }
+    }
+
+    /// Handle syscall `getsockname`
+    pub(crate) fn sys_getsockname(&self, sockfd: i32) -> Result<SocketAddr, Errno> {
+        let Ok(sockfd) = u32::try_from(sockfd) else {
+            return Err(Errno::EBADF);
+        };
+
+        match file_descriptors()
+            .read()
+            .get_fd(sockfd)
+            .ok_or(Errno::EBADF)?
+        {
+            Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
+                litebox_net().lock().get_local_addr(fd).map_err(Errno::from)
+            }),
+            _ => Err(Errno::ENOTSOCK),
+        }
     }
 }
 

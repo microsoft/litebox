@@ -2,7 +2,6 @@
 
 use crate::Task;
 use crate::UserMutPointer;
-use crate::with_current_task;
 use alloc::boxed::Box;
 use core::mem::offset_of;
 use core::ops::Range;
@@ -48,162 +47,167 @@ pub(crate) struct Credentials {
 // TODO: better management of thread IDs
 pub(crate) static NEXT_THREAD_ID: AtomicI32 = AtomicI32::new(2); // start from 2, as 1 is used by the main thread
 
-/// Set the current task's command name.
-pub(crate) fn set_task_comm(comm: &[u8]) {
-    with_current_task(|task| {
+impl Task {
+    /// Set the current task's command name.
+    pub(crate) fn set_task_comm(&self, comm: &[u8]) {
         let mut new_comm = [0u8; litebox_common_linux::TASK_COMM_LEN];
         let comm = &comm[..comm.len().min(litebox_common_linux::TASK_COMM_LEN - 1)];
         new_comm[..comm.len()].copy_from_slice(comm);
-        task.comm.set(new_comm);
-    });
-}
+        self.comm.set(new_comm);
+    }
 
-/// Handle syscall `prctl`.
-pub(crate) fn sys_prctl(
-    arg: PrctlArg<litebox_platform_multiplex::Platform>,
-) -> Result<usize, Errno> {
-    match arg {
-        PrctlArg::GetName(name) => with_current_task(|task| {
-            unsafe { name.write_slice_at_offset(0, &task.comm.get()) }.ok_or(Errno::EFAULT)
-        })
-        .map(|()| 0),
-        PrctlArg::SetName(name) => {
-            let mut name_buf = [0u8; litebox_common_linux::TASK_COMM_LEN - 1];
-            // strncpy
-            for (i, byte) in name_buf.iter_mut().enumerate() {
-                let b = *unsafe { name.read_at_offset(isize::try_from(i).unwrap()) }
-                    .ok_or(Errno::EFAULT)?;
-                if b == 0 {
-                    break;
+    /// Handle syscall `prctl`.
+    pub(crate) fn sys_prctl(
+        &self,
+        arg: PrctlArg<litebox_platform_multiplex::Platform>,
+    ) -> Result<usize, Errno> {
+        match arg {
+            PrctlArg::GetName(name) => unsafe { name.write_slice_at_offset(0, &self.comm.get()) }
+                .ok_or(Errno::EFAULT)
+                .map(|()| 0),
+            PrctlArg::SetName(name) => {
+                let mut name_buf = [0u8; litebox_common_linux::TASK_COMM_LEN - 1];
+                // strncpy
+                for (i, byte) in name_buf.iter_mut().enumerate() {
+                    let b = *unsafe { name.read_at_offset(isize::try_from(i).unwrap()) }
+                        .ok_or(Errno::EFAULT)?;
+                    if b == 0 {
+                        break;
+                    }
+                    *byte = b;
                 }
-                *byte = b;
+                self.set_task_comm(&name_buf);
+                Ok(0)
             }
-            set_task_comm(&name_buf);
-            Ok(0)
-        }
-        PrctlArg::CapBSetRead(cap) => {
-            // Return 1 if the capability specified in cap is in the calling
-            // thread's capability bounding set, or 0 if it is not.
-            if cap
-                > litebox_common_linux::CapSet::LAST_CAP
-                    .bits()
-                    .trailing_zeros() as usize
-            {
-                return Err(Errno::EINVAL);
+            PrctlArg::CapBSetRead(cap) => {
+                // Return 1 if the capability specified in cap is in the calling
+                // thread's capability bounding set, or 0 if it is not.
+                if cap
+                    > litebox_common_linux::CapSet::LAST_CAP
+                        .bits()
+                        .trailing_zeros() as usize
+                {
+                    return Err(Errno::EINVAL);
+                }
+                // Note we don't support capabilities in LiteBox, so we always return 0.
+                Ok(0)
             }
-            // Note we don't support capabilities in LiteBox, so we always return 0.
-            Ok(0)
+            _ => unimplemented!(),
         }
-        _ => unimplemented!(),
     }
-}
 
-/// Handle syscall `arch_prctl`.
-pub(crate) fn sys_arch_prctl(
-    arg: ArchPrctlArg<litebox_platform_multiplex::Platform>,
-) -> Result<(), Errno> {
-    match arg {
-        #[cfg(target_arch = "x86_64")]
-        ArchPrctlArg::SetFs(addr) => {
-            let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase { addr };
-            let token = litebox_platform_multiplex::platform()
-                .get_punchthrough_token_for(punchthrough)
-                .expect("Failed to get punchthrough token for SET_FS");
-            token.execute().map(|_| ()).map_err(|e| match e {
-                litebox::platform::PunchthroughError::Failure(errno) => errno,
-                _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-            })
+    /// Handle syscall `arch_prctl`.
+    pub(crate) fn sys_arch_prctl(
+        &self,
+        arg: ArchPrctlArg<litebox_platform_multiplex::Platform>,
+    ) -> Result<(), Errno> {
+        match arg {
+            #[cfg(target_arch = "x86_64")]
+            ArchPrctlArg::SetFs(addr) => {
+                let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase { addr };
+                let token = litebox_platform_multiplex::platform()
+                    .get_punchthrough_token_for(punchthrough)
+                    .expect("Failed to get punchthrough token for SET_FS");
+                token.execute().map(|_| ()).map_err(|e| match e {
+                    litebox::platform::PunchthroughError::Failure(errno) => errno,
+                    _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+                })
+            }
+            #[cfg(target_arch = "x86_64")]
+            ArchPrctlArg::GetFs(addr) => {
+                let punchthrough = litebox_common_linux::PunchthroughSyscall::GetFsBase { addr };
+                let token = litebox_platform_multiplex::platform()
+                    .get_punchthrough_token_for(punchthrough)
+                    .expect("Failed to get punchthrough token for GET_FS");
+                token.execute().map(|_| ()).map_err(|e| match e {
+                    litebox::platform::PunchthroughError::Failure(errno) => errno,
+                    _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+                })
+            }
+            ArchPrctlArg::CETStatus | ArchPrctlArg::CETDisable | ArchPrctlArg::CETLock => {
+                Err(Errno::EINVAL)
+            }
+            _ => unimplemented!(),
         }
-        #[cfg(target_arch = "x86_64")]
-        ArchPrctlArg::GetFs(addr) => {
-            let punchthrough = litebox_common_linux::PunchthroughSyscall::GetFsBase { addr };
-            let token = litebox_platform_multiplex::platform()
-                .get_punchthrough_token_for(punchthrough)
-                .expect("Failed to get punchthrough token for GET_FS");
-            token.execute().map(|_| ()).map_err(|e| match e {
-                litebox::platform::PunchthroughError::Failure(errno) => errno,
-                _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-            })
-        }
-        ArchPrctlArg::CETStatus | ArchPrctlArg::CETDisable | ArchPrctlArg::CETLock => {
-            Err(Errno::EINVAL)
-        }
-        _ => unimplemented!(),
     }
-}
 
-#[cfg(target_arch = "x86_64")]
-pub(crate) fn set_thread_area(
-    user_desc: crate::MutPtr<litebox_common_linux::UserDesc>,
-) -> Result<(), Errno> {
-    Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
-}
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn set_thread_area(
+        &self,
+        user_desc: crate::MutPtr<litebox_common_linux::UserDesc>,
+    ) -> Result<(), Errno> {
+        Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
+    }
 
-#[cfg(target_arch = "x86")]
-pub(crate) fn set_thread_area(
-    user_desc: crate::MutPtr<litebox_common_linux::UserDesc>,
-) -> Result<(), Errno> {
-    use litebox::platform::{PunchthroughProvider as _, PunchthroughToken as _};
-    let punchthrough = litebox_common_linux::PunchthroughSyscall::SetThreadArea { user_desc };
-    let token = litebox_platform_multiplex::platform()
-        .get_punchthrough_token_for(punchthrough)
-        .expect("Failed to get punchthrough token for SET_THREAD_AREA");
-    token.execute().map(|_| ()).map_err(|e| match e {
-        litebox::platform::PunchthroughError::Failure(errno) => errno,
-        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-    })
-}
-
-pub(crate) fn sys_rt_sigprocmask(
-    how: litebox_common_linux::SigmaskHow,
-    set: Option<crate::ConstPtr<litebox_common_linux::SigSet>>,
-    oldset: Option<crate::MutPtr<litebox_common_linux::SigSet>>,
-) -> Result<(), Errno> {
-    let punchthrough =
-        litebox_common_linux::PunchthroughSyscall::RtSigprocmask { how, set, oldset };
-    let token = litebox_platform_multiplex::platform()
-        .get_punchthrough_token_for(punchthrough)
-        .expect("Failed to get punchthrough token for RT_SIGPROCMASK");
-    token.execute().map(|_| ()).map_err(|e| match e {
-        litebox::platform::PunchthroughError::Failure(errno) => errno,
-        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-    })
-}
-
-pub(crate) fn sys_rt_sigaction(
-    signum: litebox_common_linux::Signal,
-    act: Option<crate::ConstPtr<litebox_common_linux::SigAction>>,
-    oldact: Option<crate::MutPtr<litebox_common_linux::SigAction>>,
-) -> Result<(), Errno> {
-    let punchthrough = litebox_common_linux::PunchthroughSyscall::RtSigaction {
-        signum,
-        act,
-        oldact,
-    };
-    let token = litebox_platform_multiplex::platform()
-        .get_punchthrough_token_for(punchthrough)
-        .expect("Failed to get punchthrough token for RT_SIGACTION");
-    token.execute().map(|_| ()).map_err(|e| match e {
-        litebox::platform::PunchthroughError::Failure(errno) => errno,
-        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-    })
-}
-
-/// Handle syscall `rt_sigreturn`.
-pub(crate) fn sys_rt_sigreturn(stack: usize) -> ! {
-    let punchthrough = litebox_common_linux::PunchthroughSyscall::RtSigreturn { stack };
-    let token = litebox_platform_multiplex::platform()
-        .get_punchthrough_token_for(punchthrough)
-        .expect("Failed to get punchthrough token for RT_SIGRETURN");
-    token
-        .execute()
-        .map(|_| ())
-        .map_err(|e| match e {
+    #[cfg(target_arch = "x86")]
+    pub(crate) fn set_thread_area(
+        &self,
+        user_desc: crate::MutPtr<litebox_common_linux::UserDesc>,
+    ) -> Result<(), Errno> {
+        use litebox::platform::{PunchthroughProvider as _, PunchthroughToken as _};
+        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetThreadArea { user_desc };
+        let token = litebox_platform_multiplex::platform()
+            .get_punchthrough_token_for(punchthrough)
+            .expect("Failed to get punchthrough token for SET_THREAD_AREA");
+        token.execute().map(|_| ()).map_err(|e| match e {
             litebox::platform::PunchthroughError::Failure(errno) => errno,
             _ => unimplemented!("Unsupported punchthrough error {:?}", e),
         })
-        .expect("rt_sigreturn failed");
-    unreachable!("rt_sigreturn should not return");
+    }
+
+    pub(crate) fn sys_rt_sigprocmask(
+        &self,
+        how: litebox_common_linux::SigmaskHow,
+        set: Option<crate::ConstPtr<litebox_common_linux::SigSet>>,
+        oldset: Option<crate::MutPtr<litebox_common_linux::SigSet>>,
+    ) -> Result<(), Errno> {
+        let punchthrough =
+            litebox_common_linux::PunchthroughSyscall::RtSigprocmask { how, set, oldset };
+        let token = litebox_platform_multiplex::platform()
+            .get_punchthrough_token_for(punchthrough)
+            .expect("Failed to get punchthrough token for RT_SIGPROCMASK");
+        token.execute().map(|_| ()).map_err(|e| match e {
+            litebox::platform::PunchthroughError::Failure(errno) => errno,
+            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+        })
+    }
+
+    pub(crate) fn sys_rt_sigaction(
+        &self,
+        signum: litebox_common_linux::Signal,
+        act: Option<crate::ConstPtr<litebox_common_linux::SigAction>>,
+        oldact: Option<crate::MutPtr<litebox_common_linux::SigAction>>,
+    ) -> Result<(), Errno> {
+        let punchthrough = litebox_common_linux::PunchthroughSyscall::RtSigaction {
+            signum,
+            act,
+            oldact,
+        };
+        let token = litebox_platform_multiplex::platform()
+            .get_punchthrough_token_for(punchthrough)
+            .expect("Failed to get punchthrough token for RT_SIGACTION");
+        token.execute().map(|_| ()).map_err(|e| match e {
+            litebox::platform::PunchthroughError::Failure(errno) => errno,
+            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+        })
+    }
+
+    /// Handle syscall `rt_sigreturn`.
+    pub(crate) fn sys_rt_sigreturn(&self, stack: usize) -> ! {
+        let punchthrough = litebox_common_linux::PunchthroughSyscall::RtSigreturn { stack };
+        let token = litebox_platform_multiplex::platform()
+            .get_punchthrough_token_for(punchthrough)
+            .expect("Failed to get punchthrough token for RT_SIGRETURN");
+        token
+            .execute()
+            .map(|_| ())
+            .map_err(|e| match e {
+                litebox::platform::PunchthroughError::Failure(errno) => errno,
+                _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+            })
+            .expect("rt_sigreturn failed");
+        unreachable!("rt_sigreturn should not return");
+    }
 }
 
 const ROBUST_LIST_LIMIT: isize = 2048;
@@ -278,31 +282,33 @@ fn wake_robust_list(
     Ok(())
 }
 
-pub(crate) fn sys_exit(_status: i32) {
-    let mut tls = crate::SHIM_TLS.deinit();
-    let task = tls.current_task;
-    if let Some(clear_child_tid) = task.clear_child_tid.into_inner() {
-        // Clear the child TID if requested
-        // TODO: if we are the last thread, we don't need to clear it
-        let _ = unsafe { clear_child_tid.write_at_offset(0, 0) };
-        // Cast from *i32 to *u32
-        let clear_child_tid = crate::MutPtr::from_usize(clear_child_tid.as_usize());
-        let _ = sys_futex(litebox_common_linux::FutexArgs::Wake {
-            addr: clear_child_tid,
-            flags: litebox_common_linux::FutexFlags::PRIVATE,
-            count: 1,
-        });
-    }
-    if let Some(robust_list) = task.robust_list.into_inner() {
-        let _ = wake_robust_list(robust_list);
+impl Task {
+    pub(crate) fn sys_exit(&self, _status: i32) {
+        let mut tls = crate::SHIM_TLS.deinit();
+        let task = tls.current_task;
+        if let Some(clear_child_tid) = task.clear_child_tid.into_inner() {
+            // Clear the child TID if requested
+            // TODO: if we are the last thread, we don't need to clear it
+            let _ = unsafe { clear_child_tid.write_at_offset(0, 0) };
+            // Cast from *i32 to *u32
+            let clear_child_tid = crate::MutPtr::from_usize(clear_child_tid.as_usize());
+            let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
+                addr: clear_child_tid,
+                flags: litebox_common_linux::FutexFlags::PRIVATE,
+                count: 1,
+            });
+        }
+        if let Some(robust_list) = task.robust_list.into_inner() {
+            let _ = wake_robust_list(robust_list);
+        }
+
+        task.process
+            .nr_threads
+            .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     }
 
-    task.process
-        .nr_threads
-        .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    pub(crate) fn sys_exit_group(&self, _status: i32) {}
 }
-
-pub(crate) fn sys_exit_group(_status: i32) {}
 
 /// A descriptor for thread-local storage (TLS).
 ///
@@ -340,19 +346,16 @@ impl litebox::shim::InitThread for NewThreadArgs {
 
         let child_tid = task.tid;
 
-        // Set the TLS for the platform itself
-        crate::SHIM_TLS.init(crate::LinuxShimTls { current_task: task });
-
         // Set the TLS for the guest program
         if let Some(tls) = tls {
             // Set the TLS base pointer for the new thread
             #[cfg(target_arch = "x86")]
-            set_thread_area(tls);
+            task.set_thread_area(tls);
 
             #[cfg(target_arch = "x86_64")]
             {
                 use litebox::platform::RawConstPointer as _;
-                sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()));
+                task.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()));
             }
         }
 
@@ -360,55 +363,59 @@ impl litebox::shim::InitThread for NewThreadArgs {
             // Set the child TID if requested
             let _ = unsafe { child_tid_ptr.write_at_offset(0, child_tid) };
         }
+
+        // Set the TLS for the platform itself
+        crate::SHIM_TLS.init(crate::LinuxShimTls { current_task: task });
     }
 }
 
-/// Creates a new thread or process.
-///
-/// Note we currently only support creating threads with the VM, FS, and FILES flags set.
-#[expect(clippy::too_many_arguments)]
-pub(crate) fn sys_clone(
-    flags: litebox_common_linux::CloneFlags,
-    parent_tid: Option<crate::MutPtr<i32>>,
-    stack: Option<crate::MutPtr<u8>>,
-    stack_size: usize,
-    child_tid: Option<crate::MutPtr<i32>>,
-    tls: Option<crate::MutPtr<ThreadLocalDescriptor>>,
-    ctx: &litebox_common_linux::PtRegs,
-    main: usize,
-) -> Result<usize, Errno> {
-    if !flags.contains(CloneFlags::VM) {
-        unimplemented!("Clone without VM flag is not supported");
-    }
-    if !flags.contains(CloneFlags::FILES) {
-        unimplemented!("Clone without FILES flag is not supported");
-    }
-    if !flags.contains(CloneFlags::SYSVSEM) {
-        unimplemented!("Clone without SYSVSEM flag is not supported");
-    }
-    if !flags.contains(CloneFlags::THREAD | CloneFlags::SIGHAND) {
-        unimplemented!("Clone without THREAD or SIGHAND flag is not supported");
-    }
-    let unsupported_clone_flags = CloneFlags::PIDFD
-        | CloneFlags::PTRACE
-        | CloneFlags::VFORK
-        | CloneFlags::NEWNS
-        | CloneFlags::UNTRACED
-        | CloneFlags::NEWCGROUP
-        | CloneFlags::NEWUTS
-        | CloneFlags::NEWIPC
-        | CloneFlags::NEWUSER
-        | CloneFlags::NEWPID
-        | CloneFlags::NEWNET
-        | CloneFlags::IO
-        | CloneFlags::CLEAR_SIGHAND
-        | CloneFlags::INTO_CGROUP
-        | CloneFlags::NEWTIME;
-    if flags.intersects(unsupported_clone_flags) {
-        unimplemented!("Clone with unsupported flags: {:?}", flags);
-    }
+impl Task {
+    /// Creates a new thread or process.
+    ///
+    /// Note we currently only support creating threads with the VM, FS, and FILES flags set.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn sys_clone(
+        &self,
+        flags: litebox_common_linux::CloneFlags,
+        parent_tid: Option<crate::MutPtr<i32>>,
+        stack: Option<crate::MutPtr<u8>>,
+        stack_size: usize,
+        child_tid: Option<crate::MutPtr<i32>>,
+        tls: Option<crate::MutPtr<ThreadLocalDescriptor>>,
+        ctx: &litebox_common_linux::PtRegs,
+        main: usize,
+    ) -> Result<usize, Errno> {
+        if !flags.contains(CloneFlags::VM) {
+            unimplemented!("Clone without VM flag is not supported");
+        }
+        if !flags.contains(CloneFlags::FILES) {
+            unimplemented!("Clone without FILES flag is not supported");
+        }
+        if !flags.contains(CloneFlags::SYSVSEM) {
+            unimplemented!("Clone without SYSVSEM flag is not supported");
+        }
+        if !flags.contains(CloneFlags::THREAD | CloneFlags::SIGHAND) {
+            unimplemented!("Clone without THREAD or SIGHAND flag is not supported");
+        }
+        let unsupported_clone_flags = CloneFlags::PIDFD
+            | CloneFlags::PTRACE
+            | CloneFlags::VFORK
+            | CloneFlags::NEWNS
+            | CloneFlags::UNTRACED
+            | CloneFlags::NEWCGROUP
+            | CloneFlags::NEWUTS
+            | CloneFlags::NEWIPC
+            | CloneFlags::NEWUSER
+            | CloneFlags::NEWPID
+            | CloneFlags::NEWNET
+            | CloneFlags::IO
+            | CloneFlags::CLEAR_SIGHAND
+            | CloneFlags::INTO_CGROUP
+            | CloneFlags::NEWTIME;
+        if flags.intersects(unsupported_clone_flags) {
+            unimplemented!("Clone with unsupported flags: {:?}", flags);
+        }
 
-    with_current_task(|task| {
         let set_child_tid = if flags.contains(CloneFlags::CHILD_SETTID) {
             child_tid
         } else {
@@ -425,9 +432,9 @@ pub(crate) fn sys_clone(
             None
         };
         let fs = if flags.contains(CloneFlags::FS) {
-            task.fs.borrow().clone()
+            self.fs.borrow().clone()
         } else {
-            alloc::sync::Arc::new((**task.fs.borrow()).clone())
+            alloc::sync::Arc::new((**self.fs.borrow()).clone())
         };
 
         let child_tid = NEXT_THREAD_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -454,7 +461,7 @@ pub(crate) fn sys_clone(
             ctx_copy.eax = 0;
         }
 
-        task.process
+        self.process
             .nr_threads
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
@@ -465,42 +472,40 @@ pub(crate) fn sys_clone(
                     tls,
                     set_child_tid,
                     task: Task {
-                        pid: task.pid,
+                        pid: self.pid,
                         tid: child_tid,
-                        ppid: task.ppid,
+                        ppid: self.ppid,
                         clear_child_tid: clear_child_tid.into(),
                         robust_list: None.into(),
-                        credentials: task.credentials.clone(),
-                        comm: task.comm.clone(),
+                        credentials: self.credentials.clone(),
+                        comm: self.comm.clone(),
                         fs: fs.into(),
-                        process: task.process.clone(),
+                        process: self.process.clone(),
                     },
                 }),
             )
         };
 
         if let Err(err) = r {
-            task.process
+            self.process
                 .nr_threads
                 .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
             return Err(err);
         }
 
         Ok(usize::try_from(child_tid).unwrap())
-    })
-}
+    }
 
-/// Handle syscall `set_tid_address`.
-pub(crate) fn sys_set_tid_address(tidptr: crate::MutPtr<i32>) -> i32 {
-    with_current_task(|task| {
-        task.clear_child_tid.set(Some(tidptr));
-        task.tid
-    })
-}
+    /// Handle syscall `set_tid_address`.
+    pub(crate) fn sys_set_tid_address(&self, tidptr: crate::MutPtr<i32>) -> i32 {
+        self.clear_child_tid.set(Some(tidptr));
+        self.tid
+    }
 
-/// Handle syscall `gettid`.
-pub(crate) fn sys_gettid() -> i32 {
-    with_current_task(|task| task.tid)
+    /// Handle syscall `gettid`.
+    pub(crate) fn sys_gettid(&self) -> i32 {
+        self.tid
+    }
 }
 
 // TODO: enforce the following limits:
@@ -574,16 +579,17 @@ impl ResourceLimits {
     }
 }
 
-/// Get resource limits, and optionally set new limits.
-pub(crate) fn do_prlimit(
-    resource: litebox_common_linux::RlimitResource,
-    new_limit: Option<litebox_common_linux::Rlimit>,
-) -> Result<litebox_common_linux::Rlimit, Errno> {
-    with_current_task(|task| {
+impl Task {
+    /// Get resource limits, and optionally set new limits.
+    pub(crate) fn do_prlimit(
+        &self,
+        resource: litebox_common_linux::RlimitResource,
+        new_limit: Option<litebox_common_linux::Rlimit>,
+    ) -> Result<litebox_common_linux::Rlimit, Errno> {
         let old_rlimit = match resource {
             litebox_common_linux::RlimitResource::NOFILE
             | litebox_common_linux::RlimitResource::STACK => {
-                task.process.limits.get_rlimit(resource)
+                self.process.limits.get_rlimit(resource)
             }
             _ => unimplemented!("Unsupported resource for get_rlimit: {:?}", resource),
         };
@@ -603,239 +609,250 @@ pub(crate) fn do_prlimit(
             }
             match resource {
                 litebox_common_linux::RlimitResource::NOFILE => {
-                    task.process.limits.set_rlimit(resource, new_limit);
+                    self.process.limits.set_rlimit(resource, new_limit);
                 }
                 _ => unimplemented!("Unsupported resource for set_rlimit: {:?}", resource),
             }
         }
         Ok(old_rlimit)
-    })
-}
-
-/// Handle syscall `prlimit64`.
-///
-/// Note for now setting new limits is not supported yet, and thus returning constant values
-/// for the requested resource. Getting resources for a specific PID is also not supported yet.
-pub(crate) fn sys_prlimit(
-    pid: Option<i32>,
-    resource: litebox_common_linux::RlimitResource,
-    new_rlim: Option<crate::ConstPtr<litebox_common_linux::Rlimit64>>,
-    old_rlim: Option<crate::MutPtr<litebox_common_linux::Rlimit64>>,
-) -> Result<(), Errno> {
-    if pid.is_some() {
-        unimplemented!("prlimit for a specific PID is not supported yet");
     }
-    let new_limit = match new_rlim {
-        Some(rlim) => {
-            let rlim = unsafe { rlim.read_at_offset(0) }
-                .ok_or(Errno::EINVAL)?
-                .into_owned();
-            Some(litebox_common_linux::rlimit64_to_rlimit(rlim))
+
+    /// Handle syscall `prlimit64`.
+    ///
+    /// Note for now setting new limits is not supported yet, and thus returning constant values
+    /// for the requested resource. Getting resources for a specific PID is also not supported yet.
+    pub(crate) fn sys_prlimit(
+        &self,
+        pid: Option<i32>,
+        resource: litebox_common_linux::RlimitResource,
+        new_rlim: Option<crate::ConstPtr<litebox_common_linux::Rlimit64>>,
+        old_rlim: Option<crate::MutPtr<litebox_common_linux::Rlimit64>>,
+    ) -> Result<(), Errno> {
+        if pid.is_some() {
+            unimplemented!("prlimit for a specific PID is not supported yet");
         }
-        None => None,
-    };
-    let old_limit = litebox_common_linux::rlimit_to_rlimit64(do_prlimit(resource, new_limit)?);
-    if let Some(old_rlim) = old_rlim {
-        unsafe { old_rlim.write_at_offset(0, old_limit) }.ok_or(Errno::EINVAL)?;
-    }
-    Ok(())
-}
-
-/// Handle syscall `setrlimit`.
-pub(crate) fn sys_getrlimit(
-    resource: litebox_common_linux::RlimitResource,
-    rlim: crate::MutPtr<litebox_common_linux::Rlimit>,
-) -> Result<(), Errno> {
-    let old_limit = do_prlimit(resource, None)?;
-    unsafe { rlim.write_at_offset(0, old_limit) }.ok_or(Errno::EINVAL)
-}
-
-/// Handle syscall `setrlimit`.
-pub(crate) fn sys_setrlimit(
-    resource: litebox_common_linux::RlimitResource,
-    rlim: crate::ConstPtr<litebox_common_linux::Rlimit>,
-) -> Result<(), Errno> {
-    let new_limit = unsafe { rlim.read_at_offset(0) }
-        .ok_or(Errno::EFAULT)?
-        .into_owned();
-    let _ = do_prlimit(resource, Some(new_limit))?;
-    Ok(())
-}
-
-/// Handle syscall `set_robust_list`.
-pub(crate) fn sys_set_robust_list(head: usize) {
-    let head = crate::ConstPtr::from_usize(head);
-    with_current_task(|task| {
-        task.robust_list.set(Some(head));
-    });
-}
-
-/// Handle syscall `get_robust_list`.
-pub(crate) fn sys_get_robust_list(
-    pid: Option<i32>,
-    head_ptr: crate::MutPtr<usize>,
-) -> Result<(), Errno> {
-    if pid.is_some() {
-        unimplemented!("Getting robust list for a specific PID is not supported yet");
-    }
-    let head = with_current_task(|task| task.robust_list.get().map_or(0, |ptr| ptr.as_usize()));
-    unsafe { head_ptr.write_at_offset(0, head) }.ok_or(Errno::EFAULT)
-}
-
-fn real_time_as_duration_since_epoch() -> core::time::Duration {
-    let now = litebox_platform_multiplex::platform().current_time();
-    let unix_epoch = <litebox_platform_multiplex::Platform as TimeProvider>::SystemTime::UNIX_EPOCH;
-    now.duration_since(&unix_epoch)
-        .expect("must be after unix epoch")
-}
-
-/// Handle syscall `clock_gettime`.
-pub(crate) fn sys_clock_gettime(
-    clockid: litebox_common_linux::ClockId,
-) -> Result<litebox_common_linux::Timespec, Errno> {
-    let duration = gettime_as_duration(litebox_platform_multiplex::platform(), clockid)?;
-    litebox_common_linux::Timespec::try_from(duration).or(Err(Errno::EOVERFLOW))
-}
-
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "will fail for unknown clock IDs in the future"
-)]
-fn gettime_as_duration(
-    platform: &litebox_platform_multiplex::Platform,
-    clockid: litebox_common_linux::ClockId,
-) -> Result<core::time::Duration, Errno> {
-    let duration = match clockid {
-        litebox_common_linux::ClockId::RealTime => {
-            // CLOCK_REALTIME
-            real_time_as_duration_since_epoch()
+        let new_limit = match new_rlim {
+            Some(rlim) => {
+                let rlim = unsafe { rlim.read_at_offset(0) }
+                    .ok_or(Errno::EINVAL)?
+                    .into_owned();
+                Some(litebox_common_linux::rlimit64_to_rlimit(rlim))
+            }
+            None => None,
+        };
+        let old_limit =
+            litebox_common_linux::rlimit_to_rlimit64(self.do_prlimit(resource, new_limit)?);
+        if let Some(old_rlim) = old_rlim {
+            unsafe { old_rlim.write_at_offset(0, old_limit) }.ok_or(Errno::EINVAL)?;
         }
-        litebox_common_linux::ClockId::Monotonic => {
-            // CLOCK_MONOTONIC
-            platform.now().duration_since(crate::boot_time())
+        Ok(())
+    }
+
+    /// Handle syscall `setrlimit`.
+    pub(crate) fn sys_getrlimit(
+        &self,
+        resource: litebox_common_linux::RlimitResource,
+        rlim: crate::MutPtr<litebox_common_linux::Rlimit>,
+    ) -> Result<(), Errno> {
+        let old_limit = self.do_prlimit(resource, None)?;
+        unsafe { rlim.write_at_offset(0, old_limit) }.ok_or(Errno::EINVAL)
+    }
+
+    /// Handle syscall `setrlimit`.
+    pub(crate) fn sys_setrlimit(
+        &self,
+        resource: litebox_common_linux::RlimitResource,
+        rlim: crate::ConstPtr<litebox_common_linux::Rlimit>,
+    ) -> Result<(), Errno> {
+        let new_limit = unsafe { rlim.read_at_offset(0) }
+            .ok_or(Errno::EFAULT)?
+            .into_owned();
+        let _ = self.do_prlimit(resource, Some(new_limit))?;
+        Ok(())
+    }
+
+    /// Handle syscall `set_robust_list`.
+    pub(crate) fn sys_set_robust_list(&self, head: usize) {
+        let head = crate::ConstPtr::from_usize(head);
+        self.robust_list.set(Some(head));
+    }
+
+    /// Handle syscall `get_robust_list`.
+    pub(crate) fn sys_get_robust_list(
+        &self,
+        pid: Option<i32>,
+        head_ptr: crate::MutPtr<usize>,
+    ) -> Result<(), Errno> {
+        if pid.is_some() {
+            unimplemented!("Getting robust list for a specific PID is not supported yet");
         }
-        _ => unimplemented!(),
-    };
-    Ok(duration)
-}
-
-/// Handle syscall `clock_getres`.
-pub(crate) fn sys_clock_getres(
-    _clockid: litebox_common_linux::ClockId,
-    res: crate::MutPtr<litebox_common_linux::Timespec>,
-) {
-    // Return the resolution of the clock
-    // For most modern systems, the resolution is typically 1 nanosecond
-    // This is a reasonable default for high-resolution timers
-    let resolution = litebox_common_linux::Timespec {
-        tv_sec: 0,
-        tv_nsec: 1, // 1 nanosecond resolution
-    };
-
-    unsafe {
-        res.write_at_offset(0, resolution);
+        let head = self.robust_list.get().map_or(0, |ptr| ptr.as_usize());
+        unsafe { head_ptr.write_at_offset(0, head) }.ok_or(Errno::EFAULT)
     }
-}
 
-/// Handle syscall `clock_nanosleep`.
-pub(crate) fn sys_clock_nanosleep(
-    clockid: litebox_common_linux::ClockId,
-    flags: litebox_common_linux::TimerFlags,
-    request: crate::ConstPtr<litebox_common_linux::Timespec>,
-    remain: Option<crate::MutPtr<litebox_common_linux::Timespec>>,
-) -> Result<(), Errno> {
-    let request = core::time::Duration::from(get_timeout(request)?);
-    if flags.intersects(litebox_common_linux::TimerFlags::ABSTIME.complement()) {
-        return Err(Errno::EINVAL);
+    fn real_time_as_duration_since_epoch(&self) -> core::time::Duration {
+        let now = litebox_platform_multiplex::platform().current_time();
+        let unix_epoch =
+            <litebox_platform_multiplex::Platform as TimeProvider>::SystemTime::UNIX_EPOCH;
+        now.duration_since(&unix_epoch)
+            .expect("must be after unix epoch")
     }
-    let is_abs = flags.contains(litebox_common_linux::TimerFlags::ABSTIME);
 
-    let platform = litebox_platform_multiplex::platform();
-    let duration = if is_abs {
-        let now = gettime_as_duration(platform, clockid)?;
-        if request <= now {
+    /// Handle syscall `clock_gettime`.
+    pub(crate) fn sys_clock_gettime(
+        &self,
+        clockid: litebox_common_linux::ClockId,
+    ) -> Result<litebox_common_linux::Timespec, Errno> {
+        let duration = self.gettime_as_duration(litebox_platform_multiplex::platform(), clockid)?;
+        litebox_common_linux::Timespec::try_from(duration).or(Err(Errno::EOVERFLOW))
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "will fail for unknown clock IDs in the future"
+    )]
+    fn gettime_as_duration(
+        &self,
+        platform: &litebox_platform_multiplex::Platform,
+        clockid: litebox_common_linux::ClockId,
+    ) -> Result<core::time::Duration, Errno> {
+        let duration = match clockid {
+            litebox_common_linux::ClockId::RealTime => {
+                // CLOCK_REALTIME
+                self.real_time_as_duration_since_epoch()
+            }
+            litebox_common_linux::ClockId::Monotonic => {
+                // CLOCK_MONOTONIC
+                platform.now().duration_since(crate::boot_time())
+            }
+            _ => unimplemented!(),
+        };
+        Ok(duration)
+    }
+
+    /// Handle syscall `clock_getres`.
+    pub(crate) fn sys_clock_getres(
+        &self,
+        _clockid: litebox_common_linux::ClockId,
+        res: crate::MutPtr<litebox_common_linux::Timespec>,
+    ) {
+        // Return the resolution of the clock
+        // For most modern systems, the resolution is typically 1 nanosecond
+        // This is a reasonable default for high-resolution timers
+        let resolution = litebox_common_linux::Timespec {
+            tv_sec: 0,
+            tv_nsec: 1, // 1 nanosecond resolution
+        };
+
+        unsafe {
+            res.write_at_offset(0, resolution);
+        }
+    }
+
+    /// Handle syscall `clock_nanosleep`.
+    pub(crate) fn sys_clock_nanosleep(
+        &self,
+        clockid: litebox_common_linux::ClockId,
+        flags: litebox_common_linux::TimerFlags,
+        request: crate::ConstPtr<litebox_common_linux::Timespec>,
+        remain: Option<crate::MutPtr<litebox_common_linux::Timespec>>,
+    ) -> Result<(), Errno> {
+        let request = core::time::Duration::from(get_timeout(request)?);
+        if flags.intersects(litebox_common_linux::TimerFlags::ABSTIME.complement()) {
+            return Err(Errno::EINVAL);
+        }
+        let is_abs = flags.contains(litebox_common_linux::TimerFlags::ABSTIME);
+
+        let platform = litebox_platform_multiplex::platform();
+        let duration = if is_abs {
+            let now = self.gettime_as_duration(platform, clockid)?;
+            if request <= now {
+                return Ok(());
+            }
+            request.checked_sub(now).unwrap()
+        } else {
+            request
+        };
+
+        // Reuse the raw mutex provider to implement sleep.
+        //
+        // TODO: consider a new litebox API to directly sleep, with integration with
+        // interruptions.
+        let r = platform.new_raw_mutex().block_or_timeout(0, duration);
+        assert!(matches!(
+            r,
+            Ok(litebox::platform::UnblockedOrTimedOut::TimedOut)
+        ),);
+
+        // TODO: update the remainder for non-absolute sleeps interrupted by signals.
+        let _ = remain;
+
+        Ok(())
+    }
+
+    /// Handle syscall `gettimeofday`.
+    pub(crate) fn sys_gettimeofday(
+        &self,
+        tv: crate::MutPtr<litebox_common_linux::TimeVal>,
+        tz: crate::MutPtr<litebox_common_linux::TimeZone>,
+    ) -> Result<(), Errno> {
+        if tz.as_usize() != 0 {
+            // `man 2 gettimeofday`: The use of the timezone structure is obsolete; the tz argument
+            // should normally be specified as NULL.
+            unimplemented!()
+        }
+        if tv.as_usize() == 0 {
             return Ok(());
         }
-        request.checked_sub(now).unwrap()
-    } else {
-        request
-    };
-
-    // Reuse the raw mutex provider to implement sleep.
-    //
-    // TODO: consider a new litebox API to directly sleep, with integration with
-    // interruptions.
-    let r = platform.new_raw_mutex().block_or_timeout(0, duration);
-    assert!(matches!(
-        r,
-        Ok(litebox::platform::UnblockedOrTimedOut::TimedOut)
-    ),);
-
-    // TODO: update the remainder for non-absolute sleeps interrupted by signals.
-    let _ = remain;
-
-    Ok(())
-}
-
-/// Handle syscall `gettimeofday`.
-pub(crate) fn sys_gettimeofday(
-    tv: crate::MutPtr<litebox_common_linux::TimeVal>,
-    tz: crate::MutPtr<litebox_common_linux::TimeZone>,
-) -> Result<(), Errno> {
-    if tz.as_usize() != 0 {
-        // `man 2 gettimeofday`: The use of the timezone structure is obsolete; the tz argument
-        // should normally be specified as NULL.
-        unimplemented!()
+        let timeval =
+            litebox_common_linux::Timespec::try_from(self.real_time_as_duration_since_epoch())
+                .or(Err(Errno::EOVERFLOW))?
+                .into();
+        unsafe { tv.write_at_offset(0, timeval) }.ok_or(Errno::EFAULT)
     }
-    if tv.as_usize() == 0 {
-        return Ok(());
+
+    /// Handle syscall `time`.
+    pub(crate) fn sys_time(
+        &self,
+        tloc: crate::MutPtr<litebox_common_linux::time_t>,
+    ) -> Result<litebox_common_linux::time_t, Errno> {
+        let time = self.real_time_as_duration_since_epoch();
+        let seconds: u64 = time.as_secs();
+        let seconds: litebox_common_linux::time_t = seconds.try_into().or(Err(Errno::EOVERFLOW))?;
+        if tloc.as_usize() != 0 {
+            unsafe { tloc.write_at_offset(0, seconds) }.ok_or(Errno::EFAULT)?;
+        }
+        Ok(seconds)
     }
-    let timeval = litebox_common_linux::Timespec::try_from(real_time_as_duration_since_epoch())
-        .or(Err(Errno::EOVERFLOW))?
-        .into();
-    unsafe { tv.write_at_offset(0, timeval) }.ok_or(Errno::EFAULT)
-}
 
-/// Handle syscall `time`.
-pub(crate) fn sys_time(
-    tloc: crate::MutPtr<litebox_common_linux::time_t>,
-) -> Result<litebox_common_linux::time_t, Errno> {
-    let time = real_time_as_duration_since_epoch();
-    let seconds: u64 = time.as_secs();
-    let seconds: litebox_common_linux::time_t = seconds.try_into().or(Err(Errno::EOVERFLOW))?;
-    if tloc.as_usize() != 0 {
-        unsafe { tloc.write_at_offset(0, seconds) }.ok_or(Errno::EFAULT)?;
+    /// Handle syscall `getpid`.
+    pub(crate) fn sys_getpid(&self) -> i32 {
+        self.pid
     }
-    Ok(seconds)
-}
 
-/// Handle syscall `getpid`.
-pub(crate) fn sys_getpid() -> i32 {
-    with_current_task(|task| task.pid)
-}
+    pub(crate) fn sys_getppid(&self) -> i32 {
+        self.ppid
+    }
 
-pub(crate) fn sys_getppid() -> i32 {
-    with_current_task(|task| task.ppid)
-}
+    /// Handle syscall `getuid`.
+    pub(crate) fn sys_getuid(&self) -> u32 {
+        self.credentials.uid
+    }
 
-/// Handle syscall `getuid`.
-pub(crate) fn sys_getuid() -> u32 {
-    with_current_task(|task| task.credentials.uid)
-}
+    /// Handle syscall `geteuid`.
+    pub(crate) fn sys_geteuid(&self) -> u32 {
+        self.credentials.euid
+    }
 
-/// Handle syscall `geteuid`.
-pub(crate) fn sys_geteuid() -> u32 {
-    with_current_task(|task| task.credentials.euid)
-}
+    /// Handle syscall `getgid`.
+    pub(crate) fn sys_getgid(&self) -> u32 {
+        self.credentials.gid
+    }
 
-/// Handle syscall `getgid`.
-pub(crate) fn sys_getgid() -> u32 {
-    with_current_task(|task| task.credentials.gid)
-}
-
-/// Handle syscall `getegid`.
-pub(crate) fn sys_getegid() -> u32 {
-    with_current_task(|task| task.credentials.egid)
+    /// Handle syscall `getegid`.
+    pub(crate) fn sys_getegid(&self) -> u32 {
+        self.credentials.egid
+    }
 }
 
 /// Number of CPUs
@@ -854,13 +871,15 @@ impl CpuSet {
     }
 }
 
-/// Handle syscall `sched_getaffinity`.
-///
-/// Note this is a dummy implementation that always returns the same CPU set
-pub(crate) fn sys_sched_getaffinity(_pid: Option<i32>) -> CpuSet {
-    let mut cpuset = bitvec::bitvec![u8, bitvec::order::Lsb0; 0; NR_CPUS];
-    cpuset.iter_mut().for_each(|mut b| *b = true);
-    CpuSet { bits: cpuset }
+impl Task {
+    /// Handle syscall `sched_getaffinity`.
+    ///
+    /// Note this is a dummy implementation that always returns the same CPU set
+    pub(crate) fn sys_sched_getaffinity(&self, _pid: Option<i32>) -> CpuSet {
+        let mut cpuset = bitvec::bitvec![u8, bitvec::order::Lsb0; 0; NR_CPUS];
+        cpuset.iter_mut().for_each(|mut b| *b = true);
+        CpuSet { bits: cpuset }
+    }
 }
 
 // TODO: move elsewhere?
@@ -874,145 +893,148 @@ pub(crate) fn get_timeout(
     Ok(timeout.into_owned())
 }
 
-/// Handle syscall `futex`
-pub(crate) fn sys_futex(
-    arg: litebox_common_linux::FutexArgs<litebox_platform_multiplex::Platform>,
-) -> Result<usize, Errno> {
-    /// Note our mutex implementation assumes futexes are private as we don't support shared memory yet.
-    /// It should be fine to treat shared futexes as private for now.
-    macro_rules! warn_shared_futex {
-        ($flag:ident) => {
-            #[cfg(debug_assertions)]
-            if !$flag.contains(litebox_common_linux::FutexFlags::PRIVATE) {
-                litebox::log_println!(
-                    litebox_platform_multiplex::platform(),
-                    "warning: shared futexes\n"
-                );
-            }
-        };
-    }
-
-    let res = match arg {
-        FutexArgs::Wake { addr, flags, count } => {
-            warn_shared_futex!(flags);
-            let Some(count) = core::num::NonZeroU32::new(count) else {
-                return Ok(0);
+impl Task {
+    /// Handle syscall `futex`
+    pub(crate) fn sys_futex(
+        &self,
+        arg: litebox_common_linux::FutexArgs<litebox_platform_multiplex::Platform>,
+    ) -> Result<usize, Errno> {
+        /// Note our mutex implementation assumes futexes are private as we don't support shared memory yet.
+        /// It should be fine to treat shared futexes as private for now.
+        macro_rules! warn_shared_futex {
+            ($flag:ident) => {
+                #[cfg(debug_assertions)]
+                if !$flag.contains(litebox_common_linux::FutexFlags::PRIVATE) {
+                    litebox::log_println!(
+                        litebox_platform_multiplex::platform(),
+                        "warning: shared futexes\n"
+                    );
+                }
             };
-            let futex_manager = crate::litebox_futex_manager();
-            futex_manager.wake(addr, count, None)? as usize
         }
-        FutexArgs::Wait {
-            addr,
-            flags,
-            val,
-            timeout,
-        } => {
-            warn_shared_futex!(flags);
-            let futex_manager = crate::litebox_futex_manager();
-            let timeout = timeout.map(get_timeout).transpose()?.map(Into::into);
-            futex_manager.wait(addr, val, timeout, None)?;
-            0
-        }
-        litebox_common_linux::FutexArgs::WaitBitset {
-            addr,
-            flags,
-            val,
-            timeout,
-            bitmask,
-        } => {
-            warn_shared_futex!(flags);
-            let timeout = timeout.map(get_timeout).transpose()?.map(|ts| {
-                let now = sys_clock_gettime(
-                    if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
-                        litebox_common_linux::ClockId::RealTime
-                    } else {
-                        litebox_common_linux::ClockId::Monotonic
-                    },
-                )
-                .expect("failed to get current time");
-                ts.sub_timespec(&now).unwrap_or(core::time::Duration::ZERO)
-            });
-            let futex_manager = crate::litebox_futex_manager();
-            futex_manager.wait(addr, val, timeout, core::num::NonZeroU32::new(bitmask))?;
-            0
-        }
-        _ => unimplemented!("Unsupported futex operation"),
-    };
-    Ok(res)
+
+        let res = match arg {
+            FutexArgs::Wake { addr, flags, count } => {
+                warn_shared_futex!(flags);
+                let Some(count) = core::num::NonZeroU32::new(count) else {
+                    return Ok(0);
+                };
+                let futex_manager = crate::litebox_futex_manager();
+                futex_manager.wake(addr, count, None)? as usize
+            }
+            FutexArgs::Wait {
+                addr,
+                flags,
+                val,
+                timeout,
+            } => {
+                warn_shared_futex!(flags);
+                let futex_manager = crate::litebox_futex_manager();
+                let timeout = timeout.map(get_timeout).transpose()?.map(Into::into);
+                futex_manager.wait(addr, val, timeout, None)?;
+                0
+            }
+            litebox_common_linux::FutexArgs::WaitBitset {
+                addr,
+                flags,
+                val,
+                timeout,
+                bitmask,
+            } => {
+                warn_shared_futex!(flags);
+                let timeout = timeout.map(get_timeout).transpose()?.map(|ts| {
+                    let now = self
+                        .sys_clock_gettime(
+                            if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
+                                litebox_common_linux::ClockId::RealTime
+                            } else {
+                                litebox_common_linux::ClockId::Monotonic
+                            },
+                        )
+                        .expect("failed to get current time");
+                    ts.sub_timespec(&now).unwrap_or(core::time::Duration::ZERO)
+                });
+                let futex_manager = crate::litebox_futex_manager();
+                futex_manager.wait(addr, val, timeout, core::num::NonZeroU32::new(bitmask))?;
+                0
+            }
+            _ => unimplemented!("Unsupported futex operation"),
+        };
+        Ok(res)
+    }
 }
 
 const MAX_VEC: usize = 4096; // limit count
 const MAX_TOTAL_BYTES: usize = 256 * 1024; // size cap
 
-// Handle syscall `execve`.
-//
-// Note this function does not return on success.
-pub(crate) fn sys_execve(
-    pathname: crate::ConstPtr<i8>,
-    argv: crate::ConstPtr<crate::ConstPtr<i8>>,
-    envp: crate::ConstPtr<crate::ConstPtr<i8>>,
-    ctx: &mut litebox_common_linux::PtRegs,
-) -> Result<(), Errno> {
-    fn copy_vector(
-        mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
-        which: &str,
-    ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
-        let mut out = alloc::vec::Vec::new();
-        let mut total = 0usize;
-        for _ in 0..MAX_VEC {
-            let p: crate::ConstPtr<i8> = unsafe {
-                // read pointer-sized entries
-                match base.read_at_offset(0) {
-                    Some(ptr) => ptr.into_owned(),
-                    None => return Err(Errno::EFAULT),
+impl Task {
+    /// Handle syscall `execve`.
+    pub(crate) fn sys_execve(
+        &self,
+        pathname: crate::ConstPtr<i8>,
+        argv: crate::ConstPtr<crate::ConstPtr<i8>>,
+        envp: crate::ConstPtr<crate::ConstPtr<i8>>,
+        ctx: &mut litebox_common_linux::PtRegs,
+    ) -> Result<(), Errno> {
+        fn copy_vector(
+            mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
+            which: &str,
+        ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
+            let mut out = alloc::vec::Vec::new();
+            let mut total = 0usize;
+            for _ in 0..MAX_VEC {
+                let p: crate::ConstPtr<i8> = unsafe {
+                    // read pointer-sized entries
+                    match base.read_at_offset(0) {
+                        Some(ptr) => ptr.into_owned(),
+                        None => return Err(Errno::EFAULT),
+                    }
+                };
+                if p.as_usize() == 0 {
+                    break;
                 }
-            };
-            if p.as_usize() == 0 {
-                break;
+                let Some(cs) = p.to_cstring() else {
+                    return Err(Errno::EFAULT);
+                };
+                total += cs.as_bytes().len() + 1;
+                if total > MAX_TOTAL_BYTES {
+                    return Err(Errno::E2BIG);
+                }
+                out.push(cs);
+                // advance to next pointer
+                base = crate::ConstPtr::from_usize(base.as_usize() + core::mem::size_of::<usize>());
             }
-            let Some(cs) = p.to_cstring() else {
-                return Err(Errno::EFAULT);
-            };
-            total += cs.as_bytes().len() + 1;
-            if total > MAX_TOTAL_BYTES {
-                return Err(Errno::E2BIG);
-            }
-            out.push(cs);
-            // advance to next pointer
-            base = crate::ConstPtr::from_usize(base.as_usize() + core::mem::size_of::<usize>());
+            Ok(out)
         }
-        Ok(out)
-    }
 
-    // Copy pathname
-    let Some(path_cstr) = pathname.to_cstring() else {
-        return Err(Errno::EFAULT);
-    };
-    let path = path_cstr.to_str().map_err(|_| Errno::ENOENT)?;
+        // Copy pathname
+        let Some(path_cstr) = pathname.to_cstring() else {
+            return Err(Errno::EFAULT);
+        };
+        let path = path_cstr.to_str().map_err(|_| Errno::ENOENT)?;
 
-    // Copy argv and envp vectors
-    let argv_vec = if argv.as_usize() == 0 {
-        alloc::vec::Vec::new()
-    } else {
-        copy_vector(argv, "argv")?
-    };
-    let mut envp_vec = if envp.as_usize() == 0 {
-        alloc::vec::Vec::new()
-    } else {
-        copy_vector(envp, "envp")?
-    };
+        // Copy argv and envp vectors
+        let argv_vec = if argv.as_usize() == 0 {
+            alloc::vec::Vec::new()
+        } else {
+            copy_vector(argv, "argv")?
+        };
+        let mut envp_vec = if envp.as_usize() == 0 {
+            alloc::vec::Vec::new()
+        } else {
+            copy_vector(envp, "envp")?
+        };
 
-    // Close CLOEXEC descriptors
-    crate::file_descriptors().write().close_on_exec();
+        // Close CLOEXEC descriptors
+        crate::file_descriptors().write().close_on_exec(self);
 
-    // unmmap all memory mappings and reset brk
-    with_current_task(|task| {
-        if let Some(robust_list) = task.robust_list.take() {
+        // unmmap all memory mappings and reset brk
+        if let Some(robust_list) = self.robust_list.take() {
             let _ = wake_robust_list(robust_list);
         }
 
         // Check if we are the only thread in the process
-        if task
+        if self
             .process
             .nr_threads
             .load(core::sync::atomic::Ordering::Relaxed)
@@ -1024,74 +1046,78 @@ pub(crate) fn sys_execve(
         let release = |r: Range<usize>, vm: VmFlags| !vm.is_empty();
         let page_manager = crate::litebox_page_manager();
         unsafe { page_manager.release_memory(release) }.expect("failed to release memory mappings");
-    });
 
-    litebox_platform_multiplex::Platform::clear_guest_thread_local_storage(
-        #[cfg(target_arch = "x86")]
-        ctx.xgs.truncate(),
-    );
+        litebox_platform_multiplex::Platform::clear_guest_thread_local_storage(
+            #[cfg(target_arch = "x86")]
+            ctx.xgs.truncate(),
+        );
 
-    // TODO: split this operation into pre-unmap and post-unmap parts, and handle failure properly for both cases.
-    *ctx = crate::load_program(path, argv_vec, envp_vec).unwrap();
+        // TODO: split this operation into pre-unmap and post-unmap parts, and handle failure properly for both cases.
+        *ctx = self.load_program(path, argv_vec, envp_vec).unwrap();
 
-    Ok(())
-}
-
-/// Handle syscall `alarm`.
-pub(crate) fn sys_alarm(seconds: u32) -> Result<usize, Errno> {
-    let token = litebox_platform_multiplex::platform()
-        .get_punchthrough_token_for(litebox_common_linux::PunchthroughSyscall::Alarm { seconds })
-        .expect("Failed to get punchthrough token for SET_ALARM");
-    token.execute().map_err(|e| match e {
-        litebox::platform::PunchthroughError::Failure(errno) => errno,
-        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-    })
-}
-
-/// Handle syscall `tgkill`.
-pub(crate) fn sys_tgkill(
-    thread_group_id: i32,
-    thread_id: i32,
-    sig: litebox_common_linux::Signal,
-) -> Result<(), Errno> {
-    if thread_id <= 0 || thread_group_id <= 0 {
-        return Err(Errno::EINVAL);
+        Ok(())
     }
-    if thread_group_id != sys_getpid() {
-        unimplemented!("Sending signal to other processes is not supported yet");
-    }
-    let punchthrough = litebox_common_linux::PunchthroughSyscall::ThreadKill {
-        thread_group_id,
-        thread_id,
-        sig,
-    };
-    let token = litebox_platform_multiplex::platform()
-        .get_punchthrough_token_for(punchthrough)
-        .expect("Failed to get punchthrough token for TGKILL");
-    token.execute().map(|_| ()).map_err(|e| match e {
-        litebox::platform::PunchthroughError::Failure(errno) => errno,
-        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-    })
-}
 
-/// Handle syscall `setitimer`
-pub(crate) fn sys_setitimer(
-    which: litebox_common_linux::IntervalTimer,
-    new_value: crate::ConstPtr<litebox_common_linux::ItimerVal>,
-    old_value: Option<crate::MutPtr<litebox_common_linux::ItimerVal>>,
-) -> Result<(), Errno> {
-    let punchthrough = litebox_common_linux::PunchthroughSyscall::SetITimer {
-        which,
-        new_value,
-        old_value,
-    };
-    let token = litebox_platform_multiplex::platform()
-        .get_punchthrough_token_for(punchthrough)
-        .expect("Failed to get punchthrough token for SETITIMER");
-    token.execute().map(|_| ()).map_err(|e| match e {
-        litebox::platform::PunchthroughError::Failure(errno) => errno,
-        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-    })
+    /// Handle syscall `alarm`.
+    pub(crate) fn sys_alarm(&self, seconds: u32) -> Result<usize, Errno> {
+        let token = litebox_platform_multiplex::platform()
+            .get_punchthrough_token_for(litebox_common_linux::PunchthroughSyscall::Alarm {
+                seconds,
+            })
+            .expect("Failed to get punchthrough token for SET_ALARM");
+        token.execute().map_err(|e| match e {
+            litebox::platform::PunchthroughError::Failure(errno) => errno,
+            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+        })
+    }
+
+    /// Handle syscall `tgkill`.
+    pub(crate) fn sys_tgkill(
+        &self,
+        thread_group_id: i32,
+        thread_id: i32,
+        sig: litebox_common_linux::Signal,
+    ) -> Result<(), Errno> {
+        if thread_id <= 0 || thread_group_id <= 0 {
+            return Err(Errno::EINVAL);
+        }
+        if thread_group_id != self.sys_getpid() {
+            unimplemented!("Sending signal to other processes is not supported yet");
+        }
+        let punchthrough = litebox_common_linux::PunchthroughSyscall::ThreadKill {
+            thread_group_id,
+            thread_id,
+            sig,
+        };
+        let token = litebox_platform_multiplex::platform()
+            .get_punchthrough_token_for(punchthrough)
+            .expect("Failed to get punchthrough token for TGKILL");
+        token.execute().map(|_| ()).map_err(|e| match e {
+            litebox::platform::PunchthroughError::Failure(errno) => errno,
+            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+        })
+    }
+
+    /// Handle syscall `setitimer`
+    pub(crate) fn sys_setitimer(
+        &self,
+        which: litebox_common_linux::IntervalTimer,
+        new_value: crate::ConstPtr<litebox_common_linux::ItimerVal>,
+        old_value: Option<crate::MutPtr<litebox_common_linux::ItimerVal>>,
+    ) -> Result<(), Errno> {
+        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetITimer {
+            which,
+            new_value,
+            old_value,
+        };
+        let token = litebox_platform_multiplex::platform()
+            .get_punchthrough_token_for(punchthrough)
+            .expect("Failed to get punchthrough token for SETITIMER");
+        token.execute().map(|_| ()).map_err(|e| match e {
+            litebox::platform::PunchthroughError::Failure(errno) => errno,
+            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+        })
+    }
 }
 
 #[cfg(test)]

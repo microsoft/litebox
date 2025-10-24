@@ -2,47 +2,53 @@
 //!
 //! Examples of syscalls handled here include `getrandom`, `uname`, and similar operations.
 
-use crate::with_current_task;
+use crate::Task;
 use litebox::{
     platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider as _},
     utils::TruncateExt as _,
 };
 use litebox_common_linux::errno::Errno;
 
-/// Handle syscall `getrandom`.
-pub(crate) fn sys_getrandom(
-    buf: crate::MutPtr<u8>,
-    count: usize,
-    _flags: litebox_common_linux::RngFlags,
-) -> Result<usize, Errno> {
-    // FIXME: before we have secure randomness source (see #41), use a fast and insecure one.
-    static RANDOM: once_cell::race::OnceBox<
-        litebox::sync::Mutex<litebox_platform_multiplex::Platform, litebox::utils::rng::FastRng>,
-    > = once_cell::race::OnceBox::new();
-    let mut random = RANDOM
-        .get_or_init(|| {
-            alloc::boxed::Box::new(crate::litebox().sync().new_mutex(
-                litebox::utils::rng::FastRng::new_from_seed(
-                    core::num::NonZeroU64::new(0x4d595df4d0f33173).unwrap(),
-                ),
-            ))
-        })
-        .lock();
-    let mut off = 0;
-    loop {
-        if off >= count {
-            break Ok(count);
-        }
+impl Task {
+    /// Handle syscall `getrandom`.
+    pub(crate) fn sys_getrandom(
+        &self,
+        buf: crate::MutPtr<u8>,
+        count: usize,
+        _flags: litebox_common_linux::RngFlags,
+    ) -> Result<usize, Errno> {
+        // FIXME: before we have secure randomness source (see #41), use a fast and insecure one.
+        static RANDOM: once_cell::race::OnceBox<
+            litebox::sync::Mutex<
+                litebox_platform_multiplex::Platform,
+                litebox::utils::rng::FastRng,
+            >,
+        > = once_cell::race::OnceBox::new();
+        let mut random = RANDOM
+            .get_or_init(|| {
+                alloc::boxed::Box::new(crate::litebox().sync().new_mutex(
+                    litebox::utils::rng::FastRng::new_from_seed(
+                        core::num::NonZeroU64::new(0x4d595df4d0f33173).unwrap(),
+                    ),
+                ))
+            })
+            .lock();
+        let mut off = 0;
+        loop {
+            if off >= count {
+                break Ok(count);
+            }
 
-        let bytes = random.next_u64();
-        let max = core::cmp::min(count - off, 8);
-        if buf
-            .copy_from_slice(off, &bytes.to_ne_bytes()[..max])
-            .is_none()
-        {
-            break Err(Errno::EFAULT);
+            let bytes = random.next_u64();
+            let max = core::cmp::min(count - off, 8);
+            if buf
+                .copy_from_slice(off, &bytes.to_ne_bytes()[..max])
+                .is_none()
+            {
+                break Err(Errno::EFAULT);
+            }
+            off += 8;
         }
-        off += 8;
     }
 }
 
@@ -76,36 +82,40 @@ const SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
     domainname: to_fixed_size_array::<65>(""),
 };
 
-/// Handle syscall `uname`.
-pub(crate) fn sys_uname(buf: crate::MutPtr<litebox_common_linux::Utsname>) -> Result<(), Errno> {
-    unsafe { buf.write_at_offset(0, SYS_INFO) }.ok_or(Errno::EFAULT)
-}
+impl Task {
+    /// Handle syscall `uname`.
+    pub(crate) fn sys_uname(
+        &self,
+        buf: crate::MutPtr<litebox_common_linux::Utsname>,
+    ) -> Result<(), Errno> {
+        unsafe { buf.write_at_offset(0, SYS_INFO) }.ok_or(Errno::EFAULT)
+    }
 
-/// Handle syscall `sysinfo`.
-pub(crate) fn sys_sysinfo() -> litebox_common_linux::Sysinfo {
-    let now = litebox_platform_multiplex::platform().now();
-    litebox_common_linux::Sysinfo {
-        uptime: now.duration_since(crate::boot_time()).as_secs().truncate(),
-        // TODO: Populate these fields with actual values
-        loads: [0; 3],
-        #[cfg(target_arch = "x86_64")]
-        totalram: 4 * 1024 * 1024 * 1024,
-        #[cfg(target_arch = "x86")]
-        totalram: 3 * 1024 * 1024 * 1024,
-        freeram: 2 * 1024 * 1024 * 1024,
-        sharedram: 0, // We don't support shared memory
-        bufferram: 0,
-        totalswap: 0,
-        freeswap: 0,
-        procs: with_current_task(|task| {
-            task.process
+    /// Handle syscall `sysinfo`.
+    pub(crate) fn sys_sysinfo(&self) -> litebox_common_linux::Sysinfo {
+        let now = litebox_platform_multiplex::platform().now();
+        litebox_common_linux::Sysinfo {
+            uptime: now.duration_since(crate::boot_time()).as_secs().truncate(),
+            // TODO: Populate these fields with actual values
+            loads: [0; 3],
+            #[cfg(target_arch = "x86_64")]
+            totalram: 4 * 1024 * 1024 * 1024,
+            #[cfg(target_arch = "x86")]
+            totalram: 3 * 1024 * 1024 * 1024,
+            freeram: 2 * 1024 * 1024 * 1024,
+            sharedram: 0, // We don't support shared memory
+            bufferram: 0,
+            totalswap: 0,
+            freeswap: 0,
+            procs: self
+                .process
                 .nr_threads
-                .load(core::sync::atomic::Ordering::Relaxed)
-        }),
-        totalhigh: 0,
-        freehigh: 0,
-        mem_unit: 1,
-        ..Default::default()
+                .load(core::sync::atomic::Ordering::Relaxed),
+            totalhigh: 0,
+            freehigh: 0,
+            mem_unit: 1,
+            ..Default::default()
+        }
     }
 }
 
@@ -113,53 +123,56 @@ const _LINUX_CAPABILITY_VERSION_1: u32 = 0x19980330;
 const _LINUX_CAPABILITY_VERSION_2: u32 = 0x20071026; /* deprecated - use v3 */
 const _LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 
-/// Handle syscall `capget`.
-///
-/// Note we don't support capabilities in LiteBox, so this returns empty capabilities.
-pub(crate) fn sys_capget(
-    header: crate::MutPtr<litebox_common_linux::CapHeader>,
-    data: Option<crate::MutPtr<litebox_common_linux::CapData>>,
-) -> Result<(), Errno> {
-    let hdr = unsafe { header.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
-    match hdr.version {
-        _LINUX_CAPABILITY_VERSION_1 => {
-            if let Some(data_ptr) = data {
-                let cap = litebox_common_linux::CapData {
-                    effective: 0,
-                    permitted: 0,
-                    inheritable: 0,
-                };
-                unsafe { data_ptr.write_at_offset(0, cap) }.ok_or(Errno::EFAULT)?;
-            }
-            Ok(())
-        }
-        _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => {
-            if let Some(data_ptr) = data {
-                let cap = litebox_common_linux::CapData {
-                    effective: 0,
-                    permitted: 0,
-                    inheritable: 0,
-                };
-                unsafe { data_ptr.write_at_offset(0, cap.clone()) }.ok_or(Errno::EFAULT)?;
-                unsafe { data_ptr.write_at_offset(1, cap) }.ok_or(Errno::EFAULT)?;
-            }
-            Ok(())
-        }
-        _ => {
-            unsafe {
-                header.write_at_offset(
-                    0,
-                    litebox_common_linux::CapHeader {
-                        version: _LINUX_CAPABILITY_VERSION_3,
-                        pid: hdr.pid,
-                    },
-                )
-            }
-            .ok_or(Errno::EFAULT)?;
-            if data.is_none() {
+impl Task {
+    /// Handle syscall `capget`.
+    ///
+    /// Note we don't support capabilities in LiteBox, so this returns empty capabilities.
+    pub(crate) fn sys_capget(
+        &self,
+        header: crate::MutPtr<litebox_common_linux::CapHeader>,
+        data: Option<crate::MutPtr<litebox_common_linux::CapData>>,
+    ) -> Result<(), Errno> {
+        let hdr = unsafe { header.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+        match hdr.version {
+            _LINUX_CAPABILITY_VERSION_1 => {
+                if let Some(data_ptr) = data {
+                    let cap = litebox_common_linux::CapData {
+                        effective: 0,
+                        permitted: 0,
+                        inheritable: 0,
+                    };
+                    unsafe { data_ptr.write_at_offset(0, cap) }.ok_or(Errno::EFAULT)?;
+                }
                 Ok(())
-            } else {
-                Err(Errno::EINVAL)
+            }
+            _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => {
+                if let Some(data_ptr) = data {
+                    let cap = litebox_common_linux::CapData {
+                        effective: 0,
+                        permitted: 0,
+                        inheritable: 0,
+                    };
+                    unsafe { data_ptr.write_at_offset(0, cap.clone()) }.ok_or(Errno::EFAULT)?;
+                    unsafe { data_ptr.write_at_offset(1, cap) }.ok_or(Errno::EFAULT)?;
+                }
+                Ok(())
+            }
+            _ => {
+                unsafe {
+                    header.write_at_offset(
+                        0,
+                        litebox_common_linux::CapHeader {
+                            version: _LINUX_CAPABILITY_VERSION_3,
+                            pid: hdr.pid,
+                        },
+                    )
+                }
+                .ok_or(Errno::EFAULT)?;
+                if data.is_none() {
+                    Ok(())
+                } else {
+                    Err(Errno::EINVAL)
+                }
             }
         }
     }
