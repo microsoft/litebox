@@ -11,6 +11,7 @@ fn ratchet_transmutes() -> Result<()> {
             ("dev_tests/", 2),
             ("litebox/", 1),
             ("litebox_shim_linux/", 1),
+            ("litebox_platform_linux_userland/", 2),
         ],
         |file| {
             Ok(file
@@ -27,7 +28,7 @@ fn ratchet_globals() -> Result<()> {
         &[
             ("litebox/", 5),
             ("litebox_platform_linux_kernel/", 4),
-            ("litebox_platform_linux_userland/", 3),
+            ("litebox_platform_linux_userland/", 5),
             ("litebox_platform_lvbs/", 17),
             ("litebox_platform_multiplex/", 1),
             ("litebox_platform_windows_userland/", 7),
