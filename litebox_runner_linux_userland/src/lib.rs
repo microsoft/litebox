@@ -216,7 +216,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     litebox_shim_linux::set_fs(initial_file_system);
     litebox_shim_linux::set_load_filter(fixup_env_aux);
-    platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
+    platform.register_shim(&litebox_shim_linux::LinuxShim);
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
         InterceptionBackend::Rewriter => {

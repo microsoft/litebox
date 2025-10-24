@@ -64,20 +64,8 @@ pub trait ThreadProvider: RawPointerProvider {
     unsafe fn spawn_thread(
         &self,
         ctx: &Self::ExecutionContext,
-        init_thread: alloc::boxed::Box<dyn InitThread>,
+        init_thread: alloc::boxed::Box<dyn crate::shim::InitThread>,
     ) -> Result<(), Self::ThreadSpawnError>;
-}
-
-/// An object to initialize a newly spawned platform thread for use with the
-/// shim that spawned it.
-///
-/// This is implemented by the shim for passing to [`ThreadProvider::spawn_thread`].
-pub trait InitThread: Send {
-    /// Initializes the thread.
-    ///
-    /// After calling this, the caller must run the thread in the shim until it
-    /// exits, or there may be hangs or leaks.
-    fn init(self: alloc::boxed::Box<Self>);
 }
 
 /// Punch through any functionality for a particular platform that is not explicitly part of the

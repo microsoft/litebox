@@ -330,7 +330,7 @@ struct NewThreadArgs {
 // FUTURE: Consider revisiting this impl, see <https://github.com/microsoft/litebox/issues/431>.
 unsafe impl Send for NewThreadArgs {}
 
-impl litebox::platform::InitThread for NewThreadArgs {
+impl litebox::shim::InitThread for NewThreadArgs {
     fn init(self: alloc::boxed::Box<Self>) {
         let Self {
             task,

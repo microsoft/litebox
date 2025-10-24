@@ -6,7 +6,6 @@
 
 use crate::{
     mshv::{vsm::Vtl0KernelInfo, vtl1_mem_layout::PAGE_SIZE},
-    syscall_entry::SyscallHandler,
     user_context::UserContextMap,
 };
 
@@ -23,6 +22,7 @@ use litebox::platform::{
 };
 use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::errno::Errno;
+use litebox_common_optee::ContinueOperation;
 use ptr::{UserConstPtr, UserMutPtr};
 use x86_64::structures::paging::{
     PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
@@ -328,10 +328,15 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         pt
     }
 
-    /// Register `syscall_handler` passed down from the shim. This function must be called
-    /// for each core to program its MSRs.
-    pub fn register_syscall_handler(syscall_handler: SyscallHandler) {
-        syscall_entry::init(syscall_handler);
+    /// Register the shim. This function must be called for each core to program
+    /// its MSRs.
+    pub fn register_shim(
+        shim: &'static dyn litebox::shim::EnterShim<
+            ExecutionContext = litebox_common_linux::PtRegs,
+            ContinueOperation = ContinueOperation,
+        >,
+    ) {
+        syscall_entry::init(shim);
     }
 }
 

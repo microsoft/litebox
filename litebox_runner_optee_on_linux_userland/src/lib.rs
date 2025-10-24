@@ -91,7 +91,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new(None);
     litebox_platform_multiplex::set_platform(platform);
-    platform.register_syscall_handler(litebox_shim_optee::handle_syscall_request);
+    platform.register_shim(&litebox_shim_optee::OpteeShim);
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
         InterceptionBackend::Rewriter => {}

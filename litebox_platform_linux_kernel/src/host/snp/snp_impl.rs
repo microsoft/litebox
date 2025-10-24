@@ -125,7 +125,7 @@ core::arch::global_asm!(include_str!("entry.S"));
 
 struct ThreadStartArgs {
     ctx: litebox_common_linux::PtRegs,
-    init_thread: Box<dyn litebox::platform::InitThread>,
+    init_thread: Box<dyn litebox::shim::InitThread>,
 }
 
 const RIP_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs, rip);
@@ -185,7 +185,7 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     unsafe fn spawn_thread(
         &self,
         ctx: &Self::ExecutionContext,
-        init_thread: Box<dyn litebox::platform::InitThread>,
+        init_thread: Box<dyn litebox::shim::InitThread>,
     ) -> Result<(), Self::ThreadSpawnError> {
         let flags = CloneFlags::THREAD
             | CloneFlags::VM

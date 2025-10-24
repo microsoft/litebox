@@ -35,7 +35,7 @@ pub fn init_platform(tar_data: &'static [u8], initial_dirs: &[&str], initial_fil
         install_file(data, each);
     }
 
-    platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
+    platform.register_shim(&litebox_shim_linux::LinuxShim);
 }
 
 pub fn install_dir(path: &str) {
