@@ -3,7 +3,8 @@
 /// An object to initialize a newly spawned platform thread for use with the
 /// shim that spawned it.
 ///
-/// This is implemented by the shim for passing to [`ThreadProvider::spawn_thread`].
+/// This is implemented by the shim for passing to
+/// [`ThreadProvider::spawn_thread`](crate::platform::ThreadProvider::spawn_thread).
 pub trait InitThread: Send {
     /// Initializes the thread.
     ///
