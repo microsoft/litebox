@@ -248,7 +248,7 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
             .ok_or(SeekError::ClosedFd)?
             .entry
         {
-            Device::Stdin | Device::Stdout | Device::Stderr => unimplemented!(),
+            Device::Stdin | Device::Stdout | Device::Stderr => Err(SeekError::NonSeekable),
             Device::Null => {
                 // Linux allows lseek on /dev/null and returns position 0 (or sets to length 0).
                 Ok(0)

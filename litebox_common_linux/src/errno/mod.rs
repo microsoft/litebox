@@ -200,8 +200,11 @@ impl From<litebox::fs::errors::WriteError> for Errno {
 impl From<litebox::fs::errors::SeekError> for Errno {
     fn from(value: litebox::fs::errors::SeekError) -> Self {
         match value {
-            litebox::fs::errors::SeekError::NotAFile => Errno::EBADF,
+            litebox::fs::errors::SeekError::NotAFile | litebox::fs::errors::SeekError::ClosedFd => {
+                Errno::EBADF
+            }
             litebox::fs::errors::SeekError::InvalidOffset => Errno::EINVAL,
+            litebox::fs::errors::SeekError::NonSeekable => Errno::ESPIPE,
             _ => unimplemented!(),
         }
     }
