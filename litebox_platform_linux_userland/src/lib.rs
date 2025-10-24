@@ -1901,6 +1901,9 @@ unsafe extern "C" fn exception_signal_handler(
     }
     *orig_eax = *eax;
 
+    // Ensure that `run_thread` is linked in so that `exception_callback` is visible.
+    let _ = run_thread as usize;
+
     // Jump to exception_callback.
     sigctx.gregs[libc::REG_EIP as usize] = (exception_callback as usize)
         .reinterpret_as_signed()
