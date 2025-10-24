@@ -223,15 +223,15 @@ pub(crate) fn create_tar_with_cache(tar_dir: &Path, tar_file: &Path, unique_name
     let all_entries = tar_dir
         .read_dir()
         .expect("Failed to read tar directory")
-        .into_iter()
         .filter_map(|entry| entry.map(|e| e.file_name()).ok())
         .collect::<Vec<_>>();
-    for entry in all_entries.iter() {
+    for entry in &all_entries {
         args.push(entry.to_str().unwrap());
     }
     let mut command_parts = vec!["tar"];
     command_parts.extend_from_slice(&args);
     let command = command_parts.join(" ");
+    println!("Tar command: {command}");
 
     if let Ok(true) = crate::cache::is_cached_and_valid(&input_paths, tar_file, &command) {
         println!("Using cached tar file for: {unique_name}");

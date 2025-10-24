@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use litebox::fs::{FileSystem as _, Mode};
+use litebox::fs::FileSystem as _;
 use litebox::platform::SystemInfoProvider as _;
 use litebox_platform_multiplex::Platform;
 use memmap2::Mmap;
@@ -200,10 +200,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         } else {
             open_file(&mut in_mem, prog.to_str().unwrap(), last.0);
         }
-        in_mem.with_root_privileges(|fs| {
-            fs.mkdir("/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to create /tmp");
-        });
+
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
         litebox_shim_linux::default_fs(in_mem, tar_ro)
     };

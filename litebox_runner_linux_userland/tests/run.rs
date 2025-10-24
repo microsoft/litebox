@@ -12,12 +12,12 @@ enum Backend {
     Seccomp,
 }
 
-fn run_target_program(
+fn run_target_program<F: FnOnce(PathBuf)>(
     backend: Backend,
     target: &Path,
     cmd_args: &[&str],
     environments: &[&str],
-    install_files: fn(PathBuf),
+    install_files: F,
     unique_name: &str,
     tun_name: Option<&str>,
 ) -> Vec<u8> {
@@ -178,7 +178,15 @@ fn test_dynamic_lib_with_rewriter() {
             .expect("failed to get file stem");
         let unique_name = format!("{stem}_rewriter");
         let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
-        run_target_program(Backend::Rewriter, &target, &[], &[], |_| {}, &unique_name, None);
+        run_target_program(
+            Backend::Rewriter,
+            &target,
+            &[],
+            &[],
+            |_| {},
+            &unique_name,
+            None,
+        );
     }
 }
 
@@ -191,7 +199,15 @@ fn test_static_exec_with_rewriter() {
             .expect("failed to get file stem");
         let unique_name = format!("{stem}_exec_rewriter");
         let target = common::compile(path.to_str().unwrap(), &unique_name, true, false);
-        run_target_program(Backend::Rewriter, &target, &[], &[], |_| {}, &unique_name, None);
+        run_target_program(
+            Backend::Rewriter,
+            &target,
+            &[],
+            &[],
+            |_| {},
+            &unique_name,
+            None,
+        );
     }
 }
 
@@ -206,7 +222,15 @@ fn test_dynamic_lib_with_seccomp() {
             .expect("failed to get file stem");
         let unique_name = format!("{stem}_seccomp");
         let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
-        run_target_program(Backend::Seccomp, &target, &[], &[], |_| {}, &unique_name, None);
+        run_target_program(
+            Backend::Seccomp,
+            &target,
+            &[],
+            &[],
+            |_| {},
+            &unique_name,
+            None,
+        );
     }
 }
 
@@ -283,7 +307,7 @@ fn test_runner_with_ls() {
         Backend::Rewriter,
         &ls_path,
         &["-a"],
-         &[],
+        &[],
         |_| {},
         "ls_rewriter",
         None,
@@ -314,7 +338,76 @@ fn test_runner_with_ls() {
     for each in [".", "..", "libc.so.6", "libpcre2-8.so.0", "libselinux.so.1"] {
         assert!(
             normalized.contains(&each),
-            "unexpected ls output:\n{output_str}",
+            "unexpected ls output:\n{output_str}\n{each} not found",
         );
     }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn run_python(args: &[&str]) -> String {
+    let output = std::process::Command::new("python3")
+        .args(args)
+        .output()
+        .expect("Failed to run Python");
+    assert!(output.status.success(), "Python script failed");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_runner_with_python() {
+    const HELLO_WORLD_PY: &str = "print(\"Hello, World from litebox!\")";
+    let python_path = run_which("python3");
+    let python_home = run_python(&["-c", "import sys; print(sys.prefix);"]);
+    println!("Detected PYTHONHOME: {python_home}");
+    let python_sys_path = run_python(&["-c", "import sys; print(':'.join(sys.path))"]);
+    println!("Detected PYTHONPATH: {python_sys_path}");
+    run_target_program(
+        Backend::Rewriter,
+        &python_path,
+        &["-c", HELLO_WORLD_PY],
+        &[
+            &format!("PYTHONHOME={}", python_home.trim()),
+            &format!("PYTHONPATH={}", python_sys_path.trim()),
+            // LiteBox does not support timestamp yet, so pre-compiled .pyc files are not usable.
+            // Avoid creating .pyc files as tar filesystem is read-only.
+            "PYTHONDONTWRITEBYTECODE=1",
+        ],
+        |out_dir| {
+            for each in python_sys_path.split(':') {
+                if each.is_empty() || !each.starts_with("/usr") {
+                    continue;
+                }
+                let python_lib_src = Path::new(each);
+                if python_lib_src.is_dir() {
+                    let python_lib_dst = out_dir.join(&each[1..]); // remove leading '/'
+                    if python_lib_dst.exists() {
+                        continue;
+                    }
+                    std::fs::create_dir_all(&python_lib_dst).unwrap();
+                    println!(
+                        "Copying python3 lib from {} to {}",
+                        python_lib_src.to_str().unwrap(),
+                        python_lib_dst.to_str().unwrap()
+                    );
+                    // TODO: we may also need to rewrite all .so files under the python lib directory
+                    let output = std::process::Command::new("cp")
+                        .args([
+                            "-a",
+                            python_lib_src.to_str().unwrap(),
+                            python_lib_dst.parent().unwrap().to_str().unwrap(),
+                        ])
+                        .output()
+                        .expect("Failed to copy python3 lib");
+                    assert!(
+                        output.status.success(),
+                        "failed to copy python3 lib {:?}",
+                        std::str::from_utf8(output.stderr.as_slice()).unwrap()
+                    );
+                }
+            }
+        },
+        "python3_rewriter",
+        None,
+    );
 }
