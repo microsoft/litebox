@@ -218,7 +218,12 @@ pub(crate) fn create_tar_with_cache(tar_dir: &Path, tar_file: &Path, unique_name
 
     // Create command string for caching
     let tar_filename = format!("../rootfs_{unique_name}.tar");
-    let mut args = vec!["-cvf", tar_filename.as_str()];
+    let mut args = vec![
+        // ustar format allows longer file names
+        "--format=ustar",
+        "-cvf",
+        tar_filename.as_str(),
+    ];
     // collect all entries in the tar_dir
     let all_entries = tar_dir
         .read_dir()
