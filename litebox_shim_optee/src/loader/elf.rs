@@ -8,6 +8,7 @@ use elf_loader::{
     object::ElfObject,
 };
 use hashbrown::HashMap;
+use litebox::platform::{PunchthroughProvider, PunchthroughToken};
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE},
     platform::RawConstPointer as _,
@@ -16,6 +17,7 @@ use litebox_common_linux::errno::Errno;
 use once_cell::race::OnceBox;
 use thiserror::Error;
 
+use super::ElfLoadInfo;
 use crate::MutPtr;
 
 #[cfg(feature = "platform_linux_userland")]
@@ -239,14 +241,6 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
     }
 }
 
-/// Struct to hold the information needed to start the program
-/// (entry point and stack_base).
-#[derive(Clone, Copy)]
-pub struct ElfLoadInfo {
-    pub entry_point: usize,
-    pub stack_base: usize,
-}
-
 #[cfg(feature = "platform_linux_userland")]
 #[cfg(target_arch = "x86_64")]
 type Ehdr = elf::file::Elf64_Ehdr;
@@ -418,13 +412,13 @@ impl ElfLoader {
             load_trampoline(trampoline, base, fd);
         }
 
-        // TODO: the following memory page allocated for TLS in the TA
-        // will be freed when the TA is unloaded.
-
-        // Since we don't use `ld` or `ldelf` for loading a TA, we should manually set up
-        // the userspace thread local storage (TLS)
-        let _ = crate::syscalls::mm::sys_mmap(
-            super::DEFAULT_FS_BASE,
+        // Normally, loader or libc allocates memory for TLS and sets up the FS base.
+        // Since we do not rely on them here, we explicitly do this by ourselves.
+        // In general, we do not need to deallocate this page because the OP-TEE TA
+        // does not support multiple threads such that this page should be used until
+        // the TA exits, which will free all allocated pages.
+        let addr = crate::syscalls::mm::sys_mmap(
+            0,
             PAGE_SIZE,
             litebox_common_linux::ProtFlags::PROT_READ
                 | litebox_common_linux::ProtFlags::PROT_WRITE,
@@ -435,11 +429,16 @@ impl ElfLoader {
             -1,
             0,
         );
-        unsafe {
-            litebox_common_linux::wrgsbase(super::DEFAULT_FS_BASE);
-        }
-        // TODO: store and load this FS base value through a global data structure instead of
-        // using a fixed address
+        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase {
+            addr: addr.unwrap().as_usize(),
+        };
+        let token = litebox_platform_multiplex::platform()
+            .get_punchthrough_token_for(punchthrough)
+            .expect("Failed to get punchthrough token for SET_FS");
+        let _ = token.execute().map(|_| ()).map_err(|e| match e {
+            litebox::platform::PunchthroughError::Failure(errno) => errno,
+            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+        });
 
         // Since it does not have `ld` or `ldelf`, it should relocate symbols by its own.
         elf.easy_relocate([].into_iter(), &|_| None)
@@ -465,6 +464,7 @@ impl ElfLoader {
         Ok(ElfLoadInfo {
             entry_point: entry,
             stack_base: stack.get_stack_base(),
+            params_address: stack.get_params_address(),
         })
     }
 }

@@ -18,10 +18,12 @@ use litebox::mm::linux::PageRange;
 use litebox::platform::page_mgmt::DeallocationError;
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
-    RawMutexProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
+    Punchthrough, RawMutexProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
 };
-use litebox::platform::{RawMutex as _, RawPointerProvider};
-use litebox_common_linux::errno::Errno;
+use litebox::platform::{
+    PunchthroughProvider, PunchthroughToken, RawMutPointer, RawMutex as _, RawPointerProvider,
+};
+use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
 use ptr::{UserConstPtr, UserMutPtr};
 use x86_64::structures::paging::{
     PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
@@ -51,9 +53,58 @@ pub struct LinuxKernel<Host: HostInterface> {
     user_contexts: UserContextMap,
 }
 
+pub struct LinuxPunchthroughToken<Host: HostInterface> {
+    punchthrough: PunchthroughSyscall<LinuxKernel<Host>>,
+    host: core::marker::PhantomData<Host>,
+}
+
 impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
     type RawConstPointer<T: Clone> = ptr::UserConstPtr<T>;
     type RawMutPointer<T: Clone> = ptr::UserMutPtr<T>;
+}
+
+impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
+    type Punchthrough = PunchthroughSyscall<LinuxKernel<Host>>;
+
+    fn execute(
+        self,
+    ) -> Result<
+        <Self::Punchthrough as Punchthrough>::ReturnSuccess,
+        litebox::platform::PunchthroughError<<Self::Punchthrough as Punchthrough>::ReturnFailure>,
+    > {
+        let r = match self.punchthrough {
+            PunchthroughSyscall::SetFsBase { addr } => {
+                unsafe { litebox_common_linux::wrfsbase(addr) };
+                Ok(0)
+            }
+            PunchthroughSyscall::GetFsBase { addr } => {
+                let fs_base = unsafe { litebox_common_linux::rdfsbase() };
+                let ptr: UserMutPtr<usize> = addr.cast();
+                unsafe { ptr.write_at_offset(0, fs_base) }
+                    .map(|()| 0)
+                    .ok_or(Errno::EFAULT)
+            }
+            _ => unimplemented!(),
+        };
+        match r {
+            Ok(v) => Ok(v),
+            Err(e) => Err(litebox::platform::PunchthroughError::Failure(e)),
+        }
+    }
+}
+
+impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
+    type PunchthroughToken = LinuxPunchthroughToken<Host>;
+
+    fn get_punchthrough_token_for(
+        &self,
+        punchthrough: <Self::PunchthroughToken as PunchthroughToken>::Punchthrough,
+    ) -> Option<Self::PunchthroughToken> {
+        Some(LinuxPunchthroughToken {
+            punchthrough,
+            host: core::marker::PhantomData,
+        })
+    }
 }
 
 impl<Host: HostInterface> LinuxKernel<Host> {

@@ -4,9 +4,9 @@ use litebox::{
     mm::linux::CreatePagesFlags,
     platform::{RawConstPointer, RawMutPointer},
 };
-use litebox_common_optee::{TeeParamType, UteeParams};
+use litebox_common_optee::{TeeParamType, UteeParamOwned, UteeParams};
 
-use crate::{MutPtr, UteeParamsTyped, litebox_page_manager};
+use crate::{MutPtr, litebox_page_manager};
 
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
@@ -45,7 +45,7 @@ fn align_down(addr: usize, align: usize) -> usize {
 /// - rcx: command ID
 ///
 /// NOTE: The above layout diagram is for 64-bit processes.
-pub(crate) struct TaStack {
+pub struct TaStack {
     /// The top of the stack (base address)
     stack_top: MutPtr<u8>,
     /// The length of the stack
@@ -81,7 +81,7 @@ impl TaStack {
     }
 
     /// Get the current stack pointer.
-    pub(crate) fn get_cur_stack_top(&self) -> usize {
+    pub fn get_cur_stack_top(&self) -> usize {
         self.stack_top.as_usize() + self.pos
     }
 
@@ -199,31 +199,42 @@ impl TaStack {
         Some(())
     }
 
-    pub(crate) fn init(&mut self, params: &[UteeParamsTyped]) -> Option<()> {
+    pub(crate) fn init(&mut self, params: &[UteeParamOwned]) -> Option<()> {
         if params.len() > UteeParams::TEE_NUM_PARAMS {
             return None;
         }
         for param in params {
             match param {
-                UteeParamsTyped::ValueInput { value_a, value_b } => {
+                UteeParamOwned::ValueInput { value_a, value_b } => {
                     self.push_param_values(TeeParamType::ValueInput, Some((*value_a, *value_b)))?;
                 }
-                UteeParamsTyped::ValueOutput {} => {
+                UteeParamOwned::ValueOutput { out_address: _ } => {
                     self.push_param_values(TeeParamType::ValueOutput, None)?;
                 }
-                UteeParamsTyped::ValueInout { value_a, value_b } => {
+                UteeParamOwned::ValueInout {
+                    value_a,
+                    value_b,
+                    out_address: _,
+                } => {
                     self.push_param_values(TeeParamType::ValueInout, Some((*value_a, *value_b)))?;
                 }
-                UteeParamsTyped::MemrefInput { data } => {
+                UteeParamOwned::MemrefInput { data } => {
                     self.push_param_memref(TeeParamType::MemrefInput, Some(data), data.len())?;
                 }
-                UteeParamsTyped::MemrefInout { data, buffer_size } => {
+                UteeParamOwned::MemrefInout {
+                    data,
+                    buffer_size,
+                    out_addresses: _,
+                } => {
                     self.push_param_memref(TeeParamType::MemrefInout, Some(data), *buffer_size)?;
                 }
-                UteeParamsTyped::MemrefOutput { buffer_size } => {
+                UteeParamOwned::MemrefOutput {
+                    buffer_size,
+                    out_addresses: _,
+                } => {
                     self.push_param_memref(TeeParamType::MemrefOutput, None, *buffer_size)?;
                 }
-                UteeParamsTyped::None => self.push_param_none()?,
+                UteeParamOwned::None => self.push_param_none()?,
             }
         }
 

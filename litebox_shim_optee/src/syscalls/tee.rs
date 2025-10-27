@@ -38,13 +38,6 @@ pub fn sys_return(ret: usize) -> usize {
         ret
     );
 
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "platform_linux_userland")] {
-            let session_id = crate::SESSION_ID.load(core::sync::atomic::Ordering::Relaxed);
-            crate::optee_command_dispatcher(session_id, true);
-        }
-    }
-
     ret
 }
 
