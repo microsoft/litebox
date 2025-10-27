@@ -960,7 +960,6 @@ dependencies = [
  "arrayvec",
  "base64",
  "clap",
- "hashbrown 0.15.5",
  "libc",
  "litebox",
  "litebox_common_linux",
@@ -969,10 +968,8 @@ dependencies = [
  "litebox_platform_multiplex",
  "litebox_shim_optee",
  "litebox_syscall_rewriter",
- "once_cell",
  "serde",
  "serde_json",
- "spin 0.10.0",
 ]
 
 [[package]]

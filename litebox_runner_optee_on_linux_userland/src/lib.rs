@@ -1,20 +1,11 @@
 use anyhow::Result;
 use clap::Parser;
-use hashbrown::HashMap;
 use litebox::utils::ReinterpretUnsignedExt;
-use litebox_common_optee::{OpteeTaCommand, UteeEntryFunc, UteeParamOwned};
+use litebox_common_optee::{TeeParamType, UteeEntryFunc, UteeParamOwned, UteeParams};
 use litebox_platform_multiplex::Platform;
-use once_cell::race::OnceBox;
+use litebox_shim_optee::loader::ElfLoadInfo;
 use serde::Deserialize;
-use std::boxed::Box;
-use std::collections::vec_deque::VecDeque;
 use std::path::PathBuf;
-
-mod command_dispatcher;
-use command_dispatcher::{
-    handle_optee_command_output, optee_ta_command_handler, register_session_id_elf_load_info,
-    session_id_elf_load_info_map,
-};
 
 /// Test OP-TEE TAs with LiteBox on unmodified Linux
 #[derive(Parser, Debug)]
@@ -103,47 +94,135 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         InterceptionBackend::Rewriter => {}
     }
 
-    let loaded_program = litebox_shim_optee::loader::load_elf_buffer(prog_data.as_slice()).unwrap();
+    let loaded_ta = litebox_shim_optee::loader::load_elf_buffer(prog_data.as_slice()).unwrap();
 
     // Currently, this runner supports a single TA session. Also, for simplicity,
     // it uses `tid` as a session ID.
     let session_id = platform.init_task().tid.reinterpret_as_unsigned();
     litebox_shim_optee::set_session_id(session_id);
 
-    assert!(
-        register_session_id_elf_load_info(session_id, loaded_program),
-        "redundant session ID is not allowed"
-    );
-
-    wait_for_client_command(session_id, &ta_commands);
+    run_ta_with_test_commands(session_id, &loaded_ta, &ta_commands);
     Ok(())
 }
 
-/// Runner for OP-TEE and LVBS is expected to wait for a client's commands and
-/// deliver them to the corresponding handlers (it does nothing without clients).
-/// Since this runner does not support a client (yet), it replays a given TA command log
-/// to simulate a client (mainly for testing).
-fn wait_for_client_command(session_id: u32, ta_commands: &[TaCommandBase64]) {
-    populate_ta_command_replay_queue(session_id, ta_commands);
-    replay_ta_commands(session_id);
+/// Run the loaded TA with a sequence of test commands
+fn run_ta_with_test_commands(
+    session_id: u32,
+    ta_info: &ElfLoadInfo,
+    ta_commands: &[TaCommandBase64],
+) {
+    for cmd in ta_commands {
+        assert!(
+            (cmd.args.len() <= UteeParamOwned::TEE_NUM_PARAMS),
+            "ta_command has more than four arguments."
+        );
+
+        let mut params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
+        for (param, arg) in params.iter_mut().zip(&cmd.args) {
+            *param = arg.as_utee_params_typed();
+        }
+
+        let func_id = match cmd.func_id {
+            TaEntryFunc::OpenSession => UteeEntryFunc::OpenSession,
+            TaEntryFunc::CloseSession => UteeEntryFunc::CloseSession,
+            TaEntryFunc::InvokeCommand => UteeEntryFunc::InvokeCommand,
+        };
+
+        // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
+        // loaded binary and heap. In that sense, we can create (and destroy) a stack
+        // for each command freely.
+        let stack =
+            litebox_shim_optee::loader::init_stack(Some(ta_info.stack_base), params.as_slice())
+                .expect("Failed to initialize stack with parameters");
+
+        let mut pt_regs = litebox_common_linux::PtRegs {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            rbp: 0,
+            rbx: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            rax: 0,
+            rcx: usize::try_from(cmd.cmd_id).unwrap(),
+            rdx: ta_info.params_address,
+            rsi: usize::try_from(session_id).unwrap(),
+            rdi: usize::try_from(func_id as u32).unwrap(),
+            orig_rax: 0,
+            rip: ta_info.entry_point,
+            cs: 0x33, // __USER_CS
+            eflags: 0,
+            rsp: stack.get_cur_stack_top(),
+            ss: 0x2b, // __USER_DS
+        };
+        unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };
+        handle_optee_command_output(ta_info);
+    }
 }
 
-/// Replay OP-TEE TA command logs to simulate a client. It dequeues commands from
-/// the command queue and handles each of them by interacting with loaded TAs.
-/// For now, it terminates the current thread if there is no commands left in the queue.
-/// Instead, it can be an infinite loop with sleep to continously handle commands
-/// (i.e., `UteeEntryFunc::InvokeCommand`) until it gets `UteeEntryFunc::CloseSession`
-/// from the queue.
-/// # Panics
-/// This function panics if it cannot allocate a stack
-pub fn replay_ta_commands(session_id: u32) {
-    if let Some(cmd) = optee_command_replay_queue().pop(session_id) {
-        optee_ta_command_handler(&cmd);
-        handle_optee_command_output(session_id);
-    } else {
-        // no command left. terminate the thread for now
-        session_id_elf_load_info_map().remove(session_id);
-        optee_command_replay_queue().remove(session_id);
+/// A function to retrieve the results of the OP-TEE TA command execution.
+/// This function is expected to be called through the OP-TEE TA command dispatcher's
+/// return function once the TA has processed a command.
+fn handle_optee_command_output(ta_info: &ElfLoadInfo) {
+    // TA stores results in the `UteeParams` structure and/or buffers it refers to.
+    let params = unsafe { &*(ta_info.params_address as *const UteeParams) };
+    for idx in 0..UteeParams::TEE_NUM_PARAMS {
+        let param_type = params.get_type(idx).expect("Failed to get parameter type");
+        match param_type {
+            TeeParamType::ValueOutput | TeeParamType::ValueInout => {
+                if let Ok(Some((value_a, value_b))) = params.get_values(idx) {
+                    #[cfg(debug_assertions)]
+                    litebox::log_println!(
+                        litebox_platform_multiplex::platform(),
+                        "output (index: {}): {:#x} {:#x}",
+                        idx,
+                        value_a,
+                        value_b,
+                    );
+                    // TODO: return the outcome to VTL0
+                }
+            }
+            TeeParamType::MemrefOutput | TeeParamType::MemrefInout => {
+                if let Ok(Some((addr, len))) = params.get_values(idx) {
+                    let slice = unsafe {
+                        &*core::ptr::slice_from_raw_parts(
+                            addr as *const u8,
+                            usize::try_from(len).unwrap_or(0),
+                        )
+                    };
+                    if slice.is_empty() {
+                        litebox::log_println!(
+                            litebox_platform_multiplex::platform(),
+                            "output (index: {}): {:#x}",
+                            idx,
+                            addr
+                        );
+                    } else if slice.len() < 16 {
+                        litebox::log_println!(
+                            litebox_platform_multiplex::platform(),
+                            "output (index: {}): {:#x} {:?}",
+                            idx,
+                            addr,
+                            slice
+                        );
+                    } else {
+                        litebox::log_println!(
+                            litebox_platform_multiplex::platform(),
+                            "output (index: {}): {:#x} {:?}... (total {} bytes)",
+                            idx,
+                            addr,
+                            &slice[..16],
+                            slice.len()
+                        );
+                    }
+                    // TODO: return the outcome to VTL0
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -246,103 +325,4 @@ impl TaCommandParamsBase64 {
         buffer.truncate(length);
         buffer
     }
-}
-
-fn populate_ta_command_replay_queue(session_id: u32, ta_commands: &[TaCommandBase64]) {
-    for ta_command in ta_commands {
-        assert!(
-            (ta_command.args.len() <= UteeParamOwned::TEE_NUM_PARAMS),
-            "ta_command has more than four arguments."
-        );
-
-        let mut params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
-        for (param, arg) in params.iter_mut().zip(&ta_command.args) {
-            *param = arg.as_utee_params_typed();
-        }
-
-        let func_id = match ta_command.func_id {
-            TaEntryFunc::OpenSession => UteeEntryFunc::OpenSession,
-            TaEntryFunc::CloseSession => UteeEntryFunc::CloseSession,
-            TaEntryFunc::InvokeCommand => UteeEntryFunc::InvokeCommand,
-        };
-
-        // special handling for the KMPP TA whose `OpenSession` expects the session ID
-        if func_id == UteeEntryFunc::OpenSession
-            && let UteeParamOwned::ValueInput {
-                ref mut value_a,
-                value_b: _,
-            } = params[0]
-            && *value_a == 0
-        {
-            *value_a = u64::from(session_id);
-        }
-
-        submit_ta_command(session_id, func_id, &params, ta_command.cmd_id);
-    }
-}
-
-/// OP-TEE command replay queue
-pub(crate) struct TaCommandQueue {
-    inner: spin::mutex::SpinMutex<HashMap<u32, VecDeque<OpteeTaCommand>>>,
-}
-
-impl TaCommandQueue {
-    pub fn new() -> Self {
-        TaCommandQueue {
-            inner: spin::mutex::SpinMutex::new(HashMap::new()),
-        }
-    }
-
-    pub fn push(&self, cmd: OpteeTaCommand) {
-        let session_id = match &cmd {
-            OpteeTaCommand::OpenSession { session_id, .. }
-            | OpteeTaCommand::CloseSession { session_id }
-            | OpteeTaCommand::InvokeCommand { session_id, .. } => *session_id,
-        };
-        self.inner
-            .lock()
-            .entry(session_id)
-            .or_default()
-            .push_back(cmd);
-    }
-
-    pub fn pop(&self, session_id: u32) -> Option<OpteeTaCommand> {
-        self.inner
-            .lock()
-            .get_mut(&session_id)
-            .and_then(VecDeque::pop_front)
-    }
-
-    pub fn remove(&self, session_id: u32) {
-        self.inner.lock().remove(&session_id);
-    }
-}
-
-pub(crate) fn optee_command_replay_queue() -> &'static TaCommandQueue {
-    static QUEUE: OnceBox<TaCommandQueue> = OnceBox::new();
-    QUEUE.get_or_init(|| Box::new(TaCommandQueue::new()))
-}
-
-/// Push or enqueue an OP-TEE TA command to the command replay queue which will be
-/// consumed by `command_dispatcher`.
-pub fn submit_ta_command(
-    session_id: u32,
-    func: UteeEntryFunc,
-    params: &[UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS],
-    cmd_id: u32,
-) {
-    let cmd = match func {
-        UteeEntryFunc::OpenSession => OpteeTaCommand::OpenSession {
-            session_id,
-            params: Box::new(params.clone()),
-        },
-        UteeEntryFunc::CloseSession => OpteeTaCommand::CloseSession { session_id },
-        UteeEntryFunc::InvokeCommand => OpteeTaCommand::InvokeCommand {
-            session_id,
-            params: Box::new(params.clone()),
-            cmd_id,
-        },
-        UteeEntryFunc::Unknown => return,
-    };
-    optee_command_replay_queue().push(cmd);
 }

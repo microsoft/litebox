@@ -8,7 +8,6 @@ anyhow = "1.0.97"
 arrayvec = { version = "0.7.6", default-features = false }
 base64 = "0.22.1"
 clap = { version = "4.5.33", features = ["derive"] }
-hashbrown = "0.15.2"
 libc = { version = "0.2.169", default-features = false }
 litebox = { version = "0.1.0", path = "../litebox" }
 litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
@@ -17,10 +16,8 @@ litebox_platform_linux_userland = { version = "0.1.0", path = "../litebox_platfo
 litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_multiplex", default-features = false, features = ["platform_linux_userland_with_optee_syscall", "systrap_backend"] }
 litebox_shim_optee = { version = "0.1.0", path = "../litebox_shim_optee", default-features = false, features = ["platform_linux_userland"] }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }
-once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
 serde = { version = "1.0.142", features = ["derive"] }
 serde_json = "1.0.142"
-spin = { version = "0.10.0", default-features = false, features = ["spin_mutex"] }
 
 [dev-dependencies]
 
