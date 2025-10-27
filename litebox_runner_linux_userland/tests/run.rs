@@ -381,29 +381,50 @@ fn test_runner_with_python() {
                 let python_lib_src = Path::new(each);
                 if python_lib_src.is_dir() {
                     let python_lib_dst = out_dir.join(&each[1..]); // remove leading '/'
-                    if python_lib_dst.exists() {
-                        continue;
-                    }
-                    std::fs::create_dir_all(&python_lib_dst).unwrap();
-                    println!(
-                        "Copying python3 lib from {} to {}",
-                        python_lib_src.to_str().unwrap(),
-                        python_lib_dst.to_str().unwrap()
-                    );
-                    // TODO: we may also need to rewrite all .so files under the python lib directory
-                    let output = std::process::Command::new("cp")
-                        .args([
-                            "-a",
+                    if !python_lib_dst.exists() {
+                        std::fs::create_dir_all(&python_lib_dst).unwrap();
+                        println!(
+                            "Copying python3 lib from {} to {}",
                             python_lib_src.to_str().unwrap(),
-                            python_lib_dst.parent().unwrap().to_str().unwrap(),
-                        ])
-                        .output()
-                        .expect("Failed to copy python3 lib");
-                    assert!(
-                        output.status.success(),
-                        "failed to copy python3 lib {:?}",
-                        std::str::from_utf8(output.stderr.as_slice()).unwrap()
-                    );
+                            python_lib_dst.to_str().unwrap()
+                        );
+                        let output = std::process::Command::new("cp")
+                            .args([
+                                "-rpL", // -r for recursive, -p to preserve attributes, -L to dereference symbolic links
+                                python_lib_src.to_str().unwrap(),
+                                python_lib_dst.parent().unwrap().to_str().unwrap(),
+                            ])
+                            .output()
+                            .expect("Failed to copy python3 lib");
+                        assert!(
+                            output.status.success(),
+                            "failed to copy python3 lib {:?}",
+                            std::str::from_utf8(output.stderr.as_slice()).unwrap()
+                        );
+                    }
+                    let known_exts = ["py", "pyc", "txt", "css", "ps1", "rst"];
+                    // rewrite all files under the python lib directory except those with known extensions
+                    for entry in walkdir::WalkDir::new(python_lib_src)
+                        .into_iter()
+                        .filter_map(std::result::Result::ok)
+                        .filter(|e| {
+                            e.path()
+                                .extension()
+                                .is_some_and(|ext| !known_exts.contains(&ext.to_str().unwrap()))
+                        })
+                    {
+                        let so_file = entry.path();
+                        let so_file_dest = out_dir.join(so_file.strip_prefix("/").unwrap());
+                        println!(
+                            "Rewrite {} to {}",
+                            so_file.display(),
+                            so_file_dest.display()
+                        );
+                        let success = common::rewrite_with_cache(so_file, &so_file_dest, &[]);
+                        if entry.path().extension().is_some_and(|ext| ext == "so") {
+                            assert!(success, "failed to rewrite {} file", so_file.display());
+                        }
+                    }
                 }
             }
         },
