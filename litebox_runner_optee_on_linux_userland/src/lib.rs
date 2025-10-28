@@ -99,7 +99,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // Currently, this runner supports a single TA session. Also, for simplicity,
     // it uses `tid` as a session ID.
     let session_id = platform.init_task().tid.reinterpret_as_unsigned();
-    litebox_shim_optee::set_session_id(session_id);
 
     let is_kmpp_ta = cli_args.program.contains("kmpp-ta.elf.hooked");
     run_ta_with_test_commands(session_id, &loaded_ta, &ta_commands, is_kmpp_ta);
@@ -130,7 +129,7 @@ fn run_ta_with_test_commands(
             TaEntryFunc::InvokeCommand => UteeEntryFunc::InvokeCommand,
         };
 
-        // special handling for the KMPP TA whose `OpenSession` expects the session ID that we cannot know in advance
+        // special handling for the KMPP TA whose `OpenSession` expects a session ID that we cannot determine in advance
         if is_kmpp_ta
             && func_id == UteeEntryFunc::OpenSession
             && let UteeParamOwned::ValueInput {

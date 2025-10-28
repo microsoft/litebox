@@ -416,7 +416,7 @@ impl ElfLoader {
         // Since we do not rely on them here, we explicitly do this by ourselves.
         // In general, we do not need to deallocate this page because the OP-TEE TA
         // does not support multiple threads such that this page should be used until
-        // the TA exits, which will free all allocated pages.
+        // the TA terminates, which will free all allocated pages.
         let addr = crate::syscalls::mm::sys_mmap(
             0,
             PAGE_SIZE,
