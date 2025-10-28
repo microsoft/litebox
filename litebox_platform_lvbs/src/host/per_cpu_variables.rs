@@ -102,6 +102,8 @@ impl PerCpuVariables {
     /// Save the extended states of each core
     pub(crate) fn save_extended_states(&self) {
         if self.xsave_area_addr.is_null() {
+            panic!("XSAVE area is not allocated");
+        } else {
             unsafe {
                 core::arch::asm!(
                     "xsaveopt [{}]",
@@ -110,8 +112,6 @@ impl PerCpuVariables {
                     in("rdx") !0usize,
                 );
             }
-        } else {
-            panic!("XSAVE area is not allocated");
         }
     }
 

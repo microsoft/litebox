@@ -1,12 +1,11 @@
 //! VTL switch related functions
 
 use crate::{
-    debug_serial_println,
     host::per_cpu_variables::{with_per_cpu_variables, with_per_cpu_variables_mut},
     mshv::{
         HV_VTL_NORMAL, HV_VTL_SECURE, NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT,
         VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction, vsm::vsm_dispatch,
-        vsm_intercept::vsm_handle_intercept,
+        vsm_intercept::vsm_handle_intercept, vsm_optee_smc,
     },
 };
 use core::arch::{asm, naked_asm};
@@ -297,18 +296,7 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
         .unwrap_or(VsmFunction::Unknown);
     match func_id {
         VsmFunction::Unknown => Errno::EINVAL.as_neg().into(),
-        VsmFunction::OpteeMessage => {
-            // Since we do not know whether an OP-TEE TA uses extended states, we conservatively
-            // save and restore extended states before and after running any OP-TEE TA.
-            with_per_cpu_variables_mut(|per_cpu_variables| {
-                per_cpu_variables.save_extended_states();
-            });
-            debug_serial_println!("VSM function call for OP-TEE message");
-            with_per_cpu_variables_mut(|per_cpu_variables| {
-                per_cpu_variables.restore_extended_states();
-            });
-            0
-        }
+        VsmFunction::OpteeMessage => vsm_optee_smc::optee_smc_dispatch(params[1]),
         _ => vsm_dispatch(func_id, &params[1..]),
     }
 }
