@@ -94,7 +94,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         InterceptionBackend::Rewriter => {}
     }
 
-    let loaded_ta = litebox_shim_optee::loader::load_elf_buffer(prog_data.as_slice()).unwrap();
+    let loaded_ta = litebox_shim_optee::loader::load_elf_buffer(prog_data.as_slice())?;
 
     // Currently, this runner supports a single TA session. Also, for simplicity,
     // it uses `tid` as a session ID.
@@ -147,41 +147,22 @@ fn run_ta_with_test_commands(
         let stack =
             litebox_shim_optee::loader::init_stack(Some(ta_info.stack_base), params.as_slice())
                 .expect("Failed to initialize stack with parameters");
-
-        let mut pt_regs = litebox_common_linux::PtRegs {
-            r15: 0,
-            r14: 0,
-            r13: 0,
-            r12: 0,
-            rbp: 0,
-            rbx: 0,
-            r11: 0,
-            r10: 0,
-            r9: 0,
-            r8: 0,
-            rax: 0,
-            rcx: usize::try_from(cmd.cmd_id).unwrap(),
-            rdx: ta_info.params_address,
-            rsi: usize::try_from(session_id).unwrap(),
-            rdi: usize::try_from(func_id as u32).unwrap(),
-            orig_rax: 0,
-            rip: ta_info.entry_point,
-            cs: 0x33, // __USER_CS
-            eflags: 0,
-            rsp: stack.get_cur_stack_top(),
-            ss: 0x2b, // __USER_DS
-        };
+        let mut pt_regs = litebox_shim_optee::loader::prepare_registers(
+            ta_info,
+            &stack,
+            session_id,
+            func_id as u32,
+            Some(cmd.cmd_id),
+        );
         unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };
-        handle_optee_command_output(ta_info);
+        // TA stores results in the `UteeParams` structure and/or buffers it refers to.
+        let params = unsafe { &*(ta_info.params_address as *const UteeParams) };
+        handle_ta_command_output(params);
     }
 }
 
 /// A function to retrieve the results of the OP-TEE TA command execution.
-/// This function is expected to be called through the OP-TEE TA command dispatcher's
-/// return function once the TA has processed a command.
-fn handle_optee_command_output(ta_info: &ElfLoadInfo) {
-    // TA stores results in the `UteeParams` structure and/or buffers it refers to.
-    let params = unsafe { &*(ta_info.params_address as *const UteeParams) };
+fn handle_ta_command_output(params: &UteeParams) {
     for idx in 0..UteeParams::TEE_NUM_PARAMS {
         let param_type = params.get_type(idx).expect("Failed to get parameter type");
         match param_type {
@@ -206,6 +187,7 @@ fn handle_optee_command_output(ta_info: &ElfLoadInfo) {
                             usize::try_from(len).unwrap_or(0),
                         )
                     };
+                    #[cfg(debug_assertions)]
                     if slice.is_empty() {
                         litebox::log_println!(
                             litebox_platform_multiplex::platform(),

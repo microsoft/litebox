@@ -7,8 +7,7 @@ pub fn load_elf_buffer(elf_buf: &[u8]) -> Result<ElfLoadInfo, elf::ElfLoaderErro
     elf::ElfLoader::load_buffer(elf_buf)
 }
 
-// Struct to hold the information needed to start the program
-/// (entry point and stack_base).
+/// Struct to hold the information needed to start the program (entry point and stack_base).
 #[derive(Clone, Copy)]
 pub struct ElfLoadInfo {
     pub entry_point: usize,
@@ -16,6 +15,7 @@ pub struct ElfLoadInfo {
     pub params_address: usize,
 }
 
+/// Initialize the TA stack with the given base address and parameters.
 pub fn init_stack(
     stack_base: Option<usize>,
     params: &[litebox_common_optee::UteeParamOwned],
@@ -23,6 +23,40 @@ pub fn init_stack(
     let mut stack = ta_stack::allocate_stack(stack_base)?;
     stack.init(params)?;
     Some(stack)
+}
+
+/// Prepare the CPU registers for starting the TA.
+#[allow(clippy::missing_panics_doc)]
+pub fn prepare_registers(
+    ta_info: &ElfLoadInfo,
+    stack: &ta_stack::TaStack,
+    session_id: u32,
+    func_id: u32,
+    cmd_id: Option<u32>,
+) -> litebox_common_linux::PtRegs {
+    litebox_common_linux::PtRegs {
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        rbp: 0,
+        rbx: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rax: 0,
+        rcx: usize::try_from(cmd_id.unwrap_or(0)).unwrap(),
+        rdx: ta_info.params_address,
+        rsi: usize::try_from(session_id).unwrap(),
+        rdi: usize::try_from(func_id).unwrap(),
+        orig_rax: 0,
+        rip: ta_info.entry_point,
+        cs: 0x33, // __USER_CS
+        eflags: 0,
+        rsp: stack.get_cur_stack_top(),
+        ss: 0x2b, // __USER_DS
+    }
 }
 
 /// The magic number used to identify the LiteBox rewriter and where we should
