@@ -101,7 +101,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let session_id = platform.init_task().tid.reinterpret_as_unsigned();
     litebox_shim_optee::set_session_id(session_id);
 
-    run_ta_with_test_commands(session_id, &loaded_ta, &ta_commands);
+    let is_kmpp_ta = cli_args.program.contains("kmpp-ta.elf.hooked");
+    run_ta_with_test_commands(session_id, &loaded_ta, &ta_commands, is_kmpp_ta);
     Ok(())
 }
 
@@ -110,6 +111,7 @@ fn run_ta_with_test_commands(
     session_id: u32,
     ta_info: &ElfLoadInfo,
     ta_commands: &[TaCommandBase64],
+    is_kmpp_ta: bool,
 ) {
     for cmd in ta_commands {
         assert!(
@@ -127,6 +129,17 @@ fn run_ta_with_test_commands(
             TaEntryFunc::CloseSession => UteeEntryFunc::CloseSession,
             TaEntryFunc::InvokeCommand => UteeEntryFunc::InvokeCommand,
         };
+
+        // special handling for the KMPP TA whose `OpenSession` expects the session ID that we cannot know in advance
+        if is_kmpp_ta
+            && func_id == UteeEntryFunc::OpenSession
+            && let UteeParamOwned::ValueInput {
+                ref mut value_a,
+                value_b: _,
+            } = params[0]
+        {
+            *value_a = u64::from(session_id);
+        }
 
         // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
         // loaded binary and heap. In that sense, we can create (and destroy) a stack
