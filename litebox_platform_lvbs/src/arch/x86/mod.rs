@@ -44,7 +44,8 @@ pub fn enable_fsgsbase() {
 /// Hyper-V supports. We set it to 128 for now.
 pub const MAX_CORES: usize = 128;
 
-/// Enable CPU extended states such as SSE and instructions to manage them
+/// Enable CPU extended states such as XMM and instructions to use and manage them
+/// such as SSE and XSAVE
 #[cfg(target_arch = "x86_64")]
 pub fn enable_extended_states() {
     let mut flags = x86_64::registers::control::Cr4::read();

@@ -10,21 +10,17 @@ use crate::{
         vtl1_mem_layout::PAGE_SIZE,
     },
 };
-use alloc::{boxed::Box, vec};
+use aligned_vec::avec;
+use alloc::boxed::Box;
 use core::cell::RefCell;
 use litebox_common_linux::{rdgsbase, wrgsbase};
+use x86_64::VirtAddr;
 
 pub const INTERRUPT_STACK_SIZE: usize = 2 * PAGE_SIZE;
 pub const KERNEL_STACK_SIZE: usize = 10 * PAGE_SIZE;
 
 /// XSAVE and XRSTORE require a 64-byte aligned buffer
 const XSAVE_ALIGNMENT: usize = 64;
-
-#[inline]
-fn align_up(addr: usize, align: usize) -> usize {
-    debug_assert!(align.is_power_of_two());
-    (addr + align - 1) & !(align - 1)
-}
 
 /// Per-CPU VTL1 kernel variables
 #[repr(align(4096))]
@@ -42,7 +38,7 @@ pub struct PerCpuVariables {
     pub vtl1_state: VtlState,
     pub vtl0_locked_regs: ControlRegMap,
     pub gdt: Option<&'static gdt::GdtWrapper>,
-    xsave_area_addr: usize, // Note. Option<usize> crashes
+    xsave_area_addr: VirtAddr,
 }
 
 impl PerCpuVariables {
@@ -90,40 +86,44 @@ impl PerCpuVariables {
     /// Allocate XSAVE area for saving/restoring extended states of each core
     /// This area is allocated once and never deallocated.
     pub(crate) fn allocate_xsave_area(&mut self) {
-        if self.xsave_area_addr != 0 {
+        if !self.xsave_area_addr.is_null() {
             return;
         }
         let xsave_area_size = get_xsave_area_size();
         // Leaking `xsave_area` is fine because this area is never reused until the core gets reset.
-        let xsave_area = Box::leak(vec![0u8; xsave_area_size + XSAVE_ALIGNMENT].into_boxed_slice());
-        self.xsave_area_addr = align_up((*xsave_area).as_ptr() as usize, XSAVE_ALIGNMENT);
+        let xsave_area = Box::leak(
+            avec![[XSAVE_ALIGNMENT] | 0u8; xsave_area_size]
+                .into_boxed_slice()
+                .into(),
+        );
+        self.xsave_area_addr = VirtAddr::new(xsave_area.as_ptr() as u64);
     }
 
-    /// Save the extended states of each core before VTL1 might overwrite them.
+    /// Save the extended states of each core
     pub(crate) fn save_extended_states(&self) {
-        if self.xsave_area_addr == 0 {
-            panic!("XSAVE area is not allocated");
-        } else {
+        if self.xsave_area_addr.is_null() {
             unsafe {
                 core::arch::asm!(
                     "xsaveopt [{}]",
-                    in(reg) self.xsave_area_addr,
+                    in(reg) self.xsave_area_addr.as_u64(),
                     in("rax") !0usize,
                     in("rdx") !0usize,
                 );
             }
+        } else {
+            panic!("XSAVE area is not allocated");
         }
     }
 
     /// Restore the extended states of each core
     pub(crate) fn restore_extended_states(&self) {
-        if self.xsave_area_addr == 0 {
+        if self.xsave_area_addr.is_null() {
             panic!("XSAVE area is not allocated");
         } else {
             unsafe {
                 core::arch::asm!(
                     "xrstor [{}]",
-                    in(reg) self.xsave_area_addr,
+                    in(reg) self.xsave_area_addr.as_u64(),
                     in("rax") !0usize,
                     in("rdx") !0usize,
                 );
@@ -182,7 +182,7 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
         entries: [(0, 0); NUM_CONTROL_REGS],
     },
     gdt: const { None },
-    xsave_area_addr: 0,
+    xsave_area_addr: VirtAddr::zero(),
 };
 
 /// Store the addresses of per-CPU variables. The kernel threads are expected to access

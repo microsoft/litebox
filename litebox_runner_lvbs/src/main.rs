@@ -1,3 +1,4 @@
+#![cfg(target_arch = "x86_64")]
 #![no_std]
 #![no_main]
 
@@ -12,7 +13,6 @@ use litebox_platform_lvbs::{
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
     enable_fsgsbase();
-    #[cfg(target_arch = "x86_64")]
     enable_extended_states();
     let stack_top = with_per_cpu_variables(
         litebox_platform_lvbs::host::per_cpu_variables::PerCpuVariables::kernel_stack_top,

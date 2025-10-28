@@ -298,6 +298,8 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
     match func_id {
         VsmFunction::Unknown => Errno::EINVAL.as_neg().into(),
         VsmFunction::OpteeMessage => {
+            // Since we do not know whether an OP-TEE TA uses extended states, we conservatively
+            // save and restore extended states before and after running any OP-TEE TA.
             with_per_cpu_variables_mut(|per_cpu_variables| {
                 per_cpu_variables.save_extended_states();
             });
