@@ -84,13 +84,14 @@ fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> ContinueOpe
 
     if let SyscallRequest::Return { ret } = request {
         return ContinueOperation::ExitThread(syscalls::tee::sys_return(ret));
+    } else if let SyscallRequest::Panic { code } = request {
+        return ContinueOperation::ExitThread(syscalls::tee::sys_panic(code));
     }
     let res: Result<(), TeeResult> = match request {
         SyscallRequest::Log { buf, len } => match unsafe { buf.to_cow_slice(len) } {
             Some(buf) => syscalls::tee::sys_log(&buf),
             None => Err(TeeResult::BadParameters),
         },
-        SyscallRequest::Panic { code } => syscalls::tee::sys_panic(code),
         SyscallRequest::GetProperty {
             prop_set,
             index,

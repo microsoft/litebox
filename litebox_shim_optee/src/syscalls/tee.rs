@@ -41,6 +41,17 @@ pub fn sys_return(ret: usize) -> usize {
     ret
 }
 
+/// A system call that a TA calls when it panics.
+pub fn sys_panic(code: usize) -> usize {
+    litebox::log_println!(
+        litebox_platform_multiplex::platform(),
+        "panic with code {}",
+        code,
+    );
+
+    code
+}
+
 /// A system call to print out a message.
 pub fn sys_log(buf: &[u8]) -> Result<(), TeeResult> {
     #[cfg(debug_assertions)]
@@ -51,17 +62,6 @@ pub fn sys_log(buf: &[u8]) -> Result<(), TeeResult> {
     );
     let msg = core::str::from_utf8(buf).map_err(|_| TeeResult::BadFormat)?;
     litebox::log_println!(litebox_platform_multiplex::platform(), "{}", msg);
-    Ok(())
-}
-
-/// A system call that a TA calls when it panics.
-#[allow(clippy::unnecessary_wraps)]
-pub fn sys_panic(code: usize) -> Result<(), TeeResult> {
-    litebox::log_println!(
-        litebox_platform_multiplex::platform(),
-        "panic with code {}",
-        code,
-    );
     Ok(())
 }
 

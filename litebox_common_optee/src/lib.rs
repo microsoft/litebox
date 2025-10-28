@@ -447,7 +447,7 @@ impl UteeParams {
 /// Each parameter for TA invocation with copied content/buffer for safer operations.
 /// This is our representation of `utee_params` and not for directly
 /// interacting with OP-TEE TAs and clients (which expect pointers/references).
-/// `out_address`: VTL0 physical address to write output data to. They are virtually
+/// `out_address(es)`: VTL0 physical address(es) to write output data to. They are virtually
 /// contiguous but may not be physically contiguous.
 #[derive(Clone)]
 pub enum UteeParamOwned {
@@ -457,24 +457,24 @@ pub enum UteeParamOwned {
         value_b: u64,
     },
     ValueOutput {
-        out_address: usize,
+        out_address: Option<usize>,
     },
     ValueInout {
         value_a: u64,
         value_b: u64,
-        out_address: usize,
+        out_address: Option<usize>,
     },
     MemrefInput {
         data: Box<[u8]>,
     },
     MemrefOutput {
         buffer_size: usize,
-        out_addresses: Box<[usize]>,
+        out_addresses: Option<Box<[usize]>>,
     },
     MemrefInout {
         data: Box<[u8]>,
         buffer_size: usize,
-        out_addresses: Box<[usize]>,
+        out_addresses: Option<Box<[usize]>>,
     },
 }
 
@@ -921,23 +921,4 @@ pub enum UserTaPropType {
     Identity = USER_TA_PROP_TYPE_IDENTITY,
     String = USER_TA_PROP_TYPE_STRING,
     BinaryBlock = USER_TA_PROP_TYPE_BINARY_BLOCK,
-}
-
-/// OP-TEE TA command representation. This command is delivered to a TA
-/// through its entry point function and `libutee`.
-pub enum OpteeTaCommand {
-    /// Open a new session with a loaded TA. This lets the TA know
-    /// its session ID and provides the parameters for the initialization.
-    OpenSession {
-        session_id: u32,
-        params: Box<[UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS]>,
-    },
-    /// Close an existing session with a loaded TA.
-    CloseSession { session_id: u32 },
-    /// Invoke a command within an existing session with a loaded TA.
-    InvokeCommand {
-        session_id: u32,
-        params: Box<[UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS]>,
-        cmd_id: u32,
-    },
 }

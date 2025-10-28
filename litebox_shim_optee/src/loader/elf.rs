@@ -455,10 +455,11 @@ impl ElfLoader {
         #[cfg(debug_assertions)]
         litebox::log_println!(
             litebox_platform_multiplex::platform(),
-            "entry = {:#x}, base = {:#x}, stack_base = {:#x}",
+            "entry = {:#x}, base = {:#x}, stack_base = {:#x}, params_address = {:#x}",
             entry,
             base,
-            stack.get_stack_base()
+            stack.get_stack_base(),
+            stack.get_params_address()
         );
 
         Ok(ElfLoadInfo {

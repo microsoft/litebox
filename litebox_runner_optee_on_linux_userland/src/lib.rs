@@ -119,7 +119,7 @@ fn run_ta_with_test_commands(
 
         let mut params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
         for (param, arg) in params.iter_mut().zip(&cmd.args) {
-            *param = arg.as_utee_params_typed();
+            *param = arg.as_utee_params_owned();
         }
 
         let func_id = match cmd.func_id {
@@ -275,24 +275,26 @@ enum TaCommandParamsBase64 {
 }
 
 impl TaCommandParamsBase64 {
-    pub fn as_utee_params_typed(&self) -> UteeParamOwned {
+    pub fn as_utee_params_owned(&self) -> UteeParamOwned {
         match self {
             TaCommandParamsBase64::ValueInput { value_a, value_b } => UteeParamOwned::ValueInput {
                 value_a: *value_a,
                 value_b: *value_b,
             },
-            TaCommandParamsBase64::ValueOutput {} => UteeParamOwned::ValueOutput { out_address: 0 },
+            TaCommandParamsBase64::ValueOutput {} => {
+                UteeParamOwned::ValueOutput { out_address: None }
+            }
             TaCommandParamsBase64::ValueInout { value_a, value_b } => UteeParamOwned::ValueInout {
                 value_a: *value_a,
                 value_b: *value_b,
-                out_address: 0,
+                out_address: None,
             },
             TaCommandParamsBase64::MemrefInput { data_base64 } => UteeParamOwned::MemrefInput {
                 data: Self::decode_base64(data_base64).into_boxed_slice(),
             },
             TaCommandParamsBase64::MemrefOutput { buffer_size } => UteeParamOwned::MemrefOutput {
                 buffer_size: usize::try_from(*buffer_size).unwrap(),
-                out_addresses: vec![].into(),
+                out_addresses: None,
             },
             TaCommandParamsBase64::MemrefInout {
                 data_base64,
@@ -307,7 +309,7 @@ impl TaCommandParamsBase64 {
                 UteeParamOwned::MemrefInout {
                     data: decoded_data.into_boxed_slice(),
                     buffer_size,
-                    out_addresses: vec![].into(),
+                    out_addresses: None,
                 }
             }
         }
