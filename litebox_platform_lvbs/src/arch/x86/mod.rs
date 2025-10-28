@@ -43,3 +43,21 @@ pub fn enable_fsgsbase() {
 /// The maximum number of supported CPU cores. It depends on the number of VCPUs that
 /// Hyper-V supports. We set it to 128 for now.
 pub const MAX_CORES: usize = 128;
+
+/// Enable CPU extended states such as SSE and instructions to manage them
+#[cfg(target_arch = "x86_64")]
+pub fn enable_extended_states() {
+    let mut flags = x86_64::registers::control::Cr4::read();
+    flags.insert(x86_64::registers::control::Cr4Flags::OSFXSR);
+    flags.insert(x86_64::registers::control::Cr4Flags::OSXMMEXCPT_ENABLE);
+    flags.insert(x86_64::registers::control::Cr4Flags::OSXSAVE);
+    unsafe {
+        x86_64::registers::control::Cr4::write(flags);
+    }
+    let mut flags = x86_64::registers::xcontrol::XCr0::read();
+    flags.insert(x86_64::registers::xcontrol::XCr0Flags::SSE);
+    flags.insert(x86_64::registers::xcontrol::XCr0Flags::X87);
+    unsafe {
+        x86_64::registers::xcontrol::XCr0::write(flags);
+    }
+}

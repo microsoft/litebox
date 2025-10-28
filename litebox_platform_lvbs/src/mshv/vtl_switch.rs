@@ -1,6 +1,7 @@
 //! VTL switch related functions
 
 use crate::{
+    debug_serial_println,
     host::per_cpu_variables::{with_per_cpu_variables, with_per_cpu_variables_mut},
     mshv::{
         HV_VTL_NORMAL, HV_VTL_SECURE, NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT,
@@ -296,7 +297,16 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
         .unwrap_or(VsmFunction::Unknown);
     match func_id {
         VsmFunction::Unknown => Errno::EINVAL.as_neg().into(),
-        VsmFunction::OpteeMessage => todo!("VSM function call for OP-TEE message"),
+        VsmFunction::OpteeMessage => {
+            with_per_cpu_variables_mut(|per_cpu_variables| {
+                per_cpu_variables.save_extended_states();
+            });
+            debug_serial_println!("VSM function call for OP-TEE message");
+            with_per_cpu_variables_mut(|per_cpu_variables| {
+                per_cpu_variables.restore_extended_states();
+            });
+            0
+        }
         _ => vsm_dispatch(func_id, &params[1..]),
     }
 }
