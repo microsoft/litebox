@@ -13,14 +13,17 @@
 		"ld": [
 			"-Tlitebox_runner_lvbs/x86_64_vtl1.ld",
 			"--gc-sections",
-			"-no-pie"
+			"--static",
+			"--pie"
 		],
 		"ld.lld": [
 			"--script=litebox_runner_lvbs/x86_64_vtl1.ld",
 			"--gc-sections",
-			"-no-pie"
+			"--static",
+			"--pie"
 		]
 	},
+	"relocation-model": "pic",
 	"panic-strategy": "abort",
 	"disable-redzone": true,
 	"features": "-avx,-avx2,-avx512f",

@@ -31,11 +31,25 @@ SECTIONS
         _bss_end = .;
     }
 
+    /* Relocation section for position-independent execution */
+    . = ALIGN(0x200000);
+    .rela.dyn : ALIGN(0x200000) {
+        _rela_start = .;
+        *(.rela.text .rela.text*)
+        *(.rela.data .rela.data*)
+        *(.rela.rodata .rela.rodata*)
+        *(.rela.got .rela.got*)
+        *(.rela.bss .rela.bss*)
+        *(.rela.dyn)
+        _rela_end = .;
+    }
+
     . = ALIGN(0x1000);
     _heap_start = .;
     
     /DISCARD/ :
     {
+        *(.rela.debug .rela.debug*)
         *(.dynamic) *(.dynsym) *(.dynstr) *(.dynbss)
         *(.eh_frame .eh_frame*)
         *(.comment*)
