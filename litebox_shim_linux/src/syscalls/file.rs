@@ -556,7 +556,14 @@ pub fn sys_readlinkat(
     let fspath = FsPath::new(dirfd, pathname)?;
     let path = match fspath {
         FsPath::Absolute { path } => do_readlink(path.normalized()?.as_str()),
-        _ => todo!(),
+        // Note we don't support changing cwd yet; cwd is always `/`.
+        FsPath::Cwd => do_readlink("/"),
+        FsPath::CwdRelative { path } => {
+            let normalized_path = path.normalized()?;
+            let full_path = alloc::format!("/{}", normalized_path.as_str());
+            do_readlink(&full_path)
+        }
+        FsPath::Fd(fd) | FsPath::FdRelative { fd, .. } => unimplemented!(),
     }?;
     let bytes = path.as_bytes();
     let min_len = core::cmp::min(buf.len(), bytes.len());
