@@ -222,12 +222,6 @@ impl WindowsUserland {
         x & !(gran - 1)
     }
 
-    #[expect(dead_code)]
-    fn is_aligned_to_granu(&self, x: usize) -> bool {
-        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
-        x.is_multiple_of(gran)
-    }
-
     pub fn init_task(&self) -> litebox_common_linux::TaskParams {
         // TODO: Currently we are using a static thread ID and credentials (faked).
         // This is a placeholder for future implementation to use passthrough.
@@ -943,6 +937,13 @@ where
     Ok(())
 }
 
+macro_rules! debug_assert_alignment {
+    ($r:ident, $page_size:expr) => {
+        debug_assert!($r.start.is_multiple_of($page_size));
+        debug_assert!($r.end.is_multiple_of($page_size));
+    };
+}
+
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
     // TODO(chuqi): These are currently "magic numbers" grabbed from my Windows 11 SystemInformation.
     // The actual values should be determined by `GetSystemInfo()`.
@@ -958,6 +959,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         populate_pages_immediately: bool,
         fixed_address: bool,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
+        debug_assert!(ALIGN.is_multiple_of(self.sys_info.read().unwrap().dwPageSize as usize));
+        debug_assert_alignment!(suggested_range, ALIGN);
+
         // A helper closure to reserve and commit memory in one go.
         //
         // Note that MEM_RESERVE requires the base address to be aligned to system allocation granularity,
@@ -1105,6 +1109,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
+        debug_assert_alignment!(range, ALIGN);
         process_memory_range_by_regions(
             range,
             |r, state| -> Result<bool, std::convert::Infallible> {
@@ -1129,6 +1134,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         old_range: core::ops::Range<usize>,
         new_range: core::ops::Range<usize>,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
+        debug_assert_alignment!(old_range, ALIGN);
+        debug_assert_alignment!(new_range, ALIGN);
         unimplemented!(
             "remap_pages is not implemented for Windows yet. old_range: {:?}, new_range: {:?}",
             old_range,
@@ -1141,6 +1148,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         range: core::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
+        debug_assert_alignment!(range, ALIGN);
         let flags = prot_flags(new_permissions);
         process_memory_range_by_regions(
             range,
