@@ -498,6 +498,7 @@ impl From<litebox::pipes::errors::WriteError> for Errno {
     fn from(value: litebox::pipes::errors::WriteError) -> Self {
         match value {
             litebox::pipes::errors::WriteError::ClosedFd => Errno::EBADF,
+            litebox::pipes::errors::WriteError::ReadEndClosed => Errno::EPIPE,
             litebox::pipes::errors::WriteError::NotForWriting => Errno::EINVAL,
             litebox::pipes::errors::WriteError::WouldBlock => Errno::EWOULDBLOCK,
             _ => todo!(),

@@ -88,6 +88,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// Read values in the pipe into `buf`, returning the number of elements read.
     ///
     /// See [`Self::create_pipe`] for details on blocking behavior.
+    ///
+    /// Note: currently, this function returns `Ok(0)` if the peer end has been shut down, this may
+    /// change in the future to an explicit "peer has shut down" error.
     pub fn read(&self, fd: &PipeFd<Platform>, buf: &mut [u8]) -> Result<usize, errors::ReadError> {
         let dt = self.litebox.descriptor_table();
         let p = match &dt.get_entry(fd).ok_or(errors::ReadError::ClosedFd)?.entry {
@@ -234,6 +237,8 @@ pub mod errors {
     pub enum WriteError {
         #[error("not an open file descriptor")]
         ClosedFd,
+        #[error("the reading end of this pipe is closed")]
+        ReadEndClosed,
         #[error("not open for writing")]
         NotForWriting,
         #[error("write would block")]
@@ -323,8 +328,10 @@ struct WriteEnd<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
 #[derive(Error, Debug)]
 #[non_exhaustive]
 enum PipeError {
-    #[error("this pipe has been closed down")]
-    Closed,
+    #[error("this end has been shut down")]
+    ThisEndShutdown,
+    #[error("peer has been shut down")]
+    PeerShutdown,
     #[error("this operation would block")]
     WouldBlock,
 }
@@ -332,7 +339,10 @@ enum PipeError {
 impl From<PipeError> for errors::ReadError {
     fn from(err: PipeError) -> Self {
         match err {
-            PipeError::Closed => errors::ReadError::ClosedFd,
+            PipeError::ThisEndShutdown => errors::ReadError::ClosedFd,
+            PipeError::PeerShutdown => {
+                unreachable!("unreachable for now; see documentation of `read`")
+            }
             PipeError::WouldBlock => errors::ReadError::WouldBlock,
         }
     }
@@ -340,7 +350,8 @@ impl From<PipeError> for errors::ReadError {
 impl From<PipeError> for errors::WriteError {
     fn from(err: PipeError) -> Self {
         match err {
-            PipeError::Closed => errors::WriteError::ClosedFd,
+            PipeError::ThisEndShutdown => errors::WriteError::ClosedFd,
+            PipeError::PeerShutdown => errors::WriteError::ReadEndClosed,
             PipeError::WouldBlock => errors::WriteError::WouldBlock,
         }
     }
@@ -375,8 +386,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T
     where
         T: Copy,
     {
-        if self.is_shutdown() || self.is_peer_shutdown() {
-            return Err(TryOpError::Other(PipeError::Closed));
+        if self.is_shutdown() {
+            return Err(TryOpError::Other(PipeError::ThisEndShutdown));
+        }
+        if self.is_peer_shutdown() {
+            return Err(TryOpError::Other(PipeError::PeerShutdown));
         }
         if buf.is_empty() {
             return Ok(0);
@@ -495,7 +509,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> ReadEnd<Platform, T>
         T: Copy,
     {
         if self.is_shutdown() {
-            return Err(TryOpError::Other(PipeError::Closed));
+            return Err(TryOpError::Other(PipeError::ThisEndShutdown));
         }
         if buf.is_empty() {
             return Ok(0);
