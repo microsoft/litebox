@@ -660,7 +660,9 @@ where
             let Some(range) = PageRange::new(fault_addr, start) else {
                 unreachable!()
             };
-            unsafe { vmem.insert_mapping(range, vma, false, true) }.expect("mmap failed");
+            if let Err(err) = unsafe { vmem.insert_mapping(range, vma, false, true) } {
+                unimplemented!("failed to grow stack: {:?}", err)
+            }
         }
 
         if <Platform as VmemPageFaultHandler>::access_error(error_code, vma.flags()) {

@@ -96,8 +96,9 @@ fn test_vmm_mapping() {
             ),
             false,
             true,
-        );
+        )
     }
+    .unwrap();
     // [(0x1_0000, 0x1_c000)]
     assert_eq!(
         collect_mappings(&vmm),
