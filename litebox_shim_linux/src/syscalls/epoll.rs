@@ -28,12 +28,11 @@ bitflags::bitflags! {
 }
 
 pub(crate) enum EpollDescriptor {
-    PipeReader(Arc<litebox::pipes::ReadEnd<Platform, u8>>),
-    PipeWriter(Arc<litebox::pipes::WriteEnd<Platform, u8>>),
     Eventfd(Arc<super::eventfd::EventFile<Platform>>),
     Epoll(Arc<super::epoll::EpollFile>),
     File(Arc<crate::FileFd>),
     Socket(Arc<super::net::SocketFd>),
+    Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
 }
 
 impl TryFrom<&Descriptor> for EpollDescriptor {
@@ -44,13 +43,8 @@ impl TryFrom<&Descriptor> for EpollDescriptor {
             Descriptor::LiteBoxRawFd(raw_fd) => match StrongFd::from_raw(*raw_fd)? {
                 StrongFd::FileSystem(fd) => Ok(EpollDescriptor::File(fd)),
                 StrongFd::Network(fd) => Ok(EpollDescriptor::Socket(fd)),
+                StrongFd::Pipes(fd) => Ok(EpollDescriptor::Pipe(fd)),
             },
-            Descriptor::PipeReader { consumer, .. } => {
-                Ok(EpollDescriptor::PipeReader(consumer.clone()))
-            }
-            Descriptor::PipeWriter { producer, .. } => {
-                Ok(EpollDescriptor::PipeWriter(producer.clone()))
-            }
             Descriptor::Eventfd { file, .. } => Ok(EpollDescriptor::Eventfd(file.clone())),
             Descriptor::Epoll { file, .. } => Ok(EpollDescriptor::Epoll(file.clone())),
         }
@@ -58,34 +52,31 @@ impl TryFrom<&Descriptor> for EpollDescriptor {
 }
 
 enum DescriptorRef {
-    PipeReader(Weak<litebox::pipes::ReadEnd<Platform, u8>>),
-    PipeWriter(Weak<litebox::pipes::WriteEnd<Platform, u8>>),
     Eventfd(Weak<crate::syscalls::eventfd::EventFile<litebox_platform_multiplex::Platform>>),
     Epoll(Weak<super::epoll::EpollFile>),
     File(Weak<crate::FileFd>),
     Socket(Weak<super::net::SocketFd>),
+    Pipe(Weak<litebox::pipes::PipeFd<Platform>>),
 }
 
 impl DescriptorRef {
     fn from(value: &EpollDescriptor) -> Self {
         match value {
-            EpollDescriptor::PipeReader(consumer) => Self::PipeReader(Arc::downgrade(consumer)),
-            EpollDescriptor::PipeWriter(producer) => Self::PipeWriter(Arc::downgrade(producer)),
             EpollDescriptor::Eventfd(file) => Self::Eventfd(Arc::downgrade(file)),
             EpollDescriptor::Epoll(file) => Self::Epoll(Arc::downgrade(file)),
             EpollDescriptor::File(file) => Self::File(Arc::downgrade(file)),
             EpollDescriptor::Socket(socket) => Self::Socket(Arc::downgrade(socket)),
+            EpollDescriptor::Pipe(pipe) => Self::Pipe(Arc::downgrade(pipe)),
         }
     }
 
     fn upgrade(&self) -> Option<EpollDescriptor> {
         match self {
-            DescriptorRef::PipeReader(pipe) => pipe.upgrade().map(EpollDescriptor::PipeReader),
-            DescriptorRef::PipeWriter(pipe) => pipe.upgrade().map(EpollDescriptor::PipeWriter),
             DescriptorRef::Eventfd(eventfd) => eventfd.upgrade().map(EpollDescriptor::Eventfd),
             DescriptorRef::Epoll(epoll) => epoll.upgrade().map(EpollDescriptor::Epoll),
             DescriptorRef::File(file) => file.upgrade().map(EpollDescriptor::File),
             DescriptorRef::Socket(socket) => socket.upgrade().map(EpollDescriptor::Socket),
+            DescriptorRef::Pipe(pipe) => pipe.upgrade().map(EpollDescriptor::Pipe),
         }
     }
 }
@@ -93,14 +84,14 @@ impl DescriptorRef {
 impl EpollDescriptor {
     /// Returns the interesting events now and monitors their occurrence in the future if the
     /// observer is provided.
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "should be removed once polling on socket is implemented"
-    )]
     fn poll(&self, mask: Events, observer: Option<Weak<dyn Observer<Events>>>) -> Option<Events> {
+        let poll = |iop: &dyn IOPollable| {
+            if let Some(observer) = observer {
+                iop.register_observer(observer, mask);
+            }
+            iop.check_io_events() & (mask | Events::ALWAYS_POLLED)
+        };
         let io_pollable: &dyn IOPollable = match self {
-            EpollDescriptor::PipeReader(consumer) => consumer,
-            EpollDescriptor::PipeWriter(producer) => producer,
             EpollDescriptor::Eventfd(file) => file,
             EpollDescriptor::Epoll(file) => unimplemented!(),
             EpollDescriptor::File(file) => {
@@ -108,11 +99,11 @@ impl EpollDescriptor {
                 return Some(Events::OUT & mask);
             }
             EpollDescriptor::Socket(fd) => todo!(),
+            EpollDescriptor::Pipe(fd) => {
+                return crate::litebox_pipes().read().with_iopollable(fd, poll).ok();
+            }
         };
-        if let Some(observer) = observer {
-            io_pollable.register_observer(observer, mask);
-        }
-        Some(io_pollable.check_io_events() & (mask | Events::ALWAYS_POLLED))
+        Some(poll(io_pollable))
     }
 }
 
@@ -274,12 +265,11 @@ struct EpollEntryKey(u32, *const ());
 impl EpollEntryKey {
     fn new(fd: u32, desc: &EpollDescriptor) -> Self {
         let ptr = match desc {
-            EpollDescriptor::PipeReader(consumer) => Arc::as_ptr(consumer).cast(),
-            EpollDescriptor::PipeWriter(producer) => Arc::as_ptr(producer).cast(),
             EpollDescriptor::Eventfd(file) => Arc::as_ptr(file).cast(),
             EpollDescriptor::Epoll(file) => Arc::as_ptr(file).cast(),
             EpollDescriptor::File(file) => Arc::as_ptr(file).cast(),
             EpollDescriptor::Socket(socket_fd) => Arc::as_ptr(socket_fd).cast(),
+            EpollDescriptor::Pipe(pipe_fd) => Arc::as_ptr(pipe_fd).cast(),
         };
         Self(fd, ptr)
     }
@@ -596,7 +586,7 @@ impl Observer<Events> for PollEntryObserver {
 #[cfg(test)]
 mod test {
     use alloc::sync::Arc;
-    use litebox::{event::Events, fs::OFlags};
+    use litebox::event::Events;
     use litebox_common_linux::{EfdFlags, EpollEvent};
 
     use crate::syscalls::file::{do_pselect, sys_close, sys_pipe2, sys_read};
@@ -642,9 +632,10 @@ mod test {
     #[test]
     fn test_epoll_with_pipe() {
         let epoll = setup_epoll();
-        let (producer, consumer) =
-            litebox::pipes::new_pipe::<_, u8>(crate::litebox(), 2, OFlags::empty(), None);
-        let reader = super::EpollDescriptor::PipeReader(consumer);
+        let pipes = crate::litebox_pipes().read();
+        let (producer, consumer) = pipes.create_pipe(2, litebox::pipes::Flags::empty(), None);
+        let consumer = Arc::new(consumer);
+        let reader = super::EpollDescriptor::Pipe(Arc::clone(&consumer));
         epoll
             .add_interest(
                 10,
@@ -659,14 +650,20 @@ mod test {
         // spawn a thread to write to the pipe
         std::thread::spawn(move || {
             std::thread::sleep(core::time::Duration::from_millis(100));
-            assert_eq!(producer.write(&[1, 2]).unwrap(), 2);
+            assert_eq!(
+                crate::litebox_pipes()
+                    .read()
+                    .write(&producer, &[1, 2])
+                    .unwrap(),
+                2
+            );
         });
         epoll.wait(1024, None).unwrap();
         let mut buf = [0; 2];
-        let super::EpollDescriptor::PipeReader(consumer) = reader else {
-            unreachable!();
-        };
-        consumer.read(&mut buf).unwrap();
+        crate::litebox_pipes()
+            .read()
+            .read(&consumer, &mut buf)
+            .unwrap();
         assert_eq!(buf, [1, 2]);
     }
 
