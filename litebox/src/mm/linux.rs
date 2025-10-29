@@ -11,7 +11,6 @@ use thiserror::Error;
 use crate::platform::PageManagementProvider;
 use crate::platform::RawConstPointer;
 use crate::platform::page_mgmt::AllocationError;
-use crate::platform::page_mgmt::DeallocationError;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
 
 /// Page size in bytes
