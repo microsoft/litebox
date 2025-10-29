@@ -18,18 +18,6 @@ pub unsafe extern "C" fn _start() -> ! {
         litebox_platform_lvbs::host::per_cpu_variables::PerCpuVariables::kernel_stack_top,
     );
 
-    #[cfg(not(debug_assertions))]
-    unsafe {
-        asm!(
-            "mov rsp, rax",
-            "and rsp, -16",
-            "push rax", // for alignment
-            "call {kernel_main}",
-            in("rax") stack_top, kernel_main = sym kernel_main
-        );
-    }
-    // debug build does not use aligned SSE instructions
-    #[cfg(debug_assertions)]
     unsafe {
         asm!(
             "mov rsp, rax",
@@ -42,7 +30,7 @@ pub unsafe extern "C" fn _start() -> ! {
     hlt_loop()
 }
 
-pub fn kernel_main() -> ! {
+unsafe extern "C" fn kernel_main() -> ! {
     let core_id = get_core_id();
     if core_id == 0 {
         serial_println!("==============================");
