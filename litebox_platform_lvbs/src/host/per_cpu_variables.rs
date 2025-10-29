@@ -4,7 +4,7 @@ use crate::{
     arch::{MAX_CORES, gdt, get_core_id},
     host::bootparam::get_num_possible_cpus,
     mshv::{
-        HvMessagePage, HvVpAssistPage,
+        HV_VTL_NORMAL, HV_VTL_SECURE, HvMessagePage, HvVpAssistPage,
         vsm::{ControlRegMap, NUM_CONTROL_REGS},
         vtl_switch::VtlState,
         vtl1_mem_layout::PAGE_SIZE,
@@ -18,9 +18,6 @@ use x86_64::VirtAddr;
 
 pub const INTERRUPT_STACK_SIZE: usize = 2 * PAGE_SIZE;
 pub const KERNEL_STACK_SIZE: usize = 10 * PAGE_SIZE;
-
-/// XSAVE and XRSTORE require a 64-byte aligned buffer
-const XSAVE_ALIGNMENT: usize = 64;
 
 /// Per-CPU VTL1 kernel variables
 #[repr(align(4096))]
@@ -38,10 +35,14 @@ pub struct PerCpuVariables {
     pub vtl1_state: VtlState,
     pub vtl0_locked_regs: ControlRegMap,
     pub gdt: Option<&'static gdt::GdtWrapper>,
-    xsave_area_addr: VirtAddr,
+    vtl0_xsave_area_addr: VirtAddr,
+    vtl1_xsave_area_addr: VirtAddr,
 }
 
 impl PerCpuVariables {
+    const XSAVE_ALIGNMENT: usize = 64; // XSAVE and XRSTORE require a 64-byte aligned buffer
+    const XSAVE_MASK: u64 = 0b11; // let XSAVE and XRSTORE deal with x87 and SSE states
+
     pub fn kernel_stack_top(&self) -> u64 {
         &raw const self.kernel_stack as u64 + (self.kernel_stack.len() - 1) as u64
     }
@@ -83,50 +84,68 @@ impl PerCpuVariables {
         self.gdt.map(gdt::GdtWrapper::get_segment_selectors)
     }
 
-    /// Allocate XSAVE area for saving/restoring extended states of each core
-    /// This area is allocated once and never deallocated.
+    /// Allocate XSAVE areas for saving/restoring the extended states of each core.
+    /// These buffers are allocated once and never deallocated.
     pub(crate) fn allocate_xsave_area(&mut self) {
-        if !self.xsave_area_addr.is_null() {
-            return;
-        }
+        assert!(
+            self.vtl0_xsave_area_addr.is_null() && self.vtl1_xsave_area_addr.is_null(),
+            "XSAVE areas are already allocated"
+        );
         let xsave_area_size = get_xsave_area_size();
-        // Leaking `xsave_area` is fine because this area is never reused until the core gets reset.
-        let xsave_area = Box::leak(
-            avec![[XSAVE_ALIGNMENT] | 0u8; xsave_area_size]
+        // Leaking `xsave_area` buffers are okay because they are never reused
+        // until the core gets reset.
+        let vtl0_xsave_area = Box::leak(
+            avec![[{ Self::XSAVE_ALIGNMENT }] | 0u8; xsave_area_size]
                 .into_boxed_slice()
                 .into(),
         );
-        self.xsave_area_addr = VirtAddr::new(xsave_area.as_ptr() as u64);
+        let vtl1_xsave_area = Box::leak(
+            avec![[{ Self::XSAVE_ALIGNMENT }] | 0u8; xsave_area_size]
+                .into_boxed_slice()
+                .into(),
+        );
+        self.vtl0_xsave_area_addr = VirtAddr::new(vtl0_xsave_area.as_ptr() as u64);
+        self.vtl1_xsave_area_addr = VirtAddr::new(vtl1_xsave_area.as_ptr() as u64);
     }
 
-    /// Save the extended states of each core. Currently it only saves x87 and SSE states.
-    pub(crate) fn save_extended_states(&self) {
-        if self.xsave_area_addr.is_null() {
-            panic!("XSAVE area is not allocated");
+    /// Save the extended states of each core (VTL0 or VTL1).
+    pub(crate) fn save_extended_states(&self, vtl: u8) {
+        if self.vtl0_xsave_area_addr.is_null() || self.vtl1_xsave_area_addr.is_null() {
+            panic!("XSAVE areas are not allocated");
         } else {
+            let xsave_area_addr = match vtl {
+                HV_VTL_NORMAL => self.vtl0_xsave_area_addr.as_u64(),
+                HV_VTL_SECURE => self.vtl1_xsave_area_addr.as_u64(),
+                _ => panic!("Invalid VTL value: {}", vtl),
+            };
             unsafe {
                 core::arch::asm!(
                     "xsaveopt [{}]",
-                    in(reg) self.xsave_area_addr.as_u64(),
-                    in("eax") 0b11u32, // x87 and SSE
-                    in("edx") 0,
+                    in(reg) xsave_area_addr,
+                    in("eax") Self::XSAVE_MASK & 0xffff_ffff,
+                    in("edx") (Self::XSAVE_MASK & 0xffff_ffff_0000_0000) >> 32,
                     options(nostack, preserves_flags)
                 );
             }
         }
     }
 
-    /// Restore the extended states of each core. Currently it only restores x87 and SSE states.
-    pub(crate) fn restore_extended_states(&self) {
-        if self.xsave_area_addr.is_null() {
-            panic!("XSAVE area is not allocated");
+    /// Restore the extended states of each core (VTL0 or VTL1).
+    pub(crate) fn restore_extended_states(&self, vtl: u8) {
+        if self.vtl0_xsave_area_addr.is_null() || self.vtl1_xsave_area_addr.is_null() {
+            panic!("XSAVE areas are not allocated");
         } else {
+            let xsave_area_addr = match vtl {
+                HV_VTL_NORMAL => self.vtl0_xsave_area_addr.as_u64(),
+                HV_VTL_SECURE => self.vtl1_xsave_area_addr.as_u64(),
+                _ => panic!("Invalid VTL value: {}", vtl),
+            };
             unsafe {
                 core::arch::asm!(
                     "xrstor [{}]",
-                    in(reg) self.xsave_area_addr.as_u64(),
-                    in("eax") 0b11u32, // x87 and SSE
-                    in("edx") 0,
+                    in(reg) xsave_area_addr,
+                    in("eax") Self::XSAVE_MASK & 0xffff_ffff,
+                    in("edx") (Self::XSAVE_MASK & 0xffff_ffff_0000_0000) >> 32,
                     options(nostack, preserves_flags)
                 );
             }
@@ -184,7 +203,8 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
         entries: [(0, 0); NUM_CONTROL_REGS],
     },
     gdt: const { None },
-    xsave_area_addr: VirtAddr::zero(),
+    vtl0_xsave_area_addr: VirtAddr::zero(),
+    vtl1_xsave_area_addr: VirtAddr::zero(),
 };
 
 /// Store the addresses of per-CPU variables. The kernel threads are expected to access
