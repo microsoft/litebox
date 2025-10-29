@@ -25,6 +25,7 @@ use litebox::{
     fd::{ErrRawIntFd, TypedFd},
     mm::{PageManager, linux::PAGE_SIZE},
     net::Network,
+    pipes::Pipes,
     platform::{RawConstPointer as _, RawMutPointer as _},
     sync::{RwLock, futex::FutexManager},
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
@@ -170,13 +171,19 @@ pub fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE> {
     VMEM.get_or_init(|| alloc::boxed::Box::new(PageManager::new(litebox())))
 }
 
-pub(crate) fn litebox_net<'a>()
--> &'a litebox::sync::Mutex<Platform, litebox::net::Network<Platform>> {
-    static NET: OnceBox<litebox::sync::Mutex<Platform, litebox::net::Network<Platform>>> =
-        OnceBox::new();
+pub(crate) fn litebox_net<'a>() -> &'a litebox::sync::Mutex<Platform, Network<Platform>> {
+    static NET: OnceBox<litebox::sync::Mutex<Platform, Network<Platform>>> = OnceBox::new();
     NET.get_or_init(|| {
-        let net = litebox::net::Network::new(litebox());
+        let net = Network::new(litebox());
         alloc::boxed::Box::new(litebox().sync().new_mutex(net))
+    })
+}
+
+pub(crate) fn litebox_pipes<'a>() -> &'a litebox::sync::RwLock<Platform, Pipes<Platform>> {
+    static PIPES: OnceBox<litebox::sync::RwLock<Platform, Pipes<Platform>>> = OnceBox::new();
+    PIPES.get_or_init(|| {
+        let pipes = Pipes::new(litebox());
+        alloc::boxed::Box::new(litebox().sync().new_rwlock(pipes))
     })
 }
 
@@ -289,14 +296,6 @@ impl Descriptors {
 
 enum Descriptor {
     LiteBoxRawFd(usize),
-    PipeReader {
-        consumer: alloc::sync::Arc<litebox::pipes::ReadEnd<Platform, u8>>,
-        close_on_exec: core::sync::atomic::AtomicBool,
-    },
-    PipeWriter {
-        producer: alloc::sync::Arc<litebox::pipes::WriteEnd<Platform, u8>>,
-        close_on_exec: core::sync::atomic::AtomicBool,
-    },
     Eventfd {
         file: alloc::sync::Arc<syscalls::eventfd::EventFile<Platform>>,
         close_on_exec: core::sync::atomic::AtomicBool,
@@ -335,12 +334,13 @@ pub(crate) fn file_descriptors<'a>() -> &'a RwLock<Platform, Descriptors> {
 enum StrongFd {
     FileSystem(Arc<TypedFd<LinuxFS>>),
     Network(Arc<TypedFd<Network<Platform>>>),
+    Pipes(Arc<TypedFd<Pipes<Platform>>>),
 }
 impl StrongFd {
     fn from_raw(fd: usize) -> Result<Self, Errno> {
         match raw_descriptor_store()
             .read()
-            .typed_fd_at_raw_2::<StrongFd, LinuxFS, Network<Platform>>(fd)
+            .typed_fd_at_raw_3::<StrongFd, LinuxFS, Network<Platform>, Pipes<Platform>>(fd)
         {
             Ok(r) => Ok(r),
             Err(ErrRawIntFd::InvalidSubsystem) => {
@@ -362,15 +362,22 @@ impl From<Arc<TypedFd<Network<Platform>>>> for StrongFd {
         StrongFd::Network(v)
     }
 }
+impl From<Arc<TypedFd<Pipes<Platform>>>> for StrongFd {
+    fn from(v: Arc<TypedFd<Pipes<Platform>>>) -> Self {
+        StrongFd::Pipes(v)
+    }
+}
 
 pub(crate) fn run_on_raw_fd<R>(
     fd: usize,
     fs: impl FnOnce(&TypedFd<LinuxFS>) -> R,
-    net: impl FnOnce(&TypedFd<litebox::net::Network<Platform>>) -> R,
+    net: impl FnOnce(&TypedFd<Network<Platform>>) -> R,
+    pipes: impl FnOnce(&TypedFd<Pipes<Platform>>) -> R,
 ) -> Result<R, Errno> {
     match StrongFd::from_raw(fd)? {
         StrongFd::FileSystem(fd) => Ok(fs(&fd)),
         StrongFd::Network(fd) => Ok(net(&fd)),
+        StrongFd::Pipes(fd) => Ok(pipes(&fd)),
     }
 }
 
