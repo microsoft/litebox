@@ -99,7 +99,7 @@ impl PerCpuVariables {
         self.xsave_area_addr = VirtAddr::new(xsave_area.as_ptr() as u64);
     }
 
-    /// Save the extended states of each core
+    /// Save the extended states of each core. Currently it only saves x87 and SSE states.
     pub(crate) fn save_extended_states(&self) {
         if self.xsave_area_addr.is_null() {
             panic!("XSAVE area is not allocated");
@@ -108,14 +108,15 @@ impl PerCpuVariables {
                 core::arch::asm!(
                     "xsaveopt [{}]",
                     in(reg) self.xsave_area_addr.as_u64(),
-                    in("rax") !0usize,
-                    in("rdx") !0usize,
+                    in("eax") 0b11u32, // x87 and SSE
+                    in("edx") 0,
+                    options(nostack, preserves_flags)
                 );
             }
         }
     }
 
-    /// Restore the extended states of each core
+    /// Restore the extended states of each core. Currently it only restores x87 and SSE states.
     pub(crate) fn restore_extended_states(&self) {
         if self.xsave_area_addr.is_null() {
             panic!("XSAVE area is not allocated");
@@ -124,8 +125,9 @@ impl PerCpuVariables {
                 core::arch::asm!(
                     "xrstor [{}]",
                     in(reg) self.xsave_area_addr.as_u64(),
-                    in("rax") !0usize,
-                    in("rdx") !0usize,
+                    in("eax") 0b11u32, // x87 and SSE
+                    in("edx") 0,
+                    options(nostack, preserves_flags)
                 );
             }
         }

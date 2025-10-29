@@ -64,6 +64,7 @@ pub fn enable_extended_states() {
     }
 
     let mut flags = x86_64::registers::xcontrol::XCr0::read();
+    // if necessary, we can enable AVX and other extended states here
     flags.insert(x86_64::registers::xcontrol::XCr0Flags::SSE);
     flags.insert(x86_64::registers::xcontrol::XCr0Flags::X87);
     unsafe {
