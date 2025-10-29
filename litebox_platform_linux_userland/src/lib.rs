@@ -1264,8 +1264,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
     #[cfg(target_arch = "x86_64")]
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+    // Note running 32-bit programs on x86_64 kernel has a different limit than
+    // native x86 (3GiB, see arch/x86/include/asm/page_32_types.h). It's okay to
+    // use a larger limit here since we allow returning a different address than
+    // suggested.
     #[cfg(target_arch = "x86")]
-    const TASK_ADDR_MAX: usize = 0xC000_0000; // 3 GiB (see arch/x86/include/asm/page_32_types.h)
+    const TASK_ADDR_MAX: usize = 0xFFFF_F000;
 
     fn allocate_pages(
         &self,
