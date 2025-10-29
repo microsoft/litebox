@@ -179,12 +179,10 @@ pub(crate) fn litebox_net<'a>() -> &'a litebox::sync::Mutex<Platform, Network<Pl
     })
 }
 
-pub(crate) fn litebox_pipes<'a>()
--> &'a litebox::sync::RwLock<Platform, litebox::pipes::Pipes<Platform>> {
-    static PIPES: OnceBox<litebox::sync::RwLock<Platform, litebox::pipes::Pipes<Platform>>> =
-        OnceBox::new();
+pub(crate) fn litebox_pipes<'a>() -> &'a litebox::sync::RwLock<Platform, Pipes<Platform>> {
+    static PIPES: OnceBox<litebox::sync::RwLock<Platform, Pipes<Platform>>> = OnceBox::new();
     PIPES.get_or_init(|| {
-        let pipes = litebox::pipes::Pipes::new(litebox());
+        let pipes = Pipes::new(litebox());
         alloc::boxed::Box::new(litebox().sync().new_rwlock(pipes))
     })
 }
