@@ -427,6 +427,7 @@ where
             }
             Err(linux::VmemResizeError::NotExist(_)) => Err(RemapError::AlreadyUnallocated),
             Err(linux::VmemResizeError::InvalidAddr { .. }) => Err(RemapError::AlreadyAllocated),
+            Err(linux::VmemResizeError::OutOfMemory) => Err(RemapError::OutOfMemory),
         }
     }
 
@@ -659,7 +660,7 @@ where
             let Some(range) = PageRange::new(fault_addr, start) else {
                 unreachable!()
             };
-            unsafe { vmem.insert_mapping(range, vma, false, true) };
+            unsafe { vmem.insert_mapping(range, vma, false, true) }.expect("mmap failed");
         }
 
         if <Platform as VmemPageFaultHandler>::access_error(error_code, vma.flags()) {

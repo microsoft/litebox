@@ -225,8 +225,8 @@ impl From<litebox::fs::errors::MkdirError> for Errno {
 impl From<litebox::platform::page_mgmt::AllocationError> for Errno {
     fn from(value: litebox::platform::page_mgmt::AllocationError) -> Self {
         match value {
-            litebox::platform::page_mgmt::AllocationError::Unaligned => Errno::EINVAL,
-            litebox::platform::page_mgmt::AllocationError::AlreadyAllocated => Errno::EINVAL,
+            litebox::platform::page_mgmt::AllocationError::Unaligned
+            | litebox::platform::page_mgmt::AllocationError::InvalidRange => Errno::EINVAL,
             litebox::platform::page_mgmt::AllocationError::OutOfMemory => Errno::ENOMEM,
             _ => unimplemented!(),
         }

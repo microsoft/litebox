@@ -109,8 +109,8 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
 pub enum AllocationError {
     #[error("provided range is not page-aligned")]
     Unaligned,
-    #[error("provided range is already allocated")]
-    AlreadyAllocated,
+    #[error("provided range is invalid")]
+    InvalidRange,
     #[error("out of memory")]
     OutOfMemory,
 }
