@@ -18,11 +18,22 @@ pub unsafe extern "C" fn _start() -> ! {
         litebox_platform_lvbs::host::per_cpu_variables::PerCpuVariables::kernel_stack_top,
     );
 
+    #[cfg(not(debug_assertions))]
     unsafe {
         asm!(
             "mov rsp, rax",
             "and rsp, -16",
-            "push rax",
+            "push rax", // for alignment
+            "call {kernel_main}",
+            in("rax") stack_top, kernel_main = sym kernel_main
+        );
+    }
+    // debug build does not use aligned SSE instructions
+    #[cfg(debug_assertions)]
+    unsafe {
+        asm!(
+            "mov rsp, rax",
+            "and rsp, -16",
             "call {kernel_main}",
             in("rax") stack_top, kernel_main = sym kernel_main
         );

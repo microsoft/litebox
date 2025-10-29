@@ -48,6 +48,13 @@ pub const MAX_CORES: usize = 128;
 /// such as SSE and XSAVE
 #[cfg(target_arch = "x86_64")]
 pub fn enable_extended_states() {
+    let mut flags = x86_64::registers::control::Cr0::read();
+    flags.remove(x86_64::registers::control::Cr0Flags::EMULATE_COPROCESSOR);
+    flags.insert(x86_64::registers::control::Cr0Flags::MONITOR_COPROCESSOR);
+    unsafe {
+        x86_64::registers::control::Cr0::write(flags);
+    }
+
     let mut flags = x86_64::registers::control::Cr4::read();
     flags.insert(x86_64::registers::control::Cr4Flags::OSFXSR);
     flags.insert(x86_64::registers::control::Cr4Flags::OSXMMEXCPT_ENABLE);
@@ -55,6 +62,7 @@ pub fn enable_extended_states() {
     unsafe {
         x86_64::registers::control::Cr4::write(flags);
     }
+
     let mut flags = x86_64::registers::xcontrol::XCr0::read();
     flags.insert(x86_64::registers::xcontrol::XCr0Flags::SSE);
     flags.insert(x86_64::registers::xcontrol::XCr0Flags::X87);
