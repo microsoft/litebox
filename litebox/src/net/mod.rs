@@ -159,6 +159,20 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PollableSocketHandle<'_
     /// If `new_events_only` is true, only events representing meaningful state changes
     /// since the last check are returned (e.g., new data arrived, socket became writable,
     /// new connections became acceptable).
+    ///
+    /// Note this is still just an approximation; for example, if data arrives multiple times
+    /// before this is called, only one `Events::IN` will be sent. This is probably fine
+    /// because we also update the internal state (i.e., `recv_queue`) in [`Receive`] calls so
+    /// that the following common pattern won't get stuck (it may miss some duplicate `Events::IN`
+    /// events, but they are not necessary to make progress; one is sufficient):
+    ///
+    /// ```no_run
+    /// loop {
+    ///     if (poll(socket, Events::IN) > 0) {
+    ///         assert!(receive(socket) > 0);
+    ///     }
+    /// }
+    /// ```
     fn check_socket_events(&self, new_events_only: bool) -> Events {
         if self.socket_handle.consider_closed {
             // TODO: update this when we support graceful close
@@ -1048,7 +1062,8 @@ where
                 }) else {
                     return Err(AcceptError::NoConnectionsReady);
                 };
-                // Reset the accept state tracking so that [`Network::check_socket_events`] can send new events.
+                // reset the accept state so that [`PollableSocketHandle::check_socket_events`] can send
+                // one [`Events::In`] per accepted connection.
                 handle
                     .previously_acceptable
                     .store(false, core::sync::atomic::Ordering::Relaxed);
