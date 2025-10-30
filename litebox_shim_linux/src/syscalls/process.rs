@@ -283,10 +283,9 @@ fn wake_robust_list(
 }
 
 impl Task {
-    pub(crate) fn sys_exit(&self, _status: i32) {
-        let mut tls = crate::SHIM_TLS.deinit();
-        let task = tls.current_task;
-        if let Some(clear_child_tid) = task.clear_child_tid.into_inner() {
+    /// Called when the task is exiting.
+    pub(crate) fn prepare_for_exit(&mut self) {
+        if let Some(clear_child_tid) = self.clear_child_tid.take() {
             // Clear the child TID if requested
             // TODO: if we are the last thread, we don't need to clear it
             let _ = unsafe { clear_child_tid.write_at_offset(0, 0) };
@@ -298,14 +297,16 @@ impl Task {
                 count: 1,
             });
         }
-        if let Some(robust_list) = task.robust_list.into_inner() {
+        if let Some(robust_list) = self.robust_list.take() {
             let _ = wake_robust_list(robust_list);
         }
 
-        task.process
+        self.process
             .nr_threads
             .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     }
+
+    pub(crate) fn sys_exit(&self, _status: i32) {}
 
     pub(crate) fn sys_exit_group(&self, _status: i32) {}
 }

@@ -66,7 +66,14 @@ impl litebox::shim::EnterShim for LinuxShim {
     type ContinueOperation = ContinueOperation;
 
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation {
-        with_current_task(|task| task.handle_syscall_request(ctx))
+        let r = with_current_task(|task| task.handle_syscall_request(ctx));
+        match r {
+            ContinueOperation::ResumeGuest => {}
+            ContinueOperation::ExitThread(_) | ContinueOperation::ExitProcess(_) => {
+                SHIM_TLS.deinit();
+            }
+        }
+        r
     }
 
     fn exception(
@@ -1153,6 +1160,12 @@ struct Task {
     comm: Cell<[u8; litebox_common_linux::TASK_COMM_LEN]>,
     /// Filesystem state.
     fs: RefCell<Arc<syscalls::file::FsState>>,
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        self.prepare_for_exit();
+    }
 }
 
 litebox::shim_thread_local! {
