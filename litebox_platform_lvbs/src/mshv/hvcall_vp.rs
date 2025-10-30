@@ -98,7 +98,6 @@ fn hvcall_get_vp_registers_internal(
 
 /// Hyper-V Hypercall to get current VTL (i.e., VTL1)'s registers. It can access Hyper-V registers
 /// like `HV_REGISTER_VSM_PARTITION_CONFIG`.
-#[expect(dead_code)]
 #[inline]
 pub fn hvcall_get_vp_registers(reg_name: u32) -> Result<u64, HypervCallError> {
     hvcall_get_vp_registers_internal(reg_name, HvInputVtl::current())

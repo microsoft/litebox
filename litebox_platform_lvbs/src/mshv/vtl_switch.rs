@@ -1,16 +1,22 @@
 //! VTL switch related functions
 
 use crate::{
-    host::per_cpu_variables::{with_per_cpu_variables, with_per_cpu_variables_mut},
+    host::{
+        hv_hypercall_page_address,
+        per_cpu_variables::{with_per_cpu_variables, with_per_cpu_variables_mut},
+    },
     mshv::{
-        HV_VTL_NORMAL, HV_VTL_SECURE, NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT,
-        VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction, vsm::vsm_dispatch,
-        vsm_intercept::vsm_handle_intercept, vsm_optee_smc,
+        HV_REGISTER_VSM_CODEPAGE_OFFSETS, HV_VTL_NORMAL, HV_VTL_SECURE,
+        HvRegisterVsmCodePageOffsets, NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT,
+        VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction, hvcall_vp::hvcall_get_vp_registers,
+        vsm::vsm_dispatch, vsm_intercept::vsm_handle_intercept, vsm_optee_smc,
     },
 };
 use core::arch::{asm, naked_asm};
 use litebox_common_linux::errno::Errno;
 use num_enum::TryFromPrimitive;
+
+static mut VTL_RETURN_ADDRESS: u64 = 0;
 
 /// Return to VTL0
 #[expect(clippy::inline_always)]
@@ -18,8 +24,8 @@ use num_enum::TryFromPrimitive;
 fn vtl_return() {
     unsafe {
         asm!(
-            "vmcall",
-            in("rax") 0x0, in("rcx") 0x12
+            "call rax",
+            in("rax") VTL_RETURN_ADDRESS, in("rcx") 0x0,
         );
     }
 }
@@ -310,6 +316,17 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
         VsmFunction::OpteeMessage => vsm_optee_smc::optee_smc_dispatch(params[1]),
         _ => vsm_dispatch(func_id, &params[1..]),
     }
+}
+
+pub(crate) fn mshv_vsm_get_code_page_offsets() -> Result<(), Errno> {
+    let value =
+        hvcall_get_vp_registers(HV_REGISTER_VSM_CODEPAGE_OFFSETS).map_err(|_| Errno::EIO)?;
+    let code_page_offsets = HvRegisterVsmCodePageOffsets::from_u64(value);
+    unsafe {
+        VTL_RETURN_ADDRESS =
+            hv_hypercall_page_address() + u64::from(code_page_offsets.vtl_return_offset());
+    }
+    Ok(())
 }
 
 /// VTL Entry Reason
