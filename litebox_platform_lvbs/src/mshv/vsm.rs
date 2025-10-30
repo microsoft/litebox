@@ -113,20 +113,13 @@ pub fn mshv_vsm_enable_aps(cpu_present_mask_pfn: u64) -> Result<i64, Errno> {
     if let Some(cpu_mask) =
         unsafe { crate::platform_low().copy_from_vtl0_phys::<CpuMask>(cpu_present_mask_page_addr) }
     {
-        let decoded_mask = cpu_mask.decode_cpu_mask();
+        let mut present_cpus = Vec::new();
         debug_serial_print!("cpu_present_mask: ");
-        for (i, elem) in decoded_mask.iter().enumerate() {
-            if *elem {
-                debug_serial_print!("{}, ", i);
-            }
-        }
+        cpu_mask.for_each_cpu(|cpu_id| {
+            debug_serial_print!("{}, ", cpu_id);
+            present_cpus.push(cpu_id as u32);
+        });
         debug_serial_println!("");
-
-        let present_cpus: Vec<u32> = decoded_mask
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &present)| if present { Some(i as u32) } else { None })
-            .collect();
 
         if present_cpus.is_empty() {
             serial_println!("No CPUs found in cpu_present_mask");
@@ -157,11 +150,9 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
         unsafe { crate::platform_low().copy_from_vtl0_phys::<CpuMask>(cpu_online_mask_page_addr) }
     {
         debug_serial_print!("cpu_online_mask: ");
-        for (i, elem) in cpu_mask.decode_cpu_mask().iter().enumerate() {
-            if *elem {
-                debug_serial_print!("{}, ", i);
-            }
-        }
+        cpu_mask.for_each_cpu(|cpu_id| {
+            debug_serial_print!("{}, ", cpu_id);
+        });
         debug_serial_println!("");
 
         // boot_signal is an array of bytes whose length is the number of possible cores. Copy the entire page for now.
@@ -175,11 +166,9 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
         // TODO: execute `init_vtl_ap` for each online core and update the corresponding boot signal byte.
         // Currently, we use `init_vtl_aps` to initialize all present cores which
         // takes a long time if we have a lot of cores.
-        for (i, elem) in cpu_mask.decode_cpu_mask().iter().enumerate() {
-            if *elem {
-                boot_signal_page_buf.0[i as usize] = HV_SECURE_VTL_BOOT_TOKEN;
-            }
-        }
+        cpu_mask.for_each_cpu(|cpu_id| {
+            boot_signal_page_buf.0[cpu_id] = HV_SECURE_VTL_BOOT_TOKEN;
+        });
 
         if unsafe {
             crate::platform_low()

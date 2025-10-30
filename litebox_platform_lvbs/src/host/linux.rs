@@ -75,17 +75,21 @@ impl CpuMask {
         }
     }
 
-    pub fn decode_cpu_mask(&self) -> [bool; MAX_CORES] {
-        let mut cpu_mask = [false; MAX_CORES];
+    pub fn for_each_cpu<F>(&self, mut f: F)
+    where
+        F: FnMut(usize),
+    {
         for (i, &word) in self.bits.iter().enumerate() {
+            if word == 0 {
+                continue;
+            }
+
             for j in 0..BITS_PER_LONG {
                 if (word & (1 << j)) != 0 {
-                    cpu_mask[i * BITS_PER_LONG + j] = true;
+                    f(i * BITS_PER_LONG + j);
                 }
             }
         }
-
-        cpu_mask
     }
 }
 
