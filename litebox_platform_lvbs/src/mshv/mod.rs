@@ -557,6 +557,21 @@ impl HvRegisterVsmPartitionConfig {
         Self::from_bytes(value.to_le_bytes())
     }
 }
+#[bitfield]
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct HvRegisterVsmCodePageOffsets {
+    pub vtl_call_offset: B12,
+    pub vtl_return_offset: B12,
+    #[skip]
+    __: B40,
+}
+
+impl HvRegisterVsmCodePageOffsets {
+    pub fn from_u64(value: u64) -> Self {
+        Self::from_bytes(value.to_le_bytes())
+    }
+}
 
 bitflags::bitflags! {
     #[derive(Debug, PartialEq)]

@@ -31,6 +31,7 @@ use crate::{
             validate_kernel_module_against_elf, validate_text_patch,
             verify_kernel_module_signature, verify_kernel_pe_signature,
         },
+        vtl_switch::mshv_vsm_get_code_page_offsets,
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
     serial_println,
@@ -67,6 +68,11 @@ pub(crate) fn init() {
     assert!(
         !(get_core_id() == 0 && mshv_vsm_configure_partition().is_err()),
         "Failed to configure VSM partition"
+    );
+
+    assert!(
+        !(get_core_id() == 0 && mshv_vsm_get_code_page_offsets().is_err()),
+        "Failed to retrieve Hypercall page offsets to execute VTL returns"
     );
 
     assert!(
