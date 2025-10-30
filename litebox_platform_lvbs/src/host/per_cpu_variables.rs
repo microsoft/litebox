@@ -4,15 +4,17 @@ use crate::{
     arch::{MAX_CORES, gdt, get_core_id},
     host::bootparam::get_num_possible_cpus,
     mshv::{
-        HvMessagePage, HvVpAssistPage,
+        HV_VTL_NORMAL, HV_VTL_SECURE, HvMessagePage, HvVpAssistPage,
         vsm::{ControlRegMap, NUM_CONTROL_REGS},
         vtl_switch::VtlState,
         vtl1_mem_layout::PAGE_SIZE,
     },
 };
+use aligned_vec::avec;
 use alloc::boxed::Box;
 use core::cell::RefCell;
 use litebox_common_linux::{rdgsbase, wrgsbase};
+use x86_64::VirtAddr;
 
 pub const INTERRUPT_STACK_SIZE: usize = 2 * PAGE_SIZE;
 pub const KERNEL_STACK_SIZE: usize = 10 * PAGE_SIZE;
@@ -33,9 +35,14 @@ pub struct PerCpuVariables {
     pub vtl1_state: VtlState,
     pub vtl0_locked_regs: ControlRegMap,
     pub gdt: Option<&'static gdt::GdtWrapper>,
+    vtl0_xsave_area_addr: VirtAddr,
+    vtl1_xsave_area_addr: VirtAddr,
 }
 
 impl PerCpuVariables {
+    const XSAVE_ALIGNMENT: usize = 64; // XSAVE and XRSTORE require a 64-byte aligned buffer
+    const XSAVE_MASK: u64 = 0b11; // let XSAVE and XRSTORE deal with x87 and SSE states
+
     pub fn kernel_stack_top(&self) -> u64 {
         &raw const self.kernel_stack as u64 + (self.kernel_stack.len() - 1) as u64
     }
@@ -75,6 +82,74 @@ impl PerCpuVariables {
     /// Return kernel code, user code, and user data segment selectors
     pub(crate) fn get_segment_selectors(&self) -> Option<(u16, u16, u16)> {
         self.gdt.map(gdt::GdtWrapper::get_segment_selectors)
+    }
+
+    /// Allocate XSAVE areas for saving/restoring the extended states of each core.
+    /// These buffers are allocated once and never deallocated.
+    pub(crate) fn allocate_xsave_area(&mut self) {
+        assert!(
+            self.vtl0_xsave_area_addr.is_null() && self.vtl1_xsave_area_addr.is_null(),
+            "XSAVE areas are already allocated"
+        );
+        let xsave_area_size = get_xsave_area_size();
+        // Leaking `xsave_area` buffers are okay because they are never reused
+        // until the core gets reset.
+        let vtl0_xsave_area = Box::leak(
+            avec![[{ Self::XSAVE_ALIGNMENT }] | 0u8; xsave_area_size]
+                .into_boxed_slice()
+                .into(),
+        );
+        let vtl1_xsave_area = Box::leak(
+            avec![[{ Self::XSAVE_ALIGNMENT }] | 0u8; xsave_area_size]
+                .into_boxed_slice()
+                .into(),
+        );
+        self.vtl0_xsave_area_addr = VirtAddr::new(vtl0_xsave_area.as_ptr() as u64);
+        self.vtl1_xsave_area_addr = VirtAddr::new(vtl1_xsave_area.as_ptr() as u64);
+    }
+
+    /// Save the extended states of each core (VTL0 or VTL1).
+    pub(crate) fn save_extended_states(&self, vtl: u8) {
+        if self.vtl0_xsave_area_addr.is_null() || self.vtl1_xsave_area_addr.is_null() {
+            panic!("XSAVE areas are not allocated");
+        } else {
+            let xsave_area_addr = match vtl {
+                HV_VTL_NORMAL => self.vtl0_xsave_area_addr.as_u64(),
+                HV_VTL_SECURE => self.vtl1_xsave_area_addr.as_u64(),
+                _ => panic!("Invalid VTL value: {}", vtl),
+            };
+            unsafe {
+                core::arch::asm!(
+                    "xsaveopt [{}]",
+                    in(reg) xsave_area_addr,
+                    in("eax") Self::XSAVE_MASK & 0xffff_ffff,
+                    in("edx") (Self::XSAVE_MASK & 0xffff_ffff_0000_0000) >> 32,
+                    options(nostack, preserves_flags)
+                );
+            }
+        }
+    }
+
+    /// Restore the extended states of each core (VTL0 or VTL1).
+    pub(crate) fn restore_extended_states(&self, vtl: u8) {
+        if self.vtl0_xsave_area_addr.is_null() || self.vtl1_xsave_area_addr.is_null() {
+            panic!("XSAVE areas are not allocated");
+        } else {
+            let xsave_area_addr = match vtl {
+                HV_VTL_NORMAL => self.vtl0_xsave_area_addr.as_u64(),
+                HV_VTL_SECURE => self.vtl1_xsave_area_addr.as_u64(),
+                _ => panic!("Invalid VTL value: {}", vtl),
+            };
+            unsafe {
+                core::arch::asm!(
+                    "xrstor [{}]",
+                    in(reg) xsave_area_addr,
+                    in("eax") Self::XSAVE_MASK & 0xffff_ffff,
+                    in("edx") (Self::XSAVE_MASK & 0xffff_ffff_0000_0000) >> 32,
+                    options(nostack, preserves_flags)
+                );
+            }
+        }
     }
 }
 
@@ -128,6 +203,8 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
         entries: [(0, 0); NUM_CONTROL_REGS],
     },
     gdt: const { None },
+    vtl0_xsave_area_addr: VirtAddr::zero(),
+    vtl1_xsave_area_addr: VirtAddr::zero(),
 };
 
 /// Store the addresses of per-CPU variables. The kernel threads are expected to access
@@ -236,6 +313,10 @@ pub fn allocate_per_cpu_variables() {
         "# of possible CPUs ({num_cores}) exceeds MAX_CORES",
     );
 
+    with_per_cpu_variables_mut(|per_cpu_variables| {
+        per_cpu_variables.allocate_xsave_area();
+    });
+
     // TODO: use `cpu_online_mask` to selectively allocate per-CPU variables only for online CPUs.
     // Note. `PER_CPU_VARIABLE_ADDRESSES[0]` is expected to be already initialized to point to
     // `BSP_VARIABLES` before calling this function by `get_or_init_refcell_of_per_cpu_variables()`.
@@ -246,10 +327,24 @@ pub fn allocate_per_cpu_variables() {
         let per_cpu_variables = unsafe {
             let ptr = per_cpu_variables.as_mut_ptr();
             ptr.write_bytes(0, 1);
+            (*ptr).allocate_xsave_area();
             per_cpu_variables.assume_init()
         };
         unsafe {
             PER_CPU_VARIABLE_ADDRESSES[i] = RefCell::new(Box::into_raw(per_cpu_variables));
         }
     }
+}
+
+/// Get the XSAVE area size based on enabled features (XCR0)
+fn get_xsave_area_size() -> usize {
+    let cpuid = raw_cpuid::CpuId::new();
+    let finfo = cpuid
+        .get_feature_info()
+        .expect("Failed to get cpuid feature info");
+    assert!(finfo.has_xsave(), "XSAVE is not supported");
+    let sinfo = cpuid
+        .get_extended_state_info()
+        .expect("Failed to get cpuid extended state info");
+    usize::try_from(sinfo.xsave_area_size_enabled_features()).unwrap()
 }

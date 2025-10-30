@@ -874,6 +874,7 @@ dependencies = [
  "object",
  "once_cell",
  "rangemap",
+ "raw-cpuid",
  "rsa",
  "sha1",
  "sha2",
@@ -1374,6 +1375,15 @@ name = "rangemap"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f93e7e49bb0bf967717f7bd674458b3d6b0c5f48ec7e3038166026a69fc22223"
+
+[[package]]
+name = "raw-cpuid"
+version = "11.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
+dependencies = [
+ "bitflags 2.9.4",
+]
 
 [[package]]
 name = "regex"

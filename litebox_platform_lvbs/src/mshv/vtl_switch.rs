@@ -5,7 +5,7 @@ use crate::{
     mshv::{
         HV_VTL_NORMAL, HV_VTL_SECURE, NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT,
         VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction, vsm::vsm_dispatch,
-        vsm_intercept::vsm_handle_intercept,
+        vsm_intercept::vsm_handle_intercept, vsm_optee_smc,
     },
 };
 use core::arch::{asm, naked_asm};
@@ -215,6 +215,10 @@ pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
 #[allow(clippy::inline_always)]
 #[inline(always)]
 fn jump_to_vtl_switch_loop_with_stack_cleanup() -> ! {
+    with_per_cpu_variables_mut(|per_cpu_variables| {
+        per_cpu_variables.restore_extended_states(HV_VTL_NORMAL);
+    });
+
     let stack_top =
         with_per_cpu_variables(crate::host::per_cpu_variables::PerCpuVariables::kernel_stack_top);
     unsafe {
@@ -257,6 +261,13 @@ fn vtl_switch_loop() -> ! {
             load_vtl_state(HV_VTL_SECURE);
         }
 
+        // Since we do not know whether the VTL0 kernel saves its extended states (e.g., if a VTL switch
+        // is due to memory or register access violation, the VTL0 kernel might not have saved
+        // its states), we conservatively save and restore its extended states on every VTL switch.
+        with_per_cpu_variables_mut(|per_cpu_variables| {
+            per_cpu_variables.save_extended_states(HV_VTL_NORMAL);
+        });
+
         let reason = with_per_cpu_variables(|per_cpu_variables| unsafe {
             (*per_cpu_variables.hv_vp_assist_page_as_ptr()).vtl_entry_reason
         });
@@ -296,7 +307,7 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
         .unwrap_or(VsmFunction::Unknown);
     match func_id {
         VsmFunction::Unknown => Errno::EINVAL.as_neg().into(),
-        VsmFunction::OpteeMessage => todo!("VSM function call for OP-TEE message"),
+        VsmFunction::OpteeMessage => vsm_optee_smc::optee_smc_dispatch(params[1]),
         _ => vsm_dispatch(func_id, &params[1..]),
     }
 }
