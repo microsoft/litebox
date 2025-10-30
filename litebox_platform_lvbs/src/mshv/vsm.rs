@@ -26,7 +26,7 @@ use crate::{
         },
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
-        hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_aps},
+        hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_ap},
         mem_integrity::{
             validate_kernel_module_against_elf, validate_text_patch,
             verify_kernel_module_signature, verify_kernel_pe_signature,
@@ -113,21 +113,19 @@ pub fn mshv_vsm_enable_aps(cpu_present_mask_pfn: u64) -> Result<i64, Errno> {
     if let Some(cpu_mask) =
         unsafe { crate::platform_low().copy_from_vtl0_phys::<CpuMask>(cpu_present_mask_page_addr) }
     {
-        let mut present_cpus = Vec::new();
-        debug_serial_print!("cpu_present_mask: ");
-        cpu_mask.for_each_cpu(|cpu_id| {
-            debug_serial_print!("{}, ", cpu_id);
-            present_cpus.push(cpu_id as u32);
-        });
-        debug_serial_println!("");
+        let mut error = None;
 
-        if present_cpus.is_empty() {
-            serial_println!("No CPUs found in cpu_present_mask");
+        // Initialize VTL for each present CPU
+        cpu_mask.for_each_cpu(|cpu_id| {
+            if let Err(e) = init_vtl_ap(cpu_id as u32) {
+                error = Some(e);
+          }
+        });
+
+        if let Some(e) = error {
+            serial_println!("Failed to initialize one or more APs: {:?}", e);
             return Err(Errno::EINVAL);
         }
-
-        // Initialize APs for present CPUs
-        init_vtl_aps(&present_cpus).map_err(|_| Errno::EINVAL)?;
 
         Ok(0)
     } else {
