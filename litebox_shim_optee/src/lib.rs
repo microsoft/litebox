@@ -42,8 +42,8 @@ pub fn init_session<'a>(
         current_task: Task {
             // TODO: generate a unique session ID
             session_id: 1,
-            _ta_app_id: *ta_app_id,
-            _client_identity: *client_identity,
+            ta_app_id: *ta_app_id,
+            client_identity: *client_identity,
         },
     });
     litebox()
@@ -611,9 +611,9 @@ struct Task {
     /// Session ID
     session_id: u32,
     /// TA UUID
-    _ta_app_id: TeeUuid,
+    ta_app_id: TeeUuid,
     /// Client identity (VTL0 process or another TA)
-    _client_identity: TeeIdentity,
+    client_identity: TeeIdentity,
     // TODO: add more fields as needed
 }
 

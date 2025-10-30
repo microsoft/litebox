@@ -5,9 +5,10 @@ use litebox::path::Arg;
 use litebox::platform::RawMutPointer;
 use litebox::platform::{RawConstPointer, page_mgmt::MemoryRegionPermissions};
 use litebox_common_optee::{
-    TeeIdentity, TeeLogin, TeeMemoryAccessRights, TeeOrigin, TeePropSet, TeeResult, TeeUuid,
-    UserTaPropType, UteeParams,
+    TeeIdentity, TeeMemoryAccessRights, TeeOrigin, TeePropSet, TeeResult, TeeUuid, UserTaPropType,
+    UteeParams,
 };
+use num_enum::TryFromPrimitive;
 
 use crate::{
     litebox_page_manager,
@@ -65,8 +66,16 @@ pub fn sys_log(buf: &[u8]) -> Result<(), TeeResult> {
     Ok(())
 }
 
-// TODO: replace this with a proper implementation
-const GPD_CLIENT_IDENTITY: u32 = 0xffff_0000;
+/// Global Platform Device property indexes.
+/// Note. The specification does not define constant values, so these are internal representations.
+#[non_exhaustive]
+#[derive(Clone, Copy, PartialEq, TryFromPrimitive)]
+#[repr(u32)]
+pub enum GpdPropertyIndex {
+    ClientIdentity = 0xffff_0000,
+    CurrentTaUuid = 0xffff_0001,
+    None = 0xffff_ffff,
+}
 
 /// A system call to get system, client, or TA property information.
 pub fn sys_get_property(
@@ -81,19 +90,15 @@ pub fn sys_get_property(
     if name_buf.is_some() && name_len.is_some() {
         todo!("return the name of a given property index")
     }
-    match index {
-        GPD_CLIENT_IDENTITY => {
+    match GpdPropertyIndex::try_from(index).unwrap_or(GpdPropertyIndex::None) {
+        GpdPropertyIndex::ClientIdentity => {
             if prop_set != TeePropSet::CurrentClient {
                 return Err(TeeResult::BadParameters);
             }
             if prop_buf.len() < core::mem::size_of::<TeeIdentity>() {
                 return Err(TeeResult::ShortBuffer);
             }
-            // for now, return an arbitrary user identity
-            let identity = TeeIdentity {
-                login: TeeLogin::User,
-                uuid: TeeUuid::default(),
-            };
+            let identity = crate::with_current_task(|task| task.client_identity);
             prop_buf.copy_from_slice(unsafe {
                 core::slice::from_raw_parts(
                     (&raw const identity).cast::<u8>(),
@@ -113,7 +118,31 @@ pub fn sys_get_property(
             }
             Ok(())
         }
-        _ => Err(TeeResult::BadParameters),
+        GpdPropertyIndex::CurrentTaUuid => {
+            if prop_set != TeePropSet::CurrentTa {
+                return Err(TeeResult::BadParameters);
+            }
+            if prop_buf.len() < core::mem::size_of::<TeeUuid>() {
+                return Err(TeeResult::ShortBuffer);
+            }
+            let ta_uuid = crate::with_current_task(|task| task.ta_app_id);
+            prop_buf.copy_from_slice(unsafe {
+                core::slice::from_raw_parts(
+                    (&raw const ta_uuid).cast::<u8>(),
+                    core::mem::size_of::<TeeUuid>(),
+                )
+            });
+            unsafe {
+                prop_len
+                    .write_at_offset(0, u32::try_from(core::mem::size_of::<TeeUuid>()).unwrap())
+                    .ok_or(TeeResult::AccessDenied)?;
+                prop_type
+                    .write_at_offset(0, UserTaPropType::Uuid as u32)
+                    .ok_or(TeeResult::AccessDenied)?;
+            }
+            Ok(())
+        }
+        GpdPropertyIndex::None => Err(TeeResult::BadParameters),
     }
 }
 
@@ -133,7 +162,19 @@ pub fn sys_get_property_name_to_index(
             if prop_set == TeePropSet::CurrentClient {
                 unsafe {
                     index
-                        .write_at_offset(0, GPD_CLIENT_IDENTITY)
+                        .write_at_offset(0, GpdPropertyIndex::ClientIdentity as u32)
+                        .ok_or(TeeResult::AccessDenied)?;
+                }
+                Ok(())
+            } else {
+                Err(TeeResult::BadParameters)
+            }
+        }
+        "gpd.ta.appID" => {
+            if prop_set == TeePropSet::CurrentTa {
+                unsafe {
+                    index
+                        .write_at_offset(0, GpdPropertyIndex::CurrentTaUuid as u32)
                         .ok_or(TeeResult::AccessDenied)?;
                 }
                 Ok(())
