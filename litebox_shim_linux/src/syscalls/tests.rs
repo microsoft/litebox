@@ -3,10 +3,6 @@ use litebox::platform::RawConstPointer as _;
 use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
 use litebox_platform_multiplex::{Platform, set_platform};
 
-use super::file::{
-    sys_close, sys_dup, sys_eventfd2, sys_fcntl, sys_getdirent64, sys_mkdir, sys_open, sys_pipe2,
-    sys_stat, sys_umask,
-};
 use crate::MutPtr;
 
 extern crate std;
@@ -16,7 +12,8 @@ static INIT_FUNC: spin::Once = spin::Once::new();
 
 const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
 
-pub(crate) fn init_platform(tun_device_name: Option<&str>) {
+#[must_use]
+pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task {
     INIT_FUNC.call_once(|| {
         #[cfg(target_os = "linux")]
         let platform = Platform::new(tun_device_name);
@@ -25,7 +22,7 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) {
         let platform = Platform::new();
 
         set_platform(platform);
-        let litebox = crate::init_process(platform.init_task());
+        let litebox = crate::litebox();
         let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
         in_mem_fs.with_root_privileges(|fs| {
             fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
@@ -34,6 +31,7 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) {
         let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(litebox, TEST_TAR_FILE.into());
         crate::set_fs(crate::default_fs(in_mem_fs, tar_ro_fs));
     });
+    crate::Task::new_for_test()
 }
 
 pub(crate) fn compile(input: &str, output: &str, is_static: bool, nolibc: bool) {
@@ -63,63 +61,71 @@ pub(crate) fn compile(input: &str, output: &str, is_static: bool, nolibc: bool) 
 
 #[test]
 fn test_fcntl() {
-    init_platform(None);
+    let task = init_platform(None);
 
     let check = |fd: i32, flags1: OFlags, flags2: OFlags| {
         assert_eq!(
-            sys_fcntl(fd, FcntlArg::GETFD).unwrap(),
+            task.sys_fcntl(fd, FcntlArg::GETFD).unwrap(),
             FileDescriptorFlags::FD_CLOEXEC.bits()
         );
 
-        assert_eq!(sys_fcntl(fd, FcntlArg::GETFL).unwrap(), flags1.bits());
+        assert_eq!(task.sys_fcntl(fd, FcntlArg::GETFL).unwrap(), flags1.bits());
 
-        sys_fcntl(fd, FcntlArg::SETFD(FileDescriptorFlags::empty())).unwrap();
-        assert_eq!(sys_fcntl(fd, FcntlArg::GETFD).unwrap(), 0);
+        task.sys_fcntl(fd, FcntlArg::SETFD(FileDescriptorFlags::empty()))
+            .unwrap();
+        assert_eq!(task.sys_fcntl(fd, FcntlArg::GETFD).unwrap(), 0);
 
-        sys_fcntl(fd, FcntlArg::SETFL(OFlags::empty())).unwrap();
-        assert_eq!(sys_fcntl(fd, FcntlArg::GETFL).unwrap(), flags2.bits());
+        task.sys_fcntl(fd, FcntlArg::SETFL(OFlags::empty()))
+            .unwrap();
+        assert_eq!(task.sys_fcntl(fd, FcntlArg::GETFL).unwrap(), flags2.bits());
     };
 
     // Test pipe
-    let (read_fd, write_fd) =
-        sys_pipe2(OFlags::CLOEXEC | OFlags::NONBLOCK).expect("Failed to create pipe");
+    let (read_fd, write_fd) = task
+        .sys_pipe2(OFlags::CLOEXEC | OFlags::NONBLOCK)
+        .expect("Failed to create pipe");
     let read_fd = i32::try_from(read_fd).unwrap();
     check(read_fd, OFlags::RDONLY | OFlags::NONBLOCK, OFlags::RDONLY);
     let write_fd = i32::try_from(write_fd).unwrap();
     check(write_fd, OFlags::WRONLY | OFlags::NONBLOCK, OFlags::WRONLY);
 
     // Test eventfd
-    let eventfd = sys_eventfd2(
-        0,
-        EfdFlags::CLOEXEC | EfdFlags::SEMAPHORE | EfdFlags::NONBLOCK,
-    )
-    .expect("Failed to create eventfd");
+    let eventfd = task
+        .sys_eventfd2(
+            0,
+            EfdFlags::CLOEXEC | EfdFlags::SEMAPHORE | EfdFlags::NONBLOCK,
+        )
+        .expect("Failed to create eventfd");
     let eventfd = i32::try_from(eventfd).unwrap();
     check(eventfd, OFlags::RDWR | OFlags::NONBLOCK, OFlags::RDWR);
 }
 
 #[test]
 fn test_dup() {
-    init_platform(None);
+    let task = init_platform(None);
 
-    let fd = sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty()).unwrap();
+    let fd = task
+        .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+        .unwrap();
     let fd = i32::try_from(fd).unwrap();
     // test dup
-    let fd2 = sys_dup(fd, None, None).unwrap();
+    let fd2 = task.sys_dup(fd, None, None).unwrap();
     let fd2 = i32::try_from(fd2).unwrap();
     assert_eq!(fd + 1, fd2);
 
     // test dup2
-    let fd3 = sys_dup(fd2, Some(fd2 + 10), None).unwrap();
+    let fd3 = task.sys_dup(fd2, Some(fd2 + 10), None).unwrap();
     let fd3 = i32::try_from(fd3).unwrap();
     assert_eq!(fd2 + 10, fd3);
 
     // test dup3
     assert_eq!(
-        sys_dup(fd3, Some(fd3), Some(OFlags::CLOEXEC)),
+        task.sys_dup(fd3, Some(fd3), Some(OFlags::CLOEXEC)),
         Err(Errno::EINVAL)
     );
-    let fd4 = sys_dup(fd2, Some(fd2 + 10), Some(OFlags::CLOEXEC)).unwrap();
+    let fd4 = task
+        .sys_dup(fd2, Some(fd2 + 10), Some(OFlags::CLOEXEC))
+        .unwrap();
     let fd4 = i32::try_from(fd4).unwrap();
     assert_eq!(fd2 + 10, fd4);
 }
@@ -127,38 +133,44 @@ fn test_dup() {
 // Note the test was generated by copilot with minor fixes.
 #[test]
 fn test_getdent64() {
-    init_platform(None);
+    let task = init_platform(None);
 
     // Create test files in root directory for testing
-    let file1_fd = sys_open(
-        "/test_file1.txt",
-        OFlags::CREAT | OFlags::WRONLY,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .expect("Failed to create test_file1.txt");
-    super::file::sys_close(file1_fd.try_into().unwrap()).expect("Failed to close test_file1.txt");
+    let file1_fd = task
+        .sys_open(
+            "/test_file1.txt",
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test_file1.txt");
+    task.sys_close(file1_fd.try_into().unwrap())
+        .expect("Failed to close test_file1.txt");
 
-    let file2_fd = sys_open(
-        "/test_file2.txt",
-        OFlags::CREAT | OFlags::WRONLY,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .expect("Failed to create test_file2.txt");
-    super::file::sys_close(file2_fd.try_into().unwrap()).expect("Failed to close test_file2.txt");
+    let file2_fd = task
+        .sys_open(
+            "/test_file2.txt",
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test_file2.txt");
+    task.sys_close(file2_fd.try_into().unwrap())
+        .expect("Failed to close test_file2.txt");
 
     // Open the root directory for testing
-    let dir_fd =
-        sys_open("/", OFlags::RDONLY, Mode::empty()).expect("Failed to open root directory");
+    let dir_fd = task
+        .sys_open("/", OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open root directory");
     let dir_fd = dir_fd.try_into().unwrap();
 
     // Test 1: Basic functionality - read directory entries
     let mut buffer = alloc::vec![0u8; 4096];
-    let bytes_read = sys_getdirent64(
-        dir_fd,
-        MutPtr::from_usize(buffer.as_mut_ptr() as usize),
-        buffer.len(),
-    )
-    .expect("Failed to read directory entries");
+    let bytes_read = task
+        .sys_getdirent64(
+            dir_fd,
+            MutPtr::from_usize(buffer.as_mut_ptr() as usize),
+            buffer.len(),
+        )
+        .expect("Failed to read directory entries");
 
     assert!(bytes_read > 0, "Should have read some directory entries");
     assert!(
@@ -244,7 +256,7 @@ fn test_getdent64() {
     }
 
     assert_eq!(
-        sys_getdirent64(
+        task.sys_getdirent64(
             dir_fd,
             MutPtr::from_usize(buffer.as_mut_ptr() as usize),
             buffer.len()
@@ -253,19 +265,21 @@ fn test_getdent64() {
         0,
         "should have read all entries in the previous call"
     );
-    sys_close(dir_fd).expect("Failed to close directory");
+    task.sys_close(dir_fd).expect("Failed to close directory");
 
     // Test 2: Small buffer (should handle partial reads gracefully)
-    let dir_fd =
-        sys_open("/", OFlags::RDONLY, Mode::empty()).expect("Failed to open root directory");
+    let dir_fd = task
+        .sys_open("/", OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open root directory");
     let dir_fd = dir_fd.try_into().unwrap();
     let mut small_buffer = [0u8; 64];
-    let bytes = sys_getdirent64(
-        dir_fd,
-        MutPtr::from_usize(small_buffer.as_mut_ptr() as usize),
-        small_buffer.len(),
-    )
-    .expect("Failed to read directory entries");
+    let bytes = task
+        .sys_getdirent64(
+            dir_fd,
+            MutPtr::from_usize(small_buffer.as_mut_ptr() as usize),
+            small_buffer.len(),
+        )
+        .expect("Failed to read directory entries");
 
     // Should either succeed with partial data or return 0 if no entry fits
     assert!(bytes <= small_buffer.len(), "Should not exceed buffer size");
@@ -286,7 +300,7 @@ fn test_getdent64() {
     }
 
     // Test 3: Invalid file descriptor
-    let result = sys_getdirent64(
+    let result = task.sys_getdirent64(
         -1,
         MutPtr::from_usize(buffer.as_mut_ptr() as usize),
         buffer.len(),
@@ -298,11 +312,12 @@ fn test_getdent64() {
     );
 
     // Test 4: File descriptor pointing to a regular file (not a directory)
-    let file1_fd = sys_open("/test_file1.txt", OFlags::RDONLY, Mode::empty())
+    let file1_fd = task
+        .sys_open("/test_file1.txt", OFlags::RDONLY, Mode::empty())
         .expect("Failed to open test_file1.txt");
     let file1_fd = file1_fd.try_into().unwrap();
 
-    let result = sys_getdirent64(
+    let result = task.sys_getdirent64(
         file1_fd,
         MutPtr::from_usize(buffer.as_mut_ptr() as usize),
         buffer.len(),
@@ -312,18 +327,19 @@ fn test_getdent64() {
         Err(Errno::ENOTDIR),
         "Should return ENOTDIR for non-directory fd"
     );
-    super::file::sys_close(file1_fd).expect("Failed to close file");
+    task.sys_close(file1_fd).expect("Failed to close file");
 
     // Test 5: Zero-length buffer
-    let result = sys_getdirent64(dir_fd, MutPtr::from_usize(buffer.as_mut_ptr() as usize), 0);
+    let result = task.sys_getdirent64(dir_fd, MutPtr::from_usize(buffer.as_mut_ptr() as usize), 0);
     assert_eq!(result, Ok(0), "Should return 0 for zero-length buffer");
 
-    sys_close(dir_fd).expect("Failed to close directory");
+    task.sys_close(dir_fd).expect("Failed to close directory");
 
     // Test 6: Multiple reads (test directory offset tracking)
     // Reopen directory to reset position
-    let dir_fd2 =
-        sys_open("/", OFlags::RDONLY, Mode::empty()).expect("Failed to reopen root directory");
+    let dir_fd2 = task
+        .sys_open("/", OFlags::RDONLY, Mode::empty())
+        .expect("Failed to reopen root directory");
     let dir_fd2 = dir_fd2.try_into().unwrap();
 
     // Read entries in smaller chunks to test offset tracking
@@ -331,12 +347,13 @@ fn test_getdent64() {
 
     loop {
         let mut chunk_buffer = [0u8; 64];
-        let bytes_read = sys_getdirent64(
-            dir_fd2,
-            MutPtr::from_usize(chunk_buffer.as_mut_ptr() as usize),
-            chunk_buffer.len(),
-        )
-        .expect("Failed to read directory chunk");
+        let bytes_read = task
+            .sys_getdirent64(
+                dir_fd2,
+                MutPtr::from_usize(chunk_buffer.as_mut_ptr() as usize),
+                chunk_buffer.len(),
+            )
+            .expect("Failed to read directory chunk");
 
         if bytes_read == 0 {
             break; // End of directory
@@ -391,28 +408,29 @@ fn test_getdent64() {
 
 #[test]
 fn test_umask_behavior() {
-    init_platform(None);
+    let task = init_platform(None);
 
     // 1. Capture original mask without changing final state.
-    let orig = sys_umask(0).bits(); // sets mask to 0, returns previous
-    let _ = sys_umask(orig); // restore original
+    let orig = task.sys_umask(0).bits(); // sets mask to 0, returns previous
+    let _ = task.sys_umask(orig); // restore original
 
     // We expect the default (from implementation) to be 0o022.
     assert_eq!(orig, 0o022, "Default umask should be 022 (got {orig:03o})",);
 
     // 2. Set a new umask (e.g., 0o077) and verify file creation honors it.
-    let prev = sys_umask(0o077).bits();
+    let prev = task.sys_umask(0o077).bits();
     assert_eq!(prev, orig, "Setting umask should return previous value");
 
     // Create a file with mode 0o666; with umask 0o077 it should become 0o600.
     let file_mode = Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH; // 0o666
     let test_file = "/umask_rs_test_file_perm.txt";
-    let fd = sys_open(test_file, OFlags::CREAT | OFlags::WRONLY, file_mode)
+    let fd = task
+        .sys_open(test_file, OFlags::CREAT | OFlags::WRONLY, file_mode)
         .expect("Failed to create test file with O_CREAT");
     // Close it (ignore errors)
-    let _ = sys_close(i32::try_from(fd).unwrap());
+    let _ = task.sys_close(i32::try_from(fd).unwrap());
 
-    let stat_file = sys_stat(test_file).expect("stat failed on test file");
+    let stat_file = task.sys_stat(test_file).expect("stat failed on test file");
     let actual_file_perm = stat_file.st_mode & 0o777;
     assert_eq!(
         actual_file_perm, 0o600,
@@ -422,9 +440,12 @@ fn test_umask_behavior() {
     // 3. Create a directory with mode 0o777; with umask 0o077 should become 0o700.
     let dir_mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits();
     let test_dir = "/umask_rs_test_dir";
-    sys_mkdir(test_dir, dir_mode).expect("Failed to create test directory");
+    task.sys_mkdir(test_dir, dir_mode)
+        .expect("Failed to create test directory");
 
-    let stat_dir = sys_stat(test_dir).expect("stat failed on test directory");
+    let stat_dir = task
+        .sys_stat(test_dir)
+        .expect("stat failed on test directory");
     let actual_dir_perm = stat_dir.st_mode & 0o777;
     assert_eq!(
         actual_dir_perm, 0o700,
@@ -433,25 +454,26 @@ fn test_umask_behavior() {
 
     // 4. High bits are ignored: set mask with bits beyond 0o777.
     // Current mask is 0o077; now set 0o1777 -> stored low 9 bits = 0o777.
-    let prev2 = sys_umask(0o1777).bits();
+    let prev2 = task.sys_umask(0o1777).bits();
     assert_eq!(prev2, 0o077, "Returned previous mask should be 077");
-    let prev3 = sys_umask(0).bits(); // fetch current (0o777) and set to 0
+    let prev3 = task.sys_umask(0).bits(); // fetch current (0o777) and set to 0
     assert_eq!(
         prev3, 0o777,
         "Only low 9 bits should be retained (expected 777)"
     );
     // Restore to original
-    let _ = sys_umask(orig);
+    let _ = task.sys_umask(orig);
 }
 
 #[test]
 fn test_rlimit_nofile() {
     use litebox_common_linux::{Rlimit, RlimitResource, errno::Errno};
 
-    crate::syscalls::tests::init_platform(None);
+    let task = crate::syscalls::tests::init_platform(None);
 
     // 1. Get the current NOFILE limit.
-    let cur_lim = super::process::do_prlimit(RlimitResource::NOFILE, None)
+    let cur_lim = task
+        .do_prlimit(RlimitResource::NOFILE, None)
         .expect("sys_getrlimit(NOFILE) failed");
     assert!(cur_lim.rlim_max >= cur_lim.rlim_cur, "expected max >= cur");
 
@@ -460,7 +482,8 @@ fn test_rlimit_nofile() {
         rlim_cur: cur_lim.rlim_cur,
         rlim_max: cur_lim.rlim_max.saturating_add(1),
     };
-    let err = super::process::do_prlimit(RlimitResource::NOFILE, Some(raise))
+    let err = task
+        .do_prlimit(RlimitResource::NOFILE, Some(raise))
         .expect_err("raising NOFILE hard limit should fail");
     assert_eq!(err, Errno::EPERM);
 
@@ -469,24 +492,26 @@ fn test_rlimit_nofile() {
         rlim_cur: cur_lim.rlim_max + 1,
         rlim_max: cur_lim.rlim_max,
     };
-    let err = super::process::do_prlimit(RlimitResource::NOFILE, Some(bad_order))
+    let err = task
+        .do_prlimit(RlimitResource::NOFILE, Some(bad_order))
         .expect_err("cur > max should be invalid");
     assert_eq!(err, Errno::EINVAL);
 
     // 4. Lower soft limit
-    let probe_fd = super::file::sys_dup(0, None, None).expect("probe dup failed");
+    let probe_fd = task.sys_dup(0, None, None).expect("probe dup failed");
     let new_lim = Rlimit {
         rlim_cur: probe_fd as usize + 1,
         rlim_max: cur_lim.rlim_max,
     };
-    super::process::do_prlimit(RlimitResource::NOFILE, Some(new_lim))
+    task.do_prlimit(RlimitResource::NOFILE, Some(new_lim))
         .expect("lowering NOFILE cur limit should succeed");
     assert_eq!(
-        super::file::sys_dup(0, None, None).expect_err("dup should fail due to new cur limit"),
+        task.sys_dup(0, None, None)
+            .expect_err("dup should fail due to new cur limit"),
         Errno::EMFILE,
     );
     assert_eq!(
-        super::file::sys_open("/prlimit_file", OFlags::CREAT | OFlags::RDONLY, Mode::RWXU)
+        task.sys_open("/prlimit_file", OFlags::CREAT | OFlags::RDONLY, Mode::RWXU)
             .expect_err("open should fail due to new cur limit"),
         Errno::EMFILE,
     );
@@ -494,21 +519,23 @@ fn test_rlimit_nofile() {
 
 #[test]
 fn test_unlinkat() {
-    init_platform(None);
+    let task = init_platform(None);
 
     // 1. Create a regular file and unlink it.
     let file_path = "/unlink_test_file.txt";
-    let fd = sys_open(
-        file_path,
-        OFlags::CREAT | OFlags::WRONLY,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .expect("Failed to create test file for unlink");
-    sys_close(i32::try_from(fd).unwrap()).expect("Failed to close test file");
-    super::file::sys_unlinkat(0, file_path, AtFlags::empty())
+    let fd = task
+        .sys_open(
+            file_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file for unlink");
+    task.sys_close(i32::try_from(fd).unwrap())
+        .expect("Failed to close test file");
+    task.sys_unlinkat(0, file_path, AtFlags::empty())
         .expect("unlinkat should succeed on regular file");
     assert_eq!(
-        super::file::sys_stat(file_path),
+        task.sys_stat(file_path),
         Err(Errno::ENOENT),
         "File should no longer exist after unlink"
     );
@@ -516,32 +543,36 @@ fn test_unlinkat() {
     // 2. Create a directory and attempt to unlink without AT_REMOVEDIR -> EISDIR.
     let dir_path = "/unlink_dir";
     let dir_mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits();
-    sys_mkdir(dir_path, dir_mode).expect("Failed to create directory");
+    task.sys_mkdir(dir_path, dir_mode)
+        .expect("Failed to create directory");
     assert_eq!(
-        super::file::sys_unlinkat(0, dir_path, AtFlags::empty()),
+        task.sys_unlinkat(0, dir_path, AtFlags::empty()),
         Err(Errno::EISDIR),
         "Unlinking a directory without AT_REMOVEDIR should return EISDIR"
     );
 
     // 3. Create a non-empty directory and remove with AT_REMOVEDIR -> ENOTEMPTY.
     let nonempty_dir = "/unlink_dir_nonempty";
-    sys_mkdir(nonempty_dir, dir_mode).expect("Failed to create non-empty directory");
-    let inner_file_fd = sys_open(
-        "/unlink_dir_nonempty/inner.txt",
-        OFlags::CREAT | OFlags::WRONLY,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .expect("Failed to create inner file");
-    sys_close(i32::try_from(inner_file_fd).unwrap()).expect("Failed to close inner file");
+    task.sys_mkdir(nonempty_dir, dir_mode)
+        .expect("Failed to create non-empty directory");
+    let inner_file_fd = task
+        .sys_open(
+            "/unlink_dir_nonempty/inner.txt",
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create inner file");
+    task.sys_close(i32::try_from(inner_file_fd).unwrap())
+        .expect("Failed to close inner file");
     assert_eq!(
-        super::file::sys_unlinkat(0, nonempty_dir, AtFlags::AT_REMOVEDIR),
+        task.sys_unlinkat(0, nonempty_dir, AtFlags::AT_REMOVEDIR),
         Err(Errno::ENOTEMPTY),
         "Removing a non-empty directory with AT_REMOVEDIR should return ENOTEMPTY"
     );
 
     // 4. Invalid flag combination: AT_REMOVEDIR | (any other flag) -> EINVAL.
     assert_eq!(
-        super::file::sys_unlinkat(
+        task.sys_unlinkat(
             0,
             dir_path,
             AtFlags::AT_REMOVEDIR | AtFlags::AT_SYMLINK_NOFOLLOW
@@ -551,21 +582,22 @@ fn test_unlinkat() {
     );
 
     // 5. Successfully remove previously created empty directory with AT_REMOVEDIR.
-    super::file::sys_unlinkat(0, dir_path, AtFlags::AT_REMOVEDIR)
+    task.sys_unlinkat(0, dir_path, AtFlags::AT_REMOVEDIR)
         .expect("Should remove empty directory with AT_REMOVEDIR");
     assert_eq!(
-        super::file::sys_stat(dir_path),
+        task.sys_stat(dir_path),
         Err(Errno::ENOENT),
         "Directory should no longer exist after removal"
     );
 
     // 6. Create and remove another empty directory to ensure repeatability.
     let empty_dir2 = "/unlink_empty_dir";
-    sys_mkdir(empty_dir2, dir_mode).expect("Failed to create second empty directory");
-    super::file::sys_unlinkat(0, empty_dir2, AtFlags::AT_REMOVEDIR)
+    task.sys_mkdir(empty_dir2, dir_mode)
+        .expect("Failed to create second empty directory");
+    task.sys_unlinkat(0, empty_dir2, AtFlags::AT_REMOVEDIR)
         .expect("Should remove second empty directory");
     assert_eq!(
-        super::file::sys_stat(empty_dir2),
+        task.sys_stat(empty_dir2),
         Err(Errno::ENOENT),
         "Second directory should no longer exist after removal"
     );

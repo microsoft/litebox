@@ -1257,3 +1257,67 @@ impl Task {
         Ok(pt_regs)
     }
 }
+
+#[cfg(test)]
+mod test_utils {
+    extern crate std;
+    use super::*;
+    use crate::syscalls::process::NEXT_THREAD_ID;
+
+    impl Task {
+        /// Make a new task with default values for testing.
+        pub(crate) fn new_for_test() -> Self {
+            let pid = NEXT_THREAD_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Task {
+                process: Arc::new(syscalls::process::Process::new()),
+                pid,
+                ppid: 0,
+                tid: pid,
+                clear_child_tid: Cell::new(None),
+                robust_list: Cell::new(None),
+                credentials: Arc::new(syscalls::process::Credentials {
+                    uid: 0,
+                    euid: 0,
+                    gid: 0,
+                    egid: 0,
+                }),
+                comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
+                fs: Arc::new(syscalls::file::FsState::new()).into(),
+            }
+        }
+
+        /// Returns a function that clones this task with a new TID for testing.
+        pub(crate) fn clone_for_test(&self) -> impl 'static + Send + FnOnce() -> Self {
+            let process = self.process.clone();
+            let credentials = self.credentials.clone();
+            let fs = self.fs.clone();
+            let comm = self.comm.clone();
+            let pid = self.pid;
+            let tid = NEXT_THREAD_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let parent_pid = self.ppid;
+            move || Task {
+                process,
+                pid,
+                ppid: parent_pid,
+                tid,
+                clear_child_tid: None.into(),
+                robust_list: None.into(),
+                credentials,
+                comm,
+                fs,
+            }
+        }
+
+        /// Spawns a thread that runs with a clone of this task and a new TID.
+        pub(crate) fn spawn_clone_for_test<R>(
+            &self,
+            f: impl 'static + Send + FnOnce(Task) -> R,
+        ) -> std::thread::JoinHandle<R>
+        where
+            R: 'static + Send,
+        {
+            let clone_task_fn = self.clone_for_test();
+            std::thread::spawn(move || f(clone_task_fn()))
+        }
+    }
+}

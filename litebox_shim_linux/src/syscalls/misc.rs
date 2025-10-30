@@ -188,14 +188,15 @@ mod tests {
     fn test_getrandom() {
         use litebox_common_linux::RngFlags;
 
-        init_platform(None);
+        let task = init_platform(None);
 
         let mut buf = [0u8; 16];
         let ptr = crate::MutPtr {
             inner: buf.as_mut_ptr(),
         };
-        let count =
-            super::sys_getrandom(ptr, buf.len() - 1, RngFlags::empty()).expect("getrandom failed");
+        let count = task
+            .sys_getrandom(ptr, buf.len() - 1, RngFlags::empty())
+            .expect("getrandom failed");
         assert_eq!(count, buf.len() - 1);
         assert!(
             !buf.iter().all(|&b| b == 0),
@@ -206,13 +207,13 @@ mod tests {
 
     #[test]
     fn test_uname() {
-        init_platform(None);
+        let task = init_platform(None);
 
         let mut utsname = MaybeUninit::<litebox_common_linux::Utsname>::uninit();
         let ptr = crate::MutPtr {
             inner: utsname.as_mut_ptr(),
         };
-        super::sys_uname(ptr).expect("uname failed");
+        task.sys_uname(ptr).expect("uname failed");
         let utsname = unsafe { utsname.assume_init() };
 
         assert_eq!(utsname.sysname, super::SYS_INFO.sysname);

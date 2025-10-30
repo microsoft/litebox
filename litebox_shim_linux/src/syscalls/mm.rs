@@ -214,27 +214,22 @@ mod tests {
     };
     use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
-    use crate::syscalls::{
-        file::{sys_close, sys_open, sys_write},
-        mm::{sys_mremap, sys_munmap},
-        tests::init_platform,
-    };
-
-    use super::{sys_madvise, sys_mmap};
+    use crate::syscalls::tests::init_platform;
 
     #[test]
     fn test_anonymous_mmap() {
-        init_platform(None);
+        let task = init_platform(None);
 
-        let addr = sys_mmap(
-            0,
-            0x2000,
-            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-            MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
-            -1,
-            0,
-        )
-        .unwrap();
+        let addr = task
+            .sys_mmap(
+                0,
+                0x2000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+                -1,
+                0,
+            )
+            .unwrap();
         unsafe {
             addr.mutate_subslice_with(..0x2000, |buf| {
                 buf.fill(0xff);
@@ -245,52 +240,56 @@ mod tests {
             unsafe { addr.read_at_offset(0x1000) }.unwrap().into_owned(),
             0xff,
         );
-        sys_munmap(addr, 0x2000).unwrap();
+        task.sys_munmap(addr, 0x2000).unwrap();
     }
 
     #[test]
     fn test_file_backed_mmap() {
-        init_platform(None);
+        let task = init_platform(None);
 
         let content = b"Hello, world!";
-        let fd = sys_open("test.txt", OFlags::RDWR | OFlags::CREAT, Mode::RWXU).unwrap();
+        let fd = task
+            .sys_open("test.txt", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+            .unwrap();
         let fd = i32::try_from(fd).unwrap();
-        assert_eq!(sys_write(fd, content, None).unwrap(), content.len());
-        let addr = sys_mmap(
-            0,
-            0x1000,
-            ProtFlags::PROT_READ,
-            MapFlags::MAP_PRIVATE,
-            fd,
-            0,
-        )
-        .unwrap();
+        assert_eq!(task.sys_write(fd, content, None).unwrap(), content.len());
+        let addr = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE,
+                fd,
+                0,
+            )
+            .unwrap();
         assert_eq!(
             unsafe { addr.to_cow_slice(content.len()).unwrap() },
             content.as_slice(),
         );
-        sys_munmap(addr, 0x1000).unwrap();
-        sys_close(fd).unwrap();
+        task.sys_munmap(addr, 0x1000).unwrap();
+        task.sys_close(fd).unwrap();
     }
 
     // `mremap` is not implemented for windows yet.
     #[cfg(not(any(feature = "platform_windows_userland")))]
     #[test]
     fn test_mremap() {
-        init_platform(None);
+        let task = init_platform(None);
 
-        let addr = sys_mmap(
-            0,
-            0x2000,
-            ProtFlags::PROT_READ,
-            MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
-            -1,
-            0,
-        )
-        .unwrap();
+        let addr = task
+            .sys_mmap(
+                0,
+                0x2000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+                -1,
+                0,
+            )
+            .unwrap();
 
         assert!(matches!(
-            super::sys_mremap(
+            task.sys_mremap(
                 addr,
                 0x1000,
                 0x2000,
@@ -299,21 +298,22 @@ mod tests {
             ),
             Err(litebox_common_linux::errno::Errno::ENOMEM)
         ),);
-        let new_addr = super::sys_mremap(
-            addr,
-            0x1000,
-            0x2000,
-            litebox_common_linux::MRemapFlags::MREMAP_MAYMOVE,
-            0,
-        )
-        .unwrap();
-        sys_munmap(addr, 0x2000).unwrap();
-        sys_munmap(new_addr, 0x2000).unwrap();
+        let new_addr = task
+            .sys_mremap(
+                addr,
+                0x1000,
+                0x2000,
+                litebox_common_linux::MRemapFlags::MREMAP_MAYMOVE,
+                0,
+            )
+            .unwrap();
+        task.sys_munmap(addr, 0x2000).unwrap();
+        task.sys_munmap(new_addr, 0x2000).unwrap();
     }
 
     #[test]
     fn test_collision_with_global_allocator() {
-        init_platform(None);
+        let task = init_platform(None);
         let platform = litebox_platform_multiplex::platform();
         let mut data = alloc::vec::Vec::new();
         // Find an address that is allocated to the global allocator but not in reserved regions.
@@ -333,7 +333,7 @@ mod tests {
 
             if !included {
                 // Also ensure that [addr - 0x1000, addr) is available, which is needed in the test below.
-                if let Ok(ptr) = sys_mmap(
+                if let Ok(ptr) = task.sys_mmap(
                     addr - 0x1000,
                     0x1000,
                     ProtFlags::PROT_READ,
@@ -342,7 +342,7 @@ mod tests {
                     0,
                 ) {
                     if ptr.as_usize() != addr - 0x1000 {
-                        sys_munmap(ptr, 0x1000).unwrap();
+                        task.sys_munmap(ptr, 0x1000).unwrap();
                         continue;
                     }
                     break addr;
@@ -351,43 +351,46 @@ mod tests {
         };
 
         // mmap with the found address should still succeed but not at the exact address.
-        let res = sys_mmap(
-            addr,
-            0x1000,
-            ProtFlags::PROT_READ,
-            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
-            -1,
-            0,
-        )
-        .unwrap();
+        let res = task
+            .sys_mmap(
+                addr,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
+                -1,
+                0,
+            )
+            .unwrap();
         assert_ne!(res.as_usize(), 0);
         assert_ne!(res.as_usize(), addr);
 
         // grow the mapping without MREMAP_MAYMOVE should fail as the new region collides with the global allocator
-        let err = sys_mremap(
-            crate::MutPtr::from_usize(addr - 0x1000),
-            0x1000,
-            0x2000,
-            MRemapFlags::empty(),
-            addr - 0x1000,
-        )
-        .unwrap_err();
+        let err = task
+            .sys_mremap(
+                crate::MutPtr::from_usize(addr - 0x1000),
+                0x1000,
+                0x2000,
+                MRemapFlags::empty(),
+                addr - 0x1000,
+            )
+            .unwrap_err();
         assert_eq!(err, Errno::ENOMEM);
     }
 
     #[test]
     fn test_madvise() {
-        init_platform(None);
+        let task = init_platform(None);
 
-        let addr = sys_mmap(
-            0,
-            0x2000,
-            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-            MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
-            -1,
-            0,
-        )
-        .unwrap();
+        let addr = task
+            .sys_mmap(
+                0,
+                0x2000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+                -1,
+                0,
+            )
+            .unwrap();
 
         addr.mutate_subslice_with(..0x10, |buf| {
             buf.fill(0xff);
@@ -395,11 +398,14 @@ mod tests {
         .unwrap();
 
         // Test MADV_NORMAL
-        assert!(sys_madvise(addr, 0x2000, litebox_common_linux::MadviseBehavior::Normal).is_ok());
+        assert!(
+            task.sys_madvise(addr, 0x2000, litebox_common_linux::MadviseBehavior::Normal)
+                .is_ok()
+        );
 
         // Test MADV_DONTNEED
         assert!(
-            sys_madvise(
+            task.sys_madvise(
                 addr,
                 0x2000,
                 litebox_common_linux::MadviseBehavior::DontNeed
@@ -413,6 +419,6 @@ mod tests {
             });
         }
 
-        sys_munmap(addr, 0x2000).unwrap();
+        task.sys_munmap(addr, 0x2000).unwrap();
     }
 }

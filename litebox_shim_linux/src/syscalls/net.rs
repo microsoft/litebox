@@ -914,13 +914,8 @@ mod tests {
         AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType, errno::Errno,
     };
 
-    use super::{SocketAddress, sys_connect, sys_getsockname};
-    use crate::{
-        ConstPtr,
-        syscalls::{file::sys_close, net::sys_recvfrom},
-    };
-
-    use super::{sys_accept, sys_bind, sys_listen, sys_sendto, sys_socket};
+    use super::SocketAddress;
+    use crate::ConstPtr;
 
     extern crate alloc;
     extern crate std;
@@ -931,30 +926,34 @@ mod tests {
     const CLIENT_PORT: u16 = 8081;
 
     fn test_tcp_socket(
+        task: &crate::Task,
         ip: [u8; 4],
         port: u16,
         is_nonblocking: bool,
         test_trunc: bool,
         option: &str,
     ) {
-        let server = sys_socket(
-            AddressFamily::INET,
-            SockType::Stream,
-            if is_nonblocking {
-                SockFlags::NONBLOCK
-            } else {
-                SockFlags::empty()
-            },
-            None,
-        )
-        .unwrap();
+        let server = task
+            .sys_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                if is_nonblocking {
+                    SockFlags::NONBLOCK
+                } else {
+                    SockFlags::empty()
+                },
+                None,
+            )
+            .unwrap();
         let server = i32::try_from(server).unwrap();
         let sockaddr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
             core::net::Ipv4Addr::from(ip),
             port,
         )));
-        sys_bind(server, sockaddr).expect("Failed to bind socket");
-        sys_listen(server, 1).expect("Failed to listen on socket");
+        task.sys_bind(server, sockaddr)
+            .expect("Failed to bind socket");
+        task.sys_listen(server, 1)
+            .expect("Failed to listen on socket");
 
         let buf = "Hello, world!";
         let mut child = match option {
@@ -979,7 +978,7 @@ mod tests {
 
         let client_fd = if is_nonblocking {
             loop {
-                match sys_accept(server, None, None, SockFlags::empty()) {
+                match task.sys_accept(server, None, None, SockFlags::empty()) {
                     Ok(fd) => break fd,
                     Err(e) => {
                         assert_eq!(e, Errno::EAGAIN);
@@ -988,13 +987,15 @@ mod tests {
                 }
             }
         } else {
-            sys_accept(server, None, None, SockFlags::empty()).expect("Failed to accept connection")
+            task.sys_accept(server, None, None, SockFlags::empty())
+                .expect("Failed to accept connection")
         };
         let client_fd = i32::try_from(client_fd).unwrap();
         match option {
             "sendto" => {
                 let ptr = ConstPtr::from_usize(buf.as_ptr().expose_provenance());
-                let n = sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None)
+                let n = task
+                    .sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None)
                     .expect("Failed to send data");
                 assert_eq!(n, buf.len());
                 let output = child.wait_with_output().expect("Failed to wait for client");
@@ -1007,18 +1008,19 @@ mod tests {
                 }
                 let mut recv_buf = [0u8; 48];
                 let recv_ptr = crate::MutPtr::from_usize(recv_buf.as_mut_ptr() as usize);
-                let n = sys_recvfrom(
-                    client_fd,
-                    recv_ptr,
-                    recv_buf.len(),
-                    if test_trunc {
-                        ReceiveFlags::TRUNC
-                    } else {
-                        ReceiveFlags::empty()
-                    },
-                    None,
-                )
-                .expect("Failed to receive data");
+                let n = task
+                    .sys_recvfrom(
+                        client_fd,
+                        recv_ptr,
+                        recv_buf.len(),
+                        if test_trunc {
+                            ReceiveFlags::TRUNC
+                        } else {
+                            ReceiveFlags::empty()
+                        },
+                        None,
+                    )
+                    .expect("Failed to receive data");
                 if test_trunc {
                     assert!(recv_buf.iter().all(|&b| b == 0)); // buf remains unchanged
                 } else {
@@ -1030,8 +1032,10 @@ mod tests {
             _ => panic!("Unknown option"),
         }
 
-        sys_close(client_fd).expect("Failed to close client socket");
-        sys_close(server).expect("Failed to close server socket");
+        task.sys_close(client_fd)
+            .expect("Failed to close client socket");
+        task.sys_close(server)
+            .expect("Failed to close server socket");
     }
 
     fn test_tcp_socket_with_external_client(
@@ -1040,8 +1044,8 @@ mod tests {
         test_trunc: bool,
         option: &str,
     ) {
-        crate::syscalls::tests::init_platform(Some("tun99"));
-        test_tcp_socket(TUN_IP_ADDR, port, is_nonblocking, test_trunc, option);
+        let task = crate::syscalls::tests::init_platform(Some("tun99"));
+        test_tcp_socket(&task, TUN_IP_ADDR, port, is_nonblocking, test_trunc, option);
     }
 
     #[test]
@@ -1065,22 +1069,24 @@ mod tests {
     }
 
     fn blocking_udp_server_socket(test_trunc: bool) {
-        crate::syscalls::tests::init_platform(Some("tun99"));
+        let task = crate::syscalls::tests::init_platform(Some("tun99"));
 
         // Server socket and bind
-        let server_fd = sys_socket(
-            AddressFamily::INET,
-            SockType::Datagram,
-            SockFlags::empty(),
-            Some(litebox_common_linux::Protocol::UDP),
-        )
-        .expect("failed to create server socket");
+        let server_fd = task
+            .sys_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::empty(),
+                Some(litebox_common_linux::Protocol::UDP),
+            )
+            .expect("failed to create server socket");
         let server_fd = i32::try_from(server_fd).unwrap();
         let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
             core::net::Ipv4Addr::from(TUN_IP_ADDR),
             SERVER_PORT,
         )));
-        sys_bind(server_fd, server_addr.clone()).expect("failed to bind server");
+        task.sys_bind(server_fd, server_addr.clone())
+            .expect("failed to bind server");
 
         let msg = "Hello from client";
         let mut child = std::process::Command::new("nc")
@@ -1115,18 +1121,19 @@ mod tests {
         if test_trunc {
             recv_flags.insert(ReceiveFlags::TRUNC);
         }
-        let n = sys_recvfrom(
-            server_fd,
-            recv_ptr,
-            if test_trunc {
-                8 // intentionally small size to test truncation
-            } else {
-                recv_buf.len()
-            },
-            recv_flags,
-            Some(&mut sender_addr),
-        )
-        .expect("recvfrom failed");
+        let n = task
+            .sys_recvfrom(
+                server_fd,
+                recv_ptr,
+                if test_trunc {
+                    8 // intentionally small size to test truncation
+                } else {
+                    recv_buf.len()
+                },
+                recv_flags,
+                Some(&mut sender_addr),
+            )
+            .expect("recvfrom failed");
         if test_trunc {
             assert_eq!(n, msg.len()); // return the actual length of the datagram rather than the received length
             assert_eq!(recv_buf[..8], msg.as_bytes()[..8]); // only part of the message is received
@@ -1137,7 +1144,7 @@ mod tests {
         let SocketAddress::Inet(sender_addr) = sender_addr.unwrap();
         assert_eq!(sender_addr.port(), CLIENT_PORT);
 
-        sys_close(server_fd).expect("failed to close server");
+        task.sys_close(server_fd).expect("failed to close server");
 
         child.wait().expect("Failed to wait for client");
     }
@@ -1156,16 +1163,17 @@ mod tests {
     fn test_tun_udp_client_socket_without_server() {
         // We do not support loopback yet, so this test only checks that
         // the client can send packets without a server.
-        crate::syscalls::tests::init_platform(Some("tun99"));
+        let task = crate::syscalls::tests::init_platform(Some("tun99"));
 
         // Client socket and explicit bind
-        let client_fd = sys_socket(
-            AddressFamily::INET,
-            SockType::Datagram,
-            SockFlags::empty(),
-            Some(litebox_common_linux::Protocol::UDP),
-        )
-        .expect("failed to create client socket");
+        let client_fd = task
+            .sys_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::empty(),
+                Some(litebox_common_linux::Protocol::UDP),
+            )
+            .expect("failed to create client socket");
         let client_fd = i32::try_from(client_fd).unwrap();
 
         let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
@@ -1176,7 +1184,7 @@ mod tests {
         // Send from client to server
         let msg = "Hello without connect()";
         let msg_ptr = ConstPtr::from_usize(msg.as_ptr().expose_provenance());
-        sys_sendto(
+        task.sys_sendto(
             client_fd,
             msg_ptr,
             msg.len(),
@@ -1186,18 +1194,19 @@ mod tests {
         .expect("failed to sendto");
 
         // Client implicitly bound to an ephemeral port via sendto
-        let client_addr = sys_getsockname(client_fd).expect("getsockname failed");
+        let client_addr = task.sys_getsockname(client_fd).expect("getsockname failed");
         assert_ne!(client_addr.port(), 0);
 
         // Client connects to server address
-        sys_connect(client_fd, server_addr.clone()).expect("failed to connect");
+        task.sys_connect(client_fd, server_addr.clone())
+            .expect("failed to connect");
 
         // Now client can send without specifying addr
         let msg = "Hello with connect()";
         let msg_ptr = ConstPtr::from_usize(msg.as_ptr().expose_provenance());
-        sys_sendto(client_fd, msg_ptr, msg.len(), SendFlags::empty(), None)
+        task.sys_sendto(client_fd, msg_ptr, msg.len(), SendFlags::empty(), None)
             .expect("failed to sendto");
 
-        sys_close(client_fd).expect("failed to close client");
+        task.sys_close(client_fd).expect("failed to close client");
     }
 }

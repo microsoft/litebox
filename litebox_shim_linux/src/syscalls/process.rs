@@ -1125,20 +1125,20 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_arch_prctl() {
-        use super::sys_arch_prctl;
         use crate::{MutPtr, syscalls::tests::init_platform};
         use core::mem::MaybeUninit;
         use litebox::platform::RawConstPointer;
         use litebox_common_linux::ArchPrctlArg;
 
-        init_platform(None);
+        let task = init_platform(None);
 
         // Save old FS base
         let mut old_fs_base = MaybeUninit::<usize>::uninit();
         let ptr = MutPtr {
             inner: old_fs_base.as_mut_ptr(),
         };
-        sys_arch_prctl(ArchPrctlArg::GetFs(ptr)).expect("Failed to get FS base");
+        task.sys_arch_prctl(ArchPrctlArg::GetFs(ptr))
+            .expect("Failed to get FS base");
         let old_fs_base = unsafe { old_fs_base.assume_init() };
 
         // Set new FS base
@@ -1146,27 +1146,30 @@ mod tests {
         let ptr = crate::MutPtr {
             inner: new_fs_base.as_mut_ptr(),
         };
-        sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize())).expect("Failed to set FS base");
+        task.sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize()))
+            .expect("Failed to set FS base");
 
         // Verify new FS base
         let mut current_fs_base = MaybeUninit::<usize>::uninit();
         let ptr = MutPtr {
             inner: current_fs_base.as_mut_ptr(),
         };
-        sys_arch_prctl(ArchPrctlArg::GetFs(ptr)).expect("Failed to get FS base");
+        task.sys_arch_prctl(ArchPrctlArg::GetFs(ptr))
+            .expect("Failed to get FS base");
         let current_fs_base = unsafe { current_fs_base.assume_init() };
         assert_eq!(current_fs_base, new_fs_base.as_ptr() as usize);
 
         // Restore old FS base
         let ptr: crate::MutPtr<u8> = crate::MutPtr::from_usize(old_fs_base);
-        sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize())).expect("Failed to restore FS base");
+        task.sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize()))
+            .expect("Failed to restore FS base");
     }
 
     #[test]
     fn test_sched_getaffinity() {
-        crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform(None);
 
-        let cpuset = super::sys_sched_getaffinity(None);
+        let cpuset = task.sys_sched_getaffinity(None);
         assert_eq!(cpuset.bits.len(), super::NR_CPUS);
         cpuset.bits.iter().for_each(|b| assert!(*b));
         let ones: usize = cpuset
@@ -1179,7 +1182,7 @@ mod tests {
 
     #[test]
     fn test_prctl_set_get_name() {
-        crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform(None);
 
         // Prepare a null-terminated name to set
         let name: &[u8] = b"litebox-test\0";
@@ -1188,7 +1191,7 @@ mod tests {
         let set_ptr = crate::ConstPtr {
             inner: name.as_ptr(),
         };
-        super::sys_prctl(litebox_common_linux::PrctlArg::SetName(set_ptr))
+        task.sys_prctl(litebox_common_linux::PrctlArg::SetName(set_ptr))
             .expect("sys_prctl SetName failed");
 
         // Prepare buffer for prctl(PR_GET_NAME, get_buf)
@@ -1197,7 +1200,7 @@ mod tests {
             inner: get_buf.as_mut_ptr(),
         };
 
-        super::sys_prctl(litebox_common_linux::PrctlArg::GetName(get_ptr))
+        task.sys_prctl(litebox_common_linux::PrctlArg::GetName(get_ptr))
             .expect("sys_prctl GetName failed");
         assert_eq!(
             &get_buf[..name.len()],
@@ -1210,7 +1213,7 @@ mod tests {
         let long_name_ptr = crate::ConstPtr {
             inner: long_name.as_ptr(),
         };
-        super::sys_prctl(litebox_common_linux::PrctlArg::SetName(long_name_ptr))
+        task.sys_prctl(litebox_common_linux::PrctlArg::SetName(long_name_ptr))
             .expect("sys_prctl SetName failed");
 
         // Get the name again
@@ -1218,7 +1221,7 @@ mod tests {
         let get_ptr = crate::MutPtr {
             inner: get_buf.as_mut_ptr(),
         };
-        super::sys_prctl(litebox_common_linux::PrctlArg::GetName(get_ptr))
+        task.sys_prctl(litebox_common_linux::PrctlArg::GetName(get_ptr))
             .expect("sys_prctl GetName failed");
         assert_eq!(
             get_buf[litebox_common_linux::TASK_COMM_LEN - 1],
