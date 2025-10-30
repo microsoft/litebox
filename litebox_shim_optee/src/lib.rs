@@ -50,12 +50,31 @@ pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE>
 type ConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
+pub struct OpteeShim;
+
+impl litebox::shim::EnterShim for OpteeShim {
+    type ExecutionContext = litebox_common_linux::PtRegs;
+    type ContinueOperation = ContinueOperation;
+
+    fn syscall(&self, ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation {
+        handle_syscall_request(ctx)
+    }
+
+    fn exception(
+        &self,
+        _ctx: &mut Self::ExecutionContext,
+        _info: &litebox::shim::ExceptionInfo,
+    ) -> Self::ContinueOperation {
+        todo!("terminate the optee process on exception")
+    }
+}
+
 /// Handle OP-TEE syscalls
 ///
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-pub fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
+fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
     let request = match SyscallRequest::<Platform>::try_from_raw(ctx.orig_rax, ctx) {
         Ok(request) => request,
         Err(err) => {

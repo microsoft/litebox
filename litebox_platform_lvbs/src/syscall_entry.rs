@@ -50,8 +50,12 @@ cfg_if::cfg_if! {
     }
 }
 
-pub type SyscallHandler = fn(&mut litebox_common_linux::PtRegs) -> SyscallReturnType;
-static SYSCALL_HANDLER: spin::Once<SyscallHandler> = spin::Once::new();
+static SHIM: spin::Once<
+    &'static dyn litebox::shim::EnterShim<
+        ExecutionContext = PtRegs,
+        ContinueOperation = ContinueOperation,
+    >,
+> = spin::Once::new();
 
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug)]
@@ -144,9 +148,7 @@ impl SyscallContextRaw {
 #[allow(clippy::similar_names)]
 #[allow(unreachable_code)]
 fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> usize {
-    let syscall_handler: SyscallHandler = *SYSCALL_HANDLER
-        .get()
-        .expect("Syscall handler should be initialized");
+    let &shim = SHIM.get().expect("Shim should be initialized");
 
     debug_serial_println!("sysnr = {:#x}, ctx_raw = {:#x}", sysnr, ctx_raw as usize);
     let ctx_raw = unsafe { &*ctx_raw };
@@ -168,7 +170,7 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> usize {
     let mut ctx = ctx_raw.to_pt_regs(sysnr);
 
     // call the syscall handler passed down from the shim
-    let sysret = match syscall_handler(&mut ctx) {
+    let sysret = match shim.syscall(&mut ctx) {
         ContinueOperation::ResumeGuest => ctx.rax,
         ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
             cfg_if::cfg_if! {
@@ -253,8 +255,13 @@ const STACK_ALIGNMENT: isize = -16;
 /// # Panics
 /// Panics if GDT is not initialized for the current core.
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn init(syscall_handler: SyscallHandler) {
-    SYSCALL_HANDLER.call_once(|| syscall_handler);
+pub(crate) fn init(
+    shim: &'static dyn litebox::shim::EnterShim<
+        ExecutionContext = PtRegs,
+        ContinueOperation = ContinueOperation,
+    >,
+) {
+    SHIM.call_once(|| shim);
 
     // enable 64-bit syscall/sysret
     let mut efer = Efer::read();

@@ -212,7 +212,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox_shim_linux::default_fs(in_mem, tar_ro)
     };
     litebox_shim_linux::set_fs(initial_file_system);
-    platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
+    platform.register_shim(&litebox_shim_linux::LinuxShim);
 
     let argv = cli_args
         .program_and_arguments

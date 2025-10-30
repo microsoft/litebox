@@ -45,7 +45,7 @@ fn init_platform(
         install_file(data, each);
     }
 
-    platform.register_syscall_handler(litebox_shim_linux::handle_syscall_request);
+    platform.register_shim(&litebox_shim_linux::LinuxShim);
 
     if enable_syscall_interception {
         platform.enable_seccomp_based_syscall_interception();

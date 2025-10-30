@@ -14,6 +14,7 @@ use std::os::raw::c_void;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::{ImmediatelyWokenUp, RawMutPointer};
+use litebox::shim::Exception;
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{ContinueOperation, PunchthroughSyscall};
 
@@ -22,7 +23,7 @@ use windows_sys::Win32::{
     Foundation::GetLastError,
     System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
-        EXCEPTION_POINTERS,
+        EXCEPTION_POINTERS, EXCEPTION_RECORD,
     },
     System::Memory::{
         self as Win32_Memory, PrefetchVirtualMemory, VirtualAlloc2, VirtualFree, VirtualProtect,
@@ -40,12 +41,13 @@ thread_local! {
     static THREAD_FS_BASE: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Connector to a shim-exposed syscall-handling interface.
-pub type SyscallHandler =
-    fn(&mut litebox_common_linux::PtRegs) -> litebox_common_linux::ContinueOperation;
-
-/// The syscall handler passed down from the shim.
-static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
+/// The registered shim.
+static SHIM: std::sync::OnceLock<
+    &'static dyn litebox::shim::EnterShim<
+        ExecutionContext = litebox_common_linux::PtRegs,
+        ContinueOperation = ContinueOperation,
+    >,
+> = std::sync::OnceLock::new();
 
 /// The userland Windows platform.
 ///
@@ -95,25 +97,105 @@ impl WindowsUserland {
     }
 }
 
-unsafe extern "system" fn exception_handler(exception_info: *mut EXCEPTION_POINTERS) -> i32 {
-    unsafe {
-        let info = *exception_info;
-        let exception_record = *info.ExceptionRecord;
-        if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION {
-            let current_fsbase = litebox_common_linux::rdfsbase();
-
-            // Get the saved FS base from the per-thread FS state
-            let target_fsbase = WindowsUserland::get_thread_fs_base();
-
-            if current_fsbase == 0 && current_fsbase != target_fsbase {
-                // Restore the FS base from the saved state
-                WindowsUserland::restore_thread_fs_base();
-
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
-        }
-        EXCEPTION_CONTINUE_SEARCH
+unsafe extern "system" fn vectored_exception_handler(
+    exception_info: *mut EXCEPTION_POINTERS,
+) -> i32 {
+    let tls_index = TLS_INDEX.load(std::sync::atomic::Ordering::Relaxed);
+    if tls_index == u32::MAX {
+        // TLS slot not initialized yet; cannot be in guest
+        return EXCEPTION_CONTINUE_SEARCH;
     }
+    let tls = unsafe {
+        &*windows_sys::Win32::System::Threading::TlsGetValue(tls_index).cast::<TlsState>()
+    };
+    // Only handle exceptions that happen inside the guest.
+    if !tls.is_in_guest.get() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    tls.is_in_guest.set(false);
+    let (info, exception_record, context, regs);
+    unsafe {
+        info = *exception_info;
+        exception_record = &*info.ExceptionRecord;
+        context = &mut *info.ContextRecord;
+        regs = &mut *tls.guest_context_top.get().wrapping_sub(1);
+    }
+
+    // Special case for fixing up FS base if it was cleared.
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+        && unsafe { litebox_common_linux::rdfsbase() } == 0
+    {
+        // Restore the FS base from the saved state and try again.
+        let target_fsbase = WindowsUserland::get_thread_fs_base();
+        if target_fsbase != 0 {
+            WindowsUserland::restore_thread_fs_base();
+            tls.is_in_guest.set(true);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    // Save the guest context.
+    let litebox_common_linux::PtRegs {
+        r15,
+        r14,
+        r13,
+        r12,
+        rbp,
+        rbx,
+        r11,
+        r10,
+        r9,
+        r8,
+        rax,
+        rcx,
+        rdx,
+        rsi,
+        rdi,
+        orig_rax,
+        rip,
+        cs: _,
+        eflags,
+        rsp,
+        ss: _,
+    } = regs;
+    *r15 = context.R15.truncate();
+    *r14 = context.R14.truncate();
+    *r13 = context.R13.truncate();
+    *r12 = context.R12.truncate();
+    *rbp = context.Rbp.truncate();
+    *rbx = context.Rbx.truncate();
+    *r11 = context.R11.truncate();
+    *r10 = context.R10.truncate();
+    *r9 = context.R9.truncate();
+    *r8 = context.R8.truncate();
+    *rax = context.Rax.truncate();
+    *rcx = context.Rcx.truncate();
+    *rdx = context.Rdx.truncate();
+    *rsi = context.Rsi.truncate();
+    *rdi = context.Rdi.truncate();
+    *orig_rax = context.Rax.truncate();
+    *rip = context.Rip.truncate();
+    *eflags = context.EFlags as usize;
+    *rsp = context.Rsp.truncate();
+
+    // Push the exception record onto the host stack.
+    let exception_record_ptr = tls.host_sp.get().cast::<EXCEPTION_RECORD>().wrapping_sub(1);
+    assert!(exception_record_ptr.is_aligned());
+    unsafe { exception_record_ptr.write(*exception_record) };
+
+    // Re-align the stack pointer.
+    let rsp = exception_record_ptr as usize & !15;
+
+    // Ensure that `run_thread` is linked in so that `exception_callback` is visible.
+    let _ = run_thread as usize;
+
+    // Update the thread context to jump to the exception handler.
+    context.Rip = exception_callback as usize as u64;
+    context.Rsp = rsp as u64;
+    context.Rbp = tls.host_bp.get() as u64;
+    context.Rcx = core::ptr::from_mut(regs) as u64;
+    context.Rdx = exception_record_ptr as u64;
+
+    EXCEPTION_CONTINUE_EXECUTION
 }
 
 impl WindowsUserland {
@@ -153,23 +235,27 @@ impl WindowsUserland {
         // Windows sets FS_BASE to 0 regularly upon scheduling; we register an exception handler
         // to set FS_BASE back to a "stored" value whenever we notice that it has become 0.
         unsafe {
-            let _ = AddVectoredExceptionHandler(0, Some(exception_handler));
+            let _ = AddVectoredExceptionHandler(0, Some(vectored_exception_handler));
         }
 
         Box::leak(Box::new(platform))
     }
 
-    /// Register the syscall handler (provided by the Linux shim)
+    /// Register the shim to be used by this platform.
     ///
     /// # Panics
     ///
     /// Panics if the function has already been invoked earlier.
-    pub fn register_syscall_handler(&self, syscall_handler: SyscallHandler) {
-        let old = SYSCALL_HANDLER.write().unwrap().replace(syscall_handler);
-        assert!(
-            old.is_none(),
-            "Should not register more than one syscall_handler"
-        );
+    pub fn register_shim(
+        &self,
+        shim: &'static dyn litebox::shim::EnterShim<
+            ExecutionContext = litebox_common_linux::PtRegs,
+            ContinueOperation = ContinueOperation,
+        >,
+    ) {
+        SHIM.set(shim)
+            .ok()
+            .expect("Should not register more than one shim");
     }
 
     fn read_memory_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
@@ -268,10 +354,33 @@ pub unsafe fn run_thread(ctx: &mut litebox_common_linux::PtRegs) {
         );
         TLS_INDEX.store(index, std::sync::atomic::Ordering::Relaxed);
     });
-    unsafe { run_thread_inner(ctx) }
+    let tls_index = TLS_INDEX.load(std::sync::atomic::Ordering::Relaxed);
+    let tls_state = TlsState {
+        host_sp: Cell::new(core::ptr::null_mut()),
+        host_bp: Cell::new(core::ptr::null_mut()),
+        guest_context_top: std::ptr::from_mut(ctx).wrapping_add(1).into(),
+        scratch: 0.into(),
+        is_in_guest: false.into(),
+    };
+    unsafe {
+        windows_sys::Win32::System::Threading::TlsSetValue(
+            tls_index,
+            core::ptr::from_ref(&tls_state).cast(),
+        );
+        run_thread_inner(ctx, &tls_state);
+        windows_sys::Win32::System::Threading::TlsSetValue(tls_index, core::ptr::null());
+    }
 }
 
 static TLS_INDEX: AtomicU32 = AtomicU32::new(u32::MAX);
+
+struct TlsState {
+    host_sp: Cell<*mut u128>,
+    host_bp: Cell<*mut u128>,
+    guest_context_top: Cell<*mut litebox_common_linux::PtRegs>,
+    scratch: Cell<usize>,
+    is_in_guest: Cell<bool>,
+}
 
 /// Runs the guest thread until it terminates.
 ///
@@ -285,7 +394,10 @@ static TLS_INDEX: AtomicU32 = AtomicU32::new(u32::MAX);
 /// non-volatile register state.
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
-unsafe extern "C-unwind" fn run_thread_inner(ctx: &mut litebox_common_linux::PtRegs) {
+unsafe extern "C-unwind" fn run_thread_inner(
+    ctx: &mut litebox_common_linux::PtRegs,
+    tls_state: &TlsState,
+) {
     core::arch::naked_asm!(
     "
     .seh_proc run_thread
@@ -335,24 +447,9 @@ unsafe extern "C-unwind" fn run_thread_inner(ctx: &mut litebox_common_linux::PtR
     // Offset into the TEB (gs segment) where TLS slots are stored.
     .equ TEB_TLS_SLOTS_OFFSET, 5248
 
-    // Offsets within our TLS space on the stack.
-    .equ HOST_SP, 0
-    .equ HOST_BP, 8
-    .equ GUEST_CONTEXT_TOP, 16
-    .equ SCRATCH, 24
-    .equ TLS_SIZE, 32
-
-    // Save space on the stack for the TLS data and store the pointer to it in
-    // the TLS slot.
-    sub     rsp, TLS_SIZE
-    mov     r9d, DWORD PTR [rip + {TLS_INDEX}]
-    mov     QWORD PTR gs:[r9 * 8 + TEB_TLS_SLOTS_OFFSET], rsp
-
-    // Save the host rsp and rbp and guest context top.
-    mov     QWORD PTR [rsp + HOST_SP], rsp
-    mov     QWORD PTR [rsp + HOST_BP], rbp
-    lea     rax, [rcx + {GUEST_CONTEXT_SIZE}]
-    mov     QWORD PTR [rsp + GUEST_CONTEXT_TOP], rax
+    // Save the host rsp and rbp into the TLS state.
+    mov     QWORD PTR [rdx + {HOST_SP}], rsp
+    mov     QWORD PTR [rdx + {HOST_BP}], rbp
 
     // Switch to the guest context. When the guest issues a syscall, it will
     // jump back into the middle of this function, at `syscall_callback`.
@@ -366,17 +463,18 @@ unsafe extern "C-unwind" fn run_thread_inner(ctx: &mut litebox_common_linux::PtR
     // return address in rcx. r11 is an available scratch register (it would
     // contain rflags if the syscall instruction had actually been issued).
 syscall_callback:
-    // Get the TLS base from the TLS slot.
+    // Get the TLS state from the TLS slot and clear the in-guest flag.
     mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
     mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
+    mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
     // Set rsp to the top of the guest context.
-    mov     QWORD PTR [r11 + SCRATCH], rsp
-    mov     rsp, QWORD PTR [r11 + GUEST_CONTEXT_TOP]
+    mov     QWORD PTR [r11 + {SCRATCH}], rsp
+    mov     rsp, QWORD PTR [r11 + {GUEST_CONTEXT_TOP}]
 
     // TODO: save float and vector registers (xsave or fxsave)
     // Save caller-saved registers
     push    0x2b       // pt_regs->ss = __USER_DS
-    push    QWORD PTR [r11 + SCRATCH] // pt_regs->sp
+    push    QWORD PTR [r11 + {SCRATCH}] // pt_regs->sp
     pushfq             // pt_regs->eflags
     push    0x33       // pt_regs->cs = __USER_CS
     push    rcx        // pt_regs->ip
@@ -402,17 +500,21 @@ syscall_callback:
     mov     rcx, rsp
 
     /// Reestablish the stack and frame pointers.
-    mov     rsp, [r11 + HOST_SP]
-    mov     rbp, [r11 + HOST_BP]
+    mov     rsp, [r11 + {HOST_SP}]
+    mov     rbp, [r11 + {HOST_BP}]
 
     // Handle the syscall. This will jump back to the guest but
     // will return if the thread is exiting.
     call {syscall_handler}
+    jmp .Ldone
 
-    // The thread is exiting. Zero the TLS slot to avoid dangling pointers.
-    mov     r9d, DWORD PTR [rip + {TLS_INDEX}]
-    mov     QWORD PTR gs:[r9 * 8 + TEB_TLS_SLOTS_OFFSET], 0
+exception_callback:
+    // Handle the exception. The stack and frame pointers are already restored,
+    // and the guest context is up to date. rcx contains a pointer to the
+    // guest pt_regs, and rdx contains a pointer to the exception record.
+    call {exception_handler}
 
+.Ldone:
     // Restore non-volatile registers and return.
     lea  rsp, [rbp - (168 + 56)]
     movdqa xmm6, [rsp + 0*16]
@@ -438,9 +540,14 @@ syscall_callback:
     .seh_endproc
     ",
     syscall_handler = sym syscall_handler,
+    exception_handler = sym exception_handler,
     switch_to_guest = sym switch_to_guest,
     TLS_INDEX = sym TLS_INDEX,
-    GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
+    HOST_SP = const core::mem::offset_of!(TlsState, host_sp),
+    HOST_BP = const core::mem::offset_of!(TlsState, host_bp),
+    GUEST_CONTEXT_TOP = const core::mem::offset_of!(TlsState, guest_context_top),
+    SCRATCH = const core::mem::offset_of!(TlsState, scratch),
+    IS_IN_GUEST = const core::mem::offset_of!(TlsState, is_in_guest),
     );
 }
 
@@ -455,6 +562,15 @@ syscall_callback:
 /// destructors.
 ///
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
+    let tls = unsafe {
+        &*windows_sys::Win32::System::Threading::TlsGetValue(
+            TLS_INDEX.load(core::sync::atomic::Ordering::Relaxed),
+        )
+        .cast::<TlsState>()
+    };
+    assert!(!tls.is_in_guest.get());
+    tls.is_in_guest.set(true);
+
     // The fast path for switching to the guest relies on rcx == rip. This is
     // the common case, because the syscall instruction sets rcx to rip at entry
     // to the kernel. When this is not the case, we use NtContinue to jump to
@@ -463,7 +579,6 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     // This is much slower, but it is only used for things like signal handlers,
     // so it should not be on the critical path.
     if ctx.rcx != ctx.rip {
-        #[cfg(true)]
         unsafe {
             use litebox::utils::ReinterpretSignedExt;
             use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -539,7 +654,7 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 }
 
 fn thread_start(
-    init_thread: Box<dyn litebox::platform::InitThread>,
+    init_thread: Box<dyn litebox::shim::InitThread>,
     mut ctx: litebox_common_linux::PtRegs,
 ) {
     // Allow caller to run some code before we return to the new thread.
@@ -555,7 +670,7 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
     unsafe fn spawn_thread(
         &self,
         ctx: &litebox_common_linux::PtRegs,
-        init_thread: Box<dyn litebox::platform::InitThread>,
+        init_thread: Box<dyn litebox::shim::InitThread>,
     ) -> Result<(), Self::ThreadSpawnError> {
         let ctx = *ctx;
         // TODO: do we need to wait for the handle in the main thread?
@@ -1263,6 +1378,7 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
 unsafe extern "C" {
     // Defined in asm blocks above
     fn syscall_callback() -> isize;
+    fn exception_callback() -> isize;
 }
 
 /// Windows syscall handler (placeholder - needs Windows implementation)
@@ -1276,19 +1392,49 @@ unsafe extern "C" {
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
 unsafe extern "C-unwind" fn syscall_handler(ctx: &mut litebox_common_linux::PtRegs) {
-    let syscall_handler: SyscallHandler = SYSCALL_HANDLER
-        .read()
-        .unwrap()
-        .expect("Should have run `register_syscall_handler` by now");
-    let resume = match syscall_handler(ctx) {
-        ContinueOperation::ResumeGuest => true,
+    let &shim = SHIM.get().expect("Should have run `register_shim` by now");
+    continue_operation(shim.syscall(ctx), ctx);
+}
+
+unsafe extern "C-unwind" fn exception_handler(
+    ctx: &mut litebox_common_linux::PtRegs,
+    exception_record: &EXCEPTION_RECORD,
+) {
+    let (exception, error_code, cr2) = match exception_record.ExceptionCode {
+        Win32_Foundation::EXCEPTION_ACCESS_VIOLATION => {
+            let info = exception_record.ExceptionInformation;
+            let read_write_flag = info[0];
+            let faulting_address = info[1];
+            if read_write_flag == 0 && faulting_address == !0 {
+                // This is probably a #GP, not a #PF.
+                (Exception::GENERAL_PROTECTION_FAULT, 0, 0)
+            } else {
+                let error_code = 4 | if read_write_flag == 0 { 0 } else { 1 << 1 }; // PF error code: bit 1 = write
+                (Exception::PAGE_FAULT, error_code, faulting_address)
+            }
+        }
+        Win32_Foundation::EXCEPTION_ILLEGAL_INSTRUCTION => (Exception::INVALID_OPCODE, 0, 0),
+        Win32_Foundation::EXCEPTION_BREAKPOINT => (Exception::BREAKPOINT, 0, 0),
+        Win32_Foundation::EXCEPTION_INT_DIVIDE_BY_ZERO => (Exception::DIVIDE_ERROR, 0, 0),
+        code => panic!("Unhandled Win32 exception code: {:#x}", code),
+    };
+
+    let info = litebox::shim::ExceptionInfo {
+        exception,
+        error_code,
+        cr2,
+    };
+
+    let &shim = SHIM.get().expect("Should have run `register_shim` by now");
+    continue_operation(shim.exception(ctx, &info), ctx);
+}
+
+fn continue_operation(op: ContinueOperation, ctx: &mut litebox_common_linux::PtRegs) {
+    match op {
+        ContinueOperation::ResumeGuest => unsafe { switch_to_guest(ctx) },
         ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
             ctx.rax = status.reinterpret_as_unsigned() as usize;
-            false
         }
-    };
-    if resume {
-        unsafe { switch_to_guest(ctx) };
     }
 }
 

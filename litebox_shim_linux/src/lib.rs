@@ -55,6 +55,25 @@ type UserMutPointer<T> = <Platform as litebox::platform::RawPointerProvider>::Ra
 static BOOT_TIME: once_cell::race::OnceBox<<Platform as litebox::platform::TimeProvider>::Instant> =
     once_cell::race::OnceBox::new();
 
+pub struct LinuxShim;
+
+impl litebox::shim::EnterShim for LinuxShim {
+    type ExecutionContext = litebox_common_linux::PtRegs;
+    type ContinueOperation = ContinueOperation;
+
+    fn syscall(&self, ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation {
+        handle_syscall_request(ctx)
+    }
+
+    fn exception(
+        &self,
+        ctx: &mut Self::ExecutionContext,
+        info: &litebox::shim::ExceptionInfo,
+    ) -> Self::ContinueOperation {
+        panic!("Unhandled exception: {info:#x?}");
+    }
+}
+
 /// Get the `Instant` representing the boot time of the platform.
 ///
 /// # Panics
@@ -450,7 +469,7 @@ fn pread_with_user_buf(
 /// # Panics
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-pub fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
+fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
     fn set_return(ctx: &mut litebox_common_linux::PtRegs, value: usize) {
         #[cfg(target_arch = "x86")]
         {

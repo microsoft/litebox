@@ -32,11 +32,13 @@ cfg_if::cfg_if! {
         compile_error!(r##"No syscall handler specified."##);
     }
 }
-/// Connector to a shim-exposed syscall-handling interface.
-pub type SyscallHandler = fn(&mut litebox_common_linux::PtRegs) -> SyscallReturnType;
-
 /// The syscall handler passed down from the shim.
-static SYSCALL_HANDLER: std::sync::RwLock<Option<SyscallHandler>> = std::sync::RwLock::new(None);
+static SHIM: std::sync::OnceLock<
+    &'static dyn litebox::shim::EnterShim<
+        ExecutionContext = litebox_common_linux::PtRegs,
+        ContinueOperation = ContinueOperation,
+    >,
+> = const { std::sync::OnceLock::new() };
 
 /// The userland Linux platform.
 ///
@@ -113,6 +115,8 @@ impl LinuxUserland {
     ///
     /// Panics if the tun device could not be successfully opened.
     pub fn new(tun_device_name: Option<&str>) -> &'static Self {
+        register_exception_handlers();
+
         let tun_socket_fd = tun_device_name
             .map(|tun_device_name| {
                 let tun_path = b"/dev/net/tun\0";
@@ -180,12 +184,16 @@ impl LinuxUserland {
     /// # Panics
     ///
     /// Panics if the function has already been invoked earlier.
-    pub fn register_syscall_handler(&self, syscall_handler: SyscallHandler) {
-        let old = SYSCALL_HANDLER.write().unwrap().replace(syscall_handler);
-        assert!(
-            old.is_none(),
-            "Should not register more than one syscall_handler"
-        );
+    pub fn register_shim(
+        &self,
+        shim: &'static dyn litebox::shim::EnterShim<
+            ExecutionContext = litebox_common_linux::PtRegs,
+            ContinueOperation = ContinueOperation,
+        >,
+    ) {
+        SHIM.set(shim)
+            .ok()
+            .expect("Should not register more than one shim");
     }
 
     /// Enable seccomp syscall interception on the platform.
@@ -309,14 +317,14 @@ impl litebox::platform::Provider for LinuxUserland {}
 /// # Safety
 /// The context must be valid guest context.
 pub unsafe fn run_thread(ctx: &mut litebox_common_linux::PtRegs) {
-    unsafe { run_thread_inner(ctx) }
+    with_signal_alt_stack(|| unsafe { run_thread_inner(ctx) });
 }
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     "
     .section .tbss
-    .align 4
+    .align 8
 scratch:
     .quad 0
 host_sp:
@@ -327,6 +335,8 @@ guest_context_top:
     .quad 0
 .globl guest_fsbase
 guest_fsbase:
+    .quad 0
+in_guest:
     .quad 0
     "
 );
@@ -406,10 +416,18 @@ unsafe extern "C-unwind" fn run_thread_inner(ctx: &mut litebox_common_linux::PtR
     // contain rflags if the syscall instruction had actually been issued).
     .globl syscall_callback
 syscall_callback:
+    // Restore host fs base.
+    rdfsbase r11
+    mov      gs:guest_fsbase@tpoff, r11
+    rdgsbase r11
+    wrfsbase r11
+
+    // Clear in_guest flag.
+    mov     BYTE PTR fs:in_guest@tpoff, 0
 
     // Switch to the top of the guest context.
     mov     r11, rsp
-    mov     rsp, gs:guest_context_top@tpoff
+    mov     rsp, fs:guest_context_top@tpoff
 
     // TODO: save float and vector registers (xsave or fxsave)
     // Save caller-saved registers
@@ -440,20 +458,24 @@ syscall_callback:
     mov     rdi, rsp
 
     // Restore the stack and frame pointer.
-    mov     rsp, gs:host_sp@tpoff
-    mov     rbp, gs:host_bp@tpoff
-
-    // Restore host fs base.
-    rdfsbase rdx
-    mov gs:guest_fsbase@tpoff, rdx
-    rdgsbase rdx
-    wrfsbase rdx
+    mov     rsp, fs:host_sp@tpoff
+    mov     rbp, fs:host_bp@tpoff
 
     // Handle the syscall. This will jump back to the guest but
     // will return if the thread is exiting.
     call {syscall_handler}
-
     // This thread is done. Return.
+    jmp .Ldone
+
+exception_callback:
+    // Restore the stack and frame pointer.
+    mov     rsp, fs:host_sp@tpoff
+    mov     rbp, fs:host_bp@tpoff
+
+    call {exception_handler}
+
+.Ldone:
+
     lea  rsp, [rbp - 5*8]
     pop  r15
     pop  r14
@@ -467,6 +489,7 @@ syscall_callback:
 ",
     GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
     syscall_handler = sym syscall_handler,
+    exception_handler = sym exception_handler,
     switch_to_guest = sym switch_to_guest,
     );
 }
@@ -493,6 +516,7 @@ unsafe extern "fastcall-unwind" fn run_thread_inner(ctx: &mut litebox_common_lin
     push ebx
     push esi
     push edi
+    sub esp, 12 // align
 
     // Save host esp and ebp and guest context top in TLS
     mov gs:host_sp@ntpoff, esp
@@ -558,9 +582,6 @@ syscall_callback:
     mov esp, fs:host_sp@ntpoff
     mov ebp, fs:host_bp@ntpoff
 
-    // Align the stack to 16 bytes
-    and esp, -16
-
     // Switch to host gs
     mov ax, fs
     mov gs, ax
@@ -568,6 +589,20 @@ syscall_callback:
     // Handle the syscall. This will jump back to the guest but
     // will return if the thread is exiting.
     call {syscall_handler_fast}
+    jmp .Ldone
+
+exception_callback:
+    // Restore esp and ebp
+    mov esp, gs:host_sp@ntpoff
+    mov ebp, gs:host_bp@ntpoff
+
+    push ecx
+    push edx
+    push esi
+    push edi
+    call {exception_handler}
+
+.Ldone:
 
     lea  esp, [ebp - 3*4]
     pop  edi
@@ -580,6 +615,7 @@ syscall_callback:
 ",
     GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
     syscall_handler_fast = sym syscall_handler_fast,
+    exception_handler = sym exception_handler,
     switch_to_guest = sym switch_to_guest,
         );
 }
@@ -605,6 +641,7 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         core::arch::asm!(
             "mov rsp, {ctx}",
             // Switch to the guest fsbase
+            "mov BYTE PTR fs:in_guest@tpoff, 1",
             "mov rdx, fs:guest_fsbase@tpoff",
             "wrfsbase rdx",
             "pop r15",
@@ -649,6 +686,8 @@ host_bp:
     .long 0
 guest_context_top:
     .long 0
+in_guest:
+    .long 0
     "
 );
 
@@ -657,6 +696,7 @@ unsafe extern "fastcall" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) 
     unsafe {
         core::arch::asm!(
             "mov esp, {ctx}",
+            "mov BYTE PTR gs:in_guest@ntpoff, 1",
             "pop ebx",
             "pop ecx",
             "pop edx",
@@ -679,7 +719,7 @@ unsafe extern "fastcall" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) 
 }
 
 fn thread_start(
-    init_thread: Box<dyn litebox::platform::InitThread>,
+    init_thread: Box<dyn litebox::shim::InitThread>,
     mut ctx: litebox_common_linux::PtRegs,
 ) {
     // Allow caller to run some code before we return to the new thread.
@@ -698,7 +738,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
     unsafe fn spawn_thread(
         &self,
         ctx: &litebox_common_linux::PtRegs,
-        init_thread: Box<dyn litebox::platform::InitThread>,
+        init_thread: Box<dyn litebox::shim::InitThread>,
     ) -> Result<(), Self::ThreadSpawnError> {
         let ctx = *ctx;
         // TODO: do we need to wait for the handle in the main thread?
@@ -1490,6 +1530,7 @@ impl litebox::mm::allocator::MemoryProvider for LinuxUserland {
 unsafe extern "C" {
     // Defined in asm blocks above
     fn syscall_callback() -> isize;
+    fn exception_callback();
 }
 
 /// Handles Linux syscalls and dispatches them to LiteBox implementations.
@@ -1508,12 +1549,32 @@ unsafe extern "C" {
 /// purposes.
 #[allow(clippy::cast_sign_loss)]
 unsafe extern "C-unwind" fn syscall_handler(ctx: &mut litebox_common_linux::PtRegs) {
-    let syscall_handler: SyscallHandler = SYSCALL_HANDLER
-        .read()
-        .unwrap()
-        .expect("Should have run `register_syscall_handler` by now");
-    let resume = match syscall_handler(ctx) {
-        ContinueOperation::ResumeGuest => true,
+    let &shim = SHIM
+        .get()
+        .expect("should have called `register_shim` by now");
+    continue_operation(shim.syscall(ctx), ctx);
+}
+
+extern "C-unwind" fn exception_handler(
+    ctx: &mut litebox_common_linux::PtRegs,
+    trapno: usize,
+    error: usize,
+    cr2: usize,
+) {
+    let info = litebox::shim::ExceptionInfo {
+        exception: litebox::shim::Exception(trapno.try_into().unwrap()),
+        error_code: error.try_into().unwrap(),
+        cr2,
+    };
+    let shim = SHIM
+        .get()
+        .expect("should have called `register_shim` by now");
+    continue_operation(shim.exception(ctx, &info), ctx);
+}
+
+fn continue_operation(op: ContinueOperation, ctx: &mut litebox_common_linux::PtRegs) {
+    match op {
+        ContinueOperation::ResumeGuest => unsafe { switch_to_guest(ctx) },
         ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
             #[cfg(target_arch = "x86_64")]
             {
@@ -1529,11 +1590,7 @@ unsafe extern "C-unwind" fn syscall_handler(ctx: &mut litebox_common_linux::PtRe
             {
                 ctx.eax = status.reinterpret_as_unsigned() as usize;
             }
-            false
         }
-    };
-    if resume {
-        unsafe { switch_to_guest(ctx) };
     }
 }
 
@@ -1572,6 +1629,325 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     fn clear_guest_thread_local_storage(selector: u16) {
         if selector != 0 {
             clear_thread_area(u32::from(selector) >> 3);
+        }
+    }
+}
+
+static mut NEXT_SA: [libc::sigaction; 64] = unsafe { core::mem::zeroed() };
+
+fn register_exception_handlers() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let exception_signals = &[
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGFPE,
+            libc::SIGILL,
+            libc::SIGTRAP,
+        ];
+        for &sig in exception_signals {
+            unsafe {
+                let mut sa: libc::sigaction = core::mem::zeroed();
+                sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+                sa.sa_sigaction = exception_signal_handler as usize;
+                let r = libc::sigaction(
+                    sig,
+                    &raw const sa,
+                    &raw mut NEXT_SA[sig.reinterpret_as_unsigned() as usize],
+                );
+                assert!(
+                    r >= 0,
+                    "failed to register exception handler for signal {}: {}",
+                    sig,
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    });
+}
+
+/// Runs `f` with an alternate signal stack set up.
+fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
+    let alt_stack_size = libc::SIGSTKSZ * 2;
+    let guard_page_size = 0x1000;
+    let stack_base = unsafe {
+        let stack_base = libc::mmap(
+            std::ptr::null_mut(),
+            guard_page_size + alt_stack_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        assert!(
+            stack_base != libc::MAP_FAILED,
+            "failed to allocate memory for alternate signal stack: {}",
+            std::io::Error::last_os_error()
+        );
+        // Set up a guard page to catch stack overflows.
+        let r = libc::mprotect(stack_base, guard_page_size, libc::PROT_NONE);
+        assert!(
+            r == 0,
+            "failed to set guard page for alternate signal stack: {}",
+            std::io::Error::last_os_error()
+        );
+        stack_base
+    };
+    let alt_stack = libc::stack_t {
+        ss_sp: stack_base.cast(),
+        ss_flags: 0,
+        ss_size: alt_stack_size,
+    };
+    let mut oss = libc::stack_t {
+        ss_sp: std::ptr::null_mut(),
+        ss_flags: 0,
+        ss_size: 0,
+    };
+    unsafe {
+        let r = libc::sigaltstack(&raw const alt_stack, &raw mut oss);
+        assert!(
+            r >= 0,
+            "failed to set up alternate signal stack: {}",
+            std::io::Error::last_os_error(),
+        );
+    }
+    let r = f();
+    unsafe {
+        let r = libc::sigaltstack(&raw const oss, std::ptr::null_mut());
+        assert!(
+            r >= 0,
+            "failed to restore original signal stack: {}",
+            std::io::Error::last_os_error()
+        );
+        let r = libc::munmap(stack_base, guard_page_size + alt_stack_size);
+        assert!(
+            r == 0,
+            "failed to free memory for alternate signal stack: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    r
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" fn exception_signal_handler(
+    signum: libc::c_int,
+    info: &mut libc::siginfo_t,
+    context: &mut libc::ucontext_t,
+) {
+    let regs = unsafe {
+        let gsbase: u64;
+        core::arch::asm! {
+            "rdgsbase {}", out(reg) gsbase
+        };
+        let is_in_guest = if gsbase == 0 {
+            false
+        } else {
+            let in_guest: u8;
+            core::arch::asm! {
+                "mov {in_guest}, BYTE PTR gs:in_guest@tpoff",
+                "mov BYTE PTR gs:in_guest@tpoff, 0",
+                in_guest = out(reg_byte) in_guest,
+                options(nostack, preserves_flags)
+            }
+            in_guest != 0
+        };
+        if !is_in_guest {
+            return next_signal_handler(signum, info, context);
+        }
+
+        let guest_context_top: *mut litebox_common_linux::PtRegs;
+        core::arch::asm! {
+            "wrfsbase {gsbase}",
+            "mov {guest_context_top}, fs:guest_context_top@tpoff",
+            gsbase = in(reg) gsbase,
+            guest_context_top = out(reg) guest_context_top,
+            options(nostack, preserves_flags)
+        };
+        &mut *guest_context_top.offset(-1)
+    };
+    let litebox_common_linux::PtRegs {
+        r15,
+        r14,
+        r13,
+        r12,
+        rbp,
+        rbx,
+        r11,
+        r10,
+        r9,
+        r8,
+        rax,
+        rcx,
+        rdx,
+        rsi,
+        rdi,
+        orig_rax,
+        rip,
+        cs: _,
+        eflags,
+        rsp,
+        ss: _,
+    } = regs;
+    let sigctx = &mut context.uc_mcontext;
+    for (reg, sig_reg) in [
+        (r15, libc::REG_R15),
+        (r14, libc::REG_R14),
+        (r13, libc::REG_R13),
+        (r12, libc::REG_R12),
+        (rbp, libc::REG_RBP),
+        (rbx, libc::REG_RBX),
+        (r11, libc::REG_R11),
+        (r10, libc::REG_R10),
+        (r9, libc::REG_R9),
+        (r8, libc::REG_R8),
+        (rax, libc::REG_RAX),
+        (rcx, libc::REG_RCX),
+        (rdx, libc::REG_RDX),
+        (rsi, libc::REG_RSI),
+        (rdi, libc::REG_RDI),
+        (rip, libc::REG_RIP),
+        (rsp, libc::REG_RSP),
+        (eflags, libc::REG_EFL),
+    ] {
+        *reg = sigctx.gregs[sig_reg.reinterpret_as_unsigned() as usize]
+            .reinterpret_as_unsigned()
+            .truncate();
+    }
+    *orig_rax = *rax;
+
+    // Ensure that `run_thread` is linked in so that `exception_callback` is visible.
+    let _ = run_thread as usize;
+
+    // Jump to exception_callback.
+    sigctx.gregs[libc::REG_RIP as usize] =
+        (exception_callback as usize).reinterpret_as_signed() as i64;
+    sigctx.gregs[libc::REG_RDI as usize] = core::ptr::from_mut(regs) as i64;
+    sigctx.gregs[libc::REG_RSI as usize] = sigctx.gregs[libc::REG_TRAPNO as usize];
+    sigctx.gregs[libc::REG_RDX as usize] = sigctx.gregs[libc::REG_ERR as usize];
+    sigctx.gregs[libc::REG_RCX as usize] = sigctx.gregs[libc::REG_CR2 as usize];
+}
+
+#[cfg(target_arch = "x86")]
+unsafe extern "C" fn exception_signal_handler(
+    signum: libc::c_int,
+    info: &mut libc::siginfo_t,
+    context: &mut libc::ucontext_t,
+) {
+    let regs = unsafe {
+        let is_in_guest = if context.uc_mcontext.gregs[libc::REG_FS as usize] == 0 {
+            false
+        } else {
+            let in_guest: u8;
+            core::arch::asm! {
+                "mov {in_guest}, BYTE PTR fs:in_guest@ntpoff",
+                "mov BYTE PTR fs:in_guest@ntpoff, 0",
+                in_guest = out(reg_byte) in_guest,
+                options(nostack, preserves_flags)
+            }
+            in_guest != 0
+        };
+        if !is_in_guest {
+            return next_signal_handler(signum, info, context);
+        }
+
+        let guest_context_top: *mut litebox_common_linux::PtRegs;
+        core::arch::asm! {
+            "mov {guest_context_top}, fs:guest_context_top@ntpoff",
+            guest_context_top = out(reg) guest_context_top,
+            options(nostack, preserves_flags)
+        };
+        &mut *guest_context_top.offset(-1)
+    };
+    let litebox_common_linux::PtRegs {
+        ebx,
+        ecx,
+        edx,
+        esi,
+        edi,
+        ebp,
+        eax,
+        xds,
+        xes,
+        xfs: _,
+        xgs,
+        orig_eax,
+        eip,
+        xcs,
+        eflags,
+        esp,
+        xss,
+    } = regs;
+    let sigctx = &mut context.uc_mcontext;
+    for (reg, sig_reg) in [
+        (ebx, libc::REG_EBX),
+        (ecx, libc::REG_ECX),
+        (edx, libc::REG_EDX),
+        (esi, libc::REG_ESI),
+        (edi, libc::REG_EDI),
+        (ebp, libc::REG_EBP),
+        (eax, libc::REG_EAX),
+        (eip, libc::REG_EIP),
+        (eflags, libc::REG_EFL),
+        (esp, libc::REG_ESP),
+        (xds, libc::REG_DS),
+        (xes, libc::REG_ES),
+        (xgs, libc::REG_GS),
+        (xss, libc::REG_SS),
+        (xcs, libc::REG_CS),
+    ] {
+        *reg = sigctx.gregs[sig_reg.reinterpret_as_unsigned() as usize].reinterpret_as_unsigned()
+            as usize;
+    }
+    *orig_eax = *eax;
+
+    // Ensure that `run_thread` is linked in so that `exception_callback` is visible.
+    let _ = run_thread as usize;
+
+    // Jump to exception_callback.
+    sigctx.gregs[libc::REG_EIP as usize] = (exception_callback as usize)
+        .reinterpret_as_signed()
+        .truncate();
+    sigctx.gregs[libc::REG_GS as usize] = sigctx.gregs[libc::REG_FS as usize];
+    sigctx.gregs[libc::REG_EDI as usize] = core::ptr::from_mut(regs) as i32;
+    sigctx.gregs[libc::REG_ESI as usize] = sigctx.gregs[libc::REG_TRAPNO as usize];
+    sigctx.gregs[libc::REG_EDX as usize] = sigctx.gregs[libc::REG_ERR as usize];
+    sigctx.gregs[libc::REG_ECX as usize] = sigctx.cr2.reinterpret_as_signed();
+}
+
+unsafe fn next_signal_handler(
+    signum: libc::c_int,
+    info: &mut libc::siginfo_t,
+    context: &mut libc::ucontext_t,
+) {
+    unsafe {
+        let next_sa = &NEXT_SA[signum.reinterpret_as_unsigned() as usize];
+        match next_sa.sa_sigaction {
+            libc::SIG_DFL => {
+                // Block this signal and raise.
+                let mut set: libc::sigset_t = core::mem::zeroed();
+                libc::sigemptyset(&raw mut set);
+                libc::sigaddset(&raw mut set, signum);
+                libc::sigprocmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
+                libc::raise(signum);
+                unreachable!()
+            }
+            libc::SIG_IGN => {}
+            _ => {
+                // Call the next handler
+                if next_sa.sa_flags & libc::SA_SIGINFO == 0 {
+                    let handler: extern "C" fn(libc::c_int) =
+                        core::mem::transmute(next_sa.sa_sigaction);
+                    handler(signum);
+                } else {
+                    let handler: extern "C" fn(
+                        libc::c_int,
+                        *mut libc::siginfo_t,
+                        *mut libc::ucontext_t,
+                    ) = core::mem::transmute(next_sa.sa_sigaction);
+                    handler(signum, info, context);
+                }
+            }
         }
     }
 }

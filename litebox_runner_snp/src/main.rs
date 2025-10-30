@@ -8,6 +8,7 @@ mod globals;
 extern crate alloc;
 
 use alloc::borrow::ToOwned;
+use litebox::shim::EnterShim as _;
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::ContinueOperation;
 use litebox_platform_linux_kernel::{HostInterface, host::snp::ghcb::ghcb_prints};
@@ -161,7 +162,7 @@ pub extern "C" fn sandbox_task_exit() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn do_syscall_64(pt_regs: &mut litebox_common_linux::PtRegs) {
-    match litebox_shim_linux::handle_syscall_request(pt_regs) {
+    match litebox_shim_linux::LinuxShim.syscall(pt_regs) {
         ContinueOperation::ResumeGuest => {}
         ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
             pt_regs.rax = status.cast_unsigned() as usize;
