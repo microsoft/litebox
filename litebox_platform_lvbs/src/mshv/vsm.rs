@@ -104,42 +104,18 @@ pub(crate) fn init() {
 }
 
 /// VSM function for enabling VTL of APs
-/// `cpu_present_mask_pfn` indicates the page containing the VTL0's CPU present mask.
-///
-/// # Panics
-/// Panics if hypercall for initializing VTL for APs fails
-pub fn mshv_vsm_enable_aps(cpu_present_mask_pfn: u64) -> Result<i64, Errno> {
-    debug_serial_println!("VSM: Enable VTL of APs");
-    let cpu_present_mask_page_addr =
-        PhysAddr::try_new(cpu_present_mask_pfn << PAGE_SHIFT).map_err(|_| Errno::EINVAL)?;
-
-    if let Some(cpu_mask) =
-        unsafe { crate::platform_low().copy_from_vtl0_phys::<CpuMask>(cpu_present_mask_page_addr) }
-    {
-        let mut error = None;
-
-        // Initialize VTL for each present CPU
-        cpu_mask.for_each_cpu(|cpu_id| {
-            if let Err(e) = init_vtl_ap(cpu_id as u32) {
-                error = Some(e);
-          }
-        });
-
-        if let Some(e) = error {
-            serial_println!("Failed to initialize one or more APs: {:?}", e);
-            return Err(Errno::EINVAL);
-        }
-
-        Ok(0)
-    } else {
-        serial_println!("Failed to get cpu_present_mask");
-        return Err(Errno::EINVAL);
-    }
+/// Not supported in this implementation.
+pub fn mshv_vsm_enable_aps(_cpu_present_mask_pfn: u64) -> Result<i64, Errno> {
+    serial_println!("mshv_vsm_enable_aps() not supported");
+    Ok(0)
 }
 
-/// VSM function for booting APs
+/// VSM function for enabling VTL and booting APs
 /// `cpu_online_mask_pfn` indicates the page containing the VTL0's CPU online mask.
 /// `boot_signal_pfn` indicates the boot signal page to let VTL0 know that VTL1 is ready.
+///
+/// # Panics
+/// Panics if hypercall for initializing VTL for any AP fails
 pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Result<i64, Errno> {
     debug_serial_println!("VSM: Boot APs");
     let cpu_online_mask_page_addr =
@@ -164,12 +140,21 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
             return Err(Errno::EINVAL);
 
         };
-        // TODO: execute `init_vtl_ap` for each online core and update the corresponding boot signal byte.
-        // Currently, we use `init_vtl_aps` to initialize all present cores which
-        // takes a long time if we have a lot of cores.
+
+        let mut error = None;
+
+        // Initialize VTL for each online CPU and update its boot signal byte
         cpu_mask.for_each_cpu(|cpu_id| {
-            boot_signal_page_buf.0[cpu_id] = HV_SECURE_VTL_BOOT_TOKEN;
+            if let Err(e) = init_vtl_ap(cpu_id as u32) {
+                error = Some(e);
+            }
+          boot_signal_page_buf.0[cpu_id] = HV_SECURE_VTL_BOOT_TOKEN;
         });
+
+        if let Some(e) = error {
+            serial_println!("Failed to initialize one or more APs: {:?}", e);
+            return Err(Errno::EINVAL);
+        }
 
         // Store the cpu_online_mask for later use
         CPU_ONLINE_MASK.call_once(|| cpu_mask);
