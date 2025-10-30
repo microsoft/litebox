@@ -365,7 +365,7 @@ impl litebox::shim::InitThread for NewThreadArgs {
             let _ = unsafe { child_tid_ptr.write_at_offset(0, child_tid) };
         }
 
-        // Set the TLS for the platform itself
+        // Set the shim TLS to point to the new task.
         crate::SHIM_TLS.init(crate::LinuxShimTls { current_task: task });
     }
 }
