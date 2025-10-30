@@ -70,22 +70,7 @@ fn run_target_program(
     }
     install_files(tar_dir.join("out"));
 
-    #[cfg(target_arch = "x86_64")]
-    let target = "--target=x86_64-unknown-linux-gnu";
-    #[cfg(target_arch = "x86")]
-    let target = "--target=i686-unknown-linux-gnu";
-
-    // build litebox_runner_linux_userland to get the latest `litebox_rtld_audit.so`
-    let output = std::process::Command::new("cargo")
-        .args(["build", "-p", "litebox_runner_linux_userland", target])
-        .output()
-        .expect("Failed to build litebox_runner_linux_userland");
-    assert!(
-        output.status.success(),
-        "failed to build litebox_runner_linux_userland {:?}",
-        std::str::from_utf8(output.stderr.as_slice()).unwrap()
-    );
-
+    // litebox_rtld_audit.so is already built by build.rs and available in OUT_DIR
     if let Backend::Rewriter = backend
         && !libs.is_empty()
     {
@@ -111,13 +96,12 @@ fn run_target_program(
     assert!(tar_success, "failed to create tar file");
     println!("Tar file ready at: {}", tar_file.to_str().unwrap());
 
+    // Get the path to the litebox_runner_linux_userland binary
+    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
+        .expect("NEXTEST_BIN_EXE_litebox_runner_linux_userland is auto-set by nextest - run tests with `cargo nextest run`, not `cargo test`");
+
     // run litebox_runner_linux_userland with the tar file and the compiled executable
     let mut args = vec![
-        "run",
-        "-p",
-        "litebox_runner_linux_userland",
-        target,
-        "--",
         "--unstable",
         "--interception-backend",
         backend_str,
@@ -133,8 +117,8 @@ fn run_target_program(
     ];
     args.push(path.to_str().unwrap());
     args.extend_from_slice(cmd_args);
-    println!("Running `cargo {}`", args.join(" "));
-    let output = std::process::Command::new("cargo")
+    println!("Running `{} {}`", binary_path, args.join(" "));
+    let output = std::process::Command::new(&binary_path)
         .args(args)
         .output()
         .expect("Failed to run litebox_runner_linux_userland");
