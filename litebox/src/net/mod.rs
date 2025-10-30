@@ -4,7 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
-use crate::event::Events;
+use crate::event::{Events, IOPollable};
 use crate::platform::{Instant, TimeProvider};
 use crate::sync::RawSyncPrimitivesProvider;
 use crate::{LiteBox, platform, sync};
@@ -145,6 +145,128 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> core::ops::DerefMut
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.specific
+    }
+}
+
+struct PollableSocketHandle<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    socket_handle: &'a SocketHandle<Platform>,
+    socket_set: &'a smoltcp::iface::SocketSet<'static>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PollableSocketHandle<'_, Platform> {
+    /// Get the [`Events`] for a socket handle [`SocketHandle`].
+    ///
+    /// If `new_events_only` is true, only events representing meaningful state changes
+    /// since the last check are returned (e.g., new data arrived, socket became writable,
+    /// new connections became acceptable).
+    fn check_socket_events(&self, new_events_only: bool) -> Events {
+        if self.socket_handle.consider_closed {
+            // TODO: update this when we support graceful close
+            return Events::empty();
+        }
+        let mut events = Events::empty();
+        let recv_queue_last = self
+            .socket_handle
+            .recv_queue
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let (recv_queue_now, sendable_now, receivable_now) = match self.socket_handle.protocol() {
+            Protocol::Tcp => {
+                let tcp_socket = self
+                    .socket_set
+                    .get::<tcp::Socket>(self.socket_handle.handle);
+                (
+                    tcp_socket.recv_queue(),
+                    tcp_socket.can_send(),
+                    tcp_socket.can_recv(),
+                )
+            }
+            Protocol::Udp => {
+                let udp_socket = self
+                    .socket_set
+                    .get::<udp::Socket>(self.socket_handle.handle);
+                (
+                    udp_socket.recv_queue(),
+                    udp_socket.can_send(),
+                    udp_socket.can_recv(),
+                )
+            }
+            Protocol::Icmp => unimplemented!(),
+            Protocol::Raw { protocol: _ } => unimplemented!(),
+        };
+
+        if new_events_only {
+            if recv_queue_now > recv_queue_last && receivable_now {
+                self.socket_handle
+                    .recv_queue
+                    .store(recv_queue_now, core::sync::atomic::Ordering::Relaxed);
+                // We have more data to receive than last time, so we should notify
+                events |= Events::IN;
+            }
+
+            let previously_sendable = self
+                .socket_handle
+                .previously_sendable
+                .load(core::sync::atomic::Ordering::Relaxed);
+            if !previously_sendable && sendable_now {
+                self.socket_handle
+                    .previously_sendable
+                    .store(true, core::sync::atomic::Ordering::Relaxed);
+                // We can now send, so we should notify
+                events |= Events::OUT;
+            }
+        } else {
+            if receivable_now {
+                events |= Events::IN;
+            }
+            if sendable_now {
+                events |= Events::OUT;
+            }
+        }
+
+        // A server socket should have `Events::IN` if any of its listening sockets is connected.
+        if let Protocol::Tcp = self.socket_handle.protocol()
+            && !events.contains(Events::IN)
+        {
+            let tcp_specific = self.socket_handle.specific.tcp();
+            if let Some(server_socket) = tcp_specific.server_socket.as_ref() {
+                let previously_acceptable = tcp_specific
+                    .previously_acceptable
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                if !new_events_only || !previously_acceptable {
+                    server_socket
+                        .socket_set_handles
+                        .iter()
+                        .any(|&h| {
+                            let socket: &tcp::Socket = self.socket_set.get(h);
+                            socket.state() == tcp::State::Established
+                        })
+                        .then(|| {
+                            tcp_specific
+                                .previously_acceptable
+                                .store(true, core::sync::atomic::Ordering::Relaxed);
+                            events.insert(Events::IN);
+                        });
+                }
+            }
+        }
+
+        events
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
+    for PollableSocketHandle<'_, Platform>
+{
+    fn register_observer(
+        &self,
+        observer: alloc::sync::Weak<dyn crate::event::observer::Observer<Events>>,
+        mask: Events,
+    ) {
+        self.socket_handle.pollee.register_observer(observer, mask);
+    }
+
+    fn check_io_events(&self) -> Events {
+        self.check_socket_events(false)
     }
 }
 
@@ -464,7 +586,11 @@ where
             self.litebox.descriptor_table().iter::<Network<Platform>>()
         {
             let socket_handle = &socket_handle.entry;
-            let events = self.check_socket_events(socket_handle, true);
+            let events = PollableSocketHandle {
+                socket_handle,
+                socket_set: &self.socket_set,
+            }
+            .check_socket_events(true);
             if !events.is_empty() {
                 socket_handle.pollee.notify_observers(events);
             }
@@ -1213,125 +1339,21 @@ where
         }
     }
 
-    /// Register an observer for events on a socket.
-    ///
+    /// Perform `f` with the [`IOPollable`] for the socket at `fd`.
+    ////
     /// Returns `None` if the `fd` is closed.
-    pub fn register_observer(
+    pub fn with_iopollable<R>(
         &self,
         fd: &SocketFd<Platform>,
-        observer: alloc::sync::Weak<dyn crate::event::observer::Observer<Events>>,
-        mask: Events,
-    ) -> Option<()> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let table_entry = descriptor_table.get_entry(fd)?;
-        let entry = &table_entry.entry;
-        entry.pollee.register_observer(observer, mask);
-        Some(())
-    }
-
-    /// Get the [`Events`] for a socket [`SocketFd`].
-    pub fn check_events(&self, fd: &SocketFd<Platform>) -> Option<Events> {
+        f: impl FnOnce(&dyn IOPollable) -> R,
+    ) -> Option<R> {
         let descriptor_table = self.litebox.descriptor_table();
         let table_entry = descriptor_table.get_entry(fd)?;
         let socket_handle = &table_entry.entry;
-        Some(self.check_socket_events(socket_handle, false))
-    }
-
-    /// Get the [`Events`] for a socket handle [`SocketHandle`].
-    ///
-    /// If `new_events_only` is true, only events representing meaningful state changes
-    /// since the last check are returned (e.g., new data arrived, socket became writable,
-    /// new connections became acceptable).
-    fn check_socket_events(
-        &self,
-        socket_handle: &SocketHandle<Platform>,
-        new_events_only: bool,
-    ) -> Events {
-        if socket_handle.consider_closed {
-            // TODO: update this when we support graceful close
-            return Events::empty();
-        }
-        let mut events = Events::empty();
-        let recv_queue_last = socket_handle
-            .recv_queue
-            .load(core::sync::atomic::Ordering::Relaxed);
-        let (recv_queue_now, sendable_now, receivable_now) = match socket_handle.protocol() {
-            Protocol::Tcp => {
-                let tcp_socket = self.socket_set.get::<tcp::Socket>(socket_handle.handle);
-                (
-                    tcp_socket.recv_queue(),
-                    tcp_socket.can_send(),
-                    tcp_socket.can_recv(),
-                )
-            }
-            Protocol::Udp => {
-                let udp_socket = self.socket_set.get::<udp::Socket>(socket_handle.handle);
-                (
-                    udp_socket.recv_queue(),
-                    udp_socket.can_send(),
-                    udp_socket.can_recv(),
-                )
-            }
-            Protocol::Icmp => unimplemented!(),
-            Protocol::Raw { protocol: _ } => unimplemented!(),
-        };
-
-        if new_events_only {
-            if recv_queue_now > recv_queue_last && receivable_now {
-                socket_handle
-                    .recv_queue
-                    .store(recv_queue_now, core::sync::atomic::Ordering::Relaxed);
-                // We have more data to receive than last time, so we should notify
-                events |= Events::IN;
-            }
-
-            let previously_sendable = socket_handle
-                .previously_sendable
-                .load(core::sync::atomic::Ordering::Relaxed);
-            if !previously_sendable && sendable_now {
-                socket_handle
-                    .previously_sendable
-                    .store(true, core::sync::atomic::Ordering::Relaxed);
-                // We can now send, so we should notify
-                events |= Events::OUT;
-            }
-        } else {
-            if receivable_now {
-                events |= Events::IN;
-            }
-            if sendable_now {
-                events |= Events::OUT;
-            }
-        }
-
-        // A server socket should have `Events::IN` if any of its listening sockets is connected.
-        if let Protocol::Tcp = socket_handle.protocol()
-            && !events.contains(Events::IN)
-        {
-            let tcp_specific = socket_handle.specific.tcp();
-            if let Some(server_socket) = tcp_specific.server_socket.as_ref() {
-                let previously_acceptable = tcp_specific
-                    .previously_acceptable
-                    .load(core::sync::atomic::Ordering::Relaxed);
-                if !new_events_only || !previously_acceptable {
-                    server_socket
-                        .socket_set_handles
-                        .iter()
-                        .any(|&h| {
-                            let socket: &tcp::Socket = self.socket_set.get(h);
-                            socket.state() == tcp::State::Established
-                        })
-                        .then(|| {
-                            tcp_specific
-                                .previously_acceptable
-                                .store(true, core::sync::atomic::Ordering::Relaxed);
-                            events.insert(Events::IN);
-                        });
-                }
-            }
-        }
-
-        events
+        Some(f(&PollableSocketHandle {
+            socket_handle,
+            socket_set: &self.socket_set,
+        }))
     }
 }
 

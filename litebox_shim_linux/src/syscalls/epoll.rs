@@ -98,12 +98,7 @@ impl EpollDescriptor {
                 return Some(Events::OUT & mask);
             }
             EpollDescriptor::Socket(fd) => {
-                let net = crate::litebox_net().lock();
-                if let Some(observer) = observer {
-                    net.register_observer(fd, observer, mask)?;
-                }
-                let events = net.check_events(fd)?;
-                return Some(events & (mask | Events::ALWAYS_POLLED));
+                return crate::litebox_net().lock().with_iopollable(fd, poll);
             }
             EpollDescriptor::Pipe(fd) => {
                 return crate::litebox_pipes().read().with_iopollable(fd, poll).ok();
