@@ -59,7 +59,7 @@ fn find_rewriter_source_files() -> Vec<PathBuf> {
     if let Ok(cargo_manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
         let workspace_root = std::path::Path::new(&cargo_manifest_dir).parent().unwrap();
         let rewriter_dir = workspace_root.join("litebox_syscall_rewriter");
-        let pattern = format!("{}/**/*.rs", rewriter_dir.display());
+        let pattern = format!("{}/src/**/*.rs", rewriter_dir.display());
 
         if let Ok(paths) = glob(&pattern) {
             for path in paths.flatten() {
