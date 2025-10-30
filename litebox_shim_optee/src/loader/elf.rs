@@ -412,11 +412,17 @@ impl ElfLoader {
             load_trampoline(trampoline, base, fd);
         }
 
-        // Normally, loader or libc allocates memory for TLS and sets up the FS base.
-        // Since we do not rely on them here, we explicitly do this by ourselves.
-        // In general, we do not need to deallocate this page because the OP-TEE TA
-        // does not support multiple threads such that this page should be used until
-        // the TA terminates, which will free all allocated pages.
+        // Initialize the guest TLS for an OP-TEE TA.
+        // Typically, the loader (e.g., OP-TEE's ldelf) or libc initializes the guest TLS before
+        // calling the main function. However, currently, LiteBox does not use ldelf or libc for
+        // OP-TEE TAs such that no guest code attempts to initialize the guest TLS.
+        // To avoid this problem, `litebox_shim_optee` initializes the guest TLS by
+        // allocating a guest page and programming the FS base to point to the allocated page.
+        // Note that we use `PunchthroughSyscall::SetFsBase` for this purpose not to deal with
+        // the underlying platform behaviors (i.e., swapping FS and GS).
+        // Two alternatives:
+        // 1) Initialize the guest TLS at the runner.
+        // 2) Write a minimal ldelf and bundle it with each OP-TEE TA.
         let addr = crate::syscalls::mm::sys_mmap(
             0,
             PAGE_SIZE,
@@ -440,7 +446,7 @@ impl ElfLoader {
             _ => unimplemented!("Unsupported punchthrough error {:?}", e),
         });
 
-        // Since it does not have `ld` or `ldelf`, it should relocate symbols by its own.
+        // Since LiteBox does not use ldelf or libc for OP-TEE TAs, it should relocate the TA ELF's symbols.
         elf.easy_relocate([].into_iter(), &|_| None)
             .map_err(ElfLoaderError::LoaderError)?;
 

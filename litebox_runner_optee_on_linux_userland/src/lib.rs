@@ -1,11 +1,15 @@
 use anyhow::Result;
 use clap::Parser;
 use litebox::utils::ReinterpretUnsignedExt;
-use litebox_common_optee::{TeeParamType, UteeEntryFunc, UteeParamOwned, UteeParams};
+use litebox_common_optee::{UteeEntryFunc, UteeParamOwned};
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::loader::ElfLoadInfo;
-use serde::Deserialize;
 use std::path::PathBuf;
+
+#[cfg(test)]
+use litebox_common_optee::{TeeParamType, UteeParams};
+#[cfg(test)]
+use serde::Deserialize;
 
 /// Test OP-TEE TAs with LiteBox on unmodified Linux
 #[derive(Parser, Debug)]
@@ -75,6 +79,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     // This runner supports JSON-formatted OP-TEE TA command sequence for ease of development and testing.
+    #[cfg(test)]
     let ta_commands: Vec<TaCommandBase64> = {
         let json_path = PathBuf::from(&cli_args.command_sequence);
         let json_str = std::fs::read_to_string(json_path)?;
@@ -88,6 +93,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new(None);
     litebox_platform_multiplex::set_platform(platform);
+    let _litebox = litebox_shim_optee::init_process(platform.init_task());
     platform.register_shim(&litebox_shim_optee::OpteeShim);
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
@@ -100,12 +106,40 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // it uses `tid` as a session ID.
     let session_id = platform.init_task().tid.reinterpret_as_unsigned();
 
+    #[cfg(not(test))]
+    run_ta_with_default_commands(session_id, &loaded_ta);
+
+    #[cfg(test)]
     let is_kmpp_ta = cli_args.program.contains("kmpp-ta.elf.hooked");
+    #[cfg(test)]
     run_ta_with_test_commands(session_id, &loaded_ta, &ta_commands, is_kmpp_ta);
     Ok(())
 }
 
+#[cfg(not(test))]
+fn run_ta_with_default_commands(session_id: u32, ta_info: &ElfLoadInfo) {
+    for func_id in [UteeEntryFunc::OpenSession, UteeEntryFunc::CloseSession] {
+        let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
+
+        // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
+        // loaded binary and heap. In that sense, we can create (and destroy) a stack
+        // for each command freely.
+        let stack =
+            litebox_shim_optee::loader::init_stack(Some(ta_info.stack_base), params.as_slice())
+                .expect("Failed to initialize stack with parameters");
+        let mut pt_regs = litebox_shim_optee::loader::prepare_registers(
+            ta_info,
+            &stack,
+            session_id,
+            func_id as u32,
+            None,
+        );
+        unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };
+    }
+}
+
 /// Run the loaded TA with a sequence of test commands
+#[cfg(test)]
 fn run_ta_with_test_commands(
     session_id: u32,
     ta_info: &ElfLoadInfo,
@@ -140,9 +174,6 @@ fn run_ta_with_test_commands(
             *value_a = u64::from(session_id);
         }
 
-        // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
-        // loaded binary and heap. In that sense, we can create (and destroy) a stack
-        // for each command freely.
         let stack =
             litebox_shim_optee::loader::init_stack(Some(ta_info.stack_base), params.as_slice())
                 .expect("Failed to initialize stack with parameters");
@@ -161,6 +192,7 @@ fn run_ta_with_test_commands(
 }
 
 /// A function to retrieve the results of the OP-TEE TA command execution.
+#[cfg(test)]
 fn handle_ta_command_output(params: &UteeParams) {
     for idx in 0..UteeParams::TEE_NUM_PARAMS {
         let param_type = params.get_type(idx).expect("Failed to get parameter type");
@@ -224,6 +256,7 @@ fn handle_ta_command_output(params: &UteeParams) {
 /// command ID, and up to four arguments. This is base64 encoded to enable
 /// JSON-formatted input files.
 /// TODO: use JSON Schema if we need to validate JSON or we could use Protobuf instead
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct TaCommandBase64 {
     func_id: TaEntryFunc,
@@ -233,6 +266,7 @@ struct TaCommandBase64 {
     args: Vec<TaCommandParamsBase64>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaEntryFunc {
@@ -244,6 +278,7 @@ pub enum TaEntryFunc {
 /// An argument of OP-TEE/TA message command (base64 encoded). It consists of
 /// a type and two 64-bit values/references. This is base64 encoded to enable
 /// JSON-formatted input files.
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "param_type", rename_all = "snake_case")]
 enum TaCommandParamsBase64 {
@@ -268,6 +303,7 @@ enum TaCommandParamsBase64 {
     },
 }
 
+#[cfg(test)]
 impl TaCommandParamsBase64 {
     pub fn as_utee_params_owned(&self) -> UteeParamOwned {
         match self {

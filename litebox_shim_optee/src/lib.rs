@@ -31,6 +31,18 @@ pub(crate) mod syscalls;
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 
+/// Initialize the shim to run a task with the given parameters.
+///
+/// Returns the global litebox object.
+pub fn init_process<'a>(task: litebox_common_linux::TaskParams) -> &'a LiteBox<Platform> {
+    SHIM_TLS.init(OpteeShimTls {
+        current_task: Task {
+            session_id: task.tid.reinterpret_as_unsigned(),
+        },
+    });
+    litebox()
+}
+
 /// Get the global litebox object
 pub fn litebox<'a>() -> &'a LiteBox<Platform> {
     static LITEBOX: OnceBox<LiteBox<Platform>> = OnceBox::new();
@@ -569,4 +581,25 @@ impl TeeCrypStateMap {
 pub(crate) fn tee_cryp_state_map() -> &'static TeeCrypStateMap {
     static TEE_CRYPT_STATE_MAP: OnceBox<TeeCrypStateMap> = OnceBox::new();
     TEE_CRYPT_STATE_MAP.get_or_init(|| alloc::boxed::Box::new(TeeCrypStateMap::new()))
+}
+
+struct OpteeShimTls {
+    current_task: Task,
+}
+
+#[expect(dead_code)]
+struct Task {
+    /// Session ID
+    session_id: u32,
+    // TODO: TA UUID, etc.
+}
+
+litebox::shim_thread_local! {
+    #[platform = Platform]
+    static SHIM_TLS: OpteeShimTls;
+}
+
+#[expect(dead_code)]
+fn with_current_task<R>(f: impl FnOnce(&Task) -> R) -> R {
+    SHIM_TLS.with(|tls| f(&tls.current_task))
 }

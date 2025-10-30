@@ -37,6 +37,7 @@ pub struct PerCpuVariables {
     pub gdt: Option<&'static gdt::GdtWrapper>,
     vtl0_xsave_area_addr: VirtAddr,
     vtl1_xsave_area_addr: VirtAddr,
+    pub tls: usize, // placeholder
 }
 
 impl PerCpuVariables {
@@ -205,6 +206,7 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
     gdt: const { None },
     vtl0_xsave_area_addr: VirtAddr::zero(),
     vtl1_xsave_area_addr: VirtAddr::zero(),
+    tls: 0,
 };
 
 /// Store the addresses of per-CPU variables. The kernel threads are expected to access

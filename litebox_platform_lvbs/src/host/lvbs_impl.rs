@@ -4,6 +4,7 @@ use crate::{
     Errno, HostInterface,
     arch::ioport::serial_print_string,
     host::linux::sigset_t,
+    host::per_cpu_variables::with_per_cpu_variables_mut,
     ptr::{UserConstPtr, UserMutPtr},
 };
 
@@ -49,6 +50,33 @@ mod alloc {
         unsafe fn mem_fill_pages(start: usize, size: usize) {
             unsafe { LVBS_ALLOCATOR.fill_pages(start, size) };
         }
+    }
+}
+
+impl LvbsLinuxKernel {
+    // TODO: replace it with actual implementation (e.g., atomically increment PID/TID)
+    pub fn init_task(&self) -> litebox_common_linux::TaskParams {
+        litebox_common_linux::TaskParams {
+            pid: 1,
+            tid: 1,
+            ppid: 1,
+            uid: 1000,
+            gid: 1000,
+            euid: 1000,
+            egid: 1000,
+        }
+    }
+}
+
+unsafe impl litebox::platform::ThreadLocalStorageProvider for LvbsLinuxKernel {
+    fn get_thread_local_storage() -> *mut () {
+        let tls = with_per_cpu_variables_mut(|pcv| pcv.tls);
+        tls as *mut ()
+    }
+
+    unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
+        let tls = with_per_cpu_variables_mut(|pcv| pcv.tls);
+        core::mem::replace(&mut (tls as *mut ()), value.cast()).cast()
     }
 }
 
