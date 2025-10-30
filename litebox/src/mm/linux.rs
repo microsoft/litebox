@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::platform::PageManagementProvider;
 use crate::platform::RawConstPointer;
+use crate::platform::page_mgmt::AllocationError;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
 
 /// Page size in bytes
@@ -406,10 +407,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         vma: VmArea,
         populate_pages_immediately: bool,
         fixed_address: bool,
-    ) -> Option<Platform::RawMutPointer<u8>> {
+    ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
         let (start, end) = (suggested_range.start, suggested_range.end);
         if start < Platform::TASK_ADDR_MIN || end > Platform::TASK_ADDR_MAX {
-            return None;
+            return Err(AllocationError::InvalidRange);
         }
         if fixed_address {
             // If the given address is fixed (i.e., must use), we need to remove any existing mappings that overlap
@@ -420,7 +421,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // Note we don't need to update `vmas` here as `insert` at the end will take care of the overlaps for us.
             for (r, _) in self.vmas.overlapping(start..end) {
                 let intersection = r.start.max(start)..r.end.min(end);
-                unsafe { self.platform.deallocate_pages(intersection) }.ok()?;
+                unsafe { self.platform.deallocate_pages(intersection) }
+                    .expect("deallocation failed");
             }
         }
         let permissions: u8 = vma
@@ -436,22 +438,19 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // The `max_permissions` is tracked by `VMem::protect_mapping` and thus doesn't need to be
         // passed to `allocate_pages`.
         let _ = max_permissions;
-        let ret = self
-            .platform
-            .allocate_pages(
-                suggested_range.into(),
-                MemoryRegionPermissions::from_bits(permissions).unwrap(),
-                vma.flags.contains(VmFlags::VM_GROWSDOWN),
-                populate_pages_immediately,
-                fixed_address,
-            )
-            .ok()?;
+        let ret = self.platform.allocate_pages(
+            suggested_range.into(),
+            MemoryRegionPermissions::from_bits(permissions).unwrap(),
+            vma.flags.contains(VmFlags::VM_GROWSDOWN),
+            populate_pages_immediately,
+            fixed_address,
+        )?;
         let new_start = ret.as_usize();
         let new_end = new_start + suggested_range.len();
         self.vmas.insert(new_start..new_end, vma);
         debug_assert!(new_start >= Platform::TASK_ADDR_MIN);
         debug_assert!(new_end <= Platform::TASK_ADDR_MAX);
-        Some(ret)
+        Ok(ret)
     }
 
     /// Create a new mapping in the virtual address space.
@@ -477,7 +476,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         length: NonZeroPageSize<ALIGN>,
         vma: VmArea,
         flags: CreatePagesFlags,
-    ) -> Option<Platform::RawMutPointer<u8>> {
+    ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
         let total_length = (length
             + if flags.contains(CreatePagesFlags::ENSURE_SPACE_AFTER) {
                 DEFAULT_RESERVED_SPACE_SIZE
@@ -485,11 +484,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 0
             })
         .unwrap();
-        let new_addr = self.get_unmmaped_area(
-            suggested_address,
-            total_length,
-            flags.contains(CreatePagesFlags::FIXED_ADDR),
-        )?;
+        let new_addr = self
+            .get_unmmaped_area(
+                suggested_address,
+                total_length,
+                flags.contains(CreatePagesFlags::FIXED_ADDR),
+            )
+            .ok_or(AllocationError::OutOfMemory)?;
         // new_addr must be ALIGN aligned
         let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
         unsafe {
@@ -558,7 +559,25 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 return Err(VmemResizeError::RangeOccupied(r));
             }
             let range = PageRange::new(range.end, new_end).unwrap();
-            unsafe { self.insert_mapping(range, *cur_vma, false, true) };
+            // Although we have checked the overlap above, there is still a small chance that this range
+            // collides with memory allocated to global allocator when LiteBox is used in user mode. This
+            // is because page manager is not aware of the memory allocated to global allocator.
+            // Try to insert the mapping with `fixed_address = false` to see if it is free first.
+            let ptr = match unsafe { self.insert_mapping(range, *cur_vma, false, false) } {
+                Ok(p) => p,
+                Err(AllocationError::OutOfMemory) => return Err(VmemResizeError::OutOfMemory),
+                Err(AllocationError::Unaligned | AllocationError::InvalidRange) => unreachable!(),
+            }
+            .as_usize();
+            // If it returns a different address, it means the range is occupied.
+            if ptr != range.start {
+                // rollback
+                let new_range = PageRange::new(ptr, ptr + range.len()).unwrap();
+                unsafe {
+                    self.remove_mapping(new_range).unwrap();
+                }
+                return Err(VmemResizeError::RangeOccupied(range.into()));
+            }
             return Ok(());
         }
 
@@ -733,7 +752,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 flags,
             )
         }
-        .ok_or(MappingError::OutOfMemory)
+        .map_err(MappingError::MapError)
     }
 
     /// Get the memory permissions of a given address range.
@@ -858,6 +877,8 @@ pub(super) enum VmemResizeError {
     InvalidAddr { range: Range<usize>, addr: usize },
     #[error("range {0:?} is already (partially) occupied")]
     RangeOccupied(Range<usize>),
+    #[error("out of memory")]
+    OutOfMemory,
 }
 
 /// Error for moving mappings

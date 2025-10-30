@@ -199,13 +199,13 @@ pub(crate) fn sys_madvise(
 mod tests {
     use litebox::{
         fs::{Mode, OFlags},
-        platform::{RawConstPointer, RawMutPointer},
+        platform::{PageManagementProvider, RawConstPointer, RawMutPointer},
     };
-    use litebox_common_linux::{MapFlags, ProtFlags};
+    use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
     use crate::syscalls::{
         file::{sys_close, sys_open, sys_write},
-        mm::sys_munmap,
+        mm::{sys_mremap, sys_munmap},
         tests::init_platform,
     };
 
@@ -298,6 +298,70 @@ mod tests {
         .unwrap();
         sys_munmap(addr, 0x2000).unwrap();
         sys_munmap(new_addr, 0x2000).unwrap();
+    }
+
+    #[test]
+    fn test_collision_with_global_allocator() {
+        init_platform(None);
+        let platform = litebox_platform_multiplex::platform();
+        let mut data = alloc::vec::Vec::new();
+        // Find an address that is allocated to the global allocator but not in reserved regions.
+        // LiteBox's page manager is not aware of the global allocator's allocations.
+        let addr = loop {
+            let buf = alloc::vec::Vec::<u8>::with_capacity(0x10_0000);
+            let addr = buf.as_ptr() as usize;
+            data.push(buf);
+
+            let mut included = false;
+            for r in <litebox_platform_multiplex::Platform as PageManagementProvider<4096>>::reserved_pages(platform) {
+                if r.contains(&addr) {
+                    included = true;
+                    break;
+                }
+            }
+
+            if !included {
+                // Also ensure that [addr - 0x1000, addr) is available, which is needed in the test below.
+                if let Ok(ptr) = sys_mmap(
+                    addr - 0x1000,
+                    0x1000,
+                    ProtFlags::PROT_READ,
+                    MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
+                    -1,
+                    0,
+                ) {
+                    if ptr.as_usize() != addr - 0x1000 {
+                        sys_munmap(ptr, 0x1000).unwrap();
+                        continue;
+                    }
+                    break addr;
+                }
+            }
+        };
+
+        // mmap with the found address should still succeed but not at the exact address.
+        let res = sys_mmap(
+            addr,
+            0x1000,
+            ProtFlags::PROT_READ,
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
+            -1,
+            0,
+        )
+        .unwrap();
+        assert_ne!(res.as_usize(), 0);
+        assert_ne!(res.as_usize(), addr);
+
+        // grow the mapping without MREMAP_MAYMOVE should fail as the new region collides with the global allocator
+        let err = sys_mremap(
+            crate::MutPtr::from_usize(addr - 0x1000),
+            0x1000,
+            0x2000,
+            MRemapFlags::empty(),
+            addr - 0x1000,
+        )
+        .unwrap_err();
+        assert_eq!(err, Errno::ENOMEM);
     }
 
     #[test]

@@ -162,6 +162,7 @@ jobs:
       - run: cargo clippy --locked --verbose --all-targets --all-features -p litebox_runner_linux_on_windows_userland
       - run: cargo build --locked --verbose -p litebox_runner_linux_on_windows_userland
       - run: cargo nextest run --locked --profile ci -p litebox_runner_linux_on_windows_userland
+      - run: cargo nextest run --locked --profile ci -p litebox_shim_linux --no-default-features --features platform_windows_userland
       - run: |
           cargo test --locked --verbose --doc -p litebox_runner_linux_on_windows_userland
           # We need to run `cargo test --doc` separately because doc tests

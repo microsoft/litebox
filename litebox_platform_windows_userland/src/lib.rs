@@ -732,7 +732,7 @@ impl RawMutex {
             // Check why WaitOnAddress failed
             let err = unsafe { GetLastError() };
             match err {
-                Win32_Foundation::WAIT_TIMEOUT => {
+                Win32_Foundation::ERROR_TIMEOUT => {
                     // Timed out
                     Ok(UnblockedOrTimedOut::TimedOut)
                 }
