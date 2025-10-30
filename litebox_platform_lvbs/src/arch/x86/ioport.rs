@@ -8,8 +8,11 @@ const COM_PORT_2: u16 = 0x2F8;
 
 const INTERRUPT_ENABLE_OFFSET: u16 = 1;
 const OUT_FIFO_CONTROL_OFFSET: u16 = 2;
+const SCRATCH_REGISTER_OFFSET: u16 = 7;
 const MODEM_CONTROL_OFFSET: u16 = 4;
 const IN_LINE_STATUS_OFFSET: u16 = 5;
+
+const MAX_WAIT_ITERATIONS: u32 = 1_000_000;
 
 #[expect(clippy::inline_always)]
 #[inline(always)]
@@ -63,24 +66,45 @@ fn line_status(port: u16) -> u8 {
 
 pub struct ComPort {
     port: u16,
+    available: bool,
 }
 
 impl ComPort {
     pub const fn new(port: u16) -> Self {
-        ComPort { port }
+        ComPort {
+            port,
+            available: false,
+        }
     }
 
     pub fn init(&mut self) {
+        outb(self.port + SCRATCH_REGISTER_OFFSET, 0x55);
+        let scratch = inb(self.port + SCRATCH_REGISTER_OFFSET);
+        if scratch != 0x55 {
+            self.available = false;
+            return;
+        }
+        self.available = true;
         interrupt_enable(self.port, 0x00); // Disable all interrupts
         fifo_control(self.port, 0xc7); // Enable FIFO, clear them, with 14-byte threshold
         modem_control(self.port, 0x0f); // Enable data terminal ready, request to send, and IRQ
     }
 
     pub fn write_byte(&mut self, byte: u8) {
+        if !self.available {
+            return;
+        }
+
+        /* Timeout to ensure that we do not loop indefinitely */
+        let mut wait_iterations = 0;
         loop {
-            if (line_status(self.port) & 0x20) != 0 {
+            if line_status(self.port) & 0x20 != 0 {
                 // transmittable
                 break;
+            }
+            wait_iterations += 1;
+            if wait_iterations >= MAX_WAIT_ITERATIONS {
+                return;
             }
         }
 
@@ -95,6 +119,10 @@ impl ComPort {
     }
 
     pub fn write_string(&mut self, s: &str) {
+        if !self.available {
+            return;
+        }
+
         for byte in s.bytes() {
             self.write_byte(byte);
         }
