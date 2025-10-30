@@ -71,12 +71,12 @@ impl LvbsLinuxKernel {
 unsafe impl litebox::platform::ThreadLocalStorageProvider for LvbsLinuxKernel {
     fn get_thread_local_storage() -> *mut () {
         let tls = with_per_cpu_variables_mut(|pcv| pcv.tls);
-        tls as *mut ()
+        tls.as_mut_ptr::<()>()
     }
 
     unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
         let tls = with_per_cpu_variables_mut(|pcv| pcv.tls);
-        core::mem::replace(&mut (tls as *mut ()), value.cast()).cast()
+        core::mem::replace(&mut tls.as_mut_ptr::<()>(), value.cast()).cast()
     }
 }
 
