@@ -21,8 +21,8 @@ use litebox::{
 };
 use litebox_common_optee::{
     ContinueOperation, SyscallRequest, TeeAlgorithm, TeeAlgorithmClass, TeeAttributeType,
-    TeeCrypStateHandle, TeeHandleFlag, TeeObjHandle, TeeObjectInfo, TeeObjectType,
-    TeeOperationMode, TeeResult, UteeAttribute,
+    TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeObjHandle, TeeObjectInfo, TeeObjectType,
+    TeeOperationMode, TeeResult, TeeUuid, UteeAttribute,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -34,13 +34,30 @@ const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 /// Initialize the shim to run a task with the given parameters.
 ///
 /// Returns the global litebox object.
-pub fn init_process<'a>(task: litebox_common_linux::TaskParams) -> &'a LiteBox<Platform> {
+pub fn init_session<'a>(
+    ta_app_id: &TeeUuid,
+    client_identity: &TeeIdentity,
+) -> &'a LiteBox<Platform> {
     SHIM_TLS.init(OpteeShimTls {
         current_task: Task {
-            session_id: task.tid.reinterpret_as_unsigned(),
+            // TODO: generate a unique session ID
+            session_id: 1,
+            _ta_app_id: *ta_app_id,
+            _client_identity: *client_identity,
         },
     });
     litebox()
+}
+
+/// Deinitialize the shim for the current task.
+pub fn deinit_session() {
+    SHIM_TLS.deinit();
+}
+
+/// Return the session ID of the current task.
+/// Note. OP-TEE does not have a syscall to get the session ID. This function is for internal use only.
+pub fn get_session_id() -> u32 {
+    with_current_task(|task| task.session_id)
 }
 
 /// Get the global litebox object
@@ -584,14 +601,20 @@ pub(crate) fn tee_cryp_state_map() -> &'static TeeCrypStateMap {
 }
 
 struct OpteeShimTls {
+    // Note. OP-TEE does not specify that this information shall be stored in TLS.
+    // We use TLS for better modularity.
     current_task: Task,
 }
 
-#[expect(dead_code)]
+/// TA/session-related information for the current task
 struct Task {
     /// Session ID
     session_id: u32,
-    // TODO: TA UUID, etc.
+    /// TA UUID
+    _ta_app_id: TeeUuid,
+    /// Client identity (VTL0 process or another TA)
+    _client_identity: TeeIdentity,
+    // TODO: add more fields as needed
 }
 
 litebox::shim_thread_local! {
@@ -599,7 +622,6 @@ litebox::shim_thread_local! {
     static SHIM_TLS: OpteeShimTls;
 }
 
-#[expect(dead_code)]
 fn with_current_task<R>(f: impl FnOnce(&Task) -> R) -> R {
     SHIM_TLS.with(|tls| f(&tls.current_task))
 }

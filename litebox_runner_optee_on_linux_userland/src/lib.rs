@@ -1,7 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use litebox::utils::ReinterpretUnsignedExt;
-use litebox_common_optee::{UteeEntryFunc, UteeParamOwned};
+use litebox_common_optee::{TeeIdentity, TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned};
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::loader::ElfLoadInfo;
 use std::path::PathBuf;
@@ -93,7 +92,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new(None);
     litebox_platform_multiplex::set_platform(platform);
-    let _litebox = litebox_shim_optee::init_process(platform.init_task());
     platform.register_shim(&litebox_shim_optee::OpteeShim);
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
@@ -102,24 +100,35 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let loaded_ta = litebox_shim_optee::loader::load_elf_buffer(prog_data.as_slice())?;
 
-    // Currently, this runner supports a single TA session. Also, for simplicity,
-    // it uses `tid` as a session ID.
-    let session_id = platform.init_task().tid.reinterpret_as_unsigned();
-
     #[cfg(not(test))]
-    run_ta_with_default_commands(session_id, &loaded_ta);
+    run_ta_with_default_commands(&loaded_ta);
 
     #[cfg(test)]
     let is_kmpp_ta = cli_args.program.contains("kmpp-ta.elf.hooked");
     #[cfg(test)]
-    run_ta_with_test_commands(session_id, &loaded_ta, &ta_commands, is_kmpp_ta);
+    run_ta_with_test_commands(&loaded_ta, &ta_commands, is_kmpp_ta);
     Ok(())
 }
 
 #[cfg(not(test))]
-fn run_ta_with_default_commands(session_id: u32, ta_info: &ElfLoadInfo) {
+fn run_ta_with_default_commands(ta_info: &ElfLoadInfo) {
+    let mut session_id: u32 = 0;
     for func_id in [UteeEntryFunc::OpenSession, UteeEntryFunc::CloseSession] {
         let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
+
+        if func_id == UteeEntryFunc::OpenSession {
+            // Each OP-TEE TA has its own UUID.
+            // The client of a session can be a normal-world (VTL0) application or another TA (at VTL1).
+            // The VTL0 kernel is expected to provide the client identity information.
+            let _litebox = litebox_shim_optee::init_session(
+                &TeeUuid::default(),
+                &TeeIdentity {
+                    login: TeeLogin::User,
+                    uuid: TeeUuid::default(),
+                },
+            );
+            session_id = litebox_shim_optee::get_session_id();
+        }
 
         // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
         // loaded binary and heap. In that sense, we can create (and destroy) a stack
@@ -135,17 +144,21 @@ fn run_ta_with_default_commands(session_id: u32, ta_info: &ElfLoadInfo) {
             None,
         );
         unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };
+
+        if func_id == UteeEntryFunc::CloseSession {
+            litebox_shim_optee::deinit_session();
+        }
     }
 }
 
 /// Run the loaded TA with a sequence of test commands
 #[cfg(test)]
 fn run_ta_with_test_commands(
-    session_id: u32,
     ta_info: &ElfLoadInfo,
     ta_commands: &[TaCommandBase64],
     is_kmpp_ta: bool,
 ) {
+    let mut session_id: u32 = 0;
     for cmd in ta_commands {
         assert!(
             (cmd.args.len() <= UteeParamOwned::TEE_NUM_PARAMS),
@@ -174,6 +187,17 @@ fn run_ta_with_test_commands(
             *value_a = u64::from(session_id);
         }
 
+        if func_id == UteeEntryFunc::OpenSession {
+            let _litebox = litebox_shim_optee::init_session(
+                &TeeUuid::default(),
+                &TeeIdentity {
+                    login: TeeLogin::User,
+                    uuid: TeeUuid::default(),
+                },
+            );
+            session_id = litebox_shim_optee::get_session_id();
+        }
+
         let stack =
             litebox_shim_optee::loader::init_stack(Some(ta_info.stack_base), params.as_slice())
                 .expect("Failed to initialize stack with parameters");
@@ -188,6 +212,10 @@ fn run_ta_with_test_commands(
         // TA stores results in the `UteeParams` structure and/or buffers it refers to.
         let params = unsafe { &*(ta_info.params_address as *const UteeParams) };
         handle_ta_command_output(params);
+
+        if func_id == UteeEntryFunc::CloseSession {
+            litebox_shim_optee::deinit_session();
+        }
     }
 }
 
