@@ -45,6 +45,7 @@ use core::{
 };
 use hashbrown::HashMap;
 use litebox_common_linux::errno::Errno;
+use spin::Once;
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{PageSize, PhysFrame, Size4KiB, frame::PhysFrameRange},
@@ -63,6 +64,8 @@ impl AlignedPage {
 
 // For now, we do not validate large kernel modules due to the VTL1's memory size limitation.
 const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
+
+static CPU_ONLINE_MASK: Once<Box<CpuMask>> = Once::new();
 
 pub(crate) fn init() {
     assert!(
@@ -167,6 +170,9 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
         cpu_mask.for_each_cpu(|cpu_id| {
             boot_signal_page_buf.0[cpu_id] = HV_SECURE_VTL_BOOT_TOKEN;
         });
+
+        // Store the cpu_online_mask for later use
+        CPU_ONLINE_MASK.call_once(|| cpu_mask);
 
         if unsafe {
             crate::platform_low()
