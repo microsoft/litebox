@@ -162,14 +162,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PollableSocketHandle<'_
     ///
     /// Note this is still just an approximation; for example, if data arrives multiple times
     /// before this is called, only one `Events::IN` will be sent. This is probably fine
-    /// because we also update the internal state (i.e., `recv_queue`) in [`Receive`] calls so
-    /// that the following common pattern won't get stuck (it may miss some duplicate `Events::IN`
+    /// because we also update the internal state (i.e., `recv_queue`) in [`Network::receive`] calls
+    /// so that the following common pattern won't get stuck (it may miss some duplicate `Events::IN`
     /// events, but they are not necessary to make progress; one is sufficient):
     ///
-    /// ```no_run
+    /// ```text
     /// loop {
     ///     if (poll(socket, Events::IN) > 0) {
-    ///         assert!(receive(socket) > 0);
+    ///         assert!(receive(socket, ...) > 0);
     ///     }
     /// }
     /// ```
