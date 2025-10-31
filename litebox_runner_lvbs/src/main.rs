@@ -4,8 +4,9 @@
 
 use core::arch::asm;
 use litebox_platform_lvbs::{
-    arch::{enable_extended_states, enable_fsgsbase, get_core_id, instrs::hlt_loop},
+    arch::{enable_extended_states, enable_fsgsbase, get_core_id, instrs::{hlt_loop, wrmsr}},
     host::{bootparam::parse_boot_info, per_cpu_variables::with_per_cpu_variables},
+    mshv::{HV_X64_MSR_GUEST_OS_ID},
     serial_println,
 };
 
@@ -100,6 +101,18 @@ unsafe fn apply_relocations() {
         // SAFETY: Moving to next entry within bounds
         rela_ptr = unsafe { rela_ptr.add(1) };
     }
+}
+#[expect(clippy::inline_always)]
+#[inline(always)]
+fn my_vtl_return() {
+    wrmsr(HV_X64_MSR_GUEST_OS_ID, 0x818000040f120000);
+    unsafe {
+        asm!(
+            "xor rax, rax",
+            "mov rcx, 0x12",
+            "vmcall",
+         );
+     }
 }
 
 #[expect(clippy::missing_safety_doc)]
