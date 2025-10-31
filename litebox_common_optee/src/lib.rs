@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use litebox::platform::RawConstPointer as _;
 use litebox_common_linux::{PtRegs, errno::Errno};
 use modular_bitfield::prelude::*;
@@ -443,6 +444,44 @@ impl UteeParams {
     }
 }
 
+/// Each parameter for TA invocation with copied content/buffer for safer operations.
+/// This is our representation of `utee_params` and not for directly
+/// interacting with OP-TEE TAs and clients (which expect pointers/references).
+/// `out_address(es)`: VTL0 physical address(es) to write output data to. They are virtually
+/// contiguous but may not be physically contiguous.
+#[derive(Clone)]
+pub enum UteeParamOwned {
+    None,
+    ValueInput {
+        value_a: u64,
+        value_b: u64,
+    },
+    ValueOutput {
+        out_address: Option<usize>,
+    },
+    ValueInout {
+        value_a: u64,
+        value_b: u64,
+        out_address: Option<usize>,
+    },
+    MemrefInput {
+        data: Box<[u8]>,
+    },
+    MemrefOutput {
+        buffer_size: usize,
+        out_addresses: Option<Box<[usize]>>,
+    },
+    MemrefInout {
+        data: Box<[u8]>,
+        buffer_size: usize,
+        out_addresses: Option<Box<[usize]>>,
+    },
+}
+
+impl UteeParamOwned {
+    pub const TEE_NUM_PARAMS: usize = UteeParams::TEE_NUM_PARAMS;
+}
+
 /// `utee_attribute` from `optee_os/lib/libutee/include/utee_types.h`
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -854,14 +893,14 @@ impl From<TeeResult> for u32 {
 
 const UTEE_ENTRY_FUNC_OPEN_SESSION: u32 = 0;
 const UTEE_ENTRY_FUNC_CLOSE_SESSION: u32 = 1;
-const UTEE_ENTRY_FUNC_INVOKE_COMMEND: u32 = 2;
+const UTEE_ENTRY_FUNC_INVOKE_COMMAND: u32 = 2;
 
 #[derive(Clone, Copy, TryFromPrimitive, PartialEq)]
 #[repr(u32)]
 pub enum UteeEntryFunc {
     OpenSession = UTEE_ENTRY_FUNC_OPEN_SESSION,
     CloseSession = UTEE_ENTRY_FUNC_CLOSE_SESSION,
-    InvokeCommand = UTEE_ENTRY_FUNC_INVOKE_COMMEND,
+    InvokeCommand = UTEE_ENTRY_FUNC_INVOKE_COMMAND,
     Unknown = 0xffff_ffff,
 }
 

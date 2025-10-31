@@ -1,16 +1,16 @@
 use anyhow::Result;
 use clap::Parser;
-use litebox::utils::ReinterpretUnsignedExt;
-use litebox_common_optee::UteeEntryFunc;
 use litebox_platform_multiplex::Platform;
-use litebox_shim_optee::{
-    UteeParamsTyped, optee_command_dispatcher, register_session_id_elf_load_info,
-    submit_optee_command,
-};
-use serde::Deserialize;
 use std::path::PathBuf;
 
-/// Test OP-TEE TAs with LiteBox on unmodified Linux
+#[cfg(not(test))]
+use litebox_common_optee::{TeeIdentity, TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned};
+#[cfg(not(test))]
+use litebox_shim_optee::loader::ElfLoadInfo;
+
+#[cfg(test)]
+mod tests;
+
 #[derive(Parser, Debug)]
 pub struct CliArgs {
     /// Trusted Application (TA)
@@ -77,13 +77,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         data
     };
 
-    // This runner supports JSON-formatted OP-TEE TA command sequence for ease of development and testing.
-    let ta_commands: Vec<TaCommandBase64> = {
-        let json_path = PathBuf::from(&cli_args.command_sequence);
-        let json_str = std::fs::read_to_string(json_path)?;
-        serde_json::from_str(&json_str)?
-    };
-
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     //
     // TODO: We also need to pick the type of syscall interception based on whether we want
@@ -97,150 +90,60 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         InterceptionBackend::Rewriter => {}
     }
 
-    let loaded_program = litebox_shim_optee::loader::load_elf_buffer(prog_data.as_slice()).unwrap();
+    let loaded_ta = litebox_shim_optee::loader::load_elf_buffer(prog_data.as_slice())?;
 
-    // Currently, this runner supports a single TA session. Also, for simplicity,
-    // it uses `tid` as a session ID.
-    let session_id = platform.init_task().tid.reinterpret_as_unsigned();
-    litebox_shim_optee::set_session_id(session_id);
+    #[cfg(not(test))]
+    run_ta_with_default_commands(&loaded_ta);
 
-    assert!(
-        register_session_id_elf_load_info(session_id, loaded_program),
-        "redundant session ID is not allowed"
+    #[cfg(test)]
+    tests::run_ta_with_test_commands(
+        &loaded_ta,
+        cli_args.program.as_str(),
+        &PathBuf::from(&cli_args.command_sequence),
     );
-
-    populate_optee_command_queue(session_id, &ta_commands);
-    optee_command_dispatcher(session_id, false);
     Ok(())
 }
 
-/// OP-TEE/TA message command (base64 encoded). It consists of a function ID,
-/// command ID, and up to four arguments. This is base64 encoded to enable
-/// JSON-formatted input files.
-/// TODO: use JSON Schema if we need to validate JSON or we could use Protobuf instead
-#[derive(Debug, Deserialize)]
-struct TaCommandBase64 {
-    func_id: TaEntryFunc,
-    #[serde(default)]
-    cmd_id: u32,
-    #[serde(default)]
-    args: Vec<TaCommandParamsBase64>,
-}
+/// This function simply opens and closes a session to the TA to verify that
+/// it can be loaded and run. Note that an OP-TEE TA does nothing without
+/// a client invoking commands on it.
+#[cfg(not(test))]
+fn run_ta_with_default_commands(ta_info: &ElfLoadInfo) {
+    let mut session_id: u32 = 0;
+    for func_id in [UteeEntryFunc::OpenSession, UteeEntryFunc::CloseSession] {
+        let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaEntryFunc {
-    OpenSession,
-    CloseSession,
-    InvokeCommand,
-}
-
-/// An argument of OP-TEE/TA message command (base64 encoded). It consists of
-/// a type and two 64-bit values/references. This is base64 encoded to enable
-/// JSON-formatted input files.
-#[derive(Debug, Deserialize)]
-#[serde(tag = "param_type", rename_all = "snake_case")]
-enum TaCommandParamsBase64 {
-    ValueInput {
-        value_a: u64,
-        value_b: u64,
-    },
-    ValueOutput {},
-    ValueInout {
-        value_a: u64,
-        value_b: u64,
-    },
-    MemrefInput {
-        data_base64: String,
-    },
-    MemrefOutput {
-        buffer_size: u64,
-    },
-    MemrefInout {
-        data_base64: String,
-        buffer_size: u64,
-    },
-}
-
-impl TaCommandParamsBase64 {
-    pub fn as_utee_params_typed(&self) -> UteeParamsTyped {
-        match self {
-            TaCommandParamsBase64::ValueInput { value_a, value_b } => UteeParamsTyped::ValueInput {
-                value_a: *value_a,
-                value_b: *value_b,
-            },
-            TaCommandParamsBase64::ValueOutput {} => UteeParamsTyped::ValueOutput {},
-            TaCommandParamsBase64::ValueInout { value_a, value_b } => UteeParamsTyped::ValueInout {
-                value_a: *value_a,
-                value_b: *value_b,
-            },
-            TaCommandParamsBase64::MemrefInput { data_base64 } => UteeParamsTyped::MemrefInput {
-                data: Self::decode_base64(data_base64).into_boxed_slice(),
-            },
-            TaCommandParamsBase64::MemrefOutput { buffer_size } => UteeParamsTyped::MemrefOutput {
-                buffer_size: usize::try_from(*buffer_size).unwrap(),
-            },
-            TaCommandParamsBase64::MemrefInout {
-                data_base64,
-                buffer_size,
-            } => {
-                let decoded_data = Self::decode_base64(data_base64);
-                let buffer_size = usize::try_from(*buffer_size).unwrap();
-                assert!(
-                    buffer_size >= decoded_data.len(),
-                    "Buffer size is smaller than input data size"
-                );
-                UteeParamsTyped::MemrefInout {
-                    data: decoded_data.into_boxed_slice(),
-                    buffer_size,
-                }
-            }
+        if func_id == UteeEntryFunc::OpenSession {
+            // Each OP-TEE TA has its own UUID.
+            // The client of a session can be a normal-world (VTL0) application or another TA (at VTL1).
+            // The VTL0 kernel is expected to provide the client identity information.
+            let _litebox = litebox_shim_optee::init_session(
+                &TeeUuid::default(),
+                &TeeIdentity {
+                    login: TeeLogin::User,
+                    uuid: TeeUuid::default(),
+                },
+            );
+            session_id = litebox_shim_optee::get_session_id();
         }
-    }
 
-    fn decode_base64(data_base64: &str) -> Vec<u8> {
-        let buf_size = base64::decoded_len_estimate(data_base64.len());
-        let mut buffer = vec![0u8; buf_size];
-        let length = base64::engine::Engine::decode_slice(
-            &base64::engine::general_purpose::STANDARD,
-            data_base64.as_bytes(),
-            buffer.as_mut_slice(),
-        )
-        .expect("Failed to decode base64 data");
-        buffer.truncate(length);
-        buffer
-    }
-}
-
-fn populate_optee_command_queue(session_id: u32, ta_commands: &[TaCommandBase64]) {
-    for ta_command in ta_commands {
-        assert!(
-            (ta_command.args.len() <= UteeParamsTyped::TEE_NUM_PARAMS),
-            "ta_command has more than four arguments."
+        // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
+        // loaded binary and heap. In that sense, we can create (and destroy) a stack
+        // for each command freely.
+        let stack =
+            litebox_shim_optee::loader::init_stack(Some(ta_info.stack_base), params.as_slice())
+                .expect("Failed to initialize stack with parameters");
+        let mut pt_regs = litebox_shim_optee::loader::prepare_registers(
+            ta_info,
+            &stack,
+            session_id,
+            func_id as u32,
+            None,
         );
+        unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };
 
-        let mut params = [const { UteeParamsTyped::None }; UteeParamsTyped::TEE_NUM_PARAMS];
-        for (param, arg) in params.iter_mut().zip(&ta_command.args) {
-            *param = arg.as_utee_params_typed();
+        if func_id == UteeEntryFunc::CloseSession {
+            litebox_shim_optee::deinit_session();
         }
-
-        let func_id = match ta_command.func_id {
-            TaEntryFunc::OpenSession => UteeEntryFunc::OpenSession,
-            TaEntryFunc::CloseSession => UteeEntryFunc::CloseSession,
-            TaEntryFunc::InvokeCommand => UteeEntryFunc::InvokeCommand,
-        };
-
-        // special handling for the KMPP TA whose `OpenSession` expects the session ID
-        if func_id == UteeEntryFunc::OpenSession
-            && let UteeParamsTyped::ValueInput {
-                ref mut value_a,
-                value_b: _,
-            } = params[0]
-            && *value_a == 0
-        {
-            *value_a = u64::from(session_id);
-        }
-
-        submit_optee_command(session_id, func_id, params, ta_command.cmd_id);
     }
 }
