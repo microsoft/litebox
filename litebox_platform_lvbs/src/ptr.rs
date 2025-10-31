@@ -18,24 +18,69 @@ impl<T: Clone> core::fmt::Debug for UserConstPtr<T> {
     }
 }
 
+unsafe fn read_at_offset<'a, T: Clone>(
+    ptr: *const T,
+    count: isize,
+) -> Option<alloc::borrow::Cow<'a, T>> {
+    if ptr.is_null() {
+        return None;
+    }
+    if ptr.is_aligned() {
+        Some(alloc::borrow::Cow::Borrowed(unsafe { &*ptr.offset(count) }))
+    } else {
+        // TODO: consider whether we should use `litebox_platform_linux_kernel`'s `memcpy_fallible`.
+        // `litebox_platform_lvbs` currently preallocates all memory, so there would be no page fault.
+        let mut buffer = core::mem::MaybeUninit::<T>::uninit();
+        let buffer = unsafe {
+            core::ptr::copy_nonoverlapping(
+                ptr.offset(count).cast::<u8>(),
+                buffer.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of::<T>(),
+            );
+            buffer.assume_init()
+        };
+        Some(alloc::borrow::Cow::Owned(buffer))
+    }
+}
+
+unsafe fn to_cow_slice<'a, T: Clone>(
+    ptr: *const T,
+    len: usize,
+) -> Option<alloc::borrow::Cow<'a, [T]>> {
+    if ptr.is_null() {
+        return None;
+    }
+    if len == 0 {
+        return Some(alloc::borrow::Cow::Owned(alloc::vec::Vec::new()));
+    }
+    if ptr.is_aligned() {
+        Some(alloc::borrow::Cow::Borrowed(unsafe {
+            core::slice::from_raw_parts(ptr, len)
+        }))
+    } else {
+        // TODO: consider whether we should need `litebox_platform_linux_kernel`'s `memcpy_fallible`.
+        // `litebox_platform_lvbs` currently preallocates all memory, so there would be no page fault.
+        let mut buffer = alloc::vec::Vec::<T>::with_capacity(len);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                ptr.cast::<u8>(),
+                buffer.as_mut_ptr().cast::<u8>(),
+                len * core::mem::size_of::<T>(),
+            );
+            buffer.set_len(len);
+        }
+        Some(alloc::borrow::Cow::Owned(buffer))
+    }
+}
+
 impl<T: Clone> Copy for UserConstPtr<T> {}
 impl<T: Clone> RawConstPointer<T> for UserConstPtr<T> {
     unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
-        if self.inner.is_null() || !self.inner.is_aligned() {
-            return None;
-        }
-        Some(alloc::borrow::Cow::Borrowed(unsafe {
-            &*self.inner.offset(count)
-        }))
+        unsafe { read_at_offset(self.inner, count) }
     }
 
     unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
-        if self.inner.is_null() || !self.inner.is_aligned() {
-            return None;
-        }
-        Some(alloc::borrow::Cow::Borrowed(unsafe {
-            core::slice::from_raw_parts(self.inner, len)
-        }))
+        unsafe { to_cow_slice(self.inner, len) }
     }
 
     fn as_usize(&self) -> usize {
@@ -76,21 +121,11 @@ impl<T: Clone> core::fmt::Debug for UserMutPtr<T> {
 impl<T: Clone> Copy for UserMutPtr<T> {}
 impl<T: Clone> RawConstPointer<T> for UserMutPtr<T> {
     unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
-        if self.inner.is_null() || !self.inner.is_aligned() {
-            return None;
-        }
-        Some(alloc::borrow::Cow::Borrowed(unsafe {
-            &*self.inner.offset(count)
-        }))
+        unsafe { read_at_offset(self.inner, count) }
     }
 
     unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
-        if self.inner.is_null() || !self.inner.is_aligned() {
-            return None;
-        }
-        Some(alloc::borrow::Cow::Borrowed(unsafe {
-            core::slice::from_raw_parts(self.inner, len)
-        }))
+        unsafe { to_cow_slice(self.inner, len) }
     }
 
     fn as_usize(&self) -> usize {
@@ -105,11 +140,21 @@ impl<T: Clone> RawConstPointer<T> for UserMutPtr<T> {
 
 impl<T: Clone> RawMutPointer<T> for UserMutPtr<T> {
     unsafe fn write_at_offset(self, count: isize, value: T) -> Option<()> {
-        if self.inner.is_null() || !self.inner.is_aligned() {
+        if self.inner.is_null() {
             return None;
         }
-        unsafe {
-            *self.inner.offset(count) = value;
+        if self.inner.is_aligned() {
+            unsafe {
+                *self.inner.offset(count) = value;
+            }
+        } else {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (&raw const value).cast::<u8>(),
+                    self.inner.offset(count).cast::<u8>(),
+                    core::mem::size_of::<T>(),
+                );
+            }
         }
         Some(())
     }

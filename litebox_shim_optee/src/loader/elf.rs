@@ -419,7 +419,7 @@ impl ElfLoader {
         // To avoid this problem, `litebox_shim_optee` initializes the guest TLS by
         // allocating a guest page and programming the FS base to point to the allocated page.
         // Note that we use `PunchthroughSyscall::SetFsBase` for this purpose not to deal with
-        // the underlying platform behaviors (i.e., swapping FS and GS).
+        // the underlying platform behaviors.
         // Two alternatives:
         // 1) Initialize the guest TLS at the runner.
         // 2) Write a minimal ldelf and bundle it with each OP-TEE TA.
