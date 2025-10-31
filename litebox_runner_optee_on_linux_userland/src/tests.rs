@@ -16,7 +16,6 @@ pub fn run_ta_with_test_commands(ta_info: &ElfLoadInfo, prog_name: &str, json_pa
     };
     let is_kmpp_ta = prog_name.contains("kmpp-ta.elf.hooked");
 
-    let mut session_id: u32 = 0;
     for cmd in ta_commands {
         assert!(
             (cmd.args.len() <= UteeParamOwned::TEE_NUM_PARAMS),
@@ -34,17 +33,6 @@ pub fn run_ta_with_test_commands(ta_info: &ElfLoadInfo, prog_name: &str, json_pa
             TaEntryFunc::InvokeCommand => UteeEntryFunc::InvokeCommand,
         };
 
-        // special handling for the KMPP TA whose `OpenSession` expects a session ID that we cannot determine in advance
-        if is_kmpp_ta
-            && func_id == UteeEntryFunc::OpenSession
-            && let UteeParamOwned::ValueInput {
-                ref mut value_a,
-                value_b: _,
-            } = params[0]
-        {
-            *value_a = u64::from(session_id);
-        }
-
         if func_id == UteeEntryFunc::OpenSession {
             let _litebox = litebox_shim_optee::init_session(
                 &TeeUuid::default(),
@@ -53,7 +41,17 @@ pub fn run_ta_with_test_commands(ta_info: &ElfLoadInfo, prog_name: &str, json_pa
                     uuid: TeeUuid::default(),
                 },
             );
-            session_id = litebox_shim_optee::get_session_id();
+        }
+
+        // special handling for the KMPP TA whose `OpenSession` expects a session ID that we cannot determine in advance
+        if is_kmpp_ta
+            && func_id == UteeEntryFunc::OpenSession
+            && let UteeParamOwned::ValueInput {
+                ref mut value_a,
+                value_b: _,
+            } = params[0]
+        {
+            *value_a = u64::from(litebox_shim_optee::get_session_id());
         }
 
         let stack =
@@ -62,7 +60,7 @@ pub fn run_ta_with_test_commands(ta_info: &ElfLoadInfo, prog_name: &str, json_pa
         let mut pt_regs = litebox_shim_optee::loader::prepare_registers(
             ta_info,
             &stack,
-            session_id,
+            litebox_shim_optee::get_session_id(),
             func_id as u32,
             Some(cmd.cmd_id),
         );

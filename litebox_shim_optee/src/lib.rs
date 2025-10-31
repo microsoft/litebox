@@ -10,7 +10,8 @@ extern crate alloc;
 use once_cell::race::OnceBox;
 
 use aes::{Aes128, Aes192, Aes256};
-use alloc::vec;
+use alloc::{collections::vec_deque::VecDeque, vec};
+use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use ctr::Ctr128BE;
 use hashbrown::HashMap;
 use litebox::{
@@ -40,10 +41,11 @@ pub fn init_session<'a>(
 ) -> &'a LiteBox<Platform> {
     SHIM_TLS.init(OpteeShimTls {
         current_task: Task {
-            // TODO: generate a unique session ID
-            session_id: 1,
+            session_id: session_id_pool().allocate(),
             ta_app_id: *ta_app_id,
             client_identity: *client_identity,
+            tee_cryp_state_map: TeeCrypStateMap::new(),
+            tee_obj_map: TeeObjMap::new(),
         },
     });
     litebox()
@@ -51,11 +53,14 @@ pub fn init_session<'a>(
 
 /// Deinitialize the shim for the current task.
 pub fn deinit_session() {
+    let session_id = get_session_id();
     SHIM_TLS.deinit();
+    session_id_pool().recycle(session_id);
 }
 
-/// Return the session ID of the current task.
-/// Note. OP-TEE does not have a syscall to get the session ID. This function is for internal use only.
+/// Get the session ID of the current task.
+/// Note. OP-TEE does not have a syscall to get the session ID. When the kernel runs a TA,
+/// it passes the session ID to the TA through a CPU register. This function is for internal use only.
 pub fn get_session_id() -> u32 {
     with_current_task(|task| task.session_id)
 }
@@ -323,10 +328,8 @@ where
 /// representation (i.e., doesn't have to match the original OP-TEE data structure).
 ///
 /// NOTE: This data structure is unstable and can be changed in the future.
-///
-/// TODO: OP-TEE OS manages `TeeObj` per session and per handle.
 #[derive(Clone)]
-pub struct TeeObj {
+pub(crate) struct TeeObj {
     info: TeeObjectInfo,
     busy: bool,
     key: Option<alloc::boxed::Box<[u8]>>,
@@ -341,6 +344,7 @@ impl TeeObj {
         }
     }
 
+    #[expect(dead_code)]
     pub fn info(&self) -> &TeeObjectInfo {
         &self.info
     }
@@ -465,11 +469,6 @@ impl TeeObjMap {
     }
 }
 
-pub(crate) fn tee_obj_map() -> &'static TeeObjMap {
-    static TEE_OBJ_MAP: OnceBox<TeeObjMap> = OnceBox::new();
-    TEE_OBJ_MAP.get_or_init(|| alloc::boxed::Box::new(TeeObjMap::new()))
-}
-
 /// A data structure to represent a TEE cryptography state referenced by `TeeCrypStateHandle`.
 /// This is an in-kernel data structure such that we can have our own
 /// representation (i.e., doesn't have to match the original OP-TEE data structure).
@@ -477,7 +476,7 @@ pub(crate) fn tee_obj_map() -> &'static TeeObjMap {
 ///
 /// NOTE: This data structure is unstable and can be changed in the future.
 #[derive(Clone)]
-pub struct TeeCrypState {
+pub(crate) struct TeeCrypState {
     algo: TeeAlgorithm,
     mode: TeeOperationMode,
     objs: [Option<TeeObjHandle>; 2],
@@ -507,6 +506,7 @@ impl TeeCrypState {
         TeeAlgorithmClass::from(self.algo)
     }
 
+    #[expect(dead_code)]
     pub fn operation_mode(&self) -> TeeOperationMode {
         self.mode
     }
@@ -516,6 +516,7 @@ impl TeeCrypState {
         self.objs[index]
     }
 
+    #[expect(dead_code)]
     pub fn set_cipher(&mut self, cipher: &Cipher) {
         self.cipher = Some(cipher.clone());
     }
@@ -525,9 +526,10 @@ impl TeeCrypState {
     }
 }
 
+#[allow(clippy::enum_variant_names)]
 #[non_exhaustive]
 #[derive(Clone)]
-pub enum Cipher {
+pub(crate) enum Cipher {
     Aes128Ctr(Ctr128BE<Aes128>),
     Aes192Ctr(Ctr128BE<Aes192>),
     Aes256Ctr(Ctr128BE<Aes256>),
@@ -536,8 +538,6 @@ pub enum Cipher {
 /// A data structure to manage `TeeCrypState` per handle.
 ///
 /// NOTE: This data structure is unstable and can be changed in the future.
-///
-/// TODO: OP-TEE OS manages `TeeCrypState` per session and per handle.
 pub(crate) struct TeeCrypStateMap {
     inner: spin::mutex::SpinMutex<HashMap<TeeCrypStateHandle, TeeCrypState>>,
 }
@@ -595,16 +595,13 @@ impl TeeCrypStateMap {
     }
 }
 
-pub(crate) fn tee_cryp_state_map() -> &'static TeeCrypStateMap {
-    static TEE_CRYPT_STATE_MAP: OnceBox<TeeCrypStateMap> = OnceBox::new();
-    TEE_CRYPT_STATE_MAP.get_or_init(|| alloc::boxed::Box::new(TeeCrypStateMap::new()))
-}
-
+// Note. OP-TEE does not specify that this information shall be stored in TLS.
+// We use TLS for better modularity.
 struct OpteeShimTls {
-    // Note. OP-TEE does not specify that this information shall be stored in TLS.
-    // We use TLS for better modularity.
+    /// TA/session-related information for the current task
     current_task: Task,
 }
+// TODO: OP-TEE supports global, persistent objects across sessions. Implement this map if needed.
 
 /// TA/session-related information for the current task
 struct Task {
@@ -614,6 +611,10 @@ struct Task {
     ta_app_id: TeeUuid,
     /// Client identity (VTL0 process or another TA)
     client_identity: TeeIdentity,
+    /// TEE cryptography state map (per session)
+    tee_cryp_state_map: TeeCrypStateMap,
+    /// TEE object map (per session)
+    tee_obj_map: TeeObjMap,
     // TODO: add more fields as needed
 }
 
@@ -624,4 +625,53 @@ litebox::shim_thread_local! {
 
 fn with_current_task<R>(f: impl FnOnce(&Task) -> R) -> R {
     SHIM_TLS.with(|tls| f(&tls.current_task))
+}
+
+pub struct SessionIdPool {
+    inner: spin::mutex::SpinMutex<VecDeque<u32>>,
+    next_session_id: AtomicU32,
+}
+
+impl SessionIdPool {
+    const PTA_SESSION_ID: u32 = 0xffff_fffe;
+
+    pub fn new() -> Self {
+        SessionIdPool {
+            inner: spin::mutex::SpinMutex::new(VecDeque::new()),
+            next_session_id: AtomicU32::new(1),
+        }
+    }
+
+    pub fn allocate(&self) -> u32 {
+        let mut inner = self.inner.lock();
+        if let Some(session_id) = inner.pop_front() {
+            session_id
+        } else {
+            let mut session_id = self.next_session_id.fetch_add(1, SeqCst);
+            if session_id == Self::PTA_SESSION_ID {
+                session_id = self.next_session_id.fetch_add(1, SeqCst);
+            }
+            session_id
+        }
+    }
+
+    pub fn recycle(&self, session_id: u32) {
+        let mut inner = self.inner.lock();
+        inner.push_back(session_id);
+    }
+
+    pub fn get_pta_session_id() -> u32 {
+        Self::PTA_SESSION_ID
+    }
+}
+
+impl Default for SessionIdPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn session_id_pool<'a>() -> &'a SessionIdPool {
+    static SESSION_ID_POOL: OnceBox<SessionIdPool> = OnceBox::new();
+    SESSION_ID_POOL.get_or_init(|| alloc::boxed::Box::new(SessionIdPool::new()))
 }

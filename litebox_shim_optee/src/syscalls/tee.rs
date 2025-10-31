@@ -12,9 +12,7 @@ use num_enum::TryFromPrimitive;
 
 use crate::{
     litebox_page_manager,
-    syscalls::pta::{
-        close_pta_session, get_pta_session_id, handle_system_pta_command, is_pta, is_pta_session,
-    },
+    syscalls::pta::{close_pta_session, handle_system_pta_command, is_pta, is_pta_session},
 };
 
 #[inline]
@@ -205,7 +203,7 @@ pub fn sys_open_ta_session(
         // several import services (it works as a proxy for extra system calls).
         unsafe {
             ta_sess_id
-                .write_at_offset(0, get_pta_session_id())
+                .write_at_offset(0, crate::SessionIdPool::get_pta_session_id())
                 .ok_or(TeeResult::AccessDenied)?;
         }
         Ok(())
