@@ -582,8 +582,7 @@ syscall_callback:
     mov esp, fs:host_sp@ntpoff
     mov ebp, fs:host_bp@ntpoff
 
-    // Save guest gs and switch to host gs
-    mov fs:guest_gs@tpoff, gs
+    // Switch to host gs
     mov ax, fs
     mov gs, ax
 
@@ -686,8 +685,6 @@ host_sp:
 host_bp:
     .long 0
 guest_context_top:
-    .long 0
-guest_gs:
     .long 0
 in_guest:
     .long 0
@@ -1095,8 +1092,6 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                     core::arch::asm!(
                         "mov esp, {0}",
                         "mov BYTE PTR gs:in_guest@ntpoff, 1",
-                        // Switch to guest gs
-                        "mov gs, gs:guest_gs@tpoff",
                         "mov eax, {SYSCALL_NUM}",
                         "int 0x80", // invokes rt_sigreturn
                         in(reg) stack,
