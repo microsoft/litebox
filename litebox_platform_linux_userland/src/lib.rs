@@ -268,10 +268,13 @@ impl LinuxUserland {
 
             // Check if the line corresponds to the vdso
             // Alternatively, we could read it from `/proc/self/auxv`
-            if let Some(last) = parts.last()
-                && *last == "[vdso]"
+            #[cfg(feature = "systrap_backend")]
             {
-                vdso_address = Some(start);
+                if let Some(last) = parts.last()
+                    && *last == "[vdso]"
+                {
+                    vdso_address = Some(start);
+                }
             }
         }
         (reserved_pages, vdso_address)
