@@ -30,7 +30,9 @@ use litebox::{
     mm::{PageManager, linux::PAGE_SIZE},
     net::Network,
     pipes::Pipes,
-    platform::{RawConstPointer as _, RawMutPointer as _},
+    platform::{
+        PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutPointer as _,
+    },
     sync::{RwLock, futex::FutexManager},
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
@@ -71,6 +73,23 @@ impl litebox::shim::EnterShim for LinuxShim {
             ContinueOperation::ResumeGuest => {}
             ContinueOperation::ExitThread(_) | ContinueOperation::ExitProcess(_) => {
                 SHIM_TLS.deinit();
+            }
+            // TEMP: this must be done outside of with_current_task to avoid leaking a borrow.
+            // Remove this once rt_sigreturn is handled natively by the shim.
+            ContinueOperation::RtSigreturn(stack) => {
+                let punchthrough = litebox_common_linux::PunchthroughSyscall::RtSigreturn { stack };
+                let token = litebox_platform_multiplex::platform()
+                    .get_punchthrough_token_for(punchthrough)
+                    .expect("Failed to get punchthrough token for RT_SIGRETURN");
+                token
+                    .execute()
+                    .map(|_| ())
+                    .map_err(|e| match e {
+                        litebox::platform::PunchthroughError::Failure(errno) => errno,
+                        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+                    })
+                    .expect("rt_sigreturn failed");
+                unreachable!("rt_sigreturn should not return");
             }
         }
         r
@@ -608,7 +627,7 @@ impl Task {
                     Err(Errno::EINVAL)
                 }
             }
-            SyscallRequest::RtSigreturn { stack } => self.sys_rt_sigreturn(stack),
+            SyscallRequest::RtSigreturn { stack } => return ContinueOperation::RtSigreturn(stack),
             SyscallRequest::Ioctl { fd, arg } => self.sys_ioctl(fd, arg).map(|v| v as usize),
             SyscallRequest::Pread64 {
                 fd,

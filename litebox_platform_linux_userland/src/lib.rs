@@ -1593,6 +1593,8 @@ fn continue_operation(op: ContinueOperation, ctx: &mut litebox_common_linux::PtR
                 ctx.eax = status.reinterpret_as_unsigned() as usize;
             }
         }
+        #[cfg(feature = "linux_syscall")]
+        ContinueOperation::RtSigreturn(..) => unreachable!(),
     }
 }
 

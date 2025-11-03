@@ -1435,6 +1435,7 @@ fn continue_operation(op: ContinueOperation, ctx: &mut litebox_common_linux::PtR
         ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
             ctx.rax = status.reinterpret_as_unsigned() as usize;
         }
+        ContinueOperation::RtSigreturn(..) => unreachable!(),
     }
 }
 

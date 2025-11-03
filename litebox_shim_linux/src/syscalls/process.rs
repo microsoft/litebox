@@ -191,23 +191,6 @@ impl Task {
             _ => unimplemented!("Unsupported punchthrough error {:?}", e),
         })
     }
-
-    /// Handle syscall `rt_sigreturn`.
-    pub(crate) fn sys_rt_sigreturn(&self, stack: usize) -> ! {
-        let punchthrough = litebox_common_linux::PunchthroughSyscall::RtSigreturn { stack };
-        let token = litebox_platform_multiplex::platform()
-            .get_punchthrough_token_for(punchthrough)
-            .expect("Failed to get punchthrough token for RT_SIGRETURN");
-        token
-            .execute()
-            .map(|_| ())
-            .map_err(|e| match e {
-                litebox::platform::PunchthroughError::Failure(errno) => errno,
-                _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-            })
-            .expect("rt_sigreturn failed");
-        unreachable!("rt_sigreturn should not return");
-    }
 }
 
 const ROBUST_LIST_LIMIT: isize = 2048;

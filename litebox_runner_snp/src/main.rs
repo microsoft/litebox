@@ -167,6 +167,7 @@ pub extern "C" fn do_syscall_64(pt_regs: &mut litebox_common_linux::PtRegs) {
         ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
             pt_regs.rax = status.cast_unsigned() as usize;
         }
+        ContinueOperation::RtSigreturn(..) => unreachable!(),
     }
 }
 
