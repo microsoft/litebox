@@ -220,9 +220,12 @@ fn wake_robust_list(
         litebox_common_linux::RobustListHead<litebox_platform_multiplex::Platform>,
     >,
 ) -> Result<(), Errno> {
+    // This function is called when a thread is exiting or calling execve.
+    // The robust list may be unmapped already at this point, so we need to handle
+    // invalid memory accesses gracefully.
     let mut limit = ROBUST_LIST_LIMIT;
     let head_ptr = head.as_usize();
-    let head = unsafe { head.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+    let head = unsafe { head.fallible_read_at_offset(0) }.ok_or(Errno::EFAULT)?;
     let (mut entry, mut pi) = fetch_robust_entry(head.list.next);
     let (pending, ppi) = fetch_robust_entry(head.list_op_pending);
     let futex_offset = head.futex_offset;
@@ -232,7 +235,7 @@ fn wake_robust_list(
             list
         );
     while entry.as_usize() != entry_head && limit > 0 {
-        let nxt = unsafe { entry.read_at_offset(0) }.map(|e| fetch_robust_entry(e.next));
+        let nxt = unsafe { entry.fallible_read_at_offset(0) }.map(|e| fetch_robust_entry(e.next));
         if entry.as_usize() != pending.as_usize() {
             handle_futex_death(
                 crate::ConstPtr::from_usize(entry.as_usize() + futex_offset),

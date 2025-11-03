@@ -423,4 +423,15 @@ mod tests {
 
         task.sys_munmap(addr, 0x2000).unwrap();
     }
+
+    // Signal support for Windows is not ready yet.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_fallible_read() {
+        init_platform(None);
+
+        let ptr = crate::MutPtr::<u8>::from_usize(0xdeadbeef);
+        let result = unsafe { ptr.fallible_read_at_offset(0) };
+        assert!(result.is_none());
+    }
 }
