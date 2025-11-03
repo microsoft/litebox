@@ -306,9 +306,16 @@ impl Task {
             .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     }
 
-    pub(crate) fn sys_exit(&self, _status: i32) {}
+    pub(crate) fn sys_exit(&self, _status: i32) {
+        // Nothing to do yet. The `Task` will be dropped on the way out of the
+        // shim, which will call `self.prepare_for_exit()`.
+    }
 
-    pub(crate) fn sys_exit_group(&self, _status: i32) {}
+    pub(crate) fn sys_exit_group(&self, _status: i32) {
+        // Tear down occurs similarly to `sys_exit`.
+        //
+        // TODO: remotely kill other threads.
+    }
 }
 
 /// A descriptor for thread-local storage (TLS).
@@ -347,7 +354,11 @@ impl litebox::shim::InitThread for NewThreadArgs {
 
         let child_tid = task.tid;
 
-        // Set the TLS for the guest program
+        // Set the TLS for the guest program.
+        //
+        // Note that the following calls happen _before_ setting `SHIM_TLS`, so
+        // any calls to `with_current_task` will panic. This should be OK--only
+        // entry point code should be calling `with_current_task`.
         if let Some(tls) = tls {
             // Set the TLS base pointer for the new thread
             #[cfg(target_arch = "x86")]
