@@ -56,22 +56,12 @@ pub fn is_pta(ta_uuid: &TeeUuid, params: &UteeParams) -> bool {
         && params.get_type(3).is_ok_and(|t| t == TeeParamType::None)
 }
 
-// TODO: use a fixed session ID for now. Replace it with a proper implementation.
-const PTA_SESSION_ID: u32 = 0xffff_fffe;
-
-/// Create and return a PTA session ID
-pub fn get_pta_session_id() -> u32 {
-    // TODO: replace it with a proper implementation.
-    PTA_SESSION_ID
-}
-
 // TODO: replace it with a proper implementation.
 pub fn close_pta_session(_ta_session_id: u32) {}
 
 /// Check whether a given session ID is associated with a PTA.
 pub fn is_pta_session(ta_sess_id: u32) -> bool {
-    // TODO: replace it with a proper implementation.
-    ta_sess_id == PTA_SESSION_ID
+    ta_sess_id == crate::SessionIdPool::get_pta_session_id()
 }
 
 /// Handle a command of the system PTA.

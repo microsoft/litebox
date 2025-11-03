@@ -1,14 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
+use litebox_common_optee::{TeeIdentity, TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned};
 use litebox_platform_multiplex::Platform;
+use litebox_shim_optee::loader::ElfLoadInfo;
 use std::path::PathBuf;
 
-#[cfg(not(test))]
-use litebox_common_optee::{TeeIdentity, TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned};
-#[cfg(not(test))]
-use litebox_shim_optee::loader::ElfLoadInfo;
-
-#[cfg(test)]
 mod tests;
 
 #[derive(Parser, Debug)]
@@ -92,24 +88,22 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let loaded_ta = litebox_shim_optee::loader::load_elf_buffer(prog_data.as_slice())?;
 
-    #[cfg(not(test))]
-    run_ta_with_default_commands(&loaded_ta);
-
-    #[cfg(test)]
-    tests::run_ta_with_test_commands(
-        &loaded_ta,
-        cli_args.program.as_str(),
-        &PathBuf::from(&cli_args.command_sequence),
-    );
+    if cli_args.command_sequence.is_empty() {
+        run_ta_with_default_commands(&loaded_ta);
+    } else {
+        tests::run_ta_with_test_commands(
+            &loaded_ta,
+            cli_args.program.as_str(),
+            &PathBuf::from(&cli_args.command_sequence),
+        );
+    }
     Ok(())
 }
 
 /// This function simply opens and closes a session to the TA to verify that
 /// it can be loaded and run. Note that an OP-TEE TA does nothing without
 /// a client invoking commands on it.
-#[cfg(not(test))]
 fn run_ta_with_default_commands(ta_info: &ElfLoadInfo) {
-    let mut session_id: u32 = 0;
     for func_id in [UteeEntryFunc::OpenSession, UteeEntryFunc::CloseSession] {
         let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
 
@@ -124,7 +118,6 @@ fn run_ta_with_default_commands(ta_info: &ElfLoadInfo) {
                     uuid: TeeUuid::default(),
                 },
             );
-            session_id = litebox_shim_optee::get_session_id();
         }
 
         // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
@@ -136,7 +129,7 @@ fn run_ta_with_default_commands(ta_info: &ElfLoadInfo) {
         let mut pt_regs = litebox_shim_optee::loader::prepare_registers(
             ta_info,
             &stack,
-            session_id,
+            litebox_shim_optee::get_session_id(),
             func_id as u32,
             None,
         );

@@ -1,5 +1,6 @@
 //! Implementation of cryptography related syscalls
 
+use crate::with_current_task;
 use aes::{
     Aes128, Aes192, Aes256,
     cipher::{NewCipher, StreamCipher, generic_array::GenericArray},
@@ -11,7 +12,7 @@ use litebox_common_optee::{
     TeeObjectType, TeeOperationMode, TeeResult, UteeAttribute,
 };
 
-use crate::{Cipher, MutPtr, TeeCrypState, TeeObj, tee_cryp_state_map, tee_obj_map};
+use crate::{Cipher, MutPtr, TeeCrypState, TeeObj};
 
 pub(crate) fn sys_cryp_state_alloc(
     algo: TeeAlgorithm,
@@ -20,72 +21,78 @@ pub(crate) fn sys_cryp_state_alloc(
     key2: TeeObjHandle,
     state: MutPtr<TeeCrypStateHandle>,
 ) -> Result<(), TeeResult> {
-    if key1 != TeeObjHandle::NULL {
-        if !tee_obj_map().exists(key1) {
-            return Err(TeeResult::BadState);
+    with_current_task(|task| {
+        let tee_cryp_state_map = &task.tee_cryp_state_map;
+        let tee_obj_map = &task.tee_obj_map;
+        if key1 != TeeObjHandle::NULL {
+            if !tee_obj_map.exists(key1) {
+                return Err(TeeResult::BadState);
+            }
+            if tee_obj_map.is_busy(key1) {
+                return Err(TeeResult::BadParameters);
+            }
+            // TODO: validate key type
         }
-        if tee_obj_map().is_busy(key1) {
-            return Err(TeeResult::BadParameters);
+        if key2 != TeeObjHandle::NULL {
+            if !tee_obj_map.exists(key2) {
+                return Err(TeeResult::BadState);
+            }
+            if tee_obj_map.is_busy(key2) {
+                return Err(TeeResult::BadParameters);
+            }
+            // TODO: validate key type
         }
-        // TODO: validate key type
-    }
-    if key2 != TeeObjHandle::NULL {
-        if !tee_obj_map().exists(key2) {
-            return Err(TeeResult::BadState);
+
+        // TODO: validate whether the number of keys is valid
+
+        let cryp_state = TeeCrypState::new(
+            algo,
+            mode,
+            if key1 == TeeObjHandle::NULL {
+                None
+            } else {
+                Some(key1)
+            },
+            if key2 == TeeObjHandle::NULL {
+                None
+            } else {
+                Some(key2)
+            },
+        );
+
+        let handle = tee_cryp_state_map.allocate(&cryp_state);
+        unsafe {
+            state
+                .write_at_offset(0, handle)
+                .ok_or(TeeResult::BadParameters)?;
         }
-        if tee_obj_map().is_busy(key2) {
-            return Err(TeeResult::BadParameters);
+
+        if key1 != TeeObjHandle::NULL {
+            tee_obj_map.set_busy(key1, true);
         }
-        // TODO: validate key type
-    }
-
-    // TODO: validate whether the number of keys is valid
-
-    let cryp_state = TeeCrypState::new(
-        algo,
-        mode,
-        if key1 == TeeObjHandle::NULL {
-            None
-        } else {
-            Some(key1)
-        },
-        if key2 == TeeObjHandle::NULL {
-            None
-        } else {
-            Some(key2)
-        },
-    );
-
-    let handle = tee_cryp_state_map().allocate(&cryp_state);
-    unsafe {
-        state
-            .write_at_offset(0, handle)
-            .ok_or(TeeResult::BadParameters)?;
-    }
-
-    if key1 != TeeObjHandle::NULL {
-        tee_obj_map().set_busy(key1, true);
-    }
-    if key2 != TeeObjHandle::NULL {
-        tee_obj_map().set_busy(key2, true);
-    }
-    Ok(())
+        if key2 != TeeObjHandle::NULL {
+            tee_obj_map.set_busy(key2, true);
+        }
+        Ok(())
+    })
 }
 
 #[allow(clippy::unnecessary_wraps)]
 pub(crate) fn sys_cryp_state_free(state: TeeCrypStateHandle) -> Result<(), TeeResult> {
-    if let Some(cryp_state) = tee_cryp_state_map().get_copy(state) {
-        if let Some(handle) = cryp_state.get_object_handle(true) {
-            tee_obj_map().remove(handle);
+    with_current_task(|task| {
+        let tee_cryp_state_map = &task.tee_cryp_state_map;
+        let tee_obj_map = &task.tee_obj_map;
+        if let Some(cryp_state) = tee_cryp_state_map.get_copy(state) {
+            if let Some(handle) = cryp_state.get_object_handle(true) {
+                tee_obj_map.remove(handle);
+            }
+            if let Some(handle) = cryp_state.get_object_handle(false) {
+                tee_obj_map.remove(handle);
+            }
+            tee_cryp_state_map.remove(state);
         }
-        if let Some(handle) = cryp_state.get_object_handle(false) {
-            tee_obj_map().remove(handle);
-        }
-        tee_cryp_state_map().remove(state);
-    }
-
-    // this function returns `void`
-    Ok(())
+        Ok(())
+    })
 }
 
 fn create_cipher(algo: TeeAlgorithm, key: &[u8], iv: &[u8]) -> Option<Cipher> {
@@ -110,35 +117,39 @@ fn create_cipher(algo: TeeAlgorithm, key: &[u8], iv: &[u8]) -> Option<Cipher> {
 }
 
 pub(crate) fn sys_cipher_init(state: TeeCrypStateHandle, iv: &[u8]) -> Result<(), TeeResult> {
-    if let Some(cryp_state) = tee_cryp_state_map().get_copy(state)
-        && let Some(handle) = cryp_state.get_object_handle(true)
-        && tee_obj_map().exists(handle)
-    {
-        if cryp_state.algorithm_class() != TeeAlgorithmClass::Cipher {
-            return Err(TeeResult::BadState);
-        }
-
-        let tee_obj = tee_obj_map()
-            .get_copy(handle)
-            .ok_or(TeeResult::BadParameters)?;
-        let Some(key) = tee_obj.get_key() else {
-            return Err(TeeResult::BadParameters);
-        };
-
-        if let Some(handle) = cryp_state.get_object_handle(false)
-            && tee_obj_map().exists(handle)
+    with_current_task(|task| {
+        let tee_cryp_state_map = &task.tee_cryp_state_map;
+        let tee_obj_map = &task.tee_obj_map;
+        if let Some(cryp_state) = tee_cryp_state_map.get_copy(state)
+            && let Some(handle) = cryp_state.get_object_handle(true)
+            && tee_obj_map.exists(handle)
         {
-            todo!("support two-key algorithms");
-        }
+            if cryp_state.algorithm_class() != TeeAlgorithmClass::Cipher {
+                return Err(TeeResult::BadState);
+            }
 
-        let Some(cipher) = create_cipher(cryp_state.algorithm(), key, iv) else {
-            todo!("implement algorithm {}", cryp_state.algorithm() as u32);
-        };
-        tee_cryp_state_map().set_cipher(state, &cipher)?;
-        Ok(())
-    } else {
-        Err(TeeResult::BadParameters)
-    }
+            let tee_obj = tee_obj_map
+                .get_copy(handle)
+                .ok_or(TeeResult::BadParameters)?;
+            let Some(key) = tee_obj.get_key() else {
+                return Err(TeeResult::BadParameters);
+            };
+
+            if let Some(handle) = cryp_state.get_object_handle(false)
+                && tee_obj_map.exists(handle)
+            {
+                todo!("support two-key algorithms");
+            }
+
+            let Some(cipher) = create_cipher(cryp_state.algorithm(), key, iv) else {
+                todo!("implement algorithm {}", cryp_state.algorithm() as u32);
+            };
+            tee_cryp_state_map.set_cipher(state, &cipher)?;
+            Ok(())
+        } else {
+            Err(TeeResult::BadParameters)
+        }
+    })
 }
 
 pub(crate) fn sys_cipher_update(
@@ -166,47 +177,53 @@ fn do_cipher_update(
     dst_len: &mut usize,
     last_block: bool,
 ) -> Result<(), TeeResult> {
-    if dst_slice.len() < src_slice.len() {
-        return Err(TeeResult::ShortBuffer);
-    }
-    if let Some(mut map) = tee_cryp_state_map().get_mut(state) {
-        if let &mut Some(ref mut cipher) = &mut map.get_mut(&state).unwrap().get_mut_cipher() {
-            dst_slice.copy_from_slice(src_slice);
-            match cipher {
-                Cipher::Aes128Ctr(aes128ctr) => {
-                    aes128ctr.apply_keystream(&mut dst_slice[..src_slice.len()]);
+    with_current_task(|task| {
+        let tee_cryp_state_map = &task.tee_cryp_state_map;
+        if dst_slice.len() < src_slice.len() {
+            return Err(TeeResult::ShortBuffer);
+        }
+        if let Some(mut map) = tee_cryp_state_map.get_mut(state) {
+            if let &mut Some(ref mut cipher) = &mut map.get_mut(&state).unwrap().get_mut_cipher() {
+                dst_slice.copy_from_slice(src_slice);
+                match cipher {
+                    Cipher::Aes128Ctr(aes128ctr) => {
+                        aes128ctr.apply_keystream(&mut dst_slice[..src_slice.len()]);
+                    }
+                    Cipher::Aes192Ctr(aes192ctr) => {
+                        aes192ctr.apply_keystream(&mut dst_slice[..src_slice.len()]);
+                    }
+                    Cipher::Aes256Ctr(aes256ctr) => {
+                        aes256ctr.apply_keystream(&mut dst_slice[..src_slice.len()]);
+                    }
                 }
-                Cipher::Aes192Ctr(aes192ctr) => {
-                    aes192ctr.apply_keystream(&mut dst_slice[..src_slice.len()]);
-                }
-                Cipher::Aes256Ctr(aes256ctr) => {
-                    aes256ctr.apply_keystream(&mut dst_slice[..src_slice.len()]);
-                }
+                *dst_len = src_slice.len();
             }
-            *dst_len = src_slice.len();
+            if last_block {
+                todo!("support algorithms which have a certain finalization logic");
+            }
+            Ok(())
+        } else {
+            Err(TeeResult::BadParameters)
         }
-        if last_block {
-            todo!("support algorithms which have a certain finalization logic");
-        }
-        Ok(())
-    } else {
-        Err(TeeResult::BadParameters)
-    }
+    })
 }
 
 pub(crate) fn sys_cryp_obj_get_info(
     obj: TeeObjHandle,
     info: MutPtr<TeeObjectInfo>,
 ) -> Result<(), TeeResult> {
-    if tee_obj_map().exists(obj) {
-        let tee_obj = tee_obj_map().get_copy(obj).ok_or(TeeResult::ItemNotFound)?;
-        unsafe {
-            info.write_at_offset(0, tee_obj.info)
-                .ok_or(TeeResult::AccessDenied)
+    with_current_task(|task| {
+        let tee_obj_map = &task.tee_obj_map;
+        if tee_obj_map.exists(obj) {
+            let tee_obj = tee_obj_map.get_copy(obj).ok_or(TeeResult::ItemNotFound)?;
+            unsafe {
+                info.write_at_offset(0, tee_obj.info)
+                    .ok_or(TeeResult::AccessDenied)
+            }
+        } else {
+            Err(TeeResult::BadState)
         }
-    } else {
-        Err(TeeResult::BadState)
-    }
+    })
 }
 
 pub(crate) fn sys_cryp_obj_alloc(
@@ -214,69 +231,84 @@ pub(crate) fn sys_cryp_obj_alloc(
     max_size: u32,
     obj: crate::MutPtr<TeeObjHandle>,
 ) -> Result<(), TeeResult> {
-    let tee_obj = TeeObj::new(typ, max_size);
-    let handle = tee_obj_map().allocate(&tee_obj);
-    if let Some(()) = unsafe { obj.write_at_offset(0, handle) } {
-        Ok(())
-    } else {
-        tee_obj_map().remove(handle);
-        Err(TeeResult::AccessDenied)
-    }
+    with_current_task(|task| {
+        let tee_obj_map = &task.tee_obj_map;
+        let tee_obj = TeeObj::new(typ, max_size);
+        let handle = tee_obj_map.allocate(&tee_obj);
+        if let Some(()) = unsafe { obj.write_at_offset(0, handle) } {
+            Ok(())
+        } else {
+            tee_obj_map.remove(handle);
+            Err(TeeResult::AccessDenied)
+        }
+    })
 }
 
 pub(crate) fn sys_cryp_obj_close(obj: TeeObjHandle) -> Result<(), TeeResult> {
-    if tee_obj_map().exists(obj) {
-        tee_obj_map().remove(obj);
-        Ok(())
-    } else {
-        Err(TeeResult::BadState)
-    }
+    with_current_task(|task| {
+        let tee_obj_map = &task.tee_obj_map;
+        if tee_obj_map.exists(obj) {
+            tee_obj_map.remove(obj);
+            Ok(())
+        } else {
+            Err(TeeResult::BadState)
+        }
+    })
 }
 
 pub(crate) fn sys_cryp_obj_reset(obj: TeeObjHandle) -> Result<(), TeeResult> {
-    if tee_obj_map().exists(obj) {
-        tee_obj_map().reset(obj)
-    } else {
-        Err(TeeResult::BadState)
-    }
+    with_current_task(|task| {
+        let tee_obj_map = &task.tee_obj_map;
+        if tee_obj_map.exists(obj) {
+            tee_obj_map.reset(obj)
+        } else {
+            Err(TeeResult::BadState)
+        }
+    })
 }
 
 pub(crate) fn sys_cryp_obj_populate(
     obj: TeeObjHandle,
     attrs: &[UteeAttribute],
 ) -> Result<(), TeeResult> {
-    if attrs.len() > 1 {
-        todo!("handle multiple attributes");
-    }
-    if !tee_obj_map().exists(obj) {
-        return Err(TeeResult::BadState);
-    }
-    tee_obj_map()
-        .populate(obj, attrs)
-        .map_err(|_| TeeResult::BadParameters)
+    with_current_task(|task| {
+        let tee_obj_map = &task.tee_obj_map;
+        if attrs.len() > 1 {
+            todo!("handle multiple attributes");
+        }
+        if !tee_obj_map.exists(obj) {
+            return Err(TeeResult::BadState);
+        }
+        tee_obj_map
+            .populate(obj, attrs)
+            .map_err(|_| TeeResult::BadParameters)
+    })
 }
 
 pub(crate) fn sys_cryp_obj_copy(dst: TeeObjHandle, src: TeeObjHandle) -> Result<(), TeeResult> {
-    let src_obj = tee_obj_map().get_copy(src).ok_or(TeeResult::BadState)?;
-    if !src_obj
-        .info
-        .handle_flags
-        .contains(litebox_common_optee::TeeHandleFlag::TEE_HANDLE_FLAG_INITIALIZED)
-    {
-        return Err(TeeResult::BadParameters);
-    }
+    with_current_task(|task| {
+        let tee_obj_map = &task.tee_obj_map;
+        let src_obj = tee_obj_map.get_copy(src).ok_or(TeeResult::BadState)?;
+        if !src_obj
+            .info
+            .handle_flags
+            .contains(litebox_common_optee::TeeHandleFlag::TEE_HANDLE_FLAG_INITIALIZED)
+        {
+            return Err(TeeResult::BadParameters);
+        }
 
-    let dst_obj = tee_obj_map().get_copy(dst).ok_or(TeeResult::BadState)?;
-    if dst_obj
-        .info
-        .handle_flags
-        .contains(litebox_common_optee::TeeHandleFlag::TEE_HANDLE_FLAG_INITIALIZED)
-    {
-        return Err(TeeResult::BadParameters);
-    }
+        let dst_obj = tee_obj_map.get_copy(dst).ok_or(TeeResult::BadState)?;
+        if dst_obj
+            .info
+            .handle_flags
+            .contains(litebox_common_optee::TeeHandleFlag::TEE_HANDLE_FLAG_INITIALIZED)
+        {
+            return Err(TeeResult::BadParameters);
+        }
 
-    tee_obj_map().replace(dst, &src_obj);
-    Ok(())
+        tee_obj_map.replace(dst, &src_obj);
+        Ok(())
+    })
 }
 
 pub(crate) fn sys_cryp_random_number_generate(buf: &mut [u8]) -> Result<(), TeeResult> {
