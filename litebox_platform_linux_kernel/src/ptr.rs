@@ -1,8 +1,7 @@
 //! Userspace Pointer Abstraction
 
+use litebox::mm::exception_table::__memcpy_fallible;
 use litebox::platform::{RawConstPointer, RawMutPointer};
-
-use crate::arch::mm::__memcpy_fallible;
 
 /// Represent a user space pointer to a read-only object
 #[repr(C)]
