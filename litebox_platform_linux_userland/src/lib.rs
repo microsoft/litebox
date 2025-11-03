@@ -1076,9 +1076,14 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 unsafe {
                     core::arch::asm!(
                         "mov rsp, {0}",
+                        // Switch to the guest fsbase
+                        "mov BYTE PTR fs:in_guest@tpoff, 1",
+                        "mov rax, fs:guest_fsbase@tpoff",
+                        "wrfsbase rax",
+                        "mov rax, {SYSCALL_NUM}",
                         "syscall", // invokes rt_sigreturn
                         in(reg) stack,
-                        in("rax") syscalls::Sysno::rt_sigreturn as usize,
+                        SYSCALL_NUM = const syscalls::Sysno::rt_sigreturn as usize,
                         options(noreturn)
                     );
                 }
@@ -1086,9 +1091,11 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 unsafe {
                     core::arch::asm!(
                         "mov esp, {0}",
+                        "mov BYTE PTR gs:in_guest@ntpoff, 1",
+                        "mov eax, {SYSCALL_NUM}",
                         "int 0x80", // invokes rt_sigreturn
                         in(reg) stack,
-                        in("rax") syscalls::Sysno::rt_sigreturn as usize,
+                        SYSCALL_NUM = const syscalls::Sysno::rt_sigreturn as usize,
                         options(noreturn)
                     );
                 }
