@@ -220,9 +220,6 @@ fn wake_robust_list(
         litebox_common_linux::RobustListHead<litebox_platform_multiplex::Platform>,
     >,
 ) -> Result<(), Errno> {
-    // This function is called when a thread is exiting or calling execve.
-    // The robust list may be unmapped already at this point, so we need to handle
-    // invalid memory accesses gracefully.
     let mut limit = ROBUST_LIST_LIMIT;
     let head_ptr = head.as_usize();
     let head = unsafe { head.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
