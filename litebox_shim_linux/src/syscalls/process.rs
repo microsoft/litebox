@@ -476,6 +476,7 @@ impl Task {
                         comm: self.comm.clone(),
                         fs: fs.into(),
                         process: self.process.clone(),
+                        files: self.files.clone(), // TODO: !CLONE_FILES support
                     },
                 }),
             )
@@ -1021,7 +1022,7 @@ impl Task {
         };
 
         // Close CLOEXEC descriptors
-        crate::file_descriptors().write().close_on_exec(self);
+        self.files.borrow().close_on_exec();
 
         // unmmap all memory mappings and reset brk
         if let Some(robust_list) = self.robust_list.take() {

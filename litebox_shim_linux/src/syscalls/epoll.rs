@@ -14,6 +14,7 @@ use litebox::{
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
+use super::file::FilesState;
 use crate::{Descriptor, StrongFd};
 
 bitflags::bitflags! {
@@ -35,12 +36,10 @@ pub(crate) enum EpollDescriptor {
     Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
 }
 
-impl TryFrom<&Descriptor> for EpollDescriptor {
-    type Error = Errno;
-
-    fn try_from(desc: &Descriptor) -> Result<Self, Self::Error> {
+impl EpollDescriptor {
+    pub fn try_from(files: &FilesState, desc: &Descriptor) -> Result<Self, Errno> {
         match desc {
-            Descriptor::LiteBoxRawFd(raw_fd) => match StrongFd::from_raw(*raw_fd)? {
+            Descriptor::LiteBoxRawFd(raw_fd) => match StrongFd::from_raw(files, *raw_fd)? {
                 StrongFd::FileSystem(fd) => Ok(EpollDescriptor::File(fd)),
                 StrongFd::Network(fd) => Ok(EpollDescriptor::Socket(fd)),
                 StrongFd::Pipes(fd) => Ok(EpollDescriptor::Pipe(fd)),
@@ -449,17 +448,6 @@ struct PollEntry {
 
 struct PollEntryObserver(Arc<<Platform as litebox::platform::RawMutexProvider>::RawMutex>);
 
-/// Trait for testing `PollSet`.
-pub(crate) trait GetFd {
-    fn get_fd(&self, n: i32) -> Option<&Descriptor>;
-}
-
-impl GetFd for litebox::sync::RwLockReadGuard<'_, Platform, crate::Descriptors> {
-    fn get_fd(&self, n: i32) -> Option<&Descriptor> {
-        (**self).get_fd(n.reinterpret_as_unsigned())
-    }
-}
-
 impl PollSet {
     /// Returns a new empty `PollSet` with the given interest capacity.
     pub fn with_capacity(capacity: usize) -> Self {
@@ -482,11 +470,7 @@ impl PollSet {
 
     /// Waits for any of the fds in the poll set to become ready, or until the
     /// timeout expires.
-    pub fn wait_or_timeout<T: GetFd>(
-        &mut self,
-        mut lock_fds: impl FnMut() -> T,
-        timeout: Option<Duration>,
-    ) {
+    pub fn wait_or_timeout(&mut self, files: &FilesState, timeout: Option<Duration>) {
         let platform = litebox_platform_multiplex::platform();
         let condvar = Arc::new(platform.new_raw_mutex());
 
@@ -494,12 +478,12 @@ impl PollSet {
         let mut register = true;
         let mut is_ready = timeout.is_some_and(|t| t.is_zero());
         loop {
-            let mut fds = lock_fds();
+            let mut fds = files.file_descriptors.read();
             for entry in &mut self.entries {
                 entry.revents = if entry.fd < 0 {
                     continue;
-                } else if let Some(file) = fds.get_fd(entry.fd)
-                    && let Ok(poll_descriptor) = EpollDescriptor::try_from(file)
+                } else if let Some(file) = fds.get_fd(entry.fd.reinterpret_as_unsigned())
+                    && let Ok(poll_descriptor) = EpollDescriptor::try_from(files, file)
                 {
                     let observer = if is_ready || !register {
                         // The poll set is already ready, or we have already
@@ -587,9 +571,11 @@ impl Observer<Events> for PollEntryObserver {
 mod test {
     use alloc::sync::Arc;
     use litebox::event::Events;
+    use litebox::utils::ReinterpretUnsignedExt as _;
     use litebox_common_linux::{EfdFlags, EpollEvent};
 
     use super::EpollFile;
+    use crate::syscalls::file::FilesState;
     use core::time::Duration;
 
     extern crate std;
@@ -667,28 +653,6 @@ mod test {
 
     #[test]
     fn test_poll() {
-        #[derive(Copy, Clone)]
-        struct Fds<'a>(i32, Option<&'a crate::Descriptor>);
-
-        impl super::GetFd for Fds<'_> {
-            fn get_fd(&self, n: i32) -> Option<&crate::Descriptor> {
-                if n == self.0 { self.1 } else { None }
-            }
-        }
-
-        struct FdsOnce<'a>(core::cell::Cell<Option<i32>>, Option<&'a crate::Descriptor>);
-
-        impl super::GetFd for &FdsOnce<'_> {
-            fn get_fd(&self, n: i32) -> Option<&crate::Descriptor> {
-                if Some(n) == self.0.get() {
-                    self.0.set(None);
-                    self.1
-                } else {
-                    None
-                }
-            }
-        }
-
         let task = crate::syscalls::tests::init_platform(None);
 
         let mut set = super::PollSet::with_capacity(0);
@@ -698,14 +662,17 @@ mod test {
             crate::litebox(),
         ));
 
-        let fd = 10;
+        let fd = 10i32;
         let descriptor = crate::Descriptor::Eventfd {
             file: eventfd.clone(),
             close_on_exec: core::sync::atomic::AtomicBool::new(false),
         };
 
-        let no_fds = Fds(-1, None);
-        let fds = Fds(fd, Some(&descriptor));
+        let no_fds = FilesState::new(crate::litebox());
+        let fds = FilesState::new(crate::litebox());
+        fds.file_descriptors
+            .write()
+            .insert_at(descriptor, fd.reinterpret_as_unsigned() as usize);
         set.add_fd(fd, Events::IN);
 
         let revents = |set: &super::PollSet| {
@@ -714,20 +681,16 @@ mod test {
             revents[0]
         };
 
-        set.wait_or_timeout(|| no_fds, None);
+        set.wait_or_timeout(&no_fds, None);
         assert_eq!(revents(&set), Events::NVAL);
 
         eventfd.write(1).unwrap();
-        set.wait_or_timeout(|| fds, None);
+        set.wait_or_timeout(&fds, None);
         assert_eq!(revents(&set), Events::IN);
 
         eventfd.read().unwrap();
-        set.wait_or_timeout(|| fds, Some(Duration::from_millis(100)));
+        set.wait_or_timeout(&fds, Some(Duration::from_millis(100)));
         assert!(revents(&set).is_empty());
-
-        let once = FdsOnce(Some(fd).into(), Some(&descriptor));
-        set.wait_or_timeout(|| &once, Some(Duration::from_millis(100)));
-        assert_eq!(revents(&set), Events::NVAL);
 
         // spawn a thread to write to the eventfd
         let copied_eventfd = eventfd.clone();
@@ -735,7 +698,7 @@ mod test {
             copied_eventfd.write(1).unwrap();
         });
 
-        set.wait_or_timeout(|| fds, None);
+        set.wait_or_timeout(&fds, None);
         assert_eq!(revents(&set), Events::IN);
     }
 

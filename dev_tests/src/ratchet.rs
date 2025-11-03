@@ -33,7 +33,7 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_platform_multiplex/", 1),
             ("litebox_platform_windows_userland/", 7),
             ("litebox_runner_linux_userland/", 1),
-            ("litebox_shim_linux/", 14),
+            ("litebox_shim_linux/", 12),
             ("litebox_shim_optee/", 6),
         ],
         |file| {
@@ -79,6 +79,7 @@ fn ratchet_maybe_uninit() -> Result<()> {
 /// Convenience function to set up a ratchet test, see below for examples.
 ///
 /// `expected` is a list of (file name prefix, expected count) pairs.
+#[track_caller]
 fn ratchet(expected: &[(&str, usize)], f: impl Fn(BufReader<File>) -> Result<usize>) -> Result<()> {
     let all_rs_files = crate::all_rs_files()?.collect::<Vec<std::path::PathBuf>>();
     let mut errors = Vec::new();
@@ -151,7 +152,11 @@ fn ratchet(expected: &[(&str, usize)], f: impl Fn(BufReader<File>) -> Result<usi
     }
 
     if !errors.is_empty() {
-        bail!("Ratchet test failed:\n{}", errors.join("\n\n"));
+        bail!(
+            "Ratchet test failed in {}:\n{}",
+            std::panic::Location::caller(),
+            errors.join("\n\n")
+        );
     }
 
     Ok(())

@@ -14,7 +14,7 @@ use litebox_common_linux::{
 };
 
 use crate::Task;
-use crate::{ConstPtr, Descriptor, MutPtr, file_descriptors, litebox_net};
+use crate::{ConstPtr, Descriptor, MutPtr, litebox_net};
 use crate::{Platform, litebox};
 
 const ADDR_MAX_LEN: usize = 128;
@@ -35,18 +35,21 @@ macro_rules! convert_flags {
 
 pub(super) type SocketFd = litebox::net::SocketFd<Platform>;
 
-fn with_socket_fd<R>(
-    raw_fd: usize,
-    f: impl FnOnce(&SocketFd) -> Result<R, Errno>,
-) -> Result<R, Errno> {
-    let rds = crate::raw_descriptor_store().read();
-    match rds.fd_from_raw_integer(raw_fd) {
-        Ok(fd) => {
-            drop(rds);
-            f(&fd)
+impl super::file::FilesState {
+    fn with_socket_fd<R>(
+        &self,
+        raw_fd: usize,
+        f: impl FnOnce(&SocketFd) -> Result<R, Errno>,
+    ) -> Result<R, Errno> {
+        let rds = self.raw_descriptor_store.read();
+        match rds.fd_from_raw_integer(raw_fd) {
+            Ok(fd) => {
+                drop(rds);
+                f(&fd)
+            }
+            Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
+            Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => Err(Errno::ENOTSOCK),
         }
-        Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
-        Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => Err(Errno::ENOTSOCK),
     }
 }
 
@@ -574,6 +577,7 @@ impl Task {
         flags: SockFlags,
         protocol: Option<litebox_common_linux::Protocol>,
     ) -> Result<u32, Errno> {
+        let files = self.files.borrow();
         let file = match domain {
             AddressFamily::INET => {
                 let protocol = match ty {
@@ -595,7 +599,8 @@ impl Task {
                 let socket = litebox_net().lock().socket(protocol)?;
                 initialize_socket(&socket, ty, flags);
                 Descriptor::LiteBoxRawFd(
-                    crate::raw_descriptor_store()
+                    files
+                        .raw_descriptor_store
                         .write()
                         .fd_into_raw_integer(socket),
                 )
@@ -604,11 +609,13 @@ impl Task {
             AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
             _ => unimplemented!(),
         };
-        file_descriptors()
+        files
+            .file_descriptors
             .write()
             .insert(self, file)
             .map_err(|desc| {
-                self.do_close(desc)
+                files
+                    .do_close(desc)
                     .expect("closing descriptor should succeed");
                 Errno::EMFILE
             })
@@ -693,29 +700,30 @@ impl Task {
             return Err(Errno::EBADF);
         };
 
-        let file_table = file_descriptors().read();
+        let files = self.files.borrow();
+        let file_table = files.file_descriptors.read();
         let socket = file_table.get_fd(sockfd).ok_or(Errno::EBADF)?;
         let file = match socket {
             Descriptor::LiteBoxRawFd(raw_fd) => {
-                with_socket_fd(*raw_fd, |fd| {
+                files.with_socket_fd(*raw_fd, |fd| {
                     drop(file_table); // Drop before possibly-blocking `accept`
                     let sock_type = get_socket_type(fd)?;
                     let fd = accept(fd)?;
                     initialize_socket(&fd, sock_type, flags);
                     Ok(Descriptor::LiteBoxRawFd(
-                        crate::raw_descriptor_store()
-                            .write()
-                            .fd_into_raw_integer(fd),
+                        files.raw_descriptor_store.write().fd_into_raw_integer(fd),
                     ))
                 })?
             }
             _ => return Err(Errno::ENOTSOCK),
         };
-        file_descriptors()
+        files
+            .file_descriptors
             .write()
             .insert(self, file)
             .map_err(|desc| {
-                self.do_close(desc)
+                files
+                    .do_close(desc)
                     .expect("closing descriptor should succeed");
                 Errno::EMFILE
             })
@@ -727,8 +735,14 @@ impl Task {
             return Err(Errno::EBADF);
         };
 
-        match file_descriptors().read().get_fd(fd).ok_or(Errno::EBADF)? {
-            Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
+        let files = self.files.borrow();
+        match files
+            .file_descriptors
+            .read()
+            .get_fd(fd)
+            .ok_or(Errno::EBADF)?
+        {
+            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
                 let SocketAddress::Inet(addr) = sockaddr;
                 connect(fd, addr)
             }),
@@ -742,12 +756,14 @@ impl Task {
             return Err(Errno::EBADF);
         };
 
-        match file_descriptors()
+        let files = self.files.borrow();
+        match files
+            .file_descriptors
             .read()
             .get_fd(sockfd)
             .ok_or(Errno::EBADF)?
         {
-            Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
+            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
                 let SocketAddress::Inet(addr) = sockaddr;
                 bind(fd, addr)
             }),
@@ -761,12 +777,16 @@ impl Task {
             return Err(Errno::EBADF);
         };
 
-        match file_descriptors()
+        let files = self.files.borrow();
+        match files
+            .file_descriptors
             .read()
             .get_fd(sockfd)
             .ok_or(Errno::EBADF)?
         {
-            Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| listen(fd, backlog)),
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                files.with_socket_fd(*raw_fd, |fd| listen(fd, backlog))
+            }
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -785,10 +805,11 @@ impl Task {
         };
 
         let buf = unsafe { buf.to_cow_slice(len).ok_or(Errno::EFAULT) }?;
-        let file_table = file_descriptors().read();
+        let files = self.files.borrow();
+        let file_table = files.file_descriptors.read();
         let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
         match socket {
-            Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
+            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
                 let sockaddr = sockaddr.map(|SocketAddress::Inet(addr)| addr);
                 drop(file_table); // Drop before possibly-blocking `sendto`
                 sendto(fd, &buf, flags, sockaddr)
@@ -810,9 +831,10 @@ impl Task {
             return Err(Errno::EBADF);
         };
 
-        let file_table = file_descriptors().read();
+        let files = self.files.borrow();
+        let file_table = files.file_descriptors.read();
         match file_table.get_fd(fd).ok_or(Errno::EBADF)? {
-            Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
+            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
                 let mut buffer: [u8; 4096] = [0; 4096];
                 let mut addr = None;
                 drop(file_table); // Drop before possibly-blocking `receive`
@@ -848,13 +870,15 @@ impl Task {
             return Err(Errno::EBADF);
         };
 
-        match file_descriptors()
+        let files = self.files.borrow();
+        match files
+            .file_descriptors
             .read()
             .get_fd(sockfd)
             .ok_or(Errno::EBADF)?
         {
             Descriptor::LiteBoxRawFd(raw_fd) => {
-                with_socket_fd(*raw_fd, |fd| setsockopt(fd, optname, optval, optlen))
+                files.with_socket_fd(*raw_fd, |fd| setsockopt(fd, optname, optval, optlen))
             }
             _ => Err(Errno::ENOTSOCK),
         }
@@ -872,13 +896,15 @@ impl Task {
             return Err(Errno::EBADF);
         };
 
-        match file_descriptors()
+        let files = self.files.borrow();
+        match files
+            .file_descriptors
             .read()
             .get_fd(sockfd)
             .ok_or(Errno::EBADF)?
         {
             Descriptor::LiteBoxRawFd(raw_fd) => {
-                with_socket_fd(*raw_fd, |fd| getsockopt(fd, optname, optval, optlen))
+                files.with_socket_fd(*raw_fd, |fd| getsockopt(fd, optname, optval, optlen))
             }
             _ => Err(Errno::ENOTSOCK),
         }
@@ -890,12 +916,14 @@ impl Task {
             return Err(Errno::EBADF);
         };
 
-        match file_descriptors()
+        let files = self.files.borrow();
+        match files
+            .file_descriptors
             .read()
             .get_fd(sockfd)
             .ok_or(Errno::EBADF)?
         {
-            Descriptor::LiteBoxRawFd(raw_fd) => with_socket_fd(*raw_fd, |fd| {
+            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
                 litebox_net().lock().get_local_addr(fd).map_err(Errno::from)
             }),
             _ => Err(Errno::ENOTSOCK),
