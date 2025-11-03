@@ -375,43 +375,6 @@ where
     /// unchanged for the entirety of the lifetime that the borrow (if any) is made.
     unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>>;
 
-    /// Read the value of the pointer at signed offset from it, in a fallible manner.
-    /// It can recover from invalid memory access through exception table lookups.
-    ///
-    /// # Safety
-    ///
-    /// **Important**: This function is only "fallible" if the underlying platform:
-    /// 1. Has a page fault/exception handler installed
-    /// 2. Uses [`crate::mm::exception_table::search_exception_tables`] to look up recovery addresses
-    /// 3. Redirects execution to the recovery point when a fault occurs in `__memcpy_fallible`
-    ///
-    /// If the platform does not implement proper exception handling, this function will still
-    /// trigger SIGSEGV, segmentation faults, or other fatal exceptions when accessing invalid memory.
-    ///
-    /// # Returns
-    ///
-    /// - `Some(T)` if the memory was successfully read
-    /// - `None` otherwise
-    unsafe fn fallible_read_at_offset(self, count: isize) -> Option<T> {
-        match unsafe { self.read_at_offset(count) }? {
-            alloc::borrow::Cow::Borrowed(b) => {
-                let mut data = core::mem::MaybeUninit::<T>::uninit();
-                let failed_bytes = unsafe {
-                    crate::mm::exception_table::__memcpy_fallible(
-                        data.as_mut_ptr().cast(),
-                        core::ptr::from_ref::<T>(b).cast(),
-                        core::mem::size_of::<T>(),
-                    )
-                };
-                if failed_bytes != 0 {
-                    return None;
-                }
-                Some(unsafe { data.assume_init() })
-            }
-            alloc::borrow::Cow::Owned(o) => Some(o),
-        }
-    }
-
     /// Read the pointer as a slice of memory.
     ///
     /// Returns `None` if the provided pointer is invalid, or such a slice is known (in advance) to

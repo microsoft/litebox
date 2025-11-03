@@ -17,6 +17,7 @@ use litebox::platform::{ImmediatelyWokenUp, RawConstPointer};
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
 
+mod ptr;
 mod syscall_intercept;
 
 extern crate alloc;
@@ -1206,8 +1207,8 @@ impl litebox::platform::DebugLogProvider for LinuxUserland {
 }
 
 impl litebox::platform::RawPointerProvider for LinuxUserland {
-    type RawConstPointer<T: Clone> = litebox::platform::trivial_providers::TransparentConstPtr<T>;
-    type RawMutPointer<T: Clone> = litebox::platform::trivial_providers::TransparentMutPtr<T>;
+    type RawConstPointer<T: Clone> = crate::ptr::UserConstPtr<T>;
+    type RawMutPointer<T: Clone> = crate::ptr::UserMutPtr<T>;
 }
 
 /// Operations currently supported by the safer variants of the Linux futex syscall
@@ -1367,7 +1368,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             )
         }
         .expect("mmap failed");
-        Ok(litebox::platform::trivial_providers::TransparentMutPtr {
+        Ok(crate::ptr::UserMutPtr {
             inner: ptr as *mut u8,
         })
     }
@@ -1407,7 +1408,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             )
             .expect("mremap failed")
         };
-        Ok(litebox::platform::trivial_providers::TransparentMutPtr {
+        Ok(crate::ptr::UserMutPtr {
             inner: res as *mut u8,
         })
     }

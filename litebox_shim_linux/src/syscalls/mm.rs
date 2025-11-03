@@ -234,10 +234,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        addr.mutate_subslice_with(..0x2000, |buf| {
-            buf.fill(0xff);
-        })
-        .unwrap();
+        unsafe { addr.write_slice_at_offset(0, &[0xff; 0x2000]).unwrap() };
         assert_eq!(
             unsafe { addr.read_at_offset(0x1000) }.unwrap().into_owned(),
             0xff,
@@ -394,10 +391,7 @@ mod tests {
             )
             .unwrap();
 
-        addr.mutate_subslice_with(..0x10, |buf| {
-            buf.fill(0xff);
-        })
-        .unwrap();
+        unsafe { addr.write_slice_at_offset(0, &[0xff; 0x10]).unwrap() };
 
         // Test MADV_NORMAL
         assert!(
@@ -428,10 +422,10 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn test_fallible_read() {
-        init_platform(None);
+        let _ = init_platform(None);
 
         let ptr = crate::MutPtr::<u8>::from_usize(0xdeadbeef);
-        let result = unsafe { ptr.fallible_read_at_offset(0) };
+        let result = unsafe { ptr.read_at_offset(0) };
         assert!(result.is_none());
     }
 }

@@ -60,9 +60,8 @@ fn ratchet_maybe_uninit() -> Result<()> {
     ratchet(
         &[
             ("dev_tests/", 1),
-            ("litebox/", 1),
             ("litebox_platform_linux_kernel/", 1),
-            ("litebox_platform_linux_userland/", 3),
+            ("litebox_platform_linux_userland/", 4),
             ("litebox_platform_lvbs/", 6),
             ("litebox_shim_linux/", 5),
         ],
