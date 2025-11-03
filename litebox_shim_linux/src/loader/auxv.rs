@@ -1,6 +1,6 @@
 //! Auxiliary vector support.
 
-use crate::with_current_task;
+use crate::Task;
 use litebox::platform::SystemInfoProvider as _;
 
 #[allow(non_camel_case_types)]
@@ -64,19 +64,21 @@ pub enum AuxKey {
 
 pub type AuxVec = alloc::collections::btree_map::BTreeMap<AuxKey, usize>;
 
-/// Initialize the auxiliary vector with user information and VDSO address.
-pub fn init_auxv() -> AuxVec {
-    let mut aux = AuxVec::new();
+impl Task {
+    /// Initialize the auxiliary vector with user information and VDSO address.
+    pub fn init_auxv(&self) -> AuxVec {
+        let mut aux = AuxVec::new();
 
-    let user_info = with_current_task(|task| (*task.credentials).clone());
-    aux.insert(AuxKey::AT_UID, user_info.uid as usize);
-    aux.insert(AuxKey::AT_EUID, user_info.euid as usize);
-    aux.insert(AuxKey::AT_GID, user_info.gid as usize);
-    aux.insert(AuxKey::AT_EGID, user_info.egid as usize);
+        let user_info = &self.credentials;
+        aux.insert(AuxKey::AT_UID, user_info.uid as usize);
+        aux.insert(AuxKey::AT_EUID, user_info.euid as usize);
+        aux.insert(AuxKey::AT_GID, user_info.gid as usize);
+        aux.insert(AuxKey::AT_EGID, user_info.egid as usize);
 
-    if let Some(vdso_base) = litebox_platform_multiplex::platform().get_vdso_address() {
-        aux.insert(AuxKey::AT_SYSINFO_EHDR, vdso_base);
+        if let Some(vdso_base) = litebox_platform_multiplex::platform().get_vdso_address() {
+            aux.insert(AuxKey::AT_SYSINFO_EHDR, vdso_base);
+        }
+
+        aux
     }
-
-    aux
 }

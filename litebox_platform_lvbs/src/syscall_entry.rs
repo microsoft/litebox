@@ -183,6 +183,8 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> usize {
                 }
             }
         }
+        #[cfg(feature = "linux_syscall")]
+        ContinueOperation::RtSigreturn(..) => unreachable!(),
     };
 
     // TODO: We should decide whether we place this function here, OP-TEE shim, or separate it into

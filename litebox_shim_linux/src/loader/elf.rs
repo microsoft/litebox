@@ -27,26 +27,29 @@ use crate::{
 };
 
 use super::stack::UserStack;
+use crate::Task;
+use crate::with_current_task;
 
 // An opened elf file
-struct ElfFile {
+struct ElfFile<'a> {
+    task: &'a Task,
     name: CString,
     fd: i32,
 }
 
-impl ElfFile {
-    fn new(path: &str) -> Result<Self, Errno> {
+impl<'a> ElfFile<'a> {
+    fn new(task: &'a Task, path: &str) -> Result<Self, Errno> {
         let name = CString::new(path).unwrap();
-        let fd = crate::syscalls::file::sys_open(path, OFlags::RDONLY, Mode::empty())?;
+        let fd = task.sys_open(path, OFlags::RDONLY, Mode::empty())?;
         let Ok(fd) = i32::try_from(fd) else {
             unreachable!("fd should be a valid i32");
         };
 
-        Ok(Self { name, fd })
+        Ok(Self { task, name, fd })
     }
 }
 
-impl ElfObject for ElfFile {
+impl ElfObject for ElfFile<'_> {
     fn file_name(&self) -> &core::ffi::CStr {
         &self.name
     }
@@ -57,7 +60,7 @@ impl ElfObject for ElfFile {
                 return Ok(());
             }
             // Try to read the remaining bytes
-            match crate::syscalls::file::sys_read(self.fd, buf, Some(offset)) {
+            match self.task.sys_read(self.fd, buf, Some(offset)) {
                 Ok(bytes_read) => {
                     if bytes_read == 0 {
                         // reached the end of the file
@@ -86,10 +89,11 @@ impl ElfObject for ElfFile {
 }
 
 /// [`elf_loader::mmap::Mmap`] implementation for ELF loader
-struct ElfLoaderMmap;
+struct ElfLoaderMmap<'a>(&'a Task);
 
-impl ElfLoaderMmap {
+impl ElfLoaderMmap<'_> {
     fn do_mmap_file(
+        &self,
         addr: Option<usize>,
         len: usize,
         prot: ProtFlags,
@@ -101,7 +105,7 @@ impl ElfLoaderMmap {
         // Loader may rely on `mmap` instead of `mprotect` to change the memory protection,
         // in which case the file is copied multiple times. To reduce the overhead, we
         // could convert some `mmap` calls to `mprotect` calls whenever possible.
-        match crate::syscalls::mm::sys_mmap(
+        match self.0.sys_mmap(
             addr.unwrap_or(super::DEFAULT_LOW_ADDR),
             len,
             litebox_common_linux::ProtFlags::from_bits_truncate(prot.bits()),
@@ -115,12 +119,13 @@ impl ElfLoaderMmap {
     }
 
     fn do_mmap_anonymous(
+        &self,
         addr: Option<usize>,
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
     ) -> elf_loader::Result<usize> {
-        match crate::syscalls::mm::sys_mmap(
+        match self.0.sys_mmap(
             addr.unwrap_or(0),
             len,
             litebox_common_linux::ProtFlags::from_bits_truncate(prot.bits()),
@@ -137,7 +142,7 @@ impl ElfLoaderMmap {
     }
 }
 
-impl elf_loader::mmap::Mmap for ElfLoaderMmap {
+impl elf_loader::mmap::Mmap for ElfLoaderMmap<'_> {
     unsafe fn mmap(
         addr: Option<usize>,
         len: usize,
@@ -147,27 +152,30 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
         fd: Option<i32>,
         need_copy: &mut bool,
     ) -> elf_loader::Result<NonNull<core::ffi::c_void>> {
-        #[cfg(debug_assertions)]
-        litebox::log_println!(
-            litebox_platform_multiplex::platform(),
-            "ElfLoaderMmap::mmap(addr: {:x?}, len: {}, prot: {:x?}, flags: {:x?}, offset: {}, fd: {:?})",
-            addr,
-            len,
-            prot.bits(),
-            flags.bits(),
-            offset,
-            fd
-        );
-        let ptr = if let Some(fd) = fd {
-            Self::do_mmap_file(addr, len, prot, flags, fd, offset)?
-        } else {
-            // No file provided because it is a blob.
-            // Set `need_copy` so that the loader will copy the memory
-            // to the new address space.
-            *need_copy = true;
-            Self::do_mmap_anonymous(addr, len, prot, flags)?
-        };
-        Ok(NonNull::new(ptr as _).expect("null pointer"))
+        // TODO: fix upstream elf_loader to add &self parameter to avoid using TLS here.
+        with_current_task(|task| {
+            #[cfg(debug_assertions)]
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "ElfLoaderMmap::mmap(addr: {:x?}, len: {}, prot: {:x?}, flags: {:x?}, offset: {}, fd: {:?})",
+                addr,
+                len,
+                prot.bits(),
+                flags.bits(),
+                offset,
+                fd
+            );
+            let ptr = if let Some(fd) = fd {
+                ElfLoaderMmap(task).do_mmap_file(addr, len, prot, flags, fd, offset)?
+            } else {
+                // No file provided because it is a blob.
+                // Set `need_copy` so that the loader will copy the memory
+                // to the new address space.
+                *need_copy = true;
+                ElfLoaderMmap(task).do_mmap_anonymous(addr, len, prot, flags)?
+            };
+            Ok(NonNull::new(ptr as _).expect("null pointer"))
+        })
     }
 
     unsafe fn mmap_anonymous(
@@ -176,9 +184,11 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
         prot: elf_loader::mmap::ProtFlags,
         flags: elf_loader::mmap::MapFlags,
     ) -> elf_loader::Result<NonNull<core::ffi::c_void>> {
-        let addr = if addr == 0 { None } else { Some(addr) };
-        let ptr = Self::do_mmap_anonymous(addr, len, prot, flags)?;
-        Ok(NonNull::new(ptr as _).expect("null pointer"))
+        with_current_task(|task| {
+            let addr = if addr == 0 { None } else { Some(addr) };
+            let ptr = ElfLoaderMmap(task).do_mmap_anonymous(addr, len, prot, flags)?;
+            Ok(NonNull::new(ptr as _).expect("null pointer"))
+        })
     }
 
     unsafe fn munmap(_addr: NonNull<core::ffi::c_void>, _len: usize) -> elf_loader::Result<()> {
@@ -229,7 +239,7 @@ struct TrampolineHdr {
 }
 
 /// Get the trampoline header from the ELF file.
-fn get_trampoline_hdr(object: &mut ElfFile) -> Option<TrampolineHdr> {
+fn get_trampoline_hdr(task: &Task, object: &mut ElfFile) -> Option<TrampolineHdr> {
     let mut buf: [u8; size_of::<Ehdr>()] = [0; size_of::<Ehdr>()];
     object.read(&mut buf, 0).unwrap();
     let elfhdr: &Ehdr = unsafe { &*(buf.as_ptr().cast()) };
@@ -268,7 +278,8 @@ fn get_trampoline_hdr(object: &mut ElfFile) -> Option<TrampolineHdr> {
         return None;
     }
     // The trampoline code is placed at the end of the file.
-    let file_size = crate::syscalls::file::sys_fstat(object.as_fd().unwrap())
+    let file_size = task
+        .sys_fstat(object.as_fd().unwrap())
         .expect("failed to get file stat")
         .st_size;
     Some(TrampolineHdr {
@@ -357,6 +368,7 @@ impl ElfLoader {
 
     /// Load an ELF file and prepare the stack for the new process.
     pub(super) fn load(
+        task: &Task,
         path: &str,
         argv: Vec<CString>,
         envp: Vec<CString>,
@@ -379,11 +391,11 @@ impl ElfLoader {
                 }
                 Ok(())
             }));
-            let mut object = ElfFile::new(path).map_err(ElfLoaderError::OpenError)?;
+            let mut object = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
             let file_fd = object.as_fd().unwrap();
             // Check if the file is modified by our syscall rewriter. If so, we need to update
             // the syscall callback pointer.
-            let trampoline = get_trampoline_hdr(&mut object);
+            let trampoline = get_trampoline_hdr(task, &mut object);
             let elf = loader
                 .easy_load(object)
                 .map_err(ElfLoaderError::LoaderError)?;
@@ -404,14 +416,14 @@ impl ElfLoader {
             let init_brk =
                 core::cmp::max((base + brk).next_multiple_of(PAGE_SIZE), end_of_trampoline);
             unsafe { litebox_page_manager().brk(init_brk) }.expect("failed to set brk");
-            crate::syscalls::file::sys_close(file_fd).expect("failed to close fd");
+            task.sys_close(file_fd).expect("failed to close fd");
             elf
         };
         let interp: Option<Elf> = if let Some(interp_name) = elf.interp() {
             // e.g., /lib64/ld-linux-x86-64.so.2
             let mut loader = Loader::<ElfLoaderMmap>::new();
-            let mut object = ElfFile::new(interp_name).map_err(ElfLoaderError::OpenError)?;
-            let trampoline = get_trampoline_hdr(&mut object);
+            let mut object = ElfFile::new(task, interp_name).map_err(ElfLoaderError::OpenError)?;
+            let trampoline = get_trampoline_hdr(task, &mut object);
             let file_fd = object.as_fd().unwrap();
             let interp = loader
                 .easy_load(object)
@@ -420,7 +432,7 @@ impl ElfLoader {
             if let Some(trampoline) = trampoline {
                 load_trampoline(trampoline, interp.base(), file_fd);
             }
-            crate::syscalls::file::sys_close(file_fd).expect("failed to close fd");
+            task.sys_close(file_fd).expect("failed to close fd");
             Some(interp)
         } else {
             None

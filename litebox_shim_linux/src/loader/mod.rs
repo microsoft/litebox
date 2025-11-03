@@ -5,16 +5,18 @@ pub mod auxv;
 mod elf;
 mod stack;
 
+use crate::Task;
 pub use elf::ElfLoaderError;
 
 /// Load a program into the LiteBox shim.
-pub fn load_program(
+pub(crate) fn load_program(
+    task: &Task,
     path: &str,
     argv: alloc::vec::Vec<alloc::ffi::CString>,
     envp: alloc::vec::Vec<alloc::ffi::CString>,
     aux: auxv::AuxVec,
 ) -> Result<elf::ElfLoadInfo, elf::ElfLoaderError> {
-    elf::ElfLoader::load(path, argv, envp, aux)
+    elf::ElfLoader::load(task, path, argv, envp, aux)
 }
 
 /// The magic number used to identify the LiteBox rewriter and where we should

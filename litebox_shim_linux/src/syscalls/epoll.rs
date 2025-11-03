@@ -589,15 +589,13 @@ mod test {
     use litebox::event::Events;
     use litebox_common_linux::{EfdFlags, EpollEvent};
 
-    use crate::syscalls::file::{do_pselect, sys_close, sys_pipe2, sys_read};
-
     use super::EpollFile;
     use core::time::Duration;
 
     extern crate std;
 
     fn setup_epoll() -> EpollFile {
-        crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform(None);
 
         EpollFile::new(crate::litebox())
     }
@@ -691,7 +689,7 @@ mod test {
             }
         }
 
-        crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform(None);
 
         let mut set = super::PollSet::with_capacity(0);
         let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
@@ -743,17 +741,19 @@ mod test {
 
     #[test]
     fn test_pselect() {
-        crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform(None);
 
-        let (rfd_u, wfd_u) = sys_pipe2(litebox::fs::OFlags::empty()).expect("pipe2 failed");
+        let (rfd_u, wfd_u) = task
+            .sys_pipe2(litebox::fs::OFlags::empty())
+            .expect("pipe2 failed");
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();
 
-        std::thread::spawn(move || {
+        task.spawn_clone_for_test(move |task| {
             std::thread::sleep(core::time::Duration::from_millis(100));
             // write a byte
             let buf = [0x41u8];
-            let written = super::super::file::sys_write(wfd, &buf, None).expect("write failed");
+            let written = task.sys_write(wfd, &buf, None).expect("write failed");
             assert_eq!(written, 1);
         });
 
@@ -762,45 +762,50 @@ mod test {
         rfds.set(rfd_u as usize, true);
 
         // Call pselect
-        let ret = do_pselect(rfd_u + 1, Some(&mut rfds), None, None, None).expect("pselect failed");
+        let ret = task
+            .do_pselect(rfd_u + 1, Some(&mut rfds), None, None, None)
+            .expect("pselect failed");
         assert!(ret > 0, "pselect should report ready");
         assert!(rfds.iter_ones().all(|fd| fd == rfd_u as usize));
 
         // read
         let mut out = [0u8; 8];
-        let n = sys_read(rfd, &mut out, None).expect("read failed");
+        let n = task.sys_read(rfd, &mut out, None).expect("read failed");
         assert_eq!(n, 1);
         assert_eq!(out[0], 0x41);
 
-        let _ = sys_close(rfd);
-        let _ = sys_close(wfd);
+        let _ = task.sys_close(rfd);
+        let _ = task.sys_close(wfd);
     }
 
     #[test]
     fn test_pselect_read_hup() {
-        crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform(None);
 
-        let (rfd_u, wfd_u) = sys_pipe2(litebox::fs::OFlags::empty()).expect("pipe2 failed");
+        let (rfd_u, wfd_u) = task
+            .sys_pipe2(litebox::fs::OFlags::empty())
+            .expect("pipe2 failed");
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();
 
-        std::thread::spawn(move || {
+        task.spawn_clone_for_test(move |task| {
             std::thread::sleep(core::time::Duration::from_millis(100));
-            sys_close(wfd).expect("close writer failed");
+            task.sys_close(wfd).expect("close writer failed");
         });
 
         // prepare fd_set for read
         let mut rfds = bitvec::bitvec![0; rfd_u.next_multiple_of(64) as usize];
         rfds.set(rfd_u as usize, true);
 
-        let ret = do_pselect(
-            rfd_u + 1,
-            Some(&mut rfds),
-            None,
-            None,
-            Some(core::time::Duration::from_secs(60)),
-        )
-        .expect("pselect failed");
+        let ret = task
+            .do_pselect(
+                rfd_u + 1,
+                Some(&mut rfds),
+                None,
+                None,
+                Some(core::time::Duration::from_secs(60)),
+            )
+            .expect("pselect failed");
 
         // Expect pselect to indicate readiness (HUP should cause revents)
         assert!(ret > 0, "pselect should report ready for EOF/HUP");
@@ -808,15 +813,15 @@ mod test {
 
         // read should return 0 (EOF)
         let mut out = [0u8; 8];
-        let n = sys_read(rfd, &mut out, None).expect("read failed");
+        let n = task.sys_read(rfd, &mut out, None).expect("read failed");
         assert_eq!(n, 0, "read should return 0 on EOF");
 
-        let _ = sys_close(rfd);
+        let _ = task.sys_close(rfd);
     }
 
     #[test]
     fn test_pselect_invalid_fd() {
-        crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform(None);
 
         let invalid_fd_u = 100u32;
 
@@ -824,7 +829,7 @@ mod test {
         let mut rfds = bitvec::bitvec![0; invalid_fd_u.next_multiple_of(64) as usize];
         rfds.set(invalid_fd_u as usize, true);
 
-        let ret = do_pselect(
+        let ret = task.do_pselect(
             invalid_fd_u + 1,
             Some(&mut rfds),
             None,
