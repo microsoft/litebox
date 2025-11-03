@@ -642,15 +642,15 @@ impl SessionIdPool {
         }
     }
 
+    /// # Panics
+    /// Panics if session IDs are exhausted.
     pub fn allocate(&self) -> u32 {
         let mut inner = self.inner.lock();
         if let Some(session_id) = inner.pop_front() {
             session_id
         } else {
-            let mut session_id = self.next_session_id.fetch_add(1, SeqCst);
-            if session_id == Self::PTA_SESSION_ID {
-                session_id = self.next_session_id.fetch_add(1, SeqCst);
-            }
+            let session_id = self.next_session_id.fetch_add(1, SeqCst);
+            assert!(session_id != Self::PTA_SESSION_ID, "session ID exhausted");
             session_id
         }
     }
