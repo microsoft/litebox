@@ -138,7 +138,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new(cli_args.tun_device_name.as_deref());
     litebox_platform_multiplex::set_platform(platform);
-    let litebox = litebox_shim_linux::init_process(platform.init_task());
+    let mut launcher = litebox_shim_linux::ShimLauncher::new();
+    let litebox = launcher.litebox();
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
         let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
@@ -202,7 +203,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
 
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
-        litebox_shim_linux::default_fs(in_mem, tar_ro)
+        launcher.default_fs(in_mem, tar_ro)
     };
 
     // We need to get the file path before enabling seccomp
@@ -214,8 +215,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     })?;
 
-    litebox_shim_linux::set_fs(initial_file_system);
-    litebox_shim_linux::set_load_filter(fixup_env_aux);
+    launcher.set_fs(initial_file_system);
+    launcher.set_load_filter(fixup_env_aux);
     platform.register_shim(&litebox_shim_linux::LinuxShim);
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
@@ -250,7 +251,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let mut pt_regs = litebox_shim_linux::load_program(prog_path, argv, envp)?;
+    let mut pt_regs = launcher.load_program(platform.init_task(), prog_path, argv, envp)?;
     unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };
     Ok(())
 }

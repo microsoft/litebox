@@ -7,107 +7,125 @@ use litebox::{
     fs::{FileSystem as _, Mode, OFlags},
     platform::SystemInfoProvider as _,
 };
-use litebox_platform_multiplex::{Platform, set_platform};
-use litebox_shim_linux::{litebox_fs, load_program, set_fs};
+use litebox_platform_multiplex::Platform;
 
-fn init_platform(
-    tar_data: &'static [u8],
-    initial_dirs: &[&str],
-    initial_files: &[&str],
-    tun_device_name: Option<&str>,
-    enable_syscall_interception: bool,
-) {
-    let platform = Platform::new(tun_device_name);
-    set_platform(platform);
-    let platform = litebox_platform_multiplex::platform();
-    let litebox = litebox_shim_linux::init_process(platform.init_task());
-
-    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
-    in_mem_fs.with_root_privileges(|fs| {
-        fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-            .expect("Failed to set permissions on root");
-    });
-    let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(
-        litebox,
-        if tar_data.is_empty() {
-            litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
-        } else {
-            tar_data.into()
-        },
-    );
-    set_fs(litebox_shim_linux::default_fs(in_mem_fs, tar_ro_fs));
-
-    for each in initial_dirs {
-        install_dir(each);
-    }
-    for each in initial_files {
-        let data = std::fs::read(each).unwrap();
-        install_file(data, each);
-    }
-
-    platform.register_shim(&litebox_shim_linux::LinuxShim);
-
-    if enable_syscall_interception {
-        platform.enable_seccomp_based_syscall_interception();
-    }
+struct TestLauncher {
+    platform: &'static Platform,
+    launcher: litebox_shim_linux::ShimLauncher,
+    fs: litebox_shim_linux::DefaultFS,
 }
 
-fn install_dir(path: &str) {
-    litebox_fs()
-        .mkdir(path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
-        .expect("Failed to create directory");
-}
+impl TestLauncher {
+    fn init_platform(
+        tar_data: &'static [u8],
+        initial_dirs: &[&str],
+        initial_files: &[&str],
+        tun_device_name: Option<&str>,
+        enable_syscall_interception: bool,
+    ) -> Self {
+        let platform = Platform::new(tun_device_name);
+        litebox_platform_multiplex::set_platform(platform);
+        let launcher = litebox_shim_linux::ShimLauncher::new();
+        let litebox = launcher.litebox();
 
-fn install_file(contents: Vec<u8>, out: &str) {
-    let fd = litebox_fs()
-        .open(
-            out,
-            OFlags::CREAT | OFlags::WRONLY,
-            Mode::RWXG | Mode::RWXO | Mode::RWXU,
-        )
-        .unwrap();
-    litebox_fs().write(&fd, &contents, None).unwrap();
-    litebox_fs().close(&fd).unwrap();
-}
+        let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+        in_mem_fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to set permissions on root");
+        });
+        let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(
+            litebox,
+            if tar_data.is_empty() {
+                litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
+            } else {
+                tar_data.into()
+            },
+        );
+        let fs = launcher.default_fs(in_mem_fs, tar_ro_fs);
+        let mut this = Self {
+            platform,
+            launcher,
+            fs,
+        };
 
-fn test_load_exec_common(executable_path: &str) {
-    let argv = vec![
-        CString::new(executable_path).unwrap(),
-        CString::new("hello").unwrap(),
-    ];
-    let envp = vec![
-        CString::new("PATH=/bin").unwrap(),
-        CString::new("HOME=/").unwrap(),
-    ];
-    litebox_shim_linux::set_load_filter(|_env, aux| {
-        if litebox_platform_multiplex::platform()
-            .get_vdso_address()
-            .is_none()
-        {
-            // Due to restrict permissions in CI, we cannot read `/proc/self/maps`.
-            // To pass CI, we rely on `getauxval` (which we should avoid #142) to get the VDSO
-            // address when failing to read `/proc/self/maps`.
-            #[cfg(target_arch = "x86_64")]
-            {
-                let vdso_address = unsafe { libc::getauxval(libc::AT_SYSINFO_EHDR) };
-                aux.insert(
-                    litebox_shim_linux::loader::auxv::AuxKey::AT_SYSINFO_EHDR,
-                    usize::try_from(vdso_address).unwrap(),
-                );
-            }
-            #[cfg(target_arch = "x86")]
-            {
-                // AT_SYSINFO = 32
-                let vdso_address = unsafe { libc::getauxval(32) };
-                aux.insert(
-                    litebox_shim_linux::loader::auxv::AuxKey::AT_SYSINFO,
-                    usize::try_from(vdso_address).unwrap(),
-                );
-            }
+        for each in initial_dirs {
+            this.install_dir(each);
         }
-    });
-    let mut pt_regs = load_program(executable_path, argv, envp).unwrap();
-    unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };
+        for each in initial_files {
+            let data = std::fs::read(each).unwrap();
+            this.install_file(data, each);
+        }
+
+        platform.register_shim(&litebox_shim_linux::LinuxShim);
+
+        if enable_syscall_interception {
+            platform.enable_seccomp_based_syscall_interception();
+        }
+        this
+    }
+
+    fn install_dir(&mut self, path: &str) {
+        self.fs
+            .mkdir(path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .expect("Failed to create directory");
+    }
+
+    fn install_file(&mut self, contents: Vec<u8>, out: &str) {
+        let fd = self
+            .fs
+            .open(
+                out,
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXG | Mode::RWXO | Mode::RWXU,
+            )
+            .unwrap();
+        self.fs.write(&fd, &contents, None).unwrap();
+        self.fs.close(&fd).unwrap();
+    }
+
+    fn test_load_exec_common(mut self, executable_path: &str) {
+        let argv = vec![
+            CString::new(executable_path).unwrap(),
+            CString::new("hello").unwrap(),
+        ];
+        let envp = vec![
+            CString::new("PATH=/bin").unwrap(),
+            CString::new("HOME=/").unwrap(),
+        ];
+        self.launcher.set_fs(self.fs);
+        self.launcher.set_load_filter(|_env, aux| {
+            if litebox_platform_multiplex::platform()
+                .get_vdso_address()
+                .is_none()
+            {
+                // Due to restrict permissions in CI, we cannot read `/proc/self/maps`.
+                // To pass CI, we rely on `getauxval` (which we should avoid #142) to get the VDSO
+                // address when failing to read `/proc/self/maps`.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let vdso_address = unsafe { libc::getauxval(libc::AT_SYSINFO_EHDR) };
+                    aux.insert(
+                        litebox_shim_linux::loader::auxv::AuxKey::AT_SYSINFO_EHDR,
+                        usize::try_from(vdso_address).unwrap(),
+                    );
+                }
+                #[cfg(target_arch = "x86")]
+                {
+                    // AT_SYSINFO = 32
+                    let vdso_address = unsafe { libc::getauxval(32) };
+                    aux.insert(
+                        litebox_shim_linux::loader::auxv::AuxKey::AT_SYSINFO,
+                        usize::try_from(vdso_address).unwrap(),
+                    );
+                }
+            }
+        });
+        let mut pt_regs = self
+            .launcher
+            .load_program(self.platform.init_task(), executable_path, argv, envp)
+            .unwrap();
+        unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -120,7 +138,7 @@ fn test_load_exec_dynamic() {
     let executable_path = "/hello_dylib";
     let executable_data = std::fs::read(path).unwrap();
 
-    init_platform(
+    let mut launcher = TestLauncher::init_platform(
         &[],
         &["lib64", "lib32", "lib", "lib/x86_64-linux-gnu"],
         &files_to_install
@@ -130,8 +148,8 @@ fn test_load_exec_dynamic() {
         None,
         false,
     );
-    install_file(executable_data, executable_path);
-    test_load_exec_common(executable_path);
+    launcher.install_file(executable_data, executable_path);
+    launcher.test_load_exec_common(executable_path);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -142,11 +160,11 @@ fn test_load_exec_static() {
     let executable_path = "/hello_exec";
     let executable_data = std::fs::read(path).unwrap();
 
-    init_platform(&[], &[], &[], None, false);
+    let mut launcher = TestLauncher::init_platform(&[], &[], &[], None, false);
 
-    install_file(executable_data, executable_path);
+    launcher.install_file(executable_data, executable_path);
 
-    test_load_exec_common(executable_path);
+    launcher.test_load_exec_common(executable_path);
 }
 
 const HELLO_WORLD_NOLIBC: &str = r#"
@@ -264,7 +282,7 @@ fn test_syscall_rewriter() {
     let executable_path = "/hello_exec_nolibc.hooked";
     let executable_data = std::fs::read(hooked_path).unwrap();
 
-    init_platform(&[], &[], &[], None, false);
-    install_file(executable_data, executable_path);
-    test_load_exec_common(executable_path);
+    let mut launcher = TestLauncher::init_platform(&[], &[], &[], None, false);
+    launcher.install_file(executable_data, executable_path);
+    launcher.test_load_exec_common(executable_path);
 }

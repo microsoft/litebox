@@ -43,6 +43,8 @@ pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
 
+pub type DefaultFS = LinuxFS;
+
 pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
     Platform,
     litebox::fs::in_mem::FileSystem<Platform>,
@@ -115,51 +117,111 @@ pub(crate) fn boot_time() -> &'static <Platform as litebox::platform::TimeProvid
         .expect("litebox() should have already been called before this point")
 }
 
-/// Initialize the shim to run a task with the given parameters.
-///
-/// Returns the global litebox object.
-pub fn init_process<'a>(task: litebox_common_linux::TaskParams) -> &'a LiteBox<Platform> {
-    let litebox_common_linux::TaskParams {
-        pid,
-        ppid,
-        tid,
-        uid,
-        euid,
-        gid,
-        egid,
-    } = task;
+pub struct ShimLauncher {
+    litebox: &'static LiteBox<Platform>,
+}
 
-    let litebox = litebox();
-    // TODO: ensure this gets torn down even if the thread never runs sys_exit.
-    // Consider a scoped execution model, e.g.
-    // ```
-    // litebox_shim_linux::run_process(task, |litebox| {
-    //     ...
-    // })
-    // ```
-    let files = Arc::new(syscalls::file::FilesState::new(litebox));
-    files.initialize_stdio_in_shared_descriptors_table();
-    SHIM_TLS.init(LinuxShimTls {
-        current_task: Task {
+impl Default for ShimLauncher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ShimLauncher {
+    pub fn new() -> Self {
+        Self {
+            litebox: crate::litebox(),
+        }
+    }
+
+    pub fn litebox(&self) -> &LiteBox<Platform> {
+        self.litebox
+    }
+
+    /// Set the global file system
+    ///
+    /// NOTE: This function signature might change as better parametricity is added to file systems.
+    /// Related: <https://github.com/MSRSSP/litebox/issues/24>
+    ///
+    /// # Panics
+    ///
+    /// Panics if this is called more than once or [`litebox_fs`] is called before this
+    pub fn set_fs(&mut self, fs: LinuxFS) {
+        set_fs(fs);
+    }
+
+    /// Create a default layered file system with the given in-memory and tar read-only layers.
+    pub fn default_fs(
+        &self,
+        in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+        tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
+    ) -> DefaultFS {
+        default_fs(in_mem_fs, tar_ro_fs)
+    }
+
+    /// Set the load filter, which can augment envp or auxv when starting a new program.
+    ///
+    /// # Panics
+    /// Panics if the load filter is already set.
+    pub fn set_load_filter(&mut self, callback: LoadFilter) {
+        set_load_filter(callback);
+    }
+
+    /// Initialize the shim to run a task with the given parameters.
+    pub fn load_program(
+        self,
+        task: litebox_common_linux::TaskParams,
+        path: &str,
+        argv: Vec<alloc::ffi::CString>,
+        envp: Vec<alloc::ffi::CString>,
+    ) -> Result<litebox_common_linux::PtRegs, loader::ElfLoaderError> {
+        let litebox_common_linux::TaskParams {
             pid,
             ppid,
             tid,
-            clear_child_tid: None.into(),
-            robust_list: None.into(),
-            credentials: syscalls::process::Credentials {
-                uid,
-                euid,
-                gid,
-                egid,
-            }
-            .into(),
-            comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
-            fs: Arc::new(syscalls::file::FsState::new()).into(),
-            files: files.into(),
-            process: syscalls::process::Process::new().into(),
-        },
-    });
-    litebox
+            uid,
+            euid,
+            gid,
+            egid,
+        } = task;
+
+        let files = Arc::new(syscalls::file::FilesState::new(self.litebox));
+        files.initialize_stdio_in_shared_descriptors_table();
+
+        // TODO: ensure this gets torn down even if the thread never runs sys_exit.
+        // Consider a scoped execution model, e.g.
+        // ```
+        // litebox_shim_linux::run_process(task, |litebox| {
+        //     ...
+        // })
+        // ```
+        SHIM_TLS.init(LinuxShimTls {
+            current_task: Task {
+                pid,
+                ppid,
+                tid,
+                clear_child_tid: None.into(),
+                robust_list: None.into(),
+                credentials: syscalls::process::Credentials {
+                    uid,
+                    euid,
+                    gid,
+                    egid,
+                }
+                .into(),
+                comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
+                fs: Arc::new(syscalls::file::FsState::new()).into(),
+                files: files.into(),
+                process: syscalls::process::Process::new().into(),
+            },
+        });
+
+        let r = with_current_task(|task| task.load_program(path, argv, envp));
+        if r.is_err() {
+            SHIM_TLS.deinit();
+        }
+        r
+    }
 }
 
 /// Get the global litebox object
@@ -182,14 +244,14 @@ static FS: OnceBox<LinuxFS> = OnceBox::new();
 /// # Panics
 ///
 /// Panics if this is called more than once or [`litebox_fs`] is called before this
-pub fn set_fs(fs: LinuxFS) {
+fn set_fs(fs: LinuxFS) {
     FS.set(alloc::boxed::Box::new(fs))
         .map_err(|_| {})
         .expect("fs is already set");
 }
 
 /// Create a default layered file system with the given in-memory and tar read-only layers.
-pub fn default_fs(
+fn default_fs(
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
     tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
 ) -> LinuxFS {
@@ -213,7 +275,7 @@ pub fn default_fs(
 /// # Panics
 ///
 /// Panics if this is called before [`set_fs`] has been called
-pub fn litebox_fs<'a>() -> &'a LinuxFS {
+pub(crate) fn litebox_fs<'a>() -> &'a LinuxFS {
     FS.get().expect("fs has not yet been set")
 }
 
@@ -1202,20 +1264,10 @@ static LOAD_FILTER: once_cell::race::OnceBox<LoadFilter> = once_cell::race::Once
 ///
 /// # Panics
 /// Panics if the load filter is already set.
-pub fn set_load_filter(callback: LoadFilter) {
+fn set_load_filter(callback: LoadFilter) {
     LOAD_FILTER
         .set(alloc::boxed::Box::new(callback))
         .expect("load filter already set");
-}
-
-/// Loads the specified program into the process's address space and returns the
-/// register state for the initial thread.
-pub fn load_program(
-    path: &str,
-    argv: Vec<alloc::ffi::CString>,
-    mut envp: Vec<alloc::ffi::CString>,
-) -> Result<litebox_common_linux::PtRegs, loader::ElfLoaderError> {
-    with_current_task(|task| task.load_program(path, argv, envp))
 }
 
 impl Task {

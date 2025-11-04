@@ -180,9 +180,9 @@ fn test_static_linked_prog_with_rewriter() {
     let executable_path = format!("/{prog_name_hooked}");
     let executable_data = std::fs::read(hooked_path).unwrap();
 
-    common::init_platform(&[], &[], &[]);
-    common::install_file(executable_data, &executable_path);
-    common::test_load_exec_common(&executable_path);
+    let mut launcher = common::TestLauncher::init_platform(&[], &[], &[]);
+    launcher.install_file(executable_data, &executable_path);
+    launcher.test_load_exec_common(&executable_path);
 }
 
 fn run_dynamic_linked_prog_with_rewriter(

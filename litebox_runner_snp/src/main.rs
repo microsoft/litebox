@@ -97,10 +97,11 @@ pub extern "C" fn sandbox_process_init(
     litebox::log_println!(platform, "sandbox_process_init called");
 
     litebox_platform_multiplex::set_platform(platform);
-    let litebox = litebox_shim_linux::init_process(platform.init_task(boot_params));
+    let mut launcher = litebox_shim_linux::ShimLauncher::new();
+    let litebox = launcher.litebox();
     let in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, ROOTFS.into());
-    litebox_shim_linux::set_fs(litebox_shim_linux::default_fs(in_mem_fs, tar_ro));
+    launcher.set_fs(launcher.default_fs(in_mem_fs, tar_ro));
 
     let parse_args =
         |params: &litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params| -> Option<(
@@ -138,7 +139,7 @@ pub extern "C" fn sandbox_process_init(
             globals::SM_TERM_INVALID_PARAM,
         );
     };
-    *pt_regs = match litebox_shim_linux::load_program(&program, argv, envp) {
+    *pt_regs = match launcher.load_program(platform.init_task(boot_params), &program, argv, envp) {
         Ok(regs) => regs,
         Err(err) => {
             litebox::log_println!(platform, "failed to load program: {}", err);
