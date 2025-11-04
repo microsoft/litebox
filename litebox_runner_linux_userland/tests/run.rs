@@ -12,12 +12,14 @@ enum Backend {
     Seccomp,
 }
 
-fn run_target_program(
+fn run_target_program<F: FnOnce(PathBuf)>(
     backend: Backend,
     target: &Path,
     cmd_args: &[&str],
-    install_files: fn(PathBuf),
+    environments: &[&str],
+    install_files: F,
     unique_name: &str,
+    tun_name: Option<&str>,
 ) -> Vec<u8> {
     let backend_str = match backend {
         Backend::Rewriter => "rewriter",
@@ -68,7 +70,7 @@ fn run_target_program(
             }
         }
     }
-    install_files(tar_dir.join("out"));
+    install_files(tar_dir.clone());
 
     // litebox_rtld_audit.so is already built by build.rs and available in OUT_DIR
     if let Backend::Rewriter = backend
@@ -115,6 +117,14 @@ fn run_target_program(
         "--initial-files",
         tar_file.to_str().unwrap(),
     ];
+    for env in environments {
+        args.push("--env");
+        args.push(env);
+    }
+    if let Some(tun_name) = tun_name {
+        args.push("--tun-device-name");
+        args.push(tun_name);
+    }
     args.push(path.to_str().unwrap());
     args.extend_from_slice(cmd_args);
     println!("Running `{} {}`", binary_path, args.join(" "));
@@ -168,7 +178,15 @@ fn test_dynamic_lib_with_rewriter() {
             .expect("failed to get file stem");
         let unique_name = format!("{stem}_rewriter");
         let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
-        run_target_program(Backend::Rewriter, &target, &[], |_| {}, &unique_name);
+        run_target_program(
+            Backend::Rewriter,
+            &target,
+            &[],
+            &[],
+            |_| {},
+            &unique_name,
+            None,
+        );
     }
 }
 
@@ -181,7 +199,15 @@ fn test_static_exec_with_rewriter() {
             .expect("failed to get file stem");
         let unique_name = format!("{stem}_exec_rewriter");
         let target = common::compile(path.to_str().unwrap(), &unique_name, true, false);
-        run_target_program(Backend::Rewriter, &target, &[], |_| {}, &unique_name);
+        run_target_program(
+            Backend::Rewriter,
+            &target,
+            &[],
+            &[],
+            |_| {},
+            &unique_name,
+            None,
+        );
     }
 }
 
@@ -196,7 +222,15 @@ fn test_dynamic_lib_with_seccomp() {
             .expect("failed to get file stem");
         let unique_name = format!("{stem}_seccomp");
         let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
-        run_target_program(Backend::Seccomp, &target, &[], |_| {}, &unique_name);
+        run_target_program(
+            Backend::Seccomp,
+            &target,
+            &[],
+            &[],
+            |_| {},
+            &unique_name,
+            None,
+        );
     }
 }
 
@@ -230,11 +264,13 @@ console.log(content);
         Backend::Seccomp,
         &node_path,
         &["/out/hello_world.js"],
+        &[],
         |out_dir| {
             // write the test js file to the output directory
-            std::fs::write(out_dir.join("hello_world.js"), HELLO_WORLD_JS).unwrap();
+            std::fs::write(out_dir.join("out/hello_world.js"), HELLO_WORLD_JS).unwrap();
         },
         "hello_node_seccomp",
+        None,
     );
 }
 
@@ -253,11 +289,13 @@ console.log(content);
         Backend::Rewriter,
         &node_path,
         &["/out/hello_world.js"],
+        &[],
         |out_dir| {
             // write the test js file to the output directory
-            std::fs::write(out_dir.join("hello_world.js"), HELLO_WORLD_JS).unwrap();
+            std::fs::write(out_dir.join("out/hello_world.js"), HELLO_WORLD_JS).unwrap();
         },
         "hello_node_rewriter",
+        None,
     );
 }
 
@@ -265,7 +303,15 @@ console.log(content);
 #[test]
 fn test_runner_with_ls() {
     let ls_path = run_which("ls");
-    let output = run_target_program(Backend::Rewriter, &ls_path, &["-a"], |_| {}, "ls_rewriter");
+    let output = run_target_program(
+        Backend::Rewriter,
+        &ls_path,
+        &["-a"],
+        &[],
+        |_| {},
+        "ls_rewriter",
+        None,
+    );
 
     let output_str = String::from_utf8_lossy(&output);
     let normalized = output_str.split_whitespace().collect::<Vec<_>>();
@@ -281,8 +327,10 @@ fn test_runner_with_ls() {
         Backend::Rewriter,
         &ls_path,
         &["-a", "/lib/x86_64-linux-gnu"],
+        &[],
         |_| {},
         "ls_lib_rewriter",
+        None,
     );
 
     let output_str = String::from_utf8_lossy(&output);
@@ -293,4 +341,94 @@ fn test_runner_with_ls() {
             "unexpected ls output:\n{output_str}\n{each} not found",
         );
     }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn run_python(args: &[&str]) -> String {
+    let output = std::process::Command::new("python3")
+        .args(args)
+        .output()
+        .expect("Failed to run Python");
+    assert!(output.status.success(), "Python script failed");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_runner_with_python() {
+    const HELLO_WORLD_PY: &str = "print(\"Hello, World from litebox!\")";
+    let python_path = run_which("python3");
+    let python_home = run_python(&["-c", "import sys; print(sys.prefix);"]);
+    println!("Detected PYTHONHOME: {python_home}");
+    let python_sys_path = run_python(&["-c", "import sys; print(':'.join(sys.path))"]);
+    println!("Detected PYTHONPATH: {python_sys_path}");
+    run_target_program(
+        Backend::Rewriter,
+        &python_path,
+        &["-c", HELLO_WORLD_PY],
+        &[
+            &format!("PYTHONHOME={}", python_home.trim()),
+            &format!("PYTHONPATH={}", python_sys_path.trim()),
+            // LiteBox does not support timestamp yet, so pre-compiled .pyc files are not usable.
+            // Avoid creating .pyc files as tar filesystem is read-only.
+            "PYTHONDONTWRITEBYTECODE=1",
+        ],
+        |out_dir| {
+            for each in python_sys_path.split(':') {
+                if each.is_empty() || !each.starts_with("/usr") {
+                    continue;
+                }
+                let python_lib_src = Path::new(each);
+                if python_lib_src.is_dir() {
+                    let python_lib_dst = out_dir.join(&each[1..]); // remove leading '/'
+                    if !python_lib_dst.exists() {
+                        std::fs::create_dir_all(&python_lib_dst).unwrap();
+                        println!(
+                            "Copying python3 lib from {} to {}",
+                            python_lib_src.to_str().unwrap(),
+                            python_lib_dst.to_str().unwrap()
+                        );
+                        let output = std::process::Command::new("cp")
+                            .args([
+                                "-rpL", // -r for recursive, -p to preserve attributes, -L to dereference symbolic links
+                                python_lib_src.to_str().unwrap(),
+                                python_lib_dst.parent().unwrap().to_str().unwrap(),
+                            ])
+                            .output()
+                            .expect("Failed to copy python3 lib");
+                        assert!(
+                            output.status.success(),
+                            "failed to copy python3 lib {:?}",
+                            std::str::from_utf8(output.stderr.as_slice()).unwrap()
+                        );
+                    }
+                    let known_exts = ["py", "pyc", "txt", "css", "ps1", "rst"];
+                    // rewrite all files under the python lib directory except those with known extensions
+                    for entry in walkdir::WalkDir::new(python_lib_src)
+                        .into_iter()
+                        .filter_map(std::result::Result::ok)
+                        .filter(|e| {
+                            e.path()
+                                .extension()
+                                .is_some_and(|ext| !known_exts.contains(&ext.to_str().unwrap()))
+                        })
+                    {
+                        let so_file = entry.path();
+                        let so_file_dest = out_dir.join(so_file.strip_prefix("/").unwrap());
+                        println!(
+                            "Rewrite {} to {}",
+                            so_file.display(),
+                            so_file_dest.display()
+                        );
+                        let success = common::rewrite_with_cache(so_file, &so_file_dest, &[]);
+                        if entry.path().extension().is_some_and(|ext| ext == "so") {
+                            assert!(success, "failed to rewrite {} file", so_file.display());
+                        }
+                    }
+                }
+            }
+        },
+        "python3_rewriter",
+        None,
+    );
 }
