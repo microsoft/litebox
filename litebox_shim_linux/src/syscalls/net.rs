@@ -989,32 +989,6 @@ mod tests {
             .expect("epoll_wait failed")
     }
 
-    fn epoll_add(task: &crate::Task, epfd: i32, target_fd: i32, events: litebox::event::Events) {
-        let ev = litebox_common_linux::EpollEvent {
-            events: events.bits(),
-            data: u64::try_from(target_fd).unwrap(),
-        };
-        let ev_ptr = (&raw const ev).cast::<litebox_common_linux::EpollEvent>();
-        let ev_const = crate::ConstPtr::from_usize(ev_ptr as usize);
-        task.sys_epoll_ctl(
-            epfd,
-            litebox_common_linux::EpollOp::EpollCtlAdd,
-            target_fd,
-            ev_const,
-        )
-        .expect("epoll_ctl add server failed");
-    }
-
-    fn epoll_wait(
-        task: &crate::Task,
-        epfd: i32,
-        events: &mut [litebox_common_linux::EpollEvent],
-    ) -> usize {
-        let events_ptr = crate::MutPtr::from_usize(events.as_mut_ptr() as usize);
-        task.sys_epoll_pwait(epfd, events_ptr, events.len().truncate(), -1, None, 0)
-            .expect("epoll_wait failed")
-    }
-
     fn test_tcp_socket(
         task: &crate::Task,
         ip: [u8; 4],
@@ -1218,10 +1192,11 @@ mod tests {
             .expect("failed to bind server");
 
         // Create an epoll instance and register the server fd for EPOLLIN
-        let epfd = sys_epoll_create(litebox_common_linux::EpollCreateFlags::empty())
+        let epfd = task
+            .sys_epoll_create(litebox_common_linux::EpollCreateFlags::empty())
             .expect("failed to create epoll");
         let epfd = i32::try_from(epfd).unwrap();
-        epoll_add(task, epfd, server_fd, litebox::event::Events::IN);
+        epoll_add(&task, epfd, server_fd, litebox::event::Events::IN);
 
         let msg = "Hello from client";
         let mut child = std::process::Command::new("nc")
@@ -1258,7 +1233,7 @@ mod tests {
         }
         if is_nonblocking {
             let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
-            let n = epoll_wait(task, epfd, &mut events);
+            let n = epoll_wait(&task, epfd, &mut events);
             assert_eq!(n, 1);
             for ev in &events[..n] {
                 assert!(ev.events & litebox::event::Events::IN.bits() != 0);
