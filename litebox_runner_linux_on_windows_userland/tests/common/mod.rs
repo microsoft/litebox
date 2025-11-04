@@ -46,7 +46,7 @@ impl TestLauncher {
             this.install_file(data, each);
         }
 
-        platform.register_shim(shim.entrypoints());
+        platform.register_shim(this.shim.entrypoints());
         this
     }
 
