@@ -467,6 +467,7 @@ impl Task {
                     tls,
                     set_child_tid,
                     task: Task {
+                        global: self.global.clone(),
                         pid: self.pid,
                         tid: child_tid,
                         ppid: self.ppid,
@@ -1022,7 +1023,7 @@ impl Task {
         };
 
         // Close CLOEXEC descriptors
-        self.files.borrow().close_on_exec();
+        self.close_on_exec();
 
         // unmmap all memory mappings and reset brk
         if let Some(robust_list) = self.robust_list.take() {

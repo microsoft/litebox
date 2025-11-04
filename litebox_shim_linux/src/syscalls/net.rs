@@ -614,8 +614,7 @@ impl Task {
             .write()
             .insert(self, file)
             .map_err(|desc| {
-                files
-                    .do_close(desc)
+                self.do_close(desc)
                     .expect("closing descriptor should succeed");
                 Errno::EMFILE
             })
@@ -722,8 +721,7 @@ impl Task {
             .write()
             .insert(self, file)
             .map_err(|desc| {
-                files
-                    .do_close(desc)
+                self.do_close(desc)
                     .expect("closing descriptor should succeed");
                 Errno::EMFILE
             })

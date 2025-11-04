@@ -119,6 +119,7 @@ pub(crate) fn boot_time() -> &'static <Platform as litebox::platform::TimeProvid
 
 pub struct ShimLauncher {
     litebox: &'static LiteBox<Platform>,
+    fs: Option<LinuxFS>,
 }
 
 impl Default for ShimLauncher {
@@ -131,6 +132,7 @@ impl ShimLauncher {
     pub fn new() -> Self {
         Self {
             litebox: crate::litebox(),
+            fs: None,
         }
     }
 
@@ -142,12 +144,8 @@ impl ShimLauncher {
     ///
     /// NOTE: This function signature might change as better parametricity is added to file systems.
     /// Related: <https://github.com/MSRSSP/litebox/issues/24>
-    ///
-    /// # Panics
-    ///
-    /// Panics if this is called more than once or [`litebox_fs`] is called before this
     pub fn set_fs(&mut self, fs: LinuxFS) {
-        set_fs(fs);
+        self.fs = Some(fs);
     }
 
     /// Create a default layered file system with the given in-memory and tar read-only layers.
@@ -167,6 +165,14 @@ impl ShimLauncher {
         set_load_filter(callback);
     }
 
+    fn into_global(self) -> Arc<GlobalState> {
+        Arc::new(GlobalState {
+            fs: self
+                .fs
+                .expect("File system must be set before creating global state"),
+        })
+    }
+
     /// Initialize the shim to run a task with the given parameters.
     pub fn load_program(
         self,
@@ -175,6 +181,9 @@ impl ShimLauncher {
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
     ) -> Result<litebox_common_linux::PtRegs, loader::ElfLoaderError> {
+        let litebox = self.litebox;
+        let global = self.into_global();
+
         let litebox_common_linux::TaskParams {
             pid,
             ppid,
@@ -185,8 +194,8 @@ impl ShimLauncher {
             egid,
         } = task;
 
-        let files = Arc::new(syscalls::file::FilesState::new(self.litebox));
-        files.initialize_stdio_in_shared_descriptors_table();
+        let files = Arc::new(syscalls::file::FilesState::new(litebox));
+        files.initialize_stdio_in_shared_descriptors_table(&global.fs);
 
         // TODO: ensure this gets torn down even if the thread never runs sys_exit.
         // Consider a scoped execution model, e.g.
@@ -197,6 +206,7 @@ impl ShimLauncher {
         // ```
         SHIM_TLS.init(LinuxShimTls {
             current_task: Task {
+                global,
                 pid,
                 ppid,
                 tid,
@@ -235,21 +245,6 @@ pub(crate) fn litebox<'a>() -> &'a LiteBox<Platform> {
     })
 }
 
-static FS: OnceBox<LinuxFS> = OnceBox::new();
-/// Set the global file system
-///
-/// NOTE: This function signature might change as better parametricity is added to file systems.
-/// Related: <https://github.com/MSRSSP/litebox/issues/24>
-///
-/// # Panics
-///
-/// Panics if this is called more than once or [`litebox_fs`] is called before this
-fn set_fs(fs: LinuxFS) {
-    FS.set(alloc::boxed::Box::new(fs))
-        .map_err(|_| {})
-        .expect("fs is already set");
-}
-
 /// Create a default layered file system with the given in-memory and tar read-only layers.
 fn default_fs(
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
@@ -268,15 +263,6 @@ fn default_fs(
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     )
-}
-
-/// Get the global file system
-///
-/// # Panics
-///
-/// Panics if this is called before [`set_fs`] has been called
-pub(crate) fn litebox_fs<'a>() -> &'a LinuxFS {
-    FS.get().expect("fs has not yet been set")
 }
 
 /// Get the global page manager
@@ -313,15 +299,15 @@ pub(crate) fn litebox_futex_manager<'a>() -> &'a FutexManager<Platform> {
 pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
 
 impl syscalls::file::FilesState {
-    fn initialize_stdio_in_shared_descriptors_table(&self) {
+    fn initialize_stdio_in_shared_descriptors_table(&self, fs: &LinuxFS) {
         use litebox::fs::{FileSystem as _, Mode, OFlags};
-        let stdin = litebox_fs()
+        let stdin = fs
             .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
             .unwrap();
-        let stdout = litebox_fs()
+        let stdout = fs
             .open("/dev/stdout", OFlags::WRONLY, Mode::empty())
             .unwrap();
-        let stderr = litebox_fs()
+        let stderr = fs
             .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
             .unwrap();
         let mut dt = litebox().descriptor_table_mut();
@@ -397,15 +383,17 @@ impl Descriptors {
     }
 }
 
-impl syscalls::file::FilesState {
+impl Task {
     fn close_on_exec(&self) {
-        self.file_descriptors
+        let files = self.files.borrow();
+        files
+            .file_descriptors
             .write()
             .descriptors
             .iter_mut()
             .for_each(|slot| {
                 if let Some(desc) = slot.take()
-                    && let Ok(flags) = desc.get_file_descriptor_flags(self)
+                    && let Ok(flags) = desc.get_file_descriptor_flags(&files)
                 {
                     if flags.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC) {
                         let _ = self.do_close(desc);
@@ -1205,11 +1193,16 @@ impl Task {
     }
 }
 
+struct GlobalState {
+    fs: LinuxFS,
+}
+
 struct LinuxShimTls {
     current_task: Task,
 }
 
 struct Task {
+    global: Arc<GlobalState>,
     process: Arc<syscalls::process::Process>,
     /// Process ID
     pid: i32,
@@ -1346,13 +1339,14 @@ mod test_utils {
     use super::*;
     use crate::syscalls::process::NEXT_THREAD_ID;
 
-    impl Task {
+    impl GlobalState {
         /// Make a new task with default values for testing.
-        pub(crate) fn new_for_test() -> Self {
+        pub(crate) fn new_test_task(self: Arc<Self>) -> Task {
             let pid = NEXT_THREAD_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let files = Arc::new(syscalls::file::FilesState::new(litebox()));
-            files.initialize_stdio_in_shared_descriptors_table();
+            files.initialize_stdio_in_shared_descriptors_table(&self.fs);
             Task {
+                global: self,
                 process: Arc::new(syscalls::process::Process::new()),
                 pid,
                 ppid: 0,
@@ -1370,9 +1364,12 @@ mod test_utils {
                 files: files.into(),
             }
         }
+    }
 
+    impl Task {
         /// Returns a function that clones this task with a new TID for testing.
         pub(crate) fn clone_for_test(&self) -> impl 'static + Send + FnOnce() -> Self {
+            let global = self.global.clone();
             let process = self.process.clone();
             let credentials = self.credentials.clone();
             let fs = self.fs.clone();
@@ -1382,6 +1379,7 @@ mod test_utils {
             let parent_pid = self.ppid;
             let files = self.files.clone();
             move || Task {
+                global,
                 process,
                 pid,
                 ppid: parent_pid,

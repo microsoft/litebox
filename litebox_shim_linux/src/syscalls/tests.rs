@@ -4,35 +4,37 @@ use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, err
 use litebox_platform_multiplex::{Platform, set_platform};
 
 use crate::MutPtr;
+use alloc::sync::Arc;
 
 extern crate std;
-
-// Ensure we only init the platform once
-static INIT_FUNC: spin::Once = spin::Once::new();
 
 const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
 
 #[must_use]
 pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task {
-    INIT_FUNC.call_once(|| {
-        #[cfg(target_os = "linux")]
-        let platform = Platform::new(tun_device_name);
+    static GLOBAL: std::sync::OnceLock<Arc<crate::GlobalState>> = std::sync::OnceLock::new();
+    GLOBAL
+        .get_or_init(|| {
+            #[cfg(target_os = "linux")]
+            let platform = Platform::new(tun_device_name);
 
-        #[cfg(not(target_os = "linux"))]
-        let platform = Platform::new();
+            #[cfg(not(target_os = "linux"))]
+            let platform = Platform::new();
 
-        set_platform(platform);
-        let mut launcher = crate::ShimLauncher::new();
-        let litebox = launcher.litebox();
-        let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
-        in_mem_fs.with_root_privileges(|fs| {
-            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to set permissions on root");
-        });
-        let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(litebox, TEST_TAR_FILE.into());
-        launcher.set_fs(launcher.default_fs(in_mem_fs, tar_ro_fs));
-    });
-    crate::Task::new_for_test()
+            set_platform(platform);
+            let mut launcher = crate::ShimLauncher::new();
+            let litebox = launcher.litebox();
+            let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+            in_mem_fs.with_root_privileges(|fs| {
+                fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                    .expect("Failed to set permissions on root");
+            });
+            let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(litebox, TEST_TAR_FILE.into());
+            launcher.set_fs(launcher.default_fs(in_mem_fs, tar_ro_fs));
+            launcher.into_global()
+        })
+        .clone()
+        .new_test_task()
 }
 
 pub(crate) fn compile(input: &str, output: &str, is_static: bool, nolibc: bool) {

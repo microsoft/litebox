@@ -19,7 +19,7 @@ use litebox_common_linux::{
 };
 use litebox_platform_multiplex::Platform;
 
-use crate::{ConstPtr, Descriptor, Descriptors, MutPtr, Task, litebox, litebox_fs, litebox_pipes};
+use crate::{ConstPtr, Descriptor, Descriptors, MutPtr, Task, litebox, litebox_pipes};
 use core::sync::atomic::Ordering;
 
 /// Task state shared by [`CLONE_FS`].
@@ -128,7 +128,7 @@ impl Task {
     /// Handle syscall `open`
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let mode = mode & !self.get_umask();
-        let file = litebox_fs().open(path, flags - OFlags::CLOEXEC, mode)?;
+        let file = self.global.fs.open(path, flags - OFlags::CLOEXEC, mode)?;
         if flags.contains(OFlags::CLOEXEC) {
             let None = litebox()
                 .descriptor_table_mut()
@@ -143,7 +143,7 @@ impl Task {
             .file_descriptors
             .write()
             .insert(self, Descriptor::LiteBoxRawFd(raw_fd))
-            .map_err(|desc| files.do_close(desc).err().unwrap_or(Errno::EMFILE))
+            .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
     }
 
     /// Handle syscall `openat`
@@ -177,7 +177,8 @@ impl Task {
             Descriptor::LiteBoxRawFd(raw_fd) => self.files.borrow().run_on_raw_fd(
                 *raw_fd,
                 |fd| {
-                    litebox_fs()
+                    self.global
+                        .fs
                         .truncate(fd, length, false)
                         .map_err(Errno::from)
                 },
@@ -204,9 +205,9 @@ impl Task {
         match fs_path {
             FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
                 if flags.contains(AtFlags::AT_REMOVEDIR) {
-                    litebox_fs().rmdir(path).map_err(Errno::from)
+                    self.global.fs.rmdir(path).map_err(Errno::from)
                 } else {
-                    litebox_fs().unlink(path).map_err(Errno::from)
+                    self.global.fs.unlink(path).map_err(Errno::from)
                 }
             }
             FsPath::Cwd => Err(Errno::EINVAL),
@@ -236,7 +237,8 @@ impl Task {
                     .run_on_raw_fd(
                         raw_fd,
                         |fd| {
-                            litebox_fs()
+                            self.global
+                                .fs
                                 .read(fd, &mut buf.borrow_mut(), offset)
                                 .map_err(Errno::from)
                         },
@@ -289,7 +291,7 @@ impl Task {
                 files
                     .run_on_raw_fd(
                         raw_fd,
-                        |fd| litebox_fs().write(fd, buf, offset).map_err(Errno::from),
+                        |fd| self.global.fs.write(fd, buf, offset).map_err(Errno::from),
                         |fd| {
                             super::net::sendto(
                                 fd,
@@ -355,7 +357,7 @@ impl Task {
             Descriptor::LiteBoxRawFd(raw_fd) => files
                 .run_on_raw_fd(
                     *raw_fd,
-                    |fd| litebox_fs().seek(fd, offset, whence).map_err(Errno::from),
+                    |fd| self.global.fs.seek(fd, offset, whence).map_err(Errno::from),
                     |_| Err(Errno::ESPIPE),
                     |_| Err(Errno::ESPIPE),
                 )
@@ -367,19 +369,18 @@ impl Task {
     /// Handle syscall `mkdir`
     pub fn sys_mkdir(&self, pathname: impl path::Arg, mode: u32) -> Result<(), Errno> {
         let mode = Mode::from_bits_retain(mode) & !self.get_umask();
-        litebox_fs().mkdir(pathname, mode).map_err(Errno::from)
+        self.global.fs.mkdir(pathname, mode).map_err(Errno::from)
     }
-}
 
-impl FilesState {
     pub(crate) fn do_close(&self, desc: Descriptor) -> Result<(), Errno> {
+        let files = self.files.borrow();
         match desc {
             Descriptor::LiteBoxRawFd(raw_fd) => {
-                let mut rds = self.raw_descriptor_store.write();
+                let mut rds = files.raw_descriptor_store.write();
                 match rds.fd_consume_raw_integer(raw_fd) {
                     Ok(fd) => {
                         drop(rds);
-                        litebox_fs().close(&fd).map_err(Errno::from)
+                        self.global.fs.close(&fd).map_err(Errno::from)
                     }
                     Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
                     Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
@@ -412,9 +413,7 @@ impl FilesState {
             Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } => Ok(()),
         }
     }
-}
 
-impl Task {
     /// Handle syscall `close`
     pub fn sys_close(&self, fd: i32) -> Result<(), Errno> {
         let Ok(fd) = u32::try_from(fd) else {
@@ -422,7 +421,7 @@ impl Task {
         };
         let files = self.files.borrow();
         match files.file_descriptors.write().remove(fd) {
-            Some(desc) => files.do_close(desc),
+            Some(desc) => self.do_close(desc),
             None => Err(Errno::EBADF),
         }
     }
@@ -466,7 +465,8 @@ impl Task {
                     .run_on_raw_fd(
                         *raw_fd,
                         |fd| {
-                            litebox_fs()
+                            self.global
+                                .fs
                                 .read(fd, &mut kernel_buffer, None)
                                 .map_err(Errno::from)
                         },
@@ -535,7 +535,7 @@ impl Task {
                     *raw_fd,
                     |fd| {
                         write_to_iovec(iovs, |buf: &[u8]| {
-                            litebox_fs().write(fd, buf, None).map_err(Errno::from)
+                            self.global.fs.write(fd, buf, None).map_err(Errno::from)
                         })
                     },
                     |fd| {
@@ -562,7 +562,7 @@ impl Task {
         pathname: impl path::Arg,
         mode: litebox_common_linux::AccessFlags,
     ) -> Result<(), Errno> {
-        let status = litebox_fs().file_status(pathname)?;
+        let status = self.global.fs.file_status(pathname)?;
         if mode == litebox_common_linux::AccessFlags::F_OK {
             return Ok(());
         }
@@ -638,13 +638,16 @@ impl Task {
 }
 
 impl Descriptor {
-    fn stat(&self, files: &FilesState) -> Result<FileStat, Errno> {
+    fn stat(&self, task: &Task) -> Result<FileStat, Errno> {
         let fstat = match self {
-            Descriptor::LiteBoxRawFd(raw_fd) => files
+            Descriptor::LiteBoxRawFd(raw_fd) => task
+                .files
+                .borrow()
                 .run_on_raw_fd(
                     *raw_fd,
                     |fd| {
-                        litebox_fs()
+                        task.global
+                            .fs
                             .fd_file_status(fd)
                             .map(FileStat::from)
                             .map_err(Errno::from)
@@ -746,7 +749,7 @@ impl Task {
         } else {
             normalized_path
         };
-        let status = litebox_fs().file_status(path)?;
+        let status = self.global.fs.file_status(path)?;
         Ok(FileStat::from(status))
     }
 
@@ -775,7 +778,7 @@ impl Task {
             .read()
             .get_fd(fd)
             .ok_or(Errno::EBADF)?
-            .stat(&files)
+            .stat(self)
     }
 
     /// Handle syscall `newfstatat`
@@ -796,13 +799,13 @@ impl Task {
             FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
                 self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))?
             }
-            FsPath::Cwd => litebox_fs().file_status("")?.into(),
+            FsPath::Cwd => self.global.fs.file_status("")?.into(),
             FsPath::Fd(fd) => files
                 .file_descriptors
                 .read()
                 .get_fd(fd)
                 .ok_or(Errno::EBADF)?
-                .stat(&files)?,
+                .stat(self)?,
             FsPath::FdRelative { fd, path } => todo!(),
         };
         Ok(fstat)
@@ -1076,10 +1079,10 @@ impl Task {
         let mut fds = files.file_descriptors.write();
         let w = fds
             .insert(self, Descriptor::LiteBoxRawFd(wr_raw_fd))
-            .map_err(|desc| files.do_close(desc).err().unwrap_or(Errno::EMFILE))?;
+            .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))?;
         let r = fds
             .insert(self, Descriptor::LiteBoxRawFd(rd_raw_fd))
-            .map_err(|desc| files.do_close(desc).err().unwrap_or(Errno::EMFILE))?;
+            .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))?;
         Ok((r, w))
     }
 
@@ -1104,7 +1107,7 @@ impl Task {
                     ),
                 },
             )
-            .map_err(|desc| files.do_close(desc).err().unwrap_or(Errno::EMFILE))
+            .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
     }
 
     fn stdio_ioctl(
@@ -1293,7 +1296,7 @@ impl Task {
                     ),
                 },
             )
-            .map_err(|desc| files.do_close(desc).err().unwrap_or(Errno::EMFILE))
+            .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
     }
 
     /// Handle syscall `epoll_ctl`
@@ -1714,7 +1717,7 @@ impl Task {
                 .write()
                 .insert_at(new_file, newfd as usize)
             {
-                files.do_close(old_file)?;
+                self.do_close(old_file)?;
             }
             Ok(newfd)
         } else {
@@ -1723,7 +1726,7 @@ impl Task {
                 .file_descriptors
                 .write()
                 .insert(self, new_file)
-                .map_err(|desc| files.do_close(desc).err().unwrap_or(Errno::EMFILE))
+                .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
         }
     }
 }
@@ -1763,7 +1766,7 @@ impl Task {
                 let mut nbytes = 0;
                 let off = 0;
 
-                let mut entries = litebox_fs().read_dir(file)?;
+                let mut entries = self.global.fs.read_dir(file)?;
                 entries.sort_by(|a, b| a.name.cmp(&b.name));
 
                 for entry in entries.iter().skip(dir_off) {
