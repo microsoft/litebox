@@ -174,6 +174,10 @@ impl ShimLauncher {
     }
 
     /// Initialize the shim to run a task with the given parameters.
+    ///
+    /// # Panics
+    /// Panics if the file system has not been set with [`set_fs`](Self::set_fs)
+    /// before calling this method.
     pub fn load_program(
         self,
         task: litebox_common_linux::TaskParams,
