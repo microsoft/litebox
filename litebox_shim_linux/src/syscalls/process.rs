@@ -720,6 +720,12 @@ impl Task {
                 // CLOCK_MONOTONIC
                 platform.now().duration_since(crate::boot_time())
             }
+            litebox_common_linux::ClockId::MonotonicCoarse => {
+                // CLOCK_MONOTONIC_COARSE - provides faster but less precise monotonic time
+                // For simplicity, we can reuse the same monotonic time as CLOCK_MONOTONIC
+                // In a real implementation, this would typically have lower resolution
+                platform.now().duration_since(crate::boot_time())
+            }
             _ => unimplemented!(),
         };
         Ok(duration)
@@ -728,15 +734,27 @@ impl Task {
     /// Handle syscall `clock_getres`.
     pub(crate) fn sys_clock_getres(
         &self,
-        _clockid: litebox_common_linux::ClockId,
+        clockid: litebox_common_linux::ClockId,
         res: crate::MutPtr<litebox_common_linux::Timespec>,
     ) {
         // Return the resolution of the clock
-        // For most modern systems, the resolution is typically 1 nanosecond
-        // This is a reasonable default for high-resolution timers
-        let resolution = litebox_common_linux::Timespec {
-            tv_sec: 0,
-            tv_nsec: 1, // 1 nanosecond resolution
+        let resolution = match clockid {
+            litebox_common_linux::ClockId::MonotonicCoarse => {
+                // Coarse clocks typically have lower resolution (e.g., 4 millisecond)
+                litebox_common_linux::Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 4_000_000, // 4 millisecond resolution
+                }
+            }
+            litebox_common_linux::ClockId::RealTime | litebox_common_linux::ClockId::Monotonic => {
+                // For most modern systems, the resolution is typically 1 nanosecond
+                // This is a reasonable default for high-resolution timers
+                litebox_common_linux::Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 1, // 1 nanosecond resolution
+                }
+            }
+            _ => unimplemented!(),
         };
 
         unsafe {
