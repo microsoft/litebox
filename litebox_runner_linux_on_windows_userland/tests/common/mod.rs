@@ -7,7 +7,7 @@ use litebox_platform_multiplex::Platform;
 
 pub struct TestLauncher {
     platform: &'static Platform,
-    launcher: litebox_shim_linux::ShimLauncher,
+    shim: litebox_shim_linux::LinuxShim,
     fs: litebox_shim_linux::DefaultFS,
 }
 
@@ -19,8 +19,8 @@ impl TestLauncher {
     ) -> Self {
         let platform = Platform::new();
         litebox_platform_multiplex::set_platform(platform);
-        let launcher = litebox_shim_linux::ShimLauncher::new();
-        let litebox = launcher.litebox();
+        let shim = litebox_shim_linux::LinuxShim::new();
+        let litebox = shim.litebox();
 
         let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
         in_mem_fs.with_root_privileges(|fs| {
@@ -35,12 +35,8 @@ impl TestLauncher {
                 tar_data.into()
             },
         );
-        let fs = launcher.default_fs(in_mem_fs, tar_ro_fs);
-        let mut this = Self {
-            platform,
-            launcher,
-            fs,
-        };
+        let fs = shim.default_fs(in_mem_fs, tar_ro_fs);
+        let mut this = Self { platform, shim, fs };
 
         for each in initial_dirs {
             this.install_dir(each);
@@ -50,7 +46,7 @@ impl TestLauncher {
             this.install_file(data, each);
         }
 
-        platform.register_shim(&litebox_shim_linux::LinuxShim);
+        platform.register_shim(shim.entrypoints());
         this
     }
 
@@ -74,14 +70,14 @@ impl TestLauncher {
     }
 
     pub fn test_load_exec_common(mut self, executable_path: &str) {
-        self.launcher.set_fs(self.fs);
+        self.shim.set_fs(self.fs);
         let argv = vec![
             CString::new(executable_path).unwrap(),
             CString::new("hello").unwrap(),
         ];
         let envp = vec![CString::new("PATH=/bin").unwrap()];
         let mut pt_regs = self
-            .launcher
+            .shim
             .load_program(self.platform.init_task(), executable_path, argv, envp)
             .unwrap();
         unsafe { litebox_platform_windows_userland::run_thread(&mut pt_regs) };

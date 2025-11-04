@@ -11,7 +11,7 @@ use litebox_platform_multiplex::Platform;
 
 struct TestLauncher {
     platform: &'static Platform,
-    launcher: litebox_shim_linux::ShimLauncher,
+    shim: litebox_shim_linux::LinuxShim,
     fs: litebox_shim_linux::DefaultFS,
 }
 
@@ -25,8 +25,8 @@ impl TestLauncher {
     ) -> Self {
         let platform = Platform::new(tun_device_name);
         litebox_platform_multiplex::set_platform(platform);
-        let launcher = litebox_shim_linux::ShimLauncher::new();
-        let litebox = launcher.litebox();
+        let shim = litebox_shim_linux::LinuxShim::new();
+        let litebox = shim.litebox();
 
         let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
         in_mem_fs.with_root_privileges(|fs| {
@@ -41,12 +41,8 @@ impl TestLauncher {
                 tar_data.into()
             },
         );
-        let fs = launcher.default_fs(in_mem_fs, tar_ro_fs);
-        let mut this = Self {
-            platform,
-            launcher,
-            fs,
-        };
+        let fs = shim.default_fs(in_mem_fs, tar_ro_fs);
+        let mut this = Self { platform, shim, fs };
 
         for each in initial_dirs {
             this.install_dir(each);
@@ -56,7 +52,7 @@ impl TestLauncher {
             this.install_file(data, each);
         }
 
-        platform.register_shim(&litebox_shim_linux::LinuxShim);
+        platform.register_shim(this.shim.entrypoints());
 
         if enable_syscall_interception {
             platform.enable_seccomp_based_syscall_interception();
@@ -92,8 +88,8 @@ impl TestLauncher {
             CString::new("PATH=/bin").unwrap(),
             CString::new("HOME=/").unwrap(),
         ];
-        self.launcher.set_fs(self.fs);
-        self.launcher.set_load_filter(|_env, aux| {
+        self.shim.set_fs(self.fs);
+        self.shim.set_load_filter(|_env, aux| {
             if litebox_platform_multiplex::platform()
                 .get_vdso_address()
                 .is_none()
@@ -121,7 +117,7 @@ impl TestLauncher {
             }
         });
         let mut pt_regs = self
-            .launcher
+            .shim
             .load_program(self.platform.init_task(), executable_path, argv, envp)
             .unwrap();
         unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };

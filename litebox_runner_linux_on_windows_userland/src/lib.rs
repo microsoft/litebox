@@ -144,8 +144,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let platform = Platform::new();
     litebox_platform_multiplex::set_platform(platform);
-    let mut builder = litebox_shim_linux::ShimLauncher::new();
-    let litebox = builder.litebox();
+    let mut shim = litebox_shim_linux::LinuxShim::new();
+    let litebox = shim.litebox();
     let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0]))?;
     let prog_unix_path = windows_path_to_unix(&prog);
     let initial_file_system = {
@@ -210,10 +210,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
 
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
-        builder.default_fs(in_mem, tar_ro)
+        shim.default_fs(in_mem, tar_ro)
     };
-    builder.set_fs(initial_file_system);
-    platform.register_shim(&litebox_shim_linux::LinuxShim);
+    shim.set_fs(initial_file_system);
+    platform.register_shim(shim.entrypoints());
 
     let argv = cli_args
         .program_and_arguments
@@ -248,7 +248,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let mut pt_regs = builder
+    let mut pt_regs = shim
         .load_program(platform.init_task(), &prog_unix_path, argv, envp)
         .unwrap();
     unsafe { litebox_platform_windows_userland::run_thread(&mut pt_regs) };

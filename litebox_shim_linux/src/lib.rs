@@ -63,9 +63,9 @@ type UserMutPointer<T> = <Platform as litebox::platform::RawPointerProvider>::Ra
 static BOOT_TIME: once_cell::race::OnceBox<<Platform as litebox::platform::TimeProvider>::Instant> =
     once_cell::race::OnceBox::new();
 
-pub struct LinuxShim;
+pub struct LinuxShimEntrypoints;
 
-impl litebox::shim::EnterShim for LinuxShim {
+impl litebox::shim::EnterShim for LinuxShimEntrypoints {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ContinueOperation = ContinueOperation;
 
@@ -117,18 +117,20 @@ pub(crate) fn boot_time() -> &'static <Platform as litebox::platform::TimeProvid
         .expect("litebox() should have already been called before this point")
 }
 
-pub struct ShimLauncher {
+/// The shim entry point structure.
+pub struct LinuxShim {
     litebox: &'static LiteBox<Platform>,
     fs: Option<LinuxFS>,
 }
 
-impl Default for ShimLauncher {
+impl Default for LinuxShim {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ShimLauncher {
+impl LinuxShim {
+    /// Returns a new shim.
     pub fn new() -> Self {
         Self {
             litebox: crate::litebox(),
@@ -136,6 +138,7 @@ impl ShimLauncher {
         }
     }
 
+    /// Returns the litebox object for the shim.
     pub fn litebox(&self) -> &LiteBox<Platform> {
         self.litebox
     }
@@ -165,6 +168,12 @@ impl ShimLauncher {
         set_load_filter(callback);
     }
 
+    /// Returns the entrypoints to call to interact with the shim from guest
+    /// threads.
+    pub fn entrypoints(&self) -> &'static LinuxShimEntrypoints {
+        &LinuxShimEntrypoints
+    }
+
     fn into_global(self) -> Arc<GlobalState> {
         Arc::new(GlobalState {
             fs: self
@@ -173,7 +182,8 @@ impl ShimLauncher {
         })
     }
 
-    /// Initialize the shim to run a task with the given parameters.
+    /// Loads the program at `path` as the shim's initial task, returning the
+    /// initial register state.
     ///
     /// # Panics
     /// Panics if the file system has not been set with [`set_fs`](Self::set_fs)

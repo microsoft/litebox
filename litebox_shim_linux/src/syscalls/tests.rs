@@ -22,16 +22,16 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task {
             let platform = Platform::new();
 
             set_platform(platform);
-            let mut launcher = crate::ShimLauncher::new();
-            let litebox = launcher.litebox();
+            let mut shim = crate::LinuxShim::new();
+            let litebox = shim.litebox();
             let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
             in_mem_fs.with_root_privileges(|fs| {
                 fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                     .expect("Failed to set permissions on root");
             });
             let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(litebox, TEST_TAR_FILE.into());
-            launcher.set_fs(launcher.default_fs(in_mem_fs, tar_ro_fs));
-            launcher.into_global()
+            shim.set_fs(shim.default_fs(in_mem_fs, tar_ro_fs));
+            shim.into_global()
         })
         .clone()
         .new_test_task()

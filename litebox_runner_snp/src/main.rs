@@ -97,11 +97,11 @@ pub extern "C" fn sandbox_process_init(
     litebox::log_println!(platform, "sandbox_process_init called");
 
     litebox_platform_multiplex::set_platform(platform);
-    let mut launcher = litebox_shim_linux::ShimLauncher::new();
-    let litebox = launcher.litebox();
+    let mut shim = litebox_shim_linux::LinuxShim::new();
+    let litebox = shim.litebox();
     let in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, ROOTFS.into());
-    launcher.set_fs(launcher.default_fs(in_mem_fs, tar_ro));
+    shim.set_fs(shim.default_fs(in_mem_fs, tar_ro));
 
     let parse_args =
         |params: &litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params| -> Option<(
@@ -139,7 +139,7 @@ pub extern "C" fn sandbox_process_init(
             globals::SM_TERM_INVALID_PARAM,
         );
     };
-    *pt_regs = match launcher.load_program(platform.init_task(boot_params), &program, argv, envp) {
+    *pt_regs = match shim.load_program(platform.init_task(boot_params), &program, argv, envp) {
         Ok(regs) => regs,
         Err(err) => {
             litebox::log_println!(platform, "failed to load program: {}", err);
@@ -163,7 +163,7 @@ pub extern "C" fn sandbox_task_exit() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn do_syscall_64(pt_regs: &mut litebox_common_linux::PtRegs) {
-    match litebox_shim_linux::LinuxShim.syscall(pt_regs) {
+    match litebox_shim_linux::LinuxShimEntrypoints.syscall(pt_regs) {
         ContinueOperation::ResumeGuest => {}
         ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
             pt_regs.rax = status.cast_unsigned() as usize;
