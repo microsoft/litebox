@@ -22,7 +22,7 @@ use litebox_platform_multiplex::Platform;
 use crate::{ConstPtr, Descriptor, Descriptors, MutPtr, Task, litebox, litebox_pipes};
 use core::sync::atomic::Ordering;
 
-/// Task state shared by [`CLONE_FS`].
+/// Task state shared by `CLONE_FS`.
 pub(crate) struct FsState {
     umask: core::sync::atomic::AtomicU32,
 }
@@ -47,7 +47,7 @@ impl FsState {
     }
 }
 
-/// Task state shared by [`CLONE_FILES`].
+/// Task state shared by `CLONE_FILES`.
 pub(crate) struct FilesState {
     pub file_descriptors: litebox::sync::RwLock<Platform, Descriptors>,
     pub raw_descriptor_store: litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
