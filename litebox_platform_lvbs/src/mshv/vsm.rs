@@ -105,6 +105,7 @@ pub(crate) fn init() {
 
 /// VSM function for enabling VTL of APs
 /// Not supported in this implementation.
+#[allow(clippy::unnecessary_wraps)]
 pub fn mshv_vsm_enable_aps(_cpu_present_mask_pfn: u64) -> Result<i64, Errno> {
     serial_println!("mshv_vsm_enable_aps() not supported");
     Ok(0)
@@ -138,17 +139,16 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
         }) else {
             serial_println!("Failed to get boot signal page");
             return Err(Errno::EINVAL);
-
         };
 
         let mut error = None;
 
         // Initialize VTL for each online CPU and update its boot signal byte
         cpu_mask.for_each_cpu(|cpu_id| {
-            if let Err(e) = init_vtl_ap(cpu_id as u32) {
+            if let Err(e) = init_vtl_ap(u32::try_from(cpu_id).expect("cpu_id exceeds u32 range")) {
                 error = Some(e);
             }
-          boot_signal_page_buf.0[cpu_id] = HV_SECURE_VTL_BOOT_TOKEN;
+            boot_signal_page_buf.0[cpu_id] = HV_SECURE_VTL_BOOT_TOKEN;
         });
 
         if let Some(e) = error {

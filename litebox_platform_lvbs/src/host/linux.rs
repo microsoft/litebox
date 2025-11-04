@@ -1,8 +1,6 @@
 //! Linux Structs
 
-use crate::{
-    arch::MAX_CORES
-};
+use crate::arch::MAX_CORES;
 
 /// Context saved when entering the kernel
 ///
