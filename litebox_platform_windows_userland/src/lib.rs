@@ -462,6 +462,7 @@ unsafe extern "C-unwind" fn run_thread_inner(
     // At entry, the register context is the guest context with the
     // return address in rcx. r11 is an available scratch register (it would
     // contain rflags if the syscall instruction had actually been issued).
+    .globl  syscall_callback
 syscall_callback:
     // Get the TLS state from the TLS slot and clear the in-guest flag.
     mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
