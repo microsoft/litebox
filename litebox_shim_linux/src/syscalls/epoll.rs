@@ -485,7 +485,7 @@ impl PollSet {
         let mut register = true;
         let mut is_ready = timeout.is_some_and(|t| t.is_zero());
         loop {
-            let mut fds = files.file_descriptors.read();
+            let fds = files.file_descriptors.read();
             for entry in &mut self.entries {
                 entry.revents = if entry.fd < 0 {
                     continue;

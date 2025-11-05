@@ -336,6 +336,7 @@ impl litebox::shim::InitThread for NewThreadArgs {
         // Note that the following calls happen _before_ setting `SHIM_TLS`, so
         // any calls to `with_current_task` will panic. This should be OK--only
         // entry point code should be calling `with_current_task`.
+        #[cfg_attr(not(target_arch = "x86"), expect(unused_mut))]
         if let Some(mut tls) = tls {
             // Set the TLS base pointer for the new thread
             #[cfg(target_arch = "x86")]
@@ -1030,7 +1031,7 @@ impl Task {
         } else {
             copy_vector(argv, "argv")?
         };
-        let mut envp_vec = if envp.as_usize() == 0 {
+        let envp_vec = if envp.as_usize() == 0 {
             alloc::vec::Vec::new()
         } else {
             copy_vector(envp, "envp")?

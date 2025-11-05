@@ -795,7 +795,7 @@ impl Task {
         fd: i32,
         buf: ConstPtr<u8>,
         len: usize,
-        mut flags: SendFlags,
+        flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
         let Ok(fd) = u32::try_from(fd) else {
@@ -822,7 +822,7 @@ impl Task {
         fd: i32,
         buf: MutPtr<u8>,
         len: usize,
-        mut flags: ReceiveFlags,
+        flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
     ) -> Result<usize, Errno> {
         let Ok(fd) = u32::try_from(fd) else {

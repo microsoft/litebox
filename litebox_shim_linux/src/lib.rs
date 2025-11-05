@@ -10,7 +10,6 @@
 )]
 #![expect(dead_code, reason = "transitionary to be removed soon")]
 #![expect(unused_must_use, reason = "transitionary to be removed soon")]
-#![expect(unused_mut, reason = "transitionary to be removed soon")]
 #![expect(unused_unsafe, reason = "transitionary to be removed soon")]
 #![expect(unused_variables, reason = "transitionary to be removed soon")]
 
