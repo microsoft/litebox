@@ -97,7 +97,7 @@ impl From<SocketAddrV4> for CSockInetAddr {
 /// Socket address structure for different address families.
 /// Currently only supports IPv4 (AF_INET).
 #[non_exhaustive]
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug)]
 pub(crate) enum SocketAddress {
     Inet(SocketAddr),
 }
@@ -1049,11 +1049,11 @@ mod tests {
             )
             .unwrap();
         let server = i32::try_from(server).unwrap();
-        let sockaddr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
-            core::net::Ipv4Addr::from(TUN_IP_ADDR),
+        let server_sockaddr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::from(ip),
             port,
         )));
-        task.sys_bind(server, sockaddr)
+        task.sys_bind(server, server_sockaddr.clone())
             .expect("Failed to bind socket");
         task.sys_listen(server, 1)
             .expect("Failed to listen on socket");
@@ -1113,6 +1113,8 @@ mod tests {
             )
             .expect("Failed to accept connection");
         let client_fd = i32::try_from(client_fd).unwrap();
+        assert_eq!(server_sockaddr, task.sys_getsockname(client_fd).unwrap());
+        assert_eq!(remote_addr, task.sys_getpeername(client_fd).unwrap());
         let super::SocketAddress::Inet(SocketAddr::V4(remote_addr)) = remote_addr else {
             panic!("Expected IPv4 address");
         };
@@ -1235,6 +1237,10 @@ mod tests {
         )));
         task.sys_bind(server_fd, server_addr.clone())
             .expect("failed to bind server");
+        assert_eq!(
+            server_addr,
+            task.sys_getsockname(server_fd).expect("getsockname failed")
+        );
 
         // Create an epoll instance and register the server fd for EPOLLIN
         let epfd = task
