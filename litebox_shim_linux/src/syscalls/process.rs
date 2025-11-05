@@ -131,21 +131,15 @@ impl Task {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn set_thread_area(
-        &self,
-        user_desc: crate::MutPtr<litebox_common_linux::UserDesc>,
-    ) -> Result<(), Errno> {
-        Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
-    }
-
     #[cfg(target_arch = "x86")]
     pub(crate) fn set_thread_area(
         &self,
-        user_desc: crate::MutPtr<litebox_common_linux::UserDesc>,
+        user_desc: &mut litebox_common_linux::UserDesc,
     ) -> Result<(), Errno> {
         use litebox::platform::{PunchthroughProvider as _, PunchthroughToken as _};
-        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetThreadArea { user_desc };
+        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetThreadArea {
+            user_desc: core::ptr::from_mut(user_desc),
+        };
         let token = litebox_platform_multiplex::platform()
             .get_punchthrough_token_for(punchthrough)
             .expect("Failed to get punchthrough token for SET_THREAD_AREA");
@@ -303,10 +297,10 @@ impl Task {
 
 /// A descriptor for thread-local storage (TLS).
 ///
-/// On `x86_64`, this is represented as a `u8`. The TLS pointer can point to
+/// On `x86_64`, this is represented as a `*mut u8`. The TLS pointer can point to
 /// an arbitrary-sized memory region.
 #[cfg(target_arch = "x86_64")]
-type ThreadLocalDescriptor = u8;
+type ThreadLocalDescriptor = UserMutPointer<u8>;
 
 /// A descriptor for thread-local storage (TLS).
 ///
@@ -317,7 +311,7 @@ type ThreadLocalDescriptor = litebox_common_linux::UserDesc;
 
 struct NewThreadArgs {
     /// Pointer to thread-local storage (TLS) given by the guest program
-    tls: Option<UserMutPointer<ThreadLocalDescriptor>>,
+    tls: Option<ThreadLocalDescriptor>,
     /// Where to store child TID in child's memory
     set_child_tid: Option<UserMutPointer<i32>>,
     /// Task struct that maintains all per-thread data
@@ -342,10 +336,12 @@ impl litebox::shim::InitThread for NewThreadArgs {
         // Note that the following calls happen _before_ setting `SHIM_TLS`, so
         // any calls to `with_current_task` will panic. This should be OK--only
         // entry point code should be calling `with_current_task`.
-        if let Some(tls) = tls {
+        if let Some(mut tls) = tls {
             // Set the TLS base pointer for the new thread
             #[cfg(target_arch = "x86")]
-            task.set_thread_area(tls);
+            {
+                task.set_thread_area(&mut tls);
+            }
 
             #[cfg(target_arch = "x86_64")]
             {
@@ -376,7 +372,7 @@ impl Task {
         stack: Option<crate::MutPtr<u8>>,
         stack_size: usize,
         child_tid: Option<crate::MutPtr<i32>>,
-        tls: Option<crate::MutPtr<ThreadLocalDescriptor>>,
+        tls: Option<ThreadLocalDescriptor>,
         ctx: &litebox_common_linux::PtRegs,
         main: usize,
     ) -> Result<usize, Errno> {

@@ -1039,7 +1039,28 @@ impl Task {
                 }
             }
             SyscallRequest::SetThreadArea { user_desc } => {
-                self.set_thread_area(user_desc).map(|()| 0)
+                #[cfg(target_arch = "x86_64")]
+                {
+                    Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
+                }
+                #[cfg(target_arch = "x86")]
+                {
+                    unsafe { user_desc.read_at_offset(0) }
+                        .ok_or(Errno::EFAULT)
+                        .and_then(|desc| {
+                            let mut desc = desc.into_owned();
+                            let idx = desc.entry_number;
+                            self.set_thread_area(&mut desc)?;
+                            if idx == u32::MAX {
+                                // index -1 means the kernel should try to find and
+                                // allocate an empty descriptor.
+                                // return the allocated entry number
+                                unsafe { user_desc.write_at_offset(0, desc) }
+                                    .ok_or(Errno::EFAULT)?;
+                            }
+                            Ok(0)
+                        })
+                }
             }
             SyscallRequest::SetTidAddress { tidptr } => {
                 Ok(self.sys_set_tid_address(tidptr).reinterpret_as_unsigned() as usize)
@@ -1186,7 +1207,16 @@ impl Task {
             ))
         };
         let tls = if clone_args.tls != 0 {
-            Some(MutPtr::from_usize(usize::try_from(clone_args.tls).unwrap()))
+            let addr = usize::try_from(clone_args.tls).unwrap();
+            #[cfg(target_arch = "x86_64")]
+            let desc = MutPtr::from_usize(addr);
+            #[cfg(target_arch = "x86")]
+            let desc = unsafe {
+                MutPtr::<litebox_common_linux::UserDesc>::from_usize(addr).read_at_offset(0)
+            }
+            .ok_or(Errno::EFAULT)?
+            .into_owned();
+            Some(desc)
         } else {
             None
         };

@@ -2890,9 +2890,7 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
         addr: Platform::RawMutPointer<usize>,
     },
     #[cfg(target_arch = "x86")]
-    SetThreadArea {
-        user_desc: Platform::RawMutPointer<UserDesc>,
-    },
+    SetThreadArea { user_desc: *mut UserDesc },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> litebox::platform::Punchthrough
