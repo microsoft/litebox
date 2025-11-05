@@ -1,18 +1,20 @@
 [workspace]
 resolver = "2"
 members = [
-    "litebox", 
+    "litebox",
     "litebox_common_linux",
     "litebox_common_optee",
     "litebox_platform_linux_kernel",
     "litebox_platform_linux_userland",
     "litebox_platform_windows_userland",
     "litebox_platform_lvbs",
+    "litebox_platform_baremetal",
     "litebox_platform_multiplex",
     "litebox_runner_linux_userland",
     "litebox_runner_linux_on_windows_userland",
     "litebox_runner_lvbs",
     "litebox_runner_optee_on_linux_userland",
+    "litebox_runner_baremetal",
     "litebox_shim_linux",
     "litebox_syscall_rewriter",
     "litebox_runner_snp",
@@ -36,9 +38,10 @@ default-members = [
     "litebox_syscall_rewriter",
     "dev_tests",
 ]
-# We exclude `litebox_runner_lvbs` from `default-members` because its interrupt handling
-# depends on the unstable `abi_x86_interrupt` feature, which requires a nightly toolchain.
-# Once this feature stabilizes, we can add `litebox_runner_lvbs` to `default-members`.
+# We exclude `litebox_runner_lvbs` and `litebox_runner_baremetal` from `default-members`
+# because their interrupt handling depends on the unstable `abi_x86_interrupt` feature,
+# which requires a nightly toolchain. Once this feature stabilizes, we can add them to
+# `default-members`.
 
 # Introduce all the pedantic clippy lints and remove ones I (jayb) think are
 # pushing it too far; this way we get something even further than default clippy
