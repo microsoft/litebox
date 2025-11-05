@@ -774,9 +774,24 @@ impl Task {
                 addr,
                 addrlen,
                 flags,
-            } => self
-                .sys_accept(sockfd, addr, addrlen, flags)
-                .map(|fd| fd as usize),
+            } => {
+                let mut remote_addr = addr.is_some().then(syscalls::net::SocketAddress::default);
+                self.sys_accept(sockfd, remote_addr.as_mut(), flags)
+                    .and_then(|fd| {
+                        if let (Some(addr), Some(remote_addr)) = (addr, remote_addr) {
+                            let addrlen = addrlen.ok_or(Errno::EFAULT)?;
+                            if let Err(err) =
+                                syscalls::net::write_sockaddr_to_user(remote_addr, addr, addrlen)
+                            {
+                                // If we fail to write the address back to user, we need to close the accepted socket.
+                                self.sys_close(i32::try_from(fd).unwrap())
+                                    .expect("close a newly-accepted socket failed");
+                                return Err(err);
+                            }
+                        }
+                        Ok(fd as usize)
+                    })
+            }
             SyscallRequest::Sendto {
                 sockfd,
                 buf,

@@ -5,7 +5,6 @@ use alloc::vec::Vec;
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use crate::event::{Events, IOPollable};
-use crate::net::errors::RemoteAddrError;
 use crate::platform::{Instant, TimeProvider};
 use crate::sync::RawSyncPrimitivesProvider;
 use crate::{LiteBox, platform, sync};
@@ -22,7 +21,7 @@ mod tests;
 
 use errors::{
     AcceptError, BindError, CloseError, ConnectError, ListenError, LocalAddrError, ReceiveError,
-    SendError, SocketError,
+    RemoteAddrError, SendError, SocketError,
 };
 use local_ports::{LocalPort, LocalPortAllocator};
 
@@ -886,7 +885,14 @@ where
             .get_entry_mut(fd)
             .ok_or(RemoteAddrError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        self.get_remote_addr_for_handle(socket_handle)
+    }
 
+    /// Get the remote address and port a `SocketHandle` is connected to, if any.
+    fn get_remote_addr_for_handle(
+        &self,
+        socket_handle: &SocketHandle<Platform>,
+    ) -> Result<SocketAddr, RemoteAddrError> {
         let endpoint = match socket_handle.protocol() {
             Protocol::Tcp => self
                 .socket_set
@@ -1068,7 +1074,13 @@ where
     }
 
     /// Accept a new incoming connection on a listening socket.
-    pub fn accept(&mut self, fd: &SocketFd<Platform>) -> Result<SocketFd<Platform>, AcceptError> {
+    ///
+    /// If `peer` is provided, it is filled with the remote address of the accepted connection.
+    pub fn accept(
+        &mut self,
+        fd: &SocketFd<Platform>,
+        peer: Option<&mut SocketAddr>,
+    ) -> Result<SocketFd<Platform>, AcceptError> {
         self.automated_platform_interaction(PollDirection::Both);
         let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table
@@ -1121,7 +1133,7 @@ where
                 // Trigger some automated platform interaction, to keep things flowing
                 self.automated_platform_interaction(PollDirection::Both);
                 // Create a new FD to hand it back out to the user
-                Ok(self.new_socket_fd_for(SocketHandle {
+                let handle = SocketHandle {
                     consider_closed: false,
                     handle: ready_handle,
                     specific: ProtocolSpecific::Tcp(TcpSpecific {
@@ -1132,7 +1144,14 @@ where
                     pollee: crate::event::polling::Pollee::new(&self.litebox),
                     previously_sendable: core::sync::atomic::AtomicBool::new(true),
                     recv_queue: core::sync::atomic::AtomicUsize::new(0),
-                }))
+                };
+                if let Some(peer) = peer {
+                    let Ok(remote_addr) = self.get_remote_addr_for_handle(&handle) else {
+                        unreachable!("a connected TCP socket must have a remote address")
+                    };
+                    *peer = remote_addr;
+                }
+                Ok(self.new_socket_fd_for(handle))
             }
             ProtocolSpecific::Udp(_) => unimplemented!(),
             ProtocolSpecific::Icmp(_) => unimplemented!(),
