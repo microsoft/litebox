@@ -10,7 +10,6 @@
 )]
 #![expect(dead_code, reason = "transitionary to be removed soon")]
 #![expect(unused_must_use, reason = "transitionary to be removed soon")]
-#![expect(unused_unsafe, reason = "transitionary to be removed soon")]
 #![expect(unused_variables, reason = "transitionary to be removed soon")]
 
 extern crate alloc;
@@ -1136,7 +1135,7 @@ impl Task {
                     Err(Errno::EINVAL)
                 } else {
                     let raw_bytes = cpuset.as_bytes();
-                    unsafe { mask.copy_from_slice(0, raw_bytes) }
+                    mask.copy_from_slice(0, raw_bytes)
                         .map(|()| raw_bytes.len())
                         .ok_or(Errno::EFAULT)
                 }

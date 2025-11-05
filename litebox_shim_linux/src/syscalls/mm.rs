@@ -230,12 +230,10 @@ mod tests {
                 0,
             )
             .unwrap();
-        unsafe {
-            addr.mutate_subslice_with(..0x2000, |buf| {
-                buf.fill(0xff);
-            })
-            .unwrap();
-        };
+        addr.mutate_subslice_with(..0x2000, |buf| {
+            buf.fill(0xff);
+        })
+        .unwrap();
         assert_eq!(
             unsafe { addr.read_at_offset(0x1000) }.unwrap().into_owned(),
             0xff,
