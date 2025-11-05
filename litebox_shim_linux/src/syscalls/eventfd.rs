@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn test_semaphore_eventfd() {
-        crate::syscalls::tests::init_platform(None);
+        let _task = crate::syscalls::tests::init_platform(None);
 
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn test_blocking_eventfd() {
-        crate::syscalls::tests::init_platform(None);
+        let _task = crate::syscalls::tests::init_platform(None);
 
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn test_blocking_eventfd_no_race_on_massive_readwrite() {
-        crate::syscalls::tests::init_platform(None);
+        let _task = crate::syscalls::tests::init_platform(None);
 
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_nonblocking_eventfd() {
-        crate::syscalls::tests::init_platform(None);
+        let _task = crate::syscalls::tests::init_platform(None);
 
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,

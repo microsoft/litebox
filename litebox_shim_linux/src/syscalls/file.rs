@@ -949,12 +949,14 @@ impl Task {
                             if flags.intersects(OFlags::NONBLOCK.complement()) {
                                 todo!("unsupported flags for pipes")
                             }
-                            litebox_pipes().read().update_flags(
-                                fd,
-                                litebox::pipes::Flags::NON_BLOCKING,
-                                flags.intersects(OFlags::NONBLOCK),
-                            );
-                            Ok(())
+                            litebox_pipes()
+                                .read()
+                                .update_flags(
+                                    fd,
+                                    litebox::pipes::Flags::NON_BLOCKING,
+                                    flags.intersects(OFlags::NONBLOCK),
+                                )
+                                .map_err(Errno::from)
                         },
                     )??,
                     Descriptor::Eventfd { file, .. } => {

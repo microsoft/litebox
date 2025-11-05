@@ -542,7 +542,9 @@ impl PollSet {
                     is_ready = true;
                 }
             } else {
-                condvar.block(0);
+                let Ok(()) = condvar.block(0) else {
+                    unreachable!()
+                };
             }
             condvar
                 .underlying_atomic()

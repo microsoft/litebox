@@ -347,7 +347,8 @@ impl litebox::shim::InitThread for NewThreadArgs {
             #[cfg(target_arch = "x86_64")]
             {
                 use litebox::platform::RawConstPointer as _;
-                task.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()));
+                task.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()))
+                    .unwrap();
             }
         }
 
@@ -735,7 +736,7 @@ impl Task {
         &self,
         clockid: litebox_common_linux::ClockId,
         res: crate::MutPtr<litebox_common_linux::Timespec>,
-    ) {
+    ) -> Result<(), Errno> {
         // Return the resolution of the clock
         let resolution = match clockid {
             litebox_common_linux::ClockId::MonotonicCoarse => {
@@ -756,9 +757,7 @@ impl Task {
             _ => unimplemented!(),
         };
 
-        unsafe {
-            res.write_at_offset(0, resolution);
-        }
+        unsafe { res.write_at_offset(0, resolution).ok_or(Errno::EFAULT) }
     }
 
     /// Handle syscall `clock_nanosleep`.

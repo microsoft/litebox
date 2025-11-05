@@ -9,7 +9,6 @@
     reason = "by convention, syscalls and related methods take &self even if unused"
 )]
 #![expect(dead_code, reason = "transitionary to be removed soon")]
-#![expect(unused_must_use, reason = "transitionary to be removed soon")]
 
 extern crate alloc;
 
@@ -943,8 +942,7 @@ impl Task {
             SyscallRequest::ClockGetres { clockid, res } => {
                 let clock_id =
                     litebox_common_linux::ClockId::try_from(clockid).expect("invalid clockid");
-                self.sys_clock_getres(clock_id, res);
-                Ok(0)
+                self.sys_clock_getres(clock_id, res).map(|()| 0)
             }
             SyscallRequest::ClockNanosleep {
                 clockid,
