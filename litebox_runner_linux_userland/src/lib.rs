@@ -216,6 +216,18 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     })?;
 
     shim.set_fs(initial_file_system);
+
+    if cli_args.tun_device_name.is_some() {
+        std::thread::spawn(|| {
+            // TODO: use `poll` rather than busy-looping
+            // Also, we need to terminate this thread when the main program exits
+            loop {
+                while litebox_shim_linux::perform_network_interaction().call_again_immediately() {}
+                core::hint::spin_loop();
+            }
+        });
+    }
+
     shim.set_load_filter(fixup_env_aux);
     platform.register_shim(shim.entrypoints());
     match cli_args.interception_backend {

@@ -97,7 +97,9 @@ impl EpollDescriptor {
                 // TODO: probably polling on stdio files, return dummy events for now
                 return Some(Events::OUT & mask);
             }
-            EpollDescriptor::Socket(fd) => todo!(),
+            EpollDescriptor::Socket(fd) => {
+                return crate::litebox_net().lock().with_iopollable(fd, poll);
+            }
             EpollDescriptor::Pipe(fd) => {
                 return crate::litebox_pipes().read().with_iopollable(fd, poll).ok();
             }
@@ -372,28 +374,29 @@ impl ReadySet {
             return;
         }
 
-        let mut entries = self.entries.lock();
         if !entry
             .is_ready
             .swap(true, core::sync::atomic::Ordering::Relaxed)
         {
+            let mut entries = self.entries.lock();
             entries.push_back(entry.weak_self.clone());
         }
-        drop(entries);
 
         self.pollee.notify_observers(Events::IN);
     }
 
     fn pop_multiple(&self, maxevents: usize, events: &mut Vec<EpollEvent>) {
-        let mut entries = self.entries.lock();
-        let mut nums = entries.len();
+        let mut nums = self.entries.lock().len();
         while nums > 0 {
             nums -= 1;
             if events.len() >= maxevents {
                 break;
             }
 
-            let Some(weak_entry) = entries.pop_front() else {
+            // Note the lock operation is performed inside the loop to avoid holding the lock while calling `poll()`.
+            // e.g., `poll` on a socket requires lock on network, and a deadlock may happen if another thread
+            // holds the network lock and tries to add an entry to the same epoll instance upon new events.
+            let Some(weak_entry) = self.entries.lock().pop_front() else {
                 // no more entries
                 break;
             };
@@ -416,10 +419,14 @@ impl ReadySet {
             }
 
             if is_still_ready {
-                entry
+                // if another event happened and already pushed the entry (i.e., marked it as ready)
+                // while we were processing, we don't need to push it again.
+                if !entry
                     .is_ready
-                    .store(true, core::sync::atomic::Ordering::Relaxed);
-                entries.push_back(weak_entry);
+                    .swap(true, core::sync::atomic::Ordering::Relaxed)
+                {
+                    self.entries.lock().push_back(weak_entry);
+                }
             }
         }
     }
