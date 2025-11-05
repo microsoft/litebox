@@ -33,7 +33,7 @@ use litebox::{
     platform::{
         PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutPointer as _,
     },
-    sync::{RwLock, futex::FutexManager},
+    sync::futex::FutexManager,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
 use litebox_common_linux::{ContinueOperation, SyscallRequest, errno::Errno};
@@ -42,6 +42,8 @@ use litebox_platform_multiplex::Platform;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
+
+pub type DefaultFS = LinuxFS;
 
 pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
     Platform,
@@ -61,9 +63,9 @@ type UserMutPointer<T> = <Platform as litebox::platform::RawPointerProvider>::Ra
 static BOOT_TIME: once_cell::race::OnceBox<<Platform as litebox::platform::TimeProvider>::Instant> =
     once_cell::race::OnceBox::new();
 
-pub struct LinuxShim;
+pub struct LinuxShimEntrypoints;
 
-impl litebox::shim::EnterShim for LinuxShim {
+impl litebox::shim::EnterShim for LinuxShimEntrypoints {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ContinueOperation = ContinueOperation;
 
@@ -115,47 +117,135 @@ pub(crate) fn boot_time() -> &'static <Platform as litebox::platform::TimeProvid
         .expect("litebox() should have already been called before this point")
 }
 
-/// Initialize the shim to run a task with the given parameters.
-///
-/// Returns the global litebox object.
-pub fn init_process<'a>(task: litebox_common_linux::TaskParams) -> &'a LiteBox<Platform> {
-    let litebox_common_linux::TaskParams {
-        pid,
-        ppid,
-        tid,
-        uid,
-        euid,
-        gid,
-        egid,
-    } = task;
+/// The shim entry point structure.
+pub struct LinuxShim {
+    litebox: &'static LiteBox<Platform>,
+    fs: Option<LinuxFS>,
+}
 
-    // TODO: ensure this gets torn down even if the thread never runs sys_exit.
-    // Consider a scoped execution model, e.g.
-    // ```
-    // litebox_shim_linux::run_process(task, |litebox| {
-    //     ...
-    // })
-    // ```
-    SHIM_TLS.init(LinuxShimTls {
-        current_task: Task {
+impl Default for LinuxShim {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LinuxShim {
+    /// Returns a new shim.
+    pub fn new() -> Self {
+        Self {
+            litebox: crate::litebox(),
+            fs: None,
+        }
+    }
+
+    /// Returns the litebox object for the shim.
+    pub fn litebox(&self) -> &LiteBox<Platform> {
+        self.litebox
+    }
+
+    /// Set the global file system
+    ///
+    /// NOTE: This function signature might change as better parametricity is added to file systems.
+    /// Related: <https://github.com/MSRSSP/litebox/issues/24>
+    pub fn set_fs(&mut self, fs: LinuxFS) {
+        self.fs = Some(fs);
+    }
+
+    /// Create a default layered file system with the given in-memory and tar read-only layers.
+    pub fn default_fs(
+        &self,
+        in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+        tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
+    ) -> DefaultFS {
+        default_fs(in_mem_fs, tar_ro_fs)
+    }
+
+    /// Set the load filter, which can augment envp or auxv when starting a new program.
+    ///
+    /// # Panics
+    /// Panics if the load filter is already set.
+    pub fn set_load_filter(&mut self, callback: LoadFilter) {
+        set_load_filter(callback);
+    }
+
+    /// Returns the entrypoints to call to interact with the shim from guest
+    /// threads.
+    pub fn entrypoints(&self) -> &'static LinuxShimEntrypoints {
+        &LinuxShimEntrypoints
+    }
+
+    fn into_global(self) -> Arc<GlobalState> {
+        Arc::new(GlobalState {
+            fs: self
+                .fs
+                .expect("File system must be set before creating global state"),
+        })
+    }
+
+    /// Loads the program at `path` as the shim's initial task, returning the
+    /// initial register state.
+    ///
+    /// # Panics
+    /// Panics if the file system has not been set with [`set_fs`](Self::set_fs)
+    /// before calling this method.
+    pub fn load_program(
+        self,
+        task: litebox_common_linux::TaskParams,
+        path: &str,
+        argv: Vec<alloc::ffi::CString>,
+        envp: Vec<alloc::ffi::CString>,
+    ) -> Result<litebox_common_linux::PtRegs, loader::ElfLoaderError> {
+        let litebox = self.litebox;
+        let global = self.into_global();
+
+        let litebox_common_linux::TaskParams {
             pid,
             ppid,
             tid,
-            clear_child_tid: None.into(),
-            robust_list: None.into(),
-            credentials: syscalls::process::Credentials {
-                uid,
-                euid,
-                gid,
-                egid,
-            }
-            .into(),
-            comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
-            fs: Arc::new(syscalls::file::FsState::new()).into(),
-            process: syscalls::process::Process::new().into(),
-        },
-    });
-    litebox()
+            uid,
+            euid,
+            gid,
+            egid,
+        } = task;
+
+        let files = Arc::new(syscalls::file::FilesState::new(litebox));
+        files.initialize_stdio_in_shared_descriptors_table(&global.fs);
+
+        // TODO: ensure this gets torn down even if the thread never runs sys_exit.
+        // Consider a scoped execution model, e.g.
+        // ```
+        // litebox_shim_linux::run_process(task, |litebox| {
+        //     ...
+        // })
+        // ```
+        SHIM_TLS.init(LinuxShimTls {
+            current_task: Task {
+                global,
+                pid,
+                ppid,
+                tid,
+                clear_child_tid: None.into(),
+                robust_list: None.into(),
+                credentials: syscalls::process::Credentials {
+                    uid,
+                    euid,
+                    gid,
+                    egid,
+                }
+                .into(),
+                comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
+                fs: Arc::new(syscalls::file::FsState::new()).into(),
+                files: files.into(),
+                process: syscalls::process::Process::new().into(),
+            },
+        });
+
+        let r = with_current_task(|task| task.load_program(path, argv, envp));
+        if r.is_err() {
+            SHIM_TLS.deinit();
+        }
+        r
+    }
 }
 
 /// Get the global litebox object
@@ -169,24 +259,8 @@ pub(crate) fn litebox<'a>() -> &'a LiteBox<Platform> {
     })
 }
 
-static FS: OnceBox<LinuxFS> = OnceBox::new();
-/// Set the global file system
-///
-/// NOTE: This function signature might change as better parametricity is added to file systems.
-/// Related: <https://github.com/MSRSSP/litebox/issues/24>
-///
-/// # Panics
-///
-/// Panics if this is called more than once or [`litebox_fs`] is called before this
-pub fn set_fs(fs: LinuxFS) {
-    FS.set(alloc::boxed::Box::new(fs))
-        .map_err(|_| {})
-        .expect("fs is already set");
-    initialize_stdio_in_shared_descriptors_table();
-}
-
 /// Create a default layered file system with the given in-memory and tar read-only layers.
-pub fn default_fs(
+fn default_fs(
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
     tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
 ) -> LinuxFS {
@@ -203,15 +277,6 @@ pub fn default_fs(
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     )
-}
-
-/// Get the global file system
-///
-/// # Panics
-///
-/// Panics if this is called before [`set_fs`] has been called
-pub fn litebox_fs<'a>() -> &'a LinuxFS {
-    FS.get().expect("fs has not yet been set")
 }
 
 /// Get the global page manager
@@ -247,26 +312,28 @@ pub(crate) fn litebox_futex_manager<'a>() -> &'a FutexManager<Platform> {
 // Special override so that `GETFL` can return stdio-specific flags
 pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
 
-fn initialize_stdio_in_shared_descriptors_table() {
-    use litebox::fs::{FileSystem as _, Mode, OFlags};
-    let stdin = litebox_fs()
-        .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
-        .unwrap();
-    let stdout = litebox_fs()
-        .open("/dev/stdout", OFlags::WRONLY, Mode::empty())
-        .unwrap();
-    let stderr = litebox_fs()
-        .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
-        .unwrap();
-    let mut dt = litebox().descriptor_table_mut();
-    let mut rds = raw_descriptor_store().write();
-    for (raw_fd, fd) in [(0, stdin), (1, stdout), (2, stderr)] {
-        let status_flags = OFlags::APPEND | OFlags::RDWR;
-        debug_assert_eq!(OFlags::STATUS_FLAGS_MASK & status_flags, status_flags);
-        let old = dt.set_entry_metadata(&fd, StdioStatusFlags(status_flags));
-        assert!(old.is_none());
-        let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
-        assert!(success);
+impl syscalls::file::FilesState {
+    fn initialize_stdio_in_shared_descriptors_table(&self, fs: &LinuxFS) {
+        use litebox::fs::{FileSystem as _, Mode, OFlags};
+        let stdin = fs
+            .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let stdout = fs
+            .open("/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .unwrap();
+        let stderr = fs
+            .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .unwrap();
+        let mut dt = litebox().descriptor_table_mut();
+        let mut rds = self.raw_descriptor_store.write();
+        for (raw_fd, fd) in [(0, stdin), (1, stdout), (2, stderr)] {
+            let status_flags = OFlags::APPEND | OFlags::RDWR;
+            debug_assert_eq!(OFlags::STATUS_FLAGS_MASK & status_flags, status_flags);
+            let old = dt.set_entry_metadata(&fd, StdioStatusFlags(status_flags));
+            assert!(old.is_none());
+            let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
+            assert!(success);
+        }
     }
 }
 
@@ -324,21 +391,31 @@ impl Descriptors {
     fn get_fd(&self, fd: u32) -> Option<&Descriptor> {
         self.descriptors.get(fd as usize)?.as_ref()
     }
-    fn close_on_exec(&mut self, task: &Task) {
-        self.descriptors.iter_mut().for_each(|slot| {
-            if let Some(desc) = slot.take()
-                && let Ok(flags) = desc.get_file_descriptor_flags()
-            {
-                if flags.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC) {
-                    let _ = task.do_close(desc);
-                } else {
-                    *slot = Some(desc);
-                }
-            }
-        });
-    }
+
     fn len(&self) -> usize {
         self.descriptors.len()
+    }
+}
+
+impl Task {
+    fn close_on_exec(&self) {
+        let files = self.files.borrow();
+        files
+            .file_descriptors
+            .write()
+            .descriptors
+            .iter_mut()
+            .for_each(|slot| {
+                if let Some(desc) = slot.take()
+                    && let Ok(flags) = desc.get_file_descriptor_flags(&files)
+                {
+                    if flags.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC) {
+                        let _ = self.do_close(desc);
+                    } else {
+                        *slot = Some(desc);
+                    }
+                }
+            });
     }
 }
 
@@ -354,27 +431,6 @@ enum Descriptor {
     },
 }
 
-// XXX: This should likely be made task-specific, since each task has its own list of FDs
-pub(crate) fn raw_descriptor_store<'a>() -> &'a RwLock<Platform, litebox::fd::RawDescriptorStorage>
-{
-    static RDS: once_cell::race::OnceBox<RwLock<Platform, litebox::fd::RawDescriptorStorage>> =
-        once_cell::race::OnceBox::new();
-    RDS.get_or_init(|| {
-        alloc::boxed::Box::new(
-            litebox()
-                .sync()
-                .new_rwlock(litebox::fd::RawDescriptorStorage::new()),
-        )
-    })
-}
-
-pub(crate) fn file_descriptors<'a>() -> &'a RwLock<Platform, Descriptors> {
-    static FILE_DESCRIPTORS: once_cell::race::OnceBox<RwLock<Platform, Descriptors>> =
-        once_cell::race::OnceBox::new();
-    FILE_DESCRIPTORS
-        .get_or_init(|| alloc::boxed::Box::new(litebox().sync().new_rwlock(Descriptors::new())))
-}
-
 /// A strongly-typed FD.
 ///
 /// This enum only ever stores `Arc<TypedFd<..>>`s, and should not store any additional data
@@ -385,8 +441,9 @@ enum StrongFd {
     Pipes(Arc<TypedFd<Pipes<Platform>>>),
 }
 impl StrongFd {
-    fn from_raw(fd: usize) -> Result<Self, Errno> {
-        match raw_descriptor_store()
+    fn from_raw(files: &syscalls::file::FilesState, fd: usize) -> Result<Self, Errno> {
+        match files
+            .raw_descriptor_store
             .read()
             .typed_fd_at_raw_3::<StrongFd, LinuxFS, Network<Platform>, Pipes<Platform>>(fd)
         {
@@ -416,16 +473,19 @@ impl From<Arc<TypedFd<Pipes<Platform>>>> for StrongFd {
     }
 }
 
-pub(crate) fn run_on_raw_fd<R>(
-    fd: usize,
-    fs: impl FnOnce(&TypedFd<LinuxFS>) -> R,
-    net: impl FnOnce(&TypedFd<Network<Platform>>) -> R,
-    pipes: impl FnOnce(&TypedFd<Pipes<Platform>>) -> R,
-) -> Result<R, Errno> {
-    match StrongFd::from_raw(fd)? {
-        StrongFd::FileSystem(fd) => Ok(fs(&fd)),
-        StrongFd::Network(fd) => Ok(net(&fd)),
-        StrongFd::Pipes(fd) => Ok(pipes(&fd)),
+impl syscalls::file::FilesState {
+    pub(crate) fn run_on_raw_fd<R>(
+        &self,
+        fd: usize,
+        fs: impl FnOnce(&TypedFd<LinuxFS>) -> R,
+        net: impl FnOnce(&TypedFd<Network<Platform>>) -> R,
+        pipes: impl FnOnce(&TypedFd<Pipes<Platform>>) -> R,
+    ) -> Result<R, Errno> {
+        match StrongFd::from_raw(self, fd)? {
+            StrongFd::FileSystem(fd) => Ok(fs(&fd)),
+            StrongFd::Network(fd) => Ok(net(&fd)),
+            StrongFd::Pipes(fd) => Ok(pipes(&fd)),
+        }
     }
 }
 
@@ -1147,11 +1207,16 @@ impl Task {
     }
 }
 
+struct GlobalState {
+    fs: LinuxFS,
+}
+
 struct LinuxShimTls {
     current_task: Task,
 }
 
 struct Task {
+    global: Arc<GlobalState>,
     process: Arc<syscalls::process::Process>,
     /// Process ID
     pid: i32,
@@ -1177,8 +1242,10 @@ struct Task {
     credentials: Arc<syscalls::process::Credentials>,
     /// Command name (usually the executable name, excluding the path)
     comm: Cell<[u8; litebox_common_linux::TASK_COMM_LEN]>,
-    /// Filesystem state.
+    /// Filesystem state. `RefCell` to support `unshare` in the future.
     fs: RefCell<Arc<syscalls::file::FsState>>,
+    /// File descriptors. `RefCell` to support `unshare` in the future.
+    files: RefCell<Arc<syscalls::file::FilesState>>,
 }
 
 impl Drop for Task {
@@ -1204,20 +1271,10 @@ static LOAD_FILTER: once_cell::race::OnceBox<LoadFilter> = once_cell::race::Once
 ///
 /// # Panics
 /// Panics if the load filter is already set.
-pub fn set_load_filter(callback: LoadFilter) {
+fn set_load_filter(callback: LoadFilter) {
     LOAD_FILTER
         .set(alloc::boxed::Box::new(callback))
         .expect("load filter already set");
-}
-
-/// Loads the specified program into the process's address space and returns the
-/// register state for the initial thread.
-pub fn load_program(
-    path: &str,
-    argv: Vec<alloc::ffi::CString>,
-    mut envp: Vec<alloc::ffi::CString>,
-) -> Result<litebox_common_linux::PtRegs, loader::ElfLoaderError> {
-    with_current_task(|task| task.load_program(path, argv, envp))
 }
 
 impl Task {
@@ -1296,11 +1353,14 @@ mod test_utils {
     use super::*;
     use crate::syscalls::process::NEXT_THREAD_ID;
 
-    impl Task {
+    impl GlobalState {
         /// Make a new task with default values for testing.
-        pub(crate) fn new_for_test() -> Self {
+        pub(crate) fn new_test_task(self: Arc<Self>) -> Task {
             let pid = NEXT_THREAD_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let files = Arc::new(syscalls::file::FilesState::new(litebox()));
+            files.initialize_stdio_in_shared_descriptors_table(&self.fs);
             Task {
+                global: self,
                 process: Arc::new(syscalls::process::Process::new()),
                 pid,
                 ppid: 0,
@@ -1315,11 +1375,15 @@ mod test_utils {
                 }),
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
+                files: files.into(),
             }
         }
+    }
 
+    impl Task {
         /// Returns a function that clones this task with a new TID for testing.
         pub(crate) fn clone_for_test(&self) -> impl 'static + Send + FnOnce() -> Self {
+            let global = self.global.clone();
             let process = self.process.clone();
             let credentials = self.credentials.clone();
             let fs = self.fs.clone();
@@ -1327,7 +1391,9 @@ mod test_utils {
             let pid = self.pid;
             let tid = NEXT_THREAD_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let parent_pid = self.ppid;
+            let files = self.files.clone();
             move || Task {
+                global,
                 process,
                 pid,
                 ppid: parent_pid,
@@ -1337,6 +1403,7 @@ mod test_utils {
                 credentials,
                 comm,
                 fs,
+                files,
             }
         }
 
