@@ -195,8 +195,8 @@ const ROBUST_LIST_LIMIT: isize = 2048;
  */
 fn handle_futex_death(
     futex_addr: crate::ConstPtr<u32>,
-    pi: bool,
-    pending_op: bool,
+    _pi: bool,
+    _pending_op: bool,
 ) -> Result<(), Errno> {
     if futex_addr.as_usize() % 4 != 0 {
         return Err(Errno::EINVAL);
@@ -990,7 +990,7 @@ impl Task {
     ) -> Result<(), Errno> {
         fn copy_vector(
             mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
-            which: &str,
+            _which: &str,
         ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
             let mut out = alloc::vec::Vec::new();
             let mut total = 0usize;
@@ -1055,7 +1055,7 @@ impl Task {
             unimplemented!("execve when multiple threads exist is not supported yet");
         }
         // Don't release reserved mappings.
-        let release = |r: Range<usize>, vm: VmFlags| !vm.is_empty();
+        let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
         let page_manager = crate::litebox_page_manager();
         unsafe { page_manager.release_memory(release) }.expect("failed to release memory mappings");
 

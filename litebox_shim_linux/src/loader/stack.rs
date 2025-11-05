@@ -88,7 +88,7 @@ impl UserStack {
     ///
     /// Returns `None` if stack has no enough space.
     fn push_bytes(&mut self, bytes: &[u8]) -> Option<()> {
-        let end = isize::try_from(self.pos).ok()?;
+        let _end = isize::try_from(self.pos).ok()?;
         self.pos = self.pos.checked_sub(bytes.len())?;
         self.stack_top.copy_from_slice(self.pos, bytes)?;
         Some(())

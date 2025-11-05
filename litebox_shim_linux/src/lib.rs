@@ -10,7 +10,6 @@
 )]
 #![expect(dead_code, reason = "transitionary to be removed soon")]
 #![expect(unused_must_use, reason = "transitionary to be removed soon")]
-#![expect(unused_variables, reason = "transitionary to be removed soon")]
 
 extern crate alloc;
 
@@ -98,7 +97,7 @@ impl litebox::shim::EnterShim for LinuxShimEntrypoints {
 
     fn exception(
         &self,
-        ctx: &mut Self::ExecutionContext,
+        _ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> Self::ContinueOperation {
         panic!("Unhandled exception: {info:#x?}");
@@ -1048,6 +1047,7 @@ impl Task {
             SyscallRequest::SetThreadArea { user_desc } => {
                 #[cfg(target_arch = "x86_64")]
                 {
+                    let _ = user_desc;
                     Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
                 }
                 #[cfg(target_arch = "x86")]

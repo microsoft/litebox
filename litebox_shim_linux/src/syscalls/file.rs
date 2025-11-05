@@ -160,8 +160,8 @@ impl Task {
                 self.sys_open(path, flags, mode)
             }
             FsPath::Cwd => self.sys_open("", flags, mode),
-            FsPath::Fd(fd) => todo!(),
-            FsPath::FdRelative { fd, path } => todo!(),
+            FsPath::Fd(_fd) => todo!(),
+            FsPath::FdRelative { fd: _, path: _ } => todo!(),
         }
     }
 
@@ -183,7 +183,7 @@ impl Task {
                         .map_err(Errno::from)
                 },
                 |_fd| todo!("net"),
-                |fd| todo!("pipes"),
+                |_fd| todo!("pipes"),
             ),
             _ => Err(Errno::EINVAL),
         }
@@ -454,7 +454,7 @@ impl Task {
             if iov.iov_len == 0 {
                 continue;
             }
-            let Ok(iov_len) = isize::try_from(iov.iov_len) else {
+            let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
                 return Err(Errno::EINVAL);
             };
             // TODO: The data transfers performed by readv() and writev() are atomic: the data
@@ -470,12 +470,12 @@ impl Task {
                                 .read(fd, &mut kernel_buffer, None)
                                 .map_err(Errno::from)
                         },
-                        |fd| todo!("net"),
-                        |fd| todo!("pipes"),
+                        |_fd| todo!("net"),
+                        |_fd| todo!("pipes"),
                     )
                     .flatten()?,
                 Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
-                Descriptor::Eventfd { file, .. } => todo!(),
+                Descriptor::Eventfd { .. } => todo!(),
             };
             iov.iov_base
                 .copy_from_slice(0, &kernel_buffer[..size])
@@ -548,11 +548,11 @@ impl Task {
                             )
                         })
                     },
-                    |fd| todo!("pipes"),
+                    |_fd| todo!("pipes"),
                 )
                 .flatten(),
             Descriptor::Epoll { .. } => Err(Errno::EINVAL),
-            Descriptor::Eventfd { file, .. } => todo!(),
+            Descriptor::Eventfd { .. } => todo!(),
         }
     }
 
@@ -628,7 +628,7 @@ impl Task {
                 let full_path = alloc::format!("/{}", normalized_path.as_str());
                 self.do_readlink(&full_path)
             }
-            FsPath::Fd(fd) | FsPath::FdRelative { fd, .. } => unimplemented!(),
+            FsPath::Fd(_) | FsPath::FdRelative { .. } => unimplemented!(),
         }?;
         let bytes = path.as_bytes();
         let min_len = core::cmp::min(buf.len(), bytes.len());
@@ -652,7 +652,7 @@ impl Descriptor {
                             .map(FileStat::from)
                             .map_err(Errno::from)
                     },
-                    |fd| todo!("net"),
+                    |_fd| todo!("net"),
                     |fd| {
                         let half_pipe_type = litebox_pipes().read().half_pipe_type(fd)?;
                         let read_write_mode = match half_pipe_type {
@@ -806,7 +806,7 @@ impl Task {
                 .get_fd(fd)
                 .ok_or(Errno::EBADF)?
                 .stat(self)?,
-            FsPath::FdRelative { fd, path } => todo!(),
+            FsPath::FdRelative { .. } => todo!(),
         };
         Ok(fstat)
     }
@@ -960,7 +960,7 @@ impl Task {
                     Descriptor::Eventfd { file, .. } => {
                         toggle_flags!(file);
                     }
-                    Descriptor::Epoll { file, .. } => todo!(),
+                    Descriptor::Epoll { .. } => todo!(),
                 }
                 Ok(0)
             }
@@ -972,7 +972,7 @@ impl Task {
                     .borrow()
                     .run_on_raw_fd(
                         *raw_fd,
-                        |fd| {
+                        |_fd| {
                             let mut flock = unsafe { lock.read_at_offset(0) }
                                 .ok_or(Errno::EFAULT)?
                                 .into_owned();
@@ -988,8 +988,8 @@ impl Task {
                             unsafe { lock.write_at_offset(0, flock) }.ok_or(Errno::EFAULT)?;
                             Ok(0)
                         },
-                        |fd| todo!("net"),
-                        |fd| todo!("pipes"),
+                        |_fd| todo!("net"),
+                        |_fd| todo!("pipes"),
                     )
                     .flatten()
             }
@@ -1001,7 +1001,7 @@ impl Task {
                     .borrow()
                     .run_on_raw_fd(
                         *raw_fd,
-                        |fd| {
+                        |_fd| {
                             let flock = unsafe { lock.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
                             let _ = litebox_common_linux::FlockType::try_from(flock.type_)
                                 .map_err(|_| Errno::EINVAL)?;
@@ -1010,8 +1010,8 @@ impl Task {
                             // can always acquire the lock it owns, so we don't need to maintain anything.
                             Ok(0)
                         },
-                        |fd| todo!("net"),
-                        |fd| todo!("pipes"),
+                        |_fd| todo!("net"),
+                        |_fd| todo!("pipes"),
                     )
                     .flatten()
             }
@@ -1172,7 +1172,7 @@ impl Task {
                 Descriptor::LiteBoxRawFd(raw_fd) => {
                     self.files.borrow().run_on_raw_fd(
                         *raw_fd,
-                        |file_fd| {
+                        |_file_fd| {
                             // TODO: stdio NONBLOCK?
                             #[cfg(debug_assertions)]
                             litebox::log_println!(
@@ -1236,8 +1236,8 @@ impl Task {
                                             .descriptor_table_mut()
                                             .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                                     },
-                                    |fd| todo!("net"),
-                                    |fd| todo!("pipes"),
+                                    |_fd| todo!("net"),
+                                    |_fd| todo!("pipes"),
                                 )?;
                                 Ok(0)
                             }
@@ -1262,16 +1262,16 @@ impl Task {
                         }
                     })
                 },
-                |fd| todo!("net"),
-                |fd| todo!("pipes"),
+                |_fd| todo!("net"),
+                |_fd| todo!("pipes"),
             )?,
             Descriptor::Eventfd {
-                file,
-                close_on_exec,
+                file: _,
+                close_on_exec: _,
             } => todo!(),
             Descriptor::Epoll {
-                file,
-                close_on_exec,
+                file: _,
+                close_on_exec: _,
             } => todo!(),
         }
     }
@@ -1394,6 +1394,10 @@ impl Task {
     ) -> Result<usize, Errno> {
         if sigmask.is_some() {
             unimplemented!("no sigmask support yet");
+        }
+        if sigsetsize != core::mem::size_of::<litebox_common_linux::SigSet>() {
+            // Expected via ppoll(2) manpage
+            unimplemented!()
         }
         let timeout = timeout
             .map(super::process::get_timeout)
@@ -1764,7 +1768,6 @@ impl Task {
                     .unwrap_or_default();
                 let mut dir_off = dir_off.0;
                 let mut nbytes = 0;
-                let off = 0;
 
                 let mut entries = self.global.fs.read_dir(file)?;
                 entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1808,8 +1811,8 @@ impl Task {
                     .set_fd_metadata(file, Diroff(dir_off));
                 Ok(nbytes)
             },
-            |fd| todo!("net"),
-            |fd| todo!("pipes"),
+            |_fd| todo!("net"),
+            |_fd| todo!("pipes"),
         )?
     }
 }

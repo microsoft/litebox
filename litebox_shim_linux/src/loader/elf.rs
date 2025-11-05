@@ -377,7 +377,7 @@ impl ElfLoader {
         let elf = {
             let mut loader = Loader::<ElfLoaderMmap>::new();
             // Set a hook to get the brk address (i.e., the end of the program's data segment) from the ELF file.
-            loader.set_hook(alloc::boxed::Box::new(|name, phdr, segment, data| {
+            loader.set_hook(alloc::boxed::Box::new(|_name, phdr, _segment, data| {
                 let end: usize = usize::try_from(phdr.p_vaddr + phdr.p_memsz).unwrap();
                 if let Some(elf_brk) = data.get(KEY_BRK) {
                     let elf_brk = elf_brk.downcast_ref::<AtomicUsize>().unwrap();

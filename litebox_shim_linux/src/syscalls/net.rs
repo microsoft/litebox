@@ -833,12 +833,14 @@ impl Task {
         let file_table = files.file_descriptors.read();
         match file_table.get_fd(fd).ok_or(Errno::EBADF)? {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-                let mut buffer: [u8; 4096] = [0; 4096];
+                const MAX_LEN: usize = 4096;
+                let mut buffer: [u8; MAX_LEN] = [0; MAX_LEN];
+                let buffer: &mut [u8] = &mut buffer[..MAX_LEN.min(len)];
                 let mut addr = None;
                 drop(file_table); // Drop before possibly-blocking `receive`
                 let size = receive(
                     fd,
-                    &mut buffer,
+                    buffer,
                     flags,
                     if source_addr.is_some() {
                         Some(&mut addr)

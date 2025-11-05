@@ -92,8 +92,8 @@ impl EpollDescriptor {
         };
         let io_pollable: &dyn IOPollable = match self {
             EpollDescriptor::Eventfd(file) => file,
-            EpollDescriptor::Epoll(file) => unimplemented!(),
-            EpollDescriptor::File(file) => {
+            EpollDescriptor::Epoll(_file) => unimplemented!(),
+            EpollDescriptor::File(_file) => {
                 // TODO: probably polling on stdio files, return dummy events for now
                 return Some(Events::OUT & mask);
             }
@@ -347,7 +347,7 @@ impl EpollEntry {
 }
 
 impl Observer<Events> for EpollEntry {
-    fn on_events(&self, events: &Events) {
+    fn on_events(&self, _events: &Events) {
         self.ready.push(self);
     }
 }
@@ -566,7 +566,7 @@ impl PollSet {
 }
 
 impl Observer<Events> for PollEntryObserver {
-    fn on_events(&self, events: &Events) {
+    fn on_events(&self, _events: &Events) {
         self.0
             .underlying_atomic()
             .store(1, core::sync::atomic::Ordering::Release);
@@ -588,7 +588,7 @@ mod test {
     extern crate std;
 
     fn setup_epoll() -> EpollFile {
-        let task = crate::syscalls::tests::init_platform(None);
+        let _task = crate::syscalls::tests::init_platform(None);
 
         EpollFile::new(crate::litebox())
     }
@@ -660,7 +660,7 @@ mod test {
 
     #[test]
     fn test_poll() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let _task = crate::syscalls::tests::init_platform(None);
 
         let mut set = super::PollSet::with_capacity(0);
         let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
