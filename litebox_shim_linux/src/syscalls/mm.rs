@@ -273,8 +273,6 @@ mod tests {
         task.sys_close(fd).unwrap();
     }
 
-    // `mremap` is not implemented for windows yet.
-    #[cfg(not(any(feature = "platform_windows_userland")))]
     #[test]
     fn test_mremap() {
         let task = init_platform(None);

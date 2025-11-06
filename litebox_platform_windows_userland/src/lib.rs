@@ -11,9 +11,9 @@ use core::sync::atomic::Ordering::SeqCst;
 use core::time::Duration;
 use std::os::raw::c_void;
 
-use litebox::platform::UnblockedOrTimedOut;
-use litebox::platform::page_mgmt::MemoryRegionPermissions;
+use litebox::platform::page_mgmt::{AllocationError, MemoryRegionPermissions};
 use litebox::platform::{ImmediatelyWokenUp, RawMutPointer};
+use litebox::platform::{PageManagementProvider, UnblockedOrTimedOut};
 use litebox::shim::Exception;
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{ContinueOperation, PunchthroughSyscall};
@@ -1060,7 +1060,7 @@ macro_rules! debug_assert_alignment {
     };
 }
 
-impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
+impl<const ALIGN: usize> PageManagementProvider<ALIGN> for WindowsUserland {
     // TODO(chuqi): These are currently "magic numbers" grabbed from my Windows 11 SystemInformation.
     // The actual values should be determined by `GetSystemInfo()`.
     //
@@ -1252,11 +1252,88 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
         debug_assert_alignment!(old_range, ALIGN);
         debug_assert_alignment!(new_range, ALIGN);
-        unimplemented!(
-            "remap_pages is not implemented for Windows yet. old_range: {:?}, new_range: {:?}",
-            old_range,
-            new_range
-        );
+        // TODO: rename the function to reflect that it only supports growing the range.
+        debug_assert!(new_range.len() > old_range.len());
+
+        // Get the current permissions of the old range
+        let current_permissions;
+        let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+        do_query_on_region(&mut mbi, old_range.start as *mut _);
+        // Convert Windows protection flags back to MemoryRegionPermissions
+        match mbi.Protect {
+            Win32_Memory::PAGE_READONLY => {
+                current_permissions = MemoryRegionPermissions::READ;
+            }
+            Win32_Memory::PAGE_READWRITE => {
+                current_permissions =
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+            }
+            Win32_Memory::PAGE_EXECUTE_READ => {
+                current_permissions = MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC;
+            }
+            Win32_Memory::PAGE_EXECUTE_READWRITE => {
+                current_permissions = MemoryRegionPermissions::READ
+                    | MemoryRegionPermissions::WRITE
+                    | MemoryRegionPermissions::EXEC;
+            }
+            Win32_Memory::PAGE_NOACCESS => {
+                current_permissions = MemoryRegionPermissions::empty();
+            }
+            _ => {
+                // Default to read/write if we can't determine
+                current_permissions =
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+            }
+        }
+
+        // Allocate the new range with the same permissions as the old range
+        // TODO: maybe we should pass the flags directly instead of deriving them again?
+        let temp_permission = current_permissions | MemoryRegionPermissions::WRITE; // ensure we can write during copy
+        <Self as PageManagementProvider<ALIGN>>::allocate_pages(
+            self,
+            new_range.clone(),
+            temp_permission,
+            false,
+            false,
+            true, // fixed_address = true since we want the exact new_range
+        )
+        .map_err(|e| match e {
+            AllocationError::OutOfMemory => litebox::platform::page_mgmt::RemapError::OutOfMemory,
+            AllocationError::Unaligned | AllocationError::InvalidRange => unreachable!(),
+            _ => unimplemented!(),
+        })?;
+
+        if !current_permissions.contains(MemoryRegionPermissions::READ) {
+            unimplemented!()
+        }
+        // Copy memory from old range to new range
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                old_range.start as *const u8,
+                new_range.start as *mut u8,
+                old_range.len(),
+            );
+        }
+
+        if temp_permission != current_permissions {
+            // Restore the original permissions on the new range
+            unsafe {
+                <Self as PageManagementProvider<ALIGN>>::update_permissions(
+                    self,
+                    new_range.clone(),
+                    current_permissions,
+                )
+            }
+            .expect("failed to restore permissions on new range during remap_pages");
+        }
+
+        // Deallocate the old range
+        unsafe { <Self as PageManagementProvider<ALIGN>>::deallocate_pages(self, old_range) }
+            .expect("failed to deallocate pages");
+
+        Ok(litebox::platform::trivial_providers::TransparentMutPtr {
+            inner: new_range.start as *mut u8,
+        })
     }
 
     unsafe fn update_permissions(
