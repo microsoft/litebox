@@ -954,19 +954,21 @@ impl litebox::platform::SystemTime for SystemTime {
 
 #[cfg(target_arch = "x86")]
 fn set_thread_area(
-    user_desc: litebox::platform::trivial_providers::TransparentMutPtr<
-        litebox_common_linux::UserDesc,
-    >,
+    user_desc: &mut litebox_common_linux::UserDesc,
 ) -> Result<usize, litebox_common_linux::errno::Errno> {
-    unsafe { syscalls::syscall1(syscalls::Sysno::set_thread_area, user_desc.as_usize()) }.map_err(
-        |err| match err {
-            syscalls::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
-            syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
-            syscalls::Errno::ENOSYS => litebox_common_linux::errno::Errno::ENOSYS,
-            syscalls::Errno::ESRCH => litebox_common_linux::errno::Errno::ESRCH,
-            _ => panic!("unexpected error {err}"),
-        },
-    )
+    unsafe {
+        syscalls::syscall1(
+            syscalls::Sysno::set_thread_area,
+            core::ptr::from_mut(user_desc) as usize,
+        )
+    }
+    .map_err(|err| match err {
+        syscalls::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
+        syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
+        syscalls::Errno::ENOSYS => litebox_common_linux::errno::Errno::ENOSYS,
+        syscalls::Errno::ESRCH => litebox_common_linux::errno::Errno::ESRCH,
+        _ => panic!("unexpected error {err}"),
+    })
 }
 
 #[cfg(target_arch = "x86")]
@@ -982,11 +984,8 @@ fn clear_thread_area(entry_number: u32) {
         limit: 0,
         flags,
     };
-    let user_desc_ptr = litebox::platform::trivial_providers::TransparentMutPtr {
-        inner: &raw mut user_desc,
-    };
 
-    set_thread_area(user_desc_ptr).expect("failed to clear TLS entry");
+    set_thread_area(&mut user_desc).expect("failed to clear TLS entry");
 }
 
 pub struct PunchthroughToken {
@@ -1119,7 +1118,8 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
             }
             #[cfg(target_arch = "x86")]
             PunchthroughSyscall::SetThreadArea { user_desc } => {
-                set_thread_area(user_desc).map_err(litebox::platform::PunchthroughError::Failure)
+                set_thread_area(unsafe { &mut *user_desc })
+                    .map_err(litebox::platform::PunchthroughError::Failure)
             }
             PunchthroughSyscall::Alarm { seconds } => unsafe {
                 let remain = syscalls::syscall2(

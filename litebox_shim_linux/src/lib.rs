@@ -1047,7 +1047,28 @@ impl Task {
                 }
             }
             SyscallRequest::SetThreadArea { user_desc } => {
-                self.set_thread_area(user_desc).map(|()| 0)
+                #[cfg(target_arch = "x86_64")]
+                {
+                    Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
+                }
+                #[cfg(target_arch = "x86")]
+                {
+                    unsafe { user_desc.read_at_offset(0) }
+                        .ok_or(Errno::EFAULT)
+                        .and_then(|desc| {
+                            let mut desc = desc.into_owned();
+                            let idx = desc.entry_number;
+                            self.set_thread_area(&mut desc)?;
+                            if idx == u32::MAX {
+                                // index -1 means the kernel should try to find and
+                                // allocate an empty descriptor.
+                                // return the allocated entry number
+                                unsafe { user_desc.write_at_offset(0, desc) }
+                                    .ok_or(Errno::EFAULT)?;
+                            }
+                            Ok(0)
+                        })
+                }
             }
             SyscallRequest::SetTidAddress { tidptr } => {
                 Ok(self.sys_set_tid_address(tidptr).reinterpret_as_unsigned() as usize)
@@ -1194,7 +1215,29 @@ impl Task {
             ))
         };
         let tls = if clone_args.tls != 0 {
-            Some(MutPtr::from_usize(usize::try_from(clone_args.tls).unwrap()))
+            let addr = usize::try_from(clone_args.tls).unwrap();
+            #[cfg(target_arch = "x86_64")]
+            let desc = MutPtr::from_usize(addr);
+            #[cfg(target_arch = "x86")]
+            let desc = {
+                let desc = unsafe {
+                    MutPtr::<litebox_common_linux::UserDesc>::from_usize(addr).read_at_offset(0)
+                }
+                .ok_or(Errno::EFAULT)?
+                .into_owned();
+                // Note that different from `set_thread_area` syscall that returns the allocated entry number
+                // when requested (i.e., `desc.entry_number` is -1), here we just read the descriptor to LiteBox and
+                // assume the entry number is properly set so that we don't need to write it back. This is because
+                // we set up the TLS descriptor in the new thread's context, at which point the original descriptor
+                // pointer might no longer be valid. Linux does not have this problem because it sets up the TLS for
+                // the child thread in the parent thread before `clone` returns.
+                // In practice, glibc always sets the entry number to a valid value when calling `clone` with TLS as
+                // all threads can share the same TLS entry as the main thread.
+                let idx = desc.entry_number;
+                debug_assert_ne!(idx, u32::MAX);
+                desc
+            };
+            Some(desc)
         } else {
             None
         };
