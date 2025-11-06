@@ -267,10 +267,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     Ok(())
 }
 
-fn fixup_env_aux(
-    envp: &mut Vec<alloc::ffi::CString>,
-    _aux: &mut litebox_shim_linux::loader::auxv::AuxVec,
-) {
+fn fixup_env_aux(envp: &mut Vec<alloc::ffi::CString>) {
     // Enable the audit library to load trampoline code for rewritten binaries.
     if REQUIRE_RTLD_AUDIT.load(core::sync::atomic::Ordering::SeqCst) {
         envp.push(c"LD_AUDIT=/lib/litebox_rtld_audit.so".into());

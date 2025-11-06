@@ -1271,11 +1271,10 @@ fn with_current_task<R>(f: impl FnOnce(&Task) -> R) -> R {
     SHIM_TLS.with(|tls| f(&tls.current_task))
 }
 
-pub type LoadFilter =
-    fn(envp: &mut alloc::vec::Vec<alloc::ffi::CString>, auxv: &mut loader::auxv::AuxVec);
+pub type LoadFilter = fn(envp: &mut alloc::vec::Vec<alloc::ffi::CString>);
 static LOAD_FILTER: once_cell::race::OnceBox<LoadFilter> = once_cell::race::OnceBox::new();
 
-/// Set the load filter, which can augment envp or auxv when starting a new program.
+/// Set the load filter, which can augment envp when starting a new program.
 ///
 /// # Panics
 /// Panics if the load filter is already set.
@@ -1294,14 +1293,13 @@ impl Task {
         argv: Vec<alloc::ffi::CString>,
         mut envp: Vec<alloc::ffi::CString>,
     ) -> Result<litebox_common_linux::PtRegs, loader::ElfLoaderError> {
-        let mut aux = self.init_auxv();
         if let Some(&filter) = LOAD_FILTER.get() {
-            filter(&mut envp, &mut aux);
+            filter(&mut envp);
         }
 
         // TODO: split parsing from mapping so that we can return an error code to execve that it
         // can return to the guest.
-        let load_info = loader::load_program(self, path, argv, envp, aux)?;
+        let load_info = loader::load_program(self, path, argv, envp, self.init_auxv())?;
 
         let comm = path.rsplit('/').next().unwrap_or("unknown");
         self.set_task_comm(comm.as_bytes());
