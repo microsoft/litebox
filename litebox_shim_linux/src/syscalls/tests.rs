@@ -11,6 +11,10 @@ extern crate std;
 const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
 
 #[must_use]
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(unused_variables, reason = "ignored parameter on non-linux platforms")
+)]
 pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task {
     static GLOBAL: std::sync::OnceLock<Arc<crate::GlobalState>> = std::sync::OnceLock::new();
     GLOBAL
@@ -35,31 +39,6 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task {
         })
         .clone()
         .new_test_task()
-}
-
-pub(crate) fn compile(input: &str, output: &str, is_static: bool, nolibc: bool) {
-    // Compile the hello.c file to an executable
-    let mut args = alloc::vec!["-o", output, input];
-    if is_static {
-        args.push("-static");
-    }
-    if nolibc {
-        args.push("-nostdlib");
-    }
-    args.push(match std::env::consts::ARCH {
-        "x86_64" => "-m64",
-        "x86" => "-m32",
-        _ => unimplemented!(),
-    });
-    let output = std::process::Command::new("gcc")
-        .args(args)
-        .output()
-        .expect("Failed to compile hello.c");
-    assert!(
-        output.status.success(),
-        "failed to compile {input:} {:?}",
-        std::str::from_utf8(output.stderr.as_slice()).unwrap()
-    );
 }
 
 #[test]

@@ -195,8 +195,8 @@ const ROBUST_LIST_LIMIT: isize = 2048;
  */
 fn handle_futex_death(
     futex_addr: crate::ConstPtr<u32>,
-    pi: bool,
-    pending_op: bool,
+    _pi: bool,
+    _pending_op: bool,
 ) -> Result<(), Errno> {
     if futex_addr.as_usize() % 4 != 0 {
         return Err(Errno::EINVAL);
@@ -336,17 +336,19 @@ impl litebox::shim::InitThread for NewThreadArgs {
         // Note that the following calls happen _before_ setting `SHIM_TLS`, so
         // any calls to `with_current_task` will panic. This should be OK--only
         // entry point code should be calling `with_current_task`.
+        #[cfg_attr(not(target_arch = "x86"), expect(unused_mut))]
         if let Some(mut tls) = tls {
             // Set the TLS base pointer for the new thread
             #[cfg(target_arch = "x86")]
             {
-                task.set_thread_area(&mut tls);
+                task.set_thread_area(&mut tls).unwrap();
             }
 
             #[cfg(target_arch = "x86_64")]
             {
                 use litebox::platform::RawConstPointer as _;
-                task.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()));
+                task.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()))
+                    .unwrap();
             }
         }
 
@@ -734,7 +736,7 @@ impl Task {
         &self,
         clockid: litebox_common_linux::ClockId,
         res: crate::MutPtr<litebox_common_linux::Timespec>,
-    ) {
+    ) -> Result<(), Errno> {
         // Return the resolution of the clock
         let resolution = match clockid {
             litebox_common_linux::ClockId::MonotonicCoarse => {
@@ -755,9 +757,7 @@ impl Task {
             _ => unimplemented!(),
         };
 
-        unsafe {
-            res.write_at_offset(0, resolution);
-        }
+        unsafe { res.write_at_offset(0, resolution).ok_or(Errno::EFAULT) }
     }
 
     /// Handle syscall `clock_nanosleep`.
@@ -989,7 +989,7 @@ impl Task {
     ) -> Result<(), Errno> {
         fn copy_vector(
             mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
-            which: &str,
+            _which: &str,
         ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
             let mut out = alloc::vec::Vec::new();
             let mut total = 0usize;
@@ -1030,7 +1030,7 @@ impl Task {
         } else {
             copy_vector(argv, "argv")?
         };
-        let mut envp_vec = if envp.as_usize() == 0 {
+        let envp_vec = if envp.as_usize() == 0 {
             alloc::vec::Vec::new()
         } else {
             copy_vector(envp, "envp")?
@@ -1054,7 +1054,7 @@ impl Task {
             unimplemented!("execve when multiple threads exist is not supported yet");
         }
         // Don't release reserved mappings.
-        let release = |r: Range<usize>, vm: VmFlags| !vm.is_empty();
+        let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
         let page_manager = crate::litebox_page_manager();
         unsafe { page_manager.release_memory(release) }.expect("failed to release memory mappings");
 

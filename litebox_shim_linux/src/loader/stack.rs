@@ -53,6 +53,7 @@ pub(super) struct UserStack {
     /// The top of the stack (base address)
     stack_top: MutPtr<u8>,
     /// The length of the stack
+    #[expect(dead_code, reason = "should we remove this?")]
     len: usize,
     /// The current position of the stack pointer
     pos: usize,
@@ -88,7 +89,7 @@ impl UserStack {
     ///
     /// Returns `None` if stack has no enough space.
     fn push_bytes(&mut self, bytes: &[u8]) -> Option<()> {
-        let end = isize::try_from(self.pos).ok()?;
+        let _end = isize::try_from(self.pos).ok()?;
         self.pos = self.pos.checked_sub(bytes.len())?;
         self.stack_top.copy_from_slice(self.pos, bytes)?;
         Some(())

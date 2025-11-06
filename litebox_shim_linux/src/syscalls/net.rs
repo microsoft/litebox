@@ -17,8 +17,6 @@ use crate::Task;
 use crate::{ConstPtr, Descriptor, MutPtr, litebox_net};
 use crate::{Platform, litebox};
 
-const ADDR_MAX_LEN: usize = 128;
-
 macro_rules! convert_flags {
     ($src:expr, $src_type:ty, $dst_type:ty, $($flag:ident),+ $(,)?) => {
         {
@@ -49,21 +47,6 @@ impl super::file::FilesState {
             }
             Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
             Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => Err(Errno::ENOTSOCK),
-        }
-    }
-}
-
-#[repr(C)]
-struct CSockStorage {
-    sa_family: u16,
-    bytes: [u8; ADDR_MAX_LEN - 2],
-}
-
-impl Default for CSockStorage {
-    fn default() -> Self {
-        Self {
-            sa_family: 0,
-            bytes: [0u8; _],
         }
     }
 }
@@ -795,7 +778,7 @@ impl Task {
         fd: i32,
         buf: ConstPtr<u8>,
         len: usize,
-        mut flags: SendFlags,
+        flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
         let Ok(fd) = u32::try_from(fd) else {
@@ -822,7 +805,7 @@ impl Task {
         fd: i32,
         buf: MutPtr<u8>,
         len: usize,
-        mut flags: ReceiveFlags,
+        flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
     ) -> Result<usize, Errno> {
         let Ok(fd) = u32::try_from(fd) else {
@@ -833,12 +816,14 @@ impl Task {
         let file_table = files.file_descriptors.read();
         match file_table.get_fd(fd).ok_or(Errno::EBADF)? {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-                let mut buffer: [u8; 4096] = [0; 4096];
+                const MAX_LEN: usize = 4096;
+                let mut buffer: [u8; MAX_LEN] = [0; MAX_LEN];
+                let buffer: &mut [u8] = &mut buffer[..MAX_LEN.min(len)];
                 let mut addr = None;
                 drop(file_table); // Drop before possibly-blocking `receive`
                 let size = receive(
                     fd,
-                    &mut buffer,
+                    buffer,
                     flags,
                     if source_addr.is_some() {
                         Some(&mut addr)
@@ -849,7 +834,10 @@ impl Task {
                 if let Some(source_addr) = source_addr {
                     *source_addr = addr.map(SocketAddress::Inet);
                 }
-                buf.copy_from_slice(0, &buffer[..size])
+                if !flags.contains(ReceiveFlags::TRUNC) {
+                    assert!(size <= len, "{size} should be smaller than {len}");
+                }
+                buf.copy_from_slice(0, &buffer[..size.min(buffer.len())])
                     .ok_or(Errno::EFAULT)?;
                 Ok(size)
             }),

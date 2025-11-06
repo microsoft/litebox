@@ -16,6 +16,10 @@ fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
 }
 
+#[expect(
+    dead_code,
+    reason = "unused but exists to be symmetric to `align_up` here"
+)]
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
@@ -230,12 +234,10 @@ mod tests {
                 0,
             )
             .unwrap();
-        unsafe {
-            addr.mutate_subslice_with(..0x2000, |buf| {
-                buf.fill(0xff);
-            })
-            .unwrap();
-        };
+        addr.mutate_subslice_with(..0x2000, |buf| {
+            buf.fill(0xff);
+        })
+        .unwrap();
         assert_eq!(
             unsafe { addr.read_at_offset(0x1000) }.unwrap().into_owned(),
             0xff,
