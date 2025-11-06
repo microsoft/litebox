@@ -834,7 +834,10 @@ impl Task {
                 if let Some(source_addr) = source_addr {
                     *source_addr = addr.map(SocketAddress::Inet);
                 }
-                buf.copy_from_slice(0, &buffer[..size])
+                if !flags.contains(ReceiveFlags::TRUNC) {
+                    assert!(size <= len, "{size} should be smaller than {len}");
+                }
+                buf.copy_from_slice(0, &buffer[..size.min(buffer.len())])
                     .ok_or(Errno::EFAULT)?;
                 Ok(size)
             }),
