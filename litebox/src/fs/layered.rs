@@ -41,7 +41,7 @@ pub enum LayeringSemantics {
 /// of another.
 ///
 /// This particular implementation itself doesn't carry or store any of the files, but delegates to
-/// each of the the layers. Specifically, this implementation will look for and work with files in
+/// each of the layers. Specifically, this implementation will look for and work with files in
 /// the upper layer, unless they don't exist, in which case the lower layer is looked at.
 ///
 /// The current design of layering supports treating the lower layer as read-only, or as a

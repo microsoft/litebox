@@ -82,7 +82,7 @@ impl<T: Clone> RawConstPointer<T> for UserConstPtr<T> {
 }
 
 impl<T: Clone> UserConstPtr<T> {
-    /// Check if it's null
+    /// Check if it is null
     pub fn is_null(self) -> bool {
         self.inner.is_null()
     }
@@ -170,7 +170,7 @@ impl<T: Clone> RawMutPointer<T> for UserMutPtr<T> {
 }
 
 impl<T: Clone> UserMutPtr<T> {
-    /// Check if it's null
+    /// Check if it is null
     pub fn is_null(self) -> bool {
         self.inner.is_null()
     }
