@@ -11,6 +11,10 @@ extern crate std;
 const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
 
 #[must_use]
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(unused_variables, reason = "ignored parameter on non-linux platforms")
+)]
 pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task {
     static GLOBAL: std::sync::OnceLock<Arc<crate::GlobalState>> = std::sync::OnceLock::new();
     GLOBAL
