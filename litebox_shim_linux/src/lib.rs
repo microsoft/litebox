@@ -8,7 +8,6 @@
     clippy::unused_self,
     reason = "by convention, syscalls and related methods take &self even if unused"
 )]
-#![expect(dead_code, reason = "transitionary to be removed soon")]
 
 extern crate alloc;
 

@@ -17,8 +17,6 @@ use crate::Task;
 use crate::{ConstPtr, Descriptor, MutPtr, litebox_net};
 use crate::{Platform, litebox};
 
-const ADDR_MAX_LEN: usize = 128;
-
 macro_rules! convert_flags {
     ($src:expr, $src_type:ty, $dst_type:ty, $($flag:ident),+ $(,)?) => {
         {
@@ -49,21 +47,6 @@ impl super::file::FilesState {
             }
             Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
             Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => Err(Errno::ENOTSOCK),
-        }
-    }
-}
-
-#[repr(C)]
-struct CSockStorage {
-    sa_family: u16,
-    bytes: [u8; ADDR_MAX_LEN - 2],
-}
-
-impl Default for CSockStorage {
-    fn default() -> Self {
-        Self {
-            sa_family: 0,
-            bytes: [0u8; _],
         }
     }
 }

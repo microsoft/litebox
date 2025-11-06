@@ -37,31 +37,6 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task {
         .new_test_task()
 }
 
-pub(crate) fn compile(input: &str, output: &str, is_static: bool, nolibc: bool) {
-    // Compile the hello.c file to an executable
-    let mut args = alloc::vec!["-o", output, input];
-    if is_static {
-        args.push("-static");
-    }
-    if nolibc {
-        args.push("-nostdlib");
-    }
-    args.push(match std::env::consts::ARCH {
-        "x86_64" => "-m64",
-        "x86" => "-m32",
-        _ => unimplemented!(),
-    });
-    let output = std::process::Command::new("gcc")
-        .args(args)
-        .output()
-        .expect("Failed to compile hello.c");
-    assert!(
-        output.status.success(),
-        "failed to compile {input:} {:?}",
-        std::str::from_utf8(output.stderr.as_slice()).unwrap()
-    );
-}
-
 #[test]
 fn test_fcntl() {
     let task = init_platform(None);

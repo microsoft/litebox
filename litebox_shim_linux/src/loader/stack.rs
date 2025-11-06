@@ -53,6 +53,7 @@ pub(super) struct UserStack {
     /// The top of the stack (base address)
     stack_top: MutPtr<u8>,
     /// The length of the stack
+    #[expect(dead_code, reason = "should we remove this?")]
     len: usize,
     /// The current position of the stack pointer
     pos: usize,

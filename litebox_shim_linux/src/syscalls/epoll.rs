@@ -204,6 +204,7 @@ impl EpollFile {
         Ok(())
     }
 
+    #[expect(dead_code, reason = "currently unused, but might want to use soon")]
     fn mod_interest(
         &self,
         fd: u32,

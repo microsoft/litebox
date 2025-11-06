@@ -73,6 +73,7 @@ enum FsPath<P: path::Arg> {
     /// Current working directory
     Cwd,
     /// Path is relative to a file descriptor
+    #[expect(dead_code, reason = "currently unused, might want to use later")]
     FdRelative { fd: u32, path: P },
     /// Fd
     Fd(u32),
