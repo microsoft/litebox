@@ -227,7 +227,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         });
     }
 
-    shim.set_load_filter(fixup_env_aux);
+    shim.set_load_filter(fixup_env);
     platform.register_shim(shim.entrypoints());
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
@@ -267,7 +267,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     Ok(())
 }
 
-fn fixup_env_aux(envp: &mut Vec<alloc::ffi::CString>) {
+fn fixup_env(envp: &mut Vec<alloc::ffi::CString>) {
     // Enable the audit library to load trampoline code for rewritten binaries.
     if REQUIRE_RTLD_AUDIT.load(core::sync::atomic::Ordering::SeqCst) {
         envp.push(c"LD_AUDIT=/lib/litebox_rtld_audit.so".into());
