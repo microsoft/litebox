@@ -341,7 +341,7 @@ impl litebox::shim::InitThread for NewThreadArgs {
             // Set the TLS base pointer for the new thread
             #[cfg(target_arch = "x86")]
             {
-                task.set_thread_area(&mut tls);
+                task.set_thread_area(&mut tls).unwrap();
             }
 
             #[cfg(target_arch = "x86_64")]
