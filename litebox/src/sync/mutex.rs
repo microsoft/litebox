@@ -85,7 +85,7 @@ impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
 
     /// Spin for a little while to see if quick release is possible.
     ///
-    /// Returns the state of the raw lock as soon as it is in unlcoked (0) or contended (2), or when
+    /// Returns the state of the raw lock as soon as it is in unlocked (0) or contended (2), or when
     /// it has spun for long enough.
     fn spin(&self) -> u32 {
         let mut spin = 100;
