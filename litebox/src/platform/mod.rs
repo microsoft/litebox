@@ -4,6 +4,7 @@
 //! trait is merely a collection of subtraits that could be composed independently from various
 //! other crates that implement them upon various types.
 
+pub mod common_providers;
 pub mod page_mgmt;
 pub mod trivial_providers;
 

@@ -1,3 +1,18 @@
+//! Exception Table Infrastructure
+//!
+//! This module provides the core exception table mechanism used by fallible
+//! memory operations.
+//!
+//! ## Architecture
+//!
+//! The exception table works by:
+//! 1. Assembly code marks potentially faulting instructions with entries in `.ex_table`
+//! 2. Each entry maps a faulting instruction address to a recovery address
+//! 3. Signal/exception handlers use [`search_exception_tables`] to look up recovery points
+//! 4. If found, execution is redirected to allow graceful failure handling
+//!
+//! New fallible functions should follow the pattern established by [`__memcpy_fallible`].
+
 use crate::utils::ReinterpretUnsignedExt;
 
 core::arch::global_asm!(
@@ -25,9 +40,15 @@ core::arch::global_asm!(
 );
 
 unsafe extern "C" {
-    /// Copies `size` bytes from `src` to `dst`. This function works with exception handling
-    /// and can recover from page fault.
-    /// Returns number of bytes that failed to copy.
+    /// Copies `size` bytes from `src` to `dst` in a fallible manner.
+    ///
+    /// This function can recover from memory access exceptions (e.g., page faults,
+    /// SIGSEGV) when proper exception handling is set up by the platform.
+    ///
+    /// For details on how fallible memory access works and platform requirements,
+    /// see [`crate::platform::common_providers::userspace_pointers`].
+    ///
+    /// Returns number of bytes that failed to copy (0 on success).
     pub fn __memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> usize;
 
     static __ex_table_start: [ExceptionTableEntry; 0];

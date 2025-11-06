@@ -1,7 +1,34 @@
-//! Userspace Pointer Abstraction
+//! Userspace Pointer Abstraction with Fallible Memory Access
+//!
+//! This module implements fallible userspace pointers that can safely handle invalid
+//! memory accesses from userspace. The pointers use [`__memcpy_fallible`] internally,
+//! which relies on an exception table mechanism to recover from memory faults.
+//!
+//! ## Exception Handling Mechanism
+//!
+//! **IMPORTANT**: For these pointers to behave as truly fallible (returning `None`
+//! on invalid access), the platform **must** implement and register appropriate
+//! exception handlers. Without proper exception handling setup, invalid memory
+//! accesses will still crash the program.
+//!
+//! When accessing userspace memory through these pointers:
+//!
+//! 1. **With Exception Handling** (Required for fallible behavior): The platform
+//!    must set up exception handlers (e.g., SIGSEGV signal handlers on Linux userland)
+//!    that can catch memory access failures such as page faults or segmentation violations.
+//!    The handler must use [`crate::mm::exception_table::search_exception_tables`] to
+//!    look up the faulting instruction and redirect execution to a recovery point,
+//!    allowing the operation to return `None` gracefully instead of crashing.
+//!
+//! 2. **Without Exception Handling** (Fallback behavior): If no exception handlers
+//!    are configured, these pointers behave like slightly more expensive
+//!    [`crate::platform::trivial_providers::TransparentConstPtr`] and
+//!    [`crate::platform::trivial_providers::TransparentMutPtr`]. Invalid memory
+//!    accesses will still cause the program to crash (e.g., with SIGSEGV), but
+//!    with the additional overhead of the fallible copy mechanism.
 
-use litebox::mm::exception_table::__memcpy_fallible;
-use litebox::platform::{RawConstPointer, RawMutPointer};
+use crate::mm::exception_table::__memcpy_fallible;
+use crate::platform::{RawConstPointer, RawMutPointer};
 
 /// Represent a user space pointer to a read-only object
 #[repr(C)]
@@ -18,7 +45,8 @@ impl<T: Clone> core::fmt::Debug for UserConstPtr<T> {
 
 /// Read from user space at the `off` offset, in a fallible manner.
 ///
-/// Note that this is fallible because we could recover from SIGSEGV (see [`crate::next_signal_handler`]).
+/// Note that this is fallible only if recovering from exceptions (e.g., page fault or SIGSEGV)
+/// is supported.
 unsafe fn read_at_offset<'a, T: Clone>(
     ptr: *const T,
     count: isize,
