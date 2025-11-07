@@ -1256,35 +1256,27 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for WindowsUserland {
         debug_assert!(new_range.len() > old_range.len());
 
         // Get the current permissions of the old range
-        let current_permissions;
         let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
         do_query_on_region(&mut mbi, old_range.start as *mut _);
         // Convert Windows protection flags back to MemoryRegionPermissions
-        match mbi.Protect {
-            Win32_Memory::PAGE_READONLY => {
-                current_permissions = MemoryRegionPermissions::READ;
-            }
+        let current_permissions = match mbi.Protect {
+            Win32_Memory::PAGE_READONLY => MemoryRegionPermissions::READ,
             Win32_Memory::PAGE_READWRITE => {
-                current_permissions =
-                    MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE
             }
             Win32_Memory::PAGE_EXECUTE_READ => {
-                current_permissions = MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC;
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC
             }
             Win32_Memory::PAGE_EXECUTE_READWRITE => {
-                current_permissions = MemoryRegionPermissions::READ
+                MemoryRegionPermissions::READ
                     | MemoryRegionPermissions::WRITE
-                    | MemoryRegionPermissions::EXEC;
+                    | MemoryRegionPermissions::EXEC
             }
-            Win32_Memory::PAGE_NOACCESS => {
-                current_permissions = MemoryRegionPermissions::empty();
+            Win32_Memory::PAGE_NOACCESS => MemoryRegionPermissions::empty(),
+            perm => {
+                unimplemented!("unhandled permission flags during remap_pages: {:?}", perm);
             }
-            _ => {
-                // Default to read/write if we can't determine
-                current_permissions =
-                    MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-            }
-        }
+        };
 
         // Allocate the new range with the same permissions as the old range
         // TODO: maybe we should pass the flags directly instead of deriving them again?
