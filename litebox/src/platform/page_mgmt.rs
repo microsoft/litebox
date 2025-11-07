@@ -116,11 +116,21 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
             })
             .expect("failed to update permissions on old range for copying");
         }
-        let old_ptr = <Self as RawPointerProvider>::RawConstPointer::from_usize(old_range.start);
-        unsafe {
-            new_ptr.write_slice_at_offset(0, &old_ptr.to_cow_slice(old_range.len()).unwrap())
+        // Copy in chunks of ALIGN bytes to handle very large memory regions
+        let total_len = old_range.len();
+        let mut offset = 0;
+        while offset < total_len {
+            let old_ptr =
+                <Self as RawPointerProvider>::RawConstPointer::from_usize(old_range.start + offset);
+            unsafe {
+                new_ptr.write_slice_at_offset(
+                    isize::try_from(offset).unwrap(),
+                    &old_ptr.to_cow_slice(old_range.len()).unwrap(),
+                )
+            }
+            .unwrap();
+            offset += ALIGN;
         }
-        .unwrap();
 
         if temp_permissions != permissions {
             (unsafe { self.update_permissions(new_range.clone(), permissions) })
