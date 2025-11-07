@@ -1,5 +1,7 @@
 //! Page-management related types and traits
 
+use crate::platform::{RawConstPointer as _, RawMutPointer as _};
+
 use super::RawPointerProvider;
 use core::ops::Range;
 use thiserror::Error;
@@ -79,11 +81,56 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// The caller must ensure that it is safe to move the `old_range` (i.e., these pages are not in
     /// active use).
+    ///
+    /// The `new_range` must be larger than `old_range`, and must not overlap with `old_range`.
+    ///
+    /// Both ranges must be aligned to `ALIGN`.
     unsafe fn remap_pages(
         &self,
         old_range: Range<usize>,
         new_range: Range<usize>,
-    ) -> Result<Self::RawMutPointer<u8>, RemapError>;
+        permissions: MemoryRegionPermissions,
+    ) -> Result<Self::RawMutPointer<u8>, RemapError> {
+        debug_assert!(old_range.start.is_multiple_of(ALIGN));
+        debug_assert!(new_range.start.is_multiple_of(ALIGN));
+        debug_assert!(old_range.len().is_multiple_of(ALIGN));
+        debug_assert!(new_range.len().is_multiple_of(ALIGN));
+        debug_assert!(new_range.len() > old_range.len());
+        debug_assert!(old_range.start.max(new_range.start) >= old_range.end.min(new_range.end));
+        // Default implementation: allocate new pages, copy data, deallocate old pages
+        let temp_permissions = permissions | MemoryRegionPermissions::WRITE;
+        let new_ptr = self
+            .allocate_pages(new_range.clone(), temp_permissions, false, true, true)
+            .map_err(|e| match e {
+                AllocationError::OutOfMemory => RemapError::OutOfMemory,
+                AllocationError::Unaligned | AllocationError::InvalidRange => unreachable!(),
+            })?;
+
+        // Copy memory from old range to new range
+        if !permissions.contains(MemoryRegionPermissions::READ) {
+            (unsafe {
+                self.update_permissions(
+                    old_range.clone(),
+                    permissions | MemoryRegionPermissions::READ,
+                )
+            })
+            .expect("failed to update permissions on old range for copying");
+        }
+        let old_ptr = <Self as RawPointerProvider>::RawConstPointer::from_usize(old_range.start);
+        unsafe {
+            new_ptr.write_slice_at_offset(0, &old_ptr.to_cow_slice(old_range.len()).unwrap())
+        }
+        .unwrap();
+
+        if temp_permissions != permissions {
+            (unsafe { self.update_permissions(new_range.clone(), permissions) })
+                .expect("failed to restore perrmissions on new range");
+        }
+
+        (unsafe { self.deallocate_pages(old_range) }).expect("failed to deallocate old range");
+
+        Ok(new_ptr)
+    }
 
     /// Update the permissions on pages in `range` to `new_permissions`.
     ///

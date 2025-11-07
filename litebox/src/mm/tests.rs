@@ -57,6 +57,7 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
         &self,
         old_range: Range<usize>,
         new_range: Range<usize>,
+        permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
     ) -> Result<Self::RawMutPointer<u8>, crate::platform::page_mgmt::RemapError> {
         Ok(TransparentMutPtr {
             inner: new_range.start as *mut u8,

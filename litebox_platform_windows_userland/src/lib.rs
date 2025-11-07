@@ -1245,20 +1245,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         Ok(())
     }
 
-    unsafe fn remap_pages(
-        &self,
-        old_range: core::ops::Range<usize>,
-        new_range: core::ops::Range<usize>,
-    ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
-        debug_assert_alignment!(old_range, ALIGN);
-        debug_assert_alignment!(new_range, ALIGN);
-        unimplemented!(
-            "remap_pages is not implemented for Windows yet. old_range: {:?}, new_range: {:?}",
-            old_range,
-            new_range
-        );
-    }
-
     unsafe fn update_permissions(
         &self,
         range: core::ops::Range<usize>,
