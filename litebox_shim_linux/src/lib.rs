@@ -1337,14 +1337,10 @@ impl Task {
     where
         Fut: core::future::Future,
     {
-        if let Some(dur) = timeout {
-            self.executor
-                .borrow_mut()
-                .run_or_timeout(dur, fut)
-                .map_err(|_| WaitError::TimedOut)
-        } else {
-            Ok(self.executor.borrow_mut().run(fut))
-        }
+        self.executor
+            .borrow_mut()
+            .run_or_timeout(timeout, fut)
+            .map_err(|_| WaitError::TimedOut)
     }
 }
 

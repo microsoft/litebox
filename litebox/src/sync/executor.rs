@@ -75,17 +75,19 @@ impl<Platform: RawSyncPrimitivesProvider> Executor<Platform> {
         }
     }
 
-    fn wait_timeout(&self, start_time: &Platform::Instant, timeout: Duration) -> Result<(), TimedOut>
+    fn wait_timeout(
+        &self,
+        start_time: &Platform::Instant,
+        timeout: Duration,
+    ) -> Result<(), TimedOut>
     where
         Platform: TimeProvider,
     {
         let since = self.platform.now().duration_since(&start_time);
         let timeout = timeout.saturating_sub(since);
         match self.state.0.block_or_timeout(0, timeout) {
-            Ok(UnblockedOrTimedOut::Unblocked) | Err(_) => Ok(())
-            Ok(UnblockedOrTimedOut::TimedOut) => {
-                Err(TimedOut)
-            }
+            Ok(UnblockedOrTimedOut::Unblocked) | Err(_) => Ok(()),
+            Ok(UnblockedOrTimedOut::TimedOut) => Err(TimedOut),
         }
     }
 
