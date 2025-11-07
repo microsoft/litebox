@@ -1295,7 +1295,7 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for WindowsUserland {
             temp_permission,
             false,
             false,
-            true, // fixed_address = true since we want the exact new_range
+            false,
         )
         .map_err(|e| match e {
             AllocationError::OutOfMemory => litebox::platform::page_mgmt::RemapError::OutOfMemory,
