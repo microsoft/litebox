@@ -83,7 +83,7 @@ impl<Platform: RawSyncPrimitivesProvider> Executor<Platform> {
     where
         Platform: TimeProvider,
     {
-        let since = self.platform.now().duration_since(&start_time);
+        let since = self.platform.now().duration_since(start_time);
         let timeout = timeout.saturating_sub(since);
         match self.state.0.block_or_timeout(0, timeout) {
             Ok(UnblockedOrTimedOut::Unblocked) | Err(_) => Ok(()),
