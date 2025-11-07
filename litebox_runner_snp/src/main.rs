@@ -140,7 +140,7 @@ pub extern "C" fn sandbox_process_init(
         );
     };
     *pt_regs = match shim.load_program(platform.init_task(boot_params), &program, argv, envp) {
-        Ok(regs) => regs,
+        Ok(program) => program.initial_ctx,
         Err(err) => {
             litebox::log_println!(platform, "failed to load program: {}", err);
             litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
@@ -165,9 +165,7 @@ pub extern "C" fn sandbox_task_exit() {
 pub extern "C" fn do_syscall_64(pt_regs: &mut litebox_common_linux::PtRegs) {
     match litebox_shim_linux::LinuxShimEntrypoints.syscall(pt_regs) {
         ContinueOperation::ResumeGuest => {}
-        ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
-            pt_regs.rax = status.cast_unsigned() as usize;
-        }
+        ContinueOperation::ExitThread => {}
         ContinueOperation::RtSigreturn(..) => unreachable!(),
     }
 }

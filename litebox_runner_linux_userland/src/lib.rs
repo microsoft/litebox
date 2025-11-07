@@ -263,9 +263,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let mut pt_regs = shim.load_program(platform.init_task(), prog_path, argv, envp)?;
-    unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };
-    Ok(())
+    let mut program = shim.load_program(platform.init_task(), prog_path, argv, envp)?;
+    unsafe { litebox_platform_linux_userland::run_thread(&mut program.initial_ctx) };
+    std::process::exit(program.process.wait())
 }
 
 fn fixup_env_aux(

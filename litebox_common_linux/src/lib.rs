@@ -2224,8 +2224,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
 
 pub enum ContinueOperation {
     ResumeGuest,
-    ExitThread(i32),
-    ExitProcess(i32),
+    ExitThread,
     RtSigreturn(usize), // TEMP: remove once this is handled natively by the shim
 }
 

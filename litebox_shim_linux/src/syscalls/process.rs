@@ -13,24 +13,114 @@ use litebox::platform::{
     RawMutexProvider as _, ThreadLocalStorageProvider as _,
 };
 use litebox::platform::{RawMutPointer as _, ThreadProvider as _};
+use litebox::sync::Mutex;
 #[cfg(target_arch = "x86")]
 use litebox::utils::TruncateExt;
+use litebox_common_linux::ContinueOperation;
 use litebox_common_linux::{ArchPrctlArg, errno::Errno};
 use litebox_common_linux::{CloneFlags, FutexArgs, PrctlArg};
+use litebox_platform_multiplex::Platform;
 
 /// A structure representing a process
 pub(crate) struct Process {
     /// number of threads in this process
-    pub(crate) nr_threads: core::sync::atomic::AtomicU16,
+    nr_threads:
+        <litebox_platform_multiplex::Platform as litebox::platform::RawMutexProvider>::RawMutex,
+    exiting: core::sync::atomic::AtomicBool,
+    exit_state: Mutex<Platform, ExitState>,
     /// resource limits for this process
     pub(crate) limits: ResourceLimits,
 }
 
+struct ExitState {
+    exit_code: i32,
+    group_exit: bool,
+}
+
 impl Process {
     pub fn new() -> Self {
+        let nr_threads = litebox_platform_multiplex::platform().new_raw_mutex();
+        nr_threads
+            .underlying_atomic()
+            .store(1, core::sync::atomic::Ordering::Relaxed);
         Self {
-            nr_threads: 1.into(),
+            nr_threads,
+            exiting: false.into(),
+            exit_state: crate::litebox().sync().new_mutex(ExitState {
+                exit_code: 0,
+                group_exit: false,
+            }),
             limits: ResourceLimits::default(),
+        }
+    }
+
+    pub fn nr_threads(&self) -> u32 {
+        self.nr_threads
+            .underlying_atomic()
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn is_single_threaded(&self) -> bool {
+        self.nr_threads() == 1
+    }
+
+    pub fn is_exiting(&self) -> bool {
+        self.exiting.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn wait_for_exit(&self) -> i32 {
+        loop {
+            let n = self
+                .nr_threads
+                .underlying_atomic()
+                .load(core::sync::atomic::Ordering::Acquire);
+            if n == 0 {
+                break;
+            }
+            let _ = self.nr_threads.block(n);
+        }
+        self.exit_state.lock().exit_code
+    }
+
+    /// Updates the process exit status for a thread exit.
+    fn exit_thread(&self, status: i32) {
+        let mut exit_state = self.exit_state.lock();
+        if !exit_state.group_exit {
+            exit_state.exit_code = status;
+        }
+    }
+
+    /// Updates the process exit status for a group exit and signals all threads
+    /// to exit.
+    fn exit_group(&self, status: i32) {
+        {
+            let mut exit_state = self.exit_state.lock();
+            if !exit_state.group_exit {
+                exit_state.exit_code = status;
+                exit_state.group_exit = true;
+            }
+        }
+        self.exiting
+            .store(true, core::sync::atomic::Ordering::Release);
+        // TODO: interrupt waiting and running threads.
+    }
+
+    fn increment_threads(&self) {
+        let n = self
+            .nr_threads
+            .underlying_atomic()
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        assert!(n > 0, "incrementing from zero threads");
+    }
+
+    fn decrement_threads(&self) {
+        let n = self
+            .nr_threads
+            .underlying_atomic()
+            .fetch_sub(1, core::sync::atomic::Ordering::Release);
+        assert!(n > 0, "decrementing from zero threads");
+        if n == 1 {
+            self.nr_threads.wake_all();
         }
     }
 }
@@ -278,20 +368,20 @@ impl Task {
             let _ = wake_robust_list(robust_list);
         }
 
-        self.process
-            .nr_threads
-            .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        self.process.decrement_threads();
     }
 
-    pub(crate) fn sys_exit(&self, _status: i32) {
-        // Nothing to do yet. The `Task` will be dropped on the way out of the
-        // shim, which will call `self.prepare_for_exit()`.
+    pub(crate) fn sys_exit(&self, status: i32) -> ContinueOperation {
+        // The `Task` will be dropped on the way out of the shim, which will
+        // call `self.prepare_for_exit()`.
+        self.process.exit_thread(status);
+        ContinueOperation::ExitThread
     }
 
-    pub(crate) fn sys_exit_group(&self, _status: i32) {
+    pub(crate) fn sys_exit_group(&self, status: i32) -> ContinueOperation {
         // Tear down occurs similarly to `sys_exit`.
-        //
-        // TODO: remotely kill other threads.
+        self.process.exit_group(status);
+        ContinueOperation::ExitThread
     }
 }
 
@@ -454,9 +544,7 @@ impl Task {
             ctx_copy.eax = 0;
         }
 
-        self.process
-            .nr_threads
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.process.increment_threads();
 
         let r = unsafe {
             litebox_platform_multiplex::platform().spawn_thread(
@@ -482,9 +570,7 @@ impl Task {
         };
 
         if let Err(err) = r {
-            self.process
-                .nr_threads
-                .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+            self.process.decrement_threads();
             return Err(err);
         }
 
@@ -1045,12 +1131,7 @@ impl Task {
         }
 
         // Check if we are the only thread in the process
-        if self
-            .process
-            .nr_threads
-            .load(core::sync::atomic::Ordering::Relaxed)
-            != 1
-        {
+        if !self.process.is_single_threaded() {
             unimplemented!("execve when multiple threads exist is not supported yet");
         }
         // Don't release reserved mappings.

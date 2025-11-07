@@ -1584,22 +1584,7 @@ extern "C-unwind" fn exception_handler(
 fn continue_operation(op: ContinueOperation, ctx: &mut litebox_common_linux::PtRegs) {
     match op {
         ContinueOperation::ResumeGuest => unsafe { switch_to_guest(ctx) },
-        ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
-            #[cfg(target_arch = "x86_64")]
-            {
-                cfg_if::cfg_if! {
-                    if #[cfg(feature = "linux_syscall")] {
-                        ctx.rax = status.reinterpret_as_unsigned() as usize;
-                    } else if #[cfg(feature = "optee_syscall")] {
-                        ctx.rax = status;
-                    }
-                }
-            }
-            #[cfg(target_arch = "x86")]
-            {
-                ctx.eax = status.reinterpret_as_unsigned() as usize;
-            }
-        }
+        ContinueOperation::ExitThread => {}
         #[cfg(feature = "linux_syscall")]
         ContinueOperation::RtSigreturn(..) => unreachable!(),
     }

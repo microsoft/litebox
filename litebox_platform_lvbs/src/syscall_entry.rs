@@ -172,17 +172,7 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> usize {
     // call the syscall handler passed down from the shim
     let sysret = match shim.syscall(&mut ctx) {
         ContinueOperation::ResumeGuest => ctx.rax,
-        ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
-            cfg_if::cfg_if! {
-                if #[cfg(feature = "linux_syscall")] {
-                    status.cast_unsigned() as usize
-                } else if #[cfg(feature = "optee_syscall")] {
-                    status
-                } else {
-                    compile_error!(r##"No syscall handler specified."##);
-                }
-            }
-        }
+        ContinueOperation::ExitThread => ctx.rax,
         #[cfg(feature = "linux_syscall")]
         ContinueOperation::RtSigreturn(..) => unreachable!(),
     };

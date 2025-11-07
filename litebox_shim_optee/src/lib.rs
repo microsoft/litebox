@@ -117,9 +117,11 @@ fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> ContinueOpe
     };
 
     if let SyscallRequest::Return { ret } = request {
-        return ContinueOperation::ExitThread(syscalls::tee::sys_return(ret));
+        ctx.rax = syscalls::tee::sys_return(ret);
+        return ContinueOperation::ExitThread;
     } else if let SyscallRequest::Panic { code } = request {
-        return ContinueOperation::ExitThread(syscalls::tee::sys_panic(code));
+        ctx.rax = syscalls::tee::sys_panic(code);
+        return ContinueOperation::ExitThread;
     }
     let res: Result<(), TeeResult> = match request {
         SyscallRequest::Log { buf, len } => match unsafe { buf.to_cow_slice(len) } {

@@ -1433,9 +1433,7 @@ unsafe extern "C-unwind" fn exception_handler(
 fn continue_operation(op: ContinueOperation, ctx: &mut litebox_common_linux::PtRegs) {
     match op {
         ContinueOperation::ResumeGuest => unsafe { switch_to_guest(ctx) },
-        ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
-            ctx.rax = status.reinterpret_as_unsigned() as usize;
-        }
+        ContinueOperation::ExitThread => {}
         ContinueOperation::RtSigreturn(..) => unreachable!(),
     }
 }

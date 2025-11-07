@@ -248,9 +248,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let mut pt_regs = shim
+    let mut program = shim
         .load_program(platform.init_task(), &prog_unix_path, argv, envp)
         .unwrap();
-    unsafe { litebox_platform_windows_userland::run_thread(&mut pt_regs) };
-    Ok(())
+    unsafe { litebox_platform_windows_userland::run_thread(&mut program.initial_ctx) };
+    std::os::exit(program.process.wait())
 }

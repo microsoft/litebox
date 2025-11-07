@@ -69,7 +69,7 @@ impl litebox::shim::EnterShim for LinuxShimEntrypoints {
         let r = with_current_task(|task| task.handle_syscall_request(ctx));
         match r {
             ContinueOperation::ResumeGuest => {}
-            ContinueOperation::ExitThread(_) | ContinueOperation::ExitProcess(_) => {
+            ContinueOperation::ExitThread => {
                 SHIM_TLS.deinit();
             }
             // TEMP: this must be done outside of with_current_task to avoid leaking a borrow.
@@ -178,8 +178,7 @@ impl LinuxShim {
         })
     }
 
-    /// Loads the program at `path` as the shim's initial task, returning the
-    /// initial register state.
+    /// Loads the program at `path` as the shim's initial task.
     ///
     /// # Panics
     /// Panics if the file system has not been set with [`set_fs`](Self::set_fs)
@@ -190,7 +189,7 @@ impl LinuxShim {
         path: &str,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
-    ) -> Result<litebox_common_linux::PtRegs, loader::ElfLoaderError> {
+    ) -> Result<LoadedProgram, loader::ElfLoaderError> {
         let litebox = self.litebox;
         let global = self.into_global();
 
@@ -206,6 +205,7 @@ impl LinuxShim {
 
         let files = Arc::new(syscalls::file::FilesState::new(litebox));
         files.initialize_stdio_in_shared_descriptors_table(&global.fs);
+        let process = Arc::new(syscalls::process::Process::new());
 
         // TODO: ensure this gets torn down even if the thread never runs sys_exit.
         // Consider a scoped execution model, e.g.
@@ -232,15 +232,37 @@ impl LinuxShim {
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
-                process: syscalls::process::Process::new().into(),
+                process: process.clone(),
             },
         });
 
-        let r = with_current_task(|task| task.load_program(path, argv, envp));
-        if r.is_err() {
-            SHIM_TLS.deinit();
-        }
-        r
+        let regs =
+            with_current_task(|task| task.load_program(path, argv, envp)).inspect_err(|_| {
+                SHIM_TLS.deinit();
+            })?;
+        Ok(LoadedProgram {
+            process: ShimProcess(process),
+            initial_ctx: regs,
+        })
+    }
+}
+
+/// The result of [`load_program`](LinuxShim::load_program).
+pub struct LoadedProgram {
+    /// The process representing the loaded program. This can be used to wait
+    /// for the process to exit.
+    pub process: ShimProcess,
+    /// The initial register context for the first thread of the process.
+    pub initial_ctx: litebox_common_linux::PtRegs,
+}
+
+/// A handle to a shim process.
+pub struct ShimProcess(Arc<syscalls::process::Process>);
+
+impl ShimProcess {
+    /// Wait for the process to exit, returning its exit status.
+    pub fn wait(&self) -> i32 {
+        self.0.wait_for_exit()
     }
 }
 
@@ -567,6 +589,14 @@ impl Task {
     ///
     /// Unsupported syscalls or arguments would trigger a panic for development purposes.
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
+        let r = self.do_syscall(ctx);
+        if matches!(r, ContinueOperation::ResumeGuest) && self.process.is_exiting() {
+            return ContinueOperation::ExitThread;
+        }
+        r
+    }
+
+    fn do_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
         fn set_return(ctx: &mut litebox_common_linux::PtRegs, value: usize) {
             #[cfg(target_arch = "x86")]
             {
@@ -593,11 +623,11 @@ impl Task {
         let res: Result<usize, Errno> = match request {
             SyscallRequest::Exit { status } => {
                 self.sys_exit(status);
-                return ContinueOperation::ExitThread(status);
+                return ContinueOperation::ExitThread;
             }
             SyscallRequest::ExitGroup { status } => {
                 self.sys_exit_group(status);
-                return ContinueOperation::ExitProcess(status);
+                return ContinueOperation::ExitThread;
             }
             SyscallRequest::Execve {
                 pathname,
