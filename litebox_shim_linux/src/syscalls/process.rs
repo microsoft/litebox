@@ -135,7 +135,7 @@ pub(crate) struct Credentials {
 }
 
 // TODO: better management of thread IDs
-pub(crate) static NEXT_THREAD_ID: AtomicI32 = AtomicI32::new(2); // start from 2, as 1 is used by the main thread
+static NEXT_THREAD_ID: AtomicI32 = AtomicI32::new(2); // start from 2, as 1 is used by the main thread
 
 impl Task {
     /// Set the current task's command name.
@@ -1214,6 +1214,81 @@ impl Task {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
+    use super::NEXT_THREAD_ID;
+    use crate::{GlobalState, Task, syscalls::file::FilesState};
+    use alloc::sync::Arc;
+    use core::cell::Cell;
+
+    impl GlobalState {
+        /// Make a new task with default values for testing.
+        pub(crate) fn new_test_task(self: Arc<Self>) -> Task {
+            let pid = NEXT_THREAD_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let files = Arc::new(FilesState::new(crate::litebox()));
+            files.initialize_stdio_in_shared_descriptors_table(&self.fs);
+            Task {
+                global: self,
+                process: Arc::new(super::Process::new()),
+                pid,
+                ppid: 0,
+                tid: pid,
+                clear_child_tid: Cell::new(None),
+                robust_list: Cell::new(None),
+                credentials: Arc::new(super::Credentials {
+                    uid: 0,
+                    euid: 0,
+                    gid: 0,
+                    egid: 0,
+                }),
+                comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
+                fs: Arc::new(crate::syscalls::file::FsState::new()).into(),
+                files: files.into(),
+            }
+        }
+    }
+
+    impl Task {
+        /// Returns a function that clones this task with a new TID for testing.
+        pub(crate) fn clone_for_test(&self) -> impl 'static + Send + FnOnce() -> Self {
+            let global = self.global.clone();
+            let process = self.process.clone();
+            let credentials = self.credentials.clone();
+            let fs = self.fs.clone();
+            let comm = self.comm.clone();
+            let pid = self.pid;
+            let tid = NEXT_THREAD_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let parent_pid = self.ppid;
+            let files = self.files.clone();
+            process.increment_threads();
+            move || Task {
+                global,
+                process,
+                pid,
+                ppid: parent_pid,
+                tid,
+                clear_child_tid: None.into(),
+                robust_list: None.into(),
+                credentials,
+                comm,
+                fs,
+                files,
+            }
+        }
+
+        /// Spawns a thread that runs with a clone of this task and a new TID.
+        pub(crate) fn spawn_clone_for_test<R>(
+            &self,
+            f: impl 'static + Send + FnOnce(Task) -> R,
+        ) -> std::thread::JoinHandle<R>
+        where
+            R: 'static + Send,
+        {
+            let clone_task_fn = self.clone_for_test();
+            std::thread::spawn(move || f(clone_task_fn()))
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_arch_prctl() {
