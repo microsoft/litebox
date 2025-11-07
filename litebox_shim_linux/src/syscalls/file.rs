@@ -15,7 +15,7 @@ use litebox::{
 };
 use litebox_common_linux::{
     AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
-    IoWriteVec, IoctlArg, errno::Errno,
+    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -1391,47 +1391,18 @@ impl Task {
         &self,
         fds: MutPtr<litebox_common_linux::Pollfd>,
         nfds: usize,
-        timeout: Option<ConstPtr<litebox_common_linux::Timespec>>,
+        timeout: TimeParam<Platform>,
         sigmask: Option<ConstPtr<litebox_common_linux::SigSet>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
         if sigmask.is_some() {
+            if sigsetsize != core::mem::size_of::<litebox_common_linux::SigSet>() {
+                // Expected via ppoll(2) manpage
+                unimplemented!()
+            }
             unimplemented!("no sigmask support yet");
         }
-        if sigsetsize != core::mem::size_of::<litebox_common_linux::SigSet>() {
-            // Expected via ppoll(2) manpage
-            unimplemented!()
-        }
-        let timeout = timeout
-            .map(super::process::get_timeout)
-            .transpose()?
-            .map(Into::into);
-
-        self.do_ppoll(fds, nfds, timeout)
-    }
-
-    /// Handle syscall `poll`.
-    pub fn sys_poll(
-        &self,
-        fds: MutPtr<litebox_common_linux::Pollfd>,
-        nfds: usize,
-        timeout: i32,
-    ) -> Result<usize, Errno> {
-        let timeout = if timeout >= 0 {
-            #[allow(clippy::cast_sign_loss, reason = "timeout is a positive integer")]
-            Some(core::time::Duration::from_millis(timeout as u64))
-        } else {
-            None
-        };
-        self.do_ppoll(fds, nfds, timeout)
-    }
-
-    fn do_ppoll(
-        &self,
-        fds: MutPtr<litebox_common_linux::Pollfd>,
-        nfds: usize,
-        timeout: Option<core::time::Duration>,
-    ) -> Result<usize, Errno> {
+        let timeout = timeout.read()?;
         let nfds_signed = isize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
 
         let mut set = super::epoll::PollSet::with_capacity(nfds);
@@ -1526,14 +1497,20 @@ impl Task {
         Ok(ready_count)
     }
 
-    fn select_common(
+    /// Handle syscall `pselect`.
+    pub(crate) fn sys_pselect(
         &self,
         nfds: u32,
         readfds: Option<MutPtr<usize>>,
         writefds: Option<MutPtr<usize>>,
         exceptfds: Option<MutPtr<usize>>,
-        timeout: Option<core::time::Duration>,
+        timeout: TimeParam<Platform>,
+        sigsetpack: Option<ConstPtr<litebox_common_linux::SigSetPack>>,
     ) -> Result<usize, Errno> {
+        if sigsetpack.is_some() {
+            unimplemented!("no sigsetpack support yet");
+        }
+        let timeout = timeout.read()?;
         if nfds >= i32::MAX as u32
             || nfds as usize
                 > self
@@ -1591,48 +1568,6 @@ impl Task {
         }
 
         Ok(count)
-    }
-
-    /// Handle syscall `select`.
-    pub(crate) fn sys_select(
-        &self,
-        nfds: u32,
-        readfds: Option<MutPtr<usize>>,
-        writefds: Option<MutPtr<usize>>,
-        exceptfds: Option<MutPtr<usize>>,
-        timeout: Option<MutPtr<litebox_common_linux::TimeVal>>,
-    ) -> Result<usize, Errno> {
-        let timeout = timeout
-            .map(|tv_ptr| {
-                let tv = unsafe { tv_ptr.read_at_offset(0) }
-                    .ok_or(Errno::EFAULT)?
-                    .into_owned();
-                core::time::Duration::try_from(tv).map_err(|_| Errno::EINVAL)
-            })
-            .transpose()?;
-
-        self.select_common(nfds, readfds, writefds, exceptfds, timeout)
-    }
-
-    /// Handle syscall `pselect`.
-    pub(crate) fn sys_pselect(
-        &self,
-        nfds: u32,
-        readfds: Option<MutPtr<usize>>,
-        writefds: Option<MutPtr<usize>>,
-        exceptfds: Option<MutPtr<usize>>,
-        timeout: Option<ConstPtr<litebox_common_linux::Timespec>>,
-        sigsetpack: Option<ConstPtr<litebox_common_linux::SigSetPack>>,
-    ) -> Result<usize, Errno> {
-        if sigsetpack.is_some() {
-            unimplemented!("no sigsetpack support yet");
-        }
-        let timeout = timeout
-            .map(super::process::get_timeout)
-            .transpose()?
-            .map(Into::into);
-
-        self.select_common(nfds, readfds, writefds, exceptfds, timeout)
     }
 
     fn do_dup(&self, file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {

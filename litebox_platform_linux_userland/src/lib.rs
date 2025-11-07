@@ -899,10 +899,10 @@ impl litebox::platform::TimeProvider for LinuxUserland {
         let t = unsafe { t.assume_init() };
         Instant {
             #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
-            inner: litebox_common_linux::Timespec {
-                tv_sec: i64::from(t.tv_sec),
-                tv_nsec: u64::from(t.tv_nsec.reinterpret_as_unsigned()),
-            },
+            inner: Duration::new(
+                t.tv_sec.reinterpret_as_unsigned().into(),
+                t.tv_nsec.reinterpret_as_unsigned().truncate(),
+            ),
         }
     }
 
@@ -912,46 +912,37 @@ impl litebox::platform::TimeProvider for LinuxUserland {
         let t = unsafe { t.assume_init() };
         SystemTime {
             #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
-            inner: litebox_common_linux::Timespec {
-                tv_sec: i64::from(t.tv_sec),
-                tv_nsec: u64::from(t.tv_nsec.reinterpret_as_unsigned()),
-            },
+            inner: Duration::new(
+                t.tv_sec.reinterpret_as_unsigned().into(),
+                t.tv_nsec.reinterpret_as_unsigned().truncate(),
+            ),
         }
     }
 }
 
 pub struct Instant {
-    inner: litebox_common_linux::Timespec,
+    inner: Duration,
 }
 
 impl litebox::platform::Instant for Instant {
-    fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
-        self.inner.sub_timespec(&earlier.inner).ok()
-    }
-}
-
-impl From<litebox_common_linux::Timespec> for Instant {
-    fn from(inner: litebox_common_linux::Timespec) -> Self {
-        Instant { inner }
+    fn checked_duration_since(&self, earlier: &Self) -> Option<Duration> {
+        self.inner.checked_sub(earlier.inner)
     }
 }
 
 pub struct SystemTime {
-    inner: litebox_common_linux::Timespec,
+    inner: Duration,
 }
 
 impl litebox::platform::SystemTime for SystemTime {
     const UNIX_EPOCH: Self = SystemTime {
-        inner: litebox_common_linux::Timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        },
+        inner: Duration::ZERO,
     };
 
     fn duration_since(&self, earlier: &Self) -> Result<core::time::Duration, core::time::Duration> {
         self.inner
-            .sub_timespec(&earlier.inner)
-            .map_err(|_errno| earlier.inner.sub_timespec(&self.inner).unwrap())
+            .checked_sub(earlier.inner)
+            .ok_or_else(|| earlier.inner - self.inner)
     }
 }
 
