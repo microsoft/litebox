@@ -252,9 +252,7 @@ impl Task {
                             )
                         },
                         |fd| {
-                            litebox_pipes()
-                                .read()
-                                .read(fd, &mut buf.borrow_mut())
+                            self.block_on(litebox_pipes().read(fd, &mut buf.borrow_mut()))?
                                 .map_err(Errno::from)
                         },
                     )
@@ -267,7 +265,7 @@ impl Task {
                 if buf.len() < size_of::<u64>() {
                     return Err(Errno::EINVAL);
                 }
-                let value = file.read()?;
+                let value = self.block_on(file.read())??;
                 buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
                 Ok(size_of::<u64>())
             }
@@ -301,7 +299,10 @@ impl Task {
                                 None,
                             )
                         },
-                        |fd| litebox_pipes().read().write(fd, buf).map_err(Errno::from),
+                        |fd| {
+                            self.block_on(litebox_pipes().write(fd, buf))?
+                                .map_err(Errno::from)
+                        },
                     )
                     .flatten()
             }
@@ -314,7 +315,7 @@ impl Task {
                         .try_into()
                         .map_err(|_| Errno::EINVAL)?,
                 );
-                file.write(value)
+                self.block_on(file.write(value))?
             }
         }
     }
@@ -397,7 +398,7 @@ impl Task {
                             match rds.fd_consume_raw_integer::<litebox::pipes::Pipes<litebox_platform_multiplex::Platform>>(raw_fd) {
                                 Ok(fd) => {
                                     drop(rds);
-                                    litebox_pipes().read().close(&fd).map_err(Errno::from)
+                                    litebox_pipes().close(&fd).map_err(Errno::from)
                                 }
                                 Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
                                 Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
@@ -655,7 +656,7 @@ impl Descriptor {
                     },
                     |_fd| todo!("net"),
                     |fd| {
-                        let half_pipe_type = litebox_pipes().read().half_pipe_type(fd)?;
+                        let half_pipe_type = litebox_pipes().half_pipe_type(fd)?;
                         let read_write_mode = match half_pipe_type {
                             litebox::pipes::HalfPipeType::SenderHalf => Mode::WUSR,
                             litebox::pipes::HalfPipeType::ReceiverHalf => Mode::RUSR,
@@ -875,7 +876,7 @@ impl Task {
                                 .unwrap_or(OFlags::empty()))
                         },
                         |fd| {
-                            let pipes = litebox_pipes().read();
+                            let pipes = litebox_pipes();
                             let flags = OFlags::from(pipes.get_flags(fd).map_err(Errno::from)?);
                             let dirn = match pipes.half_pipe_type(fd)? {
                                 litebox::pipes::HalfPipeType::SenderHalf => OFlags::WRONLY,
@@ -951,7 +952,6 @@ impl Task {
                                 todo!("unsupported flags for pipes")
                             }
                             litebox_pipes()
-                                .read()
                                 .update_flags(
                                     fd,
                                     litebox::pipes::Flags::NON_BLOCKING,
@@ -1058,7 +1058,7 @@ impl Task {
             (f, flags.contains(OFlags::CLOEXEC))
         };
 
-        let (writer, reader) = crate::litebox_pipes().read().create_pipe(
+        let (writer, reader) = crate::litebox_pipes().create_pipe(
             DEFAULT_PIPE_BUF_SIZE,
             pipe_flags,
             // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
@@ -1200,7 +1200,6 @@ impl Task {
                         },
                         |fd| {
                             litebox_pipes()
-                                .read()
                                 .update_flags(fd, litebox::pipes::Flags::NON_BLOCKING, val != 0)
                                 .map_err(Errno::from)
                         },
@@ -1377,13 +1376,18 @@ impl Task {
                 _ => return Err(Errno::EBADF),
             }
         };
-        let epoll_events = epoll_file.wait(maxevents, timeout)?;
-        if !epoll_events.is_empty() {
-            events
-                .copy_from_slice(0, &epoll_events)
-                .ok_or(Errno::EFAULT)?;
+        match self.block_with_timeout(timeout, epoll_file.wait(maxevents)) {
+            Ok(epoll_events) => {
+                if !epoll_events.is_empty() {
+                    events
+                        .copy_from_slice(0, &epoll_events)
+                        .ok_or(Errno::EFAULT)?;
+                }
+                Ok(epoll_events.len())
+            }
+            Err(crate::WaitError::TimedOut) => Ok(0),
+            Err(crate::WaitError::Interrupted) => Err(Errno::EINTR),
         }
-        Ok(epoll_events.len())
     }
 
     /// Handle syscall `ppoll`.
@@ -1446,7 +1450,17 @@ impl Task {
             set.add_fd(fd.fd, events);
         }
 
-        set.wait_or_timeout(&self.files.borrow(), timeout);
+        match self.block_with_timeout(timeout, set.wait(&self.files.borrow())) {
+            Ok(()) => {}
+            Err(crate::WaitError::Interrupted) => {
+                // TODO: update the remaining time.
+                return Err(Errno::EINTR);
+            }
+            Err(crate::WaitError::TimedOut) => {
+                // A timeout occurred. Scan one last time.
+                set.scan(&self.files.borrow());
+            }
+        }
 
         // Write just the revents back.
         let fds_base_addr = fds.as_usize();
@@ -1500,7 +1514,17 @@ impl Task {
             }
         }
 
-        set.wait_or_timeout(&self.files.borrow(), timeout);
+        match self.block_with_timeout(timeout, set.wait(&self.files.borrow())) {
+            Ok(()) => {}
+            Err(crate::WaitError::Interrupted) => {
+                // TODO: update the remaining time.
+                return Err(Errno::EINTR);
+            }
+            Err(crate::WaitError::TimedOut) => {
+                // A timeout occurred. Scan one last time.
+                set.scan(&self.files.borrow());
+            }
+        }
 
         let mut ready_count = 0;
         let mut process_fdset =

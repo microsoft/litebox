@@ -9,8 +9,8 @@ use core::sync::atomic::AtomicI32;
 use litebox::mm::linux::VmFlags;
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{
-    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutex as _,
-    RawMutexProvider as _, ThreadLocalStorageProvider as _,
+    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _,
+    ThreadLocalStorageProvider as _,
 };
 use litebox::platform::{RawMutPointer as _, ThreadProvider as _};
 #[cfg(target_arch = "x86")]
@@ -466,6 +466,7 @@ impl Task {
                     set_child_tid,
                     task: Task {
                         global: self.global.clone(),
+                        executor: crate::litebox().sync().new_executor().into(),
                         pid: self.pid,
                         tid: child_tid,
                         ppid: self.ppid,
@@ -785,18 +786,17 @@ impl Task {
             request
         };
 
-        // Reuse the raw mutex provider to implement sleep.
-        //
-        // TODO: consider a new litebox API to directly sleep, with integration with
-        // interruptions.
-        let r = platform.new_raw_mutex().block_or_timeout(0, duration);
-        assert!(matches!(
-            r,
-            Ok(litebox::platform::UnblockedOrTimedOut::TimedOut)
-        ),);
-
-        // TODO: update the remainder for non-absolute sleeps interrupted by signals.
-        let _ = remain;
+        match self.block_with_timeout(
+            Some(duration),
+            core::future::pending::<core::convert::Infallible>(),
+        ) {
+            Err(crate::WaitError::TimedOut) => {}
+            Err(crate::WaitError::Interrupted) => {
+                // TODO: update the remainder for non-absolute sleeps interrupted by signals.
+                let _ = remain;
+                return Err(Errno::EINTR);
+            }
+        }
 
         Ok(())
     }

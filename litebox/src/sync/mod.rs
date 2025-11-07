@@ -10,6 +10,7 @@
 use crate::platform;
 
 mod condvar;
+mod executor;
 pub mod futex;
 mod mutex;
 mod rwlock;
@@ -18,6 +19,7 @@ mod rwlock;
 mod lock_tracing;
 
 pub use condvar::Condvar;
+pub use executor::{Executor, TimedOut};
 pub use mutex::{Mutex, MutexGuard};
 pub use rwlock::{
     MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
@@ -85,5 +87,10 @@ impl<Platform: RawSyncPrimitivesProvider> Synchronization<Platform> {
     #[must_use]
     pub fn new_rwlock<T>(&self, val: T) -> RwLock<Platform, T> {
         RwLock::new_from_synchronization(self, val)
+    }
+
+    /// Create a new [`Executor`]
+    pub fn new_executor(&self) -> Executor<Platform> {
+        Executor::new_from_synchronization(self)
     }
 }

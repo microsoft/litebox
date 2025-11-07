@@ -19,7 +19,10 @@ use alloc::vec::Vec;
 use once_cell::race::OnceBox;
 
 use alloc::sync::Arc;
-use core::cell::{Cell, RefCell};
+use core::{
+    cell::{Cell, RefCell},
+    time::Duration,
+};
 use litebox::{
     LiteBox,
     fd::{ErrRawIntFd, TypedFd},
@@ -217,6 +220,7 @@ impl LinuxShim {
         SHIM_TLS.init(LinuxShimTls {
             current_task: Task {
                 global,
+                executor: litebox.sync().new_executor().into(),
                 pid,
                 ppid,
                 tid,
@@ -297,11 +301,11 @@ pub fn perform_network_interaction() -> litebox::net::PlatformInteractionReinvoc
     litebox_net().lock().perform_platform_interaction()
 }
 
-pub(crate) fn litebox_pipes<'a>() -> &'a litebox::sync::RwLock<Platform, Pipes<Platform>> {
-    static PIPES: OnceBox<litebox::sync::RwLock<Platform, Pipes<Platform>>> = OnceBox::new();
+pub(crate) fn litebox_pipes<'a>() -> &'a Pipes<Platform> {
+    static PIPES: OnceBox<Pipes<Platform>> = OnceBox::new();
     PIPES.get_or_init(|| {
         let pipes = Pipes::new(litebox());
-        alloc::boxed::Box::new(litebox().sync().new_rwlock(pipes))
+        alloc::boxed::Box::new(pipes)
     })
 }
 
@@ -1264,6 +1268,7 @@ struct LinuxShimTls {
 
 struct Task {
     global: Arc<GlobalState>,
+    executor: RefCell<litebox::sync::Executor<Platform>>,
     process: Arc<syscalls::process::Process>,
     /// Process ID
     pid: i32,
@@ -1298,6 +1303,48 @@ struct Task {
 impl Drop for Task {
     fn drop(&mut self) {
         self.prepare_for_exit();
+    }
+}
+
+#[derive(Debug)]
+struct Interrupted;
+
+impl From<Interrupted> for Errno {
+    fn from(_: Interrupted) -> Self {
+        Errno::EINTR
+    }
+}
+
+enum WaitError {
+    #[expect(dead_code, reason = "no interruptions yet")]
+    Interrupted,
+    TimedOut,
+}
+
+impl Task {
+    fn block_on<Fut>(&self, fut: Fut) -> Result<Fut::Output, Interrupted>
+    where
+        Fut: core::future::Future,
+    {
+        Ok(self.executor.borrow_mut().run(fut))
+    }
+
+    fn block_with_timeout<Fut>(
+        &self,
+        timeout: Option<Duration>,
+        fut: Fut,
+    ) -> Result<Fut::Output, WaitError>
+    where
+        Fut: core::future::Future,
+    {
+        if let Some(dur) = timeout {
+            self.executor
+                .borrow_mut()
+                .run_or_timeout(dur, fut)
+                .map_err(|_| WaitError::TimedOut)
+        } else {
+            Ok(self.executor.borrow_mut().run(fut))
+        }
     }
 }
 
@@ -1407,6 +1454,7 @@ mod test_utils {
             let files = Arc::new(syscalls::file::FilesState::new(litebox()));
             files.initialize_stdio_in_shared_descriptors_table(&self.fs);
             Task {
+                executor: RefCell::new(litebox().sync().new_executor()),
                 global: self,
                 process: Arc::new(syscalls::process::Process::new()),
                 pid,
@@ -1440,6 +1488,7 @@ mod test_utils {
             let parent_pid = self.ppid;
             let files = self.files.clone();
             move || Task {
+                executor: RefCell::new(litebox().sync().new_executor()),
                 global,
                 process,
                 pid,

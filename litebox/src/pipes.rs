@@ -91,27 +91,35 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     ///
     /// Note: currently, this function returns `Ok(0)` if the peer end has been shut down, this may
     /// change in the future to an explicit "peer has shut down" error.
-    pub fn read(&self, fd: &PipeFd<Platform>, buf: &mut [u8]) -> Result<usize, errors::ReadError> {
+    pub async fn read(
+        &self,
+        fd: &PipeFd<Platform>,
+        buf: &mut [u8],
+    ) -> Result<usize, errors::ReadError> {
         let dt = self.litebox.descriptor_table();
         let p = match &dt.get_entry(fd).ok_or(errors::ReadError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => Arc::clone(p),
             PipeEnd::Sender(_) => return Err(errors::ReadError::NotForReading),
         };
         drop(dt);
-        p.read(buf).map_err(From::from)
+        p.read(buf).await.map_err(From::from)
     }
 
     /// Write the values in `buf` into the pipe, returning the number of elements written.
     ///
     /// See [`Self::create_pipe`] for details on blocking and atomicity of writes.
-    pub fn write(&self, fd: &PipeFd<Platform>, buf: &[u8]) -> Result<usize, errors::WriteError> {
+    pub async fn write(
+        &self,
+        fd: &PipeFd<Platform>,
+        buf: &[u8],
+    ) -> Result<usize, errors::WriteError> {
         let dt = self.litebox.descriptor_table();
         let p = match &dt.get_entry(fd).ok_or(errors::WriteError::ClosedFd)?.entry {
             PipeEnd::Sender(p) => Arc::clone(p),
             PipeEnd::Receiver(_) => return Err(errors::WriteError::NotForWriting),
         };
         drop(dt);
-        p.write(buf).map_err(From::from)
+        p.write(buf).await.map_err(From::from)
     }
 
     /// Whether the provided FD points to a reader or a writer end.
@@ -361,7 +369,6 @@ impl From<TryOpError<PipeError>> for PipeError {
     fn from(err: TryOpError<PipeError>) -> Self {
         match err {
             TryOpError::TryAgain => PipeError::WouldBlock,
-            TryOpError::TimedOut => unreachable!(),
             TryOpError::Other(e) => e,
         }
     }
@@ -419,22 +426,24 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T
     /// Write the values in `buf` into the pipe, returning the number of elements written.
     ///
     /// See [`new_pipe`] for details on blocking and atomicity of writes.
-    fn write(&self, buf: &[T]) -> Result<usize, PipeError>
+    async fn write(&self, buf: &[T]) -> Result<usize, PipeError>
     where
         T: Copy,
     {
         Ok(if self.get_status().contains(OFlags::NONBLOCK) {
-            self.try_write(buf)
+            self.try_write(buf)?
         } else {
-            self.endpoint.pollee.wait_or_timeout(
-                None,
-                || self.try_write(buf),
-                || {
-                    self.check_io_events()
-                        .intersects(Events::OUT | Events::ALWAYS_POLLED)
-                },
-            )
-        }?)
+            self.endpoint
+                .pollee
+                .wait(
+                    || self.try_write(buf),
+                    || {
+                        self.check_io_events()
+                            .intersects(Events::OUT | Events::ALWAYS_POLLED)
+                    },
+                )
+                .await?
+        })
     }
 
     common_functions_for_channel!();
@@ -534,22 +543,24 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> ReadEnd<Platform, T>
     /// Read values in the pipe into `buf`, returning the number of elements read.
     ///
     /// See [`new_pipe`] for details on blocking behavior.
-    fn read(&self, buf: &mut [T]) -> Result<usize, PipeError>
+    async fn read(&self, buf: &mut [T]) -> Result<usize, PipeError>
     where
         T: Copy,
     {
         Ok(if self.get_status().contains(OFlags::NONBLOCK) {
-            self.try_read(buf)
+            self.try_read(buf)?
         } else {
-            self.endpoint.pollee.wait_or_timeout(
-                None,
-                || self.try_read(buf),
-                || {
-                    self.check_io_events()
-                        .intersects(Events::IN | Events::ALWAYS_POLLED)
-                },
-            )
-        }?)
+            self.endpoint
+                .pollee
+                .wait(
+                    || self.try_read(buf),
+                    || {
+                        self.check_io_events()
+                            .intersects(Events::IN | Events::ALWAYS_POLLED)
+                    },
+                )
+                .await?
+        })
     }
 
     common_functions_for_channel!();
@@ -622,88 +633,96 @@ mod tests {
     #[test]
     fn test_blocking_channel() {
         let platform = crate::platform::mock::MockPlatform::new();
-        let litebox = crate::LiteBox::new(platform);
-        let pipes = &super::Pipes::new(&litebox);
+        let litebox = &crate::LiteBox::new(platform);
+        let pipes = &super::Pipes::new(litebox);
 
         let (prod, cons) = pipes.create_pipe(2, super::Flags::empty(), None);
 
         std::thread::scope(|scope| {
             scope.spawn(move || {
-                let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-                let mut i = 0;
-                while i < data.len() {
-                    let ret = pipes.write(&prod, &data[i..]).unwrap();
-                    i += ret;
-                }
-                pipes.close(&prod).unwrap();
-                assert_eq!(i, data.len());
+                litebox.sync().new_executor().run(async {
+                    let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+                    let mut i = 0;
+                    while i < data.len() {
+                        let ret = pipes.write(&prod, &data[i..]).await.unwrap();
+                        i += ret;
+                    }
+                    pipes.close(&prod).unwrap();
+                    assert_eq!(i, data.len());
+                })
             });
 
-            let mut buf = [0; 10];
-            let mut i = 0;
-            loop {
-                let ret = pipes.read(&cons, &mut buf[i..]).unwrap();
-                if ret == 0 {
-                    pipes.close(&cons).unwrap();
-                    break;
+            litebox.sync().new_executor().run(async {
+                let mut buf = [0; 10];
+                let mut i = 0;
+                loop {
+                    let ret = pipes.read(&cons, &mut buf[i..]).await.unwrap();
+                    if ret == 0 {
+                        pipes.close(&cons).unwrap();
+                        break;
+                    }
+                    i += ret;
                 }
-                i += ret;
-            }
-            assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+                assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+            });
         });
     }
 
     #[test]
     fn test_nonblocking_channel() {
         let platform = crate::platform::mock::MockPlatform::new();
-        let litebox = crate::LiteBox::new(platform);
-        let pipes = &super::Pipes::new(&litebox);
+        let litebox = &crate::LiteBox::new(platform);
+        let pipes = &super::Pipes::new(litebox);
 
         let (prod, cons) = pipes.create_pipe(2, super::Flags::NON_BLOCKING, None);
 
         std::thread::scope(|scope| {
             scope.spawn(move || {
-                let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+                litebox.sync().new_executor().run(async {
+                    let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+                    let mut i = 0;
+                    while i < data.len() {
+                        match pipes.write(&prod, &data[i..]).await {
+                            Ok(n) => {
+                                i += n;
+                            }
+                            Err(WriteError::WouldBlock) => {
+                                // busy wait
+                                // TODO: use poll rather than busy wait
+                            }
+                            Err(e) => {
+                                panic!("Error writing to channel: {:?}", e);
+                            }
+                        }
+                    }
+                    pipes.close(&prod).unwrap();
+                    assert_eq!(i, data.len());
+                })
+            });
+
+            litebox.sync().new_executor().run(async {
+                let mut buf = [0; 10];
                 let mut i = 0;
-                while i < data.len() {
-                    match pipes.write(&prod, &data[i..]) {
+                loop {
+                    match pipes.read(&cons, &mut buf[i..]).await {
                         Ok(n) => {
+                            if n == 0 {
+                                break;
+                            }
                             i += n;
                         }
-                        Err(WriteError::WouldBlock) => {
+                        Err(ReadError::WouldBlock) => {
                             // busy wait
                             // TODO: use poll rather than busy wait
                         }
                         Err(e) => {
-                            panic!("Error writing to channel: {:?}", e);
+                            panic!("Error reading from channel: {:?}", e);
                         }
                     }
                 }
-                pipes.close(&prod).unwrap();
-                assert_eq!(i, data.len());
+                pipes.close(&cons).unwrap();
+                assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
             });
-
-            let mut buf = [0; 10];
-            let mut i = 0;
-            loop {
-                match pipes.read(&cons, &mut buf[i..]) {
-                    Ok(n) => {
-                        if n == 0 {
-                            break;
-                        }
-                        i += n;
-                    }
-                    Err(ReadError::WouldBlock) => {
-                        // busy wait
-                        // TODO: use poll rather than busy wait
-                    }
-                    Err(e) => {
-                        panic!("Error reading from channel: {:?}", e);
-                    }
-                }
-            }
-            pipes.close(&cons).unwrap();
-            assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         });
     }
 }

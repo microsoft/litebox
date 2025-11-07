@@ -49,16 +49,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         Ok(res)
     }
 
-    pub(crate) fn read(&self) -> Result<u64, Errno> {
+    pub(crate) async fn read(&self) -> Result<u64, Errno> {
         Ok(if self.get_status().contains(OFlags::NONBLOCK) {
-            self.try_read()
+            self.try_read()?
         } else {
-            self.pollee.wait_or_timeout(
-                None,
-                || self.try_read(),
-                || self.check_io_events().contains(Events::IN),
-            )
-        }?)
+            self.pollee
+                .wait(
+                    || self.try_read(),
+                    || self.check_io_events().contains(Events::IN),
+                )
+                .await?
+        })
     }
 
     fn try_write(&self, value: u64) -> Result<usize, TryOpError<Errno>> {
@@ -77,16 +78,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         Err(TryOpError::TryAgain)
     }
 
-    pub(crate) fn write(&self, value: u64) -> Result<usize, Errno> {
+    pub(crate) async fn write(&self, value: u64) -> Result<usize, Errno> {
         Ok(if self.get_status().contains(OFlags::NONBLOCK) {
-            self.try_write(value)
+            self.try_write(value)?
         } else {
-            self.pollee.wait_or_timeout(
-                None,
-                || self.try_write(value),
-                || self.check_io_events().contains(Events::OUT),
-            )
-        }?)
+            self.pollee
+                .wait(
+                    || self.try_write(value),
+                    || self.check_io_events().contains(Events::OUT),
+                )
+                .await?
+        })
     }
 
     crate::syscalls::common_functions_for_file_status!();
@@ -118,11 +120,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFil
 mod tests {
     use litebox_common_linux::{EfdFlags, errno::Errno};
 
+    use crate::litebox;
+
     extern crate std;
 
     #[test]
     fn test_semaphore_eventfd() {
-        let _task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform(None);
 
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,
@@ -133,17 +137,22 @@ mod tests {
         for _ in 0..total {
             let copied_eventfd = eventfd.clone();
             std::thread::spawn(move || {
-                copied_eventfd.read().unwrap();
+                litebox().sync().new_executor().run(async {
+                    copied_eventfd.read().await.unwrap();
+                });
             });
         }
 
         std::thread::sleep(core::time::Duration::from_millis(500));
-        eventfd.write(total).unwrap();
+        task.block_on(async {
+            eventfd.write(total).await.unwrap();
+        })
+        .unwrap();
     }
 
     #[test]
     fn test_blocking_eventfd() {
-        let _task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform(None);
 
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,
@@ -152,23 +161,28 @@ mod tests {
         ));
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
-            copied_eventfd.write(1).unwrap();
-            // block until the first read finishes
-            copied_eventfd.write(u64::MAX - 1).unwrap();
+            litebox().sync().new_executor().run(async {
+                copied_eventfd.write(1).await.unwrap();
+                // block until the first read finishes
+                copied_eventfd.write(u64::MAX - 1).await.unwrap();
+            })
         });
 
-        // block until the first write
-        let ret = eventfd.read().unwrap();
-        assert_eq!(ret, 1);
+        task.block_on(async {
+            // block until the first write
+            let ret = eventfd.read().await.unwrap();
+            assert_eq!(ret, 1);
 
-        // block until the second write
-        let ret = eventfd.read().unwrap();
-        assert_eq!(ret, u64::MAX - 1);
+            // block until the second write
+            let ret = eventfd.read().await.unwrap();
+            assert_eq!(ret, u64::MAX - 1);
+        })
+        .unwrap();
     }
 
     #[test]
     fn test_blocking_eventfd_no_race_on_massive_readwrite() {
-        let _task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform(None);
 
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,
@@ -177,20 +191,25 @@ mod tests {
         ));
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
-            for _ in 0..10000 {
-                copied_eventfd.write(u64::MAX - 1).unwrap();
-            }
+            litebox().sync().new_executor().run(async {
+                for _ in 0..10000 {
+                    copied_eventfd.write(u64::MAX - 1).await.unwrap();
+                }
+            });
         });
 
-        for _ in 0..10000 {
-            let ret = eventfd.read().unwrap();
-            assert_eq!(ret, u64::MAX - 1);
-        }
+        task.block_on(async {
+            for _ in 0..10000 {
+                let ret = eventfd.read().await.unwrap();
+                assert_eq!(ret, u64::MAX - 1);
+            }
+        })
+        .unwrap();
     }
 
     #[test]
     fn test_nonblocking_eventfd() {
-        let _task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform(None);
 
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,
@@ -199,19 +218,21 @@ mod tests {
         ));
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
-            // first write should succeed immediately
-            copied_eventfd.write(1).unwrap();
-            // block until the first read finishes
-            while let Err(e) = copied_eventfd.write(u64::MAX - 1) {
-                assert_eq!(e, Errno::EAGAIN, "Unexpected error: {e:?}");
-                core::hint::spin_loop();
-            }
+            litebox().sync().new_executor().run(async {
+                // first write should succeed immediately
+                copied_eventfd.write(1).await.unwrap();
+                // block until the first read finishes
+                while let Err(e) = copied_eventfd.write(u64::MAX - 1).await {
+                    assert_eq!(e, Errno::EAGAIN, "Unexpected error: {e:?}");
+                    core::hint::spin_loop();
+                }
+            })
         });
 
         let read = |eventfd: &super::EventFile<litebox_platform_multiplex::Platform>,
                     expected_value: u64| {
             loop {
-                match eventfd.read() {
+                match task.block_on(eventfd.read()).unwrap() {
                     Ok(ret) => {
                         assert_eq!(ret, expected_value);
                         break;

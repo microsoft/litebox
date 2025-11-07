@@ -458,7 +458,6 @@ where
     fn from(value: litebox::event::polling::TryOpError<E>) -> Self {
         match value {
             litebox::event::polling::TryOpError::TryAgain => Errno::EAGAIN,
-            litebox::event::polling::TryOpError::TimedOut => Errno::ETIMEDOUT,
             litebox::event::polling::TryOpError::Other(e) => e.into(),
         }
     }
