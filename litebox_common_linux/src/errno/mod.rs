@@ -380,6 +380,16 @@ impl From<litebox::net::errors::LocalAddrError> for Errno {
     }
 }
 
+impl From<litebox::net::errors::RemoteAddrError> for Errno {
+    fn from(value: litebox::net::errors::RemoteAddrError) -> Self {
+        match value {
+            litebox::net::errors::RemoteAddrError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::RemoteAddrError::NotConnected => Errno::ENOTCONN,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::net::errors::ListenError> for Errno {
     fn from(value: litebox::net::errors::ListenError) -> Self {
         match value {

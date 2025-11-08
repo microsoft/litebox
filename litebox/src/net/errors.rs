@@ -50,6 +50,16 @@ pub enum LocalAddrError {
     InvalidFd,
 }
 
+/// Possible errors from [`Network::get_remote_addr`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum RemoteAddrError {
+    #[error("Not a valid open file descriptor")]
+    InvalidFd,
+    #[error("Socket is not connected")]
+    NotConnected,
+}
+
 /// Possible errors from [`Network::bind`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
