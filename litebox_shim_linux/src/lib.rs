@@ -799,6 +799,9 @@ impl Task {
                 .map(|addr| syscalls::net::read_sockaddr_from_user(addr, addrlen as usize))
                 .transpose()
                 .and_then(|sockaddr| self.sys_sendto(sockfd, buf, len, flags, sockaddr)),
+            SyscallRequest::Sendmsg { sockfd, msg, flags } => unsafe { msg.read_at_offset(0) }
+                .ok_or(Errno::EFAULT)
+                .and_then(|msg| self.sys_sendmsg(sockfd, &msg, flags)),
             SyscallRequest::Recvfrom {
                 sockfd,
                 buf,

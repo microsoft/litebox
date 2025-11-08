@@ -420,7 +420,7 @@ impl From<litebox::net::errors::SendError> for Errno {
     fn from(value: litebox::net::errors::SendError) -> Self {
         match value {
             litebox::net::errors::SendError::InvalidFd => Errno::EBADF,
-            litebox::net::errors::SendError::SocketInInvalidState => Errno::ENOTCONN,
+            litebox::net::errors::SendError::SocketInInvalidState => Errno::EPIPE,
             litebox::net::errors::SendError::Unaddressable => Errno::EDESTADDRREQ,
             litebox::net::errors::SendError::BufferFull => Errno::EAGAIN,
             litebox::net::errors::SendError::PortAllocationFailure(e) => e.into(),
