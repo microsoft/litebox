@@ -424,7 +424,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             .insert(metadata)
     }
 
-    /// Store arbitrary metdata into a file descriptor.
+    /// Store arbitrary metadata into a file descriptor.
     ///
     /// Such metadata is specific to the current fd and is NOT shared with other open fds to the
     /// same entry. See the similar [`Self::set_entry_metadata`] which aliases metadata over all fds

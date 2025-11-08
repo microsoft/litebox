@@ -87,7 +87,7 @@ impl UserStack {
 
     /// Push `bytes` to the stack.
     ///
-    /// Returns `None` if stack has no enough space.
+    /// Returns `None` if the stack has insufficient space.
     fn push_bytes(&mut self, bytes: &[u8]) -> Option<()> {
         let _end = isize::try_from(self.pos).ok()?;
         self.pos = self.pos.checked_sub(bytes.len())?;
@@ -97,14 +97,14 @@ impl UserStack {
 
     /// Push a value to the stack.
     ///
-    /// Returns `None` if stack has no enough space.
+    /// Returns `None` if the stack has insufficient space.
     fn push_usize(&mut self, val: usize) -> Option<()> {
         self.push_bytes(&val.to_le_bytes())
     }
 
     /// Push a string with a null terminator to the stack.
     ///
-    /// Returns `None` if stack has no enough space.
+    /// Returns `None` if the stack has insufficient space.
     fn push_cstring(&mut self, val: &CString) -> Option<()> {
         let bytes = val.as_bytes_with_nul();
         self.push_bytes(bytes)
@@ -113,7 +113,7 @@ impl UserStack {
     /// Push a vector of strings with null terminators to the stack.
     ///
     /// Returns the offsets of the strings in the stack.
-    /// Returns `None` if stack has no enough space.
+    /// Returns `None` if the stack has insufficient space.
     fn push_cstrings(&mut self, vals: &[CString]) -> Option<Vec<usize>> {
         let mut envp = Vec::with_capacity(vals.len());
         for val in vals {
@@ -127,7 +127,7 @@ impl UserStack {
     ///
     /// `offsets` are the offsets of the pointers in the stack.
     ///
-    /// Returns `None` if stack has no enough space.
+    /// Returns `None` if the stack has insufficient space.
     fn push_pointers(&mut self, offsets: Vec<usize>) -> Option<()> {
         // write end marker
         self.push_usize(0)?;
@@ -141,9 +141,9 @@ impl UserStack {
         Some(())
     }
 
-    /// Push a auxiliary vector to the stack.
+    /// Push an auxiliary vector to the stack.
     ///
-    /// Returns `None` if stack has no enough space.
+    /// Returns `None` if the stack has insufficient space.
     fn push_aux(&mut self, aux: AuxVec) -> Option<()> {
         // write end marker
         self.push_usize(0)?;

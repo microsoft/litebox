@@ -222,12 +222,12 @@ pub trait RawMutex: Send + Sync {
     /// If the underlying value is `val`, block until a wake operation wakes us up.
     ///
     /// Importantly, a wake operation does NOT guarantee that the underlying value has changed; it
-    /// only means that a wake operation has occured. However, an [`ImmediatelyWokenUp`] means that
+    /// only means that a wake operation has occurred. However, an [`ImmediatelyWokenUp`] means that
     /// the value had changed _before_ it went to sleep.
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp>;
 
     /// If the underlying value is `val`, block until a wake operation wakes us up, or some `time`
-    /// has passed without a wake operation having occured.
+    /// has passed without a wake operation having occurred.
     ///
     /// See comment on [`Self::block`] for more details on underlying value.
     fn block_or_timeout(
@@ -284,9 +284,9 @@ pub enum ReceiveError {
 pub trait TimeProvider {
     type Instant: Instant;
     type SystemTime: SystemTime;
-    /// Returns an instant coresponding to "now".
+    /// Returns an instant corresponding to "now".
     fn now(&self) -> Self::Instant;
-    /// Returns the the current system time.
+    /// Returns the current system time.
     fn current_time(&self) -> Self::SystemTime;
 }
 
@@ -339,7 +339,7 @@ pub trait DebugLogProvider {
 ///
 /// Essentially, these types indicate "user" pointers (which are allowed to be null). Platforms with
 /// no meaningful user-kernel separation can use [`trivial_providers::TransparentConstPtr`] and
-/// [`trivial_providers::TransparentMutPtr`]. Platforms with meaningful user-kernal separation
+/// [`trivial_providers::TransparentMutPtr`]. Platforms with meaningful user-kernel separation
 /// should define their own `repr(C)` newtype wrappers that perform relevant copying between user
 /// and kernel.
 pub trait RawPointerProvider {
