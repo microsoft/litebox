@@ -854,14 +854,6 @@ impl litebox::platform::Instant for Instant {
     }
 }
 
-impl From<litebox_common_linux::Timespec> for Instant {
-    fn from(value: litebox_common_linux::Timespec) -> Self {
-        Instant {
-            inner: value.into(),
-        }
-    }
-}
-
 pub struct SystemTime {
     // 100ns intervals since Windows epoch
     filetime: u64,
