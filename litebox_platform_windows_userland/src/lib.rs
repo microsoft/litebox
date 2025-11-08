@@ -28,11 +28,10 @@ use windows_sys::Win32::{
     System::Memory::{
         self as Win32_Memory, PrefetchVirtualMemory, VirtualAlloc2, VirtualFree, VirtualProtect,
     },
-    System::SystemInformation::{self as Win32_SysInfo, GetSystemTimeAsFileTime},
+    System::SystemInformation::{self as Win32_SysInfo, GetSystemTimePreciseAsFileTime},
     System::Threading::{self as Win32_Threading, GetCurrentProcess},
+    System::WindowsProgramming::QueryUnbiasedInterruptTimePrecise,
 };
-
-mod perf_counter;
 
 extern crate alloc;
 
@@ -816,7 +815,9 @@ impl litebox::platform::TimeProvider for WindowsUserland {
     type SystemTime = SystemTime;
 
     fn now(&self) -> Self::Instant {
-        perf_counter::PerformanceCounterInstant::now().into()
+        let mut ts = 0;
+        unsafe { QueryUnbiasedInterruptTimePrecise(&raw mut ts) };
+        Instant(ts)
     }
 
     fn current_time(&self) -> Self::SystemTime {
@@ -825,7 +826,7 @@ impl litebox::platform::TimeProvider for WindowsUserland {
             dwHighDateTime: 0,
         };
         unsafe {
-            GetSystemTimeAsFileTime(&raw mut filetime);
+            GetSystemTimePreciseAsFileTime(&raw mut filetime);
         }
         let FILETIME {
             dwLowDateTime: low,
@@ -836,29 +837,15 @@ impl litebox::platform::TimeProvider for WindowsUserland {
     }
 }
 
-pub struct Instant {
-    inner: core::time::Duration,
-}
+/// 100ns units returned by `QueryUnbiasedInterruptTimePrecise`.
+pub struct Instant(u64);
 
 impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
-        // On windows there's a threshold below which we consider two timestamps
-        // equivalent due to measurement error. For more details + doc link,
-        // check the docs on [epsilon](perf_counter::PerformanceCounterInstant::epsilon).
-        let epsilon = perf_counter::PerformanceCounterInstant::epsilon();
-        if earlier.inner > self.inner && earlier.inner - self.inner <= epsilon {
-            Some(Duration::new(0, 0))
-        } else {
-            self.inner.checked_sub(earlier.inner)
-        }
-    }
-}
-
-impl From<litebox_common_linux::Timespec> for Instant {
-    fn from(value: litebox_common_linux::Timespec) -> Self {
-        Instant {
-            inner: value.into(),
-        }
+        let diff = self.0.checked_sub(earlier.0)?;
+        // Convert from 100ns intervals to nanoseconds. This won't overflow in
+        // our lifetimes.
+        Some(Duration::from_nanos(diff * 100))
     }
 }
 
