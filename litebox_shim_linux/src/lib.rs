@@ -1322,6 +1322,10 @@ enum WaitError {
 }
 
 impl Task {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "interruptions are not implemented yet"
+    )]
     fn block_on<Fut>(&self, fut: Fut) -> Result<Fut::Output, Interrupted>
     where
         Fut: core::future::Future,

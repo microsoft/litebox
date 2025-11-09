@@ -542,7 +542,7 @@ impl PollSet {
             register = false;
             Poll::Pending
         })
-        .await
+        .await;
     }
 
     /// Returns the accumulated `revents` for each entry in the poll set.
