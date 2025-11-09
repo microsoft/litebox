@@ -97,7 +97,7 @@ impl SnpLinuxKernel {
     ) -> litebox_common_linux::TaskParams {
         litebox_common_linux::TaskParams {
             pid: boot_params.pid,
-            tid: boot_params.tid,
+            tid: boot_params.pid,
             ppid: boot_params.ppid,
             uid: boot_params.uid,
             gid: boot_params.gid,
@@ -211,7 +211,6 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
 
     fn current_thread(&self) -> Self::ThreadHandle {
         // TODO
-        ()
     }
 
     fn interrupt_thread(&self, &(): &Self::ThreadHandle) {
