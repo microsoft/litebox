@@ -24,6 +24,10 @@ pub trait EnterShim: Send + Sync {
     /// FUTURE: use a single per-LiteBox type for all shims and platforms.
     type ContinueOperation;
 
+    /// Initialize a new thread. Must be called by the platform exactly once
+    /// before running the thread in the guest for the first time.
+    fn init(&self, ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation;
+
     /// Handle a syscall.
     ///
     /// The platform should call this in response to `syscall` on x86_64 and
@@ -38,6 +42,10 @@ pub trait EnterShim: Send + Sync {
         ctx: &mut Self::ExecutionContext,
         info: &ExceptionInfo,
     ) -> Self::ContinueOperation;
+
+    /// Handle an interrupt signaled by
+    /// [`ThreadProvider::interrupt_thread`](crate::platform::ThreadProvider::interrupt_thread).
+    fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation;
 }
 
 /// Information about a hardware exception.

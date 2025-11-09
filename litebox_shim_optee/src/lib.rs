@@ -88,6 +88,10 @@ impl litebox::shim::EnterShim for OpteeShim {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ContinueOperation = ContinueOperation;
 
+    fn init(&self, _ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation {
+        ContinueOperation::ResumeGuest
+    }
+
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation {
         handle_syscall_request(ctx)
     }
@@ -98,6 +102,10 @@ impl litebox::shim::EnterShim for OpteeShim {
         _info: &litebox::shim::ExceptionInfo,
     ) -> Self::ContinueOperation {
         todo!("terminate the optee process on exception")
+    }
+
+    fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation {
+        ContinueOperation::ResumeGuest
     }
 }
 

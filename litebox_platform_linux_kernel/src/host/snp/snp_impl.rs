@@ -97,7 +97,7 @@ impl SnpLinuxKernel {
     ) -> litebox_common_linux::TaskParams {
         litebox_common_linux::TaskParams {
             pid: boot_params.pid,
-            tid: boot_params.pid,
+            tid: boot_params.tid,
             ppid: boot_params.ppid,
             uid: boot_params.uid,
             gid: boot_params.gid,
@@ -181,6 +181,7 @@ extern "C" fn thread_start(
 impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
+    type ThreadHandle = ();
 
     unsafe fn spawn_thread(
         &self,
@@ -206,6 +207,15 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
             args: [thread_start_arg_ptr as u64, flags.bits()],
         })?;
         Ok(())
+    }
+
+    fn current_thread(&self) -> Self::ThreadHandle {
+        // TODO
+        ()
+    }
+
+    fn interrupt_thread(&self, &(): &Self::ThreadHandle) {
+        // TODO
     }
 }
 

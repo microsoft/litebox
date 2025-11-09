@@ -52,6 +52,7 @@ impl_truncate! { i128, i64 }
 impl_truncate! { i128, i32 }
 impl_truncate! { i128, i16 }
 impl_truncate! { i128, i8 }
+impl_truncate! { i64, isize }
 impl_truncate! { i64, i32 }
 impl_truncate! { i64, i16 }
 impl_truncate! { i64, i8 }
@@ -62,6 +63,7 @@ impl_truncate! { i16, i8 }
 impl_truncate! { usize, usize }
 impl_truncate! { u64, u64 }
 impl_truncate! { u32, u32 }
+impl_truncate! { isize, isize }
 impl_truncate! { i64, i64 }
 impl_truncate! { i32, i32 }
 
@@ -104,3 +106,20 @@ impl_reinterpret! { u64, i64 }
 impl_reinterpret! { u32, i32 }
 impl_reinterpret! { u16, i16 }
 impl_reinterpret! { u8, i8 }
+
+/// An object that will run a closure when it goes out of scope.
+pub struct Defer<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
+/// Returns an object that will run `f` when it goes out of scope.
+#[must_use]
+pub fn defer(f: impl FnOnce()) -> Defer<impl FnOnce()> {
+    Defer(Some(f))
+}

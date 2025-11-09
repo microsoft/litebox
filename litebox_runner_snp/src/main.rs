@@ -149,6 +149,10 @@ pub extern "C" fn sandbox_process_init(
             );
         }
     };
+    assert!(matches!(
+        shim.entrypoints().init(pt_regs),
+        ContinueOperation::ResumeGuest
+    ));
 }
 
 #[unsafe(no_mangle)]
