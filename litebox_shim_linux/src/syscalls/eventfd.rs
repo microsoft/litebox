@@ -165,7 +165,7 @@ mod tests {
                 copied_eventfd.write(1).await.unwrap();
                 // block until the first read finishes
                 copied_eventfd.write(u64::MAX - 1).await.unwrap();
-            })
+            });
         });
 
         task.block_on(async {
@@ -226,7 +226,7 @@ mod tests {
                     assert_eq!(e, Errno::EAGAIN, "Unexpected error: {e:?}");
                     core::hint::spin_loop();
                 }
-            })
+            });
         });
 
         let read = |eventfd: &super::EventFile<litebox_platform_multiplex::Platform>,

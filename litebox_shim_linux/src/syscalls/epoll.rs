@@ -610,7 +610,7 @@ mod test {
         std::thread::spawn(move || {
             litebox().sync().new_executor().run(async {
                 copied_eventfd.write(1).await.unwrap();
-            })
+            });
         });
         litebox().sync().new_executor().run(async {
             epoll.wait(1024).await;
@@ -646,7 +646,7 @@ mod test {
                         .unwrap(),
                     2
                 );
-            })
+            });
         });
         litebox().sync().new_executor().run(async {
             epoll.wait(1024).await;
