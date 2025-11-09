@@ -80,9 +80,15 @@ impl From<SocketAddrV4> for CSockInetAddr {
 /// Socket address structure for different address families.
 /// Currently only supports IPv4 (AF_INET).
 #[non_exhaustive]
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug)]
 pub(crate) enum SocketAddress {
     Inet(SocketAddr),
+}
+
+impl Default for SocketAddress {
+    fn default() -> Self {
+        SocketAddress::Inet(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
+    }
 }
 
 #[derive(Default)]
@@ -382,17 +388,17 @@ fn getsockopt(
     Ok(())
 }
 
-fn try_accept(fd: &SocketFd) -> Result<SocketFd, Errno> {
-    litebox_net().lock().accept(fd).map_err(Errno::from)
+fn try_accept(fd: &SocketFd, peer: Option<&mut SocketAddr>) -> Result<SocketFd, Errno> {
+    litebox_net().lock().accept(fd, peer).map_err(Errno::from)
 }
 
-fn accept(fd: &SocketFd) -> Result<SocketFd, Errno> {
+fn accept(fd: &SocketFd, mut peer: Option<&mut SocketAddr>) -> Result<SocketFd, Errno> {
     if get_status(fd).contains(OFlags::NONBLOCK) {
-        try_accept(fd)
+        try_accept(fd, peer)
     } else {
         // TODO: use `poll` instead of busy wait
         loop {
-            match try_accept(fd) {
+            match try_accept(fd, peer.as_deref_mut()) {
                 Err(Errno::EAGAIN) => {}
                 ret => return ret,
             }
@@ -670,14 +676,9 @@ impl Task {
     pub(crate) fn sys_accept(
         &self,
         sockfd: i32,
-        addr: Option<MutPtr<u8>>,
-        addrlen: Option<MutPtr<u32>>,
+        peer: Option<&mut SocketAddress>,
         flags: SockFlags,
     ) -> Result<u32, Errno> {
-        if addr.is_some() || addrlen.is_some() {
-            todo!("accept with addr");
-        }
-
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
@@ -690,10 +691,20 @@ impl Task {
                 files.with_socket_fd(*raw_fd, |fd| {
                     drop(file_table); // Drop before possibly-blocking `accept`
                     let sock_type = get_socket_type(fd)?;
-                    let fd = accept(fd)?;
-                    initialize_socket(&fd, sock_type, flags);
+                    let mut socket_addr = peer
+                        .is_some()
+                        .then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
+                    let accepted_fd = accept(fd, socket_addr.as_mut())?;
+                    if let (Some(peer), Some(socket_addr)) = (peer, socket_addr) {
+                        *peer = SocketAddress::Inet(socket_addr);
+                    }
+
+                    initialize_socket(&accepted_fd, sock_type, flags);
                     Ok(Descriptor::LiteBoxRawFd(
-                        files.raw_descriptor_store.write().fd_into_raw_integer(fd),
+                        files
+                            .raw_descriptor_store
+                            .write()
+                            .fd_into_raw_integer(accepted_fd),
                     ))
                 })?
             }
@@ -897,7 +908,7 @@ impl Task {
     }
 
     /// Handle syscall `getsockname`
-    pub(crate) fn sys_getsockname(&self, sockfd: i32) -> Result<SocketAddr, Errno> {
+    pub(crate) fn sys_getsockname(&self, sockfd: i32) -> Result<SocketAddress, Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
@@ -910,7 +921,35 @@ impl Task {
             .ok_or(Errno::EBADF)?
         {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-                litebox_net().lock().get_local_addr(fd).map_err(Errno::from)
+                litebox_net()
+                    .lock()
+                    .get_local_addr(fd)
+                    .map(SocketAddress::Inet)
+                    .map_err(Errno::from)
+            }),
+            _ => Err(Errno::ENOTSOCK),
+        }
+    }
+
+    /// Handle syscall `getpeername`
+    pub(crate) fn sys_getpeername(&self, sockfd: i32) -> Result<SocketAddress, Errno> {
+        let Ok(sockfd) = u32::try_from(sockfd) else {
+            return Err(Errno::EBADF);
+        };
+
+        let files = self.files.borrow();
+        match files
+            .file_descriptors
+            .read()
+            .get_fd(sockfd)
+            .ok_or(Errno::EBADF)?
+        {
+            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
+                litebox_net()
+                    .lock()
+                    .get_remote_addr(fd)
+                    .map(SocketAddress::Inet)
+                    .map_err(Errno::from)
             }),
             _ => Err(Errno::ENOTSOCK),
         }
@@ -998,11 +1037,11 @@ mod tests {
             )
             .unwrap();
         let server = i32::try_from(server).unwrap();
-        let sockaddr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+        let server_sockaddr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
             core::net::Ipv4Addr::from(ip),
             port,
         )));
-        task.sys_bind(server, sockaddr)
+        task.sys_bind(server, server_sockaddr.clone())
             .expect("Failed to bind socket");
         task.sys_listen(server, 1)
             .expect("Failed to listen on socket");
@@ -1049,11 +1088,11 @@ mod tests {
             }
         }
 
+        let mut remote_addr = super::SocketAddress::default();
         let client_fd = task
             .sys_accept(
                 server,
-                None,
-                None,
+                Some(&mut remote_addr),
                 if is_nonblocking {
                     SockFlags::NONBLOCK
                 } else {
@@ -1062,6 +1101,14 @@ mod tests {
             )
             .expect("Failed to accept connection");
         let client_fd = i32::try_from(client_fd).unwrap();
+        assert_eq!(server_sockaddr, task.sys_getsockname(client_fd).unwrap());
+        assert_eq!(remote_addr, task.sys_getpeername(client_fd).unwrap());
+        let super::SocketAddress::Inet(SocketAddr::V4(remote_addr)) = remote_addr else {
+            panic!("Expected IPv4 address");
+        };
+        assert_eq!(remote_addr.ip().octets(), [10, 0, 0, 1]);
+        assert_ne!(remote_addr.port(), 0);
+
         match option {
             "sendto" => {
                 let ptr = ConstPtr::from_usize(buf.as_ptr().expose_provenance());
@@ -1178,6 +1225,10 @@ mod tests {
         )));
         task.sys_bind(server_fd, server_addr.clone())
             .expect("failed to bind server");
+        assert_eq!(
+            server_addr,
+            task.sys_getsockname(server_fd).expect("getsockname failed")
+        );
 
         // Create an epoll instance and register the server fd for EPOLLIN
         let epfd = task
@@ -1307,7 +1358,8 @@ mod tests {
         .expect("failed to sendto");
 
         // Client implicitly bound to an ephemeral port via sendto
-        let client_addr = task.sys_getsockname(client_fd).expect("getsockname failed");
+        let SocketAddress::Inet(client_addr) =
+            task.sys_getsockname(client_fd).expect("getsockname failed");
         assert_ne!(client_addr.port(), 0);
 
         // Client connects to server address

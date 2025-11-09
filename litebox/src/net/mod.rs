@@ -21,7 +21,7 @@ mod tests;
 
 use errors::{
     AcceptError, BindError, CloseError, ConnectError, ListenError, LocalAddrError, ReceiveError,
-    SendError, SocketError,
+    RemoteAddrError, SendError, SocketError,
 };
 use local_ports::{LocalPort, LocalPortAllocator};
 
@@ -849,7 +849,17 @@ where
         let socket_handle = &mut table_entry.entry;
 
         match socket_handle.protocol() {
-            Protocol::Tcp => unimplemented!(),
+            Protocol::Tcp => {
+                let socket: &tcp::Socket = self.socket_set.get(socket_handle.handle);
+                match socket.local_endpoint() {
+                    Some(endpoint) => match endpoint.addr {
+                        smoltcp::wire::IpAddress::Ipv4(ipv4) => {
+                            Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, endpoint.port)))
+                        }
+                    },
+                    None => Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))),
+                }
+            }
             Protocol::Udp => {
                 let socket: &udp::Socket = self.socket_set.get(socket_handle.handle);
                 let local_endpoint = socket.endpoint();
@@ -865,6 +875,41 @@ where
             }
             Protocol::Icmp => unimplemented!(),
             Protocol::Raw { protocol: _ } => unimplemented!(),
+        }
+    }
+
+    /// Get the remote address and port a socket is connected to, if any.
+    pub fn get_remote_addr(&self, fd: &SocketFd<Platform>) -> Result<SocketAddr, RemoteAddrError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(RemoteAddrError::InvalidFd)?;
+        let socket_handle = &mut table_entry.entry;
+        self.get_remote_addr_for_handle(socket_handle)
+    }
+
+    /// Get the remote address and port a `SocketHandle` is connected to, if any.
+    fn get_remote_addr_for_handle(
+        &self,
+        socket_handle: &SocketHandle<Platform>,
+    ) -> Result<SocketAddr, RemoteAddrError> {
+        let endpoint = match socket_handle.protocol() {
+            Protocol::Tcp => self
+                .socket_set
+                .get::<tcp::Socket>(socket_handle.handle)
+                .remote_endpoint()
+                .ok_or(RemoteAddrError::NotConnected)?,
+            Protocol::Udp => socket_handle
+                .udp()
+                .remote_endpoint
+                .ok_or(RemoteAddrError::NotConnected)?,
+            Protocol::Icmp => unimplemented!(),
+            Protocol::Raw { protocol: _ } => unimplemented!(),
+        };
+        match endpoint.addr {
+            smoltcp::wire::IpAddress::Ipv4(ipv4) => {
+                Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, endpoint.port)))
+            }
         }
     }
 
@@ -1029,7 +1074,13 @@ where
     }
 
     /// Accept a new incoming connection on a listening socket.
-    pub fn accept(&mut self, fd: &SocketFd<Platform>) -> Result<SocketFd<Platform>, AcceptError> {
+    ///
+    /// If `peer` is provided, it is filled with the remote address of the accepted connection.
+    pub fn accept(
+        &mut self,
+        fd: &SocketFd<Platform>,
+        peer: Option<&mut SocketAddr>,
+    ) -> Result<SocketFd<Platform>, AcceptError> {
         self.automated_platform_interaction(PollDirection::Both);
         let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table
@@ -1082,7 +1133,7 @@ where
                 // Trigger some automated platform interaction, to keep things flowing
                 self.automated_platform_interaction(PollDirection::Both);
                 // Create a new FD to hand it back out to the user
-                Ok(self.new_socket_fd_for(SocketHandle {
+                let handle = SocketHandle {
                     consider_closed: false,
                     handle: ready_handle,
                     specific: ProtocolSpecific::Tcp(TcpSpecific {
@@ -1093,7 +1144,14 @@ where
                     pollee: crate::event::polling::Pollee::new(&self.litebox),
                     previously_sendable: core::sync::atomic::AtomicBool::new(true),
                     recv_queue: core::sync::atomic::AtomicUsize::new(0),
-                }))
+                };
+                if let Some(peer) = peer {
+                    let Ok(remote_addr) = self.get_remote_addr_for_handle(&handle) else {
+                        unreachable!("a connected TCP socket must have a remote address")
+                    };
+                    *peer = remote_addr;
+                }
+                Ok(self.new_socket_fd_for(handle))
             }
             ProtocolSpecific::Udp(_) => unimplemented!(),
             ProtocolSpecific::Icmp(_) => unimplemented!(),

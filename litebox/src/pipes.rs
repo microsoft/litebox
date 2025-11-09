@@ -43,7 +43,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         }
     }
 
-    /// Create a unidirectional communication channel that sending messages of (slices of) bytes.
+    /// Create a unidirectional communication channel for sending messages of (slices of) bytes.
     ///
     /// This function returns the sender and receiver halves respectively.
     ///
@@ -567,7 +567,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Drop for ReadEnd<Pla
     }
 }
 
-/// Create a unidirectional communication channel that sending messages of (slices of) type `T`.
+/// Create a unidirectional communication channel for sending messages of (slices of) type `T`.
 ///
 /// This function returns the sender and receiver halves.
 ///
