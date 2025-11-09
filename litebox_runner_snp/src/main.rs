@@ -139,6 +139,7 @@ pub extern "C" fn sandbox_process_init(
             globals::SM_TERM_INVALID_PARAM,
         );
     };
+    let entrypoints = shim.entrypoints();
     *pt_regs = match shim.load_program(platform.init_task(boot_params), &program, argv, envp) {
         Ok(regs) => regs,
         Err(err) => {
@@ -150,7 +151,7 @@ pub extern "C" fn sandbox_process_init(
         }
     };
     assert!(matches!(
-        shim.entrypoints().init(pt_regs),
+        entrypoints.init(pt_regs),
         ContinueOperation::ResumeGuest
     ));
 }
