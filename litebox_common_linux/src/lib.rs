@@ -3,6 +3,7 @@
 #![no_std]
 #![allow(non_camel_case_types)]
 
+use core::time::Duration;
 use int_enum::IntEnum;
 use litebox::{
     fs::OFlags,
@@ -721,10 +722,10 @@ impl SocketOptionName {
 cfg_if::cfg_if! {
     if #[cfg(all(target_arch = "x86"))] {
         pub type time_t = i32;
-        pub type suseconds_t = i32;
+        pub type suseconds_t = u32;
     } else if #[cfg(all(target_arch = "x86_64"))] {
         pub type time_t = i64;
-        pub type suseconds_t = i64;
+        pub type suseconds_t = u64;
     } else {
         compile_error!("Unsupported architecture");
     }
@@ -741,54 +742,63 @@ pub struct Timespec {
     pub tv_nsec: u64,
 }
 
-impl Timespec {
-    /// Subtract another `Timespec` from self
-    pub fn sub_timespec(&self, other: &Timespec) -> Result<core::time::Duration, errno::Errno> {
-        if self >= other {
-            let (secs, nsec) = if self.tv_nsec >= other.tv_nsec {
-                (
-                    self.tv_sec
-                        .checked_sub(other.tv_sec)
-                        .ok_or(errno::Errno::EDOM)?,
-                    self.tv_nsec - other.tv_nsec,
-                )
-            } else {
-                (
-                    self.tv_sec
-                        .checked_sub(other.tv_sec + 1)
-                        .ok_or(errno::Errno::EDOM)?,
-                    self.tv_nsec + 1_000_000_000 - other.tv_nsec,
-                )
-            };
+impl TryFrom<Timespec> for Duration {
+    type Error = errno::Errno;
 
-            Ok(core::time::Duration::new(
-                u64::try_from(secs).map_err(|_| errno::Errno::EDOM)?,
-                nsec.truncate(),
-            ))
-        } else {
-            Err(errno::Errno::EINVAL)
+    fn try_from(value: Timespec) -> Result<Self, Self::Error> {
+        // On 32-bit architectures, `tv_nsec` may be defined in user mode as
+        // pointer sized. Ignore any high padding bits.
+        let nsec: usize = value.tv_nsec.truncate();
+        if nsec >= 1_000_000_000 {
+            return Err(errno::Errno::EINVAL);
+        }
+        Ok(Duration::new(
+            u64::try_from(value.tv_sec).map_err(|_| errno::Errno::EINVAL)?,
+            nsec.truncate(),
+        ))
+    }
+}
+
+impl From<Duration> for Timespec {
+    fn from(value: Duration) -> Self {
+        Timespec {
+            tv_sec: value.as_secs().reinterpret_as_signed(),
+            tv_nsec: value.subsec_nanos().into(),
         }
     }
 }
 
-impl From<Timespec> for core::time::Duration {
-    fn from(timespec: Timespec) -> Self {
-        core::time::Duration::new(
-            u64::try_from(timespec.tv_sec).unwrap(),
-            timespec.tv_nsec.truncate(),
-        )
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Timespec32 {
+    pub tv_sec: i32,
+    pub tv_nsec: u32,
+}
+
+impl From<Timespec32> for Timespec {
+    fn from(value: Timespec32) -> Self {
+        Timespec {
+            tv_sec: value.tv_sec.into(),
+            tv_nsec: value.tv_nsec.into(),
+        }
     }
 }
 
-impl TryFrom<core::time::Duration> for Timespec {
-    // Overflow error, indicated just as a unit
-    type Error = ();
+impl TryFrom<Timespec32> for Duration {
+    type Error = errno::Errno;
 
-    fn try_from(duration: core::time::Duration) -> Result<Self, Self::Error> {
-        Ok(Timespec {
-            tv_sec: i64::try_from(duration.as_secs()).or(Err(()))?,
-            tv_nsec: u64::from(duration.subsec_nanos()),
-        })
+    fn try_from(value: Timespec32) -> Result<Self, Self::Error> {
+        Timespec::from(value).try_into()
+    }
+}
+
+impl From<Duration> for Timespec32 {
+    fn from(value: Duration) -> Self {
+        Timespec32 {
+            // Silently truncate if needed, just like Linux would do.
+            tv_sec: value.as_secs().reinterpret_as_signed().truncate(),
+            tv_nsec: value.subsec_nanos(),
+        }
     }
 }
 
@@ -807,46 +817,28 @@ pub struct ItimerVal {
     value: TimeVal,
 }
 
-const MICROS_PER_SEC: i32 = 1_000_000;
-impl TryFrom<TimeVal> for core::time::Duration {
+impl TryFrom<TimeVal> for Duration {
     type Error = errno::Errno;
 
     fn try_from(value: TimeVal) -> Result<Self, Self::Error> {
-        let usec: i32 = value.tv_usec.truncate();
-        if usec >= MICROS_PER_SEC {
-            Err(errno::Errno::EDOM)
-        } else {
-            Ok(core::time::Duration::new(
-                u64::try_from(value.tv_sec).map_err(|_| errno::Errno::EDOM)?,
-                u32::try_from(value.tv_usec * 1000).map_err(|_| errno::Errno::EDOM)?,
-            ))
+        let usec: u32 = value.tv_usec.truncate();
+        if usec >= 1_000_000 {
+            return Err(errno::Errno::EINVAL);
         }
+        Ok(Duration::new(
+            u64::try_from(value.tv_sec).map_err(|_| errno::Errno::EINVAL)?,
+            usec * 1000,
+        ))
     }
 }
 
-impl From<Timespec> for TimeVal {
-    fn from(timespec: Timespec) -> Self {
-        // Convert seconds to time_t
-        let timeval_sec: time_t = timespec.tv_sec.truncate();
-
-        // Convert nanoseconds to microseconds, ensuring we don't overflow suseconds_t
-        let microseconds = timespec.tv_nsec / 1_000;
-        let timeval_u_sec = suseconds_t::try_from(microseconds).unwrap_or(suseconds_t::MAX);
+impl From<Duration> for TimeVal {
+    fn from(value: Duration) -> Self {
         TimeVal {
-            tv_sec: timeval_sec,
-            tv_usec: timeval_u_sec,
-        }
-    }
-}
-
-impl From<core::time::Duration> for TimeVal {
-    fn from(duration: core::time::Duration) -> Self {
-        let timeval_sec: time_t = duration.as_secs().reinterpret_as_signed().truncate();
-        let timeval_u_sec: suseconds_t =
-            suseconds_t::from(duration.subsec_micros().reinterpret_as_signed());
-        TimeVal {
-            tv_sec: timeval_sec,
-            tv_usec: timeval_u_sec,
+            // Silently truncate if needed, just like Linux would do.
+            tv_sec: value.as_secs().reinterpret_as_signed().truncate(),
+            #[cfg_attr(target_pointer_width = "32", expect(clippy::useless_conversion))]
+            tv_usec: value.subsec_micros().into(),
         }
     }
 }
@@ -1660,13 +1652,13 @@ pub enum FutexArgs<Platform: litebox::platform::RawPointerProvider> {
         /// Note: for FUTEX_WAIT, timeout is interpreted as a relative
         /// value. This differs from other futex operations, where
         /// timeout is interpreted as an absolute value.
-        timeout: Option<Platform::RawConstPointer<Timespec>>,
+        timeout: TimeParam<Platform>,
     },
     WaitBitset {
         addr: Platform::RawMutPointer<u32>,
         flags: FutexFlags,
         val: u32,
-        timeout: Option<Platform::RawConstPointer<Timespec>>,
+        timeout: TimeParam<Platform>,
         bitmask: u32,
     },
     Wake {
@@ -2026,31 +2018,19 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     EpollCreate {
         flags: EpollCreateFlags,
     },
-    Poll {
-        fds: Platform::RawMutPointer<Pollfd>,
-        nfds: usize,
-        timeout: i32,
-    },
     Ppoll {
         fds: Platform::RawMutPointer<Pollfd>,
         nfds: usize,
-        timeout: Option<Platform::RawConstPointer<Timespec>>,
+        timeout: TimeParam<Platform>,
         sigmask: Option<Platform::RawConstPointer<SigSet>>,
         sigsetsize: usize,
-    },
-    Select {
-        nfds: u32,
-        readfds: Option<Platform::RawMutPointer<usize>>,
-        writefds: Option<Platform::RawMutPointer<usize>>,
-        exceptfds: Option<Platform::RawMutPointer<usize>>,
-        timeout: Option<Platform::RawMutPointer<TimeVal>>,
     },
     Pselect {
         nfds: u32,
         readfds: Option<Platform::RawMutPointer<usize>>,
         writefds: Option<Platform::RawMutPointer<usize>>,
         exceptfds: Option<Platform::RawMutPointer<usize>>,
-        timeout: Option<Platform::RawConstPointer<Timespec>>,
+        timeout: TimeParam<Platform>,
         sigsetpack: Option<Platform::RawConstPointer<SigSetPack>>,
     },
     ArchPrctl {
@@ -2117,24 +2097,24 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     ClockGettime {
         clockid: i32,
-        tp: Platform::RawMutPointer<Timespec>,
+        tp: TimeParam<Platform>,
     },
     ClockGetres {
         clockid: i32,
-        res: Platform::RawMutPointer<Timespec>,
+        res: TimeParam<Platform>,
     },
     ClockNanosleep {
         clockid: i32,
         flags: TimerFlags,
-        request: Platform::RawConstPointer<Timespec>,
-        remain: Option<Platform::RawMutPointer<Timespec>>,
+        request: TimeParam<Platform>,
+        remain: TimeParam<Platform>,
     },
     Gettimeofday {
-        tv: Platform::RawMutPointer<TimeVal>,
-        tz: Platform::RawMutPointer<TimeZone>,
+        tv: Option<Platform::RawMutPointer<TimeVal>>,
+        tz: Option<Platform::RawMutPointer<TimeZone>>,
     },
     Time {
-        tloc: Platform::RawMutPointer<time_t>,
+        tloc: Option<Platform::RawMutPointer<time_t>>,
     },
     Getrlimit {
         resource: RlimitResource,
@@ -2268,6 +2248,26 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             (@[$id:ident] [ $f:ident : * $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
                 sys_req!(
                     @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: ctx.sys_req_ptr($n), ]
+                )
+            };
+            (@[$id:ident] [ $f:ident : ts64 $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+                sys_req!(
+                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: TimeParam::timespec64(ctx.sys_req_ptr($n)), ]
+                )
+            };
+            (@[$id:ident] [ $f:ident : tv $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+                sys_req!(
+                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: TimeParam::timeval(ctx.sys_req_ptr($n)), ]
+                )
+            };
+            (@[$id:ident] [ $f:ident : ts $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+                sys_req!(
+                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: TimeParam::timespec_old(ctx.sys_req_ptr($n)), ]
+                )
+            };
+            (@[$id:ident] [ $f:ident : millis $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+                sys_req!(
+                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: TimeParam::Milliseconds(ctx.sys_req_arg($n)), ]
                 )
             };
             (@[$id:ident] [ $f:ident : { $e:expr } $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
@@ -2484,29 +2484,35 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 arg: FcntlArg::from(ctx.sys_req_arg(1), ctx.sys_req_arg(2)),
             },
             Sysno::gettimeofday => sys_req!(Gettimeofday { tv:*, tz:* }),
-            #[cfg(target_arch = "x86_64")]
-            Sysno::clock_gettime => sys_req!(ClockGettime { clockid, tp:* }),
+            Sysno::clock_gettime => sys_req!(ClockGettime { clockid, tp: ts }),
             #[cfg(target_arch = "x86")]
-            Sysno::clock_gettime64 => sys_req!(ClockGettime { clockid, tp:* }),
-            #[cfg(target_arch = "x86_64")]
-            Sysno::clock_getres => sys_req!(ClockGetres { clockid, res:* }),
+            Sysno::clock_gettime64 => sys_req!(ClockGettime { clockid, tp: ts64 }),
+            Sysno::clock_getres => sys_req!(ClockGetres { clockid, res: ts }),
             #[cfg(target_arch = "x86")]
-            Sysno::clock_getres_time64 => sys_req!(ClockGetres { clockid, res:* }),
-            #[cfg(target_arch = "x86_64")]
+            Sysno::clock_getres_time64 => sys_req!(ClockGetres { clockid, res: ts64 }),
             Sysno::clock_nanosleep => {
-                sys_req!(ClockNanosleep { clockid, flags, request:*, remain:* })
+                sys_req!(ClockNanosleep {
+                    clockid,
+                    flags,
+                    request: ts,
+                    remain: ts,
+                })
             }
             #[cfg(target_arch = "x86")]
             Sysno::clock_nanosleep_time64 => {
-                sys_req!(ClockNanosleep { clockid, flags, request:*, remain:* })
+                sys_req!(ClockNanosleep {
+                    clockid,
+                    flags,
+                    request: ts64,
+                    remain: ts64,
+                })
             }
-            #[cfg(target_arch = "x86_64")]
-            Sysno::nanosleep => SyscallRequest::ClockNanosleep {
-                clockid: ClockId::Monotonic.into(),
-                flags: TimerFlags::empty(),
-                request: ctx.sys_req_ptr(0),
-                remain: ctx.sys_req_ptr(1),
-            },
+            Sysno::nanosleep => sys_req!(ClockNanosleep {
+                request: ts,
+                remain: ts,
+                clockid: { ClockId::Monotonic.into() },
+                flags: { TimerFlags::empty() },
+            }),
             Sysno::time => sys_req!(Time { tloc:* }),
             Sysno::getcwd => sys_req!(Getcwd { buf:*, size }),
             Sysno::readlink => sys_req!(Readlink { pathname:*, buf:* ,bufsiz }),
@@ -2592,35 +2598,36 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 }
             }
             Sysno::epoll_create1 => sys_req!(EpollCreate { flags }),
-            #[cfg(target_arch = "x86_64")]
             Sysno::ppoll => {
-                sys_req!(Ppoll { fds:*, nfds, timeout:*, sigmask:*, sigsetsize })
+                sys_req!(Ppoll { fds:*, nfds, timeout:ts, sigmask:*, sigsetsize })
             }
             #[cfg(target_arch = "x86")]
             Sysno::ppoll_time64 => {
-                sys_req!(Ppoll { fds:*, nfds, timeout:*, sigmask:*, sigsetsize })
+                sys_req!(Ppoll { fds:*, nfds, timeout:ts64, sigmask:*, sigsetsize })
             }
             Sysno::poll => {
-                sys_req!(Poll { fds:*, nfds, timeout })
+                sys_req!(Ppoll { fds:*, nfds, timeout:millis, sigmask: { None }, sigsetsize: { 0 } })
             }
             #[cfg(target_arch = "x86_64")]
             Sysno::select => {
-                sys_req!(Select {
+                sys_req!(Pselect {
                     nfds,
                     readfds:*,
                     writefds:*,
                     exceptfds:*,
-                    timeout:*,
+                    timeout:tv,
+                    sigsetpack: { None },
                 })
             }
             #[cfg(target_arch = "x86")]
             Sysno::_newselect => {
-                sys_req!(Select {
+                sys_req!(Pselect {
                     nfds,
                     readfds:*,
                     writefds:*,
                     exceptfds:*,
-                    timeout:*,
+                    timeout:tv,
+                    sigsetpack: { None },
                 })
             }
             #[cfg(target_arch = "x86_64")]
@@ -2630,7 +2637,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     readfds:*,
                     writefds:*,
                     exceptfds:*,
-                    timeout:*,
+                    timeout:ts,
                     sigsetpack:*,
                 })
             }
@@ -2641,7 +2648,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     readfds:*,
                     writefds:*,
                     exceptfds:*,
-                    timeout:*,
+                    timeout:ts64,
                     sigsetpack:*,
                 })
             }
@@ -2782,36 +2789,9 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 }
             }
             Sysno::sched_yield => SyscallRequest::SchedYield,
-            Sysno::futex => {
-                let addr = ctx.sys_req_ptr(0);
-                let op: i32 = ctx.sys_req_arg(1);
-                let cmd = FutexOperation::try_from(op & FutexFlags::FUTEX_CMD_MASK.bits())
-                    .expect("Invalid futex operation");
-                let flags = FutexFlags::from_bits(op & !FutexFlags::FUTEX_CMD_MASK.bits()).unwrap();
-                let val = ctx.sys_req_arg(2);
-                let timeout = ctx.sys_req_ptr(3);
-                let args = match cmd {
-                    FutexOperation::Wait => FutexArgs::Wait {
-                        addr,
-                        flags,
-                        val,
-                        timeout,
-                    },
-                    FutexOperation::WaitBitset => FutexArgs::WaitBitset {
-                        addr,
-                        flags,
-                        val,
-                        timeout,
-                        bitmask: ctx.sys_req_arg(5),
-                    },
-                    FutexOperation::Wake => FutexArgs::Wake {
-                        addr,
-                        flags,
-                        count: val,
-                    },
-                };
-                SyscallRequest::Futex { args }
-            }
+            Sysno::futex => Self::parse_futex(ctx, TimeParam::timespec_old),
+            #[cfg(target_arch = "x86")]
+            Sysno::futex_time64 => Self::parse_futex(ctx, TimeParam::timespec64),
             Sysno::execve => sys_req!(Execve { pathname:*, argv:*, envp:* }),
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
@@ -2831,6 +2811,40 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             _ => unimplemented!("Translation for {sysno} is not (yet) currently supported"),
         };
         Ok(dispatcher)
+    }
+
+    fn parse_futex<T: Clone>(
+        ctx: &PtRegs,
+        time_param: impl FnOnce(Option<Platform::RawMutPointer<T>>) -> TimeParam<Platform>,
+    ) -> SyscallRequest<Platform> {
+        let addr = ctx.sys_req_ptr(0);
+        let op: i32 = ctx.sys_req_arg(1);
+        let cmd = FutexOperation::try_from(op & FutexFlags::FUTEX_CMD_MASK.bits())
+            .expect("Invalid futex operation");
+        let flags = FutexFlags::from_bits(op & !FutexFlags::FUTEX_CMD_MASK.bits()).unwrap();
+        let val = ctx.sys_req_arg(2);
+        let timeout = time_param(ctx.sys_req_ptr(3));
+        let args = match cmd {
+            FutexOperation::Wait => FutexArgs::Wait {
+                addr,
+                flags,
+                val,
+                timeout,
+            },
+            FutexOperation::WaitBitset => FutexArgs::WaitBitset {
+                addr,
+                flags,
+                val,
+                timeout,
+                bitmask: ctx.sys_req_arg(5),
+            },
+            FutexOperation::Wake => FutexArgs::Wake {
+                addr,
+                flags,
+                count: val,
+            },
+        };
+        SyscallRequest::Futex { args }
     }
 }
 
@@ -2897,6 +2911,101 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
     },
     #[cfg(target_arch = "x86")]
     SetThreadArea { user_desc: *mut UserDesc },
+}
+
+#[derive(Debug)]
+pub enum TimeParam<Platform: litebox::platform::RawPointerProvider> {
+    None,
+    Milliseconds(i32),
+    TimeVal(Platform::RawMutPointer<TimeVal>),
+    Timespec32(Platform::RawMutPointer<Timespec32>),
+    Timespec64(Platform::RawMutPointer<Timespec>),
+}
+
+impl<Platform: litebox::platform::RawPointerProvider> TimeParam<Platform> {
+    /// Return a `TimeParam` for a 64-bit timespec pointer.
+    pub fn timespec64(tp: Option<Platform::RawMutPointer<Timespec>>) -> Self {
+        tp.map_or(TimeParam::None, TimeParam::Timespec64)
+    }
+
+    /// Return a `TimeParam` for a 32-bit timespec pointer.
+    pub fn timespec32(tp: Option<Platform::RawMutPointer<Timespec32>>) -> Self {
+        tp.map_or(TimeParam::None, TimeParam::Timespec32)
+    }
+
+    /// Return a `TimeParam` for the old timespec pointer type, which is
+    /// architecture dependent.
+    #[cfg(target_arch = "x86_64")]
+    pub fn timespec_old(tp: Option<Platform::RawMutPointer<Timespec>>) -> Self {
+        Self::timespec64(tp)
+    }
+
+    /// Return a `TimeParam` for the old timespec pointer type, which is
+    /// architecture dependent.
+    #[cfg(target_arch = "x86")]
+    pub fn timespec_old(tp: Option<Platform::RawMutPointer<Timespec32>>) -> Self {
+        Self::timespec32(tp)
+    }
+
+    /// Return a `TimeParam` for a timeval pointer.
+    pub fn timeval(tp: Option<Platform::RawMutPointer<TimeVal>>) -> Self {
+        tp.map_or(TimeParam::None, TimeParam::TimeVal)
+    }
+
+    /// Convert a generic timeout argument into a `Timeout` enum.
+    pub fn read(&self) -> Result<Option<Duration>, errno::Errno> {
+        let v = match *self {
+            TimeParam::None => return Ok(None),
+            TimeParam::Milliseconds(s) => {
+                // Negative values indicate an infinite timeout.
+                let Ok(s) = s.try_into() else {
+                    return Ok(None);
+                };
+                Duration::from_millis(s)
+            }
+            TimeParam::TimeVal(tv) => {
+                let tv = unsafe { tv.read_at_offset(0) }
+                    .ok_or(errno::Errno::EFAULT)?
+                    .into_owned();
+                Duration::try_from(tv).map_err(|_| errno::Errno::EINVAL)?
+            }
+            TimeParam::Timespec32(ts) => {
+                let ts = unsafe { ts.read_at_offset(0) }
+                    .ok_or(errno::Errno::EFAULT)?
+                    .into_owned();
+                Duration::try_from(ts).map_err(|_| errno::Errno::EINVAL)?
+            }
+            TimeParam::Timespec64(ts) => {
+                let ts = unsafe { ts.read_at_offset(0) }
+                    .ok_or(errno::Errno::EFAULT)?
+                    .into_owned();
+                Duration::try_from(ts).map_err(|_| errno::Errno::EINVAL)?
+            }
+        };
+        Ok(Some(v))
+    }
+
+    /// Write a value to the time parameter.
+    pub fn write(&self, duration: Duration) -> Result<(), errno::Errno> {
+        match *self {
+            TimeParam::None | TimeParam::Milliseconds(_) => Ok(()),
+            TimeParam::TimeVal(tv_ptr) => {
+                unsafe { tv_ptr.write_at_offset(0, duration.into()) }
+                    .ok_or(errno::Errno::EFAULT)?;
+                Ok(())
+            }
+            TimeParam::Timespec32(ts_ptr) => {
+                unsafe { ts_ptr.write_at_offset(0, duration.into()) }
+                    .ok_or(errno::Errno::EFAULT)?;
+                Ok(())
+            }
+            TimeParam::Timespec64(ts_ptr) => {
+                unsafe { ts_ptr.write_at_offset(0, duration.into()) }
+                    .ok_or(errno::Errno::EFAULT)?;
+                Ok(())
+            }
+        }
+    }
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> litebox::platform::Punchthrough

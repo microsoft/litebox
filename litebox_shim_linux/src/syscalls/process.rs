@@ -6,6 +6,7 @@ use alloc::boxed::Box;
 use core::mem::offset_of;
 use core::ops::Range;
 use core::sync::atomic::AtomicI32;
+use core::time::Duration;
 use litebox::mm::linux::VmFlags;
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{
@@ -15,8 +16,10 @@ use litebox::platform::{
 use litebox::platform::{RawMutPointer as _, ThreadProvider as _};
 #[cfg(target_arch = "x86")]
 use litebox::utils::TruncateExt;
-use litebox_common_linux::{ArchPrctlArg, errno::Errno};
-use litebox_common_linux::{CloneFlags, FutexArgs, PrctlArg};
+use litebox_common_linux::{
+    ArchPrctlArg, CloneFlags, FutexArgs, PrctlArg, TimeParam, errno::Errno,
+};
+use litebox_platform_multiplex::Platform;
 
 /// A structure representing a process
 pub(crate) struct Process {
@@ -697,9 +700,10 @@ impl Task {
     pub(crate) fn sys_clock_gettime(
         &self,
         clockid: litebox_common_linux::ClockId,
-    ) -> Result<litebox_common_linux::Timespec, Errno> {
+        tp: TimeParam<Platform>,
+    ) -> Result<(), Errno> {
         let duration = self.gettime_as_duration(litebox_platform_multiplex::platform(), clockid)?;
-        litebox_common_linux::Timespec::try_from(duration).or(Err(Errno::EOVERFLOW))
+        tp.write(duration)
     }
 
     #[expect(
@@ -735,29 +739,23 @@ impl Task {
     pub(crate) fn sys_clock_getres(
         &self,
         clockid: litebox_common_linux::ClockId,
-        res: crate::MutPtr<litebox_common_linux::Timespec>,
+        res: TimeParam<Platform>,
     ) -> Result<(), Errno> {
         // Return the resolution of the clock
         let resolution = match clockid {
             litebox_common_linux::ClockId::MonotonicCoarse => {
                 // Coarse clocks typically have lower resolution (e.g., 4 millisecond)
-                litebox_common_linux::Timespec {
-                    tv_sec: 0,
-                    tv_nsec: 4_000_000, // 4 millisecond resolution
-                }
+                Duration::from_millis(4)
             }
             litebox_common_linux::ClockId::RealTime | litebox_common_linux::ClockId::Monotonic => {
                 // For most modern systems, the resolution is typically 1 nanosecond
                 // This is a reasonable default for high-resolution timers
-                litebox_common_linux::Timespec {
-                    tv_sec: 0,
-                    tv_nsec: 1, // 1 nanosecond resolution
-                }
+                Duration::from_nanos(1)
             }
             _ => unimplemented!(),
         };
 
-        unsafe { res.write_at_offset(0, resolution).ok_or(Errno::EFAULT) }
+        res.write(resolution)
     }
 
     /// Handle syscall `clock_nanosleep`.
@@ -765,10 +763,10 @@ impl Task {
         &self,
         clockid: litebox_common_linux::ClockId,
         flags: litebox_common_linux::TimerFlags,
-        request: crate::ConstPtr<litebox_common_linux::Timespec>,
-        remain: Option<crate::MutPtr<litebox_common_linux::Timespec>>,
+        request: TimeParam<Platform>,
+        remain: TimeParam<Platform>,
     ) -> Result<(), Errno> {
-        let request = core::time::Duration::from(get_timeout(request)?);
+        let request = request.read()?.ok_or(Errno::EFAULT)?;
         if flags.intersects(litebox_common_linux::TimerFlags::ABSTIME.complement()) {
             return Err(Errno::EINVAL);
         }
@@ -804,33 +802,30 @@ impl Task {
     /// Handle syscall `gettimeofday`.
     pub(crate) fn sys_gettimeofday(
         &self,
-        tv: crate::MutPtr<litebox_common_linux::TimeVal>,
-        tz: crate::MutPtr<litebox_common_linux::TimeZone>,
+        tv: Option<crate::MutPtr<litebox_common_linux::TimeVal>>,
+        tz: Option<crate::MutPtr<litebox_common_linux::TimeZone>>,
     ) -> Result<(), Errno> {
-        if tz.as_usize() != 0 {
+        if tz.is_some() {
             // `man 2 gettimeofday`: The use of the timezone structure is obsolete; the tz argument
             // should normally be specified as NULL.
             unimplemented!()
         }
-        if tv.as_usize() == 0 {
-            return Ok(());
+        if let Some(tv) = tv {
+            unsafe { tv.write_at_offset(0, self.real_time_as_duration_since_epoch().into()) }
+                .ok_or(Errno::EFAULT)?;
         }
-        let timeval =
-            litebox_common_linux::Timespec::try_from(self.real_time_as_duration_since_epoch())
-                .or(Err(Errno::EOVERFLOW))?
-                .into();
-        unsafe { tv.write_at_offset(0, timeval) }.ok_or(Errno::EFAULT)
+        Ok(())
     }
 
     /// Handle syscall `time`.
     pub(crate) fn sys_time(
         &self,
-        tloc: crate::MutPtr<litebox_common_linux::time_t>,
+        tloc: Option<crate::MutPtr<litebox_common_linux::time_t>>,
     ) -> Result<litebox_common_linux::time_t, Errno> {
         let time = self.real_time_as_duration_since_epoch();
         let seconds: u64 = time.as_secs();
         let seconds: litebox_common_linux::time_t = seconds.try_into().or(Err(Errno::EOVERFLOW))?;
-        if tloc.as_usize() != 0 {
+        if let Some(tloc) = tloc {
             unsafe { tloc.write_at_offset(0, seconds) }.ok_or(Errno::EFAULT)?;
         }
         Ok(seconds)
@@ -893,17 +888,6 @@ impl Task {
     }
 }
 
-// TODO: move elsewhere?
-pub(crate) fn get_timeout(
-    timeout: crate::ConstPtr<litebox_common_linux::Timespec>,
-) -> Result<litebox_common_linux::Timespec, Errno> {
-    let timeout = unsafe { timeout.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
-    if timeout.tv_sec < 0 || timeout.tv_nsec >= 1_000_000_000 {
-        return Err(Errno::EINVAL);
-    }
-    Ok(timeout.into_owned())
-}
-
 impl Task {
     /// Handle syscall `futex`
     pub(crate) fn sys_futex(
@@ -941,7 +925,7 @@ impl Task {
             } => {
                 warn_shared_futex!(flags);
                 let futex_manager = crate::litebox_futex_manager();
-                let timeout = timeout.map(get_timeout).transpose()?.map(Into::into);
+                let timeout = timeout.read()?;
                 futex_manager.wait(addr, val, timeout, None)?;
                 0
             }
@@ -953,9 +937,10 @@ impl Task {
                 bitmask,
             } => {
                 warn_shared_futex!(flags);
-                let timeout = timeout.map(get_timeout).transpose()?.map(|ts| {
+                let timeout = timeout.read()?.map(|ts| {
                     let now = self
-                        .sys_clock_gettime(
+                        .gettime_as_duration(
+                            litebox_platform_multiplex::platform(),
                             if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
                                 litebox_common_linux::ClockId::RealTime
                             } else {
@@ -963,7 +948,7 @@ impl Task {
                             },
                         )
                         .expect("failed to get current time");
-                    ts.sub_timespec(&now).unwrap_or(core::time::Duration::ZERO)
+                    ts.saturating_sub(now)
                 });
                 let futex_manager = crate::litebox_futex_manager();
                 futex_manager.wait(addr, val, timeout, core::num::NonZeroU32::new(bitmask))?;
