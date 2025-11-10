@@ -81,6 +81,9 @@ pub trait ThreadProvider: RawPointerProvider {
     /// if no other guest exit is concurrently in progress) is called on the
     /// thread as soon as possible, interrupting currently running guest code if
     /// needed.
+    ///
+    /// [`EnterShim`]: crate::shim::EnterShim
+    /// [`EnterShim::interrupt`]: crate::shim::EnterShim::interrupt
     fn interrupt_thread(&self, thread: &Self::ThreadHandle);
 }
 
