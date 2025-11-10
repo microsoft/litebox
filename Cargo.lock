@@ -216,6 +216,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bootloader"
+version = "0.9.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bdfddac270bbdd45903296bc1caf29a7fdce6b326aaf0bbab7f04c5f98b7447"
+
+[[package]]
 name = "buddy_system_allocator"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -820,6 +826,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_platform"
+version = "0.1.0"
+dependencies = [
+ "aligned-vec",
+ "arrayvec",
+ "bitflags 2.9.4",
+ "buddy_system_allocator",
+ "cfg-if",
+ "hashbrown 0.15.5",
+ "libc",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_common_optee",
+ "modular-bitfield",
+ "num_enum",
+ "once_cell",
+ "rangemap",
+ "raw-cpuid",
+ "slabmalloc",
+ "spin 0.10.0",
+ "thiserror",
+ "x86_64",
+]
+
+[[package]]
 name = "litebox_platform_linux_kernel"
 version = "0.1.0"
 dependencies = [
@@ -892,6 +923,7 @@ version = "0.1.0"
 dependencies = [
  "cfg-if",
  "litebox",
+ "litebox_platform",
  "litebox_platform_linux_kernel",
  "litebox_platform_linux_userland",
  "litebox_platform_lvbs",
@@ -972,6 +1004,21 @@ dependencies = [
  "litebox_syscall_rewriter",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "litebox_runner_optee_on_machine"
+version = "0.1.0"
+dependencies = [
+ "bootloader",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_common_optee",
+ "litebox_platform",
+ "litebox_platform_multiplex",
+ "litebox_shim_optee",
+ "spin 0.10.0",
+ "x86_64",
 ]
 
 [[package]]
