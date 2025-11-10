@@ -4,11 +4,11 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x8000000;
+    . = 0x0;
     _memory_base = .;
 
-    /*  CONFIG_PHYSICAL_START=0x8200000 */
-    . = 0x8200000;
+    /*  CONFIG_PHYSICAL_START=0x200000 */
+    . = 0x200000;
 
     /* CONFIG_PHYSICAL_ALIGN=0x200000 */
 
