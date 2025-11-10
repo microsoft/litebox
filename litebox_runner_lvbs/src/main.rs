@@ -6,8 +6,10 @@ use core::arch::asm;
 use litebox_platform_lvbs::{
     arch::{enable_extended_states, enable_fsgsbase, get_core_id, instrs::hlt_loop},
     host::{bootparam::parse_boot_info, per_cpu_variables::with_per_cpu_variables},
+    mm::MemoryProvider,
     serial_println,
 };
+use litebox_platform_multiplex::Platform;
 
 /// ELF64 relocation entry
 #[repr(C)]
@@ -95,6 +97,14 @@ unsafe fn apply_relocations() {
 
         // SAFETY: Moving to next entry within bounds
         rela_ptr = unsafe { rela_ptr.add(1) };
+    }
+
+    // Reclaim rela.dyn section memory to heap after applying relocations
+    let mem_fill_start = unsafe { &_rela_start as *const _ as usize };
+    let mem_fill_end = unsafe { &_rela_end as *const _ as usize };
+    let mem_fill_size = mem_fill_end - mem_fill_start;
+    unsafe {
+        Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
     }
 }
 
