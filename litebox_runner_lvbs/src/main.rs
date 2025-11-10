@@ -51,7 +51,7 @@ unsafe fn apply_relocations() {
     // SAFETY: This is also position-independent - it's just the address
     // the linker embedded in the relocation entries themselves
 
-    const EXPECTED_BASE: u64 = 0x8000000;
+    const EXPECTED_BASE: u64 = 0x0;
     let expected_base = EXPECTED_BASE;
 
     let offset = actual_base.wrapping_sub(expected_base);
