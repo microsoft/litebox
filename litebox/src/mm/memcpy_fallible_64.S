@@ -19,9 +19,8 @@ __memcpy_fallible: # (dst: *mut u8, src: *const u8, size: usize) -> usize
     mov rax, rcx
     ret
 
-// TODO: implement exception handling
 .pushsection .ex_table, "a"
-    .align 8
-    .quad [.move]
-    .quad [.memcpy_exit]
+    .align 4
+    .long .move - .
+    .long .memcpy_exit - .
 .popsection

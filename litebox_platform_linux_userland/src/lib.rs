@@ -1197,8 +1197,10 @@ impl litebox::platform::DebugLogProvider for LinuxUserland {
 }
 
 impl litebox::platform::RawPointerProvider for LinuxUserland {
-    type RawConstPointer<T: Clone> = litebox::platform::trivial_providers::TransparentConstPtr<T>;
-    type RawMutPointer<T: Clone> = litebox::platform::trivial_providers::TransparentMutPtr<T>;
+    type RawConstPointer<T: Clone> =
+        litebox::platform::common_providers::userspace_pointers::UserConstPtr<T>;
+    type RawMutPointer<T: Clone> =
+        litebox::platform::common_providers::userspace_pointers::UserMutPtr<T>;
 }
 
 /// Operations currently supported by the safer variants of the Linux futex syscall
@@ -1358,9 +1360,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             )
         }
         .expect("mmap failed");
-        Ok(litebox::platform::trivial_providers::TransparentMutPtr {
-            inner: ptr as *mut u8,
-        })
+        Ok(
+            litebox::platform::common_providers::userspace_pointers::UserMutPtr {
+                inner: ptr as *mut u8,
+            },
+        )
     }
 
     unsafe fn deallocate_pages(
@@ -1398,9 +1402,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             )
             .expect("mremap failed")
         };
-        Ok(litebox::platform::trivial_providers::TransparentMutPtr {
-            inner: res as *mut u8,
-        })
+        Ok(
+            litebox::platform::common_providers::userspace_pointers::UserMutPtr {
+                inner: res as *mut u8,
+            },
+        )
     }
 
     unsafe fn update_permissions(
@@ -1925,6 +1931,34 @@ unsafe fn next_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
+    if signum == libc::SIGSEGV {
+        let ip: usize = {
+            #[cfg(target_arch = "x86_64")]
+            {
+                context.uc_mcontext.gregs[libc::REG_RIP as usize]
+                    .reinterpret_as_unsigned()
+                    .truncate()
+            }
+            #[cfg(target_arch = "x86")]
+            {
+                context.uc_mcontext.gregs[libc::REG_EIP as usize].reinterpret_as_unsigned() as usize
+            }
+        };
+        if let Some(fixup_addr) = litebox::mm::exception_table::search_exception_tables(ip) {
+            #[cfg(target_arch = "x86_64")]
+            {
+                context.uc_mcontext.gregs[libc::REG_RIP as usize] =
+                    fixup_addr.reinterpret_as_signed() as i64;
+            }
+            #[cfg(target_arch = "x86")]
+            {
+                context.uc_mcontext.gregs[libc::REG_EIP as usize] =
+                    fixup_addr.reinterpret_as_signed().truncate();
+            }
+            return;
+        }
+    }
+
     unsafe {
         let next_sa = &NEXT_SA[signum.reinterpret_as_unsigned() as usize];
         match next_sa.sa_sigaction {
