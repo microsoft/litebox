@@ -320,6 +320,10 @@ mod tests {
         // Find an address that is allocated to the global allocator but not in reserved regions.
         // LiteBox's page manager is not aware of the global allocator's allocations.
         let addr = loop {
+            #[allow(
+                unused_variables,
+                reason = "the following features are mutually exclusive"
+            )]
             #[cfg(feature = "platform_windows_userland")]
             let addr = {
                 let buf = alloc::vec::Vec::<u8>::with_capacity(0x10_0000);
@@ -339,7 +343,9 @@ mod tests {
                         0,
                     )
                 } as usize;
-                data.push(addr);
+                data.push(alloc::vec::Vec::<u8>::from(unsafe {
+                    core::slice::from_raw_parts(addr as *const u8, 0x10_000)
+                }));
                 addr
             };
 
@@ -395,15 +401,6 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, Errno::ENOMEM);
-
-        #[cfg(feature = "platform_linux_userland")]
-        {
-            for addr in data {
-                unsafe {
-                    libc::munmap(addr as *mut _, 0x10_000);
-                }
-            }
-        }
     }
 
     #[test]
