@@ -147,7 +147,8 @@ impl ElfLoaderMmap {
             litebox_common_linux::MapFlags::from_bits(
                 flags.bits() | MapFlags::MAP_ANONYMOUS.bits(),
             )
-            .expect("unsupported flags"),
+            .expect("unsupported flags")
+                | litebox_common_linux::MapFlags::MAP_POPULATE,
             -1,
             0,
         ) {

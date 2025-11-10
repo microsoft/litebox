@@ -273,7 +273,8 @@ where
         flags: CreatePagesFlags,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-        let flags = CreatePagesFlags::IS_STACK | flags;
+        let flags =
+            CreatePagesFlags::IS_STACK | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY | flags;
         unsafe { self.create_pages(suggested_address, length, flags, perms, perms, |_| Ok(0)) }
     }
 

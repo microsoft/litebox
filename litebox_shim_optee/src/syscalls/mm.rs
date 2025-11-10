@@ -31,7 +31,7 @@ fn do_mmap_anonymous(
         suggested_addr,
         len,
         prot,
-        flags,
+        flags | MapFlags::MAP_POPULATE,
         false,
         op,
     )

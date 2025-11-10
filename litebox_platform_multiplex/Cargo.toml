@@ -9,6 +9,7 @@ litebox_platform_linux_userland = { path = "../litebox_platform_linux_userland/"
 litebox_platform_linux_kernel = { path = "../litebox_platform_linux_kernel/", version = "0.1.0", default-features = false, optional = true }
 litebox_platform_windows_userland = { path = "../litebox_platform_windows_userland/", version = "0.1.0", default-features = false, optional = true }
 litebox_platform_lvbs = { path = "../litebox_platform_lvbs/", version = "0.1.0", default-features = false, optional = true }
+litebox_platform_hypervisor = { path = "../litebox_platform_hypervisor/", version = "0.1.0", default-features = false, optional = true }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
 cfg-if = "1.0.0"
 
@@ -18,11 +19,13 @@ platform_linux_userland = ["dep:litebox_platform_linux_userland"]
 platform_windows_userland = ["dep:litebox_platform_windows_userland"]
 platform_lvbs = ["dep:litebox_platform_lvbs"]
 platform_linux_snp = ["dep:litebox_platform_linux_kernel"]
+platform_hypervisor = ["dep:litebox_platform_hypervisor"]
 systrap_backend = ["platform_linux_userland", "litebox_platform_linux_userland/systrap_backend"]
 platform_linux_userland_with_linux_syscall = ["platform_linux_userland", "litebox_platform_linux_userland/linux_syscall"]
 platform_linux_userland_with_optee_syscall = ["platform_linux_userland", "litebox_platform_linux_userland/optee_syscall"]
 platform_lvbs_with_linux_syscall = ["platform_lvbs", "litebox_platform_lvbs/linux_syscall"]
 platform_lvbs_with_optee_syscall = ["platform_lvbs", "litebox_platform_lvbs/optee_syscall"]
+platform_hypervisor_with_optee_syscall = ["platform_hypervisor", "litebox_platform_hypervisor/optee_syscall"]
 
 [lints]
 workspace = true

@@ -216,6 +216,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bootloader"
+version = "0.9.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bdfddac270bbdd45903296bc1caf29a7fdce6b326aaf0bbab7f04c5f98b7447"
+
+[[package]]
 name = "buddy_system_allocator"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -820,6 +826,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_platform_hypervisor"
+version = "0.1.0"
+dependencies = [
+ "aligned-vec",
+ "arrayvec",
+ "bitflags 2.9.4",
+ "buddy_system_allocator",
+ "cfg-if",
+ "hashbrown 0.15.5",
+ "libc",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_common_optee",
+ "modular-bitfield",
+ "num_enum",
+ "once_cell",
+ "rangemap",
+ "raw-cpuid",
+ "slabmalloc",
+ "spin 0.10.0",
+ "thiserror",
+ "x86_64 0.15.2",
+]
+
+[[package]]
 name = "litebox_platform_linux_kernel"
 version = "0.1.0"
 dependencies = [
@@ -833,7 +864,7 @@ dependencies = [
  "spin 0.9.8",
  "syscalls",
  "thiserror",
- "x86_64",
+ "x86_64 0.15.2",
 ]
 
 [[package]]
@@ -882,7 +913,7 @@ dependencies = [
  "spin 0.10.0",
  "thiserror",
  "x509-cert",
- "x86_64",
+ "x86_64 0.15.2",
 ]
 
 [[package]]
@@ -891,6 +922,7 @@ version = "0.1.0"
 dependencies = [
  "cfg-if",
  "litebox",
+ "litebox_platform_hypervisor",
  "litebox_platform_linux_kernel",
  "litebox_platform_linux_userland",
  "litebox_platform_lvbs",
@@ -949,7 +981,23 @@ dependencies = [
  "litebox_platform_lvbs",
  "litebox_platform_multiplex",
  "litebox_shim_optee",
- "x86_64",
+ "x86_64 0.15.2",
+]
+
+[[package]]
+name = "litebox_runner_optee_on_hypervisor"
+version = "0.1.0"
+dependencies = [
+ "bootloader",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_common_optee",
+ "litebox_platform_hypervisor",
+ "litebox_platform_multiplex",
+ "litebox_shim_optee",
+ "pic8259",
+ "spin 0.10.0",
+ "x86_64 0.15.2",
 ]
 
 [[package]]
@@ -1225,6 +1273,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
 dependencies = [
  "base64ct",
+]
+
+[[package]]
+name = "pic8259"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb844b5b01db1e0b17938685738f113bfc903846f18932b378bc0eabfa40e194"
+dependencies = [
+ "x86_64 0.14.13",
 ]
 
 [[package]]
@@ -1992,6 +2049,18 @@ dependencies = [
  "const-oid",
  "der",
  "spki",
+]
+
+[[package]]
+name = "x86_64"
+version = "0.14.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c101112411baafbb4bf8d33e4c4a80ab5b02d74d2612331c61e8192fc9710491"
+dependencies = [
+ "bit_field",
+ "bitflags 2.9.4",
+ "rustversion",
+ "volatile",
 ]
 
 [[package]]
