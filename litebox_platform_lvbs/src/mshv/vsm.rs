@@ -316,6 +316,37 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, Errno> {
     }
 }
 
+fn parse_certs(mut buf: &[u8]) -> Vec<Certificate> {
+    let mut certs = Vec::new();
+
+    while buf.len() >= 4 && buf[0] == 0x30 && buf[1] == 0x82 {
+        let der_len = ((buf[2] as usize) << 8) | (buf[3] as usize);
+        let total_len = der_len + 4;
+
+        if buf.len() < total_len {
+            serial_println!(
+                "Invalid DER data (expected {}, got {})",
+                total_len,
+                buf.len()
+            );
+            break;
+        }
+
+        let cert_bytes = &buf[..total_len];
+        match Certificate::from_der(cert_bytes) {
+            Ok(cert) => {
+                certs.push(cert);
+            }
+            Err(e) => {
+                serial_println!("Failed to parse one certificate: {:?}", e);
+                break;
+            }
+        }
+        buf = &buf[total_len..];
+    }
+    certs
+}
+
 /// VSM function for loading kernel data (e.g., certificates, blocklist, kernel symbols) into VTL1.
 /// `pa` and `nranges` specify memory areas containing the information about the memory ranges to load.
 pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
@@ -406,15 +437,19 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
             .read_bytes(system_certs_mem.start().unwrap(), &mut cert_buf)
             .map_err(|_| Errno::EINVAL)?;
 
+        let certs = parse_certs(&cert_buf);
+
+        if certs.is_empty() {
+            serial_println!("VSM: No valid system certificates parsed");
+            return Err(Errno::EINVAL);
+        }
+
         // The system certificate is loaded into VTL1 and locked down before `end_of_boot` is signaled.
         // Its integrity depends on UEFI Secure Boot which ensures only trusted software is loaded during
         // the boot process.
-        if let Ok(cert) = Certificate::from_der(&cert_buf) {
-            vtl0_info.set_system_certificate(cert);
-        } else {
-            serial_println!("VSM: Failed to parse system certificate");
-            return Err(Errno::EINVAL);
-        }
+        let first_cert = &certs[0];
+        vtl0_info.set_system_certificate(first_cert.clone());
+        serial_println!("VSM: Loaded {} system certificate(s)", certs.len());
     }
 
     for kexec_trampoline_range in &kexec_trampoline_metadata {
