@@ -649,7 +649,7 @@ mod tests {
                     }
                     pipes.close(&prod).unwrap();
                     assert_eq!(i, data.len());
-                })
+                });
             });
 
             litebox.sync().new_executor().run(async {
@@ -697,7 +697,7 @@ mod tests {
                     }
                     pipes.close(&prod).unwrap();
                     assert_eq!(i, data.len());
-                })
+                });
             });
 
             litebox.sync().new_executor().run(async {
