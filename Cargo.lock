@@ -993,6 +993,7 @@ dependencies = [
  "bitvec",
  "elf",
  "elf_loader",
+ "libc",
  "litebox",
  "litebox_common_linux",
  "litebox_platform_multiplex",
