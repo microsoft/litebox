@@ -558,6 +558,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             if self.vmas.overlaps(&r) {
                 return Err(VmemResizeError::RangeOccupied(r));
             }
+            if cur_vma.is_file_backed() {
+                unimplemented!("file-backed mapping expansion is not supported yet");
+            }
             let range = PageRange::new(range.end, new_end).unwrap();
             // Although we have checked the overlap above, there is still a small chance that this range
             // collides with memory allocated to global allocator when LiteBox is used in user mode. This
@@ -617,13 +620,16 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .expect("VMEM: range not found");
         assert!(cur_range.contains(&(old_range.end - 1)));
 
+        if vma.is_file_backed() {
+            unimplemented!("file-backed mapping move is not supported yet");
+        }
         let new_addr = self
             .get_unmmaped_area(suggested_new_address, new_size, false)
             .ok_or(VmemMoveError::OutOfMemory)?;
         let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
         let new_addr = unsafe {
             self.platform
-                .remap_pages(old_range.into(), new_range.into())
+                .remap_pages(old_range.into(), new_range.into(), vma.flags.into())
         }
         .map_err(VmemMoveError::RemapError)?;
 
