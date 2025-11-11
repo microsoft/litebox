@@ -142,7 +142,7 @@ impl Runner {
     #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
     fn args(&mut self, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> &mut Self {
         for arg in args {
-            self.cmd_args.push(arg.as_ref().to_os_string());
+            self.arg(arg);
         }
         self
     }
