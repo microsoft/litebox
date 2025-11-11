@@ -151,6 +151,7 @@ pub extern "C" fn sandbox_process_init(
             );
         }
     };
+    // TODO: handle ContinueOperation properly.
     assert!(matches!(
         entrypoints.init(pt_regs),
         ContinueOperation::ResumeGuest
