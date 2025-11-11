@@ -3,8 +3,12 @@
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use litebox::{
+    event::{
+        Events,
+        polling::{TryOpError, wait_or_timeout},
+    },
     fs::OFlags,
-    net::TcpOptionData,
+    net::{TcpOptionData, errors::AcceptError},
     platform::{RawConstPointer as _, RawMutPointer as _},
     utils::TruncateExt as _,
 };
@@ -388,23 +392,31 @@ fn getsockopt(
     Ok(())
 }
 
-fn try_accept(fd: &SocketFd, peer: Option<&mut SocketAddr>) -> Result<SocketFd, Errno> {
-    litebox_net().lock().accept(fd, peer).map_err(Errno::from)
+fn try_accept(fd: &SocketFd, peer: Option<&mut SocketAddr>) -> Result<SocketFd, TryOpError<Errno>> {
+    litebox_net().lock().accept(fd, peer).map_err(|e| match e {
+        AcceptError::NoConnectionsReady => TryOpError::TryAgain,
+        AcceptError::InvalidFd | AcceptError::NotListening => TryOpError::Other(e.into()),
+        _ => unimplemented!(),
+    })
 }
 
 fn accept(fd: &SocketFd, mut peer: Option<&mut SocketAddr>) -> Result<SocketFd, Errno> {
-    if get_status(fd).contains(OFlags::NONBLOCK) {
-        try_accept(fd, peer)
+    let res = if get_status(fd).contains(OFlags::NONBLOCK) {
+        try_accept(fd, peer)?
     } else {
-        // TODO: use `poll` instead of busy wait
-        loop {
-            match try_accept(fd, peer.as_deref_mut()) {
-                Err(Errno::EAGAIN) => {}
-                ret => return ret,
-            }
-            core::hint::spin_loop();
-        }
-    }
+        wait_or_timeout(
+            crate::litebox(),
+            None,
+            || try_accept(fd, peer.as_deref_mut()),
+            || true,
+            |observer, _filter| {
+                litebox_net()
+                    .lock()
+                    .with_iopollable(fd, |poll| poll.register_observer(observer, Events::IN));
+            },
+        )?
+    };
+    Ok(res)
 }
 
 fn bind(fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
@@ -433,9 +445,12 @@ fn try_sendto(
     buf: &[u8],
     flags: litebox::net::SendFlags,
     sockaddr: Option<SocketAddr>,
-) -> Result<usize, Errno> {
-    let n = litebox_net().lock().send(fd, buf, flags, sockaddr)?;
-    if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
+) -> Result<usize, TryOpError<Errno>> {
+    match litebox_net().lock().send(fd, buf, flags, sockaddr) {
+        Ok(0) => Err(TryOpError::TryAgain),
+        Ok(n) => Ok(n),
+        Err(e) => Err(TryOpError::Other(e.into())),
+    }
 }
 
 pub(crate) fn sendto(
@@ -463,19 +478,19 @@ pub(crate) fn sendto(
         try_sendto(fd, buf, new_flags, sockaddr)
     } else {
         let timeout = with_socket_options(fd, |opt| opt.send_timeout);
-        if timeout.is_some() {
-            todo!("send timeout");
-        }
-
-        // TODO: use `poll` instead of busy wait
-        loop {
-            match try_sendto(fd, buf, new_flags, sockaddr) {
-                Err(Errno::EAGAIN) => {}
-                ret => break ret,
-            }
-            core::hint::spin_loop();
-        }
-    };
+        wait_or_timeout(
+            crate::litebox(),
+            timeout,
+            || try_sendto(fd, buf, new_flags, sockaddr),
+            || true,
+            |observer, _filter| {
+                litebox_net()
+                    .lock()
+                    .with_iopollable(fd, |poll| poll.register_observer(observer, Events::OUT));
+            },
+        )
+    }
+    .map_err(Errno::from);
     if let Err(Errno::EPIPE) = ret
         && !flags.contains(SendFlags::NOSIGNAL)
     {
@@ -489,9 +504,12 @@ fn try_receive(
     buf: &mut [u8],
     flags: litebox::net::ReceiveFlags,
     source_addr: Option<&mut Option<SocketAddr>>,
-) -> Result<usize, Errno> {
-    let n = litebox_net().lock().receive(fd, buf, flags, source_addr)?;
-    if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
+) -> Result<usize, TryOpError<Errno>> {
+    match litebox_net().lock().receive(fd, buf, flags, source_addr) {
+        Ok(0) => Err(TryOpError::TryAgain),
+        Ok(n) => Ok(n),
+        Err(e) => Err(TryOpError::Other(e.into())),
+    }
 }
 
 pub(crate) fn receive(
@@ -530,19 +548,19 @@ pub(crate) fn receive(
         try_receive(fd, buf, new_flags, source_addr)
     } else {
         let timeout = with_socket_options(fd, |opt| opt.recv_timeout);
-        if timeout.is_some() {
-            todo!("recv timeout");
-        }
-
-        // TODO: use `poll` instead of busy wait
-        loop {
-            match try_receive(fd, buf, new_flags, source_addr.as_deref_mut()) {
-                Err(Errno::EAGAIN) => {}
-                ret => return ret,
-            }
-            core::hint::spin_loop();
-        }
+        wait_or_timeout(
+            crate::litebox(),
+            timeout,
+            || try_receive(fd, buf, new_flags, source_addr.as_deref_mut()),
+            || true,
+            |observer, _filter| {
+                litebox_net()
+                    .lock()
+                    .with_iopollable(fd, |poll| poll.register_observer(observer, Events::IN));
+            },
+        )
     }
+    .map_err(Errno::from)
 }
 
 fn get_socket_type(fd: &SocketFd) -> Result<SockType, Errno> {
