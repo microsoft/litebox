@@ -285,7 +285,7 @@ impl Task {
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
         let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
-        match desc {
+        let res = match desc {
             Descriptor::LiteBoxRawFd(raw_fd) => {
                 let raw_fd = *raw_fd;
                 drop(file_table);
@@ -316,7 +316,11 @@ impl Task {
                 );
                 file.write(value)
             }
+        };
+        if let Err(Errno::EPIPE) = res {
+            unimplemented!("send SIGPIPE to the current task");
         }
+        res
     }
 
     /// Handle syscall `pread64`
@@ -530,7 +534,7 @@ impl Task {
         // TODO: The data transfers performed by readv() and writev() are atomic: the data
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
-        match desc {
+        let res = match desc {
             Descriptor::LiteBoxRawFd(raw_fd) => files
                 .run_on_raw_fd(
                     *raw_fd,
@@ -554,7 +558,11 @@ impl Task {
                 .flatten(),
             Descriptor::Epoll { .. } => Err(Errno::EINVAL),
             Descriptor::Eventfd { .. } => todo!(),
+        };
+        if let Err(Errno::EPIPE) = res {
+            unimplemented!("send SIGPIPE to the current task");
         }
+        res
     }
 
     /// Handle syscall `access`

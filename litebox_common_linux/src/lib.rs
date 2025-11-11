@@ -391,6 +391,9 @@ pub struct IoReadVec<P: RawMutPointer<u8>> {
     pub iov_len: usize,
 }
 
+/// `iovec` struct for both read and write
+pub type IoVec<P> = IoReadVec<P>;
+
 impl<P: RawConstPointer<u8>> Clone for IoWriteVec<P> {
     fn clone(&self) -> Self {
         Self {
@@ -1796,6 +1799,39 @@ pub struct SigSetPack {
     pub size: usize,
 }
 
+#[repr(C)]
+#[derive(Debug)]
+pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
+    /// ptr to socket address structure
+    pub msg_name: Platform::RawConstPointer<u8>,
+    /// size of socket address structure
+    pub msg_namelen: u32,
+    /// ptr to an array of `iovec` structures
+    pub msg_iov: Platform::RawConstPointer<IoVec<Platform::RawMutPointer<u8>>>,
+    /// number of elements in msg_iov
+    pub msg_iovlen: usize,
+    /// ptr to ancillary data
+    pub msg_control: Platform::RawConstPointer<u8>,
+    /// number of bytes of ancillary data
+    pub msg_controllen: usize,
+    /// flags on received message
+    pub msg_flags: SendFlags,
+}
+
+impl<Platform: litebox::platform::RawPointerProvider> Clone for UserMsgHdr<Platform> {
+    fn clone(&self) -> Self {
+        Self {
+            msg_name: self.msg_name,
+            msg_namelen: self.msg_namelen,
+            msg_iov: self.msg_iov,
+            msg_iovlen: self.msg_iovlen,
+            msg_control: self.msg_control,
+            msg_controllen: self.msg_controllen,
+            msg_flags: self.msg_flags,
+        }
+    }
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 #[derive(Debug)]
@@ -1950,6 +1986,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         flags: SendFlags,
         addr: Option<Platform::RawConstPointer<u8>>,
         addrlen: u32,
+    },
+    Sendmsg {
+        sockfd: i32,
+        msg: Platform::RawConstPointer<UserMsgHdr<Platform>>,
+        flags: SendFlags,
     },
     Recvfrom {
         sockfd: i32,
@@ -2441,6 +2482,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }),
             Sysno::accept4 => sys_req!(Accept { sockfd, addr:*, addrlen:*, flags }),
             Sysno::sendto => sys_req!(Sendto { sockfd, buf:*, len, flags, addr:*, addrlen }),
+            Sysno::sendmsg => sys_req!(Sendmsg { sockfd, msg:*, flags }),
             Sysno::recvfrom => sys_req!(Recvfrom { sockfd, buf:*, len, flags, addr:*, addrlen:*, }),
             Sysno::bind => sys_req!(Bind { sockfd, sockaddr:*, addrlen }),
             Sysno::listen => sys_req!(Listen { sockfd, backlog }),

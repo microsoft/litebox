@@ -447,6 +447,7 @@ pub(crate) fn sendto(
     // Convert `SendFlags` to `litebox::net::SendFlags`
     // Note [`Network::send`] is non-blocking and `DONTWAIT` is handled below
     // so we don't convert `DONTWAIT` here.
+    // Also, `NOSIGNAL` is handled after the send.
     let new_flags = convert_flags!(
         flags,
         SendFlags,
@@ -455,11 +456,10 @@ pub(crate) fn sendto(
         DONTROUTE,
         EOR,
         MORE,
-        NOSIGNAL,
         OOB,
     );
 
-    if get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT) {
+    let ret = if get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT) {
         try_sendto(fd, buf, new_flags, sockaddr)
     } else {
         let timeout = with_socket_options(fd, |opt| opt.send_timeout);
@@ -471,11 +471,17 @@ pub(crate) fn sendto(
         loop {
             match try_sendto(fd, buf, new_flags, sockaddr) {
                 Err(Errno::EAGAIN) => {}
-                ret => return ret,
+                ret => break ret,
             }
             core::hint::spin_loop();
         }
+    };
+    if let Err(Errno::EPIPE) = ret
+        && !flags.contains(SendFlags::NOSIGNAL)
+    {
+        unimplemented!("send signal SIGPIPE on EPIPE");
     }
+    ret
 }
 
 fn try_receive(
@@ -810,6 +816,55 @@ impl Task {
         }
     }
 
+    /// Handle syscall `sendmsg`
+    pub(crate) fn sys_sendmsg(
+        &self,
+        fd: i32,
+        msg: &litebox_common_linux::UserMsgHdr<Platform>,
+        flags: SendFlags,
+    ) -> Result<usize, Errno> {
+        let Ok(fd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+
+        let sock_addr = if msg.msg_name.as_usize() != 0 {
+            Some(read_sockaddr_from_user(
+                msg.msg_name,
+                msg.msg_namelen as usize,
+            )?)
+        } else {
+            None
+        };
+        if msg.msg_controllen != 0 {
+            unimplemented!("ancillary data is not supported");
+        }
+        if msg.msg_iovlen == 0 || msg.msg_iovlen > 1024 {
+            return Err(Errno::EINVAL);
+        }
+        let iovs = unsafe { msg.msg_iov.to_cow_slice(msg.msg_iovlen) }.ok_or(Errno::EFAULT)?;
+        let files = self.files.borrow();
+        let file_table = files.file_descriptors.read();
+        let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
+        match socket {
+            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |socket| {
+                // drop file table as `sendto` may block
+                drop(file_table);
+                let sock_addr = sock_addr.map(|SocketAddress::Inet(addr)| addr);
+                let mut total_sent = 0;
+                for iov in iovs.iter() {
+                    if iov.iov_len == 0 {
+                        continue;
+                    }
+                    let buf =
+                        unsafe { iov.iov_base.to_cow_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
+                    total_sent += sendto(socket, &buf, flags, sock_addr)?;
+                }
+                Ok(total_sent)
+            }),
+            _ => Err(Errno::ENOTSOCK),
+        }
+    }
+
     /// Handle syscall `recvfrom`
     pub(crate) fn sys_recvfrom(
         &self,
@@ -967,7 +1022,7 @@ mod tests {
     use litebox_common_linux::{AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType};
 
     use super::SocketAddress;
-    use crate::ConstPtr;
+    use crate::{ConstPtr, MutPtr};
 
     extern crate alloc;
     extern crate std;
@@ -1057,7 +1112,7 @@ mod tests {
         let child_handle = std::thread::spawn(move || {
             std::thread::sleep(core::time::Duration::from_millis(200)); // Give server time to start
             match option {
-                "sendto" => std::process::Command::new("nc")
+                "sendto" | "sendmsg" => std::process::Command::new("nc")
                     .args([
                         "-w", // timeout for connects and final net reads
                         "1",
@@ -1123,6 +1178,40 @@ mod tests {
                 let stdout = alloc::string::String::from_utf8_lossy(&output.stdout);
                 assert_eq!(stdout, buf);
             }
+            "sendmsg" => {
+                let buf1 = "Hello,";
+                let buf2 = " world!\n";
+                let iovec = [
+                    litebox_common_linux::IoVec {
+                        iov_base: MutPtr::from_usize(buf1.as_ptr().expose_provenance()),
+                        iov_len: buf1.len(),
+                    },
+                    litebox_common_linux::IoVec {
+                        iov_base: MutPtr::from_usize(buf2.as_ptr().expose_provenance()),
+                        iov_len: buf2.len(),
+                    },
+                ];
+                let hdr = litebox_common_linux::UserMsgHdr {
+                    msg_name: ConstPtr::from_usize(0),
+                    msg_namelen: 0,
+                    msg_iov: ConstPtr::from_usize(iovec.as_ptr() as usize),
+                    msg_iovlen: iovec.len(),
+                    msg_control: ConstPtr::from_usize(0),
+                    msg_controllen: 0,
+                    msg_flags: SendFlags::empty(),
+                };
+                assert_eq!(
+                    task.sys_sendmsg(client_fd, &hdr, SendFlags::empty())
+                        .expect("Failed to sendmsg"),
+                    buf1.len() + buf2.len()
+                );
+                let output = child_handle
+                    .join()
+                    .unwrap()
+                    .expect("Failed to wait for client");
+                let stdout = alloc::string::String::from_utf8_lossy(&output.stdout);
+                assert_eq!(stdout, alloc::format!("{buf1}{buf2}"));
+            }
             "recvfrom" => {
                 if is_nonblocking {
                     epoll_add(task, epfd, client_fd, litebox::event::Events::IN);
@@ -1177,14 +1266,34 @@ mod tests {
         test_tcp_socket(&task, TUN_IP_ADDR, port, is_nonblocking, test_trunc, option);
     }
 
-    #[test]
-    fn test_tun_blocking_sendto_tcp_socket() {
-        test_tcp_socket_with_external_client(SERVER_PORT, false, false, "sendto");
+    fn test_tcp_socket_send(is_nonblocking: bool, test_trunc: bool) {
+        let task = init_platform(Some("tun99"));
+        test_tcp_socket(
+            &task,
+            TUN_IP_ADDR,
+            SERVER_PORT,
+            is_nonblocking,
+            test_trunc,
+            "sendto",
+        );
+        test_tcp_socket(
+            &task,
+            TUN_IP_ADDR,
+            SERVER_PORT,
+            is_nonblocking,
+            test_trunc,
+            "sendmsg",
+        );
     }
 
     #[test]
-    fn test_tun_nonblocking_sendto_tcp_socket() {
-        test_tcp_socket_with_external_client(SERVER_PORT, true, false, "sendto");
+    fn test_tun_blocking_send_tcp_socket() {
+        test_tcp_socket_send(false, false);
+    }
+
+    #[test]
+    fn test_tun_nonblocking_send_tcp_socket() {
+        test_tcp_socket_send(true, false);
     }
 
     #[test]
