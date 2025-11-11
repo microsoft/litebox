@@ -680,6 +680,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         &self,
         old_range: core::ops::Range<usize>,
         new_range: core::ops::Range<usize>,
+        _permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
     ) -> Result<UserMutPtr<u8>, litebox::platform::page_mgmt::RemapError> {
         let old_range = PageRange::new(old_range.start, old_range.end)
             .ok_or(litebox::platform::page_mgmt::RemapError::Unaligned)?;

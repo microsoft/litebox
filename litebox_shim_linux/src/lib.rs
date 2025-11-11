@@ -770,9 +770,24 @@ impl Task {
                 addr,
                 addrlen,
                 flags,
-            } => self
-                .sys_accept(sockfd, addr, addrlen, flags)
-                .map(|fd| fd as usize),
+            } => {
+                let mut remote_addr = addr.is_some().then(syscalls::net::SocketAddress::default);
+                self.sys_accept(sockfd, remote_addr.as_mut(), flags)
+                    .and_then(|fd| {
+                        if let (Some(addr), Some(remote_addr)) = (addr, remote_addr) {
+                            let addrlen = addrlen.ok_or(Errno::EFAULT)?;
+                            if let Err(err) =
+                                syscalls::net::write_sockaddr_to_user(remote_addr, addr, addrlen)
+                            {
+                                // If we fail to write the address back to user, we need to close the accepted socket.
+                                self.sys_close(i32::try_from(fd).unwrap())
+                                    .expect("close a newly-accepted socket failed");
+                                return Err(err);
+                            }
+                        }
+                        Ok(fd as usize)
+                    })
+            }
             SyscallRequest::Sendto {
                 sockfd,
                 buf,
@@ -784,6 +799,9 @@ impl Task {
                 .map(|addr| syscalls::net::read_sockaddr_from_user(addr, addrlen as usize))
                 .transpose()
                 .and_then(|sockaddr| self.sys_sendto(sockfd, buf, len, flags, sockaddr)),
+            SyscallRequest::Sendmsg { sockfd, msg, flags } => unsafe { msg.read_at_offset(0) }
+                .ok_or(Errno::EFAULT)
+                .and_then(|msg| self.sys_sendmsg(sockfd, &msg, flags)),
             SyscallRequest::Recvfrom {
                 sockfd,
                 buf,
@@ -843,12 +861,14 @@ impl Task {
                 addr,
                 addrlen,
             } => self.sys_getsockname(sockfd).and_then(|sockaddr| {
-                syscalls::net::write_sockaddr_to_user(
-                    syscalls::net::SocketAddress::Inet(sockaddr),
-                    addr,
-                    addrlen,
-                )
-                .map(|()| 0)
+                syscalls::net::write_sockaddr_to_user(sockaddr, addr, addrlen).map(|()| 0)
+            }),
+            SyscallRequest::Getpeername {
+                sockfd,
+                addr,
+                addrlen,
+            } => self.sys_getpeername(sockfd).and_then(|sockaddr| {
+                syscalls::net::write_sockaddr_to_user(sockaddr, addr, addrlen).map(|()| 0)
             }),
             SyscallRequest::Uname { buf } => self.sys_uname(buf).map(|()| 0usize),
             SyscallRequest::Fcntl { fd, arg } => self.sys_fcntl(fd, arg).map(|v| v as usize),
@@ -898,14 +918,6 @@ impl Task {
                 sigmask,
                 sigsetsize,
             } => self.sys_ppoll(fds, nfds, timeout, sigmask, sigsetsize),
-            SyscallRequest::Poll { fds, nfds, timeout } => self.sys_poll(fds, nfds, timeout),
-            SyscallRequest::Select {
-                nfds,
-                readfds,
-                writefds,
-                exceptfds,
-                timeout,
-            } => self.sys_select(nfds, readfds, writefds, exceptfds, timeout),
             SyscallRequest::Pselect {
                 nfds,
                 readfds,
@@ -932,11 +944,7 @@ impl Task {
             SyscallRequest::ClockGettime { clockid, tp } => {
                 let clock_id =
                     litebox_common_linux::ClockId::try_from(clockid).expect("invalid clockid");
-                self.sys_clock_gettime(clock_id).and_then(|t| {
-                    unsafe { tp.write_at_offset(0, t) }
-                        .map(|()| 0)
-                        .ok_or(Errno::EFAULT)
-                })
+                self.sys_clock_gettime(clock_id, tp).map(|()| 0)
             }
             SyscallRequest::ClockGetres { clockid, res } => {
                 let clock_id =

@@ -1,6 +1,7 @@
 //! Memory management related functionality
 
 pub mod allocator;
+pub mod exception_table;
 pub mod linux;
 
 #[cfg(test)]

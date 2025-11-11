@@ -234,10 +234,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        addr.mutate_subslice_with(..0x2000, |buf| {
-            buf.fill(0xff);
-        })
-        .unwrap();
+        unsafe { addr.write_slice_at_offset(0, &[0xff; 0x2000]).unwrap() };
         assert_eq!(
             unsafe { addr.read_at_offset(0x1000) }.unwrap().into_owned(),
             0xff,
@@ -273,8 +270,6 @@ mod tests {
         task.sys_close(fd).unwrap();
     }
 
-    // `mremap` is not implemented for windows yet.
-    #[cfg(not(any(feature = "platform_windows_userland")))]
     #[test]
     fn test_mremap() {
         let task = init_platform(None);
@@ -394,10 +389,7 @@ mod tests {
             )
             .unwrap();
 
-        addr.mutate_subslice_with(..0x10, |buf| {
-            buf.fill(0xff);
-        })
-        .unwrap();
+        unsafe { addr.write_slice_at_offset(0, &[0xff; 0x10]).unwrap() };
 
         // Test MADV_NORMAL
         assert!(
@@ -422,5 +414,16 @@ mod tests {
         }
 
         task.sys_munmap(addr, 0x2000).unwrap();
+    }
+
+    // Signal support for Windows is not ready yet.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_fallible_read() {
+        let _ = init_platform(None);
+
+        let ptr = crate::MutPtr::<u8>::from_usize(0xdeadbeef);
+        let result = unsafe { ptr.read_at_offset(0) };
+        assert!(result.is_none());
     }
 }

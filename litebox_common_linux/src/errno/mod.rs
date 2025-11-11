@@ -380,6 +380,16 @@ impl From<litebox::net::errors::LocalAddrError> for Errno {
     }
 }
 
+impl From<litebox::net::errors::RemoteAddrError> for Errno {
+    fn from(value: litebox::net::errors::RemoteAddrError) -> Self {
+        match value {
+            litebox::net::errors::RemoteAddrError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::RemoteAddrError::NotConnected => Errno::ENOTCONN,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::net::errors::ListenError> for Errno {
     fn from(value: litebox::net::errors::ListenError) -> Self {
         match value {
@@ -410,7 +420,7 @@ impl From<litebox::net::errors::SendError> for Errno {
     fn from(value: litebox::net::errors::SendError) -> Self {
         match value {
             litebox::net::errors::SendError::InvalidFd => Errno::EBADF,
-            litebox::net::errors::SendError::SocketInInvalidState => Errno::ENOTCONN,
+            litebox::net::errors::SendError::SocketInInvalidState => Errno::EPIPE,
             litebox::net::errors::SendError::Unaddressable => Errno::EDESTADDRREQ,
             litebox::net::errors::SendError::BufferFull => Errno::EAGAIN,
             litebox::net::errors::SendError::PortAllocationFailure(e) => e.into(),

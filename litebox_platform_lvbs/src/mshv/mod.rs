@@ -552,7 +552,7 @@ impl HvRegisterVsmPartitionConfig {
         u64::from_le_bytes(self.into_bytes())
     }
 
-    /// Create from a u64 value for compatibility with existing code  
+    /// Create from a u64 value for compatibility with existing code
     pub fn from_u64(value: u64) -> Self {
         Self::from_bytes(value.to_le_bytes())
     }
