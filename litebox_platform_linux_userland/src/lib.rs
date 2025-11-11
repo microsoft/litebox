@@ -1388,6 +1388,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         &self,
         old_range: core::ops::Range<usize>,
         new_range: core::ops::Range<usize>,
+        _permissions: MemoryRegionPermissions,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
         let res = unsafe {
             syscalls::syscall6(
