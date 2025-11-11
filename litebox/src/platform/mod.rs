@@ -72,7 +72,10 @@ pub trait ThreadProvider: RawPointerProvider {
     /// it later.
     ///
     /// # Panics
-    /// Panics if called from a non-platform thread.
+    /// May panic if called outside the platform's call to one of the
+    /// [`EnterShim`] methods.
+    ///
+    /// [`EnterShim`]: crate::shim::EnterShim
     fn current_thread(&self) -> Self::ThreadHandle;
 
     /// Interrupt the given thread from running guest code.

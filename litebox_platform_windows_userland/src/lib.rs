@@ -840,18 +840,18 @@ impl ThreadHandle {
 
         // SAFETY: The target TLS state is accessible while the thread is
         // suspended.
-        let tls = unsafe { &*inner.tls.0 };
+        let target_tls = unsafe { &*inner.tls.0 };
 
         // Write the target interrupt flag.
-        tls.interrupt.set(true);
+        target_tls.interrupt.set(true);
 
-        if !tls.is_in_guest.get() {
+        if !target_tls.is_in_guest.get() {
             // Not running in the guest. The interrupt flag will be checked
             // before returning to the guest, so just resume.
             return;
         }
 
-        let guest_context = tls.guest_context_top.get().wrapping_sub(1);
+        let guest_context = target_tls.guest_context_top.get().wrapping_sub(1);
 
         // Running in the guest. There are multiple possibilities:
         //
@@ -902,8 +902,8 @@ impl ThreadHandle {
 
             // SAFETY: `continue_context` is not accessed by user-mode code
             // while `is_in_guest` is true.
-            let continue_context = unsafe { &mut *tls.continue_context.get() };
-            set_context_to_interrupt_callback(tls, continue_context, guest_context);
+            let continue_context = unsafe { &mut *target_tls.continue_context.get() };
+            set_context_to_interrupt_callback(target_tls, continue_context, guest_context);
             false
         } else {
             // Case 4: save the guest context and jump to interrupt callback.
@@ -911,7 +911,7 @@ impl ThreadHandle {
             true
         };
         if run_interrupt_callback {
-            set_context_to_interrupt_callback(tls, &mut context, guest_context);
+            set_context_to_interrupt_callback(target_tls, &mut context, guest_context);
             unsafe {
                 windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(
                     inner.handle.as_raw_handle(),
@@ -922,6 +922,8 @@ impl ThreadHandle {
     }
 }
 
+/// Updates `context` to jump to the interrupt callback with the given
+/// `guest_context` pointer.
 fn set_context_to_interrupt_callback(
     tls: &TlsState,
     context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
@@ -1669,9 +1671,7 @@ unsafe extern "C" {
 }
 
 unsafe extern "C-unwind" fn init_handler(ctx: &mut litebox_common_linux::PtRegs) {
-    let &shim = SHIM.get().expect("Should have run `register_shim` by now");
-    clear_interrupt();
-    continue_operation(shim.init(ctx), ctx);
+    call_shim(ctx, |shim, ctx, _interrupt| shim.init(ctx));
 }
 
 /// Windows syscall handler (placeholder - needs Windows implementation)
@@ -1685,9 +1685,7 @@ unsafe extern "C-unwind" fn init_handler(ctx: &mut litebox_common_linux::PtRegs)
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
 unsafe extern "C-unwind" fn syscall_handler(ctx: &mut litebox_common_linux::PtRegs) {
-    let &shim = SHIM.get().expect("Should have run `register_shim` by now");
-    clear_interrupt();
-    continue_operation(shim.syscall(ctx), ctx);
+    call_shim(ctx, |shim, ctx, _interrupt| shim.syscall(ctx));
 }
 
 unsafe extern "C-unwind" fn exception_handler(
@@ -1719,30 +1717,39 @@ unsafe extern "C-unwind" fn exception_handler(
         cr2,
     };
 
-    let &shim = SHIM.get().expect("Should have run `register_shim` by now");
-    clear_interrupt();
-    continue_operation(shim.exception(ctx, &info), ctx);
+    call_shim(ctx, |shim, ctx, _interrupt| shim.exception(ctx, &info));
 }
 
 unsafe extern "C-unwind" fn interrupt_handler(ctx: &mut litebox_common_linux::PtRegs) {
+    call_shim(ctx, |shim, ctx, interrupt| {
+        if interrupt {
+            shim.interrupt(ctx)
+        } else {
+            // We likely got here just to restore fsbase, so don't bother the
+            // shim.
+            ContinueOperation::ResumeGuest
+        }
+    });
+}
+
+/// Calls `f` in order to call into a shim entrypoint.
+fn call_shim(
+    ctx: &mut litebox_common_linux::PtRegs,
+    f: impl FnOnce(
+        &dyn litebox::shim::EnterShim<
+            ContinueOperation = ContinueOperation,
+            ExecutionContext = litebox_common_linux::PtRegs,
+        >,
+        &mut litebox_common_linux::PtRegs,
+        bool,
+    ) -> ContinueOperation,
+) {
     let &shim = SHIM.get().expect("Should have run `register_shim` by now");
-    let op = if clear_interrupt() {
-        shim.interrupt(ctx)
-    } else {
-        ContinueOperation::ResumeGuest
-    };
-    continue_operation(op, ctx);
-}
-
-fn clear_interrupt() -> bool {
-    if let Some(tls) = get_tls_ptr() {
-        unsafe { (*tls).interrupt.replace(false) }
-    } else {
-        false
-    }
-}
-
-fn continue_operation(op: ContinueOperation, ctx: &mut litebox_common_linux::PtRegs) {
+    // Clear the interrupt flag before calling the shim, since we've handled it
+    // now (by calling into the shim), and it might be set again by the shim
+    // before returning.
+    let interrupt = unsafe { (*get_tls_ptr().unwrap()).interrupt.replace(false) };
+    let op = f(shim, ctx, interrupt);
     match op {
         ContinueOperation::ResumeGuest => unsafe { switch_to_guest(ctx) },
         ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {

@@ -26,6 +26,21 @@ pub trait EnterShim: Send + Sync {
 
     /// Initialize a new thread. Must be called by the platform exactly once
     /// before running the thread in the guest for the first time.
+    ///
+    /// Shims might use this to capture the thread handle via
+    /// [`ThreadProvider::current_thread`] and to validate that the thread is
+    /// still needed now that it has had a chance to run.
+    ///
+    /// This is called both for the initial thread and for any threads created
+    /// via [`ThreadProvider::spawn_thread`]. In the latter case, the platform
+    /// must first call [`InitThread::init`] on the object provided by the shim
+    /// to set up thread local storage. (FUTURE: [`InitThread::init`] should
+    /// return `Box<dyn EnterShim>` rather than rely on TLS.)
+    ///
+    /// [`ThreadProvider::spawn_thread`]:
+    ///     crate::platform::ThreadProvider::spawn_thread
+    /// [`ThreadProvider::current_thread`]:
+    ///     crate::platform::ThreadProvider::current_thread
     fn init(&self, ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation;
 
     /// Handle a syscall.
@@ -45,6 +60,10 @@ pub trait EnterShim: Send + Sync {
 
     /// Handle an interrupt signaled by
     /// [`ThreadProvider::interrupt_thread`](crate::platform::ThreadProvider::interrupt_thread).
+    ///
+    /// Note that if another event occurs (e.g., a syscall or exception) while
+    /// the thread is interrupted, the platform may just call the corresponding
+    /// handler instead of this one.
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation;
 }
 
