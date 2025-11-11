@@ -340,6 +340,7 @@ guest_fsbase:
     .quad 0
 in_guest:
     .byte 0
+.globl interrupt
 interrupt:
     .byte 0
     "
