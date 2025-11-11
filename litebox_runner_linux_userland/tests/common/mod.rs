@@ -146,7 +146,8 @@ pub fn rewrite_with_cache(input_path: &Path, output_path: &Path, extra_args: &[&
     args.push(input_path.to_str().unwrap());
 
     // Create command string for caching
-    let mut command_parts = vec!["cargo"];
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let mut command_parts = vec![cargo.as_str()];
     command_parts.extend_from_slice(&args);
     let command = command_parts.join(" ");
 
@@ -165,7 +166,7 @@ pub fn rewrite_with_cache(input_path: &Path, output_path: &Path, extra_args: &[&
         output_path.display()
     );
 
-    let output = std::process::Command::new("cargo")
+    let output = std::process::Command::new(&cargo)
         .args(args)
         .output()
         .expect("Failed to run litebox_syscall_rewriter");

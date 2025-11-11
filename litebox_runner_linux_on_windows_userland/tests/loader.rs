@@ -159,7 +159,8 @@ fn test_static_linked_prog_with_rewriter() {
         hooked_path.to_str().unwrap(),
         path.to_str().unwrap()
     );
-    let output = std::process::Command::new("cargo")
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let output = std::process::Command::new(cargo)
         .args([
             "run",
             "-p",
@@ -206,7 +207,8 @@ fn run_dynamic_linked_prog_with_rewriter(
 
     // Rewrite the target ELF executable file
     let _ = std::fs::remove_file(hooked_path.clone());
-    let output = std::process::Command::new("cargo")
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let output = std::process::Command::new(&cargo)
         .args([
             "run",
             "-p",
@@ -245,7 +247,7 @@ fn run_dynamic_linked_prog_with_rewriter(
             src.to_str().unwrap(),
             dst.to_str().unwrap(),
         );
-        let output = std::process::Command::new("cargo")
+        let output = std::process::Command::new(&cargo)
             .args([
                 "run",
                 "-p",
@@ -303,12 +305,13 @@ fn run_dynamic_linked_prog_with_rewriter(
     );
     println!("Tar file created at: {}", tar_target_file.to_str().unwrap());
 
+    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_on_windows_userland")
+        .unwrap_or_else(|_| {
+            env!("CARGO_BIN_EXE_litebox_runner_linux_on_windows_userland").to_string()
+        });
+
     // Run litebox_runner_linux_on_windows_userland with the tar file and the compiled executable
     let mut args = vec![
-        "run",
-        "-p",
-        "litebox_runner_linux_on_windows_userland",
-        "--",
         "--unstable",
         // Tell ld where to find the libraries.
         // See https://man7.org/linux/man-pages/man8/ld.so.8.html for how ld works.
@@ -323,15 +326,15 @@ fn run_dynamic_linked_prog_with_rewriter(
     args.push(hooked_path.to_str().unwrap());
     args.extend_from_slice(cmd_args);
 
-    println!("Running `cargo {}`", args.join(" "));
-    let output = std::process::Command::new("cargo")
-        .args(args)
-        .output()
+    let mut command = std::process::Command::new(&binary_path);
+    command.args(&args);
+    println!("Running `{:?}`", command);
+    let status = command
+        .status()
         .expect("Failed to run litebox_runner_linux_on_windows_userland");
     assert!(
-        output.status.success(),
-        "failed to run litebox_runner_linux_on_windows_userland {:?}",
-        std::str::from_utf8(output.stderr.as_slice()).unwrap()
+        status.success(),
+        "failed to run litebox_runner_linux_on_windows_userland: {status}",
     );
 }
 
