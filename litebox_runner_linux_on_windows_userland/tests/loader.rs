@@ -328,7 +328,7 @@ fn run_dynamic_linked_prog_with_rewriter(
 
     let mut command = std::process::Command::new(&binary_path);
     command.args(&args);
-    println!("Running `{:?}`", command);
+    println!("Running `{command:?}`");
     let status = command
         .status()
         .expect("Failed to run litebox_runner_linux_on_windows_userland");

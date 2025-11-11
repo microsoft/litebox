@@ -126,6 +126,7 @@ impl Runner {
         self
     }
 
+    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
     fn envs(&mut self, envs: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> &mut Self {
         for env in envs {
             self.env(env);
@@ -138,6 +139,7 @@ impl Runner {
         self
     }
 
+    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
     fn args(&mut self, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> &mut Self {
         for arg in args {
             self.cmd_args.push(arg.as_ref().to_os_string());
@@ -151,6 +153,7 @@ impl Runner {
         self
     }
 
+    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
     fn with_fs_path(&mut self, f: impl FnOnce(&Path)) -> &mut Self {
         f(&self.tar_dir);
         self
@@ -161,6 +164,7 @@ impl Runner {
     }
 
     #[must_use]
+    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
     fn output(&mut self) -> Vec<u8> {
         self.run_inner(true)
     }

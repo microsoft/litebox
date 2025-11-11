@@ -11,12 +11,9 @@ fn run(name: &str) {
         &format!("tests/{name}.elf.hooked"),
         &format!("tests/{name}-cmds.json"),
     ]);
-    println!("Running `{:?}`", command);
+    println!("Running `{command:?}`");
     let status = command.status().unwrap_or_else(|err| {
-        panic!(
-            "Failed to run litebox_runner_optee_on_linux_userland against {name}.elf: {}",
-            err
-        )
+        panic!("Failed to run litebox_runner_optee_on_linux_userland against {name}.elf: {err}")
     });
     assert!(
         status.success(),
