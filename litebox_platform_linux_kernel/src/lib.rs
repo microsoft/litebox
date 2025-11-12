@@ -411,7 +411,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             FixedAddressBehavior::Hint | FixedAddressBehavior::NoReplace => {}
             FixedAddressBehavior::Replace => {
                 // Clear the existing mappings first.
-                unsafe { self.deallocate_pages(suggested_range).unwrap() };
+                unsafe { self.page_table.unmap_pages(range, true).unwrap() };
             }
         }
         let flags = u32::from(initial_permissions.bits())
