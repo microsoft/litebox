@@ -119,7 +119,12 @@ impl<F: FnOnce()> Drop for Defer<F> {
 }
 
 /// Returns an object that will run `f` when it goes out of scope.
-#[must_use]
+///
+/// Caution: the returned object must be bound to a variable to ensure the
+/// closure runs at scope end. In particular, binding to `_` will not work; use
+/// a named variable or a variable with a name starting with `_` (e.g.,
+/// `_defer`) instead.
+#[must_use = "Must be bound to a variable to defer until scope end; variable name cannot be just '_' (but '_foo' is fine)."]
 pub fn defer(f: impl FnOnce()) -> Defer<impl FnOnce()> {
     Defer(Some(f))
 }
