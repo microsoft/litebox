@@ -149,9 +149,10 @@ impl<T: 'static, Platform: ThreadLocalStorageProvider> TlsKey<T, Platform> {
     pub fn with<R>(&'static self, f: impl FnOnce(&T) -> R) -> R {
         let tls = unsafe { &*self.get_ptr() };
         tls.users.set(tls.users.get().checked_add(1).unwrap());
-        let r = f(&tls.data);
-        tls.users.set(tls.users.get().checked_sub(1).unwrap());
-        r
+        let _guard = crate::utils::defer(|| {
+            tls.users.set(tls.users.get().checked_sub(1).unwrap());
+        });
+        f(&tls.data)
     }
 }
 

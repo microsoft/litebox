@@ -52,6 +52,7 @@ pub trait ThreadProvider: RawPointerProvider {
     type ExecutionContext;
     /// Error type for [`ThreadProvider::spawn_thread`].
     type ThreadSpawnError: core::error::Error;
+    type ThreadHandle: 'static + Send + Sync;
 
     /// Spawn a new thread with the given entry point.
     ///
@@ -67,6 +68,27 @@ pub trait ThreadProvider: RawPointerProvider {
         ctx: &Self::ExecutionContext,
         init_thread: alloc::boxed::Box<dyn crate::shim::InitThread>,
     ) -> Result<(), Self::ThreadSpawnError>;
+
+    /// Returns a handle to the current thread, which can be used to interrupt
+    /// it later.
+    ///
+    /// # Panics
+    /// May panic if called outside the platform's call to one of the
+    /// [`EnterShim`] methods.
+    ///
+    /// [`EnterShim`]: crate::shim::EnterShim
+    fn current_thread(&self) -> Self::ThreadHandle;
+
+    /// Interrupt the given thread from running guest code.
+    ///
+    /// Ensures that one of the [`EnterShim`] methods ([`EnterShim::interrupt`]
+    /// if no other guest exit is concurrently in progress) is called on the
+    /// thread as soon as possible, interrupting currently running guest code if
+    /// needed.
+    ///
+    /// [`EnterShim`]: crate::shim::EnterShim
+    /// [`EnterShim::interrupt`]: crate::shim::EnterShim::interrupt
+    fn interrupt_thread(&self, thread: &Self::ThreadHandle);
 }
 
 /// Punch through any functionality for a particular platform that is not explicitly part of the

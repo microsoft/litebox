@@ -84,6 +84,7 @@ pub extern "C" fn sandbox_kernel_init(
 const ROOTFS: &[u8] = include_bytes!("./test.tar");
 
 /// Initializes the sandbox process.
+#[expect(clippy::missing_panics_doc, reason = "internal invariants")]
 #[unsafe(no_mangle)]
 pub extern "C" fn sandbox_process_init(
     pt_regs: &mut litebox_common_linux::PtRegs,
@@ -139,6 +140,7 @@ pub extern "C" fn sandbox_process_init(
             globals::SM_TERM_INVALID_PARAM,
         );
     };
+    let entrypoints = shim.entrypoints();
     *pt_regs = match shim.load_program(platform.init_task(boot_params), &program, argv, envp) {
         Ok(regs) => regs,
         Err(err) => {
@@ -149,6 +151,11 @@ pub extern "C" fn sandbox_process_init(
             );
         }
     };
+    // TODO: handle ContinueOperation properly.
+    assert!(matches!(
+        entrypoints.init(pt_regs),
+        ContinueOperation::ResumeGuest
+    ));
 }
 
 #[unsafe(no_mangle)]

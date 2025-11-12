@@ -6,10 +6,12 @@
 
 use core::cell::Cell;
 use core::panic;
-use core::sync::atomic::AtomicU32;
-use core::sync::atomic::Ordering::SeqCst;
+use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
+use std::cell::RefCell;
 use std::os::raw::c_void;
+use std::os::windows::io::AsRawHandle as _;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
@@ -99,19 +101,17 @@ impl WindowsUserland {
 unsafe extern "system" fn vectored_exception_handler(
     exception_info: *mut EXCEPTION_POINTERS,
 ) -> i32 {
-    let tls_index = TLS_INDEX.load(std::sync::atomic::Ordering::Relaxed);
-    if tls_index == u32::MAX {
+    let Some(tls) = get_tls_ptr() else {
         // TLS slot not initialized yet; cannot be in guest
         return EXCEPTION_CONTINUE_SEARCH;
-    }
-    let tls = unsafe {
-        &*windows_sys::Win32::System::Threading::TlsGetValue(tls_index).cast::<TlsState>()
     };
+    let tls = unsafe { &*tls };
     // Only handle exceptions that happen inside the guest.
     if !tls.is_in_guest.get() {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     tls.is_in_guest.set(false);
+
     let (info, exception_record, context, regs);
     unsafe {
         info = *exception_info;
@@ -120,19 +120,46 @@ unsafe extern "system" fn vectored_exception_handler(
         regs = &mut *tls.guest_context_top.get().wrapping_sub(1);
     }
 
-    // Special case for fixing up FS base if it was cleared.
+    save_guest_context(regs, context);
+
+    // If it looks like fs base was cleared, then go through the interrupt path
+    // instead of the exception path to restore the fs base and try again.
+    //
+    // This is done instead of just fixing up fsbase and returning here to avoid
+    // missing a real interrupt that arrives while resuming the guest. Go through
+    // the interrupt path to ensure that any pending interrupts are also handled.
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
         && unsafe { litebox_common_linux::rdfsbase() } == 0
+        && WindowsUserland::get_thread_fs_base() != 0
     {
-        // Restore the FS base from the saved state and try again.
-        let target_fsbase = WindowsUserland::get_thread_fs_base();
-        if target_fsbase != 0 {
-            WindowsUserland::restore_thread_fs_base();
-            tls.is_in_guest.set(true);
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
+        set_context_to_interrupt_callback(tls, context, regs);
+    } else {
+        // Push the exception record onto the host stack.
+        let exception_record_ptr = tls.host_sp.get().cast::<EXCEPTION_RECORD>().wrapping_sub(1);
+        assert!(exception_record_ptr.is_aligned());
+        unsafe { exception_record_ptr.write(*exception_record) };
+
+        // Re-align the stack pointer.
+        let rsp = exception_record_ptr as usize & !15;
+
+        // Ensure that `run_thread` is linked in so that `exception_callback` is visible.
+        let _ = run_thread as usize;
+
+        // Update the thread context to jump to the exception handler.
+        context.Rip = exception_callback as usize as u64;
+        context.Rsp = rsp as u64;
+        context.Rbp = tls.host_bp.get() as u64;
+        context.Rcx = core::ptr::from_mut(regs) as u64;
+        context.Rdx = exception_record_ptr as u64;
     }
-    // Save the guest context.
+
+    EXCEPTION_CONTINUE_EXECUTION
+}
+
+fn save_guest_context(
+    guest_context: &mut litebox_common_linux::PtRegs,
+    context: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+) {
     let litebox_common_linux::PtRegs {
         r15,
         r14,
@@ -155,7 +182,7 @@ unsafe extern "system" fn vectored_exception_handler(
         eflags,
         rsp,
         ss: _,
-    } = regs;
+    } = guest_context;
     *r15 = context.R15.truncate();
     *r14 = context.R14.truncate();
     *r13 = context.R13.truncate();
@@ -175,26 +202,6 @@ unsafe extern "system" fn vectored_exception_handler(
     *rip = context.Rip.truncate();
     *eflags = context.EFlags as usize;
     *rsp = context.Rsp.truncate();
-
-    // Push the exception record onto the host stack.
-    let exception_record_ptr = tls.host_sp.get().cast::<EXCEPTION_RECORD>().wrapping_sub(1);
-    assert!(exception_record_ptr.is_aligned());
-    unsafe { exception_record_ptr.write(*exception_record) };
-
-    // Re-align the stack pointer.
-    let rsp = exception_record_ptr as usize & !15;
-
-    // Ensure that `run_thread` is linked in so that `exception_callback` is visible.
-    let _ = run_thread as usize;
-
-    // Update the thread context to jump to the exception handler.
-    context.Rip = exception_callback as usize as u64;
-    context.Rsp = rsp as u64;
-    context.Rbp = tls.host_bp.get() as u64;
-    context.Rcx = core::ptr::from_mut(regs) as u64;
-    context.Rdx = exception_record_ptr as u64;
-
-    EXCEPTION_CONTINUE_EXECUTION
 }
 
 impl WindowsUserland {
@@ -351,24 +358,28 @@ pub unsafe fn run_thread(ctx: &mut litebox_common_linux::PtRegs) {
             index < 64,
             "no non-extended TLS slots available: {index:#x}"
         );
-        TLS_INDEX.store(index, std::sync::atomic::Ordering::Relaxed);
+        TLS_INDEX.store(index, Ordering::Relaxed);
     });
-    let tls_index = TLS_INDEX.load(std::sync::atomic::Ordering::Relaxed);
+    let tls_index = TLS_INDEX.load(Ordering::Relaxed);
     let tls_state = TlsState {
         host_sp: Cell::new(core::ptr::null_mut()),
         host_bp: Cell::new(core::ptr::null_mut()),
         guest_context_top: std::ptr::from_mut(ctx).wrapping_add(1).into(),
         scratch: 0.into(),
         is_in_guest: false.into(),
+        interrupt: false.into(),
+        continue_context: Box::default(),
     };
     unsafe {
         windows_sys::Win32::System::Threading::TlsSetValue(
             tls_index,
             core::ptr::from_ref(&tls_state).cast(),
         );
-        run_thread_inner(ctx, &tls_state);
-        windows_sys::Win32::System::Threading::TlsSetValue(tls_index, core::ptr::null());
     }
+    let _tls_guard = litebox::utils::defer(|| unsafe {
+        windows_sys::Win32::System::Threading::TlsSetValue(tls_index, core::ptr::null());
+    });
+    ThreadHandle::run_with_handle(&tls_state, || unsafe { run_thread_inner(ctx, &tls_state) });
 }
 
 static TLS_INDEX: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -379,6 +390,19 @@ struct TlsState {
     guest_context_top: Cell<*mut litebox_common_linux::PtRegs>,
     scratch: Cell<usize>,
     is_in_guest: Cell<bool>,
+    interrupt: Cell<bool>,
+    continue_context:
+        Box<std::cell::UnsafeCell<windows_sys::Win32::System::Diagnostics::Debug::CONTEXT>>,
+}
+
+fn get_tls_ptr() -> Option<*const TlsState> {
+    let tls_index = TLS_INDEX.load(Ordering::Relaxed);
+    if tls_index == u32::MAX {
+        return None;
+    }
+    Some(unsafe {
+        windows_sys::Win32::System::Threading::TlsGetValue(tls_index).cast::<TlsState>()
+    })
 }
 
 /// Runs the guest thread until it terminates.
@@ -450,10 +474,8 @@ unsafe extern "C-unwind" fn run_thread_inner(
     mov     QWORD PTR [rdx + {HOST_SP}], rsp
     mov     QWORD PTR [rdx + {HOST_BP}], rbp
 
-    // Switch to the guest context. When the guest issues a syscall, it will
-    // jump back into the middle of this function, at `syscall_callback`.
-    call {switch_to_guest}
-    ud2
+    call {init_handler}
+    jmp .Ldone
 
     // This entry point is called from the guest when it issues a syscall
     // instruction.
@@ -513,6 +535,11 @@ exception_callback:
     // and the guest context is up to date. rcx contains a pointer to the
     // guest pt_regs, and rdx contains a pointer to the exception record.
     call {exception_handler}
+    jmp .Ldone
+
+interrupt_callback:
+    call {interrupt_handler}
+    jmp .Ldone
 
 .Ldone:
     // Restore non-volatile registers and return.
@@ -539,9 +566,10 @@ exception_callback:
     ret
     .seh_endproc
     ",
+    init_handler = sym init_handler,
     syscall_handler = sym syscall_handler,
     exception_handler = sym exception_handler,
-    switch_to_guest = sym switch_to_guest,
+    interrupt_handler = sym interrupt_handler,
     TLS_INDEX = sym TLS_INDEX,
     HOST_SP = const core::mem::offset_of!(TlsState, host_sp),
     HOST_BP = const core::mem::offset_of!(TlsState, host_bp),
@@ -562,36 +590,53 @@ exception_callback:
 /// destructors.
 ///
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
-    let tls = unsafe {
-        &*windows_sys::Win32::System::Threading::TlsGetValue(
-            TLS_INDEX.load(core::sync::atomic::Ordering::Relaxed),
-        )
-        .cast::<TlsState>()
-    };
-    assert!(!tls.is_in_guest.get());
-    tls.is_in_guest.set(true);
+    #[unsafe(naked)]
+    extern "C" fn switch_to_guest_sysret(ctx: &litebox_common_linux::PtRegs) -> ! {
+        core::arch::naked_asm!(
+            // Load all registers from the guest context structure.
+            "switch_to_guest_start:",
+            "mov rsp, rcx",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop rbp",
+            "pop rbx",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rax",
+            "pop rcx",
+            "pop rdx",
+            "pop rsi",
+            "pop rdi",
+            "pop rcx",    // skip orig_rax
+            "pop rcx",    // read rip into rcx
+            "add rsp, 8", // skip cs
+            "popfq",
+            "pop rsp",
+            "jmp rcx", // jump to the entry point of the thread
+            "switch_to_guest_end:",
+        );
+    }
 
-    // The fast path for switching to the guest relies on rcx == rip. This is
-    // the common case, because the syscall instruction sets rcx to rip at entry
-    // to the kernel. When this is not the case, we use NtContinue to jump to
-    // the guest with the full register state.
-    //
-    // This is much slower, but it is only used for things like signal handlers,
-    // so it should not be on the critical path.
-    if ctx.rcx != ctx.rip {
+    fn switch_to_guest_ntcontinue(tls: &TlsState, ctx: &litebox_common_linux::PtRegs) -> ! {
+        use litebox::utils::ReinterpretSignedExt;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64,
+        };
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtContinue(
+                ctx: *const CONTEXT,
+                raise_alert: u8,
+            ) -> windows_sys::Win32::Foundation::NTSTATUS;
+        }
+        let win_ctx = tls.continue_context.get();
+        // SAFETY: no other code accesses `continue_context` while `is_in_guest` is false.
         unsafe {
-            use litebox::utils::ReinterpretSignedExt;
-            use windows_sys::Win32::System::Diagnostics::Debug::{
-                CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64,
-            };
-            #[link(name = "ntdll")]
-            unsafe extern "system" {
-                fn NtContinue(
-                    ctx: *const CONTEXT,
-                    raise_alert: u8,
-                ) -> windows_sys::Win32::Foundation::NTSTATUS;
-            }
-            let win_ctx = CONTEXT {
+            win_ctx.write(CONTEXT {
                 ContextFlags: CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64,
                 EFlags: ctx.eflags.truncate(),
                 Rax: ctx.rax as u64,
@@ -611,9 +656,15 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
                 R14: ctx.r14 as u64,
                 R15: ctx.r15 as u64,
                 Rip: ctx.rip as u64,
-                ..core::mem::zeroed()
-            };
-            let status = NtContinue(&raw const win_ctx, 0);
+                ..CONTEXT::default()
+            });
+        }
+        // Ensure the context is written before we set `is_in_guest` so that
+        // `ThreadHandle::interrupt` can see a consistent state.
+        std::sync::atomic::compiler_fence(Ordering::Release);
+        tls.is_in_guest.set(true);
+        unsafe {
+            let status = NtContinue(win_ctx, 0);
             panic!(
                 "NtContinue failed: {}",
                 std::io::Error::from_raw_os_error(
@@ -623,33 +674,25 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
             );
         }
     }
-    unsafe {
-        core::arch::asm!(
-            "mov rsp, {ctx}",
-            "pop r15",
-            "pop r14",
-            "pop r13",
-            "pop r12",
-            "pop rbp",
-            "pop rbx",
-            "pop r11",
-            "pop r10",
-            "pop r9",
-            "pop r8",
-            "pop rax",
-            "pop rcx",
-            "pop rdx",
-            "pop rsi",
-            "pop rdi",
-            "pop rcx", // skip orig_rax
-            "pop rcx", // read rip into rcx
-            "add rsp, 8", // skip cs
-            "popfq",
-            "pop rsp",
-            "jmp rcx", // jump to the entry point of the thread
-            ctx = in(reg) ctx,
-            options(noreturn, nostack)
-        );
+
+    let tls = unsafe { &*get_tls_ptr().expect("TLS not initialized") };
+    assert!(!tls.is_in_guest.get());
+
+    // Restore fsbase for the guest.
+    WindowsUserland::restore_thread_fs_base();
+
+    // The fast path for switching to the guest relies on rcx == rip. This is
+    // the common case, because the syscall instruction sets rcx to rip at entry
+    // to the kernel. When this is not the case, we use NtContinue to jump to
+    // the guest with the full register state.
+    //
+    // This is much slower, but it is only used for things like signal handlers,
+    // so it should not be on the critical path.
+    if ctx.rcx == ctx.rip {
+        tls.is_in_guest.set(true);
+        switch_to_guest_sysret(ctx)
+    } else {
+        switch_to_guest_ntcontinue(tls, ctx)
     }
 }
 
@@ -666,6 +709,7 @@ fn thread_start(
 impl litebox::platform::ThreadProvider for WindowsUserland {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
+    type ThreadHandle = ThreadHandle;
 
     unsafe fn spawn_thread(
         &self,
@@ -678,6 +722,260 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
 
         Ok(())
     }
+
+    fn current_thread(&self) -> Self::ThreadHandle {
+        CURRENT_THREAD_HANDLE.with_borrow(|current| {
+            current
+                .clone()
+                .expect("current thread is not managed by LiteBox")
+        })
+    }
+
+    fn interrupt_thread(&self, thread: &Self::ThreadHandle) {
+        CURRENT_THREAD_HANDLE.with_borrow(|current| {
+            thread.interrupt(current.as_ref());
+        });
+    }
+}
+
+#[derive(Clone)]
+pub struct ThreadHandle(Arc<Mutex<Option<ThreadHandleInner>>>);
+
+struct ThreadHandleInner {
+    handle: std::os::windows::io::OwnedHandle,
+    tls: SendConstPtr<TlsState>,
+}
+
+struct SendConstPtr<T>(*const T);
+unsafe impl<T> Send for SendConstPtr<T> {}
+
+thread_local! {
+    static CURRENT_THREAD_HANDLE: RefCell<Option<ThreadHandle>> = const { RefCell::new(None) };
+}
+
+impl ThreadHandle {
+    /// Runs `f`, ensuring that [`CURRENT_THREAD_HANDLE`] is set while in the call to `f`.
+    fn run_with_handle<R>(tls: &TlsState, f: impl FnOnce() -> R) -> R {
+        let win_handle = unsafe {
+            std::os::windows::io::BorrowedHandle::borrow_raw(
+                windows_sys::Win32::System::Threading::GetCurrentThread(),
+            )
+        };
+        let handle = ThreadHandle(Arc::new(Mutex::new(Some(ThreadHandleInner {
+            handle: win_handle
+                .try_clone_to_owned()
+                .expect("failed to clone current thread handle"),
+            tls: SendConstPtr(tls),
+        }))));
+        CURRENT_THREAD_HANDLE.with_borrow_mut(|current| {
+            assert!(
+                current.is_none(),
+                "nested run_with_handle calls are not supported"
+            );
+            *current = Some(handle);
+        });
+        let _guard = litebox::utils::defer(|| {
+            let current = CURRENT_THREAD_HANDLE.take().unwrap();
+            *current.0.lock().unwrap() = None;
+        });
+        f()
+    }
+
+    /// Interrupt the thread represented by this handle, where `current` is the
+    /// current thread's handle if it is managed by LiteBox.
+    ///
+    /// The basic strategy is this:
+    /// 1. Suspend the target thread.
+    /// 2. Access its TLS state to check if it's in the guest.
+    /// 3. If it's not actually in the guest, set the interrupt flag and resume,
+    ///    with some careful handling to make sure the interrupt flag is
+    ///    evaluated upon return to the guest in all cases.
+    /// 4. If it is in the guest, save the guest context and set the thread
+    ///    context to resume at the interrupt callback.
+    /// 5. Resume the target thread.
+    fn interrupt(&self, current: Option<&ThreadHandle>) {
+        /// Helper to lock two mutexes in address order, to prevent deadlock.
+        fn lock_two<'a, T, U>(
+            left: &'a Mutex<T>,
+            right: &'a Mutex<U>,
+        ) -> (std::sync::MutexGuard<'a, T>, std::sync::MutexGuard<'a, U>) {
+            if std::ptr::from_ref(left).addr() < std::ptr::from_ref(right).addr() {
+                let l = left.lock().unwrap();
+                let r = right.lock().unwrap();
+                (l, r)
+            } else {
+                let r = right.lock().unwrap();
+                let l = left.lock().unwrap();
+                (l, r)
+            }
+        }
+
+        let (_current_guard, target) = if let Some(current) = current {
+            if Arc::ptr_eq(&current.0, &self.0) {
+                // Interrupting self; just set the flag.
+                (unsafe { &*get_tls_ptr().unwrap() }).interrupt.set(true);
+                return;
+            }
+
+            // Lock both the current and target thread handles so that this
+            // thread is not suspended while holding the target thread lock.
+            let (c, t) = lock_two(&current.0, &self.0);
+            (Some(c), t)
+        } else {
+            // The current thread can't be suspended since it's not managed by LiteBox.
+            (None, self.0.lock().unwrap())
+        };
+        let Some(inner) = target.as_ref() else {
+            // The target is no longer managed by LiteBox.
+            return;
+        };
+
+        // Suspend the target thread.
+        unsafe {
+            windows_sys::Win32::System::Threading::SuspendThread(inner.handle.as_raw_handle());
+        }
+        let _resume_guard = litebox::utils::defer(|| unsafe {
+            windows_sys::Win32::System::Threading::ResumeThread(inner.handle.as_raw_handle());
+        });
+
+        // SAFETY: The target TLS state is accessible while the thread is
+        // suspended.
+        let target_tls = unsafe { &*inner.tls.0 };
+
+        // Write the target interrupt flag.
+        target_tls.interrupt.set(true);
+
+        if !target_tls.is_in_guest.get() {
+            // Not running in the guest. The interrupt flag will be checked
+            // before returning to the guest, so just resume.
+            return;
+        }
+
+        let guest_context = target_tls.guest_context_top.get().wrapping_sub(1);
+
+        // Running in the guest. There are multiple possibilities:
+        //
+        // 1. The thread is in the middle of returning to the guest via the
+        //    register pop path. Don't save context but do jump to the interrupt
+        //    callback.
+        // 2. The thread is in the middle of returning to the guest via the
+        //    NtContinue path. Update the NtContinue context to point to the
+        //    interrupt callback.
+        // 3. The thread is beginning to handle an exception. Don't do anything;
+        //    this path will check the interrupt flag.
+        // 4. In the guest. Save the guest context and jump to the interrupt callback.
+
+        // Get the current register context.
+        let mut context = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT {
+            ContextFlags: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
+                | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64,
+            ..Default::default()
+        };
+        let r = unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext(
+                inner.handle.as_raw_handle(),
+                &raw mut context,
+            )
+        };
+        assert_ne!(
+            r,
+            0,
+            "GetThreadContext failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let run_interrupt_callback = if (switch_to_guest_start as usize
+            ..switch_to_guest_end as usize)
+            .contains(&(context.Rip.truncate()))
+        {
+            // Case 1: jump to interrupt callback without saving the guest
+            // context, since it's already saved.
+            true
+        } else if is_in_ntdll_or_this(context.Rip.truncate()) {
+            // Case 2/3: we can't distinguish between them. For case 2 we don't
+            // need to do anything, but for case 3 we need to update the
+            // NtContinue context to point to the interrupt callback (the guest
+            // context is already up to date).
+            //
+            // In case 2, the NtContinue context is not being used, so it is
+            // safe to update it anyway.
+
+            // SAFETY: `continue_context` is not accessed by user-mode code
+            // while `is_in_guest` is true.
+            let continue_context = unsafe { &mut *target_tls.continue_context.get() };
+            set_context_to_interrupt_callback(target_tls, continue_context, guest_context);
+            false
+        } else {
+            // Case 4: save the guest context and jump to interrupt callback.
+            save_guest_context(unsafe { &mut *guest_context }, &context);
+            true
+        };
+        if run_interrupt_callback {
+            set_context_to_interrupt_callback(target_tls, &mut context, guest_context);
+            unsafe {
+                windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(
+                    inner.handle.as_raw_handle(),
+                    &raw const context,
+                );
+            }
+        }
+    }
+}
+
+/// Updates `context` to jump to the interrupt callback with the given
+/// `guest_context` pointer.
+fn set_context_to_interrupt_callback(
+    tls: &TlsState,
+    context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+    guest_context: *mut litebox_common_linux::PtRegs,
+) {
+    let required_flags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
+        | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64;
+    assert!(context.ContextFlags & required_flags == required_flags);
+    context.Rip = interrupt_callback as usize as u64;
+    context.Rcx = guest_context as usize as u64;
+    context.Rsp = tls.host_sp.get().addr() as u64;
+    context.Rbp = tls.host_bp.get().addr() as u64;
+}
+
+/// Returns true if the given instruction pointer is in ntdll.dll or this module.
+fn is_in_ntdll_or_this(ip: usize) -> bool {
+    static BOUNDS: OnceLock<[std::ops::Range<usize>; 2]> = const { OnceLock::new() };
+
+    let bounds = BOUNDS.get_or_init(|| {
+        unsafe extern "C" {
+            safe static __ImageBase: c_void;
+        }
+        fn module_bounds(module: *const c_void) -> std::ops::Range<usize> {
+            let mut module_info = windows_sys::Win32::System::ProcessStatus::MODULEINFO::default();
+            let r = unsafe {
+                windows_sys::Win32::System::ProcessStatus::GetModuleInformation(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    module.cast_mut(),
+                    &raw mut module_info,
+                    size_of_val(&module_info).try_into().unwrap(),
+                )
+            };
+            assert_ne!(
+                r,
+                0,
+                "GetModuleInformation failed: {}",
+                std::io::Error::last_os_error()
+            );
+            let start = module_info.lpBaseOfDll.addr();
+            let end = start + module_info.SizeOfImage as usize;
+            start..end
+        }
+
+        let ntdll = unsafe {
+            windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(windows_sys::w!(
+                "ntdll.dll"
+            ))
+        };
+        [module_bounds(ntdll), module_bounds(&raw const __ImageBase)]
+    });
+
+    bounds.iter().any(|b| b.contains(&ip))
 }
 
 impl litebox::platform::RawMutexProvider for WindowsUserland {
@@ -704,7 +1002,7 @@ impl RawMutex {
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
         // We immediately wake up (without even hitting syscalls) if we can clearly see that the
         // value is different.
-        if self.inner.load(SeqCst) != val {
+        if self.inner.load(Ordering::SeqCst) != val {
             return Err(ImmediatelyWokenUp);
         }
 
@@ -1353,6 +1651,13 @@ unsafe extern "C" {
     // Defined in asm blocks above
     fn syscall_callback() -> isize;
     fn exception_callback() -> isize;
+    fn interrupt_callback();
+    fn switch_to_guest_start();
+    fn switch_to_guest_end();
+}
+
+unsafe extern "C-unwind" fn init_handler(ctx: &mut litebox_common_linux::PtRegs) {
+    call_shim(ctx, |shim, ctx, _interrupt| shim.init(ctx));
 }
 
 /// Windows syscall handler (placeholder - needs Windows implementation)
@@ -1366,8 +1671,7 @@ unsafe extern "C" {
 ///
 /// Unsupported syscalls or arguments would trigger a panic for development purposes.
 unsafe extern "C-unwind" fn syscall_handler(ctx: &mut litebox_common_linux::PtRegs) {
-    let &shim = SHIM.get().expect("Should have run `register_shim` by now");
-    continue_operation(shim.syscall(ctx), ctx);
+    call_shim(ctx, |shim, ctx, _interrupt| shim.syscall(ctx));
 }
 
 unsafe extern "C-unwind" fn exception_handler(
@@ -1399,11 +1703,39 @@ unsafe extern "C-unwind" fn exception_handler(
         cr2,
     };
 
-    let &shim = SHIM.get().expect("Should have run `register_shim` by now");
-    continue_operation(shim.exception(ctx, &info), ctx);
+    call_shim(ctx, |shim, ctx, _interrupt| shim.exception(ctx, &info));
 }
 
-fn continue_operation(op: ContinueOperation, ctx: &mut litebox_common_linux::PtRegs) {
+unsafe extern "C-unwind" fn interrupt_handler(ctx: &mut litebox_common_linux::PtRegs) {
+    call_shim(ctx, |shim, ctx, interrupt| {
+        if interrupt {
+            shim.interrupt(ctx)
+        } else {
+            // We likely got here just to restore fsbase, so don't bother the
+            // shim.
+            ContinueOperation::ResumeGuest
+        }
+    });
+}
+
+/// Calls `f` in order to call into a shim entrypoint.
+fn call_shim(
+    ctx: &mut litebox_common_linux::PtRegs,
+    f: impl FnOnce(
+        &dyn litebox::shim::EnterShim<
+            ContinueOperation = ContinueOperation,
+            ExecutionContext = litebox_common_linux::PtRegs,
+        >,
+        &mut litebox_common_linux::PtRegs,
+        bool,
+    ) -> ContinueOperation,
+) {
+    let &shim = SHIM.get().expect("Should have run `register_shim` by now");
+    // Clear the interrupt flag before calling the shim, since we've handled it
+    // now (by calling into the shim), and it might be set again by the shim
+    // before returning.
+    let interrupt = unsafe { (*get_tls_ptr().unwrap()).interrupt.replace(false) };
+    let op = f(shim, ctx, interrupt);
     match op {
         ContinueOperation::ResumeGuest => unsafe { switch_to_guest(ctx) },
         ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {

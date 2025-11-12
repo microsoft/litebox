@@ -65,6 +65,10 @@ impl litebox::shim::EnterShim for LinuxShimEntrypoints {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ContinueOperation = ContinueOperation;
 
+    fn init(&self, _ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation {
+        ContinueOperation::ResumeGuest
+    }
+
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation {
         let r = with_current_task(|task| task.handle_syscall_request(ctx));
         match r {
@@ -99,6 +103,10 @@ impl litebox::shim::EnterShim for LinuxShimEntrypoints {
         info: &litebox::shim::ExceptionInfo,
     ) -> Self::ContinueOperation {
         panic!("Unhandled exception: {info:#x?}");
+    }
+
+    fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation {
+        ContinueOperation::ResumeGuest
     }
 }
 

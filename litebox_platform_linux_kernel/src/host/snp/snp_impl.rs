@@ -181,6 +181,7 @@ extern "C" fn thread_start(
 impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
+    type ThreadHandle = ();
 
     unsafe fn spawn_thread(
         &self,
@@ -206,6 +207,14 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
             args: [thread_start_arg_ptr as u64, flags.bits()],
         })?;
         Ok(())
+    }
+
+    fn current_thread(&self) -> Self::ThreadHandle {
+        // TODO
+    }
+
+    fn interrupt_thread(&self, &(): &Self::ThreadHandle) {
+        // TODO
     }
 }
 
