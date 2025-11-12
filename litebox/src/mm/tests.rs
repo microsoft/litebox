@@ -253,7 +253,7 @@ fn test_vmm_mapping() {
         unsafe {
             vmm.create_mapping(
                 Some(NonZeroAddress::new(start_addr + PAGE_SIZE).unwrap()),
-                NonZeroPageSize::new(2 * PAGE_SIZE).unwrap(),
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
                 VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
                 CreatePagesFlags::FIXED_ADDR,
             )
@@ -266,7 +266,7 @@ fn test_vmm_mapping() {
         collect_mappings(&vmm),
         vec![
             start_addr..start_addr + PAGE_SIZE,
-            start_addr + PAGE_SIZE..start_addr + 3 * PAGE_SIZE,
+            start_addr + PAGE_SIZE..start_addr + 2 * PAGE_SIZE,
             start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
             DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
@@ -287,7 +287,7 @@ fn test_vmm_mapping() {
         collect_mappings(&vmm),
         vec![
             start_addr..start_addr + PAGE_SIZE,
-            start_addr + PAGE_SIZE..start_addr + 3 * PAGE_SIZE,
+            start_addr + PAGE_SIZE..start_addr + 2 * PAGE_SIZE,
             start_addr + 4 * PAGE_SIZE..start_addr + 6 * PAGE_SIZE,
             start_addr + 8 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
