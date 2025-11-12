@@ -7,6 +7,7 @@ use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};
 
 use litebox::mm::linux::PageRange;
+use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider, Provider,
     Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutPointer, RawMutexProvider,
@@ -402,11 +403,17 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
-        /* ignored because the suggested address is guaranteed to be available when running in kernel mode */
-        _fixed_address_behavior: litebox::platform::page_mgmt::FixedAddressBehavior,
+        fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let range = PageRange::new(suggested_range.start, suggested_range.end)
             .ok_or(litebox::platform::page_mgmt::AllocationError::Unaligned)?;
+        match fixed_address_behavior {
+            FixedAddressBehavior::Hint | FixedAddressBehavior::NoReplace => {}
+            FixedAddressBehavior::Replace => {
+                // Clear the existing mappings first.
+                unsafe { self.deallocate_pages(suggested_range).unwrap() };
+            }
+        }
         let flags = u32::from(initial_permissions.bits())
             | if can_grow_down {
                 litebox::mm::linux::VmFlags::VM_GROWSDOWN.bits()
