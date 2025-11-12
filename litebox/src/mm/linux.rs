@@ -11,6 +11,7 @@ use thiserror::Error;
 use crate::platform::PageManagementProvider;
 use crate::platform::RawConstPointer;
 use crate::platform::page_mgmt::AllocationError;
+use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
 
 /// Page size in bytes
@@ -377,7 +378,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             let start = r.start.max(range.start);
             let end = r.end.min(range.end);
             let new_range = PageRange::new(start, end).unwrap();
-            unsafe { self.insert_mapping(new_range, vma, false, true) }
+            unsafe { self.insert_mapping(new_range, vma, false, FixedAddressBehavior::Replace) }
                 .expect("failed to reset pages");
         }
         if unmapped_error {
@@ -406,25 +407,42 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         suggested_range: PageRange<ALIGN>,
         vma: VmArea,
         populate_pages_immediately: bool,
-        fixed_address: bool,
+        fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
         let (start, end) = (suggested_range.start, suggested_range.end);
         if start < Platform::TASK_ADDR_MIN || end > Platform::TASK_ADDR_MAX {
             return Err(AllocationError::InvalidRange);
         }
-        if fixed_address {
-            // If the given address is fixed (i.e., must use), we need to remove any existing mappings that overlap
-            // with the given range.
-            // If the given address is not fixed (i.e., just a hint for allocation), either the chosen address is
-            // guaranteed to be available (when running in kernel mode) or the following call `platform.allocate_pages`
-            // will check it and choose an available address (when running in user mode).
-            // Note we don't need to update `vmas` here as `insert` at the end will take care of the overlaps for us.
-            for (r, _) in self.vmas.overlapping(start..end) {
-                let intersection = r.start.max(start)..r.end.min(end);
-                unsafe { self.platform.deallocate_pages(intersection) }
-                    .expect("deallocation failed");
+        let platform_fixed_address_behavior = match fixed_address_behavior {
+            FixedAddressBehavior::Hint => FixedAddressBehavior::Hint,
+            FixedAddressBehavior::NoReplace => {
+                // Ensure there are no mappings managed by us.
+                if self.vmas.overlaps(&(start..end)) {
+                    return Err(AllocationError::AddressInUse);
+                }
+                FixedAddressBehavior::NoReplace
             }
-        }
+            FixedAddressBehavior::Replace => {
+                if self.vmas.overlaps(&(start..end)) {
+                    if self.vmas.gaps(&(start..end)).next().is_some() {
+                        // The range is partially overlapping with existing
+                        // mappings. If we call into the platform with
+                        // `Replace`, then it may overwrite external mappings
+                        // that are not managed by us.
+                        //
+                        // FUTURE: support this case, either by splitting this
+                        // into multiple allocate calls or by separating VA
+                        // allocation from page backing.
+                        return Err(AllocationError::AddressPartiallyInUse);
+                    }
+                    FixedAddressBehavior::Replace
+                } else {
+                    // There are no mappings managed by us, so just treat this
+                    // as NoReplace.
+                    FixedAddressBehavior::NoReplace
+                }
+            }
+        };
         let permissions: u8 = vma
             .flags
             .intersection(VmFlags::VM_ACCESS_FLAGS)
@@ -438,13 +456,19 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // The `max_permissions` is tracked by `VMem::protect_mapping` and thus doesn't need to be
         // passed to `allocate_pages`.
         let _ = max_permissions;
-        let ret = self.platform.allocate_pages(
-            suggested_range.into(),
-            MemoryRegionPermissions::from_bits(permissions).unwrap(),
-            vma.flags.contains(VmFlags::VM_GROWSDOWN),
-            populate_pages_immediately,
-            fixed_address,
-        )?;
+        let ret = self
+            .platform
+            .allocate_pages(
+                suggested_range.into(),
+                MemoryRegionPermissions::from_bits(permissions).unwrap(),
+                vma.flags.contains(VmFlags::VM_GROWSDOWN),
+                populate_pages_immediately,
+                platform_fixed_address_behavior,
+            )
+            .map_err(|err| match err {
+                AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
+                other => other,
+            })?;
         let new_start = ret.as_usize();
         let new_end = new_start + suggested_range.len();
         self.vmas.insert(new_start..new_end, vma);
@@ -498,7 +522,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 new_range,
                 vma,
                 flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
-                flags.contains(CreatePagesFlags::FIXED_ADDR),
+                if flags.contains(CreatePagesFlags::FIXED_ADDR) {
+                    FixedAddressBehavior::Replace
+                } else {
+                    FixedAddressBehavior::Hint
+                },
             )
         }
     }
@@ -566,10 +594,18 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // collides with memory allocated to global allocator when LiteBox is used in user mode. This
             // is because page manager is not aware of the memory allocated to global allocator.
             // Try to insert the mapping with `fixed_address = false` to see if it is free first.
-            let ptr = match unsafe { self.insert_mapping(range, *cur_vma, false, false) } {
+            let ptr = match unsafe {
+                self.insert_mapping(range, *cur_vma, false, FixedAddressBehavior::Hint)
+            } {
                 Ok(p) => p,
                 Err(AllocationError::OutOfMemory) => return Err(VmemResizeError::OutOfMemory),
-                Err(AllocationError::Unaligned | AllocationError::InvalidRange) => unreachable!(),
+                Err(
+                    AllocationError::Unaligned
+                    | AllocationError::InvalidRange
+                    | AllocationError::AddressInUse
+                    | AllocationError::AddressInUseByPlatform
+                    | AllocationError::AddressPartiallyInUse,
+                ) => unreachable!(),
             }
             .as_usize();
             // If it returns a different address, it means the range is occupied.

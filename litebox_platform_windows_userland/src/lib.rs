@@ -12,7 +12,9 @@ use core::time::Duration;
 use std::os::raw::c_void;
 
 use litebox::platform::UnblockedOrTimedOut;
-use litebox::platform::page_mgmt::MemoryRegionPermissions;
+use litebox::platform::page_mgmt::{
+    AllocationError, FixedAddressBehavior, MemoryRegionPermissions,
+};
 use litebox::platform::{ImmediatelyWokenUp, RawMutPointer};
 use litebox::shim::Exception;
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
@@ -1060,8 +1062,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
-        fixed_address: bool,
-    ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
         debug_assert!(ALIGN.is_multiple_of(self.sys_info.read().unwrap().dwPageSize as usize));
         debug_assert_alignment!(suggested_range, ALIGN);
 
@@ -1129,17 +1131,42 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     }
                 })
                 .is_err();
-            if has_committed_page && !fixed_address {
+            if has_committed_page && fixed_address_behavior == FixedAddressBehavior::Hint {
                 // If any page in the suggested range is already committed, and the caller
                 // did not request a fixed address, we ask the OS to allocate a new region.
                 base_addr = core::ptr::null_mut();
+            } else if has_committed_page
+                && fixed_address_behavior == FixedAddressBehavior::NoReplace
+            {
+                return Err(AllocationError::AddressInUse);
             } else {
                 process_memory_range_by_regions(
                     suggested_range,
                     |r, state| -> Result<bool, std::convert::Infallible> {
                         let ok = match state {
                             // In case the region is already reserved, we just need to commit it.
-                            Win32_Memory::MEM_RESERVE => {
+                            // In case the region is already committed, decommit and recommit it.
+                            Win32_Memory::MEM_RESERVE | Win32_Memory::MEM_COMMIT => {
+                                if state == Win32_Memory::MEM_COMMIT {
+                                    // TODO: handle this race condition properly.
+                                    assert_eq!(
+                                        fixed_address_behavior,
+                                        FixedAddressBehavior::Replace,
+                                        "raced with another memory allocator"
+                                    );
+                                    let decommit_ok = unsafe {
+                                        VirtualFree(
+                                            r.start as *mut c_void,
+                                            r.len(),
+                                            Win32_Memory::MEM_DECOMMIT,
+                                        )
+                                    } != 0;
+                                    assert!(
+                                        decommit_ok,
+                                        "VirtualFree(DECOMMIT) failed: {}",
+                                        unsafe { GetLastError() }
+                                    );
+                                }
                                 let ptr = unsafe {
                                     VirtualAlloc2(
                                         GetCurrentProcess(),
@@ -1152,18 +1179,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     )
                                 };
                                 !ptr.is_null()
-                            }
-                            // In case the region is already committed, we just need to change its permissions.
-                            Win32_Memory::MEM_COMMIT => {
-                                let mut old_protect: u32 = 0;
-                                unsafe {
-                                    Win32_Memory::VirtualProtect(
-                                        r.start as *mut c_void,
-                                        r.len(),
-                                        prot_flags(initial_permissions),
-                                        &raw mut old_protect,
-                                    ) != 0
-                                }
                             }
                             // In case the region is free, we need to reserve and commit it.
                             Win32_Memory::MEM_FREE => {
@@ -1455,6 +1470,7 @@ mod tests {
     use litebox::platform::PageManagementProvider;
     use litebox::platform::RawConstPointer;
     use litebox::platform::RawMutex;
+    use litebox::platform::page_mgmt::FixedAddressBehavior;
     use litebox::platform::page_mgmt::MemoryRegionPermissions;
 
     #[test]
@@ -1518,7 +1534,7 @@ mod tests {
             MemoryRegionPermissions::WRITE,
             false,
             true,
-            false,
+            FixedAddressBehavior::Hint,
         )
         .unwrap()
         .as_usize();
@@ -1544,7 +1560,7 @@ mod tests {
             MemoryRegionPermissions::WRITE,
             false,
             true,
-            false,
+            FixedAddressBehavior::Hint,
         )
         .unwrap()
         .as_usize();
@@ -1576,7 +1592,7 @@ mod tests {
             MemoryRegionPermissions::WRITE,
             false,
             true,
-            false,
+            FixedAddressBehavior::Hint,
         )
         .unwrap()
         .as_usize();

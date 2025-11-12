@@ -651,7 +651,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         can_grow_down: bool,
         populate_pages_immediately: bool,
         /* ignored because the suggested address is guaranteed to be available when running in kernel mode */
-        _fixed_address: bool,
+        _fixed_address_behavior: litebox::platform::page_mgmt::FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let range = PageRange::new(suggested_range.start, suggested_range.end)
             .ok_or(litebox::platform::page_mgmt::AllocationError::Unaligned)?;

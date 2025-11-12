@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use litebox::fs::OFlags;
 use litebox::platform::UnblockedOrTimedOut;
-use litebox::platform::page_mgmt::MemoryRegionPermissions;
+use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions};
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer};
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
@@ -1318,24 +1318,26 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
-        fixed_address: bool,
+        fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let flags = MapFlags::MAP_PRIVATE
             | MapFlags::MAP_ANONYMOUS
-            | (if fixed_address {
-                MapFlags::MAP_FIXED
-            } else {
-                MapFlags::empty()
-            } | if can_grow_down {
+            | match fixed_address_behavior {
+                FixedAddressBehavior::Hint => MapFlags::empty(),
+                FixedAddressBehavior::Replace => MapFlags::MAP_FIXED,
+                FixedAddressBehavior::NoReplace => MapFlags::MAP_FIXED_NOREPLACE,
+            }
+            | if can_grow_down {
                 MapFlags::MAP_GROWSDOWN
             } else {
                 MapFlags::empty()
-            } | if populate_pages_immediately {
+            }
+            | if populate_pages_immediately {
                 MapFlags::MAP_POPULATE
             } else {
                 MapFlags::empty()
-            });
-        let ptr = unsafe {
+            };
+        let r = unsafe {
             syscalls::syscall6(
                 {
                     #[cfg(target_arch = "x86_64")]
@@ -1358,8 +1360,18 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 usize::MAX,
                 0,
             )
-        }
-        .expect("mmap failed");
+        };
+        let ptr = r.map_err(|err| match err {
+            syscalls::Errno::ENOMEM => litebox::platform::page_mgmt::AllocationError::OutOfMemory,
+            syscalls::Errno::EEXIST => {
+                assert!(matches!(
+                    fixed_address_behavior,
+                    FixedAddressBehavior::NoReplace
+                ));
+                litebox::platform::page_mgmt::AllocationError::AddressInUse
+            }
+            _ => panic!("unhandled mmap error {err}"),
+        })?;
         Ok(
             litebox::platform::common_providers::userspace_pointers::UserMutPtr {
                 inner: ptr as *mut u8,

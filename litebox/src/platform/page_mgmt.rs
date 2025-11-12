@@ -46,7 +46,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///   a page fault.
     /// - `populate_pages_immediately`: If `true`, the pages are populated immediately; otherwise,
     ///   they are populated lazily.
-    /// - `fixed_address`: If `true`, the allocation must occur at the `suggested_range`.
+    /// - `fixed_address_behavior`: Specifies the required semantics of `suggested_range`.
     ///
     /// # Returns
     ///
@@ -61,7 +61,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
-        fixed_address: bool,
+        fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError>;
 
     /// De-allocated all pages in the given `range`.
@@ -100,10 +100,21 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         // Default implementation: allocate new pages, copy data, deallocate old pages
         let temp_permissions = permissions | MemoryRegionPermissions::WRITE;
         let new_ptr = self
-            .allocate_pages(new_range.clone(), temp_permissions, false, true, true)
+            .allocate_pages(
+                new_range.clone(),
+                temp_permissions,
+                false,
+                true,
+                FixedAddressBehavior::NoReplace,
+            )
             .map_err(|e| match e {
                 AllocationError::OutOfMemory => RemapError::OutOfMemory,
-                AllocationError::Unaligned | AllocationError::InvalidRange => unreachable!(),
+                AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform => {
+                    RemapError::AlreadyAllocated
+                }
+                AllocationError::Unaligned
+                | AllocationError::InvalidRange
+                | AllocationError::AddressPartiallyInUse => unreachable!(),
             })?;
 
         // Copy memory from old range to new range
@@ -160,6 +171,20 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>>;
 }
 
+/// Behavior when allocating pages at a fixed address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FixedAddressBehavior {
+    /// The address is just a hint, and the platform may choose a different
+    /// address if the hint is not available.
+    Hint,
+    /// Allocate the pages at the specified address, replacing any existing
+    /// mappings.
+    Replace,
+    /// Allocate the pages at the specified address, failing if any part of the
+    /// range is already in use.
+    NoReplace,
+}
+
 /// Possible errors for [`PageManagementProvider::allocate_pages`]
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -170,6 +195,12 @@ pub enum AllocationError {
     InvalidRange,
     #[error("out of memory")]
     OutOfMemory,
+    #[error("provided fixed address range is in use")]
+    AddressInUse,
+    #[error("provided fixed address range is in use by the platform")]
+    AddressInUseByPlatform,
+    #[error("provided fixed address range partially overlaps existing mappings")]
+    AddressPartiallyInUse,
 }
 
 /// Possible errors for [`PageManagementProvider::deallocate_pages`]
