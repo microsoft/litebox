@@ -120,10 +120,30 @@ impl<F: FnOnce()> Drop for Defer<F> {
 
 /// Returns an object that will run `f` when it goes out of scope.
 ///
+/// This is useful for cleaning up custom resources or for restoring invariants
+/// while calling user-provided closures that may panic.
+///
 /// Caution: the returned object must be bound to a variable to ensure the
 /// closure runs at scope end. In particular, binding to `_` will not work; use
 /// a named variable or a variable with a name starting with `_` (e.g.,
 /// `_defer`) instead.
+///
+/// # Example
+/// ```rust
+/// fn nest<R>(cell: &core::cell::Cell<usize>, f: impl FnOnce() -> R) -> R {
+///     cell.set(cell.get() + 1);
+///     let _defer = litebox::utils::defer(|| cell.set(cell.get() - 1));
+///     f()
+/// }
+/// let n = 0.into();
+/// nest(&n, || {
+///    assert_eq!(n.get(), 1);
+///    nest(&n, || {
+///       assert_eq!(n.get(), 2);
+///    });
+///    assert_eq!(n.get(), 1);
+/// });
+/// ```
 #[must_use = "Must be bound to a variable to defer until scope end; variable name cannot be just '_' (but '_foo' is fine)."]
 pub fn defer(f: impl FnOnce()) -> Defer<impl FnOnce()> {
     Defer(Some(f))
