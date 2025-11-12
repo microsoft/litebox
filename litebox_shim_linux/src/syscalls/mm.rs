@@ -308,6 +308,10 @@ mod tests {
         task.sys_munmap(new_addr, 0x2000).unwrap();
     }
 
+    #[cfg(any(
+        feature = "platform_linux_userland",
+        feature = "platform_windows_userland"
+    ))]
     #[test]
     fn test_collision_with_global_allocator() {
         let task = init_platform(None);
@@ -316,9 +320,34 @@ mod tests {
         // Find an address that is allocated to the global allocator but not in reserved regions.
         // LiteBox's page manager is not aware of the global allocator's allocations.
         let addr = loop {
-            let buf = alloc::vec::Vec::<u8>::with_capacity(0x10_0000);
-            let addr = buf.as_ptr() as usize;
-            data.push(buf);
+            #[allow(
+                unused_variables,
+                reason = "the following features are mutually exclusive"
+            )]
+            #[cfg(feature = "platform_windows_userland")]
+            let addr = {
+                let buf = alloc::vec::Vec::<u8>::with_capacity(0x10_0000);
+                let addr = buf.as_ptr() as usize;
+                data.push(buf);
+                addr
+            };
+            #[cfg(feature = "platform_linux_userland")]
+            let addr = {
+                let addr = unsafe {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        0x10_000,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                } as usize;
+                data.push(alloc::vec::Vec::<u8>::from(unsafe {
+                    core::slice::from_raw_parts(addr as *const u8, 0x10_000)
+                }));
+                addr
+            };
 
             let mut included = false;
             for r in <litebox_platform_multiplex::Platform as PageManagementProvider<4096>>::reserved_pages(platform) {

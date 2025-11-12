@@ -726,6 +726,7 @@ guest_context_top:
     .long 0
 in_guest:
     .byte 0
+.globl interrupt
 interrupt:
     .byte 0
     "
@@ -1112,7 +1113,10 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                             ))?
                             .into_owned();
                         // never block SIGSYS (required by Seccomp to intercept syscalls)
+                        #[cfg(feature = "systrap_backend")]
                         set.remove(litebox_common_linux::Signal::SIGSYS);
+                        // never block SIGSEGV (required to recover from fallible read/write)
+                        set.remove(litebox_common_linux::Signal::SIGSEGV);
                         Some(set)
                     }
                     None => None,
@@ -1595,51 +1599,6 @@ impl litebox::platform::StdioProvider for LinuxUserland {
             StdioStream::Stdout => std::io::stdout().is_terminal(),
             StdioStream::Stderr => std::io::stderr().is_terminal(),
         }
-    }
-}
-
-#[global_allocator]
-static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 28, LinuxUserland> =
-    litebox::mm::allocator::SafeZoneAllocator::new();
-
-impl litebox::mm::allocator::MemoryProvider for LinuxUserland {
-    fn alloc(layout: &std::alloc::Layout) -> Option<(usize, usize)> {
-        let size = core::cmp::max(
-            layout.size().next_power_of_two(),
-            // Note `mmap` provides no guarantee of alignment, so we double the size to ensure we
-            // can always find a required chunk within the returned memory region.
-            core::cmp::max(layout.align(), 0x1000) << 1,
-        );
-        unsafe {
-            syscalls::syscall6(
-                {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        syscalls::Sysno::mmap
-                    }
-                    #[cfg(target_arch = "x86")]
-                    {
-                        syscalls::Sysno::mmap2
-                    }
-                },
-                0,
-                size,
-                ProtFlags::PROT_READ_WRITE.bits().reinterpret_as_unsigned() as usize,
-                ((MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON)
-                    .bits()
-                    .reinterpret_as_unsigned()
-                    // This is to ensure it won't be intercepted by Seccomp if enabled.
-                    | syscall_intercept::MMAP_FLAG_MAGIC) as usize,
-                usize::MAX,
-                0,
-            )
-        }
-        .map(|addr| (addr, size))
-        .ok()
-    }
-
-    unsafe fn free(_addr: usize) {
-        todo!();
     }
 }
 
