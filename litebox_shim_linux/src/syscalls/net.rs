@@ -412,7 +412,8 @@ fn accept(fd: &SocketFd, mut peer: Option<&mut SocketAddr>) -> Result<SocketFd, 
             |observer, _filter| {
                 litebox_net()
                     .lock()
-                    .with_iopollable(fd, |poll| poll.register_observer(observer, Events::IN));
+                    .with_iopollable(fd, |poll| poll.register_observer(observer, Events::IN))
+                    .expect("fd should be valid");
             },
         )?
     };
@@ -460,9 +461,12 @@ fn connect(fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
             },
             || true,
             |observer, _filter| {
-                litebox_net().lock().with_iopollable(fd, |poll| {
-                    poll.register_observer(observer, Events::IN | Events::OUT);
-                });
+                litebox_net()
+                    .lock()
+                    .with_iopollable(fd, |poll| {
+                        poll.register_observer(observer, Events::IN | Events::OUT);
+                    })
+                    .expect("fd should be valid");
             },
         )?;
     }
@@ -522,7 +526,8 @@ pub(crate) fn sendto(
             |observer, _filter| {
                 litebox_net()
                     .lock()
-                    .with_iopollable(fd, |poll| poll.register_observer(observer, Events::OUT));
+                    .with_iopollable(fd, |poll| poll.register_observer(observer, Events::OUT))
+                    .expect("fd should be valid");
             },
         )
     }
@@ -592,7 +597,8 @@ pub(crate) fn receive(
             |observer, _filter| {
                 litebox_net()
                     .lock()
-                    .with_iopollable(fd, |poll| poll.register_observer(observer, Events::IN));
+                    .with_iopollable(fd, |poll| poll.register_observer(observer, Events::IN))
+                    .expect("fd should be valid");
             },
         )
     }
