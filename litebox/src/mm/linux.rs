@@ -590,32 +590,20 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 unimplemented!("file-backed mapping expansion is not supported yet");
             }
             let range = PageRange::new(range.end, new_end).unwrap();
-            // Although we have checked the overlap above, there is still a small chance that this range
-            // collides with memory allocated to global allocator when LiteBox is used in user mode. This
-            // is because page manager is not aware of the memory allocated to global allocator.
-            // Try to insert the mapping with `fixed_address = false` to see if it is free first.
-            let ptr = match unsafe {
-                self.insert_mapping(range, *cur_vma, false, FixedAddressBehavior::Hint)
+            // Try to extend the mapping. Although we checked that there are no
+            // litebox mappings in this range, this may fail if there are
+            // platform mappings in the way.
+            match unsafe {
+                self.insert_mapping(range, *cur_vma, false, FixedAddressBehavior::NoReplace)
             } {
-                Ok(p) => p,
+                Ok(_) => {}
                 Err(AllocationError::OutOfMemory) => return Err(VmemResizeError::OutOfMemory),
                 Err(
-                    AllocationError::Unaligned
-                    | AllocationError::InvalidRange
-                    | AllocationError::AddressInUse
+                    AllocationError::AddressInUse
                     | AllocationError::AddressInUseByPlatform
                     | AllocationError::AddressPartiallyInUse,
-                ) => unreachable!(),
-            }
-            .as_usize();
-            // If it returns a different address, it means the range is occupied.
-            if ptr != range.start {
-                // rollback
-                let new_range = PageRange::new(ptr, ptr + range.len()).unwrap();
-                unsafe {
-                    self.remove_mapping(new_range).unwrap();
-                }
-                return Err(VmemResizeError::RangeOccupied(range.into()));
+                ) => return Err(VmemResizeError::RangeOccupied(range.into())),
+                Err(AllocationError::Unaligned | AllocationError::InvalidRange) => unreachable!(),
             }
             return Ok(());
         }
