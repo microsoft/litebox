@@ -3,8 +3,12 @@
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use litebox::{
+    event::{
+        Events,
+        polling::{TryOpError, wait_or_timeout},
+    },
     fs::OFlags,
-    net::TcpOptionData,
+    net::{TcpOptionData, errors::AcceptError},
     platform::{RawConstPointer as _, RawMutPointer as _},
     utils::TruncateExt as _,
 };
@@ -388,23 +392,32 @@ fn getsockopt(
     Ok(())
 }
 
-fn try_accept(fd: &SocketFd, peer: Option<&mut SocketAddr>) -> Result<SocketFd, Errno> {
-    litebox_net().lock().accept(fd, peer).map_err(Errno::from)
+fn try_accept(fd: &SocketFd, peer: Option<&mut SocketAddr>) -> Result<SocketFd, TryOpError<Errno>> {
+    litebox_net().lock().accept(fd, peer).map_err(|e| match e {
+        AcceptError::NoConnectionsReady => TryOpError::TryAgain,
+        AcceptError::InvalidFd | AcceptError::NotListening => TryOpError::Other(e.into()),
+        _ => unimplemented!(),
+    })
 }
 
 fn accept(fd: &SocketFd, mut peer: Option<&mut SocketAddr>) -> Result<SocketFd, Errno> {
-    if get_status(fd).contains(OFlags::NONBLOCK) {
-        try_accept(fd, peer)
+    let res = if get_status(fd).contains(OFlags::NONBLOCK) {
+        try_accept(fd, peer)?
     } else {
-        // TODO: use `poll` instead of busy wait
-        loop {
-            match try_accept(fd, peer.as_deref_mut()) {
-                Err(Errno::EAGAIN) => {}
-                ret => return ret,
-            }
-            core::hint::spin_loop();
-        }
-    }
+        wait_or_timeout(
+            crate::litebox(),
+            None,
+            || try_accept(fd, peer.as_deref_mut()),
+            || true,
+            |observer, _filter| {
+                litebox_net()
+                    .lock()
+                    .with_iopollable(fd, |poll| poll.register_observer(observer, Events::IN))
+                    .expect("fd should be valid");
+            },
+        )?
+    };
+    Ok(res)
 }
 
 fn bind(fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
@@ -415,10 +428,49 @@ fn bind(fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
 }
 
 fn connect(fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
+    // Check if the socket is ready
+    let is_ready = |fd: &SocketFd| -> Result<bool, Errno> {
+        let events = litebox_net()
+            .lock()
+            .with_iopollable(fd, |poll| poll.check_io_events())
+            .ok_or(Errno::EBADF)?;
+        Ok(events.intersects(Events::IN | Events::OUT))
+    };
+
+    // Initiate connection, which is non-blocking
     litebox_net()
         .lock()
         .connect(fd, &sockaddr)
-        .map_err(Errno::from)
+        .map_err(Errno::from)?;
+    if get_status(fd).contains(OFlags::NONBLOCK) {
+        // If the socket is non-blocking, return EINPROGRESS if not connected yet
+        if !is_ready(fd)? {
+            return Err(Errno::EINPROGRESS);
+        }
+    } else {
+        // Wait until the connection is established
+        wait_or_timeout(
+            crate::litebox(),
+            None,
+            || {
+                if is_ready(fd).map_err(TryOpError::Other)? {
+                    Ok(())
+                } else {
+                    Err(TryOpError::TryAgain)
+                }
+            },
+            || true,
+            |observer, _filter| {
+                litebox_net()
+                    .lock()
+                    .with_iopollable(fd, |poll| {
+                        poll.register_observer(observer, Events::IN | Events::OUT);
+                    })
+                    .expect("fd should be valid");
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn listen(fd: &SocketFd, backlog: u16) -> Result<(), Errno> {
@@ -433,9 +485,12 @@ fn try_sendto(
     buf: &[u8],
     flags: litebox::net::SendFlags,
     sockaddr: Option<SocketAddr>,
-) -> Result<usize, Errno> {
-    let n = litebox_net().lock().send(fd, buf, flags, sockaddr)?;
-    if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
+) -> Result<usize, TryOpError<Errno>> {
+    match litebox_net().lock().send(fd, buf, flags, sockaddr) {
+        Ok(0) => Err(TryOpError::TryAgain),
+        Ok(n) => Ok(n),
+        Err(e) => Err(TryOpError::Other(e.into())),
+    }
 }
 
 pub(crate) fn sendto(
@@ -463,19 +518,20 @@ pub(crate) fn sendto(
         try_sendto(fd, buf, new_flags, sockaddr)
     } else {
         let timeout = with_socket_options(fd, |opt| opt.send_timeout);
-        if timeout.is_some() {
-            todo!("send timeout");
-        }
-
-        // TODO: use `poll` instead of busy wait
-        loop {
-            match try_sendto(fd, buf, new_flags, sockaddr) {
-                Err(Errno::EAGAIN) => {}
-                ret => break ret,
-            }
-            core::hint::spin_loop();
-        }
-    };
+        wait_or_timeout(
+            crate::litebox(),
+            timeout,
+            || try_sendto(fd, buf, new_flags, sockaddr),
+            || true,
+            |observer, _filter| {
+                litebox_net()
+                    .lock()
+                    .with_iopollable(fd, |poll| poll.register_observer(observer, Events::OUT))
+                    .expect("fd should be valid");
+            },
+        )
+    }
+    .map_err(Errno::from);
     if let Err(Errno::EPIPE) = ret
         && !flags.contains(SendFlags::NOSIGNAL)
     {
@@ -489,9 +545,12 @@ fn try_receive(
     buf: &mut [u8],
     flags: litebox::net::ReceiveFlags,
     source_addr: Option<&mut Option<SocketAddr>>,
-) -> Result<usize, Errno> {
-    let n = litebox_net().lock().receive(fd, buf, flags, source_addr)?;
-    if n == 0 { Err(Errno::EAGAIN) } else { Ok(n) }
+) -> Result<usize, TryOpError<Errno>> {
+    match litebox_net().lock().receive(fd, buf, flags, source_addr) {
+        Ok(0) => Err(TryOpError::TryAgain),
+        Ok(n) => Ok(n),
+        Err(e) => Err(TryOpError::Other(e.into())),
+    }
 }
 
 pub(crate) fn receive(
@@ -530,19 +589,20 @@ pub(crate) fn receive(
         try_receive(fd, buf, new_flags, source_addr)
     } else {
         let timeout = with_socket_options(fd, |opt| opt.recv_timeout);
-        if timeout.is_some() {
-            todo!("recv timeout");
-        }
-
-        // TODO: use `poll` instead of busy wait
-        loop {
-            match try_receive(fd, buf, new_flags, source_addr.as_deref_mut()) {
-                Err(Errno::EAGAIN) => {}
-                ret => return ret,
-            }
-            core::hint::spin_loop();
-        }
+        wait_or_timeout(
+            crate::litebox(),
+            timeout,
+            || try_receive(fd, buf, new_flags, source_addr.as_deref_mut()),
+            || true,
+            |observer, _filter| {
+                litebox_net()
+                    .lock()
+                    .with_iopollable(fd, |poll| poll.register_observer(observer, Events::IN))
+                    .expect("fd should be valid");
+            },
+        )
     }
+    .map_err(Errno::from)
 }
 
 fn get_socket_type(fd: &SocketFd) -> Result<SockType, Errno> {
@@ -734,14 +794,11 @@ impl Task {
         };
 
         let files = self.files.borrow();
-        match files
-            .file_descriptors
-            .read()
-            .get_fd(fd)
-            .ok_or(Errno::EBADF)?
-        {
+        let file_table = files.file_descriptors.read();
+        match file_table.get_fd(fd).ok_or(Errno::EBADF)? {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
                 let SocketAddress::Inet(addr) = sockaddr;
+                drop(file_table); // Drop before possibly-blocking `connect`
                 connect(fd, addr)
             }),
             _ => Err(Errno::ENOTSOCK),
@@ -1071,7 +1128,7 @@ mod tests {
             .expect("epoll_wait failed")
     }
 
-    fn test_tcp_socket(
+    fn test_tcp_socket_as_server(
         task: &crate::Task,
         ip: [u8; 4],
         port: u16,
@@ -1263,12 +1320,12 @@ mod tests {
         option: &'static str,
     ) {
         let task = init_platform(Some("tun99"));
-        test_tcp_socket(&task, TUN_IP_ADDR, port, is_nonblocking, test_trunc, option);
+        test_tcp_socket_as_server(&task, TUN_IP_ADDR, port, is_nonblocking, test_trunc, option);
     }
 
     fn test_tcp_socket_send(is_nonblocking: bool, test_trunc: bool) {
         let task = init_platform(Some("tun99"));
-        test_tcp_socket(
+        test_tcp_socket_as_server(
             &task,
             TUN_IP_ADDR,
             SERVER_PORT,
@@ -1276,7 +1333,7 @@ mod tests {
             test_trunc,
             "sendto",
         );
-        test_tcp_socket(
+        test_tcp_socket_as_server(
             &task,
             TUN_IP_ADDR,
             SERVER_PORT,
@@ -1309,6 +1366,62 @@ mod tests {
     #[test]
     fn test_tun_blocking_recvfrom_tcp_socket_with_truncation() {
         test_tcp_socket_with_external_client(SERVER_PORT, false, true, "recvfrom");
+    }
+
+    #[test]
+    fn test_tun_tcp_socket_as_client() {
+        let task = init_platform(Some("tun99"));
+
+        let child_handle = std::thread::spawn(|| {
+            std::process::Command::new("nc")
+                .args([
+                    "-w",
+                    "1",
+                    "-l",
+                    "10.0.0.1",
+                    SERVER_PORT.to_string().as_str(),
+                ])
+                .output()
+        });
+        std::thread::sleep(core::time::Duration::from_millis(500));
+
+        // Client socket
+        let client_fd = task
+            .sys_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                SockFlags::empty(),
+                None,
+            )
+            .expect("failed to create client socket");
+        let client_fd = i32::try_from(client_fd).unwrap();
+
+        let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::from([10, 0, 0, 1]),
+            SERVER_PORT,
+        )));
+        task.sys_connect(client_fd, server_addr)
+            .expect("failed to connect to server");
+
+        let buf = "Hello, world!";
+        let ptr = ConstPtr::from_usize(buf.as_ptr().expose_provenance());
+        let len = buf.len();
+        let n = task
+            .sys_sendto(client_fd, ptr, len, SendFlags::empty(), None)
+            .unwrap();
+        assert_eq!(n, len);
+
+        // Before we support graceful shutdown, sleep a bit to ensure data is sent
+        std::thread::sleep(core::time::Duration::from_millis(500));
+        task.sys_close(client_fd)
+            .expect("failed to close client socket");
+
+        let output = child_handle
+            .join()
+            .unwrap()
+            .expect("Failed to wait for client");
+        let stdout = alloc::string::String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout, buf);
     }
 
     fn blocking_udp_server_socket(test_trunc: bool, is_nonblocking: bool) {
