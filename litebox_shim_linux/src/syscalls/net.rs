@@ -1383,7 +1383,7 @@ mod tests {
                 ])
                 .output()
         });
-        std::thread::sleep(core::time::Duration::from_millis(500));
+        std::thread::sleep(core::time::Duration::from_millis(1000));
 
         // Client socket
         let client_fd = task
