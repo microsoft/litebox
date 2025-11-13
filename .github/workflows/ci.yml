@@ -289,7 +289,7 @@ jobs:
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
             -not -path './litebox_runner_snp/Cargo.toml' \
             -not -path './litebox_platform_hypervisor/Cargo.toml' \
-            -not -path './litebox_runner_hypervisor/Cargo.toml' \
+            -not -path './litebox_runner_optee_on_hypervisor/Cargo.toml' \
             -not -path './dev_tests/Cargo.toml' \
             -print0 | \
               xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --locked --target x86_64-unknown-none || exit 1; echo; echo'
