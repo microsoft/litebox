@@ -43,6 +43,7 @@ impl PerCpuVariables {
 
     /// Allocate XSAVE areas for saving/restoring the extended states of each core.
     /// These buffers are allocated once and never deallocated.
+    #[expect(dead_code)]
     pub(crate) fn allocate_xsave_area(&mut self) {
         assert!(
             self.xsave_area_addr.is_null(),
@@ -59,6 +60,7 @@ impl PerCpuVariables {
         self.xsave_area_addr = VirtAddr::new(xsave_area.as_ptr() as u64);
     }
 
+    #[expect(dead_code)]
     pub(crate) fn save_extended_states(&self) {
         if self.xsave_area_addr.is_null() {
             panic!("XSAVE areas are not allocated");
@@ -77,6 +79,7 @@ impl PerCpuVariables {
     }
 
     /// Restore the extended states of each core
+    #[expect(dead_code)]
     pub(crate) fn restore_extended_states(&self) {
         if self.xsave_area_addr.is_null() {
             panic!("XSAVE areas are not allocated");

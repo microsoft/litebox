@@ -277,6 +277,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// Map physical frame range to the page table
     ///
     /// Note it does not rely on the page fault handler based mapping to avoid double faults.
+    #[expect(dead_code)]
     pub(crate) fn map_phys_frame_range(
         &self,
         frame_range: PhysFrameRange<Size4KiB>,
@@ -324,6 +325,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     }
 
     /// This function creates a new empty top-level page table.
+    #[expect(dead_code)]
     pub(crate) unsafe fn new_top_level() -> Self {
         let frame = PageTableAllocator::<M>::allocate_frame(true)
             .expect("Failed to allocate a new page table frame");

@@ -11,7 +11,6 @@ use core::{
     sync::atomic::{AtomicU32, AtomicU64},
 };
 use host::linux::sigset_t;
-use litebox::platform::page_mgmt::DeallocationError;
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
     Punchthrough, RawMutexProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
@@ -22,9 +21,6 @@ use litebox::platform::{
 use litebox::{mm::linux::PageRange, platform::page_mgmt::FixedAddressBehavior};
 use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
 use ptr::{UserConstPtr, UserMutPtr};
-use x86_64::structures::paging::{
-    PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, mapper::MapToError,
-};
 
 extern crate alloc;
 
@@ -127,7 +123,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// proper operations (e.g., syscall handling). We should consider implementing
     /// partial mapping to mitigate side-channel attacks and shallow copying to get rid of redudant
     /// page table data structures for kernel space.
-    #[allow(dead_code)]
+    #[allow(clippy::unused_self)]
     pub(crate) fn new_user_page_table(&self) -> mm::PageTable<PAGE_SIZE> {
         // let pt = unsafe { mm::PageTable::new_top_level() };
         // if pt

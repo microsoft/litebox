@@ -229,11 +229,7 @@ fn test_page_table() {
 fn test_vmm_page_fault() {
     let start_addr: usize = 0x1_0000;
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
-    let platform = MockKernel::new(
-        p4.start_address(),
-        x86_64::PhysAddr::new(0),
-        x86_64::PhysAddr::new(0),
-    );
+    let platform = MockKernel::new(p4.start_address());
     let litebox = LiteBox::new(platform);
     let vmm = PageManager::<_, PAGE_SIZE>::new(&litebox);
     unsafe {

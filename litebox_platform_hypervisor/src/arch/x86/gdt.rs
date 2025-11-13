@@ -5,7 +5,7 @@ use alloc::boxed::Box;
 use x86_64::{
     PrivilegeLevel, VirtAddr,
     instructions::{
-        segmentation::{CS, DS, SS, Segment},
+        segmentation::{CS, DS, Segment},
         tables::load_tss,
     },
     structures::{

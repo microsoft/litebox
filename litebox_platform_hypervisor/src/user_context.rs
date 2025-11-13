@@ -190,7 +190,7 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
         let (cr3, _) = Cr3::read_raw();
         let mut inner = self.user_contexts.inner.lock();
         // TODO: to avoid the below linear search, we can maintain CR3 to `userspace_id` mapping.
-        for (id, user_ctx) in inner.iter_mut() {
+        for (_id, user_ctx) in inner.iter_mut() {
             if cr3 == user_ctx.page_table.get_physical_frame() {
                 user_ctx.rsp = user_stack_ptr;
                 user_ctx.rip = user_ret_addr;

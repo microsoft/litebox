@@ -49,7 +49,7 @@ jobs:
           key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
-          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_platform_lvbs --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_platform_lvbs --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp --exclude litebox_platform_hypervisor --exclude litebox_runner_optee_on_hypervisor
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox_runner_optee_on_linux_userland
           # We exclude `litebox_platform_lvbs` and `litebox_runner_lvbs` because we cannot build them with a stable toolchain.
           # They depend on the unstable `abi_x86_interrupt` feature. `build_and_test_nightly` cover them.
@@ -67,7 +67,7 @@ jobs:
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
-        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_platform_lvbs --exclude litebox_runner_lvbs --exclude litebox_runner_snp
+        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_platform_lvbs --exclude litebox_runner_lvbs --exclude litebox_runner_snp --exclude litebox_platform_hypervisor --exclude litebox_runner_optee_on_hypervisor
 
   build_and_test_32bit:
     name: Build and Test (32-bit)
@@ -288,6 +288,8 @@ jobs:
             -not -path './litebox_shim_optee/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
             -not -path './litebox_runner_snp/Cargo.toml' \
+            -not -path './litebox_platform_hypervisor/Cargo.toml' \
+            -not -path './litebox_runner_hypervisor/Cargo.toml' \
             -not -path './dev_tests/Cargo.toml' \
             -print0 | \
               xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --locked --target x86_64-unknown-none || exit 1; echo; echo'
