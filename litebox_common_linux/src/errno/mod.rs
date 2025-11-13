@@ -227,7 +227,12 @@ impl From<litebox::platform::page_mgmt::AllocationError> for Errno {
         match value {
             litebox::platform::page_mgmt::AllocationError::Unaligned
             | litebox::platform::page_mgmt::AllocationError::InvalidRange => Errno::EINVAL,
-            litebox::platform::page_mgmt::AllocationError::OutOfMemory => Errno::ENOMEM,
+            litebox::platform::page_mgmt::AllocationError::OutOfMemory
+            | litebox::platform::page_mgmt::AllocationError::AddressPartiallyInUse
+            | litebox::platform::page_mgmt::AllocationError::AddressInUseByPlatform => {
+                Errno::ENOMEM
+            }
+            litebox::platform::page_mgmt::AllocationError::AddressInUse => Errno::EEXIST,
             _ => unimplemented!(),
         }
     }

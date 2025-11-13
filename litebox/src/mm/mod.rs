@@ -661,7 +661,14 @@ where
             let Some(range) = PageRange::new(fault_addr, start) else {
                 unreachable!()
             };
-            if let Err(err) = unsafe { vmem.insert_mapping(range, vma, false, true) } {
+            if let Err(err) = unsafe {
+                vmem.insert_mapping(
+                    range,
+                    vma,
+                    false,
+                    crate::platform::page_mgmt::FixedAddressBehavior::NoReplace,
+                )
+            } {
                 unimplemented!("failed to grow stack: {:?}", err)
             }
         }
