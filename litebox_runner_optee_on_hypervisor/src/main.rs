@@ -171,7 +171,7 @@ unsafe extern "C" fn jump_to_entry_point(
     //     "iretq",
     //     "hlt",
     //     user_cs = const 0x2b,
-    //     rflags = const 1 << 9,
+    //     rflags = const 0,
     //     user_ds = const 0x33,
     // );
 }
