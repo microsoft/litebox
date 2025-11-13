@@ -38,6 +38,49 @@ pub enum TryOpError<E> {
     Other(E),
 }
 
+/// Generic wait-or-timeout helper that has the same semantics as [`Pollee::wait_or_timeout`]
+/// but takes a custom `register_observer` function as an argument.
+pub fn wait_or_timeout<Platform, R, E>(
+    litebox: &crate::LiteBox<Platform>,
+    timeout: Option<core::time::Duration>,
+    mut try_op: impl FnMut() -> Result<R, TryOpError<E>>,
+    check: impl Fn() -> bool,
+    register_observer: impl FnOnce(Weak<dyn Observer<Events>>, Events),
+) -> Result<R, TryOpError<E>>
+where
+    Platform: RawSyncPrimitivesProvider + TimeProvider,
+{
+    // Try first without waiting
+    match try_op() {
+        Err(TryOpError::TryAgain) => {}
+        ret => return ret,
+    }
+
+    // Return immediately if the timeout is zero.
+    if timeout.is_some_and(|d| d.is_zero()) {
+        return Err(TryOpError::TimedOut);
+    }
+
+    let start_time = litebox.x.platform.now();
+    let poller = Arc::new(Poller::new(litebox));
+    register_observer(Arc::downgrade(&poller) as _, Events::all());
+
+    loop {
+        if check() {
+            match try_op() {
+                Err(TryOpError::TryAgain) => {}
+                ret => return ret,
+            }
+        }
+
+        let remaining_time =
+            timeout.map(|t| t.saturating_sub(litebox.x.platform.now().duration_since(&start_time)));
+        poller
+            .wait_or_timeout(remaining_time)
+            .map_err(|TimedOut| TryOpError::TimedOut)?;
+    }
+}
+
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     /// Create a new pollee.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
@@ -64,40 +107,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     pub fn wait_or_timeout<R, E>(
         &self,
         timeout: Option<core::time::Duration>,
-        mut try_op: impl FnMut() -> Result<R, TryOpError<E>>,
+        try_op: impl FnMut() -> Result<R, TryOpError<E>>,
         check: impl Fn() -> bool,
     ) -> Result<R, TryOpError<E>> {
-        // Try first without waiting
-        match try_op() {
-            Err(TryOpError::TryAgain) => {}
-            ret => return ret,
-        }
-
-        // Return immediately if the timeout is zero.
-        if timeout.is_some_and(|d| d.is_zero()) {
-            return Err(TryOpError::TimedOut);
-        }
-
-        let start_time = self.litebox.x.platform.now();
-        let poller = Arc::new(Poller::new(&self.litebox));
-        self.register_observer(Arc::downgrade(&poller) as _, Events::all());
-
-        loop {
-            if !check() {
-                let remaining_time = timeout.map(|t| {
-                    t.saturating_sub(self.litebox.x.platform.now().duration_since(&start_time))
-                });
-                poller
-                    .wait_or_timeout(remaining_time)
-                    .map_err(|TimedOut| TryOpError::TimedOut)?;
-            }
-            // We always run `try_op` whether `check` returns true or false; we simply delay running
-            // `try_op` for a little while if `check` has returned `false`.
-            match try_op() {
-                Err(TryOpError::TryAgain) => {}
-                ret => return ret,
-            }
-        }
+        wait_or_timeout(&self.litebox, timeout, try_op, check, |observer, filter| {
+            self.register_observer(observer, filter);
+        })
     }
 
     /// Register an observer for events that satisfy the given `filter`.
