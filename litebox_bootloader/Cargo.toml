@@ -1,0 +1,10 @@
+[package]
+name = "litebox_bootloader"
+version = "0.1.0"
+edition = "2024"
+
+[build-dependencies]
+bootloader = "0.11.12"
+
+[dependencies]
+ovmf-prebuilt = "0.2.4"

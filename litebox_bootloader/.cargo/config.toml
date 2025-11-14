@@ -1,0 +1,4 @@
+[unstable]
+# enable the unstable artifact-dependencies feature, see
+# https://doc.rust-lang.org/nightly/cargo/reference/unstable.html#artifact-dependencies
+bindeps = true

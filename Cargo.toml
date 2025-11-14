@@ -18,6 +18,7 @@ members = [
     "litebox_shim_linux",
     "litebox_syscall_rewriter",
     "litebox_runner_snp",
+    "litebox_bootloader",
     # The CI tests are not meant to be released (thus are not prefixed with
     # `litebox_`), but exist purely to better manage development on LiteBox.
     "dev_tests",

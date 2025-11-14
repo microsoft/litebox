@@ -2,7 +2,8 @@
 #![no_std]
 #![no_main]
 
-use bootloader::{BootInfo, bootinfo::MemoryRegionType, entry_point};
+use bootloader_api::config::{BootloaderConfig, Mapping};
+use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use litebox_common_optee::{TeeIdentity, TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned};
 use litebox_platform_hypervisor::{
@@ -23,26 +24,27 @@ use x86_64::VirtAddr;
 // static PICS: spin::Mutex<ChainedPics> =
 //     spin::Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
-entry_point!(kernel_main);
+pub static BOOTLOADER_CONFIG: BootloaderConfig = {
+    let mut config = BootloaderConfig::new_default();
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config
+};
 
-fn kernel_main(bootinfo: &'static BootInfo) -> ! {
+entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
+
+fn kernel_main(bootinfo: &'static mut BootInfo) -> ! {
     serial_println!("====================================");
     serial_println!(" Hello from LiteBox for Hypervisor! ");
     serial_println!("====================================");
 
-    let phys_mem_offset = VirtAddr::new(bootinfo.physical_memory_offset);
+    let phys_mem_offset = VirtAddr::new(bootinfo.physical_memory_offset.into_option().unwrap());
     debug_serial_println!("Physical memory offset: {:#x}", phys_mem_offset.as_u64());
 
-    let memory_map = &bootinfo.memory_map;
-    for region in memory_map.iter() {
-        if region.region_type == MemoryRegionType::Usable {
-            let mem_fill_start =
-                usize::try_from(phys_mem_offset.as_u64() + region.range.start_frame_number * 4096)
-                    .unwrap();
-            let mem_fill_size = usize::try_from(
-                (region.range.end_frame_number - region.range.start_frame_number) * 4096,
-            )
-            .unwrap();
+    let memory_regions = &bootinfo.memory_regions;
+    for region in memory_regions.iter() {
+        if region.kind == bootloader_api::info::MemoryRegionKind::Usable {
+            let mem_fill_start = usize::try_from(phys_mem_offset.as_u64() + region.start).unwrap();
+            let mem_fill_size = usize::try_from(region.end - region.start).unwrap();
             unsafe {
                 Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
             }
@@ -154,26 +156,26 @@ unsafe extern "C" fn jump_to_entry_point(
     user_stack_top: usize,
 ) -> ! {
     // kernel mode
-    core::arch::naked_asm!("mov rsp, r9", "jmp r8", "hlt");
+    // core::arch::naked_asm!("mov rsp, r9", "jmp r8", "hlt");
 
     // user mode
-    // core::arch::naked_asm!(
-    //     "mov rax, cr3",
-    //     "mov cr3, rax",
-    //     "mov rax, {user_ds}",
-    //     "push rax",
-    //     "push r9",
-    //     "mov rax, {rflags}",
-    //     "push rax",
-    //     "mov rax, {user_cs}",
-    //     "push rax",
-    //     "push r8",
-    //     "iretq",
-    //     "hlt",
-    //     user_cs = const 0x2b,
-    //     rflags = const 0,
-    //     user_ds = const 0x33,
-    // );
+    core::arch::naked_asm!(
+        "mov rax, cr3",
+        "mov cr3, rax",
+        "mov rax, {user_ds}",
+        "push rax",
+        "push r9",
+        "mov rax, {rflags}",
+        "push rax",
+        "mov rax, {user_cs}",
+        "push rax",
+        "push r8",
+        "iretq",
+        "hlt",
+        user_cs = const 0x2b,
+        rflags = const 0,
+        user_ds = const 0x33,
+    );
 }
 
 unsafe fn active_level_4_table_addr() -> x86_64::PhysAddr {
