@@ -256,11 +256,13 @@ impl litebox::platform::Instant for Instant {
     }
 
     fn checked_add(&self, duration: core::time::Duration) -> Option<Self> {
-        self.0
-            .checked_add(
-                duration.as_micros() as u64 * CPU_MHZ.load(core::sync::atomic::Ordering::Relaxed),
-            )
-            .map(Instant)
+        let duration_micros: u64 = duration.as_micros().try_into().ok()?;
+        Some(Instant(
+            self.0.checked_add(
+                duration_micros
+                    .checked_mul(CPU_MHZ.load(core::sync::atomic::Ordering::Relaxed).into())?,
+            )?,
+        ))
     }
 }
 
