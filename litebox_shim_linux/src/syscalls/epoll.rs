@@ -538,7 +538,7 @@ impl PollSet {
         }
 
         let mut register = true;
-        cx.wait(|| {
+        cx.wait_until(|| {
             if self.scan_once(files, register.then_some(cx.waker())) {
                 return true;
             }

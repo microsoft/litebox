@@ -66,7 +66,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'_, Platfor
             if let Some(register_observer) = register_observer.take() {
                 register_observer(self.waker().observer(), Events::all());
             }
-            match self.wait(&check) {
+            match self.wait_until(&check) {
                 Ok(()) => {}
                 Err(err) => return Err(TryOpError::WaitError(err)),
             }

@@ -52,7 +52,7 @@ struct WaitStateInner<Platform: RawSyncPrimitivesProvider> {
 }
 
 /// A handle, returned by [`WaitContext::waker`], that can be used to wake up a
-/// thread waiting on via [`WaitContext::wait`].
+/// thread waiting on via [`WaitContext::wait_until`].
 pub struct Waker<Platform: RawSyncPrimitivesProvider>(Arc<WaitStateInner<Platform>>);
 
 impl<Platform: RawSyncPrimitivesProvider> Clone for Waker<Platform> {
@@ -62,7 +62,7 @@ impl<Platform: RawSyncPrimitivesProvider> Clone for Waker<Platform> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Waker<Platform> {
-    /// Causes the thread blocked in [`WaitContext::wait`] to wake up and
+    /// Causes the thread blocked in [`WaitContext::wait_until`] to wake up and
     /// reevaluate its wait condition.
     ///
     /// Note that this does not interrupt guest execution; to interrupt guest
@@ -205,10 +205,10 @@ pub struct ThreadHandle<Platform: RawSyncPrimitivesProvider + ThreadProvider> {
 impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform> {
     /// Interrupts the thread, whether it is waiting or running guest code.
     ///
-    /// If it is waiting in [`WaitContext::wait`] or [`WaitContext::sleep`], it
-    /// will be woken up to reevaluate its wait condition and interrupt
-    /// condition. If it is running guest code, the platform will interrupt the
-    /// thread and re-enter the shim.
+    /// If it is waiting in [`WaitContext::wait_until`] or
+    /// [`WaitContext::sleep`], it will be woken up to reevaluate its wait
+    /// condition and interrupt condition. If it is running guest code, the
+    /// platform will interrupt the thread and re-enter the shim.
     pub fn interrupt(&self) {
         let condvar = &self.waker.0.condvar;
         let v = condvar.underlying_atomic().fetch_update(
@@ -244,7 +244,7 @@ struct State(u32);
 impl State {
     /// The thread is running (this includes waiting non-interruptibly via a [`RawMutex`]).
     const RUNNING: Self = Self(0);
-    /// The thread is waiting via [`WaitContext::wait`].
+    /// The thread is waiting via [`WaitContext::wait_until`].
     const WAITING: Self = Self(1);
     /// The thread is waiting and has been woken up to reevaluate its wait
     /// condition.
@@ -286,8 +286,8 @@ pub struct WaitContext<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> {
 pub trait CheckForInterrupt {
     /// Returns `true` if the wait should be interrupted.
     ///
-    /// This is called by [`WaitContext::wait`] each time it is about to block
-    /// the thread. If this returns `true`, the wait will return with
+    /// This is called by [`WaitContext::wait_until`] each time it is about to
+    /// block the thread. If this returns `true`, the wait will return with
     /// [`WaitError::Interrupted`].
     fn check_for_interrupt(&self) -> bool;
 }
@@ -439,7 +439,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     /// If the deadline has already passed, this returns immediately with
     /// [`WaitError::TimedOut`], even if there is a pending interrupt.
     pub fn sleep(&self) -> WaitError {
-        self.wait(|| false).unwrap_err()
+        self.wait_until(|| false).unwrap_err()
     }
 
     /// Waits until `f` returns `true`.
@@ -452,11 +452,11 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     ///
     /// # Panics
     /// Panics if the thread is not currently in the running state, either
-    /// because `f` calls `wait` recursively, or  because
+    /// because `f` calls `wait_until` recursively, or  because
     /// [`prepare_to_run_guest`](WaitState::prepare_to_run_guest) was called
     /// without a subsequent call to
     /// [`finish_running_guest`](WaitState::finish_running_guest).
-    pub fn wait(&self, mut f: impl FnMut() -> bool) -> Result<(), WaitError> {
+    pub fn wait_until(&self, mut f: impl FnMut() -> bool) -> Result<(), WaitError> {
         assert_eq!(self.waker.0.state_for_assert(), State::RUNNING);
         let _end_wait = crate::utils::defer(|| self.end_wait());
         loop {
