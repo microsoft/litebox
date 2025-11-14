@@ -1,23 +1,23 @@
 //! Support infrastructure for interruptible waits.
 //!
-//! Ordinary waits in litebox, via the [`RawMutex`](crate::platform::RawMutex)
-//! trait, are not easily interrupted--they can only be woken up by another
-//! thread signaling the condition variable. This is fine for mutexes and
-//! condition variables, cases where wait times are short and are guaranteed to
-//! eventually complete.
+//! Ordinary waits in litebox, via the [`RawMutex`] trait, are not easily
+//! interrupted--they can only be woken up by another thread explicitly
+//! signaling the raw mutex. This is fine for ordinary uses of mutexes, locks,
+//! and condition variables, cases where waits can be guaranteed to eventually
+//! complete.
 //!
 //! However, waits on guest- or externally-controlled conditions (e.g., futexes,
-//! eventfd, some IO events) must be interruptible due to process termination or
-//! asynchronous signals, since the event may never occur. This module provides
-//! infrastructure for such interruptible waits.
+//! eventfds, IO events) must be interruptible due to process termination or
+//! asynchronous signals, since the waited-on event may never occur. This module
+//! provides infrastructure for handling such cases.
 //!
 //! The core type is [`WaitState`], which models a per-thread wait state. The
 //! thread can create a [`WaitContext`] from the wait state, which can then be
 //! used to perform interruptible waits on a given condition. The wait context
 //! produces a [`Waker`], which can be passed to other threads to wake up the
 //! waiting thread. And finally, the wait state can produce a [`ThreadHandle`],
-//! which can be used to interrupt the thread that is waiting or is running
-//! guest code.
+//! which can be used to interrupt the thread in any state, whether it is
+//! waiting or running guest code.
 
 use alloc::sync::Arc;
 use core::{marker::PhantomData, sync::atomic::Ordering};
@@ -453,9 +453,9 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     /// # Panics
     /// Panics if the thread is not currently in the running state, either
     /// because `f` calls `wait` recursively, or  because
-    /// [`prepare_to_run_guest`](Self::prepare_to_run_guest) was called without
-    /// a subsequent call to
-    /// [`finish_running_guest`](Self::finish_running_guest).
+    /// [`prepare_to_run_guest`](WaitState::prepare_to_run_guest) was called
+    /// without a subsequent call to
+    /// [`finish_running_guest`](WaitState::finish_running_guest).
     pub fn wait(&self, mut f: impl FnMut() -> bool) -> Result<(), WaitError> {
         assert_eq!(self.waker.0.state_for_assert(), State::RUNNING);
         let _end_wait = crate::utils::defer(|| self.end_wait());
