@@ -335,6 +335,20 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         }
     }
 
+    /// Returns a new context that has a deadline after the given duration, if
+    /// one is provided.
+    ///
+    /// If the existing context already has an earlier deadline or if no timeout
+    /// is provided, then this just clones the context.
+    #[must_use]
+    pub fn with_maybe_timeout(&self, timeout: Option<core::time::Duration>) -> Self {
+        if let Some(dur) = timeout {
+            self.with_timeout(dur)
+        } else {
+            Self { ..*self }
+        }
+    }
+
     /// Returns a new context that has the given deadline.
     ///
     /// If the existing context already has an earlier deadline, then this just
@@ -348,15 +362,14 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         this
     }
 
-    /// Returns a new context that has a deadline after the given duration, if
-    /// one is provided.
+    /// Returns a new context that has the given deadline, if one is provided.
     ///
-    /// If the existing context already has an earlier deadline or if no timeout
+    /// If the existing context already has an earlier deadline or if no deadline
     /// is provided, then this just clones the context.
     #[must_use]
-    pub fn with_maybe_timeout(&self, timeout: Option<core::time::Duration>) -> Self {
-        if let Some(dur) = timeout {
-            self.with_timeout(dur)
+    pub fn with_maybe_deadline(&self, deadline: Option<Platform::Instant>) -> Self {
+        if let Some(d) = deadline {
+            self.with_deadline(d)
         } else {
             Self { ..*self }
         }
@@ -393,12 +406,19 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     /// `start_wait` must have already been called and the wait condition
     /// evaluated.
     fn commit_wait(&self) -> Result<(), WaitError> {
+        // Check for timeout before checking for an interrupt. This is important
+        // for things like sleep(), where we want to return `TimedOut` rather than
+        // `Interrupted` if the deadline has already passed.
+        let timeout = if self.deadline.is_some() {
+            Some(self.remaining_timeout().ok_or(WaitError::TimedOut)?)
+        } else {
+            None
+        };
         if self.check_interrupt.check_for_interrupt() {
             return Err(WaitError::Interrupted);
         }
 
-        if self.deadline.is_some() {
-            let timeout = self.remaining_timeout().ok_or(WaitError::TimedOut)?;
+        if let Some(timeout) = timeout {
             let r = self
                 .waker
                 .0
@@ -415,6 +435,9 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     }
 
     /// Sleep until the wait is interrupted or times out.
+    ///
+    /// If the deadline has already passed, this returns immediately with
+    /// [`WaitError::TimedOut`], even if there is a pending interrupt.
     pub fn sleep(&self) -> WaitError {
         self.wait(|| false).unwrap_err()
     }

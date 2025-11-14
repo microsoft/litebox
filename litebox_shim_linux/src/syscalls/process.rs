@@ -776,22 +776,35 @@ impl Task {
         let is_abs = flags.contains(litebox_common_linux::TimerFlags::ABSTIME);
 
         let platform = litebox_platform_multiplex::platform();
-        let duration = if is_abs {
-            let now = self.gettime_as_duration(platform, clockid)?;
-            if request <= now {
-                return Ok(());
+
+        // Set up a wait context with the right deadline/timeout.
+        let wait_cx = self.wait_cx();
+        let wait_cx = if is_abs {
+            if matches!(clockid, litebox_common_linux::ClockId::Monotonic) {
+                // No need to compute the current time since the offset from the
+                // request to `Instant` is known.
+                wait_cx.with_maybe_deadline(crate::boot_time().checked_add(request))
+            } else {
+                wait_cx.with_maybe_timeout(
+                    request.checked_sub(self.gettime_as_duration(platform, clockid)?),
+                )
             }
-            request.checked_sub(now).unwrap()
         } else {
-            request
+            // Relative. Treat all clocks the same. TODO: handle the different clocks differently.
+            wait_cx.with_timeout(request)
         };
 
-        match self.wait_cx().with_timeout(duration).sleep() {
+        match wait_cx.sleep() {
             WaitError::TimedOut => {}
             WaitError::Interrupted => {
-                // TODO: update the remainder for non-absolute sleeps interrupted by signals.
-                let _ = remain;
-                return Err(Errno::EINTR);
+                if is_abs {
+                    return Err(Errno::EINTR);
+                }
+                if let Some(remaining_timeout) = wait_cx.remaining_timeout() {
+                    remain.write(remaining_timeout)?;
+                    return Err(Errno::EINTR);
+                }
+                // Whoops, time ran out after getting interrupted. Treat this as a timeout.
             }
         }
 
