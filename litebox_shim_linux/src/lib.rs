@@ -38,6 +38,7 @@ use litebox_platform_multiplex::Platform;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
+mod wait;
 
 pub type DefaultFS = LinuxFS;
 
@@ -225,6 +226,7 @@ impl LinuxShim {
         SHIM_TLS.init(LinuxShimTls {
             current_task: Task {
                 global,
+                wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
                 pid,
                 ppid,
                 tid,
@@ -305,11 +307,11 @@ pub fn perform_network_interaction() -> litebox::net::PlatformInteractionReinvoc
     litebox_net().lock().perform_platform_interaction()
 }
 
-pub(crate) fn litebox_pipes<'a>() -> &'a litebox::sync::RwLock<Platform, Pipes<Platform>> {
-    static PIPES: OnceBox<litebox::sync::RwLock<Platform, Pipes<Platform>>> = OnceBox::new();
+pub(crate) fn litebox_pipes<'a>() -> &'a Pipes<Platform> {
+    static PIPES: OnceBox<Pipes<Platform>> = OnceBox::new();
     PIPES.get_or_init(|| {
         let pipes = Pipes::new(litebox());
-        alloc::boxed::Box::new(litebox().sync().new_rwlock(pipes))
+        alloc::boxed::Box::new(pipes)
     })
 }
 
@@ -1280,6 +1282,7 @@ struct LinuxShimTls {
 
 struct Task {
     global: Arc<GlobalState>,
+    wait_state: wait::WaitState,
     process: Arc<syscalls::process::Process>,
     /// Process ID
     pid: i32,
@@ -1421,6 +1424,7 @@ mod test_utils {
             let files = Arc::new(syscalls::file::FilesState::new(litebox()));
             files.initialize_stdio_in_shared_descriptors_table(&self.fs);
             Task {
+                wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
                 global: self,
                 process: Arc::new(syscalls::process::Process::new()),
                 pid,
@@ -1454,6 +1458,7 @@ mod test_utils {
             let parent_pid = self.ppid;
             let files = self.files.clone();
             move || Task {
+                wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
                 global,
                 process,
                 pid,

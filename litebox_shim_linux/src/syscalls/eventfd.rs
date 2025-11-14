@@ -7,6 +7,7 @@ use litebox::{
         Events, IOPollable,
         observer::Observer,
         polling::{Pollee, TryOpError},
+        wait::WaitContext,
     },
     fs::OFlags,
     platform::TimeProvider,
@@ -49,16 +50,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         Ok(res)
     }
 
-    pub(crate) fn read(&self) -> Result<u64, Errno> {
-        Ok(if self.get_status().contains(OFlags::NONBLOCK) {
-            self.try_read()
-        } else {
-            self.pollee.wait_or_timeout(
-                None,
+    pub(crate) fn read(&self, cx: &WaitContext<'_, Platform>) -> Result<u64, Errno> {
+        self.pollee
+            .wait(
+                cx,
+                self.get_status().contains(OFlags::NONBLOCK),
                 || self.try_read(),
                 || self.check_io_events().contains(Events::IN),
             )
-        }?)
+            .map_err(Errno::from)
     }
 
     fn try_write(&self, value: u64) -> Result<usize, TryOpError<Errno>> {
@@ -77,16 +77,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         Err(TryOpError::TryAgain)
     }
 
-    pub(crate) fn write(&self, value: u64) -> Result<usize, Errno> {
-        Ok(if self.get_status().contains(OFlags::NONBLOCK) {
-            self.try_write(value)
-        } else {
-            self.pollee.wait_or_timeout(
-                None,
+    pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, value: u64) -> Result<usize, Errno> {
+        self.pollee
+            .wait(
+                cx,
+                self.get_status().contains(OFlags::NONBLOCK),
                 || self.try_write(value),
                 || self.check_io_events().contains(Events::OUT),
             )
-        }?)
+            .map_err(Errno::from)
     }
 
     crate::syscalls::common_functions_for_file_status!();
@@ -116,7 +115,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFil
 
 #[cfg(test)]
 mod tests {
+    use litebox::event::wait::WaitState;
     use litebox_common_linux::{EfdFlags, errno::Errno};
+    use litebox_platform_multiplex::platform;
 
     extern crate std;
 
@@ -133,12 +134,16 @@ mod tests {
         for _ in 0..total {
             let copied_eventfd = eventfd.clone();
             std::thread::spawn(move || {
-                copied_eventfd.read().unwrap();
+                copied_eventfd
+                    .read(&WaitState::new(platform()).context())
+                    .unwrap();
             });
         }
 
         std::thread::sleep(core::time::Duration::from_millis(500));
-        eventfd.write(total).unwrap();
+        eventfd
+            .write(&WaitState::new(platform()).context(), total)
+            .unwrap();
     }
 
     #[test]
@@ -152,17 +157,21 @@ mod tests {
         ));
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
-            copied_eventfd.write(1).unwrap();
+            copied_eventfd
+                .write(&WaitState::new(platform()).context(), 1)
+                .unwrap();
             // block until the first read finishes
-            copied_eventfd.write(u64::MAX - 1).unwrap();
+            copied_eventfd
+                .write(&WaitState::new(platform()).context(), u64::MAX - 1)
+                .unwrap();
         });
 
         // block until the first write
-        let ret = eventfd.read().unwrap();
+        let ret = eventfd.read(&WaitState::new(platform()).context()).unwrap();
         assert_eq!(ret, 1);
 
         // block until the second write
-        let ret = eventfd.read().unwrap();
+        let ret = eventfd.read(&WaitState::new(platform()).context()).unwrap();
         assert_eq!(ret, u64::MAX - 1);
     }
 
@@ -178,12 +187,14 @@ mod tests {
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
             for _ in 0..10000 {
-                copied_eventfd.write(u64::MAX - 1).unwrap();
+                copied_eventfd
+                    .write(&WaitState::new(platform()).context(), u64::MAX - 1)
+                    .unwrap();
             }
         });
 
         for _ in 0..10000 {
-            let ret = eventfd.read().unwrap();
+            let ret = eventfd.read(&WaitState::new(platform()).context()).unwrap();
             assert_eq!(ret, u64::MAX - 1);
         }
     }
@@ -200,9 +211,13 @@ mod tests {
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
             // first write should succeed immediately
-            copied_eventfd.write(1).unwrap();
+            copied_eventfd
+                .write(&WaitState::new(platform()).context(), 1)
+                .unwrap();
             // block until the first read finishes
-            while let Err(e) = copied_eventfd.write(u64::MAX - 1) {
+            while let Err(e) =
+                copied_eventfd.write(&WaitState::new(platform()).context(), u64::MAX - 1)
+            {
                 assert_eq!(e, Errno::EAGAIN, "Unexpected error: {e:?}");
                 core::hint::spin_loop();
             }
@@ -211,7 +226,7 @@ mod tests {
         let read = |eventfd: &super::EventFile<litebox_platform_multiplex::Platform>,
                     expected_value: u64| {
             loop {
-                match eventfd.read() {
+                match eventfd.read(&WaitState::new(platform()).context()) {
                     Ok(ret) => {
                         assert_eq!(ret, expected_value);
                         break;

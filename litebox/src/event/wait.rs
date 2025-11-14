@@ -1,0 +1,461 @@
+//! Support infrastructure for interruptible waits.
+//!
+//! Ordinary waits in litebox, via the [`RawMutex`](crate::platform::RawMutex)
+//! trait, are not easily interrupted--they can only be woken up by another
+//! thread signaling the condition variable. This is fine for mutexes and
+//! condition variables, cases where wait times are short and are guaranteed to
+//! eventually complete.
+//!
+//! However, waits on guest- or externally-controlled conditions (e.g., futexes,
+//! eventfd, some IO events) must be interruptible due to process termination or
+//! asynchronous signals, since the event may never occur. This module provides
+//! infrastructure for such interruptible waits.
+//!
+//! The core type is [`WaitState`], which models a per-thread wait state. The
+//! thread can create a [`WaitContext`] from the wait state, which can then be
+//! used to perform interruptible waits on a given condition. The wait context
+//! produces a [`Waker`], which can be passed to other threads to wake up the
+//! waiting thread. And finally, the wait state can produce a [`ThreadHandle`],
+//! which can be used to interrupt the thread that is waiting or is running
+//! guest code.
+
+use alloc::sync::Arc;
+use core::{marker::PhantomData, sync::atomic::Ordering};
+
+use crate::{
+    platform::{
+        ImmediatelyWokenUp, Instant as _, RawMutex, ThreadProvider, TimeProvider,
+        UnblockedOrTimedOut,
+    },
+    sync::RawSyncPrimitivesProvider,
+};
+use thiserror::Error;
+
+/// The wait state for a thread.
+///
+/// A thread can be running, waiting, or running in the guest. This object
+/// tracks that state and provides the ability to wait and be woken up or
+/// interrupted.
+///
+/// This is meant to be stored in a per-thread object and used for all waits for
+/// that thread.
+pub struct WaitState<Platform: RawSyncPrimitivesProvider> {
+    waker: Waker<Platform>,
+    /// Make sure this is `Send` but not `Sync` so that no one tries to share it
+    /// across threads.
+    _phantom: PhantomData<core::cell::Cell<()>>,
+}
+
+struct WaitStateInner<Platform: RawSyncPrimitivesProvider> {
+    platform: &'static Platform,
+    condvar: Platform::RawMutex,
+}
+
+/// A handle, returned by [`WaitContext::waker`], that can be used to wake up a
+/// thread waiting on via [`WaitContext::wait`].
+pub struct Waker<Platform: RawSyncPrimitivesProvider>(Arc<WaitStateInner<Platform>>);
+
+impl<Platform: RawSyncPrimitivesProvider> Clone for Waker<Platform> {
+    fn clone(&self) -> Self {
+        Waker(self.0.clone())
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> Waker<Platform> {
+    /// Causes the thread blocked in [`WaitContext::wait`] to wake up and
+    /// reevaluate its wait condition.
+    ///
+    /// Note that this does not interrupt guest execution; to interrupt guest
+    /// execution, use [`ThreadHandle::interrupt`].
+    pub fn wake(&self) {
+        self.0.wake();
+    }
+
+    /// Returns a weak reference to this waker as an observer. The waker will be
+    /// woken up on any event.
+    pub fn observer<E>(&self) -> alloc::sync::Weak<dyn crate::event::observer::Observer<E>> {
+        Arc::downgrade(&self.0) as _
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider, E> super::observer::Observer<E>
+    for WaitStateInner<Platform>
+{
+    fn on_events(&self, _events: &E) {
+        self.wake();
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
+    /// Creates a new wait state.
+    ///
+    /// Typically, you should create just one wait state per thread.
+    pub fn new(platform: &'static Platform) -> Self {
+        Self {
+            waker: Waker(Arc::new(WaitStateInner {
+                platform,
+                condvar: platform.new_raw_mutex(),
+            })),
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Returns a wait context that can be used to wait for things.
+    pub fn context(&self) -> WaitContext<'_, Platform>
+    where
+        Platform: TimeProvider,
+    {
+        WaitContext::new(&self.waker)
+    }
+
+    /// Returns a handle that can be used to interrupt the current thread,
+    /// whether it is waiting or running guest code.
+    pub fn thread_handle(&self) -> ThreadHandle<Platform>
+    where
+        Platform: ThreadProvider,
+    {
+        let current_thread = self.waker.0.platform.current_thread();
+        ThreadHandle {
+            waker: self.waker.clone(),
+            thread: current_thread,
+        }
+    }
+
+    /// Sets the wait state so that [`ThreadHandle::interrupt`] will interrupt
+    /// the guest execution, then calls `f` to see if the guest is still ready
+    /// to run.
+    ///
+    /// `f` should check if there is already a reason to not run the guest
+    /// (e.g., pending interrupts or events).
+    ///
+    /// If this returns `true`, then you must call
+    /// [`finish_running_guest`](Self::finish_running_guest) before using the
+    /// wait state again.
+    ///
+    /// # Panics
+    /// Panics if called while not in the running state.
+    #[must_use]
+    pub fn prepare_to_run_guest(&self, f: impl FnOnce() -> bool) -> bool {
+        assert_eq!(self.waker.0.state_for_assert(), State::RUNNING);
+        self.waker.0.set_state(State::IN_GUEST, Ordering::SeqCst);
+        let ready = f();
+        if !ready {
+            self.waker.0.set_state(State::RUNNING, Ordering::Relaxed);
+        }
+        ready
+    }
+
+    /// Sets the wait state back to running after running the guest.
+    ///
+    /// # Panics
+    /// Panics if there was not a prior successful call to
+    /// [`prepare_to_run_guest`](Self::prepare_to_run_guest).
+    pub fn finish_running_guest(&self) {
+        let state = self.waker.0.state_for_assert();
+        assert!(
+            state == State::IN_GUEST || state == State::INTERRUPTED_GUEST,
+            "{state:?}"
+        );
+        self.waker.0.set_state(State::RUNNING, Ordering::Relaxed);
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
+    /// Wakes up the thread if it is waiting (but not if it is running in the guest).
+    fn wake(&self) {
+        let condvar = &self.condvar;
+        let v = condvar.underlying_atomic().fetch_update(
+            Ordering::Release,
+            Ordering::Relaxed,
+            |state| match State(state) {
+                State::RUNNING | State::WOKEN | State::INTERRUPTED_GUEST | State::IN_GUEST => None,
+                State::WAITING => Some(State::WOKEN.0),
+                state => unreachable!("{state:?}"),
+            },
+        );
+        match v.map(State) {
+            Ok(State::WAITING) => {
+                condvar.wake_one();
+            }
+            Ok(state) => unreachable!("{state:?}"),
+            Err(_) => {
+                // Provide a consistent release fence even if we didn't wake up
+                // the thread.
+                core::sync::atomic::fence(Ordering::Release);
+            }
+        }
+    }
+
+    fn state_for_assert(&self) -> State {
+        State(self.condvar.underlying_atomic().load(Ordering::Relaxed))
+    }
+
+    fn set_state(&self, new_state: State, ordering: Ordering) {
+        self.condvar
+            .underlying_atomic()
+            .store(new_state.0, ordering);
+    }
+}
+
+pub struct ThreadHandle<Platform: RawSyncPrimitivesProvider + ThreadProvider> {
+    waker: Waker<Platform>,
+    thread: Platform::ThreadHandle,
+}
+
+impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform> {
+    /// Interrupts the thread, whether it is waiting or running guest code.
+    ///
+    /// If it is waiting in [`WaitContext::wait`] or [`WaitContext::sleep`], it
+    /// will be woken up to reevaluate its wait condition and interrupt
+    /// condition. If it is running guest code, the platform will interrupt the
+    /// thread and re-enter the shim.
+    pub fn interrupt(&self) {
+        let condvar = &self.waker.0.condvar;
+        let v = condvar.underlying_atomic().fetch_update(
+            Ordering::Release,
+            Ordering::Relaxed,
+            |state| match State(state) {
+                State::RUNNING | State::WOKEN | State::INTERRUPTED_GUEST => None,
+                State::WAITING => Some(State::WOKEN.0),
+                State::IN_GUEST => Some(State::INTERRUPTED_GUEST.0),
+                state => unreachable!("{state:?}"),
+            },
+        );
+        match v.map(State) {
+            Ok(State::WAITING) => {
+                condvar.wake_one();
+            }
+            Ok(State::IN_GUEST) => {
+                self.waker.0.platform.interrupt_thread(&self.thread);
+            }
+            Ok(state) => unreachable!("{state:?}"),
+            Err(_) => {
+                // Provide a consistent release fence even if we didn't wake up
+                // the thread.
+                core::sync::atomic::fence(Ordering::Release);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct State(u32);
+
+impl State {
+    /// The thread is running (this includes waiting non-interruptibly via a [`RawMutex`]).
+    const RUNNING: Self = Self(0);
+    /// The thread is waiting via [`WaitContext::wait`].
+    const WAITING: Self = Self(1);
+    /// The thread is waiting and has been woken up to reevaluate its wait
+    /// condition.
+    const WOKEN: Self = Self(2);
+    /// The thread is running guest code.
+    const IN_GUEST: Self = Self(3);
+    /// The thread is running guest code and something has called the platform
+    /// to interrupt it.
+    const INTERRUPTED_GUEST: Self = Self(4);
+}
+
+impl core::fmt::Debug for State {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let v = match *self {
+            Self::RUNNING => "RUNNING",
+            Self::WAITING => "WAITING",
+            Self::WOKEN => "WOKEN",
+            Self::IN_GUEST => "IN_GUEST",
+            Self::INTERRUPTED_GUEST => "INTERRUPTED_GUEST",
+            Self(v) => return write!(f, "UNKNOWN({v})"),
+        };
+        f.write_str(v)
+    }
+}
+
+/// A context object used to perform interruptible waits.
+///
+/// This is created from a [`WaitState`] but can be augmented with timeouts and
+/// with code to evaluate whether the wait should be interrupted.
+pub struct WaitContext<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    waker: &'a Waker<Platform>,
+    deadline: Option<Platform::Instant>,
+    check_interrupt: &'a dyn CheckForInterrupt,
+    // Not Send or Sync--this can only be used by the thread that created it.
+    _phantom: PhantomData<*mut ()>,
+}
+
+/// A trait for checking whether the wait should be interrupted.
+pub trait CheckForInterrupt {
+    /// Returns `true` if the wait should be interrupted.
+    ///
+    /// This is called by [`WaitContext::wait`] each time it is about to block
+    /// the thread. If this returns `true`, the wait will return with
+    /// [`WaitError::Interrupted`].
+    fn check_for_interrupt(&self) -> bool;
+}
+
+struct NeverInterrupt;
+
+impl CheckForInterrupt for NeverInterrupt {
+    fn check_for_interrupt(&self) -> bool {
+        false
+    }
+}
+
+impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Platform> {
+    fn new(waker: &'a Waker<Platform>) -> WaitContext<'a, Platform> {
+        WaitContext {
+            waker,
+            deadline: None,
+            check_interrupt: &NeverInterrupt,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Returns a new context that uses the given interrupt checker.
+    ///
+    /// Note that this _replaces_ any existing interrupt checker.
+    #[must_use]
+    pub fn with_check_for_interrupt(&self, f: &'a dyn CheckForInterrupt) -> Self {
+        Self {
+            check_interrupt: f,
+            ..*self
+        }
+    }
+
+    /// Returns a new context that has a deadline after the given duration.
+    ///
+    /// If the existing context already has an earlier deadline, then this just
+    /// clones the context.
+    #[must_use]
+    pub fn with_timeout(&self, timeout: core::time::Duration) -> Self {
+        // If this overflows, treat that as no deadline.
+        if let Some(deadline) = self.waker.0.platform.now().checked_add(timeout) {
+            self.with_deadline(deadline)
+        } else {
+            Self { ..*self }
+        }
+    }
+
+    /// Returns a new context that has the given deadline.
+    ///
+    /// If the existing context already has an earlier deadline, then this just
+    /// clones the context.
+    #[must_use]
+    pub fn with_deadline(&self, deadline: Platform::Instant) -> Self {
+        let mut this = Self { ..*self };
+        if self.deadline.is_none_or(|d| deadline < d) {
+            this.deadline = Some(deadline);
+        }
+        this
+    }
+
+    /// Returns a new context that has a deadline after the given duration, if
+    /// one is provided.
+    ///
+    /// If the existing context already has an earlier deadline or if no timeout
+    /// is provided, then this just clones the context.
+    #[must_use]
+    pub fn with_maybe_timeout(&self, timeout: Option<core::time::Duration>) -> Self {
+        if let Some(dur) = timeout {
+            self.with_timeout(dur)
+        } else {
+            Self { ..*self }
+        }
+    }
+
+    /// Returns the deadline for this wait context, if any.
+    pub fn deadline(&self) -> Option<Platform::Instant> {
+        self.deadline
+    }
+
+    /// Returns the remaining timeout for this wait context, if any.
+    pub fn remaining_timeout(&self) -> Option<core::time::Duration> {
+        self.deadline.and_then(|deadline| {
+            let now = self.waker.0.platform.now();
+            deadline.checked_duration_since(&now)
+        })
+    }
+
+    /// Moves the thread into the waiting state. This must happen before
+    /// evaluating the wait and interrupt conditions so that wakeups are not
+    /// missed.
+    fn start_wait(&self) {
+        self.waker.0.set_state(State::WAITING, Ordering::SeqCst);
+    }
+
+    /// Returns the thread to the running state after a wait.
+    fn end_wait(&self) {
+        self.waker.0.set_state(State::RUNNING, Ordering::Relaxed);
+    }
+
+    /// Checks whether the wait should be interrupted. If not, then performs
+    /// the wait.
+    ///
+    /// `start_wait` must have already been called and the wait condition
+    /// evaluated.
+    fn commit_wait(&self) -> Result<(), WaitError> {
+        if self.check_interrupt.check_for_interrupt() {
+            return Err(WaitError::Interrupted);
+        }
+
+        if self.deadline.is_some() {
+            let timeout = self.remaining_timeout().ok_or(WaitError::TimedOut)?;
+            let r = self
+                .waker
+                .0
+                .condvar
+                .block_or_timeout(State::WAITING.0, timeout);
+            match r {
+                Ok(UnblockedOrTimedOut::Unblocked) | Err(ImmediatelyWokenUp) => Ok(()),
+                Ok(UnblockedOrTimedOut::TimedOut) => Err(WaitError::TimedOut),
+            }
+        } else {
+            let _ = self.waker.0.condvar.block(State::WAITING.0);
+            Ok(())
+        }
+    }
+
+    /// Sleep until the wait is interrupted or times out.
+    pub fn sleep(&self) -> WaitError {
+        self.wait(|| false).unwrap_err()
+    }
+
+    /// Waits until `f` returns `true`.
+    ///
+    /// `f` is called once before the thread sleeps and then again each time the
+    /// thread is woken up. The caller must arrange for wakeups at the
+    /// appropriate time. This can be done by a call to [`Waker::wake`] or
+    /// [`ThreadHandle::interrupt`], or by signaling the observer returned by
+    /// [`Waker::observer`].
+    ///
+    /// # Panics
+    /// Panics if the thread is not currently in the running state, either
+    /// because `f` calls `wait` recursively, or  because
+    /// [`prepare_to_run_guest`](Self::prepare_to_run_guest) was called without
+    /// a subsequent call to
+    /// [`finish_running_guest`](Self::finish_running_guest).
+    pub fn wait(&self, mut f: impl FnMut() -> bool) -> Result<(), WaitError> {
+        assert_eq!(self.waker.0.state_for_assert(), State::RUNNING);
+        let _end_wait = crate::utils::defer(|| self.end_wait());
+        loop {
+            self.start_wait();
+            if f() {
+                break Ok(());
+            }
+            self.commit_wait()?;
+        }
+    }
+
+    /// Returns the waker associated with this wait context.
+    pub fn waker(&self) -> &Waker<Platform> {
+        self.waker
+    }
+}
+
+/// An error that can occur during a wait.
+#[derive(Debug, Error)]
+pub enum WaitError {
+    #[error("wait was interrupted")]
+    Interrupted,
+    #[error("wait timed out")]
+    TimedOut,
+}

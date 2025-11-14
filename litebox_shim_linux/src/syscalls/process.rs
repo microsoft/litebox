@@ -7,11 +7,12 @@ use core::mem::offset_of;
 use core::ops::Range;
 use core::sync::atomic::AtomicI32;
 use core::time::Duration;
+use litebox::event::wait::WaitError;
 use litebox::mm::linux::VmFlags;
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{
-    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutex as _,
-    RawMutexProvider as _, ThreadLocalStorageProvider as _,
+    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _,
+    ThreadLocalStorageProvider as _,
 };
 use litebox::platform::{RawMutPointer as _, ThreadProvider as _};
 #[cfg(target_arch = "x86")]
@@ -461,14 +462,16 @@ impl Task {
             .nr_threads
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
+        let platform = litebox_platform_multiplex::platform();
         let r = unsafe {
-            litebox_platform_multiplex::platform().spawn_thread(
+            platform.spawn_thread(
                 &ctx_copy,
                 Box::new(NewThreadArgs {
                     tls,
                     set_child_tid,
                     task: Task {
                         global: self.global.clone(),
+                        wait_state: crate::wait::WaitState::new(platform),
                         pid: self.pid,
                         tid: child_tid,
                         ppid: self.ppid,
@@ -783,18 +786,14 @@ impl Task {
             request
         };
 
-        // Reuse the raw mutex provider to implement sleep.
-        //
-        // TODO: consider a new litebox API to directly sleep, with integration with
-        // interruptions.
-        let r = platform.new_raw_mutex().block_or_timeout(0, duration);
-        assert!(matches!(
-            r,
-            Ok(litebox::platform::UnblockedOrTimedOut::TimedOut)
-        ),);
-
-        // TODO: update the remainder for non-absolute sleeps interrupted by signals.
-        let _ = remain;
+        match self.wait_cx().with_timeout(duration).sleep() {
+            WaitError::TimedOut => {}
+            WaitError::Interrupted => {
+                // TODO: update the remainder for non-absolute sleeps interrupted by signals.
+                let _ = remain;
+                return Err(Errno::EINTR);
+            }
+        }
 
         Ok(())
     }

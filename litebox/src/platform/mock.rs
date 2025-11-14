@@ -199,6 +199,7 @@ impl IPInterfaceProvider for MockPlatform {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct MockInstant {
     time: u64,
 }
@@ -210,6 +211,11 @@ impl Instant for MockInstant {
         } else {
             None
         }
+    }
+    fn checked_add(&self, duration: core::time::Duration) -> Option<Self> {
+        self.time
+            .checked_add(duration.as_millis() as u64)
+            .map(|new_time| MockInstant { time: new_time })
     }
 }
 
