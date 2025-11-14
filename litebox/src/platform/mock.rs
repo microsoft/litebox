@@ -213,9 +213,10 @@ impl Instant for MockInstant {
         }
     }
     fn checked_add(&self, duration: core::time::Duration) -> Option<Self> {
-        self.time
-            .checked_add(duration.as_millis() as u64)
-            .map(|new_time| MockInstant { time: new_time })
+        let duration_millis: u64 = duration.as_millis().try_into().ok()?;
+        Some(MockInstant {
+            time: self.time.checked_add(duration_millis)?,
+        })
     }
 }
 
