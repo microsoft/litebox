@@ -643,5 +643,9 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     }
 }
 
+// SAFETY: `RwLock<T>` inherits `Send` from `T`.
 unsafe impl<Platform: RawSyncPrimitivesProvider, T: Sync> Sync for RwLock<Platform, T> {}
+// SAFETY: `RwLock<T>` inherits `Sync` from `T`. Note that this is a different
+// bound from `Mutex<T>`, because `RwLock` does not guarantee mutual
+// exclusion--there could be multiple readers at the same time.
 unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Send for RwLock<Platform, T> {}
