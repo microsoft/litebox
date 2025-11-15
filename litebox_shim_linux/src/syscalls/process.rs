@@ -706,10 +706,6 @@ impl Task {
         tp.write(duration)
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "will fail for unknown clock IDs in the future"
-    )]
     fn gettime_as_duration(
         &self,
         platform: &litebox_platform_multiplex::Platform,
@@ -730,7 +726,10 @@ impl Task {
                 // In a real implementation, this would typically have lower resolution
                 platform.now().duration_since(crate::boot_time())
             }
-            _ => unimplemented!(),
+            _ => {
+                log_unsupported!("gettime for {clockid:?}");
+                return Err(Errno::EINVAL);
+            }
         };
         Ok(duration)
     }
@@ -898,12 +897,8 @@ impl Task {
         /// It should be fine to treat shared futexes as private for now.
         macro_rules! warn_shared_futex {
             ($flag:ident) => {
-                #[cfg(debug_assertions)]
                 if !$flag.contains(litebox_common_linux::FutexFlags::PRIVATE) {
-                    litebox::log_println!(
-                        litebox_platform_multiplex::platform(),
-                        "warning: shared futexes\n"
-                    );
+                    log_unsupported!("shared futex");
                 }
             };
         }
