@@ -19,7 +19,7 @@ impl EventsFilter<super::Events> for super::Events {
 }
 
 /// A trait for observers that can be notified of events.
-pub trait Observer<E> {
+pub trait Observer<E>: Send + Sync {
     /// Called when events of interest occur.
     fn on_events(&self, events: &E);
 }

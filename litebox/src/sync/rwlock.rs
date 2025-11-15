@@ -643,5 +643,5 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     }
 }
 
-unsafe impl<Platform: RawSyncPrimitivesProvider, T> Sync for RwLock<Platform, T> {}
-unsafe impl<Platform: RawSyncPrimitivesProvider, T> Send for RwLock<Platform, T> {}
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Sync> Sync for RwLock<Platform, T> {}
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Send for RwLock<Platform, T> {}

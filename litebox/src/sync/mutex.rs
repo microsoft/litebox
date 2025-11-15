@@ -199,8 +199,8 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     }
 }
 
-unsafe impl<Platform: RawSyncPrimitivesProvider, T> Send for Mutex<Platform, T> {}
-unsafe impl<Platform: RawSyncPrimitivesProvider, T> Sync for Mutex<Platform, T> {}
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Send for Mutex<Platform, T> {}
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Sync for Mutex<Platform, T> {}
 
 impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     #[inline]
