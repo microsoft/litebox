@@ -496,9 +496,9 @@ impl PollSet {
                     // because registering an observer twice with two
                     // different event masks results in the last one
                     // replacing the first. If this is changed to
-                    // instead OR the new registration into the existing
-                    // one, then we can use a single observer for all
-                    // entries.
+                    // instead combine the new event mask into the existing
+                    // registration's mask, then we can use a single observer
+                    // for all entries.
                     let observer = Arc::new(PollEntryObserver(waker.clone()));
                     let weak = Arc::downgrade(&observer);
                     entry.observer = Some(observer);

@@ -136,13 +136,20 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
     /// Panics if called while not in the running state.
     #[must_use]
     pub fn prepare_to_run_guest(&self, f: impl FnOnce() -> bool) -> bool {
-        assert_eq!(self.waker.0.state_for_assert(), State::RUNNING);
-        self.waker.0.set_state(State::IN_GUEST, Ordering::SeqCst);
-        let ready = f();
-        if !ready {
-            self.waker.0.set_state(State::RUNNING, Ordering::Relaxed);
+        assert_eq!(
+            self.waker.0.state_for_assert(),
+            ThreadState::RUNNING_IN_HOST
+        );
+        self.waker
+            .0
+            .set_state(ThreadState::RUNNING_IN_GUEST, Ordering::SeqCst);
+        let ready_to_run_guest = f();
+        if !ready_to_run_guest {
+            self.waker
+                .0
+                .set_state(ThreadState::RUNNING_IN_HOST, Ordering::Relaxed);
         }
-        ready
+        ready_to_run_guest
     }
 
     /// Sets the wait state back to running after running the guest.
@@ -153,10 +160,12 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
     pub fn finish_running_guest(&self) {
         let state = self.waker.0.state_for_assert();
         assert!(
-            state == State::IN_GUEST || state == State::INTERRUPTED_GUEST,
+            state == ThreadState::RUNNING_IN_GUEST || state == ThreadState::INTERRUPTED_GUEST,
             "{state:?}"
         );
-        self.waker.0.set_state(State::RUNNING, Ordering::Relaxed);
+        self.waker
+            .0
+            .set_state(ThreadState::RUNNING_IN_HOST, Ordering::Relaxed);
     }
 }
 
@@ -167,14 +176,17 @@ impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
         let v = condvar.underlying_atomic().fetch_update(
             Ordering::Release,
             Ordering::Relaxed,
-            |state| match State(state) {
-                State::RUNNING | State::WOKEN | State::INTERRUPTED_GUEST | State::IN_GUEST => None,
-                State::WAITING => Some(State::WOKEN.0),
+            |state| match ThreadState(state) {
+                ThreadState::RUNNING_IN_HOST
+                | ThreadState::WOKEN
+                | ThreadState::INTERRUPTED_GUEST
+                | ThreadState::RUNNING_IN_GUEST => None,
+                ThreadState::WAITING => Some(ThreadState::WOKEN.0),
                 state => unreachable!("{state:?}"),
             },
         );
-        match v.map(State) {
-            Ok(State::WAITING) => {
+        match v.map(ThreadState) {
+            Ok(ThreadState::WAITING) => {
                 condvar.wake_one();
             }
             Ok(state) => unreachable!("{state:?}"),
@@ -186,11 +198,11 @@ impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
         }
     }
 
-    fn state_for_assert(&self) -> State {
-        State(self.condvar.underlying_atomic().load(Ordering::Relaxed))
+    fn state_for_assert(&self) -> ThreadState {
+        ThreadState(self.condvar.underlying_atomic().load(Ordering::Relaxed))
     }
 
-    fn set_state(&self, new_state: State, ordering: Ordering) {
+    fn set_state(&self, new_state: ThreadState, ordering: Ordering) {
         self.condvar
             .underlying_atomic()
             .store(new_state.0, ordering);
@@ -214,18 +226,20 @@ impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform
         let v = condvar.underlying_atomic().fetch_update(
             Ordering::Release,
             Ordering::Relaxed,
-            |state| match State(state) {
-                State::RUNNING | State::WOKEN | State::INTERRUPTED_GUEST => None,
-                State::WAITING => Some(State::WOKEN.0),
-                State::IN_GUEST => Some(State::INTERRUPTED_GUEST.0),
+            |state| match ThreadState(state) {
+                ThreadState::RUNNING_IN_HOST
+                | ThreadState::WOKEN
+                | ThreadState::INTERRUPTED_GUEST => None,
+                ThreadState::WAITING => Some(ThreadState::WOKEN.0),
+                ThreadState::RUNNING_IN_GUEST => Some(ThreadState::INTERRUPTED_GUEST.0),
                 state => unreachable!("{state:?}"),
             },
         );
-        match v.map(State) {
-            Ok(State::WAITING) => {
+        match v.map(ThreadState) {
+            Ok(ThreadState::WAITING) => {
                 condvar.wake_one();
             }
-            Ok(State::IN_GUEST) => {
+            Ok(ThreadState::RUNNING_IN_GUEST) => {
                 self.waker.0.platform.interrupt_thread(&self.thread);
             }
             Ok(state) => unreachable!("{state:?}"),
@@ -239,30 +253,31 @@ impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct State(u32);
+struct ThreadState(u32);
 
-impl State {
-    /// The thread is running (this includes waiting non-interruptibly via a [`RawMutex`]).
-    const RUNNING: Self = Self(0);
+impl ThreadState {
+    /// The thread is running in the host/shim (this includes waiting
+    /// non-interruptibly via a [`RawMutex`]).
+    const RUNNING_IN_HOST: Self = Self(0);
     /// The thread is waiting via [`WaitContext::wait_until`].
     const WAITING: Self = Self(1);
     /// The thread is waiting and has been woken up to reevaluate its wait
     /// condition.
     const WOKEN: Self = Self(2);
-    /// The thread is running guest code.
-    const IN_GUEST: Self = Self(3);
+    /// The thread is running guest code (or transitioning to/from guest code).
+    const RUNNING_IN_GUEST: Self = Self(3);
     /// The thread is running guest code and something has called the platform
-    /// to interrupt it.
+    /// to interrupt it. It will return to the shim as soon as possible.
     const INTERRUPTED_GUEST: Self = Self(4);
 }
 
-impl core::fmt::Debug for State {
+impl core::fmt::Debug for ThreadState {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let v = match *self {
-            Self::RUNNING => "RUNNING",
+            Self::RUNNING_IN_HOST => "RUNNING_IN_HOST",
             Self::WAITING => "WAITING",
             Self::WOKEN => "WOKEN",
-            Self::IN_GUEST => "IN_GUEST",
+            Self::RUNNING_IN_GUEST => "RUNNING_IN_GUEST",
             Self::INTERRUPTED_GUEST => "INTERRUPTED_GUEST",
             Self(v) => return write!(f, "UNKNOWN({v})"),
         };
@@ -392,12 +407,16 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     /// evaluating the wait and interrupt conditions so that wakeups are not
     /// missed.
     fn start_wait(&self) {
-        self.waker.0.set_state(State::WAITING, Ordering::SeqCst);
+        self.waker
+            .0
+            .set_state(ThreadState::WAITING, Ordering::SeqCst);
     }
 
     /// Returns the thread to the running state after a wait.
     fn end_wait(&self) {
-        self.waker.0.set_state(State::RUNNING, Ordering::Relaxed);
+        self.waker
+            .0
+            .set_state(ThreadState::RUNNING_IN_HOST, Ordering::Relaxed);
     }
 
     /// Checks whether the wait should be interrupted. If not, then performs
@@ -423,18 +442,22 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
                 .waker
                 .0
                 .condvar
-                .block_or_timeout(State::WAITING.0, timeout);
+                .block_or_timeout(ThreadState::WAITING.0, timeout);
             match r {
                 Ok(UnblockedOrTimedOut::Unblocked) | Err(ImmediatelyWokenUp) => Ok(()),
                 Ok(UnblockedOrTimedOut::TimedOut) => Err(WaitError::TimedOut),
             }
         } else {
-            let _ = self.waker.0.condvar.block(State::WAITING.0);
+            let _ = self.waker.0.condvar.block(ThreadState::WAITING.0);
             Ok(())
         }
     }
 
     /// Sleep until the wait is interrupted or times out.
+    ///
+    /// A deadline can be provided with [`with_deadline`](Self::with_deadline)
+    /// or [`with_timeout`](Self::with_timeout). If no deadline is provided,
+    /// this sleeps until interrupted.
     ///
     /// If the deadline has already passed, this returns immediately with
     /// [`WaitError::TimedOut`], even if there is a pending interrupt.
@@ -450,6 +473,10 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     /// [`ThreadHandle::interrupt`], or by signaling the observer returned by
     /// [`Waker::observer`].
     ///
+    /// A deadline for the wait can be provided with
+    /// [`with_deadline`](Self::with_deadline) or
+    /// [`with_timeout`](Self::with_timeout).
+    ///
     /// # Panics
     /// Panics if the thread is not currently in the running state, either
     /// because `f` calls `wait_until` recursively, or  because
@@ -457,7 +484,10 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     /// without a subsequent call to
     /// [`finish_running_guest`](WaitState::finish_running_guest).
     pub fn wait_until(&self, mut f: impl FnMut() -> bool) -> Result<(), WaitError> {
-        assert_eq!(self.waker.0.state_for_assert(), State::RUNNING);
+        assert_eq!(
+            self.waker.0.state_for_assert(),
+            ThreadState::RUNNING_IN_HOST
+        );
         let _end_wait = crate::utils::defer(|| self.end_wait());
         loop {
             self.start_wait();
