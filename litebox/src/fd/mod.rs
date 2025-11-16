@@ -124,23 +124,39 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
 
     /// Close the provided `fd`, and remove the corresponding entry if it is unique.
     /// If not unique, duplicate the `fd` for future closure.
-    pub(crate) fn close_and_duplicate_if_shared<Subsystem: FdEnabledSubsystem>(
+    ///
+    /// This method takes a closure `can_close_immediately` that is called with the entry to determine
+    /// whether the file descriptor can be closed immediately. This allows the caller to implement
+    /// custom logic (e.g., checking for pending data) before allowing the close to proceed.
+    pub(crate) fn close_and_duplicate_if_shared<
+        Subsystem: FdEnabledSubsystem,
+        F: FnOnce(&Subsystem::Entry) -> bool,
+    >(
         &mut self,
         fd: &TypedFd<Subsystem>,
+        can_close_immediately: F,
     ) -> Option<CloseResult<Subsystem>> {
         let idx = fd.x.as_usize()?;
         let Some(old) = self.entries[idx].take() else {
             unreachable!();
         };
-        fd.x.mark_as_closed();
         if Arc::strong_count(&old.x) == 1 {
-            // Unique, so we can just return it.
-            let entry = Arc::into_inner(old.x)
-                .map(RwLock::into_inner)
-                .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
-                .unwrap();
-            Some(CloseResult::Closed(entry))
+            // Unique, so we can just return it if allowed.
+            if can_close_immediately(old.x.read().as_subsystem::<Subsystem>()) {
+                fd.x.mark_as_closed();
+                let entry = Arc::into_inner(old.x)
+                    .map(RwLock::into_inner)
+                    .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
+                    .unwrap();
+                Some(CloseResult::Closed(entry))
+            } else {
+                // Put it back
+                let old = self.entries[idx].replace(old);
+                assert!(old.is_none());
+                Some(CloseResult::Deferred)
+            }
         } else {
+            fd.x.mark_as_closed();
             // Shared, so we need to duplicate it.
             let old = self.entries[idx].replace(old);
             assert!(old.is_none());
@@ -487,6 +503,8 @@ pub(crate) enum CloseResult<Subsystem: FdEnabledSubsystem> {
     Closed(Subsystem::Entry),
     /// There are other references, so a new duplicate was created for queued closure
     Duplicated(TypedFd<Subsystem>),
+    /// The FD was unique but couldn't be closed immediately (e.g., due to pending data)
+    Deferred,
 }
 
 /// Safe(r) conversions between safely-typed file descriptors and unsafely-typed integers.

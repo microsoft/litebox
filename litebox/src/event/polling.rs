@@ -48,7 +48,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'_, Platfor
         &self,
         nonblock: bool,
         events: Events,
-        register_observer: impl FnOnce(Weak<dyn Observer<Events>>, Events),
+        register_observer: impl FnOnce(Weak<dyn Observer<Events>>, Events) -> Result<(), E>,
         mut try_op: impl FnMut() -> Result<R, TryOpError<E>>,
     ) -> Result<R, TryOpError<E>>
     where
@@ -65,7 +65,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'_, Platfor
         register_observer(
             Arc::downgrade(&observer) as _,
             events | Events::ALWAYS_POLLED,
-        );
+        )
+        .map_err(TryOpError::Other)?;
         loop {
             match try_op() {
                 Err(TryOpError::TryAgain) => {}
@@ -111,6 +112,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
             events,
             |observer, filter| {
                 self.register_observer(observer, filter);
+                Ok(())
             },
             try_op,
         )

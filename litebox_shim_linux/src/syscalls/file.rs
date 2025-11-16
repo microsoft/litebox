@@ -405,7 +405,7 @@ impl Task {
                     {
                         Ok(fd) => {
                             drop(rds);
-                            crate::litebox_net().lock().close(&fd).map_err(Errno::from)
+                            super::net::close_socket(&self.wait_cx(), fd)
                         },
                         Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
                         Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
@@ -436,8 +436,12 @@ impl Task {
             return Err(Errno::EBADF);
         };
         let files = self.files.borrow();
-        match files.file_descriptors.write().remove(fd) {
-            Some(desc) => self.do_close(desc),
+        let mut file_table = files.file_descriptors.write();
+        match file_table.remove(fd) {
+            Some(desc) => {
+                drop(file_table); // drop before potentially blocking `close`
+                self.do_close(desc)
+            }
             None => Err(Errno::EBADF),
         }
     }
