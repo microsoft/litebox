@@ -238,7 +238,7 @@ fn test_syscall_rewriter() {
         &hooked_path,
         &[
             "--trampoline-addr",
-            litebox_shim_linux::loader::REWRITER_MAGIC_NUMBER
+            litebox_common_linux::loader::REWRITER_MAGIC_NUMBER
                 .to_string()
                 .as_str(),
         ],

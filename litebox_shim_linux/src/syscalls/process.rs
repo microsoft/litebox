@@ -1021,6 +1021,10 @@ impl Task {
             copy_vector(envp, "envp")?
         };
 
+        let loader = crate::loader::elf::ElfLoader::new(self, path)?;
+
+        // After this point, the old program is torn down and failures must terminate the process.
+
         // Close CLOEXEC descriptors
         self.close_on_exec();
 
@@ -1048,8 +1052,9 @@ impl Task {
             ctx.xgs.truncate(),
         );
 
-        // TODO: split this operation into pre-unmap and post-unmap parts, and handle failure properly for both cases.
-        *ctx = self.load_program(path, argv_vec, envp_vec).unwrap();
+        *ctx = self
+            .load_program(loader, argv_vec, envp_vec)
+            .expect("TODO: terminate the process cleanly");
 
         Ok(())
     }

@@ -198,7 +198,7 @@ impl LinuxShim {
         path: &str,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
-    ) -> Result<litebox_common_linux::PtRegs, loader::ElfLoaderError> {
+    ) -> Result<litebox_common_linux::PtRegs, loader::elf::ElfLoaderError> {
         let litebox = self.litebox;
         let global = self.into_global();
 
@@ -215,6 +215,28 @@ impl LinuxShim {
         let files = Arc::new(syscalls::file::FilesState::new(litebox));
         files.initialize_stdio_in_shared_descriptors_table(&global.fs);
 
+        let task = Task {
+            global,
+            pid,
+            ppid,
+            tid,
+            clear_child_tid: None.into(),
+            robust_list: None.into(),
+            credentials: syscalls::process::Credentials {
+                uid,
+                euid,
+                gid,
+                egid,
+            }
+            .into(),
+            comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
+            fs: Arc::new(syscalls::file::FsState::new()).into(),
+            files: files.into(),
+            process: syscalls::process::Process::new().into(),
+        };
+
+        let regs = task.load_program(loader::elf::ElfLoader::new(&task, path)?, argv, envp)?;
+
         // TODO: ensure this gets torn down even if the thread never runs sys_exit.
         // Consider a scoped execution model, e.g.
         // ```
@@ -222,33 +244,8 @@ impl LinuxShim {
         //     ...
         // })
         // ```
-        SHIM_TLS.init(LinuxShimTls {
-            current_task: Task {
-                global,
-                pid,
-                ppid,
-                tid,
-                clear_child_tid: None.into(),
-                robust_list: None.into(),
-                credentials: syscalls::process::Credentials {
-                    uid,
-                    euid,
-                    gid,
-                    egid,
-                }
-                .into(),
-                comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
-                fs: Arc::new(syscalls::file::FsState::new()).into(),
-                files: files.into(),
-                process: syscalls::process::Process::new().into(),
-            },
-        });
-
-        let r = with_current_task(|task| task.load_program(path, argv, envp));
-        if r.is_err() {
-            SHIM_TLS.deinit();
-        }
-        r
+        SHIM_TLS.init(LinuxShimTls { current_task: task });
+        Ok(regs)
     }
 }
 
@@ -1344,20 +1341,17 @@ impl Task {
     /// register state for the initial thread.
     fn load_program(
         &self,
-        path: &str,
+        mut loader: loader::elf::ElfLoader<'_>,
         argv: Vec<alloc::ffi::CString>,
         mut envp: Vec<alloc::ffi::CString>,
-    ) -> Result<litebox_common_linux::PtRegs, loader::ElfLoaderError> {
+    ) -> Result<litebox_common_linux::PtRegs, loader::elf::ElfLoaderError> {
         if let Some(&filter) = LOAD_FILTER.get() {
             filter(&mut envp);
         }
 
-        // TODO: split parsing from mapping so that we can return an error code to execve that it
-        // can return to the guest.
-        let load_info = loader::load_program(self, path, argv, envp, self.init_auxv())?;
+        let load_info = loader.load(argv, envp, self.init_auxv())?;
 
-        let comm = path.rsplit('/').next().unwrap_or("unknown");
-        self.set_task_comm(comm.as_bytes());
+        self.set_task_comm(loader.comm());
 
         #[cfg(target_arch = "x86_64")]
         let pt_regs = litebox_common_linux::PtRegs {

@@ -49,6 +49,11 @@ int main(int argc, char *argv[], char *envp[]) {
         new_envp[0] = "PHASE=after_exec";
         new_envp[1] = NULL;
 
+        execve("nonsense", new_argv, new_envp);  // should fail
+        if (errno != ENOENT) {
+            die("execve nonsense");
+        }
+
         execve(argv[0], new_argv, new_envp);
         die("execve");
     }

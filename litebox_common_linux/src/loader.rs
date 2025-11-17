@@ -1,0 +1,725 @@
+//! ELF loader and mapper.
+//!
+//! Supports the following features:
+//! * Parsing and mapping ELF binaries as the Linux kernel would when starting a
+//!   new process, including both static and dynamic ELF binaries.
+//! * Loading LiteBox trampoline code for syscall handling.
+//! * Performing basic runtime relocations, as needed for LiteBox OPTEE TAs.
+
+use alloc::vec::Vec;
+use elf::{file::FileHeader, parse::ParseAt};
+use litebox::{
+    mm::linux::PAGE_SIZE,
+    platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider},
+    utils::{ReinterpretSignedExt as _, TruncateExt as _},
+};
+use thiserror::Error;
+use zerocopy::{FromBytes, FromZeros as _, IntoBytes};
+
+use crate::errno::Errno;
+
+type Endian = elf::endian::LittleEndian;
+
+#[derive(Debug)]
+pub struct ElfParsedFile {
+    header: FileHeader<Endian>,
+    phdrs: Vec<u8>,
+    trampoline: Option<TrampolineInfo>,
+}
+
+pub struct MappingInfo {
+    pub base_addr: usize,
+    pub brk: usize,
+    pub entry_point: usize,
+    pub phdrs_addr: usize,
+    pub num_phdrs: usize,
+}
+
+impl MappingInfo {
+    pub fn phent_size(&self) -> usize {
+        match CLASS {
+            elf::file::Class::ELF32 => size_of::<elf::segment::Elf32_Phdr>(),
+            elf::file::Class::ELF64 => size_of::<elf::segment::Elf64_Phdr>(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TrampolineInfo {
+    /// The virtual memory of the trampoline code.
+    vaddr: usize,
+    /// The file offset of the trampoline code in the ELF file.
+    file_offset: u64,
+    /// Size of the trampoline code in the ELF file.
+    size: usize,
+    /// The entry point to jump to in the trampoline.
+    syscall_entry_point: usize,
+}
+
+#[repr(C)]
+#[derive(Debug, IntoBytes, FromBytes)]
+struct TrampolineSection {
+    magic_number: u64,
+    trampoline_addr: u64,
+    trampoline_size: u64,
+}
+
+/// The magic number used to identify the LiteBox rewriter and where we should
+/// update the syscall callback pointer.
+pub const REWRITER_MAGIC_NUMBER: u64 = u64::from_le_bytes(*b"LITE BOX");
+const REWRITER_VERSION_NUMBER: u64 = u64::from_le_bytes(*b"LITEBOX0");
+
+const CLASS: elf::file::Class = if cfg!(target_pointer_width = "64") {
+    elf::file::Class::ELF64
+} else {
+    elf::file::Class::ELF32
+};
+
+const MACHINE: u16 = if cfg!(target_arch = "x86_64") {
+    elf::abi::EM_X86_64
+} else if cfg!(target_arch = "x86") {
+    elf::abi::EM_386
+} else {
+    panic!("unsupported arch")
+};
+
+fn page_align_down(address: usize) -> usize {
+    address & !(PAGE_SIZE - 1)
+}
+
+fn page_align_up(len: usize) -> usize {
+    len.next_multiple_of(PAGE_SIZE)
+}
+
+#[derive(Debug, Error)]
+pub enum ElfParseError<E> {
+    #[error("ELF parsing error")]
+    Elf(#[from] elf::parse::ParseError),
+    #[error("Bad ELF format")]
+    BadFormat,
+    #[error("I/O error")]
+    Io(#[source] E),
+    #[error("Bad trampoline section")]
+    BadTrampoline,
+    #[error("Unsupported ELF type")]
+    UnsupportedType,
+    #[error("Bad interpreter")]
+    BadInterp,
+}
+
+impl<E: Into<Errno>> From<ElfParseError<E>> for Errno {
+    fn from(value: ElfParseError<E>) -> Self {
+        match value {
+            ElfParseError::Elf(_)
+            | ElfParseError::BadFormat
+            | ElfParseError::BadTrampoline
+            | ElfParseError::BadInterp
+            | ElfParseError::UnsupportedType => Errno::ENOEXEC,
+            ElfParseError::Io(err) => err.into(),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ElfMapError<E> {
+    #[error("ELF mapping error")]
+    Map(#[source] E),
+    #[error("Invalid program header")]
+    InvalidProgramHeader,
+    #[error("Invalid trampoline version")]
+    InvalidTrampolineVersion,
+    #[error(transparent)]
+    Fault(#[from] Fault),
+    #[error("failed to relocate ELF")]
+    RelocationError(#[from] RelocationError),
+}
+
+impl<E: Into<Errno>> From<ElfMapError<E>> for Errno {
+    fn from(value: ElfMapError<E>) -> Self {
+        match value {
+            ElfMapError::InvalidProgramHeader | ElfMapError::InvalidTrampolineVersion => {
+                Errno::ENOEXEC
+            }
+            ElfMapError::Fault(Fault) => Errno::EFAULT,
+            ElfMapError::Map(err) => err.into(),
+            ElfMapError::RelocationError(err) => err.into(),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum RelocationError {
+    #[error("Unsupported relocation type")]
+    UnsupportedType,
+    #[error(transparent)]
+    Fault(#[from] Fault),
+}
+
+impl From<RelocationError> for Errno {
+    fn from(value: RelocationError) -> Self {
+        match value {
+            RelocationError::UnsupportedType => Errno::ENOEXEC,
+            RelocationError::Fault(Fault) => Errno::EFAULT,
+        }
+    }
+}
+
+impl ElfParsedFile {
+    pub fn parse<F: ReadAt>(file: &mut F) -> Result<Self, ElfParseError<F::Error>> {
+        let mut buf = [0u8; size_of::<elf::file::Elf64_Ehdr>()];
+        file.read_at(0, &mut buf).map_err(ElfParseError::Io)?;
+        let ident = elf::file::parse_ident::<Endian>(&buf)?;
+        if ident.1 != CLASS {
+            return Err(ElfParseError::BadFormat);
+        }
+        let header = elf::file::FileHeader::parse_tail(ident, &buf[elf::abi::EI_NIDENT..])?;
+
+        if header.e_type != elf::abi::ET_EXEC && header.e_type != elf::abi::ET_DYN {
+            return Err(ElfParseError::UnsupportedType);
+        }
+
+        if header.e_machine != MACHINE {
+            return Err(ElfParseError::UnsupportedType);
+        }
+
+        // Read the program headers.
+        let phent_size = if cfg!(target_pointer_width = "64") {
+            size_of::<elf::segment::Elf64_Phdr>()
+        } else {
+            size_of::<elf::segment::Elf32_Phdr>()
+        };
+        if usize::from(header.e_phentsize) != phent_size {
+            return Err(ElfParseError::BadFormat);
+        }
+        // Limit to 64KB of program headers.
+        let phdr_size: usize = header
+            .e_phentsize
+            .checked_mul(header.e_phnum)
+            .ok_or(ElfParseError::BadFormat)?
+            .into();
+        let mut phdrs = alloc::vec![0u8; phdr_size];
+        file.read_at(header.e_phoff, &mut phdrs)
+            .map_err(ElfParseError::Io)?;
+
+        Ok(ElfParsedFile {
+            header,
+            phdrs,
+            trampoline: None,
+        })
+    }
+
+    pub fn parse_trampoline<F: ReadAt>(
+        &mut self,
+        file: &mut F,
+        syscall_entry_point: usize,
+    ) -> Result<(), ElfParseError<F::Error>> {
+        let shent_size = if cfg!(target_pointer_width = "64") {
+            size_of::<elf::section::Elf64_Shdr>()
+        } else {
+            size_of::<elf::section::Elf32_Shdr>()
+        };
+
+        if self.header.e_shnum == 0 || usize::from(self.header.e_shentsize) != shent_size {
+            // No section headers or invalid size.
+            return Ok(());
+        }
+
+        let offset = self
+            .header
+            .e_shoff
+            .checked_add(u64::from(self.header.e_shentsize) * u64::from(self.header.e_shnum - 1))
+            .ok_or(ElfParseError::BadFormat)?;
+        let mut buf = [0u8; size_of::<elf::section::Elf64_Shdr>()];
+        file.read_at(offset, &mut buf).map_err(ElfParseError::Io)?;
+        let shdr = elf::section::SectionHeader::parse_at(
+            self.header.endianness,
+            self.header.class,
+            &mut 0,
+            &buf,
+        )?;
+
+        let mut data = TrampolineSection::new_zeroed();
+        if shdr.sh_size < size_of_val(&data) as u64 {
+            return Ok(());
+        }
+        file.read_at(shdr.sh_offset, data.as_mut_bytes())
+            .map_err(ElfParseError::Io)?;
+        // TODO: check section name instead of magic number
+        if data.magic_number != REWRITER_MAGIC_NUMBER {
+            // Not a trampoline section.
+            return Ok(());
+        }
+        let size: usize = data
+            .trampoline_size
+            .try_into()
+            .map_err(|_| ElfParseError::BadTrampoline)?;
+        // The trampoline is located at the end of the file.
+        let file_offset = file
+            .size()
+            .map_err(ElfParseError::Io)?
+            .checked_sub(data.trampoline_size)
+            .ok_or(ElfParseError::BadTrampoline)?;
+
+        self.trampoline = Some(TrampolineInfo {
+            vaddr: data
+                .trampoline_addr
+                .try_into()
+                .map_err(|_| ElfParseError::BadTrampoline)?,
+            size,
+            file_offset,
+            syscall_entry_point,
+        });
+
+        Ok(())
+    }
+
+    fn program_headers(
+        &self,
+    ) -> elf::parse::ParsingIterator<'_, Endian, elf::segment::ProgramHeader> {
+        elf::parse::ParsingIterator::new(self.header.endianness, self.header.class, &self.phdrs)
+    }
+
+    /// Read the interpreter path, if any.
+    #[expect(clippy::missing_panics_doc, reason = "cannot panic")]
+    pub fn interp<F: ReadAt>(
+        &self,
+        file: &mut F,
+    ) -> Result<Option<alloc::ffi::CString>, ElfParseError<F::Error>> {
+        let Some(ph) = self
+            .program_headers()
+            .find(|ph| ph.p_type == elf::abi::PT_INTERP)
+        else {
+            return Ok(None);
+        };
+        // Bound the interpreter length like Linux.
+        let len: usize = ph.p_filesz.truncate();
+        if !(2..4096).contains(&len) {
+            return Err(ElfParseError::BadInterp);
+        }
+        let mut buf = alloc::vec![0u8; len + 1];
+        file.read_at(ph.p_offset, &mut buf[..len])
+            .map_err(ElfParseError::Io)?;
+        buf.truncate(
+            buf.iter()
+                .position(|&b| b == 0)
+                .expect("we null terminated it at allocation time"),
+        );
+        Ok(Some(
+            alloc::ffi::CString::new(buf).expect("truncated away null bytes"),
+        ))
+    }
+
+    fn pt_loads(&self) -> impl Iterator<Item = elf::segment::ProgramHeader> + '_ {
+        self.program_headers()
+            .filter(|ph| ph.p_type == elf::abi::PT_LOAD)
+    }
+
+    pub fn map<M: MapMemory>(
+        &self,
+        map: &mut M,
+        mem: &mut impl AccessMemory,
+    ) -> Result<MappingInfo, ElfMapError<M::Error>> {
+        self.map_inner(map, mem, false)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn map_and_relocate<M: MapMemory>(
+        &self,
+        map: &mut M,
+        mem: &mut impl AccessMemory,
+    ) -> Result<MappingInfo, ElfMapError<M::Error>> {
+        let info = self.map_inner(map, mem, true)?;
+        self.relocate(mem, &info)?;
+        self.apply_protections(map, &info)?;
+        Ok(info)
+    }
+
+    fn map_inner<M: MapMemory>(
+        &self,
+        mapper: &mut M,
+        mem: &mut impl AccessMemory,
+        override_protections: bool,
+    ) -> Result<MappingInfo, ElfMapError<M::Error>> {
+        let base_addr = if self.header.e_type == elf::abi::ET_DYN {
+            // Find an aligned load address that will fit all PT_LOAD segments.
+            let mut min = usize::MAX;
+            let mut max = 0usize;
+            let mut align = PAGE_SIZE;
+            for ph in self.pt_loads() {
+                min = min.min(ph.p_vaddr.truncate());
+                max = max.max(
+                    (ph.p_vaddr
+                        .checked_add(ph.p_memsz)
+                        .ok_or(ElfMapError::InvalidProgramHeader)?)
+                    .truncate(),
+                );
+                if ph.p_align.is_power_of_two() {
+                    align = align.max(ph.p_align.truncate());
+                }
+            }
+            if let Some(trampoline) = &self.trampoline {
+                min = min.min(trampoline.vaddr);
+                max = max.max(trampoline.vaddr + trampoline.size);
+            }
+            let min = page_align_down(min);
+            let max = page_align_up(max);
+            mapper.reserve(max - min, align).map_err(ElfMapError::Map)?
+        } else {
+            // For ET_EXEC, load at the fixed addresses specified in the ELF.
+            0
+        };
+
+        let prot = if override_protections {
+            Some(Protection {
+                read: true,
+                write: true,
+                execute: false,
+            })
+        } else {
+            None
+        };
+
+        let mut brk = 0;
+        let mut phdrs_addr = 0;
+        for ph in self.pt_loads() {
+            let p_vaddr: usize = ph.p_vaddr.truncate();
+            let p_memsz: usize = ph.p_memsz.truncate();
+            let p_filesz: usize = ph.p_filesz.truncate();
+            if p_memsz < p_filesz
+                || p_vaddr.checked_add(p_memsz).is_none()
+                || ph.p_offset.checked_add(ph.p_filesz).is_none()
+            {
+                return Err(ElfMapError::InvalidProgramHeader);
+            }
+            let adjusted_vaddr = base_addr + p_vaddr;
+            if p_filesz > 0 {
+                let map_start = page_align_down(adjusted_vaddr);
+                let map_end = page_align_up(adjusted_vaddr + p_filesz);
+                mapper
+                    .map_file(
+                        map_start,
+                        map_end - map_start,
+                        ph.p_offset
+                            .checked_sub((adjusted_vaddr - map_start) as u64)
+                            .ok_or(ElfMapError::InvalidProgramHeader)?,
+                        &prot.unwrap_or(Protection {
+                            read: true,
+                            write: (ph.p_flags & elf::abi::PF_W) != 0,
+                            execute: (ph.p_flags & elf::abi::PF_X) != 0,
+                        }),
+                    )
+                    .map_err(ElfMapError::Map)?;
+                // Zero out the remaining part of the last page if needed and
+                // possible.
+                let zero_start = adjusted_vaddr + p_filesz;
+                let zero_end = page_align_up(zero_start); //.min(adjusted_vaddr + p_memsz);
+                if zero_end > zero_start && ph.p_flags & elf::abi::PF_W != 0 {
+                    mem.zero(zero_start, zero_end - zero_start)?;
+                }
+            }
+            let zero_map_start = page_align_up(adjusted_vaddr + p_filesz);
+            let zero_map_end = page_align_up(adjusted_vaddr + p_memsz);
+            if zero_map_end > zero_map_start {
+                mapper
+                    .map_zero(
+                        zero_map_start,
+                        zero_map_end - zero_map_start,
+                        &prot.unwrap_or(Protection {
+                            read: true,
+                            write: (ph.p_flags & elf::abi::PF_W) != 0,
+                            execute: false,
+                        }),
+                    )
+                    .map_err(ElfMapError::Map)?;
+            }
+
+            // Update the end address of the last PT_LOAD segment.
+            brk = brk.max(zero_map_end);
+
+            // Update the program headers address.
+            if ph.p_offset <= self.header.e_phoff && self.header.e_phoff < ph.p_offset + ph.p_filesz
+            {
+                let offset_in_segment: usize = (self.header.e_phoff - ph.p_offset).truncate();
+                phdrs_addr = adjusted_vaddr + offset_in_segment;
+            }
+        }
+
+        let mut info = MappingInfo {
+            base_addr,
+            brk,
+            entry_point: base_addr.wrapping_add(self.header.e_entry.truncate()),
+            phdrs_addr,
+            num_phdrs: self.header.e_phnum.into(),
+        };
+
+        if self.trampoline.is_some() {
+            self.map_trampoline(mapper, mem, &mut info)?;
+        }
+
+        Ok(info)
+    }
+
+    /// Re-apply the correct memory protections for the mapped segments.
+    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
+    fn apply_protections<M: MapMemory>(
+        &self,
+        map: &mut M,
+        info: &MappingInfo,
+    ) -> Result<(), ElfMapError<M::Error>> {
+        for ph in self.pt_loads() {
+            let p_vaddr: usize = ph.p_vaddr.truncate();
+            let p_memsz: usize = ph.p_memsz.truncate();
+            let adjusted_vaddr = info.base_addr + p_vaddr;
+            let map_start = page_align_down(adjusted_vaddr);
+            let map_end = page_align_up(adjusted_vaddr + p_memsz);
+            if map_end <= map_start {
+                continue;
+            }
+            map.protect(
+                map_start,
+                map_end - map_start,
+                &Protection {
+                    read: true,
+                    write: (ph.p_flags & elf::abi::PF_W) != 0,
+                    execute: (ph.p_flags & elf::abi::PF_X) != 0,
+                },
+            )
+            .map_err(ElfMapError::Map)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn relocate<M: AccessMemory>(
+        &self,
+        mem: &mut M,
+        info: &MappingInfo,
+    ) -> Result<(), RelocationError> {
+        fn read<M: AccessMemory, T: zerocopy::IntoBytes + zerocopy::FromBytes>(
+            mem: &mut M,
+            address: usize,
+        ) -> Result<T, Fault> {
+            let mut buf = T::new_zeroed();
+            mem.read(address, buf.as_mut_bytes())?;
+            Ok(buf)
+        }
+
+        // Find the dynamic section in the program headers.
+        let dynamic = {
+            let Some(ph) = self
+                .program_headers()
+                .find(|ph| ph.p_type == elf::abi::PT_DYNAMIC)
+            else {
+                // No dynamic section; nothing to relocate.
+                return Ok(());
+            };
+            let vaddr: usize = ph.p_vaddr.truncate();
+            info.base_addr + vaddr
+        };
+
+        // Find the RELA relocation entries.
+        let rela = {
+            let mut offset = 0;
+            let mut rela_offset = None;
+            let mut rela_count = None;
+            loop {
+                let [tag, val]: [usize; 2] = read(mem, dynamic + offset)?;
+                offset += 2 * size_of::<usize>();
+                match tag.reinterpret_as_signed() as i64 {
+                    elf::abi::DT_RELA => rela_offset = Some(val),
+                    elf::abi::DT_RELACOUNT => rela_count = Some(val),
+                    elf::abi::DT_NULL => break,
+                    _ => {}
+                }
+            }
+            rela_offset.zip(rela_count)
+        };
+
+        let Some((offset, count)) = rela else {
+            return Ok(());
+        };
+        for i in 0..count {
+            const R_RELATIVE: u32 = if cfg!(target_arch = "x86_64") {
+                elf::abi::R_X86_64_RELATIVE
+            } else {
+                panic!("unsupported arch")
+            };
+
+            let [r_offset, r_info, r_addend]: [usize; 3] = read(
+                mem,
+                info.base_addr + offset + i * size_of::<elf::relocation::Elf64_Rela>(),
+            )?;
+            let r_type: u32 = r_info.truncate();
+            if r_type != R_RELATIVE {
+                return Err(RelocationError::UnsupportedType);
+            }
+            let relocated_value = info.base_addr.wrapping_add(r_addend);
+            mem.write(info.base_addr + r_offset, &relocated_value.to_ne_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn map_trampoline<M: MapMemory>(
+        &self,
+        mapper: &mut M,
+        mem: &mut impl AccessMemory,
+        info: &mut MappingInfo,
+    ) -> Result<(), ElfMapError<M::Error>> {
+        let trampoline = self.trampoline.as_ref().unwrap();
+        let trampoline_start = info.base_addr + trampoline.vaddr;
+        let trampoline_end = page_align_up(info.base_addr + trampoline.vaddr + trampoline.size);
+        mapper
+            .map_file(
+                trampoline_start,
+                trampoline_end - trampoline_start,
+                trampoline.file_offset,
+                &Protection {
+                    read: true,
+                    write: true,
+                    execute: false,
+                },
+            )
+            .map_err(ElfMapError::Map)?;
+
+        // Validate the trampoline version number.
+        let mut version = 0u64;
+        mem.read(trampoline_start, version.as_mut_bytes())?;
+        if version != REWRITER_VERSION_NUMBER {
+            return Err(ElfMapError::InvalidTrampolineVersion);
+        }
+
+        // Write the trampoline entry point.
+        mem.write(
+            trampoline_start + 8,
+            &trampoline.syscall_entry_point.to_ne_bytes(),
+        )?;
+
+        // Now that the write is done, protect the trampoline code as
+        // read+execute only.
+        mapper
+            .protect(
+                trampoline_start,
+                trampoline_end - trampoline_start,
+                &Protection {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+            )
+            .map_err(ElfMapError::Map)?;
+
+        info.brk = info.brk.max(trampoline_end);
+        Ok(())
+    }
+}
+
+/// Trait for reading ELF binary data at specific offsets.
+pub trait ReadAt {
+    /// The error type for read operations.
+    type Error;
+
+    /// Read data at the specified offset into the provided buffer.
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error>;
+
+    /// Get the length of the ELF file.
+    fn size(&mut self) -> Result<u64, Self::Error>;
+}
+
+pub trait MapMemory {
+    type Error;
+
+    /// Reserve a region of memory with the given length and alignment,
+    /// returning the chosen address.
+    fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error>;
+
+    /// Map file data, replacing any existing mappings.
+    fn map_file(
+        &mut self,
+        address: usize,
+        len: usize,
+        offset: u64,
+        prot: &Protection,
+    ) -> Result<(), Self::Error>;
+
+    /// Map zeroed memory, replacing any existing mappings.
+    fn map_zero(
+        &mut self,
+        address: usize,
+        len: usize,
+        prot: &Protection,
+    ) -> Result<(), Self::Error>;
+
+    /// Change protections of a memory region.
+    fn protect(&mut self, address: usize, len: usize, prot: &Protection)
+    -> Result<(), Self::Error>;
+}
+
+/// Trait for reading and writing memory that has been mapped via [`MapMemory`].
+pub trait AccessMemory {
+    /// Read from memory.
+    fn read(&mut self, address: usize, buf: &mut [u8]) -> Result<usize, Fault>;
+
+    /// Write to memory.
+    fn write(&mut self, address: usize, data: &[u8]) -> Result<(), Fault>;
+
+    /// Zero out a region of memory.
+    fn zero(&mut self, address: usize, len: usize) -> Result<(), Fault>;
+}
+
+impl<Platform: RawPointerProvider> AccessMemory for &Platform {
+    fn read(&mut self, address: usize, buf: &mut [u8]) -> Result<usize, Fault> {
+        let addr = Platform::RawConstPointer::<u8>::from_usize(address);
+        buf.copy_from_slice(&addr.to_owned_slice(buf.len()).ok_or(Fault)?);
+        Ok(buf.len())
+    }
+
+    fn write(&mut self, address: usize, data: &[u8]) -> Result<(), Fault> {
+        let addr = Platform::RawMutPointer::<u8>::from_usize(address);
+        addr.copy_from_slice(0, data).ok_or(Fault)
+    }
+
+    fn zero(&mut self, address: usize, len: usize) -> Result<(), Fault> {
+        let addr = Platform::RawMutPointer::<u8>::from_usize(address);
+        // TODO: add a fill method to [`RawMutPointer`] and use it.
+        for i in 0..len {
+            unsafe {
+                addr.write_at_offset(i.reinterpret_as_signed(), 0)
+                    .ok_or(Fault)?;
+            };
+        }
+        Ok(())
+    }
+}
+
+/// An error indicating a memory access fault.
+#[derive(Debug, Error)]
+#[error("Memory access fault")]
+pub struct Fault;
+
+/// Memory protection flags.
+#[derive(Debug, Copy, Clone)]
+pub struct Protection {
+    /// Read permission.
+    pub read: bool,
+    /// Write permission.
+    pub write: bool,
+    /// Execute permission.
+    pub execute: bool,
+}
+
+impl Protection {
+    /// Converts the protection flags to Linux `PROT_*` flags.
+    pub fn flags(&self) -> crate::ProtFlags {
+        let mut flags = crate::ProtFlags::empty();
+        if self.read {
+            flags |= crate::ProtFlags::PROT_READ;
+        }
+        if self.write {
+            flags |= crate::ProtFlags::PROT_WRITE;
+        }
+        if self.execute {
+            flags |= crate::ProtFlags::PROT_EXEC;
+        }
+        flags
+    }
+}

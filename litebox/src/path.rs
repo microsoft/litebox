@@ -22,12 +22,13 @@ mod private {
     /// from implementing this trait.
     pub trait Sealed {}
 
-    impl Sealed for &str {}
+    impl Sealed for str {}
     impl Sealed for alloc::string::String {}
-    impl Sealed for &core::ffi::CStr {}
+    impl Sealed for core::ffi::CStr {}
     impl Sealed for alloc::ffi::CString {}
     impl Sealed for alloc::borrow::Cow<'_, str> {}
     impl Sealed for alloc::borrow::Cow<'_, core::ffi::CStr> {}
+    impl<T: Sealed + ?Sized> Sealed for &T {}
 }
 
 /// Trait for passing path arguments
@@ -134,7 +135,37 @@ pub trait Arg: private::Sealed {
     }
 }
 
-impl Arg for &str {
+impl<T: Arg + ?Sized> Arg for &T {
+    fn to_c_str(&self) -> Result<Cow<'_, CStr>> {
+        T::to_c_str(self)
+    }
+
+    fn as_rust_str(&self) -> Result<&str> {
+        T::as_rust_str(self)
+    }
+
+    fn to_rust_str_lossy(&self) -> Cow<'_, str> {
+        T::to_rust_str_lossy(self)
+    }
+
+    fn components(&self) -> Result<impl Iterator<Item = &str>> {
+        T::components(self)
+    }
+
+    fn normalized_components(&self) -> Result<impl Iterator<Item = &str>> {
+        T::normalized_components(self)
+    }
+
+    fn normalized(&self) -> Result<String> {
+        T::normalized(self)
+    }
+
+    fn increasing_ancestors(&self) -> Result<impl Iterator<Item = &str>> {
+        T::increasing_ancestors(self)
+    }
+}
+
+impl Arg for str {
     fn to_c_str(&self) -> Result<Cow<'_, CStr>> {
         CString::new(self.as_bytes())
             .map(Cow::Owned)
@@ -166,7 +197,7 @@ impl Arg for String {
     }
 }
 
-impl Arg for &CStr {
+impl Arg for CStr {
     fn to_c_str(&self) -> Result<Cow<'_, CStr>> {
         Ok(Cow::Borrowed(self))
     }
