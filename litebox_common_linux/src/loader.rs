@@ -436,12 +436,19 @@ impl ElfParsedFile {
                         }),
                     )
                     .map_err(ElfLoadError::Map)?;
-                // Zero out the remaining part of the last page if needed and
-                // possible.
-                let zero_start = adjusted_vaddr + p_filesz;
-                let zero_end = page_align_up(zero_start); //.min(adjusted_vaddr + p_memsz);
-                if zero_end > zero_start && ph.p_flags & elf::abi::PF_W != 0 {
-                    mem.zero(zero_start, zero_end - zero_start)?;
+                // Zero out the remaining part of the last page.
+                //
+                // The behavior here is not quite what you might expect. We zero
+                // the remainder of the last page, even if that's beyond
+                // `p_memsz`--this is necessary because common binaries seem to
+                // depend on it. But we only do this if `p_memsz` is beyond
+                // `p_filesz` and the segment is writable. This matches other
+                // loaders' behavior, so it should be sufficient.
+                if p_memsz > p_filesz && ph.p_flags & elf::abi::PF_W != 0 {
+                    let zero_start = adjusted_vaddr + p_filesz;
+                    if map_end > zero_start {
+                        mem.zero(zero_start, map_end - zero_start)?;
+                    }
                 }
             }
             let zero_map_start = page_align_up(adjusted_vaddr + p_filesz);
