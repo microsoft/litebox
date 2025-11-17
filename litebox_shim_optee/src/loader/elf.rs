@@ -158,16 +158,16 @@ impl ElfLoader {
         let platform = litebox_platform_multiplex::platform();
         let mut file = ElfFileInMemory::new(elf_buf);
 
-        let mut image = ElfParsedFile::parse(&mut file)?;
+        let mut parsed = ElfParsedFile::parse(&mut file)?;
 
         #[cfg(feature = "platform_linux_userland")]
-        image.parse_trampoline(
+        parsed.parse_trampoline(
             &mut file,
             litebox::platform::SystemInfoProvider::get_syscall_entry_point(platform),
         )?;
 
         // Since LiteBox does not use ldelf or libc for OP-TEE TAs, it should relocate the TA ELF's symbols.
-        let info = image.map_and_relocate(&mut file, &mut &*platform)?;
+        let info = parsed.load_and_relocate(&mut file, &mut &*platform)?;
         let entry = info.entry_point;
         let base = info.base_addr;
 
@@ -235,7 +235,7 @@ pub enum ElfLoaderError {
     #[error("failed to load the ELF file: {0}")]
     ParseError(#[from] litebox_common_linux::loader::ElfParseError<Errno>),
     #[error("failed to map the ELF file: {0}")]
-    MapError(#[from] litebox_common_linux::loader::ElfMapError<Errno>),
+    LoadError(#[from] litebox_common_linux::loader::ElfLoadError<Errno>),
 }
 
 impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
@@ -243,7 +243,7 @@ impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
         match value {
             ElfLoaderError::OpenError(e) => e,
             ElfLoaderError::ParseError(e) => e.into(),
-            ElfLoaderError::MapError(e) => e.into(),
+            ElfLoaderError::LoadError(e) => e.into(),
         }
     }
 }

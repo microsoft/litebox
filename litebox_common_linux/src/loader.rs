@@ -20,6 +20,9 @@ use crate::errno::Errno;
 
 type Endian = elf::endian::LittleEndian;
 
+/// The result of parsing the ELF file headers.
+///
+/// Can be used to map the ELF into memory.
 #[derive(Debug)]
 pub struct ElfParsedFile {
     header: FileHeader<Endian>,
@@ -27,15 +30,23 @@ pub struct ElfParsedFile {
     trampoline: Option<TrampolineInfo>,
 }
 
+/// Information about the mapped ELF file. This is used to set up the process
+/// after loading the executable.
 pub struct MappingInfo {
+    /// The base address where the ELF file is mapped.
     pub base_addr: usize,
+    /// The program break (end of all mapped segments).
     pub brk: usize,
+    /// The entry point, where execution begins.
     pub entry_point: usize,
+    /// The mapped address of the program headers.
     pub phdrs_addr: usize,
+    /// The number of program headers.
     pub num_phdrs: usize,
 }
 
 impl MappingInfo {
+    /// Returns the size of each program header entry.
     pub fn phent_size(&self) -> usize {
         match CLASS {
             elf::file::Class::ELF32 => size_of::<elf::segment::Elf32_Phdr>(),
@@ -45,7 +56,7 @@ impl MappingInfo {
 }
 
 #[derive(Debug)]
-pub struct TrampolineInfo {
+struct TrampolineInfo {
     /// The virtual memory of the trampoline code.
     vaddr: usize,
     /// The file offset of the trampoline code in the ELF file.
@@ -91,6 +102,7 @@ fn page_align_up(len: usize) -> usize {
     len.next_multiple_of(PAGE_SIZE)
 }
 
+/// Errors that can occur when parsing an ELF file.
 #[derive(Debug, Error)]
 pub enum ElfParseError<E> {
     #[error("ELF parsing error")]
@@ -120,9 +132,10 @@ impl<E: Into<Errno>> From<ElfParseError<E>> for Errno {
     }
 }
 
+/// Errors that can occur when mapping an ELF file into memory.
 #[derive(Debug, Error)]
-pub enum ElfMapError<E> {
-    #[error("ELF mapping error")]
+pub enum ElfLoadError<E> {
+    #[error("Memory mapping error")]
     Map(#[source] E),
     #[error("Invalid program header")]
     InvalidProgramHeader,
@@ -134,19 +147,20 @@ pub enum ElfMapError<E> {
     RelocationError(#[from] RelocationError),
 }
 
-impl<E: Into<Errno>> From<ElfMapError<E>> for Errno {
-    fn from(value: ElfMapError<E>) -> Self {
+impl<E: Into<Errno>> From<ElfLoadError<E>> for Errno {
+    fn from(value: ElfLoadError<E>) -> Self {
         match value {
-            ElfMapError::InvalidProgramHeader | ElfMapError::InvalidTrampolineVersion => {
+            ElfLoadError::InvalidProgramHeader | ElfLoadError::InvalidTrampolineVersion => {
                 Errno::ENOEXEC
             }
-            ElfMapError::Fault(Fault) => Errno::EFAULT,
-            ElfMapError::Map(err) => err.into(),
-            ElfMapError::RelocationError(err) => err.into(),
+            ElfLoadError::Fault(Fault) => Errno::EFAULT,
+            ElfLoadError::Map(err) => err.into(),
+            ElfLoadError::RelocationError(err) => err.into(),
         }
     }
 }
 
+/// Errors that can occur when applying relocations.
 #[derive(Debug, Error)]
 pub enum RelocationError {
     #[error("Unsupported relocation type")]
@@ -158,13 +172,14 @@ pub enum RelocationError {
 impl From<RelocationError> for Errno {
     fn from(value: RelocationError) -> Self {
         match value {
-            RelocationError::UnsupportedType => Errno::ENOEXEC,
+            RelocationError::UnsupportedType => Errno::EINVAL,
             RelocationError::Fault(Fault) => Errno::EFAULT,
         }
     }
 }
 
 impl ElfParsedFile {
+    /// Parse an ELF file from the given file.
     pub fn parse<F: ReadAt>(file: &mut F) -> Result<Self, ElfParseError<F::Error>> {
         let mut buf = [0u8; size_of::<elf::file::Elf64_Ehdr>()];
         file.read_at(0, &mut buf).map_err(ElfParseError::Io)?;
@@ -197,6 +212,7 @@ impl ElfParsedFile {
             .checked_mul(header.e_phnum)
             .ok_or(ElfParseError::BadFormat)?
             .into();
+
         let mut phdrs = alloc::vec![0u8; phdr_size];
         file.read_at(header.e_phoff, &mut phdrs)
             .map_err(ElfParseError::Io)?;
@@ -208,6 +224,10 @@ impl ElfParsedFile {
         })
     }
 
+    /// Parse the LiteBox trampoline section, if any.
+    ///
+    /// `syscall_entry_point` is the address of the syscall entry point to write
+    /// into the trampoline at map time.
     pub fn parse_trampoline<F: ReadAt>(
         &mut self,
         file: &mut F,
@@ -314,32 +334,34 @@ impl ElfParsedFile {
             .filter(|ph| ph.p_type == elf::abi::PT_LOAD)
     }
 
-    pub fn map<M: MapMemory>(
+    /// Load the ELF file into memory.
+    pub fn load<M: MapMemory>(
         &self,
         map: &mut M,
         mem: &mut impl AccessMemory,
-    ) -> Result<MappingInfo, ElfMapError<M::Error>> {
-        self.map_inner(map, mem, false)
+    ) -> Result<MappingInfo, ElfLoadError<M::Error>> {
+        self.load_inner(map, mem, false)
     }
 
+    /// Load the ELF file into memory and apply relocations.
     #[cfg(target_arch = "x86_64")]
-    pub fn map_and_relocate<M: MapMemory>(
+    pub fn load_and_relocate<M: MapMemory>(
         &self,
         map: &mut M,
         mem: &mut impl AccessMemory,
-    ) -> Result<MappingInfo, ElfMapError<M::Error>> {
-        let info = self.map_inner(map, mem, true)?;
+    ) -> Result<MappingInfo, ElfLoadError<M::Error>> {
+        let info = self.load_inner(map, mem, true)?;
         self.relocate(mem, &info)?;
         self.apply_protections(map, &info)?;
         Ok(info)
     }
 
-    fn map_inner<M: MapMemory>(
+    fn load_inner<M: MapMemory>(
         &self,
         mapper: &mut M,
         mem: &mut impl AccessMemory,
         override_protections: bool,
-    ) -> Result<MappingInfo, ElfMapError<M::Error>> {
+    ) -> Result<MappingInfo, ElfLoadError<M::Error>> {
         let base_addr = if self.header.e_type == elf::abi::ET_DYN {
             // Find an aligned load address that will fit all PT_LOAD segments.
             let mut min = usize::MAX;
@@ -350,7 +372,7 @@ impl ElfParsedFile {
                 max = max.max(
                     (ph.p_vaddr
                         .checked_add(ph.p_memsz)
-                        .ok_or(ElfMapError::InvalidProgramHeader)?)
+                        .ok_or(ElfLoadError::InvalidProgramHeader)?)
                     .truncate(),
                 );
                 if ph.p_align.is_power_of_two() {
@@ -363,13 +385,17 @@ impl ElfParsedFile {
             }
             let min = page_align_down(min);
             let max = page_align_up(max);
-            mapper.reserve(max - min, align).map_err(ElfMapError::Map)?
+            mapper
+                .reserve(max - min, align)
+                .map_err(ElfLoadError::Map)?
         } else {
             // For ET_EXEC, load at the fixed addresses specified in the ELF.
             0
         };
 
         let prot = if override_protections {
+            // Map read-write initially; protections will be applied later,
+            // after relocations.
             Some(Protection {
                 read: true,
                 write: true,
@@ -389,10 +415,11 @@ impl ElfParsedFile {
                 || p_vaddr.checked_add(p_memsz).is_none()
                 || ph.p_offset.checked_add(ph.p_filesz).is_none()
             {
-                return Err(ElfMapError::InvalidProgramHeader);
+                return Err(ElfLoadError::InvalidProgramHeader);
             }
             let adjusted_vaddr = base_addr + p_vaddr;
             if p_filesz > 0 {
+                // Map the file-backed portion.
                 let map_start = page_align_down(adjusted_vaddr);
                 let map_end = page_align_up(adjusted_vaddr + p_filesz);
                 mapper
@@ -401,14 +428,14 @@ impl ElfParsedFile {
                         map_end - map_start,
                         ph.p_offset
                             .checked_sub((adjusted_vaddr - map_start) as u64)
-                            .ok_or(ElfMapError::InvalidProgramHeader)?,
+                            .ok_or(ElfLoadError::InvalidProgramHeader)?,
                         &prot.unwrap_or(Protection {
                             read: true,
                             write: (ph.p_flags & elf::abi::PF_W) != 0,
                             execute: (ph.p_flags & elf::abi::PF_X) != 0,
                         }),
                     )
-                    .map_err(ElfMapError::Map)?;
+                    .map_err(ElfLoadError::Map)?;
                 // Zero out the remaining part of the last page if needed and
                 // possible.
                 let zero_start = adjusted_vaddr + p_filesz;
@@ -420,6 +447,7 @@ impl ElfParsedFile {
             let zero_map_start = page_align_up(adjusted_vaddr + p_filesz);
             let zero_map_end = page_align_up(adjusted_vaddr + p_memsz);
             if zero_map_end > zero_map_start {
+                // Map the zero-filled portion.
                 mapper
                     .map_zero(
                         zero_map_start,
@@ -430,13 +458,14 @@ impl ElfParsedFile {
                             execute: false,
                         }),
                     )
-                    .map_err(ElfMapError::Map)?;
+                    .map_err(ElfLoadError::Map)?;
             }
 
             // Update the end address of the last PT_LOAD segment.
             brk = brk.max(zero_map_end);
 
-            // Update the program headers address.
+            // Track the location of the program headers in memory; this is used
+            // for `AT_PHDR`.
             if ph.p_offset <= self.header.e_phoff && self.header.e_phoff < ph.p_offset + ph.p_filesz
             {
                 let offset_in_segment: usize = (self.header.e_phoff - ph.p_offset).truncate();
@@ -453,7 +482,7 @@ impl ElfParsedFile {
         };
 
         if self.trampoline.is_some() {
-            self.map_trampoline(mapper, mem, &mut info)?;
+            self.load_trampoline(mapper, mem, &mut info)?;
         }
 
         Ok(info)
@@ -465,7 +494,7 @@ impl ElfParsedFile {
         &self,
         map: &mut M,
         info: &MappingInfo,
-    ) -> Result<(), ElfMapError<M::Error>> {
+    ) -> Result<(), ElfLoadError<M::Error>> {
         for ph in self.pt_loads() {
             let p_vaddr: usize = ph.p_vaddr.truncate();
             let p_memsz: usize = ph.p_memsz.truncate();
@@ -484,11 +513,12 @@ impl ElfParsedFile {
                     execute: (ph.p_flags & elf::abi::PF_X) != 0,
                 },
             )
-            .map_err(ElfMapError::Map)?;
+            .map_err(ElfLoadError::Map)?;
         }
         Ok(())
     }
 
+    /// Apply relocations to the loaded ELF file.
     #[cfg(target_arch = "x86_64")]
     fn relocate<M: AccessMemory>(
         &self,
@@ -559,12 +589,13 @@ impl ElfParsedFile {
         Ok(())
     }
 
-    fn map_trampoline<M: MapMemory>(
+    /// Load the LiteBox trampoline into memory.
+    fn load_trampoline<M: MapMemory>(
         &self,
         mapper: &mut M,
         mem: &mut impl AccessMemory,
         info: &mut MappingInfo,
-    ) -> Result<(), ElfMapError<M::Error>> {
+    ) -> Result<(), ElfLoadError<M::Error>> {
         let trampoline = self.trampoline.as_ref().unwrap();
         let trampoline_start = info.base_addr + trampoline.vaddr;
         let trampoline_end = page_align_up(info.base_addr + trampoline.vaddr + trampoline.size);
@@ -579,13 +610,13 @@ impl ElfParsedFile {
                     execute: false,
                 },
             )
-            .map_err(ElfMapError::Map)?;
+            .map_err(ElfLoadError::Map)?;
 
         // Validate the trampoline version number.
         let mut version = 0u64;
         mem.read(trampoline_start, version.as_mut_bytes())?;
         if version != REWRITER_VERSION_NUMBER {
-            return Err(ElfMapError::InvalidTrampolineVersion);
+            return Err(ElfLoadError::InvalidTrampolineVersion);
         }
 
         // Write the trampoline entry point.
@@ -606,7 +637,7 @@ impl ElfParsedFile {
                     execute: true,
                 },
             )
-            .map_err(ElfMapError::Map)?;
+            .map_err(ElfLoadError::Map)?;
 
         info.brk = info.brk.max(trampoline_end);
         Ok(())

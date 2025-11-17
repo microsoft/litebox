@@ -169,7 +169,7 @@ impl<'a> FileAndParsed<'a> {
         let platform = litebox_platform_multiplex::platform();
         let file = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
-            .map_err(ElfLoaderError::LoaderError)?;
+            .map_err(ElfLoaderError::ParseError)?;
         parsed.parse_trampoline(&mut &file, platform.get_syscall_entry_point())?;
         Ok(Self { file, parsed })
     }
@@ -201,12 +201,15 @@ impl<'a> ElfLoader<'a> {
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let platform = litebox_platform_multiplex::platform();
 
-        // Map the main ELF file first so that it gets privileged addresses.
-        let info = self.main.parsed.map(&mut self.main.file, &mut &*platform)?;
+        // Load the main ELF file first so that it gets privileged addresses.
+        let info = self
+            .main
+            .parsed
+            .load(&mut self.main.file, &mut &*platform)?;
 
-        // Map the interpreter ELF file, if any.
+        // Load the interpreter ELF file, if any.
         let interp = if let Some(interp) = &mut self.interp {
-            Some(interp.parsed.map(&mut interp.file, &mut &*platform)?)
+            Some(interp.parsed.load(&mut interp.file, &mut &*platform)?)
         } else {
             None
         };
@@ -253,10 +256,10 @@ impl<'a> ElfLoader<'a> {
 pub enum ElfLoaderError {
     #[error("failed to open the ELF file")]
     OpenError(#[from] Errno),
+    #[error("failed to parse the ELF file")]
+    ParseError(#[from] litebox_common_linux::loader::ElfParseError<Errno>),
     #[error("failed to load the ELF file")]
-    LoaderError(#[from] litebox_common_linux::loader::ElfParseError<Errno>),
-    #[error("failed to map the ELF file")]
-    MapError(#[from] litebox_common_linux::loader::ElfMapError<Errno>),
+    LoadError(#[from] litebox_common_linux::loader::ElfLoadError<Errno>),
     #[error("invalid stack")]
     InvalidStackAddr,
     #[error("failed to mmap")]
@@ -267,11 +270,11 @@ impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
     fn from(value: ElfLoaderError) -> Self {
         match value {
             ElfLoaderError::OpenError(e) => e,
-            ElfLoaderError::LoaderError(e) => e.into(),
+            ElfLoaderError::ParseError(e) => e.into(),
             ElfLoaderError::InvalidStackAddr | ElfLoaderError::MappingError(_) => {
                 litebox_common_linux::errno::Errno::ENOMEM
             }
-            ElfLoaderError::MapError(e) => e.into(),
+            ElfLoaderError::LoadError(e) => e.into(),
         }
     }
 }
