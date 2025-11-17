@@ -161,8 +161,14 @@ impl Task {
                 self.sys_open(path, flags, mode)
             }
             FsPath::Cwd => self.sys_open("", flags, mode),
-            FsPath::Fd(_fd) => todo!(),
-            FsPath::FdRelative { fd: _, path: _ } => todo!(),
+            FsPath::Fd(_fd) => {
+                log_unsupported!("openat with FsPath::Fd");
+                Err(Errno::EINVAL)
+            }
+            FsPath::FdRelative { fd: _, path: _ } => {
+                log_unsupported!("openat with FsPath::FdRelative");
+                Err(Errno::EINVAL)
+            }
         }
     }
 

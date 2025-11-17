@@ -158,7 +158,10 @@ impl EpollFile {
     ) -> Result<(), Errno> {
         match op {
             EpollOp::EpollCtlAdd => self.add_interest(fd, file, event.unwrap()),
-            EpollOp::EpollCtlMod => todo!(),
+            EpollOp::EpollCtlMod => {
+                log_unsupported!("epoll_ctl mod");
+                Err(Errno::EINVAL)
+            }
             EpollOp::EpollCtlDel => {
                 let mut interests = self.interests.lock();
                 let _ = interests
