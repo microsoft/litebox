@@ -848,6 +848,12 @@ where
             }
             Protocol::Tcp => {
                 let tcp_specific = specific.tcp_mut();
+                if let Some(server_socket) = tcp_specific.server_socket.take() {
+                    // remove all listening sockets in the backlog
+                    for handle in server_socket.socket_set_handles {
+                        let _ = self.socket_set.remove(handle);
+                    }
+                }
                 if let Some(local_port) = tcp_specific.local_port.take() {
                     self.local_port_allocator.deallocate(local_port);
                 }
