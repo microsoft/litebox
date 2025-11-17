@@ -158,6 +158,7 @@ impl ElfLoader {
         let platform = litebox_platform_multiplex::platform();
         let mut file = ElfFileInMemory::new(elf_buf);
 
+        #[cfg_attr(not(feature = "platform_linux_userland"), expect(unused_mut))]
         let mut parsed = ElfParsedFile::parse(&mut file)?;
 
         #[cfg(feature = "platform_linux_userland")]

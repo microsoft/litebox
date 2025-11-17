@@ -507,9 +507,9 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "elf"
-version = "0.7.4"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4445909572dbd556c457c849c4ca58623d84b27c8fff1e74b0b4227d8b90d17b"
+checksum = "55dd888a213fc57e957abf2aa305ee3e8a28dbe05687a251f33b637cd46b0070"
 
 [[package]]
 name = "encode_unicode"
@@ -970,7 +970,6 @@ dependencies = [
  "arrayvec",
  "bitflags 2.9.4",
  "bitvec",
- "elf",
  "libc",
  "litebox",
  "litebox_common_linux",
@@ -991,7 +990,6 @@ dependencies = [
  "bitflags 2.9.4",
  "cfg-if",
  "ctr",
- "elf",
  "hashbrown 0.15.5",
  "litebox",
  "litebox_common_linux",
