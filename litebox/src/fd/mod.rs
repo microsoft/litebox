@@ -745,7 +745,8 @@ impl DescriptorEntry {
 /// A file descriptor that refers to entries by the `Subsystem`.
 #[repr(transparent)] // this allows us to cast safely
 pub struct TypedFd<Subsystem: FdEnabledSubsystem> {
-    _phantom: PhantomData<fn(Subsystem)>,
+    // Invariant in `Subsystem`: <https://doc.rust-lang.org/nomicon/phantom-data.html#table-of-phantomdata-patterns>
+    _phantom: PhantomData<fn(Subsystem) -> Subsystem>,
     x: OwnedFd,
 }
 
