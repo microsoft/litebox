@@ -25,23 +25,26 @@ pub use rwlock::{
 
 #[cfg(not(feature = "lock_tracing"))]
 /// A convenience name for specific requirements from the platform
-pub trait RawSyncPrimitivesProvider: platform::RawMutexProvider + 'static {}
+pub trait RawSyncPrimitivesProvider: platform::RawMutexProvider + Sync + 'static {}
 #[cfg(not(feature = "lock_tracing"))]
 impl<Platform> RawSyncPrimitivesProvider for Platform where
-    Platform: platform::RawMutexProvider + 'static
+    Platform: platform::RawMutexProvider + Sync + 'static
 {
 }
 
 #[cfg(feature = "lock_tracing")]
 /// A convenience name for specific requirements from the platform
 pub trait RawSyncPrimitivesProvider:
-    platform::RawMutexProvider + platform::TimeProvider + platform::DebugLogProvider + 'static
+    platform::RawMutexProvider + platform::TimeProvider + platform::DebugLogProvider + Sync + 'static
 {
 }
 #[cfg(feature = "lock_tracing")]
 impl<Platform> RawSyncPrimitivesProvider for Platform where
-    Platform:
-        platform::RawMutexProvider + platform::TimeProvider + platform::DebugLogProvider + 'static
+    Platform: platform::RawMutexProvider
+        + platform::TimeProvider
+        + platform::DebugLogProvider
+        + Sync
+        + 'static
 {
 }
 

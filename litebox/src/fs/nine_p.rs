@@ -5,12 +5,12 @@ use crate::{LiteBox, platform};
 /// A backing implementation for [`FileSystem`](super::FileSystem) using a 9p-based network file
 /// system.
 // TODO(jayb): Reduce the requirements necessary on `Platform` to the most precise one possible.
-pub struct FileSystem<Platform: platform::Provider + 'static> {
+pub struct FileSystem<Platform: platform::Provider + Sync + 'static> {
     #[expect(dead_code, reason = "placeholder, currently nine_p is unimplemented")]
     litebox: LiteBox<Platform>,
 }
 
-impl<Platform: platform::Provider + 'static> FileSystem<Platform> {
+impl<Platform: platform::Provider + Sync + 'static> FileSystem<Platform> {
     /// Construct a new `FileSystem` instance
     ///
     /// This function is expected to only be invoked once per platform, as an initialiation step,
@@ -24,10 +24,10 @@ impl<Platform: platform::Provider + 'static> FileSystem<Platform> {
     }
 }
 
-impl<Platform: platform::Provider> super::private::Sealed for FileSystem<Platform> {}
+impl<Platform: platform::Provider + Sync> super::private::Sealed for FileSystem<Platform> {}
 
 #[expect(unused_variables, reason = "unimplemented")]
-impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
+impl<Platform: platform::Provider + Sync> super::FileSystem for FileSystem<Platform> {
     fn open(
         &self,
         path: impl crate::path::Arg,
@@ -133,7 +133,7 @@ impl<Platform: platform::Provider> super::FileSystem for FileSystem<Platform> {
 }
 
 crate::fd::enable_fds_for_subsystem! {
-    @Platform: { platform::Provider + 'static };
+    @Platform: { platform::Provider + Sync + 'static };
     FileSystem<Platform>;
     ();
     -> FileFd<Platform>;

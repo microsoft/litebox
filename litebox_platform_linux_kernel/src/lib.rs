@@ -34,7 +34,8 @@ pub fn update_cpu_mhz(freq: u64) {
 /// This is the platform for running LiteBox in kernel mode.
 /// It requires a host that implements the [`HostInterface`] trait.
 pub struct LinuxKernel<Host: HostInterface> {
-    host_and_task: core::marker::PhantomData<Host>,
+    // Invariant in `Host`: <https://doc.rust-lang.org/nomicon/phantom-data.html#table-of-phantomdata-patterns>
+    host_and_task: core::marker::PhantomData<fn(Host) -> Host>,
     page_table: mm::PageTable<4096>,
 }
 

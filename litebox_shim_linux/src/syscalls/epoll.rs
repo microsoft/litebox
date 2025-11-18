@@ -266,15 +266,15 @@ impl EpollFile {
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct EpollEntryKey(u32, *const ());
+struct EpollEntryKey(u32, usize);
 impl EpollEntryKey {
     fn new(fd: u32, desc: &EpollDescriptor) -> Self {
         let ptr = match desc {
-            EpollDescriptor::Eventfd(file) => Arc::as_ptr(file).cast(),
-            EpollDescriptor::Epoll(file) => Arc::as_ptr(file).cast(),
-            EpollDescriptor::File(file) => Arc::as_ptr(file).cast(),
-            EpollDescriptor::Socket(socket_fd) => Arc::as_ptr(socket_fd).cast(),
-            EpollDescriptor::Pipe(pipe_fd) => Arc::as_ptr(pipe_fd).cast(),
+            EpollDescriptor::Eventfd(file) => Arc::as_ptr(file).addr(),
+            EpollDescriptor::Epoll(file) => Arc::as_ptr(file).addr(),
+            EpollDescriptor::File(file) => Arc::as_ptr(file).addr(),
+            EpollDescriptor::Socket(socket_fd) => Arc::as_ptr(socket_fd).addr(),
+            EpollDescriptor::Pipe(pipe_fd) => Arc::as_ptr(pipe_fd).addr(),
         };
         Self(fd, ptr)
     }
