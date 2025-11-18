@@ -903,6 +903,7 @@ dependencies = [
 name = "litebox_platform_windows_userland"
 version = "0.1.0"
 dependencies = [
+ "getrandom",
  "litebox",
  "litebox_common_linux",
  "windows-sys 0.60.2",
