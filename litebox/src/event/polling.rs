@@ -96,8 +96,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     /// If `nonblock` is true, returns `TryAgain` instead of waiting.
     ///
     /// If `try_op` returns `TryAgain`, the thread will be woken try again when
-    /// [`notify_observers`] is called with events that match the given `events`
-    /// filter (or an event in `Events::ALWAYS_POLLED`).
+    /// [`notify_observers`](Self::notify_observers) is called with events that
+    /// match the given `events` filter (or an event in `Events::ALWAYS_POLLED`).
     pub fn wait<R, E>(
         &self,
         cx: &WaitContext<'_, Platform>,
