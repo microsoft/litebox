@@ -495,3 +495,14 @@ fn test_tun_with_tcp_socket() {
         .run();
     child.join().unwrap();
 }
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "reason"]
+fn test_runner_with_iperf3() {
+    let iperf3_path = run_which("iperf3");
+    Runner::new(Backend::Rewriter, &iperf3_path, "iperf3_server_rewriter")
+        .args(["-s", "-B", "10.0.0.2"])
+        .tun_device_name("tun99")
+        .run();
+}
