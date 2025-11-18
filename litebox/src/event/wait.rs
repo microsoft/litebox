@@ -70,20 +70,6 @@ impl<Platform: RawSyncPrimitivesProvider> Waker<Platform> {
     pub fn wake(&self) {
         self.0.wake();
     }
-
-    /// Returns a weak reference to this waker as an observer. The waker will be
-    /// woken up on any event.
-    pub fn observer<E>(&self) -> alloc::sync::Weak<dyn crate::event::observer::Observer<E>> {
-        Arc::downgrade(&self.0) as _
-    }
-}
-
-impl<Platform: RawSyncPrimitivesProvider, E> super::observer::Observer<E>
-    for WaitStateInner<Platform>
-{
-    fn on_events(&self, _events: &E) {
-        self.wake();
-    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
@@ -470,8 +456,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     /// `f` is called once before the thread sleeps and then again each time the
     /// thread is woken up. The caller must arrange for wakeups at the
     /// appropriate time. This can be done by a call to [`Waker::wake`] or
-    /// [`ThreadHandle::interrupt`], or by signaling the observer returned by
-    /// [`Waker::observer`].
+    /// [`ThreadHandle::interrupt`].
     ///
     /// A deadline for the wait can be provided with
     /// [`with_deadline`](Self::with_deadline) or

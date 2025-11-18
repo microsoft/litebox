@@ -55,8 +55,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             .wait(
                 cx,
                 self.get_status().contains(OFlags::NONBLOCK),
+                Events::IN,
                 || self.try_read(),
-                || self.check_io_events().contains(Events::IN),
             )
             .map_err(Errno::from)
     }
@@ -82,8 +82,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             .wait(
                 cx,
                 self.get_status().contains(OFlags::NONBLOCK),
+                Events::OUT,
                 || self.try_write(value),
-                || self.check_io_events().contains(Events::OUT),
             )
             .map_err(Errno::from)
     }

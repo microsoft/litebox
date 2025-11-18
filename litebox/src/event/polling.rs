@@ -1,6 +1,8 @@
 //! Polling-related functionality
 
-use alloc::sync::Weak;
+use core::sync::atomic::AtomicBool;
+
+use alloc::sync::{Arc, Weak};
 use thiserror::Error;
 
 use super::{
@@ -36,40 +38,46 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'_, Platfor
     /// Run `try_op` until it returns a non-`TryAgain` result, waiting after
     /// each `TryAgain`.
     ///
-    /// If `nonblock` is true, returns `TryAgain` instead of waiting. In this
-    /// case, `try_op` is called exactly once and `check` is not used.
+    /// If `nonblock` is true, returns `TryAgain` instead of waiting.
     ///
-    /// `check` is used to determine whether `try_op` is likely to succeed. If
-    /// `check` returns `true`, the wait is skipped and `try_op` is called again
-    /// immediately. If `check` returns `false`, then the thread will block
-    /// until notified via a call to [`Observer::on_events`] on the observer
-    /// passed to `register_observer`.
+    /// If `try_op` returns `TryAgain`, the thread will be woken try again when
+    /// the observer, registered via the call to `register_observer`, is called
+    /// with events that match the given `events` filter (or an event in
+    /// `Events::ALWAYS_POLLED`).
     pub fn wait_on_events<R, E>(
         &self,
         nonblock: bool,
-        mut try_op: impl FnMut() -> Result<R, TryOpError<E>>,
-        check: impl Fn() -> bool,
+        events: Events,
         register_observer: impl FnOnce(Weak<dyn Observer<Events>>, Events),
+        mut try_op: impl FnMut() -> Result<R, TryOpError<E>>,
     ) -> Result<R, TryOpError<E>>
     where
         Platform: RawSyncPrimitivesProvider + TimeProvider,
     {
-        let mut register_observer = Some(register_observer);
+        // Try once before allocating and registering the observer.
+        match try_op() {
+            Err(TryOpError::TryAgain) if !nonblock => {}
+            ret => return ret,
+        }
+        let observer = Arc::new(PolleeObserver::new(self.waker().clone()));
+        // FUTURE: have `register_observer` return the current ready events so
+        // that we can skip calling `try_op` again if we are not yet ready.
+        register_observer(
+            Arc::downgrade(&observer) as _,
+            events | Events::ALWAYS_POLLED,
+        );
         loop {
             match try_op() {
                 Err(TryOpError::TryAgain) => {}
                 ret => return ret,
             }
-            if nonblock {
-                return Err(TryOpError::TryAgain);
-            }
-            if let Some(register_observer) = register_observer.take() {
-                register_observer(self.waker().observer(), Events::all());
-            }
-            match self.wait_until(&check) {
+            match self.wait_until(|| observer.is_ready()) {
                 Ok(()) => {}
                 Err(err) => return Err(TryOpError::WaitError(err)),
             }
+            // Reset the observer before calling [`try_op`] again so that we
+            // don't miss a wakeup.
+            observer.reset();
         }
     }
 }
@@ -85,23 +93,26 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     /// Run `try_op` until it returns a non-`TryAgain` result, waiting after
     /// each `TryAgain`.
     ///
-    /// If `nonblock` is true, returns `TryAgain` instead of waiting. In this
-    /// case, `try_op` is called exactly once and `check` is not used.
+    /// If `nonblock` is true, returns `TryAgain` instead of waiting.
     ///
-    /// `check` is used to determine whether `try_op` is likely to succeed. If
-    /// `check` returns `true`, the wait is skipped and `try_op` is called again
-    /// immediately. If `check` returns `false`, then the thread will block
-    /// until notified via [`notify_observers`](Self::notify_observers).
+    /// If `try_op` returns `TryAgain`, the thread will be woken try again when
+    /// [`notify_observers`] is called with events that match the given `events`
+    /// filter (or an event in `Events::ALWAYS_POLLED`).
     pub fn wait<R, E>(
         &self,
         cx: &WaitContext<'_, Platform>,
         nonblock: bool,
+        events: Events,
         try_op: impl FnMut() -> Result<R, TryOpError<E>>,
-        check: impl Fn() -> bool,
     ) -> Result<R, TryOpError<E>> {
-        cx.wait_on_events(nonblock, try_op, check, |observer, filter| {
-            self.register_observer(observer, filter);
-        })
+        cx.wait_on_events(
+            nonblock,
+            events,
+            |observer, filter| {
+                self.register_observer(observer, filter);
+            },
+            try_op,
+        )
     }
 
     /// Register an observer for events that satisfy the given `filter`.
@@ -118,5 +129,37 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     /// Notify all registered observers with the given events.
     pub fn notify_observers(&self, events: Events) {
         self.subject.notify_observers(events);
+    }
+}
+
+/// Private observer, used solely to help implement [`WaitContext::wait_on_events`].
+struct PolleeObserver<Platform: RawSyncPrimitivesProvider> {
+    ready: AtomicBool,
+    waker: super::wait::Waker<Platform>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider> PolleeObserver<Platform> {
+    fn new(waker: super::wait::Waker<Platform>) -> Self {
+        Self {
+            ready: AtomicBool::new(false),
+            waker,
+        }
+    }
+
+    fn reset(&self) {
+        self.ready
+            .store(false, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn is_ready(&self) -> bool {
+        self.ready.load(core::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> Observer<Events> for PolleeObserver<Platform> {
+    fn on_events(&self, _events: &Events) {
+        self.ready
+            .store(true, core::sync::atomic::Ordering::Release);
+        self.waker.wake();
     }
 }

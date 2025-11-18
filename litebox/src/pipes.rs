@@ -449,11 +449,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T
             .wait(
                 cx,
                 self.get_status().contains(OFlags::NONBLOCK),
+                Events::OUT,
                 || self.try_write(buf),
-                || {
-                    self.check_io_events()
-                        .intersects(Events::OUT | Events::ALWAYS_POLLED)
-                },
             )
             .map_err(PipeError::from)
     }
@@ -564,11 +561,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> ReadEnd<Platform, T>
             .wait(
                 cx,
                 self.get_status().contains(OFlags::NONBLOCK),
+                Events::IN,
                 || self.try_read(buf),
-                || {
-                    self.check_io_events()
-                        .intersects(Events::IN | Events::ALWAYS_POLLED)
-                },
             )
             .map_err(PipeError::from)
     }

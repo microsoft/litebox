@@ -136,18 +136,13 @@ impl EpollFile {
         maxevents: usize,
     ) -> Result<Vec<EpollEvent>, WaitError> {
         let mut events = Vec::new();
-        match self.ready.pollee.wait(
-            cx,
-            false,
-            || {
-                self.ready.pop_multiple(maxevents, &mut events);
-                if events.is_empty() {
-                    return Err(TryOpError::<Infallible>::TryAgain);
-                }
-                Ok(())
-            },
-            || self.ready.check_io_events().contains(Events::IN),
-        ) {
+        match self.ready.pollee.wait(cx, false, Events::IN, || {
+            self.ready.pop_multiple(maxevents, &mut events);
+            if events.is_empty() {
+                return Err(TryOpError::<Infallible>::TryAgain);
+            }
+            Ok(())
+        }) {
             Ok(()) => Ok(events),
             Err(TryOpError::TryAgain) => unreachable!(),
             Err(TryOpError::WaitError(e)) => Err(e),
@@ -434,14 +429,6 @@ impl ReadySet {
                     self.entries.lock().push_back(weak_entry);
                 }
             }
-        }
-    }
-
-    fn check_io_events(&self) -> Events {
-        if self.entries.lock().is_empty() {
-            Events::empty()
-        } else {
-            Events::IN
         }
     }
 }

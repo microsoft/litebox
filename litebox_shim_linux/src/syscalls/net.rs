@@ -389,13 +389,6 @@ fn getsockopt(
     Ok(())
 }
 
-fn check_ready(fd: &SocketFd, events: Events) -> bool {
-    litebox_net()
-        .lock()
-        .with_iopollable(fd, |poll| poll.check_io_events().intersects(events))
-        .unwrap_or(true)
-}
-
 fn register_observer(
     fd: &SocketFd,
     observer: alloc::sync::Weak<dyn litebox::event::observer::Observer<Events>>,
@@ -422,9 +415,9 @@ fn accept(
 ) -> Result<SocketFd, Errno> {
     cx.wait_on_events(
         get_status(fd).contains(OFlags::NONBLOCK),
+        Events::IN,
+        |observer, filter| register_observer(fd, observer, filter),
         || try_accept(fd, peer.as_deref_mut()),
-        || check_ready(fd, Events::IN),
-        |observer, _filter| register_observer(fd, observer, Events::IN),
     )
     .map_err(Errno::from)
 }
@@ -457,6 +450,8 @@ fn connect(
         .map_err(Errno::from)?;
     cx.wait_on_events(
         get_status(fd).contains(OFlags::NONBLOCK),
+        Events::IN | Events::OUT,
+        |observer, filter| register_observer(fd, observer, filter),
         || {
             if is_ready(fd).map_err(TryOpError::Other)? {
                 Ok(())
@@ -464,8 +459,6 @@ fn connect(
                 Err(TryOpError::TryAgain)
             }
         },
-        || check_ready(fd, Events::IN | Events::OUT),
-        |observer, _filter| register_observer(fd, observer, Events::IN | Events::OUT),
     )
     .map_err(|err| match err {
         TryOpError::TryAgain => Errno::EINPROGRESS,
@@ -520,9 +513,9 @@ pub(crate) fn sendto(
         .with_maybe_timeout(timeout)
         .wait_on_events(
             get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT),
+            Events::OUT,
+            |observer, filter| register_observer(fd, observer, filter),
             || try_sendto(fd, buf, new_flags, sockaddr),
-            || check_ready(fd, Events::OUT),
-            |observer, _filter| register_observer(fd, observer, Events::OUT),
         )
         .map_err(Errno::from);
     if let Err(Errno::EPIPE) = ret
@@ -583,9 +576,9 @@ pub(crate) fn receive(
     cx.with_maybe_timeout(timeout)
         .wait_on_events(
             get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(ReceiveFlags::DONTWAIT),
+            Events::IN,
+            |observer, filter| register_observer(fd, observer, filter),
             || try_receive(fd, buf, new_flags, source_addr.as_deref_mut()),
-            || check_ready(fd, Events::IN),
-            |observer, _filter| register_observer(fd, observer, Events::IN),
         )
         .map_err(Errno::from)
 }
