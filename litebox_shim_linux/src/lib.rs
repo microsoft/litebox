@@ -1090,14 +1090,8 @@ impl Task {
                     Ok(0)
                 })
             }
-            SyscallRequest::Clone { args } => self.handle_clone_request(&args, ctx),
-            SyscallRequest::Clone3 { args } => {
-                if let Some(clone_args) = unsafe { args.read_at_offset(0) } {
-                    self.handle_clone_request(&clone_args, ctx)
-                } else {
-                    Err(Errno::EFAULT)
-                }
-            }
+            SyscallRequest::Clone { args } => self.sys_clone(ctx, &args),
+            SyscallRequest::Clone3 { args } => self.sys_clone3(ctx, args),
             SyscallRequest::SetThreadArea { user_desc } => {
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -1220,91 +1214,6 @@ impl Task {
                 Err(Errno::ENOSYS)
             }
         }
-    }
-}
-
-const MAX_SIGNAL_NUMBER: u64 = 64;
-
-impl Task {
-    fn handle_clone_request(
-        &self,
-        clone_args: &litebox_common_linux::CloneArgs,
-        ctx: &litebox_common_linux::PtRegs,
-    ) -> Result<usize, Errno> {
-        if clone_args.cgroup != 0 {
-            log_unsupported!("clone with cgroup");
-            return Err(Errno::EINVAL);
-        }
-        if clone_args.set_tid != 0 {
-            log_unsupported!("clone with set_tid");
-            return Err(Errno::EINVAL);
-        }
-        // Note `exit_signal` is ignored because we don't support `fork` yet; we just validate it.
-        if clone_args.exit_signal > MAX_SIGNAL_NUMBER {
-            return Err(Errno::EINVAL);
-        }
-        let parent_tid = if clone_args.parent_tid == 0 {
-            None
-        } else {
-            Some(MutPtr::from_usize(
-                usize::try_from(clone_args.parent_tid).unwrap(),
-            ))
-        };
-        let stack = if clone_args.stack == 0 {
-            None
-        } else {
-            Some(MutPtr::from_usize(
-                usize::try_from(clone_args.stack).unwrap(),
-            ))
-        };
-        let child_tid = if clone_args.child_tid == 0 {
-            None
-        } else {
-            Some(MutPtr::from_usize(
-                usize::try_from(clone_args.child_tid).unwrap(),
-            ))
-        };
-        let tls = if clone_args.tls != 0 {
-            let addr = usize::try_from(clone_args.tls).unwrap();
-            #[cfg(target_arch = "x86_64")]
-            let desc = MutPtr::from_usize(addr);
-            #[cfg(target_arch = "x86")]
-            let desc = {
-                let desc = unsafe {
-                    MutPtr::<litebox_common_linux::UserDesc>::from_usize(addr).read_at_offset(0)
-                }
-                .ok_or(Errno::EFAULT)?
-                .into_owned();
-                // Note that different from `set_thread_area` syscall that returns the allocated entry number
-                // when requested (i.e., `desc.entry_number` is -1), here we just read the descriptor to LiteBox and
-                // assume the entry number is properly set so that we don't need to write it back. This is because
-                // we set up the TLS descriptor in the new thread's context, at which point the original descriptor
-                // pointer might no longer be valid. Linux does not have this problem because it sets up the TLS for
-                // the child thread in the parent thread before `clone` returns.
-                // In practice, glibc always sets the entry number to a valid value when calling `clone` with TLS as
-                // all threads can share the same TLS entry as the main thread.
-                let idx = desc.entry_number;
-                debug_assert_ne!(idx, u32::MAX);
-                desc
-            };
-            Some(desc)
-        } else {
-            None
-        };
-        usize::try_from(clone_args.stack_size)
-            .map_err(|_| Errno::EINVAL)
-            .and_then(|stack_size| {
-                self.sys_clone(
-                    clone_args.flags,
-                    parent_tid,
-                    stack,
-                    stack_size,
-                    child_tid,
-                    tls,
-                    ctx,
-                    ctx.get_ip(),
-                )
-            })
     }
 }
 
