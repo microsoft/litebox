@@ -69,9 +69,9 @@ impl litebox_common_linux::loader::MapMemory for ElfFile<'_> {
     type Error = Errno;
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
-        // Allocate a mapping larger than needed to satisfy alignment, then
-        // unmap the excess.
-        let mapping_len = len + (align - PAGE_SIZE);
+        // Allocate a mapping large enough that even if it's maximally misaligned we can
+        // still fit `len` bytes.
+        let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
         let mapping_ptr = self
             .task
             .sys_mmap(

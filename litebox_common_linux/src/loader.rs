@@ -207,13 +207,12 @@ impl ElfParsedFile {
             return Err(ElfParseError::BadFormat);
         }
         // Limit to 64KB of program headers.
-        let phdr_size: usize = header
+        let phdr_size: u16 = header
             .e_phentsize
             .checked_mul(header.e_phnum)
-            .ok_or(ElfParseError::BadFormat)?
-            .into();
+            .ok_or(ElfParseError::BadFormat)?;
 
-        let mut phdrs = alloc::vec![0u8; phdr_size];
+        let mut phdrs = alloc::vec![0u8; usize::from(phdr_size)];
         file.read_at(header.e_phoff, &mut phdrs)
             .map_err(ElfParseError::Io)?;
 
@@ -418,17 +417,21 @@ impl ElfParsedFile {
                 return Err(ElfLoadError::InvalidProgramHeader);
             }
             let adjusted_vaddr = base_addr + p_vaddr;
-            if p_filesz > 0 {
+            let load_start = page_align_down(adjusted_vaddr);
+            let file_end = page_align_up(adjusted_vaddr + p_filesz);
+            let load_end = page_align_up(adjusted_vaddr + p_memsz);
+            if file_end > load_start {
                 // Map the file-backed portion.
-                let map_start = page_align_down(adjusted_vaddr);
-                let map_end = page_align_up(adjusted_vaddr + p_filesz);
+                // `p_offset` should be co-aligned with `p_vaddr`. If it is not,
+                // then `map_file` is expected to fail.
+                let offset = ph
+                    .p_offset
+                    .wrapping_sub((adjusted_vaddr - load_start) as u64);
                 mapper
                     .map_file(
-                        map_start,
-                        map_end - map_start,
-                        ph.p_offset
-                            .checked_sub((adjusted_vaddr - map_start) as u64)
-                            .ok_or(ElfLoadError::InvalidProgramHeader)?,
+                        load_start,
+                        file_end - load_start,
+                        offset,
                         &prot.unwrap_or(Protection {
                             read: true,
                             write: (ph.p_flags & elf::abi::PF_W) != 0,
@@ -445,20 +448,18 @@ impl ElfParsedFile {
                 // `p_filesz` and the segment is writable. This matches other
                 // loaders' behavior, so it should be sufficient.
                 if p_memsz > p_filesz && ph.p_flags & elf::abi::PF_W != 0 {
-                    let zero_start = adjusted_vaddr + p_filesz;
-                    if map_end > zero_start {
-                        mem.zero(zero_start, map_end - zero_start)?;
+                    let unaligned_file_end = adjusted_vaddr + p_filesz;
+                    if file_end > unaligned_file_end {
+                        mem.zero(unaligned_file_end, file_end - unaligned_file_end)?;
                     }
                 }
             }
-            let zero_map_start = page_align_up(adjusted_vaddr + p_filesz);
-            let zero_map_end = page_align_up(adjusted_vaddr + p_memsz);
-            if zero_map_end > zero_map_start {
+            if load_end > file_end {
                 // Map the zero-filled portion.
                 mapper
                     .map_zero(
-                        zero_map_start,
-                        zero_map_end - zero_map_start,
+                        file_end,
+                        load_end - file_end,
                         &prot.unwrap_or(Protection {
                             read: true,
                             write: (ph.p_flags & elf::abi::PF_W) != 0,
@@ -469,7 +470,7 @@ impl ElfParsedFile {
             }
 
             // Update the end address of the last PT_LOAD segment.
-            brk = brk.max(zero_map_end);
+            brk = brk.max(load_end);
 
             // Track the location of the program headers in memory; this is used
             // for `AT_PHDR`.
@@ -668,9 +669,14 @@ pub trait MapMemory {
 
     /// Reserve a region of memory with the given length and alignment,
     /// returning the chosen address.
+    ///
+    /// `align` must be a power of two. Fails if any of the parameters are not
+    /// page-aligned.
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error>;
 
     /// Map file data, replacing any existing mappings.
+    ///
+    /// Fails if any of the parameters are not page-aligned.
     fn map_file(
         &mut self,
         address: usize,
@@ -680,6 +686,8 @@ pub trait MapMemory {
     ) -> Result<(), Self::Error>;
 
     /// Map zeroed memory, replacing any existing mappings.
+    ///
+    /// Fails if any of the parameters are not page-aligned.
     fn map_zero(
         &mut self,
         address: usize,
@@ -688,6 +696,8 @@ pub trait MapMemory {
     ) -> Result<(), Self::Error>;
 
     /// Change protections of a memory region.
+    ///
+    /// Fails if any of the parameters are not page-aligned.
     fn protect(&mut self, address: usize, len: usize, prot: &Protection)
     -> Result<(), Self::Error>;
 }

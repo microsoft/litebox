@@ -52,7 +52,7 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
     type Error = Errno;
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
-        let mapping_len = len + (align - PAGE_SIZE);
+        let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
         let mapping_ptr = crate::syscalls::mm::sys_mmap(
             DEFAULT_ELF_LOAD_BASE,
             mapping_len,
@@ -93,6 +93,11 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
             offset,
             self.buffer.len(),
         );
+
+        // The other inputs are validated by `map_zero`.
+        if !offset.is_multiple_of(PAGE_SIZE as u64) {
+            return Err(Errno::EINVAL);
+        }
 
         // Map the region as writable first.
         self.map_zero(
