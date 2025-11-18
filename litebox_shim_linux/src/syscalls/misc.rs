@@ -25,12 +25,12 @@ impl Task {
         let mut offset = 0;
         while offset < count {
             let len = (count - offset).min(kbuf.len());
+            let kbuf = &mut kbuf[..len];
             <Platform as litebox::platform::CrngProvider>::fill_bytes_crng(
                 litebox_platform_multiplex::platform(),
-                &mut kbuf[..len],
+                kbuf,
             );
-            buf.copy_from_slice(offset, &kbuf[..len])
-                .ok_or(Errno::EFAULT)?;
+            buf.copy_from_slice(offset, kbuf).ok_or(Errno::EFAULT)?;
             offset += len;
             // TODO: check for interrupt here and break out.
         }
