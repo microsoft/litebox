@@ -2287,6 +2287,12 @@ unsafe fn interrupt_signal_handler(
     set_signal_return(context, interrupt_callback, regs as isize, 0, 0, 0);
 }
 
+impl litebox::platform::CrngProvider for LinuxUserland {
+    fn fill_bytes_crng(&self, buf: &mut [u8]) {
+        getrandom::fill(buf).expect("getrandom failed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::AtomicU32;

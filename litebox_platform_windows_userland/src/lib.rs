@@ -1792,6 +1792,12 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
     }
 }
 
+impl litebox::platform::CrngProvider for WindowsUserland {
+    fn fill_bytes_crng(&self, buf: &mut [u8]) {
+        getrandom::fill(buf).expect("getrandom failed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::AtomicU32;

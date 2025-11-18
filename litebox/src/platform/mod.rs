@@ -678,3 +678,37 @@ pub unsafe trait ThreadLocalStorageProvider {
         unimplemented!()
     }
 }
+
+/// A provider of cryptographically-secure random data.
+///
+/// The precise behavior and implementation is platform specific, and in general
+/// these methods should pass through to the platform's native cryptographic RNG
+/// API when one exists.
+///
+/// **Caution**: it may be tempting to write a more efficient provider that runs
+/// fully in the litebox runtime, seeding the RNG from the platform's kernel
+/// CRNG or other trusted sources. Don't do this! Implementing this correctly as
+/// anything other than a direct passthrough is highly non-trivial, especially
+/// in the presence of `fork()` and VM snapshots. Only the native platform has
+/// enough visibility to get this right.
+///
+/// If you _are_ implementing a native platform, then be sure to take such
+/// details into account.
+///
+/// See [this Linux kernel patch series][1] for more details of the kinds of
+/// issues involved.
+///
+/// [1]:
+///     https://lore.kernel.org/all/20240703183115.1075219-1-Jason@zx2c4.com/
+pub trait CrngProvider {
+    /// Fill `buf` with cryptographically secure random bytes.
+    ///
+    /// This may take a long time for large buffers. Consider calling this
+    /// multiple times, checking for interrupts between calls, if you need to
+    /// fill a very large buffer.
+    ///
+    /// # Panics
+    /// Panics if unable to fill the buffer with random bytes. Litebox code is
+    /// not expected to handle such failures.
+    fn fill_bytes_crng(&self, buf: &mut [u8]);
+}

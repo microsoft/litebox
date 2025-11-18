@@ -8,6 +8,7 @@ use litebox::{
     utils::TruncateExt as _,
 };
 use litebox_common_linux::errno::Errno;
+use litebox_platform_multiplex::Platform;
 
 impl Task {
     /// Handle syscall `getrandom`.
@@ -17,38 +18,23 @@ impl Task {
         count: usize,
         _flags: litebox_common_linux::RngFlags,
     ) -> Result<usize, Errno> {
-        // FIXME: before we have secure randomness source (see #41), use a fast and insecure one.
-        static RANDOM: once_cell::race::OnceBox<
-            litebox::sync::Mutex<
-                litebox_platform_multiplex::Platform,
-                litebox::utils::rng::FastRng,
-            >,
-        > = once_cell::race::OnceBox::new();
-        let mut random = RANDOM
-            .get_or_init(|| {
-                alloc::boxed::Box::new(crate::litebox().sync().new_mutex(
-                    litebox::utils::rng::FastRng::new_from_seed(
-                        core::num::NonZeroU64::new(0x4d595df4d0f33173).unwrap(),
-                    ),
-                ))
-            })
-            .lock();
-        let mut off = 0;
-        loop {
-            if off >= count {
-                break Ok(count);
-            }
-
-            let bytes = random.next_u64();
-            let max = core::cmp::min(count - off, 8);
-            if buf
-                .copy_from_slice(off, &bytes.to_ne_bytes()[..max])
-                .is_none()
-            {
-                break Err(Errno::EFAULT);
-            }
-            off += 8;
+        // Linux guarantees at least 256 bytes of randomness per call before
+        // checking for interrupts.
+        const KBUF_LEN: usize = 256;
+        let mut kbuf = [0; KBUF_LEN];
+        let mut offset = 0;
+        while offset < count {
+            let len = (count - offset).min(kbuf.len());
+            <Platform as litebox::platform::CrngProvider>::fill_bytes_crng(
+                litebox_platform_multiplex::platform(),
+                &mut kbuf[..len],
+            );
+            buf.copy_from_slice(offset, &kbuf[..len])
+                .ok_or(Errno::EFAULT)?;
+            offset += len;
+            // TODO: check for interrupt here and break out.
         }
+        Ok(offset)
     }
 }
 
