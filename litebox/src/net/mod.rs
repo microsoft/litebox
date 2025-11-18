@@ -1375,6 +1375,12 @@ where
                     TcpOptionData::KEEPALIVE(keepalive) => {
                         tcp_socket.set_keep_alive(keepalive.map(smoltcp::time::Duration::from));
                     }
+                    TcpOptionData::CONGESTION(congestion) => match congestion {
+                        CongestionControl::None => {
+                            tcp_socket.set_congestion_control(tcp::CongestionControl::None);
+                        }
+                        _ => unimplemented!(),
+                    },
                 }
                 Ok(())
             }
@@ -1403,6 +1409,11 @@ where
                     }
                     TcpOptionName::KEEPALIVE => Ok(TcpOptionData::KEEPALIVE(
                         tcp_socket.keep_alive().map(core::time::Duration::from),
+                    )),
+                    TcpOptionName::CONGESTION => Ok(TcpOptionData::CONGESTION(
+                        match tcp_socket.congestion_control() {
+                            tcp::CongestionControl::None => CongestionControl::None,
+                        },
                     )),
                 }
             }
@@ -1492,6 +1503,8 @@ pub enum TcpOptionName {
     NODELAY,
     /// Enable sending of keep-alive messages.
     KEEPALIVE,
+    /// TCP congestion control algorithm
+    CONGESTION,
 }
 
 /// Data for TCP options
@@ -1502,6 +1515,15 @@ pub enum TcpOptionName {
 pub enum TcpOptionData {
     NODELAY(bool),
     KEEPALIVE(Option<core::time::Duration>),
+    CONGESTION(CongestionControl),
+}
+
+/// TCP Congestion Control Algorithms
+#[non_exhaustive]
+pub enum CongestionControl {
+    None,
+    Reno,
+    Cubic,
 }
 
 crate::fd::enable_fds_for_subsystem! {

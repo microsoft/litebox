@@ -248,45 +248,67 @@ fn setsockopt(
             Ok(())
         }
         SocketOptionName::TCP(to) => {
-            let optval: ConstPtr<u32> = ConstPtr::from_usize(optval.as_usize());
-            let val = unsafe { optval.read_at_offset(0) }
-                .ok_or(Errno::EFAULT)?
-                .into_owned();
-            match to {
-                TcpOption::NODELAY | TcpOption::CORK => {
-                    // Some applications use Nagle's Algorithm (via the TCP_NODELAY option) for a similar effect.
-                    // However, TCP_CORK offers more fine-grained control, as it's designed for applications that
-                    // send variable-length chunks of data that don't necessarily fit nicely into a full TCP segment.
-                    // Because smoltcp does not support TCP_CORK, we emulate it by enabling/disabling Nagle's Algorithm.
-                    let on = if let TcpOption::NODELAY = to {
-                        val != 0
-                    } else {
-                        // CORK is the opposite of NODELAY
-                        val == 0
-                    };
-                    litebox_net()
-                        .lock()
-                        .set_tcp_option(fd, litebox::net::TcpOptionData::NODELAY(on))?;
-                    Ok(())
-                }
-                TcpOption::KEEPINTVL => {
-                    const MAX_TCP_KEEPINTVL: u32 = 32767;
-                    if !(1..=MAX_TCP_KEEPINTVL).contains(&val) {
-                        return Err(Errno::EINVAL);
+            if let TcpOption::CONGESTION = to {
+                const TCP_CONGESTION_NAME_MAX: usize = 16;
+                let data = unsafe { optval.to_cow_slice(TCP_CONGESTION_NAME_MAX.min(optlen)) }
+                    .ok_or(Errno::EFAULT)?;
+                let name = core::str::from_utf8(&data).map_err(|_| Errno::EINVAL)?;
+                litebox_net().lock().set_tcp_option(
+                    fd,
+                    match name {
+                        "reno" | "cubic" => {
+                            log_unsupported!("enable {} for smoltcp?", name);
+                            return Err(Errno::EINVAL);
+                        }
+                        "none" => litebox::net::TcpOptionData::CONGESTION(
+                            litebox::net::CongestionControl::None,
+                        ),
+                        _ => return Err(Errno::EINVAL),
+                    },
+                )?;
+                Ok(())
+            } else {
+                let optval: ConstPtr<u32> = ConstPtr::from_usize(optval.as_usize());
+                let val = unsafe { optval.read_at_offset(0) }
+                    .ok_or(Errno::EFAULT)?
+                    .into_owned();
+                match to {
+                    TcpOption::NODELAY | TcpOption::CORK => {
+                        // Some applications use Nagle's Algorithm (via the TCP_NODELAY option) for a similar effect.
+                        // However, TCP_CORK offers more fine-grained control, as it's designed for applications that
+                        // send variable-length chunks of data that don't necessarily fit nicely into a full TCP segment.
+                        // Because smoltcp does not support TCP_CORK, we emulate it by enabling/disabling Nagle's Algorithm.
+                        let on = if let TcpOption::NODELAY = to {
+                            val != 0
+                        } else {
+                            // CORK is the opposite of NODELAY
+                            val == 0
+                        };
+                        litebox_net()
+                            .lock()
+                            .set_tcp_option(fd, litebox::net::TcpOptionData::NODELAY(on))?;
+                        Ok(())
                     }
-                    litebox_net()
-                        .lock()
-                        .set_tcp_option(
-                            fd,
-                            litebox::net::TcpOptionData::KEEPALIVE(Some(
-                                core::time::Duration::from_secs(u64::from(val)),
-                            )),
-                        )
-                        .expect("set TCP_KEEPALIVE should succeed");
-                    Ok(())
+                    TcpOption::KEEPINTVL => {
+                        const MAX_TCP_KEEPINTVL: u32 = 32767;
+                        if !(1..=MAX_TCP_KEEPINTVL).contains(&val) {
+                            return Err(Errno::EINVAL);
+                        }
+                        litebox_net()
+                            .lock()
+                            .set_tcp_option(
+                                fd,
+                                litebox::net::TcpOptionData::KEEPALIVE(Some(
+                                    core::time::Duration::from_secs(u64::from(val)),
+                                )),
+                            )
+                            .expect("set TCP_KEEPALIVE should succeed");
+                        Ok(())
+                    }
+                    TcpOption::KEEPCNT | TcpOption::KEEPIDLE => Err(Errno::EOPNOTSUPP),
+                    TcpOption::CONGESTION => unreachable!(),
+                    TcpOption::INFO => unimplemented!("TCP option {to:?}"),
                 }
-                TcpOption::KEEPCNT | TcpOption::KEEPIDLE => Err(Errno::EOPNOTSUPP),
-                _ => unimplemented!("TCP option {to:?}"),
             }
         }
     }
@@ -354,38 +376,58 @@ fn getsockopt(
             }
         }
         SocketOptionName::TCP(tcpopt) => {
-            let val: u32 = match tcpopt {
-                TcpOption::KEEPINTVL => {
-                    let TcpOptionData::KEEPALIVE(interval) = litebox_net()
-                        .lock()
-                        .get_tcp_option(fd, litebox::net::TcpOptionName::KEEPALIVE)?
-                    else {
-                        unreachable!()
-                    };
-                    interval.map_or(0, |d| d.as_secs().try_into().unwrap())
-                }
-                TcpOption::NODELAY | TcpOption::CORK => {
-                    let TcpOptionData::NODELAY(nodelay) = litebox_net()
-                        .lock()
-                        .get_tcp_option(fd, litebox::net::TcpOptionName::NODELAY)?
-                    else {
-                        unreachable!()
-                    };
-                    u32::from(if let TcpOption::NODELAY = tcpopt {
-                        nodelay
-                    } else {
-                        // CORK is the opposite of NODELAY
-                        !nodelay
-                    })
-                }
-                TcpOption::KEEPCNT | TcpOption::KEEPIDLE => return Err(Errno::EOPNOTSUPP),
-                TcpOption::CONGESTION | TcpOption::INFO => {
-                    unimplemented!("TCP option {tcpopt:?}")
-                }
-            };
-            let data = &val.to_ne_bytes()[..size_of::<u32>().min(len as usize)];
-            unsafe { optval.write_slice_at_offset(0, data) }.ok_or(Errno::EFAULT)?;
-            size_of::<u32>()
+            if let TcpOption::CONGESTION = tcpopt {
+                let TcpOptionData::CONGESTION(congestion) = litebox_net()
+                    .lock()
+                    .get_tcp_option(fd, litebox::net::TcpOptionName::CONGESTION)?
+                else {
+                    unreachable!()
+                };
+                let name = match congestion {
+                    litebox::net::CongestionControl::Reno => "reno",
+                    litebox::net::CongestionControl::Cubic => "cubic",
+                    litebox::net::CongestionControl::None => "none",
+                    _ => unimplemented!(),
+                };
+                let len = name.len().min(len as usize);
+                unsafe { optval.write_slice_at_offset(0, &name.as_bytes()[..len]) }
+                    .ok_or(Errno::EFAULT)?;
+                len
+            } else {
+                let val: u32 = match tcpopt {
+                    TcpOption::KEEPINTVL => {
+                        let TcpOptionData::KEEPALIVE(interval) = litebox_net()
+                            .lock()
+                            .get_tcp_option(fd, litebox::net::TcpOptionName::KEEPALIVE)?
+                        else {
+                            unreachable!()
+                        };
+                        interval.map_or(0, |d| d.as_secs().try_into().unwrap())
+                    }
+                    TcpOption::NODELAY | TcpOption::CORK => {
+                        let TcpOptionData::NODELAY(nodelay) = litebox_net()
+                            .lock()
+                            .get_tcp_option(fd, litebox::net::TcpOptionName::NODELAY)?
+                        else {
+                            unreachable!()
+                        };
+                        u32::from(if let TcpOption::NODELAY = tcpopt {
+                            nodelay
+                        } else {
+                            // CORK is the opposite of NODELAY
+                            !nodelay
+                        })
+                    }
+                    TcpOption::KEEPCNT | TcpOption::KEEPIDLE => return Err(Errno::EOPNOTSUPP),
+                    TcpOption::CONGESTION => unreachable!(),
+                    TcpOption::INFO => {
+                        unimplemented!("TCP option {tcpopt:?}")
+                    }
+                };
+                let data = &val.to_ne_bytes()[..size_of::<u32>().min(len as usize)];
+                unsafe { optval.write_slice_at_offset(0, data) }.ok_or(Errno::EFAULT)?;
+                size_of::<u32>()
+            }
         }
     };
     unsafe { optlen.write_at_offset(0, new_len.truncate()) }.ok_or(Errno::EFAULT)?;
