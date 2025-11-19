@@ -62,8 +62,7 @@ pub enum HekiKexecType {
     #[default]
     Unknown = 0xffff_ffff_ffff_ffff,
 }
-
-#[derive(Clone, Copy, Default, Debug, TryFromPrimitive, PartialEq)]
+#[derive(Clone, Copy, Default, Debug, TryFromPrimitive, PartialEq, Hash, Eq)]
 #[repr(u64)]
 pub enum ModMemType {
     Text = 0,
@@ -75,9 +74,58 @@ pub enum ModMemType {
     InitRoData = 6,
     ElfBuffer = 7,
     Patch = 8,
+    Syms = 9,
+    GplSyms = 10,
     #[default]
     Unknown = 0xffff_ffff_ffff_ffff,
 }
+
+impl From<usize> for ModMemType {
+    fn from(i: usize) -> Self {
+        match i {
+            0 => ModMemType::Text,
+            1 => ModMemType::Data,
+            2 => ModMemType::RoData,
+            3 => ModMemType::RoAfterInit,
+            4 => ModMemType::InitText,
+            5 => ModMemType::InitData,
+            6 => ModMemType::InitRoData,
+            _ => ModMemType::Unknown,
+        }
+    }
+}
+
+impl From<ModMemType> for usize {
+    fn from(m: ModMemType) -> Self{
+         match m {
+            ModMemType::Text => 0,
+            ModMemType::Data => 1,
+            ModMemType::RoData => 2,
+            ModMemType::RoAfterInit=>3,
+            ModMemType::InitText=>4,
+            ModMemType::InitData=>5,
+            ModMemType::InitRoData=>6,
+            _=>0xffff_ffff_ffff_ffff
+        }
+    }
+}
+/*
+impl Into<ModMemType> for usize {
+
+    fn into(self) -> ModMemType {
+        match self {
+            ModMemType::Text => 0,
+            ModMemType::Data => 1,
+            ModMemType::RoData => 2,
+            ModMemType::RoAfterInit=>3,
+            ModMemType::InitText=>4,
+            ModMemType::InitData=>5,
+            ModMemType::InitRoData=>6,
+            _=>0xffff_ffff_ffff_ffff
+        }
+    }
+}
+    */
 
 pub(crate) fn mod_mem_type_to_mem_attr(mod_mem_type: ModMemType) -> MemAttr {
     let mut mem_attr = MemAttr::empty();
