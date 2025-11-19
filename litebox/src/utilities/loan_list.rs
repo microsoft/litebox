@@ -599,7 +599,7 @@ mod tests {
                                 removed: AtomicBool::new(false),
                             },
                         ));
-                        v.as_mut().insert(&list);
+                        v.as_mut().insert(list);
                         if i % 2 == 0 {
                             v.remove();
                             inserted.fetch_add(1, Ordering::SeqCst);
@@ -629,6 +629,6 @@ mod tests {
         let observed_removed = observed_removed.into_inner();
         assert_eq!(removed, observed_removed);
         assert_eq!(removed, entries_per_key / 2);
-        std::println!("{} items removed and observed", removed);
+        std::println!("{removed} items removed and observed");
     }
 }
