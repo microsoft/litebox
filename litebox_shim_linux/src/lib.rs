@@ -236,7 +236,6 @@ impl LinuxShim {
         let litebox_common_linux::TaskParams {
             pid,
             ppid,
-            tid,
             uid,
             euid,
             gid,
@@ -259,7 +258,7 @@ impl LinuxShim {
                 wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
                 pid,
                 ppid,
-                tid,
+                tid: pid,
                 clear_child_tid: None.into(),
                 robust_list: None.into(),
                 credentials: syscalls::process::Credentials {

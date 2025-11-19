@@ -1223,8 +1223,6 @@ pub struct TaskParams {
     pub pid: i32,
     /// Parent Process ID
     pub ppid: i32,
-    /// Thread ID
-    pub tid: i32,
     /// The initial uid.
     pub uid: u32,
     /// The initial effective uid.
