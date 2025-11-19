@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use litebox::fs::FileSystem as _;
+use litebox::fs::{FileSystem as _, Mode};
 use litebox_platform_multiplex::Platform;
 use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
@@ -201,6 +201,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         } else {
             open_file(&mut in_mem, prog.to_str().unwrap(), last.0);
         }
+        in_mem.with_root_privileges(|fs| {
+            let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+            if let Err(err) = fs.mkdir("/tmp", mode) {
+                match err {
+                    litebox::fs::errors::MkdirError::AlreadyExists => {
+                        fs.chmod("/tmp", mode).expect("Failed to call chmod");
+                    }
+                    _ => panic!(),
+                }
+            }
+        });
 
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
         shim.default_fs(in_mem, tar_ro)
