@@ -167,9 +167,9 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
             }
             woken += 1;
             if woken >= num_to_wake_up.get() {
-                core::ops::ControlFlow::Continue(true)
-            } else {
                 core::ops::ControlFlow::Break(true)
+            } else {
+                core::ops::ControlFlow::Continue(true)
             }
         });
         // Wake the waiters outside the `extract_if` closure to minimize the list's lock hold
