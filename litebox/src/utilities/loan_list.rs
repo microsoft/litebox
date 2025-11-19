@@ -149,7 +149,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> LoanList<Platform, T> {
 
     /// Removes a node from the list, waiting until it is no longer loaned out.
     fn remove_node(&self, node: &Node<EntryData<Platform, T>>) {
-        let wait = loop {
+        loop {
             let v = node
                 .data
                 .state
@@ -167,24 +167,10 @@ impl<Platform: RawSyncPrimitivesProvider, T> LoanList<Platform, T> {
                 )
                 .map(EntryState)
                 .map_err(EntryState);
-            break match v {
+            match v {
                 Err(EntryState::REMOVED) => {
                     // Already removed.
-                    false
-                }
-                Err(EntryState::REMOVED_WAKING) => {
-                    // Already removed, but the remover is still accessing the entry to
-                    // wake us up. Spin until it is done.
-                    loop {
-                        core::hint::spin_loop();
-                        let state =
-                            EntryState(node.data.state.underlying_atomic().load(Ordering::Acquire));
-                        if state != EntryState::REMOVED_WAKING {
-                            assert_eq!(state, EntryState::REMOVED);
-                            break;
-                        }
-                    }
-                    false
+                    return;
                 }
                 Err(EntryState::INSERTED) => {
                     // Try to remove the entry.
@@ -197,22 +183,25 @@ impl<Platform: RawSyncPrimitivesProvider, T> LoanList<Platform, T> {
                     }
                     // Still on the list. Remove it and return.
                     unsafe { list.remove(node) };
-                    false
+                    return;
                 }
-                Ok(EntryState::LOANED) => true,
+                Ok(EntryState::LOANED) | Err(EntryState::REMOVED_WAKING) => break,
                 r => unreachable!("unexpected {r:?}"),
-            };
-        };
+            }
+        }
 
-        if wait {
-            // The entry is still in use. Wait for the remover to finish using it.
-            loop {
-                let _ = node.data.state.block(EntryState::LOANED_OWNER_WAITING.0);
-                let state = EntryState(node.data.state.underlying_atomic().load(Ordering::Acquire));
-                if state == EntryState::REMOVED {
-                    break;
+        // The entry is still in use. Wait for the remover to finish using it.
+        loop {
+            match EntryState(node.data.state.underlying_atomic().load(Ordering::Acquire)) {
+                EntryState::REMOVED => break,
+                s @ EntryState::LOANED_OWNER_WAITING => {
+                    let _ = node.data.state.block(s.0);
                 }
-                assert_eq!(state, EntryState::LOANED_OWNER_WAITING);
+                EntryState::REMOVED_WAKING => {
+                    // Spin until the remover finishes waking us.
+                    core::hint::spin_loop();
+                }
+                state => panic!("invalid state waiting for entry removal: {state:?}"),
             }
         }
     }
