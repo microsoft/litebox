@@ -19,10 +19,6 @@ pub trait EnterShim: Send + Sync {
     ///
     /// FUTURE: use a single per-architecture type for all shims and platforms.
     type ExecutionContext;
-    /// The operation the platform should take after returning from the shim.
-    ///
-    /// FUTURE: use a single per-LiteBox type for all shims and platforms.
-    type ContinueOperation;
 
     /// Initialize a new thread. Must be called by the platform exactly once
     /// before running the thread in the guest for the first time.
@@ -41,13 +37,13 @@ pub trait EnterShim: Send + Sync {
     ///     crate::platform::ThreadProvider::spawn_thread
     /// [`ThreadProvider::current_thread`]:
     ///     crate::platform::ThreadProvider::current_thread
-    fn init(&self, ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation;
+    fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation;
 
     /// Handle a syscall.
     ///
     /// The platform should call this in response to `syscall` on x86_64 and
     /// `int 0x80` on x86.
-    fn syscall(&self, ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation;
+    fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation;
 
     /// Handle a hardware exception.
     ///
@@ -56,7 +52,7 @@ pub trait EnterShim: Send + Sync {
         &self,
         ctx: &mut Self::ExecutionContext,
         info: &ExceptionInfo,
-    ) -> Self::ContinueOperation;
+    ) -> ContinueOperation;
 
     /// Handle an interrupt signaled by
     /// [`ThreadProvider::interrupt_thread`](crate::platform::ThreadProvider::interrupt_thread).
@@ -64,7 +60,16 @@ pub trait EnterShim: Send + Sync {
     /// Note that if another event occurs (e.g., a syscall or exception) while
     /// the thread is interrupted, the platform may just call the corresponding
     /// handler instead of this one.
-    fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation;
+    fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation;
+}
+
+/// The operation to perform after returning from a shim handler
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ContinueOperation {
+    /// Resume execution of the guest.
+    ResumeGuest,
+    /// Exit the current thread.
+    ExitThread,
 }
 
 /// Information about a hardware exception.

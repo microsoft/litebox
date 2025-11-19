@@ -18,9 +18,9 @@ use litebox::platform::page_mgmt::{
     AllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
 use litebox::platform::{ImmediatelyWokenUp, RawMutPointer};
-use litebox::shim::Exception;
-use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
-use litebox_common_linux::{ContinueOperation, PunchthroughSyscall};
+use litebox::shim::{ContinueOperation, Exception};
+use litebox::utils::TruncateExt as _;
+use litebox_common_linux::PunchthroughSyscall;
 
 use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
 use windows_sys::Win32::{
@@ -46,10 +46,7 @@ thread_local! {
 
 /// The registered shim.
 static SHIM: std::sync::OnceLock<
-    &'static dyn litebox::shim::EnterShim<
-        ExecutionContext = litebox_common_linux::PtRegs,
-        ContinueOperation = ContinueOperation,
-    >,
+    &'static dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 > = std::sync::OnceLock::new();
 
 /// The userland Windows platform.
@@ -256,10 +253,7 @@ impl WindowsUserland {
     /// Panics if the function has already been invoked earlier.
     pub fn register_shim(
         &self,
-        shim: &'static dyn litebox::shim::EnterShim<
-            ExecutionContext = litebox_common_linux::PtRegs,
-            ContinueOperation = ContinueOperation,
-        >,
+        shim: &'static dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ) {
         SHIM.set(shim)
             .ok()
@@ -1744,10 +1738,7 @@ unsafe extern "C-unwind" fn interrupt_handler(ctx: &mut litebox_common_linux::Pt
 fn call_shim(
     ctx: &mut litebox_common_linux::PtRegs,
     f: impl FnOnce(
-        &dyn litebox::shim::EnterShim<
-            ContinueOperation = ContinueOperation,
-            ExecutionContext = litebox_common_linux::PtRegs,
-        >,
+        &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
         &mut litebox_common_linux::PtRegs,
         bool,
     ) -> ContinueOperation,
@@ -1760,10 +1751,7 @@ fn call_shim(
     let op = f(shim, ctx, interrupt);
     match op {
         ContinueOperation::ResumeGuest => unsafe { switch_to_guest(ctx) },
-        ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
-            ctx.rax = status.reinterpret_as_unsigned() as usize;
-        }
-        ContinueOperation::RtSigreturn(..) => unreachable!(),
+        ContinueOperation::ExitThread => {}
     }
 }
 

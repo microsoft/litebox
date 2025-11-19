@@ -288,14 +288,16 @@ impl Task {
     }
 
     pub(crate) fn sys_exit(&self, _status: i32) {
-        // Nothing to do yet. The `Task` will be dropped on the way out of the
-        // shim, which will call `self.prepare_for_exit()`.
+        // Set the task to exit. The `Task` will be dropped on the way out of
+        // the shim, which will call `self.prepare_for_exit()`.
+        self.is_exiting.set(true);
     }
 
     pub(crate) fn sys_exit_group(&self, _status: i32) {
         // Tear down occurs similarly to `sys_exit`.
         //
         // TODO: remotely kill other threads.
+        self.is_exiting.set(true);
     }
 }
 
@@ -482,6 +484,8 @@ impl Task {
                         fs: fs.into(),
                         process: self.process.clone(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
+                        pending_sigreturn: false.into(),
+                        is_exiting: false.into(),
                     },
                 }),
             )
@@ -977,7 +981,7 @@ impl Task {
         argv: crate::ConstPtr<crate::ConstPtr<i8>>,
         envp: crate::ConstPtr<crate::ConstPtr<i8>>,
         ctx: &mut litebox_common_linux::PtRegs,
-    ) -> Result<(), Errno> {
+    ) -> Result<usize, Errno> {
         fn copy_vector(
             mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
             _which: &str,
@@ -1057,7 +1061,7 @@ impl Task {
         // TODO: split this operation into pre-unmap and post-unmap parts, and handle failure properly for both cases.
         *ctx = self.load_program(path, argv_vec, envp_vec).unwrap();
 
-        Ok(())
+        Ok(0)
     }
 
     /// Handle syscall `alarm`.
