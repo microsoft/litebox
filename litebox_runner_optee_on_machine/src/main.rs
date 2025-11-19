@@ -5,7 +5,7 @@
 use bootloader::{BootInfo, bootinfo::MemoryRegionType, entry_point};
 use core::panic::PanicInfo;
 use litebox_common_optee::{TeeIdentity, TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned};
-use litebox_platform::{
+use litebox_platform_kernel::{
     arch::{
         enable_extended_states, enable_fsgsbase, enable_smep, gdt, instrs::hlt_loop, interrupts,
     },
@@ -110,7 +110,7 @@ fn run_ta_with_default_commands(session_id: usize, ta_info: &ElfLoadInfo) {
                 func_id as u32,
                 None,
             );
-            unsafe { litebox_platform::run_thread(&mut pt_regs) };
+            unsafe { litebox_platform_kernel::run_thread(&mut pt_regs) };
         }
 
         if func_id == UteeEntryFunc::CloseSession {

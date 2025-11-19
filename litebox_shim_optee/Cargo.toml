@@ -33,7 +33,7 @@ elf_loader = { version = "0.12.0", default-features = false, features = ["rel"] 
 default = ["platform_lvbs"]
 platform_linux_userland = ["litebox_platform_multiplex/platform_linux_userland_with_optee_syscall"]
 platform_lvbs = ["litebox_platform_multiplex/platform_lvbs_with_optee_syscall"]
-platform = ["litebox_platform_multiplex/platform_with_optee_syscall"]
+platform_kernel = ["litebox_platform_multiplex/platform_kernel_with_optee_syscall"]
 
 [lints]
 workspace = true

@@ -170,7 +170,7 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> usize {
                 }
             };
 
-            let host_bp = unsafe { crate::get_host_bp() };
+            let host_bp = crate::get_host_bp();
             debug_serial_println!(
                 "Exiting from run_thread: rbp={:#x}, ret={:#x}",
                 host_bp,

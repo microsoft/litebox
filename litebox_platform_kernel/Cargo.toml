@@ -1,5 +1,5 @@
 [package]
-name = "litebox_platform"
+name = "litebox_platform_kernel"
 version = "0.1.0"
 edition = "2024"
 

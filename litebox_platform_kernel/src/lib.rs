@@ -476,9 +476,6 @@ unsafe extern "C" fn switch_to_guest_kernel_mode(ctx: &litebox_common_linux::PtR
     core::arch::naked_asm!(
         // Restore guest context from ctx.
         "mov rsp, rdi",
-        // Switch to the guest fsbase
-        "mov rdx, fs:guest_fsbase@tpoff",
-        "wrfsbase rdx",
         "pop r15",
         "pop r14",
         "pop r13",
@@ -503,9 +500,17 @@ unsafe extern "C" fn switch_to_guest_kernel_mode(ctx: &litebox_common_linux::PtR
     );
 }
 
-#[unsafe(naked)]
-pub(crate) unsafe extern "C" fn get_host_bp() -> u64 {
-    core::arch::naked_asm!("mov rax, gs:host_bp@tpoff", "ret");
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn get_host_bp() -> usize {
+    let value: usize;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, gs:host_bp@tpoff",
+            out(reg) value,
+            options(nostack, preserves_flags)
+        );
+    }
+    value
 }
 
 /// Switches to the provided guest context with the user mode.
@@ -521,9 +526,6 @@ unsafe extern "C" fn switch_to_guest(_ctx: &litebox_common_linux::PtRegs) -> ! {
         core::arch::asm!(
             // Restore guest context from ctx.
             "mov rsp, rdi",
-            // Switch to the guest fsbase
-            "mov rdx, fs:guest_fsbase@tpoff",
-            "wrfsbase rdx",
             "pop r15",
             "pop r14",
             "pop r13",
