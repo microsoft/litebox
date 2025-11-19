@@ -4,7 +4,6 @@
 //! * Parsing and mapping ELF binaries as the Linux kernel would when starting a
 //!   new process, including both static and dynamic ELF binaries.
 //! * Loading LiteBox trampoline code for syscall handling.
-//! * Performing basic runtime relocations, as needed for LiteBox OPTEE TAs.
 
 use alloc::vec::Vec;
 use elf::{file::FileHeader, parse::ParseAt};
@@ -143,8 +142,6 @@ pub enum ElfLoadError<E> {
     InvalidTrampolineVersion,
     #[error(transparent)]
     Fault(#[from] Fault),
-    #[error("failed to relocate ELF")]
-    RelocationError(#[from] RelocationError),
 }
 
 impl<E: Into<Errno>> From<ElfLoadError<E>> for Errno {
@@ -155,25 +152,6 @@ impl<E: Into<Errno>> From<ElfLoadError<E>> for Errno {
             }
             ElfLoadError::Fault(Fault) => Errno::EFAULT,
             ElfLoadError::Map(err) => err.into(),
-            ElfLoadError::RelocationError(err) => err.into(),
-        }
-    }
-}
-
-/// Errors that can occur when applying relocations.
-#[derive(Debug, Error)]
-pub enum RelocationError {
-    #[error("Unsupported relocation type")]
-    UnsupportedType,
-    #[error(transparent)]
-    Fault(#[from] Fault),
-}
-
-impl From<RelocationError> for Errno {
-    fn from(value: RelocationError) -> Self {
-        match value {
-            RelocationError::UnsupportedType => Errno::EINVAL,
-            RelocationError::Fault(Fault) => Errno::EFAULT,
         }
     }
 }
@@ -336,30 +314,8 @@ impl ElfParsedFile {
     /// Load the ELF file into memory.
     pub fn load<M: MapMemory>(
         &self,
-        map: &mut M,
-        mem: &mut impl AccessMemory,
-    ) -> Result<MappingInfo, ElfLoadError<M::Error>> {
-        self.load_inner(map, mem, false)
-    }
-
-    /// Load the ELF file into memory and apply relocations.
-    #[cfg(target_arch = "x86_64")]
-    pub fn load_and_relocate<M: MapMemory>(
-        &self,
-        map: &mut M,
-        mem: &mut impl AccessMemory,
-    ) -> Result<MappingInfo, ElfLoadError<M::Error>> {
-        let info = self.load_inner(map, mem, true)?;
-        self.relocate(mem, &info)?;
-        self.apply_protections(map, &info)?;
-        Ok(info)
-    }
-
-    fn load_inner<M: MapMemory>(
-        &self,
         mapper: &mut M,
         mem: &mut impl AccessMemory,
-        override_protections: bool,
     ) -> Result<MappingInfo, ElfLoadError<M::Error>> {
         let base_addr = if self.header.e_type == elf::abi::ET_DYN {
             // Find an aligned load address that will fit all PT_LOAD segments.
@@ -392,18 +348,6 @@ impl ElfParsedFile {
             0
         };
 
-        let prot = if override_protections {
-            // Map read-write initially; protections will be applied later,
-            // after relocations.
-            Some(Protection {
-                read: true,
-                write: true,
-                execute: false,
-            })
-        } else {
-            None
-        };
-
         let mut brk = 0;
         let mut phdrs_addr = 0;
         for ph in self.pt_loads() {
@@ -432,11 +376,11 @@ impl ElfParsedFile {
                         load_start,
                         file_end - load_start,
                         offset,
-                        &prot.unwrap_or(Protection {
+                        &Protection {
                             read: true,
                             write: (ph.p_flags & elf::abi::PF_W) != 0,
                             execute: (ph.p_flags & elf::abi::PF_X) != 0,
-                        }),
+                        },
                     )
                     .map_err(ElfLoadError::Map)?;
                 // Zero out the remaining part of the last page.
@@ -460,11 +404,11 @@ impl ElfParsedFile {
                     .map_zero(
                         file_end,
                         load_end - file_end,
-                        &prot.unwrap_or(Protection {
+                        &Protection {
                             read: true,
                             write: (ph.p_flags & elf::abi::PF_W) != 0,
                             execute: false,
-                        }),
+                        },
                     )
                     .map_err(ElfLoadError::Map)?;
             }
@@ -494,107 +438,6 @@ impl ElfParsedFile {
         }
 
         Ok(info)
-    }
-
-    /// Re-apply the correct memory protections for the mapped segments.
-    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
-    fn apply_protections<M: MapMemory>(
-        &self,
-        map: &mut M,
-        info: &MappingInfo,
-    ) -> Result<(), ElfLoadError<M::Error>> {
-        for ph in self.pt_loads() {
-            let p_vaddr: usize = ph.p_vaddr.truncate();
-            let p_memsz: usize = ph.p_memsz.truncate();
-            let adjusted_vaddr = info.base_addr + p_vaddr;
-            let map_start = page_align_down(adjusted_vaddr);
-            let map_end = page_align_up(adjusted_vaddr + p_memsz);
-            if map_end <= map_start {
-                continue;
-            }
-            map.protect(
-                map_start,
-                map_end - map_start,
-                &Protection {
-                    read: true,
-                    write: (ph.p_flags & elf::abi::PF_W) != 0,
-                    execute: (ph.p_flags & elf::abi::PF_X) != 0,
-                },
-            )
-            .map_err(ElfLoadError::Map)?;
-        }
-        Ok(())
-    }
-
-    /// Apply relocations to the loaded ELF file.
-    #[cfg(target_arch = "x86_64")]
-    fn relocate<M: AccessMemory>(
-        &self,
-        mem: &mut M,
-        info: &MappingInfo,
-    ) -> Result<(), RelocationError> {
-        fn read<M: AccessMemory, T: zerocopy::IntoBytes + zerocopy::FromBytes>(
-            mem: &mut M,
-            address: usize,
-        ) -> Result<T, Fault> {
-            let mut buf = T::new_zeroed();
-            mem.read(address, buf.as_mut_bytes())?;
-            Ok(buf)
-        }
-
-        // Find the dynamic section in the program headers.
-        let dynamic = {
-            let Some(ph) = self
-                .program_headers()
-                .find(|ph| ph.p_type == elf::abi::PT_DYNAMIC)
-            else {
-                // No dynamic section; nothing to relocate.
-                return Ok(());
-            };
-            let vaddr: usize = ph.p_vaddr.truncate();
-            info.base_addr + vaddr
-        };
-
-        // Find the RELA relocation entries.
-        let rela = {
-            let mut offset = 0;
-            let mut rela_offset = None;
-            let mut rela_count = None;
-            loop {
-                let [tag, val]: [usize; 2] = read(mem, dynamic + offset)?;
-                offset += 2 * size_of::<usize>();
-                match tag.reinterpret_as_signed() as i64 {
-                    elf::abi::DT_RELA => rela_offset = Some(val),
-                    elf::abi::DT_RELACOUNT => rela_count = Some(val),
-                    elf::abi::DT_NULL => break,
-                    _ => {}
-                }
-            }
-            rela_offset.zip(rela_count)
-        };
-
-        let Some((offset, count)) = rela else {
-            return Ok(());
-        };
-        for i in 0..count {
-            const R_RELATIVE: u32 = if cfg!(target_arch = "x86_64") {
-                elf::abi::R_X86_64_RELATIVE
-            } else {
-                panic!("unsupported arch")
-            };
-
-            let [r_offset, r_info, r_addend]: [usize; 3] = read(
-                mem,
-                info.base_addr + offset + i * size_of::<elf::relocation::Elf64_Rela>(),
-            )?;
-            let r_type: u32 = r_info.truncate();
-            if r_type != R_RELATIVE {
-                return Err(RelocationError::UnsupportedType);
-            }
-            let relocated_value = info.base_addr.wrapping_add(r_addend);
-            mem.write(info.base_addr + r_offset, &relocated_value.to_ne_bytes())?;
-        }
-        Ok(())
     }
 
     /// Load the LiteBox trampoline into memory.
