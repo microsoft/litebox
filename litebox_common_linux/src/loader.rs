@@ -360,6 +360,11 @@ impl ElfParsedFile {
             {
                 return Err(ElfLoadError::InvalidProgramHeader);
             }
+            let prot = Protection {
+                read: true,
+                write: (ph.p_flags & elf::abi::PF_W) != 0,
+                execute: (ph.p_flags & elf::abi::PF_X) != 0,
+            };
             let adjusted_vaddr = base_addr + p_vaddr;
             let load_start = page_align_down(adjusted_vaddr);
             let file_end = page_align_up(adjusted_vaddr + p_filesz);
@@ -372,16 +377,7 @@ impl ElfParsedFile {
                     .p_offset
                     .wrapping_sub((adjusted_vaddr - load_start) as u64);
                 mapper
-                    .map_file(
-                        load_start,
-                        file_end - load_start,
-                        offset,
-                        &Protection {
-                            read: true,
-                            write: (ph.p_flags & elf::abi::PF_W) != 0,
-                            execute: (ph.p_flags & elf::abi::PF_X) != 0,
-                        },
-                    )
+                    .map_file(load_start, file_end - load_start, offset, &prot)
                     .map_err(ElfLoadError::Map)?;
                 // Zero out the remaining part of the last page.
                 //
@@ -401,15 +397,7 @@ impl ElfParsedFile {
             if load_end > file_end {
                 // Map the zero-filled portion.
                 mapper
-                    .map_zero(
-                        file_end,
-                        load_end - file_end,
-                        &Protection {
-                            read: true,
-                            write: (ph.p_flags & elf::abi::PF_W) != 0,
-                            execute: false,
-                        },
-                    )
+                    .map_zero(file_end, load_end - file_end, &prot)
                     .map_err(ElfLoadError::Map)?;
             }
 
