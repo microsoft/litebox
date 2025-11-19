@@ -1,16 +1,16 @@
 //! A thread-safe intrusive linked list with loan semantics.
 //!
-//! This module provides [`LoanList`], a specialized linked list data structure with
-//! two key properties:
+//! This module provides [`LoanList`], a specialized linked list data structure
+//! with two key properties:
 //!
-//! 1. **Pinned, intrusive entries**: List entries are allocated once by the caller
-//!    (potentially on the stack) and must remain pinned. Entries can be freely
-//!    inserted and removed without reallocation.
+//! 1. **Pinned, intrusive entries**: List entries are allocated once by the
+//!    caller (potentially on the stack) and must remain pinned. Entries can be
+//!    freely inserted and removed without reallocation.
 //!
 //! 2. **Loan semantics**: Entries can be removed from the list by a third party
-//!    (not the owner) via [`LoanList::drain`]. The remover gets temporary shared
-//!    access to the entry (a "loan"), and if the owner tries to remove the entry
-//!    concurrently, they will block until the loan completes.
+//!    (not the owner) via [`LoanList::extract_if`]. The remover gets temporary
+//!    shared access to the entry (a "loan"), and if the owner tries to remove
+//!    the entry concurrently, they will block until the loan completes.
 //!
 //! This design is particularly useful for managing wait queues.
 //!
@@ -54,13 +54,13 @@ pub struct LoanList<Platform: RawSyncPrimitivesProvider, T>(
 
 /// A pinned entry that can be inserted into a [`LoanList`].
 ///
-/// The entry stores a value of type `T` and can be inserted onto and removed from
-/// a [`LoanList`]. The entry must remain pinned while it is on the list, and the
-/// list must outlive the entry.
+/// The entry stores a value of type `T` and can be inserted onto and removed
+/// from a [`LoanList`]. The entry must remain pinned while it is on the list,
+/// and the list must outlive the entry.
 ///
 /// When dropped, the entry automatically removes itself from the list if it is
-/// still inserted. If the entry is currently on loan (via [`LoanList::drain`]),
-/// the drop will block until the loan completes.
+/// still inserted. If the entry is currently on loan (via
+/// [`LoanList::extract_if`]), the drop will block until the loan completes.
 pub struct LoanListEntry<'a, Platform: RawSyncPrimitivesProvider, T> {
     node: Node<EntryData<Platform, T>>,
     list: Option<&'a LoanList<Platform, T>>,
@@ -102,9 +102,9 @@ impl<'a, Platform: RawSyncPrimitivesProvider, T> LoanListEntry<'a, Platform, T> 
 
     /// Removes the entry from its list, if it is inserted.
     ///
-    /// If the entry is currently on loan to a caller of [`LoanList::drain`],
-    /// this method will block until the loan completes and the entry is fully
-    /// returned.
+    /// If the entry is currently on loan to a caller of
+    /// [`LoanList::extract_if`], this method will block until the loan
+    /// completes and the entry is fully returned.
     ///
     /// If the entry is not currently inserted, this method does nothing.
     #[cfg_attr(not(test), expect(dead_code))]
@@ -218,7 +218,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> LoanList<Platform, T> {
     /// the returned iterator while still logically owned by their original
     /// [`LoanListEntry`]. If an entry owner tries to remove their entry while
     /// it is on loan, they will block until the loan completes (i.e., until the
-    /// corresponding [`RemovedListEntry`] is dropped).
+    /// corresponding [`LoanedEntry`] is dropped).
     ///
     /// The list lock is released after the entries are selected for removal,
     /// allowing concurrent insertions and removals while the caller examines
