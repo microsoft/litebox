@@ -124,12 +124,6 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
 }
 
-pub enum ContinueOperation {
-    ResumeGuest,
-    ExitThread(usize),
-    ExitProcess(usize),
-}
-
 // `litebox_common_optee` does use error codes for OP-TEE-like world (TAs) and Linux-like world (the LVBS platform).
 // for the below syscall handling, we use Linux error codes (i.e., `Errno`) because any errors will be returned
 // to the LVBS platform or runner.
