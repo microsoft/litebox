@@ -417,7 +417,7 @@ pub unsafe fn run_thread(ctx: &mut litebox_common_linux::PtRegs) {
 
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
-unsafe extern "C-unwind" fn run_thread_inner(ctx: &mut litebox_common_linux::PtRegs) {
+unsafe extern "C" fn run_thread_inner(ctx: &mut litebox_common_linux::PtRegs) {
     core::arch::naked_asm!(
         "push rbp",
         "mov rbp, rsp",
@@ -574,7 +574,10 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LiteBoxKernel {
     }
 
     unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
-        let tls = per_cpu_variables::with_per_cpu_variables_mut(|pcv| pcv.tls);
-        core::mem::replace(&mut tls.as_mut_ptr::<()>(), value.cast()).cast()
+        per_cpu_variables::with_per_cpu_variables_mut(|pcv| {
+            let old = pcv.tls;
+            pcv.tls = x86_64::VirtAddr::new(value as u64);
+            old.as_u64() as *mut ()
+        })
     }
 }

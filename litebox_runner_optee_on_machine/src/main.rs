@@ -85,36 +85,65 @@ fn kernel_main(bootinfo: &'static BootInfo) -> ! {
 /// it can be loaded and run. Note that an OP-TEE TA does nothing without
 /// a client invoking commands on it.
 fn run_ta_with_default_commands(session_id: usize, ta_info: &ElfLoadInfo) {
-    for func_id in [UteeEntryFunc::OpenSession, UteeEntryFunc::CloseSession] {
-        let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
+    for func_id in [
+        UteeEntryFunc::OpenSession,
+        UteeEntryFunc::InvokeCommand,
+        UteeEntryFunc::CloseSession,
+    ] {
+        match func_id {
+            UteeEntryFunc::OpenSession => {
+                let _litebox = litebox_shim_optee::init_session(
+                    &TeeUuid::default(),
+                    &TeeIdentity {
+                        login: TeeLogin::User,
+                        uuid: TeeUuid::default(),
+                    },
+                );
+                let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
 
-        if func_id == UteeEntryFunc::OpenSession {
-            let _litebox = litebox_shim_optee::init_session(
-                &TeeUuid::default(),
-                &TeeIdentity {
-                    login: TeeLogin::User,
-                    uuid: TeeUuid::default(),
-                },
-            );
+                // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
+                // loaded binary and heap. In that sense, we can create (and destroy) a stack
+                // for each command freely.
+                let stack = litebox_shim_optee::loader::init_stack(
+                    Some(ta_info.stack_base),
+                    params.as_slice(),
+                )
+                .expect("Failed to initialize stack with parameters");
+                let mut pt_regs = litebox_shim_optee::loader::prepare_registers(
+                    ta_info,
+                    &stack,
+                    u32::try_from(session_id).unwrap(),
+                    func_id as u32,
+                    None,
+                );
+                unsafe { litebox_platform_kernel::run_thread(&mut pt_regs) };
+            }
+            UteeEntryFunc::InvokeCommand => {
+                let mut params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
+                params[0] = UteeParamOwned::ValueInout {
+                    value_a: 200,
+                    value_b: 0,
+                    out_address: None,
+                };
 
-            // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
-            // loaded binary and heap. In that sense, we can create (and destroy) a stack
-            // for each command freely.
-            let stack =
-                litebox_shim_optee::loader::init_stack(Some(ta_info.stack_base), params.as_slice())
-                    .expect("Failed to initialize stack with parameters");
-            let mut pt_regs = litebox_shim_optee::loader::prepare_registers(
-                ta_info,
-                &stack,
-                u32::try_from(session_id).unwrap(),
-                func_id as u32,
-                None,
-            );
-            unsafe { litebox_platform_kernel::run_thread(&mut pt_regs) };
-        }
-
-        if func_id == UteeEntryFunc::CloseSession {
-            // litebox_shim_optee::deinit_session();
+                let stack = litebox_shim_optee::loader::init_stack(
+                    Some(ta_info.stack_base),
+                    params.as_slice(),
+                )
+                .expect("Failed to initialize stack with parameters");
+                let mut pt_regs = litebox_shim_optee::loader::prepare_registers(
+                    ta_info,
+                    &stack,
+                    u32::try_from(session_id).unwrap(),
+                    func_id as u32,
+                    Some(1),
+                );
+                unsafe { litebox_platform_kernel::run_thread(&mut pt_regs) };
+            }
+            UteeEntryFunc::CloseSession => {
+                litebox_shim_optee::deinit_session();
+            }
+            UteeEntryFunc::Unknown => panic!("BUG: Unsupported function ID"),
         }
     }
 }
@@ -125,6 +154,7 @@ unsafe fn active_level_4_table_addr() -> x86_64::PhysAddr {
     level_4_table_frame.start_address()
 }
 
+// TODO: support loading other TAs (dynamically)
 const TA_BINARY: &[u8] =
     include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/hello-ta.elf");
 

@@ -74,8 +74,11 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LvbsLinuxKernel {
     }
 
     unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
-        let tls = with_per_cpu_variables_mut(|pcv| pcv.tls);
-        core::mem::replace(&mut tls.as_mut_ptr::<()>(), value.cast()).cast()
+        with_per_cpu_variables_mut(|pcv| {
+            let old = pcv.tls;
+            pcv.tls = x86_64::VirtAddr::new(value as u64);
+            old.as_u64() as *mut ()
+        })
     }
 }
 
