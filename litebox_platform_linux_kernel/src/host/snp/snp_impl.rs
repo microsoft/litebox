@@ -507,3 +507,17 @@ impl HostInterface for HostSnpInterface {
         unreachable!("Should not return to the caller after terminating the process");
     }
 }
+
+impl litebox::platform::CrngProvider for SnpLinuxKernel {
+    fn fill_bytes_crng(&self, buf: &mut [u8]) {
+        // FIXME: call into the trusted host to get random bytes.
+        static RANDOM: spin::mutex::SpinMutex<litebox::utils::rng::FastRng> =
+            spin::mutex::SpinMutex::new(litebox::utils::rng::FastRng::new_from_seed(
+                core::num::NonZeroU64::new(0x4d595df4d0f33173).unwrap(),
+            ));
+        let mut random = RANDOM.lock();
+        for b in buf.chunks_mut(8) {
+            b.copy_from_slice(&random.next_u64().to_ne_bytes()[..b.len()]);
+        }
+    }
+}
