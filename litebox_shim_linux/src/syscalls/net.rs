@@ -510,7 +510,7 @@ pub(crate) fn sendto(
 
     let timeout = with_socket_options(fd, |opt| opt.send_timeout);
     let ret = cx
-        .with_maybe_timeout(timeout)
+        .with_timeout(timeout)
         .wait_on_events(
             get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT),
             Events::OUT,
@@ -573,7 +573,7 @@ pub(crate) fn receive(
     }
 
     let timeout = with_socket_options(fd, |opt| opt.recv_timeout);
-    cx.with_maybe_timeout(timeout)
+    cx.with_timeout(timeout)
         .wait_on_events(
             get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(ReceiveFlags::DONTWAIT),
             Events::IN,

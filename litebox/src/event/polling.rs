@@ -29,7 +29,7 @@ pub enum TryOpError<E> {
     #[error("operation should be retried")]
     TryAgain,
     #[error("wait error")]
-    WaitError(WaitError),
+    WaitError(#[source] WaitError),
     #[error(transparent)]
     Other(E),
 }
@@ -40,9 +40,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'_, Platfor
     ///
     /// If `nonblock` is true, returns `TryAgain` instead of waiting.
     ///
-    /// If `try_op` returns `TryAgain`, the thread will be woken try again when
-    /// the observer, registered via the call to `register_observer`, is called
-    /// with events that match the given `events` filter (or an event in
+    /// If `try_op` returns `TryAgain`, the thread will be woken to try again
+    /// when the observer, registered via the call to `register_observer`, is
+    /// called with events that match the given `events` filter (or an event in
     /// `Events::ALWAYS_POLLED`).
     pub fn wait_on_events<R, E>(
         &self,
@@ -95,9 +95,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     ///
     /// If `nonblock` is true, returns `TryAgain` instead of waiting.
     ///
-    /// If `try_op` returns `TryAgain`, the thread will be woken try again when
-    /// [`notify_observers`](Self::notify_observers) is called with events that
-    /// match the given `events` filter (or an event in `Events::ALWAYS_POLLED`).
+    /// If `try_op` returns `TryAgain`, the thread will be woken to try again
+    /// when [`notify_observers`](Self::notify_observers) is called with events
+    /// that match the given `events` filter (or an event in
+    /// `Events::ALWAYS_POLLED`).
     pub fn wait<R, E>(
         &self,
         cx: &WaitContext<'_, Platform>,

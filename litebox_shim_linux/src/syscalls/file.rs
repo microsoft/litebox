@@ -1389,7 +1389,7 @@ impl Task {
                 _ => return Err(Errno::EBADF),
             }
         };
-        match epoll_file.wait(&self.wait_cx().with_maybe_timeout(timeout), maxevents) {
+        match epoll_file.wait(&self.wait_cx().with_timeout(timeout), maxevents) {
             Ok(epoll_events) => {
                 if !epoll_events.is_empty() {
                     events
@@ -1434,10 +1434,7 @@ impl Task {
             set.add_fd(fd.fd, events);
         }
 
-        match set.wait(
-            &self.wait_cx().with_maybe_timeout(timeout),
-            &self.files.borrow(),
-        ) {
+        match set.wait(&self.wait_cx().with_timeout(timeout), &self.files.borrow()) {
             Ok(()) => {}
             Err(WaitError::Interrupted) => {
                 // TODO: update the remaining time.
@@ -1501,10 +1498,7 @@ impl Task {
             }
         }
 
-        match set.wait(
-            &self.wait_cx().with_maybe_timeout(timeout),
-            &self.files.borrow(),
-        ) {
+        match set.wait(&self.wait_cx().with_timeout(timeout), &self.files.borrow()) {
             Ok(()) => {}
             Err(WaitError::Interrupted) => {
                 // TODO: update the remaining time.

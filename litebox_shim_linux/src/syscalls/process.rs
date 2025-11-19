@@ -783,11 +783,10 @@ impl Task {
             if matches!(clockid, litebox_common_linux::ClockId::Monotonic) {
                 // No need to compute the current time since the offset from the
                 // request to `Instant` is known.
-                wait_cx.with_maybe_deadline(crate::boot_time().checked_add(request))
+                wait_cx.with_deadline(crate::boot_time().checked_add(request))
             } else {
-                wait_cx.with_maybe_timeout(
-                    request.checked_sub(self.gettime_as_duration(platform, clockid)?),
-                )
+                wait_cx
+                    .with_timeout(request.checked_sub(self.gettime_as_duration(platform, clockid)?))
             }
         } else {
             // Relative. Treat all clocks the same. TODO: handle the different clocks differently.

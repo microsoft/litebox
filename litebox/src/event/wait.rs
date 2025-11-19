@@ -324,27 +324,16 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
 
     /// Returns a new context that has a deadline after the given duration.
     ///
-    /// If the existing context already has an earlier deadline, then this just
-    /// clones the context.
-    #[must_use]
-    pub fn with_timeout(&self, timeout: core::time::Duration) -> Self {
-        // If this overflows, treat that as no deadline.
-        if let Some(deadline) = self.waker.0.platform.now().checked_add(timeout) {
-            self.with_deadline(deadline)
-        } else {
-            Self { ..*self }
-        }
-    }
-
-    /// Returns a new context that has a deadline after the given duration, if
-    /// one is provided.
-    ///
     /// If the existing context already has an earlier deadline or if no timeout
     /// is provided, then this just clones the context.
     #[must_use]
-    pub fn with_maybe_timeout(&self, timeout: Option<core::time::Duration>) -> Self {
-        if let Some(dur) = timeout {
-            self.with_timeout(dur)
+    pub fn with_timeout(&self, timeout: impl Into<Option<core::time::Duration>>) -> Self {
+        // If this overflows, treat that as no deadline.
+        if let Some(deadline) = timeout
+            .into()
+            .and_then(|timeout| self.waker.0.platform.now().checked_add(timeout))
+        {
+            self.with_deadline(deadline)
         } else {
             Self { ..*self }
         }
@@ -355,25 +344,14 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     /// If the existing context already has an earlier deadline, then this just
     /// clones the context.
     #[must_use]
-    pub fn with_deadline(&self, deadline: Platform::Instant) -> Self {
+    pub fn with_deadline(&self, deadline: impl Into<Option<Platform::Instant>>) -> Self {
         let mut this = Self { ..*self };
-        if self.deadline.is_none_or(|d| deadline < d) {
+        if let Some(deadline) = deadline.into()
+            && self.deadline.is_none_or(|d| deadline < d)
+        {
             this.deadline = Some(deadline);
         }
         this
-    }
-
-    /// Returns a new context that has the given deadline, if one is provided.
-    ///
-    /// If the existing context already has an earlier deadline or if no deadline
-    /// is provided, then this just clones the context.
-    #[must_use]
-    pub fn with_maybe_deadline(&self, deadline: Option<Platform::Instant>) -> Self {
-        if let Some(d) = deadline {
-            self.with_deadline(d)
-        } else {
-            Self { ..*self }
-        }
     }
 
     /// Returns the deadline for this wait context, if any.
@@ -451,9 +429,9 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         self.wait_until(|| false).unwrap_err()
     }
 
-    /// Waits until `f` returns `true`.
+    /// Waits until `ready` returns `true`.
     ///
-    /// `f` is called once before the thread sleeps and then again each time the
+    /// `ready` is called once before the thread sleeps and then again each time the
     /// thread is woken up. The caller must arrange for wakeups at the
     /// appropriate time. This can be done by a call to [`Waker::wake`] or
     /// [`ThreadHandle::interrupt`].
@@ -464,11 +442,11 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     ///
     /// # Panics
     /// Panics if the thread is not currently in the running state, either
-    /// because `f` calls `wait_until` recursively, or  because
+    /// because `ready` calls `wait_until` recursively, or  because
     /// [`prepare_to_run_guest`](WaitState::prepare_to_run_guest) was called
     /// without a subsequent call to
     /// [`finish_running_guest`](WaitState::finish_running_guest).
-    pub fn wait_until(&self, mut f: impl FnMut() -> bool) -> Result<(), WaitError> {
+    pub fn wait_until(&self, mut ready: impl FnMut() -> bool) -> Result<(), WaitError> {
         assert_eq!(
             self.waker.0.state_for_assert(),
             ThreadState::RUNNING_IN_HOST
@@ -476,7 +454,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         let _end_wait = crate::utils::defer(|| self.end_wait());
         loop {
             self.start_wait();
-            if f() {
+            if ready() {
                 break Ok(());
             }
             self.commit_wait()?;
