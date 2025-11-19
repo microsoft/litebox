@@ -1216,7 +1216,7 @@ where
                     socket.state() != tcp::State::Closed
                 });
                 // Find a socket that has progressed further in its TCP state machine, by finding a
-                // socket in a established state
+                // socket in an established state
                 let Some(position) = server_socket.socket_set_handles.iter().position(|&h| {
                     let socket: &tcp::Socket = self.socket_set.get(h);
                     socket.state() == tcp::State::Established
