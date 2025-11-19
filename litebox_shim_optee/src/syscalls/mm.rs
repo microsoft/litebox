@@ -83,6 +83,7 @@ pub(crate) fn sys_mmap(
 }
 
 /// Handle syscall `munmap`
+#[expect(dead_code)]
 pub(crate) fn sys_munmap(addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
     let pm = litebox_page_manager();
     litebox_common_linux::mm::sys_munmap(pm, addr, len)
