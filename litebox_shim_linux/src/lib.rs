@@ -1348,7 +1348,7 @@ struct Task {
     fs: RefCell<Arc<syscalls::file::FsState>>,
     /// File descriptors. `RefCell` to support `unshare` in the future.
     files: RefCell<Arc<syscalls::file::FilesState>>,
-    /// If true, call the sigreturn punchline instead of returning to user mode.
+    /// If true, call the sigreturn punchthrough instead of returning to user mode.
     /// TODO: remove once signals are handled internally in the shim.
     pending_sigreturn: Cell<bool>,
     /// If true, exit the thread instead of returning to user mode.
