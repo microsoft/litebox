@@ -1,6 +1,7 @@
 use crate::debug_serial_println;
 use crate::per_cpu_variables::with_per_cpu_variables;
 use core::arch::naked_asm;
+use litebox::shim::ContinueOperation;
 use litebox_common_linux::PtRegs;
 use litebox_common_optee::SyscallContext;
 use x86_64::{
@@ -34,24 +35,8 @@ use x86_64::{
 // r11: userspace rflags
 // Note. rsp should point to the userspace stack before calling `sysretq`
 
-cfg_if::cfg_if! {
-    if #[cfg(feature = "linux_syscall")] {
-        use litebox_common_linux::ContinueOperation;
-        pub type SyscallReturnType = ContinueOperation;
-    } else if #[cfg(feature = "optee_syscall")] {
-        use litebox_common_optee::ContinueOperation;
-        pub type SyscallReturnType = ContinueOperation;
-    } else {
-        compile_error!(r##"No syscall handler specified."##);
-    }
-}
-
-static SHIM: spin::Once<
-    &'static dyn litebox::shim::EnterShim<
-        ExecutionContext = PtRegs,
-        ContinueOperation = ContinueOperation,
-    >,
-> = spin::Once::new();
+static SHIM: spin::Once<&'static dyn litebox::shim::EnterShim<ExecutionContext = PtRegs>> =
+    spin::Once::new();
 
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug)]
@@ -159,22 +144,12 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> usize {
     // call the syscall handler passed down from the shim
     match shim.syscall(&mut ctx) {
         ContinueOperation::ResumeGuest => ctx.rax,
-        ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
-            cfg_if::cfg_if! {
-                if #[cfg(feature = "linux_syscall")] {
-                    let ret = status.cast_unsigned() as usize;
-                } else if #[cfg(feature = "optee_syscall")] {
-                    let ret = status;
-                } else {
-                    compile_error!(r##"No syscall handler specified."##);
-                }
-            };
-
+        ContinueOperation::ExitThread => {
             let host_bp = crate::get_host_bp();
             debug_serial_println!(
                 "Exiting from run_thread: rbp={:#x}, ret={:#x}",
                 host_bp,
-                ret
+                ctx.rax,
             );
 
             unsafe {
@@ -189,14 +164,12 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> usize {
                     "pop rbx",
                     "pop rbp",
                     "ret",
-                    ret = in(reg) ret,
+                    ret = in(reg) ctx.rax,
                     host_bp = in(reg) host_bp,
                     options(nostack, noreturn, preserves_flags),
                 );
             }
         }
-        #[cfg(feature = "linux_syscall")]
-        ContinueOperation::RtSigreturn(..) => unreachable!(),
     }
 }
 
@@ -236,12 +209,7 @@ const STACK_ALIGNMENT: isize = -16;
 /// # Panics
 /// Panics if GDT is not initialized for the current core.
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn init(
-    shim: &'static dyn litebox::shim::EnterShim<
-        ExecutionContext = PtRegs,
-        ContinueOperation = ContinueOperation,
-    >,
-) {
+pub(crate) fn init(shim: &'static dyn litebox::shim::EnterShim<ExecutionContext = PtRegs>) {
     SHIM.call_once(|| shim);
 
     // enable 64-bit syscall/sysret
