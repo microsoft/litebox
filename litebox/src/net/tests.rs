@@ -25,7 +25,13 @@ fn bidi_tcp_comms(mut network: Network<MockPlatform>, comms: fn(&mut Network<Moc
     let client_fd = network
         .socket(Protocol::Tcp)
         .expect("Failed to create TCP socket");
-    let _ = network.connect(&client_fd, &listen_addr, false);
+    let err = network
+        .connect(&client_fd, &listen_addr, false)
+        .unwrap_err();
+    assert!(
+        matches!(err, ConnectError::InProgress),
+        "Expected InProgress error, got {err:?}",
+    );
 
     comms(&mut network);
 
