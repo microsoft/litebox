@@ -304,12 +304,6 @@ struct EntryData<Platform: RawSyncPrimitivesProvider, T> {
     value: T,
 }
 
-impl<Platform: RawSyncPrimitivesProvider, T> EntryData<Platform, T> {
-    fn is_fully_removed(&self) -> bool {
-        EntryState(self.state.underlying_atomic().load(Ordering::Acquire)) == EntryState::REMOVED
-    }
-}
-
 #[derive(Copy, Clone, PartialEq, Eq)]
 struct EntryState(u32);
 
