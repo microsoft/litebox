@@ -170,8 +170,7 @@ pub extern "C" fn sandbox_task_exit() {
 #[unsafe(no_mangle)]
 pub extern "C" fn do_syscall_64(pt_regs: &mut litebox_common_linux::PtRegs) {
     match litebox_shim_linux::LinuxShimEntrypoints.syscall(pt_regs) {
-        ContinueOperation::ResumeGuest => {}
-        ContinueOperation::ExitThread => {}
+        ContinueOperation::ResumeGuest | ContinueOperation::ExitThread => {}
     }
 }
 
