@@ -166,7 +166,6 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
                 "push r12",
                 "push r13",
                 "push r14",
-                "swapgs",
                 "iretq",
                 in("r10") ds_idx, in("r11") rsp.as_u64(), in("r12") rflags.bits(),
                 in("r13") cs_idx, in("r14") rip.as_u64(),

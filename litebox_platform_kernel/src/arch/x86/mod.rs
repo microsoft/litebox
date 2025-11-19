@@ -112,3 +112,13 @@ pub fn disable_smap() {
         x86_64::registers::control::Cr4::write(flags);
     }
 }
+
+#[inline]
+pub fn write_kernel_gsbase_msr(addr: VirtAddr) {
+    x86_64::registers::model_specific::KernelGsBase::write(addr);
+}
+
+#[inline]
+pub fn write_user_gsbase_msr(addr: VirtAddr) {
+    x86_64::registers::model_specific::GsBase::write(addr);
+}

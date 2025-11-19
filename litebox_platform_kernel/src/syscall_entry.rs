@@ -176,6 +176,7 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> usize {
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry_wrapper() {
     naked_asm!(
+        "swapgs",
         "push rsp",
         "push r11",
         "push rcx",
@@ -195,6 +196,7 @@ unsafe extern "C" fn syscall_entry_wrapper() {
         "pop rcx",
         "pop r11",
         "pop rbp",
+        "swapgs",
         "sysretq",
         stack_alignment = const STACK_ALIGNMENT,
         syscall_entry = sym syscall_entry,
