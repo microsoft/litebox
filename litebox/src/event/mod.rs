@@ -2,6 +2,7 @@
 
 pub mod observer;
 pub mod polling;
+pub mod wait;
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]

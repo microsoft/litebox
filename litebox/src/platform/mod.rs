@@ -318,7 +318,7 @@ pub trait TimeProvider {
 /// Notable, the `Instant` is distinct from [`SystemTime`], in that the `Instant` is monotonic, and
 /// need not have any relation with "real" time. It does not matter if the world takes a step
 /// backwards in time, the `Instant` continues marching forward.
-pub trait Instant {
+pub trait Instant: Copy + Clone + PartialEq + Eq + PartialOrd + Ord {
     /// Returns the amount of time elapsed from another instant to this one, or `None` if that
     /// instant is later than this one.
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration>;
@@ -328,6 +328,9 @@ pub trait Instant {
         self.checked_duration_since(earlier)
             .unwrap_or(core::time::Duration::from_secs(0))
     }
+    /// Returns a new `Instant` that is the sum of this instant and the provided
+    /// duration, or `None` if the resulting instant would overflow.
+    fn checked_add(&self, duration: core::time::Duration) -> Option<Self>;
 }
 
 /// A measurement of the system clock.

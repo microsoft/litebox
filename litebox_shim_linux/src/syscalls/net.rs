@@ -3,10 +3,7 @@
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use litebox::{
-    event::{
-        Events,
-        polling::{TryOpError, wait_or_timeout},
-    },
+    event::{Events, polling::TryOpError, wait::WaitContext},
     fs::OFlags,
     net::{TcpOptionData, errors::AcceptError},
     platform::{RawConstPointer as _, RawMutPointer as _},
@@ -392,6 +389,17 @@ fn getsockopt(
     Ok(())
 }
 
+fn register_observer(
+    fd: &SocketFd,
+    observer: alloc::sync::Weak<dyn litebox::event::observer::Observer<Events>>,
+    mask: Events,
+) {
+    litebox_net()
+        .lock()
+        .with_iopollable(fd, |poll| poll.register_observer(observer, mask))
+        .expect("fd should be valid");
+}
+
 fn try_accept(fd: &SocketFd, peer: Option<&mut SocketAddr>) -> Result<SocketFd, TryOpError<Errno>> {
     litebox_net().lock().accept(fd, peer).map_err(|e| match e {
         AcceptError::NoConnectionsReady => TryOpError::TryAgain,
@@ -400,24 +408,18 @@ fn try_accept(fd: &SocketFd, peer: Option<&mut SocketAddr>) -> Result<SocketFd, 
     })
 }
 
-fn accept(fd: &SocketFd, mut peer: Option<&mut SocketAddr>) -> Result<SocketFd, Errno> {
-    let res = if get_status(fd).contains(OFlags::NONBLOCK) {
-        try_accept(fd, peer)?
-    } else {
-        wait_or_timeout(
-            crate::litebox(),
-            None,
-            || try_accept(fd, peer.as_deref_mut()),
-            || true,
-            |observer, _filter| {
-                litebox_net()
-                    .lock()
-                    .with_iopollable(fd, |poll| poll.register_observer(observer, Events::IN))
-                    .expect("fd should be valid");
-            },
-        )?
-    };
-    Ok(res)
+fn accept(
+    cx: &WaitContext<'_, Platform>,
+    fd: &SocketFd,
+    mut peer: Option<&mut SocketAddr>,
+) -> Result<SocketFd, Errno> {
+    cx.wait_on_events(
+        get_status(fd).contains(OFlags::NONBLOCK),
+        Events::IN,
+        |observer, filter| register_observer(fd, observer, filter),
+        || try_accept(fd, peer.as_deref_mut()),
+    )
+    .map_err(Errno::from)
 }
 
 fn bind(fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
@@ -427,7 +429,11 @@ fn bind(fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
         .map_err(Errno::from)
 }
 
-fn connect(fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
+fn connect(
+    cx: &WaitContext<'_, Platform>,
+    fd: &SocketFd,
+    sockaddr: SocketAddr,
+) -> Result<(), Errno> {
     // Check if the socket is ready
     let is_ready = |fd: &SocketFd| -> Result<bool, Errno> {
         let events = litebox_net()
@@ -442,35 +448,22 @@ fn connect(fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
         .lock()
         .connect(fd, &sockaddr)
         .map_err(Errno::from)?;
-    if get_status(fd).contains(OFlags::NONBLOCK) {
-        // If the socket is non-blocking, return EINPROGRESS if not connected yet
-        if !is_ready(fd)? {
-            return Err(Errno::EINPROGRESS);
-        }
-    } else {
-        // Wait until the connection is established
-        wait_or_timeout(
-            crate::litebox(),
-            None,
-            || {
-                if is_ready(fd).map_err(TryOpError::Other)? {
-                    Ok(())
-                } else {
-                    Err(TryOpError::TryAgain)
-                }
-            },
-            || true,
-            |observer, _filter| {
-                litebox_net()
-                    .lock()
-                    .with_iopollable(fd, |poll| {
-                        poll.register_observer(observer, Events::IN | Events::OUT);
-                    })
-                    .expect("fd should be valid");
-            },
-        )?;
-    }
-    Ok(())
+    cx.wait_on_events(
+        get_status(fd).contains(OFlags::NONBLOCK),
+        Events::IN | Events::OUT,
+        |observer, filter| register_observer(fd, observer, filter),
+        || {
+            if is_ready(fd).map_err(TryOpError::Other)? {
+                Ok(())
+            } else {
+                Err(TryOpError::TryAgain)
+            }
+        },
+    )
+    .map_err(|err| match err {
+        TryOpError::TryAgain => Errno::EINPROGRESS,
+        err => err.into(),
+    })
 }
 
 fn listen(fd: &SocketFd, backlog: u16) -> Result<(), Errno> {
@@ -494,6 +487,7 @@ fn try_sendto(
 }
 
 pub(crate) fn sendto(
+    cx: &WaitContext<'_, Platform>,
     fd: &SocketFd,
     buf: &[u8],
     flags: SendFlags,
@@ -514,24 +508,16 @@ pub(crate) fn sendto(
         OOB,
     );
 
-    let ret = if get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT) {
-        try_sendto(fd, buf, new_flags, sockaddr)
-    } else {
-        let timeout = with_socket_options(fd, |opt| opt.send_timeout);
-        wait_or_timeout(
-            crate::litebox(),
-            timeout,
+    let timeout = with_socket_options(fd, |opt| opt.send_timeout);
+    let ret = cx
+        .with_timeout(timeout)
+        .wait_on_events(
+            get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT),
+            Events::OUT,
+            |observer, filter| register_observer(fd, observer, filter),
             || try_sendto(fd, buf, new_flags, sockaddr),
-            || true,
-            |observer, _filter| {
-                litebox_net()
-                    .lock()
-                    .with_iopollable(fd, |poll| poll.register_observer(observer, Events::OUT))
-                    .expect("fd should be valid");
-            },
         )
-    }
-    .map_err(Errno::from);
+        .map_err(Errno::from);
     if let Err(Errno::EPIPE) = ret
         && !flags.contains(SendFlags::NOSIGNAL)
     {
@@ -554,6 +540,7 @@ fn try_receive(
 }
 
 pub(crate) fn receive(
+    cx: &WaitContext<'_, Platform>,
     fd: &SocketFd,
     buf: &mut [u8],
     flags: ReceiveFlags,
@@ -585,24 +572,15 @@ pub(crate) fn receive(
         }
     }
 
-    if get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(ReceiveFlags::DONTWAIT) {
-        try_receive(fd, buf, new_flags, source_addr)
-    } else {
-        let timeout = with_socket_options(fd, |opt| opt.recv_timeout);
-        wait_or_timeout(
-            crate::litebox(),
-            timeout,
+    let timeout = with_socket_options(fd, |opt| opt.recv_timeout);
+    cx.with_timeout(timeout)
+        .wait_on_events(
+            get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(ReceiveFlags::DONTWAIT),
+            Events::IN,
+            |observer, filter| register_observer(fd, observer, filter),
             || try_receive(fd, buf, new_flags, source_addr.as_deref_mut()),
-            || true,
-            |observer, _filter| {
-                litebox_net()
-                    .lock()
-                    .with_iopollable(fd, |poll| poll.register_observer(observer, Events::IN))
-                    .expect("fd should be valid");
-            },
         )
-    }
-    .map_err(Errno::from)
+        .map_err(Errno::from)
 }
 
 fn get_socket_type(fd: &SocketFd) -> Result<SockType, Errno> {
@@ -760,7 +738,7 @@ impl Task {
                     let mut socket_addr = peer
                         .is_some()
                         .then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
-                    let accepted_fd = accept(fd, socket_addr.as_mut())?;
+                    let accepted_fd = accept(&self.wait_cx(), fd, socket_addr.as_mut())?;
                     if let (Some(peer), Some(socket_addr)) = (peer, socket_addr) {
                         *peer = SocketAddress::Inet(socket_addr);
                     }
@@ -799,7 +777,7 @@ impl Task {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
                 let SocketAddress::Inet(addr) = sockaddr;
                 drop(file_table); // Drop before possibly-blocking `connect`
-                connect(fd, addr)
+                connect(&self.wait_cx(), fd, addr)
             }),
             _ => Err(Errno::ENOTSOCK),
         }
@@ -867,7 +845,7 @@ impl Task {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
                 let sockaddr = sockaddr.map(|SocketAddress::Inet(addr)| addr);
                 drop(file_table); // Drop before possibly-blocking `sendto`
-                sendto(fd, &buf, flags, sockaddr)
+                sendto(&self.wait_cx(), fd, &buf, flags, sockaddr)
             }),
             _ => Err(Errno::ENOTSOCK),
         }
@@ -914,7 +892,7 @@ impl Task {
                     }
                     let buf =
                         unsafe { iov.iov_base.to_cow_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
-                    total_sent += sendto(socket, &buf, flags, sock_addr)?;
+                    total_sent += sendto(&self.wait_cx(), socket, &buf, flags, sock_addr)?;
                 }
                 Ok(total_sent)
             }),
@@ -945,6 +923,7 @@ impl Task {
                 let mut addr = None;
                 drop(file_table); // Drop before possibly-blocking `receive`
                 let size = receive(
+                    &self.wait_cx(),
                     fd,
                     buffer,
                     flags,
