@@ -287,11 +287,18 @@ fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> ContinueOpe
             syscalls::cryp::sys_cryp_obj_copy(dst_obj, src_obj)
         }
         SyscallRequest::CrypRandomNumberGenerate { buf, blen } => {
-            let mut kernel_buf = vec![0u8; blen.min(MAX_KERNEL_BUF_SIZE)];
-            syscalls::cryp::sys_cryp_random_number_generate(&mut kernel_buf).and_then(|()| {
-                buf.copy_from_slice(0, &kernel_buf)
-                    .ok_or(TeeResult::ShortBuffer)
-            })
+            // This could take a long time for large sizes. But OP-TEE OS limits
+            // the maximum size of random data generation to 4096 bytes, so
+            // let's do the same rather than something more complicated.
+            if blen > 4096 {
+                Err(TeeResult::OutOfMemory)
+            } else {
+                let mut kernel_buf = vec![0u8; blen];
+                syscalls::cryp::sys_cryp_random_number_generate(&mut kernel_buf).and_then(|()| {
+                    buf.copy_from_slice(0, &kernel_buf)
+                        .ok_or(TeeResult::AccessDenied)
+                })
+            }
         }
         _ => todo!(),
     };
