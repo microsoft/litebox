@@ -73,7 +73,8 @@ fn kernel_main(bootinfo: &'static BootInfo) -> ! {
     }
 
     serial_println!("BYE!");
-    // terminate QEMU after running the TA commands
+    // TODO: this is QEMU/KVM specific instructions to terminate VM/VMM via
+    // the `isa-debug-exit` device. Different VMMs have different ways for this.
     unsafe {
         core::arch::asm!("mov dx, 0xf4; mov al, 1; out dx, al; hlt");
     }
