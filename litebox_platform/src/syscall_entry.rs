@@ -170,23 +170,27 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> usize {
                 }
             };
 
-            let kernel_rip = unsafe { crate::get_kernel_rip() };
-            let kernel_rsp = unsafe { crate::get_kernel_rsp() };
+            let host_bp = unsafe { crate::get_host_bp() };
             debug_serial_println!(
-                "Exiting from run_thread: rip={:#x}, rsp={:#x}, ret={:#x}",
-                kernel_rip,
-                kernel_rsp,
+                "Exiting from run_thread: rbp={:#x}, ret={:#x}",
+                host_bp,
                 ret
             );
 
             unsafe {
                 core::arch::asm!(
                     "mov rax, {ret}",
-                    "mov rsp, {kernel_rsp}",
-                    "jmp {kernel_rip}",
+                    "mov rbp, {host_bp}",
+                    "lea rsp, [rbp - 5*8]",
+                    "pop r15",
+                    "pop r14",
+                    "pop r13",
+                    "pop r12",
+                    "pop rbx",
+                    "pop rbp",
+                    "ret",
                     ret = in(reg) ret,
-                    kernel_rsp = in(reg) kernel_rsp,
-                    kernel_rip = in(reg) kernel_rip,
+                    host_bp = in(reg) host_bp,
                     options(nostack, noreturn, preserves_flags),
                 );
             }

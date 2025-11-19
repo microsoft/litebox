@@ -419,14 +419,20 @@ pub unsafe fn run_thread(ctx: &mut litebox_common_linux::PtRegs) {
 #[unsafe(naked)]
 unsafe extern "C-unwind" fn run_thread_inner(ctx: &mut litebox_common_linux::PtRegs) {
     core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "push rbx",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "push r15", // align
         "mov rax, rsp",
-        "lea rdx, [rax + 8]",
-        "mov gs:kernel_rsp@tpoff, rdx", // save caller's rsp
-        "mov rdx, [rax]",
-        "mov gs:kernel_rip@tpoff, rdx", // save return address
+        // Save host rsp and rbp and guest context top in TLS.
+        "mov gs:host_sp@tpoff, rsp",
+        "mov gs:host_bp@tpoff, rbp",
         "call {switch_to_guest}",
-        // switch_to_guest = sym switch_to_guest // kernel mode
-        switch_to_guest = sym switch_to_guest_user_mode // user mode
+        switch_to_guest = sym switch_to_guest
     );
 }
 
@@ -438,10 +444,6 @@ core::arch::global_asm!(
 scratch:
     .quad 0
 scratch2:
-    .quad 0
-kernel_rip:
-    .quad 0
-kernel_rsp:
     .quad 0
 host_sp:
     .quad 0
@@ -460,7 +462,7 @@ interrupt:
     "
 );
 
-/// Switches to the provided guest context.
+/// Switches to the provided guest context in kernel mode (for testing).
 ///
 /// # Safety
 /// The context must be valid guest context.
@@ -470,7 +472,7 @@ interrupt:
 #[allow(dead_code)]
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
-unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
+unsafe extern "C" fn switch_to_guest_kernel_mode(ctx: &litebox_common_linux::PtRegs) -> ! {
     core::arch::naked_asm!(
         // Restore guest context from ctx.
         "mov rsp, rdi",
@@ -502,13 +504,8 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 }
 
 #[unsafe(naked)]
-pub(crate) unsafe extern "C" fn get_kernel_rip() -> u64 {
-    core::arch::naked_asm!("mov rax, gs:kernel_rip@tpoff", "ret");
-}
-
-#[unsafe(naked)]
-pub(crate) unsafe extern "C" fn get_kernel_rsp() -> u64 {
-    core::arch::naked_asm!("mov rax, gs:kernel_rsp@tpoff", "ret");
+pub(crate) unsafe extern "C" fn get_host_bp() -> u64 {
+    core::arch::naked_asm!("mov rax, gs:host_bp@tpoff", "ret");
 }
 
 /// Switches to the provided guest context with the user mode.
@@ -519,7 +516,7 @@ pub(crate) unsafe extern "C" fn get_kernel_rsp() -> u64 {
 /// Do not call this at a point where the stack needs to be unwound to run
 /// destructors.
 #[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn switch_to_guest_user_mode(_ctx: &litebox_common_linux::PtRegs) -> ! {
+unsafe extern "C" fn switch_to_guest(_ctx: &litebox_common_linux::PtRegs) -> ! {
     unsafe {
         core::arch::asm!(
             // Restore guest context from ctx.
