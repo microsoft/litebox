@@ -1,9 +1,11 @@
 //! A Linux-y `futex`-like abstraction. Fast user-space mutexes.
 
-// Implementation note: other submodules of `crate::sync` should NOT depend on this module directly,
-// because this module itself depends on some of the other modules (specifically, this module
-// depends on on `RwLock`). A refactoring could clean this up and prevent this dependency, but at
-// the moment, it has been decided that this ordering of dependency is more fruitful.
+// Implementation note: other submodules of `crate::sync` should NOT depend on
+// this module directly, because this module itself depends on some of the other
+// modules (specifically, this module depends on on `LoanList`, which depends on
+// `Mutex`). A refactoring could clean this up and prevent this dependency, but
+// at the moment, it has been decided that this ordering of dependency is more
+// fruitful.
 
 use core::hash::BuildHasher as _;
 use core::pin::pin;
