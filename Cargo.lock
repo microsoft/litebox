@@ -1021,7 +1021,7 @@ dependencies = [
  "bitflags 2.9.4",
  "cfg-if",
  "ctr",
- "elf 0.7.4",
+ "elf 0.8.0",
  "elf_loader",
  "hashbrown 0.15.5",
  "litebox",
