@@ -681,25 +681,31 @@ pub unsafe trait ThreadLocalStorageProvider {
 
 /// A provider of cryptographically-secure random data.
 ///
-/// The precise behavior and implementation is platform specific, and in general
-/// these methods should pass through to the platform's native cryptographic RNG
-/// API when one exists.
+/// The purpose of this provider is to allow LiteBox code to efficiently
+/// generate cryptographically-secure random bytes. This must be an infallible
+/// operation, with no possibility of failure, blocking, or returning
+/// low-quality randomness. The implementation must ensure that the CRNG is
+/// appropriately initialized and seeded by the time this method can be called.
 ///
-/// **Caution**: it may be tempting to write a more efficient provider that runs
-/// fully in the litebox runtime, seeding the RNG from the platform's kernel
-/// CRNG or other trusted sources. Don't do this! Implementing this correctly as
-/// anything other than a direct passthrough is highly non-trivial, especially
-/// in the presence of `fork()` and VM snapshots. Only the native platform has
-/// enough visibility to get this right.
+/// Beyond that, the precise behavior and implementation is platform specific,
+/// and in general these methods should pass through to the platform's native
+/// cryptographic RNG API when one exists.
 ///
-/// If you _are_ implementing a native platform, then be sure to take such
-/// details into account.
+/// **Caution**: it may be tempting to write an non-passthrough implementation
+/// of this method, perhaps for efficiency reasons, seeding a CRNG algorithm's
+/// state from the platform's kernel CRNG or other trusted sources. Don't do
+/// this! Implementing this correctly as anything other than a direct
+/// passthrough is highly non-trivial, especially in the presence of `fork()`
+/// and VM snapshots. Only the native platform has enough visibility to get this
+/// right.
+///
+/// If you _are_ implementing a native platform, without an available CRNG to
+/// leverage, then be sure to take such details into account.
 ///
 /// See [this Linux kernel patch series][1] for more details of the kinds of
 /// issues involved.
 ///
-/// [1]:
-///     https://lore.kernel.org/all/20240703183115.1075219-1-Jason@zx2c4.com/
+/// [1]: https://lore.kernel.org/all/20240703183115.1075219-1-Jason@zx2c4.com/
 pub trait CrngProvider {
     /// Fill `buf` with cryptographically secure random bytes.
     ///
@@ -708,7 +714,8 @@ pub trait CrngProvider {
     /// fill a very large buffer.
     ///
     /// # Panics
-    /// Panics if unable to fill the buffer with random bytes. Litebox code is
-    /// not expected to handle such failures.
+    /// Panics if unable to fill the buffer with random bytes. This is
+    /// considered a fatal error--LiteBox code is not expected to handle such
+    /// failures.
     fn fill_bytes_crng(&self, buf: &mut [u8]);
 }
