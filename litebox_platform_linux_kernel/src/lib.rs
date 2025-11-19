@@ -34,7 +34,8 @@ pub fn update_cpu_mhz(freq: u64) {
 /// This is the platform for running LiteBox in kernel mode.
 /// It requires a host that implements the [`HostInterface`] trait.
 pub struct LinuxKernel<Host: HostInterface> {
-    host_and_task: core::marker::PhantomData<Host>,
+    // Invariant in `Host`: <https://doc.rust-lang.org/nomicon/phantom-data.html#table-of-phantomdata-patterns>
+    host_and_task: core::marker::PhantomData<fn(Host) -> Host>,
     page_table: mm::PageTable<4096>,
 }
 
@@ -227,6 +228,7 @@ impl<Host: HostInterface> DebugLogProvider for LinuxKernel<Host> {
 }
 
 /// An implementation of [`litebox::platform::Instant`]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 
 /// An implementation of [`litebox::platform::SystemTime`]
@@ -252,6 +254,13 @@ impl litebox::platform::Instant for Instant {
                 v / CPU_MHZ.load(core::sync::atomic::Ordering::Relaxed),
             )
         })
+    }
+
+    fn checked_add(&self, duration: core::time::Duration) -> Option<Self> {
+        let duration_micros: u64 = duration.as_micros().try_into().ok()?;
+        Some(Instant(self.0.checked_add(
+            duration_micros.checked_mul(CPU_MHZ.load(core::sync::atomic::Ordering::Relaxed))?,
+        )?))
     }
 }
 

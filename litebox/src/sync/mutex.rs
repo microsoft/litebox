@@ -199,8 +199,12 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     }
 }
 
-unsafe impl<Platform: RawSyncPrimitivesProvider, T> Send for Mutex<Platform, T> {}
-unsafe impl<Platform: RawSyncPrimitivesProvider, T> Sync for Mutex<Platform, T> {}
+// SAFETY: `Mutex<T>` inherits `Send` from `T`.
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Send for Mutex<Platform, T> {}
+// SAFETY: `Mutex` provides mutually exclusive access to `T`, so it's OK to
+// share a reference to it between threads as long as `T` can be _sent_ between
+// threads.
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Sync for Mutex<Platform, T> {}
 
 impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     #[inline]

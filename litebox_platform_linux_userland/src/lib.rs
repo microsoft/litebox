@@ -1027,6 +1027,7 @@ impl litebox::platform::TimeProvider for LinuxUserland {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant {
     inner: Duration,
 }
@@ -1034,6 +1035,11 @@ pub struct Instant {
 impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<Duration> {
         self.inner.checked_sub(earlier.inner)
+    }
+    fn checked_add(&self, duration: core::time::Duration) -> Option<Self> {
+        Some(Self {
+            inner: self.inner.checked_add(duration)?,
+        })
     }
 }
 
@@ -2285,6 +2291,12 @@ unsafe fn interrupt_signal_handler(
     }
     // Cases 3 and 4: jump to interrupt handler.
     set_signal_return(context, interrupt_callback, regs as isize, 0, 0, 0);
+}
+
+impl litebox::platform::CrngProvider for LinuxUserland {
+    fn fill_bytes_crng(&self, buf: &mut [u8]) {
+        getrandom::fill(buf).expect("getrandom failed");
+    }
 }
 
 #[cfg(test)]

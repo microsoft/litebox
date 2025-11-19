@@ -486,6 +486,7 @@ impl<Host: HostInterface> DebugLogProvider for LinuxKernel<Host> {
 }
 
 /// An implementation of [`litebox::platform::Instant`]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 
 /// An implementation of [`litebox::platform::SystemTime`]
@@ -511,6 +512,13 @@ impl litebox::platform::Instant for Instant {
                 v / CPU_MHZ.load(core::sync::atomic::Ordering::Relaxed),
             )
         })
+    }
+
+    fn checked_add(&self, duration: core::time::Duration) -> Option<Self> {
+        let duration_micros: u64 = duration.as_micros().try_into().ok()?;
+        Some(Instant(self.0.checked_add(
+            duration_micros.checked_mul(CPU_MHZ.load(core::sync::atomic::Ordering::Relaxed))?,
+        )?))
     }
 }
 

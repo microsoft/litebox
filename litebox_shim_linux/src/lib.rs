@@ -35,9 +35,18 @@ use litebox::{
 use litebox_common_linux::{ContinueOperation, SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
+/// On debug builds, logs that the user attempted to use an unsupported feature.
+// DEVNOTE: this is before the `mod` declarations so that it can be used within them.
+macro_rules! log_unsupported {
+    ($($arg:tt)*) => {
+        $crate::log_unsupported_fmt(core::format_args!($($arg)*));
+    };
+}
+
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
+mod wait;
 
 pub type DefaultFS = LinuxFS;
 
@@ -58,6 +67,16 @@ type UserMutPointer<T> = <Platform as litebox::platform::RawPointerProvider>::Ra
 
 static BOOT_TIME: once_cell::race::OnceBox<<Platform as litebox::platform::TimeProvider>::Instant> =
     once_cell::race::OnceBox::new();
+
+/// On debug builds, logs that the user attempted to use an unsupported feature.
+fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
+    use litebox::platform::DebugLogProvider as _;
+
+    if cfg!(debug_assertions) {
+        let msg = alloc::format!("WARNING: unsupported: {args}\n");
+        litebox_platform_multiplex::platform().debug_log_print(&msg);
+    }
+}
 
 pub struct LinuxShimEntrypoints;
 
@@ -217,6 +236,7 @@ impl LinuxShim {
 
         let task = Task {
             global,
+            wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
             pid,
             ppid,
             tid,
@@ -302,11 +322,11 @@ pub fn perform_network_interaction() -> litebox::net::PlatformInteractionReinvoc
     litebox_net().lock().perform_platform_interaction()
 }
 
-pub(crate) fn litebox_pipes<'a>() -> &'a litebox::sync::RwLock<Platform, Pipes<Platform>> {
-    static PIPES: OnceBox<litebox::sync::RwLock<Platform, Pipes<Platform>>> = OnceBox::new();
+pub(crate) fn litebox_pipes<'a>() -> &'a Pipes<Platform> {
+    static PIPES: OnceBox<Pipes<Platform>> = OnceBox::new();
     PIPES.get_or_init(|| {
         let pipes = Pipes::new(litebox());
-        alloc::boxed::Box::new(litebox().sync().new_rwlock(pipes))
+        alloc::boxed::Box::new(pipes)
     })
 }
 
@@ -587,7 +607,11 @@ impl Task {
         let syscall_number = ctx.orig_eax;
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
-        let request = match SyscallRequest::<Platform>::try_from_raw(syscall_number, ctx) {
+        let request = match SyscallRequest::<Platform>::try_from_raw(
+            syscall_number,
+            ctx,
+            log_unsupported_fmt,
+        ) {
             Ok(request) => request,
             Err(err) => {
                 set_return(ctx, (err.as_neg() as isize).reinterpret_as_unsigned());
@@ -612,7 +636,6 @@ impl Task {
                 Ok(()) => return ContinueOperation::ResumeGuest,
                 Err(err) => Err(err),
             },
-            SyscallRequest::Ret(errno) => Err(errno),
             SyscallRequest::Read { fd, buf, count } => {
                 // Note some applications (e.g., `node`) seem to assume that getting fewer bytes than
                 // requested indicates EOF.
@@ -947,26 +970,35 @@ impl Task {
             }),
             SyscallRequest::Gettimeofday { tv, tz } => self.sys_gettimeofday(tv, tz).map(|()| 0),
             SyscallRequest::ClockGettime { clockid, tp } => {
-                let clock_id =
-                    litebox_common_linux::ClockId::try_from(clockid).expect("invalid clockid");
-                self.sys_clock_gettime(clock_id, tp).map(|()| 0)
+                litebox_common_linux::ClockId::try_from(clockid)
+                    .map_err(|_| {
+                        log_unsupported!("clock_gettime(clockid = {clockid})");
+                        Errno::EINVAL
+                    })
+                    .and_then(|clock_id| self.sys_clock_gettime(clock_id, tp).map(|()| 0))
             }
             SyscallRequest::ClockGetres { clockid, res } => {
-                let clock_id =
-                    litebox_common_linux::ClockId::try_from(clockid).expect("invalid clockid");
-                self.sys_clock_getres(clock_id, res).map(|()| 0)
+                litebox_common_linux::ClockId::try_from(clockid)
+                    .map_err(|_| {
+                        log_unsupported!("clock_getres(clockid = {clockid})");
+                        Errno::EINVAL
+                    })
+                    .and_then(|clock_id| self.sys_clock_getres(clock_id, res).map(|()| 0))
             }
             SyscallRequest::ClockNanosleep {
                 clockid,
                 flags,
                 request,
                 remain,
-            } => {
-                let clock_id =
-                    litebox_common_linux::ClockId::try_from(clockid).expect("invalid clockid");
-                self.sys_clock_nanosleep(clock_id, flags, request, remain)
-                    .map(|()| 0)
-            }
+            } => litebox_common_linux::ClockId::try_from(clockid)
+                .map_err(|_| {
+                    log_unsupported!("clock_nanosleep(clockid = {clockid})");
+                    Errno::EINVAL
+                })
+                .and_then(|clock_id| {
+                    self.sys_clock_nanosleep(clock_id, flags, request, remain)
+                        .map(|()| 0)
+                }),
             SyscallRequest::Time { tloc } => self
                 .sys_time(tloc)
                 .and_then(|second| usize::try_from(second).or(Err(Errno::EOVERFLOW))),
@@ -1172,7 +1204,8 @@ impl Task {
                 old_value,
             } => self.sys_setitimer(which, new_value, old_value).map(|()| 0),
             _ => {
-                todo!()
+                log_unsupported!("{request:?}");
+                Err(Errno::ENOSYS)
             }
         };
 
@@ -1193,10 +1226,12 @@ impl Task {
         ctx: &litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
         if clone_args.cgroup != 0 {
-            unimplemented!("Clone with cgroup is not supported");
+            log_unsupported!("clone with cgroup");
+            return Err(Errno::EINVAL);
         }
         if clone_args.set_tid != 0 {
-            unimplemented!("Clone with set_tid is not supported");
+            log_unsupported!("clone with set_tid");
+            return Err(Errno::EINVAL);
         }
         // Note `exit_signal` is ignored because we don't support `fork` yet; we just validate it.
         if clone_args.exit_signal > MAX_SIGNAL_NUMBER {
@@ -1277,6 +1312,7 @@ struct LinuxShimTls {
 
 struct Task {
     global: Arc<GlobalState>,
+    wait_state: wait::WaitState,
     process: Arc<syscalls::process::Process>,
     /// Process ID
     pid: i32,
@@ -1415,6 +1451,7 @@ mod test_utils {
             let files = Arc::new(syscalls::file::FilesState::new(litebox()));
             files.initialize_stdio_in_shared_descriptors_table(&self.fs);
             Task {
+                wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
                 global: self,
                 process: Arc::new(syscalls::process::Process::new()),
                 pid,
@@ -1448,6 +1485,7 @@ mod test_utils {
             let parent_pid = self.ppid;
             let files = self.files.clone();
             move || Task {
+                wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
                 global,
                 process,
                 pid,

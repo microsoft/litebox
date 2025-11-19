@@ -7,11 +7,12 @@ use core::mem::offset_of;
 use core::ops::Range;
 use core::sync::atomic::AtomicI32;
 use core::time::Duration;
+use litebox::event::wait::WaitError;
 use litebox::mm::linux::VmFlags;
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{
-    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutex as _,
-    RawMutexProvider as _, ThreadLocalStorageProvider as _,
+    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _,
+    ThreadLocalStorageProvider as _,
 };
 use litebox::platform::{RawMutPointer as _, ThreadProvider as _};
 #[cfg(target_arch = "x86")]
@@ -461,14 +462,16 @@ impl Task {
             .nr_threads
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
+        let platform = litebox_platform_multiplex::platform();
         let r = unsafe {
-            litebox_platform_multiplex::platform().spawn_thread(
+            platform.spawn_thread(
                 &ctx_copy,
                 Box::new(NewThreadArgs {
                     tls,
                     set_child_tid,
                     task: Task {
                         global: self.global.clone(),
+                        wait_state: crate::wait::WaitState::new(platform),
                         pid: self.pid,
                         tid: child_tid,
                         ppid: self.ppid,
@@ -706,10 +709,6 @@ impl Task {
         tp.write(duration)
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "will fail for unknown clock IDs in the future"
-    )]
     fn gettime_as_duration(
         &self,
         platform: &litebox_platform_multiplex::Platform,
@@ -730,7 +729,10 @@ impl Task {
                 // In a real implementation, this would typically have lower resolution
                 platform.now().duration_since(crate::boot_time())
             }
-            _ => unimplemented!(),
+            _ => {
+                log_unsupported!("gettime for {clockid:?}");
+                return Err(Errno::EINVAL);
+            }
         };
         Ok(duration)
     }
@@ -773,28 +775,36 @@ impl Task {
         let is_abs = flags.contains(litebox_common_linux::TimerFlags::ABSTIME);
 
         let platform = litebox_platform_multiplex::platform();
-        let duration = if is_abs {
-            let now = self.gettime_as_duration(platform, clockid)?;
-            if request <= now {
-                return Ok(());
+
+        // Set up a wait context with the right deadline/timeout.
+        let wait_cx = self.wait_cx();
+        let wait_cx = if is_abs {
+            if matches!(clockid, litebox_common_linux::ClockId::Monotonic) {
+                // No need to compute the current time since the offset from the
+                // request to `Instant` is known.
+                wait_cx.with_deadline(crate::boot_time().checked_add(request))
+            } else {
+                wait_cx
+                    .with_timeout(request.checked_sub(self.gettime_as_duration(platform, clockid)?))
             }
-            request.checked_sub(now).unwrap()
         } else {
-            request
+            // Relative. Treat all clocks the same. TODO: handle the different clocks differently.
+            wait_cx.with_timeout(request)
         };
 
-        // Reuse the raw mutex provider to implement sleep.
-        //
-        // TODO: consider a new litebox API to directly sleep, with integration with
-        // interruptions.
-        let r = platform.new_raw_mutex().block_or_timeout(0, duration);
-        assert!(matches!(
-            r,
-            Ok(litebox::platform::UnblockedOrTimedOut::TimedOut)
-        ),);
-
-        // TODO: update the remainder for non-absolute sleeps interrupted by signals.
-        let _ = remain;
+        match wait_cx.sleep() {
+            WaitError::TimedOut => {}
+            WaitError::Interrupted => {
+                if is_abs {
+                    return Err(Errno::EINTR);
+                }
+                if let Some(remaining_timeout) = wait_cx.remaining_timeout() {
+                    remain.write(remaining_timeout)?;
+                    return Err(Errno::EINTR);
+                }
+                // Whoops, time ran out after getting interrupted. Treat this as a timeout.
+            }
+        }
 
         Ok(())
     }
@@ -898,12 +908,8 @@ impl Task {
         /// It should be fine to treat shared futexes as private for now.
         macro_rules! warn_shared_futex {
             ($flag:ident) => {
-                #[cfg(debug_assertions)]
                 if !$flag.contains(litebox_common_linux::FutexFlags::PRIVATE) {
-                    litebox::log_println!(
-                        litebox_platform_multiplex::platform(),
-                        "warning: shared futexes\n"
-                    );
+                    log_unsupported!("shared futex");
                 }
             };
         }

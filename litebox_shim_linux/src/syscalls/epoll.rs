@@ -1,4 +1,4 @@
-use core::{sync::atomic::AtomicBool, time::Duration};
+use core::{convert::Infallible, sync::atomic::AtomicBool};
 
 use alloc::{
     collections::{btree_map::BTreeMap, vec_deque::VecDeque},
@@ -7,8 +7,12 @@ use alloc::{
 };
 use litebox::{
     LiteBox,
-    event::{Events, IOPollable, observer::Observer, polling::Pollee},
-    platform::{Instant as _, RawMutex as _, RawMutexProvider as _, TimeProvider as _},
+    event::{
+        Events, IOPollable,
+        observer::Observer,
+        polling::{Pollee, TryOpError},
+        wait::{WaitContext, WaitError, Waker},
+    },
     utils::ReinterpretUnsignedExt,
 };
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
@@ -101,7 +105,7 @@ impl EpollDescriptor {
                 return crate::litebox_net().lock().with_iopollable(fd, poll);
             }
             EpollDescriptor::Pipe(fd) => {
-                return crate::litebox_pipes().read().with_iopollable(fd, poll).ok();
+                return crate::litebox_pipes().with_iopollable(fd, poll).ok();
             }
         };
         Some(poll(io_pollable))
@@ -128,25 +132,21 @@ impl EpollFile {
 
     pub(crate) fn wait(
         &self,
+        cx: &WaitContext<'_, Platform>,
         maxevents: usize,
-        timeout: Option<Duration>,
-    ) -> Result<Vec<EpollEvent>, Errno> {
+    ) -> Result<Vec<EpollEvent>, WaitError> {
         let mut events = Vec::new();
-        match self.ready.pollee.wait_or_timeout(
-            timeout,
-            || {
-                self.ready.pop_multiple(maxevents, &mut events);
-                if events.is_empty() {
-                    return Err(litebox::event::polling::TryOpError::<Errno>::TryAgain);
-                }
-                Ok(())
-            },
-            || self.ready.check_io_events().contains(Events::IN),
-        ) {
-            Ok(()) | Err(litebox::event::polling::TryOpError::TimedOut) => {}
-            Err(e) => return Err(e.into()),
+        match self.ready.pollee.wait(cx, false, Events::IN, || {
+            self.ready.pop_multiple(maxevents, &mut events);
+            if events.is_empty() {
+                return Err(TryOpError::<Infallible>::TryAgain);
+            }
+            Ok(())
+        }) {
+            Ok(()) => Ok(events),
+            Err(TryOpError::TryAgain) => unreachable!(),
+            Err(TryOpError::WaitError(e)) => Err(e),
         }
-        Ok(events)
     }
 
     pub(crate) fn epoll_ctl(
@@ -158,7 +158,10 @@ impl EpollFile {
     ) -> Result<(), Errno> {
         match op {
             EpollOp::EpollCtlAdd => self.add_interest(fd, file, event.unwrap()),
-            EpollOp::EpollCtlMod => todo!(),
+            EpollOp::EpollCtlMod => {
+                log_unsupported!("epoll_ctl mod");
+                Err(Errno::EINVAL)
+            }
             EpollOp::EpollCtlDel => {
                 let mut interests = self.interests.lock();
                 let _ = interests
@@ -263,15 +266,15 @@ impl EpollFile {
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct EpollEntryKey(u32, *const ());
+struct EpollEntryKey(u32, usize);
 impl EpollEntryKey {
     fn new(fd: u32, desc: &EpollDescriptor) -> Self {
         let ptr = match desc {
-            EpollDescriptor::Eventfd(file) => Arc::as_ptr(file).cast(),
-            EpollDescriptor::Epoll(file) => Arc::as_ptr(file).cast(),
-            EpollDescriptor::File(file) => Arc::as_ptr(file).cast(),
-            EpollDescriptor::Socket(socket_fd) => Arc::as_ptr(socket_fd).cast(),
-            EpollDescriptor::Pipe(pipe_fd) => Arc::as_ptr(pipe_fd).cast(),
+            EpollDescriptor::Eventfd(file) => Arc::as_ptr(file).addr(),
+            EpollDescriptor::Epoll(file) => Arc::as_ptr(file).addr(),
+            EpollDescriptor::File(file) => Arc::as_ptr(file).addr(),
+            EpollDescriptor::Socket(socket_fd) => Arc::as_ptr(socket_fd).addr(),
+            EpollDescriptor::Pipe(pipe_fd) => Arc::as_ptr(pipe_fd).addr(),
         };
         Self(fd, ptr)
     }
@@ -431,14 +434,6 @@ impl ReadySet {
             }
         }
     }
-
-    fn check_io_events(&self) -> Events {
-        if self.entries.lock().is_empty() {
-            Events::empty()
-        } else {
-            Events::IN
-        }
-    }
 }
 
 /// A poll set used for transient polling of a set of files. Designed for use
@@ -454,7 +449,8 @@ struct PollEntry {
     observer: Option<Arc<PollEntryObserver>>,
 }
 
-struct PollEntryObserver(Arc<<Platform as litebox::platform::RawMutexProvider>::RawMutex>);
+#[derive(Clone)]
+struct PollEntryObserver(Waker<Platform>);
 
 impl PollSet {
     /// Returns a new empty `PollSet` with the given interest capacity.
@@ -476,81 +472,70 @@ impl PollSet {
         });
     }
 
-    /// Waits for any of the fds in the poll set to become ready, or until the
-    /// timeout expires.
-    pub fn wait_or_timeout(&mut self, files: &FilesState, timeout: Option<Duration>) {
-        let platform = litebox_platform_multiplex::platform();
-        let condvar = Arc::new(platform.new_raw_mutex());
-
-        let start_time = platform.now();
-        let mut register = true;
-        let mut is_ready = timeout.is_some_and(|t| t.is_zero());
-        loop {
-            let fds = files.file_descriptors.read();
-            for entry in &mut self.entries {
-                entry.revents = if entry.fd < 0 {
-                    continue;
-                } else if let Some(file) = fds.get_fd(entry.fd.reinterpret_as_unsigned())
-                    && let Ok(poll_descriptor) = EpollDescriptor::try_from(files, file)
-                {
-                    let observer = if is_ready || !register {
-                        // The poll set is already ready, or we have already
-                        // registered the observer for this entry.
-                        None
-                    } else {
-                        // TODO: a separate allocation is necessary here
-                        // because registering an observer twice with two
-                        // different event masks results in the last one
-                        // replacing the first. If this is changed to
-                        // instead OR the new registration into the existing
-                        // one, then we can use a single observer for all
-                        // entries.
-                        let observer = Arc::new(PollEntryObserver(condvar.clone()));
-                        let weak = Arc::downgrade(&observer);
-                        entry.observer = Some(observer);
-                        Some(weak as _)
-                    };
-                    // TODO: add machinery to unregister the observer to avoid leaks.
-                    poll_descriptor
-                        .poll(entry.mask, observer)
-                        .unwrap_or(Events::NVAL)
+    fn scan_once(&mut self, files: &FilesState, waker: Option<&Waker<Platform>>) -> bool {
+        let mut is_ready = false;
+        let fds = files.file_descriptors.read();
+        for entry in &mut self.entries {
+            entry.revents = if entry.fd < 0 {
+                continue;
+            } else if let Some(file) = fds.get_fd(entry.fd.reinterpret_as_unsigned())
+                && let Ok(poll_descriptor) = EpollDescriptor::try_from(files, file)
+            {
+                let observer = if !is_ready && let Some(waker) = waker {
+                    // TODO: a separate allocation is necessary here
+                    // because registering an observer twice with two
+                    // different event masks results in the last one
+                    // replacing the first. If this is changed to
+                    // instead combine the new event mask into the existing
+                    // registration's mask, then we can use a single observer
+                    // for all entries.
+                    let observer = Arc::new(PollEntryObserver(waker.clone()));
+                    let weak = Arc::downgrade(&observer);
+                    entry.observer = Some(observer);
+                    Some(weak as _)
                 } else {
-                    Events::NVAL
+                    // The poll set is already ready, or we have already
+                    // registered the observer for this entry.
+                    None
                 };
-                if !entry.revents.is_empty() {
-                    is_ready = true;
-                    register = false;
-                }
+                // TODO: add machinery to unregister the observer to avoid leaks.
+                poll_descriptor
+                    .poll(entry.mask, observer)
+                    .unwrap_or(Events::NVAL)
+            } else {
+                Events::NVAL
+            };
+            if !entry.revents.is_empty() {
+                is_ready = true;
             }
-            drop(fds);
+        }
+        is_ready
+    }
 
-            if is_ready {
-                break;
+    /// Scans the poll set for ready fds once.
+    pub fn scan(&mut self, files: &FilesState) {
+        self.scan_once(files, None);
+    }
+
+    /// Waits for any of the fds in the poll set to become ready.
+    pub fn wait(
+        &mut self,
+        cx: &WaitContext<'_, Platform>,
+        files: &FilesState,
+    ) -> Result<(), WaitError> {
+        if self.scan_once(files, None) {
+            return Ok(());
+        }
+
+        let mut register = true;
+        cx.wait_until(|| {
+            if self.scan_once(files, register.then_some(cx.waker())) {
+                return true;
             }
-
             // Don't register observers again in the next iteration.
             register = false;
-
-            let remaining_time =
-                timeout.map(|t| t.saturating_sub(platform.now().duration_since(&start_time)));
-            if let Some(remaining_time) = remaining_time {
-                if matches!(
-                    condvar.block_or_timeout(0, remaining_time),
-                    Ok(litebox::platform::UnblockedOrTimedOut::TimedOut),
-                ) {
-                    // Timed out. Loop around once more to check if any fds are
-                    // ready, to match Linux behavior.
-                    is_ready = true;
-                }
-            } else {
-                let Ok(()) = condvar.block(0) else {
-                    unreachable!()
-                };
-            }
-            condvar
-                .underlying_atomic()
-                .store(0, core::sync::atomic::Ordering::Relaxed);
-        }
+            false
+        })
     }
 
     /// Returns the accumulated `revents` for each entry in the poll set.
@@ -570,10 +555,7 @@ impl PollSet {
 
 impl Observer<Events> for PollEntryObserver {
     fn on_events(&self, _events: &Events) {
-        self.0
-            .underlying_atomic()
-            .store(1, core::sync::atomic::Ordering::Release);
-        self.0.wake_one();
+        self.0.wake();
     }
 }
 
@@ -581,19 +563,20 @@ impl Observer<Events> for PollEntryObserver {
 mod test {
     use alloc::sync::Arc;
     use litebox::event::Events;
+    use litebox::event::wait::WaitState;
     use litebox::utils::ReinterpretUnsignedExt as _;
     use litebox_common_linux::{EfdFlags, EpollEvent};
+    use litebox_platform_multiplex::platform;
 
     use super::EpollFile;
-    use crate::syscalls::file::FilesState;
-    use core::time::Duration;
+    use crate::{litebox, syscalls::file::FilesState};
 
     extern crate std;
 
     fn setup_epoll() -> EpollFile {
         let _task = crate::syscalls::tests::init_platform(None);
 
-        EpollFile::new(crate::litebox())
+        EpollFile::new(litebox())
     }
 
     #[test]
@@ -602,7 +585,7 @@ mod test {
         let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
             0,
             EfdFlags::CLOEXEC,
-            crate::litebox(),
+            litebox(),
         ));
         epoll
             .add_interest(
@@ -618,15 +601,19 @@ mod test {
         // spawn a thread to write to the eventfd
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
-            copied_eventfd.write(1).unwrap();
+            copied_eventfd
+                .write(&WaitState::new(platform()).context(), 1)
+                .unwrap();
         });
-        epoll.wait(1024, None).unwrap();
+        epoll
+            .wait(&WaitState::new(platform()).context(), 1024)
+            .unwrap();
     }
 
     #[test]
     fn test_epoll_with_pipe() {
         let epoll = setup_epoll();
-        let pipes = crate::litebox_pipes().read();
+        let pipes = crate::litebox_pipes();
         let (producer, consumer) = pipes.create_pipe(2, litebox::pipes::Flags::empty(), None);
         let consumer = Arc::new(consumer);
         let reader = super::EpollDescriptor::Pipe(Arc::clone(&consumer));
@@ -646,17 +633,17 @@ mod test {
             std::thread::sleep(core::time::Duration::from_millis(100));
             assert_eq!(
                 crate::litebox_pipes()
-                    .read()
-                    .write(&producer, &[1, 2])
+                    .write(&WaitState::new(platform()).context(), &producer, &[1, 2])
                     .unwrap(),
                 2
             );
         });
-        epoll.wait(1024, None).unwrap();
+        epoll
+            .wait(&WaitState::new(platform()).context(), 1024)
+            .unwrap();
         let mut buf = [0; 2];
         crate::litebox_pipes()
-            .read()
-            .read(&consumer, &mut buf)
+            .read(&WaitState::new(platform()).context(), &consumer, &mut buf)
             .unwrap();
         assert_eq!(buf, [1, 2]);
     }
@@ -669,7 +656,7 @@ mod test {
         let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
             0,
             EfdFlags::empty(),
-            crate::litebox(),
+            litebox(),
         ));
 
         let fd = 10i32;
@@ -678,8 +665,8 @@ mod test {
             close_on_exec: core::sync::atomic::AtomicBool::new(false),
         };
 
-        let no_fds = FilesState::new(crate::litebox());
-        let fds = FilesState::new(crate::litebox());
+        let no_fds = FilesState::new(litebox());
+        let fds = FilesState::new(litebox());
         fds.file_descriptors
             .write()
             .insert_at(descriptor, fd.reinterpret_as_unsigned() as usize);
@@ -691,24 +678,37 @@ mod test {
             revents[0]
         };
 
-        set.wait_or_timeout(&no_fds, None);
+        set.wait(&WaitState::new(platform()).context(), &no_fds)
+            .unwrap();
         assert_eq!(revents(&set), Events::NVAL);
 
-        eventfd.write(1).unwrap();
-        set.wait_or_timeout(&fds, None);
+        eventfd
+            .write(&WaitState::new(platform()).context(), 1)
+            .unwrap();
+        set.wait(&WaitState::new(platform()).context(), &fds)
+            .unwrap();
         assert_eq!(revents(&set), Events::IN);
 
-        eventfd.read().unwrap();
-        set.wait_or_timeout(&fds, Some(Duration::from_millis(100)));
+        eventfd.read(&WaitState::new(platform()).context()).unwrap();
+        set.wait(
+            &WaitState::new(platform())
+                .context()
+                .with_timeout(core::time::Duration::from_millis(100)),
+            &fds,
+        )
+        .unwrap_err();
         assert!(revents(&set).is_empty());
 
         // spawn a thread to write to the eventfd
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
-            copied_eventfd.write(1).unwrap();
+            copied_eventfd
+                .write(&WaitState::new(platform()).context(), 1)
+                .unwrap();
         });
 
-        set.wait_or_timeout(&fds, None);
+        set.wait(&WaitState::new(platform()).context(), &fds)
+            .unwrap();
         assert_eq!(revents(&set), Events::IN);
     }
 

@@ -21,6 +21,7 @@ use crate::{
         Events, IOPollable,
         observer::Observer,
         polling::{Pollee, TryOpError},
+        wait::{WaitContext, WaitError},
     },
     fs::OFlags,
     platform::TimeProvider,
@@ -91,27 +92,37 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     ///
     /// Note: currently, this function returns `Ok(0)` if the peer end has been shut down, this may
     /// change in the future to an explicit "peer has shut down" error.
-    pub fn read(&self, fd: &PipeFd<Platform>, buf: &mut [u8]) -> Result<usize, errors::ReadError> {
+    pub fn read(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        fd: &PipeFd<Platform>,
+        buf: &mut [u8],
+    ) -> Result<usize, errors::ReadError> {
         let dt = self.litebox.descriptor_table();
         let p = match &dt.get_entry(fd).ok_or(errors::ReadError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => Arc::clone(p),
             PipeEnd::Sender(_) => return Err(errors::ReadError::NotForReading),
         };
         drop(dt);
-        p.read(buf).map_err(From::from)
+        p.read(cx, buf).map_err(From::from)
     }
 
     /// Write the values in `buf` into the pipe, returning the number of elements written.
     ///
     /// See [`Self::create_pipe`] for details on blocking and atomicity of writes.
-    pub fn write(&self, fd: &PipeFd<Platform>, buf: &[u8]) -> Result<usize, errors::WriteError> {
+    pub fn write(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        fd: &PipeFd<Platform>,
+        buf: &[u8],
+    ) -> Result<usize, errors::WriteError> {
         let dt = self.litebox.descriptor_table();
         let p = match &dt.get_entry(fd).ok_or(errors::WriteError::ClosedFd)?.entry {
             PipeEnd::Sender(p) => Arc::clone(p),
             PipeEnd::Receiver(_) => return Err(errors::WriteError::NotForWriting),
         };
         drop(dt);
-        p.write(buf).map_err(From::from)
+        p.write(cx, buf).map_err(From::from)
     }
 
     /// Whether the provided FD points to a reader or a writer end.
@@ -206,6 +217,8 @@ impl From<Flags> for OFlags {
 }
 
 pub mod errors {
+    use crate::event::wait::WaitError;
+
     #[expect(
         unused_imports,
         reason = "used for doc string links to work out, but not for code"
@@ -229,6 +242,8 @@ pub mod errors {
         NotForReading,
         #[error("read would block")]
         WouldBlock,
+        #[error("wait error")]
+        WaitError(WaitError),
     }
 
     /// Possible errors from [`Pipes::write`]
@@ -243,6 +258,8 @@ pub mod errors {
         NotForWriting,
         #[error("write would block")]
         WouldBlock,
+        #[error("wait error")]
+        WaitError(WaitError),
     }
 
     /// Possible errors from functions that always succeed unless the descriptor is closed.
@@ -334,6 +351,8 @@ enum PipeError {
     PeerShutdown,
     #[error("this operation would block")]
     WouldBlock,
+    #[error("wait error")]
+    WaitError(WaitError),
 }
 
 impl From<PipeError> for errors::ReadError {
@@ -344,6 +363,7 @@ impl From<PipeError> for errors::ReadError {
                 unreachable!("unreachable for now; see documentation of `read`")
             }
             PipeError::WouldBlock => errors::ReadError::WouldBlock,
+            PipeError::WaitError(e) => errors::ReadError::WaitError(e),
         }
     }
 }
@@ -353,6 +373,7 @@ impl From<PipeError> for errors::WriteError {
             PipeError::ThisEndShutdown => errors::WriteError::ClosedFd,
             PipeError::PeerShutdown => errors::WriteError::ReadEndClosed,
             PipeError::WouldBlock => errors::WriteError::WouldBlock,
+            PipeError::WaitError(e) => errors::WriteError::WaitError(e),
         }
     }
 }
@@ -361,7 +382,7 @@ impl From<TryOpError<PipeError>> for PipeError {
     fn from(err: TryOpError<PipeError>) -> Self {
         match err {
             TryOpError::TryAgain => PipeError::WouldBlock,
-            TryOpError::TimedOut => unreachable!(),
+            TryOpError::WaitError(e) => PipeError::WaitError(e),
             TryOpError::Other(e) => e,
         }
     }
@@ -419,22 +440,19 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T
     /// Write the values in `buf` into the pipe, returning the number of elements written.
     ///
     /// See [`new_pipe`] for details on blocking and atomicity of writes.
-    fn write(&self, buf: &[T]) -> Result<usize, PipeError>
+    fn write(&self, cx: &WaitContext<'_, Platform>, buf: &[T]) -> Result<usize, PipeError>
     where
         T: Copy,
     {
-        Ok(if self.get_status().contains(OFlags::NONBLOCK) {
-            self.try_write(buf)
-        } else {
-            self.endpoint.pollee.wait_or_timeout(
-                None,
+        self.endpoint
+            .pollee
+            .wait(
+                cx,
+                self.get_status().contains(OFlags::NONBLOCK),
+                Events::OUT,
                 || self.try_write(buf),
-                || {
-                    self.check_io_events()
-                        .intersects(Events::OUT | Events::ALWAYS_POLLED)
-                },
             )
-        }?)
+            .map_err(PipeError::from)
     }
 
     common_functions_for_channel!();
@@ -534,22 +552,19 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> ReadEnd<Platform, T>
     /// Read values in the pipe into `buf`, returning the number of elements read.
     ///
     /// See [`new_pipe`] for details on blocking behavior.
-    fn read(&self, buf: &mut [T]) -> Result<usize, PipeError>
+    fn read(&self, cx: &WaitContext<'_, Platform>, buf: &mut [T]) -> Result<usize, PipeError>
     where
         T: Copy,
     {
-        Ok(if self.get_status().contains(OFlags::NONBLOCK) {
-            self.try_read(buf)
-        } else {
-            self.endpoint.pollee.wait_or_timeout(
-                None,
+        self.endpoint
+            .pollee
+            .wait(
+                cx,
+                self.get_status().contains(OFlags::NONBLOCK),
+                Events::IN,
                 || self.try_read(buf),
-                || {
-                    self.check_io_events()
-                        .intersects(Events::IN | Events::ALWAYS_POLLED)
-                },
             )
-        }?)
+            .map_err(PipeError::from)
     }
 
     common_functions_for_channel!();
@@ -615,15 +630,18 @@ fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
 
 #[cfg(test)]
 mod tests {
-    use crate::pipes::errors::{ReadError, WriteError};
+    use crate::{
+        event::wait::WaitState,
+        pipes::errors::{ReadError, WriteError},
+    };
 
     extern crate std;
 
     #[test]
     fn test_blocking_channel() {
         let platform = crate::platform::mock::MockPlatform::new();
-        let litebox = crate::LiteBox::new(platform);
-        let pipes = &super::Pipes::new(&litebox);
+        let litebox = &crate::LiteBox::new(platform);
+        let pipes = &super::Pipes::new(litebox);
 
         let (prod, cons) = pipes.create_pipe(2, super::Flags::empty(), None);
 
@@ -632,7 +650,9 @@ mod tests {
                 let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
                 let mut i = 0;
                 while i < data.len() {
-                    let ret = pipes.write(&prod, &data[i..]).unwrap();
+                    let ret = pipes
+                        .write(&WaitState::new(platform).context(), &prod, &data[i..])
+                        .unwrap();
                     i += ret;
                 }
                 pipes.close(&prod).unwrap();
@@ -642,7 +662,9 @@ mod tests {
             let mut buf = [0; 10];
             let mut i = 0;
             loop {
-                let ret = pipes.read(&cons, &mut buf[i..]).unwrap();
+                let ret = pipes
+                    .read(&WaitState::new(platform).context(), &cons, &mut buf[i..])
+                    .unwrap();
                 if ret == 0 {
                     pipes.close(&cons).unwrap();
                     break;
@@ -656,8 +678,8 @@ mod tests {
     #[test]
     fn test_nonblocking_channel() {
         let platform = crate::platform::mock::MockPlatform::new();
-        let litebox = crate::LiteBox::new(platform);
-        let pipes = &super::Pipes::new(&litebox);
+        let litebox = &crate::LiteBox::new(platform);
+        let pipes = &super::Pipes::new(litebox);
 
         let (prod, cons) = pipes.create_pipe(2, super::Flags::NON_BLOCKING, None);
 
@@ -666,7 +688,7 @@ mod tests {
                 let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
                 let mut i = 0;
                 while i < data.len() {
-                    match pipes.write(&prod, &data[i..]) {
+                    match pipes.write(&WaitState::new(platform).context(), &prod, &data[i..]) {
                         Ok(n) => {
                             i += n;
                         }
@@ -686,7 +708,7 @@ mod tests {
             let mut buf = [0; 10];
             let mut i = 0;
             loop {
-                match pipes.read(&cons, &mut buf[i..]) {
+                match pipes.read(&WaitState::new(platform).context(), &cons, &mut buf[i..]) {
                     Ok(n) => {
                         if n == 0 {
                             break;

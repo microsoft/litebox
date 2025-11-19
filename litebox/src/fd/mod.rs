@@ -654,7 +654,7 @@ pub trait FdEnabledSubsystem: Sized {
 
 /// Entries for a specific [`FdEnabledSubsystem`]
 #[doc(hidden)]
-pub trait FdEnabledSubsystemEntry: core::any::Any {}
+pub trait FdEnabledSubsystemEntry: Send + Sync + core::any::Any {}
 
 /// Possible errors from [`RawDescriptorStorage::fd_from_raw_integer`] and
 /// [`RawDescriptorStorage::fd_consume_raw_integer`].
@@ -745,7 +745,8 @@ impl DescriptorEntry {
 /// A file descriptor that refers to entries by the `Subsystem`.
 #[repr(transparent)] // this allows us to cast safely
 pub struct TypedFd<Subsystem: FdEnabledSubsystem> {
-    _phantom: PhantomData<Subsystem>,
+    // Invariant in `Subsystem`: <https://doc.rust-lang.org/nomicon/phantom-data.html#table-of-phantomdata-patterns>
+    _phantom: PhantomData<fn(Subsystem) -> Subsystem>,
     x: OwnedFd,
 }
 

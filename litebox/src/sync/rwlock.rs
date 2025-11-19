@@ -643,5 +643,10 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     }
 }
 
-unsafe impl<Platform: RawSyncPrimitivesProvider, T> Sync for RwLock<Platform, T> {}
-unsafe impl<Platform: RawSyncPrimitivesProvider, T> Send for RwLock<Platform, T> {}
+// SAFETY: `RwLock<T>` inherits `Send` from `T`.
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Send for RwLock<Platform, T> {}
+// SAFETY: `RwLock<T>` is `Sync` when `T` is `Send+Sync`. Note that this is a
+// different bound from `Mutex<T>`--the `Send` bound is still necessary since a
+// writer can transfer `T` between threads, but the `Sync` bound is necessary,
+// too, since readers on multiple threads can share `T` simultaneously.
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send + Sync> Sync for RwLock<Platform, T> {}

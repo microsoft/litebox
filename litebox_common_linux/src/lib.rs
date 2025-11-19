@@ -511,8 +511,8 @@ bitflags::bitflags! {
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> FcntlArg<Platform> {
-    pub fn from(cmd: i32, arg: usize) -> Self {
-        match cmd {
+    pub fn try_from(cmd: i32, arg: usize) -> Option<Self> {
+        Some(match cmd {
             F_GETFD => Self::GETFD,
             F_SETFD => Self::SETFD(FileDescriptorFlags::from_bits_truncate(arg.truncate())),
             F_GETFL => Self::GETFL,
@@ -520,8 +520,8 @@ impl<Platform: litebox::platform::RawPointerProvider> FcntlArg<Platform> {
             F_GETLK => Self::GETLK(Platform::RawMutPointer::from_usize(arg)),
             F_SETLK => Self::SETLK(Platform::RawConstPointer::from_usize(arg)),
             F_SETLKW => Self::SETLKW(Platform::RawConstPointer::from_usize(arg)),
-            _ => unimplemented!("{cmd}"),
-        }
+            _ => return None,
+        })
     }
 }
 
@@ -708,13 +708,13 @@ pub enum SocketOptionLevel {
 }
 
 impl SocketOptionName {
-    pub fn from(level: u32, optname: u32) -> Option<Self> {
+    pub fn try_from(level: u32, optname: u32) -> Option<Self> {
         let level = SocketOptionLevel::try_from(level).ok()?;
         match level {
             SocketOptionLevel::IP => Some(Self::IP(IpOption::try_from(optname).ok()?)),
             SocketOptionLevel::SOCKET => Some(Self::Socket(SocketOption::try_from(optname).ok()?)),
             SocketOptionLevel::TCP => Some(Self::TCP(TcpOption::try_from(optname).ok()?)),
-            _ => todo!(),
+            _ => None,
         }
     }
 }
@@ -2245,8 +2245,6 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },
-    /// A sentinel that is expected to be "handled" by trivially returning its value.
-    Ret(errno::Errno),
 }
 
 pub enum ContinueOperation {
@@ -2266,7 +2264,15 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
     /// Ideally, this function would not panic. However, since it is currently under development, it
     /// is allowed to panic upon receiving a syscall number (or arguments) that it does not know how
     /// to handle.
-    pub fn try_from_raw(syscall_number: usize, ctx: &PtRegs) -> Result<Self, errno::Errno> {
+    pub fn try_from_raw(
+        syscall_number: usize,
+        ctx: &PtRegs,
+        log_unsupported: impl Fn(core::fmt::Arguments<'_>),
+    ) -> Result<Self, errno::Errno> {
+        let unsupported_einval = |args: core::fmt::Arguments<'_>| {
+            log_unsupported(args);
+            errno::Errno::EINVAL
+        };
         // sys_req! is a convenience macro that automatically takes the correct numbered arguments
         // (in the order of field specification); due to some Rust restrictions, we need to manually
         // specify pointers by adding the `:*` to that field, but otherwise everything else about
@@ -2322,7 +2328,10 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             };
         }
 
-        let sysno = Sysno::from(u32::try_from(syscall_number).map_err(|_| errno::Errno::ENOSYS)?);
+        let sysno = Sysno::new(syscall_number).ok_or_else(|| {
+            log_unsupported(format_args!("unknown syscall {syscall_number}"));
+            errno::Errno::ENOSYS
+        })?;
         let dispatcher = match sysno {
             Sysno::read => sys_req!(Read { fd, buf:*, count }),
             Sysno::write => sys_req!(Write { fd, buf:*, count }),
@@ -2364,7 +2373,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         sigsetsize,
                     })
                 } else {
-                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                    return Err(errno::Errno::EINVAL);
                 }
             }
             Sysno::rt_sigaction => {
@@ -2377,7 +2386,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         sigsetsize,
                     })
                 } else {
-                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                    return Err(errno::Errno::EINVAL);
                 }
             }
             #[cfg(target_arch = "x86_64")]
@@ -2440,7 +2449,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 if let Ok(behavior) = MadviseBehavior::try_from(behavior) {
                     sys_req!(Madvise { addr:*, length, behavior: { behavior } })
                 } else {
-                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                    return Err(errno::Errno::EINVAL);
                 }
             }
             Sysno::dup => SyscallRequest::Dup {
@@ -2461,15 +2470,22 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::socket => {
                 let domain: u32 = ctx.sys_req_arg(0);
                 let type_and_flags: u32 = ctx.sys_req_arg(1);
+                let ty = type_and_flags & 0x0f;
+                let flags = type_and_flags & !0x0f;
                 SyscallRequest::Socket {
-                    domain: AddressFamily::try_from(domain).expect("Invalid domain"),
-                    ty: SockType::try_from(type_and_flags & 0x0f).expect("Invalid sock type"),
-                    flags: SockFlags::from_bits_truncate(type_and_flags & !0x0f),
+                    domain: AddressFamily::try_from(domain).map_err(|_| {
+                        unsupported_einval(format_args!("socket(domain = {domain})"))
+                    })?,
+                    ty: SockType::try_from(ty)
+                        .map_err(|_| unsupported_einval(format_args!("socket(type = {ty})")))?,
+                    flags: SockFlags::from_bits_truncate(flags),
                     protocol: if ctx.sys_req_arg::<u8>(2) == 0 {
                         None
                     } else {
                         let protocol: u8 = ctx.sys_req_arg(2);
-                        Some(Protocol::try_from(protocol).expect("Invalid protocol"))
+                        Some(Protocol::try_from(protocol).map_err(|_| {
+                            unsupported_einval(format_args!("socket(protocol = {protocol})"))
+                        })?)
                     },
                 }
             }
@@ -2490,9 +2506,11 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::setsockopt | Sysno::getsockopt => {
                 let level: u32 = ctx.sys_req_arg(1);
                 let name: u32 = ctx.sys_req_arg(2);
-                let Some(optname) = SocketOptionName::from(level, name) else {
-                    unimplemented!("level: {}, optname: {}", level, name);
-                };
+                let optname = SocketOptionName::try_from(level, name).ok_or_else(|| {
+                    unsupported_einval(format_args!(
+                        "setsockopt(level = {level}, optname = {name})",
+                    ))
+                })?;
                 let sockfd = ctx.sys_req_arg(0);
                 match sysno {
                     Sysno::setsockopt => SyscallRequest::Setsockopt {
@@ -2515,17 +2533,29 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::exit => sys_req!(Exit { status }),
             Sysno::exit_group => sys_req!(ExitGroup { status }),
             Sysno::uname => sys_req!(Uname { buf:* }),
-            Sysno::fcntl => SyscallRequest::Fcntl {
-                fd: ctx.sys_req_arg(0),
-                arg: FcntlArg::from(ctx.sys_req_arg(1), ctx.sys_req_arg(2)),
-            },
+            Sysno::fcntl => {
+                let cmd: i32 = ctx.sys_req_arg(1);
+                let arg = ctx.sys_req_arg(2);
+                SyscallRequest::Fcntl {
+                    fd: ctx.sys_req_arg(0),
+                    arg: FcntlArg::try_from(cmd, arg).ok_or_else(|| {
+                        unsupported_einval(format_args!("fcntl(cmd = {cmd}, arg = {arg})"))
+                    })?,
+                }
+            }
             // TODO: fcntl64 is identical to fcntl except certain commands (e.g., `F_OFD_SETLK`)
             // that we don't support yet.
             #[cfg(target_arch = "x86")]
-            Sysno::fcntl64 => SyscallRequest::Fcntl {
-                fd: ctx.sys_req_arg(0),
-                arg: FcntlArg::from(ctx.sys_req_arg(1), ctx.sys_req_arg(2)),
-            },
+            Sysno::fcntl64 => {
+                let cmd: i32 = ctx.sys_req_arg(1);
+                let arg = ctx.sys_req_arg(2);
+                SyscallRequest::Fcntl {
+                    fd: ctx.sys_req_arg(0),
+                    arg: FcntlArg::try_from(cmd, arg).ok_or_else(|| {
+                        unsupported_einval(format_args!("fcntl(cmd = {cmd}, arg = {arg})"))
+                    })?,
+                }
+            }
             Sysno::gettimeofday => sys_req!(Gettimeofday { tv:*, tz:* }),
             Sysno::clock_gettime => sys_req!(ClockGettime { clockid, tp: ts }),
             #[cfg(target_arch = "x86")]
@@ -2569,7 +2599,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         rlim: ctx.sys_req_ptr(1),
                     }
                 } else {
-                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                    return Err(errno::Errno::EINVAL);
                 }
             }
             #[cfg(target_arch = "x86")]
@@ -2581,7 +2611,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         rlim: ctx.sys_req_ptr(1),
                     }
                 } else {
-                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                    return Err(errno::Errno::EINVAL);
                 }
             }
             Sysno::setrlimit => {
@@ -2592,7 +2622,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         rlim: ctx.sys_req_ptr(1),
                     }
                 } else {
-                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                    return Err(errno::Errno::EINVAL);
                 }
             }
             Sysno::prlimit64 => {
@@ -2606,7 +2636,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         old_limit: ctx.sys_req_ptr(3),
                     }
                 } else {
-                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                    return Err(errno::Errno::EINVAL);
                 }
             }
             Sysno::getpid => SyscallRequest::Getpid,
@@ -2620,7 +2650,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 if let Ok(op) = EpollOp::try_from(op) {
                     sys_req!(EpollCtl { epfd, op: {op}, fd, event:*, })
                 } else {
-                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                    return Err(errno::Errno::EINVAL);
                 }
             }
             Sysno::epoll_wait => {
@@ -2637,7 +2667,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         flags: EpollCreateFlags::empty(),
                     }
                 } else {
-                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                    return Err(errno::Errno::EINVAL);
                 }
             }
             Sysno::epoll_create1 => sys_req!(EpollCreate { flags }),
@@ -2709,30 +2739,27 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                             args: PrctlArg::CapBSetRead(ctx.sys_req_arg(1)),
                         },
                         _ => {
-                            // We don't yet support any other prctl operations.
-                            unimplemented!("Unsupported prctl operation: {op:?}")
+                            return Err(unsupported_einval(format_args!("prctl({op:?})")));
                         }
                     }
                 } else {
-                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                    return Err(errno::Errno::EINVAL);
                 }
             }
             Sysno::arch_prctl => {
                 let code: u32 = ctx.sys_req_arg(0);
-                if let Ok(code) = ArchPrctlCode::try_from(code) {
-                    let arg = match code {
-                        #[cfg(target_arch = "x86_64")]
-                        ArchPrctlCode::SetFs => ArchPrctlArg::SetFs(ctx.sys_req_arg(1)),
-                        #[cfg(target_arch = "x86_64")]
-                        ArchPrctlCode::GetFs => ArchPrctlArg::GetFs(ctx.sys_req_ptr(1)),
-                        ArchPrctlCode::CETStatus => ArchPrctlArg::CETStatus,
-                        ArchPrctlCode::CETDisable => ArchPrctlArg::CETDisable,
-                        ArchPrctlCode::CETLock => ArchPrctlArg::CETLock,
-                    };
-                    SyscallRequest::ArchPrctl { arg }
-                } else {
-                    todo!("Unsupported arch_prctl syscall: {code:?}")
-                }
+                let code = ArchPrctlCode::try_from(code)
+                    .map_err(|_| unsupported_einval(format_args!("arch_prctl(code = {code})")))?;
+                let arg = match code {
+                    #[cfg(target_arch = "x86_64")]
+                    ArchPrctlCode::SetFs => ArchPrctlArg::SetFs(ctx.sys_req_arg(1)),
+                    #[cfg(target_arch = "x86_64")]
+                    ArchPrctlCode::GetFs => ArchPrctlArg::GetFs(ctx.sys_req_ptr(1)),
+                    ArchPrctlCode::CETStatus => ArchPrctlArg::CETStatus,
+                    ArchPrctlCode::CETDisable => ArchPrctlArg::CETDisable,
+                    ArchPrctlCode::CETLock => ArchPrctlArg::CETLock,
+                };
+                SyscallRequest::ArchPrctl { arg }
             }
             Sysno::gettid => SyscallRequest::Gettid,
             Sysno::set_thread_area => sys_req!(SetThreadArea { user_desc:* }),
@@ -2809,7 +2836,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 if ctx.sys_req_arg::<usize>(1) == size_of::<RobustListHead<Platform>>() {
                     sys_req!(SetRobustList { head })
                 } else {
-                    SyscallRequest::Ret(errno::Errno::EINVAL)
+                    return Err(errno::Errno::EINVAL);
                 }
             }
             Sysno::get_robust_list => {
@@ -2832,9 +2859,11 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 }
             }
             Sysno::sched_yield => SyscallRequest::SchedYield,
-            Sysno::futex => Self::parse_futex(ctx, TimeParam::timespec_old),
+            Sysno::futex => Self::parse_futex(ctx, TimeParam::timespec_old, unsupported_einval)?,
             #[cfg(target_arch = "x86")]
-            Sysno::futex_time64 => Self::parse_futex(ctx, TimeParam::timespec64),
+            Sysno::futex_time64 => {
+                Self::parse_futex(ctx, TimeParam::timespec64, unsupported_einval)?
+            }
             Sysno::execve => sys_req!(Execve { pathname:*, argv:*, envp:* }),
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
@@ -2844,14 +2873,17 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 if let Ok(which) = IntervalTimer::try_from(which) {
                     sys_req!(SetITimer { which: {which}, new_value:*, old_value:* })
                 } else {
-                    return Ok(SyscallRequest::Ret(errno::Errno::EINVAL));
+                    return Err(errno::Errno::EINVAL);
                 }
             }
-            // TODO: support syscall `statfs`
+            // Noisy unsupported syscalls.
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
-                SyscallRequest::Ret(errno::Errno::ENOSYS)
+                return Err(errno::Errno::ENOSYS);
             }
-            _ => unimplemented!("Translation for {sysno} is not (yet) currently supported"),
+            sysno => {
+                log_unsupported(format_args!("unsupported syscall {sysno:?}"));
+                return Err(errno::Errno::ENOSYS);
+            }
         };
         Ok(dispatcher)
     }
@@ -2859,12 +2891,16 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
     fn parse_futex<T: Clone>(
         ctx: &PtRegs,
         time_param: impl FnOnce(Option<Platform::RawMutPointer<T>>) -> TimeParam<Platform>,
-    ) -> SyscallRequest<Platform> {
+        unsupported_einval: impl Fn(core::fmt::Arguments<'_>) -> errno::Errno,
+    ) -> Result<SyscallRequest<Platform>, errno::Errno> {
         let addr = ctx.sys_req_ptr(0);
-        let op: i32 = ctx.sys_req_arg(1);
-        let cmd = FutexOperation::try_from(op & FutexFlags::FUTEX_CMD_MASK.bits())
-            .expect("Invalid futex operation");
-        let flags = FutexFlags::from_bits(op & !FutexFlags::FUTEX_CMD_MASK.bits()).unwrap();
+        let op_and_flags: i32 = ctx.sys_req_arg(1);
+        let op = op_and_flags & FutexFlags::FUTEX_CMD_MASK.bits();
+        let flags = op_and_flags & !FutexFlags::FUTEX_CMD_MASK.bits();
+        let cmd = FutexOperation::try_from(op)
+            .map_err(|_| unsupported_einval(format_args!("futex(op = {op})")))?;
+        let flags = FutexFlags::from_bits(flags)
+            .ok_or_else(|| unsupported_einval(format_args!("futex(flags = {flags})")))?;
         let val = ctx.sys_req_arg(2);
         let timeout = time_param(ctx.sys_req_ptr(3));
         let args = match cmd {
@@ -2887,7 +2923,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 count: val,
             },
         };
-        SyscallRequest::Futex { args }
+        Ok(SyscallRequest::Futex { args })
     }
 }
 

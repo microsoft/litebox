@@ -1138,6 +1138,7 @@ impl litebox::platform::TimeProvider for WindowsUserland {
 }
 
 /// 100ns units returned by `QueryUnbiasedInterruptTimePrecise`.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 
 impl litebox::platform::Instant for Instant {
@@ -1146,6 +1147,12 @@ impl litebox::platform::Instant for Instant {
         // Convert from 100ns intervals to nanoseconds. This won't overflow in
         // our lifetimes.
         Some(Duration::from_nanos(diff * 100))
+    }
+
+    fn checked_add(&self, duration: core::time::Duration) -> Option<Self> {
+        let duration_100ns: u64 = (duration.as_nanos() / 100).try_into().ok()?;
+        let new = self.0.checked_add(duration_100ns)?;
+        Some(Instant(new))
     }
 }
 
@@ -1789,6 +1796,12 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
 
     fn clear_guest_thread_local_storage() {
         Self::init_thread_fs_base();
+    }
+}
+
+impl litebox::platform::CrngProvider for WindowsUserland {
+    fn fill_bytes_crng(&self, buf: &mut [u8]) {
+        getrandom::fill(buf).expect("getrandom failed");
     }
 }
 
