@@ -1118,7 +1118,10 @@ mod tests {
     use alloc::string::ToString as _;
     use litebox::platform::RawConstPointer as _;
     use litebox::utils::TruncateExt as _;
-    use litebox_common_linux::{AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType};
+    use litebox_common_linux::{
+        AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOptionName, TcpOption,
+        errno::Errno,
+    };
 
     use super::SocketAddress;
     use crate::{ConstPtr, MutPtr};
@@ -1637,5 +1640,53 @@ mod tests {
             .expect("failed to sendto");
 
         task.sys_close(client_fd).expect("failed to close client");
+    }
+
+    #[test]
+    fn test_tun_tcp_sockopt() {
+        let task = init_platform(Some("tun99"));
+        let sockfd = task
+            .sys_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                SockFlags::empty(),
+                None,
+            )
+            .expect("failed to create socket");
+        let sockfd = i32::try_from(sockfd).unwrap();
+
+        let mut congestion_name = [0u8; 16];
+        let mut optlen: u32 = congestion_name.len().truncate();
+        task.sys_getsockopt(
+            sockfd,
+            SocketOptionName::TCP(TcpOption::CONGESTION),
+            MutPtr::from_usize(congestion_name.as_mut_ptr() as usize),
+            MutPtr::from_usize(&raw mut optlen as usize),
+        )
+        .expect("Failed to get TCP_CONGESTION");
+        assert_eq!(optlen, 4);
+        assert_eq!(
+            core::str::from_utf8(&congestion_name[..optlen as usize]).unwrap(),
+            "none"
+        );
+
+        task.sys_setsockopt(
+            sockfd,
+            SocketOptionName::TCP(TcpOption::CONGESTION),
+            ConstPtr::from_usize(congestion_name.as_ptr() as usize),
+            optlen as usize,
+        )
+        .expect("Failed to set TCP_CONGESTION");
+
+        let congestion_name = b"cubic\0";
+        let err = task
+            .sys_setsockopt(
+                sockfd,
+                SocketOptionName::TCP(TcpOption::CONGESTION),
+                ConstPtr::from_usize(congestion_name.as_ptr() as usize),
+                congestion_name.len(),
+            )
+            .unwrap_err();
+        assert_eq!(err, Errno::EINVAL);
     }
 }
