@@ -326,21 +326,29 @@ impl HostSnpInterface {
 
 impl HostInterface for HostSnpInterface {
     fn send_ip_packet(packet: &[u8]) -> Result<usize, Errno> {
-        let mut req = bindings::SnpVmplRequestArgs::new_request(
-            bindings::SNP_VMPL_TUN_WRITE_REQ,
-            3,
-            [packet.as_ptr() as u64, packet.len() as u64, 0, 0, 0, 0],
-        );
+        let mut req =
+            bindings::SnpVmplRequestArgs::new_request(bindings::SNP_VMPL_TUN_WRITE_REQ, 3, [
+                packet.as_ptr() as u64,
+                packet.len() as u64,
+                0,
+                0,
+                0,
+                0,
+            ]);
         Self::request(&mut req);
         Self::parse_result(req.ret)
     }
 
     fn receive_ip_packet(packet: &mut [u8]) -> Result<usize, Errno> {
-        let mut req = bindings::SnpVmplRequestArgs::new_request(
-            bindings::SNP_VMPL_TUN_READ_REQ,
-            3,
-            [packet.as_ptr() as u64, packet.len() as u64, 0, 0, 0, 0],
-        );
+        let mut req =
+            bindings::SnpVmplRequestArgs::new_request(bindings::SNP_VMPL_TUN_READ_REQ, 3, [
+                packet.as_ptr() as u64,
+                packet.len() as u64,
+                0,
+                0,
+                0,
+                0,
+            ]);
         Self::request(&mut req);
         Self::parse_result(req.ret)
     }
@@ -358,11 +366,14 @@ impl HostInterface for HostSnpInterface {
         );
         assert!(size <= usize::try_from(PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER).unwrap());
 
-        let mut req = bindings::SnpVmplRequestArgs::new_request(
-            bindings::SNP_VMPL_ALLOC_REQ,
-            1,
-            [u64::from(bindings::SNP_VMPL_ALLOC_MAX_ORDER), 0, 0, 0, 0, 0],
-        );
+        let mut req = bindings::SnpVmplRequestArgs::new_request(bindings::SNP_VMPL_ALLOC_REQ, 1, [
+            u64::from(bindings::SNP_VMPL_ALLOC_MAX_ORDER),
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]);
         Self::request(&mut req);
         match Self::parse_alloc_result(bindings::SNP_VMPL_ALLOC_MAX_ORDER, req.ret) {
             Ok(addr) => Some((
@@ -385,11 +396,15 @@ impl HostInterface for HostSnpInterface {
     }
 
     fn terminate(reason_set: u64, reason_code: u64) -> ! {
-        let mut req = bindings::SnpVmplRequestArgs::new_request(
-            bindings::SNP_VMPL_TERMINATE_REQ,
-            2,
-            [reason_set, reason_code, 0, 0, 0, 0],
-        );
+        let mut req =
+            bindings::SnpVmplRequestArgs::new_request(bindings::SNP_VMPL_TERMINATE_REQ, 2, [
+                reason_set,
+                reason_code,
+                0,
+                0,
+                0,
+                0,
+            ]);
         Self::request(&mut req);
 
         // In case hypervisor fails to terminate it or intentionally reschedules it,

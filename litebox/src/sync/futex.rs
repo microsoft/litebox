@@ -107,15 +107,12 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         let futex_addr = Self::futex_addr_as_atomic(futex_addr)?;
 
         let bucket = self.bucket(addr);
-        let mut entry = pin!(LoanListEntry::new(
-            self.platform,
-            FutexEntry {
-                addr,
-                waker: cx.waker().clone(),
-                bitset,
-                done: AtomicBool::new(false),
-            },
-        ));
+        let mut entry = pin!(LoanListEntry::new(self.platform, FutexEntry {
+            addr,
+            waker: cx.waker().clone(),
+            bitset,
+            done: AtomicBool::new(false),
+        },));
 
         // Insert into the bucket's list. It will be removed when woken or the
         // entry goes out of scope.

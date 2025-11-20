@@ -2,6 +2,9 @@
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
+#![feature(let_chains)]
+#![feature(unsigned_is_multiple_of)]
+#![feature(result_flattening)]
 
 extern crate alloc;
 

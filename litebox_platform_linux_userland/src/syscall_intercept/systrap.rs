@@ -88,45 +88,39 @@ fn register_seccomp_filter() {
     let rules = vec![
         (libc::SYS_read, vec![backdoor_on_arg(3)]),
         (libc::SYS_write, vec![backdoor_on_arg(3)]),
-        (
-            libc::SYS_mmap,
-            vec![
-                // A backdoor to allow invoking mmap.
-                SeccompRule::new(vec![
-                    SeccompCondition::new(
-                        3,
-                        SeccompCmpArgLen::Dword,
-                        SeccompCmpOp::MaskedEq(u64::from(super::MMAP_FLAG_MAGIC)),
-                        u64::from(super::MMAP_FLAG_MAGIC),
-                    )
-                    .unwrap(),
-                ])
+        (libc::SYS_mmap, vec![
+            // A backdoor to allow invoking mmap.
+            SeccompRule::new(vec![
+                SeccompCondition::new(
+                    3,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::MaskedEq(u64::from(super::MMAP_FLAG_MAGIC)),
+                    u64::from(super::MMAP_FLAG_MAGIC),
+                )
                 .unwrap(),
-            ],
-        ),
+            ])
+            .unwrap(),
+        ]),
         (libc::SYS_mprotect, vec![backdoor_on_arg(3)]),
         (libc::SYS_munmap, vec![backdoor_on_arg(2)]),
-        (
-            libc::SYS_rt_sigaction,
-            vec![
-                // Allow rt_sigaction for non-SIGSYS signals
-                SeccompRule::new(vec![
-                    SeccompCondition::new(
-                        0,
-                        SeccompCmpArgLen::Dword,
-                        SeccompCmpOp::Ne,
-                        litebox_common_linux::Signal::SIGSYS as u64,
-                    )
-                    .unwrap(),
-                ])
+        (libc::SYS_rt_sigaction, vec![
+            // Allow rt_sigaction for non-SIGSYS signals
+            SeccompRule::new(vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Ne,
+                    litebox_common_linux::Signal::SIGSYS as u64,
+                )
                 .unwrap(),
-                SeccompRule::new(vec![
-                    // The second argument `act` is null, so it does not change the signal handler.
-                    SeccompCondition::new(1, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0).unwrap(),
-                ])
-                .unwrap(),
-            ],
-        ),
+            ])
+            .unwrap(),
+            SeccompRule::new(vec![
+                // The second argument `act` is null, so it does not change the signal handler.
+                SeccompCondition::new(1, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0).unwrap(),
+            ])
+            .unwrap(),
+        ]),
         (
             // allow rt_sigprocmask that does not block SIGSYS
             libc::SYS_rt_sigprocmask,
@@ -149,33 +143,30 @@ fn register_seccomp_filter() {
         (libc::SYS_mremap, vec![backdoor_on_arg(5)]),
         (libc::SYS_sigaltstack, vec![]),
         (libc::SYS_arch_prctl, vec![backdoor_on_arg(2)]),
-        (
-            libc::SYS_futex,
-            vec![
-                SeccompRule::new(vec![
-                    SeccompCondition::new(
-                        1,
-                        SeccompCmpArgLen::Dword,
-                        SeccompCmpOp::MaskedEq(0x7f),
-                        libc::FUTEX_WAIT as u64,
-                    )
-                    .unwrap(),
-                    backdoor_cond_on_arg(5),
-                ])
+        (libc::SYS_futex, vec![
+            SeccompRule::new(vec![
+                SeccompCondition::new(
+                    1,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::MaskedEq(0x7f),
+                    libc::FUTEX_WAIT as u64,
+                )
                 .unwrap(),
-                SeccompRule::new(vec![
-                    SeccompCondition::new(
-                        1,
-                        SeccompCmpArgLen::Dword,
-                        SeccompCmpOp::MaskedEq(0x7f),
-                        libc::FUTEX_WAKE as u64,
-                    )
-                    .unwrap(),
-                    backdoor_cond_on_arg(5),
-                ])
+                backdoor_cond_on_arg(5),
+            ])
+            .unwrap(),
+            SeccompRule::new(vec![
+                SeccompCondition::new(
+                    1,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::MaskedEq(0x7f),
+                    libc::FUTEX_WAKE as u64,
+                )
                 .unwrap(),
-            ],
-        ),
+                backdoor_cond_on_arg(5),
+            ])
+            .unwrap(),
+        ]),
         (libc::SYS_exit, vec![backdoor_on_arg(1)]),
         (libc::SYS_exit_group, vec![backdoor_on_arg(1)]),
         (libc::SYS_tgkill, vec![]),

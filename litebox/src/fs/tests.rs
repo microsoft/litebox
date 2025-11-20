@@ -1167,10 +1167,14 @@ mod layered {
 
         let mut names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
         names.sort_unstable();
-        assert_eq!(
-            names,
-            vec![".", "..", "bar", "foo", "upperdir", "upperfile"]
-        );
+        assert_eq!(names, vec![
+            ".",
+            "..",
+            "bar",
+            "foo",
+            "upperdir",
+            "upperfile"
+        ]);
 
         // Check file types
         for entry in &entries {

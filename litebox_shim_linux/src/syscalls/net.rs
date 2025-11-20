@@ -251,19 +251,16 @@ fn setsockopt(
                     let data = unsafe { optval.to_cow_slice(TCP_CONGESTION_NAME_MAX.min(optlen)) }
                         .ok_or(Errno::EFAULT)?;
                     let name = core::str::from_utf8(&data).map_err(|_| Errno::EINVAL)?;
-                    litebox_net().lock().set_tcp_option(
-                        fd,
-                        match name {
-                            "reno" | "cubic" => {
-                                log_unsupported!("enable {} for smoltcp?", name);
-                                return Err(Errno::EINVAL);
-                            }
-                            "none" => litebox::net::TcpOptionData::CONGESTION(
-                                litebox::net::CongestionControl::None,
-                            ),
-                            _ => return Err(Errno::EINVAL),
-                        },
-                    )?;
+                    litebox_net().lock().set_tcp_option(fd, match name {
+                        "reno" | "cubic" => {
+                            log_unsupported!("enable {} for smoltcp?", name);
+                            return Err(Errno::EINVAL);
+                        }
+                        "none" => litebox::net::TcpOptionData::CONGESTION(
+                            litebox::net::CongestionControl::None,
+                        ),
+                        _ => return Err(Errno::EINVAL),
+                    })?;
                     Ok(())
                 }
                 TcpOption::KEEPCNT | TcpOption::KEEPIDLE | TcpOption::INFO => {

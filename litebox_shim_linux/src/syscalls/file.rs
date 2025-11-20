@@ -1120,15 +1120,12 @@ impl Task {
         files
             .file_descriptors
             .write()
-            .insert(
-                self,
-                Descriptor::Eventfd {
-                    file: alloc::sync::Arc::new(eventfd),
-                    close_on_exec: core::sync::atomic::AtomicBool::new(
-                        flags.contains(EfdFlags::CLOEXEC),
-                    ),
-                },
-            )
+            .insert(self, Descriptor::Eventfd {
+                file: alloc::sync::Arc::new(eventfd),
+                close_on_exec: core::sync::atomic::AtomicBool::new(
+                    flags.contains(EfdFlags::CLOEXEC),
+                ),
+            })
             .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
     }
 
@@ -1139,32 +1136,26 @@ impl Task {
         match arg {
             IoctlArg::TCGETS(termios) => {
                 unsafe {
-                    termios.write_at_offset(
-                        0,
-                        litebox_common_linux::Termios {
-                            c_iflag: 0,
-                            c_oflag: 0,
-                            c_cflag: 0,
-                            c_lflag: 0,
-                            c_line: 0,
-                            c_cc: [0; 19],
-                        },
-                    )
+                    termios.write_at_offset(0, litebox_common_linux::Termios {
+                        c_iflag: 0,
+                        c_oflag: 0,
+                        c_cflag: 0,
+                        c_lflag: 0,
+                        c_line: 0,
+                        c_cc: [0; 19],
+                    })
                 }
                 .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
             IoctlArg::TCSETS(_) => Ok(0), // TODO: implement
             IoctlArg::TIOCGWINSZ(ws) => unsafe {
-                ws.write_at_offset(
-                    0,
-                    litebox_common_linux::Winsize {
-                        row: 20,
-                        col: 20,
-                        xpixel: 0,
-                        ypixel: 0,
-                    },
-                )
+                ws.write_at_offset(0, litebox_common_linux::Winsize {
+                    row: 20,
+                    col: 20,
+                    xpixel: 0,
+                    ypixel: 0,
+                })
                 .ok_or(Errno::EFAULT)?;
                 Ok(0)
             },
@@ -1308,15 +1299,12 @@ impl Task {
         files
             .file_descriptors
             .write()
-            .insert(
-                self,
-                Descriptor::Epoll {
-                    file: alloc::sync::Arc::new(epoll_file),
-                    close_on_exec: core::sync::atomic::AtomicBool::new(
-                        flags.contains(EpollCreateFlags::EPOLL_CLOEXEC),
-                    ),
-                },
-            )
+            .insert(self, Descriptor::Epoll {
+                file: alloc::sync::Arc::new(epoll_file),
+                close_on_exec: core::sync::atomic::AtomicBool::new(
+                    flags.contains(EpollCreateFlags::EPOLL_CLOEXEC),
+                ),
+            })
             .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
     }
 

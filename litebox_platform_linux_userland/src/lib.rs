@@ -3,6 +3,10 @@
 // Restrict this crate to only work on Linux. For now, we are restricting this to only x86/x86-64
 // Linux, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
+#![feature(let_chains)]
+#![feature(naked_functions)]
+#![allow(named_asm_labels)]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 use std::cell::Cell;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -388,7 +392,7 @@ fn get_guest_fsbase() -> usize {
 /// When the guest thread terminates, this function returns after restoring
 /// non-volatile register state.
 #[cfg(target_arch = "x86_64")]
-#[unsafe(naked)]
+#[naked]
 unsafe extern "C-unwind" fn run_thread_inner(ctx: &mut litebox_common_linux::PtRegs) {
     core::arch::naked_asm!(
     "
@@ -526,7 +530,7 @@ interrupt_callback:
 /// When the guest thread terminates, this function returns after restoring
 /// non-volatile register state.
 #[cfg(target_arch = "x86")]
-#[unsafe(naked)]
+#[naked]
 unsafe extern "fastcall-unwind" fn run_thread_inner(ctx: &mut litebox_common_linux::PtRegs) {
     core::arch::naked_asm!(
     "
@@ -672,7 +676,7 @@ unsafe extern "fastcall-unwind" fn syscall_handler_fast(ctx: &mut litebox_common
 /// Do not call this at a point where the stack needs to be unwound to run
 /// destructors.
 #[cfg(target_arch = "x86_64")]
-#[unsafe(naked)]
+#[naked]
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     core::arch::naked_asm!(
         "switch_to_guest_start:",
@@ -740,7 +744,7 @@ interrupt:
 );
 
 #[cfg(target_arch = "x86")]
-#[unsafe(naked)]
+#[naked]
 unsafe extern "fastcall" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     core::arch::naked_asm!(
         "switch_to_guest_start:",

@@ -111,13 +111,10 @@ fn run_ta_with_default_commands(ta_info: &ElfLoadInfo) {
             // Each OP-TEE TA has its own UUID.
             // The client of a session can be a normal-world (VTL0) application or another TA (at VTL1).
             // The VTL0 kernel is expected to provide the client identity information.
-            let _litebox = litebox_shim_optee::init_session(
-                &TeeUuid::default(),
-                &TeeIdentity {
-                    login: TeeLogin::User,
-                    uuid: TeeUuid::default(),
-                },
-            );
+            let _litebox = litebox_shim_optee::init_session(&TeeUuid::default(), &TeeIdentity {
+                login: TeeLogin::User,
+                uuid: TeeUuid::default(),
+            });
         }
 
         // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with

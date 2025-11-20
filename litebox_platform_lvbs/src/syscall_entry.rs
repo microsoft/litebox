@@ -191,7 +191,7 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> usize {
     unreachable!()
 }
 
-#[unsafe(naked)]
+#[naked]
 unsafe extern "C" fn syscall_entry_wrapper() {
     naked_asm!(
         "swapgs",

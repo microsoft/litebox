@@ -111,14 +111,11 @@ impl<T, const CAPACITY: usize> ArrayIndexMap<T, CAPACITY> {
         let Slot::Filled {
             generation: _,
             data,
-        } = core::mem::replace(
-            &mut self.storage[idx.index()],
-            Slot::Unfilled {
-                // Since it is a filled slot, it could not have transitioned from a tombstone
-                // (u32::MAX), thus this addition should never overflow.
-                generation: idx.generation.checked_add(1).unwrap(),
-            },
-        )
+        } = core::mem::replace(&mut self.storage[idx.index()], Slot::Unfilled {
+            // Since it is a filled slot, it could not have transitioned from a tombstone
+            // (u32::MAX), thus this addition should never overflow.
+            generation: idx.generation.checked_add(1).unwrap(),
+        })
         else {
             // We just confirmed that we are in a filled slot stage in the right generation, so it
             // is impossible for this to be reached.

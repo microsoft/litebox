@@ -233,16 +233,12 @@ fn test_syscall_rewriter() {
     // rewrite the hello_exec_nolibc
     let hooked_path = std::path::Path::new(dir_path.as_str()).join("hello_exec_nolibc.hooked");
     let _ = std::fs::remove_file(hooked_path.clone());
-    let rewrite_success = common::rewrite_with_cache(
-        &path,
-        &hooked_path,
-        &[
-            "--trampoline-addr",
-            litebox_shim_linux::loader::REWRITER_MAGIC_NUMBER
-                .to_string()
-                .as_str(),
-        ],
-    );
+    let rewrite_success = common::rewrite_with_cache(&path, &hooked_path, &[
+        "--trampoline-addr",
+        litebox_shim_linux::loader::REWRITER_MAGIC_NUMBER
+            .to_string()
+            .as_str(),
+    ]);
     assert!(rewrite_success, "failed to run syscall rewriter");
 
     let executable_path = "/hello_exec_nolibc.hooked";

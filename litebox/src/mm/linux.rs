@@ -291,13 +291,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 each.start % ALIGN == 0 && each.end % ALIGN == 0,
                 "Vmem: reserved range is not aligned to {ALIGN} bytes"
             );
-            vmem.vmas.insert(
-                each.start..each.end,
-                VmArea {
-                    flags: VmFlags::empty(),
-                    is_file_backed: false,
-                },
-            );
+            vmem.vmas.insert(each.start..each.end, VmArea {
+                flags: VmFlags::empty(),
+                is_file_backed: false,
+            });
         }
         vmem
     }
@@ -720,13 +717,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 VmemProtectError::ProtectError(e)
             })?;
 
-            self.vmas.insert(
-                intersection,
-                VmArea {
-                    flags: new_flags,
-                    is_file_backed: vma.is_file_backed,
-                },
-            );
+            self.vmas.insert(intersection, VmArea {
+                flags: new_flags,
+                is_file_backed: vma.is_file_backed,
+            });
             if !before.is_empty() {
                 self.vmas.insert(before, vma);
             }

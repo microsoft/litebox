@@ -8,6 +8,9 @@
     clippy::unused_self,
     reason = "by convention, syscalls and related methods take &self even if unused"
 )]
+#![feature(let_chains)]
+#![feature(unsigned_is_multiple_of)]
+#![feature(result_flattening)]
 
 extern crate alloc;
 

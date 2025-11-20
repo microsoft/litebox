@@ -101,10 +101,9 @@ fn test_vmm_mapping() {
     }
     .unwrap();
     // [(0x1_0000, 0x1_c000)]
-    assert_eq!(
-        collect_mappings(&vmm),
-        vec![start_addr..start_addr + 12 * PAGE_SIZE]
-    );
+    assert_eq!(collect_mappings(&vmm), vec![
+        start_addr..start_addr + 12 * PAGE_SIZE
+    ]);
 
     unsafe {
         vmm.remove_mapping(
@@ -113,13 +112,10 @@ fn test_vmm_mapping() {
     }
     .unwrap();
     // [(0x1_0000, 0x1_2000), (0x1_4000, 0x1_c000)]
-    assert_eq!(
-        collect_mappings(&vmm),
-        vec![
-            start_addr..start_addr + 2 * PAGE_SIZE,
-            start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE
-        ]
-    );
+    assert_eq!(collect_mappings(&vmm), vec![
+        start_addr..start_addr + 2 * PAGE_SIZE,
+        start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE
+    ]);
 
     assert!(matches!(
         unsafe {
@@ -164,10 +160,9 @@ fn test_vmm_mapping() {
         .is_ok()
     );
     // Grow and merge, [(0x1_0000, 0x1_c000)]
-    assert_eq!(
-        collect_mappings(&vmm),
-        vec![start_addr..start_addr + 12 * PAGE_SIZE]
-    );
+    assert_eq!(collect_mappings(&vmm), vec![
+        start_addr..start_addr + 12 * PAGE_SIZE
+    ]);
 
     assert!(matches!(
         unsafe {
@@ -190,14 +185,11 @@ fn test_vmm_mapping() {
         .is_ok()
     );
     // Change permission, [(0x1_0000, 0x1_2000), (0x1_2000, 0x1_4000), (0x1_4000, 0x1_c000)]
-    assert_eq!(
-        collect_mappings(&vmm),
-        vec![
-            start_addr..start_addr + 2 * PAGE_SIZE,
-            start_addr + 2 * PAGE_SIZE..start_addr + 4 * PAGE_SIZE,
-            start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE
-        ]
-    );
+    assert_eq!(collect_mappings(&vmm), vec![
+        start_addr..start_addr + 2 * PAGE_SIZE,
+        start_addr + 2 * PAGE_SIZE..start_addr + 4 * PAGE_SIZE,
+        start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE
+    ]);
 
     // try to remap [0x1_2000, 0x1_4000)
     let r = PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap();
@@ -215,14 +207,11 @@ fn test_vmm_mapping() {
         }
         .is_ok_and(|v| v.as_usize() == start_addr + 12 * PAGE_SIZE)
     );
-    assert_eq!(
-        collect_mappings(&vmm),
-        vec![
-            start_addr..start_addr + 2 * PAGE_SIZE,
-            start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
-            start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE
-        ]
-    );
+    assert_eq!(collect_mappings(&vmm), vec![
+        start_addr..start_addr + 2 * PAGE_SIZE,
+        start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
+        start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE
+    ]);
 
     // create new mapping with no suggested address
     assert_eq!(
@@ -238,15 +227,12 @@ fn test_vmm_mapping() {
         .as_usize(),
         DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE,
     );
-    assert_eq!(
-        collect_mappings(&vmm),
-        vec![
-            start_addr..start_addr + 2 * PAGE_SIZE,
-            start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
-            start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
-        ]
-    );
+    assert_eq!(collect_mappings(&vmm), vec![
+        start_addr..start_addr + 2 * PAGE_SIZE,
+        start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
+        start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
+        DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+    ]);
 
     // create new mapping with fixed address that overlaps with other mapping
     assert_eq!(
@@ -262,16 +248,13 @@ fn test_vmm_mapping() {
         .as_usize(),
         start_addr + PAGE_SIZE
     );
-    assert_eq!(
-        collect_mappings(&vmm),
-        vec![
-            start_addr..start_addr + PAGE_SIZE,
-            start_addr + PAGE_SIZE..start_addr + 2 * PAGE_SIZE,
-            start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
-            start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
-        ]
-    );
+    assert_eq!(collect_mappings(&vmm), vec![
+        start_addr..start_addr + PAGE_SIZE,
+        start_addr + PAGE_SIZE..start_addr + 2 * PAGE_SIZE,
+        start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
+        start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
+        DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+    ]);
 
     // shrink mapping
     assert!(
@@ -283,15 +266,12 @@ fn test_vmm_mapping() {
         }
         .is_ok()
     );
-    assert_eq!(
-        collect_mappings(&vmm),
-        vec![
-            start_addr..start_addr + PAGE_SIZE,
-            start_addr + PAGE_SIZE..start_addr + 2 * PAGE_SIZE,
-            start_addr + 4 * PAGE_SIZE..start_addr + 6 * PAGE_SIZE,
-            start_addr + 8 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
-            start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
-        ]
-    );
+    assert_eq!(collect_mappings(&vmm), vec![
+        start_addr..start_addr + PAGE_SIZE,
+        start_addr + PAGE_SIZE..start_addr + 2 * PAGE_SIZE,
+        start_addr + 4 * PAGE_SIZE..start_addr + 6 * PAGE_SIZE,
+        start_addr + 8 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
+        start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
+        DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+    ]);
 }

@@ -10,6 +10,10 @@
 //! the modules in this crate.
 
 #![no_std]
+#![feature(let_chains)]
+#![feature(unsigned_is_multiple_of)]
+#![feature(trait_upcasting)]
+#![feature(result_flattening)]
 
 extern crate alloc;
 
