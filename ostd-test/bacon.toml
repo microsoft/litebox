@@ -1,0 +1,36 @@
+# This is a configuration file for the bacon tool
+#
+# Complete help on configuration: https://dystroy.org/bacon/config/
+# 
+# You may check the current default at
+#   https://github.com/Canop/bacon/blob/main/defaults/default-bacon.toml
+
+default_job = "osdk-check"
+env.CARGO_TERM_COLOR = "always"
+
+# Check
+[jobs.osdk-check]
+command = ["cargo", "osdk", "check"]
+need_stdout = false
+extraneous_args = false
+
+# Test
+[jobs.osdk-test]
+command = ["cargo", "osdk", "test"]
+need_stdout = false
+extraneous_args = false
+
+# Run
+[jobs.osdk-run]
+command = ["cargo", "osdk", "run"]
+need_stdout = true
+extraneous_args = false
+allow_warnings = true
+background = false
+on_change_strategy = "kill_then_restart"
+
+# Project-specific keybindings, to make it easier to run the various jobs here.
+[keybindings]
+k = "job:osdk-check"
+t = "job:osdk-test"
+r = "job:osdk-run"
