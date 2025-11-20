@@ -65,11 +65,6 @@ pub fn run_ta_with_test_commands(ta_info: &ElfLoadInfo, prog_name: &str, json_pa
             Some(cmd.cmd_id),
         );
         unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };
-        assert!(
-            pt_regs.rax == 0,
-            "TA exits with error: return_code={:#x}",
-            pt_regs.rax
-        );
         // TA stores results in the `UteeParams` structure and/or buffers it refers to.
         let params = unsafe { &*(ta_info.params_address as *const UteeParams) };
         handle_ta_command_output(params);

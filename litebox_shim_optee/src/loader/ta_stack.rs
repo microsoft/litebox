@@ -266,9 +266,13 @@ pub(crate) fn allocate_stack(stack_base: Option<usize>) -> Option<TaStack> {
     } else {
         let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
             .expect("DEFAULT_STACK_SIZE is not page-aligned");
+        let flags = CreatePagesFlags::empty();
+        // TODO: implement demand paging in the following platforms to avoid MAP_POPULATE
+        #[cfg(any(feature = "platform_lvbs", feature = "platform_kernel"))]
+        let flags = flags | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY;
         unsafe {
             litebox_page_manager()
-                .create_stack_pages(None, length, CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY)
+                .create_stack_pages(None, length, flags)
                 .ok()?
         }
     };
