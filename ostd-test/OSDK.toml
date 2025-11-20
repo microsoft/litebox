@@ -3,6 +3,7 @@ method = "grub-rescue-iso"
 
 [qemu]
 args = """\
+    -enable-kvm \
     -machine q35,kernel-irqchip=split \
     -cpu Icelake-Server,+x2apic \
     --no-reboot \
@@ -14,4 +15,5 @@ args = """\
     -chardev stdio,id=mux,mux=on,signal=off \
     -display none \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+    -boot d,menu=off \
 """
