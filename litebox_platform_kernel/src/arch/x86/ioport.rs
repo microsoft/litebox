@@ -4,7 +4,6 @@ use core::{arch::asm, fmt};
 use spin::{Mutex, Once};
 
 const COM_PORT_1: u16 = 0x3F8;
-// const COM_PORT_2: u16 = 0x2F8;
 
 const INTERRUPT_ENABLE_OFFSET: u16 = 1;
 const OUT_FIFO_CONTROL_OFFSET: u16 = 2;

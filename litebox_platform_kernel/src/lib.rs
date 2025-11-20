@@ -119,22 +119,10 @@ impl LiteBoxKernel {
 
     /// Create a new page table for user space. Currently, it maps the entire kernel memory for
     /// proper operations (e.g., syscall handling). We should consider implementing
-    /// partial mapping to mitigate side-channel attacks and shallow copying to get rid of redudant
+    /// partial mapping to mitigate side-channel attacks and shallow copying to get rid of redundant
     /// page table data structures for kernel space.
     #[allow(clippy::unused_self)]
     pub(crate) fn new_user_page_table(&self) -> mm::PageTable<PAGE_SIZE> {
-        // let pt = unsafe { mm::PageTable::new_top_level() };
-        // if pt
-        //     .map_phys_frame_range(
-        //         self.phys_frame_range,
-        //         PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-        //     )
-        //     .is_err()
-        // {
-        //     panic!("Failed to map physical memory");
-        // }
-        // pt
-
         // TODO: use separate page table later
         let (cr3, _) = x86_64::registers::control::Cr3::read_raw();
         unsafe { mm::PageTable::new(cr3.start_address()) }
@@ -371,6 +359,9 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for LiteBoxKernel {
     }
 
     fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
+        // TODO: Consider whether we need to reserve some pages in the kernel context.
+        // For example, we might have to reserve some pages for hardware operations like
+        // memory-mapped I/O.
         core::iter::empty()
     }
 }

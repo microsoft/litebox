@@ -17,7 +17,7 @@ fn idt() -> &'static InterruptDescriptorTable {
         unsafe {
             // Rust no longer allows a function with the custom ABI to have a return type.
             // Unfortunately, the `x86_64` crate has not caught up this change.
-            // the below is a workaround mentioned in [link](https://github.com/rust-lang/rust/issues/143072).
+            // Below is a workaround mentioned in [link](https://github.com/rust-lang/rust/issues/143072).
             let addr =
                 HandlerFuncType::to_virt_addr(double_fault_handler as HandlerFuncWithErrCode);
             idt.double_fault

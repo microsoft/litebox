@@ -27,7 +27,7 @@ unsafe fn read_at_offset<'a, T: Clone>(
         Some(alloc::borrow::Cow::Borrowed(unsafe { &*ptr.offset(count) }))
     } else {
         // TODO: consider whether we should use `litebox_platform_linux_kernel`'s `memcpy_fallible`.
-        // `litebox_platform` currently preallocates all memory, so there would be no page fault.
+        // `litebox_platform_kernel` currently preallocates all memory, so there would be no page fault.
         let mut buffer = core::mem::MaybeUninit::<T>::uninit();
         let buffer = unsafe {
             core::ptr::copy_nonoverlapping(
