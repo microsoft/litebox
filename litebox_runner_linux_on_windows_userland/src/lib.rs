@@ -213,7 +213,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         shim.default_fs(in_mem, tar_ro)
     };
     shim.set_fs(initial_file_system);
-    platform.register_shim(shim.entrypoints());
 
     let argv = cli_args
         .program_and_arguments
@@ -248,12 +247,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let prorgram = shim
+    let program = shim
         .load_program(platform.init_task(), &prog_unix_path, argv, envp)
         .unwrap();
     unsafe {
         litebox_platform_windows_userland::run_thread(
-            program.shimk,
+            program.entrypoints,
             &mut litebox_common_linux::PtRegs::default(),
         );
     }

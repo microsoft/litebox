@@ -46,7 +46,6 @@ impl TestLauncher {
             this.install_file(data, each);
         }
 
-        platform.register_shim(this.shim.entrypoints());
         this
     }
 
@@ -76,13 +75,15 @@ impl TestLauncher {
             CString::new("hello").unwrap(),
         ];
         let envp = vec![CString::new("PATH=/bin").unwrap()];
-        self.shim
+        let program = self
+            .shim
             .load_program(self.platform.init_task(), executable_path, argv, envp)
             .unwrap();
         unsafe {
             litebox_platform_windows_userland::run_thread(
+                program.entrypoints,
                 &mut litebox_common_linux::PtRegs::default(),
-            )
-        };
+            );
+        }
     }
 }
