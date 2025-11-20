@@ -202,6 +202,11 @@ fn get_tls() -> *const ThreadState {
     tls
 }
 
+/// Calls the shim's `init` method to initialize the thread and the register
+/// context, preparing the thread for calls to [`handle_syscall`].
+///
+/// # Panics
+/// Panics if the thread shim is initialized more than once.
 pub fn init_thread(
     shim: Box<dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>>,
     pt_regs: &mut litebox_common_linux::PtRegs,
@@ -227,6 +232,10 @@ fn exit_thread() -> ! {
     unreachable!("thread has exited: {:?}", r);
 }
 
+/// Handles a syscall from the guest.
+///
+/// # Panics
+/// Panics if the thread shim has not been initialized with [`init_thread`].
 pub fn handle_syscall(pt_regs: &mut litebox_common_linux::PtRegs) {
     let tls = unsafe { &*get_tls() };
     match tls.shim.get().unwrap().syscall(pt_regs) {
