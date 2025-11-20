@@ -11,7 +11,7 @@
 //! 3. Signal/exception handlers use [`search_exception_tables`] to look up recovery points
 //! 4. If found, execution is redirected to allow graceful failure handling
 //!
-//! New fallible functions should follow the pattern established by [`__memcpy_fallible`].
+//! New fallible functions should follow the pattern established by [`__lb_memcpy_fallible`].
 
 use crate::utils::ReinterpretUnsignedExt;
 
@@ -49,7 +49,7 @@ unsafe extern "C" {
     /// see [`crate::platform::common_providers::userspace_pointers`].
     ///
     /// Returns number of bytes that failed to copy (0 on success).
-    pub fn __memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> usize;
+    pub fn __lb_memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> usize;
 
     static __ex_table_start: [ExceptionTableEntry; 0];
     static __ex_table_end: [ExceptionTableEntry; 0];
