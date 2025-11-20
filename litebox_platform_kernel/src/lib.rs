@@ -20,6 +20,7 @@ use litebox::platform::{
 use litebox::{mm::linux::PageRange, platform::page_mgmt::FixedAddressBehavior};
 use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
 use ptr::UserMutPtr;
+use x86_64::VirtAddr;
 
 extern crate alloc;
 
@@ -414,7 +415,14 @@ impl StdioProvider for LiteBoxKernel {
 ///
 /// # Safety
 /// The context must be valid guest context.
+/// # Panics
+/// Panics if `gsbase` is larger than `u64::MAX`.
 pub unsafe fn run_thread(ctx: &mut litebox_common_linux::PtRegs) {
+    // Currently, `litebox_platform_kernel` uses `swapgs` to efficiently switch between
+    // kernel and user GS base values during kernel-user mode transitions.
+    // This `swapgs` usage can pontetially leak a kernel address to the user, so
+    // we clear the `KernelGsBase` MSR before running the user thread.
+    crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
     unsafe {
         run_thread_inner(ctx);
     }
@@ -563,6 +571,9 @@ unsafe extern "C" fn switch_to_guest(_ctx: &litebox_common_linux::PtRegs) -> ! {
             "mov rax, {user_cs}",
             "push rax",
             "push gs:scratch@tpoff", // jump to the guest
+            // clear the GS base register (as the `KernelGsBase` MSR contains 0)
+            // while writing the current GS base value to `KernelGsBase`.
+            "swapgs",
             "iretq",
             user_cs = const 0x2b,
             rflags = const 0,
