@@ -32,6 +32,8 @@ cfg_if::cfg_if! {
         pub type Platform = litebox_platform_lvbs::host::LvbsLinuxKernel;
     } else if #[cfg(feature = "platform_linux_snp")] {
         pub type Platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel;
+    } else if #[cfg(feature = "platform_ostd")] {
+        pub type Platform = platform::OstdPlatform;
     } else {
         compile_error!(
             r##"Hint: you might have forgotten to mark 'default-features = false'."##

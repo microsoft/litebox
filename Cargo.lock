@@ -1073,6 +1073,7 @@ dependencies = [
  "litebox_platform_lvbs",
  "litebox_platform_windows_userland",
  "once_cell",
+ "platform",
 ]
 
 [[package]]
@@ -1820,6 +1821,9 @@ dependencies = [
 name = "runner"
 version = "0.1.0"
 dependencies = [
+ "litebox",
+ "litebox_platform_multiplex",
+ "litebox_shim_linux",
  "ostd",
  "platform",
 ]
