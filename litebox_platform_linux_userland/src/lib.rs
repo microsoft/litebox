@@ -292,7 +292,6 @@ pub unsafe fn run_thread(
 struct ThreadContext<'a> {
     shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &'a mut litebox_common_linux::PtRegs,
-    x: u32,
 }
 
 fn run_thread_inner(
@@ -300,11 +299,7 @@ fn run_thread_inner(
     ctx: &mut litebox_common_linux::PtRegs,
 ) {
     let ctx_ptr = core::ptr::from_mut(ctx);
-    let mut thread_ctx = ThreadContext {
-        shim,
-        ctx,
-        x: 0x1337,
-    };
+    let mut thread_ctx = ThreadContext { shim, ctx };
     ThreadHandle::run_with_handle(|| {
         with_signal_alt_stack(|| unsafe { run_thread_arch(&mut thread_ctx, ctx_ptr) })
     });
@@ -1678,7 +1673,6 @@ impl ThreadContext<'_> {
             &mut litebox_common_linux::PtRegs,
         ) -> ContinueOperation,
     ) {
-        assert_eq!(self.x, 0x1337);
         // Clear the interrupt flag before calling the shim, since we've handled it
         // now (by calling into the shim), and it might be set again by the shim
         // before returning.
