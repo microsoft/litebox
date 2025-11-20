@@ -286,7 +286,7 @@ pub unsafe fn run_thread(
     shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
 ) {
-    run_thread_inner(&shim, ctx)
+    run_thread_inner(&shim, ctx);
 }
 
 struct ThreadContext<'a> {
@@ -301,7 +301,7 @@ fn run_thread_inner(
     let ctx_ptr = core::ptr::from_mut(ctx);
     let mut thread_ctx = ThreadContext { shim, ctx };
     ThreadHandle::run_with_handle(|| {
-        with_signal_alt_stack(|| unsafe { run_thread_arch(&mut thread_ctx, ctx_ptr) })
+        with_signal_alt_stack(|| unsafe { run_thread_arch(&mut thread_ctx, ctx_ptr) });
     });
 }
 

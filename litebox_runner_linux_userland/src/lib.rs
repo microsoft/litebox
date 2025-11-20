@@ -266,7 +266,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox_platform_linux_userland::run_thread(
             program.entrypoints,
             &mut litebox_common_linux::PtRegs::default(),
-        )
+        );
     };
     Ok(())
 }

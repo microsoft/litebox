@@ -1304,8 +1304,8 @@ impl Task {
                         eflags: 0,
                         rsp: load_info.user_stack_top,
                         ss: 0x2b, // __USER_DS
-                    }
-                };
+                    };
+                }
                 #[cfg(target_arch = "x86")]
                 {
                     *ctx = litebox_common_linux::PtRegs {
