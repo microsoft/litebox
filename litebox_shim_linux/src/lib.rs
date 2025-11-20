@@ -79,13 +79,25 @@ fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
     }
 }
 
-pub struct LinuxShimEntrypoints;
+pub struct LinuxShimEntrypoints {
+    // Data for the entrypoints is stored in TLS, so do not allow Send/Sync auto
+    // traits.
+    //
+    // FUTURE: move `Task` into here once we eliminate all use of TLS.
+    _not_send: core::marker::PhantomData<*const ()>,
+}
+
+impl Drop for LinuxShimEntrypoints {
+    fn drop(&mut self) {
+        SHIM_TLS.deinit();
+    }
+}
 
 impl litebox::shim::EnterShim for LinuxShimEntrypoints {
     type ExecutionContext = litebox_common_linux::PtRegs;
 
-    fn init(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        ContinueOperation::ResumeGuest
+    fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        enter_shim(ctx, Task::handle_init_request)
     }
 
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -114,7 +126,6 @@ fn enter_shim(
         (task.is_exiting.get(), task.pending_sigreturn.take())
     });
     if exit_thread {
-        crate::SHIM_TLS.deinit();
         ContinueOperation::ExitThread
     } else if pending_sigreturn {
         // TEMP: this must be done outside of with_current_task to avoid leaking a borrow.
@@ -203,12 +214,6 @@ impl LinuxShim {
         set_load_filter(callback);
     }
 
-    /// Returns the entrypoints to call to interact with the shim from guest
-    /// threads.
-    pub fn entrypoints(&self) -> &'static LinuxShimEntrypoints {
-        &LinuxShimEntrypoints
-    }
-
     fn into_global(self) -> Arc<GlobalState> {
         Arc::new(GlobalState {
             fs: self
@@ -229,7 +234,7 @@ impl LinuxShim {
         path: &str,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
-    ) -> Result<litebox_common_linux::PtRegs, loader::ElfLoaderError> {
+    ) -> Result<LoadedProgram, loader::ElfLoaderError> {
         let litebox = self.litebox;
         let global = self.into_global();
 
@@ -245,16 +250,10 @@ impl LinuxShim {
         let files = Arc::new(syscalls::file::FilesState::new(litebox));
         files.initialize_stdio_in_shared_descriptors_table(&global.fs);
 
-        // TODO: ensure this gets torn down even if the thread never runs sys_exit.
-        // Consider a scoped execution model, e.g.
-        // ```
-        // litebox_shim_linux::run_process(task, |litebox| {
-        //     ...
-        // })
-        // ```
         SHIM_TLS.init(LinuxShimTls {
             current_task: Task {
                 global,
+                thread: syscalls::process::ThreadState::new_process(),
                 wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
                 pid,
                 ppid,
@@ -271,18 +270,21 @@ impl LinuxShim {
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
-                process: syscalls::process::Process::new().into(),
                 pending_sigreturn: false.into(),
                 is_exiting: false.into(),
             },
         });
 
-        let r = with_current_task(|task| task.load_program(path, argv, envp));
-        if r.is_err() {
-            SHIM_TLS.deinit();
-        }
-        r
+        let entrypoints = crate::LinuxShimEntrypoints {
+            _not_send: core::marker::PhantomData,
+        };
+        with_current_task(|task| task.load_program(path, argv, envp))?;
+        Ok(LoadedProgram { entrypoints })
     }
+}
+
+pub struct LoadedProgram {
+    pub entrypoints: LinuxShimEntrypoints,
 }
 
 /// Get the global litebox object
@@ -411,7 +413,7 @@ impl Descriptors {
             });
         if idx
             >= task
-                .process
+                .process()
                 .limits
                 .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
         {
@@ -1227,7 +1229,7 @@ struct LinuxShimTls {
 struct Task {
     global: Arc<GlobalState>,
     wait_state: wait::WaitState,
-    process: Arc<syscalls::process::Process>,
+    thread: syscalls::process::ThreadState,
     /// Process ID
     pid: i32,
     /// Parent Process ID
@@ -1291,75 +1293,6 @@ fn set_load_filter(callback: LoadFilter) {
         .expect("load filter already set");
 }
 
-impl Task {
-    /// Loads the specified program into the process's address space and returns the
-    /// register state for the initial thread.
-    fn load_program(
-        &self,
-        path: &str,
-        argv: Vec<alloc::ffi::CString>,
-        mut envp: Vec<alloc::ffi::CString>,
-    ) -> Result<litebox_common_linux::PtRegs, loader::ElfLoaderError> {
-        if let Some(&filter) = LOAD_FILTER.get() {
-            filter(&mut envp);
-        }
-
-        // TODO: split parsing from mapping so that we can return an error code to execve that it
-        // can return to the guest.
-        let load_info = loader::load_program(self, path, argv, envp, self.init_auxv())?;
-
-        let comm = path.rsplit('/').next().unwrap_or("unknown");
-        self.set_task_comm(comm.as_bytes());
-
-        #[cfg(target_arch = "x86_64")]
-        let pt_regs = litebox_common_linux::PtRegs {
-            r15: 0,
-            r14: 0,
-            r13: 0,
-            r12: 0,
-            rbp: 0,
-            rbx: 0,
-            r11: 0,
-            r10: 0,
-            r9: 0,
-            r8: 0,
-            rax: 0,
-            rcx: 0,
-            rdx: 0,
-            rsi: 0,
-            rdi: 0,
-            orig_rax: 0,
-            rip: load_info.entry_point,
-            cs: 0x33, // __USER_CS
-            eflags: 0,
-            rsp: load_info.user_stack_top,
-            ss: 0x2b, // __USER_DS
-        };
-        #[cfg(target_arch = "x86")]
-        let pt_regs = litebox_common_linux::PtRegs {
-            ebx: 0,
-            ecx: 0,
-            edx: 0,
-            esi: 0,
-            edi: 0,
-            ebp: 0,
-            eax: 0,
-            xds: 0,
-            xes: 0,
-            xfs: 0,
-            xgs: 0,
-            orig_eax: 0,
-            eip: load_info.entry_point,
-            xcs: 0x23, // __USER_CS
-            eflags: 0,
-            esp: load_info.user_stack_top,
-            xss: 0x2b, // __USER_DS
-        };
-
-        Ok(pt_regs)
-    }
-}
-
 #[cfg(test)]
 mod test_utils {
     extern crate std;
@@ -1375,7 +1308,7 @@ mod test_utils {
             Task {
                 wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
                 global: self,
-                process: Arc::new(syscalls::process::Process::new()),
+                thread: syscalls::process::ThreadState::new_process(),
                 pid,
                 ppid: 0,
                 tid: pid,
@@ -1400,7 +1333,7 @@ mod test_utils {
         /// Returns a function that clones this task with a new TID for testing.
         pub(crate) fn clone_for_test(&self) -> impl 'static + Send + FnOnce() -> Self {
             let global = self.global.clone();
-            let process = self.process.clone();
+            let thread = self.thread.clone_for_test();
             let credentials = self.credentials.clone();
             let fs = self.fs.clone();
             let comm = self.comm.clone();
@@ -1411,7 +1344,7 @@ mod test_utils {
             move || Task {
                 wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
                 global,
-                process,
+                thread: thread(),
                 pid,
                 ppid: parent_pid,
                 tid,

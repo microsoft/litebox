@@ -76,10 +76,13 @@ impl TestLauncher {
             CString::new("hello").unwrap(),
         ];
         let envp = vec![CString::new("PATH=/bin").unwrap()];
-        let mut pt_regs = self
-            .shim
+        self.shim
             .load_program(self.platform.init_task(), executable_path, argv, envp)
             .unwrap();
-        unsafe { litebox_platform_windows_userland::run_thread(&mut pt_regs) };
+        unsafe {
+            litebox_platform_windows_userland::run_thread(
+                &mut litebox_common_linux::PtRegs::default(),
+            )
+        };
     }
 }

@@ -140,8 +140,8 @@ pub extern "C" fn sandbox_process_init(
         );
     };
     let entrypoints = shim.entrypoints();
-    *pt_regs = match shim.load_program(platform.init_task(boot_params), &program, argv, envp) {
-        Ok(regs) => regs,
+    let program = match shim.load_program(platform.init_task(boot_params), &program, argv, envp) {
+        Ok(program) => program,
         Err(err) => {
             litebox::log_println!(platform, "failed to load program: {}", err);
             litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
@@ -150,11 +150,11 @@ pub extern "C" fn sandbox_process_init(
             );
         }
     };
-    // TODO: handle ContinueOperation properly.
-    assert!(matches!(
-        entrypoints.init(pt_regs),
-        ContinueOperation::ResumeGuest
-    ));
+
+    litebox_platform_linux_kernel::host::snp::snp_impl::init_thread(
+        shim.init_thread_boxed(program),
+        pt_regs,
+    );
 }
 
 #[unsafe(no_mangle)]
@@ -169,9 +169,7 @@ pub extern "C" fn sandbox_task_exit() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn do_syscall_64(pt_regs: &mut litebox_common_linux::PtRegs) {
-    match litebox_shim_linux::LinuxShimEntrypoints.syscall(pt_regs) {
-        ContinueOperation::ResumeGuest | ContinueOperation::ExitThread => {}
-    }
+    litebox_platform_linux_kernel::host::snp::snp_impl::handle_syscall(pt_regs);
 }
 
 /// This function is called on panic.

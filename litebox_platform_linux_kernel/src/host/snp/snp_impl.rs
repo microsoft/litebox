@@ -1,6 +1,9 @@
 //! An implementation of [`HostInterface`] for SNP VMM
 use ::alloc::boxed::Box;
-use core::arch::asm;
+use core::{
+    arch::asm,
+    cell::{Cell, OnceCell},
+};
 
 use litebox::{
     platform::{RawConstPointer, RawMutPointer},
@@ -108,15 +111,13 @@ impl SnpLinuxKernel {
 
 unsafe impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
     fn get_thread_local_storage() -> *mut () {
-        current()
-            .expect("Current task must be available")
-            .tls
-            .cast()
+        let tls = get_tls();
+        unsafe { (*tls).shim_tls.get() }
     }
 
     unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
-        let current_task = current().expect("Current task must be available");
-        core::mem::replace(&mut current_task.tls, value.cast()).cast()
+        let tls = get_tls();
+        unsafe { (*tls).shim_tls.replace(value) }
     }
 }
 
@@ -124,11 +125,19 @@ core::arch::global_asm!(include_str!("entry.S"));
 
 struct ThreadStartArgs {
     ctx: litebox_common_linux::PtRegs,
-    init_thread: Box<dyn litebox::shim::InitThread>,
+    init_thread:
+        Box<dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>>,
 }
 
 const RIP_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs, rip);
 const EFLAGS_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs, eflags);
+
+struct ThreadState {
+    shim: OnceCell<
+        Box<dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>>,
+    >,
+    shim_tls: Cell<*mut ()>,
+}
 
 /// Callback function for a new thread
 ///
@@ -143,7 +152,9 @@ extern "C" fn thread_start(
 
     // Set up thread-local storage for the new thread. This is done by
     // calling the actual thread callback with the unpacked arguments
-    thread_start_args.init_thread.init();
+    let shim = thread_start_args.init_thread.init();
+
+    init_thread(shim, regs);
 
     // Restore the context
     unsafe {
@@ -177,6 +188,53 @@ extern "C" fn thread_start(
     unreachable!("Thread should not return");
 }
 
+fn get_tls() -> *const ThreadState {
+    let tls = current().unwrap().tls;
+    if !tls.is_null() {
+        return tls.cast();
+    }
+    let tls = Box::new(ThreadState {
+        shim: OnceCell::new(),
+        shim_tls: Cell::new(core::ptr::null_mut()),
+    });
+    let tls = Box::into_raw(tls);
+    current().unwrap().tls = tls.cast();
+    tls
+}
+
+pub fn init_thread(
+    shim: Box<dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>>,
+    pt_regs: &mut litebox_common_linux::PtRegs,
+) {
+    let tls = unsafe { &*get_tls() };
+    tls.shim
+        .set(shim)
+        .ok()
+        .expect("thread shim should not be initialized twice");
+    match tls.shim.get().unwrap().init(pt_regs) {
+        litebox::shim::ContinueOperation::ResumeGuest => {}
+        litebox::shim::ContinueOperation::ExitThread => exit_thread(),
+    }
+}
+
+fn exit_thread() -> ! {
+    let tls = current().unwrap().tls.cast::<ThreadState>();
+    if !tls.is_null() {
+        let tls = unsafe { Box::from_raw(tls) };
+        drop(tls);
+    }
+    let r = HostSnpInterface::syscalls(SyscallN::<1, NR_SYSCALL_EXIT> { args: [0] });
+    unreachable!("thread has exited: {:?}", r);
+}
+
+pub fn handle_syscall(pt_regs: &mut litebox_common_linux::PtRegs) {
+    let tls = unsafe { &*get_tls() };
+    match tls.shim.get().unwrap().syscall(pt_regs) {
+        litebox::shim::ContinueOperation::ResumeGuest => {}
+        litebox::shim::ContinueOperation::ExitThread => exit_thread(),
+    }
+}
+
 impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
@@ -185,7 +243,9 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     unsafe fn spawn_thread(
         &self,
         ctx: &Self::ExecutionContext,
-        init_thread: Box<dyn litebox::shim::InitThread>,
+        init_thread: Box<
+            dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
+        >,
     ) -> Result<(), Self::ThreadSpawnError> {
         let flags = CloneFlags::THREAD
             | CloneFlags::VM
@@ -195,7 +255,7 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
             | CloneFlags::SYSVSEM
             | CloneFlags::CHILD_SETTID;
         let thread_start_args = Box::new(ThreadStartArgs {
-            ctx: *ctx,
+            ctx: ctx.clone(),
             init_thread,
         });
         let thread_start_arg_ptr = Box::into_raw(thread_start_args);
