@@ -70,8 +70,7 @@ impl litebox::platform::PunchthroughProvider for OstdPlatform {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant {
-    // TODO
-    x: u64,
+    from_boot: core::time::Duration,
 }
 pub struct SystemTime {
     // TODO
@@ -100,7 +99,9 @@ impl litebox::platform::TimeProvider for OstdPlatform {
     type Instant = Instant;
     type SystemTime = SystemTime;
     fn now(&self) -> Self::Instant {
-        todo!()
+        Instant {
+            from_boot: ostd::timer::Jiffies::elapsed().as_duration(),
+        }
     }
     fn current_time(&self) -> Self::SystemTime {
         todo!()
@@ -120,32 +121,77 @@ impl litebox::platform::IPInterfaceProvider for OstdPlatform {
 }
 
 pub struct RawMutex {
-    // TODO
+    atomic: core::sync::atomic::AtomicU32,
+    wait_queue: ostd::sync::WaitQueue,
 }
 
 impl litebox::platform::RawMutex for RawMutex {
     fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32 {
-        todo!()
+        &self.atomic
     }
-    fn wake_many(&self, _n: usize) -> usize {
-        todo!()
+
+    fn wake_many(&self, n: usize) -> usize {
+        assert!(n > 0);
+        if n == 1 {
+            if self.wait_queue.wake_one() { 1 } else { 0 }
+        } else {
+            self.wait_queue.wake_all()
+        }
     }
-    fn block(&self, _val: u32) -> Result<(), litebox::platform::ImmediatelyWokenUp> {
-        todo!()
+
+    // XXX: Not 100% sure that these semantics match what we need, but they should be close enough
+    // to work for now.
+    fn block(&self, val: u32) -> Result<(), litebox::platform::ImmediatelyWokenUp> {
+        let mut first_check = true;
+        self.wait_queue.wait_until(|| {
+            let current = self.atomic.load(core::sync::atomic::Ordering::Acquire);
+            if current != val {
+                if first_check {
+                    Some(Err(litebox::platform::ImmediatelyWokenUp))
+                } else {
+                    Some(Ok(()))
+                }
+            } else {
+                first_check = false;
+                None
+            }
+        })
     }
     fn block_or_timeout(
         &self,
-        _val: u32,
-        _time: core::time::Duration,
+        val: u32,
+        time: core::time::Duration,
     ) -> Result<litebox::platform::UnblockedOrTimedOut, litebox::platform::ImmediatelyWokenUp> {
-        todo!()
+        let start = ostd::timer::Jiffies::elapsed();
+        let deadline = start.as_duration().as_nanos() + time.as_nanos();
+        let mut first_check = true;
+        self.wait_queue.wait_until(|| {
+            let current = self.atomic.load(core::sync::atomic::Ordering::Acquire);
+            if current != val {
+                if first_check {
+                    Some(Err(litebox::platform::ImmediatelyWokenUp))
+                } else {
+                    Some(Ok(litebox::platform::UnblockedOrTimedOut::Unblocked))
+                }
+            } else {
+                first_check = false;
+                if ostd::timer::Jiffies::elapsed().as_duration().as_nanos() >= deadline {
+                    Some(Ok(litebox::platform::UnblockedOrTimedOut::TimedOut))
+                } else {
+                    None
+                }
+            }
+        })
     }
 }
 
 impl litebox::platform::RawMutexProvider for OstdPlatform {
     type RawMutex = RawMutex;
     fn new_raw_mutex(&self) -> Self::RawMutex {
-        todo!()
+        RawMutex {
+            atomic: core::sync::atomic::AtomicU32::new(0),
+            wait_queue: ostd::sync::WaitQueue::new(),
+        }
     }
 }
 
