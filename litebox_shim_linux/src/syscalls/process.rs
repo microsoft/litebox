@@ -18,8 +18,6 @@ use litebox::platform::{
 };
 use litebox::platform::{RawMutPointer as _, ThreadProvider as _};
 use litebox::utils::TruncateExt as _;
-#[cfg(target_arch = "x86")]
-use litebox::utils::TruncateExt;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, PrctlArg, TimeParam, errno::Errno,
 };
