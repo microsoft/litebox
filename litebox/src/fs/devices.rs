@@ -20,7 +20,9 @@ use crate::{
 /// Block size for stdio devices
 const STDIO_BLOCK_SIZE: usize = 1024;
 /// Block size for null device
-const NULL_BLKSIZE: usize = 0x1000;
+const NULL_BLOCK_SIZE: usize = 0x1000;
+/// Block size for /dev/urandom
+const URANDOM_BLOCK_SIZE: usize = 0x1000;
 
 /// Constant node information for all 3 stdio devices:
 /// ```console
@@ -41,12 +43,20 @@ const NULL_NODE_INFO: NodeInfo = NodeInfo {
     // major=1, minor=3
     rdev: core::num::NonZeroUsize::new(0x103),
 };
-
+/// Node info for /dev/urandom
+const URANDOM_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 8,
+    // major=1, minor=9
+    rdev: core::num::NonZeroUsize::new(0x109),
+};
+#[derive(Debug, Clone, Copy)]
 enum Device {
     Stdin,
     Stdout,
     Stderr,
     Null,
+    URandom,
 }
 
 /// A backing implementation for [`FileSystem`](super::FileSystem).
@@ -100,10 +110,42 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
             Ok((self.current_working_dir.clone() + path.as_rust_str()?).normalized()?)
         }
     }
+
+    fn device_file_status(device: Device) -> FileStatus {
+        match device {
+            Device::Stdin | Device::Stdout | Device::Stderr => FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: STDIO_NODE_INFO,
+                blksize: STDIO_BLOCK_SIZE,
+            },
+            Device::Null => FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: NULL_NODE_INFO,
+                blksize: NULL_BLOCK_SIZE,
+            },
+            Device::URandom => FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: URANDOM_NODE_INFO,
+                blksize: URANDOM_BLOCK_SIZE,
+            },
+        }
+    }
 }
 
-impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider>
-    super::FileSystem for FileSystem<Platform>
+impl<
+    Platform: crate::sync::RawSyncPrimitivesProvider
+        + crate::platform::StdioProvider
+        + crate::platform::CrngProvider,
+> super::FileSystem for FileSystem<Platform>
 {
     fn open(
         &self,
@@ -143,13 +185,19 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
                 }
             }
             "/dev/null" => Device::Null,
+            "/dev/urandom" => Device::URandom,
             _ => return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
         };
         if open_directory {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        if nonblocking && matches!(device, Device::Stdin | Device::Stderr | Device::Stdout) {
-            unimplemented!("Non-blocking I/O is not supported for stdio streams");
+        if nonblocking
+            && matches!(
+                device,
+                Device::Stdin | Device::Stderr | Device::Stdout | Device::URandom
+            )
+        {
+            unimplemented!("Non-blocking I/O is not supported for {:?}", device);
         }
         let fd = self.litebox.descriptor_table_mut().insert(device);
         if truncate {
@@ -189,6 +237,10 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
                 // /dev/null read returns EOF
                 return Ok(0);
             }
+            Device::URandom => {
+                self.litebox.x.platform.fill_bytes_crng(buf);
+                return Ok(buf.len());
+            }
         }
         if offset.is_some() {
             unimplemented!()
@@ -218,8 +270,15 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
             Device::Stdin => return Err(WriteError::NotForWriting),
             Device::Stdout => StdioOutStream::Stdout,
             Device::Stderr => StdioOutStream::Stderr,
-            Device::Null => {
+            Device::Null | Device::URandom => {
                 // /dev/null discards data: report as if written fully
+                //
+                // Writing to /dev/random or /dev/urandom will update the entropy
+                // pool with the data written, but this will not result in a higher
+                // entropy count. This means that it will impact the contents read
+                // from both files, but it will not make reads from /dev/random
+                // faster. For simplicity, we just discard the data written to
+                // /dev/urandom here.
                 return Ok(buf.len());
             }
         };
@@ -249,7 +308,7 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
             .entry
         {
             Device::Stdin | Device::Stdout | Device::Stderr => Err(SeekError::NonSeekable),
-            Device::Null => {
+            Device::Null | Device::URandom => {
                 // Linux allows lseek on /dev/null and returns position 0 (or sets to length 0).
                 Ok(0)
             }
@@ -304,52 +363,25 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
 
     fn file_status(&self, path: impl Arg) -> Result<FileStatus, FileStatusError> {
         let path = self.absolute_path(path)?;
-        match path.as_str() {
-            "/dev/stdin" | "/dev/stdout" | "/dev/stderr" => Ok(FileStatus {
-                file_type: FileType::CharacterDevice,
-                mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
-                size: 0,
-                owner: UserInfo::ROOT,
-                node_info: STDIO_NODE_INFO,
-                blksize: STDIO_BLOCK_SIZE,
-            }),
-            "/dev/null" => Ok(FileStatus {
-                file_type: FileType::CharacterDevice,
-                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
-                size: 0,
-                owner: UserInfo::ROOT,
-                node_info: NULL_NODE_INFO,
-                blksize: NULL_BLKSIZE,
-            }),
-            _ => Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)),
-        }
+        let device = match path.as_str() {
+            "/dev/stdin" => Device::Stdin,
+            "/dev/stdout" => Device::Stdout,
+            "/dev/stderr" => Device::Stderr,
+            "/dev/null" => Device::Null,
+            "/dev/urandom" => Device::URandom,
+            _ => return Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)),
+        };
+        Ok(Self::device_file_status(device))
     }
 
     fn fd_file_status(&self, fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
-        match &self
+        let device = self
             .litebox
             .descriptor_table()
             .get_entry(fd)
             .ok_or(FileStatusError::ClosedFd)?
-            .entry
-        {
-            Device::Stdin | Device::Stdout | Device::Stderr => Ok(FileStatus {
-                file_type: FileType::CharacterDevice,
-                mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
-                size: 0,
-                owner: UserInfo::ROOT,
-                node_info: STDIO_NODE_INFO,
-                blksize: STDIO_BLOCK_SIZE,
-            }),
-            Device::Null => Ok(FileStatus {
-                file_type: FileType::CharacterDevice,
-                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
-                size: 0,
-                owner: UserInfo::ROOT,
-                node_info: NULL_NODE_INFO,
-                blksize: NULL_BLKSIZE,
-            }),
-        }
+            .entry;
+        Ok(Self::device_file_status(device))
     }
 }
 
