@@ -126,7 +126,7 @@ unsafe extern "system" fn vectored_exception_handler(
         && unsafe { litebox_common_linux::rdfsbase() } == 0
         && WindowsUserland::get_thread_fs_base() != 0
     {
-        set_context_to_interrupt_callback(tls, context, regs);
+        set_context_to_interrupt_callback(tls, context);
     } else {
         // Push the exception record onto the host stack.
         let exception_record_ptr = tls.host_sp.get().cast::<EXCEPTION_RECORD>().wrapping_sub(1);
@@ -143,7 +143,6 @@ unsafe extern "system" fn vectored_exception_handler(
         context.Rip = exception_callback as usize as u64;
         context.Rsp = rsp as u64;
         context.Rbp = tls.host_bp.get() as u64;
-        context.Rcx = core::ptr::from_mut(regs) as u64;
         context.Rdx = exception_record_ptr as u64;
     }
 
@@ -460,6 +459,9 @@ unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_
     // Offset into the TEB (gs segment) where TLS slots are stored.
     .equ TEB_TLS_SLOTS_OFFSET, 5248
 
+    push    rcx // Alignment
+    push    rcx // Save thread_ctx
+
     // Save the host rsp and rbp into the TLS state.
     mov     QWORD PTR [rdx + {HOST_SP}], rsp
     mov     QWORD PTR [rdx + {HOST_BP}], rbp
@@ -508,15 +510,13 @@ syscall_callback:
     push    r14
     push    r15
 
-    /// Pass the pt_regs to syscall_handler.
-    mov     rcx, rsp
-
     /// Reestablish the stack and frame pointers.
     mov     rsp, [r11 + {HOST_SP}]
     mov     rbp, [r11 + {HOST_BP}]
 
     // Handle the syscall. This will jump back to the guest but
     // will return if the thread is exiting.
+    mov  rcx, QWORD PTR [rsp] // thread_ctx
     call {syscall_handler}
     jmp .Ldone
 
@@ -524,10 +524,12 @@ exception_callback:
     // Handle the exception. The stack and frame pointers are already restored,
     // and the guest context is up to date. rcx contains a pointer to the
     // guest pt_regs, and rdx contains a pointer to the exception record.
+    mov  rcx, QWORD PTR [rsp] // thread_ctx
     call {exception_handler}
     jmp .Ldone
 
 interrupt_callback:
+    mov  rcx, QWORD PTR [rsp] // thread_ctx
     call {interrupt_handler}
     jmp .Ldone
 
@@ -897,7 +899,7 @@ impl ThreadHandle {
             // SAFETY: `continue_context` is not accessed by user-mode code
             // while `is_in_guest` is true.
             let continue_context = unsafe { &mut *target_tls.continue_context.get() };
-            set_context_to_interrupt_callback(target_tls, continue_context, guest_context);
+            set_context_to_interrupt_callback(target_tls, continue_context);
             false
         } else {
             // Case 4: save the guest context and jump to interrupt callback.
@@ -905,7 +907,7 @@ impl ThreadHandle {
             true
         };
         if run_interrupt_callback {
-            set_context_to_interrupt_callback(target_tls, &mut context, guest_context);
+            set_context_to_interrupt_callback(target_tls, &mut context);
             unsafe {
                 windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(
                     inner.handle.as_raw_handle(),
@@ -921,13 +923,11 @@ impl ThreadHandle {
 fn set_context_to_interrupt_callback(
     tls: &TlsState,
     context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
-    guest_context: *mut litebox_common_linux::PtRegs,
 ) {
     let required_flags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
         | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64;
     assert!(context.ContextFlags & required_flags == required_flags);
     context.Rip = interrupt_callback as usize as u64;
-    context.Rcx = guest_context as usize as u64;
     context.Rsp = tls.host_sp.get().addr() as u64;
     context.Rbp = tls.host_bp.get().addr() as u64;
 }
