@@ -159,6 +159,13 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
         ) else {
             panic!("GDT is not initialized");
         };
+
+        // Currently, `litebox_platform_lvbs` uses `swapgs` to efficiently switch between
+        // kernel and user GS base values during kernel-user mode transitions.
+        // This `swapgs` usage can pontetially leak a kernel address to the user, so
+        // we clear the `KernelGsBase` MSR before running the user thread.
+        crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
+
         unsafe {
             asm!(
                 "push r10",
@@ -166,6 +173,9 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
                 "push r12",
                 "push r13",
                 "push r14",
+                // clear the GS base register (as the `KernelGsBase` MSR contains 0)
+                // while writing the current GS base value to `KernelGsBase`.
+                "swapgs",
                 "iretq",
                 in("r10") ds_idx, in("r11") rsp.as_u64(), in("r12") rflags.bits(),
                 in("r13") cs_idx, in("r14") rip.as_u64(),

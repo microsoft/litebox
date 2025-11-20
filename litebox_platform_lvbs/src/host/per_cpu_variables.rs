@@ -289,7 +289,6 @@ fn get_or_init_refcell_of_per_cpu_variables() -> Option<&'static RefCell<*mut Pe
             unsafe {
                 wrgsbase(usize::try_from(addr.as_u64()).unwrap());
             }
-            crate::arch::write_kernel_gsbase_msr(addr);
             Some(refcell)
         }
     } else {
