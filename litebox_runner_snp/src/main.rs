@@ -8,7 +8,6 @@ mod globals;
 extern crate alloc;
 
 use alloc::borrow::ToOwned;
-use litebox::shim::{ContinueOperation, EnterShim as _};
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_platform_linux_kernel::{HostInterface, host::snp::ghcb::ghcb_prints};
 
@@ -139,7 +138,6 @@ pub extern "C" fn sandbox_process_init(
             globals::SM_TERM_INVALID_PARAM,
         );
     };
-    let entrypoints = shim.entrypoints();
     let program = match shim.load_program(platform.init_task(boot_params), &program, argv, envp) {
         Ok(program) => program,
         Err(err) => {
@@ -152,7 +150,7 @@ pub extern "C" fn sandbox_process_init(
     };
 
     litebox_platform_linux_kernel::host::snp::snp_impl::init_thread(
-        shim.init_thread_boxed(program),
+        alloc::boxed::Box::new(program.entrypoints),
         pt_regs,
     );
 }
