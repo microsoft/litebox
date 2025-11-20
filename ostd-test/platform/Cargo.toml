@@ -3,5 +3,7 @@ name = "platform"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies.ostd]
-version = "0.16.1"
+[dependencies]
+ostd = "0.16.1"
+litebox = { path = "../../litebox" }
+litebox_common_linux = { path = "../../litebox_common_linux" }
