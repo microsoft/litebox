@@ -133,8 +133,11 @@ fn run_ta_with_default_commands(ta_info: &ElfLoadInfo) {
             None,
         );
         unsafe {
-            litebox_platform_linux_userland::run_thread(litebox_shim_optee::OpteeShim, &mut pt_regs)
-        };
+            litebox_platform_linux_userland::run_thread(
+                litebox_shim_optee::OpteeShim,
+                &mut pt_regs,
+            );
+        }
 
         if func_id == UteeEntryFunc::CloseSession {
             litebox_shim_optee::deinit_session();
