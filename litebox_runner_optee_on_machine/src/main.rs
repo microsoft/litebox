@@ -6,11 +6,10 @@ use bootloader::{BootInfo, bootinfo::MemoryRegionType, entry_point};
 use core::panic::PanicInfo;
 use litebox_common_optee::{TeeIdentity, TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned};
 use litebox_platform_kernel::{
-    arch::{
-        enable_extended_states, enable_fsgsbase, enable_smep, gdt, instrs::hlt_loop, interrupts,
-    },
+    arch::{enable_extended_states, enable_fsgsbase, enable_smep, gdt, interrupts},
     debug_serial_println,
     mm::MemoryProvider,
+    per_cpu_variables::{PerCpuVariables, with_per_cpu_variables},
     serial_println,
     user_context::UserSpaceManagement,
 };
@@ -18,9 +17,35 @@ use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::loader::ElfLoadInfo;
 use x86_64::VirtAddr;
 
-entry_point!(kernel_main);
+#[cfg(not(feature = "qemu"))]
+use litebox_platform_kernel::arch::instrs::hlt_loop;
 
-fn kernel_main(bootinfo: &'static BootInfo) -> ! {
+entry_point!(kernel_start);
+
+fn kernel_start(bootinfo: &'static BootInfo) -> ! {
+    enable_fsgsbase();
+    enable_extended_states();
+
+    let stack_top = with_per_cpu_variables(PerCpuVariables::kernel_stack_top);
+
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, rax",
+            "and rsp, -16",
+            "call {kernel_main}",
+            in("rdi") bootinfo, in("rax") stack_top,
+            kernel_main = sym kernel_main,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    #[cfg(feature = "qemu")]
+    qemu_exit();
+    #[cfg(not(feature = "qemu"))]
+    hlt_loop();
+}
+
+unsafe extern "C" fn kernel_main(bootinfo: &'static BootInfo) -> ! {
     serial_println!("===========================================");
     serial_println!(" Hello from LiteBox for (Virtual) Machine! ");
     serial_println!("===========================================");
@@ -55,10 +80,6 @@ fn kernel_main(bootinfo: &'static BootInfo) -> ! {
     let platform = Platform::new(l4_table);
     debug_serial_println!("LiteBox Platform created at {:p}.", platform);
 
-    enable_fsgsbase();
-    enable_extended_states();
-    enable_smep();
-
     gdt::init();
     interrupts::init_idt();
     debug_serial_println!("GDT and IDT initialized.");
@@ -66,6 +87,8 @@ fn kernel_main(bootinfo: &'static BootInfo) -> ! {
     litebox_platform_multiplex::set_platform(platform);
     Platform::register_shim(&litebox_shim_optee::OpteeShim);
     debug_serial_println!("OP-TEE Shim registered.");
+
+    enable_smep();
 
     if let Ok(session_id) = platform.create_userspace() {
         let loaded_ta = litebox_shim_optee::loader::load_elf_buffer(TA_BINARY).unwrap();
@@ -75,11 +98,10 @@ fn kernel_main(bootinfo: &'static BootInfo) -> ! {
     serial_println!("BYE!");
     // TODO: this is QEMU/KVM specific instructions to terminate VM/VMM via
     // the `isa-debug-exit` device. Different VMMs have different ways for this.
-    unsafe {
-        core::arch::asm!("mov dx, 0xf4; mov al, 1; out dx, al; hlt");
-    }
-
-    hlt_loop()
+    #[cfg(feature = "qemu")]
+    qemu_exit();
+    #[cfg(not(feature = "qemu"))]
+    hlt_loop();
 }
 
 /// This function simply opens and closes a session to the TA to verify that
@@ -153,6 +175,20 @@ unsafe fn active_level_4_table_addr() -> x86_64::PhysAddr {
     use x86_64::registers::control::Cr3;
     let (level_4_table_frame, _) = Cr3::read();
     level_4_table_frame.start_address()
+}
+
+#[cfg(feature = "qemu")]
+fn qemu_exit() -> ! {
+    const ISA_DEBUG_EXIT_IOBASE: u16 = 0xf4;
+    const EXIT_CODE: u8 = 1;
+    unsafe {
+        core::arch::asm!(
+            "mov dx, {}; mov al, {}; out dx, al; hlt",
+            const ISA_DEBUG_EXIT_IOBASE,
+            const EXIT_CODE,
+            options(noreturn)
+        )
+    }
 }
 
 // TODO: support loading other TAs (dynamically)

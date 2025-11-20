@@ -16,5 +16,9 @@ spin = { version = "0.10.0", default-features = false, features = ["spin_mutex"]
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
 
+[features]
+default = ["qemu"]
+qemu = []
+
 [lints]
 workspace = true
