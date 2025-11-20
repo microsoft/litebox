@@ -214,6 +214,7 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
 /// Instead of maintaining this map, we might be able to use a hypercall to directly program each core's GS register.
 static mut PER_CPU_VARIABLE_ADDRESSES: [RefCell<*mut PerCpuVariables>; MAX_CORES] =
     [const { RefCell::new(core::ptr::null_mut()) }; MAX_CORES];
+static mut PER_CPU_VARIABLE_ADDRESSES_IDX: usize = 0;
 
 /// Execute a closure with a reference to the current core's per-CPU variables.
 ///
@@ -280,8 +281,15 @@ fn get_or_init_refcell_of_per_cpu_variables() -> Option<&'static RefCell<*mut Pe
                 &PER_CPU_VARIABLE_ADDRESSES[0]
             }
         } else {
-            unsafe { &PER_CPU_VARIABLE_ADDRESSES[core_id] }
+            assert!(
+                unsafe { PER_CPU_VARIABLE_ADDRESSES_IDX < MAX_CORES },
+                "PER_CPU_VARIABLE_ADDRESSES_IDX exceeds MAX_CORES",
+            );
+            unsafe { &PER_CPU_VARIABLE_ADDRESSES[PER_CPU_VARIABLE_ADDRESSES_IDX] }
         };
+        unsafe {
+            PER_CPU_VARIABLE_ADDRESSES_IDX += 1;
+        }
         if refcell.borrow().is_null() {
             None
         } else {
