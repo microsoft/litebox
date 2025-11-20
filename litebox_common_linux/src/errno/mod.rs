@@ -496,7 +496,10 @@ impl From<litebox::sync::futex::FutexError> for Errno {
         match value {
             litebox::sync::futex::FutexError::NotAligned => Errno::EINVAL,
             litebox::sync::futex::FutexError::ImmediatelyWokenBecauseValueMismatch => Errno::EAGAIN,
-            litebox::sync::futex::FutexError::TimedOut => Errno::ETIMEDOUT,
+            litebox::sync::futex::FutexError::WaitError(e) => match e {
+                litebox::event::wait::WaitError::Interrupted => Errno::EINTR,
+                litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
+            },
         }
     }
 }

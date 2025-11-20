@@ -741,6 +741,36 @@ impl Task {
         Ok(duration)
     }
 
+    /// Convert an absolute time, specified as a duration since the epoch of the
+    /// given clock, to a `Platform::Instant` suitable for use as a deadline.
+    ///
+    /// If the time is so far in the future that it cannot be represented as an
+    /// `Instant`, returns `Ok(None)`. If the time occurs in the past, returns
+    /// the current time.
+    fn duration_since_epoch_to_deadline(
+        &self,
+        clock_id: litebox_common_linux::ClockId,
+        duration: Duration,
+    ) -> Result<Option<<Platform as TimeProvider>::Instant>, Errno> {
+        match clock_id {
+            litebox_common_linux::ClockId::Monotonic
+            | litebox_common_linux::ClockId::MonotonicCoarse => {
+                // No need to compute the current time since the offset from the
+                // request to `Instant` is known.
+                Ok(crate::boot_time().checked_add(duration))
+            }
+            _ => {
+                // Convert between time domains. If the requested time is in the past,
+                // return the current time.
+                let platform = litebox_platform_multiplex::platform();
+                let current_time = self.gettime_as_duration(platform, clock_id)?;
+                Ok(platform
+                    .now()
+                    .checked_add(duration.checked_sub(current_time).unwrap_or(Duration::ZERO)))
+            }
+        }
+    }
+
     /// Handle syscall `clock_getres`.
     pub(crate) fn sys_clock_getres(
         &self,
@@ -778,19 +808,10 @@ impl Task {
         }
         let is_abs = flags.contains(litebox_common_linux::TimerFlags::ABSTIME);
 
-        let platform = litebox_platform_multiplex::platform();
-
         // Set up a wait context with the right deadline/timeout.
         let wait_cx = self.wait_cx();
         let wait_cx = if is_abs {
-            if matches!(clockid, litebox_common_linux::ClockId::Monotonic) {
-                // No need to compute the current time since the offset from the
-                // request to `Instant` is known.
-                wait_cx.with_deadline(crate::boot_time().checked_add(request))
-            } else {
-                wait_cx
-                    .with_timeout(request.checked_sub(self.gettime_as_duration(platform, clockid)?))
-            }
+            wait_cx.with_deadline(self.duration_since_epoch_to_deadline(clockid, request)?)
         } else {
             // Relative. Treat all clocks the same. TODO: handle the different clocks differently.
             wait_cx.with_timeout(request)
@@ -936,7 +957,7 @@ impl Task {
                 warn_shared_futex!(flags);
                 let futex_manager = crate::litebox_futex_manager();
                 let timeout = timeout.read()?;
-                futex_manager.wait(addr, val, timeout, None)?;
+                futex_manager.wait(&self.wait_cx().with_timeout(timeout), addr, val, None)?;
                 0
             }
             litebox_common_linux::FutexArgs::WaitBitset {
@@ -947,21 +968,24 @@ impl Task {
                 bitmask,
             } => {
                 warn_shared_futex!(flags);
-                let timeout = timeout.read()?.map(|ts| {
-                    let now = self
-                        .gettime_as_duration(
-                            litebox_platform_multiplex::platform(),
-                            if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
-                                litebox_common_linux::ClockId::RealTime
-                            } else {
-                                litebox_common_linux::ClockId::Monotonic
-                            },
-                        )
-                        .expect("failed to get current time");
-                    ts.saturating_sub(now)
-                });
                 let futex_manager = crate::litebox_futex_manager();
-                futex_manager.wait(addr, val, timeout, core::num::NonZeroU32::new(bitmask))?;
+                let deadline = if let Some(timeout) = timeout.read()? {
+                    let clock_id =
+                        if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
+                            litebox_common_linux::ClockId::RealTime
+                        } else {
+                            litebox_common_linux::ClockId::Monotonic
+                        };
+                    self.duration_since_epoch_to_deadline(clock_id, timeout)?
+                } else {
+                    None
+                };
+                futex_manager.wait(
+                    &self.wait_cx().with_deadline(deadline),
+                    addr,
+                    val,
+                    core::num::NonZeroU32::new(bitmask),
+                )?;
                 0
             }
             _ => unimplemented!("Unsupported futex operation"),
