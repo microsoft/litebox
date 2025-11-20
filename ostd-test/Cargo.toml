@@ -1,0 +1,10 @@
+[workspace]
+members = [
+  "platform",
+  "runner",
+]
+resolver = "2"
+exclude = [
+  "target/osdk/base",
+  "target/osdk/test-base",
+]
