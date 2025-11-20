@@ -214,6 +214,29 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
 /// Instead of maintaining this map, we might be able to use a hypercall to directly program each core's GS register.
 static mut PER_CPU_VARIABLE_ADDRESSES: [RefCell<*mut PerCpuVariables>; MAX_CORES] =
     [const { RefCell::new(core::ptr::null_mut()) }; MAX_CORES];
+static mut PER_CPU_VARIABLE_ADDRESSES_IDX: usize = 0;
+static mut CPU_ID_TO_APIC_ID: [i32; MAX_CORES] = [-1; MAX_CORES]; // Do we need to store this mapping?
+
+/// Convert an APIC ID to a CPU ID (logical core ID).
+/// Returns `None` if no CPU corresponds to the given APIC ID.
+///
+/// # Panics
+/// Panics if the number of possible CPUs exceeds `MAX_CORES`
+pub fn convert_apicid_to_cpu(apic_id: usize) -> Option<usize> {
+    let num_cores =
+        usize::try_from(get_num_possible_cpus().expect("Failed to get number of possible CPUs"))
+            .unwrap();
+    assert!(
+        num_cores <= MAX_CORES,
+        "# of possible CPUs ({num_cores}) exceeds MAX_CORES",
+    );
+    for (cpu_id, &cpu_apic_id) in unsafe {CPU_ID_TO_APIC_ID}.iter().enumerate().take(num_cores) {
+        if cpu_apic_id == i32::try_from(apic_id).unwrap() {
+            return Some(cpu_id);
+        }
+    }
+    None
+}
 
 /// Execute a closure with a reference to the current core's per-CPU variables.
 ///
@@ -280,8 +303,13 @@ fn get_or_init_refcell_of_per_cpu_variables() -> Option<&'static RefCell<*mut Pe
                 &PER_CPU_VARIABLE_ADDRESSES[0]
             }
         } else {
-            unsafe { &PER_CPU_VARIABLE_ADDRESSES[core_id] }
+            unsafe { &PER_CPU_VARIABLE_ADDRESSES[PER_CPU_VARIABLE_ADDRESSES_IDX] }
         };
+        unsafe {
+            assert!(PER_CPU_VARIABLE_ADDRESSES_IDX < MAX_CORES);
+            CPU_ID_TO_APIC_ID[PER_CPU_VARIABLE_ADDRESSES_IDX] = i32::try_from(core_id).unwrap();
+            PER_CPU_VARIABLE_ADDRESSES_IDX += 1;
+        }
         if refcell.borrow().is_null() {
             None
         } else {
