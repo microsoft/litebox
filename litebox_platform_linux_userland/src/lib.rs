@@ -276,7 +276,7 @@ impl LinuxUserland {
 
 impl litebox::platform::Provider for LinuxUserland {}
 
-/// Runs a guest thread with the given initial context.
+/// Runs a guest thread using the provided shim and the given initial context.
 ///
 /// This will run until the thread terminates.
 ///

@@ -248,8 +248,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    shim.load_program(platform.init_task(), &prog_unix_path, argv, envp)
+    let prorgram = shim
+        .load_program(platform.init_task(), &prog_unix_path, argv, envp)
         .unwrap();
-    litebox_platform_windows_userland::run_thread(&mut litebox_common_linux::PtRegs::default())
+    unsafe {
+        litebox_platform_windows_userland::run_thread(
+            program.shimk,
+            &mut litebox_common_linux::PtRegs::default(),
+        );
+    }
     Ok(())
 }
