@@ -25,7 +25,6 @@ platform_linux_userland_with_linux_syscall = ["platform_linux_userland", "litebo
 platform_linux_userland_with_optee_syscall = ["platform_linux_userland", "litebox_platform_linux_userland/optee_syscall"]
 platform_lvbs_with_linux_syscall = ["platform_lvbs", "litebox_platform_lvbs/linux_syscall"]
 platform_lvbs_with_optee_syscall = ["platform_lvbs", "litebox_platform_lvbs/optee_syscall"]
-platform_kernel_with_optee_syscall = ["platform_kernel", "litebox_platform_kernel/optee_syscall"]
 
 [lints]
 workspace = true

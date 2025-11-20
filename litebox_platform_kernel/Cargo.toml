@@ -32,9 +32,7 @@ raw-cpuid = "11.6.0"
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
 
 [features]
-default = ["optee_syscall"]
-optee_syscall = []
-linux_syscall = []
+default = []
 interrupt = ["x86_64/abi_x86_interrupt"]
 
 [lints]
