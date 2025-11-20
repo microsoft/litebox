@@ -58,7 +58,6 @@ impl LvbsLinuxKernel {
     pub fn init_task(&self) -> litebox_common_linux::TaskParams {
         litebox_common_linux::TaskParams {
             pid: 1,
-            tid: 1,
             ppid: 1,
             uid: 1000,
             gid: 1000,

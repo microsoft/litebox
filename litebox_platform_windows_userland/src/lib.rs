@@ -315,7 +315,6 @@ impl WindowsUserland {
         // This is a placeholder for future implementation to use passthrough.
         litebox_common_linux::TaskParams {
             pid: 1000,
-            tid: 1000,
             // TODO: placeholder for actual PPID
             ppid: 0,
             uid: 1000,

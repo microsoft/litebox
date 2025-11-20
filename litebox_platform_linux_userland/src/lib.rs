@@ -276,7 +276,6 @@ impl LinuxUserland {
             .unwrap();
         litebox_common_linux::TaskParams {
             pid: tid,
-            tid,
             ppid,
             uid: unsafe { syscalls::raw::syscall0(syscalls::Sysno::getuid) }
                 .try_into()
