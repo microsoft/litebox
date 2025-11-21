@@ -120,9 +120,12 @@ impl<T: Clone> RawConstPointer<T> for TransparentConstPtr<T> {
         if self.inner.is_null() || !self.inner.is_aligned() {
             return None;
         }
-        Some(alloc::borrow::Cow::Borrowed(unsafe {
-            &*self.inner.offset(count)
-        }))
+        Some(match size_of::<T>() {
+            // Try to ensure a single access for primitive types. The use of
+            // volatile here is dubious--this should really use inline asm.
+            1 | 2 | 4 | 8 => alloc::borrow::Cow::Owned(unsafe { self.inner.read_volatile() }),
+            _ => alloc::borrow::Cow::Borrowed(unsafe { &*self.inner.offset(count) }),
+        })
     }
     unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
         if self.inner.is_null() || !self.inner.is_aligned() {
@@ -162,9 +165,12 @@ impl<T: Clone> RawConstPointer<T> for TransparentMutPtr<T> {
         if self.inner.is_null() || !self.inner.is_aligned() {
             return None;
         }
-        Some(alloc::borrow::Cow::Borrowed(unsafe {
-            &*self.inner.offset(count)
-        }))
+        Some(match size_of::<T>() {
+            // Try to ensure a single access for primitive types. The use of
+            // volatile here is dubious--this should really use inline asm.
+            1 | 2 | 4 | 8 => alloc::borrow::Cow::Owned(unsafe { self.inner.read_volatile() }),
+            _ => alloc::borrow::Cow::Borrowed(unsafe { &*self.inner.offset(count) }),
+        })
     }
     unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
         if self.inner.is_null() || !self.inner.is_aligned() {

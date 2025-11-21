@@ -177,9 +177,7 @@ mod tests {
         let task = init_platform(None);
 
         let mut buf = [0u8; 16];
-        let ptr = crate::MutPtr {
-            inner: buf.as_mut_ptr(),
-        };
+        let ptr = crate::MutPtr::from_ptr(buf.as_mut_ptr());
         let count = task
             .sys_getrandom(ptr, buf.len() - 1, RngFlags::empty())
             .expect("getrandom failed");
@@ -196,9 +194,7 @@ mod tests {
         let task = init_platform(None);
 
         let mut utsname = MaybeUninit::<litebox_common_linux::Utsname>::uninit();
-        let ptr = crate::MutPtr {
-            inner: utsname.as_mut_ptr(),
-        };
+        let ptr = crate::MutPtr::from_ptr(utsname.as_mut_ptr());
         task.sys_uname(ptr).expect("uname failed");
         let utsname = unsafe { utsname.assume_init() };
 

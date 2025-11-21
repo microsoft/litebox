@@ -9,10 +9,7 @@ use litebox::{
 use litebox_common_linux::{CloneFlags, SigSet, SigmaskHow};
 
 use super::ghcb::ghcb_prints;
-use crate::{
-    Errno, HostInterface,
-    ptr::{UserConstPtr, UserMutPtr},
-};
+use crate::{Errno, HostInterface, UserConstPtr, UserMutPtr};
 
 #[expect(dead_code, reason = "bindings are generated from C header files")]
 mod bindings {

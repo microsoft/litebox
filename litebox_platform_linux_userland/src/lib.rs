@@ -1295,11 +1295,17 @@ impl litebox::platform::DebugLogProvider for LinuxUserland {
     }
 }
 
+type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
+    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    T,
+>;
+type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
+    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    T,
+>;
 impl litebox::platform::RawPointerProvider for LinuxUserland {
-    type RawConstPointer<T: Clone> =
-        litebox::platform::common_providers::userspace_pointers::UserConstPtr<T>;
-    type RawMutPointer<T: Clone> =
-        litebox::platform::common_providers::userspace_pointers::UserMutPtr<T>;
+    type RawConstPointer<T: Clone> = UserConstPtr<T>;
+    type RawMutPointer<T: Clone> = UserMutPtr<T>;
 }
 
 /// Operations currently supported by the safer variants of the Linux futex syscall
@@ -1471,11 +1477,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             }
             _ => panic!("unhandled mmap error {err}"),
         })?;
-        Ok(
-            litebox::platform::common_providers::userspace_pointers::UserMutPtr {
-                inner: ptr as *mut u8,
-            },
-        )
+        Ok(UserMutPtr::from_usize(ptr))
     }
 
     unsafe fn deallocate_pages(
@@ -1514,11 +1516,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             )
             .expect("mremap failed")
         };
-        Ok(
-            litebox::platform::common_providers::userspace_pointers::UserMutPtr {
-                inner: res as *mut u8,
-            },
-        )
+        Ok(UserMutPtr::from_usize(res))
     }
 
     unsafe fn update_permissions(

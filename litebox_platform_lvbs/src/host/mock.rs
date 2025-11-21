@@ -63,8 +63,8 @@ impl HostInterface for MockHostInterface {
 
     fn rt_sigprocmask(
         _how: i32,
-        _set: crate::ptr::UserConstPtr<super::linux::sigset_t>,
-        _old_set: crate::ptr::UserMutPtr<super::linux::sigset_t>,
+        _set: crate::UserConstPtr<super::linux::sigset_t>,
+        _old_set: crate::UserMutPtr<super::linux::sigset_t>,
         _sigsetsize: usize,
     ) -> Result<usize, crate::Errno> {
         todo!()

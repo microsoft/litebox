@@ -1242,9 +1242,18 @@ impl litebox::platform::DebugLogProvider for WindowsUserland {
     }
 }
 
+type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
+    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    T,
+>;
+type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
+    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    T,
+>;
+
 impl litebox::platform::RawPointerProvider for WindowsUserland {
-    type RawConstPointer<T: Clone> = litebox::platform::trivial_providers::TransparentConstPtr<T>;
-    type RawMutPointer<T: Clone> = litebox::platform::trivial_providers::TransparentMutPtr<T>;
+    type RawConstPointer<T: Clone> = UserConstPtr<T>;
+    type RawMutPointer<T: Clone> = UserMutPtr<T>;
 }
 
 #[allow(
@@ -1497,9 +1506,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     },
                 )
                 .unwrap();
-                return Ok(litebox::platform::trivial_providers::TransparentMutPtr {
-                    inner: base_addr.cast::<u8>(),
-                });
+                return Ok(UserMutPtr::from_ptr(base_addr.cast()));
             }
         }
 
@@ -1516,9 +1523,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         if populate_pages_immediately {
             do_prefetch_on_range(ptr as usize, size);
         }
-        Ok(litebox::platform::trivial_providers::TransparentMutPtr {
-            inner: ptr.cast::<u8>(),
-        })
+        Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
     }
 
     unsafe fn deallocate_pages(

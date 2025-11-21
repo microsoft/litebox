@@ -395,6 +395,10 @@ where
     /// Returns `None` if the provided pointer is invalid, or such an offset is known (in advance)
     /// to be invalid.
     ///
+    /// If `T` is of size 1, 2, 4, or (on 64-bit platforms) 8 bytes, and the pointer is aligned,
+    /// then this function will perform a relaxed atomic load of the value. Otherwise, the
+    /// access pattern is unspecified.
+    ///
     /// # Safety
     ///
     /// The pointer (and underlying memory for the value at the offset) should remain valid and

@@ -1,11 +1,8 @@
 //! An implementation of [`HostInterface`] for LVBS
 
 use crate::{
-    Errno, HostInterface,
-    arch::ioport::serial_print_string,
-    host::linux::sigset_t,
-    host::per_cpu_variables::with_per_cpu_variables_mut,
-    ptr::{UserConstPtr, UserMutPtr},
+    Errno, HostInterface, UserConstPtr, UserMutPtr, arch::ioport::serial_print_string,
+    host::linux::sigset_t, host::per_cpu_variables::with_per_cpu_variables_mut,
 };
 
 pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
